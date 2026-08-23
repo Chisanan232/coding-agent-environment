@@ -281,6 +281,16 @@ install_direnv() {
         return 0
     fi
 
+    if command_exists mise; then
+        info "mise detected — installing via mise (see mise.toml)..."
+        if mise use -g direnv@latest; then
+            success "direnv installed successfully via mise"
+            return 0
+        else
+            warn "mise install failed, falling back to OS package manager..."
+        fi
+    fi
+
     case "$OS" in
         macos)
             if command_exists brew; then

@@ -1,0 +1,11 @@
+# Declaratively managed coding-agent CLI dependencies.
+# Install: `mise install` (from this repo root, or after `mise use -g` per tool).
+#
+# Only tools with a reliable mise backend are here. See docs/TOOLCHAIN.md for
+# the tools intentionally NOT managed by mise (rtk, codegraph,
+# codebase-memory-mcp) and why.
+
+[tools]
+uv = "latest"       # provides uvx — run Python tools without global installs
+direnv = "latest"   # auto-load secrets from .envrc
+gh = "latest"       # GitHub CLI — used by PR/release skills
