@@ -4,7 +4,8 @@ Versioned, portable configuration for [Claude Code](https://claude.com/claude-co
 and [Codex](https://openai.com/codex/) — global behavioral policy, hooks, skills,
 MCP server config, and status-line/toolchain/profile support — with all secrets
 redacted to `${ENV_VAR}` placeholders. See [docs/ALLOWLIST.md](docs/ALLOWLIST.md)
-for exactly what is and isn't tracked.
+for exactly what is and isn't tracked, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+for design goals, layering, and links to every ADR behind a durable decision.
 
 ## Prerequisites
 
@@ -64,10 +65,12 @@ scripts/
 tests/
 └── test-profile-resolver.sh    # 13-case / 31-assertion offline test suite
 docs/
+├── ARCHITECTURE.md             # Design goals, layering, ADR index
 ├── ALLOWLIST.md                # Tracked-file allowlist and runtime/private/generated boundary
 ├── TOOLCHAIN.md                # mise/Brewfile split, what's intentionally excluded and why
 ├── PROFILES.md                 # Directory-scoped profile design, precedence, setup
-└── SECURITY.md                 # Secrets boundary, scanning layers, history-scan result
+├── SECURITY.md                 # Secrets boundary, scanning layers, history-scan result
+└── adr/                        # 9 ADRs for durable migration/model/tooling/profile/rename decisions
 ```
 
 ## Install

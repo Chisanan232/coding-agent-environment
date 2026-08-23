@@ -21,6 +21,7 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 | `codex/AGENTS.md` | Global Codex instructions (generic, no machine-specific content) |
 | `scripts/check.sh`, `scripts/install.sh`, `scripts/profile-install.sh`, `scripts/sync-check.sh` | Bootstrap/diagnosis, prerequisite install, profile setup, live/repo drift report |
 | `.gitleaks.toml`, `.pre-commit-config.yaml`, `.github/workflows/secret-scan.yml` | Layered secret-scanning config (see `docs/SECURITY.md`) |
+| `docs/ARCHITECTURE.md`, `docs/adr/` | Design goals, layering, and ADRs for durable decisions |
 | `mise.toml`, `Brewfile` | Declarative CLI toolchain (see `docs/TOOLCHAIN.md`) |
 | `bin/coding-agent-profile`, `bin/coding-agent-profile-explain`, `bin/ca-claude`, `bin/ca-codex` | Directory-scoped profile resolver + launchers (see `docs/PROFILES.md`) |
 | `profiles/example-profile/` | Generic profile overlay template — never a real overlay |
