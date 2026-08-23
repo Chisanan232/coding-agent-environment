@@ -6,11 +6,11 @@ for the upcoming release window. This skill is preparatory — it does not trigg
 the release or create tags.
 
 ## Type
-Command-like. Invoked by `release-agent` when a release window opens, or
-explicitly via `/release-preparation`.
+Command-like. Run when a release window opens, or explicitly via
+`/release-preparation`.
 
 ## When to use
-- When `dev-lead-agent` signals that the milestone is complete and a release is due.
+- When the milestone is complete and a release is due.
 - Before the automated release workflow runs, to prepare required inputs.
 
 ## When not to use
@@ -49,7 +49,7 @@ Use `release-readiness` for that instead.
 
 ### Phase 4 — Handoff to release-watch
 13. Record the release window state: version, last tag, commit count, draft notes.
-14. Signal to `release-agent` that preparation is complete and `release-watch` should begin.
+14. Preparation is complete — run the `release-watch` skill next.
 
 ## Output format
 

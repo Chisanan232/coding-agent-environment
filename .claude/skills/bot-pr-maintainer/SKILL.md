@@ -6,8 +6,8 @@ Bot PR Policy in CLAUDE.md: approve and merge clean PRs; trigger rebase and
 re-evaluate conflicted PRs; escalate only when the update itself causes CI failure.
 
 ## Type
-Auto-used. Invoked by `dev-lead-agent` via `pr-health-check` when a PR is
-classified as `bot-pr-clean` or `bot-pr-conflict`.
+Auto-used. Run via `pr-health-check` when a PR is classified as
+`bot-pr-clean` or `bot-pr-conflict`.
 
 ## Do Not Assume
 - Do not assume a bot PR is safe just because CI was green at one point — re-check.

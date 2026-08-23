@@ -6,8 +6,8 @@ Tracks per-repo sub-tickets, monitors PRs across repos, and verifies integration
 once all per-repo work is merged. Prevents partial cross-repo merges.
 
 ## Type
-Auto-used. Invoked by `dev-lead-agent` when a parent ticket is decomposed into
-work items that span more than one repository.
+Auto-used. Run when a parent ticket is decomposed into work items that span
+more than one repository.
 
 ## Do Not Assume
 - Do not assume all repos are owned by the same GitHub org — verify remotes.
@@ -63,14 +63,15 @@ Use the parent ticket ref as the coordination anchor across sessions.
 5. Record decision:
    ```bash
    bash ~/.claude/hooks/decision-log.sh record \
-     --ticket "[parent-ticket]" --agent "dev-lead-agent" --skill "cross-repo-coordinator" \
+     --ticket "[parent-ticket]" --agent "main-agent" --skill "cross-repo-coordinator" \
      --phase "1" --decision "decomposed" \
      --reason "Parent ticket requires work in [N] repos" \
      --context "[sub-ticket list]"
    ```
 
 ### Phase 2 — Assign and track per-repo work
-6. Assign each sub-ticket to the appropriate dev-agent or developer.
+6. Assign each sub-ticket to a per-repo working session (own session, or a
+   developer, as appropriate).
 7. Each repo's work follows the standard `ticket-pickup-check → dev-impl-loop` flow.
    The sub-ticket is the active ticket for that repo session.
 8. At each polling interval (or on request), check per-repo progress:
@@ -107,7 +108,7 @@ Use the parent ticket ref as the coordination anchor across sessions.
 14. Record decision:
     ```bash
     bash ~/.claude/hooks/decision-log.sh record \
-      --ticket "[parent-ticket]" --agent "dev-lead-agent" --skill "cross-repo-coordinator" \
+      --ticket "[parent-ticket]" --agent "main-agent" --skill "cross-repo-coordinator" \
       --phase "3" --decision "all-ready" \
       --reason "All per-repo sub-tickets passed QA — proceeding to integration check" \
       --context "[sub-ticket list and PR numbers]"
@@ -122,7 +123,7 @@ Use the parent ticket ref as the coordination anchor across sessions.
 16. If integration tests pass: proceed to Phase 5.
 17. If integration tests fail:
     a. Identify which repo's change causes the failure.
-    b. Route the fix to the appropriate sub-ticket and dev-agent.
+    b. Route the fix to the appropriate sub-ticket and repo session.
     c. Record failure and update session notes:
        ```bash
        bash ~/.claude/hooks/session-memory.sh append "[parent-ticket]" \
@@ -157,7 +158,7 @@ Use the parent ticket ref as the coordination anchor across sessions.
 23. Record final decision:
     ```bash
     bash ~/.claude/hooks/decision-log.sh record \
-      --ticket "[parent-ticket]" --agent "dev-lead-agent" --skill "cross-repo-coordinator" \
+      --ticket "[parent-ticket]" --agent "main-agent" --skill "cross-repo-coordinator" \
       --phase "5" --decision "complete" \
       --reason "All per-repo PRs merged; integration tests passed; parent ticket closed"
     ```

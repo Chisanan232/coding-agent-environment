@@ -6,16 +6,15 @@ are ready to merge, which are blocked, which are stale, and which are bot PRs
 requiring automated maintenance.
 
 ## Type
-Command-like. Invoked by `dev-lead-agent` at each polling interval, or explicitly
-via `/pr-health-check`.
+Command-like. Run at each polling interval, or explicitly via `/pr-health-check`.
 
 ## When to use
 - At each scheduled polling interval (see time-layer design in CLAUDE.md).
-- When `dev-lead-agent` is reactivated to assess repository state.
+- When resuming to reassess repository state.
 - Before beginning a new task (to catch PRs that need unblocking first).
 
 ## When not to use
-Do not run this mid-implementation on a focused `dev-agent` task — it is a
+Do not run this mid-implementation on a focused implementation task — it is a
 coordination-level check, not a developer progress check.
 
 ## Steps
@@ -44,7 +43,7 @@ Classify each PR into one of:
 
 | Class | Action |
 |---|---|
-| `ready-to-merge` | Approve and merge (if `dev-lead-agent` is authorized) |
+| `ready-to-merge` | Approve and merge (if merge preconditions are met — see Auto-Merge Policy) |
 | `blocked-ci` | Note the failure — invoke `ci-failure-triage` if repair is in scope |
 | `blocked-review` | Note awaiting reviewer — no action unless stale |
 | `blocked-conflict` | Note conflict — flag to engineer |

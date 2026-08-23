@@ -114,7 +114,7 @@ if [[ "${1:-}" == "record-failure" ]]; then
   echo "[circuit-breaker] failure recorded for ${ticket}: ${failures}/${threshold} — state: ${new_state}"
 
   if [[ "$new_state" == "open" ]]; then
-    echo "[circuit-breaker] CIRCUIT OPEN — escalate to dev-lead-agent before retrying" >&2
+    echo "[circuit-breaker] CIRCUIT OPEN — escalate to the engineer before retrying" >&2
     exit 1
   fi
   exit 0

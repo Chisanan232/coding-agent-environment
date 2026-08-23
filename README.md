@@ -27,7 +27,8 @@ tools incrementally as you adopt each capability.
 .claude/
 ├── CLAUDE.md                  # Global behavioral policy (all projects)
 ├── RTK.md                     # RTK (token-killer proxy) command reference
-├── settings.json              # Permissions, model, hook wiring
+├── settings.json              # Permissions, model, hook wiring (global + project scope)
+├── settings.global-only.json  # Settings that only take effect in ~/.claude/ (plugins, theme, TUI)
 ├── config.env                 # Hook env overrides (gate toggles)
 ├── mcp-servers.runtime.json   # Runtime MCP servers, secrets redacted
 ├── hooks/                     # Workflow / gate shell hooks
@@ -39,8 +40,10 @@ tools incrementally as you adopt each capability.
 Copy into your home config (review first):
 
 ```bash
+cp .mcp.json ~/.claude/.mcp.json
 cp -R .claude/CLAUDE.md .claude/RTK.md .claude/settings.json \
-      .claude/config.env .claude/hooks .claude/skills ~/.claude/
+      .claude/settings.global-only.json .claude/config.env \
+      .claude/mcp-servers.runtime.json .claude/hooks .claude/skills ~/.claude/
 ```
 
 ## MCP servers

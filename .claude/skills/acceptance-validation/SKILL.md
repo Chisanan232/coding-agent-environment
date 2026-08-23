@@ -5,7 +5,8 @@ Validate that a delivered implementation meets its acceptance criteria from an
 external tester perspective, covering happy paths, edge cases, and regressions.
 
 ## Type
-Auto-used. `qa-agent` invokes this skill before producing a pre-merge validation report.
+Auto-used. Run this skill before declaring implementation complete, to produce
+a pre-merge validation report from an external tester perspective.
 
 ## Do Not Assume
 - Do not assume the stated acceptance criteria are complete — look for implicit requirements.
@@ -18,7 +19,7 @@ Auto-used. `qa-agent` invokes this skill before producing a pre-merge validation
 ### Phase 1 — Criteria extraction
 1. Read the ticket or PR description to identify acceptance criteria.
 2. If acceptance criteria are missing, derive them from the stated purpose and scope.
-3. Confirm with `dev-lead-agent` before proceeding if criteria cannot be determined.
+3. If criteria cannot be determined, stop and confirm with the engineer before proceeding.
 
 ### Phase 2 — Happy path validation
 4. For each acceptance criterion, identify the primary scenario that should satisfy it.
@@ -49,7 +50,7 @@ Auto-used. `qa-agent` invokes this skill before producing a pre-merge validation
 
 ### Phase 5 — Validation report
 14. Produce the structured validation report (see Output format).
-15. If any blocking items are found, report them to `dev-lead-agent` with detail.
+15. If any blocking items are found, report them to the engineer with detail.
 16. Do not declare the work ready if any criterion fails or any blocking regression exists.
 
 ## Output format
@@ -87,5 +88,5 @@ Auto-used. `qa-agent` invokes this skill before producing a pre-merge validation
 
 ## Safe-Fix Guidance
 - If a criterion fails, report it. Do not modify tests or code to make it pass.
-- If the test suite is red, stop and escalate to `dev-lead-agent` — do not proceed
+- If the test suite is red, stop and escalate to the engineer — do not proceed
   with validation on a broken baseline.

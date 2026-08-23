@@ -6,8 +6,7 @@ changes, and re-request review when all feedback is resolved. Ensures no
 reviewer comment is skipped or silently dropped.
 
 ## Type
-Auto-used. Invoked by `dev-agent` when a PR has new review comments or a
-"Request Changes" verdict.
+Auto-used. Run when a PR has new review comments or a "Request Changes" verdict.
 
 ## Do Not Assume
 - Do not assume all comments require code changes — some require a reply only.
@@ -92,6 +91,6 @@ Auto-used. Invoked by `dev-agent` when a PR has new review comments or a
 ## Safe-Fix Guidance
 - Do not mark a comment resolved until the reviewer accepts it.
 - If a Must-fix requires a design change beyond the current PR scope,
-  escalate to `dev-lead-agent` — do not scope-creep silently.
+  escalate to the engineer — do not scope-creep silently.
 - If feedback contradicts a previous reviewer's approval, flag the conflict
   and do not resolve it unilaterally.

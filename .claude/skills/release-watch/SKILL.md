@@ -6,8 +6,8 @@ Report pipeline state at each observation interval. Summarize the final outcome
 when the pipeline completes or fails.
 
 ## Type
-Auto-used. `release-agent` invokes this skill after `release-preparation` signals
-completion, and at each polling interval until the release pipeline resolves.
+Auto-used. Run after `release-preparation` signals completion, and at each
+polling interval until the release pipeline resolves.
 
 ## Do Not Assume
 - Do not assume the pipeline is progressing just because it started.

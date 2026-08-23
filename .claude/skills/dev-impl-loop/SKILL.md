@@ -7,7 +7,7 @@ pre-commit → explicit QA handoff. Provides a defined entry point, exit
 condition, and circuit breaker threshold for every iteration phase.
 
 ## Type
-Auto-used. Invoked by `dev-agent` immediately after `ticket-pickup-check` passes.
+Auto-used. Run immediately after `ticket-pickup-check` passes.
 
 ## Do Not Assume
 - Do not assume the branch is current — pull before writing any code.
@@ -64,7 +64,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
    Record the decision:
    ```bash
    bash ~/.claude/hooks/decision-log.sh record \
-     --ticket "$TICKET" --agent "dev-agent" --skill "dev-impl-loop" \
+     --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
      --phase "0" --decision "proceed" \
      --reason "Circuit closed, branch current, working tree clean"
    ```
@@ -94,7 +94,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
         ```bash
         bash ~/.claude/hooks/circuit-breaker-gate.sh record-failure "$TICKET" 5
         ```
-        If the circuit opens, stop and escalate to `dev-lead-agent`.
+        If the circuit opens, stop and escalate to the engineer.
    e. If relative tests pass after a fix:
       ```bash
       bash ~/.claude/hooks/circuit-breaker-gate.sh record-success "$TICKET"
@@ -113,10 +113,10 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
     ```
 11. If any test fails:
     a. Determine: is the failure in code I changed, or pre-existing?
-    b. Pre-existing failure → document it, report to `dev-lead-agent`, do not fix.
+    b. Pre-existing failure → document it, report to the engineer, do not fix.
        ```bash
        bash ~/.claude/hooks/decision-log.sh record \
-         --ticket "$TICKET" --agent "dev-agent" --skill "dev-impl-loop" \
+         --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
          --phase "2" --decision "escalate" \
          --reason "Pre-existing test failure — not caused by this change" \
          --context "[test name and failure output]"
@@ -131,7 +131,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
     Record decision:
     ```bash
     bash ~/.claude/hooks/decision-log.sh record \
-      --ticket "$TICKET" --agent "dev-agent" --skill "dev-impl-loop" \
+      --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
       --phase "2" --decision "proceed" \
       --reason "Full test suite green" --context "[N passed, 0 failed]"
     ```
@@ -166,7 +166,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
     Record decision:
     ```bash
     bash ~/.claude/hooks/decision-log.sh record \
-      --ticket "$TICKET" --agent "dev-agent" --skill "dev-impl-loop" \
+      --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
       --phase "3" --decision "proceed" \
       --reason "Pre-commit clean; sentinel updated"
     ```
@@ -181,9 +181,9 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
     Record decision:
     ```bash
     bash ~/.claude/hooks/decision-log.sh record \
-      --ticket "$TICKET" --agent "dev-agent" --skill "dev-impl-loop" \
+      --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
       --phase "4" --decision "qa-handoff" \
-      --reason "All phases green; signalling qa-agent for acceptance-validation"
+      --reason "All phases green; running acceptance-validation"
     ```
 17. Post a QA handoff comment on the ticket:
     ```
@@ -198,30 +198,30 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
     ### Known edge cases or concerns
     - [any area that needs extra attention during QA]
 
-    Requesting qa-agent to begin acceptance-validation.
+    Running acceptance-validation next.
     ```
-18. **Explicitly signal `qa-agent`** to begin `acceptance-validation`.
-    Do not proceed until the qa-agent verdict arrives.
+18. **Run the `acceptance-validation` skill** now, from an external tester
+    perspective. Do not proceed until it produces a verdict.
 
 ### Phase 5 — Post-QA resolution
-19. If qa-agent verdict is "ready":
+19. If the acceptance-validation verdict is "ready":
     a. Update workflow state: step 5 of 5, status "complete".
        ```bash
        bash ~/.claude/hooks/workflow-state.sh write \
          "$TICKET" "dev-impl-loop" "5" "5" "complete"
        bash ~/.claude/hooks/decision-log.sh record \
-         --ticket "$TICKET" --agent "dev-agent" --skill "dev-impl-loop" \
+         --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
          --phase "5" --decision "open-pr" \
-         --reason "QA verdict: ready" --context "[qa-agent verdict summary]"
+         --reason "QA verdict: ready" --context "[acceptance-validation verdict summary]"
        ```
     b. Open a PR using `code-review-prep` and `pr-readiness` skills.
     c. Link the PR to the ticket.
-20. If qa-agent verdict is "blocked":
+20. If the acceptance-validation verdict is "blocked":
     a. Read the blocking items from the verdict output.
     b. Re-enter the Phase 1 implementation loop to address each item.
        Circuit breaker applies — max attempts before escalating.
     c. After fixes: re-run Phase 2 (full suite) and Phase 3 (pre-commit)
-       before signaling QA again.
+       before re-running acceptance-validation.
 
 ## Circuit breaker thresholds
 - Phase 1 (relative tests): max **5 consecutive failures** or **60 min** elapsed.
@@ -235,7 +235,7 @@ When the circuit breaker trips:
    bash ~/.claude/hooks/workflow-state.sh write \
      "$TICKET" "dev-impl-loop" "[current-step]" "5" "escalated"
    bash ~/.claude/hooks/decision-log.sh record \
-     --ticket "$TICKET" --agent "dev-agent" --skill "dev-impl-loop" \
+     --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
      --phase "[current-phase]" --decision "escalate" \
      --reason "Circuit open after [N] consecutive failures" \
      --context "[last failure output summary]"
@@ -246,7 +246,7 @@ When the circuit breaker trips:
      "Circuit breaker tripped" \
      "Phase [current-phase] hit [N] consecutive failures. Last error: [summary]. Awaiting engineer reset."
    ```
-4. Report to `dev-lead-agent` with the failure summary and ticket reference.
+4. Report to the engineer with the failure summary and ticket reference.
 5. Do not retry until the engineer resets the breaker:
    `bash ~/.claude/hooks/circuit-breaker-gate.sh reset $TICKET`
 
@@ -255,7 +255,7 @@ On successful completion: PR opened, linked to ticket, workflow state = complete
 
 ## Safe-Fix Guidance
 - Do not skip Phase 2 (full suite) even if Phase 1 relative tests are green.
-- Do not open the PR before qa-agent produces a "ready" verdict.
+- Do not open the PR before acceptance-validation produces a "ready" verdict.
 - Do not mark work complete while the circuit breaker is open.
 - If the implementation loop exits without all acceptance criteria met, that is a
-  decomposition problem — escalate to `dev-lead-agent`.
+  decomposition problem — escalate to the engineer.
