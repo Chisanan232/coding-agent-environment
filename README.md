@@ -8,15 +8,20 @@ for exactly what is and isn't tracked.
 
 ## Prerequisites
 
-This configuration depends on several CLI tools. Install them before use:
+This configuration depends on several CLI tools. `uv`/`uvx`, `direnv`, and
+`gh` are declaratively managed — run `mise install` (see `mise.toml`) and
+`brew bundle` (see `Brewfile`). `rtk`, `codegraph`, and `codebase-memory-mcp`
+are not mise/Brewfile-manageable — see [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md)
+for why and their install paths:
 
 | Tool | Install | Used by |
 |---|---|---|
 | `rtk` | `cargo install rtk-token-killer` | Token-optimized CLI proxy for dev operations |
 | `codegraph` | See [CodeGraph](#codegraph) section | Codebase knowledge graph for symbol/call-path queries |
 | `codebase-memory-mcp` | `npm install -g codebase-memory-mcp` (installed via `npx` in MCP config, no separate global install required) | MCP server for structural code queries |
-| `uvx` | `pip install uv` (provides `uvx`) | Run Python tools without global installs |
-| `direnv` | `brew install direnv` (macOS) | Auto-load secrets from `.envrc` |
+| `uvx` | `mise install` (provides `uv`/`uvx`) | Run Python tools without global installs |
+| `direnv` | `mise install` | Auto-load secrets from `.envrc` |
+| `gh` | `mise install` | GitHub CLI — used by PR/release skills |
 
 **Graceful degradation**: Most features work without every tool installed.
 Missing tools trigger warnings in hooks but do not block execution. Install
@@ -26,6 +31,8 @@ tools incrementally as you adopt each capability.
 
 ```
 .mcp.json                      # MCP server templates (env placeholders) - must be at project root
+mise.toml                      # Declarative dev-CLI versions (uv, direnv, gh)
+Brewfile                       # macOS system packages (jq)
 .claude/
 ├── CLAUDE.md                  # Global behavioral policy (all projects)
 ├── RTK.md                     # RTK (token-killer proxy) command reference
@@ -41,7 +48,8 @@ codex/
 ├── config.toml                # Portable Codex desired state (see file header for exclusions)
 └── AGENTS.md                  # Global Codex instructions
 docs/
-└── ALLOWLIST.md                # Tracked-file allowlist and runtime/private/generated boundary
+├── ALLOWLIST.md                # Tracked-file allowlist and runtime/private/generated boundary
+└── TOOLCHAIN.md                # mise/Brewfile split, what's intentionally excluded and why
 ```
 
 ## Install
@@ -171,9 +179,9 @@ Use [direnv](https://direnv.net/) to auto-load secrets when entering a project d
 
 ### Setup
 
-1. Install direnv:
+1. Install direnv (managed by `mise.toml`):
    ```bash
-   brew install direnv  # macOS
+   mise install
    ```
 
 2. Add to your shell (e.g., `~/.zshrc`):
@@ -251,7 +259,7 @@ Guide me through each step, explaining what each config file does.
 
 ### What the onboarding does
 
-- Checks for required CLI tools (rtk, codegraph, uvx, direnv)
+- Checks for required CLI tools (rtk, codegraph, uvx, direnv, gh — the last three via `mise install`)
 - Validates existing `~/.claude/` configuration
 - Guides you through copying config files
 - Sets up secrets management with direnv
