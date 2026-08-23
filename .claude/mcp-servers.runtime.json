@@ -55,9 +55,6 @@
         "serve",
         "--mcp"
       ]
-    },
-    "codebase-memory-mcp": {
-      "command": "/Users/bryant/.nvm/versions/node/v23.11.0/lib/node_modules/codebase-memory-mcp/bin/codebase-memory-mcp"
     }
   }
 }

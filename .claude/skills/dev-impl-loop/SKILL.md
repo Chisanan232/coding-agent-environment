@@ -7,7 +7,7 @@ pre-commit → explicit QA handoff. Provides a defined entry point, exit
 condition, and circuit breaker threshold for every iteration phase.
 
 ## Type
-Auto-used. Invoked by `dev-agent` immediately after `ticket-pickup-check` passes.
+Auto-used. Run immediately after `ticket-pickup-check` passes.
 
 ## Do Not Assume
 - Do not assume the branch is current — pull before writing any code.

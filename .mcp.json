@@ -52,7 +52,7 @@
                 "coverage_reporting"
             ],
             "_tier": "project-opt-in",
-            "_role": "Optional: enable when coverage trend tracking is required for PR merge decisions. Used by qa-agent acceptance-validation and pr-readiness skills.",
+            "_role": "Optional: enable when coverage trend tracking is required for PR merge decisions. Used by the acceptance-validation and pr-readiness skills.",
             "_note": "[NOT AVAILABLE] The mcp/codecov Docker image does not exist publicly. You need to build a custom MCP server for Codecov integration or find a community implementation.",
             "disabled": true
         },
@@ -125,7 +125,7 @@
                 "@playwright/mcp@latest"
             ],
             "_tier": "project-opt-in",
-            "_role": "Used by qa-agent for UI acceptance testing - navigate pages, interact with elements via accessibility tree, capture snapshots. Enable for projects with a web UI.",
+            "_role": "Used for UI acceptance testing - navigate pages, interact with elements via accessibility tree, capture snapshots. Enable for projects with a web UI.",
             "capabilities": [
                 "browser_automation"
             ],
