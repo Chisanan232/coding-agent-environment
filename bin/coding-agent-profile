@@ -45,9 +45,14 @@ physical_path() {
 # find_markers PHYSICAL_DIR -> prints one marker directory per line, nearest first
 find_markers() {
     local d="$1" depth=0 markers=()
+    # Compare against the physical HOME path — $d is always physical
+    # (symlinks followed), so a raw $HOME (e.g. macOS /var/folders/... before
+    # its /private symlink resolution) would never match otherwise.
+    local home_physical=""
+    [[ -d "$HOME" ]] && home_physical="$(physical_path "$HOME")"
     while (( depth <= MAX_DEPTH )); do
         if [[ -f "$d/$MARKER_NAME" ]]; then
-            if [[ "$ALLOW_HOME_PROFILE" == "1" || ( "$d" != "$HOME" && "$d" != "/" ) ]]; then
+            if [[ "$ALLOW_HOME_PROFILE" == "1" || ( "$d" != "$home_physical" && "$d" != "/" ) ]]; then
                 markers+=("$d")
             fi
         fi
