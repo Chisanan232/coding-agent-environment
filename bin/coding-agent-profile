@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# coding-agent-profile - directory-scoped coding-agent profile resolver.
+#
+# Walks from $PWD (physical path) upward looking for a `.coding-agent-profile`
+# marker file. Nearest marker wins. Never infers identity from git remotes,
+# hostnames, or model reasoning — this is a small deterministic resolver, not
+# a classifier. See docs/PROFILES.md for the full design.
+#
+# Usage:
+#   coding-agent-profile resolve [--cwd PATH]      # prints: status name root overlay
+#   coding-agent-profile explain [--json] [--cwd PATH]
+#
+# Exit codes: 0 ok/none, 2 usage, 3 malformed, 4 unresolved.
+set -euo pipefail
+
+MARKER_NAME=".coding-agent-profile"
+MAX_DEPTH=64
+PROFILE_DIR="${CODING_AGENT_PROFILE_DIR:-$HOME/.coding-agent-profiles}"
+ALLOW_HOME_PROFILE="${CODING_AGENT_ALLOW_HOME_PROFILE:-0}"
+
+# Injectable for tests / --explain: default to the real OS paths.
+MANAGED_SETTINGS_PATH="${CODING_AGENT_MANAGED_SETTINGS_PATH:-/Library/Application Support/ClaudeCode/managed-settings.json}"
+CODEX_MANAGED_CONFIG_PATH="${CODING_AGENT_CODEX_MANAGED_CONFIG_PATH:-/Library/Application Support/Codex/managed-config.toml}"
+
+err() { echo "coding-agent-profile: $*" >&2; }
+
+# ---------------------------------------------------------------------------
+# Core resolution
+# ---------------------------------------------------------------------------
+
+# physical_path PATH -> prints resolved physical path (symlinks followed)
+physical_path() {
+    local p="$1"
+    if [[ -d "$p" ]]; then
+        (cd -P -- "$p" 2>/dev/null && pwd -P)
+    else
+        # File: resolve the directory, keep the basename.
+        local dir base
+        dir="$(dirname -- "$p")"
+        base="$(basename -- "$p")"
+        printf '%s/%s\n' "$(cd -P -- "$dir" 2>/dev/null && pwd -P)" "$base"
+    fi
+}
+
+# find_markers PHYSICAL_DIR -> prints one marker directory per line, nearest first
+find_markers() {
+    local d="$1" depth=0 markers=()
+    while (( depth <= MAX_DEPTH )); do
+        if [[ -f "$d/$MARKER_NAME" ]]; then
+            if [[ "$ALLOW_HOME_PROFILE" == "1" || ( "$d" != "$HOME" && "$d" != "/" ) ]]; then
+                markers+=("$d")
+            fi
+        fi
+        [[ "$d" == "/" ]] && break
+        d="$(dirname -- "$d")"
+        depth=$((depth + 1))
+    done
+    printf '%s\n' "${markers[@]+"${markers[@]}"}"
+}
+
+# parse_marker MARKER_FILE -> prints profile name on stdout, or "malformed:<reason>"
+parse_marker() {
+    local f="$1"
+    local -a lines=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # strip comments and blank lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        # trim
+        line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        lines+=("$line")
+    done < "$f"
+
+    if (( ${#lines[@]} == 0 )); then
+        echo "malformed:empty"
+        return
+    fi
+    if (( ${#lines[@]} > 1 )); then
+        echo "malformed:multiple-entries"
+        return
+    fi
+    local name="${lines[0]}"
+    if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+        echo "malformed:invalid-name"
+        return
+    fi
+    echo "$name"
+}
+
+# resolve CWD_PHYSICAL -> sets globals: RESOLVE_STATUS RESOLVE_NAME RESOLVE_ROOT
+#                          RESOLVE_OVERLAY RESOLVE_ANCESTORS_SCANNED
+#                          RESOLVE_SHADOWED (array) RESOLVE_MALFORMED_REASON
+resolve() {
+    local cwd="$1"
+    RESOLVE_STATUS="none"
+    RESOLVE_NAME=""
+    RESOLVE_ROOT=""
+    RESOLVE_OVERLAY=""
+    RESOLVE_MALFORMED_REASON=""
+    RESOLVE_SHADOWED=()
+
+    local -a markers=()
+    while IFS= read -r m; do
+        [[ -n "$m" ]] && markers+=("$m")
+    done < <(find_markers "$cwd")
+
+    # ancestors_scanned: count of directories walked (approx depth+1)
+    local scanned=1 d="$cwd"
+    while [[ "$d" != "/" ]]; do
+        d="$(dirname -- "$d")"
+        scanned=$((scanned + 1))
+    done
+    RESOLVE_ANCESTORS_SCANNED="$scanned"
+
+    if (( ${#markers[@]} == 0 )); then
+        RESOLVE_STATUS="none"
+        return 0
+    fi
+
+    local nearest="${markers[0]}"
+    if (( ${#markers[@]} > 1 )); then
+        RESOLVE_SHADOWED=("${markers[@]:1}")
+    fi
+
+    local parsed
+    parsed="$(parse_marker "$nearest/$MARKER_NAME")"
+    if [[ "$parsed" == malformed:* ]]; then
+        RESOLVE_STATUS="malformed"
+        RESOLVE_ROOT="$nearest"
+        RESOLVE_MALFORMED_REASON="${parsed#malformed:}"
+        return 3
+    fi
+
+    RESOLVE_NAME="$parsed"
+    RESOLVE_ROOT="$nearest"
+    RESOLVE_OVERLAY="$PROFILE_DIR/$RESOLVE_NAME"
+
+    if [[ ! -d "$RESOLVE_OVERLAY" ]]; then
+        RESOLVE_STATUS="unresolved"
+        return 4
+    fi
+
+    RESOLVE_STATUS="ok"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+cmd_resolve() {
+    local cwd_arg=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cwd) cwd_arg="$2"; shift 2 ;;
+            *) err "unknown option: $1"; exit 2 ;;
+        esac
+    done
+    local cwd
+    cwd="$(physical_path "${cwd_arg:-$PWD}")"
+    set +e
+    resolve "$cwd"
+    local rc=$?
+    set -e
+    echo "status=$RESOLVE_STATUS name=$RESOLVE_NAME root=$RESOLVE_ROOT overlay=$RESOLVE_OVERLAY"
+    exit "$rc"
+}
+
+show_help() {
+    cat <<'EOF'
+coding-agent-profile - directory-scoped coding-agent profile resolver
+
+Usage:
+  coding-agent-profile resolve [--cwd PATH]
+  coding-agent-profile explain [--json] [--cwd PATH]
+  coding-agent-profile --help
+
+Exit codes: 0 ok/none, 2 usage, 3 malformed, 4 unresolved.
+See docs/PROFILES.md for the full design.
+EOF
+}
+
+main() {
+    local cmd="${1:-}"
+    [[ $# -gt 0 ]] && shift || true
+    case "$cmd" in
+        resolve) cmd_resolve "$@" ;;
+        explain)
+            # shellcheck source=bin/coding-agent-profile-explain
+            source "$(dirname -- "${BASH_SOURCE[0]}")/coding-agent-profile-explain"
+            cmd_explain "$@"
+            ;;
+        --help|-h|"") show_help ;;
+        *) err "unknown command: $cmd"; show_help; exit 2 ;;
+    esac
+}
+
+main "$@"
