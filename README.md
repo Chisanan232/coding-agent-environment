@@ -1,4 +1,4 @@
-# claude-code-config
+# coding-agent-environment
 
 Versioned personal configuration for [Claude Code](https://claude.com/claude-code).
 Snapshot of `~/.claude/` — global behavioral policy, hooks, skills, and MCP server
@@ -203,13 +203,13 @@ export PROJECT_SPECIFIC_KEY="..."
 Copy and paste this prompt into Claude Code to automate setup:
 
 ```text
-I want to set up claude-code-config. Please:
+I want to set up coding-agent-environment. Please:
 
 1. Clone the repo if not present:
-   git clone https://github.com/Chisanan232/claude-code-config.git ~/claude-code-config
+   git clone https://github.com/Chisanan232/coding-agent-environment.git ~/coding-agent-environment
 
 2. Run the setup check script:
-   bash ~/claude-code-config/scripts/check.sh
+   bash ~/coding-agent-environment/scripts/check.sh
 
 3. Review the output and help me:
    - Install any missing prerequisites

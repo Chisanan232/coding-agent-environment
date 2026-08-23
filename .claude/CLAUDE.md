@@ -681,7 +681,7 @@ and summarizing the automated workflow rather than replacing it.
 ## Environment Variable Reference
 
 All hooks and utility scripts source `~/.claude/config.env` at startup.
-Copy `claude-code-config/.claude/hooks/config.env` to `~/.claude/config.env`
+Copy `coding-agent-environment/.claude/hooks/config.env` to `~/.claude/config.env`
 and uncomment the variables you want to override.
 
 | Variable | Default | Purpose |
