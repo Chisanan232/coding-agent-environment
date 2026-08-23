@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# ca-codex - launches Codex with the resolved directory-scoped profile
+# applied via --profile <name> (reads $CODEX_HOME/<name>.config.toml,
+# materialized by scripts/profile-install.sh as a symlink to the overlay)
+# plus a conditional -c project_root_markers override so Codex's ancestor
+# AGENTS.md walk extends to the profile root instead of stopping at the
+# git repo root. Only passed when a profile actually resolved — Codex loads
+# NO project docs at all if this override is set with no marker present
+# anywhere (validated against installed Codex 0.147.0).
+#
+# Never shadows `codex` itself. CA_DRY_RUN=1 prints argv instead of exec'ing.
+set -euo pipefail
+
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+CODEX_BIN="$(command -v codex 2>/dev/null || true)"
+if [[ -z "$CODEX_BIN" ]]; then
+    echo "ca-codex: 'codex' not found on PATH" >&2
+    exit 1
+fi
+if [[ "$(basename -- "$CODEX_BIN")" == "ca-codex" || "$CODEX_BIN" == "${BASH_SOURCE[0]}" ]]; then
+    echo "ca-codex: refusing to exec — PATH resolves 'codex' back to this wrapper" >&2
+    exit 1
+fi
+
+eval "$("$HERE/coding-agent-profile" __internal_resolve_env 2>/dev/null || true)"
+
+declare -a ARGS=()
+
+if [[ "${CAP_STATUS:-none}" == "ok" ]]; then
+    ARGS+=(--profile "$CAP_NAME")
+    ARGS+=(-c 'project_root_markers=[".coding-agent-profile"]')
+fi
+
+if [[ "${CA_DRY_RUN:-0}" == "1" ]]; then
+    printf '%s\n' "$CODEX_BIN" "${ARGS[@]+"${ARGS[@]}"}" "$@"
+    exit 0
+fi
+
+exec "$CODEX_BIN" "${ARGS[@]+"${ARGS[@]}"}" "$@"

@@ -166,6 +166,21 @@ cmd_resolve() {
     exit "$rc"
 }
 
+# Internal, undocumented: prints shell-eval-able CAP_* vars for ca-claude/
+# ca-codex to consume. Not part of the public CLI surface — do not script
+# against this from outside bin/.
+cmd_internal_resolve_env() {
+    local cwd
+    cwd="$(physical_path "${1:-$PWD}")"
+    set +e
+    resolve "$cwd"
+    set -e
+    printf 'CAP_STATUS=%q\n' "$RESOLVE_STATUS"
+    printf 'CAP_NAME=%q\n' "$RESOLVE_NAME"
+    printf 'CAP_ROOT=%q\n' "$RESOLVE_ROOT"
+    printf 'CAP_OVERLAY=%q\n' "$RESOLVE_OVERLAY"
+}
+
 show_help() {
     cat <<'EOF'
 coding-agent-profile - directory-scoped coding-agent profile resolver
@@ -185,6 +200,7 @@ main() {
     [[ $# -gt 0 ]] && shift || true
     case "$cmd" in
         resolve) cmd_resolve "$@" ;;
+        __internal_resolve_env) cmd_internal_resolve_env "$@" ;;
         explain)
             # shellcheck source=bin/coding-agent-profile-explain
             source "$(dirname -- "${BASH_SOURCE[0]}")/coding-agent-profile-explain"
