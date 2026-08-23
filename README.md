@@ -33,6 +33,9 @@ tools incrementally as you adopt each capability.
 .mcp.json                      # MCP server templates (env placeholders) - must be at project root
 mise.toml                      # Declarative dev-CLI versions (uv, direnv, gh)
 Brewfile                       # macOS system packages (jq)
+.gitleaks.toml                 # Secret-scan config (allowlist for intentional placeholders)
+.pre-commit-config.yaml        # Local gitleaks pre-commit hook
+.github/workflows/secret-scan.yml  # CI gitleaks scan on push/PR
 .claude/
 ├── CLAUDE.md                  # Global behavioral policy (all projects)
 ├── RTK.md                     # RTK (token-killer proxy) command reference
@@ -54,13 +57,17 @@ bin/
 └── ca-codex                    # Profile-aware `codex` launcher
 profiles/example-profile/       # Generic profile overlay template (copy, don't commit a real one)
 scripts/
-└── profile-install.sh          # Symlinks bin/ + materializes Codex profile configs
+├── check.sh                    # Diagnostics (prerequisites, config, profiles, precedence)
+├── install.sh                  # Prerequisite CLI installer
+├── profile-install.sh          # Symlinks bin/ + materializes Codex profile configs
+└── sync-check.sh               # Report-first live<->repo drift check
 tests/
 └── test-profile-resolver.sh    # 13-case / 31-assertion offline test suite
 docs/
 ├── ALLOWLIST.md                # Tracked-file allowlist and runtime/private/generated boundary
 ├── TOOLCHAIN.md                # mise/Brewfile split, what's intentionally excluded and why
-└── PROFILES.md                 # Directory-scoped profile design, precedence, setup
+├── PROFILES.md                 # Directory-scoped profile design, precedence, setup
+└── SECURITY.md                 # Secrets boundary, scanning layers, history-scan result
 ```
 
 ## Install
@@ -199,6 +206,23 @@ cp -R profiles/example-profile ~/.coding-agent-profiles/<name>
 cd /path/to/subtree && echo "<name>" > .coding-agent-profile
 coding-agent-profile explain
 ```
+
+## Bootstrap, Sync, and Validation
+
+- `scripts/install.sh` — installs prerequisite CLI tools (interactive,
+  `--missing`, or `--all`).
+- `scripts/check.sh` — diagnostics: prerequisites, config file validity,
+  env vars, directory-profile resolver health, settings-precedence
+  confirmation. `--json` for machine-readable output. Non-zero exit on any
+  issue found.
+- `scripts/sync-check.sh` — **report-first** bidirectional drift check
+  between this repo's tracked files and the live machine (`~/.claude`,
+  `~/.codex`, `~/.local/bin`). Reports `DIFFERS`/`MISSING-LIVE` per file;
+  never copies anything automatically in either direction — you decide
+  which side is correct per file, then `cp` explicitly.
+
+See [docs/SECURITY.md](docs/SECURITY.md) for the secret-scanning layers
+(pre-commit, CI, one-time full-history scan) and rotation policy.
 
 ## Secrets Management
 
