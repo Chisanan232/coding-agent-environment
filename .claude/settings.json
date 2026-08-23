@@ -1,11 +1,22 @@
 {
     "_scope_note": "These settings work in both global (~/.claude/) and project (.claude/) scope. For global-only settings (plugins, theme, TUI mode), see settings.global-only.json",
+    "env": {
+        "BASH_MAX_OUTPUT_LENGTH": "15000",
+        "MAX_MCP_OUTPUT_TOKENS": "12000",
+        "TASK_MAX_OUTPUT_LENGTH": "12000",
+        "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "4",
+        "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "2",
+        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "70"
+    },
     "permissions": {
         "allow": [
             "mcp__codegraph__*"
-        ]
+        ],
+        "defaultMode": "auto"
     },
     "model": "sonnet",
+    "effortLevel": "medium",
+    "advisorModel": "opus",
     "hooks": {
         "PreToolUse": [
             {

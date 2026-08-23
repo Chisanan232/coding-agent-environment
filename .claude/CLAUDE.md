@@ -681,7 +681,7 @@ and summarizing the automated workflow rather than replacing it.
 ## Environment Variable Reference
 
 All hooks and utility scripts source `~/.claude/config.env` at startup.
-Copy `claude-code-config/.claude/hooks/config.env` to `~/.claude/config.env`
+Copy `coding-agent-environment/.claude/hooks/config.env` to `~/.claude/config.env`
 and uncomment the variables you want to override.
 
 | Variable | Default | Purpose |
@@ -706,6 +706,30 @@ and uncomment the variables you want to override.
 | `CLAUDE_STRICT` | `0` | Set to `1` to treat quality_gate warnings (debug statements, unlinked TODOs) as errors that block the next action |
 | `CLAUDE_SESSION_NOTES_DIR` | `~/.claude/session-notes` | Directory for per-ticket Markdown session notes |
 | `CLAUDE_INTEGRATION_TEST_COMMAND` | _(unset)_ | Command to run cross-repo integration tests (cross-repo-coordinator Phase 4) |
+
+---
+
+## Model Routing
+
+- Main model: Sonnet, effort medium, permission mode Auto. This is the default
+  for routine implementation, testing, fixing, tool usage, CI work, and
+  orchestration — do not switch off it for ordinary work.
+- Non-trivial architecture/design/planning (meaningful architecture, significant
+  multi-module changes, migrations, security-sensitive design, important
+  trade-offs, Jira/task decomposition, materially ambiguous requirements):
+  delegate first to the `opus-architect` subagent (`.claude/agents/opus-architect.md`,
+  Opus, high effort). It inspects, designs, and returns a distilled plan.
+  Sonnet then continues execution automatically — do not stop for approval
+  merely because planning finished.
+- Skip `opus-architect` for trivial work: typos, renames, formatting, obvious
+  small fixes, simple tests, dependency bumps, isolated straightforward edits.
+- The `advisorModel` (Opus) is available for important decisions, repeated
+  failures, security/architecture uncertainty, and final review of
+  sufficiently complex work. Use it selectively, not ritualistically on every
+  task.
+- Do not enter interactive Plan Mode solely to obtain Opus planning — that's
+  what `opus-architect` is for. Only stop and ask the user when there is a
+  genuinely necessary human decision.
 
 ---
 

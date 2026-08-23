@@ -161,11 +161,15 @@
                 "figma-developer-mcp",
                 "--figma-api-key=${FIGMA_API_KEY}",
                 "--stdio"
-            ]
+            ],
+            "capabilities": ["design"],
+            "_tier": "always-active"
         },
         "codebase-memory-mcp": {
             "command": "npx",
-            "args": ["-y", "codebase-memory-mcp"]
+            "args": ["-y", "codebase-memory-mcp"],
+            "capabilities": ["codebase_memory"],
+            "_tier": "always-active"
         }
     }
 }
