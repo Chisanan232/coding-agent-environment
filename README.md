@@ -1,8 +1,10 @@
 # coding-agent-environment
 
-Versioned personal configuration for [Claude Code](https://claude.com/claude-code).
-Snapshot of `~/.claude/` — global behavioral policy, hooks, skills, and MCP server
-config — with all secrets redacted to `${ENV_VAR}` placeholders.
+Versioned, portable configuration for [Claude Code](https://claude.com/claude-code)
+and [Codex](https://openai.com/codex/) — global behavioral policy, hooks, skills,
+MCP server config, and status-line/toolchain/profile support — with all secrets
+redacted to `${ENV_VAR}` placeholders. See [docs/ALLOWLIST.md](docs/ALLOWLIST.md)
+for exactly what is and isn't tracked.
 
 ## Prerequisites
 
@@ -12,7 +14,7 @@ This configuration depends on several CLI tools. Install them before use:
 |---|---|---|
 | `rtk` | `cargo install rtk-token-killer` | Token-optimized CLI proxy for dev operations |
 | `codegraph` | See [CodeGraph](#codegraph) section | Codebase knowledge graph for symbol/call-path queries |
-| `codebase-memory-mcp` | `cargo install codebase-memory-mcp` | MCP server for structural code queries |
+| `codebase-memory-mcp` | `npm install -g codebase-memory-mcp` (installed via `npx` in MCP config, no separate global install required) | MCP server for structural code queries |
 | `uvx` | `pip install uv` (provides `uvx`) | Run Python tools without global installs |
 | `direnv` | `brew install direnv` (macOS) | Auto-load secrets from `.envrc` |
 
@@ -33,6 +35,11 @@ tools incrementally as you adopt each capability.
 ├── mcp-servers.runtime.json   # Runtime MCP servers, secrets redacted
 ├── hooks/                     # Workflow / gate shell hooks
 └── skills/                    # Custom skills (SKILL.md each)
+codex/
+├── config.toml                # Portable Codex desired state (see file header for exclusions)
+└── AGENTS.md                  # Global Codex instructions
+docs/
+└── ALLOWLIST.md                # Tracked-file allowlist and runtime/private/generated boundary
 ```
 
 ## Install
@@ -44,6 +51,16 @@ cp .mcp.json ~/.claude/.mcp.json
 cp -R .claude/CLAUDE.md .claude/RTK.md .claude/settings.json \
       .claude/settings.global-only.json .claude/config.env \
       .claude/mcp-servers.runtime.json .claude/hooks .claude/skills ~/.claude/
+```
+
+### Codex
+
+`codex/config.toml` is a curated subset, not a drop-in replacement — merge it
+by hand if you already have machine-specific `[projects.*]`/`[mcp_servers.*]`
+entries in `~/.codex/config.toml`. `codex/AGENTS.md` can be copied directly:
+
+```bash
+cp codex/AGENTS.md ~/.codex/AGENTS.md
 ```
 
 ## MCP servers
