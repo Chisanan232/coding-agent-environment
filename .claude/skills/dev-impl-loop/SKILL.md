@@ -64,7 +64,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
    Record the decision:
    ```bash
    bash ~/.claude/hooks/decision-log.sh record \
-     --ticket "$TICKET" --agent "dev-agent" --skill "dev-impl-loop" \
+     --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
      --phase "0" --decision "proceed" \
      --reason "Circuit closed, branch current, working tree clean"
    ```
@@ -94,7 +94,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
         ```bash
         bash ~/.claude/hooks/circuit-breaker-gate.sh record-failure "$TICKET" 5
         ```
-        If the circuit opens, stop and escalate to `dev-lead-agent`.
+        If the circuit opens, stop and escalate to the engineer.
    e. If relative tests pass after a fix:
       ```bash
       bash ~/.claude/hooks/circuit-breaker-gate.sh record-success "$TICKET"
@@ -113,10 +113,10 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
     ```
 11. If any test fails:
     a. Determine: is the failure in code I changed, or pre-existing?
-    b. Pre-existing failure → document it, report to `dev-lead-agent`, do not fix.
+    b. Pre-existing failure → document it, report to the engineer, do not fix.
        ```bash
        bash ~/.claude/hooks/decision-log.sh record \
-         --ticket "$TICKET" --agent "dev-agent" --skill "dev-impl-loop" \
+         --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
          --phase "2" --decision "escalate" \
          --reason "Pre-existing test failure — not caused by this change" \
          --context "[test name and failure output]"
@@ -131,7 +131,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
     Record decision:
     ```bash
     bash ~/.claude/hooks/decision-log.sh record \
-      --ticket "$TICKET" --agent "dev-agent" --skill "dev-impl-loop" \
+      --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
       --phase "2" --decision "proceed" \
       --reason "Full test suite green" --context "[N passed, 0 failed]"
     ```
@@ -166,7 +166,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
     Record decision:
     ```bash
     bash ~/.claude/hooks/decision-log.sh record \
-      --ticket "$TICKET" --agent "dev-agent" --skill "dev-impl-loop" \
+      --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
       --phase "3" --decision "proceed" \
       --reason "Pre-commit clean; sentinel updated"
     ```
@@ -181,9 +181,9 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
     Record decision:
     ```bash
     bash ~/.claude/hooks/decision-log.sh record \
-      --ticket "$TICKET" --agent "dev-agent" --skill "dev-impl-loop" \
+      --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
       --phase "4" --decision "qa-handoff" \
-      --reason "All phases green; signalling qa-agent for acceptance-validation"
+      --reason "All phases green; running acceptance-validation"
     ```
 17. Post a QA handoff comment on the ticket:
     ```
@@ -210,7 +210,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
        bash ~/.claude/hooks/workflow-state.sh write \
          "$TICKET" "dev-impl-loop" "5" "5" "complete"
        bash ~/.claude/hooks/decision-log.sh record \
-         --ticket "$TICKET" --agent "dev-agent" --skill "dev-impl-loop" \
+         --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
          --phase "5" --decision "open-pr" \
          --reason "QA verdict: ready" --context "[qa-agent verdict summary]"
        ```
@@ -235,7 +235,7 @@ When the circuit breaker trips:
    bash ~/.claude/hooks/workflow-state.sh write \
      "$TICKET" "dev-impl-loop" "[current-step]" "5" "escalated"
    bash ~/.claude/hooks/decision-log.sh record \
-     --ticket "$TICKET" --agent "dev-agent" --skill "dev-impl-loop" \
+     --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
      --phase "[current-phase]" --decision "escalate" \
      --reason "Circuit open after [N] consecutive failures" \
      --context "[last failure output summary]"
