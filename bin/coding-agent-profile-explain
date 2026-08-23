@@ -129,7 +129,7 @@ _explain_text() {
     [[ -n "$RESOLVE_MALFORMED_REASON" ]] && echo "  reason       $RESOLVE_MALFORMED_REASON"
     echo "  ancestors scanned  $RESOLVE_ANCESTORS_SCANNED  (depth cap $MAX_DEPTH)"
     echo ""
-    if (( ${#RESOLVE_SHADOWED[@]:-0} > 0 )); then
+    if (( ${#RESOLVE_SHADOWED[@]} > 0 )); then
         echo "Nested markers"
         for m in "${RESOLVE_SHADOWED[@]}"; do
             local shadowed_parsed
