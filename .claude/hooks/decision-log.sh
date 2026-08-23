@@ -7,7 +7,7 @@
 # Usage:
 #   decision-log.sh record \
 #     --ticket   "PROJ-123"     \
-#     --agent    "dev-agent"    \
+#     --agent    "main-agent"   \
 #     --skill    "dev-impl-loop" \
 #     --phase    "2"            \
 #     --decision "proceed"      \
