@@ -55,7 +55,7 @@ fails in a Node/TypeScript project.
 
 ## Safe-Fix Guidance
 - Never use `--no-verify`. If a hook is persistently broken (e.g., a config
-  error in the hook itself, not the code), report it to `dev-lead-agent`
+  error in the hook itself, not the code), report it to the engineer
   and do not proceed with the commit.
 - If `lint-staged` is configured, run the full linter directly (not via
   lint-staged) to see all violations — lint-staged only checks staged files.

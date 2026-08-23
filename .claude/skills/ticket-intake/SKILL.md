@@ -6,12 +6,12 @@ discussion, document conclusions and reference links back into the ticket,
 and prepare the ticket for decomposition.
 
 ## Type
-Command-like. Invoked by `dev-lead-agent` at the start of a sprint or planning
-cycle, when notified of a new ticket, or explicitly via `/ticket-intake`.
+Command-like. Run at the start of a sprint or planning cycle, when notified
+of a new ticket, or explicitly via `/ticket-intake`.
 
 ## When to use
 - At the start of every sprint or planning session.
-- When `dev-lead-agent` is notified of a newly created ticket.
+- When notified of a newly created ticket.
 - Before running `task-decomposition` on any ticket.
 
 ## When not to use
@@ -65,7 +65,7 @@ already passed through intake.
     ```
     ## Cross-repo scope detected
     Repositories affected: [repo-a], [repo-b]
-    Coordination required: yes — dev-lead-agent will use cross-repo-coordinator
+    Coordination required: yes — will use cross-repo-coordinator
     ```
     Tag the ticket with a `cross-repo` label if the tracker supports it.
     This routes the ticket to `cross-repo-coordinator` in the next phase.
@@ -79,9 +79,9 @@ already passed through intake.
     - Scope is agreed and documented.
     - Cross-repo scope: detected and labelled, or confirmed single-repo.
 17. Transition the ticket state to "Accepted".
-18. Signal `dev-lead-agent` with the routing decision:
-    - Single-repo: invoke `task-decomposition`.
-    - Cross-repo: invoke `cross-repo-coordinator`.
+18. Route based on the scope determined in Phase 3b:
+    - Single-repo: run `task-decomposition`.
+    - Cross-repo: run `cross-repo-coordinator`.
 
 ## Output format
 

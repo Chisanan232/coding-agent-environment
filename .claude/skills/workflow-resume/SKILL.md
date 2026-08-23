@@ -148,4 +148,4 @@ session is interrupted (crash, context limit, manual stop) and needs to continue
 - If the branch was deleted or recreated, treat this as a fresh start and run
   `ticket-pickup-check` again.
 - Do not resume a workflow if the ticket has been reassigned to another developer
-  — report the conflict to `dev-lead-agent`.
+  — report the conflict to the engineer.

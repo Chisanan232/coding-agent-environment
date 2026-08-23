@@ -7,7 +7,7 @@ notify the reporter. All steps are idempotent and checkpointed — if the skill
 is interrupted and re-run, completed steps are skipped safely.
 
 ## Type
-Auto-used. Invoked by `dev-lead-agent` immediately after a PR merge is confirmed.
+Auto-used. Run immediately after a PR merge is confirmed.
 
 ## Do Not Assume
 - Do not assume the PR was actually merged — verify the merge status before acting.
@@ -85,7 +85,7 @@ Before each step, check if it was already completed:
    Set `PR_NUMBER`, `MERGE_SHA`, `MERGED_AT` from the MCP response.
    **Then** initialise the checkpoint path and helper functions (defined above).
 4. If the PR was closed without merging: stop. Do not transition the ticket or
-   delete the branch. Report the closure reason to `dev-lead-agent`.
+   delete the branch. Report the closure reason to the engineer.
 5. Initialise checkpoint:
    ```bash
    _checkpoint_set pr_number "$PR_NUMBER"
@@ -103,14 +103,14 @@ Before each step, check if it was already completed:
    b. Post a close comment on the ticket:
       ```
       Merged via [PR reference] ([merge commit SHA]).
-      All acceptance criteria verified by qa-agent.
+      All acceptance criteria verified via acceptance-validation.
       ```
    c. Mark checkpoint: `_checkpoint_set ticket_closed true`
 9. If no ticket reference is found: log the gap to the decision log and notify
-   `dev-lead-agent`. Do not proceed to branch deletion until resolved.
+   the engineer. Do not proceed to branch deletion until resolved.
    ```bash
    bash ~/.claude/hooks/decision-log.sh record \
-     --ticket "$TICKET" --agent "dev-lead-agent" --skill "post-merge-close" \
+     --ticket "$TICKET" --agent "main-agent" --skill "post-merge-close" \
      --phase "2" --decision "escalate" \
      --reason "No ticket reference found in PR description — cannot auto-close"
    ```
@@ -127,7 +127,7 @@ Before each step, check if it was already completed:
     rm -f .claude/.current-worktree
     ```
     If `git worktree remove` fails (uncommitted changes remain), do not use
-    `--force`. Report to `dev-lead-agent` — all work must be committed before
+    `--force`. Report to the engineer — all work must be committed before
     the worktree is removed.
 12. Delete the remote feature branch (detect the remote name — do not assume `origin`):
     ```bash
@@ -141,7 +141,7 @@ Before each step, check if it was already completed:
     git branch -d [feature-branch-name]
     ```
     If `-d` fails (branch not fully merged in local index), log and skip —
-    do not use `-D`. Report to `dev-lead-agent`.
+    do not use `-D`. Report to the engineer.
 15. Mark checkpoint: `_checkpoint_set branch_deleted true`
 
 ### Phase 4 — Notify reporter
@@ -173,7 +173,7 @@ Before each step, check if it was already completed:
 21. Record decision:
     ```bash
     bash ~/.claude/hooks/decision-log.sh record \
-      --ticket "$TICKET" --agent "dev-lead-agent" --skill "post-merge-close" \
+      --ticket "$TICKET" --agent "main-agent" --skill "post-merge-close" \
       --phase "5" --decision "complete" \
       --reason "Ticket closed, branch deleted, reporter notified" \
       --context "merge SHA: [sha]"
@@ -204,7 +204,7 @@ Before each step, check if it was already completed:
 
 ## Safe-Fix Guidance
 - If the skill fails mid-way, re-run it — completed steps are checkpointed and skipped.
-- Never use `git branch -D` (force delete) — if `-d` fails, report to `dev-lead-agent`.
+- Never use `git branch -D` (force delete) — if `-d` fails, report to the engineer.
 - Do not close a ticket as Done if the PR was reverted — escalate instead.
 - If Slack notification fails, the ticket comment is sufficient — do not block on it.
 - Protected branch delete attempts exit non-zero — treat as a bug, report immediately.

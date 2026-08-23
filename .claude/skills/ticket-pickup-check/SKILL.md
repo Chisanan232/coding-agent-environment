@@ -1,13 +1,13 @@
 # SKILL.md — ticket-pickup-check
 
 ## Purpose
-Before a dev-agent begins any implementation work, verify the target ticket
-is in an acceptable state: correct workflow state ("Accepted"), no unresolved
+Before any implementation work begins, verify the target ticket is in an
+acceptable state: correct workflow state ("Accepted"), no unresolved
 blockers, no assignee conflict. Self-assign the ticket if all checks pass.
 
 ## Type
-Auto-used. Invoked by `dev-agent` as the first action before any implementation
-task. Must pass before `dev-impl-loop` begins.
+Auto-used. Run as the first action before any implementation task. Must
+pass before `dev-impl-loop` begins.
 
 ## Do Not Assume
 - Do not assume a ticket is ready just because it was handed to you.
@@ -23,7 +23,7 @@ task. Must pass before `dev-impl-loop` begins.
 2. Acceptable states: "Accepted", "Ready for Dev", "In Sprint".
 3. Unacceptable states: "New", "Open", "Backlog", "Blocked", "In Review", "Done", "Closed".
 4. If the state is not acceptable: **stop immediately**.
-   - Report to `dev-lead-agent` with the current state.
+   - Report to the engineer with the current state.
    - Do not begin implementation.
 
 ### Check 2 — Blocking dependencies
@@ -31,13 +31,13 @@ task. Must pass before `dev-impl-loop` begins.
 6. For each linked blocker ticket, check its current state.
 7. If any blocker is not "Done" or "Closed": **stop immediately**.
    - List the specific blocking tickets and their states.
-   - Report to `dev-lead-agent` to resolve the dependency.
+   - Report to the engineer to resolve the dependency.
 
 ### Check 3 — Assignee conflict
 8. Read the ticket's current assignee field.
-9. If the ticket is assigned to a named developer or another agent:
+9. If the ticket is assigned to a named developer or another session:
    - **Stop immediately.** Do not pick up a ticket already owned by someone else.
-   - Report the conflict to `dev-lead-agent`.
+   - Report the conflict to the engineer.
 10. If the ticket is unassigned: proceed to Check 4.
 
 ### Check 4 — Branch, worktree, self-assign, and state transition
@@ -71,11 +71,11 @@ task. Must pass before `dev-impl-loop` begins.
     # git worktree add "$WORKTREE_PATH" "$BRANCH_NAME"
     ```
 
-13. Assign the ticket to the current agent session / developer identity.
+13. Assign the ticket to the current session / developer identity.
 14. Transition the ticket state to "In Progress".
 15. Post a brief start comment on the ticket:
     ```
-    Starting implementation — dev-agent session [timestamp].
+    Starting implementation — session [timestamp].
     Branch: [branch-name]
     Worktree: [worktree-path]
     ```
@@ -128,7 +128,7 @@ task. Must pass before `dev-impl-loop` begins.
 ### Decision
 - Proceed with implementation: yes / no
 - Reason (if no): [reason]
-- Next action (if no): escalate to dev-lead-agent
+- Next action (if no): escalate to the engineer
 ```
 
 ## Ticket context resolution (for all skills)
@@ -157,9 +157,9 @@ state, not source code.
 - Never bypass the state check — implementing a "New" or "Backlog" ticket
   skips intake and decomposition, producing unreviewed work.
 - If the assignee field shows a stale assignment (inactive user, old session),
-  escalate to `dev-lead-agent` to resolve before self-assigning.
-- If two parallel dev-agent instances attempt the same ticket simultaneously,
-  the one that loses the assignee race must stop and report the conflict.
+  escalate to the engineer to resolve before self-assigning.
+- If two parallel sessions attempt the same ticket simultaneously, the one
+  that loses the assignee race must stop and report the conflict.
 - If the worktree path already exists (resumed session), use
   `git worktree add "$WORKTREE_PATH" "$BRANCH_NAME"` (without `-b`) to
   reattach to the existing branch without recreating it.
