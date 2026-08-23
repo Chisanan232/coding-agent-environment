@@ -17,6 +17,16 @@
     "model": "sonnet",
     "effortLevel": "medium",
     "advisorModel": "opus",
+    "statusLine": {
+        "type": "command",
+        "command": "python3 ~/.claude/statusline.py",
+        "padding": 1,
+        "refreshInterval": 3
+    },
+    "subagentStatusLine": {
+        "type": "command",
+        "command": "python3 ~/.claude/subagent-statusline.py"
+    },
     "hooks": {
         "PreToolUse": [
             {
@@ -35,6 +45,40 @@
                         "type": "command",
                         "command": "~/.claude/hooks/cbm-code-discovery-gate",
                         "timeout": 5
+                    }
+                ]
+            }
+        ],
+        "PostToolUse": [
+            {
+                "matcher": "Bash|Monitor|Workflow",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "python3 ~/.claude/hooks/bg-track.py",
+                        "timeout": 3
+                    }
+                ]
+            }
+        ],
+        "SubagentStart": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "python3 ~/.claude/hooks/bg-track.py",
+                        "timeout": 3
+                    }
+                ]
+            }
+        ],
+        "SubagentStop": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "python3 ~/.claude/hooks/bg-track.py",
+                        "timeout": 3
                     }
                 ]
             }

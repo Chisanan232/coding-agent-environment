@@ -32,6 +32,18 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 - Real credentials of any kind — tracked config uses `${ENV_VAR}` placeholders only
 - `.claude/settings.local.json` — session-scoped local permission grants
 
+## Status-line dependency closure
+
+`.claude/statusline.py`, `.claude/subagent-statusline.py`, and
+`.claude/hooks/bg-track.py` depend only on: `python3` (stdlib only, no pip
+packages), and via `subprocess` — `git`, `df`, `sysctl`, `vm_stat` — all
+base macOS/POSIX tools, not separately declared anywhere. Every subprocess
+call has a sub-second timeout; failures are swallowed and the segment is
+omitted, never blocking the prompt. `statusline.py`'s optional caveman-mode
+badge reads a path under `~/.claude/plugins/cache/...` (plugin cache,
+intentionally untracked, machine/install-specific) — gated by `os.access`,
+degrades to omitted if absent, on any machine without that plugin.
+
 ## Precedence (informal — see SPE-74 for the formal directory-profile model)
 
 1. Global (`~/.claude/`, `~/.codex/`)

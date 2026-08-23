@@ -33,7 +33,9 @@ tools incrementally as you adopt each capability.
 ├── settings.global-only.json  # Settings that only take effect in ~/.claude/ (plugins, theme, TUI)
 ├── config.env                 # Hook env overrides (gate toggles)
 ├── mcp-servers.runtime.json   # Runtime MCP servers, secrets redacted
-├── hooks/                     # Workflow / gate shell hooks
+├── statusline.py              # Status line (2 rows + optional background-task row)
+├── subagent-statusline.py     # Custom per-subagent status line rows
+├── hooks/                     # Workflow / gate shell hooks (includes bg-track.py, statusline's data source)
 └── skills/                    # Custom skills (SKILL.md each)
 codex/
 ├── config.toml                # Portable Codex desired state (see file header for exclusions)
@@ -50,7 +52,8 @@ Copy into your home config (review first):
 cp .mcp.json ~/.claude/.mcp.json
 cp -R .claude/CLAUDE.md .claude/RTK.md .claude/settings.json \
       .claude/settings.global-only.json .claude/config.env \
-      .claude/mcp-servers.runtime.json .claude/hooks .claude/skills ~/.claude/
+      .claude/mcp-servers.runtime.json .claude/statusline.py \
+      .claude/subagent-statusline.py .claude/hooks .claude/skills ~/.claude/
 ```
 
 ### Codex
