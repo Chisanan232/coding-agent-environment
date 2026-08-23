@@ -198,13 +198,13 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
     ### Known edge cases or concerns
     - [any area that needs extra attention during QA]
 
-    Requesting qa-agent to begin acceptance-validation.
+    Running acceptance-validation next.
     ```
-18. **Explicitly signal `qa-agent`** to begin `acceptance-validation`.
-    Do not proceed until the qa-agent verdict arrives.
+18. **Run the `acceptance-validation` skill** now, from an external tester
+    perspective. Do not proceed until it produces a verdict.
 
 ### Phase 5 — Post-QA resolution
-19. If qa-agent verdict is "ready":
+19. If the acceptance-validation verdict is "ready":
     a. Update workflow state: step 5 of 5, status "complete".
        ```bash
        bash ~/.claude/hooks/workflow-state.sh write \
@@ -212,16 +212,16 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
        bash ~/.claude/hooks/decision-log.sh record \
          --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
          --phase "5" --decision "open-pr" \
-         --reason "QA verdict: ready" --context "[qa-agent verdict summary]"
+         --reason "QA verdict: ready" --context "[acceptance-validation verdict summary]"
        ```
     b. Open a PR using `code-review-prep` and `pr-readiness` skills.
     c. Link the PR to the ticket.
-20. If qa-agent verdict is "blocked":
+20. If the acceptance-validation verdict is "blocked":
     a. Read the blocking items from the verdict output.
     b. Re-enter the Phase 1 implementation loop to address each item.
        Circuit breaker applies — max attempts before escalating.
     c. After fixes: re-run Phase 2 (full suite) and Phase 3 (pre-commit)
-       before signaling QA again.
+       before re-running acceptance-validation.
 
 ## Circuit breaker thresholds
 - Phase 1 (relative tests): max **5 consecutive failures** or **60 min** elapsed.
@@ -246,7 +246,7 @@ When the circuit breaker trips:
      "Circuit breaker tripped" \
      "Phase [current-phase] hit [N] consecutive failures. Last error: [summary]. Awaiting engineer reset."
    ```
-4. Report to `dev-lead-agent` with the failure summary and ticket reference.
+4. Report to the engineer with the failure summary and ticket reference.
 5. Do not retry until the engineer resets the breaker:
    `bash ~/.claude/hooks/circuit-breaker-gate.sh reset $TICKET`
 
@@ -255,7 +255,7 @@ On successful completion: PR opened, linked to ticket, workflow state = complete
 
 ## Safe-Fix Guidance
 - Do not skip Phase 2 (full suite) even if Phase 1 relative tests are green.
-- Do not open the PR before qa-agent produces a "ready" verdict.
+- Do not open the PR before acceptance-validation produces a "ready" verdict.
 - Do not mark work complete while the circuit breaker is open.
 - If the implementation loop exits without all acceptance criteria met, that is a
-  decomposition problem — escalate to `dev-lead-agent`.
+  decomposition problem — escalate to the engineer.
