@@ -19,7 +19,11 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 | `.claude/skills/` | Custom skills (`SKILL.md` each) |
 | `codex/config.toml` | Curated portable subset of `~/.codex/config.toml` (see file header for exclusions) |
 | `codex/AGENTS.md` | Global Codex instructions (generic, no machine-specific content) |
-| `scripts/check.sh`, `scripts/install.sh` | Bootstrap/diagnosis, prerequisite install |
+| `scripts/check.sh`, `scripts/install.sh`, `scripts/profile-install.sh` | Bootstrap/diagnosis, prerequisite install, profile setup |
+| `mise.toml`, `Brewfile` | Declarative CLI toolchain (see `docs/TOOLCHAIN.md`) |
+| `bin/coding-agent-profile`, `bin/coding-agent-profile-explain`, `bin/ca-claude`, `bin/ca-codex` | Directory-scoped profile resolver + launchers (see `docs/PROFILES.md`) |
+| `profiles/example-profile/` | Generic profile overlay template — never a real overlay |
+| `tests/` | Test suite (profile resolver) |
 | `README.md`, `docs/` | Install/onboarding/architecture docs |
 
 ## Never tracked (runtime/private/generated)
@@ -31,6 +35,8 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 - Plugin caches (`**/plugins/`)
 - Real credentials of any kind — tracked config uses `${ENV_VAR}` placeholders only
 - `.claude/settings.local.json` — session-scoped local permission grants
+- `~/.coding-agent-profiles/` — real profile overlays (company names, endpoints, actual MCP servers/instructions); only `profiles/example-profile/`'s generic template is tracked
+- `~/.codex/<profile-name>.config.toml` — generated symlink, materialized by `scripts/profile-install.sh`
 
 ## Status-line dependency closure
 
@@ -44,9 +50,23 @@ badge reads a path under `~/.claude/plugins/cache/...` (plugin cache,
 intentionally untracked, machine/install-specific) — gated by `os.access`,
 degrades to omitted if absent, on any machine without that plugin.
 
-## Precedence (informal — see SPE-74 for the formal directory-profile model)
+## Precedence
 
-1. Global (`~/.claude/`, `~/.codex/`)
-2. Directory-scoped profile overlay (SPE-74, not yet implemented)
-3. Project (`<repo>/.claude/`)
-4. Local/private overrides (untracked)
+Validated Claude Code settings cascade, low → high (see `docs/PROFILES.md`
+for how this was confirmed against the installed binary):
+
+```
+userSettings < projectSettings < localSettings < flagSettings (--settings, via ca-claude) < policySettings (managed)
+```
+
+Codex precedence (validated via `codex debug prompt-input`):
+
+```
+project .codex/config.toml < --profile toml (via ca-codex) < -c session flags < managed config
+```
+
+Directory-scoped profiles overlay via `--settings`/`--mcp-config` (Claude)
+and `--profile` (Codex) — see `docs/PROFILES.md` for the full design,
+including the Tier A (plain invocation: ancestor instructions + direnv
+only) vs Tier B (`ca-claude`/`ca-codex`: full overlay) split, and why
+managed/policy settings can never be bypassed by a profile.

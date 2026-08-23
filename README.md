@@ -47,9 +47,20 @@ Brewfile                       # macOS system packages (jq)
 codex/
 ├── config.toml                # Portable Codex desired state (see file header for exclusions)
 └── AGENTS.md                  # Global Codex instructions
+bin/
+├── coding-agent-profile        # Directory-scoped profile resolver + --explain
+├── coding-agent-profile-explain
+├── ca-claude                   # Profile-aware `claude` launcher
+└── ca-codex                    # Profile-aware `codex` launcher
+profiles/example-profile/       # Generic profile overlay template (copy, don't commit a real one)
+scripts/
+└── profile-install.sh          # Symlinks bin/ + materializes Codex profile configs
+tests/
+└── test-profile-resolver.sh    # 13-case / 31-assertion offline test suite
 docs/
 ├── ALLOWLIST.md                # Tracked-file allowlist and runtime/private/generated boundary
-└── TOOLCHAIN.md                # mise/Brewfile split, what's intentionally excluded and why
+├── TOOLCHAIN.md                # mise/Brewfile split, what's intentionally excluded and why
+└── PROFILES.md                 # Directory-scoped profile design, precedence, setup
 ```
 
 ## Install
@@ -172,6 +183,22 @@ Claude Code reads configuration from two locations with a defined precedence:
 
 **Tip**: Keep global config minimal and stable. Use project config for
 repo-specific overrides and experimental settings.
+
+## Directory-Scoped Profiles
+
+Every session launched anywhere under a configured filesystem subtree can
+inherit that subtree's profile — independent of Git repo boundaries, e.g.
+`/work/company-a/**/*` vs `/work/company-b/**/*`. See
+[docs/PROFILES.md](docs/PROFILES.md) for the full design (marker grammar,
+precedence, Claude/Codex integration, `--explain` diagnostics). Quick start:
+
+```bash
+cp -R profiles/example-profile ~/.coding-agent-profiles/<name>
+# edit the copy, then:
+./scripts/profile-install.sh
+cd /path/to/subtree && echo "<name>" > .coding-agent-profile
+coding-agent-profile explain
+```
 
 ## Secrets Management
 

@@ -41,4 +41,4 @@ overlay to this public repo; keep it in a private location. See
    `/work/company-a/.coding-agent-profile`.
 5. Run `scripts/profile-install.sh` to link the launchers and materialize
    the Codex symlink.
-6. Verify: `cd /work/company-a && coding-agent-profile --explain`.
+6. Verify: `cd /work/company-a && coding-agent-profile explain`.
