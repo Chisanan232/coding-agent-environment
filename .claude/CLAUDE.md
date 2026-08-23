@@ -332,7 +332,7 @@ what is configured. The following capability categories may be available:
 | `coverage_reporting` | Codecov coverage trends | Coverage regression detection |
 | `observability` | Datadog, Sentry alerts, logs | Incident triage |
 | `knowledge_search` | Confluence, Notion, internal docs | Architecture lookups |
-| `browser_automation` | Playwright UI interaction | Web UI acceptance testing (qa-agent) |
+| `browser_automation` | Playwright UI interaction | Web UI acceptance testing |
 
 When an MCP-backed capability is available for a task, prefer it over manual
 approximation. When it is not available, proceed without it and note the gap.
@@ -352,8 +352,9 @@ Claude Code may run recurring tasks using the `CronCreate` tool or manual period
 ### Default rule
 
 - Wake a **skill** for narrow, scoped checks (PR health, bot PR maintenance, pipeline state).
-- Wake **`dev-lead-agent`** only when strategic re-planning or multi-step coordination
-  is needed as a result of what the polling found.
+- Handle strategic re-planning or multi-step coordination directly in the main
+  agent only when the polling result actually needs it — delegate to
+  `opus-architect` only if that re-planning is itself non-trivial.
 
 ### Primary recurring automation targets
 
@@ -378,9 +379,10 @@ Use the `CronCreate` tool to schedule recurring skill invocations:
 
 Alternatively, invoke skills manually at the polling intervals listed above.
 
-Do not schedule a full agent (`dev-lead-agent`) for routine polling.
-Agents are stateful and expensive to wake repeatedly — use them only when
-the skill's output indicates a decision or coordination is needed.
+Do not schedule a full sub-agent for routine polling. Sub-agents are
+stateful and expensive to wake repeatedly — use one only when the skill's
+output indicates a decision or coordination genuinely needs isolated
+context or stronger reasoning (see Delegation Model above).
 
 ### Loop safety rules
 
@@ -399,13 +401,13 @@ asking Claude Code to run the named procedure.
 |---|---|---|
 | `ticket-intake` | Auto | When a new ticket arrives — before decomposition |
 | `task-decomposition` | Auto | After ticket-intake marks a ticket Accepted |
-| `ticket-pickup-check` | Auto | Before dev-agent begins any implementation task |
+| `ticket-pickup-check` | Auto | Before starting any implementation task |
 | `dev-impl-loop` | Auto | Drives the full implement→test→QA→PR cycle |
 | `feature-implementation` | Auto | Within dev-impl-loop: when implementing a feature |
 | `test-design` | Auto | When designing tests for new or changed code |
 | `code-review-prep` | Auto | Before opening a PR |
 | `ci-failure-triage` | Auto | When CI is red |
-| `acceptance-validation` | Auto | Before declaring implementation complete (qa-agent) |
+| `acceptance-validation` | Auto | Before declaring implementation complete |
 | `bot-pr-maintainer` | Auto | When a bot PR is classified as clean or conflicted |
 | `pr-feedback-response` | Auto | When a PR has new review comments or Request Changes |
 | `post-merge-close` | Auto | After a PR is merged — close ticket, delete branch |
@@ -469,8 +471,9 @@ If any condition is not met, do not merge. Wait, fix, or escalate.
 
 ### Who may trigger auto-merge
 
-- `dev-lead-agent` is the only agent that may approve merge decisions.
-- `dev-agent` and `qa-agent` must not independently trigger merges.
+- The main agent may approve merge decisions once all conditions above are met.
+- A sub-agent spawned for isolated review/verification must not independently
+  trigger a merge — it reports findings back to the main agent.
 - Engineer may override and merge manually at any time.
 
 ### Merge strategy
@@ -515,8 +518,8 @@ If a bot PR has CI failure after rebase:
 
 ### Bot PR oversight
 
-The `bot-pr-maintainer` skill and `pr-health-check` skill manage this loop.
-`dev-lead-agent` coordinates bot PR state at each polling interval.
+The `bot-pr-maintainer` skill and `pr-health-check` skill manage this loop;
+the main agent coordinates bot PR state at each polling interval.
 
 ---
 
@@ -540,8 +543,11 @@ Claude Code must not push to any remote branch unless all of the following are t
 
 ### What gates the push
 
-The `full-test-gate.sh` and `precommit-gate.sh` hooks enforce this automatically.
-If either hook fails, the push is blocked. Fix the failure — do not use `--no-verify`.
+`full-test-gate.sh` and `precommit-gate.sh` implement these checks. They are
+not currently wired as `settings.json` hooks in this repository — run them
+manually before pushing (`bash .claude/hooks/full-test-gate.sh`,
+`bash .claude/hooks/precommit-gate.sh`) until/unless a project wires them as
+a `PreToolUse`/`Stop` hook. Fix the failure — do not use `--no-verify`.
 
 ---
 
@@ -666,8 +672,9 @@ and preparatory**, not operational.
 
 ### Release coordination
 
-`release-agent` handles release observation. It is thin by design — it does not
-replace the automated workflow, it monitors and summarizes it.
+Release observation is handled directly by the main agent via the
+`release-watch`/`release-preparation` skills — thin by design, monitoring
+and summarizing the automated workflow rather than replacing it.
 
 ---
 
@@ -702,37 +709,29 @@ and uncomment the variables you want to override.
 
 ---
 
-## Agent Delegation Model
+## Delegation Model
 
-Claude Code may invoke specialized sub-agents for complex multi-step tasks.
-Each agent has a defined scope. Do not conflate responsibilities across agents.
+Delegation is capability/reasoning-based, not role-based. The main agent
+(Sonnet, medium effort, Auto) executes routine work directly — planning,
+implementation, testing, CI repair, merge decisions, release observation.
+There is no fixed organizational-role roster (no `dev-agent`/`qa-agent`/
+`dev-lead-agent`/`release-agent` split) and no required hand-off between
+agent "roles" to move a piece of work forward.
 
-### Agent roster
+Spawn an isolated sub-agent only when one of these is genuinely true:
 
-| Agent | File | Primary scope |
-|---|---|---|
-| `dev-lead-agent` | `.claude/agents/dev-lead-agent.md` | Planning, decomposition, PR decisions, coordination |
-| `dev-agent` | `.claude/agents/dev-agent.md` | Code implementation, test writing, local validation |
-| `qa-agent` | `.claude/agents/qa-agent.md` | Acceptance validation, regression checks, edge cases |
-| `release-agent` | `.claude/agents/release-agent.md` | Release observation, notes, outcome summary |
+1. **Stronger reasoning helps.** Non-trivial architecture/design/planning —
+   delegate to `opus-architect` (Opus, high effort). See Model Routing above.
+2. **Isolated context reduces noise.** A broad read-only search/audit that
+   would otherwise bloat the main context — use a general-purpose or
+   `Explore`-type agent, tools restricted to what the task needs.
+3. **Independent verification benefits from a fresh perspective.** A
+   separate read-only review/QA pass while the main lane keeps working.
+4. **Genuine parallelism** — two provably independent pieces of work that
+   don't touch overlapping files/state.
 
-### Delegation rules
-
-1. `dev-lead-agent` is the orchestrator. It decomposes tasks, assigns work to other
-   agents, reviews PRs, and makes merge decisions.
-2. `dev-agent` implements. It must not make merge decisions or orchestration choices.
-3. `qa-agent` validates from an external tester perspective. It must not implement.
-4. `release-agent` observes and summarizes. It must not trigger releases directly.
-5. When no agent delegation is needed (simple focused tasks), Claude Code acts directly.
-6. Never collapse all responsibilities into a single agent invocation.
-
-### When to wake each agent
-
-- **`dev-lead-agent`**: when a ticket arrives, when a PR needs review, when strategic
-  re-planning is required, when coordinating bot PR maintenance.
-- **`dev-agent`**: when implementation, test writing, or focused CI repair is needed.
-- **`qa-agent`**: when acceptance criteria must be verified, before a PR is merged.
-- **`release-agent`**: when a release window opens or the release pipeline needs monitoring.
+Do not invent new fixed role names as a substitute for the old roster.
+When none of the above applies, do the work directly.
 
 ---
 
@@ -852,7 +851,7 @@ bash ~/.claude/hooks/circuit-breaker-gate.sh reset <ticket>
 
 1. Stop the repair loop immediately.
 2. Write workflow state as `circuit_open`.
-3. Report to `dev-lead-agent` with the failure summary and the ticket reference.
+3. Report the failure summary and ticket reference back to the engineer.
 4. Do not attempt further repairs until the engineer reviews the situation
    and resets the breaker.
 

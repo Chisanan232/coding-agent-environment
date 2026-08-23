@@ -127,5 +127,4 @@ Auto-used. Claude Code invokes this skill when <tool> reports errors.
 ### Registering a new skill
 
 After creating a new skill, add it to the **Language-Specific Repair Skills**
-section in your project's `.claude/CLAUDE.md` and to the `dev-agent.md`
-language-specific skills table.
+section in your project's `.claude/CLAUDE.md`.
