@@ -1,0 +1,19 @@
+# gitleaks config for this repo. Extends the default ruleset; the only
+# customization is allowlisting the literal placeholder/example values that
+# intentionally look secret-shaped so they don't produce noise.
+title = "coding-agent-environment gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Intentional placeholders and generic examples, never real credentials"
+regexes = [
+  '''\$\{[A-Z_]+\}''',                 # ${ENV_VAR} placeholders used throughout .mcp.json, codex/config.toml, etc.
+  '''sk-ant-\.\.\.''',                 # README's illustrative "sk-ant-..." example
+  '''ghp_\.\.\.''',                    # README's illustrative "ghp_..." example
+  '''figd_[A-Za-z0-9_-]*EXAMPLE''',    # reserved pattern for any future redacted-figma-key fixture
+]
+paths = [
+  '''(^|/)tests/fixtures/''',          # test fixtures never contain real credentials by design
+]
