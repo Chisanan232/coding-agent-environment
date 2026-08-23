@@ -35,3 +35,7 @@
 .DS_Store
 .claude/settings.local.json
 **/__pycache__/
+
+# Real directory-scoped profile overlays (company names, endpoints,
+# instructions) — never committed. Only profiles/example-profile/ ships.
+.coding-agent-profiles/

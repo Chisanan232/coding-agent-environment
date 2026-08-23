@@ -308,6 +308,87 @@ check_mcp_json() {
     fi
 }
 
+check_profile_resolver() {
+    local repo_root
+    repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+    local bin_ok=true
+    for tool in coding-agent-profile coding-agent-profile-explain ca-claude ca-codex; do
+        if ! command -v "$tool" &>/dev/null; then
+            bin_ok=false
+        fi
+    done
+
+    local profile_dir="${CODING_AGENT_PROFILE_DIR:-$HOME/.coding-agent-profiles}"
+    local profile_dir_exists=false
+    [[ -d "$profile_dir" ]] && profile_dir_exists=true
+
+    if [[ "$bin_ok" == "true" ]]; then
+        print_status "ok" "profile resolver: ca-claude/ca-codex/coding-agent-profile on PATH"
+    else
+        print_status "info" "profile resolver: not on PATH (run scripts/profile-install.sh if you use directory-scoped profiles)"
+    fi
+
+    if [[ "$profile_dir_exists" == "true" ]]; then
+        local codex_home="${CODEX_HOME:-$HOME/.codex}"
+        local stale=0 checked=0
+        for dir in "$profile_dir"/*/; do
+            [[ -d "$dir" ]] || continue
+            local name
+            name="$(basename "$dir")"
+            [[ -f "$dir/codex/config.toml" ]] || continue
+            checked=$((checked + 1))
+            local link="$codex_home/$name.config.toml"
+            if [[ -L "$link" ]]; then
+                local target
+                target="$(readlink "$link")"
+                [[ "$target" == "$dir"config.toml || "$target" == "${dir%/}/codex/config.toml" ]] || stale=$((stale + 1))
+            else
+                stale=$((stale + 1))
+            fi
+        done
+        if [[ "$stale" -gt 0 ]]; then
+            print_status "warn" "profile resolver: $stale of $checked Codex profile symlink(s) missing/stale — rerun scripts/profile-install.sh"
+            add_issue "profile:codex_symlink:stale"
+        else
+            print_status "ok" "profile resolver: $checked Codex profile symlink(s) healthy"
+        fi
+        CONFIG_RESULTS["profile_resolver"]='{"bin_on_path": '"$bin_ok"', "profile_dir_exists": true, "codex_symlinks_checked": '"$checked"', "codex_symlinks_stale": '"$stale"'}'
+    else
+        print_status "info" "profile resolver: $profile_dir does not exist (no profiles configured — see docs/PROFILES.md)"
+        CONFIG_RESULTS["profile_resolver"]='{"bin_on_path": '"$bin_ok"', "profile_dir_exists": false}'
+    fi
+}
+
+check_settings_precedence() {
+    # The directory-profile system (docs/PROFILES.md) relies on the observed
+    # Claude Code settings cascade (userSettings < projectSettings <
+    # localSettings < flagSettings < policySettings) staying true. This is
+    # NOT a published contract — a CLI upgrade could silently change it,
+    # which would break the safety property that managed/policy settings
+    # always win over a profile overlay. Best-effort string check against
+    # the installed binary; absence is a loud warning, not a hard failure.
+    local claude_bin
+    claude_bin="$(command -v claude 2>/dev/null || true)"
+    if [[ -z "$claude_bin" ]]; then
+        print_status "info" "settings precedence: claude not on PATH, skipping"
+        CONFIG_RESULTS["settings_precedence"]='{"checked": false, "reason": "claude not on PATH"}'
+        return
+    fi
+    # Subshell with pipefail off: `grep -q` closes the pipe as soon as it
+    # matches, which SIGPIPEs `strings` — under the script's global
+    # `set -o pipefail` that non-zero SIGPIPE exit status wins even though
+    # grep itself matched, silently flipping a true positive to a false
+    # negative. Isolate that here rather than disabling pipefail globally.
+    if (set +o pipefail; strings -a "$claude_bin" 2>/dev/null | grep -qi "policySettings"); then
+        print_status "ok" "settings precedence: installed claude binary still references policySettings (managed-config layer present)"
+        CONFIG_RESULTS["settings_precedence"]='{"checked": true, "policy_layer_present": true}'
+    else
+        print_status "warn" "settings precedence: installed claude binary has no 'policySettings' string — the assumed managed-config precedence used by docs/PROFILES.md could not be confirmed. Re-verify before trusting profile overlays not to bypass managed policy."
+        CONFIG_RESULTS["settings_precedence"]='{"checked": true, "policy_layer_present": false}'
+        add_issue "profile:settings_precedence:unconfirmed"
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # Environment variable checking functions
 # -----------------------------------------------------------------------------
@@ -479,6 +560,8 @@ main() {
     human_print "Configuration Files:"
     check_settings_json
     check_mcp_json
+    check_profile_resolver
+    check_settings_precedence
     human_print ""
 
     # Check environment variables

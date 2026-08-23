@@ -1,0 +1,4 @@
+{
+    "_note": "Example profile MCP overlay — applied via `ca-claude --mcp-config`. Secrets by ${ENV_VAR} reference only, same rule as this repo's own .mcp.json.",
+    "mcpServers": {}
+}

@@ -1,0 +1,7 @@
+# Example profile Codex overlay — applied via `codex --profile example-profile`
+# (installed by scripts/profile-install.sh as ~/.codex/example-profile.config.toml).
+# Only include keys you actually want to override; this table beats project
+# .codex/config.toml but loses to -c session flags and any managed config
+# (validated against installed Codex 0.147.0 — see docs/PROFILES.md).
+
+model_reasoning_effort = "medium"

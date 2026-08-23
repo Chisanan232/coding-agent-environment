@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# ca-claude - launches Claude Code with the resolved directory-scoped profile
+# overlaid via native flags (--settings/--mcp-config/--strict-mcp-config/
+# --append-system-prompt-file). Never shadows `claude` itself — resolves the
+# real binary by absolute path and refuses to exec itself.
+#
+# Tier B: settings/MCP/status-line/profile overlay. Tier A (ancestor
+# CLAUDE.md, direnv env) already applies to plain `claude` too — see
+# docs/PROFILES.md.
+#
+# CA_DRY_RUN=1: print the resolved argv instead of exec'ing, exit 0.
+set -euo pipefail
+
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+if [[ -z "$CLAUDE_BIN" ]]; then
+    echo "ca-claude: 'claude' not found on PATH" >&2
+    exit 1
+fi
+# Recursion guard: if PATH resolution somehow points back at this wrapper
+# (e.g. this dir was accidentally named `claude` on PATH), refuse.
+if [[ "$(basename -- "$CLAUDE_BIN")" == "ca-claude" || "$CLAUDE_BIN" == "${BASH_SOURCE[0]}" ]]; then
+    echo "ca-claude: refusing to exec — PATH resolves 'claude' back to this wrapper" >&2
+    exit 1
+fi
+
+# Resolve the profile using the same logic as coding-agent-profile resolve.
+eval "$("$HERE/coding-agent-profile" __internal_resolve_env 2>/dev/null || true)"
+
+declare -a ARGS=()
+
+if [[ "${CAP_STATUS:-none}" == "ok" ]]; then
+    if [[ -f "$CAP_OVERLAY/claude/settings.json" ]]; then
+        ARGS+=(--settings "$CAP_OVERLAY/claude/settings.json")
+    fi
+    if [[ -f "$CAP_OVERLAY/claude/mcp.json" ]]; then
+        ARGS+=(--mcp-config "$CAP_OVERLAY/claude/mcp.json")
+    fi
+    if [[ -f "$CAP_OVERLAY/claude/strict-mcp" ]]; then
+        ARGS+=(--strict-mcp-config)
+    fi
+    # Instruction channel is single-valued: only inject the overlay
+    # CLAUDE.md via the fallback flag if the profile root does NOT already
+    # have one (that one loads natively via Claude's ancestor walk).
+    if [[ ! -f "$CAP_ROOT/CLAUDE.md" && -f "$CAP_OVERLAY/claude/CLAUDE.md" ]]; then
+        ARGS+=(--append-system-prompt-file "$CAP_OVERLAY/claude/CLAUDE.md")
+    fi
+fi
+
+if [[ "${CA_DRY_RUN:-0}" == "1" ]]; then
+    printf '%s\n' "$CLAUDE_BIN" "${ARGS[@]+"${ARGS[@]}"}" "$@"
+    exit 0
+fi
+
+exec "$CLAUDE_BIN" "${ARGS[@]+"${ARGS[@]}"}" "$@"

@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# coding-agent-profile-explain - sourced by bin/coding-agent-profile for the
+# `explain` subcommand. Never prints secret/env VALUES, only names.
+# shellcheck shell=bash
+
+# env var name -> "set" or "unset", never the value
+_env_state() {
+    local name="$1"
+    if [[ -n "${!name+x}" ]]; then echo "set"; else echo "unset"; fi
+}
+
+# read a profile.env "required:" list (one name per line after that marker),
+# print "NAME=state" pairs. Format: lines before a line literally "required:"
+# are KEY=VALUE (ignored here, values never printed); lines after are bare
+# variable names to report readiness for.
+_profile_required_vars() {
+    local envfile="$1"
+    [[ -f "$envfile" ]] || return 0
+    local in_required=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "required:" ]]; then
+            in_required=1
+            continue
+        fi
+        (( in_required )) || continue
+        [[ -z "$line" ]] && continue
+        printf '%s=%s\n' "$line" "$(_env_state "$line")"
+    done < "$envfile"
+}
+
+_settings_cascade_present() {
+    # Best-effort presence check for the informational cascade list. Order
+    # mirrors the validated Claude Code precedence (low -> high):
+    # userSettings < projectSettings < localSettings < flagSettings < policySettings
+    local user="$HOME/.claude/settings.json"
+    local project="$PWD/.claude/settings.json"
+    local local_s="$PWD/.claude/settings.local.json"
+    printf 'userSettings\t%s\t%s\n' "$user" "$([[ -f "$user" ]] && echo present || echo absent)"
+    printf 'projectSettings\t%s\t%s\n' "$project" "$([[ -f "$project" ]] && echo present || echo absent)"
+    printf 'localSettings\t%s\t%s\n' "$local_s" "$([[ -f "$local_s" ]] && echo present || echo absent)"
+}
+
+cmd_explain() {
+    local json=0 cwd_arg=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=1; shift ;;
+            --cwd) cwd_arg="$2"; shift 2 ;;
+            *) err "unknown option: $1"; exit 2 ;;
+        esac
+    done
+
+    local logical="${cwd_arg:-$PWD}"
+    local cwd
+    cwd="$(physical_path "$logical")"
+
+    set +e
+    resolve "$cwd"
+    local rc=$?
+    set -e
+
+    local claude_bin codex_bin
+    claude_bin="$(command -v claude 2>/dev/null || true)"
+    codex_bin="$(command -v codex 2>/dev/null || true)"
+    local ca_claude_on_path ca_codex_on_path
+    ca_claude_on_path="$(command -v ca-claude 2>/dev/null || true)"
+    ca_codex_on_path="$(command -v ca-codex 2>/dev/null || true)"
+
+    local direnv_installed="no" direnv_hooked="unknown"
+    command -v direnv >/dev/null 2>&1 && direnv_installed="yes"
+
+    local instr_active="" instr_suppressed=""
+    local claude_settings="" claude_mcp="" strict="off"
+    local codex_profile_toml="" codex_symlink_ok="unknown"
+
+    if [[ "$RESOLVE_STATUS" == "ok" ]]; then
+        if [[ -f "$RESOLVE_ROOT/CLAUDE.md" ]]; then
+            instr_active="$RESOLVE_ROOT/CLAUDE.md (profile root, auto-loaded)"
+            [[ -f "$RESOLVE_OVERLAY/claude/CLAUDE.md" ]] && instr_suppressed="$RESOLVE_OVERLAY/claude/CLAUDE.md (both present, overlay NOT injected)"
+        elif [[ -f "$RESOLVE_OVERLAY/claude/CLAUDE.md" ]]; then
+            instr_active="$RESOLVE_OVERLAY/claude/CLAUDE.md (via --append-system-prompt-file fallback)"
+        fi
+        [[ -f "$RESOLVE_OVERLAY/claude/settings.json" ]] && claude_settings="$RESOLVE_OVERLAY/claude/settings.json"
+        [[ -f "$RESOLVE_OVERLAY/claude/mcp.json" ]] && claude_mcp="$RESOLVE_OVERLAY/claude/mcp.json"
+        [[ -f "$RESOLVE_OVERLAY/claude/strict-mcp" ]] && strict="on"
+
+        codex_profile_toml="$HOME/.codex/$RESOLVE_NAME.config.toml"
+        if [[ -L "$codex_profile_toml" ]]; then
+            local target
+            target="$(readlink "$codex_profile_toml")"
+            if [[ "$target" == "$RESOLVE_OVERLAY/codex/config.toml" ]]; then
+                codex_symlink_ok="yes"
+            else
+                codex_symlink_ok="stale (points to $target)"
+            fi
+        elif [[ -e "$codex_profile_toml" ]]; then
+            codex_symlink_ok="not-a-symlink"
+        else
+            codex_symlink_ok="missing"
+        fi
+    fi
+
+    local managed_present="no"
+    [[ -f "$MANAGED_SETTINGS_PATH" ]] && managed_present="yes"
+    local codex_managed_present="no"
+    [[ -f "$CODEX_MANAGED_CONFIG_PATH" ]] && codex_managed_present="yes"
+
+    if (( json )); then
+        _explain_json
+    else
+        _explain_text
+    fi
+    exit "$rc"
+}
+
+_explain_text() {
+    echo "coding-agent-profile — explain"
+    echo ""
+    echo "Working directory"
+    echo "  logical      $logical"
+    echo "  physical     $cwd"
+    echo ""
+    echo "Profile"
+    echo "  status       $RESOLVE_STATUS"
+    [[ -n "$RESOLVE_NAME" ]] && echo "  name         $RESOLVE_NAME"
+    [[ -n "$RESOLVE_ROOT" ]] && echo "  marker       $RESOLVE_ROOT/$MARKER_NAME"
+    [[ -n "$RESOLVE_ROOT" ]] && echo "  root         $RESOLVE_ROOT"
+    [[ -n "$RESOLVE_OVERLAY" ]] && echo "  overlay      $RESOLVE_OVERLAY"
+    [[ -n "$RESOLVE_MALFORMED_REASON" ]] && echo "  reason       $RESOLVE_MALFORMED_REASON"
+    echo "  ancestors scanned  $RESOLVE_ANCESTORS_SCANNED  (depth cap $MAX_DEPTH)"
+    echo ""
+    if (( ${#RESOLVE_SHADOWED[@]} > 0 )); then
+        echo "Nested markers"
+        for m in "${RESOLVE_SHADOWED[@]}"; do
+            local shadowed_parsed
+            shadowed_parsed="$(parse_marker "$m/$MARKER_NAME" 2>/dev/null || echo "?")"
+            echo "  shadowed     $m/$MARKER_NAME -> \"$shadowed_parsed\"  — not applied, nearest wins"
+        done
+        echo ""
+    fi
+    if [[ "$RESOLVE_STATUS" == "ok" ]]; then
+        echo "Claude Code"
+        echo "  instructions"
+        echo "    active      ${instr_active:-none}"
+        [[ -n "$instr_suppressed" ]] && echo "    suppressed  $instr_suppressed"
+        echo "  settings     ${claude_settings:-(none — no profile settings.json)}"
+        echo "  mcp          ${claude_mcp:-(none — no profile mcp.json)}"
+        echo "  strict-mcp   $strict"
+        echo ""
+        echo "Codex"
+        echo "  profile toml  $codex_profile_toml"
+        echo "  symlink       $codex_symlink_ok"
+        echo ""
+    fi
+    echo "Higher-precedence settings (informational — never bypassed)"
+    echo "  Claude managed-settings.json   $MANAGED_SETTINGS_PATH   $managed_present"
+    echo "  Codex managed-config.toml      $CODEX_MANAGED_CONFIG_PATH   $codex_managed_present"
+    echo ""
+    echo "Environment"
+    echo "  direnv        installed=$direnv_installed"
+    if [[ "$RESOLVE_STATUS" == "ok" ]]; then
+        while IFS='=' read -r name state; do
+            [[ -n "$name" ]] && echo "  profile var   $name  $state"
+        done < <(_profile_required_vars "$RESOLVE_OVERLAY/profile.env")
+    fi
+    echo ""
+    echo "Inheritance tier"
+    echo "  Tier A (any invocation, incl. plain 'claude'/'codex'): ancestor CLAUDE.md/AGENTS.md, direnv env"
+    echo "  Tier B (ca-claude / ca-codex only): settings, MCP, status line, Codex profile toml"
+    echo "  ca-claude on PATH: ${ca_claude_on_path:-no}"
+    echo "  ca-codex on PATH:  ${ca_codex_on_path:-no}"
+    echo ""
+    echo "Fallback"
+    case "$RESOLVE_STATUS" in
+        none)       echo "  No marker found — no profile applied, user + project configuration only." ;;
+        malformed)  echo "  Marker at $RESOLVE_ROOT is malformed ($RESOLVE_MALFORMED_REASON) — no profile applied, grandparent NOT consulted." ;;
+        unresolved) echo "  Marker names '$RESOLVE_NAME' but $PROFILE_DIR/$RESOLVE_NAME does not exist — no profile applied." ;;
+        ok)         echo "  Profile '$RESOLVE_NAME' applied." ;;
+    esac
+}
+
+_explain_json() {
+    python3 - "$logical" "$cwd" "$RESOLVE_STATUS" "$RESOLVE_NAME" "$RESOLVE_ROOT" "$RESOLVE_OVERLAY" \
+        "$RESOLVE_MALFORMED_REASON" "$RESOLVE_ANCESTORS_SCANNED" "$MARKER_NAME" \
+        "$managed_present" "$MANAGED_SETTINGS_PATH" "$codex_managed_present" "$CODEX_MANAGED_CONFIG_PATH" \
+        "$direnv_installed" "${ca_claude_on_path:-}" "${ca_codex_on_path:-}" \
+        "$strict" "${claude_settings:-}" "${claude_mcp:-}" "${instr_active:-}" "${instr_suppressed:-}" \
+        "${codex_profile_toml:-}" "${codex_symlink_ok:-}" \
+        "${RESOLVE_SHADOWED[@]:-}" <<'PYEOF'
+import json, sys
+(logical, cwd, status, name, root, overlay, reason, scanned, marker,
+ managed_present, managed_path, codex_managed_present, codex_managed_path,
+ direnv_installed, ca_claude, ca_codex, strict, claude_settings, claude_mcp,
+ instr_active, instr_suppressed, codex_toml, codex_symlink, *shadowed) = sys.argv[1:]
+print(json.dumps({
+    "cwd": {"logical": logical, "physical": cwd},
+    "profile": {
+        "status": status, "name": name or None, "root": root or None,
+        "overlay": overlay or None, "marker_name": marker,
+        "malformed_reason": reason or None,
+        "ancestors_scanned": int(scanned),
+        "shadowed": shadowed,
+    },
+    "claude": {
+        "instructions_active": instr_active or None,
+        "instructions_suppressed": instr_suppressed or None,
+        "settings": claude_settings or None,
+        "mcp": claude_mcp or None,
+        "strict_mcp": strict == "on",
+    },
+    "codex": {
+        "profile_toml": codex_toml or None,
+        "symlink_status": codex_symlink or None,
+    },
+    "managed": {
+        "claude_managed_settings_present": managed_present == "yes",
+        "claude_managed_settings_path": managed_path,
+        "codex_managed_config_present": codex_managed_present == "yes",
+        "codex_managed_config_path": codex_managed_path,
+    },
+    "environment": {"direnv_installed": direnv_installed == "yes"},
+    "tier": {
+        "ca_claude_on_path": ca_claude or None,
+        "ca_codex_on_path": ca_codex or None,
+    },
+}, indent=2))
+PYEOF
+}

@@ -1,0 +1,6 @@
+{
+    "_note": "Example profile overlay — applied via `ca-claude --settings`. Only include keys you actually want to override for this profile; unset keys fall through to user/project settings per the validated precedence (userSettings < projectSettings < localSettings < flagSettings < policySettings).",
+    "permissions": {
+        "allow": []
+    }
+}

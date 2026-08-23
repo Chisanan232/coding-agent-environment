@@ -706,6 +706,11 @@ and uncomment the variables you want to override.
 | `CLAUDE_STRICT` | `0` | Set to `1` to treat quality_gate warnings (debug statements, unlinked TODOs) as errors that block the next action |
 | `CLAUDE_SESSION_NOTES_DIR` | `~/.claude/session-notes` | Directory for per-ticket Markdown session notes |
 | `CLAUDE_INTEGRATION_TEST_COMMAND` | _(unset)_ | Command to run cross-repo integration tests (cross-repo-coordinator Phase 4) |
+| `CODING_AGENT_PROFILE_DIR` | `~/.coding-agent-profiles` | Directory-scoped profile overlays root — see `docs/PROFILES.md` |
+| `CODING_AGENT_ALLOW_HOME_PROFILE` | `0` | Set to `1` to allow a `.coding-agent-profile` marker at `$HOME` (ignored by default) |
+| `CODING_AGENT_MANAGED_SETTINGS_PATH` | OS default | Override for testing/diagnostics — Claude managed-settings.json path |
+| `CODING_AGENT_CODEX_MANAGED_CONFIG_PATH` | OS default | Override for testing/diagnostics — Codex managed-config path |
+| `CA_DRY_RUN` | `0` | Set to `1` on `ca-claude`/`ca-codex` to print resolved argv instead of exec'ing |
 
 ---
 
