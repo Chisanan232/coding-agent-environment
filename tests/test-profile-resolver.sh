@@ -15,6 +15,14 @@ WORK="$(mktemp -d)"
 WORK="$(cd -P -- "$WORK" && pwd)"  # physical path — assertions compare against resolver output, which is always physical
 trap 'rm -rf "$WORK"' EXIT
 
+# Dry-run launcher assertions need resolvable binaries, never real host clients.
+mkdir -p "$WORK/cli-stubs"
+for client in claude codex; do
+    printf '#!/usr/bin/env bash\nexit 99\n' > "$WORK/cli-stubs/$client"
+    chmod +x "$WORK/cli-stubs/$client"
+done
+export PATH="$WORK/cli-stubs:$PATH"
+
 PASS=0
 FAIL=0
 
