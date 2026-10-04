@@ -15,6 +15,9 @@ choice for that work.
 Inspect the repository, its instructions, the ticket, current Git state, and the
 actual base branch before editing. Preserve unfamiliar or uncommitted work. Use an
 isolated worktree for ticketed changes when the repository supports worktrees.
+Resolve and fetch the actual tracking remote; check base-branch CI, ensure required
+dependencies are installed, and ensure configured hooks are active before
+implementation without disturbing unrelated state.
 
 Name a ticket branch:
 
@@ -24,19 +27,43 @@ Name a ticket branch:
 
 Keep the summary at 30 characters or fewer. Resolve the release/phase and ticket
 from the authoritative tracker or established local context; do not invent them.
+Use these established change types and meanings:
+
+| Type | Gitmoji | Meaning |
+|---|---|---|
+| `feat` | ✨ | Feature |
+| `fix` | 🐛 | Bug fix |
+| `refactor` | ♻️ | Refactor |
+| `test` | ✅ | Tests |
+| `docs` | 📝 | Documentation |
+| `config` | 🔧 | Configuration |
+| `deps` | ⬆️ | Dependencies |
+| `remove` | 🗑️ | Removal |
+| `lint` | 🚨 | Lint or type repair |
+| `security` | 🔒 | Security |
+
+Create the worktree as a sibling of the main checkout and replace `/` in the
+branch name with `-` in the worktree directory name.
 
 ## Implement and commit
 
 Keep each commit atomic and bisectable. Put one concern and its necessary tests in
-the same commit. Use imperative subjects under 72 characters:
+the same commit. Use imperative summaries under 72 characters:
 
 ```
 <emoji> <scope>: <imperative summary>
 ```
 
+The 72-character limit applies to the imperative summary, not the entire commit
+subject.
+
 Do not bypass hooks, security checks, or a genuinely failing product check. Run
 focused checks while iterating, then the repository's full relevant build, lint,
 type, test, security, privacy, documentation, and link gates before review.
+Before pushing, confirm the worktree has no uncommitted changes, the branch includes
+the current tracking base, and configured pre-commit hooks pass.
+Never force-push a protected, main, or release branch, or during active review.
+Force-pushing a feature branch requires explicit engineer permission.
 
 Classify CI as `CI_UNAVAILABLE_EXTERNAL` only when evidence shows an external
 infrastructure or account condition prevented the job from running or completing.
@@ -50,6 +77,9 @@ meaningful independent review from a separate reviewer or isolated review contex
 material findings and rerun affected checks. The implementation author's assertion
 does not count as independent evidence.
 
+Keep one concern per pull request and under 500 changed lines when practical. Split
+larger work into a reviewable sequence rather than bundling unrelated changes.
+
 Use this exact pull-request title shape:
 
 ```
@@ -58,7 +88,8 @@ Use this exact pull-request title shape:
 
 The 60-character limit applies to the imperative summary, not the entire title.
 Preserve the authoritative ticket identifier's case and the established scope
-spelling.
+spelling. Automation can check title structure and length; reviewers must assess
+whether its summary actually uses imperative meaning.
 Examples:
 
 ```
@@ -68,11 +99,14 @@ Examples:
 
 Use `$evidence-first-briefing` for the body. Lead with resulting behavior or the
 changed boundary. Include actual validation, material risks or unknowns, and issue
-references. Omit file chronology and unsupported completion claims.
+references. Preserve any required repository pull-request template and fields.
+Omit file chronology and unsupported completion claims.
 
 Do not merge until required checks, code-owner approvals, conflict resolution,
 branch currency, and blocking review threads satisfy the repository's real gates.
 Never use administrator privileges to bypass them.
+Only the main coordinator may trigger the merge; an independent reviewer reports
+findings and evidence back to that coordinator.
 
 ## Merge, reconcile, and clean up
 

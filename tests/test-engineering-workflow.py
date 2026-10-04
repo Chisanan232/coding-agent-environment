@@ -9,12 +9,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".claude/skills/engineering-workflow/SKILL.md"
 TITLE = re.compile(
-    r"^\[[^\[\]\n]+\] (?:✨|🐛|♻️|✅|📝|🔧|🔌|🪝|👨‍💻|🧭|⬆️|🗑️|🚨|🔒) "
+    r"^\[(?:[A-Z][A-Z0-9]*-[0-9]+|[0-9]+)\] (?P<emoji>[^\x00-\x7f][^ ]*) "
     r"[a-z0-9][a-z0-9._/-]*: (?P<summary>[^\n]+)$"
 )
 
 
-def valid_title(title: str) -> bool:
+def structurally_valid_title(title: str) -> bool:
+    """Check machine-verifiable shape; imperative meaning requires human review."""
     match = TITLE.fullmatch(title)
     return bool(match and len(match.group("summary")) < 60)
 
@@ -32,12 +33,27 @@ class EngineeringWorkflowContract(unittest.TestCase):
             "Create a merge commit",
             "Reconcile the authoritative Jira ticket or established issue tracker",
             "Remove the owned worktree",
+            "Resolve and fetch the actual tracking remote",
+            "configured pre-commit hooks pass",
+            "Never force-push a protected, main, or release branch",
+            "Force-pushing a feature branch requires explicit engineer permission",
+            "Create the worktree as a sibling of the main checkout",
+            "Only the main coordinator may trigger the merge",
+            "under 500 changed lines when practical",
+            "Preserve any required repository pull-request template",
+            "The 72-character limit applies to the imperative summary",
         ]
         for phrase in required:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
         self.assertIn("The 60-character limit applies to the imperative summary", text)
         self.assertIn("A product, test, security, or\nquality failure is never", text)
+        for change_type in [
+            "`feat`", "`fix`", "`refactor`", "`test`", "`docs`", "`config`",
+            "`deps`", "`remove`", "`lint`", "`security`",
+        ]:
+            with self.subTest(change_type=change_type):
+                self.assertIn(change_type, text)
 
     def test_pull_request_title_examples_and_negative_controls(self) -> None:
         valid = [
@@ -46,15 +62,30 @@ class EngineeringWorkflowContract(unittest.TestCase):
             "[42] 🐛 api: Fix retry leak",
             "[SPE-33] 🔧 workflow: Unify engineering lifecycle contract",
             "[SEC-7] 🔒 auth: Reject leaked credentials",
+            "[OPS-2] 🧯 deploy: Stop unsafe rollout",
+            "[HORO-1033] ✨ web: Preserve console state and reading continuity",
         ]
         invalid = [
             "SPE-33 🔧 workflow: Unify engineering lifecycle contract",
             "[SPE-33] workflow: Unify engineering lifecycle contract",
+            "[SPE-33] config workflow: Unify engineering lifecycle contract",
             "[SPE-33] 🔧 Workflow Unify engineering lifecycle contract",
+            "🛡️ Redact analytics route metadata and UTM payloads",
+            "✨ (web): Preserve console state and reading continuity [HORO-1033]",
+            "[HORO-1033] ✨ (web): Preserve console state and reading continuity",
+            "[not a ticket] ✨ web: Preserve console state",
             "[SPE-33] 🔧 workflow: " + "x" * 60,
         ]
-        self.assertTrue(all(valid_title(title) for title in valid))
-        self.assertFalse(any(valid_title(title) for title in invalid))
+        self.assertTrue(all(structurally_valid_title(title) for title in valid))
+        self.assertFalse(any(structurally_valid_title(title) for title in invalid))
+
+    def test_imperative_meaning_remains_a_review_judgment(self) -> None:
+        nonimperative = "[SPE-33] 🔧 workflow: Was changed yesterday"
+        self.assertTrue(structurally_valid_title(nonimperative))
+        self.assertIn(
+            "reviewers must assess\nwhether its summary actually uses imperative meaning",
+            WORKFLOW.read_text(),
+        )
 
     def test_codex_materialized_contract_is_the_exact_shared_source(self) -> None:
         installer = (ROOT / "scripts/profile-install.sh").read_text()
