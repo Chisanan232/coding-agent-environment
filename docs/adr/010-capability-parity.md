@@ -24,15 +24,15 @@ thin adapter that translates only supported concepts. Directory-scoped
 profiles select the applicable overlay, while managed policy remains above
 the profile and cannot be bypassed.
 
-The contract has exactly six classifications: native, adapter, fallback,
-profile, managed, and unavailable. Every entry records the ten matrix fields
+The contract has exactly six classifications: MUST_HAVE_PARITY, SHOULD_HAVE_PARITY,
+HOST_SPECIFIC_NO_PARITY, SECURITY_RESTRICTED, CURRENTLY_BLOCKED, and ALREADY_EQUIVALENT. Every entry records the ten matrix fields
 defined by the contract, including ownership, drift, lifecycle, scope, OAuth
 lifecycle, read/write boundary, secret handling, verification, and host
 exceptions.
 
 Native plugins and client configuration are preferred. The installed Neon
-plugin is observed as a broad capability with no fixed read-only production
-contract. A generic document task may use an official read-only MCP or a
+plugin is observed as a broad capability with no fixed read-only research
+grant. A research task may use an official read-only MCP or a
 profile-disabled broad app connection; duplicate active connections are not a
 parity strategy. Codex's baseline is CLI 0.160 with native plugins and
 `config.toml`; an external `name.config.toml` is profile materialization, and
@@ -51,7 +51,7 @@ and fresh bounded verification is required after lifecycle changes.
 - Shared semantic skills such as Requirement Zero, Codebase Zero, and
   evidence-first briefing remain reusable while provider instructions stay in
   their own adapters.
-- Some capabilities will report a fallback or unavailable classification
+- Some capabilities will report an explicit blocked or restricted classification
   until a supported client mechanism, credential lifecycle, or explicit gate
   exists.
 - Private account, company, machine, and case metadata remains outside the

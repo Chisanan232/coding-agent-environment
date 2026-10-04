@@ -29,41 +29,40 @@ alone proves that a capability is authorized or safe for production use.
 
 Every inventory entry has exactly one classification:
 
-1. **native** — provided directly by the client and managed through its
-   supported interface.
-2. **adapter** — translated by a client-specific adapter into an equivalent
-   repository capability.
-3. **fallback** — an official read-only or reduced-scope substitute used when
-   native support is absent.
-4. **profile** — selected by a directory-scoped profile and applied through a
-   client's supported profile/configuration mechanism.
-5. **managed** — controlled by an enterprise or host policy layer above the
-   repository and therefore only observed, never overridden here.
-6. **unavailable** — discovered or requested but not applicable, installed,
-   authorized, or supported in the current environment.
+1. **MUST_HAVE_PARITY** — a required semantic capability needs equivalent verified host access.
+2. **SHOULD_HAVE_PARITY** — useful current capability whose absence does not block the current work.
+3. **HOST_SPECIFIC_NO_PARITY** — native host behavior intentionally has no identical implementation.
+4. **SECURITY_RESTRICTED** — broader access is intentionally gated, even if another host has it configured.
+5. **CURRENTLY_BLOCKED** — a verified missing credential, permission or runtime prevents the capability.
+6. **ALREADY_EQUIVALENT** — verified semantic capability already exists through either native tools or shared CLI/API.
 
-These classifications describe capability provenance, not quality or
-permission. Mutation adapters remain explicitly gated; no classification
-globally authorizes writes to production systems.
+Classification does not grant permission. Record installed, configured, healthy and action-verified observations separately. Mutation and production operations retain explicit gates.
 
 ## Capability matrix
 
-The inventory records these ten fields for each capability. Empty values are
-reported as unknown rather than inferred.
+Each capability row records all ten dimensions, with unknowns explicit:
 
-| Capability | Claude adapter | Codex adapter | Desired-state owner | Live vs repository drift | Install/apply/update/remove | Global vs repo scope | OAuth lifecycle | Read/write and production boundary | Secrets, verification, and host exceptions |
-|---|---|---|---|---|---|---|---|---|---|
-| Provider tool, skill, plugin, or profile | Native name or adapter mapping; no invented flags | Native name or adapter mapping; no invented flags | Repository contract, private inventory, or managed policy as applicable | Compare declared intent with observed live state; never call presence proof | Use the provider's supported lifecycle; removal requires an explicit target | Record whether global, directory-profile, or repository scoped | Record credential class, expiry/refresh owner, and revocation path; never store tokens | Default read-only; writes require an explicit adapter gate and a bounded target; production writes require separate authorization | `${ENV_VAR}` or platform secret store only; verify with a bounded health/readback check; record host exceptions without publishing account or machine data |
+| Dimension | Required record |
+|---|---|
+| 1 | Claude-side implementation |
+| 2 | Codex-side current implementation |
+| 3 | Whether semantic capability is equivalent, with evidence |
+| 4 | Configuration and authentication differences |
+| 5 | Read, write and destructive scope |
+| 6 | Recommended Codex-native solution: official plugin, native MCP, shared skill, native hook, CLI/API or intentionally no equivalent |
+| 7 | Security implications |
+| 8 | Migration/apply strategy |
+| 9 | Fresh-session validation method |
+| 10 | Drift-detection ownership |
 
-Provider-specific instructions stay in provider documentation and adapters.
-This matrix is the shared contract and must not duplicate those instructions.
+Canonical shared skill bodies are reused; host adapters contain only installation/configuration differences. The private inventory is the actual capability-level matrix, not one row per config file.
 
 ## Current parity boundary
 
 The official Neon plugin is an installed capability, but its broad database
-surface is not a fixed read-only production contract. Treat it as a provider
+surface is not a fixed read-only research grant. Treat it as a provider
 capability requiring explicit scope and verification for each use. When a
-specific read-only operation is unavailable, the generic document fallback is
+specific read-only operation is unavailable, the research fallback is
 an official read-only MCP or a profile-disabled broad app connection. Do not
 create duplicate active connections to compensate for a missing narrow
 capability.
@@ -87,3 +86,11 @@ not prove authorization, production safety, semantic parity, or complete
 coverage. Fresh verification is required after applying, updating, removing,
 or changing a profile. Host-specific exceptions belong in the private
 inventory and must not be copied into this public repository.
+
+## Desired state and lifecycle
+
+The capability maintainer owns the public adapter and desired-state profile; account/project owners own the private inventory and scope approvals. The existing profile installer owns only explicitly named artifacts. Apply and update preserve unrelated user config, generated state and OAuth credentials. Dry-run reports planned changes; check reports drift without applying; removal refuses drift or unknown ownership. Backups and private runtime inventories stay outside Git. User-global plugins supply reusable skills; opt-in directory/native profiles narrow active tool access. Repository configuration cannot weaken managed host policy.
+
+OAuth belongs to the supported client credential store, never a repository file or copied token. Install/configure precedes login; expiration or a scope change requires refresh or supported logout/re-authorization, followed by a fresh verification. Removing a profile does not silently revoke shared account access; deliberate credential revocation is a separate operation.
+
+Read-only research, authorized mutation and destructive/production operations are distinct profiles or gates. No broad mutation profile is installed merely for symmetry. Fresh verification must show tool discovery, identity, one bounded actual read, and absence/refusal of excluded write/secret tools. Unavailable and host-specific capabilities remain explicit inventory rows; they do not count as successful parity.
