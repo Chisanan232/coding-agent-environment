@@ -8,6 +8,7 @@ enabled = false
 [mcp_servers.neon-readonly]
 url = "https://mcp.neon.tech/mcp?readonly=true&category=projects&category=branches&category=querying&category=schema&category=observability"
 enabled = true
+scopes = ["read"]
 enabled_tools = [
   "list_organizations",
   "list_projects",
