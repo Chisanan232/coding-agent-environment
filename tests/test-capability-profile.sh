@@ -24,6 +24,14 @@ assert_eq() {
     fi
 }
 
+assert_contains() {
+    local haystack="$1" needle="$2" message="$3"
+    if [[ "$haystack" != *"$needle"* ]]; then
+        printf 'FAIL: %s (missing %q)\n' "$message" "$needle" >&2
+        exit 1
+    fi
+}
+
 test_apply_installs_only_external_profile() {
     local fixture
     fixture="$(new_home)"
@@ -35,5 +43,15 @@ test_apply_installs_only_external_profile() {
     PASS=$((PASS + 1))
 }
 
+test_dry_run_reports_without_mutation() {
+    local fixture output
+    fixture="$(new_home)"
+    output="$(CODING_AGENT_SYNC_HOME="$fixture" bash "$INSTALL" --capabilities --dry-run)"
+    [[ ! -e "$fixture/.codex/capabilities-readonly.config.toml" ]]
+    assert_contains "$output" 'Managed capability drift: 1' "dry-run drift report"
+    PASS=$((PASS + 1))
+}
+
 test_apply_installs_only_external_profile
+test_dry_run_reports_without_mutation
 printf 'capability profile tests: %d passed\n' "$PASS"
