@@ -52,6 +52,20 @@ test_dry_run_reports_without_mutation() {
     PASS=$((PASS + 1))
 }
 
+test_check_reports_drift_then_convergence() {
+    local fixture output
+    fixture="$(new_home)"
+    if CODING_AGENT_SYNC_HOME="$fixture" bash "$INSTALL" --capabilities --check >/dev/null 2>&1; then
+        printf 'FAIL: missing profile passed --check\n' >&2
+        exit 1
+    fi
+    CODING_AGENT_SYNC_HOME="$fixture" bash "$INSTALL" --capabilities >/dev/null
+    output="$(CODING_AGENT_SYNC_HOME="$fixture" bash "$INSTALL" --capabilities --check)"
+    assert_contains "$output" 'Managed capability drift: 0' "converged check"
+    PASS=$((PASS + 1))
+}
+
 test_apply_installs_only_external_profile
 test_dry_run_reports_without_mutation
+test_check_reports_drift_then_convergence
 printf 'capability profile tests: %d passed\n' "$PASS"
