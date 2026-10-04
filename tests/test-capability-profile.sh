@@ -4,6 +4,7 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL="$ROOT/scripts/profile-install.sh"
+SYNC_CHECK="$ROOT/scripts/sync-check.sh"
 DESIRED="$ROOT/codex/capabilities-readonly.config.toml"
 PASS=0
 
@@ -122,6 +123,15 @@ test_symlinked_profile_is_refused() {
     PASS=$((PASS + 1))
 }
 
+test_sync_check_routes_capability_state() {
+    local fixture output
+    fixture="$(new_home)"
+    CODING_AGENT_SYNC_HOME="$fixture" bash "$INSTALL" --capabilities >/dev/null
+    output="$(CODING_AGENT_SYNC_HOME="$fixture" bash "$SYNC_CHECK" --capabilities)"
+    assert_contains "$output" 'Managed capability drift: 0' "capability sync check"
+    PASS=$((PASS + 1))
+}
+
 test_apply_installs_only_external_profile
 test_dry_run_reports_without_mutation
 test_check_reports_drift_then_convergence
@@ -129,4 +139,5 @@ test_update_backs_up_owned_profile
 test_remove_backs_up_owned_profile
 test_unowned_profile_is_refused
 test_symlinked_profile_is_refused
+test_sync_check_routes_capability_state
 printf 'capability profile tests: %d passed\n' "$PASS"
