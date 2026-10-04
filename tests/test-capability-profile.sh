@@ -106,10 +106,27 @@ test_unowned_profile_is_refused() {
     PASS=$((PASS + 1))
 }
 
+test_symlinked_profile_is_refused() {
+    local fixture outside target
+    fixture="$(new_home)"
+    outside="$fixture/outside.config.toml"
+    target="$fixture/.codex/capabilities-readonly.config.toml"
+    printf 'outside = true\n' > "$outside"
+    ln -s "$outside" "$target"
+    if CODING_AGENT_SYNC_HOME="$fixture" bash "$INSTALL" --capabilities >/dev/null 2>&1; then
+        printf 'FAIL: symlinked capability profile was followed\n' >&2
+        exit 1
+    fi
+    assert_eq 'outside = true' "$(cat "$outside")" "symlink target remains untouched"
+    [[ -L "$target" ]]
+    PASS=$((PASS + 1))
+}
+
 test_apply_installs_only_external_profile
 test_dry_run_reports_without_mutation
 test_check_reports_drift_then_convergence
 test_update_backs_up_owned_profile
 test_remove_backs_up_owned_profile
 test_unowned_profile_is_refused
+test_symlinked_profile_is_refused
 printf 'capability profile tests: %d passed\n' "$PASS"
