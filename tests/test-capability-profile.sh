@@ -80,8 +80,21 @@ test_update_backs_up_owned_profile() {
     PASS=$((PASS + 1))
 }
 
+test_remove_backs_up_owned_profile() {
+    local fixture backup
+    fixture="$(new_home)"
+    CODING_AGENT_SYNC_HOME="$fixture" bash "$INSTALL" --capabilities >/dev/null
+    CODING_AGENT_SYNC_HOME="$fixture" bash "$INSTALL" --capabilities --remove >/dev/null
+    [[ ! -e "$fixture/.codex/capabilities-readonly.config.toml" ]]
+    backup="$(find "$fixture/.codex/backups/coding-agent-environment" -type f -name capabilities-readonly.config.toml -print -quit)"
+    cmp -s "$DESIRED" "$backup"
+    assert_eq "600" "$(python3 -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[2:])' "$backup")" "removed profile backup mode"
+    PASS=$((PASS + 1))
+}
+
 test_apply_installs_only_external_profile
 test_dry_run_reports_without_mutation
 test_check_reports_drift_then_convergence
 test_update_backs_up_owned_profile
+test_remove_backs_up_owned_profile
 printf 'capability profile tests: %d passed\n' "$PASS"
