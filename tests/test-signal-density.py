@@ -46,6 +46,24 @@ class SignalDensityExamples(unittest.TestCase):
                     self.assertIn('noise: ' + phrase,
                                   findings(case, case['candidate'] + ' ' + phrase))
 
+    def test_code_comment_decisions(self) -> None:
+        import ast
+        for case in FIXTURES['cases']:
+            if 'code' not in case:
+                continue
+            with self.subTest(case=case['id']):
+                code = re.search(r'```python\n(.*?)\n```', case['candidate'], re.S).group(1)
+                tree = ast.parse(code)
+                self.assertEqual(any(line.lstrip().startswith('#') for line in code.splitlines()),
+                                 case['code']['comment'])
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.FunctionDef):
+                        self.assertIsNone(ast.get_docstring(node))
+                namespace = {}
+                exec(compile(tree, '<signal-density-fixture>', 'exec'), namespace)
+                for expression in case['code']['assertions']:
+                    self.assertTrue(eval(expression, namespace))
+
     def test_style_warning_precision_is_insufficient(self) -> None:
         false_positives = sum(tempting_warning(c['text']) for c in FIXTURES['benign'])
         self.assertEqual(false_positives, 4)
