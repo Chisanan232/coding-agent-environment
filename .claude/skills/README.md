@@ -19,6 +19,13 @@ This directory contains all Claude Code skills for this configuration.
 skills own the decision-relevant facts and gates. Load it before composing or
 reviewing Jira/ClickUp, GitHub, Slack/Teams, release or validation content.
 
+## Shared engineering lifecycle
+
+`engineering-workflow` is the canonical host-neutral contract for branch and
+worktree setup, commits, validation, review, pull requests, merge, ticket
+reconciliation, and cleanup. Claude workflow skills adapt it to their invocation
+mechanics; Codex receives the same file through the managed global installer.
+
 ## Language Repair Skills Guide
 
 Language-specific repair skills fix type errors, lint violations, test failures,

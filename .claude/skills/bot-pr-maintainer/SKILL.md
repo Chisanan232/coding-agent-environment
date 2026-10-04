@@ -29,7 +29,8 @@ Auto-used. Run via `pr-health-check` when a PR is classified as
 3. Confirm no merge conflicts.
 4. Confirm scope is limited to the automated update (no unexpected file changes).
 5. Approve the PR using GitHub MCP.
-6. Merge the PR using the repository's configured merge strategy.
+6. Merge the PR using **Create a merge commit**, as required by
+   `engineering-workflow`.
 7. Record the merge in the health report.
 
 ### Path B — Bot PR with lock-file conflict
@@ -51,8 +52,8 @@ Auto-used. Run via `pr-health-check` when a PR is classified as
 
 1. Inspect the CI failure details.
 2. Determine whether the failure is caused by the update or by an unrelated issue.
-3. **If unrelated to the update**: note the failure and proceed with merge if all
-   other conditions are met. Document the unrelated failure in the health report.
+3. **If unrelated to the update**: record the evidence and keep the PR unmerged
+   until required CI is green or the failure is repaired through its owning work.
 4. **If caused by the update**: do not merge. Escalate to engineer with:
    - PR link
    - Failure step and log excerpt

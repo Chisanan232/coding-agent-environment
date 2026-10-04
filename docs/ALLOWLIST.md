@@ -16,7 +16,7 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 | `.claude/config.env` | Push-gate env overrides |
 | `.claude/mcp-servers.runtime.json` | Project-runtime MCP servers, secrets redacted |
 | `.claude/hooks/` | Workflow/gate shell hooks |
-| `.claude/skills/` | Custom skills (`SKILL.md` each) |
+| `.claude/skills/` | Custom skills (`SKILL.md` each); shared skill sources are materialized exactly for Codex |
 | `codex/config.toml` | Curated portable subset of `~/.codex/config.toml` (see file header for exclusions) |
 | `codex/capabilities-readonly.config.toml` | Opt-in native Codex external profile: broad Neon app disabled, official read-only Neon MCP allowlisted |
 | `codex/AGENTS.md` | Global instruction template; signal-first block is managed, unrelated live instructions are preserved |

@@ -43,4 +43,9 @@ decision-critical evidence, risks and action in roughly 10–30 seconds of readi
 
 Use canonical $requirement-zero for NEW unvalidated scope and $codebase-zero for
 EXISTING artifact audits. Never reopen already-approved work through these skills.
+
+Use $engineering-workflow for the engineering lifecycle: branch and worktree,
+commits, validation, review, pull request, merge, Jira reconciliation, and cleanup.
+Pull-request titles use
+`[<ticket-number>] <emoji> <scope>: <imperative summary under 60 chars>`.
 <!-- coding-agent-environment:signal-first:end -->

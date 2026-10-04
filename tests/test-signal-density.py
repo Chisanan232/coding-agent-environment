@@ -79,7 +79,9 @@ class BriefingInstallation(unittest.TestCase):
             live = Path(temp) / 'home'
             desired_root = Path(temp) / 'repo'
             for rel in ['scripts/profile-install.sh', 'codex/AGENTS.md',
-                        'codex/subtraction-skills.json', '.claude/skills/evidence-first-briefing/SKILL.md']:
+                        'codex/subtraction-skills.json',
+                        '.claude/skills/evidence-first-briefing/SKILL.md',
+                        '.claude/skills/engineering-workflow/SKILL.md']:
                 dest = desired_root / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(root / rel, dest)
@@ -104,6 +106,8 @@ class BriefingInstallation(unittest.TestCase):
             cmd = ['bash', str(desired_root / 'scripts/profile-install.sh'), '--global']
             target = live / '.codex/skills/evidence-first-briefing/SKILL.md'
             source = root / '.claude/skills/evidence-first-briefing/SKILL.md'
+            workflow_target = live / '.codex/skills/engineering-workflow/SKILL.md'
+            workflow_source = root / '.claude/skills/engineering-workflow/SKILL.md'
             def run(*args):
                 return subprocess.run(cmd + list(args), env=env, capture_output=True, text=True)
             before_report = {p: p.read_bytes() for p in live.rglob('*') if p.is_file()}
@@ -113,6 +117,7 @@ class BriefingInstallation(unittest.TestCase):
             self.assertEqual(run('--check').returncode, 1)
             self.assertEqual(run().returncode, 0)
             self.assertEqual(target.read_bytes(), source.read_bytes())
+            self.assertEqual(workflow_target.read_bytes(), workflow_source.read_bytes())
             before = {p: p.read_bytes() for p in live.rglob('*') if p.is_file()}
             self.assertEqual(run().returncode, 0)
             self.assertEqual(before, {p: p.read_bytes() for p in live.rglob('*') if p.is_file()})
@@ -120,8 +125,14 @@ class BriefingInstallation(unittest.TestCase):
             self.assertEqual(run('--check').returncode, 1)
             self.assertEqual(run().returncode, 0)
             self.assertEqual(run('--check').returncode, 0)
+            workflow_target.write_text('workflow drift')
+            self.assertEqual(run('--check').returncode, 1)
+            self.assertEqual(run().returncode, 0)
+            self.assertEqual(workflow_target.read_bytes(), workflow_source.read_bytes())
             self.assertEqual(config.read_text(), 'local_setting = "preserve"\n')
-            self.assertEqual(next((live / '.codex/backups').rglob('SKILL.md')).read_text(), 'manual drift')
+            backups = [path.read_text() for path in (live / '.codex/backups').rglob('SKILL.md')]
+            self.assertIn('manual drift', backups)
+            self.assertIn('workflow drift', backups)
             self.assertTrue(agents.read_bytes().startswith(local_bytes))
             for path in protected:
                 self.assertEqual(path.read_bytes(), b'Unrelated private/generated fixture state')
@@ -194,6 +205,10 @@ class DesiredStateDrift(unittest.TestCase):
             dest = live / '.codex/skills/evidence-first-briefing'
             dest.mkdir(parents=True)
             shutil.copy2(root / '.claude/skills/evidence-first-briefing/SKILL.md', dest / 'SKILL.md')
+            workflow_dest = live / '.codex/skills/engineering-workflow'
+            workflow_dest.mkdir(parents=True)
+            shutil.copy2(root / '.claude/skills/engineering-workflow/SKILL.md',
+                         workflow_dest / 'SKILL.md')
             root = desired_root
             env = dict(os.environ, CODING_AGENT_SYNC_HOME=str(live))
 

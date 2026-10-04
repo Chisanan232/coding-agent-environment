@@ -2,6 +2,8 @@ name: Capability profile validation
 on:
   pull_request:
     paths:
+      - '.claude/CLAUDE.md'
+      - '.claude/skills/**'
       - 'codex/**'
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
@@ -11,6 +13,8 @@ on:
   push:
     branches: [main]
     paths:
+      - '.claude/CLAUDE.md'
+      - '.claude/skills/**'
       - 'codex/**'
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
@@ -33,3 +37,4 @@ jobs:
           bash tests/test-capability-profile.sh
           bash tests/test-profile-resolver.sh
           python3 tests/test-signal-density.py
+          python3 tests/test-engineering-workflow.py

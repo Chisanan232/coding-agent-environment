@@ -99,7 +99,7 @@ explicitly refreshing stale configuration — it will overwrite existing content
 - Wiki/docs: [fill in if applicable]
 
 ## Merge Strategy
-- [squash merge / rebase merge / merge commit — fill in]
+- [additional protected-branch or code-owner merge gates — fill in]
 
 ## Language-Specific Repair Skills
 [Fill in the applicable skills from ~/.claude/skills/ or create new ones:]
