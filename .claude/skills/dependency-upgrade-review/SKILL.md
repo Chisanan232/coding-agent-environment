@@ -1,3 +1,8 @@
+---
+name: dependency-upgrade-review
+description: "Review a dependency upgrade change to assess safety, compatibility, and risk before merging."
+---
+
 # SKILL.md — dependency-upgrade-review  [COMMAND-LIKE SKILL]
 
 ## Purpose
@@ -49,5 +54,8 @@ Classify each upgrade:
 - [ ] Note any packages that should be pinned more carefully.
 
 ## Output
-Produce an upgrade review summary with risk classification per package,
-test results, security status, and merge recommendation.
+
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+Report merge recommendation based on changed compatibility/security/behavior,
+validation evidence and material unknowns. Expand risky packages and required
+action; aggregate uneventful upgrades rather than narrating package/file edits.

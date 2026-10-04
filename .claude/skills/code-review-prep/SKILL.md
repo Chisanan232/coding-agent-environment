@@ -1,8 +1,13 @@
+---
+name: code-review-prep
+description: "Verify the current branch is ready for review and explain its semantic impact in the PR."
+---
+
 # SKILL.md — code-review-prep
 
 ## Purpose
-Verify that the current branch is ready for code review. Produce a PR description
-that meets the project's PR policy.
+
+Verify the current branch is ready for review and explain its semantic impact in the PR.
 
 ## Type
 Auto-used. Claude Code invokes this skill before any PR is opened.
@@ -43,12 +48,10 @@ Auto-used. Claude Code invokes this skill before any PR is opened.
     ```
     Resolve `<ticket-number>` from `$CLAUDE_CURRENT_TICKET` or `.claude/.current-ticket`.
     Example: `[PROJ-123] ✨ restapi: Add new user authentication endpoint`
-12. Write the PR body with these sections:
-    - **Summary**: what changed (one paragraph)
-    - **Motivation**: why it changed, issue reference
-    - **Changes**: bullet list of key changes
-    - **How to Verify**: test commands or manual steps
-    - **Checklist**: tests pass, lint pass, type check pass, docs updated, no secrets
+12. Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+    Select the changed behavior, architectural boundary, business/domain rule,
+    contract or flow the reviewer must assess. Include relevant validation
+    evidence and material compatibility/risk/unknowns. The diff owns routine edits.
 13. Link related issues: `Closes #<issue>` or `Refs #<issue>`.
 
 ### Phase 4 — Final check

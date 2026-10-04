@@ -255,12 +255,10 @@ Choose boundaries by behavior and risk, rather than one commit per function.
 
 Example: `[PROJ-123] ✨ restapi: Add new user authentication endpoint`
 
-### PR description must include
+### PR description
 
-1. What changed (one paragraph)
-2. Why it changed (motivation, context, issue reference)
-3. How to verify (manual steps or automated test reference)
-4. Related issues / tickets: `Closes #<issue-reference>`
+Use `evidence-first-briefing`; `code-review-prep` owns reviewer-relevant facts.
+Explain what the diff means, with actual validation and issue references.
 
 ### Review process
 

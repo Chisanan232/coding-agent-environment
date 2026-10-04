@@ -1,3 +1,8 @@
+---
+name: pr-feedback-response
+description: "Resolve substantive review concerns with evidence and request review while retaining unresolved threads."
+---
+
 # SKILL.md — pr-feedback-response
 
 ## Purpose
@@ -27,7 +32,7 @@ Auto-used. Run when a PR has new review comments or a "Request Changes" verdict.
    - **Discuss**: disagreement requiring dialogue before action.
    - **Acknowledge**: informational, no code change needed.
 4. Sort: Must-fix first, then Should-fix, then Discuss, then Acknowledge.
-5. Output the triage list before touching any code.
+5. Keep triage internally; surface blocking/disputed concerns that affect a decision.
 
 ### Phase 2 — Address each comment
 6. For each Must-fix and Should-fix comment:
@@ -39,8 +44,8 @@ Auto-used. Run when a PR has new review comments or a "Request Changes" verdict.
 7. For each Discuss comment:
    a. Post a reply on the PR explaining the trade-off or asking a clarifying
       question. Do not make the change until consensus is reached.
-8. For each Acknowledge comment:
-   a. Post a reply confirming receipt. No code change.
+8. For informational comments, reply only if acknowledgment is requested or
+   adds a decision/action; omit receipt-only noise.
 
 ### Phase 3 — Validation after all fixes
 9. Run the full test suite after all Must-fix and Should-fix changes are applied.
@@ -49,17 +54,10 @@ Auto-used. Run when a PR has new review comments or a "Request Changes" verdict.
 
 ### Phase 4 — Re-request review
 12. Push the branch (all gate hooks must pass).
-13. Post a summary comment on the PR:
-    ```
-    ## Feedback addressed
-
-    | Comment | Action taken |
-    |---|---|
-    | [reviewer comment summary] | [fixed / replied / acknowledged] |
-
-    All must-fix and should-fix items resolved.
-    Requesting re-review.
-    ```
+13. Apply `evidence-first-briefing` to any substantive reply or re-review request.
+    State the concern resolved, changed behavior and relevant test/commit/thread
+    reference. Distinguish an implemented fix from reviewer acceptance; surface
+    remaining disputed/unverified items. Do not repeat resolved thread details.
 14. Re-request review from all reviewers who had active "Request Changes" verdicts.
 15. Update workflow state:
     ```bash
@@ -69,24 +67,10 @@ Auto-used. Run when a PR has new review comments or a "Request Changes" verdict.
 
 ## Output
 
-```
-## PR feedback response — [PR reference]
-
-### Triage
-- Must-fix: [count] items
-- Should-fix: [count] items
-- Discuss: [count] items
-- Acknowledge: [count] items
-
-### Actions taken
-- [commit SHA]: [what was fixed]
-- [reply posted]: [comment thread]
-
-### Status
-- Full suite: pass / fail
-- Pre-commit: pass / fail
-- Re-review requested: yes / no
-```
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+Report the review decision/action, resolution evidence and remaining owner
+action. Reference threads for detail; do not publish an action table or claim
+reviewer acceptance from code changes alone.
 
 ## Safe-Fix Guidance
 - Do not mark a comment resolved until the reviewer accepts it.

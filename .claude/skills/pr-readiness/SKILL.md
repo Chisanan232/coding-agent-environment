@@ -1,3 +1,8 @@
+---
+name: pr-readiness
+description: "Run the pre-PR readiness gates when explicitly requested."
+---
+
 # SKILL.md — pr-readiness  [COMMAND-LIKE SKILL]
 
 ## Purpose
@@ -55,7 +60,8 @@ Do not run this mid-implementation — it is a completion gate, not a progress c
 - [ ] Write the PR title following CLAUDE.md PR conventions.
 - [ ] Write the PR body: use `.github/PULL_REQUEST_TEMPLATE.md` if it exists,
       otherwise use the PR description format from CLAUDE.md Pull Request Policy
-      (Summary / Motivation / Changes / How to Verify / Checklist).
+      via `evidence-first-briefing`. Respect required project fields; omit optional
+      empty boilerplate. Explain the semantic impact the reviewer must assess.
 - [ ] Link the relevant issue(s).
 
 ### 7. MCP-assisted checks (if available)
@@ -64,7 +70,8 @@ Do not run this mid-implementation — it is a completion gate, not a progress c
 - [ ] If `issue_tracking` MCP capability is available: confirm the linked issue exists.
 
 ## Output
-Produce a PR-ready summary with:
-- Pass/fail status for each checklist item
-- Draft PR title and body
-- Any items requiring engineer attention before proceeding
+
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+Report the readiness verdict, aggregate validation evidence, draft PR title/body,
+and unresolved blockers or unverified gates. Keep the checklist internal; expand
+only failures, unknowns and checks needed for review.
