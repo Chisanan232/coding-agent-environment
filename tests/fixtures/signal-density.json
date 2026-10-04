@@ -419,6 +419,220 @@
         "fully verified",
         "all production checks passed"
       ]
+    },
+    {
+      "id": "code-no-comment",
+      "surface": "Code without comment",
+      "source": "Draft next_retry_count(count: int) -> int returning count + 1. Add a comment explaining increment and a docstring just because a function exists. Check inputs 0 and 4. No business retry limit is supplied; do not invent one. Do not claim repository tests or a merge occurred.",
+      "candidate": "Increment the retry count by one; no comment or docstring is needed for the obvious operation.\n\n```python\ndef next_retry_count(count: int) -> int:\n    return count + 1\n```\n\nCheck inputs 0 and 4 against outputs 1 and 5. Business retry limit is not specified; this is a proposed function, not a verified repository change.",
+      "critical": [
+        {
+          "meaning": "increment outcome",
+          "anchor": "Increment the retry count by one"
+        },
+        {
+          "meaning": "actual code",
+          "anchor": "return count + 1"
+        },
+        {
+          "meaning": "obvious comment omitted",
+          "anchor": "no comment or docstring"
+        },
+        {
+          "meaning": "concrete checks",
+          "anchor": "outputs 1 and 5"
+        },
+        {
+          "meaning": "domain uncertainty",
+          "anchor": "Business retry limit is not specified"
+        },
+        {
+          "meaning": "proposal status",
+          "anchor": "proposed function"
+        }
+      ],
+      "noise": [
+        "# Increment the count",
+        "I then wrote"
+      ],
+      "unsupported": [
+        "repository tests passed",
+        "merged"
+      ],
+      "code": {
+        "comment": false,
+        "assertions": [
+          "next_retry_count(0) == 1",
+          "next_retry_count(4) == 5"
+        ]
+      }
+    },
+    {
+      "id": "code-constraint-comment",
+      "surface": "Code with non-obvious constraint",
+      "source": "Draft replay_key_expires_at(created_at) returning created_at + timedelta(hours=24), with datetime/timedelta imports. Provider replay remains valid for 24 hours per CONTRACT-4; the rationale must survive because shortening retention allows duplicate charges. Provider migration is not verified; compatibility owner must check CONTRACT-4 before changing retention. This is a proposal, no execution or merge evidence is supplied.",
+      "candidate": "Keep replay keys for 24 hours to prevent duplicate charges within the provider replay window (CONTRACT-4).\n\n```python\nfrom datetime import datetime, timedelta\n\ndef replay_key_expires_at(created_at: datetime) -> datetime:\n    # Provider replay remains valid for 24 hours (CONTRACT-4).\n    return created_at + timedelta(hours=24)\n```\n\nProvider migration is not verified; compatibility owner must check CONTRACT-4 before changing retention. This is proposed code.",
+      "critical": [
+        {
+          "meaning": "retention outcome",
+          "anchor": "Keep replay keys for 24 hours"
+        },
+        {
+          "meaning": "risk",
+          "anchor": "prevent duplicate charges"
+        },
+        {
+          "meaning": "durable external why",
+          "anchor": "Provider replay remains valid for 24 hours (CONTRACT-4)"
+        },
+        {
+          "meaning": "implementation contract",
+          "anchor": "timedelta(hours=24)"
+        },
+        {
+          "meaning": "unknown",
+          "anchor": "Provider migration is not verified"
+        },
+        {
+          "meaning": "owner action",
+          "anchor": "compatibility owner must check CONTRACT-4 before changing retention"
+        },
+        {
+          "meaning": "proposal status",
+          "anchor": "proposed code"
+        }
+      ],
+      "noise": [
+        "# Add 24 hours",
+        "I then wrote"
+      ],
+      "unsupported": [
+        "production safety verified",
+        "repository tests passed"
+      ],
+      "code": {
+        "comment": true,
+        "assertions": [
+          "replay_key_expires_at(datetime(2026, 1, 1)) == datetime(2026, 1, 2)"
+        ]
+      }
+    },
+    {
+      "id": "new-scope-route",
+      "surface": "Requirement Zero",
+      "source": "Use canonical Requirement Zero to assess NEW speculative configurable plugin scope for our only email provider. Supplied fixture: email delivery works; no user requested configuration; no second provider is committed. Core mission is reliable email delivery. SPE-84 is already human-approved and must not be reopened. Reach one canonical verdict, remove unsupported scope, preserve the useful existing integration, and state the re-evaluation trigger. No actual repository verification was performed for this fixture.",
+      "candidate": "REDUCE the speculative provider scope: retain reliable email delivery through the existing concrete integration. Supplied fixture evidence: delivery works, no user requested configuration, and no second provider is committed. Remove the plugin framework and provider configuration. Reassess when a named second consumer is committed or a user requests a specific configuration outcome. Actual repository behavior is not verified. Approved SPE-84 remains approved.",
+      "critical": [
+        {
+          "meaning": "canonical scope verdict",
+          "anchor": "REDUCE"
+        },
+        {
+          "meaning": "fundamental outcome",
+          "anchor": "reliable email delivery"
+        },
+        {
+          "meaning": "evidence provenance",
+          "anchor": "Supplied fixture evidence"
+        },
+        {
+          "meaning": "configuration evidence",
+          "anchor": "no user requested configuration"
+        },
+        {
+          "meaning": "consumer evidence",
+          "anchor": "no second provider is committed"
+        },
+        {
+          "meaning": "removed scope",
+          "anchor": "Remove the plugin framework and provider configuration"
+        },
+        {
+          "meaning": "trigger",
+          "anchor": "Reassess when a named second consumer is committed"
+        },
+        {
+          "meaning": "uncertainty",
+          "anchor": "Actual repository behavior is not verified"
+        },
+        {
+          "meaning": "approved work protected",
+          "anchor": "Approved SPE-84 remains approved"
+        }
+      ],
+      "noise": [
+        "I then created",
+        "future-proof architecture"
+      ],
+      "unsupported": [
+        "BUILD HARD",
+        "repository audit passed"
+      ]
+    },
+    {
+      "id": "existing-audit-route",
+      "surface": "Codebase Zero",
+      "source": "Use canonical Codebase Zero to audit hypothetical legacy CSV exporter ARTIFACT-4, not this repository. Mission: safe order fulfillment. Historical objective: CSV exports for retired customer. Supplied fixture searches show no callers, imports, config, deployment, CI or external consumers; history confirms original customer retired. No safety/security/legal/privacy/data-integrity/compatibility control. Removal blast radius is limited to unused exporter under fixture evidence. Maintenance benefit is less code, unquantified, and removal/focused validation still cost work. Recommend one verdict with mission/objective/evidence/confidence/blast-radius/benefit-cost/retained behavior/verification. Do not delete anything. Actual target HEAD was not independently inspected.",
+      "candidate": "DELETE is the audit recommendation for ARTIFACT-4; do not apply removal without separate authorization. Mission: safe order fulfillment. Objective: CSV exports for the retired customer. Supplied fixture searches found no dependents; history confirms retirement and no protective contract. Confidence is high within the fixture; actual target HEAD removal safety is not verified. Blast radius is the unused exporter under supplied evidence. Benefit is less code, unquantified; removal and focused validation still cost work. Retain safe order fulfillment. Before removal, recheck current dependents, history and external contracts, then validate affected behavior.",
+      "critical": [
+        {
+          "meaning": "canonical artifact verdict",
+          "anchor": "DELETE is the audit recommendation"
+        },
+        {
+          "meaning": "reference",
+          "anchor": "ARTIFACT-4"
+        },
+        {
+          "meaning": "audit authority",
+          "anchor": "separate authorization"
+        },
+        {
+          "meaning": "mission",
+          "anchor": "safe order fulfillment"
+        },
+        {
+          "meaning": "objective",
+          "anchor": "CSV exports for the retired customer"
+        },
+        {
+          "meaning": "provenance",
+          "anchor": "Supplied fixture searches found no dependents"
+        },
+        {
+          "meaning": "confidence",
+          "anchor": "Confidence is high within the fixture"
+        },
+        {
+          "meaning": "unknown",
+          "anchor": "actual target HEAD removal safety is not verified"
+        },
+        {
+          "meaning": "blast radius",
+          "anchor": "Blast radius is the unused exporter"
+        },
+        {
+          "meaning": "cost qualification",
+          "anchor": "unquantified; removal and focused validation still cost work"
+        },
+        {
+          "meaning": "retained outcome",
+          "anchor": "Retain safe order fulfillment"
+        },
+        {
+          "meaning": "verification action",
+          "anchor": "Before removal, recheck current dependents"
+        }
+      ],
+      "noise": [
+        "I then deleted",
+        "old means unnecessary"
+      ],
+      "unsupported": [
+        "actual repository searched",
+        "removal completed",
+        "production safety verified"
+      ]
     }
   ],
   "benign": [
