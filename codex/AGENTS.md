@@ -22,3 +22,25 @@ ALWAYS prefer MCP graph tools over grep/glob/file-search for code discovery.
 - Who calls it: `trace_path(function_name="OrderHandler", direction="inbound")`
 - Read source: `get_code_snippet(qualified_name="pkg/orders.OrderHandler")`
 <!-- codebase-memory-mcp:end -->
+
+<!-- coding-agent-environment:signal-first:start -->
+# Signal-first engineering
+
+Create only what has a current need. Search before creating; reuse or extend
+only matching semantic responsibilities, and reference canonical truth before
+repeating it. Avoid speculative abstractions; deletion/consolidation can improve
+an existing system.
+
+Code is primary implementation truth. Prefer clear names, types and boundaries.
+Comments/docstrings explain non-obvious why, constraints, invariants, safety,
+compatibility or external limitations—not obvious mechanics. Docs and tickets
+store durable decisions/outcomes without duplicating code or another source.
+
+Communicate semantic outcomes, not file/command chronology. Support material
+claims with evidence; keep inference and unknown/unverified state explicit.
+Use $evidence-first-briefing for persistent/shared engineering records, preserving
+decision-critical evidence, risks and action in roughly 10–30 seconds of reading.
+
+Use canonical $requirement-zero for NEW unvalidated scope and $codebase-zero for
+EXISTING artifact audits. Never reopen already-approved work through these skills.
+<!-- coding-agent-environment:signal-first:end -->

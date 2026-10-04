@@ -58,12 +58,26 @@ class BriefingInstallation(unittest.TestCase):
     def test_shared_body_report_apply_and_drift(self) -> None:
         root = Path(__file__).resolve().parent.parent
         with tempfile.TemporaryDirectory(prefix='codex-briefing-') as temp:
-            live = Path(temp)
+            live = Path(temp) / 'home'
+            desired_root = Path(temp) / 'repo'
+            for rel in ['scripts/profile-install.sh', 'codex/AGENTS.md',
+                        'codex/subtraction-skills.json', '.claude/skills/evidence-first-briefing/SKILL.md']:
+                dest = desired_root / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(root / rel, dest)
+            manifest = json.loads((desired_root / 'codex/subtraction-skills.json').read_text())
+            import hashlib
+            for name, spec in manifest['skills'].items():
+                folder = live / '.agents/skills' / name
+                folder.mkdir(parents=True)
+                (folder / 'SKILL.md').write_text('Disposable external skill fixture')
+                spec['files'] = {'SKILL.md': hashlib.sha256((folder / 'SKILL.md').read_bytes()).hexdigest()}
+            (desired_root / 'codex/subtraction-skills.json').write_text(json.dumps(manifest))
             config = live / '.codex/config.toml'
-            config.parent.mkdir()
+            config.parent.mkdir(parents=True)
             config.write_text('local_setting = "preserve"\n')
             env = dict(os.environ, CODING_AGENT_SYNC_HOME=str(live))
-            cmd = ['bash', str(root / 'scripts/profile-install.sh'), '--global']
+            cmd = ['bash', str(desired_root / 'scripts/profile-install.sh'), '--global']
             target = live / '.codex/skills/evidence-first-briefing/SKILL.md'
             source = root / '.claude/skills/evidence-first-briefing/SKILL.md'
             def run(*args):
@@ -81,7 +95,7 @@ class BriefingInstallation(unittest.TestCase):
             self.assertEqual(run().returncode, 0)
             self.assertEqual(run('--check').returncode, 0)
             self.assertEqual(config.read_text(), 'local_setting = "preserve"\n')
-            self.assertEqual(next((live / '.codex/backups').rglob('*.md')).read_text(), 'manual drift')
+            self.assertEqual(next((live / '.codex/backups').rglob('evidence-first-briefing.SKILL.md')).read_text(), 'manual drift')
 
 
 class DesiredStateDrift(unittest.TestCase):
