@@ -4,7 +4,7 @@
 #
 # Defaults to reporting all tracked surfaces. --codex checks only managed
 # signal-first Codex state. Applying is owned by profile-install.sh --global.
-# Usage: ./scripts/sync-check.sh [--codex | --capabilities]
+# Usage: ./scripts/sync-check.sh [--codex | --capabilities | --full-parity]
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -13,10 +13,15 @@ SYNC_HOME="${CODING_AGENT_SYNC_HOME:-$HOME}"
 
 if [[ "${1:-}" == "--codex" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --global --check
+elif [[ "${1:-}" == "--full-parity" && "$#" == 1 ]]; then
+    result=0
+    bash "$REPO_ROOT/scripts/profile-install.sh" --global --check || result=1
+    bash "$REPO_ROOT/scripts/profile-install.sh" --claude-skills --check || result=1
+    exit "$result"
 elif [[ "${1:-}" == "--capabilities" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --capabilities --check
 elif [[ "$#" != 0 ]]; then
-    echo 'Usage: sync-check.sh [--codex | --capabilities]' >&2
+    echo 'Usage: sync-check.sh [--codex | --capabilities | --full-parity]' >&2
     exit 2
 fi
 

@@ -104,9 +104,39 @@ Omit file chronology and unsupported completion claims.
 
 Do not merge until required checks, code-owner approvals, conflict resolution,
 branch currency, and blocking review threads satisfy the repository's real gates.
-Never use administrator privileges to bypass them.
+Administrator merge is never a bypass for a genuine product, test, security,
+quality, conflict, or substantive review failure. Exactly two narrow exceptions
+are authorized below; neither grants blanket administrator authority.
 Only the main coordinator may trigger the merge; an independent reviewer reports
 findings and evidence back to that coordinator.
+
+### Narrow administrator merge exceptions
+
+Use normal eligible independent review whenever it exists. Before any exception,
+verify the current PR head and mergeability, resolve conflicts and blocking
+findings, and record the qualifying evidence durably in the PR/tracker. Use
+**Create a merge commit**, never squash or rebase-merge for these exceptions.
+
+1. **CI_UNAVAILABLE_EXTERNAL**: independent evidence must prove an external,
+   account, or runner condition prevented CI from genuinely running or completing.
+   There must be no genuine product/test/security/quality failure. The full local
+   equivalent must be green, and the PR must be mergeable and conflict-free.
+   Record the external cause and local-equivalent evidence before admin merge.
+   A slow or healthy running job, missing observation, or author assertion alone
+   does not qualify; continue bounded polling of its authoritative handle.
+2. **Owner-only same-identity review deadlock**: a real governance/ownership check
+   must prove the PR author is the sole genuinely eligible required reviewer,
+   codeowner, or owner, with no alternative eligible independent reviewer/team.
+   Freshly verify the owner/admin identity. Self-review and an independent
+   adversarial agent review must both be clean. Every genuine required check
+   must be green, except a separately qualified CI_UNAVAILABLE_EXTERNAL condition.
+   There may be no unresolved blocking findings or conflicts. Record the
+   deadlock and justification durably before admin merge. An agent review does
+   not replace an available eligible independent repository reviewer.
+
+If either exception lacks its evidence, keep the normal gate pending. Fix a
+genuine failed check rather than reclassifying or bypassing it. No other approval,
+security, production, release, payment, or destructive-operation authority changes.
 
 ## Merge, reconcile, and clean up
 

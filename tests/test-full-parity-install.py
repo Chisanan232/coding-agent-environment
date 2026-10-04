@@ -43,6 +43,9 @@ class FullParity(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b'opaque unrelated state')
                 protected[path] = path.read_bytes()
+        claude_policy = self.home / '.claude/CLAUDE.md'
+        local_policy = b'Unrelated private Claude instructions\r\n'
+        claude_policy.write_bytes(local_policy)
         # Claude materialization must not depend on the unrelated Codex instruction override.
         override = self.home / '.codex/AGENTS.override.md'
         override.write_text('Private user override')
@@ -59,6 +62,20 @@ class FullParity(unittest.TestCase):
             target = self.home / ('.' + host) / 'skills/engineering-runtime/scripts/workflow-state.sh'
             self.assertEqual(target.read_bytes(), (self.repo / '.claude/hooks/workflow-state.sh').read_bytes())
             self.assertEqual(self.install(host, '--check').returncode, 0)
+        self.assertTrue(claude_policy.read_bytes().startswith(local_policy))
+        before_check = {p: p.read_bytes() for p in self.home.rglob('*') if p.is_file()}
+        full = subprocess.run(['bash', str(self.repo / 'scripts/sync-check.sh'), '--full-parity'],
+                              env=self.env, capture_output=True, text=True)
+        self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
+        self.assertEqual(before_check, {p: p.read_bytes() for p in self.home.rglob('*') if p.is_file()})
+        claude_skill = self.home / '.claude/skills/release-watch/SKILL.md'
+        saved = claude_skill.read_bytes()
+        claude_skill.unlink()
+        full = subprocess.run(['bash', str(self.repo / 'scripts/sync-check.sh'), '--full-parity'],
+                              env=self.env, capture_output=True, text=True)
+        self.assertEqual(full.returncode, 1, 'full parity check must include Claude managed practices')
+        self.assertFalse(claude_skill.exists())
+        claude_skill.write_bytes(saved)
         for path, prior in protected.items():
             self.assertEqual(path.read_bytes(), prior)
         missing = self.home / '.codex/skills/python-mypy-debugging/SKILL.md'

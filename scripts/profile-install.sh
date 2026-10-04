@@ -155,7 +155,7 @@ root, live = map(Path, sys.argv[1:3])
 dry, check = map(int, sys.argv[3:5])
 host_mode = sys.argv[5]
 host_dir = '.' + host_mode
-drift_label = 'Managed Codex drift' if host_mode == 'codex' else 'Managed Claude skill drift'
+drift_label = 'Managed Codex drift' if host_mode == 'codex' else 'Managed Claude practice drift'
 if dry and check:
     raise SystemExit('Choose --dry-run or --check, not both.')
 start = b'<!-- coding-agent-environment:signal-first:start -->'
@@ -163,10 +163,10 @@ end = b'<!-- coding-agent-environment:signal-first:end -->'
 
 def managed_span(content):
     if content.count(start) != 1 or content.count(end) != 1:
-        raise ValueError('Expected one matching managed AGENTS marker pair.')
+        raise ValueError('Expected one matching managed instruction marker pair.')
     lo, hi = content.index(start), content.index(end) + len(end)
     if lo >= hi - len(end):
-        raise ValueError('Reversed managed AGENTS markers.')
+        raise ValueError('Reversed managed instruction markers.')
     return lo, hi
 
 def reject_symlinks(path):
@@ -177,30 +177,34 @@ def reject_symlinks(path):
             raise ValueError(f'Refusing mutation through symlink: {part}')
 
 # Preflight must finish before mutation so a bad skill target cannot leave AGENTS partly applied.
-policy = (root / 'codex/AGENTS.md').read_bytes()
-lo, hi = managed_span(policy)
-block = policy[lo:hi]
-agents = live / '.codex/AGENTS.md'
-merged = b''
-if host_mode == 'codex':
+if host_mode == 'claude':
+    start = b'<!-- coding-agent-environment:engineering-workflow:start -->'
+    end = b'<!-- coding-agent-environment:engineering-workflow:end -->'
+    policy = (root / '.claude/CLAUDE.md').read_bytes()
+    agents = live / '.claude/CLAUDE.md'
+else:
+    policy = (root / 'codex/AGENTS.md').read_bytes()
+    agents = live / '.codex/AGENTS.md'
     if (agents.parent / 'AGENTS.override.md').exists():
         raise SystemExit('AGENTS.override.md overrides AGENTS.md; reconcile it explicitly first.')
-    reject_symlinks(agents)
-    prior = agents.read_bytes() if agents.exists() else b''
-    if start in prior or end in prior:
-        lo, hi = managed_span(prior)
-        merged = prior[:lo] + block + prior[hi:]
-    elif prior:
-        merged = prior + (b'' if prior.endswith(b'\n') else b'\n') + b'\n' + block + b'\n'
-    else:
-        merged = policy
+lo, hi = managed_span(policy)
+block = policy[lo:hi]
+reject_symlinks(agents)
+prior = agents.read_bytes() if agents.exists() else b''
+if start in prior or end in prior:
+    lo, hi = managed_span(prior)
+    merged = prior[:lo] + block + prior[hi:]
+elif prior:
+    merged = prior + (b'' if prior.endswith(b'\n') else b'\n') + b'\n' + block + b'\n'
+else:
+    merged = policy if host_mode == 'codex' else block + b'\n'
 shared_skills = ['evidence-first-briefing', 'engineering-workflow']
 shared_manifest = json.loads((root / 'codex/shared-skills.json').read_text())
 shared_skills += [name for name in shared_manifest['skills'] if name not in shared_skills]
 actual_skills = {p.parent.name for p in (root / '.claude/skills').glob('*/SKILL.md')}
 if actual_skills != set(shared_skills):
     raise SystemExit('Shared skill manifest does not cover the complete authored inventory.')
-managed = [(agents, merged, 'signal-first block; preserve outside bytes')] if host_mode == 'codex' else []
+managed = [(agents, merged, 'managed instruction block; preserve outside bytes')]
 for skill in shared_skills:
     folder = root / '.claude/skills' / skill
     body = (folder / 'SKILL.md').read_text()

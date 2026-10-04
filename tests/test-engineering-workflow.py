@@ -2,6 +2,8 @@
 """Semantic contract checks for the shared engineering workflow."""
 
 import re
+import json
+import os
 import unittest
 from pathlib import Path
 
@@ -55,6 +57,63 @@ class EngineeringWorkflowContract(unittest.TestCase):
         ]:
             with self.subTest(change_type=change_type):
                 self.assertIn(change_type, text)
+
+    def test_admin_exceptions_preserve_failure_and_eligibility_boundaries(self) -> None:
+        text = WORKFLOW.read_text()
+        section = text.split("### Narrow administrator merge exceptions", 1)[1]
+        required = [
+            "Use normal eligible independent review whenever it exists",
+            "independent evidence must prove an external",
+            "prevented CI from genuinely running or completing",
+            "no genuine product/test/security/quality failure",
+            "full local\n   equivalent must be green",
+            "mergeable and conflict-free",
+            "external cause and local-equivalent evidence before admin merge",
+            "slow or healthy running job",
+            "author assertion alone\n   does not qualify",
+            "real governance/ownership check",
+            "sole genuinely eligible required reviewer",
+            "no alternative eligible independent reviewer/team",
+            "Freshly verify the owner/admin identity",
+            "independent\n   adversarial agent review must both be clean",
+            "Every genuine required check\n   must be green",
+            "separately qualified CI_UNAVAILABLE_EXTERNAL",
+            "no unresolved blocking findings or conflicts",
+            "deadlock and justification durably before admin merge",
+            "does\n   not replace an available eligible independent repository reviewer",
+            "**Create a merge commit**, never squash or rebase-merge",
+            "Fix a\ngenuine failed check rather than reclassifying or bypassing it",
+        ]
+        for phrase in required:
+            with self.subTest(boundary=phrase):
+                self.assertIn(phrase, section)
+        self.assertIn("Exactly two narrow exceptions", text)
+        self.assertIn("neither grants blanket administrator authority", text)
+        self.assertNotIn("Never use administrator privileges to bypass them", text)
+        for path in [ROOT / '.claude/CLAUDE.md', ROOT / 'codex/AGENTS.md']:
+            self.assertIn('owner-only same-identity review deadlock', path.read_text())
+
+    def test_admin_exception_behavior_scenarios(self) -> None:
+        cases = json.loads((ROOT / "tests/fixtures/workflow-admin-exceptions.json").read_text())
+        indexed = {case["id"]: case for case in cases}
+        self.assertEqual(len(indexed), len(cases))
+        self.assertEqual({case["id"] for case in cases if case["admin_merge_allowed"]},
+                         {"external-qualified", "owner-qualified", "both-qualified"})
+        for boundary in ["product", "test", "security", "quality", "conflict", "review"]:
+            for kind in ["external", "owner"]:
+                self.assertFalse(indexed[f"{kind}-{boundary}"]["admin_merge_allowed"])
+        # Native behavioral validation supplies actual decisions; offline CI
+        # validates policy anchors and preserves the independently authored cases.
+        result_path = os.environ.get("WORKFLOW_ADMIN_PROBE_RESULTS")
+        if result_path:
+            results = json.loads(Path(result_path).read_text())
+            actual = {case["id"]: case for case in results}
+            self.assertEqual(len(results), len(actual))
+            self.assertEqual(set(actual), set(indexed))
+            for case_id, expected in indexed.items():
+                with self.subTest(case=case_id):
+                    self.assertIs(actual[case_id]["admin_merge_allowed"], expected["admin_merge_allowed"])
+                    self.assertTrue(actual[case_id]["reason"].strip())
 
     def test_pull_request_title_examples_and_negative_controls(self) -> None:
         valid = [
