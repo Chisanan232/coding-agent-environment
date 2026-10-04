@@ -80,10 +80,30 @@ Copy into your home config (review first):
 ```bash
 cp .mcp.json ~/.claude/.mcp.json
 cp -R .claude/CLAUDE.md .claude/RTK.md .claude/settings.json \
-      .claude/settings.global-only.json .claude/config.env \
+      .claude/config.env \
       .claude/mcp-servers.runtime.json .claude/statusline.py \
       .claude/subagent-statusline.py .claude/hooks .claude/skills ~/.claude/
 ```
+
+### Canonical subtraction skills
+
+Merge the `enabledPlugins` and `extraKnownMarketplaces` entries from
+`.claude/settings.global-only.json` into `~/.claude/settings.json`; the separate
+file is a desired-state reference, not a settings file Claude loads automatically.
+Preserve existing permissions, hooks and machine-specific settings.
+
+Install from the canonical repository (verified with Claude Code 2.1.274):
+
+```bash
+claude plugin marketplace add Chisanan232/requirement-zero --scope user
+claude plugin install requirement-zero@requirement-zero --scope user
+claude plugin details requirement-zero@requirement-zero
+```
+
+The plugin exposes `requirement-zero:requirement-zero` and
+`requirement-zero:codebase-zero`. Restart Claude Code to load newly installed
+skills. Update through `claude plugin update requirement-zero@requirement-zero`;
+never copy its skill bodies here. Approved work is not re-opened by Requirement Zero.
 
 ### Codex
 
