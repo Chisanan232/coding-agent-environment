@@ -5,16 +5,20 @@ description: "Inspect all open PRs in the repository and produce a health report
 
 # SKILL.md — pr-health-check  [COMMAND-LIKE SKILL]
 
+Read `engineering-runtime` first and initialize its host-aware environment before
+using the shell examples below. Resolve installed helper paths from that skill;
+never borrow another host’s private config, credentials or mutable state.
+
 ## Purpose
 Inspect all open PRs in the repository and produce a health report: which PRs
 are ready to merge, which are blocked, which are stale, and which are bot PRs
 requiring automated maintenance.
 
 ## Type
-Command-like. Run at each polling interval, or explicitly via `/pr-health-check`.
+Command-like. Run at each polling interval, or explicitly by naming `pr-health-check`.
 
 ## When to use
-- At each scheduled polling interval (see time-layer design in CLAUDE.md).
+- At each scheduled polling interval (see time-layer design in the active repository instructions).
 - When resuming to reassess repository state.
 - Before beginning a new task (to catch PRs that need unblocking first).
 
@@ -41,7 +45,7 @@ Classify each PR into one of:
 | `blocked-comments` | Unresolved blocking review comments |
 | `bot-pr-clean` | Bot author, CI green, no conflict |
 | `bot-pr-conflict` | Bot author, has lock-file conflict |
-| `stale` | No activity for `$CLAUDE_STALE_PR_DAYS` days after last review comment (default: 14, set in `~/.claude/config.env`) |
+| `stale` | No activity for `$ENGINEERING_STALE_PR_DAYS` days after last review comment (default: 14, set in the active host runtime configuration) |
 | `in-progress` | Active, not yet ready for review |
 
 ### 3. Act on each class

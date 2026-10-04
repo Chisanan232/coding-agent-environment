@@ -25,6 +25,7 @@ PROFILE_DIR="${CODING_AGENT_PROFILE_DIR:-$HOME/.coding-agent-profiles}"
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 DRY_RUN=0
 GLOBAL=0
+HOST_MODE=codex
 CHECK=0
 CAPABILITIES=0
 REMOVE=0
@@ -33,6 +34,7 @@ for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
         --global) GLOBAL=1 ;;
+        --claude-skills) GLOBAL=1; HOST_MODE=claude ;;
         --check) CHECK=1 ;;
         --capabilities) CAPABILITIES=1 ;;
         --remove) REMOVE=1 ;;
@@ -133,11 +135,11 @@ PYCAPABILITIES
 fi
 
 if (( GLOBAL )); then
-    if [[ -n "${CODEX_HOME:-}" && "$CODEX_HOME" != "${CODING_AGENT_SYNC_HOME:-$HOME}/.codex" ]]; then
+    if [[ "$HOST_MODE" == codex && -n "${CODEX_HOME:-}" && "$CODEX_HOME" != "${CODING_AGENT_SYNC_HOME:-$HOME}/.codex" ]]; then
         echo 'Global mode requires the standard user Codex home; custom CODEX_HOME is not managed.' >&2
         exit 2
     fi
-    python3 - "$REPO_ROOT" "${CODING_AGENT_SYNC_HOME:-$HOME}" "$DRY_RUN" "$CHECK" <<'PYGLOBAL'
+    python3 - "$REPO_ROOT" "${CODING_AGENT_SYNC_HOME:-$HOME}" "$DRY_RUN" "$CHECK" "$HOST_MODE" <<'PYGLOBAL'
 import datetime
 import hashlib
 import json
@@ -150,7 +152,10 @@ import sys
 import tempfile
 
 root, live = map(Path, sys.argv[1:3])
-dry, check = map(int, sys.argv[3:])
+dry, check = map(int, sys.argv[3:5])
+host_mode = sys.argv[5]
+host_dir = '.' + host_mode
+drift_label = 'Managed Codex drift' if host_mode == 'codex' else 'Managed Claude skill drift'
 if dry and check:
     raise SystemExit('Choose --dry-run or --check, not both.')
 start = b'<!-- coding-agent-environment:signal-first:start -->'
@@ -176,27 +181,49 @@ policy = (root / 'codex/AGENTS.md').read_bytes()
 lo, hi = managed_span(policy)
 block = policy[lo:hi]
 agents = live / '.codex/AGENTS.md'
-if (agents.parent / 'AGENTS.override.md').exists():
-    raise SystemExit('AGENTS.override.md overrides AGENTS.md; reconcile it explicitly first.')
-reject_symlinks(agents)
-prior = agents.read_bytes() if agents.exists() else b''
-if start in prior or end in prior:
-    lo, hi = managed_span(prior)
-    merged = prior[:lo] + block + prior[hi:]
-elif prior:
-    merged = prior + (b'' if prior.endswith(b'\n') else b'\n') + b'\n' + block + b'\n'
-else:
-    merged = policy
+merged = b''
+if host_mode == 'codex':
+    if (agents.parent / 'AGENTS.override.md').exists():
+        raise SystemExit('AGENTS.override.md overrides AGENTS.md; reconcile it explicitly first.')
+    reject_symlinks(agents)
+    prior = agents.read_bytes() if agents.exists() else b''
+    if start in prior or end in prior:
+        lo, hi = managed_span(prior)
+        merged = prior[:lo] + block + prior[hi:]
+    elif prior:
+        merged = prior + (b'' if prior.endswith(b'\n') else b'\n') + b'\n' + block + b'\n'
+    else:
+        merged = policy
 shared_skills = ['evidence-first-briefing', 'engineering-workflow']
-managed = [(agents, merged, 'signal-first block; preserve outside bytes')]
+shared_manifest = json.loads((root / 'codex/shared-skills.json').read_text())
+shared_skills += [name for name in shared_manifest['skills'] if name not in shared_skills]
+actual_skills = {p.parent.name for p in (root / '.claude/skills').glob('*/SKILL.md')}
+if actual_skills != set(shared_skills):
+    raise SystemExit('Shared skill manifest does not cover the complete authored inventory.')
+managed = [(agents, merged, 'signal-first block; preserve outside bytes')] if host_mode == 'codex' else []
 for skill in shared_skills:
-    source = root / '.claude/skills' / skill / 'SKILL.md'
-    target = live / '.codex/skills' / skill / 'SKILL.md'
+    folder = root / '.claude/skills' / skill
+    body = (folder / 'SKILL.md').read_text()
+    if not body.startswith('---\n') or ('name: ' + skill + '\n') not in body:
+        raise SystemExit(f'Invalid native skill metadata: {skill}')
+    sources = {str(p.relative_to(folder)): p for p in folder.rglob('*') if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.pyc'}
+    for relative, source in shared_manifest['resources'].get(skill, {}).items():
+        sources[relative] = root / source
+    for relative, source in sources.items():
+        target = live / host_dir / 'skills' / skill / relative
+        reject_symlinks(target)
+        managed.append((target, source.read_bytes(), str(source.relative_to(root))))
+for name in shared_manifest['profiles'] if host_mode == 'codex' else []:
+    source = root / 'codex' / name
+    target = live / '.codex' / name
     reject_symlinks(target)
+    if target.exists() and not target.read_bytes().startswith(b'# coding-agent-environment:managed-'):
+        raise SystemExit(f'Refusing unowned native profile: {target}')
     managed.append((target, source.read_bytes(), str(source.relative_to(root))))
 plans = []
 for path, data, label in managed:
-    changed = not path.exists() or path.read_bytes() != data
+    profile = path.name in shared_manifest['profiles']
+    changed = not path.exists() or path.read_bytes() != data or (profile and stat.S_IMODE(path.stat().st_mode) != 0o600)
     print(f"{'DIFFERS' if changed else 'IDENTICAL'} {path} <- {label}")
     if changed:
         plans.append((path, data))
@@ -207,7 +234,7 @@ for path, data, label in managed:
                 print(f'Desired SHA256: {hashlib.sha256(data).hexdigest()} ({len(data)} bytes)')
 manifest = json.loads((root / 'codex/subtraction-skills.json').read_text())
 missing = []
-for skill, spec in manifest['skills'].items():
+for skill, spec in manifest['skills'].items() if host_mode == 'codex' else []:
     folder = live / '.agents/skills' / skill
     bad = [name for name, digest in spec['files'].items()
            if not (folder / name).is_file()
@@ -222,7 +249,7 @@ for skill, spec in manifest['skills'].items():
             print(f'  {name} -> SHA256 {spec["files"][name]}')
 remaining = len(plans) + len(missing)
 if dry or check:
-    print(f'Managed Codex drift: {remaining}')
+    print(f'{drift_label}: {remaining}')
     raise SystemExit(int(bool(remaining) and check))
 if missing and live.resolve() != Path.home().resolve():
     raise SystemExit('External installation requires the actual home; fixture checks stay offline.')
@@ -233,7 +260,7 @@ if missing:
     unrelated_skills = {name: value for name, value in prior_lock.get('skills', {}).items()
                         if name not in missing}
 if remaining:
-    backup = live / '.codex/backups/coding-agent-environment' / datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    backup = live / host_dir / 'backups/coding-agent-environment' / datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     reject_symlinks(backup)
     backup.mkdir(parents=True, mode=0o700)
     for path in [p for p, _ in plans] + [live / '.agents/skills' / name for name in missing] + ([lock] if missing else []):
@@ -264,7 +291,7 @@ if missing:
             raise SystemExit('External installer did not produce the pinned canonical content; restore from backup.')
 for path, data in plans:
     path.parent.mkdir(parents=True, exist_ok=True)
-    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
+    mode = 0o600 if path.name in shared_manifest['profiles'] else (stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644)
     fd, name = tempfile.mkstemp(dir=path.parent)
     try:
         with os.fdopen(fd, 'wb') as f:
@@ -276,7 +303,7 @@ for path, data in plans:
             os.unlink(name)
     if path.read_bytes() != data:
         raise SystemExit(f'Validation failed: {path}')
-print('Managed Codex drift: 0')
+print(f'{drift_label}: 0')
 PYGLOBAL
     exit $?
 fi

@@ -78,13 +78,8 @@ class BriefingInstallation(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='codex-briefing-') as temp:
             live = Path(temp) / 'home'
             desired_root = Path(temp) / 'repo'
-            for rel in ['scripts/profile-install.sh', 'codex/AGENTS.md',
-                        'codex/subtraction-skills.json',
-                        '.claude/skills/evidence-first-briefing/SKILL.md',
-                        '.claude/skills/engineering-workflow/SKILL.md']:
-                dest = desired_root / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(root / rel, dest)
+            for rel in ['.claude', 'codex', 'scripts']:
+                shutil.copytree(root / rel, desired_root / rel)
             manifest = json.loads((desired_root / 'codex/subtraction-skills.json').read_text())
             import hashlib
             for name, spec in manifest['skills'].items():
@@ -211,6 +206,9 @@ class DesiredStateDrift(unittest.TestCase):
                          workflow_dest / 'SKILL.md')
             root = desired_root
             env = dict(os.environ, CODING_AGENT_SYNC_HOME=str(live))
+            applied = subprocess.run(['bash', str(root / 'scripts/profile-install.sh'), '--global'],
+                                     env=env, capture_output=True, text=True)
+            self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
 
             def check(expected: int, marker: str = '') -> None:
                 before = {p.relative_to(live): p.read_bytes()

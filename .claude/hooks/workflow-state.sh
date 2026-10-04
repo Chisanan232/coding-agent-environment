@@ -13,9 +13,9 @@
 
 set -euo pipefail
 
-[ -f "${HOME}/.claude/config.env" ] && source "${HOME}/.claude/config.env"
+[ -f "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}" ] && source "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}"
 
-STATE_DIR="${CLAUDE_WORKFLOW_STATE_DIR:-${HOME}/.claude/workflow-state}"
+STATE_DIR="${ENGINEERING_WORKFLOW_STATE_DIR-${CLAUDE_WORKFLOW_STATE_DIR:-${ENGINEERING_STATE_DIR:-${HOME}/.claude}/workflow-state}}"
 ARCHIVE_DIR="${STATE_DIR}/archive"
 
 cmd="${1:-}"

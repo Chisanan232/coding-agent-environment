@@ -1,7 +1,12 @@
+---
+name: python-pytest-failure-debugging
+description: "Diagnose and fix pytest failures \u2014 distinguishing test bugs from implementation bugs, reading tracebacks correctly, and resolving fixture, import, and assertion errors so the test suite returns to green."
+---
+
 # SKILL.md — python-pytest-failure-debugging
 
 > **Language**: Python. This skill is specific to pytest.
-> For other languages, see `~/.claude/skills/README.md`.
+> For other languages, see `the installed language-repair skills`.
 
 ## Purpose
 Diagnose and fix pytest failures — distinguishing test bugs from implementation
@@ -9,7 +14,7 @@ bugs, reading tracebacks correctly, and resolving fixture, import, and
 assertion errors so the test suite returns to green.
 
 ## Type
-Auto-used. Claude Code invokes this skill when pytest reports failures or errors.
+Auto-used. The coding agent invokes this skill when pytest reports failures or errors.
 
 ## Do Not Assume
 - Do not assume the failure is in the implementation — the test itself may be wrong.

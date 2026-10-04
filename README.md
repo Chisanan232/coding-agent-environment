@@ -138,29 +138,39 @@ with `scripts/profile-install.sh --capabilities --remove`; inspect drift with
 `scripts/sync-check.sh --capabilities`. `CODING_AGENT_SYNC_HOME` selects a
 disposable home for offline lifecycle validation.
 
-The shared authored skills are
-[evidence-first-briefing](.claude/skills/evidence-first-briefing/SKILL.md) and
-[engineering-workflow](.claude/skills/engineering-workflow/SKILL.md). Claude
-consumes them directly; Codex receives exact materialized user-scoped copies.
-Edit only these sources, then report, apply and check:
+The complete shared authored corpus is enumerated in
+[codex/shared-skills.json](codex/shared-skills.json). Each host receives exact
+materialized bodies from `.claude/skills`; runtime resources map to their
+canonical helpers, with native paths/config/state selected by `engineering-runtime`.
+Edit canonical sources, then report, apply and check each host:
 
 ```bash
 scripts/profile-install.sh --global --dry-run
 scripts/profile-install.sh --global
 scripts/profile-install.sh --global --check
+scripts/profile-install.sh --claude-skills --dry-run
+scripts/profile-install.sh --claude-skills
+scripts/profile-install.sh --claude-skills --check
+codex --profile engineering-reference
 ```
 
-This mode owns the marked signal-first AGENTS block, the materialized shared skills,
-and canonical subtraction installations. Apply preflights the complete plan,
-backs up changed owned paths under `~/.codex/backups/coding-agent-environment/`,
-and atomically replaces the managed AGENTS/shared-skill files. It preserves
-unrelated instructions and Codex config/plugins/trust. External skill provenance and file digests live
-in `codex/subtraction-skills.json`; bodies remain owned by
-[Chisanan232/requirement-zero](https://github.com/Chisanan232/requirement-zero).
-The pinned skills CLI installs the selected revision into universal
-`~/.agents/skills`, which native Codex discovers. Approved work is never reopened.
-It uses `CODING_AGENT_SYNC_HOME` for disposable validation homes; native profile
-installation without `--global` retains its existing behavior.
+Global Codex mode owns the marked signal-first AGENTS block, all manifest skills
+and resources, native read-only capability/reference profiles, and pinned
+subtraction installations. Claude mode owns only materialized shared skills;
+it preserves CLAUDE/settings/plugins/auth. A manifest omission fails preflight,
+so missing newly portable procedures cannot produce a false zero-drift report.
+Apply backs up changed paths, checks symlink ancestry and profile ownership, and
+atomically replaces managed files. Unrelated instructions, config, plugins,
+trust and credentials remain untouched. Optional host-private runtime config is
+never installed or overwritten. Context7 uses its official public read-only MCP
+endpoint without copying Claude authentication; rate/auth unavailability remains
+explicit. Its profile is opt-in and does not globally expand tool authority.
+
+External subtraction provenance/digests remain in `codex/subtraction-skills.json`;
+bodies remain owned by [Chisanan232/requirement-zero](https://github.com/Chisanan232/requirement-zero)
+and native Codex discovers the pinned universal `~/.agents/skills` installation.
+Use `CODING_AGENT_SYNC_HOME` for disposable offline validation homes. Review the
+[full inventory and proof boundaries](docs/FULL-PARITY.md) before claiming parity.
 
 Successful installation is not behavior proof: start a fresh Codex process after
 applying. `scripts/sync-check.sh --codex` checks only the managed signal-first

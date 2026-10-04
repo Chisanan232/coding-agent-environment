@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "skills": [
+    "acceptance-validation",
+    "architecture-design",
+    "bot-pr-maintainer",
+    "ci-failure-triage",
+    "code-review-prep",
+    "codebase-memory",
+    "cross-repo-coordinator",
+    "dependency-upgrade-review",
+    "dev-impl-loop",
+    "engineering-runtime",
+    "engineering-workflow",
+    "evidence-first-briefing",
+    "feature-implementation",
+    "go-golangci-fixing",
+    "go-vet-debugging",
+    "memory-handoff",
+    "morning-brief",
+    "node-precommit-repair",
+    "pdf-operations",
+    "post-merge-close",
+    "pr-feedback-response",
+    "pr-health-check",
+    "pr-readiness",
+    "project-setup",
+    "python-mypy-debugging",
+    "python-precommit-repair",
+    "python-pytest-failure-debugging",
+    "python-ruff-fixing",
+    "release-preparation",
+    "release-readiness",
+    "release-watch",
+    "task-decomposition",
+    "test-design",
+    "ticket-intake",
+    "ticket-pickup-check",
+    "typescript-eslint-fixing",
+    "typescript-tsc-debugging",
+    "workflow-resume"
+  ],
+  "resources": {
+    "engineering-runtime": {
+      "scripts/audit_log.sh": ".claude/hooks/audit_log.sh",
+      "scripts/circuit-breaker-gate.sh": ".claude/hooks/circuit-breaker-gate.sh",
+      "scripts/decision-log.sh": ".claude/hooks/decision-log.sh",
+      "scripts/full-test-gate.sh": ".claude/hooks/full-test-gate.sh",
+      "scripts/precommit-gate.sh": ".claude/hooks/precommit-gate.sh",
+      "scripts/quality_gate.sh": ".claude/hooks/quality_gate.sh",
+      "scripts/session-memory.sh": ".claude/hooks/session-memory.sh",
+      "scripts/workflow-state.sh": ".claude/hooks/workflow-state.sh",
+      "references/RTK.md": ".claude/RTK.md"
+    }
+  },
+  "profiles": [
+    "capabilities-readonly.config.toml",
+    "engineering-reference.config.toml"
+  ]
+}

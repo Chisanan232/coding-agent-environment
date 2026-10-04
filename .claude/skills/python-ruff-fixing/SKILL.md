@@ -1,3 +1,8 @@
+---
+name: python-ruff-fixing
+description: "Fix ruff lint violations correctly and consistently."
+---
+
 # SKILL.md — python-ruff-fixing
 
 > **Language**: Python. This skill is specific to the ruff linter/formatter.

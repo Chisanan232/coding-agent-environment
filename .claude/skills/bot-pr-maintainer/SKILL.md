@@ -1,13 +1,13 @@
 ---
 name: bot-pr-maintainer
-description: "Handle dependency bot and pre-commit maintenance bot PRs according to the Bot PR Policy in CLAUDE.md: approve and merge clean PRs; trigger rebase and re-evaluate conflicted PRs; escalate only when the update itself causes CI failure."
+description: "Handle dependency bot and pre-commit maintenance bot PRs according to the Bot PR Policy in the active repository instructions: approve and merge clean PRs; trigger rebase and re-evaluate conflicted PRs; escalate only when the update itself causes CI failure."
 ---
 
 # SKILL.md — bot-pr-maintainer
 
 ## Purpose
 Handle dependency bot and pre-commit maintenance bot PRs according to the
-Bot PR Policy in CLAUDE.md: approve and merge clean PRs; trigger rebase and
+Bot PR Policy in the active repository instructions: approve and merge clean PRs; trigger rebase and
 re-evaluate conflicted PRs; escalate only when the update itself causes CI failure.
 
 ## Type

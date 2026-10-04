@@ -5,6 +5,10 @@ description: "Resolve substantive review concerns with evidence and request revi
 
 # SKILL.md — pr-feedback-response
 
+Read `engineering-runtime` first and initialize its host-aware environment before
+using the shell examples below. Resolve installed helper paths from that skill;
+never borrow another host’s private config, credentials or mutable state.
+
 ## Purpose
 Process reviewer comments on an open PR, address each one with targeted code
 changes, and re-request review when all feedback is resolved. Ensures no
@@ -61,7 +65,7 @@ Auto-used. Run when a PR has new review comments or a "Request Changes" verdict.
 14. Re-request review from all reviewers who had active "Request Changes" verdicts.
 15. Update workflow state:
     ```bash
-    bash ~/.claude/hooks/workflow-state.sh write \
+    bash "${ENGINEERING_RUNTIME}/workflow-state.sh" write \
       "[ticket-ref]" "pr-feedback-response" "done" "done" "awaiting_review"
     ```
 

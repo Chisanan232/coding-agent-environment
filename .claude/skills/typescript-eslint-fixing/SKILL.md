@@ -1,14 +1,19 @@
+---
+name: typescript-eslint-fixing
+description: "Fix ESLint violations in TypeScript and JavaScript files so the linter exits clean. Covers both auto-fixable and manual violations."
+---
+
 # SKILL.md — typescript-eslint-fixing
 
 > **Language**: TypeScript / JavaScript. This skill is specific to ESLint.
-> For other languages, see `~/.claude/skills/README.md`.
+> For other languages, see `the installed language-repair skills`.
 
 ## Purpose
 Fix ESLint violations in TypeScript and JavaScript files so the linter exits
 clean. Covers both auto-fixable and manual violations.
 
 ## Type
-Auto-used. Claude Code invokes this skill when ESLint reports violations.
+Auto-used. The coding agent invokes this skill when ESLint reports violations.
 
 ## Do Not Assume
 - Do not assume all violations are auto-fixable — run `--fix` first, then

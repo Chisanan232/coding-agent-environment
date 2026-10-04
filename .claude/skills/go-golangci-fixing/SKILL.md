@@ -1,14 +1,19 @@
+---
+name: go-golangci-fixing
+description: "Fix lint violations reported by `golangci-lint run` so the linter exits clean. Covers the most common linters in a default golangci-lint configuration."
+---
+
 # SKILL.md — go-golangci-fixing
 
 > **Language**: Go. This skill is specific to `golangci-lint`.
-> For other languages, see `~/.claude/skills/README.md`.
+> For other languages, see `the installed language-repair skills`.
 
 ## Purpose
 Fix lint violations reported by `golangci-lint run` so the linter exits clean.
 Covers the most common linters in a default golangci-lint configuration.
 
 ## Type
-Auto-used. Claude Code invokes this skill when `golangci-lint` reports violations.
+Auto-used. The coding agent invokes this skill when `golangci-lint` reports violations.
 
 ## Do Not Assume
 - Do not assume all violations have auto-fixes — most require manual edits.

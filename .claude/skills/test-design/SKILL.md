@@ -1,3 +1,8 @@
+---
+name: test-design
+description: "Design tests that are deterministic, fast, isolated, and focused on observable behavior rather than implementation details."
+---
+
 # SKILL.md — test-design
 
 ## Purpose
@@ -5,13 +10,13 @@ Design tests that are deterministic, fast, isolated, and focused on observable
 behavior rather than implementation details.
 
 ## Type
-Auto-used. Claude Code invokes this skill when designing or reviewing tests.
+Auto-used. The coding agent invokes this skill when designing or reviewing tests.
 
 ## Do Not Assume
 - Do not assume the test framework configuration is default — read the project's
   test runner config first (e.g., `pyproject.toml`, `jest.config.js`, `go.mod`).
 - Do not assume that high coverage means good tests.
-- Do not assume mocking is appropriate — check CLAUDE.md for the project's mock policy.
+- Do not assume mocking is appropriate — check the active repository instructions for the project's mock policy.
 - Do not assume existing tests are correct templates — read them critically.
 
 ## Steps
@@ -28,7 +33,7 @@ Auto-used. Claude Code invokes this skill when designing or reviewing tests.
    (e.g., `test_<unit>_<condition>_<result>` for Python/Rust,
    `Test<Unit><Condition>` for Go, `it('should <result> when <condition>')` for JS/TS).
 6. For each external dependency, decide: real (integration) or stub (unit)?
-   Follow CLAUDE.md test strategy for this project.
+   Follow the active repository instructions test strategy for this project.
 7. Ensure tests are independent — no shared mutable state between tests.
 
 ### Phase 3 — Write tests

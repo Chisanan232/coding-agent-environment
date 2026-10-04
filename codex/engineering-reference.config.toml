@@ -1,0 +1,8 @@
+# coding-agent-environment:managed-engineering-reference:v1
+# Anonymous public documentation lookup; no OAuth or API-key copying.
+# Native opt-in external profile. Preserve unrelated base MCP/plugin settings.
+[mcp_servers.context7]
+url = "https://mcp.context7.com/mcp"
+enabled = true
+enabled_tools = ["resolve-library-id", "query-docs"]
+default_tools_approval_mode = "prompt"

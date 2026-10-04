@@ -18,11 +18,11 @@
 
 set -euo pipefail
 
-[ -f "${HOME}/.claude/config.env" ] && source "${HOME}/.claude/config.env"
+[ -f "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}" ] && source "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}"
 
 # Allow engineers who run tests outside the agent workflow to opt out.
 # Set CLAUDE_SKIP_TEST_GATE=1 in ~/.claude/config.env to disable this gate.
-if [[ "${CLAUDE_SKIP_TEST_GATE:-0}" == "1" ]]; then
+if [[ "${ENGINEERING_SKIP_TEST_GATE-${CLAUDE_SKIP_TEST_GATE:-0}}" == "1" ]]; then
     echo "[HOOK] full-test-gate: skipped (CLAUDE_SKIP_TEST_GATE=1)." >&2
     exit 0
 fi
@@ -48,7 +48,7 @@ echo "$COMMAND" | grep -qiE "git push" || exit 0
 
 # ── Compute per-repo, per-branch sentinel path ────────────────────────────────
 
-SENTINEL_BASE="${CLAUDE_SENTINEL_DIR:-${HOME}/.claude/sentinels}"
+SENTINEL_BASE="${ENGINEERING_SENTINEL_DIR-${CLAUDE_SENTINEL_DIR:-${ENGINEERING_STATE_DIR:-${HOME}/.claude}/sentinels}}"
 
 # Resolve the repo URL using whatever remote is configured — do not hardcode
 # 'origin'. If two repos both fall back to 'origin' and neither has one, they

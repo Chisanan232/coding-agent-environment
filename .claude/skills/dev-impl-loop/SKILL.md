@@ -5,6 +5,10 @@ description: "Drive a single ticket through the full implementation cycle: imple
 
 # SKILL.md — dev-impl-loop
 
+Read `engineering-runtime` first and initialize its host-aware environment before
+using the shell examples below. Resolve installed helper paths from that skill;
+never borrow another host’s private config, credentials or mutable state.
+
 ## Purpose
 Drive a single ticket through the full implementation cycle:
 implement → run relative tests → iterate until green → full test suite →
@@ -23,7 +27,7 @@ Auto-used. Run immediately after `ticket-pickup-check` passes.
 ## Ticket context
 Resolve the active ticket reference at the start of every phase:
 ```bash
-TICKET="${CLAUDE_CURRENT_TICKET:-$(cat .claude/.current-ticket 2>/dev/null || echo '')}"
+TICKET="${ENGINEERING_CURRENT_TICKET:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-ticket" 2>/dev/null || echo '')}"
 ```
 If empty, stop and ask the engineer to run `ticket-pickup-check` first.
 
@@ -32,7 +36,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
 ### Phase 0 — Environment verification (before the loop starts)
 1. Resolve the active worktree and change into it:
    ```bash
-   WORKTREE="${CLAUDE_CURRENT_WORKTREE:-$(cat .claude/.current-worktree 2>/dev/null || echo '')}"
+   WORKTREE="${ENGINEERING_CURRENT_WORKTREE:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-worktree" 2>/dev/null || echo '')}"
    if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
      cd "$WORKTREE"
    elif [ -n "$WORKTREE" ]; then
@@ -45,13 +49,13 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
    ```
 2. Load and surface prior session notes:
    ```bash
-   bash ~/.claude/hooks/session-memory.sh read "$TICKET"
+   bash "${ENGINEERING_RUNTIME}/session-memory.sh" read "$TICKET"
    ```
    Review any recorded decisions, partial work, or blockers before proceeding.
    Do not repeat steps already logged as complete in session notes.
 3. Confirm the circuit breaker for this ticket is in "closed" state:
    ```bash
-   bash ~/.claude/hooks/circuit-breaker-gate.sh check "$TICKET"
+   bash "${ENGINEERING_RUNTIME}/circuit-breaker-gate.sh" check "$TICKET"
    ```
 4. Pull from the branch's configured upstream when one exists:
    ```bash
@@ -63,12 +67,12 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
 5. Confirm working directory is clean (no stale changes from a previous session).
 6. Update workflow state: step 1 of 5.
    ```bash
-   bash ~/.claude/hooks/workflow-state.sh write \
+   bash "${ENGINEERING_RUNTIME}/workflow-state.sh" write \
      "$TICKET" "dev-impl-loop" "1" "5" "in_progress"
    ```
    Record the decision:
    ```bash
-   bash ~/.claude/hooks/decision-log.sh record \
+   bash "${ENGINEERING_RUNTIME}/decision-log.sh" record \
      --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
      --phase "0" --decision "proceed" \
      --reason "Circuit closed, branch current, working tree clean"
@@ -81,7 +85,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
    a. Implement **one unit of work** — the smallest independently meaningful
       piece: a new data model, a new function, a bug fix, a single refactoring
       step, or a requirement adjustment. Do not bundle multiple units into one
-      iteration. Follow all conventions in CLAUDE.md (naming, structure, type hints).
+      iteration. Follow all conventions in the active repository instructions (naming, structure, type hints).
    b. Run **relative tests only** — tests in the affected module or package.
       Do not run the full suite here (too slow for iteration).
    c. If relative tests pass → commit the change with a GitEmoji message.
@@ -97,12 +101,12 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
       - Re-run relative tests. Repeat from (b).
       - Record the failure and check the circuit breaker:
         ```bash
-        bash ~/.claude/hooks/circuit-breaker-gate.sh record-failure "$TICKET" 5
+        bash "${ENGINEERING_RUNTIME}/circuit-breaker-gate.sh" record-failure "$TICKET" 5
         ```
         If the circuit opens, stop and escalate to the engineer.
    e. If relative tests pass after a fix:
       ```bash
-      bash ~/.claude/hooks/circuit-breaker-gate.sh record-success "$TICKET"
+      bash "${ENGINEERING_RUNTIME}/circuit-breaker-gate.sh" record-success "$TICKET"
       ```
 8. Continue iterations until all ticket acceptance criteria are implemented
    and relative tests are green.
@@ -113,14 +117,14 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
 10. Run the complete test suite (all modules, not just relative).
     Update workflow state: step 2 of 5.
     ```bash
-    bash ~/.claude/hooks/workflow-state.sh write \
+    bash "${ENGINEERING_RUNTIME}/workflow-state.sh" write \
       "$TICKET" "dev-impl-loop" "2" "5" "in_progress"
     ```
 11. If any test fails:
     a. Determine: is the failure in code I changed, or pre-existing?
     b. Pre-existing failure → document it, report to the engineer, do not fix.
        ```bash
-       bash ~/.claude/hooks/decision-log.sh record \
+       bash "${ENGINEERING_RUNTIME}/decision-log.sh" record \
          --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
          --phase "2" --decision "escalate" \
          --reason "Pre-existing test failure — not caused by this change" \
@@ -129,13 +133,13 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
     c. Failure in changed code → one fix iteration to resolve.
        Record failure and check circuit breaker:
        ```bash
-       bash ~/.claude/hooks/circuit-breaker-gate.sh record-failure "$TICKET" 3
+       bash "${ENGINEERING_RUNTIME}/circuit-breaker-gate.sh" record-failure "$TICKET" 3
        ```
-       On success: `bash ~/.claude/hooks/circuit-breaker-gate.sh record-success "$TICKET"`
+       On success: `bash "${ENGINEERING_RUNTIME}/circuit-breaker-gate.sh" record-success "$TICKET"`
 12. All tests must pass before proceeding to Phase 3.
     Record decision:
     ```bash
-    bash ~/.claude/hooks/decision-log.sh record \
+    bash "${ENGINEERING_RUNTIME}/decision-log.sh" record \
       --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
       --phase "2" --decision "proceed" \
       --reason "Full test suite green" --context "[N passed, 0 failed]"
@@ -145,7 +149,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
 13. Run `pre-commit run --all-files`.
     Update workflow state: step 3 of 5.
     ```bash
-    bash ~/.claude/hooks/workflow-state.sh write \
+    bash "${ENGINEERING_RUNTIME}/workflow-state.sh" write \
       "$TICKET" "dev-impl-loop" "3" "5" "in_progress"
     ```
 14. If any check fails: use the language-appropriate pre-commit repair skill
@@ -154,7 +158,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
     Do not use `--no-verify`.
 15. When all checks pass: write the test sentinel (scoped to this repo+branch).
     ```bash
-    SENTINEL_BASE="${CLAUDE_SENTINEL_DIR:-${HOME}/.claude/sentinels}"
+    SENTINEL_BASE="${ENGINEERING_SENTINEL_DIR:-${ENGINEERING_STATE_DIR}/sentinels}"
     # Portable SHA-256: shasum (macOS/BSD) with fallback to sha256sum (Linux/GNU)
     _sha256() { shasum -a 256 2>/dev/null || sha256sum; }
     # Resolve repo URL from whatever remote is configured — do not hardcode 'origin'.
@@ -170,7 +174,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
     ```
     Record decision:
     ```bash
-    bash ~/.claude/hooks/decision-log.sh record \
+    bash "${ENGINEERING_RUNTIME}/decision-log.sh" record \
       --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
       --phase "3" --decision "proceed" \
       --reason "Pre-commit clean; sentinel updated"
@@ -180,12 +184,12 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
 16. Update ticket state to "Ready for QA" in the issue tracker.
     Update workflow state: step 4 of 5.
     ```bash
-    bash ~/.claude/hooks/workflow-state.sh write \
+    bash "${ENGINEERING_RUNTIME}/workflow-state.sh" write \
       "$TICKET" "dev-impl-loop" "4" "5" "in_progress"
     ```
     Record decision:
     ```bash
-    bash ~/.claude/hooks/decision-log.sh record \
+    bash "${ENGINEERING_RUNTIME}/decision-log.sh" record \
       --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
       --phase "4" --decision "qa-handoff" \
       --reason "All phases green; running acceptance-validation"
@@ -200,9 +204,9 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
 19. If the acceptance-validation verdict is "ready":
     a. Update workflow state: step 5 of 5, status "complete".
        ```bash
-       bash ~/.claude/hooks/workflow-state.sh write \
+       bash "${ENGINEERING_RUNTIME}/workflow-state.sh" write \
          "$TICKET" "dev-impl-loop" "5" "5" "complete"
-       bash ~/.claude/hooks/decision-log.sh record \
+       bash "${ENGINEERING_RUNTIME}/decision-log.sh" record \
          --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
          --phase "5" --decision "open-pr" \
          --reason "QA verdict: ready" --context "[acceptance-validation verdict summary]"
@@ -225,9 +229,9 @@ When the circuit breaker trips:
 1. Stop the loop immediately.
 2. Write state as "circuit_open" with an escalation reason:
    ```bash
-   bash ~/.claude/hooks/workflow-state.sh write \
+   bash "${ENGINEERING_RUNTIME}/workflow-state.sh" write \
      "$TICKET" "dev-impl-loop" "[current-step]" "5" "escalated"
-   bash ~/.claude/hooks/decision-log.sh record \
+   bash "${ENGINEERING_RUNTIME}/decision-log.sh" record \
      --ticket "$TICKET" --agent "main-agent" --skill "dev-impl-loop" \
      --phase "[current-phase]" --decision "escalate" \
      --reason "Circuit open after [N] consecutive failures" \
@@ -235,13 +239,13 @@ When the circuit breaker trips:
    ```
 3. Write a session note so the next session can see why work was interrupted:
    ```bash
-   bash ~/.claude/hooks/session-memory.sh append "$TICKET" \
+   bash "${ENGINEERING_RUNTIME}/session-memory.sh" append "$TICKET" \
      "Circuit breaker tripped" \
      "Phase [current-phase] hit [N] consecutive failures. Last error: [summary]. Awaiting engineer reset."
    ```
 4. Report to the engineer with the failure summary and ticket reference.
 5. Do not retry until the engineer resets the breaker:
-   `bash ~/.claude/hooks/circuit-breaker-gate.sh reset $TICKET`
+   `bash "${ENGINEERING_RUNTIME}/circuit-breaker-gate.sh" reset $TICKET`
 
 ## Output
 

@@ -5,6 +5,10 @@ description: "Validate that a delivered implementation meets its acceptance crit
 
 # SKILL.md — acceptance-validation
 
+Read `engineering-runtime` first and initialize its host-aware environment before
+using the shell examples below. Resolve installed helper paths from that skill;
+never borrow another host’s private config, credentials or mutable state.
+
 ## Purpose
 Validate that a delivered implementation meets its acceptance criteria from an
 external tester perspective, covering happy paths, edge cases, and regressions.
@@ -41,7 +45,7 @@ a pre-merge validation report from an external tester perspective.
 
 ### Phase 3b — UI and E2E validation (when applicable)
 9. If the ticket involves UI changes or end-to-end user flows, run browser validation:
-   1. If `CLAUDE_E2E_COMMAND` is set: `${CLAUDE_E2E_COMMAND}`
+   1. If `ENGINEERING_E2E_COMMAND` is set: `${ENGINEERING_E2E_COMMAND}`
    2. If Playwright MCP is enabled: navigate key user journeys via accessibility tree,
       capture page snapshots for pass evidence and screenshots for failures.
    3. If neither is configured: note the gap in the report; describe manual steps taken.

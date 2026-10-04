@@ -1,6 +1,6 @@
 ---
 name: ci-failure-triage
-description: Diagnose and reproduce CI failures, repair the cause, and verify the affected capability.
+description: "Diagnose and reproduce CI failures, repair the cause, and verify the affected capability."
 ---
 
 # SKILL.md — ci-failure-triage
@@ -10,7 +10,7 @@ Identify the root cause of a CI failure, reproduce it locally, apply a targeted 
 and verify the fix before pushing.
 
 ## Type
-Auto-used. Claude Code invokes this skill whenever CI is red.
+Auto-used. The coding agent invokes this skill whenever CI is red.
 
 ## Do Not Assume
 - Do not assume the failure is caused by your most recent change — check the history.
@@ -68,7 +68,7 @@ Auto-used. Claude Code invokes this skill whenever CI is red.
 20. Ask: can a regression test prevent this failure from recurring?
 21. If yes, add it.
 22. If the failure was caused by an environment difference, document it in the
-    project's `.claude/CLAUDE.md` (not the global `~/.claude/CLAUDE.md`) or the
+    project's `the active repository instructions` (not the global `~/the active repository instructions`) or the
     project's troubleshooting guide.
 
 ## Safe-Fix Guidance

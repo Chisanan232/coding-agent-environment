@@ -16,10 +16,10 @@
 
 set -euo pipefail
 
-[ -f "${HOME}/.claude/config.env" ] && source "${HOME}/.claude/config.env"
+[ -f "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}" ] && source "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}"
 
-BREAKER_DIR="${CLAUDE_CIRCUIT_BREAKER_DIR:-${HOME}/.claude/circuit-breaker}"
-DEFAULT_THRESHOLD="${CLAUDE_CIRCUIT_BREAKER_THRESHOLD:-5}"
+BREAKER_DIR="${ENGINEERING_CIRCUIT_BREAKER_DIR-${CLAUDE_CIRCUIT_BREAKER_DIR:-${ENGINEERING_STATE_DIR:-${HOME}/.claude}/circuit-breaker}}"
+DEFAULT_THRESHOLD="${ENGINEERING_CIRCUIT_BREAKER_THRESHOLD-${CLAUDE_CIRCUIT_BREAKER_THRESHOLD:-5}}"
 mkdir -p "$BREAKER_DIR"
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -85,7 +85,7 @@ if [[ "${1:-}" == "check" ]]; then
 
   if [[ "$state" == "open" ]]; then
     echo "[circuit-breaker] OPEN for ${ticket} — ${failures} consecutive failures (threshold: ${threshold})" >&2
-    echo "Reset with: bash ~/.claude/hooks/circuit-breaker-gate.sh reset ${ticket}" >&2
+    echo "Reset with: bash "${ENGINEERING_RUNTIME:-${HOME}/.claude/hooks}/circuit-breaker-gate.sh" reset ${ticket}" >&2
     exit 1
   fi
 

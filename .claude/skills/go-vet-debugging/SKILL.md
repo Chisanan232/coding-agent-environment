@@ -1,14 +1,19 @@
+---
+name: go-vet-debugging
+description: "Diagnose and fix errors reported by `go vet` and `go build` \u2014 including suspicious constructs, misused sync primitives, and structural type errors."
+---
+
 # SKILL.md — go-vet-debugging
 
 > **Language**: Go. This skill is specific to `go vet` and the Go compiler.
-> For other languages, see `~/.claude/skills/README.md`.
+> For other languages, see `the installed language-repair skills`.
 
 ## Purpose
 Diagnose and fix errors reported by `go vet` and `go build` — including
 suspicious constructs, misused sync primitives, and structural type errors.
 
 ## Type
-Auto-used. Claude Code invokes this skill when `go vet` or `go build` reports errors.
+Auto-used. The coding agent invokes this skill when `go vet` or `go build` reports errors.
 
 ## Do Not Assume
 - Do not assume `go vet` errors are cosmetic — they detect real runtime bugs

@@ -13,7 +13,7 @@ contract owns the lifecycle and title format.
 
 ## Type
 
-Command-like. Invoke explicitly via `/pr-readiness` or a request to run the PR
+Command-like. Invoke explicitly by naming `pr-readiness` or a request to run the PR
 readiness check.
 
 ## Procedure

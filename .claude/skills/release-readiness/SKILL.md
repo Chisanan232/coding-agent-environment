@@ -9,7 +9,7 @@ description: "Confirm that the codebase is in a releasable state before tagging 
 Confirm that the codebase is in a releasable state before tagging a release.
 
 ## Type
-Command-like. Invoke explicitly via `/release-readiness` or by asking Claude Code
+Command-like. Invoke explicitly by naming `release-readiness` or by asking The coding agent
 to "Run the release readiness check."
 
 ## When to use
