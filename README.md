@@ -113,6 +113,27 @@ by hand if you already have machine-specific `[projects.*]`/`[mcp_servers.*]`
 entries in `~/.codex/config.toml`. Preserve unrelated global instructions when
 merging `codex/AGENTS.md`.
 
+For an opt-in read-only capability session, install the native external profile
+and launch Codex with it:
+
+```bash
+scripts/profile-install.sh --capabilities --dry-run
+scripts/profile-install.sh --capabilities
+scripts/profile-install.sh --capabilities --check
+codex --profile capabilities-readonly
+```
+
+The profile disables the broad Neon app for that session and enables the
+official Neon read-only MCP endpoint with a fixed ten-tool allowlist. Only
+`run_sql` is auto-approved, within the server-enforced read-only endpoint; the
+profile does not grant write or secret-management tools. Installation owns only
+`~/.codex/capabilities-readonly.config.toml`, keeps it mode `0600`, backs up an
+owned prior version before update/removal, and refuses unknown or symlinked
+targets. It never rewrites `~/.codex/config.toml` or OAuth/auth state. Remove it
+with `scripts/profile-install.sh --capabilities --remove`; inspect drift with
+`scripts/sync-check.sh --capabilities`. `CODING_AGENT_SYNC_HOME` selects a
+disposable home for offline lifecycle validation.
+
 The single authored briefing body is
 [.claude/skills/evidence-first-briefing/SKILL.md](.claude/skills/evidence-first-briefing/SKILL.md).
 Claude consumes it directly; Codex receives a materialized user-scoped copy.
