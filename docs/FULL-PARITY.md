@@ -88,10 +88,13 @@ required shared skill/resource, instruction block and owned capability profile.
 No auth copying, permission widening, host-hook trust mutation or wholesale config
 replacement. Live unknown state is preserved.
 
-The live administrator-merge exceptions conflict with SPE-33's no-bypass contract.
-This is a founder authority decision, explicitly CURRENTLY_BLOCKED, rather than
-a silently dropped behavior. Independent work proceeds with the existing safer
-contract; no administrator merge is attempted.
+The founder resolved the live administrator-merge policy conflict on October 4:
+retain two narrow exceptions in the canonical shared engineering-workflow.
+Independent external-CI evidence plus green full local equivalents may qualify;
+owner-only deadlock additionally requires real reviewer/governance checks,
+fresh identity, clean self/adversarial review, and actual required gates. Genuine
+product/test/security/quality/conflict/substantive-review failures never qualify.
+Both native adapters route to that one contract, with durable evidence required.
 
 ## Actual live-only surface
 
@@ -148,8 +151,9 @@ private state, native state overlap, open circuit, missing acceptance sentinel
 and warning/strict outcomes. These prove apply and helper contracts, not model
 behavior. Existing SPE-33 and SPE-84–89 regressions remain required.
 
-The live administrator-merge exception conflicts with the completed SPE-33
-contract and awaits a founder decision. Installation preserves that live policy;
-no administrator merge is authorized by this migration. Fresh Claude quota and
-missing calendar source remain explicit external blockers. SPE-92 requires
+The founder-authorized SPE-33 amendment resolves the prior merge-policy conflict.
+Claude installs only a marked routing block while preserving all surrounding
+instructions. `sync-check.sh --full-parity` checks both hosts' complete managed
+practice state; legacy whole-file reporting remains separate. Fresh Claude quota
+and missing calendar source remain explicit external blockers. SPE-92 still needs
 independent fresh two-host scenario evidence before a full-parity verdict.

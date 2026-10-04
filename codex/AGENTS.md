@@ -49,6 +49,11 @@ commits, validation, review, pull request, merge, Jira reconciliation, and clean
 Pull-request titles use
 `[<ticket-number>] <emoji> <scope>: <imperative summary under 60 chars>`.
 
+The shared engineering-workflow contract alone owns the two narrowly authorized
+administrator-merge exceptions: qualified `CI_UNAVAILABLE_EXTERNAL` and verified
+owner-only same-identity review deadlock. Apply every evidence, identity, review,
+check and merge-strategy condition there; never bypass a genuine failing gate.
+
 Apply the installed engineering skills by their actual triggers: `ticket-intake`
 for new unaccepted work, `ticket-pickup-check` before ticket implementation,
 `task-decomposition` for approved outcome/dependency planning, and

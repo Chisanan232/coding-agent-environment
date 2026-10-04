@@ -324,6 +324,7 @@ extension guidance live in [skills/README.md](skills/README.md).
 
 ---
 
+<!-- coding-agent-environment:engineering-workflow:start -->
 ## Merge Policy
 
 Apply the required checks, code-owner approvals, conflict, branch-currency, and
@@ -331,6 +332,16 @@ review-thread gates from
 [engineering-workflow](skills/engineering-workflow/SKILL.md). Use **Create a
 merge commit**; do not squash or rebase-merge unless a later explicit user
 instruction authorizes that strategy.
+
+The shared contract is the sole canonical authority for the two narrow
+administrator-merge exceptions: qualified `CI_UNAVAILABLE_EXTERNAL` and verified
+owner-only same-identity review deadlock. Apply every evidence, identity, review,
+check and merge-strategy condition there; never bypass a genuine failing gate.
+
+
+This managed routing is authoritative for the shared engineering lifecycle;
+read existing merge-specific wording through the canonical contract above.
+<!-- coding-agent-environment:engineering-workflow:end -->
 
 ---
 

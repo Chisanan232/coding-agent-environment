@@ -151,13 +151,14 @@ scripts/profile-install.sh --global --check
 scripts/profile-install.sh --claude-skills --dry-run
 scripts/profile-install.sh --claude-skills
 scripts/profile-install.sh --claude-skills --check
+scripts/sync-check.sh --full-parity
 codex --profile engineering-reference
 ```
 
 Global Codex mode owns the marked signal-first AGENTS block, all manifest skills
 and resources, native read-only capability/reference profiles, and pinned
-subtraction installations. Claude mode owns only materialized shared skills;
-it preserves CLAUDE/settings/plugins/auth. A manifest omission fails preflight,
+subtraction installations. Claude mode owns materialized shared skills and a marked canonical-workflow
+routing block; it preserves surrounding CLAUDE instructions/settings/plugins/auth. A manifest omission fails preflight,
 so missing newly portable procedures cannot produce a false zero-drift report.
 Apply backs up changed paths, checks symlink ancestry and profile ownership, and
 atomically replaces managed files. Unrelated instructions, config, plugins,
