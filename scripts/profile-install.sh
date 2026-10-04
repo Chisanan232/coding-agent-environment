@@ -89,6 +89,8 @@ if target.exists() and not target.is_file():
 prior = target.read_bytes() if target.exists() else None
 if prior is not None and not prior.startswith(marker):
     raise SystemExit('Refusing to overwrite an unowned capability profile.')
+if remove and prior is not None and prior != desired:
+    raise SystemExit('Refusing to remove a drifted capability profile; reconcile owned content first.')
 
 expected = None if remove else desired
 mode_ok = prior is None or stat.S_IMODE(target.stat().st_mode) == 0o600
