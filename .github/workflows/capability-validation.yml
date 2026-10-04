@@ -32,4 +32,4 @@ jobs:
           bash -n scripts/profile-install.sh scripts/sync-check.sh
           bash tests/test-capability-profile.sh
           bash tests/test-profile-resolver.sh
-          bash tests/test-signal-density-global.sh
+          python3 tests/test-signal-density.py
