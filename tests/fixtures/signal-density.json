@@ -1,0 +1,446 @@
+{
+  "cases": [
+    {
+      "id": "pr-flow",
+      "surface": "PR",
+      "source": "First I edited gateway.py, then worker.py, then added tests. Tenant authorization now runs before queue admission instead of inside the worker. Unauthorized jobs are rejected before enqueue. The response schema remains v1. Queue/authorization assertions passed in run/auth-14. Load behavior is not verified. Rollout owner must run the load check before deployment. Contract details are owned by ADR-7. Awesome, everything looks great!",
+      "candidate": "Tenant authorization now runs before queue admission, rejecting unauthorized jobs before enqueue. The v1 response schema remains unchanged (ADR-7). Queue/authorization assertions passed in run/auth-14. Load behavior is not verified; rollout owner must run the load check before deployment.",
+      "critical": [
+        {
+          "meaning": "authorization boundary",
+          "anchor": "before queue admission"
+        },
+        {
+          "meaning": "rejection before enqueue",
+          "anchor": "before enqueue"
+        },
+        {
+          "meaning": "compatibility",
+          "anchor": "v1 response schema"
+        },
+        {
+          "meaning": "evidence",
+          "anchor": "run/auth-14"
+        },
+        {
+          "meaning": "unknown",
+          "anchor": "Load behavior is not verified"
+        },
+        {
+          "meaning": "action",
+          "anchor": "rollout owner must run the load check before deployment"
+        },
+        {
+          "meaning": "canonical contract",
+          "anchor": "ADR-7"
+        }
+      ],
+      "noise": [
+        "First I edited",
+        "then worker.py",
+        "Awesome"
+      ],
+      "unsupported": [
+        "everything looks great",
+        "production safe"
+      ]
+    },
+    {
+      "id": "ticket-completion",
+      "surface": "Jira/ClickUp",
+      "source": "I opened csv.py, renamed a variable, wrote test_import.py, ran tests and committed. The parser now preserves a quoted comma within one field. All 12 parser assertions passed in run/csv-12. PR-41 is merged. Streaming imports were not verified; their rollout remains blocked until the import owner verifies them. Ticket IMPORT-9 owns the criteria. All done and production safe!",
+      "candidate": "Quoted commas now remain within one CSV field. All 12 parser assertions passed (run/csv-12); PR-41 merged. Streaming imports were not verified; rollout remains blocked until the import owner verifies them (IMPORT-9).",
+      "critical": [
+        {
+          "meaning": "observable behavior",
+          "anchor": "Quoted commas now remain within one CSV field"
+        },
+        {
+          "meaning": "test boundary",
+          "anchor": "12 parser assertions"
+        },
+        {
+          "meaning": "evidence",
+          "anchor": "run/csv-12"
+        },
+        {
+          "meaning": "merge",
+          "anchor": "PR-41 merged"
+        },
+        {
+          "meaning": "unknown",
+          "anchor": "Streaming imports were not verified"
+        },
+        {
+          "meaning": "owner action",
+          "anchor": "rollout remains blocked until the import owner verifies them"
+        },
+        {
+          "meaning": "ticket reference",
+          "anchor": "IMPORT-9"
+        }
+      ],
+      "noise": [
+        "I opened",
+        "renamed a variable",
+        "committed"
+      ],
+      "unsupported": [
+        "production safe",
+        "all acceptance criteria verified"
+      ]
+    },
+    {
+      "id": "blocked-unknown",
+      "surface": "Blocker",
+      "source": "First I retried login, then reopened the console, then looked at deployment.yaml. Staging migration is blocked because credentials are unavailable (run/migrate-3). No migration executed. Production compatibility is unknown. Platform owner must restore staging credentials before validation. MIG-8 owns the rollout gate. It should be fine once this is sorted.",
+      "candidate": "Staging migration is blocked: credentials are unavailable (run/migrate-3). No migration executed; production compatibility is unknown. Platform owner must restore staging credentials before validation (MIG-8).",
+      "critical": [
+        {
+          "meaning": "state",
+          "anchor": "Staging migration is blocked"
+        },
+        {
+          "meaning": "cause",
+          "anchor": "credentials are unavailable"
+        },
+        {
+          "meaning": "evidence",
+          "anchor": "run/migrate-3"
+        },
+        {
+          "meaning": "execution unknown avoided",
+          "anchor": "No migration executed"
+        },
+        {
+          "meaning": "material unknown",
+          "anchor": "production compatibility is unknown"
+        },
+        {
+          "meaning": "owner action",
+          "anchor": "Platform owner must restore staging credentials before validation"
+        },
+        {
+          "meaning": "gate",
+          "anchor": "MIG-8"
+        }
+      ],
+      "noise": [
+        "First I retried",
+        "then reopened",
+        "deployment.yaml"
+      ],
+      "unsupported": [
+        "should be fine",
+        "migration passed"
+      ]
+    },
+    {
+      "id": "issue-proposal",
+      "surface": "GitHub issue",
+      "source": "We should add an importer manager, plugin registry, config framework and three child tickets for parsing, coding and testing. Proposed outcome: reject duplicate invoices before queue admission to avoid repeated charges. Preserve the v1 receipt contract. Accept when two concurrent submissions create one charge and return the original receipt. Depends on PAY-6. Provider timeout behavior remains unknown; payments owner must define timeout acceptance before implementation. Requirement decision RZ-2 approved this bounded outcome.",
+      "candidate": "Proposed: reject duplicate invoices before queue admission to avoid repeated charges. Preserve the v1 receipt contract. Accept when two concurrent submissions create one charge and return the original receipt. Depends on PAY-6; provider timeout behavior remains unknown, so payments owner must define timeout acceptance before implementation (RZ-2).",
+      "critical": [
+        {
+          "meaning": "proposal not completion",
+          "anchor": "Proposed:"
+        },
+        {
+          "meaning": "behavior",
+          "anchor": "reject duplicate invoices before queue admission"
+        },
+        {
+          "meaning": "business impact",
+          "anchor": "avoid repeated charges"
+        },
+        {
+          "meaning": "constraint",
+          "anchor": "v1 receipt contract"
+        },
+        {
+          "meaning": "acceptance",
+          "anchor": "two concurrent submissions create one charge and return the original receipt"
+        },
+        {
+          "meaning": "dependency",
+          "anchor": "PAY-6"
+        },
+        {
+          "meaning": "unknown",
+          "anchor": "provider timeout behavior remains unknown"
+        },
+        {
+          "meaning": "action",
+          "anchor": "payments owner must define timeout acceptance before implementation"
+        },
+        {
+          "meaning": "approval reference",
+          "anchor": "RZ-2"
+        }
+      ],
+      "noise": [
+        "plugin registry",
+        "config framework",
+        "three child tickets"
+      ],
+      "unsupported": [
+        "implemented",
+        "production safe"
+      ]
+    },
+    {
+      "id": "review-reply",
+      "surface": "PR review",
+      "source": "Thanks, awesome feedback! I edited lock.py, then reran pytest, then pushed 7ab2. Concurrent replay now checks the persisted key before charging. Assertion replay_concurrent passed in run/replay-4 at 7ab2. Timeout recovery is unresolved in thread-17. Reviewer must assess that remaining concern before approval. All review comments resolved!",
+      "candidate": "Concurrent replay now checks the persisted key before charging; replay_concurrent passed (run/replay-4, 7ab2). Timeout recovery remains unresolved in thread-17; reviewer must assess it before approval.",
+      "critical": [
+        {
+          "meaning": "behavior",
+          "anchor": "checks the persisted key before charging"
+        },
+        {
+          "meaning": "specific evidence",
+          "anchor": "replay_concurrent passed"
+        },
+        {
+          "meaning": "run",
+          "anchor": "run/replay-4"
+        },
+        {
+          "meaning": "commit boundary",
+          "anchor": "7ab2"
+        },
+        {
+          "meaning": "unresolved risk",
+          "anchor": "Timeout recovery remains unresolved"
+        },
+        {
+          "meaning": "thread",
+          "anchor": "thread-17"
+        },
+        {
+          "meaning": "review action",
+          "anchor": "reviewer must assess it before approval"
+        }
+      ],
+      "noise": [
+        "awesome feedback",
+        "I edited lock.py",
+        "then pushed"
+      ],
+      "unsupported": [
+        "All review comments resolved",
+        "approved"
+      ]
+    },
+    {
+      "id": "chat-status",
+      "surface": "Slack/Teams",
+      "source": "Great news! First we edited flags.json, then deployed build-29, then clicked around. Staging search now respects tenant isolation. Staging assertions passed in run/search-8. Production rollout has not started. Release owner must review compatibility in PR-52 before rollout. Everything looks great.",
+      "candidate": "Staging search now respects tenant isolation (run/search-8). Production rollout has not started; release owner must review compatibility in PR-52 before rollout.",
+      "critical": [
+        {
+          "meaning": "capability and environment",
+          "anchor": "Staging search now respects tenant isolation"
+        },
+        {
+          "meaning": "evidence",
+          "anchor": "run/search-8"
+        },
+        {
+          "meaning": "deployment boundary",
+          "anchor": "Production rollout has not started"
+        },
+        {
+          "meaning": "owner action",
+          "anchor": "release owner must review compatibility"
+        },
+        {
+          "meaning": "review reference",
+          "anchor": "PR-52"
+        },
+        {
+          "meaning": "gate",
+          "anchor": "before rollout"
+        }
+      ],
+      "noise": [
+        "Great news",
+        "First we edited",
+        "clicked around"
+      ],
+      "unsupported": [
+        "Everything looks great",
+        "production deployed"
+      ]
+    },
+    {
+      "id": "release-risk",
+      "surface": "Release",
+      "source": "We updated version.py, edited seven files, merged PR-61, ran packaging and pushed a tag. v3.0 is published at release/v3.0; artifact/package-3 is accessible. It removes legacy unsigned webhooks. Consumers must configure signing keys before upgrade; migration guide MIG-12 owns instructions. Signed webhook assertions passed in run/webhook-19. Third-party consumer upgrades are not verified. Awesome release!",
+      "candidate": "v3.0 is published (release/v3.0); artifact/package-3 is accessible and removes legacy unsigned webhooks. Consumers must configure signing keys before upgrade (MIG-12). Signed webhook assertions passed in run/webhook-19; third-party consumer upgrades are not verified.",
+      "critical": [
+        {
+          "meaning": "publication",
+          "anchor": "v3.0 is published"
+        },
+        {
+          "meaning": "release",
+          "anchor": "release/v3.0"
+        },
+        {
+          "meaning": "artifact",
+          "anchor": "artifact/package-3"
+        },
+        {
+          "meaning": "breaking change",
+          "anchor": "removes legacy unsigned webhooks"
+        },
+        {
+          "meaning": "migration action",
+          "anchor": "Consumers must configure signing keys before upgrade"
+        },
+        {
+          "meaning": "canonical migration",
+          "anchor": "MIG-12"
+        },
+        {
+          "meaning": "evidence scope",
+          "anchor": "Signed webhook assertions passed"
+        },
+        {
+          "meaning": "run",
+          "anchor": "run/webhook-19"
+        },
+        {
+          "meaning": "unknown",
+          "anchor": "third-party consumer upgrades are not verified"
+        },
+        {
+          "meaning": "artifact accessibility evidence",
+          "anchor": "artifact/package-3 is accessible"
+        }
+      ],
+      "noise": [
+        "updated version.py",
+        "edited seven files",
+        "Awesome release"
+      ],
+      "unsupported": [
+        "all consumers upgraded",
+        "fully compatible"
+      ]
+    },
+    {
+      "id": "comment-doc",
+      "surface": "Code/comment/docs",
+      "source": "Add an increment-counter comment above count += 1, and copy the replay implementation into a new API guide. The count name and statement already express incrementing; replay algorithm is canonical in service/replay.py. Preserve the non-obvious provider constraint: keys must remain for 24 hours because provider replay expires then (CONTRACT-4). Provider migration is not verified; compatibility owner must check CONTRACT-4 before changing retention. I then wrote a docstring for each function.",
+      "candidate": "Keep the 24-hour key-retention rationale: provider replay expires then (CONTRACT-4). Omit the obvious increment comment and copied replay guide; service/replay.py owns the algorithm. Provider migration is not verified; compatibility owner must check CONTRACT-4 before changing retention.",
+      "critical": [
+        {
+          "meaning": "rationale retained",
+          "anchor": "24-hour key-retention rationale"
+        },
+        {
+          "meaning": "why",
+          "anchor": "provider replay expires then"
+        },
+        {
+          "meaning": "contract",
+          "anchor": "CONTRACT-4"
+        },
+        {
+          "meaning": "obvious comment omitted",
+          "anchor": "Omit the obvious increment comment"
+        },
+        {
+          "meaning": "duplicate doc omitted",
+          "anchor": "copied replay guide"
+        },
+        {
+          "meaning": "code truth",
+          "anchor": "service/replay.py owns the algorithm"
+        },
+        {
+          "meaning": "unknown",
+          "anchor": "Provider migration is not verified"
+        },
+        {
+          "meaning": "protective action",
+          "anchor": "compatibility owner must check CONTRACT-4 before changing retention"
+        }
+      ],
+      "noise": [
+        "I then wrote",
+        "docstring for each function"
+      ],
+      "unsupported": [
+        "delete replay protection",
+        "retention is safe to remove"
+      ]
+    },
+    {
+      "id": "validation",
+      "surface": "Validation",
+      "source": "First I ran resolver.py then checked each scenario. Case 1 passed, case 2 passed, case 3 passed, case 4 passed and here is a giant success table. All 31 required profile assertions passed in run/profile-31. Production MCP connectivity was not verified because credentials are unavailable. Integration owner must verify it before production use. PROFILE-5 owns the criteria. Everything is fully verified!",
+      "candidate": "31/31 required profile assertions passed (run/profile-31). Production MCP connectivity was not verified: credentials are unavailable. Integration owner must verify it before production use (PROFILE-5).",
+      "critical": [
+        {
+          "meaning": "summary and boundary",
+          "anchor": "31/31 required profile assertions passed"
+        },
+        {
+          "meaning": "run",
+          "anchor": "run/profile-31"
+        },
+        {
+          "meaning": "unknown",
+          "anchor": "Production MCP connectivity was not verified"
+        },
+        {
+          "meaning": "reason",
+          "anchor": "credentials are unavailable"
+        },
+        {
+          "meaning": "required action",
+          "anchor": "Integration owner must verify it before production use"
+        },
+        {
+          "meaning": "criteria reference",
+          "anchor": "PROFILE-5"
+        }
+      ],
+      "noise": [
+        "First I ran",
+        "Case 1 passed",
+        "giant success table"
+      ],
+      "unsupported": [
+        "fully verified",
+        "all production checks passed"
+      ]
+    }
+  ],
+  "benign": [
+    {
+      "id": "quoted-filler",
+      "text": "The incident log says “Everything looks great”; that unsupported claim concealed the failed auth check (run/auth-9). Security owner must review INC-2.",
+      "why": "Relevant attributed quotation is necessary evidence."
+    },
+    {
+      "id": "file-is-contract",
+      "text": "Files changed: schema.json is the published API contract; deleting legacy_id breaks v1 clients (contract/v1). Compatibility owner must approve the migration.",
+      "why": "The file is itself a compatibility interface."
+    },
+    {
+      "id": "causal-order",
+      "text": "Authorize first, then enqueue; otherwise unauthorized jobs enter the worker queue (run/auth-14).",
+      "why": "Control-flow ordering is the semantic change."
+    },
+    {
+      "id": "necessary-long-record",
+      "text": "Upgrade requires four owner actions (MIG-12). Consumer 1 must install its signing key before upgrade; its compatibility result is not verified (run/consumer-1). Consumer 2 must install its signing key before upgrade; its compatibility result is not verified (run/consumer-2). Consumer 3 must install its signing key before upgrade; its compatibility result is not verified (run/consumer-3). Consumer 4 must install its signing key before upgrade; its compatibility result is not verified (run/consumer-4). Consumer 5 must install its signing key before upgrade; its compatibility result is not verified (run/consumer-5). Consumer 6 must install its signing key before upgrade; its compatibility result is not verified (run/consumer-6). Consumer 7 must install its signing key before upgrade; its compatibility result is not verified (run/consumer-7). Consumer 8 must install its signing key before upgrade; its compatibility result is not verified (run/consumer-8). Consumer 9 must install its signing key before upgrade; its compatibility result is not verified (run/consumer-9). Consumer 10 must install its signing key before upgrade; its compatibility result is not verified (run/consumer-10). Consumer 11 must install its signing key before upgrade; its compatibility result is not verified (run/consumer-11). Consumer 12 must install its signing key before upgrade; its compatibility result is not verified (run/consumer-12).",
+      "why": "Length alone cannot erase required actions and unknowns."
+    }
+  ]
+}

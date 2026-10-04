@@ -25,7 +25,7 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 | `mise.toml`, `Brewfile` | Declarative CLI toolchain (see `docs/TOOLCHAIN.md`) |
 | `bin/coding-agent-profile`, `bin/coding-agent-profile-explain`, `bin/ca-claude`, `bin/ca-codex` | Directory-scoped profile resolver + launchers (see `docs/PROFILES.md`) |
 | `profiles/example-profile/` | Generic profile overlay template — never a real overlay |
-| `tests/` | Test suite (profile resolver) |
+| `tests/` | Profile resolver and signal/desired-state evaluation suites with synthetic fixtures |
 | `README.md`, `docs/` | Install/onboarding/architecture docs |
 
 ## Never tracked (runtime/private/generated)

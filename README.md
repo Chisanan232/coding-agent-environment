@@ -244,6 +244,25 @@ coding-agent-profile explain
   never copies anything automatically in either direction — you decide
   which side is correct per file, then `cp` explicitly.
 
+Run the relevant offline suites before completion:
+
+```bash
+bash tests/test-profile-resolver.sh
+python3 tests/test-signal-density.py
+pre-commit run --all-files
+```
+
+The signal suite consumes synthetic preservation/negative-control fixtures and
+checks report-only bootstrap/drift behavior. Its anchors do not grade arbitrary
+prose or establish measured reading time; review meaning against the source.
+The enforcement decision and verification limits are owned by
+[SPE-82](https://lightning-dust-mite.atlassian.net/browse/SPE-82).
+
+For an isolated desired-state installation, set `CODING_AGENT_SYNC_HOME` when
+running `scripts/sync-check.sh`. It selects the inspected config root without
+changing the process home or copying files. Live settings compare owned fields
+and allow native plugin root entries; canonical plugin state is checked separately.
+
 See [docs/SECURITY.md](docs/SECURITY.md) for the secret-scanning layers
 (pre-commit, CI, one-time full-history scan) and rotation policy.
 
