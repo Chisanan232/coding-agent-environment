@@ -123,8 +123,13 @@ scripts/profile-install.sh --global
 scripts/profile-install.sh --global --check
 ```
 
-This mode owns only the briefing installation, backs up a changed prior body,
-and leaves Codex config, plugins, project trust and other skills untouched. It
+This mode owns the marked signal-first AGENTS block, the materialized briefing,
+and canonical subtraction installations. It preserves unrelated instructions
+and Codex config/plugins/trust. External skill provenance and file digests live
+in `codex/subtraction-skills.json`; bodies remain owned by
+[Chisanan232/requirement-zero](https://github.com/Chisanan232/requirement-zero).
+The pinned skills CLI installs the selected revision into universal
+`~/.agents/skills`, which native Codex discovers. Approved work is never reopened. It
 uses `CODING_AGENT_SYNC_HOME` for disposable validation homes; native profile
 installation without `--global` retains its existing behavior.
 

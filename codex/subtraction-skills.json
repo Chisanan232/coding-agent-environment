@@ -1,0 +1,26 @@
+{
+  "repository": "Chisanan232/requirement-zero",
+  "revision": "a466fd82c37a3eb57bc6f9e4c0c1e6713e85f2c2",
+  "installer": "skills@1.7.0",
+  "skills": {
+    "requirement-zero": {
+      "path": ".",
+      "files": {
+        "SKILL.md": "accb346333fe9d8b4b94bfd2efc77e37e144d130974aad06e7ffd18a2c6e5b7a",
+        "references/deletion.md": "82b0c9222aa9432b66bdd34d0d30a530adf53478aef2f913250f32ff8ec11fcb",
+        "references/mission-alignment.md": "6959dac3d3ac02a07307af2fba92715c3cb5e9b6b1150f389615ecb08a988327",
+        "references/provenance.md": "8a5a39a5bef4fff3ce561ee270bb0b7139563c012481a1032e76b90ed9f7c64f",
+        "references/workflow.md": "ad0bcefccfcc11e59c6539e0a670decfa1280ebf9166a30c7d1122faf0533b43"
+      }
+    },
+    "codebase-zero": {
+      "path": "skills/codebase-zero",
+      "files": {
+        "SKILL.md": "2442f67a6e5106093b0bc5db432df5fff8ea8c3b3dded244a9dcea07ab962aa5",
+        "references/blast-radius.md": "bd56bce6c378ac9e27f73147bce91b5907f9428b21bc0a57d16b22e0e5274a69",
+        "references/complexity.md": "45cb6705aef1d15eff76e635463e3b2a7362bea0742967eb11a0883146345f73",
+        "references/evidence.md": "6303d565aab40f4465d7a1fbfa3b4c8fdc43142e3d5e58ee8cae7ba0467682e0"
+      }
+    }
+  }
+}

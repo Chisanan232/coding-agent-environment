@@ -44,6 +44,34 @@ import tempfile
 
 root, live = map(Path, sys.argv[1:3])
 dry, check = map(int, sys.argv[3:])
+policy = (root / 'codex/AGENTS.md').read_text()
+start = '<!-- coding-agent-environment:signal-first:start -->'
+end = '<!-- coding-agent-environment:signal-first:end -->'
+expected_block = policy[policy.index(start):policy.index(end) + len(end)]
+agents = live / '.codex/AGENTS.md'
+prior = agents.read_text() if agents.exists() else ''
+if prior.count(start) != prior.count(end) or prior.count(start) > 1:
+    raise SystemExit('Malformed managed AGENTS markers; refusing mutation.')
+if start in prior:
+    lo, hi = prior.index(start), prior.index(end) + len(end)
+    if lo > hi:
+        raise SystemExit('Reversed managed AGENTS markers; refusing mutation.')
+    merged = prior[:lo] + expected_block + prior[hi:]
+else:
+    merged = prior + ('\n' if prior and not prior.endswith('\n') else '') + '\n' + expected_block + '\n'
+policy_changed = merged != prior
+print(f"{'DIFFERS' if policy_changed else 'IDENTICAL'} {agents} (signal-first block only)")
+if policy_changed and not (dry or check):
+    agents.parent.mkdir(parents=True, exist_ok=True)
+    if agents.exists():
+        backup = agents.parent / 'backups/coding-agent-environment' / datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+        backup.mkdir(parents=True, mode=0o700)
+        saved = backup / 'AGENTS.md'
+        saved.write_bytes(agents.read_bytes())
+        saved.chmod(0o600)
+        print(f'Prior state: {saved}')
+    agents.write_text(merged)
+
 source = root / '.claude/skills/evidence-first-briefing/SKILL.md'
 target = live / '.codex/skills/evidence-first-briefing/SKILL.md'
 expected = source.read_bytes()
@@ -66,8 +94,32 @@ if changed and not (dry or check):
     os.chmod(name, 0o644)
     os.replace(name, target)
     assert target.read_bytes() == expected
-print(f'Managed Codex drift: {int(changed and (dry or check))}')
-raise SystemExit(int(changed and check))
+import hashlib
+import json
+import subprocess
+manifest = json.loads((root / 'codex/subtraction-skills.json').read_text())
+missing = []
+for skill, spec in manifest['skills'].items():
+    folder = live / '.agents/skills' / skill
+    ok = all((folder / name).is_file() and hashlib.sha256((folder / name).read_bytes()).hexdigest() == digest
+             for name, digest in spec['files'].items())
+    print(f"{'IDENTICAL' if ok else 'DIFFERS'} {folder} <- {manifest['repository']}@{manifest['revision']}")
+    if not ok:
+        missing.append(skill)
+if missing and not (dry or check):
+    if live != Path.home():
+        raise SystemExit('External install requires the actual home; fixture checks stay offline.')
+    subprocess.run(['npx', '--yes', manifest['installer'], 'add',
+                    f"https://github.com/{manifest['repository']}/tree/{manifest['revision']}",
+                    '--global', '--agent', 'codex', '--skill', *missing,
+                    '--full-depth', '--yes'], check=True)
+    for skill in missing:
+        folder = live / '.agents/skills' / skill
+        assert all(hashlib.sha256((folder / name).read_bytes()).hexdigest() == digest
+                   for name, digest in manifest['skills'][skill]['files'].items())
+remaining = (int(changed) + int(policy_changed) + len(missing)) if dry or check else 0
+print(f'Managed Codex drift: {remaining}')
+raise SystemExit(int(remaining > 0 and check))
 PYGLOBAL
     exit $?
 fi
