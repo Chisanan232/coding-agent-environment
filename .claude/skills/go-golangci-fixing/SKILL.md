@@ -42,7 +42,9 @@ Auto-used. Claude Code invokes this skill when `golangci-lint` reports violation
 - `QF1001` (apply De Morgan's law): simplify boolean expression.
 
 **`revive` / `golint`** — Go style violations:
-- Exported type/func missing comment: add a doc comment.
+- Exported type/func missing comment: preserve the project's generated API-doc
+  contract; explain meaningful contract/constraints, not obvious mechanics.
+  Do not add docstrings automatically to every function.
 - `if-return` pattern: replace `if x { return true }; return false` with `return x`.
 - Unused parameter: prefix with `_` if it must be present for interface conformance.
 

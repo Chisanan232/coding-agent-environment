@@ -26,7 +26,9 @@ more than one repository.
 ```
 
 Parent ticket: holds the integration acceptance criteria.
-Sub-ticket: holds the repo-specific implementation criteria.
+Sub-ticket: holds an independently useful outcome and its acceptance criteria.
+Where no child is warranted, the parent owns repo-specific steps and readiness;
+apply the same integration/merge gates to those steps.
 
 ### Session notes scope
 Cross-repo state is stored in session notes under the **parent ticket** ref:
@@ -49,8 +51,10 @@ Use the parent ticket ref as the coordination anchor across sessions.
    Repos identified: [repo-a], [repo-b], ...
    Confirm this list before creating sub-tickets.
    ```
-3. For each affected repository:
-   a. Create a sub-ticket linked to the parent (use "blocks" or "sub-task" relation).
+3. Apply the separate tracking gate in `task-decomposition`; reuse existing
+   issues and keep steps in the parent when no independent tracking value exists.
+   For each repository that needs an independently tracked outcome:
+   a. Create a sub-ticket linked to the parent (use supported tracker relations).
    b. Title: `[Parent title] — [Repo name]`
    c. Body: copy relevant per-repo acceptance criteria from the parent.
    d. Link: add a reference back to the parent ticket.

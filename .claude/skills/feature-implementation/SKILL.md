@@ -20,16 +20,18 @@ task is confirmed by the engineer.
 
 ### Phase 1 — Clarification
 1. Read the relevant existing code in the affected area.
-2. Restate the requirement in your own words. Ask the engineer to confirm.
-3. Ask: are there edge cases or error conditions that must be handled?
-4. Ask: are there performance, security, or compatibility constraints?
+2. Use the approved requirement and acceptance criteria as canonical; do not
+   duplicate or reopen them. Search before proposing new scope.
+3. Identify relevant edge cases and error conditions from code and criteria.
+4. Identify performance, security and compatibility constraints.
 5. Confirm: what does "done" look like? What test would prove it works?
 
 ### Phase 2 — Planning
 6. Identify the minimal set of files that must change.
 7. Identify tests that will need to be added or modified.
-8. Propose the implementation approach in one paragraph. Wait for confirmation.
-9. Do not begin writing code until the approach is confirmed.
+8. Choose the smallest approach supported by the evidence. Use canonical
+   `requirement-zero:requirement-zero` if proposing NEW unvalidated scope.
+9. Ask only for consequential unresolved decisions; continue authorized work.
 
 ### Phase 3 — Test Design (before implementation)
 10. Write or update tests that define the expected behavior.

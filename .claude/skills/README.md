@@ -58,29 +58,17 @@ convention and template below.
 | `go-vet-debugging` | go vet / go build | Diagnose vet errors and build failures |
 | `go-golangci-fixing` | golangci-lint | Fix lint violations per linter category |
 
-### Skills to create per language
+### Extending the inventory
 
-Create a `SKILL.md` in `~/.claude/skills/<skill-name>/` for each tool in your stack.
+Search existing skills first. Add a language/tool skill only for a current
+consumer whose semantics do not match an existing capability; hypothetical
+language coverage or symmetry alone does not justify a new skill.
 
-**Rust**
-
-| Skill to create | Tool | Reference pattern |
-|---|---|---|
-| `rust-clippy-fixing` | clippy | Modelled on `python-ruff-fixing` |
-| `rust-compiler-debugging` | rustc errors | Modelled on `python-mypy-debugging` |
-
-**Java / Kotlin**
-
-| Skill to create | Tool | Reference pattern |
-|---|---|---|
-| `java-checkstyle-fixing` | Checkstyle | Modelled on `python-ruff-fixing` |
-| `java-compiler-debugging` | javac errors | Modelled on `python-mypy-debugging` |
-
-**Ruby**
-
-| Skill to create | Tool | Reference pattern |
-|---|---|---|
-| `ruby-rubocop-fixing` | RuboCop | Modelled on `python-ruff-fixing` |
+Canonical subtraction skills are installed as `requirement-zero@requirement-zero`
+from `Chisanan232/requirement-zero`; their source remains in that repository.
+Invoke `requirement-zero:requirement-zero` for NEW unvalidated scope and
+`requirement-zero:codebase-zero` to audit EXISTING artifacts. Installation is
+specified in the repository [README](../../README.md).
 
 ### Minimal SKILL.md template
 
