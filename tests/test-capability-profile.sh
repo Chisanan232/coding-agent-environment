@@ -65,7 +65,23 @@ test_check_reports_drift_then_convergence() {
     PASS=$((PASS + 1))
 }
 
+test_update_backs_up_owned_profile() {
+    local fixture target backup
+    fixture="$(new_home)"
+    target="$fixture/.codex/capabilities-readonly.config.toml"
+    printf '# coding-agent-environment:managed-capability-profile:v1\nold = true\n' > "$target"
+    chmod 644 "$target"
+    CODING_AGENT_SYNC_HOME="$fixture" bash "$INSTALL" --capabilities >/dev/null
+    cmp -s "$DESIRED" "$target"
+    assert_eq "600" "$(python3 -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[2:])' "$target")" "updated profile mode"
+    backup="$(find "$fixture/.codex/backups/coding-agent-environment" -type f -name capabilities-readonly.config.toml -print -quit)"
+    assert_contains "$(cat "$backup")" 'old = true' "backup preserves prior bytes"
+    assert_eq "600" "$(python3 -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[2:])' "$backup")" "backup mode"
+    PASS=$((PASS + 1))
+}
+
 test_apply_installs_only_external_profile
 test_dry_run_reports_without_mutation
 test_check_reports_drift_then_convergence
+test_update_backs_up_owned_profile
 printf 'capability profile tests: %d passed\n' "$PASS"
