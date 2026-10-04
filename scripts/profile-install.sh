@@ -187,13 +187,15 @@ elif prior:
     merged = prior + (b'' if prior.endswith(b'\n') else b'\n') + b'\n' + block + b'\n'
 else:
     merged = policy
-source = root / '.claude/skills/evidence-first-briefing/SKILL.md'
-target = live / '.codex/skills/evidence-first-briefing/SKILL.md'
-reject_symlinks(target)
-expected = source.read_bytes()
+shared_skills = ['evidence-first-briefing', 'engineering-workflow']
+managed = [(agents, merged, 'signal-first block; preserve outside bytes')]
+for skill in shared_skills:
+    source = root / '.claude/skills' / skill / 'SKILL.md'
+    target = live / '.codex/skills' / skill / 'SKILL.md'
+    reject_symlinks(target)
+    managed.append((target, source.read_bytes(), str(source.relative_to(root))))
 plans = []
-for path, data, label in [(agents, merged, 'signal-first block; preserve outside bytes'),
-                          (target, expected, str(source.relative_to(root)))]:
+for path, data, label in managed:
     changed = not path.exists() or path.read_bytes() != data
     print(f"{'DIFFERS' if changed else 'IDENTICAL'} {path} <- {label}")
     if changed:

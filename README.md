@@ -138,10 +138,11 @@ with `scripts/profile-install.sh --capabilities --remove`; inspect drift with
 `scripts/sync-check.sh --capabilities`. `CODING_AGENT_SYNC_HOME` selects a
 disposable home for offline lifecycle validation.
 
-The single authored briefing body is
-[.claude/skills/evidence-first-briefing/SKILL.md](.claude/skills/evidence-first-briefing/SKILL.md).
-Claude consumes it directly; Codex receives a materialized user-scoped copy.
-Edit only the source, then report, apply and check:
+The shared authored skills are
+[evidence-first-briefing](.claude/skills/evidence-first-briefing/SKILL.md) and
+[engineering-workflow](.claude/skills/engineering-workflow/SKILL.md). Claude
+consumes them directly; Codex receives exact materialized user-scoped copies.
+Edit only these sources, then report, apply and check:
 
 ```bash
 scripts/profile-install.sh --global --dry-run
@@ -149,10 +150,10 @@ scripts/profile-install.sh --global
 scripts/profile-install.sh --global --check
 ```
 
-This mode owns the marked signal-first AGENTS block, the materialized briefing,
+This mode owns the marked signal-first AGENTS block, the materialized shared skills,
 and canonical subtraction installations. Apply preflights the complete plan,
 backs up changed owned paths under `~/.codex/backups/coding-agent-environment/`,
-and atomically replaces the managed AGENTS/briefing files. It preserves
+and atomically replaces the managed AGENTS/shared-skill files. It preserves
 unrelated instructions and Codex config/plugins/trust. External skill provenance and file digests live
 in `codex/subtraction-skills.json`; bodies remain owned by
 [Chisanan232/requirement-zero](https://github.com/Chisanan232/requirement-zero).
@@ -163,7 +164,7 @@ installation without `--global` retains its existing behavior.
 
 Successful installation is not behavior proof: start a fresh Codex process after
 applying. `scripts/sync-check.sh --codex` checks only the managed signal-first
-block, briefing bytes and canonical subtraction body/reference digests; it
+block, shared-skill bytes and canonical subtraction body/reference digests; it
 ignores unrelated global instructions and private/generated config. The default
 sync check also covers the existing Claude and launcher surfaces. Restore the
 corresponding saved paths from the reported backup if recovery is needed.

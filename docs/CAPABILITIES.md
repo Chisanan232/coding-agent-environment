@@ -74,8 +74,11 @@ configuration path is not a source of truth for Codex. The CLI baseline is
 0.160, and native plugins remain the preferred integration boundary.
 
 Shared skills are reused by semantic responsibility, including
-Requirement Zero, Codebase Zero, and evidence-first briefing. Reuse does not
-imply identical invocation syntax or native hook compatibility.
+Requirement Zero, Codebase Zero, evidence-first briefing, and the engineering
+workflow. The workflow has one host-neutral source: Claude uses thin native
+adapters, while the managed Codex installer materializes the exact same skill
+and adds a concise trigger to its owned instruction block. Reuse does not imply
+identical invocation syntax or native hook compatibility.
 
 ## Verification contract
 

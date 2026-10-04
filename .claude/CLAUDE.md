@@ -39,7 +39,7 @@ Create a `.claude/CLAUDE.md` at the repository root and fill in these sections:
 | Type Checker | Which type checker, config file, project-specific suppression rules |
 | Linting Tooling | Linter name, formatter, pre-commit config location |
 | Source-of-Truth Systems | Issue tracker URL, wiki/docs space, Slack channel |
-| Merge Strategy | squash merge, rebase merge, or merge commit |
+| Merge Gates | Additional repository-specific approvals or protected-branch checks |
 | Polling Intervals | PR health check and release watch cadence for this repo |
 | Language-Specific Repair Skills | Which `<language>-*` repair skills apply (e.g., `python-ruff-fixing`) |
 
@@ -174,98 +174,16 @@ pre-commit → QA handoff → PR. See the Skill Invocation Guide.
 
 ---
 
-## Commit Policy
+## Engineering Workflow Contract
 
-Every commit must be:
+Use [engineering-workflow](skills/engineering-workflow/SKILL.md) for the shared
+branch/worktree, commit, validation, review, pull-request, merge, ticket
+reconciliation, and cleanup lifecycle. `code-review-prep` and `pr-readiness`
+adapt that contract to Claude Code; they do not redefine it.
 
-- **Atomic**: one logical concern per commit. If you need two sentences to describe it, split it.
-- **Small**: prefer many small commits over one large commit.
-- **Bisectable**: the repository must be in a working state after every commit.
-- **Descriptive**: subject line under 72 characters in imperative mood.
-
-### Commit message format
-
-```
-<emoji> <scope>: <imperative summary under 72 chars>
-
-[Optional body: what changed and why. Not how.]
-
-[Optional footer: closes #123, refs #456]
-```
-
-### GitEmoji conventions
-
-| Emoji | Scope |
-|---|---|
-| `✨` | New feature |
-| `🐛` | Bug fix |
-| `♻️` | Refactor |
-| `✅` | Tests |
-| `📝` | Documentation |
-| `🔧` | Configuration |
-| `🔌` | MCP / integrations |
-| `🪝` | Hooks |
-| `👨‍💻` | Skills |
-| `🧭` | Workflow skills |
-| `⬆️` | Dependency upgrade |
-| `🗑️` | Delete / remove |
-| `🚨` | Fix linting / type errors |
-
-### Commit granularity during implementation
-
-Keep each independently reviewable concern and its necessary tests together.
-Choose boundaries by behavior and risk, rather than one commit per function.
-
-### What not to commit
-
-- `.env` files or secrets of any kind
-- Build artifacts, compiled outputs
-- IDE-specific files not in `.gitignore`
-- Large binary files
-- Commented-out dead code
-
----
-
-## Pull Request Policy
-
-### Before opening a PR
-
-- All tests pass locally.
-- All lint and type checks pass locally.
-- Pre-commit hooks pass.
-- CI is not blocked by an unrelated red branch.
-- You have reviewed your own diff before requesting review.
-
-### PR size and scope
-
-- Keep PRs under 500 lines when possible.
-- One concern per PR. Do not bundle unrelated changes.
-- If a change is large, break it into a sequence of stacked PRs.
-
-### PR title format
-
-```
-[<ticket-number>] <emoji> <scope>: <imperative summary under 60 chars>
-```
-
-- `[<ticket-number>]` — issue/ticket reference in brackets (e.g., `[PROJ-123]`, `[42]`)
-- `<emoji>` — GitEmoji from the Commit Policy table
-- `<scope>` — affected module, package, or area
-- `<imperative summary>` — what changed, imperative mood
-
-Example: `[PROJ-123] ✨ restapi: Add new user authentication endpoint`
-
-### PR description
-
-Use `evidence-first-briefing`; `code-review-prep` owns reviewer-relevant facts.
-Explain what the diff means, with actual validation and issue references.
-
-### Review process
-
-- Address all reviewer comments before merging.
-- Do not force-push during active review.
-- CI must be green before merging.
-- Merge strategy: use the strategy configured for this repository (see project-level CLAUDE.md).
+Project-level `CLAUDE.md` files provide repository commands and product
+constraints. A later explicit user instruction can authorize a different choice
+for that work.
 
 ---
 
@@ -406,29 +324,13 @@ extension guidance live in [skills/README.md](skills/README.md).
 
 ---
 
-## Auto-Merge Policy
+## Merge Policy
 
-A pull request may be merged automatically only when **all** of the following conditions are met:
-
-1. **Code owner approval is present** — at least one required reviewer has approved.
-2. **All required CI checks pass** — no red status checks on the PR.
-3. **No merge conflicts** — the branch merges cleanly into the base.
-4. **No unresolved blocking comments** — all `Request Changes` reviews are resolved or dismissed.
-5. **Branch is up to date** — the PR branch includes the latest commits from the base branch.
-
-If any condition is not met, do not merge. Wait, fix, or escalate.
-
-### Who may trigger auto-merge
-
-- The main agent may approve merge decisions once all conditions above are met.
-- A sub-agent spawned for isolated review/verification must not independently
-  trigger a merge — it reports findings back to the main agent.
-- Engineer may override and merge manually at any time.
-
-### Merge strategy
-
-Use the merge strategy configured for this repository (defined in the project-level
-`.claude/CLAUDE.md` — e.g., squash merge for feature PRs, rebase merge for dependency bumps).
+Apply the required checks, code-owner approvals, conflict, branch-currency, and
+review-thread gates from
+[engineering-workflow](skills/engineering-workflow/SKILL.md). Use **Create a
+merge commit**; do not squash or rebase-merge unless a later explicit user
+instruction authorizes that strategy.
 
 ---
 
@@ -462,7 +364,8 @@ Do not manually resolve lock-file conflicts in bot PRs — let the bot handle it
 
 If a bot PR has CI failure after rebase:
 - Investigate the failure root cause.
-- If the failure is unrelated to the update, note it and proceed.
+- If the failure is unrelated to the update, record it and keep the PR unmerged
+  until the required check is green or repaired through its owning work.
 - If the failure is caused by the update itself, escalate to the engineer — do not merge.
 
 ### Bot PR oversight
@@ -472,127 +375,18 @@ the main agent coordinates bot PR state at each polling interval.
 
 ---
 
-## Push Gate Policy
+## Push Gate and Worktree Adapter
 
-Claude Code must not push to any remote branch unless all of the following are true:
+Apply [engineering-workflow](skills/engineering-workflow/SKILL.md) before pushing.
+Run the repository's configured full relevant checks and the Claude-specific
+`full-test-gate.sh` and `precommit-gate.sh` when present. Fix failures; do not use
+`--no-verify` or bypass a required check.
 
-1. **Full test suite passes** — run the complete test suite locally, not just impacted tests.
-2. **Pre-commit hooks pass** — run `pre-commit run --all-files`. Zero failures.
-3. **Linter is clean** — zero violations.
-4. **Type checker is clean** — zero errors.
-5. **No uncommitted changes remain** — working tree is clean before pushing.
-6. **Branch is not behind remote** — pull or rebase before pushing to avoid clobbering.
-
-### Force-push rules
-
-- Force-push is **forbidden** on `main` / `master` / release branches under any circumstance.
-- Force-push on feature branches requires **explicit engineer confirmation** and is
-  only permitted when rebasing on the base branch (not to rewrite merged history).
-- Never force-push during an active code review.
-
-### What gates the push
-
-`full-test-gate.sh` and `precommit-gate.sh` implement these checks. They are
-not currently wired as `settings.json` hooks in this repository — run them
-manually before pushing (`bash .claude/hooks/full-test-gate.sh`,
-`bash .claude/hooks/precommit-gate.sh`) until/unless a project wires them as
-a `PreToolUse`/`Stop` hook. Fix the failure — do not use `--no-verify`.
-
----
-
-## Development Preconditions
-
-Before beginning any implementation task, Claude Code must verify:
-
-1. **Branch is current** — local branch is up to date with the expected remote base.
-   Resolve the tracking remote (`git rev-parse --abbrev-ref --symbolic-full-name @{u} | cut -d'/' -f1`)
-   and run `git fetch <remote>`. Do not hardcode `origin` — the remote may be named differently.
-2. **CI is not red on the base branch** — do not start work on top of a broken base.
-   Check the most recent CI run on `main` (or the target branch) before branching.
-3. **No uncommitted state** — working tree must be clean before switching branches
-   or beginning a new task.
-4. **Dependencies are installed** — run the install command if the lock file
-   has changed since the last install.
-5. **Pre-commit hooks are active** — confirm `.git/hooks/pre-commit` is installed.
-   Run `pre-commit install` if missing.
-
-If any precondition fails, stop and resolve it before writing any code.
-Do not proceed on a stale or broken foundation.
-
----
-
-## Git Worktree Workflow
-
-Each ticket is developed in an isolated git worktree so the main working tree
-stays clean and multiple tickets can be worked on concurrently without branch-switching.
-
-### Branch naming convention
-
-All feature and fix branches must follow this four-part format:
-
-```
-<release-or-phase>/<ticket-number>/<type>/<short-summary>
-```
-
-- `<release-or-phase>`: milestone or sprint identifier — resolve from the ticket's
-  milestone/sprint field, `$CLAUDE_CURRENT_RELEASE` env var, or
-  `.claude/.current-release` file. Examples: `v0.1.0`, `phase1`, `sprint3`.
-- `<ticket-number>`: exact ticket reference (e.g., `TEST-1`, `PROJ-123`, `42`)
-- `<type>`: GitEmoji category slug matching the primary change type:
-
-  | Type | GitEmoji | When to use |
-  |---|---|---|
-  | `feat` | ✨ | New feature or capability |
-  | `fix` | 🐛 | Bug fix |
-  | `refactor` | ♻️ | Refactor with no behavior change |
-  | `test` | ✅ | Test-only change |
-  | `docs` | 📝 | Documentation change |
-  | `config` | 🔧 | Configuration change |
-  | `deps` | ⬆️ | Dependency upgrade |
-  | `remove` | 🗑️ | Deletion or removal |
-  | `lint` | 🚨 | Lint or type error fix |
-
-- `<short-summary>`: 2–4 words from the ticket title in `snake_case`, max 30 characters
-
-Examples:
-- `v0.1.0/TEST-1/feat/add_new_endpoint`
-- `phase1/PROJ-123/fix/auth_token_refresh`
-- `sprint3/42/refactor/extract_payment_service`
-
-### Worktree path convention
-
-Worktrees are created as sibling directories of the main repository.
-Because the branch name contains `/` separators, replace each `/` with `-`
-when forming the directory name:
-
-```
-<repo-parent-dir>/<repo-name>-<release-or-phase>-<ticket-number>-<type>-<short-summary>/
-```
-
-Example: main repo at `~/code/my-app`, branch `v0.1.0/TEST-1/feat/add_endpoint`
-→ worktree at `~/code/my-app-v0.1.0-TEST-1-feat-add_endpoint/`.
-
-### Lifecycle
-
-| Phase | Command |
-|---|---|
-| `ticket-pickup-check` — create | `git worktree add <path> -b <branch-name>` |
-| Development | All implementation work happens inside `<path>` |
-| `workflow-resume` — verify | Check `git worktree list` matches `.claude/.current-worktree` |
-| `post-merge-close` — clean up | `git worktree remove <path>` + `git worktree prune` |
-
-### Worktree context resolution
-
-Skills resolve the active worktree path in this order:
-1. `$CLAUDE_CURRENT_WORKTREE` environment variable
-2. `.claude/.current-worktree` file in the main repo root (written by `ticket-pickup-check`)
-
-Skills resolve the release or phase prefix in this order:
-1. `$CLAUDE_CURRENT_RELEASE` environment variable
-2. `.claude/.current-release` file in the main repo root (written by `ticket-pickup-check`)
-3. The ticket's milestone or sprint field via the issue tracker MCP
-
-Add `.claude/.current-worktree` and `.claude/.current-release` to `.gitignore`.
+Claude workflow skills resolve the active worktree from
+`$CLAUDE_CURRENT_WORKTREE`, then `.claude/.current-worktree`. They resolve the
+release or phase from `$CLAUDE_CURRENT_RELEASE`, then
+`.claude/.current-release`, then the authoritative ticket milestone or sprint.
+The shared skill owns the branch format and cleanup boundary.
 
 ---
 

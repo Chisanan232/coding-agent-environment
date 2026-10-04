@@ -34,7 +34,7 @@ Classify each PR into one of:
 
 | Class | Condition |
 |---|---|
-| `ready-to-merge` | All Auto-Merge Policy conditions met |
+| `ready-to-merge` | All `engineering-workflow` merge gates met |
 | `blocked-ci` | CI is red |
 | `blocked-review` | Missing required approvals or unresolved review requests |
 | `blocked-conflict` | Merge conflict present |
@@ -48,7 +48,7 @@ Classify each PR into one of:
 
 | Class | Action |
 |---|---|
-| `ready-to-merge` | Approve and merge (if merge preconditions are met — see Auto-Merge Policy) |
+| `ready-to-merge` | Approve and merge when the shared workflow gates are met |
 | `blocked-ci` | Note the failure — invoke `ci-failure-triage` if repair is in scope |
 | `blocked-review` | Note awaiting reviewer — no action unless stale |
 | `blocked-conflict` | Note conflict — flag to engineer |
@@ -70,7 +70,7 @@ routine healthy PRs; use a comparison table only when it materially helps a
 multi-PR decision. Omit empty classes and repeated unchanged polling updates.
 
 ## Safe-Fix Guidance
-- Do not merge a PR that does not meet all Auto-Merge Policy conditions, even if it
+- Do not merge a PR that does not meet all `engineering-workflow` conditions, even if it
   looks ready at a glance.
 - Do not close a stale PR without commenting first to give the author a chance to respond.
 - Do not repair CI directly from this skill — delegate to `ci-failure-triage`.
