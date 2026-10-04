@@ -74,6 +74,7 @@ Claude Code must follow these rules on every implementation task, without except
   controls and unknown state; canonical subtraction skills own detailed procedures.
 - Persistent/shared output leads with semantic outcome and supporting evidence.
   State material inference and unknowns honestly; reference canonical detail.
+  Use `evidence-first-briefing` before persistent/shared engineering output.
 
 ### Validation sequence
 
