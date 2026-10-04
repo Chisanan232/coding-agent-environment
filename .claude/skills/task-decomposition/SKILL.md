@@ -1,14 +1,14 @@
 ---
 name: task-decomposition
-description: Plan approved work by semantic outcome and dependencies; create child issues only when independent tracking adds concrete value.
+description: "Plan approved work by semantic outcome and dependencies; create child issues only when independent tracking adds concrete value."
 ---
 
 # Task decomposition
 
 Read the ticket, current implementation, related work and constraints before
 planning. Approved requirements are settled. Use canonical
-`requirement-zero:requirement-zero` only for newly proposed unvalidated scope;
-use `requirement-zero:codebase-zero` for existing artifact audit decisions.
+`requirement-zero` only for newly proposed unvalidated scope;
+use `codebase-zero` for existing artifact audit decisions.
 
 ## Plan within the current work item
 

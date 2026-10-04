@@ -1,8 +1,13 @@
+---
+name: node-precommit-repair
+description: "Repair pre-commit hook failures in Node.js / TypeScript projects without using `--no-verify`. Identifies which hook failed and routes to the appropriate fixing skill."
+---
+
 # SKILL.md — node-precommit-repair
 
 > **Language**: TypeScript / JavaScript (Node.js projects). This skill is specific
 > to pre-commit hooks in Node/TypeScript repos.
-> For other languages, see `~/.claude/skills/README.md`.
+> For other languages, see `the installed language-repair skills`.
 
 ## Purpose
 Repair pre-commit hook failures in Node.js / TypeScript projects without using
@@ -10,7 +15,7 @@ Repair pre-commit hook failures in Node.js / TypeScript projects without using
 skill.
 
 ## Type
-Auto-used. Claude Code invokes this skill when `pre-commit run --all-files`
+Auto-used. The coding agent invokes this skill when `pre-commit run --all-files`
 fails in a Node/TypeScript project.
 
 ## Do Not Assume

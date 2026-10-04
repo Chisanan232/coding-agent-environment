@@ -18,7 +18,7 @@ Approved work has passed the requirement decision; do not reopen it automaticall
    description, comments, dependencies and existing decisions once.
 2. Verify current behavior in code. Identify the intended outcome, constraints,
    observable acceptance, meaningful dependencies and material unknowns/risks.
-   For NEW unvalidated scope use canonical `requirement-zero:requirement-zero`.
+   For NEW unvalidated scope use canonical `requirement-zero`.
 3. Search related issues/docs before creating another artifact. Reuse only a
    semantically matching issue. Resolve routine details from available evidence;
    ask concise questions only for consequential unresolved requirements.

@@ -1,14 +1,19 @@
+---
+name: typescript-tsc-debugging
+description: "Diagnose and fix TypeScript type errors reported by `tsc --noEmit` so the type checker exits clean before committing."
+---
+
 # SKILL.md — typescript-tsc-debugging
 
 > **Language**: TypeScript. This skill is specific to the `tsc` type checker.
-> For other languages, see `~/.claude/skills/README.md`.
+> For other languages, see `the installed language-repair skills`.
 
 ## Purpose
 Diagnose and fix TypeScript type errors reported by `tsc --noEmit` so the
 type checker exits clean before committing.
 
 ## Type
-Auto-used. Claude Code invokes this skill when `tsc` reports type errors.
+Auto-used. The coding agent invokes this skill when `tsc` reports type errors.
 
 ## Do Not Assume
 - Do not assume the first error is the root cause — `tsc` cascades errors;

@@ -8,14 +8,14 @@ description: "Apply the shared engineering contract and prepare the current bran
 ## Purpose
 
 Adapt the host-neutral
-[engineering-workflow](../engineering-workflow/SKILL.md) contract to Claude Code
+[engineering-workflow](../engineering-workflow/SKILL.md) contract to The coding agent
 before opening a pull request. Read and apply that contract first; it owns the
 branch, commit, validation, review, title, body, merge, reconciliation, and
 cleanup rules.
 
 ## Type
 
-Auto-used. Claude Code invokes this skill before any pull request is opened.
+Auto-used. The coding agent invokes this skill before any pull request is opened.
 
 ## Procedure
 

@@ -48,4 +48,56 @@ Use $engineering-workflow for the engineering lifecycle: branch and worktree,
 commits, validation, review, pull request, merge, Jira reconciliation, and cleanup.
 Pull-request titles use
 `[<ticket-number>] <emoji> <scope>: <imperative summary under 60 chars>`.
+
+Apply the installed engineering skills by their actual triggers: `ticket-intake`
+for new unaccepted work, `ticket-pickup-check` before ticket implementation,
+`task-decomposition` for approved outcome/dependency planning, and
+`cross-repo-coordinator` for coordinated integration. Use the tracker's actual
+supported states; an explicit instruction to execute accepted work is pickup
+authorization unless a real owner/blocker conflict exists. Never redo completed
+work or create a child issue for each routine step.
+
+Use `architecture-design` for significant design decisions; routine work stays
+on the main agent under cost-aware routing. Use `feature-implementation`,
+`dev-impl-loop`, `test-design` and `acceptance-validation` for implementation and
+observable acceptance. Resolve `engineering-runtime` before persisted state,
+circuit/notes/gates or resume work; initialize its environment in each shell.
+Use `workflow-resume` for interrupted work and `project-setup` for onboarding.
+
+Choose the installed Python, TypeScript/Node or Go repair skill only when its
+real tool fails. Read project config, reproduce the error, repair the cause,
+review auto-fix diffs, run targeted then full relevant checks. Preserve public
+types and runtime behavior; scoped suppressions need a documented real reason.
+Tests cover public behavior, meaningful boundaries and regressions, not private
+implementation. Never skip/delete a failing test to make a check green.
+
+Use `code-review-prep`, `pr-readiness`, `pr-health-check`, `ci-failure-triage`,
+`pr-feedback-response` and `post-merge-close` at their lifecycle boundaries.
+Use `dependency-upgrade-review`/`bot-pr-maintainer` for bot updates: inspect scope,
+compatibility/security and exact-head checks; bot rebase owns lockfile conflicts.
+A genuine unrelated required-check failure still blocks merge.
+
+Use `release-preparation`, `release-readiness` and `release-watch` for preparation
+and observation. Never manually tag, publish, push release intent directly to the
+base, alter active release CI or re-trigger a release without explicit authority.
+Verify the exact run/ref and accessible artifacts before claiming publication.
+Native scheduling requires an explicit recurring-task request; otherwise poll
+the same authoritative finite job with bounded backoff. Healthy ongoing work is
+a verified wait, not a blocker. Reuse existing simulators and active job handles.
+
+Treat secrets as opaque capabilities: consume via supported client/stdin paths,
+verify presence without values, and never print/log/copy credentials or OAuth.
+Routine reversible work within an accepted non-production contract is autonomous;
+new production, destructive, payment, IAM, security-boundary or paid-spend authority
+is a separate owner decision. Tool availability never grants that authority.
+Preserve unknown/uncommitted state and protective controls; do not force-push,
+reset/clean destructively, publish or pipe remote content into a shell implicitly.
+External notifications require authorization even when a connector is available.
+
+Discover native plugins/apps/MCPs before use; do not infer authentication from
+configuration. `codebase-memory` owns graph discovery. Public library-doc lookup
+is available through the opt-in `engineering-reference` profile; use actual tool
+discovery and record rate/auth unavailability. Native document/Google skills own
+format-specific work. `pdf-operations`, `morning-brief` and `memory-handoff`
+cover the audited additional procedures; unavailable sources remain explicit.
 <!-- coding-agent-environment:signal-first:end -->

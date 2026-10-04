@@ -12,9 +12,9 @@
 
 set -euo pipefail
 
-[ -f "${HOME}/.claude/config.env" ] && source "${HOME}/.claude/config.env"
+[ -f "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}" ] && source "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}"
 
-NOTES_DIR="${CLAUDE_SESSION_NOTES_DIR:-${HOME}/.claude/session-notes}"
+NOTES_DIR="${ENGINEERING_SESSION_NOTES_DIR-${CLAUDE_SESSION_NOTES_DIR:-${ENGINEERING_STATE_DIR:-${HOME}/.claude}/session-notes}}"
 mkdir -p "$NOTES_DIR"
 
 _usage() {

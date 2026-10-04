@@ -10,8 +10,8 @@ Review a dependency upgrade change to assess safety, compatibility, and risk
 before merging.
 
 ## Type
-Command-like. Invoke explicitly via `/dependency-upgrade-review` or by asking
-Claude Code to "Review this dependency upgrade."
+Command-like. Invoke explicitly by naming `dependency-upgrade-review` or by asking
+The coding agent to "Review this dependency upgrade."
 
 ## When to use
 Before merging any PR that bumps one or more dependencies.

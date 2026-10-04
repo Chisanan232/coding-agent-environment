@@ -5,6 +5,10 @@ description: "Coordinate accepted outcomes and integration/merge gates across re
 
 # SKILL.md — cross-repo-coordinator
 
+Read `engineering-runtime` first and initialize its host-aware environment before
+using the shell examples below. Resolve installed helper paths from that skill;
+never borrow another host’s private config, credentials or mutable state.
+
 ## Purpose
 Coordinate work that spans multiple repositories under a single parent ticket.
 Tracks per-repo sub-tickets, monitors PRs across repos, and verifies integration
@@ -40,7 +44,7 @@ no child is warranted; every required repo outcome must clear acceptance.
 ### Session notes scope
 Cross-repo state is stored in session notes under the **parent ticket** ref:
 ```bash
-bash ~/.claude/hooks/session-memory.sh append "[parent-ticket]" \
+bash "${ENGINEERING_RUNTIME}/session-memory.sh" append "[parent-ticket]" \
   "Cross-repo state" \
   "Repo A: [status] | Repo B: [status] | Integration: [status]"
 ```
@@ -67,13 +71,13 @@ Use the parent ticket ref as the coordination anchor across sessions.
    d. Link: add a reference back to the parent ticket.
 4. Record the sub-ticket map in session notes:
    ```bash
-   bash ~/.claude/hooks/session-memory.sh append "[parent-ticket]" \
+   bash "${ENGINEERING_RUNTIME}/session-memory.sh" append "[parent-ticket]" \
      "Sub-ticket map" \
      "Repo A → [sub-ticket-A] | Repo B → [sub-ticket-B]"
    ```
 5. Record decision:
    ```bash
-   bash ~/.claude/hooks/decision-log.sh record \
+   bash "${ENGINEERING_RUNTIME}/decision-log.sh" record \
      --ticket "[parent-ticket]" --agent "main-agent" --skill "cross-repo-coordinator" \
      --phase "1" --decision "decomposed" \
      --reason "Parent ticket requires work in [N] repos" \
@@ -94,7 +98,7 @@ Use the parent ticket ref as the coordination anchor across sessions.
    `evidence-first-briefing`; repo comparison is useful only for a real decision.
 10. Update session notes with current state:
     ```bash
-    bash ~/.claude/hooks/session-memory.sh append "[parent-ticket]" \
+    bash "${ENGINEERING_RUNTIME}/session-memory.sh" append "[parent-ticket]" \
       "Progress snapshot ([timestamp])" \
       "Repo A: In Progress | Repo B: PR #42 open"
     ```
@@ -113,7 +117,7 @@ Use the parent ticket ref as the coordination anchor across sessions.
 13. When all sub-tickets are "Ready for QA", signal integration verification (Phase 4).
 14. Record decision:
     ```bash
-    bash ~/.claude/hooks/decision-log.sh record \
+    bash "${ENGINEERING_RUNTIME}/decision-log.sh" record \
       --ticket "[parent-ticket]" --agent "main-agent" --skill "cross-repo-coordinator" \
       --phase "3" --decision "all-ready" \
       --reason "All per-repo sub-tickets passed QA — proceeding to integration check" \
@@ -123,7 +127,7 @@ Use the parent ticket ref as the coordination anchor across sessions.
 ### Phase 4 — Integration verification
 15. Run the integration verification command (if configured):
     ```bash
-    ${CLAUDE_INTEGRATION_TEST_COMMAND:-echo "No integration test command configured. Set CLAUDE_INTEGRATION_TEST_COMMAND in ~/.claude/config.env"}
+    ${ENGINEERING_INTEGRATION_TEST_COMMAND:-echo "No integration test command configured. Set the repository integration command explicitly"}
     ```
     If not configured: ask the engineer to specify the integration check before proceeding.
 16. If integration tests pass: proceed to Phase 5.
@@ -132,7 +136,7 @@ Use the parent ticket ref as the coordination anchor across sessions.
     b. Route the fix to the appropriate sub-ticket and repo session.
     c. Record failure and update session notes:
        ```bash
-       bash ~/.claude/hooks/session-memory.sh append "[parent-ticket]" \
+       bash "${ENGINEERING_RUNTIME}/session-memory.sh" append "[parent-ticket]" \
          "Integration failure ([timestamp])" \
          "[Failure summary — which repo, what failed]"
        ```
@@ -150,11 +154,11 @@ Use the parent ticket ref as the coordination anchor across sessions.
     The parent owns integration criteria; do not copy child-ticket histories.
 22. Clear session notes for the parent ticket:
     ```bash
-    bash ~/.claude/hooks/session-memory.sh clear "[parent-ticket]"
+    bash "${ENGINEERING_RUNTIME}/session-memory.sh" clear "[parent-ticket]"
     ```
 23. Record final decision:
     ```bash
-    bash ~/.claude/hooks/decision-log.sh record \
+    bash "${ENGINEERING_RUNTIME}/decision-log.sh" record \
       --ticket "[parent-ticket]" --agent "main-agent" --skill "cross-repo-coordinator" \
       --phase "5" --decision "complete" \
       --reason "All per-repo PRs merged; integration tests passed; parent ticket closed"
@@ -173,7 +177,7 @@ If `cross-repo-coordinator` is interrupted (context limit, crash, manual stop),
 resume using session notes — they are the coordinator-level state store:
 
 ```bash
-bash ~/.claude/hooks/session-memory.sh read "[parent-ticket]"
+bash "${ENGINEERING_RUNTIME}/session-memory.sh" read "[parent-ticket]"
 ```
 
 From the notes, determine which phase was active:
@@ -190,7 +194,7 @@ recorded. Look up the existing sub-tickets by their recorded refs instead.
 
 After determining the resume point, write a new snapshot note before proceeding:
 ```bash
-bash ~/.claude/hooks/session-memory.sh append "[parent-ticket]" \
+bash "${ENGINEERING_RUNTIME}/session-memory.sh" append "[parent-ticket]" \
   "Session resumed ([timestamp])" \
   "Resuming at Phase [N]. Prior state: [summary from last note]."
 ```
@@ -200,7 +204,7 @@ bash ~/.claude/hooks/session-memory.sh append "[parent-ticket]" \
   Partial cross-repo merges create integration debt that is hard to reverse.
 - If one repo's sub-ticket is blocked, hold all other merges until resolved.
   Merging one side of an API change while the other is blocked produces broken state.
-- If integration tests cannot be run (no `CLAUDE_INTEGRATION_TEST_COMMAND`),
+- If integration tests cannot be run (no `ENGINEERING_INTEGRATION_TEST_COMMAND`),
   ask the engineer to confirm integration manually before merging.
 - Do not close the parent ticket while any sub-ticket remains open.
 - Do not recreate sub-tickets on resume — check session notes for existing refs first.

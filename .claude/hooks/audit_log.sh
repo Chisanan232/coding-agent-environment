@@ -11,14 +11,14 @@
 
 set -euo pipefail
 
-[ -f "${HOME}/.claude/config.env" ] && source "${HOME}/.claude/config.env"
+[ -f "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}" ] && source "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}"
 
-LOG_DIR="${CLAUDE_AUDIT_LOG_DIR:-$HOME/.claude/audit}"
+LOG_DIR="${ENGINEERING_AUDIT_LOG_DIR-${CLAUDE_AUDIT_LOG_DIR:-${ENGINEERING_STATE_DIR:-${HOME}/.claude}/audit}}"
 LOG_FILE="$LOG_DIR/commands.jsonl"
 MAX_LOG_SIZE_BYTES=10485760  # 10 MB
 
 # Skip if audit is disabled
-if [ "${CLAUDE_SKIP_AUDIT:-0}" = "1" ]; then
+if [ "${ENGINEERING_SKIP_AUDIT-${CLAUDE_SKIP_AUDIT:-0}}" = "1" ]; then
     exit 0
 fi
 

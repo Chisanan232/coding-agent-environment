@@ -26,17 +26,17 @@
 
 set -euo pipefail
 
-if [ -f "${HOME}/.claude/config.env" ]; then
-    bash -n "${HOME}/.claude/config.env" 2>/dev/null \
-        && source "${HOME}/.claude/config.env" \
+if [ -f "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}" ]; then
+    bash -n "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}" 2>/dev/null \
+        && source "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}" \
         || echo "[decision-log] Warning: ~/.claude/config.env has syntax errors — using defaults" >&2
 fi
 
-ENABLED="${CLAUDE_DECISION_LOG_ENABLED:-1}"
+ENABLED="${ENGINEERING_DECISION_LOG_ENABLED-${CLAUDE_DECISION_LOG_ENABLED:-1}}"
 [[ "$ENABLED" == "0" ]] && exit 0
 
-LOG_DIR="${CLAUDE_DECISION_LOG_DIR:-${HOME}/.claude/decisions}"
-MAX_CONTEXT="${CLAUDE_DECISION_LOG_MAX_CONTEXT:-500}"
+LOG_DIR="${ENGINEERING_DECISION_LOG_DIR-${CLAUDE_DECISION_LOG_DIR:-${ENGINEERING_STATE_DIR:-${HOME}/.claude}/decisions}}"
+MAX_CONTEXT="${ENGINEERING_DECISION_LOG_MAX_CONTEXT-${CLAUDE_DECISION_LOG_MAX_CONTEXT:-500}}"
 mkdir -p "$LOG_DIR"
 
 DATE_KEY="$(date -u +"%Y-%m-%d")"

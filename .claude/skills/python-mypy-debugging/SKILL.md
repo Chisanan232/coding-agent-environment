@@ -1,3 +1,8 @@
+---
+name: python-mypy-debugging
+description: "Diagnose and fix mypy type errors correctly, without suppressing them or degrading type coverage."
+---
+
 # SKILL.md — python-mypy-debugging
 
 > **Language**: Python. This skill is specific to the mypy type checker.
@@ -19,7 +24,7 @@ Auto-used when mypy reports errors.
 
 ## Steps
 
-1. Run `mypy src/` (or the project-specific mypy command from CLAUDE.md).
+1. Run `mypy src/` (or the project-specific mypy command from the active repository instructions).
 2. Read the first error completely — do not fix errors in bulk.
 3. Navigate to the flagged line and read the surrounding context.
 4. Identify the error category:

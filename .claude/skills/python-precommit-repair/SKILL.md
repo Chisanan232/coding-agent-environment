@@ -1,3 +1,8 @@
+---
+name: python-precommit-repair
+description: "Diagnose and fix pre-commit hook failures so that commits can proceed cleanly."
+---
+
 # SKILL.md — python-precommit-repair
 
 > **Language**: Python (primary). This skill covers pre-commit hook repair for

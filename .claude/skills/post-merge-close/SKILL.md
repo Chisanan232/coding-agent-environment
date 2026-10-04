@@ -5,6 +5,10 @@ description: "Verify merged PR acceptance, close the linked ticket, and resume c
 
 # SKILL.md — post-merge-close
 
+Read `engineering-runtime` first and initialize its host-aware environment before
+using the shell examples below. Resolve installed helper paths from that skill;
+never borrow another host’s private config, credentials or mutable state.
+
 ## Purpose
 After a PR is merged, perform all required close-out actions: transition the
 ticket to Done, delete the feature branch, post a completion comment, and
@@ -30,8 +34,8 @@ variables and define the helper functions AFTER step 3, once `PR_NUMBER` is
 known:
 
 ```bash
-TICKET="${CLAUDE_CURRENT_TICKET:-$(cat .claude/.current-ticket 2>/dev/null || echo '')}"
-CHECKPOINT_DIR="${HOME}/.claude/merge-closeout"
+TICKET="${ENGINEERING_CURRENT_TICKET:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-ticket" 2>/dev/null || echo '')}"
+CHECKPOINT_DIR="${ENGINEERING_STATE_DIR}/merge-closeout"
 mkdir -p "$CHECKPOINT_DIR"
 CHECKPOINT="${CHECKPOINT_DIR}/${PR_NUMBER}.json"   # set AFTER PR_NUMBER is known
 ```
@@ -105,7 +109,7 @@ Before each step, check if it was already completed:
 8. If a ticket reference is found:
    a. Confirm actual acceptance/validation evidence and required merge gates,
       then transition the ticket state to "Done" / "Closed" via
-      `CLAUDE_ISSUE_TRACKER`-routed MCP.
+      `ENGINEERING_ISSUE_TRACKER`-routed MCP.
    b. Apply `evidence-first-briefing` to a close comment: verified semantic outcome,
       merged PR and acceptance evidence, plus any remaining owner action. Check
       actual acceptance evidence before transitioning; never assert all criteria
@@ -115,7 +119,7 @@ Before each step, check if it was already completed:
 9. If no ticket reference is found: log the gap to the decision log and notify
    the engineer. Do not proceed to branch deletion until resolved.
    ```bash
-   bash ~/.claude/hooks/decision-log.sh record \
+   bash "${ENGINEERING_RUNTIME}/decision-log.sh" record \
      --ticket "$TICKET" --agent "main-agent" --skill "post-merge-close" \
      --phase "2" --decision "escalate" \
      --reason "No ticket reference found in PR description — cannot auto-close"
@@ -125,12 +129,12 @@ Before each step, check if it was already completed:
 10. Skip if `_checkpoint_get branch_deleted` == "true".
 11. Remove the git worktree for this ticket (must happen before branch deletion):
     ```bash
-    WORKTREE_PATH=$(cat .claude/.current-worktree 2>/dev/null || echo "")
+    WORKTREE_PATH=$(cat "${ENGINEERING_CONTEXT_DIR}/.current-worktree" 2>/dev/null || echo "")
     if [ -n "$WORKTREE_PATH" ] && git worktree list | grep -qF "$WORKTREE_PATH"; then
         git worktree remove "$WORKTREE_PATH"
     fi
     git worktree prune
-    rm -f .claude/.current-worktree
+    rm -f "${ENGINEERING_CONTEXT_DIR}/.current-worktree"
     ```
     If `git worktree remove` fails (uncommitted changes remain), do not use
     `--force`. Report to the engineer — all work must be committed before
@@ -163,16 +167,16 @@ Before each step, check if it was already completed:
 ### Phase 5 — Finalise
 19. Write final workflow state:
     ```bash
-    bash ~/.claude/hooks/workflow-state.sh write \
+    bash "${ENGINEERING_RUNTIME}/workflow-state.sh" write \
       "$TICKET" "post-merge-close" "done" "done" "complete"
     ```
 20. Archive the workflow state for this ticket:
     ```bash
-    bash ~/.claude/hooks/workflow-state.sh archive "$TICKET"
+    bash "${ENGINEERING_RUNTIME}/workflow-state.sh" archive "$TICKET"
     ```
 21. Record decision:
     ```bash
-    bash ~/.claude/hooks/decision-log.sh record \
+    bash "${ENGINEERING_RUNTIME}/decision-log.sh" record \
       --ticket "$TICKET" --agent "main-agent" --skill "post-merge-close" \
       --phase "5" --decision "complete" \
       --reason "Ticket closed, branch deleted, reporter notified" \
@@ -180,7 +184,7 @@ Before each step, check if it was already completed:
     ```
 22. Clear session notes for this ticket — the work is done:
     ```bash
-    bash ~/.claude/hooks/session-memory.sh clear "$TICKET"
+    bash "${ENGINEERING_RUNTIME}/session-memory.sh" clear "$TICKET"
     ```
 23. Clean up the checkpoint file:
     ```bash

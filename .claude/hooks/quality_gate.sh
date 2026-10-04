@@ -11,10 +11,10 @@
 
 set -euo pipefail
 
-[ -f "${HOME}/.claude/config.env" ] && source "${HOME}/.claude/config.env"
+[ -f "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}" ] && source "${ENGINEERING_CONFIG_ENV:-${HOME}/.claude/config.env}"
 
-STRICT_MODE="${CLAUDE_STRICT:-0}"
-COOLDOWN_FILE="/tmp/.claude_quality_gate_last_run"
+STRICT_MODE="${ENGINEERING_STRICT-${CLAUDE_STRICT:-0}}"
+COOLDOWN_FILE="${ENGINEERING_QUALITY_COOLDOWN_FILE:-/tmp/.claude_quality_gate_last_run}"
 COOLDOWN_SECONDS=30
 
 # Cooldown: do not run more than once per 30 seconds to avoid noise.
@@ -69,7 +69,7 @@ fi
 # Note: ERE (grep -E) does not support lookaheads on macOS or GNU grep,
 # so the negative-lookahead pattern silently matches nothing. Use a pipeline instead.
 # Store results in a variable so the pipeline executes only once.
-_todo_hits=$(grep -n 'TODO' "$FILE_PATH" 2>/dev/null | grep -v '#[0-9]' | head -5)
+_todo_hits=$(grep -n 'TODO' "$FILE_PATH" 2>/dev/null | grep -v '#[0-9]' | head -5 || true)
 if [ -n "$_todo_hits" ]; then
     echo "$_todo_hits"
     echo "[HOOK] WARNING: TODO comment without issue reference in $FILE_PATH" >&2

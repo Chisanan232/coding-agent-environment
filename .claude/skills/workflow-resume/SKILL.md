@@ -5,6 +5,10 @@ description: "Recover an interrupted agent session. Read the persisted workflow 
 
 # SKILL.md — workflow-resume
 
+Read `engineering-runtime` first and initialize its host-aware environment before
+using the shell examples below. Resolve installed helper paths from that skill;
+never borrow another host’s private config, credentials or mutable state.
+
 ## Purpose
 Recover an interrupted agent session. Read the persisted workflow state file,
 determine which phase was interrupted, validate the current environment matches
@@ -26,17 +30,17 @@ session is interrupted (crash, context limit, manual stop) and needs to continue
 ### Phase 1 — Read persisted state
 1. Resolve the ticket reference:
    ```bash
-   TICKET="${CLAUDE_CURRENT_TICKET:-$(cat .claude/.current-ticket 2>/dev/null || echo '[ticket-ref]')}"
+   TICKET="${ENGINEERING_CURRENT_TICKET:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-ticket" 2>/dev/null || echo '[ticket-ref]')}"
    ```
 2. Load and surface session notes before reading workflow state:
    ```bash
-   bash ~/.claude/hooks/session-memory.sh read "$TICKET"
+   bash "${ENGINEERING_RUNTIME}/session-memory.sh" read "$TICKET"
    ```
    Review any logged decisions or blockers — they provide context that the workflow
    state file alone does not capture. Do not repeat steps already marked done.
 3. Read the workflow state file for the target ticket:
    ```bash
-   bash ~/.claude/hooks/workflow-state.sh read "$TICKET"
+   bash "${ENGINEERING_RUNTIME}/workflow-state.sh" read "$TICKET"
    ```
    Expected output fields: `workflow`, `step`, `total_steps`, `status`, `timestamp`.
 4. If no state file exists:
@@ -56,7 +60,7 @@ session is interrupted (crash, context limit, manual stop) and needs to continue
    Required action before resuming:
    1. Read the escalation reason above.
    2. Resolve the root cause (e.g., reset circuit breaker, clarify requirements).
-   3. Run: bash ~/.claude/hooks/circuit-breaker-gate.sh reset $TICKET
+   3. Run: bash "${ENGINEERING_RUNTIME}/circuit-breaker-gate.sh" reset $TICKET
    4. Then re-run /workflow-resume $TICKET
    ```
    Do NOT proceed past this step until the engineer confirms resolution.
@@ -67,16 +71,16 @@ session is interrupted (crash, context limit, manual stop) and needs to continue
 ### Phase 2 — Environment verification
 8. Confirm the circuit breaker for this ticket is in "closed" state:
    ```bash
-   bash ~/.claude/hooks/circuit-breaker-gate.sh check "$TICKET"
+   bash "${ENGINEERING_RUNTIME}/circuit-breaker-gate.sh" check "$TICKET"
    ```
    If open: stop. Surface the same escalation block from Phase 1, step 6.
-9. Confirm the git worktree for this ticket is present and set `CLAUDE_CURRENT_WORKTREE`:
+9. Confirm the git worktree for this ticket is present and set `ENGINEERING_CURRENT_WORKTREE`:
    ```bash
-   WORKTREE="${CLAUDE_CURRENT_WORKTREE:-$(cat .claude/.current-worktree 2>/dev/null || echo '')}"
+   WORKTREE="${ENGINEERING_CURRENT_WORKTREE:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-worktree" 2>/dev/null || echo '')}"
    if [ -n "$WORKTREE" ]; then
      git worktree list | grep -qF "$WORKTREE" \
        || echo "⚠️  Worktree path '$WORKTREE' not found in git worktree list — may need recreation"
-     export CLAUDE_CURRENT_WORKTREE="$WORKTREE"
+     export ENGINEERING_CURRENT_WORKTREE="$WORKTREE"
    else
      echo "ℹ️  No worktree recorded for this ticket — development was in the main working tree"
    fi
@@ -122,7 +126,7 @@ session is interrupted (crash, context limit, manual stop) and needs to continue
     skill) revealed the branch has been reset or re-created.
 16. Update the workflow state to reflect the resumed session:
     ```bash
-    bash ~/.claude/hooks/workflow-state.sh write \
+    bash "${ENGINEERING_RUNTIME}/workflow-state.sh" write \
       "[ticket-ref]" "[workflow]" "[step]" "[total]" "in_progress"
     ```
 

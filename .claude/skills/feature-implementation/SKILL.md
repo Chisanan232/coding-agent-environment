@@ -1,3 +1,8 @@
+---
+name: feature-implementation
+description: "Implement new features safely, consistently, and traceably using the repository's established conventions and a test-first mindset."
+---
+
 # SKILL.md — feature-implementation
 
 ## Purpose
@@ -5,12 +10,12 @@ Implement new features safely, consistently, and traceably using the repository'
 established conventions and a test-first mindset.
 
 ## Type
-Auto-used. Claude Code invokes this skill whenever a feature implementation
+Auto-used. The coding agent invokes this skill whenever a feature implementation
 task is confirmed by the engineer.
 
 ## Do Not Assume
-- Do not assume you understand the requirement fully until you have asked at least
-  one clarifying question.
+- Resolve routine details from the accepted requirement and code. Ask only for
+  consequential unresolved decisions; do not reopen approved work.
 - Do not assume the existing code is correct or idiomatic — read it first.
 - Do not assume the test suite is complete — check what tests already exist.
 - Do not assume a dependency is available — check the lock file.
@@ -30,7 +35,7 @@ task is confirmed by the engineer.
 6. Identify the minimal set of files that must change.
 7. Identify tests that will need to be added or modified.
 8. Choose the smallest approach supported by the evidence. Use canonical
-   `requirement-zero:requirement-zero` if proposing NEW unvalidated scope.
+   `requirement-zero` if proposing NEW unvalidated scope.
 9. Ask only for consequential unresolved decisions; continue authorized work.
 
 ### Phase 3 — Test Design (before implementation)
@@ -40,7 +45,7 @@ task is confirmed by the engineer.
 
 ### Phase 4 — Implementation
 13. Implement the feature to make the tests pass.
-14. Follow all conventions from CLAUDE.md: naming, structure, type hints, error handling.
+14. Follow all conventions from the active repository instructions: naming, structure, type hints, error handling.
 15. Change only what is necessary. Do not refactor adjacent code.
 16. Run impacted tests after each logical unit of change.
 
@@ -53,7 +58,7 @@ task is confirmed by the engineer.
 
 ### Phase 6 — Commit
 22. Stage only the files changed for this feature.
-23. Write a commit message following the CLAUDE.md commit conventions.
+23. Write a commit message following the the active repository instructions commit conventions.
 24. Commit in small, logical increments — one concern per commit.
 25. Confirm the repository is in a healthy state after each commit.
 
