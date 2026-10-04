@@ -123,6 +123,20 @@ test_symlinked_profile_is_refused() {
     PASS=$((PASS + 1))
 }
 
+test_symlinked_codex_directory_is_refused() {
+    local fixture real_codex
+    fixture="$(mktemp -d)"
+    real_codex="$fixture/real-codex"
+    mkdir -p "$real_codex"
+    ln -s "$real_codex" "$fixture/.codex"
+    if CODING_AGENT_SYNC_HOME="$fixture" bash "$INSTALL" --capabilities >/dev/null 2>&1; then
+        printf 'FAIL: symlinked Codex directory was followed\n' >&2
+        exit 1
+    fi
+    [[ ! -e "$real_codex/capabilities-readonly.config.toml" ]]
+    PASS=$((PASS + 1))
+}
+
 test_sync_check_routes_capability_state() {
     local fixture output
     fixture="$(new_home)"
@@ -160,6 +174,7 @@ test_update_backs_up_owned_profile
 test_remove_backs_up_owned_profile
 test_unowned_profile_is_refused
 test_symlinked_profile_is_refused
+test_symlinked_codex_directory_is_refused
 test_sync_check_routes_capability_state
 test_tracked_profile_has_bounded_native_schema
 printf 'capability profile tests: %d passed\n' "$PASS"
