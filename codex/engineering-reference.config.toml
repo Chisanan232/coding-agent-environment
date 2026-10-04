@@ -6,3 +6,10 @@ url = "https://mcp.context7.com/mcp"
 enabled = true
 enabled_tools = ["resolve-library-id", "query-docs"]
 default_tools_approval_mode = "prompt"
+
+# The opt-in profile authorizes only these two public-documentation reads.
+[mcp_servers.context7.tools.resolve-library-id]
+approval_mode = "approve"
+
+[mcp_servers.context7.tools.query-docs]
+approval_mode = "approve"

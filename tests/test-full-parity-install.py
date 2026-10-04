@@ -82,6 +82,17 @@ class FullParity(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('complete authored inventory', result.stderr)
 
+    def test_reference_profile_grants_only_bounded_public_reads(self):
+        import tomllib
+        config = tomllib.loads((self.repo / 'codex/engineering-reference.config.toml').read_text())
+        server = config['mcp_servers']['context7']
+        self.assertEqual(server['url'], 'https://mcp.context7.com/mcp')
+        self.assertEqual(set(server['enabled_tools']), {'resolve-library-id', 'query-docs'})
+        self.assertEqual(server['default_tools_approval_mode'], 'prompt')
+        self.assertEqual(set(server['tools']), set(server['enabled_tools']))
+        self.assertTrue(all(spec['approval_mode'] == 'approve' for spec in server['tools'].values()))
+        self.assertFalse({'headers', 'http_headers', 'bearer_token_env_var'} & set(server))
+
     def test_native_context_isolation_state_resume_and_gate_outcomes(self):
         for host in ['claude', 'codex']:
             self.assertEqual(self.install(host).returncode, 0)
