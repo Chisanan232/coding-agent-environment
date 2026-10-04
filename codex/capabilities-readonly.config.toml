@@ -20,3 +20,6 @@ enabled_tools = [
   "search",
   "fetch",
 ]
+
+[mcp_servers.neon-readonly.tools.run_sql]
+approval_mode = "auto"
