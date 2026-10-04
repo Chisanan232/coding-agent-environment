@@ -147,7 +147,7 @@ expected = {
 assert app == {'enabled': False}
 assert server['enabled'] is True
 assert set(server['enabled_tools']) == expected
-assert server['tools'] == {'run_sql': {'approval_mode': 'auto'}}
+assert server['tools'] == {'run_sql': {'approval_mode': 'approve'}}
 assert 'readonly=true' in server['url']
 PY
     PASS=$((PASS + 1))
