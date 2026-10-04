@@ -18,7 +18,8 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 | `.claude/hooks/` | Workflow/gate shell hooks |
 | `.claude/skills/` | Custom skills (`SKILL.md` each) |
 | `codex/config.toml` | Curated portable subset of `~/.codex/config.toml` (see file header for exclusions) |
-| `codex/AGENTS.md` | Global Codex instructions (generic, no machine-specific content) |
+| `codex/AGENTS.md` | Global instruction template; signal-first block is managed, unrelated live instructions are preserved |
+| `codex/subtraction-skills.json` | External canonical skill revision and consumed-file digests; no vendored bodies |
 | `scripts/check.sh`, `scripts/install.sh`, `scripts/profile-install.sh`, `scripts/sync-check.sh` | Bootstrap/diagnosis, prerequisite install, profile setup, live/repo drift report |
 | `.gitleaks.toml`, `.pre-commit-config.yaml`, `.github/workflows/secret-scan.yml` | Layered secret-scanning config (see `docs/SECURITY.md`) |
 | `docs/ARCHITECTURE.md`, `docs/adr/` | Design goals, layering, and ADRs for durable decisions |
@@ -31,6 +32,7 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 ## Never tracked (runtime/private/generated)
 
 - `.claude.json`, `auth.json`, OAuth credentials (Keychain), session/history state
+- `~/.codex/backups/`, materialized `~/.codex/skills/`, installed `~/.agents/skills/` and `.skill-lock.json` — runtime/install state, not authored truth
 - `~/.codex/*.sqlite*`, `logs_*`, `history.jsonl`, `session_index.jsonl`
 - `~/.codex/config.toml`'s `[projects."<path>"]` trust entries — machine-specific
 - `~/.codex/config.toml`'s `notify` field — points at a local `.app` bundle path
