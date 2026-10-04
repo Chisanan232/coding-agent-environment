@@ -92,9 +92,24 @@ test_remove_backs_up_owned_profile() {
     PASS=$((PASS + 1))
 }
 
+test_unowned_profile_is_refused() {
+    local fixture target
+    fixture="$(new_home)"
+    target="$fixture/.codex/capabilities-readonly.config.toml"
+    printf 'user_owned = true\n' > "$target"
+    if CODING_AGENT_SYNC_HOME="$fixture" bash "$INSTALL" --capabilities >/dev/null 2>&1; then
+        printf 'FAIL: unowned capability profile was overwritten\n' >&2
+        exit 1
+    fi
+    assert_eq 'user_owned = true' "$(cat "$target")" "unowned bytes remain untouched"
+    [[ ! -e "$fixture/.codex/backups" ]]
+    PASS=$((PASS + 1))
+}
+
 test_apply_installs_only_external_profile
 test_dry_run_reports_without_mutation
 test_check_reports_drift_then_convergence
 test_update_backs_up_owned_profile
 test_remove_backs_up_owned_profile
+test_unowned_profile_is_refused
 printf 'capability profile tests: %d passed\n' "$PASS"
