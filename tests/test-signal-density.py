@@ -54,6 +54,36 @@ class SignalDensityExamples(unittest.TestCase):
         self.assertGreater(false_negatives, 0)
 
 
+class BriefingInstallation(unittest.TestCase):
+    def test_shared_body_report_apply_and_drift(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory(prefix='codex-briefing-') as temp:
+            live = Path(temp)
+            config = live / '.codex/config.toml'
+            config.parent.mkdir()
+            config.write_text('local_setting = "preserve"\n')
+            env = dict(os.environ, CODING_AGENT_SYNC_HOME=str(live))
+            cmd = ['bash', str(root / 'scripts/profile-install.sh'), '--global']
+            target = live / '.codex/skills/evidence-first-briefing/SKILL.md'
+            source = root / '.claude/skills/evidence-first-briefing/SKILL.md'
+            def run(*args):
+                return subprocess.run(cmd + list(args), env=env, capture_output=True, text=True)
+            self.assertEqual(run('--dry-run').returncode, 0)
+            self.assertFalse(target.exists())
+            self.assertEqual(run('--check').returncode, 1)
+            self.assertEqual(run().returncode, 0)
+            self.assertEqual(target.read_bytes(), source.read_bytes())
+            before = {p: p.read_bytes() for p in live.rglob('*') if p.is_file()}
+            self.assertEqual(run().returncode, 0)
+            self.assertEqual(before, {p: p.read_bytes() for p in live.rglob('*') if p.is_file()})
+            target.write_text('manual drift')
+            self.assertEqual(run('--check').returncode, 1)
+            self.assertEqual(run().returncode, 0)
+            self.assertEqual(run('--check').returncode, 0)
+            self.assertEqual(config.read_text(), 'local_setting = "preserve"\n')
+            self.assertEqual(next((live / '.codex/backups').rglob('*.md')).read_text(), 'manual drift')
+
+
 class DesiredStateDrift(unittest.TestCase):
     def test_bootstrap_and_drift_are_report_only(self) -> None:
         root = Path(__file__).resolve().parent.parent

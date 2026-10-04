@@ -109,11 +109,24 @@ never copy its skill bodies here. Approved work is not re-opened by Requirement 
 
 `codex/config.toml` is a curated subset, not a drop-in replacement — merge it
 by hand if you already have machine-specific `[projects.*]`/`[mcp_servers.*]`
-entries in `~/.codex/config.toml`. `codex/AGENTS.md` can be copied directly:
+entries in `~/.codex/config.toml`. Preserve unrelated global instructions when
+merging `codex/AGENTS.md`.
+
+The single authored briefing body is
+[.claude/skills/evidence-first-briefing/SKILL.md](.claude/skills/evidence-first-briefing/SKILL.md).
+Claude consumes it directly; Codex receives a materialized user-scoped copy.
+Edit only the source, then report, apply and check:
 
 ```bash
-cp codex/AGENTS.md ~/.codex/AGENTS.md
+scripts/profile-install.sh --global --dry-run
+scripts/profile-install.sh --global
+scripts/profile-install.sh --global --check
 ```
+
+This mode owns only the briefing installation, backs up a changed prior body,
+and leaves Codex config, plugins, project trust and other skills untouched. It
+uses `CODING_AGENT_SYNC_HOME` for disposable validation homes; native profile
+installation without `--global` retains its existing behavior.
 
 ## MCP servers
 
