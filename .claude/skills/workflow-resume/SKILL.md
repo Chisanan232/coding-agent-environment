@@ -1,3 +1,8 @@
+---
+name: workflow-resume
+description: "Recover an interrupted agent session. Read the persisted workflow state file, determine which phase was interrupted, validate the current environment matches the expected state, and re-enter the workflow at the correct point."
+---
+
 # SKILL.md — workflow-resume
 
 ## Purpose
@@ -123,23 +128,11 @@ session is interrupted (crash, context limit, manual stop) and needs to continue
 
 ## Output
 
-```
-## Workflow resume — [ticket-ref]
-
-| Check | Result |
-|---|---|
-| State file found | ✅ / ❌ not found |
-| Circuit breaker | ✅ closed / ❌ open |
-| Worktree | ✅ [worktree-path] / ℹ️ not recorded / ❌ missing |
-| Branch | ✅ [branch-name] / ❌ mismatch |
-| Working tree | ✅ clean / ⚠️ dirty — [files] |
-
-### Resume point
-- Workflow: [workflow name]
-- Step: [N] of [total]
-- Phase: [phase description]
-- Action: re-entering phase [N]
-```
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+Report the first incomplete outcome/acceptance boundary and resume action.
+Surface only material conflicting state, unresolved escalation or missing
+evidence; reference canonical ticket/PR state. Keep routine successful environment
+checks and historical notes internal.
 
 ## Safe-Fix Guidance
 - If the state file says step 2 but no tests were committed, re-enter at step 1

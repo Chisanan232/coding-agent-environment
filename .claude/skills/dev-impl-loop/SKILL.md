@@ -1,3 +1,8 @@
+---
+name: dev-impl-loop
+description: "Drive a single ticket through the full implementation cycle: implement → run relative tests → iterate until green → full test suite → pre-commit → explicit QA handoff. Provides a defined entry point, exit condition, and circuit breaker threshold for every iteration phase."
+---
+
 # SKILL.md — dev-impl-loop
 
 ## Purpose
@@ -185,21 +190,9 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
       --phase "4" --decision "qa-handoff" \
       --reason "All phases green; running acceptance-validation"
     ```
-17. Post a QA handoff comment on the ticket:
-    ```
-    ## Implementation complete — ready for QA
-
-    ### What was implemented
-    [one paragraph summary]
-
-    ### Tests added/changed
-    - [test file]: [what it covers]
-
-    ### Known edge cases or concerns
-    - [any area that needs extra attention during QA]
-
-    Running acceptance-validation next.
-    ```
+17. Apply `evidence-first-briefing` if a QA handoff comment adds useful information:
+    semantic outcome, validation evidence and remaining acceptance risk/unknowns.
+    Reference the ticket/PR/run; do not list test files or repeat its description.
 18. **Run the `acceptance-validation` skill** now, from an external tester
     perspective. Do not proceed until it produces a verdict.
 
@@ -251,7 +244,10 @@ When the circuit breaker trips:
    `bash ~/.claude/hooks/circuit-breaker-gate.sh reset $TICKET`
 
 ## Output
-On successful completion: PR opened, linked to ticket, workflow state = complete.
+
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+State the implemented capability/behavior, actual PR/acceptance evidence and
+remaining review or rollout action. Opening a PR is not merge or ticket completion.
 
 ## Safe-Fix Guidance
 - Do not skip Phase 2 (full suite) even if Phase 1 relative tests are green.

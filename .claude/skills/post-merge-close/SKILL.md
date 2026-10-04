@@ -1,3 +1,8 @@
+---
+name: post-merge-close
+description: "Verify merged PR acceptance, close the linked ticket, and resume checkpointed cleanup safely."
+---
+
 # SKILL.md — post-merge-close
 
 ## Purpose
@@ -98,13 +103,14 @@ Before each step, check if it was already completed:
 7. Fetch the linked ticket reference from the PR description
    (look for `Closes #`, `Fixes #`, `Refs #` patterns, or a ClickUp/JIRA URL).
 8. If a ticket reference is found:
-   a. Transition the ticket state to "Done" / "Closed" via
+   a. Confirm actual acceptance/validation evidence and required merge gates,
+      then transition the ticket state to "Done" / "Closed" via
       `CLAUDE_ISSUE_TRACKER`-routed MCP.
-   b. Post a close comment on the ticket:
-      ```
-      Merged via [PR reference] ([merge commit SHA]).
-      All acceptance criteria verified via acceptance-validation.
-      ```
+   b. Apply `evidence-first-briefing` to a close comment: verified semantic outcome,
+      merged PR and acceptance evidence, plus any remaining owner action. Check
+      actual acceptance evidence before transitioning; never assert all criteria
+      were verified merely because the PR merged. Reuse an existing completion
+      comment rather than posting a duplicate after interruption.
    c. Mark checkpoint: `_checkpoint_set ticket_closed true`
 9. If no ticket reference is found: log the gap to the decision log and notify
    the engineer. Do not proceed to branch deletion until resolved.
@@ -147,17 +153,11 @@ Before each step, check if it was already completed:
 ### Phase 4 — Notify reporter
 14. Skip if `_checkpoint_get reporter_notified` == "true".
 15. Identify the ticket reporter (original filer, not the implementer).
-16. If the reporter differs from the assignee, post a notification comment
-    tagging the reporter:
-    ```
-    @[reporter] — this item has been implemented and merged.
-    Summary: [one sentence from the PR description]
-    ```
-17. If `communication` MCP (Slack) is configured, post to the project channel:
-    ```
-    ✅ [ticket-ref]: [ticket title] — merged and closed.
-    PR: [PR URL] | Commit: [merge SHA]
-    ```
+16. If authorized notification is needed, tag the reporter in the existing
+    completion comment. Avoid a second comment that repeats the PR outcome.
+17. If an authorized project channel notification is needed, apply
+    `evidence-first-briefing`: changed capability/behavior and PR reference, with
+    material limitation or owner action. Tool availability alone is not permission.
 18. Mark checkpoint: `_checkpoint_set reporter_notified true`
 
 ### Phase 5 — Finalise
@@ -189,18 +189,10 @@ Before each step, check if it was already completed:
 
 ## Output
 
-```
-## Post-merge close — [PR reference]
-
-| Action | Result |
-|---|---|
-| Merge confirmed | ✅ SHA [sha] at [timestamp] |
-| Ticket closed | ✅ [ticket-ref] → Done / ❌ No ticket found |
-| Branch deleted | ✅ [branch-name] / ❌ [reason] |
-| Reporter notified | ✅ @[reporter] / ℹ️ Same as assignee |
-| Slack notified | ✅ / ℹ️ Not configured |
-| Workflow state | complete |
-```
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+Report the verified semantic outcome with merge/acceptance references. Surface
+failed cleanup, missing evidence or required owner action; keep successful
+checkpoint mechanics internal.
 
 ## Safe-Fix Guidance
 - If the skill fails mid-way, re-run it — completed steps are checkpointed and skipped.

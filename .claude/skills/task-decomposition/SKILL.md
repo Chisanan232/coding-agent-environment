@@ -37,6 +37,8 @@ Do not create a child per implementation step, file, function or routine gate.
 
 ## Output
 
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
 Keep the ordered plan in the current work item/session. Post only a new
 scope/dependency decision that changes what someone must do. Do not duplicate
-an existing plan or announce routine progress.
+an existing plan or announce routine progress. Reference separately tracked
+children only when they passed the separate tracking gate.
