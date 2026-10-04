@@ -22,4 +22,4 @@ enabled_tools = [
 ]
 
 [mcp_servers.neon-readonly.tools.run_sql]
-approval_mode = "auto"
+approval_mode = "approve"
