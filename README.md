@@ -128,8 +128,9 @@ codex --profile capabilities-readonly
 The profile disables the broad Neon app for that session and enables the
 official Neon read-only MCP endpoint with a fixed ten-tool allowlist. Only
 `run_sql` has Codex's native per-tool `approve` override, because the fixed URL
-enforces read-only SQL and this profile explicitly authorizes bounded reads; the
-profile does not grant write or secret-management tools. Installation owns only
+enforces read-only SQL and this profile explicitly authorizes bounded reads.
+OAuth requests only the `read` scope; the profile does not grant write or
+secret-management tools. Installation owns only
 `~/.codex/capabilities-readonly.config.toml`, keeps it mode `0600`, backs up an
 owned prior version before update/removal, and refuses unknown or symlinked
 targets. It never rewrites `~/.codex/config.toml` or OAuth/auth state. Remove it
