@@ -4,6 +4,7 @@ on:
     paths:
       - '.claude/CLAUDE.md'
       - '.claude/skills/**'
+      - '.claude/hooks/**'
       - 'codex/**'
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
@@ -15,6 +16,7 @@ on:
     paths:
       - '.claude/CLAUDE.md'
       - '.claude/skills/**'
+      - '.claude/hooks/**'
       - 'codex/**'
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
@@ -38,3 +40,5 @@ jobs:
           bash tests/test-profile-resolver.sh
           python3 tests/test-signal-density.py
           python3 tests/test-engineering-workflow.py
+          python3 tests/test-full-parity-inventory.py
+          python3 tests/test-full-parity-install.py

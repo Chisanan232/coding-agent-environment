@@ -130,3 +130,26 @@ native discovery/behavior proof; the full matrix is still NOT_VERIFIED.
 Synced-source hashes record provenance without private account/bucket paths.
 Tests enforce the authored census; manual live inspection owns observations.
 Neither pretends to be the two-host behavior gate.
+
+## Portable implementation (SPE-91)
+
+The manifest covers 38 individually routed authored skills, including native
+architecture review and the live-only PDF/morning/memory procedures. Canonical
+engineering-workflow/evidence-first bodies and external subtraction provenance
+are reused unchanged. All shared copies are byte-checked; supporting scripts and
+RTK reference are materialized from their existing sources. Runtime bootstrap
+selects native context/config/state and prevents inherited Claude state or skip
+flags from altering Codex gates. Helpers remain callable rather than claiming
+new automatic hook registration. Host-private configuration remains user-owned.
+
+The global apply/check covers every manifest body/resource and both native
+profiles. Tests inject missing skill/source, unsafe resource symlink, unrelated
+private state, native state overlap, open circuit, missing acceptance sentinel
+and warning/strict outcomes. These prove apply and helper contracts, not model
+behavior. Existing SPE-33 and SPE-84–89 regressions remain required.
+
+The live administrator-merge exception conflicts with the completed SPE-33
+contract and awaits a founder decision. Installation preserves that live policy;
+no administrator merge is authorized by this migration. Fresh Claude quota and
+missing calendar source remain explicit external blockers. SPE-92 requires
+independent fresh two-host scenario evidence before a full-parity verdict.
