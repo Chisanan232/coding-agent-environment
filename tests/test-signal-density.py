@@ -76,13 +76,21 @@ class BriefingInstallation(unittest.TestCase):
             config = live / '.codex/config.toml'
             config.parent.mkdir(parents=True)
             config.write_text('local_setting = "preserve"\n')
+            agents = live / '.codex/AGENTS.md'
+            local_bytes = b'Local unrelated instructions\r\n'
+            agents.write_bytes(local_bytes)
+            protected = [live / '.codex/auth.json', live / '.codex/hooks.json', live / '.codex/private-overlay.toml']
+            for path in protected:
+                path.write_bytes(b'Unrelated private/generated fixture state')
             env = dict(os.environ, CODING_AGENT_SYNC_HOME=str(live))
             cmd = ['bash', str(desired_root / 'scripts/profile-install.sh'), '--global']
             target = live / '.codex/skills/evidence-first-briefing/SKILL.md'
             source = root / '.claude/skills/evidence-first-briefing/SKILL.md'
             def run(*args):
                 return subprocess.run(cmd + list(args), env=env, capture_output=True, text=True)
+            before_report = {p: p.read_bytes() for p in live.rglob('*') if p.is_file()}
             self.assertEqual(run('--dry-run').returncode, 0)
+            self.assertEqual(before_report, {p: p.read_bytes() for p in live.rglob('*') if p.is_file()})
             self.assertFalse(target.exists())
             self.assertEqual(run('--check').returncode, 1)
             self.assertEqual(run().returncode, 0)
@@ -95,7 +103,44 @@ class BriefingInstallation(unittest.TestCase):
             self.assertEqual(run().returncode, 0)
             self.assertEqual(run('--check').returncode, 0)
             self.assertEqual(config.read_text(), 'local_setting = "preserve"\n')
-            self.assertEqual(next((live / '.codex/backups').rglob('evidence-first-briefing.SKILL.md')).read_text(), 'manual drift')
+            self.assertEqual(next((live / '.codex/backups').rglob('SKILL.md')).read_text(), 'manual drift')
+            self.assertTrue(agents.read_bytes().startswith(local_bytes))
+            for path in protected:
+                self.assertEqual(path.read_bytes(), b'Unrelated private/generated fixture state')
+            policy = agents.read_bytes()
+            agents.write_bytes(policy.replace(b'Create only', b'Manual drift: create only'))
+            self.assertEqual(run('--check').returncode, 1)
+            self.assertEqual(run().returncode, 0)
+            self.assertEqual(agents.read_bytes(), policy)
+            # Preflight errors must leave every surface unchanged, including a drifted skill.
+            for broken in [b'<!-- coding-agent-environment:signal-first:end --><!-- coding-agent-environment:signal-first:start -->',
+                           b'<!-- coding-agent-environment:signal-first:start -->',
+                           policy + policy[policy.index(b'<!-- coding-agent-environment:signal-first:start -->'):]]:
+                agents.write_bytes(broken)
+                target.write_text('do not partially repair')
+                before = {p: p.read_bytes() for p in live.rglob('*') if p.is_file()}
+                self.assertNotEqual(run().returncode, 0)
+                self.assertEqual(before, {p: p.read_bytes() for p in live.rglob('*') if p.is_file()})
+            agents.write_bytes(policy)
+            elsewhere = live / 'unowned.md'
+            elsewhere.write_text('private unrelated skill')
+            target.unlink()
+            target.symlink_to(elsewhere)
+            self.assertNotEqual(run().returncode, 0)
+            self.assertEqual(elsewhere.read_text(), 'private unrelated skill')
+            target.unlink()
+            self.assertEqual(run().returncode, 0)
+            override = live / '.codex/AGENTS.override.md'
+            override.write_text('user override')
+            self.assertNotEqual(run().returncode, 0)
+            override.unlink()
+            self.assertNotEqual(run('--check', '--dry-run').returncode, 0)
+            external = live / '.agents/skills/codebase-zero/SKILL.md'
+            external.write_text('external drift')
+            self.assertEqual(run('--check').returncode, 1)
+            before = agents.read_bytes()
+            self.assertNotEqual(run().returncode, 0)
+            self.assertEqual(agents.read_bytes(), before)
 
 
 class DesiredStateDrift(unittest.TestCase):
@@ -115,6 +160,23 @@ class DesiredStateDrift(unittest.TestCase):
             data['enabledPlugins'] = desired['enabledPlugins']
             data['extraKnownMarketplaces'] = desired['extraKnownMarketplaces']
             settings.write_text(json.dumps(data))
+            desired_root = live / 'desired-repo'
+            for rel in ['.claude', 'bin', 'scripts', 'codex']:
+                shutil.copytree(root / rel, desired_root / rel)
+            shutil.copy2(root / '.mcp.json', desired_root / '.mcp.json')
+            manifest_path = desired_root / 'codex/subtraction-skills.json'
+            manifest = json.loads(manifest_path.read_text())
+            import hashlib
+            for name, spec in manifest['skills'].items():
+                folder = live / '.agents/skills' / name
+                folder.mkdir(parents=True)
+                (folder / 'SKILL.md').write_text('Disposable canonical drift fixture')
+                spec['files'] = {'SKILL.md': hashlib.sha256((folder / 'SKILL.md').read_bytes()).hexdigest()}
+            manifest_path.write_text(json.dumps(manifest))
+            dest = live / '.codex/skills/evidence-first-briefing'
+            dest.mkdir(parents=True)
+            shutil.copy2(root / '.claude/skills/evidence-first-briefing/SKILL.md', dest / 'SKILL.md')
+            root = desired_root
             env = dict(os.environ, CODING_AGENT_SYNC_HOME=str(live))
 
             def check(expected: int, marker: str = '') -> None:

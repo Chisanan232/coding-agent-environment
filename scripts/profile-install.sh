@@ -15,6 +15,7 @@
 #
 # Usage:
 #   ./scripts/profile-install.sh [--dry-run]
+#   ./scripts/profile-install.sh --global [--dry-run | --check]
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -35,91 +36,148 @@ for arg in "$@"; do
 done
 
 if (( GLOBAL )); then
+    if [[ -n "${CODEX_HOME:-}" && "$CODEX_HOME" != "${CODING_AGENT_SYNC_HOME:-$HOME}/.codex" ]]; then
+        echo 'Global mode requires the standard user Codex home; custom CODEX_HOME is not managed.' >&2
+        exit 2
+    fi
     python3 - "$REPO_ROOT" "${CODING_AGENT_SYNC_HOME:-$HOME}" "$DRY_RUN" "$CHECK" <<'PYGLOBAL'
 import datetime
+import hashlib
+import json
 import os
 from pathlib import Path
+import shutil
+import stat
+import subprocess
 import sys
 import tempfile
 
 root, live = map(Path, sys.argv[1:3])
 dry, check = map(int, sys.argv[3:])
-policy = (root / 'codex/AGENTS.md').read_text()
-start = '<!-- coding-agent-environment:signal-first:start -->'
-end = '<!-- coding-agent-environment:signal-first:end -->'
-expected_block = policy[policy.index(start):policy.index(end) + len(end)]
-agents = live / '.codex/AGENTS.md'
-prior = agents.read_text() if agents.exists() else ''
-if prior.count(start) != prior.count(end) or prior.count(start) > 1:
-    raise SystemExit('Malformed managed AGENTS markers; refusing mutation.')
-if start in prior:
-    lo, hi = prior.index(start), prior.index(end) + len(end)
-    if lo > hi:
-        raise SystemExit('Reversed managed AGENTS markers; refusing mutation.')
-    merged = prior[:lo] + expected_block + prior[hi:]
-else:
-    merged = prior + ('\n' if prior and not prior.endswith('\n') else '') + '\n' + expected_block + '\n'
-policy_changed = merged != prior
-print(f"{'DIFFERS' if policy_changed else 'IDENTICAL'} {agents} (signal-first block only)")
-if policy_changed and not (dry or check):
-    agents.parent.mkdir(parents=True, exist_ok=True)
-    if agents.exists():
-        backup = agents.parent / 'backups/coding-agent-environment' / datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
-        backup.mkdir(parents=True, mode=0o700)
-        saved = backup / 'AGENTS.md'
-        saved.write_bytes(agents.read_bytes())
-        saved.chmod(0o600)
-        print(f'Prior state: {saved}')
-    agents.write_text(merged)
+if dry and check:
+    raise SystemExit('Choose --dry-run or --check, not both.')
+start = b'<!-- coding-agent-environment:signal-first:start -->'
+end = b'<!-- coding-agent-environment:signal-first:end -->'
 
+def managed_span(content):
+    if content.count(start) != 1 or content.count(end) != 1:
+        raise ValueError('Expected one matching managed AGENTS marker pair.')
+    lo, hi = content.index(start), content.index(end) + len(end)
+    if lo >= hi - len(end):
+        raise ValueError('Reversed managed AGENTS markers.')
+    return lo, hi
+
+def reject_symlinks(path):
+    for part in [path, *path.parents]:
+        if part == live.parent:
+            break
+        if part.is_symlink():
+            raise ValueError(f'Refusing mutation through symlink: {part}')
+
+# Preflight must finish before mutation so a bad skill target cannot leave AGENTS partly applied.
+policy = (root / 'codex/AGENTS.md').read_bytes()
+lo, hi = managed_span(policy)
+block = policy[lo:hi]
+agents = live / '.codex/AGENTS.md'
+if (agents.parent / 'AGENTS.override.md').exists():
+    raise SystemExit('AGENTS.override.md overrides AGENTS.md; reconcile it explicitly first.')
+reject_symlinks(agents)
+prior = agents.read_bytes() if agents.exists() else b''
+if start in prior or end in prior:
+    lo, hi = managed_span(prior)
+    merged = prior[:lo] + block + prior[hi:]
+elif prior:
+    merged = prior + (b'' if prior.endswith(b'\n') else b'\n') + b'\n' + block + b'\n'
+else:
+    merged = policy
 source = root / '.claude/skills/evidence-first-briefing/SKILL.md'
 target = live / '.codex/skills/evidence-first-briefing/SKILL.md'
+reject_symlinks(target)
 expected = source.read_bytes()
-if target.is_symlink() or target.parent.is_symlink():
-    raise SystemExit('Refusing to replace a symlinked skill; reconcile ownership first.')
-changed = not target.exists() or target.read_bytes() != expected
-print(f"{'DIFFERS' if changed else 'IDENTICAL'} {target} <- {source.relative_to(root)}")
-if changed and not (dry or check):
-    if target.exists():
-        backup = live / '.codex/backups/coding-agent-environment' / datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
-        backup.mkdir(parents=True, mode=0o700)
-        saved = backup / 'evidence-first-briefing.SKILL.md'
-        saved.write_bytes(target.read_bytes())
-        saved.chmod(0o600)
-        print(f'Prior state: {saved}')
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(dir=target.parent)
-    with os.fdopen(fd, 'wb') as f:
-        f.write(expected)
-    os.chmod(name, 0o644)
-    os.replace(name, target)
-    assert target.read_bytes() == expected
-import hashlib
-import json
-import subprocess
+plans = []
+for path, data, label in [(agents, merged, 'signal-first block; preserve outside bytes'),
+                          (target, expected, str(source.relative_to(root)))]:
+    changed = not path.exists() or path.read_bytes() != data
+    print(f"{'DIFFERS' if changed else 'IDENTICAL'} {path} <- {label}")
+    if changed:
+        plans.append((path, data))
+        if dry:
+            if path == agents:
+                print('Desired managed block:\n' + block.decode())
+            else:
+                print(f'Desired SHA256: {hashlib.sha256(data).hexdigest()} ({len(data)} bytes)')
 manifest = json.loads((root / 'codex/subtraction-skills.json').read_text())
 missing = []
 for skill, spec in manifest['skills'].items():
     folder = live / '.agents/skills' / skill
-    ok = all((folder / name).is_file() and hashlib.sha256((folder / name).read_bytes()).hexdigest() == digest
-             for name, digest in spec['files'].items())
-    print(f"{'IDENTICAL' if ok else 'DIFFERS'} {folder} <- {manifest['repository']}@{manifest['revision']}")
-    if not ok:
+    bad = [name for name, digest in spec['files'].items()
+           if not (folder / name).is_file()
+           or hashlib.sha256((folder / name).read_bytes()).hexdigest() != digest]
+    print(f"{'DIFFERS' if bad else 'IDENTICAL'} {folder} <- {manifest['repository']}@{manifest['revision']}")
+    if bad:
+        reject_symlinks(folder)
+        for path in folder.rglob('*') if folder.exists() else []:
+            reject_symlinks(path)
         missing.append(skill)
-if missing and not (dry or check):
-    if live != Path.home():
-        raise SystemExit('External install requires the actual home; fixture checks stay offline.')
+        for name in bad:
+            print(f'  {name} -> SHA256 {spec["files"][name]}')
+remaining = len(plans) + len(missing)
+if dry or check:
+    print(f'Managed Codex drift: {remaining}')
+    raise SystemExit(int(bool(remaining) and check))
+if missing and live.resolve() != Path.home().resolve():
+    raise SystemExit('External installation requires the actual home; fixture checks stay offline.')
+lock = live / '.agents/.skill-lock.json'
+if missing:
+    reject_symlinks(lock)
+    prior_lock = json.loads(lock.read_text()) if lock.exists() else {}
+    unrelated_skills = {name: value for name, value in prior_lock.get('skills', {}).items()
+                        if name not in missing}
+if remaining:
+    backup = live / '.codex/backups/coding-agent-environment' / datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    reject_symlinks(backup)
+    backup.mkdir(parents=True, mode=0o700)
+    for path in [p for p, _ in plans] + [live / '.agents/skills' / name for name in missing] + ([lock] if missing else []):
+        if not path.exists():
+            continue
+        saved = backup / path.relative_to(live)
+        saved.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_dir():
+            shutil.copytree(path, saved, symlinks=True)
+        else:
+            shutil.copy2(path, saved)
+            saved.chmod(0o600)
+    print(f'Prior state: {backup} (restore corresponding paths if needed)')
+if missing:
     subprocess.run(['npx', '--yes', manifest['installer'], 'add',
                     f"https://github.com/{manifest['repository']}/tree/{manifest['revision']}",
                     '--global', '--agent', 'codex', '--skill', *missing,
                     '--full-depth', '--yes'], check=True)
+    updated_lock = json.loads(lock.read_text())
+    if any(updated_lock.get('skills', {}).get(name) != value for name, value in unrelated_skills.items()):
+        if (backup / '.agents/.skill-lock.json').exists():
+            shutil.copy2(backup / '.agents/.skill-lock.json', lock)
+        raise SystemExit('Installer changed unrelated skill records; lock restored, inspect backup before continuing.')
     for skill in missing:
         folder = live / '.agents/skills' / skill
-        assert all(hashlib.sha256((folder / name).read_bytes()).hexdigest() == digest
-                   for name, digest in manifest['skills'][skill]['files'].items())
-remaining = (int(changed) + int(policy_changed) + len(missing)) if dry or check else 0
-print(f'Managed Codex drift: {remaining}')
-raise SystemExit(int(remaining > 0 and check))
+        if not all((folder / name).is_file() and hashlib.sha256((folder / name).read_bytes()).hexdigest() == digest
+                   for name, digest in manifest['skills'][skill]['files'].items()):
+            raise SystemExit('External installer did not produce the pinned canonical content; restore from backup.')
+for path, data in plans:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
+    fd, name = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        os.chmod(name, mode)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+    if path.read_bytes() != data:
+        raise SystemExit(f'Validation failed: {path}')
+print('Managed Codex drift: 0')
 PYGLOBAL
     exit $?
 fi

@@ -2,16 +2,21 @@
 # sync-check.sh - report-first bidirectional drift check between this repo's
 # tracked desired-state files and the live machine (~/.claude, ~/.codex).
 #
-# Reports drift. Never copies/overwrites either side — that decision is
-# always explicit and manual (`cp` in whichever direction you decide is
-# correct after reading the report).
-#
-# Usage: ./scripts/sync-check.sh
+# Defaults to reporting all tracked surfaces. --codex checks only managed
+# signal-first Codex state. Applying is owned by profile-install.sh --global.
+# Usage: ./scripts/sync-check.sh [--codex]
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 SYNC_HOME="${CODING_AGENT_SYNC_HOME:-$HOME}"
+
+if [[ "${1:-}" == "--codex" && "$#" == 1 ]]; then
+    exec bash "$REPO_ROOT/scripts/profile-install.sh" --global --check
+elif [[ "$#" != 0 ]]; then
+    echo 'Usage: sync-check.sh [--codex]' >&2
+    exit 2
+fi
 
 DIFFER=0
 LIVE_MISSING=0
@@ -27,7 +32,6 @@ PAIRS=(
     ".claude/mcp-servers.runtime.json:$SYNC_HOME/.claude/mcp-servers.runtime.json"
     ".claude/statusline.py:$SYNC_HOME/.claude/statusline.py"
     ".claude/subagent-statusline.py:$SYNC_HOME/.claude/subagent-statusline.py"
-    "codex/AGENTS.md:$SYNC_HOME/.codex/AGENTS.md"
 )
 
 echo "coding-agent-environment — sync-check"
@@ -133,11 +137,18 @@ else
     DIFFER=$((DIFFER + 1))
 fi
 
+if bash "$REPO_ROOT/scripts/profile-install.sh" --global --check; then
+    IDENTICAL=$((IDENTICAL + 1))
+else
+    DIFFER=$((DIFFER + 1))
+fi
+
 echo ""
 echo "Summary: $IDENTICAL identical, $DIFFER differ, $LIVE_MISSING missing-on-live"
 echo ""
 echo "This is a REPORT, not a sync. No files were copied in either direction."
-echo "Decide per-file which side is correct, then copy explicitly:"
+echo "For managed Codex state: scripts/profile-install.sh --global"
+echo "For other surfaces, review ownership before copying:"
 echo "  repo -> live:  cp <repo-path> <live-path>   (apply this repo's desired state)"
 echo "  live -> repo:  cp <live-path> <repo-path>    (capture a live change into the repo, then commit)"
 

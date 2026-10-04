@@ -49,8 +49,9 @@ Brewfile                       # macOS system packages (jq)
 ├── hooks/                     # Workflow / gate shell hooks (includes bg-track.py, statusline's data source)
 └── skills/                    # Custom skills (SKILL.md each)
 codex/
-├── config.toml                # Portable Codex desired state (see file header for exclusions)
-└── AGENTS.md                  # Global Codex instructions
+├── config.toml                # Portable subset; never globally replaced
+├── AGENTS.md                  # Global instructions + managed signal-first block
+└── subtraction-skills.json    # Canonical source revision/digests, no skill bodies
 bin/
 ├── coding-agent-profile        # Directory-scoped profile resolver + --explain
 ├── coding-agent-profile-explain
@@ -60,7 +61,7 @@ profiles/example-profile/       # Generic profile overlay template (copy, don't 
 scripts/
 ├── check.sh                    # Diagnostics (prerequisites, config, profiles, precedence)
 ├── install.sh                  # Prerequisite CLI installer
-├── profile-install.sh          # Symlinks bin/ + materializes Codex profile configs
+├── profile-install.sh          # Profile links + managed Codex global report/apply/check
 └── sync-check.sh               # Report-first live<->repo drift check
 tests/
 └── test-profile-resolver.sh    # 13-case / 31-assertion offline test suite
@@ -124,14 +125,27 @@ scripts/profile-install.sh --global --check
 ```
 
 This mode owns the marked signal-first AGENTS block, the materialized briefing,
-and canonical subtraction installations. It preserves unrelated instructions
-and Codex config/plugins/trust. External skill provenance and file digests live
+and canonical subtraction installations. Apply preflights the complete plan,
+backs up changed owned paths under `~/.codex/backups/coding-agent-environment/`,
+and atomically replaces the managed AGENTS/briefing files. It preserves
+unrelated instructions and Codex config/plugins/trust. External skill provenance and file digests live
 in `codex/subtraction-skills.json`; bodies remain owned by
 [Chisanan232/requirement-zero](https://github.com/Chisanan232/requirement-zero).
 The pinned skills CLI installs the selected revision into universal
-`~/.agents/skills`, which native Codex discovers. Approved work is never reopened. It
-uses `CODING_AGENT_SYNC_HOME` for disposable validation homes; native profile
+`~/.agents/skills`, which native Codex discovers. Approved work is never reopened.
+It uses `CODING_AGENT_SYNC_HOME` for disposable validation homes; native profile
 installation without `--global` retains its existing behavior.
+
+Successful installation is not behavior proof: start a fresh Codex process after
+applying. `scripts/sync-check.sh --codex` checks only the managed signal-first
+block, briefing bytes and canonical subtraction body/reference digests; it
+ignores unrelated global instructions and private/generated config. The default
+sync check also covers the existing Claude and launcher surfaces. Restore the
+corresponding saved paths from the reported backup if recovery is needed.
+Global mode supports the standard user home; a custom `CODEX_HOME` is refused
+rather than silently applying to a different session scope. Report/check are
+offline and never run the external installer. Apply needs `npx`/network only
+when canonical subtraction content is missing or differs.
 
 ## MCP servers
 
