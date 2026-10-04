@@ -11,28 +11,28 @@ set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+SYNC_HOME="${CODING_AGENT_SYNC_HOME:-$HOME}"
 
 DIFFER=0
 LIVE_MISSING=0
-REPO_ONLY=0
 IDENTICAL=0
 
 # repo_path:live_path pairs — the canonical file allowlist from docs/ALLOWLIST.md
 PAIRS=(
-    ".mcp.json:$HOME/.claude/.mcp.json"
-    ".claude/CLAUDE.md:$HOME/.claude/CLAUDE.md"
-    ".claude/RTK.md:$HOME/.claude/RTK.md"
-    ".claude/settings.json:$HOME/.claude/settings.json"
-    ".claude/config.env:$HOME/.claude/config.env"
-    ".claude/mcp-servers.runtime.json:$HOME/.claude/mcp-servers.runtime.json"
-    ".claude/statusline.py:$HOME/.claude/statusline.py"
-    ".claude/subagent-statusline.py:$HOME/.claude/subagent-statusline.py"
-    "codex/AGENTS.md:$HOME/.codex/AGENTS.md"
+    ".mcp.json:$SYNC_HOME/.claude/.mcp.json"
+    ".claude/CLAUDE.md:$SYNC_HOME/.claude/CLAUDE.md"
+    ".claude/RTK.md:$SYNC_HOME/.claude/RTK.md"
+    ".claude/settings.json:$SYNC_HOME/.claude/settings.json"
+    ".claude/config.env:$SYNC_HOME/.claude/config.env"
+    ".claude/mcp-servers.runtime.json:$SYNC_HOME/.claude/mcp-servers.runtime.json"
+    ".claude/statusline.py:$SYNC_HOME/.claude/statusline.py"
+    ".claude/subagent-statusline.py:$SYNC_HOME/.claude/subagent-statusline.py"
+    "codex/AGENTS.md:$SYNC_HOME/.codex/AGENTS.md"
 )
 
 echo "coding-agent-environment — sync-check"
 echo "repo:  $REPO_ROOT"
-echo "live:  \$HOME = $HOME"
+echo "live:  $SYNC_HOME"
 echo ""
 
 for pair in "${PAIRS[@]}"; do
@@ -51,13 +51,32 @@ for pair in "${PAIRS[@]}"; do
         continue
     fi
 
+    if [[ "$repo_rel" == ".claude/settings.json" ]]; then
+        # Native plugin installs add root fields; compare the owned settings only.
+        if python3 - "$repo_path" "$live_path" <<'PYEOF'
+import json, sys
+try:
+    desired, live = [json.load(open(p)) for p in sys.argv[1:]]
+    ok = all(live.get(k) == v for k, v in desired.items() if k != "_scope_note")
+except (OSError, ValueError):
+    ok = False
+sys.exit(0 if ok else 1)
+PYEOF
+        then
+            IDENTICAL=$((IDENTICAL + 1))
+        else
+            echo "DIFFERS        $repo_rel (owned settings)"
+            DIFFER=$((DIFFER + 1))
+        fi
+        continue
+    fi
+
     if diff -q "$repo_path" "$live_path" >/dev/null 2>&1; then
         IDENTICAL=$((IDENTICAL + 1))
     else
         echo "DIFFERS        $repo_rel"
         echo "               repo:  $repo_path"
         echo "               live:  $live_path"
-        echo "               $(diff "$repo_path" "$live_path" 2>/dev/null | head -1 || echo '(binary or unreadable diff)')"
         DIFFER=$((DIFFER + 1))
     fi
 done
@@ -67,8 +86,8 @@ done
 for dir in ".claude/hooks" ".claude/skills" "bin"; do
     repo_dir="$REPO_ROOT/$dir"
     case "$dir" in
-        bin) live_dir="$HOME/.local/bin" ;;
-        *)   live_dir="$HOME/$dir" ;;
+        bin) live_dir="$SYNC_HOME/.local/bin" ;;
+        *)   live_dir="$SYNC_HOME/$dir" ;;
     esac
     [[ -d "$repo_dir" ]] || continue
     if [[ ! -d "$live_dir" ]]; then
@@ -93,7 +112,7 @@ for dir in ".claude/hooks" ".claude/skills" "bin"; do
 done
 
 # The split global-only reference is merged into live settings, not copied.
-if python3 - "$REPO_ROOT/.claude/settings.global-only.json" "$HOME/.claude/settings.json" <<'PYEOF'
+if python3 - "$REPO_ROOT/.claude/settings.global-only.json" "$SYNC_HOME/.claude/settings.json" <<'PYEOF'
 import json, sys
 try:
     desired, live = [json.load(open(p)) for p in sys.argv[1:]]
