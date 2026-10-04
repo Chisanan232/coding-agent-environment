@@ -18,6 +18,7 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 | `.claude/hooks/` | Workflow/gate shell hooks |
 | `.claude/skills/` | Custom skills (`SKILL.md` each) |
 | `codex/config.toml` | Curated portable subset of `~/.codex/config.toml` (see file header for exclusions) |
+| `codex/capabilities-readonly.config.toml` | Opt-in native Codex external profile: broad Neon app disabled, official read-only Neon MCP allowlisted |
 | `codex/AGENTS.md` | Global instruction template; signal-first block is managed, unrelated live instructions are preserved |
 | `codex/subtraction-skills.json` | External canonical skill revision and consumed-file digests; no vendored bodies |
 | `scripts/check.sh`, `scripts/install.sh`, `scripts/profile-install.sh`, `scripts/sync-check.sh` | Bootstrap/diagnosis, prerequisite install, profile setup, live/repo drift report |
@@ -40,7 +41,7 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 - Real credentials of any kind — tracked config uses `${ENV_VAR}` placeholders only
 - `.claude/settings.local.json` — session-scoped local permission grants
 - `~/.coding-agent-profiles/` — real profile overlays (company names, endpoints, actual MCP servers/instructions); only `profiles/example-profile/`'s generic template is tracked
-- `~/.codex/<profile-name>.config.toml` — generated symlink, materialized by `scripts/profile-install.sh`
+- `~/.codex/<profile-name>.config.toml` — generated symlink, materialized by `scripts/profile-install.sh`; the owned `capabilities-readonly.config.toml` exception is an atomic mode-`0600` copy managed by `--capabilities`
 
 ## Status-line dependency closure
 
