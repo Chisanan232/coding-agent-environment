@@ -13,6 +13,12 @@ This directory contains all Claude Code skills for this configuration.
 
 ---
 
+## Shared communication
+
+`evidence-first-briefing` owns expression for persistent/shared records; workflow
+skills own the decision-relevant facts and gates. Load it before composing or
+reviewing Jira/ClickUp, GitHub, Slack/Teams, release or validation content.
+
 ## Language Repair Skills Guide
 
 Language-specific repair skills fix type errors, lint violations, test failures,
