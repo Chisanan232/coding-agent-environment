@@ -120,6 +120,20 @@ test_unowned_profile_removal_is_refused() {
     PASS=$((PASS + 1))
 }
 
+test_drifted_owned_profile_removal_is_refused() {
+    local fixture target
+    fixture="$(new_home)"
+    target="$fixture/.codex/capabilities-readonly.config.toml"
+    printf '# coding-agent-environment:managed-capability-profile:v1\ndrifted = true\n' > "$target"
+    if CODING_AGENT_SYNC_HOME="$fixture" bash "$INSTALL" --capabilities --remove >/dev/null 2>&1; then
+        printf 'FAIL: drifted owned capability profile was removed\n' >&2
+        exit 1
+    fi
+    assert_contains "$(cat "$target")" 'drifted = true' "drifted removal preserves bytes"
+    [[ ! -e "$fixture/.codex/backups" ]]
+    PASS=$((PASS + 1))
+}
+
 test_symlinked_profile_is_refused() {
     local fixture outside target
     fixture="$(new_home)"
@@ -188,6 +202,7 @@ test_update_backs_up_owned_profile
 test_remove_backs_up_owned_profile
 test_unowned_profile_is_refused
 test_unowned_profile_removal_is_refused
+test_drifted_owned_profile_removal_is_refused
 test_symlinked_profile_is_refused
 test_symlinked_codex_directory_is_refused
 test_sync_check_routes_capability_state
