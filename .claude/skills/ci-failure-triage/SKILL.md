@@ -1,3 +1,8 @@
+---
+name: ci-failure-triage
+description: Diagnose and reproduce CI failures, repair the cause, and verify the affected capability.
+---
+
 # SKILL.md — ci-failure-triage
 
 ## Purpose
@@ -75,3 +80,10 @@ Auto-used. Claude Code invokes this skill whenever CI is red.
 - After the fix: run the exact command that was failing in CI.
 - After verification: run the full suite.
 - Confirm CI passes on the pushed branch before closing the loop.
+
+## Output
+
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) when sharing a
+failure or repair record. Identify the failing capability/gate, observed cause
+and scope of local reproduction, actual verification evidence and remaining
+owner action. Reference the run rather than copying its full log.

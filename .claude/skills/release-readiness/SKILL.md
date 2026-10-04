@@ -1,3 +1,8 @@
+---
+name: release-readiness
+description: "Confirm that the codebase is in a releasable state before tagging a release."
+---
+
 # SKILL.md — release-readiness  [COMMAND-LIKE SKILL]
 
 ## Purpose
@@ -48,7 +53,8 @@ Before tagging a release version. After all PRs for the release are merged.
 - [ ] If `coverage_reporting` MCP capability is available: confirm coverage meets threshold.
 
 ## Output
-Produce a release readiness report:
-- Pass/fail for each item
-- List of blockers that must be resolved before release
-- Suggested release tag message
+
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+Report release readiness, validation evidence, blocking risks/unknowns and
+required action. A tag message describes shipped capability and compatibility
+impact. Keep routine successful checklist items internal.

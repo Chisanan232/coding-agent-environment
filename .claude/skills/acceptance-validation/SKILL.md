@@ -1,3 +1,8 @@
+---
+name: acceptance-validation
+description: "Validate that a delivered implementation meets its acceptance criteria from an external tester perspective, covering happy paths, edge cases, and regressions."
+---
+
 # SKILL.md — acceptance-validation
 
 ## Purpose
@@ -49,42 +54,19 @@ a pre-merge validation report from an external tester perspective.
 13. Identify behavioral regressions that the test suite does not catch.
 
 ### Phase 5 — Validation report
-14. Produce the structured validation report (see Output format).
+14. Produce the summary-first validation report (see Output format).
 15. If any blocking items are found, report them to the engineer with detail.
 16. Do not declare the work ready if any criterion fails or any blocking regression exists.
 
 ## Output format
 
-```
-## Acceptance validation report — [PR or ticket reference]
-
-### Acceptance criteria
-| Criterion | Scenario tested | Result |
-|---|---|---|
-| [criterion 1] | [scenario description] | ✅ Pass / ❌ Fail / ⚠️ Not verifiable |
-
-### Adversarial scenarios
-| Scenario | Expected behavior | Actual behavior | Result |
-|---|---|---|---|
-| [scenario] | [expected] | [actual] | ✅ / ❌ |
-
-### E2E / UI validation
-- Method used: CLAUDE_E2E_COMMAND / Playwright MCP / manual / not applicable
-- Result: ✅ pass / ❌ fail / ⚠️ not verified (gap noted)
-
-### Regression check
-- Existing tests: ✅ all pass / ❌ N failures (list below)
-- Behavioral regressions not caught by tests: [none / list]
-
-### Uncovered edge cases
-- [edge case that has no test and no verification]
-
-### Verdict
-[ ] Ready to merge
-[ ] Not ready — blocking items:
-  - [item 1]
-  - [item 2]
-```
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+Lead with the acceptance verdict and aggregate required assertions passed/failed,
+with the run/test/PR reference. Keep the criterion-to-scenario record as supporting
+evidence. Expand failures, material not-verified cases, regressions and evidence
+needed for review; omit routine passing-case tables and inapplicable sections.
+Describe the observed coverage boundary; do not infer absence of all regressions
+from passing tests. Unverified blocking criteria prevent a ready verdict.
 
 ## Safe-Fix Guidance
 - If a criterion fails, report it. Do not modify tests or code to make it pass.
