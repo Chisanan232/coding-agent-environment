@@ -107,6 +107,19 @@ test_unowned_profile_is_refused() {
     PASS=$((PASS + 1))
 }
 
+test_unowned_profile_removal_is_refused() {
+    local fixture target
+    fixture="$(new_home)"
+    target="$fixture/.codex/capabilities-readonly.config.toml"
+    printf 'user_owned = true\n' > "$target"
+    if CODING_AGENT_SYNC_HOME="$fixture" bash "$INSTALL" --capabilities --remove >/dev/null 2>&1; then
+        printf 'FAIL: unowned capability profile was removed\n' >&2
+        exit 1
+    fi
+    assert_eq 'user_owned = true' "$(cat "$target")" "unowned removal preserves bytes"
+    PASS=$((PASS + 1))
+}
+
 test_symlinked_profile_is_refused() {
     local fixture outside target
     fixture="$(new_home)"
@@ -174,6 +187,7 @@ test_check_reports_drift_then_convergence
 test_update_backs_up_owned_profile
 test_remove_backs_up_owned_profile
 test_unowned_profile_is_refused
+test_unowned_profile_removal_is_refused
 test_symlinked_profile_is_refused
 test_symlinked_codex_directory_is_refused
 test_sync_check_routes_capability_state
