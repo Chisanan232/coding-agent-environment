@@ -1,0 +1,22 @@
+# coding-agent-environment:managed-capability-profile:v1
+# Opt-in external Codex profile. It narrows the broad Neon app and exposes only
+# the official read-only Neon MCP surface needed for discovery and querying.
+
+[apps.asdk_app_69e0086d87088191a3edc052fa50c29f]
+enabled = false
+
+[mcp_servers.neon-readonly]
+url = "https://mcp.neon.tech/mcp?readonly=true&category=projects&category=branches&category=querying&category=schema&category=observability"
+enabled = true
+enabled_tools = [
+  "list_organizations",
+  "list_projects",
+  "list_branches",
+  "describe_project",
+  "describe_branch",
+  "get_database_tables",
+  "describe_table_schema",
+  "run_sql",
+  "search",
+  "fetch",
+]
