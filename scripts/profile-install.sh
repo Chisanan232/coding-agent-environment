@@ -16,6 +16,7 @@
 # Usage:
 #   ./scripts/profile-install.sh [--dry-run]
 #   ./scripts/profile-install.sh --global [--dry-run | --check]
+#   ./scripts/profile-install.sh --capabilities [--dry-run | --check | --remove]
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,15 +26,109 @@ CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 DRY_RUN=0
 GLOBAL=0
 CHECK=0
+CAPABILITIES=0
+REMOVE=0
 
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
         --global) GLOBAL=1 ;;
         --check) CHECK=1 ;;
+        --capabilities) CAPABILITIES=1 ;;
+        --remove) REMOVE=1 ;;
         *) echo "profile-install.sh: unknown option: $arg" >&2; exit 2 ;;
     esac
 done
+
+if (( GLOBAL && CAPABILITIES )); then
+    echo 'Choose --global or --capabilities, not both.' >&2
+    exit 2
+fi
+if (( REMOVE && ! CAPABILITIES )); then
+    echo '--remove requires --capabilities.' >&2
+    exit 2
+fi
+if (( DRY_RUN + CHECK + REMOVE > 1 )); then
+    echo 'Choose only one of --dry-run, --check, or --remove.' >&2
+    exit 2
+fi
+
+if (( CAPABILITIES )); then
+    if [[ -n "${CODEX_HOME:-}" && "$CODEX_HOME" != "${CODING_AGENT_SYNC_HOME:-$HOME}/.codex" ]]; then
+        echo 'Capabilities mode requires the selected user Codex home; custom CODEX_HOME is not managed.' >&2
+        exit 2
+    fi
+    python3 - "$REPO_ROOT" "${CODING_AGENT_SYNC_HOME:-$HOME}" "$DRY_RUN" "$CHECK" "$REMOVE" <<'PYCAPABILITIES'
+import datetime
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
+import tempfile
+
+root, live = map(Path, sys.argv[1:3])
+dry, check, remove = map(int, sys.argv[3:])
+marker = b'# coding-agent-environment:managed-capability-profile:v1\n'
+source = root / 'codex/capabilities-readonly.config.toml'
+target = live / '.codex/capabilities-readonly.config.toml'
+
+def reject_symlinks(path):
+    for part in [path, *path.parents]:
+        if part == live.parent:
+            break
+        if part.is_symlink():
+            raise SystemExit('Refusing capability mutation through a symlinked path.')
+
+desired = source.read_bytes()
+if not desired.startswith(marker):
+    raise SystemExit('Tracked capability profile is missing its ownership marker.')
+reject_symlinks(target)
+if target.exists() and not target.is_file():
+    raise SystemExit('Refusing to manage a non-regular capability profile path.')
+prior = target.read_bytes() if target.exists() else None
+if prior is not None and not prior.startswith(marker):
+    raise SystemExit('Refusing to overwrite an unowned capability profile.')
+
+expected = None if remove else desired
+mode_ok = prior is None or stat.S_IMODE(target.stat().st_mode) == 0o600
+changed = prior != expected or not mode_ok
+action = 'REMOVE' if remove else 'DIFFERS'
+print(f"{action if changed else 'IDENTICAL'} {target} <- {source.relative_to(root)}")
+if dry or check:
+    print(f'Managed capability drift: {int(changed)}')
+    raise SystemExit(int(changed and check))
+if not changed:
+    print('Managed capability drift: 0')
+    raise SystemExit(0)
+
+if prior is not None:
+    backup = live / '.codex/backups/coding-agent-environment' / datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    reject_symlinks(backup)
+    saved = backup / target.relative_to(live)
+    saved.parent.mkdir(parents=True, mode=0o700)
+    shutil.copy2(target, saved)
+    saved.chmod(0o600)
+    print(f'Prior state: {backup} (restore the corresponding path if needed)')
+if remove:
+    target.unlink()
+else:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=target.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(desired)
+        os.chmod(name, 0o600)
+        os.replace(name, target)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+    if target.read_bytes() != desired or stat.S_IMODE(target.stat().st_mode) != 0o600:
+        raise SystemExit('Capability profile validation failed after atomic update.')
+print('Managed capability drift: 0')
+PYCAPABILITIES
+    exit $?
+fi
 
 if (( GLOBAL )); then
     if [[ -n "${CODEX_HOME:-}" && "$CODEX_HOME" != "${CODING_AGENT_SYNC_HOME:-$HOME}/.codex" ]]; then
