@@ -1,3 +1,8 @@
+---
+name: cross-repo-coordinator
+description: "Coordinate accepted outcomes and integration/merge gates across repositories."
+---
+
 # SKILL.md — cross-repo-coordinator
 
 ## Purpose
@@ -28,7 +33,9 @@ more than one repository.
 Parent ticket: holds the integration acceptance criteria.
 Sub-ticket: holds an independently useful outcome and its acceptance criteria.
 Where no child is warranted, the parent owns repo-specific steps and readiness;
-apply the same integration/merge gates to those steps.
+apply the same integration/merge gates to those steps. References below to
+per-repo sub-ticket states mean the corresponding parent-owned outcomes when
+no child is warranted; every required repo outcome must clear acceptance.
 
 ### Session notes scope
 Cross-repo state is stored in session notes under the **parent ticket** ref:
@@ -83,13 +90,8 @@ Use the parent ticket ref as the coordination anchor across sessions.
    # For each sub-ticket, check state via issue tracker MCP
    # Expected states: In Progress → Ready for QA → Done
    ```
-9. Surface a consolidated status table:
-   ```
-   | Repository | Sub-ticket | State | PR |
-   |---|---|---|---|
-   | [repo-a] | [sub-A] | In Progress | — |
-   | [repo-b] | [sub-B] | Ready for QA | #42 |
-   ```
+9. Surface integration readiness and actionable cross-repo blockers via
+   `evidence-first-briefing`; repo comparison is useful only for a real decision.
 10. Update session notes with current state:
     ```bash
     bash ~/.claude/hooks/session-memory.sh append "[parent-ticket]" \
@@ -143,18 +145,9 @@ Use the parent ticket ref as the coordination anchor across sessions.
     - Do not force-merge — each PR must satisfy the auto-merge policy independently.
 19. After all PRs are merged, invoke `post-merge-close` for each sub-ticket.
 20. Transition the parent ticket to "Done" / "Closed".
-21. Post a completion summary on the parent ticket:
-    ```
-    ## Cross-repo work complete
-
-    | Repository | PR | Merged |
-    |---|---|---|
-    | [repo-a] | [PR URL] | ✅ |
-    | [repo-b] | [PR URL] | ✅ |
-
-    Integration tests: ✅ passed
-    All sub-tickets closed.
-    ```
+21. Apply `evidence-first-briefing` to completion: integrated behavior/contract,
+    actual integration run and merged PR references, and remaining owner action.
+    The parent owns integration criteria; do not copy child-ticket histories.
 22. Clear session notes for the parent ticket:
     ```bash
     bash ~/.claude/hooks/session-memory.sh clear "[parent-ticket]"
@@ -169,17 +162,10 @@ Use the parent ticket ref as the coordination anchor across sessions.
 
 ## Output
 
-```
-## Cross-repo coordination — [parent-ticket]
-
-| Repository | Sub-ticket | PR | State |
-|---|---|---|---|
-| [repo-a] | [sub-A] | #[N] | ✅ merged |
-| [repo-b] | [sub-B] | #[N] | ✅ merged |
-
-Integration check: ✅ passed
-Parent ticket: ✅ closed
-```
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+Report integrated behavior/contract and observed integration/merge evidence.
+Expand blocked repo boundaries and required action; keep child/PR maps in the
+canonical tracker rather than repeating routine states.
 
 ## Resuming an interrupted cross-repo-coordinator session
 

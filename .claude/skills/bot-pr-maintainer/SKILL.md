@@ -1,3 +1,8 @@
+---
+name: bot-pr-maintainer
+description: "Handle dependency bot and pre-commit maintenance bot PRs according to the Bot PR Policy in CLAUDE.md: approve and merge clean PRs; trigger rebase and re-evaluate conflicted PRs; escalate only when the update itself causes CI failure."
+---
+
 # SKILL.md — bot-pr-maintainer
 
 ## Purpose
@@ -54,13 +59,11 @@ Auto-used. Run via `pr-health-check` when a PR is classified as
    - Assessment of what the update broke
 
 ## Output
-Append to the `pr-health-check` health report:
 
-```
-### Bot PR actions
-- [PR #] [title] — Path [A/B/C] — action: [approved+merged / rebase requested / escalated]
-  - [optional: reason for escalation]
-```
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+Add only the bot update’s semantic/security/compatibility impact and actual
+merge/rebase/blocker evidence to the health report. Reference the PR and failing
+run where relevant; omit path labels and duplicate successful checks.
 
 ## Safe-Fix Guidance
 - Do not resolve lock-file conflicts manually — always let the bot rebase.

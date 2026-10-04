@@ -1,3 +1,8 @@
+---
+name: pr-health-check
+description: "Inspect all open PRs in the repository and produce a health report: which PRs are ready to merge, which are blocked, which are stale, and which are bot PRs requiring automated maintenance."
+---
+
 # SKILL.md — pr-health-check  [COMMAND-LIKE SKILL]
 
 ## Purpose
@@ -58,24 +63,11 @@ Output the health report (see Output format).
 
 ## Output format
 
-```
-## PR health report — [timestamp]
-
-### Ready to merge
-- [PR #] [title] — merging now / pending engineer authorization
-
-### Blocked
-- [PR #] [title] — blocked: [reason]
-
-### Bot PRs
-- [PR #] [title] — [bot-pr-clean / bot-pr-conflict] — action: [action taken]
-
-### Stale
-- [PR #] [title] — last activity: [date] — action: [commented / closed]
-
-### In progress
-- [PR #] [title] — [author] — no action
-```
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+Lead with merge readiness or the decision needed. Include relevant PR/run
+references, blocking check/review/conflict and required owner action. Aggregate
+routine healthy PRs; use a comparison table only when it materially helps a
+multi-PR decision. Omit empty classes and repeated unchanged polling updates.
 
 ## Safe-Fix Guidance
 - Do not merge a PR that does not meet all Auto-Merge Policy conditions, even if it

@@ -1,3 +1,8 @@
+---
+name: ticket-pickup-check
+description: "Verify ticket readiness, blockers and assignment before binding branch/worktree context."
+---
+
 # SKILL.md — ticket-pickup-check
 
 ## Purpose
@@ -73,12 +78,9 @@ pass before `dev-impl-loop` begins.
 
 13. Assign the ticket to the current session / developer identity.
 14. Transition the ticket state to "In Progress".
-15. Post a brief start comment on the ticket:
-    ```
-    Starting implementation — session [timestamp].
-    Branch: [branch-name]
-    Worktree: [worktree-path]
-    ```
+15. The In Progress transition records pickup. Post a comment only if a new
+    scope/dependency decision or blocker needs attention; keep branch/worktree
+    location in local context and the PR, rather than duplicating it in Jira.
 
 16. **Bind the ticket reference, release prefix, and worktree path** to the current session:
     ```bash
@@ -115,21 +117,9 @@ pass before `dev-impl-loop` begins.
 
 ## Output
 
-```
-## Ticket pickup check — [ticket reference]
-
-| Check | Result | Detail |
-|---|---|---|
-| Workflow state | ✅ Accepted / ❌ [state] | [acceptable / reason blocked] |
-| Blocker check | ✅ No blockers / ❌ Blocked | [blocker ticket refs if any] |
-| Assignee check | ✅ Unassigned → self-assigned / ❌ Assigned to [name] | |
-| Branch / worktree | ✅ [branch-name] at [worktree-path] / ❌ creation failed | |
-
-### Decision
-- Proceed with implementation: yes / no
-- Reason (if no): [reason]
-- Next action (if no): escalate to the engineer
-```
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+Report whether work can proceed and any material blocker/owner action. Reference
+the ticket. Routine successful state/assignee/worktree checks stay internal.
 
 ## Ticket context resolution (for all skills)
 

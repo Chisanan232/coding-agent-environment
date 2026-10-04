@@ -1,3 +1,8 @@
+---
+name: release-preparation
+description: "Prepare release artifacts (changelog, version config updates, release notes) for the upcoming release window. This skill is preparatory — it does not trigger the release or create tags."
+---
+
 # SKILL.md — release-preparation  [COMMAND-LIKE SKILL]
 
 ## Purpose
@@ -33,8 +38,9 @@ Use `release-readiness` for that instead.
 4. Note changed packages or services with their version increments if applicable.
 
 ### Phase 2 — Draft release notes
-5. Group classified changes by type.
-6. Write human-readable release note entries following the project's format.
+5. Select shipped behavior/capability and compatibility or migration impact.
+   Verify against code and PR evidence; commits are discovery input, not notes.
+6. Apply `evidence-first-briefing` to release notes following the project's format.
    [PROJECT-SPECIFIC — e.g., Keep a Changelog format, GitHub Releases format]
 7. Link each entry to its PR or commit.
 8. Flag any `breaking` changes prominently at the top.
@@ -53,33 +59,11 @@ Use `release-readiness` for that instead.
 
 ## Output format
 
-```
-## Release preparation — vX.Y.Z
-
-### Changes since [last-tag]
-
-#### Breaking changes
-- [entry] ([PR/commit link])
-
-#### New features
-- [entry] ([PR/commit link])
-
-#### Bug fixes
-- [entry] ([PR/commit link])
-
-#### Dependency updates
-- [entry] ([PR/commit link])
-
-### Files updated
-- [file]: version bumped X.Y.Z-1 → X.Y.Z
-- [file]: CHANGELOG updated
-
-### Status
-- [ ] Release notes drafted
-- [ ] Version config updated
-- [ ] Commit staged and committed
-- [ ] Handed off to release-watch
-```
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+State which capability/behavior is prepared for which version, compatibility or
+migration risk, and the notes/PR reference. Preparation is not publication; name
+the remaining release handoff if action is required. Internal file/version edits
+and successful preparation steps belong in the diff/state, not a status template.
 
 ## Safe-Fix Guidance
 - Do not create a tag manually — the automated workflow owns tagging.

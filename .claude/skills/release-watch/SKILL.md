@@ -1,3 +1,8 @@
+---
+name: release-watch
+description: "Monitor the automated release CI pipeline after `release-preparation` completes. Report pipeline state at each observation interval. Summarize the final outcome when the pipeline completes or fails."
+---
+
 # SKILL.md — release-watch
 
 ## Purpose
@@ -32,7 +37,7 @@ polling interval until the release pipeline resolves.
 8. If pipeline is still in-progress → record current state and wait for next interval.
 
 ### Phase 3 — Success summary
-9. Confirm the release tag was created: `git tag --sort=-creatordate | head -1`.
+9. Confirm the exact release tag/ref associated with the authoritative run.
 10. Confirm any published artifacts are accessible (if applicable).
 11. Confirm the changelog or release notes are published on GitHub Releases.
 12. Produce the success summary (see Output format).
@@ -49,31 +54,18 @@ polling interval until the release pipeline resolves.
 18. Do not attempt to repair the pipeline — escalate to engineer with the report.
 19. If Slack MCP is available, post the failure alert to the configured release channel.
 
-## Output format — success
+## Output
 
-```
-## Release outcome — vX.Y.Z ✅
+Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.
+On publication, report shipped behavior/capability and breaking or migration risk,
+with release/artifact and run references. Confirm the exact release ref against
+its authoritative run; do not infer publication from the newest local tag.
 
-- Tag created: vX.Y.Z ([link])
-- Pipeline: all jobs passed ([workflow run link])
-- Artifacts: [published / not applicable]
-- Release notes: [GitHub Releases link]
-- Duration: [start → end]
-```
-
-## Output format — failure
-
-```
-## Release outcome — vX.Y.Z ❌
-
-- Pipeline: [workflow run link]
-- Failed job: [job name]
-- Failed step: [step name]
-- Log excerpt:
-  [relevant lines from the failure log]
-- Classification: [transient / config error / code error]
-- Recommended action: [re-run / investigate config / investigate commit X]
-```
+On failure, report impact, failed gate and relevant run/log reference, material
+uncertainty and required owner action. Include only the log excerpt needed to
+understand or reproduce the failure. Do not copy every successful job or duration
+unless it changes the decision. Routine polling stays in observation state;
+notify only when decision-relevant state changes and posting is authorized.
 
 ## Safe-Fix Guidance
 - Do not re-trigger the pipeline without engineer confirmation.
