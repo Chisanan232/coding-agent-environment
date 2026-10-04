@@ -50,6 +50,7 @@ Brewfile                       # macOS system packages (jq)
 └── skills/                    # Custom skills (SKILL.md each)
 codex/
 ├── config.toml                # Portable subset; never globally replaced
+├── capabilities-readonly.config.toml # Opt-in read-only external profile
 ├── AGENTS.md                  # Global instructions + managed signal-first block
 └── subtraction-skills.json    # Canonical source revision/digests, no skill bodies
 bin/
@@ -64,7 +65,8 @@ scripts/
 ├── profile-install.sh          # Profile links + managed Codex global report/apply/check
 └── sync-check.sh               # Report-first live<->repo drift check
 tests/
-└── test-profile-resolver.sh    # 13-case / 31-assertion offline test suite
+├── test-profile-resolver.sh    # 13-case / 31-assertion offline test suite
+└── test-capability-profile.sh  # External-profile ownership/lifecycle checks
 docs/
 ├── ARCHITECTURE.md             # Design goals, layering, ADR index
 ├── ALLOWLIST.md                # Tracked-file allowlist and runtime/private/generated boundary
@@ -301,6 +303,7 @@ Run the relevant offline suites before completion:
 
 ```bash
 bash tests/test-profile-resolver.sh
+bash tests/test-capability-profile.sh
 python3 tests/test-signal-density.py
 pre-commit run --all-files
 ```
