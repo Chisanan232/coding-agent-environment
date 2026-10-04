@@ -92,6 +92,28 @@ for dir in ".claude/hooks" ".claude/skills" "bin"; do
     done < <(find "$repo_dir" -type f -print0)
 done
 
+# The split global-only reference is merged into live settings, not copied.
+if python3 - "$REPO_ROOT/.claude/settings.global-only.json" "$HOME/.claude/settings.json" <<'PYEOF'
+import json, sys
+try:
+    desired, live = [json.load(open(p)) for p in sys.argv[1:]]
+    plugin = "requirement-zero@requirement-zero"
+    marketplace = "requirement-zero"
+    ok = (live.get("enabledPlugins", {}).get(plugin) is True
+          and live.get("extraKnownMarketplaces", {}).get(marketplace)
+          == desired["extraKnownMarketplaces"][marketplace])
+except (OSError, ValueError, KeyError):
+    ok = False
+sys.exit(0 if ok else 1)
+PYEOF
+then
+    IDENTICAL=$((IDENTICAL + 1))
+else
+    echo "DIFFERS        canonical subtraction plugin desired state"
+    echo "               merge plugin/marketplace entries per README installation instructions"
+    DIFFER=$((DIFFER + 1))
+fi
+
 echo ""
 echo "Summary: $IDENTICAL identical, $DIFFER differ, $LIVE_MISSING missing-on-live"
 echo ""

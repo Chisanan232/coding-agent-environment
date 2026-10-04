@@ -55,22 +55,25 @@ These global behavioral rules apply unless the project file explicitly overrides
 
 Claude Code must follow these rules on every implementation task, without exception.
 
-### Before writing any code
+### Creation and source of truth
 
-1. Read the relevant existing code before proposing changes.
-2. Understand what the code currently does — do not assume.
-3. Clarify ambiguous requirements before starting.
-4. Propose the smallest change that achieves the goal.
-5. State explicitly what will change, and what will not change.
-
-### During implementation
-
-6. Change only what is necessary. Do not refactor surrounding code unless asked.
-7. Do not add features, options, or abstractions beyond what was requested.
-8. Do not add comments or docstrings to code you did not change.
-9. Do not introduce new dependencies without asking first.
-10. Do not add error handling for scenarios that cannot happen.
-11. Do not add backwards-compatibility shims for code that has no callers.
+- Establish need, search before creating, and reference before repeating.
+  Make only changes needed for the authorized outcome.
+- Use canonical `requirement-zero:requirement-zero` for NEW unvalidated scope
+  and `requirement-zero:codebase-zero` for EXISTING artifact audits. Approved
+  work is settled; these skills do not reopen its requirement decision.
+- Code is primary truth. Prefer naming, types, structure and API boundaries.
+  Comments/docstrings explain non-obvious WHY, domain constraints, safety or
+  compatibility invariants, external limits, workarounds, API documentation
+  contracts or justified suppressions; omit obvious mechanics.
+- Docs preserve durable knowledge code cannot express well. Tickets track
+  useful outcomes. Neither duplicates code, another ticket, a PR or a canonical doc.
+- Reuse only when semantic responsibility matches; avoid speculative abstraction
+  and mechanical DRY. Small duplication can be safer than false generality.
+- Deletion/consolidation is a valid scoped improvement. Preserve protective
+  controls and unknown state; canonical subtraction skills own detailed procedures.
+- Persistent/shared output leads with semantic outcome and supporting evidence.
+  State material inference and unknowns honestly; reference canonical detail.
 
 ### Validation sequence
 
@@ -82,7 +85,8 @@ Claude Code must follow these rules on every implementation task, without except
 ### Safety
 
 16. Never overwrite uncommitted changes without explicit user confirmation.
-17. Never delete files without explicit user confirmation.
+17. Delete only within authorized scope after checking dependents and risk.
+    Destructive operations outside scope require explicit confirmation.
 18. Never force-push without explicit user confirmation.
 19. Never skip pre-commit hooks (`--no-verify`) without explicit user confirmation.
 20. If you discover unexpected repository state (unfamiliar files, branches, config),
@@ -208,32 +212,8 @@ Every commit must be:
 
 ### Commit granularity during implementation
 
-Each commit must represent **one identifiable unit of work** — small enough that
-a human reviewer can understand exactly what changed and why by reading the subject
-line alone. This is the primary mechanism by which humans trace the LLM's reasoning
-and verify its implementation footprint.
-
-**One commit per:**
-
-| Unit | Example subject line |
-|---|---|
-| New data model or enum | `✨ model(user): Add UserRole enum with ADMIN, MEMBER, GUEST` |
-| New class or object | `✨ repo(user): Add UserRepository with find_by_id and save` |
-| New function or method | `✨ service(auth): Add generate_token() for JWT creation` |
-| Bug fix | `🐛 auth(token): Fix expiry check using UTC instead of local time` |
-| Requirement adjustment | `♻️ api(user): Change email field to optional per updated spec` |
-| Single refactoring step | `♻️ service(payment): Extract charge logic into _build_charge()` |
-| Test suite for one unit | `✅ test(user): Add UserRepository CRUD tests` |
-| Configuration change | `🔧 config(db): Set pool_size=10 for production connection pool` |
-
-**Never bundle in one commit:**
-- A new class and its tests (two separate commits)
-- Two unrelated bug fixes
-- A feature and a refactor of surrounding code
-
-**Why this matters:** A well-granulated commit history lets engineers reconstruct
-the LLM's implementation logic step by step — what it added, in what order, and
-why each piece was introduced. A monolithic commit obscures all of that.
+Keep each independently reviewable concern and its necessary tests together.
+Choose boundaries by behavior and risk, rather than one commit per function.
 
 ### What not to commit
 
@@ -422,38 +402,8 @@ asking Claude Code to run the named procedure.
 
 ### Language-specific repair skills
 
-Language-specific repair skills (type checker, linter, pre-commit) are configured
-per project. Add the relevant skills to the project's `.claude/CLAUDE.md` Skill
-Invocation Guide and ensure the skills directory contains matching `SKILL.md` files.
-
-Convention: `<language>-<tool>-<action>` — e.g., `python-ruff-fixing`,
-`typescript-tsc-debugging`, `go-golangci-fixing`, `rust-clippy-repair`.
-
-The following language-specific skills ship with this configuration kit:
-
-**Python**
-
-| Skill | When to use |
-|---|---|
-| `python-pytest-failure-debugging` | When pytest reports FAILED, ERROR, or collection errors |
-| `python-ruff-fixing` | When ruff lint or format check fails |
-| `python-mypy-debugging` | When mypy reports type errors |
-| `python-precommit-repair` | When pre-commit hooks fail for a Python project |
-
-**TypeScript / JavaScript**
-
-| Skill | When to use |
-|---|---|
-| `typescript-tsc-debugging` | When `tsc --noEmit` reports type errors |
-| `typescript-eslint-fixing` | When ESLint reports violations |
-| `node-precommit-repair` | When pre-commit hooks fail for a Node/TypeScript project |
-
-**Go**
-
-| Skill | When to use |
-|---|---|
-| `go-vet-debugging` | When `go vet` or `go build` reports errors |
-| `go-golangci-fixing` | When `golangci-lint` reports violations |
+Load the matching skill only when its tool fails. The installed inventory and
+extension guidance live in [skills/README.md](skills/README.md).
 
 ---
 
@@ -942,7 +892,8 @@ A ticket requires cross-repo coordination when:
 
 ### How it works
 
-`cross-repo-coordinator` creates per-repo sub-tickets linked to the parent,
+`cross-repo-coordinator` uses per-repo child tickets only when separate tracking
+has concrete value (see `task-decomposition`); otherwise the parent owns the plan. It
 tracks PR status across all repos, and gates all merges until:
 1. Every per-repo sub-ticket has passed QA.
 2. Integration tests pass (`CLAUDE_INTEGRATION_TEST_COMMAND`).
@@ -963,7 +914,7 @@ This allows any agent, in any repo session, to see the full cross-repo picture.
 
 ## What Claude Code Must Never Do Without Explicit Confirmation
 
-- Delete any file
+- Delete outside the authorized scope or remove protective controls without owner approval
 - Force-push to any branch
 - Run `git reset --hard`
 - Run `git clean -fd`

@@ -11,13 +11,20 @@
         "playwright@claude-plugins-official": true,
         "typescript-lsp@claude-plugins-official": true,
         "figma@claude-plugins-official": true,
-        "caveman@caveman": true
+        "caveman@caveman": true,
+        "requirement-zero@requirement-zero": true
     },
     "extraKnownMarketplaces": {
         "caveman": {
             "source": {
                 "source": "github",
                 "repo": "JuliusBrussee/caveman"
+            }
+        },
+        "requirement-zero": {
+            "source": {
+                "source": "github",
+                "repo": "Chisanan232/requirement-zero"
             }
         }
     },
