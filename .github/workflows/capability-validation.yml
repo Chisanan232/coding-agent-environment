@@ -1,0 +1,35 @@
+name: Capability profile validation
+on:
+  pull_request:
+    paths:
+      - 'codex/**'
+      - 'scripts/profile-install.sh'
+      - 'scripts/sync-check.sh'
+      - 'tests/**'
+      - 'bin/**'
+      - '.github/workflows/capability-validation.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'codex/**'
+      - 'scripts/profile-install.sh'
+      - 'scripts/sync-check.sh'
+      - 'tests/**'
+      - 'bin/**'
+      - '.github/workflows/capability-validation.yml'
+permissions:
+  contents: read
+jobs:
+  isolated-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Validate isolated capability and existing profile boundaries
+        run: |
+          bash -n scripts/profile-install.sh scripts/sync-check.sh
+          bash tests/test-capability-profile.sh
+          bash tests/test-profile-resolver.sh
+          bash tests/test-signal-density-global.sh
