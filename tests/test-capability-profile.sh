@@ -132,6 +132,27 @@ test_sync_check_routes_capability_state() {
     PASS=$((PASS + 1))
 }
 
+test_tracked_profile_has_bounded_native_schema() {
+    python3 - "$DESIRED" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], 'rb') as stream:
+    config = tomllib.load(stream)
+app = config['apps']['asdk_app_69e0086d87088191a3edc052fa50c29f']
+server = config['mcp_servers']['neon-readonly']
+expected = {
+    'list_organizations', 'list_projects', 'list_branches', 'describe_project',
+    'describe_branch', 'get_database_tables', 'describe_table_schema', 'run_sql',
+    'search', 'fetch',
+}
+assert app == {'enabled': False}
+assert server['enabled'] is True
+assert set(server['enabled_tools']) == expected
+assert server['tools'] == {'run_sql': {'approval_mode': 'auto'}}
+assert 'readonly=true' in server['url']
+PY
+    PASS=$((PASS + 1))
+}
+
 test_apply_installs_only_external_profile
 test_dry_run_reports_without_mutation
 test_check_reports_drift_then_convergence
@@ -140,4 +161,5 @@ test_remove_backs_up_owned_profile
 test_unowned_profile_is_refused
 test_symlinked_profile_is_refused
 test_sync_check_routes_capability_state
+test_tracked_profile_has_bounded_native_schema
 printf 'capability profile tests: %d passed\n' "$PASS"
