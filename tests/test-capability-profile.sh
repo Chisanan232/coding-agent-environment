@@ -7,10 +7,12 @@ INSTALL="$ROOT/scripts/profile-install.sh"
 SYNC_CHECK="$ROOT/scripts/sync-check.sh"
 DESIRED="$ROOT/codex/capabilities-readonly.config.toml"
 PASS=0
+TEST_ROOT="$(mktemp -d)"
+trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
 new_home() {
     local fixture
-    fixture="$(mktemp -d)"
+    fixture="$(mktemp -d "$TEST_ROOT/home.XXXXXX")"
     mkdir -p "$fixture/.codex"
     printf 'model = "user-owned"\n' > "$fixture/.codex/config.toml"
     printf 'private-auth-state\n' > "$fixture/.codex/auth.json"
@@ -152,7 +154,7 @@ test_symlinked_profile_is_refused() {
 
 test_symlinked_codex_directory_is_refused() {
     local fixture real_codex
-    fixture="$(mktemp -d)"
+    fixture="$(mktemp -d "$TEST_ROOT/home.XXXXXX")"
     real_codex="$fixture/real-codex"
     mkdir -p "$real_codex"
     ln -s "$real_codex" "$fixture/.codex"
