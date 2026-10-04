@@ -157,3 +157,6 @@ instructions. `sync-check.sh --full-parity` checks both hosts' complete managed
 practice state; legacy whole-file reporting remains separate. Fresh Claude quota
 and missing calendar source remain explicit external blockers. SPE-92 still needs
 independent fresh two-host scenario evidence before a full-parity verdict.
+
+Current fresh-session results and proof limits are recorded in
+[FULL-PARITY-VERIFICATION.md](FULL-PARITY-VERIFICATION.md).
