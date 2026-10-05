@@ -131,6 +131,21 @@ class BriefingInstallation(unittest.TestCase):
             self.assertTrue(agents.read_bytes().startswith(local_bytes))
             for path in protected:
                 self.assertEqual(path.read_bytes(), b'Unrelated private/generated fixture state')
+            # The authorized known legacy policy is retired; unknown policy is
+            # preserved and reported instead of silently overwritten.
+            legacy = (root / 'tests/fixtures/legacy-codex-routing.md').read_bytes().rstrip(b'\n')
+            installed = agents.read_bytes()
+            agents.write_bytes(legacy + b'\n' + installed)
+            self.assertEqual(run('--dry-run').returncode, 0)
+            self.assertEqual(agents.read_bytes(), legacy + b'\n' + installed)
+            self.assertEqual(run().returncode, 0)
+            self.assertNotIn(b'cost-aware-routing:start', agents.read_bytes())
+            self.assertIn(local_bytes, agents.read_bytes())
+            unknown = legacy.replace(b'three concurrent', b'two concurrent') + b'\n' + agents.read_bytes()
+            agents.write_bytes(unknown)
+            self.assertNotEqual(run().returncode, 0)
+            self.assertEqual(agents.read_bytes(), unknown)
+            agents.write_bytes(installed)
             policy = agents.read_bytes()
             agents.write_bytes(policy.replace(b'Create only', b'Manual drift: create only'))
             self.assertEqual(run('--check').returncode, 1)

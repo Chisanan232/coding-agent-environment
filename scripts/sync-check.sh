@@ -11,7 +11,9 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 SYNC_HOME="${CODING_AGENT_SYNC_HOME:-$HOME}"
 
-if [[ "${1:-}" == "--codex" && "$#" == 1 ]]; then
+if [[ "${1:-}" == "--routing" && "$#" == 1 ]]; then
+    exec bash "$REPO_ROOT/scripts/profile-install.sh" --routing --check
+elif [[ "${1:-}" == "--codex" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --global --check
 elif [[ "${1:-}" == "--full-parity" && "$#" == 1 ]]; then
     result=0
