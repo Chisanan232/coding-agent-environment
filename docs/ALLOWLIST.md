@@ -18,12 +18,14 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 | `.claude/hooks/` | Workflow/gate shell hooks |
 | `.claude/skills/` | Custom skills (`SKILL.md` each); shared skill sources are materialized exactly for Codex |
 | `codex/config.toml` | Curated portable subset of `~/.codex/config.toml` (see file header for exclusions) |
+| `codex/agents/*.toml` | Canonical named architect/implementer/reviewer routing policy; see `docs/CODEX-ROUTING.md` |
 | `codex/capabilities-readonly.config.toml` | Opt-in native Codex external profile: broad Neon app disabled, official read-only Neon MCP allowlisted |
-| `codex/AGENTS.md` | Global instruction template; signal-first block is managed, unrelated live instructions are preserved |
+| `codex/AGENTS.md` | Global instruction template; signal-first block is managed; exact known legacy routing policy is migrated, unknown/unrelated instructions are preserved |
 | `codex/subtraction-skills.json` | External canonical skill revision and consumed-file digests; no vendored bodies |
-| `scripts/check.sh`, `scripts/install.sh`, `scripts/profile-install.sh`, `scripts/sync-check.sh` | Bootstrap/diagnosis, prerequisite install, profile setup, live/repo drift report |
+| `scripts/check.sh`, `scripts/install.sh`, `scripts/profile-install.sh`, `scripts/sync-check.sh`, `scripts/codex-routing.py`, `scripts/verify-codex-routing.py` | Bootstrap/diagnosis, prerequisite install, profile setup, focused Codex routing reconciliation and live/repo drift report |
 | `.gitleaks.toml`, `.pre-commit-config.yaml`, `.github/workflows/secret-scan.yml` | Layered secret-scanning config (see `docs/SECURITY.md`) |
 | `docs/ARCHITECTURE.md`, `docs/adr/` | Design goals, layering, and ADRs for durable decisions |
+| `docs/CODEX-ROUTING.md` | Portable Codex named-role routing, ownership, lifecycle and evidence boundaries |
 | `mise.toml`, `Brewfile` | Declarative CLI toolchain (see `docs/TOOLCHAIN.md`) |
 | `bin/coding-agent-profile`, `bin/coding-agent-profile-explain`, `bin/ca-claude`, `bin/ca-codex` | Directory-scoped profile resolver + launchers (see `docs/PROFILES.md`) |
 | `profiles/example-profile/` | Generic profile overlay template — never a real overlay |
@@ -37,6 +39,7 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 - `~/.codex/*.sqlite*`, `logs_*`, `history.jsonl`, `session_index.jsonl`
 - `~/.codex/config.toml`'s `[projects."<path>"]` trust entries — machine-specific
 - `~/.codex/config.toml`'s `notify` field — points at a local `.app` bundle path
+- `~/.codex/routing-owned-state.json` and `~/.codex/.routing-install.lock` — private machine-local receipt/lock for the focused named-role reconciler; custom-provider `--resolution FILE` data is also local and must not be committed
 - Plugin caches (`**/plugins/`)
 - Real credentials of any kind — tracked config uses `${ENV_VAR}` placeholders only
 - `.claude/settings.local.json` — session-scoped local permission grants
@@ -69,6 +72,10 @@ Codex precedence (validated via `codex debug prompt-input`):
 ```
 project .codex/config.toml < --profile toml (via ca-codex) < -c session flags < managed config
 ```
+
+Named-role reconciliation ownership, provider binding, failure recovery, and
+the limits of native versus guarded-launch evidence are described in
+[`CODEX-ROUTING.md`](CODEX-ROUTING.md) and [ADR-0011](adr/0011-portable-codex-routing.md).
 
 Directory-scoped profiles overlay via `--settings`/`--mcp-config` (Claude)
 and `--profile` (Codex) — see `docs/PROFILES.md` for the full design,

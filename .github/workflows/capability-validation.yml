@@ -8,6 +8,8 @@ on:
       - 'codex/**'
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
+      - 'scripts/codex-routing.py'
+      - 'scripts/verify-codex-routing.py'
       - 'tests/**'
       - 'bin/**'
       - '.github/workflows/capability-validation.yml'
@@ -20,6 +22,8 @@ on:
       - 'codex/**'
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
+      - 'scripts/codex-routing.py'
+      - 'scripts/verify-codex-routing.py'
       - 'tests/**'
       - 'bin/**'
       - '.github/workflows/capability-validation.yml'
@@ -42,3 +46,4 @@ jobs:
           python3 tests/test-engineering-workflow.py
           python3 tests/test-full-parity-inventory.py
           python3 tests/test-full-parity-install.py
+          python3 tests/test-codex-routing.py

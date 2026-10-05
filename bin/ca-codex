@@ -37,4 +37,10 @@ if [[ "${CA_DRY_RUN:-0}" == "1" ]]; then
     exit 0
 fi
 
+if [[ -f "${CODEX_HOME:-$HOME/.codex}/routing-owned-state.json" ]]; then
+    ROUTING_ROOT="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent.parent)' "${BASH_SOURCE[0]}")"
+    CODING_AGENT_CODEX_BIN="$CODEX_BIN" python3 "$ROUTING_ROOT/scripts/codex-routing.py" \
+        --launch-check -- "${ARGS[@]+"${ARGS[@]}"}" "$@"
+fi
+
 exec "$CODEX_BIN" "${ARGS[@]+"${ARGS[@]}"}" "$@"

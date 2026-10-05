@@ -110,6 +110,9 @@ never copy its skill bodies here. Approved work is not re-opened by Requirement 
 
 ### Codex
 
+Portable named-role routing, live ownership, provider validation, and install
+or recovery steps are documented in [Codex routing](docs/CODEX-ROUTING.md).
+
 `codex/config.toml` is a curated subset, not a drop-in replacement — merge it
 by hand if you already have machine-specific `[projects.*]`/`[mcp_servers.*]`
 entries in `~/.codex/config.toml`. Preserve unrelated global instructions when

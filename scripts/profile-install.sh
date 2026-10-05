@@ -20,6 +20,10 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${1:-}" == "--routing" ]]; then
+    shift
+    exec python3 "$REPO_ROOT/scripts/codex-routing.py" "$@"
+fi
 INSTALL_BIN_DIR="${INSTALL_BIN_DIR:-$HOME/.local/bin}"
 PROFILE_DIR="${CODING_AGENT_PROFILE_DIR:-$HOME/.coding-agent-profiles}"
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
@@ -191,6 +195,18 @@ lo, hi = managed_span(policy)
 block = policy[lo:hi]
 reject_symlinks(agents)
 prior = agents.read_bytes() if agents.exists() else b''
+if host_mode == 'codex' and b'<!-- cost-aware-routing:start -->' in prior:
+    # One founder-authorized legacy routing policy predates the shared block.
+    # Retire only its exact known bytes; unknown instruction policy is a conflict.
+    legacy_start = b'<!-- cost-aware-routing:start -->'
+    legacy_end = b'<!-- cost-aware-routing:end -->'
+    if prior.count(legacy_start) != 1 or prior.count(legacy_end) != 1:
+        raise SystemExit('Ambiguous legacy routing instruction ownership.')
+    a, b = prior.index(legacy_start), prior.index(legacy_end) + len(legacy_end)
+    legacy = prior[a:b]
+    if hashlib.sha256(legacy).hexdigest() != 'b1be96f2311ce0e103583f90716a4fde2f5758de812e43916bba3ced7e13667e':
+        raise SystemExit('Unknown legacy routing policy conflicts with named-role policy; reconcile ownership explicitly.')
+    prior = prior[:a] + prior[b:]
 if start in prior or end in prior:
     lo, hi = managed_span(prior)
     merged = prior[:lo] + block + prior[hi:]
