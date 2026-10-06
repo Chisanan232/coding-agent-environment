@@ -15,6 +15,7 @@
 #
 # Usage:
 #   ./scripts/profile-install.sh [--dry-run]
+#   ./scripts/profile-install.sh --visuals [--dry-run | --check]
 #   ./scripts/profile-install.sh --global [--dry-run | --check]
 #   ./scripts/profile-install.sh --capabilities [--dry-run | --check | --remove]
 set -euo pipefail
@@ -23,6 +24,10 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ "${1:-}" == "--routing" ]]; then
     shift
     exec python3 "$REPO_ROOT/scripts/codex-routing.py" "$@"
+fi
+if [[ "${1:-}" == "--visuals" ]]; then
+    shift
+    exec python3 "$REPO_ROOT/scripts/visual-skills.py" "$@"
 fi
 INSTALL_BIN_DIR="${INSTALL_BIN_DIR:-$HOME/.local/bin}"
 PROFILE_DIR="${CODING_AGENT_PROFILE_DIR:-$HOME/.coding-agent-profiles}"

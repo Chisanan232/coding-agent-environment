@@ -13,6 +13,8 @@ SYNC_HOME="${CODING_AGENT_SYNC_HOME:-$HOME}"
 
 if [[ "${1:-}" == "--routing" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --routing --check
+elif [[ "${1:-}" == "--visuals" && "$#" == 1 ]]; then
+    exec bash "$REPO_ROOT/scripts/profile-install.sh" --visuals --check
 elif [[ "${1:-}" == "--codex" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --global --check
 elif [[ "${1:-}" == "--full-parity" && "$#" == 1 ]]; then
@@ -23,7 +25,7 @@ elif [[ "${1:-}" == "--full-parity" && "$#" == 1 ]]; then
 elif [[ "${1:-}" == "--capabilities" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --capabilities --check
 elif [[ "$#" != 0 ]]; then
-    echo 'Usage: sync-check.sh [--codex | --capabilities | --full-parity]' >&2
+    echo 'Usage: sync-check.sh [--codex | --capabilities | --full-parity | --visuals]' >&2
     exit 2
 fi
 
