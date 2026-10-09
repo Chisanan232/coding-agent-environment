@@ -104,6 +104,20 @@ form.** Do not reintroduce one — here or in a private profile overlay —
 without first re-verifying SPE-83's reproduction steps against the
 installed RTK version.
 
+**Accepted breadth**: `Bash(gh pr *)`, `Bash(gh pr merge:*)`,
+`mcp__github__create_pull_request`, and `mcp__github__merge_pull_request`
+are intentionally broad — `gh pr *` alone covers `create`, `merge`,
+`close`, `edit`, and `review --approve`. This is a deliberate choice, not
+an oversight (flagged by an automated security review of this ADR's own
+commit, evaluated, and kept): every operation it reaches is PR-scoped and
+reversible (closing/editing a PR, even merging one, can be undone through
+GitHub itself), and none of it reaches repository deletion, organization
+settings, or credential material — those stay behind their own `ask`/`deny`
+rules regardless (`gh repo delete`, `gh api … DELETE`, `create_repository`,
+`fork_repository`). Narrowing this further would mean re-litigating merge
+policy per subcommand, which ADR-0012 Decision 4/Consequences already
+explains a text rule cannot reliably do.
+
 **What a text-based permission rule cannot do** (classifier/`autoMode.environment`
 territory instead, by design — not a gap to "fix" with more rules): judge
 whether a `gh api` POST/PATCH/PUT targets content vs. settings; judge

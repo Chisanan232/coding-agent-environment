@@ -55,6 +55,21 @@ Investigated, in order, with evidence — not assumed:
    rule. Fixed by widening the `ask` patterns to `gh api * -X DELETE*` /
    `gh api * --method DELETE*` (wildcards on both sides) and not tracking
    a broad `gh api` allow rule at all.
+   A third instance — found by an automated security review of this ADR's
+   own first commit, then independently reproduced — hit the **deny**
+   side instead of `ask`: a global flag placed *before* the subcommand
+   (`terraform -chdir=/tmp destroy`, `gcloud --project=evil secrets
+   versions access latest`) breaks the contiguous-prefix match
+   `Bash(terraform destroy:*)` / `Bash(gcloud secrets versions access *)`
+   require, since the flag now sits between `terraform`/`gcloud` and the
+   dangerous subcommand. Fixed the same way: added
+   `Bash(terraform * destroy*)`, `Bash(terraform * apply *-destroy*)` (and
+   `--destroy`/`rtk`-prefixed variants), and `Bash(gcloud * secrets
+   versions access*)` — wildcards covering the flag position, anchored
+   precisely enough that `terraform plan -destroy` (read-only regardless
+   of the flag — `plan` never mutates) is deliberately **not** caught,
+   verified by `tests/test-permission-governance.py`'s
+   `GlobalFlagReorderingDenyRegression`.
 4. **The Auto Mode classifier itself can fail closed on transient API
    errors.** A real logged event (`automode-unavailable`, a `429` rate-limit
    error from the classifier's own backing call, found in a local session
