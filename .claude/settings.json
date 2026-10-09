@@ -223,14 +223,22 @@
             "Bash(terraform apply --destroy*)",
             "Bash(terraform apply * -destroy*)",
             "Bash(terraform apply * --destroy*)",
+            "Bash(terraform * apply *-destroy*)",
+            "Bash(terraform * apply *--destroy*)",
+            "Bash(terraform * destroy*)",
 
             "Bash(rtk proxy *)",
             "Bash(rtk terraform destroy *)",
             "Bash(rtk terraform apply * -destroy*)",
             "Bash(rtk terraform apply * --destroy*)",
+            "Bash(rtk terraform * apply *-destroy*)",
+            "Bash(rtk terraform * apply *--destroy*)",
+            "Bash(rtk terraform * destroy*)",
 
             "Bash(gcloud secrets versions access *)",
             "Bash(rtk gcloud secrets versions access *)",
+            "Bash(gcloud * secrets versions access*)",
+            "Bash(rtk gcloud * secrets versions access*)",
 
             "mcp__neon__get_connection_string"
         ],

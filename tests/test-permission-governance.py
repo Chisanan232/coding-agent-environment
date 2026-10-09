@@ -7,6 +7,7 @@ behavior would be the only true verification (does a live session actually
 prompt), that is explicitly out of reach here and not claimed: see the
 RTKHookSelfDecision class docstring and ADR-0012's Consequences section.
 """
+import fnmatch
 import json
 import re
 import shutil
@@ -46,9 +47,15 @@ MANDATORY_ASK = {
 
 MANDATORY_DENY = {
     "Bash(terraform destroy:*)",
+    "Bash(terraform * destroy*)",
+    "Bash(rtk terraform * destroy*)",
+    "Bash(terraform * apply *-destroy*)",
+    "Bash(terraform * apply *--destroy*)",
     "Bash(rtk proxy *)",
     "Bash(gcloud secrets versions access *)",
     "Bash(rtk gcloud secrets versions access *)",
+    "Bash(gcloud * secrets versions access*)",
+    "Bash(rtk gcloud * secrets versions access*)",
     "mcp__neon__get_connection_string",
 }
 
@@ -126,6 +133,59 @@ class MandatorySafeguardsPresent(unittest.TestCase):
             for flag in ("-X", "--method"):
                 self.assertNotIn(f"Bash(gh api * {flag} {method}*)", ask)
                 self.assertNotIn(f"Bash(rtk gh api * {flag} {method}*)", ask)
+
+
+def bash_rule_matches(command, rule):
+    """Approximates Claude Code's documented Bash rule matching: '*' is a
+    greedy any-text wildcard: a ':*' suffix is equivalent to a trailing
+    ' *', including matching the bare command with nothing after it. This
+    is a model of the documented semantics for CI-time regression testing —
+    not the real engine — see RTKHookSelfDecision's docstring for the
+    equivalent caveat about the real rtk binary."""
+    if not (rule.startswith("Bash(") and rule.endswith(")")):
+        return False
+    pattern = rule[5:-1]
+    if pattern.endswith(":*"):
+        stem = pattern[:-2]
+        return command == stem or fnmatch.fnmatchcase(command, stem + " *")
+    return fnmatch.fnmatchcase(command, pattern)
+
+
+class GlobalFlagReorderingDenyRegression(unittest.TestCase):
+    """Found via an automated security review of this ADR's own commit
+    (2026-10-10): a global flag placed BEFORE the subcommand (terraform's
+    `-chdir=`, gcloud's `--project=`, etc.) changes the command's word
+    order enough that a deny rule anchored to "terraform destroy" or
+    "gcloud secrets versions access" as a contiguous prefix no longer
+    matches — the same bug class as SPE-83's gh-api-flag-ordering fix,
+    just not yet applied to these two deny rules until now. Mirrors the
+    verification methodology already used for SPE-83's allow-side fix."""
+
+    def test_terraform_destroy_still_denied_with_a_preceding_global_flag(self):
+        deny = load_settings()["permissions"]["deny"]
+        for cmd in ("terraform -chdir=/tmp destroy", "terraform destroy",
+                    "terraform -chdir=/tmp apply -destroy",
+                    "terraform apply -auto-approve -destroy",
+                    "terraform apply -destroy"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(any(bash_rule_matches(cmd, r) for r in deny), f"not denied: {cmd!r}")
+
+    def test_terraform_plan_with_the_destroy_flag_is_not_falsely_denied(self):
+        """`terraform plan -destroy` never mutates anything — it's exactly
+        as read-only as `terraform plan`. The fix for the above must not
+        turn this into a false block."""
+        deny = load_settings()["permissions"]["deny"]
+        for cmd in ("terraform plan -destroy", "terraform plan", "terraform init", "terraform apply"):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(any(bash_rule_matches(cmd, r) for r in deny), f"incorrectly denied: {cmd!r}")
+
+    def test_gcloud_secrets_access_still_denied_with_a_preceding_global_flag(self):
+        deny = load_settings()["permissions"]["deny"]
+        for cmd in ("gcloud --project=evil secrets versions access latest",
+                    "gcloud secrets versions access latest",
+                    "rtk gcloud --project=evil secrets versions access latest"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(any(bash_rule_matches(cmd, r) for r in deny), f"not denied: {cmd!r}")
 
 
 class SPE83PushAllowRegression(unittest.TestCase):
