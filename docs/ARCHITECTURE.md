@@ -80,6 +80,15 @@ non-trivial architecture/design. Full policy in `.claude/CLAUDE.md`'s
 **Model Routing** section. Why the old role-simulating agent roster
 (`dev-agent`/`qa-agent`/`dev-lead-agent`) was retired: [ADR-0002](adr/0002-capability-based-delegation.md).
 
+## Permission governance
+
+`.claude/settings.json#permissions` — Auto Mode `allow`/`ask`/`deny` rules,
+the mandatory-safeguard list, and the known RTK self-decision defect
+(SPE-83) this repo structurally works around: `docs/SECURITY.md`'s
+Permission governance section. Why Auto Mode stays the default over
+`bypassPermissions`, and why the `ask` list shrank from 60 to 47 rather
+than growing indefinitely: [ADR-0012](adr/0012-autonomous-permission-governance.md).
+
 ## Observability
 
 Status-line design, dependency closure, and performance constraints:
@@ -135,3 +144,4 @@ Rationale: [ADR-0008](adr/0008-repository-rename.md).
 | [0007](adr/0007-directory-scoped-profiles.md) | Deterministic directory-scoped profiles + private corporate overlays |
 | [0008](adr/0008-repository-rename.md) | Repository rename to `coding-agent-environment` |
 | [0009](adr/0009-bootstrap-mechanism.md) | Bootstrap/apply mechanism: plain scripts, not a config-management tool |
+| [0012](adr/0012-autonomous-permission-governance.md) | Autonomous-first permission governance (Auto Mode `allow`/`ask`/`deny`) |

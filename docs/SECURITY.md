@@ -60,6 +60,73 @@ sit above any profile overlay in the validated precedence (see
 audits that this remains true against the currently installed `claude`
 binary, since it's observed behavior rather than a published contract.
 
+## Permission governance (Auto Mode `allow`/`ask`/`deny`)
+
+`.claude/settings.json#permissions` is this repo's own attack-surface
+boundary, not just a convenience list. Full rationale, root-cause evidence,
+and the 60→47 `ask`-rule history: [ADR-0012](adr/0012-autonomous-permission-governance.md).
+
+**Baseline**: `defaultMode: "auto"` — Auto Mode's classifier, not
+`bypassPermissions`. `ask` rules force a prompt even in Auto Mode; they
+would be silently ineffective under `bypassPermissions` (`allow` rules lose
+effect there too), so the two settings are not interchangeable — never
+switch this repo's default to `bypassPermissions` to "fix" prompting.
+
+**Mandatory `ask`-gated operations** (never move to `allow` without a
+fresh, documented decision — not merely to reduce prompts):
+
+| Category | Rules |
+|---|---|
+| Force-push, any branch | `git push --force*` / `-f*`, bare and RTK-rewritten forms |
+| Destructive local history | `git reset --hard`, `git clean -f*` |
+| Unattributable process kill | `kill -9`, `pkill`, `killall` |
+| Repo/resource deletion via API | `gh repo delete`, `gh api … -X DELETE` / `--method DELETE` (both flag orderings) |
+| Infrastructure mutation | `terraform apply` (can mutate/replace production without `destroy`) |
+| Arbitrary cloud execution | `mcp__gcloud__run_gcloud_command` |
+| Production monetization | `mcp__polar-production__execute_tool` |
+| Managed-DB/storage deletion | every `mcp__neon__*delete*`/`disable_auth`/`reset_from_parent`/`*_credential`, every `mcp__cloudflare-bindings__*_delete` |
+| Trust-boundary widening | `mcp__github__delete_file`, `create_repository`, `fork_repository`, `mcp__claude_ai_Google_Drive__share_file` |
+
+**`deny` (no legitimate interactive use in this workflow)**: `terraform
+destroy` (and `apply -destroy` variants), `rtk proxy` (documented
+debug-only raw-execution bypass — see
+[SPE-83](https://lightning-dust-mite.atlassian.net/browse/SPE-83)),
+`gcloud secrets versions access`, `mcp__neon__get_connection_string` (its
+return value *is* the secret — a settings-file rule cannot scope by
+parameter, so the whole tool is denied).
+
+**Known unresolved defect**: [SPE-83](https://lightning-dust-mite.atlassian.net/browse/SPE-83)
+— RTK's own PreToolUse self-decision can match an `allow` rule at
+`git <subcommand>` granularity (ignoring flags) and bypass a configured
+`ask` rule for the same subcommand. This repo's mitigation is structural:
+**no `allow` rule in `.claude/settings.json` matches `git push` in any
+form.** Do not reintroduce one — here or in a private profile overlay —
+without first re-verifying SPE-83's reproduction steps against the
+installed RTK version.
+
+**Accepted breadth**: `Bash(gh pr *)`, `Bash(gh pr merge:*)`,
+`mcp__github__create_pull_request`, and `mcp__github__merge_pull_request`
+are intentionally broad — `gh pr *` alone covers `create`, `merge`,
+`close`, `edit`, and `review --approve`. This is a deliberate choice, not
+an oversight (flagged by an automated security review of this ADR's own
+commit, evaluated, and kept): every operation it reaches is PR-scoped and
+reversible (closing/editing a PR, even merging one, can be undone through
+GitHub itself), and none of it reaches repository deletion, organization
+settings, or credential material — those stay behind their own `ask`/`deny`
+rules regardless (`gh repo delete`, `gh api … DELETE`, `create_repository`,
+`fork_repository`). Narrowing this further would mean re-litigating merge
+policy per subcommand, which ADR-0012 Decision 4/Consequences already
+explains a text rule cannot reliably do.
+
+**What a text-based permission rule cannot do** (classifier/`autoMode.environment`
+territory instead, by design — not a gap to "fix" with more rules): judge
+whether a `gh api` POST/PATCH/PUT targets content vs. settings; judge
+whether a deletion is inside or outside the agent's authorized scope;
+enforce a specific merge strategy (flags cannot be reliably
+pattern-matched, since `*` spans arbitrary trailing text); distinguish a
+transient classifier failure (fail-closed `429`/`automode-unavailable`,
+expected and correct) from an actual policy decision.
+
 ## Repository visibility
 
 This repo is PUBLIC (verified via `gh repo view`, unchanged across the

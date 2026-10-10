@@ -13,6 +13,8 @@ SYNC_HOME="${CODING_AGENT_SYNC_HOME:-$HOME}"
 
 if [[ "${1:-}" == "--routing" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --routing --check
+elif [[ "${1:-}" == "--visuals" && "$#" == 1 ]]; then
+    exec bash "$REPO_ROOT/scripts/profile-install.sh" --visuals --check
 elif [[ "${1:-}" == "--codex" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --global --check
 elif [[ "${1:-}" == "--full-parity" && "$#" == 1 ]]; then
@@ -23,7 +25,7 @@ elif [[ "${1:-}" == "--full-parity" && "$#" == 1 ]]; then
 elif [[ "${1:-}" == "--capabilities" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --capabilities --check
 elif [[ "$#" != 0 ]]; then
-    echo 'Usage: sync-check.sh [--codex | --capabilities | --full-parity]' >&2
+    echo 'Usage: sync-check.sh [--codex | --capabilities | --full-parity | --visuals]' >&2
     exit 2
 fi
 
@@ -66,19 +68,54 @@ for pair in "${PAIRS[@]}"; do
 
     if [[ "$repo_rel" == ".claude/settings.json" ]]; then
         # Native plugin installs add root fields; compare the owned settings only.
-        if python3 - "$repo_path" "$live_path" <<'PYEOF'
+        #
+        # permissions.allow/ask/deny and autoMode.environment get a SEMANTIC
+        # (subset) comparison, not exact-equality: a live machine legitimately
+        # extends this repo's portable rule set with machine-specific or
+        # corporate-private entries (ADR-0012) — that is not drift. Only a
+        # desired rule that is MISSING on live, or a changed defaultMode, or
+        # any other top-level key differing, counts as real drift.
+        set +e
+        settings_report="$(python3 - "$repo_path" "$live_path" <<'PYEOF'
 import json, sys
+
+def subset_report(label, desired, live):
+    missing = sorted(set(desired) - set(live))
+    return [f"  missing {label}: {m}" for m in missing]
+
 try:
     desired, live = [json.load(open(p)) for p in sys.argv[1:]]
-    ok = all(live.get(k) == v for k, v in desired.items() if k != "_scope_note")
-except (OSError, ValueError):
-    ok = False
-sys.exit(0 if ok else 1)
+except (OSError, ValueError) as e:
+    print(f"  unreadable: {e}")
+    sys.exit(1)
+
+problems = []
+for k, v in desired.items():
+    if k == "_scope_note":
+        continue
+    if k == "permissions":
+        live_perm = live.get("permissions", {})
+        for rule_key in ("allow", "ask", "deny"):
+            problems += subset_report(f"permissions.{rule_key}", v.get(rule_key, []), live_perm.get(rule_key, []))
+        if v.get("defaultMode") != live_perm.get("defaultMode"):
+            problems.append(f"  permissions.defaultMode: desired {v.get('defaultMode')!r}, live {live_perm.get('defaultMode')!r}")
+    elif k == "autoMode":
+        live_auto = live.get("autoMode", {})
+        problems += subset_report("autoMode.environment", v.get("environment", []), live_auto.get("environment", []))
+    elif live.get(k) != v:
+        problems.append(f"  {k}: differs")
+
+print("\n".join(problems))
+sys.exit(1 if problems else 0)
 PYEOF
-        then
+)"
+        settings_status=$?
+        set -e
+        if [[ "$settings_status" -eq 0 ]]; then
             IDENTICAL=$((IDENTICAL + 1))
         else
             echo "DIFFERS        $repo_rel (owned settings)"
+            [[ -n "$settings_report" ]] && echo "$settings_report"
             DIFFER=$((DIFFER + 1))
         fi
         continue

@@ -3,6 +3,7 @@ on:
   pull_request:
     paths:
       - '.claude/CLAUDE.md'
+      - '.claude/settings.json'
       - '.claude/skills/**'
       - '.claude/hooks/**'
       - 'codex/**'
@@ -10,6 +11,7 @@ on:
       - 'scripts/sync-check.sh'
       - 'scripts/codex-routing.py'
       - 'scripts/verify-codex-routing.py'
+      - 'scripts/visual-skills.py'
       - 'tests/**'
       - 'bin/**'
       - '.github/workflows/capability-validation.yml'
@@ -17,6 +19,7 @@ on:
     branches: [main]
     paths:
       - '.claude/CLAUDE.md'
+      - '.claude/settings.json'
       - '.claude/skills/**'
       - '.claude/hooks/**'
       - 'codex/**'
@@ -24,6 +27,7 @@ on:
       - 'scripts/sync-check.sh'
       - 'scripts/codex-routing.py'
       - 'scripts/verify-codex-routing.py'
+      - 'scripts/visual-skills.py'
       - 'tests/**'
       - 'bin/**'
       - '.github/workflows/capability-validation.yml'
@@ -47,3 +51,5 @@ jobs:
           python3 tests/test-full-parity-inventory.py
           python3 tests/test-full-parity-install.py
           python3 tests/test-codex-routing.py
+          python3 tests/test-visual-skills.py
+          python3 tests/test-permission-governance.py

@@ -52,7 +52,8 @@ codex/
 ├── config.toml                # Portable subset; never globally replaced
 ├── capabilities-readonly.config.toml # Opt-in read-only external profile
 ├── AGENTS.md                  # Global instructions + managed signal-first block
-└── subtraction-skills.json    # Canonical source revision/digests, no skill bodies
+├── agents/                    # Portable named architect/implementer/reviewer roles
+└── subtraction-skills.json    # Canonical external skill pins/tree digests; no vendored bodies
 bin/
 ├── coding-agent-profile        # Directory-scoped profile resolver + --explain
 ├── coding-agent-profile-explain
@@ -63,18 +64,23 @@ scripts/
 ├── check.sh                    # Diagnostics (prerequisites, config, profiles, precedence)
 ├── install.sh                  # Prerequisite CLI installer
 ├── profile-install.sh          # Profile links + managed Codex global report/apply/check
-└── sync-check.sh               # Report-first live<->repo drift check
+├── sync-check.sh               # Report-first live<->repo drift check
+└── visual-skills.py            # Pinned visual-skill snapshots and host integration
 tests/
 ├── test-profile-resolver.sh    # 13-case / 31-assertion offline test suite
 └── test-capability-profile.sh  # External-profile ownership/lifecycle checks
 docs/
 ├── ARCHITECTURE.md             # Design goals, layering, ADR index
 ├── ALLOWLIST.md                # Tracked-file allowlist and runtime/private/generated boundary
+├── VISUAL-SKILLS.md            # Pinned Archify/Visual Explainer source and host installation
 ├── TOOLCHAIN.md                # mise/Brewfile split, what's intentionally excluded and why
 ├── PROFILES.md                 # Directory-scoped profile design, precedence, setup
 ├── SECURITY.md                 # Secrets boundary, scanning layers, history-scan result
 └── adr/                        # 9 ADRs for durable migration/model/tooling/profile/rename decisions
 ```
+
+See [Visual skills](docs/VISUAL-SKILLS.md) for the pinned Archify and Visual
+Explainer packages, their host-specific entry points, and safe installation.
 
 ## Install
 
@@ -158,9 +164,10 @@ scripts/sync-check.sh --full-parity
 codex --profile engineering-reference
 ```
 
-Global Codex mode owns the marked signal-first AGENTS block, all manifest skills
-and resources, native read-only capability/reference profiles, and pinned
-subtraction installations. Claude mode owns materialized shared skills and a marked canonical-workflow
+Global Codex mode owns the marked signal-first AGENTS block, the shared-skill
+manifest resources, native read-only capability/reference profiles, and pinned
+Requirement Zero subtraction installation. Visual skills use the dedicated
+`--visuals` lifecycle above. Claude mode owns materialized shared skills and a marked canonical-workflow
 routing block; it preserves surrounding CLAUDE instructions/settings/plugins/auth. A manifest omission fails preflight,
 so missing newly portable procedures cannot produce a false zero-drift report.
 Apply backs up changed paths, checks symlink ancestry and profile ownership, and
@@ -175,6 +182,15 @@ bodies remain owned by [Chisanan232/requirement-zero](https://github.com/Chisana
 and native Codex discovers the pinned universal `~/.agents/skills` installation.
 Use `CODING_AGENT_SYNC_HOME` for disposable offline validation homes. Review the
 [full inventory and proof boundaries](docs/FULL-PARITY.md) before claiming parity.
+
+For the separately pinned Archify and Visual Explainer packages, use
+`scripts/profile-install.sh --visuals --dry-run`, then
+`scripts/profile-install.sh --visuals` and `scripts/sync-check.sh --visuals`.
+Their source pins and host-specific Claude/Codex integration are documented in
+[Visual skills](docs/VISUAL-SKILLS.md). Archify is linked from the immutable
+local snapshot; Codex receives a managed physical Visual Explainer copy while
+Claude uses the native local-marketplace plugin. Generated runtime files and
+authentication state are not committed.
 
 Successful installation is not behavior proof: start a fresh Codex process after
 applying. `scripts/sync-check.sh --codex` checks only the managed signal-first
