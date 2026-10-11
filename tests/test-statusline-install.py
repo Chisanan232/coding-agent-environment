@@ -48,6 +48,16 @@ class StatuslineInstall(unittest.TestCase):
         self.assertEqual(self.settings.read_bytes(), before)
         self.assertFalse((self.home / '.claude/statusline.py').exists())
 
+    def test_expected_absent_does_not_overwrite_new_settings(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('installer', INSTALL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        before = self.settings.read_bytes()
+        with self.assertRaises(ValueError):
+            module.replace(self.settings, b'{}', 0o600, self.home / 'backups', expected=None)
+        self.assertEqual(self.settings.read_bytes(), before)
+
     def test_check_rejects_invalid_statusline_type(self):
         self.assertEqual(self.invoke('--adopt').returncode, 0)
         data = json.loads(self.settings.read_text())

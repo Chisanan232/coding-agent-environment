@@ -20,9 +20,14 @@ def regular(path):
         raise ValueError(f"Refusing non-regular target: {path}")
 
 
-def replace(path, content, mode, backups, expected=None):
+UNSET = object()
+
+
+def replace(path, content, mode, backups, expected=UNSET):
     regular(path)
-    if expected is not None and path.read_bytes() != expected:
+    def unchanged():
+        return expected is UNSET or (not path.exists() if expected is None else path.exists() and path.read_bytes() == expected)
+    if not unchanged():
         raise ValueError("Target changed concurrently; retry after review")
     for component in (backups, *backups.parents):
         if component.is_symlink():
@@ -45,7 +50,7 @@ def replace(path, content, mode, backups, expected=None):
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        if expected is not None and path.read_bytes() != expected:
+        if not unchanged():
             raise ValueError("Target changed concurrently; retry after review")
         os.replace(name, path)
     finally:

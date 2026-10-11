@@ -208,6 +208,8 @@ class StatuslineComposition(unittest.TestCase):
         text = '\x1b[2J\x1b]52;c;secret\x07\x1b[31mOK\x1b[0m'
         self.assertEqual(MODULE.sanitize(text, True), '\x1b[31mOK\x1b[0m')
         self.assertEqual(MODULE.sanitize(text, False), 'OK')
+        for color in (True, False):
+            self.assertNotRegex(MODULE.sanitize('\x9b2J\x9d52;c;data\x9c', color), '[\x80-\x9f]')
 
     def test_base_escape_controls_are_removed_in_both_color_modes(self):
         self.base = self.script('controls.py', "print('\\033[2J\\033]52;c;secret\\007OK')\n")

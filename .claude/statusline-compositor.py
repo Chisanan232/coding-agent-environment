@@ -42,7 +42,7 @@ SECRETISH = re.compile(r"(?:TOKEN|SECRET|PASSWORD|CREDENTIAL|API[_-]?KEY|AUTH)",
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 SGR = re.compile(r"\x1b\[[0-9;:]*m")
 OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\|$)")
-CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 ID = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 
 
