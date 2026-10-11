@@ -88,6 +88,26 @@ cp -R .claude/CLAUDE.md .claude/RTK.md .claude/settings.json \
       .claude/subagent-statusline.py .claude/hooks .claude/skills ~/.claude/
 ```
 
+### Managed statusline installation
+
+Install the canonical compositor and base renderer with a reviewed Python 3.9+
+interpreter. Invoke the installer with a direct interpreter binary, not a shim:
+
+```bash
+/absolute/path/to/python3 scripts/statusline-install.py --check
+/absolute/path/to/python3 scripts/statusline-install.py --adopt
+```
+
+`--adopt` explicitly backs up differing existing scripts and settings before
+replacement. The installer pins the resolved interpreter binary and installed
+script path in `statusLine.command`, preserving other statusline properties and
+all unrelated settings. Reinstallation is a no-op when synchronized. Private
+provider configuration stays outside the repository. `scripts/sync-check.sh
+--statusline` reports drift without writing; set `CODING_AGENT_STATUSLINE_PYTHON`
+to a direct interpreter if PATH resolves through a slow version-manager shim.
+Do not overwrite live settings with the generic copy recipe on an existing
+installation; run this focused installer after any reviewed settings migration.
+
 ### Canonical subtraction skills
 
 Merge the `enabledPlugins` and `extraKnownMarketplaces` entries from
