@@ -3,6 +3,7 @@ on:
   pull_request:
     paths:
       - '.claude/CLAUDE.md'
+      - '.claude/settings.json'
       - '.claude/skills/**'
       - '.claude/hooks/**'
       - 'codex/**'
@@ -17,6 +18,7 @@ on:
     branches: [main]
     paths:
       - '.claude/CLAUDE.md'
+      - '.claude/settings.json'
       - '.claude/skills/**'
       - '.claude/hooks/**'
       - 'codex/**'
@@ -47,3 +49,4 @@ jobs:
           python3 tests/test-full-parity-inventory.py
           python3 tests/test-full-parity-install.py
           python3 tests/test-codex-routing.py
+          python3 tests/test-permission-governance.py
