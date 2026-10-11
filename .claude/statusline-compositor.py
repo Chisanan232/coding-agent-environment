@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import time
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,8 @@ SAFE_ENV_PREFIXES = ("LC_", "XDG_")
 EXTRA_ENV_ALLOWLIST = {"SSH_AUTH_SOCK", "HORONOM_STATUSLINE_HOME"}
 SECRETISH = re.compile(r"(?:TOKEN|SECRET|PASSWORD|CREDENTIAL|API[_-]?KEY|AUTH)", re.I)
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+SGR = re.compile(r"\x1b\[[0-9;:]*m")
+OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\|$)")
 CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 ID = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 
@@ -79,19 +82,13 @@ def color_capable() -> bool:
 
 def sanitize(text: str, color: bool) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    if color:
-        # Preserve ANSI SGR only; strip every other control byte.
-        saved = []
-        def hold(match: re.Match[str]) -> str:
-            saved.append(match.group(0))
-            return f"@@ANSI{len(saved) - 1}@@"
-        text = ANSI.sub(hold, text)
-        text = CONTROL.sub("", text)
-        for index, code in enumerate(saved):
-            text = text.replace(f"@@ANSI{index}@@", code)
-    else:
-        text = ANSI.sub("", text)
-        text = CONTROL.sub("", text)
+    text = OSC.sub("", text)
+    text = ANSI.sub(lambda match: match.group(0) if color and SGR.fullmatch(match.group(0)) else "", text)
+    # Remove remaining control bytes while retaining only verified SGR escapes.
+    chunks = SGR.split(text)
+    codes = SGR.findall(text)
+    text = "".join(CONTROL.sub("", chunk) + (codes[index] if color and index < len(codes) else "")
+                   for index, chunk in enumerate(chunks))
     lines = text.split("\n")
     return "\n".join(lines[:MAX_OUTPUT_LINES]).strip("\n")
 
@@ -190,24 +187,46 @@ def child_env(extension: Extension, color: bool) -> dict[str, str]:
 
 
 def run(argv: tuple[str, ...], payload: bytes, timeout_ms: int, env: dict[str, str] | None) -> tuple[bool, str]:
+    proc = None
     try:
-        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, start_new_session=True)
-        out, _ = proc.communicate(payload, timeout=timeout_ms / 1000)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.communicate(timeout=0.1)
-        except Exception:
-            pass
-        return False, ""
+        # A seekable input avoids deadlock when the child writes before reading.
+        with tempfile.TemporaryFile() as incoming:
+            incoming.write(payload)
+            incoming.seek(0)
+            proc = subprocess.Popen(argv, stdin=incoming, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+            os.set_blocking(proc.stdout.fileno(), False)
+            deadline = time.monotonic() + timeout_ms / 1000
+            out = bytearray()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False, ""
+                if not select.select([proc.stdout], [], [], min(remaining, .05))[0]:
+                    continue
+                chunk = os.read(proc.stdout.fileno(), MAX_OUTPUT_BYTES + 1 - len(out))
+                if not chunk:
+                    proc.wait(timeout=max(.001, deadline - time.monotonic()))
+                    break
+                out.extend(chunk)
+                if len(out) > MAX_OUTPUT_BYTES:
+                    return False, ""
+            if proc.returncode != 0:
+                return False, ""
+            return True, out.decode("utf-8", errors="strict")
     except Exception:
         return False, ""
-    if proc.returncode != 0 or len(out) > MAX_OUTPUT_BYTES:
-        return False, ""
-    try:
-        return True, out.decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        return False, ""
+    finally:
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.stdout.close()
+            try:
+                proc.wait(timeout=.1)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 def run_extensions(extensions: tuple[Extension, ...], color: bool, deadline_ms: int) -> dict[str, str]:
@@ -344,7 +363,7 @@ def main() -> int:
         base_ok, base = run(base_command(), payload, MAX_TIMEOUT_MS, None)
     except ValueError:
         base_ok, base = False, ""
-    if not base_ok:
+    if not base_ok or not base.strip():
         base = generic_fallback(payload)
     config_path = os.environ.get(CONFIG_ENV)
     try:

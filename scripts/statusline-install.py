@@ -73,7 +73,7 @@ def main():
     status = data.get("statusLine", {})
     if not isinstance(status, dict):
         raise ValueError("statusLine must be an object")
-    changed_command = status.get("command") != command
+    changed_command = status.get("command") != command or status.get("type") != "command"
     changes = []
     for name in FILES:
         target = directory / name

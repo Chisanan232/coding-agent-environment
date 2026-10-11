@@ -48,6 +48,15 @@ class StatuslineInstall(unittest.TestCase):
         self.assertEqual(self.settings.read_bytes(), before)
         self.assertFalse((self.home / '.claude/statusline.py').exists())
 
+    def test_check_rejects_invalid_statusline_type(self):
+        self.assertEqual(self.invoke('--adopt').returncode, 0)
+        data = json.loads(self.settings.read_text())
+        data['statusLine'].pop('type')
+        self.settings.write_text(json.dumps(data))
+        self.assertEqual(self.invoke('--check').returncode, 1)
+        self.assertEqual(self.invoke('--adopt').returncode, 0)
+        self.assertEqual(json.loads(self.settings.read_text())['statusLine']['type'], 'command')
+
     def test_symlink_target_is_rejected_before_any_write(self):
         outside = self.home / 'outside'
         outside.write_text('untouched')

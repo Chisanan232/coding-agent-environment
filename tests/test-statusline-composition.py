@@ -204,6 +204,22 @@ class StatuslineComposition(unittest.TestCase):
         self.assertIn(b"Profile bypassed \xc2\xb7 use ca-claude", result.stdout)
         self.assertNotIn(b"alpha", result.stdout)
 
+    def test_escape_controls_are_removed_but_color_is_preserved(self):
+        text = '\x1b[2J\x1b]52;c;secret\x07\x1b[31mOK\x1b[0m'
+        self.assertEqual(MODULE.sanitize(text, True), '\x1b[31mOK\x1b[0m')
+        self.assertEqual(MODULE.sanitize(text, False), 'OK')
+
+    def test_successful_empty_base_uses_fallback(self):
+        self.base = self.script('empty.py', 'pass\n')
+        result = self.invoke(payload=b'{}')
+        self.assertEqual(result.stdout, b'Claude Code')
+
+    def test_base_output_overflow_is_rejected(self):
+        noisy = self.script('noisy.py', "import os\nwhile True: os.write(1, b'x' * 65536)\n")
+        ok, output = MODULE.run((sys.executable, str(noisy)), b'{}', 2000, None)
+        self.assertFalse(ok)
+        self.assertEqual(output, '')
+
     def test_malformed_config_preserves_base(self):
         cfg = self.root / "bad.json"
         cfg.write_text('{bad')
