@@ -57,6 +57,15 @@ class StatuslineInstall(unittest.TestCase):
         self.assertEqual(self.invoke('--adopt').returncode, 0)
         self.assertEqual(json.loads(self.settings.read_text())['statusLine']['type'], 'command')
 
+    def test_symlink_backup_directory_is_rejected(self):
+        outside = self.home / 'outside'
+        outside.mkdir()
+        (self.settings.parent / 'backups').symlink_to(outside)
+        before = self.settings.read_bytes()
+        self.assertEqual(self.invoke('--adopt').returncode, 1)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(self.settings.read_bytes(), before)
+
     def test_symlink_target_is_rejected_before_any_write(self):
         outside = self.home / 'outside'
         outside.write_text('untouched')

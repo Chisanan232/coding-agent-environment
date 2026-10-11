@@ -209,6 +209,11 @@ class StatuslineComposition(unittest.TestCase):
         self.assertEqual(MODULE.sanitize(text, True), '\x1b[31mOK\x1b[0m')
         self.assertEqual(MODULE.sanitize(text, False), 'OK')
 
+    def test_base_escape_controls_are_removed_in_both_color_modes(self):
+        self.base = self.script('controls.py', "print('\\033[2J\\033]52;c;secret\\007OK')\n")
+        for env in ({}, {'NO_COLOR': '1'}):
+            self.assertEqual(self.invoke(env=env).stdout, b'OK\n')
+
     def test_successful_empty_base_uses_fallback(self):
         self.base = self.script('empty.py', 'pass\n')
         result = self.invoke(payload=b'{}')

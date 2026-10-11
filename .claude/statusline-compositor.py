@@ -80,7 +80,7 @@ def color_capable() -> bool:
     return os.environ.get("TERM", "").lower() not in {"", "dumb"}
 
 
-def sanitize(text: str, color: bool) -> str:
+def sanitize(text: str, color: bool, limit_lines: bool = True) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = OSC.sub("", text)
     text = ANSI.sub(lambda match: match.group(0) if color and SGR.fullmatch(match.group(0)) else "", text)
@@ -89,6 +89,8 @@ def sanitize(text: str, color: bool) -> str:
     codes = SGR.findall(text)
     text = "".join(CONTROL.sub("", chunk) + (codes[index] if color and index < len(codes) else "")
                    for index, chunk in enumerate(chunks))
+    if not limit_lines:
+        return text
     lines = text.split("\n")
     return "\n".join(lines[:MAX_OUTPUT_LINES]).strip("\n")
 
@@ -371,8 +373,9 @@ def main() -> int:
     except Exception:
         config = Config((), DEFAULT_DEADLINE_MS)
     color = color_capable()
-    if not color:
-        base = ANSI.sub("", base)
+    base = sanitize(base, color, limit_lines=False)
+    if not base.strip():
+        base = generic_fallback(payload)
     output = base
     if config.extensions:
         results = run_extensions(config.extensions, color, config.deadline_ms)
@@ -381,7 +384,7 @@ def main() -> int:
             value = results.get(ext.ident)
             if value is None:
                 continue
-            clean = render_provider_contract(value, color) if ext.renderer == "provider-contract" else sanitize(value, color)
+            clean = sanitize((render_provider_contract(value, color) or "") if ext.renderer == "provider-contract" else value, color)
             if clean:
                 additions.append(clean)
         if additions:

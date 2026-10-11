@@ -20,8 +20,13 @@ def regular(path):
         raise ValueError(f"Refusing non-regular target: {path}")
 
 
-def replace(path, content, mode, backups):
+def replace(path, content, mode, backups, expected=None):
     regular(path)
+    if expected is not None and path.read_bytes() != expected:
+        raise ValueError("Target changed concurrently; retry after review")
+    for component in (backups, *backups.parents):
+        if component.is_symlink():
+            raise ValueError("Refusing symlinked backup directory")
     if path.exists() and path.read_bytes() == content:
         return
     if path.exists():
@@ -40,6 +45,8 @@ def replace(path, content, mode, backups):
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
+        if expected is not None and path.read_bytes() != expected:
+            raise ValueError("Target changed concurrently; retry after review")
         os.replace(name, path)
     finally:
         if os.path.exists(name):
@@ -59,7 +66,8 @@ def main():
         raise ValueError("Refusing symlinked Claude directory")
     settings = directory / "settings.json"
     regular(settings)
-    data = json.loads(settings.read_text()) if settings.exists() else {}
+    settings_bytes = settings.read_bytes() if settings.exists() else None
+    data = json.loads(settings_bytes) if settings_bytes is not None else {}
     if not isinstance(data, dict):
         raise ValueError("Settings must be an object")
     probe = subprocess.run([args.python, "-c", "import json,select,signal,dataclasses,pathlib;import sys;print(sys.executable)"],
@@ -94,7 +102,7 @@ def main():
         replace(target, content, 0o755, backups)
     if changed_command:
         data["statusLine"] = dict(status, type="command", command=command)
-        replace(settings, (json.dumps(data, indent=2) + "\n").encode(), settings.stat().st_mode & 0o777 if settings.exists() else 0o600, backups)
+        replace(settings, (json.dumps(data, indent=2) + "\n").encode(), settings.stat().st_mode & 0o777 if settings.exists() else 0o600, backups, expected=settings_bytes)
     print(json.dumps({"synchronized": True, "sha256": {name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in FILES}}))
     return 0
 
