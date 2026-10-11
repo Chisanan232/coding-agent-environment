@@ -47,3 +47,5 @@ jobs:
           python3 tests/test-full-parity-inventory.py
           python3 tests/test-full-parity-install.py
           python3 tests/test-codex-routing.py
+          python3 tests/test-statusline-composition.py
+          python3 tests/test-statusline-install.py
