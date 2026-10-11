@@ -173,10 +173,15 @@
             "Bash(rtk git push * -f *)",
 
             "Bash(git reset --hard *)",
+            "Bash(rtk git reset --hard *)",
             "Bash(git clean -f*)",
+            "Bash(rtk git clean -f*)",
             "Bash(kill -9 *)",
+            "Bash(rtk kill -9 *)",
             "Bash(pkill *)",
+            "Bash(rtk pkill *)",
             "Bash(killall *)",
+            "Bash(rtk killall *)",
 
             "Bash(gh repo delete *)",
             "Bash(rtk gh repo delete *)",
@@ -186,6 +191,7 @@
             "Bash(rtk gh api * --method DELETE*)",
 
             "Bash(terraform apply:*)",
+            "Bash(rtk terraform apply:*)",
             "mcp__gcloud__run_gcloud_command",
             "mcp__polar-production__execute_tool",
 
@@ -228,7 +234,9 @@
             "Bash(terraform * destroy*)",
 
             "Bash(rtk proxy *)",
-            "Bash(rtk terraform destroy *)",
+            "Bash(rtk terraform destroy:*)",
+            "Bash(rtk terraform apply -destroy*)",
+            "Bash(rtk terraform apply --destroy*)",
             "Bash(rtk terraform apply * -destroy*)",
             "Bash(rtk terraform apply * --destroy*)",
             "Bash(rtk terraform * apply *-destroy*)",

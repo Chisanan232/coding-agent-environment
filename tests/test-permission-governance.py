@@ -188,6 +188,87 @@ class GlobalFlagReorderingDenyRegression(unittest.TestCase):
                 self.assertTrue(any(bash_rule_matches(cmd, r) for r in deny), f"not denied: {cmd!r}")
 
 
+class RTKPrefixTwinCoverage(unittest.TestCase):
+    """Found via an automated security review (2026-10-11): every `ask`-
+    gated destructive-command rule must have an `rtk <same rule>` twin,
+    since RTK's hook rewrites a Bash invocation by prefixing `rtk ` onto
+    it (RTK.md: "git status -> rtk git status", documented as applying
+    to "all other commands", not just git). A bare rule with no rtk twin
+    never matches the RTK-rewritten form Claude Code's native engine
+    actually sees, so the ask prompt silently never fires for it — the
+    same bug shape SPE-83 and the gh-api/terraform/gcloud fixes already
+    address, just previously missed for git reset --hard, git clean -f,
+    kill -9, pkill, and killall."""
+
+    # Bare ask rules whose rtk-prefixed Bash twin is mandatory. Each must
+    # be matched by "rtk " + the bare rule's own pattern.
+    _REQUIRES_RTK_TWIN = (
+        "Bash(git reset --hard *)",
+        "Bash(git clean -f*)",
+        "Bash(kill -9 *)",
+        "Bash(pkill *)",
+        "Bash(killall *)",
+    )
+
+    def test_every_dangerous_bash_ask_rule_has_an_rtk_prefixed_twin(self):
+        ask = load_settings()["permissions"]["ask"]
+        for rule in self._REQUIRES_RTK_TWIN:
+            pattern = rule[len("Bash("):-1]
+            twin = f"Bash(rtk {pattern})"
+            with self.subTest(rule=rule):
+                self.assertIn(twin, ask, f"missing rtk-prefixed twin of {rule!r}: expected {twin!r}")
+
+    def test_rtk_rewritten_dangerous_commands_are_still_caught(self):
+        ask = load_settings()["permissions"]["ask"]
+        for cmd in (
+            "rtk git reset --hard HEAD~1",
+            "rtk git clean -fd",
+            "rtk kill -9 1234",
+            "rtk pkill node",
+            "rtk killall node",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(any(bash_rule_matches(cmd, r) for r in ask), f"not caught: {cmd!r}")
+
+    def test_no_bash_ask_or_deny_rule_is_missing_its_rtk_twin(self):
+        """General sweep, not just the curated list above: for every bare
+        (non-rtk-prefixed) Bash ask/deny rule, its exact `rtk `-prefixed
+        twin must also be present. Catches this bug class even if a
+        future rule is added without its twin."""
+        settings = load_settings()
+        for kind in ("ask", "deny"):
+            rules = settings["permissions"][kind]
+            for rule in rules:
+                if not rule.startswith("Bash(") or rule.startswith("Bash(rtk "):
+                    continue
+                twin = "Bash(rtk " + rule[len("Bash("):]
+                with self.subTest(kind=kind, rule=rule):
+                    self.assertIn(twin, rules, f"{kind} rule {rule!r} has no rtk twin {twin!r}")
+
+    def test_rtk_terraform_apply_bare_is_ask_gated(self):
+        ask = load_settings()["permissions"]["ask"]
+        for cmd in ("terraform apply -auto-approve", "rtk terraform apply -auto-approve"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(any(bash_rule_matches(cmd, r) for r in ask), f"not caught: {cmd!r}")
+
+    def test_rtk_terraform_destroy_bare_is_denied(self):
+        deny = load_settings()["permissions"]["deny"]
+        for cmd in ("terraform destroy", "rtk terraform destroy"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(any(bash_rule_matches(cmd, r) for r in deny), f"not denied: {cmd!r}")
+
+    def test_rtk_terraform_apply_destroy_adjacent_is_denied(self):
+        deny = load_settings()["permissions"]["deny"]
+        for cmd in (
+            "terraform apply -destroy",
+            "rtk terraform apply -destroy",
+            "terraform apply --destroy",
+            "rtk terraform apply --destroy",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(any(bash_rule_matches(cmd, r) for r in deny), f"not denied: {cmd!r}")
+
+
 class SPE83PushAllowRegression(unittest.TestCase):
     """Structural mitigation for the open RTK defect (SPE-83): no allow rule
     may match `git push` at subcommand granularity in any form, because
