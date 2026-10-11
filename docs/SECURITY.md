@@ -127,6 +127,16 @@ pattern-matched, since `*` spans arbitrary trailing text); distinguish a
 transient classifier failure (fail-closed `429`/`automode-unavailable`,
 expected and correct) from an actual policy decision.
 
+**`sync-check.sh`'s subset comparison only flags a desired rule missing on
+a live machine** — it has no way to detect a live-only `allow` rule that
+shadows this repo's own `ask`/`deny` rule for the same command shape
+(flagged by an independent review, 2026-10-11). That's intentional (a
+machine legitimately extends the portable profile), but it means a
+careless private-profile-overlay addition could silently reintroduce the
+exact SPE-83 shadowing class this file documents — outside this repo's
+own visibility. Review any local `allow` addition against the mandatory
+table above before adding it.
+
 ## Repository visibility
 
 This repo is PUBLIC (verified via `gh repo view`, unchanged across the

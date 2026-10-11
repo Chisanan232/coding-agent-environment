@@ -41,6 +41,7 @@
             "Bash(rtk gh run *)",
 
             "Bash(cargo nextest run *)",
+            "Bash(rtk cargo nextest run *)",
             "Bash(cargo build *)",
             "Bash(rtk cargo build *)",
             "Bash(cargo test *)",
