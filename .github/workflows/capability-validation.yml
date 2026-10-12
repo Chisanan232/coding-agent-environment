@@ -51,4 +51,5 @@ jobs:
           python3 tests/test-codex-routing.py
           python3 tests/test-statusline-composition.py
           python3 tests/test-statusline-install.py
+          python3 tests/test-profile-statusline.py
           python3 tests/test-permission-governance.py

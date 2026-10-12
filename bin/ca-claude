@@ -26,20 +26,67 @@ if [[ "$(basename -- "$CLAUDE_BIN")" == "ca-claude" || "$CLAUDE_BIN" == "${BASH_
 fi
 
 # Resolve the profile using the same logic as coding-agent-profile resolve.
-eval "$("$HERE/coding-agent-profile" __internal_resolve_env 2>/dev/null || true)"
+unset CAP_STATUS CAP_NAME CAP_ROOT CAP_OVERLAY CAP_BASELINE
+if ! resolved="$("$HERE/coding-agent-profile" __internal_resolve_env 2>/dev/null)"; then
+    echo 'ca-claude: profile resolution failed; refusing inherited activation' >&2
+    exit 2
+fi
+eval "$resolved"
 
 declare -a ARGS=()
-
+PROFILE_ACTIVE=0
+PROFILE_MARKER=0
+statusline_config=""
+statusline_runtime=""
 if [[ "${CAP_STATUS:-none}" == "ok" ]]; then
-    if [[ -f "$CAP_OVERLAY/claude/settings.json" ]]; then
-        ARGS+=(--settings "$CAP_OVERLAY/claude/settings.json")
+    PROFILE_ACTIVE=1
+    PROFILE_MARKER=1
+elif [[ "${CAP_STATUS:-none}" != "none" ]]; then
+    PROFILE_MARKER=1
+    echo "ca-claude: profile ${CAP_STATUS}; no profile overlay activated (run coding-agent-profile explain)" >&2
+fi
+
+# Resolved profile wins over the explicit machine-local baseline. Never inherit
+# another session's selectors merely because the wrapper was launched from it.
+for overlay in "${CAP_OVERLAY:-}" "${CAP_BASELINE:-}"; do
+    [[ -n "$overlay" && -d "$overlay" ]] || continue
+    if [[ -z "$statusline_config" && -f "$overlay/claude/statusline.json" ]]; then
+        statusline_config="$overlay/claude/statusline.json"
     fi
-    if [[ -f "$CAP_OVERLAY/claude/mcp.json" ]]; then
-        ARGS+=(--mcp-config "$CAP_OVERLAY/claude/mcp.json")
+    if [[ -z "$statusline_runtime" && -d "$overlay/claude/statusline-runtime" ]]; then
+        statusline_runtime="$overlay/claude/statusline-runtime"
     fi
-    if [[ -f "$CAP_OVERLAY/claude/strict-mcp" ]]; then
+done
+
+for overlay in "${CAP_BASELINE:-}" "${CAP_OVERLAY:-}"; do
+    [[ -n "$overlay" && -d "$overlay" ]] || continue
+    if [[ -f "$overlay/claude/settings.json" ]]; then
+        if ! python3 - "$overlay/claude/settings.json" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+    raise SystemExit(int(not isinstance(data, dict) or 'statusLine' in data))
+except (ValueError, OSError):
+    raise SystemExit(1)
+PY
+        then
+            echo 'ca-claude: invalid overlay settings or canonical statusLine override' >&2
+            exit 2
+        fi
+        ARGS+=(--settings "$overlay/claude/settings.json")
+    fi
+    if [[ -f "$overlay/claude/mcp.json" ]]; then
+        ARGS+=(--mcp-config "$overlay/claude/mcp.json")
+    fi
+    if [[ -f "$overlay/claude/strict-mcp" ]]; then
         ARGS+=(--strict-mcp-config)
     fi
+    if [[ -d "$overlay/claude/plugin" ]]; then
+        ARGS+=(--plugin-dir "$overlay/claude/plugin")
+    fi
+done
+
+if [[ "${CAP_STATUS:-none}" == "ok" ]]; then
     # Instruction channel is single-valued: only inject the overlay
     # CLAUDE.md via the fallback flag if the profile root does NOT already
     # have one (that one loads natively via Claude's ancestor walk).
@@ -53,4 +100,10 @@ if [[ "${CA_DRY_RUN:-0}" == "1" ]]; then
     exit 0
 fi
 
+unset CODING_AGENT_PROFILE_ACTIVE CODING_AGENT_PROFILE_MARKER_PRESENT
+[[ "$PROFILE_ACTIVE" != "1" ]] || export CODING_AGENT_PROFILE_ACTIVE=1
+[[ "$PROFILE_MARKER" != "1" ]] || export CODING_AGENT_PROFILE_MARKER_PRESENT=1
+unset CODING_AGENT_STATUSLINE_CONFIG CODING_AGENT_STATUSLINE_CONTRACT_RUNTIME
+[[ -z "$statusline_config" ]] || export CODING_AGENT_STATUSLINE_CONFIG="$statusline_config"
+[[ -z "$statusline_runtime" ]] || export CODING_AGENT_STATUSLINE_CONTRACT_RUNTIME="$statusline_runtime"
 exec "$CLAUDE_BIN" "${ARGS[@]+"${ARGS[@]}"}" "$@"
