@@ -22,6 +22,10 @@ for client in claude codex; do
     chmod +x "$WORK/cli-stubs/$client"
 done
 export PATH="$WORK/cli-stubs:$PATH"
+export CODING_AGENT_LOCAL_DIR="$WORK/local"
+export CODING_AGENT_LOCAL_PROFILE_DIR="$WORK/local/profiles"
+export CODING_AGENT_LOCAL_BASELINE_DIR="$WORK/local/baseline"
+cd "$WORK" || exit 1
 
 PASS=0
 FAIL=0
@@ -183,7 +187,7 @@ echo "acme" > "$WORK/c11/root/.coding-agent-profile"
 echo '{}' > "$WORK/c11/overlay/acme/claude/settings.json"
 cd "$WORK/c11/root" || exit 1
 dry_present=$(CODING_AGENT_PROFILE_DIR="$WORK/c11/overlay" CA_DRY_RUN=1 "$CA_CLAUDE" foo 2>&1)
-cd "$REPO_ROOT" || exit 1
+cd "$WORK" || exit 1
 assert_contains "case11b: profile present -> --settings injected" "$dry_present" "--settings"
 assert_contains "case11b: user argv preserved" "$dry_present" "foo"
 
@@ -199,7 +203,7 @@ echo "# root instructions" > "$WORK/c13/root/CLAUDE.md"
 echo "# overlay instructions" > "$WORK/c13/overlay/acme/claude/CLAUDE.md"
 cd "$WORK/c13/root" || exit 1
 dry=$(CODING_AGENT_PROFILE_DIR="$WORK/c13/overlay" CA_DRY_RUN=1 "$CA_CLAUDE" 2>&1)
-cd "$REPO_ROOT" || exit 1
+cd "$WORK" || exit 1
 assert_not_contains "case13: --append-system-prompt-file NOT injected when root CLAUDE.md exists" "$dry" "--append-system-prompt-file"
 explain=$(CODING_AGENT_PROFILE_DIR="$WORK/c13/overlay" "$BIN" explain --cwd "$WORK/c13/root")
 assert_contains "case13: --explain warns about suppressed overlay CLAUDE.md" "$explain" "suppressed"

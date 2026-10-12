@@ -158,6 +158,11 @@ _explain_text() {
     echo ""
     echo "Environment"
     echo "  direnv        installed=$direnv_installed"
+    echo "  launcher state: ${CODING_AGENT_PROFILE_ACTIVE:-unset} (current process only)"
+    echo "  provider selector: $(_env_state CODING_AGENT_STATUSLINE_CONFIG)"
+    echo "  contract runtime: $(_env_state CODING_AGENT_STATUSLINE_CONTRACT_RUNTIME)"
+    echo "  Resolve reports directory intent, not activation of another running session."
+    echo "  Start/resume Tier B with: ca-claude / ca-claude --resume"
     if [[ "$RESOLVE_STATUS" == "ok" ]]; then
         while IFS='=' read -r name state; do
             [[ -n "$name" ]] && echo "  profile var   $name  $state"

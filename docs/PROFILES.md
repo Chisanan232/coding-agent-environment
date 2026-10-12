@@ -1,10 +1,55 @@
 # Directory-scoped coding-agent profiles
 
-Every Claude Code / Codex session launched anywhere under a configured
-filesystem subtree inherits that subtree's profile — independent of Git
-repository boundaries, and working from arbitrarily deeply nested paths.
-Example: `/work/company-a/**/*` and `/work/company-b/**/*` resolve to
-different deterministic profiles.
+Sessions launched with `ca-claude` / `ca-codex` under a configured subtree
+receive its resolved profile independent of Git boundaries. Plain invocations
+receive Tier A only; marker discovery alone does not activate Tier B settings
+or provider registration. Example: `/work/company-a/**/*` and
+`/work/company-b/**/*` resolve to different deterministic profiles.
+
+## Reliable startup and resume
+
+For an existing managed local launcher runtime, review and synchronize only
+its three launcher files (backups are retained; no settings or profiles copied):
+
+```bash
+/absolute/path/to/python3 scripts/launcher-install.py --check
+/absolute/path/to/python3 scripts/launcher-install.py --adopt
+scripts/sync-check.sh --launchers
+```
+
+From any project inside the intended subtree:
+
+```bash
+coding-agent-profile explain
+CA_DRY_RUN=1 ca-claude --resume
+ca-claude                 # fresh session
+ca-claude --resume        # supported resume entrypoint
+```
+
+Set terminal/IDE launch tasks to invoke `ca-claude` explicitly where full profile
+activation is wanted; leave the official `claude` binary unchanged. The launcher
+never sources `profile.env` or changes security enforcement. Use approved direnv
+integration for environment readiness; its inheritance of env/instructions is
+not equivalent to profile activation.
+
+`Profile bypassed · use ca-claude` means the compositor found a marker but the
+current process lacks launcher activation. A valid resolver result describes
+intent, not another session's effective environment. Existing processes do not
+acquire startup-only flags/env from changing cwd or installing a launcher; leave
+them running and use the supported entrypoint on future starts/resumes.
+
+Private profiles may live at `$CODING_AGENT_LOCAL_PROFILE_DIR` (default
+`~/.config/coding-agent-environment/local/profiles`), taking precedence over the
+personal profile directory for the same marker name. An explicitly configured
+machine-local baseline at `$CODING_AGENT_LOCAL_BASELINE_DIR` is additive even
+without a marker. Neither directory is published. Within each selected overlay,
+`claude/statusline.json` selects optional extensions and `claude/statusline-runtime`
+selects their contract renderer; profile entries win over baseline entries.
+The launcher clears inherited selectors when neither applies, preventing a
+corporate parent session from activating providers in an unrelated project.
+Overlay settings must not replace canonical `statusLine`; use the dedicated
+statusline installer for that runtime. Provider failure keeps the generic base;
+absence of registration is not fabricated provider telemetry.
 
 ## Marker grammar
 

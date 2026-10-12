@@ -16,6 +16,9 @@ set -euo pipefail
 MARKER_NAME=".coding-agent-profile"
 MAX_DEPTH=64
 PROFILE_DIR="${CODING_AGENT_PROFILE_DIR:-$HOME/.coding-agent-profiles}"
+LOCAL_DIR="${CODING_AGENT_LOCAL_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/coding-agent-environment/local}"
+LOCAL_PROFILE_DIR="${CODING_AGENT_LOCAL_PROFILE_DIR:-$LOCAL_DIR/profiles}"
+LOCAL_BASELINE_DIR="${CODING_AGENT_LOCAL_BASELINE_DIR:-$LOCAL_DIR/baseline}"
 ALLOW_HOME_PROFILE="${CODING_AGENT_ALLOW_HOME_PROFILE:-0}"
 
 # Injectable for tests / --explain: default to the real OS paths.
@@ -138,7 +141,11 @@ resolve() {
 
     RESOLVE_NAME="$parsed"
     RESOLVE_ROOT="$nearest"
-    RESOLVE_OVERLAY="$PROFILE_DIR/$RESOLVE_NAME"
+    if [[ -d "$LOCAL_PROFILE_DIR/$RESOLVE_NAME" ]]; then
+        RESOLVE_OVERLAY="$LOCAL_PROFILE_DIR/$RESOLVE_NAME"
+    else
+        RESOLVE_OVERLAY="$PROFILE_DIR/$RESOLVE_NAME"
+    fi
 
     if [[ ! -d "$RESOLVE_OVERLAY" ]]; then
         RESOLVE_STATUS="unresolved"
@@ -184,6 +191,7 @@ cmd_internal_resolve_env() {
     printf 'CAP_NAME=%q\n' "$RESOLVE_NAME"
     printf 'CAP_ROOT=%q\n' "$RESOLVE_ROOT"
     printf 'CAP_OVERLAY=%q\n' "$RESOLVE_OVERLAY"
+    printf 'CAP_BASELINE=%q\n' "$LOCAL_BASELINE_DIR"
 }
 
 show_help() {
