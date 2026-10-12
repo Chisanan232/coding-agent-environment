@@ -26,7 +26,12 @@ if [[ "$(basename -- "$CLAUDE_BIN")" == "ca-claude" || "$CLAUDE_BIN" == "${BASH_
 fi
 
 # Resolve the profile using the same logic as coding-agent-profile resolve.
-eval "$("$HERE/coding-agent-profile" __internal_resolve_env 2>/dev/null || true)"
+unset CAP_STATUS CAP_NAME CAP_ROOT CAP_OVERLAY CAP_BASELINE
+if ! resolved="$("$HERE/coding-agent-profile" __internal_resolve_env 2>/dev/null)"; then
+    echo 'ca-claude: profile resolution failed; refusing inherited activation' >&2
+    exit 2
+fi
+eval "$resolved"
 
 declare -a ARGS=()
 PROFILE_ACTIVE=0

@@ -70,6 +70,20 @@ class ProfileStatusline(unittest.TestCase):
         self.assertIsNone(data['env']['CODING_AGENT_PROFILE_ACTIVE'])
         self.assertIsNone(data['env']['CODING_AGENT_STATUSLINE_CONFIG'])
 
+    def test_resolver_failure_never_uses_inherited_cap_values(self):
+        import shutil
+        isolated = self.root / 'broken-launcher'
+        isolated.mkdir()
+        shutil.copy2(ROOT / 'bin/ca-claude', isolated / 'ca-claude')
+        resolver = isolated / 'coding-agent-profile'
+        resolver.write_text('#!/bin/sh\nexit 1\n')
+        resolver.chmod(0o755)
+        self.env.update(CAP_STATUS='ok', CAP_OVERLAY=str(self.overlay.parent), CAP_ROOT=str(self.company))
+        result = subprocess.run([str(isolated / 'ca-claude')], cwd=self.company, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('refusing inherited activation', result.stderr)
+
     def test_managed_runtime_install_and_reinstall(self):
         installer = ROOT / 'scripts/launcher-install.py'
         argv = [os.sys.executable, str(installer), '--home', str(self.root)]
