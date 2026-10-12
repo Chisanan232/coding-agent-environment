@@ -52,7 +52,7 @@ class ProfileStatusline(unittest.TestCase):
         self.env['CODING_AGENT_STATUSLINE_CONTRACT_RUNTIME'] = 'foreign'
         result = self.launch(self.root)
         data = json.loads(result.stdout)
-        self.assertEqual(data['env']['CODING_AGENT_PROFILE_ACTIVE'], '0')
+        self.assertIsNone(data['env']['CODING_AGENT_PROFILE_ACTIVE'])
         self.assertIsNone(data['env']['CODING_AGENT_STATUSLINE_CONFIG'])
         self.assertIsNone(data['env']['CODING_AGENT_STATUSLINE_CONTRACT_RUNTIME'])
 
@@ -62,7 +62,7 @@ class ProfileStatusline(unittest.TestCase):
             result = self.launch(self.company)
             self.assertEqual(result.returncode, 0)
             self.assertIn('no profile overlay activated', result.stderr)
-            self.assertEqual(json.loads(result.stdout)['env']['CODING_AGENT_PROFILE_ACTIVE'], '0')
+            self.assertIsNone(json.loads(result.stdout)['env']['CODING_AGENT_PROFILE_ACTIVE'])
 
     def test_plain_invocation_does_not_activate_tier_b(self):
         result = subprocess.run(['claude'], cwd=self.company, env=self.env, capture_output=True, text=True)
