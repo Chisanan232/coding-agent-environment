@@ -82,3 +82,8 @@ and `--profile` (Codex) — see `docs/PROFILES.md` for the full design,
 including the Tier A (plain invocation: ancestor instructions + direnv
 only) vs Tier B (`ca-claude`/`ca-codex`: full overlay) split, and why
 managed/policy settings can never be bypassed by a profile.
+
+
+Shared `engineering-runtime/scripts/closeout.py` and its tests/contract are
+managed source. Its `.local/state/coding-agent-environment/closeout` bindings,
+locks and receipts are private runtime evidence and never tracked.

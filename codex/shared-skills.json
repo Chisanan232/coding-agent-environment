@@ -50,7 +50,8 @@
       "scripts/quality_gate.sh": ".claude/hooks/quality_gate.sh",
       "scripts/session-memory.sh": ".claude/hooks/session-memory.sh",
       "scripts/workflow-state.sh": ".claude/hooks/workflow-state.sh",
-      "references/RTK.md": ".claude/RTK.md"
+      "references/RTK.md": ".claude/RTK.md",
+      "scripts/closeout.py": ".claude/skills/engineering-runtime/scripts/closeout.py"
     }
   },
   "profiles": [
