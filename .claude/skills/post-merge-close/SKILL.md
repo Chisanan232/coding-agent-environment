@@ -59,7 +59,9 @@ repository/merge reconciliation; never auto-import them.
 ## Reconcile each outcome
 
 Before every action, inspect the holder's verified steps and current external
-state. A crash can occur after an action succeeds but before its receipt write;
+state. Use `effective_complete`, never the historical `record.complete` flag.
+Schema-1 receipts remain readable but report `finalization_unverified`; do not
+repeat their already verified cleanup merely to upgrade the receipt. A crash can occur after an action succeeds but before its receipt write;
 re-observation prevents duplicate comments/deletions. Mark distinct outcomes
 only after successful verification. A failed operation remains pending.
 
@@ -115,11 +117,19 @@ bash "$ENGINEERING_RUNTIME/workflow-state.sh" write \
 bash "$ENGINEERING_RUNTIME/workflow-state.sh" archive "$TICKET"
 ```
 
+After verifying the archive exists in the bound native ticket scope, record
+`{"op":"mark_finalization","step":"workflow_archived","evidence":"Exact archive path and verified state"}`.
 Record the verified outcome and merge SHA through `decision-log.sh`, then clear
-only this completed ticket's session notes via `session-memory.sh`. If archive,
+only this completed ticket's session notes via `session-memory.sh`. Re-observe
+and reference an existing matching durable decision on retry; do not append a
+duplicate simply because its checkpoint is missing. Record `decision_recorded`
+with that durable reference and `notes_cleared` only after verifying absence in
+the exact host/ticket scope, using `mark_finalization` requests. These three
+finalization outcomes are required alongside the six lifecycle steps. If archive,
 log or notes handling fails, keep the holder open or release with pending
 finalization; re-observe these operations on retry. Send `{"op":"finish"}`
-after successful finalization, then `{"op":"release"}`. Keep the terminal receipt;
+after all nine outcomes are verified and `pending` is empty. Require its reply
+to report `effective_complete: true`, then send `{"op":"release"}`. Keep the terminal receipt;
 removing it would lose idempotency evidence. Release on an unresolved refusal
 and retain the partial record rather than marking the workflow complete.
 
@@ -132,3 +142,10 @@ See `engineering-runtime` for shared storage integration and diagnostics.
 Use `evidence-first-briefing`: verified acceptance/merge references, actual cleanup
 outcomes, and precise pending ownership/configuration/notification/finalization
 work. Do not declare success merely because a PR merged or a receipt exists.
+
+Receipt schema 2 requires the corrected helper in both hosts. Old helpers refuse
+new receipts safely; install both host copies through the existing scoped
+installer before reconciliation. Status/hold preserve schema-1 bytes. The first
+valid `mark_finalization` under the held lock upgrades the binding and existing
+evidence atomically without inferring historical finalization. Unknown ownership
+or active same-ticket work still prevents state/notes mutation.

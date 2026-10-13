@@ -80,3 +80,7 @@ host-private history/configuration. Hold the same live process handle across
 observe/act/verify/record; a per-write lock alone cannot serialize external actions.
 Status/receipts are evidence, never a cleanup grant. Context markers remain
 preserved until all writers use a coordinated ownership protocol.
+
+Closeout schema 2 separately checkpoints archive, decision and notes finalization.
+Read `effective_complete`; legacy terminal flags leave finalization unverified.
+Install the same helper for both hosts before reconciling legacy receipts.
