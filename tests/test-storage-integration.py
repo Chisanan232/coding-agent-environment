@@ -349,6 +349,25 @@ class StorageIntegration(unittest.TestCase):
         storage.rollback(self.home)
         self.assertEqual(self.receipt_path().read_bytes(), after)
 
+    def test_reapply_refuses_unsafe_retained_package_without_selection_change(self):
+        storage.install(self.home, self.checkout, self.runner)
+        spec = dict(storage.manifest(), revision="b" * 40)
+        self.runner.head = spec["revision"]
+        self.runner.description = "bbbbbbb"
+        self.runner.payload = b"retained-runtime"
+        with patch.object(storage, "manifest", return_value=spec):
+            storage.install(self.home, self.checkout, self.runner)
+            retained = storage.read_selection(self.receipt_path())[0]
+            storage.rollback(self.home)
+            before = self.receipt_path().read_bytes()
+            binary = Path(retained["path"])
+            for target, unsafe, safe in ((binary, 0o777, 0o755), (binary.parents[1], 0o777, 0o700)):
+                target.chmod(unsafe)
+                with self.assertRaises(ValueError):
+                    storage.install(self.home, self.checkout, self.runner)
+                self.assertEqual(self.receipt_path().read_bytes(), before)
+                target.chmod(safe)
+
     def test_rollback_recovers_damaged_current_but_refuses_damaged_target(self):
         storage.install(self.home, self.checkout, self.runner)
         first = storage.read_selection(self.receipt_path())[0]

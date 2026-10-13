@@ -299,6 +299,8 @@ def install(home, checkout, runner=subprocess.run):
             finally:
                 if stage.exists():
                     shutil.rmtree(stage)  # Only this invocation's private staging directory.
+        if artifact_state(new, base) != "installed":
+            raise ValueError("Versioned artifact has drift; refusing selection")
         verify_binary(destination, expected, runner)
         if old == new:
             return "installed"
