@@ -84,3 +84,21 @@ Do not change trust state or bypass it to claim automatic lifecycle parity.
 See the [official hooks contract](https://learn.chatgpt.com/docs/hooks).
 Shared receipts survive interrupted holders; arbitrary unattended retirement
 requires a supported owner/session contract and separate empirical validation.
+
+## Finalization receipt compatibility
+
+Receipt schema 2 adds three verified finalization outcomes: workflow archival,
+durable decision recording and exact-scope note cleanup. All six lifecycle
+outcomes and all three finalization outcomes are required by `finish`.
+Consumers must use `effective_complete`; a schema-1 historical `complete` flag
+proves only the older six-outcome contract, not full finalization.
+
+Status and entering hold preserve legacy bytes. The first valid
+`mark_finalization` request upgrades a valid legacy receipt atomically, retaining
+its immutable binding and original evidence, setting effective completion false
+until finalization is verified. Never replay deletion or append duplicate decisions
+merely because an older receipt lacks their checkpoint. Observe existing results.
+Corrupt or conflicting receipts refuse unchanged. Install the new helper in both
+hosts before upgrade: old strict readers refuse schema 2 rather than guessing.
+No helper request executes archive, note deletion, logging or external cleanup;
+the workflow retains responsibility for ownership, execution and verification.
