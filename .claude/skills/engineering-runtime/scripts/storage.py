@@ -9,12 +9,16 @@ import stat
 
 def resolve(home, pin):
     try:
-        base = Path(home) / ".local/share/coding-agent-environment"
+        base = Path(home) / ".local/share/coding-agent-environment/storage"
         receipt_path = base / "storage-core.json"
         def regular(path, private=True):
             for part in (path, *path.parents):
                 if part.is_symlink():
                     raise ValueError("symlinked storage state")
+                if part.is_dir():
+                    ancestor = part.stat()
+                    if ancestor.st_mode & 0o022 and not ancestor.st_mode & stat.S_ISVTX:
+                        raise ValueError("writable storage ancestry")
             info = path.stat()
             forbidden = 0o077 if private else 0o022
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & forbidden:
@@ -33,6 +37,8 @@ def resolve(home, pin):
         binary = base / "glomeris" / checksum / "bin/glomeris"
         if receipt["path"] != str(binary):
             raise ValueError("unowned path")
+        if base.parent.stat().st_uid != os.getuid():
+            raise ValueError("unowned shared container")
         for directory in (base, base / "glomeris", binary.parents[1], binary.parent):
             info = directory.stat()
             if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
