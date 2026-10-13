@@ -26,8 +26,10 @@ network capability. No LLM calls or workstation evidence uploads are added.
 The installer checks the actual dev/release version string against the source
 identity and validates the numeric/status JSON contract. It publishes executable
 and ownership receipt together into a private content-addressed package under
-`~/.local/share/coding-agent-environment/glomeris/<sha256>/bin/glomeris`.
-The shared local `storage-core.json` atomically records current and previous
+`~/.local/share/coding-agent-environment/storage/glomeris/<sha256>/bin/glomeris`.
+The new private `storage` child leaves the established shared parent and its
+visual skills unchanged. Writable or symlinked ancestors refuse installation.
+The shared local `storage/storage-core.json` atomically records current and previous
 deployment identities (source revision, executable digest and absolute path).
 Interrupted upgrades preserve both identities and the prior rollback target.
 Legacy owned receipts remain readable; successful upgrades migrate the selection

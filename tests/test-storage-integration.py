@@ -408,6 +408,27 @@ class StorageIntegration(unittest.TestCase):
                 self.assertEqual(exports["ENGINEERING_STORAGE_BIN"], "")
                 self.assertEqual(exports["ENGINEERING_STORAGE_STATUS"], "refused")
 
+    def test_private_child_preserves_existing_shared_parent(self):
+        parent = self.home / ".local/share/coding-agent-environment"
+        parent.mkdir(parents=True, mode=0o755)
+        parent.chmod(0o755)
+        visual = parent / "visual-skills"
+        visual.mkdir()
+        marker = visual / "unrelated.txt"
+        marker.write_text("existing visual configuration")
+        storage.install(self.home, self.checkout, self.runner)
+        self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(marker.read_text(), "existing visual configuration")
+        self.assertEqual((parent / "storage").stat().st_mode & 0o777, 0o700)
+        self.assertEqual(storage.receipt_state(self.receipt_path()), "installed")
+        self.assertEqual(resolver_core.resolve(self.home, storage.manifest())[1], "verified_installation")
+        before = self.receipt_path().read_bytes()
+        parent.chmod(0o777)
+        with self.assertRaises(ValueError):
+            storage.install(self.home, self.checkout, self.runner)
+        self.assertEqual(self.receipt_path().read_bytes(), before)
+        self.assertEqual(resolver_core.resolve(self.home, storage.manifest()), ("", "refused"))
+
     def test_changed_pin_makes_check_fail(self):
         storage.install(self.home, self.checkout, self.runner)
         changed = dict(storage.manifest(), revision="b" * 40)

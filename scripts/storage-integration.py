@@ -16,7 +16,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "codex/storage-core.json"
-RUNTIME = Path(".local/share/coding-agent-environment")
+RUNTIME = Path(".local/share/coding-agent-environment/storage")
 REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -43,6 +43,10 @@ def reject_symlink_ancestry(path):
         current = current / part
         if current.is_symlink():
             raise ValueError(f"Refusing symlinked path: {current}")
+        if current.exists() and current.is_dir():
+            info = current.stat()
+            if info.st_mode & 0o022 and not (info.st_mode & stat.S_ISVTX):
+                raise ValueError("Refusing writable managed path ancestry")
 
 
 def ensure_private_dir(path):
@@ -116,6 +120,8 @@ def artifact_state(receipt, base):
     expected = base / "glomeris" / receipt["binary_sha256"] / "bin/glomeris"
     if binary != expected:
         raise ValueError("Storage receipt path is outside its owned versioned destination")
+    if base.parent.stat().st_uid != os.getuid():
+        raise ValueError("Shared configuration container is not user-owned")
     for directory in (base, base / "glomeris", binary.parents[1], binary.parent):
         private_directory(directory)
     reject_symlink_ancestry(binary)
@@ -251,6 +257,8 @@ def install(home, checkout, runner=subprocess.run):
     binaries = base / "glomeris"
     receipt_path = base / "storage-core.json"
     ensure_private_dir(base)
+    if base.parent.stat().st_uid != os.getuid():
+        raise ValueError("Shared configuration container is not user-owned")
     ensure_private_dir(binaries)
     lock_fd = acquire_lock(base / "storage-core.lock")
     try:
@@ -314,6 +322,8 @@ def rollback(home):
     base = Path(home).expanduser().absolute() / RUNTIME
     receipt_path = base / "storage-core.json"
     ensure_private_dir(base)
+    if base.parent.stat().st_uid != os.getuid():
+        raise ValueError("Shared configuration container is not user-owned")
     lock_fd = acquire_lock(base / "storage-core.lock")
     try:
         current, previous = read_selection(receipt_path)
