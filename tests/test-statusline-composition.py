@@ -144,9 +144,17 @@ class StatuslineComposition(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 1.0)
             self.assertIsNotNone(proc.poll())
             # A killed child may briefly remain a zombie; neither state can run.
-            state = subprocess.run(["ps", "-p", str(descendant), "-o", "stat="],
-                                   capture_output=True, text=True).stdout.strip()
+            # Group signaling is asynchronous: reaping the direct child does
+            # not guarantee the descendant has processed SIGKILL yet. Observe
+            # its terminal state within the original one-second bound.
+            while True:
+                state = subprocess.run(["ps", "-p", str(descendant), "-o", "stat="],
+                                       capture_output=True, text=True).stdout.strip()
+                if not state or state.startswith("Z") or time.monotonic() >= started + 1.0:
+                    break
+                time.sleep(.01)
             self.assertTrue(not state or state.startswith("Z"), state)
+            self.assertLess(time.monotonic() - started, 1.0)
         finally:
             import signal
             try:
