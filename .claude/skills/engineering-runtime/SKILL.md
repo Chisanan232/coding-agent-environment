@@ -54,3 +54,11 @@ for overrides. State-directory, strict/skip and threshold overrides use the
 `ENGINEERING_` names exported by the bootstrap. Claude legacy `CLAUDE_` names
 remain supported in Claude only. Never store credentials in these files; use
 native supported authentication. Opt-outs never replace required validation.
+
+
+Shared closeout receipts use `scripts/closeout.py`, as specified by
+`post-merge-close`. Its shared user-local state coordinates hosts without copying
+host-private history/configuration. Hold the same live process handle across
+observe/act/verify/record; a per-write lock alone cannot serialize external actions.
+Status/receipts are evidence, never a cleanup grant. Context markers remain
+preserved until all writers use a coordinated ownership protocol.
