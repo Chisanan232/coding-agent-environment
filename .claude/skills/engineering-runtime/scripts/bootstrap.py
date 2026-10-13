@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import json
 
 host_root = Path(__file__).resolve().parents[3]
 if host_root.name not in {'.claude', '.codex'}:
@@ -46,5 +47,13 @@ for suffix, default in {
 }.items():
     values['ENGINEERING_' + suffix] = os.environ.get('ENGINEERING_' + suffix,
         os.environ.get('CLAUDE_' + suffix, default) if host_root.name == '.claude' else default)
+try:
+    from storage import resolve as resolve_storage
+    storage_pin = json.loads((Path(__file__).resolve().parent.parent / 'references/storage-core.json').read_text())
+    storage_bin, storage_status = resolve_storage(Path.home(), storage_pin)
+except (ImportError, OSError, ValueError, KeyError, TypeError):
+    storage_bin, storage_status = '', 'unavailable'
+values['ENGINEERING_STORAGE_BIN'] = storage_bin
+values['ENGINEERING_STORAGE_STATUS'] = storage_status
 for key, value in values.items():
     print('export ' + key + '=' + shlex.quote(value))

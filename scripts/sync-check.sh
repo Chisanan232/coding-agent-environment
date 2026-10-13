@@ -15,6 +15,8 @@ if [[ "${1:-}" == "--statusline" && "$#" == 1 ]]; then
     exec "${CODING_AGENT_STATUSLINE_PYTHON:-python3}" "$REPO_ROOT/scripts/statusline-install.py" --home "$SYNC_HOME" --check
 elif [[ "${1:-}" == "--launchers" && "$#" == 1 ]]; then
     exec "${CODING_AGENT_STATUSLINE_PYTHON:-python3}" "$REPO_ROOT/scripts/launcher-install.py" --home "$SYNC_HOME" --check
+elif [[ "${1:-}" == "--storage" && "$#" == 1 ]]; then
+    exec bash "$REPO_ROOT/scripts/profile-install.sh" --storage --check
 elif [[ "${1:-}" == "--routing" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --routing --check
 elif [[ "${1:-}" == "--codex" && "$#" == 1 ]]; then
