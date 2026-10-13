@@ -54,3 +54,22 @@ for overrides. State-directory, strict/skip and threshold overrides use the
 `ENGINEERING_` names exported by the bootstrap. Claude legacy `CLAUDE_` names
 remain supported in Claude only. Never store credentials in these files; use
 native supported authentication. Opt-outs never replace required validation.
+
+
+Storage recovery uses the established Glomeris CLI. Run the existing repository
+`profile-install.sh --storage --dry-run`, then `--storage --apply --checkout PATH`
+from an exact pinned clean public Glomeris checkout. `sync-check.sh --storage`
+checks deployment provenance. Bootstrap exports `ENGINEERING_STORAGE_BIN` only
+when the shared local receipt, artifact ownership, source pin and executable
+SHA-256 agree; `ENGINEERING_STORAGE_STATUS` explains missing/outdated/refused
+installation. It reads no other host's credentials/history/configuration.
+
+Use the verified binary directly for `status --json`, `detect`, `explain` and
+`clean --dry-run`; the latter cannot execute. Inspect native CLI help for typed
+execution/recovery options and actual refusal codes. Preserve policy decisions,
+exit codes (including busy 75), estimates versus measured free-space delta and
+safe-exhaustion diagnostics. Never fall back to raw deletion or pre-acquire
+Glomeris's execution lock. Shared/active/unknown resources stay protected.
+A verified installation is not proof that startup hooks, daemon monitoring,
+all toolchains or autonomous worktree ownership are enabled. Native Glomeris
+is the only storage monitor; no additional daemon is installed by this profile.

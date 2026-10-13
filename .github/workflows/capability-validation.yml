@@ -9,6 +9,7 @@ on:
       - 'codex/**'
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
+      - 'scripts/storage-integration.py'
       - 'scripts/codex-routing.py'
       - 'scripts/verify-codex-routing.py'
       - 'tests/**'
@@ -24,6 +25,7 @@ on:
       - 'codex/**'
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
+      - 'scripts/storage-integration.py'
       - 'scripts/codex-routing.py'
       - 'scripts/verify-codex-routing.py'
       - 'tests/**'
@@ -49,6 +51,7 @@ jobs:
           python3 tests/test-full-parity-inventory.py
           python3 tests/test-full-parity-install.py
           python3 tests/test-codex-routing.py
+          python3 tests/test-storage-integration.py
           python3 tests/test-statusline-composition.py
           python3 tests/test-statusline-install.py
           python3 tests/test-profile-statusline.py

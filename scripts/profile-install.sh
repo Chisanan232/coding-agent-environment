@@ -20,6 +20,10 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${1:-}" == "--storage" ]]; then
+    shift
+    exec python3 "$REPO_ROOT/scripts/storage-integration.py" "$@"
+fi
 if [[ "${1:-}" == "--routing" ]]; then
     shift
     exec python3 "$REPO_ROOT/scripts/codex-routing.py" "$@"
