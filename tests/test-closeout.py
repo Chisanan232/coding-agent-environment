@@ -136,6 +136,7 @@ class Closeout(unittest.TestCase):
 
     def test_complete_and_repeat_keeps_terminal_receipt(self):
         requests=[{'op':'mark','step':step,'evidence':'fresh observation: '+step} for step in module.STEPS]
+        requests += [{'op':'mark_finalization','step':step,'evidence':'verified finalization: '+step} for step in module.FINALIZATION]
         requests += [{'op':'finish'},{'op':'release'}]
         self.assertEqual(self.run_helper(requests).returncode,0)
         receipt=next(self.state.glob('*.json')); before=receipt.read_bytes()
@@ -143,6 +144,82 @@ class Closeout(unittest.TestCase):
         self.assertEqual(self.run_helper(requests).returncode,0)
         self.assertEqual(receipt.read_bytes(),before)
         self.assertEqual(self.run_helper([{'op':'finish'}]).returncode,0)
+
+    def old_completed_record(self):
+        self.run_helper()
+        receipt = next(self.state.glob('*.json'))
+        record = json.loads(receipt.read_text())
+        record.pop('finalization')
+        record['schema'] = 1
+        record['steps'] = {step: {'verified': True, 'evidence': 'legacy evidence: '+step} for step in module.STEPS}
+        record['complete'] = True
+        receipt.write_text(json.dumps(record))
+        receipt.chmod(0o600)
+        return receipt, record
+
+    def test_every_missing_finalization_outcome_prevents_completion(self):
+        for missing in module.FINALIZATION:
+            with self.subTest(missing=missing):
+                requests = [{'op':'mark','step':step,'evidence':'verified'} for step in module.STEPS]
+                requests += [{'op':'mark_finalization','step':step,'evidence':'verified'} for step in module.FINALIZATION if step != missing]
+                requests += [{'op':'finish'}]
+                # Use separate repository identity for each independent control.
+                self.binding['repository'] = 'https://github.com/example/'+missing
+                self.write_binding()
+                self.assertEqual(self.run_helper(requests).returncode, 2)
+                status = json.loads(self.run_helper(mode='status').stdout)
+                self.assertFalse(status['effective_complete'])
+                self.assertIn(missing, status['pending'])
+
+    def test_legacy_status_and_hold_preserve_historical_bytes(self):
+        receipt, _ = self.old_completed_record()
+        before = receipt.read_bytes()
+        for mode in ('status', 'hold'):
+            result = self.run_helper(mode=mode)
+            self.assertEqual(result.returncode, 0)
+            report = json.loads(result.stdout.splitlines()[0])
+            self.assertTrue(report['record']['complete'])
+            self.assertFalse(report['effective_complete'])
+            self.assertEqual(report['finalization_status'], 'finalization_unverified')
+            self.assertEqual(receipt.read_bytes(), before)
+        self.assertEqual(self.run_helper([{'op':'finish'}]).returncode, 2)
+        self.assertEqual(receipt.read_bytes(), before)
+
+    def test_legacy_finalization_reconciliation_preserves_verified_outcomes(self):
+        receipt, old = self.old_completed_record()
+        holder = self.holder()
+        first = sorted(module.FINALIZATION)[0]
+        self.send(holder, {'op':'mark_finalization','step':first,'evidence':'observed durable result'})
+        holder.kill(); holder.wait(timeout=5)
+        migrated = json.loads(receipt.read_text())
+        self.assertEqual(migrated['schema'], 2)
+        self.assertFalse(migrated['complete'])
+        self.assertEqual(migrated['steps'], old['steps'])
+        self.assertEqual(migrated['binding'], old['binding'])
+        requests = [{'op':'mark_finalization','step':step,'evidence':'verified scoped finalization'} for step in module.FINALIZATION if step != first]
+        requests += [{'op':'finish'}]
+        self.assertEqual(self.run_helper(requests).returncode, 0)
+        self.assertTrue(json.loads(self.run_helper(mode='status').stdout)['effective_complete'])
+        before = receipt.read_bytes()
+        self.assertEqual(self.run_helper([{'op':'mark_finalization','step':first,'evidence':'different retry assertion'}]).returncode, 0)
+        self.assertEqual(receipt.read_bytes(), before)
+
+    def test_invalid_finalization_and_false_terminal_refuse_unchanged(self):
+        self.run_helper()
+        receipt = next(self.state.glob('*.json'))
+        before = receipt.read_bytes()
+        for request in [{'op':'mark_finalization','step':'unknown','evidence':'verified'},
+                        {'op':'mark_finalization','step':'notes_cleared','evidence':''},
+                        {'op':'mark_finalization','step':'notes_cleared','evidence':'漢'*4096}]:
+            self.assertEqual(self.run_helper([request]).returncode, 2)
+            self.assertEqual(receipt.read_bytes(), before)
+        record = json.loads(before)
+        record['complete'] = True
+        record['steps'] = {step:{'verified':True,'evidence':'observed'} for step in module.STEPS}
+        receipt.write_text(json.dumps(record))
+        corrupt = receipt.read_bytes()
+        self.assertEqual(self.run_helper(mode='status').returncode, 2)
+        self.assertEqual(receipt.read_bytes(), corrupt)
 
     def test_pending_and_invalid_requests_are_not_completion(self):
         result=self.run_helper([{'op':'finish'}])

@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 STEPS = {"ticket_closed", "worktree_removed", "remote_branch_removed",
          "local_branch_removed", "context_cleared", "reporter_handled"}
+FINALIZATION = {"workflow_archived", "decision_recorded", "notes_cleared"}
 
 
 def binding_from(path):
@@ -96,13 +97,18 @@ def locked(root, key):
 def read_record(path, binding):
     reject_links(path)
     if not path.exists():
-        return {"schema": 1, "binding": binding, "steps": {}, "complete": False}
+        return {"schema": 2, "binding": binding, "steps": {}, "finalization": {}, "complete": False}
     if not path.is_file():
         raise ValueError("Invalid closeout receipt")
     if path.stat().st_size > 65536 or stat.S_IMODE(path.stat().st_mode) & 0o077:
         raise ValueError("Oversized or non-private receipt")
     record = json.loads(path.read_text())
-    if (not isinstance(record, dict) or set(record) != {"schema", "binding", "steps", "complete"} or record.get("schema") != 1
+    if not isinstance(record, dict) or type(record.get("schema")) is not int or record["schema"] not in (1, 2):
+        raise ValueError("Unsupported closeout receipt")
+    fields = {"schema", "binding", "steps", "complete"}
+    if record["schema"] == 2:
+        fields.add("finalization")
+    if (set(record) != fields
             or record.get("binding") != binding or not isinstance(record.get("steps"), dict)
             or type(record.get("complete")) is not bool):
         raise ValueError("Corrupt, unsupported or conflicting closeout receipt")
@@ -113,7 +119,30 @@ def read_record(path, binding):
             raise ValueError("Corrupt closeout outcome")
     if record["complete"] and set(record["steps"]) != STEPS:
         raise ValueError("Incomplete terminal receipt")
+    if record["schema"] == 2:
+        outcomes = record["finalization"]
+        if not isinstance(outcomes, dict) or not set(outcomes).issubset(FINALIZATION):
+            raise ValueError("Invalid finalization outcomes")
+        for outcome in outcomes.values():
+            validate_outcome(outcome)
+        if record["complete"] and set(outcomes) != FINALIZATION:
+            raise ValueError("Incomplete terminal finalization")
     return record
+
+
+def validate_outcome(outcome):
+    if (not isinstance(outcome, dict) or set(outcome) != {"verified", "evidence"}
+            or outcome["verified"] is not True or not isinstance(outcome["evidence"], str)
+            or not outcome["evidence"].strip() or len(outcome["evidence"].encode()) > 4096):
+        raise ValueError("Invalid verification evidence")
+
+
+def completion(record):
+    pending = sorted(STEPS - set(record["steps"]))
+    pending += sorted(FINALIZATION - set(record.get("finalization", {})))
+    return {"effective_complete": record["schema"] == 2 and record["complete"] and not pending,
+            "finalization_status": "finalization_unverified" if record["schema"] == 1 else ("pending" if pending else "verified"),
+            "pending": pending}
 
 
 def save_record(path, record):
@@ -154,17 +183,18 @@ def main():
     with locked(args.state_dir, key):
         record = read_record(path, binding)
         if args.mode == "status":
-            emit({"exists": path.exists(), "record": record})
+            emit({"exists": path.exists(), "record": record, **completion(record)})
             return
-        save_record(path, record)
-        emit({"status": "locked", "record": record})
+        if not path.exists():
+            save_record(path, record)
+        emit({"status": "locked", "record": record, **completion(record)})
         for line in sys.stdin:
             request = json.loads(line)
             if not isinstance(request, dict):
                 raise ValueError("Invalid receipt request")
             op = request.get("op")
             if op == "status":
-                emit({"record": record})
+                emit({"record": record, **completion(record)})
             elif op == "mark":
                 step, evidence = request.get("step"), request.get("evidence")
                 if step not in STEPS or not isinstance(evidence, str) or not evidence.strip() or len(evidence.encode()) > 4096:
@@ -173,12 +203,24 @@ def main():
                     record["steps"][step] = {"verified": True, "evidence": evidence}
                     save_record(path, record)
                 emit({"status": "recorded", "step": step})
+            elif op == "mark_finalization":
+                step = request.get("step")
+                outcome = {"verified": True, "evidence": request.get("evidence")}
+                if step not in FINALIZATION:
+                    raise ValueError("Unknown finalization outcome")
+                validate_outcome(outcome)
+                if record["schema"] == 1:
+                    record = {**record, "schema": 2, "complete": False, "finalization": {}}
+                if step not in record["finalization"]:
+                    record["finalization"][step] = outcome
+                    save_record(path, record)
+                emit({"status": "recorded", "step": step})
             elif op == "finish":
-                if set(record["steps"]) != STEPS:
+                if record["schema"] != 2 or completion(record)["pending"]:
                     raise ValueError("Closeout outcomes remain pending")
                 record["complete"] = True
                 save_record(path, record)
-                emit({"status": "complete"})
+                emit({"status": "complete", **completion(record)})
             elif op == "release":
                 emit({"status": "released"})
                 break
