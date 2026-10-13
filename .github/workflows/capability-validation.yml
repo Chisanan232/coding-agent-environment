@@ -48,6 +48,7 @@ jobs:
           bash tests/test-profile-resolver.sh
           python3 tests/test-signal-density.py
           python3 tests/test-engineering-workflow.py
+          python3 tests/test-closeout.py
           python3 tests/test-full-parity-inventory.py
           python3 tests/test-full-parity-install.py
           python3 tests/test-codex-routing.py

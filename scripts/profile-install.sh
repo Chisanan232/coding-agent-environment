@@ -37,6 +37,8 @@ HOST_MODE=codex
 CHECK=0
 CAPABILITIES=0
 REMOVE=0
+SHARED_SELECTION=""
+SHARED_SELECTION_SET=0
 
 for arg in "$@"; do
     case "$arg" in
@@ -46,9 +48,22 @@ for arg in "$@"; do
         --check) CHECK=1 ;;
         --capabilities) CAPABILITIES=1 ;;
         --remove) REMOVE=1 ;;
+        --shared-skills=*)
+            if (( SHARED_SELECTION_SET )); then
+                echo 'Specify --shared-skills exactly once.' >&2; exit 2
+            fi
+            SHARED_SELECTION_SET=1
+            SHARED_SELECTION="${arg#*=}"
+            [[ -n "$SHARED_SELECTION" ]] || { echo 'Shared skill selection must not be empty.' >&2; exit 2; }
+            ;;
         *) echo "profile-install.sh: unknown option: $arg" >&2; exit 2 ;;
     esac
 done
+
+if [[ -n "$SHARED_SELECTION" ]] && (( ! GLOBAL )); then
+    echo "--shared-skills requires --global or --claude-skills." >&2
+    exit 2
+fi
 
 if (( GLOBAL && CAPABILITIES )); then
     echo 'Choose --global or --capabilities, not both.' >&2
@@ -147,7 +162,7 @@ if (( GLOBAL )); then
         echo 'Global mode requires the standard user Codex home; custom CODEX_HOME is not managed.' >&2
         exit 2
     fi
-    python3 - "$REPO_ROOT" "${CODING_AGENT_SYNC_HOME:-$HOME}" "$DRY_RUN" "$CHECK" "$HOST_MODE" <<'PYGLOBAL'
+    python3 - "$REPO_ROOT" "${CODING_AGENT_SYNC_HOME:-$HOME}" "$DRY_RUN" "$CHECK" "$HOST_MODE" "$SHARED_SELECTION" <<'PYGLOBAL'
 import datetime
 import hashlib
 import json
@@ -162,6 +177,7 @@ import tempfile
 root, live = map(Path, sys.argv[1:3])
 dry, check = map(int, sys.argv[3:5])
 host_mode = sys.argv[5]
+selection = sys.argv[6].split(',') if sys.argv[6] else []
 host_dir = '.' + host_mode
 drift_label = 'Managed Codex drift' if host_mode == 'codex' else 'Managed Claude practice drift'
 if dry and check:
@@ -224,7 +240,11 @@ shared_skills += [name for name in shared_manifest['skills'] if name not in shar
 actual_skills = {p.parent.name for p in (root / '.claude/skills').glob('*/SKILL.md')}
 if actual_skills != set(shared_skills):
     raise SystemExit('Shared skill manifest does not cover the complete authored inventory.')
-managed = [(agents, merged, 'managed instruction block; preserve outside bytes')]
+if selection and (len(selection) != len(set(selection)) or not set(selection).issubset(shared_skills)):
+    raise SystemExit('Unknown or duplicate shared skill selection.')
+managed = [] if selection else [(agents, merged, 'managed instruction block; preserve outside bytes')]
+if selection:
+    shared_skills = selection
 for skill in shared_skills:
     folder = root / '.claude/skills' / skill
     body = (folder / 'SKILL.md').read_text()
@@ -237,7 +257,7 @@ for skill in shared_skills:
         target = live / host_dir / 'skills' / skill / relative
         reject_symlinks(target)
         managed.append((target, source.read_bytes(), str(source.relative_to(root))))
-for name in shared_manifest['profiles'] if host_mode == 'codex' else []:
+for name in shared_manifest['profiles'] if host_mode == 'codex' and not selection else []:
     source = root / 'codex' / name
     target = live / '.codex' / name
     reject_symlinks(target)
@@ -258,7 +278,7 @@ for path, data, label in managed:
                 print(f'Desired SHA256: {hashlib.sha256(data).hexdigest()} ({len(data)} bytes)')
 manifest = json.loads((root / 'codex/subtraction-skills.json').read_text())
 missing = []
-for skill, spec in manifest['skills'].items() if host_mode == 'codex' else []:
+for skill, spec in manifest['skills'].items() if host_mode == 'codex' and not selection else []:
     folder = live / '.agents/skills' / skill
     bad = [name for name, digest in spec['files'].items()
            if not (folder / name).is_file()

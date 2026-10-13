@@ -73,3 +73,10 @@ Glomeris's execution lock. Shared/active/unknown resources stay protected.
 A verified installation is not proof that startup hooks, daemon monitoring,
 all toolchains or autonomous worktree ownership are enabled. Native Glomeris
 is the only storage monitor; no additional daemon is installed by this profile.
+
+Shared closeout receipts use `scripts/closeout.py`, as specified by
+`post-merge-close`. Its shared user-local state coordinates hosts without copying
+host-private history/configuration. Hold the same live process handle across
+observe/act/verify/record; a per-write lock alone cannot serialize external actions.
+Status/receipts are evidence, never a cleanup grant. Context markers remain
+preserved until all writers use a coordinated ownership protocol.

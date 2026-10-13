@@ -90,3 +90,7 @@ managed/policy settings can never be bypassed by a profile.
 engineering-runtime resolver and `tests/test-storage-integration.py` are managed
 source. Local `.local/share/coding-agent-environment` package receipts/binaries,
 closeout receipts, staging builds and raw diagnostics are never tracked.
+
+Shared `engineering-runtime/scripts/closeout.py` and its tests/contract are
+managed source. Its `.local/state/coding-agent-environment/closeout` bindings,
+locks and receipts are private runtime evidence and never tracked.

@@ -51,7 +51,8 @@
       "scripts/session-memory.sh": ".claude/hooks/session-memory.sh",
       "scripts/workflow-state.sh": ".claude/hooks/workflow-state.sh",
       "references/RTK.md": ".claude/RTK.md",
-      "references/storage-core.json": "codex/storage-core.json"
+      "references/storage-core.json": "codex/storage-core.json",
+      "scripts/closeout.py": ".claude/skills/engineering-runtime/scripts/closeout.py"
     }
   },
   "profiles": [
