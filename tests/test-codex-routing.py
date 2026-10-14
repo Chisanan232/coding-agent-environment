@@ -21,6 +21,8 @@ class RoutingTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve())
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.addCleanup(os.chdir, Path.cwd())
+        os.chdir(self.root)
         self.home = self.root / 'home'
         self.home.mkdir()
         self.bin = self.root / 'codex-fake'
