@@ -98,3 +98,27 @@ and private backups until verification finishes.
 Interrupted rollback journals the observed policy state and restore intent.
 Only that exact pre-restore state or the expected restored result can resume;
 unexpected disappearance and user drift remain refusals.
+
+## Core-only artifact exports
+
+`glomeris resource export ID GENERATION --artifact artifact.o --destination
+ABSOLUTE_PATH` copies one sealed, producer-verified object into an existing
+user-owned directory. It refuses overwrite, redirected paths, changed artifacts
+and generations previously exposed through an arbitrary native hold. The core
+retains the source barrier until its descriptors close and its access outcome is
+durable; native consumers receive an independent copy, not source access.
+Exported copies belong to their destination owner and are outside this cleanup
+authority. Partial copies remain preserved after errors or interruption.
+
+An interrupted core-only export can reconcile verified holder death as ended
+source access, without reporting successful export. Its observed end is a
+conservative inactivity bound. Normal 24-hour retention and all existing
+class, budget and execution gates still apply. No additional cleanup class is
+enabled by export, and it does not establish complete native-session custody,
+general Cargo target ownership or worktree release authority.
+
+Access records retain `read_claims`. Older strict readers reject those records
+and preserve their resources, including with an enabled cleanup envelope.
+Rollback must preserve the records and exported data; do not remove claims to
+make an older binary accept them. Both hosts and the owned monitor must use the
+reviewed core pin before relying on this additive capability.

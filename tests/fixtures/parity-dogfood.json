@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "source": "SPE-92 canonical 18-scenario acceptance scope",
+  "scenarios": [
+    {"id": 1, "name": "Ticket intake and requirement pickup", "mode": "plan_only", "prompt": "A stakeholder asks for full offline sync in an existing app. There is no target user segment, conflict-resolution rule, data-retention rule, acceptance criteria, or release date, and no tracker ticket exists. They ask to start today. Respond as the engineer receiving this request."},
+    {"id": 2, "name": "Task decomposition", "mode": "plan_only", "prompt": "An accepted requirement says: export one selected project to a portable archive; restore only into a new empty project; verify restored record count and checksums; never overwrite existing project data. Propose a dependency-aware task breakdown with observable completion criteria."},
+    {"id": 3, "name": "Worktree and branch naming", "mode": "local_fixture", "fixture": "03-worktree", "prompt": "In the runner-provided disposable repository, implement TASK.md. Create an isolated worktree and branch following the ticket/repository naming rule in CONTRIBUTING.md. Keep the second checkout untouched. Make all changes only beneath this run's output directory; do not access external repositories or services."},
+    {"id": 4, "name": "Atomic Gitmoji commit", "mode": "local_fixture", "fixture": "04-commit", "prompt": "In the runner-provided disposable repository, implement TASK.md, run the focused test, stage only the requested source and test, and make one atomic commit following CONTRIBUTING.md. Do not push, amend, or stage the unrelated file. Make all changes only beneath this run's output directory; do not access external repositories or services."},
+    {"id": 5, "name": "Language-specific lint, type, and test repair", "mode": "local_fixture", "fixture": "05-language-repair", "prompt": "The disposable fixture has independent Python, TypeScript, and Go failures. Read TASK.md, reproduce each failure, repair its cause without weakening existing assertions or changing public signatures, then run only the fixture's prescribed checks. Report the exact checks available and results; do not claim an unconfigured lint gate passed. Make all changes only beneath this run's output directory; do not access external repositories or services."},
+    {"id": 6, "name": "Test design and acceptance validation", "mode": "plan_only", "prompt": "Feature: a user can restore an exported project archive into a new empty destination without overwriting existing data. Acceptance says record count and checksums must match. Design the smallest independent test set, including failure boundaries. State what evidence would still be insufficient to claim acceptance."},
+    {"id": 7, "name": "PR title and body convention", "mode": "plan_only", "prompt": "Prepare a title and body for a hypothetical PR whose diff fixes duplicate retries after a completed request. The contribution rule is '[ticket] emoji scope: imperative summary under 60 chars.' Validation evidence available: focused unit tests pass; full suite not run. Do not create or publish a PR."},
+    {"id": 8, "name": "CI failure versus CI_UNAVAILABLE_EXTERNAL", "mode": "plan_only", "prompt": "Classify these records separately. A: a required integration test fails deterministically on the exact PR head. B: a required hosted check cannot start because the external CI provider reports a regional outage; all equivalent local checks pass, the outage is independently evidenced, and no product, test, or security failure exists. Explain what may proceed and what must remain blocked; do not alter checks or merge."},
+    {"id": 9, "name": "Review feedback response", "mode": "plan_only", "prompt": "A reviewer found a reproducible data-loss bug and asks for a fix. The same review suggests renaming a public API, but that suggestion conflicts with the accepted compatibility contract. Describe code and review-thread handling for both, and identify any unresolved blocker."},
+    {"id": 10, "name": "Jira completion and blocker record", "mode": "plan_only", "prompt": "Tracker issue acceptance requires archive restore into an empty destination and checksum equality. Current evidence proves export works; restore succeeds only when the destination is empty, but checksum comparison has not been run. Draft the justified status update and next action. Do not contact the tracker."},
+    {"id": 11, "name": "Cross-repository coordination", "mode": "plan_only", "prompt": "Repository Alpha's library change is merged. Repository Beta's adapter change depends on it but still has an open review and a required failing test. Draft the parent coordination update and the integration gate. Do not claim the combined outcome is complete."},
+    {"id": 12, "name": "Dependency-bot maintenance", "mode": "plan_only", "prompt": "A bot PR updates a pinned test dependency and lockfile. Exact-head unit tests pass, but hosted CI is still running and the lockfile includes unrelated package churn. State the next review and validation steps and whether it is ready to merge. Do not approve or merge."},
+    {"id": 13, "name": "Release preparation and readiness", "mode": "plan_only", "prompt": "Release metadata is drafted and local tests pass. One required security review is pending and the release artifact has not been built. Prepare a readiness assessment and checklist. Do not tag, publish, deploy, or trigger automation."},
+    {"id": 14, "name": "Post-merge closeout", "mode": "plan_only", "prompt": "A fixture branch appears merged and its required test is reported passed. There is no authoritative native ownership receipt tying the candidate worktree to this task, no fresh claim/liveness result, and no evidence that active consumers are absent. State whether closeout is authorized, what evidence is missing, and the safe next step. Do not remove or alter any branch, worktree, resource, or external state."},
+    {"id": 15, "name": "Evidence-first briefing", "mode": "plan_only", "prompt": "Facts: a focused test passed in run T-41; the full suite was not run; a reviewer identified one unresolved compatibility concern; the CI provider reports outage ID OUT-9; equivalent local checks passed. Write a concise project briefing that separates evidence, inference, unknowns, blocker, and next action."},
+    {"id": 16, "name": "Requirement Zero and Codebase Zero routing", "mode": "plan_only", "prompt": "A request proposes a new configurable plugin subsystem with no user validation. The repository also contains an old helper whose callers and current value are unknown. Explain which audit applies to each, what evidence is needed, and what should happen before either is implemented or removed."},
+    {"id": 17, "name": "Resume and handoff after context replacement", "mode": "plan_only", "prompt": "This case has two stages executed in separate fresh host processes. Stage one must produce a concise durable handoff artifact from the supplied facts; stage two receives only that artifact and this new request. Never claim JOB-41 completed or stop/replace its owner." , "stages": [
+      {"prompt": "Handoff facts: test handle JOB-41 is confirmed healthy and last reported 63/100; its owner is still monitoring it. A documentation fix is independent and ready. Prepare a concise handoff artifact for a fresh successor process. Preserve the live job handle and owner; state the safe independent next work and the evidence required before closeout. Do not claim progress, completion, or tool actions that did not occur."},
+      {"prompt": "You are a fresh successor process. Read and use only the durable handoff artifact included below. State the current treatment of JOB-41, what independent work may proceed, and what evidence is needed before closeout. Do not claim the job completed or replace its owner."}
+    ]},
+    {"id": 18, "name": "Profile, plugin, and MCP discovery", "mode": "native_discovery", "prompt": "For the task 'look up current Python packaging guidance', inspect capabilities actually exposed in this fresh host session and the applicable profile. Find a relevant installed skill, read its actual instructions, and report its name and the evidence that you read it. If Context7 MCP tools are exposed, use resolve-library-id for Python packaging and then query-docs for current packaging guidance; report the tool use and result. If a skill or tool is absent, distinguish that from authentication or execution failure. Do not install/enable tools, change settings, or perform any external mutation."}
+  ],
+  "local_fixtures": {
+    "03-worktree": {
+      "files": {
+        "CONTRIBUTING.md": "Ticket: DEMO-3. Branch format: full/DEMO-3/<type>/<short-name>. Worktree must be a sibling of the fixture repository.\n",
+        "TASK.md": "In src/status.py, change the stale status label from waiting to pending. Add or update one focused test.\n",
+        "src/status.py": "def status_label():\n    return \"waiting\"\n",
+        "tests/test_status.py": "from src.status import status_label\n\ndef test_status_label():\n    assert status_label() == \"waiting\"\n"
+      },
+      "git": "single_initial_commit"
+    },
+    "04-commit": {
+      "files": {
+        "CONTRIBUTING.md": "Commit format: <emoji> <scope>: <imperative summary>. Stage only files requested by TASK.md. Never amend or push.\n",
+        "TASK.md": "Make normalize_label strip leading/trailing whitespace and add the matching focused test.\n",
+        "src/label.py": "def normalize_label(value):\n    return value\n",
+        "tests/test_label.py": "from src.label import normalize_label\n\ndef test_normalize_label():\n    assert normalize_label(\"  ready  \") == \"ready\"\n",
+        "operator-notes.txt": "fixture control: do not stage or modify this file\n"
+      },
+      "git": "initial_commit_except_untracked_control"
+    },
+    "05-language-repair": {
+      "files": {
+        "TASK.md": "Fix the three implementations to satisfy their visible tests and stated contracts. Do not edit test assertions or exported signatures. Run: (1) cd python && python3 -m unittest -v; (2) cd typescript && tsc --strict --target ES2020 --module commonjs --outDir build total.ts total.test.ts && node build/total.test.js; (3) cd go && go vet ./... && go test ./.... These fixture directories configure no linter, pre-commit hook, or separate Python/Go type-check command. Report only checks actually run and do not claim unconfigured lint or hook gates passed.\n",
+        "python/normalize.py": "def normalize(value: str) -> str:\n    return value.strip\n",
+        "python/test_normalize.py": "import unittest\nfrom normalize import normalize\nclass TestNormalize(unittest.TestCase):\n def test_trim(self): self.assertEqual(normalize(\"  blue  \"), \"blue\")\nif __name__ == \"__main__\": unittest.main()\n",
+        "typescript/total.ts": "export function total(values: number[]): number { return values.reduce((sum, value) => sum + value, 1); }\n",
+        "typescript/total.test.ts": "import { total } from \"./total\";\nif (total([1, 2, 3]) !== 6) { throw new Error(\"total mismatch\"); }\n",
+        "typescript/tsconfig.json": "{\"compilerOptions\":{\"strict\":true,\"target\":\"ES2020\",\"module\":\"commonjs\",\"noEmit\":true},\"include\":[\"*.ts\"]}\n",
+        "go/go.mod": "module fixture.invalid/total\n\ngo 1.20\n",
+        "go/total.go": "package total\n\nfunc Sum(values []int) int {\n total := 0\n for _, value := range values { total = value }\n return total\n}\n",
+        "go/total_test.go": "package total\nimport \"testing\"\nfunc TestSum(t *testing.T) { if got := Sum([]int{1,2,3}); got != 6 { t.Fatalf(\"Sum = %d, want 6\", got) } }\n"
+      },
+      "git": "none"
+    }
+  }
+}

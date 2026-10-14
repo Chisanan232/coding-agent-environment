@@ -12,6 +12,7 @@ on:
       - 'scripts/storage-integration.py'
       - 'scripts/resource-policy-install.py'
       - 'scripts/launcher-install.py'
+      - 'scripts/parity-dogfood.py'
       - 'scripts/codex-routing.py'
       - 'scripts/verify-codex-routing.py'
       - 'tests/**'
@@ -30,6 +31,7 @@ on:
       - 'scripts/storage-integration.py'
       - 'scripts/resource-policy-install.py'
       - 'scripts/launcher-install.py'
+      - 'scripts/parity-dogfood.py'
       - 'scripts/codex-routing.py'
       - 'scripts/verify-codex-routing.py'
       - 'tests/**'
@@ -64,6 +66,7 @@ jobs:
           python3 tests/test-resource-adapters.py
           python3 tests/test-resource-policy-install.py
           python3 tests/test-launcher-runtime.py
+          python3 tests/test-parity-dogfood.py
   native-resource-wire:
     runs-on: macos-14
     steps:

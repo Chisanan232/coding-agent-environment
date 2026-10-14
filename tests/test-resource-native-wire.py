@@ -14,8 +14,6 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BINARY = Path("/Users/bryant/.codex/audit-baselines/lifecycle-20261014/rust-target/debug/glomeris")
-BINARY = Path(os.environ.get("GLOMERIS_NATIVE_WIRE_BINARY", str(DEFAULT_BINARY))).resolve()
 POLICY_REL = Path("Library/Application Support/Glomeris/resources/policy.json")
 AUTHORITY_REL = Path("Library/Application Support/Glomeris/autopilot.conf")
 
@@ -29,6 +27,13 @@ def load_module(name, path):
 
 
 INSTALLER = load_module("native_wire_resource_policy_installer", ROOT / "scripts/resource-policy-install.py")
+if "GLOMERIS_NATIVE_WIRE_BINARY" in os.environ:
+    BINARY = Path(os.environ["GLOMERIS_NATIVE_WIRE_BINARY"]).resolve()
+else:
+    installed, installation_status = INSTALLER.resolver.resolve(Path.home(), INSTALLER.storage.manifest())
+    # Optional local execution uses the same verified receipt as either host;
+    # CI's explicit required binary still fails if unavailable or mismatched.
+    BINARY = Path(installed) if installation_status == "verified_installation" else ROOT / "native-core/target/debug/glomeris"
 
 REVISION_PATTERN = re.compile(
     r"\brev\s*(?:(?:v\d+\.\d+\.\d+-\d+-g)?(?P<sha>[0-9a-f]{7,40})(?:-dirty)?)(?=[)\s]|$)"
