@@ -43,4 +43,7 @@ if [[ -f "${CODEX_HOME:-$HOME/.codex}/routing-owned-state.json" ]]; then
         --launch-check -- "${ARGS[@]+"${ARGS[@]}"}" "$@"
 fi
 
+if [[ -n "${CODING_AGENT_MANAGED_RESOURCE_ID:-}" || -n "${CODING_AGENT_MANAGED_RESOURCE_GENERATION:-}" ]]; then
+    exec "$HERE/coding-agent-resource" --host codex -- "$CODEX_BIN" "${ARGS[@]+"${ARGS[@]}"}" "$@"
+fi
 exec "$CODEX_BIN" "${ARGS[@]+"${ARGS[@]}"}" "$@"

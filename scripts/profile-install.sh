@@ -4,7 +4,8 @@
 #
 # What it does:
 #   1. Symlinks bin/coding-agent-profile, bin/coding-agent-profile-explain,
-#      bin/ca-claude, bin/ca-codex into ~/.local/bin (or $INSTALL_BIN_DIR).
+#      bin/ca-claude, bin/ca-codex, bin/coding-agent-resource into ~/.local/bin
+#      (or $INSTALL_BIN_DIR).
 #   2. For each profile directory under $CODING_AGENT_PROFILE_DIR that has a
 #      codex/config.toml, symlinks it to
 #      $CODEX_DIR/<profile-name>.config.toml (Codex only reads --profile
@@ -17,12 +18,17 @@
 #   ./scripts/profile-install.sh [--dry-run]
 #   ./scripts/profile-install.sh --global [--dry-run | --check]
 #   ./scripts/profile-install.sh --capabilities [--dry-run | --check | --remove]
+#   ./scripts/profile-install.sh --resource-policy [--dry-run | --check | --apply | --rollback]
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ "${1:-}" == "--storage" ]]; then
     shift
     exec python3 "$REPO_ROOT/scripts/storage-integration.py" "$@"
+fi
+if [[ "${1:-}" == "--resource-policy" ]]; then
+    shift
+    exec python3 "$REPO_ROOT/scripts/resource-policy-install.py" "$@"
 fi
 if [[ "${1:-}" == "--routing" ]]; then
     shift
@@ -426,7 +432,7 @@ link_codex_profile() {
 }
 
 info "installing launcher symlinks into $INSTALL_BIN_DIR"
-for tool in coding-agent-profile coding-agent-profile-explain ca-claude ca-codex; do
+for tool in coding-agent-profile coding-agent-profile-explain ca-claude ca-codex coding-agent-resource; do
     link_bin "$tool" || true
 done
 
@@ -443,4 +449,4 @@ fi
 
 info "done. Add $INSTALL_BIN_DIR to PATH if it isn't already, then run:"
 info "  coding-agent-profile --help"
-info "  ca-claude / ca-codex   (drop-in replacements for claude/codex under a profile root)"
+info "  ca-claude / ca-codex   (profile-aware host launchers with optional resource holds)"

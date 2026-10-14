@@ -531,5 +531,47 @@ class StorageIntegration(unittest.TestCase):
         self.assertEqual(resolver_core.resolve(stale_home, stale), ("", "outdated"))
 
 
+class RollingPinnedResolver(unittest.TestCase):
+    def setUp(self):
+        self.fixture=StorageIntegration();self.fixture.setUp()
+        self.home=self.fixture.home
+        self.pin,self.old,self.old_binary=self.fixture.create_installed_fixture(self.home)
+        self.base=self.home/storage.RUNTIME
+    def tearDown(self):self.fixture.tearDown()
+    def entry(self,revision,payload=b"new pinned runtime"):
+        checksum=hashlib.sha256(payload).hexdigest()
+        binary=self.base/"glomeris"/checksum/"bin/glomeris"
+        binary.parent.mkdir(parents=True,mode=0o700)
+        for directory in (binary.parent,binary.parents[1]):directory.chmod(0o700)
+        binary.write_bytes(payload);binary.chmod(0o755)
+        entry={"source_revision":revision,"binary_sha256":checksum,"path":str(binary)}
+        self.fixture.write_private_json(binary.parents[1]/"artifact.json",entry)
+        return entry,binary
+    def selection(self,current,previous):
+        self.fixture.write_private_json(self.fixture.receipt_path(),{"schema":1,"current":current,"previous":previous})
+    def test_mixed_host_pins_keep_both_exact_revisions_verified(self):
+        current,binary=self.entry("d"*40);self.selection(current,self.old)
+        self.assertEqual(resolver_core.resolve(self.home,self.pin),(str(self.old_binary),"verified_installation"))
+        self.assertEqual(resolver_core.resolve(self.home,dict(self.pin,revision="d"*40)),(str(binary),"verified_installation"))
+        self.assertEqual(resolver_core.resolve(self.home,dict(self.pin,revision="e"*40)),("","outdated"))
+    def test_matching_corrupt_current_never_falls_back(self):
+        current,binary=self.entry(self.pin["revision"]);self.selection(current,self.old)
+        binary.write_bytes(b"tampered")
+        self.assertEqual(resolver_core.resolve(self.home,self.pin),("","refused"))
+    def test_legacy_receipt_and_rollback_order(self):
+        self.assertEqual(resolver_core.resolve(self.home,self.pin)[1],"verified_installation")
+        current,_=self.entry("d"*40);self.selection(current,self.old)
+        self.assertEqual(resolver_core.resolve(self.home,self.pin)[1],"verified_installation")
+        self.selection(self.old,self.old)
+        self.assertEqual(resolver_core.resolve(self.home,dict(self.pin,revision="d"*40)),("","outdated"))
+        self.assertEqual(resolver_core.resolve(self.home,self.pin)[1],"verified_installation")
+    def test_malformed_other_slot_and_redirected_matching_artifact_refuse(self):
+        current,_=self.entry("d"*40);self.selection(current,{"source_revision":self.pin["revision"]})
+        self.assertEqual(resolver_core.resolve(self.home,self.pin),("","refused"))
+        self.selection(current,self.old)
+        self.old_binary.unlink();self.old_binary.symlink_to(Path(current["path"]))
+        self.assertEqual(resolver_core.resolve(self.home,self.pin),("","refused"))
+
+
 if __name__ == "__main__":
     unittest.main()
