@@ -87,3 +87,14 @@ Codex routing validator and its canonical role files. Existing regular wrappers
 in `~/.local/bin` are preserved. Use the installed private runtime launchers
 explicitly when existing aliases are not managed. Native launch without managed
 resource variables retains its previous behavior.
+
+Rolling upgrades retain exact verified current/previous artifacts. Deploy the
+reviewed resolver to both owned hosts before selecting the new core; then update
+both host pins. No artifact-directory search or corrupt-current fallback occurs.
+Rollback revokes managed authority first, restores old host pins, then restores
+engine selection and the owned monitor binding. Keep both immutable binaries
+and private backups until verification finishes.
+
+Interrupted rollback journals the observed policy state and restore intent.
+Only that exact pre-restore state or the expected restored result can resume;
+unexpected disappearance and user drift remain refusals.

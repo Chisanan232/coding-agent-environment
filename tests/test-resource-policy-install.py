@@ -31,11 +31,10 @@ class FakeNative:
         self.authority_path = home / installer_module.AUTHORITY_REL
         self.calls = []
         self.crash_after = None
+        self.crash_before = None
         self.crashed = False
         self.stored_at_override = None
-        self.default_policy = {"schema": 1, "classes": {"managed_generated": {
-            "idle_threshold_secs": 86400, "unattended": False}}, "max_actions": 3,
-            "max_bytes": installer_module.MAX_BYTES}
+        self.default_policy = copy.deepcopy(installer_module.CORE_DISABLED_POLICY)
         self.authority = self.report()
         self.authority["min_pressure"] = "CRITICAL"
         self.prior_authority = copy.deepcopy(self.authority)
@@ -65,6 +64,9 @@ class FakeNative:
             raise AssertionError("native core must use the selected home")
         args = command[1:]
         self.calls.append(tuple(args))
+        if args[:3] == ["resource", "policy", "apply"] and self.crash_before == "policy_apply":
+            self.crash_before = None
+            raise Crash("simulated interruption before native policy CAS")
         if args == ["resource", "policy", "show"]:
             value = self.default_policy
             if self.policy_path.exists():
@@ -93,10 +95,10 @@ class FakeNative:
                 self.policy_path.chmod(0o600)
                 self.default_policy = json.loads(raw)
             else:
-                self.policy_path.unlink(missing_ok=True)
-                self.default_policy = {"schema": 1, "classes": {"managed_generated": {
-                    "idle_threshold_secs": 86400, "unattended": False}}, "max_actions": 3,
-                    "max_bytes": installer_module.MAX_BYTES}
+                self.default_policy = copy.deepcopy(installer_module.CORE_DISABLED_POLICY)
+                self.policy_path.parent.mkdir(parents=True, exist_ok=True)
+                self.policy_path.write_text(json.dumps(self.default_policy, separators=(",", ":")))
+                self.policy_path.chmod(0o600)
             self.maybe_crash("policy_restore")
             return Result()
         if args[:3] == ["resource", "authority", "grant-managed"]:
@@ -166,7 +168,8 @@ class ResourcePolicyInstallTests(unittest.TestCase):
         self.assertEqual(inst.rollback(), "rolled back")
         self.assertTrue(inst.authority_path.is_file())
         self.assertEqual(inst.authority_path.read_text(), "canonical-revoked-envelope\n")
-        self.assertFalse(inst.policy_path.exists())
+        self.assertTrue(inst.policy_path.is_file())
+        self.assertEqual(json.loads(inst.policy_path.read_text()), installer_module.CORE_DISABLED_POLICY)
         self.assertEqual(inst.rollback(), "already rolled back")
 
     def test_existing_native_bytes_and_pressure_floor_are_preserved(self):
@@ -223,6 +226,91 @@ class ResourcePolicyInstallTests(unittest.TestCase):
             inst.rollback()
         self.native.crash_after = None
         self.assertEqual(self.install().rollback(), "rolled back")
+
+    def test_rollback_resumes_after_native_default_restore_before_journal_capture(self):
+        inst = self.install()
+        inst.apply()
+        self.native.crash_after = "policy_restore"
+        with self.assertRaises(Crash):
+            inst.rollback()
+        journal = json.loads(inst.journal_path.read_text())
+        self.assertEqual(journal["phase"], "ENV_RESTORED")
+        self.assertTrue(inst.policy_path.is_file())
+        self.assertEqual(json.loads(inst.policy_path.read_text()), installer_module.CORE_DISABLED_POLICY)
+        self.native.crash_after = None
+        self.assertEqual(self.install().rollback(), "rolled back")
+        self.assertEqual(json.loads(inst.policy_path.read_text()), installer_module.CORE_DISABLED_POLICY)
+
+    def test_env_restored_plan_resumes_after_prepared_policy_apply_without_policy_post(self):
+        self.native.crash_after = "policy_apply"
+        with self.assertRaises(Crash):
+            self.install().apply()
+        self.native.crash_after = None
+        inst = self.install()
+        original_save = inst.save
+
+        def crash_after_env_plan(journal):
+            original_save(journal)
+            if journal["phase"] == "ENV_RESTORED":
+                raise Crash("interrupted after rollback plan persisted")
+
+        inst.save = crash_after_env_plan
+        with self.assertRaises(Crash):
+            inst.rollback()
+        journal = json.loads(inst.journal_path.read_text())
+        self.assertEqual(journal["phase"], "ENV_RESTORED")
+        self.assertIsNone(journal["policy_post"])
+        self.assertTrue(journal["rollback_policy_restore_intent"])
+        self.assertEqual(journal["rollback_policy_before"], installer_module.snapshot(inst.policy_path))
+
+        self.assertEqual(self.install().rollback(), "rolled back")
+        self.assertEqual(json.loads(inst.policy_path.read_text()), installer_module.CORE_DISABLED_POLICY)
+
+    def test_env_restored_plan_resumes_from_prepared_before_any_native_write(self):
+        self.native.crash_before = "policy_apply"
+        with self.assertRaises(Crash):
+            self.install().apply()
+        inst = self.install()
+        original_save = inst.save
+
+        def crash_after_env_plan(journal):
+            original_save(journal)
+            if journal["phase"] == "ENV_RESTORED":
+                raise Crash("interrupted after rollback plan persisted")
+
+        inst.save = crash_after_env_plan
+        with self.assertRaises(Crash):
+            inst.rollback()
+        journal = json.loads(inst.journal_path.read_text())
+        self.assertEqual(journal["phase"], "ENV_RESTORED")
+        self.assertIsNone(journal["policy_post"])
+        self.assertFalse(journal["rollback_policy_restore_intent"])
+        self.assertFalse(journal["rollback_policy_before"]["exists"])
+        self.assertEqual(journal["rollback_policy_before"]["bytes_b64"], "")
+
+        self.assertEqual(self.install().rollback(), "rolled back")
+        self.assertFalse(inst.policy_path.exists())
+
+    def test_rollback_does_not_adopt_noncanonical_policy_drift_in_resume_phase(self):
+        inst = self.install()
+        inst.apply()
+        self.native.crash_after = "policy_restore"
+        with self.assertRaises(Crash):
+            inst.rollback()
+        inst.policy_path.unlink()
+        with self.assertRaisesRegex(ValueError, "changed outside this transaction"):
+            inst.rollback()
+
+        drift = copy.deepcopy(installer_module.CORE_DISABLED_POLICY)
+        drift["classes"]["managed_generated"]["idle_threshold_secs"] = 3600
+        inst.policy_path.write_text(json.dumps(drift))
+        inst.policy_path.chmod(0o600)
+        self.native.default_policy = drift
+        bytes_before = inst.policy_path.read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "changed outside this transaction"):
+            inst.rollback()
+        self.assertEqual(inst.policy_path.read_bytes(), bytes_before)
 
     def test_concurrent_drift_refuses_before_mutating_either_native_file(self):
         inst = self.install()

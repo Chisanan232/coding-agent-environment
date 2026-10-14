@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,7 +14,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BINARY = Path(os.environ.get("GLOMERIS_NATIVE_WIRE_BINARY", str(ROOT / "target/debug/glomeris"))).resolve()
+DEFAULT_BINARY = Path("/Users/bryant/.codex/audit-baselines/lifecycle-20261014/rust-target/debug/glomeris")
+BINARY = Path(os.environ.get("GLOMERIS_NATIVE_WIRE_BINARY", str(DEFAULT_BINARY))).resolve()
 POLICY_REL = Path("Library/Application Support/Glomeris/resources/policy.json")
 AUTHORITY_REL = Path("Library/Application Support/Glomeris/autopilot.conf")
 
@@ -28,6 +30,32 @@ def load_module(name, path):
 
 INSTALLER = load_module("native_wire_resource_policy_installer", ROOT / "scripts/resource-policy-install.py")
 
+REVISION_PATTERN = re.compile(
+    r"\brev\s*(?:(?:v\d+\.\d+\.\d+-\d+-g)?(?P<sha>[0-9a-f]{7,40})(?:-dirty)?)(?=[)\s]|$)"
+)
+
+
+def reported_revision(version):
+    match = REVISION_PATTERN.search(version)
+    if match is None:
+        raise ValueError("Glomeris version must report a git-describe or hexadecimal source revision")
+    return match.group("sha")
+
+
+class VersionRevisionFormatTests(unittest.TestCase):
+    def test_git_describe_and_shallow_sha_formats_require_a_revision(self):
+        self.assertEqual(reported_revision("glomeris 0.2.0 (dev build, rev v0.2.0-1168-g911563e)"),
+                         "911563e")
+        self.assertEqual(reported_revision("glomeris 0.2.0 (dev build, rev 911563e)"), "911563e")
+        for value in ("glomeris 0.2.0 (dev build)", "glomeris 0.2.0 (rev v0.2.0)",
+                      "glomeris 0.2.0 (rev 91156xz)"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                reported_revision(value)
+
+
+class NativeRestoreCrash(BaseException):
+    pass
+
 
 class NativeWireTests(unittest.TestCase):
     @classmethod
@@ -39,8 +67,13 @@ class NativeWireTests(unittest.TestCase):
         cls.binary_sha256 = hashlib.sha256(BINARY.read_bytes()).hexdigest()
         probe = subprocess.run([str(BINARY), "--version"], capture_output=True, text=True, timeout=10)
         cls.binary_version = (probe.stdout + probe.stderr).strip()
-        if not re.search(r"\brev v[0-9].*", cls.binary_version):
-            raise AssertionError(f"debug binary did not report its source revision: {cls.binary_version!r}")
+        cls.pin = INSTALLER.storage.manifest()
+        try:
+            source_revision = reported_revision(cls.binary_version)
+        except ValueError as exc:
+            raise AssertionError(f"debug binary did not report its source revision: {cls.binary_version!r}") from exc
+        if not cls.pin["revision"].startswith(source_revision):
+            raise AssertionError(f"binary revision {source_revision} does not match configured source pin")
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="glomeris-native-wire-")
@@ -65,20 +98,38 @@ class NativeWireTests(unittest.TestCase):
     def install_actual_adapter_bootstrap(self):
         scripts = self.home / ".claude/skills/engineering-runtime/scripts"
         scripts.mkdir(parents=True, mode=0o700)
-        # This test-only bootstrap accepts only the exact executable and revision
-        # captured above; the adapter's ordinary binary override env var is poison.
+        container = self.home / ".local/share/coding-agent-environment"
+        managed = container / "storage"
+        binary_dir = managed / "glomeris" / self.binary_sha256 / "bin"
+        binary_dir.mkdir(parents=True, mode=0o700)
+        for directory in (self.home / ".local", self.home / ".local/share", container,
+                          managed, managed / "glomeris", binary_dir.parent, binary_dir):
+            directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+            directory.chmod(0o700)
+        fixture_binary = binary_dir / "glomeris"
+        shutil.copyfile(BINARY, fixture_binary)
+        fixture_binary.chmod(0o755)
+        receipt = {"source_revision": self.pin["revision"], "binary_sha256": self.binary_sha256,
+                   "path": str(fixture_binary)}
+        for receipt_path in (managed / "storage-core.json", binary_dir.parent / "artifact.json"):
+            receipt_path.write_text(json.dumps(receipt, sort_keys=True) + "\n")
+            receipt_path.chmod(0o600)
+        self.assertEqual(INSTALLER.resolver.resolve(self.home, self.pin),
+                         (str(fixture_binary), "verified_installation"))
+        self.assertEqual(json.loads((managed / "storage-core.json").read_text())["source_revision"],
+                         self.pin["revision"])
+        # The actual resolver validates this fixture receipt, executable digest,
+        # private layout, and exact source pin before the adapter may launch.
         bootstrap = f'''#!/usr/bin/env python3
-import hashlib, pathlib, subprocess, sys
-binary = pathlib.Path({str(BINARY)!r})
-expected_hash = {self.binary_sha256!r}
-expected_version = {self.binary_version!r}
-actual_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
-probe = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=10)
-actual_version = (probe.stdout + probe.stderr).strip()
-if actual_hash != expected_hash or actual_version != expected_version:
-    raise SystemExit("test fixture refused binary digest/revision mismatch")
-print("export ENGINEERING_STORAGE_BIN=" + __import__("shlex").quote(str(binary)))
-print("export ENGINEERING_STORAGE_STATUS=verified_installation")
+import importlib.util, pathlib, shlex
+spec = importlib.util.spec_from_file_location("storage_resolver", {str(ROOT / '.claude/skills/engineering-runtime/scripts/storage.py')!r})
+resolver = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(resolver)
+binary, status = resolver.resolve(pathlib.Path.home(), {self.pin!r})
+if status != "verified_installation":
+    raise SystemExit("test fixture refused unverified executable receipt")
+print("export ENGINEERING_STORAGE_BIN=" + shlex.quote(binary))
+print("export ENGINEERING_STORAGE_STATUS=" + status)
 '''
         (scripts / "bootstrap.py").write_text(bootstrap)
 
@@ -157,6 +208,38 @@ print("export ENGINEERING_STORAGE_STATUS=verified_installation")
         self.assertEqual(restored_authority["allowed_kinds"], [])
         self.assertFalse(restored_authority["respond_to_alerts"])
         self.assertFalse(restored_authority["starts_unprompted"])
+        self.assertEqual(installer.rollback(), "already rolled back")
+
+    def test_real_native_absent_policy_restore_interruption_resumes(self):
+        policy_path = self.home / POLICY_REL
+        authority_path = self.home / AUTHORITY_REL
+        self.assertFalse(policy_path.exists())
+        self.assertFalse(authority_path.exists())
+        installer = INSTALLER.ResourcePolicyInstaller(self.home, BINARY)
+        self.assertEqual(installer.apply(), "installed")
+
+        def crash_after_real_restore(command, **kwargs):
+            result = subprocess.run(command, **kwargs)
+            if command[1:4] == ["resource", "policy", "restore"]:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                raise NativeRestoreCrash("interrupted after native policy CAS, before journal capture")
+            return result
+
+        installer.runner = crash_after_real_restore
+        with self.assertRaises(NativeRestoreCrash):
+            installer.rollback()
+        journal = json.loads(installer.journal_path.read_text())
+        self.assertEqual(journal["phase"], "ENV_RESTORED")
+        self.assertTrue(journal["rollback_policy_restore_intent"])
+        self.assertEqual(journal["rollback_policy_before"]["exists"], True)
+        self.assertTrue(policy_path.is_file())
+        self.assertEqual(json.loads(self.core("resource", "policy", "show").stdout),
+                         INSTALLER.CORE_DISABLED_POLICY)
+
+        installer.runner = subprocess.run
+        self.assertEqual(installer.rollback(), "rolled back")
+        self.assertEqual(json.loads(self.core("resource", "policy", "show").stdout),
+                         INSTALLER.CORE_DISABLED_POLICY)
         self.assertEqual(installer.rollback(), "already rolled back")
 
 

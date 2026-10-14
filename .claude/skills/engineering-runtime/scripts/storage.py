@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import stat
 
@@ -25,11 +26,25 @@ def resolve(home, pin):
                 raise ValueError("unowned storage state")
         regular(receipt_path)
         receipt = json.loads(receipt_path.read_text())
-        if isinstance(receipt, dict) and set(receipt) == {"schema", "current", "previous"} and receipt["schema"] == 1:
-            receipt = receipt["current"]
-        if not isinstance(receipt, dict) or set(receipt) != {"source_revision", "binary_sha256", "path"}:
-            raise ValueError("invalid receipt")
-        if receipt["source_revision"] != pin["revision"]:
+        if isinstance(receipt, dict) and set(receipt) == {"schema", "current", "previous"}:
+            if type(receipt["schema"]) is not int or receipt["schema"] != 1:
+                raise ValueError("invalid selection schema")
+            candidates = [receipt["current"]]
+            if receipt["previous"] is not None:
+                candidates.append(receipt["previous"])
+        else:
+            candidates = [receipt]
+        for entry in candidates:
+            if not isinstance(entry, dict) or set(entry) != {"source_revision", "binary_sha256", "path"}:
+                raise ValueError("invalid receipt")
+            revision, digest, selected_path = entry["source_revision"], entry["binary_sha256"], entry["path"]
+            if (not isinstance(revision, str) or re.fullmatch("[0-9a-f]{40}", revision) is None
+                    or not isinstance(digest, str) or re.fullmatch("[0-9a-f]{64}", digest) is None
+                    or selected_path != str(base / "glomeris" / digest / "bin/glomeris")):
+                raise ValueError("invalid selection metadata")
+        # Current wins; a corrupt matching artifact must not trigger fallback.
+        receipt = next((entry for entry in candidates if entry["source_revision"] == pin["revision"]), None)
+        if receipt is None:
             return "", "outdated"
         checksum = receipt["binary_sha256"]
         if not isinstance(checksum, str) or len(checksum) != 64 or any(c not in "0123456789abcdef" for c in checksum):

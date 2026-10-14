@@ -23,6 +23,12 @@ SCHEMA = 1
 MAX_ACTIONS = 3
 MAX_BYTES = 5368709120
 MAX_DURATION = 60
+CORE_DISABLED_POLICY = {
+    "schema": 1,
+    "classes": {"managed_generated": {"idle_threshold_secs": 86400, "unattended": False}},
+    "max_actions": 3,
+    "max_bytes": MAX_BYTES,
+}
 PHASES = {"PREPARED", "POLICY_APPLIED", "ENVELOPE_APPLIED", "COMPLETE",
           "ENV_RESTORED", "POLICY_RESTORED", "ROLLED_BACK"}
 
@@ -159,7 +165,13 @@ class ResourcePolicyInstaller:
         required = {"schema", "owner", "home", "pin_revision", "desired_policy_digest", "phase", "before",
                     "before_authority_report", "policy_post", "envelope_post", "rollback_policy_post",
                     "rollback_envelope_post"}
-        if (not isinstance(value, dict) or set(value) != required or value["schema"] != SCHEMA
+        rollback_fields = {"rollback_policy_before", "rollback_policy_restore_intent"}
+        if not isinstance(value, dict) or set(value) not in (required, required | rollback_fields):
+            raise ValueError("Invalid resource-policy journal fields")
+        if set(value) == required:
+            value["rollback_policy_before"] = None
+            value["rollback_policy_restore_intent"] = None
+        if (value["schema"] != SCHEMA
                 or value["owner"] != OWNER or value["home"] != str(self.home)
                 or value["pin_revision"] != self.pin["revision"]
                 or value["desired_policy_digest"] != self.desired_digest or value["phase"] not in PHASES):
@@ -167,9 +179,16 @@ class ResourcePolicyInstaller:
         if not isinstance(value["before"], dict) or set(value["before"]) != {"policy", "envelope"}:
             raise ValueError("Invalid original resource-policy snapshots")
         for entry in (value["before"]["policy"], value["before"]["envelope"], value["policy_post"],
-                      value["envelope_post"], value["rollback_policy_post"], value["rollback_envelope_post"]):
+                      value["envelope_post"], value["rollback_policy_post"], value["rollback_envelope_post"],
+                      value["rollback_policy_before"]):
             if entry is not None:
                 snapshot_bytes(entry)
+        if (value["rollback_policy_restore_intent"] is not None
+                and type(value["rollback_policy_restore_intent"]) is not bool):
+            raise ValueError("Invalid rollback policy restore intent")
+        if ((value["rollback_policy_before"] is None)
+                != (value["rollback_policy_restore_intent"] is None)):
+            raise ValueError("Incomplete rollback policy restore plan")
         if not isinstance(value["before_authority_report"], dict):
             raise ValueError("Invalid original Autopilot authority report")
         return value
@@ -229,7 +248,8 @@ class ResourcePolicyInstaller:
                            "phase": "PREPARED", "before": before,
                            "before_authority_report": authority_report, "policy_post": None,
                            "envelope_post": None, "rollback_policy_post": None,
-                           "rollback_envelope_post": None}
+                           "rollback_envelope_post": None, "rollback_policy_before": None,
+                           "rollback_policy_restore_intent": None}
                 self.save(journal)
             phase = journal["phase"]
             if phase == "COMPLETE":
@@ -337,14 +357,45 @@ class ResourcePolicyInstaller:
                 else:
                     raise ValueError("Autopilot no longer matches this transaction; authority preserved")
 
-            if same_snapshot(current_policy, before_policy):
-                policy_needs_restore = False
-            elif journal["policy_post"] is not None and same_snapshot(current_policy, journal["policy_post"]):
-                policy_needs_restore = True
-            elif journal["policy_post"] is None and self.policy_is_desired():
-                policy_needs_restore = True
+            if phase == "ENV_RESTORED":
+                plan_before = journal["rollback_policy_before"]
+                restore_intent = journal["rollback_policy_restore_intent"]
+                if plan_before is None:
+                    # Upgrade an interrupted pre-plan journal only from states
+                    # independently tied to this transaction; never infer from absence.
+                    if same_snapshot(current_policy, before_policy):
+                        plan_before, restore_intent = current_policy, False
+                    elif (journal["policy_post"] is not None
+                          and same_snapshot(current_policy, journal["policy_post"])):
+                        plan_before, restore_intent = current_policy, True
+                    elif journal["policy_post"] is None and self.policy_is_desired():
+                        plan_before, restore_intent = current_policy, True
+                    else:
+                        raise ValueError("Resource policy changed outside this transaction; current file preserved")
+                    journal["rollback_policy_before"] = plan_before
+                    journal["rollback_policy_restore_intent"] = restore_intent
+                    self.save(journal)
+                if same_snapshot(current_policy, plan_before):
+                    policy_needs_restore = restore_intent
+                else:
+                    completed_original = (before_policy["exists"]
+                                          and same_snapshot(current_policy, before_policy))
+                    completed_absent_default = (
+                        restore_intent and not before_policy["exists"] and current_policy["exists"]
+                        and self.observe_policy() == CORE_DISABLED_POLICY)
+                    if restore_intent and (completed_original or completed_absent_default):
+                        policy_needs_restore = False
+                    else:
+                        raise ValueError("Resource policy changed outside this transaction; current file preserved")
             else:
-                raise ValueError("Resource policy changed outside this transaction; current file preserved")
+                if same_snapshot(current_policy, before_policy):
+                    policy_needs_restore = False
+                elif journal["policy_post"] is not None and same_snapshot(current_policy, journal["policy_post"]):
+                    policy_needs_restore = True
+                elif journal["policy_post"] is None and self.policy_is_desired():
+                    policy_needs_restore = True
+                else:
+                    raise ValueError("Resource policy changed outside this transaction; current file preserved")
 
             # Check both native files before the first mutation so drift in either
             # cannot cause the other original file to be restored partially.
@@ -357,6 +408,9 @@ class ResourcePolicyInstaller:
                     expected.unlink(missing_ok=True)
                     original.unlink(missing_ok=True)
             journal["rollback_envelope_post"] = snapshot(self.authority_path)
+            if phase != "ENV_RESTORED":
+                journal["rollback_policy_before"] = current_policy
+                journal["rollback_policy_restore_intent"] = policy_needs_restore
             journal["phase"] = "ENV_RESTORED"
             self.save(journal)
 
