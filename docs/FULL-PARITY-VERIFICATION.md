@@ -155,7 +155,7 @@ must distinguish missing capabilities from authentication or execution failures.
 A capture made with an allowlist that hides a required skill or discovery tool is
 harness-invalid and cannot count as evidence that the host lacks that capability.
 
-Example operator commands (not run as part of this change):
+Example operator commands:
 
 ```sh
 python3 scripts/parity-dogfood.py --host claude --case 18
@@ -198,8 +198,8 @@ Earlier case-18 captures that hid required skills or discovery capabilities are
 superseded; failure under those artificial restrictions is not evidence that a
 host lacks installed skills or tools. The completed Codex case-18 attempt used an
 artificial tool restriction that blocked read-only `exec`, so it is not valid
-discovery evidence and is not repeated here. The corrected prompt now permits
-read-only inspection inside Codex's existing sandbox for a future operator run.
+discovery evidence. A corrected fresh run subsequently exercised read-only
+inspection inside Codex's existing sandbox, as recorded below.
 SPE-92 and full two-host parity remain
 **NOT_VERIFIED** pending independent anti-vacuity review and explicit
 reconciliation of every scenario.
@@ -230,3 +230,28 @@ was located afterward; that establishes availability only. No authorized
 invocation of that compiler or follow-up check occurred, so TypeScript
 validation remains unverified. No external toolchain install, fallback, model
 endpoint, or model-selection change was made.
+
+### Independent acceptance boundary
+
+The fourteen fresh Claude captures yielded four scoped passes (decomposition
+planning, real fixture worktree/naming, real atomic fixture commit, and PR draft)
+and ten partial results. The remaining four scenarios are quota-blocked.
+Planning drafts do not prove remote workflows or executed acceptance tests.
+
+Codex's corrected scenario 18 actually read an installed skill, inspected the
+existing reference profile, and used its exposed web interface to retrieve
+[official packaging guidance](https://packaging.python.org/en/latest/tutorials/packaging-projects/)
+and the [pyproject configuration guide](https://packaging.python.org/en/latest/guides/writing-pyproject-toml/).
+Context7 was configured in the opt-in profile but was not exposed in that
+session; neither its authentication nor its use is established by this result.
+
+Codex scenario 17 completed two fresh processes with distinct observed thread
+IDs. The persisted handoff matched its hash and was consumed verbatim by the
+successor. This proves the bounded fresh-process handoff only: the job handle
+in its stimulus was synthetic, so actual background-job recovery remains
+unverified. Native history confirms the existing model routing; no alternative
+model or endpoint was selected.
+
+These scoped results leave SPE-92 open. Complete native resource custody,
+positive production worktree retirement, and the remaining live workflow
+matrix are not established by response capture or installation drift checks.
