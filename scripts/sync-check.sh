@@ -4,7 +4,7 @@
 #
 # Defaults to reporting all tracked surfaces. --codex checks only managed
 # signal-first Codex state. Applying is owned by profile-install.sh --global.
-# Usage: ./scripts/sync-check.sh [--codex | --capabilities | --full-parity]
+# Usage: ./scripts/sync-check.sh [--codex | --capabilities | --resource-policy | --full-parity]
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,6 +17,8 @@ elif [[ "${1:-}" == "--launchers" && "$#" == 1 ]]; then
     exec "${CODING_AGENT_STATUSLINE_PYTHON:-python3}" "$REPO_ROOT/scripts/launcher-install.py" --home "$SYNC_HOME" --check
 elif [[ "${1:-}" == "--storage" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --storage --check
+elif [[ "${1:-}" == "--resource-policy" && "$#" == 1 ]]; then
+    exec bash "$REPO_ROOT/scripts/profile-install.sh" --resource-policy --check
 elif [[ "${1:-}" == "--routing" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --routing --check
 elif [[ "${1:-}" == "--codex" && "$#" == 1 ]]; then
@@ -29,7 +31,7 @@ elif [[ "${1:-}" == "--full-parity" && "$#" == 1 ]]; then
 elif [[ "${1:-}" == "--capabilities" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --capabilities --check
 elif [[ "$#" != 0 ]]; then
-    echo 'Usage: sync-check.sh [--codex | --capabilities | --full-parity]' >&2
+    echo 'Usage: sync-check.sh [--codex | --capabilities | --resource-policy | --full-parity]' >&2
     exit 2
 fi
 

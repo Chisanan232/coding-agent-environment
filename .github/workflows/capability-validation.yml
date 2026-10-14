@@ -10,6 +10,8 @@ on:
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
       - 'scripts/storage-integration.py'
+      - 'scripts/resource-policy-install.py'
+      - 'scripts/launcher-install.py'
       - 'scripts/codex-routing.py'
       - 'scripts/verify-codex-routing.py'
       - 'tests/**'
@@ -26,6 +28,8 @@ on:
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
       - 'scripts/storage-integration.py'
+      - 'scripts/resource-policy-install.py'
+      - 'scripts/launcher-install.py'
       - 'scripts/codex-routing.py'
       - 'scripts/verify-codex-routing.py'
       - 'tests/**'
@@ -57,3 +61,37 @@ jobs:
           python3 tests/test-statusline-install.py
           python3 tests/test-profile-statusline.py
           python3 tests/test-permission-governance.py
+          python3 tests/test-resource-adapters.py
+          python3 tests/test-resource-policy-install.py
+          python3 tests/test-launcher-runtime.py
+  native-resource-wire:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Read pinned shared engine revision
+        id: pin
+        run: |
+          python3 - <<'PYCODE'
+          import json, os, re
+          pin = json.load(open('codex/storage-core.json'))
+          assert pin['repository'] == 'https://github.com/Chisanan232/glomeris'
+          assert re.fullmatch('[0-9a-f]{40}', pin['revision'])
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write('revision=' + pin['revision'] + '\n')
+          PYCODE
+      - uses: actions/checkout@v4
+        with:
+          repository: Chisanan232/glomeris
+          ref: ${{ steps.pin.outputs.revision }}
+          path: native-core
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build exact pinned core and validate native wire
+        env:
+          CARGO_INCREMENTAL: '0'
+          CARGO_PROFILE_DEV_DEBUG: '0'
+        run: |
+          cargo build --locked --manifest-path native-core/Cargo.toml --bin glomeris --target-dir "$RUNNER_TEMP/core-target"
+          GLOMERIS_NATIVE_WIRE_BINARY="$RUNNER_TEMP/core-target/debug/glomeris" python3 tests/test-resource-native-wire.py
