@@ -235,6 +235,7 @@ class Closeout(unittest.TestCase):
         self.assertEqual(self.run_helper().returncode,2)
         self.assertEqual(list(outside.iterdir()),[])
         self.state.unlink();self.state.mkdir(mode=0o755)
+        self.state.chmod(0o755)  # Exercise unsafe permissions even under a private umask.
         self.assertEqual(self.run_helper().returncode,2)
         self.assertEqual(list(self.state.iterdir()),[])
 
