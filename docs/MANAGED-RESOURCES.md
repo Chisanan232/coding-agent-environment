@@ -81,6 +81,15 @@ restore the transaction snapshots. `scripts/sync-check.sh --resource-policy`
 verifies effective state. The installer keeps a private resumable journal and
 refuses user drift. No global Cargo or temporary-directory override is applied.
 
+After an explicitly supported core upgrade, `--check` may report that a policy
+receipt needs pin rebinding. `--apply` rebinds only a completed transaction whose
+policy and authority still exactly match its post-installation snapshots and
+whose current selected runtime is verified. It changes journal metadata only;
+the original rollback snapshots remain intact. Rebound schema-2 receipts retain
+the revision chain and prior journal digest. Interrupted transactions, unknown
+upgrade paths, changed policies, and native drift remain refusals. Older
+installers reject rebound receipts rather than silently adopting them.
+
 `python3 scripts/launcher-install.py` installs the complete reviewed launcher
 runtime under `~/.local/lib/coding-agent-environment/`, including the unchanged
 Codex routing validator and its canonical role files. Existing regular wrappers

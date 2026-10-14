@@ -184,6 +184,76 @@ print("export ENGINEERING_STORAGE_STATUS=" + status)
         self.assertFalse(record["producer"]["closed_consumers"])
         self.assertIsNone(record["sealed"], "native exposure permanently prevents automatic sealing")
 
+    def test_core_export_retains_independent_native_consumer_copy(self):
+        created, artifact = self.create_produced_generation()
+        destination = self.root / "consumer-artifact.o"
+        source_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        result = self.core("resource", "export", created["id"], created["generation"],
+                           "--artifact", "artifact.o", "--destination", destination)
+        self.assertEqual(result.returncode, 0)
+        self.assertNotEqual(destination.stat().st_ino, artifact.stat().st_ino)
+        consumer = subprocess.run(
+            [sys.executable, "-c", "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())",
+             str(destination)], env=self.env, capture_output=True, text=True, check=True)
+        self.assertEqual(consumer.stdout.strip(), source_hash)
+        record_path = self.home / "Library/Application Support/Glomeris/resources/records" / f"{created['id']}.json"
+        record = json.loads(record_path.read_text())
+        self.assertTrue(record["producer"]["closed_consumers"])
+        self.assertTrue(record["read_claims"][-1]["ended"])
+        self.assertTrue(record["read_claims"][-1]["exported"])
+        self.assertNotEqual(self.core("resource", "export", created["id"], created["generation"],
+                                   "--artifact", "artifact.o", "--destination", destination,
+                                   check=False).returncode, 0)
+        self.assertEqual(hashlib.sha256(destination.read_bytes()).hexdigest(), source_hash)
+
+    def test_real_native_completed_pin_rebind_preserves_authority_and_rollback(self):
+        self.install_actual_adapter_bootstrap()
+        installer = INSTALLER.ResourcePolicyInstaller(self.home, BINARY)
+        self.assertEqual(installer.apply(), "installed")
+        journal = json.loads(installer.journal_path.read_text())
+        journal["pin_revision"] = "f98389017b8ea52035d25bb21598711fd5f882a0"
+        INSTALLER.storage.atomic_json(installer.journal_path, journal)
+        before = {p: p.read_bytes() for p in (installer.policy_path, installer.authority_path)}
+        original_before = journal["before"]
+        fixture_binary, status = INSTALLER.resolver.resolve(self.home, self.pin)
+        self.assertEqual(status, "verified_installation")
+        installer.binary = Path(fixture_binary)
+        self.assertEqual(installer.apply(), "pin rebound")
+        rebound = json.loads(installer.journal_path.read_text())
+        self.assertEqual(rebound["before"], original_before)
+        self.assertEqual(rebound["schema"], 2)
+        self.assertEqual(rebound["pin_revision"], self.pin["revision"])
+        for path, raw in before.items():
+            self.assertEqual(path.read_bytes(), raw)
+        self.assertEqual(installer.apply(), "already installed")
+        self.assertEqual(installer.inspect(), 0)
+        self.assertEqual(installer.rollback(), "rolled back")
+        self.assertEqual(json.loads(self.core("resource", "policy", "show").stdout),
+                         INSTALLER.CORE_DISABLED_POLICY)
+        self.assertFalse(json.loads(self.core("autopilot", "show", "--json").stdout)["enabled"])
+
+    def test_native_rebind_refuses_previous_receipt_fallback(self):
+        self.install_actual_adapter_bootstrap()
+        installer = INSTALLER.ResourcePolicyInstaller(self.home, BINARY)
+        installer.apply()
+        journal = json.loads(installer.journal_path.read_text())
+        journal["pin_revision"] = "f98389017b8ea52035d25bb21598711fd5f882a0"
+        INSTALLER.storage.atomic_json(installer.journal_path, journal)
+        selection_path = self.home / INSTALLER.storage.RUNTIME / "storage-core.json"
+        valid = json.loads(selection_path.read_text())
+        invalid = dict(valid, source_revision="0" * 40)
+        INSTALLER.storage.atomic_json(selection_path, {"schema": 1, "current": invalid, "previous": valid})
+        resolved, status = INSTALLER.resolver.resolve(self.home, self.pin)
+        self.assertEqual(status, "verified_installation")
+        self.assertEqual(resolved, valid["path"], "general resolver deliberately permits verified previous")
+        installer.binary = Path(valid["path"])
+        paths = (installer.journal_path, installer.policy_path, installer.authority_path)
+        before = {path: path.read_bytes() for path in paths}
+        for operation in (installer.inspect, installer.apply):
+            with self.assertRaisesRegex(ValueError, "Current.*receipt"):
+                operation()
+            self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
     def test_resource_policy_installer_cas_apply_check_and_rollback_absent_policy(self):
         policy_path = self.home / POLICY_REL
         authority_path = self.home / AUTHORITY_REL
