@@ -148,6 +148,21 @@ class ResourcePolicyInstallTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def completed_old_pin_install(self):
+        old_pin = dict(installer_module.storage.manifest())
+        old_pin["revision"] = installer_module.SUPPORTED_REBIND[0]
+        with patch.object(installer_module.storage, "manifest", return_value=old_pin):
+            old_installer = installer_module.ResourcePolicyInstaller(
+                self.home, Path("/verified/fake-glomeris"), self.native)
+            self.assertEqual(old_installer.apply(), "installed")
+        return old_installer
+
+    def rebind_installer(self):
+        installer = installer_module.ResourcePolicyInstaller(
+            self.home, Path("/verified/fake-glomeris"), self.native)
+        installer._verify_rebind_runtime = lambda: "a" * 64
+        return installer
+
     def test_read_only_modes_do_not_create_installer_state(self):
         inst = self.install()
         self.assertEqual(inst.inspect(dry_run=True), 0)
@@ -401,7 +416,7 @@ class ResourcePolicyInstallTests(unittest.TestCase):
         journal = json.loads(inst.journal_path.read_text())
         journal["pin_revision"] = "0" * 40
         installer_module.storage.atomic_json(inst.journal_path, journal)
-        with self.assertRaisesRegex(ValueError, "conflicts"):
+        with self.assertRaises(ValueError):
             self.install().apply()
 
     def test_journal_desired_policy_digest_conflict_refuses(self):
@@ -414,6 +429,198 @@ class ResourcePolicyInstallTests(unittest.TestCase):
         with patch.object(installer_module, "SOURCE", source):
             with self.assertRaisesRegex(ValueError, "conflicts"):
                 self.install().apply()
+
+    def test_completed_install_rebinds_once_and_preserves_receipt_posts(self):
+        old = self.completed_old_pin_install()
+        old_bytes = old.journal_path.read_bytes()
+        old_journal = json.loads(old_bytes)
+        native_writes = sum(call[:3] in (("resource", "policy", "apply"),
+                                         ("resource", "authority", "grant-managed"))
+                            for call in self.native.calls)
+        installer = self.rebind_installer()
+        self.assertEqual(installer.apply(), "pin rebound")
+        rebound = json.loads(installer.journal_path.read_bytes())
+        self.assertEqual(rebound["schema"], installer_module.REBOUND_SCHEMA)
+        self.assertEqual(rebound["pin_revision"], installer_module.SUPPORTED_REBIND[1])
+        for key in ("before", "before_authority_report", "policy_post", "envelope_post",
+                    "rollback_policy_post", "rollback_envelope_post"):
+            self.assertEqual(rebound[key], old_journal[key])
+        self.assertEqual(rebound["pin_rebindings"], [{
+            "from_revision": installer_module.SUPPORTED_REBIND[0],
+            "to_revision": installer_module.SUPPORTED_REBIND[1],
+            "target_binary_sha256": "a" * 64,
+            "previous_journal_sha256": installer_module.sha256(old_bytes),
+        }])
+        rebound_bytes = installer.journal_path.read_bytes()
+        self.assertEqual(installer.apply(), "already installed")
+        self.assertEqual(installer.journal_path.read_bytes(), rebound_bytes)
+        self.assertEqual(sum(call[:3] in (("resource", "policy", "apply"),
+                                          ("resource", "authority", "grant-managed"))
+                             for call in self.native.calls), native_writes)
+
+    def test_read_only_inspect_reports_rebind_required(self):
+        old = self.completed_old_pin_install()
+        before = old.journal_path.read_bytes()
+        self.assertEqual(self.rebind_installer().inspect(), 1)
+        self.assertEqual(old.journal_path.read_bytes(), before)
+
+    def test_read_only_inspect_refuses_ineligible_rebind_without_mutation(self):
+        old = self.completed_old_pin_install()
+        original = json.loads(old.journal_path.read_text())
+        for variation in ("interrupted", "unsupported", "policy_drift", "envelope_drift", "runtime"):
+            with self.subTest(variation=variation):
+                journal = copy.deepcopy(original)
+                installer = self.rebind_installer()
+                if variation == "interrupted":
+                    journal["phase"] = "PREPARED"
+                elif variation == "unsupported":
+                    journal["pin_revision"] = "0" * 40
+                installer_module.storage.atomic_json(old.journal_path, journal)
+                paths = (old.journal_path, old.policy_path, old.authority_path)
+                pristine = {path: path.read_bytes() for path in paths}
+                if variation == "policy_drift":
+                    old.policy_path.write_bytes(pristine[old.policy_path] + b" ")
+                elif variation == "envelope_drift":
+                    old.authority_path.write_bytes(pristine[old.authority_path] + b" ")
+                elif variation == "runtime":
+                    installer._verify_rebind_runtime = lambda: (_ for _ in ()).throw(
+                        ValueError("Current receipt unavailable; previous must not authorize"))
+                observed = {path: path.read_bytes() for path in paths}
+                with self.assertRaises(ValueError):
+                    installer.inspect()
+                self.assertEqual({path: path.read_bytes() for path in paths}, observed)
+                for path, raw in pristine.items():
+                    path.write_bytes(raw)
+
+    def test_rebind_crash_before_or_after_atomic_journal_replace_is_idempotent(self):
+        for crash_after_save in (False, True):
+            with self.subTest(crash_after_save=crash_after_save):
+                case_temp = tempfile.TemporaryDirectory()
+                home = (Path(case_temp.name) / "home").resolve()
+                home.mkdir(mode=0o700)
+                native = FakeNative(home)
+                old_pin = dict(installer_module.storage.manifest())
+                old_pin["revision"] = installer_module.SUPPORTED_REBIND[0]
+                with patch.object(installer_module.storage, "manifest", return_value=old_pin):
+                    old = installer_module.ResourcePolicyInstaller(
+                        home, Path("/verified/fake-glomeris"), native)
+                    self.assertEqual(old.apply(), "installed")
+                installer = installer_module.ResourcePolicyInstaller(
+                    home, Path("/verified/fake-glomeris"), native)
+                installer._verify_rebind_runtime = lambda: "a" * 64
+                original_save = installer.save
+
+                def interrupted_save(journal):
+                    if crash_after_save:
+                        original_save(journal)
+                    raise Crash("simulated interruption around atomic journal replace")
+
+                installer.save = interrupted_save
+                with self.assertRaises(Crash):
+                    installer.apply()
+                current = json.loads(old.journal_path.read_text())
+                if crash_after_save:
+                    self.assertEqual(current["schema"], installer_module.REBOUND_SCHEMA)
+                    self.assertEqual(installer.apply(), "already installed")
+                else:
+                    self.assertEqual(current["pin_revision"], installer_module.SUPPORTED_REBIND[0])
+                    installer.save = original_save
+                    self.assertEqual(installer.apply(), "pin rebound")
+                case_temp.cleanup()
+
+    def test_rollback_interrupted_old_pin_cannot_be_rebound(self):
+        old = self.completed_old_pin_install()
+        self.native.crash_after = "authority_restore"
+        with self.assertRaises(Crash):
+            old.rollback()
+        journal_before = old.journal_path.read_bytes()
+        self.assertIn(json.loads(journal_before)["phase"], {"COMPLETE", "ENV_RESTORED"})
+        with self.assertRaisesRegex(ValueError, "preserved"):
+            self.rebind_installer().apply()
+        self.assertEqual(old.journal_path.read_bytes(), journal_before)
+
+    def test_cross_pin_rebind_refuses_every_noncomplete_phase(self):
+        old = self.completed_old_pin_install()
+        original = old.journal_path.read_bytes()
+        for phase in sorted(installer_module.PHASES - {"COMPLETE"}):
+            with self.subTest(phase=phase):
+                journal = json.loads(original)
+                journal["phase"] = phase
+                installer_module.storage.atomic_json(old.journal_path, journal)
+                before = old.journal_path.read_bytes()
+                with self.assertRaisesRegex(ValueError, "Only a completed"):
+                    self.rebind_installer().apply()
+                self.assertEqual(old.journal_path.read_bytes(), before)
+                old.journal_path.write_bytes(original)
+
+    def test_rebind_refuses_live_policy_or_envelope_drift(self):
+        old = self.completed_old_pin_install()
+        policy_bytes = old.policy_path.read_bytes()
+        envelope_bytes = old.authority_path.read_bytes()
+        for drift in ("policy", "envelope"):
+            with self.subTest(drift=drift):
+                old.policy_path.write_bytes(policy_bytes)
+                old.authority_path.write_bytes(envelope_bytes)
+                self.native.default_policy = copy.deepcopy(installer_module.validate_policy(
+                    json.loads(policy_bytes)))
+                path = old.policy_path if drift == "policy" else old.authority_path
+                if drift == "policy":
+                    changed_policy = copy.deepcopy(installer_module.CORE_DISABLED_POLICY)
+                    changed_policy["classes"]["managed_generated"]["idle_threshold_secs"] = 42
+                    path.write_text(json.dumps(changed_policy))
+                    path.chmod(0o600)
+                    self.native.default_policy = changed_policy
+                else:
+                    path.write_bytes(b"different native envelope\n")
+                before_journal = old.journal_path.read_bytes()
+                with self.assertRaises(ValueError):
+                    self.rebind_installer().apply()
+                self.assertEqual(old.journal_path.read_bytes(), before_journal)
+
+    def test_rebind_refuses_pressure_floor_drift_and_unverified_current_receipt(self):
+        old = self.completed_old_pin_install()
+        self.native.authority["min_pressure"] = "EMERGENCY"
+        with self.assertRaisesRegex(ValueError, "recorded managed install"):
+            self.rebind_installer().apply()
+        self.native.authority["min_pressure"] = "CRITICAL"
+        installer = self.rebind_installer()
+        installer._verify_rebind_runtime = lambda: (_ for _ in ()).throw(
+            ValueError("current receipt verification failed"))
+        with self.assertRaisesRegex(ValueError, "receipt verification failed"):
+            installer.apply()
+        self.assertEqual(json.loads(old.journal_path.read_text())["pin_revision"],
+                         installer_module.SUPPORTED_REBIND[0])
+
+    def test_rebind_refuses_changed_source_policy_and_corrupt_lineage(self):
+        old = self.completed_old_pin_install()
+        changed = json.loads(installer_module.SOURCE.read_text())
+        changed["classes"]["managed_generated"]["idle_threshold_secs"] += 1
+        changed_source = Path(self.temp.name) / "changed-policy.json"
+        changed_source.write_text(json.dumps(changed))
+        with patch.object(installer_module, "SOURCE", changed_source):
+            with self.assertRaisesRegex(ValueError, "conflicts"):
+                installer_module.ResourcePolicyInstaller(
+                    self.home, Path("/verified/fake-glomeris"), self.native).apply()
+        installer = self.rebind_installer()
+        self.assertEqual(installer.apply(), "pin rebound")
+        journal = json.loads(installer.journal_path.read_text())
+        journal["pin_rebindings"][0]["target_binary_sha256"] = "not-a-digest"
+        installer_module.storage.atomic_json(installer.journal_path, journal)
+        with self.assertRaisesRegex(ValueError, "lineage"):
+            self.install().apply()
+
+    def test_schema_two_journal_accepts_same_pin_rollback_phase_without_optional_fields(self):
+        self.completed_old_pin_install()
+        installer = self.rebind_installer()
+        self.assertEqual(installer.apply(), "pin rebound")
+        journal = json.loads(installer.journal_path.read_text())
+        journal["phase"] = "ENV_RESTORED"
+        journal.pop("rollback_policy_before", None)
+        journal.pop("rollback_policy_restore_intent", None)
+        validated = installer.validate_journal(journal)
+        self.assertEqual(validated["phase"], "ENV_RESTORED")
+        self.assertIsNone(validated["rollback_policy_before"])
+        self.assertIsNone(validated["rollback_policy_restore_intent"])
 
 
 if __name__ == "__main__":

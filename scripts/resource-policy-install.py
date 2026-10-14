@@ -20,6 +20,9 @@ POLICY_REL = Path("Library/Application Support/Glomeris/resources/policy.json")
 AUTHORITY_REL = Path("Library/Application Support/Glomeris/autopilot.conf")
 OWNER = "coding-agent-environment:resource-policy:v1"
 SCHEMA = 1
+REBOUND_SCHEMA = 2
+SUPPORTED_REBIND = ("f98389017b8ea52035d25bb21598711fd5f882a0",
+                   "839dbd518b9a1d56096bb6b8a0b427d2c660c88f")
 MAX_ACTIONS = 3
 MAX_BYTES = 5368709120
 MAX_DURATION = 60
@@ -161,23 +164,42 @@ class ResourcePolicyInstaller:
     def capture(self):
         return {"policy": snapshot(self.policy_path), "envelope": snapshot(self.authority_path)}
 
-    def validate_journal(self, value):
+    def validate_journal(self, value, check_pin=True):
         required = {"schema", "owner", "home", "pin_revision", "desired_policy_digest", "phase", "before",
                     "before_authority_report", "policy_post", "envelope_post", "rollback_policy_post",
                     "rollback_envelope_post"}
         rollback_fields = {"rollback_policy_before", "rollback_policy_restore_intent"}
-        if not isinstance(value, dict) or set(value) not in (required, required | rollback_fields):
+        rebind_fields = {"pin_rebindings"}
+        allowed = (required, required | rollback_fields, required | rebind_fields,
+                   required | rollback_fields | rebind_fields)
+        if not isinstance(value, dict) or set(value) not in allowed:
             raise ValueError("Invalid resource-policy journal fields")
-        if set(value) == required:
+        if type(value.get("schema")) is not int or value["schema"] not in (SCHEMA, REBOUND_SCHEMA):
+            raise ValueError("Unsupported resource-policy journal schema")
+        if (value["schema"] == SCHEMA and "pin_rebindings" in value
+                or value["schema"] == REBOUND_SCHEMA and "pin_rebindings" not in value):
+            raise ValueError("Resource-policy journal schema and rebind history disagree")
+        if value["schema"] == REBOUND_SCHEMA:
+            self.validate_pin_rebindings(value["pin_rebindings"], value["pin_revision"])
+        if set(value) in (required, required | rebind_fields):
             value["rollback_policy_before"] = None
             value["rollback_policy_restore_intent"] = None
-        if (value["schema"] != SCHEMA
+        if (not isinstance(value["pin_revision"], str)
+                or len(value["pin_revision"]) != 40
+                or any(char not in "0123456789abcdef" for char in value["pin_revision"])
+                or not isinstance(value["desired_policy_digest"], str)
+                or len(value["desired_policy_digest"]) != 64
+                or any(char not in "0123456789abcdef" for char in value["desired_policy_digest"])
+                or not isinstance(value["owner"], str) or not isinstance(value["home"], str)
+                or not isinstance(value["phase"], str)
                 or value["owner"] != OWNER or value["home"] != str(self.home)
-                or value["pin_revision"] != self.pin["revision"]
+                or check_pin and value["pin_revision"] != self.pin["revision"]
                 or value["desired_policy_digest"] != self.desired_digest or value["phase"] not in PHASES):
             raise ValueError("Resource-policy journal conflicts with this home, source pin, or desired policy")
         if not isinstance(value["before"], dict) or set(value["before"]) != {"policy", "envelope"}:
             raise ValueError("Invalid original resource-policy snapshots")
+        if any(value["before"][key] is None for key in ("policy", "envelope")):
+            raise ValueError("Original resource-policy snapshots are missing")
         for entry in (value["before"]["policy"], value["before"]["envelope"], value["policy_post"],
                       value["envelope_post"], value["rollback_policy_post"], value["rollback_envelope_post"],
                       value["rollback_policy_before"]):
@@ -189,13 +211,46 @@ class ResourcePolicyInstaller:
         if ((value["rollback_policy_before"] is None)
                 != (value["rollback_policy_restore_intent"] is None)):
             raise ValueError("Incomplete rollback policy restore plan")
-        if not isinstance(value["before_authority_report"], dict):
+        prior = value["before_authority_report"]
+        prior_required = {"enabled", "allowed_kinds", "ask_preauthorizations", "max_actions", "max_bytes",
+                          "max_duration_secs", "min_pressure", "respond_to_alerts", "starts_unprompted",
+                          "stored_at"}
+        if (not isinstance(prior, dict) or not prior_required.issubset(prior)
+                or any(type(prior[key]) is not bool for key in ("enabled", "respond_to_alerts", "starts_unprompted"))
+                or any(not isinstance(prior[key], list) or any(not isinstance(item, str) for item in prior[key])
+                       for key in ("allowed_kinds", "ask_preauthorizations"))
+                or any(type(prior[key]) is not int for key in ("max_actions", "max_bytes", "max_duration_secs"))
+                or prior["min_pressure"] is not None and not isinstance(prior["min_pressure"], str)
+                or prior["stored_at"] != str(self.authority_path)):
             raise ValueError("Invalid original Autopilot authority report")
         return value
 
-    def read_journal(self):
+    @staticmethod
+    def validate_pin_rebindings(entries, final_revision):
+        if not isinstance(entries, list) or not entries:
+            raise ValueError("Invalid resource-policy pin rebind history")
+        previous = None
+        for entry in entries:
+            if (not isinstance(entry, dict)
+                    or set(entry) != {"from_revision", "to_revision", "target_binary_sha256",
+                                      "previous_journal_sha256"}
+                    or (entry["from_revision"], entry["to_revision"]) != SUPPORTED_REBIND
+                    or not isinstance(entry["target_binary_sha256"], str)
+                    or len(entry["target_binary_sha256"]) != 64
+                    or any(char not in "0123456789abcdef" for char in entry["target_binary_sha256"])
+                    or not isinstance(entry["previous_journal_sha256"], str)
+                    or len(entry["previous_journal_sha256"]) != 64
+                    or any(char not in "0123456789abcdef" for char in entry["previous_journal_sha256"])):
+                raise ValueError("Invalid resource-policy pin rebind lineage")
+            if previous is not None and entry["from_revision"] != previous:
+                raise ValueError("Broken resource-policy pin rebind lineage")
+            previous = entry["to_revision"]
+        if previous != final_revision:
+            raise ValueError("Resource-policy pin rebind lineage does not end at the pinned revision")
+
+    def read_journal(self, check_pin=True):
         value = storage.read_private_json(self.journal_path)
-        return None if value is None else self.validate_journal(value)
+        return None if value is None else self.validate_journal(value, check_pin=check_pin)
 
     def save(self, journal):
         storage.atomic_json(self.journal_path, journal)
@@ -235,12 +290,80 @@ class ResourcePolicyInstaller:
     def policy_is_desired(self):
         return self.observe_policy() == self.desired
 
+    def _verify_rebind_runtime(self):
+        """Return the hash of the verified current runtime receipt's binary."""
+        _old_revision, target_revision = SUPPORTED_REBIND
+        if self.pin.get("revision") != target_revision:
+            raise ValueError("No supported policy journal pin rebind exists for this source revision")
+        receipt_path = self.home / storage.RUNTIME / "storage-core.json"
+        current, _previous = storage.read_selection(receipt_path)
+        if current is None or current["source_revision"] != target_revision:
+            raise ValueError("Current Glomeris storage receipt does not match the target source pin")
+        if storage.artifact_state(current, receipt_path.parent) != "installed":
+            raise ValueError("Current Glomeris runtime receipt failed artifact verification")
+        resolved, status = resolver.resolve(self.home, self.pin)
+        if status != "verified_installation" or Path(resolved) != Path(current["path"]):
+            raise ValueError("Current pinned Glomeris runtime did not resolve from its verified receipt")
+        if Path(resolved) != self.binary:
+            raise ValueError("Installer binary does not match the verified current runtime receipt")
+        return current["binary_sha256"]
+
+    def _validate_rebind_eligibility(self, journal):
+        old_revision, target_revision = SUPPORTED_REBIND
+        if (journal["schema"] != SCHEMA or journal["pin_revision"] != old_revision
+                or self.pin.get("revision") != target_revision):
+            raise ValueError("Resource-policy journal pin change is outside the supported migration")
+        if journal["phase"] != "COMPLETE":
+            raise ValueError("Only a completed resource-policy journal can be rebound")
+        if (journal["policy_post"] is None or journal["envelope_post"] is None
+                or journal["before"]["policy"] is None or journal["before"]["envelope"] is None
+                or journal["rollback_policy_post"] is not None
+                or journal["rollback_envelope_post"] is not None
+                or journal.get("rollback_policy_before") is not None
+                or journal.get("rollback_policy_restore_intent") is not None):
+            raise ValueError("Completed resource-policy journal has rollback state or incomplete posts")
+        binary_digest = self._verify_rebind_runtime()
+        current_policy, current_envelope = snapshot(self.policy_path), snapshot(self.authority_path)
+        if (not same_snapshot(current_policy, journal["policy_post"])
+                or not same_snapshot(current_envelope, journal["envelope_post"])):
+            raise ValueError("Live native state drifted from the completed install; journal preserved")
+        policy, authority = self.check_capabilities()
+        if policy != self.desired or not self.desired_authority(authority, journal["before_authority_report"]):
+            raise ValueError("Live native policy or grant differs from the recorded managed install")
+        if current_policy != snapshot(self.policy_path) or current_envelope != snapshot(self.authority_path):
+            raise ValueError("Live native state changed during pin verification; journal preserved")
+        return binary_digest, current_policy, current_envelope
+
+    def _rebind_completed_journal(self, journal):
+        binary_digest, current_policy, current_envelope = self._validate_rebind_eligibility(journal)
+        old_revision, target_revision = SUPPORTED_REBIND
+        old_journal_bytes = self.journal_path.read_bytes()
+        rebound = dict(journal)
+        rebound["schema"] = REBOUND_SCHEMA
+        rebound["pin_revision"] = target_revision
+        rebound["pin_rebindings"] = list(journal.get("pin_rebindings", [])) + [{
+            "from_revision": old_revision,
+            "to_revision": target_revision,
+            "target_binary_sha256": binary_digest,
+            "previous_journal_sha256": sha256(old_journal_bytes),
+        }]
+        self.validate_journal(rebound)
+        if (current_policy != snapshot(self.policy_path) or current_envelope != snapshot(self.authority_path)):
+            raise ValueError("Live native state changed before journal rebind; journal preserved")
+        self.save(rebound)
+        if (not same_snapshot(snapshot(self.policy_path), rebound["policy_post"])
+                or not same_snapshot(snapshot(self.authority_path), rebound["envelope_post"])):
+            raise ValueError("Live native state changed after journal rebind; review required")
+        return "pin rebound"
+
     def apply(self):
         storage.ensure_private_dir(self.state_dir)
         lock = storage.acquire_lock(self.lock_path)
         try:
             _, authority_report = self.check_capabilities()
-            journal = self.read_journal()
+            journal = self.read_journal(check_pin=False)
+            if journal is not None and journal["pin_revision"] != self.pin["revision"]:
+                return self._rebind_completed_journal(journal)
             if journal is None:
                 before = self.capture()
                 journal = {"schema": SCHEMA, "owner": OWNER, "home": str(self.home),
@@ -433,7 +556,13 @@ class ResourcePolicyInstaller:
 
     def inspect(self, dry_run=False):
         self.check_capabilities()
-        journal = self.read_journal()
+        journal = self.read_journal(check_pin=False)
+        if journal and journal["pin_revision"] != self.pin["revision"]:
+            self._validate_rebind_eligibility(journal)
+            print("resource-policy: pin rebind required")
+            return 1
+        if journal is not None:
+            self.validate_journal(journal)
         if journal and journal["phase"] == "COMPLETE":
             clean = (same_snapshot(snapshot(self.policy_path), journal["policy_post"])
                      and same_snapshot(snapshot(self.authority_path), journal["envelope_post"]))
@@ -448,8 +577,14 @@ class ResourcePolicyInstaller:
 
 def runtime_binary(home):
     pin = storage.manifest()
+    receipt_path = Path(home) / storage.RUNTIME / "storage-core.json"
+    current, _previous = storage.read_selection(receipt_path)
+    if current is None or current["source_revision"] != pin["revision"]:
+        raise ValueError("Current Glomeris storage receipt does not match the source pin")
+    if storage.artifact_state(current, receipt_path.parent) != "installed":
+        raise ValueError("Current Glomeris runtime receipt failed artifact verification")
     binary, status = resolver.resolve(home, pin)
-    if status != "verified_installation":
+    if status != "verified_installation" or Path(binary) != Path(current["path"]):
         raise ValueError(f"Pinned Glomeris runtime is {status}; install/verify storage first")
     return Path(binary)
 
