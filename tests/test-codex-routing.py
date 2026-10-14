@@ -18,7 +18,7 @@ ROLES = ('architect', 'implementer', 'reviewer')
 
 class RoutingTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=REPO)
+        self.temp = tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve())
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.home = self.root / 'home'
@@ -45,7 +45,7 @@ else: sys.exit(3)
 
     def run_cli(self, *args, ok=True, cwd=None):
         result = subprocess.run([sys.executable, str(SCRIPT), *args], env=self.env,
-                                cwd=cwd, text=True, capture_output=True)
+                                cwd=self.root if cwd is None else cwd, text=True, capture_output=True)
         if ok:
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         else:
@@ -133,6 +133,23 @@ else: sys.exit(3)
           'models': {n: ('gpt-6-astra' if n != 'implementer' else 'gpt-6-luna') for n in ROLES}}))
         self.run_cli('--apply', '--resolution', str(resolution))
         self.run_cli('--check')
+
+    def test_fixture_ignores_caller_routing_but_explicit_project_still_refuses(self):
+        caller = self.root / 'caller'
+        (caller / '.codex').mkdir(parents=True)
+        (caller / '.codex' / 'config.toml').write_text('[agents.custom]\nmodel = "gpt-6-luna"\n')
+        self.write_config('model_provider = "openai"\n')
+        previous = Path.cwd()
+        try:
+            os.chdir(caller)
+            self.install()
+            self.run_cli('--check')
+            before = self.config.read_bytes()
+            refused = self.run_cli('--launch-check', ok=False, cwd=caller)
+            self.assertIn('Project routing override', refused.stderr)
+            self.assertEqual(self.config.read_bytes(), before)
+        finally:
+            os.chdir(previous)
 
     def test_launch_overrides_that_can_change_routing_refuse_without_writes(self):
         self.write_config('model_provider = "openai"\n')
