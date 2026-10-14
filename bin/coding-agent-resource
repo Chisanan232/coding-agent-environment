@@ -12,6 +12,8 @@ import time
 RENEW_INTERVAL = 20
 BUSY_RETRY_WINDOW = 2
 BUSY_RETRY_INITIAL_DELAY = 0.1
+HOLD_RETRY_WINDOW = 10
+HOLD_RETRY_MAX_DELAY = 0.5
 
 
 def failed(reply):
@@ -48,18 +50,46 @@ def storage_binary(host):
 
 class Core:
     def __init__(self, binary, resource_id, generation, host, session, owner_pid):
+        self.command = [binary, "resource", "hold", resource_id, generation, "--host", host,
+                        "--session", session, "--owner-pid", str(owner_pid)]
+        self.start()
+
+    def start(self):
+        if hasattr(self, "selector"):
+            self.selector.close()
         try:
-            self.process = subprocess.Popen(
-                [binary, "resource", "hold", resource_id, generation, "--host", host,
-                 "--session", session, "--owner-pid", str(owner_pid)],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+            self.process = subprocess.Popen(self.command, stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE, bufsize=0)
             os.set_blocking(self.process.stdout.fileno(), False)
             self.selector = selectors.DefaultSelector()
             self.selector.register(self.process.stdout, selectors.EVENT_READ)
             self.pending = bytearray()
+            self.reply_bytes_seen = False
             self.broken = False
         except OSError:
             refuse("could not start verified Glomeris core")
+
+    def initial_hold(self):
+        deadline = time.monotonic() + HOLD_RETRY_WINDOW
+        delay = BUSY_RETRY_INITIAL_DELAY
+        while True:
+            reply = self.read_reply(timeout=max(0.01, deadline - time.monotonic()))
+            if reply is not None or self.reply_bytes_seen:
+                return reply
+            remaining = deadline - time.monotonic()
+            try:
+                code = self.process.wait(timeout=max(0.01, min(0.1, remaining)))
+            except subprocess.TimeoutExpired:
+                return None
+            remaining = deadline - time.monotonic()
+            if code != 75 or remaining <= 0:
+                return None
+            time.sleep(min(delay, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            delay = min(delay * 2, HOLD_RETRY_MAX_DELAY)
+            self.start()
 
     def request(self, value, timeout=5):
         if self.broken or self.process.poll() is not None:
@@ -95,6 +125,7 @@ class Core:
                 if not chunk:
                     self.broken = True
                     return None
+                self.reply_bytes_seen = True
                 self.pending.extend(chunk)
             self.broken = True
         except (OSError, ValueError, json.JSONDecodeError):
@@ -147,7 +178,7 @@ def main(argv):
     if not session:
         refuse("managed mode requires an existing session identity")
     core = Core(storage_binary(host), resource_id, generation, host, session, os.getpid())
-    held = core.read_reply()
+    held = core.initial_hold()
     if (not held or held.get("status") != "held" or held.get("id") != resource_id
             or held.get("generation") != generation or not isinstance(held.get("path"), str)
             or not Path(held["path"]).is_absolute()):

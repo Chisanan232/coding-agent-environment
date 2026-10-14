@@ -28,6 +28,19 @@ args = sys.argv[1:]
 if args[:3] != ["resource", "hold", "resource-1"] or args[3] != "generation-2": sys.exit(90)
 with open(os.environ["CORE_ARGS_FILE"], "w") as f: json.dump(args, f)
 mode = os.environ.get("CORE_MODE", "ok")
+initial_mode = os.environ.get("CORE_INITIAL_MODE", "ok")
+attempt_file = os.environ.get("CORE_HOLD_ATTEMPTS_FILE")
+attempt = 0
+if attempt_file:
+ try: attempt = int(open(attempt_file).read())
+ except (OSError, ValueError): pass
+ with open(attempt_file, "w") as f: f.write(str(attempt + 1))
+if initial_mode == "permanent_busy" or (initial_mode == "busy_then_success" and attempt < int(os.environ.get("CORE_BUSY_HOLD_COUNT", "1"))):
+ sys.exit(75)
+if initial_mode == "lost_ack": sys.exit(0)
+if initial_mode == "malformed_ack":
+ print("not-json", flush=True)
+ sys.exit(0)
 child_pgid = None
 busy_counts = {}
 closed_consumers = True
@@ -118,6 +131,61 @@ open(os.environ["MARKER"], "w").write(json.dumps([sys.argv[1:], os.environ.get("
         refused = self.run_adapter(str(child), env=refused_env)
         self.assertNotEqual(refused.returncode, 0)
         self.assertFalse(self.marker.exists())
+
+    def test_initial_busy_before_acquisition_retries_until_held_then_launches(self):
+        child = self.root / "busy-then-held-child"
+        child.write_text('#!/bin/sh\ntouch "$MARKER"\n')
+        child.chmod(0o755)
+        attempts = self.root / "hold-attempts"
+        env = dict(self.env, CORE_INITIAL_MODE="busy_then_success", CORE_BUSY_HOLD_COUNT="2",
+                   CORE_HOLD_ATTEMPTS_FILE=str(attempts), MARKER=str(self.marker))
+        run = ("import sys; ns={'__name__':'adapter'}; "
+               "exec(compile(open(sys.argv[1]).read(),sys.argv[1],'exec'),ns); "
+               "ns['HOLD_RETRY_WINDOW']=1; raise SystemExit(ns['main'](sys.argv[2:]))")
+        result = subprocess.run([sys.executable, "-c", run, str(ADAPTER), "--host", "claude", "--",
+                                 str(child)], env=env, text=True, capture_output=True, timeout=4)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.marker.exists())
+        self.assertEqual(attempts.read_text(), "3")
+        self.assertEqual([r["op"] for r in self.requests()],
+                         ["child_pending", "register_child", "release"])
+
+    def test_permanent_initial_busy_is_bounded_and_never_launches(self):
+        child = self.root / "permanent-busy-child"
+        child.write_text('#!/bin/sh\ntouch "$MARKER"\n')
+        child.chmod(0o755)
+        attempts = self.root / "hold-attempts"
+        env = dict(self.env, CORE_INITIAL_MODE="permanent_busy", CORE_HOLD_ATTEMPTS_FILE=str(attempts),
+                   MARKER=str(self.marker))
+        run = ("import sys; ns={'__name__':'adapter'}; "
+               "exec(compile(open(sys.argv[1]).read(),sys.argv[1],'exec'),ns); "
+               "ns['HOLD_RETRY_WINDOW']=.38; raise SystemExit(ns['main'](sys.argv[2:]))")
+        started = time.monotonic()
+        result = subprocess.run([sys.executable, "-c", run, str(ADAPTER), "--host", "claude", "--",
+                                 str(child)], env=env, text=True, capture_output=True, timeout=3)
+        elapsed = time.monotonic() - started
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requested persisted resource hold", result.stderr)
+        self.assertFalse(self.marker.exists())
+        self.assertGreaterEqual(int(attempts.read_text()), 2)
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(self.requests(), [])
+
+    def test_lost_or_malformed_initial_hold_ack_is_never_retried(self):
+        child = self.root / "uncertain-hold-child"
+        child.write_text('#!/bin/sh\ntouch "$MARKER"\n')
+        child.chmod(0o755)
+        for mode in ("lost_ack", "malformed_ack"):
+            with self.subTest(mode=mode):
+                attempts = self.root / "hold-attempts"
+                attempts.unlink(missing_ok=True)
+                self.log.unlink(missing_ok=True)
+                env = dict(self.env, CORE_INITIAL_MODE=mode, CORE_HOLD_ATTEMPTS_FILE=str(attempts),
+                           MARKER=str(self.marker))
+                result = self.run_adapter(str(child), env=env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.marker.exists())
+                self.assertEqual(attempts.read_text(), "1")
         missing = dict(self.env)
         missing.pop("CODING_AGENT_RESOURCE_SESSION_ID")
         missing.pop("CODEX_THREAD_ID", None)
@@ -324,6 +392,12 @@ open(os.environ["MARKER"], "w").write("finished")
         native.write_text('''#!/usr/bin/env python3
 import json, os, sys
 open(os.environ["NATIVE_ARGS"], "w").write(json.dumps(sys.argv[1:]))
+if sys.argv[1:3] == ["debug", "models"]:
+ print(json.dumps({"models":[{"slug":"gpt-6-astra","supported_reasoning_levels":[{"effort":e} for e in ("low","medium","high","xhigh","max")]}, {"slug":"gpt-6-luna","supported_reasoning_levels":[{"effort":e} for e in ("low","medium","high","xhigh","max")]}]}))
+elif sys.argv[1:2] == ["app-server"]:
+ sys.exit(0)
+elif "--json" in sys.argv:
+ print('{"native":true,"items":[]}')
 ''')
         native.chmod(0o755)
         self.bootstrap_home("codex")
@@ -355,6 +429,37 @@ open(os.environ["NATIVE_ARGS"], "w").write(json.dumps(sys.argv[1:]))
         self.assertEqual(json.loads((self.root / "native-args").read_text()),
                          ["--profile", "team-profile", "-c",
                           'project_root_markers=[".coding-agent-profile"]', *args])
+
+    def test_ca_codex_routing_launch_check_keeps_native_json_stdout_clean(self):
+        self.bootstrap_home("codex")
+        fakebin = self.root / "routing-fakebin"
+        fakebin.mkdir()
+        native = fakebin / "codex"
+        native.write_text('''#!/usr/bin/env python3
+import json, sys
+if sys.argv[1:3] == ["debug", "models"]:
+ print(json.dumps({"models":[{"slug":"gpt-6-astra","supported_reasoning_levels":[{"effort":e} for e in ("low","medium","high","xhigh","max")]}, {"slug":"gpt-6-luna","supported_reasoning_levels":[{"effort":e} for e in ("low","medium","high","xhigh","max")]}]}))
+elif sys.argv[1:2] == ["app-server"]:
+ sys.exit(0)
+else:
+ print('{"native":true,"items":[]}')
+''')
+        native.chmod(0o755)
+        codex_home = self.root.resolve() / "routing-home" / ".codex"
+        codex_home.mkdir(parents=True, exist_ok=True)
+        project = self.root.resolve() / "routing-project"
+        project.mkdir()
+        (codex_home / "config.toml").write_text('model_provider = "openai"\n')
+        env = dict(self.env, PATH=f"{fakebin}:{os.environ['PATH']}", CODEX_HOME=str(codex_home),
+                   CODING_AGENT_CODEX_BIN=str(native))
+        installed = subprocess.run([sys.executable, str(ROOT / "scripts/codex-routing.py"), "--apply"],
+                                   env=env, cwd=project, text=True, capture_output=True, timeout=10)
+        self.assertEqual(installed.returncode, 0, installed.stderr + installed.stdout)
+        result = subprocess.run([str(ROOT / "bin/ca-codex"), "--json"], env=env,
+                                cwd=project, text=True, capture_output=True, timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '{"native":true,"items":[]}\n')
+        self.assertIn("Routing drift = 0", result.stderr)
 
 
 if __name__ == "__main__":
