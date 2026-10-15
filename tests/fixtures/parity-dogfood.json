@@ -58,5 +58,20 @@
       },
       "git": "none"
     }
+  },
+  "repair_focus_fixtures": {
+    "static-analysis": {
+      "scenario_id": 5,
+      "files": {
+        "TASK.md": "Repair only the Python lint issue and TypeScript type/runtime issue in this disposable focus fixture.\n\nPython: run `ruff check .` and `python3 -m unittest -v` from `python/`. If Ruff reports a failure, find the active `python-ruff-fixing` entrypoint in the fresh native skill registry, read and invoke it after observing the failure and before editing.\n\nTypeScript: run `tsc --project tsconfig.json --noEmit false --outDir build && node build/double.test.js` from `typescript/`. The project configuration is strict. If the type check fails, find the active `typescript-tsc-debugging` entrypoint in the fresh native skill registry, read and invoke it after observing the failure and before editing.\n\nIf a required tool is unavailable, leave that language's source unchanged and report the limitation. Never install or substitute a tool. Preserve tests, project configuration, public signatures, and files outside this fixture. Report only observed check output and tool/skill evidence. This capture is CAPTURED evidence, never a PASS verdict.\n",
+        "python/doubling.py": "from pathlib import Path\n\ndef double(value: int) -> int:\n    return value * 2\n",
+        "python/test_doubling.py": "import unittest\nfrom doubling import double\n\nclass DoubleTests(unittest.TestCase):\n    def test_values(self):\n        for value, expected in ((0, 0), (3, 6), (-4, -8)):\n            with self.subTest(value=value):\n                self.assertEqual(double(value), expected)\n\nif __name__ == \"__main__\":\n    unittest.main()\n",
+        "python/pyproject.toml": "[tool.ruff.lint]\nselect = [\"F401\"]\n",
+        "typescript/double.ts": "export function double(value: number): number {\n  return value + \"2\";\n}\n",
+        "typescript/double.test.ts": "import { double } from \"./double\";\n\nfor (const [value, expected] of [[0, 0], [3, 6], [-4, -8]] as const) {\n  if (double(value) !== expected) {\n    throw new Error(`double(${value}) did not equal ${expected}`);\n  }\n}\n",
+        "typescript/tsconfig.json": "{\"compilerOptions\":{\"strict\":true,\"target\":\"ES2020\",\"module\":\"commonjs\",\"noEmit\":true},\"include\":[\"*.ts\"]}\n"
+      },
+      "git": "none"
+    }
   }
 }

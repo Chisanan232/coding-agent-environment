@@ -38,6 +38,7 @@ def fixture_process_env(source: dict[str, str] | None = None) -> dict[str, str]:
     env = {name: value for name, value in source.items()
            if not name.startswith("GIT_")}
     env.pop("CODING_AGENT_PARITY_TSC_JS", None)
+    env.pop("CODING_AGENT_PARITY_RUFF", None)
     env.update(GIT_ENV)
     return env
 
@@ -123,6 +124,101 @@ def configure_typescript_toolchain(case_dir: Path, fixture_cwd: Path,
     return metadata, {"PATH": str(tool_dir) + os.pathsep + source_env.get("PATH", os.defpath)}
 
 
+def configure_ruff_toolchain(case_dir: Path, fixture_cwd: Path,
+                             source_env: dict[str, str]) -> tuple[dict, dict[str, str]]:
+    """Expose only the explicitly configured Ruff executable through a private shim."""
+    tool_dir = case_dir / "tool-bin"
+    tool_dir.mkdir(mode=PRIVATE_DIR_MODE, exist_ok=True)
+    assert_private_dir(tool_dir, create=False)
+    cache_dir = case_dir / "ruff-cache"
+    cache_dir.mkdir(mode=PRIVATE_DIR_MODE, exist_ok=True)
+    assert_private_dir(cache_dir, create=False)
+    ruff_env = fixture_process_env(source_env)
+    ruff_env["RUFF_CACHE_DIR"] = str(cache_dir)
+    value = source_env.get("CODING_AGENT_PARITY_RUFF")
+    metadata = {"status": "unavailable", "configured_path": value,
+                "resolved_path": None, "sha256": None, "version": None,
+                "reason": None}
+    executable = None
+    if not value:
+        metadata["reason"] = "CODING_AGENT_PARITY_RUFF is unset"
+    else:
+        if (not Path(value).is_absolute()
+                or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+            raise DogfoodError("CODING_AGENT_PARITY_RUFF must be an absolute executable path")
+        try:
+            executable = Path(value).resolve(strict=True)
+            info = executable.stat()
+        except OSError as exc:
+            raise DogfoodError("Configured Ruff executable is unavailable") from exc
+        if not stat.S_ISREG(info.st_mode) or not os.access(executable, os.X_OK):
+            raise DogfoodError("CODING_AGENT_PARITY_RUFF must resolve to an executable regular file")
+        digest = hashlib.sha256()
+        try:
+            with executable.open("rb") as stream:
+                while block := stream.read(1024 * 1024):
+                    digest.update(block)
+        except OSError as exc:
+            raise DogfoodError("Configured Ruff executable cannot be read") from exc
+        metadata.update(resolved_path=str(executable), sha256=digest.hexdigest())
+        try:
+            result = subprocess.run([str(executable), "--version"], cwd=fixture_cwd,
+                                    env=ruff_env,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        version = result.stdout.strip() if result and result.returncode == 0 else ""
+        if version:
+            metadata.update(status="available", version=version)
+        else:
+            metadata["reason"] = "Configured Ruff version could not be verified"
+
+    shim = tool_dir / "ruff"
+    if executable is not None and metadata["status"] == "available":
+        source = ("#!/usr/bin/env python3\nimport os, sys\n"
+                  f"os.execv({str(executable)!r}, [{str(executable)!r}, *sys.argv[1:]])\n")
+    else:
+        source = ("#!/usr/bin/env python3\nimport sys\n"
+                  "print('configured Ruff executable is unavailable', file=sys.stderr)\n"
+                  "raise SystemExit(127)\n")
+    private_write(shim, source.encode())
+    shim.chmod(0o700)
+    return metadata, {"PATH": str(tool_dir) + os.pathsep + source_env.get("PATH", os.defpath),
+                      "RUFF_CACHE_DIR": str(cache_dir)}
+
+
+def materialize_repair_focus(run_case: Path, baseline: dict, focus: str) -> Path:
+    if focus != "static-analysis":
+        raise DogfoodError(f"Unsupported repair focus: {focus}")
+    seed = baseline.get("repair_focus_fixtures", {}).get(focus)
+    if (not isinstance(seed, dict) or seed.get("scenario_id") != 5
+            or not isinstance(seed.get("files"), dict)):
+        raise DogfoodError("Static-analysis repair fixture is missing or not bound to case 5")
+    repo = run_case / "repository"
+    init_repository(repo)
+    for relative, body in seed["files"].items():
+        if not isinstance(relative, str) or not isinstance(body, str):
+            raise DogfoodError("Repair fixture files must map relative paths to text")
+        write_seed_file(repo, relative, body)
+    if seed.get("git") != "none":
+        raise DogfoodError("Unsupported repair fixture repository setup")
+    commit_all(repo, "🧪 fixture: seed static-analysis repair")
+    return repo
+
+
+def repair_focus_prompt(focus: str) -> str:
+    if focus != "static-analysis":
+        raise DogfoodError(f"Unsupported repair focus: {focus}")
+    return (
+        "Read TASK.md in the disposable fixture and follow its commands, skill gates, "
+        "and file boundaries exactly. The task file is the canonical repair contract. "
+        "Do not change tests, configuration, public signatures, or files outside this fixture. "
+        "Do not install tools or substitute an ambient executable. Report observed checks "
+        "and matching active-skill invocations as evidence; never turn capture into a PASS verdict."
+    )
+
+
 def load_baseline(path: Path = BASELINE) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -152,6 +248,15 @@ def load_baseline(path: Path = BASELINE) -> dict:
                     or any(not isinstance(stage, dict) or not isinstance(stage.get("prompt"), str)
                            or not stage["prompt"].strip() for stage in stages)):
                 raise DogfoodError("Scenario 17 must define two nonempty fresh-process stages")
+    focus_fixtures = data.get("repair_focus_fixtures", {})
+    if (not isinstance(focus_fixtures, dict)
+            or set(focus_fixtures) - {"static-analysis"}):
+        raise DogfoodError("Repair-focus fixtures contain an unsupported focus")
+    if "static-analysis" in focus_fixtures:
+        focus = focus_fixtures["static-analysis"]
+        if (not isinstance(focus, dict) or focus.get("scenario_id") != 5
+                or not isinstance(focus.get("files"), dict)):
+            raise DogfoodError("Static-analysis repair focus must be bound to scenario 5")
     return data
 
 
@@ -638,10 +743,52 @@ def execute_process(host: str, wrapper: Path, cwd: Path, stage_dir: Path, case: 
 
 
 def execute_case(host: str, wrapper: Path, run_dir: Path, case: dict,
-                 baseline: dict) -> tuple[dict, bool]:
+                 baseline: dict, *, repair_focus: str | None = None,
+                 baseline_sha256: str | None = None) -> tuple[dict, bool]:
     case_dir = run_dir / "cases" / f"{case['id']:02d}"
     case_dir.mkdir(parents=True, mode=PRIVATE_DIR_MODE)
     fixture_repo = None
+    if repair_focus is not None:
+        if case["id"] != 5:
+            raise DogfoodError("--repair-focus is only valid with --case 5")
+        fixture_repo = materialize_repair_focus(case_dir, baseline, repair_focus)
+        cwd = fixture_repo
+        toolchain, extra_env = configure_typescript_toolchain(
+            case_dir, cwd / "typescript", os.environ)
+        ruff, ruff_env = configure_ruff_toolchain(case_dir, cwd / "python", os.environ)
+        extra_env.update(ruff_env)
+        toolchain["ruff"] = ruff
+        toolchain["repair_focus"] = repair_focus
+        save_record(case_dir / "fixture-metadata.json", toolchain, replace=True)
+        tsc = toolchain["typescript"]
+        focus_metadata = {
+            "focus": repair_focus,
+            "scenario_id": 5,
+            "baseline_sha256": baseline_sha256,
+            "tool_availability": {
+                "ruff": {key: ruff.get(key) for key in ("status", "version", "sha256", "reason")},
+                "typescript": {key: tsc.get(key) for key in
+                               ("status", "version", "compiler_sha256", "reason")},
+            },
+        }
+        harness_context = (
+            f"Repair focus: {repair_focus}. Ruff status: {ruff['status']}"
+            + (f" ({ruff['version']}, SHA-256 {ruff['sha256']})" if ruff["status"] == "available"
+               else f" ({ruff['reason']})")
+            + ". TypeScript status: " + tsc["status"]
+            + (f" ({tsc['version']}, SHA-256 {tsc['compiler_sha256']})"
+               if tsc["status"] == "available" else f" ({tsc['reason']})")
+            + ". An unavailable tool must remain explicitly unavailable; do not use PATH fallback."
+        )
+        prompt = build_prompt(case, repair_focus_prompt(repair_focus), host=host,
+                              harness_context=harness_context)
+        record, stop_run, _ = execute_process(
+            host, wrapper, cwd, case_dir, case, prompt, str(uuid.uuid4()),
+            env_overrides=extra_env)
+        record["fixture_repository"] = str(fixture_repo)
+        record["repair_focus"] = focus_metadata
+        save_record(case_dir / "result.json", record, replace=True)
+        return record, stop_run
     if case["mode"] == "local_fixture":
         fixture_repo = materialize_fixture(case_dir, case, baseline)
         cwd = fixture_repo
@@ -741,8 +888,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run", action="store_true", help="explicitly launch fresh native host processes")
     parser.add_argument("--output-dir", help="private persistent output root beneath the current user's home")
     parser.add_argument("--max-cases", type=int, help="optional finite scenario-count cap for --all")
+    parser.add_argument("--repair-focus", choices=("static-analysis",),
+                        help="run the opt-in static-analysis fixture; valid only with --case 5")
     args = parser.parse_args(argv)
     try:
+        if args.repair_focus and (args.case != 5 or args.all):
+            raise DogfoodError("--repair-focus is only valid with --case 5")
         baseline = load_baseline()
         scenarios = select_scenarios(baseline, args.case, args.all)
         if args.max_cases is not None:
@@ -756,6 +907,8 @@ def main(argv: list[str] | None = None) -> int:
         output_root = safe_output_root(home, args.output_dir)
         if not args.run:
             print(f"DRY PLAN: host={args.host}; scenarios={len(scenarios)}; execution=dry_plan")
+            if args.repair_focus:
+                print(f"Repair focus: case 5 / {args.repair_focus}; no fixture or host process created")
             if omitted_by_budget:
                 print(f"Finite scenario cap leaves {len(omitted_by_budget)} cases NOT_RUN_BY_BUDGET")
             for case in scenarios:
@@ -772,16 +925,22 @@ def main(argv: list[str] | None = None) -> int:
         run_dir = output_root / run_id
         run_dir.mkdir(mode=PRIVATE_DIR_MODE)
         os.chmod(run_dir, PRIVATE_DIR_MODE)
+        baseline_sha256 = hashlib.sha256(BASELINE.read_bytes()).hexdigest()
         run_record = {
             "schema": 1, "status": "RUNNING", "host": args.host,
             "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "baseline": str(BASELINE), "baseline_sha256": hashlib.sha256(BASELINE.read_bytes()).hexdigest(),
+            "baseline": str(BASELINE), "baseline_sha256": baseline_sha256,
             "wrapper": str(wrapper), "selected_scenarios": [item["id"] for item in scenarios],
             "host_cli_version_observed": cli_version,
             "not_run_by_budget": [item["id"] for item in omitted_by_budget],
             "max_cases": args.max_cases,
             "model_or_effort_override": False,
         }
+        if args.repair_focus:
+            run_record["repair_focus"] = {
+                "scenario_id": 5, "focus": args.repair_focus,
+                "baseline_sha256": baseline_sha256,
+            }
         save_record(run_dir / "run.json", run_record)
         print(f"Private evidence directory: {run_dir}")
         outcomes = []
@@ -794,7 +953,10 @@ def main(argv: list[str] | None = None) -> int:
                 case_dir.mkdir(parents=True, mode=PRIVATE_DIR_MODE)
                 save_record(case_dir / "result.json", record)
             else:
-                record, stopped = execute_case(args.host, wrapper, run_dir, case, baseline)
+                record, stopped = execute_case(
+                    args.host, wrapper, run_dir, case, baseline,
+                    repair_focus=args.repair_focus,
+                    baseline_sha256=baseline_sha256)
                 print(f"{case['id']:02d}: {record['status']}")
             outcomes.append(record)
         outcomes.extend({"scenario_id": case["id"], "scenario": case["name"],
