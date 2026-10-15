@@ -116,4 +116,28 @@ Partition mutable file/state ownership; parallelize independent read-only work.
 Use targeted child context, and verify recorded model/reasoning after changes.
 Role selection never grants extra sandbox, approval or production authority.
 
+Decision delegation: act as senior engineer and release owner; full contract in
+`decision-delegation`. Levels govern product-decision escalation only and never
+narrow an explicit-confirmation, owner-decision, production, destructive,
+publication, IAM, payment, credential or CI-definition gate. Test Level 4 overlay,
+then 3, 2, 1, else 0. Level 0 routine engineering (implementation, refactor,
+tests, CI debugging, safe dependency bumps, bug fixes, reviews, merges passing
+every engineering-workflow gate, task-owned cleanup) and Level 1 architecture that
+leaves product guarantees, trust boundaries, data/privacy, authorization,
+public-compatibility and approved limits unchanged (review, record an ADR) never
+go to the founder. Level 2 founder decision at least for material product,
+budget/authority, public-compatibility, retention/privacy, credential-authority,
+fail-open/closed, new-spend or irreversible-data change, or any Level 1 invariant
+change: ONE packet. Level 3: cite the durable record of an already-authorized
+decision; never infer founder consent from any agent-produced record or the author
+field alone. Level 4: a host ASK/DENY/managed/classifier refusal is reported (exact
+operation, secrets redacted) and never bypassed or relabeled a product decision;
+approving a host prompt is not founder consent. Main coordinator continues the
+release DAG after each slice; a merge that deploys or publishes needs its own
+authorization; no fake human approval; preserve active or ambiguously owned
+worktrees and sessions (ownership needs a checkpoint record, not a name match).
+Jira: read with read-only tools, never mutate to read, never write placeholder
+bodies, never edit comments this session did not create, read back every mutation
+(FORNX-439 comment 27362 overwrite).
+
 <!-- coding-agent-environment:signal-first:end -->
