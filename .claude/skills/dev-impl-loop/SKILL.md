@@ -27,7 +27,11 @@ Auto-used. Run immediately after `ticket-pickup-check` passes.
 ## Ticket context
 Resolve the active ticket reference at the start of every phase:
 ```bash
-TICKET="${ENGINEERING_CURRENT_TICKET:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-ticket" 2>/dev/null || echo '')}"
+if [[ ${ENGINEERING_CONTEXT_STATUS:-legacy_uncoordinated} == legacy_uncoordinated ]]; then
+  TICKET="${ENGINEERING_CURRENT_TICKET:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-ticket" 2>/dev/null || echo '')}"
+else
+  TICKET="${ENGINEERING_CURRENT_TICKET-}"
+fi
 ```
 If empty, stop and ask the engineer to run `ticket-pickup-check` first.
 
@@ -36,7 +40,11 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
 ### Phase 0 — Environment verification (before the loop starts)
 1. Resolve the active worktree and change into it:
    ```bash
-   WORKTREE="${ENGINEERING_CURRENT_WORKTREE:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-worktree" 2>/dev/null || echo '')}"
+   if [[ ${ENGINEERING_CONTEXT_STATUS:-legacy_uncoordinated} == legacy_uncoordinated ]]; then
+     WORKTREE="${ENGINEERING_CURRENT_WORKTREE:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-worktree" 2>/dev/null || echo '')}"
+   else
+     WORKTREE="${ENGINEERING_CURRENT_WORKTREE-}"
+   fi
    if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
      cd "$WORKTREE"
    elif [ -n "$WORKTREE" ]; then

@@ -23,6 +23,14 @@ handoff from another host, read that host's relevant notes/checkpoints explicitl
 and reconcile them against current Git, PR and tracker evidence. Do not copy
 history, OAuth, secrets or an entire state directory.
 
+Managed context is created only in a freshly and exclusively created host root;
+legacy roots are never adopted. When `.current-context.json` exists, its valid
+active tuple is authoritative, while a cleared tombstone or invalid/unreadable
+object suppresses all environment and marker fallback. Preserve this
+context-capability reader during rollback: restoring marker-only bootstrap
+behavior could resurrect stale environment values. Context CAS tokens coordinate
+updates; they grant no task-release or cleanup authority.
+
 Invoke the canonical helpers through `$ENGINEERING_RUNTIME`: `workflow-state.sh`,
 `session-memory.sh`, `circuit-breaker-gate.sh`, `decision-log.sh`, `audit_log.sh`,
 `full-test-gate.sh`, `precommit-gate.sh`, `quality_gate.sh`. State/notes/decisions
@@ -81,7 +89,8 @@ observe/act/verify/record; a per-write lock alone cannot serialize external acti
 Status/receipts are evidence, never a cleanup grant. Context markers remain
 preserved until all writers use a coordinated ownership protocol.
 
-Native notes and workflow writers share `ticket-state.py` revisioned operations.
+Native notes, workflow and context operations use the manifest-installed
+`$ENGINEERING_RUNTIME/ticket-state.py` helper.
 Capture `session-memory.sh snapshot TICKET` / `workflow-state.sh snapshot TICKET`
 while observing the completed task. Clearing/archiving requires that original
 token; concurrent replacement, even identical content in a new generation,

@@ -58,9 +58,12 @@ pass before `dev-impl-loop` begins.
     ```
     <release-or-phase>/<ticket-number>/<type>/<short-summary>
     ```
-    - `<release-or-phase>`: resolve in order — `$ENGINEERING_CURRENT_RELEASE` env var,
-      `${ENGINEERING_CONTEXT_DIR}/.current-release` file, or the ticket's milestone/sprint field
-      from the issue tracker. Examples: `v0.1.0`, `phase1`, `sprint3`.
+    - `<release-or-phase>`: for `legacy_uncoordinated`, resolve the existing
+      `$ENGINEERING_CURRENT_RELEASE` env/marker precedence, then the ticket's
+      milestone/sprint field. For managed state, use the bootstrap-resolved
+      release if present; otherwise use the ticket's milestone/sprint field.
+      Never consult legacy markers when status is `managed` or `unavailable`.
+      Store the selected prefix in `RELEASE`. Examples: `v0.1.0`, `phase1`, `sprint3`.
     - `<ticket-number>`: exact ticket reference (e.g., `TEST-1`, `PROJ-123`, `42`).
     - `<type>`: GitEmoji category slug for the primary change type —
       `feat`, `fix`, `refactor`, `test`, `docs`, `config`, `deps`, `remove`, `lint`.
@@ -90,24 +93,69 @@ pass before `dev-impl-loop` begins.
     scope/dependency decision or blocker needs attention; keep branch/worktree
     location in local context and the PR, rather than duplicating it in Jira.
 
-16. **Bind the ticket reference, release prefix, and worktree path** to the current session:
+16. **Bind the ticket reference, release prefix, and worktree path** without
+    adopting or overwriting legacy state. Inspect the target host root before
+    changing context:
     ```bash
-    # In the MAIN repo — write context files for cross-session reference
-    mkdir -p "$ENGINEERING_CONTEXT_DIR"
-    echo "[ticket-ref]"        > "${ENGINEERING_CONTEXT_DIR}/.current-ticket"
-    echo "$WORKTREE_PATH"      > "${ENGINEERING_CONTEXT_DIR}/.current-worktree"
-    echo "[release-or-phase]"  > "${ENGINEERING_CONTEXT_DIR}/.current-release"
-
-    # In the WORKTREE — write the ticket context so skills work from inside it
-    mkdir -p "${WORKTREE_PATH}/$(basename "$ENGINEERING_CONTEXT_DIR")"
-    echo "[ticket-ref]"       > "${WORKTREE_PATH}/$(basename "$ENGINEERING_CONTEXT_DIR")/.current-ticket"
-    echo "[release-or-phase]" > "${WORKTREE_PATH}/$(basename "$ENGINEERING_CONTEXT_DIR")/.current-release"
-
-    # Export for the current shell session
-    export ENGINEERING_CURRENT_TICKET="[ticket-ref]"
-    export ENGINEERING_CURRENT_WORKTREE="$WORKTREE_PATH"
-    export ENGINEERING_CURRENT_RELEASE="[release-or-phase]"
+    HOST=$(basename "$ENGINEERING_STATE_DIR")
+    CONTEXT_ROOT="${WORKTREE_PATH}/${HOST}"
+    CONTEXT_HELPER="${ENGINEERING_RUNTIME}/ticket-state.py"
+    CONTEXT_RELEASE_ARGS=()
+    if [[ -n ${RELEASE:-} ]]; then
+      CONTEXT_RELEASE_ARGS=(--release "$RELEASE")
+    fi
+    CONTEXT_JSON=$(python3 "$CONTEXT_HELPER" context "$CONTEXT_ROOT" inspect) || exit 1
     ```
+    Only when `[[ ! -e "$CONTEXT_ROOT" && ! -L "$CONTEXT_ROOT" ]]`, create a
+    managed context with the explicit
+    fresh-scope operation:
+    ```bash
+    CONTEXT_RESULT=$(python3 "$CONTEXT_HELPER" context "$CONTEXT_ROOT" initialize \
+      --host "${HOST#.}" --worktree "$WORKTREE_PATH" --ticket "$TICKET" \
+      --fresh-owned-scope "${CONTEXT_RELEASE_ARGS[@]}") || exit 1
+    ```
+    The operation exclusively creates the canonical worktree host directory.
+    If it already exists, never initialize over it. For an existing managed
+    active context already bound to this same accepted ticket and worktree,
+    capture its generation and CAS token from one `inspect`
+    result and publish the accepted tuple with those exact values:
+    ```bash
+    CONTEXT_JSON=$(python3 "$CONTEXT_HELPER" context "$CONTEXT_ROOT" inspect) || exit 1
+    CONTEXT_GENERATION=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["generation"])' <<<"$CONTEXT_JSON")
+    CONTEXT_TOKEN=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' <<<"$CONTEXT_JSON")
+    CONTEXT_RESULT=$(python3 "$CONTEXT_HELPER" context "$CONTEXT_ROOT" publish \
+      --expected-generation "$CONTEXT_GENERATION" --expected-token "$CONTEXT_TOKEN" \
+      --ticket "$TICKET" --worktree "$WORKTREE_PATH" "${CONTEXT_RELEASE_ARGS[@]}") || exit 1
+    ```
+    A CAS snapshot does not authorize taking over another ticket's context.
+    If the existing ticket differs, preserve it and use a fresh owned worktree
+    unless an authoritative handover has independently been verified.
+    A stale token or generation refuses the update. An existing tombstone or
+    unavailable context cannot be reused; preserve it and use a new owned
+    worktree. Unexpected legacy markers also block publish; preserve the active
+    context and markers and use a fresh worktree. An existing root without a managed object is
+    `legacy_uncoordinated`: do not import it, create a managed object inside it,
+    or write/truncate `.current-*` markers. Keep legacy contexts unchanged and
+    bind this session with environment variables only. Once in the selected
+    worktree, run its bootstrap and verify `ENGINEERING_CONTEXT_STATUS` and the
+    resolved tuple before continuing. `managed` is authoritative; `unavailable`
+    suppresses all fallback; only `legacy_uncoordinated` uses the old env/marker
+    precedence.
+
+    ```bash
+    cd "$WORKTREE_PATH"
+    eval "$(python3 "${ENGINEERING_RUNTIME}/bootstrap.py")"
+    ```
+    For an uncoordinated legacy root, export the accepted ticket/worktree/release
+    for this shell after bootstrap:
+    ```bash
+    if [[ $ENGINEERING_CONTEXT_STATUS == legacy_uncoordinated ]]; then
+      export ENGINEERING_CURRENT_TICKET="$TICKET"
+      export ENGINEERING_CURRENT_WORKTREE="$WORKTREE_PATH"
+      export ENGINEERING_CURRENT_RELEASE="$RELEASE"
+    fi
+    ```
+    Do not persist them in marker files.
     All subsequent development work happens inside `$WORKTREE_PATH`.
 
 17. Write the initial workflow state file:
@@ -132,24 +180,34 @@ the ticket. Routine successful state/assignee/worktree checks stay internal.
 ## Ticket context resolution (for all skills)
 
 All skills that need the ticket reference resolve it in this order:
-1. `$ENGINEERING_CURRENT_TICKET` environment variable (set by CI or the engineer)
-2. `${ENGINEERING_CONTEXT_DIR}/.current-ticket` file in the repository root (written by this skill)
-3. Prompt the engineer if neither is set
+For `managed` and `unavailable`, use only the bootstrap's
+`ENGINEERING_CURRENT_TICKET`; an empty value means no usable context. For
+`legacy_uncoordinated`, retain the existing environment-then-marker precedence.
+Prompt the engineer if neither source yields a ticket.
 
 Skills should never hardcode a ticket ref or worktree path. Use this pattern:
 ```bash
-TICKET="${ENGINEERING_CURRENT_TICKET:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-ticket" 2>/dev/null || echo '')}"
+if [[ ${ENGINEERING_CONTEXT_STATUS:-legacy_uncoordinated} == legacy_uncoordinated ]]; then
+  TICKET="${ENGINEERING_CURRENT_TICKET:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-ticket" 2>/dev/null || echo '')}"
+else
+  TICKET="${ENGINEERING_CURRENT_TICKET-}"
+fi
 if [[ -z "$TICKET" ]]; then
   echo "No active ticket context. Run ticket-pickup-check first." >&2
   exit 1
 fi
 
-WORKTREE="${ENGINEERING_CURRENT_WORKTREE:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-worktree" 2>/dev/null || echo '')}"
+if [[ ${ENGINEERING_CONTEXT_STATUS:-legacy_uncoordinated} == legacy_uncoordinated ]]; then
+  WORKTREE="${ENGINEERING_CURRENT_WORKTREE:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-worktree" 2>/dev/null || echo '')}"
+else
+  WORKTREE="${ENGINEERING_CURRENT_WORKTREE-}"
+fi
 ```
 
-Ensure `${ENGINEERING_CONTEXT_DIR}/.current-ticket`, `${ENGINEERING_CONTEXT_DIR}/.current-worktree`, and
-`${ENGINEERING_CONTEXT_DIR}/.current-release` are listed in `.gitignore` — they are session
-state, not source code.
+Managed state exposes its status, generation, scope ID and CAS token through
+the bootstrap environment. The token is an early-observation CAS snapshot, not
+proof that a task is released. Legacy marker files remain readable only while
+the context object is absent; never create or overwrite them during pickup.
 
 ## Safe-Fix Guidance
 - Never bypass the state check — implementing a "New" or "Backlog" ticket
