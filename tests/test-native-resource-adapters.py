@@ -21,9 +21,11 @@ class NativeResourceAdapterTests(unittest.TestCase):
         self.events = self.root / "events.jsonl"
         self.state = self.root / "native-state.json"
         self.child_record = self.root / "child.json"
+        self.child_started = self.root / "child-started"
+        self.confirm_observed = self.root / "confirm-observed"
         self.core = self.root / "glomeris"
         self.core.write_text('''#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 args = sys.argv[1:]
 state_path = os.environ["NATIVE_STATE"]
 if os.path.exists(state_path):
@@ -41,8 +43,13 @@ action = request.get("op")
 if action == "update": action = request.get("update", {}).get("kind")
 safe_request = dict(request)
 if "token" in safe_request: safe_request["token"] = "[redacted]"
+if action == "confirm_child" and os.environ.get("WAIT_FOR_CHILD_START") == "1":
+ deadline = time.monotonic() + 5
+ while not os.path.exists(os.environ["CHILD_STARTED"]) and time.monotonic() < deadline:
+  time.sleep(.01)
+ if not os.path.exists(os.environ["CHILD_STARTED"]): sys.exit(86)
 with open(os.environ["NATIVE_EVENTS"], "a") as out:
- out.write(json.dumps({"request": safe_request, "child_exists": os.path.exists(os.environ["CHILD_RECORD"])}) + "\\n")
+ out.write(json.dumps({"request": safe_request, "child_exists": os.path.exists(os.environ["CHILD_STARTED"])}) + "\\n")
 resource = state[request["id"]]
 if resource["generation"] != request["generation"] or resource["revision"] != request["revision"]:
  sys.exit(91)
@@ -61,6 +68,8 @@ else:
  reply_extra = {}
 resource["revision"] += 1
 json.dump(state, open(state_path, "w"))
+if action == "confirm_child":
+ open(os.environ["CONFIRM_OBSERVED"], "w").write("confirmed")
 if os.environ.get("DROP_ACK_ACTION") == action:
  sys.exit(0)
 reply = {"status":"acknowledged", "id":resource["id"], "generation":resource["generation"],
@@ -77,6 +86,7 @@ print(json.dumps(reply))
         self.resources = [{"id": "1" * 32, "generation": "a" * 32}]
         self.env = dict(os.environ, HOME=str(self.home), NATIVE_STATE=str(self.state),
                         NATIVE_EVENTS=str(self.events), CHILD_RECORD=str(self.child_record),
+                        CHILD_STARTED=str(self.child_started), CONFIRM_OBSERVED=str(self.confirm_observed),
                         NATIVE_RESOURCES=json.dumps(self.resources),
                         CODING_AGENT_NATIVE_RESOURCES=json.dumps(self.resources),
                         CODING_AGENT_RESOURCE_SESSION_ID="session-existing",
@@ -97,8 +107,22 @@ print(json.dumps(reply))
         path.write_text(code)
         return [sys.executable, str(path), "arg with spaces"]
 
+    def child_until_confirmation(self):
+        code = """import json, os, sys, time
+from pathlib import Path
+Path(os.environ['CHILD_STARTED']).write_text('started')
+deadline = time.monotonic() + 8
+while not Path(os.environ['CONFIRM_OBSERVED']).exists() and time.monotonic() < deadline:
+    time.sleep(.01)
+if not Path(os.environ['CONFIRM_OBSERVED']).exists():
+    raise SystemExit(86)
+json.dump({'args': sys.argv[1:], 'env': dict(os.environ)}, open(os.environ['CHILD_RECORD'], 'w'))
+"""
+        return self.child(code)
+
     def test_acquire_and_prepare_precede_child_and_normal_exit_waits_without_release(self):
-        result = self.run_adapter("claude", *self.child())
+        result = self.run_adapter("claude", *self.child_until_confirmation(),
+                                  env=dict(self.env, WAIT_FOR_CHILD_START="1"))
         self.assertEqual(result.returncode, 0, result.stderr)
         observed = json.loads(self.child_record.read_text())
         self.assertEqual(observed["args"], ["arg with spaces"])
@@ -205,7 +229,7 @@ print(json.dumps(reply))
         self.assertEqual(self.state_read()[self.resources[0]["id"]]["transitions"], ["prepare_child"])
 
     def test_confirm_failure_does_not_stop_useful_child_or_release_claim(self):
-        child_code = "import os,time; time.sleep(.15); open(os.environ['CHILD_RECORD'],'w').write('finished'); raise SystemExit(9)"
+        child_code = "import os; open(os.environ['CHILD_RECORD'],'w').write('finished'); raise SystemExit(9)"
         env = dict(self.env, REFUSE_ACTION="confirm_child")
         result = self.run_adapter("claude", *self.child(child_code), env=env)
         self.assertEqual(result.returncode, 9, result.stderr)

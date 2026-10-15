@@ -464,6 +464,28 @@ class ResourcePolicyInstallTests(unittest.TestCase):
         self.assertEqual(self.rebind_installer().inspect(), 1)
         self.assertEqual(old.journal_path.read_bytes(), before)
 
+    def test_completed_rebound_journal_preserves_its_existing_history_on_next_pin(self):
+        old = self.completed_old_pin_install()
+        journal = json.loads(old.journal_path.read_text())
+        history = {"from_revision": installer_module.HISTORICAL_REBIND[0],
+                   "to_revision": installer_module.HISTORICAL_REBIND[1],
+                   "target_binary_sha256": "b" * 64, "previous_journal_sha256": "c" * 64}
+        journal.update(schema=2, pin_rebindings=[history])
+        installer_module.storage.atomic_json(old.journal_path, journal)
+        before = old.journal_path.read_bytes()
+        native_before = {p: p.read_bytes() for p in (old.policy_path, old.authority_path)}
+        current = self.rebind_installer()
+        self.assertEqual(current.apply(), "pin rebound")
+        rebound = json.loads(current.journal_path.read_text())
+        self.assertEqual(rebound["pin_rebindings"][0], history)
+        self.assertEqual(len(rebound["pin_rebindings"]), 2)
+        self.assertEqual(rebound["pin_rebindings"][-1]["previous_journal_sha256"],
+                         installer_module.sha256(before))
+        self.assertEqual(rebound["before"], journal["before"])
+        self.assertEqual({p: p.read_bytes() for p in native_before}, native_before)
+        self.assertEqual(current.apply(), "already installed")
+        self.assertEqual(current.rollback(), "rolled back")
+
     def test_read_only_inspect_refuses_ineligible_rebind_without_mutation(self):
         old = self.completed_old_pin_install()
         original = json.loads(old.journal_path.read_text())

@@ -21,8 +21,12 @@ AUTHORITY_REL = Path("Library/Application Support/Glomeris/autopilot.conf")
 OWNER = "coding-agent-environment:resource-policy:v1"
 SCHEMA = 1
 REBOUND_SCHEMA = 2
-SUPPORTED_REBIND = ("f98389017b8ea52035d25bb21598711fd5f882a0",
-                   "839dbd518b9a1d56096bb6b8a0b427d2c660c88f")
+HISTORICAL_REBIND = ("f98389017b8ea52035d25bb21598711fd5f882a0",
+                    "839dbd518b9a1d56096bb6b8a0b427d2c660c88f")
+SUPPORTED_REBIND = (HISTORICAL_REBIND[1], "fa7379adbc5dc1a94d847048ba549d3f4a30cfeb")
+# Each edge retains the tested policy/restore contract; no arbitrary forward adoption.
+SUPPORTED_REBINDS = {HISTORICAL_REBIND, SUPPORTED_REBIND,
+                     (HISTORICAL_REBIND[0], SUPPORTED_REBIND[1])}
 MAX_ACTIONS = 3
 MAX_BYTES = 5368709120
 MAX_DURATION = 60
@@ -234,7 +238,7 @@ class ResourcePolicyInstaller:
             if (not isinstance(entry, dict)
                     or set(entry) != {"from_revision", "to_revision", "target_binary_sha256",
                                       "previous_journal_sha256"}
-                    or (entry["from_revision"], entry["to_revision"]) != SUPPORTED_REBIND
+                    or (entry["from_revision"], entry["to_revision"]) not in SUPPORTED_REBINDS
                     or not isinstance(entry["target_binary_sha256"], str)
                     or len(entry["target_binary_sha256"]) != 64
                     or any(char not in "0123456789abcdef" for char in entry["target_binary_sha256"])
@@ -309,9 +313,8 @@ class ResourcePolicyInstaller:
         return current["binary_sha256"]
 
     def _validate_rebind_eligibility(self, journal):
-        old_revision, target_revision = SUPPORTED_REBIND
-        if (journal["schema"] != SCHEMA or journal["pin_revision"] != old_revision
-                or self.pin.get("revision") != target_revision):
+        if (journal["schema"] not in (SCHEMA, REBOUND_SCHEMA)
+                or (journal["pin_revision"], self.pin.get("revision")) not in SUPPORTED_REBINDS):
             raise ValueError("Resource-policy journal pin change is outside the supported migration")
         if journal["phase"] != "COMPLETE":
             raise ValueError("Only a completed resource-policy journal can be rebound")
@@ -336,7 +339,7 @@ class ResourcePolicyInstaller:
 
     def _rebind_completed_journal(self, journal):
         binary_digest, current_policy, current_envelope = self._validate_rebind_eligibility(journal)
-        old_revision, target_revision = SUPPORTED_REBIND
+        old_revision, target_revision = journal["pin_revision"], self.pin["revision"]
         old_journal_bytes = self.journal_path.read_bytes()
         rebound = dict(journal)
         rebound["schema"] = REBOUND_SCHEMA
