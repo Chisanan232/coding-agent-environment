@@ -303,3 +303,24 @@ Raw transcripts, host session identifiers, and workstation paths stay in private
 local evidence. Ticket closure still requires independently reviewed native
 behavior for every actual criterion, including compatibility gates; Codex-only
 results never substitute for Claude runtime proof.
+
+### Read-only probe instruction correction
+
+A fresh installed Codex briefing probe correctly refused the former blanket
+ban on write-capable tools: its local skill reader was an execution tool, even
+though the selected sandbox was read-only. Read-only Codex scenarios now
+explicitly permit local observational commands to inspect active skill and
+profile/tool contracts. The native read-only sandbox, Claude plan/tool limits,
+mutating-operation prohibition and approval boundaries are unchanged. Editable
+repair scenarios and the separate Claude TypeScript permission refusal are
+unaffected.
+
+The subsequent fresh Codex briefing revalidation actually read the installed
+briefing skill and completed the supplied-facts briefing; independent review
+confirmed this scoped result. Original refused evidence is preserved. Actual
+installed Claude and Codex adapters both recorded waiting native claims with
+unreleased child scope and no cleanup authority. This proves opt-in acquisition
+and preservation wiring, not canonical session lineage, complete consumer
+coverage, native retirement or production storage reclamation. A preexisting
+hook-loading diagnostic remains a compatibility observation, not a passed hook
+compatibility gate. The overall verdict remains PARTIAL PARITY.

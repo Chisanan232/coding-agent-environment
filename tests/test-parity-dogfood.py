@@ -393,6 +393,22 @@ else:
         self.assertTrue(all(item["status"] == "NOT_RUN_BY_BUDGET" for item in summary["scenarios"][2:]))
         self.assertEqual(len(self.calls.read_text().splitlines()), 2)
 
+    def test_plan_probe_allows_reading_skills_without_broadening_native_permissions(self):
+        case = dogfood.load_baseline()["scenarios"][14]
+        codex_prompt = dogfood.build_prompt(case, case["prompt"], host="codex")
+        self.assertIn("Read-only local exec commands may inspect", codex_prompt)
+        self.assertNotIn("Use no write-capable local tools", codex_prompt)
+        self.assertIn("Do not write files", codex_prompt)
+        self.assertIn("request or bypass approval", codex_prompt)
+        claude_prompt = dogfood.build_prompt(case, case["prompt"], host="claude")
+        self.assertIn("Use no write-capable local tools", claude_prompt)
+        codex_args = dogfood.host_argv("codex", Path("ca-codex"), "owned", codex_prompt, read_only=True)
+        self.assertIn("--sandbox", codex_args)
+        self.assertEqual(codex_args[codex_args.index("--sandbox") + 1], "read-only")
+        claude_args = dogfood.host_argv("claude", Path("ca-claude"), "owned", claude_prompt, read_only=True)
+        self.assertIn("--tools=Read,Glob,Grep,Skill", claude_args)
+        self.assertEqual(claude_args[claude_args.index("--permission-mode") + 1], "plan")
+
     def test_case14_withholds_cleanup_authority_and_requires_protection(self):
         case = dogfood.load_baseline()["scenarios"][13]
         self.assertEqual(case["mode"], "plan_only")

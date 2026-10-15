@@ -500,6 +500,15 @@ def build_prompt(case: dict, prompt: str, handoff: str | None = None,
             "integrations. Do not request or bypass approval. If this cannot be enforced, "
             "stop and report that limitation. "
         )
+        if host == "codex":
+            read_boundary = (
+                "This case is read-only within the already selected read-only sandbox. "
+                "Read-only local exec commands may inspect applicable installed skill "
+                "instructions and active tool/profile contracts. Do not write files, "
+                "install or enable tools, change settings, perform remote mutations, or "
+                "request or bypass approval. If a read cannot be performed within these "
+                "boundaries, stop and report that limitation. "
+            )
     if host == "codex" and case["id"] == 18:
         read_boundary += (
             "Read-only exec commands are allowed within the already selected read-only "
