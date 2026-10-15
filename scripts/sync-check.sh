@@ -75,7 +75,7 @@ for pair in "${PAIRS[@]}"; do
     if [[ "$repo_rel" == ".claude/settings.json" ]]; then
         # Native plugin installs add root fields; compare the owned settings only.
         #
-        # permissions.allow/ask/deny and autoMode.environment get a SEMANTIC
+        # permissions.allow/ask/deny and autoMode.environment/allow get a SEMANTIC
         # (subset) comparison, not exact-equality: a live machine legitimately
         # extends this repo's portable rule set with machine-specific or
         # corporate-private entries (ADR-0012) — that is not drift. Only a
@@ -107,7 +107,8 @@ for k, v in desired.items():
             problems.append(f"  permissions.defaultMode: desired {v.get('defaultMode')!r}, live {live_perm.get('defaultMode')!r}")
     elif k == "autoMode":
         live_auto = live.get("autoMode", {})
-        problems += subset_report("autoMode.environment", v.get("environment", []), live_auto.get("environment", []))
+        for auto_key in ("environment", "allow"):
+            problems += subset_report(f"autoMode.{auto_key}", v.get(auto_key, []), live_auto.get(auto_key, []))
     elif live.get(k) != v:
         problems.append(f"  {k}: differs")
 
