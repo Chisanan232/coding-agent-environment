@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -32,11 +33,94 @@ class DogfoodError(Exception):
     pass
 
 
-def fixture_process_env() -> dict[str, str]:
-    env = {name: value for name, value in os.environ.items()
+def fixture_process_env(source: dict[str, str] | None = None) -> dict[str, str]:
+    source = os.environ if source is None else source
+    env = {name: value for name, value in source.items()
            if not name.startswith("GIT_")}
+    env.pop("CODING_AGENT_PARITY_TSC_JS", None)
     env.update(GIT_ENV)
     return env
+
+
+def configure_typescript_toolchain(case_dir: Path, fixture_cwd: Path,
+                                   source_env: dict[str, str]) -> tuple[dict, dict[str, str]]:
+    """Install a private tsc shim that only delegates to the configured compiler."""
+    tool_dir = case_dir / "tool-bin"
+    metadata = {"schema": 1, "typescript": {
+        "status": "unavailable", "configured_path": None, "resolved_path": None,
+        "compiler_sha256": None, "version": None, "node_path": None, "reason": None,
+    }}
+    compiler_value = source_env.get("CODING_AGENT_PARITY_TSC_JS")
+    node_value = None
+    compiler_path = None
+    unavailable_reason = None
+    if not compiler_value:
+        unavailable_reason = "CODING_AGENT_PARITY_TSC_JS is unset"
+    else:
+        candidate = Path(compiler_value)
+        if (not candidate.is_absolute() or candidate.name != "tsc.js"
+                or any(ord(char) < 32 or ord(char) == 127 for char in compiler_value)):
+            raise DogfoodError("CODING_AGENT_PARITY_TSC_JS must be an absolute tsc.js path")
+        try:
+            compiler_path = candidate.resolve(strict=True)
+            compiler_info = compiler_path.stat()
+        except OSError as exc:
+            raise DogfoodError("Configured TypeScript compiler is unavailable") from exc
+        if not stat.S_ISREG(compiler_info.st_mode):
+            raise DogfoodError("Configured TypeScript compiler must resolve to a regular file")
+        digest = hashlib.sha256()
+        try:
+            with compiler_path.open("rb") as stream:
+                while block := stream.read(1024 * 1024):
+                    digest.update(block)
+        except OSError as exc:
+            raise DogfoodError("Configured TypeScript compiler cannot be read") from exc
+        metadata["typescript"].update(configured_path=str(candidate),
+                                      resolved_path=str(compiler_path),
+                                      compiler_sha256=digest.hexdigest())
+        node_value = shutil.which("node", path=source_env.get("PATH"))
+        if node_value is None:
+            unavailable_reason = "Node.js is unavailable on PATH"
+        else:
+            try:
+                node_path = Path(node_value).resolve(strict=True)
+                node_info = node_path.stat()
+            except OSError as exc:
+                raise DogfoodError("The selected Node.js executable is unavailable") from exc
+            if not stat.S_ISREG(node_info.st_mode) or not os.access(node_path, os.X_OK):
+                raise DogfoodError("The selected Node.js executable is not a regular executable")
+            node_value = str(node_path)
+            metadata["typescript"]["node_path"] = node_value
+            try:
+                result = subprocess.run([node_value, str(compiler_path), "--version"],
+                                        cwd=fixture_cwd, env=fixture_process_env(source_env),
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True, timeout=10, check=False)
+            except (OSError, subprocess.SubprocessError):
+                result = None
+            version = result.stdout.strip() if result and result.returncode == 0 else ""
+            if version:
+                metadata["typescript"].update(status="available", version=version)
+            else:
+                unavailable_reason = "Configured TypeScript compiler version could not be verified"
+
+    if metadata["typescript"]["status"] != "available":
+        metadata["typescript"]["reason"] = unavailable_reason
+    tool_dir.mkdir(mode=PRIVATE_DIR_MODE)
+    metadata_path = case_dir / "fixture-metadata.json"
+    save_record(metadata_path, metadata)
+
+    shim = tool_dir / "tsc"
+    if metadata["typescript"]["status"] == "available":
+        source = ("#!/usr/bin/env python3\nimport os, sys\n"
+                  f"os.execv({node_value!r}, [{node_value!r}, {str(compiler_path)!r}, *sys.argv[1:]])\n")
+    else:
+        source = ("#!/usr/bin/env python3\nimport sys\n"
+                  "print('TypeScript compiler unavailable: runner has no verified existing compiler', file=sys.stderr)\n"
+                  "raise SystemExit(127)\n")
+    private_write(shim, source.encode())
+    shim.chmod(0o700)
+    return metadata, {"PATH": str(tool_dir) + os.pathsep + source_env.get("PATH", os.defpath)}
 
 
 def load_baseline(path: Path = BASELINE) -> dict:
@@ -408,7 +492,7 @@ def host_argv(host: str, wrapper: Path, session_id: str, prompt: str,
 
 
 def build_prompt(case: dict, prompt: str, handoff: str | None = None,
-                 host: str | None = None) -> str:
+                 host: str | None = None, harness_context: str | None = None) -> str:
     read_boundary = ""
     if case["mode"] in {"plan_only", "native_discovery"}:
         read_boundary = (
@@ -436,6 +520,8 @@ def build_prompt(case: dict, prompt: str, handoff: str | None = None,
     )
     if handoff is not None:
         text += "\n\nDurable handoff artifact from the preceding fresh process follows verbatim:\n\n" + handoff
+    if harness_context is not None:
+        text += "\n\nRunner-provided fixture context:\n" + harness_context
     return text + (
         "\n\nThis is a fresh-session parity evidence capture. Do not claim work, tool use, "
         "validation, or external state changes that you did not actually perform. Do not "
@@ -444,7 +530,8 @@ def build_prompt(case: dict, prompt: str, handoff: str | None = None,
 
 
 def execute_process(host: str, wrapper: Path, cwd: Path, stage_dir: Path, case: dict,
-                    prompt: str, invocation_id: str, step: int = 1) -> tuple[dict, bool, dict]:
+                    prompt: str, invocation_id: str, step: int = 1,
+                    env_overrides: dict[str, str] | None = None) -> tuple[dict, bool, dict]:
     stage_dir.mkdir(parents=True, mode=PRIVATE_DIR_MODE, exist_ok=True)
     if stage_dir.is_symlink() or not stage_dir.is_dir():
         raise DogfoodError(f"Invalid case evidence directory: {stage_dir}")
@@ -466,10 +553,13 @@ def execute_process(host: str, wrapper: Path, cwd: Path, stage_dir: Path, case: 
         argv = host_argv(host, wrapper, invocation_id, prompt,
                          read_only=case["mode"] in {"plan_only", "native_discovery"})
         record["status"] = "RUNNING"
+        child_env = fixture_process_env()
+        if env_overrides:
+            child_env.update(env_overrides)
         try:
             proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
                                     stdout=stdout_file, stderr=stderr_file, shell=False,
-                                    env=fixture_process_env(), start_new_session=True)
+                                    env=child_env, start_new_session=True)
         except OSError as exc:
             record.update(status="FAILED_LAUNCH", detail=str(exc))
             record["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -553,10 +643,23 @@ def execute_case(host: str, wrapper: Path, run_dir: Path, case: dict,
         git(work, "add", "README.md")
         git(work, "commit", "--quiet", "-m", "🧪 fixture: initialize isolated case")
         cwd = work
+    extra_env = None
+    harness_context = None
+    if case["id"] == 5:
+        toolchain, extra_env = configure_typescript_toolchain(case_dir, cwd / "typescript", os.environ)
+        tsc = toolchain["typescript"]
+        if tsc["status"] == "available":
+            harness_context = (f"The fixture's tsc command delegates to the verified existing TypeScript "
+                               f"compiler ({tsc['version']}, SHA-256 {tsc['compiler_sha256']}). "
+                               "Do not install packages or invoke another compiler; report only checks actually run.")
+        else:
+            harness_context = ("No existing TypeScript compiler was configured and verified. The fixture's "
+                               "tsc command will explicitly refuse as unavailable; do not install packages, "
+                               "invoke another compiler, or claim TypeScript validation passed.")
     if case["id"] != 17:
-        prompt = build_prompt(case, case["prompt"], host=host)
+        prompt = build_prompt(case, case["prompt"], host=host, harness_context=harness_context)
         record, stop_run, _ = execute_process(
-            host, wrapper, cwd, case_dir, case, prompt, str(uuid.uuid4()))
+            host, wrapper, cwd, case_dir, case, prompt, str(uuid.uuid4()), env_overrides=extra_env)
         if fixture_repo:
             record["fixture_repository"] = str(fixture_repo)
             save_record(case_dir / "result.json", record, replace=True)
