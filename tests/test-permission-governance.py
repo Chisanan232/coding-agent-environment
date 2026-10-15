@@ -388,6 +388,158 @@ class SyncCheckSemanticDiff(unittest.TestCase):
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
+    def test_live_missing_the_merge_automode_allow_entry_is_reported(self):
+        def mutate(d):
+            d["autoMode"].pop("allow", None)
+
+        home = self._fixture_home(mutate)
+        try:
+            report = self._run_sync_check(home)
+            self.assertIn("missing autoMode.allow", report)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+OVERLAY_TEMPLATE = ROOT / "docs/examples/secret-metadata-overlay.example.json"
+
+
+def _rule_regex(rule):
+    """Emulate Claude Code Bash rule matching: `X:*` = X or X + space + anything;
+    otherwise `*` spans any text. Static layer only — classifier not modeled."""
+    body = rule[len("Bash("):-1]
+    if body.endswith(":*"):
+        pre = re.escape(body[:-2])
+        return re.compile(rf"^{pre}(?: .*)?$", re.S)
+    return re.compile("^" + ".*".join(re.escape(x) for x in body.split("*")) + "$", re.S)
+
+
+def static_decision(command, permissions):
+    """deny > ask > allow, first bucket with a match wins; else 'classifier'."""
+    for bucket in ("deny", "ask", "allow"):
+        for rule in permissions[bucket]:
+            if rule.startswith("Bash(") and _rule_regex(rule).match(command):
+                return bucket
+    return "classifier"
+
+
+class SPE105EffectiveBehavior(unittest.TestCase):
+    """Effective static allow/ask/deny outcomes, not just JSON validity. The
+    Auto Mode classifier layer is NOT modeled and is not claimed here."""
+
+    def setUp(self):
+        self.perm = load_settings()["permissions"]
+
+    def assertDecision(self, expected, commands, perm=None):
+        for cmd in commands:
+            for prefix in ("", "rtk "):
+                with self.subTest(cmd=prefix + cmd):
+                    self.assertEqual(expected, static_decision(prefix + cmd, perm or self.perm))
+
+    def test_read_only_git_is_statically_allowed(self):
+        self.assertDecision("allow", [
+            "git status", "git status --short", "git log --oneline -5", "git diff HEAD~1",
+            "git show abc123", "git rev-parse HEAD", "git rev-list --count main..HEAD",
+            "git ls-files", "git remote -v", "git worktree list --porcelain",
+        ])
+
+    def test_narrow_git_allows_do_not_cover_broader_commands(self):
+        self.assertDecision("classifier", [
+            "git -c core.pager=evil status", "git remote add x http://x", "git remote set-url origin x",
+            "git reflog expire --all", "git statusx", "git worktree remove /some/tree",
+        ])
+
+    def test_output_writing_git_forms_ask(self):
+        self.assertDecision("ask", ["git diff --output=/tmp/x", "git log -p --output=/tmp/y", "git show HEAD --output=f", "git diff --ext-diff HEAD~1"])
+
+    def test_dangerous_worktree_operations_ask_in_every_flag_position(self):
+        self.assertDecision("ask", [
+            "git worktree remove --force /t", "git worktree remove -f /t", "git worktree remove /t -f",
+            "git worktree remove /t --force", "git worktree remove -f -f /t",
+            "git worktree prune", "git worktree prune --dry-run", "git worktree move a b",
+        ])
+
+    def test_routine_worktree_operations_remain_allowed(self):
+        self.assertDecision("allow", ["git worktree add ../w -b feature", "git worktree list", "git worktree repair"])
+
+    def test_no_allow_rule_reaches_git_push_or_force_removal(self):
+        self.assertDecision("classifier", ["git push origin main"])
+        self.assertDecision("ask", ["git push --force origin x", "git reset --hard HEAD~1", "git clean -fd"])
+
+    def test_deny_boundaries_unchanged_and_beat_everything(self):
+        self.assertDecision("deny", [
+            "terraform destroy", "terraform -chdir=x destroy", "terraform apply -destroy",
+            "gcloud secrets versions access latest --secret=s",
+            "gcloud --project=p secrets versions access latest --secret=s",
+        ])
+        self.assertIn("mcp__neon__get_connection_string", self.perm["deny"])
+        self.assertEqual("deny", static_decision("rtk proxy git push", self.perm))
+
+    def test_public_baseline_carries_no_project_specific_secret_rules(self):
+        """ADR-0012 Decision 2/6: private project names live in an overlay."""
+        blob = json.dumps(self.perm)
+        self.assertNotIn("horonom", blob)
+        self.assertNotIn("sync-neon-secret", blob)
+        self.assertNotRegex(blob, r"gcloud secrets (?:versions )?(?:add|create)")
+
+    def test_merge_authorization_is_evidence_gated_prose_not_a_blanket(self):
+        d = load_settings()
+        entries = d["autoMode"]["allow"]
+        self.assertEqual("$defaults", entries[0])
+        merge = [e for e in entries if "merge" in e.lower()]
+        self.assertEqual(1, len(merge))
+        for needle in ("merge commit", "--match-head-commit", "squash", "green", "conflicts", "owns or administers"):
+            self.assertIn(needle, merge[0])
+        self.assertNotIn("soft_deny", d["autoMode"])
+        self.assertNotIn("hard_deny", d["autoMode"])
+
+    def test_bypass_permissions_never_enabled(self):
+        text = SETTINGS_PATH.read_text()
+        self.assertNotIn("bypassPermissions", text)
+        self.assertEqual("auto", load_settings()["permissions"]["defaultMode"])
+
+
+class SecretMetadataOverlayTemplate(unittest.TestCase):
+    """The private-overlay template grants metadata + write-only version add,
+    never plaintext reads, and deny still wins when merged with the baseline."""
+
+    def setUp(self):
+        t = json.loads(OVERLAY_TEMPLATE.read_text())
+        rules = [r.replace("<private-gcp-project>", "proj-x") for r in t["permissions"]["allow"]]
+        base = load_settings()["permissions"]
+        self.merged = {"deny": base["deny"], "ask": base["ask"], "allow": base["allow"] + rules}
+
+    def test_metadata_and_write_only_commands_are_allowed_for_the_scoped_project(self):
+        for cmd in (
+            "gcloud secrets list --project=proj-x", "gcloud secrets describe s1 --project=proj-x",
+            "gcloud secrets create s1 --project=proj-x", "gcloud secrets versions list s1 --project=proj-x",
+            "gcloud secrets versions describe 3 --secret=s1 --project=proj-x",
+            "gcloud secrets versions add s1 --project=proj-x --data-file=-",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual("allow", static_decision(cmd, self.merged))
+
+    def test_other_projects_and_unscoped_shapes_are_not_allowed(self):
+        for cmd in (
+            "gcloud secrets versions list s1 --project=other", "gcloud secrets create s1",
+            "gcloud secrets versions add s1 --project=proj-x --data-file=/etc/passwd",
+            "gcloud secrets versions add s1 --project=proj-x --data-file=- --extra",
+            "gcloud secrets delete s1 --project=proj-x", "gcloud secrets versions destroy 1 --secret=s --project=proj-x",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertNotEqual("allow", static_decision(cmd, self.merged))
+
+    def test_secret_value_reads_stay_denied_even_with_the_overlay(self):
+        for cmd in (
+            "gcloud secrets versions access latest --secret=s1 --project=proj-x",
+            "gcloud secrets versions access 1 --secret=s --project=proj-x --data-file=-",
+            "gcloud --project=proj-x secrets versions access latest --secret=s1",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual("deny", static_decision(cmd, self.merged))
+
+    def test_template_has_no_real_project_name(self):
+        self.assertNotIn("horonom", OVERLAY_TEMPLATE.read_text())
+
 
 if __name__ == "__main__":
     unittest.main()
