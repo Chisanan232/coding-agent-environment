@@ -131,3 +131,41 @@ and preserve their resources, including with an enabled cleanup envelope.
 Rollback must preserve the records and exported data; do not remove claims to
 make an older binary accept them. Both hosts and the owned monitor must use the
 reviewed core pin before relying on this additive capability.
+
+## Native consumer entitlements (evidence-only opt-in)
+
+`CODING_AGENT_NATIVE_RESOURCES` accepts a JSON array of one to eight existing
+`{id, generation}` native registrations. It is mutually exclusive with managed
+resource variables. Both launchers use the same adapter and verified Glomeris
+core. With neither opt-in set, launch behavior is unchanged. Enrollment never
+changes Cargo target settings, Docker configuration, or Git worktree contents.
+
+The core can register a Cargo target directory, registered Git worktree, or
+local Docker socket with a caller-declared builder label. These labels are not
+verified host-session lineage or Docker daemon identity. Registration and
+consumer leases are evidence, not reconstructability or retirement authority.
+No native cleanup category is enabled by this integration.
+
+The adapter acquires each requested generation and prepares child scope before
+launch, then confirms the observed child identity. Credentials remain in memory
+and stdin, never child arguments or environment. Unconfirmed operations preserve
+claims and useful children; they do not trigger process termination. Renewals do
+not count as meaningful activity. Direct-child exit transitions the owner to
+waiting, preserving resumable sessions and child claims rather than asserting
+that every descendant or future consumer has finished. Explicit authenticated
+child release/resume is a separate core operation; elapsed time or process death
+cannot substitute for it. Inspection redacts capabilities and always reports
+incomplete consumer coverage. The 24-hour inactivity policy is unchanged.
+
+Shared namespace locking fences cleanup against enrolled scopes, even if a
+manual plan predates enrollment. This does not establish complete acquisition
+interception for unmodified native tools. Legacy ownership, task completion,
+consumer closure, and native retirement remain separate acceptance gates.
+
+Reviewed policy-receipt migration supports the original pin, the previous
+export-capable pin, and this native-entitlement pin only. A completed schema-2
+journal may append the next known transition while preserving its prior chain
+and original rollback snapshots. Native policy and authority bytes must remain
+unchanged. Unknown transitions, incomplete transactions, drift, and corrupt
+current executable receipts still refuse migration. Rollback preserves native
+records and data; older cores do not gain authority to reclaim enrolled scopes.

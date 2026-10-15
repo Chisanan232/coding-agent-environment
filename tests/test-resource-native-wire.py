@@ -10,7 +10,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -93,20 +95,20 @@ class NativeWireTests(unittest.TestCase):
                                                    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"}:
                 self.env.pop(key)
 
-    def core(self, *args, env=None, check=True):
+    def core(self, *args, env=None, check=True, payload=None):
         result = subprocess.run([str(BINARY), *map(str, args)], env=env or self.env,
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=30, input=payload)
         if check and result.returncode:
             self.fail(f"Glomeris {args!r} failed ({result.returncode}): {result.stderr}\n{result.stdout}")
         return result
 
-    def install_actual_adapter_bootstrap(self):
-        scripts = self.home / ".claude/skills/engineering-runtime/scripts"
+    def install_actual_adapter_bootstrap(self, host="claude"):
+        scripts = self.home / f".{host}/skills/engineering-runtime/scripts"
         scripts.mkdir(parents=True, mode=0o700)
         container = self.home / ".local/share/coding-agent-environment"
         managed = container / "storage"
         binary_dir = managed / "glomeris" / self.binary_sha256 / "bin"
-        binary_dir.mkdir(parents=True, mode=0o700)
+        binary_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
         for directory in (self.home / ".local", self.home / ".local/share", container,
                           managed, managed / "glomeris", binary_dir.parent, binary_dir):
             directory.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -144,12 +146,84 @@ print("export ENGINEERING_STORAGE_STATUS=" + status)
         (source / "src").mkdir()
         (source / "Cargo.toml").write_text('[package]\nname = "native-wire-fixture"\nversion = "0.1.0"\nedition = "2021"\n')
         (source / "src/lib.rs").write_text("pub fn generated_value() -> u32 { 7 }\n")
-        subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(source), "config", "user.name", "Native Wire Test"], check=True)
-        subprocess.run(["git", "-C", str(source), "config", "user.email", "native-wire@example.invalid"], check=True)
-        subprocess.run(["git", "-C", str(source), "add", "Cargo.toml", "src/lib.rs"], check=True)
-        subprocess.run(["git", "-C", str(source), "commit", "-qm", "fixture source"], check=True)
+        git_env = {key: value for key, value in self.env.items() if not key.startswith("GIT_")}
+        git_env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+        def git(*args):
+            subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args],
+                           check=True, capture_output=True, env=git_env)
+        git("init", "-q", str(source))
+        git("-C", str(source), "config", "user.name", "Native Wire Test")
+        git("-C", str(source), "config", "user.email", "native-wire@example.invalid")
+        git("-C", str(source), "add", "Cargo.toml", "src/lib.rs")
+        git("-C", str(source), "commit", "-qm", "fixture source")
         return source
+
+    def test_actual_core_native_adapter_acquires_both_hosts_and_keeps_future_use(self):
+        for host in ("claude", "codex"):
+            with self.subTest(host=host):
+                self.install_actual_adapter_bootstrap(host)
+                target = self.root / (host + "-target")
+                target.mkdir(mode=0o700)
+                request = {"op": "register", "request_id": uuid.uuid4().hex,
+                           "kind": "cargo_target", "path": str(target)}
+                registered = json.loads(self.core("resource", "native", "request", "--json",
+                                                  payload=json.dumps(request)).stdout)
+                marker = self.root / (host + "-child.json")
+                env = dict(self.env, CODING_AGENT_NATIVE_RESOURCES=json.dumps([
+                    {key: registered[key] for key in ("id", "generation")}]),
+                    CODING_AGENT_RESOURCE_SESSION_ID="native-wire-" + host)
+                for key in ("CODING_AGENT_MANAGED_RESOURCE_ID", "CODING_AGENT_MANAGED_RESOURCE_GENERATION"):
+                    env.pop(key, None)
+                started = self.root / (host + "-child-started")
+                finish = self.root / (host + "-child-finish")
+                child_code = """import json, os, pathlib, sys, time
+started = pathlib.Path(sys.argv[1])
+finish = pathlib.Path(sys.argv[2])
+started.write_text('started')
+deadline = time.monotonic() + 8
+while not finish.exists() and time.monotonic() < deadline:
+    time.sleep(.01)
+if not finish.exists():
+    raise SystemExit(86)
+json.dump({'args': sys.argv[4:], 'nested': os.environ.get('CODING_AGENT_NATIVE_RESOURCES')},
+          open(sys.argv[3], 'w'))
+print('child-finished')
+"""
+                child = [sys.executable, "-c", child_code, str(started), str(finish), str(marker), "a b"]
+                adapter = subprocess.Popen([sys.executable, str(ROOT / "bin/coding-agent-resource"),
+                                            "--host", host, "--", *child], env=env,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                deadline = time.monotonic() + 5
+                confirmed_record = None
+                while time.monotonic() < deadline and adapter.poll() is None:
+                    records = json.loads(self.core("resource", "native", "inspect", "--json").stdout)
+                    candidate = next((item for item in records if item["id"] == registered["id"]), None)
+                    if candidate and candidate.get("claims"):
+                        claim = candidate["claims"][0]
+                        if any(child_record.get("identity") and not child_record["released"]
+                               for child_record in claim.get("children", [])):
+                            confirmed_record = candidate
+                            finish.write_text("parent observed confirmed child\n")
+                            break
+                    time.sleep(.02)
+                stdout, stderr = adapter.communicate(timeout=35)
+                self.assertIsNotNone(confirmed_record,
+                                     "child must stay alive until its confirmed claim is observed")
+                self.assertTrue(started.is_file(), "adapter must launch child before confirmation")
+                self.assertIn("child-finished", stdout)
+                self.assertEqual(adapter.returncode, 0, stderr)
+                self.assertTrue(finish.is_file())
+                self.assertEqual(json.loads(marker.read_text()), {"args": ["a b"], "nested": None})
+                records = json.loads(self.core("resource", "native", "inspect", "--json").stdout)
+                record = next(item for item in records if item["id"] == registered["id"])
+                self.assertFalse(record["cleanup_authority"])
+                self.assertFalse(record["eligible"])
+                self.assertEqual(record["claims"][0]["host"], host)
+                self.assertEqual(record["claims"][0]["state"], "waiting")
+                self.assertEqual(len(record["claims"][0]["children"]), 1)
+                self.assertFalse(record["claims"][0]["children"][0]["released"])
+                self.assertNotIn('"token"', json.dumps(record))
+                self.assertTrue(target.is_dir(), "normal host exit cannot authorize retirement")
 
     def create_produced_generation(self):
         source = self.git_source()
@@ -211,8 +285,16 @@ print("export ENGINEERING_STORAGE_STATUS=" + status)
         installer = INSTALLER.ResourcePolicyInstaller(self.home, BINARY)
         self.assertEqual(installer.apply(), "installed")
         journal = json.loads(installer.journal_path.read_text())
-        journal["pin_revision"] = "f98389017b8ea52035d25bb21598711fd5f882a0"
+        # Model an already-rebound installation; this is a journal fixture,
+        # not a claim that an historical executable was run by this test.
+        journal["pin_revision"] = INSTALLER.HISTORICAL_REBIND[1]
+        history = {"from_revision": INSTALLER.HISTORICAL_REBIND[0],
+                   "to_revision": INSTALLER.HISTORICAL_REBIND[1],
+                   "target_binary_sha256": "b" * 64,
+                   "previous_journal_sha256": "c" * 64}
+        journal.update(schema=2, pin_rebindings=[history])
         INSTALLER.storage.atomic_json(installer.journal_path, journal)
+        prior_journal = installer.journal_path.read_bytes()
         before = {p: p.read_bytes() for p in (installer.policy_path, installer.authority_path)}
         original_before = journal["before"]
         fixture_binary, status = INSTALLER.resolver.resolve(self.home, self.pin)
@@ -222,6 +304,10 @@ print("export ENGINEERING_STORAGE_STATUS=" + status)
         rebound = json.loads(installer.journal_path.read_text())
         self.assertEqual(rebound["before"], original_before)
         self.assertEqual(rebound["schema"], 2)
+        self.assertEqual(rebound["pin_rebindings"][0], history)
+        self.assertEqual(len(rebound["pin_rebindings"]), 2)
+        self.assertEqual(rebound["pin_rebindings"][-1]["previous_journal_sha256"],
+                         hashlib.sha256(prior_journal).hexdigest())
         self.assertEqual(rebound["pin_revision"], self.pin["revision"])
         for path, raw in before.items():
             self.assertEqual(path.read_bytes(), raw)
