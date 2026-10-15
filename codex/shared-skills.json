@@ -49,6 +49,7 @@
       "scripts/precommit-gate.sh": ".claude/hooks/precommit-gate.sh",
       "scripts/quality_gate.sh": ".claude/hooks/quality_gate.sh",
       "scripts/session-memory.sh": ".claude/hooks/session-memory.sh",
+      "scripts/ticket-state.py": ".claude/hooks/ticket-state.py",
       "scripts/workflow-state.sh": ".claude/hooks/workflow-state.sh",
       "references/RTK.md": ".claude/RTK.md",
       "references/storage-core.json": "codex/storage-core.json",

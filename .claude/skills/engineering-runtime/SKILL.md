@@ -81,6 +81,14 @@ observe/act/verify/record; a per-write lock alone cannot serialize external acti
 Status/receipts are evidence, never a cleanup grant. Context markers remain
 preserved until all writers use a coordinated ownership protocol.
 
+Native notes and workflow writers share `ticket-state.py` revisioned operations.
+Capture `session-memory.sh snapshot TICKET` / `workflow-state.sh snapshot TICKET`
+while observing the completed task. Clearing/archiving requires that original
+token; concurrent replacement, even identical content in a new generation,
+refuses. Notes are archived durably rather than destroyed. Legacy files remain
+readable but cannot be cleared without coordinated writer provenance. These
+tokens are state snapshots, never proof that a task or session has finished.
+
 Closeout schema 2 separately checkpoints archive, decision and notes finalization.
 Read `effective_complete`; legacy terminal flags leave finalization unverified.
 Install the same helper for both hosts before reconciling legacy receipts.
