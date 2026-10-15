@@ -19,9 +19,18 @@ for ordinary engineering. Classify before asking; most questions are Level 0 or 
 | 3 | Already authorized | Cite the durable record; do not re-ask. |
 | 4 | Host permission | Report the blocked operation; never bypass. |
 
+Levels govern product-decision escalation only. They never narrow an
+explicit-confirmation, owner-decision, production, destructive, publication, IAM,
+payment, credential or CI-definition gate in global or project instructions; those
+stay gated at every level.
+
 Test in order: Level 4 (is a host control refusing the action?), Level 3 (does a
 verified record cover this exact scope?), Level 2 (does it change a protected
-property below?), Level 1 (is it a substantive design choice?), else Level 0.
+property below, or any Level 1 invariant?), Level 1 (is it a substantive design
+choice?), else Level 0. Level 4 is an overlay, not exclusive: report a host refusal
+in addition to, never instead of, the Level 3/2 result. If unsure whether a
+security, privacy, authorization, data-loss or spend property changes, treat it as
+Level 2.
 
 ### Level 0 — autonomous
 
@@ -29,8 +38,12 @@ Never ask the founder about: algorithm and implementation details; normal
 refactoring; test design and fixtures; CI/build environment debugging; safe
 dependency updates; ordinary performance work; internal documentation;
 reproducing and fixing real bugs; Jira bug/improvement tickets; independent AI
-code/security review and fixing its findings; PR creation and merges the gates
-permit; safe task-owned post-merge cleanup.
+code/security review and fixing its findings; PR creation and merges that pass
+every `engineering-workflow` gate, including real required/code-owner approvals
+(never submit an approving review from the author identity); safe task-owned
+post-merge cleanup. Task-owned means created by this session/ticket as recorded in
+its checkpoint or `.claude/.current-worktree`; a matching branch name, Done ticket
+or merged PR alone does not prove ownership.
 
 ### Level 1 — delegated architecture
 
@@ -43,7 +56,7 @@ founder to choose between technically equivalent internal implementations.
 
 ### Level 2 — founder decision
 
-Escalate only when the decision materially changes: product positioning or primary
+Escalate at least when the decision materially changes: product positioning or primary
 user outcome; a user-visible budget/cost/authority guarantee; public compatibility
 commitments; data retention or privacy commitments; credential or security-principal
 authority; trusted execution or fail-open/fail-closed defaults; material new
@@ -59,16 +72,25 @@ choices.
 Do not re-ask an approved decision within the same verified scope. Cite its durable
 Jira/ADR record. Reconfirm only when actual scope, risk, authority, resources or
 material conditions changed. Founder consent is never inferred or fabricated from
-an agent's own Jira comment or engineering reasoning; a record counts only when its
-author is verifiably the founder (or an authorized delegate).
+any agent-produced record (any session or subagent) or from engineering reasoning.
+The author field is not proof, because agents may post under the founder's
+credentials. A record counts only if it is a human-written founder reply to a
+specific decision, or a founder-authored ADR/ticket field, and it names the scope. A
+delegate counts only if a founder-authored record names that human.
 
 ### Level 4 — host permissions
 
 Founder business authorization is distinct from actual Claude Code/Codex/OS
-execution permission. Do not bypass ASK, DENY, managed settings, branch protection
-or an explicit classifier refusal. Do not switch to `bypassPermissions`, rewrite
-commands, add wrappers or use alternative tools to evade a denial. Report the exact
-operation and the supported approval mechanism. A permission denial is never a
+execution permission. Do not bypass ASK, DENY, managed settings or an explicit
+classifier refusal. Branch protection yields only to the two `engineering-workflow`
+administrator-merge exceptions, with their recorded evidence, by the main
+coordinator; never otherwise. Do not switch to `bypassPermissions`, rewrite
+commands, add wrappers or use alternative tools to evade a denial. Re-issuing the
+documented canonical form of the same operation is permitted; changing the
+operation, tool, target or wrapper to obtain a different permission outcome is
+evasion. Report the exact operation, with any secret-bearing argument redacted, and
+the supported approval mechanism. Approving a host permission prompt is not founder
+product consent. A permission denial is never a
 missing founder product decision, and a founder decision does not lift a denial.
 No human approval is ever claimed that a human did not give; agent review is not a
 human PR approval.
@@ -81,14 +103,17 @@ PR, test or implementation:
 1. Verify the result.
 2. Update Jira with actual evidence.
 3. Verify current PR and base-branch status.
-4. Resolve legitimate review findings.
-5. Perform the authorized merge.
+4. Resolve every material review finding; dismissing one needs a recorded
+   technical reason, and a human REQUEST_CHANGES is never dismissed.
+5. As main coordinator only, perform the merge `engineering-workflow` permits.
 6. Identify newly unblocked tasks.
 7. Continue automatically.
 
 A finished subagent task or PR is not campaign completion. Never claim
 `RELEASE_READY` without verified evidence for every acceptance node. Engineering
-completion implies no new publication or deployment authorization.
+completion implies no new publication or deployment authorization. A merge whose
+pipeline deploys to production or publishes is itself a deployment/publication
+action needing its own Level 3 record or Level 2 packet.
 
 ## Resource and data safety
 
@@ -115,10 +140,13 @@ For every Jira mutation:
 - Verify the target (issue key, comment id) and the operation first, using a read.
 - Never send placeholder, empty, template or dummy bodies.
 - Preserve unrelated existing content; send the smallest scoped change; prefer
-  adding a new comment over editing an existing one, and never edit another
-  author's comment, above all a founder decision.
+  adding a new comment over editing an existing one, and never edit or delete
+  a comment this session did not create (track by comment id); founder decision
+  comments are immutable to agents.
 - Independently read the result back and confirm prior content survived.
-- If a read-back shows damage, stop, restore from history, and disclose it.
+- If a read-back shows damage, stop, restore only the content this session
+  damaged to its exact prior bytes, read back again, and disclose the incident to
+  the founder.
 
 ## Defers to
 

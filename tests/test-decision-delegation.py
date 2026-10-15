@@ -23,18 +23,21 @@ CLAUDE_MD = ROOT / ".claude/CLAUDE.md"
 AGENTS_MD = ROOT / "codex/AGENTS.md"
 
 
-def classify(flags: set) -> int:
-    """The documented order: host, existing authorization, protected, design, routine."""
-    if "host_refusal" in flags:
-        return 4
+def base_level(flags: set) -> int:
     if ("verified_authorization_same_scope" in flags and "scope_changed" not in flags
             and "agent_authored_record_only" not in flags):
         return 3
-    if "changes_protected" in flags:
+    if "changes_protected" in flags or "changes_level1_invariant" in flags:
         return 2
     if "substantive_design" in flags:
         return 1
     return 0
+
+
+def classify(flags: set) -> list:
+    """Reference order from the skill; Level 4 is an overlay reported with the base level."""
+    base = base_level(flags)
+    return [4, base] if "host_refusal" in flags else [base]
 
 
 def flat(text: str) -> str:
@@ -51,7 +54,8 @@ def managed_block(path: Path, name: str) -> str:
 class PolicyText(unittest.TestCase):
     text = flat(SKILL.read_text())
 
-    def test_level_order_is_documented_and_scenarios_follow_it(self) -> None:
+    def test_fixture_matches_reference_order(self) -> None:
+        """Checks fixture consistency with the reference order, not model behavior."""
         self.assertIn("Level 4 (is a host control refusing the action?), Level 3", self.text)
         for s in FIX["scenarios"]:
             with self.subTest(s["id"]):
@@ -66,10 +70,12 @@ class PolicyText(unittest.TestCase):
                 self.assertIn(phrase, self.text)
 
     def test_consequential_decisions_escalate_with_one_packet(self) -> None:
-        raw = SKILL.read_text()
         for prop in FIX["protected_properties"]:
             with self.subTest(prop):
-                self.assertIn(prop, raw)
+                self.assertIn(prop, self.text)
+        for gate in FIX["gated_classes"]:
+            with self.subTest(gate):
+                self.assertIn(gate, self.text.split("Test in order")[0])
         for phrase in ["Send ONE packet", "recommended option", "exact minimum founder action",
                        "Never write repetitive multi-page packets"]:
             self.assertIn(phrase, self.text)
@@ -78,26 +84,31 @@ class PolicyText(unittest.TestCase):
         for phrase in ["Do not re-ask an approved decision within the same verified scope",
                        "Cite its durable Jira/ADR record",
                        "Reconfirm only when actual scope, risk, authority, resources or material conditions changed",
-                       "never inferred or fabricated from an agent's own Jira comment"]:
+                       "never inferred or fabricated from any agent-produced record",
+                       "The author field is not proof", "names the scope"]:
             self.assertIn(phrase, self.text)
 
     def test_host_denials_are_not_bypassed_or_mislabeled(self) -> None:
-        for phrase in ["Do not bypass ASK, DENY, managed settings, branch protection or an explicit classifier refusal",
+        for phrase in ["Do not bypass ASK, DENY, managed settings or an explicit classifier refusal",
+                       "Branch protection yields only to the two `engineering-workflow` administrator-merge exceptions",
                        "`bypassPermissions`", "rewrite commands, add wrappers or use alternative tools",
-                       "never a missing founder product decision",
+                       "never a missing founder product decision", "Approving a host permission prompt is not founder product consent",
+                       "evasion",
                        "No human approval is ever claimed that a human did not give",
                        "agent review is not a human PR approval"]:
             self.assertIn(phrase, self.text)
 
     def test_release_dag_continues_in_order(self) -> None:
         steps = ["Verify the result.", "Update Jira with actual evidence.",
-                 "Verify current PR and base-branch status.", "Resolve legitimate review findings.",
-                 "Perform the authorized merge.", "Identify newly unblocked tasks.", "Continue automatically."]
+                 "Verify current PR and base-branch status.", "Resolve every material review finding; dismissing one needs a recorded technical reason, and a human REQUEST_CHANGES is never dismissed.",
+                 "As main coordinator only, perform the merge `engineering-workflow` permits.", "Identify newly unblocked tasks.", "Continue automatically."]
         raw = SKILL.read_text()
-        positions = [raw.index(f"{i}. {s}") for i, s in enumerate(steps, 1)]
+        flat_raw = flat(raw)
+        positions = [flat_raw.index(f"{i}. {s}") for i, s in enumerate(steps, 1)]
         self.assertEqual(positions, sorted(positions))
         for phrase in ["A finished subagent task or PR is not campaign completion",
-                       "Never claim `RELEASE_READY`", "implies no new publication or deployment authorization"]:
+                       "Never claim `RELEASE_READY`", "As main coordinator only, perform the merge",
+                       "needing its own Level 3 record or Level 2 packet", "implies no new publication or deployment authorization"]:
             self.assertIn(phrase, self.text)
 
     def test_active_state_is_preserved(self) -> None:
@@ -112,24 +123,34 @@ class PolicyText(unittest.TestCase):
                        "FORNX-439, comment 27362", "literal `placeholder`",
                        "Never send placeholder, empty, template or dummy bodies",
                        "Independently read the result back",
-                       "never edit another author's comment"]:
+                       "founder decision comments are immutable to agents"]:
             self.assertIn(phrase, self.text)
 
-    def test_corporate_restrictions_are_never_loosened(self) -> None:
+    def test_repo_claude_settings_not_bypass_mode_and_skill_defers(self) -> None:
+        """Scope: repo Claude settings only; corporate profiles are covered by the resolver tests."""
         self.assertIn("Corporate/managed profiles keep their restrictions; this skill never loosens them", self.text)
         settings = json.loads((ROOT / ".claude/settings.json").read_text())
         self.assertNotEqual(settings.get("permissions", {}).get("defaultMode"), "bypassPermissions")
 
 
 class ManagedBlocks(unittest.TestCase):
+    def test_both_hosts_carry_identical_delegation_text(self) -> None:
+        paragraphs = []
+        for path, name in [(CLAUDE_MD, "engineering-workflow"), (AGENTS_MD, "signal-first")]:
+            block = flat(managed_block(path, name))
+            paragraphs.append(block[block.index("Decision delegation: act as senior"):block.rindex("<!--")].strip())
+        self.assertEqual(paragraphs[0], paragraphs[1])
+        for gate in FIX["gated_classes"]:
+            self.assertIn(gate, paragraphs[0])
+
     def test_both_hosts_carry_the_same_invariants(self) -> None:
         blocks = [managed_block(CLAUDE_MD, "engineering-workflow"), managed_block(AGENTS_MD, "signal-first")]
         for block in blocks:
             text = flat(block)
-            for phrase in ["`decision-delegation`", "Level 2 founder decision only for",
-                           "never infer founder consent from an agent's own Jira comment",
+            for phrase in ["`decision-delegation`", "Level 2 founder decision at least for",
+                           "never infer founder consent from any agent-produced record",
                            "never bypassed or relabeled a product decision", "no fake human approval",
-                           "preserve active or ambiguously owned worktrees", "FORNX-439 comment 27362"]:
+                           "preserve active or ambiguously owned worktrees and sessions", "FORNX-439 comment 27362"]:
                 with self.subTest(phrase=phrase):
                     self.assertIn(phrase, text)
 

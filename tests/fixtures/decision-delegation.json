@@ -1,27 +1,174 @@
 {
   "protected_properties": [
-    "product positioning or primary\nuser outcome",
+    "product positioning or primary user outcome",
     "user-visible budget/cost/authority guarantee",
-    "public compatibility\ncommitments",
+    "public compatibility commitments",
     "data retention or privacy commitments",
-    "credential or security-principal\nauthority",
+    "credential or security-principal authority",
     "trusted execution or fail-open/fail-closed defaults",
-    "material new\nexternal expenditure",
+    "material new external expenditure",
     "irreversible customer/production data consequences"
   ],
   "scenarios": [
-    {"id": "refactor-helper", "flags": [], "expected": 0},
-    {"id": "fix-flaky-fixture", "flags": [], "expected": 0},
-    {"id": "safe-dependency-bump", "flags": [], "expected": 0},
-    {"id": "choose-between-equivalent-internals", "flags": ["substantive_design"], "expected": 1},
-    {"id": "new-queue-internal-only", "flags": ["substantive_design"], "expected": 1},
-    {"id": "change-fail-open-to-fail-closed-default", "flags": ["substantive_design", "changes_protected"], "expected": 2},
-    {"id": "add-paid-vendor-spend", "flags": ["changes_protected"], "expected": 2},
-    {"id": "extend-data-retention", "flags": ["changes_protected"], "expected": 2},
-    {"id": "approved-decision-same-scope", "flags": ["changes_protected", "verified_authorization_same_scope"], "expected": 3},
-    {"id": "approved-decision-scope-grew", "flags": ["changes_protected", "verified_authorization_same_scope", "scope_changed"], "expected": 2},
-    {"id": "agent-comment-only-no-founder-record", "flags": ["changes_protected", "agent_authored_record_only"], "expected": 2},
-    {"id": "ask-rule-blocks-merge", "flags": ["host_refusal"], "expected": 4},
-    {"id": "deny-despite-founder-approval", "flags": ["host_refusal", "changes_protected", "verified_authorization_same_scope"], "expected": 4}
+    {
+      "id": "refactor-helper",
+      "flags": [],
+      "expected": [
+        0
+      ]
+    },
+    {
+      "id": "fix-flaky-fixture",
+      "flags": [],
+      "expected": [
+        0
+      ]
+    },
+    {
+      "id": "safe-dependency-bump",
+      "flags": [],
+      "expected": [
+        0
+      ]
+    },
+    {
+      "id": "choose-between-equivalent-internals",
+      "flags": [
+        "substantive_design"
+      ],
+      "expected": [
+        1
+      ]
+    },
+    {
+      "id": "new-queue-internal-only",
+      "flags": [
+        "substantive_design"
+      ],
+      "expected": [
+        1
+      ]
+    },
+    {
+      "id": "change-fail-open-to-fail-closed-default",
+      "flags": [
+        "substantive_design",
+        "changes_protected"
+      ],
+      "expected": [
+        2
+      ]
+    },
+    {
+      "id": "add-paid-vendor-spend",
+      "flags": [
+        "changes_protected"
+      ],
+      "expected": [
+        2
+      ]
+    },
+    {
+      "id": "extend-data-retention",
+      "flags": [
+        "changes_protected"
+      ],
+      "expected": [
+        2
+      ]
+    },
+    {
+      "id": "approved-decision-same-scope",
+      "flags": [
+        "changes_protected",
+        "verified_authorization_same_scope"
+      ],
+      "expected": [
+        3
+      ]
+    },
+    {
+      "id": "approved-decision-scope-grew",
+      "flags": [
+        "changes_protected",
+        "verified_authorization_same_scope",
+        "scope_changed"
+      ],
+      "expected": [
+        2
+      ]
+    },
+    {
+      "id": "agent-comment-only-no-founder-record",
+      "flags": [
+        "changes_protected",
+        "verified_authorization_same_scope",
+        "agent_authored_record_only"
+      ],
+      "expected": [
+        2
+      ]
+    },
+    {
+      "id": "ask-rule-blocks-merge",
+      "flags": [
+        "host_refusal"
+      ],
+      "expected": [
+        4,
+        0
+      ]
+    },
+    {
+      "id": "deny-despite-founder-approval",
+      "flags": [
+        "host_refusal",
+        "changes_protected",
+        "verified_authorization_same_scope"
+      ],
+      "expected": [
+        4,
+        3
+      ]
+    },
+    {
+      "id": "host-refusal-plus-unauthorized-protected-change",
+      "flags": [
+        "host_refusal",
+        "changes_protected"
+      ],
+      "expected": [
+        4,
+        2
+      ]
+    },
+    {
+      "id": "rbac-scope-change-outside-level2-list",
+      "flags": [
+        "substantive_design",
+        "changes_level1_invariant"
+      ],
+      "expected": [
+        2
+      ]
+    },
+    {
+      "id": "design-with-all-invariants-unchanged",
+      "flags": [
+        "substantive_design"
+      ],
+      "expected": [
+        1
+      ]
+    }
+  ],
+  "gated_classes": [
+    "production",
+    "destructive",
+    "publication",
+    "IAM",
+    "payment",
+    "credential",
+    "CI-definition"
   ]
 }
