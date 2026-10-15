@@ -42,6 +42,7 @@
   ],
   "resources": {
     "engineering-runtime": {
+      "scripts/ticket-state.py": ".claude/hooks/ticket-state.py",
       "scripts/audit_log.sh": ".claude/hooks/audit_log.sh",
       "scripts/circuit-breaker-gate.sh": ".claude/hooks/circuit-breaker-gate.sh",
       "scripts/decision-log.sh": ".claude/hooks/decision-log.sh",
@@ -49,7 +50,6 @@
       "scripts/precommit-gate.sh": ".claude/hooks/precommit-gate.sh",
       "scripts/quality_gate.sh": ".claude/hooks/quality_gate.sh",
       "scripts/session-memory.sh": ".claude/hooks/session-memory.sh",
-      "scripts/ticket-state.py": ".claude/hooks/ticket-state.py",
       "scripts/workflow-state.sh": ".claude/hooks/workflow-state.sh",
       "references/RTK.md": ".claude/RTK.md",
       "references/storage-core.json": "codex/storage-core.json",
