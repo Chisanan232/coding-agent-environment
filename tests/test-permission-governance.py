@@ -467,17 +467,22 @@ class SPE105EffectiveBehavior(unittest.TestCase):
             "git worktree remove /t --f", "git worktree remove --for --for /t",
             "git -C /repo worktree remove /t", "git -c k=v worktree remove --force /t",
             "git -C /repo worktree prune", "git -C /repo worktree move a b",
-            "git worktree unlock /t", "git worktree add -B existing ../w HEAD~5",
-            "git worktree add ../w -B existing", "git worktree add --force ../w", "git worktree add ../w --for",
+            "git worktree unlock /t", "git worktree add -B existing ../w HEAD~5", "git worktree add -Bexisting ../w", "git worktree add -b x -Bexisting ../w",
+            "git worktree add ../w -B existing", "git diff '--output=/tmp/x'", "git log '--ext-diff' -p", "git fetch '--upload-pack=cmd' .", "git diff --no-index /dev/null x", "git worktree add --force ../w", "git worktree add ../w --for",
             "git fetch --upload-pack=cmd .", "git fetch origin --upload-pack=cmd", "git fetch --upl=cmd .",
         ])
+
+    def test_worktree_add_clusters_and_unlisted_shapes_are_not_allowed(self):
+        """Allow is limited to -b/--detach shapes; clustered short options and
+        bare `add <path> <ref>` go to the classifier (never a silent allow)."""
+        self.assertDecision("classifier", ["git worktree add -qB keep ../w", "git worktree add -qf ../w", "git worktree add ../w main"])
 
     def test_worktree_repair_is_bare_only(self):
         self.assertDecision("allow", ["git worktree repair"])
         self.assertDecision("classifier", ["git worktree repair /some/path"])
 
     def test_routine_worktree_operations_remain_allowed(self):
-        self.assertDecision("allow", ["git worktree add ../w -b feature", "git worktree list", "git worktree repair"])
+        self.assertDecision("allow", ["git worktree add ../w -b feature", "git worktree add -b feature ../w origin/main", "git worktree add --detach ../w", "git worktree list", "git worktree repair"])
 
     def test_no_allow_rule_reaches_git_push_or_force_removal(self):
         self.assertDecision("classifier", ["git push origin main"])

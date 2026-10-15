@@ -224,3 +224,12 @@ Founder-approved scoped refinements; Decisions 1-6 stand.
   classifier, so the merge prose only governs merge forms the classifier
   actually evaluates. It does not narrow those allows and is not claimed to.
   Pre-existing and out of scope: `git branch *` permits `-D`.
+- **Glob limits (accepted, documented)**: ask globs are space-free (`git*--output*`)
+  so position and shell quoting of a flag cannot hide it, and `worktree add` is
+  allowed only for `-b`/`--detach` shapes. Text globs still cannot stop
+  deliberate obfuscation (`--out"put"`), clustered short options after an
+  allowed `-b` (`add -b x -qf`), implicit no-index reads (`git diff /dev/null
+  <file outside the repo>`, equivalent to the already-allowed Read tool), or
+  `git fetch ext::...` helpers (pre-existing `git fetch *` allow; a trailing
+  `::*` is parsed as a prefix rule so no safe ask glob exists). These rules
+  guard accidental misuse; adversarial obfuscation remains the classifier's job.
