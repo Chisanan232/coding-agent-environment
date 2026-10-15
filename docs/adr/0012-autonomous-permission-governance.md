@@ -188,3 +188,39 @@ than preserve all 60 by default, removed two overbroad categories:
   was replaced by narrative guidance aimed at the one thing actually
   capable of judging target/semantics (the classifier), and no rule
   matching this ADR's "mandatory" list (Decision §4) was touched.
+
+## Amendment 1 (SPE-105, 2026-10-15)
+
+Founder-approved scoped refinements; Decisions 1-6 stand.
+
+- **Merge**: `Bash(gh pr merge:*)` was already a static allow, yet Auto Mode's
+  built-in `soft_deny` "Merge Without Review" still refused merges (a
+  classifier judgment, not a rule). `autoMode.allow` now carries one
+  evidence-gated entry (merge commit, pinned head SHA, green or documented
+  CI-unavailable, no conflicts, owned/administered repo, authorized). It is
+  prose to the classifier, not a blanket; `hard_deny` is untouched. Whether the
+  classifier honors it is observed behavior, not a static guarantee.
+- **Read-only git** (`status/log/diff/show/rev-parse/rev-list/ls-files/remote -v`)
+  are static allows. `git * --output*` is `ask` (diff/log/show can write files).
+  RTK's hook was verified not to self-approve any `ask`-shaped variant.
+- **Worktrees**: blanket `git worktree *` allow replaced by
+  list/add/repair/lock/unlock. `remove` with force in any flag position, `prune`
+  and `move` are `ask`; plain `remove` falls to the classifier plus the
+  ownership guidance in `autoMode.environment` (HORO-1700).
+- **Secrets**: Decision 2's exclusion of project-scoped rules is retained. The
+  public baseline does NOT gain `--project=<private>` rules; a tested template
+  lives at `docs/examples/secret-metadata-overlay.example.json` for the
+  private overlay. All four DENY families are unchanged; there is still no
+  `git push` allow (Decision 3).
+- **Review hardening (independent security + regression review)**: git accepts
+  unambiguous long-option prefixes, so force and `--upload-pack` gates use
+  `--f*` / `--upl*`; global-option forms (`git -C x worktree remove`) are `ask`;
+  `worktree unlock`, `add -B`/force, `fetch --upload-pack` (executes a command)
+  and `diff --no-index` (reads arbitrary files) are `ask`; `worktree repair` is
+  bare-only. The secret-overlay template also asks on fully-qualified
+  `projects/<other>/...` names, impersonation and `create --data-file`.
+- **Known limit**: `Bash(gh pr merge:*)` / `mcp__github__merge_pull_request`
+  remain static allows (unchanged); a static allow is decided before the
+  classifier, so the merge prose only governs merge forms the classifier
+  actually evaluates. It does not narrow those allows and is not claimed to.
+  Pre-existing and out of scope: `git branch *` permits `-D`.

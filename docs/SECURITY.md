@@ -142,3 +142,11 @@ table above before adding it.
 This repo is PUBLIC (verified via `gh repo view`, unchanged across the
 SPE-71 rename). Visibility changes are a consequential decision and are
 never made without the repository owner's explicit request.
+
+## Permission refinements (SPE-105)
+
+See ADR-0012 Amendment 1. Worktree `remove --force`, `prune` and `move` are
+`ask`; read-only git is allowed; the merge `autoMode.allow` entry is classifier
+guidance, not a rule. Secret-metadata allows for a specific project belong in a
+private overlay (`docs/examples/secret-metadata-overlay.example.json`), never in
+the tracked baseline. `gcloud secrets versions access` remains denied.
