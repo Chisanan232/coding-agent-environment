@@ -173,6 +173,7 @@ class Installation(unittest.TestCase):
                 spec["files"] = {"SKILL.md": hashlib.sha256((folder / "SKILL.md").read_bytes()).hexdigest()}
             (repo / "codex/subtraction-skills.json").write_text(json.dumps(manifest))
             env = dict(os.environ, CODING_AGENT_SYNC_HOME=str(live))
+            env.pop("CODEX_HOME", None)
             installer = ["bash", str(repo / "scripts/profile-install.sh")]
             outside = b"Local unrelated instructions\r\n"
             targets = {"--global": (".codex", "codex/AGENTS.md", "signal-first"),
