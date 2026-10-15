@@ -42,6 +42,7 @@
   ],
   "resources": {
     "engineering-runtime": {
+      "scripts/ticket-state.py": ".claude/hooks/ticket-state.py",
       "scripts/audit_log.sh": ".claude/hooks/audit_log.sh",
       "scripts/circuit-breaker-gate.sh": ".claude/hooks/circuit-breaker-gate.sh",
       "scripts/decision-log.sh": ".claude/hooks/decision-log.sh",
