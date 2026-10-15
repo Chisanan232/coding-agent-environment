@@ -58,6 +58,14 @@ repository/merge reconciliation; never auto-import them.
 
 ## Reconcile each outcome
 
+After verifying this exact task owns the native ticket state and has released its
+resources, observe notes and workflow state before acting. Capture their revision
+tokens through `session-memory.sh snapshot "$TICKET"` and `workflow-state.sh
+snapshot "$TICKET"`. Keep those tokens with this closeout's observations; they
+contain identity/digests, not note contents. A token is not task-release authority.
+Never replace a stale token with a newly observed token merely to make cleanup
+succeed: a changed generation may belong to resumed or concurrent work.
+
 Before every action, inspect the holder's verified steps and current external
 state. Use `effective_complete`, never the historical `record.complete` flag.
 Schema-1 receipts remain readable but report `finalization_unverified`; do not
@@ -109,18 +117,25 @@ only after successful verification. A failed operation remains pending.
    was sent when it wasn't. Notification failure is reported without repeating
    the completion comment.
 
-Only after all outcomes are verified, finalize native workflow state:
+Only after all outcomes are verified, archive the previously observed native
+workflow state using its original token. Do not overwrite the current state with
+an unconditional "complete" write: a resumed same-ticket task may own it now.
+The retained shared receipt records verified completion separately.
 
 ```bash
-bash "$ENGINEERING_RUNTIME/workflow-state.sh" write \
-  "$TICKET" post-merge-close done done complete
-bash "$ENGINEERING_RUNTIME/workflow-state.sh" archive "$TICKET"
+bash "$ENGINEERING_RUNTIME/workflow-state.sh" archive "$TICKET" "$STATE_TOKEN"
 ```
 
 After verifying the archive exists in the bound native ticket scope, record
 `{"op":"mark_finalization","step":"workflow_archived","evidence":"Exact archive path and verified state"}`.
 Record the verified outcome and merge SHA through `decision-log.sh`, then clear
-only this completed ticket's session notes via `session-memory.sh`. Re-observe
+only this completed ticket's session notes via
+`session-memory.sh clear "$TICKET" "$NOTES_TOKEN"`. The helper durably archives
+notes before clearing their current path; it never destroys session history.
+All managed append/write/clear/archive operations use stable per-ticket writer
+locks. Missing/stale tokens and legacy unknown writer revisions preserve data.
+If a newer writer intervened, retain pending finalization for ownership resolution.
+Re-observe
 and reference an existing matching durable decision on retry; do not append a
 duplicate simply because its checkpoint is missing. Record `decision_recorded`
 with that durable reference and `notes_cleared` only after verifying absence in
