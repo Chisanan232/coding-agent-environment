@@ -405,7 +405,9 @@ OVERLAY_TEMPLATE = ROOT / "docs/examples/secret-metadata-overlay.example.json"
 
 def _rule_regex(rule):
     """Emulate Claude Code Bash rule matching: `X:*` = X or X + space + anything;
-    otherwise `*` spans any text. Static layer only — classifier not modeled."""
+    otherwise `*` spans any text. Static layer only: the classifier, quoting and
+    `$()` are not modeled, and compound commands (`a && b`) are NOT split the way
+    Claude Code splits them, so this is looser than the real engine for compounds."""
     body = rule[len("Bash("):-1]
     if body.endswith(":*"):
         pre = re.escape(body[:-2])
@@ -449,7 +451,7 @@ class SPE105EffectiveBehavior(unittest.TestCase):
         ])
 
     def test_output_writing_git_forms_ask(self):
-        self.assertDecision("ask", ["git diff --output=/tmp/x", "git log -p --output=/tmp/y", "git show HEAD --output=f", "git diff --ext-diff HEAD~1"])
+        self.assertDecision("ask", ["git diff --output=/tmp/x", "git log -p --output=/tmp/y", "git show HEAD --output=f", "git diff --ext-diff HEAD~1", "git diff --no-index /dev/null /tmp/x"])
 
     def test_dangerous_worktree_operations_ask_in_every_flag_position(self):
         self.assertDecision("ask", [
@@ -457,6 +459,22 @@ class SPE105EffectiveBehavior(unittest.TestCase):
             "git worktree remove /t --force", "git worktree remove -f -f /t",
             "git worktree prune", "git worktree prune --dry-run", "git worktree move a b",
         ])
+
+    def test_force_abbreviations_and_global_options_cannot_skip_the_worktree_asks(self):
+        """git accepts any unambiguous long-option prefix (--for, --fo, --f)."""
+        self.assertDecision("ask", [
+            "git worktree remove --forc /t", "git worktree remove --for /t", "git worktree remove --fo /t",
+            "git worktree remove /t --f", "git worktree remove --for --for /t",
+            "git -C /repo worktree remove /t", "git -c k=v worktree remove --force /t",
+            "git -C /repo worktree prune", "git -C /repo worktree move a b",
+            "git worktree unlock /t", "git worktree add -B existing ../w HEAD~5",
+            "git worktree add ../w -B existing", "git worktree add --force ../w", "git worktree add ../w --for",
+            "git fetch --upload-pack=cmd .", "git fetch origin --upload-pack=cmd", "git fetch --upl=cmd .",
+        ])
+
+    def test_worktree_repair_is_bare_only(self):
+        self.assertDecision("allow", ["git worktree repair"])
+        self.assertDecision("classifier", ["git worktree repair /some/path"])
 
     def test_routine_worktree_operations_remain_allowed(self):
         self.assertDecision("allow", ["git worktree add ../w -b feature", "git worktree list", "git worktree repair"])
@@ -506,7 +524,8 @@ class SecretMetadataOverlayTemplate(unittest.TestCase):
         t = json.loads(OVERLAY_TEMPLATE.read_text())
         rules = [r.replace("<private-gcp-project>", "proj-x") for r in t["permissions"]["allow"]]
         base = load_settings()["permissions"]
-        self.merged = {"deny": base["deny"], "ask": base["ask"], "allow": base["allow"] + rules}
+        asks = t["permissions"]["ask"]
+        self.merged = {"deny": base["deny"], "ask": base["ask"] + asks, "allow": base["allow"] + rules}
 
     def test_metadata_and_write_only_commands_are_allowed_for_the_scoped_project(self):
         for cmd in (
@@ -527,6 +546,17 @@ class SecretMetadataOverlayTemplate(unittest.TestCase):
         ):
             with self.subTest(cmd=cmd):
                 self.assertNotEqual("allow", static_decision(cmd, self.merged))
+
+    def test_qualified_names_impersonation_and_file_uploads_ask(self):
+        for cmd in (
+            "gcloud secrets describe projects/other/secrets/s --project=proj-x",
+            "gcloud secrets versions add projects/other/secrets/s --project=proj-x --data-file=-",
+            "gcloud secrets list --impersonate-service-account=a@b.iam --project=proj-x",
+            "gcloud secrets create s1 --data-file=/home/u/key.pem --project=proj-x",
+            "gcloud secrets create s1 --data-file=./k --project=proj-x",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual("ask", static_decision(cmd, self.merged))
 
     def test_secret_value_reads_stay_denied_even_with_the_overlay(self):
         for cmd in (
