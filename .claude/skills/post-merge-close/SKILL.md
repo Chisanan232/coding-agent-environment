@@ -58,13 +58,27 @@ repository/merge reconciliation; never auto-import them.
 
 ## Reconcile each outcome
 
-After verifying this exact task owns the native ticket state and has released its
-resources, observe notes and workflow state before acting. Capture their revision
-tokens through `session-memory.sh snapshot "$TICKET"` and `workflow-state.sh
-snapshot "$TICKET"`. Keep those tokens with this closeout's observations; they
-contain identity/digests, not note contents. A token is not task-release authority.
+At the start of closeout, before any lifecycle action, retain the context status,
+generation, scope ID and CAS token exported by bootstrap, together with the exact
+ticket/worktree tuple. After verifying this exact task owns native ticket state
+and has released its resources, observe notes and workflow state before acting.
+Capture their revision tokens through `session-memory.sh snapshot "$TICKET"` and
+`workflow-state.sh snapshot "$TICKET"`. Keep these original tokens with this
+closeout's observations; they contain identity/digests, not note contents. A
+token is not task-release authority.
 Never replace a stale token with a newly observed token merely to make cleanup
 succeed: a changed generation may belong to resumed or concurrent work.
+
+Capture these values once before acting so a later bootstrap cannot replace the
+CAS snapshot:
+```bash
+CONTEXT_STATUS="$ENGINEERING_CONTEXT_STATUS"
+CONTEXT_GENERATION="$ENGINEERING_CONTEXT_GENERATION"
+CONTEXT_SCOPE_ID="$ENGINEERING_CONTEXT_SCOPE_ID"
+CONTEXT_CAS_TOKEN="$ENGINEERING_CONTEXT_CAS_TOKEN"
+CONTEXT_TICKET="$ENGINEERING_CURRENT_TICKET"
+CONTEXT_WORKTREE="$ENGINEERING_CURRENT_WORKTREE"
+```
 
 Before every action, inspect the holder's verified steps and current external
 state. Use `effective_complete`, never the historical `record.complete` flag.
@@ -103,13 +117,31 @@ only after successful verification. A failed operation remains pending.
 4. **Local branch (`local_branch_removed`).** Verify the bound topic branch has no
    new commits or other linked worktrees. Use `git branch -d "$FEATURE_BRANCH"`
    only and verify absence. Failure stays pending; never use `-D`.
-5. **Context (`context_cleared`).** Current context writers are not all coordinated
-   by a shared lock. Preserve existing `.current-ticket`, `.current-worktree`
-   and `.current-release` markers and report `context_changed_or_uncoordinated`;
-   compare-then-unlink could erase a concurrent session's assignment. If all
-   three markers were already absent, verify absence and record this outcome.
-   Never modify another host's private markers. Use explicit environment context
-   for the next task until a coordinated writer contract is available.
+5. **Context (`context_cleared`).** For `managed` active state, verify the
+   original early ticket and worktree match this closeout. Clear only with that
+   original generation and token; never replace a stale snapshot:
+   ```bash
+   CONTEXT_CLEAR_RESULT=$(python3 "${ENGINEERING_RUNTIME}/ticket-state.py" context \
+     "$ENGINEERING_CONTEXT_DIR" clear \
+     --expected-generation "$CONTEXT_GENERATION" \
+     --expected-token "$CONTEXT_CAS_TOKEN") || exit 1
+   CONTEXT_AFTER=$(python3 "${ENGINEERING_RUNTIME}/ticket-state.py" context \
+     "$ENGINEERING_CONTEXT_DIR" inspect) || exit 1
+   ```
+   Verify both captured responses and the original early tuple. The subsequent
+   inspect must show a managed `cleared`
+   tombstone with an empty tuple. This retains the context object and every
+   legacy file. A stale token, changed tuple, malformed object or unavailable
+   helper leaves the context untouched and this outcome pending. If removing
+   the worktree also removed its managed context root, absence alone cannot
+   satisfy this outcome: removal-time evidence must bind that exact context
+   generation and fingerprint. Until that integration exists, keep the outcome
+   pending and `effective_complete` false. Never clear context before a failed
+   worktree removal merely to avoid this gap. For
+   `legacy_uncoordinated`, preserve existing markers and report
+   `context_changed_or_uncoordinated`; if all three markers were already absent,
+   verify absence and record the outcome. `unavailable` never falls back to
+   markers and stays pending. Never modify another host's context.
 6. **Reporter (`reporter_handled`).** Identify the actual reporter. Only authorized
    notifications may be sent; tag in the existing completion comment when needed.
    Connector availability grants no notification authority. Record an authorized

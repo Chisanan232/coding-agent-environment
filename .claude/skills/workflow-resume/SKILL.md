@@ -30,7 +30,15 @@ session is interrupted (crash, context limit, manual stop) and needs to continue
 ### Phase 1 — Read persisted state
 1. Resolve the ticket reference:
    ```bash
-   TICKET="${ENGINEERING_CURRENT_TICKET:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-ticket" 2>/dev/null || echo '[ticket-ref]')}"
+   if [[ ${ENGINEERING_CONTEXT_STATUS:-legacy_uncoordinated} == legacy_uncoordinated ]]; then
+     TICKET="${ENGINEERING_CURRENT_TICKET:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-ticket" 2>/dev/null || echo '[ticket-ref]')}"
+   else
+     TICKET="${ENGINEERING_CURRENT_TICKET-}"
+   fi
+   if [[ -z "$TICKET" ]]; then
+     echo "No active ticket in managed context; do not fall back to stale environment or markers." >&2
+     exit 1
+   fi
    ```
 2. Load and surface session notes before reading workflow state:
    ```bash
@@ -76,7 +84,11 @@ session is interrupted (crash, context limit, manual stop) and needs to continue
    If open: stop. Surface the same escalation block from Phase 1, step 6.
 9. Confirm the git worktree for this ticket is present and set `ENGINEERING_CURRENT_WORKTREE`:
    ```bash
-   WORKTREE="${ENGINEERING_CURRENT_WORKTREE:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-worktree" 2>/dev/null || echo '')}"
+   if [[ ${ENGINEERING_CONTEXT_STATUS:-legacy_uncoordinated} == legacy_uncoordinated ]]; then
+     WORKTREE="${ENGINEERING_CURRENT_WORKTREE:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-worktree" 2>/dev/null || echo '')}"
+   else
+     WORKTREE="${ENGINEERING_CURRENT_WORKTREE-}"
+   fi
    if [ -n "$WORKTREE" ]; then
      git worktree list | grep -qF "$WORKTREE" \
        || echo "⚠️  Worktree path '$WORKTREE' not found in git worktree list — may need recreation"
