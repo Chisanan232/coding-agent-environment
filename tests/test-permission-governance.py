@@ -542,7 +542,7 @@ class SecretMetadataOverlayTemplate(unittest.TestCase):
             "gcloud secrets versions list s1 --project=other", "gcloud secrets create s1",
             "gcloud secrets versions add s1 --project=proj-x --data-file=/etc/passwd",
             "gcloud secrets versions add s1 --project=proj-x --data-file=- --extra",
-            "gcloud secrets delete s1 --project=proj-x", "gcloud secrets versions destroy 1 --secret=s --project=proj-x",
+            "gcloud secrets delete s1 --project=proj-x", "gcloud --project=proj-x secrets create s1 --data-file /k", "gcloud secrets versions destroy 1 --secret=s --project=proj-x",
         ):
             with self.subTest(cmd=cmd):
                 self.assertNotEqual("allow", static_decision(cmd, self.merged))
@@ -554,6 +554,8 @@ class SecretMetadataOverlayTemplate(unittest.TestCase):
             "gcloud secrets list --impersonate-service-account=a@b.iam --project=proj-x",
             "gcloud secrets create s1 --data-file=/home/u/key.pem --project=proj-x",
             "gcloud secrets create s1 --data-file=./k --project=proj-x",
+            "gcloud secrets create --data-file=/home/u/key s1 --project=proj-x",
+            "gcloud --impersonate-service-account=a@b.iam secrets list --project=proj-x",
         ):
             with self.subTest(cmd=cmd):
                 self.assertEqual("ask", static_decision(cmd, self.merged))
