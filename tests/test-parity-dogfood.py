@@ -191,6 +191,7 @@ else:
             "ANTHROPIC_API_KEY": "opaque-test-capability",
             "OPENAI_API_KEY": "opaque-test-capability",
             "CODEX_HOME": "/preserved/codex-home",
+            "CODING_AGENT_PARITY_TSC_JS": "/private/external/typescript/bin/tsc.js",
         }
         with mock.patch.dict(os.environ, injected):
             env = dogfood.fixture_process_env()
@@ -198,6 +199,7 @@ else:
                          set(dogfood.GIT_ENV))
         self.assertEqual({name: env[name] for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_HOME")},
                          {name: injected[name] for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_HOME")})
+        self.assertNotIn("CODING_AGENT_PARITY_TSC_JS", env)
         self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
 
     def test_native_capture_uses_installed_wrapper_and_never_reports_pass(self):
@@ -575,6 +577,90 @@ print(json.dumps({"subtype":"success","is_error":False,"session_id":session,"res
         task = seed["files"]["TASK.md"]
         self.assertIn("no linter", task)
         self.assertIn("go vet ./...", task)
+
+    def test_typescript_shim_delegates_exact_arguments_and_only_reads_external_tool(self):
+        external = self.home / "installed-typescript"
+        compiler = external / "node_modules/typescript/bin/tsc.js"
+        compiler.parent.mkdir(parents=True)
+        compiler.write_bytes(b"// owned external compiler fixture\n")
+        alias = self.home / "known-tool-link/tsc.js"
+        alias.parent.mkdir()
+        alias.symlink_to(compiler)
+        sentinel = external / "sentinel.txt"
+        sentinel.write_bytes(b"external tree stays unchanged\n")
+        before = {path: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in (compiler, sentinel)}
+        fake_node_dir = self.home / "fake-node-bin"
+        fake_node_dir.mkdir()
+        fake_node = fake_node_dir / "node"
+        fake_node.write_text('''#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["FAKE_NODE_CALLS"], "a") as stream:
+ stream.write(json.dumps({"argv":sys.argv[1:],"cwd":os.getcwd()})+"\\n")
+if sys.argv[2:] == ["--version"]:
+ print("Version 5.9.1")
+''')
+        fake_node.chmod(0o700)
+        call_log = self.home / "fake-node-calls.jsonl"
+        env = dict(self.env, PATH=f"{fake_node_dir}:{os.environ.get('PATH', '')}",
+                   CODING_AGENT_PARITY_TSC_JS=str(alias), FAKE_NODE_CALLS=str(call_log))
+        case_dir = self.home / "private-case"
+        case_dir.mkdir(mode=0o700)
+        fixture_cwd = case_dir / "repository/typescript"
+        fixture_cwd.mkdir(parents=True, mode=0o700)
+
+        metadata, overrides = dogfood.configure_typescript_toolchain(case_dir, fixture_cwd, env)
+        self.assertEqual(metadata["typescript"]["status"], "available")
+        self.assertEqual(metadata["typescript"]["configured_path"], str(alias))
+        self.assertEqual(metadata["typescript"]["resolved_path"], str(compiler.resolve()))
+        self.assertEqual(metadata["typescript"]["version"], "Version 5.9.1")
+        self.assertEqual(metadata["typescript"]["compiler_sha256"], before[compiler])
+        self.assertEqual((case_dir / "fixture-metadata.json").stat().st_mode & 0o777, 0o600)
+        shim = Path(overrides["PATH"].split(os.pathsep, 1)[0]) / "tsc"
+        shim_env = dogfood.fixture_process_env(env)
+        shim_env.update(overrides)
+        args = ["--strict", "--project", "fixture config.json", "--outDir", "build output"]
+        result = subprocess.run([str(shim), *args], cwd=fixture_cwd, env=shim_env,
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in call_log.read_text().splitlines()]
+        self.assertEqual(calls[0]["argv"], [str(compiler.resolve()), "--version"])
+        self.assertEqual(calls[1]["argv"], [str(compiler.resolve()), *args])
+        self.assertEqual(calls[1]["cwd"], str(fixture_cwd))
+        self.assertNotIn("CODING_AGENT_PARITY_TSC_JS", shim_env)
+        self.assertEqual({path: hashlib.sha256(path.read_bytes()).hexdigest()
+                          for path in (compiler, sentinel)}, before)
+        self.assertFalse((fixture_cwd / "build output").exists())
+
+    def test_typescript_absence_is_explicit_and_refuses_instead_of_faking_success(self):
+        env = dict(self.env, PATH=os.environ.get("PATH", ""))
+        env.pop("CODING_AGENT_PARITY_TSC_JS", None)
+        case_dir = self.home / "private-case"
+        case_dir.mkdir(mode=0o700)
+        fixture_cwd = case_dir / "repository/typescript"
+        fixture_cwd.mkdir(parents=True, mode=0o700)
+        metadata, overrides = dogfood.configure_typescript_toolchain(case_dir, fixture_cwd, env)
+        self.assertEqual(metadata["typescript"]["status"], "unavailable")
+        self.assertIsNone(metadata["typescript"]["compiler_sha256"])
+        self.assertIsNone(metadata["typescript"]["version"])
+        shim = Path(overrides["PATH"].split(os.pathsep, 1)[0]) / "tsc"
+        shim_env = dogfood.fixture_process_env(env)
+        shim_env.update(overrides)
+        result = subprocess.run([str(shim), "--strict", "--outDir", "build"], cwd=fixture_cwd,
+                                env=shim_env, capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TypeScript compiler unavailable", result.stderr)
+        self.assertFalse((fixture_cwd / "build").exists())
+
+    def test_configured_typescript_compiler_path_must_be_absolute_tsc_js_regular_file(self):
+        case_dir = self.home / "private-case"
+        case_dir.mkdir(mode=0o700)
+        fixture_cwd = case_dir / "repository/typescript"
+        fixture_cwd.mkdir(parents=True, mode=0o700)
+        for value in ("relative/tsc.js", str(self.home / "compiler.txt")):
+            with self.subTest(value=value), self.assertRaises(dogfood.DogfoodError):
+                dogfood.configure_typescript_toolchain(
+                    case_dir, fixture_cwd, dict(self.env, CODING_AGENT_PARITY_TSC_JS=value))
 
     def test_failure_classifier_names_host_gate_categories(self):
         cases = (

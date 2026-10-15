@@ -255,3 +255,51 @@ model or endpoint was selected.
 These scoped results leave SPE-92 open. Complete native resource custody,
 positive production worktree retirement, and the remaining live workflow
 matrix are not established by response capture or installation drift checks.
+
+## 2026-10-15 continuation: scoped evidence, remaining gates
+
+The quota observations above are historical. Fresh Claude captures now run
+through the existing authorized routing. Scenarios 15 and 16 have scoped native
+briefing/zero-rule evidence; scenario 17 used two distinct fresh processes and a
+verbatim durable handoff. Its fictional waiting-job scenario is not evidence of
+polling a real running job. Scenario 18 actually discovered and invoked Context7
+against public PyPA documentation. The corrected prompt restricts skill evidence
+to the active native registry or documented active entrypoints; backup trees do
+not establish active skill availability. An honest report of no applicable
+active skill does not prove positive skill invocation or global skill absence.
+None of these results closes the complete 18-scenario or SPE-36 matrix.
+
+Scenario 05 can use an existing compiler without package installation:
+
+```bash
+CODING_AGENT_PARITY_TSC_JS=/absolute/path/to/typescript/lib/tsc.js \
+  python3 scripts/parity-dogfood.py --host claude --case 5 --run
+```
+
+The runner verifies the configured regular entrypoint with the existing Node
+executable, records its version and entrypoint-file SHA-256 in private fixture
+metadata, and creates a fixture-only `tsc` delegating shim. This hash does not
+attest every file in the compiler package. Missing configuration is an explicit
+unavailable refusal, never a successful stub. No external project is modified
+and the configuration variable is removed from the model process environment.
+The test shim unit fixture uses a fake Node solely to check delegation; it is
+not actual compiler or native model proof.
+
+The real Claude repair follow-up reproduced and fixed Python and Go failures.
+Its TypeScript source fix was independently compiled and executed by the
+orchestrator, but native Claude execution of the compiler was refused by the
+existing permission classifier. That gate was preserved; no alternate route,
+permission override, or compiler installation was used to bypass it. Therefore
+Claude TypeScript runtime validation remains blocked, not passed. The seed's
+TypeScript defect is a logic error, not evidence of repairing a type error.
+Independent reproduction in the retained owned fixture's `typescript` directory:
+
+```bash
+node /absolute/path/to/typescript/lib/tsc.js --project tsconfig.json --noEmit false --outDir build
+node build/total.test.js
+```
+
+Raw transcripts, host session identifiers, and workstation paths stay in private
+local evidence. Ticket closure still requires independently reviewed native
+behavior for every actual criterion, including compatibility gates; Codex-only
+results never substitute for Claude runtime proof.
