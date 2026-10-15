@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -192,6 +193,7 @@ else:
             "OPENAI_API_KEY": "opaque-test-capability",
             "CODEX_HOME": "/preserved/codex-home",
             "CODING_AGENT_PARITY_TSC_JS": "/private/external/typescript/bin/tsc.js",
+            "CODING_AGENT_PARITY_RUFF": "/private/external/bin/ruff",
         }
         with mock.patch.dict(os.environ, injected):
             env = dogfood.fixture_process_env()
@@ -200,6 +202,7 @@ else:
         self.assertEqual({name: env[name] for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_HOME")},
                          {name: injected[name] for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_HOME")})
         self.assertNotIn("CODING_AGENT_PARITY_TSC_JS", env)
+        self.assertNotIn("CODING_AGENT_PARITY_RUFF", env)
         self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
 
     def test_native_capture_uses_installed_wrapper_and_never_reports_pass(self):
@@ -594,6 +597,219 @@ print(json.dumps({"subtype":"success","is_error":False,"session_id":session,"res
         self.assertIn("no linter", task)
         self.assertIn("go vet ./...", task)
         self.assertIn("tsc --project tsconfig.json --noEmit false --outDir build", task)
+
+    def test_repair_focus_is_restricted_to_case_five(self):
+        self.make_wrapper("claude")
+        for args in (("--case", "4"), ("--all",)):
+            with self.subTest(args=args):
+                result = self.run_cli("--host", "claude", *args,
+                                      "--repair-focus", "static-analysis", "--run")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("only valid with --case 5", result.stderr)
+        unsupported = self.run_cli("--host", "claude", "--case", "5", "--repair-focus",
+                                   "unknown", "--run")
+        self.assertEqual(unsupported.returncode, 2)
+        self.assertIn("invalid choice", unsupported.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_static_analysis_fixture_isolated_and_task_gates_edits_on_active_skills(self):
+        baseline = dogfood.load_baseline()
+        with self.assertRaises(dogfood.DogfoodError):
+            dogfood.materialize_repair_focus(
+                self.home / "invalid-focus", baseline, "unknown")
+        run_case = self.home / "focus-case"
+        run_case.mkdir(mode=0o700)
+        repo = dogfood.materialize_repair_focus(run_case, baseline, "static-analysis")
+        self.assertTrue(repo.is_relative_to(run_case))
+        self.assertFalse((repo / "go").exists())
+        ruff_config = tomllib.loads((repo / "python/pyproject.toml").read_text())
+        self.assertEqual(ruff_config["tool"]["ruff"]["lint"]["select"], ["F401"])
+        task = (repo / "TASK.md").read_text()
+        for skill in ("python-ruff-fixing", "typescript-tsc-debugging"):
+            skill_position = task.index(skill)
+            if skill == "python-ruff-fixing":
+                failure_position = task.index("ruff check .")
+            else:
+                failure_position = task.index("tsc --project tsconfig.json")
+            self.assertLess(failure_position, skill_position)
+            self.assertLess(skill_position, task.index("before editing", skill_position))
+            self.assertIn("native skill registry", task)
+        self.assertIn("CAPTURED", task)
+        self.assertIn("never a PASS verdict", task)
+        python_check = subprocess.run(
+            [sys.executable, "-m", "unittest", "-v"], cwd=repo / "python",
+            capture_output=True, text=True, check=False)
+        self.assertEqual(python_check.returncode, 0, python_check.stderr)
+        self.assertIn("Ran 1 test", python_check.stderr)
+
+    def test_ruff_shim_delegates_to_only_the_configured_executable(self):
+        external = self.home / "known-ruff"
+        external.mkdir()
+        executable = external / "ruff"
+        calls = self.home / "ruff-calls.jsonl"
+        executable.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+with open(os.environ["RUFF_CALLS"], "a") as stream:
+ stream.write(json.dumps({"argv":sys.argv[1:],"cwd":os.getcwd(),
+                          "cache":os.environ.get("RUFF_CACHE_DIR")})+"\\n")
+if sys.argv[1:] == ["--version"]: print("ruff 0.16.6")
+else:
+ cache=Path(os.environ["RUFF_CACHE_DIR"])
+ cache.mkdir(parents=True, exist_ok=True)
+ (cache/"mock-cache-entry").write_text("owned fixture cache")
+''')
+        executable.chmod(0o700)
+        sentinel = external / "sentinel"
+        sentinel.write_bytes(b"external tool tree is read-only\n")
+        before = {path: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in (executable, sentinel)}
+        case_dir = self.home / "ruff-case"
+        case_dir.mkdir(mode=0o700)
+        fixture_cwd = case_dir / "python"
+        fixture_cwd.mkdir(mode=0o700)
+        env = dict(self.env, CODING_AGENT_PARITY_RUFF=str(executable),
+                   RUFF_CALLS=str(calls), RUFF_CACHE_DIR=str(external / "inherited-cache"))
+        inherited_cache = Path(env["RUFF_CACHE_DIR"])
+        inherited_cache.mkdir()
+        external_marker = inherited_cache / "preserve.txt"
+        external_marker.write_bytes(b"external cache marker remains unchanged\n")
+        external_marker_before = hashlib.sha256(external_marker.read_bytes()).hexdigest()
+
+        metadata, overrides = dogfood.configure_ruff_toolchain(
+            case_dir, fixture_cwd, env)
+        self.assertEqual(metadata["status"], "available")
+        self.assertEqual(metadata["version"], "ruff 0.16.6")
+        self.assertEqual(metadata["sha256"], before[executable])
+        shim = Path(overrides["PATH"].split(os.pathsep, 1)[0]) / "ruff"
+        private_cache = case_dir / "ruff-cache"
+        self.assertEqual(overrides["RUFF_CACHE_DIR"], str(private_cache))
+        self.assertTrue(private_cache.is_dir())
+        self.assertEqual(stat.S_IMODE(private_cache.stat().st_mode), 0o700)
+        delegated = subprocess.run(
+            [str(shim), "check", "--select", "F401", "."], cwd=fixture_cwd,
+            env={**dogfood.fixture_process_env(env), **overrides},
+            capture_output=True, text=True, check=False)
+        self.assertEqual(delegated.returncode, 0, delegated.stderr)
+        invocations = [json.loads(line) for line in calls.read_text().splitlines()]
+        self.assertEqual(invocations[0]["argv"], ["--version"])
+        self.assertEqual(invocations[1]["argv"], ["check", "--select", "F401", "."])
+        self.assertEqual(invocations[1]["cwd"], str(fixture_cwd))
+        self.assertEqual(invocations[0]["cache"], str(private_cache))
+        self.assertEqual(invocations[1]["cache"], str(private_cache))
+        self.assertTrue((private_cache / "mock-cache-entry").is_file())
+        self.assertEqual(hashlib.sha256(external_marker.read_bytes()).hexdigest(),
+                         external_marker_before)
+        self.assertFalse((inherited_cache / "mock-cache-entry").exists())
+        self.assertEqual({path: hashlib.sha256(path.read_bytes()).hexdigest()
+                          for path in (executable, sentinel)}, before)
+
+    def test_configured_ruff_reports_seed_f401_despite_hostile_external_configs(self):
+        executable = os.environ.get("CODING_AGENT_PARITY_RUFF")
+        if not executable:
+            self.skipTest("real Ruff verification requires explicit CODING_AGENT_PARITY_RUFF")
+        baseline = dogfood.load_baseline()
+        case_dir = self.home / "hostile-config-case"
+        case_dir.mkdir(mode=0o700)
+        repo = dogfood.materialize_repair_focus(case_dir, baseline, "static-analysis")
+        ancestor_config = self.home / "pyproject.toml"
+        ancestor_config.write_text('[tool.ruff.lint]\nignore = ["F401"]\n')
+        xdg_config = self.home / "xdg-config/ruff/ruff.toml"
+        xdg_config.parent.mkdir(parents=True)
+        xdg_config.write_text('[lint]\nignore = ["F401"]\n')
+        seed = repo / "python/doubling.py"
+        external_cache = self.home / "external-ruff-cache"
+        external_cache.mkdir()
+        marker = external_cache / "keep.txt"
+        marker.write_bytes(b"do not write here\n")
+        protected = (ancestor_config, xdg_config, seed, marker)
+        before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in protected}
+        env = dict(self.env, CODING_AGENT_PARITY_RUFF=executable,
+                   RUFF_CACHE_DIR=str(external_cache), XDG_CONFIG_HOME=str(self.home / "xdg-config"))
+        _, overrides = dogfood.configure_ruff_toolchain(case_dir, repo / "python", env)
+        shim = Path(overrides["PATH"].split(os.pathsep, 1)[0]) / "ruff"
+        result = subprocess.run(
+            [str(shim), "check", "."], cwd=repo / "python",
+            env={**dogfood.fixture_process_env(env), **overrides},
+            capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("F401", result.stdout + result.stderr)
+        self.assertEqual({path: hashlib.sha256(path.read_bytes()).hexdigest()
+                          for path in protected}, before)
+        self.assertEqual(overrides["RUFF_CACHE_DIR"], str(case_dir / "ruff-cache"))
+
+    def test_ruff_absence_does_not_fall_back_to_path(self):
+        fallback_dir = self.home / "ambient-bin"
+        fallback_dir.mkdir()
+        fallback = fallback_dir / "ruff"
+        called = self.home / "fallback-called"
+        fallback.write_text(f"#!/bin/sh\ntouch {called}\n")
+        fallback.chmod(0o700)
+        case_dir = self.home / "ruff-unavailable"
+        case_dir.mkdir(mode=0o700)
+        fixture_cwd = case_dir / "python"
+        fixture_cwd.mkdir(mode=0o700)
+        env = dict(self.env, PATH=f"{fallback_dir}:{os.environ.get('PATH', '')}")
+        env.pop("CODING_AGENT_PARITY_RUFF", None)
+
+        metadata, overrides = dogfood.configure_ruff_toolchain(case_dir, fixture_cwd, env)
+        self.assertEqual(metadata["status"], "unavailable")
+        self.assertEqual(metadata["reason"], "CODING_AGENT_PARITY_RUFF is unset")
+        shim = Path(overrides["PATH"].split(os.pathsep, 1)[0]) / "ruff"
+        result = subprocess.run([str(shim), "check", "."], cwd=fixture_cwd,
+                                env={**dogfood.fixture_process_env(env), **overrides},
+                                capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("configured Ruff executable is unavailable", result.stderr)
+        self.assertFalse(called.exists())
+
+    def test_ruff_configured_path_must_be_absolute_executable(self):
+        case_dir = self.home / "ruff-invalid"
+        case_dir.mkdir(mode=0o700)
+        fixture_cwd = case_dir / "python"
+        fixture_cwd.mkdir(mode=0o700)
+        for value in ("relative/ruff", str(fixture_cwd / "not-executable")):
+            with self.subTest(value=value):
+                path = Path(value)
+                if path.is_absolute():
+                    path.write_text("not executable")
+                with self.assertRaises(dogfood.DogfoodError):
+                    dogfood.configure_ruff_toolchain(
+                        case_dir, fixture_cwd,
+                        dict(self.env, CODING_AGENT_PARITY_RUFF=value))
+
+    def test_repair_focus_capture_records_baseline_and_unavailable_tools_without_pass_claim(self):
+        self.make_wrapper("claude")
+        self.env.pop("CODING_AGENT_PARITY_RUFF", None)
+        self.env.pop("CODING_AGENT_PARITY_TSC_JS", None)
+        result = self.run_cli("--host", "claude", "--case", "5", "--repair-focus",
+                              "static-analysis", "--run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_dir = Path(result.stdout.split("Private evidence directory: ", 1)[1].splitlines()[0])
+        baseline_sha = hashlib.sha256(dogfood.BASELINE.read_bytes()).hexdigest()
+        summary = json.loads((run_dir / "run.json").read_text())
+        record = json.loads((run_dir / "cases/05/result.json").read_text())
+        request = (run_dir / "cases/05/request.txt").read_text()
+        task = (Path(record["fixture_repository"]) / "TASK.md").read_text()
+        call = json.loads(self.calls.read_text().splitlines()[0])
+        self.assertEqual(len(dogfood.load_baseline()["scenarios"]), 18)
+        self.assertEqual(summary["repair_focus"], {
+            "scenario_id": 5, "focus": "static-analysis", "baseline_sha256": baseline_sha})
+        self.assertEqual(record["status"], "CAPTURED")
+        self.assertEqual(record["repair_focus"]["baseline_sha256"], baseline_sha)
+        self.assertEqual(record["repair_focus"]["tool_availability"]["ruff"]["status"],
+                         "unavailable")
+        self.assertEqual(record["repair_focus"]["tool_availability"]["typescript"]["status"],
+                         "unavailable")
+        self.assertEqual(summary["acceptance_verdict"], "NOT_EVALUATED")
+        self.assertNotIn("PASS", json.dumps(summary))
+        self.assertIn("Read TASK.md", request)
+        self.assertIn("python-ruff-fixing", task)
+        self.assertIn("typescript-tsc-debugging", task)
+        self.assertNotIn("--permission-mode", call["argv"])
+        self.assertNotIn("--tools=", " ".join(call["argv"]))
+        self.assertIn("configured Ruff executable is unavailable",
+                      (run_dir / "cases/05/tool-bin/ruff").read_text())
 
     def test_typescript_shim_delegates_exact_arguments_and_only_reads_external_tool(self):
         external = self.home / "installed-typescript"
