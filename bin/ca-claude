@@ -106,7 +106,7 @@ unset CODING_AGENT_PROFILE_ACTIVE CODING_AGENT_PROFILE_MARKER_PRESENT
 unset CODING_AGENT_STATUSLINE_CONFIG CODING_AGENT_STATUSLINE_CONTRACT_RUNTIME
 [[ -z "$statusline_config" ]] || export CODING_AGENT_STATUSLINE_CONFIG="$statusline_config"
 [[ -z "$statusline_runtime" ]] || export CODING_AGENT_STATUSLINE_CONTRACT_RUNTIME="$statusline_runtime"
-if [[ -n "${CODING_AGENT_MANAGED_RESOURCE_ID:-}" || -n "${CODING_AGENT_MANAGED_RESOURCE_GENERATION:-}" ]]; then
+if [[ -n "${CODING_AGENT_MANAGED_RESOURCE_ID:-}" || -n "${CODING_AGENT_MANAGED_RESOURCE_GENERATION:-}" || -n "${CODING_AGENT_NATIVE_RESOURCES+x}" ]]; then
     exec "$HERE/coding-agent-resource" --host claude -- "$CLAUDE_BIN" "${ARGS[@]+"${ARGS[@]}"}" "$@"
 fi
 exec "$CLAUDE_BIN" "${ARGS[@]+"${ARGS[@]}"}" "$@"
