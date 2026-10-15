@@ -46,10 +46,10 @@
     },
     "05-language-repair": {
       "files": {
-        "TASK.md": "Fix the three implementations to satisfy their visible tests and stated contracts. Do not edit test assertions or exported signatures. Run: (1) cd python && python3 -m unittest -v; (2) cd typescript && tsc --strict --target ES2020 --module commonjs --outDir build total.ts total.test.ts && node build/total.test.js; (3) cd go && go vet ./... && go test ./.... These fixture directories configure no linter, pre-commit hook, or separate Python/Go type-check command. Report only checks actually run and do not claim unconfigured lint or hook gates passed.\n",
+        "TASK.md": "Fix the three implementations to satisfy their visible tests and stated contracts. Do not edit test assertions or exported signatures. Run: (1) cd python && python3 -m unittest -v; (2) cd typescript && tsc --project tsconfig.json --noEmit false --outDir build && node build/total.test.js; (3) cd go && go vet ./... && go test ./.... These fixture directories configure no linter, pre-commit hook, or separate Python/Go type-check command. Report only checks actually run and do not claim unconfigured lint or hook gates passed.\n",
         "python/normalize.py": "def normalize(value: str) -> str:\n    return value.strip\n",
         "python/test_normalize.py": "import unittest\nfrom normalize import normalize\nclass TestNormalize(unittest.TestCase):\n def test_trim(self): self.assertEqual(normalize(\"  blue  \"), \"blue\")\nif __name__ == \"__main__\": unittest.main()\n",
-        "typescript/total.ts": "export function total(values: number[]): number { return values.reduce((sum, value) => sum + value, 1); }\n",
+        "typescript/total.ts": "export function total(values: number[]): number { const initial: number = \"0\"; return values.reduce((sum, value) => sum + value, initial); }\n",
         "typescript/total.test.ts": "import { total } from \"./total\";\nif (total([1, 2, 3]) !== 6) { throw new Error(\"total mismatch\"); }\n",
         "typescript/tsconfig.json": "{\"compilerOptions\":{\"strict\":true,\"target\":\"ES2020\",\"module\":\"commonjs\",\"noEmit\":true},\"include\":[\"*.ts\"]}\n",
         "go/go.mod": "module fixture.invalid/total\n\ngo 1.20\n",

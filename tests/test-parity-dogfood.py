@@ -586,13 +586,14 @@ print(json.dumps({"subtype":"success","is_error":False,"session_id":session,"res
         self.assertIn("agent_message", detail)
         self.assertEqual(metadata, {})
 
-    def test_language_repair_seed_has_a_real_typescript_behavior_failure_and_no_lint_claim(self):
+    def test_language_repair_seed_has_type_failure_and_preserves_runtime_assertion(self):
         seed = dogfood.load_baseline()["local_fixtures"]["05-language-repair"]
-        self.assertIn("sum + value, 1", seed["files"]["typescript/total.ts"])
+        self.assertIn('const initial: number = "0"', seed["files"]["typescript/total.ts"])
         self.assertIn("total([1, 2, 3]) !== 6", seed["files"]["typescript/total.test.ts"])
         task = seed["files"]["TASK.md"]
         self.assertIn("no linter", task)
         self.assertIn("go vet ./...", task)
+        self.assertIn("tsc --project tsconfig.json --noEmit false --outDir build", task)
 
     def test_typescript_shim_delegates_exact_arguments_and_only_reads_external_tool(self):
         external = self.home / "installed-typescript"

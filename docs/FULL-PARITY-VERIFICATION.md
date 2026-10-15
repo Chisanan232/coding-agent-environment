@@ -324,3 +324,13 @@ and preservation wiring, not canonical session lineage, complete consumer
 coverage, native retirement or production storage reclamation. A preexisting
 hook-loading diagnostic remains a compatibility observation, not a passed hook
 compatibility gate. The overall verdict remains PARTIAL PARITY.
+
+The next repair seed now contains a real TypeScript type error and uses its
+project configuration (`tsc --project tsconfig.json --noEmit false --outDir
+build`), compatible with compilers that reject source-file arguments beside a
+configuration file. An independent check using existing TypeScript 7.0.2
+observed TS2322 before the scoped implementation fix, then successful compilation
+and execution of the unchanged runtime assertion. This is fixture validity
+proof, not retroactive credit for historical logic-only captures or permission-
+blocked Claude execution. No package installation or native permission change
+was needed.
