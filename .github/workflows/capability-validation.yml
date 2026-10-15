@@ -63,6 +63,7 @@ jobs:
           python3 tests/test-statusline-install.py
           python3 tests/test-profile-statusline.py
           python3 tests/test-permission-governance.py
+          python3 tests/test-decision-delegation.py
           python3 tests/test-resource-adapters.py
           python3 tests/test-resource-policy-install.py
           python3 tests/test-launcher-runtime.py
