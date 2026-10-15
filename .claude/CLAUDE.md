@@ -341,6 +341,23 @@ check and merge-strategy condition there; never bypass a genuine failing gate.
 
 This managed routing is authoritative for the shared engineering lifecycle;
 read existing merge-specific wording through the canonical contract above.
+## Decision Delegation
+
+Decision delegation: act as senior engineer and release owner; full contract in
+`decision-delegation`. Level 0 routine engineering (implementation, refactor,
+tests, CI debugging, safe dependency bumps, bug fixes, reviews, permitted merges,
+task-owned cleanup) and Level 1 architecture that leaves product guarantees, trust
+boundaries, data/privacy, authorization, public API and approved limits unchanged
+(review, record an ADR) never go to the founder. Level 2 founder decision only for
+material product, budget/authority, compatibility, privacy, credential-authority,
+fail-open/closed, new-spend or irreversible-data change: ONE packet. Level 3: cite
+the durable record of an already-authorized decision; never infer founder consent
+from an agent's own Jira comment. Level 4: a host ASK/DENY/managed/classifier
+refusal is reported with the exact operation, never bypassed or relabeled a
+product decision. Continue the release DAG after each slice; no fake human
+approval; preserve active or ambiguously owned worktrees and sessions. Jira: read
+with read-only tools, never mutate to read, never write placeholder bodies, read
+back every mutation (FORNX-439 comment 27362 overwrite).
 <!-- coding-agent-environment:engineering-workflow:end -->
 
 ---
