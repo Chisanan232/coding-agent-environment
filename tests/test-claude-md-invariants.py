@@ -81,6 +81,25 @@ MANIFEST = [
     ("mcp-active-servers", CLAUDE, "`fetch` and `github` are active by default", None),
     ("layering-project-wins", CLAUDE, "Project values take precedence when both define the same concept.", None),
     ("layering-global-applies", CLAUDE, "These global behavioral rules apply unless the project file explicitly overrides them.", None),
+    # Moved verbatim out of CLAUDE.md; CLAUDE.md names the owning reference.
+    ("circuit-breaker-stop", ".claude/skills/engineering-runtime/references/claude-runtime.md", "Do not attempt further repairs until the engineer reviews the situation", "claude-runtime reference"),
+    ("circuit-breaker-state", ".claude/skills/engineering-runtime/references/claude-runtime.md", "Write workflow state as `circuit_open`.", "claude-runtime reference"),
+    ("loop-no-recursion", ".claude/skills/engineering-runtime/references/claude-runtime.md", "A skill woken by a loop must not trigger another loop.", "claude-runtime reference"),
+    ("loop-no-self-repair", ".claude/skills/engineering-runtime/references/claude-runtime.md", "A skill must not enter a self-repair cycle", "claude-runtime reference"),
+    ("no-hardcoded-ticket", ".claude/skills/engineering-runtime/references/claude-runtime.md", "Skills\nmust never hardcode a ticket ref", "claude-runtime reference"),
+    ("bot-no-manual-lockfile", ".claude/skills/bot-pr-maintainer/references/bot-pr-policy.md", "Do not manually resolve lock-file conflicts in bot PRs", "bot-pr-policy"),
+    ("bot-escalate-on-update-failure", ".claude/skills/bot-pr-maintainer/references/bot-pr-policy.md", "escalate to the engineer", "bot-pr-policy"),
+    ("cross-repo-integration-gate", ".claude/skills/cross-repo-coordinator/references/cross-repo-work.md", "Integration tests pass", "cross-repo-work"),
+    ("tests-no-disabling", ".claude/skills/feature-implementation/references/quality-policies.md", "Do not disable failing tests.", "quality-policies"),
+    ("tests-regression", ".claude/skills/feature-implementation/references/quality-policies.md", "All bug fixes require a regression test.", "quality-policies"),
+    ("types-scoped-suppression", ".claude/skills/feature-implementation/references/quality-policies.md", "never suppress an entire file or block without a documented reason", "quality-policies"),
+    ("lint-no-silent-suppression", ".claude/skills/feature-implementation/references/quality-policies.md", "Do not suppress lint warnings without a comment", "quality-policies"),
+    ("ci-no-surface-fixes", ".claude/skills/ci-failure-triage/references/claude-ci-triage.md", "Do not apply surface-level fixes.", "claude-ci-triage"),
+    ("release-observe-only", ".claude/skills/release-watch/references/release-operations.md", "Observe release workflow state", "release-operations"),
+    ("delegation-conditions", ".claude/skills/architecture-design/references/model-routing-and-delegation.md", "Spawn an isolated sub-agent only when one of these is genuinely true", "model-routing-and-delegation"),
+    ("model-skip-opus-trivial", ".claude/skills/architecture-design/references/model-routing-and-delegation.md", "Skip `opus-architect` for trivial work", "model-routing-and-delegation"),
+    ("project-section-table", ".claude/skills/project-setup/references/project-claude-md.md", "Merge Gates", "project CLAUDE.md reference"),
+    ("skill-table", ".claude/skills/README.md", "| `post-merge-close` | Auto |", "skills/README.md"),
 ]
 
 
