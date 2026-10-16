@@ -254,5 +254,11 @@ class FullParity(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('symlinked private overlay', result.stderr)
 
+    def test_overlay_files_are_gitignored_and_never_tracked(self):
+        tracked = subprocess.check_output(['git', 'ls-files'], cwd=ROOT, text=True).splitlines()
+        self.assertFalse([name for name in tracked if name.endswith('CLAUDE.private.md')])
+        ignored = subprocess.run(['git', 'check-ignore', '-q', 'any/dir/claude/CLAUDE.private.md'], cwd=ROOT)
+        self.assertEqual(ignored.returncode, 0)
+
 if __name__ == '__main__':
     unittest.main()
