@@ -255,8 +255,9 @@ if host_mode == 'claude':
         pstart = b'<!-- coding-agent-environment:private-overlay:start -->'
         pend = b'<!-- coding-agent-environment:private-overlay:end -->'
         body = overlay.read_bytes()
-        if pstart in body or pend in body:
-            raise SystemExit('Private overlay must not contain its own managed markers.')
+        if any(marker in body for marker in (pstart, pend, start, end)):
+            # A workflow marker inside the overlay would make every later run fail on an ambiguous pair.
+            raise SystemExit('Private overlay must not contain managed markers.')
         private_block = pstart + b'\n' + body.rstrip(b'\n') + b'\n' + pend
         if pstart in merged or pend in merged:
             if merged.count(pstart) != 1 or merged.count(pend) != 1 or merged.index(pstart) > merged.index(pend):

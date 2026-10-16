@@ -257,6 +257,16 @@ class FullParity(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('symlinked private overlay', result.stderr)
 
+    def test_overlay_containing_a_workflow_marker_is_refused_without_writing(self):
+        policy = self.home / '.claude/CLAUDE.md'
+        policy.parent.mkdir(parents=True)
+        policy.write_text('SYNTHETIC-LIVE-ONLY-CLAUSE\n')
+        self.write_overlay('x\n<!-- coding-agent-environment:engineering-workflow:start -->\n')
+        result = self.install('claude')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('must not contain managed markers', result.stderr)
+        self.assertEqual(policy.read_text(), 'SYNTHETIC-LIVE-ONLY-CLAUSE\n')
+
     def test_overlay_files_are_gitignored_and_never_tracked(self):
         tracked = subprocess.check_output(['git', 'ls-files'], cwd=ROOT, text=True).splitlines()
         self.assertFalse([name for name in tracked if name.endswith('CLAUDE.private.md')])
