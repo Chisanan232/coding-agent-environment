@@ -513,50 +513,9 @@ tracking table are in the [claude-runtime reference](skills/engineering-runtime/
 
 ## Circuit Breaker Policy
 
-Claude Code uses a circuit breaker to prevent runaway repair loops. When the
-same ticket accumulates too many consecutive failures, the circuit opens and
-all further attempts are blocked until an engineer intervenes.
-
-### States
-
-| State | Meaning |
-|---|---|
-| **Closed** | Normal operation — failures recorded but below threshold |
-| **Open** | Threshold exceeded — further attempts blocked |
-| **Reset** | Manually cleared by engineer — returns to Closed |
-
-### Thresholds (per skill)
-
-| Skill / Phase | Threshold |
-|---|---|
-| `dev-impl-loop` Phase 1 (relative tests) | 5 consecutive failures |
-| `dev-impl-loop` Phase 2 (full suite repair) | 3 consecutive failures |
-| `dev-impl-loop` Phase 5 (post-QA repair cycles) | 3 QA rejection cycles |
-
-### How to use
-
-Skills call the utility directly:
-```bash
-# Check before entering a loop
-bash ~/.claude/hooks/circuit-breaker-gate.sh check <ticket> [threshold]
-
-# Record a failure after each failed iteration
-bash ~/.claude/hooks/circuit-breaker-gate.sh record-failure <ticket> [threshold]
-
-# Record a success (resets consecutive failure count)
-bash ~/.claude/hooks/circuit-breaker-gate.sh record-success <ticket>
-
-# Manual reset after engineer review
-bash ~/.claude/hooks/circuit-breaker-gate.sh reset <ticket>
-```
-
-### When the circuit opens
-
-1. Stop the repair loop immediately.
-2. Write workflow state as `circuit_open`.
-3. Report the failure summary and ticket reference back to the engineer.
-4. Do not attempt further repairs until the engineer reviews the situation
-   and resets the breaker.
+A circuit breaker stops runaway repair loops: when it opens, stop repairing, write
+state `circuit_open`, report to the engineer, and do not retry until they reset it.
+Thresholds and commands are in the [claude-runtime reference](skills/engineering-runtime/references/claude-runtime.md).
 
 ---
 
