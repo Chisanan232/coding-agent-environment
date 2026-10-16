@@ -3,6 +3,8 @@
 from importlib.util import module_from_spec, spec_from_file_location
 import json
 import os
+import threading
+import time
 from pathlib import Path
 import tempfile
 import unittest
@@ -149,6 +151,45 @@ class Volume(unittest.TestCase):
         with mock.patch.object(da.os, 'statvfs', side_effect=PermissionError('denied')):
             with self.assertRaises(da.VolumeError):
                 da.read_free_bytes()
+
+
+class Transactions(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / 'admission/state.json'
+
+    def test_concurrent_checks_serialize_state_writes(self):
+        inside, peak, guard = [0], [0], threading.Lock()
+
+        def measure():
+            with guard:
+                inside[0] += 1
+                peak[0] = max(peak[0], inside[0])
+            time.sleep(0.01)
+            with guard:
+                inside[0] -= 1
+            return 150 * GIB
+
+        # Negative control: the detector does see overlap when nothing serializes.
+        workers = [threading.Thread(target=measure) for _ in range(6)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        self.assertGreater(peak[0], 1)
+        inside[0], peak[0], results = 0, 0, []
+        workers = [threading.Thread(target=lambda: results.append(da.evaluate('heavy', self.path, measure)))
+                   for _ in range(6)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        self.assertEqual(peak[0], 1)
+        self.assertEqual(len(results), 6)
+        self.assertTrue(all(result['admit'] for result in results))
+        self.assertEqual(da.read_state(self.path)['free_bytes'], 150 * GIB)
+        self.assertEqual(sorted(entry.name for entry in self.path.parent.iterdir()), ['state.json', 'state.json.lock'])
 
 
 if __name__ == '__main__':
