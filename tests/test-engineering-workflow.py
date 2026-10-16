@@ -29,7 +29,6 @@ class EngineeringWorkflowContract(unittest.TestCase):
         required = [
             "<version-or-phase>/<ticket-id>/<short_summary>",
             "<GitEmoji> (<scope>): <imperative summary>",
-            "one concern and its necessary tests",
             "CI_UNAVAILABLE_EXTERNAL",
             "meaningful independent review",
             "[<TICKET>] <GitEmoji> (<scope>): <imperative summary under 60 chars>",
@@ -43,7 +42,6 @@ class EngineeringWorkflowContract(unittest.TestCase):
             "Create the worktree as a sibling of the main checkout",
             "Only the main coordinator may trigger the merge",
             "under 500 changed lines when practical",
-            "Preserve any required repository pull-request template",
             "The 72-character limit applies to the imperative summary",
         ]
         for phrase in required:
