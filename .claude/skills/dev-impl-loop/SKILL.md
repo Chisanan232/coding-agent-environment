@@ -96,7 +96,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
       iteration. Follow all conventions in the active repository instructions (naming, structure, type hints).
    b. Run **relative tests only** — tests in the affected module or package.
       Do not run the full suite here (too slow for iteration).
-   c. If relative tests pass → commit the change with a GitEmoji message.
+   c. If relative tests pass → commit the change as one small commit in the `engineering-workflow` format.
       One unit of work = one commit. Examples:
       - `✨ model(order): Add OrderStatus enum with PENDING, CONFIRMED, CANCELLED`
       - `✨ repo(order): Add OrderRepository.find_by_user_id()`
