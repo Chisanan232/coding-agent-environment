@@ -236,6 +236,10 @@ def apply(args):
             return 8
         new_text = serialise(with_gate(live), raw)
     backups = Path(args.backup_dir)
+    message = redirected(backups / 'receipt')
+    if message:
+        print(message)
+        return 4
     backups.mkdir(parents=True, exist_ok=True)
     stamp = time.time_ns()
     receipt = {'schema': 1, 'live': str(live_p), 'settings_backup': None, 'settings_sha_before': live_sha,
