@@ -34,15 +34,30 @@ from the branch by replacing `/` with `-`: `<repo>-<phase>-<ticket>-<summary>`.
 
 ## Implement and commit
 
-Keep each commit atomic and bisectable. Put one concern and its necessary tests in
-the same commit. Use imperative summaries under 72 characters:
+Keep each commit atomic and bisectable. Use imperative summaries under 72 characters:
 
 ```
-<emoji> <scope>: <imperative summary>
+<GitEmoji> (<scope>): <imperative summary>
 ```
+
+Parentheses around the scope are required. Example:
+`✨ (model): Add property to TestModel`.
 
 The 72-character limit applies to the imperative summary, not the entire commit
-subject.
+subject. Choose the GitEmoji by the primary change:
+
+| GitEmoji | Meaning |
+|---|---|
+| ✨ | Feature |
+| 🐛 | Bug fix |
+| ♻️ | Refactor |
+| ✅ | Tests |
+| 📝 | Documentation |
+| 🔧 | Configuration |
+| ⬆️ | Dependencies |
+| 🗑️ | Removal |
+| 🚨 | Lint or type repair |
+| 🔒 | Security |
 
 Do not bypass hooks, security checks, or a genuinely failing product check. Run
 focused checks while iterating, then the repository's full relevant build, lint,
@@ -70,7 +85,7 @@ larger work into a reviewable sequence rather than bundling unrelated changes.
 Use this exact pull-request title shape:
 
 ```
-[<ticket-number>] <emoji> <scope>: <imperative summary under 60 chars>
+[<TICKET>] <GitEmoji> (<scope>): <imperative summary under 60 chars>
 ```
 
 The 60-character limit applies to the imperative summary, not the entire title.
@@ -80,13 +95,13 @@ whether its summary actually uses imperative meaning.
 Examples:
 
 ```
-[PROJ-123] ✨ restapi: Add user authentication
-[42] 🐛 api: Fix retry leak
+[PROJ-123] ✨ (restapi): Add user authentication
+[42] 🐛 (api): Fix retry leak
 ```
 
 Use `$evidence-first-briefing` for the body. Lead with resulting behavior or the
 changed boundary. Include actual validation, material risks or unknowns, and issue
-references. Preserve any required repository pull-request template and fields.
+references. Use the repository's `.github/PULL_REQUEST_TEMPLATE.md` and keep its fields.
 Omit file chronology and unsupported completion claims.
 
 Do not merge until required checks, code-owner approvals, conflict resolution,
