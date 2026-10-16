@@ -435,6 +435,12 @@ class GateInputs(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][2:], ['check', '--weight', 'heavy'])
 
 
+    def test_adapter_timeout_is_a_failure_not_an_admission(self):
+        with mock.patch.object(gate.subprocess, 'run', side_effect=gate.subprocess.TimeoutExpired('x', 1)):
+            code, text = gate.run_adapter()
+        self.assertIsNone(code)
+        self.assertTrue(text)
+
 
 if __name__ == '__main__':
     unittest.main()
