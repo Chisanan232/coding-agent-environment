@@ -245,7 +245,7 @@ never read or written, and the platform classifier defaults (the single
 Materialization") cannot be removed through personal settings. Only `allow`
 exceptions to `soft_deny` are possible; the one added here is the narrow,
 transcript-verifiable pull-request merge entry below (an explicit exception to
-"Merge Without Review"). No exception is added for the other categories.
+"Merge Without Review"); the optional cross-repository personal-development entry (below, applied only with `--dev-dirs`) is the only other. No exception is added for the remaining categories.
 
 **Why `ask` is a safe replacement (documented, not assumed).** `ask` prompts in
 every permission mode, `bypassPermissions` included; `deny` also stays enforced
@@ -311,8 +311,12 @@ allow should precede the classifier, yet earlier merge commands were
 classifier-denied, so the entry is kept and its effect is unverified. It is an
 explicit carve-out from "Merge Without Review", and its "no PR-body text" clause
 only constrains what the classifier counts as evidence. (c) `terraform -* apply*`
-and `gcloud secrets` metadata reads that merely contain `projects/` remain
-classifier-judged.
+still prompts on a few read-only commands when a global flag precedes it and an
+argument contains the word (for example `terraform -chdir=x plan -out apply.tfplan`,
+`terraform -chdir=x output apply_url`, `terraform -chdir=x workspace select
+destroy-x`); accepted as the cost of covering `-chdir=` forms. `gcloud secrets`
+metadata reads whose arguments contain `projects/` are no longer gated by the
+baseline (the narrower `gcloud secrets*projects/*` ask lives in the private overlay).
 
 **Personal-machine trust (founder clarification, 2026-10-16).** Trust is global to
 the personal Claude Code installation, not to the directory a session started in.
@@ -324,10 +328,17 @@ development context, (b) one narrow `autoMode.allow` exception so work in anothe
 repository under the same roots is not "wandering into other repos", and (c)
 `permissions.additionalDirectories`, the documented file-access grant (Read/Edit/
 Write/Glob/Grep, recursive, same permission rules as the working directory, not
-the Bash cwd). The tool rejects roots that are the filesystem root, the home
-directory, a system path or a credential path. The trust text excludes credential
-and key files, system-protected paths, production resources and uploads of private
-data. The documentation names no "trusted local directory" slot and does not
+the Bash cwd). The tool resolves each root (`~`, symlinks, case) before judging it and accepts only
+a directory strictly under the home directory (not a hidden, Library or
+Applications folder, and not on a credential path) or `/Volumes/<name>/<dir>`;
+`.`/`..` segments, `~user`, backticks and control characters are rejected. A later,
+narrower `--dev-dirs` replaces the earlier grant instead of adding to it. Because
+`additionalDirectories` makes reads under the roots silent, the tool also adds
+`ask` rules for `Read(**/.env)` and `Read(**/.env.local)` (verified to prompt while
+`.env.example` reads freely). The trust text excludes credential and key files,
+`.env` files, the agent's own configuration (`.claude/`, CLAUDE.md, AGENTS.md), git
+hooks and config, shell startup files, system paths, production resources,
+irreversible deletion and uploads of private data. The documentation names no "trusted local directory" slot and does not
 specify how auto mode weighs `additionalDirectories`, so (a) and (b) are
 free-form prose whose effect is sampled, not proven. No external volume was
 mounted when this was written; `/Volumes/...` roots are accepted by `--dev-dirs`.
