@@ -50,9 +50,10 @@ WRAPPER_VALUE_OPTIONS = {
 SHELLS = {'bash', 'sh', 'zsh', 'dash'}
 # Control-flow words that precede a command in a compound statement.
 KEYWORDS = {'{', '!', 'if', 'then', 'else', 'elif', 'do', 'while', 'until'}
-CARGO_HEAVY = {'build', 'b', 'test', 't', 'check', 'c', 'doc', 'clippy', 'nextest', 'bench', 'rustdoc'}
-CARGO_VALUE_OPTIONS = {'-C', '--config', '-Z', '--color'}
-NODE_HEAVY = {'install', 'i', 'ci', 'build'}
+CARGO_HEAVY = {'build', 'b', 'test', 't', 'check', 'c', 'doc', 'clippy', 'nextest', 'bench', 'rustdoc',
+               'run', 'r', 'install', 'rustc'}
+CARGO_VALUE_OPTIONS = {'-C', '--config', '-Z', '--color', '--manifest-path', '--target-dir'}
+NODE_HEAVY = {'install', 'i', 'ci', 'build', 'test', 't'}
 
 
 def _heredoc_word(text, index):
