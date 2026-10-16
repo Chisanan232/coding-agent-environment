@@ -461,6 +461,12 @@ class Fixture(unittest.TestCase):
         self.assertIn('immediately before the restore', text)
         self.assertEqual(self.live.read_text(), '{"statusLine": "concurrent writer"}\n')
 
+    def test_apply_writes_the_command_for_the_given_destination(self):
+        self.assertEqual(self.apply()[0], 0)
+        command = json.loads(self.live.read_text())['hooks']['PreToolUse'][-1]['hooks'][0]['command']
+        self.assertEqual(command, 'python3 %s' % self.dest)
+        self.assertTrue(Path(command.split(' ', 1)[1]).is_file())
+
 
 class CommandDerivation(unittest.TestCase):
     def test_command_uses_the_tilde_form_under_home_and_quotes_other_paths(self):
