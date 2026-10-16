@@ -97,6 +97,40 @@ def serialise(obj, raw):
     return json.dumps(obj, indent=indent, ensure_ascii=False) + ('\n' if raw.endswith('\n') else '')
 
 
+BAD_SETTINGS_EXIT = 10
+
+
+class SettingsError(Exception):
+    """The settings file cannot be handled safely."""
+
+
+def load_settings(path):
+    """(raw bytes, text, parsed object) for a settings file this tool can edit; SettingsError otherwise."""
+    try:
+        raw_bytes = Path(path).read_bytes()
+    except OSError as exc:
+        raise SettingsError('cannot read %s: %s' % (path, exc))
+    try:
+        raw = raw_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        raise SettingsError('settings are not valid UTF-8')
+    try:
+        live = json.loads(raw)
+    except ValueError as exc:
+        raise SettingsError('settings are not valid JSON: %s' % exc)
+    if not isinstance(live, dict):
+        raise SettingsError('the settings root is not an object')
+    hooks = live.get('hooks', {})
+    if not isinstance(hooks, dict):
+        raise SettingsError('"hooks" is not an object')
+    groups = hooks.get('PreToolUse', [])
+    if not isinstance(groups, list) or any(
+            not isinstance(group, dict) or not isinstance(group.get('hooks', []), list)
+            or any(not isinstance(entry, dict) for entry in group.get('hooks', [])) for group in groups):
+        raise SettingsError('"hooks.PreToolUse" is not a list of hook groups')
+    return raw_bytes, raw, live
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('mode', choices=['plan', 'apply', 'verify', 'rollback'])
@@ -117,8 +151,7 @@ def build_parser():
 
 def plan(args):
     live_p, src = Path(args.live), Path(args.hook_src)
-    raw_bytes = live_p.read_bytes()
-    live = json.loads(raw_bytes)
+    raw_bytes, raw, live = load_settings(live_p)
     hook_sha = rollout.sha(src)
     state = gate_state(live)
     print('live settings sha256 %s' % sha_bytes(raw_bytes))
@@ -128,7 +161,6 @@ def plan(args):
     print('hook destination: %s (%s)' % (dest, 'matches' if dest.exists() and rollout.sha(dest) == hook_sha
                                           else 'exists, differs' if dest.exists() else 'absent'))
     print('mode file: %s (WARN is the staged default)' % mode_state(Path(args.mode_file)))
-    raw = raw_bytes.decode()
     if serialise(live, raw) != raw:
         print('NOTE: re-serialising the unmodified settings changes its formatting; apply needs --allow-reformat')
     if state == 'conflict':
@@ -175,13 +207,7 @@ def apply(args):
     if message:
         print(message)
         return 4
-    raw_bytes = live_p.read_bytes()
-    raw = raw_bytes.decode()
-    try:
-        live = json.loads(raw)
-    except ValueError as exc:
-        print('REFUSING: live settings are not valid JSON: %s' % exc)
-        return 6
+    raw_bytes, raw, live = load_settings(live_p)
     state = gate_state(live)
     if state == 'conflict':
         print('REFUSING: the settings already hold a different disk-admission-gate entry')
@@ -239,7 +265,7 @@ def apply(args):
 def verify(args):
     live_p, dest = Path(args.live), Path(args.hook_dest)
     problems = []
-    live = json.loads(live_p.read_text())
+    live = load_settings(live_p)[2]
     found = gate_entries(live)
     if len(found) != 1:
         problems.append('expected the gate hook exactly once in settings, found %d' % len(found))
@@ -317,16 +343,12 @@ def rollback(args):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    if args.mode == 'plan':
-        return plan(args)
-    if args.mode == 'apply':
-        return apply(args)
-    if args.mode == 'verify':
-        return verify(args)
-    if args.mode == 'rollback':
-        return rollback(args)
-    print('mode %s is not available yet' % args.mode)
-    return 2
+    handlers = {'plan': plan, 'apply': apply, 'verify': verify, 'rollback': rollback}
+    try:
+        return handlers[args.mode](args)
+    except SettingsError as exc:
+        print('REFUSING: %s' % exc)
+        return BAD_SETTINGS_EXIT
 
 
 if __name__ == '__main__':
