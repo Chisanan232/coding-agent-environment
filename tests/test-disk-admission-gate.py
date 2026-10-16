@@ -212,6 +212,10 @@ class Newlines(unittest.TestCase):
         self.assertTrue(self.heavy('cat <<EOF && cargo build\nx\nEOF'))
         self.assertTrue(self.heavy('cargo build <<EOF\nx\nEOF'))
 
+    def test_crlf_line_endings_separate_commands(self):
+        self.assertTrue(self.heavy('echo a\r\ncargo build'))
+        self.assertFalse(self.heavy('cat <<EOF\r\ncargo build\r\nEOF\r\nls'))
+
 
 if __name__ == '__main__':
     unittest.main()
