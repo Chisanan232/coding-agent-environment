@@ -688,6 +688,12 @@ class HarnessWorkdir(unittest.TestCase):
         self.assertIn("hashlib.sha256(shell.encode()).hexdigest()[:12]", text)
         self.assertIn("differs from the sha of the command sent", text)
 
+    def test_production_path_case_is_opt_in_and_declares_its_real_directory_writes(self):
+        text = (ROOT / 'tests/acceptance/gate-acceptance.py').read_text()
+        self.assertIn("'--include-production-path' in argv", text)
+        self.assertIn('account database, not $HOME', text)
+        self.assertIn('def production_case', text)
+
 
 class HungAdapter(unittest.TestCase):
     def setUp(self):
