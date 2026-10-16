@@ -728,6 +728,23 @@ class ReservationHardening(unittest.TestCase):
             self.assertIn('invalid-request', da.release(label, self.path)['reason'], repr(label))
         self.assertTrue(self.take('ok')['admit'])
 
+    def test_garbled_or_naive_expiry_is_a_problem_not_a_crash(self):
+        self.assertTrue(self.take('job-a')['admit'])
+        self.assertTrue(da.release('job-a', self.path)['admit'])
+        directory = self.path.parent / 'reservations'
+        token = da.process_token(os.getpid())
+        base = {'version': 1, 'label': 'job-x', 'bytes': GIB, 'pid': os.getpid(), 'start_token': token}
+        for expires in ('2026-10-16T12:00:00', 'soon', '', '2026-13-45T99:00:00Z'):
+            (directory / 'job-x.json').write_text(json.dumps(dict(base, expires=expires)))
+            with da.state_lock(self.path):
+                live, problems = da.live_reservations(self.path, self.now)
+            self.assertEqual(live, [], expires)
+            self.assertIn('reservation-unreadable', ' '.join(problems), expires)
+            refused = self.take('job-y')
+            self.assertFalse(refused['admit'], expires)
+            self.assertIn('reservation-unreadable', refused['reason'])
+        self.assertTrue((directory / 'job-x.json').exists())
+
 
 if __name__ == '__main__':
     unittest.main()
