@@ -254,6 +254,8 @@ if host_mode == 'claude':
             raise SystemExit('Private overlay must be a regular file owned by you with mode 0600.')
         pstart = b'<!-- coding-agent-environment:private-overlay:start -->'
         pend = b'<!-- coding-agent-environment:private-overlay:end -->'
+        if info.st_size > 262144:
+            raise SystemExit('Private overlay exceeds the 256 KiB limit.')
         body = overlay.read_bytes()
         if any(marker in body for marker in (pstart, pend, start, end)):
             # A workflow marker inside the overlay would make every later run fail on an ambiguous pair.
