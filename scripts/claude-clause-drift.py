@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -52,6 +53,14 @@ def main() -> int:
         return 1
     public = (ROOT / ".claude/CLAUDE.md").read_text()
     overlay_file = overlay_path(home)
+    if overlay_file.is_symlink():
+        print("Refusing symlinked private overlay.")
+        return 2
+    if overlay_file.exists():
+        info = overlay_file.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            print("Private overlay must be a regular file owned by you with mode 0600.")
+            return 2
     overlay = overlay_file.read_text() if overlay_file.is_file() else ""
     covered = {h for _, _, h in clauses(public)} | {h for _, _, h in clauses(overlay)}
     live = live_path.read_text()
