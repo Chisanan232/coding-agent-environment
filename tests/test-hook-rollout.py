@@ -309,6 +309,16 @@ class Fixture(unittest.TestCase):
         self.assertIn('enforce', text)
         self.assertEqual(self.run_cli('verify', '--allow-enforce')[0], 0)
 
+    def test_verify_fails_when_a_deny_rule_was_added(self):
+        self.assertEqual(self.apply()[0], 0)
+        receipt = next(p for p in self.backups.iterdir() if 'receipt' in p.name)
+        data = json.loads(self.live.read_text())
+        data['permissions']['deny'] = ['Bash(cargo build:*)']
+        self.live.write_text(json.dumps(data, indent=2) + '\n')
+        code, text = self.run_cli('verify', '--receipt', str(receipt))
+        self.assertEqual(code, 1)
+        self.assertIn('deny', text)
+
 
 if __name__ == '__main__':
     unittest.main()
