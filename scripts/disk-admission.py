@@ -328,5 +328,14 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
     return 0 if result['admit'] else REFUSED_EXIT
 
 
+def run(argv=None):
+    """main() with every unexpected failure turned into a refusal."""
+    try:
+        return main(argv)
+    except Exception as exc:
+        print('refused: internal error: %s' % exc)
+        return REFUSED_EXIT
+
+
 if __name__ == '__main__':
-    raise SystemExit(main())
+    raise SystemExit(run())
