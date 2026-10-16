@@ -429,6 +429,12 @@ class GateInputs(unittest.TestCase):
         self.assertEqual(gate.adapter_path(), ROOT / 'scripts/disk-admission.py')
 
 
+    def test_adapter_is_asked_for_heavy_work_only(self):
+        with mock.patch.object(gate.subprocess, 'run', return_value=mock.Mock(returncode=77, stdout='refused\n', stderr='')) as run:
+            self.assertEqual(gate.run_adapter(), (77, 'refused'))
+        self.assertEqual(run.call_args.args[0][2:], ['check', '--weight', 'heavy'])
+
+
 
 if __name__ == '__main__':
     unittest.main()
