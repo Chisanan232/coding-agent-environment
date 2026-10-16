@@ -12,6 +12,7 @@ Usage: gate-acceptance.py WORKDIR [--cases H1,H2,...]
 The admitted path (free space >= 100 GiB) is reported NOT_YET_VERIFIABLE while
 the host is below 100 GiB; it is never faked.
 """
+import hashlib
 import json
 import os
 import pwd
@@ -126,8 +127,12 @@ class Harness:
             evidence = self.session(shell, mode, marker)
             evidence['retried'] = True
         ok, why = check(evidence)
+        expected = hashlib.sha256(shell.encode()).hexdigest()[:12]
+        sha_ok = all(e.get('cmd_sha12') == expected for e in evidence['audit'])
+        if evidence['audit'] and not sha_ok:
+            ok, why = False, 'audit cmd_sha12 differs from the sha of the command sent (%s)' % expected
         self.results.append({'case': label, 'mode': mode, 'command': command, 'status': 'PASS' if ok else 'FAIL',
-                             'why': why, 'answer': evidence['answer'], 'command_ran': evidence['ran'],
+                             'why': why, 'sha_match': sha_ok if evidence['audit'] else None, 'answer': evidence['answer'], 'command_ran': evidence['ran'],
                              'audit': [(e['classification'], e['tool'], e['decision'], e['tier']) for e in evidence['audit']]})
 
     def not_verifiable(self, label, reason):
