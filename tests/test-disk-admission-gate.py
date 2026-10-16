@@ -409,6 +409,14 @@ class GateInputs(unittest.TestCase):
             self.assertEqual(self.gate_main(raw), (0, '', ''), raw)
 
 
+    def test_non_bash_tools_are_ignored(self):
+        raw = json.dumps({'tool_name': 'Read', 'tool_input': {'command': 'cargo build'}})
+        self.assertEqual(self.gate_main(raw), (0, '', ''))
+        # Negative control: the same payload for Bash reaches the adapter.
+        raw = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'cargo build'}})
+        self.assertEqual(self.gate_main(raw)[0], 2)  # the adapter was reached and its failure closed
+
+
 
 if __name__ == '__main__':
     unittest.main()
