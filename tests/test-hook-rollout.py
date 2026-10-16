@@ -58,5 +58,47 @@ class Pure(unittest.TestCase):
         self.assertEqual(hr.gate_state(other), 'conflict')
 
 
+class Fixture(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.live = self.root / 'claude/settings.json'
+        self.live.parent.mkdir()
+        self.live_text = json.dumps(LIVE, indent=2, ensure_ascii=False) + '\n'
+        self.live.write_text(self.live_text)
+        os.chmod(self.live, 0o600)
+        self.src = self.root / 'src/disk-admission-gate.py'
+        self.src.parent.mkdir()
+        self.src.write_text('#!/usr/bin/env python3\nprint("gate")\n')
+        self.dest = self.root / 'claude/hooks/disk-admission-gate.py'
+        self.mode = self.root / 'cache/admission/mode'
+        self.backups = self.root / 'claude/backups'
+
+    def args(self, mode, *extra):
+        return [mode, '--live', str(self.live), '--hook-src', str(self.src), '--hook-dest', str(self.dest),
+                '--mode-file', str(self.mode), '--backup-dir', str(self.backups), *extra]
+
+    def run_cli(self, mode, *extra):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = hr.main(self.args(mode, *extra))
+        return code, out.getvalue()
+
+    def snapshot_tree(self):
+        return {str(p.relative_to(self.root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in sorted(self.root.rglob('*')) if p.is_file()}
+
+    def test_plan_writes_nothing_and_reports_hashes(self):
+        before = self.snapshot_tree()
+        code, text = self.run_cli('plan')
+        self.assertEqual(code, 0)
+        self.assertIn(hashlib.sha256(self.live_text.encode()).hexdigest(), text)
+        self.assertIn(hashlib.sha256(self.src.read_bytes()).hexdigest(), text)
+        self.assertIn('append 1 PreToolUse group', text)
+        self.assertIn('mode file: absent', text)
+        self.assertEqual(self.snapshot_tree(), before)
+
+
 if __name__ == '__main__':
     unittest.main()
