@@ -92,6 +92,7 @@ MANIFEST = [
     ("cross-repo-integration-gate", ".claude/skills/cross-repo-coordinator/references/cross-repo-work.md", "Integration tests pass", "cross-repo-work"),
     ("tests-no-disabling", ".claude/skills/feature-implementation/references/quality-policies.md", "Do not disable failing tests.", "quality-policies"),
     ("tests-regression", ".claude/skills/feature-implementation/references/quality-policies.md", "All bug fixes require a regression test.", "quality-policies"),
+    ("types-no-runtime-change", ".claude/skills/feature-implementation/references/quality-policies.md", "Type annotations must never change runtime behavior.", "quality-policies"),
     ("types-scoped-suppression", ".claude/skills/feature-implementation/references/quality-policies.md", "never suppress an entire file or block without a documented reason", "quality-policies"),
     ("lint-no-silent-suppression", ".claude/skills/feature-implementation/references/quality-policies.md", "Do not suppress lint warnings without a comment", "quality-policies"),
     ("ci-no-surface-fixes", ".claude/skills/ci-failure-triage/references/claude-ci-triage.md", "Do not apply surface-level fixes.", "claude-ci-triage"),
