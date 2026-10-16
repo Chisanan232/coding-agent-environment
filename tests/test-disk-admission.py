@@ -418,6 +418,12 @@ class Hardening(unittest.TestCase):
         self.assertEqual(self.path.read_text(), before)
         self.assertEqual(sorted(entry.name for entry in self.path.parent.iterdir()), ['state.json', 'state.json.lock'])
 
+    def test_existing_state_directory_is_tightened_to_0700(self):
+        self.path.parent.mkdir(parents=True, mode=0o755)
+        os.chmod(self.path.parent, 0o755)
+        self.assertTrue(da.evaluate('light', self.path, lambda: 500 * GIB)['admit'])
+        self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
+
 
 if __name__ == '__main__':
     unittest.main()
