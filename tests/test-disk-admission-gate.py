@@ -301,6 +301,12 @@ class Compound(unittest.TestCase):
         for command in ('cargo tree', 'cargo metadata', 'cargo help build', 'cargo fmt', 'cargo --version'):
             self.assertFalse(self.heavy(command), command)
 
+    def test_package_manager_test_is_heavy(self):
+        for command in ('npm test', 'pnpm test', 'yarn test', 'npm t'):
+            self.assertTrue(self.heavy(command), command)
+        self.assertFalse(self.heavy('npm --version'))
+        self.assertFalse(self.heavy('npm run test'))
+
 
 if __name__ == '__main__':
     unittest.main()
