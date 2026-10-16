@@ -169,8 +169,10 @@ default intervals and scheduling are in the [claude-runtime reference](skills/en
 Invoke skills by their actual triggers; the skill-to-trigger table and the
 language-specific repair skill guidance are in [skills/README.md](skills/README.md).
 Load a language repair skill only when its tool fails.
-Frontend work needs the `acceptance-validation` frontend QA evidence, and
-`post-merge-close` owns closeout, the disk-free check and cleanup status.
+Frontend work needs the [acceptance-validation](skills/acceptance-validation/SKILL.md)
+frontend QA evidence, and [post-merge-close](skills/post-merge-close/SKILL.md) owns
+closeout, the disk-free check and cleanup status. [decision-delegation](skills/decision-delegation/SKILL.md)
+owns the `READY_FOR_RELEASE` completion token and decision levels.
 
 ---
 
