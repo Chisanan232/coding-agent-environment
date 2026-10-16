@@ -205,6 +205,16 @@ class Fixture(unittest.TestCase):
         self.assertEqual(target.read_text(), 'untouched')
         self.assertEqual(self.live.read_text(), self.live_text)
 
+    def test_enforce_mode_file_blocks_apply_unless_allowed(self):
+        self.mode.parent.mkdir(parents=True)
+        self.mode.write_text('enforce\n')
+        before = self.snapshot_tree()
+        code, text = self.apply()
+        self.assertEqual(code, 9)
+        self.assertIn('WARN', text)
+        self.assertEqual(self.snapshot_tree(), before)
+        self.assertEqual(self.apply('--allow-enforce')[0], 0)
+
 
 if __name__ == '__main__':
     unittest.main()
