@@ -2,6 +2,8 @@
 """The disk-admission PreToolUse gate classifies heavy builds and only ever denies."""
 from importlib.util import module_from_spec, spec_from_file_location
 import os
+import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -108,6 +110,28 @@ class Mode(unittest.TestCase):
         self.path.symlink_to(Path(self.temp.name) / 'elsewhere')
         (Path(self.temp.name) / 'elsewhere').write_text('enforce')
         self.assertEqual(gate.read_mode(self.path), 'warn')
+
+
+class Decisions(unittest.TestCase):
+    def run_gate(self, command, mode, runner, tool='Bash'):
+        payload = json.dumps({'tool_name': tool, 'tool_input': {'command': command}, 'session_id': 's'})
+        out, err = io.StringIO(), io.StringIO()
+        code = gate.main(payload, out, err, mode_fn=lambda: mode, runner=runner)
+        return code, out.getvalue(), err.getvalue()
+
+    @staticmethod
+    def refuses():
+        return 77, 'heavy refused in tier low; tier=low free=35.9 GiB'
+
+    def test_warn_mode_allows_and_adds_context_when_admission_would_refuse(self):
+        code, out, err = self.run_gate('cargo build', 'warn', self.refuses)
+        self.assertEqual((code, err), (0, ''))
+        context = json.loads(out)['hookSpecificOutput']
+        self.assertEqual(context['hookEventName'], 'PreToolUse')
+        self.assertIn('would block', context['additionalContext'])
+        self.assertIn('tier=low', context['additionalContext'])
+        # Negative control: an admitted heavy command is allowed silently.
+        self.assertEqual(self.run_gate('cargo build', 'warn', lambda: (0, 'admitted')), (0, '', ''))
 
 
 if __name__ == '__main__':
