@@ -223,6 +223,13 @@ class Fixture(unittest.TestCase):
         self.mode.write_text('warn\n')
         self.assertEqual(self.apply()[0], 0)
 
+    def test_unmerged_hook_file_is_refused_without_the_rehearsal_flag(self):
+        code, text = self.run_cli('apply', '--expect-live-sha', hashlib.sha256(self.live.read_bytes()).hexdigest(),
+                                  '--expect-hook-sha', hashlib.sha256(self.src.read_bytes()).hexdigest())
+        self.assertEqual(code, 7)
+        self.assertIn('outside the repository', text)
+        self.assertFalse(self.dest.exists())
+
 
 if __name__ == '__main__':
     unittest.main()
