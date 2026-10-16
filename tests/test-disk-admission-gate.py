@@ -156,6 +156,18 @@ class Decisions(unittest.TestCase):
         # A non-heavy command never reaches the adapter, so its failure cannot block it.
         self.assertEqual(self.run_gate('ls', 'enforce', raises), (0, '', ''))
 
+    def test_gate_never_rewrites_the_command(self):
+        outputs = []
+        for mode in ('warn', 'enforce'):
+            for runner in (self.refuses, lambda: (0, 'ok'), lambda: (None, 'down')):
+                outputs.append(self.run_gate('FOO=1 rtk cargo build --target-dir /tmp/new-x', mode, runner))
+        for code, out, err in outputs:
+            for text in (out, err):
+                self.assertNotIn('updatedInput', text)
+                self.assertNotIn('"command"', text)
+                self.assertNotIn('permissionDecision', text)
+        self.assertEqual({code for code, _, _ in outputs}, {0, 2})
+
 
 if __name__ == '__main__':
     unittest.main()
