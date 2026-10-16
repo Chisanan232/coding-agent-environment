@@ -478,6 +478,21 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.snapshot_tree(), before)
         self.assertEqual(self.run_cli('verify', '--hook-dest', str(other))[0], 1)
 
+    def refuses_dest(self, value):
+        before = self.snapshot_tree()
+        for mode in ('plan', 'apply', 'verify'):
+            code, text = self.run_cli(mode, '--hook-dest', value, *(self.pins()[:4] if mode == 'apply' else []),
+                                      *(['--unmerged-ok'] if mode == 'apply' else []))
+            self.assertEqual(code, 12, (mode, value, text))
+            self.assertIn('--hook-dest', text)
+        self.assertEqual(self.snapshot_tree(), before)
+        self.assertEqual(self.live.read_text(), self.live_text)
+        self.assertFalse(os.path.exists('~') and 'x' in os.listdir('~'))
+
+    def test_a_relative_hook_destination_is_refused(self):
+        self.refuses_dest('hooks/disk-admission-gate.py')
+        self.refuses_dest('./disk-admission-gate.py')
+
 
 class CommandDerivation(unittest.TestCase):
     def test_command_uses_the_tilde_form_under_home_and_quotes_other_paths(self):
