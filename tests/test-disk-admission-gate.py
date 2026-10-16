@@ -216,6 +216,12 @@ class Newlines(unittest.TestCase):
         self.assertTrue(self.heavy('echo a\r\ncargo build'))
         self.assertFalse(self.heavy('cat <<EOF\r\ncargo build\r\nEOF\r\nls'))
 
+    def test_apostrophe_inside_heredoc_body_does_not_break_parsing(self):
+        verdict = gate.classify("cat <<EOF\nit's a trap\nEOF\ncargo build")
+        self.assertEqual((verdict['heavy'], verdict['confidence']), (True, 'exact'))
+        verdict = gate.classify("cat <<EOF\nit's a trap\nEOF\nls")
+        self.assertEqual((verdict['heavy'], verdict['confidence']), (False, 'exact'))
+
 
 if __name__ == '__main__':
     unittest.main()
