@@ -16,6 +16,15 @@ TITLE = re.compile(
     r"[a-z0-9][a-z0-9._/-]*: (?P<summary>[^\n]+)$"
 )
 
+BRANCH = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/(?:[A-Z][A-Z0-9]*-[0-9]+|[0-9]+)/[a-z0-9]+(?:_[a-z0-9]+){1,3}$"
+)
+
+
+def valid_branch(name: str) -> bool:
+    """Phase/ticket/summary only; a type segment would add a fourth part."""
+    return bool(BRANCH.fullmatch(name)) and len(name.rsplit("/", 1)[1]) <= 30
+
 
 def structurally_valid_title(title: str) -> bool:
     """Check machine-verifiable shape; imperative meaning requires human review."""
@@ -167,6 +176,22 @@ class EngineeringWorkflowContract(unittest.TestCase):
         self.assertEqual(workflow.count("- '.claude/CLAUDE.md'"), 2)
         self.assertEqual(workflow.count("- '.claude/skills/**'"), 2)
         self.assertIn("python3 tests/test-engineering-workflow.py", workflow)
+
+    def test_branch_name_has_no_type_segment_and_derives_the_worktree(self) -> None:
+        valid = ["full/SPE-108/restore_dev_contract", "v0.1.0/TEST-1/add_endpoint", "sprint3/42/extract_payment_service"]
+        invalid = [
+            "full/SPE-108/feat/restore_dev_contract",
+            "v0.1.0/TEST-1/fix/auth_token_refresh",
+            "full/SPE-108",
+            "full/spe-108/restore_dev_contract",
+            "full/SPE-108/single",
+            "full/SPE-108/" + "_".join(["word"] * 7),
+        ]
+        self.assertTrue(all(valid_branch(name) for name in valid))
+        self.assertFalse(any(valid_branch(name) for name in invalid))
+        text = WORKFLOW.read_text()
+        self.assertNotIn("<type>", text)
+        self.assertIn("<repo>-<phase>-<ticket>-<summary>", text)
 
 
 if __name__ == "__main__":
