@@ -267,6 +267,16 @@ class FullParity(unittest.TestCase):
         self.assertIn('must not contain managed markers', result.stderr)
         self.assertEqual(policy.read_text(), 'SYNTHETIC-LIVE-ONLY-CLAUSE\n')
 
+    def test_oversized_overlay_is_refused_without_writing(self):
+        policy = self.home / '.claude/CLAUDE.md'
+        policy.parent.mkdir(parents=True)
+        policy.write_text('SYNTHETIC-LIVE-ONLY-CLAUSE\n')
+        self.write_overlay('x' * (262144 + 1))
+        result = self.install('claude')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('256 KiB', result.stderr)
+        self.assertEqual(policy.read_text(), 'SYNTHETIC-LIVE-ONLY-CLAUSE\n')
+
     def test_overlay_files_are_gitignored_and_never_tracked(self):
         tracked = subprocess.check_output(['git', 'ls-files'], cwd=ROOT, text=True).splitlines()
         self.assertFalse([name for name in tracked if name.endswith('CLAUDE.private.md')])
