@@ -383,6 +383,13 @@ class CommandModes(Fixture):
         self.assertIn("permissions.deny: 8 -> 0", out)
         self.assertFalse((self.home / ".claude/backups").exists())
 
+    def test_dev_dirs_without_owner_lines_exits_6_with_refusal(self):
+        dev = self.home / "dev"
+        dev.mkdir()
+        rc, out = self.run_tool("plan", "--baseline", str(self.base_p), "--live", str(self.live_p), "--dev-dirs", str(dev), "--unmerged-ok")
+        self.assertEqual(6, rc, out)
+        self.assertIn("REFUSING", out)
+
     def test_apply_refuses_without_both_hashes(self):
         before = self.live_p.read_bytes()
         rc, _ = self.run_tool("apply", *self.args())
