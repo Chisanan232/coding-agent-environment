@@ -254,6 +254,11 @@ class Compound(unittest.TestCase):
         self.assertTrue(self.heavy('nice -10 cargo build'))
         self.assertFalse(self.heavy('nice -n 10 ls'))
 
+    def test_sudo_with_user_option_is_heavy(self):
+        self.assertTrue(self.heavy('sudo -u builder cargo build'))
+        self.assertTrue(self.heavy('sudo -E npm ci'))
+        self.assertFalse(self.heavy('sudo -u builder ls'))
+
 
 if __name__ == '__main__':
     unittest.main()
