@@ -274,6 +274,14 @@ class Fixture(unittest.TestCase):
         self.assertFalse(self.dest.exists())
         self.assertNotIn('disk-admission-gate', self.live.read_text())
 
+    def test_verify_passes_after_apply_and_reports_the_mode(self):
+        self.assertEqual(self.apply()[0], 0)
+        receipt = next(p for p in self.backups.iterdir() if 'receipt' in p.name)
+        code, text = self.run_cli('verify', '--receipt', str(receipt))
+        self.assertEqual(code, 0, text)
+        self.assertIn('verify OK', text)
+        self.assertIn('mode file: absent', text)
+
 
 if __name__ == '__main__':
     unittest.main()
