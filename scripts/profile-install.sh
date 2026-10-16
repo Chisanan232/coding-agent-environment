@@ -240,6 +240,30 @@ elif prior:
     merged = prior + (b'' if prior.endswith(b'\n') else b'\n') + b'\n' + block + b'\n'
 else:
     merged = policy if host_mode == 'codex' else block + b'\n'
+if host_mode == 'claude':
+    # Optional private overlay (live-only clauses). It lives outside the repository, is never
+    # printed, and only its own marker span is replaced or appended in the live policy.
+    local_dir = Path(os.environ.get('CODING_AGENT_LOCAL_DIR') or live / '.config/coding-agent-environment/local')
+    overlay = Path(os.environ.get('CODING_AGENT_LOCAL_BASELINE_DIR') or local_dir / 'baseline') / 'claude/CLAUDE.private.md'
+    if overlay.is_symlink():
+        raise SystemExit('Refusing symlinked private overlay.')
+    if overlay.exists():
+        info = overlay.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise SystemExit('Private overlay must be a regular file owned by you with mode 0600.')
+        pstart = b'<!-- coding-agent-environment:private-overlay:start -->'
+        pend = b'<!-- coding-agent-environment:private-overlay:end -->'
+        body = overlay.read_bytes()
+        if pstart in body or pend in body:
+            raise SystemExit('Private overlay must not contain its own managed markers.')
+        private_block = pstart + b'\n' + body.rstrip(b'\n') + b'\n' + pend
+        if pstart in merged or pend in merged:
+            if merged.count(pstart) != 1 or merged.count(pend) != 1 or merged.index(pstart) > merged.index(pend):
+                raise SystemExit('Ambiguous private overlay markers in the live policy.')
+            merged = merged[:merged.index(pstart)] + private_block + merged[merged.index(pend) + len(pend):]
+        else:
+            merged = merged.rstrip(b'\n') + b'\n\n' + private_block + b'\n'
+        print(f'Private overlay merged into the managed policy ({len(body)} bytes; content not shown).')
 shared_skills = ['evidence-first-briefing', 'engineering-workflow']
 shared_manifest = json.loads((root / 'codex/shared-skills.json').read_text())
 shared_skills += [name for name in shared_manifest['skills'] if name not in shared_skills]
