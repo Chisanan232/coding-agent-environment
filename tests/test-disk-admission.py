@@ -222,6 +222,16 @@ class Cli(unittest.TestCase):
             self.assertEqual(result.returncode, 2, argv)
         self.assertFalse((Path(self.temp.name) / '.cache').exists())
 
+    def test_refusal_exit_code_is_77(self):
+        code, text = self.run_main(['check', '--weight', 'heavy'], 36 * GIB)
+        self.assertEqual(code, 77)
+        self.assertEqual(len(text.splitlines()), 1)
+        self.assertIn('tier=low', text)
+        self.assertIn('36.0 GiB', text)
+        # Negative control: the same request is admitted with enough space.
+        self.assertEqual(self.run_main(['check', '--weight', 'heavy'], 150 * GIB)[0], 0)
+        self.assertEqual(self.run_main(['check', '--weight', 'light'], 36 * GIB)[0], 0)
+
 
 if __name__ == '__main__':
     unittest.main()
