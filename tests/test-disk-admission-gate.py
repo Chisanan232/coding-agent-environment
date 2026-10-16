@@ -308,5 +308,25 @@ class Compound(unittest.TestCase):
         self.assertFalse(self.heavy('npm run test'))
 
 
+class Uncertain(unittest.TestCase):
+    UNPARSABLE = "echo 'unterminated && cargo build"
+
+    @staticmethod
+    def refuses():
+        return 77, 'heavy refused in tier low'
+
+    def run_gate(self, command, mode, runner):
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}})
+        out, err = io.StringIO(), io.StringIO()
+        code = gate.main(payload, out, err, mode_fn=lambda: mode, runner=runner)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_unparsable_heavy_command_is_denied_in_enforce(self):
+        code, out, err = self.run_gate(self.UNPARSABLE, 'enforce', self.refuses)
+        self.assertEqual((code, out), (2, ''))
+        self.assertIn('unparsable', err)
+        self.assertEqual(self.run_gate(self.UNPARSABLE, 'enforce', lambda: (0, 'ok')), (0, '', ''))
+
+
 if __name__ == '__main__':
     unittest.main()
