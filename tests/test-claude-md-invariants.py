@@ -173,6 +173,11 @@ class ClaudeMdInvariants(unittest.TestCase):
         self.assertIn("(references/release-operations.md)", text)
         self.assertTrue((ROOT / ".claude/skills/release-watch/references/release-operations.md").is_file())
 
+    def test_architecture_design_skill_links_its_reference(self) -> None:
+        text = (ROOT / ".claude/skills/architecture-design/SKILL.md").read_text()
+        self.assertIn("(references/model-routing-and-delegation.md)", text)
+        self.assertTrue((ROOT / ".claude/skills/architecture-design/references/model-routing-and-delegation.md").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
