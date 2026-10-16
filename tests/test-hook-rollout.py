@@ -72,6 +72,7 @@ class Fixture(unittest.TestCase):
         self.src.parent.mkdir()
         self.src.write_text('#!/usr/bin/env python3\nprint("gate")\n')
         self.dest = self.root / 'claude/hooks/disk-admission-gate.py'
+        self.command = hr.command_for(self.dest)
         self.mode = self.root / 'cache/admission/mode'
         self.backups = self.root / 'claude/backups'
 
@@ -100,7 +101,7 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.snapshot_tree(), before)
 
     def test_plan_refuses_a_conflicting_existing_entry(self):
-        data = hr.with_gate(LIVE)
+        data = hr.with_gate(LIVE, self.command)
         data['hooks']['PreToolUse'][-1]['hooks'][0]['command'] += ' --admission-dir /x'
         self.live.write_text(json.dumps(data, indent=2) + '\n')
         code, text = self.run_cli('plan')
@@ -130,9 +131,9 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.dest.read_bytes(), self.src.read_bytes())
         self.assertEqual(stat.S_IMODE(self.dest.stat().st_mode), 0o755)
         new = json.loads(self.live.read_text())
-        self.assertEqual(new, hr.with_gate(LIVE))
-        self.assertEqual(hr.gate_state(new), 'installed')
-        self.assertEqual(self.live.read_text(), json.dumps(hr.with_gate(LIVE), indent=2, ensure_ascii=False) + '\n')
+        self.assertEqual(new, hr.with_gate(LIVE, self.command))
+        self.assertEqual(hr.gate_state(new, self.command), 'installed')
+        self.assertEqual(self.live.read_text(), json.dumps(hr.with_gate(LIVE, self.command), indent=2, ensure_ascii=False) + '\n')
         self.assertEqual(stat.S_IMODE(self.live.stat().st_mode), 0o600)
 
     def test_apply_backs_up_the_settings_hash_exact_and_writes_a_receipt(self):
@@ -153,7 +154,7 @@ class Fixture(unittest.TestCase):
         self.assertEqual(new['hooks']['PreToolUse'][:3], LIVE['hooks']['PreToolUse'])
         commands = [h['command'] for g in new['hooks']['PreToolUse'] for h in g['hooks']]
         self.assertEqual(commands, ['rtk hook claude', '~/.claude/hooks/cbm-code-discovery-gate',
-                                    '~/.claude/hooks/fornax-guard', 'python3 ~/.claude/hooks/disk-admission-gate.py'])
+                                    '~/.claude/hooks/fornax-guard', self.command])
         self.assertEqual(new['hooks']['PostToolUse'], LIVE['hooks']['PostToolUse'])
         self.assertEqual(new['hooks']['SessionStart'], LIVE['hooks']['SessionStart'])
         self.assertEqual(new['permissions'], LIVE['permissions'])
@@ -231,7 +232,7 @@ class Fixture(unittest.TestCase):
         self.assertFalse(self.dest.exists())
 
     def test_conflicting_existing_entry_is_refused_by_apply(self):
-        data = hr.with_gate(LIVE)
+        data = hr.with_gate(LIVE, self.command)
         data['hooks']['PreToolUse'][-1]['hooks'][0]['command'] += ' --admission-dir /x'
         self.live.write_text(json.dumps(data, indent=2) + '\n')
         before = self.snapshot_tree()
@@ -286,7 +287,7 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.run_cli('verify')[0], 1)
         self.assertEqual(self.apply()[0], 0)
         data = json.loads(self.live.read_text())
-        data['hooks']['PreToolUse'].append(hr.gate_group())
+        data['hooks']['PreToolUse'].append(hr.gate_group(self.command))
         self.live.write_text(json.dumps(data, indent=2) + '\n')
         code, text = self.run_cli('verify')
         self.assertEqual(code, 1)

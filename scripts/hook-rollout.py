@@ -24,6 +24,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import pwd
 import re
+import shlex
 import sys
 import tempfile
 import time
@@ -43,8 +44,17 @@ GATE_COMMAND = 'python3 ~/.claude/hooks/disk-admission-gate.py'
 GATE_MARK = 'disk-admission-gate.py'
 
 
-def gate_group():
-    return {'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': GATE_COMMAND}]}
+def command_for(dest):
+    """The settings command that runs the hook file at dest (`~/` form when under the home directory)."""
+    dest = Path(dest)
+    try:
+        return 'python3 ~/%s' % shlex.quote(str(dest.relative_to(HOME)))
+    except ValueError:
+        return 'python3 %s' % shlex.quote(str(dest))
+
+
+def gate_group(command=GATE_COMMAND):
+    return {'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': command}]}
 
 
 def gate_entries(live):
@@ -57,21 +67,21 @@ def gate_entries(live):
     return found
 
 
-def gate_state(live):
+def gate_state(live, command=GATE_COMMAND):
     """'absent', 'installed' (exactly our group) or 'conflict' (some other gate entry)."""
     found = gate_entries(live)
     if not found:
         return 'absent'
-    canonical = gate_group()
+    canonical = gate_group(command)
     if len(found) == 1 and found[0][1] == canonical:
         return 'installed'
     return 'conflict'
 
 
-def with_gate(live):
+def with_gate(live, command=GATE_COMMAND):
     """Copy of live with our group appended last; every existing entry keeps its position."""
     new = json.loads(json.dumps(live))
-    new.setdefault('hooks', {}).setdefault('PreToolUse', []).append(gate_group())
+    new.setdefault('hooks', {}).setdefault('PreToolUse', []).append(gate_group(command))
     return new
 
 
@@ -154,7 +164,8 @@ def plan(args):
     live_p, src = Path(args.live), Path(args.hook_src)
     raw_bytes, raw, live = load_settings(live_p)
     hook_sha = rollout.sha(src)
-    state = gate_state(live)
+    command = command_for(args.hook_dest)
+    state = gate_state(live, command)
     print('live settings sha256 %s' % sha_bytes(raw_bytes))
     print('hook file     sha256 %s' % hook_sha)
     print('settings gate entry: %s' % state)
@@ -243,7 +254,8 @@ def apply(args):
         print(message)
         return 4
     raw_bytes, raw, live = load_settings(live_p)
-    state = gate_state(live)
+    command = command_for(dest)
+    state = gate_state(live, command)
     if state == 'conflict':
         print('REFUSING: the settings already hold a different disk-admission-gate entry')
         return 2
@@ -269,7 +281,7 @@ def apply(args):
         if serialise(live, raw) != raw and not args.allow_reformat:
             print('REFUSING: re-serialising the settings would change unrelated formatting; pass --allow-reformat')
             return 8
-        new_text = serialise(with_gate(live), raw)
+        new_text = serialise(with_gate(live, command), raw)
     backups = Path(args.backup_dir)
     message = redirected(backups / 'receipt')
     if message:
@@ -327,7 +339,7 @@ def verify(args):
     found = gate_entries(live)
     if len(found) != 1:
         problems.append('expected the gate hook exactly once in settings, found %d' % len(found))
-    elif gate_state(live) != 'installed':
+    elif gate_state(live, command_for(dest)) != 'installed':
         problems.append('the gate entry is not the canonical PreToolUse Bash group')
     expected = args.expect_hook_sha or rollout.sha(args.hook_src)
     if redirected(dest):
@@ -351,7 +363,7 @@ def verify(args):
         receipt = json.loads(Path(args.receipt).read_text())
         if receipt.get('settings_backup'):
             before = json.loads(Path(receipt['settings_backup']).read_text())
-            if live != with_gate(before):
+            if live != with_gate(before, command_for(dest)):
                 problems.append('settings differ from the pre-apply backup plus the gate group (a deny or other key changed)')
     print('mode file: %s' % mode)
     print('\n'.join(problems) if problems else 'verify OK: gate hook present once, file hash matches, no deny added')
