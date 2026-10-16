@@ -513,6 +513,19 @@ class Reservations(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn('notes.json', problems[0])
 
+    def take(self, label, nbytes, free, pid=None, **extra):
+        return da.reserve(label, nbytes, pid or os.getpid(), self.path, lambda: free, now=self.now, **extra)
+
+    def test_over_capacity_reservation_refused(self):
+        refused = self.take('job-big', 60 * GIB, 150 * GIB)
+        self.assertFalse(refused['admit'])
+        self.assertIn('over-capacity', refused['reason'])
+        self.assertFalse((self.path.parent / 'reservations/job-big.json').exists())
+        # Negative control: leaving exactly the 100 GiB floor is admitted.
+        admitted = self.take('job-fits', 50 * GIB, 150 * GIB)
+        self.assertTrue(admitted['admit'], admitted)
+        self.assertEqual(admitted['reserved_bytes'], 50 * GIB)
+
 
 if __name__ == '__main__':
     unittest.main()
