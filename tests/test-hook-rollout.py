@@ -319,6 +319,19 @@ class Fixture(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('deny', text)
 
+    def receipt(self):
+        return next(p for p in self.backups.iterdir() if 'receipt' in p.name)
+
+    def test_rollback_restores_the_settings_hash_exact_and_removes_the_new_hook(self):
+        before = self.live.read_bytes()
+        self.assertEqual(self.apply()[0], 0)
+        code, text = self.run_cli('rollback', '--receipt', str(self.receipt()))
+        self.assertEqual(code, 0, text)
+        self.assertEqual(hashlib.sha256(self.live.read_bytes()).hexdigest(), hashlib.sha256(before).hexdigest())
+        self.assertEqual(stat.S_IMODE(self.live.stat().st_mode), 0o600)
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(len([p for p in self.live.parent.iterdir() if '.pre-rollback.' in p.name]), 1)
+
 
 if __name__ == '__main__':
     unittest.main()
