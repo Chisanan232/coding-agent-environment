@@ -497,6 +497,10 @@ class Fixture(unittest.TestCase):
         self.refuses_dest('~/x/disk-admission-gate.py')
         self.assertFalse(Path('~').exists() and (Path('~') / 'x').exists())
 
+    def test_a_destination_with_dot_dot_components_is_refused(self):
+        self.refuses_dest(str(self.root) + '/a/../b/disk-admission-gate.py')
+        self.refuses_dest(str(self.root) + '//double/disk-admission-gate.py')
+
 
 class CommandDerivation(unittest.TestCase):
     def test_command_uses_the_tilde_form_under_home_and_quotes_other_paths(self):
