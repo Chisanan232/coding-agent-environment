@@ -34,6 +34,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import secrets
 import stat
 import subprocess
 import time
@@ -146,7 +147,8 @@ def write_state(path, free_bytes, latch, now=None):
     stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     record = {'version': STATE_VERSION, 'timestamp': stamp.isoformat(timespec='seconds').replace('+00:00', 'Z'),
               'free_bytes': free_bytes, 'tier': tier(free_bytes), 'latch': bool(latch)}
-    temporary = path.with_name('.%s.%d.tmp' % (path.name, os.getpid()))
+    # Random per call: a leftover from a crashed writer must never block later writes.
+    temporary = path.with_name('.%s.%s.tmp' % (path.name, secrets.token_hex(8)))
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         with os.fdopen(descriptor, 'w') as handle:
@@ -154,6 +156,12 @@ def write_state(path, free_bytes, latch, now=None):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        # Persist the rename itself, not only the file contents.
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except BaseException:
         try:
             os.unlink(temporary)
