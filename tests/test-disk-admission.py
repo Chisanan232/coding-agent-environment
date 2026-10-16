@@ -424,6 +424,17 @@ class Hardening(unittest.TestCase):
         self.assertTrue(da.evaluate('light', self.path, lambda: 500 * GIB)['admit'])
         self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
 
+    def test_symlinked_lock_file_refused(self):
+        self.path.parent.mkdir(parents=True)
+        target = Path(self.temp.name) / 'victim'
+        target.write_text('untouched')
+        os.symlink(target, str(self.path) + '.lock')
+        result = da.evaluate('light', self.path, lambda: 500 * GIB)
+        self.assertFalse(result['admit'])
+        self.assertIn('state-unwritable', result['reason'])
+        self.assertEqual(target.read_text(), 'untouched')
+        self.assertFalse(self.path.exists())
+
 
 if __name__ == '__main__':
     unittest.main()
