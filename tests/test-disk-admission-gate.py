@@ -334,6 +334,10 @@ class Uncertain(unittest.TestCase):
         self.assertEqual((code, err), (0, ''))
         self.assertIn('unparsable', json.loads(out)['hookSpecificOutput']['additionalContext'])
 
+    def test_unparsable_command_without_a_heavy_word_is_light(self):
+        for mode in ('warn', 'enforce'):
+            self.assertEqual(self.run_gate("echo 'unterminated", mode, self.refuses), (0, '', ''))
+
 
 if __name__ == '__main__':
     unittest.main()
