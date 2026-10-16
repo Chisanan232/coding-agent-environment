@@ -297,6 +297,20 @@ class EngineeringWorkflowContract(unittest.TestCase):
                 for stale in ["Eight", "1..8", "0..7", "dynamic 0-7"]:
                     self.assertNotIn(stale, adapter_text)
 
+    def test_frontend_qa_requires_real_playwright_evidence(self) -> None:
+        text = " ".join((ROOT / ".claude/skills/acceptance-validation/SKILL.md").read_text().split())
+        for phrase in [
+            "read the project design specs",
+            "run the app",
+            "verify through Playwright screenshots",
+            "personal Mac only",
+            "sanitized",
+            "never invent screenshots",
+        ]:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+        self.assertIn("frontend QA evidence defined in `acceptance-validation`", " ".join(WORKFLOW.read_text().split()))
+
 
 if __name__ == "__main__":
     unittest.main()
