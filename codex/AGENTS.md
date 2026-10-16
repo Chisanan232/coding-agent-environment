@@ -109,9 +109,9 @@ Use named `architect` for consequential architecture/security/cross-repository
 ambiguity, `implementer` for bounded work after contracts stabilize, and
 `reviewer` for an independent final semantic/security/architecture gate.
 The orchestrator owns integration and routine work; escalate contradictions.
-Delegate independent work when it improves time to correct completion. Eight
-concurrent subagents is a ceiling, never a target: choose 1..8 from dependencies,
-token cost, expected speedup, mutable-state overlap and integration overhead.
+Delegate independent work when it improves time to correct completion. Seven
+concurrent subagents is a ceiling, never a target: choose 0..7, one owner per
+scope, from dependencies, token cost, expected speedup, mutable-state overlap and integration overhead.
 Partition mutable file/state ownership; parallelize independent read-only work.
 Use targeted child context, and verify recorded model/reasoning after changes.
 Role selection never grants extra sandbox, approval or production authority.
