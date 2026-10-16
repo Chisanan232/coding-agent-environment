@@ -328,8 +328,8 @@ It is applied at rollout from private parameters, never committed: `--owners`
 (verified GitHub owners) fills the trusted-owner entries, and `--dev-dirs` (explicit
 personal development roots) fills (a) one `autoMode.environment` line declaring
 repositories and worktrees under those roots whose origin is owned by a trusted
-owner trusted development context (location alone never grants trust: a clone from
-any other owner keeps its external provenance; found by the independent
+owner as trusted development context (location alone never grants trust: a clone from
+any other owner, and third-party code inside an owned repository, keeps its external provenance; found by the independent
 `claude auto-mode critique`), (b) one narrow `autoMode.allow` exception so work in another
 repository under the same roots is not "wandering into other repos", and (c)
 `permissions.additionalDirectories`, the documented file-access grant (Read/Edit/
