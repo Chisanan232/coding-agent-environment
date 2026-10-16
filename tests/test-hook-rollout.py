@@ -360,6 +360,14 @@ class Fixture(unittest.TestCase):
         self.assertIn('no longer matches', text)
         self.assertEqual(self.live.read_bytes(), installed)
 
+    def test_rollback_keeps_a_hook_file_that_was_changed_after_apply(self):
+        self.assertEqual(self.apply()[0], 0)
+        self.dest.write_text('operator edit')
+        code, text = self.run_cli('rollback', '--receipt', str(self.receipt()))
+        self.assertEqual(code, 0)
+        self.assertIn('left', text)
+        self.assertEqual(self.dest.read_text(), 'operator edit')
+
 
 if __name__ == '__main__':
     unittest.main()
