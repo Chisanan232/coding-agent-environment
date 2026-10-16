@@ -379,6 +379,13 @@ class Hardening(unittest.TestCase):
             (home / '.cache/coding-agent-environment').unlink()
             self.assertTrue(da.evaluate('light', path, lambda: 500 * GIB)['admit'])
 
+    def test_stale_temp_file_does_not_block_writes(self):
+        self.path.parent.mkdir(parents=True)
+        stale = self.path.parent / ('.state.json.%d.tmp' % os.getpid())
+        stale.write_text('leftover from a crashed writer')
+        self.assertTrue(da.evaluate('light', self.path, lambda: 500 * GIB)['admit'])
+        self.assertEqual(stale.read_text(), 'leftover from a crashed writer')
+
 
 if __name__ == '__main__':
     unittest.main()
