@@ -2,6 +2,7 @@
 """Disk-pressure admission core refuses unsafe work and fails closed."""
 from importlib.util import module_from_spec, spec_from_file_location
 import io
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import stat
@@ -448,6 +449,34 @@ class Hardening(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised, mock.patch('sys.stderr', io.StringIO()):
             da.run(['check'])
         self.assertEqual(raised.exception.code, 2)
+
+
+class Reservations(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name).resolve() / 'admission/state.json'
+        self.now = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+
+    def reserve_file(self, label, pid=None, token=None, nbytes=10 * GIB, hours=1):
+        pid = pid or os.getpid()
+        token = token or da.process_token(pid)
+        with da.state_lock(self.path):
+            da.write_reservation(self.path, label, nbytes, pid, token, self.now + timedelta(hours=hours))
+        return self.path.parent / 'reservations' / (label + '.json')
+
+    def live(self):
+        with da.state_lock(self.path):
+            return da.live_reservations(self.path, self.now)
+
+    def test_live_reservation_is_counted(self):
+        file = self.reserve_file('job-a')
+        live, problems = self.live()
+        self.assertEqual([(r['label'], r['bytes']) for r in live], [('job-a', 10 * GIB)])
+        self.assertEqual(problems, [])
+        self.assertTrue(file.exists())
+        self.assertEqual(file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(file.parent.stat().st_mode & 0o777, 0o700)
 
 
 if __name__ == '__main__':
