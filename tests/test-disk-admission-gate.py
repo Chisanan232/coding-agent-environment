@@ -781,5 +781,13 @@ class ConfigErrors(unittest.TestCase):
         self.assertEqual(self.run_gate('git status', 'enforce', error=None)[1:], ('', '', []))
 
 
+class RolloutDocumentationLimits(unittest.TestCase):
+    def test_docs_require_the_first_warn_audit_line_after_install(self):
+        text = (ROOT / 'docs/STORAGE-INTEGRATION.md').read_text()
+        for needle in ('first WARN audit line', 'not** the installed\nfile path', 'account database,\nnot `$HOME`',
+                       'config-error', 'exit codes'):
+            self.assertIn(needle, text, needle)
+
+
 if __name__ == '__main__':
     unittest.main()
