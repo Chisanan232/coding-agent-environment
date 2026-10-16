@@ -35,6 +35,8 @@ import os
 from pathlib import Path
 import pwd
 import shlex
+import stat
+import subprocess
 import sys
 
 OPERATORS = {';', '&&', '||', '|', '&', '(', ')', '|&', ';;', '\n'}
@@ -198,5 +200,20 @@ def target_dir_advice(verdict, exists=os.path.exists):
     return None
 
 
-if __name__ == '__main__':
-    raise SystemExit(0)
+MODE_RELATIVE = '.cache/coding-agent-environment/admission/mode'
+DENY_EXIT = 2
+ADAPTER_TIMEOUT_S = 30
+
+
+def read_mode(path=None):
+    """'enforce' only when the operator's mode file says exactly so; anything else is warn."""
+    path = path or account_home() / MODE_RELATIVE
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return 'warn'
+            value = handle.read(64).decode('ascii', 'replace').strip()
+    except OSError:
+        return 'warn'
+    return 'enforce' if value == 'enforce' else 'warn'
