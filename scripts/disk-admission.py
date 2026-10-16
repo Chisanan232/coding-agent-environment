@@ -30,6 +30,7 @@ GIB = 1024 ** 3
 EMERGENCY_BELOW = 20 * GIB
 LOW_BELOW = 100 * GIB
 STABLE_BELOW = 200 * GIB
+RELEASE_AT = 50 * GIB
 
 
 def tier(free_bytes):
@@ -46,11 +47,23 @@ WEIGHTS = ('heavy', 'light')
 ADMITTED_TIERS = {'heavy': ('stable', 'wide'), 'light': ('low', 'stable', 'wide')}
 
 
+def next_latch(free_bytes, state):
+    """Set below 20 GiB; once set, released only at 50 GiB or more."""
+    if free_bytes < EMERGENCY_BELOW:
+        return True
+    if state.get('latch') and free_bytes < RELEASE_AT:
+        return True
+    return False
+
+
 def decide(weight, free_bytes, state):
     """Return (admit, new_state, reason) for one unit of work."""
     if weight not in WEIGHTS:
         raise ValueError('weight must be heavy or light')
     current = tier(free_bytes)
+    new_state = dict(state, latch=next_latch(free_bytes, state))
+    if new_state['latch']:
+        return False, new_state, '%s refused: latched until free space reaches 50 GiB (tier %s)' % (weight, current)
     if current in ADMITTED_TIERS[weight]:
-        return True, dict(state), '%s admitted in tier %s' % (weight, current)
-    return False, dict(state), '%s refused in tier %s' % (weight, current)
+        return True, new_state, '%s admitted in tier %s' % (weight, current)
+    return False, new_state, '%s refused in tier %s' % (weight, current)
