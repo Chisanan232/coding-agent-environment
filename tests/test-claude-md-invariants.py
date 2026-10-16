@@ -134,6 +134,15 @@ class ClaudeMdInvariants(unittest.TestCase):
             with self.subTest(link=link):
                 self.assertTrue(((ROOT / ".claude") / link).is_file())
 
+    def test_readme_never_tells_readers_to_copy_claude_md_over_the_live_file(self) -> None:
+        readme = (ROOT / "README.md").read_text()
+        for match in re.finditer(r"^\s*cp\b[^\n]*(?:\\\n[^\n]*)*", readme, re.MULTILINE):
+            with self.subTest(command=match.group(0)[:60]):
+                command = " ".join(match.group(0).replace("\\\n", " ").split())
+                self.assertFalse("CLAUDE.md" in command and "~/.claude" in command)
+        self.assertIn("scripts/profile-install.sh --claude-skills", readme)
+        self.assertIn("base layer", readme)
+
 
 if __name__ == "__main__":
     unittest.main()
