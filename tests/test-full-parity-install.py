@@ -240,5 +240,19 @@ class FullParity(unittest.TestCase):
         self.assertNotIn('SYNTHETIC-PRIVATE-BODY\n', updated)
         self.assertTrue(updated.startswith(live_only))
 
+    def test_private_overlay_must_be_private_and_not_a_symlink(self):
+        path = self.write_overlay('SYNTHETIC', mode=0o644)
+        result = self.install('claude', '--check')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('mode 0600', result.stderr)
+        path.unlink()
+        target = Path(self.temp.name) / 'elsewhere.md'
+        target.write_text('SYNTHETIC')
+        target.chmod(0o600)
+        path.symlink_to(target)
+        result = self.install('claude', '--check')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('symlinked private overlay', result.stderr)
+
 if __name__ == '__main__':
     unittest.main()
