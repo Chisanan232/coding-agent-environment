@@ -241,6 +241,21 @@ class Cli(unittest.TestCase):
         code, text = self.run_main(['status', '--json'], 30 * GIB)
         self.assertTrue(json.loads(text)['latch'])
 
+    def test_unreadable_volume_and_corrupt_state_refuse_with_distinct_reasons(self):
+        def broken():
+            raise da.VolumeError('gone')
+        self.assertFalse(da.evaluate('light', self.path, broken)['admit'])
+        self.assertIn('volume-unreadable', da.evaluate('light', self.path, broken)['reason'])
+        self.assertFalse(self.path.exists())
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text('{corrupt')
+        result = da.evaluate('light', self.path, lambda: 500 * GIB)
+        self.assertFalse(result['admit'])
+        self.assertIn('state-corrupt', result['reason'])
+        self.assertTrue(result['latch'])
+        # Rewritten as latched; recovery at 50 GiB or more admits again.
+        self.assertTrue(da.evaluate('light', self.path, lambda: 500 * GIB)['admit'])
+
 
 if __name__ == '__main__':
     unittest.main()
