@@ -129,5 +129,22 @@ class State(unittest.TestCase):
             self.write(10 * GIB, True)
 
 
+class Volume(unittest.TestCase):
+    @staticmethod
+    def stats():
+        return mock.Mock(f_bavail=1000, f_frsize=4096, f_bfree=9999)
+
+    def test_darwin_reads_data_volume(self):
+        with mock.patch.object(da.os.path, 'exists', return_value=True), \
+                mock.patch.object(da.os, 'statvfs', return_value=self.stats()) as statvfs:
+            self.assertEqual(da.read_free_bytes(), 1000 * 4096)
+        statvfs.assert_called_once_with('/System/Volumes/Data')
+        # Negative control: without the data volume it falls back to root.
+        with mock.patch.object(da.os.path, 'exists', return_value=False), \
+                mock.patch.object(da.os, 'statvfs', return_value=self.stats()) as statvfs:
+            da.read_free_bytes()
+        statvfs.assert_called_once_with('/')
+
+
 if __name__ == '__main__':
     unittest.main()
