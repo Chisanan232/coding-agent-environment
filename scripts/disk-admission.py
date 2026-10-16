@@ -463,7 +463,7 @@ def _refusal(reason, **extra):
 
 
 def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None,
-            token_fn=process_token, ttl=DEFAULT_TTL, owner_fn=process_owner):
+            token_fn=process_token, ttl=DEFAULT_TTL, owner_fn=process_owner, allow_long=False):
     """Admit one heavy job and record its byte reservation, or refuse.
 
     Admission needs: heavy admitted by tier and latch, a free heavy lane, and
@@ -472,7 +472,7 @@ def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None
     callers cannot jointly overcommit.
     """
     if not (isinstance(label, str) and LABEL_RE.fullmatch(label) and type(nbytes) is int and nbytes > 0
-            and type(pid) is int and pid > 0 and type(ttl) is int and 0 < ttl <= MAX_TTL):
+            and type(pid) is int and pid > 0 and type(ttl) is int and 0 < ttl <= (MAX_TTL if allow_long else DEFAULT_TTL)):
         return _refusal('invalid-request: label, bytes, pid or ttl is out of range')
     now = now or datetime.now(timezone.utc)
     try:
@@ -624,7 +624,8 @@ def build_parser():
     take.add_argument('--bytes', type=int, required=True, dest='nbytes')
     take.add_argument('--pid', type=int, required=True)
     take.add_argument('--label', required=True)
-    take.add_argument('--ttl-s', type=int, default=DEFAULT_TTL, dest='ttl')
+    take.add_argument('--ttl-s', type=int, default=DEFAULT_TTL, dest='ttl', help='seconds, at most 4 h unless --max-hold')
+    take.add_argument('--max-hold', action='store_true', dest='allow_long', help='allow a hold of up to 24 h')
     shot = commands.add_parser('snapshot', allow_abbrev=False, help='publish the host resource snapshot')
     mode = shot.add_mutually_exclusive_group(required=True)
     mode.add_argument('--json', action='store_true', help='write and print a fresh snapshot')
@@ -639,7 +640,7 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
     state_path = state_path or default_state_path()
     args = build_parser().parse_args(argv)
     if args.command in ('reserve', 'release'):
-        result = (reserve(args.label, args.nbytes, args.pid, state_path, free_fn, ttl=args.ttl)
+        result = (reserve(args.label, args.nbytes, args.pid, state_path, free_fn, ttl=args.ttl, allow_long=args.allow_long)
                   if args.command == 'reserve' else release(args.label, state_path))
         print(result['reason'])
         return 0 if result['admit'] else REFUSED_EXIT
