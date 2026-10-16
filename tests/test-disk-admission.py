@@ -305,6 +305,20 @@ class Hardening(unittest.TestCase):
         self.path.unlink()
         self.assertTrue(da.evaluate('light', self.path, lambda: 60 * GIB)['admit'])
 
+    def test_forged_unlatched_state_refused(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        forged = {'version': 1, 'timestamp': '2026-01-01T00:00:00Z', 'free_bytes': 5 * GIB,
+                  'tier': 'emergency', 'latch': False}
+        for record in (forged, dict(forged, tier='wide')):
+            self.path.write_text(json.dumps(record))
+            result = da.evaluate('light', self.path, lambda: 30 * GIB)
+            self.assertFalse(result['admit'], record)
+            self.assertIn('state-corrupt', result['reason'])
+            self.assertTrue(result['latch'])
+        # Negative control: a self-consistent unlatched record is trusted.
+        self.path.write_text(json.dumps(dict(forged, free_bytes=150 * GIB, tier='stable')))
+        self.assertTrue(da.evaluate('light', self.path, lambda: 30 * GIB)['admit'])
+
 
 if __name__ == '__main__':
     unittest.main()
