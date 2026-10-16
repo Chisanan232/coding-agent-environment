@@ -694,6 +694,15 @@ class HarnessWorkdir(unittest.TestCase):
         self.assertIn('account database, not $HOME', text)
         self.assertIn('def production_case', text)
 
+    def test_the_home_guard_holds_even_when_the_home_directory_carries_the_sentinel(self):
+        fake_home = self.base / 'fake-home'
+        fake_home.mkdir()
+        (fake_home / self.harness.SENTINEL).write_text('x')
+        with mock.patch.object(self.harness.pwd, 'getpwuid', return_value=mock.Mock(pw_dir=str(fake_home))):
+            for path in (fake_home, self.base):
+                with self.assertRaises(self.harness.RefusedWorkdir, msg=str(path)):
+                    self.harness.claim_workdir(path)
+
 
 class HungAdapter(unittest.TestCase):
     def setUp(self):
