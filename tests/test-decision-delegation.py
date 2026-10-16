@@ -111,6 +111,9 @@ class PolicyText(unittest.TestCase):
                        "needing its own Level 3 record or Level 2 packet", "implies no new publication or deployment authorization"]:
             self.assertIn(phrase, self.text)
 
+    def test_completion_token_is_ready_for_release_only(self) -> None:
+        self.assertNotIn("RELEASE_READY", self.text.replace("READY_FOR_RELEASE", ""))
+
     def test_active_state_is_preserved(self) -> None:
         for phrase in ["Preserve active or ambiguously owned worktrees, branches, background processes, caches and test data",
                        "Never delete another Claude Code/Codex session's state",
