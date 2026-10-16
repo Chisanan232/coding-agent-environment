@@ -285,5 +285,26 @@ class Sources(unittest.TestCase):
         self.assertIn('volume-unreadable', result['reason'])
 
 
+class Hardening(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name).resolve() / 'admission/state.json'
+
+    def test_deleted_state_below_50_gib_is_latched(self):
+        self.assertTrue(da.evaluate('light', self.path, lambda: 150 * GIB)['admit'])
+        self.path.unlink()
+        result = da.evaluate('light', self.path, lambda: 30 * GIB)
+        self.assertFalse(result['admit'])
+        self.assertIn('state-missing', result['reason'])
+        self.assertTrue(result['latch'])
+        # Still held at 49 GiB, released by fresh free space at 50 GiB.
+        self.assertFalse(da.evaluate('light', self.path, lambda: 49 * GIB)['admit'])
+        self.assertTrue(da.evaluate('light', self.path, lambda: 50 * GIB)['admit'])
+        # Negative control: a missing record with plenty of space is not latched.
+        self.path.unlink()
+        self.assertTrue(da.evaluate('light', self.path, lambda: 60 * GIB)['admit'])
+
+
 if __name__ == '__main__':
     unittest.main()
