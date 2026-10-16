@@ -88,4 +88,6 @@ failure or repair record. Identify the failing capability/gate, observed cause
 and scope of local reproduction, actual verification evidence and remaining
 owner action. Reference the run rather than copying its full log.
 
+<!-- claude-only:start -->
 See the [reference](references/claude-ci-triage.md) for the Claude CI triage expectations.
+<!-- claude-only:end -->
