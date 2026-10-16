@@ -207,5 +207,38 @@ class FullParity(unittest.TestCase):
         self.assertEqual(stale.read_text(), 'stale')
 
 
+    def overlay_path(self):
+        return self.home / '.config/coding-agent-environment/local/baseline/claude/CLAUDE.private.md'
+
+    def write_overlay(self, text, mode=0o600):
+        path = self.overlay_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        path.chmod(mode)
+        return path
+    def test_private_overlay_span_is_merged_without_touching_unmarked_content(self):
+        policy = self.home / '.claude/CLAUDE.md'
+        policy.parent.mkdir(parents=True)
+        live_only = 'SYNTHETIC-LIVE-ONLY-CLAUSE keep me\n'
+        policy.write_text(live_only)
+        self.write_overlay('## Synthetic Private Clause\nSYNTHETIC-PRIVATE-BODY\n')
+        dry = self.install('claude', '--dry-run')
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertNotIn('SYNTHETIC-PRIVATE-BODY', dry.stdout + dry.stderr)
+        self.assertEqual(policy.read_text(), live_only)
+        self.assertEqual(self.install('claude').returncode, 0)
+        merged = policy.read_text()
+        self.assertTrue(merged.startswith(live_only))
+        self.assertEqual(merged.count('SYNTHETIC-PRIVATE-BODY'), 1)
+        self.assertEqual(self.install('claude', '--check').returncode, 0)
+        # Editing the overlay replaces only its span; repeated installs do not duplicate it.
+        self.write_overlay('## Synthetic Private Clause\nSYNTHETIC-PRIVATE-BODY-2\n')
+        self.assertEqual(self.install('claude').returncode, 0)
+        updated = policy.read_text()
+        self.assertEqual(updated.count('private-overlay:start'), 1)
+        self.assertIn('SYNTHETIC-PRIVATE-BODY-2', updated)
+        self.assertNotIn('SYNTHETIC-PRIVATE-BODY\n', updated)
+        self.assertTrue(updated.startswith(live_only))
+
 if __name__ == '__main__':
     unittest.main()
