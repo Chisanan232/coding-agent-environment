@@ -634,5 +634,22 @@ class AcceptanceHarness(unittest.TestCase):
         self.assertIn('--admission-dir', text)
 
 
+class HarnessWorkdir(unittest.TestCase):
+    def setUp(self):
+        path = ROOT / 'tests/acceptance/gate-acceptance.py'
+        self.harness = module_from_spec(spec_from_file_location('gate_acceptance_wd', path))
+        self.harness.__spec__.loader.exec_module(self.harness)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+
+    def test_home_root_and_repository_paths_are_refused(self):
+        home = Path(gate.account_home())
+        for path in (home, Path('/'), home.parent, ROOT, ROOT / 'tests'):
+            with self.assertRaises(self.harness.RefusedWorkdir, msg=str(path)):
+                self.harness.claim_workdir(path)
+        self.assertTrue(home.exists() and ROOT.exists())
+
+
 if __name__ == '__main__':
     unittest.main()
