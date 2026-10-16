@@ -819,5 +819,12 @@ class RolloutDocumentationLimits(unittest.TestCase):
             self.assertIn(needle, text, needle)
 
 
+class RolloutRaceDocumentation(unittest.TestCase):
+    def test_docs_state_the_destination_rule_and_the_residual_rename_window(self):
+        text = (ROOT / 'docs/STORAGE-INTEGRATION.md').read_text()
+        for needle in ('normalised absolute path ending in', 'microsecond lost-update window', 'run `verify`'):
+            self.assertIn(needle, text.replace('\n', ' ').replace('  ', ' '), needle)
+
+
 if __name__ == '__main__':
     unittest.main()
