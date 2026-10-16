@@ -226,6 +226,17 @@ class EngineeringWorkflowContract(unittest.TestCase):
             with self.subTest(heading=heading):
                 self.assertIn(heading, text)
 
+    def test_commit_granularity_rules(self) -> None:
+        text = " ".join(WORKFLOW.read_text().split())
+        for phrase in [
+            "one logically small change per commit",
+            "one new test per commit",
+            "utilities and mocks land in earlier commits than the tests that use them",
+        ]:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+        self.assertNotIn("one concern and its necessary tests", text)
+
 
 if __name__ == "__main__":
     unittest.main()
