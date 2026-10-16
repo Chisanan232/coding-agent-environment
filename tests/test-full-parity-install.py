@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -57,8 +58,10 @@ class FullParity(unittest.TestCase):
         manifest = json.loads((self.repo / 'codex/shared-skills.json').read_text())
         for host in ['claude', 'codex']:
             for name in manifest['skills']:
-                self.assertEqual((self.home / ('.' + host) / 'skills' / name / 'SKILL.md').read_bytes(),
-                                 (self.repo / '.claude/skills' / name / 'SKILL.md').read_bytes())
+                expected = (self.repo / '.claude/skills' / name / 'SKILL.md').read_bytes()
+                if host == 'codex':
+                    expected = re.sub(rb'<!-- claude-only:start -->.*?<!-- claude-only:end -->\n?', b'', expected, flags=re.S)
+                self.assertEqual((self.home / ('.' + host) / 'skills' / name / 'SKILL.md').read_bytes(), expected)
             target = self.home / ('.' + host) / 'skills/engineering-runtime/scripts/workflow-state.sh'
             self.assertEqual(target.read_bytes(), (self.repo / '.claude/hooks/workflow-state.sh').read_bytes())
             self.assertEqual(self.install(host, '--check').returncode, 0)

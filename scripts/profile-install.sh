@@ -174,6 +174,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -302,7 +303,11 @@ for skill in shared_skills:
                 stale_host_specific.append(target)
             continue
         reject_symlinks(target)
-        managed.append((target, source.read_bytes(), str(source.relative_to(root))))
+        data = source.read_bytes()
+        if host_mode == 'codex' and source.suffix == '.md':
+            # Pointers to Claude-only files sit inside a claude-only span the Codex copy drops.
+            data = re.sub(rb'<!-- claude-only:start -->.*?<!-- claude-only:end -->\n?', b'', data, flags=re.S)
+        managed.append((target, data, str(source.relative_to(root))))
 for name in shared_manifest['profiles'] if host_mode == 'codex' and not selection else []:
     source = root / 'codex' / name
     target = live / '.codex' / name
