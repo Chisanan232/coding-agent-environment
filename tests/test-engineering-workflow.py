@@ -237,6 +237,15 @@ class EngineeringWorkflowContract(unittest.TestCase):
                 self.assertIn(phrase, text)
         self.assertNotIn("one concern and its necessary tests", text)
 
+    def test_all_repository_changes_go_through_pull_requests(self) -> None:
+        text = " ".join(WORKFLOW.read_text().split())
+        self.assertIn("All repository code changes go through pull requests", text)
+        self.assertIn("never push directly to the default or protected branch (main/master); merge only via PR", text)
+        claude = (ROOT / ".claude/CLAUDE.md").read_text()
+        for stale in ["Quick-Fix Path", "Push directly", "quick-fix path"]:
+            with self.subTest(stale=stale):
+                self.assertNotIn(stale, claude)
+
 
 if __name__ == "__main__":
     unittest.main()
