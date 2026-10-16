@@ -127,3 +127,22 @@ def write_state(path, free_bytes, latch, now=None):
             pass
         raise
     return record
+
+
+def read_state(path):
+    """Return the stored state, {} when none exists; StateError when untrustworthy."""
+    _refuse_symlinks(path)
+    try:
+        with open(path, 'rb') as handle:
+            record = json.loads(handle.read(65536))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise StateError('state unreadable: %s' % exc)
+    valid = (isinstance(record, dict) and record.get('version') == STATE_VERSION
+             and type(record.get('latch')) is bool and type(record.get('free_bytes')) is int
+             and record.get('tier') in ('emergency', 'low', 'stable', 'wide')
+             and isinstance(record.get('timestamp'), str))
+    if not valid:
+        raise StateError('state has the wrong schema')
+    return record
