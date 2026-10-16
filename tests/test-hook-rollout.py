@@ -159,6 +159,14 @@ class Fixture(unittest.TestCase):
         self.assertEqual(new['permissions'], LIVE['permissions'])
         self.assertEqual(new['statusLine'], LIVE['statusLine'])
 
+    def test_second_apply_is_a_no_op(self):
+        self.assertEqual(self.apply()[0], 0)
+        after = self.snapshot_tree()
+        code, text = self.run_cli('apply')
+        self.assertEqual(code, 0)
+        self.assertIn('already installed', text)
+        self.assertEqual(self.snapshot_tree(), after)
+
 
 if __name__ == '__main__':
     unittest.main()
