@@ -407,6 +407,17 @@ class Hardening(unittest.TestCase):
         self.assertTrue(temporary[0] & os.O_EXCL and temporary[0] & os.O_NOFOLLOW)
         self.assertTrue(flags['state.json.lock'] & os.O_NOFOLLOW)
 
+    def test_enospc_through_evaluate_refuses_and_keeps_previous_state(self):
+        import errno
+        self.assertTrue(da.evaluate('light', self.path, lambda: 500 * GIB)['admit'])
+        before = self.path.read_text()
+        with mock.patch.object(da.os, 'fsync', side_effect=OSError(errno.ENOSPC, 'No space left on device')):
+            result = da.evaluate('light', self.path, lambda: 500 * GIB)
+        self.assertFalse(result['admit'])
+        self.assertIn('state-unwritable', result['reason'])
+        self.assertEqual(self.path.read_text(), before)
+        self.assertEqual(sorted(entry.name for entry in self.path.parent.iterdir()), ['state.json', 'state.json.lock'])
+
 
 if __name__ == '__main__':
     unittest.main()
