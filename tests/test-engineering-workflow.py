@@ -27,7 +27,7 @@ class EngineeringWorkflowContract(unittest.TestCase):
     def test_contract_owns_required_lifecycle_boundaries(self) -> None:
         text = WORKFLOW.read_text()
         required = [
-            "<release-or-phase>/<ticket>/<type>/<2-4_word_snake_summary>",
+            "<version-or-phase>/<ticket-id>/<short_summary>",
             "<emoji> <scope>: <imperative summary>",
             "one concern and its necessary tests",
             "CI_UNAVAILABLE_EXTERNAL",

@@ -19,15 +19,17 @@ Resolve and fetch the actual tracking remote; check base-branch CI, ensure requi
 dependencies are installed, and ensure configured hooks are active before
 implementation without disturbing unrelated state.
 
-Name a ticket branch:
+Name a ticket branch with no change-type segment:
 
 ```
-<release-or-phase>/<ticket>/<type>/<2-4_word_snake_summary>
+<version-or-phase>/<ticket-id>/<short_summary>
 ```
 
-Keep the summary at 30 characters or fewer. Resolve the release/phase and ticket
-from the authoritative tracker or established local context; do not invent them.
-Use these established change types and meanings:
+Keep the summary at 2-4 snake_case words and 30 characters or fewer. Resolve the
+version/phase and ticket from the authoritative tracker or established local
+context; do not invent them.
+
+Use these established change types and meanings when choosing a commit GitEmoji:
 
 | Type | Gitmoji | Meaning |
 |---|---|---|
@@ -42,8 +44,8 @@ Use these established change types and meanings:
 | `lint` | 🚨 | Lint or type repair |
 | `security` | 🔒 | Security |
 
-Create the worktree as a sibling of the main checkout and replace `/` in the
-branch name with `-` in the worktree directory name.
+Create the worktree as a sibling of the main checkout. Derive its directory name
+from the branch by replacing `/` with `-`: `<repo>-<phase>-<ticket>-<summary>`.
 
 ## Implement and commit
 
