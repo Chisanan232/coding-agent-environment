@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""scripts/permission-rollout.py against synthetic fixtures in a temp $HOME.
+Nothing here reads or writes a real ~/.claude or the repo's own settings."""
+import copy
+import importlib.util
+import io
+import json
+import os
+import contextlib
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_file_location("rollout", ROOT / "scripts/permission-rollout.py")
+rollout = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(rollout)
+
+BASE_ASK = [
+    "Bash(terraform apply:*)", "Bash(rtk terraform apply:*)",
+    "Bash(terraform destroy:*)", "Bash(rtk terraform destroy:*)",
+    "Bash(terraform -* destroy*)", "Bash(rtk terraform -* destroy*)",
+    "Bash(terraform -* apply*)", "Bash(rtk terraform -* apply*)",
+    "Bash(rtk proxy *)",
+    "Bash(gcloud secrets versions access *)", "Bash(rtk gcloud secrets versions access *)",
+    "Bash(gcloud * secrets versions access*)", "Bash(rtk gcloud * secrets versions access*)",
+    "mcp__neon__get_connection_string",
+    "Bash(git worktree add -f*)", "Bash(git worktree add * -f*)",
+    "Bash(git worktree remove* -f*)", "Bash(git * worktree remove*)",
+]
+BASELINE = {
+    "permissions": {"allow": ["Bash(git status:*)", "Bash(git worktree list:*)"], "ask": BASE_ASK, "deny": [], "defaultMode": "auto"},
+    "autoMode": {
+        "environment": ["$defaults", "**Worktree and session ownership**: only task-owned worktrees."],
+        "allow": ["$defaults", "**Authorized pull request merge**: user-authorized, merge commit, pinned SHA."],
+    },
+}
+LIVE = {
+    "model": "sonnet",
+    "hooks": {"PreToolUse": [{"matcher": "Bash"}]},
+    "permissions": {
+        "allow": ["Bash(git worktree *)", "Bash(rtk git worktree *)", "Bash(sync-private:*)"],
+        "ask": ["Bash(git worktree add*-f*)", "Bash(git * worktree remove*)", "Bash(gcloud*projects/*)", "Bash(pkill *)"],
+        "deny": [
+            "Bash(terraform destroy:*)", "Bash(terraform apply -destroy*)", "Bash(rtk terraform destroy *)", "Bash(terraform * destroy*)",
+            "Bash(rtk proxy *)", "Bash(gcloud secrets versions access *)", "mcp__neon__get_connection_string",
+            "Bash(private-only-deny *)",
+        ],
+        "defaultMode": "auto",
+    },
+    "autoMode": {
+        "environment": [
+            "### Org-wide", "**Organization**: None configured",
+            "**Source control**: The trusted repo only — no remotes are configured for /x",
+            "**Trusted repo**: /x (no remotes configured; local-only checkout)",
+            "routine under /x/ prefix",
+            "**Worktree cleanup**: git worktree remove --force is routine.",
+            "**Process cleanup**: terminating this session's own process is routine.",
+            "**Force-push**: every force-push (--force, --force-with-lease, -f) always asks.",
+        ],
+        "allow": ["$defaults", "**Evidence-gated pull request merge**: old prose.", "**Private**: keep me."],
+    },
+}
+
+
+class Fixture(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        (self.home / ".claude").mkdir()
+        self._old_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.home)
+        self.base_p = self.home / "baseline.json"
+        self.live_p = self.home / ".claude/settings.json"
+        self.base_p.write_text(json.dumps(BASELINE, indent=4))
+        self.live_p.write_text(json.dumps(LIVE, indent=4) + "\n")
+
+    def tearDown(self):
+        if self._old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._old_home
+        self.tmp.cleanup()
+
+    def run_tool(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = rollout.main(list(argv))
+        return rc, out.getvalue()
+
+    def merged(self, owners=("OwnerA", "OwnerB")):
+        return rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), list(owners))
+
+
+class MergeSemantics(Fixture):
+    def test_deny_is_emptied_and_every_former_deny_command_asks(self):
+        new = self.merged()
+        self.assertEqual([], new["permissions"]["deny"])
+        for cmd in rollout.FORMER_DENY_COMMANDS:
+            for pre in ("", "rtk "):
+                if pre == "rtk " and cmd.startswith("rtk "):
+                    continue
+                with self.subTest(cmd=pre + cmd):
+                    self.assertEqual("ask", rollout.static_decision(pre + cmd, new["permissions"]))
+
+    def test_live_only_deny_is_moved_to_ask_not_dropped_or_allowed(self):
+        new = self.merged()
+        self.assertIn("Bash(private-only-deny *)", new["permissions"]["ask"])
+        self.assertNotIn("Bash(private-only-deny *)", new["permissions"]["allow"])
+        self.assertEqual("ask", rollout.static_decision("private-only-deny x", new["permissions"]))
+
+    def test_old_broad_terraform_destroy_glob_does_not_survive_as_a_false_positive(self):
+        new = self.merged()
+        self.assertNotIn("Bash(terraform * destroy*)", new["permissions"]["ask"])
+        for cmd in ("terraform plan -out destroy.tfplan", "terraform workspace select destroy-x"):
+            with self.subTest(cmd=cmd):
+                self.assertNotEqual("ask", rollout.static_decision(cmd, new["permissions"]))
+        for cmd in ("terraform destroy", "terraform -chdir=x destroy", "rtk terraform -chdir=x destroy"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual("ask", rollout.static_decision(cmd, new["permissions"]))
+
+    def test_subsumed_deny_variants_are_not_duplicated_into_ask(self):
+        ask = self.merged()["permissions"]["ask"]
+        self.assertNotIn("Bash(terraform apply -destroy*)", ask)
+        self.assertNotIn("Bash(rtk terraform destroy *)", ask)
+
+    def test_live_only_entries_and_unrelated_keys_survive(self):
+        new = self.merged()
+        self.assertIn("Bash(sync-private:*)", new["permissions"]["allow"])
+        self.assertIn("Bash(pkill *)", new["permissions"]["ask"])
+        self.assertIn("**Private**: keep me.", new["autoMode"]["allow"])
+        self.assertIn("**Process cleanup**: terminating this session's own process is routine.", new["autoMode"]["environment"])
+        self.assertEqual(LIVE["model"], new["model"])
+        self.assertEqual(LIVE["hooks"], new["hooks"])
+
+    def test_superseded_broad_rules_are_retired(self):
+        new = self.merged()
+        self.assertNotIn("Bash(git worktree *)", new["permissions"]["allow"])
+        self.assertNotIn("Bash(git worktree add*-f*)", new["permissions"]["ask"])
+        self.assertIn("Bash(git * worktree remove*)", new["permissions"]["ask"], "ownership gate on global-option removal is kept")
+        self.assertNotIn("Bash(gcloud*projects/*)", new["permissions"]["ask"])
+        self.assertIn("Bash(gcloud secrets*projects/*)", new["permissions"]["ask"], "narrowed replacement kept in live")
+
+    def test_stale_environment_snapshot_is_replaced_by_defaults_and_owner_lines(self):
+        env = self.merged()["autoMode"]["environment"]
+        self.assertEqual("$defaults", env[0])
+        joined = "\n".join(env)
+        for stale in ("no remotes", "local-only checkout", "None configured", "### ", "routine under", "Worktree cleanup"):
+            self.assertNotIn(stale, joined)
+        self.assertIn("`OwnerA`, `OwnerB`", joined)
+        self.assertEqual(2, sum("OwnerA" in e for e in env))
+
+    def test_older_live_copies_of_baseline_lines_are_not_duplicated(self):
+        env = self.merged()["autoMode"]["environment"]
+        self.assertFalse(any(e.startswith("**Force-push**: every force-push (--force,") for e in env))
+
+    def test_old_merge_prose_is_replaced_by_the_baseline_prose(self):
+        allow = self.merged()["autoMode"]["allow"]
+        self.assertEqual("$defaults", allow[0])
+        self.assertFalse(any(e.startswith("**Evidence-gated") for e in allow))
+        self.assertIn(BASELINE["autoMode"]["allow"][1], allow)
+
+    def test_a_baseline_deny_rule_becomes_ask_not_dropped(self):
+        base = copy.deepcopy(BASELINE)
+        base["permissions"]["deny"] = ["Bash(newly-denied *)"]
+        new = rollout.merge(copy.deepcopy(LIVE), base, [])
+        self.assertEqual([], new["permissions"]["deny"])
+        self.assertIn("Bash(newly-denied *)", new["permissions"]["ask"])
+
+    def test_merge_is_idempotent(self):
+        once = self.merged()
+        twice = rollout.merge(copy.deepcopy(once), copy.deepcopy(BASELINE), ["OwnerA", "OwnerB"])
+        self.assertEqual(once, twice)
+
+    def test_no_owners_means_no_trust_lines(self):
+        self.assertNotIn("OwnerA", json.dumps(self.merged(owners=())))
+
+    def test_merged_result_passes_its_own_policy_check(self):
+        self.assertEqual([], rollout.problems(self.merged()))
+
+    def test_bypass_permissions_and_git_push_allow_are_flagged(self):
+        bad = self.merged()
+        bad["permissions"]["defaultMode"] = "bypassPermissions"
+        bad["permissions"]["allow"].append("Bash(git push:*)")
+        found = "\n".join(rollout.problems(bad))
+        self.assertIn("bypassPermissions", found)
+        self.assertIn("git push", found)
+
+
+class PersonalDevTrust(Fixture):
+    DEV = ["~/dev-root"]
+
+    def merged_dev(self, live=None, dev=None):
+        return rollout.merge(copy.deepcopy(live or LIVE), copy.deepcopy(BASELINE), ["OwnerA"], dev or self.DEV)
+
+    def test_dev_dirs_add_scoped_file_access_prose_and_allow_exception(self):
+        new = self.merged_dev()
+        self.assertEqual(self.DEV, new["permissions"]["additionalDirectories"])
+        env = "\n".join(new["autoMode"]["environment"])
+        self.assertIn("Personal development machine", env)
+        self.assertIn("`~/dev-root`", env)
+        self.assertIn("does not cover credential or key files", env)
+        allow = "\n".join(new["autoMode"]["allow"])
+        self.assertIn("Cross-repository personal development", allow)
+        self.assertIn("does not apply to credential or key files", allow)
+        self.assertEqual([], rollout.problems(new))
+
+    def test_without_dev_dirs_nothing_about_directories_is_added(self):
+        new = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), ["OwnerA"])
+        self.assertNotIn("additionalDirectories", new["permissions"])
+        self.assertNotIn("Personal development machine", json.dumps(new))
+
+    def test_changed_dev_dirs_replace_the_old_lines_instead_of_stacking(self):
+        first = self.merged_dev()
+        second = self.merged_dev(live=first, dev=["~/other-root"])
+        env = [e for e in second["autoMode"]["environment"] if e.startswith("**Personal development machine")]
+        self.assertEqual(1, len(env))
+        self.assertIn("`~/other-root`", env[0])
+        self.assertNotIn("~/dev-root", env[0])
+        self.assertEqual(1, sum(e.startswith("**Cross-repository") for e in second["autoMode"]["allow"]))
+        self.assertEqual(first, self.merged_dev(live=first))
+
+    def test_overbroad_or_sensitive_dev_dirs_are_rejected(self):
+        for bad in ("/", "~", str(Path.home()), "/Users", "/Volumes", "~/.ssh", "~/.config/gcloud/x", "relative/path", "/private/etc"):
+            with self.subTest(dir=bad):
+                self.assertIsNotNone(rollout.check_dev_dir(bad), bad)
+        for good in ("~/dev-root", "/Volumes/Personal/dev"):
+            with self.subTest(dir=good):
+                self.assertIsNone(rollout.check_dev_dir(good))
+
+    def test_cli_refuses_a_home_wide_dev_dir_and_writes_nothing(self):
+        before = self.live_p.read_bytes()
+        rc, out = self.run_tool("apply", "--baseline", str(self.base_p), "--live", str(self.live_p), "--dev-dirs", str(Path.home()),
+                                "--expect-live-sha", rollout.sha(self.live_p), "--expect-baseline-sha", rollout.sha(self.base_p))
+        self.assertEqual(6, rc, out)
+        self.assertEqual(before, self.live_p.read_bytes())
+
+    def test_verify_flags_a_broad_additional_directory(self):
+        bad = self.merged_dev()
+        bad["permissions"]["additionalDirectories"].append("/")
+        self.assertIn("too broad", "\n".join(rollout.problems(bad)))
+
+    def test_existing_additional_directories_are_preserved(self):
+        live = copy.deepcopy(LIVE)
+        live["permissions"]["additionalDirectories"] = ["~/already-there"]
+        new = self.merged_dev(live=live)
+        self.assertEqual(["~/already-there", "~/dev-root"], new["permissions"]["additionalDirectories"])
+
+
+class CommandModes(Fixture):
+    def args(self, *extra):
+        return ["--baseline", str(self.base_p), "--live", str(self.live_p), "--owners", "OwnerA", *extra]
+
+    def test_plan_writes_nothing(self):
+        before = self.live_p.read_bytes()
+        rc, out = self.run_tool("plan", *self.args())
+        self.assertEqual(0, rc)
+        self.assertEqual(before, self.live_p.read_bytes())
+        self.assertIn("permissions.deny: 8 -> 0", out)
+        self.assertFalse((self.home / ".claude/backups").exists())
+
+    def test_apply_refuses_without_both_hashes(self):
+        before = self.live_p.read_bytes()
+        rc, _ = self.run_tool("apply", *self.args())
+        self.assertEqual(3, rc)
+        rc, _ = self.run_tool("apply", *self.args("--expect-live-sha", rollout.sha(self.live_p), "--expect-baseline-sha", "0" * 64))
+        self.assertEqual(3, rc)
+        self.assertEqual(before, self.live_p.read_bytes())
+
+    def test_apply_backs_up_writes_and_rollback_restores(self):
+        original = self.live_p.read_bytes()
+        rc, out = self.run_tool("apply", *self.args("--expect-live-sha", rollout.sha(self.live_p), "--expect-baseline-sha", rollout.sha(self.base_p)))
+        self.assertEqual(0, rc, out)
+        applied = json.loads(self.live_p.read_text())
+        self.assertEqual([], applied["permissions"]["deny"])
+        backups = list((self.home / ".claude/backups").glob("settings.json.pre-SPE-106.*"))
+        self.assertEqual(1, len(backups))
+        self.assertEqual(original, backups[0].read_bytes())
+        rc, _ = self.run_tool("verify", "--live", str(self.live_p))
+        self.assertEqual(0, rc)
+        rc, _ = self.run_tool("rollback", "--live", str(self.live_p), "--backup", str(backups[0]))
+        self.assertEqual(0, rc)
+        self.assertEqual(original, self.live_p.read_bytes())
+
+    def test_back_to_back_applies_never_overwrite_the_original_backup(self):
+        original = self.live_p.read_bytes()
+        for _ in range(2):
+            rc, out = self.run_tool("apply", *self.args("--expect-live-sha", rollout.sha(self.live_p), "--expect-baseline-sha", rollout.sha(self.base_p)))
+            self.assertEqual(0, rc, out)
+        backups = sorted((self.home / ".claude/backups").glob("settings.json.pre-SPE-106.*"))
+        self.assertEqual(2, len(backups))
+        self.assertIn(original, [b.read_bytes() for b in backups])
+
+    def test_apply_preserves_file_mode(self):
+        os.chmod(self.live_p, 0o600)
+        rc, out = self.run_tool("apply", *self.args("--expect-live-sha", rollout.sha(self.live_p), "--expect-baseline-sha", rollout.sha(self.base_p)))
+        self.assertEqual(0, rc, out)
+        self.assertEqual(0o600, self.live_p.stat().st_mode & 0o777)
+
+    def test_apply_refuses_when_live_changed_since_review(self):
+        reviewed = rollout.sha(self.live_p)
+        base_sha = rollout.sha(self.base_p)
+        live = json.loads(self.live_p.read_text())
+        live["permissions"]["allow"].append("Bash(echo changed:*)")
+        self.live_p.write_text(json.dumps(live, indent=4) + "\n")
+        rc, _ = self.run_tool("apply", *self.args("--expect-live-sha", reviewed, "--expect-baseline-sha", base_sha))
+        self.assertEqual(3, rc)
+
+    def test_plan_refuses_a_baseline_that_does_not_cover_former_deny(self):
+        weak = copy.deepcopy(BASELINE)
+        weak["permissions"]["ask"] = [r for r in weak["permissions"]["ask"] if "versions access" not in r]
+        live = json.loads(self.live_p.read_text())
+        live["permissions"]["deny"] = []
+        self.live_p.write_text(json.dumps(live))
+        self.base_p.write_text(json.dumps(weak))
+        rc, out = self.run_tool("plan", *self.args())
+        self.assertEqual(2, rc)
+        self.assertIn("former-deny command does not ask", out)
+
+    def test_apply_refuses_a_symlinked_live_file(self):
+        real = self.home / "real-settings.json"
+        real.write_bytes(self.live_p.read_bytes())
+        self.live_p.unlink()
+        self.live_p.symlink_to(real)
+        rc, out = self.run_tool("apply", *self.args("--expect-live-sha", rollout.sha(real), "--expect-baseline-sha", rollout.sha(self.base_p)))
+        self.assertEqual(4, rc, out)
+        self.assertTrue(self.live_p.is_symlink())
+
+    def test_apply_leaves_no_temp_file_and_a_fixed_temp_name_is_not_used(self):
+        (self.home / ".claude/settings.json.spe106.tmp").symlink_to(self.home / "victim.txt")
+        rc, out = self.run_tool("apply", *self.args("--expect-live-sha", rollout.sha(self.live_p), "--expect-baseline-sha", rollout.sha(self.base_p)))
+        self.assertEqual(0, rc, out)
+        self.assertFalse((self.home / "victim.txt").exists(), "a planted symlink at a predictable temp name was followed")
+        leftovers = [p.name for p in (self.home / ".claude").glob("settings.json.spe106.*") if p.name != "settings.json.spe106.tmp"]
+        self.assertEqual([], leftovers)
+
+    def test_rollback_saves_current_state_and_rejects_invalid_backup(self):
+        bad = self.home / "bad-backup"
+        bad.write_text("{not json")
+        before = self.live_p.read_bytes()
+        with self.assertRaises(ValueError):
+            self.run_tool("rollback", "--live", str(self.live_p), "--backup", str(bad))
+        self.assertEqual(before, self.live_p.read_bytes())
+        good = self.home / "good-backup"
+        good.write_text(json.dumps({"permissions": {"allow": [], "ask": [], "deny": []}}))
+        rc, out = self.run_tool("rollback", "--live", str(self.live_p), "--backup", str(good))
+        self.assertEqual(0, rc, out)
+        saved = list((self.home / ".claude").glob("settings.json.pre-rollback.*"))
+        self.assertEqual(1, len(saved))
+        self.assertEqual(before, saved[0].read_bytes())
+
+    def test_verify_fails_on_the_unmigrated_live_file(self):
+        rc, out = self.run_tool("verify", "--live", str(self.live_p))
+        self.assertEqual(1, rc)
+        self.assertIn("permissions.deny is not empty", out)
+        self.assertIn('lacks "$defaults"', out)
+
+
+if __name__ == "__main__":
+    unittest.main()
