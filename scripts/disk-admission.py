@@ -34,6 +34,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import stat
 import subprocess
 import time
 
@@ -160,12 +161,19 @@ def read_state(path):
     """Return the stored state, {} when none exists; StateError when untrustworthy."""
     _refuse_symlinks(path)
     try:
-        with open(path, 'rb') as handle:
-            record = json.loads(handle.read(65536))
+        # O_NONBLOCK: opening a FIFO must not wait for a writer.
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except FileNotFoundError:
         return {}
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
         raise StateError('state unreadable: %s' % exc, 'state-corrupt')
+    with os.fdopen(descriptor, 'rb') as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise StateError('state is not a regular file', 'state-not-regular')
+        try:
+            record = json.loads(handle.read(65536))
+        except (OSError, ValueError) as exc:
+            raise StateError('state unreadable: %s' % exc, 'state-corrupt')
     valid = (isinstance(record, dict) and record.get('version') == STATE_VERSION
              and type(record.get('latch')) is bool and type(record.get('free_bytes')) is int
              and record.get('tier') in ('emergency', 'low', 'stable', 'wide')
