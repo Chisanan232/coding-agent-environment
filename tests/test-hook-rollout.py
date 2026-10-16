@@ -230,6 +230,14 @@ class Fixture(unittest.TestCase):
         self.assertIn('outside the repository', text)
         self.assertFalse(self.dest.exists())
 
+    def test_conflicting_existing_entry_is_refused_by_apply(self):
+        data = hr.with_gate(LIVE)
+        data['hooks']['PreToolUse'][-1]['hooks'][0]['command'] += ' --admission-dir /x'
+        self.live.write_text(json.dumps(data, indent=2) + '\n')
+        before = self.snapshot_tree()
+        self.assertEqual(self.apply()[0], 2)
+        self.assertEqual(self.snapshot_tree(), before)
+
 
 if __name__ == '__main__':
     unittest.main()
