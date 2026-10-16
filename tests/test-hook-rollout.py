@@ -215,6 +215,14 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.snapshot_tree(), before)
         self.assertEqual(self.apply('--allow-enforce')[0], 0)
 
+    def test_warn_or_absent_mode_file_allows_apply(self):
+        self.assertEqual(self.apply()[0], 0)
+        self.live.write_text(self.live_text)
+        self.dest.unlink()
+        self.mode.parent.mkdir(parents=True)
+        self.mode.write_text('warn\n')
+        self.assertEqual(self.apply()[0], 0)
+
 
 if __name__ == '__main__':
     unittest.main()
