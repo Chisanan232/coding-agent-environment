@@ -249,6 +249,11 @@ class Compound(unittest.TestCase):
         self.assertTrue(self.heavy('echo `cargo build`'))
         self.assertFalse(self.heavy('echo `date`'))
 
+    def test_nice_with_adjustment_is_heavy(self):
+        self.assertTrue(self.heavy('nice -n 10 cargo build'))
+        self.assertTrue(self.heavy('nice -10 cargo build'))
+        self.assertFalse(self.heavy('nice -n 10 ls'))
+
 
 if __name__ == '__main__':
     unittest.main()
