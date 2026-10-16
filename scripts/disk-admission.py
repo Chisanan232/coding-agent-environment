@@ -108,6 +108,12 @@ def _refuse_symlinks(path):
     for candidate in (path, path.parent):
         if candidate.is_symlink():
             raise StateError('state path is a symlink: %s' % candidate)
+    # Any redirected ancestor between the account home and the file counts too.
+    root = account_home()
+    if path.parent.is_relative_to(root):
+        expected = os.path.join(os.path.realpath(root), path.parent.relative_to(root))
+        if os.path.realpath(path.parent) != expected:
+            raise StateError('state directory has a symlinked ancestor: %s' % path.parent)
 
 
 @contextmanager
