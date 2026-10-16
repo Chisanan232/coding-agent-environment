@@ -431,6 +431,20 @@ class Fixture(unittest.TestCase):
         self.assertFalse(self.dest.exists())
         self.assertEqual([p.name for p in self.live.parent.iterdir() if '.hookroll.' in p.name], [])
 
+    def test_a_second_apply_while_the_lock_is_held_is_refused(self):
+        import fcntl
+        self.backups.mkdir(parents=True)
+        holder = os.open(str(self.backups / '.hook-rollout.lock'), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        before = self.snapshot_tree()
+        code, text = self.apply()
+        self.assertEqual(code, 11)
+        self.assertIn('another apply', text)
+        self.assertEqual(self.snapshot_tree(), before)
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        self.assertEqual(self.apply()[0], 0)
+
 
 if __name__ == '__main__':
     unittest.main()
