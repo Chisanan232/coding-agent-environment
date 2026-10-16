@@ -37,6 +37,14 @@ class Census(unittest.TestCase):
                 else:
                     expected = [f'{source}#{key}']
                 self.assertFalse(set(expected) - ids)
+    def test_claude_only_references_are_host_specific(self):
+        rows = {r['id']: r for r in json.loads((ROOT / 'docs/full-parity-inventory.json').read_text())['rows']}
+        for name in ['engineering-runtime/references/claude-runtime.md',
+                     'ci-failure-triage/references/claude-ci-triage.md',
+                     'architecture-design/references/model-routing-and-delegation.md']:
+            with self.subTest(reference=name):
+                self.assertEqual(rows['.claude/skills/' + name]['classification'], 'HOST_SPECIFIC_NO_PARITY')
+
 
 if __name__ == '__main__':
     unittest.main()
