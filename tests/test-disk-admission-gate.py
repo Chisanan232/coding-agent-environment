@@ -53,9 +53,9 @@ class Classification(unittest.TestCase):
             verdict = gate.classify(command)
             self.assertTrue(verdict['heavy'], command)
             self.assertEqual(verdict['confidence'], 'best-effort', command)
-        # Unparsable input is reported as such and never treated as heavy.
+        # Unparsable input naming a heavy tool is heavy but flagged unparsable.
         verdict = gate.classify("echo 'unterminated cargo build")
-        self.assertEqual((verdict['heavy'], verdict['confidence']), (False, 'unparsable'))
+        self.assertEqual((verdict['heavy'], verdict['confidence']), (True, 'unparsable'))
 
     def test_documented_blind_spots_are_not_detected(self):
         for command in ('make build', 'just build', 'npm run build', './target/debug/tool', 'xargs cargo build < list'):

@@ -32,6 +32,7 @@ hidden behind variable expansion, aliases, scripts or xargs.
 """
 import json
 import os
+import re
 from pathlib import Path
 import pwd
 import shlex
@@ -249,13 +250,27 @@ def _shell_script(words):
     return None
 
 
+HEAVY_WORD_RE = re.compile(r'(?<![\w./-])(cargo|rustc|rustdoc|nextest|maturin|npm|pnpm|yarn|uv|docker|xcodebuild)(?![\w-])')
+MAX_PARSE_CHARS = 256 * 1024
+UNCERTAIN = ('unparsable', 'oversize')
+
+
+def _uncertain(command, confidence):
+    """A command that cannot be tokenized: heavy when it names a heavy tool anywhere."""
+    found = HEAVY_WORD_RE.search(command)
+    return {'heavy': bool(found), 'confidence': confidence, 'kind': found.group(1) if found else None,
+            'assignments': [], 'words': []}
+
+
 def classify(command, _depth=0):
     """Return {'heavy', 'confidence', 'kind', 'assignments', 'words'} for a Bash command line."""
     verdict = {'heavy': False, 'confidence': 'exact', 'kind': None, 'assignments': [], 'words': []}
+    if len(command) > MAX_PARSE_CHARS:
+        return _uncertain(command, 'oversize')
     try:
         simple_commands = split_commands(command)
     except ValueError:
-        return dict(verdict, confidence='unparsable')
+        return _uncertain(command, 'unparsable')
     for tokens in simple_commands:
         assignments, words = _command_words(tokens)
         kind = _heavy_kind(words)
@@ -353,6 +368,11 @@ def decide(command, mode, runner=run_adapter, exists=os.path.exists):
     if not verdict['heavy']:
         return 0, '', ''
     label = '%s (%s classification)' % (verdict['kind'], verdict['confidence'])
+    if verdict['confidence'] in UNCERTAIN and mode != 'enforce':
+        # Warn mode never blocks and cannot tell what this command runs.
+        note = 'disk-admission-gate (mode %s, advice): command is %s and names %s; it may be a heavy build' % (
+            mode, verdict['confidence'], verdict['kind'])
+        return 0, json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'additionalContext': note}}), ''
     notes = []
     try:
         code, text = runner()
