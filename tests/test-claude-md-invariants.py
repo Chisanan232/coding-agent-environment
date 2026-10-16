@@ -210,6 +210,17 @@ class ClaudeMdInvariants(unittest.TestCase):
         self.assertIn("--dry-run` or `--check` first", readme)
         self.assertNotIn("reads only the block", readme)
 
+    def test_deploy_packet_covers_evidence_side_effects_rollback_and_probes(self) -> None:
+        text = (ROOT / "docs/DEPLOY-SPE-108.md").read_text()
+        for heading in ["## Evidence from a scratch HOME", "## Apply", "## Rollback", "## Acceptance probes"]:
+            with self.subTest(heading=heading):
+                self.assertIn(heading, text)
+        self.assertIn("profile-install.sh --claude-skills --dry-run", text)
+        self.assertIn("overwrites\n   every shared skill file", text)
+        self.assertIn("Prior state:", text)
+        for probe in ["Subagent cap", "PR-only delivery", "Commit format"]:
+            self.assertIn(probe, text)
+
 
 if __name__ == "__main__":
     unittest.main()
