@@ -630,7 +630,7 @@ def build_parser():
     mode = shot.add_mutually_exclusive_group(required=True)
     mode.add_argument('--json', action='store_true', help='write and print a fresh snapshot')
     mode.add_argument('--check-fresh', action='store_true', help='read-only: exit 0 when the snapshot is fresh, else 77')
-    shot.add_argument('--max-age', type=int, default=STALE_AFTER_S, help='seconds; with --check-fresh only')
+    shot.add_argument('--max-age', type=int, default=STALE_AFTER_S, help='seconds, 1..120; with --check-fresh only')
     drop = commands.add_parser('release', allow_abbrev=False, help='release a reservation by label')
     drop.add_argument('--label', required=True)
     return parser
@@ -645,6 +645,10 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
         print(result['reason'])
         return 0 if result['admit'] else REFUSED_EXIT
     if args.command == 'snapshot' and args.check_fresh:
+        if not 0 < args.max_age <= STALE_AFTER_S:
+            # A caller may tighten the staleness rule but never relax it.
+            print('refused: --max-age must be between 1 and %d seconds' % STALE_AFTER_S)
+            return REFUSED_EXIT
         try:
             fresh = snapshot_is_fresh(read_snapshot(state_path), max_age=args.max_age)
             print('snapshot fresh' if fresh else 'snapshot stale: older than %d s or dated in the future' % args.max_age)
