@@ -376,26 +376,36 @@ create`) cannot hide them; the `gsutil` rules keep one literal space and so are 
 against double spacing. An independent review found the original `keys create` rule
 did exactly that and it was fixed before merge.
 
-Known limits (text globs), disclosed after two independent reviews:
+Known limits (text globs), disclosed after two independent reviews and a real-engine
+test (fresh `claude -p` sessions with PermissionRequest-hook logging; the model-based
+reviews had mispredicted several of these):
+- Verified to STILL ASK (the engine normalizes them): `env X=1 ...`, `X=1 ...`,
+  `command ...`, `time ...`, and extra spacing in `terraform  destroy`, `git push  --force`.
+- Verified to BYPASS every text-matched ask rule, and to run with no prompt when the
+  user explicitly requests the command: `bash -c "gcloud ... add-iam-policy-binding ..."`,
+  an absolute-path binary (`/opt/homebrew/bin/gcloud ...`, `/usr/bin/git push --force ...`),
+  `gcloud iam roles copy`, and `gcloud storage ... --predefined-acl`. The first two
+  affect every ask rule in this file, including the pre-existing force-push and
+  `terraform apply` asks, and applied equally to the old deny rules; this change did
+  not create them. Closing them with text rules needs an absolute-path and a
+  `bash -c` variant per rule (130+ extra lines) and `*`-anchored variants match innocent
+  arguments, so they are left to the Auto Mode classifier, which is stricter when the
+  agent acts without an explicit user request. Not a hard boundary.
+- Also not matched: raw REST calls (`...:setIamPolicy`), `gsutil` with a tab or extra
+  spacing after `iam`/`acl`, `kubectl apply -f rolebinding.yaml`, `kubectl patch|edit
+  (cluster)rolebinding`, `kubectl create role`, `roles undelete`, `keys enable`,
+  `sign-jwt|sign-blob`, and `gh api` permission grants (collaborators, team membership,
+  deploy keys). `kubectl apply -f rolebinding.yaml` was blocked by the classifier in the
+  test.
 - Fail-safe false positives: any gcloud/kubectl/bq command that merely contains one of
-  these words prompts, for example `keys list --created-before=DATE` (matches
-  `keys*create`), `--filter`/`--sort-by` values containing create or update,
-  `projects create my-iam-roles-create-proj`, `kubectl create namespace rolebinding-test`
-  or `kubectl create configmap --from-file=rolebinding.yaml`.
-- Not matched, so they fall to the classifier: absolute-path, `env X=1`, `command`/`time`/
-  `xargs` wrappers and `bash -c` spellings; raw REST calls (`...:setIamPolicy`); `gsutil`
-  with extra spacing or a tab after `iam`/`acl` (those rules keep one literal space);
-  `kubectl apply -f rolebinding.yaml`, `kubectl patch|edit (cluster)rolebinding` and
-  `kubectl create role`; `gcloud iam roles copy` (same escalation as `roles create`);
-  `gcloud storage ... --predefined-acl|--add-acl-grant` (the gcloud twin of the gated
-  `gsutil acl`); `roles undelete`, `keys enable`, `sign-jwt|sign-blob`; and `gh api`
-  permission grants (collaborators, team membership, deploy keys). Quoting a word
-  inside `keys create` does not hide it (those rules still ask).
-- Short-lived token minting (`gcloud auth print-access-token`, `--impersonate-service-account`)
-  is deliberately not gated.
+  the gated words prompts, for example `keys list --created-before=DATE`, a
+  `--filter`/`--sort-by` value containing create or update, `projects create
+  my-iam-roles-create-proj`, or `kubectl create namespace rolebinding-test`.
+- Short-lived token minting (`gcloud auth print-access-token`,
+  `--impersonate-service-account`) is deliberately not gated.
 - Unprompted by design: `get-iam-policy` (without a filter containing a gated word),
   `roles describe|list`, `service-accounts list|describe`, `keys list` (without
-  `--created-before`/filter text containing create), `gsutil ls|iam get`, `bq ls|show`
+  `--created-before` or filter text containing create), `gsutil ls|iam get`, `bq ls|show`
   and `kubectl get rolebindings`.
 - `scripts/permission-rollout.py` refuses a baseline whose rules do not ask on a sample
   command from every gated family and on the MCP gcloud route.
