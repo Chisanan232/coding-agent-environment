@@ -99,6 +99,14 @@ class Fixture(unittest.TestCase):
         self.assertIn('mode file: absent', text)
         self.assertEqual(self.snapshot_tree(), before)
 
+    def test_plan_refuses_a_conflicting_existing_entry(self):
+        data = hr.with_gate(LIVE)
+        data['hooks']['PreToolUse'][-1]['hooks'][0]['command'] += ' --admission-dir /x'
+        self.live.write_text(json.dumps(data, indent=2) + '\n')
+        code, text = self.run_cli('plan')
+        self.assertEqual(code, 2)
+        self.assertIn('different disk-admission-gate entry', text)
+
 
 if __name__ == '__main__':
     unittest.main()
