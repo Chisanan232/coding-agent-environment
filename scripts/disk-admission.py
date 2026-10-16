@@ -33,6 +33,8 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import pwd
+import subprocess
 
 GIB = 1024 ** 3
 EMERGENCY_BELOW = 20 * GIB
@@ -167,7 +169,56 @@ def read_free_bytes():
     return stats.f_bavail * stats.f_frsize
 
 
-def evaluate(weight, state_path, free_fn=read_free_bytes, now=None):
+GLOMERIS_TIMEOUT = 10
+
+
+def account_home():
+    # The account database, not $HOME: the environment is caller-controlled.
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def read_glomeris_free():
+    """Free bytes from the pinned Glomeris core `status --json`.
+
+    The binary comes from the installed storage-core receipt, only when
+    storage-integration.py verifies it as installed. Glomeris pressure
+    levels in the output are advisory and deliberately ignored.
+    """
+    try:
+        from importlib.util import module_from_spec, spec_from_file_location
+        spec = spec_from_file_location('storage_integration', Path(__file__).with_name('storage-integration.py'))
+        storage = module_from_spec(spec)
+        spec.loader.exec_module(storage)
+        receipt = account_home() / '.local/share/coding-agent-environment/storage/storage-core.json'
+        if storage.receipt_state(receipt) != 'installed':
+            raise VolumeError('storage core is not installed')
+        binary = storage.read_selection(receipt)[0]['path']
+        done = subprocess.run([binary, 'status', '--json'], capture_output=True, text=True,
+                              timeout=GLOMERIS_TIMEOUT, stdin=subprocess.DEVNULL, check=True)
+        free = json.loads(done.stdout)['free_bytes']
+    except VolumeError:
+        raise
+    except Exception as exc:
+        raise VolumeError('glomeris status unavailable: %s' % exc)
+    if type(free) is not int or free < 0:
+        raise VolumeError('glomeris reported an invalid free_bytes')
+    return free
+
+
+def measure_free_bytes(glomeris=read_glomeris_free, statvfs=read_free_bytes):
+    """Smaller of the readable sources; refuses only when none is readable."""
+    values, errors = [], []
+    for source in (glomeris, statvfs):
+        try:
+            values.append(source())
+        except VolumeError as exc:
+            errors.append(str(exc))
+    if not values:
+        raise VolumeError('; '.join(errors))
+    return min(values)
+
+
+def evaluate(weight, state_path, free_fn=measure_free_bytes, now=None):
     """Measure, decide and persist under one lock; weight None only refreshes state.
 
     Returns a result dict. admit is False whenever anything is untrustworthy.
@@ -213,7 +264,7 @@ def build_parser():
     return parser
 
 
-def main(argv=None, free_fn=read_free_bytes, state_path=DEFAULT_STATE_PATH):
+def main(argv=None, free_fn=measure_free_bytes, state_path=DEFAULT_STATE_PATH):
     args = build_parser().parse_args(argv)
     result = evaluate(args.weight if args.command == 'check' else None, state_path, free_fn)
     if args.command == 'status':
