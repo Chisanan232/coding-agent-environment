@@ -445,6 +445,21 @@ class Fixture(unittest.TestCase):
         fcntl.flock(holder, fcntl.LOCK_UN)
         self.assertEqual(self.apply()[0], 0)
 
+    def test_rollback_detects_a_change_just_before_the_rename(self):
+        self.assertEqual(self.apply()[0], 0)
+        receipt = str(self.receipt())
+        real_chmod = os.chmod
+
+        def chmod_then_change(path, mode):
+            real_chmod(path, mode)
+            if os.path.basename(str(path)).startswith('settings.json.hookroll.'):
+                self.live.write_text('{"statusLine": "concurrent writer"}\n')
+        with mock.patch.object(hr.os, 'chmod', chmod_then_change):
+            code, text = self.run_cli('rollback', '--receipt', receipt)
+        self.assertEqual(code, 5)
+        self.assertIn('immediately before the restore', text)
+        self.assertEqual(self.live.read_text(), '{"statusLine": "concurrent writer"}\n')
+
 
 if __name__ == '__main__':
     unittest.main()
