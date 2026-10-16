@@ -665,5 +665,28 @@ class Snapshots(unittest.TestCase):
         self.assertEqual(da.snapshot_age_s(record, at(45)), 45)
 
 
+class FreshnessCli(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name).resolve() / 'admission/state.json'
+
+    def check(self, *extra):
+        from contextlib import redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = da.main(['snapshot', '--check-fresh', *extra], free_fn=lambda: 300 * GIB, state_path=self.path)
+        return code, out.getvalue()
+
+    def publish(self, age_seconds):
+        da.snapshot(self.path, lambda: (300 * GIB, 'glomeris'),
+                    now=datetime.now(timezone.utc) - timedelta(seconds=age_seconds))
+
+    def test_fresh_snapshot_exits_0(self):
+        self.publish(10)
+        self.assertEqual(self.check()[0], 0)
+        self.assertEqual(self.check('--max-age', '60')[0], 0)
+
+
 if __name__ == '__main__':
     unittest.main()
