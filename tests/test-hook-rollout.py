@@ -340,6 +340,16 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.run_cli('rollback', '--receipt', str(self.receipt()))[0], 0)
         self.assertEqual(self.dest.read_text(), 'old hook')
 
+    def test_rollback_is_idempotent(self):
+        self.assertEqual(self.apply()[0], 0)
+        receipt = str(self.receipt())
+        self.assertEqual(self.run_cli('rollback', '--receipt', receipt)[0], 0)
+        after = self.snapshot_tree()
+        code, text = self.run_cli('rollback', '--receipt', receipt)
+        self.assertEqual(code, 0)
+        self.assertIn('already match', text)
+        self.assertEqual(self.snapshot_tree(), after)
+
 
 if __name__ == '__main__':
     unittest.main()
