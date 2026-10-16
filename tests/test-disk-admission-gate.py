@@ -387,6 +387,12 @@ class Tamper(unittest.TestCase):
             self.assertEqual((code, err), (0, ''), command)
             self.assertIn('tamper-suspect', json.loads(out)['hookSpecificOutput']['additionalContext'])
 
+    def test_reading_the_state_directory_is_not_tamper(self):
+        d = self.DIR
+        for command in ('cat %smode' % d, 'ls -la %s' % d, 'grep enforce %smode' % d, 'sed s/a/b/ %smode' % d,
+                        'echo hi', 'echo %smode' % d):
+            self.assertEqual(self.run_gate(command, 'enforce'), (0, '', ''), command)
+
 
 if __name__ == '__main__':
     unittest.main()
