@@ -766,6 +766,22 @@ class ReservationHardening(unittest.TestCase):
         record = json.loads((self.path.parent / 'reservations/job-4h.json').read_text())
         self.assertEqual(record['expires'], '2026-10-16T16:00:00Z')
 
+    def test_reservation_whose_process_cannot_be_inspected_is_counted_conservatively(self):
+        self.assertTrue(self.take('job-a', nbytes=40 * GIB)['admit'])
+        file = self.path.parent / 'reservations/job-a.json'
+
+        def broken(pid):
+            raise da.ReservationError('ps is unavailable')
+        with da.state_lock(self.path):
+            live, problems = da.live_reservations(self.path, self.now, broken)
+        self.assertEqual([(r['label'], r['bytes']) for r in live], [('job-a', 40 * GIB)])
+        self.assertIn('reservation-unverifiable', ' '.join(problems))
+        self.assertTrue(file.exists())
+        # A snapshot taken while ps is broken still counts the job and reports a blocker.
+        record = da.snapshot(self.path, lambda: (300 * GIB, 'glomeris'), now=self.now, token_fn=broken)
+        self.assertEqual((record['active_heavy_jobs'], record['reserved_bytes']), (1, 40 * GIB))
+        self.assertIn('reservation-unverifiable', ' '.join(record['blockers']))
+
 
 if __name__ == '__main__':
     unittest.main()
