@@ -102,5 +102,7 @@ Closeout schema 2 separately checkpoints archive, decision and notes finalizatio
 Read `effective_complete`; legacy terminal flags leave finalization unverified.
 Install the same helper for both hosts before reconciling legacy receipts.
 
+<!-- claude-only:start -->
 Claude-specific variables, workflow state, circuit breaker, session memory, polling and
 MCP routing details are in the [Claude runtime reference](references/claude-runtime.md).
+<!-- claude-only:end -->
