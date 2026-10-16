@@ -47,10 +47,85 @@ CARGO_VALUE_OPTIONS = {'-C', '--config', '-Z', '--color'}
 NODE_HEAVY = {'install', 'i', 'ci', 'build'}
 
 
+def _heredoc_word(text, index):
+    """Parse `<<[-]['"]WORD['"]` at index (just after `<<`); returns (word, strip_tabs, end)."""
+    strip = text.startswith('-', index)
+    index += strip
+    while index < len(text) and text[index] in ' \t':
+        index += 1
+    quote = text[index] if index < len(text) and text[index] in '\'"' else ''
+    index += bool(quote)
+    start = index
+    while index < len(text) and (text[index] not in ' \t\n;&|<>()' if not quote else text[index] != quote):
+        index += 1
+    word = text[start:index]
+    return word, strip, index + bool(quote)
+
+
+def _normalize(command):
+    """Rewrite unquoted newlines as `;`, drop comments and heredoc bodies (data, not commands)."""
+    out, pending, index, quote = [], [], 0, ''
+    while index < len(command):
+        char = command[index]
+        if quote:
+            out.append(char)
+            if char == '\\' and quote == '"' and index + 1 < len(command):
+                out.append(command[index + 1])
+                index += 1
+            elif char == quote:
+                quote = ''
+        elif char in '\'"':
+            quote = char
+            out.append(char)
+        elif char == '\\' and index + 1 < len(command):
+            following = command[index + 1]
+            if following == '\n':
+                out.append(' ')
+            elif following == '\r' and command[index + 2:index + 3] == '\n':
+                out.append(' ')
+                index += 1
+            else:
+                out.append(char + following)
+            index += 1
+        elif char == '#' and (not out or out[-1] in ' \t\n;&|(){}'):
+            while index < len(command) and command[index] != '\n':
+                index += 1
+            continue
+        elif char == '`':
+            out.append(' ; ')
+        elif command.startswith('<<', index) and not command.startswith('<<<', index):
+            word, strip, end = _heredoc_word(command, index + 2)
+            if word:
+                pending.append((word, strip))
+            out.append(' << ' + shlex.quote(word) + ' ')
+            index = end
+            continue
+        elif char == '\r' and command[index + 1:index + 2] == '\n':
+            pass
+        elif char == '\n':
+            out.append(' ; ')
+            index += 1
+            for word, strip in pending:
+                while index < len(command):
+                    end = command.find('\n', index)
+                    end = len(command) if end < 0 else end
+                    line = command[index:end].rstrip('\r')
+                    index = min(end + 1, len(command))
+                    if (line.lstrip('\t') if strip else line) == word:
+                        break
+            pending = []
+            continue
+        else:
+            out.append(char)
+        index += 1
+    return ''.join(out)
+
+
 def split_commands(command):
     """Split a shell line into simple commands (token lists); ValueError if unparsable."""
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer = shlex.shlex(_normalize(command), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
+    lexer.commenters = ''
     commands, current = [], []
     for token in lexer:
         if token in OPERATORS:
