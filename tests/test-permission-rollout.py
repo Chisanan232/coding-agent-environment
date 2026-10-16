@@ -25,6 +25,21 @@ BASE_ASK = [
     "Bash(gcloud secrets versions access *)", "Bash(rtk gcloud secrets versions access *)",
     "Bash(gcloud * secrets versions access*)", "Bash(rtk gcloud * secrets versions access*)",
     "mcp__neon__get_connection_string",
+    "Bash(gcloud*add-iam-policy-binding*)", "Bash(rtk gcloud*add-iam-policy-binding*)",
+    "Bash(gcloud*remove-iam-policy-binding*)", "Bash(rtk gcloud*remove-iam-policy-binding*)",
+    "Bash(gcloud*set-iam-policy*)", "Bash(rtk gcloud*set-iam-policy*)",
+    "Bash(gcloud*service-accounts*keys*create*)", "Bash(rtk gcloud*service-accounts*keys*create*)",
+    "Bash(gcloud*service-accounts*keys*upload*)", "Bash(rtk gcloud*service-accounts*keys*upload*)",
+    "Bash(gcloud*iam*roles*create*)", "Bash(rtk gcloud*iam*roles*create*)",
+    "Bash(gcloud*iam*roles*update*)", "Bash(rtk gcloud*iam*roles*update*)",
+    "Bash(gsutil*iam ch*)", "Bash(rtk gsutil*iam ch*)",
+    "Bash(gsutil*iam set*)", "Bash(rtk gsutil*iam set*)",
+    "Bash(gsutil*acl ch*)", "Bash(rtk gsutil*acl ch*)",
+    "Bash(gsutil*acl set*)", "Bash(rtk gsutil*acl set*)",
+    "Bash(bq*add-iam-policy-binding*)", "Bash(rtk bq*add-iam-policy-binding*)",
+    "Bash(bq*set-iam-policy*)", "Bash(rtk bq*set-iam-policy*)",
+    "Bash(kubectl*create*rolebinding*)", "Bash(rtk kubectl*create*rolebinding*)",
+    "mcp__gcloud__run_gcloud_command",
     "Bash(git worktree add -f*)", "Bash(git worktree add * -f*)",
     "Bash(git worktree remove* -f*)", "Bash(git * worktree remove*)",
 ]
@@ -517,6 +532,28 @@ class StaticGate(Fixture):
         rc, out = self.run_tool("verify", "--live", str(self.live_p), "--baseline", str(self.base_p))
         self.assertEqual(1, rc)
         self.assertIn("baseline ask rules missing", out)
+
+    def test_a_baseline_without_iam_asks_is_refused(self):
+        weak = copy.deepcopy(BASELINE)
+        weak["permissions"]["ask"] = [r for r in weak["permissions"]["ask"] if "iam-policy" not in r]
+        merged = rollout.merge(copy.deepcopy(LIVE), weak, [])
+        self.assertIn("IAM command does not ask", "\n".join(rollout.problems(merged)))
+
+    def test_each_iam_family_is_enforced_independently(self):
+        for family in ("service-accounts*keys*create", "service-accounts*keys*upload", "iam*roles*create", "iam*roles*update",
+                       "gsutil*iam ch", "gsutil*iam set", "gsutil*acl ch", "gsutil*acl set", "bq*add-iam", "bq*set-iam-policy",
+                       "kubectl*create*rolebinding", "remove-iam-policy-binding"):
+            with self.subTest(family=family):
+                weak = copy.deepcopy(BASELINE)
+                weak["permissions"]["ask"] = [r for r in weak["permissions"]["ask"] if family not in r]
+                merged = rollout.merge(copy.deepcopy(LIVE), weak, [])
+                self.assertIn("IAM command does not ask", "\n".join(rollout.problems(merged)))
+
+    def test_dropping_the_mcp_gcloud_ask_is_flagged(self):
+        weak = copy.deepcopy(BASELINE)
+        weak["permissions"]["ask"] = [r for r in weak["permissions"]["ask"] if r != "mcp__gcloud__run_gcloud_command"]
+        merged = rollout.merge(copy.deepcopy(LIVE), weak, [])
+        self.assertIn("mcp__gcloud__run_gcloud_command", "\n".join(rollout.problems(merged)))
 
     def test_catch_all_allow_rules_are_flagged(self):
         merged = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [])

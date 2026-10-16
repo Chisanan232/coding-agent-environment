@@ -83,6 +83,7 @@ fresh, documented decision — not merely to reduce prompts):
 | Repo/resource deletion via API | `gh repo delete`, `gh api … -X DELETE` / `--method DELETE` (both flag orderings) |
 | Infrastructure mutation | `terraform apply` (can mutate/replace production without `destroy`) |
 | Arbitrary cloud execution | `mcp__gcloud__run_gcloud_command` |
+| IAM mutation and credential minting | `add-/remove-iam-policy-binding`, `set-iam-policy` (gcloud, bq), `service-accounts keys create/upload`, `iam roles create/update`, `gsutil iam ch/set` and `acl ch/set`, `kubectl create (cluster)rolebinding`; bare and RTK-rewritten forms |
 | Production monetization | `mcp__polar-production__execute_tool` |
 | Managed-DB/storage deletion | every `mcp__neon__*delete*`/`disable_auth`/`reset_from_parent`/`*_credential`, every `mcp__cloudflare-bindings__*_delete` |
 | Trust-boundary widening | `mcp__github__delete_file`, `create_repository`, `fork_repository`, `mcp__claude_ai_Google_Drive__share_file` |
