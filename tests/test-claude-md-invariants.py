@@ -143,6 +143,11 @@ class ClaudeMdInvariants(unittest.TestCase):
         self.assertIn("scripts/profile-install.sh --claude-skills", readme)
         self.assertIn("base layer", readme)
 
+    def test_bot_pr_maintainer_skill_links_its_reference(self) -> None:
+        text = (ROOT / ".claude/skills/bot-pr-maintainer/SKILL.md").read_text()
+        self.assertIn("(references/bot-pr-policy.md)", text)
+        self.assertTrue((ROOT / ".claude/skills/bot-pr-maintainer/references/bot-pr-policy.md").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
