@@ -110,7 +110,7 @@ PR, test or implementation:
 7. Continue automatically.
 
 A finished subagent task or PR is not campaign completion. Never claim
-`RELEASE_READY` without verified evidence for every acceptance node. Engineering
+`READY_FOR_RELEASE` without verified evidence for every acceptance node. Engineering
 completion implies no new publication or deployment authorization. A merge whose
 pipeline deploys to production or publishes is itself a deployment/publication
 action needing its own Level 3 record or Level 2 packet.

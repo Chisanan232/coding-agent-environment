@@ -50,7 +50,7 @@ Use `release-readiness` for that instead.
    [PROJECT-SPECIFIC — e.g., `pyproject.toml`, `package.json`, `CHANGELOG.md`]
 10. Stage the update.
 11. Commit as an isolated commit:
-    `📝 release: Prepare vX.Y.Z release notes and version bump`
+    `📝 (release): Prepare vX.Y.Z release notes and version bump`
 12. Do not push — the automated release workflow will handle the push and tag.
 
 ### Phase 4 — Handoff to release-watch

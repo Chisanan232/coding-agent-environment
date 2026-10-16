@@ -54,30 +54,29 @@ pass before `dev-impl-loop` begins.
 10. If unassigned or owned by the current authorized identity: proceed to Check 4.
 
 ### Check 4 — Branch, worktree, self-assign, and state transition
-11. Derive the branch name using the four-part format:
+11. Derive the branch name with no change-type segment, as owned by
+    `engineering-workflow`:
     ```
-    <release-or-phase>/<ticket-number>/<type>/<short-summary>
+    <version-or-phase>/<ticket-id>/<short_summary>
     ```
-    - `<release-or-phase>`: for `legacy_uncoordinated`, resolve the existing
+    - `<version-or-phase>`: for `legacy_uncoordinated`, resolve the existing
       `$ENGINEERING_CURRENT_RELEASE` env/marker precedence, then the ticket's
       milestone/sprint field. For managed state, use the bootstrap-resolved
       release if present; otherwise use the ticket's milestone/sprint field.
       Never consult legacy markers when status is `managed` or `unavailable`.
       Store the selected prefix in `RELEASE`. Examples: `v0.1.0`, `phase1`, `sprint3`.
-    - `<ticket-number>`: exact ticket reference (e.g., `TEST-1`, `PROJ-123`, `42`).
-    - `<type>`: GitEmoji category slug for the primary change type —
-      `feat`, `fix`, `refactor`, `test`, `docs`, `config`, `deps`, `remove`, `lint`.
-    - `<short-summary>`: 2–4 words from the ticket title in `snake_case`, max 30 characters.
-    - Examples: `v0.1.0/TEST-1/feat/add_new_endpoint`, `phase1/PROJ-123/fix/auth_token_refresh`
+    - `<ticket-id>`: exact ticket reference (e.g., `TEST-1`, `PROJ-123`, `42`).
+    - `<short_summary>`: 2-4 words from the ticket title in `snake_case`, max 30 characters.
+    - Examples: `v0.1.0/TEST-1/add_new_endpoint`, `phase1/PROJ-123/auth_token_refresh`
 
 12. Create a git worktree and branch for this ticket:
     ```bash
     REPO_ROOT=$(git rev-parse --show-toplevel)
     REPO_NAME=$(basename "$REPO_ROOT")
-    BRANCH_NAME="[release-or-phase]/[ticket-number]/[type]/[short-summary]"
-    # e.g. v0.1.0/TEST-1/feat/add_new_endpoint
+    BRANCH_NAME="[version-or-phase]/[ticket-id]/[short_summary]"
+    # e.g. v0.1.0/TEST-1/add_new_endpoint
 
-    # Worktree path: replace '/' with '-' to avoid creating nested directories
+    # Worktree path <repo>-<phase>-<ticket>-<summary>: replace '/' with '-'
     WORKTREE_SUFFIX=$(echo "$BRANCH_NAME" | tr '/' '-')
     WORKTREE_PATH="${REPO_ROOT}/../${REPO_NAME}-${WORKTREE_SUFFIX}"
 
@@ -88,10 +87,11 @@ pass before `dev-impl-loop` begins.
     ```
 
 13. Assign the ticket to the current session / developer identity.
-14. Transition the ticket state to "In Progress".
-15. The In Progress transition records pickup. Post a comment only if a new
-    scope/dependency decision or blocker needs attention; keep branch/worktree
-    location in local context and the PR, rather than duplicating it in Jira.
+14. When work really starts, apply the `engineering-workflow` Jira lifecycle:
+    transition to "In Progress", post a real start comment, and set the actual
+    Start Date and an estimated Due Date. Never fabricate dates.
+15. Keep branch/worktree location in local context and the PR; the start comment
+    states what is starting, not where the worktree lives.
 
 16. **Bind the ticket reference, release prefix, and worktree path** without
     adopting or overwriting legacy state. Inspect the target host root before

@@ -12,6 +12,8 @@ choice for that work.
 
 ## Start from known state
 
+All repository code changes go through pull requests; never push directly to the
+default or protected branch (main/master); merge only via PR.
 Inspect the repository, its instructions, the ticket, current Git state, and the
 actual base branch before editing. Preserve unfamiliar or uncommitted work. Use an
 isolated worktree for ticketed changes when the repository supports worktrees.
@@ -19,43 +21,47 @@ Resolve and fetch the actual tracking remote; check base-branch CI, ensure requi
 dependencies are installed, and ensure configured hooks are active before
 implementation without disturbing unrelated state.
 
-Name a ticket branch:
+Name a ticket branch with no change-type segment:
 
 ```
-<release-or-phase>/<ticket>/<type>/<2-4_word_snake_summary>
+<version-or-phase>/<ticket-id>/<short_summary>
 ```
 
-Keep the summary at 30 characters or fewer. Resolve the release/phase and ticket
-from the authoritative tracker or established local context; do not invent them.
-Use these established change types and meanings:
+Keep the summary at 2-4 snake_case words and 30 characters or fewer. Resolve the
+version/phase and ticket from the authoritative tracker or established local
+context; do not invent them.
 
-| Type | Gitmoji | Meaning |
-|---|---|---|
-| `feat` | ✨ | Feature |
-| `fix` | 🐛 | Bug fix |
-| `refactor` | ♻️ | Refactor |
-| `test` | ✅ | Tests |
-| `docs` | 📝 | Documentation |
-| `config` | 🔧 | Configuration |
-| `deps` | ⬆️ | Dependencies |
-| `remove` | 🗑️ | Removal |
-| `lint` | 🚨 | Lint or type repair |
-| `security` | 🔒 | Security |
-
-Create the worktree as a sibling of the main checkout and replace `/` in the
-branch name with `-` in the worktree directory name.
+Create the worktree as a sibling of the main checkout. Derive its directory name
+from the branch by replacing `/` with `-`: `<repo>-<phase>-<ticket>-<summary>`.
 
 ## Implement and commit
 
-Keep each commit atomic and bisectable. Put one concern and its necessary tests in
-the same commit. Use imperative summaries under 72 characters:
+Keep each commit atomic and bisectable: one logically small change per commit,
+one new test per commit, and utilities and mocks land in earlier commits than the
+tests that use them. Use imperative summaries under 72 characters:
 
 ```
-<emoji> <scope>: <imperative summary>
+<GitEmoji> (<scope>): <imperative summary>
 ```
+
+Parentheses around the scope are required. Example:
+`✨ (model): Add property to TestModel`.
 
 The 72-character limit applies to the imperative summary, not the entire commit
-subject.
+subject. Choose the GitEmoji by the primary change:
+
+| GitEmoji | Meaning |
+|---|---|
+| ✨ | Feature |
+| 🐛 | Bug fix |
+| ♻️ | Refactor |
+| ✅ | Tests |
+| 📝 | Documentation |
+| 🔧 | Configuration |
+| ⬆️ | Dependencies |
+| 🗑️ | Removal |
+| 🚨 | Lint or type repair |
+| 🔒 | Security |
 
 Do not bypass hooks, security checks, or a genuinely failing product check. Run
 focused checks while iterating, then the repository's full relevant build, lint,
@@ -65,10 +71,20 @@ the current tracking base, and configured pre-commit hooks pass.
 Never force-push a protected, main, or release branch, or during active review.
 Force-pushing a feature branch requires explicit engineer permission.
 
+Public repositories require green CI before merge, except a qualified
+`CI_UNAVAILABLE_EXTERNAL` exception below. Private repositories require the full
+local suite to pass instead.
+
 Classify CI as `CI_UNAVAILABLE_EXTERNAL` only when evidence shows an external
 infrastructure or account condition prevented the job from running or completing.
 Record that cause and run the full local equivalent. A product, test, security, or
 quality failure is never `CI_UNAVAILABLE_EXTERNAL` and must be fixed.
+
+## Delegation
+
+Use at most seven concurrent subagents (dynamic 0-7), with one owner per scope.
+Seven is a ceiling, never a target; choose the count from dependencies, cost,
+expected speedup, mutable-state overlap, and integration overhead.
 
 ## Review and open the pull request
 
@@ -83,7 +99,7 @@ larger work into a reviewable sequence rather than bundling unrelated changes.
 Use this exact pull-request title shape:
 
 ```
-[<ticket-number>] <emoji> <scope>: <imperative summary under 60 chars>
+[<TICKET>] <GitEmoji> (<scope>): <imperative summary under 60 chars>
 ```
 
 The 60-character limit applies to the imperative summary, not the entire title.
@@ -93,13 +109,14 @@ whether its summary actually uses imperative meaning.
 Examples:
 
 ```
-[PROJ-123] ✨ restapi: Add user authentication
-[42] 🐛 api: Fix retry leak
+[PROJ-123] ✨ (restapi): Add user authentication
+[42] 🐛 (api): Fix retry leak
 ```
 
 Use `$evidence-first-briefing` for the body. Lead with resulting behavior or the
 changed boundary. Include actual validation, material risks or unknowns, and issue
-references. Preserve any required repository pull-request template and fields.
+references. Use the repository's `.github/PULL_REQUEST_TEMPLATE.md` when present.
+Preserve any required repository pull-request template and fields otherwise.
 Omit file chronology and unsupported completion claims.
 
 Do not merge until required checks, code-owner approvals, conflict resolution,
@@ -137,6 +154,16 @@ findings, and record the qualifying evidence durably in the PR/tracker. Use
 If either exception lacks its evidence, keep the normal gate pending. Fix a
 genuine failed check rather than reclassifying or bypassing it. No other approval,
 security, production, release, payment, or destructive-operation authority changes.
+
+## Jira lifecycle
+
+When Jira is the tracker: move the ticket to In Progress when work really starts,
+not earlier; post a real start comment describing what is starting; set Start Date
+to the actual date, set an estimated Due Date, and never fabricate dates. An Epic
+or Story cascades In Progress only for items that truly started, and you close a
+ticket only when every acceptance criterion passes, with evidence.
+
+Frontend changes also need the frontend QA evidence defined in `acceptance-validation`.
 
 ## Merge, reconcile, and clean up
 
