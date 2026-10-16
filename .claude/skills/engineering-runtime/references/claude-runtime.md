@@ -154,3 +154,43 @@ bash ~/.claude/hooks/circuit-breaker-gate.sh reset <ticket>
 4. Do not attempt further repairs until the engineer reviews the situation
    and resets the breaker.
 
+## Session Memory
+
+Claude Code can persist notes for a ticket across interrupted sessions using the
+`session-memory.sh` utility. Notes survive context resets and process restarts.
+
+### When to use
+
+- When beginning work on a ticket that was previously interrupted.
+- When the circuit breaker trips — record why before stopping.
+- When a meaningful decision is made mid-session that future sessions should know.
+
+### How to use
+
+```bash
+# Surface prior notes at session start
+bash ~/.claude/hooks/session-memory.sh read "$TICKET"
+
+# Append a decision or blocker note
+bash ~/.claude/hooks/session-memory.sh append "$TICKET" "Section title" "Body text"
+
+# Clear notes after the ticket is fully closed
+bash ~/.claude/hooks/session-memory.sh clear "$TICKET"
+
+# List all tickets with active session notes
+bash ~/.claude/hooks/session-memory.sh list
+```
+
+### Notes storage
+
+Notes are stored as Markdown in `${CLAUDE_SESSION_NOTES_DIR:-~/.claude/session-notes}/<ticket>.md`.
+Each note has a frontmatter header and timestamped sections.
+
+### What session notes do not replace
+
+- **Workflow state** — which phase the skill is in. Use `workflow-state.sh`.
+- **Decision log** — why each phase decision was made. Use `decision-log.sh`.
+- **Git history** — what code was committed. Use `git log`.
+- Session notes capture **conversational context** (decisions, blockers, partial
+  work completed) that is not represented in any of the above.
+
