@@ -282,6 +282,16 @@ class Fixture(unittest.TestCase):
         self.assertIn('verify OK', text)
         self.assertIn('mode file: absent', text)
 
+    def test_verify_fails_before_apply_and_for_a_duplicate_entry(self):
+        self.assertEqual(self.run_cli('verify')[0], 1)
+        self.assertEqual(self.apply()[0], 0)
+        data = json.loads(self.live.read_text())
+        data['hooks']['PreToolUse'].append(hr.gate_group())
+        self.live.write_text(json.dumps(data, indent=2) + '\n')
+        code, text = self.run_cli('verify')
+        self.assertEqual(code, 1)
+        self.assertIn('found 2', text)
+
 
 if __name__ == '__main__':
     unittest.main()
