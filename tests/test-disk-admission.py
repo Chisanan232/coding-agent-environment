@@ -145,6 +145,11 @@ class Volume(unittest.TestCase):
             da.read_free_bytes()
         statvfs.assert_called_once_with('/')
 
+    def test_unreadable_volume_fails_closed(self):
+        with mock.patch.object(da.os, 'statvfs', side_effect=PermissionError('denied')):
+            with self.assertRaises(da.VolumeError):
+                da.read_free_bytes()
+
 
 if __name__ == '__main__':
     unittest.main()
