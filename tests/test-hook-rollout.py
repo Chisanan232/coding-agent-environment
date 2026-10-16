@@ -47,6 +47,16 @@ class Pure(unittest.TestCase):
         # The input is not mutated.
         self.assertEqual(len(LIVE['hooks']['PreToolUse']), 3)
 
+    def test_gate_state_distinguishes_absent_installed_and_conflict(self):
+        self.assertEqual(hr.gate_state(LIVE), 'absent')
+        self.assertEqual(hr.gate_state(hr.with_gate(LIVE)), 'installed')
+        twice = hr.with_gate(hr.with_gate(LIVE))
+        self.assertEqual(hr.gate_state(twice), 'conflict')
+        other = json.loads(json.dumps(LIVE))
+        other['hooks']['PreToolUse'].append({'matcher': 'Bash', 'hooks': [
+            {'type': 'command', 'command': 'python3 ~/.claude/hooks/disk-admission-gate.py --admission-dir /x'}]})
+        self.assertEqual(hr.gate_state(other), 'conflict')
+
 
 if __name__ == '__main__':
     unittest.main()
