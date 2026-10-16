@@ -661,6 +661,17 @@ class HarnessWorkdir(unittest.TestCase):
         self.assertEqual((victim / 'fx/precious.txt').read_text(), 'keep')
         self.assertEqual((victim / 'notes.txt').read_text(), 'keep')
 
+    def test_a_fresh_directory_is_claimed_and_reused_without_touching_other_files(self):
+        work = self.base / 'run'
+        self.assertEqual(self.harness.claim_workdir(work), work)
+        self.assertTrue((work / self.harness.SENTINEL).is_file())
+        (work / 'sandbox-admission').mkdir()
+        (work / 'sandbox-admission/old').write_text('stale')
+        (work / 'unrelated.txt').write_text('keep')
+        self.harness.claim_workdir(work)
+        self.assertFalse((work / 'sandbox-admission').exists())
+        self.assertEqual((work / 'unrelated.txt').read_text(), 'keep')
+
 
 if __name__ == '__main__':
     unittest.main()
