@@ -89,6 +89,7 @@ MANIFEST = [
     ("no-hardcoded-ticket", ".claude/skills/engineering-runtime/references/claude-runtime.md", "Skills\nmust never hardcode a ticket ref", "claude-runtime reference"),
     ("bot-no-manual-lockfile", ".claude/skills/bot-pr-maintainer/references/bot-pr-policy.md", "Do not manually resolve lock-file conflicts in bot PRs", "bot-pr-policy"),
     ("bot-escalate-on-update-failure", ".claude/skills/bot-pr-maintainer/references/bot-pr-policy.md", "escalate to the engineer", "bot-pr-policy"),
+    ("cross-repo-qa-gate", ".claude/skills/cross-repo-coordinator/references/cross-repo-work.md", "Every per-repo sub-ticket has passed QA.", "cross-repo-work"),
     ("cross-repo-integration-gate", ".claude/skills/cross-repo-coordinator/references/cross-repo-work.md", "Integration tests pass", "cross-repo-work"),
     ("tests-no-disabling", ".claude/skills/feature-implementation/references/quality-policies.md", "Do not disable failing tests.", "quality-policies"),
     ("tests-regression", ".claude/skills/feature-implementation/references/quality-policies.md", "All bug fixes require a regression test.", "quality-policies"),
