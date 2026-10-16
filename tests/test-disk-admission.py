@@ -694,6 +694,12 @@ class FreshnessCli(unittest.TestCase):
         self.assertIn('stale', text)
         self.assertEqual(self.check('--max-age', '600')[0], 0)
 
+    def test_missing_snapshot_exits_77(self):
+        code, text = self.check()
+        self.assertEqual(code, 77)
+        self.assertIn('unusable', text)
+        self.assertFalse(self.path.parent.exists())
+
 
 if __name__ == '__main__':
     unittest.main()
