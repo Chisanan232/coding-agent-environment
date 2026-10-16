@@ -274,6 +274,47 @@ def verify(args):
     return 1 if problems else 0
 
 
+def rollback(args):
+    if not args.receipt:
+        print('rollback needs --receipt')
+        return 2
+    receipt = json.loads(Path(args.receipt).read_text())
+    live_p, dest = Path(receipt['live']), Path(receipt['hook_dest'])
+    message = redirected(live_p, dest)
+    if message:
+        print(message)
+        return 4
+    backup, hook_backup = receipt.get('settings_backup'), receipt.get('hook_backup')
+    data = hook_data = None
+    if backup:
+        data = Path(backup).read_bytes()
+        if sha_bytes(data) != receipt['settings_sha_before']:
+            print('REFUSING: the settings backup no longer matches its recorded hash')
+            return 3
+        json.loads(data)
+    if hook_backup:
+        hook_data = Path(hook_backup).read_bytes()
+    if data is not None and live_p.exists() and live_p.read_bytes() != data:
+        saved = live_p.with_name('%s.pre-rollback.%d' % (live_p.name, time.time_ns()))
+        rollout.write_new(saved, live_p.read_bytes(), live_p.stat().st_mode & 0o777)
+        print('current settings saved to %s' % saved)
+        rollout.atomic_write(live_p, data)
+        print('restored %s from %s' % (live_p, backup))
+    elif data is not None:
+        print('settings already match the backup; nothing to restore')
+    if hook_data is not None:
+        if not dest.exists() or dest.read_bytes() != hook_data:
+            install_bytes(dest, hook_data, 0o755)
+            print('restored %s from %s' % (dest, hook_backup))
+    elif receipt.get('hook_created') and dest.exists():
+        if rollout.sha(dest) == receipt['hook_sha_installed']:
+            dest.unlink()
+            print('removed %s (created by apply)' % dest)
+        else:
+            print('left %s in place: it no longer matches what apply installed' % dest)
+    return 0
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.mode == 'plan':
@@ -282,6 +323,8 @@ def main(argv=None):
         return apply(args)
     if args.mode == 'verify':
         return verify(args)
+    if args.mode == 'rollback':
+        return rollback(args)
     print('mode %s is not available yet' % args.mode)
     return 2
 
