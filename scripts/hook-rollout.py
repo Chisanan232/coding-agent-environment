@@ -24,6 +24,8 @@ from pathlib import Path
 import pwd
 import re
 import sys
+import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parent.parent
 _spec = spec_from_file_location('permission_rollout', ROOT / 'scripts/permission-rollout.py')
@@ -136,10 +138,110 @@ def plan(args):
     return 0
 
 
+def redirected(*paths):
+    """Message for the first path (or its parent directory) that is a symlink."""
+    for path in paths:
+        for candidate in (path, path.parent):
+            if candidate.is_symlink():
+                return 'REFUSING: %s is a symlink; resolve it and pass the real path' % candidate
+    return None
+
+
+def install_bytes(path, data, mode):
+    """Private temp sibling, fsync, mode set before the rename, then fsync of the directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=path.name + '.hookroll.', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+        raise
+
+
+def apply(args):
+    live_p, src, dest = Path(args.live), Path(args.hook_src), Path(args.hook_dest)
+    message = redirected(live_p, dest)
+    if message:
+        print(message)
+        return 4
+    raw_bytes = live_p.read_bytes()
+    raw = raw_bytes.decode()
+    try:
+        live = json.loads(raw)
+    except ValueError as exc:
+        print('REFUSING: live settings are not valid JSON: %s' % exc)
+        return 6
+    state = gate_state(live)
+    if state == 'conflict':
+        print('REFUSING: the settings already hold a different disk-admission-gate entry')
+        return 2
+    if mode_state(Path(args.mode_file)) == 'enforce' and not args.allow_enforce:
+        print('REFUSING: the mode file says enforce; the staged rollout starts in WARN (pass --allow-enforce to override)')
+        return 9
+    hook_bytes = src.read_bytes()
+    hook_sha, live_sha = sha_bytes(hook_bytes), sha_bytes(raw_bytes)
+    dest_sha = rollout.sha(dest) if dest.exists() else None
+    if state == 'installed' and dest_sha == hook_sha:
+        print('already installed: settings entry present once and hook file identical; nothing changed')
+        return 0
+    if not args.unmerged_ok:
+        why = rollout.baseline_not_merged(src)
+        if why:
+            print('REFUSING: %s. Deploy only a merged hook file (or pass --unmerged-ok for a rehearsal on a copy).' % why)
+            return 7
+    if args.expect_hook_sha != hook_sha or (state == 'absent' and args.expect_live_sha != live_sha):
+        print('REFUSING: --expect-hook-sha / --expect-live-sha do not match the inputs; re-review required')
+        return 3
+    new_text = None
+    if state == 'absent':
+        if serialise(live, raw) != raw and not args.allow_reformat:
+            print('REFUSING: re-serialising the settings would change unrelated formatting; pass --allow-reformat')
+            return 8
+        new_text = serialise(with_gate(live), raw)
+    backups = Path(args.backup_dir)
+    backups.mkdir(parents=True, exist_ok=True)
+    stamp = time.time_ns()
+    receipt = {'schema': 1, 'live': str(live_p), 'settings_backup': None, 'settings_sha_before': live_sha,
+               'hook_dest': str(dest), 'hook_backup': None, 'hook_created': dest_sha is None,
+               'hook_sha_installed': hook_sha}
+    if new_text is not None:
+        receipt['settings_backup'] = str(backups / ('settings.json.pre-SPE-109.%d' % stamp))
+        rollout.write_new(Path(receipt['settings_backup']), raw_bytes, live_p.stat().st_mode & 0o777)
+    if dest_sha is not None and dest_sha != hook_sha:
+        receipt['hook_backup'] = str(backups / ('disk-admission-gate.py.pre-SPE-109.%d' % stamp))
+        rollout.write_new(Path(receipt['hook_backup']), dest.read_bytes(), dest.stat().st_mode & 0o777)
+    if live_p.read_bytes() != raw_bytes:
+        print('REFUSING: the live file changed while the install was prepared; nothing was written')
+        return 5
+    if dest_sha != hook_sha:
+        install_bytes(dest, hook_bytes, 0o755)
+    if new_text is not None:
+        rollout.atomic_write(live_p, new_text.encode())
+        receipt['settings_sha_after'] = sha_bytes(new_text.encode())
+    receipt_path = backups / ('disk-admission-gate.receipt.%d.json' % stamp)
+    rollout.write_new(receipt_path, (json.dumps(receipt, indent=2) + '\n').encode(), 0o600)
+    print('applied | receipt %s | rollback: python3 %s rollback --live %s --receipt %s' % (
+        receipt_path, sys.argv[0], live_p, receipt_path))
+    return 0
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.mode == 'plan':
         return plan(args)
+    if args.mode == 'apply':
+        return apply(args)
     print('mode %s is not available yet' % args.mode)
     return 2
 
