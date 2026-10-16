@@ -203,6 +203,13 @@ class ClaudeMdInvariants(unittest.TestCase):
         self.assertEqual(len(claude_md_copy_commands(scratch)), 1)
         self.assertEqual(claude_md_copy_commands((ROOT / "README.md").read_text()), [])
 
+    def test_readme_states_that_the_claude_installer_also_overwrites_shared_skills(self) -> None:
+        readme = " ".join((ROOT / "README.md").read_text().split())
+        self.assertIn("overwrites every shared skill file under `~/.claude/skills`", readme)
+        self.assertIn("saves a backup of replaced files", readme)
+        self.assertIn("--dry-run` or `--check` first", readme)
+        self.assertNotIn("reads only the block", readme)
+
 
 if __name__ == "__main__":
     unittest.main()
