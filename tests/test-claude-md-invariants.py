@@ -109,6 +109,13 @@ def normalized(path: str) -> str:
     return " ".join((ROOT / path).read_text().split())
 
 
+def claude_md_copy_commands(text: str) -> list[str]:
+    """Return `cp` commands (backslash continuations joined) that copy CLAUDE.md into ~/.claude."""
+    joined = re.sub(r"\\\n\s*", " ", text)
+    commands = re.findall(r"^\s*cp\b[^\n]*", joined, re.MULTILINE)
+    return [" ".join(c.split()) for c in commands if "CLAUDE.md" in c and "~/.claude" in c]
+
+
 class ClaudeMdInvariants(unittest.TestCase):
     def test_manifest_has_unique_ids(self) -> None:
         ids = [clause[0] for clause in MANIFEST]
@@ -138,10 +145,7 @@ class ClaudeMdInvariants(unittest.TestCase):
 
     def test_readme_never_tells_readers_to_copy_claude_md_over_the_live_file(self) -> None:
         readme = (ROOT / "README.md").read_text()
-        for match in re.finditer(r"^\s*cp\b[^\n]*(?:\\\n[^\n]*)*", readme, re.MULTILINE):
-            with self.subTest(command=match.group(0)[:60]):
-                command = " ".join(match.group(0).replace("\\\n", " ").split())
-                self.assertFalse("CLAUDE.md" in command and "~/.claude" in command)
+        self.assertEqual(claude_md_copy_commands(readme), [])
         self.assertIn("scripts/profile-install.sh --claude-skills", readme)
         self.assertIn("base layer", readme)
 
