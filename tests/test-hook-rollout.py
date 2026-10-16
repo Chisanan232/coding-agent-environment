@@ -147,6 +147,18 @@ class Fixture(unittest.TestCase):
         self.assertEqual(data['settings_sha_before'], hashlib.sha256(before).hexdigest())
         self.assertTrue(data['hook_created'])
 
+    def test_apply_preserves_every_other_hook_and_the_pretooluse_order(self):
+        self.assertEqual(self.apply()[0], 0)
+        new = json.loads(self.live.read_text())
+        self.assertEqual(new['hooks']['PreToolUse'][:3], LIVE['hooks']['PreToolUse'])
+        commands = [h['command'] for g in new['hooks']['PreToolUse'] for h in g['hooks']]
+        self.assertEqual(commands, ['rtk hook claude', '~/.claude/hooks/cbm-code-discovery-gate',
+                                    '~/.claude/hooks/fornax-guard', 'python3 ~/.claude/hooks/disk-admission-gate.py'])
+        self.assertEqual(new['hooks']['PostToolUse'], LIVE['hooks']['PostToolUse'])
+        self.assertEqual(new['hooks']['SessionStart'], LIVE['hooks']['SessionStart'])
+        self.assertEqual(new['permissions'], LIVE['permissions'])
+        self.assertEqual(new['statusLine'], LIVE['statusLine'])
+
 
 if __name__ == '__main__':
     unittest.main()
