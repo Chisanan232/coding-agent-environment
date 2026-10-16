@@ -425,6 +425,10 @@ class GateInputs(unittest.TestCase):
         self.assertIn('shared target', json.loads(out)['hookSpecificOutput']['additionalContext'])
 
 
+    def test_adapter_is_resolved_from_this_checkout(self):
+        self.assertEqual(gate.adapter_path(), ROOT / 'scripts/disk-admission.py')
+
+
 
 if __name__ == '__main__':
     unittest.main()
