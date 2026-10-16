@@ -332,6 +332,14 @@ class Fixture(unittest.TestCase):
         self.assertFalse(self.dest.exists())
         self.assertEqual(len([p for p in self.live.parent.iterdir() if '.pre-rollback.' in p.name]), 1)
 
+    def test_rollback_restores_a_previous_hook_file(self):
+        self.dest.parent.mkdir()
+        self.dest.write_text('old hook')
+        os.chmod(self.dest, 0o700)
+        self.assertEqual(self.apply()[0], 0)
+        self.assertEqual(self.run_cli('rollback', '--receipt', str(self.receipt()))[0], 0)
+        self.assertEqual(self.dest.read_text(), 'old hook')
+
 
 if __name__ == '__main__':
     unittest.main()
