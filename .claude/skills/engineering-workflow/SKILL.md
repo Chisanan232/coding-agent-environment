@@ -34,7 +34,9 @@ from the branch by replacing `/` with `-`: `<repo>-<phase>-<ticket>-<summary>`.
 
 ## Implement and commit
 
-Keep each commit atomic and bisectable. Use imperative summaries under 72 characters:
+Keep each commit atomic and bisectable: one logically small change per commit,
+one new test per commit, and utilities and mocks land in earlier commits than the
+tests that use them. Use imperative summaries under 72 characters:
 
 ```
 <GitEmoji> (<scope>): <imperative summary>
