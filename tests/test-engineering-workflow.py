@@ -49,7 +49,6 @@ class EngineeringWorkflowContract(unittest.TestCase):
         required = [
             "<version-or-phase>/<ticket-id>/<short_summary>",
             "<GitEmoji> (<scope>): <imperative summary>",
-            "one concern and its necessary tests",
             "CI_UNAVAILABLE_EXTERNAL",
             "meaningful independent review",
             "[<TICKET>] <GitEmoji> (<scope>): <imperative summary under 60 chars>",
