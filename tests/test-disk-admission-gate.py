@@ -492,6 +492,15 @@ class AdmissionDirFlag(unittest.TestCase):
         self.assertEqual((code, out), (2, ''))
         self.assertIn('BLOCKED', err)
 
+    def test_sandbox_directory_is_protected_from_tampering(self):
+        command = 'echo warn > %s/mode' % self.dir
+        (self.dir / 'mode').write_text('enforce')
+        code, out, err = self.run_gate(command, lambda: (0, 'ok'))
+        self.assertEqual(code, 2)
+        self.assertIn('tamper-suspect', err)
+        # Negative control: reading the same file is fine.
+        self.assertEqual(self.run_gate('cat %s/mode' % self.dir, lambda: (0, 'ok')), (0, '', ''))
+
 
 
 if __name__ == '__main__':
