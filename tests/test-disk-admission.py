@@ -99,6 +99,18 @@ class State(unittest.TestCase):
         self.assertEqual(json.loads(self.path.read_text()), record)
         self.assertEqual(sorted(entry.name for entry in self.path.parent.iterdir()), ['state.json', 'state.json.lock'])
 
+    def test_corrupt_state_fails_closed(self):
+        self.assertEqual(da.read_state(self.path), {})
+        self.write(150 * GIB, False)
+        self.assertEqual(da.read_state(self.path)['latch'], False)
+        bad = ['', '{not json', '[]', 'null', json.dumps({'version': 2, 'latch': False}),
+               json.dumps({'version': 1, 'latch': 'no', 'free_bytes': 1, 'tier': 'low', 'timestamp': 't'}),
+               json.dumps({'version': 1, 'latch': False, 'free_bytes': 1, 'tier': 'huge', 'timestamp': 't'})]
+        for content in bad:
+            self.path.write_text(content)
+            with self.assertRaises(da.StateError, msg=content):
+                da.read_state(self.path)
+
 
 if __name__ == '__main__':
     unittest.main()
