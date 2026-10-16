@@ -526,6 +526,16 @@ class Reservations(unittest.TestCase):
         self.assertTrue(admitted['admit'], admitted)
         self.assertEqual(admitted['reserved_bytes'], 50 * GIB)
 
+    def test_second_heavy_lane_refused_until_release(self):
+        self.assertTrue(self.take('job-one', 10 * GIB, 300 * GIB)['admit'])
+        second = self.take('job-two', 10 * GIB, 300 * GIB)
+        self.assertFalse(second['admit'])
+        self.assertIn('lane-cap', second['reason'])
+        self.assertTrue(da.release('job-one', self.path)['admit'])
+        self.assertTrue(self.take('job-two', 10 * GIB, 300 * GIB)['admit'])
+        # A host below the stable tier has no heavy lane at all.
+        self.assertIn('refused', self.take('job-low', 1 * GIB, 60 * GIB)['reason'])
+
 
 if __name__ == '__main__':
     unittest.main()
