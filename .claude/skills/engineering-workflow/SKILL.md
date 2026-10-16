@@ -158,7 +158,7 @@ security, production, release, payment, or destructive-operation authority chang
 When Jira is the tracker: move the ticket to In Progress when work really starts,
 not earlier; post a real start comment describing what is starting; set Start Date
 to the actual date; and set an estimated Due Date; never fabricate dates. An Epic or Story cascades
-In Progress only for items that truly started. Rule: close a ticket only when
+In Progress only for items that truly started, and you close a ticket only when
 every acceptance criterion passes, with evidence.
 
 ## Merge, reconcile, and clean up
