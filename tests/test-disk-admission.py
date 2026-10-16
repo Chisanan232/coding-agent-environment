@@ -637,6 +637,18 @@ class Snapshots(unittest.TestCase):
                          (None, None, 0, None))
         self.assertIn('volume-unreadable', closed['blockers'][0])
 
+    def test_snapshot_freshness_rule(self):
+        record = self.shot(300 * GIB)
+        at = lambda seconds: self.now + timedelta(seconds=seconds)
+        self.assertTrue(da.snapshot_is_fresh(record, at(0)))
+        self.assertTrue(da.snapshot_is_fresh(record, at(120)))
+        # Negative controls: just past the limit, far in the future, and malformed.
+        self.assertFalse(da.snapshot_is_fresh(record, at(121)))
+        self.assertFalse(da.snapshot_is_fresh(record, at(-60)))
+        self.assertFalse(da.snapshot_is_fresh({'ts': 'yesterday'}, at(0)))
+        self.assertFalse(da.snapshot_is_fresh({}, at(0)))
+        self.assertEqual(da.snapshot_age_s(record, at(45)), 45)
+
 
 if __name__ == '__main__':
     unittest.main()
