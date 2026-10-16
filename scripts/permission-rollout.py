@@ -136,6 +136,18 @@ IAM_COMMANDS = [
     "gcloud projects remove-iam-policy-binding p --member=m --role=r",
     "gcloud projects set-iam-policy p f.json",
     "gcloud iam service-accounts keys create k.json --iam-account=s",
+    "gcloud iam service-accounts --project=p keys create k.json --iam-account=s",
+    "gcloud iam service-accounts keys upload k.pem --iam-account=s",
+    "gcloud iam roles create r --project=p",
+    "gsutil iam ch allUsers:objectViewer gs://b",
+    "bq add-iam-policy-binding --member=m --role=r p:d.t",
+    "kubectl create clusterrolebinding crb --clusterrole=cluster-admin --user=u",
+    "gcloud iam roles update r --project=p --add-permissions=x",
+    "gsutil iam set policy.json gs://b",
+    "gsutil acl ch -u AllUsers:R gs://b/o",
+    "gsutil acl set public-read gs://b/o",
+    "bq set-iam-policy p:d.t policy.json",
+    "gcloud projects remove-iam-policy-binding p --member=m --role=r",
 ]
 
 
@@ -316,6 +328,8 @@ def problems(live, base=None):
         for pre in ("", "rtk "):
             if static_decision(pre + cmd, p) != "ask":
                 out.append(f"IAM command does not ask: {pre + cmd!r} -> {static_decision(pre + cmd, p)}")
+    if "mcp__gcloud__run_gcloud_command" not in p.get("ask", []):
+        out.append("mcp__gcloud__run_gcloud_command is not ask-gated (same power as the Bash route)")
     if "mcp__neon__get_connection_string" not in p.get("ask", []):
         out.append("mcp__neon__get_connection_string is not ask-gated")
     if any(r.startswith(("Bash(git push", "Bash(rtk git push")) for r in p.get("allow", [])):
