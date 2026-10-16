@@ -48,6 +48,14 @@ class ClauseDrift(unittest.TestCase):
         self.overlay.unlink()
         self.assertEqual(self.report().returncode, 1)  # negative control: same live file, no overlay
 
+    def test_overlay_keyword_missing_from_live_is_flagged_by_hash(self) -> None:
+        self.live.write_text("## Workflow Path\n")
+        self.overlay.write_text("<!-- clause-keywords: SYNTHETIC-KEYWORD-ONE, Workflow Path -->\n")
+        result = self.report()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(result.stdout.count("MISSING overlay keyword"), 1)
+        self.assertNotIn("SYNTHETIC-KEYWORD-ONE", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
