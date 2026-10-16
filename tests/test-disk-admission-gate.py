@@ -417,6 +417,14 @@ class GateInputs(unittest.TestCase):
         self.assertEqual(self.gate_main(raw)[0], 2)  # the adapter was reached and its failure closed
 
 
+    def test_target_dir_advice_never_denies_in_enforce(self):
+        raw = json.dumps({'tool_name': 'Bash',
+                          'tool_input': {'command': 'CARGO_TARGET_DIR=/private/tmp/never-existed-x cargo build'}})
+        code, out, err = self.gate_main(raw, runner=lambda: (0, 'ok'))
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('shared target', json.loads(out)['hookSpecificOutput']['additionalContext'])
+
+
 
 if __name__ == '__main__':
     unittest.main()
