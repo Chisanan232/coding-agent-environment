@@ -687,6 +687,13 @@ class FreshnessCli(unittest.TestCase):
         self.assertEqual(self.check()[0], 0)
         self.assertEqual(self.check('--max-age', '60')[0], 0)
 
+    def test_stale_snapshot_exits_77(self):
+        self.publish(300)
+        code, text = self.check()
+        self.assertEqual(code, 77)
+        self.assertIn('stale', text)
+        self.assertEqual(self.check('--max-age', '600')[0], 0)
+
 
 if __name__ == '__main__':
     unittest.main()
