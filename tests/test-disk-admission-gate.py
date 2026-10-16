@@ -350,6 +350,13 @@ class Uncertain(unittest.TestCase):
         self.assertEqual((light['heavy'], light['confidence']), (False, 'oversize'))
         self.assertEqual(self.run_gate(filler + 'cargo build', 'enforce', self.refuses)[0], 2)
 
+    def test_undecodable_bytes_in_the_payload_do_not_hide_a_heavy_command(self):
+        payload = b'{"tool_name": "Bash", "tool_input": {"command": "echo \xff\xfe; cargo build"}}'
+        out, err = io.StringIO(), io.StringIO()
+        code = gate.main(payload, out, err, mode_fn=lambda: 'enforce', runner=self.refuses)
+        self.assertEqual(code, 2)
+        self.assertIn('BLOCKED', err.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()
