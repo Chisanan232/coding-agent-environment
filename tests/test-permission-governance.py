@@ -70,7 +70,18 @@ MANDATORY_IAM_ASK = {
     "Bash(gcloud*add-iam-policy-binding*)", "Bash(rtk gcloud*add-iam-policy-binding*)",
     "Bash(gcloud*remove-iam-policy-binding*)", "Bash(rtk gcloud*remove-iam-policy-binding*)",
     "Bash(gcloud*set-iam-policy*)", "Bash(rtk gcloud*set-iam-policy*)",
-    "Bash(gcloud*service-accounts keys create*)", "Bash(rtk gcloud*service-accounts keys create*)",
+    "Bash(gcloud*service-accounts*keys*create*)", "Bash(rtk gcloud*service-accounts*keys*create*)",
+    "Bash(gcloud*service-accounts*keys*upload*)", "Bash(rtk gcloud*service-accounts*keys*upload*)",
+    "Bash(gcloud*iam*roles*create*)", "Bash(rtk gcloud*iam*roles*create*)",
+    "Bash(gcloud*iam*roles*update*)", "Bash(rtk gcloud*iam*roles*update*)",
+    "Bash(gsutil*iam ch*)", "Bash(rtk gsutil*iam ch*)",
+    "Bash(gsutil*iam set*)", "Bash(rtk gsutil*iam set*)",
+    "Bash(gsutil*acl ch*)", "Bash(rtk gsutil*acl ch*)",
+    "Bash(gsutil*acl set*)", "Bash(rtk gsutil*acl set*)",
+    "Bash(bq*add-iam-policy-binding*)", "Bash(rtk bq*add-iam-policy-binding*)",
+    "Bash(bq*set-iam-policy*)", "Bash(rtk bq*set-iam-policy*)",
+    "Bash(kubectl*create*rolebinding*)", "Bash(rtk kubectl*create*rolebinding*)",
+    "mcp__gcloud__run_gcloud_command",
 }
 
 # Patterns that would reproduce SPE-83: any allow rule RTK's self-decision
@@ -530,13 +541,37 @@ class SPE105EffectiveBehavior(unittest.TestCase):
             "gcloud organizations add-iam-policy-binding 1 --member=user:a@example.com --role=roles/owner",
             "gcloud projects remove-iam-policy-binding p --member=user:a@example.com --role=roles/viewer",
             "gcloud projects set-iam-policy p policy.json",
-            "gcloud iam service-accounts keys create key.json --iam-account=sa@p.iam",
+            "gcloud storage buckets add-iam-policy-binding gs://b --member=allUsers --role=roles/storage.objectViewer",
+            "gsutil iam ch allUsers:objectViewer gs://b", "gsutil iam set policy.json gs://b",
+            "gsutil -m acl ch -u AllUsers:R gs://b/o", "gsutil acl set public-read gs://b/o",
+            "bq add-iam-policy-binding --member=user:a@example.com --role=roles/bigquery.dataViewer p:d.t",
+            "bq set-iam-policy p:d.t policy.json",
+            "kubectl create rolebinding rb --clusterrole=admin --user=u",
+            "kubectl -n ns create clusterrolebinding crb --clusterrole=cluster-admin --user=u",
         ])
+
+    def test_key_minting_and_role_edits_ask_with_interleaved_flags_and_extra_spacing(self):
+        """Reviewer finding: literal spaces inside a glob let double spacing or a flag
+        between the words slip past; the key/role rules use `*` between words."""
+        self.assertDecision("ask", [
+            "gcloud iam service-accounts keys create key.json --iam-account=sa@p.iam",
+            "gcloud iam service-accounts  keys create key.json --iam-account=sa@p.iam",
+            "gcloud iam service-accounts --project=p keys create key.json --iam-account=sa@p.iam",
+            "gcloud iam service-accounts keys --project=p create key.json --iam-account=sa@p.iam",
+            "gcloud beta iam service-accounts keys upload pub.pem --iam-account=sa@p.iam",
+            "gcloud iam roles create custom --project=p --permissions=resourcemanager.projects.setIamPolicy",
+            "gcloud --project=p iam roles update custom --add-permissions=iam.serviceAccounts.actAs",
+        ])
+
+    def test_the_mcp_gcloud_route_has_the_same_gate(self):
+        self.assertIn("mcp__gcloud__run_gcloud_command", self.perm["ask"])
 
     def test_read_only_iam_commands_stay_unprompted(self):
         for cmd in ("gcloud projects get-iam-policy p", "gcloud iam roles describe roles/viewer",
                     "gcloud iam service-accounts list", "gcloud iam service-accounts keys list --iam-account=sa@p.iam",
-                    "gcloud projects describe p"):
+                    "gcloud projects describe p", "gsutil ls gs://bucket", "gsutil iam get gs://bucket", "bq ls", "bq show p:d.t",
+                    "kubectl get rolebindings -A", "kubectl get clusterrolebinding", "kubectl describe rolebinding rb",
+                    "gcloud iam roles describe roles/viewer", "gcloud iam roles list"):
             for pre in ("", "rtk "):
                 with self.subTest(cmd=pre + cmd):
                     self.assertNotEqual("ask", static_decision(pre + cmd, self.perm))
