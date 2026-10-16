@@ -146,3 +146,21 @@ def read_state(path):
     if not valid:
         raise StateError('state has the wrong schema')
     return record
+
+
+DATA_VOLUME = '/System/Volumes/Data'
+
+
+class VolumeError(Exception):
+    """Free space could not be measured, so nothing can be admitted."""
+
+
+def read_free_bytes():
+    # On Darwin `/` is the sealed system volume and sits near 5% forever; the
+    # data volume is the one that fills up.
+    mount = DATA_VOLUME if os.path.exists(DATA_VOLUME) else '/'
+    try:
+        stats = os.statvfs(mount)
+    except OSError as exc:
+        raise VolumeError('cannot read free space on %s: %s' % (mount, exc))
+    return stats.f_bavail * stats.f_frsize
