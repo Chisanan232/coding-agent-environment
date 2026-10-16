@@ -332,6 +332,22 @@ class Hardening(unittest.TestCase):
         self.assertNotIn('aa-qa', relative)
         self.assertEqual(relative, '.cache/coding-agent-environment/admission/state.json')
 
+    def test_stuck_lock_holder_refuses_without_hanging(self):
+        import fcntl
+        self.path.parent.mkdir(parents=True)
+        holder = os.open(str(self.path) + '.lock', os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        started = time.monotonic()
+        with mock.patch.object(da, 'LOCK_TIMEOUT', 0.3):
+            result = da.evaluate('light', self.path, lambda: 500 * GIB)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertFalse(result['admit'])
+        self.assertIn('state-lock-timeout', result['reason'])
+        # Negative control: once the holder lets go the same call admits.
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        self.assertTrue(da.evaluate('light', self.path, lambda: 500 * GIB)['admit'])
+
 
 if __name__ == '__main__':
     unittest.main()
