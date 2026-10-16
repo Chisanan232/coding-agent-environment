@@ -40,7 +40,13 @@ import subprocess
 import sys
 
 OPERATORS = {';', '&&', '||', '|', '&', '(', ')', '|&', ';;', '\n'}
-WRAPPERS = {'env', 'time', 'command', 'nohup', 'nice', 'exec', 'rtk', 'sudo'}
+WRAPPERS = {'env', 'time', 'command', 'nohup', 'nice', 'exec', 'rtk', 'sudo', 'timeout', 'watch'}
+# Wrapper options that consume the next token.
+WRAPPER_VALUE_OPTIONS = {
+    'nice': ('-n', '--adjustment'), 'env': ('-u', '-C'), 'exec': ('-a',), 'timeout': ('-s', '-k'),
+    'watch': ('-n', '--interval'),
+    'sudo': ('-u', '-g', '-h', '-p', '-C', '-D', '-R', '-T', '-U', '--user', '--group'),
+}
 SHELLS = {'bash', 'sh', 'zsh', 'dash'}
 # Control-flow words that precede a command in a compound statement.
 KEYWORDS = {'{', '!', 'if', 'then', 'else', 'elif', 'do', 'while', 'until'}
@@ -147,21 +153,30 @@ def _is_assignment(token):
 
 
 def _command_words(tokens):
-    """Env assignments and wrappers stripped; returns (assignments, words)."""
+    """Env assignments, keywords and wrappers stripped; returns (assignments, words)."""
     assignments, index = [], 0
     while index < len(tokens):
         token = tokens[index]
         if token in KEYWORDS:
-            pass
+            index += 1
         elif _is_assignment(token):
             assignments.append(token)
+            index += 1
         elif os.path.basename(token) in WRAPPERS:
-            pass
-        elif token.startswith('-') and index and os.path.basename(tokens[index - 1]) in WRAPPERS:
-            pass
+            wrapper = os.path.basename(token)
+            index += 1
+            values = WRAPPER_VALUE_OPTIONS.get(wrapper, ())
+            while index < len(tokens) and tokens[index].startswith('-'):
+                if tokens[index] == '--':
+                    index += 1
+                    break
+                index += 2 if tokens[index] in values else 1
+            if wrapper == 'timeout':
+                index += 1
+            elif wrapper == 'rtk' and tokens[index:index + 1] == ['proxy']:
+                index += 1
         else:
             break
-        index += 1
     return assignments, tokens[index:]
 
 
