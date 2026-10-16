@@ -583,5 +583,30 @@ class Reservations(unittest.TestCase):
         self.assertEqual(da.release('missing', self.path)['reason'], 'no reservation named missing')
 
 
+class Snapshots(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name).resolve() / 'admission/state.json'
+        self.now = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+
+    def shot(self, free, source='glomeris'):
+        return da.snapshot(self.path, lambda: (free, source), now=self.now)
+
+    def test_snapshot_contract_and_file(self):
+        record = self.shot(250 * GIB)
+        self.assertEqual(sorted(record), sorted(['schema', 'ts', 'age_s', 'free_bytes', 'tier', 'latch',
+                                                 'heavy_lanes_allowed', 'active_heavy_jobs', 'reserved_bytes',
+                                                 'protection', 'blockers', 'source']))
+        self.assertEqual((record['schema'], record['ts'], record['age_s']), (1, '2026-10-16T12:00:00Z', 0))
+        self.assertEqual((record['free_bytes'], record['tier'], record['latch']), (250 * GIB, 'wide', False))
+        self.assertEqual((record['heavy_lanes_allowed'], record['blockers'], record['source']), (1, [], 'glomeris'))
+        self.assertEqual(record['protection'], 'advisory-not-wired')
+        file = self.path.parent / 'snapshot.json'
+        self.assertEqual(json.loads(file.read_text()), record)
+        self.assertEqual(file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.shot(80 * GIB, 'statvfs')['source'], 'statvfs')
+
+
 if __name__ == '__main__':
     unittest.main()
