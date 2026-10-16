@@ -238,6 +238,16 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.apply()[0], 2)
         self.assertEqual(self.snapshot_tree(), before)
 
+    def test_reformatting_settings_needs_an_explicit_flag(self):
+        compact = self.live_text.replace('"allow": [\n      "Bash(git status)"\n    ]', '"allow": ["Bash(git status)"]')
+        self.live.write_text(compact)
+        before = self.snapshot_tree()
+        code, text = self.apply()
+        self.assertEqual(code, 8)
+        self.assertIn('--allow-reformat', text)
+        self.assertEqual(self.snapshot_tree(), before)
+        self.assertEqual(self.apply('--allow-reformat')[0], 0)
+
 
 if __name__ == '__main__':
     unittest.main()
