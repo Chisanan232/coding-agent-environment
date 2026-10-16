@@ -21,6 +21,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -65,17 +66,28 @@ MIGRATION = {
         # `destroy:*` and the leading-dash `terraform -* destroy*` form.
         "Bash(terraform * destroy*)", "Bash(rtk terraform * destroy*)",
     ],
-    # Environment lines that are stale snapshots, copies of the built-in
-    # defaults (restored by "$defaults"), or contradict the ownership policy.
-    "retire_env_prefixes": [
+    # Environment lines retired unconditionally: stale session snapshots, lines that
+    # contradict the ownership policy, and older copies of lines the baseline carries.
+    "retire_env_always": [
         "### ", "routine under ", "**Trusted repo**", "**Worktree cleanup**",
         "**git -C convention**", "**Secrets**: never materialize",
+        "**Force-push**: every force-push (--force,", "**Command rewriting**: a PreToolUse hook (`rtk hook claude`)",
+        "**File/directory deletion (2026-10-10)**", "**gh api method classification (2026-10-10)**",
+    ],
+    # Copies of the built-in defaults (restored by "$defaults"). Retired ONLY when the
+    # text still carries default wording, so a curated line with the same key survives.
+    "retire_env_default_copies": [
         "**Repository visibility**", "**Internal sharing", "**Sensitive data locations",
         "**Sensitive remote targets**", "**Protected deployment namespaces", "**Protected IaC scopes**",
         "**Primary use of Claude Code**",
-        # Older live copies of lines the baseline now carries (kept once, in the baseline).
-        "**Force-push**: every force-push (--force,", "**Command rewriting**: a PreToolUse hook (`rtk hook claude`)",
-        "**File/directory deletion (2026-10-10)**", "**gh api method classification (2026-10-10)**",
+    ],
+    "default_copy_signatures": [
+        "assume private unless the remote host and repo name indicate otherwise",
+        "treat public paste/gist services as outside the trust boundary",
+        "any file or store holding personal data, confidential business data",
+        "any namespace, host, or container whose name carries `prod`",
+        "IAM, RBAC, networking, quota, and node-pool resources",
+        ": software development",
     ],
     # Content markers of a generated, session-specific snapshot.
     "stale_env_markers": ["None configured", "no remotes", "local-only checkout", "origin/HEAD unset", "The trusted repo only"],
@@ -113,30 +125,55 @@ def static_decision(command, perm):
 
 
 def is_stale_env(line):
-    return line.startswith(tuple(MIGRATION["retire_env_prefixes"])) or any(m in line for m in MIGRATION["stale_env_markers"])
+    if line.startswith(tuple(MIGRATION["retire_env_always"])) or any(m in line for m in MIGRATION["stale_env_markers"]):
+        return True
+    return line.startswith(tuple(MIGRATION["retire_env_default_copies"])) and any(s in line for s in MIGRATION["default_copy_signatures"])
 
 
 # Entries written by this tool are replaced (not duplicated) on every apply.
 OWNER_PREFIXES = ("**Trusted GitHub owners", "**Personal source-control scope")
 DEV_ENV_PREFIXES = ("**Personal development machine",)
 DEV_ALLOW_PREFIXES = ("**Cross-repository personal development",)
-FORBIDDEN_DEV_DIRS = {"/", "/Users", "/Library", "/System", "/private", "/etc", "/usr", "/var", "/bin", "/sbin", "/opt", "/Volumes", "~", "~/"}
-SYSTEM_PREFIXES = ("/System/", "/Library/", "/etc/", "/usr/", "/bin/", "/sbin/", "/private/etc", "/private/var", "/var/", "/dev/", "/Applications/")
-SENSITIVE_PARTS = (".ssh", ".aws", ".gnupg", ".config/gcloud", "Keychains", ".claude")
+HIDDEN_OR_SYSTEM_HOME_DIRS = {"library", "applications"}
+SENSITIVE_PARTS = {".ssh", ".aws", ".gnupg", "keychains", ".claude", ".kube", ".docker", ".netrc", ".npmrc", "gcloud"}
+ENV_READ_ASKS = ["Read(**/.env)", "Read(**/.env.local)"]
+OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+
+
+def normalize_dev_dir(d):
+    """Return (resolved absolute path, None) or (None, reason).
+
+    Resolves `~`, symlinks and case before judging, so `~/.`, `~/dev/../..`,
+    `/users/me` and symlinks into credential directories cannot slip through.
+    The root must sit strictly under the home directory (not in a hidden or
+    system top-level folder) or be a directory under /Volumes/<name>/.
+    """
+    if not d or any(c in d for c in "`\n\r\t"):
+        return None, f"dev dir {d!r} is empty or has control/backtick characters"
+    if d.startswith("~") and not (d == "~" or d.startswith("~/")):
+        return None, f"dev dir {d!r} uses ~user, which is not allowed"
+    if any(seg in (".", "..") for seg in d.split("/")):
+        return None, f"dev dir {d!r} contains a '.' or '..' segment"
+    real = os.path.realpath(os.path.expanduser(d)).rstrip("/") or "/"
+    home = os.path.realpath(str(Path.home())).rstrip("/")
+    low, hlow = real.casefold(), home.casefold()
+    if low == hlow:
+        return None, f"dev dir {d!r} is the home directory"
+    if low.startswith(hlow + "/"):
+        rel = real[len(home) + 1:]
+        first = rel.split("/")[0]
+        if first.startswith(".") or first.casefold() in HIDDEN_OR_SYSTEM_HOME_DIRS:
+            return None, f"dev dir {d!r} is inside a hidden, Library or Applications folder"
+    elif not re.match(r"^/Volumes/[^/]+/[^/]+", real, re.I):
+        return None, f"dev dir {d!r} resolves to {real!r}: must be under the home directory or /Volumes/<name>/<dir>"
+    rel_parts = {p.casefold() for p in real.split("/")}
+    if rel_parts & SENSITIVE_PARTS:
+        return None, f"dev dir {d!r} overlaps a credential or protected path"
+    return real, None
 
 
 def check_dev_dir(d):
-    """Reject roots that would turn 'development trust' into broad filesystem access."""
-    norm = d.rstrip("/") or "/"
-    if norm in FORBIDDEN_DEV_DIRS or norm == str(Path.home()):
-        return f"dev dir {d!r} is too broad (filesystem root, system path or the home directory)"
-    if norm.startswith(SYSTEM_PREFIXES):
-        return f"dev dir {d!r} is inside a system path"
-    if any(part in norm for part in SENSITIVE_PARTS):
-        return f"dev dir {d!r} overlaps a credential or protected path"
-    if not (norm.startswith("~/") or norm.startswith("/")):
-        return f"dev dir {d!r} must be absolute or start with ~/"
-    return None
+    return normalize_dev_dir(d)[1]
 
 
 def _fill(lines, owners, dev_dirs):
@@ -158,6 +195,10 @@ def template_lines(owners, dev_dirs):
     return _fill(env, owners, dev_dirs), _fill(allow, owners, dev_dirs)
 
 
+def _bad_dir(d):
+    raise ValueError(f"invalid dev dir: {check_dev_dir(d)}")
+
+
 def merge(live, base, owners, dev_dirs=()):
     new = copy.deepcopy(live)
     perm = new.setdefault("permissions", {})
@@ -174,8 +215,13 @@ def merge(live, base, owners, dev_dirs=()):
     moved = [r for r in denied if r not in MIGRATION["deny_subsumed"] and r not in perm["ask"]]
     perm["ask"] += moved
     perm["deny"] = []
+    dev_dirs = list(dict.fromkeys(normalize_dev_dir(d)[0] or _bad_dir(d) for d in dev_dirs))
 
     am = new.setdefault("autoMode", {})
+    previous_dev_dirs = []
+    for e in am.get("environment", []):
+        if e.startswith(DEV_ENV_PREFIXES):
+            previous_dev_dirs += [x for x in re.findall(r"`([^`]+)`", e) if x.startswith(("/", "~"))]
     kept = [e for e in am.get("environment", [])
             if e != "$defaults" and not is_stale_env(e)]
     wanted = [e for e in base["autoMode"]["environment"] if e != "$defaults"]
@@ -193,8 +239,11 @@ def merge(live, base, owners, dev_dirs=()):
         old_allow = [e for e in old_allow if not e.startswith(DEV_ALLOW_PREFIXES)]
     am["allow"] = ["$defaults"] + wanted_allow + old_allow + [e for e in allow_add if e not in old_allow]
     if dev_dirs:
-        have = perm.setdefault("additionalDirectories", [])
-        have += [d for d in dev_dirs if d not in have]
+        # Replace what a previous apply granted (read back from the old prose) so a
+        # narrower --dev-dirs narrows the access grant instead of only growing it.
+        have = [d for d in perm.get("additionalDirectories", []) if d not in previous_dev_dirs]
+        perm["additionalDirectories"] = have + [d for d in dev_dirs if d not in have]
+        perm["ask"] += [r for r in ENV_READ_ASKS if r not in perm["ask"]]
     return new
 
 
@@ -261,6 +310,10 @@ def main(argv=None):
     a = ap.parse_args(argv)
     owners = [o.strip() for o in a.owners.split(",") if o.strip()]
     dev_dirs = [d.strip() for d in a.dev_dirs.split(",") if d.strip()]
+    for o in owners:
+        if not OWNER_RE.match(o):
+            print(f"REFUSING: owner {o!r} is not a valid GitHub login")
+            return 6
     for d in dev_dirs:
         why = check_dev_dir(d)
         if why:
@@ -288,6 +341,9 @@ def main(argv=None):
     bad = problems(new, base)
     print(f"live     sha256 {live_sha}\nbaseline sha256 {base_sha}")
     print("\n".join(summary(live, new)))
+    gone = [e for e in live.get("autoMode", {}).get("environment", []) if e not in new["autoMode"]["environment"]]
+    print(f"environment lines removed ({len(gone)}):")
+    print("\n".join("  - " + e[:110].replace("\n", " ") for e in gone))
     if bad:
         print("REFUSING, merged result violates policy:\n  " + "\n  ".join(bad))
         return 2
@@ -301,17 +357,29 @@ def main(argv=None):
     # Nanosecond name + exclusive create: a second apply can never overwrite the
     # backup that holds the original file.
     backup = backups / f"settings.json.pre-SPE-106.{time.time_ns()}"
-    with open(backup, "xb") as fh:
-        fh.write(raw_bytes)
-    shutil.copystat(live_p, backup)
+    write_new(backup, raw_bytes, live_p.stat().st_mode & 0o777)
     indent = 4 if '\n    "' in raw else 2
     out = json.dumps(new, indent=indent, ensure_ascii=False) + ("\n" if raw.endswith("\n") else "")
     if live_p.read_bytes() != raw_bytes:
         print("REFUSING: the live file changed while the merge was prepared; nothing was written")
         return 5
     atomic_write(live_p, out.encode())
-    print(f"applied | backup {backup} | rollback: {sys.argv[0]} rollback --live {live_p} --backup {backup}")
+    print(f"applied | backup {backup} | rollback: python3 {sys.argv[0]} rollback --live {live_p} --backup {backup}")
     return 0
+
+
+def write_new(path, data, mode):
+    """Exclusive create with the intended mode from the first byte (no umask-looser window)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        os.unlink(path)
+        raise
 
 
 def atomic_write(path, data):
@@ -344,10 +412,12 @@ def rollback(live_p, backup):
     current = live_p.read_bytes() if live_p.exists() else None
     if current is not None:
         saved = live_p.with_name(f"{live_p.name}.pre-rollback.{time.time_ns()}")
-        with open(saved, "xb") as fh:
-            fh.write(current)
+        write_new(saved, current, live_p.stat().st_mode & 0o777)
         print(f"current file saved to {saved}")
-    atomic_write(live_p, data) if live_p.exists() else live_p.write_bytes(data)
+    if live_p.exists():
+        atomic_write(live_p, data)
+    else:
+        write_new(live_p, data, Path(backup).stat().st_mode & 0o777)
     print(f"restored {live_p} from {backup}")
     return 0
 

@@ -188,63 +188,135 @@ class MergeSemantics(Fixture):
 
 
 class PersonalDevTrust(Fixture):
-    DEV = ["~/dev-root"]
+    def real(self, name):
+        return os.path.realpath(self.home / name)
 
-    def merged_dev(self, live=None, dev=None):
-        return rollout.merge(copy.deepcopy(live or LIVE), copy.deepcopy(BASELINE), ["OwnerA"], dev or self.DEV)
+    def merged_dev(self, live=None, dev=("~/dev-root",)):
+        return rollout.merge(copy.deepcopy(live or LIVE), copy.deepcopy(BASELINE), ["OwnerA"], list(dev))
 
-    def test_dev_dirs_add_scoped_file_access_prose_and_allow_exception(self):
+    def test_dev_dirs_add_scoped_file_access_prose_allow_exception_and_env_read_gate(self):
         new = self.merged_dev()
-        self.assertEqual(self.DEV, new["permissions"]["additionalDirectories"])
+        self.assertEqual([self.real("dev-root")], new["permissions"]["additionalDirectories"])
         env = "\n".join(new["autoMode"]["environment"])
         self.assertIn("Personal development machine", env)
-        self.assertIn("`~/dev-root`", env)
-        self.assertIn("does not cover credential or key files", env)
+        self.assertIn(f"`{self.real('dev-root')}`", env)
+        for guard in ("credential or key files", ".claude", ".git/hooks", "shell startup"):
+            self.assertIn(guard, env)
         allow = "\n".join(new["autoMode"]["allow"])
         self.assertIn("Cross-repository personal development", allow)
-        self.assertIn("does not apply to credential or key files", allow)
+        for guard in ("credential or key files", ".claude", ".git/hooks", "shell startup", ".env", "irreversible deletion"):
+            self.assertIn(guard, allow)
+        for rule in ("Read(**/.env)", "Read(**/.env.local)"):
+            self.assertIn(rule, new["permissions"]["ask"])
         self.assertEqual([], rollout.problems(new))
 
     def test_without_dev_dirs_nothing_about_directories_is_added(self):
         new = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), ["OwnerA"])
         self.assertNotIn("additionalDirectories", new["permissions"])
         self.assertNotIn("Personal development machine", json.dumps(new))
+        self.assertNotIn("Read(**/.env)", new["permissions"]["ask"])
 
-    def test_changed_dev_dirs_replace_the_old_lines_instead_of_stacking(self):
-        first = self.merged_dev()
-        second = self.merged_dev(live=first, dev=["~/other-root"])
+    def test_narrower_dev_dirs_narrow_the_grant_and_the_prose_together(self):
+        first = self.merged_dev(dev=("~/dev", "~/work"))
+        self.assertEqual([self.real("dev"), self.real("work")], first["permissions"]["additionalDirectories"])
+        second = self.merged_dev(live=first, dev=("~/work",))
+        self.assertEqual([self.real("work")], second["permissions"]["additionalDirectories"])
         env = [e for e in second["autoMode"]["environment"] if e.startswith("**Personal development machine")]
         self.assertEqual(1, len(env))
-        self.assertIn("`~/other-root`", env[0])
-        self.assertNotIn("~/dev-root", env[0])
+        self.assertNotIn(self.real("dev") + "`", env[0])
         self.assertEqual(1, sum(e.startswith("**Cross-repository") for e in second["autoMode"]["allow"]))
-        self.assertEqual(first, self.merged_dev(live=first))
+        self.assertEqual(first, self.merged_dev(live=first, dev=("~/dev", "~/work")))
 
-    def test_overbroad_or_sensitive_dev_dirs_are_rejected(self):
-        for bad in ("/", "~", str(Path.home()), "/Users", "/Volumes", "~/.ssh", "~/.config/gcloud/x", "relative/path", "/private/etc"):
-            with self.subTest(dir=bad):
-                self.assertIsNotNone(rollout.check_dev_dir(bad), bad)
-        for good in ("~/dev-root", "/Volumes/Personal/dev"):
-            with self.subTest(dir=good):
-                self.assertIsNone(rollout.check_dev_dir(good))
+    def test_trailing_slash_and_duplicates_collapse(self):
+        new = self.merged_dev(dev=("~/x", "~/x/"))
+        self.assertEqual([self.real("x")], new["permissions"]["additionalDirectories"])
 
-    def test_cli_refuses_a_home_wide_dev_dir_and_writes_nothing(self):
+    def test_every_bypass_the_reviewer_found_is_rejected(self):
+        home = str(Path.home())
+        bad = ["~/.", "~/./", home + "/.", "~/dev/../..", "~/..", "/..", "/Volumes/x/../..", "/Users/other", "/users/someone",
+               "/USERS", "~/Library", home + "/Library", home + "/library/Keychains", "~/.config", home + "/.SSH", "~/.kube", "~/.docker",
+               "~/.netrc", "~/.npmrc", "/private/tmp", "/tmp", "/", "~", home, "/Volumes", "/Volumes/OnlyName", "~someone/dev",
+               "relative/path", "", "~/a`b", "~/a\nb", "~/.ssh", "~/.claude/x", "/private/etc"]
+        for d in bad:
+            with self.subTest(dir=d):
+                self.assertIsNotNone(rollout.check_dev_dir(d), d)
+        self.assertEqual(self.real("dev-root"), rollout.normalize_dev_dir("~/dev-root")[0])
+        self.assertIsNone(rollout.check_dev_dir("/Volumes/Personal/dev"))
+
+    def test_a_symlink_into_a_credential_directory_is_rejected(self):
+        (self.home / ".ssh").mkdir()
+        (self.home / "innocent").symlink_to(self.home / ".ssh")
+        self.assertIsNotNone(rollout.check_dev_dir("~/innocent"))
+        (self.home / "outside").symlink_to("/private/tmp")
+        self.assertIsNotNone(rollout.check_dev_dir("~/outside"))
+
+    def test_cli_refuses_bad_dev_dirs_and_bad_owners_and_writes_nothing(self):
         before = self.live_p.read_bytes()
-        rc, out = self.run_tool("apply", "--baseline", str(self.base_p), "--live", str(self.live_p), "--dev-dirs", str(Path.home()),
-                                "--expect-live-sha", rollout.sha(self.live_p), "--expect-baseline-sha", rollout.sha(self.base_p))
-        self.assertEqual(6, rc, out)
-        self.assertEqual(before, self.live_p.read_bytes())
+        for extra in (["--dev-dirs", str(Path.home())], ["--dev-dirs", "~/dev/../.."], ["--owners=bad owner`x"], ["--owners=-leading"], ["--owners=a/b"]):
+            with self.subTest(extra=extra):
+                rc, out = self.run_tool("apply", "--baseline", str(self.base_p), "--live", str(self.live_p), *extra,
+                                        "--expect-live-sha", rollout.sha(self.live_p), "--expect-baseline-sha", rollout.sha(self.base_p))
+                self.assertEqual(6, rc, out)
+                self.assertEqual(before, self.live_p.read_bytes())
 
     def test_verify_flags_a_broad_additional_directory(self):
         bad = self.merged_dev()
-        bad["permissions"]["additionalDirectories"].append("/")
-        self.assertIn("too broad", "\n".join(rollout.problems(bad)))
+        bad["permissions"]["additionalDirectories"].append(str(Path.home()))
+        self.assertIn("home directory", "\n".join(rollout.problems(bad)))
 
     def test_existing_additional_directories_are_preserved(self):
         live = copy.deepcopy(LIVE)
         live["permissions"]["additionalDirectories"] = ["~/already-there"]
         new = self.merged_dev(live=live)
-        self.assertEqual(["~/already-there", "~/dev-root"], new["permissions"]["additionalDirectories"])
+        self.assertEqual(["~/already-there", self.real("dev-root")], new["permissions"]["additionalDirectories"])
+
+
+class CuratedEnvironmentLines(Fixture):
+    def env(self, lines):
+        live = copy.deepcopy(LIVE)
+        live["autoMode"]["environment"] = lines
+        return rollout.merge(live, copy.deepcopy(BASELINE), [])["autoMode"]["environment"]
+
+    def test_curated_lines_with_a_default_key_survive_and_default_copies_go(self):
+        curated = ["**Sensitive data locations**: ~/vault, ~/clients", "**Protected IaC scopes**: modules/prod only",
+                   "**Sensitive remote targets**: host db-prod-1", "**Repository visibility**: all my repos are private"]
+        copies = ["**Sensitive data locations & audiences**: any file or store holding personal data, confidential business data, credentials",
+                  "**Primary use of Claude Code**: software development",
+                  "**Repository visibility**: assume private unless the remote host and repo name indicate otherwise"]
+        env = self.env(curated + copies)
+        for line in curated:
+            self.assertIn(line, env)
+        for line in copies:
+            self.assertNotIn(line, env)
+
+    def test_plan_lists_every_environment_line_it_removes(self):
+        rc, out = self.run_tool("plan", "--baseline", str(self.base_p), "--live", str(self.live_p))
+        self.assertEqual(0, rc, out)
+        self.assertIn("environment lines removed (", out)
+        self.assertIn("Worktree cleanup", out)
+
+
+class FileModes(Fixture):
+    def test_extra_files_keep_the_live_files_mode(self):
+        os.chmod(self.live_p, 0o600)
+        rc, out = self.run_tool("apply", "--baseline", str(self.base_p), "--live", str(self.live_p),
+                                "--expect-live-sha", rollout.sha(self.live_p), "--expect-baseline-sha", rollout.sha(self.base_p))
+        self.assertEqual(0, rc, out)
+        backup = next((self.home / ".claude/backups").glob("settings.json.pre-SPE-106.*"))
+        self.assertEqual(0o600, backup.stat().st_mode & 0o777)
+        rc, out = self.run_tool("rollback", "--live", str(self.live_p), "--backup", str(backup))
+        self.assertEqual(0, rc, out)
+        saved = next((self.home / ".claude").glob("settings.json.pre-rollback.*"))
+        self.assertEqual(0o600, saved.stat().st_mode & 0o777)
+
+    def test_rollback_into_a_missing_file_uses_the_backup_mode(self):
+        backup = self.home / "b.json"
+        backup.write_text("{}")
+        os.chmod(backup, 0o600)
+        self.live_p.unlink()
+        rc, _ = self.run_tool("rollback", "--live", str(self.live_p), "--backup", str(backup))
+        self.assertEqual(0, rc)
+        self.assertEqual(0o600, self.live_p.stat().st_mode & 0o777)
 
 
 class CommandModes(Fixture):
