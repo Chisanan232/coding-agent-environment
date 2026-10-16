@@ -257,5 +257,16 @@ class Cli(unittest.TestCase):
         self.assertTrue(da.evaluate('light', self.path, lambda: 500 * GIB)['admit'])
 
 
+class Sources(unittest.TestCase):
+    @staticmethod
+    def failing():
+        raise da.VolumeError('down')
+
+    def test_glomeris_free_bytes_cross_checked_with_statvfs(self):
+        self.assertEqual(da.measure_free_bytes(lambda: 40 * GIB, lambda: 38 * GIB), 38 * GIB)
+        # The smaller reading wins whichever source reports it.
+        self.assertEqual(da.measure_free_bytes(lambda: 38 * GIB, lambda: 40 * GIB), 38 * GIB)
+
+
 if __name__ == '__main__':
     unittest.main()
