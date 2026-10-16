@@ -467,6 +467,17 @@ class Fixture(unittest.TestCase):
         self.assertEqual(command, 'python3 %s' % self.dest)
         self.assertTrue(Path(command.split(' ', 1)[1]).is_file())
 
+    def test_an_entry_pointing_at_a_different_destination_is_a_conflict(self):
+        self.assertEqual(self.apply()[0], 0)
+        other = self.root / 'other/disk-admission-gate.py'
+        code, text = self.run_cli('plan', '--hook-dest', str(other))
+        self.assertEqual(code, 2)
+        self.assertIn('different disk-admission-gate entry', text)
+        before = self.snapshot_tree()
+        self.assertEqual(self.run_cli('apply', '--hook-dest', str(other), *self.pins())[0], 2)
+        self.assertEqual(self.snapshot_tree(), before)
+        self.assertEqual(self.run_cli('verify', '--hook-dest', str(other))[0], 1)
+
 
 class CommandDerivation(unittest.TestCase):
     def test_command_uses_the_tilde_form_under_home_and_quotes_other_paths(self):
