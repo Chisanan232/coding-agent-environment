@@ -56,6 +56,17 @@ class Decisions(unittest.TestCase):
         # Negative control: without a prior latch 20..<50 GiB never latches.
         self.assertFalse(da.decide('light', 30 * GIB, {})[1]['latch'])
 
+    def test_latch_refuses_light_below_50(self):
+        latched = {'latch': True}
+        for free in (25 * GIB, 49 * GIB):
+            admit, _, reason = da.decide('light', free, latched)
+            self.assertFalse(admit, free)
+            self.assertIn('latched', reason)
+        self.assertFalse(da.decide('heavy', 150 * GIB - 100 * GIB - 1, latched)[0])
+        # Negative control: the same free space without a latch admits light work.
+        self.assertTrue(da.decide('light', 25 * GIB, {})[0])
+        self.assertTrue(da.decide('light', 50 * GIB, latched)[0])
+
 
 if __name__ == '__main__':
     unittest.main()
