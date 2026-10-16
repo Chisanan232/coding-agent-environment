@@ -311,6 +311,12 @@ class EngineeringWorkflowContract(unittest.TestCase):
                 self.assertIn(phrase, text)
         self.assertIn("frontend QA evidence defined in `acceptance-validation`", " ".join(WORKFLOW.read_text().split()))
 
+    def test_post_merge_close_requires_disk_check_and_cleanup_status(self) -> None:
+        text = " ".join((ROOT / ".claude/skills/post-merge-close/SKILL.md").read_text().split())
+        self.assertIn("Check free disk space", text)
+        self.assertIn("report the cleanup status", text)
+        self.assertIn("SPE-109", text)
+
 
 if __name__ == "__main__":
     unittest.main()
