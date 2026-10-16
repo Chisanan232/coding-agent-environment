@@ -497,6 +497,22 @@ class Reservations(unittest.TestCase):
         self.assertEqual(live, [])
         self.assertFalse(file.exists())
 
+    def test_expired_reservation_is_pruned_and_only_own_files(self):
+        expired = self.reserve_file('job-old', hours=-1)
+        fresh = self.reserve_file('job-new')
+        foreign = expired.parent / 'notes.json'
+        foreign.write_text('{"unrelated": true}')
+        stranger = expired.parent / 'readme.txt'
+        stranger.write_text('keep')
+        live, problems = self.live()
+        self.assertEqual([r['label'] for r in live], ['job-new'])
+        self.assertFalse(expired.exists())
+        self.assertTrue(fresh.exists())
+        # Foreign files are reported or ignored, never deleted.
+        self.assertTrue(foreign.exists() and stranger.exists())
+        self.assertEqual(len(problems), 1)
+        self.assertIn('notes.json', problems[0])
+
 
 if __name__ == '__main__':
     unittest.main()
