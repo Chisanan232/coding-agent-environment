@@ -264,6 +264,10 @@ class Compound(unittest.TestCase):
         self.assertTrue(self.heavy('timeout -s KILL 5 npm ci'))
         self.assertFalse(self.heavy('timeout 5 echo cargo build'))
 
+    def test_watch_is_heavy(self):
+        self.assertTrue(self.heavy('watch -n 5 cargo check'))
+        self.assertFalse(self.heavy('watch -n 5 df -h'))
+
 
 if __name__ == '__main__':
     unittest.main()
