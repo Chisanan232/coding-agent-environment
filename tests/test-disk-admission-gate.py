@@ -602,6 +602,17 @@ class AuditTrail(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('BLOCKED', err.getvalue())
 
+    def test_an_unwritable_audit_location_keeps_the_normal_refusal_message(self):
+        self.dir.mkdir()
+        (self.dir / 'mode').write_text('enforce')
+        os.chmod(self.dir, 0o500)
+        self.addCleanup(os.chmod, self.dir, 0o700)
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'cargo build'}})
+        err = io.StringIO()
+        gate.main(payload, io.StringIO(), err, runner=lambda: (77, 'heavy refused in tier low'), admission_dir=self.dir)
+        self.assertIn('disk admission refuses heavy command cargo', err.getvalue())
+        self.assertNotIn('internal error', err.getvalue())
+
 
 class RolloutDocumentation(unittest.TestCase):
     def test_docs_state_the_staged_rollout_audit_and_scope(self):
