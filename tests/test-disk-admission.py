@@ -609,10 +609,11 @@ class Snapshots(unittest.TestCase):
 
     def test_snapshot_contract_and_file(self):
         record = self.shot(250 * GIB)
-        self.assertEqual(sorted(record), sorted(['schema', 'ts', 'age_s', 'free_bytes', 'tier', 'latch',
+        self.assertEqual(sorted(record), sorted(['schema', 'ts', 'free_bytes', 'tier', 'latch',
                                                  'heavy_lanes_allowed', 'active_heavy_jobs', 'reserved_bytes',
                                                  'protection', 'blockers', 'source']))
-        self.assertEqual((record['schema'], record['ts'], record['age_s']), (1, '2026-10-16T12:00:00Z', 0))
+        self.assertEqual((record['schema'], record['ts']), (1, '2026-10-16T12:00:00Z'))
+        self.assertNotIn('age_s', json.loads((self.path.parent / 'snapshot.json').read_text()))
         self.assertEqual((record['free_bytes'], record['tier'], record['latch']), (250 * GIB, 'wide', False))
         self.assertEqual((record['heavy_lanes_allowed'], record['blockers'], record['source']), (1, [], 'glomeris'))
         self.assertEqual(record['protection'], 'advisory-not-wired')

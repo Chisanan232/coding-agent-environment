@@ -521,12 +521,32 @@ def snapshot_age_s(record, now=None):
     return ((now or datetime.now(timezone.utc)) - stamp).total_seconds()
 
 
-def snapshot_is_fresh(record, now=None):
+def snapshot_is_fresh(record, now=None, max_age=STALE_AFTER_S):
     """False for stale, future-dated (beyond 5s of skew) or malformed snapshots."""
     try:
-        return -5 <= snapshot_age_s(record, now) <= STALE_AFTER_S
+        return -5 <= snapshot_age_s(record, now) <= max_age
     except (KeyError, TypeError, ValueError, AttributeError):
         return False
+
+
+def read_snapshot(state_path):
+    """The published snapshot; StateError when missing, unreadable or not this schema. Read-only."""
+    path = state_path.with_name(SNAPSHOT_NAME)
+    _refuse_symlinks(path)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise StateError('snapshot unreadable: %s' % exc, 'snapshot-unreadable')
+    with os.fdopen(descriptor, 'rb') as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise StateError('snapshot is not a regular file', 'snapshot-unreadable')
+        try:
+            record = json.loads(handle.read(65536))
+        except (OSError, ValueError) as exc:
+            raise StateError('snapshot unreadable: %s' % exc, 'snapshot-unreadable')
+    if not isinstance(record, dict) or record.get('schema') != SNAPSHOT_SCHEMA or not isinstance(record.get('ts'), str):
+        raise StateError('snapshot has the wrong schema', 'snapshot-unreadable')
+    return record
 
 
 def snapshot(state_path, source_fn=measure_with_source, now=None, token_fn=process_token):
@@ -550,7 +570,7 @@ def snapshot(state_path, source_fn=measure_with_source, now=None, token_fn=proce
             elif HEAVY_LANES[result['tier']] == 0:
                 blockers.insert(0, 'tier %s is below stable' % result['tier'])
             lanes = 0 if result['tier'] is None or result['latch'] else HEAVY_LANES[result['tier']]
-            record = {'schema': SNAPSHOT_SCHEMA, 'ts': iso_utc(now), 'age_s': 0,
+            record = {'schema': SNAPSHOT_SCHEMA, 'ts': iso_utc(now),
                       'free_bytes': result['free_bytes'], 'tier': result['tier'], 'latch': result['latch'],
                       'heavy_lanes_allowed': lanes, 'active_heavy_jobs': len(live),
                       'reserved_bytes': sum(r['bytes'] for r in live),
@@ -581,7 +601,10 @@ def build_parser():
     take.add_argument('--label', required=True)
     take.add_argument('--ttl-s', type=int, default=DEFAULT_TTL, dest='ttl')
     shot = commands.add_parser('snapshot', allow_abbrev=False, help='publish the host resource snapshot')
-    shot.add_argument('--json', action='store_true', required=True)
+    mode = shot.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--json', action='store_true', help='write and print a fresh snapshot')
+    mode.add_argument('--check-fresh', action='store_true', help='read-only: exit 0 when the snapshot is fresh, else 77')
+    shot.add_argument('--max-age', type=int, default=STALE_AFTER_S, help='seconds; with --check-fresh only')
     drop = commands.add_parser('release', allow_abbrev=False, help='release a reservation by label')
     drop.add_argument('--label', required=True)
     return parser
@@ -595,6 +618,14 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
                   if args.command == 'reserve' else release(args.label, state_path))
         print(result['reason'])
         return 0 if result['admit'] else REFUSED_EXIT
+    if args.command == 'snapshot' and args.check_fresh:
+        try:
+            fresh = snapshot_is_fresh(read_snapshot(state_path), max_age=args.max_age)
+            print('snapshot fresh' if fresh else 'snapshot stale: older than %d s or dated in the future' % args.max_age)
+        except StateError as exc:
+            fresh = False
+            print('snapshot unusable: %s' % exc)
+        return 0 if fresh else REFUSED_EXIT
     if args.command == 'snapshot':
         record = snapshot(state_path, (lambda: (free_fn(), 'injected')) if free_fn is not measure_free_bytes else measure_with_source)
         print(json.dumps(record, sort_keys=True))
