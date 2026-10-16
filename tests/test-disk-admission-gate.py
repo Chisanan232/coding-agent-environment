@@ -683,6 +683,11 @@ class HarnessWorkdir(unittest.TestCase):
             self.harness.claim_workdir(repo / 'child')
         self.assertFalse((repo / 'child').exists())
 
+    def test_the_harness_compares_the_audit_hash_with_the_command_sent(self):
+        text = (ROOT / 'tests/acceptance/gate-acceptance.py').read_text()
+        self.assertIn("hashlib.sha256(shell.encode()).hexdigest()[:12]", text)
+        self.assertIn("differs from the sha of the command sent", text)
+
 
 class HungAdapter(unittest.TestCase):
     def setUp(self):
