@@ -279,6 +279,12 @@ class Compound(unittest.TestCase):
         self.assertFalse(self.heavy('bash -euo pipefail -c "echo cargo build"'))
         self.assertFalse(self.heavy('bash -x script.sh cargo build'))
 
+    def test_eval_is_heavy_best_effort(self):
+        for command in ('eval "cargo build"', 'eval cargo build'):
+            verdict = gate.classify(command)
+            self.assertEqual((verdict['heavy'], verdict['confidence']), (True, 'best-effort'), command)
+        self.assertFalse(self.heavy('eval "echo cargo build"'))
+
 
 if __name__ == '__main__':
     unittest.main()
