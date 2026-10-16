@@ -26,6 +26,7 @@ overridden from the command line; tests inject them through arguments.
 Exit codes for `check`: 0 admit, 77 refuse. Usage errors exit 2.
 """
 
+import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -196,3 +197,33 @@ def evaluate(weight, state_path, free_fn=read_free_bytes, now=None):
         return dict(refused, reason='state-unwritable: %s' % exc)
     return dict(admit=admit, reason=reason, tier=record['tier'], free_bytes=free,
                 latch=record['latch'], timestamp=record['timestamp'])
+
+
+REFUSED_EXIT = 77
+
+
+def build_parser():
+    # No free-space or state-path flags: the measurement and its record must not be forgeable from argv.
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
+    commands = parser.add_subparsers(dest='command', required=True)
+    check = commands.add_parser('check', allow_abbrev=False, help='exit 0 to admit, 77 to refuse')
+    check.add_argument('--weight', choices=WEIGHTS, required=True)
+    status = commands.add_parser('status', allow_abbrev=False, help='report the current tier and latch')
+    status.add_argument('--json', action='store_true', required=True)
+    return parser
+
+
+def main(argv=None, free_fn=read_free_bytes, state_path=DEFAULT_STATE_PATH):
+    args = build_parser().parse_args(argv)
+    result = evaluate(args.weight if args.command == 'check' else None, state_path, free_fn)
+    if args.command == 'status':
+        keys = ('tier', 'free_bytes', 'latch', 'timestamp')
+        print(json.dumps(dict({key: result[key] for key in keys}, **({} if result['tier'] else {'error': result['reason']})), sort_keys=True))
+        return 0 if result['tier'] else REFUSED_EXIT
+    free = 'unknown' if result['free_bytes'] is None else '%.1f GiB' % (result['free_bytes'] / GIB)
+    print('%s; tier=%s free=%s' % (result['reason'], result['tier'] or 'unknown', free))
+    return 0 if result['admit'] else REFUSED_EXIT
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
