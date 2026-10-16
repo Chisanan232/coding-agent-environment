@@ -148,6 +148,11 @@ class ClaudeMdInvariants(unittest.TestCase):
         self.assertIn("(references/bot-pr-policy.md)", text)
         self.assertTrue((ROOT / ".claude/skills/bot-pr-maintainer/references/bot-pr-policy.md").is_file())
 
+    def test_ci_failure_triage_skill_links_its_reference(self) -> None:
+        text = (ROOT / ".claude/skills/ci-failure-triage/SKILL.md").read_text()
+        self.assertIn("(references/claude-ci-triage.md)", text)
+        self.assertTrue((ROOT / ".claude/skills/ci-failure-triage/references/claude-ci-triage.md").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
