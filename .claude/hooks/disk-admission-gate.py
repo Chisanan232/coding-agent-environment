@@ -33,6 +33,7 @@ hidden behind variable expansion, aliases, scripts or xargs.
 import json
 import os
 from pathlib import Path
+import pwd
 import shlex
 import sys
 
@@ -156,6 +157,45 @@ def classify(command, _depth=0):
             if inner['heavy']:
                 return dict(inner, confidence='best-effort')
     return verdict
+
+
+def account_home():
+    # The account database, not $HOME: the environment is caller-controlled.
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+SCRATCH_ROOTS = ('/private/tmp', '/tmp', '/private/var/folders', '/var/folders')
+
+
+def target_dir(verdict):
+    """Explicit cargo target directory of a classified command, else None."""
+    if verdict['kind'] != 'cargo':
+        return None
+    for assignment in verdict['assignments']:
+        if assignment.startswith('CARGO_TARGET_DIR='):
+            return assignment.partition('=')[2]
+    words = verdict['words']
+    for index, word in enumerate(words):
+        if word == '--target-dir' and index + 1 < len(words):
+            return words[index + 1]
+        if word.startswith('--target-dir='):
+            return word.partition('=')[2]
+    return None
+
+
+def target_dir_advice(verdict, exists=os.path.exists):
+    """Advice (never a denial) against a fresh cold-build target in scratch space."""
+    chosen = target_dir(verdict)
+    if not chosen:
+        return None
+    path = os.path.expanduser(chosen)
+    shared = str(account_home() / '.cargo/shared-target')
+    if not os.path.isabs(path) or path == shared or path.startswith(shared + '/') or exists(path):
+        return None
+    if path.startswith(tuple(root + '/' for root in SCRATCH_ROOTS)) or 'scratchpad' in Path(path).parts:
+        return ('cargo target dir %s is new scratch space, so this is a cold build that duplicates build output; '
+                'prefer the shared target %s' % (chosen, shared))
+    return None
 
 
 if __name__ == '__main__':
