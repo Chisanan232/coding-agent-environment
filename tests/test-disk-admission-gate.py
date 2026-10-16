@@ -358,5 +358,29 @@ class Uncertain(unittest.TestCase):
         self.assertIn('BLOCKED', err.getvalue())
 
 
+class Tamper(unittest.TestCase):
+    DIR = '~/.cache/coding-agent-environment/admission/'
+
+    def run_gate(self, command, mode):
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}})
+        out, err = io.StringIO(), io.StringIO()
+        code = gate.main(payload, out, err, mode_fn=lambda: mode, runner=lambda: (0, 'ok'))
+        return code, out.getvalue(), err.getvalue()
+
+    def writes(self):
+        d = self.DIR
+        return ['echo warn > %smode' % d, 'echo x >> %smode' % d, 'printf warn | tee %smode' % d,
+                'mv /tmp/m %smode' % d, 'rm %sstate.json' % d, 'cp /tmp/m %smode' % d,
+                "sed -i '' s/enforce/warn/ %smode" % d, 'chflags nouchg %smode' % d,
+                "python3 -c \"open('/Users/u/.cache/coding-agent-environment/admission/mode','w')\"",
+                "bash -c 'echo warn > %smode'" % d]
+
+    def test_tamper_suspect_commands_are_denied_in_enforce(self):
+        for command in self.writes():
+            code, out, err = self.run_gate(command, 'enforce')
+            self.assertEqual((code, out), (2, ''), command)
+            self.assertIn('tamper-suspect', err)
+
+
 if __name__ == '__main__':
     unittest.main()
