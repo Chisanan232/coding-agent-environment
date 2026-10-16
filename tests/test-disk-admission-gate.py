@@ -464,5 +464,27 @@ class Documentation(unittest.TestCase):
         self.assertIn('--check-fresh', (ROOT / 'docs/STORAGE-INTEGRATION.md').read_text())
 
 
+class AdmissionDirFlag(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name).resolve() / 'sandbox'
+        self.dir.mkdir()
+
+    def run_gate(self, command, runner):
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}})
+        out, err = io.StringIO(), io.StringIO()
+        code = gate.main(payload, out, err, runner=runner, admission_dir=self.dir)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_flag_forms_are_parsed_and_relative_paths_ignored(self):
+        self.assertEqual(gate.parse_admission_dir(['--admission-dir', '/x/y']), Path('/x/y'))
+        self.assertEqual(gate.parse_admission_dir(['--admission-dir=/x/y']), Path('/x/y'))
+        self.assertIsNone(gate.parse_admission_dir(['--admission-dir', 'relative']))
+        self.assertIsNone(gate.parse_admission_dir(['--admission-dir']))
+        self.assertIsNone(gate.parse_admission_dir([]))
+
+
+
 if __name__ == '__main__':
     unittest.main()
