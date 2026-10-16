@@ -22,6 +22,7 @@ import os
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import pwd
+import re
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -88,7 +89,9 @@ def sha_bytes(data):
 
 
 def serialise(obj, raw):
-    indent = 4 if '\n    "' in raw else 2
+    # The first indented key line gives the file's indent width.
+    found = re.search(r'\n( +)"', raw)
+    indent = len(found.group(1)) if found else 2
     return json.dumps(obj, indent=indent, ensure_ascii=False) + ('\n' if raw.endswith('\n') else '')
 
 
