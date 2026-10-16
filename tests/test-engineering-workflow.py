@@ -237,6 +237,12 @@ class EngineeringWorkflowContract(unittest.TestCase):
         self.assertIn("report the cleanup status", text)
         self.assertIn("SPE-109", text)
 
+    def test_ci_requirement_differs_for_public_and_private_repositories(self) -> None:
+        text = " ".join(WORKFLOW.read_text().split())
+        self.assertIn("Public repositories require green CI", text)
+        self.assertIn("qualified `CI_UNAVAILABLE_EXTERNAL`", text)
+        self.assertIn("Private repositories require the full local suite", text)
+
 
 if __name__ == "__main__":
     unittest.main()
