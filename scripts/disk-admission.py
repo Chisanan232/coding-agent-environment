@@ -278,17 +278,22 @@ def read_glomeris_free():
     return free
 
 
-def measure_free_bytes(glomeris=read_glomeris_free, statvfs=read_free_bytes):
-    """Smaller of the readable sources; refuses only when none is readable."""
+def measure_with_source(glomeris=read_glomeris_free, statvfs=read_free_bytes):
+    """(free bytes, source name) of the smaller readable source; VolumeError if none reads."""
     values, errors = [], []
-    for source in (glomeris, statvfs):
+    for name, source in (('glomeris', glomeris), ('statvfs', statvfs)):
         try:
-            values.append(source())
+            values.append((source(), name))
         except VolumeError as exc:
             errors.append(str(exc))
     if not values:
         raise VolumeError('; '.join(errors))
     return min(values)
+
+
+def measure_free_bytes(glomeris=read_glomeris_free, statvfs=read_free_bytes):
+    """Smaller of the readable sources; refuses only when none is readable."""
+    return measure_with_source(glomeris, statvfs)[0]
 
 
 RESERVATIONS_DIR = 'reservations'
@@ -503,6 +508,62 @@ def release(label, state_path):
         return _refusal('reservation-unreadable: %s' % exc)
 
 
+SNAPSHOT_SCHEMA = 1
+SNAPSHOT_NAME = 'snapshot.json'
+STALE_AFTER_S = 120
+# Flip only once an installed, operator-enabled gate has been proven end to end.
+GATE_PROVEN_WIRED = False
+
+
+def snapshot_age_s(record, now=None):
+    """Seconds since the snapshot's ts; consumers must treat > 120 as stale."""
+    stamp = datetime.fromisoformat(record['ts'].replace('Z', '+00:00'))
+    return ((now or datetime.now(timezone.utc)) - stamp).total_seconds()
+
+
+def snapshot_is_fresh(record, now=None):
+    """False for stale, future-dated (beyond 5s of skew) or malformed snapshots."""
+    try:
+        return -5 <= snapshot_age_s(record, now) <= STALE_AFTER_S
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+
+
+def snapshot(state_path, source_fn=measure_with_source, now=None, token_fn=process_token):
+    """Refresh state and publish the host resource snapshot next to it."""
+    now = now or datetime.now(timezone.utc)
+    seen = {}
+
+    def free():
+        value, seen['source'] = source_fn()
+        return value
+
+    try:
+        with state_lock(state_path):
+            result = _evaluate_locked(None, state_path, free, now)
+            live, problems = live_reservations(state_path, now, token_fn)
+            blockers = list(problems)
+            if result['tier'] is None:
+                blockers.insert(0, result['reason'])
+            elif result['latch']:
+                blockers.insert(0, 'latched until free space reaches 50 GiB')
+            elif HEAVY_LANES[result['tier']] == 0:
+                blockers.insert(0, 'tier %s is below stable' % result['tier'])
+            lanes = 0 if result['tier'] is None or result['latch'] else HEAVY_LANES[result['tier']]
+            record = {'schema': SNAPSHOT_SCHEMA, 'ts': iso_utc(now), 'age_s': 0,
+                      'free_bytes': result['free_bytes'], 'tier': result['tier'], 'latch': result['latch'],
+                      'heavy_lanes_allowed': lanes, 'active_heavy_jobs': len(live),
+                      'reserved_bytes': sum(r['bytes'] for r in live),
+                      'protection': 'wired' if GATE_PROVEN_WIRED else 'advisory-not-wired',
+                      'blockers': blockers, 'source': seen.get('source')}
+            write_json_atomic(state_path.with_name(SNAPSHOT_NAME), record)
+            return record
+    except StateError as exc:
+        return {'error': '%s: %s' % (exc.kind, exc)}
+    except OSError as exc:
+        return {'error': 'state-unwritable: %s' % exc}
+
+
 REFUSED_EXIT = 77
 
 
@@ -519,6 +580,8 @@ def build_parser():
     take.add_argument('--pid', type=int, required=True)
     take.add_argument('--label', required=True)
     take.add_argument('--ttl-s', type=int, default=DEFAULT_TTL, dest='ttl')
+    shot = commands.add_parser('snapshot', allow_abbrev=False, help='publish the host resource snapshot')
+    shot.add_argument('--json', action='store_true', required=True)
     drop = commands.add_parser('release', allow_abbrev=False, help='release a reservation by label')
     drop.add_argument('--label', required=True)
     return parser
@@ -532,6 +595,10 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
                   if args.command == 'reserve' else release(args.label, state_path))
         print(result['reason'])
         return 0 if result['admit'] else REFUSED_EXIT
+    if args.command == 'snapshot':
+        record = snapshot(state_path, (lambda: (free_fn(), 'injected')) if free_fn is not measure_free_bytes else measure_with_source)
+        print(json.dumps(record, sort_keys=True))
+        return REFUSED_EXIT if 'error' in record else 0
     result = evaluate(args.weight if args.command == 'check' else None, state_path, free_fn)
     if args.command == 'status':
         keys = ('tier', 'free_bytes', 'latch', 'timestamp')
