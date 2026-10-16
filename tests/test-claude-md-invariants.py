@@ -193,6 +193,16 @@ class ClaudeMdInvariants(unittest.TestCase):
             with self.subTest(clause=clause_id):
                 self.assertIn(f"]({target})", claude)
 
+    def test_copy_check_catches_a_multiline_overwrite_even_with_the_safe_phrases(self) -> None:
+        scratch = (ROOT / "README.md").read_text() + (
+            "\n```bash\ncp -R .claude/CLAUDE.md .claude/RTK.md .claude/settings.json \\\n"
+            "      .claude/hooks ~/.claude/\n```\n"
+        )
+        self.assertIn("base layer", scratch)
+        self.assertIn("scripts/profile-install.sh --claude-skills", scratch)
+        self.assertEqual(len(claude_md_copy_commands(scratch)), 1)
+        self.assertEqual(claude_md_copy_commands((ROOT / "README.md").read_text()), [])
+
 
 if __name__ == "__main__":
     unittest.main()
