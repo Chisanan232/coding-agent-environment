@@ -13,7 +13,7 @@ WORKFLOW = ROOT / ".claude/skills/engineering-workflow/SKILL.md"
 TITLE = re.compile(
     r"^\[(?:[A-Z][A-Z0-9]*-[0-9]+|[0-9]+)\] "
     r"(?P<emoji>✨|🐛|♻️|✅|📝|🔧|🔌|🪝|👨‍💻|🧭|⬆️|🗑️|🚨|🔒|🎨|🧪|👷|🛡️) "
-    r"[a-z0-9][a-z0-9._/-]*: (?P<summary>[^\n]+)$"
+    r"\([a-z0-9][a-z0-9._/-]*\): (?P<summary>[^\n]+)$"
 )
 
 
@@ -27,12 +27,12 @@ class EngineeringWorkflowContract(unittest.TestCase):
     def test_contract_owns_required_lifecycle_boundaries(self) -> None:
         text = WORKFLOW.read_text()
         required = [
-            "<release-or-phase>/<ticket>/<type>/<2-4_word_snake_summary>",
-            "<emoji> <scope>: <imperative summary>",
+            "<version-or-phase>/<ticket-id>/<short_summary>",
+            "<GitEmoji> (<scope>): <imperative summary>",
             "one concern and its necessary tests",
             "CI_UNAVAILABLE_EXTERNAL",
             "meaningful independent review",
-            "[<ticket-number>] <emoji> <scope>: <imperative summary under 60 chars>",
+            "[<TICKET>] <GitEmoji> (<scope>): <imperative summary under 60 chars>",
             "Create a merge commit",
             "Reconcile the authoritative Jira ticket or established issue tracker",
             "Remove the owned worktree",
@@ -56,7 +56,12 @@ class EngineeringWorkflowContract(unittest.TestCase):
             "`deps`", "`remove`", "`lint`", "`security`",
         ]:
             with self.subTest(change_type=change_type):
-                self.assertIn(change_type, text)
+                self.assertNotIn(change_type, text)
+        self.assertNotIn("<type>", text)
+        self.assertIn("<repo>-<phase>-<ticket>-<summary>", text)
+        self.assertIn("`✨ (model): Add property to TestModel`", text)
+        self.assertIn("Parentheses around the scope are required", text)
+        self.assertIn(".github/PULL_REQUEST_TEMPLATE.md", text)
 
     def test_admin_exceptions_preserve_failure_and_eligibility_boundaries(self) -> None:
         text = WORKFLOW.read_text()
@@ -117,32 +122,33 @@ class EngineeringWorkflowContract(unittest.TestCase):
 
     def test_pull_request_title_examples_and_negative_controls(self) -> None:
         valid = [
-            "[PROJ-123] ✨ restapi: Add user authentication",
-            "[PROJ-123] ✨ restapi: Add new user authentication endpoint",
-            "[42] 🐛 api: Fix retry leak",
-            "[SPE-33] 🔧 workflow: Unify engineering lifecycle contract",
-            "[SEC-7] 🔒 auth: Reject leaked credentials",
-            "[OPS-2] 👷 ci: Stabilize release checks",
-            "[SEC-8] 🛡️ privacy: Redact analytics metadata",
-            "[HORO-1033] ✨ web: Preserve console state and reading continuity",
+            "[PROJ-123] ✨ (restapi): Add user authentication",
+            "[PROJ-123] ✨ (restapi): Add new user authentication endpoint",
+            "[42] 🐛 (api): Fix retry leak",
+            "[SPE-33] 🔧 (workflow): Unify engineering lifecycle contract",
+            "[SEC-7] 🔒 (auth): Reject leaked credentials",
+            "[OPS-2] 👷 (ci): Stabilize release checks",
+            "[SEC-8] 🛡️ (privacy): Redact analytics metadata",
+            "[HORO-1033] ✨ (web): Preserve console state and reading continuity",
         ]
         invalid = [
             "SPE-33 🔧 workflow: Unify engineering lifecycle contract",
             "[SPE-33] workflow: Unify engineering lifecycle contract",
             "[SPE-33] config workflow: Unify engineering lifecycle contract",
             "[SPE-33] 🔧 Workflow Unify engineering lifecycle contract",
+            "[SPE-33] 🔧 workflow: Unify engineering lifecycle contract",
+            "[SPE-33] 🔧 (workflow) Unify engineering lifecycle contract",
             "🛡️ Redact analytics route metadata and UTM payloads",
             "✨ (web): Preserve console state and reading continuity [HORO-1033]",
-            "[HORO-1033] ✨ (web): Preserve console state and reading continuity",
             "[not a ticket] ✨ web: Preserve console state",
             "[SPE-33] 中文 workflow: Restore workflow parity",
-            "[SPE-33] 🔧 workflow: " + "x" * 60,
+            "[SPE-33] 🔧 (workflow): " + "x" * 60,
         ]
         self.assertTrue(all(structurally_valid_title(title) for title in valid))
         self.assertFalse(any(structurally_valid_title(title) for title in invalid))
 
     def test_imperative_meaning_remains_a_review_judgment(self) -> None:
-        nonimperative = "[SPE-33] 🔧 workflow: Was changed yesterday"
+        nonimperative = "[SPE-33] 🔧 (workflow): Was changed yesterday"
         self.assertTrue(structurally_valid_title(nonimperative))
         self.assertIn(
             "reviewers must assess\nwhether its summary actually uses imperative meaning",
@@ -158,7 +164,7 @@ class EngineeringWorkflowContract(unittest.TestCase):
         policy = (ROOT / "codex/AGENTS.md").read_text()
         self.assertIn("Use $engineering-workflow for the engineering lifecycle", policy)
         self.assertIn(
-            "[<ticket-number>] <emoji> <scope>: <imperative summary under 60 chars>",
+            "[<TICKET>] <GitEmoji> (<scope>): <imperative summary under 60 chars>",
             policy,
         )
 
