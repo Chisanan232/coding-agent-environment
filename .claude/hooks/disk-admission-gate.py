@@ -72,7 +72,7 @@ def _heredoc_word(text, index):
     quote = text[index] if index < len(text) and text[index] in '\'"' else ''
     index += bool(quote)
     start = index
-    while index < len(text) and (text[index] not in ' \t\n;&|<>()' if not quote else text[index] != quote):
+    while index < len(text) and (text[index] not in ' \t\r\n;&|<>()' if not quote else text[index] != quote):
         index += 1
     word = text[start:index]
     return word, strip, index + bool(quote)
