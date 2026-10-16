@@ -35,6 +35,7 @@ import os
 from pathlib import Path
 import pwd
 import subprocess
+import time
 
 GIB = 1024 ** 3
 EMERGENCY_BELOW = 20 * GIB
@@ -80,6 +81,7 @@ def decide(weight, free_bytes, state):
 
 
 STATE_VERSION = 1
+LOCK_TIMEOUT = 5.0
 STATE_RELATIVE = '.cache/coding-agent-environment/admission/state.json'
 
 
@@ -93,7 +95,11 @@ def default_state_path():
 
 
 class StateError(Exception):
-    """The state file or its location cannot be trusted."""
+    """The state file or its location cannot be trusted; kind names the refusal."""
+
+    def __init__(self, message, kind='state-untrusted'):
+        super().__init__(message)
+        self.kind = kind
 
 
 def _refuse_symlinks(path):
@@ -112,7 +118,16 @@ def state_lock(path):
     os.chmod(path.parent, 0o700)
     descriptor = os.open(str(path) + '.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        # Bounded: a stuck holder must produce a refusal, never a hung caller.
+        deadline = time.monotonic() + LOCK_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise StateError('lock held for more than %gs' % LOCK_TIMEOUT, 'state-lock-timeout')
+                time.sleep(0.05)
         yield
     finally:
         os.close(descriptor)
@@ -150,16 +165,16 @@ def read_state(path):
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as exc:
-        raise StateError('state unreadable: %s' % exc)
+        raise StateError('state unreadable: %s' % exc, 'state-corrupt')
     valid = (isinstance(record, dict) and record.get('version') == STATE_VERSION
              and type(record.get('latch')) is bool and type(record.get('free_bytes')) is int
              and record.get('tier') in ('emergency', 'low', 'stable', 'wide')
              and isinstance(record.get('timestamp'), str))
     if not valid:
-        raise StateError('state has the wrong schema')
+        raise StateError('state has the wrong schema', 'state-corrupt')
     # A record cannot honestly show an unlatched host below the latch line.
     if record['tier'] != tier(record['free_bytes']) or (not record['latch'] and record['free_bytes'] < EMERGENCY_BELOW):
-        raise StateError('state contradicts itself')
+        raise StateError('state contradicts itself', 'state-corrupt')
     return record
 
 
@@ -240,7 +255,7 @@ def evaluate(weight, state_path, free_fn=measure_free_bytes, now=None):
             try:
                 state, corrupt = read_state(state_path), None
             except StateError as exc:
-                if state_path.is_symlink() or state_path.parent.is_symlink():
+                if exc.kind != 'state-corrupt':
                     raise
                 # Unparsable state counts as latched until it is rewritten and free space recovers.
                 state, corrupt = {'latch': True}, str(exc)
@@ -257,7 +272,7 @@ def evaluate(weight, state_path, free_fn=measure_free_bytes, now=None):
                 reason = 'state-corrupt: %s; treated as latched' % corrupt
             record = write_state(state_path, free, new_state['latch'], now)
     except StateError as exc:
-        return dict(refused, reason='state-untrusted: %s' % exc)
+        return dict(refused, reason='%s: %s' % (exc.kind, exc))
     except OSError as exc:
         return dict(refused, reason='state-unwritable: %s' % exc)
     return dict(admit=admit, reason=reason, tier=record['tier'], free_bytes=free,
