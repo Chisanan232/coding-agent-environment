@@ -536,6 +536,15 @@ class Reservations(unittest.TestCase):
         # A host below the stable tier has no heavy lane at all.
         self.assertIn('refused', self.take('job-low', 1 * GIB, 60 * GIB)['reason'])
 
+    def test_live_reservations_reduce_remaining_headroom(self):
+        with mock.patch.dict(da.HEAVY_LANES, {'wide': 3}):
+            self.assertTrue(self.take('job-a', 40 * GIB, 200 * GIB)['admit'])
+            self.assertTrue(self.take('job-b', 40 * GIB, 200 * GIB)['admit'])
+            third = self.take('job-c', 40 * GIB, 200 * GIB)
+        self.assertFalse(third['admit'])
+        self.assertIn('over-capacity', third['reason'])
+        self.assertEqual(third['reserved_bytes'], 80 * GIB)
+
 
 if __name__ == '__main__':
     unittest.main()
