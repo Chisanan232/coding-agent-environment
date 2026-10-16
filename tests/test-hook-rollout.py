@@ -398,6 +398,11 @@ class Fixture(unittest.TestCase):
     def test_non_utf8_settings_are_refused_cleanly(self):
         self.refuses_bad_settings(b'{"statusLine": "\xff\xfe"}\n')
 
+    def test_invalid_json_and_a_missing_file_are_refused_cleanly(self):
+        self.refuses_bad_settings(b'{not json')
+        self.live.unlink()
+        self.assertEqual(self.run_cli('plan')[0], 10)
+
 
 if __name__ == '__main__':
     unittest.main()
