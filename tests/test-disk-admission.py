@@ -22,5 +22,16 @@ class Tiers(unittest.TestCase):
         self.assertEqual(da.tier(100 * 10 ** 9), 'low')
 
 
+class Decisions(unittest.TestCase):
+    def test_heavy_refused_below_100_gib(self):
+        for free in (0, 19 * GIB, 50 * GIB, 100 * GIB - 1):
+            admit, _, reason = da.decide('heavy', free, {})
+            self.assertFalse(admit, free)
+            self.assertIn('refused', reason)
+        # Negative control: at the boundary heavy work is admitted.
+        for free in (100 * GIB, 150 * GIB, 500 * GIB):
+            self.assertTrue(da.decide('heavy', free, {})[0], free)
+
+
 if __name__ == '__main__':
     unittest.main()
