@@ -603,5 +603,13 @@ class AuditTrail(unittest.TestCase):
         self.assertIn('BLOCKED', err.getvalue())
 
 
+class RolloutDocumentation(unittest.TestCase):
+    def test_docs_state_the_staged_rollout_audit_and_scope(self):
+        text = (ROOT / 'docs/STORAGE-INTEGRATION.md').read_text()
+        for needle in ('hook-rollout.py plan|apply|verify|rollback', 'gate-audit.jsonl', '--admission-dir',
+                       'WARN, verify, ENFORCE', 'not yet verifiable', 'Nothing here\nclaims host-wide coverage'):
+            self.assertIn(needle.lower(), text.lower().replace('  ', ' '), needle)
+
+
 if __name__ == '__main__':
     unittest.main()
