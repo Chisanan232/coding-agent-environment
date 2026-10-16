@@ -327,6 +327,13 @@ class Uncertain(unittest.TestCase):
         self.assertIn('unparsable', err)
         self.assertEqual(self.run_gate(self.UNPARSABLE, 'enforce', lambda: (0, 'ok')), (0, '', ''))
 
+    def test_unparsable_heavy_command_is_allowed_with_advice_in_warn(self):
+        def forbidden():
+            raise AssertionError('warn mode must not call the adapter for an unparsable command')
+        code, out, err = self.run_gate(self.UNPARSABLE, 'warn', forbidden)
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('unparsable', json.loads(out)['hookSpecificOutput']['additionalContext'])
+
 
 if __name__ == '__main__':
     unittest.main()
