@@ -621,6 +621,22 @@ class Snapshots(unittest.TestCase):
         low = self.shot(70 * GIB)
         self.assertTrue(any('below stable' in b or 'latched' in b for b in low['blockers']))
 
+    def test_snapshot_counts_reservations_and_reports_blockers(self):
+        self.shot(300 * GIB)
+        self.assertTrue(da.reserve('job-a', 40 * GIB, os.getpid(), self.path, lambda: 300 * GIB, now=self.now)['admit'])
+        record = self.shot(300 * GIB)
+        self.assertEqual((record['active_heavy_jobs'], record['reserved_bytes']), (1, 40 * GIB))
+        # An unreadable reservation is surfaced as a blocker rather than silently ignored.
+        (self.path.parent / 'reservations/bad.json').write_text('{')
+        self.assertIn('reservation-unreadable', ' '.join(self.shot(300 * GIB)['blockers']))
+        # An unreadable volume publishes a closed snapshot instead of a stale optimistic one.
+        def broken():
+            raise da.VolumeError('gone')
+        closed = da.snapshot(self.path, broken, now=self.now)
+        self.assertEqual((closed['tier'], closed['free_bytes'], closed['heavy_lanes_allowed'], closed['source']),
+                         (None, None, 0, None))
+        self.assertIn('volume-unreadable', closed['blockers'][0])
+
 
 if __name__ == '__main__':
     unittest.main()
