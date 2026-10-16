@@ -275,6 +275,17 @@ class EngineeringWorkflowContract(unittest.TestCase):
         self.assertIn("<version-or-phase>/<ticket-id>/<short_summary>", config)
         self.assertNotIn("<type>", config)
 
+    def test_skill_commit_examples_use_the_current_subject_format(self) -> None:
+        example = re.compile(r"`(?:✨|🐛|♻️|✅|📝|🔧|🔌|🪝|🗑️|🚨|🔒|⬆️) [^`\n]*`")
+        checked = 0
+        for path in sorted((ROOT / ".claude/skills").rglob("*.md")):
+            for match in example.finditer(path.read_text()):
+                subject = match.group(0).strip("`")
+                with self.subTest(path=str(path.relative_to(ROOT)), example=subject):
+                    checked += 1
+                    self.assertTrue(valid_commit_subject(subject))
+        self.assertGreater(checked, 5)
+
 
 if __name__ == "__main__":
     unittest.main()
