@@ -582,6 +582,20 @@ class Reservations(unittest.TestCase):
         self.assertFalse((self.path.parent / 'escape.json').exists())
         self.assertEqual(da.release('missing', self.path)['reason'], 'no reservation named missing')
 
+    def test_unreadable_reservation_file_blocks_new_reservations_and_is_kept(self):
+        self.assertTrue(self.take('job-ok', 10 * GIB, 300 * GIB)['admit'])
+        self.assertTrue(da.release('job-ok', self.path)['admit'])
+        stray = self.path.parent / 'reservations/stray.json'
+        stray.write_text('not json')
+        refused = self.take('job-next', 10 * GIB, 300 * GIB)
+        self.assertFalse(refused['admit'])
+        self.assertIn('reservation-unreadable', refused['reason'])
+        self.assertEqual(stray.read_text(), 'not json')
+        # Negative control: once the operator removes it, reservations work again.
+        stray.unlink()
+        self.assertTrue(self.take('job-next', 10 * GIB, 300 * GIB)['admit'])
+
+
 
 class Snapshots(unittest.TestCase):
     def setUp(self):
