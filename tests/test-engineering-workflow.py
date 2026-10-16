@@ -217,6 +217,20 @@ class EngineeringWorkflowContract(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
 
+    def test_jira_lifecycle_rules_are_owned_by_the_workflow(self) -> None:
+        text = " ".join(WORKFLOW.read_text().split())
+        for phrase in [
+            "move the ticket to In Progress when work really starts",
+            "post a real start comment",
+            "set Start Date to the actual date",
+            "set an estimated Due Date",
+            "never fabricate dates",
+            "Epic or Story cascades In Progress only for items that truly started",
+            "close a ticket only when every acceptance criterion passes",
+        ]:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
 
 if __name__ == "__main__":
     unittest.main()
