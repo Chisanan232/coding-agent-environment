@@ -240,3 +240,27 @@ context or stronger reasoning (see Delegation Model above).
 - A skill must not enter a self-repair cycle — it must report failure and exit.
 - If a repair action is needed, the skill reports it; the engineer or agent decides.
 
+## MCP-Backed Systems
+
+Claude Code can use MCP-connected tools when available. Check `.mcp.json` for
+what is configured. The following capability categories may be available:
+
+| Capability | What it provides | When to use |
+|---|---|---|
+| `code_repository` | Git operations, PR creation, branch management | Branching, PRs, diffs |
+| `issue_tracking` | Read/write issues and tickets | Linking commits to issues |
+| `communication` | Post to Slack, notify teams | Status updates on deploys |
+| `static_analysis` | SonarQube quality gates, code smells | Pre-PR quality checks |
+| `coverage_reporting` | Codecov coverage trends | Coverage regression detection |
+| `observability` | Datadog, Sentry alerts, logs | Incident triage |
+| `knowledge_search` | Confluence, Notion, internal docs | Architecture lookups |
+| `browser_automation` | Playwright UI interaction | Web UI acceptance testing |
+
+When an MCP-backed capability is available for a task, prefer it over manual
+approximation. When it is not available, proceed without it and note the gap.
+
+**Active vs opt-in servers:** `fetch` and `github` are active by default.
+All other servers (`sonarqube`, `playwright`, `slack`, `clickup`, `jira`, `codecov`, `datadog`)
+are disabled by default and must be enabled per-project in the project's `.mcp.json`
+or by setting their required credentials in the environment.
+
