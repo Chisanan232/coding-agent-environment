@@ -44,7 +44,7 @@ Auto-used. Run when a PR has new review comments or a "Request Changes" verdict.
    b. Apply the minimal change that satisfies the comment.
    c. Run impacted tests after the change.
    d. Commit the fix as a standalone atomic commit referencing the reviewer:
-      Example: `🔧 fix(module): Address review feedback — [short description]`
+      Example: `🔧 (module): Address review feedback - [short description]`
 7. For each Discuss comment:
    a. Post a reply on the PR explaining the trade-off or asking a clarifying
       question. Do not make the change until consensus is reached.
