@@ -729,5 +729,34 @@ class HungAdapter(unittest.TestCase):
         self.assertLess(took, 10)
 
 
+class ConfigErrors(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name).resolve() / 'default-dir'
+        self.dir.mkdir()
+        patcher = mock.patch.object(gate, 'AUDIT_ENABLED', True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_gate(self, command, mode, error='--admission-dir \'rel/dir\' is not an absolute path'):
+        (self.dir / 'mode').write_text(mode)
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}})
+        out, err = io.StringIO(), io.StringIO()
+        code = gate.main(payload, out, err, runner=lambda: (0, 'ok'), admission_dir=self.dir, config_error=error)
+        log = self.dir / 'gate-audit.jsonl'
+        lines = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        return code, out.getvalue(), err.getvalue(), lines
+
+    def test_config_parsing_flags_relative_tilde_missing_and_unknown_arguments(self):
+        self.assertEqual(gate.admission_dir_config(['--admission-dir', '/ok/dir']), (Path('/ok/dir'), None))
+        self.assertEqual(gate.admission_dir_config([]), (None, None))
+        for argv in (['--admission-dir', 'rel'], ['--admission-dir=~/x'], ['--admission-dir'], ['--admision-dir', '/x'],
+                     ['--admission-dir', '/ok', '--extra']):
+            error = gate.admission_dir_config(argv)[1]
+            self.assertIsNotNone(error, argv)
+        self.assertIsNone(gate.admission_dir_config(['--admission-dir', '/ok'])[1])
+
+
 if __name__ == '__main__':
     unittest.main()
