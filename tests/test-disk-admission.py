@@ -756,6 +756,16 @@ class ReservationHardening(unittest.TestCase):
         self.assertIn('process-not-owned', other['reason'])
         self.assertTrue(self.take('job-mine')['admit'])
 
+    def test_hold_longer_than_4_hours_needs_max_hold_and_is_capped_at_24(self):
+        four, day = 4 * 3600, 24 * 3600
+        with mock.patch.dict(da.HEAVY_LANES, {'wide': 4}):
+            self.assertTrue(self.take('job-4h', ttl=four)['admit'])
+            self.assertIn('invalid-request', self.take('job-5h', ttl=four + 1)['reason'])
+            self.assertTrue(self.take('job-24h', ttl=day, allow_long=True)['admit'])
+        self.assertIn('invalid-request', self.take('job-25h', ttl=day + 1, allow_long=True)['reason'])
+        record = json.loads((self.path.parent / 'reservations/job-4h.json').read_text())
+        self.assertEqual(record['expires'], '2026-10-16T16:00:00Z')
+
 
 if __name__ == '__main__':
     unittest.main()
