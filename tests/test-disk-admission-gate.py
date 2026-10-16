@@ -711,6 +711,12 @@ class HungAdapter(unittest.TestCase):
         self.assertIn('could not be evaluated', err)
         self.assertLess(took, 10)
 
+    def test_hung_adapter_only_advises_in_warn(self):
+        code, out, err, took = self.run_gate('warn')
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('could not be evaluated', json.loads(out)['hookSpecificOutput']['additionalContext'])
+        self.assertLess(took, 10)
+
 
 if __name__ == '__main__':
     unittest.main()
