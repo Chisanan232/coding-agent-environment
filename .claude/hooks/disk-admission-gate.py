@@ -329,14 +329,32 @@ def target_dir_advice(verdict, exists=os.path.exists):
     return None
 
 
-MODE_RELATIVE = '.cache/coding-agent-environment/admission/mode'
+ADMISSION_RELATIVE = '.cache/coding-agent-environment/admission'
 DENY_EXIT = 2
 ADAPTER_TIMEOUT_S = 30
 
 
+def default_admission_dir():
+    return account_home() / ADMISSION_RELATIVE
+
+
+def parse_admission_dir(argv):
+    """Value of --admission-dir from the hook command line, else None.
+
+    The flag comes from the command registered in settings.json, which only the
+    operator edits; the agent's Bash commands cannot change it.
+    """
+    for index, arg in enumerate(argv):
+        value = arg.partition('=')[2] if arg.startswith('--admission-dir=') else (
+            argv[index + 1] if arg == '--admission-dir' and index + 1 < len(argv) else None)
+        if value is not None:
+            return Path(value) if os.path.isabs(value) else None
+    return None
+
+
 def read_mode(path=None):
     """'enforce' only when the operator's mode file says exactly so; anything else is warn."""
-    path = path or account_home() / MODE_RELATIVE
+    path = path or default_admission_dir() / 'mode'
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         with os.fdopen(descriptor, 'rb') as handle:
@@ -355,11 +373,30 @@ def adapter_path():
     return next((candidate for candidate in candidates if candidate.is_file()), None)
 
 
-def run_adapter():
+def _run_adapter_in_process(adapter, admission_dir):
+    """Sandbox use only: the adapter has no state-path flag, so call its main() directly."""
+    import contextlib
+    import importlib.util
+    import io
+    spec = importlib.util.spec_from_file_location('disk_admission_adapter', adapter)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        code = module.run(['check', '--weight', 'heavy'], state_path=admission_dir / 'state.json')
+    return code, captured.getvalue().strip()[:300]
+
+
+def run_adapter(admission_dir=None):
     """(exit code, one-line text) of `disk-admission.py check --weight heavy`; code None on failure."""
     adapter = adapter_path()
     if adapter is None:
         return None, 'disk-admission.py not found'
+    if admission_dir is not None and admission_dir != default_admission_dir():
+        try:
+            return _run_adapter_in_process(adapter, admission_dir)
+        except Exception as exc:
+            return None, str(exc)
     try:
         done = subprocess.run([sys.executable, str(adapter), 'check', '--weight', 'heavy'], capture_output=True,
                               text=True, timeout=ADAPTER_TIMEOUT_S, stdin=subprocess.DEVNULL)
@@ -409,9 +446,9 @@ TAMPER_NOTE = ('command appears to modify the disk-admission state directory (mo
                'reservations); only the operator should edit it')
 
 
-def tamper_suspect(command):
+def tamper_suspect(command, needles=(STATE_NEEDLE,)):
     """Best-effort: does this command write, move or remove under the admission state directory?"""
-    if STATE_NEEDLE not in command:
+    if not any(needle in command for needle in needles):
         return False
     try:
         simple_commands = split_commands(command)
@@ -429,14 +466,14 @@ def tamper_suspect(command):
         if program == 'sed' and any(w.startswith('-i') or w == '--in-place' for w in words[1:]):
             return True
         script = _shell_script(words)
-        if script is not None and tamper_suspect(script):
+        if script is not None and tamper_suspect(script, needles):
             return True
     return False
 
 
-def decide(command, mode, runner=run_adapter, exists=os.path.exists):
+def decide(command, mode, runner=run_adapter, exists=os.path.exists, needles=(STATE_NEEDLE,)):
     """Return (exit code, stdout text, stderr text) for one Bash command."""
-    if not tamper_suspect(command):
+    if not tamper_suspect(command, needles):
         return _decide_heavy(command, mode, runner, exists)
     if mode == 'enforce':
         return DENY_EXIT, '', 'BLOCKED by disk-admission-gate (mode enforce): tamper-suspect: ' + TAMPER_NOTE
@@ -448,7 +485,12 @@ def decide(command, mode, runner=run_adapter, exists=os.path.exists):
     return code, json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'additionalContext': note}}), err
 
 
-def main(raw, stdout, stderr, mode_fn=read_mode, runner=run_adapter):
+def main(raw, stdout, stderr, mode_fn=None, runner=None, admission_dir=None):
+    directory = admission_dir or default_admission_dir()
+    custom = admission_dir is not None
+    mode_fn = mode_fn or (lambda: read_mode(directory / 'mode'))
+    runner = runner or (lambda: run_adapter(directory if custom else None))
+    needles = (STATE_NEEDLE,) + ((str(directory),) if custom else ())
     try:
         if isinstance(raw, bytes):
             raw = raw.decode('utf-8', 'replace')
@@ -460,7 +502,7 @@ def main(raw, stdout, stderr, mode_fn=read_mode, runner=run_adapter):
     except Exception:
         return 0
     try:
-        code, out, err = decide(command, mode, runner)
+        code, out, err = decide(command, mode, runner, needles=needles)
     except Exception as exc:
         if mode != 'enforce':
             return 0
@@ -473,4 +515,4 @@ def main(raw, stdout, stderr, mode_fn=read_mode, runner=run_adapter):
 
 
 if __name__ == '__main__':
-    raise SystemExit(main(sys.stdin.buffer.read(), sys.stdout, sys.stderr))
+    raise SystemExit(main(sys.stdin.buffer.read(), sys.stdout, sys.stderr, admission_dir=parse_admission_dir(sys.argv[1:])))
