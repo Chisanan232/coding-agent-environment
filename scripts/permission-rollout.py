@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -102,6 +103,29 @@ FORMER_DENY_COMMANDS = [
     "gcloud --project=p secrets versions access latest --secret=s",
     "rtk proxy git log",
 ]
+
+
+def baseline_not_merged(path):
+    """Return a reason string unless `path` is a tracked, committed file of this repo
+    whose HEAD is contained in origin/main (fetch first; the check uses the local ref)."""
+    p = Path(path).resolve()
+    try:
+        rel = p.relative_to(ROOT)
+    except ValueError:
+        return f"baseline {p} is outside the repository {ROOT}"
+
+    def git(*args):
+        return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True)
+
+    if git("ls-files", "--error-unmatch", str(rel)).returncode != 0:
+        return "baseline is not tracked by git"
+    if git("diff", "--quiet", "HEAD", "--", str(rel)).returncode != 0:
+        return "baseline has uncommitted changes"
+    if git("rev-parse", "--verify", "-q", "origin/main").returncode != 0:
+        return "origin/main is unknown; run `git fetch origin main` first"
+    if git("merge-base", "--is-ancestor", "HEAD", "origin/main").returncode != 0:
+        return "HEAD is not contained in origin/main (the baseline is not merged yet)"
+    return None
 
 
 def sha(path):
@@ -254,9 +278,19 @@ def merge(live, base, owners, dev_dirs=()):
     return new
 
 
+CATCH_ALL_ALLOWS = {"Bash", "Bash(*)", "Bash(:*)", "*", "Edit", "Write", "Read(*)", "mcp__*"}
+
+
 def problems(live, base=None):
     out = []
     p = live.get("permissions", {})
+    if base is not None:
+        missing = [r for r in base["permissions"]["ask"] if r not in p.get("ask", [])]
+        if missing:
+            out.append(f"baseline ask rules missing from the result: {missing[:5]}")
+    catch = [r for r in p.get("allow", []) if r in CATCH_ALL_ALLOWS]
+    if catch:
+        out.append(f"catch-all allow rule(s) would outrank the classifier: {catch}")
     if p.get("deny"):
         out.append(f"permissions.deny is not empty: {len(p['deny'])} entries")
     if p.get("defaultMode") != "auto":
@@ -311,10 +345,13 @@ def main(argv=None):
     ap.add_argument("--live", default=str(LIVE))
     ap.add_argument("--owners", default="", help="comma-separated trusted GitHub owners (account + administered orgs)")
     ap.add_argument("--dev-dirs", default="", help="comma-separated personal development roots, e.g. ~/Bryant-Developments")
+    ap.add_argument("--unmerged-ok", action="store_true",
+                    help="rehearsal only: allow a baseline that is not merged to origin/main (never for the real live file)")
     ap.add_argument("--expect-live-sha")
     ap.add_argument("--expect-baseline-sha")
     ap.add_argument("--backup", help="backup file to restore (rollback)")
     a = ap.parse_args(argv)
+    a.baseline_given = any(x == "--baseline" or x.startswith("--baseline=") for x in (argv if argv is not None else sys.argv[1:]))
     owners = [o.strip() for o in a.owners.split(",") if o.strip()]
     dev_dirs = [d.strip() for d in a.dev_dirs.split(",") if d.strip()]
     for o in owners:
@@ -331,7 +368,8 @@ def main(argv=None):
     if a.mode == "rollback":
         return rollback(live_p, a.backup)
     if a.mode == "verify":
-        found = problems(json.loads(live_p.read_text()))
+        base_for_verify = json.loads(Path(a.baseline).read_text()) if a.baseline_given else None
+        found = problems(json.loads(live_p.read_text()), base_for_verify)
         print("\n".join(found) if found else "verify OK: zero static deny, former-deny commands ask, defaults intact")
         return 1 if found else 0
 
@@ -356,6 +394,11 @@ def main(argv=None):
         return 2
     if a.mode == "plan":
         return 0
+    if not a.unmerged_ok:
+        why = baseline_not_merged(a.baseline)
+        if why:
+            print(f"REFUSING: {why}. Deploy only a merged baseline (or pass --unmerged-ok for a rehearsal on a copy).")
+            return 7
     if a.expect_live_sha != live_sha or a.expect_baseline_sha != base_sha:
         print("REFUSING: --expect-live-sha / --expect-baseline-sha do not match the inputs; re-review required")
         return 3

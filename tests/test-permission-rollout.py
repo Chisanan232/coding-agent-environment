@@ -310,7 +310,7 @@ class CuratedEnvironmentLines(Fixture):
 class FileModes(Fixture):
     def test_extra_files_keep_the_live_files_mode(self):
         os.chmod(self.live_p, 0o600)
-        rc, out = self.run_tool("apply", "--baseline", str(self.base_p), "--live", str(self.live_p),
+        rc, out = self.run_tool("apply", "--baseline", str(self.base_p), "--live", str(self.live_p), "--unmerged-ok",
                                 "--expect-live-sha", rollout.sha(self.live_p), "--expect-baseline-sha", rollout.sha(self.base_p))
         self.assertEqual(0, rc, out)
         backup = next((self.home / ".claude/backups").glob("settings.json.pre-SPE-106.*"))
@@ -332,7 +332,7 @@ class FileModes(Fixture):
 
 class CommandModes(Fixture):
     def args(self, *extra):
-        return ["--baseline", str(self.base_p), "--live", str(self.live_p), "--owners", "OwnerA", *extra]
+        return ["--baseline", str(self.base_p), "--live", str(self.live_p), "--owners", "OwnerA", "--unmerged-ok", *extra]
 
     def test_plan_writes_nothing(self):
         before = self.live_p.read_bytes()
@@ -437,6 +437,91 @@ class CommandModes(Fixture):
         self.assertEqual(1, rc)
         self.assertIn("permissions.deny is not empty", out)
         self.assertIn('lacks "$defaults"', out)
+
+
+class MergedBaselineGate(Fixture):
+    """The real live file may only receive a baseline that is committed and contained in origin/main."""
+
+    def git(self, *a, cwd=None):
+        import subprocess
+        return subprocess.run(["git", *a], cwd=cwd or self.repo, capture_output=True, text=True, check=True)
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.home / "repo"
+        self.remote = self.home / "remote.git"
+        self.remote.mkdir()
+        self.git("init", "-q", "--bare", "-b", "main", cwd=self.remote)
+        (self.repo / ".claude").mkdir(parents=True)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "t@t")
+        self.git("config", "user.name", "t")
+        (self.repo / ".claude/settings.json").write_text(json.dumps(BASELINE))
+        self.git("add", "-A")
+        self.git("commit", "-qm", "base")
+        self.git("remote", "add", "origin", str(self.remote))
+        self._root = rollout.ROOT
+        rollout.ROOT = self.repo.resolve()
+        self.tracked = self.repo / ".claude/settings.json"
+
+    def tearDown(self):
+        rollout.ROOT = self._root
+        super().tearDown()
+
+    def apply(self, *extra):
+        return self.run_tool("apply", "--baseline", str(self.tracked), "--live", str(self.live_p),
+                             "--expect-live-sha", rollout.sha(self.live_p), "--expect-baseline-sha", rollout.sha(self.tracked), *extra)
+
+    def test_a_baseline_outside_the_repo_is_refused(self):
+        rc, out = self.run_tool("apply", "--baseline", str(self.base_p), "--live", str(self.live_p),
+                                "--expect-live-sha", rollout.sha(self.live_p), "--expect-baseline-sha", rollout.sha(self.base_p))
+        self.assertEqual(7, rc, out)
+        self.assertIn("outside the repository", out)
+
+    def test_committed_but_unmerged_is_refused_then_merged_is_accepted(self):
+        before = self.live_p.read_bytes()
+        self.git("push", "-q", "origin", "main")
+        self.git("fetch", "-q", "origin", "main")
+        (self.repo / "other.txt").write_text("x")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "unmerged work")
+        rc, out = self.apply()
+        self.assertEqual(7, rc, out)
+        self.assertIn("not contained in origin/main", out)
+        self.assertEqual(before, self.live_p.read_bytes())
+        self.git("push", "-q", "origin", "main")
+        self.git("fetch", "-q", "origin", "main")
+        rc, out = self.apply()
+        self.assertEqual(0, rc, out)
+
+    def test_uncommitted_baseline_edits_are_refused(self):
+        self.git("push", "-q", "origin", "main")
+        self.git("fetch", "-q", "origin", "main")
+        edited = json.loads(self.tracked.read_text())
+        edited["permissions"]["allow"].append("Bash(echo extra:*)")
+        self.tracked.write_text(json.dumps(edited))
+        rc, out = self.apply()
+        self.assertEqual(7, rc, out)
+        self.assertIn("uncommitted", out)
+
+    def test_unmerged_ok_is_the_only_override(self):
+        rc, out = self.apply("--unmerged-ok")
+        self.assertEqual(0, rc, out)
+
+
+class StaticGate(Fixture):
+    def test_verify_with_a_baseline_flags_missing_ask_rules(self):
+        merged = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [])
+        merged["permissions"]["ask"].remove("Bash(rtk proxy *)")
+        self.live_p.write_text(json.dumps(merged))
+        rc, out = self.run_tool("verify", "--live", str(self.live_p), "--baseline", str(self.base_p))
+        self.assertEqual(1, rc)
+        self.assertIn("baseline ask rules missing", out)
+
+    def test_catch_all_allow_rules_are_flagged(self):
+        merged = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [])
+        merged["permissions"]["allow"].append("Bash(*)")
+        self.assertIn("catch-all allow", "\n".join(rollout.problems(merged)))
 
 
 if __name__ == "__main__":

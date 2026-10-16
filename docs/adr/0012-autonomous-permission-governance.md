@@ -297,7 +297,11 @@ control" entries. `scripts/permission-rollout.py` merges the baseline into a liv
 file: it hashes the exact bytes it merges, requires both expected hashes,
 refuses a symlinked live file, writes exclusive-create backups, replaces the file
 atomically through a private fsynced temp file with the original mode, and its
-`rollback` validates the backup and saves the current file first. Global-option
+`rollback` validates the backup and saves the current file first. `apply` also
+refuses any baseline that is not a tracked, committed file whose HEAD is contained
+in `origin/main` (`--unmerged-ok` exists for rehearsals on copies only), and `verify
+--baseline` checks that every baseline ask rule is present and that no catch-all
+allow rule outranks the classifier. Global-option
 `worktree remove` stays `ask` (ownership protection); global-option `worktree add`
 force flags are `ask`.
 
