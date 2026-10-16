@@ -201,6 +201,13 @@ class Newlines(unittest.TestCase):
         # Negative control: the same lines without a heavy command stay light.
         self.assertFalse(self.heavy('echo a\necho cargo build'))
 
+    def test_heredoc_body_is_data(self):
+        self.assertFalse(self.heavy('cat <<EOF\ncargo build\nEOF'))
+        self.assertFalse(self.heavy("cat <<'EOF'\ncargo build\nEOF\nls"))
+        self.assertFalse(self.heavy('cat <<-EOF\n\tcargo build\n\tEOF\nls'))
+        # Negative control: a command after the terminator is real.
+        self.assertTrue(self.heavy('cat <<EOF\nx\nEOF\ncargo test'))
+
 
 if __name__ == '__main__':
     unittest.main()
