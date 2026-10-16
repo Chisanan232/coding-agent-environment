@@ -327,6 +327,11 @@ class Hardening(unittest.TestCase):
         self.assertEqual(path, account / da.STATE_RELATIVE)
         self.assertFalse(str(path).startswith(self.temp.name))
 
+    def test_default_state_lives_outside_resource_lock_namespace(self):
+        relative = da.STATE_RELATIVE
+        self.assertNotIn('aa-qa', relative)
+        self.assertEqual(relative, '.cache/coding-agent-environment/admission/state.json')
+
 
 if __name__ == '__main__':
     unittest.main()
