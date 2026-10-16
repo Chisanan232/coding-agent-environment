@@ -161,12 +161,9 @@ def state_lock(path):
         os.close(descriptor)
 
 
-def write_state(path, free_bytes, latch, now=None):
-    """Atomically replace the state file; call while holding state_lock."""
+def write_json_atomic(path, record):
+    """Atomically replace a private JSON file; call while holding state_lock."""
     _refuse_symlinks(path)
-    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    record = {'version': STATE_VERSION, 'timestamp': stamp.isoformat(timespec='seconds').replace('+00:00', 'Z'),
-              'free_bytes': free_bytes, 'tier': tier(free_bytes), 'latch': bool(latch)}
     # Random per call: a leftover from a crashed writer must never block later writes.
     temporary = path.with_name('.%s.%s.tmp' % (path.name, secrets.token_hex(8)))
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -188,6 +185,17 @@ def write_state(path, free_bytes, latch, now=None):
         except FileNotFoundError:
             pass
         raise
+
+
+def iso_utc(moment):
+    return moment.astimezone(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
+
+
+def write_state(path, free_bytes, latch, now=None):
+    """Atomically replace the state file; call while holding state_lock."""
+    record = {'version': STATE_VERSION, 'timestamp': iso_utc(now or datetime.now(timezone.utc)),
+              'free_bytes': free_bytes, 'tier': tier(free_bytes), 'latch': bool(latch)}
+    write_json_atomic(path, record)
     return record
 
 
