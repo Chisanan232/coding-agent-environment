@@ -712,5 +712,22 @@ class FreshnessCli(unittest.TestCase):
         self.assertEqual(self.check()[0], 77)
 
 
+class ReservationHardening(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name).resolve() / 'admission/state.json'
+        self.now = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+
+    def take(self, label, nbytes=10 * GIB, free=300 * GIB, pid=None, **extra):
+        return da.reserve(label, nbytes, pid or os.getpid(), self.path, lambda: free, now=self.now, **extra)
+
+    def test_label_with_trailing_newline_is_rejected(self):
+        for label in ('ok\n', 'ok\n\n', '\nok'):
+            self.assertIn('invalid-request', self.take(label)['reason'], repr(label))
+            self.assertIn('invalid-request', da.release(label, self.path)['reason'], repr(label))
+        self.assertTrue(self.take('ok')['admit'])
+
+
 if __name__ == '__main__':
     unittest.main()
