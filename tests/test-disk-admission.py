@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Disk-pressure admission core refuses unsafe work and fails closed."""
 from importlib.util import module_from_spec, spec_from_file_location
+import json
+import os
 from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = spec_from_file_location('disk_admission', ROOT / 'scripts/disk-admission.py')
@@ -66,6 +70,34 @@ class Decisions(unittest.TestCase):
         # Negative control: the same free space without a latch admits light work.
         self.assertTrue(da.decide('light', 25 * GIB, {})[0])
         self.assertTrue(da.decide('light', 50 * GIB, latched)[0])
+
+
+class State(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / 'admission/state.json'
+
+    def write(self, free, latch):
+        with da.state_lock(self.path):
+            return da.write_state(self.path, free, latch)
+
+    def test_state_written_atomically_with_timestamp(self):
+        self.write(36 * GIB, True)
+        record = json.loads(self.path.read_text())
+        self.assertEqual(record['version'], 1)
+        self.assertEqual((record['free_bytes'], record['tier'], record['latch']), (36 * GIB, 'low', True))
+        self.assertTrue(record['timestamp'].endswith('Z'))
+        from datetime import datetime
+        datetime.fromisoformat(record['timestamp'].replace('Z', '+00:00'))
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
+        # A failed replace leaves the previous complete record and no temp file behind.
+        with mock.patch.object(da.os, 'replace', side_effect=OSError('boom')):
+            with self.assertRaises(OSError):
+                self.write(500 * GIB, False)
+        self.assertEqual(json.loads(self.path.read_text()), record)
+        self.assertEqual(sorted(entry.name for entry in self.path.parent.iterdir()), ['state.json', 'state.json.lock'])
 
 
 if __name__ == '__main__':
