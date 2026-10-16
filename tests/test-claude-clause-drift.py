@@ -56,6 +56,11 @@ class ClauseDrift(unittest.TestCase):
         self.assertEqual(result.stdout.count("MISSING overlay keyword"), 1)
         self.assertNotIn("SYNTHETIC-KEYWORD-ONE", result.stdout)
 
+    def test_absent_live_policy_fails_without_reading_anything_else(self) -> None:
+        result = self.report()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Live policy absent", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
