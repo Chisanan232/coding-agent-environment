@@ -386,6 +386,27 @@ class Hardening(unittest.TestCase):
         self.assertTrue(da.evaluate('light', self.path, lambda: 500 * GIB)['admit'])
         self.assertEqual(stale.read_text(), 'leftover from a crashed writer')
 
+    def test_state_and_directory_are_synced_and_temp_is_exclusive(self):
+        synced, flags = [], {}
+        real_open, real_fsync = os.open, os.fsync
+
+        def spy_open(target, mode, *args):
+            flags[os.path.basename(target)] = mode
+            return real_open(target, mode, *args)
+
+        def spy_fsync(descriptor):
+            synced.append(stat.S_ISDIR(os.fstat(descriptor).st_mode))
+            return real_fsync(descriptor)
+
+        with mock.patch.object(da.os, 'open', spy_open), mock.patch.object(da.os, 'fsync', spy_fsync):
+            self.assertTrue(da.evaluate('light', self.path, lambda: 500 * GIB)['admit'])
+        # One fsync for the file contents, one for the directory entry of the rename.
+        self.assertEqual(sorted(synced), [False, True])
+        temporary = [mode for name, mode in flags.items() if name.endswith('.tmp')]
+        self.assertEqual(len(temporary), 1)
+        self.assertTrue(temporary[0] & os.O_EXCL and temporary[0] & os.O_NOFOLLOW)
+        self.assertTrue(flags['state.json.lock'] & os.O_NOFOLLOW)
+
 
 if __name__ == '__main__':
     unittest.main()
