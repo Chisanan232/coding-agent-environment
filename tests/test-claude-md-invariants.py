@@ -178,6 +178,15 @@ class ClaudeMdInvariants(unittest.TestCase):
         self.assertIn("(references/model-routing-and-delegation.md)", text)
         self.assertTrue((ROOT / ".claude/skills/architecture-design/references/model-routing-and-delegation.md").is_file())
 
+    def test_claude_md_links_to_the_file_owning_each_moved_clause(self) -> None:
+        claude = (ROOT / CLAUDE).read_text()
+        for clause_id, path, _, _ in MANIFEST:
+            if path == CLAUDE:
+                continue
+            target = path.removeprefix(".claude/")
+            with self.subTest(clause=clause_id):
+                self.assertIn(f"]({target})", claude)
+
 
 if __name__ == "__main__":
     unittest.main()
