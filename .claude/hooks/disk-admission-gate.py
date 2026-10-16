@@ -42,6 +42,8 @@ import sys
 OPERATORS = {';', '&&', '||', '|', '&', '(', ')', '|&', ';;', '\n'}
 WRAPPERS = {'env', 'time', 'command', 'nohup', 'nice', 'exec', 'rtk', 'sudo'}
 SHELLS = {'bash', 'sh', 'zsh', 'dash'}
+# Control-flow words that precede a command in a compound statement.
+KEYWORDS = {'{', '!', 'if', 'then', 'else', 'elif', 'do', 'while', 'until'}
 CARGO_HEAVY = {'build', 'b', 'test', 't', 'check', 'c', 'doc', 'clippy', 'nextest', 'bench', 'rustdoc'}
 CARGO_VALUE_OPTIONS = {'-C', '--config', '-Z', '--color'}
 NODE_HEAVY = {'install', 'i', 'ci', 'build'}
@@ -149,7 +151,9 @@ def _command_words(tokens):
     assignments, index = [], 0
     while index < len(tokens):
         token = tokens[index]
-        if _is_assignment(token):
+        if token in KEYWORDS:
+            pass
+        elif _is_assignment(token):
             assignments.append(token)
         elif os.path.basename(token) in WRAPPERS:
             pass
