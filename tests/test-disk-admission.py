@@ -700,6 +700,17 @@ class FreshnessCli(unittest.TestCase):
         self.assertIn('unusable', text)
         self.assertFalse(self.path.parent.exists())
 
+    def test_unreadable_or_forged_snapshot_exits_77(self):
+        self.publish(10)
+        file = self.path.parent / 'snapshot.json'
+        for content in ('', '{not json', '[]', json.dumps({'schema': 2, 'ts': '2026-10-16T12:00:00Z'}),
+                        json.dumps({'schema': 1, 'ts': 'yesterday'}), json.dumps({'schema': 1})):
+            file.write_text(content)
+            self.assertEqual(self.check()[0], 77, content)
+        file.unlink()
+        os.symlink(self.path, file)
+        self.assertEqual(self.check()[0], 77)
+
 
 if __name__ == '__main__':
     unittest.main()
