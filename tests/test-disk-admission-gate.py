@@ -757,6 +757,14 @@ class ConfigErrors(unittest.TestCase):
             self.assertIsNotNone(error, argv)
         self.assertIsNone(gate.admission_dir_config(['--admission-dir', '/ok'])[1])
 
+    def test_warn_mode_advises_loudly_and_records_a_config_error_line(self):
+        code, out, err, lines = self.run_gate('cargo build', 'warn')
+        self.assertEqual((code, err), (0, ''))
+        context = json.loads(out)['hookSpecificOutput']['additionalContext']
+        self.assertIn('configuration error', context)
+        self.assertIn('not an absolute path', context)
+        self.assertEqual([(l['classification'], l['decision']) for l in lines][:1], [('config-error', 'warn')])
+
 
 if __name__ == '__main__':
     unittest.main()
