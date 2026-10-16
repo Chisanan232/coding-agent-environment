@@ -327,8 +327,10 @@ the personal Claude Code installation, not to the directory a session started in
 It is applied at rollout from private parameters, never committed: `--owners`
 (verified GitHub owners) fills the trusted-owner entries, and `--dev-dirs` (explicit
 personal development roots) fills (a) one `autoMode.environment` line declaring
-repositories and worktrees under those roots, existing and future, trusted
-development context, (b) one narrow `autoMode.allow` exception so work in another
+repositories and worktrees under those roots whose origin is owned by a trusted
+owner trusted development context (location alone never grants trust: a clone from
+any other owner keeps its external provenance; found by the independent
+`claude auto-mode critique`), (b) one narrow `autoMode.allow` exception so work in another
 repository under the same roots is not "wandering into other repos", and (c)
 `permissions.additionalDirectories`, the documented file-access grant (Read/Edit/
 Write/Glob/Grep, recursive, same permission rules as the working directory, not
