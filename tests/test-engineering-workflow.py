@@ -243,6 +243,14 @@ class EngineeringWorkflowContract(unittest.TestCase):
         self.assertIn("qualified `CI_UNAVAILABLE_EXTERNAL`", text)
         self.assertIn("Private repositories require the full local suite", text)
 
+    def test_pull_request_template_exists_with_evidence_sections(self) -> None:
+        template = ROOT / ".github/PULL_REQUEST_TEMPLATE.md"
+        self.assertTrue(template.is_file())
+        text = template.read_text()
+        for heading in ["## Outcome", "## Validation", "## Risks and unknowns", "## References"]:
+            with self.subTest(heading=heading):
+                self.assertIn(heading, text)
+
 
 if __name__ == "__main__":
     unittest.main()
