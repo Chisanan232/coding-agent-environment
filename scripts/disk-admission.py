@@ -282,43 +282,50 @@ def measure_free_bytes(glomeris=read_glomeris_free, statvfs=read_free_bytes):
     return min(values)
 
 
+REFUSED = {'admit': False, 'tier': None, 'free_bytes': None, 'latch': None, 'timestamp': None}
+
+
+def _evaluate_locked(weight, state_path, free_fn, now):
+    """The measure-decide-persist step; the caller holds state_lock."""
+    try:
+        free = free_fn()
+    except VolumeError as exc:
+        return dict(REFUSED, reason='volume-unreadable: %s' % exc)
+    try:
+        state, corrupt = read_state(state_path), None
+    except StateError as exc:
+        if exc.kind != 'state-corrupt':
+            raise
+        # Unparsable state counts as latched until it is rewritten and free space recovers.
+        state, corrupt = {'latch': True}, str(exc)
+    # Lost history cannot prove the host never fell below 20 GiB, so below
+    # 50 GiB a missing record is latched; only fresh free space releases it.
+    missing = not state and free < RELEASE_AT and corrupt is None
+    if missing:
+        state = {'latch': True}
+    admit, new_state, reason = decide(weight or 'light', free, state)
+    if missing:
+        reason = 'state-missing: %s' % reason
+    if corrupt:
+        admit, new_state = False, dict(new_state, latch=True)
+        reason = 'state-corrupt: %s; treated as latched' % corrupt
+    record = write_state(state_path, free, new_state['latch'], now)
+    return dict(admit=admit, reason=reason, tier=record['tier'], free_bytes=free,
+                latch=record['latch'], timestamp=record['timestamp'])
+
+
 def evaluate(weight, state_path, free_fn=measure_free_bytes, now=None):
     """Measure, decide and persist under one lock; weight None only refreshes state.
 
     Returns a result dict. admit is False whenever anything is untrustworthy.
     """
-    refused = {'admit': False, 'tier': None, 'free_bytes': None, 'latch': None, 'timestamp': None}
     try:
         with state_lock(state_path):
-            try:
-                free = free_fn()
-            except VolumeError as exc:
-                return dict(refused, reason='volume-unreadable: %s' % exc)
-            try:
-                state, corrupt = read_state(state_path), None
-            except StateError as exc:
-                if exc.kind != 'state-corrupt':
-                    raise
-                # Unparsable state counts as latched until it is rewritten and free space recovers.
-                state, corrupt = {'latch': True}, str(exc)
-            # Lost history cannot prove the host never fell below 20 GiB, so below
-            # 50 GiB a missing record is latched; only fresh free space releases it.
-            missing = not state and free < RELEASE_AT and corrupt is None
-            if missing:
-                state = {'latch': True}
-            admit, new_state, reason = decide(weight or 'light', free, state)
-            if missing:
-                reason = 'state-missing: %s' % reason
-            if corrupt:
-                admit, new_state = False, dict(new_state, latch=True)
-                reason = 'state-corrupt: %s; treated as latched' % corrupt
-            record = write_state(state_path, free, new_state['latch'], now)
+            return _evaluate_locked(weight, state_path, free_fn, now)
     except StateError as exc:
-        return dict(refused, reason='%s: %s' % (exc.kind, exc))
+        return dict(REFUSED, reason='%s: %s' % (exc.kind, exc))
     except OSError as exc:
-        return dict(refused, reason='state-unwritable: %s' % exc)
-    return dict(admit=admit, reason=reason, tier=record['tier'], free_bytes=free,
-                latch=record['latch'], timestamp=record['timestamp'])
+        return dict(REFUSED, reason='state-unwritable: %s' % exc)
 
 
 REFUSED_EXIT = 77
