@@ -521,6 +521,16 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.snapshot_tree(), before)
         self.assertEqual(target.read_text(), 'untouched')
 
+    def test_a_valid_absolute_destination_is_accepted_and_a_second_apply_is_idempotent(self):
+        self.assertEqual(self.apply()[0], 0)
+        after = self.snapshot_tree()
+        code, text = self.run_cli('apply', '--hook-dest', str(self.dest))
+        self.assertEqual(code, 0)
+        self.assertIn('already installed', text)
+        self.assertEqual(self.snapshot_tree(), after)
+        groups = json.loads(self.live.read_text())['hooks']['PreToolUse']
+        self.assertEqual(sum(1 for g in groups if hr.GATE_MARK in json.dumps(g)), 1)
+
 
 class CommandDerivation(unittest.TestCase):
     def test_command_uses_the_tilde_form_under_home_and_quotes_other_paths(self):
