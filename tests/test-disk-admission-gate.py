@@ -714,6 +714,16 @@ class HarnessWorkdir(unittest.TestCase):
                 self.harness.claim_workdir(fake_repo / 'sub')
         self.assertTrue((fake_repo / self.harness.SENTINEL).exists())
 
+    def test_hash_candidates_tolerate_only_semicolon_spacing(self):
+        import hashlib
+        sha = lambda text: hashlib.sha256(text.encode()).hexdigest()[:12]
+        candidates = self.harness.sha_candidates('cargo build --help ; touch ran-H1')
+        for text in ('cargo build --help ; touch ran-H1', 'cargo build --help; touch ran-H1', 'cargo build --help;touch ran-H1'):
+            self.assertIn(sha(text), candidates, text)
+        # Negative controls: a different command or flag is a real difference.
+        for text in ('cargo build --release ; touch ran-H1', 'cargo build --help ; touch ran-H2', 'cargo  build --help ; touch ran-H1'):
+            self.assertNotIn(sha(text), candidates, text)
+
 
 class HungAdapter(unittest.TestCase):
     def setUp(self):
