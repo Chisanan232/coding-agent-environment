@@ -60,5 +60,26 @@ class Classification(unittest.TestCase):
             self.assertIn(name, doc)
 
 
+class TargetAdvice(unittest.TestCase):
+    def advice(self, command, exists=lambda path: False):
+        return gate.target_dir_advice(gate.classify(command), exists)
+
+    def test_new_scratch_target_dir_gets_shared_target_advice(self):
+        scratch = '/private/tmp/claude-501/x/scratchpad/target'
+        for command in ('CARGO_TARGET_DIR=%s cargo build' % scratch, 'cargo test --target-dir %s' % scratch,
+                        'cargo test --target-dir=%s' % scratch, 'env CARGO_TARGET_DIR=/tmp/t cargo check',
+                        'rtk cargo build --target-dir /var/folders/ab/T/t'):
+            message = self.advice(command)
+            self.assertIn('shared target', message or '', command)
+            self.assertIn('.cargo/shared-target', message)
+        # Negative controls: existing dir, shared target, non-scratch path, no override, non-cargo.
+        self.assertIsNone(self.advice('CARGO_TARGET_DIR=%s cargo build' % scratch, lambda path: True))
+        self.assertIsNone(self.advice('cargo build --target-dir ~/.cargo/shared-target'))
+        self.assertIsNone(self.advice('cargo build --target-dir /Users/someone/work/target'))
+        self.assertIsNone(self.advice('cargo build'))
+        self.assertIsNone(self.advice('npm ci'))
+        self.assertIsNone(self.advice('cargo build --target-dir relative/target'))
+
+
 if __name__ == '__main__':
     unittest.main()
