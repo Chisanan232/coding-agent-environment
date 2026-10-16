@@ -80,7 +80,16 @@ def decide(weight, free_bytes, state):
 
 
 STATE_VERSION = 1
-DEFAULT_STATE_PATH = Path.home() / '.cache/aa-qa/admission/state.json'
+STATE_RELATIVE = '.cache/aa-qa/admission/state.json'
+
+
+def account_home():
+    # The account database, not $HOME: the environment is caller-controlled.
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def default_state_path():
+    return account_home() / STATE_RELATIVE
 
 
 class StateError(Exception):
@@ -173,11 +182,6 @@ def read_free_bytes():
 
 
 GLOMERIS_TIMEOUT = 10
-
-
-def account_home():
-    # The account database, not $HOME: the environment is caller-controlled.
-    return Path(pwd.getpwuid(os.getuid()).pw_dir)
 
 
 def read_glomeris_free():
@@ -274,7 +278,8 @@ def build_parser():
     return parser
 
 
-def main(argv=None, free_fn=measure_free_bytes, state_path=DEFAULT_STATE_PATH):
+def main(argv=None, free_fn=measure_free_bytes, state_path=None):
+    state_path = state_path or default_state_path()
     args = build_parser().parse_args(argv)
     result = evaluate(args.weight if args.command == 'check' else None, state_path, free_fn)
     if args.command == 'status':
