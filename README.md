@@ -84,13 +84,15 @@ clauses that exist only in your live file. Run `scripts/sync-check.sh` first to
 see drift, and never overwrite `~/.claude/CLAUDE.md` with `cp`.
 
 Install the instruction policy with the marker-span installer instead.
-`scripts/profile-install.sh --claude-skills` (add `--dry-run` or `--check` to
-preview) reads only the block between the
-`coding-agent-environment:engineering-workflow:start` and `:end` markers in
-`.claude/CLAUDE.md`. If the live file already has those markers, only that span is
-replaced in place; if it has content but no markers, the block is appended; if the
-file is absent, it is created from the block alone. Everything outside the span is
-left untouched.
+`scripts/profile-install.sh --claude-skills` changes two things in `~/.claude`.
+For `CLAUDE.md` it merges only the block between the
+`coding-agent-environment:engineering-workflow:start` and `:end` markers: replaced
+in place if the live file has markers, appended if it has content but no markers,
+created if absent; everything outside the span is untouched. It also overwrites
+every shared skill file under `~/.claude/skills` with the repository copy, and it
+saves a backup of replaced files under `~/.claude/backups/coding-agent-environment/`.
+Run `scripts/profile-install.sh --claude-skills --dry-run` or `--check` first to
+see the drift before anything is written.
 
 Copy the remaining files into your home config (review first):
 
