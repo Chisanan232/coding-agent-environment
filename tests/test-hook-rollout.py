@@ -135,6 +135,18 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.live.read_text(), json.dumps(hr.with_gate(LIVE), indent=2, ensure_ascii=False) + '\n')
         self.assertEqual(stat.S_IMODE(self.live.stat().st_mode), 0o600)
 
+    def test_apply_backs_up_the_settings_hash_exact_and_writes_a_receipt(self):
+        before = self.live.read_bytes()
+        self.assertEqual(self.apply()[0], 0)
+        (backup,) = [p for p in self.backups.iterdir() if p.name.startswith('settings.json.pre-SPE-109.')]
+        self.assertEqual(backup.read_bytes(), before)
+        self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
+        (receipt,) = [p for p in self.backups.iterdir() if p.name.endswith('.json') and 'receipt' in p.name]
+        data = json.loads(receipt.read_text())
+        self.assertEqual(data['settings_backup'], str(backup))
+        self.assertEqual(data['settings_sha_before'], hashlib.sha256(before).hexdigest())
+        self.assertTrue(data['hook_created'])
+
 
 if __name__ == '__main__':
     unittest.main()
