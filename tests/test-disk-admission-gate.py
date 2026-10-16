@@ -771,6 +771,15 @@ class ConfigErrors(unittest.TestCase):
         self.assertIn('configuration error', err)
         self.assertEqual([(l['classification'], l['decision']) for l in lines], [('config-error', 'deny')])
 
+    def test_enforce_mode_still_allows_benign_commands_with_an_advisory(self):
+        code, out, err, lines = self.run_gate('git status', 'enforce')
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('configuration error', json.loads(out)['hookSpecificOutput']['additionalContext'])
+        self.assertEqual([l['decision'] for l in lines], ['warn'])
+        # Negative control: a valid configuration produces no advisory for the same command.
+        (self.dir / 'gate-audit.jsonl').unlink()
+        self.assertEqual(self.run_gate('git status', 'enforce', error=None)[1:], ('', '', []))
+
 
 if __name__ == '__main__':
     unittest.main()
