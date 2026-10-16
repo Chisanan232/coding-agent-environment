@@ -167,31 +167,31 @@ class GlobalFlagReorderingAskRegression(unittest.TestCase):
     just not yet applied to these two deny rules until now. Mirrors the
     verification methodology already used for SPE-83's allow-side fix."""
 
-    def test_terraform_destroy_still_denied_with_a_preceding_global_flag(self):
-        deny = load_settings()["permissions"]["ask"]
+    def test_terraform_destroy_still_ask_gated_with_a_preceding_global_flag(self):
+        ask = load_settings()["permissions"]["ask"]
         for cmd in ("terraform -chdir=/tmp destroy", "terraform destroy",
                     "terraform -chdir=/tmp apply -destroy",
                     "terraform apply -auto-approve -destroy",
                     "terraform apply -destroy"):
             with self.subTest(cmd=cmd):
-                self.assertTrue(any(bash_rule_matches(cmd, r) for r in deny), f"not ask-gated: {cmd!r}")
+                self.assertTrue(any(bash_rule_matches(cmd, r) for r in ask), f"not ask-gated: {cmd!r}")
 
-    def test_terraform_plan_with_the_destroy_flag_is_not_falsely_denied(self):
+    def test_terraform_plan_with_the_destroy_flag_is_not_falsely_ask_gated(self):
         """`terraform plan -destroy` never mutates anything — it's exactly
         as read-only as `terraform plan`. The fix for the above must not
         turn this into a false block."""
-        deny = load_settings()["permissions"]["ask"]
+        ask = load_settings()["permissions"]["ask"]
         for cmd in ("terraform plan -destroy", "terraform plan", "terraform init", "terraform fmt"):
             with self.subTest(cmd=cmd):
-                self.assertFalse(any(bash_rule_matches(cmd, r) for r in deny), f"incorrectly ask-gated: {cmd!r}")
+                self.assertFalse(any(bash_rule_matches(cmd, r) for r in ask), f"incorrectly ask-gated: {cmd!r}")
 
-    def test_gcloud_secrets_access_still_denied_with_a_preceding_global_flag(self):
-        deny = load_settings()["permissions"]["ask"]
+    def test_gcloud_secrets_access_still_ask_gated_with_a_preceding_global_flag(self):
+        ask = load_settings()["permissions"]["ask"]
         for cmd in ("gcloud --project=evil secrets versions access latest",
                     "gcloud secrets versions access latest",
                     "rtk gcloud --project=evil secrets versions access latest"):
             with self.subTest(cmd=cmd):
-                self.assertTrue(any(bash_rule_matches(cmd, r) for r in deny), f"not ask-gated: {cmd!r}")
+                self.assertTrue(any(bash_rule_matches(cmd, r) for r in ask), f"not ask-gated: {cmd!r}")
 
 
 class RTKPrefixTwinCoverage(unittest.TestCase):
@@ -545,9 +545,7 @@ class SPE105EffectiveBehavior(unittest.TestCase):
         self.assertEqual("$defaults", entries[0])
         merge = [e for e in entries if "merge" in e.lower()]
         self.assertEqual(1, len(merge))
-        for needle in ("A user message", "a user message", "--merge", "--match-head-commit", "--squash", "gh pr checks", "--admin", "never excuses a failing check"):
-            if needle in ("A user message", "a user message"):
-                continue
+        for needle in ("--merge", "--match-head-commit", "--squash", "gh pr checks", "--admin", "never excuses a failing check"):
             self.assertIn(needle, merge[0])
         self.assertIn("user message", merge[0])
         self.assertNotIn("global instructions", merge[0], "the classifier may not see CLAUDE.md; conditions must be transcript-verifiable")
