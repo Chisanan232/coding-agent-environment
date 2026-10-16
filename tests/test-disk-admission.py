@@ -710,6 +710,17 @@ class FreshnessCli(unittest.TestCase):
         os.symlink(self.path, file)
         self.assertEqual(self.check()[0], 77)
 
+    def test_max_age_cannot_relax_the_120_second_rule(self):
+        self.publish(500)
+        for relaxed in ('99999', '121', '0', '-5'):
+            code, text = self.check('--max-age', relaxed)
+            self.assertEqual(code, 77, relaxed)
+            self.assertIn('--max-age', text)
+        self.assertEqual(self.check()[0], 77)
+        # Negative control: a fresh snapshot passes with the limit at its maximum.
+        self.publish(10)
+        self.assertEqual(self.check('--max-age', '120')[0], 0)
+
 
 class ReservationHardening(unittest.TestCase):
     def setUp(self):
