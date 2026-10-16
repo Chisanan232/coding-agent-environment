@@ -236,6 +236,11 @@ class Compound(unittest.TestCase):
         self.assertTrue(self.heavy('if true; then echo a; else cargo test; fi'))
         self.assertFalse(self.heavy('if cargo --version; then echo ok; fi'))
 
+    def test_loop_body_is_heavy(self):
+        self.assertTrue(self.heavy('for crate in a b; do cargo test -p $crate; done'))
+        self.assertTrue(self.heavy('while true; do npm ci; done'))
+        self.assertFalse(self.heavy('for x in a b; do echo $x; done'))
+
 
 if __name__ == '__main__':
     unittest.main()
