@@ -176,6 +176,14 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.snapshot_tree(), before)
         self.assertFalse(self.dest.exists())
 
+    def test_wrong_live_sha_is_refused_and_nothing_is_written(self):
+        before = self.snapshot_tree()
+        code, _ = self.run_cli('apply', '--expect-live-sha', '1' * 64,
+                               '--expect-hook-sha', hashlib.sha256(self.src.read_bytes()).hexdigest(), '--unmerged-ok')
+        self.assertEqual(code, 3)
+        self.assertEqual(self.snapshot_tree(), before)
+        self.assertEqual(self.run_cli('apply', '--unmerged-ok')[0], 3)
+
 
 if __name__ == '__main__':
     unittest.main()
