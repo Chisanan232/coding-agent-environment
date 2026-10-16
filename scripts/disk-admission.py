@@ -327,6 +327,21 @@ def process_token(pid):
     raise ReservationError('cannot inspect process %d: ps exit %d' % (pid, done.returncode))
 
 
+def process_owner(pid):
+    """Owning uid of a live process, None when it is gone."""
+    try:
+        done = subprocess.run(['/bin/ps', '-o', 'uid=', '-p', str(pid)], capture_output=True, text=True,
+                              timeout=5, stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/bin:/usr/bin'})
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReservationError('cannot inspect process %d: %s' % (pid, exc))
+    value = done.stdout.strip()
+    if done.returncode == 0 and value.isdigit():
+        return int(value)
+    if done.returncode == 1 and not value:
+        return None
+    raise ReservationError('cannot inspect process %d: ps exit %d' % (pid, done.returncode))
+
+
 def reservations_dir(state_path):
     return state_path.parent / RESERVATIONS_DIR
 
@@ -448,7 +463,7 @@ def _refusal(reason, **extra):
 
 
 def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None,
-            token_fn=process_token, ttl=DEFAULT_TTL):
+            token_fn=process_token, ttl=DEFAULT_TTL, owner_fn=process_owner):
     """Admit one heavy job and record its byte reservation, or refuse.
 
     Admission needs: heavy admitted by tier and latch, a free heavy lane, and
@@ -471,6 +486,12 @@ def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None
             token = token_fn(pid)
             if token is None:
                 return dict(result, admit=False, reason='process-not-running: pid %d' % pid)
+            try:
+                owner = owner_fn(pid)
+            except ReservationError as exc:
+                return dict(result, admit=False, reason='process-unverifiable: %s' % exc)
+            if owner != os.getuid():
+                return dict(result, admit=False, reason='process-not-owned: pid %d is not run by this user' % pid)
             same = [r for r in live if r['label'] == label]
             if same and (same[0]['pid'], same[0]['start_token']) != (pid, token):
                 return dict(result, admit=False, reason='label-in-use: %s belongs to another live process' % label)
