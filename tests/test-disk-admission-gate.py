@@ -223,5 +223,14 @@ class Newlines(unittest.TestCase):
         self.assertEqual((verdict['heavy'], verdict['confidence']), (False, 'exact'))
 
 
+class Compound(unittest.TestCase):
+    def heavy(self, command):
+        return gate.classify(command)['heavy']
+
+    def test_brace_group_is_heavy(self):
+        self.assertTrue(self.heavy('{ cargo build; }'))
+        self.assertFalse(self.heavy('{ echo cargo build; }'))
+
+
 if __name__ == '__main__':
     unittest.main()
