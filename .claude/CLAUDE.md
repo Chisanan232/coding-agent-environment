@@ -521,6 +521,9 @@ Spawn an isolated sub-agent only when one of these is genuinely true:
 4. **Genuine parallelism** — two provably independent pieces of work that
    don't touch overlapping files/state.
 
+Use at most seven concurrent subagents (dynamic 0-7, one owner per scope), as
+owned by `engineering-workflow`.
+
 Do not invent new fixed role names as a substitute for the old roster.
 When none of the above applies, do the work directly.
 
