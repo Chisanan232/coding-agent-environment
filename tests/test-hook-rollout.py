@@ -416,6 +416,21 @@ class Fixture(unittest.TestCase):
         self.assertFalse(self.dest.exists())
         self.assertEqual(self.live.read_text(), self.live_text)
 
+    def test_a_change_between_the_temp_write_and_the_rename_is_detected(self):
+        real_chmod = os.chmod
+
+        def chmod_then_change(path, mode):
+            real_chmod(path, mode)
+            if os.path.basename(str(path)).startswith('settings.json.hookroll.'):
+                self.live.write_text(self.live_text.replace('git status', 'git log'))
+        with mock.patch.object(hr.os, 'chmod', chmod_then_change):
+            code, text = self.apply()
+        self.assertEqual(code, 5)
+        self.assertIn('immediately before the write', text)
+        self.assertEqual(self.live.read_text(), self.live_text.replace('git status', 'git log'))
+        self.assertFalse(self.dest.exists())
+        self.assertEqual([p.name for p in self.live.parent.iterdir() if '.hookroll.' in p.name], [])
+
 
 if __name__ == '__main__':
     unittest.main()
