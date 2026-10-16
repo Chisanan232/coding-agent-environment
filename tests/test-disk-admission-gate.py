@@ -703,6 +703,17 @@ class HarnessWorkdir(unittest.TestCase):
                 with self.assertRaises(self.harness.RefusedWorkdir, msg=str(path)):
                     self.harness.claim_workdir(path)
 
+    def test_the_repository_guard_holds_even_when_the_repository_carries_the_sentinel(self):
+        fake_repo = self.base / 'fake-repo'
+        fake_repo.mkdir()
+        (fake_repo / self.harness.SENTINEL).write_text('x')
+        with mock.patch.object(self.harness, 'ROOT', fake_repo):
+            with self.assertRaises(self.harness.RefusedWorkdir):
+                self.harness.claim_workdir(fake_repo)
+            with self.assertRaises(self.harness.RefusedWorkdir):
+                self.harness.claim_workdir(fake_repo / 'sub')
+        self.assertTrue((fake_repo / self.harness.SENTINEL).exists())
+
 
 class HungAdapter(unittest.TestCase):
     def setUp(self):
