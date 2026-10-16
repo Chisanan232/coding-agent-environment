@@ -23,6 +23,14 @@ class Classification(unittest.TestCase):
         # Negative control: the same words as a real command are heavy.
         self.assertTrue(self.heavy('cargo build'))
 
+    def test_each_supported_heavy_tool_is_heavy(self):
+        for command in ('cargo build', 'cargo test -p x', 'cargo check', 'cargo doc', 'cargo clippy', 'cargo nextest run',
+                        'cargo bench', 'cargo rustdoc', 'cargo +nightly build', 'cargo -C x test', '/opt/homebrew/bin/cargo build',
+                        'maturin build', 'maturin develop', 'npm install', 'npm ci', 'npm build', 'pnpm install',
+                        'pnpm build', 'yarn install', 'yarn', 'uv sync', 'uv pip install x', 'pip install x',
+                        'python3 -m pip install x', 'docker build .', 'docker buildx build .', 'xcodebuild -scheme x'):
+            self.assertTrue(self.heavy(command), command)
+
 
 if __name__ == '__main__':
     unittest.main()
