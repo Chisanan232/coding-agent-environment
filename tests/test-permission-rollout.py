@@ -225,6 +225,11 @@ class PersonalDevTrust(Fixture):
             self.assertIn(rule, new["permissions"]["ask"])
         self.assertEqual([], rollout.problems(new))
 
+    def test_dev_dirs_without_any_trusted_owner_is_refused(self):
+        # The dev-trust prose refers to the trusted owners; it must never dangle.
+        with self.assertRaises(ValueError):
+            rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [], ["~/dev"])
+
     def test_dev_trust_is_bound_to_owner_provenance_not_location(self):
         # A clone from another owner dropped into the dev directory must not
         # inherit trust from its location (auto-mode critique, SPE-106).
