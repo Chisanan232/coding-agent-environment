@@ -174,6 +174,15 @@ class EngineeringWorkflowContract(unittest.TestCase):
         self.assertEqual(workflow.count("- '.claude/skills/**'"), 2)
         self.assertIn("python3 tests/test-engineering-workflow.py", workflow)
 
+    def test_all_repository_changes_go_through_pull_requests(self) -> None:
+        text = WORKFLOW.read_text()
+        self.assertIn("All repository code changes go through pull requests", text)
+        self.assertIn("never push or merge to `main`", text)
+        claude = (ROOT / ".claude/CLAUDE.md").read_text()
+        for stale in ["Quick-Fix Path", "Push directly", "quick-fix path"]:
+            with self.subTest(stale=stale):
+                self.assertNotIn(stale, claude)
+
 
 if __name__ == "__main__":
     unittest.main()
