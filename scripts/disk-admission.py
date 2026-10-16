@@ -297,7 +297,7 @@ def measure_free_bytes(glomeris=read_glomeris_free, statvfs=read_free_bytes):
 
 
 RESERVATIONS_DIR = 'reservations'
-LABEL_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$')
+LABEL_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._-]{0,63}')
 DEFAULT_TTL = 4 * 3600
 MAX_TTL = 24 * 3600
 HEAVY_FLOOR = LOW_BELOW
@@ -350,7 +350,7 @@ def _read_reservation(path):
             raise ValueError('not a regular file')
         record = json.loads(handle.read(65536))
     valid = (isinstance(record, dict) and record.get('version') == STATE_VERSION
-             and record.get('label') == path.stem and LABEL_RE.match(path.stem)
+             and record.get('label') == path.stem and LABEL_RE.fullmatch(path.stem)
              and type(record.get('bytes')) is int and record['bytes'] > 0
              and type(record.get('pid')) is int and record['pid'] > 0
              and isinstance(record.get('start_token'), str) and isinstance(record.get('expires'), str))
@@ -452,7 +452,7 @@ def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None
     the 100 GiB floor. Everything runs under the state lock, so concurrent
     callers cannot jointly overcommit.
     """
-    if not (isinstance(label, str) and LABEL_RE.match(label) and type(nbytes) is int and nbytes > 0
+    if not (isinstance(label, str) and LABEL_RE.fullmatch(label) and type(nbytes) is int and nbytes > 0
             and type(pid) is int and pid > 0 and type(ttl) is int and 0 < ttl <= MAX_TTL):
         return _refusal('invalid-request: label, bytes, pid or ttl is out of range')
     now = now or datetime.now(timezone.utc)
@@ -491,7 +491,7 @@ def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None
 
 def release(label, state_path):
     """Delete this tool's reservation file for label; a missing one is success."""
-    if not (isinstance(label, str) and LABEL_RE.match(label)):
+    if not (isinstance(label, str) and LABEL_RE.fullmatch(label)):
         return _refusal('invalid-request: bad label')
     try:
         with state_lock(state_path):
