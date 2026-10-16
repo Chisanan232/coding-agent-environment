@@ -484,6 +484,14 @@ class AdmissionDirFlag(unittest.TestCase):
         self.assertIsNone(gate.parse_admission_dir(['--admission-dir']))
         self.assertIsNone(gate.parse_admission_dir([]))
 
+    def test_mode_is_read_from_the_sandbox_directory(self):
+        refuses = lambda: (77, 'heavy refused in tier low')
+        self.assertEqual(self.run_gate('cargo build', refuses)[0], 0)  # no mode file: warn
+        (self.dir / 'mode').write_text('enforce\n')
+        code, out, err = self.run_gate('cargo build', refuses)
+        self.assertEqual((code, out), (2, ''))
+        self.assertIn('BLOCKED', err)
+
 
 
 if __name__ == '__main__':
