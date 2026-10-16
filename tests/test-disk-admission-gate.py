@@ -546,6 +546,15 @@ class AuditTrail(unittest.TestCase):
         self.assertEqual(self.lines(), [])
         self.assertFalse(self.log.exists())
 
+    def test_audit_line_never_contains_the_command_text(self):
+        command = 'cargo build --features SECRET_MARKER_8431 -p hidden-crate'
+        self.run_gate(command)
+        raw = self.log.read_text()
+        for fragment in ('SECRET_MARKER_8431', 'hidden-crate', '--features', 'cargo build'):
+            self.assertNotIn(fragment, raw)
+        import hashlib
+        self.assertEqual(self.lines()[0]['cmd_sha12'], hashlib.sha256(command.encode()).hexdigest()[:12])
+
 
 if __name__ == '__main__':
     unittest.main()
