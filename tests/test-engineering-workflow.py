@@ -286,6 +286,17 @@ class EngineeringWorkflowContract(unittest.TestCase):
                     self.assertTrue(valid_commit_subject(subject))
         self.assertGreater(checked, 5)
 
+    def test_subagent_maximum_is_seven_and_owned_only_by_the_workflow(self) -> None:
+        text = " ".join(WORKFLOW.read_text().split())
+        self.assertIn("at most seven concurrent subagents (dynamic 0-7)", text)
+        self.assertIn("one owner per scope", text)
+        for adapter in [ROOT / "codex/AGENTS.md", ROOT / ".claude/CLAUDE.md"]:
+            adapter_text = " ".join(adapter.read_text().split())
+            with self.subTest(adapter=str(adapter.relative_to(ROOT))):
+                self.assertIn("engineering-workflow` Delegation section", adapter_text)
+                for stale in ["Eight", "1..8", "0..7", "dynamic 0-7"]:
+                    self.assertNotIn(stale, adapter_text)
+
 
 if __name__ == "__main__":
     unittest.main()
