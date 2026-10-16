@@ -168,6 +168,19 @@ class Decisions(unittest.TestCase):
                 self.assertNotIn('permissionDecision', text)
         self.assertEqual({code for code, _, _ in outputs}, {0, 2})
 
+    def test_unusable_input_is_allowed_and_target_advice_never_denies(self):
+        def forbidden():
+            raise AssertionError('adapter must not run')
+        for raw in ('', 'not json', '[]', '{"tool_name": "Bash"}', '{"tool_name": "Bash", "tool_input": {"command": 5}}'):
+            out, err = io.StringIO(), io.StringIO()
+            self.assertEqual(gate.main(raw, out, err, mode_fn=lambda: 'enforce', runner=forbidden), 0, raw)
+            self.assertEqual((out.getvalue(), err.getvalue()), ('', ''))
+        self.assertEqual(self.run_gate('cargo build', 'enforce', forbidden, tool='Read'), (0, '', ''))
+        code, out, err = self.run_gate('CARGO_TARGET_DIR=/private/tmp/never-existed-x cargo build', 'enforce',
+                                       lambda: (0, 'ok'))
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('shared target', json.loads(out)['hookSpecificOutput']['additionalContext'])
+
 
 if __name__ == '__main__':
     unittest.main()
