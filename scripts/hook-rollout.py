@@ -379,10 +379,15 @@ def rollback(args):
     if hook_backup:
         hook_data = Path(hook_backup).read_bytes()
     if data is not None and live_p.exists() and live_p.read_bytes() != data:
+        current = live_p.read_bytes()
         saved = live_p.with_name('%s.pre-rollback.%d' % (live_p.name, time.time_ns()))
-        rollout.write_new(saved, live_p.read_bytes(), live_p.stat().st_mode & 0o777)
+        rollout.write_new(saved, current, live_p.stat().st_mode & 0o777)
         print('current settings saved to %s' % saved)
-        rollout.atomic_write(live_p, data)
+        try:
+            replace_if_unchanged(live_p, data, current)
+        except SettingsChanged:
+            print('REFUSING: the live file changed immediately before the restore; nothing was restored')
+            return 5
         print('restored %s from %s' % (live_p, backup))
     elif data is not None:
         print('settings already match the backup; nothing to restore')
