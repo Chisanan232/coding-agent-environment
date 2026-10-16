@@ -95,9 +95,9 @@ def _refuse_symlinks(path):
 def state_lock(path):
     """Serialize every read-modify-write of the state file across processes."""
     _refuse_symlinks(path)
-    if not path.parent.exists():
-        os.makedirs(path.parent, mode=0o700)
-        os.chmod(path.parent, 0o700)
+    # exist_ok: two first-time callers may race to create the directory.
+    os.makedirs(path.parent, mode=0o700, exist_ok=True)
+    os.chmod(path.parent, 0o700)
     descriptor = os.open(str(path) + '.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
