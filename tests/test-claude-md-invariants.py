@@ -158,6 +158,11 @@ class ClaudeMdInvariants(unittest.TestCase):
         self.assertIn("(references/cross-repo-work.md)", text)
         self.assertTrue((ROOT / ".claude/skills/cross-repo-coordinator/references/cross-repo-work.md").is_file())
 
+    def test_feature_implementation_skill_links_its_reference(self) -> None:
+        text = (ROOT / ".claude/skills/feature-implementation/SKILL.md").read_text()
+        self.assertIn("(references/quality-policies.md)", text)
+        self.assertTrue((ROOT / ".claude/skills/feature-implementation/references/quality-policies.md").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
