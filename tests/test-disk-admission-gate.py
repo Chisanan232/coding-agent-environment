@@ -672,6 +672,17 @@ class HarnessWorkdir(unittest.TestCase):
         self.assertFalse((work / 'sandbox-admission').exists())
         self.assertEqual((work / 'unrelated.txt').read_text(), 'keep')
 
+    def test_a_directory_inside_a_git_working_tree_is_refused(self):
+        repo = self.base / 'repo'
+        repo.mkdir()
+        gate_subprocess = __import__('subprocess')
+        gate_subprocess.run(['git', 'init', '-q'], cwd=repo, check=True)
+        with self.assertRaises(self.harness.RefusedWorkdir):
+            self.harness.claim_workdir(repo)
+        with self.assertRaises(self.harness.RefusedWorkdir):
+            self.harness.claim_workdir(repo / 'child')
+        self.assertFalse((repo / 'child').exists())
+
 
 if __name__ == '__main__':
     unittest.main()
