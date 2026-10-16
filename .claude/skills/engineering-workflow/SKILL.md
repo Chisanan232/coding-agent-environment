@@ -80,6 +80,12 @@ infrastructure or account condition prevented the job from running or completing
 Record that cause and run the full local equivalent. A product, test, security, or
 quality failure is never `CI_UNAVAILABLE_EXTERNAL` and must be fixed.
 
+## Delegation
+
+Use at most seven concurrent subagents (dynamic 0-7), with one owner per scope.
+Seven is a ceiling, never a target; choose the count from dependencies, cost,
+expected speedup, mutable-state overlap, and integration overhead.
+
 ## Review and open the pull request
 
 Review the complete diff and commit range yourself. Then obtain a
