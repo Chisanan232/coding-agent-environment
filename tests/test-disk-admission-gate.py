@@ -290,6 +290,11 @@ class Compound(unittest.TestCase):
         self.assertTrue(self.heavy('cargo --manifest-path=x/Cargo.toml test'))
         self.assertFalse(self.heavy('cargo --manifest-path x/Cargo.toml metadata'))
 
+    def test_cargo_toolchain_selector_before_the_subcommand_is_heavy(self):
+        self.assertTrue(self.heavy('cargo +nightly build'))
+        self.assertTrue(self.heavy('cargo +1.80 -C x --locked test'))
+        self.assertFalse(self.heavy('cargo +nightly fmt'))
+
 
 if __name__ == '__main__':
     unittest.main()
