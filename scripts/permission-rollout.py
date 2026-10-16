@@ -70,7 +70,7 @@ MIGRATION = {
     # contradict the ownership policy, and older copies of lines the baseline carries.
     "retire_env_always": [
         "### ", "routine under ", "**Trusted repo**", "**Worktree cleanup**",
-        "**git -C convention**", "**Secrets**: never materialize",
+        "**git -C convention**",
         "**Force-push**: every force-push (--force,", "**Command rewriting**: a PreToolUse hook (`rtk hook claude`)",
         "**File/directory deletion (2026-10-10)**", "**gh api method classification (2026-10-10)**",
     ],
@@ -122,6 +122,13 @@ def static_decision(command, perm):
             if rule.startswith("Bash(") and rule_regex(rule).match(command):
                 return bucket
     return "classifier"
+
+
+def rewrite_env_line(line):
+    """Keep live-only guidance, drop only the sentence that is no longer true."""
+    if line.startswith("**Secrets**: never materialize"):
+        return re.sub(r"\s*[^.]*denied by rule[^.]*\.?", "", line).rstrip()
+    return line
 
 
 def is_stale_env(line):
@@ -222,7 +229,7 @@ def merge(live, base, owners, dev_dirs=()):
     for e in am.get("environment", []):
         if e.startswith(DEV_ENV_PREFIXES):
             previous_dev_dirs += [x for x in re.findall(r"`([^`]+)`", e) if x.startswith(("/", "~"))]
-    kept = [e for e in am.get("environment", [])
+    kept = [rewrite_env_line(e) for e in am.get("environment", [])
             if e != "$defaults" and not is_stale_env(e)]
     wanted = [e for e in base["autoMode"]["environment"] if e != "$defaults"]
     am["environment"] = ["$defaults"] + [e for e in wanted if e not in kept] + kept

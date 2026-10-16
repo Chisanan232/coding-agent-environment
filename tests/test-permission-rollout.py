@@ -289,6 +289,17 @@ class CuratedEnvironmentLines(Fixture):
         for line in copies:
             self.assertNotIn(line, env)
 
+    def test_secrets_line_keeps_its_live_only_guidance_and_loses_only_the_false_sentence(self):
+        line = ("**Secrets**: never materialize a credential in plaintext. Use `/x/bin/sync-neon-secret` for Neon to GCP transfers "
+                "(stays inside an OS pipe). `gcloud secrets versions access` and `mcp__neon__get_connection_string` are denied by rule, not merely discouraged.")
+        env = self.env([line])
+        kept = [e for e in env if e.startswith("**Secrets**")]
+        self.assertEqual(1, len(kept))
+        self.assertIn("sync-neon-secret", kept[0])
+        self.assertIn("OS pipe", kept[0])
+        self.assertNotIn("denied by rule", kept[0])
+        self.assertEqual(env, self.env(env), "rewriting is idempotent")
+
     def test_plan_lists_every_environment_line_it_removes(self):
         rc, out = self.run_tool("plan", "--baseline", str(self.base_p), "--live", str(self.live_p))
         self.assertEqual(0, rc, out)
