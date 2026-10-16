@@ -20,3 +20,5 @@ product, authority, cost, security or irreversible-action decision.
 
 Use `task-decomposition` for independent tracking decisions, `cross-repo-coordinator`
 for integrated outcomes and `engineering-workflow` for independent review.
+
+See the [reference](references/model-routing-and-delegation.md) for the model routing and delegation conditions.
