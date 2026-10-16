@@ -350,6 +350,16 @@ class Fixture(unittest.TestCase):
         self.assertIn('already match', text)
         self.assertEqual(self.snapshot_tree(), after)
 
+    def test_rollback_refuses_a_tampered_backup(self):
+        self.assertEqual(self.apply()[0], 0)
+        backup = next(p for p in self.backups.iterdir() if p.name.startswith('settings.json.pre-SPE-109.'))
+        backup.write_text('{"hooks": {}}')
+        installed = self.live.read_bytes()
+        code, text = self.run_cli('rollback', '--receipt', str(self.receipt()))
+        self.assertEqual(code, 3)
+        self.assertIn('no longer matches', text)
+        self.assertEqual(self.live.read_bytes(), installed)
+
 
 if __name__ == '__main__':
     unittest.main()
