@@ -40,3 +40,17 @@ def tier(free_bytes):
     if free_bytes < STABLE_BELOW:
         return 'stable'
     return 'wide'
+
+
+WEIGHTS = ('heavy', 'light')
+ADMITTED_TIERS = {'heavy': ('stable', 'wide'), 'light': ('low', 'stable', 'wide')}
+
+
+def decide(weight, free_bytes, state):
+    """Return (admit, new_state, reason) for one unit of work."""
+    if weight not in WEIGHTS:
+        raise ValueError('weight must be heavy or light')
+    current = tier(free_bytes)
+    if current in ADMITTED_TIERS[weight]:
+        return True, dict(state), '%s admitted in tier %s' % (weight, current)
+    return False, dict(state), '%s refused in tier %s' % (weight, current)
