@@ -95,39 +95,21 @@ Claude Code must follow these rules on every implementation task, without except
 
 ---
 
-## When to Use the Full Workflow vs. the Quick-Fix Path
+## Workflow Path
+
+Every repository code change, however small, goes through a pull request that
+follows [engineering-workflow](skills/engineering-workflow/SKILL.md). Never push
+or merge directly to `main`.
 
 The ticket-driven workflow (`ticket-intake → dev-impl-loop → QA handoff → PR`) is
-the right contract for substantive feature work. It is overkill for small changes.
-Use judgment to choose the right path.
+the contract for substantive work: new features, significant refactors, bug fixes
+with regression risk, changes touching multiple files or modules, and work that
+requires QA sign-off. Follow `dev-impl-loop` (5 phases): implement → relative
+tests → full suite → pre-commit → QA handoff → PR. See the Skill Invocation Guide.
 
-### Quick-fix path (no ticket required)
-
-Use for: single-file bugfixes, documentation updates, configuration tweaks,
-personal/exploratory projects with no issue tracker, data science notebooks.
-
-1. Read the relevant code.
-2. Make the minimal change.
-3. Run impacted tests only — no full suite required for trivial changes.
-4. Commit with a clear message.
-5. Push directly if all checks pass.
-
-No ticket, no QA handoff, no circuit breaker, no workflow state file needed.
-Claude Code acts directly per Rule 5 of the Agent Delegation Model.
-
-### Full workflow path (ticket required)
-
-Use for: new features, significant refactors, bug fixes with regression risk,
-any change that touches multiple files or modules, work that requires QA sign-off.
-
-Follow `dev-impl-loop` (5 phases): implement → relative tests → full suite →
-pre-commit → QA handoff → PR. See the Skill Invocation Guide.
-
-### Decision rule
-
-> If you can describe the complete change in one sentence and it touches fewer
-> than three files, use the quick-fix path.
-> Otherwise, use the full workflow.
+For a small change, keep the same PR and commit rules and scale only the ceremony:
+no QA handoff, circuit breaker, or workflow state file is needed unless the change
+carries regression risk.
 
 ---
 
