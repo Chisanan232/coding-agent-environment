@@ -363,6 +363,22 @@ class Hardening(unittest.TestCase):
         # The FIFO is left alone rather than replaced.
         self.assertTrue(stat.S_ISFIFO(os.lstat(self.path).st_mode))
 
+    def test_symlinked_ancestor_of_state_directory_refused(self):
+        home = Path(self.temp.name).resolve() / 'home'
+        elsewhere = Path(self.temp.name).resolve() / 'elsewhere'
+        (home / '.cache').mkdir(parents=True)
+        elsewhere.mkdir()
+        (home / '.cache/coding-agent-environment').symlink_to(elsewhere)
+        path = home / da.STATE_RELATIVE
+        with mock.patch.object(da, 'account_home', return_value=home):
+            result = da.evaluate('light', path, lambda: 500 * GIB)
+            self.assertFalse(result['admit'])
+            self.assertIn('state-untrusted', result['reason'])
+            self.assertEqual(list(elsewhere.iterdir()), [])
+            # Negative control: the same layout without the symlink works.
+            (home / '.cache/coding-agent-environment').unlink()
+            self.assertTrue(da.evaluate('light', path, lambda: 500 * GIB)['admit'])
+
 
 if __name__ == '__main__':
     unittest.main()
