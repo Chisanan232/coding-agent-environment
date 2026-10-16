@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Disk-pressure admission core refuses unsafe work and fails closed."""
 from importlib.util import module_from_spec, spec_from_file_location
+import io
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -116,7 +119,7 @@ class State(unittest.TestCase):
     def test_symlinked_state_path_refused(self):
         target = Path(self.temp.name) / 'elsewhere.json'
         target.write_text('{}')
-        self.path.parent.mkdir(parents=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.symlink_to(target)
         with self.assertRaises(da.StateError):
             da.read_state(self.path)
@@ -190,6 +193,34 @@ class Transactions(unittest.TestCase):
         self.assertTrue(all(result['admit'] for result in results))
         self.assertEqual(da.read_state(self.path)['free_bytes'], 150 * GIB)
         self.assertEqual(sorted(entry.name for entry in self.path.parent.iterdir()), ['state.json', 'state.json.lock'])
+
+
+class Cli(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / 'admission/state.json'
+
+    def run_main(self, argv, free):
+        from contextlib import redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = da.main(argv, free_fn=lambda: free, state_path=self.path)
+        return code, out.getvalue()
+
+    def test_cli_rejects_free_bytes_override(self):
+        home = {**os.environ, 'HOME': self.temp.name}
+        script = str(ROOT / 'scripts/disk-admission.py')
+        for extra in (['--free-bytes', str(900 * GIB)], ['--state', '/tmp/x'], ['--state-path=/tmp/x'], ['--bogus']):
+            result = subprocess.run([sys.executable, script, 'check', '--weight', 'heavy', *extra],
+                                    capture_output=True, text=True, env=home)
+            self.assertEqual(result.returncode, 2, extra)
+            self.assertEqual(result.stdout, '')
+        # An unknown weight and an abbreviated flag are usage errors too.
+        for argv in (['check', '--weight', 'medium'], ['check', '--wei', 'heavy'], ['status']):
+            result = subprocess.run([sys.executable, script, *argv], capture_output=True, text=True, env=home)
+            self.assertEqual(result.returncode, 2, argv)
+        self.assertFalse((Path(self.temp.name) / '.cache').exists())
 
 
 if __name__ == '__main__':
