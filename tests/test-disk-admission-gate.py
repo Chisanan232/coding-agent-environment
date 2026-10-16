@@ -363,6 +363,11 @@ class Uncertain(unittest.TestCase):
         code = gate.main(payload, out, err, mode_fn=lambda: 'enforce', runner=self.refuses)
         self.assertEqual(code, 2)
         self.assertIn('BLOCKED', err.getvalue())
+    def test_warn_advice_for_an_unparsable_command_explains_the_uncertainty(self):
+        code, out, err = self.run_gate(self.UNPARSABLE, 'warn', self.refuses)
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('may be a heavy build', json.loads(out)['hookSpecificOutput']['additionalContext'])
+        self.assertNotIn('refuses', out)
 
 
 class Tamper(unittest.TestCase):
