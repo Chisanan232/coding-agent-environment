@@ -87,13 +87,17 @@ fresh, documented decision — not merely to reduce prompts):
 | Managed-DB/storage deletion | every `mcp__neon__*delete*`/`disable_auth`/`reset_from_parent`/`*_credential`, every `mcp__cloudflare-bindings__*_delete` |
 | Trust-boundary widening | `mcp__github__delete_file`, `create_repository`, `fork_repository`, `mcp__claude_ai_Google_Drive__share_file` |
 
-**`deny` (no legitimate interactive use in this workflow)**: `terraform
-destroy` (and `apply -destroy` variants), `rtk proxy` (documented
-debug-only raw-execution bypass — see
+**Static `deny` is empty (SPE-106).** The personal policy carries no
+user-controlled `deny`; the former deny families are `ask`-gated, and `ask`
+prompts in every permission mode, `bypassPermissions` included:
+`terraform destroy` and `apply` (typed as `terraform`, with or without a global flag; env-prefixed, absolute-path, `tofu` and `terragrunt` spellings are classifier-judged), `rtk proxy` (the one command rtk does
+not rewrite; it bypasses rule matching, see
 [SPE-83](https://lightning-dust-mite.atlassian.net/browse/SPE-83)),
-`gcloud secrets versions access`, `mcp__neon__get_connection_string` (its
-return value *is* the secret — a settings-file rule cannot scope by
-parameter, so the whole tool is denied).
+`gcloud secrets versions access`, and `mcp__neon__get_connection_string` (its
+return value *is* the secret). Approving such a prompt authorizes that one call;
+it is not permission to echo, log or store the value (CLAUDE.md item 21).
+Platform classifier defaults (`hard_deny`, `soft_deny`) and managed settings are
+outside this file and cannot be removed here. Details: ADR-0012 Amendment 2.
 
 **Known unresolved defect**: [SPE-83](https://lightning-dust-mite.atlassian.net/browse/SPE-83)
 — RTK's own PreToolUse self-decision can match an `allow` rule at

@@ -233,3 +233,110 @@ Founder-approved scoped refinements; Decisions 1-6 stand.
   `git fetch ext::...` helpers (pre-existing `git fetch *` allow; a trailing
   `::*` is parsed as a prefix rule so no safe ask glob exists). These rules
   guard accidental misuse; adversarial obfuscation remains the classifier's job.
+
+## Amendment 2 (SPE-106, 2026-10-16) — zero static deny and Auto Mode environment repair
+
+**Decision (founder, 2026-10-16).** The personal Claude Code policy carries no
+user-controlled static `deny`: `permissions.deny` is `[]`. Each former deny
+pattern is an `ask`. This is personal policy; managed/organization settings are
+never read or written, and the platform classifier defaults (the single
+`hard_deny` "Data Exfiltration" and 72 `soft_deny` categories, including
+"Merge Without Review", "Permission Grant", "Self-Modification" and "Credential
+Materialization") cannot be removed through personal settings. Only `allow`
+exceptions to `soft_deny` are possible; the one added here is the narrow,
+transcript-verifiable pull-request merge entry below (an explicit exception to
+"Merge Without Review"). No exception is added for the other categories.
+
+**Why `ask` is a safe replacement (documented, not assumed).** `ask` prompts in
+every permission mode, `bypassPermissions` included; `deny` also stays enforced
+there. Unanswered, an `ask` in a non-interactive run is auto-denied, so
+unattended sessions fail closed. Decision 5 of this ADR ("deny is reserved for
+no legitimate interactive use") is superseded: the cost is a prompt where a
+silent block used to be.
+
+**Root causes found (evidence in SPE-106).**
+1. The live `autoMode.environment` was a static paste of a generated config from
+   one earlier session (working directory a non-git folder). It declared that
+   folder the only trusted repo, "no remotes", "unknown" protected branches and
+   no organization, and it omitted `"$defaults"`, which replaces the built-in
+   section. Every session in every repository inherited it. It also called
+   `git worktree remove --force` / `prune` routine, contradicting the
+   ownership line and the ask rules. `claude auto-mode critique` flags the same
+   mismatch.
+2. SPE-105's `git worktree add*-f*` and `*-B*` matched any path containing
+   `-f`/`-B` (ticket worktree paths contain `-full-`): 89 historical commands.
+   Flags are now space-anchored (`add -f*`, `add * -f*`, `--f*` long prefixes).
+3. `rtk proxy *` was hit 76 times by agents following RTK.md. It stays an `ask`
+   because `rtk proxy` is the one command rtk does not rewrite and it bypasses
+   rule matching; the friction fix is to stop recommending it (RTK.md is
+   rtk-managed and outside this repo).
+4. **Correction to Amendment 1.** The permission engine evaluates the
+   rtk-rewritten command, not the typed one: a fresh-session test with an ask
+   rule on only the plain form executed the command, while the `rtk` form
+   blocked. The `rtk` twins are therefore required, not redundant. Commands rtk
+   does not rewrite (`terraform init|validate|fmt`, `git checkout -b`) need no
+   twin; `rtk terraform plan` did lack a bare-form match and is now `plan:*`.
+5. Correction to Root Cause 1 of this ADR: "no `bypassPermissions` was ever
+   configured" no longer holds for launches. Long-running sessions start with
+   `--allow-dangerously-skip-permissions`, which adds `bypassPermissions` to the
+   mode cycle (transcripts alternate `auto` and `bypassPermissions`). The
+   default mode stays `auto`; the launcher is the owner's, not this repo's.
+
+**Implemented.** Deny to ask, with the subsumed `apply -destroy` variants folded
+into `terraform apply:*` / `terraform -* apply*` (the latter also asks when a
+global flag precedes `apply`; anchoring on a leading `-` keeps
+`terraform plan -out apply.tfplan` unprompted); `"$defaults"` first in
+`autoMode.environment`; the merge allow restated in terms the classifier can
+verify in the transcript (a user message naming the PR or branch and authorizing
+the merge, `--merge` with `--match-head-commit`, the agent's own `gh pr checks`
+output, an owner under the trusted GitHub owners entry; `--admin` only when the
+user says so). Trusted GitHub owners stay out of the public baseline and are
+supplied at rollout from `docs/examples/automode-trusted-sources.example.json`
+under names that explicitly supersede the default "Organization"/"Source
+control" entries. `scripts/permission-rollout.py` merges the baseline into a live
+file: it hashes the exact bytes it merges, requires both expected hashes,
+refuses a symlinked live file, writes exclusive-create backups, replaces the file
+atomically through a private fsynced temp file with the original mode, and its
+`rollback` validates the backup and saves the current file first. Global-option
+`worktree remove` stays `ask` (ownership protection); global-option `worktree add`
+force flags are `ask`.
+
+**Review findings kept as limits.** (a) Quoted or clustered flags
+(`worktree remove "-f"`, `add -qf`) and env-prefixed, absolute-path, `tofu` or
+`terragrunt` spellings of the terraform commands are not matched by text globs
+and fall to the classifier, as they did under the old deny rules. (b) The merge
+entry cannot be proven to bind: `Bash(gh pr merge:*)`, `Bash(gh pr *)` and the
+MCP merge tool remain static allows (accepted breadth, SECURITY.md); a static
+allow should precede the classifier, yet earlier merge commands were
+classifier-denied, so the entry is kept and its effect is unverified. It is an
+explicit carve-out from "Merge Without Review", and its "no PR-body text" clause
+only constrains what the classifier counts as evidence. (c) `terraform -* apply*`
+and `gcloud secrets` metadata reads that merely contain `projects/` remain
+classifier-judged.
+
+**Personal-machine trust (founder clarification, 2026-10-16).** Trust is global to
+the personal Claude Code installation, not to the directory a session started in.
+It is applied at rollout from private parameters, never committed: `--owners`
+(verified GitHub owners) fills the trusted-owner entries, and `--dev-dirs` (explicit
+personal development roots) fills (a) one `autoMode.environment` line declaring
+repositories and worktrees under those roots, existing and future, trusted
+development context, (b) one narrow `autoMode.allow` exception so work in another
+repository under the same roots is not "wandering into other repos", and (c)
+`permissions.additionalDirectories`, the documented file-access grant (Read/Edit/
+Write/Glob/Grep, recursive, same permission rules as the working directory, not
+the Bash cwd). The tool rejects roots that are the filesystem root, the home
+directory, a system path or a credential path. The trust text excludes credential
+and key files, system-protected paths, production resources and uploads of private
+data. The documentation names no "trusted local directory" slot and does not
+specify how auto mode weighs `additionalDirectories`, so (a) and (b) are
+free-form prose whose effect is sampled, not proven. No external volume was
+mounted when this was written; `/Volumes/...` roots are accepted by `--dev-dirs`.
+
+**Known limits (disclosed).** Classifier verdicts are not statically testable;
+fresh-session probes sample them. A statically allowed command can still be
+blocked in a long-lived session whose transcript shows a denied attempt (the
+classifier's documented preemptive block on read-only scouting); fresh sessions
+did not reproduce the 13 denials seen after the SPE-105 rollout, and the cause
+was not proven. Plain `git worktree remove` (no force) is left to the classifier
+and the ownership environment line. `pkill`/`kill -9` asks (pre-existing) are the
+largest source of ordinary prompts (230 historical matches).
