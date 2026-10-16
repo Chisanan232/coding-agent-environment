@@ -81,3 +81,47 @@ symlink/drift/source-pin checks, contention and idempotency. They use controlled
 subprocess fixtures and prove no real Glomeris execution. The staged exact-source
 build and CLI smoke gate supply actual executable compatibility evidence; core
 safety and fresh-host validation have separate proof boundaries.
+
+## Disk-pressure admission (SPE-109, advisory, not wired)
+
+`scripts/disk-admission.py` is a thin admission adapter over Glomeris, not a
+cleanup engine, registry or daemon: it reads free space from the pinned Glomeris
+core `status --json` (statvfs is a cross-check and fallback, the smaller reading
+wins), computes the founder tier from free bytes (Glomeris pressure levels are
+advisory input only) and answers `check --weight heavy|light`. Exit 0 admits;
+every non-zero exit, including 77 and usage errors, means refuse.
+
+**No host-wide protection exists.** Nothing calls the adapter until an operator
+installs the gate hook. Entry-point inventory:
+
+| Entry point | Status |
+|---|---|
+| `.claude/hooks/disk-admission-gate.py` (PreToolUse Bash) | Source only. Integrated: none. The operator must patch `settings.json`; real-engine behavior is not verified until then |
+| Codex, launchers (`ca-*`), installer/sync, resource-lock, Glomeris callers | Not integrated, pending later stages |
+| `make`, `just`, `npm run <script>`, direct binaries, a user's own `!` shell, IDE analysis | Unsupported blind spots the hook cannot see |
+
+State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
+0600, home from the account database, symlinked path or ancestors refused):
+
+- `state.json`: latch and last measurement. A missing file below 50 GiB counts
+  as latched; a self-contradicting or corrupt one is latched and refuses.
+- `snapshot.json` (`snapshot --json`): `schema, ts, age_s, free_bytes, tier,
+  latch, heavy_lanes_allowed, active_heavy_jobs, reserved_bytes, protection,
+  blockers, source`. `age_s` is 0 when written; a consumer recomputes age from
+  `ts` and must treat age over 120 s (or a future `ts`) as stale and refuse
+  heavy work. `heavy_lanes_allowed` is 0 below 100 GiB or while latched and 1
+  in stable and wide until a second-lane analysis is approved. `protection`
+  stays `advisory-not-wired` until the gate is proven wired.
+- `reservations/<label>.json`: `reserve --bytes N --pid P --label L` admits a
+  heavy job only if the tier and latch admit it, a lane is free, and free bytes
+  minus live reservations minus N stay at or above 100 GiB. A reservation
+  records pid, process start time and expiry; one whose process is gone, whose
+  start time differs (pid reuse) or that expired is ignored and deleted. Only
+  well-formed files of this schema are ever deleted, and `release --label L`
+  deletes just that one. An unreadable file blocks reservations and is never
+  deleted. These are byte claims for admission only; native Glomeris leases own
+  resource claims and reaping.
+- `mode`: `warn` or `enforce`, edited only by an operator. Absent or invalid
+  means warn. warn allows and adds a context warning; enforce exits 2 when
+  admission refuses or cannot be evaluated. The hook never rewrites a command.
+  The hook consults tier and latch only, not reservations.
