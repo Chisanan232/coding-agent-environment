@@ -684,5 +684,33 @@ class HarnessWorkdir(unittest.TestCase):
         self.assertFalse((repo / 'child').exists())
 
 
+class HungAdapter(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.stub = Path(self.temp.name) / 'disk-admission.py'
+        self.stub.write_text('import time\ntime.sleep(60)\n')
+        for patcher in (mock.patch.object(gate, 'adapter_path', return_value=self.stub),
+                        mock.patch.object(gate, 'ADAPTER_TIMEOUT_S', 1)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_gate(self, mode):
+        mode_dir = Path(self.temp.name)
+        (mode_dir / 'mode').write_text(mode)
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'cargo build'}})
+        out, err = io.StringIO(), io.StringIO()
+        started = time.monotonic()
+        # No admission_dir and no injected runner: this is the production subprocess path.
+        code = gate.main(payload, out, err, mode_fn=lambda: mode)
+        return code, out.getvalue(), err.getvalue(), time.monotonic() - started
+
+    def test_hung_adapter_is_a_refusal_in_enforce_and_never_a_hang(self):
+        code, out, err, took = self.run_gate('enforce')
+        self.assertEqual((code, out), (2, ''))
+        self.assertIn('could not be evaluated', err)
+        self.assertLess(took, 10)
+
+
 if __name__ == '__main__':
     unittest.main()
