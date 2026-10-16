@@ -39,3 +39,6 @@
 # Real directory-scoped profile overlays (company names, endpoints,
 # instructions) — never committed. Only profiles/example-profile/ ships.
 .coding-agent-profiles/
+
+# Private policy overlay (live-only clauses) — never committed.
+**/CLAUDE.private.md
