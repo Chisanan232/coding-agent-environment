@@ -167,6 +167,15 @@ class Fixture(unittest.TestCase):
         self.assertIn('already installed', text)
         self.assertEqual(self.snapshot_tree(), after)
 
+    def test_wrong_hook_sha_is_refused_and_nothing_is_written(self):
+        before = self.snapshot_tree()
+        code, text = self.run_cli('apply', '--expect-live-sha', hashlib.sha256(self.live.read_bytes()).hexdigest(),
+                                  '--expect-hook-sha', '0' * 64, '--unmerged-ok')
+        self.assertEqual(code, 3)
+        self.assertIn('do not match', text)
+        self.assertEqual(self.snapshot_tree(), before)
+        self.assertFalse(self.dest.exists())
+
 
 if __name__ == '__main__':
     unittest.main()
