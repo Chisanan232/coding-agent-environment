@@ -71,3 +71,5 @@ run where relevant; omit path labels and duplicate successful checks.
 - Do not merge a bot PR when CI is red due to the update itself.
 - Do not use `--no-verify` or override CI status checks to force a merge.
 - Limit to two rebase attempts before escalating to the engineer.
+
+See the [reference](references/bot-pr-policy.md) for the full Bot PR policy.

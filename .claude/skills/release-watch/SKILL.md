@@ -72,3 +72,5 @@ notify only when decision-relevant state changes and posting is authorized.
 - Do not attempt to manually complete a partially failed release.
 - If the pipeline is stuck (no progress for more than 30 minutes), report it and
   escalate — do not assume it will self-recover.
+
+See the [reference](references/release-operations.md) for the release window duties.

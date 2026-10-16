@@ -74,3 +74,5 @@ task is confirmed by the engineer.
 - Impacted validation: run tests in the module or package you changed.
 - Full validation: run the complete test suite plus lint and type checks.
 - Order: impacted validation during iteration → full validation before committing.
+
+See the [reference](references/quality-policies.md) for the testing, type and lint policies.

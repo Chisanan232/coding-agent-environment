@@ -54,6 +54,7 @@ jobs:
           bash tests/test-profile-resolver.sh
           python3 tests/test-signal-density.py
           python3 tests/test-engineering-workflow.py
+          python3 tests/test-claude-md-invariants.py
           python3 tests/test-closeout.py
           python3 tests/test-ticket-state.py
           python3 tests/test-context-state.py

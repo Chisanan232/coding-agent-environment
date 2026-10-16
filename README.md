@@ -78,11 +78,27 @@ docs/
 
 ## Install
 
-Copy into your home config (review first):
+**Warning: `.claude/CLAUDE.md` in this repository is a base layer, not a complete
+policy.** A wholesale copy over an existing `~/.claude/CLAUDE.md` can delete
+clauses that exist only in your live file. Run `scripts/sync-check.sh` first to
+see drift, and never overwrite `~/.claude/CLAUDE.md` with `cp`.
+
+Install the instruction policy with the marker-span installer instead.
+`scripts/profile-install.sh --claude-skills` changes two things in `~/.claude`.
+For `CLAUDE.md` it merges only the block between the
+`coding-agent-environment:engineering-workflow:start` and `:end` markers: replaced
+in place if the live file has markers, appended if it has content but no markers,
+created if absent; everything outside the span is untouched. It also overwrites
+every shared skill file under `~/.claude/skills` with the repository copy, and it
+saves a backup of replaced files under `~/.claude/backups/coding-agent-environment/`.
+Run `scripts/profile-install.sh --claude-skills --dry-run` or `--check` first to
+see the drift before anything is written.
+
+Copy the remaining files into your home config (review first):
 
 ```bash
 cp .mcp.json ~/.claude/.mcp.json
-cp -R .claude/CLAUDE.md .claude/RTK.md .claude/settings.json \
+cp -R .claude/RTK.md .claude/settings.json \
       .claude/config.env \
       .claude/mcp-servers.runtime.json .claude/statusline.py \
       .claude/subagent-statusline.py .claude/hooks .claude/skills ~/.claude/
