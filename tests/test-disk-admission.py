@@ -72,7 +72,10 @@ class Decisions(unittest.TestCase):
             admit, _, reason = da.decide('light', free, latched)
             self.assertFalse(admit, free)
             self.assertIn('latched', reason)
-        self.assertFalse(da.decide('heavy', 150 * GIB - 100 * GIB - 1, latched)[0])
+        # Heavy work just below the latch release point is refused by the latch itself.
+        admit, _, reason = da.decide('heavy', 50 * GIB - 1, latched)
+        self.assertFalse(admit)
+        self.assertIn('latched', reason)
         # Negative control: the same free space without a latch admits light work.
         self.assertTrue(da.decide('light', 25 * GIB, {})[0])
         self.assertTrue(da.decide('light', 50 * GIB, latched)[0])
