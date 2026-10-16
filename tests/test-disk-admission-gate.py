@@ -259,6 +259,11 @@ class Compound(unittest.TestCase):
         self.assertTrue(self.heavy('sudo -E npm ci'))
         self.assertFalse(self.heavy('sudo -u builder ls'))
 
+    def test_timeout_with_duration_is_heavy(self):
+        self.assertTrue(self.heavy('timeout 600 cargo test'))
+        self.assertTrue(self.heavy('timeout -s KILL 5 npm ci'))
+        self.assertFalse(self.heavy('timeout 5 echo cargo build'))
+
 
 if __name__ == '__main__':
     unittest.main()
