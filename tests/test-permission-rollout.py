@@ -25,6 +25,10 @@ BASE_ASK = [
     "Bash(gcloud secrets versions access *)", "Bash(rtk gcloud secrets versions access *)",
     "Bash(gcloud * secrets versions access*)", "Bash(rtk gcloud * secrets versions access*)",
     "mcp__neon__get_connection_string",
+    "Bash(gcloud*add-iam-policy-binding*)", "Bash(rtk gcloud*add-iam-policy-binding*)",
+    "Bash(gcloud*remove-iam-policy-binding*)", "Bash(rtk gcloud*remove-iam-policy-binding*)",
+    "Bash(gcloud*set-iam-policy*)", "Bash(rtk gcloud*set-iam-policy*)",
+    "Bash(gcloud*service-accounts keys create*)", "Bash(rtk gcloud*service-accounts keys create*)",
     "Bash(git worktree add -f*)", "Bash(git worktree add * -f*)",
     "Bash(git worktree remove* -f*)", "Bash(git * worktree remove*)",
 ]
@@ -517,6 +521,12 @@ class StaticGate(Fixture):
         rc, out = self.run_tool("verify", "--live", str(self.live_p), "--baseline", str(self.base_p))
         self.assertEqual(1, rc)
         self.assertIn("baseline ask rules missing", out)
+
+    def test_a_baseline_without_iam_asks_is_refused(self):
+        weak = copy.deepcopy(BASELINE)
+        weak["permissions"]["ask"] = [r for r in weak["permissions"]["ask"] if "iam-policy" not in r]
+        merged = rollout.merge(copy.deepcopy(LIVE), weak, [])
+        self.assertIn("IAM command does not ask", "\n".join(rollout.problems(merged)))
 
     def test_catch_all_allow_rules_are_flagged(self):
         merged = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [])
