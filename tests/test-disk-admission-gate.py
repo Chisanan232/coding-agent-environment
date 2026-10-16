@@ -31,6 +31,18 @@ class Classification(unittest.TestCase):
                         'python3 -m pip install x', 'docker build .', 'docker buildx build .', 'xcodebuild -scheme x'):
             self.assertTrue(self.heavy(command), command)
 
+    def test_env_prefix_chaining_and_rtk_twin(self):
+        for command in ('FOO=1 cargo build', 'A=1 B=2 cargo test', 'env FOO=1 cargo check', 'cd crates/x && cargo test',
+                        'git pull; cargo build', 'ls | cargo build', '(cd x && cargo build)', 'time cargo build',
+                        'rtk cargo build', 'rtk cargo nextest run -p x', 'FOO=1 rtk cargo test'):
+            verdict = gate.classify(command)
+            self.assertTrue(verdict['heavy'], command)
+            self.assertEqual(verdict['confidence'], 'exact', command)
+        self.assertEqual(gate.classify('rtk cargo build')['kind'], 'cargo')
+        # Negative control: env prefix on a non-heavy command stays light.
+        self.assertFalse(self.heavy('FOO=1 cargo --version'))
+        self.assertFalse(self.heavy('cd cargo && ls build'))
+
 
 if __name__ == '__main__':
     unittest.main()
