@@ -86,7 +86,7 @@ larger work into a reviewable sequence rather than bundling unrelated changes.
 Use this exact pull-request title shape:
 
 ```
-[<ticket-number>] <emoji> <scope>: <imperative summary under 60 chars>
+[<TICKET>] <GitEmoji> (<scope>): <imperative summary under 60 chars>
 ```
 
 The 60-character limit applies to the imperative summary, not the entire title.
@@ -96,13 +96,14 @@ whether its summary actually uses imperative meaning.
 Examples:
 
 ```
-[PROJ-123] ✨ restapi: Add user authentication
-[42] 🐛 api: Fix retry leak
+[PROJ-123] ✨ (restapi): Add user authentication
+[42] 🐛 (api): Fix retry leak
 ```
 
 Use `$evidence-first-briefing` for the body. Lead with resulting behavior or the
 changed boundary. Include actual validation, material risks or unknowns, and issue
-references. Preserve any required repository pull-request template and fields.
+references. Use the repository's `.github/PULL_REQUEST_TEMPLATE.md` when present.
+Preserve any required repository pull-request template and fields otherwise.
 Omit file chronology and unsupported completion claims.
 
 Do not merge until required checks, code-owner approvals, conflict resolution,

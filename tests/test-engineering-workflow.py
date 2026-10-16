@@ -52,7 +52,7 @@ class EngineeringWorkflowContract(unittest.TestCase):
             "one concern and its necessary tests",
             "CI_UNAVAILABLE_EXTERNAL",
             "meaningful independent review",
-            "[<ticket-number>] <emoji> <scope>: <imperative summary under 60 chars>",
+            "[<TICKET>] <GitEmoji> (<scope>): <imperative summary under 60 chars>",
             "Create a merge commit",
             "Reconcile the authoritative Jira ticket or established issue tracker",
             "Remove the owned worktree",
