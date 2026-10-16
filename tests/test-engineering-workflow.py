@@ -194,6 +194,16 @@ class EngineeringWorkflowContract(unittest.TestCase):
                 self.assertIn(phrase, text)
         self.assertNotIn("Put one concern and its necessary tests in the same commit", text)
 
+    def test_subagent_maximum_is_seven_with_single_owner_per_scope(self) -> None:
+        text = " ".join(WORKFLOW.read_text().split())
+        self.assertIn("at most seven concurrent subagents (dynamic 0-7", text)
+        self.assertIn("one owner per scope", text)
+        codex = (ROOT / "codex/AGENTS.md").read_text()
+        self.assertIn("Seven\nconcurrent subagents is a ceiling", codex)
+        self.assertIn("choose 0..7", codex)
+        self.assertNotIn("Eight", codex)
+        self.assertNotIn("1..8", codex)
+
 
 if __name__ == "__main__":
     unittest.main()
