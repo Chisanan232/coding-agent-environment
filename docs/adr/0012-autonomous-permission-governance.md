@@ -356,18 +356,46 @@ was not proven. Plain `git worktree remove` (no force) is left to the classifier
 and the ownership environment line. `pkill`/`kill -9` asks (pre-existing) are the
 largest source of ordinary prompts (230 historical matches).
 
-## Amendment 3 (SPE-106 follow-up, 2026-10-16) — IAM mutation asks
+## Amendment 3 (SPE-106 follow-up, 2026-10-16) - IAM and credential-minting asks
 
 Fresh-session acceptance on the pre-deploy live config showed that
 `gcloud projects add-iam-policy-binding ...` ran with no prompt and no classifier
 block when the request was explicit (the classifier's "Permission Grant" category
 only blocks a grant the user did not name). The founder requires production IAM
 changes to need explicit approval, so the baseline gains static `ask` rules, with
-`rtk` twins, for `add-iam-policy-binding`, `remove-iam-policy-binding`,
-`set-iam-policy` and `service-accounts keys create` (space-free globs, so a global
-flag or `beta` before the subcommand cannot hide them). Read-only `get-iam-policy`,
-`roles describe`, `service-accounts list` and `keys list` stay unprompted. Limits:
-text globs do not stop quoted or env-prefixed spellings, and `gh api` permission
-grants on GitHub (collaborators, team membership) remain classifier-judged.
-`scripts/permission-rollout.py` refuses a baseline that does not ask on these
-commands.
+`rtk` twins, for: `add-iam-policy-binding`, `remove-iam-policy-binding` and
+`set-iam-policy` (gcloud, `bq`); `gcloud ... service-accounts ... keys create|upload`;
+`gcloud ... iam ... roles create|update` (custom-role privilege escalation);
+`gsutil iam ch|set` and `gsutil acl ch|set`; and `kubectl create (cluster)rolebinding`.
+`mcp__gcloud__run_gcloud_command`, the MCP route with the same power, was already
+`ask` and the rollout tool now refuses a baseline that drops it.
+
+The binding/policy rules and the key/role rules use `*` between words, so a global
+flag, `beta`, extra spacing or an interleaved flag (`service-accounts --project=p keys
+create`) cannot hide them; the `gsutil` rules keep one literal space and so are weaker
+against double spacing. An independent review found the original `keys create` rule
+did exactly that and it was fixed before merge.
+
+Known limits (text globs), disclosed after two independent reviews:
+- Fail-safe false positives: any gcloud/kubectl/bq command that merely contains one of
+  these words prompts, for example `keys list --created-before=DATE` (matches
+  `keys*create`), `--filter`/`--sort-by` values containing create or update,
+  `projects create my-iam-roles-create-proj`, `kubectl create namespace rolebinding-test`
+  or `kubectl create configmap --from-file=rolebinding.yaml`.
+- Not matched, so they fall to the classifier: absolute-path, `env X=1`, `command`/`time`/
+  `xargs` wrappers and `bash -c` spellings; raw REST calls (`...:setIamPolicy`); `gsutil`
+  with extra spacing or a tab after `iam`/`acl` (those rules keep one literal space);
+  `kubectl apply -f rolebinding.yaml`, `kubectl patch|edit (cluster)rolebinding` and
+  `kubectl create role`; `gcloud iam roles copy` (same escalation as `roles create`);
+  `gcloud storage ... --predefined-acl|--add-acl-grant` (the gcloud twin of the gated
+  `gsutil acl`); `roles undelete`, `keys enable`, `sign-jwt|sign-blob`; and `gh api`
+  permission grants (collaborators, team membership, deploy keys). Quoting a word
+  inside `keys create` does not hide it (those rules still ask).
+- Short-lived token minting (`gcloud auth print-access-token`, `--impersonate-service-account`)
+  is deliberately not gated.
+- Unprompted by design: `get-iam-policy` (without a filter containing a gated word),
+  `roles describe|list`, `service-accounts list|describe`, `keys list` (without
+  `--created-before`/filter text containing create), `gsutil ls|iam get`, `bq ls|show`
+  and `kubectl get rolebindings`.
+- `scripts/permission-rollout.py` refuses a baseline whose rules do not ask on a sample
+  command from every gated family and on the MCP gcloud route.
