@@ -1,29 +1,49 @@
 #!/usr/bin/env python3
-"""Host disk-pressure admission core (SPE-109 stage S1).
+"""Host disk-pressure admission adapter (SPE-109 stage S1).
 
 Answers one question for a caller: may this unit of work start given the free
-space on the host data volume right now. Nothing calls it yet, so it protects
-nothing host-wide until a later stage wires it into an entry point.
+space on the host data volume right now. This is a thin admission adapter over
+Glomeris, the single storage authority. It is NOT a cleanup engine, registry
+or daemon: it deletes nothing, tracks no resources or leases, and runs only
+when called. Nothing calls it yet, so it protects nothing host-wide until a
+later stage wires it into an entry point.
+
+Free space comes from the pinned Glomeris core `status --json` (binary
+resolved through the installed storage-core receipt, verified by
+storage-integration.py). A statvfs reading of /System/Volumes/Data (else `/`)
+is a cross-check and fallback: the smaller reading wins, either source alone
+suffices, and only when both fail does the check refuse. Glomeris pressure
+levels (WARN/PRESSURED/CRITICAL/EMERGENCY, by percent or bytes) are advisory
+input only and are ignored here; the admission tier is computed from free bytes.
 
 Tiers by free space (GiB = 1024**3): emergency < 20, low 20..<100,
 stable 100..<200, wide >= 200. Heavy work needs stable or wide. Light work
 is admitted in low, stable and wide and refused in emergency.
 
 A latch is set when free space drops below 20 GiB and is released only once
-free space reaches 50 GiB. While latched every weight is refused, light
+fresh free space reaches 50 GiB. While latched every weight is refused, light
 included. "Held until 50 GiB" means the 20..<50 GiB range stays refused during
 recovery; that is the architect's reading, PENDING FOUNDER CONFIRMATION.
+The latch comes from the fresh measurement, not only a stored flag: a missing
+state file below 50 GiB is latched, and a record that contradicts itself (for
+example latch=false with free_bytes under 20 GiB) is treated as corrupt. A
+same-user forger who writes a self-consistent record cannot be detected; the
+state file is advisory, not a security boundary.
 Cleanup work is meant to stay admissible while latched but has no weight
 here yet; that is a later stage.
 
-Fail closed: an unreadable volume refuses, and a corrupt, unparsable or
-wrong-schema state file counts as latched and refuses with its own reason.
+Fail closed: an unreadable volume, a symlinked or non-regular state path, an
+unwritable state file, a lock held for over 5 seconds, and a corrupt,
+unparsable or wrong-schema state file (counted as latched) all refuse, each
+with its own reason.
 
 The only host write is the state file, default
-~/.cache/coding-agent-environment/admission/state.json. Free space and the state path cannot be
+~/.cache/coding-agent-environment/admission/state.json (home from the account
+database, not $HOME), plus its .lock. Free space and the state path cannot be
 overridden from the command line; tests inject them through arguments.
 
-Exit codes for `check`: 0 admit, 77 refuse. Usage errors exit 2.
+Exit codes for `check`: 0 admit, 77 refuse, 2 usage error. Callers MUST treat
+every non-zero exit, not only 77, as REFUSE; unexpected errors exit 77.
 """
 
 import argparse
