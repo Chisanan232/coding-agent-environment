@@ -245,6 +245,10 @@ class Compound(unittest.TestCase):
         self.assertTrue(self.heavy('! cargo build'))
         self.assertFalse(self.heavy('! cargo --version'))
 
+    def test_backtick_substitution_is_heavy(self):
+        self.assertTrue(self.heavy('echo `cargo build`'))
+        self.assertFalse(self.heavy('echo `date`'))
+
 
 if __name__ == '__main__':
     unittest.main()
