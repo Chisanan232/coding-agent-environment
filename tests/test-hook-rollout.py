@@ -117,6 +117,24 @@ class Fixture(unittest.TestCase):
         self.live.write_text(self.live_text)
         self.assertNotIn('changes its formatting', self.run_cli('plan')[1])
 
+    def pins(self, *extra):
+        return ['--expect-live-sha', hashlib.sha256(self.live.read_bytes()).hexdigest(),
+                '--expect-hook-sha', hashlib.sha256(self.src.read_bytes()).hexdigest(), '--unmerged-ok', *extra]
+
+    def apply(self, *extra):
+        return self.run_cli('apply', *self.pins(*extra))
+
+    def test_apply_installs_the_hook_and_adds_exactly_one_group(self):
+        code, text = self.apply()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.dest.read_bytes(), self.src.read_bytes())
+        self.assertEqual(stat.S_IMODE(self.dest.stat().st_mode), 0o755)
+        new = json.loads(self.live.read_text())
+        self.assertEqual(new, hr.with_gate(LIVE))
+        self.assertEqual(hr.gate_state(new), 'installed')
+        self.assertEqual(self.live.read_text(), json.dumps(hr.with_gate(LIVE), indent=2, ensure_ascii=False) + '\n')
+        self.assertEqual(stat.S_IMODE(self.live.stat().st_mode), 0o600)
+
 
 if __name__ == '__main__':
     unittest.main()
