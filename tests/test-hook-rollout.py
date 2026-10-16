@@ -508,6 +508,19 @@ class Fixture(unittest.TestCase):
     def test_a_trailing_slash_destination_is_refused(self):
         self.refuses_dest(str(self.dest) + '/')
 
+    def test_a_symlink_as_the_final_component_is_refused_with_nothing_written(self):
+        target = self.root / 'elsewhere.py'
+        target.write_text('untouched')
+        self.dest.parent.mkdir()
+        self.dest.symlink_to(target)
+        before = self.snapshot_tree()
+        for mode_args in (('apply', *self.pins()),):
+            code, text = self.run_cli(*mode_args)
+            self.assertEqual(code, 4)
+            self.assertIn('symlink', text)
+        self.assertEqual(self.snapshot_tree(), before)
+        self.assertEqual(target.read_text(), 'untouched')
+
 
 class CommandDerivation(unittest.TestCase):
     def test_command_uses_the_tilde_form_under_home_and_quotes_other_paths(self):
