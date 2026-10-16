@@ -208,6 +208,10 @@ class Newlines(unittest.TestCase):
         # Negative control: a command after the terminator is real.
         self.assertTrue(self.heavy('cat <<EOF\nx\nEOF\ncargo test'))
 
+    def test_heredoc_with_trailing_command_on_the_operator_line_is_heavy(self):
+        self.assertTrue(self.heavy('cat <<EOF && cargo build\nx\nEOF'))
+        self.assertTrue(self.heavy('cargo build <<EOF\nx\nEOF'))
+
 
 if __name__ == '__main__':
     unittest.main()
