@@ -275,6 +275,15 @@ class Sources(unittest.TestCase):
                 with self.assertRaises(da.VolumeError):
                     da.read_glomeris_free()
 
+    def test_both_sources_failing_refuses(self):
+        with self.assertRaises(da.VolumeError):
+            da.measure_free_bytes(self.failing, self.failing)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'admission/state.json'
+            result = da.evaluate('light', path, lambda: da.measure_free_bytes(self.failing, self.failing))
+        self.assertFalse(result['admit'])
+        self.assertIn('volume-unreadable', result['reason'])
+
 
 if __name__ == '__main__':
     unittest.main()
