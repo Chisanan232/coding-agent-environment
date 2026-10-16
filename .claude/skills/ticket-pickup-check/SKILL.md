@@ -87,10 +87,11 @@ pass before `dev-impl-loop` begins.
     ```
 
 13. Assign the ticket to the current session / developer identity.
-14. Transition the ticket state to "In Progress".
-15. The In Progress transition records pickup. Post a comment only if a new
-    scope/dependency decision or blocker needs attention; keep branch/worktree
-    location in local context and the PR, rather than duplicating it in Jira.
+14. When work really starts, apply the `engineering-workflow` Jira lifecycle:
+    transition to "In Progress", post a real start comment, and set the actual
+    Start Date and an estimated Due Date. Never fabricate dates.
+15. Keep branch/worktree location in local context and the PR; the start comment
+    states what is starting, not where the worktree lives.
 
 16. **Bind the ticket reference, release prefix, and worktree path** without
     adopting or overwriting legacy state. Inspect the target host root before
