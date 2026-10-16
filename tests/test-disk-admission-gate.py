@@ -143,6 +143,19 @@ class Decisions(unittest.TestCase):
         self.assertEqual(self.run_gate('cargo build', 'enforce', lambda: (0, 'ok')), (0, '', ''))
         self.assertEqual(self.run_gate('git status', 'enforce', self.refuses), (0, '', ''))
 
+    def test_fail_closed_only_in_enforce(self):
+        def raises():
+            raise RuntimeError('adapter exploded')
+        for runner in (lambda: (None, 'timed out'), lambda: (2, 'usage'), lambda: (1, 'crash'), raises):
+            code, out, err = self.run_gate('cargo build', 'enforce', runner)
+            self.assertEqual((code, out), (2, ''))
+            self.assertIn('could not be evaluated', err)
+            code, out, err = self.run_gate('cargo build', 'warn', runner)
+            self.assertEqual((code, err), (0, ''))
+            self.assertIn('could not be evaluated', json.loads(out)['hookSpecificOutput']['additionalContext'])
+        # A non-heavy command never reaches the adapter, so its failure cannot block it.
+        self.assertEqual(self.run_gate('ls', 'enforce', raises), (0, '', ''))
+
 
 if __name__ == '__main__':
     unittest.main()
