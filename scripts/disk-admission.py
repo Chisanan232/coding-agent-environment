@@ -48,7 +48,7 @@ every non-zero exit, not only 77, as REFUSE; unexpected errors exit 77.
 
 import argparse
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import json
 import os
@@ -434,6 +434,75 @@ def evaluate(weight, state_path, free_fn=measure_free_bytes, now=None):
         return dict(REFUSED, reason='state-unwritable: %s' % exc)
 
 
+def _refusal(reason, **extra):
+    return dict(REFUSED, reason=reason, **extra)
+
+
+def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None,
+            token_fn=process_token, ttl=DEFAULT_TTL):
+    """Admit one heavy job and record its byte reservation, or refuse.
+
+    Admission needs: heavy admitted by tier and latch, a free heavy lane, and
+    free bytes minus live reservations minus this request still at or above
+    the 100 GiB floor. Everything runs under the state lock, so concurrent
+    callers cannot jointly overcommit.
+    """
+    if not (isinstance(label, str) and LABEL_RE.match(label) and type(nbytes) is int and nbytes > 0
+            and type(pid) is int and pid > 0 and type(ttl) is int and 0 < ttl <= MAX_TTL):
+        return _refusal('invalid-request: label, bytes, pid or ttl is out of range')
+    now = now or datetime.now(timezone.utc)
+    try:
+        with state_lock(state_path):
+            result = _evaluate_locked('heavy', state_path, free_fn, now)
+            if not result['admit']:
+                return result
+            live, problems = live_reservations(state_path, now, token_fn)
+            if problems:
+                return dict(result, admit=False, reason=problems[0])
+            token = token_fn(pid)
+            if token is None:
+                return dict(result, admit=False, reason='process-not-running: pid %d' % pid)
+            same = [r for r in live if r['label'] == label]
+            if same and (same[0]['pid'], same[0]['start_token']) != (pid, token):
+                return dict(result, admit=False, reason='label-in-use: %s belongs to another live process' % label)
+            others = [r for r in live if r['label'] != label]
+            lanes = HEAVY_LANES[result['tier']]
+            reserved = sum(r['bytes'] for r in others)
+            if len(others) >= lanes:
+                return dict(result, admit=False, reserved_bytes=reserved,
+                            reason='lane-cap: %d of %d heavy lanes in use' % (len(others), lanes))
+            if result['free_bytes'] - reserved - nbytes < HEAVY_FLOOR:
+                return dict(result, admit=False, reserved_bytes=reserved,
+                            reason='over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
+                                result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB))
+            write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl))
+            return dict(result, reserved_bytes=reserved + nbytes,
+                        reason='reserved %.1f GiB for %s (lane %d of %d)' % (nbytes / GIB, label, len(others) + 1, lanes))
+    except StateError as exc:
+        return _refusal('%s: %s' % (exc.kind, exc))
+    except OSError as exc:
+        return _refusal('state-unwritable: %s' % exc)
+
+
+def release(label, state_path):
+    """Delete this tool's reservation file for label; a missing one is success."""
+    if not (isinstance(label, str) and LABEL_RE.match(label)):
+        return _refusal('invalid-request: bad label')
+    try:
+        with state_lock(state_path):
+            path = reservations_dir(state_path) / (label + '.json')
+            _refuse_symlinks(path)
+            if not path.exists():
+                return dict(REFUSED, admit=True, reason='no reservation named %s' % label)
+            _read_reservation(path)
+            path.unlink()
+            return dict(REFUSED, admit=True, reason='released %s' % label)
+    except StateError as exc:
+        return _refusal('%s: %s' % (exc.kind, exc))
+    except (OSError, ValueError) as exc:
+        return _refusal('reservation-unreadable: %s' % exc)
+
+
 REFUSED_EXIT = 77
 
 
@@ -445,12 +514,24 @@ def build_parser():
     check.add_argument('--weight', choices=WEIGHTS, required=True)
     status = commands.add_parser('status', allow_abbrev=False, help='report the current tier and latch')
     status.add_argument('--json', action='store_true', required=True)
+    take = commands.add_parser('reserve', allow_abbrev=False, help='reserve bytes for one heavy job')
+    take.add_argument('--bytes', type=int, required=True, dest='nbytes')
+    take.add_argument('--pid', type=int, required=True)
+    take.add_argument('--label', required=True)
+    take.add_argument('--ttl-s', type=int, default=DEFAULT_TTL, dest='ttl')
+    drop = commands.add_parser('release', allow_abbrev=False, help='release a reservation by label')
+    drop.add_argument('--label', required=True)
     return parser
 
 
 def main(argv=None, free_fn=measure_free_bytes, state_path=None):
     state_path = state_path or default_state_path()
     args = build_parser().parse_args(argv)
+    if args.command in ('reserve', 'release'):
+        result = (reserve(args.label, args.nbytes, args.pid, state_path, free_fn, ttl=args.ttl)
+                  if args.command == 'reserve' else release(args.label, state_path))
+        print(result['reason'])
+        return 0 if result['admit'] else REFUSED_EXIT
     result = evaluate(args.weight if args.command == 'check' else None, state_path, free_fn)
     if args.command == 'status':
         keys = ('tier', 'free_bytes', 'latch', 'timestamp')
