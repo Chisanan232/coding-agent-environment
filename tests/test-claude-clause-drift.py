@@ -38,6 +38,16 @@ class ClauseDrift(unittest.TestCase):
         self.assertNotIn(SECRET_TEXT, result.stdout + result.stderr)
         self.assertNotIn("Orphan", result.stdout + result.stderr)
 
+    def test_clause_covered_by_the_private_overlay_is_not_drift(self) -> None:
+        self.live.write_text("## Workflow Path\n\n## Synthetic Overlay Clause\n9. Synthetic overlay rule\n")
+        self.overlay.write_text("## Synthetic Overlay Clause\n9. Synthetic overlay rule\n")
+        result = self.report()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("overlay present", result.stdout)
+        self.assertNotIn("UNTRACKED", result.stdout)
+        self.overlay.unlink()
+        self.assertEqual(self.report().returncode, 1)  # negative control: same live file, no overlay
+
 
 if __name__ == "__main__":
     unittest.main()
