@@ -16,6 +16,7 @@ are reused from permission-rollout.py. This is not host-wide protection: only
 Claude Bash commands that the hook recognises are covered.
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -170,6 +171,40 @@ def plan(args):
     return 0
 
 
+class SettingsChanged(Exception):
+    """The live settings changed between reading and replacing them."""
+
+
+def replace_if_unchanged(path, data, expected):
+    """Write data over path only if path still holds the bytes that were read (checked right before the rename)."""
+    mode = path.stat().st_mode & 0o777
+    descriptor, temporary = tempfile.mkstemp(prefix=path.name + '.hookroll.', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        if path.read_bytes() != expected:
+            raise SettingsChanged()
+        os.replace(temporary, path)
+    except BaseException:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+        raise
+
+
+def take_lock(backups):
+    """Exclusive non-blocking lock so two applies cannot interleave; None when another holds it."""
+    descriptor = os.open(backups / '.hook-rollout.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    return descriptor
+
+
 def redirected(*paths):
     """Message for the first path (or its parent directory) that is a symlink."""
     for path in paths:
@@ -241,6 +276,17 @@ def apply(args):
         print(message)
         return 4
     backups.mkdir(parents=True, exist_ok=True)
+    lock = take_lock(backups)
+    if lock is None:
+        print('REFUSING: another apply holds the lock in %s' % backups)
+        return 11
+    try:
+        return _apply_locked(args, live_p, dest, backups, raw_bytes, live_sha, hook_bytes, hook_sha, dest_sha, new_text)
+    finally:
+        os.close(lock)
+
+
+def _apply_locked(args, live_p, dest, backups, raw_bytes, live_sha, hook_bytes, hook_sha, dest_sha, new_text):
     stamp = time.time_ns()
     receipt = {'schema': 1, 'live': str(live_p), 'settings_backup': None, 'settings_sha_before': live_sha,
                'hook_dest': str(dest), 'hook_backup': None, 'hook_created': dest_sha is None,
@@ -257,7 +303,15 @@ def apply(args):
     if dest_sha != hook_sha:
         install_bytes(dest, hook_bytes, 0o755)
     if new_text is not None:
-        rollout.atomic_write(live_p, new_text.encode())
+        try:
+            replace_if_unchanged(live_p, new_text.encode(), raw_bytes)
+        except SettingsChanged:
+            if receipt['hook_created'] and dest.exists():
+                dest.unlink()
+            elif receipt['hook_backup']:
+                install_bytes(dest, Path(receipt['hook_backup']).read_bytes(), 0o755)
+            print('REFUSING: the live file changed immediately before the write; the hook install was undone')
+            return 5
         receipt['settings_sha_after'] = sha_bytes(new_text.encode())
     receipt_path = backups / ('disk-admission-gate.receipt.%d.json' % stamp)
     rollout.write_new(receipt_path, (json.dumps(receipt, indent=2) + '\n').encode(), 0o600)
