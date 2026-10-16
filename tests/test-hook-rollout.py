@@ -395,6 +395,9 @@ class Fixture(unittest.TestCase):
     def test_a_root_array_is_refused_cleanly(self):
         self.refuses_bad_settings(b'[{"hooks": {}}]\n')
 
+    def test_non_utf8_settings_are_refused_cleanly(self):
+        self.refuses_bad_settings(b'{"statusLine": "\xff\xfe"}\n')
+
 
 if __name__ == '__main__':
     unittest.main()
