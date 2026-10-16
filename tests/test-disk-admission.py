@@ -4,6 +4,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -347,6 +348,20 @@ class Hardening(unittest.TestCase):
         # Negative control: once the holder lets go the same call admits.
         fcntl.flock(holder, fcntl.LOCK_UN)
         self.assertTrue(da.evaluate('light', self.path, lambda: 500 * GIB)['admit'])
+
+    def test_fifo_state_refused_without_hanging(self):
+        self.path.parent.mkdir(parents=True)
+        os.mkfifo(self.path)
+        results = []
+        worker = threading.Thread(target=lambda: results.append(da.evaluate('light', self.path, lambda: 500 * GIB)),
+                                  daemon=True)
+        worker.start()
+        worker.join(5)
+        self.assertFalse(worker.is_alive(), 'evaluate hung on a FIFO')
+        self.assertFalse(results[0]['admit'])
+        self.assertIn('state-not-regular', results[0]['reason'])
+        # The FIFO is left alone rather than replaced.
+        self.assertTrue(stat.S_ISFIFO(os.lstat(self.path).st_mode))
 
 
 if __name__ == '__main__':
