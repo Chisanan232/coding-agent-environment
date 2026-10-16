@@ -285,6 +285,11 @@ class Compound(unittest.TestCase):
             self.assertEqual((verdict['heavy'], verdict['confidence']), (True, 'best-effort'), command)
         self.assertFalse(self.heavy('eval "echo cargo build"'))
 
+    def test_cargo_manifest_path_before_the_subcommand_is_heavy(self):
+        self.assertTrue(self.heavy('cargo --manifest-path x/Cargo.toml build'))
+        self.assertTrue(self.heavy('cargo --manifest-path=x/Cargo.toml test'))
+        self.assertFalse(self.heavy('cargo --manifest-path x/Cargo.toml metadata'))
+
 
 if __name__ == '__main__':
     unittest.main()
