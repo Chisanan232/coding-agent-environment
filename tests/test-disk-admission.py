@@ -545,6 +545,23 @@ class Reservations(unittest.TestCase):
         self.assertIn('over-capacity', third['reason'])
         self.assertEqual(third['reserved_bytes'], 80 * GIB)
 
+    def test_concurrent_reserve_serialization(self):
+        results = []
+        with mock.patch.dict(da.HEAVY_LANES, {'wide': 8}):
+            workers = [threading.Thread(target=lambda n=n: results.append(self.take('job-%d' % n, 30 * GIB, 200 * GIB)))
+                       for n in range(8)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+        self.assertEqual(len(results), 8)
+        # 200 - 3 * 30 = 110 >= 100 but a fourth would leave 80: exactly three fit.
+        self.assertEqual(sum(1 for result in results if result['admit']), 3)
+        live, problems = self.live()
+        self.assertEqual((len(live), problems), (3, []))
+        self.assertEqual(sorted(entry.name for entry in (self.path.parent / 'reservations').iterdir()),
+                         sorted(record['label'] + '.json' for record in live))
+
 
 if __name__ == '__main__':
     unittest.main()
