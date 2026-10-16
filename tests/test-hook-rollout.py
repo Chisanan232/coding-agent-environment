@@ -300,6 +300,15 @@ class Fixture(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('hash differs', text)
 
+    def test_verify_flags_an_enforce_mode_file_unless_allowed(self):
+        self.assertEqual(self.apply()[0], 0)
+        self.mode.parent.mkdir(parents=True)
+        self.mode.write_text('enforce')
+        code, text = self.run_cli('verify')
+        self.assertEqual(code, 1)
+        self.assertIn('enforce', text)
+        self.assertEqual(self.run_cli('verify', '--allow-enforce')[0], 0)
+
 
 if __name__ == '__main__':
     unittest.main()
