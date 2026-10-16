@@ -29,3 +29,13 @@ Moved verbatim from `.claude/CLAUDE.md`; that file keeps a short pointer.
 > **Project-specific**: which type checker (mypy, pyright, tsc, etc.), config file
 > location, and language-specific annotation syntax belong in the project's `.claude/CLAUDE.md`.
 
+## Linting and Formatting Policy
+
+- All lint errors must be fixed before committing.
+- Do not suppress lint warnings without a comment explaining the exception.
+- Pre-commit hooks enforce both linting and formatting.
+- Config lives in the project's standard config file (see project-level CLAUDE.md).
+
+> **Project-specific**: linter name, formatter, and config file location belong in the
+> project's `.claude/CLAUDE.md`.
+

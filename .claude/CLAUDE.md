@@ -135,13 +135,9 @@ every commit. Details are in
 
 ## Linting and Formatting Policy
 
-- All lint errors must be fixed before committing.
-- Do not suppress lint warnings without a comment explaining the exception.
-- Pre-commit hooks enforce both linting and formatting.
-- Config lives in the project's standard config file (see project-level CLAUDE.md).
-
-> **Project-specific**: linter name, formatter, and config file location belong in the
-> project's `.claude/CLAUDE.md`.
+Fix all lint errors before committing and explain any suppression with a comment;
+pre-commit hooks enforce lint and format. Details are in
+[quality-policies](skills/feature-implementation/references/quality-policies.md).
 
 ---
 
