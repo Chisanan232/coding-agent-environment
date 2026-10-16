@@ -110,8 +110,9 @@ State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
   heavy_lanes_allowed, active_heavy_jobs, reserved_bytes, protection, blockers,
   source`. A consumer computes age from `ts` and must treat age over 120 s (or a
   future `ts`) as stale and refuse heavy work. Other sessions can call the
-  read-only `snapshot --check-fresh [--max-age 120]` (exit 0 fresh; 77 stale,
-  missing or unreadable). The gate does not use the snapshot: it always asks the
+  read-only `snapshot --check-fresh [--max-age N]` (exit 0 fresh; 77 stale,
+  missing or unreadable). N may only tighten the rule: values above 120 or
+  below 1 are refused with exit 77. The gate does not use the snapshot: it always asks the
   adapter for a fresh `check`. `heavy_lanes_allowed` is 0 below 100 GiB or while
   latched and 1 in stable and wide until a second-lane analysis is approved.
   `protection` stays `advisory-not-wired` until the gate is proven wired.
