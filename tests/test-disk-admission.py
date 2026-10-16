@@ -232,6 +232,15 @@ class Cli(unittest.TestCase):
         self.assertEqual(self.run_main(['check', '--weight', 'heavy'], 150 * GIB)[0], 0)
         self.assertEqual(self.run_main(['check', '--weight', 'light'], 36 * GIB)[0], 0)
 
+    def test_status_json_reports_tier_and_latch(self):
+        code, text = self.run_main(['status', '--json'], 10 * GIB)
+        report = json.loads(text)
+        self.assertEqual(code, 0)
+        self.assertEqual((report['tier'], report['free_bytes'], report['latch']), ('emergency', 10 * GIB, True))
+        self.assertIn('timestamp', report)
+        code, text = self.run_main(['status', '--json'], 30 * GIB)
+        self.assertTrue(json.loads(text)['latch'])
+
 
 if __name__ == '__main__':
     unittest.main()
