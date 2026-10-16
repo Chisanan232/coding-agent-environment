@@ -765,6 +765,12 @@ class ConfigErrors(unittest.TestCase):
         self.assertIn('not an absolute path', context)
         self.assertEqual([(l['classification'], l['decision']) for l in lines][:1], [('config-error', 'warn')])
 
+    def test_enforce_mode_refuses_heavy_commands_on_a_configuration_error(self):
+        code, out, err, lines = self.run_gate('cargo build', 'enforce')
+        self.assertEqual((code, out), (2, ''))
+        self.assertIn('configuration error', err)
+        self.assertEqual([(l['classification'], l['decision']) for l in lines], [('config-error', 'deny')])
+
 
 if __name__ == '__main__':
     unittest.main()
