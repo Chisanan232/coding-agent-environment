@@ -319,6 +319,14 @@ class Hardening(unittest.TestCase):
         self.path.write_text(json.dumps(dict(forged, free_bytes=150 * GIB, tier='stable')))
         self.assertTrue(da.evaluate('light', self.path, lambda: 30 * GIB)['admit'])
 
+    def test_default_state_path_ignores_home_environment(self):
+        import pwd
+        account = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        with mock.patch.dict(os.environ, {'HOME': self.temp.name}):
+            path = da.default_state_path()
+        self.assertEqual(path, account / da.STATE_RELATIVE)
+        self.assertFalse(str(path).startswith(self.temp.name))
+
 
 if __name__ == '__main__':
     unittest.main()
