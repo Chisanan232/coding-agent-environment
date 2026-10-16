@@ -398,6 +398,8 @@ def decide(command, mode, runner=run_adapter, exists=os.path.exists):
 
 def main(raw, stdout, stderr, mode_fn=read_mode, runner=run_adapter):
     try:
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8', 'replace')
         payload = json.loads(raw)
         command = payload['tool_input']['command']
         if payload.get('tool_name') != 'Bash' or not isinstance(command, str):
@@ -419,4 +421,4 @@ def main(raw, stdout, stderr, mode_fn=read_mode, runner=run_adapter):
 
 
 if __name__ == '__main__':
-    raise SystemExit(main(sys.stdin.read(), sys.stdout, sys.stderr))
+    raise SystemExit(main(sys.stdin.buffer.read(), sys.stdout, sys.stderr))
