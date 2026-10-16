@@ -116,16 +116,11 @@ carries regression risk.
 
 ## Testing Expectations
 
-- All new features require tests. All bug fixes require a regression test.
-- Tests must be deterministic, isolated, and fast.
-- Test behavior, not implementation. Tests must not assert on private internals.
-- Do not disable failing tests. Fix them or escalate.
-- Coverage is a metric, not the goal. Meaningful tests matter more than coverage %.
-- Run impacted tests during iteration. Run the full suite before committing.
-
-> **Project-specific**: test runner, coverage tool, fixture strategy, mocking library,
-> test directory layout, coverage threshold, and database test strategy belong in the
-> project's `.claude/CLAUDE.md`.
+New features need tests and bug fixes need a regression test. Tests are
+deterministic, isolated, fast, and assert behavior rather than private internals.
+Do not disable failing tests; fix them or escalate. Run impacted tests while
+iterating and the full suite before committing. Details are in
+[quality-policies](skills/feature-implementation/references/quality-policies.md).
 
 ---
 
