@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """The disk-admission PreToolUse gate classifies heavy builds and only ever denies."""
 from importlib.util import module_from_spec, spec_from_file_location
+import os
 from pathlib import Path
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -79,6 +81,33 @@ class TargetAdvice(unittest.TestCase):
         self.assertIsNone(self.advice('cargo build'))
         self.assertIsNone(self.advice('npm ci'))
         self.assertIsNone(self.advice('cargo build --target-dir relative/target'))
+
+
+class Mode(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / 'mode'
+
+    def mode(self, content=None):
+        if content is not None:
+            self.path.write_bytes(content)
+        return gate.read_mode(self.path)
+
+    def test_mode_file_defaults_to_warn_and_only_exact_enforce_enforces(self):
+        self.assertEqual(self.mode(), 'warn')
+        self.assertEqual(self.mode(b'enforce\n'), 'enforce')
+        self.assertEqual(self.mode(b'  enforce  '), 'enforce')
+        # Negative controls: warn, anything else, wrong case, empty and binary all fall back to warn.
+        for content in (b'warn\n', b'', b'ENFORCE', b'enforce please', b'\xff\xfe', b'off'):
+            self.assertEqual(self.mode(content), 'warn', content)
+        self.path.unlink()
+        os.mkfifo(self.path)
+        self.assertEqual(gate.read_mode(self.path), 'warn')
+        self.path.unlink()
+        self.path.symlink_to(Path(self.temp.name) / 'elsewhere')
+        (Path(self.temp.name) / 'elsewhere').write_text('enforce')
+        self.assertEqual(gate.read_mode(self.path), 'warn')
 
 
 if __name__ == '__main__':
