@@ -9,6 +9,7 @@ RTKHookSelfDecision class docstring and ADR-0012's Consequences section.
 """
 import fnmatch
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -17,7 +18,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SETTINGS_PATH = ROOT / ".claude/settings.json"
+# PERMISSION_BASELINE lets a reviewer validate a candidate file before it is applied.
+SETTINGS_PATH = Path(os.environ.get("PERMISSION_BASELINE", ROOT / ".claude/settings.json"))
 SYNC_CHECK = ROOT / "scripts/sync-check.sh"
 
 MANDATORY_ASK = {
@@ -45,12 +47,15 @@ MANDATORY_ASK = {
     "mcp__polar-production__execute_tool",
 }
 
-MANDATORY_DENY = {
+# SPE-106: the personal policy has zero static deny. These former-deny rules
+# are ask-gated, which prompts in every permission mode, bypass included.
+MANDATORY_FORMER_DENY_ASK = {
     "Bash(terraform destroy:*)",
-    "Bash(terraform * destroy*)",
-    "Bash(rtk terraform * destroy*)",
-    "Bash(terraform * apply *-destroy*)",
-    "Bash(terraform * apply *--destroy*)",
+    "Bash(rtk terraform destroy:*)",
+    "Bash(terraform -* destroy*)",
+    "Bash(rtk terraform -* destroy*)",
+    "Bash(terraform -* apply*)",
+    "Bash(rtk terraform -* apply*)",
     "Bash(rtk proxy *)",
     "Bash(gcloud secrets versions access *)",
     "Bash(rtk gcloud secrets versions access *)",
@@ -118,10 +123,11 @@ class MandatorySafeguardsPresent(unittest.TestCase):
         missing = MANDATORY_ASK - ask
         self.assertEqual(missing, set(), f"mandatory ask rule(s) missing: {missing}")
 
-    def test_mandatory_deny_rules_present(self):
-        deny = set(load_settings()["permissions"]["deny"])
-        missing = MANDATORY_DENY - deny
-        self.assertEqual(missing, set(), f"mandatory deny rule(s) missing: {missing}")
+    def test_static_deny_list_is_empty_and_former_deny_rules_ask(self):
+        p = load_settings()["permissions"]
+        self.assertEqual(p["deny"], [], "personal policy is zero static deny (SPE-106)")
+        missing = MANDATORY_FORMER_DENY_ASK - set(p["ask"])
+        self.assertEqual(missing, set(), f"former-deny rule(s) not ask-gated: {missing}")
 
     def test_rm_rf_and_broad_gh_api_methods_are_intentionally_not_blanket_ask(self):
         """ADR-0012's 60->47 narrowing is a deliberate decision, not drift —
@@ -151,7 +157,7 @@ def bash_rule_matches(command, rule):
     return fnmatch.fnmatchcase(command, pattern)
 
 
-class GlobalFlagReorderingDenyRegression(unittest.TestCase):
+class GlobalFlagReorderingAskRegression(unittest.TestCase):
     """Found via an automated security review of this ADR's own commit
     (2026-10-10): a global flag placed BEFORE the subcommand (terraform's
     `-chdir=`, gcloud's `--project=`, etc.) changes the command's word
@@ -161,31 +167,31 @@ class GlobalFlagReorderingDenyRegression(unittest.TestCase):
     just not yet applied to these two deny rules until now. Mirrors the
     verification methodology already used for SPE-83's allow-side fix."""
 
-    def test_terraform_destroy_still_denied_with_a_preceding_global_flag(self):
-        deny = load_settings()["permissions"]["deny"]
+    def test_terraform_destroy_still_ask_gated_with_a_preceding_global_flag(self):
+        ask = load_settings()["permissions"]["ask"]
         for cmd in ("terraform -chdir=/tmp destroy", "terraform destroy",
                     "terraform -chdir=/tmp apply -destroy",
                     "terraform apply -auto-approve -destroy",
                     "terraform apply -destroy"):
             with self.subTest(cmd=cmd):
-                self.assertTrue(any(bash_rule_matches(cmd, r) for r in deny), f"not denied: {cmd!r}")
+                self.assertTrue(any(bash_rule_matches(cmd, r) for r in ask), f"not ask-gated: {cmd!r}")
 
-    def test_terraform_plan_with_the_destroy_flag_is_not_falsely_denied(self):
+    def test_terraform_plan_with_the_destroy_flag_is_not_falsely_ask_gated(self):
         """`terraform plan -destroy` never mutates anything — it's exactly
         as read-only as `terraform plan`. The fix for the above must not
         turn this into a false block."""
-        deny = load_settings()["permissions"]["deny"]
-        for cmd in ("terraform plan -destroy", "terraform plan", "terraform init", "terraform apply"):
+        ask = load_settings()["permissions"]["ask"]
+        for cmd in ("terraform plan -destroy", "terraform plan", "terraform init", "terraform fmt"):
             with self.subTest(cmd=cmd):
-                self.assertFalse(any(bash_rule_matches(cmd, r) for r in deny), f"incorrectly denied: {cmd!r}")
+                self.assertFalse(any(bash_rule_matches(cmd, r) for r in ask), f"incorrectly ask-gated: {cmd!r}")
 
-    def test_gcloud_secrets_access_still_denied_with_a_preceding_global_flag(self):
-        deny = load_settings()["permissions"]["deny"]
+    def test_gcloud_secrets_access_still_ask_gated_with_a_preceding_global_flag(self):
+        ask = load_settings()["permissions"]["ask"]
         for cmd in ("gcloud --project=evil secrets versions access latest",
                     "gcloud secrets versions access latest",
                     "rtk gcloud --project=evil secrets versions access latest"):
             with self.subTest(cmd=cmd):
-                self.assertTrue(any(bash_rule_matches(cmd, r) for r in deny), f"not denied: {cmd!r}")
+                self.assertTrue(any(bash_rule_matches(cmd, r) for r in ask), f"not ask-gated: {cmd!r}")
 
 
 class RTKPrefixTwinCoverage(unittest.TestCase):
@@ -251,14 +257,14 @@ class RTKPrefixTwinCoverage(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertTrue(any(bash_rule_matches(cmd, r) for r in ask), f"not caught: {cmd!r}")
 
-    def test_rtk_terraform_destroy_bare_is_denied(self):
-        deny = load_settings()["permissions"]["deny"]
+    def test_rtk_terraform_destroy_bare_is_ask_gated(self):
+        ask = load_settings()["permissions"]["ask"]
         for cmd in ("terraform destroy", "rtk terraform destroy"):
             with self.subTest(cmd=cmd):
-                self.assertTrue(any(bash_rule_matches(cmd, r) for r in deny), f"not denied: {cmd!r}")
+                self.assertTrue(any(bash_rule_matches(cmd, r) for r in ask), f"not ask-gated: {cmd!r}")
 
-    def test_rtk_terraform_apply_destroy_adjacent_is_denied(self):
-        deny = load_settings()["permissions"]["deny"]
+    def test_rtk_terraform_apply_destroy_adjacent_is_ask_gated(self):
+        ask = load_settings()["permissions"]["ask"]
         for cmd in (
             "terraform apply -destroy",
             "rtk terraform apply -destroy",
@@ -266,7 +272,7 @@ class RTKPrefixTwinCoverage(unittest.TestCase):
             "rtk terraform apply --destroy",
         ):
             with self.subTest(cmd=cmd):
-                self.assertTrue(any(bash_rule_matches(cmd, r) for r in deny), f"not denied: {cmd!r}")
+                self.assertTrue(any(bash_rule_matches(cmd, r) for r in ask), f"not ask-gated: {cmd!r}")
 
 
 class SPE83PushAllowRegression(unittest.TestCase):
@@ -322,8 +328,8 @@ class RTKHookSelfDecision(unittest.TestCase):
                 out = self._hook(cmd)
                 self.assertNotIn('"permissionDecision":"allow"', out.replace(" ", ""))
 
-    def test_rtk_proxy_itself_is_unrewritten_and_relies_on_the_deny_rule(self):
-        """rtk does not rewrite its own `proxy` subcommand — the deny rule
+    def test_rtk_proxy_itself_is_unrewritten_and_relies_on_the_ask_rule(self):
+        """rtk does not rewrite its own `proxy` subcommand — the ask rule
         must match the literal bare text, not an `rtk `-prefixed form."""
         out = self._hook("rtk proxy terraform destroy")
         self.assertNotIn("updatedInput", out)
@@ -465,10 +471,11 @@ class SPE105EffectiveBehavior(unittest.TestCase):
         self.assertDecision("ask", [
             "git worktree remove --forc /t", "git worktree remove --for /t", "git worktree remove --fo /t",
             "git worktree remove /t --f", "git worktree remove --for --for /t",
-            "git -C /repo worktree remove /t", "git -c k=v worktree remove --force /t",
+            "git -c k=v worktree remove --force /t", "git -C /repo worktree remove -f /t", "git -C /repo worktree remove /t --f", "git -C /repo worktree remove /t",
+            "git -C /repo worktree add -f ../w", "git -C /repo worktree add ../w -B x", "git -C /repo worktree add --force ../w",
             "git -C /repo worktree prune", "git -C /repo worktree move a b",
             "git worktree unlock /t", "git worktree add -B existing ../w HEAD~5", "git worktree add -Bexisting ../w", "git worktree add -b x -Bexisting ../w",
-            "git worktree add ../w -B existing", "git diff '--output=/tmp/x'", "git log '--ext-diff' -p", "git fetch '--upload-pack=cmd' .", "git diff --no-index /dev/null x", "git worktree add --force ../w", "git worktree add ../w --for",
+            "git worktree add ../w -B existing", "git diff '--output=/tmp/x'", "git log '--ext-diff' -p", "git fetch '--upload-pack=cmd' .", "git diff --no-index /dev/null x", "git worktree add --force ../w", "git worktree add ../w --for", "git worktree add -f ../w",
             "git fetch --upload-pack=cmd .", "git fetch origin --upload-pack=cmd", "git fetch --upl=cmd .",
         ])
 
@@ -488,14 +495,42 @@ class SPE105EffectiveBehavior(unittest.TestCase):
         self.assertDecision("classifier", ["git push origin main"])
         self.assertDecision("ask", ["git push --force origin x", "git reset --hard HEAD~1", "git clean -fd"])
 
-    def test_deny_boundaries_unchanged_and_beat_everything(self):
-        self.assertDecision("deny", [
+    def test_former_deny_boundaries_ask_in_every_spelling(self):
+        """SPE-106: no static deny; each former-deny operation prompts, bare and rtk-rewritten."""
+        self.assertDecision("ask", [
             "terraform destroy", "terraform -chdir=x destroy", "terraform apply -destroy",
+            "terraform apply --destroy -auto-approve", "terraform -chdir=x apply -destroy", "terraform apply",
             "gcloud secrets versions access latest --secret=s",
             "gcloud --project=p secrets versions access latest --secret=s",
         ])
-        self.assertIn("mcp__neon__get_connection_string", self.perm["deny"])
-        self.assertEqual("deny", static_decision("rtk proxy git push", self.perm))
+        self.assertIn("mcp__neon__get_connection_string", self.perm["ask"])
+        self.assertEqual("ask", static_decision("rtk proxy git push", self.perm))
+        self.assertEqual([], self.perm["deny"])
+
+    def test_read_only_terraform_stays_unprompted(self):
+        """rtk rewrites only `terraform plan`; init/validate/fmt reach the engine unchanged."""
+        for cmd in ("terraform plan -destroy", "rtk terraform plan -destroy", "terraform plan", "rtk terraform plan",
+                    "terraform init", "terraform validate", "terraform fmt"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual("allow", static_decision(cmd, self.perm))
+
+    def test_terraform_globs_do_not_prompt_on_words_inside_read_only_arguments(self):
+        for cmd in ("terraform plan -out apply.tfplan", "terraform plan -out destroy.tfplan", "terraform output apply_url", "terraform workspace select destroy-x"):
+            for pre in ("", "rtk "):
+                with self.subTest(cmd=pre + cmd):
+                    self.assertNotEqual("ask", static_decision(pre + cmd, self.perm))
+
+    def test_worktree_add_with_ticket_style_paths_is_not_a_false_positive(self):
+        """SPE-106: `add*-f*` matched any path containing "-f" (e.g. "...-full-SPE-1")."""
+        self.assertDecision("allow", [
+            "git worktree add -b full/SPE-106/config/zero_static_deny ../repo-full-SPE-106-config-zero origin/main",
+            "git worktree add ../repo-full-SPE-106-config -b full/SPE-106/config/x origin/main",
+            "git worktree add --detach ../repo-fix-feature-flag origin/main",
+        ])
+
+    def test_plain_worktree_remove_is_left_to_the_classifier_with_the_ownership_line(self):
+        self.assertDecision("classifier", ["git worktree remove /some/tree"])
+        self.assertDecision("ask", ["git worktree remove -f /t", "git -C /repo worktree remove --force /t", "git -C /repo worktree remove /t", "git worktree prune"])
 
     def test_public_baseline_carries_no_project_specific_secret_rules(self):
         """ADR-0012 Decision 2/6: private project names live in an overlay."""
@@ -504,16 +539,27 @@ class SPE105EffectiveBehavior(unittest.TestCase):
         self.assertNotIn("sync-neon-secret", blob)
         self.assertNotRegex(blob, r"gcloud secrets (?:versions )?(?:add|create)")
 
-    def test_merge_authorization_is_evidence_gated_prose_not_a_blanket(self):
+    def test_merge_authorization_is_verifiable_prose_not_a_blanket(self):
         d = load_settings()
         entries = d["autoMode"]["allow"]
         self.assertEqual("$defaults", entries[0])
         merge = [e for e in entries if "merge" in e.lower()]
         self.assertEqual(1, len(merge))
-        for needle in ("merge commit", "--match-head-commit", "squash", "green", "conflicts", "owns or administers"):
+        for needle in ("--merge", "--match-head-commit", "--squash", "gh pr checks", "--admin", "never excuses a failing check"):
             self.assertIn(needle, merge[0])
+        self.assertIn("user message", merge[0])
+        self.assertNotIn("global instructions", merge[0], "the classifier may not see CLAUDE.md; conditions must be transcript-verifiable")
         self.assertNotIn("soft_deny", d["autoMode"])
         self.assertNotIn("hard_deny", d["autoMode"])
+
+    def test_environment_keeps_defaults_and_has_no_stale_or_contradictory_lines(self):
+        env = load_settings()["autoMode"]["environment"]
+        self.assertEqual("$defaults", env[0], "omitting $defaults replaces the built-in environment")
+        joined = "\n".join(env)
+        for stale in ("no remotes", "local-only checkout", "None configured", "### ", "routine under", "Worktree cleanup", "denied by rule"):
+            self.assertNotIn(stale, joined)
+        self.assertIn("Worktree and session ownership", joined)
+        self.assertIn("ask-gated, not denied", joined)
 
     def test_bypass_permissions_never_enabled(self):
         text = SETTINGS_PATH.read_text()
@@ -565,17 +611,45 @@ class SecretMetadataOverlayTemplate(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual("ask", static_decision(cmd, self.merged))
 
-    def test_secret_value_reads_stay_denied_even_with_the_overlay(self):
+    def test_secret_value_reads_still_ask_even_with_the_overlay(self):
         for cmd in (
             "gcloud secrets versions access latest --secret=s1 --project=proj-x",
             "gcloud secrets versions access 1 --secret=s --project=proj-x --data-file=-",
             "gcloud --project=proj-x secrets versions access latest --secret=s1",
         ):
             with self.subTest(cmd=cmd):
-                self.assertEqual("deny", static_decision(cmd, self.merged))
+                self.assertEqual("ask", static_decision(cmd, self.merged))
 
     def test_template_has_no_real_project_name(self):
         self.assertNotIn("horonom", OVERLAY_TEMPLATE.read_text())
+
+
+SOURCES_TEMPLATE = ROOT / "docs/examples/automode-trusted-sources.example.json"
+
+
+class TrustedSourcesTemplate(unittest.TestCase):
+    def test_template_uses_a_placeholder_and_names_no_real_owner(self):
+        text = SOURCES_TEMPLATE.read_text()
+        self.assertIn("<owners>", text)
+        for real in ("Chisanan232", "horonomy", "AI-agent-assembly", "ai-agent-assembly", "Lightning", "rome"):
+            self.assertNotIn(real, text)
+
+    def test_template_has_dev_dir_placeholder_and_no_real_path(self):
+        data = json.loads(SOURCES_TEMPLATE.read_text())["autoMode"]
+        text = json.dumps(data)
+        self.assertIn("<dev-dirs>", text)
+        self.assertNotIn("/Users/", text)
+        self.assertNotIn("Bryant-Developments", text)
+        self.assertEqual(1, len(data["allow"]))
+        for guard in ("credential or key files", "system", "external"):
+            self.assertIn(guard, data["allow"][0])
+
+    def test_template_never_trusts_arbitrary_external_targets(self):
+        env = json.loads(SOURCES_TEMPLATE.read_text())["autoMode"]["environment"]
+        joined = " ".join(env)
+        self.assertIn("Any other owner is external", joined)
+        for broad in ("any GitHub", "all repositories", "trusted cloud", "gs://", "*.com"):
+            self.assertNotIn(broad, joined)
 
 
 if __name__ == "__main__":
