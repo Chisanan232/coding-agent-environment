@@ -20,7 +20,7 @@ Fail closed: an unreadable volume refuses, and a corrupt, unparsable or
 wrong-schema state file counts as latched and refuses with its own reason.
 
 The only host write is the state file, default
-~/.cache/aa-qa/admission/state.json. Free space and the state path cannot be
+~/.cache/coding-agent-environment/admission/state.json. Free space and the state path cannot be
 overridden from the command line; tests inject them through arguments.
 
 Exit codes for `check`: 0 admit, 77 refuse. Usage errors exit 2.
@@ -80,7 +80,7 @@ def decide(weight, free_bytes, state):
 
 
 STATE_VERSION = 1
-STATE_RELATIVE = '.cache/aa-qa/admission/state.json'
+STATE_RELATIVE = '.cache/coding-agent-environment/admission/state.json'
 
 
 def account_home():
