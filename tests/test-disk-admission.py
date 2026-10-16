@@ -478,6 +478,18 @@ class Reservations(unittest.TestCase):
         self.assertEqual(file.stat().st_mode & 0o777, 0o600)
         self.assertEqual(file.parent.stat().st_mode & 0o777, 0o700)
 
+    def test_dead_pid_reservation_is_pruned(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        token = da.process_token(child.pid)
+        file = self.reserve_file('job-dead', child.pid, token)
+        self.assertEqual(len(self.live()[0]), 1)
+        child.kill()
+        child.wait()
+        self.assertIsNone(da.process_token(child.pid))
+        live, problems = self.live()
+        self.assertEqual((live, problems), ([], []))
+        self.assertFalse(file.exists())
+
 
 if __name__ == '__main__':
     unittest.main()
