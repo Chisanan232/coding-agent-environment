@@ -292,6 +292,14 @@ class Fixture(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('found 2', text)
 
+    def test_verify_fails_on_a_changed_hook_file(self):
+        self.assertEqual(self.apply()[0], 0)
+        self.dest.write_text('tampered')
+        os.chmod(self.dest, 0o755)
+        code, text = self.run_cli('verify')
+        self.assertEqual(code, 1)
+        self.assertIn('hash differs', text)
+
 
 if __name__ == '__main__':
     unittest.main()
