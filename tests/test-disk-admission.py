@@ -490,6 +490,13 @@ class Reservations(unittest.TestCase):
         self.assertEqual((live, problems), ([], []))
         self.assertFalse(file.exists())
 
+    def test_pid_reuse_token_mismatch_is_pruned(self):
+        file = self.reserve_file('job-reused', token='Mon Jan  1 00:00:00 2001')
+        self.assertTrue(file.exists())
+        live, _ = self.live()
+        self.assertEqual(live, [])
+        self.assertFalse(file.exists())
+
 
 if __name__ == '__main__':
     unittest.main()
