@@ -184,6 +184,17 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.snapshot_tree(), before)
         self.assertEqual(self.run_cli('apply', '--unmerged-ok')[0], 3)
 
+    def test_symlinked_settings_are_refused(self):
+        real = self.root / 'claude/real-settings.json'
+        real.write_text(self.live_text)
+        self.live.unlink()
+        self.live.symlink_to(real)
+        code, text = self.apply()
+        self.assertEqual(code, 4)
+        self.assertIn('symlink', text)
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(real.read_text(), self.live_text)
+
 
 if __name__ == '__main__':
     unittest.main()
