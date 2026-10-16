@@ -307,7 +307,16 @@
             "Bash(rtk gcloud secrets versions access *)",
             "Bash(gcloud * secrets versions access*)",
             "Bash(rtk gcloud * secrets versions access*)",
-            "mcp__neon__get_connection_string"
+            "mcp__neon__get_connection_string",
+
+            "Bash(gcloud*add-iam-policy-binding*)",
+            "Bash(rtk gcloud*add-iam-policy-binding*)",
+            "Bash(gcloud*remove-iam-policy-binding*)",
+            "Bash(rtk gcloud*remove-iam-policy-binding*)",
+            "Bash(gcloud*set-iam-policy*)",
+            "Bash(rtk gcloud*set-iam-policy*)",
+            "Bash(gcloud*service-accounts keys create*)",
+            "Bash(rtk gcloud*service-accounts keys create*)"
         ],
         "deny": [],
         "defaultMode": "auto"

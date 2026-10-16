@@ -64,6 +64,15 @@ MANDATORY_FORMER_DENY_ASK = {
     "mcp__neon__get_connection_string",
 }
 
+# SPE-106 follow-up: IAM mutations and service-account key creation prompt (the
+# baseline had no static gate; an explicitly requested grant otherwise ran unprompted).
+MANDATORY_IAM_ASK = {
+    "Bash(gcloud*add-iam-policy-binding*)", "Bash(rtk gcloud*add-iam-policy-binding*)",
+    "Bash(gcloud*remove-iam-policy-binding*)", "Bash(rtk gcloud*remove-iam-policy-binding*)",
+    "Bash(gcloud*set-iam-policy*)", "Bash(rtk gcloud*set-iam-policy*)",
+    "Bash(gcloud*service-accounts keys create*)", "Bash(rtk gcloud*service-accounts keys create*)",
+}
+
 # Patterns that would reproduce SPE-83: any allow rule RTK's self-decision
 # could match for a plain `git push`, at git-subcommand granularity,
 # regardless of trailing wildcard shape.
@@ -122,6 +131,10 @@ class MandatorySafeguardsPresent(unittest.TestCase):
         ask = set(load_settings()["permissions"]["ask"])
         missing = MANDATORY_ASK - ask
         self.assertEqual(missing, set(), f"mandatory ask rule(s) missing: {missing}")
+
+    def test_iam_mutation_rules_present(self):
+        missing = MANDATORY_IAM_ASK - set(load_settings()["permissions"]["ask"])
+        self.assertEqual(missing, set(), f"IAM ask rule(s) missing: {missing}")
 
     def test_static_deny_list_is_empty_and_former_deny_rules_ask(self):
         p = load_settings()["permissions"]
@@ -506,6 +519,27 @@ class SPE105EffectiveBehavior(unittest.TestCase):
         self.assertIn("mcp__neon__get_connection_string", self.perm["ask"])
         self.assertEqual("ask", static_decision("rtk proxy git push", self.perm))
         self.assertEqual([], self.perm["deny"])
+
+    def test_iam_grants_and_key_creation_ask_in_every_spelling(self):
+        self.assertDecision("ask", [
+            "gcloud projects add-iam-policy-binding p --member=user:a@example.com --role=roles/viewer",
+            "gcloud --project=p projects add-iam-policy-binding p --member=user:a@example.com --role=roles/owner",
+            "gcloud beta projects add-iam-policy-binding p --member=serviceAccount:s@p.iam --role=roles/editor",
+            "gcloud iam service-accounts add-iam-policy-binding sa@p.iam --member=user:a@example.com --role=roles/iam.serviceAccountUser",
+            "gcloud run services add-iam-policy-binding svc --member=allUsers --role=roles/run.invoker",
+            "gcloud organizations add-iam-policy-binding 1 --member=user:a@example.com --role=roles/owner",
+            "gcloud projects remove-iam-policy-binding p --member=user:a@example.com --role=roles/viewer",
+            "gcloud projects set-iam-policy p policy.json",
+            "gcloud iam service-accounts keys create key.json --iam-account=sa@p.iam",
+        ])
+
+    def test_read_only_iam_commands_stay_unprompted(self):
+        for cmd in ("gcloud projects get-iam-policy p", "gcloud iam roles describe roles/viewer",
+                    "gcloud iam service-accounts list", "gcloud iam service-accounts keys list --iam-account=sa@p.iam",
+                    "gcloud projects describe p"):
+            for pre in ("", "rtk "):
+                with self.subTest(cmd=pre + cmd):
+                    self.assertNotEqual("ask", static_decision(pre + cmd, self.perm))
 
     def test_read_only_terraform_stays_unprompted(self):
         """rtk rewrites only `terraform plan`; init/validate/fmt reach the engine unchanged."""
