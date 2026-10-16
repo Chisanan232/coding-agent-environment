@@ -607,6 +607,20 @@ class Snapshots(unittest.TestCase):
         self.assertEqual(file.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.shot(80 * GIB, 'statvfs')['source'], 'statvfs')
 
+    def test_snapshot_heavy_lanes_by_tier_and_latch(self):
+        self.assertEqual(self.shot(150 * GIB)['heavy_lanes_allowed'], 1)
+        self.assertEqual(self.shot(99 * GIB)['heavy_lanes_allowed'], 0)
+        self.assertEqual(self.shot(100 * GIB)['heavy_lanes_allowed'], 1)
+        wide = self.shot(500 * GIB)
+        self.assertEqual((wide['tier'], wide['heavy_lanes_allowed']), ('wide', 1))
+        # Latched: no lane, with the reason listed, even once free space reads as stable again.
+        self.shot(10 * GIB)
+        held = self.shot(40 * GIB)
+        self.assertEqual((held['latch'], held['heavy_lanes_allowed']), (True, 0))
+        self.assertIn('latched', held['blockers'][0])
+        low = self.shot(70 * GIB)
+        self.assertTrue(any('below stable' in b or 'latched' in b for b in low['blockers']))
+
 
 if __name__ == '__main__':
     unittest.main()
