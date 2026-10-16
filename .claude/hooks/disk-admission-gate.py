@@ -217,3 +217,78 @@ def read_mode(path=None):
     except OSError:
         return 'warn'
     return 'enforce' if value == 'enforce' else 'warn'
+
+
+def adapter_path():
+    """The admission adapter next to this checkout, else the managed runtime copy."""
+    candidates = (Path(__file__).resolve().parents[2] / 'scripts/disk-admission.py',
+                  account_home() / '.local/lib/coding-agent-environment/scripts/disk-admission.py')
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
+
+
+def run_adapter():
+    """(exit code, one-line text) of `disk-admission.py check --weight heavy`; code None on failure."""
+    adapter = adapter_path()
+    if adapter is None:
+        return None, 'disk-admission.py not found'
+    try:
+        done = subprocess.run([sys.executable, str(adapter), 'check', '--weight', 'heavy'], capture_output=True,
+                              text=True, timeout=ADAPTER_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, str(exc)
+    return done.returncode, (done.stdout.strip() or done.stderr.strip())[:300]
+
+
+def decide(command, mode, runner=run_adapter, exists=os.path.exists):
+    """Return (exit code, stdout text, stderr text) for one Bash command."""
+    verdict = classify(command)
+    if not verdict['heavy']:
+        return 0, '', ''
+    label = '%s (%s classification)' % (verdict['kind'], verdict['confidence'])
+    notes = []
+    try:
+        code, text = runner()
+        if code == 77:
+            notes.append('disk admission refuses heavy command %s: %s' % (label, text))
+        elif code != 0:
+            notes.append('disk admission could not be evaluated for %s: %s' % (label, text))
+        denied = bool(notes)
+    except Exception as exc:
+        notes.append('disk admission could not be evaluated for %s: %s' % (label, exc))
+        denied = True
+    advice = target_dir_advice(verdict, exists)
+    if advice:
+        notes.append(advice)
+    if denied and mode == 'enforce':
+        return DENY_EXIT, '', 'BLOCKED by disk-admission-gate (mode enforce): ' + '; '.join(notes)
+    if not notes:
+        return 0, '', ''
+    prefix = 'disk-admission-gate (mode %s, %s): ' % (mode, 'would block' if denied else 'advice')
+    return 0, json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse',
+                                                   'additionalContext': prefix + '; '.join(notes)}}), ''
+
+
+def main(raw, stdout, stderr, mode_fn=read_mode, runner=run_adapter):
+    try:
+        payload = json.loads(raw)
+        command = payload['tool_input']['command']
+        if payload.get('tool_name') != 'Bash' or not isinstance(command, str):
+            return 0
+        mode = mode_fn()
+    except Exception:
+        return 0
+    try:
+        code, out, err = decide(command, mode, runner)
+    except Exception as exc:
+        if mode != 'enforce':
+            return 0
+        code, out, err = DENY_EXIT, '', 'BLOCKED by disk-admission-gate (mode enforce): internal error: %s' % exc
+    if out:
+        stdout.write(out + '\n')
+    if err:
+        stderr.write(err + '\n')
+    return code
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.stdin.read(), sys.stdout, sys.stderr))
