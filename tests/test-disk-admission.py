@@ -266,6 +266,14 @@ class Sources(unittest.TestCase):
         self.assertEqual(da.measure_free_bytes(lambda: 40 * GIB, lambda: 38 * GIB), 38 * GIB)
         # The smaller reading wins whichever source reports it.
         self.assertEqual(da.measure_free_bytes(lambda: 38 * GIB, lambda: 40 * GIB), 38 * GIB)
+    def test_glomeris_unavailable_falls_back_to_statvfs(self):
+        self.assertEqual(da.measure_free_bytes(self.failing, lambda: 38 * GIB), 38 * GIB)
+        self.assertEqual(da.measure_free_bytes(lambda: 38 * GIB, self.failing), 38 * GIB)
+        # Unparsable output or a missing binary is unavailable, not a crash.
+        with mock.patch.object(da.subprocess, 'run', return_value=mock.Mock(stdout='not json')):
+            with mock.patch.dict(da.__dict__, {'account_home': lambda: Path(tempfile.gettempdir()) / 'absent-home'}):
+                with self.assertRaises(da.VolumeError):
+                    da.read_glomeris_free()
 
 
 if __name__ == '__main__':
