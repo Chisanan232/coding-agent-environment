@@ -373,6 +373,21 @@ class Fixture(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('--receipt', text)
 
+    def refuses_bad_settings(self, content):
+        self.live.write_bytes(content)
+        before = self.snapshot_tree()
+        for mode in ('plan', 'verify'):
+            code, text = self.run_cli(mode)
+            self.assertEqual(code, 10, (mode, text))
+            self.assertIn('REFUSING', text)
+        code, text = self.apply('--allow-reformat')
+        self.assertEqual(code, 10, text)
+        self.assertEqual(self.snapshot_tree(), before)
+        self.assertFalse(self.dest.exists())
+
+    def test_null_hooks_object_is_refused_cleanly(self):
+        self.refuses_bad_settings(b'{"hooks": null, "permissions": {}}\n')
+
 
 if __name__ == '__main__':
     unittest.main()
