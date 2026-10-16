@@ -164,3 +164,35 @@ def read_free_bytes():
     except OSError as exc:
         raise VolumeError('cannot read free space on %s: %s' % (mount, exc))
     return stats.f_bavail * stats.f_frsize
+
+
+def evaluate(weight, state_path, free_fn=read_free_bytes, now=None):
+    """Measure, decide and persist under one lock; weight None only refreshes state.
+
+    Returns a result dict. admit is False whenever anything is untrustworthy.
+    """
+    refused = {'admit': False, 'tier': None, 'free_bytes': None, 'latch': None, 'timestamp': None}
+    try:
+        with state_lock(state_path):
+            try:
+                free = free_fn()
+            except VolumeError as exc:
+                return dict(refused, reason='volume-unreadable: %s' % exc)
+            try:
+                state, corrupt = read_state(state_path), None
+            except StateError as exc:
+                if state_path.is_symlink() or state_path.parent.is_symlink():
+                    raise
+                # Unparsable state counts as latched until it is rewritten and free space recovers.
+                state, corrupt = {'latch': True}, str(exc)
+            admit, new_state, reason = decide(weight or 'light', free, state)
+            if corrupt:
+                admit, new_state = False, dict(new_state, latch=True)
+                reason = 'state-corrupt: %s; treated as latched' % corrupt
+            record = write_state(state_path, free, new_state['latch'], now)
+    except StateError as exc:
+        return dict(refused, reason='state-untrusted: %s' % exc)
+    except OSError as exc:
+        return dict(refused, reason='state-unwritable: %s' % exc)
+    return dict(admit=admit, reason=reason, tier=record['tier'], free_bytes=free,
+                latch=record['latch'], timestamp=record['timestamp'])
