@@ -225,6 +225,18 @@ class PersonalDevTrust(Fixture):
             self.assertIn(rule, new["permissions"]["ask"])
         self.assertEqual([], rollout.problems(new))
 
+    def test_dev_trust_is_bound_to_owner_provenance_not_location(self):
+        # A clone from another owner dropped into the dev directory must not
+        # inherit trust from its location (auto-mode critique, SPE-106).
+        new = self.merged_dev()
+        env = "\n".join(e for e in new["autoMode"]["environment"] if e.startswith("**Personal development machine"))
+        allow = "\n".join(e for e in new["autoMode"]["allow"] if e.startswith("**Cross-repository"))
+        self.assertNotIn("existing and future", env)
+        self.assertIn("owned by one of the trusted GitHub owners", env)
+        self.assertIn("Code from External", env)
+        self.assertIn("provenance", env)
+        self.assertIn("owned by one of the trusted GitHub owners", allow)
+
     def test_without_dev_dirs_nothing_about_directories_is_added(self):
         new = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), ["OwnerA"])
         self.assertNotIn("additionalDirectories", new["permissions"])
