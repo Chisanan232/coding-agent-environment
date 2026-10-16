@@ -295,6 +295,12 @@ class Compound(unittest.TestCase):
         self.assertTrue(self.heavy('cargo +1.80 -C x --locked test'))
         self.assertFalse(self.heavy('cargo +nightly fmt'))
 
+    def test_cargo_run_install_rustc_and_aliases_are_heavy(self):
+        for command in ('cargo run', 'cargo r', 'cargo install ripgrep', 'cargo rustc', 'cargo bench', 'cargo t', 'cargo c'):
+            self.assertTrue(self.heavy(command), command)
+        for command in ('cargo tree', 'cargo metadata', 'cargo help build', 'cargo fmt', 'cargo --version'):
+            self.assertFalse(self.heavy(command), command)
+
 
 if __name__ == '__main__':
     unittest.main()
