@@ -745,6 +745,17 @@ class ReservationHardening(unittest.TestCase):
             self.assertIn('reservation-unreadable', refused['reason'])
         self.assertTrue((directory / 'job-x.json').exists())
 
+    def test_reserving_for_pid_1_or_another_users_process_is_refused(self):
+        refused = self.take('job-init', pid=1)
+        self.assertFalse(refused['admit'])
+        self.assertIn('process-not-owned', refused['reason'])
+        self.assertFalse((self.path.parent / 'reservations/job-init.json').exists())
+        # The owner check is what refuses: a stubbed foreign owner for a live pid is refused too,
+        # and the same pid is admitted when it is the current user's.
+        other = self.take('job-foreign', owner_fn=lambda pid: os.getuid() + 1)
+        self.assertIn('process-not-owned', other['reason'])
+        self.assertTrue(self.take('job-mine')['admit'])
+
 
 if __name__ == '__main__':
     unittest.main()
