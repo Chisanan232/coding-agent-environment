@@ -591,6 +591,17 @@ class AuditTrail(unittest.TestCase):
                                      ('heavy', 'enforce', 'deny'), ('tamper-suspect', 'enforce', 'deny')])
         self.assertEqual(self.lines()[0]['tier'], 'stable')
 
+    def test_an_unwritable_audit_location_never_changes_the_decision(self):
+        self.dir.mkdir()
+        (self.dir / 'mode').write_text('enforce')
+        os.chmod(self.dir, 0o500)
+        self.addCleanup(os.chmod, self.dir, 0o700)
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'cargo build'}})
+        out, err = io.StringIO(), io.StringIO()
+        code = gate.main(payload, out, err, runner=lambda: (77, 'refused'), admission_dir=self.dir)
+        self.assertEqual(code, 2)
+        self.assertIn('BLOCKED', err.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()
