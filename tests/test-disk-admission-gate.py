@@ -231,6 +231,11 @@ class Compound(unittest.TestCase):
         self.assertTrue(self.heavy('{ cargo build; }'))
         self.assertFalse(self.heavy('{ echo cargo build; }'))
 
+    def test_if_then_body_is_heavy_but_a_light_condition_is_not(self):
+        self.assertTrue(self.heavy('if x; then cargo build; fi'))
+        self.assertTrue(self.heavy('if true; then echo a; else cargo test; fi'))
+        self.assertFalse(self.heavy('if cargo --version; then echo ok; fi'))
+
 
 if __name__ == '__main__':
     unittest.main()
