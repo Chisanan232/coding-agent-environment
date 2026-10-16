@@ -133,6 +133,16 @@ class Decisions(unittest.TestCase):
         # Negative control: an admitted heavy command is allowed silently.
         self.assertEqual(self.run_gate('cargo build', 'warn', lambda: (0, 'admitted')), (0, '', ''))
 
+    def test_enforce_mode_denies_with_exit_2_and_a_clear_message(self):
+        for command in ('cargo build', 'rtk cargo test', 'cd x && npm ci', 'bash -c "cargo check"'):
+            code, out, err = self.run_gate(command, 'enforce', self.refuses)
+            self.assertEqual((code, out), (2, ''), command)
+            self.assertIn('BLOCKED by disk-admission-gate', err)
+            self.assertIn('tier=low', err)
+        # Negative controls: admitted heavy and any non-heavy command are allowed.
+        self.assertEqual(self.run_gate('cargo build', 'enforce', lambda: (0, 'ok')), (0, '', ''))
+        self.assertEqual(self.run_gate('git status', 'enforce', self.refuses), (0, '', ''))
+
 
 if __name__ == '__main__':
     unittest.main()
