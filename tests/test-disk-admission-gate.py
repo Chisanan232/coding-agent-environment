@@ -571,6 +571,16 @@ class AuditTrail(unittest.TestCase):
         gate.audit_append(other, {'classification': 'heavy'}, 'x')
         self.assertEqual(sorted(entry.name for entry in other.iterdir()), ['gate-audit.jsonl'])
 
+    def test_audit_file_is_private_and_a_symlink_is_not_followed(self):
+        self.run_gate('cargo build')
+        self.assertEqual(self.log.stat().st_mode & 0o777, 0o600)
+        self.log.unlink()
+        victim = self.dir.parent / 'victim'
+        victim.write_text('untouched')
+        self.log.symlink_to(victim)
+        self.run_gate('cargo build')
+        self.assertEqual(victim.read_text(), 'untouched')
+
 
 if __name__ == '__main__':
     unittest.main()
