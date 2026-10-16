@@ -272,6 +272,13 @@ class Compound(unittest.TestCase):
         self.assertTrue(self.heavy('rtk proxy cargo build'))
         self.assertFalse(self.heavy('rtk proxy git status'))
 
+    def test_shell_option_cluster_before_dash_c_is_heavy_best_effort(self):
+        for command in ('bash -euo pipefail -c "cargo build"', 'zsh -o errexit -c "npm ci"', 'bash -ec "cargo test"'):
+            verdict = gate.classify(command)
+            self.assertEqual((verdict['heavy'], verdict['confidence']), (True, 'best-effort'), command)
+        self.assertFalse(self.heavy('bash -euo pipefail -c "echo cargo build"'))
+        self.assertFalse(self.heavy('bash -x script.sh cargo build'))
+
 
 if __name__ == '__main__':
     unittest.main()
