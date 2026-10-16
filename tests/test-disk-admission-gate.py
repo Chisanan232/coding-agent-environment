@@ -650,6 +650,17 @@ class HarnessWorkdir(unittest.TestCase):
                 self.harness.claim_workdir(path)
         self.assertTrue(home.exists() and ROOT.exists())
 
+    def test_an_existing_directory_without_the_sentinel_is_refused_and_untouched(self):
+        victim = self.base / 'important'
+        victim.mkdir()
+        (victim / 'fx').mkdir()
+        (victim / 'fx/precious.txt').write_text('keep')
+        (victim / 'notes.txt').write_text('keep')
+        with self.assertRaises(self.harness.RefusedWorkdir):
+            self.harness.claim_workdir(victim)
+        self.assertEqual((victim / 'fx/precious.txt').read_text(), 'keep')
+        self.assertEqual((victim / 'notes.txt').read_text(), 'keep')
+
 
 if __name__ == '__main__':
     unittest.main()
