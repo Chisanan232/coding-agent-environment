@@ -562,6 +562,26 @@ class Reservations(unittest.TestCase):
         self.assertEqual(sorted(entry.name for entry in (self.path.parent / 'reservations').iterdir()),
                          sorted(record['label'] + '.json' for record in live))
 
+    def test_label_ownership_dead_pid_and_invalid_labels(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        self.assertTrue(self.take('shared', 10 * GIB, 300 * GIB, pid=child.pid)['admit'])
+        taken = self.take('shared', 10 * GIB, 300 * GIB)
+        self.assertIn('label-in-use', taken['reason'])
+        # The owner may renew its own label.
+        self.assertTrue(self.take('shared', 20 * GIB, 300 * GIB, pid=child.pid)['admit'])
+        done = subprocess.run([sys.executable, '-c', 'pass'])
+        gone = subprocess.Popen([sys.executable, '-c', 'pass'])
+        gone.wait()
+        self.assertIn('process-not-running', self.take('ghost', 1 * GIB, 300 * GIB, pid=gone.pid)['reason'])
+        for bad in ('../escape', 'a/b', '', '.hidden', 'x' * 65):
+            result = self.take(bad, 1 * GIB, 300 * GIB)
+            self.assertIn('invalid-request', result['reason'], bad)
+            self.assertIn('invalid-request', da.release(bad, self.path)['reason'], bad)
+        self.assertFalse((self.path.parent / 'escape.json').exists())
+        self.assertEqual(da.release('missing', self.path)['reason'], 'no reservation named missing')
+
 
 if __name__ == '__main__':
     unittest.main()
