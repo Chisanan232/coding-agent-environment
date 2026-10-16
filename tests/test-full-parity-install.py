@@ -263,5 +263,24 @@ class FullParity(unittest.TestCase):
         ignored = subprocess.run(['git', 'check-ignore', '-q', 'any/dir/claude/CLAUDE.private.md'], cwd=ROOT)
         self.assertEqual(ignored.returncode, 0)
 
+    def dangling_codex_links(self):
+        found = []
+        for doc in sorted((self.home / '.codex/skills').rglob('*.md')):
+            for link in re.findall(r'\]\((?!https?:|mailto:|#)([^)#\s]+)', doc.read_text()):
+                if not (doc.parent / link).exists():
+                    found.append((str(doc.relative_to(self.home)), link))
+        return found
+
+    def test_codex_install_has_no_dangling_relative_links_and_the_scan_detects_one(self):
+        shutil.copytree(ROOT / 'docs', self.repo / 'docs')
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(self.dangling_codex_links(), [])
+        # Negative control: a hard link to a host-specific file outside any claude-only span.
+        skill = self.repo / '.claude/skills/ci-failure-triage/SKILL.md'
+        skill.write_text(skill.read_text() + '\nSee [Claude only](references/claude-ci-triage.md).\n')
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(self.dangling_codex_links(),
+                         [('.codex/skills/ci-failure-triage/SKILL.md', 'references/claude-ci-triage.md')])
+
 if __name__ == '__main__':
     unittest.main()
