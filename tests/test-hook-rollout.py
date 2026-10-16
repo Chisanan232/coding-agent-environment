@@ -392,6 +392,9 @@ class Fixture(unittest.TestCase):
         self.refuses_bad_settings(b'{"hooks": {"PreToolUse": null}}\n')
         self.refuses_bad_settings(b'{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": null}]}}\n')
 
+    def test_a_root_array_is_refused_cleanly(self):
+        self.refuses_bad_settings(b'[{"hooks": {}}]\n')
+
 
 if __name__ == '__main__':
     unittest.main()
