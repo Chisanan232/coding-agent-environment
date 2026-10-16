@@ -226,6 +226,9 @@ class Newlines(unittest.TestCase):
     def test_multi_line_heredoc_body_is_skipped_to_the_terminator(self):
         self.assertFalse(self.heavy('cat <<EOF\nfirst\ncargo build\nlast\nEOF'))
         self.assertTrue(self.heavy('cat <<EOF\nfirst\ncargo build\nEOF\ncargo test'))
+    def test_crlf_heredoc_terminator_is_recognised(self):
+        self.assertTrue(self.heavy('cat <<EOF\r\nfirst\r\ncargo build\r\nEOF\r\ncargo test'))
+        self.assertFalse(self.heavy('cat <<EOF\r\nfirst\r\ncargo build\r\nEOF\r\nls'))
 
 
 class Compound(unittest.TestCase):
