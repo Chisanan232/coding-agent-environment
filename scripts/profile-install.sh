@@ -249,6 +249,18 @@ if actual_skills != set(shared_skills):
 if selection and (len(selection) != len(set(selection)) or not set(selection).issubset(shared_skills)):
     raise SystemExit('Unknown or duplicate shared skill selection.')
 managed = [] if selection else [(agents, merged, 'managed instruction block; preserve outside bytes')]
+host_specific = set()
+inventory_path = root / 'docs/full-parity-inventory.json'
+if inventory_path.exists():
+    host_specific = {row['id'] for row in json.loads(inventory_path.read_text())['rows']
+                     if row['classification'] == 'HOST_SPECIFIC_NO_PARITY'}
+stale_host_specific = []
+
+def codex_excluded(skill, relative):
+    # Claude-only references are not portable: they describe Claude hooks, env vars and models.
+    return (host_mode == 'codex' and (Path(relative).name.startswith('claude-')
+            or f'.claude/skills/{skill}/{relative}' in host_specific))
+
 if selection:
     shared_skills = selection
 for skill in shared_skills:
@@ -261,6 +273,10 @@ for skill in shared_skills:
         sources[relative] = root / source
     for relative, source in sources.items():
         target = live / host_dir / 'skills' / skill / relative
+        if codex_excluded(skill, relative):
+            if target.exists():
+                stale_host_specific.append(target)
+            continue
         reject_symlinks(target)
         managed.append((target, source.read_bytes(), str(source.relative_to(root))))
 for name in shared_manifest['profiles'] if host_mode == 'codex' and not selection else []:
@@ -297,8 +313,11 @@ for skill, spec in manifest['skills'].items() if host_mode == 'codex' and not se
         missing.append(skill)
         for name in bad:
             print(f'  {name} -> SHA256 {spec["files"][name]}')
+for path in stale_host_specific:
+    print(f'STALE host-specific file (report only; operator must delete): {path}')
 remaining = len(plans) + len(missing)
 if dry or check:
+    remaining += len(stale_host_specific)
     print(f'{drift_label}: {remaining}')
     raise SystemExit(int(bool(remaining) and check))
 if missing and live.resolve() != Path.home().resolve():
