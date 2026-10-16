@@ -355,3 +355,19 @@ did not reproduce the 13 denials seen after the SPE-105 rollout, and the cause
 was not proven. Plain `git worktree remove` (no force) is left to the classifier
 and the ownership environment line. `pkill`/`kill -9` asks (pre-existing) are the
 largest source of ordinary prompts (230 historical matches).
+
+## Amendment 3 (SPE-106 follow-up, 2026-10-16) — IAM mutation asks
+
+Fresh-session acceptance on the pre-deploy live config showed that
+`gcloud projects add-iam-policy-binding ...` ran with no prompt and no classifier
+block when the request was explicit (the classifier's "Permission Grant" category
+only blocks a grant the user did not name). The founder requires production IAM
+changes to need explicit approval, so the baseline gains static `ask` rules, with
+`rtk` twins, for `add-iam-policy-binding`, `remove-iam-policy-binding`,
+`set-iam-policy` and `service-accounts keys create` (space-free globs, so a global
+flag or `beta` before the subcommand cannot hide them). Read-only `get-iam-policy`,
+`roles describe`, `service-accounts list` and `keys list` stay unprompted. Limits:
+text globs do not stop quoted or env-prefixed spellings, and `gh api` permission
+grants on GitHub (collaborators, team membership) remain classifier-judged.
+`scripts/permission-rollout.py` refuses a baseline that does not ask on these
+commands.
