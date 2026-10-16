@@ -252,14 +252,10 @@ The external release workflow (automated tag creation, version bumping, changelo
 generation) handles the mechanics of releasing. Claude Code's role is **observational
 and preparatory**, not operational.
 
-### What Claude Code does during a release window
-
-1. **Identify changes** — inspect the commits in the release window (since the last tag).
-2. **Prepare release notes** — draft human-readable changelog content.
-3. **Update release intent config** — update version references or release config files
-   if the project uses them (e.g., `pyproject.toml`, `package.json`, `CHANGELOG.md`).
-4. **Observe release workflow state** — monitor the automated release CI pipeline.
-5. **Summarize outcome** — report success or failure with links to the release artifact.
+During a release window Claude Code observes and prepares (identify changes, draft
+notes, update release intent config, watch the pipeline, summarize) via the
+`release-watch` and `release-preparation` skills; see
+[release-operations](skills/release-watch/references/release-operations.md).
 
 ### What Claude Code must not do during release
 
@@ -268,12 +264,6 @@ and preparatory**, not operational.
 - Do not push directly to `main` / `master` during a release window.
 - Do not modify CI/CD pipeline definitions during active release.
 - Do not publish packages to registries — this is the automated workflow's job.
-
-### Release coordination
-
-Release observation is handled directly by the main agent via the
-`release-watch`/`release-preparation` skills — thin by design, monitoring
-and summarizing the automated workflow rather than replacing it.
 
 ---
 
