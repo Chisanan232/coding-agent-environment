@@ -26,6 +26,17 @@ def valid_branch(name: str) -> bool:
     return bool(BRANCH.fullmatch(name)) and len(name.rsplit("/", 1)[1]) <= 30
 
 
+COMMIT = re.compile(
+    r"^(?P<emoji>✨|🐛|♻️|✅|📝|🔧|🔌|🪝|👨‍💻|🧭|⬆️|🗑️|🚨|🔒|🎨|🧪|👷|🛡️) "
+    r"\([a-z0-9][a-z0-9._/-]*\): (?P<summary>[^\n]+)$"
+)
+
+
+def valid_commit_subject(subject: str) -> bool:
+    match = COMMIT.fullmatch(subject)
+    return bool(match and len(match.group("summary")) < 72)
+
+
 def structurally_valid_title(title: str) -> bool:
     """Check machine-verifiable shape; imperative meaning requires human review."""
     match = TITLE.fullmatch(title)
@@ -189,6 +200,24 @@ class EngineeringWorkflowContract(unittest.TestCase):
         text = WORKFLOW.read_text()
         self.assertNotIn("<type>", text)
         self.assertIn("<repo>-<phase>-<ticket>-<summary>", text)
+
+    def test_commit_subject_requires_parenthesized_scope(self) -> None:
+        valid = [
+            "✨ (model): Add property to TestModel",
+            "🐛 (service-payment): Fix double charge on retry",
+            "✅ (order): Add repository lookup test",
+        ]
+        invalid = [
+            "✨ web: Add property to TestModel",
+            "✨ model(order): Add property to TestModel",
+            "✨ (web) Add property to TestModel",
+            "(model): Add property to TestModel",
+            "✨ (): Add property to TestModel",
+            "✨ (model): " + "x" * 72,
+        ]
+        self.assertTrue(all(valid_commit_subject(subject) for subject in valid))
+        self.assertFalse(any(valid_commit_subject(subject) for subject in invalid))
+        self.assertIn("Parentheses around the scope are required", WORKFLOW.read_text())
 
 
 if __name__ == "__main__":
