@@ -255,7 +255,7 @@ def _bad_dir(d):
 
 def merge(live, base, owners, dev_dirs=()):
     new = copy.deepcopy(live)
-    has_owner_lines = any(e.startswith(OWNER_PREFIXES) for e in new.get("autoMode", {}).get("environment", []))
+    has_owner_lines = any(e.startswith("**Trusted GitHub owners") for e in new.get("autoMode", {}).get("environment", []))
     if dev_dirs and not owners and not has_owner_lines:
         # The dev-trust prose is conditional on trusted owners; without any it would dangle.
         raise ValueError("--dev-dirs needs trusted owners: pass --owners or keep existing owner lines")
