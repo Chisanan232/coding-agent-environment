@@ -501,6 +501,11 @@ class AdmissionDirFlag(unittest.TestCase):
         # Negative control: reading the same file is fine.
         self.assertEqual(self.run_gate('cat %s/mode' % self.dir, lambda: (0, 'ok')), (0, '', ''))
 
+    def test_sandbox_adapter_run_writes_state_only_inside_the_sandbox(self):
+        code, text = gate.run_adapter(self.dir)
+        self.assertIn(code, (0, 77))
+        self.assertIn('tier=', text)
+        self.assertTrue((self.dir / 'state.json').exists())
 
 
 if __name__ == '__main__':
