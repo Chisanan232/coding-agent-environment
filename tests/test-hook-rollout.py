@@ -195,6 +195,16 @@ class Fixture(unittest.TestCase):
         self.assertFalse(self.dest.exists())
         self.assertEqual(real.read_text(), self.live_text)
 
+    def test_symlinked_hook_destination_is_refused(self):
+        target = self.root / 'elsewhere.py'
+        target.write_text('untouched')
+        self.dest.parent.mkdir()
+        self.dest.symlink_to(target)
+        code, _ = self.apply()
+        self.assertEqual(code, 4)
+        self.assertEqual(target.read_text(), 'untouched')
+        self.assertEqual(self.live.read_text(), self.live_text)
+
 
 if __name__ == '__main__':
     unittest.main()
