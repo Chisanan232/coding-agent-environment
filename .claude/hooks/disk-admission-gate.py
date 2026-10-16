@@ -36,6 +36,8 @@ direct binaries (a compiled tool that itself builds), a user's own `!` shell
 commands, IDE background analysis (flycheck, rust-analyzer), and any command
 hidden behind variable expansion, aliases, scripts or xargs.
 """
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 import re
@@ -405,7 +407,24 @@ def run_adapter(admission_dir=None):
     return done.returncode, (done.stdout.strip() or done.stderr.strip())[:300]
 
 
-def _decide_heavy(command, mode, runner, exists):
+AUDIT_ENABLED = True
+AUDIT_NAME = 'gate-audit.jsonl'
+AUDIT_MAX_BYTES = 1024 * 1024
+ADAPTER_LINE_RE = re.compile(r'tier=(\w+) free=\S+ GiB bytes=(\d+)')
+
+
+def _event(events, classification, verdict, mode, decision, text=''):
+    """Record one audit event; never holds the command text."""
+    if events is None:
+        return
+    found = ADAPTER_LINE_RE.search(text or '')
+    events.append({'classification': classification, 'tool': verdict['kind'] if verdict else None,
+                   'confidence': verdict['confidence'] if verdict else None, 'mode': mode, 'decision': decision,
+                   'tier': found.group(1) if found else None,
+                   'free_bytes': int(found.group(2)) if found else None})
+
+
+def _decide_heavy(command, mode, runner, exists, events=None):
     verdict = classify(command)
     if not verdict['heavy']:
         return 0, '', ''
@@ -414,8 +433,10 @@ def _decide_heavy(command, mode, runner, exists):
         # Warn mode never blocks and cannot tell what this command runs.
         note = 'disk-admission-gate (mode %s, advice): command is %s and names %s; it may be a heavy build' % (
             mode, verdict['confidence'], verdict['kind'])
+        _event(events, 'heavy', verdict, mode, 'warn')
         return 0, json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'additionalContext': note}}), ''
     notes = []
+    text = ''
     try:
         code, text = runner()
         if code == 77:
@@ -430,7 +451,9 @@ def _decide_heavy(command, mode, runner, exists):
     if advice:
         notes.append(advice)
     if denied and mode == 'enforce':
+        _event(events, 'heavy', verdict, mode, 'deny', text)
         return DENY_EXIT, '', 'BLOCKED by disk-admission-gate (mode enforce): ' + '; '.join(notes)
+    _event(events, 'heavy', verdict, mode, 'warn' if notes else 'allow', text)
     if not notes:
         return 0, '', ''
     prefix = 'disk-admission-gate (mode %s, %s): ' % (mode, 'would block' if denied else 'advice')
@@ -471,18 +494,41 @@ def tamper_suspect(command, needles=(STATE_NEEDLE,)):
     return False
 
 
-def decide(command, mode, runner=run_adapter, exists=os.path.exists, needles=(STATE_NEEDLE,)):
+def decide(command, mode, runner=run_adapter, exists=os.path.exists, needles=(STATE_NEEDLE,), events=None):
     """Return (exit code, stdout text, stderr text) for one Bash command."""
     if not tamper_suspect(command, needles):
-        return _decide_heavy(command, mode, runner, exists)
+        return _decide_heavy(command, mode, runner, exists, events)
+    _event(events, 'tamper-suspect', None, mode, 'deny' if mode == 'enforce' else 'warn')
     if mode == 'enforce':
         return DENY_EXIT, '', 'BLOCKED by disk-admission-gate (mode enforce): tamper-suspect: ' + TAMPER_NOTE
-    code, out, err = _decide_heavy(command, mode, runner, exists)
+    code, out, err = _decide_heavy(command, mode, runner, exists, events)
     note = 'disk-admission-gate (mode %s, advice): tamper-suspect: %s' % (mode, TAMPER_NOTE)
     if out:
         extra = json.loads(out)['hookSpecificOutput']['additionalContext']
         note += '; ' + extra
     return code, json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'additionalContext': note}}), err
+
+
+def audit_append(directory, event, command, now=None):
+    """Append one JSONL line; never raises and never records the command itself."""
+    record = dict(event, ts=(now or datetime.now(timezone.utc)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                  cmd_sha12=hashlib.sha256(command.encode('utf-8', 'replace')).hexdigest()[:12])
+    line = (json.dumps(record, sort_keys=True) + '\n').encode()
+    path = Path(directory) / AUDIT_NAME
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        try:
+            if os.lstat(path).st_size + len(line) > AUDIT_MAX_BYTES:
+                os.replace(path, str(path) + '.1')
+        except FileNotFoundError:
+            pass
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(descriptor, line)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        pass
 
 
 def main(raw, stdout, stderr, mode_fn=None, runner=None, admission_dir=None):
@@ -502,7 +548,11 @@ def main(raw, stdout, stderr, mode_fn=None, runner=None, admission_dir=None):
     except Exception:
         return 0
     try:
-        code, out, err = decide(command, mode, runner, needles=needles)
+        events = []
+        code, out, err = decide(command, mode, runner, needles=needles, events=events)
+        if AUDIT_ENABLED:
+            for event in events:
+                audit_append(directory, event, command)
     except Exception as exc:
         if mode != 'enforce':
             return 0

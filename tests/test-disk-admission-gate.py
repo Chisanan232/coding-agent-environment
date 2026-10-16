@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = spec_from_file_location('disk_gate', ROOT / '.claude/hooks/disk-admission-gate.py')
 gate = module_from_spec(spec)
 spec.loader.exec_module(gate)
+gate.AUDIT_ENABLED = False  # tests must not write the operator's audit file; audit tests re-enable it
 
 
 class Classification(unittest.TestCase):
