@@ -241,6 +241,10 @@ class Compound(unittest.TestCase):
         self.assertTrue(self.heavy('while true; do npm ci; done'))
         self.assertFalse(self.heavy('for x in a b; do echo $x; done'))
 
+    def test_negated_command_is_heavy(self):
+        self.assertTrue(self.heavy('! cargo build'))
+        self.assertFalse(self.heavy('! cargo --version'))
+
 
 if __name__ == '__main__':
     unittest.main()
