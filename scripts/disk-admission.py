@@ -54,6 +54,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import secrets
 import stat
 import subprocess
@@ -288,6 +289,103 @@ def measure_free_bytes(glomeris=read_glomeris_free, statvfs=read_free_bytes):
     if not values:
         raise VolumeError('; '.join(errors))
     return min(values)
+
+
+RESERVATIONS_DIR = 'reservations'
+LABEL_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$')
+DEFAULT_TTL = 4 * 3600
+MAX_TTL = 24 * 3600
+HEAVY_FLOOR = LOW_BELOW
+# One heavy lane in stable and wide until a second-lane analysis is approved.
+HEAVY_LANES = {'emergency': 0, 'low': 0, 'stable': 1, 'wide': 1}
+
+
+class ReservationError(Exception):
+    """A reservation or its owning process cannot be verified."""
+
+
+def process_token(pid):
+    """Start-time token of a live process, None when it is gone.
+
+    pid plus start time identifies one process; a reused pid has a new token.
+    """
+    try:
+        done = subprocess.run(['/bin/ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True,
+                              timeout=5, stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/bin:/usr/bin'})
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReservationError('cannot inspect process %d: %s' % (pid, exc))
+    token = done.stdout.strip()
+    if done.returncode == 0 and token:
+        return token
+    if done.returncode == 1 and not token:
+        return None
+    raise ReservationError('cannot inspect process %d: ps exit %d' % (pid, done.returncode))
+
+
+def reservations_dir(state_path):
+    return state_path.parent / RESERVATIONS_DIR
+
+
+def write_reservation(state_path, label, nbytes, pid, token, expires):
+    """Create or replace this job's reservation file; call while holding state_lock."""
+    directory = reservations_dir(state_path)
+    _refuse_symlinks(directory / label)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    record = {'version': STATE_VERSION, 'label': label, 'bytes': nbytes, 'pid': pid,
+              'start_token': token, 'expires': iso_utc(expires)}
+    write_json_atomic(directory / (label + '.json'), record)
+    return record
+
+
+def _read_reservation(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, 'rb') as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError('not a regular file')
+        record = json.loads(handle.read(65536))
+    valid = (isinstance(record, dict) and record.get('version') == STATE_VERSION
+             and record.get('label') == path.stem and LABEL_RE.match(path.stem)
+             and type(record.get('bytes')) is int and record['bytes'] > 0
+             and type(record.get('pid')) is int and record['pid'] > 0
+             and isinstance(record.get('start_token'), str) and isinstance(record.get('expires'), str))
+    if not valid:
+        raise ValueError('wrong schema')
+    record['expires_at'] = datetime.fromisoformat(record['expires'].replace('Z', '+00:00'))
+    return record
+
+
+def live_reservations(state_path, now=None, token_fn=process_token):
+    """Return (live records, problems); call while holding state_lock.
+
+    A reservation whose process is gone, whose start token no longer matches
+    (pid reuse) or whose expiry passed is deleted. Only well-formed files of
+    this schema are ever deleted; anything else is reported as a problem and
+    left alone. A process that cannot be inspected stays counted (fail closed).
+    """
+    now = now or datetime.now(timezone.utc)
+    directory = reservations_dir(state_path)
+    live, problems = [], []
+    if not directory.exists():
+        return live, problems
+    _refuse_symlinks(directory / 'x')
+    for path in sorted(directory.glob('*.json')):
+        try:
+            record = _read_reservation(path)
+        except (OSError, ValueError) as exc:
+            problems.append('reservation-unreadable: %s: %s' % (path.name, exc))
+            continue
+        try:
+            current = token_fn(record['pid'])
+        except ReservationError as exc:
+            problems.append('reservation-unverifiable: %s: %s' % (path.name, exc))
+            live.append(record)
+            continue
+        if current is None or current != record['start_token'] or record['expires_at'] <= now:
+            path.unlink()
+            continue
+        live.append(record)
+    return live, problems
 
 
 REFUSED = {'admit': False, 'tier': None, 'free_bytes': None, 'latch': None, 'timestamp': None}
