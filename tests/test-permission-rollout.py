@@ -230,6 +230,11 @@ class PersonalDevTrust(Fixture):
         with self.assertRaises(ValueError):
             rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [], ["~/dev"])
 
+    def test_dev_dirs_reuse_existing_owner_lines_when_owners_flag_is_omitted(self):
+        with_owner = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), ["OwnerA"])
+        again = rollout.merge(copy.deepcopy(with_owner), copy.deepcopy(BASELINE), [], ["~/dev"])
+        self.assertTrue(any(e.startswith("**Personal development machine") for e in again["autoMode"]["environment"]))
+
     def test_dev_trust_is_bound_to_owner_provenance_not_location(self):
         # A clone from another owner dropped into the dev directory must not
         # inherit trust from its location (auto-mode critique, SPE-106).
