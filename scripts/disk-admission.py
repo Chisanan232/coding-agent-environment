@@ -26,6 +26,13 @@ overridden from the command line; tests inject them through arguments.
 Exit codes for `check`: 0 admit, 77 refuse. Usage errors exit 2.
 """
 
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
+import json
+import os
+from pathlib import Path
+
 GIB = 1024 ** 3
 EMERGENCY_BELOW = 20 * GIB
 LOW_BELOW = 100 * GIB
@@ -67,3 +74,56 @@ def decide(weight, free_bytes, state):
     if current in ADMITTED_TIERS[weight]:
         return True, new_state, '%s admitted in tier %s' % (weight, current)
     return False, new_state, '%s refused in tier %s' % (weight, current)
+
+
+STATE_VERSION = 1
+DEFAULT_STATE_PATH = Path.home() / '.cache/aa-qa/admission/state.json'
+
+
+class StateError(Exception):
+    """The state file or its location cannot be trusted."""
+
+
+def _refuse_symlinks(path):
+    # lstat semantics: a redirected file or directory could point the write elsewhere.
+    for candidate in (path, path.parent):
+        if candidate.is_symlink():
+            raise StateError('state path is a symlink: %s' % candidate)
+
+
+@contextmanager
+def state_lock(path):
+    """Serialize every read-modify-write of the state file across processes."""
+    _refuse_symlinks(path)
+    if not path.parent.exists():
+        os.makedirs(path.parent, mode=0o700)
+        os.chmod(path.parent, 0o700)
+    descriptor = os.open(str(path) + '.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def write_state(path, free_bytes, latch, now=None):
+    """Atomically replace the state file; call while holding state_lock."""
+    _refuse_symlinks(path)
+    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    record = {'version': STATE_VERSION, 'timestamp': stamp.isoformat(timespec='seconds').replace('+00:00', 'Z'),
+              'free_bytes': free_bytes, 'tier': tier(free_bytes), 'latch': bool(latch)}
+    temporary = path.with_name('.%s.%d.tmp' % (path.name, os.getpid()))
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(descriptor, 'w') as handle:
+            json.dump(record, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+    return record
