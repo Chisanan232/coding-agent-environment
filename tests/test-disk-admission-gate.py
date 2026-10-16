@@ -622,5 +622,17 @@ class RolloutDocumentation(unittest.TestCase):
             self.assertIn(needle.lower(), text.lower().replace('  ', ' '), needle)
 
 
+class AcceptanceHarness(unittest.TestCase):
+    def test_harness_loads_stays_out_of_ci_and_never_fakes_the_admitted_path(self):
+        path = ROOT / 'tests/acceptance/gate-acceptance.py'
+        harness = module_from_spec(spec_from_file_location('gate_acceptance', path))
+        harness.__spec__.loader.exec_module(harness)
+        self.assertIn('cargo build --help', harness.prompt('cargo build --help'))
+        self.assertFalse(path.name.startswith('test-'))
+        text = path.read_text()
+        self.assertIn('NOT_YET_VERIFIABLE', text)
+        self.assertIn('--admission-dir', text)
+
+
 if __name__ == '__main__':
     unittest.main()
