@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+from unittest import mock
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -180,6 +181,14 @@ class Decisions(unittest.TestCase):
                                        lambda: (0, 'ok'))
         self.assertEqual((code, err), (0, ''))
         self.assertIn('shared target', json.loads(out)['hookSpecificOutput']['additionalContext'])
+
+    def test_adapter_is_resolved_from_this_checkout_and_asks_for_heavy(self):
+        self.assertEqual(gate.adapter_path(), ROOT / 'scripts/disk-admission.py')
+        with mock.patch.object(gate.subprocess, 'run', return_value=mock.Mock(returncode=77, stdout='refused\n', stderr='')) as run:
+            self.assertEqual(gate.run_adapter(), (77, 'refused'))
+        self.assertEqual(run.call_args.args[0][2:], ['check', '--weight', 'heavy'])
+        with mock.patch.object(gate.subprocess, 'run', side_effect=gate.subprocess.TimeoutExpired('x', 1)):
+            self.assertEqual(gate.run_adapter()[0], None)
 
 
 if __name__ == '__main__':
