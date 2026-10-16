@@ -381,6 +381,12 @@ class Tamper(unittest.TestCase):
             self.assertEqual((code, out), (2, ''), command)
             self.assertIn('tamper-suspect', err)
 
+    def test_tamper_suspect_commands_only_advise_in_warn(self):
+        for command in self.writes():
+            code, out, err = self.run_gate(command, 'warn')
+            self.assertEqual((code, err), (0, ''), command)
+            self.assertIn('tamper-suspect', json.loads(out)['hookSpecificOutput']['additionalContext'])
+
 
 if __name__ == '__main__':
     unittest.main()
