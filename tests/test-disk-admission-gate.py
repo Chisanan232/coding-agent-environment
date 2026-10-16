@@ -509,5 +509,37 @@ class AdmissionDirFlag(unittest.TestCase):
         self.assertTrue((self.dir / 'state.json').exists())
 
 
+class AuditTrail(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name).resolve() / 'sandbox'
+        patcher = mock.patch.object(gate, 'AUDIT_ENABLED', True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @property
+    def log(self):
+        return self.dir / 'gate-audit.jsonl'
+
+    def lines(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def run_gate(self, command, mode='warn', runner=None):
+        self.dir.mkdir(exist_ok=True)
+        (self.dir / 'mode').write_text(mode)
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}})
+        runner = runner or (lambda: (77, 'heavy refused in tier low; tier=low free=35.9 GiB bytes=38512345678'))
+        return gate.main(payload, io.StringIO(), io.StringIO(), runner=runner, admission_dir=self.dir)
+
+    def test_heavy_command_writes_exactly_one_audit_line(self):
+        self.run_gate('cargo build')
+        (entry,) = self.lines()
+        self.assertEqual((entry['classification'], entry['tool'], entry['confidence']), ('heavy', 'cargo', 'exact'))
+        self.assertEqual((entry['mode'], entry['decision']), ('warn', 'warn'))
+        self.assertEqual((entry['tier'], entry['free_bytes']), ('low', 38512345678))
+        self.assertRegex(entry['ts'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
+
+
 if __name__ == '__main__':
     unittest.main()
