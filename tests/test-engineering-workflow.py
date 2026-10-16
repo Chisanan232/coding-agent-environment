@@ -13,7 +13,7 @@ WORKFLOW = ROOT / ".claude/skills/engineering-workflow/SKILL.md"
 TITLE = re.compile(
     r"^\[(?:[A-Z][A-Z0-9]*-[0-9]+|[0-9]+)\] "
     r"(?P<emoji>✨|🐛|♻️|✅|📝|🔧|🔌|🪝|👨‍💻|🧭|⬆️|🗑️|🚨|🔒|🎨|🧪|👷|🛡️) "
-    r"[a-z0-9][a-z0-9._/-]*: (?P<summary>[^\n]+)$"
+    r"\([a-z0-9][a-z0-9._/-]*\): (?P<summary>[^\n]+)$"
 )
 
 BRANCH = re.compile(
@@ -134,32 +134,33 @@ class EngineeringWorkflowContract(unittest.TestCase):
 
     def test_pull_request_title_examples_and_negative_controls(self) -> None:
         valid = [
-            "[PROJ-123] ✨ restapi: Add user authentication",
-            "[PROJ-123] ✨ restapi: Add new user authentication endpoint",
-            "[42] 🐛 api: Fix retry leak",
-            "[SPE-33] 🔧 workflow: Unify engineering lifecycle contract",
-            "[SEC-7] 🔒 auth: Reject leaked credentials",
-            "[OPS-2] 👷 ci: Stabilize release checks",
-            "[SEC-8] 🛡️ privacy: Redact analytics metadata",
-            "[HORO-1033] ✨ web: Preserve console state and reading continuity",
+            "[PROJ-123] ✨ (restapi): Add user authentication",
+            "[PROJ-123] ✨ (restapi): Add new user authentication endpoint",
+            "[42] 🐛 (api): Fix retry leak",
+            "[SPE-33] 🔧 (workflow): Unify engineering lifecycle contract",
+            "[SEC-7] 🔒 (auth): Reject leaked credentials",
+            "[OPS-2] 👷 (ci): Stabilize release checks",
+            "[SEC-8] 🛡️ (privacy): Redact analytics metadata",
+            "[HORO-1033] ✨ (web): Preserve console state and reading continuity",
         ]
         invalid = [
             "SPE-33 🔧 workflow: Unify engineering lifecycle contract",
             "[SPE-33] workflow: Unify engineering lifecycle contract",
-            "[SPE-33] config workflow: Unify engineering lifecycle contract",
+            "[SPE-33] config (workflow): Unify engineering lifecycle contract",
             "[SPE-33] 🔧 Workflow Unify engineering lifecycle contract",
             "🛡️ Redact analytics route metadata and UTM payloads",
             "✨ (web): Preserve console state and reading continuity [HORO-1033]",
-            "[HORO-1033] ✨ (web): Preserve console state and reading continuity",
-            "[not a ticket] ✨ web: Preserve console state",
-            "[SPE-33] 中文 workflow: Restore workflow parity",
-            "[SPE-33] 🔧 workflow: " + "x" * 60,
+            "[HORO-1033] ✨ web: Preserve console state and reading continuity",
+            "[SPE-33] 🔧 (workflow) Unify engineering lifecycle contract",
+            "[not a ticket] ✨ (web): Preserve console state",
+            "[SPE-33] 中文 (workflow): Restore workflow parity",
+            "[SPE-33] 🔧 (workflow): " + "x" * 60,
         ]
         self.assertTrue(all(structurally_valid_title(title) for title in valid))
         self.assertFalse(any(structurally_valid_title(title) for title in invalid))
 
     def test_imperative_meaning_remains_a_review_judgment(self) -> None:
-        nonimperative = "[SPE-33] 🔧 workflow: Was changed yesterday"
+        nonimperative = "[SPE-33] 🔧 (workflow): Was changed yesterday"
         self.assertTrue(structurally_valid_title(nonimperative))
         self.assertIn(
             "reviewers must assess\nwhether its summary actually uses imperative meaning",
