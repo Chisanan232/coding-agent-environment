@@ -176,6 +176,36 @@ class FullParity(unittest.TestCase):
         self.assertEqual(quality(warning, 0).returncode, 0)
         cooldown.unlink()
         self.assertEqual(quality(warning, 1).returncode, 1)
+    def test_codex_tree_excludes_host_specific_files_and_reports_stale_ones(self):
+        shutil.copytree(ROOT / 'docs', self.repo / 'docs')
+        host_specific = ['engineering-runtime/references/claude-runtime.md',
+                         'ci-failure-triage/references/claude-ci-triage.md',
+                         'architecture-design/references/model-routing-and-delegation.md',
+                         'project-setup/references/project-claude-md.md']
+        portable = ['bot-pr-maintainer/references/bot-pr-policy.md',
+                    'feature-implementation/references/quality-policies.md',
+                    'engineering-runtime/SKILL.md']
+        self.assertEqual(self.install('claude').returncode, 0)
+        self.assertEqual(self.install().returncode, 0)
+        for name in host_specific:
+            with self.subTest(host='claude', file=name):
+                self.assertTrue((self.home / '.claude/skills' / name).is_file())
+            with self.subTest(host='codex', file=name):
+                self.assertFalse((self.home / '.codex/skills' / name).exists())
+        for name in portable:
+            with self.subTest(host='codex', portable=name):
+                self.assertTrue((self.home / '.codex/skills' / name).is_file())
+        self.assertEqual(self.install('codex', '--check').returncode, 0)
+        # An existing install that already holds a stale file is reported, never deleted.
+        stale = self.home / '.codex/skills' / host_specific[0]
+        stale.write_text('stale')
+        check = self.install('codex', '--check')
+        self.assertNotEqual(check.returncode, 0)
+        self.assertIn('STALE host-specific file', check.stdout)
+        self.assertIn(str(stale), check.stdout)
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(stale.read_text(), 'stale')
+
 
 if __name__ == '__main__':
     unittest.main()
