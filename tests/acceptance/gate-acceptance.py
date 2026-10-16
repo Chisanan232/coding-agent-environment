@@ -14,6 +14,7 @@ the host is below 100 GiB; it is never faked.
 """
 import json
 import os
+import pwd
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import shutil
@@ -36,6 +37,46 @@ gate = load('gate', '.claude/hooks/disk-admission-gate.py')
 adapter = load('adapter', 'scripts/disk-admission.py')
 
 
+SENTINEL = '.gate-acceptance-workdir'
+OWNED_CHILDREN = ('sandbox-admission', 'fx', 'extra-settings.json', 'result.json')
+
+
+class RefusedWorkdir(Exception):
+    pass
+
+
+def claim_workdir(path):
+    """A work directory this script created (it holds the sentinel), or a fresh one; never anything else.
+
+    Refuses `/`, the home directory or any ancestor of it, any git working tree
+    (including this repository), and an existing directory without the sentinel.
+    """
+    work = Path(path).expanduser().resolve()
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    if work == Path('/') or work == home or home.is_relative_to(work):
+        raise RefusedWorkdir('refusing %s: it is, or contains, the home directory' % work)
+    if ROOT.is_relative_to(work) or work.is_relative_to(ROOT):
+        raise RefusedWorkdir('refusing %s: it overlaps this repository' % work)
+    probe = work
+    while not probe.exists():
+        probe = probe.parent
+    if subprocess.run(['git', '-C', str(probe), 'rev-parse', '--show-toplevel'], capture_output=True).returncode == 0:
+        raise RefusedWorkdir('refusing %s: it is inside a git working tree' % work)
+    if work.exists():
+        if not (work / SENTINEL).is_file():
+            raise RefusedWorkdir('refusing %s: it exists and was not created by this script (no %s)' % (work, SENTINEL))
+        for name in OWNED_CHILDREN:
+            child = work / name
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            elif child.exists() or child.is_symlink():
+                child.unlink()
+    else:
+        work.mkdir(parents=True)
+        (work / SENTINEL).write_text('created by gate-acceptance.py\n')
+    return work
+
+
 def prompt(command):
     return ('Run exactly this one Bash command and nothing else: %s . Reply with exactly one word first: EXECUTED if '
             'the command ran (even with no output or an error), BLOCKED if it was refused or denied by a hook. Do not '
@@ -44,14 +85,13 @@ def prompt(command):
 
 class Harness:
     def __init__(self, work):
-        self.work = Path(work).resolve()
+        self.work = claim_workdir(work)
         self.sandbox = self.work / 'sandbox-admission'
         self.fixture = self.work / 'fx/disposable'
         self.settings = self.work / 'extra-settings.json'
         self.results = []
 
     def prepare(self):
-        shutil.rmtree(self.work, ignore_errors=True)
         self.sandbox.mkdir(parents=True, mode=0o700)
         self.fixture.mkdir(parents=True)
         subprocess.run(['git', 'init', '-q'], cwd=self.fixture, check=True)
