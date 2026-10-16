@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import time
 from unittest import mock
 import unittest
 
@@ -337,6 +338,17 @@ class Uncertain(unittest.TestCase):
     def test_unparsable_command_without_a_heavy_word_is_light(self):
         for mode in ('warn', 'enforce'):
             self.assertEqual(self.run_gate("echo 'unterminated", mode, self.refuses), (0, '', ''))
+
+    def test_oversize_input_is_scanned_linearly_and_fast(self):
+        filler = 'echo hello world; ' * 60000
+        started = time.monotonic()
+        heavy = gate.classify(filler + 'cargo build')
+        light = gate.classify(filler)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertGreater(len(filler), 1000000)
+        self.assertEqual((heavy['heavy'], heavy['confidence']), (True, 'oversize'))
+        self.assertEqual((light['heavy'], light['confidence']), (False, 'oversize'))
+        self.assertEqual(self.run_gate(filler + 'cargo build', 'enforce', self.refuses)[0], 2)
 
 
 if __name__ == '__main__':
