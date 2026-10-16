@@ -356,7 +356,11 @@ def _read_reservation(path):
              and isinstance(record.get('start_token'), str) and isinstance(record.get('expires'), str))
     if not valid:
         raise ValueError('wrong schema')
-    record['expires_at'] = datetime.fromisoformat(record['expires'].replace('Z', '+00:00'))
+    expires_at = datetime.fromisoformat(record['expires'].replace('Z', '+00:00'))
+    if expires_at.tzinfo is None:
+        # A naive time cannot be compared with now; treat it as a damaged record.
+        raise ValueError('expires has no timezone')
+    record['expires_at'] = expires_at
     return record
 
 
