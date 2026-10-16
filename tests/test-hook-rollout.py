@@ -501,6 +501,10 @@ class Fixture(unittest.TestCase):
         self.refuses_dest(str(self.root) + '/a/../b/disk-admission-gate.py')
         self.refuses_dest(str(self.root) + '//double/disk-admission-gate.py')
 
+    def test_a_wrong_basename_is_refused(self):
+        self.refuses_dest(str(self.root / 'claude/hooks/evil.py'))
+        self.refuses_dest(str(self.root / 'claude/hooks/disk-admission-gate.py.bak'))
+
 
 class CommandDerivation(unittest.TestCase):
     def test_command_uses_the_tilde_form_under_home_and_quotes_other_paths(self):
