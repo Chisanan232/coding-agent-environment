@@ -45,6 +45,17 @@ class Decisions(unittest.TestCase):
         with self.assertRaises(ValueError):
             da.decide('medium', 500 * GIB, {})
 
+    def test_latch_set_below_20_held_until_50(self):
+        admit, state, _ = da.decide('light', 19 * GIB, {})
+        self.assertFalse(admit)
+        self.assertTrue(state['latch'])
+        # Held through recovery, then released exactly at 50 GiB.
+        for free in (20 * GIB, 49 * GIB, 50 * GIB - 1):
+            self.assertTrue(da.decide('light', free, state)[1]['latch'], free)
+        self.assertFalse(da.decide('light', 50 * GIB, state)[1]['latch'])
+        # Negative control: without a prior latch 20..<50 GiB never latches.
+        self.assertFalse(da.decide('light', 30 * GIB, {})[1]['latch'])
+
 
 if __name__ == '__main__':
     unittest.main()
