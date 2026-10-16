@@ -438,6 +438,17 @@ class Hardening(unittest.TestCase):
         self.assertEqual(target.read_text(), 'untouched')
         self.assertFalse(self.path.exists())
 
+    def test_unexpected_exception_exits_77(self):
+        from contextlib import redirect_stdout
+        out = io.StringIO()
+        with mock.patch.object(da, 'evaluate', side_effect=RuntimeError('boom')), redirect_stdout(out):
+            self.assertEqual(da.run(['check', '--weight', 'light']), 77)
+        self.assertIn('internal error', out.getvalue())
+        # Usage errors stay argparse's SystemExit(2), still non-zero for callers.
+        with self.assertRaises(SystemExit) as raised, mock.patch('sys.stderr', io.StringIO()):
+            da.run(['check'])
+        self.assertEqual(raised.exception.code, 2)
+
 
 if __name__ == '__main__':
     unittest.main()
