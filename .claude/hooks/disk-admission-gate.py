@@ -226,12 +226,25 @@ def _heavy_kind(words):
 
 
 def _shell_script(words):
-    """The string given to `bash -c` (also -lc and similar), else None."""
-    if not words or os.path.basename(words[0]) not in SHELLS:
+    """The string run by `bash -c` (flag clusters like -euo pipefail -c allowed) or `eval`, else None."""
+    if not words:
         return None
-    for index, token in enumerate(words[1:3], 1):
-        if token.startswith('-') and not token.startswith('--') and token.endswith('c') and index + 1 < len(words):
-            return words[index + 1]
+    program = os.path.basename(words[0])
+    if program == 'eval':
+        return ' '.join(words[1:]) or None
+    if program not in SHELLS:
+        return None
+    index = 1
+    while index < len(words):
+        token = words[index]
+        if token in ('-o', '+o', '-O', '+O'):
+            index += 2
+        elif token.startswith('-') and not token.startswith('--') and len(token) > 1:
+            if token.endswith('c'):
+                return words[index + 1] if index + 1 < len(words) else None
+            index += 2 if token.endswith('o') else 1
+        else:
+            return None
     return None
 
 
