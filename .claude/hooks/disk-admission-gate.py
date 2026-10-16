@@ -16,6 +16,12 @@ absent or invalid file means warn. Only an operator edits it.
   enforce  exit 2 with a message when admission refuses, and also when
            admission cannot be evaluated (fail closed). Only enforce fails closed.
 
+Enforce is a guardrail, not a security boundary: the governed agent runs as the
+same user as the operator and could edit the mode file. A Bash command that
+appears to write, move or remove under the admission directory is flagged
+tamper-suspect (denied in enforce, advisory in warn); that detection is
+best-effort. Operator hardening: chmod 0444 and chflags uchg on the mode file.
+
 A failure before the command is classified allows it: denying every Bash call
 because of a hook bug would be worse than the gap.
 
