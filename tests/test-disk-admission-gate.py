@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = spec_from_file_location('disk_gate', ROOT / '.claude/hooks/disk-admission-gate.py')
 gate = module_from_spec(spec)
 spec.loader.exec_module(gate)
+gate.AUDIT_ENABLED = False  # tests must not write the operator's audit file; audit tests re-enable it
 
 
 class Classification(unittest.TestCase):
@@ -462,6 +463,367 @@ class Documentation(unittest.TestCase):
             self.assertIn('chflags uchg', text, relative)
             self.assertIn('0444', text, relative)
         self.assertIn('--check-fresh', (ROOT / 'docs/STORAGE-INTEGRATION.md').read_text())
+
+
+class AdmissionDirFlag(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name).resolve() / 'sandbox'
+        self.dir.mkdir()
+
+    def run_gate(self, command, runner):
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}})
+        out, err = io.StringIO(), io.StringIO()
+        code = gate.main(payload, out, err, runner=runner, admission_dir=self.dir)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_flag_forms_are_parsed_and_relative_paths_ignored(self):
+        self.assertEqual(gate.parse_admission_dir(['--admission-dir', '/x/y']), Path('/x/y'))
+        self.assertEqual(gate.parse_admission_dir(['--admission-dir=/x/y']), Path('/x/y'))
+        self.assertIsNone(gate.parse_admission_dir(['--admission-dir', 'relative']))
+        self.assertIsNone(gate.parse_admission_dir(['--admission-dir']))
+        self.assertIsNone(gate.parse_admission_dir([]))
+
+    def test_mode_is_read_from_the_sandbox_directory(self):
+        refuses = lambda: (77, 'heavy refused in tier low')
+        self.assertEqual(self.run_gate('cargo build', refuses)[0], 0)  # no mode file: warn
+        (self.dir / 'mode').write_text('enforce\n')
+        code, out, err = self.run_gate('cargo build', refuses)
+        self.assertEqual((code, out), (2, ''))
+        self.assertIn('BLOCKED', err)
+
+    def test_sandbox_directory_is_protected_from_tampering(self):
+        command = 'echo warn > %s/mode' % self.dir
+        (self.dir / 'mode').write_text('enforce')
+        code, out, err = self.run_gate(command, lambda: (0, 'ok'))
+        self.assertEqual(code, 2)
+        self.assertIn('tamper-suspect', err)
+        # Negative control: reading the same file is fine.
+        self.assertEqual(self.run_gate('cat %s/mode' % self.dir, lambda: (0, 'ok')), (0, '', ''))
+
+    def test_sandbox_adapter_run_writes_state_only_inside_the_sandbox(self):
+        code, text = gate.run_adapter(self.dir)
+        self.assertIn(code, (0, 77))
+        self.assertIn('tier=', text)
+        self.assertTrue((self.dir / 'state.json').exists())
+
+
+class AuditTrail(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name).resolve() / 'sandbox'
+        patcher = mock.patch.object(gate, 'AUDIT_ENABLED', True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @property
+    def log(self):
+        return self.dir / 'gate-audit.jsonl'
+
+    def lines(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def run_gate(self, command, mode='warn', runner=None):
+        self.dir.mkdir(exist_ok=True)
+        (self.dir / 'mode').write_text(mode)
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}})
+        runner = runner or (lambda: (77, 'heavy refused in tier low; tier=low free=35.9 GiB bytes=38512345678'))
+        return gate.main(payload, io.StringIO(), io.StringIO(), runner=runner, admission_dir=self.dir)
+
+    def test_heavy_command_writes_exactly_one_audit_line(self):
+        self.run_gate('cargo build')
+        (entry,) = self.lines()
+        self.assertEqual((entry['classification'], entry['tool'], entry['confidence']), ('heavy', 'cargo', 'exact'))
+        self.assertEqual((entry['mode'], entry['decision']), ('warn', 'warn'))
+        self.assertEqual((entry['tier'], entry['free_bytes']), ('low', 38512345678))
+        self.assertRegex(entry['ts'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
+
+    def test_benign_commands_write_no_audit_line(self):
+        for command in ('git status', 'echo cargo build', 'cargo --version', 'ls -la', 'cat Cargo.toml'):
+            self.run_gate(command)
+        self.assertEqual(self.lines(), [])
+        self.assertFalse(self.log.exists())
+
+    def test_audit_line_never_contains_the_command_text(self):
+        command = 'cargo build --features SECRET_MARKER_8431 -p hidden-crate'
+        self.run_gate(command)
+        raw = self.log.read_text()
+        for fragment in ('SECRET_MARKER_8431', 'hidden-crate', '--features', 'cargo build'):
+            self.assertNotIn(fragment, raw)
+        import hashlib
+        self.assertEqual(self.lines()[0]['cmd_sha12'], hashlib.sha256(command.encode()).hexdigest()[:12])
+
+    def test_audit_file_rotates_at_the_cap_keeping_one_backup(self):
+        with mock.patch.object(gate, 'AUDIT_MAX_BYTES', 700):
+            for _ in range(12):
+                self.run_gate('cargo build')
+        backup = Path(str(self.log) + '.1')
+        self.assertTrue(backup.exists())
+        self.assertLessEqual(self.log.stat().st_size, 700)
+        self.assertLessEqual(backup.stat().st_size, 700)
+        self.assertEqual(sorted(entry.name for entry in self.dir.iterdir() if entry.name.startswith('gate-audit')),
+                         ['gate-audit.jsonl', 'gate-audit.jsonl.1'])
+        # Negative control: below the cap nothing rotates.
+        other = self.dir.parent / 'other'
+        other.mkdir()
+        gate.audit_append(other, {'classification': 'heavy'}, 'x')
+        self.assertEqual(sorted(entry.name for entry in other.iterdir()), ['gate-audit.jsonl'])
+
+    def test_audit_file_is_private_and_a_symlink_is_not_followed(self):
+        self.run_gate('cargo build')
+        self.assertEqual(self.log.stat().st_mode & 0o777, 0o600)
+        self.log.unlink()
+        victim = self.dir.parent / 'victim'
+        victim.write_text('untouched')
+        self.log.symlink_to(victim)
+        self.run_gate('cargo build')
+        self.assertEqual(victim.read_text(), 'untouched')
+
+    def test_decisions_allow_warn_and_deny_and_tamper_are_recorded(self):
+        self.run_gate('cargo build', 'warn', lambda: (0, 'heavy admitted; tier=stable free=150.0 GiB bytes=161061273600'))
+        self.run_gate('cargo build', 'warn')
+        self.run_gate('cargo build', 'enforce')
+        self.run_gate('echo warn > %s/mode' % self.dir, 'enforce')
+        decisions = [(e['classification'], e['mode'], e['decision']) for e in self.lines()]
+        self.assertEqual(decisions, [('heavy', 'warn', 'allow'), ('heavy', 'warn', 'warn'),
+                                     ('heavy', 'enforce', 'deny'), ('tamper-suspect', 'enforce', 'deny')])
+        self.assertEqual(self.lines()[0]['tier'], 'stable')
+
+    def test_an_unwritable_audit_location_never_changes_the_decision(self):
+        self.dir.mkdir()
+        (self.dir / 'mode').write_text('enforce')
+        os.chmod(self.dir, 0o500)
+        self.addCleanup(os.chmod, self.dir, 0o700)
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'cargo build'}})
+        out, err = io.StringIO(), io.StringIO()
+        code = gate.main(payload, out, err, runner=lambda: (77, 'refused'), admission_dir=self.dir)
+        self.assertEqual(code, 2)
+        self.assertIn('BLOCKED', err.getvalue())
+
+    def test_an_unwritable_audit_location_keeps_the_normal_refusal_message(self):
+        self.dir.mkdir()
+        (self.dir / 'mode').write_text('enforce')
+        os.chmod(self.dir, 0o500)
+        self.addCleanup(os.chmod, self.dir, 0o700)
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'cargo build'}})
+        err = io.StringIO()
+        gate.main(payload, io.StringIO(), err, runner=lambda: (77, 'heavy refused in tier low'), admission_dir=self.dir)
+        self.assertIn('disk admission refuses heavy command cargo', err.getvalue())
+        self.assertNotIn('internal error', err.getvalue())
+
+
+class RolloutDocumentation(unittest.TestCase):
+    def test_docs_state_the_staged_rollout_audit_and_scope(self):
+        text = (ROOT / 'docs/STORAGE-INTEGRATION.md').read_text()
+        for needle in ('hook-rollout.py plan|apply|verify|rollback', 'gate-audit.jsonl', '--admission-dir',
+                       'WARN, verify, ENFORCE', 'not yet verifiable', 'Nothing here\nclaims host-wide coverage'):
+            self.assertIn(needle.lower(), text.lower().replace('  ', ' '), needle)
+
+
+class AcceptanceHarness(unittest.TestCase):
+    def test_harness_loads_stays_out_of_ci_and_never_fakes_the_admitted_path(self):
+        path = ROOT / 'tests/acceptance/gate-acceptance.py'
+        harness = module_from_spec(spec_from_file_location('gate_acceptance', path))
+        harness.__spec__.loader.exec_module(harness)
+        self.assertIn('cargo build --help', harness.prompt('cargo build --help'))
+        self.assertFalse(path.name.startswith('test-'))
+        text = path.read_text()
+        self.assertIn('NOT_YET_VERIFIABLE', text)
+        self.assertIn('--admission-dir', text)
+
+
+class HarnessWorkdir(unittest.TestCase):
+    def setUp(self):
+        path = ROOT / 'tests/acceptance/gate-acceptance.py'
+        self.harness = module_from_spec(spec_from_file_location('gate_acceptance_wd', path))
+        self.harness.__spec__.loader.exec_module(self.harness)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+
+    def test_home_root_and_repository_paths_are_refused(self):
+        home = Path(gate.account_home())
+        for path in (home, Path('/'), home.parent, ROOT, ROOT / 'tests'):
+            with self.assertRaises(self.harness.RefusedWorkdir, msg=str(path)):
+                self.harness.claim_workdir(path)
+        self.assertTrue(home.exists() and ROOT.exists())
+
+    def test_an_existing_directory_without_the_sentinel_is_refused_and_untouched(self):
+        victim = self.base / 'important'
+        victim.mkdir()
+        (victim / 'fx').mkdir()
+        (victim / 'fx/precious.txt').write_text('keep')
+        (victim / 'notes.txt').write_text('keep')
+        with self.assertRaises(self.harness.RefusedWorkdir):
+            self.harness.claim_workdir(victim)
+        self.assertEqual((victim / 'fx/precious.txt').read_text(), 'keep')
+        self.assertEqual((victim / 'notes.txt').read_text(), 'keep')
+
+    def test_a_fresh_directory_is_claimed_and_reused_without_touching_other_files(self):
+        work = self.base / 'run'
+        self.assertEqual(self.harness.claim_workdir(work), work)
+        self.assertTrue((work / self.harness.SENTINEL).is_file())
+        (work / 'sandbox-admission').mkdir()
+        (work / 'sandbox-admission/old').write_text('stale')
+        (work / 'unrelated.txt').write_text('keep')
+        self.harness.claim_workdir(work)
+        self.assertFalse((work / 'sandbox-admission').exists())
+        self.assertEqual((work / 'unrelated.txt').read_text(), 'keep')
+
+    def test_a_directory_inside_a_git_working_tree_is_refused(self):
+        repo = self.base / 'repo'
+        repo.mkdir()
+        gate_subprocess = __import__('subprocess')
+        gate_subprocess.run(['git', 'init', '-q'], cwd=repo, check=True)
+        with self.assertRaises(self.harness.RefusedWorkdir):
+            self.harness.claim_workdir(repo)
+        with self.assertRaises(self.harness.RefusedWorkdir):
+            self.harness.claim_workdir(repo / 'child')
+        self.assertFalse((repo / 'child').exists())
+
+    def test_the_harness_compares_the_audit_hash_with_the_command_sent(self):
+        text = (ROOT / 'tests/acceptance/gate-acceptance.py').read_text()
+        self.assertIn("hashlib.sha256(shell.encode()).hexdigest()[:12]", text)
+        self.assertIn("differs from the sha of the command sent", text)
+
+    def test_production_path_case_is_opt_in_and_declares_its_real_directory_writes(self):
+        text = (ROOT / 'tests/acceptance/gate-acceptance.py').read_text()
+        self.assertIn("'--include-production-path' in argv", text)
+        self.assertIn('account database, not $HOME', text)
+        self.assertIn('def production_case', text)
+
+    def test_the_home_guard_holds_even_when_the_home_directory_carries_the_sentinel(self):
+        fake_home = self.base / 'fake-home'
+        fake_home.mkdir()
+        (fake_home / self.harness.SENTINEL).write_text('x')
+        with mock.patch.object(self.harness.pwd, 'getpwuid', return_value=mock.Mock(pw_dir=str(fake_home))):
+            for path in (fake_home, self.base):
+                with self.assertRaises(self.harness.RefusedWorkdir, msg=str(path)):
+                    self.harness.claim_workdir(path)
+
+    def test_the_repository_guard_holds_even_when_the_repository_carries_the_sentinel(self):
+        fake_repo = self.base / 'fake-repo'
+        fake_repo.mkdir()
+        (fake_repo / self.harness.SENTINEL).write_text('x')
+        with mock.patch.object(self.harness, 'ROOT', fake_repo):
+            with self.assertRaises(self.harness.RefusedWorkdir):
+                self.harness.claim_workdir(fake_repo)
+            with self.assertRaises(self.harness.RefusedWorkdir):
+                self.harness.claim_workdir(fake_repo / 'sub')
+        self.assertTrue((fake_repo / self.harness.SENTINEL).exists())
+
+    def test_hash_candidates_tolerate_only_semicolon_spacing(self):
+        import hashlib
+        sha = lambda text: hashlib.sha256(text.encode()).hexdigest()[:12]
+        candidates = self.harness.sha_candidates('cargo build --help ; touch ran-H1')
+        for text in ('cargo build --help ; touch ran-H1', 'cargo build --help; touch ran-H1', 'cargo build --help;touch ran-H1'):
+            self.assertIn(sha(text), candidates, text)
+        # Negative controls: a different command or flag is a real difference.
+        for text in ('cargo build --release ; touch ran-H1', 'cargo build --help ; touch ran-H2', 'cargo  build --help ; touch ran-H1'):
+            self.assertNotIn(sha(text), candidates, text)
+
+
+class HungAdapter(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.stub = Path(self.temp.name) / 'disk-admission.py'
+        self.stub.write_text('import time\ntime.sleep(60)\n')
+        for patcher in (mock.patch.object(gate, 'adapter_path', return_value=self.stub),
+                        mock.patch.object(gate, 'ADAPTER_TIMEOUT_S', 1)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_gate(self, mode):
+        mode_dir = Path(self.temp.name)
+        (mode_dir / 'mode').write_text(mode)
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'cargo build'}})
+        out, err = io.StringIO(), io.StringIO()
+        started = time.monotonic()
+        # No admission_dir and no injected runner: this is the production subprocess path.
+        code = gate.main(payload, out, err, mode_fn=lambda: mode)
+        return code, out.getvalue(), err.getvalue(), time.monotonic() - started
+
+    def test_hung_adapter_is_a_refusal_in_enforce_and_never_a_hang(self):
+        code, out, err, took = self.run_gate('enforce')
+        self.assertEqual((code, out), (2, ''))
+        self.assertIn('could not be evaluated', err)
+        self.assertLess(took, 10)
+
+    def test_hung_adapter_only_advises_in_warn(self):
+        code, out, err, took = self.run_gate('warn')
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('could not be evaluated', json.loads(out)['hookSpecificOutput']['additionalContext'])
+        self.assertLess(took, 10)
+
+
+class ConfigErrors(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name).resolve() / 'default-dir'
+        self.dir.mkdir()
+        patcher = mock.patch.object(gate, 'AUDIT_ENABLED', True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_gate(self, command, mode, error='--admission-dir \'rel/dir\' is not an absolute path'):
+        (self.dir / 'mode').write_text(mode)
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}})
+        out, err = io.StringIO(), io.StringIO()
+        code = gate.main(payload, out, err, runner=lambda: (0, 'ok'), admission_dir=self.dir, config_error=error)
+        log = self.dir / 'gate-audit.jsonl'
+        lines = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        return code, out.getvalue(), err.getvalue(), lines
+
+    def test_config_parsing_flags_relative_tilde_missing_and_unknown_arguments(self):
+        self.assertEqual(gate.admission_dir_config(['--admission-dir', '/ok/dir']), (Path('/ok/dir'), None))
+        self.assertEqual(gate.admission_dir_config([]), (None, None))
+        for argv in (['--admission-dir', 'rel'], ['--admission-dir=~/x'], ['--admission-dir'], ['--admision-dir', '/x'],
+                     ['--admission-dir', '/ok', '--extra']):
+            error = gate.admission_dir_config(argv)[1]
+            self.assertIsNotNone(error, argv)
+        self.assertIsNone(gate.admission_dir_config(['--admission-dir', '/ok'])[1])
+
+    def test_warn_mode_advises_loudly_and_records_a_config_error_line(self):
+        code, out, err, lines = self.run_gate('cargo build', 'warn')
+        self.assertEqual((code, err), (0, ''))
+        context = json.loads(out)['hookSpecificOutput']['additionalContext']
+        self.assertIn('configuration error', context)
+        self.assertIn('not an absolute path', context)
+        self.assertEqual([(l['classification'], l['decision']) for l in lines][:1], [('config-error', 'warn')])
+
+    def test_enforce_mode_refuses_heavy_commands_on_a_configuration_error(self):
+        code, out, err, lines = self.run_gate('cargo build', 'enforce')
+        self.assertEqual((code, out), (2, ''))
+        self.assertIn('configuration error', err)
+        self.assertEqual([(l['classification'], l['decision']) for l in lines], [('config-error', 'deny')])
+
+    def test_enforce_mode_still_allows_benign_commands_with_an_advisory(self):
+        code, out, err, lines = self.run_gate('git status', 'enforce')
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('configuration error', json.loads(out)['hookSpecificOutput']['additionalContext'])
+        self.assertEqual([l['decision'] for l in lines], ['warn'])
+        # Negative control: a valid configuration produces no advisory for the same command.
+        (self.dir / 'gate-audit.jsonl').unlink()
+        self.assertEqual(self.run_gate('git status', 'enforce', error=None)[1:], ('', '', []))
+
+
+class RolloutDocumentationLimits(unittest.TestCase):
+    def test_docs_require_the_first_warn_audit_line_after_install(self):
+        text = (ROOT / 'docs/STORAGE-INTEGRATION.md').read_text()
+        for needle in ('first WARN audit line', 'not** the installed\nfile path', 'account database,\nnot `$HOME`',
+                       'config-error', 'exit codes'):
+            self.assertIn(needle, text, needle)
+
+
+class RolloutRaceDocumentation(unittest.TestCase):
+    def test_docs_state_the_destination_rule_and_the_residual_rename_window(self):
+        text = (ROOT / 'docs/STORAGE-INTEGRATION.md').read_text()
+        for needle in ('normalised absolute path ending in', 'microsecond lost-update window', 'run `verify`'):
+            self.assertIn(needle, text.replace('\n', ' ').replace('  ', ' '), needle)
 
 
 if __name__ == '__main__':

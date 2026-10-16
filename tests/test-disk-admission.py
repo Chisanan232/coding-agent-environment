@@ -261,6 +261,21 @@ class Cli(unittest.TestCase):
         # Rewritten as latched; recovery at 50 GiB or more admits again.
         self.assertTrue(da.evaluate('light', self.path, lambda: 500 * GIB)['admit'])
 
+    def test_check_line_reports_exact_free_bytes(self):
+        code, text = self.run_main(['check', '--weight', 'heavy'], 36 * GIB + 12345)
+        self.assertEqual(code, 77)
+        self.assertIn('bytes=%d' % (36 * GIB + 12345), text)
+        self.assertEqual(len(text.splitlines()), 1)
+
+    def test_run_passes_injected_state_path_and_free_space(self):
+        from contextlib import redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = da.run(['check', '--weight', 'heavy'], state_path=self.path, free_fn=lambda: 36 * GIB)
+        self.assertEqual(code, 77)
+        self.assertTrue(self.path.exists())
+        self.assertIn('tier=low', out.getvalue())
+
 
 class Sources(unittest.TestCase):
     @staticmethod

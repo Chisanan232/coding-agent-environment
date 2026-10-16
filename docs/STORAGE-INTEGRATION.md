@@ -96,7 +96,7 @@ installs the gate hook. Entry-point inventory:
 
 | Entry point | Status |
 |---|---|
-| `.claude/hooks/disk-admission-gate.py` (PreToolUse Bash) | Source only. Integrated: none. The operator must patch `settings.json`; real-engine behavior is not verified until then |
+| Claude Code Bash heavy commands through `.claude/hooks/disk-admission-gate.py` (PreToolUse) | Supported only after the operator runs `scripts/hook-rollout.py apply`. Not installed by default; verified stage by stage (see the rollout below). Covers the heavy commands listed under the hook behavior, nothing else |
 | Codex, launchers (`ca-*`), installer/sync, resource-lock, Glomeris callers | Not integrated, pending later stages |
 | `make`, `just`, `npm run <script>`, `xargs`, direct binaries, a user's own `!` shell, IDE analysis (flycheck, rust-analyzer) | Unsupported blind spots the hook cannot see |
 | `$(...)` inside double quotes, aliases, variable-expanded commands | Not detected (best-effort token parsing) |
@@ -150,3 +150,89 @@ tamper-suspect: denied in enforce, advisory in warn. That detection is
 best-effort. Operator hardening: `chmod 0444` and `chflags uchg` on the `mode`
 file (`chflags nouchg` before an edit); leave `state.json` writable, because the
 adapter updates it.
+
+### Gate audit trail
+
+The hook appends one JSON line per heavy or tamper-suspect classification to
+`gate-audit.jsonl` in the admission directory (0600, rotated at 1 MiB keeping
+one `.1` backup): `ts, mode, classification, tool, confidence, decision
+(allow|warn|deny), tier, free_bytes, cmd_sha12`. It never stores the command
+text, only the first 12 hex characters of its SHA-256 and the matched tool
+name. Benign commands are not logged. An audit write failure never changes the
+decision.
+
+### Operator-set admission directory
+
+The hook accepts `--admission-dir PATH` (absolute) on its command line in
+`settings.json`; the default is `~/.cache/coding-agent-environment/admission`.
+The mode file, state and audit file all live there, so acceptance runs use a
+sandbox directory without touching the real state. Only the operator edits the
+hook command in `settings.json`; the agent's Bash commands cannot change it
+(an edit to `settings.json` is itself a protected operator action).
+
+### Staged rollout: WARN, verify, ENFORCE
+
+Install is the existing protected operator process, modeled on
+`permission-rollout.py`: `scripts/hook-rollout.py plan|apply|verify|rollback`.
+
+1. `plan` prints the live settings hash and hook file hash; nothing is written.
+2. `apply --expect-live-sha H1 --expect-hook-sha H2` installs the merged hook
+   file (0755, backup if one exists) and appends exactly one
+   `PreToolUse` group `{matcher: Bash, command: python3
+   ~/.claude/hooks/disk-admission-gate.py}`. Every other hook and key is kept,
+   existing groups keep their order, and a receipt records the hash-exact
+   backups. It refuses an unmerged hook file, a symlink, a wrong hash, a
+   different existing gate entry, a formatting-changing rewrite without
+   `--allow-reformat`, and an `enforce` mode file without `--allow-enforce`.
+   Re-running it is a no-op.
+3. WARN stage (default, absent mode file): the hook only adds context and
+   writes audit lines. `verify` checks the hook is present once, the file hash,
+   the mode file state and that no deny was added.
+4. Observe `gate-audit.jsonl` over real use: confirm heavy commands show up with
+   plausible `decision` values and no false positives on benign work.
+5. ENFORCE stage: the operator writes `enforce` into the mode file (then
+   `chmod 0444` and `chflags uchg` it). Re-run `verify --allow-enforce`.
+6. `rollback --receipt FILE` restores the settings and any previous hook file
+   hash-exact.
+
+Post-install acceptance step (required): the real-session harness runs the hook
+from the checkout with a sandbox `--admission-dir`, so it proves the
+classification and decision logic (H1, H2, R1a, M1e) but **not** the installed
+file path (`~/.claude/hooks/disk-admission-gate.py`, the settings command and
+the production subprocess adapter). After `apply`, run one heavy command in a
+real Claude session and confirm the **first WARN audit line** appears in
+`gate-audit.jsonl` with the expected `tool`, `mode` and `cmd_sha12`; until that
+line exists the install is not verified. The harness's opt-in P1 case
+(`--include-production-path`) exercises the production subprocess path from the
+checkout; the adapter resolves the home directory from the account database,
+not `$HOME`, so P1 cannot be sandboxed and writes the real state file and one
+audit line.
+
+A hook argument other than a valid absolute `--admission-dir` (a typo, a
+relative or `~` path) is a configuration error: the hook still never crashes,
+but it advises loudly, records a `config-error` audit line and, in enforce,
+refuses heavy commands. `hook-rollout.py` exit codes: 2 conflicting entry, 3 hash
+mismatch, 4 symlink, 5 concurrent change, 7 unmerged, 8 reformat, 9 enforce
+mode file, 10 settings it cannot edit safely (null `hooks`, root array,
+non-UTF-8), 11 another apply running.
+
+`--hook-dest` must be a normalised absolute path ending in
+`disk-admission-gate.py` (exit 12 otherwise, nothing written): a relative path
+would make Claude Code run repository-controlled code from each session's working
+directory, and a `~` path would create a literal `~` directory.
+
+Residual race: `apply` and `rollback` re-compare the live settings immediately
+before the rename, but no lock that other writers honour exists, so a
+microsecond lost-update window remains between that final compare and the rename.
+Mitigation: apply only when no session is rewriting settings, and run `verify`
+afterwards.
+
+What "verified" means at each stage: after `apply`, file and settings state
+match the pinned hashes (offline tests on fixture settings); after WARN use, the
+audit shows the hook fires on real sessions; ENFORCE is verified only for the
+supported scope and only with free space below the floor (the deny path).
+`tests/acceptance/gate-acceptance.py` drives real `claude -p` sessions against a
+sandbox; it is not part of CI. The admitted path (free space at or above
+100 GiB) is not yet verifiable while the host is below that floor. Nothing here
+claims host-wide coverage.
+

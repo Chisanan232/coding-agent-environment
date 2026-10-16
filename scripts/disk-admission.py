@@ -666,14 +666,15 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
         print(json.dumps(dict({key: result[key] for key in keys}, **({} if result['tier'] else {'error': result['reason']})), sort_keys=True))
         return 0 if result['tier'] else REFUSED_EXIT
     free = 'unknown' if result['free_bytes'] is None else '%.1f GiB' % (result['free_bytes'] / GIB)
-    print('%s; tier=%s free=%s' % (result['reason'], result['tier'] or 'unknown', free))
+    exact = 'unknown' if result['free_bytes'] is None else result['free_bytes']
+    print('%s; tier=%s free=%s bytes=%s' % (result['reason'], result['tier'] or 'unknown', free, exact))
     return 0 if result['admit'] else REFUSED_EXIT
 
 
-def run(argv=None):
-    """main() with every unexpected failure turned into a refusal."""
+def run(argv=None, **options):
+    """main() with every unexpected failure turned into a refusal; options inject state_path or free_fn."""
     try:
-        return main(argv)
+        return main(argv, **options)
     except Exception as exc:
         print('refused: internal error: %s' % exc)
         return REFUSED_EXIT

@@ -36,6 +36,8 @@ direct binaries (a compiled tool that itself builds), a user's own `!` shell
 commands, IDE background analysis (flycheck, rust-analyzer), and any command
 hidden behind variable expansion, aliases, scripts or xargs.
 """
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 import re
@@ -329,14 +331,59 @@ def target_dir_advice(verdict, exists=os.path.exists):
     return None
 
 
-MODE_RELATIVE = '.cache/coding-agent-environment/admission/mode'
+ADMISSION_RELATIVE = '.cache/coding-agent-environment/admission'
 DENY_EXIT = 2
 ADAPTER_TIMEOUT_S = 30
 
 
+def default_admission_dir():
+    return account_home() / ADMISSION_RELATIVE
+
+
+def parse_admission_dir(argv):
+    """Value of --admission-dir from the hook command line, else None.
+
+    The flag comes from the command registered in settings.json, which only the
+    operator edits; the agent's Bash commands cannot change it.
+    """
+    for index, arg in enumerate(argv):
+        value = arg.partition('=')[2] if arg.startswith('--admission-dir=') else (
+            argv[index + 1] if arg == '--admission-dir' and index + 1 < len(argv) else None)
+        if value is not None:
+            return Path(value) if os.path.isabs(value) else None
+    return None
+
+
+def admission_dir_config(argv):
+    """(directory or None, error or None) from the hook command line.
+
+    Any argument other than a valid absolute --admission-dir is a configuration
+    error: silently falling back to the real default directory would let a typo
+    read the real mode file while an operator believes a sandbox is in use.
+    """
+    directory, error, index = None, None, 0
+    while index < len(argv):
+        arg = argv[index]
+        value = None
+        if arg.startswith('--admission-dir='):
+            value = arg.partition('=')[2]
+        elif arg == '--admission-dir':
+            value = argv[index + 1] if index + 1 < len(argv) else ''
+            index += 1
+        else:
+            error = 'unrecognised hook argument %r' % arg
+        if value is not None:
+            if os.path.isabs(value):
+                directory = Path(value)
+            else:
+                error = '--admission-dir %r is not an absolute path' % value
+        index += 1
+    return directory, error
+
+
 def read_mode(path=None):
     """'enforce' only when the operator's mode file says exactly so; anything else is warn."""
-    path = path or account_home() / MODE_RELATIVE
+    path = path or default_admission_dir() / 'mode'
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         with os.fdopen(descriptor, 'rb') as handle:
@@ -355,11 +402,30 @@ def adapter_path():
     return next((candidate for candidate in candidates if candidate.is_file()), None)
 
 
-def run_adapter():
+def _run_adapter_in_process(adapter, admission_dir):
+    """Sandbox use only: the adapter has no state-path flag, so call its main() directly."""
+    import contextlib
+    import importlib.util
+    import io
+    spec = importlib.util.spec_from_file_location('disk_admission_adapter', adapter)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        code = module.run(['check', '--weight', 'heavy'], state_path=admission_dir / 'state.json')
+    return code, captured.getvalue().strip()[:300]
+
+
+def run_adapter(admission_dir=None):
     """(exit code, one-line text) of `disk-admission.py check --weight heavy`; code None on failure."""
     adapter = adapter_path()
     if adapter is None:
         return None, 'disk-admission.py not found'
+    if admission_dir is not None and admission_dir != default_admission_dir():
+        try:
+            return _run_adapter_in_process(adapter, admission_dir)
+        except Exception as exc:
+            return None, str(exc)
     try:
         done = subprocess.run([sys.executable, str(adapter), 'check', '--weight', 'heavy'], capture_output=True,
                               text=True, timeout=ADAPTER_TIMEOUT_S, stdin=subprocess.DEVNULL)
@@ -368,7 +434,24 @@ def run_adapter():
     return done.returncode, (done.stdout.strip() or done.stderr.strip())[:300]
 
 
-def _decide_heavy(command, mode, runner, exists):
+AUDIT_ENABLED = True
+AUDIT_NAME = 'gate-audit.jsonl'
+AUDIT_MAX_BYTES = 1024 * 1024
+ADAPTER_LINE_RE = re.compile(r'tier=(\w+) free=\S+ GiB bytes=(\d+)')
+
+
+def _event(events, classification, verdict, mode, decision, text=''):
+    """Record one audit event; never holds the command text."""
+    if events is None:
+        return
+    found = ADAPTER_LINE_RE.search(text or '')
+    events.append({'classification': classification, 'tool': verdict['kind'] if verdict else None,
+                   'confidence': verdict['confidence'] if verdict else None, 'mode': mode, 'decision': decision,
+                   'tier': found.group(1) if found else None,
+                   'free_bytes': int(found.group(2)) if found else None})
+
+
+def _decide_heavy(command, mode, runner, exists, events=None):
     verdict = classify(command)
     if not verdict['heavy']:
         return 0, '', ''
@@ -377,8 +460,10 @@ def _decide_heavy(command, mode, runner, exists):
         # Warn mode never blocks and cannot tell what this command runs.
         note = 'disk-admission-gate (mode %s, advice): command is %s and names %s; it may be a heavy build' % (
             mode, verdict['confidence'], verdict['kind'])
+        _event(events, 'heavy', verdict, mode, 'warn')
         return 0, json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'additionalContext': note}}), ''
     notes = []
+    text = ''
     try:
         code, text = runner()
         if code == 77:
@@ -393,7 +478,9 @@ def _decide_heavy(command, mode, runner, exists):
     if advice:
         notes.append(advice)
     if denied and mode == 'enforce':
+        _event(events, 'heavy', verdict, mode, 'deny', text)
         return DENY_EXIT, '', 'BLOCKED by disk-admission-gate (mode enforce): ' + '; '.join(notes)
+    _event(events, 'heavy', verdict, mode, 'warn' if notes else 'allow', text)
     if not notes:
         return 0, '', ''
     prefix = 'disk-admission-gate (mode %s, %s): ' % (mode, 'would block' if denied else 'advice')
@@ -409,9 +496,9 @@ TAMPER_NOTE = ('command appears to modify the disk-admission state directory (mo
                'reservations); only the operator should edit it')
 
 
-def tamper_suspect(command):
+def tamper_suspect(command, needles=(STATE_NEEDLE,)):
     """Best-effort: does this command write, move or remove under the admission state directory?"""
-    if STATE_NEEDLE not in command:
+    if not any(needle in command for needle in needles):
         return False
     try:
         simple_commands = split_commands(command)
@@ -429,18 +516,19 @@ def tamper_suspect(command):
         if program == 'sed' and any(w.startswith('-i') or w == '--in-place' for w in words[1:]):
             return True
         script = _shell_script(words)
-        if script is not None and tamper_suspect(script):
+        if script is not None and tamper_suspect(script, needles):
             return True
     return False
 
 
-def decide(command, mode, runner=run_adapter, exists=os.path.exists):
+def decide(command, mode, runner=run_adapter, exists=os.path.exists, needles=(STATE_NEEDLE,), events=None):
     """Return (exit code, stdout text, stderr text) for one Bash command."""
-    if not tamper_suspect(command):
-        return _decide_heavy(command, mode, runner, exists)
+    if not tamper_suspect(command, needles):
+        return _decide_heavy(command, mode, runner, exists, events)
+    _event(events, 'tamper-suspect', None, mode, 'deny' if mode == 'enforce' else 'warn')
     if mode == 'enforce':
         return DENY_EXIT, '', 'BLOCKED by disk-admission-gate (mode enforce): tamper-suspect: ' + TAMPER_NOTE
-    code, out, err = _decide_heavy(command, mode, runner, exists)
+    code, out, err = _decide_heavy(command, mode, runner, exists, events)
     note = 'disk-admission-gate (mode %s, advice): tamper-suspect: %s' % (mode, TAMPER_NOTE)
     if out:
         extra = json.loads(out)['hookSpecificOutput']['additionalContext']
@@ -448,7 +536,34 @@ def decide(command, mode, runner=run_adapter, exists=os.path.exists):
     return code, json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'additionalContext': note}}), err
 
 
-def main(raw, stdout, stderr, mode_fn=read_mode, runner=run_adapter):
+def audit_append(directory, event, command, now=None):
+    """Append one JSONL line; never raises and never records the command itself."""
+    record = dict(event, ts=(now or datetime.now(timezone.utc)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                  cmd_sha12=hashlib.sha256(command.encode('utf-8', 'replace')).hexdigest()[:12])
+    line = (json.dumps(record, sort_keys=True) + '\n').encode()
+    path = Path(directory) / AUDIT_NAME
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        try:
+            if os.lstat(path).st_size + len(line) > AUDIT_MAX_BYTES:
+                os.replace(path, str(path) + '.1')
+        except FileNotFoundError:
+            pass
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(descriptor, line)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        pass
+
+
+def main(raw, stdout, stderr, mode_fn=None, runner=None, admission_dir=None, config_error=None):
+    directory = admission_dir or default_admission_dir()
+    custom = admission_dir is not None
+    mode_fn = mode_fn or (lambda: read_mode(directory / 'mode'))
+    runner = runner or (lambda: run_adapter(directory if custom else None))
+    needles = (STATE_NEEDLE,) + ((str(directory),) if custom else ())
     try:
         if isinstance(raw, bytes):
             raw = raw.decode('utf-8', 'replace')
@@ -460,7 +575,27 @@ def main(raw, stdout, stderr, mode_fn=read_mode, runner=run_adapter):
     except Exception:
         return 0
     try:
-        code, out, err = decide(command, mode, runner)
+        events = []
+        note = None
+        if config_error:
+            heavy = classify(command)['heavy']
+            note = 'disk-admission-gate configuration error: %s; using the default admission directory' % config_error
+            refuse = heavy and mode == 'enforce'
+            events.append({'classification': 'config-error', 'tool': None, 'confidence': None, 'mode': mode,
+                           'decision': 'deny' if refuse else 'warn', 'tier': None, 'free_bytes': None})
+            if refuse:
+                if AUDIT_ENABLED:
+                    audit_append(directory, events[0], command)
+                stderr.write('BLOCKED by disk-admission-gate (mode enforce): ' + note + '\n')
+                return DENY_EXIT
+        code, out, err = decide(command, mode, runner, needles=needles, events=events)
+        if note:
+            extra = json.loads(out)['hookSpecificOutput']['additionalContext'] if out else None
+            out = json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse',
+                                                       'additionalContext': note + ('; ' + extra if extra else '')}})
+        if AUDIT_ENABLED:
+            for event in events:
+                audit_append(directory, event, command)
     except Exception as exc:
         if mode != 'enforce':
             return 0
@@ -473,4 +608,5 @@ def main(raw, stdout, stderr, mode_fn=read_mode, runner=run_adapter):
 
 
 if __name__ == '__main__':
-    raise SystemExit(main(sys.stdin.buffer.read(), sys.stdout, sys.stderr))
+    _directory, _error = admission_dir_config(sys.argv[1:])
+    raise SystemExit(main(sys.stdin.buffer.read(), sys.stdout, sys.stderr, admission_dir=_directory, config_error=_error))
