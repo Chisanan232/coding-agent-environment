@@ -260,6 +260,20 @@ class Fixture(unittest.TestCase):
         self.assertFalse(data['hook_created'])
         self.assertEqual(data['hook_backup'], str(backup))
 
+    def test_a_concurrent_settings_change_aborts_the_write(self):
+        real = hr.rollout.write_new
+
+        def write_then_change(path, data, mode):
+            real(path, data, mode)
+            if path.name.startswith('settings.json.pre-SPE-109'):
+                self.live.write_text(self.live_text.replace('git status', 'git log'))
+        with mock.patch.object(hr.rollout, 'write_new', write_then_change):
+            code, text = self.apply()
+        self.assertEqual(code, 5)
+        self.assertIn('changed while', text)
+        self.assertFalse(self.dest.exists())
+        self.assertNotIn('disk-admission-gate', self.live.read_text())
+
 
 if __name__ == '__main__':
     unittest.main()
