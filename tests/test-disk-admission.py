@@ -32,6 +32,19 @@ class Decisions(unittest.TestCase):
         for free in (100 * GIB, 150 * GIB, 500 * GIB):
             self.assertTrue(da.decide('heavy', free, {})[0], free)
 
+    def test_light_allowed_low_refused_emergency(self):
+        for free in (20 * GIB, 60 * GIB, 100 * GIB, 300 * GIB):
+            self.assertTrue(da.decide('light', free, {})[0], free)
+        # Negative control: below the emergency line light work is refused too.
+        for free in (0, 10 * GIB, 20 * GIB - 1):
+            admit, _, reason = da.decide('light', free, {})
+            self.assertFalse(admit, free)
+            self.assertIn('emergency', reason)
+
+    def test_unknown_weight_is_rejected(self):
+        with self.assertRaises(ValueError):
+            da.decide('medium', 500 * GIB, {})
+
 
 if __name__ == '__main__':
     unittest.main()
