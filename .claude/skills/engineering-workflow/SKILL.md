@@ -12,6 +12,7 @@ choice for that work.
 
 ## Start from known state
 
+All repository code changes go through pull requests; never push or merge to `main`.
 Inspect the repository, its instructions, the ticket, current Git state, and the
 actual base branch before editing. Preserve unfamiliar or uncommitted work. Use an
 isolated worktree for ticketed changes when the repository supports worktrees.
