@@ -226,49 +226,10 @@ or by setting their required credentials in the environment.
 
 ## Time-Layer Design — Skill-First Polling and Scheduling
 
-Claude Code may run recurring tasks using the `CronCreate` tool or manual periodic invocation. The rule is:
-**prefer waking narrow skills, not full agents, for polling and status checks.**
-
-### Default rule
-
-- Wake a **skill** for narrow, scoped checks (PR health, bot PR maintenance, pipeline state).
-- Handle strategic re-planning or multi-step coordination directly in the main
-  agent only when the polling result actually needs it — delegate to
-  `opus-architect` only if that re-planning is itself non-trivial.
-
-### Primary recurring automation targets
-
-| Target | Skill to wake | Wake agent if |
-|---|---|---|
-| PR health checks | `pr-health-check` | A PR requires merge decision or escalation |
-| Bot PR maintenance | `bot-pr-maintainer` (via `pr-health-check`) | CI failure caused by the update itself |
-| Release pipeline observation | `release-watch` | Pipeline fails and engineer action is needed |
-
-### Default polling intervals
-
-- PR health check: every 30 minutes during working hours
-  (override per project in `.claude/CLAUDE.md`)
-- Release watch: every 5 minutes during an open release window
-  (override per project in `.claude/CLAUDE.md`)
-
-### How to configure
-
-Use the `CronCreate` tool to schedule recurring skill invocations:
-- PR health check: schedule `/pr-health-check` at the 30-minute interval.
-- Release window: schedule `/release-preparation` then `/release-watch` at the 5-minute interval.
-
-Alternatively, invoke skills manually at the polling intervals listed above.
-
-Do not schedule a full sub-agent for routine polling. Sub-agents are
-stateful and expensive to wake repeatedly — use one only when the skill's
-output indicates a decision or coordination genuinely needs isolated
-context or stronger reasoning (see Delegation Model above).
-
-### Loop safety rules
-
-- A skill woken by a loop must not trigger another loop.
-- A skill must not enter a self-repair cycle — it must report failure and exit.
-- If a repair action is needed, the skill reports it; the engineer or agent decides.
+Prefer waking narrow skills (`pr-health-check`, `bot-pr-maintainer`, `release-watch`),
+not full agents, for recurring polling. A skill woken by a loop must not trigger
+another loop or enter a self-repair cycle; it reports failure and exits. Targets,
+default intervals and scheduling are in the [claude-runtime reference](skills/engineering-runtime/references/claude-runtime.md).
 
 ---
 
