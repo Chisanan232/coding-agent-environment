@@ -462,5 +462,14 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.live.read_text(), '{"statusLine": "concurrent writer"}\n')
 
 
+class CommandDerivation(unittest.TestCase):
+    def test_command_uses_the_tilde_form_under_home_and_quotes_other_paths(self):
+        self.assertEqual(hr.command_for(hr.HOME / '.claude/hooks/disk-admission-gate.py'),
+                         'python3 ~/.claude/hooks/disk-admission-gate.py')
+        self.assertEqual(hr.command_for(hr.HOME / '.claude/hooks/disk-admission-gate.py'), hr.GATE_COMMAND)
+        self.assertEqual(hr.command_for('/opt/hooks/disk-admission-gate.py'), 'python3 /opt/hooks/disk-admission-gate.py')
+        self.assertEqual(hr.command_for('/opt/my hooks/g.py'), "python3 '/opt/my hooks/g.py'")
+
+
 if __name__ == '__main__':
     unittest.main()
