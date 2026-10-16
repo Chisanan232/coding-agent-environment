@@ -195,6 +195,27 @@ Install is the existing protected operator process, modeled on
 6. `rollback --receipt FILE` restores the settings and any previous hook file
    hash-exact.
 
+Post-install acceptance step (required): the real-session harness runs the hook
+from the checkout with a sandbox `--admission-dir`, so it proves the
+classification and decision logic (H1, H2, R1a, M1e) but **not** the installed
+file path (`~/.claude/hooks/disk-admission-gate.py`, the settings command and
+the production subprocess adapter). After `apply`, run one heavy command in a
+real Claude session and confirm the **first WARN audit line** appears in
+`gate-audit.jsonl` with the expected `tool`, `mode` and `cmd_sha12`; until that
+line exists the install is not verified. The harness's opt-in P1 case
+(`--include-production-path`) exercises the production subprocess path from the
+checkout; the adapter resolves the home directory from the account database,
+not `$HOME`, so P1 cannot be sandboxed and writes the real state file and one
+audit line.
+
+A hook argument other than a valid absolute `--admission-dir` (a typo, a
+relative or `~` path) is a configuration error: the hook still never crashes,
+but it advises loudly, records a `config-error` audit line and, in enforce,
+refuses heavy commands. `hook-rollout.py` exit codes: 2 conflicting entry, 3 hash
+mismatch, 4 symlink, 5 concurrent change, 7 unmerged, 8 reformat, 9 enforce
+mode file, 10 settings it cannot edit safely (null `hooks`, root array,
+non-UTF-8), 11 another apply running.
+
 What "verified" means at each stage: after `apply`, file and settings state
 match the pinned hashes (offline tests on fixture settings); after WARN use, the
 audit shows the hook fires on real sessions; ENFORCE is verified only for the
