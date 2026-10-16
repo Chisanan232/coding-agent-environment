@@ -126,17 +126,10 @@ iterating and the full suite before committing. Details are in
 
 ## Type Checking Policy
 
-- All public APIs must have complete type annotations.
-- All function signatures must be annotated (parameters + return type).
-- All class attributes must be annotated at the class level.
-- Do not use the language's "any" escape hatch without a code comment explaining why.
-- Suppress type errors only with the language-specific scoped suppression mechanism,
-  never suppress an entire file or block without a documented reason.
-- Type annotations must never change runtime behavior.
-- Run the configured type checker before every commit.
-
-> **Project-specific**: which type checker (mypy, pyright, tsc, etc.), config file
-> location, and language-specific annotation syntax belong in the project's `.claude/CLAUDE.md`.
+Annotate all public APIs, signatures and class attributes; justify any "any" escape
+hatch and use only scoped type suppressions. Run the configured type checker before
+every commit. Details are in
+[quality-policies](skills/feature-implementation/references/quality-policies.md).
 
 ---
 
