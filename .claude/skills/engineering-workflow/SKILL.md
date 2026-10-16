@@ -163,6 +163,8 @@ to the actual date, set an estimated Due Date, and never fabricate dates. An Epi
 or Story cascades In Progress only for items that truly started, and you close a
 ticket only when every acceptance criterion passes, with evidence.
 
+Frontend changes also need the frontend QA evidence defined in `acceptance-validation`.
+
 ## Merge, reconcile, and clean up
 
 Use **Create a merge commit**. Do not squash or rebase-merge unless a later explicit
