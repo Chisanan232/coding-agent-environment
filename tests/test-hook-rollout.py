@@ -368,6 +368,11 @@ class Fixture(unittest.TestCase):
         self.assertIn('left', text)
         self.assertEqual(self.dest.read_text(), 'operator edit')
 
+    def test_rollback_without_a_receipt_is_refused(self):
+        code, text = self.run_cli('rollback')
+        self.assertEqual(code, 2)
+        self.assertIn('--receipt', text)
+
 
 if __name__ == '__main__':
     unittest.main()
