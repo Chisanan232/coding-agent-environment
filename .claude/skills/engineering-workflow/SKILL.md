@@ -70,6 +70,10 @@ the current tracking base, and configured pre-commit hooks pass.
 Never force-push a protected, main, or release branch, or during active review.
 Force-pushing a feature branch requires explicit engineer permission.
 
+Public repositories require green CI before merge, except a qualified
+`CI_UNAVAILABLE_EXTERNAL` exception below. Private repositories require the full
+local suite to pass instead.
+
 Classify CI as `CI_UNAVAILABLE_EXTERNAL` only when evidence shows an external
 infrastructure or account condition prevented the job from running or completing.
 Record that cause and run the full local equivalent. A product, test, security, or
