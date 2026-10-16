@@ -168,6 +168,11 @@ class ClaudeMdInvariants(unittest.TestCase):
         self.assertIn("(references/project-claude-md.md)", text)
         self.assertTrue((ROOT / ".claude/skills/project-setup/references/project-claude-md.md").is_file())
 
+    def test_release_watch_skill_links_its_reference(self) -> None:
+        text = (ROOT / ".claude/skills/release-watch/SKILL.md").read_text()
+        self.assertIn("(references/release-operations.md)", text)
+        self.assertTrue((ROOT / ".claude/skills/release-watch/references/release-operations.md").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
