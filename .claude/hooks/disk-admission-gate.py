@@ -362,8 +362,7 @@ def run_adapter():
     return done.returncode, (done.stdout.strip() or done.stderr.strip())[:300]
 
 
-def decide(command, mode, runner=run_adapter, exists=os.path.exists):
-    """Return (exit code, stdout text, stderr text) for one Bash command."""
+def _decide_heavy(command, mode, runner, exists):
     verdict = classify(command)
     if not verdict['heavy']:
         return 0, '', ''
@@ -394,6 +393,53 @@ def decide(command, mode, runner=run_adapter, exists=os.path.exists):
     prefix = 'disk-admission-gate (mode %s, %s): ' % (mode, 'would block' if denied else 'advice')
     return 0, json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse',
                                                    'additionalContext': prefix + '; '.join(notes)}}), ''
+
+
+STATE_NEEDLE = 'coding-agent-environment/admission'
+REDIRECTS = {'>', '>>', '>|', '&>', '&>>'}
+WRITERS = {'tee', 'mv', 'rm', 'cp', 'ln', 'truncate', 'dd', 'chmod', 'chflags', 'install', 'touch', 'rmdir',
+           'unlink', 'rsync', 'perl', 'ruby', 'node', 'awk', 'gawk'}
+TAMPER_NOTE = ('command appears to modify the disk-admission state directory (mode file, state, snapshot or '
+               'reservations); only the operator should edit it')
+
+
+def tamper_suspect(command):
+    """Best-effort: does this command write, move or remove under the admission state directory?"""
+    if STATE_NEEDLE not in command:
+        return False
+    try:
+        simple_commands = split_commands(command)
+    except ValueError:
+        return True
+    for tokens in simple_commands:
+        _, words = _command_words(tokens)
+        if any(token in REDIRECTS for token in tokens):
+            return True
+        if not words:
+            continue
+        program = os.path.basename(words[0])
+        if program in WRITERS or program.startswith('python'):
+            return True
+        if program == 'sed' and any(w.startswith('-i') or w == '--in-place' for w in words[1:]):
+            return True
+        script = _shell_script(words)
+        if script is not None and tamper_suspect(script):
+            return True
+    return False
+
+
+def decide(command, mode, runner=run_adapter, exists=os.path.exists):
+    """Return (exit code, stdout text, stderr text) for one Bash command."""
+    if not tamper_suspect(command):
+        return _decide_heavy(command, mode, runner, exists)
+    if mode == 'enforce':
+        return DENY_EXIT, '', 'BLOCKED by disk-admission-gate (mode enforce): tamper-suspect: ' + TAMPER_NOTE
+    code, out, err = _decide_heavy(command, mode, runner, exists)
+    note = 'disk-admission-gate (mode %s, advice): tamper-suspect: %s' % (mode, TAMPER_NOTE)
+    if out:
+        extra = json.loads(out)['hookSpecificOutput']['additionalContext']
+        note += '; ' + extra
+    return code, json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'additionalContext': note}}), err
 
 
 def main(raw, stdout, stderr, mode_fn=read_mode, runner=run_adapter):
