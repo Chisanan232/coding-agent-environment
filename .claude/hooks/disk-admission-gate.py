@@ -354,6 +354,33 @@ def parse_admission_dir(argv):
     return None
 
 
+def admission_dir_config(argv):
+    """(directory or None, error or None) from the hook command line.
+
+    Any argument other than a valid absolute --admission-dir is a configuration
+    error: silently falling back to the real default directory would let a typo
+    read the real mode file while an operator believes a sandbox is in use.
+    """
+    directory, error, index = None, None, 0
+    while index < len(argv):
+        arg = argv[index]
+        value = None
+        if arg.startswith('--admission-dir='):
+            value = arg.partition('=')[2]
+        elif arg == '--admission-dir':
+            value = argv[index + 1] if index + 1 < len(argv) else ''
+            index += 1
+        else:
+            error = 'unrecognised hook argument %r' % arg
+        if value is not None:
+            if os.path.isabs(value):
+                directory = Path(value)
+            else:
+                error = '--admission-dir %r is not an absolute path' % value
+        index += 1
+    return directory, error
+
+
 def read_mode(path=None):
     """'enforce' only when the operator's mode file says exactly so; anything else is warn."""
     path = path or default_admission_dir() / 'mode'
@@ -531,7 +558,7 @@ def audit_append(directory, event, command, now=None):
         pass
 
 
-def main(raw, stdout, stderr, mode_fn=None, runner=None, admission_dir=None):
+def main(raw, stdout, stderr, mode_fn=None, runner=None, admission_dir=None, config_error=None):
     directory = admission_dir or default_admission_dir()
     custom = admission_dir is not None
     mode_fn = mode_fn or (lambda: read_mode(directory / 'mode'))
@@ -549,7 +576,23 @@ def main(raw, stdout, stderr, mode_fn=None, runner=None, admission_dir=None):
         return 0
     try:
         events = []
+        note = None
+        if config_error:
+            heavy = classify(command)['heavy']
+            note = 'disk-admission-gate configuration error: %s; using the default admission directory' % config_error
+            refuse = heavy and mode == 'enforce'
+            events.append({'classification': 'config-error', 'tool': None, 'confidence': None, 'mode': mode,
+                           'decision': 'deny' if refuse else 'warn', 'tier': None, 'free_bytes': None})
+            if refuse:
+                if AUDIT_ENABLED:
+                    audit_append(directory, events[0], command)
+                stderr.write('BLOCKED by disk-admission-gate (mode enforce): ' + note + '\n')
+                return DENY_EXIT
         code, out, err = decide(command, mode, runner, needles=needles, events=events)
+        if note:
+            extra = json.loads(out)['hookSpecificOutput']['additionalContext'] if out else None
+            out = json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse',
+                                                       'additionalContext': note + ('; ' + extra if extra else '')}})
         if AUDIT_ENABLED:
             for event in events:
                 audit_append(directory, event, command)
@@ -565,4 +608,5 @@ def main(raw, stdout, stderr, mode_fn=None, runner=None, admission_dir=None):
 
 
 if __name__ == '__main__':
-    raise SystemExit(main(sys.stdin.buffer.read(), sys.stdout, sys.stderr, admission_dir=parse_admission_dir(sys.argv[1:])))
+    _directory, _error = admission_dir_config(sys.argv[1:])
+    raise SystemExit(main(sys.stdin.buffer.read(), sys.stdout, sys.stderr, admission_dir=_directory, config_error=_error))
