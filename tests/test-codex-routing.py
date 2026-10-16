@@ -93,6 +93,21 @@ else: sys.exit(3)
         self.assertEqual(self.config.read_bytes(), original)
         self.assertFalse((self.state / 'routing-owned-state.json').exists())
 
+    def test_receipt_owned_eight_thread_install_reconciles_to_seven(self):
+        key = 'max_concurrent_threads_per_session'
+        self.write_config('model = "gpt-6-astra"\nmodel_provider = "openai"\n')
+        self.install()
+        # Reproduce a pre-SPE-108 installation: config and receipt both own 8.
+        self.config.write_text(self.config.read_text().replace(f'{key} = 7', f'{key} = 8'))
+        receipt_path = self.state / 'routing-owned-state.json'
+        receipt = json.loads(receipt_path.read_text())
+        receipt['desired']['agents.' + key] = 8
+        receipt_path.write_text(json.dumps(receipt))
+        self.install()
+        self.assertEqual(__import__('tomllib').loads(self.config.read_text())['agents'][key], 7)
+        self.assertEqual(json.loads(receipt_path.read_text())['desired']['agents.' + key], 7)
+        self.run_cli('--check')
+
     def test_unmarked_exact_roles_and_preexisting_owned_fields_require_adoption(self):
         self.write_config('[agents]\nenabled = true\nmax_concurrent_threads_per_session = 7\n')
         (self.state / 'agents').mkdir()
