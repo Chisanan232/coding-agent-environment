@@ -394,5 +394,21 @@ class Tamper(unittest.TestCase):
             self.assertEqual(self.run_gate(command, 'enforce'), (0, '', ''), command)
 
 
+class GateInputs(unittest.TestCase):
+    @staticmethod
+    def forbidden():
+        raise AssertionError('adapter must not run')
+
+    def gate_main(self, raw, mode='enforce', runner=None, tool='Bash'):
+        out, err = io.StringIO(), io.StringIO()
+        code = gate.main(raw, out, err, mode_fn=lambda: mode, runner=runner or self.forbidden)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_malformed_payloads_are_allowed_silently(self):
+        for raw in ('', 'not json', '[]', '{"tool_name": "Bash"}', '{"tool_name": "Bash", "tool_input": {"command": 5}}'):
+            self.assertEqual(self.gate_main(raw), (0, '', ''), raw)
+
+
+
 if __name__ == '__main__':
     unittest.main()
