@@ -29,21 +29,6 @@ Keep the summary at 2-4 snake_case words and 30 characters or fewer. Resolve the
 version/phase and ticket from the authoritative tracker or established local
 context; do not invent them.
 
-Use these established change types and meanings when choosing a commit GitEmoji:
-
-| Type | Gitmoji | Meaning |
-|---|---|---|
-| `feat` | ✨ | Feature |
-| `fix` | 🐛 | Bug fix |
-| `refactor` | ♻️ | Refactor |
-| `test` | ✅ | Tests |
-| `docs` | 📝 | Documentation |
-| `config` | 🔧 | Configuration |
-| `deps` | ⬆️ | Dependencies |
-| `remove` | 🗑️ | Removal |
-| `lint` | 🚨 | Lint or type repair |
-| `security` | 🔒 | Security |
-
 Create the worktree as a sibling of the main checkout. Derive its directory name
 from the branch by replacing `/` with `-`: `<repo>-<phase>-<ticket>-<summary>`.
 
@@ -53,11 +38,27 @@ Keep each commit atomic and bisectable. Put one concern and its necessary tests 
 the same commit. Use imperative summaries under 72 characters:
 
 ```
-<emoji> <scope>: <imperative summary>
+<GitEmoji> (<scope>): <imperative summary>
 ```
 
+Parentheses around the scope are required. Example:
+`✨ (model): Add property to TestModel`.
+
 The 72-character limit applies to the imperative summary, not the entire commit
-subject.
+subject. Choose the GitEmoji by the primary change:
+
+| GitEmoji | Meaning |
+|---|---|
+| ✨ | Feature |
+| 🐛 | Bug fix |
+| ♻️ | Refactor |
+| ✅ | Tests |
+| 📝 | Documentation |
+| 🔧 | Configuration |
+| ⬆️ | Dependencies |
+| 🗑️ | Removal |
+| 🚨 | Lint or type repair |
+| 🔒 | Security |
 
 Do not bypass hooks, security checks, or a genuinely failing product check. Run
 focused checks while iterating, then the repository's full relevant build, lint,

@@ -37,7 +37,7 @@ class EngineeringWorkflowContract(unittest.TestCase):
         text = WORKFLOW.read_text()
         required = [
             "<version-or-phase>/<ticket-id>/<short_summary>",
-            "<emoji> <scope>: <imperative summary>",
+            "<GitEmoji> (<scope>): <imperative summary>",
             "one concern and its necessary tests",
             "CI_UNAVAILABLE_EXTERNAL",
             "meaningful independent review",
@@ -60,12 +60,9 @@ class EngineeringWorkflowContract(unittest.TestCase):
                 self.assertIn(phrase, text)
         self.assertIn("The 60-character limit applies to the imperative summary", text)
         self.assertIn("A product, test, security, or\nquality failure is never", text)
-        for change_type in [
-            "`feat`", "`fix`", "`refactor`", "`test`", "`docs`", "`config`",
-            "`deps`", "`remove`", "`lint`", "`security`",
-        ]:
-            with self.subTest(change_type=change_type):
-                self.assertIn(change_type, text)
+        for gitmoji in ["✨", "🐛", "♻️", "✅", "📝", "🔧", "⬆️", "🗑️", "🚨", "🔒"]:
+            with self.subTest(gitmoji=gitmoji):
+                self.assertIn(f"| {gitmoji} |", text)
 
     def test_admin_exceptions_preserve_failure_and_eligibility_boundaries(self) -> None:
         text = WORKFLOW.read_text()
