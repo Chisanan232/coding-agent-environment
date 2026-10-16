@@ -244,8 +244,12 @@ class PersonalDevTrust(Fixture):
         self.assertNotIn("existing and future", env)
         self.assertIn("owned by one of the trusted GitHub owners", env)
         self.assertIn("Code from External", env)
-        self.assertIn("provenance", env)
-        self.assertIn("owned by one of the trusted GitHub owners", allow)
+        self.assertIn("Location alone never grants trust", env)
+        for third_party in ("forks of third-party projects", "submodules", "Untrusted Code Integration"):
+            self.assertIn(third_party, env)
+        self.assertIn("(see the Environment section)", allow)
+        # the owners the prose refers to must really be in the same output
+        self.assertTrue(any(e.startswith("**Trusted GitHub owners") for e in new["autoMode"]["environment"]))
 
     def test_without_dev_dirs_nothing_about_directories_is_added(self):
         new = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), ["OwnerA"])
