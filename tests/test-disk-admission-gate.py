@@ -268,6 +268,10 @@ class Compound(unittest.TestCase):
         self.assertTrue(self.heavy('watch -n 5 cargo check'))
         self.assertFalse(self.heavy('watch -n 5 df -h'))
 
+    def test_rtk_proxy_is_heavy(self):
+        self.assertTrue(self.heavy('rtk proxy cargo build'))
+        self.assertFalse(self.heavy('rtk proxy git status'))
+
 
 if __name__ == '__main__':
     unittest.main()
