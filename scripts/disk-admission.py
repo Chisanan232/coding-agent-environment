@@ -48,12 +48,13 @@ every non-zero exit, not only 77, as REFUSE; unexpected errors exit 77.
 
 import argparse
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import json
 import os
 from pathlib import Path
 import pwd
+import re
 import secrets
 import stat
 import subprocess
@@ -161,12 +162,9 @@ def state_lock(path):
         os.close(descriptor)
 
 
-def write_state(path, free_bytes, latch, now=None):
-    """Atomically replace the state file; call while holding state_lock."""
+def write_json_atomic(path, record):
+    """Atomically replace a private JSON file; call while holding state_lock."""
     _refuse_symlinks(path)
-    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    record = {'version': STATE_VERSION, 'timestamp': stamp.isoformat(timespec='seconds').replace('+00:00', 'Z'),
-              'free_bytes': free_bytes, 'tier': tier(free_bytes), 'latch': bool(latch)}
     # Random per call: a leftover from a crashed writer must never block later writes.
     temporary = path.with_name('.%s.%s.tmp' % (path.name, secrets.token_hex(8)))
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -188,6 +186,17 @@ def write_state(path, free_bytes, latch, now=None):
         except FileNotFoundError:
             pass
         raise
+
+
+def iso_utc(moment):
+    return moment.astimezone(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
+
+
+def write_state(path, free_bytes, latch, now=None):
+    """Atomically replace the state file; call while holding state_lock."""
+    record = {'version': STATE_VERSION, 'timestamp': iso_utc(now or datetime.now(timezone.utc)),
+              'free_bytes': free_bytes, 'tier': tier(free_bytes), 'latch': bool(latch)}
+    write_json_atomic(path, record)
     return record
 
 
@@ -269,12 +278,12 @@ def read_glomeris_free():
     return free
 
 
-def measure_free_bytes(glomeris=read_glomeris_free, statvfs=read_free_bytes):
-    """Smaller of the readable sources; refuses only when none is readable."""
+def measure_with_source(glomeris=read_glomeris_free, statvfs=read_free_bytes):
+    """(free bytes, source name) of the smaller readable source; VolumeError if none reads."""
     values, errors = [], []
-    for source in (glomeris, statvfs):
+    for name, source in (('glomeris', glomeris), ('statvfs', statvfs)):
         try:
-            values.append(source())
+            values.append((source(), name))
         except VolumeError as exc:
             errors.append(str(exc))
     if not values:
@@ -282,43 +291,322 @@ def measure_free_bytes(glomeris=read_glomeris_free, statvfs=read_free_bytes):
     return min(values)
 
 
+def measure_free_bytes(glomeris=read_glomeris_free, statvfs=read_free_bytes):
+    """Smaller of the readable sources; refuses only when none is readable."""
+    return measure_with_source(glomeris, statvfs)[0]
+
+
+RESERVATIONS_DIR = 'reservations'
+LABEL_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._-]{0,63}')
+DEFAULT_TTL = 4 * 3600
+MAX_TTL = 24 * 3600
+HEAVY_FLOOR = LOW_BELOW
+# One heavy lane in stable and wide until a second-lane analysis is approved.
+HEAVY_LANES = {'emergency': 0, 'low': 0, 'stable': 1, 'wide': 1}
+
+
+class ReservationError(Exception):
+    """A reservation or its owning process cannot be verified."""
+
+
+def process_token(pid):
+    """Start-time token of a live process, None when it is gone.
+
+    pid plus start time identifies one process; a reused pid has a new token.
+    """
+    try:
+        done = subprocess.run(['/bin/ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True,
+                              timeout=5, stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/bin:/usr/bin'})
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReservationError('cannot inspect process %d: %s' % (pid, exc))
+    token = done.stdout.strip()
+    if done.returncode == 0 and token:
+        return token
+    if done.returncode == 1 and not token:
+        return None
+    raise ReservationError('cannot inspect process %d: ps exit %d' % (pid, done.returncode))
+
+
+def process_owner(pid):
+    """Owning uid of a live process, None when it is gone."""
+    try:
+        done = subprocess.run(['/bin/ps', '-o', 'uid=', '-p', str(pid)], capture_output=True, text=True,
+                              timeout=5, stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/bin:/usr/bin'})
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReservationError('cannot inspect process %d: %s' % (pid, exc))
+    value = done.stdout.strip()
+    if done.returncode == 0 and value.isdigit():
+        return int(value)
+    if done.returncode == 1 and not value:
+        return None
+    raise ReservationError('cannot inspect process %d: ps exit %d' % (pid, done.returncode))
+
+
+def reservations_dir(state_path):
+    return state_path.parent / RESERVATIONS_DIR
+
+
+def write_reservation(state_path, label, nbytes, pid, token, expires):
+    """Create or replace this job's reservation file; call while holding state_lock."""
+    directory = reservations_dir(state_path)
+    _refuse_symlinks(directory / label)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    record = {'version': STATE_VERSION, 'label': label, 'bytes': nbytes, 'pid': pid,
+              'start_token': token, 'expires': iso_utc(expires)}
+    write_json_atomic(directory / (label + '.json'), record)
+    return record
+
+
+def _read_reservation(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, 'rb') as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError('not a regular file')
+        record = json.loads(handle.read(65536))
+    valid = (isinstance(record, dict) and record.get('version') == STATE_VERSION
+             and record.get('label') == path.stem and LABEL_RE.fullmatch(path.stem)
+             and type(record.get('bytes')) is int and record['bytes'] > 0
+             and type(record.get('pid')) is int and record['pid'] > 0
+             and isinstance(record.get('start_token'), str) and isinstance(record.get('expires'), str))
+    if not valid:
+        raise ValueError('wrong schema')
+    expires_at = datetime.fromisoformat(record['expires'].replace('Z', '+00:00'))
+    if expires_at.tzinfo is None:
+        # A naive time cannot be compared with now; treat it as a damaged record.
+        raise ValueError('expires has no timezone')
+    record['expires_at'] = expires_at
+    return record
+
+
+def live_reservations(state_path, now=None, token_fn=process_token):
+    """Return (live records, problems); call while holding state_lock.
+
+    A reservation whose process is gone, whose start token no longer matches
+    (pid reuse) or whose expiry passed is deleted. Only well-formed files of
+    this schema are ever deleted; anything else is reported as a problem and
+    left alone. A process that cannot be inspected stays counted (fail closed).
+    """
+    now = now or datetime.now(timezone.utc)
+    directory = reservations_dir(state_path)
+    live, problems = [], []
+    if not directory.exists():
+        return live, problems
+    _refuse_symlinks(directory / 'x')
+    for path in sorted(directory.glob('*.json')):
+        try:
+            record = _read_reservation(path)
+        except (OSError, ValueError) as exc:
+            problems.append('reservation-unreadable: %s: %s' % (path.name, exc))
+            continue
+        try:
+            current = token_fn(record['pid'])
+        except ReservationError as exc:
+            problems.append('reservation-unverifiable: %s: %s' % (path.name, exc))
+            live.append(record)
+            continue
+        if current is None or current != record['start_token'] or record['expires_at'] <= now:
+            path.unlink()
+            continue
+        live.append(record)
+    return live, problems
+
+
+REFUSED = {'admit': False, 'tier': None, 'free_bytes': None, 'latch': None, 'timestamp': None}
+
+
+def _evaluate_locked(weight, state_path, free_fn, now):
+    """The measure-decide-persist step; the caller holds state_lock."""
+    try:
+        free = free_fn()
+    except VolumeError as exc:
+        return dict(REFUSED, reason='volume-unreadable: %s' % exc)
+    try:
+        state, corrupt = read_state(state_path), None
+    except StateError as exc:
+        if exc.kind != 'state-corrupt':
+            raise
+        # Unparsable state counts as latched until it is rewritten and free space recovers.
+        state, corrupt = {'latch': True}, str(exc)
+    # Lost history cannot prove the host never fell below 20 GiB, so below
+    # 50 GiB a missing record is latched; only fresh free space releases it.
+    missing = not state and free < RELEASE_AT and corrupt is None
+    if missing:
+        state = {'latch': True}
+    admit, new_state, reason = decide(weight or 'light', free, state)
+    if missing:
+        reason = 'state-missing: %s' % reason
+    if corrupt:
+        admit, new_state = False, dict(new_state, latch=True)
+        reason = 'state-corrupt: %s; treated as latched' % corrupt
+    record = write_state(state_path, free, new_state['latch'], now)
+    return dict(admit=admit, reason=reason, tier=record['tier'], free_bytes=free,
+                latch=record['latch'], timestamp=record['timestamp'])
+
+
 def evaluate(weight, state_path, free_fn=measure_free_bytes, now=None):
     """Measure, decide and persist under one lock; weight None only refreshes state.
 
     Returns a result dict. admit is False whenever anything is untrustworthy.
     """
-    refused = {'admit': False, 'tier': None, 'free_bytes': None, 'latch': None, 'timestamp': None}
     try:
         with state_lock(state_path):
-            try:
-                free = free_fn()
-            except VolumeError as exc:
-                return dict(refused, reason='volume-unreadable: %s' % exc)
-            try:
-                state, corrupt = read_state(state_path), None
-            except StateError as exc:
-                if exc.kind != 'state-corrupt':
-                    raise
-                # Unparsable state counts as latched until it is rewritten and free space recovers.
-                state, corrupt = {'latch': True}, str(exc)
-            # Lost history cannot prove the host never fell below 20 GiB, so below
-            # 50 GiB a missing record is latched; only fresh free space releases it.
-            missing = not state and free < RELEASE_AT and corrupt is None
-            if missing:
-                state = {'latch': True}
-            admit, new_state, reason = decide(weight or 'light', free, state)
-            if missing:
-                reason = 'state-missing: %s' % reason
-            if corrupt:
-                admit, new_state = False, dict(new_state, latch=True)
-                reason = 'state-corrupt: %s; treated as latched' % corrupt
-            record = write_state(state_path, free, new_state['latch'], now)
+            return _evaluate_locked(weight, state_path, free_fn, now)
     except StateError as exc:
-        return dict(refused, reason='%s: %s' % (exc.kind, exc))
+        return dict(REFUSED, reason='%s: %s' % (exc.kind, exc))
     except OSError as exc:
-        return dict(refused, reason='state-unwritable: %s' % exc)
-    return dict(admit=admit, reason=reason, tier=record['tier'], free_bytes=free,
-                latch=record['latch'], timestamp=record['timestamp'])
+        return dict(REFUSED, reason='state-unwritable: %s' % exc)
+
+
+def _refusal(reason, **extra):
+    return dict(REFUSED, reason=reason, **extra)
+
+
+def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None,
+            token_fn=process_token, ttl=DEFAULT_TTL, owner_fn=process_owner, allow_long=False):
+    """Admit one heavy job and record its byte reservation, or refuse.
+
+    Admission needs: heavy admitted by tier and latch, a free heavy lane, and
+    free bytes minus live reservations minus this request still at or above
+    the 100 GiB floor. Everything runs under the state lock, so concurrent
+    callers cannot jointly overcommit.
+    """
+    if not (isinstance(label, str) and LABEL_RE.fullmatch(label) and type(nbytes) is int and nbytes > 0
+            and type(pid) is int and pid > 0 and type(ttl) is int and 0 < ttl <= (MAX_TTL if allow_long else DEFAULT_TTL)):
+        return _refusal('invalid-request: label, bytes, pid or ttl is out of range')
+    now = now or datetime.now(timezone.utc)
+    try:
+        with state_lock(state_path):
+            result = _evaluate_locked('heavy', state_path, free_fn, now)
+            if not result['admit']:
+                return result
+            live, problems = live_reservations(state_path, now, token_fn)
+            if problems:
+                return dict(result, admit=False, reason=problems[0])
+            token = token_fn(pid)
+            if token is None:
+                return dict(result, admit=False, reason='process-not-running: pid %d' % pid)
+            try:
+                owner = owner_fn(pid)
+            except ReservationError as exc:
+                return dict(result, admit=False, reason='process-unverifiable: %s' % exc)
+            if owner != os.getuid():
+                return dict(result, admit=False, reason='process-not-owned: pid %d is not run by this user' % pid)
+            same = [r for r in live if r['label'] == label]
+            if same and (same[0]['pid'], same[0]['start_token']) != (pid, token):
+                return dict(result, admit=False, reason='label-in-use: %s belongs to another live process' % label)
+            others = [r for r in live if r['label'] != label]
+            lanes = HEAVY_LANES[result['tier']]
+            reserved = sum(r['bytes'] for r in others)
+            if len(others) >= lanes:
+                return dict(result, admit=False, reserved_bytes=reserved,
+                            reason='lane-cap: %d of %d heavy lanes in use' % (len(others), lanes))
+            if result['free_bytes'] - reserved - nbytes < HEAVY_FLOOR:
+                return dict(result, admit=False, reserved_bytes=reserved,
+                            reason='over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
+                                result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB))
+            write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl))
+            return dict(result, reserved_bytes=reserved + nbytes,
+                        reason='reserved %.1f GiB for %s (lane %d of %d)' % (nbytes / GIB, label, len(others) + 1, lanes))
+    except StateError as exc:
+        return _refusal('%s: %s' % (exc.kind, exc))
+    except OSError as exc:
+        return _refusal('state-unwritable: %s' % exc)
+
+
+def release(label, state_path):
+    """Delete this tool's reservation file for label; a missing one is success."""
+    if not (isinstance(label, str) and LABEL_RE.fullmatch(label)):
+        return _refusal('invalid-request: bad label')
+    try:
+        with state_lock(state_path):
+            path = reservations_dir(state_path) / (label + '.json')
+            _refuse_symlinks(path)
+            if not path.exists():
+                return dict(REFUSED, admit=True, reason='no reservation named %s' % label)
+            _read_reservation(path)
+            path.unlink()
+            return dict(REFUSED, admit=True, reason='released %s' % label)
+    except StateError as exc:
+        return _refusal('%s: %s' % (exc.kind, exc))
+    except (OSError, ValueError) as exc:
+        return _refusal('reservation-unreadable: %s' % exc)
+
+
+SNAPSHOT_SCHEMA = 1
+SNAPSHOT_NAME = 'snapshot.json'
+STALE_AFTER_S = 120
+# Flip only once an installed, operator-enabled gate has been proven end to end.
+GATE_PROVEN_WIRED = False
+
+
+def snapshot_age_s(record, now=None):
+    """Seconds since the snapshot's ts; consumers must treat > 120 as stale."""
+    stamp = datetime.fromisoformat(record['ts'].replace('Z', '+00:00'))
+    return ((now or datetime.now(timezone.utc)) - stamp).total_seconds()
+
+
+def snapshot_is_fresh(record, now=None, max_age=STALE_AFTER_S):
+    """False for stale, future-dated (beyond 5s of skew) or malformed snapshots."""
+    try:
+        return -5 <= snapshot_age_s(record, now) <= max_age
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+
+
+def read_snapshot(state_path):
+    """The published snapshot; StateError when missing, unreadable or not this schema. Read-only."""
+    path = state_path.with_name(SNAPSHOT_NAME)
+    _refuse_symlinks(path)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise StateError('snapshot unreadable: %s' % exc, 'snapshot-unreadable')
+    with os.fdopen(descriptor, 'rb') as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise StateError('snapshot is not a regular file', 'snapshot-unreadable')
+        try:
+            record = json.loads(handle.read(65536))
+        except (OSError, ValueError) as exc:
+            raise StateError('snapshot unreadable: %s' % exc, 'snapshot-unreadable')
+    if not isinstance(record, dict) or record.get('schema') != SNAPSHOT_SCHEMA or not isinstance(record.get('ts'), str):
+        raise StateError('snapshot has the wrong schema', 'snapshot-unreadable')
+    return record
+
+
+def snapshot(state_path, source_fn=measure_with_source, now=None, token_fn=process_token):
+    """Refresh state and publish the host resource snapshot next to it."""
+    now = now or datetime.now(timezone.utc)
+    seen = {}
+
+    def free():
+        value, seen['source'] = source_fn()
+        return value
+
+    try:
+        with state_lock(state_path):
+            result = _evaluate_locked(None, state_path, free, now)
+            live, problems = live_reservations(state_path, now, token_fn)
+            blockers = list(problems)
+            if result['tier'] is None:
+                blockers.insert(0, result['reason'])
+            elif result['latch']:
+                blockers.insert(0, 'latched until free space reaches 50 GiB')
+            elif HEAVY_LANES[result['tier']] == 0:
+                blockers.insert(0, 'tier %s is below stable' % result['tier'])
+            lanes = 0 if result['tier'] is None or result['latch'] else HEAVY_LANES[result['tier']]
+            record = {'schema': SNAPSHOT_SCHEMA, 'ts': iso_utc(now),
+                      'free_bytes': result['free_bytes'], 'tier': result['tier'], 'latch': result['latch'],
+                      'heavy_lanes_allowed': lanes, 'active_heavy_jobs': len(live),
+                      'reserved_bytes': sum(r['bytes'] for r in live),
+                      'protection': 'wired' if GATE_PROVEN_WIRED else 'advisory-not-wired',
+                      'blockers': blockers, 'source': seen.get('source')}
+            write_json_atomic(state_path.with_name(SNAPSHOT_NAME), record)
+            return record
+    except StateError as exc:
+        return {'error': '%s: %s' % (exc.kind, exc)}
+    except OSError as exc:
+        return {'error': 'state-unwritable: %s' % exc}
 
 
 REFUSED_EXIT = 77
@@ -332,12 +620,46 @@ def build_parser():
     check.add_argument('--weight', choices=WEIGHTS, required=True)
     status = commands.add_parser('status', allow_abbrev=False, help='report the current tier and latch')
     status.add_argument('--json', action='store_true', required=True)
+    take = commands.add_parser('reserve', allow_abbrev=False, help='reserve bytes for one heavy job')
+    take.add_argument('--bytes', type=int, required=True, dest='nbytes')
+    take.add_argument('--pid', type=int, required=True)
+    take.add_argument('--label', required=True)
+    take.add_argument('--ttl-s', type=int, default=DEFAULT_TTL, dest='ttl', help='seconds, at most 4 h unless --max-hold')
+    take.add_argument('--max-hold', action='store_true', dest='allow_long', help='allow a hold of up to 24 h')
+    shot = commands.add_parser('snapshot', allow_abbrev=False, help='publish the host resource snapshot')
+    mode = shot.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--json', action='store_true', help='write and print a fresh snapshot')
+    mode.add_argument('--check-fresh', action='store_true', help='read-only: exit 0 when the snapshot is fresh, else 77')
+    shot.add_argument('--max-age', type=int, default=STALE_AFTER_S, help='seconds, 1..120; with --check-fresh only')
+    drop = commands.add_parser('release', allow_abbrev=False, help='release a reservation by label')
+    drop.add_argument('--label', required=True)
     return parser
 
 
 def main(argv=None, free_fn=measure_free_bytes, state_path=None):
     state_path = state_path or default_state_path()
     args = build_parser().parse_args(argv)
+    if args.command in ('reserve', 'release'):
+        result = (reserve(args.label, args.nbytes, args.pid, state_path, free_fn, ttl=args.ttl, allow_long=args.allow_long)
+                  if args.command == 'reserve' else release(args.label, state_path))
+        print(result['reason'])
+        return 0 if result['admit'] else REFUSED_EXIT
+    if args.command == 'snapshot' and args.check_fresh:
+        if not 0 < args.max_age <= STALE_AFTER_S:
+            # A caller may tighten the staleness rule but never relax it.
+            print('refused: --max-age must be between 1 and %d seconds' % STALE_AFTER_S)
+            return REFUSED_EXIT
+        try:
+            fresh = snapshot_is_fresh(read_snapshot(state_path), max_age=args.max_age)
+            print('snapshot fresh' if fresh else 'snapshot stale: older than %d s or dated in the future' % args.max_age)
+        except StateError as exc:
+            fresh = False
+            print('snapshot unusable: %s' % exc)
+        return 0 if fresh else REFUSED_EXIT
+    if args.command == 'snapshot':
+        record = snapshot(state_path, (lambda: (free_fn(), 'injected')) if free_fn is not measure_free_bytes else measure_with_source)
+        print(json.dumps(record, sort_keys=True))
+        return REFUSED_EXIT if 'error' in record else 0
     result = evaluate(args.weight if args.command == 'check' else None, state_path, free_fn)
     if args.command == 'status':
         keys = ('tier', 'free_bytes', 'latch', 'timestamp')

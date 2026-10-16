@@ -81,3 +81,72 @@ symlink/drift/source-pin checks, contention and idempotency. They use controlled
 subprocess fixtures and prove no real Glomeris execution. The staged exact-source
 build and CLI smoke gate supply actual executable compatibility evidence; core
 safety and fresh-host validation have separate proof boundaries.
+
+## Disk-pressure admission (SPE-109, advisory, not wired)
+
+`scripts/disk-admission.py` is a thin admission adapter over Glomeris, not a
+cleanup engine, registry or daemon: it reads free space from the pinned Glomeris
+core `status --json` (statvfs is a cross-check and fallback, the smaller reading
+wins), computes the founder tier from free bytes (Glomeris pressure levels are
+advisory input only) and answers `check --weight heavy|light`. Exit 0 admits;
+every non-zero exit, including 77 and usage errors, means refuse.
+
+**No host-wide protection exists.** Nothing calls the adapter until an operator
+installs the gate hook. Entry-point inventory:
+
+| Entry point | Status |
+|---|---|
+| `.claude/hooks/disk-admission-gate.py` (PreToolUse Bash) | Source only. Integrated: none. The operator must patch `settings.json`; real-engine behavior is not verified until then |
+| Codex, launchers (`ca-*`), installer/sync, resource-lock, Glomeris callers | Not integrated, pending later stages |
+| `make`, `just`, `npm run <script>`, `xargs`, direct binaries, a user's own `!` shell, IDE analysis (flycheck, rust-analyzer) | Unsupported blind spots the hook cannot see |
+| `$(...)` inside double quotes, aliases, variable-expanded commands | Not detected (best-effort token parsing) |
+
+State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
+0600, home from the account database, symlinked path or ancestors refused):
+
+- `state.json`: latch and last measurement. A missing file below 50 GiB counts
+  as latched; a self-contradicting or corrupt one is latched and refuses.
+- `snapshot.json` (`snapshot --json`): `schema, ts, free_bytes, tier, latch,
+  heavy_lanes_allowed, active_heavy_jobs, reserved_bytes, protection, blockers,
+  source`. A consumer computes age from `ts` and must treat age over 120 s (or a
+  future `ts`) as stale and refuse heavy work. Other sessions can call the
+  read-only `snapshot --check-fresh [--max-age N]` (exit 0 fresh; 77 stale,
+  missing or unreadable). N may only tighten the rule: values above 120 or
+  below 1 are refused with exit 77. The gate does not use the snapshot: it always asks the
+  adapter for a fresh `check`. `heavy_lanes_allowed` is 0 below 100 GiB or while
+  latched and 1 in stable and wide until a second-lane analysis is approved.
+  `protection` stays `advisory-not-wired` until the gate is proven wired.
+- `reservations/<label>.json`: `reserve --bytes N --pid P --label L` admits a
+  heavy job only if the tier and latch admit it, a lane is free, P is a live
+  process of the current user, and free bytes minus live reservations minus N
+  stay at or above 100 GiB. The hold lasts at most 4 h (`--ttl-s`), or up to 24 h
+  with an explicit `--max-hold`. A reservation records pid, process start time
+  and expiry; one whose process is gone, whose start time differs (pid reuse) or
+  that expired is ignored and deleted. A process that cannot be inspected stays
+  counted. Only well-formed files of this schema are ever deleted, and
+  `release --label L` deletes just that one. An unreadable or damaged file blocks
+  reservations and is never deleted. These are byte claims for admission only;
+  native Glomeris leases own resource claims and reaping.
+- `mode`: `warn` or `enforce`, edited only by an operator. Absent or invalid
+  means warn.
+
+### Gate hook behavior
+
+The hook is deny-only and never rewrites a command. It classifies the command
+word of each simple command (newlines and heredoc bodies handled; env prefixes,
+`cd x &&`, compound statements, `nice`/`sudo`/`timeout`/`watch`/`rtk proxy`
+wrappers and `bash -c`/`eval` looked through, the latter marked best-effort).
+In warn mode it allows and adds a context warning; in enforce mode it exits 2
+when admission refuses or cannot be evaluated. A command that cannot be parsed
+or exceeds 256 KiB is scanned for heavy tool names: enforce treats a match as
+heavy, warn only advises. The hook consults tier and latch, not reservations.
+
+**Enforce is a guardrail, not a security boundary.** The governed agent runs as
+the same user as the operator, so it can edit the mode file or the state
+directory, and software cannot prevent that. The hook flags any Bash command
+that appears to write, move or remove under the admission directory
+(redirects, tee, mv, rm, cp, `sed -i`, interpreters, `chmod`/`chflags`) as
+tamper-suspect: denied in enforce, advisory in warn. That detection is
+best-effort. Operator hardening: `chmod 0444` and `chflags uchg` on the `mode`
+file (`chflags nouchg` before an edit); leave `state.json` writable, because the
+adapter updates it.

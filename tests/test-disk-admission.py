@@ -2,6 +2,7 @@
 """Disk-pressure admission core refuses unsafe work and fails closed."""
 from importlib.util import module_from_spec, spec_from_file_location
 import io
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import stat
@@ -448,6 +449,348 @@ class Hardening(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised, mock.patch('sys.stderr', io.StringIO()):
             da.run(['check'])
         self.assertEqual(raised.exception.code, 2)
+
+
+class Reservations(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name).resolve() / 'admission/state.json'
+        self.now = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+
+    def reserve_file(self, label, pid=None, token=None, nbytes=10 * GIB, hours=1):
+        pid = pid or os.getpid()
+        token = token or da.process_token(pid)
+        with da.state_lock(self.path):
+            da.write_reservation(self.path, label, nbytes, pid, token, self.now + timedelta(hours=hours))
+        return self.path.parent / 'reservations' / (label + '.json')
+
+    def live(self):
+        with da.state_lock(self.path):
+            return da.live_reservations(self.path, self.now)
+
+    def test_live_reservation_is_counted(self):
+        file = self.reserve_file('job-a')
+        live, problems = self.live()
+        self.assertEqual([(r['label'], r['bytes']) for r in live], [('job-a', 10 * GIB)])
+        self.assertEqual(problems, [])
+        self.assertTrue(file.exists())
+        self.assertEqual(file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(file.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_dead_pid_reservation_is_pruned(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        token = da.process_token(child.pid)
+        file = self.reserve_file('job-dead', child.pid, token)
+        self.assertEqual(len(self.live()[0]), 1)
+        child.kill()
+        child.wait()
+        self.assertIsNone(da.process_token(child.pid))
+        live, problems = self.live()
+        self.assertEqual((live, problems), ([], []))
+        self.assertFalse(file.exists())
+
+    def test_pid_reuse_token_mismatch_is_pruned(self):
+        file = self.reserve_file('job-reused', token='Mon Jan  1 00:00:00 2001')
+        self.assertTrue(file.exists())
+        live, _ = self.live()
+        self.assertEqual(live, [])
+        self.assertFalse(file.exists())
+
+    def test_expired_reservation_is_pruned_and_only_own_files(self):
+        expired = self.reserve_file('job-old', hours=-1)
+        fresh = self.reserve_file('job-new')
+        foreign = expired.parent / 'notes.json'
+        foreign.write_text('{"unrelated": true}')
+        stranger = expired.parent / 'readme.txt'
+        stranger.write_text('keep')
+        live, problems = self.live()
+        self.assertEqual([r['label'] for r in live], ['job-new'])
+        self.assertFalse(expired.exists())
+        self.assertTrue(fresh.exists())
+        # Foreign files are reported or ignored, never deleted.
+        self.assertTrue(foreign.exists() and stranger.exists())
+        self.assertEqual(len(problems), 1)
+        self.assertIn('notes.json', problems[0])
+
+    def take(self, label, nbytes, free, pid=None, **extra):
+        return da.reserve(label, nbytes, pid or os.getpid(), self.path, lambda: free, now=self.now, **extra)
+
+    def test_over_capacity_reservation_refused(self):
+        refused = self.take('job-big', 60 * GIB, 150 * GIB)
+        self.assertFalse(refused['admit'])
+        self.assertIn('over-capacity', refused['reason'])
+        self.assertFalse((self.path.parent / 'reservations/job-big.json').exists())
+        # Negative control: leaving exactly the 100 GiB floor is admitted.
+        admitted = self.take('job-fits', 50 * GIB, 150 * GIB)
+        self.assertTrue(admitted['admit'], admitted)
+        self.assertEqual(admitted['reserved_bytes'], 50 * GIB)
+
+    def test_second_heavy_lane_refused_until_release(self):
+        self.assertTrue(self.take('job-one', 10 * GIB, 300 * GIB)['admit'])
+        second = self.take('job-two', 10 * GIB, 300 * GIB)
+        self.assertFalse(second['admit'])
+        self.assertIn('lane-cap', second['reason'])
+        self.assertTrue(da.release('job-one', self.path)['admit'])
+        self.assertTrue(self.take('job-two', 10 * GIB, 300 * GIB)['admit'])
+        # A host below the stable tier has no heavy lane at all.
+        self.assertIn('refused', self.take('job-low', 1 * GIB, 60 * GIB)['reason'])
+
+    def test_live_reservations_reduce_remaining_headroom(self):
+        with mock.patch.dict(da.HEAVY_LANES, {'wide': 3}):
+            self.assertTrue(self.take('job-a', 40 * GIB, 200 * GIB)['admit'])
+            self.assertTrue(self.take('job-b', 40 * GIB, 200 * GIB)['admit'])
+            third = self.take('job-c', 40 * GIB, 200 * GIB)
+        self.assertFalse(third['admit'])
+        self.assertIn('over-capacity', third['reason'])
+        self.assertEqual(third['reserved_bytes'], 80 * GIB)
+
+    def test_concurrent_reserve_serialization(self):
+        results = []
+        with mock.patch.dict(da.HEAVY_LANES, {'wide': 8}):
+            workers = [threading.Thread(target=lambda n=n: results.append(self.take('job-%d' % n, 30 * GIB, 200 * GIB)))
+                       for n in range(8)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+        self.assertEqual(len(results), 8)
+        # 200 - 3 * 30 = 110 >= 100 but a fourth would leave 80: exactly three fit.
+        self.assertEqual(sum(1 for result in results if result['admit']), 3)
+        live, problems = self.live()
+        self.assertEqual((len(live), problems), (3, []))
+        self.assertEqual(sorted(entry.name for entry in (self.path.parent / 'reservations').iterdir()),
+                         sorted(record['label'] + '.json' for record in live))
+
+    def test_label_ownership_dead_pid_and_invalid_labels(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        self.assertTrue(self.take('shared', 10 * GIB, 300 * GIB, pid=child.pid)['admit'])
+        taken = self.take('shared', 10 * GIB, 300 * GIB)
+        self.assertIn('label-in-use', taken['reason'])
+        # The owner may renew its own label.
+        self.assertTrue(self.take('shared', 20 * GIB, 300 * GIB, pid=child.pid)['admit'])
+        done = subprocess.run([sys.executable, '-c', 'pass'])
+        gone = subprocess.Popen([sys.executable, '-c', 'pass'])
+        gone.wait()
+        self.assertIn('process-not-running', self.take('ghost', 1 * GIB, 300 * GIB, pid=gone.pid)['reason'])
+        for bad in ('../escape', 'a/b', '', '.hidden', 'x' * 65):
+            result = self.take(bad, 1 * GIB, 300 * GIB)
+            self.assertIn('invalid-request', result['reason'], bad)
+            self.assertIn('invalid-request', da.release(bad, self.path)['reason'], bad)
+        self.assertFalse((self.path.parent / 'escape.json').exists())
+        self.assertEqual(da.release('missing', self.path)['reason'], 'no reservation named missing')
+
+    def test_unreadable_reservation_file_blocks_new_reservations_and_is_kept(self):
+        self.assertTrue(self.take('job-ok', 10 * GIB, 300 * GIB)['admit'])
+        self.assertTrue(da.release('job-ok', self.path)['admit'])
+        stray = self.path.parent / 'reservations/stray.json'
+        stray.write_text('not json')
+        refused = self.take('job-next', 10 * GIB, 300 * GIB)
+        self.assertFalse(refused['admit'])
+        self.assertIn('reservation-unreadable', refused['reason'])
+        self.assertEqual(stray.read_text(), 'not json')
+        # Negative control: once the operator removes it, reservations work again.
+        stray.unlink()
+        self.assertTrue(self.take('job-next', 10 * GIB, 300 * GIB)['admit'])
+
+
+
+class Snapshots(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name).resolve() / 'admission/state.json'
+        self.now = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+
+    def shot(self, free, source='glomeris'):
+        return da.snapshot(self.path, lambda: (free, source), now=self.now)
+
+    def test_snapshot_contract_and_file(self):
+        record = self.shot(250 * GIB)
+        self.assertEqual(sorted(record), sorted(['schema', 'ts', 'free_bytes', 'tier', 'latch',
+                                                 'heavy_lanes_allowed', 'active_heavy_jobs', 'reserved_bytes',
+                                                 'protection', 'blockers', 'source']))
+        self.assertEqual((record['schema'], record['ts']), (1, '2026-10-16T12:00:00Z'))
+        self.assertNotIn('age_s', json.loads((self.path.parent / 'snapshot.json').read_text()))
+        self.assertEqual((record['free_bytes'], record['tier'], record['latch']), (250 * GIB, 'wide', False))
+        self.assertEqual((record['heavy_lanes_allowed'], record['blockers'], record['source']), (1, [], 'glomeris'))
+        self.assertEqual(record['protection'], 'advisory-not-wired')
+        file = self.path.parent / 'snapshot.json'
+        self.assertEqual(json.loads(file.read_text()), record)
+        self.assertEqual(file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.shot(80 * GIB, 'statvfs')['source'], 'statvfs')
+
+    def test_snapshot_heavy_lanes_by_tier_and_latch(self):
+        self.assertEqual(self.shot(150 * GIB)['heavy_lanes_allowed'], 1)
+        self.assertEqual(self.shot(99 * GIB)['heavy_lanes_allowed'], 0)
+        self.assertEqual(self.shot(100 * GIB)['heavy_lanes_allowed'], 1)
+        wide = self.shot(500 * GIB)
+        self.assertEqual((wide['tier'], wide['heavy_lanes_allowed']), ('wide', 1))
+        # Latched: no lane, with the reason listed, even once free space reads as stable again.
+        self.shot(10 * GIB)
+        held = self.shot(40 * GIB)
+        self.assertEqual((held['latch'], held['heavy_lanes_allowed']), (True, 0))
+        self.assertIn('latched', held['blockers'][0])
+        low = self.shot(70 * GIB)
+        self.assertTrue(any('below stable' in b or 'latched' in b for b in low['blockers']))
+
+    def test_snapshot_counts_reservations_and_reports_blockers(self):
+        self.shot(300 * GIB)
+        self.assertTrue(da.reserve('job-a', 40 * GIB, os.getpid(), self.path, lambda: 300 * GIB, now=self.now)['admit'])
+        record = self.shot(300 * GIB)
+        self.assertEqual((record['active_heavy_jobs'], record['reserved_bytes']), (1, 40 * GIB))
+        # An unreadable reservation is surfaced as a blocker rather than silently ignored.
+        (self.path.parent / 'reservations/bad.json').write_text('{')
+        self.assertIn('reservation-unreadable', ' '.join(self.shot(300 * GIB)['blockers']))
+        # An unreadable volume publishes a closed snapshot instead of a stale optimistic one.
+        def broken():
+            raise da.VolumeError('gone')
+        closed = da.snapshot(self.path, broken, now=self.now)
+        self.assertEqual((closed['tier'], closed['free_bytes'], closed['heavy_lanes_allowed'], closed['source']),
+                         (None, None, 0, None))
+        self.assertIn('volume-unreadable', closed['blockers'][0])
+
+    def test_snapshot_freshness_rule(self):
+        record = self.shot(300 * GIB)
+        at = lambda seconds: self.now + timedelta(seconds=seconds)
+        self.assertTrue(da.snapshot_is_fresh(record, at(0)))
+        self.assertTrue(da.snapshot_is_fresh(record, at(120)))
+        # Negative controls: just past the limit, far in the future, and malformed.
+        self.assertFalse(da.snapshot_is_fresh(record, at(121)))
+        self.assertFalse(da.snapshot_is_fresh(record, at(-60)))
+        self.assertFalse(da.snapshot_is_fresh({'ts': 'yesterday'}, at(0)))
+        self.assertFalse(da.snapshot_is_fresh({}, at(0)))
+        self.assertEqual(da.snapshot_age_s(record, at(45)), 45)
+
+
+class FreshnessCli(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name).resolve() / 'admission/state.json'
+
+    def check(self, *extra):
+        from contextlib import redirect_stdout
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = da.main(['snapshot', '--check-fresh', *extra], free_fn=lambda: 300 * GIB, state_path=self.path)
+        return code, out.getvalue()
+
+    def publish(self, age_seconds):
+        da.snapshot(self.path, lambda: (300 * GIB, 'glomeris'),
+                    now=datetime.now(timezone.utc) - timedelta(seconds=age_seconds))
+
+    def test_fresh_snapshot_exits_0(self):
+        self.publish(10)
+        self.assertEqual(self.check()[0], 0)
+        self.assertEqual(self.check('--max-age', '60')[0], 0)
+
+    def test_stale_snapshot_exits_77(self):
+        self.publish(300)
+        code, text = self.check()
+        self.assertEqual(code, 77)
+        self.assertIn('stale', text)
+
+    def test_missing_snapshot_exits_77(self):
+        code, text = self.check()
+        self.assertEqual(code, 77)
+        self.assertIn('unusable', text)
+        self.assertFalse(self.path.parent.exists())
+
+    def test_unreadable_or_forged_snapshot_exits_77(self):
+        self.publish(10)
+        file = self.path.parent / 'snapshot.json'
+        for content in ('', '{not json', '[]', json.dumps({'schema': 2, 'ts': '2026-10-16T12:00:00Z'}),
+                        json.dumps({'schema': 1, 'ts': 'yesterday'}), json.dumps({'schema': 1})):
+            file.write_text(content)
+            self.assertEqual(self.check()[0], 77, content)
+        file.unlink()
+        os.symlink(self.path, file)
+        self.assertEqual(self.check()[0], 77)
+
+    def test_max_age_cannot_relax_the_120_second_rule(self):
+        self.publish(500)
+        for relaxed in ('99999', '121', '0', '-5'):
+            code, text = self.check('--max-age', relaxed)
+            self.assertEqual(code, 77, relaxed)
+            self.assertIn('--max-age', text)
+        self.assertEqual(self.check()[0], 77)
+        # Negative control: a fresh snapshot passes with the limit at its maximum.
+        self.publish(10)
+        self.assertEqual(self.check('--max-age', '120')[0], 0)
+
+
+class ReservationHardening(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name).resolve() / 'admission/state.json'
+        self.now = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+
+    def take(self, label, nbytes=10 * GIB, free=300 * GIB, pid=None, **extra):
+        return da.reserve(label, nbytes, pid or os.getpid(), self.path, lambda: free, now=self.now, **extra)
+
+    def test_label_with_trailing_newline_is_rejected(self):
+        for label in ('ok\n', 'ok\n\n', '\nok'):
+            self.assertIn('invalid-request', self.take(label)['reason'], repr(label))
+            self.assertIn('invalid-request', da.release(label, self.path)['reason'], repr(label))
+        self.assertTrue(self.take('ok')['admit'])
+
+    def test_garbled_or_naive_expiry_is_a_problem_not_a_crash(self):
+        self.assertTrue(self.take('job-a')['admit'])
+        self.assertTrue(da.release('job-a', self.path)['admit'])
+        directory = self.path.parent / 'reservations'
+        token = da.process_token(os.getpid())
+        base = {'version': 1, 'label': 'job-x', 'bytes': GIB, 'pid': os.getpid(), 'start_token': token}
+        for expires in ('2026-10-16T12:00:00', 'soon', '', '2026-13-45T99:00:00Z'):
+            (directory / 'job-x.json').write_text(json.dumps(dict(base, expires=expires)))
+            with da.state_lock(self.path):
+                live, problems = da.live_reservations(self.path, self.now)
+            self.assertEqual(live, [], expires)
+            self.assertIn('reservation-unreadable', ' '.join(problems), expires)
+            refused = self.take('job-y')
+            self.assertFalse(refused['admit'], expires)
+            self.assertIn('reservation-unreadable', refused['reason'])
+        self.assertTrue((directory / 'job-x.json').exists())
+
+    def test_reserving_for_pid_1_or_another_users_process_is_refused(self):
+        refused = self.take('job-init', pid=1)
+        self.assertFalse(refused['admit'])
+        self.assertIn('process-not-owned', refused['reason'])
+        self.assertFalse((self.path.parent / 'reservations/job-init.json').exists())
+        # The owner check is what refuses: a stubbed foreign owner for a live pid is refused too,
+        # and the same pid is admitted when it is the current user's.
+        other = self.take('job-foreign', owner_fn=lambda pid: os.getuid() + 1)
+        self.assertIn('process-not-owned', other['reason'])
+        self.assertTrue(self.take('job-mine')['admit'])
+
+    def test_hold_longer_than_4_hours_needs_max_hold_and_is_capped_at_24(self):
+        four, day = 4 * 3600, 24 * 3600
+        with mock.patch.dict(da.HEAVY_LANES, {'wide': 4}):
+            self.assertTrue(self.take('job-4h', ttl=four)['admit'])
+            self.assertIn('invalid-request', self.take('job-5h', ttl=four + 1)['reason'])
+            self.assertTrue(self.take('job-24h', ttl=day, allow_long=True)['admit'])
+        self.assertIn('invalid-request', self.take('job-25h', ttl=day + 1, allow_long=True)['reason'])
+        record = json.loads((self.path.parent / 'reservations/job-4h.json').read_text())
+        self.assertEqual(record['expires'], '2026-10-16T16:00:00Z')
+
+    def test_reservation_whose_process_cannot_be_inspected_is_counted_conservatively(self):
+        self.assertTrue(self.take('job-a', nbytes=40 * GIB)['admit'])
+        file = self.path.parent / 'reservations/job-a.json'
+
+        def broken(pid):
+            raise da.ReservationError('ps is unavailable')
+        with da.state_lock(self.path):
+            live, problems = da.live_reservations(self.path, self.now, broken)
+        self.assertEqual([(r['label'], r['bytes']) for r in live], [('job-a', 40 * GIB)])
+        self.assertIn('reservation-unverifiable', ' '.join(problems))
+        self.assertTrue(file.exists())
+        # A snapshot taken while ps is broken still counts the job and reports a blocker.
+        record = da.snapshot(self.path, lambda: (300 * GIB, 'glomeris'), now=self.now, token_fn=broken)
+        self.assertEqual((record['active_heavy_jobs'], record['reserved_bytes']), (1, 40 * GIB))
+        self.assertIn('reservation-unverifiable', ' '.join(record['blockers']))
 
 
 if __name__ == '__main__':
