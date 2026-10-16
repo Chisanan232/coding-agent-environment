@@ -148,6 +148,9 @@ def read_state(path):
              and isinstance(record.get('timestamp'), str))
     if not valid:
         raise StateError('state has the wrong schema')
+    # A record cannot honestly show an unlatched host below the latch line.
+    if record['tier'] != tier(record['free_bytes']) or (not record['latch'] and record['free_bytes'] < EMERGENCY_BELOW):
+        raise StateError('state contradicts itself')
     return record
 
 
@@ -237,7 +240,14 @@ def evaluate(weight, state_path, free_fn=measure_free_bytes, now=None):
                     raise
                 # Unparsable state counts as latched until it is rewritten and free space recovers.
                 state, corrupt = {'latch': True}, str(exc)
+            # Lost history cannot prove the host never fell below 20 GiB, so below
+            # 50 GiB a missing record is latched; only fresh free space releases it.
+            missing = not state and free < RELEASE_AT and corrupt is None
+            if missing:
+                state = {'latch': True}
             admit, new_state, reason = decide(weight or 'light', free, state)
+            if missing:
+                reason = 'state-missing: %s' % reason
             if corrupt:
                 admit, new_state = False, dict(new_state, latch=True)
                 reason = 'state-corrupt: %s; treated as latched' % corrupt
