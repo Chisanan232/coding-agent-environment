@@ -236,12 +236,52 @@ def apply(args):
     return 0
 
 
+def verify(args):
+    live_p, dest = Path(args.live), Path(args.hook_dest)
+    problems = []
+    live = json.loads(live_p.read_text())
+    found = gate_entries(live)
+    if len(found) != 1:
+        problems.append('expected the gate hook exactly once in settings, found %d' % len(found))
+    elif gate_state(live) != 'installed':
+        problems.append('the gate entry is not the canonical PreToolUse Bash group')
+    expected = args.expect_hook_sha or rollout.sha(args.hook_src)
+    if redirected(dest):
+        problems.append('hook destination is redirected by a symlink')
+    elif not dest.exists():
+        problems.append('hook file %s is missing' % dest)
+    else:
+        if rollout.sha(dest) != expected:
+            problems.append('hook file hash differs from the expected hash')
+        if not os.access(dest, os.X_OK):
+            problems.append('hook file is not executable')
+    mode = mode_state(Path(args.mode_file))
+    if mode == 'invalid':
+        problems.append('mode file is invalid (it is treated as warn)')
+    if mode == 'enforce' and not args.allow_enforce:
+        problems.append('mode file says enforce but --allow-enforce was not passed')
+    deny = (live.get('permissions') or {}).get('deny') or []
+    if any(GATE_MARK in str(rule) or 'disk-admission' in str(rule) for rule in deny):
+        problems.append('a permissions.deny rule mentions the gate')
+    if args.receipt:
+        receipt = json.loads(Path(args.receipt).read_text())
+        if receipt.get('settings_backup'):
+            before = json.loads(Path(receipt['settings_backup']).read_text())
+            if live != with_gate(before):
+                problems.append('settings differ from the pre-apply backup plus the gate group (a deny or other key changed)')
+    print('mode file: %s' % mode)
+    print('\n'.join(problems) if problems else 'verify OK: gate hook present once, file hash matches, no deny added')
+    return 1 if problems else 0
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.mode == 'plan':
         return plan(args)
     if args.mode == 'apply':
         return apply(args)
+    if args.mode == 'verify':
+        return verify(args)
     print('mode %s is not available yet' % args.mode)
     return 2
 
