@@ -6,6 +6,7 @@ A clause that lives outside `.claude/CLAUDE.md` must be named by `reach` text th
 appears in `.claude/CLAUDE.md`, so the always-loaded file still routes to it.
 Moving a clause means updating its `file` (and `reach`) in the same commit.
 """
+import re
 import unittest
 from pathlib import Path
 
@@ -105,6 +106,14 @@ class ClaudeMdInvariants(unittest.TestCase):
             with self.subTest(clause=clause_id):
                 self.assertTrue(reach, "clause outside CLAUDE.md needs a reach pointer")
                 self.assertIn(reach, claude)
+
+    def test_every_relative_link_in_claude_md_resolves(self) -> None:
+        text = (ROOT / CLAUDE).read_text()
+        links = re.findall(r"\]\((?!https?:|#)([^)#]+)", text)
+        self.assertGreater(len(links), 5)
+        for link in links:
+            with self.subTest(link=link):
+                self.assertTrue(((ROOT / ".claude") / link).is_file())
 
 
 if __name__ == "__main__":
