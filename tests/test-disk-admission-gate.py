@@ -540,6 +540,12 @@ class AuditTrail(unittest.TestCase):
         self.assertEqual((entry['tier'], entry['free_bytes']), ('low', 38512345678))
         self.assertRegex(entry['ts'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
 
+    def test_benign_commands_write_no_audit_line(self):
+        for command in ('git status', 'echo cargo build', 'cargo --version', 'ls -la', 'cat Cargo.toml'):
+            self.run_gate(command)
+        self.assertEqual(self.lines(), [])
+        self.assertFalse(self.log.exists())
+
 
 if __name__ == '__main__':
     unittest.main()
