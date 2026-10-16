@@ -216,6 +216,17 @@ mismatch, 4 symlink, 5 concurrent change, 7 unmerged, 8 reformat, 9 enforce
 mode file, 10 settings it cannot edit safely (null `hooks`, root array,
 non-UTF-8), 11 another apply running.
 
+`--hook-dest` must be a normalised absolute path ending in
+`disk-admission-gate.py` (exit 12 otherwise, nothing written): a relative path
+would make Claude Code run repository-controlled code from each session's working
+directory, and a `~` path would create a literal `~` directory.
+
+Residual race: `apply` and `rollback` re-compare the live settings immediately
+before the rename, but no lock that other writers honour exists, so a
+microsecond lost-update window remains between that final compare and the rename.
+Mitigation: apply only when no session is rewriting settings, and run `verify`
+afterwards.
+
 What "verified" means at each stage: after `apply`, file and settings state
 match the pinned hashes (offline tests on fixture settings); after WARN use, the
 audit shows the hook fires on real sessions; ENFORCE is verified only for the
