@@ -4,7 +4,7 @@
 #
 # Defaults to reporting all tracked surfaces. --codex checks only managed
 # signal-first Codex state. Applying is owned by profile-install.sh --global.
-# Usage: ./scripts/sync-check.sh [--codex | --capabilities | --resource-policy | --full-parity]
+# Usage: ./scripts/sync-check.sh [--claude-clauses | --codex | --capabilities | --resource-policy | --full-parity]
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,6 +15,8 @@ if [[ "${1:-}" == "--statusline" && "$#" == 1 ]]; then
     exec "${CODING_AGENT_STATUSLINE_PYTHON:-python3}" "$REPO_ROOT/scripts/statusline-install.py" --home "$SYNC_HOME" --check
 elif [[ "${1:-}" == "--launchers" && "$#" == 1 ]]; then
     exec "${CODING_AGENT_STATUSLINE_PYTHON:-python3}" "$REPO_ROOT/scripts/launcher-install.py" --home "$SYNC_HOME" --check
+elif [[ "${1:-}" == "--claude-clauses" && "$#" == 1 ]]; then
+    exec python3 "$REPO_ROOT/scripts/claude-clause-drift.py" --home "$SYNC_HOME"
 elif [[ "${1:-}" == "--storage" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --storage --check
 elif [[ "${1:-}" == "--resource-policy" && "$#" == 1 ]]; then
