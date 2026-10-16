@@ -493,6 +493,10 @@ class Fixture(unittest.TestCase):
         self.refuses_dest('hooks/disk-admission-gate.py')
         self.refuses_dest('./disk-admission-gate.py')
 
+    def test_a_tilde_hook_destination_is_refused_without_creating_a_directory(self):
+        self.refuses_dest('~/x/disk-admission-gate.py')
+        self.assertFalse(Path('~').exists() and (Path('~') / 'x').exists())
+
 
 class CommandDerivation(unittest.TestCase):
     def test_command_uses_the_tilde_form_under_home_and_quotes_other_paths(self):
