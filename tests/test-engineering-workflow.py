@@ -175,10 +175,9 @@ class EngineeringWorkflowContract(unittest.TestCase):
     def test_codex_policy_routes_lifecycle_to_exact_shared_source(self) -> None:
         policy = (ROOT / "codex/AGENTS.md").read_text()
         self.assertIn("Use $engineering-workflow for the engineering lifecycle", policy)
-        self.assertIn(
-            "[<ticket-number>] <emoji> <scope>: <imperative summary under 60 chars>",
-            policy,
-        )
+        self.assertIn("alone defines the commit, branch, worktree and pull-request formats", " ".join(policy.split()))
+        self.assertNotIn("<emoji> <scope>:", policy)
+        self.assertNotIn("<ticket-number>", policy)
 
     def test_ci_tracks_both_policy_adapters_and_contract_tests(self) -> None:
         workflow = (ROOT / ".github/workflows/capability-validation.yml").read_text()

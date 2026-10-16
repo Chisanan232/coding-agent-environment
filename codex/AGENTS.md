@@ -46,8 +46,8 @@ EXISTING artifact audits. Never reopen already-approved work through these skill
 
 Use $engineering-workflow for the engineering lifecycle: branch and worktree,
 commits, validation, review, pull request, merge, Jira reconciliation, and cleanup.
-Pull-request titles use
-`[<ticket-number>] <emoji> <scope>: <imperative summary under 60 chars>`.
+It alone defines the commit, branch, worktree and pull-request formats; do not
+restate them here.
 
 The shared engineering-workflow contract alone owns the two narrowly authorized
 administrator-merge exceptions: qualified `CI_UNAVAILABLE_EXTERNAL` and verified
