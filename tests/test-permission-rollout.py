@@ -225,6 +225,32 @@ class PersonalDevTrust(Fixture):
             self.assertIn(rule, new["permissions"]["ask"])
         self.assertEqual([], rollout.problems(new))
 
+    def test_dev_dirs_without_any_trusted_owner_is_refused(self):
+        # The dev-trust prose refers to the trusted owners; it must never dangle.
+        with self.assertRaises(ValueError):
+            rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [], ["~/dev"])
+
+    def test_dev_dirs_reuse_existing_owner_lines_when_owners_flag_is_omitted(self):
+        with_owner = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), ["OwnerA"])
+        again = rollout.merge(copy.deepcopy(with_owner), copy.deepcopy(BASELINE), [], ["~/dev"])
+        self.assertTrue(any(e.startswith("**Personal development machine") for e in again["autoMode"]["environment"]))
+
+    def test_dev_trust_is_bound_to_owner_provenance_not_location(self):
+        # A clone from another owner dropped into the dev directory must not
+        # inherit trust from its location (auto-mode critique, SPE-106).
+        new = self.merged_dev()
+        env = "\n".join(e for e in new["autoMode"]["environment"] if e.startswith("**Personal development machine"))
+        allow = "\n".join(e for e in new["autoMode"]["allow"] if e.startswith("**Cross-repository"))
+        self.assertNotIn("existing and future", env)
+        self.assertIn("owned by one of the trusted GitHub owners", env)
+        self.assertIn("Code from External", env)
+        self.assertIn("Location alone never grants trust", env)
+        for third_party in ("forks of third-party projects", "submodules", "Untrusted Code Integration"):
+            self.assertIn(third_party, env)
+        self.assertIn("(see the Environment section)", allow)
+        # the owners the prose refers to must really be in the same output
+        self.assertTrue(any(e.startswith("**Trusted GitHub owners") for e in new["autoMode"]["environment"]))
+
     def test_without_dev_dirs_nothing_about_directories_is_added(self):
         new = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), ["OwnerA"])
         self.assertNotIn("additionalDirectories", new["permissions"])
@@ -356,6 +382,13 @@ class CommandModes(Fixture):
         self.assertEqual(before, self.live_p.read_bytes())
         self.assertIn("permissions.deny: 8 -> 0", out)
         self.assertFalse((self.home / ".claude/backups").exists())
+
+    def test_dev_dirs_without_owner_lines_exits_6_with_refusal(self):
+        dev = self.home / "dev"
+        dev.mkdir()
+        rc, out = self.run_tool("plan", "--baseline", str(self.base_p), "--live", str(self.live_p), "--dev-dirs", str(dev), "--unmerged-ok")
+        self.assertEqual(6, rc, out)
+        self.assertIn("REFUSING", out)
 
     def test_apply_refuses_without_both_hashes(self):
         before = self.live_p.read_bytes()

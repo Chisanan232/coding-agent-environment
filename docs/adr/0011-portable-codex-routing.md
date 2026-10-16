@@ -21,7 +21,7 @@ authentication, plugin, MCP, trust, or other workstation state.
 - Keep the workstation root model and default delegate live-only. Role
   selection carries no additional tool, approval, or sandbox authority.
 - Reconcile only `agents.enabled`,
-  `agents.max_concurrent_threads_per_session = 8`, and the named role
+  `agents.max_concurrent_threads_per_session = 7`, and the named role
   description/config-file references. Preserve all unowned configuration.
 - Validate against the installed Codex catalog and strict native config
   parser before mutation. Nonstandard providers require a machine-local,
@@ -29,7 +29,7 @@ authentication, plugin, MCP, trust, or other workstation state.
 - Use `ca-codex` to check an installed receipt's effective provider/profile
   binding before launch. Plain `codex` bypasses the wrapper and requires an
   explicit routing check after relevant configuration changes.
-- Treat eight as a concurrency ceiling. Delegate only independent work with a
+- Treat seven as a concurrency ceiling. Delegate only independent work with a
   concrete benefit, keep ownership disjoint, and never use routing to upgrade
   authority.
 - Record partial multi-file failures as incomplete through a journal; do not

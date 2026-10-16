@@ -180,6 +180,11 @@ to report `effective_complete: true`, then send `{"op":"release"}`. Keep the ter
 removing it would lose idempotency evidence. Release on an unresolved refusal
 and retain the partial record rather than marking the workflow complete.
 
+Check free disk space (for example `df -h /System/Volumes/Data` on macOS) at the
+start of closeout and report the cleanup status: which owned worktrees, branches
+and artifacts were removed, which remain and why, and the free space before and
+after. Reclaiming storage is not implemented here; SPE-109 owns the reclaimer.
+
 Storage candidates go through the established Glomeris CLI/policy/executor,
 never raw recursive deletion. Post-merge success does not grant cache authority.
 See `engineering-runtime` for shared storage integration and diagnostics.

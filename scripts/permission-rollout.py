@@ -255,6 +255,10 @@ def _bad_dir(d):
 
 def merge(live, base, owners, dev_dirs=()):
     new = copy.deepcopy(live)
+    has_owner_lines = any(e.startswith("**Trusted GitHub owners") for e in new.get("autoMode", {}).get("environment", []))
+    if dev_dirs and not owners and not has_owner_lines:
+        # The dev-trust prose is conditional on trusted owners; without any it would dangle.
+        raise ValueError("--dev-dirs needs trusted owners: pass --owners or keep existing owner lines")
     perm = new.setdefault("permissions", {})
     for k in ("allow", "ask", "deny"):
         perm.setdefault(k, [])
@@ -411,7 +415,11 @@ def main(argv=None):
     live_sha, base_sha = hashlib.sha256(raw_bytes).hexdigest(), hashlib.sha256(base_bytes).hexdigest()
     base = json.loads(base_bytes)
     live = json.loads(raw)
-    new = merge(live, base, owners, dev_dirs)
+    try:
+        new = merge(live, base, owners, dev_dirs)
+    except ValueError as exc:
+        print(f"REFUSING: {exc}")
+        return 6
     bad = problems(new, base)
     print(f"live     sha256 {live_sha}\nbaseline sha256 {base_sha}")
     print("\n".join(summary(live, new)))

@@ -46,8 +46,8 @@ EXISTING artifact audits. Never reopen already-approved work through these skill
 
 Use $engineering-workflow for the engineering lifecycle: branch and worktree,
 commits, validation, review, pull request, merge, Jira reconciliation, and cleanup.
-Pull-request titles use
-`[<ticket-number>] <emoji> <scope>: <imperative summary under 60 chars>`.
+It alone defines the commit, branch, worktree and pull-request formats; do not
+restate them here.
 
 The shared engineering-workflow contract alone owns the two narrowly authorized
 administrator-merge exceptions: qualified `CI_UNAVAILABLE_EXTERNAL` and verified
@@ -109,9 +109,9 @@ Use named `architect` for consequential architecture/security/cross-repository
 ambiguity, `implementer` for bounded work after contracts stabilize, and
 `reviewer` for an independent final semantic/security/architecture gate.
 The orchestrator owns integration and routine work; escalate contradictions.
-Delegate independent work when it improves time to correct completion. Eight
-concurrent subagents is a ceiling, never a target: choose 1..8 from dependencies,
-token cost, expected speedup, mutable-state overlap and integration overhead.
+Delegate independent work when it improves time to correct completion; the
+`engineering-workflow` Delegation section owns the subagent maximum and scope
+ownership.
 Partition mutable file/state ownership; parallelize independent read-only work.
 Use targeted child context, and verify recorded model/reasoning after changes.
 Role selection never grants extra sandbox, approval or production authority.
