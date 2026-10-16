@@ -8,7 +8,13 @@ The user's live hooks (for example `rtk hook claude`) stay active, which is the
 point of case R1. Evidence per case: the model's one-word answer, a marker file
 the command creates only if it really ran, and the sandbox audit lines.
 
-Usage: gate-acceptance.py WORKDIR [--cases H1,H2,...]
+Usage: gate-acceptance.py WORKDIR [--cases H1,H2,...] [--include-production-path]
+
+WORKDIR must be new or a directory this script created earlier (it holds a sentinel file);
+nothing else is ever deleted. P1 (--include-production-path) runs the hook WITHOUT
+--admission-dir, through the production subprocess adapter. The adapter resolves the home
+directory from the account database, not $HOME, so P1 cannot be sandboxed: it writes the real
+state file and one audit line in the real default admission directory (read-only otherwise).
 The admitted path (free space >= 100 GiB) is reported NOT_YET_VERIFIABLE while
 the host is below 100 GiB; it is never faked.
 """
@@ -39,7 +45,7 @@ adapter = load('adapter', 'scripts/disk-admission.py')
 
 
 SENTINEL = '.gate-acceptance-workdir'
-OWNED_CHILDREN = ('sandbox-admission', 'fx', 'extra-settings.json', 'result.json')
+OWNED_CHILDREN = ('sandbox-admission', 'fx', 'extra-settings.json', 'extra-settings-prod.json', 'result.json')
 
 
 class RefusedWorkdir(Exception):
@@ -101,23 +107,25 @@ class Harness:
         self.settings.write_text(json.dumps({'hooks': {'PreToolUse': [
             {'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': command}]}]}}, indent=2))
 
-    def audit(self):
-        path = self.sandbox / 'gate-audit.jsonl'
+    def audit(self, directory=None):
+        path = (directory or self.sandbox) / 'gate-audit.jsonl'
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
-    def session(self, command, mode, marker):
-        (self.sandbox / 'mode').write_text(mode + '\n')
-        (self.sandbox / 'gate-audit.jsonl').unlink(missing_ok=True)
+    def session(self, command, mode, marker, settings=None, audit_dir=None):
+        audit_dir = audit_dir or self.sandbox
+        if mode is not None:
+            (self.sandbox / 'mode').write_text(mode + '\n')
+            (self.sandbox / 'gate-audit.jsonl').unlink(missing_ok=True)
         (self.fixture / marker).unlink(missing_ok=True)
         try:
-            done = subprocess.run(['claude', '-p', '--no-session-persistence', '--settings', str(self.settings),
+            done = subprocess.run(['claude', '-p', '--no-session-persistence', '--settings', str(settings or self.settings),
                                    '--permission-mode', 'auto', prompt(command)], cwd=self.fixture,
                                   capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
             out = done.stdout
         except subprocess.TimeoutExpired:
             out = 'TIMEOUT'
         word = next((w for w in ('EXECUTED', 'BLOCKED') if w in out[:120]), '?')
-        return {'answer': word, 'ran': (self.fixture / marker).exists(), 'audit': self.audit(), 'reply': out[:200]}
+        return {'answer': word, 'ran': (self.fixture / marker).exists(), 'audit': self.audit(audit_dir), 'reply': out[:200]}
 
     def case(self, label, command, mode, check):
         marker = 'ran-' + label
@@ -134,6 +142,28 @@ class Harness:
         self.results.append({'case': label, 'mode': mode, 'command': command, 'status': 'PASS' if ok else 'FAIL',
                              'why': why, 'sha_match': sha_ok if evidence['audit'] else None, 'answer': evidence['answer'], 'command_ran': evidence['ran'],
                              'audit': [(e['classification'], e['tool'], e['decision'], e['tier']) for e in evidence['audit']]})
+
+    def production_case(self):
+        """P1: hook without --admission-dir, so the production subprocess adapter and default directory are used."""
+        real = gate.default_admission_dir()
+        prod = self.work / 'extra-settings-prod.json'
+        command = 'python3 %s' % (ROOT / '.claude/hooks/disk-admission-gate.py')
+        prod.write_text(json.dumps({'hooks': {'PreToolUse': [
+            {'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': command}]}]}}, indent=2))
+        before = self.audit(real)
+        mode = gate.read_mode(real / 'mode')
+        shell = 'cargo build --help ; touch ran-P1'
+        evidence = self.session(shell, None, 'ran-P1', settings=prod, audit_dir=real)
+        new = evidence['audit'][len(before):]
+        expected = hashlib.sha256(shell.encode()).hexdigest()[:12]
+        decision = 'deny' if mode == 'enforce' else 'warn'
+        ok = (len(new) == 1 and new[0]['decision'] == decision and new[0]['tool'] == 'cargo'
+              and new[0]['cmd_sha12'] == expected and evidence['ran'] == (mode != 'enforce'))
+        self.results.append({'case': 'P1-production-path', 'mode': mode, 'status': 'PASS' if ok else 'FAIL',
+                             'why': 'real default dir %s; hook run from the checkout, not ~/.claude/hooks; one new audit line %s'
+                                    % (real, new[0]['cmd_sha12'] if new else 'MISSING'),
+                             'command_ran': evidence['ran'], 'answer': evidence['answer'],
+                             'audit': [(e['classification'], e['tool'], e['decision'], e['tier']) for e in new]})
 
     def not_verifiable(self, label, reason):
         self.results.append({'case': label, 'status': 'NOT_YET_VERIFIABLE', 'why': reason})
@@ -172,6 +202,9 @@ def main(argv):
             continue
         harness.case(label, command, mode, check)
         print(label, harness.results[-1]['status'], harness.results[-1].get('answer'), harness.results[-1].get('audit'), flush=True)
+    if '--include-production-path' in argv:
+        harness.production_case()
+        print('P1', harness.results[-1]['status'], harness.results[-1]['audit'], harness.results[-1]['why'], flush=True)
     live = Path.home() / '.claude/settings.json'
     rtk_active = live.exists() and 'rtk hook claude' in live.read_text()
     static_ok = gate.classify('rtk cargo build --help')['heavy'] and gate.classify('cargo build --help')['heavy']
