@@ -107,6 +107,16 @@ class Fixture(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('different disk-admission-gate entry', text)
 
+    def test_plan_reports_when_reserialising_would_change_formatting(self):
+        compact = self.live_text.replace('"allow": [\n      "Bash(git status)"\n    ]', '"allow": ["Bash(git status)"]')
+        self.assertNotEqual(compact, self.live_text)
+        self.live.write_text(compact)
+        code, text = self.run_cli('plan')
+        self.assertEqual(code, 0)
+        self.assertIn('changes its formatting', text)
+        self.live.write_text(self.live_text)
+        self.assertNotIn('changes its formatting', self.run_cli('plan')[1])
+
 
 if __name__ == '__main__':
     unittest.main()
