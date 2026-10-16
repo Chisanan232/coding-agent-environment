@@ -581,6 +581,16 @@ class AuditTrail(unittest.TestCase):
         self.run_gate('cargo build')
         self.assertEqual(victim.read_text(), 'untouched')
 
+    def test_decisions_allow_warn_and_deny_and_tamper_are_recorded(self):
+        self.run_gate('cargo build', 'warn', lambda: (0, 'heavy admitted; tier=stable free=150.0 GiB bytes=161061273600'))
+        self.run_gate('cargo build', 'warn')
+        self.run_gate('cargo build', 'enforce')
+        self.run_gate('echo warn > %s/mode' % self.dir, 'enforce')
+        decisions = [(e['classification'], e['mode'], e['decision']) for e in self.lines()]
+        self.assertEqual(decisions, [('heavy', 'warn', 'allow'), ('heavy', 'warn', 'warn'),
+                                     ('heavy', 'enforce', 'deny'), ('tamper-suspect', 'enforce', 'deny')])
+        self.assertEqual(self.lines()[0]['tier'], 'stable')
+
 
 if __name__ == '__main__':
     unittest.main()
