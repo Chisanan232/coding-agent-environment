@@ -248,6 +248,18 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.snapshot_tree(), before)
         self.assertEqual(self.apply('--allow-reformat')[0], 0)
 
+    def test_an_existing_different_hook_file_is_backed_up(self):
+        self.dest.parent.mkdir()
+        self.dest.write_text('old hook')
+        os.chmod(self.dest, 0o700)
+        self.assertEqual(self.apply()[0], 0)
+        (backup,) = [p for p in self.backups.iterdir() if p.name.startswith('disk-admission-gate.py.pre-SPE-109.')]
+        self.assertEqual(backup.read_text(), 'old hook')
+        self.assertEqual(self.dest.read_bytes(), self.src.read_bytes())
+        data = json.loads(next(p for p in self.backups.iterdir() if 'receipt' in p.name).read_text())
+        self.assertFalse(data['hook_created'])
+        self.assertEqual(data['hook_backup'], str(backup))
+
 
 if __name__ == '__main__':
     unittest.main()
