@@ -109,6 +109,8 @@ def serialise(obj, raw):
 
 
 BAD_SETTINGS_EXIT = 10
+BAD_DEST_EXIT = 12
+HOOK_NAME = 'disk-admission-gate.py'
 
 
 class SettingsError(Exception):
@@ -140,6 +142,23 @@ def load_settings(path):
             or any(not isinstance(entry, dict) for entry in group.get('hooks', [])) for group in groups):
         raise SettingsError('"hooks.PreToolUse" is not a list of hook groups')
     return raw_bytes, raw, live
+
+
+def dest_problem(value):
+    """Why --hook-dest cannot be used, else None.
+
+    The destination becomes the settings command. A relative path would run
+    repository-controlled code from each session's working directory, and a `~`
+    path would create a literal `~` directory, so only a normalised absolute
+    path to the hook file name is accepted.
+    """
+    if not isinstance(value, str) or not value.startswith('/'):
+        return '--hook-dest must be an absolute path (no ~, no relative path): %r' % (value,)
+    if os.path.normpath(value) != value or '..' in Path(value).parts:
+        return '--hook-dest must be normalised (no "..", ".", doubled or trailing slashes): %r' % value
+    if os.path.basename(value) != HOOK_NAME:
+        return '--hook-dest must end in %s: %r' % (HOOK_NAME, value)
+    return None
 
 
 def build_parser():
@@ -419,6 +438,10 @@ def rollback(args):
 def main(argv=None):
     args = build_parser().parse_args(argv)
     handlers = {'plan': plan, 'apply': apply, 'verify': verify, 'rollback': rollback}
+    problem = dest_problem(args.hook_dest) if args.mode != 'rollback' else None
+    if problem:
+        print('REFUSING: %s' % problem)
+        return BAD_DEST_EXIT
     try:
         return handlers[args.mode](args)
     except SettingsError as exc:
