@@ -191,5 +191,16 @@ class Decisions(unittest.TestCase):
             self.assertEqual(gate.run_adapter()[0], None)
 
 
+class Newlines(unittest.TestCase):
+    def heavy(self, command):
+        return gate.classify(command)['heavy']
+
+    def test_newline_chain_is_heavy(self):
+        self.assertTrue(self.heavy('echo a\ncargo build'))
+        self.assertTrue(self.heavy('ls\n\n  npm ci\n'))
+        # Negative control: the same lines without a heavy command stay light.
+        self.assertFalse(self.heavy('echo a\necho cargo build'))
+
+
 if __name__ == '__main__':
     unittest.main()
