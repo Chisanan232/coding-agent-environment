@@ -149,6 +149,14 @@ If either exception lacks its evidence, keep the normal gate pending. Fix a
 genuine failed check rather than reclassifying or bypassing it. No other approval,
 security, production, release, payment, or destructive-operation authority changes.
 
+## Jira lifecycle
+
+When Jira is the tracker: move the ticket to In Progress when work really starts,
+not earlier; post a real start comment describing what is starting; set Start Date
+to the actual date; and set an estimated Due Date; never fabricate dates. An Epic
+or Story cascades In Progress only for items that truly started, and you close a
+ticket only when every acceptance criterion passes, with evidence.
+
 ## Merge, reconcile, and clean up
 
 Use **Create a merge commit**. Do not squash or rebase-merge unless a later explicit
