@@ -107,9 +107,12 @@ class PolicyText(unittest.TestCase):
         positions = [flat_raw.index(f"{i}. {s}") for i, s in enumerate(steps, 1)]
         self.assertEqual(positions, sorted(positions))
         for phrase in ["A finished subagent task or PR is not campaign completion",
-                       "Never claim `RELEASE_READY`", "As main coordinator only, perform the merge",
+                       "Never claim `READY_FOR_RELEASE`", "As main coordinator only, perform the merge",
                        "needing its own Level 3 record or Level 2 packet", "implies no new publication or deployment authorization"]:
             self.assertIn(phrase, self.text)
+
+    def test_completion_token_is_ready_for_release_only(self) -> None:
+        self.assertNotIn("RELEASE_READY", self.text.replace("READY_FOR_RELEASE", ""))
 
     def test_active_state_is_preserved(self) -> None:
         for phrase in ["Preserve active or ambiguously owned worktrees, branches, background processes, caches and test data",
