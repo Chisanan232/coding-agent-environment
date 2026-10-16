@@ -111,6 +111,23 @@ class State(unittest.TestCase):
             with self.assertRaises(da.StateError, msg=content):
                 da.read_state(self.path)
 
+    def test_symlinked_state_path_refused(self):
+        target = Path(self.temp.name) / 'elsewhere.json'
+        target.write_text('{}')
+        self.path.parent.mkdir(parents=True)
+        self.path.symlink_to(target)
+        with self.assertRaises(da.StateError):
+            da.read_state(self.path)
+        with self.assertRaises(da.StateError):
+            self.write(10 * GIB, True)
+        self.assertEqual(target.read_text(), '{}')
+        # A redirected directory is refused as well.
+        self.path.unlink()
+        self.path.parent.rmdir()
+        self.path.parent.symlink_to(self.temp.name)
+        with self.assertRaises(da.StateError):
+            self.write(10 * GIB, True)
+
 
 if __name__ == '__main__':
     unittest.main()
