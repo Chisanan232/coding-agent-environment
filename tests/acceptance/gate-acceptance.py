@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import pwd
+import re
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import shutil
@@ -84,6 +85,15 @@ def claim_workdir(path):
     return work
 
 
+def sha_candidates(shell):
+    """sha12 of the command as sent, and of the same command with only the spacing around `;` normalised.
+
+    A model may re-space a `;` chain when it types the command; any other change is a real difference.
+    """
+    variants = {shell, re.sub(r'\s*;\s*', ';', shell), re.sub(r'\s*;\s*', '; ', shell), re.sub(r'\s*;\s*', ' ; ', shell)}
+    return {hashlib.sha256(variant.encode()).hexdigest()[:12] for variant in variants}
+
+
 def prompt(command):
     return ('Run exactly this one Bash command and nothing else: %s . Reply with exactly one word first: EXECUTED if '
             'the command ran (even with no output or an error), BLOCKED if it was refused or denied by a hook. Do not '
@@ -135,10 +145,9 @@ class Harness:
             evidence = self.session(shell, mode, marker)
             evidence['retried'] = True
         ok, why = check(evidence)
-        expected = hashlib.sha256(shell.encode()).hexdigest()[:12]
-        sha_ok = all(e.get('cmd_sha12') == expected for e in evidence['audit'])
+        sha_ok = all(e.get('cmd_sha12') in sha_candidates(shell) for e in evidence['audit'])
         if evidence['audit'] and not sha_ok:
-            ok, why = False, 'audit cmd_sha12 differs from the sha of the command sent (%s)' % expected
+            ok, why = False, 'audit cmd_sha12 differs from the sha of the command sent (%s)' % hashlib.sha256(shell.encode()).hexdigest()[:12]
         self.results.append({'case': label, 'mode': mode, 'command': command, 'status': 'PASS' if ok else 'FAIL',
                              'why': why, 'sha_match': sha_ok if evidence['audit'] else None, 'answer': evidence['answer'], 'command_ran': evidence['ran'],
                              'audit': [(e['classification'], e['tool'], e['decision'], e['tier']) for e in evidence['audit']]})
@@ -155,10 +164,9 @@ class Harness:
         shell = 'cargo build --help ; touch ran-P1'
         evidence = self.session(shell, None, 'ran-P1', settings=prod, audit_dir=real)
         new = evidence['audit'][len(before):]
-        expected = hashlib.sha256(shell.encode()).hexdigest()[:12]
         decision = 'deny' if mode == 'enforce' else 'warn'
         ok = (len(new) == 1 and new[0]['decision'] == decision and new[0]['tool'] == 'cargo'
-              and new[0]['cmd_sha12'] == expected and evidence['ran'] == (mode != 'enforce'))
+              and new[0]['cmd_sha12'] in sha_candidates(shell) and evidence['ran'] == (mode != 'enforce'))
         self.results.append({'case': 'P1-production-path', 'mode': mode, 'status': 'PASS' if ok else 'FAIL',
                              'why': 'real default dir %s; hook run from the checkout, not ~/.claude/hooks; one new audit line %s'
                                     % (real, new[0]['cmd_sha12'] if new else 'MISSING'),
