@@ -251,6 +251,14 @@ class EngineeringWorkflowContract(unittest.TestCase):
             with self.subTest(heading=heading):
                 self.assertIn(heading, text)
 
+    def test_ticket_pickup_uses_the_typeless_branch_and_worktree_format(self) -> None:
+        text = " ".join((ROOT / ".claude/skills/ticket-pickup-check/SKILL.md").read_text().split())
+        self.assertIn("<version-or-phase>/<ticket-id>/<short_summary>", text)
+        self.assertNotIn("<type>", text)
+        self.assertNotIn("[type]", text)
+        config = (ROOT / ".claude/hooks/config.env").read_text()
+        self.assertNotIn("<type>", config)
+
 
 if __name__ == "__main__":
     unittest.main()
