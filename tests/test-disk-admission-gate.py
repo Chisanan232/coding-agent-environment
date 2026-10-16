@@ -555,6 +555,22 @@ class AuditTrail(unittest.TestCase):
         import hashlib
         self.assertEqual(self.lines()[0]['cmd_sha12'], hashlib.sha256(command.encode()).hexdigest()[:12])
 
+    def test_audit_file_rotates_at_the_cap_keeping_one_backup(self):
+        with mock.patch.object(gate, 'AUDIT_MAX_BYTES', 700):
+            for _ in range(12):
+                self.run_gate('cargo build')
+        backup = Path(str(self.log) + '.1')
+        self.assertTrue(backup.exists())
+        self.assertLessEqual(self.log.stat().st_size, 700)
+        self.assertLessEqual(backup.stat().st_size, 700)
+        self.assertEqual(sorted(entry.name for entry in self.dir.iterdir() if entry.name.startswith('gate-audit')),
+                         ['gate-audit.jsonl', 'gate-audit.jsonl.1'])
+        # Negative control: below the cap nothing rotates.
+        other = self.dir.parent / 'other'
+        other.mkdir()
+        gate.audit_append(other, {'classification': 'heavy'}, 'x')
+        self.assertEqual(sorted(entry.name for entry in other.iterdir()), ['gate-audit.jsonl'])
+
 
 if __name__ == '__main__':
     unittest.main()
