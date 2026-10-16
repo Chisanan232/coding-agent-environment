@@ -277,25 +277,12 @@ table lives in the [claude-runtime reference](skills/engineering-runtime/referen
 
 ## Model Routing
 
-- Main model: Sonnet, effort medium, permission mode Auto. This is the default
-  for routine implementation, testing, fixing, tool usage, CI work, and
-  orchestration — do not switch off it for ordinary work.
-- Non-trivial architecture/design/planning (meaningful architecture, significant
-  multi-module changes, migrations, security-sensitive design, important
-  trade-offs, Jira/task decomposition, materially ambiguous requirements):
-  delegate first to the `opus-architect` subagent (`.claude/agents/opus-architect.md`,
-  Opus, high effort). It inspects, designs, and returns a distilled plan.
-  Sonnet then continues execution automatically — do not stop for approval
-  merely because planning finished.
-- Skip `opus-architect` for trivial work: typos, renames, formatting, obvious
-  small fixes, simple tests, dependency bumps, isolated straightforward edits.
-- The `advisorModel` (Opus) is available for important decisions, repeated
-  failures, security/architecture uncertainty, and final review of
-  sufficiently complex work. Use it selectively, not ritualistically on every
-  task.
-- Do not enter interactive Plan Mode solely to obtain Opus planning — that's
-  what `opus-architect` is for. Only stop and ask the user when there is a
-  genuinely necessary human decision.
+Main model: Sonnet, effort medium, permission mode Auto. Use it for routine work. For
+non-trivial architecture/design/planning, delegate first to the `opus-architect`
+subagent, then continue execution without waiting for approval; skip it for trivial
+work and do not enter Plan Mode just to get Opus planning. Use `advisorModel`
+selectively. Details are in
+[model-routing-and-delegation](skills/architecture-design/references/model-routing-and-delegation.md).
 
 ---
 
