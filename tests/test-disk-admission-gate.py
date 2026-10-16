@@ -442,5 +442,15 @@ class GateInputs(unittest.TestCase):
         self.assertTrue(text)
 
 
+class Documentation(unittest.TestCase):
+    def test_same_user_limit_and_operator_hardening_are_documented(self):
+        for relative in ('.claude/hooks/disk-admission-gate.py', 'docs/STORAGE-INTEGRATION.md'):
+            text = (ROOT / relative).read_text()
+            self.assertIn('not a security boundary', text, relative)
+            self.assertIn('chflags uchg', text, relative)
+            self.assertIn('0444', text, relative)
+        self.assertIn('--check-fresh', (ROOT / 'docs/STORAGE-INTEGRATION.md').read_text())
+
+
 if __name__ == '__main__':
     unittest.main()
