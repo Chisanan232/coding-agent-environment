@@ -403,6 +403,19 @@ class Fixture(unittest.TestCase):
         self.live.unlink()
         self.assertEqual(self.run_cli('plan')[0], 10)
 
+    def test_symlinked_backup_directory_is_refused(self):
+        elsewhere = self.root / 'elsewhere'
+        elsewhere.mkdir()
+        self.backups.parent.mkdir(exist_ok=True)
+        self.backups.symlink_to(elsewhere)
+        before = self.snapshot_tree()
+        code, text = self.apply()
+        self.assertEqual(code, 4)
+        self.assertIn('symlink', text)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(self.live.read_text(), self.live_text)
+
 
 if __name__ == '__main__':
     unittest.main()
