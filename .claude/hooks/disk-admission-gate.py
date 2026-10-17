@@ -529,6 +529,8 @@ def _redirects_ok(tokens, needles):
 def _read_only(tokens, words, needles):
     program = os.path.basename(words[0])
     arguments = words[1:]
+    if '/' in words[0] and not TRUSTED_BIN.match(words[0]):
+        return False  # a planted binary named like a read-only tool
     if not _redirects_ok(tokens, needles):
         return False
     if program == 'find':
@@ -543,8 +545,30 @@ def _read_only(tokens, words, needles):
 
 
 def _mentions(command, needles):
-    """Loose match: every path component of a needle appears, so /./, // and ../ spellings still count."""
-    return any(all(part in command for part in needle.split('/')) for needle in needles)
+    """Does the line name the state directory, its parent, or a spelling of either (/./, //, globs)?
+
+    Path-shaped on purpose: a worktree called coding-agent-environment-SPE-1 or a file called disk-admission.py
+    must not match, while rm -rf <parent>, <parent>/adm*, <parent>/./admission and coding-agent-env*/ must.
+    """
+    for needle in needles:
+        if needle in command:
+            return True
+        parent, _, child = needle.rpartition('/')
+        if not parent:
+            continue
+        # A bare directory name only counts under a dot-directory (~/.cache, ~/.claude, ~/.config): the
+        # same name is also an ordinary checkout, and `git -C .../coding-agent-environment status` is fine.
+        anchor = '' if '/' in parent else r'(?<=\.cache/)|(?<=\.claude/)|(?<=\.config/)'
+        parent_re = re.escape(parent)
+        rooted = ('(?:' + anchor + ')' if anchor else '') + parent_re
+        if re.search(rooted + r'/+(\.{1,2}/+)*(' + re.escape(child[:3]) + r'|[*?\[])', command) or \
+                re.search(rooted + r'/*(?=[\s\'"]|$)', command) or \
+                re.search(r'(?:\.cache|\.claude|\.config)/' + re.escape(parent[:12]) + r'[^\s/]*[*?\[][^\s/]*/+', command):
+            return True
+    return False
+
+
+TRUSTED_BIN = re.compile(r'\A(/bin|/usr/bin|/usr/local/bin|/opt/homebrew/bin)/[^/]+\Z')
 
 
 UNSAFE_ASSIGNMENTS = re.compile(r'\A(PATH|BASH_ENV|ENV|IFS|LD_\w+|DYLD_\w+)=')

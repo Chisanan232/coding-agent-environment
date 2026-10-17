@@ -419,7 +419,11 @@ class TamperPrecision(unittest.TestCase):
                         'cat %smode; echo done > /tmp/o' % d, 'ls %s && echo ok' % d,
                         'find %s -name "*.jsonl"' % d,
                         'jq . %sstate.json > /tmp/pretty.json' % d, 'sed s/a/b/ %smode > /tmp/o' % d,
-                        'grep -c deny %sgate-audit.jsonl' % d):
+                        'grep -c deny %sgate-audit.jsonl' % d,
+                        'python3 /Users/u/Dev/coding-agent-environment-harden-SPE-109-x/scripts/disk-admission.py status',
+                        'cd /Users/u/Dev/coding-agent-environment-harden-SPE-109-x && python3 tests/test-disk-admission-gate.py',
+                        'git -C /Users/u/Dev/coding-agent-environment-x commit -m "harden coding-agent-environment admission"',
+                        '/bin/cat %smode' % d):
             self.assertEqual(self.run_gate(command, 'enforce'), (0, '', ''), command)
 
     def test_every_write_route_is_still_tamper(self):
@@ -452,6 +456,10 @@ class TamperPrecision(unittest.TestCase):
                   'cat %smode > mode' % d, 'cat %smode > /tmp/../Users/u/x' % d,
                   'echo "$(rm -f %smode)"' % d, 'cat %smode "$(touch /tmp/x)"' % d,
                   'cat() { rm %smode; }; cat' % d, 'PATH=/tmp/evil cat %smode' % d,
+                  'rm -rf /Users/u/.cache/coding-agent-environment', 'mv /Users/u/.cache/coding-agent-environment /tmp/g',
+                  'rm -rf /Users/u/.cache/coding-agent-environment/adm*', 'rm -r /Users/u/.cache/coding-agent-env*/admission',
+                  'cd /Users/u/.cache/coding-agent-environment/ && rm -rf admission',
+                  '/tmp/cat %smode' % d, './cat %smode' % d,
                   'cd %s && echo x > mode' % d, 'cd %s; : > mode' % d, '(cd %s; rm mode)' % d,
                   'pushd %s >/dev/null && rm mode' % d, 'cd %s && python3 -c "open(\'mode\',\'w\')"' % d,
                   'bash -c "cd %s && rm mode"' % d, 'rm `echo %s`/mode' % d, 'rm $(echo %s)/mode' % d]
