@@ -51,7 +51,8 @@ restate them here.
 
 The shared engineering-workflow contract alone owns the two narrowly authorized
 administrator-merge exceptions: qualified `CI_UNAVAILABLE_EXTERNAL` and verified
-owner-only same-identity review deadlock. Apply every evidence, identity, review,
+owner-only same-identity review deadlock (owner-admin merge needs no separate human
+Approve). Apply every evidence, identity, review,
 check and merge-strategy condition there; never bypass a genuine failing gate.
 
 Apply the installed engineering skills by their actual triggers: `ticket-intake`
