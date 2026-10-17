@@ -87,22 +87,16 @@ class EngineeringWorkflowContract(unittest.TestCase):
             "external cause and local-equivalent evidence before admin merge",
             "slow or healthy running job",
             "author assertion alone\n   does not qualify",
-            "real governance/ownership check",
-            "sole genuinely eligible required reviewer",
-            "no alternative eligible independent reviewer/team",
-            "Freshly verify the owner/admin identity",
-            "independent\n   adversarial agent review must both be clean",
-            "Every genuine required check\n   must be green",
-            "separately qualified CI_UNAVAILABLE_EXTERNAL",
-            "no unresolved blocking findings or conflicts",
-            "deadlock and justification durably before admin merge",
-            "does\n   not replace an available eligible independent repository reviewer",
             "**Create a merge commit**, never squash or rebase-merge",
             "Fix a\ngenuine failed check rather than reclassifying or bypassing it",
         ]
         for phrase in required:
             with self.subTest(boundary=phrase):
                 self.assertIn(phrase, section)
+        flat = " ".join(section.split())
+        for phrase in ['owner-admin merge', 'effective admin-bypass rights', 'freshly verified', 'A separate human GitHub Approve is not required', 'zero GitHub reviews is not by itself a blocker', 'independent risk-based review', 'Every genuine required check and security gate must', 'separately qualified CI_UNAVAILABLE_EXTERNAL', 'no unresolved blocking findings, `REQUEST_CHANGES`, or conflicts', '--match-head-commit <full sha>', 'HARNESS_PERMISSION_BLOCK', 'never route around it']:
+            with self.subTest(owner_admin=phrase):
+                self.assertIn(phrase, flat)
         self.assertIn("Exactly two narrow exceptions", text)
         self.assertIn("neither grants blanket administrator authority", text)
         self.assertNotIn("Never use administrator privileges to bypass them", text)
@@ -114,7 +108,11 @@ class EngineeringWorkflowContract(unittest.TestCase):
         indexed = {case["id"]: case for case in cases}
         self.assertEqual(len(indexed), len(cases))
         self.assertEqual({case["id"] for case in cases if case["admin_merge_allowed"]},
-                         {"external-qualified", "owner-qualified", "both-qualified"})
+                         {"external-qualified", "owner-qualified", "both-qualified",
+                          "owner-alternative", "owner-external-ci-qualified"})
+        for refused in ["owner-non-owner", "owner-no-admin-permission", "owner-red-ci",
+                        "owner-requested-changes", "owner-host-refusal", "owner-new-head"]:
+            self.assertFalse(indexed[refused]["admin_merge_allowed"], refused)
         for boundary in ["product", "test", "security", "quality", "conflict", "review"]:
             for kind in ["external", "owner"]:
                 self.assertFalse(indexed[f"{kind}-{boundary}"]["admin_merge_allowed"])
