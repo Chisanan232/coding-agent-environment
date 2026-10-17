@@ -182,6 +182,25 @@ class EngineeringWorkflowContract(unittest.TestCase):
         self.assertTrue(any(c["verdict"] == "IN_PROGRESS" and c["gates"]["engineering"] for c in cases),
                         "a merged PR alone must not be READY_FOR_RELEASE")
 
+    def test_secret_safe_testing_rule_forbids_inspection_and_requires_disclosure(self) -> None:
+        flat = " ".join(WORKFLOW.read_text().split("## Secret-safe testing", 1)[1]
+                        .split("## Jira lifecycle", 1)[0].split())
+        for phrase in [
+            "may be consumed by its intended SDK or provider runtime",
+            "must never inspect, print, copy, export, serialize, hash for reporting, or reveal",
+            "Do not read credential-bearing shell startup files or configuration files (the prohibition does not depend on intent)",
+            "through stdin or a pipe, never as a command-line argument",
+            "tool or MCP call whose result is the secret value",
+            "Check presence only",
+            "Do not use environment dumps, process command lines",
+            "shell tracing or verbose authenticated HTTP logs",
+            "Keep credential handling inside the approved runtime or provider boundary",
+            "disclose the exposure plainly and recommend rotation",
+        ]:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, flat)
+        self.assertNotRegex(flat, r"(?i)(api[_-]?key|token)\s*[=:]\s*[A-Za-z0-9_\-]{16,}")
+
     def test_pull_request_title_examples_and_negative_controls(self) -> None:
         valid = [
             "[PROJ-123] ✨ (restapi): Add user authentication",
