@@ -521,7 +521,8 @@ def _redirects_ok(tokens, needles):
             target = tokens[index + 1] if index + 1 < len(tokens) else '$'
             if token in ('>&', '<&') and FD_DUP.match(target):
                 continue
-            if not SAFE_SINKS.match(target) or DYNAMIC.search(target) or os.path.normpath(target) != target:
+            if not SAFE_SINKS.match(target) or DYNAMIC.search(target) or os.path.normpath(target) != target \
+                    or _mentions(target, needles):
                 return False
     return True
 

@@ -467,6 +467,17 @@ class TamperPrecision(unittest.TestCase):
             self.assertEqual(self.run_gate(command, 'enforce')[:2], (2, ''), command)
 
 
+class ScratchStateDirectory(unittest.TestCase):
+    """A state directory that itself lives under a scratch path (the sandbox tests, CI on Linux) is still protected."""
+
+    def test_redirects_into_the_state_directory_are_tamper_even_under_scratch_paths(self):
+        for state in ('/tmp/zz-state', '/private/tmp/zz-state', '/var/folders/ab/cd/T/zz-state'):
+            needles = (state,)
+            self.assertTrue(gate.tamper_suspect('echo warn > %s/mode' % state, needles), state)
+            self.assertTrue(gate.tamper_suspect('cat /etc/hosts 2> %s/err' % state, needles), state)
+            self.assertFalse(gate.tamper_suspect('cat %s/mode > /tmp/copy' % state, needles), state)
+
+
 class GateInputs(unittest.TestCase):
     @staticmethod
     def forbidden():
