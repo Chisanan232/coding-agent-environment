@@ -631,6 +631,30 @@ def build_refresher_plist(python, script):
     }).decode()
 
 
+def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, ttl=DEFAULT_TTL, allow_long=False,
+                 exec_fn=os.execvp):
+    """Reserve for this very process, then exec the job: nothing runs before admission.
+
+    execv keeps the pid and the start time, so the reservation is held by the job itself and ends with it
+    (lazy reaping handles exit, pid reuse and TTL). A refusal never execs and returns 77; a failed exec
+    releases the reservation and returns 127.
+    """
+    if not argv or not all(isinstance(part, str) and part and '\0' not in part for part in argv):
+        print('refused: invalid-request: a command is required after --')
+        return REFUSED_EXIT
+    result = reserve(label, nbytes, os.getpid(), state_path, free_fn, ttl=ttl, allow_long=allow_long)
+    print(result['reason'], file=sys.stderr)
+    if not result['admit']:
+        return REFUSED_EXIT
+    try:
+        exec_fn(argv[0], argv)
+    except OSError as exc:
+        release(label, state_path)
+        print('exec failed: %s' % exc, file=sys.stderr)
+        return 127
+    return 0  # only reachable with an injected exec_fn
+
+
 def build_parser():
     # No free-space or state-path flags: the measurement and its record must not be forgeable from argv.
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
@@ -651,6 +675,12 @@ def build_parser():
     mode.add_argument('--check-fresh', action='store_true', help='read-only: exit 0 when the snapshot is fresh, else 77')
     shot.add_argument('--max-age', type=int, default=STALE_AFTER_S, help='seconds, 1..120; with --check-fresh only')
     commands.add_parser('refresher-plist', allow_abbrev=False, help='print the snapshot-refresher launchd agent; installs nothing')
+    go = commands.add_parser('run', allow_abbrev=False, help='reserve bytes for this process, then exec the job')
+    go.add_argument('--bytes', type=int, required=True, dest='nbytes')
+    go.add_argument('--label', required=True)
+    go.add_argument('--ttl-s', type=int, default=DEFAULT_TTL, dest='ttl', help='seconds, at most 4 h unless --max-hold')
+    go.add_argument('--max-hold', action='store_true', dest='allow_long')
+    go.add_argument('job', nargs=argparse.REMAINDER, help='-- COMMAND [ARG...]')
     drop = commands.add_parser('release', allow_abbrev=False, help='release a reservation by label')
     drop.add_argument('--label', required=True)
     return parser
@@ -662,6 +692,9 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
     if args.command == 'refresher-plist':
         print(build_refresher_plist(sys.executable, str(Path(__file__).resolve())), end='')
         return 0
+    if args.command == 'run':
+        job = args.job[1:] if args.job[:1] == ['--'] else args.job
+        return run_reserved(args.label, args.nbytes, job, state_path, free_fn, args.ttl, args.allow_long)
     if args.command in ('reserve', 'release'):
         result = (reserve(args.label, args.nbytes, args.pid, state_path, free_fn, ttl=args.ttl, allow_long=args.allow_long)
                   if args.command == 'reserve' else release(args.label, state_path))

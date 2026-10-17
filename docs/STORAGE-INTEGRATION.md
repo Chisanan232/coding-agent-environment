@@ -130,6 +130,17 @@ State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
 - `mode`: `warn` or `enforce`, edited only by an operator. Absent or invalid
   means warn.
 
+### Reserving a lane for a job (`run`)
+
+`disk-admission.py run --bytes N --label L [--ttl-s S] -- COMMAND [ARG...]` reserves for its own process and
+then `exec`s the job. `exec` keeps the pid and start time, so the reservation is held by the job itself, nothing
+runs before admission, and no release step exists: exit, pid reuse and TTL expiry are reaped lazily. A refusal
+(latched, no free lane, over capacity, bad label or bytes, TTL above 4 h without `--max-hold`) never starts the job
+and exits 77; a failed `exec` releases the reservation and exits 127. A running job past its TTL silently loses its
+reservation, and an exited job that its parent has not reaped is still counted. Reservations only coordinate
+callers that use them: the gate hook still decides on tier and latch alone, so an unwrapped heavy command can run
+beside a reserved one. This state is advisory (same-user), not a security boundary.
+
 ### Gate hook behavior
 
 The hook is deny-only and never rewrites a command. It classifies the command

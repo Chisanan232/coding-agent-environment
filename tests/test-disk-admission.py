@@ -831,5 +831,74 @@ class RefresherPlist(unittest.TestCase):
             self.assertFalse(state.parent.exists())
 
 
+class RunReserved(unittest.TestCase):
+    """`run` reserves for the process that becomes the job; nothing runs before admission."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name).resolve()
+        self.path = self.dir / 'admission/state.json'
+        self.sentinel = self.dir / 'ran'
+
+    def go(self, label='job-a', nbytes=10 * GIB, free=300 * GIB, argv=None, **options):
+        spawned = []
+        code = da.run_reserved(label, nbytes, argv if argv is not None else ['touch', str(self.sentinel)], self.path,
+                               lambda: free, exec_fn=lambda program, args: spawned.append((program, args)), **options)
+        return code, spawned
+
+    def test_admits_then_execs_with_this_process_as_the_reservation_holder(self):
+        code, spawned = self.go()
+        self.assertEqual((code, spawned), (0, [('touch', ['touch', str(self.sentinel)])]))
+        record = json.loads((self.path.parent / 'reservations/job-a.json').read_text())
+        self.assertEqual(record['pid'], os.getpid())
+
+    def test_refusals_never_exec(self):
+        for name, options in (('latched-or-low', dict(free=30 * GIB)), ('over-capacity', dict(nbytes=250 * GIB)),
+                              ('zero-bytes', dict(nbytes=0)), ('negative-bytes', dict(nbytes=-5)),
+                              ('bad-label', dict(label='../escape')), ('ttl-too-long', dict(ttl=5 * 3600)),
+                              ('empty-command', dict(argv=[]))):
+            with self.subTest(name):
+                code, spawned = self.go(**options)
+                self.assertEqual((code, spawned), (77, []))
+        self.assertFalse(self.sentinel.exists())
+
+    def test_second_job_hits_the_lane_cap_and_same_label_is_refused(self):
+        da.reserve('other-job', 10 * GIB, os.getppid(), self.path, lambda: 300 * GIB)
+        code, spawned = self.go(label='job-b')
+        self.assertEqual((code, spawned), (77, []))
+
+    def test_failed_exec_releases_and_exits_127(self):
+        def boom(program, args):
+            raise FileNotFoundError(program)
+        code = da.run_reserved('job-a', 10 * GIB, ['no-such-binary-xyz'], self.path, lambda: 300 * GIB, exec_fn=boom)
+        self.assertEqual(code, 127)
+        self.assertFalse((self.path.parent / 'reservations/job-a.json').exists())
+
+    def test_job_argv_after_the_separator_is_plain_arguments(self):
+        code, spawned = self.go(argv=['echo', '; rm -rf /', '$(id)', '--bytes', '1'])
+        self.assertEqual(spawned[0][1], ['echo', '; rm -rf /', '$(id)', '--bytes', '1'])
+
+    def test_real_exec_keeps_pid_and_token_and_the_reservation_ends_with_the_job(self):
+        script = str(ROOT / 'scripts/disk-admission.py')
+        harness = (
+            "import importlib.util,sys;from pathlib import Path;"
+            "s=importlib.util.spec_from_file_location('da',%r);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+            "sys.exit(m.main(['run','--bytes',str(10*2**30),'--label','real-job','--','python3','-c',"
+            "'import os;print(os.getpid())'],free_fn=lambda:300*2**30,state_path=Path(%r)))" % (script, str(self.path)))
+        done = subprocess.run([sys.executable, '-c', harness], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        job_pid = int(done.stdout.strip())
+        record = json.loads((self.path.parent / 'reservations/real-job.json').read_text())
+        self.assertEqual(record['pid'], job_pid)  # exec kept the pid the reservation was written for
+        shot = da.snapshot(self.path, lambda: (300 * GIB, 'injected'))
+        self.assertEqual(shot['active_heavy_jobs'], 0)  # the job has exited, so the reservation is reaped
+
+    def test_cli_requires_a_command_and_shows_in_help(self):
+        out = subprocess.run([sys.executable, str(ROOT / 'scripts/disk-admission.py'), 'run', '--help'],
+                             capture_output=True, text=True)
+        self.assertIn('--bytes', out.stdout)
+
+
 if __name__ == '__main__':
     unittest.main()
