@@ -221,6 +221,19 @@ class ClaudeMdInvariants(unittest.TestCase):
         for probe in ["Subagent cap", "PR-only delivery", "Commit format"]:
             self.assertIn(probe, text)
 
+    def test_delivery_contract_sections_sit_inside_the_installed_span(self) -> None:
+        # The installer replaces only the engineering-workflow marker span in the live file, so a section
+        # outside it is never delivered. Retiring the legacy live sections is safe only if these are inside.
+        text = (ROOT / CLAUDE).read_text()
+        start = text.index("<!-- coding-agent-environment:engineering-workflow:start -->")
+        end = text.index("<!-- coding-agent-environment:engineering-workflow:end -->")
+        span = text[start:end]
+        for heading in ["Workflow Path", "Engineering Workflow Contract", "Push Gate and Worktree Adapter",
+                        "Delegation Model", "Merge Policy", "Decision Delegation"]:
+            with self.subTest(heading=heading):
+                self.assertEqual(span.count("\n## " + heading + "\n"), 1)
+                self.assertEqual(text.count("\n## " + heading + "\n"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
