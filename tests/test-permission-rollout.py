@@ -266,6 +266,8 @@ class PersonalDevTrust(Fixture):
         self.assertIn("fetch via core.sshCommand", env)
         self.assertIn("status and diff via core.fsmonitor", env)
         self.assertIn("remain ordinary source-control work", env)
+        self.assertIn("origin URL alone never clears it", env)
+        self.assertIn("cloned themselves from a trusted owner", env)
         self.assertNotIn("<owners>", env)
         self.assertNotIn("<dev-dirs>", env)
 
