@@ -130,6 +130,29 @@ State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
 - `mode`: `warn` or `enforce`, edited only by an operator. Absent or invalid
   means warn.
 
+### Keeping the snapshot fresh (`refresher-plist`)
+
+The snapshot is stale after 120 s, so something has to republish it. `disk-admission.py refresher-plist` prints a
+launchd user agent (`com.coding-agent-environment.admission-snapshot`, every 60 s, `RunAtLoad`, no `KeepAlive`,
+output to `/dev/null` so no log can grow); it installs nothing. Operator steps, run from the **stable merged
+checkout** (never a worktree or temporary clone, and do not copy the script alone: the Glomeris reading is loaded
+from the sibling `storage-integration.py`, and without it the snapshot silently falls back to `statvfs` only):
+
+```bash
+python3 scripts/disk-admission.py refresher-plist > ~/Library/LaunchAgents/com.coding-agent-environment.admission-snapshot.plist
+plutil -lint ~/Library/LaunchAgents/com.coding-agent-environment.admission-snapshot.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.coding-agent-environment.admission-snapshot.plist
+python3 scripts/disk-admission.py snapshot --check-fresh        # exit 0 = fresh
+# rollback
+launchctl bootout gui/$(id -u)/com.coding-agent-environment.admission-snapshot && rm ~/Library/LaunchAgents/com.coding-agent-environment.admission-snapshot.plist
+```
+
+The interpreter and script paths are baked in when the plist is printed: a Homebrew Python upgrade that removes that
+interpreter, or moving the checkout, makes the agent fail without any output. Diagnose with
+`launchctl print gui/$(id -u)/com.coding-agent-environment.admission-snapshot` (last exit status) and by running
+`snapshot --json` by hand. A fresh snapshot is not permission: it may report `volume-unreadable` or zero heavy lanes,
+which consumers must read as refuse.
+
 ### Gate hook behavior
 
 The hook is deny-only and never rewrites a command. It classifies the command
