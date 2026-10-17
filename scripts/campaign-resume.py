@@ -145,6 +145,13 @@ def validate_event(event):
     return event
 
 
+def event_key(event):
+    """Content identity of an event: the same wait re-declared is the same key, a different wait is not."""
+    if event['kind'] == 'pr_merged':
+        return 'pr_merged:%s#%d' % (event['repo'], event['number'])
+    return 'not_before:%s' % event['at']
+
+
 def validate(record):
     if not isinstance(record, dict) or record.get('schema') != SCHEMA:
         raise CheckpointError('wrong schema')
@@ -184,16 +191,20 @@ def load(directory, name):
 
 def register(directory, name, session_id, cwd, events, now, max_resumes=DEFAULT_MAX_RESUMES,
              cooldown_s=DEFAULT_COOLDOWN_S, timeout_s=DEFAULT_TIMEOUT_S, admission_weight='light'):
-    """Declare a fresh wait. The spent budget, a live lease and WAITING_OPERATOR carry over; consumed events do not."""
+    """Declare a wait. The spent budget, a live lease, WAITING_OPERATOR and the consumed state of any event whose content is unchanged carry over."""
     record = {'schema': SCHEMA, 'campaign': name, 'session_id': session_id, 'cwd': cwd,
               'state': 'WAIT_DEPENDENCY', 'events': events, 'consumed': [], 'resumes_used': 0,
               'max_resumes': max_resumes, 'cooldown_s': cooldown_s, 'timeout_s': timeout_s,
               'admission_weight': admission_weight, 'last_resume_at': None, 'next_attempt_after': None,
               'lease': None, 'registered_at': iso_utc(now)}
+    if not NAME_RE.match(name):
+        raise CheckpointError('bad campaign name')
     with campaign_lock(directory, name):
         try:
             previous = load(directory, name)
             record['resumes_used'] = previous['resumes_used']
+            keys = {event_key(event) for event in events}
+            record['consumed'] = [key for key in previous['consumed'] if key in keys]
             record['last_resume_at'] = previous['last_resume_at']
             record['lease'] = previous['lease']
             record['next_attempt_after'] = previous['next_attempt_after']
@@ -289,15 +300,16 @@ def _observe(directory, name, record, clock, pr_state):
     """Evaluate events with no lock held (gh can take 20 s per event). State is monotonic, so _commit re-checks."""
     hit, unreadable = [], False
     for event in record['events']:
-        if event['id'] in record['consumed']:
+        if event_key(event) in record['consumed']:
             continue
+        key = event_key(event)
         if event['kind'] == 'pr_merged':
             state = pr_state(event['repo'], event['number'])
             unreadable = unreadable or state is None
             if state == 'MERGED':
-                hit.append(event['id'])
+                hit.append(key)
         elif clock() >= parse_utc(event['at']):
-            hit.append(event['id'])
+            hit.append(key)
     return hit, unreadable
 
 
@@ -343,8 +355,9 @@ def _commit(directory, name, hit, blocker, execute, clock):
         now = clock()
         if record['state'] in ('DONE', 'WAITING_OPERATOR') or lease_live(record['lease'], now):
             return None
-        hit = [event_id for event_id in hit if event_id not in record['consumed']
-               and any(event['id'] == event_id for event in record['events'])]
+        # Compare content, not position: a re-register during the gh call may have replaced the wait.
+        current = {event_key(event) for event in record['events']}
+        hit = [key for key in hit if key not in record['consumed'] and key in current]
         if not hit:
             return None
         if record['resumes_used'] >= record['max_resumes']:
@@ -403,12 +416,14 @@ def _finish(directory, name, clock, plan, result):
 
 
 def reset(directory, name, now):
-    """Operator action: return a WAITING_OPERATOR campaign to WAIT_DEPENDENCY with a fresh budget."""
+    """Operator action: return a campaign to WAIT_DEPENDENCY with a fresh budget and no consumed events."""
+    if not NAME_RE.match(name):
+        raise CheckpointError('bad campaign name')
     with campaign_lock(directory, name):
         record = load(directory, name)
         if lease_live(record['lease'], now):
             raise CheckpointError('a resume is still running')
-        record.update(state='WAIT_DEPENDENCY', resumes_used=0, lease=None, next_attempt_after=None)
+        record.update(state='WAIT_DEPENDENCY', resumes_used=0, consumed=[], lease=None, next_attempt_after=None)
         _save(directory, record)
         receipt(directory, now, name, 'operator_reset')
 

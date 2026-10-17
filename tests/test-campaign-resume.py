@@ -25,6 +25,8 @@ SESSION = '01234567-89ab-cdef-0123-456789abcdef'
 NOW = datetime(2026, 10, 17, 6, 0, 0, tzinfo=timezone.utc)
 PR_EVENT = {'id': 'pr0-76', 'kind': 'pr_merged', 'repo': 'Chisanan232/coding-agent-environment', 'number': 76}
 
+KEY = 'pr_merged:Chisanan232/coding-agent-environment#76'
+
 
 def make(directory, **overrides):
     options = dict(name='spe-108', session_id=SESSION, cwd='/tmp', events=[dict(PR_EVENT)], now=NOW)
@@ -60,13 +62,15 @@ class Checkpoints(unittest.TestCase):
                 make(self.dir, **overrides)
         self.assertEqual(list(self.dir.glob('*.json')), [])
 
-    def test_reregister_keeps_budget_but_declares_a_fresh_wait(self):
+    def test_reregister_keeps_budget_and_only_unchanged_consumed_events(self):
         make(self.dir)
         record = cr.load(self.dir, 'spe-108')
-        record.update(resumes_used=2, consumed=['pr0-76'], state='WAITING_OPERATOR')
+        record.update(resumes_used=2, consumed=[KEY], state='WAITING_OPERATOR')
         cr.write_json_atomic(self.dir / 'spe-108.json', record)
         again = make(self.dir, events=[dict(PR_EVENT), dict(PR_EVENT, id='pr1-77', number=77)])
-        self.assertEqual((again['resumes_used'], again['consumed'], again['state']), (2, [], 'WAITING_OPERATOR'))
+        self.assertEqual((again['resumes_used'], again['consumed'], again['state']), (2, [KEY], 'WAITING_OPERATOR'))
+        other = make(self.dir, events=[dict(PR_EVENT, number=99)])
+        self.assertEqual(other['consumed'], [])
 
     def test_load_refuses_symlink_and_garbage(self):
         make(self.dir)
@@ -153,7 +157,7 @@ class Engine(unittest.TestCase):
             self.assertNotIn(forbidden, argv)
         record = cr.load(self.dir, 'spe-108')
         self.assertEqual((record['state'], record['resumes_used'], record['consumed'], record['lease']),
-                         ('WAIT_DEPENDENCY', 1, ['pr0-76'], None))
+                         ('WAIT_DEPENDENCY', 1, [KEY], None))
         self.assertEqual(self.decisions(), ['resume_started', 'resume_finished'])
         self.assertNotIn(cr.PROMPT, (self.dir / 'receipts.jsonl').read_text())
 
@@ -185,7 +189,7 @@ class Engine(unittest.TestCase):
         dead = subprocess.Popen(['/usr/bin/true'])
         dead.wait()
         record = cr.load(self.dir, 'spe-108')
-        record.update(state='RUNNING', resumes_used=1, consumed=['pr0-76'],
+        record.update(state='RUNNING', resumes_used=1, consumed=[KEY],
                       lease={'pid': dead.pid, 'token': 'x', 'expires': cr.iso_utc(NOW + timedelta(hours=1))})
         cr.write_json_atomic(self.dir / 'spe-108.json', record)
         self.assertEqual(self.tick(), [])
@@ -196,7 +200,7 @@ class Engine(unittest.TestCase):
     def test_expired_lease_is_recovered_even_if_pid_is_alive(self):
         make(self.dir, cwd=self.tmp.name)
         record = cr.load(self.dir, 'spe-108')
-        record.update(state='RUNNING', consumed=['pr0-76'],
+        record.update(state='RUNNING', consumed=[KEY],
                       lease={'pid': os.getpid(), 'token': 'x', 'expires': cr.iso_utc(NOW - timedelta(seconds=1))})
         cr.write_json_atomic(self.dir / 'spe-108.json', record)
         self.tick()
@@ -261,9 +265,9 @@ class Engine(unittest.TestCase):
 
     def test_lifetime_budget_stops_after_max_resumes(self):
         for index in range(2):
-            make(self.dir, cwd=self.tmp.name, max_resumes=2, events=[dict(PR_EVENT, id='pr%d' % index)])
+            make(self.dir, cwd=self.tmp.name, max_resumes=2, events=[dict(PR_EVENT, id='pr%d' % index, number=100 + index)])
             self.tick(now=NOW + timedelta(days=index))
-        make(self.dir, cwd=self.tmp.name, max_resumes=2, events=[dict(PR_EVENT, id='pr9')])
+        make(self.dir, cwd=self.tmp.name, max_resumes=2, events=[dict(PR_EVENT, id='pr9', number=109)])
         self.tick(now=NOW + timedelta(days=5))
         self.assertEqual(len(self.calls), 2)
         self.assertEqual((cr.load(self.dir, 'spe-108')['state'], self.decisions()[-1]), ('WAITING_OPERATOR', 'budget_exhausted'))
@@ -419,6 +423,67 @@ class Engine(unittest.TestCase):
             cr.write_json_atomic(self.dir / 'spe-108.json', record)
             self.assertEqual(self.tick(), [])
         self.assertEqual(self.calls, [])
+
+    def test_reregistering_an_already_consumed_pr_does_not_resume_again(self):
+        make(self.dir, cwd=self.tmp.name)
+        self.tick()
+        make(self.dir, cwd=self.tmp.name)
+        self.assertEqual(self.tick(now=NOW + timedelta(days=2)), [])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_commit_compares_event_content_when_register_races_the_gh_call(self):
+        make(self.dir, cwd=self.tmp.name)
+
+        def swap_the_wait(repo, number):
+            make(self.dir, cwd=self.tmp.name, events=[dict(PR_EVENT, repo='other/repo')])
+            return 'MERGED'
+        self.assertEqual(self.tick(pr_state=swap_the_wait), [])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(cr.load(self.dir, 'spe-108')['resumes_used'], 0)
+
+    def test_invalid_name_never_touches_the_filesystem_outside_the_state_dir(self):
+        for call in (lambda: make(self.dir, name='../x'), lambda: cr.reset(self.dir, '../x', NOW)):
+            with self.assertRaises(cr.CheckpointError):
+                call()
+        self.assertFalse((self.dir.parent / 'x.lock').exists())
+
+    def test_reset_refuses_while_a_resume_is_running(self):
+        make(self.dir, cwd=self.tmp.name)
+        record = cr.load(self.dir, 'spe-108')
+        record.update(state='RUNNING', lease={'pid': os.getpid(), 'child': None, 'token': 'x', 'expires': cr.iso_utc(NOW + timedelta(hours=1))})
+        cr.write_json_atomic(self.dir / 'spe-108.json', record)
+        with self.assertRaises(cr.CheckpointError):
+            cr.reset(self.dir, 'spe-108', NOW)
+        self.assertEqual(cr.load(self.dir, 'spe-108')['state'], 'RUNNING')
+
+    def test_finish_leaves_a_checkpoint_it_no_longer_owns(self):
+        make(self.dir, cwd=self.tmp.name)
+
+        def takeover(argv, cwd, timeout, log_path, on_start=None):
+            record = cr.load(self.dir, 'spe-108')
+            record['lease']['token'] = 'someone-else'
+            cr.write_json_atomic(self.dir / 'spe-108.json', record)
+            return {'outcome': 'exited', 'code': 1}
+        self.tick(runner=takeover)
+        record = cr.load(self.dir, 'spe-108')
+        self.assertEqual((record['state'], record['lease']['token']), ('RUNNING', 'someone-else'))
+
+    def test_real_runner_records_the_child_pid_in_the_lease(self):
+        fake = Path(self.tmp.name) / 'claude'
+        fake.write_text('#!/bin/sh\nsleep 1\n')
+        fake.chmod(0o755)
+        make(self.dir, cwd=self.tmp.name)
+        recorded = []
+        original = cr._record_child
+
+        def spy(directory, name, token, pid):
+            original(directory, name, token, pid)
+            recorded.append((cr.load(directory, name)['lease']['child'], pid))
+        with mock.patch.object(cr.shutil, 'which', return_value=str(fake)), mock.patch.object(cr, '_record_child', spy):
+            self.tick(runner=cr.run_claude)
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0][0], recorded[0][1])
+        self.assertGreater(recorded[0][1], 0)
 
 
 if __name__ == '__main__':

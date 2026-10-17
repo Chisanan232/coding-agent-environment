@@ -13,17 +13,17 @@ happens until an event is observed.
    and for a newly satisfied event runs `claude --resume <uuid> -p <fixed prompt>`
    in the recorded `cwd` with a budget cap.
 4. The resumed session re-reads live state, continues, and registers its next wait
-   (`register` declares a fresh wait). If it exits 0 without registering, the campaign
+   (`register` declares the wait; an event whose content (PR or time) is unchanged stays consumed, a changed one is new). If it exits 0 without registering, the campaign
    returns to `WAIT_DEPENDENCY` with nothing pending. If it fails, times out or cannot
    launch, the campaign becomes `WAITING_OPERATOR`, a receipt is written and nothing
    resumes it until the operator runs `campaign-resume.py reset --campaign <name>`
-   (which also restores the budget). `status --json` shows every state.
+   (which restores the budget and clears consumed events, so an already-satisfied pending event resumes on the next tick). `status --json` shows every state.
 
 ## Safety properties (each has a regression test)
 
 | Property | Behavior |
 |---|---|
-| Deduplication | Each event is consumed once per registration; a repeated or stale event never resumes again. |
+| Deduplication | Events are keyed by content (`repo#N` or time). A consumed event never resumes again, even if re-registered; a different PR or time is a new event. |
 | Budget and cooldown | `max_resumes` is a LIFETIME cap per campaign name, kept across re-registers and spent before launch, so crashes and refused launches count. At the limit the campaign becomes `WAITING_OPERATOR` until `reset`. `cooldown_s` spaces attempts. |
 | Lease | An unexpired lease whose coordinator pid or resumed child pid is alive blocks concurrent ticks. A dead or expired lease is recovered with a receipt and no extra spend. Timestamps use the time of each claim. |
 | Locking | Events (`gh`, 20 s each) and admission are evaluated with no lock held and re-verified under it, so `register` is never blocked behind them. |
@@ -60,6 +60,9 @@ cross-harness claim is made.
   Run `plist` from the merged checkout so the embedded script path is the installed one.
 - The agent has no `KeepAlive`, so a failure cannot respawn in a loop. Its plist sets `HOME` and a `PATH` covering `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`; if `gh` or `claude` live elsewhere, edit the plist before loading it.
 - `<name>.log` and `receipts.jsonl` are append-only and not rotated. The log holds the resumed session's raw output and may contain whatever it printed.
+- A resumed grandchild that calls `setsid` escapes the process-group kill at the timeout.
+- A crash between `Popen` and recording the child pid leaves only the coordinator pid in the lease.
+- `tick_error` receipts are not rate limited.
 - Nothing coordinates with a session you still have open interactively; do not register a session id you are actively using.
 - Admission is checked, not reserved, so a heavy resume has a time-of-check window.
 - Only a trivial prompt was verified end to end. A headless resume without permission flags acts only within the settings it inherits.
