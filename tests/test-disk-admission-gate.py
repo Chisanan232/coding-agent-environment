@@ -459,7 +459,7 @@ class TamperPrecision(unittest.TestCase):
                   'rm -rf /Users/u/.cache/coding-agent-environment', 'mv /Users/u/.cache/coding-agent-environment /tmp/g',
                   'rm -rf /Users/u/.cache/coding-agent-environment/adm*', 'rm -r /Users/u/.cache/coding-agent-env*/admission',
                   'cd /Users/u/.cache/coding-agent-environment/ && rm -rf admission',
-                  '/tmp/cat %smode' % d, './cat %smode' % d,
+                  'rm -r /Users/u/.cache/*/admission', '/tmp/cat %smode' % d, './cat %smode' % d,
                   'cd %s && echo x > mode' % d, 'cd %s; : > mode' % d, '(cd %s; rm mode)' % d,
                   'pushd %s >/dev/null && rm mode' % d, 'cd %s && python3 -c "open(\'mode\',\'w\')"' % d,
                   'bash -c "cd %s && rm mode"' % d, 'rm `echo %s`/mode' % d, 'rm $(echo %s)/mode' % d]

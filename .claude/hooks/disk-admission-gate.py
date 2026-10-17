@@ -563,6 +563,7 @@ def _mentions(command, needles):
         rooted = ('(?:' + anchor + ')' if anchor else '') + parent_re
         if re.search(rooted + r'/+(\.{1,2}/+)*(' + re.escape(child[:3]) + r'|[*?\[])', command) or \
                 re.search(rooted + r'/*(?=[\s\'"]|$)', command) or \
+                re.search(r'[*?\[][^\s/]*/+(\.{1,2}/+)*' + re.escape(child), command) or \
                 re.search(r'(?:\.cache|\.claude|\.config)/' + re.escape(parent[:12]) + r'[^\s/]*[*?\[][^\s/]*/+', command):
             return True
     return False
