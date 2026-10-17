@@ -499,10 +499,11 @@ TAMPER_NOTE = ('command appears to modify the disk-admission state directory (mo
 # Default-suspect: a line that mentions the state directory is cleared only when every simple command on it
 # is provably read-only. Unknown programs, interpreters, cwd changes, heredocs and process substitution
 # stay suspect, so narrowing the old blanket rule cannot open a write route.
-READ_ONLY = {'cat', 'ls', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'rg', 'wc', 'stat', 'file', 'jq', 'diff',
-             'cmp', 'shasum', 'sha256sum', 'md5', 'md5sum', 'od', 'xxd', 'strings', 'less', 'more', 'sort',
-             'uniq', 'cut', 'tr', 'du', 'df', 'realpath', 'readlink', 'basename', 'dirname', 'echo', 'printf',
-             'true', 'false', ':', 'test', '[', 'pwd', 'date', 'sleep'}
+# Only programs with no file-writing or command-running option: sort -o, uniq IN OUT, xxd -r, date -s,
+# less/rg --pre, sed w and awk system() are deliberately absent.
+READ_ONLY = {'cat', 'ls', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'wc', 'stat', 'jq', 'diff', 'cmp', 'shasum',
+             'sha256sum', 'md5', 'md5sum', 'strings', 'cut', 'tr', 'du', 'df', 'realpath', 'readlink', 'basename',
+             'dirname', 'echo', 'printf', 'true', 'false', ':', 'test', '[', 'pwd'}
 FIND_WRITES = ('-delete', '-exec', '-execdir', '-ok', '-okdir', '-fprint', '-fprint0', '-fprintf', '-fls')
 # Programs that change what later commands act on (cwd) or run what they are fed: suspect anywhere on the line.
 CWD_CHANGERS = {'cd', 'pushd', 'popd', 'chdir', 'xargs', 'parallel', 'source', '.', 'builtin'}
@@ -530,10 +531,11 @@ def _read_only(tokens, words, needles):
     if program == 'find':
         return not any(a.startswith(FIND_WRITES) for a in arguments)
     if program == 'sed':
-        return not any(re.match(r'-[A-Za-z]*i', a) or a.startswith('--in-place') or a == '-f' or
-                       a.startswith('--file') for a in arguments)
-    if program in ('awk', 'gawk'):
-        return not re.search(r'[>|]|system|-i\b|-f\b', ' '.join(arguments))
+        # Only a plain substitution: no -i, no -f, no w/e flags or commands that write or run something.
+        flags = [a for a in arguments if a.startswith('-')]
+        rest = [a for a in arguments if not a.startswith('-')]
+        return bool(rest) and all(f in ('-n', '-E', '-r') for f in flags) and \
+            re.fullmatch(r's/[^/\\]*/[^/\\]*/[gpiI0-9]*', rest[0]) is not None
     return program in READ_ONLY
 
 

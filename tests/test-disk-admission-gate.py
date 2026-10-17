@@ -442,6 +442,9 @@ class TamperPrecision(unittest.TestCase):
                   'unterminated "quote %smode' % d, 'mv %sstate.json /tmp/elsewhere' % d,
                   'echo x > >(tee %smode)' % d, 'find %s -delete' % d, 'find %s -exec rm {} +' % d,
                   'find %s -name mode | xargs rm' % d, 'sed -Ei s/a/b/ %smode' % d, 'sed -si s/a/b/ %smode' % d,
+                  'sort -o %smode /tmp/x' % d, 'sort /tmp/x -o %smode' % d, 'uniq /tmp/x %smode' % d,
+                  "sed 's/a/b/w %smode' /tmp/x" % d, "sed -n 'w %smode' /tmp/x" % d, 'xxd -r /tmp/x %smode' % d,
+                  'rg --pre rm x %s' % d, 'cat %smode > $OUT' % d, 'less %smode' % d,
                   'cd %s && echo x > mode' % d, 'cd %s; : > mode' % d, '(cd %s; rm mode)' % d,
                   'pushd %s >/dev/null && rm mode' % d, 'cd %s && python3 -c "open(\'mode\',\'w\')"' % d,
                   'bash -c "cd %s && rm mode"' % d, 'rm `echo %s`/mode' % d, 'rm $(echo %s)/mode' % d]
