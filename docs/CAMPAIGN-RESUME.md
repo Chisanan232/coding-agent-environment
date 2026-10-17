@@ -4,6 +4,17 @@
 continue after its Claude Code session has ended. It is plain code: no model call
 happens until an event is observed.
 
+## Ownership (founder decision, 2026-10-17)
+
+`Chisanan232/claude-campaign-coordinator` (SPE-96) is the single canonical Claude Code
+campaign orchestrator. This script is **not** deployed as a second launchd resume service:
+do not install the `plist` output, and do not register a campaign here that is also enrolled
+there, because two resume owners can resume the same session twice. This engine stays as a
+tested reference for event kinds (`pr_merged`, `file_exists`, `not_before`), content-keyed
+deduplication and receipt rotation that can be contributed to the coordinator; SPE-111 tracks
+that. The coordinator's liveness check (`claude agents --json`) is stronger than the transcript
+mtime guard described below, which is only a heuristic.
+
 ## Flow
 
 1. The agent finishes what it can, then records a checkpoint:
