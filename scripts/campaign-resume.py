@@ -34,7 +34,7 @@ Exit codes: 0 success, 2 usage or invalid input, 77 refused.
 
 import argparse
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import json
 import os
@@ -43,6 +43,9 @@ import plistlib
 import pwd
 import re
 import secrets
+import shutil
+import signal
+import subprocess
 import sys
 
 SCHEMA = 1
@@ -186,6 +189,8 @@ def register(directory, name, session_id, cwd, events, now, max_resumes=DEFAULT_
             record['consumed'] = previous['consumed']
             record['resumes_used'] = previous['resumes_used']
             record['last_resume_at'] = previous['last_resume_at']
+            record['lease'] = previous['lease']
+            record['next_attempt_after'] = previous['next_attempt_after']
             if previous['state'] == 'WAITING_OPERATOR':
                 record['state'] = 'WAITING_OPERATOR'
         except CheckpointError:
@@ -193,6 +198,158 @@ def register(directory, name, session_id, cwd, events, now, max_resumes=DEFAULT_
         validate(record)
         write_json_atomic(checkpoint_path(directory, name), record)
     return record
+
+
+def receipt(directory, now, campaign, decision, **detail):
+    line = json.dumps(dict(detail, ts=iso_utc(now), campaign=campaign, decision=decision), sort_keys=True)
+    fd = os.open(_private_dir(directory) / 'receipts.jsonl', os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, (line + '\n').encode())
+    finally:
+        os.close(fd)
+
+
+def gh_pr_state(repo, number):
+    """Authoritative PR state from GitHub, or None when it cannot be read (never a guess)."""
+    try:
+        done = subprocess.run(['gh', 'pr', 'view', str(number), '--repo', repo, '--json', 'state', '--jq', '.state'],
+                              capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def event_satisfied(event, now, pr_state):
+    if event['kind'] == 'not_before':
+        return now >= parse_utc(event['at'])
+    return pr_state(event['repo'], event['number']) == 'MERGED'
+
+
+def admission_admits(weight):
+    """Fail closed: only an explicit exit 0 from the admission adapter admits."""
+    script = Path(__file__).with_name('disk-admission.py')
+    try:
+        done = subprocess.run([sys.executable, str(script), 'check', '--weight', weight], capture_output=True,
+                              timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
+
+
+def run_claude(argv, cwd, timeout, log_path):
+    """Run one resume in its own process group; kill the whole group at the timeout."""
+    fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=fd, stderr=fd, start_new_session=True)
+    except OSError as exc:
+        return {'outcome': 'launch_failed', 'error': type(exc).__name__}
+    finally:
+        os.close(fd)
+    try:
+        return {'outcome': 'exited', 'code': process.wait(timeout=timeout)}
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        return {'outcome': 'timeout'}
+
+
+def lease_live(lease, now):
+    if not lease:
+        return False
+    try:
+        os.kill(lease['pid'], 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return parse_utc(lease['expires']) > now
+
+
+def _save(directory, record):
+    write_json_atomic(checkpoint_path(directory, record['campaign']), record)
+
+
+def _claim(directory, name, now, execute, pr_state, admit):
+    """Decide under the lock whether to resume; returns the launch plan or None."""
+    with campaign_lock(directory, name):
+        try:
+            record = load(directory, name)
+        except CheckpointError as exc:
+            receipt(directory, now, name, 'invalid_checkpoint', detail=str(exc))
+            return None
+        if record['state'] in ('DONE', 'WAITING_OPERATOR'):
+            return None
+        if lease_live(record['lease'], now):
+            return None
+        if record['lease']:
+            record.update(lease=None, state='WAIT_DEPENDENCY')
+            _save(directory, record)
+            receipt(directory, now, name, 'crash_recovered', session_id=record['session_id'])
+        pending = [event for event in record['events'] if event['id'] not in record['consumed']]
+        hit = [event['id'] for event in pending if event_satisfied(event, now, pr_state)]
+        if not hit:
+            return None
+        if record['resumes_used'] >= record['max_resumes']:
+            record['state'] = 'WAITING_OPERATOR'
+            _save(directory, record)
+            receipt(directory, now, name, 'budget_exhausted', resumes_used=record['resumes_used'])
+            return None
+        if record['next_attempt_after'] and parse_utc(record['next_attempt_after']) > now:
+            return None
+        if not execute:
+            receipt(directory, now, name, 'dry_run_would_resume', events=hit)
+            return None
+        claude = shutil.which('claude')
+        blocker = None
+        if not os.path.isdir(record['cwd']):
+            blocker = 'cwd_missing'
+        elif not claude:
+            blocker = 'claude_not_found'
+        elif not admit(record['admission_weight']):
+            blocker = 'admission_denied'
+        if blocker:
+            record['next_attempt_after'] = iso_utc(now + timedelta(seconds=record['cooldown_s']))
+            _save(directory, record)
+            receipt(directory, now, name, blocker, events=hit)
+            return None
+        # Spend the budget and consume the events BEFORE launching, so a crash cannot cause a repeat resume.
+        token = secrets.token_hex(8)
+        record['consumed'] = record['consumed'] + hit
+        record.update(resumes_used=record['resumes_used'] + 1, last_resume_at=iso_utc(now), state='RUNNING',
+                      next_attempt_after=iso_utc(now + timedelta(seconds=record['cooldown_s'])),
+                      lease={'pid': os.getpid(), 'token': token, 'expires': iso_utc(now + timedelta(seconds=record['timeout_s'] + 60))})
+        _save(directory, record)
+        receipt(directory, now, name, 'resume_started', events=hit, session_id=record['session_id'],
+                resumes_used=record['resumes_used'])
+        argv = [claude, '--resume', record['session_id'], '-p', PROMPT, '--max-budget-usd', DEFAULT_BUDGET_USD]
+        return {'argv': argv, 'cwd': record['cwd'], 'timeout': record['timeout_s'], 'token': token}
+
+
+def _finish(directory, name, now, plan, result):
+    with campaign_lock(directory, name):
+        record = load(directory, name)
+        if (record['lease'] or {}).get('token') == plan['token']:
+            record['lease'] = None
+            if record['state'] == 'RUNNING':
+                # The session exited without writing a new checkpoint: wait for operator or a re-register.
+                record['state'] = 'WAIT_DEPENDENCY'
+            _save(directory, record)
+        receipt(directory, now, name, 'resume_finished', state_after=record['state'], **result)
+
+
+def tick(directory, now, execute, pr_state=gh_pr_state, admit=admission_admits, runner=run_claude):
+    """One pass over every checkpoint. Makes no model call except the single resume it launches."""
+    started = []
+    for path in sorted(_private_dir(directory).glob('*.json')):
+        name = path.stem
+        if not NAME_RE.match(name):
+            continue
+        plan = _claim(directory, name, now, execute, pr_state, admit)
+        if plan:
+            result = runner(plan['argv'], plan['cwd'], plan['timeout'], _private_dir(directory) / ('%s.log' % name))
+            _finish(directory, name, now, plan, result)
+            started.append(name)
+    return started
 
 
 def build_plist(python, script):
@@ -224,6 +381,8 @@ def build_parser():
     reg.add_argument('--weight', choices=('light', 'heavy'), default='light')
     stat = commands.add_parser('status', allow_abbrev=False, help='print every checkpoint')
     stat.add_argument('--json', action='store_true', required=True)
+    tick_cmd = commands.add_parser('tick', allow_abbrev=False, help='observe events and resume due campaigns')
+    tick_cmd.add_argument('--execute', action='store_true', help='actually resume; without it only receipts a dry run')
     commands.add_parser('plist', allow_abbrev=False, help='print the launchd agent definition; installs nothing')
     return parser
 
@@ -253,6 +412,10 @@ def main(argv=None, directory=None, now=None):
             record = register(directory, args.campaign, args.session_id, args.cwd, parse_events(args), now,
                               args.max_resumes, args.cooldown_s, args.timeout_s, args.weight)
             print('registered %s: %d event(s), budget %d' % (record['campaign'], len(record['events']), record['max_resumes']))
+            return 0
+        if args.command == 'tick':
+            started = tick(directory, now, args.execute)
+            print('resumed: %s' % (', '.join(started) or 'none'))
             return 0
         rows = []
         for path in sorted(_private_dir(directory).glob('*.json')):
