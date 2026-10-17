@@ -625,7 +625,6 @@ def build_refresher_plist(python, script):
         'ProgramArguments': [python, script, 'snapshot', '--json'],
         'StartInterval': REFRESH_INTERVAL_S,
         'RunAtLoad': True,
-        'ProcessType': 'Background',
         'EnvironmentVariables': {'HOME': str(account_home()), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'},
         'StandardOutPath': '/dev/null',
         'StandardErrorPath': '/dev/null',
@@ -650,7 +649,8 @@ def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, tt
     releases the reservation and returns 127. Every message goes to stderr; the exit code is the contract,
     and it is authoritative only until the job starts (after exec the exit code is the job's own).
     """
-    if not argv or not all(isinstance(part, str) and part and '\0' not in part for part in argv):
+    # Only the program must be non-empty: `git commit -m ''` and `sh -c ''` are legitimate jobs.
+    if not argv or not all(isinstance(part, str) and '\0' not in part for part in argv) or not argv[0]:
         print('refused: invalid-request: a command is required after --', file=sys.stderr)
         return REFUSED_EXIT
     result = reserve(label, nbytes, os.getpid(), state_path, free_fn, ttl=ttl, allow_long=allow_long)
@@ -703,7 +703,11 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
     state_path = state_path or default_state_path()
     args = build_parser().parse_args(argv)
     if args.command == 'refresher-plist':
-        print(build_refresher_plist(sys.executable, str(Path(__file__).resolve())), end='')
+        script = Path(__file__).resolve()
+        if str(script).startswith(('/tmp/', '/private/tmp/', '/var/folders/', '/private/var/folders/')):
+            print('warning: %s is scratch space; run refresher-plist from the stable merged checkout' % script,
+                  file=sys.stderr)
+        print(build_refresher_plist(sys.executable, str(script)), end='')
         return 0
     if args.command == 'run':
         if args.job[:1] != ['--']:

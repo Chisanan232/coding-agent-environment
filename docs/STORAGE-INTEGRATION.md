@@ -132,19 +132,41 @@ State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
 
 ### Reserving a lane for a job (`run`)
 
-`disk-admission.py run --bytes N --label L [--ttl-s S] -- COMMAND [ARG...]` reserves for its own process and
+`disk-admission.py run --bytes N --label L [--ttl-s S] [--max-hold] -- COMMAND [ARG...]` reserves for its own process and
 then `exec`s the job. `exec` keeps the pid and start time, so the reservation is held by the job itself, nothing
 runs before admission, and no release step exists: exit, pid reuse and TTL expiry are reaped lazily. A refusal
 (latched, no free lane, over capacity, bad label or bytes, TTL above 4 h without `--max-hold`) never starts the job
 and exits 77; a failed `exec` releases the reservation and exits 127. Messages go to stderr (the reserved line only
 when stderr is a terminal, so a captured job stderr is not polluted), `--` between the options and the command is
-mandatory, and the job starts with default SIGPIPE/SIGXFSZ dispositions. The exit codes 77/127 are authoritative only
+mandatory, and the job starts with default SIGPIPE/SIGXFSZ dispositions (a caller's own ignore of those signals is not preserved, because Python overwrites it at startup). The exit codes 77/127 are authoritative only
 until the job starts; afterwards the exit code is the job's own, so a job that can exit 77 or 127 is ambiguous (argparse
 errors exit 2). Only the exec'd process is tracked: a job that forks a daemon and exits, or backgrounds work, loses its
 reservation while the real consumer continues. A running job past its TTL silently loses its
 reservation, and an exited job that its parent has not reaped is still counted. Reservations only coordinate
 callers that use them: the gate hook still decides on tier and latch alone, so an unwrapped heavy command can run
 beside a reserved one. This state is advisory (same-user), not a security boundary.
+### Keeping the snapshot fresh (`refresher-plist`)
+
+The snapshot is stale after 120 s, so something has to republish it. `disk-admission.py refresher-plist` prints a
+launchd user agent (`com.coding-agent-environment.admission-snapshot`, every 60 s, `RunAtLoad`, no `KeepAlive`,
+output to `/dev/null` so no log can grow); it installs nothing. Operator steps, run from the **stable merged
+checkout** (never a worktree or temporary clone, and do not copy the script alone: the Glomeris reading is loaded
+from the sibling `storage-integration.py`, and without it the snapshot silently falls back to `statvfs` only):
+
+```bash
+python3 scripts/disk-admission.py refresher-plist > ~/Library/LaunchAgents/com.coding-agent-environment.admission-snapshot.plist
+plutil -lint ~/Library/LaunchAgents/com.coding-agent-environment.admission-snapshot.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.coding-agent-environment.admission-snapshot.plist
+python3 scripts/disk-admission.py snapshot --check-fresh        # exit 0 = fresh
+# rollback
+launchctl bootout gui/$(id -u)/com.coding-agent-environment.admission-snapshot && rm ~/Library/LaunchAgents/com.coding-agent-environment.admission-snapshot.plist
+```
+
+The interpreter and script paths are baked in when the plist is printed: a Homebrew Python upgrade that removes that
+interpreter, or moving the checkout, makes the agent fail without any output. Diagnose with
+`launchctl print gui/$(id -u)/com.coding-agent-environment.admission-snapshot` (last exit status) and by running
+`snapshot --json` by hand. A fresh snapshot is not permission: it may report `volume-unreadable` or zero heavy lanes,
+which consumers must read as refuse.
 
 ### Gate hook behavior
 

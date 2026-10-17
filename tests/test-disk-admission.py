@@ -817,6 +817,8 @@ class RefresherPlist(unittest.TestCase):
         self.assertEqual(data['ProgramArguments'], ['/usr/bin/python3', '/opt/x/disk-admission.py', 'snapshot', '--json'])
         self.assertLess(data['StartInterval'], da.STALE_AFTER_S)
         self.assertNotIn('KeepAlive', data)
+        self.assertNotIn('ProcessType', data)  # Background would throttle the job that matters under pressure
+        self.assertTrue(data['ProgramArguments'][0].startswith('/') and data['ProgramArguments'][1].startswith('/'))
         self.assertEqual((data['StandardOutPath'], data['StandardErrorPath']), ('/dev/null', '/dev/null'))
         self.assertTrue(data['RunAtLoad'])
 
@@ -870,6 +872,7 @@ class RunReserved(unittest.TestCase):
 
     def test_second_job_hits_the_lane_cap(self):
         holder = subprocess.Popen(['sleep', '30'])
+        self.addCleanup(holder.wait)
         self.addCleanup(holder.kill)
         self.assertTrue(da.reserve('other-job', 10 * GIB, holder.pid, self.path, lambda: 300 * GIB)['admit'])
         code, spawned, err = self.go(label='job-b')
@@ -886,6 +889,23 @@ class RunReserved(unittest.TestCase):
             code = da.run_reserved('job-a', 10 * GIB, ['no-such-binary-xyz'], self.path, lambda: 300 * GIB, exec_fn=boom)
         self.assertEqual(code, 127)
         self.assertFalse((self.path.parent / 'reservations/job-a.json').exists())
+
+    def test_empty_string_arguments_are_passed_through_but_an_empty_program_is_refused(self):
+        code, spawned, _ = self.go(argv=['git', 'commit', '-m', ''])
+        self.assertEqual((code, spawned[0][1]), (0, ['git', 'commit', '-m', '']))
+        code, spawned, _ = self.go(label='job-b', argv=[''])
+        self.assertEqual((code, spawned), (77, []))
+
+    def test_exec_resets_sigpipe_and_sigxfsz_to_default(self):
+        import signal
+        saved = {name: signal.getsignal(getattr(signal, name)) for name in ('SIGPIPE', 'SIGXFSZ')}
+        self.addCleanup(lambda: [signal.signal(getattr(signal, n), h) for n, h in saved.items()])
+        for name in saved:
+            signal.signal(getattr(signal, name), signal.SIG_IGN)
+        with mock.patch.object(da.os, 'execvp', lambda program, args: None):
+            da._exec_job('true', ['true'])
+        for name in saved:
+            self.assertEqual(signal.getsignal(getattr(signal, name)), signal.SIG_DFL, name)
 
     def test_job_argv_after_the_separator_is_plain_arguments(self):
         code, spawned, _ = self.go(argv=['echo', '; rm -rf /', '$(id)', '--bytes', '1'])
