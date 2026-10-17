@@ -624,7 +624,6 @@ def build_refresher_plist(python, script):
         'ProgramArguments': [python, script, 'snapshot', '--json'],
         'StartInterval': REFRESH_INTERVAL_S,
         'RunAtLoad': True,
-        'ProcessType': 'Background',
         'EnvironmentVariables': {'HOME': str(account_home()), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'},
         'StandardOutPath': '/dev/null',
         'StandardErrorPath': '/dev/null',
@@ -660,7 +659,11 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
     state_path = state_path or default_state_path()
     args = build_parser().parse_args(argv)
     if args.command == 'refresher-plist':
-        print(build_refresher_plist(sys.executable, str(Path(__file__).resolve())), end='')
+        script = Path(__file__).resolve()
+        if str(script).startswith(('/tmp/', '/private/tmp/', '/var/folders/', '/private/var/folders/')):
+            print('warning: %s is scratch space; run refresher-plist from the stable merged checkout' % script,
+                  file=sys.stderr)
+        print(build_refresher_plist(sys.executable, str(script)), end='')
         return 0
     if args.command in ('reserve', 'release'):
         result = (reserve(args.label, args.nbytes, args.pid, state_path, free_fn, ttl=args.ttl, allow_long=args.allow_long)

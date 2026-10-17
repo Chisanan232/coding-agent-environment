@@ -816,6 +816,8 @@ class RefresherPlist(unittest.TestCase):
         self.assertEqual(data['ProgramArguments'], ['/usr/bin/python3', '/opt/x/disk-admission.py', 'snapshot', '--json'])
         self.assertLess(data['StartInterval'], da.STALE_AFTER_S)
         self.assertNotIn('KeepAlive', data)
+        self.assertNotIn('ProcessType', data)  # Background would throttle the job that matters under pressure
+        self.assertTrue(data['ProgramArguments'][0].startswith('/') and data['ProgramArguments'][1].startswith('/'))
         self.assertEqual((data['StandardOutPath'], data['StandardErrorPath']), ('/dev/null', '/dev/null'))
         self.assertTrue(data['RunAtLoad'])
 
