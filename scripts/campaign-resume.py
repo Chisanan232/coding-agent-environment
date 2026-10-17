@@ -21,6 +21,10 @@ Guarantees:
   that finds a live lease does nothing; a dead or expired lease is recovered.
 - A resume is admitted only when scripts/disk-admission.py check exits 0.
 - The resumed command has a hard timeout; its process group is killed on expiry.
+- A session whose transcript changed in the last 120 s, or is not found, is not
+  resumed (stat only; transcripts are never read), which protects an open
+  interactive session. `receipts.jsonl` and each `<name>.log` keep one previous
+  generation beyond 1 MiB.
 - Every decision writes one JSONL receipt. Receipts never contain the prompt
   text, environment or command lines beyond the session id. The per-campaign
   `<name>.log` holds the resumed session's raw output (mode 0600, not rotated)
@@ -65,6 +69,8 @@ DEFAULT_COOLDOWN_S = 900
 DEFAULT_TIMEOUT_S = 3600
 MAX_TIMEOUT_S = 4 * 3600
 DEFAULT_BUDGET_USD = '5'
+MIN_IDLE_S = 120
+MAX_LOG_BYTES = 1024 * 1024
 REFUSED_EXIT = 77
 PROMPT = ('A recorded dependency of this campaign is now satisfied. Re-read live state '
           '(Jira, GitHub, the worktree) before acting, continue the campaign under the '
@@ -135,6 +141,10 @@ def validate_event(event):
             raise CheckpointError('pr_merged needs repo owner/name')
         if not isinstance(event.get('number'), int) or isinstance(event['number'], bool) or event['number'] < 1:
             raise CheckpointError('pr_merged needs a positive integer number')
+    elif kind == 'file_exists':
+        path = event.get('path')
+        if not isinstance(path, str) or not os.path.isabs(path) or '\0' in path or '/../' in path + '/':
+            raise CheckpointError('file_exists needs an absolute path without ..')
     elif kind == 'not_before':
         try:
             parse_utc(event.get('at', ''))
@@ -149,6 +159,8 @@ def event_key(event):
     """Content identity of an event: the same wait re-declared is the same key, a different wait is not."""
     if event['kind'] == 'pr_merged':
         return 'pr_merged:%s#%d' % (event['repo'], event['number'])
+    if event['kind'] == 'file_exists':
+        return 'file_exists:%s' % event['path']
     return 'not_before:%s' % event['at']
 
 
@@ -219,7 +231,29 @@ def register(directory, name, session_id, cwd, events, now, max_resumes=DEFAULT_
     return record
 
 
+def _rotate(path, limit=MAX_LOG_BYTES):
+    """Keep one previous generation so an append-only file cannot grow without bound."""
+    try:
+        if path.stat().st_size > limit:
+            os.replace(path, path.with_name(path.name + '.1'))
+    except FileNotFoundError:
+        pass
+
+
+def session_age(session_id, now):
+    """Seconds since the session transcript last changed (stat only, never read), None when it is not found."""
+    newest = None
+    for path in (account_home() / '.claude/projects').glob('*/%s.jsonl' % session_id):
+        try:
+            modified = path.stat().st_mtime
+        except OSError:
+            continue
+        newest = modified if newest is None else max(newest, modified)
+    return None if newest is None else max(0.0, now.timestamp() - newest)
+
+
 def receipt(directory, now, campaign, decision, **detail):
+    _rotate(_private_dir(directory) / 'receipts.jsonl')
     line = json.dumps(dict(detail, ts=iso_utc(now), campaign=campaign, decision=decision), sort_keys=True)
     fd = os.open(_private_dir(directory) / 'receipts.jsonl', os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
@@ -292,10 +326,16 @@ def _save(directory, record):
     write_json_atomic(checkpoint_path(directory, record['campaign']), record)
 
 
-def _blocker(record):
+def _blocker(record, clock, age):
     if not os.path.isdir(record['cwd']):
         return 'cwd_missing'
-    return None if shutil.which('claude') else 'claude_not_found'
+    if not shutil.which('claude'):
+        return 'claude_not_found'
+    seconds = age(record['session_id'], clock())
+    if seconds is None:
+        return 'session_not_found'
+    # A session whose transcript changed recently is probably open and in use: never resume it underneath the user.
+    return 'session_active' if seconds < MIN_IDLE_S else None
 
 
 def _observe(directory, name, record, clock, pr_state):
@@ -310,12 +350,15 @@ def _observe(directory, name, record, clock, pr_state):
             unreadable = unreadable or state is None
             if state == 'MERGED':
                 hit.append(key)
+        elif event['kind'] == 'file_exists':
+            if os.path.isfile(event['path']):
+                hit.append(key)
         elif clock() >= parse_utc(event['at']):
             hit.append(key)
     return hit, unreadable
 
 
-def _screen(directory, name, clock, pr_state, admit):
+def _screen(directory, name, clock, pr_state, admit, age):
     """Phase A and B: cheap checks under the lock, slow checks outside it. Returns (hit ids, blocker) or None."""
     with campaign_lock(directory, name):
         try:
@@ -344,7 +387,7 @@ def _screen(directory, name, clock, pr_state, admit):
                 receipt(directory, clock(), name, 'github_unreadable')
     if not hit:
         return None
-    return hit, _blocker(record) or (None if admit(record['admission_weight']) else 'admission_denied')
+    return hit, _blocker(record, clock, age) or (None if admit(record['admission_weight']) else 'admission_denied')
 
 
 def _commit(directory, name, hit, blocker, execute, clock):
@@ -430,7 +473,7 @@ def reset(directory, name, now):
         receipt(directory, now, name, 'operator_reset')
 
 
-def tick(directory, now, execute, pr_state=gh_pr_state, admit=admission_admits, runner=run_claude):
+def tick(directory, now, execute, pr_state=gh_pr_state, admit=admission_admits, runner=run_claude, age=session_age):
     """One pass over every checkpoint. `now` is a datetime or a zero-argument clock. No model call except the resume."""
     clock = now if callable(now) else (lambda: now)
     started = []
@@ -439,11 +482,13 @@ def tick(directory, now, execute, pr_state=gh_pr_state, admit=admission_admits, 
         if not NAME_RE.match(name):
             continue
         try:
-            screened = _screen(directory, name, clock, pr_state, admit)
+            screened = _screen(directory, name, clock, pr_state, admit, age)
             plan = _commit(directory, name, *screened, execute, clock) if screened else None
             if plan:
                 started.append(name)
-                result = runner(plan['argv'], plan['cwd'], plan['timeout'], _private_dir(directory) / ('%s.log' % name),
+                log_path = _private_dir(directory) / ('%s.log' % name)
+                _rotate(log_path)
+                result = runner(plan['argv'], plan['cwd'], plan['timeout'], log_path,
                                 on_start=lambda pid: _record_child(directory, name, plan['token'], pid))
                 _finish(directory, name, clock, plan, result)
         except Exception as exc:
@@ -478,6 +523,7 @@ def build_parser():
     reg.add_argument('--session-id', required=True)
     reg.add_argument('--cwd', required=True)
     reg.add_argument('--pr-merged', action='append', default=[], metavar='OWNER/REPO#N')
+    reg.add_argument('--file-exists', action='append', default=[], metavar='ABS_PATH', help='operator-done marker or QA artifact')
     reg.add_argument('--not-before', action='append', default=[], metavar='YYYY-MM-DDTHH:MM:SSZ')
     reg.add_argument('--max-resumes', type=int, default=DEFAULT_MAX_RESUMES)
     reg.add_argument('--cooldown-s', type=int, default=DEFAULT_COOLDOWN_S)
@@ -501,6 +547,8 @@ def parse_events(args):
             raise CheckpointError('--pr-merged needs OWNER/REPO#N')
         events.append({'id': 'pr%d-%s' % (index, match.group(2)), 'kind': 'pr_merged',
                        'repo': match.group(1), 'number': int(match.group(2))})
+    for index, path in enumerate(args.file_exists):
+        events.append({'id': 'file%d' % index, 'kind': 'file_exists', 'path': path})
     for index, at in enumerate(args.not_before):
         events.append({'id': 'time%d' % index, 'kind': 'not_before', 'at': at})
     return events

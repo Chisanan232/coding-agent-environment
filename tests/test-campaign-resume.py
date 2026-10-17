@@ -132,8 +132,8 @@ class Engine(unittest.TestCase):
             return result or {'outcome': 'exited', 'code': 0}
         return run
 
-    def tick(self, now=NOW, execute=True, pr_state=None, admit=lambda weight: True, runner=None):
-        return cr.tick(self.dir, now, execute, pr_state or self.merged, admit, runner or self.runner())
+    def tick(self, now=NOW, execute=True, pr_state=None, admit=lambda weight: True, runner=None, age=lambda session, at: 3600):
+        return cr.tick(self.dir, now, execute, pr_state or self.merged, admit, runner or self.runner(), age=age)
 
     def receipts(self):
         path = self.dir / 'receipts.jsonl'
@@ -492,6 +492,61 @@ class Engine(unittest.TestCase):
                     '--weight', 'heavy'], directory=self.dir, now=NOW)
         self.assertEqual(raised.exception.code, 2)
         self.assertEqual(list(self.dir.glob('*.json')) if self.dir.exists() else [], [])
+
+
+    def test_recently_active_or_missing_session_is_never_resumed(self):
+        make(self.dir, cwd=self.tmp.name)
+        self.assertEqual(self.tick(age=lambda session, at: 5), [])
+        self.assertEqual(self.tick(age=lambda session, at: None, now=NOW + timedelta(seconds=cr.DEFAULT_COOLDOWN_S + 1)), [])
+        self.assertEqual(self.decisions(), ['session_active', 'session_not_found'])
+        record = cr.load(self.dir, 'spe-108')
+        self.assertEqual((record['resumes_used'], record['consumed']), (0, []))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.tick(now=NOW + timedelta(days=1)), ['spe-108'])
+
+    def test_session_age_uses_transcript_mtime_without_reading_it(self):
+        home = Path(self.tmp.name) / 'home'
+        transcript = home / '.claude/projects/-some-cwd' / ('%s.jsonl' % SESSION)
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('SECRET-CONTENT')
+        os.utime(transcript, (NOW.timestamp() - 600, NOW.timestamp() - 600))
+        with mock.patch.object(cr, 'account_home', return_value=home), \
+                mock.patch.object(Path, 'read_text', side_effect=AssertionError('transcript must not be read')):
+            self.assertEqual(cr.session_age(SESSION, NOW), 600)
+            self.assertIsNone(cr.session_age('11111111-2222-3333-4444-555555555555', NOW))
+
+    def test_receipts_and_logs_are_bounded(self):
+        path = self.dir / 'receipts.jsonl'
+        self.dir.mkdir(parents=True)
+        path.write_text('x' * (cr.MAX_LOG_BYTES + 1))
+        cr.receipt(self.dir, NOW, 'c', 'probe')
+        self.assertTrue((self.dir / 'receipts.jsonl.1').exists())
+        self.assertEqual(len(path.read_text().splitlines()), 1)
+        make(self.dir, cwd=self.tmp.name)
+        log = self.dir / 'spe-108.log'
+        log.write_text('y' * (cr.MAX_LOG_BYTES + 1))
+        self.tick()
+        self.assertTrue((self.dir / 'spe-108.log.1').exists())
+
+
+    def test_file_marker_event_fires_when_the_file_appears(self):
+        marker = Path(self.tmp.name) / 'operator-done'
+        make(self.dir, cwd=self.tmp.name, events=[{'id': 'f0', 'kind': 'file_exists', 'path': str(marker)}])
+        self.assertEqual(self.tick(), [])
+        marker.write_text('')
+        self.assertEqual(self.tick(), ['spe-108'])
+        self.assertEqual(self.tick(now=NOW + timedelta(days=2)), [])
+
+    def test_file_marker_event_rejects_relative_and_traversal_paths(self):
+        for path in ('relative', '/a/../etc/passwd', '/a/b/..', 5):
+            with self.subTest(path=path), self.assertRaises(cr.CheckpointError):
+                make(self.dir, events=[{'id': 'f0', 'kind': 'file_exists', 'path': path}])
+
+    def test_idle_ticks_spawn_nothing(self):
+        make(self.dir, cwd=self.tmp.name)
+        for minute in range(0, 60, 5):
+            self.tick(now=NOW + timedelta(minutes=minute), pr_state=self.open)
+        self.assertEqual((self.calls, self.receipts()), ([], []))
 
 
 if __name__ == '__main__':
