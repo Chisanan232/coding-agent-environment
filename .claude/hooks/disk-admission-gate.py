@@ -557,15 +557,20 @@ def _mentions(command, needles):
         parent, _, child = needle.rpartition('/')
         if not parent:
             continue
-        # A bare directory name only counts under a dot-directory (~/.cache, ~/.claude, ~/.config): the
-        # same name is also an ordinary checkout, and `git -C .../coding-agent-environment status` is fine.
-        anchor = '' if '/' in parent else r'(?<=\.cache/)|(?<=\.claude/)|(?<=\.config/)'
-        parent_re = re.escape(parent)
-        rooted = ('(?:' + anchor + ')' if anchor else '') + parent_re
-        if re.search(rooted + r'/+(\.{1,2}/+)*(' + re.escape(child[:3]) + r'|[*?\[])', command) or \
-                re.search(rooted + r'/*(?=[\s\'"]|$)', command) or \
-                re.search(r'[*?\[][^\s/]*/+(\.{1,2}/+)*' + re.escape(child), command) or \
-                re.search(r'(?:\.cache|\.claude|\.config)/' + re.escape(parent[:12]) + r'[^\s/]*[*?\[][^\s/]*/+', command):
+        glob = r'[*?\[]'
+        if '/' not in parent:
+            # A bare directory name only counts under a dot-directory (~/.cache, ~/.claude, ~/.config): the same
+            # name is also an ordinary checkout, and `git -C .../coding-agent-environment status` is fine.
+            rooted = r'(?:(?<=\.cache/)|(?<=\.claude/)|(?<=\.config/))' + re.escape(parent)
+            if re.search(rooted + r'/+\S', command) or re.search(rooted + r'(?![\w.+-])', command) or \
+                    re.search(r'(?:\.cache|\.claude|\.config)/' + re.escape(parent[:12]) + r'[^\s/]*' + glob + r'[^\s/]*', command):
+                return True
+        else:
+            # A custom (sandbox) directory: its own name, spelled with /./, // or a glob; never its whole parent.
+            parent_re = re.escape(parent)
+            if re.search(parent_re + r'/+(\.{1,2}/+)*(' + re.escape(child) + r'(?![\w.+-])|[^\s/]*' + glob + ')', command):
+                return True
+        if re.search(glob + r'[^\s/]*/+(\.{1,2}/+)*' + re.escape(child) + r'(?![\w.+-])', command):
             return True
     return False
 
@@ -615,6 +620,21 @@ def tamper_suspect(command, needles=(STATE_NEEDLE,)):
     return False
 
 
+def _directory_spellings(directory):
+    """The configured directory as typed, resolved, and with macOS's /private alias added or removed."""
+    spellings = {str(directory)}
+    try:
+        spellings.add(os.path.realpath(directory))
+    except OSError:
+        pass
+    for text in list(spellings):
+        if text.startswith('/private/'):
+            spellings.add(text[len('/private'):])
+        elif text.startswith(('/tmp/', '/var/', '/etc/')):
+            spellings.add('/private' + text)
+    return tuple(sorted(spellings))
+
+
 def decide(command, mode, runner=run_adapter, exists=os.path.exists, needles=(STATE_NEEDLE,), events=None):
     """Return (exit code, stdout text, stderr text) for one Bash command."""
     if not tamper_suspect(command, needles):
@@ -657,7 +677,7 @@ def main(raw, stdout, stderr, mode_fn=None, runner=None, admission_dir=None, con
     custom = admission_dir is not None
     mode_fn = mode_fn or (lambda: read_mode(directory / 'mode'))
     runner = runner or (lambda: run_adapter(directory if custom else None))
-    needles = (STATE_NEEDLE,) + ((str(directory),) if custom else ())
+    needles = (STATE_NEEDLE,) + (_directory_spellings(directory) if custom else ())
     try:
         if isinstance(raw, bytes):
             raw = raw.decode('utf-8', 'replace')

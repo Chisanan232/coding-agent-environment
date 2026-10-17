@@ -478,6 +478,36 @@ class ScratchStateDirectory(unittest.TestCase):
             self.assertFalse(gate.tamper_suspect('cat %s/mode > /tmp/copy' % state, needles), state)
 
 
+class ParentAndAliasSpellings(unittest.TestCase):
+    P = '/Users/u/.cache/coding-agent-environment'
+
+    def test_punctuation_after_the_parent_and_unusual_children_are_still_mentions(self):
+        p = self.P
+        for command in ('rm -rf %s;' % p, '(rm -rf %s)' % p, 'rm -rf %s|cat' % p, 'rm -rf %s>/dev/null' % p,
+                        'cd %s; rm -rf admission' % p, 'cd %s;echo x>admission/mode' % p, 'cd %s&&rm -rf admission' % p,
+                        'rm -rf %s/x/../admission' % p, 'rm -rf %s/a*' % p, 'rm -rf %s/ad?ission' % p,
+                        'rm -rf %s/./' % p, 'rm -rf %s/.[a]*' % p):
+            self.assertTrue(gate.tamper_suspect(command), command)
+
+    def test_worktrees_and_checkouts_are_not_mentions(self):
+        for command in ('cd /Users/u/Dev/coding-agent-environment-harden-SPE-109-x && ls',
+                        'cd /Users/u/Dev/coding-agent-environment && rm -rf build',
+                        'git -C /Users/u/Dev/coding-agent-environment status',
+                        'python3 /Users/u/Dev/coding-agent-environment-x/scripts/disk-admission.py status'):
+            self.assertFalse(gate.tamper_suspect(command), command)
+
+    def test_private_tmp_alias_of_a_sandbox_directory_is_covered_both_ways(self):
+        for configured, typed in (('/private/tmp/sbx/state', '/tmp/sbx/state'), ('/tmp/sbx/state', '/private/tmp/sbx/state')):
+            needles = gate._directory_spellings(Path(configured))
+            self.assertTrue(gate.tamper_suspect('rm %s/mode' % typed, needles), (configured, typed))
+            self.assertTrue(gate.tamper_suspect('echo x > %s/mode' % typed, needles), (configured, typed))
+
+    def test_short_sandbox_names_do_not_block_unrelated_scratch_files(self):
+        needles = gate._directory_spellings(Path('/tmp/state'))
+        self.assertFalse(gate.tamper_suspect('cargo build > /tmp/stats.log', needles))
+        self.assertFalse(gate.tamper_suspect('git status > /tmp/statusfile', needles))
+
+
 class GateInputs(unittest.TestCase):
     @staticmethod
     def forbidden():
