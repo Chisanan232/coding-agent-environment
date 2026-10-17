@@ -532,6 +532,27 @@ class RunWrapperLookThrough(unittest.TestCase):
             verdict = gate.classify(self.wrapped(job))
             self.assertEqual((verdict['heavy'], verdict['kind']), (True, kind), job)
 
+    def test_direct_execution_interpreter_options_uv_run_and_doubled_separator(self):
+        da = self.DA
+        for command in ('%s run --bytes 1 --label a -- cargo build' % da,
+                        './disk-admission.py run --bytes 1 --label a -- cargo build',
+                        'scripts/disk-admission.py run --bytes 1 --label a -- cargo build',
+                        'python3 -W ignore %s run --bytes 1 --label a -- cargo build' % da,
+                        'python3 -X dev -u -B %s run --bytes 1 --label a -- cargo build' % da,
+                        'uv run %s run --bytes 1 --label a -- cargo build' % da,
+                        'uv run python %s run --bytes 1 --label a -- cargo build' % da,
+                        'python3 %s run --bytes 1 --label a -- -- cargo build' % da,
+                        'python3 %s run --bytes 1 --label a -- bash -c "cargo build"' % da):
+            self.assertTrue(gate.classify(command)['heavy'], command)
+
+    def test_other_scripts_and_late_script_names_are_not_wrappers(self):
+        da = self.DA
+        for command in ('python3 foo.py run -- cargo build', 'python3 foo.py %s run -- cargo build' % da,
+                        'python3 -c "x" %s run -- cargo build' % da, 'python3 -m pytest %s run -- cargo build' % da,
+                        'uv run pytest %s run -- cargo build' % da, 'python3 %s run cargo build' % da,
+                        'python3 %s run --bytes 1 --label a cargo build' % da):
+            self.assertFalse(gate.classify(command)['heavy'], command)
+
     def test_wrapped_commands_inside_a_shell_string_are_still_found(self):
         verdict = gate.classify("bash -c '%s'" % self.wrapped('cargo build'))
         self.assertEqual((verdict['heavy'], verdict['kind']), (True, 'cargo'))

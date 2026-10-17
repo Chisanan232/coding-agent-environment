@@ -158,7 +158,8 @@ file (`chflags nouchg` before an edit); leave `state.json` writable, because the
 adapter updates it.
 
 The hook looks through the reserve-then-exec wrapper: `python3 .../disk-admission.py run ... -- JOB` is
-classified by `JOB`, so the wrapper cannot hide `cargo`, `uv` and the like. The wrapper path is never trusted and a
+classified by `JOB`, so the wrapper cannot hide `cargo`, `uv` and the like. The file name `disk-admission.py` is matched (direct execution, `python*` with options, or `uv run`), but its path
+and contents are never trusted, a copy or symlink under another name is not recognised, and a
 wrapped job is never treated as pre-admitted; it is admitted, warned or denied exactly like the same command typed
 directly, and a wrapped write to the admission directory is still tamper-suspect. The audit line is unchanged (no
 command text).
