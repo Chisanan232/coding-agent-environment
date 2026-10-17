@@ -407,35 +407,46 @@ class Tamper(unittest.TestCase):
             self.assertEqual(self.run_gate(command, 'enforce'), (0, '', ''), command)
 
 
-class TamperPrecision(Tamper):
-    """SPE-109: reading the state directory must not look like tampering; every write route still must."""
+class TamperPrecision(unittest.TestCase):
+    """SPE-109: provably read-only use of the state directory is not tamper; every write route still is."""
+    DIR = Tamper.DIR
+    run_gate = Tamper.run_gate
 
-    def test_reads_stderr_redirects_and_unrelated_writers_are_not_tamper(self):
+    def test_read_only_use_stderr_redirects_and_unrelated_writers_are_not_tamper(self):
         d = self.DIR
         for command in ('cat %sstate.json 2>/dev/null' % d, 'cat %sstate.json 2>&1 | head -5' % d,
-                        'tail -n 20 %sgate-audit.jsonl > /tmp/audit-copy' % d,
+                        'tail -n 20 %sgate-audit.jsonl > /tmp/audit-copy' % d, 'ls %s &> /dev/null' % d,
                         'cat %smode; rm /tmp/scratch' % d, 'rm /tmp/scratch && ls %s' % d,
-                        'cp %sstate.json /tmp/state-backup.json' % d,
-                        'dd if=%sstate.json of=/tmp/x' % d,
-                        "python3 -c \"import json;print(json.load(open('%sstate.json')))\"" % d,
-                        'jq . %sstate.json > /tmp/pretty.json' % d, 'sed -i s/a/b/ /tmp/file; cat %smode' % d):
+                        'cat %smode | tee /tmp/o' % d, 'find %s -name "*.jsonl"' % d,
+                        'jq . %sstate.json > /tmp/pretty.json' % d, 'sed s/a/b/ %smode > /tmp/o' % d,
+                        'sed -i s/a/b/ /tmp/file; cat %smode' % d, 'grep -c deny %sgate-audit.jsonl' % d):
             self.assertEqual(self.run_gate(command, 'enforce'), (0, '', ''), command)
 
     def test_every_write_route_is_still_tamper(self):
         d = self.DIR
-        for command in ('cp /tmp/m %smode' % d, 'cp -t %s /tmp/m' % d, 'rsync /tmp/m %s' % d,
-                        'ln -sf /tmp/m %smode' % d, 'dd if=/dev/zero of=%smode' % d,
-                        'echo x 2>/dev/null > %smode' % d, 'cat /tmp/m >| %smode' % d,
-                        'D=%s; echo warn > $D/mode' % d, 'D=%s; rm $D/state.json' % d,
-                        'echo warn | tee -a %smode' % d, 'truncate -s 0 %sstate.json' % d,
-                        'rm /tmp/x; rm %sstate.json' % d, 'env X=1 rm %sstate.json' % d,
-                        'rtk proxy rm %sstate.json' % d, '(rm %sstate.json)' % d,
-                        "perl -i -pe 's/a/b/' %smode" % d, "awk '{print > \"%smode\"}' /tmp/m" % d,
-                        "node -e \"require('fs').writeFileSync('%smode','warn')\"" % d,
-                        'bash -c "cat /tmp/m > %smode"' % d, "eval 'rm %sstate.json'" % d,
-                        'unterminated "quote %smode' % d, 'mv %sstate.json /tmp/elsewhere' % d):
-            code, out, err = self.run_gate(command, 'enforce')
-            self.assertEqual((code, out), (2, ''), command)
+        routes = ['cp /tmp/m %smode' % d, 'cp /tmp/x %smode 2>/dev/null' % d, 'cp /tmp/x %smode 2>&1' % d,
+                  'cp -rt %s /tmp/x' % d, 'install -m 644 /tmp/x %smode >/dev/null' % d,
+                  'rsync -a /tmp/x/ %s > /tmp/log' % d, 'rsync --remove-source-files %s /tmp/b' % d,
+                  'ln -sf /tmp/m %smode' % d, 'dd if=/dev/zero of=%smode' % d,
+                  'echo x 2>/dev/null > %smode' % d, 'cat /tmp/m >| %smode' % d, 'echo x >& %smode' % d,
+                  'D=%s; echo warn > $D/mode' % d, 'D=%s; rm $D/state.json' % d, 'export P=%s' % d,
+                  'echo warn | tee -a %smode' % d, 'truncate -s 0 %sstate.json' % d,
+                  'rm /tmp/x; rm %sstate.json' % d, 'env X=1 rm %sstate.json' % d,
+                  'rtk proxy rm %sstate.json' % d, '(rm %sstate.json)' % d,
+                  "perl -i -pe 's/a/b/' %smode" % d, "awk '{print > \"%smode\"}' /tmp/m" % d,
+                  "node -e \"require('fs').writeFileSync('%smode','warn')\"" % d,
+                  "python3 -c 'import shutil;shutil.move(\"%smode\",\"/tmp\")'" % d,
+                  "python3 -c 'import os;os.system(\"rm %smode\")'" % d,
+                  'python3 - <<EOF\nimport os\nos.remove("%smode")\nEOF' % d,
+                  'bash -c "cat /tmp/m > %smode"' % d, "eval 'rm %sstate.json'" % d,
+                  'unterminated "quote %smode' % d, 'mv %sstate.json /tmp/elsewhere' % d,
+                  'echo x > >(tee %smode)' % d, 'find %s -delete' % d, 'find %s -exec rm {} +' % d,
+                  'find %s -name mode | xargs rm' % d, 'sed -Ei s/a/b/ %smode' % d, 'sed -si s/a/b/ %smode' % d,
+                  'cd %s && echo x > mode' % d, 'cd %s; : > mode' % d, '(cd %s; rm mode)' % d,
+                  'pushd %s >/dev/null && rm mode' % d, 'cd %s && python3 -c "open(\'mode\',\'w\')"' % d,
+                  'bash -c "cd %s && rm mode"' % d, 'rm `echo %s`/mode' % d, 'rm $(echo %s)/mode' % d]
+        for command in routes:
+            self.assertEqual(self.run_gate(command, 'enforce')[:2], (2, ''), command)
 
 
 class GateInputs(unittest.TestCase):

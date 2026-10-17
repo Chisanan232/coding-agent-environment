@@ -496,70 +496,82 @@ TAMPER_NOTE = ('command appears to modify the disk-admission state directory (mo
                'reservations); only the operator should edit it')
 
 
-DESTINATION_ONLY = {'cp', 'install', 'ln', 'rsync'}
-INTERPRETERS = {'perl', 'ruby', 'node', 'awk', 'gawk'}
-# Interpreter source cannot be parsed, so only text that writes, removes or renames counts.
-WRITE_SIGNS = re.compile(r'write|remove|unlink|rename|replace|rmtree|truncate|chmod|touch|mkdir|append|>|'
-                         r'open\([^,)]*,\s*[\'"][^\'"]*[wax+]|mode\s*=\s*[\'"][^\'"]*[wax+]', re.IGNORECASE)
+# Default-suspect: a line that mentions the state directory is cleared only when every simple command on it
+# is provably read-only. Unknown programs, interpreters, cwd changes, heredocs and process substitution
+# stay suspect, so narrowing the old blanket rule cannot open a write route.
+READ_ONLY = {'cat', 'ls', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'rg', 'wc', 'stat', 'file', 'jq', 'diff',
+             'cmp', 'shasum', 'sha256sum', 'md5', 'md5sum', 'od', 'xxd', 'strings', 'less', 'more', 'sort',
+             'uniq', 'cut', 'tr', 'du', 'df', 'realpath', 'readlink', 'basename', 'dirname', 'echo', 'printf',
+             'true', 'false', ':', 'test', '[', 'pwd', 'date', 'sleep'}
+FIND_WRITES = ('-delete', '-exec', '-execdir', '-ok', '-okdir', '-fprint', '-fprint0', '-fprintf', '-fls')
+# Programs that change what later commands act on (cwd) or run what they are fed: suspect anywhere on the line.
+CWD_CHANGERS = {'cd', 'pushd', 'popd', 'chdir', 'xargs', 'parallel', 'source', '.', 'builtin'}
+DYNAMIC = re.compile(r'[$`*?\[{]')
+FD_DUP = re.compile(r'\A(\d+|-)\Z')
 
 
-def _names_state(text, needles, context):
-    """A path argument names the state directory, or cannot be resolved and the command mentions it."""
-    if any(needle in text for needle in needles):
-        return True
-    return ('$' in text or '`' in text) and any(needle in context for needle in needles)
-
-
-def _writes_state(tokens, words, needles, context):
-    """Does this one simple command write, move or remove something under the state directory?"""
+def _redirects_ok(tokens, needles):
+    """Every output redirect targets a literal path outside the state directory."""
     for index, token in enumerate(tokens):
-        if token in REDIRECTS:
+        if token.startswith(('>', '&>')) or token == '<>':
             target = tokens[index + 1] if index + 1 < len(tokens) else '$'
-            if _names_state(target, needles, context):
-                return True
+            if token in ('>&', '<&') and FD_DUP.match(target):
+                continue
+            if any(n in target for n in needles) or DYNAMIC.search(target) or target in ('(', ')'):
+                return False
+    return True
+
+
+def _read_only(tokens, words, needles):
     program = os.path.basename(words[0])
     arguments = words[1:]
-    if program in DESTINATION_ONLY:
-        if any(a == '-t' or a.startswith('--target-directory') for a in arguments):
-            return any(_names_state(a, needles, context) for a in arguments)
-        return bool(arguments) and _names_state(arguments[-1], needles, context)
-    if program == 'dd':
-        return any(a.startswith('of=') and _names_state(a, needles, context) for a in arguments)
+    if not _redirects_ok(tokens, needles):
+        return False
+    if program == 'find':
+        return not any(a.startswith(FIND_WRITES) for a in arguments)
     if program == 'sed':
-        return any(a.startswith('-i') or a == '--in-place' for a in arguments) and \
-            any(_names_state(a, needles, context) for a in arguments)
-    if program in WRITERS - DESTINATION_ONLY - {'dd', 'perl', 'ruby', 'node', 'awk', 'gawk'}:
-        return any(_names_state(a, needles, context) for a in arguments)
-    if program in INTERPRETERS or program.startswith('python'):
-        text = ' '.join(arguments)
-        in_place = not program.startswith('python') and any(re.match(r'-[A-Za-z]*i', a) for a in arguments)
-        return any(needle in text for needle in needles) and (in_place or bool(WRITE_SIGNS.search(text)))
-    return False
+        return not any(re.match(r'-[A-Za-z]*i', a) or a.startswith('--in-place') or a == '-f' or
+                       a.startswith('--file') for a in arguments)
+    if program in ('awk', 'gawk'):
+        return not re.search(r'[>|]|system|-i\b|-f\b', ' '.join(arguments))
+    return program in READ_ONLY
 
 
 def tamper_suspect(command, needles=(STATE_NEEDLE,)):
     """Best-effort: does this command write, move or remove under the admission state directory?
 
-    Judged per simple command: reading the directory, redirecting stderr, or an unrelated writer elsewhere
-    in the same line is not tamper. A target that cannot be resolved statically (a variable) counts as the
-    state directory when the line mentions it, and an unparsable line that mentions it is suspect.
+    Reading the directory (cat, ls, tail, grep, find without -delete or -exec, ...) with stderr or output
+    redirected elsewhere is not tamper. Everything else on a line that mentions the directory is suspect:
+    any other program that names it or uses a variable or glob, any cd or pushd, heredocs and process
+    substitution, interpreters, and an unparsable line.
     """
     if not any(needle in command for needle in needles):
         return False
+    if '<<' in command or '>(' in command or '<(' in command or '`' in command:
+        return True
     try:
         simple_commands = split_commands(command)
     except ValueError:
         return True
     for tokens in simple_commands:
-        _, words = _command_words(tokens)
+        assignments, words = _command_words(tokens)
+        if any(needle in a for a in assignments for needle in needles):
+            return True
         if not words:
-            if any(token in REDIRECTS for token in tokens) and _writes_state(tokens, ['true'], needles, command):
+            if not _redirects_ok(tokens, needles):
                 return True
             continue
-        if _writes_state(tokens, words, needles, command):
+        program = os.path.basename(words[0])
+        if program in CWD_CHANGERS:
             return True
         script = _shell_script(words)
-        if script is not None and tamper_suspect(script, needles):
+        if script is not None:
+            if tamper_suspect(script, needles):
+                return True
+            continue
+        if _read_only(tokens, words, needles):
+            continue
+        if any(n in token for token in tokens for n in needles) or any(DYNAMIC.search(w) for w in words):
             return True
     return False
 
