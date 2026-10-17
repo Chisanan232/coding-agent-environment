@@ -210,6 +210,23 @@ one prompt, is the unit of completion: `TASK_DONE` is not `CAMPAIGN_DONE`,
   `RELEASE_BLOCKED_BY_OPERATOR`. Never tag, publish, deploy to production or spend
   unapproved funds merely because the engineering work is complete.
 
+## Secret-safe testing
+
+An existing credential may be consumed by its intended SDK or provider runtime when
+the task is authorized. An agent must never inspect, print, copy, export, serialize,
+hash for reporting, or reveal an API key or other secret value.
+
+- Do not read credential-bearing shell startup files or configuration files merely
+  to discover secrets. Check presence only, with a test whose output cannot contain
+  the value (a boolean, an exit code or a length).
+- Do not use environment dumps, process command lines (`ps`, `pgrep -f`), shell
+  tracing or verbose authenticated HTTP logs; they leak values by construction.
+- Keep credential handling inside the approved runtime or provider boundary. Never
+  copy a value into the repository, a fixture, a commit, a ticket, a log or
+  generated documentation.
+- If a value is exposed anyway, stop using it, disclose the exposure plainly and
+  recommend rotation.
+
 ## Jira lifecycle
 
 When Jira is the tracker: move the ticket to In Progress when work really starts,
