@@ -178,7 +178,7 @@ one prompt, is the unit of completion: `TASK_DONE` is not `CAMPAIGN_DONE`,
   window (120 seconds) is stale and never a current decision. Before declaring
   `WAITING_DEPENDENCY`, recheck the exact merged PR and source state and recompute
   the dependency graph.
-- **Automatic reconciliation.** When a dependency merges or verifies: revalidate the
+- **Automatic reconciliation.** When a dependency merges, or its verification evidence is complete and recorded: revalidate the
   exact merged SHA, update the acceptance matrix, mark newly unblocked work `READY`,
   acquire resources, run the applicable tests, record real results and defects, and
   continue to the next real blocker. Ordinary accepted work needs no repeated
@@ -190,7 +190,9 @@ one prompt, is the unit of completion: `TASK_DONE` is not `CAMPAIGN_DONE`,
   child processes, release task-owned reservations, and reclaim only disposable
   resources through the authorized storage policy. Preserve active or resumable
   peer resources. Never change host policy or bypass a refusal to go faster.
-- **Escalation and ledger.** Routine engineering is not escalated. Escalate only a
+- **Escalation and ledger.** Routine engineering is not escalated. This list adds to,
+  and never narrows, gates defined elsewhere (force-push, publication, production,
+  IAM, payment, CI-definition changes and explicit-confirmation actions). Escalate only a
   host refusal, sensitive real-home access, credential or privileged settings
   change, unapproved spend, unauthorized destructive action, a material scope or
   release decision, or required personal founder acceptance, with exact action,
@@ -202,13 +204,15 @@ one prompt, is the unit of completion: `TASK_DONE` is not `CAMPAIGN_DONE`,
   actually installed. Valid resume events are resource admission available, owning
   PR merged, required CI or security result changed, ticket dependency completed,
   operator approval completed, and a new QA artifact. Never poll an unchanged state
-  with model calls, and never claim a closed session can wake itself. Without a real
+  with model calls (bounded polling of an authoritative handle runs in a non-model
+  watcher that wakes the agent on change), and never claim a closed session can wake itself. Without a real
   scheduler, say so and hand the missing capability to the environment owner.
 - **Verdict.** `READY_FOR_RELEASE` requires every required in-scope engineering,
   integration, QA, security, dogfooding and cleanup gate to be satisfied by live
   evidence, not installation alone. If only a founder-only gate remains, report
   `RELEASE_BLOCKED_BY_OPERATOR`. Never tag, publish, deploy to production or spend
-  unapproved funds merely because the engineering work is complete.
+  unapproved funds on the basis of campaign state; each remains gated by its own
+  explicit authorization, including when every engineering gate is satisfied.
 
 ## Secret-safe testing
 
