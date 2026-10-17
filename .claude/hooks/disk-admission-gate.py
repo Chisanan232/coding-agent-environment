@@ -511,14 +511,17 @@ DYNAMIC = re.compile(r'[$`*?\[{]')
 FD_DUP = re.compile(r'\A(\d+|-)\Z')
 
 
+SAFE_SINKS = re.compile(r'\A(/dev/(null|stdout|stderr)|(/private)?/tmp/[^\s]*|/var/folders/[^\s]*)\Z')
+
+
 def _redirects_ok(tokens, needles):
-    """Every output redirect targets a literal path outside the state directory."""
+    """Every output redirect is a descriptor duplication or a normalized path in a scratch area."""
     for index, token in enumerate(tokens):
         if token.startswith(('>', '&>')) or token == '<>':
             target = tokens[index + 1] if index + 1 < len(tokens) else '$'
             if token in ('>&', '<&') and FD_DUP.match(target):
                 continue
-            if any(n in target for n in needles) or DYNAMIC.search(target) or target in ('(', ')'):
+            if not SAFE_SINKS.match(target) or DYNAMIC.search(target) or os.path.normpath(target) != target:
                 return False
     return True
 
@@ -539,17 +542,25 @@ def _read_only(tokens, words, needles):
     return program in READ_ONLY
 
 
+def _mentions(command, needles):
+    """Loose match: every path component of a needle appears, so /./, // and ../ spellings still count."""
+    return any(all(part in command for part in needle.split('/')) for needle in needles)
+
+
+UNSAFE_ASSIGNMENTS = re.compile(r'\A(PATH|BASH_ENV|ENV|IFS|LD_\w+|DYLD_\w+)=')
+
+
 def tamper_suspect(command, needles=(STATE_NEEDLE,)):
     """Best-effort: does this command write, move or remove under the admission state directory?
 
-    Reading the directory (cat, ls, tail, grep, find without -delete or -exec, ...) with stderr or output
-    redirected elsewhere is not tamper. Everything else on a line that mentions the directory is suspect:
-    any other program that names it or uses a variable or glob, any cd or pushd, heredocs and process
-    substitution, interpreters, and an unparsable line.
+    Default-suspect. A line that mentions the directory is cleared only when every simple command on it is
+    on a read-only allowlist and its output redirects go to descriptors or normalized scratch paths. Any other
+    command on the line, cd, xargs, heredocs, command substitution, process substitution, backticks, function
+    definitions, interpreters and unparsable lines are suspect, so a decoy mention cannot clear a writer.
     """
-    if not any(needle in command for needle in needles):
+    if not _mentions(command, needles):
         return False
-    if '<<' in command or '>(' in command or '<(' in command or '`' in command:
+    if any(mark in command for mark in ('<<', '>(', '<(', '`', '$(', '${')):
         return True
     try:
         simple_commands = split_commands(command)
@@ -557,12 +568,14 @@ def tamper_suspect(command, needles=(STATE_NEEDLE,)):
         return True
     for tokens in simple_commands:
         assignments, words = _command_words(tokens)
-        if any(needle in a for a in assignments for needle in needles):
+        if any(UNSAFE_ASSIGNMENTS.match(a) or _mentions(a, needles) for a in assignments):
             return True
         if not words:
             if not _redirects_ok(tokens, needles):
                 return True
             continue
+        if any(t == '()' or t.endswith('()') for t in tokens) or os.path.basename(words[0]) == 'function':
+            return True
         program = os.path.basename(words[0])
         if program in CWD_CHANGERS:
             return True
@@ -571,9 +584,7 @@ def tamper_suspect(command, needles=(STATE_NEEDLE,)):
             if tamper_suspect(script, needles):
                 return True
             continue
-        if _read_only(tokens, words, needles):
-            continue
-        if any(n in token for token in tokens for n in needles) or any(DYNAMIC.search(w) for w in words):
+        if not _read_only(tokens, words, needles):
             return True
     return False
 

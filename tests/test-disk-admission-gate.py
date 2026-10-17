@@ -416,10 +416,10 @@ class TamperPrecision(unittest.TestCase):
         d = self.DIR
         for command in ('cat %sstate.json 2>/dev/null' % d, 'cat %sstate.json 2>&1 | head -5' % d,
                         'tail -n 20 %sgate-audit.jsonl > /tmp/audit-copy' % d, 'ls %s &> /dev/null' % d,
-                        'cat %smode; rm /tmp/scratch' % d, 'rm /tmp/scratch && ls %s' % d,
-                        'cat %smode | tee /tmp/o' % d, 'find %s -name "*.jsonl"' % d,
+                        'cat %smode; echo done > /tmp/o' % d, 'ls %s && echo ok' % d,
+                        'find %s -name "*.jsonl"' % d,
                         'jq . %sstate.json > /tmp/pretty.json' % d, 'sed s/a/b/ %smode > /tmp/o' % d,
-                        'sed -i s/a/b/ /tmp/file; cat %smode' % d, 'grep -c deny %sgate-audit.jsonl' % d):
+                        'grep -c deny %sgate-audit.jsonl' % d):
             self.assertEqual(self.run_gate(command, 'enforce'), (0, '', ''), command)
 
     def test_every_write_route_is_still_tamper(self):
@@ -445,6 +445,13 @@ class TamperPrecision(unittest.TestCase):
                   'sort -o %smode /tmp/x' % d, 'sort /tmp/x -o %smode' % d, 'uniq /tmp/x %smode' % d,
                   "sed 's/a/b/w %smode' /tmp/x" % d, "sed -n 'w %smode' /tmp/x" % d, 'xxd -r /tmp/x %smode' % d,
                   'rg --pre rm x %s' % d, 'cat %smode > $OUT' % d, 'less %smode' % d,
+                  'ls %s; rm /Users/u/.cache/coding-agent-environment/./admission/mode' % d,
+                  'ls %s; rm /Users/u/.cache/coding-agent-environment//admission/mode' % d,
+                  'cat %smode; mv /tmp/x /tmp/y' % d, 'cat %smode; python3 /tmp/s.py' % d,
+                  'cat %smode > /Users/u/.cache/coding-agent-environment/./admission/mode' % d,
+                  'cat %smode > mode' % d, 'cat %smode > /tmp/../Users/u/x' % d,
+                  'echo "$(rm -f %smode)"' % d, 'cat %smode "$(touch /tmp/x)"' % d,
+                  'cat() { rm %smode; }; cat' % d, 'PATH=/tmp/evil cat %smode' % d,
                   'cd %s && echo x > mode' % d, 'cd %s; : > mode' % d, '(cd %s; rm mode)' % d,
                   'pushd %s >/dev/null && rm mode' % d, 'cd %s && python3 -c "open(\'mode\',\'w\')"' % d,
                   'bash -c "cd %s && rm mode"' % d, 'rm `echo %s`/mode' % d, 'rm $(echo %s)/mode' % d]
