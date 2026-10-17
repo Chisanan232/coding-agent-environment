@@ -561,14 +561,18 @@ def _mentions(command, needles):
         if '/' not in parent:
             # A bare directory name only counts under a dot-directory (~/.cache, ~/.claude, ~/.config): the same
             # name is also an ordinary checkout, and `git -C .../coding-agent-environment status` is fine.
-            rooted = r'(?:(?<=\.cache/)|(?<=\.claude/)|(?<=\.config/))' + re.escape(parent)
+            rooted = (r'(?:\.cache|\.claude|\.config)["\']?/+(?:\.{1,2}/+|[^\s/]+/+\.\./+)*["\']?' + re.escape(parent))
             if re.search(rooted + r'/+\S', command) or re.search(rooted + r'(?![\w.+-])', command) or \
                     re.search(r'(?:\.cache|\.claude|\.config)/' + re.escape(parent[:12]) + r'[^\s/]*' + glob + r'[^\s/]*', command):
                 return True
         else:
-            # A custom (sandbox) directory: its own name, spelled with /./, // or a glob; never its whole parent.
+            # A custom (sandbox) directory: its own name (also via ../ or /./ or a glob) and, when it is at
+            # least two levels deep, its parent too (deleting the parent deletes the state). A one-level
+            # parent such as /tmp is never a mention, or every scratch file would be.
             parent_re = re.escape(parent)
-            if re.search(parent_re + r'/+(\.{1,2}/+)*(' + re.escape(child) + r'(?![\w.+-])|[^\s/]*' + glob + ')', command):
+            if re.search(parent_re + r'/+(?:\.{1,2}/+|[^\s/]+/+\.\./+)*(' + re.escape(child) + r'(?![\w.+-])|[^\s/]*' + glob + ')', command):
+                return True
+            if parent.strip('/').count('/') >= 1 and re.search(parent_re + r'(?![\w.+-])', command):
                 return True
         if re.search(glob + r'[^\s/]*/+(\.{1,2}/+)*' + re.escape(child) + r'(?![\w.+-])', command):
             return True

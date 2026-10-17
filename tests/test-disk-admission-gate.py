@@ -489,6 +489,17 @@ class ParentAndAliasSpellings(unittest.TestCase):
                         'rm -rf %s/./' % p, 'rm -rf %s/.[a]*' % p):
             self.assertTrue(gate.tamper_suspect(command), command)
 
+    def test_sandbox_parent_and_dotdot_child_and_quoted_default_parent(self):
+        needles = gate._directory_spellings(Path('/tmp/sbx/state'))
+        for command in ('rm -rf /tmp/sbx', 'rm -rf /tmp/sbx/x/../state', 'cd /tmp/sbx && rm -rf state'):
+            self.assertTrue(gate.tamper_suspect(command, needles), command)
+        for command in ('rm -rf /tmp/sbx-other', 'cargo build > /tmp/stats.log', 'ls /tmp'):
+            self.assertFalse(gate.tamper_suspect(command, needles), command)
+        for command in ('rm -rf ~/.cache/./coding-agent-environment', 'rm -rf ~/.cache//coding-agent-environment',
+                        'rm -rf ~/.cache/x/../coding-agent-environment', 'rm -rf ~/.cache/"coding-agent-environment"',
+                        'rm -rf "$HOME/.cache"/coding-agent-environment', 'mv ~/.config/./coding-agent-environment /tmp/g'):
+            self.assertTrue(gate.tamper_suspect(command), command)
+
     def test_worktrees_and_checkouts_are_not_mentions(self):
         for command in ('cd /Users/u/Dev/coding-agent-environment-harden-SPE-109-x && ls',
                         'cd /Users/u/Dev/coding-agent-environment && rm -rf build',
