@@ -136,7 +136,12 @@ State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
 then `exec`s the job. `exec` keeps the pid and start time, so the reservation is held by the job itself, nothing
 runs before admission, and no release step exists: exit, pid reuse and TTL expiry are reaped lazily. A refusal
 (latched, no free lane, over capacity, bad label or bytes, TTL above 4 h without `--max-hold`) never starts the job
-and exits 77; a failed `exec` releases the reservation and exits 127. A running job past its TTL silently loses its
+and exits 77; a failed `exec` releases the reservation and exits 127. Messages go to stderr (the reserved line only
+when stderr is a terminal, so a captured job stderr is not polluted), `--` between the options and the command is
+mandatory, and the job starts with default SIGPIPE/SIGXFSZ dispositions. The exit codes 77/127 are authoritative only
+until the job starts; afterwards the exit code is the job's own, so a job that can exit 77 or 127 is ambiguous (argparse
+errors exit 2). Only the exec'd process is tracked: a job that forks a daemon and exits, or backgrounds work, loses its
+reservation while the real consumer continues. A running job past its TTL silently loses its
 reservation, and an exited job that its parent has not reaped is still counted. Reservations only coordinate
 callers that use them: the gate hook still decides on tier and latch alone, so an unwrapped heavy command can run
 beside a reserved one. This state is advisory (same-user), not a security boundary.

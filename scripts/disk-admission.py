@@ -57,6 +57,7 @@ import plistlib
 import pwd
 import re
 import secrets
+import signal
 import stat
 import subprocess
 import sys
@@ -631,21 +632,33 @@ def build_refresher_plist(python, script):
     }).decode()
 
 
+def _exec_job(program, args):
+    """exec the job with default signal dispositions: Python ignores SIGPIPE and SIGXFSZ and exec inherits that,
+    which would make `sh -c 'yes | head -1'` behave differently under the wrapper than without it."""
+    for name in ('SIGPIPE', 'SIGXFSZ'):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), signal.SIG_DFL)
+    os.execvp(program, args)
+
+
 def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, ttl=DEFAULT_TTL, allow_long=False,
-                 exec_fn=os.execvp):
+                 exec_fn=_exec_job):
     """Reserve for this very process, then exec the job: nothing runs before admission.
 
     execv keeps the pid and the start time, so the reservation is held by the job itself and ends with it
     (lazy reaping handles exit, pid reuse and TTL). A refusal never execs and returns 77; a failed exec
-    releases the reservation and returns 127.
+    releases the reservation and returns 127. Every message goes to stderr; the exit code is the contract,
+    and it is authoritative only until the job starts (after exec the exit code is the job's own).
     """
     if not argv or not all(isinstance(part, str) and part and '\0' not in part for part in argv):
-        print('refused: invalid-request: a command is required after --')
+        print('refused: invalid-request: a command is required after --', file=sys.stderr)
         return REFUSED_EXIT
     result = reserve(label, nbytes, os.getpid(), state_path, free_fn, ttl=ttl, allow_long=allow_long)
-    print(result['reason'], file=sys.stderr)
     if not result['admit']:
+        print(result['reason'], file=sys.stderr)
         return REFUSED_EXIT
+    if sys.stderr.isatty():
+        print(result['reason'], file=sys.stderr)  # never injected into a captured job stderr
     try:
         exec_fn(argv[0], argv)
     except OSError as exc:
@@ -693,7 +706,10 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
         print(build_refresher_plist(sys.executable, str(Path(__file__).resolve())), end='')
         return 0
     if args.command == 'run':
-        job = args.job[1:] if args.job[:1] == ['--'] else args.job
+        if args.job[:1] != ['--']:
+            print('refused: invalid-request: put -- between the options and the command', file=sys.stderr)
+            return REFUSED_EXIT
+        job = args.job[1:]
         return run_reserved(args.label, args.nbytes, job, state_path, free_fn, args.ttl, args.allow_long)
     if args.command in ('reserve', 'release'):
         result = (reserve(args.label, args.nbytes, args.pid, state_path, free_fn, ttl=args.ttl, allow_long=args.allow_long)
