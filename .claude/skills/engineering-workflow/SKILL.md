@@ -220,9 +220,12 @@ An existing credential may be consumed by its intended SDK or provider runtime w
 the task is authorized. An agent must never inspect, print, copy, export, serialize,
 hash for reporting, or reveal an API key or other secret value.
 
-- Do not read credential-bearing shell startup files or configuration files merely
-  to discover secrets. Check presence only, with a test whose output cannot contain
-  the value (a boolean, an exit code or a length).
+- Do not read credential-bearing shell startup files or configuration files (the
+  prohibition does not depend on intent). Check presence only, with a test whose
+  output cannot contain the value (a boolean, an exit code or a length).
+- Pass a secret to a process through stdin or a pipe, never as a command-line
+  argument. Do not use a tool or MCP call whose result is the secret value; use a
+  path that keeps the value inside a pipe between processes.
 - Do not use environment dumps, process command lines (`ps`, `pgrep -f`), shell
   tracing or verbose authenticated HTTP logs; they leak values by construction.
 - Keep credential handling inside the approved runtime or provider boundary. Never

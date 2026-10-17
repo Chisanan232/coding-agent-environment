@@ -188,7 +188,9 @@ class EngineeringWorkflowContract(unittest.TestCase):
         for phrase in [
             "may be consumed by its intended SDK or provider runtime",
             "must never inspect, print, copy, export, serialize, hash for reporting, or reveal",
-            "Do not read credential-bearing shell startup files",
+            "Do not read credential-bearing shell startup files or configuration files (the prohibition does not depend on intent)",
+            "through stdin or a pipe, never as a command-line argument",
+            "tool or MCP call whose result is the secret value",
             "Check presence only",
             "Do not use environment dumps, process command lines",
             "shell tracing or verbose authenticated HTTP logs",
