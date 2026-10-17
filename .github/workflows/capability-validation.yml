@@ -76,6 +76,8 @@ jobs:
           python3 tests/test-resource-policy-install.py
           python3 tests/test-launcher-runtime.py
           python3 tests/test-campaign-resume.py
+          python3 tests/test-disk-admission-gate.py
+          python3 tests/test-disk-admission.py
           python3 tests/test-parity-dogfood.py
   native-resource-wire:
     runs-on: macos-14

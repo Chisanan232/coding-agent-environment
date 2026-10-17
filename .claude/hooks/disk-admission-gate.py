@@ -496,29 +496,147 @@ TAMPER_NOTE = ('command appears to modify the disk-admission state directory (mo
                'reservations); only the operator should edit it')
 
 
-def tamper_suspect(command, needles=(STATE_NEEDLE,)):
-    """Best-effort: does this command write, move or remove under the admission state directory?"""
-    if not any(needle in command for needle in needles):
+# Default-suspect: a line that mentions the state directory is cleared only when every simple command on it
+# is provably read-only. Unknown programs, interpreters, cwd changes, heredocs and process substitution
+# stay suspect, so narrowing the old blanket rule cannot open a write route.
+# Only programs with no file-writing or command-running option: sort -o, uniq IN OUT, xxd -r, date -s,
+# less/rg --pre, sed w and awk system() are deliberately absent.
+READ_ONLY = {'cat', 'ls', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'wc', 'stat', 'jq', 'diff', 'cmp', 'shasum',
+             'sha256sum', 'md5', 'md5sum', 'strings', 'cut', 'tr', 'du', 'df', 'realpath', 'readlink', 'basename',
+             'dirname', 'echo', 'printf', 'true', 'false', ':', 'test', '[', 'pwd'}
+FIND_WRITES = ('-delete', '-exec', '-execdir', '-ok', '-okdir', '-fprint', '-fprint0', '-fprintf', '-fls')
+# Programs that change what later commands act on (cwd) or run what they are fed: suspect anywhere on the line.
+CWD_CHANGERS = {'cd', 'pushd', 'popd', 'chdir', 'xargs', 'parallel', 'source', '.', 'builtin'}
+DYNAMIC = re.compile(r'[$`*?\[{]')
+FD_DUP = re.compile(r'\A(\d+|-)\Z')
+
+
+SAFE_SINKS = re.compile(r'\A(/dev/(null|stdout|stderr)|(/private)?/tmp/[^\s]*|/var/folders/[^\s]*)\Z')
+
+
+def _redirects_ok(tokens, needles):
+    """Every output redirect is a descriptor duplication or a normalized path in a scratch area."""
+    for index, token in enumerate(tokens):
+        if token.startswith(('>', '&>')) or token == '<>':
+            target = tokens[index + 1] if index + 1 < len(tokens) else '$'
+            if token in ('>&', '<&') and FD_DUP.match(target):
+                continue
+            if not SAFE_SINKS.match(target) or DYNAMIC.search(target) or os.path.normpath(target) != target \
+                    or _mentions(target, needles):
+                return False
+    return True
+
+
+def _read_only(tokens, words, needles):
+    program = os.path.basename(words[0])
+    arguments = words[1:]
+    if '/' in words[0] and not TRUSTED_BIN.match(words[0]):
+        return False  # a planted binary named like a read-only tool
+    if not _redirects_ok(tokens, needles):
         return False
+    if program == 'find':
+        return not any(a.startswith(FIND_WRITES) for a in arguments)
+    if program == 'sed':
+        # Only a plain substitution: no -i, no -f, no w/e flags or commands that write or run something.
+        flags = [a for a in arguments if a.startswith('-')]
+        rest = [a for a in arguments if not a.startswith('-')]
+        return bool(rest) and all(f in ('-n', '-E', '-r') for f in flags) and \
+            re.fullmatch(r's/[^/\\]*/[^/\\]*/[gpiI0-9]*', rest[0]) is not None
+    return program in READ_ONLY
+
+
+def _mentions(command, needles):
+    """Does the line name the state directory, its parent, or a spelling of either (/./, //, globs)?
+
+    Path-shaped on purpose: a worktree called coding-agent-environment-SPE-1 or a file called disk-admission.py
+    must not match, while rm -rf <parent>, <parent>/adm*, <parent>/./admission and coding-agent-env*/ must.
+    """
+    for needle in needles:
+        if needle in command:
+            return True
+        parent, _, child = needle.rpartition('/')
+        if not parent:
+            continue
+        glob = r'[*?\[]'
+        if '/' not in parent:
+            # A bare directory name only counts under a dot-directory (~/.cache, ~/.claude, ~/.config): the same
+            # name is also an ordinary checkout, and `git -C .../coding-agent-environment status` is fine.
+            rooted = (r'(?:\.cache|\.claude|\.config)["\']?/+(?:\.{1,2}/+|[^\s/]+/+\.\./+)*["\']?' + re.escape(parent))
+            if re.search(rooted + r'/+\S', command) or re.search(rooted + r'(?![\w.+-])', command) or \
+                    re.search(r'(?:\.cache|\.claude|\.config)/' + re.escape(parent[:12]) + r'[^\s/]*' + glob + r'[^\s/]*', command):
+                return True
+        else:
+            # A custom (sandbox) directory: its own name (also via ../ or /./ or a glob) and, when it is at
+            # least two levels deep, its parent too (deleting the parent deletes the state). A one-level
+            # parent such as /tmp is never a mention, or every scratch file would be.
+            parent_re = re.escape(parent)
+            if re.search(parent_re + r'/+(?:\.{1,2}/+|[^\s/]+/+\.\./+)*(' + re.escape(child) + r'(?![\w.+-])|[^\s/]*' + glob + ')', command):
+                return True
+            if parent.strip('/').count('/') >= 1 and re.search(parent_re + r'(?![\w.+-])', command):
+                return True
+        if re.search(glob + r'[^\s/]*/+(\.{1,2}/+)*' + re.escape(child) + r'(?![\w.+-])', command):
+            return True
+    return False
+
+
+TRUSTED_BIN = re.compile(r'\A(/bin|/usr/bin|/usr/local/bin|/opt/homebrew/bin)/[^/]+\Z')
+
+
+UNSAFE_ASSIGNMENTS = re.compile(r'\A(PATH|BASH_ENV|ENV|IFS|LD_\w+|DYLD_\w+)=')
+
+
+def tamper_suspect(command, needles=(STATE_NEEDLE,)):
+    """Best-effort: does this command write, move or remove under the admission state directory?
+
+    Default-suspect. A line that mentions the directory is cleared only when every simple command on it is
+    on a read-only allowlist and its output redirects go to descriptors or normalized scratch paths. Any other
+    command on the line, cd, xargs, heredocs, command substitution, process substitution, backticks, function
+    definitions, interpreters and unparsable lines are suspect, so a decoy mention cannot clear a writer.
+    """
+    if not _mentions(command, needles):
+        return False
+    if any(mark in command for mark in ('<<', '>(', '<(', '`', '$(', '${')):
+        return True
     try:
         simple_commands = split_commands(command)
     except ValueError:
         return True
     for tokens in simple_commands:
-        _, words = _command_words(tokens)
-        if any(token in REDIRECTS for token in tokens):
+        assignments, words = _command_words(tokens)
+        if any(UNSAFE_ASSIGNMENTS.match(a) or _mentions(a, needles) for a in assignments):
             return True
         if not words:
+            if not _redirects_ok(tokens, needles):
+                return True
             continue
-        program = os.path.basename(words[0])
-        if program in WRITERS or program.startswith('python'):
+        if any(t == '()' or t.endswith('()') for t in tokens) or os.path.basename(words[0]) == 'function':
             return True
-        if program == 'sed' and any(w.startswith('-i') or w == '--in-place' for w in words[1:]):
+        program = os.path.basename(words[0])
+        if program in CWD_CHANGERS:
             return True
         script = _shell_script(words)
-        if script is not None and tamper_suspect(script, needles):
+        if script is not None:
+            if tamper_suspect(script, needles):
+                return True
+            continue
+        if not _read_only(tokens, words, needles):
             return True
     return False
+
+
+def _directory_spellings(directory):
+    """The configured directory as typed, resolved, and with macOS's /private alias added or removed."""
+    spellings = {str(directory)}
+    try:
+        spellings.add(os.path.realpath(directory))
+    except OSError:
+        pass
+    for text in list(spellings):
+        if text.startswith('/private/'):
+            spellings.add(text[len('/private'):])
+        elif text.startswith(('/tmp/', '/var/', '/etc/')):
+            spellings.add('/private' + text)
+    return tuple(sorted(spellings))
 
 
 def decide(command, mode, runner=run_adapter, exists=os.path.exists, needles=(STATE_NEEDLE,), events=None):
@@ -563,7 +681,7 @@ def main(raw, stdout, stderr, mode_fn=None, runner=None, admission_dir=None, con
     custom = admission_dir is not None
     mode_fn = mode_fn or (lambda: read_mode(directory / 'mode'))
     runner = runner or (lambda: run_adapter(directory if custom else None))
-    needles = (STATE_NEEDLE,) + ((str(directory),) if custom else ())
+    needles = (STATE_NEEDLE,) + (_directory_spellings(directory) if custom else ())
     try:
         if isinstance(raw, bytes):
             raw = raw.decode('utf-8', 'replace')
