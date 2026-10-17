@@ -28,7 +28,7 @@ happens until an event is observed.
 | Lease | An unexpired lease whose coordinator pid or resumed child pid is alive blocks concurrent ticks. A dead or expired lease is recovered with a receipt and no extra spend. Timestamps use the time of each claim. |
 | Locking | Events (`gh`, 20 s each) and admission are evaluated with no lock held and re-verified under it, so `register` is never blocked behind them. |
 | Isolation | One campaign's error is receipted (`tick_error`) and the others still run. An unreadable `gh` is receipted as `github_unreadable`, at most hourly. |
-| Admission | A resume starts only when `disk-admission.py check --weight <light/heavy>` exits 0. Denial spends no budget. |
+| Admission | A resume starts only when `disk-admission.py check --weight light` exits 0. Denial spends no budget. Heavy automatic resumes are DISABLED: admission is a check, and a SPE-109 reservation needs a byte size and pid this tool cannot know. Heavy work in the resumed session is still subject to the SPE-109 gate hook (WARN until an operator enables ENFORCE). Registering `heavy` is refused. |
 | Timeout | The run has a hard timeout; its process group is killed. |
 | No bypass | The argv has no permission flag. The prompt is a constant; checkpoints are never executed or used as prompt text. |
 | Receipts | One JSONL line per decision in `~/.cache/coding-agent-environment/campaigns/receipts.jsonl` (mode 0600). |

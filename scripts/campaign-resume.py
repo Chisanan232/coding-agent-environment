@@ -163,8 +163,10 @@ def validate(record):
         raise CheckpointError('cwd must be absolute')
     if record.get('state') not in STATES:
         raise CheckpointError('bad state')
-    if record.get('admission_weight') not in ('light', 'heavy'):
-        raise CheckpointError('admission_weight must be light or heavy')
+    if record.get('admission_weight') != 'light':
+        # Admission is a check, not a reservation (SPE-109 reserve needs a byte size this tool cannot know),
+        # so automatic heavy resumes stay disabled until a reviewed reservation integration exists.
+        raise CheckpointError('admission_weight must be light; automatic heavy resumes are disabled')
     events = record.get('events')
     if not isinstance(events, list) or not events:
         raise CheckpointError('at least one event is required')
@@ -480,7 +482,7 @@ def build_parser():
     reg.add_argument('--max-resumes', type=int, default=DEFAULT_MAX_RESUMES)
     reg.add_argument('--cooldown-s', type=int, default=DEFAULT_COOLDOWN_S)
     reg.add_argument('--timeout-s', type=int, default=DEFAULT_TIMEOUT_S)
-    reg.add_argument('--weight', choices=('light', 'heavy'), default='light')
+    reg.add_argument('--weight', choices=('light',), default='light', help='heavy automatic resumes are disabled')
     stat = commands.add_parser('status', allow_abbrev=False, help='print every checkpoint')
     stat.add_argument('--json', action='store_true', required=True)
     tick_cmd = commands.add_parser('tick', allow_abbrev=False, help='observe events and resume due campaigns')

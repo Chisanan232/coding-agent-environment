@@ -55,7 +55,7 @@ class Checkpoints(unittest.TestCase):
             dict(events=[]), dict(events=[{'id': 'x', 'kind': 'shell', 'cmd': 'rm -rf /'}]),
             dict(events=[dict(PR_EVENT, repo='a/b; rm')]), dict(events=[dict(PR_EVENT, number=0)]),
             dict(events=[dict(PR_EVENT), dict(PR_EVENT)]), dict(max_resumes=0), dict(cooldown_s=1),
-            dict(timeout_s=cr.MAX_TIMEOUT_S + 1), dict(admission_weight='huge'),
+            dict(timeout_s=cr.MAX_TIMEOUT_S + 1), dict(admission_weight='huge'), dict(admission_weight='heavy'),
         ]
         for overrides in bad:
             with self.subTest(overrides=overrides), self.assertRaises(cr.CheckpointError):
@@ -236,11 +236,11 @@ class Engine(unittest.TestCase):
         self.assertEqual(self.tick(now=NOW + timedelta(seconds=60)), [])
         self.assertEqual(self.tick(now=NOW + timedelta(seconds=cr.DEFAULT_COOLDOWN_S + 1)), ['spe-108'])
 
-    def test_admission_uses_checkpoint_weight_and_fails_closed(self):
-        make(self.dir, cwd=self.tmp.name, admission_weight='heavy')
+    def test_admission_is_light_only_and_fails_closed(self):
+        make(self.dir, cwd=self.tmp.name)
         seen = []
         self.tick(admit=lambda weight: seen.append(weight) or False)
-        self.assertEqual(seen, ['heavy'])
+        self.assertEqual(seen, ['light'])
         with mock.patch.object(cr.subprocess, 'run', side_effect=OSError('boom')):
             self.assertFalse(cr.admission_admits('light'))
         with mock.patch.object(cr.subprocess, 'run', return_value=subprocess.CompletedProcess([], 77)):
@@ -484,6 +484,14 @@ class Engine(unittest.TestCase):
         self.assertEqual(len(recorded), 1)
         self.assertEqual(recorded[0][0], recorded[0][1])
         self.assertGreater(recorded[0][1], 0)
+
+
+    def test_cli_refuses_heavy_automatic_resume(self):
+        with redirect_stdout(io.StringIO()), mock.patch('sys.stderr', io.StringIO()), self.assertRaises(SystemExit) as raised:
+            cr.run(['register', '--campaign', 'c', '--session-id', SESSION, '--cwd', '/tmp', '--pr-merged', 'o/r#1',
+                    '--weight', 'heavy'], directory=self.dir, now=NOW)
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(list(self.dir.glob('*.json')) if self.dir.exists() else [], [])
 
 
 if __name__ == '__main__':
