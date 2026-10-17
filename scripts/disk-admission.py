@@ -53,11 +53,13 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import plistlib
 import pwd
 import re
 import secrets
 import stat
 import subprocess
+import sys
 import time
 
 GIB = 1024 ** 3
@@ -610,6 +612,23 @@ def snapshot(state_path, source_fn=measure_with_source, now=None, token_fn=proce
 
 
 REFUSED_EXIT = 77
+REFRESH_LABEL = 'com.coding-agent-environment.admission-snapshot'
+REFRESH_INTERVAL_S = 60  # well inside STALE_AFTER_S, so a missed run does not make consumers refuse at once
+
+
+def build_refresher_plist(python, script):
+    """launchd user agent that republishes the snapshot. No KeepAlive; output goes nowhere because the published
+    record is the product (a stale snapshot is what `snapshot --check-fresh` reports), so no log can grow."""
+    return plistlib.dumps({
+        'Label': REFRESH_LABEL,
+        'ProgramArguments': [python, script, 'snapshot', '--json'],
+        'StartInterval': REFRESH_INTERVAL_S,
+        'RunAtLoad': True,
+        'ProcessType': 'Background',
+        'EnvironmentVariables': {'HOME': str(account_home()), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'},
+        'StandardOutPath': '/dev/null',
+        'StandardErrorPath': '/dev/null',
+    }).decode()
 
 
 def build_parser():
@@ -631,6 +650,7 @@ def build_parser():
     mode.add_argument('--json', action='store_true', help='write and print a fresh snapshot')
     mode.add_argument('--check-fresh', action='store_true', help='read-only: exit 0 when the snapshot is fresh, else 77')
     shot.add_argument('--max-age', type=int, default=STALE_AFTER_S, help='seconds, 1..120; with --check-fresh only')
+    commands.add_parser('refresher-plist', allow_abbrev=False, help='print the snapshot-refresher launchd agent; installs nothing')
     drop = commands.add_parser('release', allow_abbrev=False, help='release a reservation by label')
     drop.add_argument('--label', required=True)
     return parser
@@ -639,6 +659,9 @@ def build_parser():
 def main(argv=None, free_fn=measure_free_bytes, state_path=None):
     state_path = state_path or default_state_path()
     args = build_parser().parse_args(argv)
+    if args.command == 'refresher-plist':
+        print(build_refresher_plist(sys.executable, str(Path(__file__).resolve())), end='')
+        return 0
     if args.command in ('reserve', 'release'):
         result = (reserve(args.label, args.nbytes, args.pid, state_path, free_fn, ttl=args.ttl, allow_long=args.allow_long)
                   if args.command == 'reserve' else release(args.label, state_path))

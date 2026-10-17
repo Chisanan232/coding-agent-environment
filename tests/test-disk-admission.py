@@ -808,5 +808,28 @@ class ReservationHardening(unittest.TestCase):
         self.assertIn('reservation-unverifiable', ' '.join(record['blockers']))
 
 
+class RefresherPlist(unittest.TestCase):
+    def test_refresher_agent_is_bounded_and_installs_nothing(self):
+        import plistlib
+        data = plistlib.loads(da.build_refresher_plist('/usr/bin/python3', '/opt/x/disk-admission.py').encode())
+        self.assertEqual(data['Label'], 'com.coding-agent-environment.admission-snapshot')
+        self.assertEqual(data['ProgramArguments'], ['/usr/bin/python3', '/opt/x/disk-admission.py', 'snapshot', '--json'])
+        self.assertLess(data['StartInterval'], da.STALE_AFTER_S)
+        self.assertNotIn('KeepAlive', data)
+        self.assertEqual((data['StandardOutPath'], data['StandardErrorPath']), ('/dev/null', '/dev/null'))
+        self.assertTrue(data['RunAtLoad'])
+
+    def test_cli_prints_the_plist_without_touching_state(self):
+        import io, contextlib
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp) / 'admission/state.json'
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = da.main(['refresher-plist'], state_path=state)
+            self.assertEqual(code, 0)
+            self.assertIn('<key>StartInterval</key>', out.getvalue())
+            self.assertFalse(state.parent.exists())
+
+
 if __name__ == '__main__':
     unittest.main()
