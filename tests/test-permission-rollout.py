@@ -251,6 +251,20 @@ class PersonalDevTrust(Fixture):
         # the owners the prose refers to must really be in the same output
         self.assertTrue(any(e.startswith("**Trusted GitHub owners") for e in new["autoMode"]["environment"]))
 
+    def test_external_provenance_hardening_n3_n5_n6(self):
+        # SPE-106 negative controls: a session started in an external repo (N5), spoofed ownership signals (N6)
+        # and git commands that execute an untrusted repository's configured commands (N3).
+        new = self.merged_dev()
+        env = "\n".join(e for e in new["autoMode"]["environment"] if e.startswith("**Personal development machine"))
+        self.assertIn("Being the session's starting directory is not trust", env)
+        self.assertIn("lifecycle hooks and test commands are external code", env)
+        self.assertIn("host must be exactly github.com", env)
+        for spoof in ("lookalike host or owner", "embedded credentials", "mirror or redirect", "README"):
+            self.assertIn(spoof, env)
+        for hook in ("core.sshCommand", "core.fsmonitor", "uploadpack", "-C into"):
+            self.assertIn(hook, env)
+        self.assertIn("even fetch, status, diff or log", env)
+
     def test_without_dev_dirs_nothing_about_directories_is_added(self):
         new = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), ["OwnerA"])
         self.assertNotIn("additionalDirectories", new["permissions"])

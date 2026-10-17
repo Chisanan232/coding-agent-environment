@@ -322,6 +322,8 @@ destroy-x`); accepted as the cost of covering `-chdir=` forms. `gcloud secrets`
 metadata reads whose arguments contain `projects/` are no longer gated by the
 baseline (the narrower `gcloud secrets*projects/*` ask lives in the private overlay).
 
+**External-provenance hardening (N3/N5/N6, 2026-10-17).** The negative controls left three gaps in the dev-trust prose, closed in the template line (no new rule type; the effect is classifier-sampled, not proven): (N5) a session started inside a repository whose origin is not owned by a trusted owner gets no trust from being the starting directory, so its scripts, build files, lifecycle hooks and test commands are external code; (N6) ownership is read from the real origin host and owner path (host exactly github.com), so lookalike hosts or owners, embedded credentials, mirrors, redirects and owner names appearing in repository text earn nothing; (N3) git commands in or `-C` into an external-provenance repository read its `.git/config` and can run configured commands (`core.sshCommand`, `core.fsmonitor`, filter drivers, credential helpers, `remote.*.uploadpack`), so even fetch/status/diff/log are judged as running external code. The earlier N3 observation (fetch executed unprompted) is therefore treated as a policy gap, not as consistent. Live effect requires the hash-pinned operator rollout.
+
 **Personal-machine trust (founder clarification, 2026-10-16).** Trust is global to
 the personal Claude Code installation, not to the directory a session started in.
 It is applied at rollout from private parameters, never committed: `--owners`
