@@ -11,6 +11,7 @@ import stat
 import tempfile
 import os
 import subprocess
+import threading
 import unittest
 from datetime import timedelta
 from unittest import mock
@@ -59,13 +60,13 @@ class Checkpoints(unittest.TestCase):
                 make(self.dir, **overrides)
         self.assertEqual(list(self.dir.glob('*.json')), [])
 
-    def test_reregister_keeps_spent_budget_and_consumed_events(self):
+    def test_reregister_keeps_budget_but_declares_a_fresh_wait(self):
         make(self.dir)
         record = cr.load(self.dir, 'spe-108')
         record.update(resumes_used=2, consumed=['pr0-76'], state='WAITING_OPERATOR')
         cr.write_json_atomic(self.dir / 'spe-108.json', record)
         again = make(self.dir, events=[dict(PR_EVENT), dict(PR_EVENT, id='pr1-77', number=77)])
-        self.assertEqual((again['resumes_used'], again['consumed'], again['state']), (2, ['pr0-76'], 'WAITING_OPERATOR'))
+        self.assertEqual((again['resumes_used'], again['consumed'], again['state']), (2, [], 'WAITING_OPERATOR'))
 
     def test_load_refuses_symlink_and_garbage(self):
         make(self.dir)
@@ -90,6 +91,9 @@ class Checkpoints(unittest.TestCase):
         self.assertEqual(plist['StartInterval'], 300)
         self.assertNotIn('KeepAlive', plist)
         self.assertFalse(plist['RunAtLoad'])
+        path = plist['EnvironmentVariables']['PATH'].split(':')
+        self.assertIn('/opt/homebrew/bin', path)
+        self.assertTrue(any(entry.endswith('.local/bin') for entry in path))
 
     def test_cli_register_status_and_invalid_exit(self):
         out = io.StringIO()
@@ -119,7 +123,7 @@ class Engine(unittest.TestCase):
         self.open = lambda repo, number: 'OPEN'
 
     def runner(self, result=None):
-        def run(argv, cwd, timeout, log_path):
+        def run(argv, cwd, timeout, log_path, on_start=None):
             self.calls.append((argv, cwd, timeout))
             return result or {'outcome': 'exited', 'code': 0}
         return run
@@ -198,22 +202,25 @@ class Engine(unittest.TestCase):
         self.tick()
         self.assertEqual(self.decisions(), ['crash_recovered'])
 
-    def test_session_exit_without_checkpoint_returns_to_wait(self):
+    def test_clean_exit_without_checkpoint_waits_but_failed_exit_needs_operator(self):
         make(self.dir, cwd=self.tmp.name)
-        self.tick(runner=self.runner({'outcome': 'exited', 'code': 1}))
+        self.tick(runner=self.runner({'outcome': 'exited', 'code': 0}))
         self.assertEqual(cr.load(self.dir, 'spe-108')['state'], 'WAIT_DEPENDENCY')
+        make(self.dir, name='bad', cwd=self.tmp.name)
+        self.tick(runner=self.runner({'outcome': 'exited', 'code': 1}))
+        self.assertEqual(cr.load(self.dir, 'bad')['state'], 'WAITING_OPERATOR')
         self.assertEqual(self.receipts()[-1]['code'], 1)
 
     def test_agent_reregister_during_run_is_preserved(self):
         make(self.dir, cwd=self.tmp.name)
 
-        def agent(argv, cwd, timeout, log_path):
+        def agent(argv, cwd, timeout, log_path, on_start=None):
             make(self.dir, cwd=self.tmp.name, events=[dict(PR_EVENT, id='pr1-77', number=77)])
             return {'outcome': 'exited', 'code': 0}
         self.tick(runner=agent)
         record = cr.load(self.dir, 'spe-108')
         self.assertEqual([event['id'] for event in record['events']], ['pr1-77'])
-        self.assertEqual(record['consumed'], ['pr0-76'])
+        self.assertEqual(record['consumed'], [])
         self.assertIsNone(record['lease'])
 
     def test_admission_denied_spends_nothing_and_honours_cooldown(self):
@@ -237,25 +244,132 @@ class Engine(unittest.TestCase):
         with mock.patch.object(cr.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
             self.assertTrue(cr.admission_admits('light'))
 
-    def test_permission_denied_launch_spends_budget_then_stops_for_operator(self):
-        make(self.dir, cwd=self.tmp.name, max_resumes=2, events=[dict(PR_EVENT)])
-        denied = {'outcome': 'launch_failed', 'error': 'PermissionError'}
-        self.tick(runner=self.runner(denied))
+    def test_permission_denied_launch_spends_budget_and_needs_operator(self):
+        make(self.dir, cwd=self.tmp.name)
+        self.tick(runner=self.runner({'outcome': 'launch_failed', 'error': 'PermissionError'}))
         record = cr.load(self.dir, 'spe-108')
-        self.assertEqual((record['resumes_used'], record['state']), (1, 'WAIT_DEPENDENCY'))
+        self.assertEqual((record['resumes_used'], record['state']), (1, 'WAITING_OPERATOR'))
         self.assertEqual(self.receipts()[-1]['error'], 'PermissionError')
-        # a fresh event after the cooldown spends the last unit; the next event finds the budget gone
-        make(self.dir, cwd=self.tmp.name, max_resumes=2, events=[dict(PR_EVENT, id='pr1-77', number=77)])
-        later = NOW + timedelta(seconds=cr.DEFAULT_COOLDOWN_S + 1)
-        self.tick(now=later, runner=self.runner(denied))
-        make(self.dir, cwd=self.tmp.name, max_resumes=2, events=[dict(PR_EVENT, id='pr2-78', number=78)])
-        self.tick(now=later + timedelta(days=1), runner=self.runner(denied))
+        make(self.dir, cwd=self.tmp.name, events=[dict(PR_EVENT, id='pr1-77', number=77)])
+        self.tick(now=NOW + timedelta(days=1))
+        self.assertEqual(len(self.calls), 1)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(cr.run(['reset', '--campaign', 'spe-108'], directory=self.dir, now=NOW + timedelta(days=1)), 0)
         record = cr.load(self.dir, 'spe-108')
-        self.assertEqual((record['state'], record['resumes_used']), ('WAITING_OPERATOR', 2))
+        self.assertEqual((record['state'], record['resumes_used']), ('WAIT_DEPENDENCY', 0))
+        self.assertEqual(self.decisions()[-1], 'operator_reset')
+
+    def test_lifetime_budget_stops_after_max_resumes(self):
+        for index in range(2):
+            make(self.dir, cwd=self.tmp.name, max_resumes=2, events=[dict(PR_EVENT, id='pr%d' % index)])
+            self.tick(now=NOW + timedelta(days=index))
+        make(self.dir, cwd=self.tmp.name, max_resumes=2, events=[dict(PR_EVENT, id='pr9')])
+        self.tick(now=NOW + timedelta(days=5))
         self.assertEqual(len(self.calls), 2)
-        self.assertEqual(self.decisions()[-1], 'budget_exhausted')
-        self.tick(now=later + timedelta(days=3))
+        self.assertEqual((cr.load(self.dir, 'spe-108')['state'], self.decisions()[-1]), ('WAITING_OPERATOR', 'budget_exhausted'))
+
+    def test_second_timer_wait_after_a_resume_still_fires(self):
+        at = {'id': 'time0', 'kind': 'not_before', 'at': '2026-10-17T07:00:00Z'}
+        make(self.dir, cwd=self.tmp.name, events=[dict(at)])
+        self.tick(now=NOW + timedelta(hours=2))
+        make(self.dir, cwd=self.tmp.name, events=[dict(at, at='2026-10-18T07:00:00Z')])
+        self.assertEqual(self.tick(now=NOW + timedelta(days=2)), ['spe-108'])
         self.assertEqual(len(self.calls), 2)
+
+    def test_later_campaign_is_stamped_with_its_own_claim_time(self):
+        make(self.dir, name='aaa', cwd=self.tmp.name)
+        make(self.dir, name='bbb', cwd=self.tmp.name)
+        clock_now = [NOW]
+
+        def slow(argv, cwd, timeout, log_path, on_start=None):
+            clock_now[0] = NOW + timedelta(hours=3)
+            return {'outcome': 'exited', 'code': 0}
+        self.tick(now=lambda: clock_now[0], runner=slow)
+        record = cr.load(self.dir, 'bbb')
+        self.assertEqual(cr.parse_utc(record['last_resume_at']), NOW + timedelta(hours=3))
+        self.assertEqual(cr.parse_utc(record['next_attempt_after']), NOW + timedelta(hours=3, seconds=cr.DEFAULT_COOLDOWN_S))
+        self.assertEqual(cr.load(self.dir, 'aaa')['last_resume_at'], cr.iso_utc(NOW))
+
+    def test_child_process_keeps_the_lease_alive_after_the_coordinator_dies(self):
+        child = subprocess.Popen(['/bin/sleep', '30'])
+        self.addCleanup(child.kill)
+        dead = subprocess.Popen(['/usr/bin/true'])
+        dead.wait()
+        lease = {'pid': dead.pid, 'child': child.pid, 'token': 'x', 'expires': cr.iso_utc(NOW + timedelta(hours=1))}
+        self.assertTrue(cr.lease_live(lease, NOW))
+        child.kill()
+        child.wait()
+        self.assertFalse(cr.lease_live(lease, NOW))
+
+    def test_child_pid_is_recorded_in_the_lease_while_running(self):
+        make(self.dir, cwd=self.tmp.name)
+        leases = []
+
+        def run(argv, cwd, timeout, log_path, on_start=None):
+            on_start(os.getpid())
+            leases.append(cr.load(self.dir, 'spe-108')['lease'])
+            return {'outcome': 'exited', 'code': 0}
+        self.tick(runner=run)
+        self.assertEqual(leases[0]['child'], os.getpid())
+
+    def test_events_are_read_outside_the_lock(self):
+        make(self.dir, cwd=self.tmp.name)
+        finished = []
+
+        def slow_github(repo, number):
+            # The resumed agent registers while the coordinator is inside gh; the lock must be free.
+            worker = threading.Thread(target=lambda: make(self.dir, cwd=self.tmp.name))
+            worker.start()
+            worker.join(5)
+            finished.append(not worker.is_alive())
+            return 'MERGED'
+        self.tick(pr_state=slow_github)
+        self.assertEqual(finished, [True])
+
+    def test_unreadable_github_is_receipted_once_per_hour(self):
+        make(self.dir, cwd=self.tmp.name)
+        unreadable = lambda repo, number: None
+        self.tick(pr_state=unreadable)
+        self.tick(now=NOW + timedelta(minutes=10), pr_state=unreadable)
+        self.assertEqual(self.decisions(), ['github_unreadable'])
+        self.tick(now=NOW + timedelta(hours=2), pr_state=unreadable)
+        self.assertEqual(self.decisions(), ['github_unreadable'] * 2)
+
+    def test_tick_survives_a_campaign_that_raises_and_a_deleted_checkpoint(self):
+        make(self.dir, name='aaa', cwd=self.tmp.name)
+        make(self.dir, name='bbb', cwd=self.tmp.name)
+
+        def run(argv, cwd, timeout, log_path, on_start=None):
+            if '/aaa' in str(log_path) or str(log_path).endswith('aaa.log'):
+                (self.dir / 'aaa.json').unlink()
+                return {'outcome': 'exited', 'code': 0}
+            raise RuntimeError('boom')
+        self.tick(runner=run)
+        decisions = self.decisions()
+        self.assertIn('resume_finished', decisions)
+        self.assertIn('tick_error', decisions)
+        finished = [row for row in self.receipts() if row['decision'] == 'resume_finished'][0]
+        self.assertEqual(finished['state_after'], 'unreadable')
+
+    def test_timeout_survives_an_already_exited_process_group(self):
+        process = mock.Mock(pid=4242)
+        process.wait.side_effect = [subprocess.TimeoutExpired('x', 1), 0]
+        with mock.patch.object(cr.subprocess, 'Popen', return_value=process), \
+                mock.patch.object(cr.os, 'killpg', side_effect=ProcessLookupError):
+            result = cr.run_claude(['claude'], self.tmp.name, 1, Path(self.tmp.name) / 'log')
+        self.assertEqual(result, {'outcome': 'timeout'})
+
+    def test_real_argv_reaches_the_claude_binary(self):
+        fake = Path(self.tmp.name) / 'claude'
+        out = Path(self.tmp.name) / 'argv.txt'
+        fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > ' + str(out) + '\n')
+        fake.chmod(0o755)
+        make(self.dir, cwd=self.tmp.name)
+        with mock.patch.object(cr.shutil, 'which', return_value=str(fake)):
+            self.assertEqual(self.tick(runner=cr.run_claude), ['spe-108'])
+        self.assertEqual(out.read_text().splitlines(),
+                         ['--resume', SESSION, '-p', cr.PROMPT, '--max-budget-usd', cr.DEFAULT_BUDGET_USD])
+        self.assertEqual(cr.load(self.dir, 'spe-108')['state'], 'WAIT_DEPENDENCY')
 
     def test_real_launch_failure_and_timeout(self):
         script = Path(self.tmp.name) / 'noexec'
