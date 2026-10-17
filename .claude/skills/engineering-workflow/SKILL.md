@@ -141,15 +141,20 @@ findings, and record the qualifying evidence durably in the PR/tracker. Use
    Record the external cause and local-equivalent evidence before admin merge.
    A slow or healthy running job, missing observation, or author assertion alone
    does not qualify; continue bounded polling of its authoritative handle.
-2. **Owner-only same-identity review deadlock**: a real governance/ownership check
-   must prove the PR author is the sole genuinely eligible required reviewer,
-   codeowner, or owner, with no alternative eligible independent reviewer/team.
-   Freshly verify the owner/admin identity. Self-review and an independent
-   adversarial agent review must both be clean. Every genuine required check
-   must be green, except a separately qualified CI_UNAVAILABLE_EXTERNAL condition.
-   There may be no unresolved blocking findings or conflicts. Record the
-   deadlock and justification durably before admin merge. An agent review does
-   not replace an available eligible independent repository reviewer.
+2. **Owner-only same-identity review deadlock (owner-admin merge)**: the PR author
+   is a repository/org owner with effective admin-bypass rights, freshly verified
+   by an actual ownership check (`orgs/<org>/memberships/<login>` role admin, or the
+   repository permission for a personal repository), never inferred from admin-capable
+   API access alone. A separate human GitHub Approve is not required, and zero GitHub
+   reviews is not by itself a blocker. Complete self-review and an applicable
+   independent risk-based review (an adversarial agent review at minimum) must both
+   be clean at the current head. Every genuine required check and security gate must
+   be green, except a separately qualified CI_UNAVAILABLE_EXTERNAL condition. There
+   may be no unresolved blocking findings, `REQUEST_CHANGES`, or conflicts. Pin the
+   exact head (`--match-head-commit <full sha>`) and record the justification
+   durably before admin merge. A reviewer's outstanding `REQUEST_CHANGES` still
+   blocks. A host or tool refusal of the merge is `HARNESS_PERMISSION_BLOCK`: report
+   it and never route around it.
 
 If either exception lacks its evidence, keep the normal gate pending. Fix a
 genuine failed check rather than reclassifying or bypassing it. No other approval,
