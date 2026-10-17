@@ -160,6 +160,56 @@ If either exception lacks its evidence, keep the normal gate pending. Fix a
 genuine failed check rather than reclassifying or bypassing it. No other approval,
 security, production, release, payment, or destructive-operation authority changes.
 
+## Campaign autonomy
+
+A campaign is the approved scope of related tickets. The campaign, not one task or
+one prompt, is the unit of completion: `TASK_DONE` is not `CAMPAIGN_DONE`,
+`PR_MERGED` is not `QA_SIGNED_OFF`, and `QA_SIGNED_OFF` is not
+`RELEASE_PUBLISHED`. Never invent new mandatory release scope.
+
+- **Task-scoped blockers.** Classify each task independently as `READY`, `RUNNING`,
+  `WAITING_RESOURCE`, `WAITING_DEPENDENCY`, `WAITING_OPERATOR`,
+  `VERIFICATION_PENDING`, `DONE` or `OUT_OF_SCOPE`. One blocked task never freezes
+  the campaign: run the next safe eligible task, and stop a worker only when it has
+  no authorized executable work left. A worker checkpoint is not campaign completion.
+- **Fresh evidence.** A cached checkpoint or historical ticket status is not proof.
+  Before declaring `WAITING_RESOURCE`, measure the current physical volume and read
+  the canonical admission state; an admission snapshot older than its freshness
+  window (120 seconds) is stale and never a current decision. Before declaring
+  `WAITING_DEPENDENCY`, recheck the exact merged PR and source state and recompute
+  the dependency graph.
+- **Automatic reconciliation.** When a dependency merges or verifies: revalidate the
+  exact merged SHA, update the acceptance matrix, mark newly unblocked work `READY`,
+  acquire resources, run the applicable tests, record real results and defects, and
+  continue to the next real blocker. Ordinary accepted work needs no repeated
+  "continue" confirmation.
+- **Resources.** Honor the admission contract: at most the authoritative number of
+  heavy lanes, a valid process-bound byte reservation before heavy work, no second
+  heavy build while the lane belongs to another owner, and reuse of compatible
+  build targets. After every task persist evidence, stop only exclusively owned
+  child processes, release task-owned reservations, and reclaim only disposable
+  resources through the authorized storage policy. Preserve active or resumable
+  peer resources. Never change host policy or bypass a refusal to go faster.
+- **Escalation and ledger.** Routine engineering is not escalated. Escalate only a
+  host refusal, sensitive real-home access, credential or privileged settings
+  change, unapproved spend, unauthorized destructive action, a material scope or
+  release decision, or required personal founder acceptance, with exact action,
+  resource, SHA, risk, scope and operator path. Record each decision and operator
+  action durably and do not re-ask a decided issue without new material evidence.
+- **Resumption.** A passive checkpoint is not automatic resumption. Persist the
+  campaign state, dependency graph, owners, exact SHAs and pending events, release
+  idle resources, and register a resume trigger only with a coordinator that is
+  actually installed. Valid resume events are resource admission available, owning
+  PR merged, required CI or security result changed, ticket dependency completed,
+  operator approval completed, and a new QA artifact. Never poll an unchanged state
+  with model calls, and never claim a closed session can wake itself. Without a real
+  scheduler, say so and hand the missing capability to the environment owner.
+- **Verdict.** `READY_FOR_RELEASE` requires every required in-scope engineering,
+  integration, QA, security, dogfooding and cleanup gate to be satisfied by live
+  evidence, not installation alone. If only a founder-only gate remains, report
+  `RELEASE_BLOCKED_BY_OPERATOR`. Never tag, publish, deploy to production or spend
+  unapproved funds merely because the engineering work is complete.
+
 ## Jira lifecycle
 
 When Jira is the tracker: move the ticket to In Progress when work really starts,

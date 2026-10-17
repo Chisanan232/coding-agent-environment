@@ -1,0 +1,75 @@
+[
+  {
+    "id": "all-gates-live",
+    "gates": {
+      "engineering": true,
+      "integration": true,
+      "qa": true,
+      "security": true,
+      "dogfood": true,
+      "cleanup": true
+    },
+    "verdict": "READY_FOR_RELEASE"
+  },
+  {
+    "id": "pr-merged-no-qa",
+    "gates": {
+      "engineering": true,
+      "integration": true,
+      "qa": false,
+      "security": true,
+      "dogfood": false,
+      "cleanup": true
+    },
+    "verdict": "IN_PROGRESS"
+  },
+  {
+    "id": "qa-signed-security-open",
+    "gates": {
+      "engineering": true,
+      "integration": true,
+      "qa": true,
+      "security": false,
+      "dogfood": true,
+      "cleanup": true
+    },
+    "verdict": "IN_PROGRESS"
+  },
+  {
+    "id": "cleanup-open",
+    "gates": {
+      "engineering": true,
+      "integration": true,
+      "qa": true,
+      "security": true,
+      "dogfood": true,
+      "cleanup": false
+    },
+    "verdict": "IN_PROGRESS"
+  },
+  {
+    "id": "installed-not-live-accepted",
+    "gates": {
+      "engineering": true,
+      "integration": false,
+      "qa": true,
+      "security": true,
+      "dogfood": true,
+      "cleanup": true
+    },
+    "verdict": "IN_PROGRESS"
+  },
+  {
+    "id": "only-founder-acceptance-open",
+    "gates": {
+      "engineering": true,
+      "integration": true,
+      "qa": true,
+      "security": true,
+      "dogfood": false,
+      "cleanup": true
+    },
+    "only_founder_gate_open": true,
+    "verdict": "RELEASE_BLOCKED_BY_OPERATOR"
+  }
+]
