@@ -131,7 +131,7 @@ class EngineeringWorkflowContract(unittest.TestCase):
 
     def test_campaign_autonomy_contract_defines_completion_blockers_and_resumption(self) -> None:
         text = WORKFLOW.read_text()
-        section = text.split("## Campaign autonomy", 1)[1].split("## Jira lifecycle", 1)[0]
+        section = text.split("## Campaign autonomy", 1)[1].split("\n## ", 1)[0]
         flat = " ".join(section.split())
         required = [
             "`TASK_DONE` is not `CAMPAIGN_DONE`",
@@ -150,7 +150,9 @@ class EngineeringWorkflowContract(unittest.TestCase):
             "Never poll an unchanged state with model calls",
             "`READY_FOR_RELEASE` requires every required",
             "`RELEASE_BLOCKED_BY_OPERATOR`",
-            "Never tag, publish, deploy to production or spend unapproved funds",
+            "Never tag, publish, deploy to production or spend unapproved funds on the basis of campaign state",
+            "never narrows, gates defined elsewhere",
+            "non-model watcher that wakes the agent on change",
         ]
         for phrase in required:
             with self.subTest(phrase=phrase):
@@ -163,9 +165,10 @@ class EngineeringWorkflowContract(unittest.TestCase):
         gates = ("engineering", "integration", "qa", "security", "dogfood", "cleanup")
 
         def verdict(case: dict) -> str:
-            if all(case["gates"][gate] for gate in gates):
+            open_gates = {gate for gate in gates if not case["gates"][gate]}
+            if not open_gates:
                 return "READY_FOR_RELEASE"
-            if case.get("only_founder_gate_open"):
+            if open_gates <= set(case.get("founder_gates", [])):
                 return "RELEASE_BLOCKED_BY_OPERATOR"
             return "IN_PROGRESS"
 
@@ -173,6 +176,9 @@ class EngineeringWorkflowContract(unittest.TestCase):
             with self.subTest(case=case["id"]):
                 self.assertEqual(verdict(case), case["verdict"])
         self.assertTrue(any(c["verdict"] == "READY_FOR_RELEASE" for c in cases))
+        mixed = {"gates": dict.fromkeys(gates, True), "founder_gates": ["dogfood"]}
+        mixed["gates"].update(qa=False, dogfood=False)
+        self.assertEqual(verdict(mixed), "IN_PROGRESS", "a non-founder open gate must not hide behind a founder gate")
         self.assertTrue(any(c["verdict"] == "IN_PROGRESS" and c["gates"]["engineering"] for c in cases),
                         "a merged PR alone must not be READY_FOR_RELEASE")
 

@@ -69,7 +69,9 @@
       "dogfood": false,
       "cleanup": true
     },
-    "only_founder_gate_open": true,
-    "verdict": "RELEASE_BLOCKED_BY_OPERATOR"
+    "verdict": "RELEASE_BLOCKED_BY_OPERATOR",
+    "founder_gates": [
+      "dogfood"
+    ]
   }
 ]
