@@ -129,6 +129,59 @@ class EngineeringWorkflowContract(unittest.TestCase):
                     self.assertIs(actual[case_id]["admin_merge_allowed"], expected["admin_merge_allowed"])
                     self.assertTrue(actual[case_id]["reason"].strip())
 
+    def test_campaign_autonomy_contract_defines_completion_blockers_and_resumption(self) -> None:
+        text = WORKFLOW.read_text()
+        section = text.split("## Campaign autonomy", 1)[1].split("\n## ", 1)[0]
+        flat = " ".join(section.split())
+        required = [
+            "`TASK_DONE` is not `CAMPAIGN_DONE`",
+            "`PR_MERGED` is not `QA_SIGNED_OFF`",
+            "`QA_SIGNED_OFF` is not `RELEASE_PUBLISHED`",
+            "One blocked task never freezes the campaign",
+            "`WAITING_RESOURCE`", "`WAITING_DEPENDENCY`", "`WAITING_OPERATOR`",
+            "snapshot older than its freshness window (120 seconds) is stale",
+            "A cached checkpoint or historical ticket status is not proof",
+            "revalidate the exact merged SHA",
+            "no second heavy build while the lane belongs to another owner",
+            "release task-owned reservations",
+            "Preserve active or resumable peer resources",
+            "A passive checkpoint is not automatic resumption",
+            "never claim a closed session can wake itself",
+            "Never poll an unchanged state with model calls",
+            "`READY_FOR_RELEASE` requires every required",
+            "`RELEASE_BLOCKED_BY_OPERATOR`",
+            "Never tag, publish, deploy to production or spend unapproved funds on the basis of campaign state",
+            "never narrows, gates defined elsewhere",
+            "non-model watcher that wakes the agent on change",
+        ]
+        for phrase in required:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, flat)
+
+    def test_campaign_verdict_scenarios(self) -> None:
+        cases = json.loads((ROOT / "tests/fixtures/campaign-verdicts.json").read_text())
+        ids = [case["id"] for case in cases]
+        self.assertEqual(len(ids), len(set(ids)))
+        gates = ("engineering", "integration", "qa", "security", "dogfood", "cleanup")
+
+        def verdict(case: dict) -> str:
+            open_gates = {gate for gate in gates if not case["gates"][gate]}
+            if not open_gates:
+                return "READY_FOR_RELEASE"
+            if open_gates <= set(case.get("founder_gates", [])):
+                return "RELEASE_BLOCKED_BY_OPERATOR"
+            return "IN_PROGRESS"
+
+        for case in cases:
+            with self.subTest(case=case["id"]):
+                self.assertEqual(verdict(case), case["verdict"])
+        self.assertTrue(any(c["verdict"] == "READY_FOR_RELEASE" for c in cases))
+        mixed = {"gates": dict.fromkeys(gates, True), "founder_gates": ["dogfood"]}
+        mixed["gates"].update(qa=False, dogfood=False)
+        self.assertEqual(verdict(mixed), "IN_PROGRESS", "a non-founder open gate must not hide behind a founder gate")
+        self.assertTrue(any(c["verdict"] == "IN_PROGRESS" and c["gates"]["engineering"] for c in cases),
+                        "a merged PR alone must not be READY_FOR_RELEASE")
+
     def test_pull_request_title_examples_and_negative_controls(self) -> None:
         valid = [
             "[PROJ-123] ✨ (restapi): Add user authentication",
