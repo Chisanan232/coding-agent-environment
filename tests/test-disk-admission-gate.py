@@ -519,6 +519,91 @@ class ParentAndAliasSpellings(unittest.TestCase):
         self.assertFalse(gate.tamper_suspect('git status > /tmp/statusfile', needles))
 
 
+class RunWrapperLookThrough(unittest.TestCase):
+    """`disk-admission.py run ... -- JOB` must not hide the job from the hook, and is never pre-admitted."""
+    DA = '/Users/u/.local/lib/coding-agent-environment/scripts/disk-admission.py'
+
+    def wrapped(self, job, extra='--bytes 1000 --label job-a'):
+        return 'python3 %s run %s -- %s' % (self.DA, extra, job)
+
+    def test_wrapped_heavy_commands_are_classified_by_the_inner_command(self):
+        for job, kind in (('cargo build', 'cargo'), ('env FOO=1 cargo test', 'cargo'), ('uv sync', 'uv'),
+                          ('nice -n 5 npm install', 'npm'), ('pip install x', 'pip')):
+            verdict = gate.classify(self.wrapped(job))
+            self.assertEqual((verdict['heavy'], verdict['kind']), (True, kind), job)
+
+    def test_direct_execution_interpreter_options_uv_run_and_doubled_separator(self):
+        da = self.DA
+        for command in ('%s run --bytes 1 --label a -- cargo build' % da,
+                        './disk-admission.py run --bytes 1 --label a -- cargo build',
+                        'scripts/disk-admission.py run --bytes 1 --label a -- cargo build',
+                        'python3 -W ignore %s run --bytes 1 --label a -- cargo build' % da,
+                        'python3 -X dev -u -B %s run --bytes 1 --label a -- cargo build' % da,
+                        'uv run %s run --bytes 1 --label a -- cargo build' % da,
+                        'uv run python %s run --bytes 1 --label a -- cargo build' % da,
+                        'python3 %s run --bytes 1 --label a -- -- cargo build' % da,
+                        'python3 %s run --bytes 1 --label a -- bash -c "cargo build"' % da):
+            self.assertTrue(gate.classify(command)['heavy'], command)
+
+    def test_other_scripts_and_late_script_names_are_not_wrappers(self):
+        da = self.DA
+        for command in ('python3 foo.py run -- cargo build', 'python3 foo.py %s run -- cargo build' % da,
+                        'python3 -c "x" %s run -- cargo build' % da, 'python3 -m pytest %s run -- cargo build' % da,
+                        'uv run pytest %s run -- cargo build' % da, 'python3 %s run cargo build' % da,
+                        'python3 %s run --bytes 1 --label a cargo build' % da):
+            self.assertFalse(gate.classify(command)['heavy'], command)
+
+    def test_wrapped_commands_inside_a_shell_string_are_still_found(self):
+        verdict = gate.classify("bash -c '%s'" % self.wrapped('cargo build'))
+        self.assertEqual((verdict['heavy'], verdict['kind']), (True, 'cargo'))
+
+    def test_non_heavy_inner_and_malformed_wrappers_are_not_heavy(self):
+        for command in (self.wrapped('ls -la'), self.wrapped('echo cargo build'),
+                        'python3 %s run --bytes 1 --label a cargo build' % self.DA,  # no separator: not a wrapper
+                        'python3 %s status --json' % self.DA, 'python3 %s run --bytes 1 --label a --' % self.DA):
+            self.assertFalse(gate.classify(command)['heavy'], command)
+
+    def test_the_wrapper_path_is_never_trusted(self):
+        for path in ('/tmp/evil/disk-admission.py', 'disk-admission.py', '~/x/disk-admission.py'):
+            verdict = gate.classify('python3 %s run --bytes 1 --label a -- cargo build' % path)
+            self.assertTrue(verdict['heavy'], path)  # classified and admitted like a typed command
+
+    def run_gate(self, command, mode, runner):
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}})
+        out, err = io.StringIO(), io.StringIO()
+        code = gate.main(payload, out, err, mode_fn=lambda: mode, runner=runner)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_enforce_denies_a_refused_wrapped_job_and_warn_never_blocks(self):
+        refuse = lambda: (77, 'heavy refused in tier low')
+        code, out, err = self.run_gate(self.wrapped('cargo build'), 'enforce', refuse)
+        self.assertEqual((code, out), (2, ''))
+        self.assertIn('BLOCKED', err)
+        code, out, err = self.run_gate(self.wrapped('cargo build'), 'warn', refuse)
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('would block', json.loads(out)['hookSpecificOutput']['additionalContext'])
+        self.assertEqual(self.run_gate(self.wrapped('cargo build'), 'enforce', lambda: (0, 'ok')), (0, '', ''))
+
+    def test_a_wrapped_write_to_the_state_directory_is_still_tamper(self):
+        d = '~/.cache/coding-agent-environment/admission/'
+        for job in ('rm %smode' % d, 'tee %smode' % d, 'sh -c "echo warn > %smode"' % d):
+            code, out, err = self.run_gate(self.wrapped(job), 'enforce', lambda: (0, 'ok'))
+            self.assertEqual((code, out), (2, ''), job)
+            self.assertIn('tamper-suspect', err)
+
+    @mock.patch.object(gate, 'AUDIT_ENABLED', True)
+    def test_audit_lines_for_wrapped_jobs_never_contain_the_command(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp).resolve()
+            (directory / 'mode').write_text('warn')
+            payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': self.wrapped('cargo build -p SECRET_CRATE_77')}})
+            gate.main(payload, io.StringIO(), io.StringIO(), runner=lambda: (0, 'ok'), admission_dir=directory)
+            raw = (directory / 'gate-audit.jsonl').read_text()
+            self.assertEqual(len(raw.splitlines()), 1)  # the wrapped job was classified and audited
+            for fragment in ('SECRET_CRATE_77', 'cargo build', 'disk-admission.py'):
+                self.assertNotIn(fragment, raw)
+
+
 class GateInputs(unittest.TestCase):
     @staticmethod
     def forbidden():

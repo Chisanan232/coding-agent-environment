@@ -235,6 +235,48 @@ def _heavy_kind(words):
     return None
 
 
+ADMISSION_SCRIPT = 'disk-admission.py'
+INTERPRETER_VALUE_OPTIONS = {'-W', '-X', '-Q'}
+
+
+def _admission_run_inner(words):
+    """Words of the job inside `[python|uv run [python]] disk-admission.py run ... -- JOB...`, else None.
+
+    The wrapper reserves and execs the job, so it would otherwise hide cargo/uv/... from this hook. Only the
+    shape is recognised: the file name is matched but its path and contents are never trusted, and the wrapper
+    is never treated as pre-admitted, so the inner command is classified and admitted exactly as if it had
+    been typed directly. A copy or symlink under another name is not recognised.
+    """
+    if not words:
+        return None
+    program = os.path.basename(words[0])
+    index = 0
+    if program != ADMISSION_SCRIPT:
+        if program == 'uv' and words[1:2] == ['run']:
+            index = 2
+        elif program.startswith('python'):
+            index = 1
+        else:
+            return None
+        while index < len(words) and os.path.basename(words[index]) != ADMISSION_SCRIPT:
+            word = words[index]
+            if word == '--' or not (word.startswith('-') or os.path.basename(word).startswith('python')
+                                    or (index > 0 and words[index - 1] in INTERPRETER_VALUE_OPTIONS)):
+                return None
+            index += 1
+        if index >= len(words):
+            return None
+    if words[index + 1:index + 2] != ['run']:
+        return None
+    rest = words[index + 2:]
+    if '--' not in rest:
+        return None
+    inner = rest[rest.index('--') + 1:]
+    while inner[:1] == ['--']:
+        inner = inner[1:]
+    return inner or None
+
+
 def _shell_script(words):
     """The string run by `bash -c` (flag clusters like -euo pipefail -c allowed) or `eval`, else None."""
     if not words:
@@ -284,6 +326,16 @@ def classify(command, _depth=0):
         kind = _heavy_kind(words)
         if kind:
             return {'heavy': True, 'confidence': 'exact', 'kind': kind, 'assignments': assignments, 'words': words}
+        wrapped = _admission_run_inner(words) if _depth < 3 else None
+        if wrapped is not None:
+            inner_assignments, inner_words = _command_words(wrapped)
+            inner_kind = _heavy_kind(inner_words)
+            if inner_kind:
+                return {'heavy': True, 'confidence': 'exact', 'kind': inner_kind,
+                        'assignments': assignments + inner_assignments, 'words': inner_words}
+            inner = classify(' '.join(shlex.quote(w) for w in wrapped), _depth + 1)
+            if inner['heavy']:
+                return dict(inner, confidence='best-effort')
         script = _shell_script(words) if _depth < 3 else None
         if script is not None:
             inner = classify(script, _depth + 1)
