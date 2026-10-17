@@ -146,7 +146,11 @@ the same user as the operator, so it can edit the mode file or the state
 directory, and software cannot prevent that. The hook flags any Bash command
 that appears to write, move or remove under the admission directory
 (redirects, tee, mv, rm, cp, `sed -i`, interpreters, `chmod`/`chflags`) as
-tamper-suspect: denied in enforce, advisory in warn. That detection is
+tamper-suspect: denied in enforce, advisory in warn. Each simple command is judged on
+its own targets: reading the directory, `2>/dev/null`, a copy out of it, or an unrelated
+writer elsewhere on the same line is not tamper, while a redirect, writer destination,
+in-place edit or interpreter write that names the directory (or a variable on a line that
+mentions it) is. An unparsable line that mentions the directory stays suspect. That detection is
 best-effort. Operator hardening: `chmod 0444` and `chflags uchg` on the `mode`
 file (`chflags nouchg` before an edit); leave `state.json` writable, because the
 adapter updates it.

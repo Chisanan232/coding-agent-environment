@@ -496,8 +496,54 @@ TAMPER_NOTE = ('command appears to modify the disk-admission state directory (mo
                'reservations); only the operator should edit it')
 
 
+DESTINATION_ONLY = {'cp', 'install', 'ln', 'rsync'}
+INTERPRETERS = {'perl', 'ruby', 'node', 'awk', 'gawk'}
+# Interpreter source cannot be parsed, so only text that writes, removes or renames counts.
+WRITE_SIGNS = re.compile(r'write|remove|unlink|rename|replace|rmtree|truncate|chmod|touch|mkdir|append|>|'
+                         r'open\([^,)]*,\s*[\'"][^\'"]*[wax+]|mode\s*=\s*[\'"][^\'"]*[wax+]', re.IGNORECASE)
+
+
+def _names_state(text, needles, context):
+    """A path argument names the state directory, or cannot be resolved and the command mentions it."""
+    if any(needle in text for needle in needles):
+        return True
+    return ('$' in text or '`' in text) and any(needle in context for needle in needles)
+
+
+def _writes_state(tokens, words, needles, context):
+    """Does this one simple command write, move or remove something under the state directory?"""
+    for index, token in enumerate(tokens):
+        if token in REDIRECTS:
+            target = tokens[index + 1] if index + 1 < len(tokens) else '$'
+            if _names_state(target, needles, context):
+                return True
+    program = os.path.basename(words[0])
+    arguments = words[1:]
+    if program in DESTINATION_ONLY:
+        if any(a == '-t' or a.startswith('--target-directory') for a in arguments):
+            return any(_names_state(a, needles, context) for a in arguments)
+        return bool(arguments) and _names_state(arguments[-1], needles, context)
+    if program == 'dd':
+        return any(a.startswith('of=') and _names_state(a, needles, context) for a in arguments)
+    if program == 'sed':
+        return any(a.startswith('-i') or a == '--in-place' for a in arguments) and \
+            any(_names_state(a, needles, context) for a in arguments)
+    if program in WRITERS - DESTINATION_ONLY - {'dd', 'perl', 'ruby', 'node', 'awk', 'gawk'}:
+        return any(_names_state(a, needles, context) for a in arguments)
+    if program in INTERPRETERS or program.startswith('python'):
+        text = ' '.join(arguments)
+        in_place = not program.startswith('python') and any(re.match(r'-[A-Za-z]*i', a) for a in arguments)
+        return any(needle in text for needle in needles) and (in_place or bool(WRITE_SIGNS.search(text)))
+    return False
+
+
 def tamper_suspect(command, needles=(STATE_NEEDLE,)):
-    """Best-effort: does this command write, move or remove under the admission state directory?"""
+    """Best-effort: does this command write, move or remove under the admission state directory?
+
+    Judged per simple command: reading the directory, redirecting stderr, or an unrelated writer elsewhere
+    in the same line is not tamper. A target that cannot be resolved statically (a variable) counts as the
+    state directory when the line mentions it, and an unparsable line that mentions it is suspect.
+    """
     if not any(needle in command for needle in needles):
         return False
     try:
@@ -506,14 +552,11 @@ def tamper_suspect(command, needles=(STATE_NEEDLE,)):
         return True
     for tokens in simple_commands:
         _, words = _command_words(tokens)
-        if any(token in REDIRECTS for token in tokens):
-            return True
         if not words:
+            if any(token in REDIRECTS for token in tokens) and _writes_state(tokens, ['true'], needles, command):
+                return True
             continue
-        program = os.path.basename(words[0])
-        if program in WRITERS or program.startswith('python'):
-            return True
-        if program == 'sed' and any(w.startswith('-i') or w == '--in-place' for w in words[1:]):
+        if _writes_state(tokens, words, needles, command):
             return True
         script = _shell_script(words)
         if script is not None and tamper_suspect(script, needles):
