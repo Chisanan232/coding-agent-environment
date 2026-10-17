@@ -257,13 +257,17 @@ class PersonalDevTrust(Fixture):
         new = self.merged_dev()
         env = "\n".join(e for e in new["autoMode"]["environment"] if e.startswith("**Personal development machine"))
         self.assertIn("Being the session's starting directory is not trust", env)
-        self.assertIn("lifecycle hooks and test commands are external code", env)
+        self.assertIn("lifecycle hooks and test commands are external code, judged under Code from External", env)
         self.assertIn("host must be exactly github.com", env)
         for spoof in ("lookalike host or owner", "embedded credentials", "mirror or redirect", "README"):
             self.assertIn(spoof, env)
-        for hook in ("core.sshCommand", "core.fsmonitor", "uploadpack", "-C into"):
+        for hook in ("core.sshCommand", "core.fsmonitor", "uploadpack", "-C into", "textconv", "include.path"):
             self.assertIn(hook, env)
-        self.assertIn("even fetch, status, diff or log", env)
+        self.assertIn("fetch via core.sshCommand", env)
+        self.assertIn("status and diff via core.fsmonitor", env)
+        self.assertIn("remain ordinary source-control work", env)
+        self.assertNotIn("<owners>", env)
+        self.assertNotIn("<dev-dirs>", env)
 
     def test_without_dev_dirs_nothing_about_directories_is_added(self):
         new = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), ["OwnerA"])
