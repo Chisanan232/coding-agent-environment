@@ -46,8 +46,10 @@ the resumed agent registers what it still waits for.
 
 In a throwaway directory, `claude -p ... --session-id <uuid>` followed by
 `claude --resume <uuid> -p ...` continued the same session non-interactively.
-An unknown id fails with `No conversation found with session ID`. Sessions are
-looked up from the working directory, so the checkpoint records `cwd`.
+An unknown id fails with `No conversation found with session ID`. In a later
+canary a resume launched from a different directory still found the session, so
+`cwd` is not required for lookup; the checkpoint records it so the resumed agent
+starts in the campaign's worktree.
 
 ## Codex
 
