@@ -22,12 +22,13 @@ Guarantees:
 - A resume is admitted only when scripts/disk-admission.py check exits 0.
 - The resumed command has a hard timeout; its process group is killed on expiry.
 - A session whose transcript changed in the last 120 s, or is not found, is not
-  resumed (stat only; transcripts are never read), which protects an open
-  interactive session. `receipts.jsonl` and each `<name>.log` keep one previous
+  resumed (stat only; transcripts are never read), checked again just before the
+  budget is spent. This is a best-effort idle heuristic: a session that is open but
+  quiet for 120 s or more (a pending prompt, a long tool call) can still be resumed. `receipts.jsonl` and each `<name>.log` keep one previous
   generation beyond 1 MiB.
 - Every decision writes one JSONL receipt. Receipts never contain the prompt
   text, environment or command lines beyond the session id. The per-campaign
-  `<name>.log` holds the resumed session's raw output (mode 0600, not rotated)
+  `<name>.log` holds the resumed session's raw output (mode 0600, one previous generation kept past 1 MiB)
   and may contain anything that session printed.
 
 Limits, stated plainly: this tool resumes Claude Code sessions only; Codex has
@@ -243,7 +244,9 @@ def _rotate(path, limit=MAX_LOG_BYTES):
 def session_age(session_id, now):
     """Seconds since the session transcript last changed (stat only, never read), None when it is not found."""
     newest = None
-    for path in (account_home() / '.claude/projects').glob('*/%s.jsonl' % session_id):
+    config = os.environ.get('CLAUDE_CONFIG_DIR')
+    base = Path(config) if config and os.path.isabs(config) else account_home() / '.claude'
+    for path in (base / 'projects').glob('*/%s.jsonl' % session_id):
         try:
             modified = path.stat().st_mtime
         except OSError:
@@ -253,13 +256,16 @@ def session_age(session_id, now):
 
 
 def receipt(directory, now, campaign, decision, **detail):
-    _rotate(_private_dir(directory) / 'receipts.jsonl')
     line = json.dumps(dict(detail, ts=iso_utc(now), campaign=campaign, decision=decision), sort_keys=True)
-    fd = os.open(_private_dir(directory) / 'receipts.jsonl', os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    try:
-        os.write(fd, (line + '\n').encode())
-    finally:
-        os.close(fd)
+    path = _private_dir(directory) / 'receipts.jsonl'
+    # A dedicated lock makes rotate-then-append atomic, so two writers cannot destroy the previous generation.
+    with campaign_lock(directory, '.receipts'):
+        _rotate(path)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, (line + '\n').encode())
+        finally:
+            os.close(fd)
 
 
 def gh_pr_state(repo, number):
@@ -390,7 +396,7 @@ def _screen(directory, name, clock, pr_state, admit, age):
     return hit, _blocker(record, clock, age) or (None if admit(record['admission_weight']) else 'admission_denied')
 
 
-def _commit(directory, name, hit, blocker, execute, clock):
+def _commit(directory, name, hit, blocker, execute, clock, age):
     """Phase C: re-verify under the lock, then spend the budget and take the lease."""
     with campaign_lock(directory, name):
         try:
@@ -414,6 +420,10 @@ def _commit(directory, name, hit, blocker, execute, clock):
             receipt(directory, now, name, 'dry_run_would_resume', events=hit)
             return None
         cooldown = timedelta(seconds=record['cooldown_s'])
+        if not blocker:
+            # The session may have become active while events and admission were being read.
+            seconds = age(record['session_id'], now)
+            blocker = 'session_not_found' if seconds is None else ('session_active' if seconds < MIN_IDLE_S else None)
         if blocker:
             record['next_attempt_after'] = iso_utc(now + cooldown)
             _save(directory, record)
@@ -483,7 +493,7 @@ def tick(directory, now, execute, pr_state=gh_pr_state, admit=admission_admits, 
             continue
         try:
             screened = _screen(directory, name, clock, pr_state, admit, age)
-            plan = _commit(directory, name, *screened, execute, clock) if screened else None
+            plan = _commit(directory, name, *screened, execute, clock, age) if screened else None
             if plan:
                 started.append(name)
                 log_path = _private_dir(directory) / ('%s.log' % name)

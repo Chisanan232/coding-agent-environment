@@ -549,5 +549,34 @@ class Engine(unittest.TestCase):
         self.assertEqual((self.calls, self.receipts()), ([], []))
 
 
+    def test_session_that_becomes_active_during_the_admission_window_is_not_resumed(self):
+        make(self.dir, cwd=self.tmp.name)
+        ages = iter([3600, 5])
+        self.assertEqual(self.tick(age=lambda session, at: next(ages)), [])
+        self.assertEqual((self.calls, self.decisions()), ([], ['session_active']))
+        self.assertEqual(cr.load(self.dir, 'spe-108')['resumes_used'], 0)
+
+    def test_claude_config_dir_is_honoured_by_the_session_lookup(self):
+        config = Path(self.tmp.name) / 'cfg'
+        transcript = config / 'projects/-x' / ('%s.jsonl' % SESSION)
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('')
+        os.utime(transcript, (NOW.timestamp() - 300, NOW.timestamp() - 300))
+        with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(config)}):
+            self.assertEqual(cr.session_age(SESSION, NOW), 300)
+
+    def test_concurrent_receipts_keep_every_line_across_rotation(self):
+        self.dir.mkdir(parents=True)
+        (self.dir / 'receipts.jsonl').write_text('x' * (cr.MAX_LOG_BYTES + 1))
+        workers = [threading.Thread(target=lambda n=n: cr.receipt(self.dir, NOW, 'c', 'probe', n=n)) for n in range(8)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(10)
+        lines = (self.dir / 'receipts.jsonl').read_text().splitlines()
+        self.assertEqual(len(lines), 8)
+        self.assertEqual((self.dir / 'receipts.jsonl.1').stat().st_size, cr.MAX_LOG_BYTES + 1)
+
+
 if __name__ == '__main__':
     unittest.main()

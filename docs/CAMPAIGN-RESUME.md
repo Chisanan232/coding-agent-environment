@@ -33,7 +33,7 @@ the resumed agent registers what it still waits for.
 | Deduplication | Events are keyed by content (`repo#N` or time). A consumed event never resumes again, even if re-registered; a different PR or time is a new event. |
 | Budget and cooldown | `max_resumes` is a LIFETIME cap per campaign name, kept across re-registers and spent before launch, so crashes and refused launches count. At the limit the campaign becomes `WAITING_OPERATOR` until `reset`. `cooldown_s` spaces attempts. |
 | Lease | An unexpired lease whose coordinator pid or resumed child pid is alive blocks concurrent ticks. A dead or expired lease is recovered with a receipt and no extra spend. Timestamps use the time of each claim. |
-| Open session | A session whose transcript changed in the last 120 s, or that is not found, is not resumed (`session_active` / `session_not_found`, cooldown, no budget). Only the file's mtime is read. |
+| Open session | Best-effort: a session whose transcript changed in the last 120 s, or that is not found, is not resumed (`session_active` / `session_not_found`, cooldown, no budget), checked again just before the budget is spent. Only the file's mtime is read. Honours `CLAUDE_CONFIG_DIR`. |
 | Bounded files | `receipts.jsonl` and `<name>.log` keep one previous generation beyond 1 MiB. |
 | Locking | Events (`gh`, 20 s each) and admission are evaluated with no lock held and re-verified under it, so `register` is never blocked behind them. |
 | Isolation | One campaign's error is receipted (`tick_error`) and the others still run. An unreadable `gh` is receipted as `github_unreadable`, at most hourly. |
@@ -68,12 +68,13 @@ cross-harness claim is made.
 
   Run `plist` from the merged checkout so the embedded script path is the installed one.
 - The agent has no `KeepAlive`, so a failure cannot respawn in a loop. Its plist sets `HOME` and a `PATH` covering `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`; if `gh` or `claude` live elsewhere, edit the plist before loading it.
-- `<name>.log` and `receipts.jsonl` are append-only and not rotated. The log holds the resumed session's raw output and may contain whatever it printed.
+- `<name>.log` and `receipts.jsonl` keep one previous generation beyond 1 MiB, checked at the start of a run; one run's output is not capped while it runs. The log holds the resumed session's raw output and may contain whatever it printed.
 - A resumed grandchild that calls `setsid` escapes the process-group kill at the timeout.
 - A crash between `Popen` and recording the child pid leaves only the coordinator pid in the lease.
 - `tick_error` receipts are not rate limited.
 - Nothing coordinates with a session you still have open interactively; do not register a session id you are actively using.
-- Admission is checked, not reserved, so a heavy resume has a time-of-check window.
+- Admission is checked, not reserved. Heavy automatic resumes are refused, so only the light check has a time-of-check window.
+- The open-session guard is a best-effort 120 s idle heuristic on the transcript mtime: an open session that is quiet longer (a pending prompt, a long tool call) can be resumed.
 - Only a trivial prompt was verified end to end. A headless resume without permission flags acts only within the settings it inherits.
 - The checkpoint directory is advisory state, not a boundary against a same-user attacker.
 
