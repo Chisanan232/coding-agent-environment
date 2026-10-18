@@ -276,7 +276,7 @@ def _admission_run_inner(words):
             if not (word.startswith('-') or os.path.basename(word).startswith('python')
                                     or (index > 0 and words[index - 1] in value_options)):
                 return None
-            if os.path.basename(word).startswith('python'):
+            if os.path.basename(word).startswith('python') and not (index > 0 and words[index - 1] in value_options):
                 value_options = INTERPRETER_VALUE_OPTIONS  # the options that follow belong to the interpreter
             index += 1
         if index >= len(words):
