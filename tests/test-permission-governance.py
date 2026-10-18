@@ -636,6 +636,12 @@ class SPE105EffectiveBehavior(unittest.TestCase):
         self.assertNotIn("bypassPermissions", text)
         self.assertEqual("auto", load_settings()["permissions"]["defaultMode"])
 
+    def test_gh_api_delete_with_the_method_flag_first_asks_in_every_spelling(self):
+        for cmd in ("gh api -X DELETE repos/o/r", "rtk gh api -X DELETE repos/o/r",
+                    "gh api --method DELETE repos/o/r", "rtk gh api --method DELETE repos/o/r"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual("ask", static_decision(cmd, self.perm))
+
 
 class SPE114RtkProxyScopedAsks(unittest.TestCase):
     """`rtk proxy` is never rewritten, so only a rule naming the wrapper sees the wrapped command."""
