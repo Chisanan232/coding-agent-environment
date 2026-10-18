@@ -596,6 +596,11 @@ class MergedBaselineGate(Fixture):
 
 
 class StaticGate(Fixture):
+    def test_blanket_proxy_ask_arriving_as_a_deny_is_not_moved_back_into_ask(self):
+        merged = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [])
+        self.assertNotIn("Bash(rtk proxy *)", merged["permissions"]["ask"])
+        self.assertEqual([], merged["permissions"]["deny"])
+
     def test_migration_retires_the_blanket_proxy_ask_and_keeps_the_scoped_asks(self):
         live = copy.deepcopy(LIVE)
         live["permissions"]["deny"] = []
