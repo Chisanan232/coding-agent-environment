@@ -188,13 +188,16 @@ class EngineeringWorkflowContract(unittest.TestCase):
         for phrase in [
             "Prefer the authenticated `gh` CLI",
             "GitHub MCP is optional",
+            "unavailable, errors, times out, returns an integration-permission error",
             "use `gh` for the same operation without asking",
-            "an MCP refusal is not a host permission block",
-            "A host denial of the `gh` operation itself is binding: do not wrap, split or reroute it",
+            "A host permission or classifier denial of a GitHub action through either interface is binding (`HARNESS_PERMISSION_BLOCK`)",
+            "never retry it through the other interface",
             "Never approve a PR with the account that authored it",
         ]:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, flat)
+        # A refusal is not an MCP-availability failure: no fallback may be keyed to it.
+        self.assertNotIn("refuses", flat)
 
     def test_secret_safe_testing_rule_forbids_inspection_and_requires_disclosure(self) -> None:
         flat = " ".join(WORKFLOW.read_text().split("## Secret-safe testing", 1)[1]

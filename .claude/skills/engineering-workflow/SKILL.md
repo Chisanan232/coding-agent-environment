@@ -26,12 +26,13 @@ implementation without disturbing unrelated state.
 Prefer the authenticated `gh` CLI for GitHub operations (inspection, PRs, reviews,
 CI, branch sync, approved merges, post-merge verification); GitHub MCP is optional.
 Verify the account and repository (`gh auth status`) before a mutation, never print
-or copy a token, and never switch to another account. If MCP fails, refuses, times
-out or lacks a capability, use `gh` for the same operation without asking and
-without retrying the failed MCP call; an MCP refusal is not a host permission block.
-A host denial of the `gh` operation itself is binding: do not wrap, split or reroute
-it, and report the exact operator command. Never approve a PR with the account that
-authored it.
+or copy a token, and never switch to another account. If the MCP server or API is
+unavailable, errors, times out, returns an integration-permission error (such as 403)
+or lacks a capability, use `gh` for the same operation without asking and without
+retrying the failed MCP call. A host permission or classifier denial of a GitHub
+action through either interface is binding (`HARNESS_PERMISSION_BLOCK`): do not wrap,
+split or reroute it, never retry it through the other interface, and report the exact
+operator command. Never approve a PR with the account that authored it.
 
 Name a ticket branch with no change-type segment:
 
