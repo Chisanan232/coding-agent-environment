@@ -70,25 +70,6 @@ Claude Code must follow these rules on every implementation task, without except
 
 ---
 
-## Workflow Path
-
-Every repository code change, however small, goes through a pull request that
-follows [engineering-workflow](skills/engineering-workflow/SKILL.md), which owns
-the branch, commit and pull-request rules. Never push directly to the default or
-protected branch.
-
-The ticket-driven workflow (`ticket-intake → dev-impl-loop → QA handoff → PR`) is
-the contract for substantive work: new features, significant refactors, bug fixes
-with regression risk, changes touching multiple files or modules, and work that
-requires QA sign-off. Follow `dev-impl-loop` (5 phases): implement → relative
-tests → full suite → pre-commit → QA handoff → PR. See the Skill Invocation Guide.
-
-For a small change, keep the same PR and commit rules and scale only the ceremony:
-no QA handoff, circuit breaker, or workflow state file is needed unless the change
-carries regression risk.
-
----
-
 ## Testing Expectations
 
 New features need tests and bug fixes need a regression test. Tests are
@@ -113,19 +94,6 @@ every commit. Details are in
 Fix all lint errors before committing and explain any suppression with a comment;
 pre-commit hooks enforce lint and format. Details are in
 [quality-policies](skills/feature-implementation/references/quality-policies.md).
-
----
-
-## Engineering Workflow Contract
-
-Use [engineering-workflow](skills/engineering-workflow/SKILL.md) for the shared
-branch/worktree, commit, validation, review, pull-request, merge, ticket
-reconciliation, and cleanup lifecycle. `code-review-prep` and `pr-readiness`
-adapt that contract to Claude Code; they do not redefine it.
-
-Project-level `CLAUDE.md` files provide repository commands and product
-constraints. A later explicit user instruction can authorize a different choice
-for that work.
 
 ---
 
@@ -177,6 +145,64 @@ owns the `READY_FOR_RELEASE` completion token and decision levels.
 ---
 
 <!-- coding-agent-environment:engineering-workflow:start -->
+## Workflow Path
+
+Every repository code change, however small, goes through a pull request that
+follows [engineering-workflow](skills/engineering-workflow/SKILL.md), which owns
+the branch, commit and pull-request rules. Never push directly to the default or
+protected branch.
+
+The ticket-driven workflow (`ticket-intake → dev-impl-loop → QA handoff → PR`) is
+the contract for substantive work: new features, significant refactors, bug fixes
+with regression risk, changes touching multiple files or modules, and work that
+requires QA sign-off. Follow `dev-impl-loop` (5 phases): implement → relative
+tests → full suite → pre-commit → QA handoff → PR. See the Skill Invocation Guide.
+
+For a small change, keep the same PR and commit rules and scale only the ceremony:
+no QA handoff, circuit breaker, or workflow state file is needed unless the change
+carries regression risk.
+
+---
+
+## Engineering Workflow Contract
+
+Use [engineering-workflow](skills/engineering-workflow/SKILL.md) for the shared
+branch/worktree, commit, validation, review, pull-request, merge, ticket
+reconciliation, and cleanup lifecycle. `code-review-prep` and `pr-readiness`
+adapt that contract to Claude Code; they do not redefine it.
+
+Project-level `CLAUDE.md` files provide repository commands and product
+constraints. A later explicit user instruction can authorize a different choice
+for that work.
+
+---
+
+## Push Gate and Worktree Adapter
+
+Apply [engineering-workflow](skills/engineering-workflow/SKILL.md) before pushing.
+Run the repository's configured full relevant checks and the Claude-specific
+`full-test-gate.sh` and `precommit-gate.sh` when present. Fix failures; do not use
+`--no-verify` or bypass a required check.
+
+Claude workflow skills resolve the active worktree from
+`$CLAUDE_CURRENT_WORKTREE`, then `.claude/.current-worktree`. They resolve the
+release or phase from `$CLAUDE_CURRENT_RELEASE`, then
+`.claude/.current-release`, then the authoritative ticket milestone or sprint.
+The shared skill owns the branch format and cleanup boundary.
+
+---
+
+## Delegation Model
+
+Delegation is capability-based, not role-based; the main agent does routine work
+directly. Spawn a subagent only for stronger reasoning, isolated context, independent
+verification or genuine parallelism (conditions in
+[model-routing-and-delegation](skills/architecture-design/references/model-routing-and-delegation.md)).
+Subagent concurrency limits and scope ownership are owned by the `engineering-workflow`
+Delegation section.
+
+---
+
 ## Merge Policy
 
 Apply the required checks, code-owner approvals, conflict, branch-currency, and
@@ -234,21 +260,6 @@ never by hand. If the update itself causes a CI failure, escalate and do not mer
 
 ---
 
-## Push Gate and Worktree Adapter
-
-Apply [engineering-workflow](skills/engineering-workflow/SKILL.md) before pushing.
-Run the repository's configured full relevant checks and the Claude-specific
-`full-test-gate.sh` and `precommit-gate.sh` when present. Fix failures; do not use
-`--no-verify` or bypass a required check.
-
-Claude workflow skills resolve the active worktree from
-`$CLAUDE_CURRENT_WORKTREE`, then `.claude/.current-worktree`. They resolve the
-release or phase from `$CLAUDE_CURRENT_RELEASE`, then
-`.claude/.current-release`, then the authoritative ticket milestone or sprint.
-The shared skill owns the branch format and cleanup boundary.
-
----
-
 ## Release Operations Policy
 
 The external release workflow (automated tag creation, version bumping, changelog
@@ -286,17 +297,6 @@ subagent, then continue execution without waiting for approval; skip it for triv
 work and do not enter Plan Mode just to get Opus planning. Use `advisorModel`
 selectively. Details are in
 [model-routing-and-delegation](skills/architecture-design/references/model-routing-and-delegation.md).
-
----
-
-## Delegation Model
-
-Delegation is capability-based, not role-based; the main agent does routine work
-directly. Spawn a subagent only for stronger reasoning, isolated context, independent
-verification or genuine parallelism (conditions in
-[model-routing-and-delegation](skills/architecture-design/references/model-routing-and-delegation.md)).
-Subagent concurrency limits and scope ownership are owned by the `engineering-workflow`
-Delegation section.
 
 ---
 
