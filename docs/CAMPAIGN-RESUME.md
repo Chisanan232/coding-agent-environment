@@ -1,14 +1,27 @@
 # Campaign resume coordinator (SPE-110)
 
-`scripts/campaign-resume.py` lets a campaign that is waiting on an external event
+`scripts/campaign-resume.py` (reference implementation; see Ownership) lets a campaign that is waiting on an external event
 continue after its Claude Code session has ended. It is plain code: no model call
 happens until an event is observed.
+
+## Ownership (founder decision, 2026-10-17; recorded on Jira SPE-96, SPE-100 and SPE-111)
+
+`Chisanan232/claude-campaign-coordinator` (SPE-96) is the designated single canonical Claude Code
+campaign orchestrator (still pre-MVP and canary-scoped as of 2026-10-17; it resumes on Jira
+dependency-frontier changes and has no PR-merge, file or time events yet, so PR-merged waits have
+no automatic resumer until those events are contributed: resume them manually). This script is **not** deployed as a second launchd resume service:
+do not install the `plist` output, and do not register a campaign here that is also enrolled
+there, because two resume owners can resume the same session twice. This engine stays as a
+tested reference for event kinds (`pr_merged`, `file_exists`, `not_before`), content-keyed
+deduplication and receipt rotation that can be contributed to the coordinator; SPE-111 tracks
+that. The coordinator's liveness check (`claude agents --json`) is stronger than the transcript
+mtime guard described below, which is only a heuristic.
 
 ## Flow
 
 1. The agent finishes what it can, then records a checkpoint:
    `campaign-resume.py register --campaign <name> --session-id <uuid> --cwd <abs path> --pr-merged owner/repo#N [--not-before <UTC>]`.
-2. A launchd user agent runs `campaign-resume.py tick --execute` every 300 s.
+2. (Reference design only; not deployed, see Ownership.) A launchd user agent would run `campaign-resume.py tick --execute` every 300 s.
 3. `tick` reads each checkpoint, asks GitHub for PR state (or compares the clock),
    and for a newly satisfied event runs `claude --resume <uuid> -p <fixed prompt>`
    in the recorded `cwd` with a budget cap.
@@ -46,8 +59,10 @@ the resumed agent registers what it still waits for.
 
 In a throwaway directory, `claude -p ... --session-id <uuid>` followed by
 `claude --resume <uuid> -p ...` continued the same session non-interactively.
-An unknown id fails with `No conversation found with session ID`. Sessions are
-looked up from the working directory, so the checkpoint records `cwd`.
+An unknown id fails with `No conversation found with session ID`. On 2026-10-17 (claude 2.1.287) a
+resume launched from a different directory than the original still found the session, so
+`cwd` was not required for lookup in that test (not verified across versions); the checkpoint records it so the resumed agent
+starts in the campaign's worktree.
 
 ## Codex
 
@@ -58,7 +73,7 @@ cross-harness claim is made.
 ## Limits
 
 - It resumes only while the launchd agent is loaded. Without it nothing resumes.
-- Installing the agent is an operator action; `campaign-resume.py plist` prints
+- Do not install the agent (see Ownership). Installing it would be an operator action; `campaign-resume.py plist` prints
   the definition and installs nothing:
 
   ```
@@ -78,7 +93,7 @@ cross-harness claim is made.
 - Only a trivial prompt was verified end to end. A headless resume without permission flags acts only within the settings it inherits.
 - The checkpoint directory is advisory state, not a boundary against a same-user attacker.
 
-## Rollback
+## Rollback (only if the agent was installed despite the Ownership decision)
 
 ```
 launchctl bootout gui/$(id -u)/com.coding-agent-environment.campaign-resume
@@ -97,4 +112,4 @@ Checkpoints and receipts under `~/.cache/coding-agent-environment/campaigns/` ar
 | Bounded `claude --resume -p`, no permission bypass | Done. One attempt per event, lifetime budget plus cooldown (stricter than N per day). |
 | Heavy-lane reservation and queue | Deferred; heavy automatic resumes are refused (acceptance cases 3 and 4 depend on it). |
 | Receipts | Done, keyed by event content rather than a set hash. |
-| Operator-installed launchd with rollback | Packet above; not installed. |
+| Operator-installed launchd with rollback | Packet above; intentionally NOT installed (see Ownership). |
