@@ -251,6 +251,34 @@ class PersonalDevTrust(Fixture):
         # the owners the prose refers to must really be in the same output
         self.assertTrue(any(e.startswith("**Trusted GitHub owners") for e in new["autoMode"]["environment"]))
 
+    def test_external_provenance_hardening_n3_n5_n6(self):
+        # SPE-106 negative controls: a session started in an external repo (N5), spoofed ownership signals (N6)
+        # and git commands that execute an untrusted repository's configured commands (N3).
+        new = self.merged_dev()
+        env = "\n".join(e for e in new["autoMode"]["environment"] if e.startswith("**Personal development machine"))
+        self.assertIn("Being the session's starting directory is not trust", env)
+        self.assertIn("lifecycle hooks and test commands are external code, judged under Code from External", env)
+        self.assertIn("host must be exactly github.com", env)
+        for spoof in ("lookalike host or owner", "embedded credentials", "mirror or redirect", "README"):
+            self.assertIn(spoof, env)
+        for hook in ("core.sshCommand", "core.fsmonitor", "uploadpack", "-C into", "textconv", "include.path"):
+            self.assertIn(hook, env)
+        self.assertIn("fetch via core.sshCommand", env)
+        self.assertIn("status and diff via core.fsmonitor", env)
+        self.assertIn("remain ordinary source-control work", env)
+        self.assertIn("origin URL alone never clears it", env)
+        self.assertIn("cloned themselves from a trusted owner", env)
+        self.assertNotIn("<owners>", env)
+        self.assertNotIn("<dev-dirs>", env)
+
+    def test_owner_source_control_entry_carries_provenance_without_dev_dirs(self):
+        new = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), ["OwnerA"])
+        env = "\n".join(e for e in new["autoMode"]["environment"] if e.startswith("**Personal source-control scope"))
+        self.assertIn("copied, unpacked or downloaded from elsewhere", env)
+        self.assertIn("can execute commands configured in its .git/config", env)
+        self.assertIn("not as source-control work", env)
+        self.assertNotIn("Personal development machine", json.dumps(new))
+
     def test_without_dev_dirs_nothing_about_directories_is_added(self):
         new = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), ["OwnerA"])
         self.assertNotIn("additionalDirectories", new["permissions"])
