@@ -893,8 +893,9 @@ class RunReserved(unittest.TestCase):
     def test_empty_string_arguments_are_passed_through_but_an_empty_program_is_refused(self):
         code, spawned, _ = self.go(argv=['git', 'commit', '-m', ''])
         self.assertEqual((code, spawned[0][1]), (0, ['git', 'commit', '-m', '']))
-        code, spawned, _ = self.go(label='job-b', argv=[''])
+        code, spawned, err = self.go(label='job-b', argv=[''])
         self.assertEqual((code, spawned), (77, []))
+        self.assertIn('a command is required', err)
 
     def test_exec_resets_sigpipe_and_sigxfsz_to_default(self):
         import signal
