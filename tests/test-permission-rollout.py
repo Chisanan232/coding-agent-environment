@@ -16,12 +16,22 @@ spec = importlib.util.spec_from_file_location("rollout", ROOT / "scripts/permiss
 rollout = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rollout)
 
+PROXY_SCOPED_ASK = [
+    "Bash(rtk proxy gcloud:*)", "Bash(rtk proxy gsutil:*)", "Bash(rtk proxy bq:*)", "Bash(rtk proxy kubectl:*)",
+    "Bash(rtk proxy terraform:*)", "Bash(rtk proxy kill:*)", "Bash(rtk proxy pkill:*)", "Bash(rtk proxy killall:*)",
+    "Bash(rtk proxy sh:*)", "Bash(rtk proxy bash:*)", "Bash(rtk proxy zsh:*)", "Bash(rtk proxy eval:*)",
+    "Bash(rtk proxy env:*)", "Bash(rtk proxy xargs:*)", "Bash(rtk proxy sudo:*)",
+    "Bash(rtk proxy git push:*)", "Bash(rtk proxy git reset:*)", "Bash(rtk proxy git clean:*)",
+    "Bash(rtk proxy git worktree:*)", "Bash(rtk proxy gh repo delete *)",
+    "Bash(rtk proxy gh api * -X DELETE*)", "Bash(rtk proxy gh api * --method DELETE*)",
+]
+
 BASE_ASK = [
     "Bash(terraform apply:*)", "Bash(rtk terraform apply:*)",
     "Bash(terraform destroy:*)", "Bash(rtk terraform destroy:*)",
     "Bash(terraform -* destroy*)", "Bash(rtk terraform -* destroy*)",
     "Bash(terraform -* apply*)", "Bash(rtk terraform -* apply*)",
-    "Bash(rtk proxy *)",
+    *PROXY_SCOPED_ASK,
     "Bash(gcloud secrets versions access *)", "Bash(rtk gcloud secrets versions access *)",
     "Bash(gcloud * secrets versions access*)", "Bash(rtk gcloud * secrets versions access*)",
     "mcp__neon__get_connection_string",
@@ -588,7 +598,7 @@ class MergedBaselineGate(Fixture):
 class StaticGate(Fixture):
     def test_verify_with_a_baseline_flags_missing_ask_rules(self):
         merged = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [])
-        merged["permissions"]["ask"].remove("Bash(rtk proxy *)")
+        merged["permissions"]["ask"].remove("Bash(rtk proxy gcloud:*)")
         self.live_p.write_text(json.dumps(merged))
         rc, out = self.run_tool("verify", "--live", str(self.live_p), "--baseline", str(self.base_p))
         self.assertEqual(1, rc)

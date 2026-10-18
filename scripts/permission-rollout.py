@@ -47,6 +47,9 @@ MIGRATION = {
         "Bash(git worktree remove --f*)", "Bash(rtk git worktree remove --f*)",
         "Bash(git worktree remove * --f*)", "Bash(rtk git worktree remove * --f*)",
         "Bash(gcloud*projects/*)", "Bash(rtk gcloud*projects/*)",
+        # SPE-114: the blanket wrapper ask prompted on routine raw-output builds and tests; the baseline
+        # now asks per control-plane program and protected git subcommand instead.
+        "Bash(rtk proxy *)",
     ],
     # Retired rule -> narrower replacement kept in live (private overlay rules live there).
     "replace_ask": {
@@ -66,6 +69,8 @@ MIGRATION = {
         # Broad forms that matched "destroy" inside arguments; real destroys are covered by
         # `destroy:*` and the leading-dash `terraform -* destroy*` form.
         "Bash(terraform * destroy*)", "Bash(rtk terraform * destroy*)",
+        # SPE-114: replaced by program-scoped `rtk proxy` asks.
+        "Bash(rtk proxy *)",
     ],
     # Environment lines retired unconditionally: stale session snapshots, lines that
     # contradict the ownership policy, and older copies of lines the baseline carries.
@@ -101,7 +106,28 @@ FORMER_DENY_COMMANDS = [
     "terraform apply --destroy -auto-approve", "terraform -chdir=x apply -destroy",
     "gcloud secrets versions access latest --secret=s",
     "gcloud --project=p secrets versions access latest --secret=s",
-    "rtk proxy git log",
+    "rtk proxy terraform destroy",
+]
+
+# SPE-114: `rtk proxy` is never rewritten, so rules written for the plain and `rtk` spellings do not see the
+# wrapped command. Protected operations must still ask when wrapped, and routine raw-output development
+# through the wrapper must not.
+PROXY_PROTECTED_COMMANDS = [
+    "rtk proxy gcloud secrets versions access latest --secret=s",
+    "rtk proxy gcloud projects add-iam-policy-binding p --member=user:a@b.c --role=roles/viewer",
+    "rtk proxy gsutil iam ch user:a@b.c:objectViewer gs://b", "rtk proxy bq show", "rtk proxy kubectl get pods",
+    "rtk proxy terraform apply", "rtk proxy terraform destroy",
+    "rtk proxy git push --force origin x", "rtk proxy git push origin x", "rtk proxy git reset --hard HEAD~1",
+    "rtk proxy git clean -fd", "rtk proxy git worktree remove --force /w",
+    "rtk proxy kill -9 1", "rtk proxy pkill x", "rtk proxy killall x",
+    "rtk proxy sh -c 'git push --force'", "rtk proxy bash -c x", "rtk proxy zsh -c x", "rtk proxy eval x",
+    "rtk proxy env gcloud x", "rtk proxy xargs rm", "rtk proxy sudo x",
+    "rtk proxy gh repo delete o/r --yes", "rtk proxy gh api repos/o/r -X DELETE", "rtk proxy gh api repos/o/r --method DELETE",
+]
+PROXY_ROUTINE_COMMANDS = [
+    "rtk proxy cargo test", "rtk proxy cargo build --release", "rtk proxy grep -rn fn src", "rtk proxy rg x",
+    "rtk proxy git log --oneline -3", "rtk proxy git diff HEAD~1", "rtk proxy pnpm run lint", "rtk proxy uv run pytest -q",
+    "rtk proxy gh api repos/o/r/branches/main/protection", "rtk proxy gh run list", "rtk proxy python3 -m pytest",
 ]
 
 
@@ -332,6 +358,12 @@ def problems(live, base=None):
         for pre in ("", "rtk "):
             if static_decision(pre + cmd, p) != "ask":
                 out.append(f"IAM command does not ask: {pre + cmd!r} -> {static_decision(pre + cmd, p)}")
+    for cmd in PROXY_PROTECTED_COMMANDS:
+        if static_decision(cmd, p) != "ask":
+            out.append(f"wrapped protected command does not ask: {cmd!r} -> {static_decision(cmd, p)}")
+    for cmd in PROXY_ROUTINE_COMMANDS:
+        if static_decision(cmd, p) == "ask":
+            out.append(f"routine wrapped command asks (friction regression): {cmd!r}")
     if "mcp__gcloud__run_gcloud_command" not in p.get("ask", []):
         out.append("mcp__gcloud__run_gcloud_command is not ask-gated (same power as the Bash route)")
     if "mcp__neon__get_connection_string" not in p.get("ask", []):
