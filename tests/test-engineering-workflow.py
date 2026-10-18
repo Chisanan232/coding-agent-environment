@@ -190,6 +190,7 @@ class EngineeringWorkflowContract(unittest.TestCase):
             "GitHub MCP is optional",
             "unavailable, errors, times out, returns an integration-permission error",
             "use `gh` for the same operation without asking",
+            "a repository-protection, ruleset or required-review refusal from GitHub itself is a gate, not an integration error",
             "A host permission or classifier denial of a GitHub action through either interface is binding (`HARNESS_PERMISSION_BLOCK`)",
             "never retry it through the other interface",
             "Never approve a PR with the account that authored it",

@@ -29,7 +29,8 @@ Verify the account and repository (`gh auth status`) before a mutation, never pr
 or copy a token, and never switch to another account. If the MCP server or API is
 unavailable, errors, times out, returns an integration-permission error (such as 403)
 or lacks a capability, use `gh` for the same operation without asking and without
-retrying the failed MCP call. A host permission or classifier denial of a GitHub
+retrying the failed MCP call; a repository-protection, ruleset or required-review
+refusal from GitHub itself is a gate, not an integration error. A host permission or classifier denial of a GitHub
 action through either interface is binding (`HARNESS_PERMISSION_BLOCK`): do not wrap,
 split or reroute it, never retry it through the other interface, and report the exact
 operator command. Never approve a PR with the account that authored it.
