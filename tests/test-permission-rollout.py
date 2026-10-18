@@ -271,6 +271,14 @@ class PersonalDevTrust(Fixture):
         self.assertNotIn("<owners>", env)
         self.assertNotIn("<dev-dirs>", env)
 
+    def test_owner_source_control_entry_carries_provenance_without_dev_dirs(self):
+        new = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), ["OwnerA"])
+        env = "\n".join(e for e in new["autoMode"]["environment"] if e.startswith("**Personal source-control scope"))
+        self.assertIn("copied, unpacked or downloaded from elsewhere", env)
+        self.assertIn("can execute commands configured in its .git/config", env)
+        self.assertIn("not as source-control work", env)
+        self.assertNotIn("Personal development machine", json.dumps(new))
+
     def test_without_dev_dirs_nothing_about_directories_is_added(self):
         new = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), ["OwnerA"])
         self.assertNotIn("additionalDirectories", new["permissions"])
