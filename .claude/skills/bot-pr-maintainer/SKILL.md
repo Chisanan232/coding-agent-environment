@@ -28,7 +28,7 @@ Auto-used. Run via `pr-health-check` when a PR is classified as
 2. Confirm CI is green (all required checks pass).
 3. Confirm no merge conflicts.
 4. Confirm scope is limited to the automated update (no unexpected file changes).
-5. Approve the PR with `gh pr review --approve` (see `engineering-workflow` GitHub tool selection).
+5. Approve the PR with `gh pr review <n> --repo <owner/repo> --approve` (never without the explicit number and repository; see `engineering-workflow` GitHub tool selection).
 6. Merge the PR using **Create a merge commit**, as required by
    `engineering-workflow`.
 7. Record the merge in the health report.
