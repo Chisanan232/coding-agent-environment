@@ -596,6 +596,12 @@ class MergedBaselineGate(Fixture):
 
 
 class StaticGate(Fixture):
+    def test_a_result_that_reintroduces_the_blanket_proxy_ask_is_flagged_as_friction(self):
+        merged = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [])
+        merged["permissions"]["ask"].append("Bash(rtk proxy *)")
+        found = rollout.problems(merged)
+        self.assertTrue(any("routine wrapped command asks" in f and "rtk proxy cargo test" in f for f in found), found)
+
     def test_verify_with_a_baseline_flags_missing_ask_rules(self):
         merged = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [])
         merged["permissions"]["ask"].remove("Bash(rtk proxy gcloud:*)")
