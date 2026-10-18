@@ -552,6 +552,14 @@ class RunWrapperLookThrough(unittest.TestCase):
         self.assertFalse(gate.classify('python3 -- foo.py %s run -- cargo build' % self.DA)['heavy'])
         self.assertFalse(gate.classify('python3 --')['heavy'])
 
+    def test_a_separator_between_the_adapter_and_run_is_looked_through(self):
+        for command in ('python3 %s -- run --bytes 1 --label a -- cargo build' % self.DA,
+                        '%s -- run --bytes 1 --label a -- cargo build' % self.DA):
+            self.assertTrue(gate.classify(command)['heavy'], command)
+        # Negative controls: another subcommand or a second separator is not the wrapper's run.
+        self.assertFalse(gate.classify('python3 %s -- status -- cargo build' % self.DA)['heavy'])
+        self.assertFalse(gate.classify('python3 %s -- -- run -- cargo build' % self.DA)['heavy'])
+
     def test_other_scripts_and_late_script_names_are_not_wrappers(self):
         da = self.DA
         for command in ('python3 foo.py run -- cargo build', 'python3 foo.py %s run -- cargo build' % da,
