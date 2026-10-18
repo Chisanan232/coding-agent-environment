@@ -100,6 +100,15 @@ class Fixture(unittest.TestCase):
         self.assertIn('mode file: absent', text)
         self.assertEqual(self.snapshot_tree(), before)
 
+    def test_plan_says_it_will_replace_a_differing_installed_hook_file(self):
+        self.assertEqual(self.apply()[0], 0)
+        self.src.write_text('#!/usr/bin/env python3\nprint("gate v2")\n')
+        code, text = self.run_cli('plan')
+        self.assertEqual(code, 0)
+        self.assertIn('hook destination: %s (exists, differs)' % self.dest, text)
+        self.assertIn('replace the hook file with a backup', text)
+        self.assertNotIn('none, already installed', text)
+
     def test_plan_refuses_a_conflicting_existing_entry(self):
         data = hr.with_gate(LIVE, self.command)
         data['hooks']['PreToolUse'][-1]['hooks'][0]['command'] += ' --admission-dir /x'
