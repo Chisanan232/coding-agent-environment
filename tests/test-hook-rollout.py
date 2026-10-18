@@ -116,6 +116,15 @@ class Fixture(unittest.TestCase):
         self.assertIn('hook destination: %s (matches)' % self.dest, text)
         self.assertIn('change: none, already installed', text)
 
+    def test_plan_says_it_will_install_a_missing_hook_file_without_a_backup(self):
+        self.assertEqual(self.apply()[0], 0)
+        self.dest.unlink()
+        code, text = self.run_cli('plan')
+        self.assertEqual(code, 0)
+        self.assertIn('hook destination: %s (absent)' % self.dest, text)
+        self.assertIn('install the hook file, no backup needed', text)
+        self.assertNotIn('with a backup', text)
+
     def test_plan_refuses_a_conflicting_existing_entry(self):
         data = hr.with_gate(LIVE, self.command)
         data['hooks']['PreToolUse'][-1]['hooks'][0]['command'] += ' --admission-dir /x'
