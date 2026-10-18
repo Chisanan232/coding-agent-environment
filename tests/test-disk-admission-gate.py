@@ -407,6 +407,241 @@ class Tamper(unittest.TestCase):
             self.assertEqual(self.run_gate(command, 'enforce'), (0, '', ''), command)
 
 
+class TamperPrecision(unittest.TestCase):
+    """SPE-109: provably read-only use of the state directory is not tamper; every write route still is."""
+    DIR = Tamper.DIR
+    run_gate = Tamper.run_gate
+
+    def test_read_only_use_stderr_redirects_and_unrelated_writers_are_not_tamper(self):
+        d = self.DIR
+        for command in ('cat %sstate.json 2>/dev/null' % d, 'cat %sstate.json 2>&1 | head -5' % d,
+                        'tail -n 20 %sgate-audit.jsonl > /tmp/audit-copy' % d, 'ls %s &> /dev/null' % d,
+                        'cat %smode; echo done > /tmp/o' % d, 'ls %s && echo ok' % d,
+                        'find %s -name "*.jsonl"' % d,
+                        'jq . %sstate.json > /tmp/pretty.json' % d, 'sed s/a/b/ %smode > /tmp/o' % d,
+                        'grep -c deny %sgate-audit.jsonl' % d,
+                        'python3 /Users/u/Dev/coding-agent-environment-harden-SPE-109-x/scripts/disk-admission.py status',
+                        'cd /Users/u/Dev/coding-agent-environment-harden-SPE-109-x && python3 tests/test-disk-admission-gate.py',
+                        'git -C /Users/u/Dev/coding-agent-environment-x commit -m "harden coding-agent-environment admission"',
+                        '/bin/cat %smode' % d):
+            self.assertEqual(self.run_gate(command, 'enforce'), (0, '', ''), command)
+
+    def test_every_write_route_is_still_tamper(self):
+        d = self.DIR
+        routes = ['cp /tmp/m %smode' % d, 'cp /tmp/x %smode 2>/dev/null' % d, 'cp /tmp/x %smode 2>&1' % d,
+                  'cp -rt %s /tmp/x' % d, 'install -m 644 /tmp/x %smode >/dev/null' % d,
+                  'rsync -a /tmp/x/ %s > /tmp/log' % d, 'rsync --remove-source-files %s /tmp/b' % d,
+                  'ln -sf /tmp/m %smode' % d, 'dd if=/dev/zero of=%smode' % d,
+                  'echo x 2>/dev/null > %smode' % d, 'cat /tmp/m >| %smode' % d, 'echo x >& %smode' % d,
+                  'D=%s; echo warn > $D/mode' % d, 'D=%s; rm $D/state.json' % d, 'export P=%s' % d,
+                  'echo warn | tee -a %smode' % d, 'truncate -s 0 %sstate.json' % d,
+                  'rm /tmp/x; rm %sstate.json' % d, 'env X=1 rm %sstate.json' % d,
+                  'rtk proxy rm %sstate.json' % d, '(rm %sstate.json)' % d,
+                  "perl -i -pe 's/a/b/' %smode" % d, "awk '{print > \"%smode\"}' /tmp/m" % d,
+                  "node -e \"require('fs').writeFileSync('%smode','warn')\"" % d,
+                  "python3 -c 'import shutil;shutil.move(\"%smode\",\"/tmp\")'" % d,
+                  "python3 -c 'import os;os.system(\"rm %smode\")'" % d,
+                  'python3 - <<EOF\nimport os\nos.remove("%smode")\nEOF' % d,
+                  'bash -c "cat /tmp/m > %smode"' % d, "eval 'rm %sstate.json'" % d,
+                  'unterminated "quote %smode' % d, 'mv %sstate.json /tmp/elsewhere' % d,
+                  'echo x > >(tee %smode)' % d, 'find %s -delete' % d, 'find %s -exec rm {} +' % d,
+                  'find %s -name mode | xargs rm' % d, 'sed -Ei s/a/b/ %smode' % d, 'sed -si s/a/b/ %smode' % d,
+                  'sort -o %smode /tmp/x' % d, 'sort /tmp/x -o %smode' % d, 'uniq /tmp/x %smode' % d,
+                  "sed 's/a/b/w %smode' /tmp/x" % d, "sed -n 'w %smode' /tmp/x" % d, 'xxd -r /tmp/x %smode' % d,
+                  'rg --pre rm x %s' % d, 'cat %smode > $OUT' % d, 'less %smode' % d,
+                  'ls %s; rm /Users/u/.cache/coding-agent-environment/./admission/mode' % d,
+                  'ls %s; rm /Users/u/.cache/coding-agent-environment//admission/mode' % d,
+                  'cat %smode; mv /tmp/x /tmp/y' % d, 'cat %smode; python3 /tmp/s.py' % d,
+                  'cat %smode > /Users/u/.cache/coding-agent-environment/./admission/mode' % d,
+                  'cat %smode > mode' % d, 'cat %smode > /tmp/../Users/u/x' % d,
+                  'echo "$(rm -f %smode)"' % d, 'cat %smode "$(touch /tmp/x)"' % d,
+                  'cat() { rm %smode; }; cat' % d, 'PATH=/tmp/evil cat %smode' % d,
+                  'rm -rf /Users/u/.cache/coding-agent-environment', 'mv /Users/u/.cache/coding-agent-environment /tmp/g',
+                  'rm -rf /Users/u/.cache/coding-agent-environment/adm*', 'rm -r /Users/u/.cache/coding-agent-env*/admission',
+                  'cd /Users/u/.cache/coding-agent-environment/ && rm -rf admission',
+                  'rm -r /Users/u/.cache/*/admission', '/tmp/cat %smode' % d, './cat %smode' % d,
+                  'cd %s && echo x > mode' % d, 'cd %s; : > mode' % d, '(cd %s; rm mode)' % d,
+                  'pushd %s >/dev/null && rm mode' % d, 'cd %s && python3 -c "open(\'mode\',\'w\')"' % d,
+                  'bash -c "cd %s && rm mode"' % d, 'rm `echo %s`/mode' % d, 'rm $(echo %s)/mode' % d]
+        for command in routes:
+            self.assertEqual(self.run_gate(command, 'enforce')[:2], (2, ''), command)
+
+
+class ScratchStateDirectory(unittest.TestCase):
+    """A state directory that itself lives under a scratch path (the sandbox tests, CI on Linux) is still protected."""
+
+    def test_redirects_into_the_state_directory_are_tamper_even_under_scratch_paths(self):
+        for state in ('/tmp/zz-state', '/private/tmp/zz-state', '/var/folders/ab/cd/T/zz-state'):
+            needles = (state,)
+            self.assertTrue(gate.tamper_suspect('echo warn > %s/mode' % state, needles), state)
+            self.assertTrue(gate.tamper_suspect('cat /etc/hosts 2> %s/err' % state, needles), state)
+            self.assertFalse(gate.tamper_suspect('cat %s/mode > /tmp/copy' % state, needles), state)
+
+
+class ParentAndAliasSpellings(unittest.TestCase):
+    P = '/Users/u/.cache/coding-agent-environment'
+
+    def test_punctuation_after_the_parent_and_unusual_children_are_still_mentions(self):
+        p = self.P
+        for command in ('rm -rf %s;' % p, '(rm -rf %s)' % p, 'rm -rf %s|cat' % p, 'rm -rf %s>/dev/null' % p,
+                        'cd %s; rm -rf admission' % p, 'cd %s;echo x>admission/mode' % p, 'cd %s&&rm -rf admission' % p,
+                        'rm -rf %s/x/../admission' % p, 'rm -rf %s/a*' % p, 'rm -rf %s/ad?ission' % p,
+                        'rm -rf %s/./' % p, 'rm -rf %s/.[a]*' % p):
+            self.assertTrue(gate.tamper_suspect(command), command)
+
+    def test_sandbox_parent_and_dotdot_child_and_quoted_default_parent(self):
+        needles = gate._directory_spellings(Path('/tmp/sbx/state'))
+        for command in ('rm -rf /tmp/sbx', 'rm -rf /tmp/sbx/x/../state', 'cd /tmp/sbx && rm -rf state'):
+            self.assertTrue(gate.tamper_suspect(command, needles), command)
+        for command in ('rm -rf /tmp/sbx-other', 'cargo build > /tmp/stats.log', 'ls /tmp'):
+            self.assertFalse(gate.tamper_suspect(command, needles), command)
+        for command in ('rm -rf ~/.cache/./coding-agent-environment', 'rm -rf ~/.cache//coding-agent-environment',
+                        'rm -rf ~/.cache/x/../coding-agent-environment', 'rm -rf ~/.cache/"coding-agent-environment"',
+                        'rm -rf "$HOME/.cache"/coding-agent-environment', 'mv ~/.config/./coding-agent-environment /tmp/g'):
+            self.assertTrue(gate.tamper_suspect(command), command)
+
+    def test_worktrees_and_checkouts_are_not_mentions(self):
+        for command in ('cd /Users/u/Dev/coding-agent-environment-harden-SPE-109-x && ls',
+                        'cd /Users/u/Dev/coding-agent-environment && rm -rf build',
+                        'git -C /Users/u/Dev/coding-agent-environment status',
+                        'python3 /Users/u/Dev/coding-agent-environment-x/scripts/disk-admission.py status'):
+            self.assertFalse(gate.tamper_suspect(command), command)
+
+    def test_private_tmp_alias_of_a_sandbox_directory_is_covered_both_ways(self):
+        for configured, typed in (('/private/tmp/sbx/state', '/tmp/sbx/state'), ('/tmp/sbx/state', '/private/tmp/sbx/state')):
+            needles = gate._directory_spellings(Path(configured))
+            self.assertTrue(gate.tamper_suspect('rm %s/mode' % typed, needles), (configured, typed))
+            self.assertTrue(gate.tamper_suspect('echo x > %s/mode' % typed, needles), (configured, typed))
+
+    def test_short_sandbox_names_do_not_block_unrelated_scratch_files(self):
+        needles = gate._directory_spellings(Path('/tmp/state'))
+        self.assertFalse(gate.tamper_suspect('cargo build > /tmp/stats.log', needles))
+        self.assertFalse(gate.tamper_suspect('git status > /tmp/statusfile', needles))
+
+
+class RunWrapperLookThrough(unittest.TestCase):
+    """`disk-admission.py run ... -- JOB` must not hide the job from the hook, and is never pre-admitted."""
+    DA = '/Users/u/.local/lib/coding-agent-environment/scripts/disk-admission.py'
+
+    def wrapped(self, job, extra='--bytes 1000 --label job-a'):
+        return 'python3 %s run %s -- %s' % (self.DA, extra, job)
+
+    def test_wrapped_heavy_commands_are_classified_by_the_inner_command(self):
+        for job, kind in (('cargo build', 'cargo'), ('env FOO=1 cargo test', 'cargo'), ('uv sync', 'uv'),
+                          ('nice -n 5 npm install', 'npm'), ('pip install x', 'pip')):
+            verdict = gate.classify(self.wrapped(job))
+            self.assertEqual((verdict['heavy'], verdict['kind']), (True, kind), job)
+
+    def test_direct_execution_interpreter_options_uv_run_and_doubled_separator(self):
+        da = self.DA
+        for command in ('%s run --bytes 1 --label a -- cargo build' % da,
+                        './disk-admission.py run --bytes 1 --label a -- cargo build',
+                        'scripts/disk-admission.py run --bytes 1 --label a -- cargo build',
+                        'python3 -W ignore %s run --bytes 1 --label a -- cargo build' % da,
+                        'python3 -X dev -u -B %s run --bytes 1 --label a -- cargo build' % da,
+                        'uv run %s run --bytes 1 --label a -- cargo build' % da,
+                        'uv run python %s run --bytes 1 --label a -- cargo build' % da,
+                        'python3 %s run --bytes 1 --label a -- -- cargo build' % da,
+                        'python3 %s run --bytes 1 --label a -- bash -c "cargo build"' % da):
+            self.assertTrue(gate.classify(command)['heavy'], command)
+
+    def test_an_end_of_options_separator_before_the_adapter_is_looked_through(self):
+        command = 'python3 -- %s run --bytes 1 --label a -- cargo build' % self.DA
+        self.assertTrue(gate.classify(command)['heavy'])
+        # Negative controls: only the adapter itself may follow the separator.
+        self.assertFalse(gate.classify('python3 -- foo.py %s run -- cargo build' % self.DA)['heavy'])
+        self.assertFalse(gate.classify('python3 --')['heavy'])
+
+    def test_a_separator_between_the_adapter_and_run_is_looked_through(self):
+        for command in ('python3 %s -- run --bytes 1 --label a -- cargo build' % self.DA,
+                        '%s -- run --bytes 1 --label a -- cargo build' % self.DA):
+            self.assertTrue(gate.classify(command)['heavy'], command)
+        # Negative controls: another subcommand or a second separator is not the wrapper's run.
+        self.assertFalse(gate.classify('python3 %s -- status -- cargo build' % self.DA)['heavy'])
+        self.assertFalse(gate.classify('python3 %s -- -- run -- cargo build' % self.DA)['heavy'])
+
+    def test_uv_run_options_with_values_before_the_adapter_are_skipped(self):
+        for command in ('uv run --python 3.12 %s run --bytes 1 --label a -- cargo build' % self.DA,
+                        'uv run --with rich --project . %s run --bytes 1 --label a -- cargo build' % self.DA,
+                        'uv run --python=3.12 %s run --bytes 1 --label a -- cargo build' % self.DA):
+            self.assertTrue(gate.classify(command)['heavy'], command)
+        # Negative controls: an unlisted option, another program and a non-uv option value stay unrecognised.
+        for command in ('uv run --unknown val %s run -- cargo build' % self.DA,
+                        'uv run --python 3.12 pytest %s run -- cargo build' % self.DA,
+                        'python3 -p x %s run -- cargo build' % self.DA):
+            self.assertFalse(gate.classify(command)['heavy'], command)
+
+    def test_interpreter_option_values_after_uv_run_python_are_still_skipped(self):
+        for command in ('uv run python3 -X dev %s run --bytes 1 --label a -- cargo build' % self.DA,
+                        'uv run python3 -W ignore %s run --bytes 1 --label a -- cargo build' % self.DA,
+                        'uv run --python 3.12 python3 -X dev %s run --bytes 1 --label a -- cargo build' % self.DA):
+            self.assertTrue(gate.classify(command)['heavy'], command)
+        # Negative control: uv's own value options are not python's.
+        self.assertFalse(gate.classify('uv run python3 -p foo.py %s run -- cargo build' % self.DA)['heavy'])
+
+    def test_a_python_looking_uv_option_value_does_not_switch_to_interpreter_options(self):
+        command = 'uv run --python python3.12 --with x %s run --bytes 1 --label a -- cargo build' % self.DA
+        self.assertTrue(gate.classify(command)['heavy'])
+
+    def test_other_scripts_and_late_script_names_are_not_wrappers(self):
+        da = self.DA
+        for command in ('python3 foo.py run -- cargo build', 'python3 foo.py %s run -- cargo build' % da,
+                        'python3 -c "x" %s run -- cargo build' % da, 'python3 -m pytest %s run -- cargo build' % da,
+                        'uv run pytest %s run -- cargo build' % da, 'python3 %s run cargo build' % da,
+                        'python3 %s run --bytes 1 --label a cargo build' % da):
+            self.assertFalse(gate.classify(command)['heavy'], command)
+
+    def test_wrapped_commands_inside_a_shell_string_are_still_found(self):
+        verdict = gate.classify("bash -c '%s'" % self.wrapped('cargo build'))
+        self.assertEqual((verdict['heavy'], verdict['kind']), (True, 'cargo'))
+
+    def test_non_heavy_inner_and_malformed_wrappers_are_not_heavy(self):
+        for command in (self.wrapped('ls -la'), self.wrapped('echo cargo build'),
+                        'python3 %s run --bytes 1 --label a cargo build' % self.DA,  # no separator: not a wrapper
+                        'python3 %s status --json' % self.DA, 'python3 %s run --bytes 1 --label a --' % self.DA):
+            self.assertFalse(gate.classify(command)['heavy'], command)
+
+    def test_the_wrapper_path_is_never_trusted(self):
+        for path in ('/tmp/evil/disk-admission.py', 'disk-admission.py', '~/x/disk-admission.py'):
+            verdict = gate.classify('python3 %s run --bytes 1 --label a -- cargo build' % path)
+            self.assertTrue(verdict['heavy'], path)  # classified and admitted like a typed command
+
+    def run_gate(self, command, mode, runner):
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}})
+        out, err = io.StringIO(), io.StringIO()
+        code = gate.main(payload, out, err, mode_fn=lambda: mode, runner=runner)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_enforce_denies_a_refused_wrapped_job_and_warn_never_blocks(self):
+        refuse = lambda: (77, 'heavy refused in tier low')
+        code, out, err = self.run_gate(self.wrapped('cargo build'), 'enforce', refuse)
+        self.assertEqual((code, out), (2, ''))
+        self.assertIn('BLOCKED', err)
+        code, out, err = self.run_gate(self.wrapped('cargo build'), 'warn', refuse)
+        self.assertEqual((code, err), (0, ''))
+        self.assertIn('would block', json.loads(out)['hookSpecificOutput']['additionalContext'])
+        self.assertEqual(self.run_gate(self.wrapped('cargo build'), 'enforce', lambda: (0, 'ok')), (0, '', ''))
+
+    def test_a_wrapped_write_to_the_state_directory_is_still_tamper(self):
+        d = '~/.cache/coding-agent-environment/admission/'
+        for job in ('rm %smode' % d, 'tee %smode' % d, 'sh -c "echo warn > %smode"' % d):
+            code, out, err = self.run_gate(self.wrapped(job), 'enforce', lambda: (0, 'ok'))
+            self.assertEqual((code, out), (2, ''), job)
+            self.assertIn('tamper-suspect', err)
+
+    @mock.patch.object(gate, 'AUDIT_ENABLED', True)
+    def test_audit_lines_for_wrapped_jobs_never_contain_the_command(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp).resolve()
+            (directory / 'mode').write_text('warn')
+            payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': self.wrapped('cargo build -p SECRET_CRATE_77')}})
+            gate.main(payload, io.StringIO(), io.StringIO(), runner=lambda: (0, 'ok'), admission_dir=directory)
+            raw = (directory / 'gate-audit.jsonl').read_text()
+            self.assertEqual(len(raw.splitlines()), 1)  # the wrapped job was classified and audited
+            for fragment in ('SECRET_CRATE_77', 'cargo build', 'disk-admission.py'):
+                self.assertNotIn(fragment, raw)
+
+
 class GateInputs(unittest.TestCase):
     @staticmethod
     def forbidden():

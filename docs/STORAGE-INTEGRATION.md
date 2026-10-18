@@ -130,6 +130,44 @@ State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
 - `mode`: `warn` or `enforce`, edited only by an operator. Absent or invalid
   means warn.
 
+### Reserving a lane for a job (`run`)
+
+`disk-admission.py run --bytes N --label L [--ttl-s S] [--max-hold] -- COMMAND [ARG...]` reserves for its own process and
+then `exec`s the job. `exec` keeps the pid and start time, so the reservation is held by the job itself, nothing
+runs before admission, and no release step exists: exit, pid reuse and TTL expiry are reaped lazily. A refusal
+(latched, no free lane, over capacity, bad label or bytes, TTL above 4 h without `--max-hold`) never starts the job
+and exits 77; a failed `exec` releases the reservation and exits 127. Messages go to stderr (the reserved line only
+when stderr is a terminal, so a captured job stderr is not polluted), `--` between the options and the command is
+mandatory, and the job starts with default SIGPIPE/SIGXFSZ dispositions (a caller's own ignore of those signals is not preserved, because Python overwrites it at startup). The exit codes 77/127 are authoritative only
+until the job starts; afterwards the exit code is the job's own, so a job that can exit 77 or 127 is ambiguous (argparse
+errors exit 2). Only the exec'd process is tracked: a job that forks a daemon and exits, or backgrounds work, loses its
+reservation while the real consumer continues. A running job past its TTL silently loses its
+reservation, and an exited job that its parent has not reaped is still counted. Reservations only coordinate
+callers that use them: the gate hook still decides on tier and latch alone, so an unwrapped heavy command can run
+beside a reserved one. This state is advisory (same-user), not a security boundary.
+### Keeping the snapshot fresh (`refresher-plist`)
+
+The snapshot is stale after 120 s, so something has to republish it. `disk-admission.py refresher-plist` prints a
+launchd user agent (`com.coding-agent-environment.admission-snapshot`, every 60 s, `RunAtLoad`, no `KeepAlive`,
+output to `/dev/null` so no log can grow); it installs nothing. Operator steps, run from the **stable merged
+checkout** (never a worktree or temporary clone, and do not copy the script alone: the Glomeris reading is loaded
+from the sibling `storage-integration.py`, and without it the snapshot silently falls back to `statvfs` only):
+
+```bash
+python3 scripts/disk-admission.py refresher-plist > ~/Library/LaunchAgents/com.coding-agent-environment.admission-snapshot.plist
+plutil -lint ~/Library/LaunchAgents/com.coding-agent-environment.admission-snapshot.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.coding-agent-environment.admission-snapshot.plist
+python3 scripts/disk-admission.py snapshot --check-fresh        # exit 0 = fresh
+# rollback
+launchctl bootout gui/$(id -u)/com.coding-agent-environment.admission-snapshot && rm ~/Library/LaunchAgents/com.coding-agent-environment.admission-snapshot.plist
+```
+
+The interpreter and script paths are baked in when the plist is printed: a Homebrew Python upgrade that removes that
+interpreter, or moving the checkout, makes the agent fail without any output. Diagnose with
+`launchctl print gui/$(id -u)/com.coding-agent-environment.admission-snapshot` (last exit status) and by running
+`snapshot --json` by hand. A fresh snapshot is not permission: it may report `volume-unreadable` or zero heavy lanes,
+which consumers must read as refuse.
+
 ### Gate hook behavior
 
 The hook is deny-only and never rewrites a command. It classifies the command
@@ -146,10 +184,23 @@ the same user as the operator, so it can edit the mode file or the state
 directory, and software cannot prevent that. The hook flags any Bash command
 that appears to write, move or remove under the admission directory
 (redirects, tee, mv, rm, cp, `sed -i`, interpreters, `chmod`/`chflags`) as
-tamper-suspect: denied in enforce, advisory in warn. That detection is
+tamper-suspect: denied in enforce, advisory in warn. A line that mentions the directory is
+cleared only when every simple command on it is provably read-only (`cat`, `ls`, `tail`, `grep`,
+`jq`, `find` without `-delete`/`-exec`, `sed` without `-i`, ... with output redirected to a literal
+path elsewhere, `2>/dev/null` and `2>&1` included). Everything else stays suspect: other programs
+that name it, variables, globs, `cd`/`pushd`, `xargs`, heredocs, process substitution, backticks,
+interpreters (`python`, `perl`, `node`, ...) and unparsable lines. Reading the directory through an
+interpreter is therefore still flagged (a known false positive). That detection is
 best-effort. Operator hardening: `chmod 0444` and `chflags uchg` on the `mode`
 file (`chflags nouchg` before an edit); leave `state.json` writable, because the
 adapter updates it.
+
+The hook looks through the reserve-then-exec wrapper: `python3 .../disk-admission.py run ... -- JOB` is
+classified by `JOB`, so the recognised spellings of the wrapper do not hide `cargo`, `uv` and the like. The file name `disk-admission.py` is matched (direct execution, `python*` with options or `--`, a `--` before `run`, or `uv run` with its listed value options), but its path
+and contents are never trusted, an unlisted `uv run` option that takes a separate value, or any other launcher, leaves the wrapper unrecognised (the wrapper still admits its own job), a copy or symlink under another name is not recognised, and a
+wrapped job is never treated as pre-admitted; it is admitted, warned or denied exactly like the same command typed
+directly, and a wrapped write to the admission directory is still tamper-suspect. The audit line is unchanged (no
+command text).
 
 ### Gate audit trail
 

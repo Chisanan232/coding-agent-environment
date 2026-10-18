@@ -53,11 +53,14 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import plistlib
 import pwd
 import re
 import secrets
+import signal
 import stat
 import subprocess
+import sys
 import time
 
 GIB = 1024 ** 3
@@ -610,6 +613,59 @@ def snapshot(state_path, source_fn=measure_with_source, now=None, token_fn=proce
 
 
 REFUSED_EXIT = 77
+REFRESH_LABEL = 'com.coding-agent-environment.admission-snapshot'
+REFRESH_INTERVAL_S = 60  # well inside STALE_AFTER_S, so a missed run does not make consumers refuse at once
+
+
+def build_refresher_plist(python, script):
+    """launchd user agent that republishes the snapshot. No KeepAlive; output goes nowhere because the published
+    record is the product (a stale snapshot is what `snapshot --check-fresh` reports), so no log can grow."""
+    return plistlib.dumps({
+        'Label': REFRESH_LABEL,
+        'ProgramArguments': [python, script, 'snapshot', '--json'],
+        'StartInterval': REFRESH_INTERVAL_S,
+        'RunAtLoad': True,
+        'EnvironmentVariables': {'HOME': str(account_home()), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'},
+        'StandardOutPath': '/dev/null',
+        'StandardErrorPath': '/dev/null',
+    }).decode()
+
+
+def _exec_job(program, args):
+    """exec the job with default signal dispositions: Python ignores SIGPIPE and SIGXFSZ and exec inherits that,
+    which would make `sh -c 'yes | head -1'` behave differently under the wrapper than without it."""
+    for name in ('SIGPIPE', 'SIGXFSZ'):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), signal.SIG_DFL)
+    os.execvp(program, args)
+
+
+def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, ttl=DEFAULT_TTL, allow_long=False,
+                 exec_fn=_exec_job):
+    """Reserve for this very process, then exec the job: nothing runs before admission.
+
+    execv keeps the pid and the start time, so the reservation is held by the job itself and ends with it
+    (lazy reaping handles exit, pid reuse and TTL). A refusal never execs and returns 77; a failed exec
+    releases the reservation and returns 127. Every message goes to stderr; the exit code is the contract,
+    and it is authoritative only until the job starts (after exec the exit code is the job's own).
+    """
+    # Only the program must be non-empty: `git commit -m ''` and `sh -c ''` are legitimate jobs.
+    if not argv or not all(isinstance(part, str) and '\0' not in part for part in argv) or not argv[0]:
+        print('refused: invalid-request: a command is required after --', file=sys.stderr)
+        return REFUSED_EXIT
+    result = reserve(label, nbytes, os.getpid(), state_path, free_fn, ttl=ttl, allow_long=allow_long)
+    if not result['admit']:
+        print(result['reason'], file=sys.stderr)
+        return REFUSED_EXIT
+    if sys.stderr.isatty():
+        print(result['reason'], file=sys.stderr)  # never injected into a captured job stderr
+    try:
+        exec_fn(argv[0], argv)
+    except OSError as exc:
+        release(label, state_path)
+        print('exec failed: %s' % exc, file=sys.stderr)
+        return 127
+    return 0  # only reachable with an injected exec_fn
 
 
 def build_parser():
@@ -631,6 +687,13 @@ def build_parser():
     mode.add_argument('--json', action='store_true', help='write and print a fresh snapshot')
     mode.add_argument('--check-fresh', action='store_true', help='read-only: exit 0 when the snapshot is fresh, else 77')
     shot.add_argument('--max-age', type=int, default=STALE_AFTER_S, help='seconds, 1..120; with --check-fresh only')
+    commands.add_parser('refresher-plist', allow_abbrev=False, help='print the snapshot-refresher launchd agent; installs nothing')
+    go = commands.add_parser('run', allow_abbrev=False, help='reserve bytes for this process, then exec the job')
+    go.add_argument('--bytes', type=int, required=True, dest='nbytes')
+    go.add_argument('--label', required=True)
+    go.add_argument('--ttl-s', type=int, default=DEFAULT_TTL, dest='ttl', help='seconds, at most 4 h unless --max-hold')
+    go.add_argument('--max-hold', action='store_true', dest='allow_long')
+    go.add_argument('job', nargs=argparse.REMAINDER, help='-- COMMAND [ARG...]')
     drop = commands.add_parser('release', allow_abbrev=False, help='release a reservation by label')
     drop.add_argument('--label', required=True)
     return parser
@@ -639,6 +702,19 @@ def build_parser():
 def main(argv=None, free_fn=measure_free_bytes, state_path=None):
     state_path = state_path or default_state_path()
     args = build_parser().parse_args(argv)
+    if args.command == 'refresher-plist':
+        script = Path(__file__).resolve()
+        if str(script).startswith(('/tmp/', '/private/tmp/', '/var/folders/', '/private/var/folders/')):
+            print('warning: %s is scratch space; run refresher-plist from the stable merged checkout' % script,
+                  file=sys.stderr)
+        print(build_refresher_plist(sys.executable, str(script)), end='')
+        return 0
+    if args.command == 'run':
+        if args.job[:1] != ['--']:
+            print('refused: invalid-request: put -- between the options and the command', file=sys.stderr)
+            return REFUSED_EXIT
+        job = args.job[1:]
+        return run_reserved(args.label, args.nbytes, job, state_path, free_fn, args.ttl, args.allow_long)
     if args.command in ('reserve', 'release'):
         result = (reserve(args.label, args.nbytes, args.pid, state_path, free_fn, ttl=args.ttl, allow_long=args.allow_long)
                   if args.command == 'reserve' else release(args.label, state_path))
