@@ -7,7 +7,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 NAMES = ('ca-claude', 'ca-codex', 'coding-agent-resource', 'coding-agent-profile', 'coding-agent-profile-explain')
-ASSETS = tuple(('bin/' + name, 0o755) for name in NAMES) + (('scripts/codex-routing.py', 0o755),) + tuple(('codex/agents/' + role + '.toml', 0o600) for role in ('architect', 'implementer', 'reviewer'))
+ASSETS = tuple(('bin/' + name, 0o755) for name in NAMES) + (('scripts/codex-routing.py', 0o755), ('scripts/disk-admission.py', 0o755), ('scripts/storage-integration.py', 0o755)) + tuple(('codex/agents/' + role + '.toml', 0o600) for role in ('architect', 'implementer', 'reviewer'))
 
 
 def main():

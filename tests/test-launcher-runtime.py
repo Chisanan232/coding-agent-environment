@@ -25,6 +25,14 @@ class Runtime(unittest.TestCase):
             (runtime/'bin/ca-codex').write_text('drift')
             self.assertNotEqual(run().returncode,0)
             self.assertEqual((runtime/'bin/ca-codex').read_text(),'drift')
+    def test_runtime_has_the_disk_admission_adapter_the_gate_falls_back_to(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result=subprocess.run([sys.executable,str(ROOT/'scripts/launcher-install.py'),'--home',temp],capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            scripts=Path(temp)/'.local/lib/coding-agent-environment/scripts'
+            for name in ('disk-admission.py','storage-integration.py'):
+                self.assertEqual((scripts/name).read_bytes(),(ROOT/'scripts'/name).read_bytes())
+                self.assertTrue(os.access(scripts/name,os.X_OK))
     def test_redirected_asset_parent_refused(self):
         with tempfile.TemporaryDirectory() as temp:
             home=Path(temp);runtime=home/'.local/lib/coding-agent-environment';runtime.mkdir(parents=True)
