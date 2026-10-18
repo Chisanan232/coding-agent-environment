@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Disk-pressure admission core refuses unsafe work and fails closed."""
 from importlib.util import module_from_spec, spec_from_file_location
+import contextlib
 import io
 from datetime import datetime, timedelta, timezone
 import json
@@ -831,6 +832,121 @@ class RefresherPlist(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn('<key>StartInterval</key>', out.getvalue())
             self.assertFalse(state.parent.exists())
+
+
+class RunReserved(unittest.TestCase):
+    """`run` reserves for the process that becomes the job; nothing runs before admission."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name).resolve()
+        self.path = self.dir / 'admission/state.json'
+        self.sentinel = self.dir / 'ran'
+
+    def go(self, label='job-a', nbytes=10 * GIB, free=300 * GIB, argv=None, **options):
+        spawned = []
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = da.run_reserved(label, nbytes, argv if argv is not None else ['touch', str(self.sentinel)], self.path,
+                                   lambda: free, exec_fn=lambda program, args: spawned.append((program, args)), **options)
+        return code, spawned, err.getvalue()
+
+    def test_admits_then_execs_with_this_process_as_the_reservation_holder(self):
+        code, spawned, _ = self.go()
+        self.assertEqual((code, spawned), (0, [('touch', ['touch', str(self.sentinel)])]))
+        record = json.loads((self.path.parent / 'reservations/job-a.json').read_text())
+        self.assertEqual(record['pid'], os.getpid())
+
+    def test_refusals_never_exec_and_say_why(self):
+        for name, options, reason in (('latched', dict(free=30 * GIB), 'latched'), ('over-capacity', dict(nbytes=250 * GIB), 'over-capacity'),
+                                      ('zero-bytes', dict(nbytes=0), 'invalid-request'), ('negative-bytes', dict(nbytes=-5), 'invalid-request'),
+                                      ('bad-label', dict(label='../escape'), 'invalid-request'),
+                                      ('ttl-too-long', dict(ttl=5 * 3600), 'invalid-request'),
+                                      ('empty-command', dict(argv=[]), 'command is required')):
+            with self.subTest(name):
+                code, spawned, err = self.go(**options)
+                self.assertEqual((code, spawned), (77, []))
+                self.assertIn(reason, err)
+        self.assertFalse(self.sentinel.exists())
+
+    def test_second_job_hits_the_lane_cap(self):
+        holder = subprocess.Popen(['sleep', '30'])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertTrue(da.reserve('other-job', 10 * GIB, holder.pid, self.path, lambda: 300 * GIB)['admit'])
+        code, spawned, err = self.go(label='job-b')
+        self.assertEqual((code, spawned), (77, []))
+        self.assertIn('lane-cap', err)
+        code, spawned, err = self.go(label='other-job')
+        self.assertEqual((code, spawned), (77, []))
+        self.assertIn('label-in-use', err)
+
+    def test_failed_exec_releases_and_exits_127(self):
+        def boom(program, args):
+            raise FileNotFoundError(program)
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = da.run_reserved('job-a', 10 * GIB, ['no-such-binary-xyz'], self.path, lambda: 300 * GIB, exec_fn=boom)
+        self.assertEqual(code, 127)
+        self.assertFalse((self.path.parent / 'reservations/job-a.json').exists())
+
+    def test_empty_string_arguments_are_passed_through_but_an_empty_program_is_refused(self):
+        code, spawned, _ = self.go(argv=['git', 'commit', '-m', ''])
+        self.assertEqual((code, spawned[0][1]), (0, ['git', 'commit', '-m', '']))
+        code, spawned, err = self.go(label='job-b', argv=[''])
+        self.assertEqual((code, spawned), (77, []))
+        self.assertIn('a command is required', err)
+
+    def test_exec_resets_sigpipe_and_sigxfsz_to_default(self):
+        import signal
+        saved = {name: signal.getsignal(getattr(signal, name)) for name in ('SIGPIPE', 'SIGXFSZ')}
+        self.addCleanup(lambda: [signal.signal(getattr(signal, n), h) for n, h in saved.items()])
+        for name in saved:
+            signal.signal(getattr(signal, name), signal.SIG_IGN)
+        with mock.patch.object(da.os, 'execvp', lambda program, args: None):
+            da._exec_job('true', ['true'])
+        for name in saved:
+            self.assertEqual(signal.getsignal(getattr(signal, name)), signal.SIG_DFL, name)
+
+    def test_job_argv_after_the_separator_is_plain_arguments(self):
+        code, spawned, _ = self.go(argv=['echo', '; rm -rf /', '$(id)', '--bytes', '1'])
+        self.assertEqual(spawned[0][1], ['echo', '; rm -rf /', '$(id)', '--bytes', '1'])
+
+    def run_cli(self, *job_args, free=300 * 2**30):
+        script = str(ROOT / 'scripts/disk-admission.py')
+        harness = (
+            "import importlib.util,sys;from pathlib import Path;"
+            "s=importlib.util.spec_from_file_location('da',%r);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+            "sys.exit(m.main(%r,free_fn=lambda:%d,state_path=Path(%r)))" % (script, list(job_args), free, str(self.path)))
+        return subprocess.run([sys.executable, '-c', harness], capture_output=True, text=True, timeout=60)
+
+    def test_real_exec_keeps_pid_token_while_running_and_ends_with_the_job(self):
+        probe = (
+            "import importlib.util,json,os,signal;from pathlib import Path;"
+            "s=importlib.util.spec_from_file_location('da',%r);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+            "p=Path(%r);rec=json.loads((p.parent/'reservations/real-job.json').read_text());"
+            "print(json.dumps(dict(pid=os.getpid(),rec_pid=rec['pid'],token_now=m.process_token(os.getpid()),"
+            "rec_token=rec['start_token'],active=m.snapshot(p,lambda:(300*2**30,'x'))['active_heavy_jobs'])))"
+            % (str(ROOT / 'scripts/disk-admission.py'), str(self.path)))
+        done = self.run_cli('run', '--bytes', str(10 * 2**30), '--label', 'real-job', '--', sys.executable, '-c', probe)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        seen = json.loads(done.stdout)
+        self.assertEqual(seen['pid'], seen['rec_pid'])
+        self.assertEqual(seen['token_now'], seen['rec_token'])  # exec kept the start token the reservation holds
+        self.assertEqual(seen['active'], 1)
+        shot = da.snapshot(self.path, lambda: (300 * GIB, 'injected'))
+        self.assertEqual(shot['active_heavy_jobs'], 0)  # the job has exited, so the reservation is reaped
+        self.assertEqual(done.stderr, '')  # nothing injected into a captured job stderr
+
+    def test_pipeline_job_dies_by_sigpipe_like_it_would_without_the_wrapper(self):
+        done = self.run_cli('run', '--bytes', str(10 * 2**30), '--label', 'pipe-job', '--', 'sh', '-c', 'yes | head -1')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn('Broken pipe', done.stderr)
+
+    def test_cli_requires_the_separator_and_a_command(self):
+        for args in (('run', '--bytes', '1', '--label', 'a', 'echo', 'hi'), ('run', '--bytes', '1', '--label', 'a', '--')):
+            done = self.run_cli(*args)
+            self.assertEqual(done.returncode, 77, args)
 
 
 if __name__ == '__main__':
