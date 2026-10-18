@@ -273,9 +273,12 @@ def _admission_run_inner(words):
             index += 1
         if index >= len(words):
             return None
-    if words[index + 1:index + 2] != ['run']:
+    after = index + 1
+    if words[after:after + 1] == ['--']:  # argparse accepts a separator before the subcommand
+        after += 1
+    if words[after:after + 1] != ['run']:
         return None
-    rest = words[index + 2:]
+    rest = words[after + 1:]
     if '--' not in rest:
         return None
     inner = rest[rest.index('--') + 1:]
