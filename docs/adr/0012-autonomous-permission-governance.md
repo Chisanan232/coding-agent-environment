@@ -433,7 +433,7 @@ non-waivable boundary. A wrapper that is not itself material must not prompt.
 **Decision.** `Bash(rtk proxy *)` is retired. The baseline asks per program instead of per sub-command: the
 control-plane CLIs (`gcloud`, `gsutil`, `bq`, `kubectl`, `terraform`), process kill (`kill`, `pkill`,
 `killall`), shell and exec wrappers (`sh`, `bash`, `zsh`, `eval`, `env`, `xargs`, `sudo`, `exec`, `command`), any absolute-path program (`rtk proxy /...`), `git push|reset|clean|
-worktree`, `gh repo delete` and `gh api` with a DELETE method. Everything else through the wrapper (build, test,
+worktree` (bare and after global options such as `-C <path>`), `gh repo delete` and `gh api` with a DELETE method. Everything else through the wrapper (build, test,
 search, git read, `gh` reads, package scripts) is no longer a static ask and is left to the classifier.
 `permission-rollout.py` fails any result in which one of those protected wrapped commands stops asking or a
 routine wrapped command asks.
