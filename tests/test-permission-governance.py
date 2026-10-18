@@ -637,6 +637,24 @@ class SPE105EffectiveBehavior(unittest.TestCase):
         self.assertEqual("auto", load_settings()["permissions"]["defaultMode"])
 
 
+class SPE114RtkProxyScopedAsks(unittest.TestCase):
+    """`rtk proxy` is never rewritten, so only a rule naming the wrapper sees the wrapped command."""
+
+    def setUp(self):
+        self.perm = load_settings()["permissions"]
+
+    def test_wrapped_protected_operations_ask(self):
+        for cmd in (
+            "rtk proxy git push --force origin x", "rtk proxy git reset --hard HEAD~1", "rtk proxy git clean -fd",
+            "rtk proxy gcloud secrets versions access latest --secret=s",
+            "rtk proxy gcloud projects add-iam-policy-binding p --member=user:a@b.c --role=roles/viewer",
+            "rtk proxy terraform destroy", "rtk proxy kill -9 1", "rtk proxy sh -c 'git push --force'",
+            "rtk proxy env gcloud config list", "rtk proxy gh api repos/o/r -X DELETE", "rtk proxy gh repo delete o/r --yes",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual("ask", static_decision(cmd, self.perm))
+
+
 class SecretMetadataOverlayTemplate(unittest.TestCase):
     """The private-overlay template grants metadata + write-only version add,
     never plaintext reads, and deny still wins when merged with the baseline."""
