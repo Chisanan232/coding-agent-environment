@@ -668,6 +668,15 @@ class SPE114RtkProxyScopedAsks(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual("ask", static_decision(cmd, self.perm))
 
+    def test_wrapped_protected_git_after_global_options_asks(self):
+        for cmd in (
+            "rtk proxy git -C /peer push --force origin x", "rtk proxy git -c a=b reset --hard HEAD~1",
+            "rtk proxy git --git-dir=x clean -fd", "rtk proxy git -C /peer worktree remove --force /w",
+            "rtk proxy gh api -X DELETE repos/o/r", "rtk proxy gh api --method DELETE repos/o/r",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual("ask", static_decision(cmd, self.perm))
+
 
 class SecretMetadataOverlayTemplate(unittest.TestCase):
     """The private-overlay template grants metadata + write-only version add,
