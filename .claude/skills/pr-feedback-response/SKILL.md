@@ -27,8 +27,8 @@ Auto-used. Run when a PR has new review comments or a "Request Changes" verdict.
 ## Steps
 
 ### Phase 1 — Triage feedback
-1. Fetch the PR's current review state using `code_repository` MCP
-   (GitHub MCP `pull_request_read`).
+1. Fetch the PR's current review state with `gh pr view` and `gh api` (GitHub MCP
+   `pull_request_read` is optional).
 2. Collect all unresolved review comments and Request Changes verdicts.
 3. Categorize each comment:
    - **Must-fix**: blocking issue (correctness, security, policy violation).
