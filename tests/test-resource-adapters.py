@@ -142,6 +142,7 @@ open(os.environ["MARKER"], "w").write(json.dumps([sys.argv[1:], os.environ.get("
         run = ("import sys; ns={'__name__':'adapter'}; "
                "exec(compile(open(sys.argv[1]).read(),sys.argv[1],'exec'),ns); "
                "ns['HOLD_RETRY_WINDOW']=1; raise SystemExit(ns['main'](sys.argv[2:]))")
+        self.prelaunch_core(env)
         result = subprocess.run([sys.executable, "-c", run, str(ADAPTER), "--host", "claude", "--",
                                  str(child)], env=env, text=True, capture_output=True, timeout=4)
         self.assertEqual(result.returncode, 0, result.stderr)
