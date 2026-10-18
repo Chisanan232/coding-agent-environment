@@ -198,9 +198,13 @@ def plan(args):
         print('REFUSING: the settings already hold a different disk-admission-gate entry')
         return 2
     if state == 'installed':
-        in_sync = dest.exists() and rollout.sha(dest) == hook_sha
-        print('change: %s' % ('none, already installed' if in_sync else
-                              'replace the hook file with a backup (the settings entry is already present and stays unchanged)'))
+        if not dest.exists():
+            action = 'install the hook file, no backup needed (the settings entry is already present and stays unchanged)'
+        elif rollout.sha(dest) == hook_sha:
+            action = 'none, already installed'
+        else:
+            action = 'replace the hook file with a backup (the settings entry is already present and stays unchanged)'
+        print('change: %s' % action)
     else:
         print('change: append 1 PreToolUse group (matcher Bash)')
     return 0
