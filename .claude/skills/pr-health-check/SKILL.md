@@ -29,7 +29,7 @@ coordination-level check, not a developer progress check.
 ## Steps
 
 ### 1. List open PRs
-- Use GitHub MCP to list all open PRs on the repository.
+- Use `gh pr list` (GitHub MCP optional) to list all open PRs on the repository.
 - For each PR, collect: title, author, CI status, review status, merge conflict state,
   last activity timestamp, and labels.
 
