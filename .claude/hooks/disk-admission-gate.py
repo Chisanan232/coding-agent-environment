@@ -237,6 +237,9 @@ def _heavy_kind(words):
 
 ADMISSION_SCRIPT = 'disk-admission.py'
 INTERPRETER_VALUE_OPTIONS = {'-W', '-X', '-Q'}
+# `uv run` options that take a separate value; an unlisted option leaves the wrapper unrecognised.
+UV_VALUE_OPTIONS = {'--python', '-p', '--with', '--with-requirements', '--with-editable', '--project',
+                    '--directory', '--env-file', '--package', '--extra', '--group', '--only-group'}
 
 
 def _admission_run_inner(words):
@@ -252,8 +255,10 @@ def _admission_run_inner(words):
     program = os.path.basename(words[0])
     index = 0
     if program != ADMISSION_SCRIPT:
+        value_options = INTERPRETER_VALUE_OPTIONS
         if program == 'uv' and words[1:2] == ['run']:
             index = 2
+            value_options = UV_VALUE_OPTIONS
         elif program.startswith('python'):
             index = 1
         else:
@@ -268,7 +273,7 @@ def _admission_run_inner(words):
                 index += 1
                 break
             if not (word.startswith('-') or os.path.basename(word).startswith('python')
-                                    or (index > 0 and words[index - 1] in INTERPRETER_VALUE_OPTIONS)):
+                                    or (index > 0 and words[index - 1] in value_options)):
                 return None
             index += 1
         if index >= len(words):
