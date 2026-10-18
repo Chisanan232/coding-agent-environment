@@ -122,6 +122,7 @@ PROXY_PROTECTED_COMMANDS = [
     "rtk proxy kill -9 1", "rtk proxy pkill x", "rtk proxy killall x",
     "rtk proxy sh -c 'git push --force'", "rtk proxy bash -c x", "rtk proxy zsh -c x", "rtk proxy eval x",
     "rtk proxy env gcloud x", "rtk proxy xargs rm", "rtk proxy sudo x",
+    "rtk proxy exec gcloud x", "rtk proxy command gcloud x", "rtk proxy /usr/bin/gcloud auth list",
     "rtk proxy gh repo delete o/r --yes", "rtk proxy gh api repos/o/r -X DELETE", "rtk proxy gh api repos/o/r --method DELETE",
 ]
 PROXY_ROUTINE_COMMANDS = [

@@ -21,6 +21,7 @@ PROXY_SCOPED_ASK = [
     "Bash(rtk proxy terraform:*)", "Bash(rtk proxy kill:*)", "Bash(rtk proxy pkill:*)", "Bash(rtk proxy killall:*)",
     "Bash(rtk proxy sh:*)", "Bash(rtk proxy bash:*)", "Bash(rtk proxy zsh:*)", "Bash(rtk proxy eval:*)",
     "Bash(rtk proxy env:*)", "Bash(rtk proxy xargs:*)", "Bash(rtk proxy sudo:*)",
+    "Bash(rtk proxy exec:*)", "Bash(rtk proxy command:*)", "Bash(rtk proxy /*)",
     "Bash(rtk proxy git push:*)", "Bash(rtk proxy git reset:*)", "Bash(rtk proxy git clean:*)",
     "Bash(rtk proxy git worktree:*)", "Bash(rtk proxy gh repo delete *)",
     "Bash(rtk proxy gh api * -X DELETE*)", "Bash(rtk proxy gh api * --method DELETE*)",

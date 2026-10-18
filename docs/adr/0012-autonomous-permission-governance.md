@@ -432,14 +432,14 @@ non-waivable boundary. A wrapper that is not itself material must not prompt.
 
 **Decision.** `Bash(rtk proxy *)` is retired. The baseline asks per program instead of per sub-command: the
 control-plane CLIs (`gcloud`, `gsutil`, `bq`, `kubectl`, `terraform`), process kill (`kill`, `pkill`,
-`killall`), shell and exec wrappers (`sh`, `bash`, `zsh`, `eval`, `env`, `xargs`, `sudo`), `git push|reset|clean|
+`killall`), shell and exec wrappers (`sh`, `bash`, `zsh`, `eval`, `env`, `xargs`, `sudo`, `exec`, `command`), any absolute-path program (`rtk proxy /...`), `git push|reset|clean|
 worktree`, `gh repo delete` and `gh api` with a DELETE method. Everything else through the wrapper (build, test,
 search, git read, `gh` reads, package scripts) is no longer a static ask and is left to the classifier.
 `permission-rollout.py` fails any result in which one of those protected wrapped commands stops asking or a
 routine wrapped command asks.
 
 **Limits, stated plainly.** These are prefix rules and can be sidestepped by a spelling the matcher does not
-anchor (an unknown `VAR=1` prefix, an absolute program path, `command`, `nohup`, an interpreter running code that
+anchor (an unknown `VAR=1` prefix, `nohup`, `timeout`, `nice`, an interpreter running code that
 spawns the program). That limitation applies equally to the plain and `rtk` rules and is not new. The
 classifier is the second layer, not a guarantee; a structural fix would be a parsing PreToolUse hook and is out
 of scope here.
