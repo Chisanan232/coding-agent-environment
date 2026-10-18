@@ -103,6 +103,13 @@ class LiveScripts(unittest.TestCase):
         self.assertNotIn("CODING_AGENT_LOCAL_DIR", self.env)
         self.assertNotIn("CODING_AGENT_LOCAL_BASELINE_DIR", self.env)
 
+    def test_script_env_never_inherits_an_install_target_override(self):
+        names = ("CODING_AGENT_SYNC_HOME", "CODEX_HOME", "INSTALL_BIN_DIR", "CODING_AGENT_PROFILE_DIR")
+        with mock.patch.dict(os.environ, {name: "/nonexistent/real-" + name for name in names}):
+            self.setUp()
+        for name in names:
+            self.assertNotIn(name, self.env)
+
     def test_retire_refuses_a_marker_inside_a_legacy_section(self):
         self.install()
         with self.live.open("a") as handle:
