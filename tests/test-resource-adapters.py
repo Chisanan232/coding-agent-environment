@@ -150,6 +150,15 @@ open(os.environ["MARKER"], "w").write(json.dumps([sys.argv[1:], os.environ.get("
         self.assertEqual([r["op"] for r in self.requests()],
                          ["child_pending", "register_child", "release"])
 
+    def prelaunch_core(self, env):
+        """Launch the fake core once so a timed retry window does not absorb its first-launch cost.
+
+        The core is a script written moments ago; its first launch pays OS validation (up to ~230-530 ms measured on
+        a loaded Mac). With no arguments it exits 90 before any side effect, so the attempts file, protocol log and
+        args file are untouched; the exit code is asserted so a later reorder cannot turn this into a counted attempt.
+        """
+        self.assertEqual(subprocess.run([str(self.core)], env=env, capture_output=True).returncode, 90)
+
     def test_permanent_initial_busy_is_bounded_and_never_launches(self):
         child = self.root / "permanent-busy-child"
         child.write_text('#!/bin/sh\ntouch "$MARKER"\n')
@@ -160,10 +169,7 @@ open(os.environ["MARKER"], "w").write(json.dumps([sys.argv[1:], os.environ.get("
         run = ("import sys; ns={'__name__':'adapter'}; "
                "exec(compile(open(sys.argv[1]).read(),sys.argv[1],'exec'),ns); "
                "ns['HOLD_RETRY_WINDOW']=.38; raise SystemExit(ns['main'](sys.argv[2:]))")
-        # The core is a script written moments ago: its first launch pays OS validation (up to ~230 ms measured on
-        # a loaded Mac), which can consume the whole 0.38 s window and leave one attempt. It exits 90 before any
-        # side effect, so launching it once first leaves the timed run measuring retry behavior only.
-        subprocess.run([str(self.core)], env=env, capture_output=True)
+        self.prelaunch_core(env)
         started = time.monotonic()
         result = subprocess.run([sys.executable, "-c", run, str(ADAPTER), "--host", "claude", "--",
                                  str(child)], env=env, text=True, capture_output=True, timeout=3)
