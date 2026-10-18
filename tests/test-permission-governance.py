@@ -663,6 +663,11 @@ class SPE114RtkProxyScopedAsks(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertNotEqual("ask", static_decision(cmd, self.perm))
 
+    def test_wrapped_absolute_path_exec_and_command_forms_ask(self):
+        for cmd in ("rtk proxy /usr/bin/gcloud auth list", "rtk proxy exec gcloud x", "rtk proxy command gcloud x"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual("ask", static_decision(cmd, self.perm))
+
 
 class SecretMetadataOverlayTemplate(unittest.TestCase):
     """The private-overlay template grants metadata + write-only version add,
