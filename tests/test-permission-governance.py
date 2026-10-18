@@ -654,6 +654,15 @@ class SPE114RtkProxyScopedAsks(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual("ask", static_decision(cmd, self.perm))
 
+    def test_routine_wrapped_development_does_not_ask(self):
+        for cmd in (
+            "rtk proxy cargo test", "CARGO_TARGET_DIR=/x rtk proxy cargo test 2>&1", "rtk proxy grep -rn fn src",
+            "rtk proxy git log --oneline -3", "rtk proxy git diff HEAD~1", "rtk proxy pnpm run lint",
+            "rtk proxy uv run pytest -q", "rtk proxy gh api repos/o/r/branches/main/protection",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertNotEqual("ask", static_decision(cmd, self.perm))
+
 
 class SecretMetadataOverlayTemplate(unittest.TestCase):
     """The private-overlay template grants metadata + write-only version add,
