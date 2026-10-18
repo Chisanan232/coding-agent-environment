@@ -195,6 +195,13 @@ best-effort. Operator hardening: `chmod 0444` and `chflags uchg` on the `mode`
 file (`chflags nouchg` before an edit); leave `state.json` writable, because the
 adapter updates it.
 
+The hook looks through the reserve-then-exec wrapper: `python3 .../disk-admission.py run ... -- JOB` is
+classified by `JOB`, so the recognised spellings of the wrapper do not hide `cargo`, `uv` and the like. The file name `disk-admission.py` is matched (direct execution, `python*` with options or `--`, a `--` before `run`, or `uv run` with its listed value options), but its path
+and contents are never trusted, an unlisted `uv run` option that takes a separate value, or any other launcher, leaves the wrapper unrecognised (the wrapper still admits its own job), a copy or symlink under another name is not recognised, and a
+wrapped job is never treated as pre-admitted; it is admitted, warned or denied exactly like the same command typed
+directly, and a wrapped write to the admission directory is still tamper-suspect. The audit line is unchanged (no
+command text).
+
 ### Gate audit trail
 
 The hook appends one JSON line per heavy or tamper-suspect classification to
