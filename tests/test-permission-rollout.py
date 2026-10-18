@@ -30,6 +30,8 @@ PROXY_SCOPED_ASK = [
 ]
 
 BASE_ASK = [
+    "Bash(gh api -X DELETE*)", "Bash(rtk gh api -X DELETE*)",
+    "Bash(gh api --method DELETE*)", "Bash(rtk gh api --method DELETE*)",
     "Bash(terraform apply:*)", "Bash(rtk terraform apply:*)",
     "Bash(terraform destroy:*)", "Bash(rtk terraform destroy:*)",
     "Bash(terraform -* destroy*)", "Bash(rtk terraform -* destroy*)",

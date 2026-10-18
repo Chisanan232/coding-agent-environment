@@ -107,6 +107,7 @@ FORMER_DENY_COMMANDS = [
     "gcloud secrets versions access latest --secret=s",
     "gcloud --project=p secrets versions access latest --secret=s",
     "rtk proxy terraform destroy",
+    "gh api -X DELETE repos/o/r", "gh api --method DELETE repos/o/r",
 ]
 
 # SPE-114: `rtk proxy` is never rewritten, so rules written for the plain and `rtk` spellings do not see the
