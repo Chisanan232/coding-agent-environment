@@ -545,6 +545,13 @@ class RunWrapperLookThrough(unittest.TestCase):
                         'python3 %s run --bytes 1 --label a -- bash -c "cargo build"' % da):
             self.assertTrue(gate.classify(command)['heavy'], command)
 
+    def test_an_end_of_options_separator_before_the_adapter_is_looked_through(self):
+        command = 'python3 -- %s run --bytes 1 --label a -- cargo build' % self.DA
+        self.assertTrue(gate.classify(command)['heavy'])
+        # Negative controls: only the adapter itself may follow the separator.
+        self.assertFalse(gate.classify('python3 -- foo.py %s run -- cargo build' % self.DA)['heavy'])
+        self.assertFalse(gate.classify('python3 --')['heavy'])
+
     def test_other_scripts_and_late_script_names_are_not_wrappers(self):
         da = self.DA
         for command in ('python3 foo.py run -- cargo build', 'python3 foo.py %s run -- cargo build' % da,
