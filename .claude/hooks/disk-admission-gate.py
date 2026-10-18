@@ -237,7 +237,8 @@ def _heavy_kind(words):
 
 ADMISSION_SCRIPT = 'disk-admission.py'
 INTERPRETER_VALUE_OPTIONS = {'-W', '-X', '-Q'}
-# `uv run` options that take a separate value; an unlisted option leaves the wrapper unrecognised.
+# `uv run` options that take a separate value; an unlisted option followed by a separate value leaves the wrapper
+# unrecognised (a valueless flag is skipped like any other `-` word).
 UV_VALUE_OPTIONS = {'--python', '-p', '--with', '--with-requirements', '--with-editable', '--project',
                     '--directory', '--env-file', '--package', '--extra', '--group', '--only-group'}
 
