@@ -596,6 +596,16 @@ class MergedBaselineGate(Fixture):
 
 
 class StaticGate(Fixture):
+    def test_migration_retires_the_blanket_proxy_ask_and_keeps_the_scoped_asks(self):
+        live = copy.deepcopy(LIVE)
+        live["permissions"]["deny"] = []
+        live["permissions"]["ask"].append("Bash(rtk proxy *)")
+        merged = rollout.merge(live, copy.deepcopy(BASELINE), [])
+        ask = merged["permissions"]["ask"]
+        self.assertNotIn("Bash(rtk proxy *)", ask)
+        self.assertTrue(set(PROXY_SCOPED_ASK) <= set(ask))
+        self.assertEqual([], rollout.problems(merged))
+
     def test_a_result_that_stops_asking_for_a_wrapped_force_push_is_flagged(self):
         merged = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [])
         merged["permissions"]["ask"].remove("Bash(rtk proxy git push:*)")
