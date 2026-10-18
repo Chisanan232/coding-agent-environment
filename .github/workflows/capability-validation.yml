@@ -13,6 +13,7 @@ on:
       - 'scripts/resource-policy-install.py'
       - 'scripts/launcher-install.py'
       - 'scripts/campaign-resume.py'
+      - 'scripts/spe108-live/**'
       - 'scripts/parity-dogfood.py'
       - 'scripts/codex-routing.py'
       - 'scripts/verify-codex-routing.py'
@@ -33,6 +34,7 @@ on:
       - 'scripts/resource-policy-install.py'
       - 'scripts/launcher-install.py'
       - 'scripts/campaign-resume.py'
+      - 'scripts/spe108-live/**'
       - 'scripts/parity-dogfood.py'
       - 'scripts/codex-routing.py'
       - 'scripts/verify-codex-routing.py'
@@ -79,6 +81,7 @@ jobs:
           python3 tests/test-campaign-resume.py
           python3 tests/test-disk-admission-gate.py
           python3 tests/test-disk-admission.py
+          python3 tests/test-spe108-live.py
           python3 tests/test-parity-dogfood.py
   native-resource-wire:
     runs-on: macos-14

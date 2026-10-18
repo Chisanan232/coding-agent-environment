@@ -12,8 +12,9 @@ Nothing here replaces a live file wholesale, and no live policy text is publishe
 | Private overlay | `$CODING_AGENT_LOCAL_BASELINE_DIR/claude/CLAUDE.private.md` (default `~/.config/coding-agent-environment/local/baseline/claude/`), mode 0600, owned by you | never (gitignored) |
 | Live file | `~/.claude/CLAUDE.md` | no |
 
-Live-only safety clauses (secret handling, CI classification, auto-merge conditions, push gate,
-worktree workflow, non-production autonomy) belong in the private overlay, not in this repo.
+Live-only safety clauses (secret handling, CI classification, auto-merge conditions, non-production
+autonomy and any other rule the public base does not carry) belong in the private overlay, not in this
+repo. The commit, PR, branch, worktree and delegation rules are delivered by the managed span.
 
 ## Preconditions
 
@@ -73,3 +74,31 @@ disposable repository and a stub ticket. Record transcripts only after secret re
 Automated assertions can reuse the regexes in `tests/test-engineering-workflow.py`. A failing probe
 after install means the session did not load the policy: check `sync-check.sh --claude-clauses` and
 `--check` first.
+
+## Live deployment order (operator scripts in `scripts/spe108-live/`)
+
+The scripts never print policy text. They were reviewed independently in three rounds. Run them from a
+clean checkout whose `HEAD` equals `origin/main` after `git fetch` (so it contains the managed-span change);
+`build-overlay.py` refuses anything else.
+
+1. Back up `~/.claude/CLAUDE.md` and `rules/*.md` (Preconditions above).
+2. `scripts/profile-install.sh --claude-skills --dry-run`, `--check`, then apply **with no overlay yet**.
+   This replaces the managed span with the current one (all delivery-contract sections inside it).
+3. `python3 scripts/spe108-live/build-overlay.py --repo <checkout>`. Creates the mode-0600 overlay from
+   live-only text only (nothing inside the managed span or an existing overlay block is copied, so no stale
+   duplicate of public policy). Refuses to overwrite.
+4. `scripts/profile-install.sh --claude-skills` again to merge the overlay, then `--check`.
+5. `python3 scripts/spe108-live/retire-sections.py --repo <checkout>` (dry-run): lists the four legacy
+   unmarked sections (Commit Policy, Pull Request Policy, Git Worktree Workflow, Delegation Model) by line
+   range, per-section counts of lines absent from the public base (they survive only in the backup), and the
+   residual references to review by hand, labelled by region (original, managed span, overlay copy).
+6. `python3 scripts/spe108-live/retire-sections.py --apply --expect-sha256 <printed live hash>`. It refuses
+   unless the replacement sections are inside the managed span, takes a byte-exact 0600 backup, preserves the
+   file mode and writes atomically.
+7. Hand-edit the residual references in the original region of `~/.claude/CLAUDE.md` and in
+   `CLAUDE.private.md` (reinstall afterwards); never edit the managed span.
+8. `scripts/sync-check.sh --claude-clauses` must report `Claude clause drift: 0`; then the acceptance probes.
+
+Rollback: copy the backup printed by `retire-sections.py` (or the step 1 backup) back over
+`~/.claude/CLAUDE.md`; delete the overlay file and re-run the installer if the overlay is to go too.
+Expect the live file to grow by roughly the overlay size, because the originals stay in place.
