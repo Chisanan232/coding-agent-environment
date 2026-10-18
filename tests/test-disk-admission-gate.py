@@ -579,6 +579,10 @@ class RunWrapperLookThrough(unittest.TestCase):
         # Negative control: uv's own value options are not python's.
         self.assertFalse(gate.classify('uv run python3 -p foo.py %s run -- cargo build' % self.DA)['heavy'])
 
+    def test_a_python_looking_uv_option_value_does_not_switch_to_interpreter_options(self):
+        command = 'uv run --python python3.12 --with x %s run --bytes 1 --label a -- cargo build' % self.DA
+        self.assertTrue(gate.classify(command)['heavy'])
+
     def test_other_scripts_and_late_script_names_are_not_wrappers(self):
         da = self.DA
         for command in ('python3 foo.py run -- cargo build', 'python3 foo.py %s run -- cargo build' % da,
