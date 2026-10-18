@@ -260,7 +260,14 @@ def _admission_run_inner(words):
             return None
         while index < len(words) and os.path.basename(words[index]) != ADMISSION_SCRIPT:
             word = words[index]
-            if word == '--' or not (word.startswith('-') or os.path.basename(word).startswith('python')
+            if word == '--':
+                # `--` ends the interpreter's options, so only the script itself may follow.
+                following = words[index + 1:index + 2]
+                if not following or os.path.basename(following[0]) != ADMISSION_SCRIPT:
+                    return None
+                index += 1
+                break
+            if not (word.startswith('-') or os.path.basename(word).startswith('python')
                                     or (index > 0 and words[index - 1] in INTERPRETER_VALUE_OPTIONS)):
                 return None
             index += 1
