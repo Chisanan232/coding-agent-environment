@@ -12,6 +12,7 @@ on:
       - 'scripts/storage-integration.py'
       - 'scripts/resource-policy-install.py'
       - 'scripts/launcher-install.py'
+      - 'scripts/hook-rollout.py'
       - 'scripts/campaign-resume.py'
       - 'scripts/spe108-live/**'
       - 'scripts/parity-dogfood.py'
@@ -33,6 +34,7 @@ on:
       - 'scripts/storage-integration.py'
       - 'scripts/resource-policy-install.py'
       - 'scripts/launcher-install.py'
+      - 'scripts/hook-rollout.py'
       - 'scripts/campaign-resume.py'
       - 'scripts/spe108-live/**'
       - 'scripts/parity-dogfood.py'
@@ -81,6 +83,7 @@ jobs:
           python3 tests/test-campaign-resume.py
           python3 tests/test-disk-admission-gate.py
           python3 tests/test-disk-admission.py
+          python3 tests/test-hook-rollout.py
           python3 tests/test-spe108-live.py
           python3 tests/test-parity-dogfood.py
   native-resource-wire:
