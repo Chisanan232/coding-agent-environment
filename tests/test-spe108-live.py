@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 LIVE = ROOT / "scripts/spe108-live"
@@ -91,6 +92,13 @@ class LiveScripts(unittest.TestCase):
         self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
         second = self.run_script(sys.executable, retire, ok=False)
         self.assertNotEqual(second.returncode, 0)  # nothing left to retire
+
+    def test_script_env_never_inherits_an_overlay_location(self):
+        with mock.patch.dict(os.environ, {"CODING_AGENT_LOCAL_DIR": "/nonexistent/real-overlay",
+                                          "CODING_AGENT_LOCAL_BASELINE_DIR": "/nonexistent/real-baseline"}):
+            self.setUp()
+        self.assertNotIn("CODING_AGENT_LOCAL_DIR", self.env)
+        self.assertNotIn("CODING_AGENT_LOCAL_BASELINE_DIR", self.env)
 
     def test_retire_refuses_a_marker_inside_a_legacy_section(self):
         self.install()
