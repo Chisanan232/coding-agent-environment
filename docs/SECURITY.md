@@ -91,9 +91,10 @@ fresh, documented decision — not merely to reduce prompts):
 **Static `deny` is empty (SPE-106).** The personal policy carries no
 user-controlled `deny`; the former deny families are `ask`-gated, and `ask`
 prompts in every permission mode, `bypassPermissions` included:
-`terraform destroy` and `apply` (typed as `terraform`, with or without a global flag; env-prefixed, absolute-path, `tofu` and `terragrunt` spellings are classifier-judged), `rtk proxy` (the one command rtk does
-not rewrite; it bypasses rule matching, see
-[SPE-83](https://lightning-dust-mite.atlassian.net/browse/SPE-83)),
+`terraform destroy` and `apply` (typed as `terraform`, with or without a global flag; env-prefixed, absolute-path, `tofu` and `terragrunt` spellings are classifier-judged), wrapped `rtk proxy` control-plane, process-kill, shell-wrapper and protected-git commands (rtk never
+rewrites its own wrapper, so the plain and `rtk` rules cannot see them, see
+[SPE-83](https://lightning-dust-mite.atlassian.net/browse/SPE-83); routine raw-output builds, tests and
+searches through the wrapper do not ask, ADR 0012 Amendment 4),
 `gcloud secrets versions access`, and `mcp__neon__get_connection_string` (its
 return value *is* the secret). Approving such a prompt authorizes that one call;
 it is not permission to echo, log or store the value (CLAUDE.md item 21).

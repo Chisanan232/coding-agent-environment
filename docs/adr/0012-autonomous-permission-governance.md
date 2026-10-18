@@ -413,3 +413,38 @@ reviews had mispredicted several of these):
   and `kubectl get rolebindings`.
 - `scripts/permission-rollout.py` refuses a baseline whose rules do not ask on a sample
   command from every gated family and on the MCP gcloud route.
+
+## Amendment 4 (SPE-114, 2026-10-18) - program-scoped `rtk proxy` asks
+
+Policy: default is autonomous execution; an ask marks a material authority boundary; deny marks a
+non-waivable boundary. A wrapper that is not itself material must not prompt.
+
+**Measured (Claude Code 2.1.292, rtk 0.43.0, auto mode).**
+- `rtk proxy cargo test`, with or without a `CARGO_TARGET_DIR=` prefix and `2>&1 | grep | head`, prompted
+  only because of the blanket `Bash(rtk proxy *)` ask; the same command typed directly did not prompt.
+  `rtk` rewrites a piped direct command too (`cargo test ... | grep` becomes `rtk cargo test ... | grep`), so
+  the wrapper is the only way to get raw, unfiltered output into a pipeline.
+- Removing the blanket ask and relying on the Auto Mode classifier alone was measured and is not enough: a
+  wrapped force-push, a wrapped `gcloud secrets versions access`, a wrapped IAM grant and `rtk proxy sh -c
+  '...'` all executed. This is why the wrapper ask was kept in Amendment 2.
+- Of 302 denied Bash results in seven days of transcripts, 288 were classifier blocks and 14 were ask rules,
+  mostly this one.
+
+**Decision.** `Bash(rtk proxy *)` is retired. The baseline asks per program instead of per sub-command: the
+control-plane CLIs (`gcloud`, `gsutil`, `bq`, `kubectl`, `terraform`), process kill (`kill`, `pkill`,
+`killall`), shell and exec wrappers (`sh`, `bash`, `zsh`, `eval`, `env`, `xargs`, `sudo`), `git push|reset|clean|
+worktree`, `gh repo delete` and `gh api` with a DELETE method. Everything else through the wrapper (build, test,
+search, git read, `gh` reads, package scripts) is no longer a static ask and is left to the classifier.
+`permission-rollout.py` fails any result in which one of those protected wrapped commands stops asking or a
+routine wrapped command asks.
+
+**Limits, stated plainly.** These are prefix rules and can be sidestepped by a spelling the matcher does not
+anchor (an unknown `VAR=1` prefix, an absolute program path, `command`, `nohup`, an interpreter running code that
+spawns the program). That limitation applies equally to the plain and `rtk` rules and is not new. The
+classifier is the second layer, not a guarantee; a structural fix would be a parsing PreToolUse hook and is out
+of scope here.
+
+**Not changed.** `git worktree prune` still asks: it deletes the registrations of every missing worktree in
+the repository, including a peer's temporarily absent path, and no prefix rule can establish ownership.
+Task-owned cleanup is `git worktree remove <path>` (not forced), which does not prompt. The remaining
+recommendation to run `prune` after it is in the user-private global CLAUDE.md, not in this repository.
