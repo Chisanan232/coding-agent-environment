@@ -182,6 +182,20 @@ class EngineeringWorkflowContract(unittest.TestCase):
         self.assertTrue(any(c["verdict"] == "IN_PROGRESS" and c["gates"]["engineering"] for c in cases),
                         "a merged PR alone must not be READY_FOR_RELEASE")
 
+    def test_github_tool_selection_prefers_gh_and_keeps_host_denials_binding(self) -> None:
+        flat = " ".join(WORKFLOW.read_text().split("## GitHub tool selection", 1)[1]
+                        .split("Name a ticket branch", 1)[0].split())
+        for phrase in [
+            "Prefer the authenticated `gh` CLI",
+            "GitHub MCP is optional",
+            "use `gh` for the same operation without asking",
+            "an MCP refusal is not a host permission block",
+            "A host denial of the `gh` operation itself is binding: do not wrap, split or reroute it",
+            "Never approve a PR with the account that authored it",
+        ]:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, flat)
+
     def test_secret_safe_testing_rule_forbids_inspection_and_requires_disclosure(self) -> None:
         flat = " ".join(WORKFLOW.read_text().split("## Secret-safe testing", 1)[1]
                         .split("## Jira lifecycle", 1)[0].split())
