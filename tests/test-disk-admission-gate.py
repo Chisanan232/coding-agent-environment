@@ -571,6 +571,14 @@ class RunWrapperLookThrough(unittest.TestCase):
                         'python3 -p x %s run -- cargo build' % self.DA):
             self.assertFalse(gate.classify(command)['heavy'], command)
 
+    def test_interpreter_option_values_after_uv_run_python_are_still_skipped(self):
+        for command in ('uv run python3 -X dev %s run --bytes 1 --label a -- cargo build' % self.DA,
+                        'uv run python3 -W ignore %s run --bytes 1 --label a -- cargo build' % self.DA,
+                        'uv run --python 3.12 python3 -X dev %s run --bytes 1 --label a -- cargo build' % self.DA):
+            self.assertTrue(gate.classify(command)['heavy'], command)
+        # Negative control: uv's own value options are not python's.
+        self.assertFalse(gate.classify('uv run python3 -p foo.py %s run -- cargo build' % self.DA)['heavy'])
+
     def test_other_scripts_and_late_script_names_are_not_wrappers(self):
         da = self.DA
         for command in ('python3 foo.py run -- cargo build', 'python3 foo.py %s run -- cargo build' % da,
