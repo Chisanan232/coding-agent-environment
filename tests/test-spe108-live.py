@@ -41,7 +41,10 @@ class LiveScripts(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "add", "-A"], check=True, env=env)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "-m", "snapshot", "--allow-empty"], check=True, env=env)
         subprocess.run(["git", "-C", str(self.repo), "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
-        self.env = {**os.environ, "HOME": str(self.home)}
+        # An inherited overlay location would make the scripts write the operator's real CLAUDE.private.md.
+        self.env = {k: v for k, v in os.environ.items()
+                    if k not in ("CODING_AGENT_LOCAL_DIR", "CODING_AGENT_LOCAL_BASELINE_DIR")}
+        self.env["HOME"] = str(self.home)
 
     def run_script(self, *args, ok=True):
         done = subprocess.run(list(args), capture_output=True, text=True, env=self.env, cwd=self.repo)
