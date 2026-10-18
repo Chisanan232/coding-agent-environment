@@ -151,7 +151,7 @@ The full sequence is in
 Check `.mcp.json` for configured MCP tools. When an MCP-backed capability is
 available, prefer it over manual approximation; otherwise proceed and note the gap.
 `fetch` and `github` are active by default; other servers are opt-in per project.
-GitHub operations use `gh` first and the `github` MCP only as an optional fallback (`engineering-workflow`).
+GitHub operations use `gh` first and the `github` MCP is optional (`engineering-workflow`, GitHub tool selection).
 The capability table is in the [claude-runtime reference](skills/engineering-runtime/references/claude-runtime.md).
 
 ---
