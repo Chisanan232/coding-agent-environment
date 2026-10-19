@@ -61,3 +61,36 @@ and pass `--ci-unavailable`. Any genuinely failing check still refuses.
 `PASS` means every check GitHub reported on that head passed (at least one succeeded); it cannot know
 which checks a repository should have. It does not approve a PR, satisfy a required formal review, change branch protection, merge
 into a release or deployment branch, or authorize deployment or publication (it cannot see whether merging to the default branch deploys).
+
+## Pull request classes (SPE-116)
+
+`check` reports `class` in its output. The class decides who must approve; the gate never
+changes it and fails closed when it cannot verify the author.
+
+| Class | Author | Extra requirement before PASS | Gate prints |
+|---|---|---|---|
+| A | The authenticated owner identity | Repository admin, or a verified code owner with write permission for every changed file (CODEOWNERS read from the default branch; teams and unsupported syntax never count; a PR editing CODEOWNERS never qualifies) | the pinned merge command |
+| B | A verified dependency bot (`dependabot`, `renovate`: bot flag, bot branch, bot-only commits, dependency manifests only) | A real GitHub APPROVE by the owner identity on the exact head | `WAIT` with `approve_command` until approved, then the pinned merge command |
+| C | Anyone else, including a failed bot check | A genuine GitHub APPROVED review by the owner on the exact head; the agent's comment never substitutes; `--admin` is never printed | the pinned merge command |
+| unverified | Missing, deleted or ghost author | Refused: request owner review | nothing |
+
+For B and C the owner identity must be the repository owner account or an active org
+administrator; write access alone is not enough.
+
+Limit: the gate runs under the owner's own GitHub token, so GitHub shows an agent-submitted
+approval and a personal one identically. The gate can prove an approval exists for the exact
+head, not who typed it. For class C the agent must never submit the approval (the host's
+Self-Approval rule blocks it); for class B the approval is the documented action.
+
+Bot PRs merge one at a time: `queue` marks only the first PASS runnable. After each merge,
+refresh the base, update the next branch with a merge from the base (no history rewrite), let
+the bot or the owner resolve lockfile conflicts, and run `check` again; any new head needs a
+new review record and a new approval.
+
+If the host denies a merge, record it and stop:
+
+```bash
+python3 scripts/owner-merge-gate.py host-denied --repo OWNER/REPO --pr N --head <sha> --message "<host text>"
+```
+
+It prints `HARNESS_PERMISSION_BLOCK`, offers no alternate flag or tool, and exits 1.
