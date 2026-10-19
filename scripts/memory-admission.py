@@ -19,11 +19,13 @@ MIN_SPACING seconds apart, all satisfy the stricter EXIT thresholds. Unknown or 
 """
 import argparse
 import contextlib
-import importlib.util
+import fcntl
 import json
+import math
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -48,6 +50,10 @@ HEAVY_COMMS = frozenset({"cargo", "rustc", "rust-lld", "cc1", "cc1plus", "clang"
                          "swift-build", "swift-frontend", "gradle", "buildkitd"})
 DEFAULT_STATE = pathlib.Path.home() / ".cache/coding-agent-environment/memory-admission/state.json"
 REFUSE_RC = 77
+VALID_LEVELS = frozenset({1, 2, 4})   # the only values the kernel reports
+SYSCTL, PS, VM_STAT = "/usr/sbin/sysctl", "/bin/ps", "/usr/bin/vm_stat"   # absolute: PATH is not trusted
+MAX_STATE_BYTES = 64 * 1024
+LOCK_WAIT = 10.0
 
 
 # ---- parsing ---------------------------------------------------------------------------------------------------------
@@ -59,7 +65,10 @@ def parse_swapusage(text):
         m = re.search(rf"{key}\s*=\s*([\d.]+)\s*([KMG])", text or "")
         if not m:
             return None
-        out[key] = int(float(m.group(1)) * units[m.group(2)])
+        try:
+            out[key] = int(float(m.group(1)) * units[m.group(2)])
+        except ValueError:
+            return None
     return out
 
 
@@ -90,20 +99,22 @@ def _run(cmd, run=subprocess.run):
         return None
 
 
-def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu_fn=os.cpu_count, disk_free_fn=None):
+def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu_fn=os.cpu_count, disk_free_fn=None, mono_fn=time.monotonic):
     """One reading of the machine. Every field may be None when it could not be read (fail closed upstream)."""
     def sysctl_int(name):
-        t = _run(["sysctl", "-n", name], run)
+        t = _run([SYSCTL, "-n", name], run)
         try:
             return int(t.strip())
         except (AttributeError, ValueError):
             return None
-    comms = _run(["ps", "-axo", "comm="], run)
-    heavy = {}
-    for line in (comms or "").splitlines():
-        base = os.path.basename(line.strip())
-        if base in HEAVY_COMMS:
-            heavy[base] = heavy.get(base, 0) + 1
+    comms = _run([PS, "-axo", "comm="], run)
+    heavy = None   # None = the process list could not be read (unknown), never "no heavy process"
+    if comms is not None:
+        heavy = {}
+        for line in comms.splitlines():
+            base = os.path.basename(line.strip())
+            if base in HEAVY_COMMS:
+                heavy[base] = heavy.get(base, 0) + 1
     try:
         load1 = load_fn()[0]
     except OSError:
@@ -116,16 +127,17 @@ def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu
         disk_free = disk_free_fn()
     except OSError:
         disk_free = None
-    return {"time": now_fn(), "ram": sysctl_int("hw.memsize"), "pressure_level": sysctl_int("kern.memorystatus_vm_pressure_level"),
-            "swap": parse_swapusage(_run(["sysctl", "-n", "vm.swapusage"], run)), "vm": parse_vm_stat(_run(["vm_stat"], run)),
+    return {"time": now_fn(), "mono": mono_fn(), "ram": sysctl_int("hw.memsize"), "pressure_level": sysctl_int("kern.memorystatus_vm_pressure_level"),
+            "swap": parse_swapusage(_run([SYSCTL, "-n", "vm.swapusage"], run)), "vm": parse_vm_stat(_run([VM_STAT], run)),
             "load1": load1, "cpus": cpu_fn() or None, "disk_free": disk_free, "heavy_procs": heavy}
 
 
 def derive(s1, s2):
     """Rates and ratios from two samples taken `window` seconds apart. None means unknown."""
     d = {"pressure_level": s2.get("pressure_level"), "ram": s2.get("ram"), "disk_free": s2.get("disk_free"),
-         "heavy_procs": s2.get("heavy_procs") or {}, "swap": s2.get("swap")}
-    dt = (s2.get("time") or 0) - (s1.get("time") or 0)
+         "heavy_procs": s2.get("heavy_procs"), "swap": s2.get("swap")}
+    key = "mono" if s1.get("mono") is not None and s2.get("mono") is not None else "time"   # monotonic: a wall-clock step must not dilute the rate
+    dt = (s2.get(key) or 0) - (s1.get(key) or 0)
     v1, v2 = s1.get("vm"), s2.get("vm")
     d["swap_io_mib_s"] = None
     d["compressor_ratio"] = None
@@ -151,8 +163,8 @@ def refusal_reasons(weight, m):
     """Reasons memory alone would refuse `weight` work right now (ENTER thresholds)."""
     r, unknown = [], []
     lvl = m.get("pressure_level")
-    if lvl is None:
-        unknown.append("pressure level unreadable")
+    if lvl is None or lvl not in VALID_LEVELS:
+        unknown.append("pressure level unreadable or out of range")
     elif lvl >= PRESSURE_CRITICAL:
         r.append(f"memory pressure CRITICAL (level {lvl})")
     elif weight == "heavy" and lvl >= PRESSURE_WARN:
@@ -175,10 +187,16 @@ def refusal_reasons(weight, m):
             unknown.append("load unreadable")
         elif lpc >= ENTER["load_per_core_heavy"]:
             r.append(f"load per core {lpc:.1f} >= {ENTER['load_per_core_heavy']:g}")
-        procs = m.get("heavy_procs", {})
-        if procs:
+        procs = m.get("heavy_procs")
+        if procs is None:
+            unknown.append("process list unreadable")
+        elif procs:
             names = ", ".join(f"{k} x{v}" for k, v in sorted(procs.items()))
             r.append(f"another heavy build/test process is running ({names}): one heavy lane at a time")
+        if m.get("swap") is None:
+            unknown.append("swap usage unreadable")
+        if m.get("disk_free") is None:
+            unknown.append("free disk unreadable")
         if swap_cannot_grow(m):
             r.append("swap is nearly full and cannot grow (free disk below the heavy floor)")
     return r, unknown
@@ -197,6 +215,12 @@ def decide(weight, m, state, now):
     """Pure. Returns (verdict, new_state). state = {'latched': bool, 'ok_streak': int, 'last_ok': float, 'levels': [..]}."""
     st = {"latched": False, "ok_streak": 0, "last_ok": 0.0, "levels": []}
     st.update(state or {})
+    st["levels"] = [x for x in (st.get("levels") or []) if type(x) is int and x in VALID_LEVELS]
+    if type(st["ok_streak"]) is not int or not 0 <= st["ok_streak"] < EXIT_SAMPLES:
+        st["ok_streak"] = 0   # a hand-edited streak can never skip the hysteresis
+    lo = st["last_ok"]
+    if not isinstance(lo, (int, float)) or isinstance(lo, bool) or not math.isfinite(lo) or lo > now:
+        st["last_ok"], st["ok_streak"] = 0.0, 0   # clock stepped back or tampered: restart the recovery count
     reasons, unknown = refusal_reasons(weight, m)
     warnings = []
     lvl = m.get("pressure_level")
@@ -232,20 +256,55 @@ def decide(weight, m, state, now):
 
 # ---- state -----------------------------------------------------------------------------------------------------------
 def load_state(path):
-    """(state, problem). A missing file is a clean start; unreadable or malformed state is reported and latches heavy work."""
+    """(state, problem). A missing file is a clean start; unreadable, non-regular or malformed state is reported and latches heavy work."""
+    latched = {"latched": True}
     try:
-        raw = pathlib.Path(path).read_text()
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except FileNotFoundError:
         return {}, None
     except OSError as exc:
-        return {"latched": True}, f"state unreadable: {exc}"
+        return latched, f"state unreadable: {exc.strerror or type(exc).__name__}"
     try:
-        d = json.loads(raw)
-        ok = (isinstance(d, dict) and isinstance(d.get("latched"), bool) and isinstance(d.get("ok_streak"), int) and 0 <= d["ok_streak"] <= 100
-              and isinstance(d.get("last_ok"), (int, float)) and isinstance(d.get("levels", []), list))
-    except ValueError:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return latched, "state is not a regular file: treated as latched"
+        raw = os.read(fd, MAX_STATE_BYTES + 1)
+    except OSError as exc:
+        return latched, f"state unreadable: {exc.strerror or type(exc).__name__}"
+    finally:
+        os.close(fd)
+    if len(raw) > MAX_STATE_BYTES:
+        return latched, "state corrupt: too large, treated as latched"
+    try:
+        d = json.loads(raw.decode("utf-8"))
+        ok = (isinstance(d, dict) and isinstance(d.get("latched"), bool) and type(d.get("ok_streak")) is int and 0 <= d["ok_streak"] < EXIT_SAMPLES
+              and isinstance(d.get("last_ok"), (int, float)) and not isinstance(d.get("last_ok"), bool) and math.isfinite(d["last_ok"])
+              and isinstance(d.get("levels", []), list) and len(d.get("levels", [])) <= 8
+              and all(type(x) is int and x in VALID_LEVELS for x in d.get("levels", [])))
+    except (ValueError, UnicodeDecodeError):
         ok = False
-    return (d, None) if ok else ({"latched": True}, "state corrupt: treated as latched")
+    return (d, None) if ok else (latched, "state corrupt: treated as latched")
+
+
+@contextlib.contextmanager
+def state_lock(path, wait=LOCK_WAIT, sleep=time.sleep):
+    """Exclusive advisory lock so two concurrent checks cannot overwrite a fresh latch with a stale unlatched state."""
+    p = pathlib.Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(str(p.parent / (p.name + ".lock")), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        waited = 0.0
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if waited >= wait:
+                    raise OSError("state busy: another check holds the lock")
+                sleep(0.1)
+                waited += 0.1
+        yield
+    finally:
+        os.close(fd)
 
 
 def save_state(path, state):
@@ -280,17 +339,25 @@ def assess(weight, window, state_path, memory_only, deps):
     deps["sleep"](window)
     s2 = deps["sample"]()
     m = derive(s1, s2)
-    state, problem = ({}, None)
     if weight == "heavy":
-        state, problem = load_state(state_path)
-    verdict, new_state = decide(weight, m, state, deps["now"]())
-    if problem:
-        verdict["admit"] = False
-        verdict["reasons"] = verdict["reasons"] + [problem]
-    if weight == "heavy" or problem is None:
-        with contextlib.suppress(OSError):
-            if weight == "heavy":
-                save_state(state_path, new_state)
+        try:
+            with deps["lock"](state_path):
+                state, problem = load_state(state_path)
+                verdict, new_state = decide(weight, m, state, deps["now"]())
+                if problem:
+                    verdict["admit"] = False
+                    verdict["reasons"] = verdict["reasons"] + [problem]
+                try:
+                    save_state(state_path, new_state)
+                except OSError as exc:   # a refusal that cannot be remembered must not become an admission
+                    verdict["admit"] = False
+                    verdict["reasons"] = verdict["reasons"] + [f"state unwritable ({exc.strerror or type(exc).__name__}): heavy work fails closed"]
+        except OSError as exc:
+            verdict, _ = decide(weight, m, {"latched": True}, deps["now"]())
+            verdict["admit"] = False
+            verdict["reasons"] = verdict["reasons"] + [f"{exc}: heavy work fails closed"]
+    else:
+        verdict, _ = decide(weight, m, None, deps["now"]())
     verdict["memory"] = {k: m[k] for k in ("pressure_level", "swap_io_mib_s", "compressor_ratio", "load_per_core", "disk_free")}
     verdict["memory"]["swap_used_fraction"] = (m["swap"]["used"] / m["swap"]["total"]) if m.get("swap") and m["swap"]["total"] else None
     if not memory_only and weight:
@@ -303,7 +370,7 @@ def assess(weight, window, state_path, memory_only, deps):
 
 
 def main(argv=None, deps=None):
-    d = {"sample": take_sample, "sleep": time.sleep, "now": time.time, "disk": disk_gate}
+    d = {"sample": take_sample, "sleep": time.sleep, "now": time.time, "disk": disk_gate, "lock": state_lock}
     d.update(deps or {})
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -316,7 +383,7 @@ def main(argv=None, deps=None):
         p.add_argument("--window", type=float, default=10.0)
         p.add_argument("--state", default=str(DEFAULT_STATE))
     a = ap.parse_args(argv)
-    window = min(max(a.window, 1.0), 120.0)
+    window = min(max(a.window, 1.0), 120.0) if math.isfinite(a.window) else 10.0
     if a.cmd == "status":
         v = assess("light", window, a.state, True, d)  # status never writes heavy state or asks the disk gate
         v.pop("admit")

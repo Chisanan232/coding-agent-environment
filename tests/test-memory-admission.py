@@ -39,9 +39,12 @@ def vm(swapins=0, swapouts=0, compressor_pages=0):
     return {"page_size": PAGE, "free": 1, "swapins": swapins, "swapouts": swapouts, "compressor": compressor_pages}
 
 
-def sample(t, level=1, swapins=0, swapouts=0, compressor=0.0, load=2.0, cpus=16, disk=494 * GIB, swap=None, heavy=None):
-    return {"time": t, "ram": RAM, "pressure_level": level, "swap": swap, "vm": vm(swapins, swapouts, int(compressor * RAM / PAGE)),
-            "load1": load, "cpus": cpus, "disk_free": disk, "heavy_procs": heavy or {}}
+ZERO_SWAP = {"total": 0, "used": 0, "free": 0}   # a fresh post-reboot machine: no swap files yet
+
+
+def sample(t, level=1, swapins=0, swapouts=0, compressor=0.0, load=2.0, cpus=16, disk=494 * GIB, swap=ZERO_SWAP, heavy=None):
+    return {"time": t, "mono": t, "ram": RAM, "pressure_level": level, "swap": swap, "vm": vm(swapins, swapouts, int(compressor * RAM / PAGE)),
+            "load1": load, "cpus": cpus, "disk_free": disk, "heavy_procs": {} if heavy is None else heavy}
 
 
 def metrics(**kw):
@@ -70,10 +73,11 @@ class Parsing(unittest.TestCase):
 
     def test_take_sample_counts_heavy_process_names_only(self):
         def run(cmd, **kw):
+            self.assertTrue(os.path.isabs(cmd[0]), cmd)   # PATH is never consulted
             out = {"ps": "/usr/bin/cargo\n/bin/zsh\n/x/y/rustc\n/x/rustc\nclaude\n", "vm_stat": VM_STAT,
-                   "sysctl": {"hw.memsize": str(RAM), "kern.memorystatus_vm_pressure_level": "2", "vm.swapusage": SWAP}.get(cmd[-1], "")}[cmd[0]]
+                   "sysctl": {"hw.memsize": str(RAM), "kern.memorystatus_vm_pressure_level": "2", "vm.swapusage": SWAP}.get(cmd[-1], "")}[os.path.basename(cmd[0])]
             return type("R", (), {"returncode": 0, "stdout": out})()
-        s = ma.take_sample(run=run, now_fn=lambda: 5.0, load_fn=lambda: (1.0, 1.0, 1.0), cpu_fn=lambda: 16, disk_free_fn=lambda: GIB)
+        s = ma.take_sample(run=run, now_fn=lambda: 5.0, mono_fn=lambda: 5.0, load_fn=lambda: (1.0, 1.0, 1.0), cpu_fn=lambda: 16, disk_free_fn=lambda: GIB)
         self.assertEqual(s["heavy_procs"], {"cargo": 1, "rustc": 2})
         self.assertEqual((s["pressure_level"], s["ram"]), (2, RAM))
 
@@ -81,7 +85,7 @@ class Parsing(unittest.TestCase):
         def run(cmd, **kw):
             raise OSError("nope")
         s = ma.take_sample(run=run, now_fn=lambda: 1.0, load_fn=lambda: (_ for _ in ()).throw(OSError()), cpu_fn=lambda: None, disk_free_fn=lambda: (_ for _ in ()).throw(OSError()))
-        self.assertTrue(all(s[k] is None for k in ("ram", "pressure_level", "swap", "vm", "load1", "cpus", "disk_free")))
+        self.assertTrue(all(s[k] is None for k in ("ram", "pressure_level", "swap", "vm", "load1", "cpus", "disk_free", "heavy_procs")))
 
 
 class Derivation(unittest.TestCase):
@@ -308,6 +312,139 @@ class Cli(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             ma.main(["status", "--window", "100000", "--json"], {"sample": lambda: next(calls), "sleep": seen.append, "now": lambda: 1.0, "disk": lambda w: (True, "")})
         self.assertEqual(seen, [120.0])
+
+
+class ReviewHardening(unittest.TestCase):
+    """Each case is a concrete failure from the independent review of PR #99."""
+
+    def heavy(self, m, state=None, now=1000.0):
+        return ma.decide("heavy", m, state, now)
+
+    def setUp(self):
+        self.d = pathlib.Path(tempfile.mkdtemp(prefix="ma-hard-"))
+        self.addCleanup(__import__("shutil").rmtree, self.d, True)
+
+    def test_unreadable_process_list_is_unknown_not_no_heavy_process(self):
+        def run(cmd, **kw):
+            if os.path.basename(cmd[0]) == "ps":
+                raise __import__("subprocess").TimeoutExpired(cmd, 20)
+            return type("R", (), {"returncode": 0, "stdout": VM_STAT if "vm_stat" in cmd[0] else "1\n"})()
+        s = ma.take_sample(run=run, now_fn=lambda: 1.0, mono_fn=lambda: 1.0, load_fn=lambda: (1.0, 1.0, 1.0), cpu_fn=lambda: 16, disk_free_fn=lambda: 494 * GIB)
+        self.assertIsNone(s["heavy_procs"])
+        m = ma.derive(sample(0), dict(sample(10), heavy_procs=None))
+        v, st = self.heavy(m)
+        self.assertFalse(v["admit"])
+        self.assertTrue(any("process list unreadable" in r for r in v["reasons"]))
+        self.assertTrue(ma.decide("light", m, None, 1.0)[0]["admit"])
+
+    def test_each_remaining_unknown_input_alone_fails_closed_for_heavy(self):
+        for field in ("swap", "disk_free"):
+            b = sample(10)
+            b[field] = None
+            v, _ = self.heavy(ma.derive(sample(0), b))
+            self.assertFalse(v["admit"], field)
+            self.assertTrue(any("fails closed" in r for r in v["reasons"]), field)
+
+    def test_pressure_level_outside_what_the_kernel_reports_is_unknown(self):
+        for bad in (0, -1, 3, 5, 99):
+            v, _ = self.heavy(metrics(level=bad))
+            self.assertFalse(v["admit"], bad)
+        v, _ = ma.decide("light", metrics(level=0), None, 1.0)
+        self.assertTrue(v["admit"])
+        self.assertTrue(any(w.startswith("unknown") for w in v["warnings"]))
+
+    def test_tampered_streak_cannot_skip_hysteresis(self):
+        v, st = self.heavy(metrics(level=1), {"latched": True, "ok_streak": 100, "last_ok": 0.0, "levels": []}, now=1000.0)
+        self.assertFalse(v["admit"])
+        self.assertTrue(st["latched"])
+
+    def test_future_or_nonfinite_last_ok_restarts_the_count_and_still_recovers(self):
+        for bad in (1e18, float("nan"), float("inf"), True, "later"):
+            _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+            st.update(ok_streak=2, last_ok=bad)
+            v, st = self.heavy(metrics(level=1), st, now=1000.0)
+            self.assertFalse(v["admit"], bad)
+            self.assertIn("recovering (1/3", v["reasons"][0], bad)
+            v, st = self.heavy(metrics(level=1), st, now=1040.0)
+            v, st = self.heavy(metrics(level=1), st, now=1080.0)
+            self.assertTrue(v["admit"], bad)
+
+    def test_garbage_levels_cannot_crash_decide(self):
+        v, st = self.heavy(metrics(level=1), {"latched": False, "ok_streak": 0, "last_ok": 0.0, "levels": [{}, [], "x", 7, True]})
+        self.assertTrue(v["admit"])
+        self.assertEqual(st["levels"], [1])
+
+    def test_swap_io_rate_uses_the_monotonic_clock_not_the_wall_clock(self):
+        pages = int(10 * 1024 ** 3 / PAGE)          # a 10 GiB swap burst
+        a = sample(0, swapins=0)
+        b = sample(10, swapins=pages)
+        b["time"] = 1010.0                          # wall clock stepped forward 1000 s during the window
+        rate = ma.derive(a, b)["swap_io_mib_s"]
+        self.assertGreater(rate, 900)               # 10240 MiB / 10 s, not diluted to ~10 MiB/s
+        self.assertFalse(self.heavy(ma.derive(a, b))[0]["admit"])
+
+    def test_load_state_rejects_every_malformed_shape(self):
+        path = self.d / "state.json"
+        good = {"latched": False, "ok_streak": 0, "last_ok": 0.0, "levels": [1]}
+        bad_variants = [dict(good, levels=[{}, []]), dict(good, levels=[1] * 50), dict(good, levels=[3]), dict(good, ok_streak=100),
+                        dict(good, ok_streak=-1), dict(good, ok_streak=True), dict(good, last_ok="x")]
+        for v in bad_variants:
+            path.write_text(json.dumps(v))
+            st, problem = ma.load_state(path)
+            self.assertTrue(st["latched"], v)
+            self.assertIn("corrupt", problem)
+        path.write_text('{"latched": false, "ok_streak": 0, "last_ok": NaN, "levels": []}')
+        self.assertTrue(ma.load_state(path)[0]["latched"])
+        path.write_text(json.dumps(good))
+        self.assertEqual(ma.load_state(path), (good, None))
+        path.write_text("x" * (ma.MAX_STATE_BYTES + 5))
+        self.assertIn("too large", ma.load_state(path)[1])
+
+    def test_fifo_and_symlink_state_paths_are_refused_without_hanging(self):
+        fifo = self.d / "fifo.json"
+        os.mkfifo(fifo)
+        st, problem = ma.load_state(fifo)
+        self.assertTrue(st["latched"])
+        self.assertIn("not a regular file", problem)
+        target = self.d / "real.json"
+        target.write_text(json.dumps({"latched": False, "ok_streak": 0, "last_ok": 0.0, "levels": []}))
+        link = self.d / "link.json"
+        os.symlink(target, link)
+        st, problem = ma.load_state(link)
+        self.assertTrue(st["latched"])
+        self.assertIn("unreadable", problem)
+
+    def test_a_held_lock_refuses_heavy_instead_of_racing(self):
+        path = self.d / "s" / "state.json"
+        with ma.state_lock(path):
+            with self.assertRaises(OSError) as cm:
+                with ma.state_lock(path, wait=0.3, sleep=lambda s: None):
+                    pass
+            self.assertIn("busy", str(cm.exception))
+        calls = iter([sample(0.0), sample(10.0)])
+        def busy(p):
+            raise OSError("state busy: another check holds the lock")
+        deps = {"sample": lambda: next(calls), "sleep": lambda s: None, "now": lambda: 1000.0, "disk": lambda w: (True, "ok"), "lock": busy}
+        v = ma.assess("heavy", 1.0, str(path), False, deps)
+        self.assertFalse(v["admit"])
+        self.assertTrue(any("busy" in r for r in v["reasons"]))
+
+    def test_unwritable_state_refuses_heavy_instead_of_forgetting_the_latch(self):
+        from unittest import mock
+        calls = iter([sample(0.0), sample(10.0)])
+        deps = {"sample": lambda: next(calls), "sleep": lambda s: None, "now": lambda: 1000.0, "disk": lambda w: (True, "ok"), "lock": ma.state_lock}
+        with mock.patch.object(ma, "save_state", side_effect=OSError(30, "Read-only file system")):
+            v = ma.assess("heavy", 1.0, str(self.d / "state.json"), False, deps)
+        self.assertFalse(v["admit"])
+        self.assertTrue(any("state unwritable" in r for r in v["reasons"]))
+
+    def test_malformed_numbers_and_nan_window_do_not_crash(self):
+        self.assertIsNone(ma.parse_swapusage("total = 1.2.3M  used = 1M  free = 1M"))
+        seen = []
+        calls = iter([sample(0.0), sample(10.0)])
+        with redirect_stdout(io.StringIO()):
+            ma.main(["status", "--window", "nan", "--json"], {"sample": lambda: next(calls), "sleep": seen.append, "now": lambda: 1.0, "disk": lambda w: (True, "")})
+        self.assertEqual(seen, [10.0])
 
 
 if __name__ == "__main__":
