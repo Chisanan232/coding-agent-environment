@@ -187,7 +187,7 @@ def ask_packet(action, dest, classes):
 ASK_BASH_RULES = [
     "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git push --force-with-lease:*)", "Bash(git push * --force*)",
     "Bash(git push * -f)", "Bash(git push * -f *)", "Bash(git push * +*)", "Bash(git push origin --delete:*)",
-    "Bash(git push * --delete*)", "Bash(gh api * merge*)", "Bash(gh release create:*)", "Bash(gh release upload:*)",
+    "Bash(git push * --delete*)", "Bash(gh api *pulls/*/merge*)", "Bash(gh release create:*)", "Bash(gh release upload:*)",
     "Bash(gh pr merge * --admin*)", "Bash(gh pr merge --admin*)",
     "Bash(npm publish:*)", "Bash(pnpm publish:*)", "Bash(yarn npm publish:*)", "Bash(cargo publish:*)", "Bash(twine upload:*)",
     "Bash(uv publish:*)", "Bash(docker push:*)",
