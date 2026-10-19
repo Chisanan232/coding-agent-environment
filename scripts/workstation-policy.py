@@ -27,7 +27,7 @@ KNOWN_CLASSES = PROTECTED_DATA | {"public", "credentials", "auth_handshake"}
 HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?")
 PLACEHOLDER = re.compile(r"<[^<>]+>")
 PROTECTED_PATHS = (
-    "~/.claude", "~/.claude.json", "/Library/Application Support/ClaudeCode", "/etc/claude-code", "/Library/Managed Preferences",
+    "~/.claude", "~/.claude.json", "/Library/Application Support/ClaudeCode", "/etc/claude-code", "/private/etc/claude-code", "/Library/Managed Preferences",
 )
 PROTECTED_BASENAMES = {"managed-settings.json", "managed-mcp.json", ".mcp.json"}
 PROTECTED_RELATIVE = (".claude/settings.json", ".claude/settings.local.json", ".claude/hooks", ".claude/claude.md")
