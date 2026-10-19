@@ -90,7 +90,7 @@ class Rollout(unittest.TestCase):
         self.assertEqual(cr.sha(pathlib.Path(res["backup"]).read_bytes()), p["live_sha"])
         rc, out = self.run_cli("verify", "--live", str(self.live), "--expect-result-sha", p["result_sha"])
         self.assertEqual(json.loads(out)["verdict"], "VERIFIED")
-        rc, out = self.run_cli("rollback", "--live", str(self.live), "--backup", res["backup"], "--expect-backup-sha", p["live_sha"])
+        rc, out = self.run_cli("rollback", "--live", str(self.live), "--backup", res["backup"], "--expect-backup-sha", p["live_sha"], "--expect-live-sha", p["result_sha"])
         self.assertEqual(rc, 0)
         self.assertEqual(self.live.read_bytes(), original)
 
@@ -163,10 +163,44 @@ class Rollout(unittest.TestCase):
         self.assertIn("REFUSED", str(rc))
         self.assertEqual(self.live.read_bytes(), before)
 
+    def test_rollback_refuses_when_live_changed_since_apply(self):
+        p = self.plan()
+        rc, out = self.run_cli("apply", *self.args, "--expect-live-sha", p["live_sha"], "--expect-result-sha", p["result_sha"], "--backup-dir", str(self.d / "b"))
+        res = json.loads(out)
+        self.live.write_text(self.live.read_text() + "\n")  # an edit made after apply must not be silently lost
+        edited = self.live.read_bytes()
+        rc, _ = self.run_cli("rollback", "--live", str(self.live), "--backup", res["backup"], "--expect-backup-sha", p["live_sha"],
+                             "--expect-live-sha", p["result_sha"])
+        self.assertIn("REFUSED", str(rc))
+        self.assertEqual(self.live.read_bytes(), edited)
+
+    def test_apply_refuses_when_live_changes_after_the_pin_check(self):
+        p = self.plan()
+        real_plan = cr.plan
+
+        def racing(args, raw=None):
+            out = real_plan(args, raw)
+            self.live.write_text(self.live.read_text() + " ")  # a concurrent edit after the hashes were checked
+            return out
+
+        before_backups = list((self.d / "b").glob("*")) if (self.d / "b").exists() else []
+        cr.plan = racing
+        self.addCleanup(setattr, cr, "plan", real_plan)
+        rc, _ = self.run_cli("apply", *self.args, "--expect-live-sha", p["live_sha"], "--expect-result-sha", p["result_sha"], "--backup-dir", str(self.d / "b"))
+        self.assertIn("REFUSED", str(rc))
+        self.assertNotEqual(cr.sha(self.live.read_bytes()), p["result_sha"])
+        self.assertEqual(json.loads(self.live.read_text())["autoMode"], LIVE["autoMode"])
+
+    def test_backup_holds_the_exact_hashed_bytes(self):
+        p = self.plan()
+        rc, out = self.run_cli("apply", *self.args, "--expect-live-sha", p["live_sha"], "--expect-result-sha", p["result_sha"], "--backup-dir", str(self.d / "b"))
+        self.assertEqual(cr.sha(pathlib.Path(json.loads(out)["backup"]).read_bytes()), p["live_sha"])
+
     def test_rollback_refuses_a_tampered_backup(self):
         bk = self.d / "bk.json"
         bk.write_text("{}")
-        rc, _ = self.run_cli("rollback", "--live", str(self.live), "--backup", str(bk), "--expect-backup-sha", "0" * 64)
+        rc, _ = self.run_cli("rollback", "--live", str(self.live), "--backup", str(bk), "--expect-backup-sha", "0" * 64,
+                             "--expect-live-sha", cr.sha(self.live.read_bytes()))
         self.assertIn("REFUSED", str(rc))
 
 

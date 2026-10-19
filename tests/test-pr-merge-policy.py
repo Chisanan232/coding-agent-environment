@@ -321,6 +321,13 @@ class ReadOnly(unittest.TestCase):
             with self.assertRaises(RuntimeError, msg=bad):
                 omg.read_only(bad)
 
+    def test_trailing_wildcard_last_segment_fails_closed(self):
+        self.assertFalse(omg.codeowners_cover("* @chisanan232\n/docs* @other\n", ["docs/x.md"], ME))
+        self.assertFalse(omg.codeowners_cover("src* @chisanan232\n", ["src/a.py"], ME))
+        for ok in ("*.py @chisanan232", "docs/*.md @chisanan232", "/src/* @chisanan232", "docs/ @chisanan232", "/a/b @chisanan232", "** @chisanan232"):
+            path = {"*.py": "a/b.py", "docs/*.md": "docs/x.md", "/src/*": "src/a.py", "docs/": "docs/s/x", "/a/b": "a/b/c", "**": "z"}[ok.split()[0]]
+            self.assertTrue(omg.codeowners_cover(ok + "\n", [path], ME), ok)
+
     def test_tab_before_a_codeowners_comment_does_not_add_owners(self):
         self.assertFalse(omg.codeowners_cover("* @x\t# @chisanan232\n", ["a.py"], ME))
         self.assertTrue(omg.codeowners_cover("* @chisanan232 # trailing note\n", ["a.py"], ME))

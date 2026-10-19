@@ -112,7 +112,7 @@ class Ambiguity(unittest.TestCase):
         self.check_denied(None)
 
     def test_username_is_never_trusted(self):
-        self.check_denied({**CORP, "user": "bryant", "host_fingerprint_sha256": "<x>"})
+        self.check_denied({**CORP, "user": "alice-example", "host_fingerprint_sha256": "<x>"})
 
     def test_ambiguous_profile_may_only_ask_about_public_data(self):
         d = wsp.decide({**PERSONAL, "kind": "nope"}, out("x.example", ["public"]), FP)
@@ -218,6 +218,19 @@ class Candidates(unittest.TestCase):
         cand = wsp.candidate("personal")
         cand["permissions"]["ask"] = [r for r in cand["permissions"]["ask"] if not r.startswith("Bash(rtk ")]
         self.assertTrue(any("rtk-rewritten twin" in p for p in wsp.lint_settings(cand)))
+
+    def test_candidate_asks_cover_deletion_apis_and_plugins(self):
+        asks = set(wsp.candidate("personal")["permissions"]["ask"])
+        for rule in ("Bash(gh repo delete:*)", "Bash(gh api * -X DELETE*)", "Bash(rtk gh api -X DELETE*)", "Edit(**/.claude/plugins/**)", "Write(**/.claude/plugins/**)"):
+            self.assertIn(rule, asks)
+        self.assertTrue(wsp.is_protected_path("/p/.claude/plugins/x/hooks.json"))
+        env = " ".join(wsp.candidate("personal")["autoMode"]["environment"])
+        self.assertIn("never pre-authorized", env)
+
+    def test_unapproved_auth_host_on_personal_asks_with_a_packet(self):
+        res = wsp.decide(PERSONAL, out("evil.example", ["auth_handshake"], data_source="gh login", purpose="sign in"), FP)
+        self.assertEqual(res["verdict"], "ASK")
+        self.assertTrue(res["ask_packet"]["safer_alternatives"] and res["ask_packet"]["risks"])
 
     def test_candidate_asks_protect_security_paths_in_home_and_projects(self):
         asks = set(wsp.candidate("personal")["permissions"]["ask"])
