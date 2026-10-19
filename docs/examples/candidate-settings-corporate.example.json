@@ -1,0 +1,38 @@
+{
+  "_scope_note": "Candidate only. Review and deploy by hand; never applied automatically. Keeps the built-in rule lists via $defaults.",
+  "autoMode": {
+    "environment": [
+      "$defaults",
+      "Source of truth: GitHub repositories owned by the owner; Jira for tickets; the workstation profile is corporate.",
+      "Task-owned resources (own worktree, scratch dir, regenerable build output) may be created and removed; other sessions' work is not task-owned.",
+      "Routine merges follow the repository's documented PR class policy; a host denial stands and is reported, never rerouted.",
+      "Corporate machine: data leaves only to destinations inside the formally approved corporate trust boundary."
+    ],
+    "allow": [
+      "$defaults"
+    ],
+    "soft_deny": [
+      "$defaults"
+    ],
+    "hard_deny": [
+      "$defaults"
+    ]
+  },
+  "permissions": {
+    "ask": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push --force-with-lease:*)",
+      "Bash(git push origin --delete:*)",
+      "Bash(gh release create:*)",
+      "Bash(gh release upload:*)",
+      "Bash(gh pr merge * --admin*)",
+      "Bash(gh pr merge --admin*)",
+      "Edit(~/.claude/settings.json)",
+      "Write(~/.claude/settings.json)",
+      "Edit(~/.claude/hooks/**)",
+      "Write(~/.claude/hooks/**)"
+    ],
+    "deny": []
+  }
+}

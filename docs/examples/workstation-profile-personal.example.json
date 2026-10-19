@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "kind": "personal",
+  "host_fingerprint_sha256": "<output of: workstation-policy.py fingerprint>",
+  "approved_destinations": [
+    "github.com",
+    "*.github.com",
+    "<your private git host>",
+    "<your package registry>"
+  ],
+  "auth_hosts": [
+    "github.com",
+    "<your identity provider host>"
+  ],
+  "notes": "Template. Copy to a private location outside this repository, fill every <placeholder>, never commit the filled file."
+}

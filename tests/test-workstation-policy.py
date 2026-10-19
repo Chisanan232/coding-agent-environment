@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Workstation profile policy tests (SPE-116): synthetic profiles, injected fingerprints, no host access."""
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import sys
+import tempfile
+import unittest
+
+sys.dont_write_bytecode = True
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location("wsp", ROOT / "scripts/workstation-policy.py")
+wsp = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wsp)
+
+FP = "f" * 64
+PERSONAL = {"schema": 1, "kind": "personal", "host_fingerprint_sha256": FP, "approved_destinations": ["github.com", "*.pkg.example"],
+            "auth_hosts": ["github.com"]}
+CORP = {"schema": 1, "kind": "corporate", "host_fingerprint_sha256": FP,
+        "approved_destinations": ["git.corp.example", "*.registry.corp.example", "llm.corp.example"], "auth_hosts": ["idp.corp.example"]}
+
+
+def out(dest, classes, **kw):
+    return {"kind": "outbound", "destination": dest, "data_classes": classes, **kw}
+
+
+class Personal(unittest.TestCase):
+    def test_routine_source_to_private_approved_host_is_allowed(self):
+        self.assertEqual(wsp.decide(PERSONAL, out("github.com", ["source_code"], visibility="private"), FP)["verdict"], "ALLOW")
+
+    def test_sensitive_outbound_asks_with_a_complete_disclosure_packet(self):
+        d = wsp.decide(PERSONAL, out("paste.example.net", ["logs", "screenshots"], data_source="local build logs", purpose="debug help"), FP)
+        self.assertEqual(d["verdict"], "ASK")
+        pk = d["ask_packet"]
+        self.assertEqual((pk["source"], pk["destination"], pk["purpose"]), ("local build logs", "paste.example.net", "debug help"))
+        self.assertTrue(pk["safer_alternatives"] and pk["risks"])
+
+    def test_sensitive_to_an_approved_host_still_asks_each_time(self):
+        d = wsp.decide(PERSONAL, out("github.com", ["documents"], visibility="private", data_source="notes", purpose="issue"), FP)
+        self.assertEqual(d["verdict"], "ASK")
+
+    def test_public_or_unknown_visibility_is_not_routine(self):
+        d = wsp.decide(PERSONAL, out("github.com", ["source_code"], visibility="public", data_source="repo", purpose="push"), FP)
+        self.assertEqual(d["verdict"], "ASK")
+
+    def test_ask_without_source_or_purpose_cannot_be_asked_and_fails_closed(self):
+        d = wsp.decide(PERSONAL, out("paste.example.net", ["logs"]), FP)
+        self.assertEqual(d["verdict"], "DENY")
+        self.assertIn("ASK_PACKET_INCOMPLETE", d["reasons"][0])
+
+    def test_authentication_to_an_approved_host_stays_usable(self):
+        self.assertEqual(wsp.decide(PERSONAL, out("github.com", ["auth_handshake"]), FP)["verdict"], "ALLOW")
+        self.assertEqual(wsp.decide(PERSONAL, out("evil.example", ["auth_handshake"]), FP)["verdict"], "ASK")
+
+    def test_raw_credentials_are_denied_everywhere(self):
+        for prof in (PERSONAL, CORP):
+            self.assertEqual(wsp.decide(prof, out("github.com", ["credentials"]), FP)["verdict"], "DENY")
+            self.assertEqual(wsp.decide(prof, out("git.corp.example", ["source_code", "credentials"]), FP)["verdict"], "DENY")
+
+
+class Corporate(unittest.TestCase):
+    def test_prohibited_destinations_are_denied_for_every_protected_class(self):
+        for cls in sorted(wsp.PROTECTED_DATA):
+            d = wsp.decide(CORP, out("api.thirdparty.example", [cls], data_source="x", purpose="y"), FP)
+            self.assertEqual(d["verdict"], "DENY", cls)
+            self.assertIn("CORPORATE_OUTBOUND_PROHIBITED", d["reasons"][0])
+
+    def test_denied_even_when_the_owner_style_ask_fields_are_supplied(self):
+        d = wsp.decide(CORP, out("github.com", ["source_code"], visibility="private", data_source="repo", purpose="mirror"), FP)
+        self.assertEqual(d["verdict"], "DENY")
+        self.assertNotIn("ask_packet", d)
+
+    def test_approved_internal_destinations_remain_usable(self):
+        for host in ("git.corp.example", "llm.corp.example", "pkg.registry.corp.example"):
+            self.assertEqual(wsp.decide(CORP, out(host, ["source_code", "documents"]), FP)["verdict"], "ALLOW", host)
+        self.assertEqual(wsp.decide(CORP, out("idp.corp.example", ["auth_handshake"]), FP)["verdict"], "ALLOW")
+
+    def test_lookalike_and_malformed_hosts_do_not_match(self):
+        for host in ("git.corp.example.evil.example", "evilgit.corp.example", "registry.corp.example", "git.corp.example@evil.example",
+                     "git.corp.example:443", "GIT.CORP.EXAMPLE/../x", "", "evil.example#git.corp.example"):
+            d = wsp.decide(CORP, out(host, ["source_code"]), FP)
+            self.assertEqual(d["verdict"], "DENY", host)
+
+    def test_unknown_or_missing_data_class_fails_closed(self):
+        for classes in (None, [], ["mystery"], "logs"):
+            self.assertEqual(wsp.decide(CORP, {"kind": "outbound", "destination": "git.corp.example", "data_classes": classes}, FP)["verdict"], "DENY")
+
+    def test_public_data_is_allowed(self):
+        self.assertEqual(wsp.decide(CORP, out("docs.thirdparty.example", ["public"]), FP)["verdict"], "ALLOW")
+
+
+class Ambiguity(unittest.TestCase):
+    def check_denied(self, profile, fp=FP):
+        d = wsp.decide(profile, out("git.corp.example", ["source_code"]), fp)
+        self.assertEqual((d["profile_state"], d["verdict"]), ("AMBIGUOUS", "DENY"), d)
+
+    def test_mismatched_fingerprint_fails_closed(self):
+        self.check_denied(CORP, "0" * 64)
+        self.check_denied(CORP, None)
+
+    def test_placeholder_fingerprint_template_is_unverified(self):
+        for kind in ("personal", "corporate"):
+            tpl = json.load(open(ROOT / f"docs/examples/workstation-profile-{kind}.example.json"))
+            self.check_denied(tpl)
+
+    def test_unknown_kind_or_schema_fails_closed(self):
+        self.check_denied({**CORP, "kind": "work"})
+        self.check_denied({**CORP, "schema": 2})
+        self.check_denied({})
+        self.check_denied(None)
+
+    def test_username_is_never_trusted(self):
+        self.check_denied({**CORP, "user": "bryant", "host_fingerprint_sha256": "<x>"})
+
+    def test_ambiguous_profile_may_only_ask_about_public_data(self):
+        d = wsp.decide({**PERSONAL, "kind": "nope"}, out("x.example", ["public"]), FP)
+        self.assertEqual(d["verdict"], "ASK")
+
+
+class PolicyModification(unittest.TestCase):
+    def test_protected_locations_and_keys_need_owner_approval(self):
+        home = os.path.expanduser("~")
+        paths = ["~/.claude/settings.json", f"{home}/.claude/hooks/gate.sh", "/Library/Application Support/ClaudeCode/managed-settings.json",
+                 "/x/managed-settings.json", "repo/.claude/settings.json", "~/.claude/../.claude/settings.json", ""]
+        for path in paths:
+            for prof in (PERSONAL, CORP):
+                d = wsp.decide(prof, {"kind": "modify_policy", "path": path}, FP)
+                self.assertEqual((d["verdict"], d.get("owner_approval_required")), ("ASK", True), path)
+        for key in ("autoMode.allow", "permissions", "hooks.PreToolUse", "sandbox.enabled"):
+            self.assertEqual(wsp.decide(PERSONAL, {"kind": "modify_policy", "key": key}, FP)["verdict"], "ASK", key)
+        self.assertEqual(wsp.decide(PERSONAL, {"kind": "modify_policy"}, FP)["verdict"], "ASK")
+
+    def test_ordinary_files_are_not_policy(self):
+        self.assertEqual(wsp.decide(PERSONAL, {"kind": "modify_policy", "path": "/work/app/src/main.py"}, FP)["verdict"], "ALLOW")
+
+    def test_ambiguous_profile_does_not_lower_policy_protection(self):
+        self.assertEqual(wsp.decide({}, {"kind": "modify_policy", "path": "~/.claude/settings.json"}, None)["verdict"], "ASK")
+
+
+class Candidates(unittest.TestCase):
+    def test_rendered_candidates_are_clean_and_match_the_committed_examples(self):
+        for kind in ("personal", "corporate"):
+            cand = wsp.candidate(kind)
+            self.assertEqual(wsp.lint_settings(cand), [])
+            self.assertEqual(cand, json.load(open(ROOT / f"docs/examples/candidate-settings-{kind}.example.json")))
+            am = cand["autoMode"]
+            self.assertTrue(all(am[k][0] == "$defaults" for k in am))
+            self.assertEqual(am["allow"], ["$defaults"])
+
+    def test_lint_catches_each_forbidden_shape(self):
+        base = wsp.candidate("personal")
+        def mut(f):
+            c = json.loads(json.dumps(base)); f(c); return wsp.lint_settings(c)
+        self.assertTrue(mut(lambda c: c["autoMode"].update(allow=["only mine"])))
+        self.assertTrue(mut(lambda c: c["autoMode"].update(allow=["$defaults", "Authorized pull request merge: anything"])))
+        self.assertTrue(mut(lambda c: c["autoMode"].update(hard_deny=["x"])))
+        self.assertTrue(mut(lambda c: c["autoMode"].pop("hard_deny") and None) is not None)
+        self.assertTrue(mut(lambda c: c["permissions"].update(allow=["Bash(*)"])))
+        self.assertTrue(mut(lambda c: c.update(permissions={"defaultMode": "bypassPermissions"})))
+        self.assertTrue(mut(lambda c: c["autoMode"].update(environment=["$defaults"] + ["x" * 400])))
+        self.assertTrue(mut(lambda c: c["autoMode"].update(environment=["$defaults"] + ["f"] * 12)))
+
+    def test_templates_hold_placeholders_only(self):
+        for kind in ("personal", "corporate"):
+            raw = open(ROOT / f"docs/examples/workstation-profile-{kind}.example.json").read()
+            tpl = json.loads(raw)
+            self.assertTrue(wsp.PLACEHOLDER.fullmatch(tpl["host_fingerprint_sha256"]))
+            self.assertFalse(re.search(r"[0-9a-f]{64}", raw))
+            for host in tpl["approved_destinations"] + tpl["auth_hosts"]:
+                self.assertTrue(wsp.PLACEHOLDER.search(host) or host.endswith("github.com"), host)
+
+    def test_render_refuses_protected_destinations(self):
+        for bad in ("~/.claude/settings.json", "~/.claude/anything.json", "/Library/Application Support/ClaudeCode/managed-settings.json",
+                    "/tmp/x/.claude/candidate.json", "/tmp/settings.json"):
+            self.assertEqual(wsp.main(["render-settings", "--kind", "personal", "--out", bad]), 3, bad)
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "cand.json")
+            self.assertEqual(wsp.main(["render-settings", "--kind", "corporate", "--out", target]), 0)
+            self.assertEqual(wsp.lint_settings(json.load(open(target))), [])
+
+    def test_cli_exit_codes(self):
+        with tempfile.TemporaryDirectory() as d:
+            prof = os.path.join(d, "p.json")
+            json.dump(CORP, open(prof, "w"))
+            run = lambda act: wsp.main(["evaluate", "--profile", prof, "--action", json.dumps(act), "--fingerprint", FP])
+            self.assertEqual(run(out("git.corp.example", ["source_code"])), 0)
+            self.assertEqual(run({"kind": "modify_policy", "key": "autoMode"}), 1)
+            self.assertEqual(run(out("evil.example", ["source_code"])), 2)
+            self.assertEqual(wsp.main(["evaluate", "--profile", os.path.join(d, "missing"), "--action", "{}", "--fingerprint", FP]), 3)
+
+
+if __name__ == "__main__":
+    unittest.main()
