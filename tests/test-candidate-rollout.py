@@ -63,6 +63,29 @@ class Rollout(unittest.TestCase):
         self.assertEqual(merged["hooks"]["PreToolUse"][0], LIVE["hooks"]["PreToolUse"][0])
         self.assertEqual(LIVE["autoMode"]["allow"][1], "Authorized pull request merge: old text")  # input not mutated
 
+    def test_asks_only_candidate_leaves_autoMode_exactly_as_it_is(self):
+        cand = cr.wsp.candidate("personal", asks_only=True)
+        self.assertNotIn("autoMode", cand)
+        merged, rep = cr.merge(LIVE, cand)  # no baseline: only the candidate's asks are added
+        self.assertEqual(merged["autoMode"], LIVE["autoMode"])
+        self.assertEqual(rep["autoMode_before"], rep["autoMode_after"])
+        for key in ("env", "model", "statusLine", "hooks"):
+            self.assertEqual(merged[key], LIVE[key])
+        self.assertEqual(merged["permissions"]["allow"], LIVE["permissions"]["allow"])
+        self.assertTrue(set(LIVE["permissions"]["ask"]) <= set(merged["permissions"]["ask"]))
+        self.assertTrue(rep["asks_added"])
+        bare = {k: v for k, v in LIVE.items() if k != "autoMode"}  # owner reset: no autoMode block at all
+        merged2, _ = cr.merge(bare, cand)
+        self.assertNotIn("autoMode", merged2)
+
+    def test_asks_only_plan_has_no_blocking_finding_and_example_matches_generator(self):
+        self.cand.write_text(json.dumps(cr.wsp.candidate("personal", asks_only=True)))
+        p = json.loads(self.run_cli("plan", "--live", str(self.live), "--candidate", str(self.cand))[1])
+        self.assertFalse(p["blocking"])
+        example = json.loads((ROOT / "docs/examples/candidate-settings-personal-asks-only.example.json").read_text())
+        self.assertEqual(example, cr.wsp.candidate("personal", asks_only=True))
+        self.assertEqual(cr.wsp.lint_settings(example), [])
+
     def test_baseline_autoMode_text_is_never_applied(self):
         merged, _ = cr.merge(LIVE, cr.wsp.candidate("personal"), BASELINE)
         self.assertNotIn("Authorized pull request merge", json.dumps(merged["autoMode"]))

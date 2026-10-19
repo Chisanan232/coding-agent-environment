@@ -3,7 +3,7 @@
 
   workstation-policy.py fingerprint
   workstation-policy.py evaluate --profile FILE --action JSON [--fingerprint SHA256]
-  workstation-policy.py render-settings --kind personal|corporate [--out FILE]
+  workstation-policy.py render-settings --kind personal|corporate [--asks-only] [--out FILE]
   workstation-policy.py lint-settings FILE
 
 `evaluate` answers ALLOW, ASK or DENY for one described action. It is a decision function and a
@@ -206,7 +206,7 @@ ASK_PATH_RULES = [f"{tool}({path})" for tool in ("Edit", "Write") for path in (
     "**/.claude/settings.json", "**/.claude/settings.local.json", "**/.claude/hooks/**", "**/.claude/plugins/**", "**/.mcp.json")]
 
 
-def candidate(kind):
+def candidate(kind, asks_only=False):
     env = [
         "Source of truth: GitHub repositories owned by the owner; Jira for tickets; the workstation profile is " + kind + ".",
         "Task-owned resources (own worktree, scratch dir, regenerable build output) may be created and removed; other sessions' work is not task-owned.",
@@ -216,7 +216,7 @@ def candidate(kind):
         env.append("Corporate machine: data leaves only to destinations inside the formally approved corporate trust boundary.")
     else:
         env.append("Personal machine: no standing approval exists for sending sensitive data to external services; each such send needs explicit user approval at that time.")
-    return {
+    cand = {
         "_scope_note": "Candidate only. Review and deploy by hand; never applied automatically. Keeps the built-in rule lists via $defaults. The ask patterns are prefix/glob matches, not a complete gate: wrapped or reordered commands can evade them, so test them against the live host before relying on them.",
         "autoMode": {"environment": ["$defaults"] + env, "allow": ["$defaults"], "soft_deny": ["$defaults"], "hard_deny": ["$defaults"]},
         "permissions": {
@@ -224,6 +224,9 @@ def candidate(kind):
             "deny": [],
         },
     }
+    if asks_only:  # canary shape: asks only; the owner's existing autoMode (or its absence) is left exactly as it is
+        cand.pop("autoMode")
+    return cand
 
 
 def lint_settings(cfg):
@@ -282,6 +285,7 @@ def main(argv=None):
     r = sub.add_parser("render-settings")
     r.add_argument("--kind", required=True, choices=("personal", "corporate"))
     r.add_argument("--out")
+    r.add_argument("--asks-only", action="store_true", help="omit the autoMode block (minimal canary candidate)")
     lint = sub.add_parser("lint-settings")
     lint.add_argument("file")
     a = ap.parse_args(argv)
@@ -298,7 +302,7 @@ def main(argv=None):
             print(json.dumps(out, indent=1))
             return {"ALLOW": 0, "ASK": 1, "DENY": 2}[out["verdict"]]
         if a.cmd == "render-settings":
-            text = json.dumps(candidate(a.kind), indent=2) + "\n"
+            text = json.dumps(candidate(a.kind, asks_only=a.asks_only), indent=2) + "\n"
             if a.out:
                 with open(safe_out(a.out), "x") as fh:  # exclusive create: never overwrites an existing file
                     fh.write(text)

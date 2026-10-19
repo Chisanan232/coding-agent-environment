@@ -20,6 +20,28 @@ against the deployed file). Reaching one never implies the next.
 `allow`, `deny`, `env`, `model`, `statusLine`, `enabledPlugins` and every other hook are untouched. The baseline's own
 `autoMode` text is never applied. Do not use `permission-rollout.py apply` for this.
 
+## Minimal canary (asks only)
+
+Use this first. It adds only the protected-operation asks and leaves the owner's `autoMode` (or its absence) and every other key
+untouched. Do not pass `--baseline`: the repository baseline's asks (including the `rtk proxy` scoped asks) are then not unioned.
+
+```bash
+python3 $R/scripts/candidate-rollout.py plan  --live "$L" --candidate $R/docs/examples/candidate-settings-personal-asks-only.example.json
+# apply / verify / rollback exactly as below, with the same candidate and the pins printed by this plan
+```
+
+Why this shape: the `rtk proxy` scoped asks are inert while the live `Bash(rtk proxy *)` ask stays (the tool only adds asks), and a custom
+`autoMode.environment` needs a documented need, which no measurement has shown. Both are decisions for later, not for the canary.
+
+GO to apply: `plan` shows `blocking: false`, `live_sha` equals the pin, `autoMode_before == autoMode_after`, no ask removed, the scratch
+apply/verify/rollback round-trip passed, and the overlay matrix shows no unexpected routine prompt. NO-GO or roll back: a new session fails to
+start or reports a settings error, a routine command or a pinned owner merge prompts or is blocked by an ask, the hash drifted, or the live
+matrix differs from the overlay matrix. A correct security prompt is not a reason to roll back.
+
+Published documentation does not specify the Bash pattern glob rules (a pattern ending in ` :*` was measured not to match; ` :**` does),
+which settings keys a running session reloads (only hook changes are documented), `--resume` behavior, or the `onFailure` hook field. Treat all of
+these as measured on one host and version only.
+
 ## Order
 
 1. Merge the SPE-116 PR (the tooling and templates). Merging deploys nothing.
@@ -58,7 +80,7 @@ create the private profile (`workstation-policy.py fingerprint`, then copy the t
 `--hook-command "python3 <installed path>/workstation-policy-hook.py"`. Add `--fail-closed` only after reading the
 trade-off: `onFailure: "block"` makes a missing or broken script block every matched call, including the Bash commands
 you would use to repair it. Without it, a crash or timeout fails open. The adapter escalates its own judging errors on
-commands that name a network tool either way. Check the field's minimum Claude Code version in the hooks reference.
+commands that name a network tool either way. The published hooks guide does not mention `onFailure`; treat `--fail-closed` as unverified on this host until a test shows a broken script actually blocks.
 
 ## Compatibility checks (before apply)
 
