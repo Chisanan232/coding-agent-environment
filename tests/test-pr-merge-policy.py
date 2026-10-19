@@ -34,10 +34,17 @@ class Fake(base.Fake):
         self.pr.setdefault("files", [{"path": "src/app.py"}])
         self.pr.setdefault("commits", [{"authors": [{"login": ME}]}])
 
+    renames = 0
+    codeowners_error = None
+
     def __call__(self, *a):
+        if a[0] == "api" and a[1].endswith("/files"):
+            return f"{self.renames}\n"
         if a[0] == "api" and a[1].startswith(f"repos/{REPO}/contents/"):
+            if self.codeowners_error:
+                raise RuntimeError(self.codeowners_error)
             if self.codeowners is None or not a[1].endswith(".github/CODEOWNERS"):
-                raise RuntimeError("404")
+                raise RuntimeError("gh api failed: HTTP 404 Not Found")
             return base64.b64encode(self.codeowners.encode()).decode()
         return super().__call__(*a)
 
@@ -93,6 +100,29 @@ class ClassA(Case):
         self.refused(Fake(viewerPermission="WRITE", codeowners="* @other\nsrc/ @chisanan232 @other\n*.py @other\n"), "NOT_REPO_ADMIN")
         self.refused(Fake(viewerPermission="WRITE", codeowners="src/[a]* @chisanan232\n"), "NOT_REPO_ADMIN")
         self.refused(Fake(viewerPermission="WRITE", codeowners=None), "NOT_REPO_ADMIN")
+
+    def test_directory_star_pattern_does_not_cover_nested_paths(self):
+        for pat in ("docs/* @chisanan232", "/src/* @chisanan232"):
+            f = Fake(viewerPermission="WRITE", codeowners=pat + "\n")
+            f.pr["files"] = [{"path": "src/a/b/c.py" if pat.startswith("/") else "docs/sub/x.md"}]
+            self.refused(f, "NOT_REPO_ADMIN")
+        f = Fake(viewerPermission="WRITE", codeowners="docs/* @chisanan232\n")
+        f.pr["files"] = [{"path": "docs/x.md"}]
+        self.assertEqual(self.check(f)[0], "PASS")
+
+    def test_renames_and_large_prs_cannot_use_code_owner_authority(self):
+        f = Fake(viewerPermission="WRITE", codeowners="* @chisanan232\n")
+        f.renames = 1
+        self.refused(f, "NOT_REPO_ADMIN")
+        g = Fake(viewerPermission="WRITE", codeowners="* @chisanan232\n")
+        g.pr["files"] = [{"path": f"f{i}.py"} for i in range(30)]
+        self.refused(g, "NOT_REPO_ADMIN")
+
+    def test_codeowners_read_error_other_than_404_fails_closed(self):
+        f = Fake(viewerPermission="WRITE", codeowners="* @chisanan232\n")
+        f.codeowners_error = "gh api failed: HTTP 502"
+        with self.assertRaises(RuntimeError):
+            self.check(f)
 
     def test_pr_editing_codeowners_cannot_grant_itself_ownership(self):
         f = Fake(viewerPermission="WRITE", codeowners="* @chisanan232\n")
@@ -188,6 +218,15 @@ class ClassB(Case):
         self.assertEqual(v, "REFUSE")
         self.assertNotIn("approve_command", facts)
 
+    def test_stranger_or_other_bot_approval_is_not_the_owners(self):
+        for who in ("stranger", "auto-approver[bot]", "dependabot[bot]"):
+            v, _, facts = self.check(bot(reviews=[approval(who)]))
+            self.assertEqual((v, facts.get("needs_approval")), ("WAIT", True), who)
+        f = bot(reviews=[approval("stranger")], reviewDecision="REVIEW_REQUIRED", mergeStateStatus="BLOCKED")
+        v, _, facts = self.check(f)
+        self.assertNotEqual(v, "PASS")
+        self.assertNotIn("merge_command", facts)
+
     def test_approval_for_older_head_is_not_enough(self):
         v, _, facts = self.check(bot(reviews=[approval(oid="c" * 40)]))
         self.assertEqual(v, "WAIT")
@@ -265,6 +304,20 @@ class HostDenial(unittest.TestCase):
 
 
 class ReadOnly(unittest.TestCase):
+    def test_endpoint_allowlist_and_local_file_variables(self):
+        for bad in (["api", "repos/o/r/contents/.env", "--jq", ".content"], ["api", "repos/o/r/actions/secrets"], ["api", "orgs/o/members"],
+                    ["api", "graphql", "-F", "o=@/etc/passwd"], ["api", "repos/o/../x/commits/" + "a" * 40]):
+            with self.assertRaises(RuntimeError, msg=bad):
+                omg.read_only(bad)
+        omg.read_only(["api", f"repos/{REPO}/pulls/7/files", "--jq", "length"])
+        omg.read_only(["api", f"repos/{REPO}/compare/main...{HEAD}", "--jq", ".behind_by"])
+
+    def test_queue_exit_ignores_pass_text_inside_a_refusal(self):
+        import io, contextlib
+        f = Fake(statusCheckRollup=[{"name": "x PASS y", "status": "COMPLETED", "conclusion": "FAILURE"}])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(omg.main(["queue", "--repo", REPO, "--prs", "7", "--owners", "Chisanan232"], run=f), 1)
+
     def test_new_reads_stay_inside_the_allowlist(self):
         omg.read_only(["api", f"repos/{REPO}/contents/.github/CODEOWNERS", "--jq", ".content"])
         for bad in (["pr", "review", "7", "--approve"], ["pr", "merge", "7", "--admin"], ["api", f"repos/{REPO}/pulls/7/reviews", "-X", "POST"]):

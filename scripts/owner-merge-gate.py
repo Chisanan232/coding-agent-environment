@@ -20,6 +20,7 @@ never a GitHub approval and the gate never presents it as one. External-CI-unava
 and only together with --ci-unavailable and only when no check genuinely failed.
 """
 import argparse
+import base64
 import json
 import re
 import subprocess
@@ -40,6 +41,12 @@ THREADS = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pu
            "{reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved isOutdated}}}}}")
 
 
+_RO = r"repos/[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.{1,2}/)[A-Za-z0-9._-]{1,100}"
+_REF = r"[A-Za-z0-9._/-]{1,200}"
+API_READS = [re.compile(x) for x in (
+    _RO + rf"/compare/{_REF}\.\.\.{_REF}", _RO + r"/commits/[0-9a-f]{40}", _RO + r"/pulls/\d{1,9}/files",
+    _RO + r"/contents/(\.github/CODEOWNERS|CODEOWNERS|docs/CODEOWNERS)",
+    r"orgs/[A-Za-z0-9][A-Za-z0-9-]{0,38}/memberships/[A-Za-z0-9][A-Za-z0-9-]{0,38}")]
 SAFE_FLAGS = {"--json", "--jq", "--repo"}
 GRAPHQL_VARS = {"query", "o", "r", "n"}
 
@@ -53,7 +60,7 @@ def read_only(args):
     """
     args = [str(x) for x in args]
     verb = tuple(args[:2])
-    ok_api = verb[0] == "api" and len(args) > 1 and (verb[1] in ("user", "graphql") or re.fullmatch(r"(repos|orgs)/[A-Za-z0-9._/-]+", verb[1]))
+    ok_api = verb[0] == "api" and len(args) > 1 and (verb[1] in ("user", "graphql") or any(r.fullmatch(verb[1]) for r in API_READS))
     if verb not in (("repo", "view"), ("pr", "view")) and not ok_api:
         raise RuntimeError(f"refused non-read-only gh call: {' '.join(verb)}")
     if "mutation" in " ".join(args).lower():
@@ -64,7 +71,7 @@ def read_only(args):
         if arg.startswith("-"):
             if verb == ("api", "graphql") and arg in ("-f", "-F") and i + 1 < len(args):
                 key, _, val = args[i + 1].partition("=")
-                if key not in GRAPHQL_VARS or (key == "query" and not val.lstrip().startswith("query")):
+                if key not in GRAPHQL_VARS or val.startswith("@") or (key == "query" and not val.lstrip().startswith("query")):
                     raise RuntimeError("refused graphql variable")
                 i += 2
                 continue
@@ -109,6 +116,7 @@ def _co_regex(pat):
     dir_only = pat.endswith("/")
     body = pat.strip("/")
     out, i = "", 0
+    last = body.rsplit("/", 1)[-1]
     while i < len(body):
         if body.startswith("**/", i):
             out, i = out + "(?:.*/)?", i + 3
@@ -118,7 +126,7 @@ def _co_regex(pat):
             out, i = out + "[^/]*", i + 1
         else:
             out, i = out + re.escape(body[i]), i + 1
-    return re.compile(("" if anchored else "(?:.*/)?") + out + ("/.*" if dir_only else "(?:/.*)?"))
+    return re.compile(("" if anchored else "(?:.*/)?") + out + ("/.*" if dir_only else ("" if "*" in last else "(?:/.*)?")))
 
 
 def codeowners_cover(text, files, me):
@@ -151,6 +159,8 @@ def bot_provenance(p, bots):
     if p["isCrossRepository"]:
         bad.append("head is in another repository")
     commits = p.get("commits") or []
+    if len(commits) >= 100:
+        bad.append("commit list may be truncated")
     if not commits:
         bad.append("no commit authorship to verify")
     for c in commits:
@@ -206,15 +216,18 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None):
     if klass == "A":
         if perm != "ADMIN":
             co = ""
-            if perm in ("WRITE", "MAINTAIN") and 0 < len(p.get("files") or []) < 100 \
+            if perm in ("WRITE", "MAINTAIN") and 0 < len(p.get("files") or []) < 30 \
                     and not any(f["path"] in CODEOWNERS_PATHS for f in p["files"]):
-                for path in CODEOWNERS_PATHS:
-                    try:
-                        import base64
-                        co = base64.b64decode(run("api", f"repos/{repo}/contents/{path}", "--jq", ".content")).decode()
-                        break
-                    except Exception:
-                        continue
+                renamed = run("api", f"repos/{repo}/pulls/{pr}/files", "--jq",
+                              "[.[] | select(.previous_filename != null or .status == \"renamed\")] | length").strip()
+                if renamed == "0":
+                    for path in CODEOWNERS_PATHS:
+                        try:
+                            co = base64.b64decode(run("api", f"repos/{repo}/contents/{path}", "--jq", ".content")).decode()
+                            break
+                        except RuntimeError as ex:
+                            if "404" not in str(ex) and "Not Found" not in str(ex):
+                                raise  # only a missing file may fall through to a lower-precedence one
             if co and codeowners_cover(co, [f["path"] for f in p["files"]], me):
                 facts["authority"] = "verified code owner with write permission"
             else:
@@ -276,7 +289,7 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None):
                            "THIRD_PARTY_NEEDS_OWNER_APPROVAL: a genuine GitHub approval by the owner on this exact head is required; agent comments never substitute")
     if p["reviewDecision"] == "REVIEW_REQUIRED" and (klass in ("A", "UNVERIFIED") or (klass in ("B", "C") and owner_approved)):
         reasons.append("FORMAL_APPROVAL_REQUIRED: the repository requires a formal approving review; the gate never substitutes for it")
-    if klass == "B" and not (approved_by - {norm_bot(login), login.lower()}):
+    if klass == "B" and not owner_approved:
         wait.append("AWAITING_BOT_APPROVAL: all other gates passed or pending; submit the real GitHub APPROVE (approve_command), then re-run check")
         facts["needs_approval"] = True
         facts["approve_command"] = (f"gh pr review {pr} --repo {repo} --approve --body "
@@ -440,7 +453,7 @@ def main(argv=None, run=None):
                 return 1
             text = queue_report(run, a.repo, [int(x) for x in a.prs.split(",")], owners, a.ci_unavailable)
             print(text)
-            return 0 if all(" PASS " in l for l in text.splitlines() if l.startswith("#")) else 1
+            return 0 if all(re.match(r"#\d+ PASS ", l) for l in text.splitlines() if l.startswith("#")) else 1
         if a.cmd == "check":
             owners = [o.strip() for o in a.owners.split(",") if o.strip()]
             if not owners or not all(OWNER_RE.fullmatch(o) for o in owners):
