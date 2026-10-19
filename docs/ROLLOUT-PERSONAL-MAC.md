@@ -105,9 +105,9 @@ baseline and the candidate: the tool is not self-pinning, and `apply` has a smal
 
 The asks match command text. Measured on the host (SPE-116 audit): `git push --delete origin x`, `-d`, `origin :branch`, `yarn publish`
 and `python -m twine upload` ask; routine pushes (including `HEAD:refs/heads/x`) and local `git branch -d` do not. They still do not
-catch (measured as executing without a prompt): `git push --mirror`, `bash -c '...'` wrappers, `npm --registry x publish`,
+catch (observed executing without a prompt on one host, one run): `bash -c '...'` wrappers, `npm --registry x publish`,
 `cargo +stable publish`, `curl -X DELETE`, and `tee` writes to hooks. Other forms (`git -C dir push -f`, `-uf`, `docker buildx build
---push`, `sed -i` on settings, graphql merge mutations) were blocked by the built-in classifier in some runs and not in others, so
-treat them as unguarded. `poetry/maturin publish` were not measured. A pattern may not end in ` :*` (read as the legacy prefix suffix);
+--push`, `sed -i` on settings, `git push --mirror`, graphql merge mutations) were blocked by the built-in classifier in some runs and
+executed in others, so treat them as unguarded. `poetry/maturin publish` were not measured. A pattern may not end in ` :*` (read as the legacy prefix suffix);
 use ` :**`. `gh api` reads whose text contains `delete` (for example a `--jq` filter) prompt: a known usability cost. The built-in
 classifier and the asks already in the live file remain a second layer; nothing here is a security boundary.

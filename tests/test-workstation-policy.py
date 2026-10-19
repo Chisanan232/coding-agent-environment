@@ -239,7 +239,8 @@ class Candidates(unittest.TestCase):
             self.assertTrue(hit(cmd), cmd)
         # routine pushes and local branch deletion must stay unprompted
         for cmd in ("git push origin feature/x", "git push -u origin feature/x", "git push origin HEAD:refs/heads/feature/x",
-                    "git push origin main", "git branch -d old", "git status"):
+                    "git push origin main", "git push origin main:main", "git push origin src:dst", "git push --follow-tags origin main",
+                    "git branch -d old", "git status"):
             self.assertFalse(hit(cmd), cmd)
 
     def test_gh_api_delete_asks_match_attached_equals_and_case_variants(self):
