@@ -5,7 +5,7 @@
       "$defaults",
       "Source of truth: GitHub repositories owned by the owner; Jira for tickets; the workstation profile is personal.",
       "Task-owned resources (own worktree, scratch dir, regenerable build output) may be created and removed; other sessions' work is not task-owned.",
-      "Routine merges follow the repository's documented PR class policy; a host denial stands and is reported, never rerouted.",
+      "Merges follow each repository's documented PR class policy and are never pre-authorized by this text; a host denial stands and is reported, never rerouted.",
       "Personal machine: sensitive outbound disclosure is approved per operation."
     ],
     "allow": [
@@ -34,6 +34,11 @@
       "Bash(gh release upload:*)",
       "Bash(gh pr merge * --admin*)",
       "Bash(gh pr merge --admin*)",
+      "Bash(gh repo delete:*)",
+      "Bash(gh api * -X DELETE*)",
+      "Bash(gh api * --method DELETE*)",
+      "Bash(gh api -X DELETE*)",
+      "Bash(gh api --method DELETE*)",
       "Bash(npm publish:*)",
       "Bash(pnpm publish:*)",
       "Bash(yarn npm publish:*)",
@@ -55,6 +60,11 @@
       "Bash(rtk gh release upload:*)",
       "Bash(rtk gh pr merge * --admin*)",
       "Bash(rtk gh pr merge --admin*)",
+      "Bash(rtk gh repo delete:*)",
+      "Bash(rtk gh api * -X DELETE*)",
+      "Bash(rtk gh api * --method DELETE*)",
+      "Bash(rtk gh api -X DELETE*)",
+      "Bash(rtk gh api --method DELETE*)",
       "Bash(rtk npm publish:*)",
       "Bash(rtk pnpm publish:*)",
       "Bash(rtk yarn npm publish:*)",
@@ -70,6 +80,7 @@
       "Edit(**/.claude/settings.json)",
       "Edit(**/.claude/settings.local.json)",
       "Edit(**/.claude/hooks/**)",
+      "Edit(**/.claude/plugins/**)",
       "Edit(**/.mcp.json)",
       "Write(~/.claude/settings.json)",
       "Write(~/.claude/settings.local.json)",
@@ -79,6 +90,7 @@
       "Write(**/.claude/settings.json)",
       "Write(**/.claude/settings.local.json)",
       "Write(**/.claude/hooks/**)",
+      "Write(**/.claude/plugins/**)",
       "Write(**/.mcp.json)"
     ],
     "deny": []

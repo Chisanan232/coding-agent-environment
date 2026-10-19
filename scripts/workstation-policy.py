@@ -31,7 +31,7 @@ PROTECTED_PATHS = (
 )
 PROTECTED_BASENAMES = {"managed-settings.json", "managed-mcp.json", ".mcp.json"}
 PROTECTED_RELATIVE = (".claude/settings.json", ".claude/settings.local.json", ".claude/hooks", ".claude/claude.md", ".claude/agents",
-                      ".claude/skills", ".claude/commands", ".claude/rules")
+                      ".claude/skills", ".claude/commands", ".claude/rules", ".claude/plugins")
 # Settings keys that may change without owner approval; every other key can run commands or move a trust boundary.
 BENIGN_KEYS = {"model", "effortlevel", "advisormodel", "theme", "verbose"}
 NON_GOVERNED_KINDS = {"local"}
@@ -45,12 +45,14 @@ ALTERNATIVES = {
     "structured_data": "use a synthetic fixture with the same shape", "internal_config": "describe the shape without values",
     "personal_data": "use synthetic data", "source_code": "share only the minimal reproducing snippet",
     "unclassified": "name the data class and share a redacted or synthetic stand-in",
+    "auth_handshake": "authenticate only to hosts on the approved list, from the client's own credential store",
 }
 RISKS = {"documents": "content may be retained or indexed by the destination", "logs": "logs often embed identifiers and tokens",
          "screenshots": "images can expose unrelated windows and secrets", "recordings": "recordings capture more than intended",
          "structured_data": "records may contain personal or customer fields", "internal_config": "reveals topology and trust boundaries",
          "personal_data": "disclosure of personal data is hard to retract", "source_code": "code may be retained by the destination",
-         "unclassified": "the payload cannot be judged, so it may be sensitive"}
+         "unclassified": "the payload cannot be judged, so it may be sensitive",
+         "auth_handshake": "credentials sent to an unapproved host can leak"}
 
 
 def fingerprint():
@@ -154,7 +156,9 @@ def decide(profile, action, fp):
     if classes <= {"auth_handshake"}:
         if host_ok(dest, profile.get("auth_hosts")):
             return done("ALLOW", "approved authentication host")
-        return done("DENY" if state == "corporate" else "ASK", "AUTH_HOST_NOT_APPROVED")
+        if state == "corporate":
+            return done("DENY", "AUTH_HOST_NOT_APPROVED")
+        return done("ASK", "AUTH_HOST_NOT_APPROVED", ask_packet=ask_packet(action, dest, classes))
     approved = host_ok(dest, profile.get("approved_destinations"))
     if state == "corporate":
         if classes <= {"public"}:
@@ -176,7 +180,7 @@ def decide(profile, action, fp):
 
 
 def ask_packet(action, dest, classes):
-    sensitive = sorted(classes & PROTECTED_DATA)
+    sensitive = sorted(classes & (PROTECTED_DATA | {"auth_handshake"}))
     packet = {"data": sorted(classes), "source": action.get("data_source"), "destination": dest, "purpose": action.get("purpose"),
               "safer_alternatives": [ALTERNATIVES[c] for c in sensitive], "risks": [RISKS[c] for c in sensitive]}
     packet["missing"] = [k for k in ("source", "purpose") if not packet[k]] + ([] if dest else ["destination"])
@@ -189,19 +193,20 @@ ASK_BASH_RULES = [
     "Bash(git push * -f)", "Bash(git push * -f *)", "Bash(git push * +*)", "Bash(git push origin --delete:*)",
     "Bash(git push * --delete*)", "Bash(gh api *pulls/*/merge*)", "Bash(gh release create:*)", "Bash(gh release upload:*)",
     "Bash(gh pr merge * --admin*)", "Bash(gh pr merge --admin*)",
-    "Bash(npm publish:*)", "Bash(pnpm publish:*)", "Bash(yarn npm publish:*)", "Bash(cargo publish:*)", "Bash(twine upload:*)",
+    "Bash(gh repo delete:*)", "Bash(gh api * -X DELETE*)", "Bash(gh api * --method DELETE*)", "Bash(gh api -X DELETE*)",
+    "Bash(gh api --method DELETE*)", "Bash(npm publish:*)", "Bash(pnpm publish:*)", "Bash(yarn npm publish:*)", "Bash(cargo publish:*)", "Bash(twine upload:*)",
     "Bash(uv publish:*)", "Bash(docker push:*)",
 ]
 ASK_PATH_RULES = [f"{tool}({path})" for tool in ("Edit", "Write") for path in (
     "~/.claude/settings.json", "~/.claude/settings.local.json", "~/.claude/hooks/**", "~/.claude/bin/**", "~/.claude.json",
-    "**/.claude/settings.json", "**/.claude/settings.local.json", "**/.claude/hooks/**", "**/.mcp.json")]
+    "**/.claude/settings.json", "**/.claude/settings.local.json", "**/.claude/hooks/**", "**/.claude/plugins/**", "**/.mcp.json")]
 
 
 def candidate(kind):
     env = [
         "Source of truth: GitHub repositories owned by the owner; Jira for tickets; the workstation profile is " + kind + ".",
         "Task-owned resources (own worktree, scratch dir, regenerable build output) may be created and removed; other sessions' work is not task-owned.",
-        "Routine merges follow the repository's documented PR class policy; a host denial stands and is reported, never rerouted.",
+        "Merges follow each repository's documented PR class policy and are never pre-authorized by this text; a host denial stands and is reported, never rerouted.",
     ]
     if kind == "corporate":
         env.append("Corporate machine: data leaves only to destinations inside the formally approved corporate trust boundary.")
