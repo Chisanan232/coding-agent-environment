@@ -18,6 +18,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import shutil
 import sys
 import tempfile
@@ -57,7 +58,16 @@ def merge(live, candidate, baseline=None, hook_command=None, fail_closed=False):
     merged = json.loads(json.dumps(live))
     report = {"autoMode_before": {k: len(v) for k, v in (live.get("autoMode") or {}).items() if isinstance(v, list)},
               "autoMode_after": {k: len(v) for k, v in candidate["autoMode"].items() if isinstance(v, list)}}
-    merged["autoMode"] = json.loads(json.dumps(candidate["autoMode"]))
+    am = json.loads(json.dumps(candidate["autoMode"]))
+    live_am = live.get("autoMode") or {}
+    report["denies_kept"] = {}
+    for key in ("soft_deny", "hard_deny"):  # an owner's own deny entries are never dropped
+        extra = [x for x in live_am.get(key, []) if x != "$defaults"]
+        report["denies_kept"][key] = len(extra)
+        if extra:
+            am[key] = ["$defaults"] + union(extra, [x for x in am.get(key, []) if x != "$defaults"])
+    report["dropped_from_live"] = {key: [str(x)[:100] for x in live_am.get(key, []) if x not in am.get(key, [])] for key in ("environment", "allow")}
+    merged["autoMode"] = am
     perms = merged.setdefault("permissions", {})
     before = list(perms.get("ask", []))
     base_asks = ((baseline or {}).get("permissions") or {}).get("ask", [])
@@ -70,13 +80,20 @@ def merge(live, candidate, baseline=None, hook_command=None, fail_closed=False):
         if fail_closed:
             entry["onFailure"] = "block"
         groups = merged.setdefault("hooks", {}).setdefault("PreToolUse", [])
-        if not any(h.get("command") == hook_command for g in groups for h in g.get("hooks", [])):
+        existing = [(g, h) for g in groups for h in g.get("hooks", []) if h.get("command") == hook_command]
+        report["hook_conflict"] = []
+        for g, h in existing:
+            if set(re.split(r"[|,\s]+", g.get("matcher", ""))) != set(HOOK_MATCHER.split("|")):
+                report["hook_conflict"].append(f"existing hook entry has matcher {g.get('matcher')!r}, expected {HOOK_MATCHER!r}")
+            if fail_closed and h.get("onFailure") != "block":
+                report["hook_conflict"].append("existing hook entry is not fail-closed (onFailure != block) but --fail-closed was requested")
+        if not existing:
             groups.append({"matcher": HOOK_MATCHER, "hooks": [entry]})
             report["hook_added"] = True
     return merged, report
 
 
-def compat(live, merged, candidate):
+def compat(live, merged, candidate, report_conflicts=()):
     """Findings the owner should read before applying. Informational unless noted BLOCKING."""
     out = []
     for problem in wsp.lint_settings(candidate):
@@ -85,6 +102,8 @@ def compat(live, merged, candidate):
     for key in ("allow", "soft_deny", "hard_deny", "environment"):
         if key in am and (not am[key] or am[key][0] != "$defaults"):
             out.append(f"BLOCKING autoMode.{key} lost $defaults")
+    for msg in report_conflicts:
+        out.append(f"BLOCKING {msg}")
     live_allow = (live.get("permissions") or {}).get("allow", [])
     for problem in wsp.lint_settings({"permissions": {"allow": live_allow}}):
         out.append(f"live allow list (untouched, informational): {problem}")
@@ -103,7 +122,10 @@ def plan(args):
     baseline = load(args.baseline)[1] if args.baseline else None
     merged, report = merge(live, cand, baseline, args.hook_command, args.fail_closed)
     text = dump(merged)
-    findings = compat(live, merged, cand)
+    findings = compat(live, merged, cand, report.get("hook_conflict", []))
+    dropped = {k: v for k, v in report["dropped_from_live"].items() if v}
+    if dropped:
+        findings.append(f"live autoMode entries replaced by the candidate (informational, review them): {dropped}")
     return {"live_sha": sha(raw), "candidate_sha": sha(pathlib.Path(args.candidate).read_bytes()),
             "baseline_sha": sha(pathlib.Path(args.baseline).read_bytes()) if args.baseline else None,
             "result_sha": sha(text), "report": report, "compat": findings,

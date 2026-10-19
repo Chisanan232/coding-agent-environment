@@ -134,6 +134,35 @@ class Rollout(unittest.TestCase):
         self.assertFalse(p["blocking"])
         self.assertTrue(any("standing merge permission" in f and "informational" in f for f in p["compat"]), p["compat"])
 
+    def test_owner_deny_entries_survive_and_dropped_text_is_reported(self):
+        live = json.loads(json.dumps(LIVE))
+        live["autoMode"]["hard_deny"] = ["$defaults", "never touch prod X"]
+        live["autoMode"]["soft_deny"] = ["$defaults", "owner soft rule"]
+        merged, rep = cr.merge(live, cr.wsp.candidate("personal"))
+        self.assertEqual(merged["autoMode"]["hard_deny"], ["$defaults", "never touch prod X"])
+        self.assertEqual(merged["autoMode"]["soft_deny"], ["$defaults", "owner soft rule"])
+        self.assertEqual(rep["denies_kept"], {"soft_deny": 1, "hard_deny": 1})
+        self.assertIn("Authorized pull request merge: old text", rep["dropped_from_live"]["allow"])
+        self.live.write_text(json.dumps(live))
+        p = self.plan()
+        self.assertTrue(any("replaced by the candidate" in f for f in p["compat"]))
+        self.assertFalse(p["blocking"])
+
+    def test_existing_hook_entry_that_is_weaker_than_requested_is_blocking(self):
+        live = json.loads(json.dumps(LIVE))
+        live["hooks"]["PreToolUse"].append({"matcher": "Bash", "hooks": [{"type": "command", "command": "/x/hook.py"}]})
+        self.live.write_text(json.dumps(live))
+        p = self.plan("--hook-command", "/x/hook.py", "--fail-closed")
+        self.assertTrue(p["blocking"])
+        text = " ".join(p["compat"])
+        self.assertIn("matcher", text)
+        self.assertIn("not fail-closed", text)
+        before = self.live.read_bytes()
+        rc, _ = self.run_cli("apply", *self.args, "--hook-command", "/x/hook.py", "--fail-closed", "--expect-live-sha", p["live_sha"],
+                             "--expect-result-sha", p["result_sha"], "--backup-dir", str(self.d / "b"))
+        self.assertIn("REFUSED", str(rc))
+        self.assertEqual(self.live.read_bytes(), before)
+
     def test_rollback_refuses_a_tampered_backup(self):
         bk = self.d / "bk.json"
         bk.write_text("{}")
