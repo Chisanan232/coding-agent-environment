@@ -21,7 +21,7 @@ import subprocess
 import sys
 
 PROTECTED_DATA = {"source_code", "documents", "structured_data", "logs", "screenshots", "recordings",
-                  "internal_config", "personal_data"}
+                  "internal_config", "personal_data", "unclassified"}
 SENSITIVE_PERSONAL = PROTECTED_DATA - {"source_code"}  # source code to an ordinary private dev host is routine
 KNOWN_CLASSES = PROTECTED_DATA | {"public", "credentials", "auth_handshake"}
 HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?")
@@ -44,11 +44,13 @@ ALTERNATIVES = {
     "screenshots": "crop to the relevant region or use a synthetic reproduction", "recordings": "use a synthetic recording or a text summary",
     "structured_data": "use a synthetic fixture with the same shape", "internal_config": "describe the shape without values",
     "personal_data": "use synthetic data", "source_code": "share only the minimal reproducing snippet",
+    "unclassified": "name the data class and share a redacted or synthetic stand-in",
 }
 RISKS = {"documents": "content may be retained or indexed by the destination", "logs": "logs often embed identifiers and tokens",
          "screenshots": "images can expose unrelated windows and secrets", "recordings": "recordings capture more than intended",
          "structured_data": "records may contain personal or customer fields", "internal_config": "reveals topology and trust boundaries",
-         "personal_data": "disclosure of personal data is hard to retract", "source_code": "code may be retained by the destination"}
+         "personal_data": "disclosure of personal data is hard to retract", "source_code": "code may be retained by the destination",
+         "unclassified": "the payload cannot be judged, so it may be sensitive"}
 
 
 def fingerprint():

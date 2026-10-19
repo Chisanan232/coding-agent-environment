@@ -16,6 +16,7 @@ on:
       - 'scripts/owner-merge-gate.py'
       - 'scripts/workstation-policy.py'
       - 'scripts/candidate-rollout.py'
+      - 'scripts/workstation-policy-hook.py'
       - 'scripts/campaign-resume.py'
       - 'scripts/spe108-live/**'
       - 'scripts/parity-dogfood.py'
@@ -42,6 +43,7 @@ on:
       - 'scripts/owner-merge-gate.py'
       - 'scripts/workstation-policy.py'
       - 'scripts/candidate-rollout.py'
+      - 'scripts/workstation-policy-hook.py'
       - 'scripts/campaign-resume.py'
       - 'scripts/spe108-live/**'
       - 'scripts/parity-dogfood.py'
@@ -96,6 +98,7 @@ jobs:
           python3 tests/test-pr-merge-policy.py
           python3 tests/test-workstation-policy.py
           python3 tests/test-candidate-rollout.py
+          python3 tests/test-workstation-policy-hook.py
           python3 tests/test-spe108-live.py
           python3 tests/test-parity-dogfood.py
   native-resource-wire:
