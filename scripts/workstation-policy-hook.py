@@ -31,16 +31,24 @@ FILE_TOOLS = {"edit", "write", "multiedit", "notebookedit"}
 NET_TOOLS = {"curl", "wget", "scp", "rsync", "sftp", "nc", "ncat"}
 NET_WORD = re.compile(r"\b(curl|wget|scp|rsync|sftp|nc|ncat)\b")
 OPAQUE = re.compile(r"\b(xargs|eval|base64|exec)\b|-exec\b|\|\s*(sh|bash|zsh)\b")
-WRAPPERS = {"rtk", "command", "nohup", "time", "env", "sudo", "timeout", "nice", "stdbuf", "ionice", "caffeinate", "doas"}
+WRAPPERS = {"rtk", "command", "nohup", "time", "env", "sudo", "timeout", "nice", "stdbuf", "ionice", "caffeinate", "doas", "exec",
+            "builtin", "if", "then", "else", "elif", "do", "while", "until", "!", "{", "}"}
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+SUBSTITUTION = re.compile(r"\$\(|<\(|>\(| ; ")
 SEPARATORS = {"&&", "||", ";", "|", "&", "(", ")", ";;", "|&"}
 SCP_HOST = re.compile(r"^(?:[^@/\s]+@)?([A-Za-z0-9][A-Za-z0-9.-]*):(?!//)")
 HOSTISH = re.compile(r"^(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}$|^\d{1,3}(?:\.\d{1,3}){3}$|^localhost$|^\[[0-9A-Fa-f:]+\]$")
 CURL_LONG_PAYLOAD = ("--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii", "--json", "--form", "--form-string",
                      "--upload-file", "--config")
-CURL_VALUE_OPTS = {"-H", "-X", "-o", "-u", "-A", "-e", "-b", "-c", "-m", "-w", "-E", "-z", "-r", "-C", "-D", "-d", "-F", "-T", "-K",
+CURL_VALUE_OPTS = {"-H", "-X", "-o", "-u", "-A", "-e", "-b", "-c", "-m", "-w", "-E", "-z", "-r", "-C", "-D", "-d", "-F", "-T", "-K", "-x",
                    "--header", "--request", "--output", "--user", "--user-agent", "--referer", "--cookie", "--cookie-jar", "--max-time",
-                   "--write-out", "--cert", "--time-cond", "--range", "--continue-at", "--dump-header", "--proxy", "-x", "--connect-timeout"}
+                   "--write-out", "--cert", "--time-cond", "--range", "--continue-at", "--dump-header", "--proxy", "--connect-timeout",
+                   "--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii", "--json", "--form", "--form-string",
+                   "--upload-file", "--config", "--connect-to", "--resolve", "--interface", "--cacert", "--capath", "--key", "--pass",
+                   "--retry", "--retry-delay", "--limit-rate", "--noproxy", "--proxy-user", "--oauth2-bearer", "--aws-sigv4",
+                   "--unix-socket", "--doh-url", "--cert-type", "--key-type", "--ciphers", "--tls-max", "--tlsv1.3"}
+CURL_VALUE_SHORT = set("HoubAecmwEzrCDdFTKXx")
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
@@ -65,7 +73,7 @@ def simple_commands(command):
     lexer.whitespace_split = True
     cur, out = [], []
     for tok in lexer:
-        if tok in SEPARATORS or (set(tok) <= set("&|;()") and tok):
+        if tok in SEPARATORS or (set(tok) <= set("&|;()<>") and tok):  # redirections and process substitutions split too
             if cur:
                 out.append(cur)
             cur = []
@@ -94,10 +102,15 @@ def host_of(token):
 
 
 def find_tool(argv):
-    """If the command starts with a network tool or a wrapper, return (tool, args) for the first network tool within it."""
+    """If the command starts (after assignments) with a network tool, wrapper or shell keyword, return (tool, args) for the
+    first network tool within it."""
+    i = 0
+    while i < len(argv) and ASSIGNMENT.match(argv[i]):
+        i += 1
+    argv = argv[i:]
     if not argv or os.path.basename(argv[0]) not in WRAPPERS | NET_TOOLS:
         return None
-    for i, tok in enumerate(argv[:12]):
+    for i, tok in enumerate(argv[:14]):
         if os.path.basename(tok) in NET_TOOLS:
             return os.path.basename(tok), argv[i + 1:]
     return None
@@ -125,31 +138,61 @@ def curl_is_upload(args):
 
 
 def curl_destinations(args):
+    """Every destination of a curl invocation; 'unknown-host' when a positional argument cannot be resolved."""
     skip, out = False, []
     for a in args:
         if skip:
             skip = False
             continue
+        if a.startswith("--url="):
+            out.append(host_of(a[6:]) or "unknown-host")
+            continue
+        if a == "--url":
+            skip = False
+            out.append("__url_next__")
+            continue
+        if out and out[-1] == "__url_next__":
+            out[-1] = host_of(a) or "unknown-host"
+            continue
         if a in CURL_VALUE_OPTS:
             skip = True
             continue
-        if a.startswith("-") or a.startswith("@") or "=@" in a:
+        if a.startswith("--"):
             continue
-        h = host_of(a)
-        if h:
-            out.append(h)
+        if a.startswith("-") and len(a) > 1:
+            for j, ch in enumerate(a[1:]):
+                if ch in CURL_VALUE_SHORT:
+                    skip = j == len(a) - 2  # value attached to the cluster, or in the next token
+                    break
+            continue
+        if a.startswith("@") or "=@" in a:
+            continue
+        out.append(host_of(a) or "unknown-host")
+    return [h for h in out if h != "__url_next__"] or ["unknown-host"]
+
+
+def commands_in(command, depth=0):
+    """Simple commands of `command`, including the contents of $(...), <(...), backtick and sh -c strings (best effort)."""
+    out = []
+    for argv in simple_commands(command):
+        out.append(argv)
+        if depth < 3:
+            for tok in argv:
+                if SUBSTITUTION.search(tok):
+                    inner = re.sub(r"\$\(|<\(|>\(|\)", " ; ", tok)
+                    out.extend(commands_in(inner, depth + 1))
+            base = os.path.basename(argv[0]) if argv else ""
+            if base in SHELLS:
+                for i, tok in enumerate(argv[1:-1], 1):
+                    if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", tok):
+                        out.extend(commands_in(argv[i + 1], depth + 1))
     return out
 
 
-def uploads(argv, depth=0):
+def uploads(argv):
     """Return a list of (host, hint) pairs for every remote destination this simple command sends data to."""
     found = find_tool(argv)
     if not found:
-        base = os.path.basename(argv[0]) if argv else ""
-        if base in SHELLS and "-c" in argv and depth < 3:
-            i = argv.index("-c")
-            if i + 1 < len(argv):
-                return [h for cmd in simple_commands(argv[i + 1]) for h in uploads(cmd, depth + 1)]
         return []
     tool, args = found
     hint = " ".join(argv)[:120]
@@ -182,9 +225,9 @@ def judge_bash(event, profile, fp_fn):
     if not NET_WORD.search(command):
         return None
     purpose = (event.get("tool_input") or {}).get("description") or None
-    hits = [h for argv in simple_commands(command) for h in uploads(argv)]
-    if not hits and OPAQUE.search(command):
-        hits = [("unknown-host", command[:120])]  # a network tool is named inside a construct this hook cannot read
+    hits = [h for argv in commands_in(command) for h in uploads(argv)]
+    if OPAQUE.search(command):
+        hits.append(("unknown-host", command[:120]))  # a network tool is named inside a construct this hook cannot read
     worst, fp = None, None
     for host, hint in hits:
         action = {"kind": "outbound", "destination": host, "data_classes": ["unclassified"], "data_source": f"command arguments: {hint}",
