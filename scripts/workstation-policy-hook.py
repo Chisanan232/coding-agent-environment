@@ -69,19 +69,24 @@ def load_profile(path):
 
 def simple_commands(command):
     command = command.replace("\n", " ; ").replace("`", " ; ")
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    cur, out = [], []
-    for tok in lexer:
-        if tok in SEPARATORS or (set(tok) <= set("&|;()<>") and tok):  # redirections and process substitutions split too
-            if cur:
-                out.append(cur)
-            cur = []
-        else:
-            cur.append(tok)
-    if cur:
-        out.append(cur)
-    return out
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        cur, out = [], []
+        for tok in lexer:
+            if tok in SEPARATORS or (set(tok) <= set("&|;()<>") and tok):  # redirections and process substitutions split too
+                if cur:
+                    out.append(cur)
+                cur = []
+            else:
+                cur.append(tok)
+        if cur:
+            out.append(cur)
+        return out
+    except ValueError:
+        # Unbalanced quotes (an apostrophe in a heredoc commit message, or a deliberate trick): fall back to a quote-blind split
+        # so a command that starts with a network tool is still seen, while prose that merely mentions one is not.
+        return [seg.split() for seg in re.split(r"[;&|()<>\n]+", command) if seg.split()]
 
 
 def host_of(token):
