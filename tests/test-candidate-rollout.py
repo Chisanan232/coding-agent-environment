@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""scripts/candidate-rollout.py on scratch copies only (SPE-116). Never touches a real settings file."""
+import importlib.util
+import io
+import json
+import os
+import pathlib
+import stat
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+
+sys.dont_write_bytecode = True
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location("cr", ROOT / "scripts/candidate-rollout.py")
+cr = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cr)
+DUMMY = "DUMMY-NOT-A-REAL-SECRET-123"
+LIVE = {"env": {"EXAMPLE_TOKEN": DUMMY}, "model": "m", "effortLevel": "medium",
+        "permissions": {"allow": ["Bash(ls:*)", "Bash(gh pr merge:*)"], "deny": ["Bash(rm -rf /)"], "ask": ["Bash(git push --force:*)", "Bash(old ask:*)"]},
+        "autoMode": {"environment": ["$defaults", "old long natural-language rule"], "allow": ["$defaults", "Authorized pull request merge: old text"]},
+        "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk-hook"}]}]},
+        "statusLine": {"type": "command", "command": "sl"}}
+BASELINE = {"permissions": {"ask": ["Bash(terraform destroy:*)", "Bash(rtk terraform destroy:*)"], "allow": ["Bash(everything:*)"]},
+            "autoMode": {"allow": ["$defaults", "Authorized pull request merge: restored old text"]}}
+
+
+class Rollout(unittest.TestCase):
+    def setUp(self):
+        self.d = pathlib.Path(tempfile.mkdtemp(prefix="cr-test-"))
+        self.addCleanup(__import__("shutil").rmtree, self.d, True)
+        self.live, self.base, self.cand = self.d / "settings.json", self.d / "baseline.json", self.d / "cand.json"
+        self.live.write_text(json.dumps(LIVE, indent=2))
+        self.base.write_text(json.dumps(BASELINE))
+        self.cand.write_text(json.dumps(cr.wsp.candidate("personal")))
+        self.args = ["--live", str(self.live), "--candidate", str(self.cand), "--baseline", str(self.base)]
+
+    def run_cli(self, *argv):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            try:
+                rc = cr.main(list(argv))
+            except SystemExit as e:
+                return str(e.code), buf.getvalue()
+        return rc, buf.getvalue()
+
+    def plan(self, *extra):
+        rc, out = self.run_cli("plan", *self.args, *extra)
+        return json.loads(out)
+
+    def test_merge_touches_only_autoMode_ask_and_the_optional_hook(self):
+        merged, rep = cr.merge(LIVE, cr.wsp.candidate("personal"), BASELINE, "/x/hook.py")
+        for key in ("env", "model", "effortLevel", "statusLine"):
+            self.assertEqual(merged[key], LIVE[key])
+        self.assertEqual(merged["permissions"]["allow"], LIVE["permissions"]["allow"])
+        self.assertEqual(merged["permissions"]["deny"], LIVE["permissions"]["deny"])
+        self.assertEqual(merged["autoMode"], cr.wsp.candidate("personal")["autoMode"])
+        self.assertTrue(set(LIVE["permissions"]["ask"]) <= set(merged["permissions"]["ask"]))
+        self.assertIn("Bash(terraform destroy:*)", merged["permissions"]["ask"])
+        self.assertEqual(len(merged["permissions"]["ask"]), len(set(merged["permissions"]["ask"])))
+        self.assertTrue(rep["hook_added"])
+        self.assertEqual(merged["hooks"]["PreToolUse"][0], LIVE["hooks"]["PreToolUse"][0])
+        self.assertEqual(LIVE["autoMode"]["allow"][1], "Authorized pull request merge: old text")  # input not mutated
+
+    def test_baseline_autoMode_text_is_never_applied(self):
+        merged, _ = cr.merge(LIVE, cr.wsp.candidate("personal"), BASELINE)
+        self.assertNotIn("Authorized pull request merge", json.dumps(merged["autoMode"]))
+        self.assertNotIn("Bash(everything:*)", merged["permissions"]["allow"])
+
+    def test_plan_is_read_only_and_never_prints_env_values(self):
+        before = self.live.read_bytes()
+        rc, out = self.run_cli("plan", *self.args)
+        self.assertEqual(self.live.read_bytes(), before)
+        self.assertNotIn(DUMMY, out)
+        self.assertNotIn("EXAMPLE_TOKEN", out)
+        p = json.loads(out)
+        self.assertEqual(p["live_sha"], cr.sha(before))
+        self.assertNotIn("_text", p)
+
+    def test_apply_verify_rollback_roundtrip(self):
+        original = self.live.read_bytes()
+        p = self.plan()
+        bdir = self.d / "backups"
+        rc, out = self.run_cli("apply", *self.args, "--expect-live-sha", p["live_sha"], "--expect-result-sha", p["result_sha"], "--backup-dir", str(bdir))
+        self.assertEqual(rc, 0, out)
+        res = json.loads(out)
+        self.assertEqual(cr.sha(self.live.read_bytes()), p["result_sha"])
+        self.assertEqual(stat.S_IMODE(os.stat(res["backup"]).st_mode), 0o600)
+        self.assertEqual(cr.sha(pathlib.Path(res["backup"]).read_bytes()), p["live_sha"])
+        rc, out = self.run_cli("verify", "--live", str(self.live), "--expect-result-sha", p["result_sha"])
+        self.assertEqual(json.loads(out)["verdict"], "VERIFIED")
+        rc, out = self.run_cli("rollback", "--live", str(self.live), "--backup", res["backup"], "--expect-backup-sha", p["live_sha"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.live.read_bytes(), original)
+
+    def test_apply_refuses_when_pins_do_not_match(self):
+        p = self.plan()
+        before = self.live.read_bytes()
+        for live_sha, res_sha in (("0" * 64, p["result_sha"]), (p["live_sha"], "0" * 64)):
+            rc, _ = self.run_cli("apply", *self.args, "--expect-live-sha", live_sha, "--expect-result-sha", res_sha, "--backup-dir", str(self.d / "b"))
+            self.assertIn("REFUSED", str(rc))
+        self.live.write_text(self.live.read_text() + " ")  # live changed after the plan
+        rc, _ = self.run_cli("apply", *self.args, "--expect-live-sha", p["live_sha"], "--expect-result-sha", p["result_sha"], "--backup-dir", str(self.d / "b"))
+        self.assertIn("REFUSED", str(rc))
+        self.assertEqual(self.live.read_bytes(), before + b" ")
+
+    def test_blocking_candidate_cannot_be_applied(self):
+        bad = cr.wsp.candidate("personal")
+        bad["autoMode"]["allow"] = ["only mine"]
+        self.cand.write_text(json.dumps(bad))
+        p = self.plan()
+        self.assertTrue(p["blocking"])
+        before = self.live.read_bytes()
+        rc, _ = self.run_cli("apply", *self.args, "--expect-live-sha", p["live_sha"], "--expect-result-sha", p["result_sha"], "--backup-dir", str(self.d / "b"))
+        self.assertIn("REFUSED", str(rc))
+        self.assertEqual(self.live.read_bytes(), before)
+
+    def test_second_apply_is_a_no_op_and_hook_is_added_once(self):
+        extra = ["--hook-command", "/x/hook.py", "--fail-closed"]
+        p = self.plan(*extra)
+        self.run_cli("apply", *self.args, *extra, "--expect-live-sha", p["live_sha"], "--expect-result-sha", p["result_sha"], "--backup-dir", str(self.d / "b"))
+        cfg = json.loads(self.live.read_text())
+        hooks = [h for g in cfg["hooks"]["PreToolUse"] for h in g["hooks"] if h["command"] == "/x/hook.py"]
+        self.assertEqual(len(hooks), 1)
+        self.assertEqual(hooks[0]["onFailure"], "block")
+        again = self.plan(*extra)
+        self.assertEqual(again["report"]["asks_added"], [])
+        self.assertFalse(again["report"]["hook_added"])
+        self.assertEqual(again["result_sha"], again["live_sha"])
+
+    def test_compat_reports_standing_merge_allow_and_overlaps_without_blocking(self):
+        p = self.plan()
+        self.assertFalse(p["blocking"])
+        self.assertTrue(any("standing merge permission" in f and "informational" in f for f in p["compat"]), p["compat"])
+
+    def test_rollback_refuses_a_tampered_backup(self):
+        bk = self.d / "bk.json"
+        bk.write_text("{}")
+        rc, _ = self.run_cli("rollback", "--live", str(self.live), "--backup", str(bk), "--expect-backup-sha", "0" * 64)
+        self.assertIn("REFUSED", str(rc))
+
+
+if __name__ == "__main__":
+    unittest.main()
