@@ -227,6 +227,13 @@ class Candidates(unittest.TestCase):
         env = " ".join(wsp.candidate("personal")["autoMode"]["environment"])
         self.assertIn("never pre-authorized", env)
 
+    def test_gh_api_delete_asks_match_attached_equals_and_case_variants(self):
+        import fnmatch
+        asks = [r[len("Bash("):-1] for r in wsp.candidate("personal")["permissions"]["ask"] if r.startswith("Bash(gh api")]
+        for cmd in ("gh api -X DELETE repos/o/r/git/refs/heads/x", "gh api -XDELETE repos/o/r", "gh api --method=DELETE repos/o/r",
+                    "gh api repos/o/r -X=DELETE", "gh api repos/o/r --method delete", "gh api repos/o/r -X Delete"):
+            self.assertTrue(any(fnmatch.fnmatchcase(cmd, a.replace(":*", " *") if a.endswith(":*") else a) for a in asks), cmd)
+
     def test_unapproved_auth_host_on_personal_asks_with_a_packet(self):
         res = wsp.decide(PERSONAL, out("evil.example", ["auth_handshake"], data_source="gh login", purpose="sign in"), FP)
         self.assertEqual(res["verdict"], "ASK")
