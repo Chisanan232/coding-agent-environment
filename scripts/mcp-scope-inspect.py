@@ -48,12 +48,29 @@ def github_match(name, spec):
     return None
 
 
+TRANSPORTS = ("http", "sse", "stdio", "ws")
+
+
 def transport(spec):
+    """Allowlisted transport name only: the raw `type` text is never echoed."""
     if not isinstance(spec, dict):
         return "unknown"
-    if spec.get("type"):
-        return str(spec["type"])[:12]
+    t = str(spec.get("type") or "").lower()
+    if t:
+        return t if t in TRANSPORTS else "other"
     return "http" if spec.get("url") else "stdio" if spec.get("command") else "unknown"
+
+
+def printable(text, limit=200):
+    """True when the text is safe to print and to put inside a quoted shell command."""
+    t = str(text)
+    return 0 < len(t) <= limit and t.isprintable()
+
+
+def show(text, limit=60):
+    """Display form: control characters become '?' and the length is capped."""
+    t = "".join(c if c.isprintable() else "?" for c in str(text))
+    return t if len(t) <= limit else t[:limit - 1] + "…"
 
 
 def load(path):
@@ -77,7 +94,8 @@ def inspect(home, project_roots, managed_file):
         for n, s in servers_in(cj.get("mcpServers")).items():
             found.append(("user", "~/.claude.json", None, n, s))
         for proj, body in servers_in(cj.get("projects")).items():
-            for n, s in servers_in((body or {}).get("mcpServers")).items():
+            body = body if isinstance(body, dict) else {}
+            for n, s in servers_in(body.get("mcpServers")).items():
                 found.append(("local", "~/.claude.json", proj, n, s))
     for root in project_roots:
         p = pathlib.Path(root) / ".mcp.json"
@@ -99,9 +117,9 @@ def inspect(home, project_roots, managed_file):
     rows = []
     for scope, src, proj, name, spec in found:
         gh = github_match(name, spec)
-        row = {"scope": scope, "source": src, "server": str(name), "transport": transport(spec), "github": bool(gh), "matched_by": gh}
+        row = {"scope": scope, "source": src, "server": show(name), "transport": transport(spec), "github": bool(gh), "matched_by": gh}
         if proj:
-            row["project"] = proj
+            row["project"] = show(proj, 200)
         if gh:
             row["retire"] = retire_command(scope, name, proj, src)
         rows.append(row)
@@ -109,6 +127,8 @@ def inspect(home, project_roots, managed_file):
 
 
 def retire_command(scope, name, project, source):
+    if not printable(name) or (project is not None and not printable(project)):
+        return "unusual server name or path (control characters or very long): remove it by hand; no command is generated"
     q = lambda s: "'" + str(s).replace("'", "'\\''") + "'"
     if scope == "user":
         return f"claude mcp remove {q(name)} -s user"

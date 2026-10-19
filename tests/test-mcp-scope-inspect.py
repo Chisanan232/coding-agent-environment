@@ -131,5 +131,44 @@ class Robustness(unittest.TestCase):
         self.assertFalse(any(r["github"] for r in out["servers"]))
 
 
+class ReviewHardening(unittest.TestCase):
+    """Concrete failures from the independent review of PR #99."""
+
+    def test_raw_type_text_is_never_echoed(self):
+        home = home_with(user={"github": {"type": "SYNTHETIC-SECRET-IN-TYPE", "url": "http://x/"}, "ok": {"type": "SSE", "url": "http://y/"}})
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, True))
+        out = msi.inspect(str(home), [], "/nonexistent")
+        by = {r["server"]: r for r in out["servers"]}
+        self.assertEqual((by["github"]["transport"], by["ok"]["transport"]), ("other", "sse"))
+        self.assertNotIn("SYNTHETIC-SECRET-IN-TYPE", json.dumps(out))
+
+    def test_control_characters_never_reach_the_terminal_and_get_no_copy_paste_command(self):
+        evil = "github\x1b[2J\nfake-line"
+        home = home_with(user={evil: {"type": "http", "url": "http://x/"}}, projects={"/p\x07ath": {"mcpServers": {"github": {"command": "docker", "args": ["ghcr.io/github/github-mcp-server"]}}}})
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, True))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            msi.main(["--home", str(home), "--managed-file", "/nonexistent"])
+        text = buf.getvalue()
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\x07", text)
+        self.assertNotIn("fake-line\n", text.replace("?fake-line", ""))
+        self.assertIn("no command is generated", text)
+        self.assertNotIn("claude mcp remove", text)
+
+    def test_very_long_names_are_truncated_for_display_and_get_no_command(self):
+        home = home_with(user={"github-" + "a" * 500: {"type": "http", "url": "http://x/"}})
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, True))
+        row = msi.inspect(str(home), [], "/nonexistent")["servers"][0]
+        self.assertLessEqual(len(row["server"]), 60)
+        self.assertIn("by hand", row["retire"])
+
+    def test_non_dict_project_entries_do_not_abort_the_inspection(self):
+        home = home_with(user={"a": {"command": "x"}}, projects={"/l": ["x"], "/n": 5, "/s": "str", "/ok": {"mcpServers": {"github": {"type": "http", "url": "http://x/"}}}})
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, True))
+        out = msi.inspect(str(home), [], "/nonexistent")
+        self.assertEqual(sorted((r["scope"], r["server"]) for r in out["servers"]), [("local", "github"), ("user", "a")])
+
+
 if __name__ == "__main__":
     unittest.main()
