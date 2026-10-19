@@ -52,6 +52,8 @@ stop, report the exact blocked operation.
   approve a personal equivalent.
 - Raw credentials are denied everywhere; approved authentication hosts stay usable because
   clients authenticate from their own credential store.
+- The fingerprint only detects a profile copied to the wrong machine; it does not authenticate the profile file. Keep the filled profile in an owner-controlled location the agent cannot rewrite, and treat `--fingerprint` as a test hook (it needs `WORKSTATION_POLICY_TEST_FINGERPRINT=1`).
+- Unknown action kinds are denied, any settings key outside a tiny benign list asks, and the whole `~/.claude/` tree, project `.claude/settings*`, `.claude/hooks`, `.mcp.json` and managed settings are protected paths (case-insensitive, symlink-resolved).
 - Anything unverified (template, placeholder, mismatched fingerprint, unknown kind) is
   AMBIGUOUS: protected data is denied, and a username is never used as evidence.
 

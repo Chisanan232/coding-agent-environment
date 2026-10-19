@@ -21,6 +21,7 @@ on:
       - 'scripts/codex-routing.py'
       - 'scripts/verify-codex-routing.py'
       - 'tests/**'
+      - 'docs/examples/**'
       - 'bin/**'
       - '.github/workflows/capability-validation.yml'
   push:

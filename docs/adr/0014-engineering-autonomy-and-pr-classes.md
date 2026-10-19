@@ -58,6 +58,7 @@ class, and how personal and corporate machines treat outbound data.
   stated, mitigated by policy and the host's Self-Approval rule, and not hidden.
 - "CI green" is every reported check passing, not the required set; the CI-unavailable
   exception is bounded (ADR 0013).
+- The CI-unavailable exception applies only when GitHub reports no checks; billing exhaustion that records failed runs stays `CI_FAILED`, which fails closed.
 - Candidate `permissions.ask` patterns are unverified against the live host. They need the
   fresh and resumed matrix (see `docs/ENGINEERING-POLICY.md`) before any deployment.
 
