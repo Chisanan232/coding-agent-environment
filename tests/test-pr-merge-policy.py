@@ -149,6 +149,27 @@ class ClassC(Case):
         self.refused(third_party(reviews=[approval()], viewerPermission="READ"), "NO_MERGE_PERMISSION")
 
 
+class OwnerIdentity(Case):
+    def org_fake(self, builder, role, **over):
+        f = builder(nameWithOwner="horonomy/r", owner={"login": "horonomy"}, org_role=role, **over)
+        return f
+
+    def test_write_collaborator_is_not_the_owner_for_class_b_or_c(self):
+        for builder in (third_party, bot):
+            f = self.org_fake(builder, "member active", reviews=[approval()])
+            v, why, _ = omg.evaluate(f, "horonomy/r", 7, OWNERS)
+            self.assertEqual(v, "REFUSE", builder.__name__)
+            self.assertTrue(any("OWNER_IDENTITY_NOT_VERIFIED" in w for w in why), why)
+
+    def test_org_admin_counts_as_the_owner(self):
+        f = self.org_fake(third_party, "admin active", reviews=[approval()])
+        self.assertEqual(omg.evaluate(f, "horonomy/r", 7, OWNERS)[0], "PASS")
+
+    def test_inactive_or_pending_org_admin_does_not(self):
+        f = self.org_fake(third_party, "admin pending", reviews=[approval()])
+        self.assertEqual(omg.evaluate(f, "horonomy/r", 7, OWNERS)[0], "REFUSE")
+
+
 class ClassB(Case):
     def test_verified_bot_waits_for_real_approval_then_passes(self):
         v, why, facts = self.check(bot())

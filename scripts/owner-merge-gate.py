@@ -225,8 +225,14 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None):
                 role = run("api", f"orgs/{owner}/memberships/{me}", "--jq", ".role + \" \" + .state").strip()
                 if role != "admin active":
                     reasons.append(f"OWNER_NOT_ADMINISTERED_BY_VIEWER: {owner!r} is neither the authenticated account nor an org it administers")
-    elif klass in ("B", "C") and perm not in MERGE_PERMS:
-        reasons.append(f"NO_MERGE_PERMISSION: viewer permission {perm}")
+    elif klass in ("B", "C"):
+        if perm not in MERGE_PERMS:
+            reasons.append(f"NO_MERGE_PERMISSION: viewer permission {perm}")
+        # The approval that counts must be the owner's personally, not just any collaborator's with write access.
+        if owner != me.lower():
+            role = run("api", f"orgs/{owner}/memberships/{me}", "--jq", ".role + \" \" + .state").strip()
+            if role != "admin active":
+                reasons.append(f"OWNER_IDENTITY_NOT_VERIFIED: {me!r} is neither the repository owner account nor an administrator of org {owner!r}")
     if len(p["comments"]) >= 100 or len(p["reviews"]) >= 100:
         reasons.append("EVIDENCE_TRUNCATED: 100 or more comments or reviews; later records may be hidden")
     if p["state"] != "OPEN":
