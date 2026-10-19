@@ -33,7 +33,7 @@ class Fake:
                    "statusCheckRollup": green()}
         self.repo = {"nameWithOwner": "Chisanan232/r", "defaultBranchRef": {"name": "main"}, "isFork": False,
                      "viewerPermission": "ADMIN", "owner": {"login": "Chisanan232"}}
-        self.behind, self.threads, self.me = 0, [], "chisanan232"
+        self.behind, self.threads, self.me, self.more_threads = 0, [], "chisanan232", False
         self.parents, self.cmp = [HEAD, "b" * 40], "ahead"
         for k, v in over.items():
             target = self.repo if k in self.repo else self.pr if k in self.pr else None
@@ -52,7 +52,7 @@ class Fake:
         if a[0] == "api" and "/compare/" in a[1]:
             return (str(self.behind) if "behind_by" in a[3] else self.cmp) + "\n"
         if a[:2] == ("api", "graphql"):
-            return json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": self.threads}}}}})
+            return json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"pageInfo": {"hasNextPage": self.more_threads}, "nodes": self.threads}}}}})
         if a[0] == "api" and "/commits/" in a[1]:
             return json.dumps(self.parents)
         raise AssertionError(a)

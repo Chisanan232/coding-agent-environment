@@ -3,6 +3,8 @@
 
   owner-merge-gate.py check  --repo OWNER/REPO --pr N --owners a,b[,c] [--ci-unavailable]
   owner-merge-gate.py verify --repo OWNER/REPO --pr N --head SHA
+  owner-merge-gate.py queue  --repo OWNER/REPO --prs 5,6 --owners a,b      (print-only plan)
+  owner-merge-gate.py evidence-line --head SHA --reviewer ID               (prints the record line)
 
 `check` evaluates the exact PR head and prints one JSON verdict (PASS, REFUSE or WAIT) plus the
 merge command to run. It never merges, comments, approves or posts a status: the merge stays a
@@ -35,10 +37,26 @@ DEPLOY_BASES = re.compile(r"(^|/)(prod|production|release|releases|gh-pages|depl
 PR_FIELDS = ("number,state,isDraft,baseRefName,headRefName,headRefOid,author,mergeable,mergeStateStatus,"
              "reviewDecision,reviews,comments,statusCheckRollup,isCrossRepository,mergeCommit")
 THREADS = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n)"
-           "{reviewThreads(first:100){nodes{isResolved isOutdated}}}}}")
+           "{reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved isOutdated}}}}}")
+
+
+def read_only(args):
+    """Fail closed: the gate may only read. Anything else raises before gh is started."""
+    verb = tuple(map(str, args[:2]))
+    allowed = (verb in (("repo", "view"), ("pr", "view"), ("api", "user"), ("api", "graphql"))
+               or (verb[0] == "api" and verb[1].startswith("repos/")))
+    if not allowed:
+        raise RuntimeError(f"refused non-read-only gh call: {' '.join(verb)}")
+    flat = " ".join(map(str, args))
+    if "mutation" in flat.lower():
+        raise RuntimeError("refused gh call containing a mutation")
+    # A GraphQL read needs -f/-F variables; any other call must not carry a method, body or field.
+    if verb != ("api", "graphql") and re.search(r"(^|\s)(-X|--method|--input|-f|-F|--field|--raw-field)(\s|=)", flat):
+        raise RuntimeError("refused gh call with a method, input or field override")
 
 
 def gh(*args):
+    read_only(args)
     r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=120)
     if r.returncode:
         raise RuntimeError(f"gh {args[0]} {args[1]} failed: {r.stderr.strip()[:200]}")
@@ -81,8 +99,13 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False):
     behind = int(run("api", f"repos/{repo}/compare/{base}...{head}", "--jq", ".behind_by").strip() or 0)
     if behind:
         reasons.append(f"STALE_BRANCH: head is {behind} commit(s) behind {base}; rebase or merge the base and revalidate")
-    if p["mergeStateStatus"] == "BLOCKED" and p["reviewDecision"] != "REVIEW_REQUIRED":
+    mss = p["mergeStateStatus"]
+    if mss == "BLOCKED" and p["reviewDecision"] != "REVIEW_REQUIRED":
         reasons.append("BLOCKED_BY_REPOSITORY_RULES: mergeStateStatus BLOCKED (branch protection or ruleset)")
+    elif mss == "UNKNOWN":
+        wait.append("MERGE_STATE_UNKNOWN: GitHub has not computed the merge state yet")
+    elif mss not in ("CLEAN", "HAS_HOOKS", "BLOCKED", "DIRTY", "BEHIND"):
+        reasons.append(f"MERGE_STATE_NOT_CLEAN: mergeStateStatus {mss!r} (unstable or unrecognized state fails closed)")
     if p["reviewDecision"] == "CHANGES_REQUESTED":
         reasons.append("CHANGES_REQUESTED")
     if p["reviewDecision"] == "REVIEW_REQUIRED":
@@ -95,8 +118,10 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False):
         reasons.append("CHANGES_REQUESTED: an outstanding REQUEST_CHANGES review")
     o, r_ = repo.split("/")
     threads = _json(run, "api", "graphql", "-f", f"query={THREADS}", "-F", f"o={o}", "-F", f"r={r_}", "-F", f"n={pr}")
-    unresolved = [t for t in threads["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
-                  if not t["isResolved"] and not t["isOutdated"]]
+    rt = threads["data"]["repository"]["pullRequest"]["reviewThreads"]
+    if rt["pageInfo"]["hasNextPage"]:
+        reasons.append("REVIEW_THREADS_TRUNCATED: more than 100 review threads, cannot prove none is unresolved")
+    unresolved = [t for t in rt["nodes"] if not t["isResolved"]]
     if unresolved:
         reasons.append(f"UNRESOLVED_REVIEW_THREADS: {len(unresolved)}")
     texts = [c["body"] for c in p["comments"] if c["author"]["login"].lower() == me.lower()]
@@ -111,6 +136,7 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False):
         if bad or any(m[1] == "FAIL" or m[2] != "0" for m in found if m[0] == head):
             reasons.append("REVIEW_NOT_CLEAN: recorded review has blocking findings or a non-PASS verdict")
         facts["reviewer"] = at_head[-1][3]
+        facts["review_kind"] = "independent technical review record (not a GitHub approval)"
         if at_head[-1][3].lower() in (me.lower(), "self", "author", "coordinator"):
             reasons.append("REVIEW_NOT_INDEPENDENT: reviewer id is the author or coordinator")
     checks = p["statusCheckRollup"] or []
@@ -129,6 +155,7 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False):
         else:
             reasons.append("NO_CI_EVIDENCE: no completed checks on this head and no qualified CI_UNAVAILABLE_EXTERNAL record")
     facts["checks"] = len(checks)
+    facts["formal_github_approval"] = bool(latest) and "APPROVED" in latest.values()
     if reasons:
         return "REFUSE", reasons + wait, facts
     if wait:
@@ -155,30 +182,69 @@ def merge_command(facts):
     return (f"gh pr merge {facts['pr']} --repo {facts['repo']} --merge --match-head-commit {facts['head']}")
 
 
-def main(argv=None):
+def evidence_line(head, reviewer, verdict="PASS", blocking=0):
+    if not re.fullmatch(r"[0-9a-f]{40}", head) or not re.fullmatch(r"[A-Za-z0-9._:-]{3,64}", reviewer):
+        raise ValueError("head must be a full 40-hex sha and reviewer a plain identifier")
+    if verdict not in ("PASS", "FAIL") or blocking < 0:
+        raise ValueError("verdict must be PASS or FAIL and blocking >= 0")
+    return f"OWNER-MERGE-REVIEW head={head} verdict={verdict} blocking={blocking} reviewer={reviewer}"
+
+
+def queue_report(run, repo, prs, owners, ci_unavailable=False):
+    """Text plan for the owner: gate verdict per PR, in the order given. Print-only."""
+    lines, first = [], True
+    for n in prs:
+        verdict, reasons, facts = evaluate(run, repo, n, owners, ci_unavailable)
+        lines.append(f"#{n} {verdict}" + (f"  {'; '.join(reasons)}" if reasons else ""))
+        if verdict == "PASS":
+            lines.append(("  run: " if first else "  after the previous merge, re-run check (this branch will then be behind): ")
+                         + merge_command(facts))
+            first = False
+    return "\n".join(lines)
+
+
+def main(argv=None, run=None):
+    run = run or gh
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("check", "verify"):
-        s = sub.add_parser(name)
-        s.add_argument("--repo", required=True)
-        s.add_argument("--pr", type=int, required=True)
+        sp = sub.add_parser(name)
+        sp.add_argument("--repo", required=True)
+        sp.add_argument("--pr", type=int, required=True)
     sub.choices["check"].add_argument("--owners", required=True)
     sub.choices["check"].add_argument("--ci-unavailable", action="store_true")
     sub.choices["verify"].add_argument("--head", required=True)
+    q = sub.add_parser("queue")
+    q.add_argument("--repo", required=True)
+    q.add_argument("--prs", required=True, help="comma-separated PR numbers, in the order to consider")
+    q.add_argument("--owners", required=True)
+    q.add_argument("--ci-unavailable", action="store_true")
+    e = sub.add_parser("evidence-line")
+    e.add_argument("--head", required=True)
+    e.add_argument("--reviewer", required=True)
+    e.add_argument("--verdict", default="PASS")
+    e.add_argument("--blocking", type=int, default=0)
     a = ap.parse_args(argv)
     try:
+        if a.cmd == "evidence-line":
+            print(evidence_line(a.head, a.reviewer, a.verdict, a.blocking))
+            return 0
+        if a.cmd == "queue":
+            owners = [o.strip() for o in a.owners.split(",") if o.strip()]
+            print(queue_report(run, a.repo, [int(x) for x in a.prs.split(",")], owners, a.ci_unavailable))
+            return 0
         if a.cmd == "check":
             owners = [o.strip() for o in a.owners.split(",") if o.strip()]
             if not owners or not all(OWNER_RE.match(o) for o in owners):
                 print(json.dumps({"verdict": "REFUSE", "reasons": ["BAD_OWNERS"]}))
                 return 1
-            verdict, reasons, facts = evaluate(gh, a.repo, a.pr, owners, a.ci_unavailable)
+            verdict, reasons, facts = evaluate(run, a.repo, a.pr, owners, a.ci_unavailable)
             out = {"verdict": verdict, "reasons": reasons, **facts}
             if verdict == "PASS":
                 out["merge_command"] = merge_command(facts)
             print(json.dumps(out, indent=1))
             return {"PASS": 0, "REFUSE": 1, "WAIT": 2}[verdict]
-        out = verify(gh, a.repo, a.pr, a.head)
+        out = verify(run, a.repo, a.pr, a.head)
         print(json.dumps(out, indent=1))
         return 0 if out["verdict"] == "VERIFIED" else 1
     except (RuntimeError, KeyError, ValueError) as e:
