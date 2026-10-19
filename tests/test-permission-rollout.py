@@ -16,12 +16,27 @@ spec = importlib.util.spec_from_file_location("rollout", ROOT / "scripts/permiss
 rollout = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rollout)
 
+PROXY_SCOPED_ASK = [
+    "Bash(rtk proxy gcloud:*)", "Bash(rtk proxy gsutil:*)", "Bash(rtk proxy bq:*)", "Bash(rtk proxy kubectl:*)",
+    "Bash(rtk proxy terraform:*)", "Bash(rtk proxy kill:*)", "Bash(rtk proxy pkill:*)", "Bash(rtk proxy killall:*)",
+    "Bash(rtk proxy sh:*)", "Bash(rtk proxy bash:*)", "Bash(rtk proxy zsh:*)", "Bash(rtk proxy eval:*)",
+    "Bash(rtk proxy env:*)", "Bash(rtk proxy xargs:*)", "Bash(rtk proxy sudo:*)",
+    "Bash(rtk proxy exec:*)", "Bash(rtk proxy command:*)", "Bash(rtk proxy /*)",
+    "Bash(rtk proxy git push:*)", "Bash(rtk proxy git reset:*)", "Bash(rtk proxy git clean:*)",
+    "Bash(rtk proxy git worktree:*)", "Bash(rtk proxy git * push*)", "Bash(rtk proxy git * reset*)",
+    "Bash(rtk proxy git * clean*)", "Bash(rtk proxy git * worktree*)",
+    "Bash(rtk proxy gh api -X DELETE*)", "Bash(rtk proxy gh api --method DELETE*)", "Bash(rtk proxy gh repo delete *)",
+    "Bash(rtk proxy gh api * -X DELETE*)", "Bash(rtk proxy gh api * --method DELETE*)",
+]
+
 BASE_ASK = [
+    "Bash(gh api -X DELETE*)", "Bash(rtk gh api -X DELETE*)",
+    "Bash(gh api --method DELETE*)", "Bash(rtk gh api --method DELETE*)",
     "Bash(terraform apply:*)", "Bash(rtk terraform apply:*)",
     "Bash(terraform destroy:*)", "Bash(rtk terraform destroy:*)",
     "Bash(terraform -* destroy*)", "Bash(rtk terraform -* destroy*)",
     "Bash(terraform -* apply*)", "Bash(rtk terraform -* apply*)",
-    "Bash(rtk proxy *)",
+    *PROXY_SCOPED_ASK,
     "Bash(gcloud secrets versions access *)", "Bash(rtk gcloud secrets versions access *)",
     "Bash(gcloud * secrets versions access*)", "Bash(rtk gcloud * secrets versions access*)",
     "mcp__neon__get_connection_string",
@@ -586,9 +601,36 @@ class MergedBaselineGate(Fixture):
 
 
 class StaticGate(Fixture):
+    def test_blanket_proxy_ask_arriving_as_a_deny_is_not_moved_back_into_ask(self):
+        merged = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [])
+        self.assertNotIn("Bash(rtk proxy *)", merged["permissions"]["ask"])
+        self.assertEqual([], merged["permissions"]["deny"])
+
+    def test_migration_retires_the_blanket_proxy_ask_and_keeps_the_scoped_asks(self):
+        live = copy.deepcopy(LIVE)
+        live["permissions"]["deny"] = []
+        live["permissions"]["ask"].append("Bash(rtk proxy *)")
+        merged = rollout.merge(live, copy.deepcopy(BASELINE), [])
+        ask = merged["permissions"]["ask"]
+        self.assertNotIn("Bash(rtk proxy *)", ask)
+        self.assertTrue(set(PROXY_SCOPED_ASK) <= set(ask))
+        self.assertEqual([], rollout.problems(merged))
+
+    def test_a_result_that_stops_asking_for_a_wrapped_force_push_is_flagged(self):
+        merged = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [])
+        merged["permissions"]["ask"].remove("Bash(rtk proxy git push:*)")
+        found = rollout.problems(merged)
+        self.assertTrue(any("wrapped protected command does not ask" in f and "git push --force" in f for f in found), found)
+
+    def test_a_result_that_reintroduces_the_blanket_proxy_ask_is_flagged_as_friction(self):
+        merged = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [])
+        merged["permissions"]["ask"].append("Bash(rtk proxy *)")
+        found = rollout.problems(merged)
+        self.assertTrue(any("routine wrapped command asks" in f and "rtk proxy cargo test" in f for f in found), found)
+
     def test_verify_with_a_baseline_flags_missing_ask_rules(self):
         merged = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [])
-        merged["permissions"]["ask"].remove("Bash(rtk proxy *)")
+        merged["permissions"]["ask"].remove("Bash(rtk proxy gcloud:*)")
         self.live_p.write_text(json.dumps(merged))
         rc, out = self.run_tool("verify", "--live", str(self.live_p), "--baseline", str(self.base_p))
         self.assertEqual(1, rc)

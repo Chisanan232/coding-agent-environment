@@ -56,7 +56,8 @@ MANDATORY_FORMER_DENY_ASK = {
     "Bash(rtk terraform -* destroy*)",
     "Bash(terraform -* apply*)",
     "Bash(rtk terraform -* apply*)",
-    "Bash(rtk proxy *)",
+    "Bash(rtk proxy terraform:*)",
+    "Bash(rtk proxy gcloud:*)",
     "Bash(gcloud secrets versions access *)",
     "Bash(rtk gcloud secrets versions access *)",
     "Bash(gcloud * secrets versions access*)",
@@ -634,6 +635,53 @@ class SPE105EffectiveBehavior(unittest.TestCase):
         text = SETTINGS_PATH.read_text()
         self.assertNotIn("bypassPermissions", text)
         self.assertEqual("auto", load_settings()["permissions"]["defaultMode"])
+
+    def test_gh_api_delete_with_the_method_flag_first_asks_in_every_spelling(self):
+        for cmd in ("gh api -X DELETE repos/o/r", "rtk gh api -X DELETE repos/o/r",
+                    "gh api --method DELETE repos/o/r", "rtk gh api --method DELETE repos/o/r"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual("ask", static_decision(cmd, self.perm))
+
+
+class SPE114RtkProxyScopedAsks(unittest.TestCase):
+    """`rtk proxy` is never rewritten, so only a rule naming the wrapper sees the wrapped command."""
+
+    def setUp(self):
+        self.perm = load_settings()["permissions"]
+
+    def test_wrapped_protected_operations_ask(self):
+        for cmd in (
+            "rtk proxy git push --force origin x", "rtk proxy git reset --hard HEAD~1", "rtk proxy git clean -fd",
+            "rtk proxy gcloud secrets versions access latest --secret=s",
+            "rtk proxy gcloud projects add-iam-policy-binding p --member=user:a@b.c --role=roles/viewer",
+            "rtk proxy terraform destroy", "rtk proxy kill -9 1", "rtk proxy sh -c 'git push --force'",
+            "rtk proxy env gcloud config list", "rtk proxy gh api repos/o/r -X DELETE", "rtk proxy gh repo delete o/r --yes",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual("ask", static_decision(cmd, self.perm))
+
+    def test_routine_wrapped_development_does_not_ask(self):
+        for cmd in (
+            "rtk proxy cargo test", "CARGO_TARGET_DIR=/x rtk proxy cargo test 2>&1", "rtk proxy grep -rn fn src",
+            "rtk proxy git log --oneline -3", "rtk proxy git diff HEAD~1", "rtk proxy pnpm run lint",
+            "rtk proxy uv run pytest -q", "rtk proxy gh api repos/o/r/branches/main/protection",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertNotEqual("ask", static_decision(cmd, self.perm))
+
+    def test_wrapped_absolute_path_exec_and_command_forms_ask(self):
+        for cmd in ("rtk proxy /usr/bin/gcloud auth list", "rtk proxy exec gcloud x", "rtk proxy command gcloud x"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual("ask", static_decision(cmd, self.perm))
+
+    def test_wrapped_protected_git_after_global_options_asks(self):
+        for cmd in (
+            "rtk proxy git -C /peer push --force origin x", "rtk proxy git -c a=b reset --hard HEAD~1",
+            "rtk proxy git --git-dir=x clean -fd", "rtk proxy git -C /peer worktree remove --force /w",
+            "rtk proxy gh api -X DELETE repos/o/r", "rtk proxy gh api --method DELETE repos/o/r",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual("ask", static_decision(cmd, self.perm))
 
 
 class SecretMetadataOverlayTemplate(unittest.TestCase):
