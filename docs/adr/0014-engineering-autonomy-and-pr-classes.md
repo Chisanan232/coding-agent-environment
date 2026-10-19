@@ -69,6 +69,42 @@ class, and how personal and corporate machines treat outbound data.
 | 1 | 2026-10-18 | ADR 0012 natural-language rule set (superseded as the direction; file kept) |
 | 2 | 2026-10-19 | ADR 0013 read-only owner merge gate (SPE-115) |
 | 3 | 2026-10-19 | This ADR: PR classes, workstation profiles, minimal candidates (SPE-116) |
+| 4 | 2026-10-19 | Consistency review against the owner's requirements; hook adapter, rollout tool, enforcement status (SPE-116) |
 
 The repository has no release version; revisions are tracked by ADR number and date. No
 release or tag is created by this change.
+
+## Revision 4: consistency review against the approved requirements
+
+The implementation was compared with the owner's written requirements, not with its own tests.
+
+**A. `gh pr merge --admin` ask: kept, and it does not block Class A.** The approved Class A path is a regular merge commit
+pinned with `--match-head-commit`; the gate never prints `--admin` and these repositories have no branch protection, so the
+approved workflow never needs it. The ask fires only on the exception path (same-identity review deadlock, unavailable CI) that
+the owner-only policy restricts to real bypass authority, which is a material authority boundary a permission rule cannot
+evaluate. Measured fact: the owner's live settings already allow `gh pr merge:*` and have no `--admin` ask, so today an admin merge
+is ungated at the permission layer; the candidate adds the ask. No `allow` rule for admin merges is added, and the lint rejects one.
+
+**B. Raw credentials: the implementation is stricter than the approved policy.** Approved: per-operation ASK for personal sensitive
+outbound, ordinary authentication stays usable. Implemented: raw credentials are denied on every profile, derived from CLAUDE.md
+item 21 (an agent never reads or exposes a secret value), without the owner having chosen that for the personal profile. Proposed
+reconciliation: personal ASKs with the full packet (an approval covers one stdin-to-consumer transfer and never puts the value in
+context), corporate stays DENY, `auth_handshake` to approved hosts stays ALLOW. The change was denied by the host's Auto Mode
+classifier (`[Security Weaken]`) and is not applied; the owner decides.
+
+**C. Ordinary configuration maintenance: the implementation is stricter than the approved policy.** A hardening round protected the
+whole `~/.claude/` tree and project agents, skills, commands, rules and CLAUDE.md. Approved: those stay autonomous; only
+permissions, security hooks, sandbox and trust boundaries need approval. Proposed reconciliation is in
+`docs/ENGINEERING-POLICY.md` section 5. The measured permission layer is already consistent with it (the candidate asks cover
+settings, hooks, bin and `.mcp.json` only). The oracle and hook adapter are the stricter parts, are not deployed, and carry the
+same pending host denial.
+
+**D. Enforcement.** See `docs/ENGINEERING-POLICY.md` section 3 for the exact table. Summary: built-in classifier rules and the
+static ask rules are enforceable today; the gate is deterministic but voluntary; the workstation oracle is a design and test aid;
+the hook adapter covers a defined subset and is not installed; corporate DENY is not enforced without the organization's managed
+settings and sandbox network limits.
+
+**Deployment path.** `permission-rollout.py apply` writes the repository baseline's `autoMode` text, which is the retired rule set,
+and its pinned hashes predate the owner's reset. The candidate is rolled out only with `scripts/candidate-rollout.py`
+(`docs/ROLLOUT-PERSONAL-MAC.md`), which merges just `autoMode`, the ask union and one optional hook entry. PR #93 shares no files with
+this change and can merge independently; its asks reach a machine through `--baseline`, not through its own apply path.
