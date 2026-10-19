@@ -121,6 +121,8 @@ def _co_regex(pat):
     body = pat.strip("/")
     out, i = "", 0
     last = body.rsplit("/", 1)[-1]
+    if "*" in last and last not in ("*", "**") and not re.fullmatch(r"\*\.[A-Za-z0-9_.-]+", last):
+        return None  # e.g. /docs*: the exact CODEOWNERS semantics are unclear, so fail closed
     while i < len(body):
         if body.startswith("**/", i):
             out, i = out + "(?:.*/)?", i + 3
