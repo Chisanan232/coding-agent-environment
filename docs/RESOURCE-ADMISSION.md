@@ -19,6 +19,9 @@ subagent fan-out. Run `scripts/memory-admission.py check --weight heavy` first; 
 | Load per core | `getloadavg` / CPU count | Scheduler saturation that RAM numbers do not show |
 | Reservations and ownership | the existing `disk-admission.py` gate (reserve, lane cap, process identity) | Task ownership already lives there; it is not duplicated |
 
+The script runs from the coding-agent-environment checkout; it is not installed into `~/.claude` (installing it next to
+`disk-admission.py` is a separate owner decision). Commands are called by absolute path (`/usr/sbin/sysctl`, `/bin/ps`, `/usr/bin/vm_stat`).
+
 `check` asks the disk gate too and admits only when **both** admit. Neither gate relies on the other.
 
 ## 2. Why "swap used" is not a gate
@@ -49,9 +52,11 @@ All values are constants at the top of `scripts/memory-admission.py`. They are c
 
 Hysteresis: a heavy refusal latches. It clears only after **3 consecutive checks, at least 30 s apart**, that all satisfy the
 stricter exit column. A bad check resets the count; checks closer than 30 s do not count. Heavy state lives in
-`~/.cache/coding-agent-environment/memory-admission/state.json` (0600, atomic replace). Missing data, an unreadable counter, or a
-corrupt state file fails closed for heavy work and is reported; light work is refused only on measured critical conditions and
-is otherwise admitted with a warning. `status` is read-only: it never refuses, never writes state and never asks the disk gate.
+`~/.cache/coding-agent-environment/memory-admission/state.json` (0600, atomic replace). For heavy work these fail closed and are reported: an unreadable pressure level (or one outside 1, 2, 4), swap I/O, compressor size,
+load, process list, swap usage or free disk, a corrupt, oversized, non-regular or symlinked state file, an unwritable state file (a refusal
+that cannot be remembered is not allowed to become an admission), and a lock held by another check for more than 10 s. Light work is refused
+only on measured critical conditions and is otherwise admitted with a warning. Rates use the monotonic clock, so a wall-clock step during the
+window cannot dilute them; a state whose recovery time is in the future restarts its count. `status` is read-only: it never refuses, never writes state and never asks the disk gate.
 
 Exit code 0 admits and 77 refuses, like `disk-admission.py`. Typical use:
 

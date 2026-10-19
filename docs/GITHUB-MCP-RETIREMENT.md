@@ -35,8 +35,8 @@ Refresh the redacted live snapshot so `sync-check.sh` does not report drift: cop
 `.claude/mcp-servers.runtime.json` over `~/.claude/mcp-servers.runtime.json` after reviewing `diff` (the only change is the removed
 `github` entry). The repository snapshot already omits it.
 
-Rollback: restore the backed-up `~/.claude.json` (or re-add the server with `claude mcp add` from your own notes; the repository does
-not hold the URL's credentials).
+Rollback: re-add the server with `claude mcp add` using your own notes (the repository does not hold its credentials). Restoring the
+whole backed-up `~/.claude.json` is a last resort: it also reverts unrelated state Claude Code wrote since the backup (history, project data).
 
 ## What this change does not do
 

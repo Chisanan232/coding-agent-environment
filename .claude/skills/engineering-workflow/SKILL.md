@@ -234,7 +234,8 @@ one prompt, is the unit of completion: `TASK_DONE` is not `CAMPAIGN_DONE`,
 
 Before heavy work (workspace or full builds, Cargo workspace builds, Docker suites, native QA, full E2E, large
 parallel fan-out) assess the host; disk admission alone is not enough. Run
-`scripts/memory-admission.py check --weight heavy`, then reserve through `scripts/disk-admission.py run`. The
+`scripts/memory-admission.py check --weight heavy` from the coding-agent-environment checkout (it is not installed into
+`~/.claude`), then reserve through `scripts/disk-admission.py run`. The
 memory check reads the kernel pressure level and trend, swap I/O over a measured window, the compressor's share of
 RAM, load per core and other running heavy processes (free disk only to judge whether swap can grow), composes the
 existing SPE-109 disk gate with its reservations and lane caps, and keeps heavy work refused until consecutive good

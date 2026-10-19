@@ -20,7 +20,8 @@ Not changed: `settings.json`, `settings.local.json`, hooks, `autoMode`, permissi
 
 1. Back up and record hashes (mode 0600): `cp -p ~/.claude/CLAUDE.md ~/.claude/backups/CLAUDE.md.$(date +%Y%m%d-%H%M%S)` and
    `shasum -a 256 ~/.claude/CLAUDE.md`.
-2. From a clean checkout of `main`: `scripts/profile-install.sh --claude-skills --dry-run`, then `--check`. Expect drift only in the
+2. From a clean checkout of `main`, run `scripts/profile-install.sh --claude-skills --dry-run` and, as a separate command,
+   `scripts/profile-install.sh --claude-skills --check` (`--dry-run` and `--check` cannot be combined, and `--check` needs `--claude-skills`). Expect drift only in the
    rows above. **Stop and review** if it lists any other skill or file; the installer overwrites every shared skill file.
 3. Apply: `scripts/profile-install.sh --claude-skills` (it saves its own backup under `~/.claude/backups/coding-agent-environment/`).
 4. Edit one sentence in the original region of `~/.claude/CLAUDE.md` (the installer does not touch it). Under "MCP-Backed Systems":

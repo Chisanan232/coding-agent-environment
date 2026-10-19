@@ -224,7 +224,8 @@ read existing merge-specific wording through the canonical contract above.
 
 ## Resource Admission and GitHub Operations
 
-Before heavy work run `scripts/memory-admission.py check --weight heavy` (it also asks the SPE-109 disk gate); one heavy
+Before heavy work run `scripts/memory-admission.py check --weight heavy` from the coding-agent-environment checkout (it also asks the
+SPE-109 disk gate; it is not installed into `~/.claude`); one heavy
 lane at a time, never kill or delete another session's work, and treat a swap-used number as history, not current
 exhaustion. After a reboot treat earlier processes, locks, reservations and jobs as stale and reconcile before resuming.
 Use `gh` for GitHub; it never bypasses host authorization, PR classes, CI, reviews or the merge gate. Details:
