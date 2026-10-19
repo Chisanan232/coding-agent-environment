@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "kind": "corporate",
+  "host_fingerprint_sha256": "<output of: workstation-policy.py fingerprint>",
+  "approved_destinations": [
+    "<approved internal git host>",
+    "<approved internal package registry>",
+    "<approved company LLM proxy host>"
+  ],
+  "auth_hosts": [
+    "<approved corporate identity provider host>"
+  ],
+  "notes": "Template. The approved list is the formally approved corporate trust boundary only. Keep the filled file private; never publish corporate hostnames."
+}
