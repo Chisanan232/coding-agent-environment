@@ -27,7 +27,7 @@ to act on. Conversely, host authorization never excuses a REFUSE.
    pinned command `gh pr merge N --repo R --merge --match-head-commit <sha>`. It never
    merges, approves, comments, posts a status, edits a branch or enables auto-merge; a
    write verb, `-X`, `--input`, a field override or a GraphQL mutation raises before `gh`
-   starts. The merge is a separate, visible command judged by the repository and the host.
+   starts. The wrapper is an exact allowlist: only `repo view`, `pr view`, `api user`, a `repos/` or `orgs/` read and one GraphQL query are accepted, and the only flags are `--json`, `--jq` and `--repo` (plus query variables for that GraphQL read). Attached short flags (`-XPOST`), headers, `--hostname`, `--input` and `--paginate` are refused. The merge is a separate, visible command judged by the repository and the host.
 2. **Review evidence is head-pinned.** An independent technical review is recorded as one
    PR comment by the authenticated user: `OWNER-MERGE-REVIEW head=<sha> verdict=PASS
    blocking=0 reviewer=<id>`. A push changes the head and invalidates it
@@ -44,6 +44,30 @@ to act on. Conversely, host authorization never excuses a REFUSE.
 5. **Sequencing without a lock manager.** A PR must not be behind its base
    (`STALE_BRANCH`). After one lockfile PR merges, the next is stale or conflicting until it
    is updated and re-reviewed at its new head.
+
+## Limits of the evidence the gate can see
+
+- **CI means every reported check passed, not that the required set passed.** Personal repositories
+  have no branch protection, so GitHub does not tell the gate which checks are required. A
+  repository whose workflow never triggered (path filters, a disabled workflow) can show one
+  trivial passing check. The gate requires at least one SUCCESS and treats all-skipped or neutral
+  as no evidence, but cannot prove completeness. Treat CI coverage as a repository property.
+- **The CI-unavailable exception applies only when GitHub reports no checks at all.** When
+  billing or quota blocks Actions, runs are often reported as failed or cancelled; the gate keeps
+  refusing that as `CI_FAILED`, and queued-forever checks stay WAIT. The owner decides those
+  cases. The record's `cause=` is self-attested text and is not verified.
+- **Trust anchor.** `--owners` is policy input, but a repository counts only if its owner is the
+  authenticated account or an organization that account administers (membership role admin and
+  active) and the viewer has ADMIN on the repository. An invented owner string does not widen it.
+- **Review records are self-attested.** The same authenticated identity writes the record, so
+  independence rests on the reviewer id and the engineering-workflow rules. A marker inside a
+  code fence is ignored. With 100 or more comments or reviews the gate refuses
+  (`EVIDENCE_TRUNCATED`) because later records could be hidden.
+- **Deployment.** The gate cannot detect a repository whose default branch deploys on merge
+  (for example a hosting integration on `main`); it guards base-branch names only. A merge that
+  triggers a deployment needs its own authorization.
+- **Exit codes:** PASS 0, REFUSE 1, WAIT 2, ERROR 3 (a retry loop must not treat ERROR as WAIT).
+  `formal_github_approval` is true only for an APPROVED review on the current head.
 
 ## What the host documents (read 2026-10-19, code.claude.com auto-mode-config)
 

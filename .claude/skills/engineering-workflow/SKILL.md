@@ -140,7 +140,7 @@ quality, conflict, or substantive review failure. Exactly two narrow exceptions
 are authorized below; neither grants blanket administrator authority.
 Only the main coordinator may trigger the merge; an independent reviewer reports
 findings and evidence back to that coordinator.
-Verify a merge with `scripts/owner-merge-gate.py` (read-only PASS/REFUSE/WAIT at the
+Check a merge before and after with `scripts/owner-merge-gate.py` (read-only PASS/REFUSE/WAIT at the
 exact head; see `docs/OWNER-MERGE-WORKFLOW.md`). Its PASS is evidence, not a GitHub
 approval and not host authorization; a host denial of the merge stands and is reported.
 

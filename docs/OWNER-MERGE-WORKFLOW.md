@@ -22,6 +22,7 @@ protection, host authorization, gate verdict).
 
    - `PASS` (exit 0) prints the pinned merge command.
    - `WAIT` (exit 2): CI pending or mergeability unknown. Run it again.
+   - `ERROR` (exit 3): `gh` or the network failed. Fix that first; do not loop.
    - `REFUSE` (exit 1): read the reason codes and fix the cause; never reclassify a failure.
 
 3. Run the printed command. The host decides whether the agent may run it:
@@ -57,5 +58,6 @@ and pass `--ci-unavailable`. Any genuinely failing check still refuses.
 
 ## What this does not do
 
-It does not approve a PR, satisfy a required formal review, change branch protection, merge
-into a release or deployment branch, or authorize deployment or publication.
+`PASS` means every check GitHub reported on that head passed (at least one succeeded); it cannot know
+which checks a repository should have. It does not approve a PR, satisfy a required formal review, change branch protection, merge
+into a release or deployment branch, or authorize deployment or publication (it cannot see whether merging to the default branch deploys).
