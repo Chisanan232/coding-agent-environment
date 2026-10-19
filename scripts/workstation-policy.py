@@ -188,16 +188,18 @@ def ask_packet(action, dest, classes):
 
 
 # The host's rtk PreToolUse hook rewrites `git ...` to `rtk git ...` before rules match, so every Bash ask needs both forms.
+# `git push * :**` (not `:*`): a pattern ending in `:*` is read as the legacy prefix suffix and never matched a colon refspec (measured on the host).
 ASK_BASH_RULES = [
     "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git push --force-with-lease:*)", "Bash(git push * --force*)",
     "Bash(git push * -f)", "Bash(git push * -f *)", "Bash(git push * +*)", "Bash(git push origin --delete:*)",
-    "Bash(git push * --delete*)", "Bash(gh api *pulls/*/merge*)", "Bash(gh release create:*)", "Bash(gh release upload:*)",
+    "Bash(git push * --delete*)", "Bash(git push --delete*)", "Bash(git push -d *)", "Bash(git push * -d *)", "Bash(git push * -d)",
+    "Bash(git push :**)", "Bash(git push * :**)", "Bash(gh api *pulls/*/merge*)", "Bash(gh release create:*)", "Bash(gh release upload:*)",
     "Bash(gh pr merge * --admin*)", "Bash(gh pr merge --admin*)",
     "Bash(gh repo delete:*)", "Bash(gh api * -X DELETE*)", "Bash(gh api * --method DELETE*)", "Bash(gh api -X DELETE*)",
     "Bash(gh api --method DELETE*)",
     "Bash(gh api *DELETE*)", "Bash(gh api *delete*)", "Bash(gh api *Delete*)",  # also -XDELETE, --method=DELETE, -X=DELETE
     "Bash(npm publish:*)", "Bash(pnpm publish:*)", "Bash(yarn npm publish:*)", "Bash(cargo publish:*)", "Bash(twine upload:*)",
-    "Bash(uv publish:*)", "Bash(docker push:*)",
+    "Bash(yarn publish:*)", "Bash(python3 -m twine upload:*)", "Bash(python -m twine upload:*)", "Bash(uv publish:*)", "Bash(docker push:*)",
 ]
 ASK_PATH_RULES = [f"{tool}({path})" for tool in ("Edit", "Write") for path in (
     "~/.claude/settings.json", "~/.claude/settings.local.json", "~/.claude/hooks/**", "~/.claude/bin/**", "~/.claude.json",

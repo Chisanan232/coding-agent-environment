@@ -227,6 +227,22 @@ class Candidates(unittest.TestCase):
         env = " ".join(wsp.candidate("personal")["autoMode"]["environment"])
         self.assertIn("never pre-authorized", env)
 
+    def test_remote_branch_delete_and_extra_publish_spellings_ask(self):
+        # Measured on a live host (SPE-116 audit): these ran with no prompt before the patterns existed.
+        import fnmatch
+        asks = [r[len("Bash("):-1] for r in wsp.candidate("personal")["permissions"]["ask"] if r.startswith("Bash(") and not r.startswith("Bash(rtk ")]
+
+        def hit(cmd):
+            return any(fnmatch.fnmatchcase(cmd, a.replace(":*", " *") if a.endswith(":*") else a) or (a.endswith(":*") and cmd == a[:-2]) for a in asks)
+        for cmd in ("git push --delete origin x", "git push -d origin x", "git push origin -d x", "git push origin :x", "git push :x",
+                    "git push origin :refs/heads/x", "yarn publish --dry-run", "python3 -m twine upload dist/*", "python -m twine upload dist/*"):
+            self.assertTrue(hit(cmd), cmd)
+        # routine pushes and local branch deletion must stay unprompted
+        for cmd in ("git push origin feature/x", "git push -u origin feature/x", "git push origin HEAD:refs/heads/feature/x",
+                    "git push origin main", "git push origin main:main", "git push origin src:dst", "git push --follow-tags origin main",
+                    "git branch -d old", "git status"):
+            self.assertFalse(hit(cmd), cmd)
+
     def test_gh_api_delete_asks_match_attached_equals_and_case_variants(self):
         import fnmatch
         asks = [r[len("Bash("):-1] for r in wsp.candidate("personal")["permissions"]["ask"] if r.startswith("Bash(gh api")]
