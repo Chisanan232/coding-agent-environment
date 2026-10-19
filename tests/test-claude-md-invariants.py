@@ -78,7 +78,7 @@ MANIFEST = [
     ("model-main", CLAUDE, "Main model: Sonnet, effort medium, permission mode Auto.", None),
     ("model-opus-architect", CLAUDE, "delegate first to the `opus-architect` subagent", None),
     ("mcp-prefer-capability", CLAUDE, "prefer it over manual", None),
-    ("mcp-active-servers", CLAUDE, "`fetch` and `github` are active by default", None),
+    ("mcp-active-servers", CLAUDE, "`fetch` is active by default", None),
     ("layering-project-wins", CLAUDE, "Project values take precedence when both define the same concept.", None),
     ("layering-global-applies", CLAUDE, "These global behavioral rules apply unless the project file explicitly overrides them.", None),
     # Moved verbatim out of CLAUDE.md; CLAUDE.md names the owning reference.

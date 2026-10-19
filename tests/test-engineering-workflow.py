@@ -182,23 +182,44 @@ class EngineeringWorkflowContract(unittest.TestCase):
         self.assertTrue(any(c["verdict"] == "IN_PROGRESS" and c["gates"]["engineering"] for c in cases),
                         "a merged PR alone must not be READY_FOR_RELEASE")
 
-    def test_github_tool_selection_prefers_gh_and_keeps_host_denials_binding(self) -> None:
+    def test_github_tool_selection_is_gh_first_with_mcp_retired_and_keeps_host_denials_binding(self) -> None:
         flat = " ".join(WORKFLOW.read_text().split("## GitHub tool selection", 1)[1]
                         .split("Name a ticket branch", 1)[0].split())
         for phrase in [
-            "Prefer the authenticated `gh` CLI",
-            "GitHub MCP is optional",
-            "unavailable, errors, times out, returns an integration-permission error",
-            "use `gh` for the same operation without asking",
-            "a repository-protection, ruleset or required-review refusal from GitHub itself is a gate, not an integration error",
-            "A host permission or classifier denial of a GitHub action through either interface is binding (`HARNESS_PERMISSION_BLOCK`)",
-            "never retry it through the other interface",
+            "Use the authenticated `gh` CLI as the GitHub interface",
+            "The GitHub MCP server is retired on this workstation",
+            "do not reconnect, rebuild or repair it",
+            "do not call `mcp__github__*` tools",
+            "Using `gh` first is not permission to bypass host authorization, the PR class A/B/C rules, required checks, reviews or the independent merge gate",
+            "A repository-protection, ruleset or required-review refusal from GitHub itself is a gate, not an integration error",
+            "A host permission or classifier denial of a GitHub action is binding (`HARNESS_PERMISSION_BLOCK`)",
+            "never retry it through another interface",
             "Never approve a PR with the account that authored it",
         ]:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, flat)
-        # A refusal is not an MCP-availability failure: no fallback may be keyed to it.
+        # No fallback to the retired MCP, and no fallback keyed to a refusal.
+        self.assertNotIn("GitHub MCP is optional", flat)
+        self.assertNotIn("without asking", flat)
         self.assertNotIn("refuses", flat)
+
+    def test_resource_admission_and_post_reboot_rules_are_present_and_never_license_deletion(self) -> None:
+        text = WORKFLOW.read_text()
+        flat = " ".join(text.split("## Resource admission and concurrency", 1)[1].split("## Secret-safe testing", 1)[0].split())
+        for phrase in [
+            "disk admission alone is not enough",
+            "`scripts/memory-admission.py check --weight heavy`",
+            "A single swap-used figure is history, not proof of current exhaustion",
+            "do not change the disk gate's thresholds",
+            "Run one admitted heavy lane at a time",
+            "Never kill another active session or delete its worktree, runtime, cache, container, reservation or scratch",
+            "Age alone never justifies deletion",
+            "never delete unknown or active work to reach an admission threshold",
+            "treat every earlier process, lock, reservation, background-task and job observation as stale",
+            "do not assume it survived or completed, and do not rerun finished work",
+        ]:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, flat)
 
     def test_secret_safe_testing_rule_forbids_inspection_and_requires_disclosure(self) -> None:
         flat = " ".join(WORKFLOW.read_text().split("## Secret-safe testing", 1)[1]
