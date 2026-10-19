@@ -12,7 +12,7 @@ separate, visible `gh pr merge` that the host classifier and the repository judg
 `verify` is the read-only post-merge check (merge commit exists, has the reviewed head as a parent
 and is on the base branch).
 
-Review evidence is a PR comment written by the authenticated user, one line:
+Review evidence (self-attested by the authenticated identity) is a PR comment written by the authenticated user, one line:
   OWNER-MERGE-REVIEW head=<40-hex> verdict=PASS blocking=0 reviewer=<independent reviewer id>
 It pins the reviewed head, so any later push invalidates it. It records an independent review; it is
 never a GitHub approval and the gate never presents it as one. External-CI-unavailable exception:
@@ -27,8 +27,8 @@ import sys
 
 REVIEW_RE = re.compile(r"^OWNER-MERGE-REVIEW head=([0-9a-f]{40}) verdict=(\w+) blocking=(\d+) reviewer=(\S+)\s*$", re.M)
 CI_RE = re.compile(r"^OWNER-MERGE-CI-UNAVAILABLE head=([0-9a-f]{40}) cause=(billing|quota|outage) local_equivalent=(\w+)\s*$", re.M)
-OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
-REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$")
+OWNER_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}")
 FAIL = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR", "STALE"}
 OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 DEPLOY_BASES = re.compile(r"(^|/)(prod|production|release|releases|gh-pages|deploy)([-/].*)?$", re.I)
@@ -40,19 +40,39 @@ THREADS = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pu
            "{reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved isOutdated}}}}}")
 
 
+SAFE_FLAGS = {"--json", "--jq", "--repo"}
+GRAPHQL_VARS = {"query", "o", "r", "n"}
+
+
 def read_only(args):
-    """Fail closed: the gate may only read. Anything else raises before gh is started."""
-    verb = tuple(map(str, args[:2]))
-    allowed = (verb in (("repo", "view"), ("pr", "view"), ("api", "user"), ("api", "graphql"))
-               or (verb[0] == "api" and verb[1].startswith("repos/")))
-    if not allowed:
+    """Fail closed: the gate may only read. Anything else raises before gh is started.
+
+    An exact allowlist, not a blacklist: besides the verb, the only flags are --json/--jq/--repo
+    (plus -f/-F query variables for one GraphQL read). Attached short forms (-XPOST), headers,
+    --hostname, --input, --paginate and every other flag are refused.
+    """
+    args = [str(x) for x in args]
+    verb = tuple(args[:2])
+    ok_api = verb[0] == "api" and len(args) > 1 and (verb[1] in ("user", "graphql") or re.fullmatch(r"(repos|orgs)/[A-Za-z0-9._/-]+", verb[1]))
+    if verb not in (("repo", "view"), ("pr", "view")) and not ok_api:
         raise RuntimeError(f"refused non-read-only gh call: {' '.join(verb)}")
-    flat = " ".join(map(str, args))
-    if "mutation" in flat.lower():
+    if "mutation" in " ".join(args).lower():
         raise RuntimeError("refused gh call containing a mutation")
-    # A GraphQL read needs -f/-F variables; any other call must not carry a method, body or field.
-    if verb != ("api", "graphql") and re.search(r"(^|\s)(-X|--method|--input|-f|-F|--field|--raw-field)(\s|=)", flat):
-        raise RuntimeError("refused gh call with a method, input or field override")
+    i = 2
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("-"):
+            if verb == ("api", "graphql") and arg in ("-f", "-F") and i + 1 < len(args):
+                key, _, val = args[i + 1].partition("=")
+                if key not in GRAPHQL_VARS or (key == "query" and not val.lstrip().startswith("query")):
+                    raise RuntimeError("refused graphql variable")
+                i += 2
+                continue
+            if arg not in SAFE_FLAGS:
+                raise RuntimeError(f"refused gh flag {arg.split('=')[0]}")
+            i += 2 if i + 1 < len(args) else 1
+            continue
+        i += 1
 
 
 def gh(*args):
@@ -71,19 +91,25 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False):
     """Return (verdict, reasons, facts). `run` executes gh and returns stdout (injected in tests)."""
     reasons, wait = [], []
     owner = repo.split("/")[0].lower()
-    if not REPO_RE.match(repo) or owner not in {o.lower() for o in owners}:
+    if not REPO_RE.fullmatch(repo) or owner not in {o.lower() for o in owners}:
         return "REFUSE", [f"UNAUTHORIZED_REPO: {repo} is not owned by a trusted owner"], {}
     meta = _json(run, "repo", "view", repo, "--json", "nameWithOwner,defaultBranchRef,isFork,viewerPermission,owner")
     if meta["nameWithOwner"].lower() != repo.lower() or meta["owner"]["login"].lower() not in {o.lower() for o in owners}:
         reasons.append("NOT_CANONICAL_REPO: repository identity does not match the target")
     if meta.get("isFork"):
         reasons.append("FORK_REPO: target is a fork, not the canonical repository")
-    if meta.get("viewerPermission") not in ("ADMIN", "MAINTAIN", "WRITE"):
-        reasons.append(f"NO_WRITE_ACCESS: viewer permission {meta.get('viewerPermission')}")
     me = run("api", "user", "--jq", ".login").strip()
+    if owner != me.lower():  # an org is trusted only if the authenticated user administers it
+        role = run("api", f"orgs/{owner}/memberships/{me}", "--jq", ".role + \" \" + .state").strip()
+        if role != "admin active":
+            reasons.append(f"OWNER_NOT_ADMINISTERED_BY_VIEWER: {owner!r} is neither the authenticated account nor an org it administers")
+    if meta.get("viewerPermission") != "ADMIN":
+        reasons.append(f"NOT_REPO_ADMIN: viewer permission {meta.get('viewerPermission')}")
     p = _json(run, "pr", "view", str(pr), "--repo", repo, "--json", PR_FIELDS)
     head, base = p["headRefOid"], p["baseRefName"]
     facts = {"repo": repo, "pr": pr, "head": head, "base": base, "viewer": me}
+    if len(p["comments"]) >= 100 or len(p["reviews"]) >= 100:
+        reasons.append("EVIDENCE_TRUNCATED: 100 or more comments or reviews; later records may be hidden")
     if p["state"] != "OPEN":
         reasons.append(f"NOT_OPEN: state {p['state']}")
     if p["isDraft"]:
@@ -113,7 +139,8 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False):
     latest = {}
     for r in p["reviews"]:
         if r["state"] in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
-            latest[r["author"]["login"]] = r["state"]
+            at = (r.get("commit") or {}).get("oid")
+            latest[r["author"]["login"]] = r["state"] + ("" if at in (None, head) or r["state"] != "APPROVED" else "@stale")
     if "CHANGES_REQUESTED" in latest.values():
         reasons.append("CHANGES_REQUESTED: an outstanding REQUEST_CHANGES review")
     o, r_ = repo.split("/")
@@ -124,7 +151,8 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False):
     unresolved = [t for t in rt["nodes"] if not t["isResolved"]]
     if unresolved:
         reasons.append(f"UNRESOLVED_REVIEW_THREADS: {len(unresolved)}")
-    texts = [c["body"] for c in p["comments"] if c["author"]["login"].lower() == me.lower()]
+    texts = [re.sub(r"```.*?```", "", (c["body"] or ""), flags=re.S) for c in p["comments"]
+             if (c.get("author") or {}).get("login", "").lower() == me.lower()]
     found = [m for t in texts for m in REVIEW_RE.findall(t)]
     at_head = [m for m in found if m[0] == head]
     if not found:
@@ -133,10 +161,10 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False):
         reasons.append("REVIEW_STALE: the recorded review is for a different head; the PR changed after review")
     else:
         bad = [m for m in at_head if m[1] != "PASS" or m[2] != "0"]
-        if bad or any(m[1] == "FAIL" or m[2] != "0" for m in found if m[0] == head):
+        if bad:
             reasons.append("REVIEW_NOT_CLEAN: recorded review has blocking findings or a non-PASS verdict")
         facts["reviewer"] = at_head[-1][3]
-        facts["review_kind"] = "independent technical review record (not a GitHub approval)"
+        facts["review_kind"] = "recorded technical review, self-attested by the authenticated identity (not a GitHub approval)"
         if at_head[-1][3].lower() in (me.lower(), "self", "author", "coordinator"):
             reasons.append("REVIEW_NOT_INDEPENDENT: reviewer id is the author or coordinator")
     checks = p["statusCheckRollup"] or []
@@ -148,14 +176,15 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False):
         reasons.append(f"CI_FAILED: {sorted(set(failed))[:5]}")
     elif pending:
         wait.append(f"CI_PENDING: {sorted(set(pending))[:5]}")
-    elif not checks or not all((c.get("conclusion") or c.get("state") or "").upper() in OK for c in checks):
+    elif not checks or not all((c.get("conclusion") or c.get("state") or "").upper() in OK for c in checks) \
+            or not any((c.get("conclusion") or c.get("state") or "").upper() == "SUCCESS" for c in checks):
         ci = [m for t in texts for m in CI_RE.findall(t) if m[0] == head and m[2] == "PASS"]
         if ci_unavailable and ci and not checks:
             facts["ci_exception"] = ci[-1][1]
         else:
             reasons.append("NO_CI_EVIDENCE: no completed checks on this head and no qualified CI_UNAVAILABLE_EXTERNAL record")
     facts["checks"] = len(checks)
-    facts["formal_github_approval"] = bool(latest) and "APPROVED" in latest.values()
+    facts["formal_github_approval"] = "APPROVED" in latest.values()
     if reasons:
         return "REFUSE", reasons + wait, facts
     if wait:
@@ -164,6 +193,8 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False):
 
 
 def verify(run, repo, pr, head):
+    if not REPO_RE.fullmatch(repo) or not re.fullmatch(r"[0-9a-f]{40}", head):
+        return {"verdict": "ERROR", "reasons": ["BAD_REPO_OR_HEAD"]}
     p = _json(run, "pr", "view", str(pr), "--repo", repo, "--json", "state,mergeCommit,baseRefName")
     out, ok = {"repo": repo, "pr": pr, "reviewed_head": head}, True
     if p["state"] != "MERGED" or not p.get("mergeCommit"):
@@ -194,7 +225,11 @@ def queue_report(run, repo, prs, owners, ci_unavailable=False):
     """Text plan for the owner: gate verdict per PR, in the order given. Print-only."""
     lines, first = [], True
     for n in prs:
-        verdict, reasons, facts = evaluate(run, repo, n, owners, ci_unavailable)
+        try:
+            verdict, reasons, facts = evaluate(run, repo, n, owners, ci_unavailable)
+        except Exception as e:
+            lines.append(f"#{n} ERROR  {type(e).__name__}: {str(e)[:200]}")
+            continue
         lines.append(f"#{n} {verdict}" + (f"  {'; '.join(reasons)}" if reasons else ""))
         if verdict == "PASS":
             lines.append(("  run: " if first else "  after the previous merge, re-run check (this branch will then be behind): ")
@@ -231,11 +266,15 @@ def main(argv=None, run=None):
             return 0
         if a.cmd == "queue":
             owners = [o.strip() for o in a.owners.split(",") if o.strip()]
-            print(queue_report(run, a.repo, [int(x) for x in a.prs.split(",")], owners, a.ci_unavailable))
-            return 0
+            if not owners or not all(OWNER_RE.fullmatch(o) for o in owners):
+                print(json.dumps({"verdict": "REFUSE", "reasons": ["BAD_OWNERS"]}))
+                return 1
+            text = queue_report(run, a.repo, [int(x) for x in a.prs.split(",")], owners, a.ci_unavailable)
+            print(text)
+            return 0 if all(" PASS" in l for l in text.splitlines() if l.startswith("#")) else 1
         if a.cmd == "check":
             owners = [o.strip() for o in a.owners.split(",") if o.strip()]
-            if not owners or not all(OWNER_RE.match(o) for o in owners):
+            if not owners or not all(OWNER_RE.fullmatch(o) for o in owners):
                 print(json.dumps({"verdict": "REFUSE", "reasons": ["BAD_OWNERS"]}))
                 return 1
             verdict, reasons, facts = evaluate(run, a.repo, a.pr, owners, a.ci_unavailable)
@@ -247,9 +286,9 @@ def main(argv=None, run=None):
         out = verify(run, a.repo, a.pr, a.head)
         print(json.dumps(out, indent=1))
         return 0 if out["verdict"] == "VERIFIED" else 1
-    except (RuntimeError, KeyError, ValueError) as e:
-        print(json.dumps({"verdict": "ERROR", "reasons": [str(e)[:300]]}))
-        return 2
+    except Exception as e:  # any failure is an ERROR (exit 3), never read as a REFUSE or a WAIT
+        print(json.dumps({"verdict": "ERROR", "reasons": [f"{type(e).__name__}: {str(e)[:300]}"]}))
+        return 3
 
 
 if __name__ == "__main__":
