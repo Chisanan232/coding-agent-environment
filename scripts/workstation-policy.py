@@ -194,7 +194,9 @@ ASK_BASH_RULES = [
     "Bash(git push * --delete*)", "Bash(gh api *pulls/*/merge*)", "Bash(gh release create:*)", "Bash(gh release upload:*)",
     "Bash(gh pr merge * --admin*)", "Bash(gh pr merge --admin*)",
     "Bash(gh repo delete:*)", "Bash(gh api * -X DELETE*)", "Bash(gh api * --method DELETE*)", "Bash(gh api -X DELETE*)",
-    "Bash(gh api --method DELETE*)", "Bash(npm publish:*)", "Bash(pnpm publish:*)", "Bash(yarn npm publish:*)", "Bash(cargo publish:*)", "Bash(twine upload:*)",
+    "Bash(gh api --method DELETE*)",
+    "Bash(gh api *DELETE*)", "Bash(gh api *delete*)", "Bash(gh api *Delete*)",  # also -XDELETE, --method=DELETE, -X=DELETE
+    "Bash(npm publish:*)", "Bash(pnpm publish:*)", "Bash(yarn npm publish:*)", "Bash(cargo publish:*)", "Bash(twine upload:*)",
     "Bash(uv publish:*)", "Bash(docker push:*)",
 ]
 ASK_PATH_RULES = [f"{tool}({path})" for tool in ("Edit", "Write") for path in (
