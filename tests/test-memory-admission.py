@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""scripts/memory-admission.py with synthetic samples only (SPE-117). Never reads or changes the real machine's state."""
+import importlib.util
+import io
+import json
+import os
+import pathlib
+import stat
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+
+sys.dont_write_bytecode = True
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location("ma", ROOT / "scripts/memory-admission.py")
+ma = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ma)
+
+GIB, PAGE = 1024 ** 3, 16384
+RAM = 128 * GIB
+
+# Real formats captured from macOS 26 (values synthetic).
+VM_STAT = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                                     6406.
+Pages active:                                1567550.
+Pages inactive:                              1563258.
+Pages wired down:                             524300.
+Pages occupied by compressor:                4681379.
+Decompressions:                            415856000.
+Compressions:                              456704000.
+Swapins:                                    17446826.
+Swapouts:                                   21935261.
+"""
+SWAP = "total = 69632.00M  used = 69001.25M  free = 630.75M  (encrypted)"
+
+
+def vm(swapins=0, swapouts=0, compressor_pages=0):
+    return {"page_size": PAGE, "free": 1, "swapins": swapins, "swapouts": swapouts, "compressor": compressor_pages}
+
+
+def sample(t, level=1, swapins=0, swapouts=0, compressor=0.0, load=2.0, cpus=16, disk=494 * GIB, swap=None, heavy=None):
+    return {"time": t, "ram": RAM, "pressure_level": level, "swap": swap, "vm": vm(swapins, swapouts, int(compressor * RAM / PAGE)),
+            "load1": load, "cpus": cpus, "disk_free": disk, "heavy_procs": heavy or {}}
+
+
+def metrics(**kw):
+    io_mib = kw.pop("io", 0.0)
+    pages = int(io_mib * 1024 ** 2 * 10 / PAGE)  # over a 10 s window
+    return ma.derive(sample(0, **{k: v for k, v in kw.items() if k not in ("swapins", "swapouts")}),
+                     sample(10, swapins=pages, **kw))
+
+
+class Parsing(unittest.TestCase):
+    def test_swapusage_and_vm_stat_parse_real_formats(self):
+        s = ma.parse_swapusage(SWAP)
+        self.assertEqual((s["total"], s["used"]), (69632 * 1024 ** 2, int(69001.25 * 1024 ** 2)))
+        v = ma.parse_vm_stat(VM_STAT)
+        self.assertEqual((v["page_size"], v["compressor"], v["swapins"], v["swapouts"]), (16384, 4681379, 17446826, 21935261))
+
+    def test_garbage_and_missing_counters_are_none_not_zero(self):
+        self.assertIsNone(ma.parse_swapusage("nonsense"))
+        self.assertIsNone(ma.parse_swapusage(""))
+        self.assertIsNone(ma.parse_swapusage(None))
+        self.assertIsNone(ma.parse_vm_stat("Pages free: 1."))
+        self.assertIsNone(ma.parse_vm_stat(VM_STAT.replace("Swapins:", "Whatever:")))
+
+    def test_post_reboot_swap_of_zero_parses_and_is_not_an_error(self):
+        self.assertEqual(ma.parse_swapusage("total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)")["total"], 0)
+
+    def test_take_sample_counts_heavy_process_names_only(self):
+        def run(cmd, **kw):
+            out = {"ps": "/usr/bin/cargo\n/bin/zsh\n/x/y/rustc\n/x/rustc\nclaude\n", "vm_stat": VM_STAT,
+                   "sysctl": {"hw.memsize": str(RAM), "kern.memorystatus_vm_pressure_level": "2", "vm.swapusage": SWAP}.get(cmd[-1], "")}[cmd[0]]
+            return type("R", (), {"returncode": 0, "stdout": out})()
+        s = ma.take_sample(run=run, now_fn=lambda: 5.0, load_fn=lambda: (1.0, 1.0, 1.0), cpu_fn=lambda: 16, disk_free_fn=lambda: GIB)
+        self.assertEqual(s["heavy_procs"], {"cargo": 1, "rustc": 2})
+        self.assertEqual((s["pressure_level"], s["ram"]), (2, RAM))
+
+    def test_take_sample_survives_failing_commands(self):
+        def run(cmd, **kw):
+            raise OSError("nope")
+        s = ma.take_sample(run=run, now_fn=lambda: 1.0, load_fn=lambda: (_ for _ in ()).throw(OSError()), cpu_fn=lambda: None, disk_free_fn=lambda: (_ for _ in ()).throw(OSError()))
+        self.assertTrue(all(s[k] is None for k in ("ram", "pressure_level", "swap", "vm", "load1", "cpus", "disk_free")))
+
+
+class Derivation(unittest.TestCase):
+    def test_swap_io_rate_and_compressor_ratio(self):
+        m = metrics(io=20.0, compressor=0.5)
+        self.assertAlmostEqual(m["swap_io_mib_s"], 20.0, delta=0.1)
+        self.assertAlmostEqual(m["compressor_ratio"], 0.5, delta=0.01)
+
+    def test_counter_going_backwards_or_zero_window_is_unknown_not_zero(self):
+        a, b = sample(0, swapins=100), sample(10, swapins=50)
+        self.assertIsNone(ma.derive(a, b)["swap_io_mib_s"])
+        self.assertIsNone(ma.derive(sample(5), sample(5))["swap_io_mib_s"])
+
+
+class Decisions(unittest.TestCase):
+    def heavy(self, m, state=None, now=1000.0):
+        return ma.decide("heavy", m, state, now)
+
+    def test_healthy_post_reboot_machine_admits_both_weights(self):
+        m = metrics(swap={"total": 0, "used": 0, "free": 0})
+        self.assertTrue(self.heavy(m)[0]["admit"])
+        self.assertTrue(ma.decide("light", m, None, 1.0)[0]["admit"])
+
+    def test_historical_swap_used_alone_is_not_exhaustion(self):
+        # The pre-reboot shape: swap 99% used, but calm now. The old "swap free < 4 GiB" rule refused this; this tool must not.
+        m = metrics(level=1, io=0.5, compressor=0.10, load=3.0, swap={"total": 69632 * 1024 ** 2, "used": int(69000 * 1024 ** 2), "free": 630 * 1024 ** 2})
+        v, _ = self.heavy(m)
+        self.assertTrue(v["admit"], v)
+        self.assertTrue(any("historical" in w for w in v["warnings"]))
+
+    def test_swap_nearly_full_and_cannot_grow_refuses_heavy_but_not_light(self):
+        sw = {"total": 69632 * 1024 ** 2, "used": int(69000 * 1024 ** 2), "free": 630 * 1024 ** 2}
+        m = metrics(swap=sw, disk=60 * GIB)
+        v, _ = self.heavy(m)
+        self.assertFalse(v["admit"])
+        self.assertTrue(any("cannot grow" in r for r in v["reasons"]))
+        self.assertTrue(ma.decide("light", m, None, 1.0)[0]["admit"])
+        m_ok = metrics(swap=sw, disk=494 * GIB)  # same swap, plenty of disk: swap can grow
+        self.assertTrue(self.heavy(m_ok)[0]["admit"])
+
+    def test_pressure_levels(self):
+        self.assertFalse(self.heavy(metrics(level=2))[0]["admit"])      # warn: heavy refused
+        self.assertTrue(ma.decide("light", metrics(level=2), None, 1.0)[0]["admit"])
+        self.assertTrue(any("warn level" in w for w in ma.decide("light", metrics(level=2), None, 1.0)[0]["warnings"]))
+        self.assertFalse(ma.decide("light", metrics(level=4), None, 1.0)[0]["admit"])   # critical: nothing is admitted
+        self.assertFalse(self.heavy(metrics(level=4))[0]["admit"])
+
+    def test_sustained_swap_io(self):
+        self.assertFalse(self.heavy(metrics(io=20.0))[0]["admit"])
+        self.assertTrue(ma.decide("light", metrics(io=20.0), None, 1.0)[0]["admit"])
+        self.assertFalse(ma.decide("light", metrics(io=200.0), None, 1.0)[0]["admit"])
+        self.assertTrue(self.heavy(metrics(io=2.0))[0]["admit"])
+
+    def test_compressor_share_and_load(self):
+        self.assertFalse(self.heavy(metrics(compressor=0.56))[0]["admit"])     # the measured pre-reboot value
+        self.assertTrue(ma.decide("light", metrics(compressor=0.40), None, 1.0)[0]["admit"])
+        self.assertFalse(ma.decide("light", metrics(compressor=0.56), None, 1.0)[0]["admit"])
+        self.assertFalse(self.heavy(metrics(load=129.0))[0]["admit"])          # load average 129 on 16 cores
+        self.assertTrue(ma.decide("light", metrics(load=129.0), None, 1.0)[0]["admit"])
+
+    def test_one_heavy_lane_other_build_process_blocks_heavy_only(self):
+        m = metrics(heavy={"cargo": 1})
+        v, _ = self.heavy(m)
+        self.assertFalse(v["admit"])
+        self.assertIn("cargo x1", " ".join(v["reasons"]))
+        self.assertTrue(ma.decide("light", m, None, 1.0)[0]["admit"])
+
+    def test_unknown_data_fails_closed_for_heavy_and_warns_for_light(self):
+        a = sample(0)
+        b = sample(10)
+        b["pressure_level"] = None
+        b["vm"] = None
+        m = ma.derive(a, b)
+        v, st = self.heavy(m)
+        self.assertFalse(v["admit"])
+        self.assertTrue(st["latched"])
+        lv, _ = ma.decide("light", m, None, 1.0)
+        self.assertTrue(lv["admit"])
+        self.assertTrue(any(w.startswith("unknown") for w in lv["warnings"]))
+
+
+    def test_each_unknown_input_alone_fails_closed_for_heavy(self):
+        for field in ("pressure_level", "vm", "load1", "cpus"):
+            b = sample(10)
+            b[field] = None
+            v, _ = self.heavy(ma.derive(sample(0), b))
+            self.assertFalse(v["admit"], field)
+            self.assertTrue(any("fails closed" in r for r in v["reasons"]), field)
+
+
+class Hysteresis(unittest.TestCase):
+    def good(self):
+        return metrics(level=1, io=0.0, compressor=0.05, load=2.0)
+
+    def test_recovery_needs_consecutive_spaced_good_checks(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        self.assertTrue(st["latched"])
+        v, st = ma.decide("heavy", self.good(), st, 100.0)
+        self.assertFalse(v["admit"])
+        self.assertIn("recovering (1/3", v["reasons"][0])
+        v, st = ma.decide("heavy", self.good(), st, 105.0)       # too close: does not count
+        self.assertEqual(st["ok_streak"], 1)
+        v, st = ma.decide("heavy", self.good(), st, 140.0)
+        v, st = ma.decide("heavy", self.good(), st, 180.0)
+        self.assertTrue(v["admit"], v)
+        self.assertFalse(st["latched"])
+
+    def test_a_bad_sample_resets_the_streak(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        _, st = ma.decide("heavy", self.good(), st, 100.0)
+        _, st = ma.decide("heavy", self.good(), st, 140.0)
+        self.assertEqual(st["ok_streak"], 2)
+        _, st = ma.decide("heavy", metrics(level=2), st, 180.0)
+        self.assertEqual(st["ok_streak"], 0)
+        self.assertTrue(st["latched"])
+
+    def test_exit_thresholds_are_stricter_than_enter(self):
+        # 8 MiB/s is below the 16 MiB/s entry threshold (admitted when never latched) but above the 4 MiB/s exit threshold.
+        m = metrics(io=8.0)
+        self.assertTrue(ma.decide("heavy", m, None, 1.0)[0]["admit"])
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        v, st = ma.decide("heavy", m, st, 100.0)
+        self.assertFalse(v["admit"])
+        self.assertEqual(st["ok_streak"], 0)
+
+    def test_light_work_has_no_latch(self):
+        _, st = ma.decide("light", metrics(level=4), None, 0.0)
+        self.assertFalse(st["latched"])
+        self.assertTrue(ma.decide("light", self.good(), st, 1.0)[0]["admit"])
+
+    def test_pressure_trend_warning(self):
+        _, st = ma.decide("light", metrics(level=1), None, 0.0)
+        v, _ = ma.decide("light", metrics(level=2), st, 10.0)
+        self.assertTrue(any("rising" in w for w in v["warnings"]))
+
+
+class StateFile(unittest.TestCase):
+    def setUp(self):
+        self.d = pathlib.Path(tempfile.mkdtemp(prefix="ma-test-"))
+        self.addCleanup(__import__("shutil").rmtree, self.d, True)
+        self.path = self.d / "sub" / "state.json"
+
+    def test_round_trip_is_atomic_and_private(self):
+        ma.save_state(self.path, {"latched": True, "ok_streak": 2, "last_ok": 5.0, "levels": [1, 2]})
+        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(self.path.parent).st_mode), 0o700)
+        st, problem = ma.load_state(self.path)
+        self.assertEqual((st["latched"], st["ok_streak"], problem), (True, 2, None))
+        self.assertEqual([p.name for p in self.path.parent.iterdir()], ["state.json"])
+
+    def test_missing_state_is_a_clean_start(self):
+        self.assertEqual(ma.load_state(self.path), ({}, None))
+
+    def test_corrupt_state_latches_heavy_with_a_reason(self):
+        self.path.parent.mkdir()
+        for bad in ("not json", "[]", json.dumps({"latched": "yes", "ok_streak": 1, "last_ok": 0}), json.dumps({"latched": False, "ok_streak": 99999, "last_ok": 0})):
+            self.path.write_text(bad)
+            st, problem = ma.load_state(self.path)
+            self.assertTrue(st["latched"], bad)
+            self.assertIn("corrupt", problem)
+
+
+class Cli(unittest.TestCase):
+    def setUp(self):
+        self.d = pathlib.Path(tempfile.mkdtemp(prefix="ma-cli-"))
+        self.addCleanup(__import__("shutil").rmtree, self.d, True)
+        self.state = str(self.d / "state.json")
+
+    def run_cli(self, argv, level=1, mibs=0.0, disk=(True, "heavy admitted in tier wide")):
+        calls = iter([sample(0.0, level=level), sample(10.0, level=level, swapins=int(mibs * 1024 ** 2 * 10 / PAGE))])
+        deps = {"sample": lambda: next(calls), "sleep": lambda s: None, "now": lambda: 1000.0, "disk": lambda w: disk}
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = ma.main(argv, deps)
+        return rc, buf.getvalue()
+
+    def test_admit_and_refuse_exit_codes(self):
+        rc, out = self.run_cli(["check", "--weight", "heavy", "--state", self.state, "--json"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(json.loads(out)["admit"])
+        rc, out = self.run_cli(["check", "--weight", "heavy", "--state", self.state, "--json"], level=4)
+        self.assertEqual(rc, 77)
+        self.assertFalse(json.loads(out)["admit"])
+
+    def test_disk_gate_refusal_wins_even_when_memory_is_healthy(self):
+        rc, out = self.run_cli(["check", "--weight", "heavy", "--state", self.state, "--json"], disk=(False, "heavy refused in tier low"))
+        d = json.loads(out)
+        self.assertEqual(rc, 77)
+        self.assertTrue(any(r.startswith("disk gate") for r in d["reasons"]))
+
+    def test_memory_refusal_wins_even_when_disk_is_healthy(self):
+        rc, out = self.run_cli(["check", "--weight", "heavy", "--state", self.state, "--json"], level=2)
+        self.assertEqual(rc, 77)
+        self.assertTrue(json.loads(out)["disk_gate"]["admit"])
+
+    def test_corrupt_state_file_refuses_heavy_through_the_cli(self):
+        pathlib.Path(self.state).write_text("garbage")
+        rc, out = self.run_cli(["check", "--weight", "heavy", "--state", self.state, "--json"])
+        self.assertEqual(rc, 77)
+        self.assertTrue(any("corrupt" in r for r in json.loads(out)["reasons"]))
+
+    def test_status_never_refuses_writes_no_state_and_skips_the_disk_gate(self):
+        rc, out = self.run_cli(["status", "--state", self.state, "--json"], level=4, disk=(False, "must not be asked"))
+        d = json.loads(out)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("disk_gate", d)
+        self.assertFalse(pathlib.Path(self.state).exists())
+
+    def test_light_check_does_not_touch_the_heavy_state(self):
+        rc, _ = self.run_cli(["check", "--weight", "light", "--state", self.state, "--json"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(pathlib.Path(self.state).exists())
+
+    def test_disk_gate_helper_fails_closed(self):
+        ok, msg = ma.disk_gate("heavy", run=lambda *a, **k: (_ for _ in ()).throw(OSError("x")))
+        self.assertFalse(ok)
+        self.assertIn("unavailable", msg)
+        ok, _ = ma.disk_gate("heavy", run=lambda *a, **k: type("R", (), {"returncode": 77, "stdout": "heavy refused", "stderr": ""})())
+        self.assertFalse(ok)
+
+    def test_window_is_clamped(self):
+        seen = []
+        calls = iter([sample(0.0), sample(10.0)])
+        with redirect_stdout(io.StringIO()):
+            ma.main(["status", "--window", "100000", "--json"], {"sample": lambda: next(calls), "sleep": seen.append, "now": lambda: 1.0, "disk": lambda w: (True, "")})
+        self.assertEqual(seen, [120.0])
+
+
+if __name__ == "__main__":
+    unittest.main()
