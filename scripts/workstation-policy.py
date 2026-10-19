@@ -213,7 +213,7 @@ def candidate(kind):
     if kind == "corporate":
         env.append("Corporate machine: data leaves only to destinations inside the formally approved corporate trust boundary.")
     else:
-        env.append("Personal machine: sensitive outbound disclosure is approved per operation.")
+        env.append("Personal machine: no standing approval exists for sending sensitive data to external services; each such send needs explicit user approval at that time.")
     return {
         "_scope_note": "Candidate only. Review and deploy by hand; never applied automatically. Keeps the built-in rule lists via $defaults. The ask patterns are prefix/glob matches, not a complete gate: wrapped or reordered commands can evade them, so test them against the live host before relying on them.",
         "autoMode": {"environment": ["$defaults"] + env, "allow": ["$defaults"], "soft_deny": ["$defaults"], "hard_deny": ["$defaults"]},
