@@ -208,6 +208,23 @@ class Candidates(unittest.TestCase):
         # the hardening key must not be mistaken for bypassPermissions
         self.assertEqual(mut(lambda c: c.update(disableBypassPermissionsMode="disable")), [])
 
+    def test_every_bash_ask_has_its_rtk_rewritten_twin(self):
+        for kind in ("personal", "corporate"):
+            asks = wsp.candidate(kind)["permissions"]["ask"]
+            bash = [r for r in asks if r.startswith("Bash(") and not r.startswith("Bash(rtk ")]
+            self.assertTrue(bash)
+            for r in bash:
+                self.assertIn(r.replace("Bash(", "Bash(rtk ", 1), asks, r)
+        cand = wsp.candidate("personal")
+        cand["permissions"]["ask"] = [r for r in cand["permissions"]["ask"] if not r.startswith("Bash(rtk ")]
+        self.assertTrue(any("rtk-rewritten twin" in p for p in wsp.lint_settings(cand)))
+
+    def test_candidate_asks_protect_security_paths_in_home_and_projects(self):
+        asks = set(wsp.candidate("personal")["permissions"]["ask"])
+        for tool in ("Edit", "Write"):
+            for path in ("~/.claude/settings.json", "~/.claude/hooks/**", "~/.claude/bin/**", "**/.claude/settings.json", "**/.mcp.json"):
+                self.assertIn(f"{tool}({path})", asks)
+
     def test_templates_hold_placeholders_only(self):
         for kind in ("personal", "corporate"):
             raw = open(ROOT / f"docs/examples/workstation-profile-{kind}.example.json").read()

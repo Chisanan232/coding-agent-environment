@@ -181,6 +181,18 @@ def ask_packet(action, dest, classes):
     return packet
 
 
+# The host's rtk PreToolUse hook rewrites `git ...` to `rtk git ...` before rules match, so every Bash ask needs both forms.
+ASK_BASH_RULES = [
+    "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git push --force-with-lease:*)", "Bash(git push * --force*)",
+    "Bash(git push * -f)", "Bash(git push * -f *)", "Bash(git push * +*)", "Bash(git push origin --delete:*)",
+    "Bash(git push * --delete*)", "Bash(gh api * merge*)", "Bash(gh release create:*)", "Bash(gh release upload:*)",
+    "Bash(gh pr merge * --admin*)", "Bash(gh pr merge --admin*)",
+]
+ASK_PATH_RULES = [f"{tool}({path})" for tool in ("Edit", "Write") for path in (
+    "~/.claude/settings.json", "~/.claude/settings.local.json", "~/.claude/hooks/**", "~/.claude/bin/**", "~/.claude.json",
+    "**/.claude/settings.json", "**/.claude/settings.local.json", "**/.claude/hooks/**", "**/.mcp.json")]
+
+
 def candidate(kind):
     env = [
         "Source of truth: GitHub repositories owned by the owner; Jira for tickets; the workstation profile is " + kind + ".",
@@ -195,12 +207,7 @@ def candidate(kind):
         "_scope_note": "Candidate only. Review and deploy by hand; never applied automatically. Keeps the built-in rule lists via $defaults. The ask patterns are prefix/glob matches, not a complete gate: wrapped or reordered commands can evade them, so test them against the live host before relying on them.",
         "autoMode": {"environment": ["$defaults"] + env, "allow": ["$defaults"], "soft_deny": ["$defaults"], "hard_deny": ["$defaults"]},
         "permissions": {
-            "ask": ["Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git push --force-with-lease:*)",
-                    "Bash(git push * --force*)", "Bash(git push * -f)", "Bash(git push * -f *)", "Bash(git push * +*)",
-                    "Bash(git push origin --delete:*)", "Bash(git push * --delete*)", "Bash(gh api * merge*)", "Bash(gh release create:*)", "Bash(gh release upload:*)",
-                    "Bash(gh pr merge * --admin*)", "Bash(gh pr merge --admin*)",
-                    "Edit(~/.claude/settings.json)", "Write(~/.claude/settings.json)",
-                    "Edit(~/.claude/hooks/**)", "Write(~/.claude/hooks/**)"],
+            "ask": ASK_BASH_RULES + [r.replace("Bash(", "Bash(rtk ", 1) for r in ASK_BASH_RULES] + ASK_PATH_RULES,
             "deny": [],
         },
     }
@@ -227,6 +234,10 @@ def lint_settings(cfg):
         bad.append("defaultMode removes prompts")
     if re.search(r"authorized pull request merge|standing\b.{0,40}\bmerge|merge\b.{0,40}\b(authori[sz]ation|without review)", blob, re.I):
         bad.append("standing merge authorization text must not return")
+    asks = [str(r) for r in (cfg.get("permissions") or {}).get("ask", [])]
+    for r in asks:
+        if r.startswith("Bash(") and not r.startswith("Bash(rtk ") and r.replace("Bash(", "Bash(rtk ", 1) not in asks:
+            bad.append(f"ask rule has no rtk-rewritten twin: {r}")
     for r in (cfg.get("permissions") or {}).get("allow", []):
         r = str(r)
         if re.fullmatch(r"(Bash|Edit|Write|PowerShell|WebFetch)(\(\*+\))?", r):
