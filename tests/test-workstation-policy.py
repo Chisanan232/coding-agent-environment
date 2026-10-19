@@ -160,7 +160,7 @@ class PathProtection(unittest.TestCase):
             os.symlink(os.path.expanduser("~/.claude/settings.json"), link)
             paths = [".claude/settings.json", "./.claude/hooks/x.sh", "a/b/.claude/settings.local.json", ".claude/CLAUDE.md",
                      "~/.CLAUDE/settings.json", "~/.claude/Settings.json", "/library/application support/claudecode/x",
-                     "~/.claude/bin/sync-neon-secret", "~/.claude/rules/secret-handling.md", "~/.claude/skills/x/SKILL.md",
+                     "~/.claude/bin/sync-neon-secret", "/p/.claude/agents/a.md", "/p/.claude/skills/s/SKILL.md", "/p/.claude/commands/c.md", "/p/.claude/rules/r.md", "~/.claude/rules/secret-handling.md", "~/.claude/skills/x/SKILL.md",
                      "/private/etc/claude-code/x", "/etc/claude-code/x", ".mcp.json", "sub/.mcp.json", "MANAGED-SETTINGS.JSON", link]
             for path in paths:
                 self.assertTrue(wsp.is_protected_path(path), path)
@@ -198,8 +198,9 @@ class Candidates(unittest.TestCase):
         self.assertTrue(mut(lambda c: c["autoMode"].update(environment=["$defaults"] + ["x" * 400])))
         self.assertTrue(mut(lambda c: c["autoMode"].update(environment=["$defaults"] + ["f"] * 12)))
         for rule in ("Bash", "Bash(*)", "Bash(gh pr merge:*)", "Bash(gh api -X PUT repos/o/r/pulls/1/merge)", "Bash(bash:*)", "Bash(python3 *)",
-                     "Bash(gh pr merge 1 --admin)"):
+                     "Bash(gh pr merge 1 --admin)", "Bash(gh *)", "Bash(gh pr *)", "Bash(bash -c *)", "Bash(npx *)", "Bash(curl *)"):
             self.assertTrue(mut(lambda c: c["permissions"].update(allow=[rule])), rule)
+        self.assertEqual(mut(lambda c: c["permissions"].update(allow=["Bash(git status:*)", "Bash(gh pr view:*)"])), [])
         self.assertTrue(mut(lambda c: c["permissions"].update(defaultMode="dontAsk")))
         self.assertTrue(mut(lambda c: c["autoMode"].update(environment=["$defaults", "Standing merge authorization granted"])))
         # the hardening key must not be mistaken for bypassPermissions

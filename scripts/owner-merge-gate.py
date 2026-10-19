@@ -42,7 +42,7 @@ THREADS = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pu
 
 
 _RO = r"repos/[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.{1,2}/)[A-Za-z0-9._-]{1,100}"
-_REF = r"[A-Za-z0-9._/-]{1,200}"
+_REF = r"(?!.*(?:^|/)\.\.(?:/|$))[A-Za-z0-9._/-]{1,200}"
 API_READS = [re.compile(x) for x in (
     _RO + rf"/compare/{_REF}\.\.\.{_REF}", _RO + r"/commits/[0-9a-f]{40}", _RO + r"/pulls/\d{1,9}/files",
     _RO + r"/contents/(\.github/CODEOWNERS|CODEOWNERS|docs/CODEOWNERS)",
@@ -77,6 +77,8 @@ def read_only(args):
                 continue
             if arg not in SAFE_FLAGS:
                 raise RuntimeError(f"refused gh flag {arg.split('=')[0]}")
+            if arg == "--jq" and i + 1 < len(args) and re.search(r"\benv\b|\$ENV|\binput|\bdebug|@sh|\bgetpath|\$__", args[i + 1]):
+                raise RuntimeError("refused jq expression that can read the environment or input")
             i += 2 if i + 1 < len(args) else 1
             continue
         i += 1
@@ -133,7 +135,7 @@ def codeowners_cover(text, files, me):
     """True only if the last matching rule for every file lists @me (teams never count)."""
     rules = []
     for line in text.splitlines():
-        line = line.split(" #")[0].strip()
+        line = re.split(r"\s#", line)[0].strip()
         if not line or line.startswith("#"):
             continue
         parts = line.split()

@@ -30,7 +30,8 @@ PROTECTED_PATHS = (
     "~/.claude", "~/.claude.json", "/Library/Application Support/ClaudeCode", "/etc/claude-code", "/private/etc/claude-code", "/Library/Managed Preferences",
 )
 PROTECTED_BASENAMES = {"managed-settings.json", "managed-mcp.json", ".mcp.json"}
-PROTECTED_RELATIVE = (".claude/settings.json", ".claude/settings.local.json", ".claude/hooks", ".claude/claude.md")
+PROTECTED_RELATIVE = (".claude/settings.json", ".claude/settings.local.json", ".claude/hooks", ".claude/claude.md", ".claude/agents",
+                      ".claude/skills", ".claude/commands", ".claude/rules")
 # Settings keys that may change without owner approval; every other key can run commands or move a trust boundary.
 BENIGN_KEYS = {"model", "effortlevel", "advisormodel", "theme", "verbose"}
 NON_GOVERNED_KINDS = {"local"}
@@ -105,7 +106,7 @@ def is_protected_path(path):
             return True
         if any(cf == b or cf.startswith(b + os.sep) for b in bases):
             return True
-        hay = "/" + cf.replace(os.sep, "/").lstrip("./") + "/"
+        hay = "/" + cf.replace(os.sep, "/").lstrip("/") + "/"
         if any(("/" + r + "/") in hay for r in PROTECTED_RELATIVE):
             return True
     return False
@@ -229,7 +230,7 @@ def lint_settings(cfg):
             bad.append(f"blanket allow {r}")
         elif re.search(r"gh pr merge|gh api.*merge|--admin", r):
             bad.append(f"standing merge permission {r}")
-        elif re.search(r"\((bash|sh|zsh|python3?|node|env|xargs|sudo|eval)\b[: ]\*", r):
+        elif re.search(r"\((bash|sh|zsh|python3?|node|npx|env|xargs|sudo|eval|curl|wget|gh|git)\b[^)]*[: ]\*", r) and not re.fullmatch(r"Bash\((git (status|diff|log|show|branch)|gh (pr|issue|run) (view|list|checks|diff|status))[: ][^)]*\)", r):
             bad.append(f"interpreter wildcard allow {r}")
     return bad
 

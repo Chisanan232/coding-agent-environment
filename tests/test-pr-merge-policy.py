@@ -312,6 +312,17 @@ class ReadOnly(unittest.TestCase):
         omg.read_only(["api", f"repos/{REPO}/pulls/7/files", "--jq", "length"])
         omg.read_only(["api", f"repos/{REPO}/compare/main...{HEAD}", "--jq", ".behind_by"])
 
+    def test_dotdot_refs_and_environment_reading_jq_are_refused(self):
+        for bad in (["api", f"repos/{REPO}/compare/x/../../../../user...y", "--jq", ".a"],
+                    ["api", f"repos/{REPO}/pulls/7/files", "--jq", "env.GH_TOKEN"], ["api", f"repos/{REPO}/pulls/7/files", "--jq", "$ENV.X"],
+                    ["api", f"repos/{REPO}/pulls/7/files", "--jq", "input"]):
+            with self.assertRaises(RuntimeError, msg=bad):
+                omg.read_only(bad)
+
+    def test_tab_before_a_codeowners_comment_does_not_add_owners(self):
+        self.assertFalse(omg.codeowners_cover("* @x\t# @chisanan232\n", ["a.py"], ME))
+        self.assertTrue(omg.codeowners_cover("* @chisanan232 # trailing note\n", ["a.py"], ME))
+
     def test_queue_exit_ignores_pass_text_inside_a_refusal(self):
         import io, contextlib
         f = Fake(statusCheckRollup=[{"name": "x PASS y", "status": "COMPLETED", "conclusion": "FAILURE"}])
