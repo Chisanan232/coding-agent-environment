@@ -1,5 +1,5 @@
 {
-  "_scope_note": "Candidate only. Review and deploy by hand; never applied automatically. Keeps the built-in rule lists via $defaults.",
+  "_scope_note": "Candidate only. Review and deploy by hand; never applied automatically. Keeps the built-in rule lists via $defaults. The ask patterns are prefix/glob matches, not a complete gate: wrapped or reordered commands can evade them, so test them against the live host before relying on them.",
   "autoMode": {
     "environment": [
       "$defaults",
@@ -23,7 +23,13 @@
       "Bash(git push --force:*)",
       "Bash(git push -f:*)",
       "Bash(git push --force-with-lease:*)",
+      "Bash(git push * --force*)",
+      "Bash(git push * -f)",
+      "Bash(git push * -f *)",
+      "Bash(git push * +*)",
       "Bash(git push origin --delete:*)",
+      "Bash(git push * --delete*)",
+      "Bash(gh api * merge*)",
       "Bash(gh release create:*)",
       "Bash(gh release upload:*)",
       "Bash(gh pr merge * --admin*)",

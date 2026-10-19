@@ -27,13 +27,13 @@ KNOWN_CLASSES = PROTECTED_DATA | {"public", "credentials", "auth_handshake"}
 HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?")
 PLACEHOLDER = re.compile(r"<[^<>]+>")
 PROTECTED_PATHS = (
-    "~/.claude/settings.json", "~/.claude/settings.local.json", "~/.claude/hooks", "~/.claude/CLAUDE.md",
-    "/Library/Application Support/ClaudeCode", "/etc/claude-code", "/Library/Managed Preferences",
-    "~/.claude.json",
+    "~/.claude", "~/.claude.json", "/Library/Application Support/ClaudeCode", "/etc/claude-code", "/Library/Managed Preferences",
 )
-PROTECTED_BASENAMES = {"managed-settings.json", "managed-mcp.json"}
-PROTECTED_RELATIVE = (".claude/settings.json", ".claude/settings.local.json", ".claude/hooks/")
-PROTECTED_KEYS = re.compile(r"^(autoMode|permissions|hooks|sandbox|env|disableBypassPermissionsMode|enableAllProjectMcpServers)(\.|$)")
+PROTECTED_BASENAMES = {"managed-settings.json", "managed-mcp.json", ".mcp.json"}
+PROTECTED_RELATIVE = (".claude/settings.json", ".claude/settings.local.json", ".claude/hooks", ".claude/claude.md")
+# Settings keys that may change without owner approval; every other key can run commands or move a trust boundary.
+BENIGN_KEYS = {"model", "effortlevel", "advisormodel", "theme", "verbose"}
+NON_GOVERNED_KINDS = {"local"}
 
 ALTERNATIVES = {
     "documents": "share a redacted excerpt or a synthetic stand-in", "logs": "share a redacted excerpt with identifiers removed",
@@ -89,22 +89,34 @@ def host_ok(host, allowed):
 
 
 def is_protected_path(path):
+    """Case-insensitive, symlink-resolved, relative-aware. Unparseable input is treated as protected."""
     if not isinstance(path, str) or not path or "\0" in path:
-        return True  # unparseable means unverifiable
-    expanded = os.path.normpath(os.path.expanduser(path))
+        return True
+    raw = os.path.normpath(os.path.expanduser(path))
+    forms = {raw, os.path.realpath(os.path.expanduser(path))}
+    bases = set()
     for prot in PROTECTED_PATHS:
         base = os.path.normpath(os.path.expanduser(prot))
-        if expanded == base or expanded.startswith(base + os.sep):
+        bases |= {base, os.path.realpath(base)}
+    bases = {b.casefold() for b in bases}
+    for form in forms:
+        cf = form.casefold()
+        if os.path.basename(cf) in PROTECTED_BASENAMES:
             return True
-    if os.path.basename(expanded) in PROTECTED_BASENAMES:
-        return True
-    norm = expanded.replace(os.sep, "/")
-    return any(("/" + r.rstrip("/") + "/") in (norm + "/") for r in PROTECTED_RELATIVE)
+        if any(cf == b or cf.startswith(b + os.sep) for b in bases):
+            return True
+        hay = "/" + cf.replace(os.sep, "/").lstrip("./") + "/"
+        if any(("/" + r + "/") in hay for r in PROTECTED_RELATIVE):
+            return True
+    return False
 
 
 def decide(profile, action, fp):
     state, problems = profile_state(profile, fp)
     kind = action.get("kind") if isinstance(action, dict) else None
+    if isinstance(kind, str):
+        kind = kind.strip().lower()
+        action = {**action, "kind": kind}
     out = {"profile_state": state, "action_kind": kind, "reasons": list(problems)}
 
     def done(verdict, *why, **extra):
@@ -114,12 +126,14 @@ def decide(profile, action, fp):
     if kind == "modify_policy":
         path, key = action.get("path"), action.get("key")
         if (path is None and key is None) or (path is not None and is_protected_path(path)) \
-                or (key is not None and PROTECTED_KEYS.match(str(key))):
+                or (key is not None and str(key).split(".")[0].casefold() not in BENIGN_KEYS):
             return done("ASK", "POLICY_CHANGE_NEEDS_OWNER_APPROVAL: effective Auto Mode, permissions, hooks, sandbox and trust boundaries are owner-approved",
                         owner_approval_required=True)
         return done("ALLOW", "not a protected policy location")
     if kind != "outbound":
-        return done("ALLOW", "action is not governed by workstation outbound policy")
+        if isinstance(kind, str) and kind in NON_GOVERNED_KINDS:
+            return done("ALLOW", "explicitly non-governed local action")
+        return done("DENY", "UNKNOWN_ACTION_KIND: only outbound, modify_policy and local actions are described; fail closed")
     classes = action.get("data_classes")
     if not isinstance(classes, list) or not classes or not set(map(str, classes)) <= KNOWN_CLASSES:
         return done("DENY", "UNKNOWN_DATA_CLASS: outbound data must be classified; fail closed")
@@ -174,11 +188,12 @@ def candidate(kind):
     else:
         env.append("Personal machine: sensitive outbound disclosure is approved per operation.")
     return {
-        "_scope_note": "Candidate only. Review and deploy by hand; never applied automatically. Keeps the built-in rule lists via $defaults.",
+        "_scope_note": "Candidate only. Review and deploy by hand; never applied automatically. Keeps the built-in rule lists via $defaults. The ask patterns are prefix/glob matches, not a complete gate: wrapped or reordered commands can evade them, so test them against the live host before relying on them.",
         "autoMode": {"environment": ["$defaults"] + env, "allow": ["$defaults"], "soft_deny": ["$defaults"], "hard_deny": ["$defaults"]},
         "permissions": {
             "ask": ["Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git push --force-with-lease:*)",
-                    "Bash(git push origin --delete:*)", "Bash(gh release create:*)", "Bash(gh release upload:*)",
+                    "Bash(git push * --force*)", "Bash(git push * -f)", "Bash(git push * -f *)", "Bash(git push * +*)",
+                    "Bash(git push origin --delete:*)", "Bash(git push * --delete*)", "Bash(gh api * merge*)", "Bash(gh release create:*)", "Bash(gh release upload:*)",
                     "Bash(gh pr merge * --admin*)", "Bash(gh pr merge --admin*)",
                     "Edit(~/.claude/settings.json)", "Write(~/.claude/settings.json)",
                     "Edit(~/.claude/hooks/**)", "Write(~/.claude/hooks/**)"],
@@ -202,20 +217,29 @@ def lint_settings(cfg):
     blob = json.dumps(cfg)
     if re.search(r'"Bash\(\*\)"|Bash\(\*:\*\)', blob):
         bad.append("blanket Bash(*) permission")
-    if re.search(r"bypassPermissions", blob, re.I):
+    if re.search(r"bypassPermissions|dangerously-skip-permissions", blob):
         bad.append("bypassPermissions must not appear")
-    if re.search(r"authorized pull request merge|standing owner merge", blob, re.I):
+    if (cfg.get("permissions") or {}).get("defaultMode") in ("dontAsk", "bypassPermissions") or cfg.get("defaultMode") in ("dontAsk", "bypassPermissions"):
+        bad.append("defaultMode removes prompts")
+    if re.search(r"authorized pull request merge|standing\b.{0,40}\bmerge|merge\b.{0,40}\b(authori[sz]ation|without review)", blob, re.I):
         bad.append("standing merge authorization text must not return")
     for r in (cfg.get("permissions") or {}).get("allow", []):
-        if re.fullmatch(r"(Bash|Edit|Write)\(\*+\)", str(r)):
+        r = str(r)
+        if re.fullmatch(r"(Bash|Edit|Write|PowerShell|WebFetch)(\(\*+\))?", r):
             bad.append(f"blanket allow {r}")
+        elif re.search(r"gh pr merge|gh api.*merge|--admin", r):
+            bad.append(f"standing merge permission {r}")
+        elif re.search(r"\((bash|sh|zsh|python3?|node|env|xargs|sudo|eval)\b[: ]\*", r):
+            bad.append(f"interpreter wildcard allow {r}")
     return bad
 
 
 def safe_out(path):
     p = pathlib.Path(os.path.expanduser(path)).resolve()
-    if is_protected_path(str(p)) or p.name in ("settings.json", "settings.local.json") or ".claude" in p.parts:
+    if is_protected_path(str(p)) or p.name.casefold() in ("settings.json", "settings.local.json") or ".claude" in map(str.casefold, p.parts):
         raise PermissionError("refusing to write to a protected settings location; review the candidate and deploy it by hand")
+    if p.suffix != ".json":
+        raise PermissionError("candidate output must be a .json file")
     return p
 
 
@@ -239,6 +263,8 @@ def main(argv=None):
             return 0
         if a.cmd == "evaluate":
             profile = json.load(open(a.profile))
+            if a.fingerprint is not None and os.environ.get("WORKSTATION_POLICY_TEST_FINGERPRINT") != "1":
+                raise PermissionError("--fingerprint is a test hook; set WORKSTATION_POLICY_TEST_FINGERPRINT=1 to use it")
             fp = a.fingerprint if a.fingerprint is not None else fingerprint()
             out = decide(profile, json.loads(a.action), fp)
             print(json.dumps(out, indent=1))
@@ -246,7 +272,8 @@ def main(argv=None):
         if a.cmd == "render-settings":
             text = json.dumps(candidate(a.kind), indent=2) + "\n"
             if a.out:
-                safe_out(a.out).write_text(text)
+                with open(safe_out(a.out), "x") as fh:  # exclusive create: never overwrites an existing file
+                    fh.write(text)
             else:
                 sys.stdout.write(text)
             return 0
