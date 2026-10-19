@@ -6,7 +6,7 @@
   candidate-rollout.py verify   --live F --expect-result-sha S
   candidate-rollout.py rollback --live F --backup F --expect-backup-sha S --expect-live-sha S
 
-Only three things are merged: the `autoMode` block is replaced by the candidate's, `permissions.ask` becomes the
+Only three things are merged: the `autoMode` block is replaced by the candidate's (a candidate with no `autoMode` key leaves it untouched), `permissions.ask` becomes the
 ordered union of live, baseline and candidate asks, and (optionally) one PreToolUse hook entry is added. Everything
 else (`allow`, `deny`, `env`, `model`, `statusLine`, other hooks) is left untouched, and the baseline's own `autoMode`
 text is never applied. `plan` and `verify` write nothing. `apply` and `rollback` write the live file, so the OWNER runs
@@ -56,18 +56,21 @@ def union(*lists):
 def merge(live, candidate, baseline=None, hook_command=None, fail_closed=False):
     """Pure function: returns (merged, report). `live` is not mutated."""
     merged = json.loads(json.dumps(live))
-    report = {"autoMode_before": {k: len(v) for k, v in (live.get("autoMode") or {}).items() if isinstance(v, list)},
-              "autoMode_after": {k: len(v) for k, v in candidate["autoMode"].items() if isinstance(v, list)}}
-    am = json.loads(json.dumps(candidate["autoMode"]))
     live_am = live.get("autoMode") or {}
-    report["denies_kept"] = {}
-    for key in ("soft_deny", "hard_deny"):  # an owner's own deny entries are never dropped
-        extra = [x for x in live_am.get(key, []) if x != "$defaults"]
-        report["denies_kept"][key] = len(extra)
-        if extra:
-            am[key] = ["$defaults"] + union(extra, [x for x in am.get(key, []) if x != "$defaults"])
-    report["dropped_from_live"] = {key: [str(x)[:100] for x in live_am.get(key, []) if x not in am.get(key, [])] for key in ("environment", "allow")}
-    merged["autoMode"] = am
+    before_counts = {k: len(v) for k, v in live_am.items() if isinstance(v, list)}
+    report = {"autoMode_before": before_counts, "denies_kept": {}, "dropped_from_live": {"environment": [], "allow": []}}
+    if "autoMode" in candidate:  # an asks-only candidate (no autoMode key) leaves the live autoMode exactly as it is
+        am = json.loads(json.dumps(candidate["autoMode"]))
+        report["autoMode_after"] = {k: len(v) for k, v in am.items() if isinstance(v, list)}
+        for key in ("soft_deny", "hard_deny"):  # an owner's own deny entries are never dropped
+            extra = [x for x in live_am.get(key, []) if x != "$defaults"]
+            report["denies_kept"][key] = len(extra)
+            if extra:
+                am[key] = ["$defaults"] + union(extra, [x for x in am.get(key, []) if x != "$defaults"])
+        report["dropped_from_live"] = {key: [str(x)[:100] for x in live_am.get(key, []) if x not in am.get(key, [])] for key in ("environment", "allow")}
+        merged["autoMode"] = am
+    else:
+        report["autoMode_after"] = before_counts
     perms = merged.setdefault("permissions", {})
     before = list(perms.get("ask", []))
     base_asks = ((baseline or {}).get("permissions") or {}).get("ask", [])
