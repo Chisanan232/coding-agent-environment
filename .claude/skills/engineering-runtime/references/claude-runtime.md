@@ -18,7 +18,7 @@ and uncomment the variables you want to override.
 | `CLAUDE_DECISION_LOG_DIR` | `~/.claude/decisions` | Structured decision log (daily JSONL) |
 | `CLAUDE_DECISION_LOG_ENABLED` | `1` | Set to `0` to disable the decision log |
 | `CLAUDE_DECISION_LOG_MAX_CONTEXT` | `500` | Max chars of context captured per entry |
-| `CLAUDE_ISSUE_TRACKER` | `github` | Which MCP to use for tickets: `github`, `clickup`, or `jira` |
+| `CLAUDE_ISSUE_TRACKER` | `github` | Which tracker to use for tickets: `github` (via the `gh` CLI), `clickup`, or `jira` (MCP) |
 | `CLAUDE_CURRENT_TICKET` | _(from `.claude/.current-ticket`)_ | Active ticket ref; overrides file lookup |
 | `CLAUDE_CURRENT_WORKTREE` | _(from `.claude/.current-worktree`)_ | Active worktree path for the current ticket |
 | `CLAUDE_CURRENT_RELEASE` | _(from `.claude/.current-release`)_ | Release or phase prefix for branch naming (e.g., `v0.1.0`, `phase1`); overrides file lookup |

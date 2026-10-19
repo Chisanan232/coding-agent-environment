@@ -1,12 +1,5 @@
 {
   "mcpServers": {
-    "github": {
-      "type": "http",
-      "url": "http://localhost:8082/",
-      "headers": {
-        "Authorization": "Bearer ${GITHUB_TOKEN}"
-      }
-    },
     "cloudflare-docs": {
       "type": "http",
       "url": "https://docs.mcp.cloudflare.com/mcp"

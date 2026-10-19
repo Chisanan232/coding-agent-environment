@@ -118,8 +118,8 @@ The full sequence is in
 
 Check `.mcp.json` for configured MCP tools. When an MCP-backed capability is
 available, prefer it over manual approximation; otherwise proceed and note the gap.
-`fetch` and `github` are active by default; other servers are opt-in per project.
-GitHub operations use `gh` first and the `github` MCP is optional (`engineering-workflow`, GitHub tool selection).
+`fetch` is active by default; other servers are opt-in per project.
+GitHub operations use `gh`; the `github` MCP is retired (`engineering-workflow`, GitHub tool selection).
 The capability table is in the [claude-runtime reference](skills/engineering-runtime/references/claude-runtime.md).
 
 ---
@@ -221,6 +221,15 @@ check and merge-strategy condition there; never bypass a genuine failing gate.
 
 This managed routing is authoritative for the shared engineering lifecycle;
 read existing merge-specific wording through the canonical contract above.
+
+## Resource Admission and GitHub Operations
+
+Before heavy work run `scripts/memory-admission.py check --weight heavy` from the coding-agent-environment checkout (it also asks the
+SPE-109 disk gate; it is not installed into `~/.claude`); one heavy
+lane at a time, never kill or delete another session's work, and treat a swap-used number as history, not current
+exhaustion. After a reboot treat earlier processes, locks, reservations and jobs as stale and reconcile before resuming.
+Use `gh` for GitHub; it never bypasses host authorization, PR classes, CI, reviews or the merge gate. Details:
+[engineering-workflow](skills/engineering-workflow/SKILL.md).
 
 ## Decision Delegation
 

@@ -454,7 +454,7 @@ I want to set up coding-agent-environment. Please:
 
 My preferences:
 - Scope: [global / project at <path>]
-- MCP servers I need: [github, jira, fetch, playwright, codegraph, etc.]
+- MCP servers I need: [jira, fetch, playwright, codegraph, etc.] (GitHub uses the `gh` CLI; the GitHub MCP is retired)
 
 Guide me through each step, explaining what each config file does.
 ```

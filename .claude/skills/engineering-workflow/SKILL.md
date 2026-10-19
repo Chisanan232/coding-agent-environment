@@ -23,17 +23,16 @@ implementation without disturbing unrelated state.
 
 ## GitHub tool selection
 
-Prefer the authenticated `gh` CLI for GitHub operations (inspection, PRs, reviews,
-CI, branch sync, approved merges, post-merge verification); GitHub MCP is optional.
-Verify the account and repository (`gh auth status`) before a mutation, never print
-or copy a token, and never switch to another account. If the MCP server or API is
-unavailable, errors, times out, returns an integration-permission error (such as 403)
-or lacks a capability, use `gh` for the same operation without asking and without
-retrying the failed MCP call; a repository-protection, ruleset or required-review
-refusal from GitHub itself is a gate, not an integration error. A host permission or classifier denial of a GitHub
-action through either interface is binding (`HARNESS_PERMISSION_BLOCK`): do not wrap,
-split or reroute it, never retry it through the other interface, and report the exact
-operator command. Never approve a PR with the account that authored it.
+Use the authenticated `gh` CLI as the GitHub interface (`gh pr`, `gh issue`, `gh run`, `gh release`, and
+`gh api` for anything those do not cover) together with local `git`, for inspection, PRs, reviews, CI,
+releases, branch sync, approved merges and post-merge verification. The GitHub MCP server is retired on this
+workstation: do not reconnect, rebuild or repair it, and do not call `mcp__github__*` tools. Verify the account and
+repository (`gh auth status`) before a mutation, never print or copy a token, and never switch to another account.
+Using `gh` first is not permission to bypass host authorization, the PR class A/B/C rules, required checks,
+reviews or the independent merge gate. A repository-protection, ruleset or required-review refusal from GitHub
+itself is a gate, not an integration error. A host permission or classifier denial of a GitHub action is binding
+(`HARNESS_PERMISSION_BLOCK`): do not wrap, split or reroute it, never retry it through another interface, and
+report the exact operator command. Never approve a PR with the account that authored it.
 
 Name a ticket branch with no change-type segment:
 
@@ -230,6 +229,33 @@ one prompt, is the unit of completion: `TASK_DONE` is not `CAMPAIGN_DONE`,
   `RELEASE_BLOCKED_BY_OPERATOR`. Never tag, publish, deploy to production or spend
   unapproved funds on the basis of campaign state; each remains gated by its own
   explicit authorization, including when every engineering gate is satisfied.
+
+## Resource admission and concurrency
+
+Before heavy work (workspace or full builds, Cargo workspace builds, Docker suites, native QA, full E2E, large
+parallel fan-out) assess the host; disk admission alone is not enough. Run
+`scripts/memory-admission.py check --weight heavy` from the coding-agent-environment checkout (it is not installed into
+`~/.claude`), then reserve through `scripts/disk-admission.py run`. The
+memory check reads the kernel pressure level and trend, swap I/O over a measured window, the compressor's share of
+RAM, load per core and other running heavy processes (free disk only to judge whether swap can grow), composes the
+existing SPE-109 disk gate with its reservations and lane caps, and keeps heavy work refused until consecutive good
+checks (hysteresis). A single swap-used figure is history, not proof of current exhaustion. Thresholds are proposed in
+`docs/RESOURCE-ADMISSION.md` in the coding-agent-environment repository; do not change the disk gate's thresholds.
+
+Run one admitted heavy lane at a time. Do not start competing Cargo workspace builds, Docker suites, native QA or full
+E2E, and lower subagent fan-out while pressure is not normal; prefer reusable build artifacts and isolated targets
+within the resource budget. Never kill another active session or delete its worktree, runtime, cache, container,
+reservation or scratch. Clean only regenerable caches and scratch proven idle and owned (owner, process lifetime, open
+handles, age, reproducibility). Age alone never justifies deletion; ask-only resources stay ask-only; never delete
+unknown or active work to reach an admission threshold. Aim for at least 100 GiB free.
+
+## Post-reboot recovery
+
+After a reboot or crash, treat every earlier process, lock, reservation, background-task and job observation as stale.
+Before resuming, reconcile GitHub (`gh pr list`, `gh run list`) and Jira with the persisted checkpoints, revalidate
+process and reservation identities (pid and start time, not names), and read each earlier test job's durable result:
+do not assume it survived or completed, and do not rerun finished work. Preserve completed QA evidence, resume only
+incomplete tasks, and record exact blockers and resume triggers.
 
 ## Secret-safe testing
 
