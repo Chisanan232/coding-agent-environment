@@ -225,14 +225,21 @@ def judge_bash(event, profile, fp_fn):
     if not NET_WORD.search(command):
         return None
     purpose = (event.get("tool_input") or {}).get("description") or None
-    hits = [h for argv in commands_in(command) for h in uploads(argv)]
+    try:
+        hits = [h for argv in commands_in(command) for h in uploads(argv)]
+    except Exception:  # e.g. an unterminated quote: a network tool is named but the command cannot be read
+        hits = [("unknown-host", command[:120])]
     if OPAQUE.search(command):
         hits.append(("unknown-host", command[:120]))  # a network tool is named inside a construct this hook cannot read
     worst, fp = None, None
     for host, hint in hits:
         action = {"kind": "outbound", "destination": host, "data_classes": ["unclassified"], "data_source": f"command arguments: {hint}",
                   "purpose": purpose, "visibility": "unknown"}
-        fp = fp if fp is not None else fp_fn()
+        if fp is None:
+            try:
+                fp = fp_fn()
+            except Exception:
+                fp = ""  # unreadable machine id: the profile cannot be verified, so it is ambiguous and fails closed
         res = wsp.decide(profile, action, fp)
         rank = {"ALLOW": 0, "ASK": 1, "DENY": 2}[res["verdict"]]
         if rank and (worst is None or rank > worst[0]):
@@ -268,7 +275,9 @@ def evaluate_event(event, profile, fp_fn):
         try:
             return judge_bash(event, profile, fp_fn)
         except Exception as ex:
-            print(f"workstation policy hook: could not judge command ({type(ex).__name__}); no opinion", file=sys.stderr)
+            command = (event.get("tool_input") or {}).get("command") or ""
+            if NET_WORD.search(command):  # never stay silent about a command that names a network tool
+                return decision("ask", f"workstation policy hook error while judging a command that names a network tool: {type(ex).__name__}")
             return None
     return None
 
