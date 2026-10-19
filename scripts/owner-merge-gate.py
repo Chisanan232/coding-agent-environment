@@ -63,6 +63,8 @@ def read_only(args):
     ok_api = verb[0] == "api" and len(args) > 1 and (verb[1] in ("user", "graphql") or any(r.fullmatch(verb[1]) for r in API_READS))
     if verb not in (("repo", "view"), ("pr", "view")) and not ok_api:
         raise RuntimeError(f"refused non-read-only gh call: {' '.join(verb)}")
+    if any(seg == ".." for a in args[:2] for seg in a.split("/")) or any(seg == ".." for seg in args[1].split("/")):
+        raise RuntimeError("refused path traversal segment")
     if "mutation" in " ".join(args).lower():
         raise RuntimeError("refused gh call containing a mutation")
     i = 2

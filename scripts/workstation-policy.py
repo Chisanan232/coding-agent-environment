@@ -35,6 +35,9 @@ PROTECTED_RELATIVE = (".claude/settings.json", ".claude/settings.local.json", ".
 # Settings keys that may change without owner approval; every other key can run commands or move a trust boundary.
 BENIGN_KEYS = {"model", "effortlevel", "advisormodel", "theme", "verbose"}
 NON_GOVERNED_KINDS = {"local"}
+# The only wildcard Bash allows a candidate may carry; everything else with a `*` is reported. Case-sensitive on purpose.
+READ_ONLY_ALLOW = re.compile(
+    r"Bash\((git (status|diff|log|show)|gh (pr|issue|run) (view|list|checks|diff|status)|ls|cat|pytest|python3 -m pytest)(:\*| \*)\)")
 
 ALTERNATIVES = {
     "documents": "share a redacted excerpt or a synthetic stand-in", "logs": "share a redacted excerpt with identifiers removed",
@@ -230,8 +233,8 @@ def lint_settings(cfg):
             bad.append(f"blanket allow {r}")
         elif re.search(r"gh pr merge|gh api.*merge|--admin", r):
             bad.append(f"standing merge permission {r}")
-        elif re.search(r"\((bash|sh|zsh|python3?|node|npx|env|xargs|sudo|eval|curl|wget|gh|git)\b[^)]*[: ]\*", r) and not re.fullmatch(r"Bash\((git (status|diff|log|show|branch)|gh (pr|issue|run) (view|list|checks|diff|status))[: ][^)]*\)", r):
-            bad.append(f"interpreter wildcard allow {r}")
+        elif "*" in r and not READ_ONLY_ALLOW.fullmatch(r):
+            bad.append(f"wildcard allow outside the read-only allowlist {r}")
     return bad
 
 

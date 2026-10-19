@@ -315,7 +315,9 @@ class ReadOnly(unittest.TestCase):
     def test_dotdot_refs_and_environment_reading_jq_are_refused(self):
         for bad in (["api", f"repos/{REPO}/compare/x/../../../../user...y", "--jq", ".a"],
                     ["api", f"repos/{REPO}/pulls/7/files", "--jq", "env.GH_TOKEN"], ["api", f"repos/{REPO}/pulls/7/files", "--jq", "$ENV.X"],
-                    ["api", f"repos/{REPO}/pulls/7/files", "--jq", "input"]):
+                    ["api", f"repos/{REPO}/pulls/7/files", "--jq", "input"],
+                    ["api", f"repos/{REPO}/compare/a.../..", "--jq", ".a"], ["api", f"repos/{REPO}/compare/../x...y", "--jq", ".a"],
+                    ["api", f"repos/{REPO}/compare/{HEAD}...a/../../../user", "--jq", ".a"]):
             with self.assertRaises(RuntimeError, msg=bad):
                 omg.read_only(bad)
 
