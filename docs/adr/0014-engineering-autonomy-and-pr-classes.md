@@ -108,3 +108,15 @@ settings and sandbox network limits.
 and its pinned hashes predate the owner's reset. The candidate is rolled out only with `scripts/candidate-rollout.py`
 (`docs/ROLLOUT-PERSONAL-MAC.md`), which merges just `autoMode`, the ask union and one optional hook entry. PR #93 shares no files with
 this change and can merge independently; its asks reach a machine through `--baseline`, not through its own apply path.
+
+**Measured before deployment (scratch settings, never the live file).** The candidate merged onto a copy of the live settings and
+run through the headless permission matrix (`claude -p --setting-sources project,local --settings <candidate>`; targets are nonexistent
+repositories, a disposable fixture and a local port): 20 static cases, all matching after one fix. Prompts were logged for plain and
+rtk-wrapped force pushes, `+refspec`, remote branch deletion, `gh pr merge --admin`, `gh release create`, npm/cargo/docker/twine
+publication, `gh api ... pulls/N/merge`, and writes to project `settings.json`, `.mcp.json` and a hook script. The pinned Class A merge,
+ordinary source/doc writes, skill and command writes and `git status` ran with no prompt. The first run exposed a real defect (`gh api *
+merge*` never matched a `/merge` path; the classifier blocked instead of the ask rule), fixed by `*pulls/*/merge*`. Hook isolation: with
+`curl` allowed at the permission layer, an upload executes without the hook and is blocked with it (personal and corporate profiles);
+downloads and `ls` are unaffected. Headless mode cannot show whether a hook `ask` becomes a prompt or a denial, so ask-versus-deny
+behavior of the hook is not live-verified. This is pre-deployment evidence on one machine, not `POLICY_LIVE_TESTED`: the deployed file and
+resumed sessions have not been tested because nothing is deployed.
