@@ -45,8 +45,8 @@ Status as of this revision. **Nothing introduced by SPE-116 is deployed**, so ev
 | `gh pr merge --admin` | **Candidate** | Live settings allow `gh pr merge:*` and have no `--admin` ask, so an admin merge is ungated at the permission layer today; the candidate adds the ask |
 | Class A/B/C merge rules | **Advisory (process)** | `owner-merge-gate.py` is deterministic but only when someone runs it; nothing forces a merge through it, GitHub has no protection or rulesets on these repositories, and the host allows `gh pr merge:*`. Class C "owner approval required" and "never --admin" are enforced only by the gate and agent discipline |
 | Edits to settings, hooks, `~/.claude/bin`, `.mcp.json`, managed settings | **Candidate, Edit/Write tools only** | Candidate `Edit(...)`/`Write(...)` asks and `workstation-policy-hook.py` (not installed). Writes by shell redirect or `sed -i` are covered only by the built-in classifier rule, which is not deterministic |
-| Personal sensitive outbound ASK with packet | **Oracle + partial hook** | Hook judges only curl/wget/scp/rsync/sftp/nc uploads; not git, gh, package managers, interpreters, MCP tools or WebFetch |
-| Corporate prohibited outbound DENY | **Not enforced** | Needs the organization's managed settings (`allowManagedHooksOnly`, `allowManagedPermissionRulesOnly`) and sandbox network limits (`sandbox.network.allowedDomains`, `allowManagedDomainsOnly`). The sandbox covers shell commands only; file tools, MCP servers and hooks run outside it. A hook that crashes or times out fails open unless the hook entry sets `onFailure: "block"` |
+| Personal sensitive outbound ASK with packet | **Oracle + partial hook** | Hook judges only curl/wget/scp/rsync/sftp/nc uploads (also inside `$()`, backticks, `sh -c`, wrappers). It does NOT see: git/gh/package-manager traffic, `ssh`, `aws`/`gcloud`/`rclone` uploads, interpreter-made requests, MCP tools, WebFetch, shell quoting or variable indirection (`cu""rl`, `C=curl; $C`), or data carried in a GET URL or header. Shell parsing is best-effort |
+| Corporate prohibited outbound DENY | **Not enforced** | Needs the organization's managed settings (`allowManagedHooksOnly`, `allowManagedPermissionRulesOnly`) and sandbox network limits (`sandbox.network.allowedDomains`, `allowManagedDomainsOnly`). The sandbox covers shell commands only; file tools, MCP servers and hooks run outside it. A hook that crashes or times out fails open unless the hook entry sets `onFailure: "block"` (check the minimum Claude Code version for that field in the hooks reference). The adapter itself escalates, rather than ignores, its own errors on commands that name a network tool |
 | Machine profile verification | **Weak by design** | A fingerprint detects a profile copied to the wrong machine, not a forged or rewritten one |
 | Auto Mode candidate (`$defaults`, short environment) | **Candidate** | `docs/examples/candidate-settings-*.example.json`, rolled out only by `candidate-rollout.py` |
 
@@ -92,6 +92,9 @@ Both are stricter than the approved policy, so they fail closed; they are listed
    `settings*.json`, `hooks`, `bin`, `plugins`, `~/.claude.json`, managed settings and `.mcp.json` ask;
    skills, commands and agents stay autonomous unless their frontmatter adds `hooks`, `allowed-tools`
    or `permissionMode`. Same host denial, same status.
+3. **Personal upload with no stated purpose.** The hook builds the disclosure packet from the Bash `description` as the
+   purpose. Without one the personal profile DENIES (`ASK_PACKET_INCOMPLETE`) instead of asking with a "purpose missing" note.
+   Stricter than the approved per-operation ASK; the same DENY-to-ASK direction as item 1, so it is not changed without the owner.
 
 ## 6. Validation
 
@@ -117,6 +120,7 @@ and one optional PreToolUse hook entry, and never `allow`, `deny`, `env` or othe
 2. Test the result on a scratch copy with the fresh and resumed matrix (`docs/ROLLOUT-PERSONAL-MAC.md`) before any apply.
 3. After explicit owner approval, the owner runs `apply` with both hashes pinned. It backs up the live file (0600),
    refuses on any hash mismatch or blocking finding, and writes atomically.
-4. `verify` confirms the result hash; `rollback` restores the backup after checking its hash.
+4. `verify` confirms the result hash; `rollback` restores the backup after checking both its hash and that the live file still
+   has the hash `apply` produced, so edits made since apply are never silently lost.
 5. Corporate machines: use the organization's managed settings; see `docs/ROLLOUT-CORPORATE-PROFILE.md`.
    This repository never carries corporate hostnames or controls.

@@ -57,7 +57,8 @@ Copy `scripts/workstation-policy.py` and `scripts/workstation-policy-hook.py` to
 create the private profile (`workstation-policy.py fingerprint`, then copy the template and fill it), and plan/apply with
 `--hook-command "python3 <installed path>/workstation-policy-hook.py"`. Add `--fail-closed` only after reading the
 trade-off: `onFailure: "block"` makes a missing or broken script block every matched call, including the Bash commands
-you would use to repair it. Without it, a crash or timeout fails open.
+you would use to repair it. Without it, a crash or timeout fails open. The adapter escalates its own judging errors on
+commands that name a network tool either way. Check the field's minimum Claude Code version in the hooks reference.
 
 ## Compatibility checks (before apply)
 
@@ -90,7 +91,8 @@ measured defects to fix, not reasons to relax a rule.
 ## Rollback
 
 ```bash
-python3 $R/scripts/candidate-rollout.py rollback --live "$L" --backup ~/.claude/backups/settings.<LIVE_SHA_BEFORE first 12>.json --expect-backup-sha <LIVE_SHA_BEFORE>
+python3 $R/scripts/candidate-rollout.py rollback --live "$L" --backup ~/.claude/backups/settings.<LIVE_SHA_BEFORE first 12>.json --expect-backup-sha <LIVE_SHA_BEFORE> \
+  --expect-live-sha <RESULT_SHA or the live hash right now>
 shasum -a 256 "$L"        # must equal LIVE_SHA_BEFORE
 ```
 

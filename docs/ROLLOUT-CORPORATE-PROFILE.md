@@ -21,7 +21,8 @@ mismatched profile fails closed.
 
 The hook sees curl, wget, scp, rsync, sftp and nc uploads (including inside `bash -c`, `$()` and common wrappers). It does
 not see git or gh traffic, package managers, interpreter-made requests (`python -c`, `node -e`), MCP tools, WebFetch,
-redirects or file contents, and shell parsing is best-effort. A crashed or timed-out hook fails open unless the entry sets
+redirects or file contents; `ssh`, `aws`/`gcloud`/`rclone` uploads; shell quoting or variable indirection (`cu""rl`, `C=curl; $C`);
+or data carried in a GET URL or header. Shell parsing is best-effort. A crashed or timed-out hook fails open unless the entry sets
 `onFailure: "block"`. It is a guard rail, not a boundary.
 
 ## What real enforcement needs (organization-owned, not this repository)
