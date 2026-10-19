@@ -109,7 +109,7 @@ def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu
             return None
     comms = _run([PS, "-axo", "comm="], run)
     heavy = None   # None = the process list could not be read (unknown), never "no heavy process"
-    if comms is not None:
+    if comms is not None and comms.strip():   # empty output from a successful ps is not "nothing running": a live system always has processes
         heavy = {}
         for line in comms.splitlines():
             base = os.path.basename(line.strip())
@@ -224,7 +224,7 @@ def decide(weight, m, state, now):
     reasons, unknown = refusal_reasons(weight, m)
     warnings = []
     lvl = m.get("pressure_level")
-    levels = (st.get("levels") or [])[-4:] + ([lvl] if lvl is not None else [])
+    levels = (st.get("levels") or [])[-4:] + ([lvl] if lvl in VALID_LEVELS else [])
     st["levels"] = levels
     if len(levels) >= 2 and levels[-1] > levels[-2]:
         warnings.append(f"pressure trend rising ({levels[-2]} -> {levels[-1]})")

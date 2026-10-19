@@ -337,6 +337,18 @@ class ReviewHardening(unittest.TestCase):
         self.assertTrue(any("process list unreadable" in r for r in v["reasons"]))
         self.assertTrue(ma.decide("light", m, None, 1.0)[0]["admit"])
 
+    def test_empty_ps_output_is_unknown_not_nothing_running(self):
+        def run(cmd, **kw):
+            out = {"ps": "", "vm_stat": VM_STAT}.get(os.path.basename(cmd[0]), "1\n")
+            return type("R", (), {"returncode": 0, "stdout": out})()
+        s = ma.take_sample(run=run, now_fn=lambda: 1.0, mono_fn=lambda: 1.0, load_fn=lambda: (1.0, 1.0, 1.0), cpu_fn=lambda: 16, disk_free_fn=lambda: GIB)
+        self.assertIsNone(s["heavy_procs"])
+
+    def test_an_out_of_range_pressure_level_is_never_saved_into_state(self):
+        _, st = ma.decide("heavy", metrics(level=0), None, 0.0)
+        self.assertEqual(st["levels"], [])
+        self.assertTrue(st["latched"])
+
     def test_each_remaining_unknown_input_alone_fails_closed_for_heavy(self):
         for field in ("swap", "disk_free"):
             b = sample(10)
