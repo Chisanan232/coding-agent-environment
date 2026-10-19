@@ -96,4 +96,15 @@ python3 $R/scripts/candidate-rollout.py rollback --live "$L" --backup ~/.claude/
 shasum -a 256 "$L"        # must equal LIVE_SHA_BEFORE
 ```
 
-Existing sessions keep their startup settings; start a new session (or resume) after any apply or rollback.
+Whether an already-running session re-reads changed permission rules is unverified, so apply and roll back only while no other
+Claude Code session is active, then start a new session. Rely on the fresh-versus-resumed matrix row, not on an assumption.
+Before `apply`, run from a clean checkout of merged `main` and record `git rev-parse HEAD`, and the sha256 of the two scripts, the
+baseline and the candidate: the tool is not self-pinning, and `apply` has a small unlocked window before the atomic write.
+
+### Known limits of the ask patterns (reasoned from glob semantics by the independent review; not individually measured)
+
+The asks match command text. They do not catch: `git push origin :branch`, `git push -d`/`--delete origin x` (remote name first),
+`--mirror`/`--prune`, combined flags such as `-uf`, `git -C dir push -f`, env-prefixed or `bash -c` wrappers, `gh api graphql`
+merge mutations, `npm --registry x publish`, `cargo +nightly publish`, `yarn/poetry/maturin publish`, `python -m twine upload`,
+`docker buildx build --push`, `curl -X DELETE`, and Bash writes (`sed -i`, `tee`, redirects) to settings or hooks. The built-in
+classifier and the asks already in the live file remain a second layer; nothing here is a security boundary.

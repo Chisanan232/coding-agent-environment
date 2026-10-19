@@ -6,7 +6,7 @@
       "Source of truth: GitHub repositories owned by the owner; Jira for tickets; the workstation profile is personal.",
       "Task-owned resources (own worktree, scratch dir, regenerable build output) may be created and removed; other sessions' work is not task-owned.",
       "Merges follow each repository's documented PR class policy and are never pre-authorized by this text; a host denial stands and is reported, never rerouted.",
-      "Personal machine: sensitive outbound disclosure is approved per operation."
+      "Personal machine: no standing approval exists for sending sensitive data to external services; each such send needs explicit user approval at that time."
     ],
     "allow": [
       "$defaults"
