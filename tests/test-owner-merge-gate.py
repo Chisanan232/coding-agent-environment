@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""Unit tests for scripts/owner-merge-gate.py with a fake gh runner (SPE-115).
+
+Live behavior (the host classifier, a real merge) is covered by the acceptance runs recorded in
+the ticket, not here.
+"""
+import importlib.util
+import json
+import pathlib
+import unittest
+
+SPEC = importlib.util.spec_from_file_location("omg", pathlib.Path(__file__).resolve().parents[1] / "scripts/owner-merge-gate.py")
+omg = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(omg)
+
+HEAD = "a" * 40
+OWNERS = ["Chisanan232", "horonomy", "ai-agent-assembly"]
+REVIEW = f"OWNER-MERGE-REVIEW head={HEAD} verdict=PASS blocking=0 reviewer=independent-agent-1"
+
+
+def green():
+    return [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+
+
+class Fake:
+    """Answers the gh calls the gate makes from a mutable state dict."""
+
+    def __init__(self, **over):
+        self.pr = {"number": 7, "state": "OPEN", "isDraft": False, "baseRefName": "main", "headRefOid": HEAD,
+                   "author": {"login": "chisanan232"}, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+                   "reviewDecision": "", "reviews": [], "isCrossRepository": False, "mergeCommit": None,
+                   "comments": [{"author": {"login": "chisanan232"}, "body": REVIEW}],
+                   "statusCheckRollup": green()}
+        self.repo = {"nameWithOwner": "Chisanan232/r", "defaultBranchRef": {"name": "main"}, "isFork": False,
+                     "viewerPermission": "ADMIN", "owner": {"login": "Chisanan232"}}
+        self.behind, self.threads, self.me, self.more_threads = 0, [], "chisanan232", False
+        self.parents, self.cmp, self.org_role = [HEAD, "b" * 40], "ahead", "admin active"
+        for k, v in over.items():
+            target = self.repo if k in self.repo else self.pr if k in self.pr else None
+            if target is None:
+                setattr(self, k, v)
+            else:
+                target[k] = v
+
+    def __call__(self, *a):
+        if a[:2] == ("repo", "view"):
+            return json.dumps(self.repo)
+        if a[:2] == ("api", "user"):
+            return self.me + "\n"
+        if a[:2] == ("pr", "view"):
+            return json.dumps(self.pr)
+        if a[0] == "api" and "/compare/" in a[1]:
+            return (str(self.behind) if "behind_by" in a[3] else self.cmp) + "\n"
+        if a[:2] == ("api", "graphql"):
+            return json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"pageInfo": {"hasNextPage": self.more_threads}, "nodes": self.threads}}}}})
+        if a[0] == "api" and a[1].startswith("orgs/"):
+            return self.org_role + "\n"
+        if a[0] == "api" and "/commits/" in a[1]:
+            return json.dumps(self.parents)
+        raise AssertionError(a)
+
+
+def run(fake, **kw):
+    return omg.evaluate(fake, "Chisanan232/r", 7, OWNERS, **kw)
+
+
+class Gate(unittest.TestCase):
+    def refused(self, fake, code, **kw):
+        v, reasons, _ = run(fake, **kw)
+        self.assertEqual(v, "REFUSE", reasons)
+        self.assertTrue(any(r.startswith(code) for r in reasons), reasons)
+
+    def test_reviewed_green_pr_passes_with_pinned_merge_commit_command(self):
+        v, reasons, facts = run(Fake())
+        self.assertEqual((v, reasons), ("PASS", []))
+        cmd = omg.merge_command(facts)
+        self.assertIn("--merge", cmd)
+        self.assertIn(f"--match-head-commit {HEAD}", cmd)
+        self.assertNotIn("--admin", cmd)
+        self.assertNotIn("--squash", cmd)
+
+    def test_failed_required_ci_refuses(self):
+        self.refused(Fake(statusCheckRollup=[{"name": "t", "status": "COMPLETED", "conclusion": "FAILURE"}]), "CI_FAILED")
+
+    def test_pending_ci_waits_not_passes(self):
+        v, _, _ = run(Fake(statusCheckRollup=[{"name": "t", "status": "IN_PROGRESS", "conclusion": ""}]))
+        self.assertEqual(v, "WAIT")
+
+    def test_unresolved_review_thread_refuses(self):
+        self.refused(Fake(threads=[{"isResolved": False, "isOutdated": False}]), "UNRESOLVED_REVIEW_THREADS")
+
+    def test_outstanding_request_changes_refuses(self):
+        self.refused(Fake(reviews=[{"state": "CHANGES_REQUESTED", "author": {"login": "x"}}]), "CHANGES_REQUESTED")
+
+    def test_head_changed_after_review_refuses(self):
+        self.refused(Fake(headRefOid="c" * 40), "REVIEW_STALE")
+
+    def test_missing_review_record_refuses(self):
+        self.refused(Fake(comments=[]), "NO_REVIEW_EVIDENCE")
+
+    def test_review_record_from_another_user_does_not_count(self):
+        self.refused(Fake(comments=[{"author": {"login": "someone-else"}, "body": REVIEW}]), "NO_REVIEW_EVIDENCE")
+
+    def test_review_with_blocking_findings_refuses(self):
+        body = REVIEW.replace("blocking=0", "blocking=2")
+        self.refused(Fake(comments=[{"author": {"login": "chisanan232"}, "body": body}]), "REVIEW_NOT_CLEAN")
+
+    def test_author_review_is_not_independent(self):
+        body = REVIEW.replace("independent-agent-1", "coordinator")
+        self.refused(Fake(comments=[{"author": {"login": "chisanan232"}, "body": body}]), "REVIEW_NOT_INDEPENDENT")
+
+    def test_stale_branch_refuses_so_overlapping_lockfile_prs_serialize(self):
+        self.refused(Fake(behind=1), "STALE_BRANCH")
+
+    def test_conflicting_pr_refuses(self):
+        self.refused(Fake(mergeable="CONFLICTING", mergeStateStatus="DIRTY"), "CONFLICTS")
+
+    def test_required_formal_review_is_never_substituted(self):
+        self.refused(Fake(reviewDecision="REVIEW_REQUIRED", mergeStateStatus="BLOCKED"), "FORMAL_APPROVAL_REQUIRED")
+
+    def test_repository_rule_block_refuses(self):
+        self.refused(Fake(mergeStateStatus="BLOCKED"), "BLOCKED_BY_REPOSITORY_RULES")
+
+    def test_untrusted_owner_refuses_before_any_gh_call(self):
+        v, reasons, _ = omg.evaluate(lambda *a: self.fail("gh called"), "evil/r", 7, OWNERS)
+        self.assertEqual(v, "REFUSE")
+        self.assertTrue(reasons[0].startswith("UNAUTHORIZED_REPO"))
+
+    def test_lookalike_owner_prefix_refuses(self):
+        v, reasons, _ = omg.evaluate(lambda *a: self.fail("gh called"), "Chisanan2320/r", 7, OWNERS)
+        self.assertEqual(v, "REFUSE")
+
+    def test_fork_and_cross_repository_head_refuse(self):
+        self.refused(Fake(isFork=True), "FORK_REPO")
+        self.refused(Fake(isCrossRepository=True), "CROSS_REPOSITORY_HEAD")
+
+    def test_non_default_and_deployment_bases_refuse(self):
+        self.refused(Fake(baseRefName="release"), "BASE_NOT_DEFAULT_OR_DEPLOY")
+        self.refused(Fake(baseRefName="feature-x"), "BASE_NOT_DEFAULT_OR_DEPLOY")
+
+    def test_draft_and_closed_refuse(self):
+        self.refused(Fake(isDraft=True), "DRAFT")
+        self.refused(Fake(state="MERGED"), "NOT_OPEN")
+
+    def test_no_checks_without_exception_refuses(self):
+        self.refused(Fake(statusCheckRollup=[]), "NO_CI_EVIDENCE")
+
+    def test_ci_unavailable_needs_flag_and_head_pinned_record(self):
+        record = f"OWNER-MERGE-CI-UNAVAILABLE head={HEAD} cause=billing local_equivalent=PASS"
+        comments = [{"author": {"login": "chisanan232"}, "body": REVIEW}, {"author": {"login": "chisanan232"}, "body": record}]
+        self.refused(Fake(statusCheckRollup=[], comments=comments), "NO_CI_EVIDENCE")  # flag missing
+        v, _, facts = run(Fake(statusCheckRollup=[], comments=comments), ci_unavailable=True)
+        self.assertEqual((v, facts["ci_exception"]), ("PASS", "billing"))
+        stale = [comments[0], {"author": {"login": "chisanan232"}, "body": record.replace(HEAD, "d" * 40)}]
+        self.refused(Fake(statusCheckRollup=[], comments=stale), "NO_CI_EVIDENCE", ci_unavailable=True)
+
+    def test_ci_unavailable_never_excuses_a_genuine_failure(self):
+        record = f"OWNER-MERGE-CI-UNAVAILABLE head={HEAD} cause=billing local_equivalent=PASS"
+        comments = [{"author": {"login": "chisanan232"}, "body": REVIEW}, {"author": {"login": "chisanan232"}, "body": record}]
+        bad = [{"name": "t", "status": "COMPLETED", "conclusion": "FAILURE"}]
+        self.refused(Fake(statusCheckRollup=bad, comments=comments), "CI_FAILED", ci_unavailable=True)
+
+
+class Verify(unittest.TestCase):
+    def fake(self, state="MERGED", parents=None, cmp="ahead"):
+        f = Fake(parents=parents or [HEAD, "b" * 40], cmp=cmp)
+        f.pr = {"state": state, "mergeCommit": {"oid": "m" * 40} if state == "MERGED" else None, "baseRefName": "main"}
+        return f
+
+    def test_merge_commit_with_reviewed_head_parent_verifies(self):
+        self.assertEqual(omg.verify(self.fake(), "Chisanan232/r", 7, HEAD)["verdict"], "VERIFIED")
+
+    def test_squash_shaped_single_parent_is_a_mismatch(self):
+        self.assertEqual(omg.verify(self.fake(parents=["b" * 40]), "Chisanan232/r", 7, HEAD)["verdict"], "MISMATCH")
+
+    def test_head_not_a_parent_is_a_mismatch(self):
+        self.assertEqual(omg.verify(self.fake(parents=["c" * 40, "b" * 40]), "Chisanan232/r", 7, HEAD)["verdict"], "MISMATCH")
+
+    def test_open_pr_is_not_merged(self):
+        self.assertEqual(omg.verify(self.fake(state="OPEN"), "Chisanan232/r", 7, HEAD)["verdict"], "NOT_MERGED")
+
+
+class ReviewHardening(unittest.TestCase):
+    def refused(self, fake, code, **kw):
+        v, reasons, _ = run(fake, **kw)
+        self.assertEqual(v, "REFUSE", reasons)
+        self.assertTrue(any(r.startswith(code) for r in reasons), reasons)
+
+    def test_read_only_allowlist_rejects_attached_and_header_forms(self):
+        for call in (("api", "repos/o/r/issues/1/comments", "-XPOST", "-fbody=x"), ("api", "repos/o/r", "-H", "X-HTTP-Method-Override: POST"),
+                     ("api", "repos/o/r", "--hostname", "evil.example"), ("api", "repos/o/r", "--input", "x.json"), ("api", "repos/o/r", "--paginate"),
+                     ("api", "repos/o/r", "--method=POST"), ("api", "graphql", "-f", "query=mutation{x}"), ("api", "graphql", "-f", "evil=1"),
+                     ("api", "graphql", "-H", "x: y"), ("pr", "merge", "1"), ("repo", "delete", "o/r"), ("api", "user", "-XDELETE")):
+            with self.assertRaises(RuntimeError, msg=call):
+                omg.read_only(call)
+
+    def test_read_only_allowlist_accepts_the_calls_the_gate_makes(self):
+        for call in (("repo", "view", "o/r", "--json", "x"), ("pr", "view", "7", "--repo", "o/r", "--json", "x"), ("api", "user", "--jq", ".login"),
+                     ("api", "repos/o/r/compare/main...abc", "--jq", ".behind_by"), ("api", "orgs/o/memberships/me", "--jq", ".role"),
+                     ("api", "graphql", "-f", "query=query($o:String!){x}", "-F", "o=o", "-F", "n=7")):
+            omg.read_only(call)
+
+    def test_repo_name_with_newline_or_dot_segments_is_refused(self):
+        for bad in ("Chisanan232/r\n", "Chisanan232/..", "Chisanan232/."):
+            v, reasons, _ = omg.evaluate(lambda *a: self.fail("gh called"), bad, 7, OWNERS)
+            self.assertEqual(v, "REFUSE", bad)
+
+    def test_error_exit_code_is_distinct_from_wait_and_refuse(self):
+        import contextlib
+        import io
+        def boom(*a):
+            raise FileNotFoundError("gh")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = omg.main(["check", "--repo", "Chisanan232/r", "--pr", "1", "--owners", "Chisanan232"], run=boom)
+        self.assertEqual(rc, 3)
+        self.assertEqual(json.loads(out.getvalue())["verdict"], "ERROR")
+
+    def test_queue_reports_error_per_pr_and_nonzero_exit(self):
+        import contextlib
+        import io
+        def boom(*a):
+            raise RuntimeError("no auth")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = omg.main(["queue", "--repo", "Chisanan232/r", "--prs", "1,2", "--owners", "Chisanan232"], run=boom)
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.getvalue().count("ERROR"), 2)
+
+    def test_stale_approval_is_not_reported_as_formal_approval(self):
+        old = [{"state": "APPROVED", "author": {"login": "rev"}, "commit": {"oid": "c" * 40}}]
+        self.assertFalse(run(Fake(reviews=old))[2]["formal_github_approval"])
+        cur = [{"state": "APPROVED", "author": {"login": "rev"}, "commit": {"oid": HEAD}}]
+        self.assertTrue(run(Fake(reviews=cur))[2]["formal_github_approval"])
+
+    def test_record_inside_a_code_fence_is_ignored(self):
+        body = "example:\n```\n" + REVIEW + "\n```\n"
+        self.refused(Fake(comments=[{"author": {"login": "chisanan232"}, "body": body}]), "NO_REVIEW_EVIDENCE")
+
+    def test_mixed_pass_and_fail_records_at_one_head_refuse(self):
+        fail = REVIEW.replace("verdict=PASS blocking=0", "verdict=FAIL blocking=1")
+        comments = [{"author": {"login": "chisanan232"}, "body": REVIEW}, {"author": {"login": "chisanan232"}, "body": fail}]
+        self.refused(Fake(comments=comments), "REVIEW_NOT_CLEAN")
+
+    def test_all_skipped_or_neutral_checks_are_not_a_pass(self):
+        self.refused(Fake(statusCheckRollup=[{"name": "t", "status": "COMPLETED", "conclusion": "SKIPPED"}]), "NO_CI_EVIDENCE")
+
+    def test_status_context_shapes(self):
+        ok = [{"context": "legacy", "state": "SUCCESS"}]
+        self.assertEqual(run(Fake(statusCheckRollup=ok))[0], "PASS")
+        self.refused(Fake(statusCheckRollup=[{"context": "legacy", "state": "FAILURE"}]), "CI_FAILED")
+        self.assertEqual(run(Fake(statusCheckRollup=[{"context": "legacy", "state": "PENDING"}]))[0], "WAIT")
+
+    def test_merge_state_values(self):
+        self.refused(Fake(mergeStateStatus="UNSTABLE"), "MERGE_STATE_NOT_CLEAN")
+        self.assertEqual(run(Fake(mergeStateStatus="UNKNOWN"))[0], "WAIT")
+
+    def test_possibly_truncated_comment_history_refuses(self):
+        many = [{"author": {"login": "x"}, "body": "c"}] * 99 + [{"author": {"login": "chisanan232"}, "body": REVIEW}]
+        self.refused(Fake(comments=many), "EVIDENCE_TRUNCATED")
+
+    def test_org_is_trusted_only_if_viewer_administers_it(self):
+        org = {"nameWithOwner": "horonomy/r", "owner": {"login": "horonomy"}}
+        v, reasons, _ = omg.evaluate(Fake(**org), "horonomy/r", 7, OWNERS)
+        self.assertEqual((v, reasons), ("PASS", []))
+        v, reasons, _ = omg.evaluate(Fake(org_role="member active", **org), "horonomy/r", 7, OWNERS)
+        self.assertEqual(v, "REFUSE")
+        self.assertTrue(any(r.startswith("OWNER_NOT_ADMINISTERED_BY_VIEWER") for r in reasons))
+
+    def test_non_admin_viewer_refuses(self):
+        self.refused(Fake(viewerPermission="WRITE"), "NOT_REPO_ADMIN")
+
+    def test_verify_rejects_bad_repo_or_head(self):
+        self.assertEqual(omg.verify(lambda *a: self.fail("gh"), "Chisanan232/r\n", 7, HEAD)["verdict"], "ERROR")
+        self.assertEqual(omg.verify(lambda *a: self.fail("gh"), "Chisanan232/r", 7, "abc")["verdict"], "ERROR")
+
+
+if __name__ == "__main__":
+    unittest.main()
