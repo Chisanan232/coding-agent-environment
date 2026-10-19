@@ -86,7 +86,8 @@ def simple_commands(command):
     except ValueError:
         # Unbalanced quotes (an apostrophe in a heredoc commit message, or a deliberate trick): fall back to a quote-blind split
         # so a command that starts with a network tool is still seen, while prose that merely mentions one is not.
-        return [seg.split() for seg in re.split(r"[;&|()<>\n]+", command) if seg.split()]
+        segments = [[re.sub(r"[\"'\\]", "", tok) for tok in seg.split()] for seg in re.split(r"[;&|()<>\n]+", command)]
+        return [seg for seg in segments if seg]  # quotes and backslashes are dropped so cu"rl or \\curl still resolve to the tool
 
 
 def host_of(token):
@@ -227,7 +228,7 @@ def uploads(argv):
 
 def judge_bash(event, profile, fp_fn):
     command = (event.get("tool_input") or {}).get("command") or ""
-    if not NET_WORD.search(command):
+    if not NET_WORD.search(command) and not NET_WORD.search(re.sub(r"[\"'\\]", "", command)):
         return None
     purpose = (event.get("tool_input") or {}).get("description") or None
     try:
