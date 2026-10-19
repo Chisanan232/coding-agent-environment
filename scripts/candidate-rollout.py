@@ -4,7 +4,7 @@
   candidate-rollout.py plan     --live F --candidate F [--baseline F] [--hook-command CMD [--fail-closed]]
   candidate-rollout.py apply    --live F --candidate F [--baseline F] [--hook-command CMD] --expect-live-sha S --expect-result-sha S [--backup-dir D]
   candidate-rollout.py verify   --live F --expect-result-sha S
-  candidate-rollout.py rollback --live F --backup F --expect-backup-sha S
+  candidate-rollout.py rollback --live F --backup F --expect-backup-sha S --expect-live-sha S
 
 Only three things are merged: the `autoMode` block is replaced by the candidate's, `permissions.ask` becomes the
 ordered union of live, baseline and candidate asks, and (optionally) one PreToolUse hook entry is added. Everything
@@ -116,8 +116,10 @@ def compat(live, merged, candidate, report_conflicts=()):
     return out
 
 
-def plan(args):
-    raw, live = load(args.live)
+def plan(args, raw=None):
+    if raw is None:
+        raw = pathlib.Path(args.live).read_bytes()
+    live = json.loads(raw)
     _, cand = load(args.candidate)
     baseline = load(args.baseline)[1] if args.baseline else None
     merged, report = merge(live, cand, baseline, args.hook_command, args.fail_closed)
@@ -143,7 +145,8 @@ def atomic_write(path, text):
 
 
 def apply(args):
-    p = plan(args)
+    raw = pathlib.Path(args.live).read_bytes()  # one read: the pin check, the plan, and the backup all use these exact bytes
+    p = plan(args, raw)
     if p["live_sha"] != args.expect_live_sha:
         raise SystemExit(f"REFUSED: live file hash {p['live_sha']} != pinned {args.expect_live_sha}; re-run plan")
     if p["result_sha"] != args.expect_result_sha:
@@ -153,8 +156,11 @@ def apply(args):
     bdir = pathlib.Path(os.path.expanduser(args.backup_dir))
     bdir.mkdir(parents=True, exist_ok=True)
     backup = bdir / f"settings.{p['live_sha'][:12]}.json"
-    shutil.copyfile(args.live, backup)
-    os.chmod(backup, 0o600)
+    fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(raw)
+    if sha(pathlib.Path(args.live).read_bytes()) != p["live_sha"]:
+        raise SystemExit("REFUSED: the live file changed while applying; nothing was written, re-run plan")
     atomic_write(args.live, p["_text"])
     return {"applied": True, "backup": str(backup), "backup_sha": p["live_sha"], "result_sha": sha(pathlib.Path(args.live).read_bytes())}
 
@@ -165,6 +171,8 @@ def verify(args):
 
 
 def rollback(args):
+    if sha(pathlib.Path(args.live).read_bytes()) != args.expect_live_sha:
+        raise SystemExit("REFUSED: the live file is not the one the rollback was pinned to (changes made since apply would be lost); re-check it first")
     data = pathlib.Path(args.backup).read_bytes()
     if sha(data) != args.expect_backup_sha:
         raise SystemExit("REFUSED: backup hash does not match the pinned value")
@@ -193,6 +201,7 @@ def main(argv=None):
     r.add_argument("--live", required=True)
     r.add_argument("--backup", required=True)
     r.add_argument("--expect-backup-sha", required=True)
+    r.add_argument("--expect-live-sha", required=True, help="hash of the live file right now (the apply result unless it was edited since)")
     a = ap.parse_args(argv)
     out = {"plan": plan, "apply": apply, "verify": verify, "rollback": rollback}[a.cmd](a)
     out.pop("_text", None)
