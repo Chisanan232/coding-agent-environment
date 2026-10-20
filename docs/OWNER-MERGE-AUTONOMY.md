@@ -30,32 +30,35 @@ One standard form, emitted by the gate (`scripts/owner-merge-gate.py check`), ru
 gh pr merge <N> --repo <OWNER/REPO> --merge --match-head-commit <40-hex>
 ```
 
-Rules: no `cd`, no env prefix, no `;`/`&&`, no pipe, no `$(…)`, no loop, no heredoc. One merge per tool call.
+Rules: no `cd`, no env prefix, no `;`/`&&`, no pipe, no `$(…)`, no loop, no heredoc. One merge per tool call. Measured history: every denial was a compound or wrapped shape; the host evaluates compound commands per subcommand, so a shape that misses the allow rule reaches the classifier, but the exact classifier input for each wrapped form is not documented.
 
 Settings change (owner-applied, user scope):
 
-```diff
- "permissions": {
-   "allow": [
--    "Bash(gh pr merge:*)",
--    "Bash(gh pr *)",
--    "Bash(rtk gh pr *)",
-+    "Bash(gh pr merge * --merge --match-head-commit *)",
-+    "Bash(rtk gh pr merge * --merge --match-head-commit *)",
-+    "Bash(gh pr view:*)", "Bash(gh pr list:*)", "Bash(gh pr checks:*)",
-+    "Bash(gh pr diff:*)", "Bash(gh pr status:*)", "Bash(gh pr comment:*)",
-+    "Bash(gh pr create:*)", "Bash(gh pr edit:*)", "Bash(gh pr ready:*)",
-+    (and the rtk-prefixed equivalents)
-   ],
-   "ask": [
-+    "Bash(gh pr merge * --admin*)", "Bash(gh pr merge --admin*)",
-+    "Bash(gh pr merge * --squash*)", "Bash(gh pr merge * --rebase*)",
-+    "Bash(gh pr merge * --auto*)",
-+    "Bash(gh pr review * --approve*)"
-   ]
+```json
+{
+  "remove_allow": ["Bash(gh pr merge:*)", "Bash(gh pr *)", "Bash(rtk gh pr *)"],
+  "add_allow": [
+    "Bash(gh pr merge * --merge --match-head-commit *)",
+    "Bash(rtk gh pr merge * --merge --match-head-commit *)",
+    "Bash(gh pr view:*)", "Bash(rtk gh pr view:*)", "Bash(gh pr list:*)", "Bash(rtk gh pr list:*)",
+    "Bash(gh pr checks:*)", "Bash(rtk gh pr checks:*)", "Bash(gh pr diff:*)", "Bash(rtk gh pr diff:*)",
+    "Bash(gh pr status:*)", "Bash(rtk gh pr status:*)", "Bash(gh pr comment:*)", "Bash(rtk gh pr comment:*)",
+    "Bash(gh pr create:*)", "Bash(rtk gh pr create:*)", "Bash(gh pr edit:*)", "Bash(rtk gh pr edit:*)",
+    "Bash(gh pr ready:*)", "Bash(rtk gh pr ready:*)"
+  ],
+  "add_ask": [
+    "Bash(gh pr merge * --admin*)", "Bash(rtk gh pr merge * --admin*)", "Bash(gh pr merge --admin*)", "Bash(rtk gh pr merge --admin*)",
+    "Bash(gh pr merge * --squash*)", "Bash(rtk gh pr merge * --squash*)",
+    "Bash(gh pr merge * --rebase*)", "Bash(rtk gh pr merge * --rebase*)",
+    "Bash(gh pr merge * --auto*)", "Bash(rtk gh pr merge * --auto*)",
+    "Bash(gh pr merge *--match-head-commit*--match-head-commit*)", "Bash(rtk gh pr merge *--match-head-commit*--match-head-commit*)",
+    "Bash(gh pr merge *--match-head-commit=*)", "Bash(rtk gh pr merge *--match-head-commit=*)",
+    "Bash(gh pr review * --approve*)", "Bash(rtk gh pr review * --approve*)"
+  ]
+}
 ```
 
-Properties: no global allow of `gh pr merge`; ask rules are evaluated before allow, so `--admin`/`--squash`/`--rebase`/`--auto` always prompt even though the glob would match them; `gh pr review --approve` and `gh pr close` stop being silently allowed. No built-in rule is removed, no autoMode text is added, no hook is installed. The classifier still evaluates anything that is not this exact shape.
+Properties: no global allow of `gh pr merge`; ask rules are evaluated before allow, so `--admin`/`--squash`/`--rebase`/`--auto`, a second `--match-head-commit` (which could blank the pin) and `--match-head-commit=` prompt in both the `gh` and `rtk gh` spellings even though the allow glob also matches them; `gh pr review --approve` and `gh pr close` stop being silently allowed. No built-in rule is removed, no autoMode text is added, no hook is installed. The classifier still evaluates anything that is not this exact shape.
 
 The measured gap: the allow clears the *classifier*, not the *judgment*. The decision to run the command comes from the gate verdict plus the head-pinned evidence comment. The `--match-head-commit` pin makes a stale verdict fail closed at GitHub.
 
@@ -64,7 +67,7 @@ The measured gap: the allow clears the *classifier*, not the *judgment*. The dec
 | Class | Author | Needed before the pinned merge |
 |---|---|---|
 | A | verified owner account, owner is ADMIN (or code owner with WRITE/MAINTAIN) | independent PASS comment `OWNER-MERGE-REVIEW head=<sha> verdict=PASS blocking=0 reviewer=<id>` at the current head; gate `PASS`. No formal self-approval. |
-| B | verified dependency bot | real GitHub APPROVE from an authorized non-author identity at the exact head; one at a time per repo; reconcile and re-gate after each merge. |
+| B | verified dependency bot | real GitHub APPROVE at the exact head from the authenticated owner identity, as the gate requires (`scripts/owner-merge-gate.py`); one at a time per repo; reconcile and re-gate after each merge. |
 | C | any other human | owner's genuine APPROVED review at the exact head, never submitted on the owner's behalf. |
 
 A new commit changes the head, so earlier evidence no longer matches and the gate refuses until a fresh review is recorded.
@@ -78,7 +81,7 @@ If the host refuses the standard form, report the exact operation (secrets redac
 1. Back up: `cp -p ~/.claude/settings.json ~/.claude/backups/settings.json.$(date +%Y%m%d-%H%M%S)`; record `shasum -a 256`.
 2. Review the exact diff from `python3 scripts/workstation-policy.py render-settings --asks-only` plus section 2 above. Apply by hand or with the repo's candidate-rollout tool; do not apply while an active session may be affected.
 3. Verify the effective policy in a **new** session (`/permissions`): the allow list has no `gh pr merge:*` and no `gh pr *`; the ask list has the `--admin` rule.
-4. Negative controls on fixtures only (nonexistent repo): `--admin` prompts; `--squash` prompts; a `cd … && gh pr merge …` compound is not auto-allowed.
+4. Negative controls on fixtures only (nonexistent repo): `--admin`, `--squash`, a doubled `--match-head-commit` and the `rtk` spellings of each prompt. Compound forms are evaluated per subcommand by the host, so do not rely on a compound being refused; the gate only ever prints the simple form.
 5. Positive control on the disposable owner PR described in `docs/OWNER-MERGE-LIVE-VALIDATION-PLAN.md`.
 6. Resumed sessions keep the policy loaded at start; start a new session after any change.
 
