@@ -130,8 +130,8 @@ def compat(live, merged, candidate, report_conflicts=()):
         if r not in wsp.RETIRABLE_ASKS:
             out.append(f"BLOCKING candidate asks to retire an ask the tool may not retire: {r}")
     for r in candidate["permissions"].get("allow", []):
-        if r not in wsp.PROXY_ROUTINE_ALLOW:
-            out.append(f"BLOCKING candidate allow is not one of the scoped rtk proxy allows this tool may add: {r}")
+        if r not in wsp.PROXY_ROUTINE_ALLOW + wsp.ROUTINE_BARE_ALLOW:
+            out.append(f"BLOCKING candidate allow is not one of the scoped allows this tool may add: {r}")
     merged_perm = merged["permissions"]
     if candidate["permissions"].get("allow") or any(r in candidate["permissions"].get("retire_ask", []) for r in wsp.RETIRABLE_ASKS):
         for cmd in pr.PROXY_PROTECTED_COMMANDS:

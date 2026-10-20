@@ -57,11 +57,11 @@ class Replacement(unittest.TestCase):
 
     def test_only_scoped_wrapped_allows_are_added(self):
         merged, rep, _ = merged_permissions()
-        self.assertEqual(rep["allow_added"], wsp.PROXY_ROUTINE_ALLOW)
+        self.assertEqual(rep["allow_added"], wsp.PROXY_ROUTINE_ALLOW + wsp.ROUTINE_BARE_ALLOW)
         self.assertEqual(merged["permissions"]["allow"][:2], LIVE["permissions"]["allow"])
         for r in merged["permissions"]["allow"]:
             self.assertNotIn(r, ("Bash(rtk proxy *)", "Bash(*)", "Bash"))
-            self.assertTrue(r.startswith("Bash(rtk proxy ") or r in LIVE["permissions"]["allow"], r)
+            self.assertTrue(r.startswith("Bash(rtk proxy ") or r in wsp.ROUTINE_BARE_ALLOW or r in LIVE["permissions"]["allow"], r)
 
     def test_every_protected_wrapped_command_still_asks_including_the_parity_gaps(self):
         merged, _, findings = merged_permissions()
@@ -162,12 +162,30 @@ class WrappedTwins(unittest.TestCase):
         self.assertTrue(any(f.startswith("BLOCKING protected wrapped command would not ask") and "--output" in f for f in findings), findings)
 
 
+class BareReadOnlyGit(unittest.TestCase):
+    def test_ls_tree_blame_merge_base_describe_run_without_a_prompt_in_both_spellings(self):
+        merged, _, _ = merged_permissions()
+        for pre in ("", "rtk "):
+            for cmd in ("git ls-tree HEAD", "git ls-tree -r --name-only HEAD", "git blame Cargo.toml", "git merge-base HEAD main", "git describe --always"):
+                self.assertEqual(pr.static_decision(pre + cmd, merged["permissions"]), "allow", pre + cmd)
+
+    def test_cat_file_stays_out_because_it_can_run_helpers(self):
+        merged, _, _ = merged_permissions()
+        self.assertNotEqual(pr.static_decision("git cat-file --textconv HEAD:f", merged["permissions"]), "allow")
+
+    def test_a_candidate_allow_outside_the_exact_set_is_still_blocked(self):
+        cand = wsp.proxy_scoped_candidate()
+        cand["permissions"]["allow"] = cand["permissions"]["allow"] + ["Bash(git cat-file:*)"]
+        _, _, findings = merged_permissions(cand)
+        self.assertTrue(any(f.startswith("BLOCKING candidate allow is not one of the scoped") for f in findings), findings)
+
+
 class RepositoryState(unittest.TestCase):
     def test_baseline_carries_the_scoped_asks_and_allows_but_no_broad_rule(self):
         perm = BASELINE["permissions"]
         self.assertNotIn("Bash(rtk proxy *)", perm["ask"] + perm["allow"])
         self.assertTrue(set(wsp.PROXY_PARITY_ASKS) <= set(perm["ask"]))
-        self.assertTrue(set(wsp.PROXY_ROUTINE_ALLOW) <= set(perm["allow"]))
+        self.assertTrue(set(wsp.PROXY_ROUTINE_ALLOW + wsp.ROUTINE_BARE_ALLOW) <= set(perm["allow"]))
         for cmd in PROTECTED:
             self.assertEqual(pr.static_decision(cmd, perm), "ask", cmd)
 

@@ -36,11 +36,14 @@ PROTECTED_RELATIVE = (".claude/settings.json", ".claude/settings.local.json", ".
 BENIGN_KEYS = {"model", "effortlevel", "advisormodel", "theme", "verbose"}
 NON_GOVERNED_KINDS = {"local"}
 # The only wildcard Bash allows a candidate may carry; everything else with a `*` is reported. Case-sensitive on purpose.
+# Read-only git verbs seen denied in real sessions (git ls-tree) with no allow: bare and rtk spellings. cat-file is left out (--textconv/--filters run helpers).
+ROUTINE_BARE_ALLOW = [f"Bash({p}git {v}:*)" for v in ("ls-tree", "merge-base", "describe", "blame") for p in ("", "rtk ")]
 # `rg` is deliberately absent: `rg --pre CMD` runs CMD, and no bare rg allow exists to be at parity with.
 # SPE-119 adds the scoped `rtk proxy` spellings of read-only git, search and local cargo checks: `rtk proxy` is never rewritten by the
 # hook, so a rule naming the plain command does not see it, and the broad `rtk proxy *` ask it replaces cannot be overridden by an allow.
 PROXY_ROUTINE_ALLOW = (
     [f"Bash(rtk proxy git {v}:*)" for v in ("diff", "show", "log", "status", "rev-parse", "rev-list", "ls-files", "merge-base")]
+    + [f"Bash(rtk proxy git {v}:*)" for v in ("ls-tree", "describe", "blame")]
     + ["Bash(rtk proxy grep:*)"]
     + [f"Bash(rtk proxy cargo {v}:*)" for v in ("test", "build", "check", "clippy", "fmt", "nextest run")]
 )
@@ -55,7 +58,8 @@ PROXY_TWIN_ASKS = None  # filled after ASK_BASH_RULES is defined
 RETIRABLE_ASKS = ("Bash(rtk proxy *)",)
 READ_ONLY_ALLOW = re.compile(
     r"Bash\((git (status|diff|log|show)|gh (pr|issue|run) (view|list|checks|diff|status)|ls|cat|pytest|python3 -m pytest)(:\*| \*)\)"
-    r"|Bash\(rtk proxy (git (diff|show|log|status|rev-parse|rev-list|ls-files|merge-base)|grep|cargo (test|build|check|clippy|fmt|nextest run)):\*\)")
+    r"|Bash\((rtk )?git (ls-tree|merge-base|describe|blame):\*\)"
+    r"|Bash\(rtk proxy (git (diff|show|log|status|rev-parse|rev-list|ls-files|merge-base|ls-tree|describe|blame)|grep|cargo (test|build|check|clippy|fmt|nextest run)):\*\)")
 
 ALTERNATIVES = {
     "documents": "share a redacted excerpt or a synthetic stand-in", "logs": "share a redacted excerpt with identifiers removed",
@@ -262,7 +266,7 @@ def proxy_scoped_candidate():
     return {
         "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Retires the broad Bash(rtk proxy *) ask "
                        "(an ask cannot be overridden by a narrower allow) and replaces it with scoped asks plus scoped allows for routine wrapped work. No autoMode change.",
-        "permissions": {"ask": asks, "allow": list(PROXY_ROUTINE_ALLOW), "retire_ask": list(RETIRABLE_ASKS), "deny": []},
+        "permissions": {"ask": asks, "allow": PROXY_ROUTINE_ALLOW + ROUTINE_BARE_ALLOW, "retire_ask": list(RETIRABLE_ASKS), "deny": []},
     }
 
 
