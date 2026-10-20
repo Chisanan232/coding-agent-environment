@@ -1,8 +1,11 @@
 {
  "measured": "2026-10-20",
- "harness": "scripts/permission-host-matrix.py (hardened: command-matched hook evidence, health-checked, credentials scrubbed)",
+ "harness": "scripts/permission-host-matrix.py (command-matched hook evidence, health-checked, hermetic environment)",
  "corpus": "docs/permission-corpus/routine-command-corpus.json",
+ "candidate_definition": "live settings copy + asks-only personal canary + docs/examples/candidate-settings-rtk-proxy-scoped.example.json via scripts/candidate-rollout.py",
+ "rescore": "python3 scripts/permission-host-matrix.py --corpus docs/permission-corpus/routine-command-corpus.json --rescore docs/permission-corpus/results-2026-10-20.json --section candidate",
  "live": {
+  "mode": "live",
   "score": {
    "errors": 0,
    "unverified": [],
@@ -26,781 +29,1400 @@
    {
     "id": "001-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk read Cargo.toml"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "002-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: sed -n 1,3p Cargo.toml"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "003-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk grep -rn marker src ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "004-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk rg marker src ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "005-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk find src -name '*.rs' ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "006-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: fd marker src ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "007-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk read Cargo.toml --max-lines 3"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "008-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk read Cargo.toml --tail-lines 3"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "009-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: awk 'NR<3' Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "010-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: cut -c1-10 Cargo.toml"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "011-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: sort Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "012-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: sort Cargo.toml | uniq -c"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "013-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk wc -l Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "014-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: jq -n 1 ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "015-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: yq --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "016-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk ls -la ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "017-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: pwd"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "018-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: stat Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "019-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: file Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "020-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: realpath . ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "021-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: readlink -f ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "022-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk diff Cargo.toml Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "023-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: cmp Cargo.toml Cargo.toml"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "024-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: shasum -a 256 Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "025-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: sha256sum Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "026-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git status --short ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "027-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git log --oneline -3 ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "028-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git show HEAD --stat ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "029-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git diff HEAD ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "030-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git diff origin/main...HEAD -- src/ web/"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "031-git-ro",
     "class": "UNKNOWN_REQUIRES_REVIEW",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: git blame Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "032-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: git rev-parse HEAD"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "033-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: git merge-base HEAD HEAD"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "034-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git branch -a"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "035-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git branch --show-current"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "036-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: git ls-files ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "037-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: git ls-tree HEAD ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "038-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: git cat-file -p HEAD ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "039-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: git remote -v"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "040-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git fetch origin"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "041-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git -C . status --short ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "042-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git log -p -1 -- Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "043-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git stash list ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "044-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: git describe --always"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "045-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr view 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "046-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr diff 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "047-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr checks 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "048-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr list --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "049-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh run view 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "050-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh run list --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "051-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh issue view 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "052-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh issue list --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "053-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh api repos/Chisanan232/zz-nonexistent-probe-repo/pulls"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "054-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk gh api graphql -f query='query{viewer{login}}'"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "055-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr status --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "056-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: gh pr view 1 --repo Chisanan232/zz-nonexistent-probe-repo --json state,mergeable"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "057-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk cargo test --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "058-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk cargo check --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "059-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk cargo build --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "060-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk cargo fmt --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "061-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk cargo clippy --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "062-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: cargo nextest run --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "063-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk pytest --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "064-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: uv run python --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "065-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: ruff --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "066-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk mypy --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "067-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: go version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "068-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk go test -h ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "069-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk go vet -h ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "070-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: go fmt -h ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "071-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk go build -h ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "072-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: pnpm --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "073-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: pnpm test --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "074-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk pnpm run --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "075-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk npm run --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "076-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: npm test --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "077-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: yarn --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "078-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk tsc --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "079-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk lint --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "080-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk vitest --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "081-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: swift --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "082-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: xcodebuild -version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "083-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk pre-commit --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "084-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: lefthook version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "085-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk pytest --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "086-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: python3 -c 'print(1)'"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "087-dev",
     "class": "AUTO_WITH_RESOURCE_ADMISSION",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk cargo build --release --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "088-dev",
     "class": "AUTO_WITH_RESOURCE_ADMISSION",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk cargo test --workspace --no-run --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "089-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk git worktree add ../wt-corp-a -b corp/a ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "090-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git add src ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "091-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git commit --allow-empty -m 'test: corpus' ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "092-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git push origin HEAD:refs/heads/corp-owned-1"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "093-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: git switch -c corp/b ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "094-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: git checkout -b corp/c ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "095-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr create --repo Chisanan232/zz-nonexistent-probe-repo --title t --body b --head x"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "096-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr comment 1 --repo Chisanan232/zz-nonexistent-probe-repo --body ok"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "097-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr edit 1 --repo Chisanan232/zz-nonexistent-probe-repo --title t"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "098-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr review 1 --repo Chisanan232/zz-nonexistent-probe-repo --comment --body ok"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "099-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git worktree list ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "100-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git branch corp/d"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "101-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy git diff HEAD -- src/ web/"
+    ],
     "outcome": "prompted"
    },
    {
     "id": "102-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy git show HEAD:Cargo.toml | sed -n 1,3p"
+    ],
     "outcome": "prompted"
    },
    {
     "id": "103-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy git log --oneline -3 ."
+    ],
     "outcome": "prompted"
    },
    {
     "id": "104-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy git status --short"
+    ],
     "outcome": "prompted"
    },
    {
     "id": "105-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy grep -rn marker src | head -3"
+    ],
     "outcome": "prompted"
    },
    {
     "id": "106-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy cargo --version"
+    ],
     "outcome": "prompted"
    },
    {
     "id": "107-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy cargo test --help"
+    ],
     "outcome": "prompted"
    },
    {
     "id": "108-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: CARGO_TARGET_DIR=./target rtk proxy cargo --version | grep cargo | head -1"
+    ],
     "outcome": "prompted"
    },
    {
     "id": "109-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: FOO=1 rtk proxy git diff HEAD ."
+    ],
     "outcome": "prompted"
    },
    {
     "id": "110-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: RUST_LOG=info rtk cargo test --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "111-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: CI=1 rtk pytest --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "112-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git status --short && rtk git log --oneline -1 ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "113-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: cd src && rtk git status --short ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "114-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git status --short | head -3"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "115-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk git log --oneline -3 | cat ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "116-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: for f in src/*; do echo $f; done"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "117-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk ls src; echo done"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "118-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git diff HEAD | head -5; rtk git status --short ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "119-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk grep -rn marker src | grep a | cut -c1-40 | head -3 ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "120-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk read Cargo.toml | head -2 | wc -l"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "121-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: (cd src && ls)"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "122-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: echo ok > ./zz-out.txt"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "123-wrapper",
     "class": "UNKNOWN_REQUIRES_REVIEW",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: bash ./scripts/does-not-exist.sh --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "124-wrapper",
     "class": "UNKNOWN_REQUIRES_REVIEW",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: python3 scripts/does-not-exist.py"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "125-wrapper",
     "class": "UNKNOWN_REQUIRES_REVIEW",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy python3 -c 'print(1)'"
+    ],
     "outcome": "prompted"
    },
    {
     "id": "126-wrapper",
     "class": "UNKNOWN_REQUIRES_REVIEW",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy rg marker src ."
+    ],
     "outcome": "prompted"
    },
    {
     "id": "127-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk git push --force origin full/SPE-9/owned"
+    ],
     "outcome": "held"
    },
    {
     "id": "128-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git push origin --delete corp-owned-1"
+    ],
     "outcome": "RAN-UNPROMPTED"
    },
    {
     "id": "129-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk git push -f origin full/SPE-9/owned"
+    ],
     "outcome": "held"
    },
    {
     "id": "130-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh release create v0.0.0 --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "RAN-UNPROMPTED"
    },
    {
     "id": "131-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr merge 1 --repo Chisanan232/zz-nonexistent-probe-repo --merge --admin"
+    ],
     "outcome": "RAN-UNPROMPTED"
    },
    {
     "id": "132-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: terraform apply ."
+    ],
     "outcome": "held"
    },
    {
     "id": "133-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: terraform destroy ."
+    ],
     "outcome": "held"
    },
    {
     "id": "134-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: cargo publish --dry-run ."
+    ],
     "outcome": "RAN-UNPROMPTED"
    },
    {
     "id": "135-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: npm publish --dry-run ."
+    ],
     "outcome": "RAN-UNPROMPTED"
    },
    {
     "id": "136-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: git reset --hard HEAD"
+    ],
     "outcome": "held"
    },
    {
     "id": "137-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: git clean -fd ."
+    ],
     "outcome": "held"
    },
    {
     "id": "138-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: kill -9 999999"
+    ],
     "outcome": "held"
    },
    {
     "id": "139-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk gh repo delete Chisanan232/zz-nonexistent-probe-repo --yes"
+    ],
     "outcome": "held"
    },
    {
     "id": "140-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh api -X DELETE repos/Chisanan232/zz-nonexistent-probe-repo/git/refs/heads/x"
+    ],
     "outcome": "RAN-UNPROMPTED"
    },
    {
     "id": "141-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk git worktree remove --force wt-peer ."
+    ],
     "outcome": "held"
    },
    {
     "id": "142-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy git push --force origin full/SPE-9/owned"
+    ],
     "outcome": "held"
    },
    {
     "id": "143-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy gh release create v0.0.0 ."
+    ],
     "outcome": "held"
    },
    {
     "id": "144-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy cargo publish --dry-run ."
+    ],
     "outcome": "held"
    },
    {
     "id": "145-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: CARGO_TARGET_DIR=x rtk proxy git push --force origin full/SPE-9/owned"
+    ],
     "outcome": "held"
    },
    {
     "id": "146-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy git diff HEAD --output=./zz-out ."
+    ],
     "outcome": "held"
    },
    {
     "id": "147-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy git diff --ext-dif HEAD ."
+    ],
     "outcome": "held"
    },
    {
     "id": "148-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy git fetch --upload-pack=true origin"
+    ],
     "outcome": "held"
    },
    {
     "id": "149-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk git diff HEAD --output=./zz-out2 ."
+    ],
     "outcome": "held"
    },
    {
     "id": "150-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk git diff --no-index /etc/hosts /etc/hosts ."
+    ],
     "outcome": "held"
    },
    {
     "id": "151-protected",
     "class": "DENY_OR_HOST_PROTECTED",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk gcloud secrets versions access latest --secret=x --project=zz-nonexistent-probe-project"
+    ],
     "outcome": "held"
    },
    {
     "id": "152-protected",
     "class": "DENY_OR_HOST_PROTECTED",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy gcloud secrets versions access latest --secret=x --project=zz-nonexistent-probe-project"
+    ],
     "outcome": "held"
    },
    {
     "id": "153-protected",
     "class": "DENY_OR_HOST_PROTECTED",
+    "healthy": true,
+    "recorded": [],
     "outcome": "held"
    },
    {
     "id": "154-protected",
     "class": "DENY_OR_HOST_PROTECTED",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy sh -c 'git push -f origin x'"
+    ],
     "outcome": "held"
    },
    {
     "id": "155-protected",
     "class": "DENY_OR_HOST_PROTECTED",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy gcloud projects add-iam-policy-binding zz-nonexistent-probe-project --member=user:a@b.c --role=roles/viewer"
+    ],
     "outcome": "held"
    }
   ]
  },
  "candidate": {
+  "mode": "candidate",
   "score": {
    "errors": 0,
    "unverified": [],
@@ -817,779 +1439,1396 @@
    {
     "id": "001-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk read Cargo.toml"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "002-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: sed -n 1,3p Cargo.toml"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "003-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk grep -rn marker src ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "004-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk rg marker src ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "005-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk find src -name '*.rs' ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "006-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: fd marker src ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "007-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk read Cargo.toml --max-lines 3"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "008-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk read Cargo.toml --tail-lines 3"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "009-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: awk 'NR<3' Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "010-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: cut -c1-10 Cargo.toml"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "011-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: sort Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "012-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: sort Cargo.toml | uniq -c"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "013-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk wc -l Cargo.toml"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "014-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: jq -n 1 ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "015-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: yq --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "016-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk ls -la ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "017-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: pwd"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "018-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: stat Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "019-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: file Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "020-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: realpath . ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "021-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: readlink -f ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "022-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk diff Cargo.toml Cargo.toml"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "023-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: cmp Cargo.toml Cargo.toml"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "024-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: shasum -a 256 Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "025-inspect",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: sha256sum Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "026-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git status --short ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "027-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git log --oneline -3 ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "028-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git show HEAD --stat ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "029-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git diff HEAD ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "030-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git diff origin/main...HEAD -- src/ web/"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "031-git-ro",
     "class": "UNKNOWN_REQUIRES_REVIEW",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: git blame Cargo.toml ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "032-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: git rev-parse HEAD"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "033-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: git merge-base HEAD HEAD"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "034-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git branch -a"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "035-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git branch --show-current"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "036-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: git ls-files ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "037-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: git ls-tree HEAD ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "038-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: git cat-file -p HEAD ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "039-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: git remote -v"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "040-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git fetch origin"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "041-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git -C . status --short ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "042-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git log -p -1 -- Cargo.toml"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "043-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git stash list ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "044-git-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: git describe --always"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "045-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr view 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "046-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr diff 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "047-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr checks 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "048-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr list --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "049-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh run view 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "050-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh run list --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "051-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh issue view 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "052-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh issue list --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "053-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh api repos/Chisanan232/zz-nonexistent-probe-repo/pulls"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "054-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk gh api graphql -f query='query{viewer{login}}'"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "055-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr status --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "056-gh-ro",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: gh pr view 1 --repo Chisanan232/zz-nonexistent-probe-repo --json state,mergeable"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "057-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk cargo test --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "058-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk cargo check --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "059-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk cargo build --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "060-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk cargo fmt --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "061-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk cargo clippy --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "062-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: cargo nextest run --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "063-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk pytest --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "064-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: uv run python --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "065-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: ruff --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "066-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk mypy --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "067-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: go version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "068-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk go test -h ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "069-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk go vet -h ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "070-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: go fmt -h ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "071-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk go build -h ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "072-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: pnpm --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "073-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: pnpm test --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "074-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk pnpm run --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "075-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk npm run --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "076-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: npm test --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "077-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: yarn --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "078-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk tsc --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "079-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk lint --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "080-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk vitest --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "081-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: swift --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "082-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: xcodebuild -version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "083-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk pre-commit --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "084-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: lefthook version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "085-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk pytest --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "086-dev",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: python3 -c 'print(1)'"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "087-dev",
     "class": "AUTO_WITH_RESOURCE_ADMISSION",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk cargo build --release --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "088-dev",
     "class": "AUTO_WITH_RESOURCE_ADMISSION",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk cargo test --workspace --no-run --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "089-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk git worktree add ../wt-corp-a -b corp/a ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "090-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git add src ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "091-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git commit --allow-empty -m 'test: corpus' ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "092-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git push origin HEAD:refs/heads/corp-owned-1"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "093-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: git switch -c corp/b"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "094-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: git checkout -b corp/c"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "095-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr create --repo Chisanan232/zz-nonexistent-probe-repo --title t --body b --head x ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "096-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr comment 1 --repo Chisanan232/zz-nonexistent-probe-repo --body ok"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "097-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr edit 1 --repo Chisanan232/zz-nonexistent-probe-repo --title t"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "098-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk gh pr review 1 --repo Chisanan232/zz-nonexistent-probe-repo --comment --body ok"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "099-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git worktree list"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "100-source-control",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git branch corp/d"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "101-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk proxy git diff HEAD -- src/ web/ ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "102-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk proxy git show HEAD:Cargo.toml | sed -n 1,3p"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "103-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk proxy git log --oneline -3 ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "104-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk proxy git status --short ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "105-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk proxy grep -rn marker src | head -3"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "106-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk proxy cargo --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "107-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk proxy cargo test --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "108-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: CARGO_TARGET_DIR=./target rtk proxy cargo --version | grep cargo | head -1"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "109-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: FOO=1 rtk proxy git diff HEAD ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "110-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: RUST_LOG=info rtk cargo test --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "111-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: CI=1 rtk pytest --version"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "112-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git status --short && rtk git log --oneline -1"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "113-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: cd src && rtk git status --short ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "114-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git status --short | head -3"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "115-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git log --oneline -3 | cat"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "116-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: for f in src/*; do echo $f; done"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "117-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk ls src; echo done"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "118-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk git diff HEAD | head -5; rtk git status --short ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "119-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk grep -rn marker src | grep a | cut -c1-40 | head -3 ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "120-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk read Cargo.toml | head -2 | wc -l"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "121-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: (cd src && ls)"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "122-wrapper",
     "class": "AUTO_SAFE",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: echo ok > ./zz-out.txt"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "123-wrapper",
     "class": "UNKNOWN_REQUIRES_REVIEW",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: bash ./scripts/does-not-exist.sh --help"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "124-wrapper",
     "class": "UNKNOWN_REQUIRES_REVIEW",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: python3 scripts/does-not-exist.py"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "125-wrapper",
     "class": "UNKNOWN_REQUIRES_REVIEW",
+    "healthy": true,
+    "recorded": [
+     "PostToolUse: rtk proxy python3 -c 'print(1)'"
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "126-wrapper",
     "class": "UNKNOWN_REQUIRES_REVIEW",
+    "healthy": true,
+    "recorded": [
+     "PostToolUseFailure: rtk proxy rg marker src ."
+    ],
     "outcome": "ran-no-prompt"
    },
    {
     "id": "127-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk git push --force origin full/SPE-9/owned"
+    ],
     "outcome": "held"
    },
    {
     "id": "128-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk git push origin --delete corp-owned-1"
+    ],
     "outcome": "held"
    },
    {
     "id": "129-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk git push -f origin full/SPE-9/owned"
+    ],
     "outcome": "held"
    },
    {
     "id": "130-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk gh release create v0.0.0 --repo Chisanan232/zz-nonexistent-probe-repo"
+    ],
     "outcome": "held"
    },
    {
     "id": "131-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk gh pr merge 1 --repo Chisanan232/zz-nonexistent-probe-repo --merge --admin"
+    ],
     "outcome": "held"
    },
    {
     "id": "132-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: terraform apply ."
+    ],
     "outcome": "held"
    },
    {
     "id": "133-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: terraform destroy ."
+    ],
     "outcome": "held"
    },
    {
     "id": "134-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: cargo publish --dry-run ."
+    ],
     "outcome": "held"
    },
    {
     "id": "135-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: npm publish --dry-run ."
+    ],
     "outcome": "held"
    },
    {
     "id": "136-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: git reset --hard HEAD"
+    ],
     "outcome": "held"
    },
    {
     "id": "137-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: git clean -fd ."
+    ],
     "outcome": "held"
    },
    {
     "id": "138-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: kill -9 999999"
+    ],
     "outcome": "held"
    },
    {
     "id": "139-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk gh repo delete Chisanan232/zz-nonexistent-probe-repo --yes"
+    ],
     "outcome": "held"
    },
    {
     "id": "140-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk gh api -X DELETE repos/Chisanan232/zz-nonexistent-probe-repo/git/refs/heads/x"
+    ],
     "outcome": "held"
    },
    {
     "id": "141-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk git worktree remove --force wt-peer ."
+    ],
     "outcome": "held"
    },
    {
     "id": "142-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy git push --force origin full/SPE-9/owned"
+    ],
     "outcome": "held"
    },
    {
     "id": "143-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy gh release create v0.0.0 ."
+    ],
     "outcome": "held"
    },
    {
     "id": "144-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy cargo publish --dry-run ."
+    ],
     "outcome": "held"
    },
    {
     "id": "145-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: CARGO_TARGET_DIR=x rtk proxy git push --force origin full/SPE-9/owned"
+    ],
     "outcome": "held"
    },
    {
     "id": "146-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy git diff HEAD --output=./zz-out ."
+    ],
     "outcome": "held"
    },
    {
     "id": "147-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy git diff --ext-dif HEAD ."
+    ],
     "outcome": "held"
    },
    {
     "id": "148-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy git fetch --upload-pack=true origin"
+    ],
     "outcome": "held"
    },
    {
     "id": "149-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk git diff HEAD --output=./zz-out2 ."
+    ],
     "outcome": "held"
    },
    {
     "id": "150-owner-ask",
     "class": "OWNER_ASK",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk git diff --no-index /etc/hosts /etc/hosts ."
+    ],
     "outcome": "held"
    },
    {
     "id": "151-protected",
     "class": "DENY_OR_HOST_PROTECTED",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk gcloud secrets versions access latest --secret=x --project=zz-nonexistent-probe-project"
+    ],
     "outcome": "held"
    },
    {
     "id": "152-protected",
     "class": "DENY_OR_HOST_PROTECTED",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy gcloud secrets versions access latest --secret=x --project=zz-nonexistent-probe-project"
+    ],
     "outcome": "held"
    },
    {
     "id": "153-protected",
     "class": "DENY_OR_HOST_PROTECTED",
+    "healthy": true,
+    "recorded": [],
     "outcome": "held"
    },
    {
     "id": "154-protected",
     "class": "DENY_OR_HOST_PROTECTED",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy sh -c 'git push -f origin x'"
+    ],
     "outcome": "held"
    },
    {
     "id": "155-protected",
     "class": "DENY_OR_HOST_PROTECTED",
+    "healthy": true,
+    "recorded": [
+     "PermissionRequest: rtk proxy gcloud projects add-iam-policy-binding zz-nonexistent-probe-project --member=user:a@b.c --role=roles/viewer"
+    ],
     "outcome": "held"
    }
   ]
- },
- "candidate_definition": "live settings copy + asks-only personal canary (docs/examples/candidate-settings-personal-asks-only.example.json) + docs/examples/candidate-settings-rtk-proxy-scoped.example.json via scripts/candidate-rollout.py"
+ }
 }

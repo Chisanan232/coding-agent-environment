@@ -96,18 +96,21 @@ def norm(cmd):
 
 
 def command_matches(recorded, expected):
-    """True when the recorded Bash command is the expected one modulo rtk's rewrite: every expected program appears (directly or as its
-    rtk verb) and every non-flag, non-numeric expected argument appears among the recorded tokens. `echo BLOCKED` never matches a cargo case."""
+    """True when the recorded Bash command is the expected one modulo rtk's rewrite. Every expected program must appear and every expected
+    argument, flags and numbers included, must appear among the recorded tokens; the only relaxation is for a program that rtk renames to its
+    own verb (cat/head/tail become `rtk read` with different flags), where flags and numbers are not compared. A weaker command (`git push`
+    for `git push --force`) or a different one (`echo BLOCKED`) never matches."""
     rec, exp = simple_commands(recorded), simple_commands(expected)
     if not exp or not rec:
         return False
     rec_progs = {p for p, _ in rec}
     rec_tokens = {t for _, a in rec for t in a} | rec_progs
     for prog, args in exp:
-        if prog not in rec_progs and not any(prog in PROGRAM_EQUIV.get(rp, ()) for rp in rec_progs):
+        renamed = prog not in rec_progs
+        if renamed and not any(prog in PROGRAM_EQUIV.get(rp, ()) for rp in rec_progs):
             return False
         for a in args:
-            if a.startswith("-") or a.isdigit():
+            if renamed and (a.startswith("-") or a.isdigit()):
                 continue
             if a not in rec_tokens:
                 return False
@@ -145,10 +148,17 @@ def score(entries):
     return out
 
 
+SCRUB = re.compile(r"(AWS_|AZURE_|GOOGLE_|CLOUDSDK_|GCLOUD_|OPENAI_|GH_|GITHUB_|GIT_|NPM_|NODE_AUTH|CARGO_REGISTR|TF_|TERRAFORM_|PULUMI_|DOCKER_|KUBECONFIG|SSH_AUTH_SOCK)")
+
+
 def scrubbed_env(label, log, work):
-    """The caller's environment minus cloud credentials: a protection regression in the corpus must not reach a real account."""
-    env = {k: v for k, v in os.environ.items() if not re.match(r"(AWS_|AZURE_|GOOGLE_APPLICATION_CREDENTIALS|CLOUDSDK_|GCLOUD_|OPENAI_|ANTHROPIC_API)", k)}
-    env.update(PROBE_LABEL=label, PROBE_LOG=str(log), CLOUDSDK_CONFIG=str(work / "no-gcloud"))
+    """A hermetic probe environment: nothing that names a cloud account, a GitHub repository or token, a git directory or a package registry
+    survives, and the CLIs that keep credentials in their own config get an empty one. Claude's own login (keychain or ANTHROPIC_*/CLAUDE_*) is kept."""
+    env = {k: v for k, v in os.environ.items() if not SCRUB.match(k)}
+    empty = work / "empty-config"
+    env.update(PROBE_LABEL=label, PROBE_LOG=str(log), CLOUDSDK_CONFIG=str(work / "no-gcloud"), GH_CONFIG_DIR=str(empty / "gh"), NPM_CONFIG_USERCONFIG=str(empty / "npmrc"),
+               CARGO_HOME=str(empty / "cargo"), DOCKER_CONFIG=str(empty / "docker"), KUBECONFIG=str(empty / "kube"), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
+               GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid", GIT_TERMINAL_PROMPT="0")
     return env
 
 
@@ -223,6 +233,7 @@ def main(argv=None):
     g.add_argument("--candidate")
     g.add_argument("--live", action="store_true")
     ap.add_argument("--rescore", help="re-evaluate a stored result file offline; starts no claude process")
+    ap.add_argument("--section", default="candidate", help="with --rescore on a stored multi-section file: which section (live or candidate)")
     ap.add_argument("--par", type=int, default=3)
     ap.add_argument("--ids")
     ap.add_argument("--limit", type=int)
@@ -233,7 +244,12 @@ def main(argv=None):
         ap.error("one of --candidate, --live or --rescore FILE is required")
     corpus = json.loads(pathlib.Path(a.corpus).read_text())["commands"]
     if a.rescore:
-        result = rescore(json.loads(pathlib.Path(a.rescore).read_text()), corpus)
+        stored = json.loads(pathlib.Path(a.rescore).read_text())
+        if "cases" not in stored:
+            if a.section not in stored:
+                ap.error(f"--section must be one of {sorted(k for k in stored if isinstance(stored[k], dict) and 'cases' in stored[k])}")
+            stored = stored[a.section]
+        result = rescore(stored, corpus)
         if a.out:
             pathlib.Path(a.out).write_text(json.dumps(result, indent=1))
         print(json.dumps(result["score"], indent=1))

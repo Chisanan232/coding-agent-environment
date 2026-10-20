@@ -148,10 +148,42 @@ class HarnessPureParts(unittest.TestCase):
         self.assertTrue(m("rtk pytest --version", "python3 -m pytest --version"))
         self.assertFalse(m("rtk lint --version", "cargo --version"))
         self.assertFalse(m("echo BLOCKED", "rtk proxy cargo test --help"))
+        self.assertFalse(m("rtk proxy git diff HEAD", "rtk proxy git diff HEAD --output=./zz-out"))   # a weaker command is not the tested one
+        self.assertFalse(m("rtk git push origin x", "git push --force origin x"))
+        self.assertFalse(m("rtk git log --oneline", "git log --oneline -3"))
+        self.assertTrue(m("rtk git log --oneline -3 .", "git log --oneline -3"))
         self.assertFalse(m("rtk read other.toml", "cat Cargo.toml"))
         self.assertFalse(m("rtk git status", "git status --short && git log --oneline -1"))
         self.assertFalse(m("", "git status"))
         self.assertFalse(m("rtk git push origin main", "git push --force origin full/SPE-9/owned"))
+
+    def test_the_probe_environment_is_hermetic(self):
+        import os
+        names = {"GH_REPO": "owner/real", "GH_TOKEN": "t", "GITHUB_TOKEN": "t", "GIT_DIR": "/real/.git", "GIT_WORK_TREE": "/real", "NPM_TOKEN": "t", "CARGO_REGISTRY_TOKEN": "t",
+                 "KUBECONFIG": "/real", "SSH_AUTH_SOCK": "/s", "ANTHROPIC_API_KEY": "claude-login", "KEEP_ME": "1"}
+        os.environ.update(names)
+        try:
+            env = hm.scrubbed_env("1", pathlib.Path("/tmp/l"), pathlib.Path("/w"))
+        finally:
+            for k in names:
+                os.environ.pop(k, None)
+        for k in ("GH_REPO", "GH_TOKEN", "GITHUB_TOKEN", "GIT_DIR", "GIT_WORK_TREE", "NPM_TOKEN", "CARGO_REGISTRY_TOKEN", "SSH_AUTH_SOCK"):
+            self.assertNotIn(k, env, k)
+        self.assertEqual(env["GH_CONFIG_DIR"], "/w/empty-config/gh")
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "claude-login")   # the probe still needs claude's own login
+        self.assertEqual(env["KEEP_ME"], "1")
+
+    def test_stored_results_are_consistent_with_the_harness(self):
+        stored = json.loads((ROOT / "docs/permission-corpus/results-2026-10-20.json").read_text())
+        for section in ("live", "candidate"):
+            res = hm.rescore(stored[section], CORPUS)
+            self.assertEqual(res["score"], stored[section]["score"], section)
+            self.assertEqual([e["outcome"] for e in res["cases"]], [e["outcome"] for e in stored[section]["cases"]], section)
+            self.assertTrue(res["score"]["valid"], section)
+        self.assertEqual(stored["candidate"]["score"]["routine_pct"], 100.0)
+        self.assertEqual(stored["candidate"]["score"]["protected_leaked"], [])
+        self.assertEqual(len(stored["live"]["score"]["protected_leaked"]), 6)
 
     def test_cloud_credentials_never_reach_the_probe_environment(self):
         import os
