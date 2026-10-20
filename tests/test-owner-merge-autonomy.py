@@ -128,6 +128,15 @@ class EveryMergeFlag(unittest.TestCase):
             for pin in ("$''", '$""', "$(printf '')", "`printf ''`", "${EMPTY}", "{a,}", "$'\\x00'"):
                 self.assertEqual(decide(base.replace(f"--match-head-commit {SHA}", f"--match-head-commit {pin}")), "ask", (pre, pin))
 
+    def test_quotes_and_backslashes_cannot_disguise_a_flag(self):
+        for pre in PREFIXES:
+            base = gate_cmd(pre)
+            for disguised in ('--ad""min', "--ad''min", "--ad\\min", '--"admin"', "--sq\\uash", '-"s"', "--del\\ete-branch"):
+                self.assertEqual(decide(base.replace(" --merge", f" {disguised} --merge", 1)), "ask", (pre, disguised))
+                self.assertEqual(decide(f"{base} {disguised}"), "ask", (pre, disguised))
+            for disguised in ('--ap""prove', "--app\\rove", "--approve=true", "-\"a\""):
+                self.assertEqual(decide(f"{pre} pr review 7 --repo a/b {disguised} --comment"), "ask", (pre, disguised))
+
     def test_comment_reviews_are_allowed_and_any_approval_asks(self):
         for pre in PREFIXES:
             self.assertEqual(decide(f"{pre} pr review 7 --repo a/b --comment --body ok"), "allow", pre)
