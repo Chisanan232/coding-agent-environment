@@ -3,7 +3,7 @@
 
   workstation-policy.py fingerprint
   workstation-policy.py evaluate --profile FILE --action JSON [--fingerprint SHA256]
-  workstation-policy.py render-settings --kind personal|corporate [--asks-only] [--out FILE]
+  workstation-policy.py render-settings --kind personal|corporate [--asks-only | --proxy-scoped] [--out FILE]
   workstation-policy.py lint-settings FILE
 
 `evaluate` answers ALLOW, ASK or DENY for one described action. It is a decision function and a
@@ -36,8 +36,20 @@ PROTECTED_RELATIVE = (".claude/settings.json", ".claude/settings.local.json", ".
 BENIGN_KEYS = {"model", "effortlevel", "advisormodel", "theme", "verbose"}
 NON_GOVERNED_KINDS = {"local"}
 # The only wildcard Bash allows a candidate may carry; everything else with a `*` is reported. Case-sensitive on purpose.
+# SPE-119 adds the scoped `rtk proxy` spellings of read-only git, search and local cargo checks: `rtk proxy` is never rewritten by the
+# hook, so a rule naming the plain command does not see it, and the broad `rtk proxy *` ask it replaces cannot be overridden by an allow.
+PROXY_ROUTINE_ALLOW = (
+    [f"Bash(rtk proxy git {v}:*)" for v in ("diff", "show", "log", "status", "rev-parse", "rev-list", "ls-files", "merge-base")]
+    + ["Bash(rtk proxy grep:*)", "Bash(rtk proxy rg:*)"]
+    + [f"Bash(rtk proxy cargo {v}:*)" for v in ("test", "build", "check", "clippy", "fmt", "nextest")]
+)
+# Wrapped twins of the bare asks that write files, run helpers or reach outside the repository (SPE-114 parity gaps).
+PROXY_PARITY_ASKS = ["Bash(rtk proxy git*--output*)", "Bash(rtk proxy git*--ext-diff*)", "Bash(rtk proxy git*--no-index*)", "Bash(rtk proxy git fetch*--upl*)"]
+# The only ask candidate-rollout may retire; any other ask stays until the owner removes it by hand.
+RETIRABLE_ASKS = ("Bash(rtk proxy *)",)
 READ_ONLY_ALLOW = re.compile(
-    r"Bash\((git (status|diff|log|show)|gh (pr|issue|run) (view|list|checks|diff|status)|ls|cat|pytest|python3 -m pytest)(:\*| \*)\)")
+    r"Bash\((git (status|diff|log|show)|gh (pr|issue|run) (view|list|checks|diff|status)|ls|cat|pytest|python3 -m pytest)(:\*| \*)\)"
+    r"|Bash\(rtk proxy (git (diff|show|log|status|rev-parse|rev-list|ls-files|merge-base)|grep|rg|cargo (test|build|check|clippy|fmt|nextest)):\*\)")
 
 ALTERNATIVES = {
     "documents": "share a redacted excerpt or a synthetic stand-in", "logs": "share a redacted excerpt with identifiers removed",
@@ -229,6 +241,22 @@ def candidate(kind, asks_only=False):
     return cand
 
 
+def proxy_scoped_candidate():
+    """SPE-119: retire the broad `rtk proxy *` ask, keep every protected wrapped operation asking, allow routine wrapped work.
+
+    The scoped asks are read from the repository baseline (the SPE-114 rules and their tests), not retyped here.
+    """
+    base = json.loads((pathlib.Path(__file__).resolve().parent.parent / ".claude/settings.json").read_text())["permissions"]["ask"]
+    gh_api = {f"Bash({p}gh api {f}*)" for p in ("", "rtk ") for f in ("-X DELETE", "--method DELETE")}
+    asks = [r for r in base if "rtk proxy" in r or r in gh_api]
+    asks += [r for r in PROXY_PARITY_ASKS if r not in asks]
+    return {
+        "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Retires the broad Bash(rtk proxy *) ask "
+                       "(an ask cannot be overridden by a narrower allow) and replaces it with scoped asks plus scoped allows for routine wrapped work. No autoMode change.",
+        "permissions": {"ask": asks, "allow": list(PROXY_ROUTINE_ALLOW), "retire_ask": list(RETIRABLE_ASKS), "deny": []},
+    }
+
+
 def lint_settings(cfg):
     """Invariants every candidate must hold. Returns a list of violations (empty means clean)."""
     bad = []
@@ -286,6 +314,7 @@ def main(argv=None):
     r.add_argument("--kind", required=True, choices=("personal", "corporate"))
     r.add_argument("--out")
     r.add_argument("--asks-only", action="store_true", help="omit the autoMode block (minimal canary candidate)")
+    r.add_argument("--proxy-scoped", action="store_true", help="SPE-119 candidate: retire the broad rtk proxy ask, add scoped asks and allows")
     lint = sub.add_parser("lint-settings")
     lint.add_argument("file")
     a = ap.parse_args(argv)
@@ -302,7 +331,7 @@ def main(argv=None):
             print(json.dumps(out, indent=1))
             return {"ALLOW": 0, "ASK": 1, "DENY": 2}[out["verdict"]]
         if a.cmd == "render-settings":
-            text = json.dumps(candidate(a.kind, asks_only=a.asks_only), indent=2) + "\n"
+            text = json.dumps(proxy_scoped_candidate() if a.proxy_scoped else candidate(a.kind, asks_only=a.asks_only), indent=2) + "\n"
             if a.out:
                 with open(safe_out(a.out), "x") as fh:  # exclusive create: never overwrites an existing file
                     fh.write(text)

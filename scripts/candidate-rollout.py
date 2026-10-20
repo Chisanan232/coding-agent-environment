@@ -6,6 +6,11 @@
   candidate-rollout.py verify   --live F --expect-result-sha S
   candidate-rollout.py rollback --live F --backup F --expect-backup-sha S --expect-live-sha S
 
+SPE-119 extends the permission merge for one case: a candidate may carry `permissions.allow` (unioned in, and held to the
+read-only/routine allowlist by the candidate lint) and `permissions.retire_ask` (exact strings, and only those the tool is
+allowed to retire: today the broad `Bash(rtk proxy *)` ask). After the merge the plan checks that every protected `rtk proxy`
+operation still asks and every routine one no longer does.
+
 Only three things are merged: the `autoMode` block is replaced by the candidate's (a candidate with no `autoMode` key leaves it untouched), `permissions.ask` becomes the
 ordered union of live, baseline and candidate asks, and (optionally) one PreToolUse hook entry is added. Everything
 else (`allow`, `deny`, `env`, `model`, `statusLine`, other hooks) is left untouched, and the baseline's own `autoMode`
@@ -27,6 +32,9 @@ HERE = pathlib.Path(__file__).resolve().parent
 _spec = importlib.util.spec_from_file_location("wsp", HERE / "workstation-policy.py")
 wsp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wsp)
+_pr_spec = importlib.util.spec_from_file_location("pr", HERE / "permission-rollout.py")
+pr = importlib.util.module_from_spec(_pr_spec)
+_pr_spec.loader.exec_module(pr)
 HOOK_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash"
 
 
@@ -75,6 +83,14 @@ def merge(live, candidate, baseline=None, hook_command=None, fail_closed=False):
     before = list(perms.get("ask", []))
     base_asks = ((baseline or {}).get("permissions") or {}).get("ask", [])
     perms["ask"] = union(before, base_asks, candidate["permissions"]["ask"])
+    retire = [r for r in candidate["permissions"].get("retire_ask", [])]
+    report["asks_retired"] = [r for r in perms["ask"] if r in retire and r in wsp.RETIRABLE_ASKS]
+    report["retire_refused"] = [r for r in retire if r not in wsp.RETIRABLE_ASKS]
+    perms["ask"] = [r for r in perms["ask"] if r not in report["asks_retired"]]
+    allow_before = list(perms.get("allow", []))
+    if candidate["permissions"].get("allow"):
+        perms["allow"] = union(allow_before, candidate["permissions"]["allow"])
+    report["allow_added"] = [a for a in perms.get("allow", []) if a not in allow_before]
     report["asks_added"] = [a for a in perms["ask"] if a not in before]
     report["asks_kept"] = len(before)
     report["hook_added"] = False
@@ -110,6 +126,17 @@ def compat(live, merged, candidate, report_conflicts=()):
     live_allow = (live.get("permissions") or {}).get("allow", [])
     for problem in wsp.lint_settings({"permissions": {"allow": live_allow}}):
         out.append(f"live allow list (untouched, informational): {problem}")
+    for r in candidate["permissions"].get("retire_ask", []):
+        if r not in wsp.RETIRABLE_ASKS:
+            out.append(f"BLOCKING candidate asks to retire an ask the tool may not retire: {r}")
+    merged_perm = merged["permissions"]
+    if any(r in candidate["permissions"].get("retire_ask", []) for r in wsp.RETIRABLE_ASKS):
+        for cmd in pr.PROXY_PROTECTED_COMMANDS:
+            if pr.static_decision(cmd, merged_perm) != "ask":
+                out.append(f"BLOCKING protected wrapped command would not ask after the merge: {cmd!r} -> {pr.static_decision(cmd, merged_perm)}")
+        for cmd in pr.PROXY_ROUTINE_COMMANDS:
+            if pr.static_decision(cmd, merged_perm) == "ask":
+                out.append(f"routine wrapped command still asks after the merge (informational): {cmd!r}")
     allow, ask = set(live_allow), set(merged["permissions"]["ask"])
     for rule in sorted(allow & ask):
         out.append(f"rule is in both allow and ask (ask wins per the permissions docs, informational): {rule[:80]}")
