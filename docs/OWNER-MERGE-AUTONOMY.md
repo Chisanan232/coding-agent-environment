@@ -66,7 +66,9 @@ Settings change (owner-applied, user scope):
     "Bash(gh pr checkout:*)",
     "Bash(rtk gh pr checkout:*)",
     "Bash(gh pr update-branch:*)",
-    "Bash(rtk gh pr update-branch:*)"
+    "Bash(rtk gh pr update-branch:*)",
+    "Bash(gh pr review * --comment*)",
+    "Bash(rtk gh pr review * --comment*)"
   ],
   "add_ask": [
     "Bash(gh pr merge * --admin*)",
@@ -122,7 +124,31 @@ Settings change (owner-applied, user scope):
     "Bash(gh pr merge *--match-head-commit * *)",
     "Bash(rtk gh pr merge *--match-head-commit * *)",
     "Bash(gh pr review * --approve*)",
-    "Bash(rtk gh pr review * --approve*)"
+    "Bash(rtk gh pr review * --approve*)",
+    "Bash(gh pr merge * -m*)",
+    "Bash(rtk gh pr merge * -m*)",
+    "Bash(gh pr merge * -h*)",
+    "Bash(rtk gh pr merge * -h*)",
+    "Bash(gh pr merge*$*)",
+    "Bash(rtk gh pr merge*$*)",
+    "Bash(gh pr merge*`*)",
+    "Bash(rtk gh pr merge*`*)",
+    "Bash(gh pr merge*{*)",
+    "Bash(rtk gh pr merge*{*)",
+    "Bash(gh pr review * -a*)",
+    "Bash(rtk gh pr review * -a*)",
+    "Bash(gh pr review * -b*)",
+    "Bash(rtk gh pr review * -b*)",
+    "Bash(gh pr review * -c*)",
+    "Bash(rtk gh pr review * -c*)",
+    "Bash(gh pr review * -r*)",
+    "Bash(rtk gh pr review * -r*)",
+    "Bash(gh pr review * -F*)",
+    "Bash(rtk gh pr review * -F*)",
+    "Bash(gh pr review * -h*)",
+    "Bash(rtk gh pr review * -h*)",
+    "Bash(gh pr review * --request-changes*)",
+    "Bash(rtk gh pr review * --request-changes*)"
   ]
 }
 ```
@@ -130,6 +156,12 @@ Settings change (owner-applied, user scope):
 Properties: no global allow of `gh pr merge`; ask rules are evaluated before allow, so `--admin`/`--squash`/`--rebase`/`--auto`, a second `--match-head-commit` (which could blank the pin) and `--match-head-commit=` prompt in both the `gh` and `rtk gh` spellings even though the allow glob also matches them; `gh pr review --approve` and `gh pr close` stop being silently allowed. No built-in rule is removed, no autoMode text is added, no hook is installed. The classifier still evaluates anything that is not this exact shape.
 
 The measured gap: the allow clears the *classifier*, not the *judgment*. The decision to run the command comes from the gate verdict plus the head-pinned evidence comment. The `--match-head-commit` pin makes a stale verdict fail closed at GitHub.
+
+### Residual: a glob allow can only be hardened by enumeration
+
+A trailing-wildcard allow cannot say "exactly these tokens", so the safety of section 2 rests on asks that enumerate everything else: every `gh pr merge` flag of the installed `gh` (2.102), the pin-blanking forms, short-flag clusters, and shell expansions. Independent review rounds kept finding another spelling, which is the nature of the approach. `tests/test-owner-merge-autonomy.py` reads the installed `gh`'s own flag list and fails when a flag or short-flag cluster is not covered, so a new `gh` release cannot silently widen the allow, but the host matcher itself has not been measured against these merge forms (only the `rtk proxy` matrix was).
+
+The stronger design is a merge runner that re-validates the exact argument vector (40-hex pin, repository, PR number, `merge` strategy only) and the gate verdict in code before running `gh pr merge`, with the allow rule covering that program only. It moves the bypass surface into code that can be tested exhaustively. It is **not built here**: ADR 0013 makes the gate read-only and never-merging, and an allow rule over a merge-executing program is a policy change for the owner to decide, not an implementation detail. Until then the supported fallback is unchanged: if the host asks or denies, the owner runs the printed command with the `!` prefix.
 
 ## 3. PR classes
 

@@ -108,6 +108,32 @@ class EveryMergeFlag(unittest.TestCase):
                 for cmd in (f"{base} {val}", base.replace(" --repo", f" {val} --repo", 1), base.replace(" --merge", f" {val} --merge", 1)):
                     self.assertEqual(decide(cmd), "ask", (pre, f, cmd))
 
+    def test_short_flag_clusters_ask(self):
+        flags = gh_merge_flags()
+        if flags is None:
+            self.skipTest("gh not installed")
+        shorts = sorted(f[1] for f in flags if re.fullmatch(r"-[A-Za-z]", f) and f not in ("-R", "-m", "-h")) + ["m"]
+        for pre in PREFIXES:
+            base = gate_cmd(pre)
+            for a in shorts:
+                for b in shorts:
+                    for tail in (f"-{a}{b}", f"-{a}"):
+                        self.assertEqual(decide(f"{base} {tail}"), "ask", (pre, tail))
+                        self.assertEqual(decide(base.replace(" --repo", f" {tail} --repo", 1)), "ask", (pre, tail))
+                        self.assertEqual(decide(base.replace(" --merge", f" {tail}tx --merge", 1)), "ask", (pre, tail))
+
+    def test_shell_expansion_in_the_pin_asks(self):
+        for pre in PREFIXES:
+            base = gate_cmd(pre)
+            for pin in ("$''", '$""', "$(printf '')", "`printf ''`", "${EMPTY}", "{a,}", "$'\\x00'"):
+                self.assertEqual(decide(base.replace(f"--match-head-commit {SHA}", f"--match-head-commit {pin}")), "ask", (pre, pin))
+
+    def test_comment_reviews_are_allowed_and_any_approval_asks(self):
+        for pre in PREFIXES:
+            self.assertEqual(decide(f"{pre} pr review 7 --repo a/b --comment --body ok"), "allow", pre)
+            for bad in ("--approve", "-a", "-ca", "-ac", "-b x -a", "--comment --approve", "--request-changes"):
+                self.assertEqual(decide(f"{pre} pr review 7 --repo a/b {bad}"), "ask", (pre, bad))
+
     def test_sole_empty_pin_and_merge_false_ask(self):
         for pre in PREFIXES:
             base = gate_cmd(pre)
