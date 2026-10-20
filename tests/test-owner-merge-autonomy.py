@@ -137,6 +137,33 @@ class EveryMergeFlag(unittest.TestCase):
             for disguised in ('--ap""prove', "--app\\rove", "--approve=true", "-\"a\""):
                 self.assertEqual(decide(f"{pre} pr review 7 --repo a/b {disguised} --comment"), "ask", (pre, disguised))
 
+    # glob wildcards (cannot be expressed in a pattern) and characters that cannot change how the shell splits or expands the command
+    UNCOVERED = set("*?!#%+,@^]}~")
+
+    def test_every_character_outside_the_standard_form_asks(self):
+        import string
+        standard = set(string.ascii_letters + string.digits + " ._/=:-")
+        for pre in PREFIXES:
+            base = gate_cmd(pre)
+            for ch in map(chr, list(range(9, 14)) + list(range(33, 127))):
+                if ch in standard or ch in self.UNCOVERED:
+                    continue
+                for cmd in (f"{base}{ch}", base.replace(" --merge", f"{ch}--merge", 1), f"{pre} pr review 7 --repo a/b --comment{ch}--body ok"):
+                    self.assertEqual(decide(cmd), "ask", (pre, repr(ch), cmd))
+
+    def test_a_tab_cannot_separate_a_flag_from_the_pin(self):
+        for pre in PREFIXES:
+            base = gate_cmd(pre)
+            for tail in ("--admin", "-s", "--squash", "--delete-branch"):
+                self.assertEqual(decide(f"{base}\t{tail}"), "ask", (pre, tail))
+                self.assertEqual(decide(base.replace(" --merge", f"\t{tail} --merge", 1)), "ask", (pre, tail))
+            self.assertEqual(decide(f"{pre} pr review 7 --repo a/b\t--approve --comment"), "ask", pre)
+
+    def test_shell_expansion_in_a_review_asks(self):
+        for pre in PREFIXES:
+            for expansion in ("--{approve,comment=false}", "--$(printf approve)", "--`printf approve`", "--${A}pprove", "--appro{ve,}"):
+                self.assertEqual(decide(f"{pre} pr review 7 --repo a/b {expansion} --comment=false --body ok"), "ask", (pre, expansion))
+
     def test_comment_reviews_are_allowed_and_any_approval_asks(self):
         for pre in PREFIXES:
             self.assertEqual(decide(f"{pre} pr review 7 --repo a/b --comment --body ok"), "allow", pre)

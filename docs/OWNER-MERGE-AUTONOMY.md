@@ -160,7 +160,65 @@ Settings change (owner-applied, user scope):
     "Bash(gh pr review*'*)",
     "Bash(rtk gh pr review*'*)",
     "Bash(gh pr review*\\*)",
-    "Bash(rtk gh pr review*\\*)"
+    "Bash(rtk gh pr review*\\*)",
+    "Bash(gh pr merge*\t*)",
+    "Bash(rtk gh pr merge*\t*)",
+    "Bash(gh pr review*\t*)",
+    "Bash(rtk gh pr review*\t*)",
+    "Bash(gh pr review*$*)",
+    "Bash(rtk gh pr review*$*)",
+    "Bash(gh pr review*`*)",
+    "Bash(rtk gh pr review*`*)",
+    "Bash(gh pr review*{*)",
+    "Bash(rtk gh pr review*{*)",
+    "Bash(gh pr merge*\n*)",
+    "Bash(rtk gh pr merge*\n*)",
+    "Bash(gh pr merge*\r*)",
+    "Bash(rtk gh pr merge*\r*)",
+    "Bash(gh pr merge*\f*)",
+    "Bash(rtk gh pr merge*\f*)",
+    "Bash(gh pr merge*\u000b*)",
+    "Bash(rtk gh pr merge*\u000b*)",
+    "Bash(gh pr merge*;*)",
+    "Bash(rtk gh pr merge*;*)",
+    "Bash(gh pr merge*&*)",
+    "Bash(rtk gh pr merge*&*)",
+    "Bash(gh pr merge*|*)",
+    "Bash(rtk gh pr merge*|*)",
+    "Bash(gh pr merge*<*)",
+    "Bash(rtk gh pr merge*<*)",
+    "Bash(gh pr merge*>*)",
+    "Bash(rtk gh pr merge*>*)",
+    "Bash(gh pr merge*(*)",
+    "Bash(rtk gh pr merge*(*)",
+    "Bash(gh pr merge*)*)",
+    "Bash(rtk gh pr merge*)*)",
+    "Bash(gh pr merge*[*)",
+    "Bash(rtk gh pr merge*[*)",
+    "Bash(gh pr review*\n*)",
+    "Bash(rtk gh pr review*\n*)",
+    "Bash(gh pr review*\r*)",
+    "Bash(rtk gh pr review*\r*)",
+    "Bash(gh pr review*\f*)",
+    "Bash(rtk gh pr review*\f*)",
+    "Bash(gh pr review*\u000b*)",
+    "Bash(rtk gh pr review*\u000b*)",
+    "Bash(gh pr review*;*)",
+    "Bash(rtk gh pr review*;*)",
+    "Bash(gh pr review*&*)",
+    "Bash(rtk gh pr review*&*)",
+    "Bash(gh pr review*|*)",
+    "Bash(rtk gh pr review*|*)",
+    "Bash(gh pr review*<*)",
+    "Bash(rtk gh pr review*<*)",
+    "Bash(gh pr review*>*)",
+    "Bash(rtk gh pr review*>*)",
+    "Bash(gh pr review*(*)",
+    "Bash(rtk gh pr review*(*)",
+    "Bash(gh pr review*)*)",
+    "Bash(rtk gh pr review*)*)",
+    "Bash(gh pr review*[*)",
+    "Bash(rtk gh pr review*[*)"
   ]
 }
 ```
@@ -171,7 +229,9 @@ The measured gap: the allow clears the *classifier*, not the *judgment*. The dec
 
 ### Residual: a glob allow can only be hardened by enumeration
 
-A trailing-wildcard allow cannot say "exactly these tokens", so the safety of section 2 rests on asks that enumerate everything else: every `gh pr merge` flag of the installed `gh` (2.102), the pin-blanking forms, short-flag clusters, shell expansions, and any quote or backslash (the shell would reassemble `--ad""min` into `--admin` after the text was matched). Independent review rounds kept finding another spelling, which is the nature of the approach. `tests/test-owner-merge-autonomy.py` reads the installed `gh`'s own flag list and fails when a flag or short-flag cluster is not covered, so a new `gh` release cannot silently widen the allow, but the host matcher itself has not been measured against these merge forms (only the `rtk proxy` matrix was).
+A trailing-wildcard allow cannot say "exactly these tokens", so the safety of section 2 rests on asks that enumerate everything else: every `gh pr merge` flag of the installed `gh` (2.102), the pin-blanking forms, short-flag clusters, shell expansions (in merge and review commands alike), any whitespace other than a plain space, any shell metacharacter, and any quote or backslash (the shell would reassemble `--ad""min` into `--admin` after the text was matched). Independent review rounds kept finding another spelling, which is the nature of the approach. `tests/test-owner-merge-autonomy.py` reads the installed `gh`'s own flag list and fails when a flag or short-flag cluster is not covered, so a new `gh` release cannot silently widen the allow, but the host matcher itself has not been measured against these merge forms (only the `rtk proxy` matrix was).
+
+The characters a glob cannot express or that are inert here are listed in the test (`UNCOVERED`: `* ? ! # % + , @ ^ ] } ~`); every other character outside the standard form's `[A-Za-z0-9 ._/=:-]` asks.
 
 The stronger design is a merge runner that re-validates the exact argument vector (40-hex pin, repository, PR number, `merge` strategy only) and the gate verdict in code before running `gh pr merge`, with the allow rule covering that program only. It moves the bypass surface into code that can be tested exhaustively. It is **not built here**: ADR 0013 makes the gate read-only and never-merging, and an allow rule over a merge-executing program is a policy change for the owner to decide, not an implementation detail. Until then the supported fallback is unchanged: if the host asks or denies, the owner runs the printed command with the `!` prefix.
 
