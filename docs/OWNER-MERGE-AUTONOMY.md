@@ -68,7 +68,13 @@ Settings change (owner-applied, user scope):
     "Bash(gh pr update-branch:*)",
     "Bash(rtk gh pr update-branch:*)",
     "Bash(gh pr review * --comment*)",
-    "Bash(rtk gh pr review * --comment*)"
+    "Bash(rtk gh pr review * --comment*)",
+    "Bash(gh pr reopen:*)",
+    "Bash(rtk gh pr reopen:*)",
+    "Bash(gh pr lock:*)",
+    "Bash(rtk gh pr lock:*)",
+    "Bash(gh pr unlock:*)",
+    "Bash(rtk gh pr unlock:*)"
   ],
   "add_ask": [
     "Bash(gh pr merge * --admin*)",
@@ -153,32 +159,16 @@ Settings change (owner-applied, user scope):
     "Bash(rtk gh pr merge*\"*)",
     "Bash(gh pr merge*'*)",
     "Bash(rtk gh pr merge*'*)",
-    "Bash(gh pr merge*\\*)",
-    "Bash(rtk gh pr merge*\\*)",
     "Bash(gh pr review*\"*)",
     "Bash(rtk gh pr review*\"*)",
     "Bash(gh pr review*'*)",
     "Bash(rtk gh pr review*'*)",
-    "Bash(gh pr review*\\*)",
-    "Bash(rtk gh pr review*\\*)",
-    "Bash(gh pr merge*\t*)",
-    "Bash(rtk gh pr merge*\t*)",
-    "Bash(gh pr review*\t*)",
-    "Bash(rtk gh pr review*\t*)",
     "Bash(gh pr review*$*)",
     "Bash(rtk gh pr review*$*)",
     "Bash(gh pr review*`*)",
     "Bash(rtk gh pr review*`*)",
     "Bash(gh pr review*{*)",
     "Bash(rtk gh pr review*{*)",
-    "Bash(gh pr merge*\n*)",
-    "Bash(rtk gh pr merge*\n*)",
-    "Bash(gh pr merge*\r*)",
-    "Bash(rtk gh pr merge*\r*)",
-    "Bash(gh pr merge*\f*)",
-    "Bash(rtk gh pr merge*\f*)",
-    "Bash(gh pr merge*\u000b*)",
-    "Bash(rtk gh pr merge*\u000b*)",
     "Bash(gh pr merge*;*)",
     "Bash(rtk gh pr merge*;*)",
     "Bash(gh pr merge*&*)",
@@ -195,14 +185,6 @@ Settings change (owner-applied, user scope):
     "Bash(rtk gh pr merge*)*)",
     "Bash(gh pr merge*[*)",
     "Bash(rtk gh pr merge*[*)",
-    "Bash(gh pr review*\n*)",
-    "Bash(rtk gh pr review*\n*)",
-    "Bash(gh pr review*\r*)",
-    "Bash(rtk gh pr review*\r*)",
-    "Bash(gh pr review*\f*)",
-    "Bash(rtk gh pr review*\f*)",
-    "Bash(gh pr review*\u000b*)",
-    "Bash(rtk gh pr review*\u000b*)",
     "Bash(gh pr review*;*)",
     "Bash(rtk gh pr review*;*)",
     "Bash(gh pr review*&*)",
@@ -218,7 +200,11 @@ Settings change (owner-applied, user scope):
     "Bash(gh pr review*)*)",
     "Bash(rtk gh pr review*)*)",
     "Bash(gh pr review*[*)",
-    "Bash(rtk gh pr review*[*)"
+    "Bash(rtk gh pr review*[*)",
+    "Bash(gh pr merge*\\**)",
+    "Bash(rtk gh pr merge*\\**)",
+    "Bash(gh pr review*\\**)",
+    "Bash(rtk gh pr review*\\**)"
   ]
 }
 ```
@@ -227,11 +213,27 @@ Properties: no global allow of `gh pr merge`; ask rules are evaluated before all
 
 The measured gap: the allow clears the *classifier*, not the *judgment*. The decision to run the command comes from the gate verdict plus the head-pinned evidence comment. The `--match-head-commit` pin makes a stale verdict fail closed at GitHub.
 
-### Residual: a glob allow can only be hardened by enumeration
+### Measured on the real host (2026-10-20)
 
-A trailing-wildcard allow cannot say "exactly these tokens", so the safety of section 2 rests on asks that enumerate everything else: every `gh pr merge` flag of the installed `gh` (2.102), the pin-blanking forms, short-flag clusters, shell expansions (in merge and review commands alike), any whitespace other than a plain space, any shell metacharacter, and any quote or backslash (the shell would reassemble `--ad""min` into `--admin` after the text was matched). Independent review rounds kept finding another spelling, which is the nature of the approach. `tests/test-owner-merge-autonomy.py` reads the installed `gh`'s own flag list and fails when a flag or short-flag cluster is not covered, so a new `gh` release cannot silently widen the allow, but the host matcher itself has not been measured against these merge forms (only the `rtk proxy` matrix was).
+`scripts/permission-host-matrix.py` (SPE-119) was run against these rules with `docs/permission-corpus/owner-merge-corpus.json` (37 commands, every target a nonexistent repository; hook-recorded ground truth; results in `docs/permission-corpus/owner-merge-results-2026-10-20.json`).
 
-The characters a glob cannot express or that are inert here are listed in the test (`UNCOVERED`: `* ? ! # % + , @ ^ ] } ~`); every other character outside the standard form's `[A-Za-z0-9 ._/=:-]` asks.
+| | Result |
+|---|---|
+| The pinned merge (both spellings) and routine PR verbs (checkout, update-branch, reopen, view, checks, diff, comment, comment-only review) | **10 of 10 run with no prompt** |
+| Risky spellings (admin, squash, `-s`, `-d`, `-md` clusters, delete-branch, disable-auto, subject, body, `--merge=false`, empty and doubled pins, trailing argument, quoted flags, review approvals in every tested spelling, brace expansion, command substitution, literal-star globbing) | **26 of 26 prompt** |
+| Backslash-disguised flag (`--ad\min`) | **runs with no prompt** (residual, below) |
+
+Three host facts were measured and corrected earlier assumptions. Whitespace in a command is normalized (a tab or doubled space still matches a space in a rule), so no tab or newline rule is needed, and one in a rule is normalized to a space and matches every command: with such rules present the standard pinned merge itself prompted (the first real-host positive control failed, after five review rounds that used only a Python glob emulation). `?` is a wildcard in a rule. A literal `*` is asked with an escaped star (`*\**`), a literal `[` works, but a literal backslash cannot be matched by `\\` or `\`.
+
+### Residual: what a glob allow cannot close
+
+A trailing-wildcard allow cannot say "exactly these tokens", so safety rests on asks that enumerate everything else: every `gh pr merge` flag of the installed `gh` (2.102), the pin-blanking forms, short-flag clusters, shell expansions (merge and review alike), shell metacharacters, quotes and a literal star. `tests/test-owner-merge-autonomy.py` reads the installed `gh`'s own flag list and fails when a flag or cluster is not covered. Independent review rounds kept finding another spelling, which is the nature of the approach. What remains open on this host, by measurement:
+
+- **A backslash inside a flag** (`--ad\min`, which the shell turns into `--admin`) matches the allow and no ask. The agent itself would have to type it; an attacker who can only influence PR text cannot.
+- **`?` globbing** (`--admi?` with a file named `--admin` in the working directory) cannot be asked because `?` is a rule wildcard.
+- The characters in the test's `UNCOVERED` set are inert for splitting or expansion.
+
+These are accepted-or-not decisions for the owner, not defects to keep patching. If they are not acceptable, do not apply the narrow allow; use the validating runner below or keep the `!` fallback.
 
 The stronger design is a merge runner that re-validates the exact argument vector (40-hex pin, repository, PR number, `merge` strategy only) and the gate verdict in code before running `gh pr merge`, with the allow rule covering that program only. It moves the bypass surface into code that can be tested exhaustively. It is **not built here**: ADR 0013 makes the gate read-only and never-merging, and an allow rule over a merge-executing program is a policy change for the owner to decide, not an implementation detail. Until then the supported fallback is unchanged: if the host asks or denies, the owner runs the printed command with the `!` prefix.
 

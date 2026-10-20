@@ -27,13 +27,26 @@ PREFIXES = ("gh", "rtk gh")
 
 
 def glob(pattern, cmd):
+    """Permission-rule glob as measured on the real host: `*` is a wildcard, `\\*` is a literal star, `prefix:*` is a word-bounded prefix."""
     if pattern.endswith(":*"):
         head = pattern[:-2]
         return cmd == head or cmd.startswith(head + " ")
-    return re.fullmatch(".*".join(re.escape(p) for p in pattern.split("*")), cmd) is not None
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern[i] == "\\" and pattern[i + 1:i + 2] == "*":
+            out.append(re.escape("*"))
+            i += 2
+        elif pattern[i] == "*":
+            out.append(".*")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.fullmatch("".join(out), cmd, re.S) is not None
 
 
 def decide(cmd):
+    cmd = " ".join(cmd.split())   # measured on the real host: a tab or a doubled space matches a space in a rule
     if any(glob(a, cmd) for a in ASK):
         return "ask"
     return "allow" if any(glob(a, cmd) for a in ALLOW) else "classifier"
@@ -131,25 +144,31 @@ class EveryMergeFlag(unittest.TestCase):
     def test_quotes_and_backslashes_cannot_disguise_a_flag(self):
         for pre in PREFIXES:
             base = gate_cmd(pre)
-            for disguised in ('--ad""min', "--ad''min", "--ad\\min", '--"admin"', "--sq\\uash", '-"s"', "--del\\ete-branch"):
+            for disguised in ('--ad""min', "--ad''min", '--"admin"', '-"s"'):
                 self.assertEqual(decide(base.replace(" --merge", f" {disguised} --merge", 1)), "ask", (pre, disguised))
                 self.assertEqual(decide(f"{base} {disguised}"), "ask", (pre, disguised))
-            for disguised in ('--ap""prove', "--app\\rove", "--approve=true", "-\"a\""):
+            for disguised in ('--ap""prove', "--approve=true", '-"a"'):
                 self.assertEqual(decide(f"{pre} pr review 7 --repo a/b {disguised} --comment"), "ask", (pre, disguised))
 
     # glob wildcards (cannot be expressed in a pattern) and characters that cannot change how the shell splits or expands the command
-    UNCOVERED = set("*?!#%+,@^]}~")
+    UNCOVERED = set("?!#%+,@^]}~\\")   # ? and the backslash cannot be matched by a rule on the real host (measured); a literal * is asked with an escaped star
 
     def test_every_character_outside_the_standard_form_asks(self):
         import string
         standard = set(string.ascii_letters + string.digits + " ._/=:-")
         for pre in PREFIXES:
             base = gate_cmd(pre)
-            for ch in map(chr, list(range(9, 14)) + list(range(33, 127))):
+            for ch in map(chr, range(33, 127)):
                 if ch in standard or ch in self.UNCOVERED:
                     continue
                 for cmd in (f"{base}{ch}", base.replace(" --merge", f"{ch}--merge", 1), f"{pre} pr review 7 --repo a/b --comment{ch}--body ok"):
                     self.assertEqual(decide(cmd), "ask", (pre, repr(ch), cmd))
+
+    def test_no_rule_contains_whitespace_other_than_a_plain_space(self):
+        # measured on the real host: a tab or newline inside a rule is normalised to a space, so such an ask matches every command and makes the
+        # standard pinned merge ask every time (the positive control failed with these rules present)
+        for r in BLOCK["add_ask"] + BLOCK["add_allow"]:
+            self.assertFalse(set(r) & set("\t\n\r\f\v"), repr(r))
 
     def test_a_tab_cannot_separate_a_flag_from_the_pin(self):
         for pre in PREFIXES:
@@ -181,6 +200,26 @@ class EveryMergeFlag(unittest.TestCase):
         for pre in PREFIXES:
             for verb in ("checkout 7 --repo a/b", "update-branch 7 --repo a/b", "view 7", "checks 7", "diff 7"):
                 self.assertEqual(decide(f"{pre} pr {verb}"), "allow", (pre, verb))
+
+
+class HostCorpus(unittest.TestCase):
+    CORPUS = json.loads((ROOT / "docs/permission-corpus/owner-merge-corpus.json").read_text())["commands"]
+
+    def test_example_candidate_equals_the_documented_block(self):
+        ex = json.loads((ROOT / "docs/examples/owner-merge-pinned-allow.example.json").read_text())["permissions"]
+        self.assertEqual((ex["allow"], ex["ask"], ex["deny"]), (BLOCK["add_allow"], BLOCK["add_ask"], []))
+
+    def test_corpus_is_nonexistent_targets_only_and_matches_the_emulation(self):
+        ids = [c["id"] for c in self.CORPUS]
+        self.assertEqual(len(ids), len(set(ids)))
+        for c in self.CORPUS:
+            if "--repo" in c["cmd"]:
+                self.assertIn("zz-nonexistent-probe-repo", c["cmd"], c["id"])
+            if c["class"] == "UNKNOWN_REQUIRES_REVIEW":
+                self.assertEqual(decide(c["cmd"]), "allow", (c["id"], "documented residual"))
+                continue
+            self.assertEqual(decide(c["cmd"]), c["expect"], (c["id"], c["cmd"]))
+        self.assertGreaterEqual(len(self.CORPUS), 30)
 
 
 class DocumentedBlock(unittest.TestCase):
