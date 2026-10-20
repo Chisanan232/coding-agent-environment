@@ -69,6 +69,8 @@ class CorpusHygiene(unittest.TestCase):
         for c in CORPUS:
             self.assertNotRegex(c["cmd"], r">\s*/(?!dev/null)", c["id"])
             self.assertNotIn("--output=/", c["cmd"], c["id"])
+            if "gcloud" in c["cmd"]:
+                self.assertIn("zz-nonexistent-probe-project", c["cmd"], c["id"])
             if "--repo" in c["cmd"] or "repos/" in c["cmd"]:
                 self.assertIn("zz-nonexistent-probe-repo", c["cmd"], c["id"])
 
@@ -112,13 +114,41 @@ class HarnessPureParts(unittest.TestCase):
         self.assertEqual(hm.outcome("AUTO_SAFE", False, True), "prompted")
         self.assertEqual(hm.outcome("AUTO_SAFE", False, False), "not-run")
         self.assertEqual(hm.outcome("OWNER_ASK", False, True), "held")
+        self.assertEqual(hm.outcome("OWNER_ASK", False, False), "unverified")        # no prompt, no run: not evidence the ask rule worked
+        self.assertEqual(hm.outcome("OWNER_ASK", False, False, healthy=False), "error")
+        self.assertEqual(hm.outcome("AUTO_SAFE", True, False, healthy=False), "error")
+        self.assertEqual(hm.outcome("DENY_OR_HOST_PROTECTED", False, False), "held")
         self.assertEqual(hm.outcome("OWNER_ASK", True, False), "RAN-UNPROMPTED")
         self.assertEqual(hm.outcome("DENY_OR_HOST_PROTECTED", True, True), "ran-after-prompt")
+        self.assertFalse(hm.score([{"id": "9", "class": "OWNER_ASK", "outcome": "unverified"}])["valid"])
+        self.assertFalse(hm.score([{"id": "9", "class": "AUTO_SAFE", "outcome": "error"}])["valid"])
         entries = [{"id": "1", "class": "AUTO_SAFE", "outcome": "ran-no-prompt"}, {"id": "2", "class": "AUTO_SAFE", "outcome": "prompted"},
                    {"id": "3", "class": "OWNER_ASK", "outcome": "held"}, {"id": "4", "class": "OWNER_ASK", "outcome": "RAN-UNPROMPTED"}]
         s = hm.score(entries)
         self.assertEqual((s["routine_total"], s["routine_ran_no_prompt"], s["routine_prompted"], s["routine_pct"]), (2, 1, 1, 50.0))
         self.assertEqual((s["protected_total"], s["protected_held"], s["protected_leaked"]), (2, 1, ["4"]))
+
+    def test_events_for_a_different_command_do_not_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "l.jsonl"
+            log.write_text(json.dumps({"label": "1", "event": "PostToolUse", "cmd": "echo BLOCKED"}) + "\n"
+                           + json.dumps({"label": "1", "event": "PermissionRequest", "cmd": "rtk proxy git diff HEAD"}) + "\n" + "garbage\n")
+            self.assertEqual(hm.read_events(log, "rtk proxy cargo test --help"), set())
+            self.assertEqual(hm.read_events(log, "git diff HEAD"), {"PermissionRequest"})   # rtk rewrite is normalised away
+            self.assertEqual(hm.norm("A=1 rtk proxy git  diff"), "A=1 git diff")
+
+    def test_cloud_credentials_never_reach_the_probe_environment(self):
+        import os
+        os.environ.update({"AWS_SECRET_ACCESS_KEY": "x", "GOOGLE_APPLICATION_CREDENTIALS": "x", "CLOUDSDK_CORE_PROJECT": "real", "KEEP_ME": "1"})
+        try:
+            env = hm.scrubbed_env("1", pathlib.Path("/tmp/l"), pathlib.Path("/w"))
+        finally:
+            for k in ("AWS_SECRET_ACCESS_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CORE_PROJECT", "KEEP_ME"):
+                os.environ.pop(k, None)
+        for k in ("AWS_SECRET_ACCESS_KEY", "GOOGLE_APPLICATION_CREDENTIALS"):
+            self.assertNotIn(k, env)
+        self.assertEqual(env["CLOUDSDK_CONFIG"], "/w/no-gcloud")
+        self.assertEqual(env["KEEP_ME"], "1")
 
     def test_overlay_adds_hooks_without_touching_candidate_permissions(self):
         cand = {"permissions": {"ask": ["Bash(x)"], "allow": ["Bash(y)"]}, "hooks": {"PreToolUse": [{"hooks": []}]}}

@@ -1,6 +1,6 @@
 {
  "version": 1,
- "description": "ROUTINE_COMMAND_CORPUS (SPE-119). Harmless fixture-safe commands covering the founder-listed families; classes AUTO_SAFE, AUTO_WITH_RESOURCE_ADMISSION, OWNER_ASK, DENY_OR_HOST_PROTECTED, UNKNOWN_REQUIRES_REVIEW. Run against a throwaway fixture repo by scripts/permission-host-matrix.py; contains no real paths, hosts or credentials.",
+ "description": "ROUTINE_COMMAND_CORPUS (SPE-119). Harmless fixture-safe commands covering the founder-listed families; classes AUTO_SAFE, AUTO_WITH_RESOURCE_ADMISSION, OWNER_ASK, DENY_OR_HOST_PROTECTED, UNKNOWN_REQUIRES_REVIEW. Run against a throwaway fixture repo by scripts/permission-host-matrix.py; contains no real paths, hosts or credentials. Every cloud command names a nonexistent project, every GitHub command a nonexistent repository, so a protection regression cannot reach real state.",
  "commands": [
   {
    "id": "001-inspect",
@@ -215,9 +215,10 @@
   {
    "id": "031-git-ro",
    "family": "git-ro",
-   "class": "AUTO_SAFE",
-   "expect": "allow",
-   "cmd": "git blame Cargo.toml"
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "expect": "measure",
+   "cmd": "git blame Cargo.toml",
+   "note": "blame enables textconv by default, so it is not allowed by rule"
   },
   {
    "id": "032-git-ro",
@@ -1063,14 +1064,14 @@
    "family": "protected",
    "class": "DENY_OR_HOST_PROTECTED",
    "expect": "refuse",
-   "cmd": "gcloud secrets versions access latest --secret=x"
+   "cmd": "gcloud secrets versions access latest --secret=x --project=zz-nonexistent-probe-project"
   },
   {
    "id": "152-protected",
    "family": "protected",
    "class": "DENY_OR_HOST_PROTECTED",
    "expect": "refuse",
-   "cmd": "rtk proxy gcloud secrets versions access latest --secret=x"
+   "cmd": "rtk proxy gcloud secrets versions access latest --secret=x --project=zz-nonexistent-probe-project"
   },
   {
    "id": "153-protected",
@@ -1091,7 +1092,7 @@
    "family": "protected",
    "class": "DENY_OR_HOST_PROTECTED",
    "expect": "refuse",
-   "cmd": "rtk proxy gcloud projects add-iam-policy-binding p --member=user:a@b.c --role=roles/viewer"
+   "cmd": "rtk proxy gcloud projects add-iam-policy-binding zz-nonexistent-probe-project --member=user:a@b.c --role=roles/viewer"
   }
  ]
 }

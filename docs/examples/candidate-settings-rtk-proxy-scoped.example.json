@@ -89,7 +89,6 @@
       "Bash(rtk proxy git merge-base:*)",
       "Bash(rtk proxy git ls-tree:*)",
       "Bash(rtk proxy git describe:*)",
-      "Bash(rtk proxy git blame:*)",
       "Bash(rtk proxy grep:*)",
       "Bash(rtk proxy cargo test:*)",
       "Bash(rtk proxy cargo build:*)",
@@ -102,9 +101,7 @@
       "Bash(git merge-base:*)",
       "Bash(rtk git merge-base:*)",
       "Bash(git describe:*)",
-      "Bash(rtk git describe:*)",
-      "Bash(git blame:*)",
-      "Bash(rtk git blame:*)"
+      "Bash(rtk git describe:*)"
     ],
     "retire_ask": [
       "Bash(rtk proxy *)"

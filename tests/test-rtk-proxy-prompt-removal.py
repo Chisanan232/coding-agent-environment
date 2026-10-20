@@ -163,15 +163,16 @@ class WrappedTwins(unittest.TestCase):
 
 
 class BareReadOnlyGit(unittest.TestCase):
-    def test_ls_tree_blame_merge_base_describe_run_without_a_prompt_in_both_spellings(self):
+    def test_ls_tree_merge_base_describe_run_without_a_prompt_in_both_spellings(self):
         merged, _, _ = merged_permissions()
         for pre in ("", "rtk "):
-            for cmd in ("git ls-tree HEAD", "git ls-tree -r --name-only HEAD", "git blame Cargo.toml", "git merge-base HEAD main", "git describe --always"):
+            for cmd in ("git ls-tree HEAD", "git ls-tree -r --name-only HEAD", "git merge-base HEAD main", "git describe --always"):
                 self.assertEqual(pr.static_decision(pre + cmd, merged["permissions"]), "allow", pre + cmd)
 
-    def test_cat_file_stays_out_because_it_can_run_helpers(self):
+    def test_cat_file_and_blame_stay_out_because_they_can_run_helpers(self):
         merged, _, _ = merged_permissions()
-        self.assertNotEqual(pr.static_decision("git cat-file --textconv HEAD:f", merged["permissions"]), "allow")
+        for cmd in ("git cat-file --textconv HEAD:f", "git blame HEAD -- f.pdf", "git blame --textconv HEAD -- f.pdf", "rtk git blame f", "rtk proxy git blame f"):
+            self.assertNotEqual(pr.static_decision(cmd, merged["permissions"]), "allow", cmd)
 
     def test_a_candidate_allow_outside_the_exact_set_is_still_blocked(self):
         cand = wsp.proxy_scoped_candidate()
