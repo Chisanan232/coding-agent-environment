@@ -135,7 +135,20 @@ class HarnessPureParts(unittest.TestCase):
                            + json.dumps({"label": "1", "event": "PermissionRequest", "cmd": "rtk proxy git diff HEAD"}) + "\n" + "garbage\n")
             self.assertEqual(hm.read_events(log, "rtk proxy cargo test --help"), set())
             self.assertEqual(hm.read_events(log, "git diff HEAD"), {"PermissionRequest"})   # rtk rewrite is normalised away
-            self.assertEqual(hm.norm("A=1 rtk proxy git  diff"), "A=1 git diff")
+            self.assertEqual(hm.norm("A=1 rtk proxy git  diff"), "git diff")
+
+    def test_command_matching_tolerates_rtk_rewrites_and_rejects_other_commands(self):
+        m = hm.command_matches
+        self.assertTrue(m("rtk grep -rn marker src .", "grep -rn marker src"))
+        self.assertTrue(m("rtk read Cargo.toml", "cat Cargo.toml"))
+        self.assertTrue(m("rtk read Cargo.toml --max-lines 3", "head -3 Cargo.toml"))
+        self.assertTrue(m("CARGO_TARGET_DIR=./target rtk cargo --version | grep cargo | head -1", "CARGO_TARGET_DIR=./target rtk proxy cargo --version | grep cargo | head -1"))
+        self.assertTrue(m("rtk git status --short && rtk git log --oneline -1", "git status --short && git log --oneline -1"))
+        self.assertFalse(m("echo BLOCKED", "rtk proxy cargo test --help"))
+        self.assertFalse(m("rtk read other.toml", "cat Cargo.toml"))
+        self.assertFalse(m("rtk git status", "git status --short && git log --oneline -1"))
+        self.assertFalse(m("", "git status"))
+        self.assertFalse(m("rtk git push origin main", "git push --force origin full/SPE-9/owned"))
 
     def test_cloud_credentials_never_reach_the_probe_environment(self):
         import os

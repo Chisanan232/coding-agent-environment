@@ -17,6 +17,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -66,9 +67,51 @@ def prompt(cmd):
             "Do not retry or use any other tool.")
 
 
+ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# rtk rewrites some programs to its own verbs (cat/head/tail become `rtk read`); a recorded command may use the rewritten verb
+PROGRAM_EQUIV = {"read": {"cat", "head", "tail", "sed", "bat"}}
+
+
+def simple_commands(cmd):
+    """Split into simple commands and return (program, args) pairs with env assignments, `rtk` and `proxy` removed."""
+    out = []
+    for part in re.split(r"&&|\|\||;|\||\n", str(cmd)):
+        try:
+            toks = shlex.split(part)
+        except ValueError:
+            toks = part.split()
+        while toks and ENV_ASSIGN.match(toks[0]):
+            toks.pop(0)
+        if toks and toks[0] == "rtk":
+            toks.pop(0)
+            if toks and toks[0] == "proxy":
+                toks.pop(0)
+        if toks:
+            out.append((os.path.basename(toks[0]), toks[1:]))
+    return out
+
+
 def norm(cmd):
-    """Compare commands across the rtk rewrite: drop the rtk and rtk proxy words and collapse whitespace."""
-    return " ".join(re.sub(r"\brtk (proxy )?", "", str(cmd)).split())
+    return " ".join(f"{p} {' '.join(a)}".strip() for p, a in simple_commands(cmd))
+
+
+def command_matches(recorded, expected):
+    """True when the recorded Bash command is the expected one modulo rtk's rewrite: every expected program appears (directly or as its
+    rtk verb) and every non-flag, non-numeric expected argument appears among the recorded tokens. `echo BLOCKED` never matches a cargo case."""
+    rec, exp = simple_commands(recorded), simple_commands(expected)
+    if not exp or not rec:
+        return False
+    rec_progs = {p for p, _ in rec}
+    rec_tokens = {t for _, a in rec for t in a} | rec_progs
+    for prog, args in exp:
+        if prog not in rec_progs and not any(prog in PROGRAM_EQUIV.get(rp, ()) for rp in rec_progs):
+            return False
+        for a in args:
+            if a.startswith("-") or a.isdigit():
+                continue
+            if a not in rec_tokens:
+                return False
+    return True
 
 
 def outcome(cls, ran, prompted, healthy=True):
@@ -111,15 +154,27 @@ def scrubbed_env(label, log, work):
 
 def read_events(log, cmd):
     """Events recorded for THIS command: a Bash event whose command differs (the model ran something else) does not count."""
-    want, seen = norm(cmd), set()
+    seen = set()
     for line in log.read_text().splitlines():
         try:
             rec = json.loads(line)
         except ValueError:
             continue
-        if norm(rec.get("cmd", "")) == want:
+        if command_matches(rec.get("cmd", ""), cmd):
             seen.add(rec["event"])
     return seen
+
+
+def recorded_commands(log):
+    """The commands the hooks saw, kept in the result for audit (corpus commands are non-sensitive fixture commands)."""
+    out = []
+    for line in log.read_text().splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        out.append(f"{rec.get('event')}: {rec.get('cmd', '')[:160]}")
+    return out
 
 
 def run_case(c, work, settings, live, timeout):
@@ -141,7 +196,7 @@ def run_case(c, work, settings, live, timeout):
             break
     ran = bool(events & {"PostToolUse", "PostToolUseFailure"})
     prompted = "PermissionRequest" in events
-    return {"id": c["id"], "class": c["class"], "ran": ran, "prompted": prompted, "healthy": healthy,
+    return {"id": c["id"], "class": c["class"], "ran": ran, "prompted": prompted, "healthy": healthy, "recorded": recorded_commands(log),
             "outcome": outcome(c["class"], ran, prompted, healthy or bool(events))}
 
 
