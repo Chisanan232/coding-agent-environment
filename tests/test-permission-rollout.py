@@ -26,6 +26,8 @@ PROXY_SCOPED_ASK = [
     "Bash(rtk proxy git worktree:*)", "Bash(rtk proxy git * push*)", "Bash(rtk proxy git * reset*)",
     "Bash(rtk proxy git * clean*)", "Bash(rtk proxy git * worktree*)",
     "Bash(rtk proxy gh api -X DELETE*)", "Bash(rtk proxy gh api --method DELETE*)", "Bash(rtk proxy gh repo delete *)",
+    "Bash(rtk proxy git*--output*)", "Bash(rtk proxy git*--ext-diff*)", "Bash(rtk proxy git*--no-index*)", "Bash(rtk proxy git fetch*--upl*)",
+    "Bash(rtk proxy git*--textconv*)",
     "Bash(rtk proxy gh api * -X DELETE*)", "Bash(rtk proxy gh api * --method DELETE*)",
 ]
 

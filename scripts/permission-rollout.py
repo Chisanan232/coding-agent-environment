@@ -127,6 +127,9 @@ PROXY_PROTECTED_COMMANDS = [
     "rtk proxy sh -c 'git push --force'", "rtk proxy bash -c x", "rtk proxy zsh -c x", "rtk proxy eval x",
     "rtk proxy env gcloud x", "rtk proxy xargs rm", "rtk proxy sudo x",
     "rtk proxy exec gcloud x", "rtk proxy command gcloud x", "rtk proxy /usr/bin/gcloud auth list",
+    "rtk proxy git diff HEAD --output=/tmp/x", "rtk proxy git log -p --output=f", "rtk proxy git show HEAD --ext-diff",
+    "rtk proxy git diff --ext-diff HEAD~1", "rtk proxy git diff --no-index /a /b", "rtk proxy git fetch --upload-pack=cmd origin",
+    "rtk proxy git diff --textconv HEAD~1 HEAD", "rtk proxy git -C /peer diff --output=/tmp/x",
     "rtk proxy gh repo delete o/r --yes", "rtk proxy gh api repos/o/r -X DELETE", "rtk proxy gh api repos/o/r --method DELETE",
 ]
 PROXY_ROUTINE_COMMANDS = [

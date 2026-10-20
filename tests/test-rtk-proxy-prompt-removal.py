@@ -29,7 +29,7 @@ LIVE = {"env": {"EXAMPLE": "DUMMY-NOT-A-REAL-SECRET"}, "model": "m",
         "autoMode": {"environment": ["$defaults", "keep me"]}}
 PARITY_GAPS = ["rtk proxy git diff HEAD --output=/tmp/x", "rtk proxy git log -p --output=f", "rtk proxy git show HEAD --ext-diff",
                "rtk proxy git diff --ext-diff HEAD~1", "rtk proxy git diff --no-index /a /b", "rtk proxy git fetch --upload-pack=cmd origin",
-               "rtk proxy git -C /peer diff --output=/tmp/x", "rtk proxy git -c core.pager=x diff --no-index /a /b"]
+               "rtk proxy git diff --textconv HEAD~1 HEAD", "rtk proxy git -C /peer diff --output=/tmp/x", "rtk proxy git -c core.pager=x diff --no-index /a /b"]
 ROUTINE = ["rtk proxy cargo test -p fornax-cli", "rtk proxy cargo build --release", "rtk proxy cargo clippy --all-targets", "rtk proxy cargo fmt --check",
            "rtk proxy git diff origin/main...HEAD -- tests/ docs/", "rtk proxy git show origin/main:src/lib.rs", "rtk proxy git log --oneline -5",
            "rtk proxy git status --short", "rtk proxy grep -rn needle src"]
@@ -100,8 +100,21 @@ class NegativeControls(unittest.TestCase):
     def test_a_candidate_without_the_parity_asks_is_blocked_on_the_flag_forms(self):
         cand = wsp.proxy_scoped_candidate()
         cand["permissions"]["ask"] = [r for r in cand["permissions"]["ask"] if r not in wsp.PROXY_PARITY_ASKS]
-        merged, _ = cr.merge({"permissions": {"ask": ["Bash(rtk proxy *)"], "allow": []}}, cand)
-        self.assertEqual(pr.static_decision("rtk proxy git diff --no-index /a /b", merged["permissions"]), "allow")  # what the gap would have allowed
+        _, _, findings = merged_permissions(cand)
+        blocked = " ".join(f for f in findings if f.startswith("BLOCKING protected wrapped command would not ask"))
+        for flag in ("--output", "--ext-diff", "--no-index", "--upload-pack", "--textconv"):
+            self.assertIn(flag, blocked, flag)
+
+    def test_an_exact_allow_outside_the_scoped_set_is_blocked(self):
+        cand = wsp.proxy_scoped_candidate()
+        cand["permissions"]["allow"] = cand["permissions"]["allow"] + ["Bash(rtk proxy python3 -c 'print(1)')"]
+        _, _, findings = merged_permissions(cand)
+        self.assertTrue(any(f.startswith("BLOCKING candidate allow is not one of the scoped") for f in findings), findings)
+
+    def test_nextest_is_allowed_only_for_run(self):
+        merged, _, _ = merged_permissions()
+        self.assertEqual(pr.static_decision("rtk proxy cargo nextest run -p x", merged["permissions"]), "allow")
+        self.assertNotEqual(pr.static_decision("rtk proxy cargo nextest self update --yes", merged["permissions"]), "allow")
 
     def test_the_tool_refuses_to_retire_any_other_ask(self):
         cand = wsp.proxy_scoped_candidate()

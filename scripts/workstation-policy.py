@@ -42,15 +42,15 @@ NON_GOVERNED_KINDS = {"local"}
 PROXY_ROUTINE_ALLOW = (
     [f"Bash(rtk proxy git {v}:*)" for v in ("diff", "show", "log", "status", "rev-parse", "rev-list", "ls-files", "merge-base")]
     + ["Bash(rtk proxy grep:*)"]
-    + [f"Bash(rtk proxy cargo {v}:*)" for v in ("test", "build", "check", "clippy", "fmt", "nextest")]
+    + [f"Bash(rtk proxy cargo {v}:*)" for v in ("test", "build", "check", "clippy", "fmt", "nextest run")]
 )
 # Wrapped twins of the bare asks that write files, run helpers or reach outside the repository (SPE-114 parity gaps).
-PROXY_PARITY_ASKS = ["Bash(rtk proxy git*--output*)", "Bash(rtk proxy git*--ext-diff*)", "Bash(rtk proxy git*--no-index*)", "Bash(rtk proxy git fetch*--upl*)"]
+PROXY_PARITY_ASKS = ["Bash(rtk proxy git*--output*)", "Bash(rtk proxy git*--ext-diff*)", "Bash(rtk proxy git*--no-index*)", "Bash(rtk proxy git fetch*--upl*)", "Bash(rtk proxy git*--textconv*)"]
 # The only ask candidate-rollout may retire; any other ask stays until the owner removes it by hand.
 RETIRABLE_ASKS = ("Bash(rtk proxy *)",)
 READ_ONLY_ALLOW = re.compile(
     r"Bash\((git (status|diff|log|show)|gh (pr|issue|run) (view|list|checks|diff|status)|ls|cat|pytest|python3 -m pytest)(:\*| \*)\)"
-    r"|Bash\(rtk proxy (git (diff|show|log|status|rev-parse|rev-list|ls-files|merge-base)|grep|cargo (test|build|check|clippy|fmt|nextest)):\*\)")
+    r"|Bash\(rtk proxy (git (diff|show|log|status|rev-parse|rev-list|ls-files|merge-base)|grep|cargo (test|build|check|clippy|fmt|nextest run)):\*\)")
 
 ALTERNATIVES = {
     "documents": "share a redacted excerpt or a synthetic stand-in", "logs": "share a redacted excerpt with identifiers removed",

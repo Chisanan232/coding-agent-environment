@@ -40,7 +40,8 @@
       "Bash(rtk proxy git*--output*)",
       "Bash(rtk proxy git*--ext-diff*)",
       "Bash(rtk proxy git*--no-index*)",
-      "Bash(rtk proxy git fetch*--upl*)"
+      "Bash(rtk proxy git fetch*--upl*)",
+      "Bash(rtk proxy git*--textconv*)"
     ],
     "allow": [
       "Bash(rtk proxy git diff:*)",
@@ -57,7 +58,7 @@
       "Bash(rtk proxy cargo check:*)",
       "Bash(rtk proxy cargo clippy:*)",
       "Bash(rtk proxy cargo fmt:*)",
-      "Bash(rtk proxy cargo nextest:*)"
+      "Bash(rtk proxy cargo nextest run:*)"
     ],
     "retire_ask": [
       "Bash(rtk proxy *)"
