@@ -133,7 +133,7 @@ def compat(live, merged, candidate, report_conflicts=()):
         if r not in wsp.PROXY_ROUTINE_ALLOW:
             out.append(f"BLOCKING candidate allow is not one of the scoped rtk proxy allows this tool may add: {r}")
     merged_perm = merged["permissions"]
-    if any(r in candidate["permissions"].get("retire_ask", []) for r in wsp.RETIRABLE_ASKS):
+    if candidate["permissions"].get("allow") or any(r in candidate["permissions"].get("retire_ask", []) for r in wsp.RETIRABLE_ASKS):
         for cmd in pr.PROXY_PROTECTED_COMMANDS:
             if pr.static_decision(cmd, merged_perm) != "ask":
                 out.append(f"BLOCKING protected wrapped command would not ask after the merge: {cmd!r} -> {pr.static_decision(cmd, merged_perm)}")

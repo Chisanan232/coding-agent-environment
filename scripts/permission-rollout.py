@@ -130,6 +130,9 @@ PROXY_PROTECTED_COMMANDS = [
     "rtk proxy git diff HEAD --output=/tmp/x", "rtk proxy git log -p --output=f", "rtk proxy git show HEAD --ext-diff",
     "rtk proxy git diff --ext-diff HEAD~1", "rtk proxy git diff --no-index /a /b", "rtk proxy git fetch --upload-pack=cmd origin",
     "rtk proxy git diff --textconv HEAD~1 HEAD", "rtk proxy git -C /peer diff --output=/tmp/x",
+    "rtk proxy git diff --ext-dif HEAD", "rtk proxy git diff --outp=/tmp/x HEAD", "rtk proxy git log --tex -p",
+    "rtk proxy gh release create v1.0", "rtk proxy gh release upload v1.0 f", "rtk proxy cargo publish", "rtk proxy npm publish",
+    "rtk proxy pnpm publish", "rtk proxy twine upload dist/*", "rtk proxy uv publish", "rtk proxy gh pr merge 7 --repo a/b --merge",
     "rtk proxy gh repo delete o/r --yes", "rtk proxy gh api repos/o/r -X DELETE", "rtk proxy gh api repos/o/r --method DELETE",
 ]
 PROXY_ROUTINE_COMMANDS = [

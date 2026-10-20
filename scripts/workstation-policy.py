@@ -45,7 +45,12 @@ PROXY_ROUTINE_ALLOW = (
     + [f"Bash(rtk proxy cargo {v}:*)" for v in ("test", "build", "check", "clippy", "fmt", "nextest run")]
 )
 # Wrapped twins of the bare asks that write files, run helpers or reach outside the repository (SPE-114 parity gaps).
-PROXY_PARITY_ASKS = ["Bash(rtk proxy git*--output*)", "Bash(rtk proxy git*--ext-diff*)", "Bash(rtk proxy git*--no-index*)", "Bash(rtk proxy git fetch*--upl*)", "Bash(rtk proxy git*--textconv*)"]
+# git accepts any unique prefix of a long option, so the prefixes below are the shortest that stay unambiguous (--ou*, --ext*, --tex*,
+# --upl*); --no-index has no shorter unique spelling. A wrapped merge is never allowed by a wrapper rule: the pinned form is the plain command.
+PROXY_PARITY_ASKS = ["Bash(rtk proxy git*--ou*)", "Bash(rtk proxy git*--ext*)", "Bash(rtk proxy git*--no-index*)", "Bash(rtk proxy git fetch*--upl*)",
+                     "Bash(rtk proxy git*--tex*)", "Bash(rtk proxy gh pr merge*)"]
+# Every bare protected ask also asks when wrapped, so wrapping a release, publish, delete or force-push never lowers its protection.
+PROXY_TWIN_ASKS = None  # filled after ASK_BASH_RULES is defined
 # The only ask candidate-rollout may retire; any other ask stays until the owner removes it by hand.
 RETIRABLE_ASKS = ("Bash(rtk proxy *)",)
 READ_ONLY_ALLOW = re.compile(
@@ -219,6 +224,9 @@ ASK_PATH_RULES = [f"{tool}({path})" for tool in ("Edit", "Write") for path in (
     "**/.claude/settings.json", "**/.claude/settings.local.json", "**/.claude/hooks/**", "**/.claude/plugins/**", "**/.mcp.json")]
 
 
+PROXY_TWIN_ASKS = [r.replace("Bash(", "Bash(rtk proxy ", 1) for r in ASK_BASH_RULES]
+
+
 def candidate(kind, asks_only=False):
     env = [
         "Source of truth: GitHub repositories owned by the owner; Jira for tickets; the workstation profile is " + kind + ".",
@@ -250,7 +258,7 @@ def proxy_scoped_candidate():
     base = json.loads((pathlib.Path(__file__).resolve().parent.parent / ".claude/settings.json").read_text())["permissions"]["ask"]
     gh_api = {f"Bash({p}gh api {f}*)" for p in ("", "rtk ") for f in ("-X DELETE", "--method DELETE")}
     asks = [r for r in base if "rtk proxy" in r or r in gh_api]
-    asks += [r for r in PROXY_PARITY_ASKS if r not in asks]
+    asks += [r for r in PROXY_PARITY_ASKS + PROXY_TWIN_ASKS if r not in asks]
     return {
         "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Retires the broad Bash(rtk proxy *) ask "
                        "(an ask cannot be overridden by a narrower allow) and replaces it with scoped asks plus scoped allows for routine wrapped work. No autoMode change.",

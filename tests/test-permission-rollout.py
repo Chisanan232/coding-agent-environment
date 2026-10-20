@@ -26,8 +26,6 @@ PROXY_SCOPED_ASK = [
     "Bash(rtk proxy git worktree:*)", "Bash(rtk proxy git * push*)", "Bash(rtk proxy git * reset*)",
     "Bash(rtk proxy git * clean*)", "Bash(rtk proxy git * worktree*)",
     "Bash(rtk proxy gh api -X DELETE*)", "Bash(rtk proxy gh api --method DELETE*)", "Bash(rtk proxy gh repo delete *)",
-    "Bash(rtk proxy git*--output*)", "Bash(rtk proxy git*--ext-diff*)", "Bash(rtk proxy git*--no-index*)", "Bash(rtk proxy git fetch*--upl*)",
-    "Bash(rtk proxy git*--textconv*)",
     "Bash(rtk proxy gh api * -X DELETE*)", "Bash(rtk proxy gh api * --method DELETE*)",
 ]
 
@@ -60,6 +58,11 @@ BASE_ASK = [
     "Bash(git worktree add -f*)", "Bash(git worktree add * -f*)",
     "Bash(git worktree remove* -f*)", "Bash(git * worktree remove*)",
 ]
+_wsp_spec = importlib.util.spec_from_file_location("wsp_fixture", ROOT / "scripts/workstation-policy.py")
+_wsp = importlib.util.module_from_spec(_wsp_spec)
+_wsp_spec.loader.exec_module(_wsp)
+# the wrapped asks are derived from the policy module (SPE-119), so this fixture cannot drift from it
+BASE_ASK += [r for r in _wsp.PROXY_PARITY_ASKS + _wsp.PROXY_TWIN_ASKS if r not in BASE_ASK]
 BASELINE = {
     "permissions": {"allow": ["Bash(git status:*)", "Bash(git worktree list:*)"], "ask": BASE_ASK, "deny": [], "defaultMode": "auto"},
     "autoMode": {
@@ -620,7 +623,8 @@ class StaticGate(Fixture):
 
     def test_a_result_that_stops_asking_for_a_wrapped_force_push_is_flagged(self):
         merged = rollout.merge(copy.deepcopy(LIVE), copy.deepcopy(BASELINE), [])
-        merged["permissions"]["ask"].remove("Bash(rtk proxy git push:*)")
+        cmd = "rtk proxy git push --force origin x"
+        merged["permissions"]["ask"] = [r for r in merged["permissions"]["ask"] if not rollout.rule_regex(r).match(cmd)]
         found = rollout.problems(merged)
         self.assertTrue(any("wrapped protected command does not ask" in f and "git push --force" in f for f in found), found)
 

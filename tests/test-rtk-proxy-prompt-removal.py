@@ -29,7 +29,8 @@ LIVE = {"env": {"EXAMPLE": "DUMMY-NOT-A-REAL-SECRET"}, "model": "m",
         "autoMode": {"environment": ["$defaults", "keep me"]}}
 PARITY_GAPS = ["rtk proxy git diff HEAD --output=/tmp/x", "rtk proxy git log -p --output=f", "rtk proxy git show HEAD --ext-diff",
                "rtk proxy git diff --ext-diff HEAD~1", "rtk proxy git diff --no-index /a /b", "rtk proxy git fetch --upload-pack=cmd origin",
-               "rtk proxy git diff --textconv HEAD~1 HEAD", "rtk proxy git -C /peer diff --output=/tmp/x", "rtk proxy git -c core.pager=x diff --no-index /a /b"]
+               "rtk proxy git diff --textconv HEAD~1 HEAD", "rtk proxy git -C /peer diff --output=/tmp/x", "rtk proxy git -c core.pager=x diff --no-index /a /b",
+               "rtk proxy git diff --ext-dif HEAD", "rtk proxy git diff --outp=/tmp/x HEAD", "rtk proxy git log --tex -p"]
 ROUTINE = ["rtk proxy cargo test -p fornax-cli", "rtk proxy cargo build --release", "rtk proxy cargo clippy --all-targets", "rtk proxy cargo fmt --check",
            "rtk proxy git diff origin/main...HEAD -- tests/ docs/", "rtk proxy git show origin/main:src/lib.rs", "rtk proxy git log --oneline -5",
            "rtk proxy git status --short", "rtk proxy grep -rn needle src"]
@@ -127,6 +128,38 @@ class NegativeControls(unittest.TestCase):
     def test_a_broad_wrapper_allow_or_blanket_bash_allow_fails_the_lint(self):
         for bad in ("Bash(rtk proxy *)", "Bash(rtk proxy:*)", "Bash(*)", "Bash(rtk proxy git push:*)"):
             self.assertTrue(wsp.lint_settings({"permissions": {"allow": [bad]}}), bad)
+
+
+class WrappedTwins(unittest.TestCase):
+    @staticmethod
+    def sample(rule):
+        return rule[len("Bash("):-1].replace(":*", " x").replace("**", "x").replace("*", "x")
+
+    def test_every_bare_protected_ask_also_asks_when_wrapped(self):
+        merged, _, _ = merged_permissions()
+        for rule in wsp.ASK_BASH_RULES:
+            wrapped = "rtk proxy " + self.sample(rule)
+            self.assertEqual(pr.static_decision(wrapped, merged["permissions"]), "ask", wrapped)
+            self.assertEqual(pr.static_decision(wrapped, BASELINE["permissions"]), "ask", wrapped)
+
+    def test_release_publish_and_wrapped_merge_ask(self):
+        merged, _, _ = merged_permissions()
+        for cmd in ("rtk proxy gh release create v1.0", "rtk proxy cargo publish", "rtk proxy npm publish", "rtk proxy twine upload dist/x",
+                    "rtk proxy gh pr merge 7 --repo a/b --merge --match-head-commit " + "0" * 40):
+            self.assertEqual(pr.static_decision(cmd, merged["permissions"]), "ask", cmd)
+
+    def test_abbreviated_long_git_options_still_ask(self):
+        merged, _, _ = merged_permissions()
+        for cmd in ("rtk proxy git diff --ext-dif HEAD", "rtk proxy git diff --ext HEAD", "rtk proxy git diff --ou=/tmp/x HEAD",
+                    "rtk proxy git diff --outp=/tmp/x HEAD", "rtk proxy git log --tex -p", "rtk proxy git show --text HEAD"):
+            self.assertEqual(pr.static_decision(cmd, merged["permissions"]), "ask", cmd)
+
+    def test_allow_only_candidate_still_runs_the_protection_check(self):
+        live = {"permissions": {"ask": [], "allow": []}}
+        cand = {"permissions": {"ask": [], "allow": ["Bash(rtk proxy git diff:*)"], "deny": []}}
+        merged, _ = cr.merge(live, cand)
+        findings = cr.compat(live, merged, cand)
+        self.assertTrue(any(f.startswith("BLOCKING protected wrapped command would not ask") and "--output" in f for f in findings), findings)
 
 
 class RepositoryState(unittest.TestCase):
