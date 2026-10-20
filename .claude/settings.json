@@ -61,7 +61,6 @@
             "Bash(rtk proxy git ls-files:*)",
             "Bash(rtk proxy git merge-base:*)",
             "Bash(rtk proxy grep:*)",
-            "Bash(rtk proxy rg:*)",
             "Bash(rtk proxy cargo test:*)",
             "Bash(rtk proxy cargo build:*)",
             "Bash(rtk proxy cargo check:*)",

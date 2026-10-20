@@ -32,7 +32,7 @@ PARITY_GAPS = ["rtk proxy git diff HEAD --output=/tmp/x", "rtk proxy git log -p 
                "rtk proxy git -C /peer diff --output=/tmp/x", "rtk proxy git -c core.pager=x diff --no-index /a /b"]
 ROUTINE = ["rtk proxy cargo test -p fornax-cli", "rtk proxy cargo build --release", "rtk proxy cargo clippy --all-targets", "rtk proxy cargo fmt --check",
            "rtk proxy git diff origin/main...HEAD -- tests/ docs/", "rtk proxy git show origin/main:src/lib.rs", "rtk proxy git log --oneline -5",
-           "rtk proxy git status --short", "rtk proxy grep -rn needle src", "rtk proxy rg needle"]
+           "rtk proxy git status --short", "rtk proxy grep -rn needle src"]
 PROTECTED = list(pr.PROXY_PROTECTED_COMMANDS) + PARITY_GAPS
 
 
@@ -79,6 +79,12 @@ class Replacement(unittest.TestCase):
 
 
 class NegativeControls(unittest.TestCase):
+    def test_ripgrep_pre_helper_is_never_allowed_by_a_scoped_rule(self):
+        merged, _, _ = merged_permissions()
+        for cmd in ("rtk proxy rg --pre sh needle f", "rtk proxy rg needle", "rtk proxy rg --search-zip needle"):
+            self.assertNotEqual(pr.static_decision(cmd, merged["permissions"]), "allow", cmd)
+            self.assertNotEqual(pr.static_decision(cmd, BASELINE["permissions"]), "allow", cmd)
+
     def test_wrapping_never_makes_a_protected_command_allowed(self):
         merged, _, _ = merged_permissions()
         for cmd in ("rtk proxy git push --force origin x", "rtk proxy git -C /p push --force origin x", "rtk proxy git reset --hard HEAD",

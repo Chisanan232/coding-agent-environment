@@ -36,11 +36,12 @@ PROTECTED_RELATIVE = (".claude/settings.json", ".claude/settings.local.json", ".
 BENIGN_KEYS = {"model", "effortlevel", "advisormodel", "theme", "verbose"}
 NON_GOVERNED_KINDS = {"local"}
 # The only wildcard Bash allows a candidate may carry; everything else with a `*` is reported. Case-sensitive on purpose.
+# `rg` is deliberately absent: `rg --pre CMD` runs CMD, and no bare rg allow exists to be at parity with.
 # SPE-119 adds the scoped `rtk proxy` spellings of read-only git, search and local cargo checks: `rtk proxy` is never rewritten by the
 # hook, so a rule naming the plain command does not see it, and the broad `rtk proxy *` ask it replaces cannot be overridden by an allow.
 PROXY_ROUTINE_ALLOW = (
     [f"Bash(rtk proxy git {v}:*)" for v in ("diff", "show", "log", "status", "rev-parse", "rev-list", "ls-files", "merge-base")]
-    + ["Bash(rtk proxy grep:*)", "Bash(rtk proxy rg:*)"]
+    + ["Bash(rtk proxy grep:*)"]
     + [f"Bash(rtk proxy cargo {v}:*)" for v in ("test", "build", "check", "clippy", "fmt", "nextest")]
 )
 # Wrapped twins of the bare asks that write files, run helpers or reach outside the repository (SPE-114 parity gaps).
@@ -49,7 +50,7 @@ PROXY_PARITY_ASKS = ["Bash(rtk proxy git*--output*)", "Bash(rtk proxy git*--ext-
 RETIRABLE_ASKS = ("Bash(rtk proxy *)",)
 READ_ONLY_ALLOW = re.compile(
     r"Bash\((git (status|diff|log|show)|gh (pr|issue|run) (view|list|checks|diff|status)|ls|cat|pytest|python3 -m pytest)(:\*| \*)\)"
-    r"|Bash\(rtk proxy (git (diff|show|log|status|rev-parse|rev-list|ls-files|merge-base)|grep|rg|cargo (test|build|check|clippy|fmt|nextest)):\*\)")
+    r"|Bash\(rtk proxy (git (diff|show|log|status|rev-parse|rev-list|ls-files|merge-base)|grep|cargo (test|build|check|clippy|fmt|nextest)):\*\)")
 
 ALTERNATIVES = {
     "documents": "share a redacted excerpt or a synthetic stand-in", "logs": "share a redacted excerpt with identifiers removed",
