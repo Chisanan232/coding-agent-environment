@@ -36,24 +36,92 @@ Settings change (owner-applied, user scope):
 
 ```json
 {
-  "remove_allow": ["Bash(gh pr merge:*)", "Bash(gh pr *)", "Bash(rtk gh pr *)"],
+  "remove_allow": [
+    "Bash(gh pr merge:*)",
+    "Bash(gh pr *)",
+    "Bash(rtk gh pr *)"
+  ],
   "add_allow": [
     "Bash(gh pr merge * --merge --match-head-commit *)",
     "Bash(rtk gh pr merge * --merge --match-head-commit *)",
-    "Bash(gh pr view:*)", "Bash(rtk gh pr view:*)", "Bash(gh pr list:*)", "Bash(rtk gh pr list:*)",
-    "Bash(gh pr checks:*)", "Bash(rtk gh pr checks:*)", "Bash(gh pr diff:*)", "Bash(rtk gh pr diff:*)",
-    "Bash(gh pr status:*)", "Bash(rtk gh pr status:*)", "Bash(gh pr comment:*)", "Bash(rtk gh pr comment:*)",
-    "Bash(gh pr create:*)", "Bash(rtk gh pr create:*)", "Bash(gh pr edit:*)", "Bash(rtk gh pr edit:*)",
-    "Bash(gh pr ready:*)", "Bash(rtk gh pr ready:*)"
+    "Bash(gh pr view:*)",
+    "Bash(rtk gh pr view:*)",
+    "Bash(gh pr list:*)",
+    "Bash(rtk gh pr list:*)",
+    "Bash(gh pr checks:*)",
+    "Bash(rtk gh pr checks:*)",
+    "Bash(gh pr diff:*)",
+    "Bash(rtk gh pr diff:*)",
+    "Bash(gh pr status:*)",
+    "Bash(rtk gh pr status:*)",
+    "Bash(gh pr comment:*)",
+    "Bash(rtk gh pr comment:*)",
+    "Bash(gh pr create:*)",
+    "Bash(rtk gh pr create:*)",
+    "Bash(gh pr edit:*)",
+    "Bash(rtk gh pr edit:*)",
+    "Bash(gh pr ready:*)",
+    "Bash(rtk gh pr ready:*)",
+    "Bash(gh pr checkout:*)",
+    "Bash(rtk gh pr checkout:*)",
+    "Bash(gh pr update-branch:*)",
+    "Bash(rtk gh pr update-branch:*)"
   ],
   "add_ask": [
-    "Bash(gh pr merge * --admin*)", "Bash(rtk gh pr merge * --admin*)", "Bash(gh pr merge --admin*)", "Bash(rtk gh pr merge --admin*)",
-    "Bash(gh pr merge * --squash*)", "Bash(rtk gh pr merge * --squash*)",
-    "Bash(gh pr merge * --rebase*)", "Bash(rtk gh pr merge * --rebase*)",
-    "Bash(gh pr merge * --auto*)", "Bash(rtk gh pr merge * --auto*)",
-    "Bash(gh pr merge *--match-head-commit*--match-head-commit*)", "Bash(rtk gh pr merge *--match-head-commit*--match-head-commit*)",
-    "Bash(gh pr merge *--match-head-commit=*)", "Bash(rtk gh pr merge *--match-head-commit=*)",
-    "Bash(gh pr review * --approve*)", "Bash(rtk gh pr review * --approve*)"
+    "Bash(gh pr merge * --admin*)",
+    "Bash(rtk gh pr merge * --admin*)",
+    "Bash(gh pr merge --admin*)",
+    "Bash(rtk gh pr merge --admin*)",
+    "Bash(gh pr merge *--auto*)",
+    "Bash(rtk gh pr merge *--auto*)",
+    "Bash(gh pr merge *--disable-auto*)",
+    "Bash(rtk gh pr merge *--disable-auto*)",
+    "Bash(gh pr merge *--squash*)",
+    "Bash(rtk gh pr merge *--squash*)",
+    "Bash(gh pr merge * -s*)",
+    "Bash(rtk gh pr merge * -s*)",
+    "Bash(gh pr merge *--rebase*)",
+    "Bash(rtk gh pr merge *--rebase*)",
+    "Bash(gh pr merge * -r*)",
+    "Bash(rtk gh pr merge * -r*)",
+    "Bash(gh pr merge *-m *)",
+    "Bash(rtk gh pr merge *-m *)",
+    "Bash(gh pr merge * -m?*)",
+    "Bash(rtk gh pr merge * -m?*)",
+    "Bash(gh pr merge *--merge=*)",
+    "Bash(rtk gh pr merge *--merge=*)",
+    "Bash(gh pr merge *--body*)",
+    "Bash(rtk gh pr merge *--body*)",
+    "Bash(gh pr merge * -b*)",
+    "Bash(rtk gh pr merge * -b*)",
+    "Bash(gh pr merge * -F*)",
+    "Bash(rtk gh pr merge * -F*)",
+    "Bash(gh pr merge *--delete-branch*)",
+    "Bash(rtk gh pr merge *--delete-branch*)",
+    "Bash(gh pr merge * -d*)",
+    "Bash(rtk gh pr merge * -d*)",
+    "Bash(gh pr merge *--subject*)",
+    "Bash(rtk gh pr merge *--subject*)",
+    "Bash(gh pr merge * -t*)",
+    "Bash(rtk gh pr merge * -t*)",
+    "Bash(gh pr merge *--author-email*)",
+    "Bash(rtk gh pr merge *--author-email*)",
+    "Bash(gh pr merge * -A*)",
+    "Bash(rtk gh pr merge * -A*)",
+    "Bash(gh pr merge *--match-head-commit=*)",
+    "Bash(rtk gh pr merge *--match-head-commit=*)",
+    "Bash(gh pr merge *--match-head-commit*--match-head-commit*)",
+    "Bash(rtk gh pr merge *--match-head-commit*--match-head-commit*)",
+    "Bash(gh pr merge *--match-head-commit ''*)",
+    "Bash(rtk gh pr merge *--match-head-commit ''*)",
+    "Bash(gh pr merge *--match-head-commit \"\"*)",
+    "Bash(rtk gh pr merge *--match-head-commit \"\"*)",
+    "Bash(gh pr merge *--match-head-commit -*)",
+    "Bash(rtk gh pr merge *--match-head-commit -*)",
+    "Bash(gh pr merge *--match-head-commit * *)",
+    "Bash(rtk gh pr merge *--match-head-commit * *)",
+    "Bash(gh pr review * --approve*)",
+    "Bash(rtk gh pr review * --approve*)"
   ]
 }
 ```
@@ -78,14 +146,14 @@ If the host refuses the standard form, report the exact operation (secrets redac
 
 ## 5. Install, verify, rollback (owner-run; protected file)
 
-1. Back up: `cp -p ~/.claude/settings.json ~/.claude/backups/settings.json.$(date +%Y%m%d-%H%M%S)`; record `shasum -a 256`.
-2. Review the exact diff from `python3 scripts/workstation-policy.py render-settings --asks-only` plus section 2 above. Apply by hand or with the repo's candidate-rollout tool; do not apply while an active session may be affected.
+1. Back up and pin: `cp -p ~/.claude/settings.json ~/.claude/backups/settings.json.$(date +%Y%m%d-%H%M%S)`; record `shasum -a 256` of the live file and of the backup.
+2. Apply the JSON block in section 2 through `/permissions` (remove the three listed allows, add the listed allows and asks), or edit the three arrays by hand. `scripts/candidate-rollout.py` does not apply this block: it only adds asks and the scoped `rtk proxy` allows from SPE-119, and it preserves existing broad allows. Do not apply while an active session may be affected.
 3. Verify the effective policy in a **new** session (`/permissions`): the allow list has no `gh pr merge:*` and no `gh pr *`; the ask list has the `--admin` rule.
 4. Negative controls on fixtures only (nonexistent repo): `--admin`, `--squash`, a doubled `--match-head-commit` and the `rtk` spellings of each prompt. Compound forms are evaluated per subcommand by the host, so do not rely on a compound being refused; the gate only ever prints the simple form.
 5. Positive control on the disposable owner PR described in `docs/OWNER-MERGE-LIVE-VALIDATION-PLAN.md`.
 6. Resumed sessions keep the policy loaded at start; start a new session after any change.
 
-Rollback: copy the backup over `~/.claude/settings.json`; start a new session.
+Rollback: check that `shasum -a 256` of the backup equals the recorded pin, copy it over `~/.claude/settings.json`, start a new session.
 
 ## 6. What is and is not claimed
 

@@ -76,6 +76,51 @@ class PinnedForm(unittest.TestCase):
             self.assertEqual(decide(f"{pre} pr review 7 --repo a/b --approve"), "ask", pre)
 
 
+def gh_merge_flags():
+    """Every flag of the installed `gh pr merge`, read from its own help (skipped when gh is absent)."""
+    import shutil
+    import subprocess
+    if not shutil.which("gh"):
+        return None
+    res = subprocess.run(["gh", "pr", "merge", "--help"], capture_output=True, text=True, timeout=20)
+    text = res.stdout + res.stderr
+    flags = set()
+    for line in text.split("\nFLAGS", 1)[-1].split("\nINHERITED", 1)[0].splitlines():
+        m = re.match(r"\s+(?:(-[A-Za-z]), )?(--[a-z][a-z-]*)", line)
+        if m:
+            flags.update(f for f in m.groups() if f)
+    return flags
+
+
+class EveryMergeFlag(unittest.TestCase):
+    PERMITTED = {"--repo", "-R", "--merge", "--match-head-commit"}
+
+    def test_every_other_gh_pr_merge_flag_asks_in_every_position(self):
+        flags = gh_merge_flags()
+        if flags is None:
+            self.skipTest("gh not installed")
+        flags = {f for f in flags if f not in self.PERMITTED | {"-h", "--help"}}
+        self.assertTrue({"--admin", "--squash", "-s", "--delete-branch", "--disable-auto", "--subject"} <= flags, flags)
+        for pre in PREFIXES:
+            base = gate_cmd(pre)
+            for f in sorted(flags):
+                val = f if f.startswith("--") and f in ("--admin", "--auto", "--disable-auto", "--squash", "--rebase", "--delete-branch") or f in ("-s", "-r", "-d", "-m") else f"{f} x"
+                for cmd in (f"{base} {val}", base.replace(" --repo", f" {val} --repo", 1), base.replace(" --merge", f" {val} --merge", 1)):
+                    self.assertEqual(decide(cmd), "ask", (pre, f, cmd))
+
+    def test_sole_empty_pin_and_merge_false_ask(self):
+        for pre in PREFIXES:
+            base = gate_cmd(pre)
+            for cmd in (base.replace(f"--match-head-commit {SHA}", "--match-head-commit ''"), base.replace(f"--match-head-commit {SHA}", '--match-head-commit ""'),
+                        f"{base} --merge=false -s", base.replace("--merge", "--subject --merge", 1), f"{base} -d", f"{base} --disable-auto"):
+                self.assertEqual(decide(cmd), "ask", cmd)
+
+    def test_routine_pr_verbs_keep_a_scoped_allow(self):
+        for pre in PREFIXES:
+            for verb in ("checkout 7 --repo a/b", "update-branch 7 --repo a/b", "view 7", "checks 7", "diff 7"):
+                self.assertEqual(decide(f"{pre} pr {verb}"), "allow", (pre, verb))
+
+
 class DocumentedBlock(unittest.TestCase):
     def test_no_broad_pr_allow_is_added_and_each_removal_is_the_broad_one(self):
         for r in BLOCK["add_allow"]:
