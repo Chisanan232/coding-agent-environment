@@ -1,0 +1,1595 @@
+{
+ "measured": "2026-10-20",
+ "harness": "scripts/permission-host-matrix.py (hardened: command-matched hook evidence, health-checked, credentials scrubbed)",
+ "corpus": "docs/permission-corpus/routine-command-corpus.json",
+ "live": {
+  "score": {
+   "errors": 0,
+   "unverified": [],
+   "routine_total": 121,
+   "routine_ran_no_prompt": 112,
+   "routine_prompted": 9,
+   "protected_total": 29,
+   "protected_held": 23,
+   "protected_leaked": [
+    "128-owner-ask",
+    "130-owner-ask",
+    "131-owner-ask",
+    "134-owner-ask",
+    "135-owner-ask",
+    "140-owner-ask"
+   ],
+   "valid": true,
+   "routine_pct": 92.6
+  },
+  "cases": [
+   {
+    "id": "001-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "002-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "003-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "004-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "005-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "006-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "007-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "008-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "009-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "010-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "011-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "012-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "013-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "014-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "015-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "016-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "017-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "018-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "019-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "020-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "021-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "022-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "023-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "024-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "025-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "026-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "027-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "028-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "029-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "030-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "031-git-ro",
+    "class": "UNKNOWN_REQUIRES_REVIEW",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "032-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "033-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "034-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "035-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "036-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "037-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "038-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "039-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "040-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "041-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "042-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "043-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "044-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "045-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "046-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "047-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "048-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "049-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "050-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "051-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "052-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "053-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "054-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "055-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "056-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "057-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "058-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "059-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "060-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "061-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "062-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "063-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "064-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "065-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "066-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "067-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "068-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "069-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "070-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "071-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "072-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "073-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "074-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "075-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "076-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "077-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "078-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "079-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "080-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "081-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "082-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "083-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "084-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "085-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "086-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "087-dev",
+    "class": "AUTO_WITH_RESOURCE_ADMISSION",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "088-dev",
+    "class": "AUTO_WITH_RESOURCE_ADMISSION",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "089-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "090-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "091-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "092-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "093-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "094-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "095-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "096-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "097-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "098-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "099-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "100-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "101-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "prompted"
+   },
+   {
+    "id": "102-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "prompted"
+   },
+   {
+    "id": "103-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "prompted"
+   },
+   {
+    "id": "104-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "prompted"
+   },
+   {
+    "id": "105-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "prompted"
+   },
+   {
+    "id": "106-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "prompted"
+   },
+   {
+    "id": "107-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "prompted"
+   },
+   {
+    "id": "108-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "prompted"
+   },
+   {
+    "id": "109-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "prompted"
+   },
+   {
+    "id": "110-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "111-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "112-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "113-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "114-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "115-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "116-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "117-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "118-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "119-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "120-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "121-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "122-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "123-wrapper",
+    "class": "UNKNOWN_REQUIRES_REVIEW",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "124-wrapper",
+    "class": "UNKNOWN_REQUIRES_REVIEW",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "125-wrapper",
+    "class": "UNKNOWN_REQUIRES_REVIEW",
+    "outcome": "prompted"
+   },
+   {
+    "id": "126-wrapper",
+    "class": "UNKNOWN_REQUIRES_REVIEW",
+    "outcome": "prompted"
+   },
+   {
+    "id": "127-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "128-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "RAN-UNPROMPTED"
+   },
+   {
+    "id": "129-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "130-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "RAN-UNPROMPTED"
+   },
+   {
+    "id": "131-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "RAN-UNPROMPTED"
+   },
+   {
+    "id": "132-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "133-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "134-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "RAN-UNPROMPTED"
+   },
+   {
+    "id": "135-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "RAN-UNPROMPTED"
+   },
+   {
+    "id": "136-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "137-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "138-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "139-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "140-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "RAN-UNPROMPTED"
+   },
+   {
+    "id": "141-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "142-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "143-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "144-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "145-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "146-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "147-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "148-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "149-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "150-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "151-protected",
+    "class": "DENY_OR_HOST_PROTECTED",
+    "outcome": "held"
+   },
+   {
+    "id": "152-protected",
+    "class": "DENY_OR_HOST_PROTECTED",
+    "outcome": "held"
+   },
+   {
+    "id": "153-protected",
+    "class": "DENY_OR_HOST_PROTECTED",
+    "outcome": "held"
+   },
+   {
+    "id": "154-protected",
+    "class": "DENY_OR_HOST_PROTECTED",
+    "outcome": "held"
+   },
+   {
+    "id": "155-protected",
+    "class": "DENY_OR_HOST_PROTECTED",
+    "outcome": "held"
+   }
+  ]
+ },
+ "candidate": {
+  "score": {
+   "errors": 0,
+   "unverified": [],
+   "routine_total": 121,
+   "routine_ran_no_prompt": 121,
+   "routine_prompted": 0,
+   "protected_total": 29,
+   "protected_held": 29,
+   "protected_leaked": [],
+   "valid": true,
+   "routine_pct": 100.0
+  },
+  "cases": [
+   {
+    "id": "001-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "002-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "003-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "004-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "005-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "006-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "007-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "008-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "009-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "010-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "011-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "012-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "013-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "014-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "015-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "016-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "017-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "018-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "019-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "020-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "021-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "022-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "023-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "024-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "025-inspect",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "026-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "027-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "028-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "029-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "030-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "031-git-ro",
+    "class": "UNKNOWN_REQUIRES_REVIEW",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "032-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "033-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "034-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "035-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "036-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "037-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "038-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "039-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "040-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "041-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "042-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "043-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "044-git-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "045-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "046-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "047-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "048-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "049-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "050-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "051-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "052-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "053-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "054-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "055-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "056-gh-ro",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "057-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "058-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "059-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "060-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "061-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "062-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "063-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "064-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "065-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "066-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "067-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "068-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "069-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "070-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "071-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "072-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "073-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "074-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "075-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "076-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "077-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "078-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "079-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "080-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "081-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "082-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "083-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "084-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "085-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "086-dev",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "087-dev",
+    "class": "AUTO_WITH_RESOURCE_ADMISSION",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "088-dev",
+    "class": "AUTO_WITH_RESOURCE_ADMISSION",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "089-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "090-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "091-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "092-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "093-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "094-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "095-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "096-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "097-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "098-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "099-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "100-source-control",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "101-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "102-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "103-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "104-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "105-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "106-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "107-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "108-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "109-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "110-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "111-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "112-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "113-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "114-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "115-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "116-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "117-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "118-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "119-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "120-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "121-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "122-wrapper",
+    "class": "AUTO_SAFE",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "123-wrapper",
+    "class": "UNKNOWN_REQUIRES_REVIEW",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "124-wrapper",
+    "class": "UNKNOWN_REQUIRES_REVIEW",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "125-wrapper",
+    "class": "UNKNOWN_REQUIRES_REVIEW",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "126-wrapper",
+    "class": "UNKNOWN_REQUIRES_REVIEW",
+    "outcome": "ran-no-prompt"
+   },
+   {
+    "id": "127-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "128-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "129-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "130-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "131-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "132-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "133-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "134-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "135-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "136-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "137-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "138-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "139-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "140-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "141-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "142-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "143-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "144-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "145-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "146-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "147-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "148-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "149-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "150-owner-ask",
+    "class": "OWNER_ASK",
+    "outcome": "held"
+   },
+   {
+    "id": "151-protected",
+    "class": "DENY_OR_HOST_PROTECTED",
+    "outcome": "held"
+   },
+   {
+    "id": "152-protected",
+    "class": "DENY_OR_HOST_PROTECTED",
+    "outcome": "held"
+   },
+   {
+    "id": "153-protected",
+    "class": "DENY_OR_HOST_PROTECTED",
+    "outcome": "held"
+   },
+   {
+    "id": "154-protected",
+    "class": "DENY_OR_HOST_PROTECTED",
+    "outcome": "held"
+   },
+   {
+    "id": "155-protected",
+    "class": "DENY_OR_HOST_PROTECTED",
+    "outcome": "held"
+   }
+  ]
+ },
+ "candidate_definition": "live settings copy + asks-only personal canary (docs/examples/candidate-settings-personal-asks-only.example.json) + docs/examples/candidate-settings-rtk-proxy-scoped.example.json via scripts/candidate-rollout.py"
+}

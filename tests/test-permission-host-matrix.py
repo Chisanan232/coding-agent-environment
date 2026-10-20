@@ -144,6 +144,9 @@ class HarnessPureParts(unittest.TestCase):
         self.assertTrue(m("rtk read Cargo.toml --max-lines 3", "head -3 Cargo.toml"))
         self.assertTrue(m("CARGO_TARGET_DIR=./target rtk cargo --version | grep cargo | head -1", "CARGO_TARGET_DIR=./target rtk proxy cargo --version | grep cargo | head -1"))
         self.assertTrue(m("rtk git status --short && rtk git log --oneline -1", "git status --short && git log --oneline -1"))
+        self.assertTrue(m("rtk lint --version", "biome --version"))
+        self.assertTrue(m("rtk pytest --version", "python3 -m pytest --version"))
+        self.assertFalse(m("rtk lint --version", "cargo --version"))
         self.assertFalse(m("echo BLOCKED", "rtk proxy cargo test --help"))
         self.assertFalse(m("rtk read other.toml", "cat Cargo.toml"))
         self.assertFalse(m("rtk git status", "git status --short && git log --oneline -1"))
@@ -179,6 +182,17 @@ class HarnessPureParts(unittest.TestCase):
             self.assertTrue((repo / "src/lib.rs").read_text().count("marker"))
             out = subprocess.run(["git", "remote", "-v"], cwd=repo, capture_output=True, text=True).stdout
             self.assertIn(str(pathlib.Path(tmp) / "remote.git"), out)
+
+    def test_rescore_reevaluates_stored_evidence_offline(self):
+        corpus = [{"id": "1-a", "class": "AUTO_SAFE", "cmd": "biome --version"}, {"id": "2-b", "class": "OWNER_ASK", "cmd": "git push --force origin x"},
+                  {"id": "3-c", "class": "OWNER_ASK", "cmd": "git push --force origin y"}]
+        stored = {"mode": "candidate", "cases": [
+            {"id": "1-a", "class": "AUTO_SAFE", "healthy": True, "recorded": ["PostToolUseFailure: rtk lint --version"], "outcome": "not-run"},
+            {"id": "2-b", "class": "OWNER_ASK", "healthy": True, "recorded": ["PermissionRequest: rtk git push --force origin x"], "outcome": "unverified"},
+            {"id": "3-c", "class": "OWNER_ASK", "healthy": True, "recorded": ["PostToolUse: echo BLOCKED"], "outcome": "held"}]}
+        res = hm.rescore(stored, corpus)
+        self.assertEqual([e["outcome"] for e in res["cases"]], ["ran-no-prompt", "held", "unverified"])
+        self.assertFalse(res["score"]["valid"])
 
     def test_live_and_candidate_are_mutually_exclusive_and_one_is_required(self):
         for argv in (["--corpus", "x"], ["--corpus", "x", "--live", "--candidate", "y"]):

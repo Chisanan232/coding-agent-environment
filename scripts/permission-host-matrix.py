@@ -69,7 +69,7 @@ def prompt(cmd):
 
 ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # rtk rewrites some programs to its own verbs (cat/head/tail become `rtk read`); a recorded command may use the rewritten verb
-PROGRAM_EQUIV = {"read": {"cat", "head", "tail", "sed", "bat"}}
+PROGRAM_EQUIV = {"read": {"cat", "head", "tail", "sed", "bat"}, "lint": {"biome", "eslint"}, "pytest": {"python3", "python"}}
 
 
 def simple_commands(cmd):
@@ -177,6 +177,22 @@ def recorded_commands(log):
     return out
 
 
+def rescore(result, corpus):
+    """Re-evaluate a stored result from its recorded hook commands with the current matcher, without running claude again."""
+    by_id = {c["id"]: c for c in corpus}
+    entries = []
+    for e in result["cases"]:
+        c = by_id[e["id"]]
+        events = set()
+        for line in e.get("recorded", []):
+            ev, _, cmd = line.partition(": ")
+            if command_matches(cmd, c["cmd"]):
+                events.add(ev)
+        ran, prompted = bool(events & {"PostToolUse", "PostToolUseFailure"}), "PermissionRequest" in events
+        entries.append(dict(e, ran=ran, prompted=prompted, outcome=outcome(c["class"], ran, prompted, e.get("healthy", True) or bool(events))))
+    return {"mode": result.get("mode"), "rescored": True, "score": score(entries), "cases": entries}
+
+
 def run_case(c, work, settings, live, timeout):
     log = work / f"log-{c['id']}.jsonl"
     healthy, events = True, set()
@@ -203,16 +219,25 @@ def run_case(c, work, settings, live, timeout):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--corpus", required=True)
-    g = ap.add_mutually_exclusive_group(required=True)
+    g = ap.add_mutually_exclusive_group()
     g.add_argument("--candidate")
     g.add_argument("--live", action="store_true")
+    ap.add_argument("--rescore", help="re-evaluate a stored result file offline; starts no claude process")
     ap.add_argument("--par", type=int, default=3)
     ap.add_argument("--ids")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--out")
     ap.add_argument("--timeout", type=int, default=240)
     a = ap.parse_args(argv)
+    if not (a.candidate or a.live or a.rescore):
+        ap.error("one of --candidate, --live or --rescore FILE is required")
     corpus = json.loads(pathlib.Path(a.corpus).read_text())["commands"]
+    if a.rescore:
+        result = rescore(json.loads(pathlib.Path(a.rescore).read_text()), corpus)
+        if a.out:
+            pathlib.Path(a.out).write_text(json.dumps(result, indent=1))
+        print(json.dumps(result["score"], indent=1))
+        return 0
     if a.ids:
         want = set(a.ids.split(","))
         corpus = [c for c in corpus if c["id"].split("-")[0] in want]
