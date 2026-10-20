@@ -35,6 +35,14 @@ print(json.dumps({"label": os.environ.get("PROBE_LABEL"), "event": os.environ.ge
 """
 
 
+def hermetic_env():
+    """Environment for every subprocess the harness starts: no git directory redirect, no inherited git config count, no credentials."""
+    env = {k: v for k, v in os.environ.items() if not SCRUB.match(k)}
+    env.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null", GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid", GIT_TERMINAL_PROMPT="0")
+    return env
+
+
 def build_fixture(root):
     """A disposable repository with a local bare origin; every corpus command is safe to run here."""
     root = pathlib.Path(root)
@@ -42,8 +50,7 @@ def build_fixture(root):
     (repo / "src").mkdir(parents=True)
     (repo / "Cargo.toml").write_text('[package]\nname = "fixture"\nversion = "0.0.0"\n')
     (repo / "src/lib.rs").write_text("// marker\npub fn f() {}\n")
-    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid",
-               GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+    env = hermetic_env()
     for cmd in (["git", "init", "-q", "-b", "main", str(remote), "--bare"], ["git", "init", "-q", "-b", "main"], ["git", "add", "."], ["git", "commit", "-q", "-m", "init"],
                 ["git", "remote", "add", "origin", str(remote)], ["git", "push", "-q", "origin", "main"]):
         subprocess.run(cmd, cwd=repo if "--bare" not in cmd else root, env=env, check=True, capture_output=True)
@@ -55,7 +62,7 @@ def overlay(candidate, hook_paths):
     cfg = json.loads(json.dumps(candidate)) if candidate else {}
     hooks = cfg.setdefault("hooks", {})
     for ev, path in hook_paths.items():
-        entry = {"hooks": [{"type": "command", "command": str(path)}]}
+        entry = {"hooks": [{"type": "command", "command": shlex.quote(str(path))}]}
         if ev != "PermissionRequest":
             entry["matcher"] = "Bash"
         hooks.setdefault(ev, []).append(entry)
@@ -96,24 +103,25 @@ def norm(cmd):
 
 
 def command_matches(recorded, expected):
-    """True when the recorded Bash command is the expected one modulo rtk's rewrite. Every expected program must appear and every expected
-    argument, flags and numbers included, must appear among the recorded tokens; the only relaxation is for a program that rtk renames to its
-    own verb (cat/head/tail become `rtk read` with different flags), where flags and numbers are not compared. A weaker command (`git push`
-    for `git push --force`) or a different one (`echo BLOCKED`) never matches."""
+    """True when the recorded Bash command is the expected one modulo rtk's rewrite. Each expected simple command must be satisfied by ONE
+    recorded simple command with the same program (or the rtk verb that replaces it) that contains every expected argument, flags and numbers
+    included; arguments never pool across commands (`git push origin x; echo --force` is not `git push --force origin x`). The only relaxation
+    is for a program rtk renames (cat/head/tail become `rtk read` with different flags), where flags and numbers are not compared."""
     rec, exp = simple_commands(recorded), simple_commands(expected)
     if not exp or not rec:
         return False
-    rec_progs = {p for p, _ in rec}
-    rec_tokens = {t for _, a in rec for t in a} | rec_progs
     for prog, args in exp:
-        renamed = prog not in rec_progs
-        if renamed and not any(prog in PROGRAM_EQUIV.get(rp, ()) for rp in rec_progs):
-            return False
-        for a in args:
-            if renamed and (a.startswith("-") or a.isdigit()):
+        ok = False
+        for rprog, rargs in rec:
+            renamed = rprog != prog
+            if renamed and prog not in PROGRAM_EQUIV.get(rprog, ()):
                 continue
-            if a not in rec_tokens:
-                return False
+            tokens = set(rargs) | {rprog}
+            if all(a in tokens or (renamed and (a.startswith("-") or a.isdigit())) for a in args):
+                ok = True
+                break
+        if not ok:
+            return False
     return True
 
 
@@ -152,13 +160,12 @@ SCRUB = re.compile(r"(AWS_|AZURE_|GOOGLE_|CLOUDSDK_|GCLOUD_|OPENAI_|GH_|GITHUB_|
 
 
 def scrubbed_env(label, log, work):
-    """A hermetic probe environment: nothing that names a cloud account, a GitHub repository or token, a git directory or a package registry
-    survives, and the CLIs that keep credentials in their own config get an empty one. Claude's own login (keychain or ANTHROPIC_*/CLAUDE_*) is kept."""
-    env = {k: v for k, v in os.environ.items() if not SCRUB.match(k)}
+    """A hermetic probe environment (see hermetic_env) plus empty config directories for the CLIs that keep credentials in their own config.
+    Claude's own login (keychain or ANTHROPIC_*/CLAUDE_*) is kept."""
+    env = hermetic_env()
     empty = work / "empty-config"
     env.update(PROBE_LABEL=label, PROBE_LOG=str(log), CLOUDSDK_CONFIG=str(work / "no-gcloud"), GH_CONFIG_DIR=str(empty / "gh"), NPM_CONFIG_USERCONFIG=str(empty / "npmrc"),
-               CARGO_HOME=str(empty / "cargo"), DOCKER_CONFIG=str(empty / "docker"), KUBECONFIG=str(empty / "kube"), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null",
-               GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid", GIT_TERMINAL_PROMPT="0")
+               CARGO_HOME=str(empty / "cargo"), DOCKER_CONFIG=str(empty / "docker"), KUBECONFIG=str(empty / "kube"))
     return env
 
 

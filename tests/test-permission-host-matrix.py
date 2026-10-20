@@ -151,6 +151,9 @@ class HarnessPureParts(unittest.TestCase):
         self.assertFalse(m("rtk proxy git diff HEAD", "rtk proxy git diff HEAD --output=./zz-out"))   # a weaker command is not the tested one
         self.assertFalse(m("rtk git push origin x", "git push --force origin x"))
         self.assertFalse(m("rtk git log --oneline", "git log --oneline -3"))
+        self.assertFalse(m("git push origin x; echo --force", "git push --force origin x"))   # arguments never pool across commands
+        self.assertFalse(m("git status --short && echo --force", "git push --force origin x"))
+        self.assertTrue(m("git status --short && git push --force origin x", "git push --force origin x"))
         self.assertTrue(m("rtk git log --oneline -3 .", "git log --oneline -3"))
         self.assertFalse(m("rtk read other.toml", "cat Cargo.toml"))
         self.assertFalse(m("rtk git status", "git status --short && git log --oneline -1"))
@@ -173,6 +176,27 @@ class HarnessPureParts(unittest.TestCase):
         self.assertEqual(env["GIT_CONFIG_GLOBAL"], "/dev/null")
         self.assertEqual(env["ANTHROPIC_API_KEY"], "claude-login")   # the probe still needs claude's own login
         self.assertEqual(env["KEEP_ME"], "1")
+
+    def test_fixture_setup_cannot_be_redirected_by_inherited_git_variables(self):
+        import os
+        names = {"GIT_DIR": "/nonexistent/.git", "GIT_WORK_TREE": "/nonexistent", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": "/nonexistent"}
+        os.environ.update(names)
+        try:
+            self.assertFalse(set(names) & set(hm.hermetic_env()))
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = hm.build_fixture(tmp)          # would fail or write outside the temp dir if the variables were inherited
+                self.assertTrue((repo / ".git").is_dir())
+                self.assertFalse(pathlib.Path("/nonexistent").exists())
+        finally:
+            for k in names:
+                os.environ.pop(k, None)
+
+    def test_hook_commands_survive_spaces_in_the_temporary_path(self):
+        import shlex
+        cfg = hm.overlay(None, {ev: pathlib.Path("/tmp/probe space/h-" + ev + ".sh") for ev in hm.EVENTS})
+        for ev in hm.EVENTS:
+            argv = shlex.split(cfg["hooks"][ev][0]["hooks"][0]["command"])
+            self.assertEqual(argv, ["/tmp/probe space/h-" + ev + ".sh"])
 
     def test_stored_results_are_consistent_with_the_harness(self):
         stored = json.loads((ROOT / "docs/permission-corpus/results-2026-10-20.json").read_text())
