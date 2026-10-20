@@ -1,0 +1,34 @@
+{
+  "profile": "personal",
+  "corporate_markers": [],
+  "stale_after_seconds": 2700,
+  "notify": {
+    "agent_completed": false,
+    "idle": false,
+    "session_ended": true
+  },
+  "retry": {
+    "max_attempts": 5,
+    "base_seconds": 30,
+    "max_seconds": 900
+  },
+  "backends": {
+    "macos": {
+      "enabled": false
+    },
+    "ntfy": {
+      "enabled": false,
+      "approved_destination": "",
+      "server": "https://ntfy.sh",
+      "topic_env": "NTFY_TOPIC",
+      "token_env": ""
+    },
+    "pushover": {
+      "enabled": false,
+      "approved_destination": "",
+      "token_env": "PUSHOVER_APP_TOKEN",
+      "user_env": "PUSHOVER_USER_KEY"
+    }
+  },
+  "_note": "Everything is off until a backend sets enabled to true. Credentials are environment-variable NAMES or file paths, never values. Remote backends also need approved_destination equal to the server host, and are refused on the corporate profile."
+}
