@@ -16,6 +16,8 @@ on:
       - 'scripts/owner-merge-gate.py'
       - 'scripts/workstation-policy.py'
       - 'scripts/candidate-rollout.py'
+      - 'tests/test-rtk-proxy-prompt-removal.py'
+      - 'docs/ROLLOUT-RTK-PROXY-SCOPING.md'
       - 'scripts/workstation-policy-hook.py'
       - 'scripts/memory-admission.py'
       - 'scripts/mcp-scope-inspect.py'
@@ -45,6 +47,8 @@ on:
       - 'scripts/owner-merge-gate.py'
       - 'scripts/workstation-policy.py'
       - 'scripts/candidate-rollout.py'
+      - 'tests/test-rtk-proxy-prompt-removal.py'
+      - 'docs/ROLLOUT-RTK-PROXY-SCOPING.md'
       - 'scripts/workstation-policy-hook.py'
       - 'scripts/memory-admission.py'
       - 'scripts/mcp-scope-inspect.py'
@@ -102,6 +106,7 @@ jobs:
           python3 tests/test-pr-merge-policy.py
           python3 tests/test-workstation-policy.py
           python3 tests/test-candidate-rollout.py
+          python3 tests/test-rtk-proxy-prompt-removal.py
           python3 tests/test-workstation-policy-hook.py
           python3 tests/test-memory-admission.py
           python3 tests/test-mcp-scope-inspect.py
