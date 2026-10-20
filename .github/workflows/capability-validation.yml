@@ -17,6 +17,9 @@ on:
       - 'scripts/workstation-policy.py'
       - 'scripts/candidate-rollout.py'
       - 'tests/test-rtk-proxy-prompt-removal.py'
+      - 'tests/test-permission-host-matrix.py'
+      - 'scripts/permission-host-matrix.py'
+      - 'docs/permission-corpus/routine-command-corpus.json'
       - 'docs/ROLLOUT-RTK-PROXY-SCOPING.md'
       - 'scripts/workstation-policy-hook.py'
       - 'scripts/memory-admission.py'
@@ -48,6 +51,9 @@ on:
       - 'scripts/workstation-policy.py'
       - 'scripts/candidate-rollout.py'
       - 'tests/test-rtk-proxy-prompt-removal.py'
+      - 'tests/test-permission-host-matrix.py'
+      - 'scripts/permission-host-matrix.py'
+      - 'docs/permission-corpus/routine-command-corpus.json'
       - 'docs/ROLLOUT-RTK-PROXY-SCOPING.md'
       - 'scripts/workstation-policy-hook.py'
       - 'scripts/memory-admission.py'
@@ -107,6 +113,7 @@ jobs:
           python3 tests/test-workstation-policy.py
           python3 tests/test-candidate-rollout.py
           python3 tests/test-rtk-proxy-prompt-removal.py
+          python3 tests/test-permission-host-matrix.py
           python3 tests/test-workstation-policy-hook.py
           python3 tests/test-memory-admission.py
           python3 tests/test-mcp-scope-inspect.py
