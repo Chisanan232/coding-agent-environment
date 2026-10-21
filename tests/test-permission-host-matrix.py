@@ -255,6 +255,8 @@ class HarnessPureParts(unittest.TestCase):
             {"id": "3-c", "class": "OWNER_ASK", "healthy": True, "recorded": ["PostToolUse: echo BLOCKED"], "outcome": "held"}]}
         res = hm.rescore(stored, corpus)
         self.assertEqual([e["outcome"] for e in res["cases"]], ["ran-no-prompt", "held", "unverified"])
+        reclassified = hm.rescore(stored, [dict(corpus[0], **{"class": "UNKNOWN_REQUIRES_REVIEW"})] + corpus[1:])
+        self.assertEqual(reclassified["cases"][0]["class"], "UNKNOWN_REQUIRES_REVIEW")   # the corpus's current class wins over the stored one
         self.assertFalse(res["score"]["valid"])
 
     def test_live_and_candidate_are_mutually_exclusive_and_one_is_required(self):

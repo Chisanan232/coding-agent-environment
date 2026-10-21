@@ -211,7 +211,7 @@ def rescore(result, corpus):
             if command_matches(cmd, c["cmd"]):
                 events.add(ev)
         ran, prompted = bool(events & {"PostToolUse", "PostToolUseFailure"}), "PermissionRequest" in events
-        entries.append(dict(e, ran=ran, prompted=prompted, outcome=outcome(c["class"], ran, prompted, e.get("healthy", True) or bool(events))))
+        entries.append(dict(e, **{"class": c["class"]}, ran=ran, prompted=prompted, outcome=outcome(c["class"], ran, prompted, e.get("healthy", True) or bool(events))))
     return {"mode": result.get("mode"), "rescored": True, "score": score(entries), "cases": entries}
 
 
