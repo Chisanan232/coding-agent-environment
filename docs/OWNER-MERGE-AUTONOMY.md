@@ -1,6 +1,6 @@
 # Owner PR merge autonomy (SPE-118)
 
-Status: POLICY_DESIGNED, PREDEPLOY partly verified. Not live. Nothing here edits live settings; the owner applies the diff.
+Status: **design record and real-host measurement. The narrow-allow rule block in section 2 is NOT recommended for deployment as it stands.** Independent review found a new way past a trailing-wildcard allow in each of eight consecutive rounds (section 2, Residual), the host's matching rules were only learned by measuring them, and the remaining holes cannot be closed with glob rules. The decision for the owner is in section 6. Not live; nothing here edits live settings.
 
 ## 1. Blocking layer (measured, not assumed)
 
@@ -242,6 +242,8 @@ These are accepted-or-not decisions for the owner, not defects to keep patching.
 
 The stronger design is a merge runner that re-validates the exact argument vector (40-hex pin, repository, PR number, `merge` strategy only) and the gate verdict in code before running `gh pr merge`, with the allow rule covering that program only. It moves the bypass surface into code that can be tested exhaustively. It is **not built here**: ADR 0013 makes the gate read-only and never-merging, and an allow rule over a merge-executing program is a policy change for the owner to decide, not an implementation detail. Until then the supported fallback is unchanged: if the host asks or denies, the owner runs the printed command with the `!` prefix.
 
+The list of holes is open-ended, not just the four above. Reviews also reproduced, against allows that take a body or attachments: `gh pr comment ... --attach ./private.png` (local upload), a short-flag cluster such as `gh pr create ... -dF./private.txt` (draft plus body file), a quoted long flag such as `gh pr edit ... --bo""dy-file ./private.txt`, and local-file exfiltration through command substitution inside an inline body (`--body "$(cat file)"`), which today's broad `gh pr *` allow already permits. Conversely, asks that fire on flag text also fire on prose: a comment body that contains `-h` or `--approve` as words asks. Each fix to one class made another instance appear; this is the review-loop circuit breaker of `docs/ENGINEERING-CONSTITUTION.md`, so the instances are not patched further and the architectural options are presented instead.
+
 ## 3. PR classes
 
 | Class | Author | Needed before the pinned merge |
@@ -256,7 +258,7 @@ A new commit changes the head, so earlier evidence no longer matches and the gat
 
 If the host refuses the standard form, report the exact operation (secrets redacted) and stop. Do not re-run it with another shape, tool, script, subagent or operator. The owner may run the printed command with the `!` prefix, and that is the supported path. A denial is `HARNESS_PERMISSION_BLOCK`, not evidence the PR is unsafe, and not a product decision.
 
-## 5. Install, verify, rollback (owner-run; protected file)
+## 5. Install, verify, rollback (owner-run; protected file; only if the owner chooses option D in section 6)
 
 1. Back up and pin: `cp -p ~/.claude/settings.json ~/.claude/backups/settings.json.$(date +%Y%m%d-%H%M%S)`; record `shasum -a 256` of the live file and of the backup.
 2. Apply the JSON block in section 2 through `/permissions` (remove the three listed allows, add the listed allows and asks), or edit the three arrays by hand. `scripts/candidate-rollout.py` does not apply this block: it only adds asks and the scoped `rtk proxy` allows from SPE-119, and it preserves existing broad allows. Do not apply while an active session may be affected.
@@ -267,6 +269,19 @@ If the host refuses the standard form, report the exact operation (secrets redac
 
 Rollback: check that `shasum -a 256` of the backup equals the recorded pin, copy it over `~/.claude/settings.json`, start a new session.
 
-## 6. What is and is not claimed
+## 6. Decision needed (owner), with the evidence
+
+The merge itself is gated deterministically by `scripts/owner-merge-gate.py` (read-only) plus the pinned command. What is undecided is how the host is allowed to run the pinned command without a per-merge prompt, and the measured answer is that a glob allow cannot do it safely. Options:
+
+| Option | What it is | Cost and limits |
+|---|---|---|
+| A. Validating merge runner (recommended) | A small program that re-checks the exact argument vector (40-hex pin, repository, PR number, merge strategy only) and the gate verdict, then runs `gh pr merge`; the allow rule covers that program only | Moves the bypass surface into code that can be tested exhaustively. A policy change: ADR 0013 makes the gate read-only and non-merging, and an allow rule over a merge-executing program must be the owner's decision. Not built here |
+| B. PreToolUse hook | A hook that shell-parses the command (after expansion) and approves only the exact pinned shape | Same property as A without a new executable; whether a hook's allow bypasses the classifier is untested |
+| C. Keep the per-merge `!` run | The agent prints the pinned command; the owner runs it with the `!` prefix | No new exposure; one owner action per merge. This is the current supported fallback |
+| D. Apply section 2 knowingly | Accept the residuals above | Not recommended: the holes are open-ended and some are exfiltration paths |
+
+Until the owner chooses, the supported state is C, and the live broad `Bash(gh pr merge:*)` allow remains the unresolved exposure it is today.
+
+## 7. What is and is not claimed
 
 Designed and unit-tested in this repository; the classifier behavior above is measured on the owner's workstation. LIVE_DEPLOYED and LIVE_VALIDATED stay false until the owner applies the diff and the disposable-PR run succeeds. This document is not permission to bypass any earlier host denial and must not be read as `MERGE_AUTONOMY_READY`.
