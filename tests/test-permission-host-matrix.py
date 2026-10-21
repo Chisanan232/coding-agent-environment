@@ -134,15 +134,18 @@ class HarnessPureParts(unittest.TestCase):
             log.write_text(json.dumps({"label": "1", "event": "PostToolUse", "cmd": "echo BLOCKED"}) + "\n"
                            + json.dumps({"label": "1", "event": "PermissionRequest", "cmd": "rtk proxy git diff HEAD"}) + "\n" + "garbage\n")
             self.assertEqual(hm.read_events(log, "rtk proxy cargo test --help"), set())
-            self.assertEqual(hm.read_events(log, "git diff HEAD"), {"PermissionRequest"})   # rtk rewrite is normalised away
-            self.assertEqual(hm.norm("A=1 rtk proxy git  diff"), "git diff")
+            self.assertEqual(hm.read_events(log, "rtk proxy git diff HEAD"), {"PermissionRequest"})
+            self.assertEqual(hm.read_events(log, "git diff HEAD"), set())   # a plain command is not the wrapped one
+            self.assertEqual(hm.norm("A=1 rtk proxy git  diff"), "proxy git diff")
+            self.assertEqual(hm.norm("rtk git diff"), "git diff")
 
     def test_command_matching_tolerates_rtk_rewrites_and_rejects_other_commands(self):
         m = hm.command_matches
         self.assertTrue(m("rtk grep -rn marker src .", "grep -rn marker src"))
         self.assertTrue(m("rtk read Cargo.toml", "cat Cargo.toml"))
         self.assertTrue(m("rtk read Cargo.toml --max-lines 3", "head -3 Cargo.toml"))
-        self.assertTrue(m("CARGO_TARGET_DIR=./target rtk cargo --version | grep cargo | head -1", "CARGO_TARGET_DIR=./target rtk proxy cargo --version | grep cargo | head -1"))
+        self.assertFalse(m("CARGO_TARGET_DIR=./target rtk cargo --version | grep cargo | head -1", "CARGO_TARGET_DIR=./target rtk proxy cargo --version | grep cargo | head -1"))   # different permission rule
+        self.assertTrue(m("CARGO_TARGET_DIR=./target rtk proxy cargo --version | rtk grep cargo | head -1", "CARGO_TARGET_DIR=./target rtk proxy cargo --version | grep cargo | head -1"))
         self.assertTrue(m("rtk git status --short && rtk git log --oneline -1", "git status --short && git log --oneline -1"))
         self.assertTrue(m("rtk lint --version", "biome --version"))
         self.assertTrue(m("rtk pytest --version", "python3 -m pytest --version"))
@@ -151,6 +154,10 @@ class HarnessPureParts(unittest.TestCase):
         self.assertFalse(m("rtk proxy git diff HEAD", "rtk proxy git diff HEAD --output=./zz-out"))   # a weaker command is not the tested one
         self.assertFalse(m("rtk git push origin x", "git push --force origin x"))
         self.assertFalse(m("rtk git log --oneline", "git log --oneline -3"))
+        self.assertFalse(m("rtk git push --force origin full/SPE-9/owned", "rtk proxy git push --force origin full/SPE-9/owned"))   # wrapper identity
+        self.assertFalse(m("rtk proxy git push --force origin x", "git push --force origin x"))
+        self.assertTrue(m("rtk proxy git push --force origin x", "rtk proxy git push --force origin x"))
+        self.assertTrue(m("CARGO_TARGET_DIR=./t rtk proxy cargo --version | rtk grep cargo | head -1", "CARGO_TARGET_DIR=./t rtk proxy cargo --version | grep cargo | head -1"))
         self.assertFalse(m("git push origin x; echo --force", "git push --force origin x"))   # arguments never pool across commands
         self.assertFalse(m("git status --short && echo --force", "git push --force origin x"))
         self.assertTrue(m("git status --short && git push --force origin x", "git push --force origin x"))
@@ -162,7 +169,7 @@ class HarnessPureParts(unittest.TestCase):
 
     def test_the_probe_environment_is_hermetic(self):
         import os
-        names = {"GH_REPO": "owner/real", "GH_TOKEN": "t", "GITHUB_TOKEN": "t", "GIT_DIR": "/real/.git", "GIT_WORK_TREE": "/real", "NPM_TOKEN": "t", "CARGO_REGISTRY_TOKEN": "t",
+        names = {"UV_PROJECT": "/real", "UV_WORKING_DIR": "/real", "VIRTUAL_ENV": "/real/.venv", "PYTHONPATH": "/real", "GH_REPO": "owner/real", "GH_TOKEN": "t", "GITHUB_TOKEN": "t", "GIT_DIR": "/real/.git", "GIT_WORK_TREE": "/real", "NPM_TOKEN": "t", "CARGO_REGISTRY_TOKEN": "t",
                  "KUBECONFIG": "/real", "SSH_AUTH_SOCK": "/s", "ANTHROPIC_API_KEY": "claude-login", "KEEP_ME": "1"}
         os.environ.update(names)
         try:
@@ -170,7 +177,7 @@ class HarnessPureParts(unittest.TestCase):
         finally:
             for k in names:
                 os.environ.pop(k, None)
-        for k in ("GH_REPO", "GH_TOKEN", "GITHUB_TOKEN", "GIT_DIR", "GIT_WORK_TREE", "NPM_TOKEN", "CARGO_REGISTRY_TOKEN", "SSH_AUTH_SOCK"):
+        for k in ("UV_PROJECT", "UV_WORKING_DIR", "VIRTUAL_ENV", "PYTHONPATH", "GH_REPO", "GH_TOKEN", "GITHUB_TOKEN", "GIT_DIR", "GIT_WORK_TREE", "NPM_TOKEN", "CARGO_REGISTRY_TOKEN", "SSH_AUTH_SOCK"):
             self.assertNotIn(k, env, k)
         self.assertEqual(env["GH_CONFIG_DIR"], "/w/empty-config/gh")
         self.assertEqual(env["GIT_CONFIG_GLOBAL"], "/dev/null")

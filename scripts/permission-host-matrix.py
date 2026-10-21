@@ -80,7 +80,8 @@ PROGRAM_EQUIV = {"read": {"cat", "head", "tail", "sed", "bat"}, "lint": {"biome"
 
 
 def simple_commands(cmd):
-    """Split into simple commands and return (program, args) pairs with env assignments, `rtk` and `proxy` removed."""
+    """Split into simple commands and return (program, args, proxy) triples with env assignments and `rtk` removed. `rtk proxy` is kept as
+    the `proxy` flag: the hook never rewrites it, so `rtk proxy git push` and `rtk git push` exercise different permission rules."""
     out = []
     for part in re.split(r"&&|\|\||;|\||\n", str(cmd)):
         try:
@@ -89,17 +90,19 @@ def simple_commands(cmd):
             toks = part.split()
         while toks and ENV_ASSIGN.match(toks[0]):
             toks.pop(0)
+        proxy = False
         if toks and toks[0] == "rtk":
             toks.pop(0)
             if toks and toks[0] == "proxy":
                 toks.pop(0)
+                proxy = True
         if toks:
-            out.append((os.path.basename(toks[0]), toks[1:]))
+            out.append((os.path.basename(toks[0]), toks[1:], proxy))
     return out
 
 
 def norm(cmd):
-    return " ".join(f"{p} {' '.join(a)}".strip() for p, a in simple_commands(cmd))
+    return " ".join(f"{'proxy ' if x else ''}{p} {' '.join(a)}".strip() for p, a, x in simple_commands(cmd))
 
 
 def command_matches(recorded, expected):
@@ -110,9 +113,11 @@ def command_matches(recorded, expected):
     rec, exp = simple_commands(recorded), simple_commands(expected)
     if not exp or not rec:
         return False
-    for prog, args in exp:
+    for prog, args, proxy in exp:
         ok = False
-        for rprog, rargs in rec:
+        for rprog, rargs, rproxy in rec:
+            if rproxy != proxy:
+                continue
             renamed = rprog != prog
             if renamed and prog not in PROGRAM_EQUIV.get(rprog, ()):
                 continue
@@ -156,7 +161,7 @@ def score(entries):
     return out
 
 
-SCRUB = re.compile(r"(AWS_|AZURE_|GOOGLE_|CLOUDSDK_|GCLOUD_|OPENAI_|GH_|GITHUB_|GIT_|NPM_|NODE_AUTH|CARGO_REGISTR|TF_|TERRAFORM_|PULUMI_|DOCKER_|KUBECONFIG|SSH_AUTH_SOCK)")
+SCRUB = re.compile(r"(UV_|VIRTUAL_ENV|PYTHON|PIP_|POETRY_|PIPENV_|CONDA|AWS_|AZURE_|GOOGLE_|CLOUDSDK_|GCLOUD_|OPENAI_|GH_|GITHUB_|GIT_|NPM_|NODE_AUTH|CARGO_REGISTR|TF_|TERRAFORM_|PULUMI_|DOCKER_|KUBECONFIG|SSH_AUTH_SOCK)")
 
 
 def scrubbed_env(label, log, work):
@@ -165,7 +170,7 @@ def scrubbed_env(label, log, work):
     env = hermetic_env()
     empty = work / "empty-config"
     env.update(PROBE_LABEL=label, PROBE_LOG=str(log), CLOUDSDK_CONFIG=str(work / "no-gcloud"), GH_CONFIG_DIR=str(empty / "gh"), NPM_CONFIG_USERCONFIG=str(empty / "npmrc"),
-               CARGO_HOME=str(empty / "cargo"), DOCKER_CONFIG=str(empty / "docker"), KUBECONFIG=str(empty / "kube"))
+               CARGO_HOME=str(empty / "cargo"), DOCKER_CONFIG=str(empty / "docker"), KUBECONFIG=str(empty / "kube"), UV_CACHE_DIR=str(empty / "uv-cache"), UV_NO_CONFIG="1")
     return env
 
 
