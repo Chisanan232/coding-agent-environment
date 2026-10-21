@@ -129,8 +129,6 @@ Settings change (owner-applied, user scope):
     "Bash(rtk gh pr merge *--match-head-commit -*)",
     "Bash(gh pr merge *--match-head-commit * *)",
     "Bash(rtk gh pr merge *--match-head-commit * *)",
-    "Bash(gh pr review * --approve*)",
-    "Bash(rtk gh pr review * --approve*)",
     "Bash(gh pr merge * -m*)",
     "Bash(rtk gh pr merge * -m*)",
     "Bash(gh pr merge * -h*)",
@@ -141,34 +139,10 @@ Settings change (owner-applied, user scope):
     "Bash(rtk gh pr merge*`*)",
     "Bash(gh pr merge*{*)",
     "Bash(rtk gh pr merge*{*)",
-    "Bash(gh pr review * -a*)",
-    "Bash(rtk gh pr review * -a*)",
-    "Bash(gh pr review * -b*)",
-    "Bash(rtk gh pr review * -b*)",
-    "Bash(gh pr review * -c*)",
-    "Bash(rtk gh pr review * -c*)",
-    "Bash(gh pr review * -r*)",
-    "Bash(rtk gh pr review * -r*)",
-    "Bash(gh pr review * -F*)",
-    "Bash(rtk gh pr review * -F*)",
-    "Bash(gh pr review * -h*)",
-    "Bash(rtk gh pr review * -h*)",
-    "Bash(gh pr review * --request-changes*)",
-    "Bash(rtk gh pr review * --request-changes*)",
     "Bash(gh pr merge*\"*)",
     "Bash(rtk gh pr merge*\"*)",
     "Bash(gh pr merge*'*)",
     "Bash(rtk gh pr merge*'*)",
-    "Bash(gh pr review*\"*)",
-    "Bash(rtk gh pr review*\"*)",
-    "Bash(gh pr review*'*)",
-    "Bash(rtk gh pr review*'*)",
-    "Bash(gh pr review*$*)",
-    "Bash(rtk gh pr review*$*)",
-    "Bash(gh pr review*`*)",
-    "Bash(rtk gh pr review*`*)",
-    "Bash(gh pr review*{*)",
-    "Bash(rtk gh pr review*{*)",
     "Bash(gh pr merge*;*)",
     "Bash(rtk gh pr merge*;*)",
     "Bash(gh pr merge*&*)",
@@ -185,26 +159,52 @@ Settings change (owner-applied, user scope):
     "Bash(rtk gh pr merge*)*)",
     "Bash(gh pr merge*[*)",
     "Bash(rtk gh pr merge*[*)",
-    "Bash(gh pr review*;*)",
-    "Bash(rtk gh pr review*;*)",
-    "Bash(gh pr review*&*)",
-    "Bash(rtk gh pr review*&*)",
-    "Bash(gh pr review*|*)",
-    "Bash(rtk gh pr review*|*)",
-    "Bash(gh pr review*<*)",
-    "Bash(rtk gh pr review*<*)",
-    "Bash(gh pr review*>*)",
-    "Bash(rtk gh pr review*>*)",
-    "Bash(gh pr review*(*)",
-    "Bash(rtk gh pr review*(*)",
-    "Bash(gh pr review*)*)",
-    "Bash(rtk gh pr review*)*)",
-    "Bash(gh pr review*[*)",
-    "Bash(rtk gh pr review*[*)",
     "Bash(gh pr merge*\\**)",
     "Bash(rtk gh pr merge*\\**)",
-    "Bash(gh pr review*\\**)",
-    "Bash(rtk gh pr review*\\**)"
+    "Bash(gh pr comment *--body-file*)",
+    "Bash(rtk gh pr comment *--body-file*)",
+    "Bash(gh pr comment * -F*)",
+    "Bash(rtk gh pr comment * -F*)",
+    "Bash(gh pr comment *--template*)",
+    "Bash(rtk gh pr comment *--template*)",
+    "Bash(gh pr comment * -T*)",
+    "Bash(rtk gh pr comment * -T*)",
+    "Bash(gh pr create *--body-file*)",
+    "Bash(rtk gh pr create *--body-file*)",
+    "Bash(gh pr create * -F*)",
+    "Bash(rtk gh pr create * -F*)",
+    "Bash(gh pr create *--template*)",
+    "Bash(rtk gh pr create *--template*)",
+    "Bash(gh pr create * -T*)",
+    "Bash(rtk gh pr create * -T*)",
+    "Bash(gh pr edit *--body-file*)",
+    "Bash(rtk gh pr edit *--body-file*)",
+    "Bash(gh pr edit * -F*)",
+    "Bash(rtk gh pr edit * -F*)",
+    "Bash(gh pr edit *--template*)",
+    "Bash(rtk gh pr edit *--template*)",
+    "Bash(gh pr edit * -T*)",
+    "Bash(rtk gh pr edit * -T*)",
+    "Bash(gh pr review * --approve*)",
+    "Bash(rtk gh pr review * --approve*)",
+    "Bash(gh pr review * -a*)",
+    "Bash(rtk gh pr review * -a*)",
+    "Bash(gh pr review * -c*)",
+    "Bash(rtk gh pr review * -c*)",
+    "Bash(gh pr review * -r*)",
+    "Bash(rtk gh pr review * -r*)",
+    "Bash(gh pr review * -h*)",
+    "Bash(rtk gh pr review * -h*)",
+    "Bash(gh pr review * --request-changes*)",
+    "Bash(rtk gh pr review * --request-changes*)",
+    "Bash(gh pr review *--body-file*)",
+    "Bash(rtk gh pr review *--body-file*)",
+    "Bash(gh pr review * -F*)",
+    "Bash(rtk gh pr review * -F*)",
+    "Bash(gh pr review *--template*)",
+    "Bash(rtk gh pr review *--template*)",
+    "Bash(gh pr review * -T*)",
+    "Bash(rtk gh pr review * -T*)"
   ]
 }
 ```
@@ -213,25 +213,30 @@ Properties: no global allow of `gh pr merge`; ask rules are evaluated before all
 
 The measured gap: the allow clears the *classifier*, not the *judgment*. The decision to run the command comes from the gate verdict plus the head-pinned evidence comment. The `--match-head-commit` pin makes a stale verdict fail closed at GitHub.
 
-### Measured on the real host (2026-10-20)
+### Measured on the real host (2026-10-22)
 
-`scripts/permission-host-matrix.py` (SPE-119) was run against these rules with `docs/permission-corpus/owner-merge-corpus.json` (37 commands, every target a nonexistent repository; hook-recorded ground truth; results in `docs/permission-corpus/owner-merge-results-2026-10-20.json`).
+`scripts/permission-host-matrix.py` (SPE-119) was run against these rules with `docs/permission-corpus/owner-merge-corpus.json` (47 commands, every target a nonexistent repository; hook-recorded ground truth, matched to the tested command; zero probe errors; results in `docs/permission-corpus/owner-merge-results-2026-10-22.json`).
 
 | | Result |
 |---|---|
-| The pinned merge (both spellings) and routine PR verbs (checkout, update-branch, reopen, view, checks, diff, comment, comment-only review) | **10 of 10 run with no prompt** |
-| Risky spellings (admin, squash, `-s`, `-d`, `-md` clusters, delete-branch, disable-auto, subject, body, `--merge=false`, empty and doubled pins, trailing argument, quoted flags, review approvals in every tested spelling, brace expansion, command substitution, literal-star globbing) | **26 of 26 prompt** |
-| Backslash-disguised flag (`--ad\min`) | **runs with no prompt** (residual, below) |
+| The pinned merge (both spellings), routine PR verbs (checkout, update-branch, reopen, view, checks, diff, comment), comment-only reviews including `-b` and quoted bodies with `#12` | **14 of 14 run with no prompt** |
+| Risky spellings (29): admin, squash, `-s`, `-d`, `-md` clusters, delete-branch, disable-auto, subject, body, `--merge=false`, empty and doubled pins, trailing argument, quoted merge flags, plain review approvals, `--body-file` and `-F` on comment, create, edit and review, literal-star globbing | **29 of 29 prompt** |
+| Measured residuals (4, below) | backslash flag and substitution-disguised review approval ran with no prompt; brace-expanded review did not run; a trailing-comment merge was approved by the classifier |
 
-Three host facts were measured and corrected earlier assumptions. Whitespace in a command is normalized (a tab or doubled space still matches a space in a rule), so no tab or newline rule is needed, and one in a rule is normalized to a space and matches every command: with such rules present the standard pinned merge itself prompted (the first real-host positive control failed, after five review rounds that used only a Python glob emulation). `?` is a wildcard in a rule. A literal `*` is asked with an escaped star (`*\**`), a literal `[` works, but a literal backslash cannot be matched by `\\` or `\`.
+Host facts measured here, each of which corrected an earlier assumption (five review rounds had used only a Python glob emulation, and the first real-host positive control failed):
+
+- Whitespace in a command is normalized: a tab or doubled space still matches a space in a rule. A tab or newline inside a **rule** is normalized to a space and matches every command, so such rules made the standard pinned merge itself prompt; none exist.
+- A trailing shell comment is stripped before matching, so comment text can neither hide nor supply a pin. `--merge # --merge --match-head-commit <sha>` is not rule-allowed; it reaches the classifier like any unlisted merge (measured: the classifier ran it against the nonexistent repository, which is a reason not to rely on the classifier for merges). No ask can match comment text, so none exist for `#`.
+- `?` is a wildcard in a rule. A literal `*` is asked with an escaped star (`*\**`), a literal `[` works, and a literal backslash cannot be matched by `\\` or `\`.
 
 ### Residual: what a glob allow cannot close
 
-A trailing-wildcard allow cannot say "exactly these tokens", so safety rests on asks that enumerate everything else: every `gh pr merge` flag of the installed `gh` (2.102), the pin-blanking forms, short-flag clusters, shell expansions (merge and review alike), shell metacharacters, quotes and a literal star. `tests/test-owner-merge-autonomy.py` reads the installed `gh`'s own flag list and fails when a flag or cluster is not covered. Independent review rounds kept finding another spelling, which is the nature of the approach. What remains open on this host, by measurement:
+A trailing-wildcard allow cannot say "exactly these tokens", so safety rests on asks that enumerate everything else: every `gh pr merge` flag of the installed `gh` (2.102), the pin-blanking forms, short-flag clusters, shell expansions and quotes in merge commands, shell metacharacters, a literal star, and `--body-file`/`-F`/`--template` on every allowed body-taking verb. `tests/test-owner-merge-autonomy.py` reads the installed `gh`'s own flag list and fails when a flag or cluster is not covered. Independent review rounds kept finding another spelling, which is the nature of the approach. What remains open on this host, by measurement:
 
-- **A backslash inside a flag** (`--ad\min`, which the shell turns into `--admin`) matches the allow and no ask. The agent itself would have to type it; an attacker who can only influence PR text cannot.
+- **A backslash inside a merge flag** (`--ad\min`, which the shell turns into `--admin`) matches the allow and no ask. The agent itself would have to type it; an attacker who can only influence PR text cannot.
+- **Disguised review approval** (`--ap""prove`, brace expansion or command substitution reassembling `--approve`). The review allow carries no generic quote, brace or substitution asks, because ordinary comment bodies contain quotes and `$(...)`; asking on them made routine comment reviews prompt. The only other control is the built-in Self-Approval protection, which is not deterministic.
 - **`?` globbing** (`--admi?` with a file named `--admin` in the working directory) cannot be asked because `?` is a rule wildcard.
-- The characters in the test's `UNCOVERED` set are inert for splitting or expansion.
+- **An unpinned merge in any spelling** is not rule-allowed but is left to the classifier, which is not a control to rely on.
 
 These are accepted-or-not decisions for the owner, not defects to keep patching. If they are not acceptable, do not apply the narrow allow; use the validating runner below or keep the `!` fallback.
 
