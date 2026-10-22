@@ -867,6 +867,146 @@ class SignedEvidence(Base):
         self.assertNotIn(self.KEY.decode(), e.getvalue())
 
 
+class ProtectionErrorClassification(Base):
+    def test_only_a_real_http_404_status_means_absent(self):
+        for err in ("gh: Not Found (HTTP 404)", "HTTP 404: Not Found (https://api.github.com/repos/x/branches/main/protection)",
+                    "gh: Branch not protected (HTTP 404)"):
+            code, rec = self.go(FakeGh(protection=(1, err)), dry=True)
+            self.assertEqual((code, rec["server_side"]["protection"]), (omr.EXIT_OK, "absent"), err)
+
+    def test_other_ambiguous_or_unparseable_errors_are_unreadable_and_refuse(self):
+        errs = ("HTTP 403: Resource not accessible by integration (https://api.github.com/repos/x/branches/release-404/protection)",
+                "gh: Resource not accessible (HTTP 403) repos/x/branches/release-404/protection",
+                "HTTP 403 Not Found? branches/404/protection", "HTTP 500: Internal error 404", "HTTP 401 Bad credentials 404",
+                "Not Found", "404", "branch release-404 missing", "HTTP 40", "dial tcp: lookup api.github.com ... 404", "",
+                "HTTP 403: forbidden (HTTP 404)")
+        for err in errs:
+            self.assertRefused(FakeGh(protection=(1, err)), "enforce_admins is unverified")
+
+    def test_branch_names_containing_404_do_not_confuse_the_classifier(self):
+        self.write_evidence(base="release-404")
+        pr = base_pr(baseRefName="release-404")
+        self.assertRefused(FakeGh(pr, protection=(1, "HTTP 403: nope repos/x/branches/release-404/protection")),
+                           "enforce_admins is unverified")
+        code, rec = self.go(FakeGh(pr, protection=(1, "gh: Not Found (HTTP 404)")), dry=True)
+        self.assertEqual((code, rec["server_side"]["protection"]), (omr.EXIT_OK, "absent"))
+
+    def test_unreadable_protection_without_ruleset_checks_stays_an_error(self):
+        gh = FakeGh(rules=[], protection=(1, "HTTP 403: nope 404"))
+        self.assertEqual((self.go(gh)[0], gh.merges()), (omr.EXIT_ERROR, []))
+
+
+class MalformedInputFailsClosed(Base):
+    def audited_refusal(self, gh, code_expected=None, **kw):
+        code, rec = self.go(gh, **kw)
+        self.assertEqual(gh.merges(), [])
+        self.assertEqual(code, omr.EXIT_REFUSED if code_expected is None else code_expected, rec)
+        self.assertTrue(self.audit.exists(), "an audit record must exist")
+        return rec
+
+    def test_signature_shape_is_validated_before_compare(self):
+        key = SignedEvidence.KEY
+        keyfile = self.tmp_real / "k.key"
+        keyfile.write_bytes(key)
+        os.chmod(keyfile, 0o600)
+        self.allow.write_text(json.dumps(dict(allow_doc(), evidence_key_file=str(keyfile))))
+        good = omr.evidence_mac(key, json.loads(json.dumps({
+            "repo": REPO, "pr": 7, "base": "main", "head": HEAD, "verdict": "PASS", "reviewer": "independent-1",
+            "reviewer_kind": "independent-agent", "reviewed_at": "2026-10-20T10:00:00Z"})))
+        for bad in ("é" * 64, good.upper(), good[:-1], good + "0", "", " " * 64, "0" * 63 + "g"):
+            self.write_evidence(hmac=bad)
+            self.audit_refused = self.audited_refusal(FakeGh())
+
+    def test_malformed_review_elements_refuse_with_an_audit_record(self):
+        for reviews in (["malformed"], [None], [5], [[]], [{"author": "x", "state": "APPROVED"}],
+                        [{"author": None, "state": "APPROVED"}], [{"author": {"login": 5}, "state": "APPROVED"}],
+                        [{"author": {"login": "a"}, "state": 5}], [{"author": {"login": "a"}, "state": "APPROVED", "commit": "x"}],
+                        [{"state": "APPROVED"}], {"a": 1}, "reviews"):
+            rec = self.audited_refusal(FakeGh(base_pr(reviews=reviews)))
+            self.assertIn(rec["outcome"], ("REFUSED",), reviews)
+
+    def test_unexpected_exception_at_every_stage_is_audited_and_never_merges(self):
+        def boom(*a, **k):
+            raise ZeroDivisionError("injected")
+        stages = ["load_allowlist", "repo_config", "load_key", "decide", "load_evidence", "check_server_protection",
+                  "summarize_checks", "evaluate"]
+        keyfile = self.tmp_real / "k2.key"
+        keyfile.write_bytes(SignedEvidence.KEY)
+        os.chmod(keyfile, 0o600)
+        self.allow.write_text(json.dumps(dict(allow_doc(), evidence_key_file=str(keyfile))))
+        self.write_evidence()
+        ev = json.loads(self.evidence.read_text())
+        ev["hmac"] = omr.evidence_mac(SignedEvidence.KEY, ev)
+        self.evidence.write_text(json.dumps(ev))
+        for name in stages:
+            real = getattr(omr, name)
+            setattr(omr, name, boom)
+            try:
+                gh = FakeGh()
+                code, rec = self.go(gh)
+            finally:
+                setattr(omr, name, real)
+            self.assertEqual((code, gh.merges(), rec["outcome"]), (omr.EXIT_INTERNAL, [], "ERROR"), (name, rec["reasons"]))
+            self.assertEqual(self.records()[-1]["outcome"], "ERROR", name)
+            self.assertIn("unexpected ZeroDivisionError", " ".join(rec["reasons"]), name)
+
+    def test_unexpected_exception_from_gh_before_exec_is_audited(self):
+        class Boom(FakeGh):
+            def __call__(self, argv):
+                if argv[:2] == ["pr", "view"] and self.fetches >= 1:
+                    raise KeyError("injected")
+                return super().__call__(argv)
+        gh = Boom()
+        code, rec = self.go(gh)
+        self.assertEqual((code, gh.merges()), (omr.EXIT_INTERNAL, []))
+
+    def test_second_pass_exception_and_pending_write_exception_do_not_merge(self):
+        calls = {"n": 0}
+        real = omr.decide
+
+        def second_boom(*a, **k):
+            calls["n"] += 1
+            if calls["n"] >= 3:  # read 1, then read 2 (first pass end), then the second pass
+                raise ZeroDivisionError("injected")
+            return real(*a, **k)
+        omr.decide = second_boom
+        try:
+            gh = FakeGh()
+            code, _ = self.go(gh)
+        finally:
+            omr.decide = real
+        self.assertEqual((code, gh.merges()), (omr.EXIT_INTERNAL, []))
+        real_w, state = omr.write_audit, {"n": 0}
+
+        def pending_boom(path, record):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise ValueError("injected")
+            return real_w(path, record)
+        omr.write_audit = pending_boom
+        try:
+            gh = FakeGh()
+            code, rec = self.go(gh)
+        finally:
+            omr.write_audit = real_w
+        self.assertEqual((code, gh.merges()), (omr.EXIT_INTERNAL, []))
+        self.assertEqual(self.records()[-1]["outcome"], "ERROR")
+
+    def test_pending_record_still_precedes_exec_and_post_merge_exception_is_flagged(self):
+        class Boom(FakeGh):
+            def __call__(self, argv):
+                if argv[:2] == ["pr", "view"] and argv[6] == omr.READBACK_FIELDS:
+                    raise KeyError("injected")
+                return super().__call__(argv)
+        gh = Boom()
+        code, rec = self.go(gh)
+        self.assertEqual((code, len(gh.merges())), (omr.EXIT_INTERNAL, 1))
+        recs = self.records()
+        self.assertEqual([r["outcome"] for r in recs], ["PENDING", "ERROR"])
+        self.assertIn("may already be merged", " ".join(recs[-1]["reasons"]))
+        self.assertTrue(recs[-1]["merge_attempted"])
+
+
 class Outcomes(Base):
     def test_denial_recorded_not_retried(self):
         gh = FakeGh(merge_rc=1, merge_err="GraphQL: Merge Without Review denied: permission denied")
@@ -888,8 +1028,8 @@ class Outcomes(Base):
 
     def test_exit_codes_are_distinct(self):
         codes = {omr.EXIT_OK, omr.EXIT_REFUSED, omr.EXIT_DENIED, omr.EXIT_ERROR, omr.EXIT_UNVERIFIED, omr.EXIT_AUDIT,
-                 omr.EXIT_BASE_MISMATCH, omr.EXIT_USAGE}
-        self.assertEqual(len(codes), 8)
+                 omr.EXIT_BASE_MISMATCH, omr.EXIT_INTERNAL, omr.EXIT_USAGE}
+        self.assertEqual(len(codes), 9)
 
     def test_gh_unavailable_is_error(self):
         def broken(argv):

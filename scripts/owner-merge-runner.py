@@ -20,7 +20,8 @@ The review evidence file is produced by an independent review; the runner only r
 Exit codes: 0 success (or validated dry run), 2 refused by a guard, 3 denied by gh, 4 error,
 5 unverified (merge ran but the read-back did not show MERGED), 6 final audit record not written
 (the outcome is on stderr), 7 the PR is MERGED but its base differs from the reviewed base
-(INCIDENT: POSSIBLE MERGE TO UNREVIEWED BASE; treat as a security incident), 64 usage error.
+(INCIDENT: POSSIBLE MERGE TO UNREVIEWED BASE; treat as a security incident), 8 unexpected internal
+error (audited, fail closed; if a merge had been attempted the record says it may have executed), 64 usage error.
 """
 import argparse
 import calendar
@@ -35,13 +36,15 @@ import subprocess
 import sys
 import time
 
-EXIT_OK, EXIT_REFUSED, EXIT_DENIED, EXIT_ERROR, EXIT_UNVERIFIED, EXIT_AUDIT, EXIT_BASE_MISMATCH, EXIT_USAGE = \
-    0, 2, 3, 4, 5, 6, 7, 64
+EXIT_OK, EXIT_REFUSED, EXIT_DENIED, EXIT_ERROR, EXIT_UNVERIFIED, EXIT_AUDIT, EXIT_BASE_MISMATCH, EXIT_INTERNAL, \
+    EXIT_USAGE = 0, 2, 3, 4, 5, 6, 7, 8, 64
 INCIDENT = "POSSIBLE MERGE TO UNREVIEWED BASE"
 
 REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.{1,2}\Z)[A-Za-z0-9._-]{1,100}")
 PR_RE = re.compile(r"[1-9][0-9]{0,8}")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
+MAC_RE = re.compile(r"[0-9a-f]{64}")
+HTTP_STATUS_RE = re.compile(r"HTTP (\d{3})")
 BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,200}")
 READ_PATHS = (re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rules/branches/([A-Za-z0-9._/-]{1,200})"),
               re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/branches/([A-Za-z0-9._/-]{1,200})/protection"),
@@ -367,7 +370,8 @@ def load_evidence(path, head, repo, pr, base, cfg, key, now):
             bad.append("evidence reviewed_at is not a valid time")
     if cfg["require_signed_evidence"]:
         mac = ev.get("hmac")
-        if key is None or not isinstance(mac, str) or not hmac.compare_digest(mac, evidence_mac(key, ev)):
+        if key is None or not isinstance(mac, str) or not MAC_RE.fullmatch(mac) \
+                or not hmac.compare_digest(mac, evidence_mac(key, ev)):
             bad.append("evidence signature missing or invalid")
     if bad:
         raise Refused(bad)
@@ -480,8 +484,8 @@ def check_server_protection(runner, repo, base, cfg):
         if not admins and not cfg["accept_bypass_actors"]:
             raise Refused(["branch protection does not enforce its rules for administrators (enforce_admins); "
                            "set accept_bypass_actors to accept"])
-    elif re.search(r"404|Not Found", err):
-        prot_state = "absent"
+    elif (HTTP_STATUS_RE.search(err) or [None, None])[1] == "404":
+        prot_state = "absent"  # only a real HTTP 404 status (the first status token) means no classic protection
     else:
         prot_state = "unreadable"
     if not names:
@@ -544,12 +548,13 @@ def decide(p, repo, pr, head, me, cfg):
         bad.append(f"mergeStateStatus is {mss}")
     latest = {}
     for r in reviews:
-        who = ((r or {}).get("author") or {}).get("login")
-        st = (r or {}).get("state")
-        if not isinstance(who, str) or not isinstance(st, str):
+        if not isinstance(r, dict) or not isinstance(r.get("author"), dict) or not isinstance(r.get("state"), str) \
+                or not isinstance(r["author"].get("login"), str) \
+                or not (r.get("commit") is None or isinstance(r.get("commit"), dict)):
             raise Refused(["review entry malformed"])
+        who, st = r["author"]["login"], r["state"]
         if st in DECISIVE:
-            latest[who.lower()] = (st, ((r.get("commit") or {}).get("oid")), r.get("authorAssociation"))
+            latest[who.lower()] = (st, (r.get("commit") or {}).get("oid"), r.get("authorAssociation"))
     if decision == "CHANGES_REQUESTED" or any(v[0] == "CHANGES_REQUESTED" for v in latest.values()):
         bad.append("unresolved CHANGES_REQUESTED")
     checks, check_bad = summarize_checks(rollup, cfg["required_checks"])
@@ -685,6 +690,7 @@ def run(repo, pr, head, evidence, allowlist, audit, dry_run, gh, clock=time.time
                 write_audit(audit, dict(rec))  # durable before exec; no audit trail, no merge
             except OSError as e:
                 raise Refused(["audit record could not be written, refusing before execution: " + scrub(e)])
+            rec["merge_attempted"] = True
             mrc, _, merr = runner.call(merge_argv(repo, pr, head))
             if mrc != 0:
                 rec["reasons"].append(scrub(merr))
@@ -715,6 +721,11 @@ def run(repo, pr, head, evidence, allowlist, audit, dry_run, gh, clock=time.time
         rec["decision"] = "ERROR" if rec["decision"] != "APPROVE" else "APPROVE"
         rec["reasons"].append(scrub(e))
         rec["outcome"], code = "ERROR", EXIT_ERROR
+    except Exception as e:  # fail closed: any unexpected error is audited and exits distinctly, never a traceback
+        rec["reasons"].append(f"unexpected {type(e).__name__}: " + scrub(e))
+        if rec.get("merge_attempted"):
+            rec["reasons"].append("the merge command had been started: the PR may already be merged")
+        rec["outcome"], code = "ERROR", EXIT_INTERNAL
     try:
         write_audit(audit, rec)
     except OSError as e:

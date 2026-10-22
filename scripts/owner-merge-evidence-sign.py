@@ -3,11 +3,12 @@
 
   owner-merge-evidence-sign.py --key-file PATH --in EVIDENCE.json --out SIGNED.json
 
-Run this from the REVIEWER session with the reviewer's own key file. It adds an HMAC-SHA256 over the
-canonical evidence JSON as the `hmac` field. This only raises the bar when the key is held by a different
-OS user or session than the merging agent; a process running as the same user as the key file can
-read it and forge evidence. The key is never printed; the key file must be a regular, user-owned file
-with no group/other permissions. The output is created with mode 0600 and never overwrites a file.
+Run this with the reviewer's key file. It adds an HMAC-SHA256 over the canonical evidence JSON as the
+`hmac` field. This is tamper evidence only. The runner verifies with the same key, so the key file must be
+readable by the OS user that runs the runner; anything running as that user can read the key and sign
+forged evidence. Only holding the key in a different OS user or trust domain would help, and the runner
+cannot verify without having the key. The key is never printed; the key file must be a regular, user-owned
+file with no group/other permissions. The output is created with mode 0600 and never overwrites a file.
 """
 import argparse
 import importlib.util
