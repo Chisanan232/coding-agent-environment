@@ -124,3 +124,51 @@ and one optional PreToolUse hook entry, and never `allow`, `deny`, `env` or othe
    has the hash `apply` produced, so edits made since apply are never silently lost.
 5. Corporate machines: use the organization's managed settings; see `docs/ROLLOUT-CORPORATE-PROFILE.md`.
    This repository never carries corporate hostnames or controls.
+
+## 8. Private-repository CI acceptance and bounded validation (founder policy, 2026-10-22)
+
+Applies to every product and session. This section is the single recorded statement; other documents link here
+and do not restate it.
+
+**CI states, never merged into one.** `CI_PASS` hosted CI executed and passed. `CI_UNAVAILABLE_EXTERNAL` hosted
+jobs never executed because of a verified billing or quota restriction. `LOCAL_EQUIVALENT_PASS` the corresponding
+commands ran locally and passed against the exact revision. `LOCAL_EQUIVALENT_FAIL` they ran and found defects.
+`NOT_VERIFIED` no valid evidence. Unavailable CI is never reported as `CI_PASS`. A check that executed and failed
+is `CI_FAILED` and is never bypassed.
+
+**Gate.** For a verified billing or quota outage only, `LOCAL_EQUIVALENT_PASS` satisfies the corresponding
+engineering or release gate when the local run is sufficiently equivalent. Record the exact evidence in the PR and
+Jira; do not claim hosted CI succeeded; do not weaken branch protection; do not ask the founder again for the same
+known exception.
+
+**Equivalence.** Inspect the workflow's real commands, run them locally with matching runtime, dependencies,
+features and configuration, record exit codes and test counts, preserve sanitized logs, pin to the exact
+commit or tree, and document platform or coverage differences. Reuse evidence while the tested inputs are
+unchanged; a documentation-only commit does not justify rerunning a full suite. SonarCloud may stay unavailable;
+no other scanner stands in for it.
+
+**Not replaceable by local runs.** Real macOS GUI or accessibility acceptance, code signing and notarization, Linux
+kernel security mechanisms, native sandbox confinement, real provider or model acceptance, independent security QA
+when required, and any mandatory real-hardware or real-daemon evidence. Such a gate stays `BLOCKED` or
+`NOT_VERIFIED`; its acceptance criteria are never relaxed to obtain a green result.
+
+**Bounded review.** At most two substantive independent review/fix cycles per coherent candidate: cycle 1 full
+review, remediation and targeted regression tests; cycle 2 exact-head or affected-delta review and closure. Later
+findings: fix Critical and High defects and re-review only the affected area; file Medium and Low hardening as
+follow-ups with a rationale. The limit never authorizes merging a known Critical or High security defect. A
+blocker that persists becomes one decision packet.
+
+**Merge.** Eligible PRs merge automatically when the authenticated identity, GitHub rules and host policy allow it.
+Self-review and independent agent review count as engineering validation but never as a manufactured GitHub
+approval. On a self-approval, branch-protection or host denial: record it once, do not retry through aliases or
+other syntax, and hand over the PR URL, head SHA, local evidence, review verdict and the head-pinned owner merge
+command, then continue other work.
+
+**Release readiness.** `DEVELOPMENT_COMPLETE`, `QA_SIGNED_OFF`, `READY_FOR_RELEASE`, `RELEASE_APPROVED` and
+`RELEASED` stay separate. An unavailable hosted workflow alone does not keep `READY_FOR_RELEASE` false when an
+approved local equivalent satisfies that requirement; missing platform evidence, owner acceptance or required
+security QA still blocks it. Tagging, publication and production deployment need separate authorization.
+
+**Executable form in this repository.** `scripts/owner-merge-runner.py` implements the exception for merges, per
+repository and off by default (`local_equivalent_ci` in the owner allowlist). See `docs/OWNER-MERGE-AUTONOMY.md`
+section 9.
