@@ -11,7 +11,7 @@ DOC = (ROOT / "docs/ENGINEERING-CONSTITUTION.md").read_text()
 SECTIONS = ["One source of truth, by topic", "Instruction precedence and conflict handling", "Principles carried over unchanged", "Context-sensitive principles",
             "Abstraction and extensibility policy", "Change-risk-based verification", "Durable checkpoints and retry circuit breakers",
             "Multi-agent resource coordination", "Security profiles", "Open decisions (founder), with recommended defaults",
-            "Harness integration facts (verified or not)", "Behavioral acceptance plan (not yet run)", "Rollout and rollback"]
+            "Harness integration facts (verified or not)", "Behavioral acceptance: first results (partial, not parity)", "Rollout and rollback"]
 
 
 class Structure(unittest.TestCase):
@@ -56,7 +56,7 @@ class NotASecondSourceOfTruth(unittest.TestCase):
 
     def test_unverified_facts_are_marked_not_asserted(self):
         self.assertRegex(DOC, r"Codex 0\.163\.0 loads[^|]*\|\s*\*\*UNVERIFIED\*\*")
-        self.assertIn("not yet run", DOC)
+        self.assertIn("Not run, so not claimed", DOC)
         self.assertNotRegex(DOC, r"(?i)full parity (achieved|complete)")
 
 
