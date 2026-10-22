@@ -5,6 +5,7 @@ No real gh, no real PR, no network. The fake is passed through the module API; t
 way to select an alternate gh executable.
 """
 import contextlib
+import signal
 import importlib.util
 import io
 import json
@@ -1049,6 +1050,125 @@ class MalformedInputFailsClosed(Base):
         self.assertEqual([r["outcome"] for r in recs], ["PENDING", "ERROR"])
         self.assertIn("may already be merged", " ".join(recs[-1]["reasons"]))
         self.assertTrue(recs[-1]["merge_attempted"])
+
+
+class Redaction(Base):
+    CASES = [  # (text, fragments that must not survive)
+        ("HTTP 401: Authorization: Basic c3ludGhldGljOnBhc3N3b3Jk", ["c3ludGhldGljOnBhc3N3b3Jk", "Basic c3"]),
+        ("authorization=Token abcdefgh12345 more", ["abcdefgh12345", "more"]),
+        ('password="my secret pass phrase" tail', ["my secret", "pass phrase", "phrase"]),
+        ("password='a b c d' tail", ["a b c", "c d"]),
+        ("secret = 'two words here'", ["two words", "words here"]),
+        ("token=abc def ghi", ["abc", "def", "ghi"]),
+        ("api_key: sk-synthetic 12 34", ["sk-synthetic", "12 34"]),
+        ("X-Api-Key=synthetic-value-1", ["synthetic-value-1"]),
+        ("apikey = \"quoted key with spaces\"", ["quoted key", "with spaces"]),
+        ("Authorization: Bearer abcdefghijklmnop", ["abcdefghijklmnop"]),
+        ("got Basic dXNlcjpwYXNz back", ["dXNlcjpwYXNz"]),
+        ("passwd: s3cr3t value", ["s3cr3t", "value"]),
+        ("access_token=zzz yyy", ["zzz", "yyy"]),
+        ("ghp_" + "A1b2C3d4" * 3, ["A1b2C3d4"]),
+        ("github_pat_" + "x1" * 12, ["x1x1x1"]),
+    ]
+
+    def test_whole_credential_values_are_redacted(self):
+        for text, gone in self.CASES:
+            out = omr.scrub(text)
+            self.assertIn("[redacted]", out, text)
+            for frag in gone:
+                self.assertNotIn(frag, out, (text, frag))
+
+    def test_head_shas_and_plain_text_are_not_redacted(self):
+        self.assertEqual(omr.scrub(HEAD), HEAD)
+        self.assertEqual(omr.scrub("PR is a draft"), "PR is a draft")
+
+    def test_gh_stderr_is_never_stored_raw(self):
+        raw = "HTTP 403: Authorization: Basic c3ludGhldGljOnBhc3N3b3Jk password=\"a b c\" " + "Z9" * 30
+        summary = omr.gh_error(raw)
+        self.assertIn("status=403", summary)
+        self.assertRegex(summary, r"sha256=[0-9a-f]{16}")
+        for frag in ("c3ludGhldGljOnBhc3N3b3Jk", "a b c", "Z9Z9Z9Z9"):
+            self.assertNotIn(frag, summary)
+        self.assertIn("status=unknown", omr.gh_error("no status here"))
+
+    def test_audit_carries_only_the_summary_for_every_gh_failure_path(self):
+        raw = "HTTP 500: Authorization: Basic c3ludGhldGljOnBhc3N3b3Jk password='x y z'"
+        runs = {
+            "merge denied": FakeGh(merge_rc=1, merge_err=raw),
+            "protection read": FakeGh(rules=[], protection=(1, raw)),
+            "pr view": None,
+        }
+
+        class ViewFails(FakeGh):
+            def __call__(self, argv):
+                if argv[:2] == ["pr", "view"]:
+                    return 1, "", raw
+                return super().__call__(argv)
+        runs["pr view"] = ViewFails()
+        for name, gh in runs.items():
+            self.go(gh)
+            text = self.audit.read_text()
+            for frag in ("c3ludGhldGljOnBhc3N3b3Jk", "x y z", "Basic c3"):
+                self.assertNotIn(frag, text, name)
+            self.assertIn("sha256=", text, name)
+            self.assertIn("status=500", text, name)
+
+
+class FifoPaths(Base):
+    @contextlib.contextmanager
+    def guard(self, seconds=10):
+        def alarm(*_):
+            raise AssertionError("runner hung on a FIFO")
+        old = signal.signal(signal.SIGALRM, alarm)
+        signal.alarm(seconds)
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+    def fifo(self, name):
+        path = self.tmp_real / name
+        os.mkfifo(path, 0o600)
+        return path
+
+    def test_allowlist_fifo_is_refused_promptly(self):
+        with self.guard():
+            gh = FakeGh()
+            code, rec = self.go(gh, allow=self.fifo("allow.fifo"))
+        self.assertEqual((code, gh.merges()), (omr.EXIT_REFUSED, []))
+        self.assertIn("not a regular", " ".join(rec["reasons"]))
+        self.assertTrue(self.audit.exists())
+
+    def test_key_file_fifo_is_refused_promptly(self):
+        fifo = self.fifo("key.fifo")
+        self.allow.write_text(json.dumps(dict(allow_doc(), evidence_key_file=str(fifo))))
+        with self.guard():
+            gh = FakeGh()
+            code, rec = self.go(gh)
+        self.assertEqual((code, gh.merges()), (omr.EXIT_REFUSED, []))
+        self.assertIn("not a regular", " ".join(rec["reasons"]))
+
+    def test_evidence_fifo_is_refused_promptly(self):
+        with self.guard():
+            gh = FakeGh()
+            code, rec = self.go(gh, evidence=self.fifo("ev.fifo"))
+        self.assertEqual((code, gh.merges()), (omr.EXIT_REFUSED, []))
+        self.assertIn("not a regular", " ".join(rec["reasons"]))
+
+    def test_audit_fifo_blocks_the_merge_promptly(self):
+        os.makedirs(self.audit.parent)
+        os.mkfifo(self.audit, 0o600)
+        with self.guard():
+            gh = FakeGh()
+            code, rec = self.go(gh)
+        self.assertEqual(gh.merges(), [])
+        self.assertNotEqual(code, omr.EXIT_OK)
+
+    def test_device_files_are_refused_not_read(self):
+        with self.guard():
+            code, rec = self.go(FakeGh(), evidence=pathlib.Path("/dev/zero"))
+        self.assertEqual(code, omr.EXIT_REFUSED)
 
 
 class Outcomes(Base):

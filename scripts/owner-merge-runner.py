@@ -63,8 +63,13 @@ READBACK_FIELDS = "state,mergeCommit,baseRefName"
 BOT_LOGINS = {"dependabot", "renovate"}
 BOT_BRANCH = re.compile(r"(dependabot|renovate)/")
 DECISIVE = {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
-SECRET_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|Bearer\s+\S+|"
-                       r"(?i:token|password|secret|authorization)\s*[=:]\s*\S+)")
+SECRET_RE = re.compile(
+    r"gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}"
+    r"|(?i:\bauthorization)\s*[=:][^\r\n]*"  # the whole header value, scheme included
+    r"|(?i:\b(?:bearer|basic)\s+)[^\s\"']+"
+    r"|(?i:\b(?:token|password|passwd|secret|api[_-]?key|apikey|access[_-]?token)\b)\s*[=:]\s*"
+    r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\r\n]*)")  # quoted value (spaces included) or to end of line
+LONG_RE = re.compile(r"[A-Za-z0-9+/=_-]{20,}")
 DENIAL_RE = re.compile(r"permission|denied|forbidden|not authori[sz]ed|HTTP 40[13]|must have|"
                        r"protected branch|required status|review is required|not allowed", re.I)
 DEFAULT_AUDIT = os.path.join(os.path.expanduser("~"), ".claude", "audit", "owner-merge-runner.jsonl")
@@ -82,6 +87,15 @@ class Refused(Exception):
 
 def scrub(text):
     return SECRET_RE.sub("[redacted]", str(text))[:300]
+
+
+def gh_error(err):
+    """What may be stored about a gh failure: a status token, a hash of the raw text and a short, heavily
+    scrubbed excerpt. Raw stderr is never stored."""
+    raw = str(err)
+    digest = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
+    excerpt = LONG_RE.sub("[long]", scrub(raw))[:100]
+    return f"gh error status={http_status(raw) or 'unknown'} sha256={digest} excerpt={excerpt!r}"
 
 
 def merge_argv(repo, pr, sha):
@@ -158,7 +172,7 @@ class Runner:
     def json(self, argv):
         rc, out, err = self.call(argv)
         if rc != 0:
-            raise RuntimeError(f"gh {argv[0]} {argv[1]} failed: {scrub(err)}")
+            raise RuntimeError(f"gh {argv[0]} {argv[1]} failed: {gh_error(err)}")
         try:
             data = json.loads(out)
         except ValueError:
@@ -230,7 +244,7 @@ def read_trusted_file(path, label, loose_mask, limit=65536):
     path = os.path.abspath(path)
     bad = dir_chain_problems(os.path.dirname(path))
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)  # a FIFO must not hang the open
     except OSError:
         try:
             link = stat.S_ISLNK(os.lstat(path).st_mode)
@@ -326,10 +340,18 @@ def load_key(path):
 
 def load_evidence(path, head, repo, pr, base, cfg, key, now):
     try:
-        if os.path.getsize(path) > 65536:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)  # a FIFO or device must not hang the open or the read
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise Refused(["review evidence is not a regular file"])
+            with os.fdopen(fd, "rb") as f:
+                fd = None
+                raw = f.read(65537)
+        finally:
+            if fd is not None:
+                os.close(fd)
+        if len(raw) > 65536:
             raise Refused(["evidence file too large"])
-        with open(path, "rb") as f:
-            raw = f.read(65537)
         ev = json.loads(raw.decode("utf-8"))
     except Refused:
         raise
@@ -477,7 +499,7 @@ def check_server_protection(runner, repo, base, cfg):
     required check, and refuse when a readable ruleset lists a bypass actor that could apply to us."""
     rc, rules, err = _read_json(runner, rules_argv(repo, base), "gh rules read")
     if rc != 0:
-        raise RuntimeError(f"gh rules read failed: {scrub(err)}")
+        raise RuntimeError(f"gh rules read failed: {gh_error(err)}")
     if not isinstance(rules, list):
         raise RuntimeError("gh rules read returned unexpected JSON shape")
     names, ids = parse_rule_contexts(rules)
@@ -500,7 +522,7 @@ def check_server_protection(runner, repo, base, cfg):
         prot_state = "unreadable"
     if not names:
         if prot_state == "unreadable":
-            raise RuntimeError(f"gh branch protection read failed: {scrub(err)}")
+            raise RuntimeError(f"gh branch protection read failed: {gh_error(err)}")
         raise Refused(["no server-side required status checks on the base branch"])
     if prot_state == "unreadable" and not cfg["accept_bypass_actors"]:
         raise Refused(["branch protection could not be read, so enforce_admins is unverified; "
@@ -652,7 +674,7 @@ def write_audit(path, record):
         bad = dir_chain_problems(d)
         if bad:
             raise AuditError("audit directory untrusted: " + "; ".join(bad))
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     except AuditError:
         raise
     except OSError as e:
@@ -714,7 +736,7 @@ def run(repo, pr, head, evidence, allowlist, audit, dry_run, gh, clock=time.time
             rec["merge_attempted"] = True
             mrc, _, merr = runner.call(merge_argv(repo, pr, head))
             if mrc != 0:
-                rec["reasons"].append(scrub(merr))
+                rec["reasons"].append(gh_error(merr))
                 rec["outcome"], code = ("DENIED", EXIT_DENIED) if DENIAL_RE.search(merr) else ("ERROR", EXIT_ERROR)
             else:
                 try:
