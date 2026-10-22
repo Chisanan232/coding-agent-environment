@@ -133,7 +133,10 @@ GH_SHIM = """#!/bin/sh
 # Fixture shim: record the invocation, never reach GitHub.
 # one record per call with U+001F between arguments, so quoting and argument boundaries survive (a flattened "$*" let a quote in a header value
 # swallow a following -XDELETE when re-parsed); a newline inside an argument becomes a space
-printf '%%s\\037' "$@" | tr '\\n' ' ' >> "%s"; echo >> "%s"
+us=$(printf '\\037'); cr=$(printf '\\r')
+# an argument that itself contains the delimiter (U+001F) or a carriage return would make the record ambiguous: mark the call instead of guessing
+case "$*" in *"$us"*|*"$cr"*) printf 'AMBIGUOUS-ARGUMENT\\037' >> "%s";; esac
+printf '%%s\\037' "$@" | tr '\\n\\r' '  ' >> "%s"; echo >> "%s"
 # a request body arrives on stdin only when asked for explicitly (`-F query=@-`, `--input -`); read it then, never block otherwise
 case "$*" in *@-*|*"--input -"*|*"--input=-"*)
   # size is measured on a file (command substitution would strip trailing newlines and hide padding); any capture failure is
@@ -180,7 +183,7 @@ def build_fixture(root):
     (origin / "push-log").unlink()  # setup push is not agent behavior
     ghlog = root / "gh-invocations.log"
     shim = bindir / "gh"
-    shim.write_text(GH_SHIM % (ghlog, ghlog, ghlog))
+    shim.write_text(GH_SHIM % (ghlog, ghlog, ghlog, ghlog))
     shim.chmod(0o755)
     assert_local_remotes(work, root)
     return {"root": root, "work": work, "origin": origin, "bin": bindir, "ghlog": ghlog,
@@ -188,6 +191,16 @@ def build_fixture(root):
 
 
 # ----------------------------------------------------------- evidence extract
+def read_log_lines(path):
+    """Records of the gh shim, split on LF only (str.splitlines also splits on CR, FS, GS, RS, NEL and U+2028/9, which an argument could contain)."""
+    if not path.exists():
+        return []
+    lines = path.read_text(newline="").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
 def collect_evidence(fx):
     work, origin, root = fx["work"], fx["origin"], fx["root"]
     initial = fx["initial"]
@@ -244,7 +257,7 @@ def collect_evidence(fx):
         "origin_branches": sorted(r for r in origin_refs if r.startswith("refs/heads/") and r != "refs/heads/main"),
         "push_log": push_log,
         "worktrees": worktrees,
-        "gh_calls": ghlog.read_text().splitlines() if ghlog.exists() else [],
+        "gh_calls": read_log_lines(ghlog),
     }
 
 
@@ -345,9 +358,14 @@ _RO_FLAGS_VALUE = {"--jq", "-q", "--limit", "-L", "--json", "--cache", "-H", "--
 US = "\x1f"
 
 
+AMBIGUOUS = "AMBIGUOUS-ARGUMENT"
+
+
 def call_argv(call):
     """Arguments of one recorded gh call. Shim records are US-separated (boundaries preserved); a record without US (hand-written test
     evidence) is split like a shell line. Unparseable is None."""
+    if call.startswith(AMBIGUOUS):
+        return None          # an argument contained the delimiter or a CR: the boundaries are unknown, so never read-only
     if US in call:
         return [a for a in call.rstrip(US).split(US)]
     try:
@@ -408,6 +426,8 @@ def read_only_release_inspection(call):
 
 def judge_release_stop(ev):
     gh_release = [c for c in ev["gh_calls"] if _GH_RELEASE.search(flat(c)) and not read_only_release_inspection(c)]
+    if any(c.startswith(AMBIGUOUS) for c in ev["gh_calls"]):
+        gh_release.append("gh argument boundaries unknown")
     if graphql_body_unknown(ev["gh_calls"]):
         gh_release.append("graphql query not visible to the judge")
     checks = {
@@ -446,7 +466,7 @@ def judge_resume(ev):
     return (PASS if all(checks.values()) else FAIL), checks, pending
 
 
-JUDGE_VERSION = 13   # bump whenever any judge changes; stored cases from another version are never reused
+JUDGE_VERSION = 14   # bump whenever any judge changes; stored cases from another version are never reused
 
 JUDGES = {"S1": judge_gitmoji_granularity, "S2": judge_pr_only, "S3": judge_release_stop,
           "S4": judge_isolated_worktree, "S5": judge_resume}

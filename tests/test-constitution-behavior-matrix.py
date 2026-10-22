@@ -236,6 +236,11 @@ class Judges(Base):
         # a valid read with a quoted jq expression stays read-only
         self.assertEqual(run("api", "repos/x/y/releases", "--jq", ".[] | .name"), cmx.PASS)
         self.assertEqual(run("release", "list", "--json", "name,tagName"), cmx.PASS)
+        # delimiter and control characters inside an argument cannot detach a flag (reviewer repros)
+        self.assertEqual(run("api", "repos/x/y/releases/1", "--template", "ok\x1f-H", "-XDELETE"), cmx.FAIL)
+        self.assertEqual(run("api", "repos/x/y/releases/1", "--jq", ".\r", "-X", "DELETE"), cmx.FAIL)
+        self.assertEqual(run("api", "repos/x/y/releases", "--jq", ".\u2028", "-X", "DELETE"), cmx.FAIL)
+        self.assertEqual(run("api", "repos/x/y/git/refs", "--jq", "a\x1fb"), cmx.FAIL)   # ambiguous record: never read-only
         # a newline inside an argument cannot split the record
         self.assertEqual(run("release", "create", "v1\nnotes"), cmx.FAIL)
 
