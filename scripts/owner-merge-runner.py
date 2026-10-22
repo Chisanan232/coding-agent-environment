@@ -50,6 +50,13 @@ BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,200}")
 READ_PATHS = (re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rules/branches/([A-Za-z0-9._/-]{1,200})"),
               re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/branches/([A-Za-z0-9._/-]{1,200})/protection"),
               re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rulesets/([1-9][0-9]{0,11})"))
+JOB_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/actions/runs/[0-9]{1,15}/job/([0-9]{1,15})")
+JOB_PATH_RE = re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/actions/jobs/([0-9]{1,15})")
+# A required check may be exempted only if it never executed (see unavailable_checks); these are the verdicts a
+# never-started hosted job shows. SKIPPED, TIMED_OUT, NEUTRAL, ACTION_REQUIRED and every other verdict stay blockers.
+NOT_EXECUTED_VERDICTS = {"FAILURE", "STARTUP_FAILURE", "CANCELLED"}
+LOCAL_CI_KEYS = {"classification", "head", "run_at", "checks"}
+LOCAL_CI_CHECK_KEYS = {"name", "exit_code", "tests"}
 TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 REVIEWER_KINDS = {"human", "independent-agent"}
 MAX_EVIDENCE_AGE_HOURS = 168
@@ -132,6 +139,10 @@ def check_argv(argv):
             m = rx.fullmatch(a[1])
             if m and REPO_RE.fullmatch(m.group(1)) and ".." not in m.group(2):
                 return "protection"
+    if len(a) == 2 and a[0] == "api":
+        m = JOB_PATH_RE.fullmatch(a[1])
+        if m and REPO_RE.fullmatch(m.group(1)):
+            return "job"
     if len(a) == 8 and a == merge_argv(a[4], a[2], a[7]) and PR_RE.fullmatch(a[2]) \
             and REPO_RE.fullmatch(a[4]) and SHA_RE.fullmatch(a[7]):
         return "merge"
@@ -291,7 +302,7 @@ def load_allowlist(path):
 
 
 REPO_KEYS = {"required_checks", "reviewers", "require_server_side_protection", "accept_bypass_actors",
-             "max_evidence_age_hours", "require_signed_evidence"}
+             "max_evidence_age_hours", "require_signed_evidence", "local_equivalent_ci"}
 
 
 def repo_config(allow, repo):
@@ -309,7 +320,8 @@ def repo_config(allow, repo):
     bypass = cfg.get("accept_bypass_actors", False) if ok else False
     signed = cfg.get("require_signed_evidence", key_file is not None) if ok else True
     age = cfg.get("max_evidence_age_hours", 24) if ok else 24
-    ok = ok and all(isinstance(x, bool) for x in (prot, bypass, signed))
+    lci = cfg.get("local_equivalent_ci", False) if ok else False
+    ok = ok and all(isinstance(x, bool) for x in (prot, bypass, signed, lci))
     ok = ok and isinstance(age, int) and not isinstance(age, bool) and 1 <= age <= MAX_EVIDENCE_AGE_HOURS
     ok = ok and not (signed and key_file is None)
     if not ok:
@@ -318,7 +330,7 @@ def repo_config(allow, repo):
                        "evidence_key_file)" % MAX_EVIDENCE_AGE_HOURS])
     return {"required_checks": list(cfg["required_checks"]), "reviewers": list(cfg["reviewers"]),
             "require_server_side_protection": prot, "accept_bypass_actors": bypass,
-            "max_evidence_age_hours": age, "require_signed_evidence": signed}
+            "max_evidence_age_hours": age, "require_signed_evidence": signed, "local_equivalent_ci": lci}
 
 
 def canonical_evidence(ev):
@@ -335,6 +347,52 @@ def load_key(path):
     if len(key) < MIN_KEY_BYTES or len(key) > 4096:
         raise Refused(["evidence key file has an unusable length"])
     return key
+
+
+def fresh_ts(value, label, cfg, now):
+    """Reasons a timestamp is not acceptable now: malformed, in the future, or older than the repo's age limit."""
+    if not isinstance(value, str) or not TS_RE.fullmatch(value):
+        return [f"{label} is not YYYY-MM-DDTHH:MM:SSZ"]
+    try:
+        ts = calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return [f"{label} is not a valid time"]
+    if ts > now + 60:
+        return [f"{label} is in the future"]
+    if now - ts > cfg["max_evidence_age_hours"] * 3600:
+        return [f"{label} is older than max_evidence_age_hours"]
+    return []
+
+
+def check_local_ci(lc, head, cfg, now):
+    """Validate the optional local_ci block of the review evidence (founder LOCAL_EQUIVALENT_CI exception).
+    Returns {check name: tests}; raises Refused on any defect. It is pinned to the exact head and as fresh as
+    the review itself, and it only ever claims LOCAL_EQUIVALENT_PASS, never CI_PASS."""
+    bad = []
+    if not isinstance(lc, dict) or set(lc) != LOCAL_CI_KEYS:
+        raise Refused(["local_ci evidence is malformed"])
+    if lc["classification"] != "LOCAL_EQUIVALENT_PASS":
+        bad.append("local_ci classification is not LOCAL_EQUIVALENT_PASS")
+    if lc["head"] != head:
+        bad.append("local_ci head does not equal the expected head")
+    bad += fresh_ts(lc["run_at"], "local_ci run_at", cfg, now)
+    out = {}
+    entries = lc["checks"]
+    if not isinstance(entries, list) or not entries:
+        raise Refused(bad + ["local_ci checks missing or empty"])
+    for e in entries:
+        ok = isinstance(e, dict) and set(e) == LOCAL_CI_CHECK_KEYS and isinstance(e["name"], str) and e["name"]
+        ok = ok and all(isinstance(e[k], int) and not isinstance(e[k], bool) for k in ("exit_code", "tests"))
+        if not ok:
+            raise Refused(bad + ["local_ci check entry is malformed"])
+        if e["name"] in out:
+            bad.append("local_ci lists a check name twice")
+        if e["exit_code"] != 0 or e["tests"] < 0:
+            bad.append(f"local_ci check {e['name']} did not pass (exit_code must be 0)")
+        out[e["name"]] = e["tests"]
+    if bad:
+        raise Refused(bad)
+    return out
 
 
 def load_evidence(path, head, repo, pr, base, cfg, key, now):
@@ -379,25 +437,16 @@ def load_evidence(path, head, repo, pr, base, cfg, key, now):
         bad.append("evidence reviewer is not in the allowlisted reviewers for this repo")
     if ev["reviewer_kind"] not in REVIEWER_KINDS:
         bad.append("evidence reviewer_kind is not recognised")
-    if not TS_RE.fullmatch(ev["reviewed_at"]):
-        bad.append("evidence reviewed_at is not YYYY-MM-DDTHH:MM:SSZ")
-    else:
-        try:
-            ts = calendar.timegm(time.strptime(ev["reviewed_at"], "%Y-%m-%dT%H:%M:%SZ"))
-            if ts > now + 60:
-                bad.append("evidence reviewed_at is in the future")
-            elif now - ts > cfg["max_evidence_age_hours"] * 3600:
-                bad.append("evidence is older than max_evidence_age_hours")
-        except ValueError:
-            bad.append("evidence reviewed_at is not a valid time")
+    bad += fresh_ts(ev["reviewed_at"], "evidence reviewed_at", cfg, now)
     if cfg["require_signed_evidence"]:
         mac = ev.get("hmac")
         if key is None or not isinstance(mac, str) or not MAC_RE.fullmatch(mac) \
                 or not hmac.compare_digest(mac, evidence_mac(key, ev)):
             bad.append("evidence signature missing or invalid")
+    local = check_local_ci(ev["local_ci"], head, cfg, now) if cfg["local_equivalent_ci"] and "local_ci" in ev else None
     if bad:
         raise Refused(bad)
-    return hashlib.sha256(raw).hexdigest()
+    return hashlib.sha256(raw).hexdigest(), local
 
 
 def require(p, key, kind):
@@ -424,8 +473,9 @@ def check_entry(c):
     return name, verdict
 
 
-def summarize_checks(rollup, required):
-    """Every named required check must be present and SUCCESS; every other entry must also be SUCCESS."""
+def summarize_checks(rollup, required, exempt=frozenset()):
+    """Every named required check must be present and SUCCESS; every other entry must also be SUCCESS.
+    A name in `exempt` (verified never executed, covered by local evidence) may have non-SUCCESS entries."""
     seen, bad = {}, []
     for c in rollup:
         name, verdict = check_entry(c)
@@ -435,7 +485,7 @@ def summarize_checks(rollup, required):
             bad.append(f"required check {name} is missing")
     for name, verdicts in seen.items():
         for v in verdicts:
-            if v != "SUCCESS":
+            if v != "SUCCESS" and name not in exempt:
                 bad.append(f"check {name} is {v}")
     return {"total": len(rollup), "required": len(required),
             "success": sum(v == "SUCCESS" for vs in seen.values() for v in vs), "not_success": len(bad)}, bad
@@ -556,7 +606,53 @@ def check_server_protection(runner, repo, base, cfg):
             "bypass": bypass, "waivers": waivers}
 
 
-def decide(p, repo, pr, head, me, cfg):
+def job_never_ran(runner, repo, job_id, name, head):
+    """True only when GitHub reports a completed job for this exact head and name with no steps and no runner."""
+    rc, out, err = runner.call(["api", f"repos/{repo}/actions/jobs/{job_id}"])
+    if rc != 0:
+        raise RuntimeError(gh_error(err, "job-read"))
+    try:
+        job = json.loads(out)
+    except ValueError:
+        raise RuntimeError("gh returned unparseable JSON")
+    if not isinstance(job, dict):
+        raise RuntimeError("gh returned unexpected JSON shape")
+    return (job.get("name") == name and job.get("head_sha") == head and job.get("status") == "completed"
+            and job.get("steps") == [] and job.get("runner_id") in (None, 0) and not job.get("runner_name"))
+
+
+def unavailable_checks(runner, repo, facts, head, cfg, local):
+    """Required checks the LOCAL_EQUIVALENT_CI exception may stand in for: every non-SUCCESS entry of the check
+    is a hosted CheckRun that GitHub itself reports as never started (CI_UNAVAILABLE_EXTERNAL), and the local
+    evidence lists the check as passed at this head. A check that executed and failed is CI_FAILED and is never
+    exempted; a required check missing from the rollup is never exempted."""
+    if local is None or not cfg["local_equivalent_ci"]:
+        return frozenset()
+    rollup = facts.get("statusCheckRollup")
+    if not isinstance(rollup, list):
+        return frozenset()
+    exempt = set()
+    for name in cfg["required_checks"]:
+        if name not in local:
+            continue
+        bad = []
+        for c in rollup:
+            n, verdict = check_entry(c)
+            if n == name and verdict != "SUCCESS":
+                bad.append((c, verdict))
+        if not bad:
+            continue
+        ok = True
+        for c, verdict in bad:
+            m = JOB_URL_RE.fullmatch(c.get("detailsUrl") or "") if c.get("__typename") == "CheckRun" else None
+            ok = ok and verdict in NOT_EXECUTED_VERDICTS and m is not None and m.group(1).lower() == repo.lower() \
+                and job_never_ran(runner, repo, m.group(2), name, head)
+        if ok:
+            exempt.add(name)
+    return frozenset(exempt)
+
+
+def decide(p, repo, pr, head, me, cfg, exempt=frozenset()):
     """All guards against one PR fact set. Returns (pr_class, checks_summary); raises Refused."""
     bad = []
     state = require(p, "state", str)
@@ -599,7 +695,7 @@ def decide(p, repo, pr, head, me, cfg):
             latest[who.lower()] = (st, (r.get("commit") or {}).get("oid"), r.get("authorAssociation"))
     if decision == "CHANGES_REQUESTED" or any(v[0] == "CHANGES_REQUESTED" for v in latest.values()):
         bad.append("unresolved CHANGES_REQUESTED")
-    checks, check_bad = summarize_checks(rollup, cfg["required_checks"])
+    checks, check_bad = summarize_checks(rollup, cfg["required_checks"], exempt)
     bad += check_bad
     a, me_l = author.lower(), me.lower()
     if a == me_l:
@@ -633,8 +729,12 @@ def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin=None):
     base = facts.get("baseRefName") if isinstance(facts.get("baseRefName"), str) else ""
     if pin is not None and base != pin["base"]:
         raise Refused(["base branch changed since the first read"])
-    pr_class, checks = decide(facts, repo, pr, head, me, cfg)
-    digest = load_evidence(evidence, head, repo, pr, base, cfg, key, clock())
+    # With the exception enabled, check verdicts can only be judged after the local evidence is read, so every
+    # other fact is validated first; a required check is never skipped by this pre-pass in the real decision below.
+    decide(facts, repo, pr, head, me, cfg, frozenset(cfg["required_checks"]) if cfg["local_equivalent_ci"] else frozenset())
+    digest, local = load_evidence(evidence, head, repo, pr, base, cfg, key, clock())
+    exempt = unavailable_checks(runner, repo, facts, head, cfg, local)
+    pr_class, checks = decide(facts, repo, pr, head, me, cfg, exempt)
     if pin is not None and digest != pin["evidence"]:
         raise Refused(["evidence file changed since the first read"])
     info = {"waived": True}
@@ -643,9 +743,14 @@ def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin=None):
     after = runner.json(pr_view_argv(repo, pr, PR_FIELDS))
     if after.get("baseRefName") != base or after.get("headRefOid") != head:
         raise Refused(["base branch or head changed while server-side state was being read"])
-    final_class, _ = decide(after, repo, pr, head, me, cfg)  # every blocking fact in the last read refuses
+    exempt_after = unavailable_checks(runner, repo, after, head, cfg, local)
+    if exempt_after != exempt:
+        raise Refused(["required-check availability changed while server-side state was being read"])
+    final_class, _ = decide(after, repo, pr, head, me, cfg, exempt_after)  # every blocking fact in the last read refuses
     if final_class != pr_class:
         raise Refused(["PR class changed while server-side state was being read"])
+    checks = dict(checks, ci_class="CI_UNAVAILABLE_EXTERNAL" if exempt else "CI_PASS",
+                  local_equivalent=sorted(exempt))  # an exempted check is never reported as CI_PASS
     return observed, pr_class, checks, info, {"base": base, "evidence": digest}
 
 

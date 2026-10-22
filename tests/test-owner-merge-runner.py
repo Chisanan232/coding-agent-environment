@@ -64,7 +64,7 @@ def base_pr(**over):
 
 class FakeGh:
     def __init__(self, pr=None, merge_rc=0, merge_err="", merged=True, later=None, user=ME,
-                 rules=None, protection=(1, "HTTP 404: Not Found"), ruleset=None):
+                 rules=None, protection=(1, "HTTP 404: Not Found"), ruleset=None, jobs=None):
         self.pr = pr if pr is not None else base_pr()
         self.merge_rc, self.merge_err, self.merged = merge_rc, merge_err, merged
         self.later = later  # PR facts returned from the second full fetch (the pre-exec re-check) on
@@ -72,6 +72,7 @@ class FakeGh:
         self.rules = server_rules() if rules is None else rules
         self.ruleset = (0, json.dumps({"id": 11, "bypass_actors": []})) if ruleset is None else ruleset
         self.protection = protection  # (rc, stdout-or-stderr) for the branch-protection read
+        self.jobs = jobs if jobs is not None else {}  # job id -> (rc, job dict); a callable is invoked per read
         self.fetches = 0
         self.readback_base = None
         self.overrides = {}  # fetch number -> PR facts for that single PR-facts read
@@ -99,6 +100,10 @@ class FakeGh:
                     return 0, json.dumps({"state": "MERGED", "mergeCommit": {"oid": MERGE_SHA},
                                           "baseRefName": self.readback_base or self.pr["baseRefName"]}), ""
                 return 0, json.dumps({"state": "OPEN", "mergeCommit": None, "baseRefName": self.pr["baseRefName"]}), ""
+        if argv[0] == "api" and "/actions/jobs/" in argv[1]:
+            job = self.jobs[argv[1].rsplit("/", 1)[1]]
+            rc, body = job() if callable(job) else job
+            return (0, json.dumps(body), "") if rc == 0 else (1, "", "HTTP 500")
         if argv[0] == "api" and "/rulesets/" in argv[1]:
             if self.on_ruleset:
                 self.on_ruleset()
@@ -1442,6 +1447,189 @@ class ArgvFixedness(Base):
             rc = omr.main(["--repo", REPO, "--pr", "7", "--expect-head", HEAD, "--review-evidence", str(self.evidence),
                        "--dry-run"], gh=gh, allowlist=str(self.allow), audit=str(self.audit), clock=lambda: NOW)
         self.assertEqual(rc, omr.EXIT_OK)
+
+
+JOB_ID = "99"
+
+
+def never_ran(**over):
+    job = {"name": "ci", "head_sha": HEAD, "status": "completed", "conclusion": "failure", "steps": [],
+           "runner_id": 0, "runner_name": ""}
+    job.update(over)
+    return (0, job)
+
+
+def unavailable(verdict="FAILURE", url=None, name="ci"):
+    return [{"__typename": "CheckRun", "name": name, "status": "COMPLETED", "conclusion": verdict,
+             "detailsUrl": f"https://github.com/{REPO}/actions/runs/5/job/{JOB_ID}" if url is None else url},
+            {"__typename": "StatusContext", "context": "SonarCloud Code Analysis", "state": "SUCCESS"}]
+
+
+class LocalEquivalentCi(Base):
+    """Founder LOCAL_EQUIVALENT_CI exception: only for required checks GitHub reports as never started, covered
+    by pinned local evidence. An executed failure (CI_FAILED) is never bypassed."""
+
+    LOCAL = {"classification": "LOCAL_EQUIVALENT_PASS", "head": HEAD, "run_at": "2026-10-20T11:00:00Z",
+             "checks": [{"name": "ci", "exit_code": 0, "tests": 12}]}
+
+    def setUp(self):
+        super().setUp()
+        self.enable()
+
+    def enable(self, on=True, **local_over):
+        self.allow.write_text(json.dumps(allow_doc(local_equivalent_ci=on)))
+        local = dict(self.LOCAL, **local_over)
+        for k in [k for k, v in local.items() if v is DROP]:
+            del local[k]
+        self.write_evidence(local_ci=local)
+
+    def gh(self, rollup=None, job=None, **kw):
+        return FakeGh(base_pr(statusCheckRollup=rollup if rollup is not None else unavailable()),
+                      jobs={JOB_ID: job or never_ran()}, **kw)
+
+    def test_never_started_job_with_local_evidence_is_approved_and_not_labelled_ci_pass(self):
+        gh = self.gh()
+        code, rec = self.go(gh, dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+        self.assertEqual(rec["checks"]["ci_class"], "CI_UNAVAILABLE_EXTERNAL")
+        self.assertEqual(rec["checks"]["local_equivalent"], ["ci"])
+
+    def test_green_ci_stays_ci_pass(self):
+        code, rec = self.go(FakeGh(), dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+        self.assertEqual((rec["checks"]["ci_class"], rec["checks"]["local_equivalent"]), ("CI_PASS", []))
+
+    def test_real_merge_runs_once_and_audit_records_the_exception(self):
+        gh = self.gh()
+        code, rec = self.go(gh)
+        self.assertEqual((code, rec["outcome"]), (omr.EXIT_OK, "MERGED"), rec)
+        self.assertEqual(len(gh.merges()), 1)
+        self.assertEqual(self.records()[0]["checks"]["ci_class"], "CI_UNAVAILABLE_EXTERNAL")  # the PENDING record
+
+    def test_disabled_in_allowlist_refuses(self):
+        self.enable(on=False)
+        self.assertRefused(self.gh(), "check ci is FAILURE")
+
+    def test_no_local_ci_block_refuses(self):
+        self.write_evidence()
+        self.assertRefused(self.gh(), "check ci is FAILURE")
+
+    def test_executed_failure_is_never_exempted(self):
+        for job in (never_ran(steps=[{"name": "run tests"}]), never_ran(runner_id=17), never_ran(runner_name="GitHub Actions 3"),
+                    never_ran(head_sha=OTHER), never_ran(name="other"), never_ran(status="in_progress"),
+                    (0, {"name": "ci"})):
+            with self.subTest(job=job):
+                self.assertRefused(self.gh(job=job), "check ci is FAILURE")
+
+    def test_only_not_started_verdicts_qualify(self):
+        for verdict in ("TIMED_OUT", "SKIPPED", "NEUTRAL", "ACTION_REQUIRED", "IN_PROGRESS", "QUEUED"):
+            with self.subTest(verdict=verdict):
+                self.assertRefused(self.gh(rollup=unavailable(verdict)), f"check ci is {verdict}")
+        for verdict in ("FAILURE", "STARTUP_FAILURE", "CANCELLED"):
+            with self.subTest(verdict=verdict):
+                code, rec = self.go(self.gh(rollup=unavailable(verdict)), dry=True)
+                self.assertEqual(code, omr.EXIT_OK, rec)
+
+    def test_details_url_must_be_a_job_of_this_repo(self):
+        for url in (None, "", "https://github.com/other/repo/actions/runs/5/job/99",
+                    f"https://github.com/{REPO}/actions/runs/5", f"https://evil.example/{REPO}/actions/runs/5/job/99",
+                    f"https://github.com/{REPO}/actions/runs/5/job/99/../1", f"https://github.com/{REPO}/actions/runs/5/job/99?x=1"):
+            with self.subTest(url=url):
+                roll = unavailable(url="" if url is None else url)
+                if url is None:
+                    del roll[0]["detailsUrl"]
+                self.assertRefused(self.gh(rollup=roll, job=never_ran()), "check ci is FAILURE")
+
+    def test_status_context_is_never_exempted(self):
+        roll = [{"__typename": "StatusContext", "context": "ci", "state": "FAILURE"}, unavailable()[1]]
+        self.assertRefused(self.gh(rollup=roll), "check ci is FAILURE")
+
+    def test_local_evidence_must_pass_at_this_head_and_be_fresh(self):
+        cases = {"exit": dict(checks=[{"name": "ci", "exit_code": 1, "tests": 12}]),
+                 "bool exit": dict(checks=[{"name": "ci", "exit_code": False, "tests": 1}]),
+                 "head": dict(head=OTHER), "class": dict(classification="CI_PASS"),
+                 "stale": dict(run_at="2026-10-01T00:00:00Z"), "future": dict(run_at="2026-10-21T00:00:00Z"),
+                 "bad time": dict(run_at="yesterday"), "other check": dict(checks=[{"name": "lint", "exit_code": 0, "tests": 1}]),
+                 "dup": dict(checks=[{"name": "ci", "exit_code": 0, "tests": 1}] * 2),
+                 "empty": dict(checks=[]), "extra key": dict(note="x"), "missing key": dict(run_at=DROP),
+                 "entry extra": dict(checks=[{"name": "ci", "exit_code": 0, "tests": 1, "x": 1}]),
+                 "neg tests": dict(checks=[{"name": "ci", "exit_code": 0, "tests": -1}])}
+        for label, over in cases.items():
+            with self.subTest(label):
+                self.enable(**over)
+                code, rec = self.go(self.gh())
+                self.assertNotEqual(code, omr.EXIT_OK, rec)
+                self.assertTrue(code == omr.EXIT_REFUSED, rec)
+
+    def test_missing_required_check_is_never_exempted(self):
+        self.assertRefused(self.gh(rollup=[unavailable()[1]]), "required check ci is missing")
+
+    def test_unrelated_or_unlisted_failures_still_block(self):
+        roll = unavailable() + [{"__typename": "CheckRun", "name": "gitleaks", "status": "COMPLETED", "conclusion": "FAILURE",
+                                 "detailsUrl": f"https://github.com/{REPO}/actions/runs/5/job/98"}]
+        self.assertRefused(self.gh(rollup=roll, job=never_ran()), "check gitleaks is FAILURE")
+
+    def test_one_executed_duplicate_of_the_check_blocks_the_whole_check(self):
+        roll = unavailable() + [{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "FAILURE",
+                                 "detailsUrl": f"https://github.com/{REPO}/actions/runs/6/job/98"}]
+        gh = FakeGh(base_pr(statusCheckRollup=roll), jobs={JOB_ID: never_ran(), "98": never_ran(steps=[{"name": "t"}])})
+        self.assertRefused(gh, "check ci is FAILURE")
+
+    def test_job_read_failure_or_odd_shape_is_an_error_and_never_merges(self):
+        for job in ((1, None), (0, ["x"])):
+            with self.subTest(job=job):
+                gh = self.gh(job=job)
+                code, rec = self.go(gh)
+                self.assertEqual(code, omr.EXIT_ERROR, rec)
+                self.assertEqual(gh.merges(), [])
+
+    def test_job_state_change_between_passes_refuses(self):
+        state = {"n": 0}
+
+        def flip():
+            state["n"] += 1
+            return never_ran() if state["n"] <= 1 else never_ran(steps=[{"name": "run tests"}])
+
+        gh = self.gh(job=flip)
+        code, rec = self.go(gh)
+        self.assertEqual(code, omr.EXIT_REFUSED, rec)
+        self.assertEqual(gh.merges(), [])
+
+    def test_exception_does_not_relax_review_or_other_guards(self):
+        self.write_evidence(local_ci=dict(self.LOCAL), verdict="FAIL")
+        self.assertRefused(self.gh(), "verdict is not PASS")
+        self.enable()
+        self.assertRefused(FakeGh(base_pr(statusCheckRollup=unavailable(), isDraft=True), jobs={JOB_ID: never_ran()}), "draft")
+        self.assertRefused(FakeGh(base_pr(statusCheckRollup=unavailable(), mergeStateStatus="BLOCKED"),
+                                  jobs={JOB_ID: never_ran()}), "mergeStateStatus")
+
+    def test_signed_evidence_covers_the_local_block(self):
+        key = self.tmp_real / "k"
+        key.write_bytes(b"k" * 40)
+        key.chmod(0o600)
+        doc = allow_doc(local_equivalent_ci=True, require_signed_evidence=True)
+        doc["evidence_key_file"] = str(key)
+        self.allow.write_text(json.dumps(doc))
+        ev = json.loads(self.evidence.read_text())
+        ev["hmac"] = omr.evidence_mac(b"k" * 40, ev)
+        self.evidence.write_text(json.dumps(ev))
+        code, rec = self.go(self.gh(), dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+        ev["local_ci"]["checks"][0]["tests"] = 13  # tampering after signing
+        self.evidence.write_text(json.dumps(ev))
+        self.assertRefused(self.gh(), "signature")
+
+    def test_invalid_config_value_is_refused(self):
+        self.allow.write_text(json.dumps(allow_doc(local_equivalent_ci="yes")))
+        self.assertRefused(self.gh(), "allowlist config")
+
+    def test_check_argv_job_shape(self):
+        self.assertEqual(omr.check_argv(["api", f"repos/{REPO}/actions/jobs/99"]), "job")
+        for bad in (["api", f"repos/{REPO}/actions/jobs/9x"], ["api", f"repos/{REPO}/actions/jobs/99/logs"],
+                    ["api", "repos/../x/actions/jobs/99"], ["api", f"repos/{REPO}/actions/jobs/99", "-X", "POST"],
+                    ["api", "-X", "POST", f"repos/{REPO}/actions/jobs/99"]):
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                omr.check_argv(bad)
 
 
 if __name__ == "__main__":

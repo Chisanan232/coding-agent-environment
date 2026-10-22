@@ -339,3 +339,28 @@ invoked exactly as `/Users/bryant/.claude/bin/owner-merge-runner --repo OWNER/NA
 1. Evidence independence (P1-3), not closed by this runner. Options: (a) accept same-user evidence as tamper-evident only (the position today); (b) a required review, check or status from a second identity (another human or a GitHub App) that the runner reads back from GitHub, which needs a runner change; (c) verification of evidence by a separate trusted process or OS user that holds the key and returns only a verdict, so the merging user never holds the key (needs a runner change and a service boundary). Until one is chosen, nothing here claims independent review.
 2. Whether to waive per repo: `accept_bypass_actors`, `require_server_side_protection`, `require_signed_evidence`. The defaults refuse; waivers are visible in the audit record.
 3. The host allow rule from this section (unmeasured until verified with `scripts/permission-host-matrix.py`).
+
+## 9. LOCAL_EQUIVALENT_CI exception (founder policy 2026-10-22)
+
+Policy text lives once, in `docs/ENGINEERING-POLICY.md` section 8. This section only describes how the runner enforces it.
+
+Off by default. Per repository, the owner sets `"local_equivalent_ci": true` in the allowlist. It does **not** relax server-side protection, the review evidence, the author/class rules, mergeability, the audit trail or any other guard.
+
+A required check is exempted only when all of these hold, re-evaluated on both passes and on the final read:
+
+1. Every non-SUCCESS rollup entry of that check is a hosted `CheckRun` with verdict `FAILURE`, `STARTUP_FAILURE` or `CANCELLED` (not `TIMED_OUT`, `SKIPPED`, `NEUTRAL`, `ACTION_REQUIRED`, pending, or a status context).
+2. Its `detailsUrl` is a job URL of this same repository, and `gh api repos/R/actions/jobs/ID` reports for that job: the same name, `head_sha` equal to the expected head, `status` completed, **no steps**, and **no runner** (`runner_id` null or 0, empty `runner_name`). That is GitHub's own statement that the job never executed, as opposed to a test failure (`CI_FAILED`, never bypassed).
+3. The review evidence carries a `local_ci` block that lists the check with `exit_code` 0, pinned to the same head, fresh within `max_evidence_age_hours`, classification `LOCAL_EQUIVALENT_PASS`. The block is covered by the evidence HMAC when signing is configured. Exact key sets; duplicates, booleans, extra keys refuse.
+
+```json
+"local_ci": {"classification": "LOCAL_EQUIVALENT_PASS", "head": "<40-hex head>", "run_at": "2026-10-22T10:00:00Z",
+             "checks": [{"name": "isolated-validation", "exit_code": 0, "tests": 125}]}
+```
+
+A required check missing from the rollup, a failing check that is not required, an executed failure, a malformed or stale block, a job read that fails, or a job that changes between reads all refuse (or error); nothing merges. The audit record carries `checks.ci_class` (`CI_PASS` only when nothing was exempted, else `CI_UNAVAILABLE_EXTERNAL`) and `checks.local_equivalent` (the exempted names): an exempted check is never reported as passed hosted CI.
+
+Not closed, stated plainly:
+- The runner cannot tell a billing or quota cause from any other reason a job never started; it verifies "never executed", and the founder policy's "verified billing or quota restriction" remains the person's attestation in the evidence.
+- The job-shape condition (`steps: []`, no runner) is not yet observed against a real billing outage; until it is, it is `NOT_VERIFIED` against reality and only unit-tested with a fake `gh`.
+- The local evidence has the same same-user forgeability as the review evidence (section 8, residuals).
+- If the base branch has server-side required checks, GitHub itself blocks the merge while the check is unavailable; the runner does not and must not change that.
