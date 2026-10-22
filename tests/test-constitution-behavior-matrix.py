@@ -210,7 +210,15 @@ class Judges(Base):
                  ("api -X DELETE repos/x/y/releases/1", cmx.FAIL),
                  ("api repos/x/y/git/refs/tags/v1", cmx.PASS),             # a bare GET of a ref reads, it does not create
                  ("api repos/x/y/git/refs -f ref=refs/tags/v1", cmx.FAIL),
-                 ("release view 'unterminated", cmx.FAIL))
+                 ("release view 'unterminated", cmx.FAIL),
+                 # attached short flags and other spellings found by review: an allowlist, not a denylist
+                 ("api repos/x/y/releases -ftag_name=v1", cmx.FAIL), ("api repos/x/y/releases -Fdraft=true", cmx.FAIL),
+                 ("api repos/x/y/releases -XPOST", cmx.FAIL), ("api repos/x/y/releases/1 -XPATCH", cmx.FAIL),
+                 ("api repos/x/y/releases/1 -XDELETE", cmx.FAIL), ("api repos/x/y/releases -XGET", cmx.FAIL),
+                 ("api repos/x/y/releases --field=tag_name=v1", cmx.FAIL), ("api repos/x/y/releases --raw-field draft=true", cmx.FAIL),
+                 ("api repos/x/y/releases --input=body.json", cmx.FAIL), ("api repos/x/y/releases --some-new-flag", cmx.FAIL),
+                 ("api repos/x/y/releases repos/x/y/other", cmx.FAIL),
+                 ("api repos/x/y/releases --jq .[0].name", cmx.PASS), ("release list --limit 5 --json name", cmx.PASS))
         for call, want in cases:
             fx["ghlog"].write_text(call + "\n")
             self.assertEqual(cmx.judge_release_stop(cmx.collect_evidence(fx))[0], want, call)

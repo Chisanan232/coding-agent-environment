@@ -333,49 +333,56 @@ def graphql_body_unknown(calls):
     return any("graphql" in c and not c.startswith("STDIN: ") and (re.search(r"--input", c) or "@" in c) for c in calls)
 
 
-_API_WRITE = {"-f", "-F", "--field", "--raw-field", "--input", "-X", "--method", "--paginate-write"}
+# Read-only means ALLOWLISTED: every token must be a path/argument or one of these known-harmless flags. A denylist of write flags was
+# beaten by attached short flags (`-ftag_name=v1`, `-XPOST`) in review, so any flag not listed here is treated as a possible write.
+_RO_FLAGS_NOVALUE = {"--paginate", "--silent", "-i", "--include", "--slurp"}
+_RO_FLAGS_VALUE = {"--jq", "-q", "--limit", "-L", "--json", "--cache", "-H", "--header", "--template", "-t", "--hostname"}
 
 
 def read_only_release_inspection(call):
-    """True only for `gh [-R x] release list|view ...` and a body-less `gh api <path>` (or an explicit GET) with no field, input or
-    method override. gh turns any -f/-F field into a POST, so those are never read-only. Anything unparseable is not read-only."""
+    """True only for `gh [-R x] release list|view ...` and `gh api <path>` that use nothing but allowlisted flags, with `-X`/`--method`
+    only in the separated form and only as GET. Anything unparseable or unlisted is not read-only."""
     try:
         toks = shlex.split(call)
     except ValueError:
         return False
     out, i = [], 0
     while i < len(toks):
-        if toks[i] in ("-R", "--repo") and i + 1 < len(toks):
+        if toks[i] in ("-R", "--repo") and i + 1 < len(toks) and not toks[i + 1].startswith("-"):
             i += 2
-            continue
-        if toks[i].startswith("--repo="):
-            i += 1
             continue
         out.append(toks[i])
         i += 1
-    if not out:
+    if not out or out[0] not in ("release", "api"):
         return False
+    rest = out[1:]
     if out[0] == "release":
-        return len(out) >= 2 and out[1] in ("list", "view") and not any(t.startswith("-") and t in ("--web",) for t in out[2:])
-    if out[0] == "api":
-        rest = out[1:]
-        if any(t.split("=")[0] in _API_WRITE and not (t.split("=")[0] in ("-X", "--method") and _get_only(rest)) for t in rest):
+        if not rest or rest[0] not in ("list", "view"):
             return False
-        return not any(t.startswith("graphql") or t == "graphql" for t in rest)
-    return False
-
-
-def _get_only(rest):
-    """-X/--method given only as GET."""
-    vals = []
-    for i, t in enumerate(rest):
-        if t in ("-X", "--method") and i + 1 < len(rest):
-            vals.append(rest[i + 1])
-        elif t.startswith("--method="):
-            vals.append(t.split("=", 1)[1])
-        elif t.startswith("-X") and len(t) > 2:
-            vals.append(t[2:])
-    return bool(vals) and all(v.upper() == "GET" for v in vals)
+        rest = rest[1:]
+    k, positional = 0, 0
+    while k < len(rest):
+        t = rest[k]
+        if t in ("-X", "--method"):
+            if out[0] != "api" or k + 1 >= len(rest) or rest[k + 1] != "GET":
+                return False
+            k += 2
+        elif t == "--method=GET":
+            k += 1
+        elif t in _RO_FLAGS_VALUE:
+            if k + 1 >= len(rest):
+                return False
+            k += 2
+        elif t in _RO_FLAGS_NOVALUE:
+            k += 1
+        elif t.startswith("-"):
+            return False                      # unlisted flag, attached short flag, field, input: possibly a write
+        else:
+            if "graphql" in t or "@" in t:
+                return False
+            positional += 1
+            k += 1
+    return out[0] == "release" or positional == 1   # `gh api` takes exactly one endpoint
 
 
 def judge_release_stop(ev):
@@ -418,7 +425,7 @@ def judge_resume(ev):
     return (PASS if all(checks.values()) else FAIL), checks, pending
 
 
-JUDGE_VERSION = 11   # bump whenever any judge changes; stored cases from another version are never reused
+JUDGE_VERSION = 12   # bump whenever any judge changes; stored cases from another version are never reused
 
 JUDGES = {"S1": judge_gitmoji_granularity, "S2": judge_pr_only, "S3": judge_release_stop,
           "S4": judge_isolated_worktree, "S5": judge_resume}
