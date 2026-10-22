@@ -1,6 +1,6 @@
 # Owner PR merge autonomy (SPE-118)
 
-Status: **design record and real-host measurement. The narrow-allow rule block in section 2 is NOT recommended for deployment as it stands.** Independent review found a new way past a trailing-wildcard allow in each of eight consecutive rounds (section 2, Residual), the host's matching rules were only learned by measuring them, and the remaining holes cannot be closed with glob rules. The decision for the owner is in section 6. Not live; nothing here edits live settings.
+Status: **Option A selected by the founder: a structurally validated merge runner (`scripts/owner-merge-runner.py`) is implemented and unit-tested. It is NOT deployed and NOT live-validated; no live setting was changed and the runner has never been run against a real PR.** The glob-only allow block in section 2 is **NOT RECOMMENDED** and is not to be deployed: independent review found a new way past a trailing-wildcard allow in each of eight consecutive rounds (section 2, Residual), the host's matching rules were only learned by measuring them, and the remaining holes cannot be closed with glob rules. The runner and its still-open owner step are in section 8.
 
 ## 1. Blocking layer (measured, not assumed)
 
@@ -23,7 +23,7 @@ Evidence (`1,814` recorded `gh pr merge` calls):
 
 Conclusion: the block is the built-in classifier, reached only because the command shape missed the allow rule. The current broad allow `Bash(gh pr merge:*)` makes the outcome depend on shape, and also lets `--admin` and `--squash` through unreviewed. Only hard_deny #0 is unconditional; the merge rules are soft_deny and are overridable by an allow rule or explicit user intent.
 
-## 2. Smallest supported fix
+## 2. Smallest supported fix (glob-only allow: NOT RECOMMENDED, superseded by section 8)
 
 One standard form, emitted by the gate (`scripts/owner-merge-gate.py check`), run as a single simple command:
 
@@ -240,7 +240,7 @@ A trailing-wildcard allow cannot say "exactly these tokens", so safety rests on 
 
 These are accepted-or-not decisions for the owner, not defects to keep patching. If they are not acceptable, do not apply the narrow allow; use the validating runner below or keep the `!` fallback.
 
-The stronger design is a merge runner that re-validates the exact argument vector (40-hex pin, repository, PR number, `merge` strategy only) and the gate verdict in code before running `gh pr merge`, with the allow rule covering that program only. It moves the bypass surface into code that can be tested exhaustively. It is **not built here**: ADR 0013 makes the gate read-only and never-merging, and an allow rule over a merge-executing program is a policy change for the owner to decide, not an implementation detail. Until then the supported fallback is unchanged: if the host asks or denies, the owner runs the printed command with the `!` prefix.
+The stronger design is a merge runner that re-validates the exact argument vector (40-hex pin, repository, PR number, `merge` strategy only) and the gate verdict in code before running `gh pr merge`, with the allow rule covering that program only. It moves the bypass surface into code that can be tested exhaustively. It is now built (section 8). ADR 0013 still makes the gate itself read-only and never-merging; the runner is a separate program, and an allow rule over a merge-executing program is a policy change that only the owner applies. Until that rule is applied and verified the supported fallback is unchanged: if the host asks or denies, the owner runs the printed command with the `!` prefix.
 
 The list of holes is open-ended, not just the four above. Reviews also reproduced, against allows that take a body or attachments: `gh pr comment ... --attach ./private.png` (local upload), a short-flag cluster such as `gh pr create ... -dF./private.txt` (draft plus body file), a quoted long flag such as `gh pr edit ... --bo""dy-file ./private.txt`, and local-file exfiltration through command substitution inside an inline body (`--body "$(cat file)"`), which today's broad `gh pr *` allow already permits. Conversely, asks that fire on flag text also fire on prose: a comment body that contains `-h` or `--approve` as words asks. Each fix to one class made another instance appear; this is the review-loop circuit breaker of `docs/ENGINEERING-CONSTITUTION.md`, so the instances are not patched further and the architectural options are presented instead.
 
@@ -275,13 +275,55 @@ The merge gate (`scripts/owner-merge-gate.py`) is deterministic when it is run, 
 
 | Option | What it is | Cost and limits |
 |---|---|---|
-| A. Validating merge runner (recommended) | A small program that re-checks the exact argument vector (40-hex pin, repository, PR number, merge strategy only) and the gate verdict, then runs `gh pr merge`; the allow rule covers that program only | Moves the bypass surface into code that can be tested exhaustively. A policy change: ADR 0013 makes the gate read-only and non-merging, and an allow rule over a merge-executing program must be the owner's decision. Not built here |
+| A. Validating merge runner (SELECTED by the founder; implemented, not deployed) | A small program that re-checks the exact argument vector (40-hex pin, repository, PR number, merge strategy only) and the gate verdict, then runs `gh pr merge`; the allow rule covers that program only | Moves the bypass surface into code that can be tested exhaustively. A policy change: ADR 0013 makes the gate read-only and non-merging, and an allow rule over a merge-executing program must be the owner's decision. Built in section 8; the allow rule is still an owner step |
 | B. PreToolUse hook | A hook that receives the Bash command as an unexpanded string (the documented PreToolUse input; it does not see the resolved argument vector) and approves only the exact pinned shape, rejecting any expansion, quoting or escape syntax rather than interpreting it | Same property as A without a new executable; whether a hook's allow bypasses the classifier is untested |
 | C. Keep the per-merge `!` run | The agent prints the pinned command; the owner runs it with the `!` prefix | No new exposure; one owner action per merge. This is the current supported fallback |
 | D. Apply section 2 knowingly | Accept the residuals above | Not recommended: the holes are open-ended and some are exfiltration paths |
 
-Until the owner chooses, the supported state is C, and the live broad `Bash(gh pr merge:*)` allow remains the unresolved exposure it is today.
+The founder selected A. Until the runner's allow rule is applied and verified, the supported state is C, and the live broad `Bash(gh pr merge:*)` allow remains the unresolved exposure it is today.
 
 ## 7. What is and is not claimed
 
-Designed and unit-tested in this repository; the classifier behavior above is measured on the owner's workstation. LIVE_DEPLOYED and LIVE_VALIDATED stay false until the owner applies the diff and the disposable-PR run succeeds. This document is not permission to bypass any earlier host denial and must not be read as `MERGE_AUTONOMY_READY`.
+Designed and unit-tested in this repository; the classifier behavior above is measured on the owner's workstation. LIVE_DEPLOYED and LIVE_VALIDATED stay false until the owner applies the runner allow rule (section 8) and a disposable-PR run succeeds. This document is not permission to bypass any earlier host denial and must not be read as `MERGE_AUTONOMY_READY`.
+
+## 8. Option A: the validating merge runner (implemented, not deployed)
+
+`scripts/owner-merge-runner.py` (stdlib Python 3, `tests/test-owner-merge-runner.py`, wired into `capability-validation.yml`):
+
+```
+owner-merge-runner.py --repo OWNER/NAME --pr N --expect-head SHA40 --review-evidence PATH [--dry-run]
+```
+
+What it enforces in code, each with a negative-control test:
+
+- Structured arguments only. `--repo`, `--pr` and `--expect-head` are matched by strict regexes before any use (shell metacharacters, trailing newline, uppercase hex, wrong length all refuse before gh is started). `gh` is resolved once as an absolute path, run with `shell=False`, and every call passes an argv-shape check: only `gh api user`, `gh pr view ... --json <fixed field list>` and the single merge argv are accepted. There is no flag to choose another `gh`; tests inject a fake through the module API only.
+- Guards (all must hold; every reason is reported): PR OPEN and not draft; head equals the pinned `--expect-head`; `mergeable == MERGEABLE` and `mergeStateStatus == CLEAN`; no unresolved `CHANGES_REQUESTED` (latest decisive review per reviewer, plus `reviewDecision`); every check in the rollup completed with `SUCCESS` (empty, pending, skipped or neutral all refuse, SonarCloud included when present); repo on the allowlist file; a review-evidence JSON whose `head` equals the pinned head and `verdict` is `PASS` (the runner only reads it, never writes it); any PR field missing or malformed refuses.
+- PR class (section 3): A author equals the authenticated `gh` user; B dependency bot on a bot branch in the same repository, with an APPROVED review by the authenticated user at the exact head; C an APPROVED review at the exact head by a non-author whose `authorAssociation` is OWNER, MEMBER or COLLABORATOR; a cross-repository (fork) Class C PR additionally needs the authenticated user's own APPROVED review at the exact head.
+- One mutating command, byte-for-byte: `gh pr merge N --repo R --merge --match-head-commit SHA`. Never `--admin`, `--squash`, `--rebase`, `--auto` or `--delete-branch`. The head is re-read immediately before it runs. One attempt only: a gh refusal is recorded as `DENIED` (or `ERROR`) and the runner exits nonzero without retrying, trying another route or touching settings.
+- After a zero exit the PR is read back; anything other than `MERGED` with a merge commit is `UNVERIFIED` and fails.
+- Append-only JSONL audit (fixed path `~/.claude/audit/owner-merge-runner.jsonl`, mode 0600, secret-shaped text redacted) with a `PENDING` record written before the merge; if the audit cannot be written, no merge happens.
+- Exit codes: 0 success or validated dry run, 2 refused, 3 denied, 4 error, 5 unverified, 64 usage.
+
+The allowlist is required and fixed: `~/.claude/owner-merge-runner-allowlist.json` (never loaded from the repo; there is no CLI override for it, the audit log path or `gh`; only the module API used by tests can pass others). Before it is trusted the runner checks it is a regular non-symlink file, owned by the current user, not group/world-writable (same for its directory), and not inside a git worktree, so an agent-writable checkout cannot widen scope. The runner refuses until the owner creates it. `docs/examples/owner-merge-runner-allowlist.example.json` shows the format (`{"repos": ["OWNER/NAME"]}`) and is refused if pointed at, being in a worktree.
+
+Mutation check (removed one guard at a time in a scratch copy; the suite failed every time): head pin, pre-exec head re-check, check status, empty rollup, merge argv gaining `--admin`, argv-shape check disabled, `mergeStateStatus`, changes-requested, allowlist, evidence verdict, evidence head, draft, argument-syntax validation, post-merge read-back, audit 0600, secret scrub, class C approval. 23 of 23 killed (this list plus class C association, cross-repository rule, and the allowlist symlink, owner, mode, worktree and default-path guards).
+
+### Owner step still open: the host permission (unmeasured)
+
+The runner does not change what the host asks. To run it without a per-merge prompt, the owner would copy the script to one stable path and allow only that literal form. Proposed rule (user scope, owner-applied; not applied, not measured):
+
+```
+Bash(/Users/bryant/.claude/bin/owner-merge-runner --repo * --pr * --expect-head * --review-evidence *)
+```
+
+invoked exactly as `/Users/bryant/.claude/bin/owner-merge-runner --repo OWNER/NAME --pr N --expect-head SHA --review-evidence PATH` (no `python3`, no `rtk` prefix, no `cd`, no env prefix; the rtk-rewritten spelling may need its own rule). Whether the host matches that form, normalizes it, or still reaches the classifier is **unmeasured** until verified with `scripts/permission-host-matrix.py` against a corpus of this exact command (plus negative controls) on the real host. Use `--dry-run` only for such probes; do not point a probe at a real PR.
+
+### Binding limits, residuals
+
+- Explicit host denial stays binding. If the host denies the runner call, report the exact operation and stop; do not re-shape it, route around it or ask a subagent. The runner is not a bypass of the Auto Mode classifier, including Self-Approval and Merge Without Review (#59, #60): an allow rule may clear the classifier for this literal form only if the owner applies and verifies one, and nothing here asserts that it would.
+- The evidence file is only as independent as whoever wrote it; the runner checks head and verdict, not the reviewer's identity or the review's quality. Class A and the evidence record both rest on one shared GitHub identity.
+- Checks are trusted as GitHub reports them; a repository with no required checks (empty rollup) is refused rather than merged.
+- Branch protection and bypass-actor settings are not read; GitHub remains the final authority and `--match-head-commit` fails a stale pin there.
+- The runner never uses `--admin`, so a same-identity `REVIEW_REQUIRED` deadlock is not resolved by it (the separate owner-only exception is out of scope).
+- The evidence path is read as given; whoever can write that file can supply a PASS, so it must come from the independent review, not the merging agent. The allowlist is checked for ownership, mode, symlink and worktree location, but an actor running as the same OS user can still edit a file in `~/.claude`; the check removes the agent-writable-checkout path, not same-user tampering.
+- Nothing here was exercised against a real PR. Verified: unit tests with a fake `gh`. Not verified: real `gh` JSON field behavior for every PR shape (for example bot author spelling), real merge, host matching.
