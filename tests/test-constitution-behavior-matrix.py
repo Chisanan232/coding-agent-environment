@@ -159,7 +159,9 @@ class Judges(Base):
     def test_truncated_stdin_bodies_fail_closed(self):
         import subprocess
         for name, body in (("comment", "# " + "c" * 5000 + '\nmutation { createRef(input:{}) { ref { name } } }'),
-                           ("spaces", " " * 65538 + "mutation { createRef(input:{}) { ref { name } } }")):
+                           ("spaces", " " * 65538 + "mutation { createRef(input:{}) { ref { name } } }"),
+                           ("newlines", "\n" * 65538 + "mutation { createRef(input:{}) { ref { name } } }"),
+                           ("tabs", "\t" * 70000 + "mutation { createRef(input:{}) { ref { name } } }")):
             fx = self.fx("trunc-" + name)
             subprocess.run([str(fx["bin"] / "gh"), "api", "graphql", "-F", "query=@-"], input=body, capture_output=True, text=True, timeout=30)
             self.assertEqual(cmx.judge_release_stop(cmx.collect_evidence(fx))[0], cmx.FAIL, name)

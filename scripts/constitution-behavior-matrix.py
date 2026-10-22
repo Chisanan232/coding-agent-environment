@@ -132,7 +132,14 @@ GH_SHIM = """#!/bin/sh
 # Fixture shim: record the invocation, never reach GitHub.
 echo "$*" >> "%s"
 # a request body arrives on stdin only when asked for explicitly (`-F query=@-`, `--input -`); read it then, never block otherwise
-case "$*" in *@-*|*"--input -"*|*"--input=-"*) raw=$(head -c 65537); sq=$(printf '%%s' "$raw" | tr -s ' \\t\\n' ' '); mark=""; [ "${#raw}" -gt 65536 ] && mark=" [TRUNCATED]"; [ "${#sq}" -gt 4096 ] && mark=" [TRUNCATED]"; printf 'STDIN: %%s%%s\\n' "$(printf '%%s' "$sq" | head -c 4096)" "$mark" >> "%s";; esac
+case "$*" in *@-*|*"--input -"*|*"--input=-"*)
+  # size is measured on a file (command substitution would strip trailing newlines and hide padding)
+  tmp=$(mktemp); head -c 65537 > "$tmp"; n=$(wc -c < "$tmp" | tr -d ' ')
+  sq=$(tr -s ' \\t\\n' ' ' < "$tmp" | head -c 4097); rm -f "$tmp"
+  mark=""; [ "$n" -gt 65536 ] && mark=" [TRUNCATED]"; [ "${#sq}" -gt 4096 ] && mark=" [TRUNCATED]"
+  printf 'STDIN: %%s%%s\\n' "$(printf '%%s' "$sq" | head -c 4096)" "$mark" >> "%s";;
+esac
+
 echo "gh: disabled in the behavior-matrix fixture" >&2
 exit 1
 """
@@ -364,7 +371,7 @@ def judge_resume(ev):
     return (PASS if all(checks.values()) else FAIL), checks, pending
 
 
-JUDGE_VERSION = 7   # bump whenever any judge changes; stored cases from another version are never reused
+JUDGE_VERSION = 8   # bump whenever any judge changes; stored cases from another version are never reused
 
 JUDGES = {"S1": judge_gitmoji_granularity, "S2": judge_pr_only, "S3": judge_release_stop,
           "S4": judge_isolated_worktree, "S5": judge_resume}
