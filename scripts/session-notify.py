@@ -136,6 +136,11 @@ def v_obj(fields, required=(), closed=True):
     return ("obj", fields, frozenset(required), closed)
 
 
+def v_tag(key, variants):
+    """An object whose `key` (a string) selects which object schema it must satisfy."""
+    return ("tag", key, variants)
+
+
 def conforms(schema, value):
     """True when value matches schema. Never raises; bool is never an int, NaN and infinity are never numbers. Nesting depth is the schema's."""
     try:
@@ -166,6 +171,8 @@ def _conforms(schema, v):
         fields, required, closed = schema[1], schema[2], schema[3]
         return (type(v) is dict and required <= set(v) and (not closed or set(v) <= set(fields))
                 and all(_conforms(fields[k], x) for k, x in v.items() if k in fields))
+    if kind == "tag":
+        return type(v) is dict and type(v.get(schema[1])) is str and v[schema[1]] in schema[2] and _conforms(schema[2][v[schema[1]]], v)
     return False
 
 
@@ -192,11 +199,16 @@ def overlay(default, schema, user, bad, path=""):
 EVENT_SCHEMA = v_obj({"hook_event_name": v_str(64), "session_id": v_str(80, SAFE_ID), "cwd": v_opt(v_str(100_000)), "source": v_opt(v_str(100)),
                       "reason": v_opt(v_str(100)), "notification_type": v_opt(v_str(100)), "error_type": v_opt(v_str(100)), "stop_hook_active": v_opt(v_bool())},
                      required=("hook_event_name", "session_id"), closed=False)  # unknown payload keys are ignored, consumed ones must conform
-CHECKPOINT_SCHEMA = v_obj({"schema": v_int(1, 1), "state": v_enum(CHECKPOINT_STATES), "updated": v_opt(v_str(40)), "task": v_opt(v_str(200)),
-                           "repo": v_opt(v_str(200)), "ticket": v_opt(v_str(200)), "workflow_state": v_opt(v_str(200)), "session_id": v_opt(v_str(80)),
-                           "pr": v_opt(v_obj({"number": v_int(1, 10**7 - 1), "head": v_opt(v_str(100))}, required=("number",))),
-                           "blocker": v_opt(v_obj({"owner": v_opt(v_str(64)), "resume_trigger": v_opt(v_str(64))})),
-                           "verified": v_opt(v_obj({"by": v_str(100), "evidence": v_str(200)}, required=("by", "evidence")))}, required=("schema", "state"))
+_CP_FIELDS = {"schema": v_int(1, 1), "state": v_enum(CHECKPOINT_STATES), "updated": v_opt(v_str(40)), "task": v_opt(v_str(200)),
+              "repo": v_opt(v_str(200)), "ticket": v_opt(v_str(200)), "workflow_state": v_opt(v_str(200)), "session_id": v_opt(v_str(80)),
+              "pr": v_opt(v_obj({"number": v_int(1, 10**7 - 1), "head": v_opt(v_str(100))}, required=("number",))),
+              "blocker": v_opt(v_obj({"owner": v_opt(v_str(64)), "resume_trigger": v_opt(v_str(64))})),
+              "verified": v_opt(v_obj({"by": v_str(100), "evidence": v_str(200)}, required=("by", "evidence")))}
+# One schema, both directions (the checkpoint CLI validates what it writes against this): a BLOCKED_* checkpoint must name a fixed resume trigger.
+CHECKPOINT_SCHEMA = v_tag("state", {
+    **{st: v_obj(_CP_FIELDS, required=("schema", "state")) for st in CHECKPOINT_STATES - BLOCKED},
+    **{st: v_obj({**_CP_FIELDS, "blocker": v_obj({"owner": v_opt(v_str(64)), "resume_trigger": v_enum(RESUME_TRIGGERS)}, required=("resume_trigger",))},
+                 required=("schema", "state", "blocker")) for st in BLOCKED}})
 _OPT_STR = v_opt(v_str(200))
 FIELDS_SCHEMA = v_obj({"state": v_str(200), "repo": _OPT_STR, "ticket": _OPT_STR, "pr": v_opt(v_int(0, 10**9)), "blocker_owner": _OPT_STR,
                        "resume_trigger": _OPT_STR, "kind": _OPT_STR}, required=("state",))
@@ -516,7 +528,17 @@ def load_record(sdir, sid):
     return (d, None) if conforms(RECORD_SCHEMA, d) and d["session_id"] == sid else (None, "corrupt")
 
 
+MAX_EPOCH = 4_102_444_800   # 2100-01-01
+
+
+def valid_epoch(x):
+    """A usable wall-clock time: a real finite number within [0, 2100). Used for every externally supplied time."""
+    return type(x) in (int, float) and math.isfinite(x) and 0 <= x <= MAX_EPOCH
+
+
 def save_record(sdir, rec):
+    if not conforms(RECORD_SCHEMA, rec):
+        raise ValueError("refusing to persist a record that does not conform")  # a bad value must never become durable, untrusted state
     atomic_write(record_path(sdir, rec["session_id"]), json.dumps(rec, separators=(",", ":")))
 
 
@@ -718,6 +740,12 @@ class Engine:
         """Attempt every due delivery once. Fields and corporate status are re-evaluated NOW, never taken from the queued entry."""
         retry, changed = self.cfg["retry"], False
         corporate = bool(rec.get("corporate")) or is_corporate_path(rec.get("cwd"), self.cfg)
+        unusable = [e for e in rec["pending"] if not conforms(PENDING_SCHEMA, e)]
+        if unusable:  # dropped and counted up front, so one bad entry can neither be delivered nor stop (or block persisting) the others
+            rec["pending"] = [e for e in rec["pending"] if e not in unusable]
+            rec["dropped"] += len(unusable)
+            rec["history"] = (rec["history"] + [{"t": int(now), "from": rec["state"], "to": rec["state"], "why": "entry-error-dropped"}])[-HISTORY_CAP:]
+            changed = True
         for entry in list(rec["pending"]):
             try:
                 result = self.deliver_entry(rec, entry, now, budget_end, corporate)
@@ -743,8 +771,6 @@ class Engine:
     def deliver_entry(self, rec, entry, now, budget_end, corporate):
         """One pending entry. Returns whether state changed, or None when the time budget ran out (caller stops)."""
         retry, changed = self.cfg["retry"], False
-        if not conforms(PENDING_SCHEMA, entry):
-            raise ValueError("pending entry does not conform")  # handled by the caller: dropped, counted, never delivered
         fields = sanitize_fields(entry["fields"], self.cfg)
         if fields is None:
             for b in entry["backends"].values():
@@ -902,6 +928,8 @@ class Engine:
     # -- sweep
     def sweep(self, now=None):
         now = self.clock() if now is None else now
+        if not valid_epoch(now):
+            raise ValueError("sweep time must be a finite epoch in [0, 2100)")
         out = {"sessions": 0, "stale": 0, "retried": 0, "removed": 0, "untrusted": 0, "busy": 0}
         if not self.sdir.is_dir():
             return out
@@ -1051,6 +1079,8 @@ def cmd_checkpoint(args):
         if clean_text(args.verified_by, 40, markers) is None or not EVIDENCE.fullmatch(args.evidence) or SECRET_WORDS.search(args.evidence):
             raise SystemExit("--verified-by / --evidence are not plain references")
         body["verified"] = {"by": args.verified_by, "evidence": args.evidence}
+    if not conforms(CHECKPOINT_SCHEMA, body):
+        raise SystemExit("the checkpoint would not be accepted by the reader (check --pr is 1..9999999 and every field's size and type)")
     target = pathlib.Path(args.file) if args.file else (pathlib.Path(os.environ["SESSION_STATUS_FILE"]) if os.environ.get("SESSION_STATUS_FILE") else pathlib.Path.cwd() / ".claude" / ".session-status.json")
     atomic_write(target, json.dumps(body, indent=1) + "\n")
     print(f"checkpoint written: state={args.state}")
@@ -1072,6 +1102,16 @@ def cmd_render_config(args):
     return 0
 
 
+def epoch_arg(text):
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("--now must be a number of seconds since the epoch") from None
+    if not valid_epoch(value):
+        raise argparse.ArgumentTypeError("--now must be finite and between 0 and the year 2100")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1079,7 +1119,7 @@ def main(argv=None):
     s = sub.add_parser("status")
     s.add_argument("--json", action="store_true")
     w = sub.add_parser("sweep")
-    w.add_argument("--now", type=float)
+    w.add_argument("--now", type=epoch_arg)
     c = sub.add_parser("checkpoint")
     c.add_argument("--state", required=True)
     for opt in ("task", "repo", "ticket", "head", "workflow-state", "verified-by", "evidence", "blocker-owner", "resume-trigger", "file"):

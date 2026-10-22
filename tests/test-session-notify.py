@@ -725,6 +725,10 @@ class ReviewRegressions(Base):
         self.advance(3)
         self.checkpoint(state="BLOCKED_OWNER", verified=None, repo="aB12-cD34-eF56", blocker={"owner": "rm -rf backup", "resume_trigger": "rm -rf backup"})
         self.ev(e, "Stop")
+        self.assertEqual((self.rec()["state"], self.fake.sent), ("IDLE", []))      # a blocked checkpoint without a fixed resume trigger is absent
+        self.checkpoint(state="BLOCKED_OWNER", verified=None, repo="aB12-cD34-eF56", blocker={"owner": "rm -rf backup", "resume_trigger": "owner_approval"})
+        self.advance(3)
+        self.ev(e, "Stop")
         self.assertTrue(self.fake.sent)
         blob = json.dumps(self.fake.sent)
         for piece in ("rm -rf", "backup", "aB12-cD34-eF56"):
@@ -1367,8 +1371,62 @@ class Cycle3Regressions(Base):
 
 
 # ---- cycle 4: one declarative boundary validator, proven by systematic mutation -------------------------------------------------
-WRONG = [None, True, False, 0, 7, 1.5, float("nan"), float("inf"), "x", "x" * 300_000, [], {}, [[1]], {"a": {"b": 1}}]
+WRONG = [None, True, False, 0, 7, -1, 10**13, 2**70, 1.0, 1.5, float("nan"), float("inf"), "x", "x" * 300_000, "BLOCKED_DEPENDENCY", "not_a_trigger",
+         [], {}, [[1]], {"a": {"b": 1}}]
 DEEP = "[" * 60_000 + "]" * 60_000
+
+
+def ref_ok(schema, v):
+    """Independent reference check of a sn schema (a separate implementation from sn.conforms): the oracle for what each boundary must accept."""
+    k = schema[0]
+    isnum = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)
+    if k == "opt":
+        return v is None or ref_ok(schema[1], v)
+    if k == "str":
+        return isinstance(v, str) and len(v) <= schema[1] and (schema[2] is None or bool(schema[2].fullmatch(v)))
+    if k == "enum":
+        return isinstance(v, str) and v in set(schema[1])
+    if k == "bool":
+        return isinstance(v, bool)
+    if k == "int":
+        return isinstance(v, int) and not isinstance(v, bool) and schema[1] <= v <= schema[2]
+    if k == "num":
+        return isnum(v) and v == v and abs(v) != float("inf")
+    if k == "list":
+        return isinstance(v, list) and schema[3] <= len(v) <= schema[2] and not [x for x in v if not ref_ok(schema[1], x)]
+    if k == "map":
+        return isinstance(v, dict) and len(v) <= schema[3] and not [1 for kk, x in v.items() if not (ref_ok(schema[1], kk) and ref_ok(schema[2], x))]
+    if k == "obj":
+        if not isinstance(v, dict) or [r for r in schema[2] if r not in v]:
+            return False
+        if schema[3] and [kk for kk in v if kk not in schema[1]]:
+            return False
+        return not [kk for kk, x in v.items() if kk in schema[1] and not ref_ok(schema[1][kk], x)]
+    if k == "tag":
+        return isinstance(v, dict) and isinstance(v.get(schema[1]), str) and v[schema[1]] in schema[2] and ref_ok(schema[2][v[schema[1]]], v)
+    raise AssertionError(f"unknown schema kind {k}")
+
+
+def ref_config(m):
+    """What load_config must return for a parsed user config m, derived leaf by leaf from CONFIG_SCHEMA with the reference check."""
+    import copy
+    bad = []
+
+    def walk(default, schema, user, path):
+        if isinstance(schema, dict):
+            user = user if isinstance(user, dict) else {}
+            return {k: walk(default[k], schema[k], user.get(k, "<missing>"), path + (k,)) for k in default}
+        if user != "<missing>" and ref_ok(schema, user):
+            return copy.deepcopy(user)
+        if user != "<missing>":
+            bad.append(path[0])
+        return copy.deepcopy(default)
+    if not isinstance(m, dict) or json.dumps(m, allow_nan=True).count("NaN") + json.dumps(m).count("Infinity") or len(json.dumps(m)) > 64 * 1024:
+        return copy.deepcopy(sn.DEFAULT_CONFIG)
+    cfg_ = walk(sn.DEFAULT_CONFIG, sn.CONFIG_SCHEMA, m, ())
+    if "profile" in bad or "corporate_markers" in bad:
+        cfg_["profile"] = "corporate"
+    return cfg_
 
 
 def leaf_paths(obj, prefix=()):
@@ -1387,43 +1445,30 @@ def at(obj, path):
     return obj
 
 
-def mutants(base, optional=()):
-    """(path, new value, mutated copy, expect_invalid) for every field x every wrong value, plus key deletions (never asserted invalid).
-
-    expect_invalid is only claimed when the replacement is certainly outside the schema: a different JSON type (numbers are
-    interchangeable with each other), a non-finite number, or a string far beyond every bound. None on an optional leaf is allowed."""
+def mutants(base):
+    """(path, new value, mutated copy) for every field x every wrong value, plus the deletion of every dict key. No verdict is attached:
+    each test derives it from the schema with ref_ok."""
     import copy
     for path in leaf_paths(base):
-        orig = at(base, path)
         for w in WRONG:
             if not path:
-                m = copy.deepcopy(w)
-            else:
-                m = copy.deepcopy(base)
-                at(m, path[:-1])[path[-1]] = copy.deepcopy(w)
-            num = lambda x: type(x) in (int, float)
-            if isinstance(w, float) and w != w or w == float("inf") or (isinstance(w, str) and len(w) > 100_000):
-                bad = True
-            elif num(w) and num(orig):
-                bad = False
-            elif orig is None:
-                bad = False
-            elif w is None:
-                bad = bool(path) and path[-1] not in optional
-            else:
-                bad = type(w) is not type(orig)
-            yield path, w, m, bad
+                yield path, w, copy.deepcopy(w)
+                continue
+            m = copy.deepcopy(base)
+            at(m, path[:-1])[path[-1]] = copy.deepcopy(w)
+            yield path, w, m
         if path and isinstance(at(base, path[:-1]), dict):
             m = copy.deepcopy(base)
             del at(m, path[:-1])[path[-1]]
-            yield path, "<deleted>", m, False
+            yield path, "<deleted>", m
 
 
 class BoundaryFuzz(Base):
-    """For every boundary, every field mutated to every wrong type: no exception escapes the public entry point and nothing is delivered
-    from an invalid value."""
+    """For every boundary, every field mutated to every wrong value. The verdict for each mutation comes from the schema (ref_ok, an independent
+    implementation): invalid => rejected and nothing delivered, valid => accepted. No exception escapes any public entry point."""
 
-    def collect(self, failures):
+    def collect(self, failures, n, minimum):
+        self.assertGreater(n, minimum)
         self.assertEqual(failures[:8], [], f"{len(failures)} boundary violations")
 
     def test_config_every_field_every_wrong_type(self):
@@ -1434,67 +1479,53 @@ class BoundaryFuzz(Base):
         base["backends"]["macos"]["enabled"] = True
         base["backends"]["ntfy"].update(enabled=True, approved_destination="ntfy.sh", topic_file="/x/t")
         base["backends"]["pushover"].update(enabled=True, user_file="/x/u")
-        shape = lambda v: {k: shape(x) for k, x in v.items()} if isinstance(v, dict) else type(v).__name__
-        want, failures, n = shape(sn.DEFAULT_CONFIG), [], 0
+        failures, n = [], 0
         path = self.tmp / "fuzz-config.json"
-        for mpath, w, m, bad in mutants(base):
+        for mpath, w, m in mutants(base):
             n += 1
             path.write_text(json.dumps(m))
             try:
-                cfg_, _ = sn.load_config(path)
+                got, _ = sn.load_config(path)
             except BaseException as exc:  # noqa: BLE001
                 failures.append((mpath, repr(w)[:20], type(exc).__name__))
                 continue
-            if shape(cfg_) != want:
-                failures.append((mpath, repr(w)[:20], "shape"))
-            elif bad and mpath and mpath[0] in cfg_:
-                leaf = cfg_
-                dleaf = sn.DEFAULT_CONFIG
-                for k in mpath:
-                    if not isinstance(dleaf, dict) or k not in dleaf:
-                        break
-                    leaf, dleaf = leaf[k], dleaf[k]
-                if (isinstance(w, float) and (w != w or w == float("inf"))) or (isinstance(w, str) and len(w) > 100_000):
-                    ok = cfg_ == sn.DEFAULT_CONFIG        # NaN/Infinity (invalid JSON) or an oversized file: defaults, everything off
-                elif mpath[0] in ("profile", "corporate_markers"):
-                    ok = cfg_["profile"] == "corporate"
-                else:
-                    ok = leaf == dleaf
-                if not ok:
-                    failures.append((mpath, repr(w)[:20], "kept"))
+            if got != ref_config(m):
+                failures.append((mpath, repr(w)[:20], "differs from the schema-derived config"))
         path.write_text(DEEP)
         sn.load_config(path)
-        self.assertGreater(n, 400)
-        self.collect(failures)
+        self.collect(failures, n, 400)
 
     def test_checkpoint_every_field_every_wrong_type(self):
-        base = {"schema": 1, "state": "COMPLETED", "updated": "2026-01-01T00:00:00Z", "task": "SPE-120 notifier", "repo": "work", "ticket": "SPE-120",
-                "workflow_state": "review", "session_id": "s1", "pr": {"number": 7, "head": "a" * 40}, "blocker": {"owner": "owner", "resume_trigger": "ci_green"},
-                "verified": {"by": "codex-review", "evidence": "PR#7@" + "a" * 40}}
-        optional = {"updated", "task", "repo", "ticket", "workflow_state", "session_id", "pr", "blocker", "verified", "head", "owner", "resume_trigger"}
+        completed = {"schema": 1, "state": "COMPLETED", "updated": "2026-01-01T00:00:00Z", "task": "SPE-120 notifier", "repo": "work", "ticket": "SPE-120",
+                     "workflow_state": "review", "session_id": "s1", "pr": {"number": 7, "head": "a" * 40}, "blocker": {"owner": "owner", "resume_trigger": "ci_green"},
+                     "verified": {"by": "codex-review", "evidence": "PR#7@" + "a" * 40}}
+        blocked = dict(completed, state="BLOCKED_OWNER", verified=None)
         failures, n = [], 0
-        for mpath, w, m, bad in mutants(base, optional):
-            n += 1
-            self.checkpoint_raw(json.dumps(m))
-            try:
-                cp, _ = sn.read_checkpoint(str(self.work), "s1", [])
-                e = self.engine()
-                sid = f"c{n}"
-                self.ev(e, "UserPromptSubmit", sid=sid)
-                self.advance(2)
-                self.checkpoint_raw(json.dumps(m))
-                self.fake.sent.clear()
-                self.ev(e, "Stop", sid=sid)
-                state = self.rec(sid)["state"]
-            except BaseException as exc:  # noqa: BLE001
-                failures.append((mpath, repr(w)[:20], type(exc).__name__))
-                continue
-            if bad and (cp is not None or state != "IDLE" or self.fake.sent):
-                failures.append((mpath, repr(w)[:20], "accepted"))
+        for base in (completed, blocked):
+            for mpath, w, m in mutants(base):
+                n += 1
+                valid = ref_ok(sn.CHECKPOINT_SCHEMA, m) and m.get("session_id") in (None, "s1")
+                try:
+                    self.checkpoint_raw(json.dumps(m))
+                    cp, _ = sn.read_checkpoint(str(self.work), "s1", [])
+                    e = self.engine()
+                    sid = f"c{n}"
+                    self.ev(e, "UserPromptSubmit", sid=sid)
+                    self.advance(2)
+                    self.checkpoint_raw(json.dumps(m))
+                    self.fake.sent.clear()
+                    self.ev(e, "Stop", sid=sid)
+                    state = self.rec(sid)["state"]
+                except BaseException as exc:  # noqa: BLE001
+                    failures.append((mpath, repr(w)[:20], type(exc).__name__))
+                    continue
+                if (cp is not None) != valid:
+                    failures.append((mpath, repr(w)[:20], "accepted" if cp is not None else "rejected a valid checkpoint"))
+                elif not valid and (state != "IDLE" or self.fake.sent):
+                    failures.append((mpath, repr(w)[:20], "acted on an invalid checkpoint"))
         self.checkpoint_raw(DEEP)
         self.assertIsNone(sn.read_checkpoint(str(self.work), "s1", [])[0])
-        self.assertGreater(n, 150)
-        self.collect(failures)
+        self.collect(failures, n, 300)
 
     def checkpoint_raw(self, text):
         p = self.work / ".claude/.session-status.json"
@@ -1518,36 +1549,34 @@ class BoundaryFuzz(Base):
 
     def test_state_every_field_every_wrong_type(self):
         base, c = self.base_record()
-        optional = {"ended_reason", "repo_label", "code", "repo", "ticket", "pr", "blocker_owner", "resume_trigger", "kind"}
         failures, n = [], 0
-        for mpath, w, m, bad in mutants(base, optional):
+        for mpath, w, m in mutants(base):
             n += 1
+            valid = ref_ok(sn.RECORD_SCHEMA, m) and m.get("session_id") == "s1"
             fake = Fake()
             e = sn.Engine(self.sdir, c, fake.table(), clock=lambda: self.t + 1000, sleep=lambda s: None)
             (self.sdir / "s1.json").write_text(json.dumps(m))
             try:
                 got, problem = sn.load_record(self.sdir, "s1")
                 handled = e.handle({"hook_event_name": "Stop", "session_id": "s1", "cwd": str(self.work)})
-                swept = e.sweep()
+                e.sweep()
             except BaseException as exc:  # noqa: BLE001
                 failures.append((mpath, repr(w)[:20], type(exc).__name__))
                 continue
-            if bad and (got is not None or not str(handled).startswith("untrusted:") or fake.sent):
-                failures.append((mpath, repr(w)[:20], "trusted"))
-            elif got is None and fake.sent:
-                failures.append((mpath, repr(w)[:20], "delivered"))
+            if (got is not None) != valid:
+                failures.append((mpath, repr(w)[:20], "trusted" if got is not None else "rejected a valid record"))
+            elif not valid and (not str(handled).startswith("untrusted:") or fake.sent):
+                failures.append((mpath, repr(w)[:20], "acted on an invalid record"))
         (self.sdir / "s1.json").write_text(DEEP)
         self.assertEqual(sn.load_record(self.sdir, "s1"), (None, "corrupt"))
-        self.assertGreater(n, 700)
-        self.collect(failures)
+        self.collect(failures, n, 700)
 
     def test_pending_deliveries_every_field_every_wrong_type(self):
         base = {"key": "k", "cycle": 1, "created": 0,
                 "fields": {"state": "FAILED", "repo": "work", "ticket": "SPE-1", "pr": 4, "blocker_owner": "owner", "resume_trigger": "ci_green", "kind": "rate_limit"},
                 "backends": {"macos": {"status": "failed", "attempts": 1, "next_at": 0, "code": "network"}, "ntfy": {"status": "pending", "attempts": 0, "next_at": 0, "code": None}}}
-        optional = {"repo", "ticket", "pr", "blocker_owner", "resume_trigger", "kind", "code"}
         failures, n = [], 0
-        for mpath, w, m, bad in mutants(base, optional):
+        for mpath, w, m in mutants(base):
             n += 1
             fake = Fake()
             e = sn.Engine(self.sdir, cfg(), fake.table(), clock=lambda: self.t, sleep=lambda s: None)
@@ -1558,10 +1587,9 @@ class BoundaryFuzz(Base):
             except BaseException as exc:  # noqa: BLE001
                 failures.append((mpath, repr(w)[:20], type(exc).__name__))
                 continue
-            if bad and fake.sent:
-                failures.append((mpath, repr(w)[:20], "delivered"))
-        self.assertGreater(n, 150)
-        self.collect(failures)
+            if not ref_ok(sn.PENDING_SCHEMA, m) and fake.sent:
+                failures.append((mpath, repr(w)[:20], "delivered from an invalid entry"))
+        self.collect(failures, n, 250)
 
     def test_hook_payload_every_field_every_wrong_type(self):
         events = [{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": str(self.work), "source": "startup"},
@@ -1569,10 +1597,9 @@ class BoundaryFuzz(Base):
                   {"hook_event_name": "Notification", "session_id": "s1", "cwd": str(self.work), "notification_type": "permission_prompt"},
                   {"hook_event_name": "StopFailure", "session_id": "s1", "cwd": str(self.work), "error_type": "rate_limit"},
                   {"hook_event_name": "Stop", "session_id": "s1", "cwd": str(self.work), "stop_hook_active": False}]
-        optional = {"cwd", "source", "reason", "notification_type", "error_type", "stop_hook_active"}
         failures, n = [], 0
         for base in events:
-            for mpath, w, m, bad in mutants(base, optional):
+            for mpath, w, m in mutants(base):
                 n += 1
                 e = self.engine()
                 before = (sorted(p.name for p in self.sdir.glob("*")) if self.sdir.exists() else [], list(self.fake.sent))
@@ -1582,10 +1609,10 @@ class BoundaryFuzz(Base):
                     failures.append((base["hook_event_name"], mpath, repr(w)[:20], type(exc).__name__))
                     continue
                 after = (sorted(p.name for p in self.sdir.glob("*")) if self.sdir.exists() else [], list(self.fake.sent))
-                if bad and (result != "ignored" or after != before):
-                    failures.append((base["hook_event_name"], mpath, repr(w)[:20], "processed"))
-        self.assertGreater(n, 300)
-        self.collect(failures)
+                valid = ref_ok(sn.EVENT_SCHEMA, m)
+                if (result != "ignored") != valid or (not valid and after != before):
+                    failures.append((base["hook_event_name"], mpath, repr(w)[:20], "processed" if not valid else "ignored a valid event"))
+        self.collect(failures, n, 500)
 
     def test_cmd_hook_survives_every_json_root_and_deep_nesting(self):
         saved, stdin = dict(os.environ), sys.stdin
@@ -1602,11 +1629,17 @@ class BoundaryFuzz(Base):
 
 
 class BoundaryLint(unittest.TestCase):
-    """Best effort: outside the validator section, a value that came from outside (json.loads result, or a parameter named like a boundary
-    value) must pass through `conforms`/`overlay` before it is subscripted, `.get()`/`.items()`-ed or iterated."""
+    """BEST EFFORT, not a proof. Outside the validator, a value that came from outside (a json.loads result, a parameter named like a boundary
+    value, or a plain alias of either) must not be subscripted, `.get()`/`.items()`-ed or iterated before a `conforms`/`overlay` call whose
+    result is USED (a bare statement `conforms(S, x)` does not count) has been seen on it.
+
+    It is line-ordered, not a real data-flow analysis: it is not path-sensitive (`if not conforms(...): pass` still counts as a guard), not
+    interprocedural (TRUSTED_CONTRACT lists the functions whose callers validate or sanitise first) and does not follow attribute, container
+    or call-result aliases. The guarantee comes from the structure (every boundary calls `conforms` first) and from BoundaryFuzz; this only
+    catches the common regressions."""
     VALIDATOR = {"conforms", "_conforms", "overlay"}
-    TRUSTED = {"render"}                      # takes sanitize_fields output only
-    BOUNDARY_PARAMS = {"ev", "raw", "d", "user", "fields", "entry"}
+    TRUSTED_CONTRACT = {"render", "apply", "deliver_entry"}   # receive sanitised or already validated values
+    BOUNDARY_PARAMS = {"ev", "raw", "d", "user", "fields", "entry", "event"}
 
     @classmethod
     def violations(cls, source):
@@ -1614,19 +1647,24 @@ class BoundaryLint(unittest.TestCase):
         tree = ast.parse(source)
         found = []
         for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
-            if fn.name in cls.VALIDATOR or fn.name.startswith("v_") or fn.name in cls.TRUSTED:
+            if fn.name in cls.VALIDATOR or fn.name.startswith("v_") or fn.name in cls.TRUSTED_CONTRACT:
                 continue
-            tainted = {a.arg for a in fn.args.args if a.arg in cls.BOUNDARY_PARAMS}
-            for node in ast.walk(fn):
-                if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and ast.unparse(node.value.func) == "json.loads"
-                        and all(isinstance(t, ast.Name) for t in node.targets)):
-                    tainted |= {t.id for t in node.targets}
+            root = {a.arg: a.arg for a in fn.args.args if a.arg in cls.BOUNDARY_PARAMS}
+            assigns = [n for n in ast.walk(fn) if isinstance(n, ast.Assign) and all(isinstance(t, ast.Name) for t in n.targets)]
+            for n in assigns:
+                if isinstance(n.value, ast.Call) and ast.unparse(n.value.func) == "json.loads":
+                    root.update({t.id: t.id for t in n.targets})
+            for _ in range(len(assigns)):                      # aliases: `a = b` where b is already tainted
+                for n in assigns:
+                    if isinstance(n.value, ast.Name) and n.value.id in root:
+                        root.update({t.id: root[n.value.id] for t in n.targets})
+            ignored = {id(n.value) for n in ast.walk(fn) if isinstance(n, ast.Expr)}
             validated = {}
             for node in ast.walk(fn):
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("conforms", "overlay"):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("conforms", "overlay") and id(node) not in ignored:
                     for a in ast.walk(node):
-                        if isinstance(a, ast.Name) and a.id in tainted:
-                            validated[a.id] = min(validated.get(a.id, 10**9), node.lineno)
+                        if isinstance(a, ast.Name) and a.id in root:
+                            validated[root[a.id]] = min(validated.get(root[a.id], 10**9), node.lineno)
             for node in ast.walk(fn):
                 target = None
                 if isinstance(node, ast.Attribute) and node.attr in ("get", "items", "keys", "values") and isinstance(node.value, ast.Name):
@@ -1635,17 +1673,23 @@ class BoundaryLint(unittest.TestCase):
                     target = node.value.id
                 elif isinstance(node, ast.For) and isinstance(node.iter, ast.Name):
                     target = node.iter.id
-                if target in tainted and node.lineno < validated.get(target, 10**9):
+                if target in root and node.lineno < validated.get(root[target], 10**9):
                     found.append(f"{fn.name}:{node.lineno}:{target}")
         return found
 
     def test_script_touches_boundary_values_only_after_validation(self):
         self.assertEqual(self.violations(SCRIPT.read_text()), [])
 
-    def test_the_lint_itself_catches_an_unvalidated_access(self):
+    def test_the_lint_catches_an_unvalidated_access(self):
         self.assertTrue(self.violations("def f(ev):\n    return ev.get('x')\n"))
         self.assertTrue(self.violations("import json\ndef f(t):\n    d = json.loads(t)\n    return d['x']\n"))
         self.assertEqual(self.violations("import json\ndef f(t):\n    d = json.loads(t)\n    if not conforms(S, d):\n        return None\n    return d['x']\n"), [])
+
+    def test_the_lint_does_not_accept_nominal_validation_or_aliases_or_the_event_name(self):
+        self.assertEqual(len(self.violations("def f(ev):\n    conforms(S, ev)\n    return ev['x']\n")), 1)          # result ignored
+        self.assertEqual(len(self.violations("def f(event):\n    return event.get('x')\n")), 1)                      # unvalidated `event`
+        self.assertEqual(len(self.violations("def f(raw):\n    alias = raw\n    return alias['x']\n")), 1)           # alias of a boundary value
+        self.assertEqual(self.violations("def f(raw):\n    if not conforms(S, raw):\n        return None\n    alias = raw\n    return alias['x']\n"), [])
 
 
 class Cycle4Regressions(Base):
@@ -1683,6 +1727,80 @@ class Cycle4Regressions(Base):
         doc = (ROOT / "docs/SESSION-NOTIFICATIONS.md").read_text()
         self.assertNotIn("at-least-once", doc)
         self.assertIn("best-effort delivery with bounded retries", doc)
+
+
+class Cycle5Regressions(Base):
+    def cli(self, *argv):
+        env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(self.sdir), SESSION_NOTIFY_CONFIG=str(self.tmp / "none.json"))
+        env.pop("SESSION_STATUS_FILE", None)
+        return subprocess.run([sys.executable, str(SCRIPT), *argv], env=env, capture_output=True, text=True, cwd=str(self.work))
+
+    def test_1_sweep_now_is_validated_and_never_persists_non_finite_state(self):
+        c = cfg()
+        c["backends"]["ntfy"]["enabled"] = c["backends"]["pushover"]["enabled"] = False
+        e = self.engine(c, Fake(fail={"macos": "network"}))
+        self.ev(e, "UserPromptSubmit")
+        self.ev(e, "StopFailure", error_type="rate_limit")                 # a due retry is queued
+        before = (self.sdir / "s1.json").read_bytes()
+        for bad in ("nan", "inf", "-inf", "-1", "abc", "1e300", ""):
+            with self.subTest(bad):
+                r = self.cli("sweep", "--now", bad)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertEqual((self.sdir / "s1.json").read_bytes(), before)
+                self.assertIsNone(sn.load_record(self.sdir, "s1")[1])
+        for bad in (float("nan"), float("inf"), -5, 10**12, "5", True):
+            with self.assertRaises(ValueError):
+                e.sweep(now=bad)
+        self.assertEqual((self.sdir / "s1.json").read_bytes(), before)
+
+    def test_1_a_non_conforming_record_is_never_written(self):
+        rec = sn.new_record("s1", self.t)
+        rec["pending"] = [{"key": "k", "cycle": 1, "created": 0, "fields": {"state": "FAILED"},
+                           "backends": {"macos": {"status": "sending", "attempts": 1, "next_at": float("nan")}}}]
+        with self.assertRaises(ValueError):
+            sn.save_record(self.sdir, rec)
+        self.assertFalse((self.sdir / "s1.json").exists())
+
+    def test_2_the_checkpoint_command_refuses_what_the_reader_would_reject(self):
+        args = ["checkpoint", "--state", "COMPLETED", "--ticket", "SPE-120", "--head", "a" * 40, "--verified-by", "codex-review", "--evidence", "PR#7@" + "a" * 40]
+        target = self.work / ".claude/.session-status.json"
+        for pr in ("-1", "0", "10000000"):
+            r = self.cli(*args, "--pr", pr)
+            self.assertNotEqual(r.returncode, 0, pr)
+            self.assertFalse(target.exists(), pr)
+        self.assertEqual(self.cli(*args, "--pr", "9999999").returncode, 0)
+        self.assertTrue(sn.conforms(sn.CHECKPOINT_SCHEMA, json.loads(target.read_text())))
+
+    def test_3_a_blocked_checkpoint_needs_a_valid_resume_trigger(self):
+        for label, blocker in {"null": None, "empty": {}, "owner only": {"owner": "owner"}, "bad trigger": {"resume_trigger": "not_a_trigger"},
+                               "wrong type": {"resume_trigger": []}}.items():
+            with self.subTest(label):
+                e = self.engine()
+                sid = "b" + label.replace(" ", "")
+                self.ev(e, "UserPromptSubmit", sid=sid)
+                self.advance(2)
+                self.checkpoint(state="BLOCKED_DEPENDENCY", verified=None, blocker=blocker)
+                self.fake.sent.clear()
+                self.ev(e, "Stop", sid=sid)
+                self.assertEqual((self.rec(sid)["state"], self.fake.sent), ("IDLE", []))
+        e = self.engine()
+        self.ev(e, "UserPromptSubmit", sid="ok")
+        self.advance(2)
+        self.checkpoint(state="BLOCKED_DEPENDENCY", verified=None, blocker={"resume_trigger": "dependency_merged"})
+        self.ev(e, "Stop", sid="ok")
+        self.assertEqual(self.rec("ok")["state"], "BLOCKED_DEPENDENCY")
+
+    def test_4_the_schema_rejects_what_the_old_oracle_never_asserted(self):
+        base = {"schema": 1, "state": "COMPLETED", "pr": {"number": 7}, "verified": {"by": "ci", "evidence": "run:1234"}}
+        import copy
+        for label, edit in {"pr.number float": lambda d: d["pr"].update(number=1.5), "pr.number deleted": lambda d: d["pr"].pop("number"),
+                            "schema deleted": lambda d: d.pop("schema"), "pr.number below bound": lambda d: d["pr"].update(number=0),
+                            "state enum violation": lambda d: d.update(state="DONE")}.items():
+            m = copy.deepcopy(base)
+            edit(m)
+            self.assertFalse(sn.conforms(sn.CHECKPOINT_SCHEMA, m), label)
+            self.assertFalse(ref_ok(sn.CHECKPOINT_SCHEMA, m), label)
+        self.assertTrue(sn.conforms(sn.CHECKPOINT_SCHEMA, base))
 
 
 def hashlib_key(sid, extra):
