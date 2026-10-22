@@ -249,24 +249,21 @@ monocle_face coffin test_tube necktie stethoscope bricks technologist money_with
 electric_plug hook compass
 """.split())
 
-_EMOJI_RANGES = (
-    (0x1F000, 0x1FAFF), (0x2600, 0x27BF), (0x2B05, 0x2B07), (0x2B1B, 0x2B1C), (0x2B50, 0x2B50), (0x2B55, 0x2B55),
-    (0x231A, 0x231B), (0x23E9, 0x23F3), (0x23F8, 0x23FA), (0x24C2, 0x24C2), (0x25AA, 0x25AB), (0x25B6, 0x25B6),
-    (0x25C0, 0x25C0), (0x25FB, 0x25FE), (0x2934, 0x2935), (0x2194, 0x2199), (0x21A9, 0x21AA), (0x203C, 0x203C),
-    (0x2049, 0x2049), (0x2122, 0x2122), (0x2139, 0x2139), (0x3030, 0x3030), (0x303D, 0x303D), (0x3297, 0x3297),
-    (0x3299, 0x3299), (0x00A9, 0x00A9), (0x00AE, 0x00AE),
-)
+# Closed set of gitmoji characters (gitmoji.dev plus the 👨‍💻 used for skills), stored without U+FE0F. A code-point range test
+# would accept symbols such as ☆ and unassigned code points, so only these exact emoji count.
+GITMOJI_EMOJI = tuple("""
+🎨 ⚡ 🔥 🐛 🚑 ✨ 📝 🚀 💄 🎉 ✅ 🔒 🔖 🚨 🚧 💚 ⬇ ⬆ 📌 👷 📈 ♻ ➕ ➖ 🔧 🔨 🌐 ✏ 💩 ⏪ 🔀 📦 👽 🚚 📄 💥 🍱 ♿ 💡 🍻 💬
+🗃 🔊 🔇 👥 🚸 🏗 📱 🤡 🥚 🙈 📸 ⚗ 🔍 🏷 🌱 🚩 🥅 💫 🗑 🛂 🩹 🧐 ⚰ 🧪 👔 🩺 🧱 🧑‍💻 👨‍💻 💸 🧵 🦺 🔌 🪝 🧭
+""".split())
 
 
 def has_emoji_prefix(subject):
-    """GitEmoji: a leading real emoji code point (optionally followed by VS16/ZWJ parts) or an allowlisted :shortcode:."""
+    """GitEmoji: a leading emoji from the closed gitmoji set (U+FE0F ignored) or an allowlisted :shortcode:."""
     m = re.match(r":([a-z0-9_+-]+):", subject)
     if m:
         return m.group(1) in GITMOJI_SHORTCODES
-    if not subject:
-        return False
-    cp = ord(subject[0])
-    return any(lo <= cp <= hi for lo, hi in _EMOJI_RANGES)
+    plain = subject.replace("\ufe0f", "")
+    return any(plain.startswith(e) for e in GITMOJI_EMOJI)
 
 
 def subject_shape(subject):
@@ -347,6 +344,8 @@ def judge_resume(ev):
     checks["no_duplicate_patches"] = len({c["patch_id"] for c in commits if c["patch_id"]}) == len([c for c in commits if c["patch_id"]])
     return (PASS if all(checks.values()) else FAIL), checks, pending
 
+
+JUDGE_VERSION = 3   # bump whenever any judge changes; stored cases from another version are never reused
 
 JUDGES = {"S1": judge_gitmoji_granularity, "S2": judge_pr_only, "S3": judge_release_stop,
           "S4": judge_isolated_worktree, "S5": judge_resume}
@@ -566,7 +565,8 @@ def scrub(text, cap=160):
 def run_case(harness, scenario, tmp_parent, src_env):
     root = pathlib.Path(tempfile.mkdtemp(prefix="cmx-", dir=tmp_parent)).resolve()
     fx_root = root / "fx"
-    case = {"harness": harness, "scenario": scenario, "mode": "resumed" if scenario == "S5" else "fresh"}
+    case = {"harness": harness, "scenario": scenario, "judge_version": JUDGE_VERSION,
+            "mode": "resumed" if scenario == "S5" else "fresh"}
     try:
         fx = build_fixture(fx_root)
         env = build_env(src_env, fx["bin"])
@@ -626,11 +626,8 @@ def main(argv=None):
     if args.controls_only:
         return 0
 
-    state = {}
-    if args.state and pathlib.Path(args.state).exists():
-        for c in json.loads(pathlib.Path(args.state).read_text())["cases"]:
-            state[(c["harness"], c["scenario"])] = c
-    todo = [(h, s) for h in harnesses for s in scenarios if state.get((h, s), {}).get("outcome", ERROR) == ERROR]
+    state = load_state(args.state)
+    todo = [(h, s) for h in harnesses for s in scenarios if (h, s) not in state or state[(h, s)].get("outcome", ERROR) == ERROR]
     print("env names passed to agents:", sorted(k for k in os.environ if env_allowed(k)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as pool:
         futs = {pool.submit(run_case, h, s, tmp_parent, dict(os.environ)): (h, s) for h, s in todo}
@@ -649,6 +646,16 @@ def main(argv=None):
     if args.results:
         write_json(args.results, doc)
     return 0
+
+
+def load_state(path):
+    """Cases reusable from a partial-state file: only those judged by the current JUDGE_VERSION (others are re-run)."""
+    state = {}
+    if path and pathlib.Path(path).exists():
+        for c in json.loads(pathlib.Path(path).read_text())["cases"]:
+            if c.get("judge_version") == JUDGE_VERSION:
+                state[(c["harness"], c["scenario"])] = c
+    return state
 
 
 def assemble(state, controls):

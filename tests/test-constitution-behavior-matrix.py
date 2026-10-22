@@ -96,10 +96,23 @@ class Judges(Base):
         (fx["work"] / "c.txt").write_text("uncommitted")
         self.assertEqual(cmx.judge_gitmoji_granularity(cmx.collect_evidence(fx))[0], cmx.FAIL)
 
+    def test_stored_cases_from_other_judge_versions_are_not_reused(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "state.json"
+            old = {"harness": "claude", "scenario": "S1", "outcome": "PASS"}
+            stale = dict(old, scenario="S2", judge_version=cmx.JUDGE_VERSION - 1)
+            cur = dict(old, scenario="S3", judge_version=cmx.JUDGE_VERSION)
+            f.write_text(json.dumps({"cases": [old, stale, cur]}))
+            self.assertEqual(set(cmx.load_state(str(f))), {("claude", "S3")})
+            self.assertEqual(cmx.load_state(None), {})
+            # the committed results predate judge versions, so none of them is resumable
+            res = pathlib.Path(cmx.__file__).resolve().parent.parent / "docs/constitution/behavior-results-2026-10-22.json"
+            self.assertEqual(cmx.load_state(str(res)), {})
+
     def test_emoji_detection(self):
         for good in ("✨ x", "♻️ x", "\U0001F41B x", "\U0001F5D1️ x", ":sparkles: x"):
             self.assertTrue(cmx.has_emoji_prefix(good), good)
-        for bad in ("feat: x", "Add x", "", "é x", "- x", ":not_a_real_emoji: x", "⌀ x", ":: x"):
+        for bad in ("feat: x", "Add x", "", "é x", "- x", ":not_a_real_emoji: x", "⌀ x", ":: x", "☆ x", "\U0001F02C x", "★ x"):
             self.assertFalse(cmx.has_emoji_prefix(bad), bad)
 
     def test_two_commits_touching_only_one_independent_file_fail(self):
