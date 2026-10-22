@@ -130,3 +130,16 @@ The unit tests replay each scenario against scratch state with fake transports (
 ## Owner decisions still open
 
 Whether and which mobile service to approve (ntfy or Pushover; no choice and no contact has been made); whether to wire `sweep` to launchd; the `stale_after_seconds` value for 10-30 hour runs; which paths count as `corporate_markers` on a corporate machine; the repository names to list in `known_repos` (an empty list means every notice says `unlisted`).
+
+## Evidence tokens and approved contract
+
+Founder approved the contract on 2026-10-22: best-effort delivery with bounded retries, best-effort dedup inside a 24 h / 500-key window, a new prompt or resume discards earlier checkpoints, a working path over 4096 characters counts as corporate, state schema v3. Mobile push remains unapproved and uncontacted.
+
+Delivery and what the owner sees are separate evidence and are never merged into one claim:
+
+| Token | Meaning | Source | Status |
+|---|---|---|---|
+| `LOCAL_NOTIFICATION_DELIVERED` | the macOS backend ran (`osascript` exit 0) and the state file records the notice as delivered, replay produced no second one | `scripts/session-notify.py status`, the smoke test above | reproducible by the agent; recorded once on 2026-10-22 |
+| `LOCAL_BANNER_CONFIRMED` | a person saw the banner on screen | the owner, by eye, after running the smoke test | **not yet confirmed**; notification settings, Focus mode or a locked screen can hide a delivered banner |
+
+A delivered record alone never upgrades to a confirmed banner. Until the owner reports seeing it, only `LOCAL_NOTIFICATION_DELIVERED` is claimed.
