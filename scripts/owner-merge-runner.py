@@ -557,6 +557,11 @@ def http_status(err):
     return m.group(1) if m and STATUS_RE.fullmatch(m.group(1)) else None
 
 
+def server_kind(info):
+    """What actually backs the merge, as the audit states it."""
+    return info.get("capability", "waived" if info.get("waived") else "server-enforced")
+
+
 def plan_limited(err):
     """True only for GitHub's own plan-limit refusal (HTTP 403 plus its fixed upgrade sentence); the text is matched
     in memory and never stored."""
@@ -876,10 +881,10 @@ def run(repo, pr, head, evidence, allowlist, audit, dry_run, gh, clock=time.time
         rec["observed_head"], rec["class"], rec["checks"], rec["server_side"], pin = \
             evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock)
         rec["base"] = pin["base"]
+        kind = server_kind(rec["server_side"])
         rec["guarantees"] = {
             "head_pin": "github-enforced (gh pr merge --match-head-commit)",
-            "server_side": rec["server_side"].get("capability", "waived" if rec["server_side"].get("waived")
-                                                  else "server-enforced"),
+            "server_side": kind,
             "review": "github-independent-approval" if cfg["independent_github_reviewers"]
                       else "local-evidence-attestation (not a GitHub approval)",
             "ci": rec["checks"]["ci_class"]}
@@ -889,6 +894,8 @@ def run(repo, pr, head, evidence, allowlist, audit, dry_run, gh, clock=time.time
             observed2, class2, checks2, rec["server_side"], _ = evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin)
         except Refused as e:
             raise Refused(["changed before execution: " + x for x in e.reasons])
+        if server_kind(rec["server_side"]) != kind:
+            raise Refused(["changed before execution: the kind of server-side backing differs between passes"])
         if checks2 != rec["checks"]:
             raise Refused(["changed before execution: check results or CI classification differ"])
         if observed2 != head or class2 != rec["class"]:

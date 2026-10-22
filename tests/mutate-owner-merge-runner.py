@@ -185,6 +185,7 @@ MUTANTS = [
     ("pf: conflicting waiver refused", 'and not (cap == "private-free-app-level" and not prot)', ''),
     ("pf: guarantees recorded", '        rec["guarantees"] = {', '        rec["guarantees_off"] = {'),
     ("pf: review label honest", '"local-evidence-attestation (not a GitHub approval)"', '"github-independent-approval"'),
+    ("pf: server backing compared across passes", '        if server_kind(rec["server_side"]) != kind:', '        if False:'),
 ]
 
 

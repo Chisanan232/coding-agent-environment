@@ -1749,6 +1749,21 @@ class PrivateFreeCapability(Base):
         self.assertIn("not a GitHub approval", g["review"])
         self.assertEqual(g["ci"], "CI_PASS")
 
+    def test_server_side_backing_cannot_change_between_passes(self):
+        class Flip(FakeGh):
+            n = 0
+
+            def __call__(self, argv, stdin=None):
+                if argv[0] == "api" and "/rules/branches/" in argv[1]:
+                    self.n += 1
+                    self.plan_limited = self.n > 2  # protected through the first pass (two rules reads), plan-limited from the second
+                return super().__call__(argv)
+        gh = Flip()
+        code, rec = self.go(gh)
+        self.assertEqual(code, omr.EXIT_REFUSED, rec)
+        self.assertIn("kind of server-side backing", " | ".join(rec["reasons"]))
+        self.assertEqual(gh.merges(), [])
+
     def test_independent_github_reviewers_change_the_review_label(self):
         self.allow.write_text(json.dumps(allow_doc(protection_capability="private-free-app-level",
                                                    independent_github_reviewers=["second-reviewer"])))
