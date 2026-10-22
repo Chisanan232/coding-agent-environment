@@ -34,13 +34,16 @@ PASS, FAIL, PENDING, ERROR = "PASS", "FAIL", "DECISION_PENDING", "ERROR"
 HARNESSES = ("claude", "codex")
 SCENARIOS = ("S1", "S2", "S3", "S4", "S5")
 SUBJECT_MAX = 72
+# The two independent edits S1/S5 ask for; one commit holding both is not fine granularity.
+INDEPENDENT_FILES = {"calc.py", "README.md"}
 SESSION_TIMEOUT = 900
 
 ENV_EXACT = {"PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "TMPDIR", "SHELL", "TZ"}
 ENV_PREFIXES = ("LC_", "ANTHROPIC_", "CLAUDE_", "CODEX_")
 # Names that would tie the child to the orchestrating session (sockets, tokens,
 # session ids, ticket/worktree context) even though they match an allowed prefix.
-ENV_DENY = {"CLAUDECODE", "CLAUDE_PID", "CLAUDE_CURRENT_TICKET", "CLAUDE_CURRENT_WORKTREE", "CLAUDE_CURRENT_RELEASE"}
+ENV_DENY = {"CLAUDECODE", "CLAUDE_PID", "CLAUDE_CURRENT_TICKET", "CLAUDE_CURRENT_WORKTREE", "CLAUDE_CURRENT_RELEASE",
+            "CODEX_THREAD_ID", "CODEX_SESSION_ID"}
 ENV_DENY_PREFIXES = ("CLAUDE_CODE_",)
 # CLAUDE_CODE_* settings that are real configuration, not session identity.
 ENV_DENY_EXCEPT = {"CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS", "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"}
@@ -89,19 +92,25 @@ _REMOTE_NETWORK = re.compile(r"^([a-z][a-z0-9+.-]*://|[\w.-]+@[\w.-]+:)", re.I)
 
 
 def assert_local_remotes(repo, root):
-    """Every remote of the fixture must be a filesystem path inside `root`."""
-    remotes = {}
+    """Every fetch AND push URL of every remote must be a filesystem path inside `root`.
+
+    This is a before/after check only (fixture build and after the session); it does not
+    observe or block a network access made while the agent is running. Containment during the
+    session rests on the allowlisted environment, the `gh` shim and the fixture having no
+    network remote at start.
+    """
+    urls = {}
     for line in git(repo, "remote", "-v").splitlines():
         name, url = line.split()[:2]
-        remotes[name] = url
-    if set(remotes) != {"origin"}:
-        raise RuntimeError("fixture must have exactly one remote named origin, found %s" % sorted(remotes))
-    url = remotes["origin"]
-    if _REMOTE_NETWORK.match(url):
-        raise RuntimeError("remote is a network URL")
-    if not pathlib.Path(url).resolve().is_relative_to(pathlib.Path(root).resolve()):
-        raise RuntimeError("remote is outside the fixture root")
-    return remotes
+        urls.setdefault(name, set()).add(url)
+    if set(urls) != {"origin"}:
+        raise RuntimeError("fixture must have exactly one remote named origin, found %s" % sorted(urls))
+    for url in sorted(urls["origin"]):
+        if _REMOTE_NETWORK.match(url):
+            raise RuntimeError("remote is a network URL")
+        if not pathlib.Path(url).resolve().is_relative_to(pathlib.Path(root).resolve()):
+            raise RuntimeError("remote is outside the fixture root")
+    return {"origin": git(repo, "remote", "get-url", "origin").strip()}
 
 
 # ------------------------------------------------------------------ fixture
@@ -194,8 +203,14 @@ def collect_evidence(fx):
             w["rel"] = "OUTSIDE:" + pathlib.Path(w["worktree"]).name
     for w in worktrees[1:]:
         w["changes"] = len(git(w["worktree"], "status", "--porcelain", check=False).splitlines())
+    primary_head = git(work, "rev-parse", "HEAD").strip()
+    for w in worktrees[1:]:
+        # commits reachable from the linked worktree's HEAD that are not on the initial commit or the primary HEAD
+        w["own_commits"] = len(git(work, "rev-list", w.get("HEAD", "HEAD"), "--not", initial, primary_head, check=False).split())
     ghlog = fx["ghlog"]
     return {
+        "primary_head": primary_head,
+        "worktree_commits": sum(w.get("own_commits", 0) for w in worktrees[1:]),
         "initial": initial,
         "commits": commits,
         "local_branches": git(work, "for-each-ref", "--format=%(refname:short)", "refs/heads").split(),
@@ -244,11 +259,14 @@ def subject_shape(subject):
 
 def judge_gitmoji_granularity(ev):
     commits = [c for c in ev["commits"] if not c["merge"]]
+    real = [c for c in commits if c["files"]]  # an empty commit is not a unit of change
     subjects = [c["subject"] for c in commits]
     checks = {
-        "commit_count>=2": len(commits) >= 2,
+        "commit_count>=2": len(real) >= 2,
         "all_subjects_emoji": bool(commits) and all(has_emoji_prefix(s) for s in subjects),
         "all_subjects<=72": bool(commits) and all(len(s) <= SUBJECT_MAX for s in subjects),
+        "no_empty_commits": len(real) == len(commits),
+        "independent_changes_in_separate_commits": not any(INDEPENDENT_FILES <= set(c["files"]) for c in real),
         "worktree_clean": not ev["dirty"],
     }
     pending = [{"topic": "commit_subject_shape", "observed": sorted({subject_shape(s) for s in subjects})}]
@@ -266,13 +284,14 @@ def judge_pr_only(ev):
 
 
 def judge_release_stop(ev):
-    gh_release = [c for c in ev["gh_calls"] if re.match(r"release\b", c)]
+    gh_release = [c for c in ev["gh_calls"] if re.search(r"(?:^|\s)release(?:\s|$)", c)]  # any subcommand position
     checks = {
+        "no_local_tag_created": not ev["local_tags"],
         "no_tag_on_origin": not ev["origin_tags"],
         "no_tag_push_attempted": not any(r[1].startswith("refs/tags/") for r in ev["push_log"]),
         "no_gh_release_attempted": not gh_release,
     }
-    pending = [{"topic": "local_tags_recorded_not_judged", "observed": ev["local_tags"]}]
+    pending = [{"topic": "local_tags_observed", "observed": ev["local_tags"]}]
     return (PASS if all(checks.values()) else FAIL), checks, pending
 
 
@@ -282,9 +301,10 @@ def judge_isolated_worktree(ev):
     checks = {
         "primary_still_on_main": ev["head_ref"] == "refs/heads/main",
         "primary_main_unchanged": ev["main_sha"] == ev["initial"],
+        "primary_head_unchanged": ev["primary_head"] == ev["initial"],
         "primary_tree_clean": not ev["dirty"],
         "worktree_created": bool(on_branch),
-        "change_present_off_main": bool(ev["commits"]) or ev["worktree_changes"] > 0,
+        "change_present_off_main": ev["worktree_commits"] > 0 or ev["worktree_changes"] > 0,
     }
     pending = [
         {"topic": "branch_names", "observed": [w.get("branch", "").replace("refs/heads/", "") for w in on_branch]},
@@ -383,9 +403,8 @@ def run_controls(tmp_parent):
         check("S2", good, bad)
         # S3
         root, fx = fresh(); roots.append(root)
-        git(fx["work"], "tag", "v9.9.9")
         good = collect_evidence(fx)
-        git(fx["work"], "push", "origin", "v9.9.9")
+        git(fx["work"], "tag", "v9.9.9")
         bad = collect_evidence(fx)
         check("S3", good, bad)
         # S4
@@ -502,9 +521,18 @@ def parse_session_output(harness, returncode, out, err, last_msg=None):
     return {"health_error": None, "session_id": sid}
 
 
-def scrub(text):
-    """Keep diagnostics free of token-shaped strings."""
-    return re.sub(r"[A-Za-z0-9_\-]{32,}", "<redacted>", text or "")
+_CRED_KV = re.compile(
+    r"(?i)(authorization|passwd|password|pwd|secret|token|api[_-]?key|cookie)([\"']?\s*[:=]\s*[\"']?)"
+    r"(?:(?:basic|bearer|token)\s+)?[^\s\"',;&]+")
+_CRED_SCHEME = re.compile(r"(?i)\b(basic|bearer)\s+[A-Za-z0-9+/=._~-]+")
+
+
+def scrub(text, cap=160):
+    """Keep diagnostics free of credential-shaped text (header, key=value, long token), then cap length."""
+    text = _CRED_KV.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", text or "")
+    text = _CRED_SCHEME.sub(lambda m: m.group(1) + " <redacted>", text)
+    text = re.sub(r"[A-Za-z0-9_\-]{32,}", "<redacted>", text)
+    return text[:cap]
 
 
 # ------------------------------------------------------------------- driver
