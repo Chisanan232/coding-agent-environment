@@ -45,14 +45,13 @@ READ_PATHS = (re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rules/branches/
               re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rulesets/([1-9][0-9]{0,11})"))
 TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 REVIEWER_KINDS = {"human", "independent-agent"}
-RISKY_BYPASS = {"OrganizationAdmin", "RepositoryRole", "Team"}
 MAX_EVIDENCE_AGE_HOURS = 168
 MIN_KEY_BYTES = 32
 LOGIN_RE = re.compile(r"(app/)?[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?")
 
 PR_FIELDS = ("state,isDraft,author,baseRefName,headRefName,headRefOid,isCrossRepository,mergeable,"
              "mergeStateStatus,reviewDecision,reviews,statusCheckRollup,files")
-READBACK_FIELDS = "state,mergeCommit"
+READBACK_FIELDS = "state,mergeCommit,baseRefName"
 
 BOT_LOGINS = {"dependabot", "renovate"}
 BOT_BRANCH = re.compile(r"(dependabot|renovate)/")
@@ -322,8 +321,9 @@ def load_evidence(path, head, repo, pr, base, cfg, key, now):
     try:
         if os.path.getsize(path) > 65536:
             raise Refused(["evidence file too large"])
-        with open(path, "r", encoding="utf-8") as f:
-            ev = json.load(f)
+        with open(path, "rb") as f:
+            raw = f.read(65537)
+        ev = json.loads(raw.decode("utf-8"))
     except Refused:
         raise
     except (OSError, ValueError):
@@ -368,6 +368,7 @@ def load_evidence(path, head, repo, pr, base, cfg, key, now):
             bad.append("evidence signature missing or invalid")
     if bad:
         raise Refused(bad)
+    return hashlib.sha256(raw).hexdigest()
 
 
 def require(p, key, kind):
@@ -467,9 +468,15 @@ def check_server_protection(runner, repo, base, cfg):
         raise RuntimeError("gh rules read returned unexpected JSON shape")
     names, ids = parse_rule_contexts(rules)
     rc, prot, err = _read_json(runner, protection_argv(repo, base), "gh branch protection read")
+    admins = "n/a"
     if rc == 0:
         names |= parse_protection_contexts(prot)
         prot_state = "read"
+        ea = prot.get("enforce_admins")
+        admins = isinstance(ea, dict) and ea.get("enabled") is True
+        if not admins and not cfg["accept_bypass_actors"]:
+            raise Refused(["branch protection does not enforce its rules for administrators (enforce_admins); "
+                           "set accept_bypass_actors to accept"])
     elif re.search(r"404|Not Found", err):
         prot_state = "absent"
     else:
@@ -488,10 +495,10 @@ def check_server_protection(runner, repo, base, cfg):
         if rc != 0 or not isinstance(actors, list) or not all(isinstance(a, dict) for a in actors):
             unreadable = True
             continue
-        risky += [a.get("actor_type") for a in actors if a.get("actor_type") in RISKY_BYPASS]
+        risky += [str(a.get("actor_type")) for a in actors]  # any listed actor is a bypass; only [] is none
     if risky and not cfg["accept_bypass_actors"]:
         raise Refused([f"ruleset allows bypass by {sorted(set(risky))}; set accept_bypass_actors to accept"])
-    return {"contexts": sorted(names), "protection": prot_state,
+    return {"contexts": sorted(names), "protection": prot_state, "enforce_admins": admins,
             "bypass": "accepted" if risky else ("unreadable" if unreadable else "none")}
 
 
@@ -562,18 +569,26 @@ def decide(p, repo, pr, head, me, cfg):
     return pr_class, checks
 
 
-def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock):
-    """One complete read-and-decide pass: fresh PR facts, evidence (bound to head and base), every guard,
-    server-side protection. Returns (observed head, class, checks, server-side info)."""
+def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin=None):
+    """One complete read-and-decide pass. The base branch comes from the first PR read of the first pass and is
+    pinned: every later PR read, the protection reads, the evidence and the read-back must agree with it, and the
+    evidence file must be byte-identical across passes. Returns (head, class, checks, server-side info, pin)."""
     facts = runner.json(pr_view_argv(repo, pr, PR_FIELDS))
     observed = facts.get("headRefOid") if isinstance(facts.get("headRefOid"), str) else None
     base = facts.get("baseRefName") if isinstance(facts.get("baseRefName"), str) else ""
+    if pin is not None and base != pin["base"]:
+        raise Refused(["base branch changed since the first read"])
     pr_class, checks = decide(facts, repo, pr, head, me, cfg)
-    load_evidence(evidence, head, repo, pr, base, cfg, key, clock())
+    digest = load_evidence(evidence, head, repo, pr, base, cfg, key, clock())
+    if pin is not None and digest != pin["evidence"]:
+        raise Refused(["evidence file changed since the first read"])
     info = {"waived": True}
     if cfg["require_server_side_protection"]:
-        info = check_server_protection(runner, repo, base, cfg)
-    return observed, pr_class, checks, info
+        info = check_server_protection(runner, repo, base, cfg)  # for the pinned base
+    after = runner.json(pr_view_argv(repo, pr, PR_FIELDS))
+    if after.get("baseRefName") != base or after.get("headRefOid") != head:
+        raise Refused(["base branch or head changed while server-side state was being read"])
+    return observed, pr_class, checks, info, {"base": base, "evidence": digest}
 
 
 class AuditError(OSError):
@@ -639,12 +654,13 @@ def run(repo, pr, head, evidence, allowlist, audit, dry_run, gh, clock=time.time
         cfg = repo_config(allow, repo)
         key = load_key(allow["evidence_key_file"]) if cfg["require_signed_evidence"] else None
         rec["signed_evidence"] = cfg["require_signed_evidence"]
-        rec["observed_head"], rec["class"], rec["checks"], rec["server_side"] = \
+        rec["observed_head"], rec["class"], rec["checks"], rec["server_side"], pin = \
             evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock)
+        rec["base"] = pin["base"]
         rec["decision"] = "APPROVE"
         # Full re-evaluation immediately before the one mutating call; any change refuses.
         try:
-            observed2, class2, _, rec["server_side"] = evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock)
+            observed2, class2, _, rec["server_side"], _ = evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin)
         except Refused as e:
             raise Refused(["changed before execution: " + x for x in e.reasons])
         if observed2 != head or class2 != rec["class"]:
@@ -668,10 +684,11 @@ def run(repo, pr, head, evidence, allowlist, audit, dry_run, gh, clock=time.time
                     mc = (back.get("mergeCommit") or {}).get("oid") if isinstance(back.get("mergeCommit"), dict) else None
                 except RuntimeError:
                     back, mc = {}, None
-                if back.get("state") == "MERGED" and isinstance(mc, str) and SHA_RE.fullmatch(mc):
+                if back.get("state") == "MERGED" and isinstance(mc, str) and SHA_RE.fullmatch(mc) \
+                        and back.get("baseRefName") == pin["base"]:
                     rec["outcome"], code = "MERGED", EXIT_OK
                 else:
-                    rec["reasons"].append("read-back did not show MERGED with a merge commit")
+                    rec["reasons"].append("read-back did not show MERGED, a merge commit and the pinned base branch")
                     rec["outcome"], code = "UNVERIFIED", EXIT_UNVERIFIED
     except Refused as e:
         rec["reasons"] += [scrub(x) for x in e.reasons]

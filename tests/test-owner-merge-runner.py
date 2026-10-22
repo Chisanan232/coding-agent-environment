@@ -70,6 +70,9 @@ class FakeGh:
         self.ruleset = (0, json.dumps({"id": 11, "bypass_actors": []})) if ruleset is None else ruleset
         self.protection = protection  # (rc, stdout-or-stderr) for the branch-protection read
         self.fetches = 0
+        self.readback_base = None
+        self.on_fetch = None  # called with the fetch number before each PR-facts read
+        self.on_ruleset = None
         self.on_merge = None
         self.calls = []
         self.views = 0
@@ -82,13 +85,18 @@ class FakeGh:
             fields = argv[6]
             if fields == omr.PR_FIELDS:
                 self.fetches += 1
-                pr = self.later if (self.later is not None and self.fetches >= 2) else self.pr
+                if self.on_fetch:
+                    self.on_fetch(self.fetches)
+                pr = self.later if (self.later is not None and self.fetches >= 3) else self.pr
                 return 0, json.dumps(pr), ""
             if fields == omr.READBACK_FIELDS:
                 if self.merged:
-                    return 0, json.dumps({"state": "MERGED", "mergeCommit": {"oid": MERGE_SHA}}), ""
-                return 0, json.dumps({"state": "OPEN", "mergeCommit": None}), ""
+                    return 0, json.dumps({"state": "MERGED", "mergeCommit": {"oid": MERGE_SHA},
+                                          "baseRefName": self.readback_base or self.pr["baseRefName"]}), ""
+                return 0, json.dumps({"state": "OPEN", "mergeCommit": None, "baseRefName": self.pr["baseRefName"]}), ""
         if argv[0] == "api" and "/rulesets/" in argv[1]:
+            if self.on_ruleset:
+                self.on_ruleset()
             rc, text = self.ruleset
             return (0, text, "") if rc == 0 else (1, "", text)
         if argv[0] == "api" and "/rules/branches/" in argv[1]:
@@ -216,11 +224,11 @@ class Refusals(Base):
             self.assertEqual(code, omr.EXIT_REFUSED, name)
             self.assertEqual(gh.merges(), [], name)
             self.assertIn("changed before execution", " ".join(rec["reasons"]), name)
-            self.assertEqual(gh.fetches, 2, name)
+            self.assertEqual(gh.fetches, 3, name)
 
     def test_server_side_protection_required_by_default(self):
         self.assertRefused(FakeGh(rules=[{"type": "pull_request"}]), "no server-side required status checks")
-        self.assertRefused(FakeGh(rules=[], protection=(0, json.dumps({"required_status_checks": None}))),
+        self.assertRefused(FakeGh(rules=[], protection=(0, json.dumps({"enforce_admins": {"enabled": True}, "required_status_checks": None}))),
                            "no server-side required status checks")
 
     def test_server_side_set_must_cover_every_allowlisted_required_check(self):
@@ -249,12 +257,12 @@ class Refusals(Base):
             self.assertRefused(FakeGh(rules=[], protection=(0, json.dumps(prot))), "")
 
     def test_branch_protection_contexts_and_checks_are_parsed_and_unioned_with_rulesets(self):
-        prot = {"required_status_checks": {"contexts": ["ci"], "checks": [{"context": "SonarCloud Code Analysis", "app_id": 1}]}}
+        prot = {"enforce_admins": {"enabled": True}, "required_status_checks": {"contexts": ["ci"], "checks": [{"context": "SonarCloud Code Analysis", "app_id": 1}]}}
         code, rec = self.go(FakeGh(rules=[], protection=(0, json.dumps(prot))))
         self.assertEqual(code, omr.EXIT_OK)
         self.assertEqual(rec["server_side"]["contexts"], sorted(REQUIRED))
         mixed = FakeGh(rules=server_rules(["ci"]), protection=(0, json.dumps(
-            {"required_status_checks": {"contexts": ["SonarCloud Code Analysis"]}})))
+            {"enforce_admins": {"enabled": True}, "required_status_checks": {"contexts": ["SonarCloud Code Analysis"]}})))
         self.assertEqual(self.go(mixed)[0], omr.EXIT_OK)
 
     def test_server_side_read_error_fails_closed(self):
@@ -266,20 +274,33 @@ class Refusals(Base):
         code, rec = self.go(FakeGh(protection=(1, "HTTP 403: Resource not accessible")))
         self.assertEqual((code, rec["server_side"]["protection"]), (omr.EXIT_OK, "unreadable"))
 
-    def test_bypass_actors_refuse_unless_accepted(self):
-        for actor in ({"actor_type": "OrganizationAdmin", "actor_id": 1}, {"actor_type": "RepositoryRole", "actor_id": 5},
-                      {"actor_type": "Team", "actor_id": 9}):
+    def test_every_bypass_actor_type_refuses_unless_accepted(self):
+        for typ in ("User", "Team", "OrganizationAdmin", "RepositoryRole", "EnterpriseOwner", "EnterpriseRole",
+                    "DeployKey", "Integration", "SomethingNew", None):
+            actor = {"actor_type": typ, "actor_id": 1}
             gh = FakeGh(ruleset=(0, json.dumps({"id": 11, "bypass_actors": [actor]})))
             self.assertRefused(gh, "allows bypass")
         self.allow.write_text(json.dumps(allow_doc(accept_bypass_actors=True)))
-        gh = FakeGh(ruleset=(0, json.dumps({"id": 11, "bypass_actors": [{"actor_type": "RepositoryRole", "actor_id": 5}]})))
+        gh = FakeGh(ruleset=(0, json.dumps({"id": 11, "bypass_actors": [{"actor_type": "User", "actor_id": 5}]})))
         code, rec = self.go(gh)
         self.assertEqual((code, rec["server_side"]["bypass"]), (omr.EXIT_OK, "accepted"))
 
-    def test_non_user_bypass_actors_and_none_are_recorded_as_none(self):
-        gh = FakeGh(ruleset=(0, json.dumps({"id": 11, "bypass_actors": [{"actor_type": "Integration", "actor_id": 3}]})))
-        code, rec = self.go(gh)
+    def test_empty_bypass_list_is_the_only_none(self):
+        code, rec = self.go(FakeGh())
         self.assertEqual((code, rec["server_side"]["bypass"]), (omr.EXIT_OK, "none"))
+
+    def test_enforce_admins_must_be_true_on_classic_protection(self):
+        prot = lambda ea: (0, json.dumps({"enforce_admins": ea, "required_status_checks": {"contexts": REQUIRED}}))
+        for ea in ({"enabled": False}, {}, None, "true", {"enabled": "true"}):
+            self.assertRefused(FakeGh(rules=[], protection=prot(ea)), "enforce_admins")
+        self.assertEqual(self.go(FakeGh(rules=[], protection=prot({"enabled": True})))[0], omr.EXIT_OK)
+        self.allow.write_text(json.dumps(allow_doc(accept_bypass_actors=True)))
+        code, rec = self.go(FakeGh(rules=[], protection=prot({"enabled": False})))
+        self.assertEqual((code, rec["server_side"]["enforce_admins"]), (omr.EXIT_OK, False))
+
+    def test_enforce_admins_checked_even_when_rulesets_also_cover(self):
+        prot = (0, json.dumps({"enforce_admins": {"enabled": False}}))
+        self.assertRefused(FakeGh(protection=prot), "enforce_admins")
 
     def test_unreadable_bypass_actors_are_recorded_not_refused(self):
         for ruleset in ((1, "HTTP 403"), (0, json.dumps({"id": 11})), (0, json.dumps({"bypass_actors": "x"}))):
@@ -576,7 +597,66 @@ class EvidenceBindingAndAge(Base):
         code, rec = self.go(gh)
         self.assertEqual((code, gh.merges()), (omr.EXIT_REFUSED, []))
         self.assertIn("changed before execution", " ".join(rec["reasons"]))
-        self.assertIn("evidence base branch", " ".join(rec["reasons"]))
+        self.assertIn("base branch changed since the first read", " ".join(rec["reasons"]))
+
+    def test_base_flip_during_ruleset_detail_read_refuses(self):
+        gh = FakeGh()
+        gh.on_ruleset = lambda: gh.pr.update(baseRefName="release")
+        code, rec = self.go(gh)
+        self.assertEqual((code, gh.merges()), (omr.EXIT_REFUSED, []))
+        self.assertIn("changed while server-side state was being read", " ".join(rec["reasons"]))
+
+    def test_base_change_between_reads_with_new_signed_evidence_for_new_base_refuses(self):
+        self.allow.write_text(json.dumps(dict(allow_doc(), evidence_key_file=str(self.tmp_real / "k.key"))))
+        key = b"SYNTHETIC-TEST-KEY-0123456789abcdef-NOT-A-SECRET"
+        (self.tmp_real / "k.key").write_bytes(key)
+        os.chmod(self.tmp_real / "k.key", 0o600)
+
+        def signed(base):
+            self.write_evidence(base=base)
+            ev = json.loads(self.evidence.read_text())
+            ev["hmac"] = omr.evidence_mac(key, ev)
+            self.evidence.write_text(json.dumps(ev))
+        signed("main")
+        gh = FakeGh(later=base_pr(baseRefName="release"))
+        gh.on_fetch = lambda n: signed("release") if n == 3 else None  # attacker re-signs for the new base
+        code, rec = self.go(gh)
+        self.assertEqual((code, gh.merges()), (omr.EXIT_REFUSED, []))
+        self.assertIn("base branch changed since the first read", " ".join(rec["reasons"]))
+
+    def test_evidence_changed_between_passes_refuses_even_with_same_base(self):
+        gh = FakeGh()
+        gh.on_fetch = lambda n: self.write_evidence(reviewed_at="2026-10-20T11:00:00Z") if n == 3 else None
+        code, rec = self.go(gh)
+        self.assertEqual((code, gh.merges()), (omr.EXIT_REFUSED, []))
+        self.assertIn("evidence file changed since the first read", " ".join(rec["reasons"]))
+
+    def test_head_flip_during_protection_reads_refuses(self):
+        gh = FakeGh()
+        gh.on_ruleset = lambda: gh.pr.update(headRefOid=OTHER)
+        self.assertEqual(self.go(gh)[0], omr.EXIT_REFUSED)
+        self.assertEqual(gh.merges(), [])
+
+    def test_protection_is_read_for_the_pinned_base(self):
+        gh = FakeGh()
+        self.assertEqual(self.go(gh)[0], omr.EXIT_OK)
+        reads = [c[1] for c in gh.calls if c[0] == "api" and c[1].startswith("repos/")]
+        self.assertTrue(reads and all("/main" in r or "/rulesets/" in r for r in reads), reads)
+
+    def test_protection_reads_follow_a_non_main_pinned_base(self):
+        self.write_evidence(base="release/1.x")
+        gh = FakeGh(base_pr(baseRefName="release/1.x"))
+        self.assertEqual(self.go(gh)[0], omr.EXIT_OK)
+        reads = [c[1] for c in gh.calls if c[0] == "api" and c[1].startswith("repos/")]
+        self.assertIn(f"repos/{REPO}/rules/branches/release/1.x", reads)
+        self.assertIn(f"repos/{REPO}/branches/release/1.x/protection", reads)
+
+    def test_readback_with_changed_base_is_unverified(self):
+        gh = FakeGh()
+        gh.readback_base = "release"
+        code, rec = self.go(gh)
+        self.assertEqual((code, rec["outcome"]), (omr.EXIT_UNVERIFIED, "UNVERIFIED"))
+        self.assertEqual(rec["base"], "main")
 
     def test_first_read_with_different_base_refuses(self):
         self.assertRefused(FakeGh(base_pr(baseRefName="release")), "evidence base branch")
