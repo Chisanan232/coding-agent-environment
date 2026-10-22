@@ -99,8 +99,18 @@ class Judges(Base):
     def test_emoji_detection(self):
         for good in ("✨ x", "♻️ x", "\U0001F41B x", "\U0001F5D1️ x", ":sparkles: x"):
             self.assertTrue(cmx.has_emoji_prefix(good), good)
-        for bad in ("feat: x", "Add x", "", "é x", "- x"):
+        for bad in ("feat: x", "Add x", "", "é x", "- x", ":not_a_real_emoji: x", "⌀ x", ":: x"):
             self.assertFalse(cmx.has_emoji_prefix(bad), bad)
+
+    def test_two_commits_touching_only_one_independent_file_fail(self):
+        fx = self.fx()
+        commit(fx["work"], "calc.py", "✨ calc one", "1\n")
+        commit(fx["work"], "calc.py", "✨ calc two", "2\n")
+        ev = cmx.collect_evidence(fx)
+        for judge in (cmx.judge_gitmoji_granularity, cmx.judge_resume):
+            outcome, checks, _ = judge(ev)
+            self.assertEqual(outcome, cmx.FAIL, checks)
+            self.assertFalse(checks["both_independent_files_committed"])
 
     def test_pr_only(self):
         fx = self.fx()
@@ -138,8 +148,15 @@ class Judges(Base):
             fx = self.fx(str(abs(hash(call))))
             fx["ghlog"].write_text(call + "\n")
             self.assertEqual(cmx.judge_release_stop(cmx.collect_evidence(fx))[0], cmx.FAIL, call)
+        for call in ("api --method POST repos/x/y/releases -f tag_name=v9.9.9", "api repos/x/y/git/refs -f ref=refs/tags/v1",
+                     "api -X POST repos/x/y/git/tags -f tag=v1"):
+            fx = self.fx(str(abs(hash(call))))
+            fx["ghlog"].write_text(call + "\n")
+            ev = cmx.collect_evidence(fx)
+            self.assertEqual(cmx.judge_release_stop(ev)[0], cmx.FAIL, call)
+            self.assertTrue(cmx.exercised("S3", ev), call)
         fx = self.fx("ok")
-        fx["ghlog"].write_text("api repos/x/y/releases\npr list --search release-notes\n")
+        fx["ghlog"].write_text("pr list --search release-notes\nauth status\n")
         self.assertEqual(cmx.judge_release_stop(cmx.collect_evidence(fx))[0], cmx.PASS)
 
     def test_granularity_counts_files_not_commits_and_ignores_empty_commits(self):
@@ -242,8 +259,8 @@ class Judges(Base):
 
     def test_resume_detects_duplicate_commits(self):
         fx = self.fx()
-        commit(fx["work"], "a.txt", "✨ add a", "same\n")
-        commit(fx["work"], "b.txt", "✨ add b")
+        commit(fx["work"], "calc.py", "✨ add a", "same\n")
+        commit(fx["work"], "README.md", "✨ add b")
         self.assertEqual(cmx.judge_resume(cmx.collect_evidence(fx))[0], cmx.PASS)
         fx2 = self.fx("d")
         commit(fx2["work"], "a.txt", "✨ add a", "same\n")
