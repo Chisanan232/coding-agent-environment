@@ -1,6 +1,6 @@
 {
  "version": 1,
- "description": "Owner-merge rule corpus (SPE-118): the pinned merge and routine PR verbs must run with no prompt, every other merge or approval spelling must prompt. Run with scripts/permission-host-matrix.py --candidate docs/examples/owner-merge-pinned-allow.example.json. Every target is a nonexistent repository.",
+ "description": "Owner-merge rule corpus (SPE-118): the pinned merge and routine PR verbs must run with no prompt, every other merge or approval spelling in an OWNER_ASK entry must prompt (UNKNOWN_REQUIRES_REVIEW entries are measured residuals that do not). Run with scripts/permission-host-matrix.py --candidate docs/examples/owner-merge-pinned-allow.example.json. Every target is a nonexistent repository.",
  "commands": [
   {
    "id": "001-owner-merge",

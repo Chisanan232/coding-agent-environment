@@ -215,7 +215,7 @@ The measured gap: the allow clears the *classifier*, not the *judgment*. The dec
 
 ### Measured on the real host (2026-10-22)
 
-`scripts/permission-host-matrix.py` (SPE-119) was run against these rules with `docs/permission-corpus/owner-merge-corpus.json` (47 commands, every target a nonexistent repository; hook-recorded ground truth, matched to the tested command; zero probe errors; results in `docs/permission-corpus/owner-merge-results-2026-10-22.json`).
+`scripts/permission-host-matrix.py` (SPE-119) was run against these rules with `docs/permission-corpus/owner-merge-corpus.json` (47 commands, every target a nonexistent repository; hook-recorded ground truth, matched to the tested command by program and arguments (rtk may append an argument such as a trailing dot, and the stored `recorded` text is truncated to 160 characters, so stored commands are not byte-identical to the corpus); zero probe errors; results in `docs/permission-corpus/owner-merge-results-2026-10-22.json`).
 
 | | Result |
 |---|---|
@@ -271,7 +271,7 @@ Rollback: check that `shasum -a 256` of the backup equals the recorded pin, copy
 
 ## 6. Decision needed (owner), with the evidence
 
-The merge itself is gated deterministically by `scripts/owner-merge-gate.py` (read-only) plus the pinned command. What is undecided is how the host is allowed to run the pinned command without a per-merge prompt, and the measured answer is that a glob allow cannot do it safely. Options:
+The merge gate (`scripts/owner-merge-gate.py`) is deterministic when it is run, but it is read-only and prints the pinned command after PASS; nothing forces a merge through it, and the head pin enforces SHA equality only, not that a review or the gate happened. What is undecided is how the host is allowed to run the pinned command without a per-merge prompt, and the measured answer is that a glob allow cannot do it safely. Options:
 
 | Option | What it is | Cost and limits |
 |---|---|---|

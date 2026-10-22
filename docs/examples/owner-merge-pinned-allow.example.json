@@ -1,5 +1,5 @@
 {
-  "_scope_note": "Generated from the JSON block in docs/OWNER-MERGE-AUTONOMY.md (a test pins them equal). Candidate for scripts/permission-host-matrix.py only; the owner applies the block to the live file by hand.",
+  "_scope_note": "NOT RECOMMENDED FOR DEPLOYMENT as it stands. Generated from the JSON block in docs/OWNER-MERGE-AUTONOMY.md (a test pins them equal) for scripts/permission-host-matrix.py measurement only. The document's measured residuals are open-ended and the owner decision in its section 6 is unresolved; apply by hand only if the owner chooses option D.",
   "permissions": {
     "allow": [
       "Bash(gh pr merge * --merge --match-head-commit *)",
