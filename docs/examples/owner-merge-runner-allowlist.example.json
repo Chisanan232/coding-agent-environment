@@ -1,3 +1,9 @@
 {
-  "repos": ["EXAMPLE-OWNER/example-repo"]
+  "repos": {
+    "EXAMPLE-OWNER/example-repo": {
+      "required_checks": ["ci", "SonarCloud Code Analysis"],
+      "reviewers": ["independent-reviewer-id"],
+      "require_server_side_protection": true
+    }
+  }
 }

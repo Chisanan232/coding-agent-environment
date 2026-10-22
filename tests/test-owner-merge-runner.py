@@ -28,9 +28,18 @@ REPO = "Chisanan232/demo-repo"
 ME = "chisanan232"
 
 
+REQUIRED = ["ci", "SonarCloud Code Analysis"]
+
+
 def green():
     return [{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"},
             {"__typename": "StatusContext", "context": "SonarCloud Code Analysis", "state": "SUCCESS"}]
+
+
+def allow_doc(**cfg):
+    c = {"required_checks": REQUIRED, "reviewers": ["independent-1"]}
+    c.update(cfg)
+    return {"repos": {REPO: c}}
 
 
 def base_pr(**over):
@@ -43,11 +52,16 @@ def base_pr(**over):
 
 
 class FakeGh:
-    def __init__(self, pr=None, merge_rc=0, merge_err="", merged=True, head_after=None, user=ME):
+    def __init__(self, pr=None, merge_rc=0, merge_err="", merged=True, later=None, user=ME,
+                 rules=None, protection=(1, "HTTP 404: Not Found")):
         self.pr = pr if pr is not None else base_pr()
         self.merge_rc, self.merge_err, self.merged = merge_rc, merge_err, merged
-        self.head_after = head_after  # head reported by the second (pre-exec) view
+        self.later = later  # PR facts returned from the second full fetch (the pre-exec re-check) on
         self.user = user
+        self.rules = [{"type": "required_status_checks"}] if rules is None else rules
+        self.protection = protection  # (rc, stdout-or-stderr) for the branch-protection read
+        self.fetches = 0
+        self.on_merge = None
         self.calls = []
         self.views = 0
 
@@ -58,15 +72,21 @@ class FakeGh:
         if argv[:2] == ["pr", "view"]:
             fields = argv[6]
             if fields == omr.PR_FIELDS:
-                return 0, json.dumps(self.pr), ""
-            if fields == omr.HEAD_FIELDS:
-                head = self.head_after or self.pr["headRefOid"]
-                return 0, json.dumps({"state": self.pr["state"], "headRefOid": head}), ""
+                self.fetches += 1
+                pr = self.later if (self.later is not None and self.fetches >= 2) else self.pr
+                return 0, json.dumps(pr), ""
             if fields == omr.READBACK_FIELDS:
                 if self.merged:
                     return 0, json.dumps({"state": "MERGED", "mergeCommit": {"oid": MERGE_SHA}}), ""
                 return 0, json.dumps({"state": "OPEN", "mergeCommit": None}), ""
+        if argv[0] == "api" and "/rules/branches/" in argv[1]:
+            return 0, json.dumps(self.rules), ""
+        if argv[0] == "api" and argv[1].endswith("/protection"):
+            rc, text = self.protection
+            return (0, text, "") if rc == 0 else (1, "", text)
         if argv[:2] == ["pr", "merge"]:
+            if self.on_merge:
+                self.on_merge()
             return self.merge_rc, "", self.merge_err
         raise AssertionError(f"unexpected argv {argv}")
 
@@ -74,20 +94,27 @@ class FakeGh:
         return [c for c in self.calls if c[:2] == ["pr", "merge"]]
 
 
+DROP = object()
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        d = pathlib.Path(self.tmp.name)
+        d = pathlib.Path(os.path.realpath(self.tmp.name))
+        self.tmp_real = d
         self.allow = d / "allow.json"
-        self.allow.write_text(json.dumps({"repos": [REPO]}))
+        self.allow.write_text(json.dumps(allow_doc()))
         self.evidence = d / "evidence.json"
         self.write_evidence()
         self.audit = d / "audit" / "log.jsonl"
 
     def write_evidence(self, **over):
-        ev = {"head": HEAD, "verdict": "PASS", "reviewer": "independent-1"}
+        ev = {"repo": REPO, "pr": 7, "head": HEAD, "verdict": "PASS", "reviewer": "independent-1",
+              "reviewer_kind": "independent-agent", "reviewed_at": "2026-10-20T10:00:00Z"}
         ev.update(over)
+        for k in [k for k, v in ev.items() if v is DROP]:
+            del ev[k]
         self.evidence.write_text(json.dumps(ev))
 
     def go(self, gh, repo=REPO, pr="7", head=HEAD, dry=False, allow=None, evidence=None):
@@ -103,6 +130,14 @@ class Base(unittest.TestCase):
         self.assertEqual(gh.merges(), [], "a refusal must never reach gh pr merge")
         self.assertIn(needle, " | ".join(rec["reasons"]))
         return rec
+
+
+    def assertBlocked(self, gh, needle, **kw):
+        """Like assertRefused, but also accepts the audit-failed code when the audit shares the tampered tree."""
+        code, rec = self.go(gh, **kw)
+        self.assertIn(code, (omr.EXIT_REFUSED, omr.EXIT_AUDIT), rec)
+        self.assertEqual(gh.merges(), [])
+        self.assertIn(needle, " | ".join(rec["reasons"]))
 
 
 class HappyPath(Base):
@@ -152,8 +187,46 @@ class Refusals(Base):
         self.assertRefused(FakeGh(), "observed head differs", head=OTHER)
 
     def test_head_moved_between_check_and_exec(self):
-        gh = FakeGh(head_after=OTHER)
-        self.assertRefused(gh, "head moved")
+        self.assertRefused(FakeGh(later=base_pr(headRefOid=OTHER)), "changed before execution")
+
+    def test_full_recheck_before_exec_catches_every_stale_fact(self):
+        bad_roll = green() + [{"__typename": "CheckRun", "name": "late", "status": "COMPLETED", "conclusion": "FAILURE"}]
+        cases = {"changes requested": base_pr(reviews=[{"author": {"login": "rev"}, "state": "CHANGES_REQUESTED",
+                                                         "commit": {"oid": HEAD}}]),
+                 "check failed": base_pr(statusCheckRollup=bad_roll),
+                 "required check vanished": base_pr(statusCheckRollup=green()[:1]),
+                 "not clean": base_pr(mergeStateStatus="BLOCKED"),
+                 "draft": base_pr(isDraft=True), "closed": base_pr(state="CLOSED"),
+                 "class changed": base_pr(author={"login": "stranger"})}
+        for name, later in cases.items():
+            gh = FakeGh(later=later)
+            code, rec = self.go(gh)
+            self.assertEqual(code, omr.EXIT_REFUSED, name)
+            self.assertEqual(gh.merges(), [], name)
+            self.assertIn("changed before execution", " ".join(rec["reasons"]), name)
+            self.assertEqual(gh.fetches, 2, name)
+
+    def test_server_side_protection_required_by_default(self):
+        self.assertRefused(FakeGh(rules=[{"type": "pull_request"}]), "no server-side required status checks")
+        self.assertRefused(FakeGh(rules=[], protection=(0, json.dumps({"required_status_checks": None}))),
+                           "no server-side required status checks")
+
+    def test_server_side_protection_via_branch_protection_or_ruleset(self):
+        ok = FakeGh(rules=[], protection=(0, json.dumps({"required_status_checks": {"contexts": ["ci"]}})))
+        self.assertEqual(self.go(ok)[0], omr.EXIT_OK)
+        self.assertEqual(self.go(FakeGh())[0], omr.EXIT_OK)
+
+    def test_server_side_protection_read_error_fails_closed(self):
+        gh = FakeGh(rules=[], protection=(1, "HTTP 403: Resource not accessible"))
+        code, _ = self.go(gh)
+        self.assertEqual((code, gh.merges()), (omr.EXIT_ERROR, []))
+
+    def test_server_side_protection_explicit_waiver(self):
+        self.allow.write_text(json.dumps(allow_doc(require_server_side_protection=False)))
+        code, rec = self.go(FakeGh(rules=[]))
+        self.assertEqual((code, rec["server_side_protection"]), (omr.EXIT_OK, "waived"))
+        self.allow.write_text(json.dumps(allow_doc(require_server_side_protection="false")))
+        self.assertRefused(FakeGh(rules=[]), "invalid")
 
     def test_draft(self):
         self.assertRefused(FakeGh(base_pr(isDraft=True)), "draft")
@@ -174,7 +247,34 @@ class Refusals(Base):
         self.assertRefused(FakeGh(base_pr(statusCheckRollup=roll)), "SonarCloud")
 
     def test_missing_checks(self):
-        self.assertRefused(FakeGh(base_pr(statusCheckRollup=[])), "no status checks")
+        self.assertRefused(FakeGh(base_pr(statusCheckRollup=[])), "required check ci is missing")
+
+    def test_each_required_check_must_be_present(self):
+        self.assertRefused(FakeGh(base_pr(statusCheckRollup=green()[:1])), "required check SonarCloud")
+        self.assertRefused(FakeGh(base_pr(statusCheckRollup=green()[1:])), "required check ci is missing")
+        # only an unrelated green check: no required name present
+        other = [{"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        self.assertRefused(FakeGh(base_pr(statusCheckRollup=other)), "required check")
+
+    def test_extra_unnamed_failing_check_refuses(self):
+        roll = green() + [{"__typename": "CheckRun", "name": "extra", "status": "COMPLETED", "conclusion": "FAILURE"}]
+        self.assertRefused(FakeGh(base_pr(statusCheckRollup=roll)), "check extra is FAILURE")
+        roll = green() + [{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"}]
+        self.assertRefused(FakeGh(base_pr(statusCheckRollup=roll)), "check ci is FAILURE")  # duplicate name
+
+    def test_malformed_rollup_entries_refuse(self):
+        for bad in ({}, {"name": "x"}, {"name": "x", "status": "COMPLETED"}, {"status": "COMPLETED", "conclusion": "SUCCESS"},
+                    {"name": "", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    {"__typename": "StatusContext", "state": "SUCCESS"}, {"__typename": "StatusContext", "context": "x"},
+                    {"__typename": "CheckRun", "name": "x", "status": 5}, "string", None):
+            self.assertRefused(FakeGh(base_pr(statusCheckRollup=green() + [bad])), "malformed check entry")
+
+    def test_allowlist_repo_config_must_name_required_checks_and_reviewers(self):
+        for cfg in ({"required_checks": [], "reviewers": ["a"]}, {"reviewers": ["a"]}, {"required_checks": ["ci"]},
+                    {"required_checks": ["ci"], "reviewers": []}, {"required_checks": [""], "reviewers": ["a"]},
+                    {"required_checks": "ci", "reviewers": ["a"]}, {"required_checks": ["ci"], "reviewers": ["a"], "x": 1}, []):
+            self.allow.write_text(json.dumps({"repos": {REPO: cfg}}))
+            self.assertRefused(FakeGh(), "invalid")
 
     def test_unresolved_changes_requested(self):
         rv = [{"author": {"login": "rev"}, "state": "CHANGES_REQUESTED", "commit": {"oid": HEAD}}]
@@ -196,13 +296,15 @@ class Refusals(Base):
         self.assertRefused(FakeGh(base_pr(author={"login": "stranger"})), "class C needs")
 
     def test_repo_not_allowlisted(self):
-        self.allow.write_text(json.dumps({"repos": ["Other/repo"]}))
-        self.assertRefused(FakeGh(), "allowlist")
+        self.allow.write_text(json.dumps({"repos": {"Other/repo": allow_doc()["repos"][REPO]}}))
+        self.assertRefused(FakeGh(), "not on the allowlist")
+        self.allow.write_text(json.dumps({"repos": [REPO]}))  # the old list format is not accepted
+        self.assertRefused(FakeGh(), "allowlist must map")
 
     def test_allowlist_missing_or_empty_is_refused(self):
-        self.assertRefused(FakeGh(), "allowlist", allow=pathlib.Path(self.tmp.name) / "nope.json")
-        self.allow.write_text(json.dumps({"repos": []}))
-        self.assertRefused(FakeGh(), "allowlist")
+        self.assertRefused(FakeGh(), "allowlist", allow=self.tmp_real / "nope.json")
+        self.allow.write_text(json.dumps({"repos": {}}))
+        self.assertRefused(FakeGh(), "allowlist must map")
 
     def test_missing_pr_fields_fail_closed(self):
         for key in ("state", "isDraft", "author", "headRefOid", "mergeable", "mergeStateStatus", "reviews",
@@ -218,9 +320,42 @@ class Refusals(Base):
         self.assertRefused(FakeGh(), "verdict")
         self.write_evidence(pr=8)
         self.assertRefused(FakeGh(), "evidence pr")
-        self.assertRefused(FakeGh(), "evidence missing", evidence=pathlib.Path(self.tmp.name) / "none.json")
+        self.write_evidence(repo="Other/repo")
+        self.assertRefused(FakeGh(), "evidence repo mismatch")
+        self.assertRefused(FakeGh(), "evidence missing", evidence=self.tmp_real / "none.json")
         self.evidence.write_text("not json")
         self.assertRefused(FakeGh(), "unparseable")
+
+    def test_evidence_requires_every_bound_field_with_the_right_type(self):
+        for key in ("repo", "pr", "head", "verdict", "reviewer", "reviewed_at", "reviewer_kind"):
+            self.write_evidence(**{key: DROP})
+            self.assertRefused(FakeGh(), "evidence")
+        for key, bad in (("reviewer", 5), ("reviewer", ""), ("reviewed_at", 123), ("reviewer_kind", ["x"]),
+                         ("repo", None), ("pr", True), ("pr", 7.5), ("pr", [7])):
+            self.write_evidence(**{key: bad})
+            self.assertRefused(FakeGh(), "evidence")
+
+    def test_evidence_pr_may_be_int_or_digit_string(self):
+        self.write_evidence(pr="7")
+        self.assertEqual(self.go(FakeGh(), dry=True)[0], omr.EXIT_OK)
+
+    def test_evidence_reviewer_must_be_allowlisted_for_the_repo(self):
+        self.write_evidence(reviewer="someone-else")
+        self.assertRefused(FakeGh(), "not in the allowlisted reviewers")
+        self.write_evidence(reviewer="Independent-1")  # exact match only
+        self.assertRefused(FakeGh(), "not in the allowlisted reviewers")
+
+    def test_evidence_kind_and_timestamp_validated(self):
+        self.write_evidence(reviewer_kind="self")
+        self.assertRefused(FakeGh(), "reviewer_kind")
+        for ts in ("yesterday", "2026-10-20 10:00:00", "2026-13-40T99:00:00Z", "2999-01-01T00:00:00Z"):
+            self.write_evidence(reviewed_at=ts)
+            self.assertRefused(FakeGh(), "reviewed_at")
+
+    def test_class_a_still_requires_evidence(self):
+        gh = FakeGh()
+        code, rec = self.go(gh, evidence=self.tmp_real / "absent.json")
+        self.assertEqual((rec["class"], code, gh.merges()), (None, omr.EXIT_REFUSED, []))
 
     def test_bad_syntax_never_reaches_gh(self):
         cases = [dict(repo="nope"), dict(repo="a/b;rm -rf"), dict(repo="a/b c"), dict(repo="a/../b"),
@@ -249,36 +384,108 @@ class AllowlistTrust(Base):
         self.assertRefused(FakeGh(), "git worktree", allow=ex)  # the repo copy is refused even if pointed at
 
     def test_symlink_refused(self):
-        link = pathlib.Path(self.tmp.name) / "link.json"
+        link = self.tmp_real / "link.json"
         link.symlink_to(self.allow)
         self.assertRefused(FakeGh(), "non-symlink", allow=link)
 
     def test_group_or_world_writable_file_or_dir_refused(self):
         for mode in (0o664, 0o666, 0o646):
             os.chmod(self.allow, mode)
-            self.assertRefused(FakeGh(), "writable")
+            self.assertBlocked(FakeGh(), "writable")
         os.chmod(self.allow, 0o644)
         os.chmod(self.tmp.name, 0o777)
         try:
-            self.assertRefused(FakeGh(), "writable")
+            self.assertBlocked(FakeGh(), "writable")
         finally:
             os.chmod(self.tmp.name, 0o700)
 
     def test_inside_git_worktree_refused(self):
-        wt = pathlib.Path(self.tmp.name) / "wt"
+        wt = self.tmp_real / "wt"
         wt.mkdir()
         (wt / ".git").write_text("gitdir: /nowhere")
         f = wt / "allow.json"
-        f.write_text(json.dumps({"repos": [REPO]}))
+        f.write_text(json.dumps(allow_doc()))
         self.assertRefused(FakeGh(), "git worktree", allow=f)
 
     def test_foreign_owner_refused(self):
         real = os.geteuid
         omr.os.geteuid = lambda: real() + 1
         try:
-            self.assertRefused(FakeGh(), "not owned")
+            self.assertBlocked(FakeGh(), "not owned")
         finally:
             omr.os.geteuid = real
+
+    def test_group_writable_ancestor_refused(self):
+        sub = self.tmp_real / "a" / "b"
+        sub.mkdir(parents=True)
+        f = sub / "allow.json"
+        f.write_text(json.dumps(allow_doc()))
+        os.chmod(sub.parent, 0o775)
+        self.assertBlocked(FakeGh(), "writable", allow=f)
+        os.chmod(sub.parent, 0o700)
+        self.assertEqual(self.go(FakeGh(), dry=True, allow=f)[0], omr.EXIT_OK)
+
+    def test_symlinked_ancestor_refused(self):
+        real = self.tmp_real / "real"
+        real.mkdir()
+        (real / "allow.json").write_text(json.dumps(allow_doc()))
+        link = self.tmp_real / "linkdir"
+        link.symlink_to(real)
+        self.assertRefused(FakeGh(), "symlink", allow=link / "allow.json")
+
+    def test_sticky_root_owned_writable_ancestor_is_the_only_writable_exception(self):
+        real_lstat = os.lstat
+        target = str(self.tmp_real.parent)
+
+        def fake(path, *a, **k):
+            st = real_lstat(path, *a, **k)
+            if str(path) == target:
+                vals = list(st)
+                vals[0] = stat.S_IFDIR | 0o1777
+                vals[4] = 0
+                return os.stat_result(vals)
+            return st
+        omr.os.lstat = fake
+        try:
+            self.assertEqual(omr.dir_chain_problems(str(self.tmp_real)), [])
+            def fake2(path, *a, **k):
+                st = fake(path, *a, **k)
+                if str(path) == target:
+                    vals = list(st)
+                    vals[0] = stat.S_IFDIR | 0o777  # writable, not sticky
+                    return os.stat_result(vals)
+                return st
+            omr.os.lstat = fake2
+            self.assertTrue(any("writable" in p for p in omr.dir_chain_problems(str(self.tmp_real))))
+        finally:
+            omr.os.lstat = real_lstat
+
+    def test_allowlist_is_read_through_the_checked_descriptor(self):
+        opened, real_open = [], os.open
+
+        def spy(path, flags, *a, **k):
+            opened.append((str(path), flags))
+            return real_open(path, flags, *a, **k)
+        omr.os.open = spy
+        try:
+            self.assertEqual(self.go(FakeGh(), dry=True)[0], omr.EXIT_OK)
+        finally:
+            omr.os.open = real_open
+        flags = [f for p, f in opened if p == str(self.allow)]
+        self.assertEqual(len(flags), 1)
+        self.assertTrue(flags[0] & os.O_NOFOLLOW)
+        src = (ROOT / "scripts/owner-merge-runner.py").read_text()
+        body = src[src.index("def read_trusted_allowlist"):src.index("def load_allowlist")]
+        self.assertNotIn("open(path", body.replace("os.open(path", ""))  # no second open by pathname
+
+    def test_fifo_or_directory_allowlist_refused(self):
+        fifo = self.tmp_real / "fifo.json"
+        os.mkfifo(fifo)
+        # O_NONBLOCK is not used by the runner, so refuse before reading: opening a FIFO read-only blocks
+        # only without a writer; open a writer thread-free by testing the directory case instead.
+        d = self.tmp_real / "dir.json"
+        d.mkdir()
+        self.assertRefused(FakeGh(), "allowlist", allow=d)
 
     def test_trusted_file_is_accepted(self):
         code, _ = self.go(FakeGh(), dry=True)
@@ -328,8 +535,9 @@ class Outcomes(Base):
         self.assertEqual((code, rec["outcome"]), (omr.EXIT_UNVERIFIED, "UNVERIFIED"))
 
     def test_exit_codes_are_distinct(self):
-        codes = {omr.EXIT_OK, omr.EXIT_REFUSED, omr.EXIT_DENIED, omr.EXIT_ERROR, omr.EXIT_UNVERIFIED, omr.EXIT_USAGE}
-        self.assertEqual(len(codes), 6)
+        codes = {omr.EXIT_OK, omr.EXIT_REFUSED, omr.EXIT_DENIED, omr.EXIT_ERROR, omr.EXIT_UNVERIFIED, omr.EXIT_AUDIT,
+                 omr.EXIT_USAGE}
+        self.assertEqual(len(codes), 7)
 
     def test_gh_unavailable_is_error(self):
         def broken(argv):
@@ -339,7 +547,7 @@ class Outcomes(Base):
 
     def test_audit_unwritable_blocks_merge(self):
         gh = FakeGh()
-        blocker = pathlib.Path(self.tmp.name) / "file"
+        blocker = self.tmp_real / "file"
         blocker.write_text("x")
         code, rec = omr.run(REPO, "7", HEAD, str(self.evidence), str(self.allow), str(blocker / "log"), False, gh)
         self.assertNotEqual(code, omr.EXIT_OK)
@@ -348,9 +556,6 @@ class Outcomes(Base):
 
 class Audit(Base):
     def test_audit_written_0600_append_only_and_clean(self):
-        os.makedirs(self.audit.parent)
-        self.audit.write_text("")
-        os.chmod(self.audit, 0o644)
         self.go(FakeGh())
         self.go(FakeGh(base_pr(isDraft=True)))
         self.assertEqual(stat.S_IMODE(os.stat(self.audit).st_mode), 0o600)
@@ -369,6 +574,112 @@ class Audit(Base):
         self.assertNotIn("abcdef123456", text)
         self.assertNotRegex(text, omr.SECRET_RE)
 
+    def test_audit_symlink_refused_no_merge(self):
+        os.makedirs(self.audit.parent)
+        victim = self.tmp_real / "victim.txt"
+        victim.write_text("keep")
+        self.audit.symlink_to(victim)
+        gh = FakeGh()
+        code, rec = self.go(gh)
+        self.assertEqual(gh.merges(), [])
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertNotEqual(code, omr.EXIT_OK)
+
+    def test_audit_hardlink_wrong_mode_or_dir_refused(self):
+        os.makedirs(self.audit.parent)
+        other = self.tmp_real / "other.jsonl"
+        other.write_text("")
+        os.chmod(other, 0o600)
+        os.link(other, self.audit)  # nlink == 2
+        gh = FakeGh()
+        self.assertNotEqual(self.go(gh)[0], omr.EXIT_OK)
+        self.assertEqual(gh.merges(), [])
+        os.unlink(self.audit)
+        self.audit.write_text("")
+        os.chmod(self.audit, 0o644)
+        gh = FakeGh()
+        self.assertNotEqual(self.go(gh)[0], omr.EXIT_OK)
+        self.assertEqual(gh.merges(), [])
+        os.chmod(self.audit, 0o600)
+        os.chmod(self.audit.parent, 0o777)
+        gh = FakeGh()
+        try:
+            self.assertNotEqual(self.go(gh)[0], omr.EXIT_OK)
+        finally:
+            os.chmod(self.audit.parent, 0o700)
+        self.assertEqual(gh.merges(), [])
+
+    def test_audit_symlinked_directory_refused(self):
+        real = self.tmp_real / "realaudit"
+        real.mkdir()
+        link = self.tmp_real / "linkaudit"
+        link.symlink_to(real)
+        gh = FakeGh()
+        code, _ = omr.run(REPO, "7", HEAD, str(self.evidence), str(self.allow), str(link / "log.jsonl"), False, gh)
+        self.assertEqual((gh.merges(), code == omr.EXIT_OK), ([], False))
+
+    def test_pending_record_fsynced_before_exec(self):
+        gh, real = FakeGh(), os.fsync
+
+        def spy(fd):
+            gh.calls.append(["FSYNC"])
+            return real(fd)
+        omr.os.fsync = spy
+        try:
+            self.assertEqual(self.go(gh)[0], omr.EXIT_OK)
+        finally:
+            omr.os.fsync = real
+        names = [c[0] if c[0] == "FSYNC" else " ".join(c[:2]) for c in gh.calls]
+        self.assertLess(names.index("FSYNC"), names.index("pr merge"))
+
+    def test_short_writes_are_looped_into_one_complete_line(self):
+        real = os.write
+        omr.os.write = lambda fd, data: real(fd, bytes(data[:3]))
+        try:
+            self.assertEqual(self.go(FakeGh())[0], omr.EXIT_OK)
+        finally:
+            omr.os.write = real
+        recs = self.records()  # every line parses as complete JSON
+        self.assertEqual([r["outcome"] for r in recs], ["PENDING", "MERGED"])
+
+    def test_zero_progress_write_raises_and_blocks_merge(self):
+        real = os.write
+        omr.os.write = lambda fd, data: 0
+        gh = FakeGh()
+        try:
+            code, rec = self.go(gh)
+        finally:
+            omr.os.write = real
+        self.assertEqual(gh.merges(), [])
+        self.assertNotEqual(code, omr.EXIT_OK)
+        with self.assertRaises(omr.AuditError):
+            omr.os.write = lambda fd, data: 0
+            try:
+                omr.write_all(1, b"abc")
+            finally:
+                omr.os.write = real
+
+    def test_pending_failure_refuses_before_exec(self):
+        blocker = self.tmp_real / "file"
+        blocker.write_text("x")
+        gh = FakeGh()
+        with contextlib.redirect_stderr(io.StringIO()):
+            code, rec = omr.run(REPO, "7", HEAD, str(self.evidence), str(self.allow), str(blocker / "log"), False, gh)
+        self.assertEqual(gh.merges(), [])
+        self.assertIn("refusing before execution", " ".join(rec["reasons"]))
+
+    def test_final_record_failure_exits_with_distinct_code_and_stderr_line(self):
+        gh = FakeGh()
+        gh.on_merge = lambda: os.chmod(self.audit, 0o644)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, rec = self.go(gh)
+        self.assertEqual(len(gh.merges()), 1)
+        self.assertEqual(code, omr.EXIT_AUDIT)
+        self.assertNotEqual(code, omr.EXIT_OK)
+        self.assertIn("final audit record", err.getvalue())
+        self.assertIn("MERGED", err.getvalue())
+
     def test_scrub_redacts_common_token_shapes(self):
         for s in ("github_pat_" + "x" * 30, "ghs_" + "y" * 30, "password=hunter2", "Authorization: abc"):
             self.assertIn("[redacted]", omr.scrub(s))
@@ -379,9 +690,13 @@ class ArgvFixedness(Base):
         ok = omr.merge_argv(REPO, "7", HEAD)
         self.assertEqual(omr.check_argv(ok), "merge")
         self.assertEqual(omr.check_argv(["api", "user"]), "user")
+        self.assertEqual(omr.check_argv(omr.rules_argv(REPO, "main")), "protection")
+        self.assertEqual(omr.check_argv(omr.protection_argv(REPO, "release/1.x")), "protection")
         bad = [ok + ["--admin"], ok + ["--squash"], ok[:-2], [x for x in ok if x != "--merge"],
                ["pr", "merge", "7", "--repo", REPO, "--squash", "--match-head-commit", HEAD],
                ["pr", "merge", "7", "--repo", REPO, "--merge", "--match-head-commit", "x" * 40],
+               ["api", "repos/a/b/branches/main"], ["api", "repos/a/b/rules/branches/../x"],
+               ["api", f"repos/{REPO}/branches/main/protection", "-X", "DELETE"],
                ["pr", "close", "7", "--repo", REPO], ["api", "user", "-X", "POST"],
                ["pr", "view", "7", "--repo", REPO, "--json", "body"], ["api", "repos/a/b/pulls/7/merge"]]
         for argv in bad:
@@ -403,8 +718,8 @@ class ArgvFixedness(Base):
             self.assertNotIn(f'"{forbidden}"', src)
 
     def test_real_subprocess_path_with_fake_executable_in_tmp(self):
-        bin_path = pathlib.Path(self.tmp.name) / "fake-gh"
-        log = pathlib.Path(self.tmp.name) / "argv.log"
+        bin_path = self.tmp_real / "fake-gh"
+        log = self.tmp_real / "argv.log"
         script = ("#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done >> LOG\nprintf -- '---\\n' >> LOG\n"
                   "case \"$1 $2\" in 'api user') echo '{\"login\":\"chisanan232\"}';; esac\nexit 0\n")
         bin_path.write_text(script.replace("LOG", f"'{log}'"))
