@@ -1671,5 +1671,57 @@ class LocalEquivalentCi(Base):
                 omr.check_argv(bad)
 
 
+def approval(login, oid=HEAD, state="APPROVED", assoc="COLLABORATOR"):
+    return {"author": {"login": login}, "state": state, "commit": {"oid": oid}, "authorAssociation": assoc}
+
+
+class IndependentReviewReadback(Base):
+    """Security-sensitive merges: an APPROVED GitHub review at the exact head by a second, allowlisted identity.
+    The local evidence file (even signed) is same-user tamper evidence, not this."""
+
+    def setUp(self):
+        super().setUp()
+        self.allow.write_text(json.dumps(allow_doc(independent_github_reviewers=["Second-Reviewer"])))
+
+    def check(self, reviews, ok):
+        gh = FakeGh(base_pr(reviews=reviews))
+        if ok:
+            code, rec = self.go(gh, dry=True)
+            self.assertEqual(code, omr.EXIT_OK, rec)
+        else:
+            self.assertRefused(gh, "allowlisted independent reviewer")
+
+    def test_second_identity_approval_at_head_passes_case_insensitively(self):
+        self.check([approval("second-reviewer")], True)
+
+    def test_missing_wrong_stale_or_unqualified_approvals_refuse(self):
+        self.check([], False)
+        self.check([approval("someone-else")], False)
+        self.check([approval("second-reviewer", oid=OTHER)], False)
+        self.check([approval("second-reviewer", state="COMMENTED")], False)
+        self.check([approval("second-reviewer", assoc="NONE")], False)
+        self.check([approval("second-reviewer"), approval("second-reviewer", state="DISMISSED")], False)
+
+    def test_reviewer_cannot_be_the_author_or_the_authenticated_user(self):
+        self.allow.write_text(json.dumps(allow_doc(independent_github_reviewers=[ME])))
+        self.check([approval(ME)], False)  # the PR author and the merging user is the same identity
+        self.allow.write_text(json.dumps(allow_doc(independent_github_reviewers=["Second-Reviewer"])))
+        gh = FakeGh(base_pr(author={"login": "second-reviewer"}, reviews=[approval("second-reviewer", assoc="OWNER")]))
+        code, rec = self.go(gh)
+        self.assertNotEqual(code, omr.EXIT_OK, rec)
+
+    def test_a_later_changes_requested_from_the_reviewer_refuses(self):
+        self.check([approval("second-reviewer"), approval("second-reviewer", state="CHANGES_REQUESTED")], False)
+
+    def test_default_has_no_such_requirement_and_bad_config_refuses(self):
+        self.allow.write_text(json.dumps(allow_doc()))
+        code, rec = self.go(FakeGh(), dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+        for bad in ("x", ["bad login!"], [1], ["a", None]):
+            with self.subTest(bad=bad):
+                self.allow.write_text(json.dumps(allow_doc(independent_github_reviewers=bad)))
+                self.assertRefused(FakeGh(), "allowlist config")
+
+
 if __name__ == "__main__":
     unittest.main()

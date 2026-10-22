@@ -170,6 +170,12 @@ MUTANTS = [
     ("lci: actions-only gate used", '        ok = only_actions_runs(runner, repo, head, name)', '        ok = True'),
     ("lci: second evaluation checks compared", '        if checks2 != rec["checks"]:', '        if False:'),
     ("lci: check-runs argv shape", 'CHECK_RUNS_RE.fullmatch(a[1])', 'None'),
+    ("ind: requirement enforced", '    if ind and not any(who in ind', '    if False and not any(who in ind'),
+    ("ind: not author or merging user", 'who in ind and who not in (a, me_l) and', 'who in ind and'),
+    ("ind: exact head", 'st == "APPROVED" and oid == head and assoc in TRUSTED_ASSOC\n                       for who', 'st == "APPROVED" and assoc in TRUSTED_ASSOC\n                       for who'),
+    ("ind: trusted association", 'st == "APPROVED" and oid == head and assoc in TRUSTED_ASSOC\n                       for who', 'st == "APPROVED" and oid == head\n                       for who'),
+    ("ind: login validated in config", 'all(isinstance(x, str) and LOGIN_RE.fullmatch(x) for x in ind)', 'True'),
+    ("ind: logins lowercased", '"independent_github_reviewers": [x.lower() for x in ind]}', '"independent_github_reviewers": list(ind)}'),
 ]
 
 

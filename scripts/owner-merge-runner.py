@@ -308,7 +308,8 @@ def load_allowlist(path):
 
 
 REPO_KEYS = {"required_checks", "reviewers", "require_server_side_protection", "accept_bypass_actors",
-             "max_evidence_age_hours", "require_signed_evidence", "local_equivalent_ci"}
+             "max_evidence_age_hours", "require_signed_evidence", "local_equivalent_ci",
+             "independent_github_reviewers"}
 
 
 def repo_config(allow, repo):
@@ -327,7 +328,9 @@ def repo_config(allow, repo):
     signed = cfg.get("require_signed_evidence", key_file is not None) if ok else True
     age = cfg.get("max_evidence_age_hours", 24) if ok else 24
     lci = cfg.get("local_equivalent_ci", False) if ok else False
+    ind = cfg.get("independent_github_reviewers", []) if ok else []
     ok = ok and all(isinstance(x, bool) for x in (prot, bypass, signed, lci))
+    ok = ok and isinstance(ind, list) and all(isinstance(x, str) and LOGIN_RE.fullmatch(x) for x in ind)
     ok = ok and isinstance(age, int) and not isinstance(age, bool) and 1 <= age <= MAX_EVIDENCE_AGE_HOURS
     ok = ok and not (signed and key_file is None)
     if not ok:
@@ -336,7 +339,8 @@ def repo_config(allow, repo):
                        "evidence_key_file)" % MAX_EVIDENCE_AGE_HOURS])
     return {"required_checks": list(cfg["required_checks"]), "reviewers": list(cfg["reviewers"]),
             "require_server_side_protection": prot, "accept_bypass_actors": bypass,
-            "max_evidence_age_hours": age, "require_signed_evidence": signed, "local_equivalent_ci": lci}
+            "max_evidence_age_hours": age, "require_signed_evidence": signed, "local_equivalent_ci": lci,
+            "independent_github_reviewers": [x.lower() for x in ind]}
 
 
 def canonical_evidence(ev):
@@ -739,6 +743,11 @@ def decide(p, repo, pr, head, me, cfg, exempt=frozenset()):
             bad.append("class C cross-repository PR needs an APPROVED review by the authenticated user at the expected head")
         elif not trusted:
             bad.append("class C needs an APPROVED review at the expected head by a non-author OWNER, MEMBER or COLLABORATOR")
+    ind = set(cfg["independent_github_reviewers"])
+    if ind and not any(who in ind and who not in (a, me_l) and st == "APPROVED" and oid == head and assoc in TRUSTED_ASSOC
+                       for who, (st, oid, assoc) in latest.items()):
+        bad.append("needs a GitHub APPROVED review at the expected head from an allowlisted independent reviewer "
+                   "who is neither the PR author nor the authenticated user")
     if bad:
         raise Refused(bad)
     return pr_class, checks
