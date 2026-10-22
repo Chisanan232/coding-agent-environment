@@ -118,7 +118,8 @@ def recorded_applied(repo, branch, sha):
                 rec = json.load(f)
         except (OSError, ValueError):
             continue
-        if rec.get("payload_sha256") == sha and isinstance(rec.get("applied"), str):
+        if rec.get("repo") == repo and rec.get("branch") == branch and rec.get("payload_sha256") == sha \
+                and isinstance(rec.get("applied"), str):
             return rec["applied"]
     return None
 

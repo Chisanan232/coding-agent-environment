@@ -170,6 +170,16 @@ class T(unittest.TestCase):
         gh.prot["required_status_checks"]["checks"][0]["app_id"] = 99999  # check source changed after apply
         self.assertEqual(self.run_cmd("rollback", gh, sha=self.sha()), 2)
 
+    def test_rollback_ignores_another_branchs_apply_record(self):
+        gh = FakeGh()
+        self.run_cmd("apply", gh, sha=self.sha())
+        gh.prot["required_status_checks"]["checks"][0]["app_id"] = 99999  # edited after apply
+        other = {"repo": REPO, "branch": "main.extra", "payload_sha256": self.sha(), "applied": bpr.normalize(gh.prot)}
+        with open(os.path.join(bpr.BACKUPS, f"branch-protection.Chisanan232_demo-repo.main.extra.{10**20}.json"), "w") as f:
+            json.dump(other, f)  # sorts first and has the live (edited) readback
+        self.assertEqual(self.run_cmd("rollback", gh, sha=self.sha()), 2)
+        self.assertIsNotNone(gh.prot)
+
     def test_rollback_without_an_apply_record_refuses(self):
         gh = FakeGh(existing=get_shape(bpr.payload(CHECKS, True)))
         self.assertEqual(self.run_cmd("rollback", gh, sha=self.sha()), 2)
