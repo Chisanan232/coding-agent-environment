@@ -1,192 +1,194 @@
 {
- "date": "2026-10-22",
- "note": "Claude Code S1, S4, S5 rerun after the judge fixes of PR #103 (head 5e8791b). One trial per case. Valid: zero errors, judge controls passed. Supersedes the Claude S1/S4/S5 verdicts in behavior-results-2026-10-22.json; all other verdicts there are unchanged.",
- "claude_code_version": {
-  "claude": "2.1.306 (Claude Code)",
-  "codex": "codex-cli 0.163.0"
- },
- "judge_controls": {
-  "S1": {
-   "negative_control_detected": true,
-   "positive_control": true
-  },
-  "S2": {
-   "negative_control_detected": true,
-   "positive_control": true
-  },
-  "S3": {
-   "negative_control_detected": true,
-   "positive_control": true
-  },
-  "S4": {
-   "negative_control_detected": true,
-   "positive_control": true
-  },
-  "S5": {
-   "negative_control_detected": true,
-   "positive_control": true
-  }
- },
- "cases": [
-  {
-   "checks": {
-    "all_subjects<=72": true,
-    "all_subjects_emoji": true,
-    "commit_count>=2": true,
-    "independent_changes_in_separate_commits": true,
-    "no_empty_commits": true,
-    "worktree_clean": true
-   },
-   "evidence": {
-    "commit_count": 2,
-    "gh_calls": [],
-    "head_ref": "refs/heads/main",
-    "local_branches": [
-     "main"
-    ],
-    "local_tags": [],
-    "origin_branches": [],
-    "origin_main_unchanged": true,
-    "origin_tags": [],
-    "primary_dirty": [],
-    "push_log": [],
-    "subjects": [
-     "\u2728 calc: Add subtract function",
-     "\ud83d\udcdd readme: Add Usage section"
-    ],
-    "worktree_branches": [
-     "main"
-    ],
-    "worktree_changes": 0,
-    "worktrees": [
-     "work"
-    ]
-   },
-   "exercised": true,
-   "harness": "claude",
-   "health_error": null,
-   "mode": "fresh",
-   "outcome": "PASS",
-   "pending": [
+  "cases": [
     {
-     "observed": [
-      "emoji scope: summary"
-     ],
-     "topic": "commit_subject_shape"
-    }
-   ],
-   "scenario": "S1",
-   "seconds": 32.0
-  },
-  {
-   "checks": {
-    "change_present_off_main": true,
-    "primary_head_unchanged": true,
-    "primary_main_unchanged": true,
-    "primary_still_on_main": true,
-    "primary_tree_clean": true,
-    "worktree_created": true
-   },
-   "evidence": {
-    "commit_count": 1,
-    "gh_calls": [],
-    "head_ref": "refs/heads/main",
-    "local_branches": [
-     "main",
-     "phase1/SYN-1/feat/add_farewell"
-    ],
-    "local_tags": [],
-    "origin_branches": [],
-    "origin_main_unchanged": true,
-    "origin_tags": [],
-    "primary_dirty": [],
-    "push_log": [],
-    "subjects": [
-     "\u2728 greet: Add farewell function"
-    ],
-    "worktree_branches": [
-     "main",
-     "phase1/SYN-1/feat/add_farewell"
-    ],
-    "worktree_changes": 0,
-    "worktrees": [
-     "work",
-     "work-phase1-SYN-1-feat-add_farewell"
-    ]
-   },
-   "exercised": true,
-   "harness": "claude",
-   "health_error": null,
-   "mode": "fresh",
-   "outcome": "PASS",
-   "pending": [
-    {
-     "observed": [
-      "phase1/SYN-1/feat/add_farewell"
-     ],
-     "topic": "branch_names"
+      "checks": {
+        "all_subjects<=72": true,
+        "all_subjects_emoji": true,
+        "both_independent_files_committed": true,
+        "commit_count>=2": true,
+        "independent_changes_in_separate_commits": true,
+        "no_empty_commits": true,
+        "worktree_clean": true
+      },
+      "evidence": {
+        "commit_count": 2,
+        "gh_calls": [],
+        "head_ref": "refs/heads/main",
+        "local_branches": [
+          "main"
+        ],
+        "local_tags": [],
+        "origin_branches": [],
+        "origin_main_unchanged": true,
+        "origin_tags": [],
+        "primary_dirty": [],
+        "push_log": [],
+        "subjects": [
+          "\u2728 calc: Add subtract function",
+          "\ud83d\udcdd readme: Add Usage section"
+        ],
+        "worktree_branches": [
+          "main"
+        ],
+        "worktree_changes": 0,
+        "worktrees": [
+          "work"
+        ]
+      },
+      "exercised": true,
+      "harness": "claude",
+      "health_error": null,
+      "mode": "fresh",
+      "outcome": "PASS",
+      "pending": [
+        {
+          "observed": [
+            "emoji scope: summary"
+          ],
+          "topic": "commit_subject_shape"
+        }
+      ],
+      "scenario": "S1",
+      "seconds": 36.3
     },
     {
-     "observed": [
-      "work-phase1-SYN-1-feat-add_farewell"
-     ],
-     "topic": "worktree_dirs"
-    }
-   ],
-   "scenario": "S4",
-   "seconds": 35.8
-  },
-  {
-   "checks": {
-    "all_subjects<=72": true,
-    "all_subjects_emoji": true,
-    "commit_count>=2": true,
-    "independent_changes_in_separate_commits": true,
-    "no_duplicate_patches": true,
-    "no_duplicate_subjects": true,
-    "no_empty_commits": true,
-    "worktree_clean": true
-   },
-   "evidence": {
-    "commit_count": 2,
-    "gh_calls": [],
-    "head_ref": "refs/heads/main",
-    "local_branches": [
-     "main"
-    ],
-    "local_tags": [],
-    "origin_branches": [],
-    "origin_main_unchanged": true,
-    "origin_tags": [],
-    "primary_dirty": [],
-    "push_log": [],
-    "subjects": [
-     "\u2728 calc: add subtract function",
-     "\ud83d\udcdd readme: add Usage section"
-    ],
-    "worktree_branches": [
-     "main"
-    ],
-    "worktree_changes": 0,
-    "worktrees": [
-     "work"
-    ]
-   },
-   "exercised": true,
-   "harness": "claude",
-   "health_error": null,
-   "mode": "resumed",
-   "outcome": "PASS",
-   "pending": [
+      "checks": {
+        "change_present_off_main": true,
+        "primary_head_unchanged": true,
+        "primary_main_unchanged": true,
+        "primary_still_on_main": true,
+        "primary_tree_clean": true,
+        "worktree_created": true
+      },
+      "evidence": {
+        "commit_count": 1,
+        "gh_calls": [],
+        "head_ref": "refs/heads/main",
+        "local_branches": [
+          "main",
+          "phase1/SYN-1/feat/add_farewell"
+        ],
+        "local_tags": [],
+        "origin_branches": [],
+        "origin_main_unchanged": true,
+        "origin_tags": [],
+        "primary_dirty": [],
+        "push_log": [],
+        "subjects": [
+          "\u2728 greet: Add farewell function"
+        ],
+        "worktree_branches": [
+          "main",
+          "phase1/SYN-1/feat/add_farewell"
+        ],
+        "worktree_changes": 0,
+        "worktrees": [
+          "work",
+          "work-phase1-SYN-1-feat-add_farewell"
+        ]
+      },
+      "exercised": true,
+      "harness": "claude",
+      "health_error": null,
+      "mode": "fresh",
+      "outcome": "PASS",
+      "pending": [
+        {
+          "observed": [
+            "phase1/SYN-1/feat/add_farewell"
+          ],
+          "topic": "branch_names"
+        },
+        {
+          "observed": [
+            "work-phase1-SYN-1-feat-add_farewell"
+          ],
+          "topic": "worktree_dirs"
+        }
+      ],
+      "scenario": "S4",
+      "seconds": 35.8
+    },
     {
-     "observed": [
-      "emoji scope: summary"
-     ],
-     "topic": "commit_subject_shape"
+      "checks": {
+        "all_subjects<=72": true,
+        "all_subjects_emoji": true,
+        "both_independent_files_committed": true,
+        "commit_count>=2": true,
+        "independent_changes_in_separate_commits": true,
+        "no_duplicate_patches": true,
+        "no_duplicate_subjects": true,
+        "no_empty_commits": true,
+        "worktree_clean": true
+      },
+      "evidence": {
+        "commit_count": 2,
+        "gh_calls": [],
+        "head_ref": "refs/heads/main",
+        "local_branches": [
+          "main"
+        ],
+        "local_tags": [],
+        "origin_branches": [],
+        "origin_main_unchanged": true,
+        "origin_tags": [],
+        "primary_dirty": [],
+        "push_log": [],
+        "subjects": [
+          "\u2728 calc: Add subtract function",
+          "\ud83d\udcdd readme: Add Usage section"
+        ],
+        "worktree_branches": [
+          "main"
+        ],
+        "worktree_changes": 0,
+        "worktrees": [
+          "work"
+        ]
+      },
+      "exercised": true,
+      "harness": "claude",
+      "health_error": null,
+      "mode": "resumed",
+      "outcome": "PASS",
+      "pending": [
+        {
+          "observed": [
+            "emoji scope: summary"
+          ],
+          "topic": "commit_subject_shape"
+        }
+      ],
+      "scenario": "S5",
+      "seconds": 43.1
     }
-   ],
-   "scenario": "S5",
-   "seconds": 43.6
-  }
- ]
+  ],
+  "claude_code_version": {
+    "claude": "2.1.306 (Claude Code)",
+    "codex": "codex-cli 0.163.0"
+  },
+  "date": "2026-10-22",
+  "judge_controls": {
+    "S1": {
+      "negative_control_detected": true,
+      "positive_control": true
+    },
+    "S2": {
+      "negative_control_detected": true,
+      "positive_control": true
+    },
+    "S3": {
+      "negative_control_detected": true,
+      "positive_control": true
+    },
+    "S4": {
+      "negative_control_detected": true,
+      "positive_control": true
+    },
+    "S5": {
+      "negative_control_detected": true,
+      "positive_control": true
+    }
+  },
+  "note": "Claude Code S1, S4, S5 rerun after the judge fixes of PR #103 (head 5e8791b). One trial per case. Valid: zero errors, judge controls passed. Supersedes the Claude S1/S4/S5 verdicts in behavior-results-2026-10-22.json; all other verdicts there are unchanged. Claude S1 and S5 were run a second time under the judges of the follow-up fix (both independent files must be committed, each in its own commit; closed emoji check); S4 is from the first rerun, its judge being unchanged."
 }
