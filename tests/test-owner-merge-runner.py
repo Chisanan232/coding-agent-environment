@@ -71,6 +71,7 @@ class FakeGh:
         self.protection = protection  # (rc, stdout-or-stderr) for the branch-protection read
         self.fetches = 0
         self.readback_base = None
+        self.overrides = {}  # fetch number -> PR facts for that single PR-facts read
         self.on_fetch = None  # called with the fetch number before each PR-facts read
         self.on_ruleset = None
         self.on_merge = None
@@ -88,6 +89,7 @@ class FakeGh:
                 if self.on_fetch:
                     self.on_fetch(self.fetches)
                 pr = self.later if (self.later is not None and self.fetches >= 3) else self.pr
+                pr = self.overrides.get(self.fetches, pr)
                 return 0, json.dumps(pr), ""
             if fields == omr.READBACK_FIELDS:
                 if self.merged:
@@ -270,7 +272,10 @@ class Refusals(Base):
         code, _ = self.go(gh)
         self.assertEqual((code, gh.merges()), (omr.EXIT_ERROR, []))
 
-    def test_unreadable_protection_is_tolerated_when_rulesets_cover_the_checks(self):
+    def test_unreadable_protection_refuses_by_default_and_is_waived_only_by_accept(self):
+        gh = FakeGh(protection=(1, "HTTP 403: Resource not accessible"))
+        self.assertRefused(gh, "enforce_admins is unverified")
+        self.allow.write_text(json.dumps(allow_doc(accept_bypass_actors=True)))
         code, rec = self.go(FakeGh(protection=(1, "HTTP 403: Resource not accessible")))
         self.assertEqual((code, rec["server_side"]["protection"]), (omr.EXIT_OK, "unreadable"))
 
@@ -302,10 +307,16 @@ class Refusals(Base):
         prot = (0, json.dumps({"enforce_admins": {"enabled": False}}))
         self.assertRefused(FakeGh(protection=prot), "enforce_admins")
 
-    def test_unreadable_bypass_actors_are_recorded_not_refused(self):
-        for ruleset in ((1, "HTTP 403"), (0, json.dumps({"id": 11})), (0, json.dumps({"bypass_actors": "x"}))):
+    def test_unreadable_or_malformed_bypass_metadata_refuses_by_default(self):
+        for ruleset in ((1, "HTTP 403"), (0, json.dumps({"id": 11})), (0, json.dumps({"bypass_actors": "x"})),
+                        (0, json.dumps({"bypass_actors": ["x"]})), (0, json.dumps([])), (0, "null")):
+            self.assertRefused(FakeGh(ruleset=ruleset), "unreadable or malformed")
+
+    def test_accept_bypass_actors_waives_unreadable_bypass_metadata(self):
+        self.allow.write_text(json.dumps(allow_doc(accept_bypass_actors=True)))
+        for ruleset in ((1, "HTTP 403"), (0, json.dumps({"id": 11}))):
             code, rec = self.go(FakeGh(ruleset=ruleset))
-            self.assertEqual((code, rec["server_side"]["bypass"]), (omr.EXIT_OK, "unreadable"), ruleset)
+            self.assertEqual((code, rec["server_side"]["bypass"]), (omr.EXIT_OK, "unreadable-accepted"), ruleset)
 
     def test_server_side_protection_explicit_waiver(self):
         self.allow.write_text(json.dumps(allow_doc(require_server_side_protection=False)))
@@ -599,6 +610,29 @@ class EvidenceBindingAndAge(Base):
         self.assertIn("changed before execution", " ".join(rec["reasons"]))
         self.assertIn("base branch changed since the first read", " ".join(rec["reasons"]))
 
+    def test_final_read_runs_the_full_decision_on_both_passes(self):
+        """Read 2 closes the first pass, read 4 is the last read before the merge; each must be fully clean."""
+        bad_roll = green() + [{"__typename": "CheckRun", "name": "security", "status": "COMPLETED", "conclusion": "FAILURE"}]
+        no_sonar = [green()[0]]
+        cases = {
+            "changes requested": base_pr(reviews=[{"author": {"login": "rev"}, "state": "CHANGES_REQUESTED",
+                                                    "commit": {"oid": HEAD}}]),
+            "failed check": base_pr(statusCheckRollup=bad_roll),
+            "required check gone": base_pr(statusCheckRollup=no_sonar),
+            "draft": base_pr(isDraft=True), "closed": base_pr(state="CLOSED"),
+            "not clean": base_pr(mergeStateStatus="BLOCKED"), "conflicting": base_pr(mergeable="CONFLICTING"),
+            "malformed check": base_pr(statusCheckRollup=green() + [{"name": "x"}]),
+            "class changed": base_pr(author={"login": "stranger"}),
+            "review decision": base_pr(reviewDecision="CHANGES_REQUESTED"),
+        }
+        for read in (2, 4):
+            for name, pr in cases.items():
+                gh = FakeGh()
+                gh.overrides = {read: pr}
+                code, rec = self.go(gh)
+                self.assertEqual((code, gh.merges()), (omr.EXIT_REFUSED, []), (read, name))
+                self.assertEqual(gh.fetches, read, (read, name))
+
     def test_base_flip_during_ruleset_detail_read_refuses(self):
         gh = FakeGh()
         gh.on_ruleset = lambda: gh.pr.update(baseRefName="release")
@@ -651,12 +685,24 @@ class EvidenceBindingAndAge(Base):
         self.assertIn(f"repos/{REPO}/rules/branches/release/1.x", reads)
         self.assertIn(f"repos/{REPO}/branches/release/1.x/protection", reads)
 
-    def test_readback_with_changed_base_is_unverified(self):
+    def test_readback_with_changed_base_is_an_incident_with_its_own_exit_code(self):
         gh = FakeGh()
         gh.readback_base = "release"
-        code, rec = self.go(gh)
-        self.assertEqual((code, rec["outcome"]), (omr.EXIT_UNVERIFIED, "UNVERIFIED"))
-        self.assertEqual(rec["base"], "main")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, rec = self.go(gh)
+        self.assertEqual((code, rec["outcome"], rec["base"]), (omr.EXIT_BASE_MISMATCH, "UNVERIFIED", "main"))
+        self.assertNotIn(code, (omr.EXIT_OK, omr.EXIT_UNVERIFIED))
+        self.assertIn("POSSIBLE MERGE TO UNREVIEWED BASE", err.getvalue())
+        self.assertEqual(rec["incident"], "POSSIBLE MERGE TO UNREVIEWED BASE")
+        final = self.records()[-1]
+        self.assertEqual(final["incident"], "POSSIBLE MERGE TO UNREVIEWED BASE")
+        self.assertIn("POSSIBLE MERGE TO UNREVIEWED BASE", " ".join(final["reasons"]))
+        self.assertEqual(len(gh.merges()), 1)
+
+    def test_not_merged_readback_keeps_the_plain_unverified_code(self):
+        code, rec = self.go(FakeGh(merged=False))
+        self.assertEqual((code, "incident" in rec), (omr.EXIT_UNVERIFIED, False))
 
     def test_first_read_with_different_base_refuses(self):
         self.assertRefused(FakeGh(base_pr(baseRefName="release")), "evidence base branch")
@@ -842,8 +888,8 @@ class Outcomes(Base):
 
     def test_exit_codes_are_distinct(self):
         codes = {omr.EXIT_OK, omr.EXIT_REFUSED, omr.EXIT_DENIED, omr.EXIT_ERROR, omr.EXIT_UNVERIFIED, omr.EXIT_AUDIT,
-                 omr.EXIT_USAGE}
-        self.assertEqual(len(codes), 7)
+                 omr.EXIT_BASE_MISMATCH, omr.EXIT_USAGE}
+        self.assertEqual(len(codes), 8)
 
     def test_gh_unavailable_is_error(self):
         def broken(argv):

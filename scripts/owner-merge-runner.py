@@ -19,7 +19,8 @@ The review evidence file is produced by an independent review; the runner only r
 
 Exit codes: 0 success (or validated dry run), 2 refused by a guard, 3 denied by gh, 4 error,
 5 unverified (merge ran but the read-back did not show MERGED), 6 final audit record not written
-(the outcome is on stderr), 64 usage error.
+(the outcome is on stderr), 7 the PR is MERGED but its base differs from the reviewed base
+(INCIDENT: POSSIBLE MERGE TO UNREVIEWED BASE; treat as a security incident), 64 usage error.
 """
 import argparse
 import calendar
@@ -34,7 +35,9 @@ import subprocess
 import sys
 import time
 
-EXIT_OK, EXIT_REFUSED, EXIT_DENIED, EXIT_ERROR, EXIT_UNVERIFIED, EXIT_AUDIT, EXIT_USAGE = 0, 2, 3, 4, 5, 6, 64
+EXIT_OK, EXIT_REFUSED, EXIT_DENIED, EXIT_ERROR, EXIT_UNVERIFIED, EXIT_AUDIT, EXIT_BASE_MISMATCH, EXIT_USAGE = \
+    0, 2, 3, 4, 5, 6, 7, 64
+INCIDENT = "POSSIBLE MERGE TO UNREVIEWED BASE"
 
 REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.{1,2}\Z)[A-Za-z0-9._-]{1,100}")
 PR_RE = re.compile(r"[1-9][0-9]{0,8}")
@@ -485,6 +488,9 @@ def check_server_protection(runner, repo, base, cfg):
         if prot_state == "unreadable":
             raise RuntimeError(f"gh branch protection read failed: {scrub(err)}")
         raise Refused(["no server-side required status checks on the base branch"])
+    if prot_state == "unreadable" and not cfg["accept_bypass_actors"]:
+        raise Refused(["branch protection could not be read, so enforce_admins is unverified; "
+                       "set accept_bypass_actors to accept"])
     missing = [n for n in cfg["required_checks"] if n not in names]
     if missing:
         raise Refused([f"required check {n} is not required server-side" for n in missing])
@@ -496,10 +502,12 @@ def check_server_protection(runner, repo, base, cfg):
             unreadable = True
             continue
         risky += [str(a.get("actor_type")) for a in actors]  # any listed actor is a bypass; only [] is none
+    if unreadable and not cfg["accept_bypass_actors"]:
+        raise Refused(["ruleset bypass actors are unreadable or malformed; set accept_bypass_actors to accept"])
     if risky and not cfg["accept_bypass_actors"]:
         raise Refused([f"ruleset allows bypass by {sorted(set(risky))}; set accept_bypass_actors to accept"])
     return {"contexts": sorted(names), "protection": prot_state, "enforce_admins": admins,
-            "bypass": "accepted" if risky else ("unreadable" if unreadable else "none")}
+            "bypass": "accepted" if risky else ("unreadable-accepted" if unreadable else "none")}
 
 
 def decide(p, repo, pr, head, me, cfg):
@@ -588,6 +596,9 @@ def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin=None):
     after = runner.json(pr_view_argv(repo, pr, PR_FIELDS))
     if after.get("baseRefName") != base or after.get("headRefOid") != head:
         raise Refused(["base branch or head changed while server-side state was being read"])
+    final_class, _ = decide(after, repo, pr, head, me, cfg)  # every blocking fact in the last read refuses
+    if final_class != pr_class:
+        raise Refused(["PR class changed while server-side state was being read"])
     return observed, pr_class, checks, info, {"base": base, "evidence": digest}
 
 
@@ -684,11 +695,17 @@ def run(repo, pr, head, evidence, allowlist, audit, dry_run, gh, clock=time.time
                     mc = (back.get("mergeCommit") or {}).get("oid") if isinstance(back.get("mergeCommit"), dict) else None
                 except RuntimeError:
                     back, mc = {}, None
-                if back.get("state") == "MERGED" and isinstance(mc, str) and SHA_RE.fullmatch(mc) \
-                        and back.get("baseRefName") == pin["base"]:
+                merged = back.get("state") == "MERGED" and isinstance(mc, str) and SHA_RE.fullmatch(mc)
+                if merged and back.get("baseRefName") == pin["base"]:
                     rec["outcome"], code = "MERGED", EXIT_OK
+                elif merged:
+                    rec["incident"] = INCIDENT
+                    rec["reasons"].append(f"{INCIDENT}: read-back base differs from the reviewed base")
+                    rec["outcome"], code = "UNVERIFIED", EXIT_BASE_MISMATCH
+                    sys.stderr.write(f"INCIDENT: {INCIDENT}: PR {scrub(repo)}#{scrub(pr)} is MERGED but its base is not "
+                                     f"the reviewed base {scrub(pin['base'])}\n")
                 else:
-                    rec["reasons"].append("read-back did not show MERGED, a merge commit and the pinned base branch")
+                    rec["reasons"].append("read-back did not show MERGED with a merge commit")
                     rec["outcome"], code = "UNVERIFIED", EXIT_UNVERIFIED
     except Refused as e:
         rec["reasons"] += [scrub(x) for x in e.reasons]
