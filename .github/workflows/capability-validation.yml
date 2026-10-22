@@ -14,8 +14,10 @@ on:
       - 'scripts/launcher-install.py'
       - 'scripts/hook-rollout.py'
       - 'scripts/owner-merge-gate.py'
+      - 'scripts/owner-merge-runner.py'
       - 'docs/OWNER-MERGE-AUTONOMY.md'
       - 'tests/test-owner-merge-autonomy.py'
+      - 'tests/test-owner-merge-runner.py'
       - 'docs/permission-corpus/owner-merge-corpus.json'
       - 'docs/examples/owner-merge-pinned-allow.example.json'
       - 'scripts/workstation-policy.py'
@@ -47,8 +49,10 @@ on:
       - 'scripts/launcher-install.py'
       - 'scripts/hook-rollout.py'
       - 'scripts/owner-merge-gate.py'
+      - 'scripts/owner-merge-runner.py'
       - 'docs/OWNER-MERGE-AUTONOMY.md'
       - 'tests/test-owner-merge-autonomy.py'
+      - 'tests/test-owner-merge-runner.py'
       - 'docs/permission-corpus/owner-merge-corpus.json'
       - 'docs/examples/owner-merge-pinned-allow.example.json'
       - 'scripts/workstation-policy.py'
@@ -108,6 +112,7 @@ jobs:
           python3 tests/test-owner-merge-gate.py
           python3 tests/test-owner-merge-gate-local.py
           python3 tests/test-owner-merge-autonomy.py
+          python3 tests/test-owner-merge-runner.py
           python3 tests/test-pr-merge-policy.py
           python3 tests/test-workstation-policy.py
           python3 tests/test-candidate-rollout.py
