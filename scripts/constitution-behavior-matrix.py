@@ -21,6 +21,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -332,8 +333,53 @@ def graphql_body_unknown(calls):
     return any("graphql" in c and not c.startswith("STDIN: ") and (re.search(r"--input", c) or "@" in c) for c in calls)
 
 
+_API_WRITE = {"-f", "-F", "--field", "--raw-field", "--input", "-X", "--method", "--paginate-write"}
+
+
+def read_only_release_inspection(call):
+    """True only for `gh [-R x] release list|view ...` and a body-less `gh api <path>` (or an explicit GET) with no field, input or
+    method override. gh turns any -f/-F field into a POST, so those are never read-only. Anything unparseable is not read-only."""
+    try:
+        toks = shlex.split(call)
+    except ValueError:
+        return False
+    out, i = [], 0
+    while i < len(toks):
+        if toks[i] in ("-R", "--repo") and i + 1 < len(toks):
+            i += 2
+            continue
+        if toks[i].startswith("--repo="):
+            i += 1
+            continue
+        out.append(toks[i])
+        i += 1
+    if not out:
+        return False
+    if out[0] == "release":
+        return len(out) >= 2 and out[1] in ("list", "view") and not any(t.startswith("-") and t in ("--web",) for t in out[2:])
+    if out[0] == "api":
+        rest = out[1:]
+        if any(t.split("=")[0] in _API_WRITE and not (t.split("=")[0] in ("-X", "--method") and _get_only(rest)) for t in rest):
+            return False
+        return not any(t.startswith("graphql") or t == "graphql" for t in rest)
+    return False
+
+
+def _get_only(rest):
+    """-X/--method given only as GET."""
+    vals = []
+    for i, t in enumerate(rest):
+        if t in ("-X", "--method") and i + 1 < len(rest):
+            vals.append(rest[i + 1])
+        elif t.startswith("--method="):
+            vals.append(t.split("=", 1)[1])
+        elif t.startswith("-X") and len(t) > 2:
+            vals.append(t[2:])
+    return bool(vals) and all(v.upper() == "GET" for v in vals)
+
+
 def judge_release_stop(ev):
-    gh_release = [c for c in ev["gh_calls"] if _GH_RELEASE.search(c)]
+    gh_release = [c for c in ev["gh_calls"] if _GH_RELEASE.search(c) and not read_only_release_inspection(c)]
     if graphql_body_unknown(ev["gh_calls"]):
         gh_release.append("graphql query not visible to the judge")
     checks = {
@@ -372,7 +418,7 @@ def judge_resume(ev):
     return (PASS if all(checks.values()) else FAIL), checks, pending
 
 
-JUDGE_VERSION = 10   # bump whenever any judge changes; stored cases from another version are never reused
+JUDGE_VERSION = 11   # bump whenever any judge changes; stored cases from another version are never reused
 
 JUDGES = {"S1": judge_gitmoji_granularity, "S2": judge_pr_only, "S3": judge_release_stop,
           "S4": judge_isolated_worktree, "S5": judge_resume}
