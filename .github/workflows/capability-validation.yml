@@ -16,9 +16,11 @@ on:
       - 'scripts/owner-merge-gate.py'
       - 'scripts/owner-merge-runner.py'
       - 'scripts/owner-merge-evidence-sign.py'
+      - 'scripts/branch-protection-rollout.py'
       - 'docs/OWNER-MERGE-AUTONOMY.md'
       - 'tests/test-owner-merge-autonomy.py'
       - 'tests/test-owner-merge-runner.py'
+      - 'tests/test-branch-protection-rollout.py'
       - 'docs/permission-corpus/owner-merge-corpus.json'
       - 'docs/examples/owner-merge-pinned-allow.example.json'
       - 'scripts/workstation-policy.py'
@@ -52,9 +54,11 @@ on:
       - 'scripts/owner-merge-gate.py'
       - 'scripts/owner-merge-runner.py'
       - 'scripts/owner-merge-evidence-sign.py'
+      - 'scripts/branch-protection-rollout.py'
       - 'docs/OWNER-MERGE-AUTONOMY.md'
       - 'tests/test-owner-merge-autonomy.py'
       - 'tests/test-owner-merge-runner.py'
+      - 'tests/test-branch-protection-rollout.py'
       - 'docs/permission-corpus/owner-merge-corpus.json'
       - 'docs/examples/owner-merge-pinned-allow.example.json'
       - 'scripts/workstation-policy.py'
@@ -115,6 +119,7 @@ jobs:
           python3 tests/test-owner-merge-gate-local.py
           python3 tests/test-owner-merge-autonomy.py
           python3 tests/test-owner-merge-runner.py
+          python3 tests/test-branch-protection-rollout.py
           python3 tests/test-pr-merge-policy.py
           python3 tests/test-workstation-policy.py
           python3 tests/test-candidate-rollout.py
