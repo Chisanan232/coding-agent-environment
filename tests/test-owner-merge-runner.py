@@ -5,6 +5,8 @@ No real gh, no real PR, no network. The fake is passed through the module API; t
 way to select an alternate gh executable.
 """
 import contextlib
+import inspect
+import re
 import signal
 import importlib.util
 import io
@@ -1052,6 +1054,10 @@ class MalformedInputFailsClosed(Base):
         self.assertTrue(recs[-1]["merge_attempted"])
 
 
+def inspect_source(name):
+    return inspect.getsource(getattr(omr, name))
+
+
 class Redaction(Base):
     CASES = [  # (text, fragments that must not survive)
         ("HTTP 401: Authorization: Basic c3ludGhldGljOnBhc3N3b3Jk", ["c3ludGhldGljOnBhc3N3b3Jk", "Basic c3"]),
@@ -1082,36 +1088,66 @@ class Redaction(Base):
         self.assertEqual(omr.scrub(HEAD), HEAD)
         self.assertEqual(omr.scrub("PR is a draft"), "PR is a draft")
 
-    def test_gh_stderr_is_never_stored_raw(self):
-        raw = "HTTP 403: Authorization: Basic c3ludGhldGljOnBhc3N3b3Jk password=\"a b c\" " + "Z9" * 30
-        summary = omr.gh_error(raw)
-        self.assertIn("status=403", summary)
-        self.assertRegex(summary, r"sha256=[0-9a-f]{16}")
-        for frag in ("c3ludGhldGljOnBhc3N3b3Jk", "a b c", "Z9Z9Z9Z9"):
-            self.assertNotIn(frag, summary)
-        self.assertIn("status=unknown", omr.gh_error("no status here"))
+    def test_gh_error_is_stage_status_and_category_only(self):
+        self.assertEqual(omr.gh_error("HTTP 403: whatever", "merge"), "gh failure stage=merge status=403 category=denied")
+        self.assertEqual(omr.gh_error("HTTP 401", "pr-view"), "gh failure stage=pr-view status=401 category=denied")
+        self.assertEqual(omr.gh_error("gh: Not Found (HTTP 404)", "protection-read"),
+                         "gh failure stage=protection-read status=404 category=not-found")
+        self.assertEqual(omr.gh_error("HTTP 502: Bad gateway", "rules-read"),
+                         "gh failure stage=rules-read status=502 category=error")
+        self.assertEqual(omr.gh_error("HTTP 4040: x", "merge"), "gh failure stage=merge status=unknown category=unreadable")
+        self.assertEqual(omr.gh_error("", "merge"), "gh failure stage=merge status=unknown category=unreadable")
+        body = inspect_source("gh_error").split('"""')[2]  # code only, not the docstring
+        for forbidden in ("sha256", "hashlib", "scrub(", "excerpt", "[:"):
+            self.assertNotIn(forbidden, body)
 
-    def test_audit_carries_only_the_summary_for_every_gh_failure_path(self):
-        raw = "HTTP 500: Authorization: Basic c3ludGhldGljOnBhc3N3b3Jk password='x y z'"
-        runs = {
-            "merge denied": FakeGh(merge_rc=1, merge_err=raw),
-            "protection read": FakeGh(rules=[], protection=(1, raw)),
-            "pr view": None,
-        }
+    HOSTILE = [
+        'HTTP 403: Bearer "SYNq1 SYNq2" and SYNtail',
+        'HTTP 403: password="SYNa\\"SYNb" SYNtail2',
+        "HTTP 500: Authorization: Basic SYNdXNlcjpwYXNz\nSYNsecondline token=SYNtok",
+        "HTTP 403: ghp_SYN" + "A" * 24 + " github_pat_SYN" + "b" * 24,
+        "HTTP 401: api_key='SYN k e y' x-api-key: SYNxk\nline3 SYNline3 secret=\"SYN s s\"",
+        "SYNnostatus Bearer SYNb64== password SYNpw",
+        "HTTP 404: Not Found SYNpath/repos/SYNowner/SYNrepo\n\n\tSYNtabbed",
+    ]
+    LEAKS = ["SYN", "Bearer", "Basic", "Authorization", "password", "api_key", "token=", "secret=", "ghp_", "github_pat_"]
 
-        class ViewFails(FakeGh):
-            def __call__(self, argv):
-                if argv[:2] == ["pr", "view"]:
-                    return 1, "", raw
+    def run_path(self, path, hostile):
+        class Gh(FakeGh):
+            def __call__(inner, argv):
+                if path == "pr-view" and argv[:2] == ["pr", "view"]:
+                    return 1, "", hostile
+                if path == "rules-read" and argv[0] == "api" and "/rules/branches/" in argv[1]:
+                    return 1, "", hostile
                 return super().__call__(argv)
-        runs["pr view"] = ViewFails()
-        for name, gh in runs.items():
-            self.go(gh)
-            text = self.audit.read_text()
-            for frag in ("c3ludGhldGljOnBhc3N3b3Jk", "x y z", "Basic c3"):
-                self.assertNotIn(frag, text, name)
-            self.assertIn("sha256=", text, name)
-            self.assertIn("status=500", text, name)
+        if path == "protection-read":
+            gh = Gh(rules=[], protection=(1, hostile))
+        elif path == "merge":
+            gh = Gh(merge_rc=1, merge_err=hostile)
+        else:
+            gh = Gh()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            omr.main(["--repo", REPO, "--pr", "7", "--expect-head", HEAD, "--review-evidence", str(self.evidence)],
+                     gh=gh, allowlist=str(self.allow), audit=str(self.audit), clock=lambda: NOW)
+        return self.audit.read_text() + out.getvalue() + err.getvalue()
+
+    def test_hostile_stderr_appears_nowhere_on_any_gh_failure_path(self):
+        for path in ("pr-view", "rules-read", "protection-read", "merge"):
+            for hostile in self.HOSTILE:
+                if self.audit.exists():
+                    self.audit.unlink()
+                blob = self.run_path(path, hostile)
+                status = re.search(r"HTTP (\d{3})", hostile)
+                if not (path == "protection-read" and status and status.group(1) == "404"):  # a real 404 is "absent"
+                    self.assertIn(f"stage={path}", blob, (path, hostile))
+                    self.assertIn(f"status={status.group(1) if status else 'unknown'}", blob, (path, hostile))
+                for leak in self.LEAKS:
+                    self.assertNotIn(leak, blob, (path, hostile, leak))
+                for word in re.findall(r"[A-Za-z0-9_+/=.-]{3,}", hostile):
+                    if word in ("403", "401", "404", "500", "HTTP", "Not", "Found", "line3", "and"):
+                        continue
+                    self.assertNotIn(word, blob, (path, hostile, word))
 
 
 class FifoPaths(Base):

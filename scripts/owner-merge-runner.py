@@ -69,7 +69,6 @@ SECRET_RE = re.compile(
     r"|(?i:\b(?:bearer|basic)\s+)[^\s\"']+"
     r"|(?i:\b(?:token|password|passwd|secret|api[_-]?key|apikey|access[_-]?token)\b)\s*[=:]\s*"
     r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\r\n]*)")  # quoted value (spaces included) or to end of line
-LONG_RE = re.compile(r"[A-Za-z0-9+/=_-]{20,}")
 DENIAL_RE = re.compile(r"permission|denied|forbidden|not authori[sz]ed|HTTP 40[13]|must have|"
                        r"protected branch|required status|review is required|not allowed", re.I)
 DEFAULT_AUDIT = os.path.join(os.path.expanduser("~"), ".claude", "audit", "owner-merge-runner.jsonl")
@@ -89,13 +88,13 @@ def scrub(text):
     return SECRET_RE.sub("[redacted]", str(text))[:300]
 
 
-def gh_error(err):
-    """What may be stored about a gh failure: a status token, a hash of the raw text and a short, heavily
-    scrubbed excerpt. Raw stderr is never stored."""
-    raw = str(err)
-    digest = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
-    excerpt = LONG_RE.sub("[long]", scrub(raw))[:100]
-    return f"gh error status={http_status(raw) or 'unknown'} sha256={digest} excerpt={excerpt!r}"
+def gh_error(err, stage):
+    """The only thing ever stored about a gh failure: our own stage name, a parsed three-digit HTTP status
+    and a fixed category. No stderr text, excerpt or digest of it is kept anywhere."""
+    status = http_status(str(err))
+    category = ("denied" if status in ("401", "403") else "not-found" if status == "404"
+                else "error" if status else "unreadable")
+    return f"gh failure stage={stage} status={status or 'unknown'} category={category}"
 
 
 def merge_argv(repo, pr, sha):
@@ -172,7 +171,7 @@ class Runner:
     def json(self, argv):
         rc, out, err = self.call(argv)
         if rc != 0:
-            raise RuntimeError(f"gh {argv[0]} {argv[1]} failed: {gh_error(err)}")
+            raise RuntimeError(gh_error(err, "pr-view"))
         try:
             data = json.loads(out)
         except ValueError:
@@ -499,7 +498,7 @@ def check_server_protection(runner, repo, base, cfg):
     required check, and refuse when a readable ruleset lists a bypass actor that could apply to us."""
     rc, rules, err = _read_json(runner, rules_argv(repo, base), "gh rules read")
     if rc != 0:
-        raise RuntimeError(f"gh rules read failed: {gh_error(err)}")
+        raise RuntimeError(gh_error(err, "rules-read"))
     if not isinstance(rules, list):
         raise RuntimeError("gh rules read returned unexpected JSON shape")
     names, ids = parse_rule_contexts(rules)
@@ -522,7 +521,7 @@ def check_server_protection(runner, repo, base, cfg):
         prot_state = "unreadable"
     if not names:
         if prot_state == "unreadable":
-            raise RuntimeError(f"gh branch protection read failed: {gh_error(err)}")
+            raise RuntimeError(gh_error(err, "protection-read"))
         raise Refused(["no server-side required status checks on the base branch"])
     if prot_state == "unreadable" and not cfg["accept_bypass_actors"]:
         raise Refused(["branch protection could not be read, so enforce_admins is unverified; "
@@ -736,7 +735,7 @@ def run(repo, pr, head, evidence, allowlist, audit, dry_run, gh, clock=time.time
             rec["merge_attempted"] = True
             mrc, _, merr = runner.call(merge_argv(repo, pr, head))
             if mrc != 0:
-                rec["reasons"].append(gh_error(merr))
+                rec["reasons"].append(gh_error(merr, "merge"))
                 rec["outcome"], code = ("DENIED", EXIT_DENIED) if DENIAL_RE.search(merr) else ("ERROR", EXIT_ERROR)
             else:
                 try:
