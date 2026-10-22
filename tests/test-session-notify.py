@@ -1855,6 +1855,16 @@ class Cycle7Regressions(Base):
         env["SESSION_NOTIFY_CONFIG"] = str(self.tmp / "absent.json")
         self.assertNotIn("CONFIG_PROBLEM", subprocess.run([sys.executable, str(SCRIPT), "status"], env=env, capture_output=True, text=True).stdout)
 
+    def test_status_hides_only_a_missing_config_not_other_read_errors(self):
+        blocker = self.tmp / "afile"
+        blocker.write_text("x")
+        env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(self.sdir), SESSION_NOTIFY_CONFIG=str(blocker / "c.json"))   # parent is a file: ENOTDIR (20), not ENOENT (2)
+        out = subprocess.run([sys.executable, str(SCRIPT), "status"], env=env, capture_output=True, text=True).stdout
+        self.assertIn("CONFIG_PROBLEM", out)
+        self.assertIn("unreadable:20", out)
+        env["SESSION_NOTIFY_CONFIG"] = str(self.tmp / "absent.json")   # ENOENT stays quiet
+        self.assertNotIn("CONFIG_PROBLEM", subprocess.run([sys.executable, str(SCRIPT), "status"], env=env, capture_output=True, text=True).stdout)
+
 
 def hashlib_key(sid, extra):
     import hashlib

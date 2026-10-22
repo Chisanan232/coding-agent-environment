@@ -986,7 +986,7 @@ def cmd_hook(args):
             return 0
         ev = json.loads(raw.decode("utf-8", "replace"))
         cfg, problem = load_config()
-        if problem and problem not in (None,) and not str(problem).startswith("unreadable:2"):
+        if problem and problem not in (None,) and str(problem) != "unreadable:2":
             log_line(sdir, f"config {problem}")
         result = Engine(sdir, cfg).handle(ev)
         if result not in ("ok", "ignored"):
@@ -1007,7 +1007,7 @@ def age(now, t):
 def cmd_status(args):
     sdir, rows, now = state_dir(), [], time.time()
     config_problem = load_config()[1]
-    if config_problem and not str(config_problem).startswith("unreadable:2"):
+    if config_problem and str(config_problem) != "unreadable:2":
         rows.append({"session": "(config)", "state": "CONFIG_PROBLEM", "problem": config_problem})  # surfaced here, not only in hook.log
     for p in sorted(sdir.glob("*.json")) if sdir.is_dir() else []:
         sid = p.stem
