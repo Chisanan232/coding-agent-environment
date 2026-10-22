@@ -39,10 +39,10 @@ A tool is not treated as safe because it usually is: `rg` is not allowed through
 | **False positives**: routine commands that prompted | **9**, all `rtk proxy` forms | **0** |
 | Protected commands (29) held by a recorded prompt or refusal | 23 | **29** |
 | **False negatives**: protected commands that ran unprompted | **4**: `gh release create`, `gh pr merge --admin`, `cargo publish`, `npm publish` | **0** |
-| Protected commands refused by the host classifier with no prompt (neither a leak nor an ask rule) | 2: remote branch delete, `gh api -X DELETE` | 0 |
+| `OWNER_ASK` commands refused by the host classifier with no prompt (neither a leak nor an ask rule) | 2: remote branch delete, `gh api -X DELETE` | 0 |
 | UNKNOWN (5): trusted local scripts, wrapped interpreters, `git blame` | measured, no expectation | measured, no expectation |
 
-The two host-blocked commands ran unprompted in earlier live runs the same day, so the classifier is non-deterministic for exactly these: on the live file they are leaks some of the time. The candidate is a copy of the live settings with the asks-only canary and `docs/examples/candidate-settings-rtk-proxy-scoped.example.json` merged by `scripts/candidate-rollout.py`; the canary's bare asks are what turn all of them into deterministic prompts.
+The `host-protected` outbound-data case (`curl -d @file` to an invalid host) has no ask rule in either configuration: it was attempted and refused by the classifier without a prompt in both, so the candidate still relies on host protection for it. The two host-blocked commands ran unprompted in earlier live runs the same day, so the classifier is non-deterministic for exactly these: on the live file they are leaks some of the time. The candidate is a copy of the live settings with the asks-only canary and `docs/examples/candidate-settings-rtk-proxy-scoped.example.json` merged by `scripts/candidate-rollout.py`; the canary's bare asks are what turn all of them into deterministic prompts.
 
 Other modes, one routine and one protected command each, on the candidate (measured with the first harness version, before command matching was added):
 

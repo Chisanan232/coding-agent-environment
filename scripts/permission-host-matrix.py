@@ -227,7 +227,7 @@ def rescore(result, corpus):
                 events.add(ev)
         ran, prompted = bool(events & {"PostToolUse", "PostToolUseFailure"}), "PermissionRequest" in events
         attempted = "PreToolUse" in events or ran or prompted
-        entries.append(dict(e, **{"class": c["class"]}, ran=ran, prompted=prompted, outcome=outcome(c["class"], ran, prompted, e.get("healthy", True) or bool(events), attempted)))
+        entries.append(dict(e, **{"class": c["class"]}, ran=ran, prompted=prompted, outcome=outcome(c["class"], ran, prompted, e.get("healthy", True) or ran or prompted, attempted)))
     return {"mode": result.get("mode"), "rescored": True, "score": score(entries), "cases": entries}
 
 
@@ -252,7 +252,7 @@ def run_case(c, work, settings, live, timeout):
     prompted = "PermissionRequest" in events
     attempted = "PreToolUse" in events or ran or prompted
     return {"id": c["id"], "class": c["class"], "ran": ran, "prompted": prompted, "healthy": healthy, "recorded": recorded_commands(log),
-            "outcome": outcome(c["class"], ran, prompted, healthy or bool(events), attempted)}
+            "outcome": outcome(c["class"], ran, prompted, healthy or ran or prompted, attempted)}
 
 
 def main(argv=None):

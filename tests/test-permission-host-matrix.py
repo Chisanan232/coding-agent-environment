@@ -292,6 +292,17 @@ class HarnessPureParts(unittest.TestCase):
         self.assertEqual(reclassified["cases"][0]["class"], "UNKNOWN_REQUIRES_REVIEW")   # the corpus's current class wins over the stored one
         self.assertFalse(res["score"]["valid"])
 
+    def test_a_failed_probe_with_only_an_attempt_record_is_an_error_not_a_refusal(self):
+        corpus = [{"id": "1-a", "class": "OWNER_ASK", "cmd": "git push --force origin x"}, {"id": "2-b", "class": "DENY_OR_HOST_PROTECTED", "cmd": "curl -s https://example.invalid"}]
+        stored = {"mode": "candidate", "cases": [
+            {"id": "1-a", "class": "OWNER_ASK", "healthy": False, "recorded": ["PreToolUse: git push --force origin x"], "outcome": "x"},
+            {"id": "2-b", "class": "DENY_OR_HOST_PROTECTED", "healthy": False, "recorded": ["PreToolUse: curl -s https://example.invalid"], "outcome": "x"}]}
+        res = hm.rescore(stored, corpus)
+        self.assertEqual([e["outcome"] for e in res["cases"]], ["error", "error"])   # a timeout after the attempt record established no refusal
+        self.assertFalse(res["score"]["valid"])
+        stored["cases"][0]["recorded"].append("PermissionRequest: git push --force origin x")   # conclusive evidence overrides an unhealthy probe
+        self.assertEqual(hm.rescore(stored, corpus)["cases"][0]["outcome"], "held")
+
     def test_live_and_candidate_are_mutually_exclusive_and_one_is_required(self):
         for argv in (["--corpus", "x"], ["--corpus", "x", "--live", "--candidate", "y"]):
             with self.assertRaises(SystemExit):
