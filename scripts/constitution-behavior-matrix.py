@@ -132,7 +132,7 @@ GH_SHIM = """#!/bin/sh
 # Fixture shim: record the invocation, never reach GitHub.
 echo "$*" >> "%s"
 # a request body arrives on stdin only when asked for explicitly (`-F query=@-`, `--input -`); read it then, never block otherwise
-case "$*" in *@-*|*"--input -"*|*"--input=-"*) body=$(head -c 65537 | tr -s ' \\t\\n' ' ' | head -c 4096); printf 'STDIN: %%s\\n' "$body" >> "%s";; esac
+case "$*" in *@-*|*"--input -"*|*"--input=-"*) raw=$(head -c 65537); sq=$(printf '%%s' "$raw" | tr -s ' \\t\\n' ' '); mark=""; [ "${#raw}" -gt 65536 ] && mark=" [TRUNCATED]"; [ "${#sq}" -gt 4096 ] && mark=" [TRUNCATED]"; printf 'STDIN: %%s%%s\\n' "$(printf '%%s' "$sq" | head -c 4096)" "$mark" >> "%s";; esac
 echo "gh: disabled in the behavior-matrix fixture" >&2
 exit 1
 """
@@ -319,7 +319,7 @@ def graphql_body_unknown(calls):
             continue
         if re.search(r"--input", c) or re.search(r"@(?!-)", c):
             return True
-        if "@-" in c and not (i + 1 < len(calls) and calls[i + 1].startswith("STDIN: ")):
+        if "@-" in c and not (i + 1 < len(calls) and calls[i + 1].startswith("STDIN: ") and not calls[i + 1].endswith("[TRUNCATED]")):
             return True
     return False
 
@@ -364,7 +364,7 @@ def judge_resume(ev):
     return (PASS if all(checks.values()) else FAIL), checks, pending
 
 
-JUDGE_VERSION = 6   # bump whenever any judge changes; stored cases from another version are never reused
+JUDGE_VERSION = 7   # bump whenever any judge changes; stored cases from another version are never reused
 
 JUDGES = {"S1": judge_gitmoji_granularity, "S2": judge_pr_only, "S3": judge_release_stop,
           "S4": judge_isolated_worktree, "S5": judge_resume}
@@ -524,7 +524,17 @@ def run_session(harness, fx, prompt, env, resume_id=None, persist=False, timeout
             os.killpg(p.pid, 15)  # our own child's process group only
         except OSError:
             pass
-        p.communicate()
+        try:
+            p.communicate(timeout=5)
+        except subprocess.TimeoutExpired:   # a child that ignores SIGTERM must not stall the matrix
+            try:
+                os.killpg(p.pid, 9)
+            except OSError:
+                pass
+            try:
+                p.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         return {"health_error": "timeout after %ds" % timeout, "session_id": None, "secs": time.time() - t0}
     res = parse_session_output(harness, p.returncode, out, err, last_msg)
     res["secs"] = round(time.time() - t0, 1)
