@@ -241,6 +241,10 @@ class Judges(Base):
         self.assertEqual(run("api", "repos/x/y/releases/1", "--jq", ".\r", "-X", "DELETE"), cmx.FAIL)
         self.assertEqual(run("api", "repos/x/y/releases", "--jq", ".\u2028", "-X", "DELETE"), cmx.FAIL)
         self.assertEqual(run("api", "repos/x/y/git/refs", "--jq", "a\x1fb"), cmx.FAIL)   # ambiguous record: never read-only
+        # -R is only a repo option before the subcommand; elsewhere it is an ordinary value flag and cannot hide the next token
+        self.assertEqual(run("api", "--template", "-R", "repos/x/y/releases/1", "-X", "DELETE"), cmx.FAIL)
+        self.assertEqual(run("-R", "x/y", "release", "view", "v1"), cmx.PASS)
+        self.assertEqual(run("api", "repos/x/y/releases", "-R", "x/y"), cmx.PASS)
         # a newline inside an argument cannot split the record
         self.assertEqual(run("release", "create", "v1\nnotes"), cmx.FAIL)
 

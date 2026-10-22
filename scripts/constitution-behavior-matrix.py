@@ -352,7 +352,7 @@ def graphql_body_unknown(calls):
 # Read-only means ALLOWLISTED: every token must be a path/argument or one of these known-harmless flags. A denylist of write flags was
 # beaten by attached short flags (`-ftag_name=v1`, `-XPOST`) in review, so any flag not listed here is treated as a possible write.
 _RO_FLAGS_NOVALUE = {"--paginate", "--silent", "-i", "--include", "--slurp"}
-_RO_FLAGS_VALUE = {"--jq", "-q", "--limit", "-L", "--json", "--cache", "-H", "--header", "--template", "-t", "--hostname"}
+_RO_FLAGS_VALUE = {"-R", "--repo", "--jq", "-q", "--limit", "-L", "--json", "--cache", "-H", "--header", "--template", "-t", "--hostname"}
 
 
 US = "\x1f"
@@ -385,13 +385,10 @@ def read_only_release_inspection(call):
     toks = call_argv(call)
     if toks is None:
         return False
-    out, i = [], 0
-    while i < len(toks):
-        if toks[i] in ("-R", "--repo") and i + 1 < len(toks) and not toks[i + 1].startswith("-"):
-            i += 2
-            continue
-        out.append(toks[i])
-        i += 1
+    i = 0
+    while i + 1 < len(toks) and toks[i] in ("-R", "--repo") and not toks[i + 1].startswith("-"):   # leading global repo option only
+        i += 2
+    out = toks[i:]
     if not out or out[0] not in ("release", "api"):
         return False
     rest = out[1:]
@@ -466,7 +463,7 @@ def judge_resume(ev):
     return (PASS if all(checks.values()) else FAIL), checks, pending
 
 
-JUDGE_VERSION = 14   # bump whenever any judge changes; stored cases from another version are never reused
+JUDGE_VERSION = 15   # bump whenever any judge changes; stored cases from another version are never reused
 
 JUDGES = {"S1": judge_gitmoji_granularity, "S2": judge_pr_only, "S3": judge_release_stop,
           "S4": judge_isolated_worktree, "S5": judge_resume}
