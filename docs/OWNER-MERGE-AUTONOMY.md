@@ -398,3 +398,19 @@ The existing `scripts/owner-merge-gate.py --ci-unavailable` path (a posted `OWNE
 Local review evidence, even HMAC-signed, is written and verified by the same OS user the runner runs as: tamper evidence, not independent approval. For a repository the owner marks security-sensitive, set `"independent_github_reviewers": ["<login>", ...]` in its allowlist entry. The runner then also requires, on every pass including the final read, a GitHub review that is `APPROVED` at the exact head by one of those logins, whose latest decisive review it is, whose `authorAssociation` is OWNER, MEMBER or COLLABORATOR, and who is neither the PR author nor the authenticated user. GitHub, not a local file, is the record, so a same-user process cannot mint it. The local evidence file, the checks, server-side protection and all other guards still apply; the key is additive, off by default, and a malformed list refuses.
 
 Limits: the second identity must exist and approve for real (another human, or a GitHub App that approves); this runner never creates or requests that approval. A reviewer's GitHub account can itself be shared or compromised, and the runner cannot tell. Org-level required-review settings remain a GitHub-side control beyond this.
+
+## 12. Measured on a real GitHub repository (2026-10-22, temporary public test repo, deleted afterwards)
+
+A temporary repository (private repositories on a free plan return 403 for branch protection and rulesets, so it had to be public; it held only synthetic files) was used with the founder's authorization. Evidence is kept in the private QA directory (`protection-test-2026-10-22.md`).
+
+| Check | Result |
+|---|---|
+| `plan` / `apply` / `verify` of required status check `ci`, `enforce_admins=true` | applied, readback matches, runner's own server-side check accepted it (first real-GitHub confirmation) |
+| PR with no `ci` status | runner REFUSED (`BLOCKED`, `ci` missing); plain `gh pr merge` refused by GitHub ("base branch policy prohibits the merge") |
+| `ci` failing | runner REFUSED |
+| `ci` success | runner APPROVE (dry run), then a real runner merge: `MERGED`, merge commit `fe82657…` with parents base+head, read back from GitHub; audit PENDING and MERGED records written; the host did not deny |
+| `independent_github_reviewers` configured, no such approval | runner REFUSED |
+| `rollback` | deleted, readback 404, repeat is a no-op |
+| protection strengthened after `apply` (review requirement added) | `rollback` REFUSED and kept it |
+
+Not shown, so not claimed: `gh pr merge --admin` was not executed (an owner-ask command), so `enforce_admins=true` is confirmed by readback only; no second reviewer identity existed, so the independent-review path was exercised only as a refusal; the review evidence file was a synthetic fixture; the check was a commit status, not an Actions run. This is one merge in a throwaway repository and does not make `MERGE_AUTONOMY_READY` true for any production repository.
