@@ -44,7 +44,8 @@ REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.{1,2}\Z)[A-Za-z0-9._-]
 PR_RE = re.compile(r"[1-9][0-9]{0,8}")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 MAC_RE = re.compile(r"[0-9a-f]{64}")
-HTTP_STATUS_RE = re.compile(r"HTTP (\d{3})")
+HTTP_TOKEN_RE = re.compile(r"HTTP ([^\s:)]*)")
+STATUS_RE = re.compile(r"[0-9]{3}")
 BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,200}")
 READ_PATHS = (re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rules/branches/([A-Za-z0-9._/-]{1,200})"),
               re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/branches/([A-Za-z0-9._/-]{1,200})/protection"),
@@ -465,6 +466,12 @@ def _read_json(runner, argv, what):
         raise RuntimeError(f"{what} returned unparseable JSON")
 
 
+def http_status(err):
+    """The first `HTTP <token>` in gh's error, only if the whole token is exactly three digits."""
+    m = HTTP_TOKEN_RE.search(err)
+    return m.group(1) if m and STATUS_RE.fullmatch(m.group(1)) else None
+
+
 def check_server_protection(runner, repo, base, cfg):
     """Require a non-empty server-side set of required status checks that covers every allowlisted
     required check, and refuse when a readable ruleset lists a bypass actor that could apply to us."""
@@ -475,7 +482,7 @@ def check_server_protection(runner, repo, base, cfg):
         raise RuntimeError("gh rules read returned unexpected JSON shape")
     names, ids = parse_rule_contexts(rules)
     rc, prot, err = _read_json(runner, protection_argv(repo, base), "gh branch protection read")
-    admins = "n/a"
+    admins, waivers = "n/a", []
     if rc == 0:
         names |= parse_protection_contexts(prot)
         prot_state = "read"
@@ -484,7 +491,10 @@ def check_server_protection(runner, repo, base, cfg):
         if not admins and not cfg["accept_bypass_actors"]:
             raise Refused(["branch protection does not enforce its rules for administrators (enforce_admins); "
                            "set accept_bypass_actors to accept"])
-    elif (HTTP_STATUS_RE.search(err) or [None, None])[1] == "404":
+        if not admins:
+            admins = "false-accepted"
+            waivers.append("enforce_admins_false")
+    elif http_status(err) == "404":
         prot_state = "absent"  # only a real HTTP 404 status (the first status token) means no classic protection
     else:
         prot_state = "unreadable"
@@ -495,6 +505,9 @@ def check_server_protection(runner, repo, base, cfg):
     if prot_state == "unreadable" and not cfg["accept_bypass_actors"]:
         raise Refused(["branch protection could not be read, so enforce_admins is unverified; "
                        "set accept_bypass_actors to accept"])
+    if prot_state == "unreadable":
+        admins = "unverified-accepted"
+        waivers.append("protection_unreadable")
     missing = [n for n in cfg["required_checks"] if n not in names]
     if missing:
         raise Refused([f"required check {n} is not required server-side" for n in missing])
@@ -510,8 +523,16 @@ def check_server_protection(runner, repo, base, cfg):
         raise Refused(["ruleset bypass actors are unreadable or malformed; set accept_bypass_actors to accept"])
     if risky and not cfg["accept_bypass_actors"]:
         raise Refused([f"ruleset allows bypass by {sorted(set(risky))}; set accept_bypass_actors to accept"])
+    if risky:
+        waivers.append("bypass_actors_present:" + ",".join(sorted(set(risky))))
+    if unreadable:
+        waivers.append("bypass_unreadable")
+    # `bypass` is "none" only when no waiver of any kind was exercised; the waivers list names each one.
+    bypass = "none"
+    if waivers:
+        bypass = "accepted" if risky else ("unreadable-accepted" if unreadable else "protection-waiver-accepted")
     return {"contexts": sorted(names), "protection": prot_state, "enforce_admins": admins,
-            "bypass": "accepted" if risky else ("unreadable-accepted" if unreadable else "none")}
+            "bypass": bypass, "waivers": waivers}
 
 
 def decide(p, repo, pr, head, me, cfg):

@@ -292,7 +292,40 @@ class Refusals(Base):
 
     def test_empty_bypass_list_is_the_only_none(self):
         code, rec = self.go(FakeGh())
-        self.assertEqual((code, rec["server_side"]["bypass"]), (omr.EXIT_OK, "none"))
+        self.assertEqual((code, rec["server_side"]["bypass"], rec["server_side"]["waivers"]), (omr.EXIT_OK, "none", []))
+        self.assertEqual(rec["server_side"]["enforce_admins"], "n/a")
+
+    def test_accepting_with_nothing_to_waive_records_none(self):
+        self.allow.write_text(json.dumps(allow_doc(accept_bypass_actors=True)))
+        code, rec = self.go(FakeGh())
+        self.assertEqual((rec["server_side"]["bypass"], rec["server_side"]["waivers"]), ("none", []))
+
+    def test_exercised_waivers_are_recorded_truthfully_never_none(self):
+        self.allow.write_text(json.dumps(allow_doc(accept_bypass_actors=True)))
+        ok_prot = {"enforce_admins": {"enabled": True}}
+        cases = {
+            "protection unreadable": (FakeGh(protection=(1, "HTTP 403: nope")), "protection-waiver-accepted",
+                                      "unverified-accepted", ["protection_unreadable"]),
+            "enforce_admins false": (FakeGh(protection=(0, json.dumps({"enforce_admins": {"enabled": False}}))),
+                                     "protection-waiver-accepted", "false-accepted", ["enforce_admins_false"]),
+            "ruleset detail unreadable": (FakeGh(ruleset=(1, "HTTP 403")), "unreadable-accepted", "n/a",
+                                          ["bypass_unreadable"]),
+            "ruleset bypass_actors malformed": (FakeGh(ruleset=(0, json.dumps({"bypass_actors": "x"}))),
+                                                "unreadable-accepted", "n/a", ["bypass_unreadable"]),
+            "bypass actors present": (FakeGh(ruleset=(0, json.dumps({"bypass_actors": [
+                {"actor_type": "User", "actor_id": 1}, {"actor_type": "Team", "actor_id": 2}]}))), "accepted", "n/a",
+                ["bypass_actors_present:Team,User"]),
+            "two rulesets with bypass actors": (FakeGh(rules=server_rules(REQUIRED, 11) + server_rules(["ci"], 12),
+                                              ruleset=(0, json.dumps({"bypass_actors": [{"actor_type": "User"}]}))),
+                                       "accepted", "n/a", ["bypass_actors_present:User"]),
+        }
+        for name, (gh, bypass, admins, waivers) in cases.items():
+            code, rec = self.go(gh)
+            ss = rec["server_side"]
+            self.assertEqual(code, omr.EXIT_OK, name)
+            self.assertNotEqual(ss["bypass"], "none", name)
+            self.assertEqual((ss["bypass"], ss["enforce_admins"], ss["waivers"]), (bypass, admins, waivers), name)
+            self.assertEqual(self.records()[-1]["server_side"]["waivers"], waivers, name)
 
     def test_enforce_admins_must_be_true_on_classic_protection(self):
         prot = lambda ea: (0, json.dumps({"enforce_admins": ea, "required_status_checks": {"contexts": REQUIRED}}))
@@ -301,7 +334,9 @@ class Refusals(Base):
         self.assertEqual(self.go(FakeGh(rules=[], protection=prot({"enabled": True})))[0], omr.EXIT_OK)
         self.allow.write_text(json.dumps(allow_doc(accept_bypass_actors=True)))
         code, rec = self.go(FakeGh(rules=[], protection=prot({"enabled": False})))
-        self.assertEqual((code, rec["server_side"]["enforce_admins"]), (omr.EXIT_OK, False))
+        self.assertEqual((code, rec["server_side"]["enforce_admins"], rec["server_side"]["bypass"]),
+                         (omr.EXIT_OK, "false-accepted", "protection-waiver-accepted"))
+        self.assertEqual(rec["server_side"]["waivers"], ["enforce_admins_false"])
 
     def test_enforce_admins_checked_even_when_rulesets_also_cover(self):
         prot = (0, json.dumps({"enforce_admins": {"enabled": False}}))
@@ -873,6 +908,15 @@ class ProtectionErrorClassification(Base):
                     "gh: Branch not protected (HTTP 404)"):
             code, rec = self.go(FakeGh(protection=(1, err)), dry=True)
             self.assertEqual((code, rec["server_side"]["protection"]), (omr.EXIT_OK, "absent"), err)
+
+    def test_status_token_must_be_complete(self):
+        for err in ("HTTP 4040: Not Found", "HTTP 404abc: Not Found", "gh: Not Found (HTTP 4040)", "HTTP 404x",
+                    "HTTP 40: x", "HTTP  404", "HTTP 404_", "HTTP 4040: nope (HTTP 404)", "HTTP 404abc (HTTP 404)"):
+            self.assertIsNone(omr.http_status(err), err)
+            self.assertRefused(FakeGh(protection=(1, err)), "enforce_admins is unverified")
+        for err, want in (("gh: Not Found (HTTP 404)", "404"), ("HTTP 404: Not Found", "404"), ("HTTP 404", "404"),
+                          ("HTTP 403: x (HTTP 404)", "403")):
+            self.assertEqual(omr.http_status(err), want, err)
 
     def test_other_ambiguous_or_unparseable_errors_are_unreadable_and_refuse(self):
         errs = ("HTTP 403: Resource not accessible by integration (https://api.github.com/repos/x/branches/release-404/protection)",
