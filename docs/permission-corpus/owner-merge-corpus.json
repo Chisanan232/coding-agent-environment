@@ -1,0 +1,382 @@
+{
+ "version": 1,
+ "description": "Owner-merge rule corpus (SPE-118): the pinned merge and routine PR verbs must run with no prompt, every other merge or approval spelling in an OWNER_ASK entry must prompt (UNKNOWN_REQUIRES_REVIEW entries are measured residuals that do not). Run with scripts/permission-host-matrix.py --candidate docs/examples/owner-merge-pinned-allow.example.json. Every target is a nonexistent repository.",
+ "commands": [
+  {
+   "id": "001-owner-merge",
+   "family": "owner-merge",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "the gate-emitted pinned form"
+  },
+  {
+   "id": "002-owner-merge",
+   "family": "owner-merge",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "rtk gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "rtk-prefixed spelling"
+  },
+  {
+   "id": "003-owner-merge",
+   "family": "owner-merge",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr checkout 7 --repo Chisanan232/zz-nonexistent-probe-repo",
+   "note": ""
+  },
+  {
+   "id": "004-owner-merge",
+   "family": "owner-merge",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr update-branch 7 --repo Chisanan232/zz-nonexistent-probe-repo",
+   "note": ""
+  },
+  {
+   "id": "005-owner-merge",
+   "family": "owner-merge",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr reopen 7 --repo Chisanan232/zz-nonexistent-probe-repo",
+   "note": ""
+  },
+  {
+   "id": "006-owner-merge",
+   "family": "owner-merge",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr view 7 --repo Chisanan232/zz-nonexistent-probe-repo",
+   "note": ""
+  },
+  {
+   "id": "007-owner-merge",
+   "family": "owner-merge",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr checks 7 --repo Chisanan232/zz-nonexistent-probe-repo",
+   "note": ""
+  },
+  {
+   "id": "008-owner-merge",
+   "family": "owner-merge",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr diff 7 --repo Chisanan232/zz-nonexistent-probe-repo",
+   "note": ""
+  },
+  {
+   "id": "009-owner-merge",
+   "family": "owner-merge",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr comment 7 --repo Chisanan232/zz-nonexistent-probe-repo --body ok",
+   "note": ""
+  },
+  {
+   "id": "010-owner-merge",
+   "family": "owner-merge",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr review 7 --repo Chisanan232/zz-nonexistent-probe-repo --comment --body ok",
+   "note": ""
+  },
+  {
+   "id": "011-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --admin --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "admin"
+  },
+  {
+   "id": "012-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --squash --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "squash"
+  },
+  {
+   "id": "013-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 -s --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "short squash"
+  },
+  {
+   "id": "014-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 -d --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "short delete"
+  },
+  {
+   "id": "015-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo -md --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "short cluster"
+  },
+  {
+   "id": "016-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --delete-branch --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "delete-branch"
+  },
+  {
+   "id": "017-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --disable-auto --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "disable-auto"
+  },
+  {
+   "id": "018-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --auto --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "auto"
+  },
+  {
+   "id": "019-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --subject x --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "subject"
+  },
+  {
+   "id": "020-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567 --body x",
+   "note": "body"
+  },
+  {
+   "id": "021-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 -s --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567 --merge=false",
+   "note": "merge=false"
+  },
+  {
+   "id": "022-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit ''",
+   "note": "empty pin single quotes"
+  },
+  {
+   "id": "023-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit \"\"",
+   "note": "empty pin double quotes"
+  },
+  {
+   "id": "024-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit $''",
+   "note": "empty pin ansi-c"
+  },
+  {
+   "id": "025-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit=",
+   "note": "pin equals"
+  },
+  {
+   "id": "026-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567 --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "duplicate pin"
+  },
+  {
+   "id": "027-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567 extra",
+   "note": "argument after pin"
+  },
+  {
+   "id": "028-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567\t--admin",
+   "note": "tab before flag"
+  },
+  {
+   "id": "029-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --ad\"\"min --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "quoted flag"
+  },
+  {
+   "id": "030-owner-merge",
+   "family": "owner-merge",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "expect": "measure",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --ad\\min --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "backslash flag: MEASURED residual, runs unprompted on the real host (a literal backslash cannot be matched by a rule)"
+  },
+  {
+   "id": "031-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr review 7 --repo Chisanan232/zz-nonexistent-probe-repo --approve",
+   "note": "review approve"
+  },
+  {
+   "id": "032-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr review 7 -a --repo Chisanan232/zz-nonexistent-probe-repo",
+   "note": "review short approve"
+  },
+  {
+   "id": "033-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr review 7 -ca --repo Chisanan232/zz-nonexistent-probe-repo",
+   "note": "review cluster"
+  },
+  {
+   "id": "034-owner-merge",
+   "family": "owner-merge",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "expect": "measure",
+   "cmd": "gh pr review 7 --repo Chisanan232/zz-nonexistent-probe-repo --{approve,comment=false} --comment=false",
+   "note": "disguised review approval: documented residual (review bodies are routine; generic quote/expansion asks were removed)"
+  },
+  {
+   "id": "035-owner-merge",
+   "family": "owner-merge",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "expect": "measure",
+   "cmd": "gh pr review 7 --repo Chisanan232/zz-nonexistent-probe-repo --$(printf approve) --comment=false",
+   "note": "disguised review approval: documented residual (review bodies are routine; generic quote/expansion asks were removed)"
+  },
+  {
+   "id": "036-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "rtk gh pr merge 999999 --admin --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "rtk admin"
+  },
+  {
+   "id": "037-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --admi* --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "literal star globbing"
+  },
+  {
+   "id": "038-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr comment 7 --repo Chisanan232/zz-nonexistent-probe-repo --body-file ./Cargo.toml",
+   "note": "body from a local file"
+  },
+  {
+   "id": "039-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr comment 7 --repo Chisanan232/zz-nonexistent-probe-repo -F ./Cargo.toml",
+   "note": "short body-file"
+  },
+  {
+   "id": "040-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr create --repo Chisanan232/zz-nonexistent-probe-repo --title t --body-file ./Cargo.toml --head x",
+   "note": "create with a body file"
+  },
+  {
+   "id": "041-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr edit 7 --repo Chisanan232/zz-nonexistent-probe-repo --body-file ./Cargo.toml",
+   "note": "edit with a body file"
+  },
+  {
+   "id": "042-owner-merge",
+   "family": "owner-merge",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr review 7 --repo Chisanan232/zz-nonexistent-probe-repo --comment --body-file ./Cargo.toml",
+   "note": "review with a body file"
+  },
+  {
+   "id": "043-owner-merge",
+   "family": "owner-merge",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr create --repo Chisanan232/zz-nonexistent-probe-repo --title t --body b --head x",
+   "note": "control: inline body is routine"
+  },
+  {
+   "id": "044-owner-merge",
+   "family": "owner-merge",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "expect": "measure",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge # --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "trailing shell comment: the host strips it before matching, so the unpinned command is not rule-allowed and reaches the classifier (measured: the classifier ran it against the nonexistent repo)"
+  },
+  {
+   "id": "045-owner-merge",
+   "family": "owner-merge",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr review 7 --repo Chisanan232/zz-nonexistent-probe-repo --comment -b ok",
+   "note": "short body flag is a routine comment review"
+  },
+  {
+   "id": "046-owner-merge",
+   "family": "owner-merge",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr review 7 --repo Chisanan232/zz-nonexistent-probe-repo --comment --body \"Looks fine, see #12\"",
+   "note": "quoted body with an issue reference is routine"
+  },
+  {
+   "id": "047-owner-merge",
+   "family": "owner-merge",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr comment 7 --repo Chisanan232/zz-nonexistent-probe-repo --body \"Fixes #12: ok\"",
+   "note": "quoted comment body"
+  }
+ ]
+}

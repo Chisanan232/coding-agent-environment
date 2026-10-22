@@ -1,0 +1,19 @@
+{
+  "evidence_key_file": "/Users/EXAMPLE/.claude/owner-merge-evidence.key",
+  "repos": {
+    "EXAMPLE-OWNER/example-repo": {
+      "required_checks": [
+        "ci",
+        "SonarCloud Code Analysis"
+      ],
+      "reviewers": [
+        "independent-reviewer-id"
+      ],
+      "require_server_side_protection": true,
+      "accept_bypass_actors": false,
+      "max_evidence_age_hours": 24,
+      "require_signed_evidence": true,
+      "local_equivalent_ci": false
+    }
+  }
+}
