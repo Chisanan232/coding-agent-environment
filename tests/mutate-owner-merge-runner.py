@@ -175,7 +175,16 @@ MUTANTS = [
     ("ind: exact head", 'st == "APPROVED" and oid == head and assoc in TRUSTED_ASSOC\n                       for who', 'st == "APPROVED" and assoc in TRUSTED_ASSOC\n                       for who'),
     ("ind: trusted association", 'st == "APPROVED" and oid == head and assoc in TRUSTED_ASSOC\n                       for who', 'st == "APPROVED" and oid == head\n                       for who'),
     ("ind: login validated in config", 'all(isinstance(x, str) and LOGIN_RE.fullmatch(x) for x in ind)', 'True'),
-    ("ind: logins lowercased", '"independent_github_reviewers": [x.lower() for x in ind]}', '"independent_github_reviewers": list(ind)}'),
+    ("ind: logins lowercased", '"independent_github_reviewers": [x.lower() for x in ind], "protection_capability": cap}', '"independent_github_reviewers": list(ind), "protection_capability": cap}'),
+    ("pf: plan-limit text required", 'return http_status(err) == "403" and PLAN_LIMIT_RE.search(err) is not None', 'return http_status(err) == "403"'),
+    ("pf: status 403 required", 'return http_status(err) == "403" and PLAN_LIMIT_RE', 'return PLAN_LIMIT_RE.search(err) is not None and PLAN_LIMIT_RE'),
+    ("pf: both reads must be limited", '    if rc1 != 0 and rc2 != 0 and plan_limited(err1) and plan_limited(err2):', '    if rc1 != 0 and plan_limited(err1):'),
+    ("pf: fall back to strict check", 'check_private_free(runner, repo, base) or check_server_protection(runner, repo, base, cfg)', 'check_private_free(runner, repo, base) or {"capability": "private-free-app-level"}'),
+    ("pf: opt-in required", '    if cfg["protection_capability"] == "private-free-app-level":\n        info =', '    if True:\n        info ='),
+    ("pf: capability validated", 'cap in CAPABILITIES and not', 'not'),
+    ("pf: conflicting waiver refused", 'and not (cap == "private-free-app-level" and not prot)', ''),
+    ("pf: guarantees recorded", '        rec["guarantees"] = {', '        rec["guarantees_off"] = {'),
+    ("pf: review label honest", '"local-evidence-attestation (not a GitHub approval)"', '"github-independent-approval"'),
 ]
 
 
