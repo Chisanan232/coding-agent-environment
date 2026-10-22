@@ -46,14 +46,23 @@ STOP_FAILURE_KINDS = {"rate_limit", "overloaded", "authentication_failed", "oaut
                       "invalid_request", "model_not_found", "server_error", "max_output_tokens", "cloud_credential_error", "unknown"}
 END_NOTIFY_REASONS = {"other", "logout"}
 REMOTE_BACKENDS = ("ntfy", "pushover")
-REMOTE_BLOCKER_OWNERS = {"owner", "dependency", "resource", "ci", "reviewer", "other"}
+BLOCKER_OWNERS = {"owner", "dependency", "resource", "ci", "reviewer", "other"}
+# Everything a notification can say about a resume condition is one of these fixed phrases; there is no free-text field.
+RESUME_TRIGGERS = {"owner_approval": "owner approval", "owner_decision": "owner decision", "dependency_merged": "dependency merged",
+                   "ci_green": "CI green", "review_complete": "review complete", "resource_available": "resource available",
+                   "credentials_provided": "credentials provided", "manual_restart": "manual restart", "other": "other"}
+KIND_TEXT = {"STALE": "no heartbeat", "ENDED": "ended while running", "AGENT": "background agent finished"}
+ALLOWED_KINDS = set(KIND_TEXT.values()) | STOP_FAILURE_KINDS
+BACKEND_NAMES = {"macos", "ntfy", "pushover"}
+DELIVERY_STATUSES = {"pending", "sending", "failed", "sent", "dropped", "skipped"}
+TERMINAL = {"sent", "dropped", "skipped"}
 
 MAX_STDIN = 256 * 1024
-MAX_STATE_BYTES = 64 * 1024
+MAX_STATE_BYTES = 256 * 1024
 MAX_CHECKPOINT_BYTES = 8 * 1024
 HEARTBEAT_EVERY = 30
 HISTORY_CAP = 60
-NOTIFIED_CAP = 200
+NOTIFIED_CAP = 2000
 PENDING_CAP = 20
 HOOK_DEADLINE = 10
 SENDING_STALE = 300
@@ -63,6 +72,7 @@ LOG_CAP = 256 * 1024
 DEFAULT_CONFIG = {
     "profile": "personal",
     "corporate_markers": [],
+    "known_repos": [],
     "stale_after_seconds": 2700,
     "notify": {"agent_completed": False, "idle": False, "session_ended": True},
     "retry": {"max_attempts": 5, "base_seconds": 30, "max_seconds": 900},
@@ -120,6 +130,32 @@ def clean_repo(value, markers=()):
     return None if any(m and m.lower() in low for m in markers) else value
 
 
+def sanitize_fields(fields, cfg):
+    """Rebuild every outbound field from a strict validator or a fixed enum. None when the state itself is not a known state.
+
+    Used when a notification is queued AND again at every delivery attempt, so nothing read back from disk is trusted.
+    The repository label must be one the owner listed in `known_repos`; free text has no field to travel in.
+    """
+    if not isinstance(fields, dict) or fields.get("state") not in STATES:
+        return None
+    known = {r for r in cfg.get("known_repos", []) if isinstance(r, str)}
+    repo = fields.get("repo")
+    out = {"state": fields["state"], "repo": repo if isinstance(repo, str) and repo in known else "unlisted"}
+    ticket = fields.get("ticket")
+    if isinstance(ticket, str) and TICKET.fullmatch(ticket):
+        out["ticket"] = ticket
+    pr = fields.get("pr")
+    if type(pr) is int and 0 < pr < 10**7:
+        out["pr"] = pr
+    if fields.get("blocker_owner") in BLOCKER_OWNERS:
+        out["blocker_owner"] = fields["blocker_owner"]
+    if fields.get("resume_trigger") in RESUME_TRIGGERS:
+        out["resume_trigger"] = fields["resume_trigger"]
+    if fields.get("kind") in ALLOWED_KINDS:
+        out["kind"] = fields["kind"]
+    return out
+
+
 def clean_sid(value):
     if isinstance(value, str) and SAFE_ID.fullmatch(value):
         return value
@@ -154,27 +190,32 @@ def config_path():
 
 
 def read_regular(path, limit):
-    """Bytes of a regular, non-symlink file no larger than limit; (None, problem) otherwise. Missing file -> (None, None)."""
+    raw, problem, _ = read_regular_ex(path, limit)
+    return raw, problem
+
+
+def read_regular_ex(path, limit):
+    """(bytes, problem, mtime) of a regular, non-symlink file no larger than limit, all taken from ONE opened descriptor."""
     try:
         fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except FileNotFoundError:
-        return None, None
+        return None, None, 0.0
     except OSError as exc:
-        return None, f"unreadable:{exc.errno}"
+        return None, f"unreadable:{exc.errno}", 0.0
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            return None, "not-regular"
+            return None, "not-regular", 0.0
         if st.st_uid != os.getuid():
-            return None, "foreign-owner"
+            return None, "foreign-owner", 0.0
         raw = os.read(fd, limit + 1)
     except OSError as exc:
-        return None, f"unreadable:{exc.errno}"
+        return None, f"unreadable:{exc.errno}", 0.0
     finally:
         os.close(fd)
     if len(raw) > limit:
-        return None, "too-large"
-    return raw, None
+        return None, "too-large", 0.0
+    return raw, None, st.st_mtime
 
 
 def atomic_write(path, text):
@@ -196,18 +237,30 @@ def atomic_write(path, text):
 def session_lock(path, wait=3.0, sleep=time.sleep):
     p = pathlib.Path(path)
     p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(str(p.parent / (p.name + ".lock")), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    lock_path = str(p.parent / (p.name + ".lock"))
+    waited = 0.0
+    while True:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            if waited >= wait:
+                raise TimeoutError("session state busy")
+            sleep(0.05)
+            waited += 0.05
+            continue
+        try:  # stable identity: the lock only counts if its path still names the inode we hold (garbage collection may have replaced it)
+            same = os.stat(lock_path).st_ino == os.fstat(fd).st_ino
+        except OSError:
+            same = False
+        if same:
+            break
+        os.close(fd)
+        if waited >= wait:
+            raise TimeoutError("session state busy")
+        waited += 0.05
     try:
-        waited = 0.0
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError:
-                if waited >= wait:
-                    raise TimeoutError("session state busy")
-                sleep(0.05)
-                waited += 0.05
         yield
     finally:
         os.close(fd)
@@ -219,11 +272,16 @@ def log_line(sdir, text):
         path = pathlib.Path(sdir) / "hook.log"
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with contextlib.suppress(OSError):
-            if path.stat().st_size > LOG_CAP:
+            st = os.lstat(path)
+            if stat.S_ISREG(st.st_mode) and st.st_size > LOG_CAP:
                 os.replace(path, str(path) + ".1")
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "a") as fh:
-            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {text[:200]}\n")
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):  # a FIFO or device here must never be written to or waited on
+                return
+            os.write(fd, f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {text[:200]}\n".encode("ascii", "replace"))
+        finally:
+            os.close(fd)
     except Exception:
         pass
 
@@ -240,7 +298,7 @@ def load_config(path=None):
             raise ValueError
     except ValueError:
         return cfg, "invalid-json"
-    for key in ("profile", "corporate_markers", "stale_after_seconds"):
+    for key in ("profile", "corporate_markers", "known_repos", "stale_after_seconds"):
         if key in user:
             cfg[key] = user[key]
     for key in ("notify", "retry"):
@@ -253,6 +311,7 @@ def load_config(path=None):
         cfg["profile"] = "corporate"  # unknown profile fails towards the stricter one
     if not isinstance(cfg["corporate_markers"], list):
         cfg["corporate_markers"] = []
+    cfg["known_repos"] = [r for r in cfg["known_repos"] if isinstance(r, str) and SAFE_REPO.fullmatch(r)] if isinstance(cfg["known_repos"], list) else []
     if type(cfg["stale_after_seconds"]) is not int or cfg["stale_after_seconds"] < 60:
         cfg["stale_after_seconds"] = DEFAULT_CONFIG["stale_after_seconds"]
     return cfg, None
@@ -277,17 +336,19 @@ def find_checkpoint(cwd):
 
 
 def read_checkpoint(cwd, sid, markers):
-    """(sanitised checkpoint dict or None, mtime). Never raises; anything doubtful yields None."""
+    """(sanitised checkpoint dict or None, mtime of the SAME opened file). Never raises; anything doubtful yields None.
+
+    Only shapes and enums survive: `task` and `workflow_state` are short plain text kept for local identity and never sent anywhere.
+    """
     path = find_checkpoint(cwd)
     if path is None:
         return None, 0.0
-    raw, problem = read_regular(path, MAX_CHECKPOINT_BYTES)
+    raw, problem, mtime = read_regular_ex(path, MAX_CHECKPOINT_BYTES)
     if raw is None:
         return None, 0.0
     try:
         d = json.loads(raw.decode("utf-8"))
-        mtime = path.stat().st_mtime
-    except (ValueError, OSError):
+    except ValueError:
         return None, 0.0
     if not isinstance(d, dict) or d.get("schema") != 1 or d.get("state") not in CHECKPOINT_STATES:
         return None, 0.0
@@ -298,13 +359,15 @@ def read_checkpoint(cwd, sid, markers):
     verified = d.get("verified") if isinstance(d.get("verified"), dict) else {}
     ver_by = clean_text(verified.get("by"), 40, markers)
     ver_ev = verified.get("evidence")
-    ver_ev = ver_ev if isinstance(ver_ev, str) and EVIDENCE.fullmatch(ver_ev) and not SECRET_WORDS.search(ver_ev) else None  # a reference (may hold a full SHA); never transmitted
-    repo = clean_repo(d.get("repo"), markers)
-    ticket = d.get("ticket") if isinstance(d.get("ticket"), str) and TICKET.fullmatch(d["ticket"]) else None
+    ver_ev = ver_ev if isinstance(ver_ev, str) and EVIDENCE.fullmatch(ver_ev) and not SECRET_WORDS.search(ver_ev) else None  # a reference; never transmitted
+    owner = blocker.get("owner")
+    trigger = blocker.get("resume_trigger")
     return {
-        "state": d["state"], "task": clean_text(d.get("task"), 64, markers), "repo": repo, "ticket": ticket, "pr": pr, "head": head or None,
+        "state": d["state"], "task": clean_text(d.get("task"), 64, markers), "repo": clean_repo(d.get("repo"), markers),
+        "ticket": d.get("ticket") if isinstance(d.get("ticket"), str) and TICKET.fullmatch(d["ticket"]) else None, "pr": pr, "head": head or None,
         "workflow_state": clean_text(d.get("workflow_state"), 48, markers),
-        "blocker_owner": clean_text(blocker.get("owner"), 48, markers), "resume_trigger": clean_text(blocker.get("resume_trigger"), 96, markers),
+        "blocker_owner": owner if owner in BLOCKER_OWNERS else ("other" if owner else None),
+        "resume_trigger": trigger if trigger in RESUME_TRIGGERS else None,
         "verified": bool(ver_by and ver_ev),
     }, mtime
 
@@ -316,18 +379,32 @@ def ticket_from_environment():
 
 # ---- records -------------------------------------------------------------------------------------------------------------------
 def new_record(sid, now):
-    return {"v": 1, "session_id": sid, "state": "IDLE", "state_since": now, "last_seen": now, "cycle": 0, "cycle_started": now, "agent_done": 0,
-            "task": {}, "history": [], "notified": [], "pending": [], "ended_reason": None}
+    return {"v": 2, "session_id": sid, "state": "IDLE", "state_since": now, "last_seen": now, "cycle": 0, "run_started": now, "agent_done": 0,
+            "task": {}, "history": [], "notified": {}, "pending": [], "ended_reason": None, "dropped": 0, "overflow": 0, "cwd": ""}
+
+
+def valid_pending(e):
+    try:
+        return (isinstance(e, dict) and isinstance(e.get("key"), str) and 0 < len(e["key"]) <= 64 and type(e.get("cycle")) is int and e["cycle"] >= 0
+                and type(e.get("created")) is int and isinstance(e.get("fields"), dict) and isinstance(e.get("backends"), dict) and len(e["backends"]) <= 8
+                and all(isinstance(n, str) and n in BACKEND_NAMES and isinstance(b, dict) and b.get("status") in DELIVERY_STATUSES
+                        and type(b.get("attempts")) is int and 0 <= b["attempts"] <= 100 and isinstance(b.get("next_at"), (int, float))
+                        and not isinstance(b.get("next_at"), bool) for n, b in e["backends"].items()))
+    except Exception:
+        return False
 
 
 def valid_record(d, sid):
     try:
-        return (isinstance(d, dict) and d.get("v") == 1 and d.get("session_id") == sid and d.get("state") in STATES
+        return (isinstance(d, dict) and d.get("v") == 2 and d.get("session_id") == sid and d.get("state") in STATES
                 and type(d.get("cycle")) is int and d["cycle"] >= 0 and isinstance(d.get("history"), list) and len(d["history"]) <= HISTORY_CAP
-                and isinstance(d.get("notified"), list) and len(d["notified"]) <= NOTIFIED_CAP and all(isinstance(k, str) for k in d["notified"])
-                and isinstance(d.get("pending"), list) and len(d["pending"]) <= PENDING_CAP and isinstance(d.get("task"), dict)
+                and isinstance(d.get("notified"), dict) and len(d["notified"]) <= NOTIFIED_CAP
+                and all(isinstance(k, str) and isinstance(v, list) and len(v) == 2 and all(type(x) is int for x in v) for k, v in d["notified"].items())
+                and isinstance(d.get("pending"), list) and len(d["pending"]) <= PENDING_CAP and all(valid_pending(e) for e in d["pending"])
+                and isinstance(d.get("task"), dict) and isinstance(d.get("cwd", ""), str)
                 and isinstance(d.get("last_seen"), (int, float)) and isinstance(d.get("state_since"), (int, float))
-                and isinstance(d.get("cycle_started"), (int, float)) and type(d.get("agent_done")) is int)
+                and isinstance(d.get("run_started"), (int, float)) and type(d.get("agent_done")) is int
+                and type(d.get("dropped")) is int and type(d.get("overflow")) is int)
     except Exception:
         return False
 
@@ -379,10 +456,16 @@ def send_macos(payload, cfg):
     return None if r.returncode == 0 else "osascript-rc"
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # approval covers the first URL only; a redirect is an error, never followed (it would carry the Authorization header)
+
+
 def http_post(url, data, headers, timeout=4):
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())  # no environment proxies either
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - https and approved host checked by the caller
+        with opener.open(req, timeout=timeout) as resp:  # https and approved host checked by the caller
             return None if 200 <= resp.status < 300 else f"http-{resp.status}"
     except urllib.error.HTTPError as exc:
         return f"http-{exc.code}"
@@ -426,24 +509,21 @@ def backend_allowed(name, cfg, corporate_session):
     return True, None
 
 
-def render(payload_fields, remote):
-    """Title and body from allowlisted fields only. Remote backends get no free text from the checkpoint."""
-    state = payload_fields["state"]
-    bits = [payload_fields.get("repo") or "unknown-repo"]
-    if payload_fields.get("ticket"):
-        bits.append(payload_fields["ticket"])
-    if payload_fields.get("pr"):
-        bits.append(f"PR #{payload_fields['pr']}")
+def render(fields):
+    """Title and body from sanitised fields and fixed phrases only. Identical for every backend: there is no free-text field."""
+    bits = [fields.get("repo", "unlisted")]
+    if fields.get("ticket"):
+        bits.append(fields["ticket"])
+    if fields.get("pr"):
+        bits.append(f"PR #{fields['pr']}")
     body = " ".join(bits)
-    kind = payload_fields.get("kind")
-    if kind:
-        body += f" | {kind}"
-    owner = payload_fields.get("blocker_owner")
-    if owner:
-        body += f" | owner: {owner}"
-    if not remote and payload_fields.get("resume_trigger"):
-        body += f" | resume: {payload_fields['resume_trigger']}"
-    return {"title": f"Claude Code: {state}", "body": body[:200]}
+    if fields.get("kind"):
+        body += f" | {fields['kind']}"
+    if fields.get("blocker_owner"):
+        body += f" | owner: {fields['blocker_owner']}"
+    if fields.get("resume_trigger"):
+        body += f" | resume: {RESUME_TRIGGERS[fields['resume_trigger']]}"
+    return {"title": f"Claude Code: {fields['state']}", "body": body[:200]}
 
 
 # ---- engine --------------------------------------------------------------------------------------------------------------------
@@ -452,99 +532,131 @@ class Engine:
         self.sdir, self.cfg, self.transports, self.clock, self.sleep = pathlib.Path(sdir), cfg, transports or REAL_TRANSPORTS, clock, sleep
 
     # -- state machine
-    def set_state(self, rec, new, reason, now, cp=None, kind=None, notify=True, force=False):
+    def set_state(self, rec, new, reason, now, cp=None, kind=None, notify=True, force=False, bump=True, new_run=False, extra=None):
+        """Move the session. `cycle` counts runs for notification dedup; `run_started` is the freshness floor for a checkpoint."""
         old = rec["state"]
         if new == "RUNNING" and old != "RUNNING":
-            rec["cycle"] += 1
-            rec["cycle_started"] = now
+            if bump:
+                rec["cycle"] += 1
+            if new_run:
+                rec["run_started"] = now
         if new != old or force:
             rec["history"] = (rec["history"] + [{"t": int(now), "from": old, "to": new, "why": reason}])[-HISTORY_CAP:]
             rec["state"], rec["state_since"] = new, now
         rec["last_seen"] = now
         if cp:
             rec["task"] = {k: cp[k] for k in ("task", "repo", "ticket", "pr", "head", "workflow_state", "blocker_owner", "resume_trigger", "verified") if cp.get(k) is not None}
-        if notify and (new in NOTIFIABLE or kind == "STALE" or kind == "ENDED"):
-            self.enqueue(rec, new, reason, now, kind)
+        if notify and (new in NOTIFIABLE or kind in ("STALE", "ENDED")):
+            self.enqueue(rec, new, reason, now, kind, extra=extra)
 
-    def enqueue(self, rec, state, reason, now, kind=None, extra_key=""):
-        t = rec["task"]
-        label = kind or state
-        key_src = "|".join([rec["session_id"], str(t.get("task") or t.get("ticket") or "-"), label, str(t.get("head") or ""), str(rec["cycle"]), extra_key])
-        key = hashlib.sha256(key_src.encode()).hexdigest()[:24]
-        if key in rec["notified"] or any(p["key"] == key for p in rec["pending"]):
+    @staticmethod
+    def seen(rec, base, cycle):
+        got = rec["notified"].get(base)
+        return (got is not None and got[0] >= cycle) or any(p["key"] == base and p["cycle"] == cycle for p in rec["pending"])
+
+    @staticmethod
+    def mark_notified(rec, base, cycle, now):
+        """Remember a finished notification for the retention window; only entries older than the window (or the hard cap) are forgotten."""
+        rec["notified"][base] = [int(cycle), int(now)]
+        for k in [k for k, v in rec["notified"].items() if v[1] < now - GC_AFTER]:
+            del rec["notified"][k]
+        while len(rec["notified"]) > NOTIFIED_CAP:
+            oldest = min(rec["notified"], key=lambda k: rec["notified"][k][1])
+            del rec["notified"][oldest]
+            rec["overflow"] += 1  # durable and visible in `status`: dedup memory was truncated inside its retention window
+
+    def make_room(self, rec, now):
+        """A full queue gives its oldest entry a durable terminal outcome instead of silently discarding it."""
+        while len(rec["pending"]) >= PENDING_CAP:
+            old = rec["pending"].pop(0)
+            for b in old["backends"].values():
+                if b["status"] not in TERMINAL:
+                    b.update(status="dropped", code="queue-overflow")
+            self.mark_notified(rec, old["key"], old["cycle"], now)
+            rec["dropped"] += 1
+            rec["history"] = (rec["history"] + [{"t": int(now), "from": rec["state"], "to": rec["state"], "why": "queue-overflow-dropped"}])[-HISTORY_CAP:]
+
+    def enqueue(self, rec, state, reason, now, kind=None, extra_key="", extra=None):
+        t, label, cycle = rec["task"], kind or state, rec["cycle"]
+        base = hashlib.sha256("|".join([rec["session_id"], str(t.get("task") or t.get("ticket") or "-"), label, str(t.get("head") or ""), extra_key]).encode()).hexdigest()[:24]
+        if self.seen(rec, base, cycle):
             return None
-        markers = self.cfg.get("corporate_markers", [])
-        fields = {"state": "FAILED" if kind == "STALE" else state, "repo": t.get("repo") or rec.get("repo_label") or "unknown-repo", "ticket": t.get("ticket"),
-                  "pr": (t.get("pr") or None), "blocker_owner": t.get("blocker_owner") if state in BLOCKED else None,
-                  "resume_trigger": t.get("resume_trigger") if state in BLOCKED or kind else None, "kind": None}
-        if kind == "STALE":
-            fields["kind"] = "no heartbeat"
-        elif kind == "ENDED":
-            fields["state"], fields["kind"] = "SESSION_ENDED", "ended while running"
-        elif kind == "AGENT":
-            fields["state"], fields["kind"] = "RUNNING", "background agent finished"
+        raw = {"state": "FAILED" if kind == "STALE" else ("SESSION_ENDED" if kind == "ENDED" else ("RUNNING" if kind == "AGENT" else state)),
+               "repo": t.get("repo") or rec.get("repo_label"), "ticket": t.get("ticket"), "pr": t.get("pr")}
+        if state in BLOCKED:
+            raw.update(blocker_owner=t.get("blocker_owner") or ("owner" if state == "BLOCKED_OWNER" else None), resume_trigger=t.get("resume_trigger"))
+        if kind in KIND_TEXT:
+            raw["kind"] = KIND_TEXT[kind]
         elif reason.startswith("stop_failure:"):
-            fields["kind"] = reason.split(":", 1)[1]
-        if state == "BLOCKED_OWNER" and not fields.get("blocker_owner"):
-            fields["blocker_owner"] = "owner"
-        entry = {"key": key, "created": int(now), "fields": {k: v for k, v in fields.items() if v is not None},
-                 "corporate": bool(rec.get("corporate")), "backends": {}}
+            raw["kind"] = reason.split(":", 1)[1]
+        raw.update(extra or {})
+        fields = sanitize_fields(raw, self.cfg)
+        if fields is None:
+            return None
+        backends = {}
         for name in self.cfg["backends"]:
-            ok, why = backend_allowed(name, self.cfg, entry["corporate"])
-            entry["backends"][name] = {"status": "pending" if ok else "skipped", "attempts": 0, "next_at": 0, "code": why}
-        if not any(b["status"] == "pending" for b in entry["backends"].values()):
-            rec["notified"] = (rec["notified"] + [key])[-NOTIFIED_CAP:]
-            return entry
-        rec["pending"] = (rec["pending"] + [entry])[-PENDING_CAP:]
-        return entry
+            enabled = (self.cfg["backends"][name] or {}).get("enabled") is True
+            backends[name] = {"status": "pending" if enabled else "skipped", "attempts": 0, "next_at": 0, "code": None if enabled else "disabled"}
+        if not any(b["status"] == "pending" for b in backends.values()):
+            self.mark_notified(rec, base, cycle, now)
+            return None
+        self.make_room(rec, now)
+        rec["pending"].append({"key": base, "cycle": cycle, "created": int(now), "fields": fields, "backends": backends})
+        return base
 
     def deliver(self, rec, now, budget_end=None):
-        """Attempt every due delivery once. Returns True when the record changed."""
+        """Attempt every due delivery once. Fields and corporate status are re-evaluated NOW, never taken from the queued entry."""
         retry, changed = self.cfg["retry"], False
-        for entry in rec["pending"]:
-            for name, b in entry["backends"].items():
-                if b["status"] == "sending" and now - b["next_at"] > SENDING_STALE:
-                    b["status"], changed = "failed", True
-                if b["status"] not in ("pending", "failed") or b["next_at"] > now:
-                    continue
-                if budget_end is not None and self.clock() > budget_end:
-                    return changed
-                ok, why = backend_allowed(name, self.cfg, entry.get("corporate"))
-                if not ok:
-                    b.update(status="skipped", code=why)
+        corporate = bool(rec.get("corporate")) or is_corporate_path(rec.get("cwd"), self.cfg)
+        for entry in list(rec["pending"]):
+            fields = sanitize_fields(entry["fields"], self.cfg)
+            if fields is None:
+                for b in entry["backends"].values():
+                    if b["status"] not in TERMINAL:
+                        b.update(status="dropped", code="invalid-fields")
+                        changed = True
+            else:
+                if fields != entry["fields"]:
+                    entry["fields"], changed = fields, True
+                for name, b in entry["backends"].items():
+                    if b["status"] == "sending" and now - b["next_at"] > SENDING_STALE:
+                        b["status"], changed = "failed", True
+                    if b["status"] not in ("pending", "failed") or b["next_at"] > now:
+                        continue
+                    ok, why = backend_allowed(name, self.cfg, corporate)
+                    if not ok:
+                        b.update(status="skipped", code=why)
+                        changed = True
+                        continue
+                    if b["attempts"] >= int(retry["max_attempts"]):  # interrupted-send recoveries count: the cap is enforced BEFORE sending
+                        b.update(status="dropped", code="max-attempts")
+                        changed = True
+                        continue
+                    if budget_end is not None and self.clock() > budget_end:
+                        return changed
+                    payload = render(fields)
+                    b.update(status="sending", attempts=b["attempts"] + 1, next_at=now)
+                    save_record(self.sdir, rec)  # persisted BEFORE sending: a crash here retries once instead of looping or losing
+                    transport = self.transports.get(name)
+                    try:
+                        code = transport(payload, self.cfg["backends"][name]) if transport else "no-transport"
+                    except Exception as exc:
+                        code = f"error-{type(exc).__name__}"[:40]
                     changed = True
-                    continue
-                payload = render(entry["fields"], remote=name in REMOTE_BACKENDS)
-                if name in REMOTE_BACKENDS:
-                    payload = self.remote_safe(entry["fields"], payload)
-                b.update(status="sending", attempts=b["attempts"] + 1, next_at=now)
-                save_record(self.sdir, rec)  # persisted BEFORE sending: a crash here retries once instead of looping or losing
-                transport = self.transports.get(name)
-                try:
-                    code = transport(payload, self.cfg["backends"][name]) if transport else "no-transport"
-                except Exception as exc:
-                    code = f"error-{type(exc).__name__}"[:40]
-                changed = True
-                if code is None:
-                    b.update(status="sent", code=None)
-                elif b["attempts"] >= int(retry["max_attempts"]):
-                    b.update(status="dropped", code=str(code)[:40])
-                else:
-                    delay = min(int(retry["max_seconds"]), int(retry["base_seconds"]) * (2 ** (b["attempts"] - 1)))
-                    b.update(status="failed", code=str(code)[:40], next_at=now + delay)
-        done = [e for e in rec["pending"] if all(b["status"] in ("sent", "dropped", "skipped") for b in e["backends"].values())]
+                    if code is None:
+                        b.update(status="sent", code=None)
+                    elif b["attempts"] >= int(retry["max_attempts"]):
+                        b.update(status="dropped", code=str(code)[:40])
+                    else:
+                        delay = min(int(retry["max_seconds"]), int(retry["base_seconds"]) * (2 ** (b["attempts"] - 1)))
+                        b.update(status="failed", code=str(code)[:40], next_at=now + delay)
+        done = [e for e in rec["pending"] if all(b["status"] in TERMINAL for b in e["backends"].values())]
+        for e in done:
+            self.mark_notified(rec, e["key"], e["cycle"], now)
         if done:
-            rec["notified"] = (rec["notified"] + [e["key"] for e in done if e["key"] not in rec["notified"]])[-NOTIFIED_CAP:]
             rec["pending"] = [e for e in rec["pending"] if e not in done]
             changed = True
         return changed
-
-    @staticmethod
-    def remote_safe(fields, payload):
-        """Remote backends get the enum blocker owner only; the resume trigger and free text never leave the machine."""
-        owner = fields.get("blocker_owner")
-        f = dict(fields, blocker_owner=owner if owner in REMOTE_BLOCKER_OWNERS else ("unspecified" if owner else None), resume_trigger=None)
-        return render(f, remote=True)
 
     # -- events
     def handle(self, ev):
@@ -564,15 +676,15 @@ class Engine:
                 rec = rec or new_record(sid, now)
                 before = json.dumps(rec, sort_keys=True)
                 cwd = ev.get("cwd") if isinstance(ev.get("cwd"), str) else None
+                if cwd:
+                    rec["cwd"] = cwd[:300]
                 rec["corporate"] = bool(is_corporate_path(cwd, self.cfg)) or bool(rec.get("corporate"))
                 markers = self.cfg.get("corporate_markers", [])
                 cp, cp_mtime = read_checkpoint(cwd, sid, markers)
                 if cp is None and not rec["task"] and ticket_from_environment():
-                    cp_env = {"ticket": ticket_from_environment()}
-                    rec["task"].update(cp_env)
+                    rec["task"].update({"ticket": ticket_from_environment()})
                 if not rec["task"].get("repo") and cwd:
-                    label = os.path.basename(cwd.rstrip("/"))
-                    rec["repo_label"] = clean_repo(label, markers) or "unknown-repo"
+                    rec["repo_label"] = clean_repo(os.path.basename(cwd.rstrip("/")), markers) or "unlisted"
                 self.apply(rec, name, ev, cp, cp_mtime, now, created)
                 changed = json.dumps(rec, sort_keys=True) != before
                 if self.deliver(rec, now, budget_end=now + 6):
@@ -587,8 +699,9 @@ class Engine:
     def apply(self, rec, name, ev, cp, cp_mtime, now, created):
         state = rec["state"]
         if name == "SessionStart":
-            if state == "SESSION_ENDED" or created or ev.get("source") in ("resume", "startup", "clear", "fork", "compact"):
-                self.set_state(rec, "RUNNING", f"start:{str(ev.get('source') or 'unknown')[:12]}", now, cp, notify=False)
+            source = str(ev.get("source") or "unknown")
+            # a resume restores the same run: no new cycle, so an identical block already announced is not announced again
+            self.set_state(rec, "RUNNING", f"start:{source[:12]}", now, cp, notify=False, bump=source != "resume", new_run=True)
             return
         if name == "SessionEnd":
             reason = str(ev.get("reason") or "other")
@@ -599,17 +712,20 @@ class Engine:
             if was == "RUNNING" and reason in END_NOTIFY_REASONS and self.cfg["notify"].get("session_ended", True):
                 self.enqueue(rec, "SESSION_ENDED", f"end:{reason}", now, kind="ENDED")
             return
-        if state == "SESSION_ENDED" and name not in ("UserPromptSubmit",):
+        if state == "SESSION_ENDED" and name != "UserPromptSubmit":
             return
         if name == "UserPromptSubmit":
             if state != "RUNNING":
-                self.set_state(rec, "RUNNING", "prompt", now, cp, notify=False)
+                self.set_state(rec, "RUNNING", "prompt", now, cp, notify=False, new_run=True)
             else:
                 self.heartbeat(rec, now)
             return
         if name in ("PostToolUse", "PostToolUseFailure", "SubagentStop", "TaskCompleted", "SubagentStart", "PreToolUse"):
-            if name in ("PostToolUse", "PostToolUseFailure") and state in BLOCKED | {"IDLE", "COMPLETED", "FAILED"}:
-                self.set_state(rec, "RUNNING", "progress", now, cp, notify=False)
+            if name in ("PostToolUse", "PostToolUseFailure") and state in BLOCKED:
+                # the owner unblocked it: a new cycle, but the SAME run, so a checkpoint written by this very tool call stays fresh
+                self.set_state(rec, "RUNNING", "progress", now, cp, notify=False, new_run=False)
+            elif name in ("PostToolUse", "PostToolUseFailure") and state in ("IDLE", "COMPLETED", "FAILED"):
+                self.set_state(rec, "RUNNING", "progress", now, cp, notify=False, new_run=True)
             else:
                 self.heartbeat(rec, now)
             if name in ("TaskCompleted", "SubagentStop"):
@@ -617,8 +733,9 @@ class Engine:
             return
         if name == "Notification":
             ntype = str(ev.get("notification_type") or "")
+            block = {"blocker_owner": "owner", "resume_trigger": "owner_decision" if ntype != "permission_prompt" else "owner_approval"}
             if ntype in OWNER_BLOCK_TYPES or (ntype == "idle_prompt" and state in ("RUNNING", "IDLE")):
-                self.set_state(rec, "BLOCKED_OWNER", ntype[:30], now, self.owner_cp(cp), notify=True)
+                self.set_state(rec, "BLOCKED_OWNER", ntype[:30], now, cp, notify=True, extra=block)
             elif ntype == "agent_completed":
                 rec["agent_done"] += 1
                 self.heartbeat(rec, now)
@@ -637,7 +754,7 @@ class Engine:
                 self.heartbeat(rec, now)
                 return
             target, reason = "IDLE", "stop"
-            if cp and cp_mtime > rec["cycle_started"]:  # strictly newer: a leftover file from before this run never counts
+            if cp and cp_mtime > rec["run_started"]:  # strictly newer than this run's start: a leftover file never counts
                 if cp["state"] == "COMPLETED":
                     target, reason = ("COMPLETED", "checkpoint-verified") if cp["verified"] else ("IDLE", "completion-unverified")
                 elif cp["state"] in BLOCKED or cp["state"] == "FAILED":
@@ -645,10 +762,6 @@ class Engine:
             self.set_state(rec, target, reason, now, cp, notify=target in NOTIFIABLE)
             return
         self.heartbeat(rec, now)
-
-    @staticmethod
-    def owner_cp(cp):
-        return cp
 
     def heartbeat(self, rec, now):
         if now - rec["last_seen"] >= HEARTBEAT_EVERY or now < rec["last_seen"]:
@@ -681,6 +794,7 @@ class Engine:
                         changed = True
                         out["retried"] += pending_before
                     if rec["state"] in ("SESSION_ENDED", "COMPLETED", "FAILED") and not rec["pending"] and now - rec["last_seen"] > GC_AFTER:
+                        # removed while HOLDING the lock; session_lock re-checks the inode, so a waiter that opened the old file retries on the new one
                         for q in (p, p.with_name(p.name + ".lock")):
                             with contextlib.suppress(OSError):
                                 os.unlink(q)
@@ -697,12 +811,17 @@ class Engine:
 def cmd_hook(args):
     sdir = state_dir()
 
+    fired = []
+
     def on_alarm(signum, frame):
+        if fired:
+            os._exit(0)  # the first TimeoutError was swallowed somewhere: leave without waiting for anything else
+        fired.append(1)
         raise TimeoutError("hook deadline")
 
     try:
         signal.signal(signal.SIGALRM, on_alarm)
-        signal.alarm(HOOK_DEADLINE)
+        signal.setitimer(signal.ITIMER_REAL, HOOK_DEADLINE, 1)  # repeats every second after the deadline
         raw = sys.stdin.buffer.read(MAX_STDIN + 1)
         if len(raw) > MAX_STDIN:
             log_line(sdir, "stdin too large")
@@ -718,7 +837,7 @@ def cmd_hook(args):
         log_line(sdir, f"hook error {type(exc).__name__}")
     finally:
         with contextlib.suppress(Exception):
-            signal.alarm(0)
+            signal.setitimer(signal.ITIMER_REAL, 0)
     return 0
 
 
@@ -738,7 +857,8 @@ def cmd_status(args):
         t = rec["task"]
         pend = sum(1 for e in rec["pending"] for b in e["backends"].values() if b["status"] in ("pending", "failed", "sending"))
         rows.append({"session": sid[:12], "state": rec["state"], "age": age(now, rec["state_since"]), "seen": age(now, rec["last_seen"]), "cycle": rec["cycle"],
-                     "repo": t.get("repo") or rec.get("repo_label"), "ticket": t.get("ticket"), "pr": t.get("pr"), "pending_deliveries": pend})
+                     "repo": t.get("repo") or rec.get("repo_label"), "ticket": t.get("ticket"), "pr": t.get("pr"), "pending_deliveries": pend,
+                     "dropped": rec["dropped"] or None, "dedup_overflow": rec["overflow"] or None})
     if args.json:
         print(json.dumps(rows, indent=1))
     else:
@@ -785,13 +905,16 @@ def cmd_checkpoint(args):
         raise SystemExit("--head needs --pr")
     if args.blocker_owner or args.resume_trigger:
         body["blocker"] = {}
-        for key, val, limit in (("owner", args.blocker_owner, 48), ("resume_trigger", args.resume_trigger, 96)):
-            if val is not None:
-                if clean_text(val, limit, markers) is None:
-                    raise SystemExit(f"--{key.replace('_', '-')} must be short plain text")
-                body["blocker"][key] = val
+        if args.blocker_owner is not None:
+            if args.blocker_owner not in BLOCKER_OWNERS:
+                raise SystemExit(f"--blocker-owner must be one of {sorted(BLOCKER_OWNERS)}")
+            body["blocker"]["owner"] = args.blocker_owner
+        if args.resume_trigger is not None:
+            if args.resume_trigger not in RESUME_TRIGGERS:
+                raise SystemExit(f"--resume-trigger must be one of {sorted(RESUME_TRIGGERS)}")
+            body["blocker"]["resume_trigger"] = args.resume_trigger
     if args.state in BLOCKED and not args.resume_trigger:
-        raise SystemExit("a BLOCKED_* checkpoint needs --resume-trigger (the exact condition that unblocks it)")
+        raise SystemExit("a BLOCKED_* checkpoint needs --resume-trigger (one of the fixed conditions that unblocks it)")
     if args.state == "COMPLETED":
         if not (args.verified_by and args.evidence):
             raise SystemExit("COMPLETED needs --verified-by and --evidence (a durable reference such as PR#101@<sha> or ci:<run>)")
@@ -808,7 +931,8 @@ def cmd_render_config(args):
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     cfg["profile"] = args.profile
     cfg["_note"] = ("Everything is off until a backend sets enabled to true. Credentials are environment-variable NAMES or file paths, never values. "
-                    "Remote backends also need approved_destination equal to the server host, and are refused on the corporate profile.")
+                    "Remote backends also need approved_destination equal to the server host, and are refused on the corporate profile. "
+                    "Notifications show a repository name only if it is listed in known_repos; otherwise they say 'unlisted'.")
     text = json.dumps(cfg, indent=2) + "\n"
     if args.out:
         with open(args.out, "x") as fh:
