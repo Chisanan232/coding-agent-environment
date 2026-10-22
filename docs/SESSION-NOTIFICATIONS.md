@@ -142,4 +142,12 @@ Delivery and what the owner sees are separate evidence and are never merged into
 | `LOCAL_NOTIFICATION_DELIVERED` | the macOS backend ran (`osascript` exit 0) and the state file records the notice as delivered, replay produced no second one | `scripts/session-notify.py status`, the smoke test above | reproducible by the agent; recorded once on 2026-10-22 |
 | `LOCAL_BANNER_CONFIRMED` | a person saw the banner on screen | the owner, by eye, after running the smoke test | **not yet confirmed**; notification settings, Focus mode or a locked screen can hide a delivered banner |
 
+A third, objective level sits between them: `LOCAL_BANNER_PRESENTED_BY_OS`. After the smoke test, the macOS unified log shows the notification subsystem presenting it. It is not the owner's eyes, and Focus or a locked screen are still possible, but it shows macOS accepted and displayed the banner (attributed to Script Editor, the `osascript` notification sender; the body is `<private>` in the log and not read):
+
+```bash
+/usr/bin/log show --last 2m --style compact --predicate '(process == "usernoted" OR process == "NotificationCenter") AND (eventMessage CONTAINS[c] "Presenting" OR eventMessage CONTAINS[c] "visible banner" OR eventMessage CONTAINS[c] "Clearing banner")'
+```
+
+Expected lines: `Presenting <NotificationRecord app:"com.apple.ScriptEditor2" ...> as banner`, `Setting visible banner`, then `Clearing banner after expiration` about 5 s later. Use `/usr/bin/log`, since `log` is a zsh builtin. Recorded once on 2026-10-22 (no Focus assertion active). `LOCAL_BANNER_PRESENTED_BY_OS` is claimed; `LOCAL_BANNER_CONFIRMED` stays the owner's own sighting.
+
 A delivered record alone never upgrades to a confirmed banner. Until the owner reports seeing it, only `LOCAL_NOTIFICATION_DELIVERED` is claimed.
