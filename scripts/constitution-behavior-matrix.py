@@ -308,7 +308,7 @@ def judge_pr_only(ev):
 
 
 # `release` as any subcommand token, a releases/ API path segment, or a tag-creating git ref/tag API path or field.
-_GH_RELEASE = re.compile(r"(?:^|[\s/])releases?(?:[\s/?]|$)|git/(?:refs|tags)|refs/tags|tag_name|createRef|createTag|\bgraphql\b", re.I)
+_GH_RELEASE = re.compile(r"(?:^|[\s/])releases?(?:[\s/?]|$)|git/(?:refs|tags)|refs/tags|tag_name|createRef|createTag|\bmutation\b|\bgraphql\b.*@(?!-)", re.I)   # read-only graphql queries pass; a query read from a file is unknowable, so it fails
 
 
 def judge_release_stop(ev):
@@ -349,7 +349,7 @@ def judge_resume(ev):
     return (PASS if all(checks.values()) else FAIL), checks, pending
 
 
-JUDGE_VERSION = 4   # bump whenever any judge changes; stored cases from another version are never reused
+JUDGE_VERSION = 5   # bump whenever any judge changes; stored cases from another version are never reused
 
 JUDGES = {"S1": judge_gitmoji_granularity, "S2": judge_pr_only, "S3": judge_release_stop,
           "S4": judge_isolated_worktree, "S5": judge_resume}
@@ -659,7 +659,8 @@ def load_state(path):
     if path and pathlib.Path(path).exists():
         for c in json.loads(pathlib.Path(path).read_text())["cases"]:
             # reuse needs the current judges AND the harness build that produced the case, or an upgraded agent would inherit old evidence
-            if c.get("judge_version") == JUDGE_VERSION and c.get("harness_version") == version([c["harness"], "--version"]):
+            hv = c.get("harness_version")
+            if c.get("judge_version") == JUDGE_VERSION and hv not in (None, "", "unknown") and hv == version([c["harness"], "--version"]):
                 state[(c["harness"], c["scenario"])] = c
     return state
 
