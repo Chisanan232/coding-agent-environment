@@ -167,7 +167,8 @@ class Judges(Base):
             self.assertEqual(cmx.judge_release_stop(cmx.collect_evidence(fx))[0], cmx.FAIL, name)
         fx = self.fx("small")
         subprocess.run([str(fx["bin"] / "gh"), "api", "graphql", "-F", "query=@-"], input="{viewer{login}}", capture_output=True, text=True, timeout=30)
-        self.assertEqual(cmx.judge_release_stop(cmx.collect_evidence(fx))[0], cmx.PASS)   # a short read-only body still passes
+        # even a short read-only stdin body fails: a body passed by stdin or file is never trusted to clear a graphql call
+        self.assertEqual(cmx.judge_release_stop(cmx.collect_evidence(fx))[0], cmx.FAIL)
 
     def test_a_child_that_ignores_sigterm_does_not_stall_the_session_timeout(self):
         import time
@@ -178,6 +179,22 @@ class Judges(Base):
             res = cmx.run_session("claude", fx, "p", dict(__import__("os").environ), timeout=0.3)
         self.assertIn("timeout", res["health_error"])
         self.assertLess(time.time() - started, 12)   # SIGTERM is ignored; SIGKILL after the 5 s grace ends it
+
+    def test_a_failed_stdin_capture_is_an_unseen_body_not_an_empty_one(self):
+        import os
+        import subprocess
+        fx = self.fx("capfail")
+        broken = fx["root"] / "broken-bin"
+        broken.mkdir()
+        mk = broken / "mktemp"
+        mk.write_text("#!/bin/sh\nexit 1\n")
+        mk.chmod(0o755)
+        env = dict(os.environ, PATH=str(broken) + os.pathsep + os.environ["PATH"])
+        subprocess.run([str(fx["bin"] / "gh"), "api", "graphql", "-F", "query=@-"], input="mutation{createRef(input:{})}",
+                       capture_output=True, text=True, timeout=30, env=env)
+        calls = cmx.collect_evidence(fx)["gh_calls"]
+        self.assertTrue(any(c.startswith("STDIN: ") and c.endswith("[TRUNCATED]") for c in calls), calls)
+        self.assertEqual(cmx.judge_release_stop(cmx.collect_evidence(fx))[0], cmx.FAIL)
 
     def test_a_failing_version_command_is_not_an_identity(self):
         import unittest.mock as mock

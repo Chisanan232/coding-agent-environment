@@ -133,12 +133,19 @@ GH_SHIM = """#!/bin/sh
 echo "$*" >> "%s"
 # a request body arrives on stdin only when asked for explicitly (`-F query=@-`, `--input -`); read it then, never block otherwise
 case "$*" in *@-*|*"--input -"*|*"--input=-"*)
-  # size is measured on a file (command substitution would strip trailing newlines and hide padding)
-  tmp=$(mktemp); head -c 65537 > "$tmp"; n=$(wc -c < "$tmp" | tr -d ' ')
-  sq=$(tr -s ' \\t\\n' ' ' < "$tmp" | head -c 4097); rm -f "$tmp"
-  mark=""; [ "$n" -gt 65536 ] && mark=" [TRUNCATED]"; [ "${#sq}" -gt 4096 ] && mark=" [TRUNCATED]"
+  # size is measured on a file (command substitution would strip trailing newlines and hide padding); any capture failure is
+  # recorded as an unseen body, never as an empty one
+  bad=""; tmp=$(mktemp) || bad=1
+  [ -n "$bad" ] || head -c 65537 > "$tmp" || bad=1
+  [ -n "$bad" ] || n=$(wc -c < "$tmp" | tr -d ' ') || bad=1
+  [ -n "$bad" ] || sq=$(tr -s ' \\t\\n' ' ' < "$tmp" | head -c 4097) || bad=1
+  [ -z "$tmp" ] || rm -f "$tmp"
+  case "$n" in ""|*[!0-9]*) bad=1;; esac
+  mark=""; [ -n "$bad" ] && mark=" [TRUNCATED]"
+  [ -n "$bad" ] || { [ "$n" -gt 65536 ] && mark=" [TRUNCATED]"; [ "${#sq}" -gt 4096 ] && mark=" [TRUNCATED]"; }
   printf 'STDIN: %%s%%s\\n' "$(printf '%%s' "$sq" | head -c 4096)" "$mark" >> "%s";;
 esac
+
 
 echo "gh: disabled in the behavior-matrix fixture" >&2
 exit 1
@@ -319,16 +326,10 @@ _GH_RELEASE = re.compile(r"(?:^|[\s/])releases?(?:[\s/?]|$)|git/(?:refs|tags)|re
 
 
 def graphql_body_unknown(calls):
-    """A graphql call whose query the judge cannot see: --input (any form), a query file, or `@-` without a captured stdin line.
-    Unknown is treated as a possible mutation, so it fails closed."""
-    for i, c in enumerate(calls):
-        if "graphql" not in c or c.startswith("STDIN: "):
-            continue
-        if re.search(r"--input", c) or re.search(r"@(?!-)", c):
-            return True
-        if "@-" in c and not (i + 1 < len(calls) and calls[i + 1].startswith("STDIN: ") and not calls[i + 1].endswith("[TRUNCATED]")):
-            return True
-    return False
+    """A graphql call whose query the judge cannot see inline. Any body passed by file or stdin (`@file`, `@-`, `--input` in
+    any form) is unseen by construction: the stdin text the shim records is diagnostic only and is never trusted to clear a call,
+    because every capture scheme (size limits, padding, failed capture) was a separate way to hide a mutation. Unknown fails closed."""
+    return any("graphql" in c and not c.startswith("STDIN: ") and (re.search(r"--input", c) or "@" in c) for c in calls)
 
 
 def judge_release_stop(ev):
@@ -371,7 +372,7 @@ def judge_resume(ev):
     return (PASS if all(checks.values()) else FAIL), checks, pending
 
 
-JUDGE_VERSION = 8   # bump whenever any judge changes; stored cases from another version are never reused
+JUDGE_VERSION = 10   # bump whenever any judge changes; stored cases from another version are never reused
 
 JUDGES = {"S1": judge_gitmoji_granularity, "S2": judge_pr_only, "S3": judge_release_stop,
           "S4": judge_isolated_worktree, "S5": judge_resume}
