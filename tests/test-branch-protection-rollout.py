@@ -20,7 +20,7 @@ def get_shape(p):
     """What GET returns for a protection set by `p` (GitHub nests booleans under {"enabled": ...})."""
     rsc = p["required_status_checks"]
     return {"required_status_checks": {"strict": rsc["strict"], "contexts": rsc["contexts"],
-                                       "checks": [{"context": c, "app_id": None} for c in rsc["contexts"]]},
+                                       "checks": [{"context": c, "app_id": 15368} for c in rsc["contexts"]]},
             "enforce_admins": {"enabled": p["enforce_admins"]}, "allow_force_pushes": {"enabled": p["allow_force_pushes"]},
             "allow_deletions": {"enabled": p["allow_deletions"]}}
 
@@ -167,8 +167,13 @@ class T(unittest.TestCase):
                 self.assertIsNotNone(gh.prot)
         gh = FakeGh()
         self.run_cmd("apply", gh, sha=self.sha())
-        gh.prot["required_status_checks"]["checks"][0]["app_id"] = 15368  # pinned check source
+        gh.prot["required_status_checks"]["checks"][0]["app_id"] = 99999  # check source changed after apply
         self.assertEqual(self.run_cmd("rollback", gh, sha=self.sha()), 2)
+
+    def test_rollback_without_an_apply_record_refuses(self):
+        gh = FakeGh(existing=get_shape(bpr.payload(CHECKS, True)))
+        self.assertEqual(self.run_cmd("rollback", gh, sha=self.sha()), 2)
+        self.assertIsNotNone(gh.prot)
 
     def test_apply_rereads_right_before_the_write(self):
         class Racy(FakeGh):

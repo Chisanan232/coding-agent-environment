@@ -79,11 +79,48 @@ def matches(body, p):
     names = {c.get("context") for c in checks} | set(rsc.get("contexts") or [])
     flag = lambda k: (body.get(k) or {}).get("enabled")  # noqa: E731
     return (names == set(p["required_status_checks"]["contexts"]) and rsc.get("strict") is False
-            and all(c.get("app_id") in (None, -1) for c in checks)
             and set(body) <= KNOWN_KEYS and set(rsc) <= {"url", "strict", "contexts", "checks", "contexts_url"}
             and flag("enforce_admins") is p["enforce_admins"] and flag("allow_force_pushes") is False
             and flag("allow_deletions") is False and not body.get("restrictions")
             and all(not flag(k) for k in EXTRA_FLAGS))
+
+
+def normalize(body):
+    """Canonical form of a protection readback without GitHub's own url fields."""
+    def strip(v):
+        if isinstance(v, dict):
+            return {k: strip(x) for k, x in v.items() if not k.endswith("url")}
+        if isinstance(v, list):
+            return [strip(x) for x in v]
+        return v
+    return json.dumps(strip(body), sort_keys=True, separators=(",", ":"))
+
+
+def record_applied(path, body):
+    with open(path) as f:
+        rec = json.load(f)
+    rec["applied"] = normalize(body)
+    fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+    with os.fdopen(fd, "w") as f:
+        json.dump(rec, f)
+
+
+def recorded_applied(repo, branch, sha):
+    """The readback `apply` recorded for exactly this payload (newest first), or None."""
+    prefix = f"branch-protection.{repo.replace('/', '_')}.{branch.replace('/', '_')}."
+    try:
+        names = sorted((n for n in os.listdir(BACKUPS) if n.startswith(prefix)), reverse=True)
+    except OSError:
+        return None
+    for n in names:
+        try:
+            with open(os.path.join(BACKUPS, n)) as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if rec.get("payload_sha256") == sha and isinstance(rec.get("applied"), str):
+            return rec["applied"]
+    return None
 
 
 def backup(repo, branch, p, prior):
@@ -135,6 +172,8 @@ def run(cmd, repo, branch, checks, enforce_admins, expect_sha, gh, out):
         rc, _, err = gh(["api", "-X", "PUT", protection_path(repo, branch), "--input", "-"], stdin=json.dumps(p))
         state2, body2 = read_state(gh, repo, branch)
         applied = rc == 0 and state2 == "present" and matches(body2, p)
+        if applied:
+            record_applied(path, body2)
         out({"applied": applied, "backup": path, "put": "ok" if rc == 0 else omr.gh_error(err, "protection-put"),
              "readback_matches": bool(state2 == "present" and matches(body2, p)),
              "rollback": f"{sys.argv[0]} rollback --repo {repo} --branch {branch} --checks {','.join(sorted(checks))} "
@@ -144,8 +183,10 @@ def run(cmd, repo, branch, checks, enforce_admins, expect_sha, gh, out):
         if state == "absent":
             out({"rolled_back": True, "note": "already absent"})
             return 0
-        if not matches(body, p):
-            out({"error": "live protection is not the one apply wrote; refusing to delete later edits"})
+        wrote = recorded_applied(repo, branch, sha)
+        if not matches(body, p) or wrote is None or normalize(body) != wrote:
+            out({"error": "live protection is not exactly what apply wrote (or no apply record exists); refusing to delete "
+                          "later edits"})
             return 2
         rc, _, err = gh(["api", "-X", "DELETE", protection_path(repo, branch)])
         state2, _ = read_state(gh, repo, branch)
