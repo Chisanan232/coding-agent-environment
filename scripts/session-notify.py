@@ -187,7 +187,7 @@ def overlay(default, schema, user, bad, path=""):
             if user is not MISSING:
                 bad.append(path or "root")
             user = {}
-        bad.extend(f"{path}.{k}".lstrip(".") for k in user if k not in schema)
+        bad.extend(f"{path}.{k}".lstrip(".") for k in user if k not in schema and not k.startswith("_"))  # "_note"-style comment keys are ignored
         return {k: overlay(default[k], schema[k], user.get(k, MISSING), bad, f"{path}.{k}".lstrip(".")) for k in default}
     if user is not MISSING and conforms(schema, user):
         return copy.deepcopy(user)
@@ -1006,6 +1006,9 @@ def age(now, t):
 
 def cmd_status(args):
     sdir, rows, now = state_dir(), [], time.time()
+    config_problem = load_config()[1]
+    if config_problem and not str(config_problem).startswith("unreadable:2"):
+        rows.append({"session": "(config)", "state": "CONFIG_PROBLEM", "problem": config_problem})  # surfaced here, not only in hook.log
     for p in sorted(sdir.glob("*.json")) if sdir.is_dir() else []:
         sid = p.stem
         rec, problem = load_record(sdir, sid) if SAFE_ID.fullmatch(sid) else (None, "bad-name")

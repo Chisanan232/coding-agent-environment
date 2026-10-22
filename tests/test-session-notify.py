@@ -1831,6 +1831,31 @@ class Cycle6Regressions(Base):
         self.assertEqual(self.rec("i")["state"], "BLOCKED_OWNER")
 
 
+class Cycle7Regressions(Base):
+    def test_rendered_config_round_trips_with_macos_enabled(self):
+        text = subprocess.run([sys.executable, str(SCRIPT), "render-config"], capture_output=True, text=True).stdout
+        user = json.loads(text)
+        user["backends"]["macos"]["enabled"] = True
+        p = self.tmp / "rendered.json"
+        p.write_text(json.dumps(user))
+        got, problem = sn.load_config(p)
+        self.assertIsNone(problem)
+        self.assertIs(got["backends"]["macos"]["enabled"], True)
+
+    def test_an_unknown_key_degrades_only_that_key_and_is_reported_by_status(self):
+        p = self.tmp / "c.json"
+        p.write_text(json.dumps({"bogus": 1, "backends": {"macos": {"enabled": True}, "ntfy": {"surprise": 1}}}))
+        got, problem = sn.load_config(p)
+        self.assertIs(got["backends"]["macos"]["enabled"], True)
+        self.assertEqual(problem, "invalid:bogus,backends.ntfy.surprise")
+        env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(self.sdir), SESSION_NOTIFY_CONFIG=str(p))
+        out = subprocess.run([sys.executable, str(SCRIPT), "status"], env=env, capture_output=True, text=True).stdout
+        self.assertIn("CONFIG_PROBLEM", out)
+        self.assertIn("invalid:bogus", out)
+        env["SESSION_NOTIFY_CONFIG"] = str(self.tmp / "absent.json")
+        self.assertNotIn("CONFIG_PROBLEM", subprocess.run([sys.executable, str(SCRIPT), "status"], env=env, capture_output=True, text=True).stdout)
+
+
 def hashlib_key(sid, extra):
     import hashlib
     return hashlib.sha256("|".join([sid, "-", "AGENT", "", extra]).encode()).hexdigest()[:24]
