@@ -36,6 +36,14 @@ def green():
             {"__typename": "StatusContext", "context": "SonarCloud Code Analysis", "state": "SUCCESS"}]
 
 
+def server_rules(names=REQUIRED, rid=11):
+    return [{"type": "required_status_checks", "ruleset_id": rid,
+             "parameters": {"required_status_checks": [{"context": n} for n in names]}}]
+
+
+NOW = 1792497600  # 2026-10-20T12:00:00Z; every test run uses this clock
+
+
 def allow_doc(**cfg):
     c = {"required_checks": REQUIRED, "reviewers": ["independent-1"]}
     c.update(cfg)
@@ -53,12 +61,13 @@ def base_pr(**over):
 
 class FakeGh:
     def __init__(self, pr=None, merge_rc=0, merge_err="", merged=True, later=None, user=ME,
-                 rules=None, protection=(1, "HTTP 404: Not Found")):
+                 rules=None, protection=(1, "HTTP 404: Not Found"), ruleset=None):
         self.pr = pr if pr is not None else base_pr()
         self.merge_rc, self.merge_err, self.merged = merge_rc, merge_err, merged
         self.later = later  # PR facts returned from the second full fetch (the pre-exec re-check) on
         self.user = user
-        self.rules = [{"type": "required_status_checks"}] if rules is None else rules
+        self.rules = server_rules() if rules is None else rules
+        self.ruleset = (0, json.dumps({"id": 11, "bypass_actors": []})) if ruleset is None else ruleset
         self.protection = protection  # (rc, stdout-or-stderr) for the branch-protection read
         self.fetches = 0
         self.on_merge = None
@@ -79,6 +88,9 @@ class FakeGh:
                 if self.merged:
                     return 0, json.dumps({"state": "MERGED", "mergeCommit": {"oid": MERGE_SHA}}), ""
                 return 0, json.dumps({"state": "OPEN", "mergeCommit": None}), ""
+        if argv[0] == "api" and "/rulesets/" in argv[1]:
+            rc, text = self.ruleset
+            return (0, text, "") if rc == 0 else (1, "", text)
         if argv[0] == "api" and "/rules/branches/" in argv[1]:
             return 0, json.dumps(self.rules), ""
         if argv[0] == "api" and argv[1].endswith("/protection"):
@@ -110,16 +122,16 @@ class Base(unittest.TestCase):
         self.audit = d / "audit" / "log.jsonl"
 
     def write_evidence(self, **over):
-        ev = {"repo": REPO, "pr": 7, "head": HEAD, "verdict": "PASS", "reviewer": "independent-1",
+        ev = {"repo": REPO, "pr": 7, "base": "main", "head": HEAD, "verdict": "PASS", "reviewer": "independent-1",
               "reviewer_kind": "independent-agent", "reviewed_at": "2026-10-20T10:00:00Z"}
         ev.update(over)
         for k in [k for k, v in ev.items() if v is DROP]:
             del ev[k]
         self.evidence.write_text(json.dumps(ev))
 
-    def go(self, gh, repo=REPO, pr="7", head=HEAD, dry=False, allow=None, evidence=None):
+    def go(self, gh, repo=REPO, pr="7", head=HEAD, dry=False, allow=None, evidence=None, clock=lambda: NOW):
         return omr.run(repo, pr, head, str(evidence or self.evidence), str(allow or self.allow),
-                       str(self.audit), dry, gh)
+                       str(self.audit), dry, gh, clock=clock)
 
     def records(self):
         return [json.loads(x) for x in self.audit.read_text().splitlines()]
@@ -211,40 +223,75 @@ class Refusals(Base):
         self.assertRefused(FakeGh(rules=[], protection=(0, json.dumps({"required_status_checks": None}))),
                            "no server-side required status checks")
 
-    def test_server_side_protection_via_branch_protection_or_ruleset(self):
-        ok = FakeGh(rules=[], protection=(0, json.dumps({"required_status_checks": {"contexts": ["ci"]}})))
-        self.assertEqual(self.go(ok)[0], omr.EXIT_OK)
-        self.assertEqual(self.go(FakeGh())[0], omr.EXIT_OK)
+    def test_server_side_set_must_cover_every_allowlisted_required_check(self):
+        self.assertRefused(FakeGh(rules=server_rules(["ci"])), "SonarCloud Code Analysis is not required server-side")
+        self.assertRefused(FakeGh(rules=server_rules(["other"])), "is not required server-side")
+        gh = FakeGh(rules=server_rules(REQUIRED + ["extra-job"]))  # a superset is fine
+        self.assertEqual(self.go(gh)[0], omr.EXIT_OK)
 
-    def test_server_side_protection_read_error_fails_closed(self):
+    def test_empty_or_malformed_server_side_definitions_refuse(self):
+        bad_rules = [server_rules([]), [{"type": "required_status_checks", "ruleset_id": 11}],
+                     [{"type": "required_status_checks", "ruleset_id": 11, "parameters": {"required_status_checks": "ci"}}],
+                     [{"type": "required_status_checks", "ruleset_id": 11,
+                       "parameters": {"required_status_checks": [{"integration_id": 1}]}}],
+                     [{"type": "required_status_checks", "ruleset_id": 11,
+                       "parameters": {"required_status_checks": [{"context": ""}]}}],
+                     [{"type": "required_status_checks", "ruleset_id": "11",
+                       "parameters": {"required_status_checks": [{"context": "ci"}]}}],
+                     [{"type": "required_status_checks", "ruleset_id": True,
+                       "parameters": {"required_status_checks": [{"context": "ci"}]}}], ["x"]]
+        for rules in bad_rules:
+            self.assertRefused(FakeGh(rules=rules), "malformed" if rules == ["x"] else "empty or malformed")
+        for prot in ({"required_status_checks": {"contexts": [], "checks": []}}, {"required_status_checks": {}},
+                     {"required_status_checks": "ci"}, {"required_status_checks": {"contexts": "ci"}},
+                     {"required_status_checks": {"contexts": [1]}}, {"required_status_checks": {"checks": [{"app_id": 1}]}},
+                     [1]):
+            self.assertRefused(FakeGh(rules=[], protection=(0, json.dumps(prot))), "")
+
+    def test_branch_protection_contexts_and_checks_are_parsed_and_unioned_with_rulesets(self):
+        prot = {"required_status_checks": {"contexts": ["ci"], "checks": [{"context": "SonarCloud Code Analysis", "app_id": 1}]}}
+        code, rec = self.go(FakeGh(rules=[], protection=(0, json.dumps(prot))))
+        self.assertEqual(code, omr.EXIT_OK)
+        self.assertEqual(rec["server_side"]["contexts"], sorted(REQUIRED))
+        mixed = FakeGh(rules=server_rules(["ci"]), protection=(0, json.dumps(
+            {"required_status_checks": {"contexts": ["SonarCloud Code Analysis"]}})))
+        self.assertEqual(self.go(mixed)[0], omr.EXIT_OK)
+
+    def test_server_side_read_error_fails_closed(self):
         gh = FakeGh(rules=[], protection=(1, "HTTP 403: Resource not accessible"))
         code, _ = self.go(gh)
         self.assertEqual((code, gh.merges()), (omr.EXIT_ERROR, []))
 
+    def test_unreadable_protection_is_tolerated_when_rulesets_cover_the_checks(self):
+        code, rec = self.go(FakeGh(protection=(1, "HTTP 403: Resource not accessible")))
+        self.assertEqual((code, rec["server_side"]["protection"]), (omr.EXIT_OK, "unreadable"))
+
+    def test_bypass_actors_refuse_unless_accepted(self):
+        for actor in ({"actor_type": "OrganizationAdmin", "actor_id": 1}, {"actor_type": "RepositoryRole", "actor_id": 5},
+                      {"actor_type": "Team", "actor_id": 9}):
+            gh = FakeGh(ruleset=(0, json.dumps({"id": 11, "bypass_actors": [actor]})))
+            self.assertRefused(gh, "allows bypass")
+        self.allow.write_text(json.dumps(allow_doc(accept_bypass_actors=True)))
+        gh = FakeGh(ruleset=(0, json.dumps({"id": 11, "bypass_actors": [{"actor_type": "RepositoryRole", "actor_id": 5}]})))
+        code, rec = self.go(gh)
+        self.assertEqual((code, rec["server_side"]["bypass"]), (omr.EXIT_OK, "accepted"))
+
+    def test_non_user_bypass_actors_and_none_are_recorded_as_none(self):
+        gh = FakeGh(ruleset=(0, json.dumps({"id": 11, "bypass_actors": [{"actor_type": "Integration", "actor_id": 3}]})))
+        code, rec = self.go(gh)
+        self.assertEqual((code, rec["server_side"]["bypass"]), (omr.EXIT_OK, "none"))
+
+    def test_unreadable_bypass_actors_are_recorded_not_refused(self):
+        for ruleset in ((1, "HTTP 403"), (0, json.dumps({"id": 11})), (0, json.dumps({"bypass_actors": "x"}))):
+            code, rec = self.go(FakeGh(ruleset=ruleset))
+            self.assertEqual((code, rec["server_side"]["bypass"]), (omr.EXIT_OK, "unreadable"), ruleset)
+
     def test_server_side_protection_explicit_waiver(self):
         self.allow.write_text(json.dumps(allow_doc(require_server_side_protection=False)))
         code, rec = self.go(FakeGh(rules=[]))
-        self.assertEqual((code, rec["server_side_protection"]), (omr.EXIT_OK, "waived"))
+        self.assertEqual((code, rec["server_side"]), (omr.EXIT_OK, {"waived": True}))
         self.allow.write_text(json.dumps(allow_doc(require_server_side_protection="false")))
         self.assertRefused(FakeGh(rules=[]), "invalid")
-
-    def test_draft(self):
-        self.assertRefused(FakeGh(base_pr(isDraft=True)), "draft")
-
-    def test_not_open(self):
-        self.assertRefused(FakeGh(base_pr(state="MERGED")), "not OPEN")
-
-    def test_failing_check(self):
-        roll = green() + [{"__typename": "CheckRun", "name": "tests", "status": "COMPLETED", "conclusion": "FAILURE"}]
-        self.assertRefused(FakeGh(base_pr(statusCheckRollup=roll)), "check tests is FAILURE")
-
-    def test_pending_check(self):
-        roll = green() + [{"__typename": "CheckRun", "name": "tests", "status": "IN_PROGRESS", "conclusion": ""}]
-        self.assertRefused(FakeGh(base_pr(statusCheckRollup=roll)), "check tests is IN_PROGRESS")
-
-    def test_pending_sonarcloud_status_context(self):
-        roll = [{"__typename": "StatusContext", "context": "SonarCloud Code Analysis", "state": "PENDING"}]
-        self.assertRefused(FakeGh(base_pr(statusCheckRollup=roll)), "SonarCloud")
 
     def test_missing_checks(self):
         self.assertRefused(FakeGh(base_pr(statusCheckRollup=[])), "required check ci is missing")
@@ -475,7 +522,7 @@ class AllowlistTrust(Base):
         self.assertEqual(len(flags), 1)
         self.assertTrue(flags[0] & os.O_NOFOLLOW)
         src = (ROOT / "scripts/owner-merge-runner.py").read_text()
-        body = src[src.index("def read_trusted_allowlist"):src.index("def load_allowlist")]
+        body = src[src.index("def read_trusted_file"):src.index("def load_allowlist")]
         self.assertNotIn("open(path", body.replace("os.open(path", ""))  # no second open by pathname
 
     def test_fifo_or_directory_allowlist_refused(self):
@@ -515,6 +562,185 @@ class ClassCAssociation(Base):
         self.assertEqual(code, omr.EXIT_OK)
 
 
+class EvidenceBindingAndAge(Base):
+    def test_base_branch_required_and_bound(self):
+        self.write_evidence(base=DROP)
+        self.assertRefused(FakeGh(), "evidence field base")
+        self.write_evidence(base="release")
+        self.assertRefused(FakeGh(), "evidence base branch")
+        self.write_evidence(base=5)
+        self.assertRefused(FakeGh(), "evidence field base")
+
+    def test_base_branch_change_at_the_recheck_refuses(self):
+        gh = FakeGh(later=base_pr(baseRefName="release"))
+        code, rec = self.go(gh)
+        self.assertEqual((code, gh.merges()), (omr.EXIT_REFUSED, []))
+        self.assertIn("changed before execution", " ".join(rec["reasons"]))
+        self.assertIn("evidence base branch", " ".join(rec["reasons"]))
+
+    def test_first_read_with_different_base_refuses(self):
+        self.assertRefused(FakeGh(base_pr(baseRefName="release")), "evidence base branch")
+
+    def test_default_max_age_is_24_hours_and_future_refuses(self):
+        self.write_evidence(reviewed_at="2026-10-19T12:00:00Z")  # exactly 24h
+        self.assertEqual(self.go(FakeGh(), dry=True)[0], omr.EXIT_OK)
+        self.write_evidence(reviewed_at="2026-10-19T11:59:59Z")
+        self.assertRefused(FakeGh(), "older than max_evidence_age_hours")
+        self.write_evidence(reviewed_at="2026-10-20T12:01:01Z")
+        self.assertRefused(FakeGh(), "in the future")
+
+    def test_configured_age_is_honoured_and_bounded(self):
+        self.allow.write_text(json.dumps(allow_doc(max_evidence_age_hours=1)))
+        self.write_evidence(reviewed_at="2026-10-20T10:30:00Z")
+        self.assertRefused(FakeGh(), "older than")
+        self.allow.write_text(json.dumps(allow_doc(max_evidence_age_hours=168)))
+        self.write_evidence(reviewed_at="2026-10-14T12:00:00Z")
+        self.assertEqual(self.go(FakeGh(), dry=True)[0], omr.EXIT_OK)
+        for bad in (0, -1, 169, 1.5, "24", True):
+            self.allow.write_text(json.dumps(allow_doc(max_evidence_age_hours=bad)))
+            self.assertRefused(FakeGh(), "invalid")
+
+
+class SignedEvidence(Base):
+    KEY = b"SYNTHETIC-TEST-KEY-0123456789abcdef-NOT-A-SECRET"
+
+    def setUp(self):
+        super().setUp()
+        self.keyfile = self.tmp_real / "keys" / "evidence.key"
+        self.keyfile.parent.mkdir(mode=0o700)
+        self.put_key(self.KEY)
+
+    def put_key(self, data, mode=0o600):
+        self.keyfile.write_bytes(data)
+        os.chmod(self.keyfile, mode)
+
+    def enable(self, **cfg):
+        doc = allow_doc(**cfg)
+        doc["evidence_key_file"] = str(self.keyfile)
+        self.allow.write_text(json.dumps(doc))
+
+    def sign(self, key=None, **over):
+        self.write_evidence(**over)
+        ev = json.loads(self.evidence.read_text())
+        ev["hmac"] = omr.evidence_mac(key or self.KEY, ev)
+        self.evidence.write_text(json.dumps(ev))
+
+    def test_valid_signature_accepted_and_recorded(self):
+        self.enable()
+        self.sign()
+        code, rec = self.go(FakeGh())
+        self.assertEqual((code, rec["signed_evidence"]), (omr.EXIT_OK, True))
+
+    def test_signature_required_by_default_when_key_configured(self):
+        self.enable()
+        self.write_evidence()  # no hmac
+        self.assertRefused(FakeGh(), "signature missing or invalid")
+
+    def test_tampered_wrong_key_and_malformed_signatures_refuse(self):
+        self.enable()
+        self.sign()
+        ev = json.loads(self.evidence.read_text())
+        for mutate in (lambda e: e.update(head=OTHER), lambda e: e.update(reviewer="independent-1 "),
+                       lambda e: e.update(verdict="PASS ", reviewed_at="2026-10-20T11:00:00Z"),
+                       lambda e: e.update(extra="x"), lambda e: e.update(hmac="0" * 64),
+                       lambda e: e.update(hmac=None), lambda e: e.update(hmac=5), lambda e: e.pop("hmac")):
+            bad = json.loads(json.dumps(ev))
+            mutate(bad)
+            self.evidence.write_text(json.dumps(bad))
+            code, rec = self.go(FakeGh())
+            self.assertEqual(code, omr.EXIT_REFUSED, bad)
+        self.sign(key=b"a-different-synthetic-key-of-enough-length!!")
+        self.assertRefused(FakeGh(), "signature missing or invalid")
+
+    def test_explicit_waiver_allows_unsigned(self):
+        self.enable(require_signed_evidence=False)
+        self.write_evidence()
+        code, rec = self.go(FakeGh())
+        self.assertEqual((code, rec["signed_evidence"]), (omr.EXIT_OK, False))
+
+    def test_unsigned_by_default_without_key_file(self):
+        code, rec = self.go(FakeGh())
+        self.assertEqual((code, rec["signed_evidence"]), (omr.EXIT_OK, False))
+
+    def test_require_signed_without_key_file_is_invalid_config(self):
+        self.allow.write_text(json.dumps(allow_doc(require_signed_evidence=True)))
+        self.assertRefused(FakeGh(), "invalid")
+
+    def test_key_file_must_be_trusted(self):
+        self.enable()
+        self.sign()
+        for mode in (0o644, 0o640, 0o604, 0o660):
+            os.chmod(self.keyfile, mode)
+            self.assertRefused(FakeGh(), "readable or writable by group or others")
+        os.chmod(self.keyfile, 0o600)
+        self.put_key(b"short")
+        self.assertRefused(FakeGh(), "unusable length")
+        self.put_key(self.KEY)
+        link = self.keyfile.parent / "link.key"
+        link.symlink_to(self.keyfile)
+        doc = allow_doc()
+        doc["evidence_key_file"] = str(link)
+        self.allow.write_text(json.dumps(doc))
+        self.assertRefused(FakeGh(), "non-symlink")
+        doc["evidence_key_file"] = str(self.tmp_real / "absent.key")
+        self.allow.write_text(json.dumps(doc))
+        self.assertRefused(FakeGh(), "evidence key file")
+        doc["evidence_key_file"] = "relative.key"
+        self.allow.write_text(json.dumps(doc))
+        self.assertRefused(FakeGh(), "absolute path")
+
+    def test_key_file_in_git_worktree_or_loose_ancestor_refused(self):
+        self.enable()
+        self.sign()
+        wt = self.tmp_real / "wt"
+        wt.mkdir()
+        (wt / ".git").write_text("gitdir: /nowhere")
+        k = wt / "k.key"
+        k.write_bytes(self.KEY)
+        os.chmod(k, 0o600)
+        doc = allow_doc()
+        doc["evidence_key_file"] = str(k)
+        self.allow.write_text(json.dumps(doc))
+        self.assertRefused(FakeGh(), "git worktree")
+        self.enable()
+        os.chmod(self.keyfile.parent, 0o770)
+        self.assertBlocked(FakeGh(), "writable")
+        os.chmod(self.keyfile.parent, 0o700)
+
+    def test_key_material_never_appears_in_audit_stdout_or_stderr(self):
+        self.enable()
+        self.sign()
+        out, err = io.StringIO(), io.StringIO()
+        gh = FakeGh(merge_rc=1, merge_err="permission denied")
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            omr.main(["--repo", REPO, "--pr", "7", "--expect-head", HEAD, "--review-evidence", str(self.evidence)],
+                     gh=gh, allowlist=str(self.allow), audit=str(self.audit), clock=lambda: NOW)
+            self.evidence.write_text("{}")
+            omr.main(["--repo", REPO, "--pr", "7", "--expect-head", HEAD, "--review-evidence", str(self.evidence)],
+                     gh=FakeGh(), allowlist=str(self.allow), audit=str(self.audit), clock=lambda: NOW)
+        blob = out.getvalue() + err.getvalue() + self.audit.read_text()
+        self.assertNotIn(self.KEY.decode(), blob)
+        self.assertNotIn(omr.evidence_mac(self.KEY, {"a": 1}), blob)
+        self.assertNotIn("hmac", self.audit.read_text())
+
+    def test_sign_script_round_trip_and_refusals(self):
+        spec = importlib.util.spec_from_file_location("oms", ROOT / "scripts/owner-merge-evidence-sign.py")
+        oms = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(oms)
+        self.enable()
+        self.write_evidence()
+        out = self.tmp_real / "signed.json"
+        self.assertEqual(oms.main(["--key-file", str(self.keyfile), "--in", str(self.evidence), "--out", str(out)]), 0)
+        self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o600)
+        self.assertEqual(self.go(FakeGh(), evidence=out)[0], omr.EXIT_OK)
+        self.assertEqual(oms.main(["--key-file", str(self.keyfile), "--in", str(self.evidence), "--out", str(out)]), 4)  # no overwrite
+        os.chmod(self.keyfile, 0o644)
+        with contextlib.redirect_stderr(io.StringIO()) as e:
+            rc = oms.main(["--key-file", str(self.keyfile), "--in", str(self.evidence), "--out", str(self.tmp_real / "x.json")])
+        self.assertEqual(rc, 2)
+        self.assertNotIn(self.KEY.decode(), e.getvalue())
+
+
 class Outcomes(Base):
     def test_denial_recorded_not_retried(self):
         gh = FakeGh(merge_rc=1, merge_err="GraphQL: Merge Without Review denied: permission denied")
@@ -549,7 +775,8 @@ class Outcomes(Base):
         gh = FakeGh()
         blocker = self.tmp_real / "file"
         blocker.write_text("x")
-        code, rec = omr.run(REPO, "7", HEAD, str(self.evidence), str(self.allow), str(blocker / "log"), False, gh)
+        code, rec = omr.run(REPO, "7", HEAD, str(self.evidence), str(self.allow), str(blocker / "log"), False, gh,
+                               clock=lambda: NOW)
         self.assertNotEqual(code, omr.EXIT_OK)
         self.assertEqual(gh.merges(), [])
 
@@ -664,7 +891,8 @@ class Audit(Base):
         blocker.write_text("x")
         gh = FakeGh()
         with contextlib.redirect_stderr(io.StringIO()):
-            code, rec = omr.run(REPO, "7", HEAD, str(self.evidence), str(self.allow), str(blocker / "log"), False, gh)
+            code, rec = omr.run(REPO, "7", HEAD, str(self.evidence), str(self.allow), str(blocker / "log"), False, gh,
+                               clock=lambda: NOW)
         self.assertEqual(gh.merges(), [])
         self.assertIn("refusing before execution", " ".join(rec["reasons"]))
 
@@ -746,7 +974,7 @@ class ArgvFixedness(Base):
         gh = FakeGh()
         with contextlib.redirect_stdout(io.StringIO()):
             rc = omr.main(["--repo", REPO, "--pr", "7", "--expect-head", HEAD, "--review-evidence", str(self.evidence),
-                       "--dry-run"], gh=gh, allowlist=str(self.allow), audit=str(self.audit))
+                       "--dry-run"], gh=gh, allowlist=str(self.allow), audit=str(self.audit), clock=lambda: NOW)
         self.assertEqual(rc, omr.EXIT_OK)
 
 

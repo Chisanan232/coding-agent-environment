@@ -23,6 +23,8 @@ Exit codes: 0 success (or validated dry run), 2 refused by a guard, 3 denied by 
 """
 import argparse
 import calendar
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -39,9 +41,13 @@ PR_RE = re.compile(r"[1-9][0-9]{0,8}")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,200}")
 READ_PATHS = (re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rules/branches/([A-Za-z0-9._/-]{1,200})"),
-              re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/branches/([A-Za-z0-9._/-]{1,200})/protection"))
+              re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/branches/([A-Za-z0-9._/-]{1,200})/protection"),
+              re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rulesets/([1-9][0-9]{0,11})"))
 TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 REVIEWER_KINDS = {"human", "independent-agent"}
+RISKY_BYPASS = {"OrganizationAdmin", "RepositoryRole", "Team"}
+MAX_EVIDENCE_AGE_HOURS = 168
+MIN_KEY_BYTES = 32
 LOGIN_RE = re.compile(r"(app/)?[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?")
 
 PR_FIELDS = ("state,isDraft,author,baseRefName,headRefName,headRefOid,isCrossRepository,mergeable,"
@@ -87,6 +93,10 @@ def rules_argv(repo, base):
 
 def protection_argv(repo, base):
     return ["api", f"repos/{repo}/branches/{base}/protection"]
+
+
+def ruleset_argv(repo, rid):
+    return ["api", f"repos/{repo}/rulesets/{rid}"]
 
 
 def check_argv(argv):
@@ -206,8 +216,11 @@ def dir_chain_problems(directory):
         cur = parent
 
 
-def read_trusted_allowlist(path):
-    """Walk the ancestors, open with O_NOFOLLOW, fstat the descriptor and read from that descriptor."""
+def read_trusted_file(path, label, loose_mask, limit=65536):
+    """Walk the ancestors, open with O_NOFOLLOW, fstat the descriptor and read from that descriptor.
+
+    loose_mask is the permission bits that must be clear (0o022 for the allowlist, 0o077 for a key file).
+    Returns bytes. Never includes file content in an error."""
     path = os.path.abspath(path)
     bad = dir_chain_problems(os.path.dirname(path))
     try:
@@ -217,61 +230,95 @@ def read_trusted_allowlist(path):
             link = stat.S_ISLNK(os.lstat(path).st_mode)
         except OSError:
             link = False
-        raise Refused(bad + (["allowlist is not a regular non-symlink file"] if link
-                             else ["allowlist file missing or unparseable"]))
+        raise Refused(bad + ([f"{label} is not a regular non-symlink file"] if link
+                             else [f"{label} file missing or unparseable"]))
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            bad.append("allowlist is not a regular non-symlink file")
+            bad.append(f"{label} is not a regular non-symlink file")
         if st.st_uid != os.geteuid():
-            bad.append("allowlist is not owned by the current user")
-        if st.st_mode & 0o022:
-            bad.append("allowlist is group/world-writable")
+            bad.append(f"{label} is not owned by the current user")
+        if st.st_mode & loose_mask:
+            bad.append(f"{label} is group/world-writable" if loose_mask == 0o022
+                       else f"{label} is readable or writable by group or others")
         if in_git_worktree(path):
-            bad.append("allowlist lives inside a git worktree")
+            bad.append(f"{label} lives inside a git worktree")
         if bad:
             raise Refused(bad)
-        with os.fdopen(fd, "r", encoding="utf-8") as f:
+        with os.fdopen(fd, "rb") as f:
             fd = None
-            return f.read(65537)
-    except UnicodeDecodeError:
-        raise Refused(["allowlist file missing or unparseable"])
+            return f.read(limit + 1)
     finally:
         if fd is not None:
             os.close(fd)
 
 
 def load_allowlist(path):
-    """Return {lowercased OWNER/NAME: raw config}; per-repo validity is checked by repo_config."""
-    text = read_trusted_allowlist(path)
+    """Return {"repos": {lowercased OWNER/NAME: raw config}, "evidence_key_file": str|None}."""
     try:
+        text = read_trusted_file(path, "allowlist", 0o022).decode("utf-8")
         data = json.loads(text)
-    except ValueError:
+    except (UnicodeDecodeError, ValueError):
         raise Refused(["allowlist file missing or unparseable"])
     repos = data.get("repos") if isinstance(data, dict) else None
+    key_file = data.get("evidence_key_file") if isinstance(data, dict) else None
     if not isinstance(repos, dict) or not repos or not all(isinstance(k, str) and REPO_RE.fullmatch(k) for k in repos):
         raise Refused(["allowlist must map at least one valid OWNER/NAME to a config"])
-    return {k.lower(): v for k, v in repos.items()}
+    if set(data) - {"repos", "evidence_key_file"}:
+        raise Refused(["allowlist has an unknown top-level key"])
+    if key_file is not None and (not isinstance(key_file, str) or not os.path.isabs(key_file) or "\0" in key_file):
+        raise Refused(["allowlist evidence_key_file must be an absolute path string"])
+    return {"repos": {k.lower(): v for k, v in repos.items()}, "evidence_key_file": key_file}
+
+
+REPO_KEYS = {"required_checks", "reviewers", "require_server_side_protection", "accept_bypass_actors",
+             "max_evidence_age_hours", "require_signed_evidence"}
 
 
 def repo_config(allow, repo):
-    """Validated per-repo config: required_checks, reviewers, require_server_side_protection (default True)."""
-    cfg = allow.get(repo.lower())
+    """Validated per-repo config. Defaults: protection required, bypass actors not accepted, 24h evidence age,
+    signed evidence required exactly when a key file is configured."""
+    cfg = allow["repos"].get(repo.lower())
     if cfg is None:
         raise Refused(["repo is not on the allowlist"])
-    ok = isinstance(cfg, dict) and set(cfg) <= {"required_checks", "reviewers", "require_server_side_protection"}
+    key_file = allow["evidence_key_file"]
+    ok = isinstance(cfg, dict) and set(cfg) <= REPO_KEYS
     for key in ("required_checks", "reviewers"):
         v = cfg.get(key) if ok else None
         ok = ok and isinstance(v, list) and bool(v) and all(isinstance(x, str) and x.strip() and x == x.strip() for x in v)
     prot = cfg.get("require_server_side_protection", True) if ok else True
-    if not ok or not isinstance(prot, bool):
+    bypass = cfg.get("accept_bypass_actors", False) if ok else False
+    signed = cfg.get("require_signed_evidence", key_file is not None) if ok else True
+    age = cfg.get("max_evidence_age_hours", 24) if ok else 24
+    ok = ok and all(isinstance(x, bool) for x in (prot, bypass, signed))
+    ok = ok and isinstance(age, int) and not isinstance(age, bool) and 1 <= age <= MAX_EVIDENCE_AGE_HOURS
+    ok = ok and not (signed and key_file is None)
+    if not ok:
         raise Refused(["allowlist config for repo is invalid (needs non-empty required_checks and reviewers lists; "
-                       "require_server_side_protection must be a boolean)"])
+                       "booleans must be booleans; max_evidence_age_hours 1-%d; require_signed_evidence needs an "
+                       "evidence_key_file)" % MAX_EVIDENCE_AGE_HOURS])
     return {"required_checks": list(cfg["required_checks"]), "reviewers": list(cfg["reviewers"]),
-            "require_server_side_protection": prot}
+            "require_server_side_protection": prot, "accept_bypass_actors": bypass,
+            "max_evidence_age_hours": age, "require_signed_evidence": signed}
 
 
-def load_evidence(path, head, repo, pr, reviewers, now):
+def canonical_evidence(ev):
+    body = {k: v for k, v in ev.items() if k != "hmac"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def evidence_mac(key, ev):
+    return hmac.new(key, canonical_evidence(ev), hashlib.sha256).hexdigest()
+
+
+def load_key(path):
+    key = read_trusted_file(path, "evidence key file", 0o077).rstrip(b"\r\n \t")
+    if len(key) < MIN_KEY_BYTES or len(key) > 4096:
+        raise Refused(["evidence key file has an unusable length"])
+    return key
+
+
+def load_evidence(path, head, repo, pr, base, cfg, key, now):
     try:
         if os.path.getsize(path) > 65536:
             raise Refused(["evidence file too large"])
@@ -284,9 +331,9 @@ def load_evidence(path, head, repo, pr, reviewers, now):
     if not isinstance(ev, dict):
         raise Refused(["review evidence is not a JSON object"])
     bad = []
-    for key in ("repo", "head", "verdict", "reviewer", "reviewed_at", "reviewer_kind"):
-        if not isinstance(ev.get(key), str) or not ev.get(key):
-            bad.append(f"evidence field {key} missing or not a string")
+    for k in ("repo", "base", "head", "verdict", "reviewer", "reviewed_at", "reviewer_kind"):
+        if not isinstance(ev.get(k), str) or not ev.get(k):
+            bad.append(f"evidence field {k} missing or not a string")
     pr_v = ev.get("pr")
     if isinstance(pr_v, bool) or not isinstance(pr_v, (int, str)) or str(pr_v) != pr:
         bad.append("evidence pr missing or mismatched")
@@ -294,11 +341,13 @@ def load_evidence(path, head, repo, pr, reviewers, now):
         raise Refused(bad)
     if ev["repo"].lower() != repo.lower():
         bad.append("evidence repo mismatch")
+    if ev["base"] != base:
+        bad.append("evidence base branch does not equal the PR's base branch")
     if ev["head"] != head:
         bad.append("evidence head does not equal the expected head")
     if ev["verdict"] != "PASS":
         bad.append("evidence verdict is not PASS")
-    if ev["reviewer"] not in reviewers:
+    if ev["reviewer"] not in cfg["reviewers"]:
         bad.append("evidence reviewer is not in the allowlisted reviewers for this repo")
     if ev["reviewer_kind"] not in REVIEWER_KINDS:
         bad.append("evidence reviewer_kind is not recognised")
@@ -306,10 +355,17 @@ def load_evidence(path, head, repo, pr, reviewers, now):
         bad.append("evidence reviewed_at is not YYYY-MM-DDTHH:MM:SSZ")
     else:
         try:
-            if calendar.timegm(time.strptime(ev["reviewed_at"], "%Y-%m-%dT%H:%M:%SZ")) > now + 300:
+            ts = calendar.timegm(time.strptime(ev["reviewed_at"], "%Y-%m-%dT%H:%M:%SZ"))
+            if ts > now + 60:
                 bad.append("evidence reviewed_at is in the future")
+            elif now - ts > cfg["max_evidence_age_hours"] * 3600:
+                bad.append("evidence is older than max_evidence_age_hours")
         except ValueError:
             bad.append("evidence reviewed_at is not a valid time")
+    if cfg["require_signed_evidence"]:
+        mac = ev.get("hmac")
+        if key is None or not isinstance(mac, str) or not hmac.compare_digest(mac, evidence_mac(key, ev)):
+            bad.append("evidence signature missing or invalid")
     if bad:
         raise Refused(bad)
 
@@ -355,30 +411,88 @@ def summarize_checks(rollup, required):
             "success": sum(v == "SUCCESS" for vs in seen.values() for v in vs), "not_success": len(bad)}, bad
 
 
-def check_server_protection(runner, repo, base):
-    """Refuse unless GitHub itself requires status checks on the base branch (ruleset or branch protection)."""
-    rc, out, err = runner.call(rules_argv(repo, base))
+def parse_rule_contexts(rules):
+    """(context names, ruleset ids) from required_status_checks rules; empty or malformed definitions refuse."""
+    names, ids = set(), set()
+    for r in rules:
+        if not isinstance(r, dict):
+            raise Refused(["server-side rules response is malformed"])
+        if r.get("type") != "required_status_checks":
+            continue
+        params = r.get("parameters")
+        lst = params.get("required_status_checks") if isinstance(params, dict) else None
+        rid = r.get("ruleset_id")
+        if not isinstance(lst, list) or not lst or isinstance(rid, bool) or not isinstance(rid, int) or rid <= 0 \
+                or not all(isinstance(c, dict) and isinstance(c.get("context"), str) and c["context"] for c in lst):
+            raise Refused(["server-side required_status_checks rule is empty or malformed"])
+        names.update(c["context"] for c in lst)
+        ids.add(rid)
+    return names, ids
+
+
+def parse_protection_contexts(prot):
+    if not isinstance(prot, dict):
+        raise Refused(["branch protection response is malformed"])
+    rsc = prot.get("required_status_checks")
+    if rsc is None:
+        return set()
+    ctx, checks = (rsc.get("contexts", []), rsc.get("checks", [])) if isinstance(rsc, dict) else (None, None)
+    if not isinstance(ctx, list) or not isinstance(checks, list) \
+            or not all(isinstance(x, str) and x for x in ctx) \
+            or not all(isinstance(c, dict) and isinstance(c.get("context"), str) and c["context"] for c in checks):
+        raise Refused(["branch protection required_status_checks is malformed"])
+    names = set(ctx) | {c["context"] for c in checks}
+    if not names:
+        raise Refused(["branch protection required_status_checks is empty"])
+    return names
+
+
+def _read_json(runner, argv, what):
+    rc, out, err = runner.call(argv)
+    if rc != 0:
+        return rc, None, err
+    try:
+        return 0, json.loads(out), err
+    except ValueError:
+        raise RuntimeError(f"{what} returned unparseable JSON")
+
+
+def check_server_protection(runner, repo, base, cfg):
+    """Require a non-empty server-side set of required status checks that covers every allowlisted
+    required check, and refuse when a readable ruleset lists a bypass actor that could apply to us."""
+    rc, rules, err = _read_json(runner, rules_argv(repo, base), "gh rules read")
     if rc != 0:
         raise RuntimeError(f"gh rules read failed: {scrub(err)}")
-    try:
-        rules = json.loads(out)
-    except ValueError:
-        raise RuntimeError("gh rules read returned unparseable JSON")
     if not isinstance(rules, list):
         raise RuntimeError("gh rules read returned unexpected JSON shape")
-    if any(isinstance(r, dict) and r.get("type") == "required_status_checks" for r in rules):
-        return
-    rc, out, err = runner.call(protection_argv(repo, base))
-    if rc != 0:
-        if re.search(r"404|Not Found", err):
-            raise Refused(["no server-side required status checks on the base branch"])
-        raise RuntimeError(f"gh branch protection read failed: {scrub(err)}")
-    try:
-        prot = json.loads(out)
-    except ValueError:
-        raise RuntimeError("gh branch protection read returned unparseable JSON")
-    if not isinstance(prot, dict) or not isinstance(prot.get("required_status_checks"), dict):
+    names, ids = parse_rule_contexts(rules)
+    rc, prot, err = _read_json(runner, protection_argv(repo, base), "gh branch protection read")
+    if rc == 0:
+        names |= parse_protection_contexts(prot)
+        prot_state = "read"
+    elif re.search(r"404|Not Found", err):
+        prot_state = "absent"
+    else:
+        prot_state = "unreadable"
+    if not names:
+        if prot_state == "unreadable":
+            raise RuntimeError(f"gh branch protection read failed: {scrub(err)}")
         raise Refused(["no server-side required status checks on the base branch"])
+    missing = [n for n in cfg["required_checks"] if n not in names]
+    if missing:
+        raise Refused([f"required check {n} is not required server-side" for n in missing])
+    risky, unreadable = [], False
+    for rid in sorted(ids):
+        rc, detail, _ = _read_json(runner, ruleset_argv(repo, rid), "gh ruleset read")
+        actors = detail.get("bypass_actors") if isinstance(detail, dict) else None
+        if rc != 0 or not isinstance(actors, list) or not all(isinstance(a, dict) for a in actors):
+            unreadable = True
+            continue
+        risky += [a.get("actor_type") for a in actors if a.get("actor_type") in RISKY_BYPASS]
+    if risky and not cfg["accept_bypass_actors"]:
+        raise Refused([f"ruleset allows bypass by {sorted(set(risky))}; set accept_bypass_actors to accept"])
+    return {"contexts": sorted(names), "protection": prot_state,
+            "bypass": "accepted" if risky else ("unreadable" if unreadable else "none")}
 
 
 def decide(p, repo, pr, head, me, cfg):
@@ -448,15 +562,18 @@ def decide(p, repo, pr, head, me, cfg):
     return pr_class, checks
 
 
-def evaluate(runner, repo, pr, head, me, cfg, evidence, clock):
-    """One complete read-and-decide pass: fresh PR facts, evidence, every guard, server-side protection."""
+def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock):
+    """One complete read-and-decide pass: fresh PR facts, evidence (bound to head and base), every guard,
+    server-side protection. Returns (observed head, class, checks, server-side info)."""
     facts = runner.json(pr_view_argv(repo, pr, PR_FIELDS))
     observed = facts.get("headRefOid") if isinstance(facts.get("headRefOid"), str) else None
-    load_evidence(evidence, head, repo, pr, cfg["reviewers"], clock())
+    base = facts.get("baseRefName") if isinstance(facts.get("baseRefName"), str) else ""
     pr_class, checks = decide(facts, repo, pr, head, me, cfg)
+    load_evidence(evidence, head, repo, pr, base, cfg, key, clock())
+    info = {"waived": True}
     if cfg["require_server_side_protection"]:
-        check_server_protection(runner, repo, facts["baseRefName"])
-    return observed, pr_class, checks
+        info = check_server_protection(runner, repo, base, cfg)
+    return observed, pr_class, checks, info
 
 
 class AuditError(OSError):
@@ -518,13 +635,16 @@ def run(repo, pr, head, evidence, allowlist, audit, dry_run, gh, clock=time.time
             me = None
         if not isinstance(me, str) or not LOGIN_RE.fullmatch(me):
             raise RuntimeError("authenticated gh user unavailable")
-        cfg = repo_config(load_allowlist(allowlist), repo)
-        rec["server_side_protection"] = "required" if cfg["require_server_side_protection"] else "waived"
-        rec["observed_head"], rec["class"], rec["checks"] = evaluate(runner, repo, pr, head, me, cfg, evidence, clock)
+        allow = load_allowlist(allowlist)
+        cfg = repo_config(allow, repo)
+        key = load_key(allow["evidence_key_file"]) if cfg["require_signed_evidence"] else None
+        rec["signed_evidence"] = cfg["require_signed_evidence"]
+        rec["observed_head"], rec["class"], rec["checks"], rec["server_side"] = \
+            evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock)
         rec["decision"] = "APPROVE"
         # Full re-evaluation immediately before the one mutating call; any change refuses.
         try:
-            observed2, class2, _ = evaluate(runner, repo, pr, head, me, cfg, evidence, clock)
+            observed2, class2, _, rec["server_side"] = evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock)
         except Refused as e:
             raise Refused(["changed before execution: " + x for x in e.reasons])
         if observed2 != head or class2 != rec["class"]:
@@ -576,7 +696,7 @@ class _Parser(argparse.ArgumentParser):
         raise SystemExit(EXIT_USAGE)
 
 
-def main(argv=None, gh=None, allowlist=None, audit=None):
+def main(argv=None, gh=None, allowlist=None, audit=None, clock=time.time):
     ap = _Parser(description="Guarded owner merge runner (merge commit only).", allow_abbrev=False)
     ap.add_argument("--repo", required=True)
     ap.add_argument("--pr", required=True)
@@ -591,7 +711,7 @@ def main(argv=None, gh=None, allowlist=None, audit=None):
             sys.stderr.write(f"error: {e}\n")
             return EXIT_ERROR
     code, rec = run(a.repo, a.pr, a.expect_head, a.review_evidence,
-                    allowlist or DEFAULT_ALLOWLIST, audit or DEFAULT_AUDIT, a.dry_run, gh)
+                    allowlist or DEFAULT_ALLOWLIST, audit or DEFAULT_AUDIT, a.dry_run, gh, clock=clock)
     print(json.dumps({k: rec[k] for k in ("repo", "pr", "class", "decision", "outcome", "reasons")}))
     return code
 
