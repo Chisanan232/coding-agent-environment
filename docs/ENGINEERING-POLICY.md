@@ -169,6 +169,7 @@ command, then continue other work.
 approved local equivalent satisfies that requirement; missing platform evidence, owner acceptance or required
 security QA still blocks it. Tagging, publication and production deployment need separate authorization.
 
-**Executable form in this repository.** `scripts/owner-merge-runner.py` implements the exception for merges, per
-repository and off by default (`local_equivalent_ci` in the owner allowlist). See `docs/OWNER-MERGE-AUTONOMY.md`
-section 9.
+**Executable form in this repository.** Two forms of this one policy, neither a second policy:
+`scripts/owner-merge-gate.py --ci-unavailable` (a posted `OWNER-MERGE-CI-UNAVAILABLE` record, see
+`docs/OWNER-MERGE-WORKFLOW.md`) and, per repository and off by default, `local_equivalent_ci` in the owner-merge
+runner allowlist (`docs/OWNER-MERGE-AUTONOMY.md` section 9, once that runner is merged).
