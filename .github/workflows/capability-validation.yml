@@ -18,6 +18,10 @@ on:
       - 'scripts/candidate-rollout.py'
       - 'scripts/workstation-policy-hook.py'
       - 'scripts/memory-admission.py'
+      - 'scripts/session-notify.py'
+      - 'tests/test-session-notify.py'
+      - 'docs/SESSION-NOTIFICATIONS.md'
+      - 'docs/examples/session-notify*.json'
       - 'scripts/mcp-scope-inspect.py'
       - 'scripts/campaign-resume.py'
       - 'scripts/spe108-live/**'
@@ -47,6 +51,10 @@ on:
       - 'scripts/candidate-rollout.py'
       - 'scripts/workstation-policy-hook.py'
       - 'scripts/memory-admission.py'
+      - 'scripts/session-notify.py'
+      - 'tests/test-session-notify.py'
+      - 'docs/SESSION-NOTIFICATIONS.md'
+      - 'docs/examples/session-notify*.json'
       - 'scripts/mcp-scope-inspect.py'
       - 'scripts/campaign-resume.py'
       - 'scripts/spe108-live/**'
@@ -104,6 +112,7 @@ jobs:
           python3 tests/test-candidate-rollout.py
           python3 tests/test-workstation-policy-hook.py
           python3 tests/test-memory-admission.py
+          python3 tests/test-session-notify.py
           python3 tests/test-mcp-scope-inspect.py
           python3 tests/test-spe108-live.py
           python3 tests/test-parity-dogfood.py
