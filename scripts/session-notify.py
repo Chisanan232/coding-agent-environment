@@ -16,13 +16,14 @@ NAMES or file paths for credentials, never values.
 Truth model: Stop and SessionEnd are NOT project completion. State changes to COMPLETED or BLOCKED_* come only from the structured
 checkpoint file (`checkpoint` subcommand), never from model prose or the hook payload's text fields (`message`,
 `last_assistant_message` and `transcript_path` are never read). COMPLETED additionally needs a `verified` record and a checkpoint
-written during the current run. Forced termination (kill -9, power loss) cannot run hooks: `sweep` detects the silence afterwards.
+written after the current run started (every SessionStart and UserPromptSubmit opens a new run) and not already acted on. Forced termination (kill -9, power loss) cannot run hooks: `sweep` detects the silence afterwards.
 """
 import argparse
 import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -62,7 +63,9 @@ MAX_STATE_BYTES = 256 * 1024
 MAX_CHECKPOINT_BYTES = 8 * 1024
 HEARTBEAT_EVERY = 30
 HISTORY_CAP = 60
-NOTIFIED_CAP = 2000
+NOTIFIED_CAP = 500
+DEDUP_WINDOW = 86400   # best-effort dedup memory: older or beyond the cap, a repeat of the same transition may notify again
+MAX_CWD = 4096
 PENDING_CAP = 20
 HOOK_DEADLINE = 10
 SENDING_STALE = 300
@@ -122,6 +125,14 @@ def clean_text(value, limit, markers=()):
     return v
 
 
+def clean_ticket(value, markers=()):
+    """A ticket label (ABC-123): never secret-shaped and never carrying a corporate marker."""
+    if not isinstance(value, str) or not TICKET.fullmatch(value) or secret_shaped(value):
+        return None
+    low = value.lower()
+    return None if any(m and m.lower() in low for m in markers) else value
+
+
 def clean_repo(value, markers=()):
     """A repository label: plain name characters, and never secret-shaped, a long identifier or a corporate marker."""
     if not isinstance(value, str) or not SAFE_REPO.fullmatch(value) or secret_shaped(value):
@@ -134,15 +145,17 @@ def sanitize_fields(fields, cfg):
     """Rebuild every outbound field from a strict validator or a fixed enum. None when the state itself is not a known state.
 
     Used when a notification is queued AND again at every delivery attempt, so nothing read back from disk is trusted.
-    The repository label must be one the owner listed in `known_repos`; free text has no field to travel in.
+    Repository and ticket labels pass the same secret and corporate-marker checks as every other label, with the markers of the
+    config in force NOW; a repository must also be listed in `known_repos`. Free text has no field to travel in.
     """
     if not isinstance(fields, dict) or fields.get("state") not in STATES:
         return None
+    markers = [m for m in cfg.get("corporate_markers", []) if isinstance(m, str)]
     known = {r for r in cfg.get("known_repos", []) if isinstance(r, str)}
-    repo = fields.get("repo")
-    out = {"state": fields["state"], "repo": repo if isinstance(repo, str) and repo in known else "unlisted"}
-    ticket = fields.get("ticket")
-    if isinstance(ticket, str) and TICKET.fullmatch(ticket):
+    repo = clean_repo(fields.get("repo"), markers)
+    out = {"state": fields["state"], "repo": repo if repo in known else "unlisted"}
+    ticket = clean_ticket(fields.get("ticket"), markers)
+    if ticket:
         out["ticket"] = ticket
     pr = fields.get("pr")
     if type(pr) is int and 0 < pr < 10**7:
@@ -327,8 +340,11 @@ def find_checkpoint(cwd):
     p = pathlib.Path(cwd)
     for _ in range(8):
         cand = p / ".claude" / ".session-status.json"
-        if cand.exists() or cand.is_symlink():
-            return cand
+        try:
+            if cand.exists() or cand.is_symlink():
+                return cand
+        except OSError:  # e.g. ENAMETOOLONG: older Pythons answer False, 3.13 raises; either way there is no checkpoint here
+            pass
         if p.parent == p:
             break
         p = p.parent
@@ -364,7 +380,7 @@ def read_checkpoint(cwd, sid, markers):
     trigger = blocker.get("resume_trigger")
     return {
         "state": d["state"], "task": clean_text(d.get("task"), 64, markers), "repo": clean_repo(d.get("repo"), markers),
-        "ticket": d.get("ticket") if isinstance(d.get("ticket"), str) and TICKET.fullmatch(d["ticket"]) else None, "pr": pr, "head": head or None,
+        "ticket": clean_ticket(d.get("ticket"), markers), "pr": pr, "head": head or None,
         "workflow_state": clean_text(d.get("workflow_state"), 48, markers),
         "blocker_owner": owner if owner in BLOCKER_OWNERS else ("other" if owner else None),
         "resume_trigger": trigger if trigger in RESUME_TRIGGERS else None,
@@ -378,35 +394,62 @@ def ticket_from_environment():
 
 
 # ---- records -------------------------------------------------------------------------------------------------------------------
+TASK_TYPES = {"task": str, "repo": str, "ticket": str, "pr": int, "head": str, "workflow_state": str, "blocker_owner": str,
+              "resume_trigger": str, "verified": bool}
+
+
 def new_record(sid, now):
-    return {"v": 2, "session_id": sid, "state": "IDLE", "state_since": now, "last_seen": now, "cycle": 0, "run_started": now, "agent_done": 0,
-            "task": {}, "history": [], "notified": {}, "pending": [], "ended_reason": None, "dropped": 0, "overflow": 0, "cwd": ""}
+    return {"v": 3, "session_id": sid, "state": "IDLE", "state_since": now, "last_seen": now, "cycle": 0, "run_started": now, "cp_floor": 0, "agent_done": 0,
+            "task": {}, "history": [], "notified": {}, "pending": [], "ended_reason": None, "dropped": 0, "cwd": "", "corporate": False}
+
+
+def is_num(x):
+    """A real, finite number. bool is an int subclass and NaN/inf survive json, so neither may stand in for a timestamp."""
+    return type(x) in (int, float) and math.isfinite(x)
+
+
+def short_str(x, limit):
+    return isinstance(x, str) and len(x) <= limit
+
+
+def valid_backend(n, b):
+    return (n in BACKEND_NAMES and isinstance(b, dict) and b.get("status") in DELIVERY_STATUSES and type(b.get("attempts")) is int and 0 <= b["attempts"] <= 100
+            and is_num(b.get("next_at")) and (b.get("code") is None or short_str(b.get("code"), 40)))
 
 
 def valid_pending(e):
-    try:
-        return (isinstance(e, dict) and isinstance(e.get("key"), str) and 0 < len(e["key"]) <= 64 and type(e.get("cycle")) is int and e["cycle"] >= 0
-                and type(e.get("created")) is int and isinstance(e.get("fields"), dict) and isinstance(e.get("backends"), dict) and len(e["backends"]) <= 8
-                and all(isinstance(n, str) and n in BACKEND_NAMES and isinstance(b, dict) and b.get("status") in DELIVERY_STATUSES
-                        and type(b.get("attempts")) is int and 0 <= b["attempts"] <= 100 and isinstance(b.get("next_at"), (int, float))
-                        and not isinstance(b.get("next_at"), bool) for n, b in e["backends"].items()))
-    except Exception:
-        return False
+    return (isinstance(e, dict) and short_str(e.get("key"), 64) and e["key"] and type(e.get("cycle")) is int and e["cycle"] >= 0
+            and type(e.get("created")) is int and isinstance(e.get("fields"), dict) and isinstance(e.get("backends"), dict) and len(e["backends"]) <= 8
+            and all(valid_backend(n, b) for n, b in e["backends"].items()))
+
+
+def valid_history(h):
+    return (isinstance(h, dict) and type(h.get("t")) is int and h.get("from") in STATES and h.get("to") in STATES and short_str(h.get("why"), 100))
+
+
+def valid_task(t):
+    return isinstance(t, dict) and all(k in TASK_TYPES and type(v) is TASK_TYPES[k] and (type(v) is not str or len(v) <= 100) for k, v in t.items())
 
 
 def valid_record(d, sid):
+    """Strict structure, fail-closed: any wrong type, bool-as-number, NaN/inf or unknown shape makes the whole record untrusted."""
     try:
-        return (isinstance(d, dict) and d.get("v") == 2 and d.get("session_id") == sid and d.get("state") in STATES
-                and type(d.get("cycle")) is int and d["cycle"] >= 0 and isinstance(d.get("history"), list) and len(d["history"]) <= HISTORY_CAP
+        return (isinstance(d, dict) and d.get("v") == 3 and d.get("session_id") == sid and d.get("state") in STATES
+                and type(d.get("cycle")) is int and d["cycle"] >= 0
+                and isinstance(d.get("history"), list) and len(d["history"]) <= HISTORY_CAP and all(valid_history(h) for h in d["history"])
                 and isinstance(d.get("notified"), dict) and len(d["notified"]) <= NOTIFIED_CAP
                 and all(isinstance(k, str) and isinstance(v, list) and len(v) == 2 and all(type(x) is int for x in v) for k, v in d["notified"].items())
                 and isinstance(d.get("pending"), list) and len(d["pending"]) <= PENDING_CAP and all(valid_pending(e) for e in d["pending"])
-                and isinstance(d.get("task"), dict) and isinstance(d.get("cwd", ""), str)
-                and isinstance(d.get("last_seen"), (int, float)) and isinstance(d.get("state_since"), (int, float))
-                and isinstance(d.get("run_started"), (int, float)) and type(d.get("agent_done")) is int
-                and type(d.get("dropped")) is int and type(d.get("overflow")) is int)
+                and valid_task(d.get("task")) and short_str(d.get("cwd"), MAX_CWD) and type(d.get("corporate")) is bool
+                and all(is_num(d.get(k)) for k in ("last_seen", "state_since", "run_started", "cp_floor"))
+                and type(d.get("agent_done")) is int and type(d.get("dropped")) is int
+                and (d.get("ended_reason") is None or short_str(d.get("ended_reason"), 30)) and (d.get("repo_label") is None or short_str(d.get("repo_label"), 64)))
     except Exception:
         return False
+
+
+def reject_constant(name):
+    raise ValueError(name)  # NaN, Infinity and -Infinity are not JSON; they are never trusted state
 
 
 def record_path(sdir, sid):
@@ -419,7 +462,7 @@ def load_record(sdir, sid):
     if raw is None:
         return None, problem
     try:
-        d = json.loads(raw.decode("utf-8"))
+        d = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
     except ValueError:
         return None, "corrupt"
     return (d, None) if valid_record(d, sid) else (None, "corrupt")
@@ -532,14 +575,11 @@ class Engine:
         self.sdir, self.cfg, self.transports, self.clock, self.sleep = pathlib.Path(sdir), cfg, transports or REAL_TRANSPORTS, clock, sleep
 
     # -- state machine
-    def set_state(self, rec, new, reason, now, cp=None, kind=None, notify=True, force=False, bump=True, new_run=False, extra=None):
-        """Move the session. `cycle` counts runs for notification dedup; `run_started` is the freshness floor for a checkpoint."""
+    def set_state(self, rec, new, reason, now, cp=None, kind=None, notify=True, force=False, bump=True, extra=None):
+        """Move the session. `cycle` counts entries into RUNNING for notification dedup. Checkpoint freshness is separate: see `apply`."""
         old = rec["state"]
-        if new == "RUNNING" and old != "RUNNING":
-            if bump:
-                rec["cycle"] += 1
-            if new_run:
-                rec["run_started"] = now
+        if new == "RUNNING" and old != "RUNNING" and bump:
+            rec["cycle"] += 1
         if new != old or force:
             rec["history"] = (rec["history"] + [{"t": int(now), "from": old, "to": new, "why": reason}])[-HISTORY_CAP:]
             rec["state"], rec["state_since"] = new, now
@@ -550,20 +590,20 @@ class Engine:
             self.enqueue(rec, new, reason, now, kind, extra=extra)
 
     @staticmethod
-    def seen(rec, base, cycle):
+    def seen(rec, base, cycle, now):
+        """Best-effort dedup: a transition is a repeat only while its tombstone is inside DEDUP_WINDOW (and was not evicted by the cap)."""
         got = rec["notified"].get(base)
-        return (got is not None and got[0] >= cycle) or any(p["key"] == base and p["cycle"] == cycle for p in rec["pending"])
+        return (got is not None and got[0] >= cycle and got[1] >= now - DEDUP_WINDOW) or any(p["key"] == base and p["cycle"] == cycle for p in rec["pending"])
 
     @staticmethod
     def mark_notified(rec, base, cycle, now):
-        """Remember a finished notification for the retention window; only entries older than the window (or the hard cap) are forgotten."""
-        rec["notified"][base] = [int(cycle), int(now)]
-        for k in [k for k, v in rec["notified"].items() if v[1] < now - GC_AFTER]:
+        """Remember a finished notification. A tombstone only ever moves to a newer cycle; entries past the window or the cap are forgotten."""
+        got = rec["notified"].get(base)
+        rec["notified"][base] = [max(int(cycle), got[0]) if got else int(cycle), int(now)]
+        for k in [k for k, v in rec["notified"].items() if v[1] < now - DEDUP_WINDOW]:
             del rec["notified"][k]
         while len(rec["notified"]) > NOTIFIED_CAP:
-            oldest = min(rec["notified"], key=lambda k: rec["notified"][k][1])
-            del rec["notified"][oldest]
-            rec["overflow"] += 1  # durable and visible in `status`: dedup memory was truncated inside its retention window
+            del rec["notified"][min(rec["notified"], key=lambda k: rec["notified"][k][1])]
 
     def make_room(self, rec, now):
         """A full queue gives its oldest entry a durable terminal outcome instead of silently discarding it."""
@@ -579,7 +619,7 @@ class Engine:
     def enqueue(self, rec, state, reason, now, kind=None, extra_key="", extra=None):
         t, label, cycle = rec["task"], kind or state, rec["cycle"]
         base = hashlib.sha256("|".join([rec["session_id"], str(t.get("task") or t.get("ticket") or "-"), label, str(t.get("head") or ""), extra_key]).encode()).hexdigest()[:24]
-        if self.seen(rec, base, cycle):
+        if self.seen(rec, base, cycle, now):
             return None
         raw = {"state": "FAILED" if kind == "STALE" else ("SESSION_ENDED" if kind == "ENDED" else ("RUNNING" if kind == "AGENT" else state)),
                "repo": t.get("repo") or rec.get("repo_label"), "ticket": t.get("ticket"), "pr": t.get("pr")}
@@ -676,9 +716,9 @@ class Engine:
                 rec = rec or new_record(sid, now)
                 before = json.dumps(rec, sort_keys=True)
                 cwd = ev.get("cwd") if isinstance(ev.get("cwd"), str) else None
-                if cwd:
-                    rec["cwd"] = cwd[:300]
-                rec["corporate"] = bool(is_corporate_path(cwd, self.cfg)) or bool(rec.get("corporate"))
+                if cwd and len(cwd) <= MAX_CWD:
+                    rec["cwd"] = cwd  # whole path, never truncated: corporate markers are re-evaluated against it at every delivery
+                rec["corporate"] = bool(is_corporate_path(cwd, self.cfg)) or bool(rec["corporate"]) or bool(cwd and len(cwd) > MAX_CWD)  # unstorable path: fail closed
                 markers = self.cfg.get("corporate_markers", [])
                 cp, cp_mtime = read_checkpoint(cwd, sid, markers)
                 if cp is None and not rec["task"] and ticket_from_environment():
@@ -701,7 +741,8 @@ class Engine:
         if name == "SessionStart":
             source = str(ev.get("source") or "unknown")
             # a resume restores the same run: no new cycle, so an identical block already announced is not announced again
-            self.set_state(rec, "RUNNING", f"start:{source[:12]}", now, cp, notify=False, bump=source != "resume", new_run=True)
+            rec["run_started"] = now
+            self.set_state(rec, "RUNNING", f"start:{source[:12]}", now, cp, notify=False, bump=source != "resume")
             return
         if name == "SessionEnd":
             reason = str(ev.get("reason") or "other")
@@ -715,17 +756,16 @@ class Engine:
         if state == "SESSION_ENDED" and name != "UserPromptSubmit":
             return
         if name == "UserPromptSubmit":
+            rec["run_started"] = now  # a prompt always opens a new run, even while RUNNING: earlier checkpoints stop counting
             if state != "RUNNING":
-                self.set_state(rec, "RUNNING", "prompt", now, cp, notify=False, new_run=True)
+                self.set_state(rec, "RUNNING", "prompt", now, cp, notify=False)
             else:
                 self.heartbeat(rec, now)
             return
         if name in ("PostToolUse", "PostToolUseFailure", "SubagentStop", "TaskCompleted", "SubagentStart", "PreToolUse"):
-            if name in ("PostToolUse", "PostToolUseFailure") and state in BLOCKED:
-                # the owner unblocked it: a new cycle, but the SAME run, so a checkpoint written by this very tool call stays fresh
-                self.set_state(rec, "RUNNING", "progress", now, cp, notify=False, new_run=False)
-            elif name in ("PostToolUse", "PostToolUseFailure") and state in ("IDLE", "COMPLETED", "FAILED"):
-                self.set_state(rec, "RUNNING", "progress", now, cp, notify=False, new_run=True)
+            if name in ("PostToolUse", "PostToolUseFailure") and state in BLOCKED | {"IDLE", "COMPLETED", "FAILED"}:
+                # progress only changes the state: it never touches checkpoint freshness, so the checkpoint written by this very tool call counts
+                self.set_state(rec, "RUNNING", "progress", now, cp, notify=False)
             else:
                 self.heartbeat(rec, now)
             if name in ("TaskCompleted", "SubagentStop"):
@@ -754,7 +794,8 @@ class Engine:
                 self.heartbeat(rec, now)
                 return
             target, reason = "IDLE", "stop"
-            if cp and cp_mtime > rec["run_started"]:  # strictly newer than this run's start: a leftover file never counts
+            if cp and cp_mtime > max(rec["run_started"], rec["cp_floor"]):  # newer than this run's start and than any checkpoint already acted on
+                rec["cp_floor"] = cp_mtime
                 if cp["state"] == "COMPLETED":
                     target, reason = ("COMPLETED", "checkpoint-verified") if cp["verified"] else ("IDLE", "completion-unverified")
                 elif cp["state"] in BLOCKED or cp["state"] == "FAILED":
@@ -811,17 +852,15 @@ class Engine:
 def cmd_hook(args):
     sdir = state_dir()
 
-    fired = []
-
     def on_alarm(signum, frame):
-        if fired:
-            os._exit(0)  # the first TimeoutError was swallowed somewhere: leave without waiting for anything else
-        fired.append(1)
-        raise TimeoutError("hook deadline")
+        # Hard stop at the FIRST deadline: nothing the engine could catch or swallow gets a chance to keep the hook alive. State writes are
+        # atomic and a delivery is persisted as `sending` before it runs, so leaving here never corrupts or loses state.
+        log_line(sdir, "hook deadline")
+        os._exit(0)
 
     try:
         signal.signal(signal.SIGALRM, on_alarm)
-        signal.setitimer(signal.ITIMER_REAL, HOOK_DEADLINE, 1)  # repeats every second after the deadline
+        signal.setitimer(signal.ITIMER_REAL, HOOK_DEADLINE)
         raw = sys.stdin.buffer.read(MAX_STDIN + 1)
         if len(raw) > MAX_STDIN:
             log_line(sdir, "stdin too large")
@@ -858,7 +897,7 @@ def cmd_status(args):
         pend = sum(1 for e in rec["pending"] for b in e["backends"].values() if b["status"] in ("pending", "failed", "sending"))
         rows.append({"session": sid[:12], "state": rec["state"], "age": age(now, rec["state_since"]), "seen": age(now, rec["last_seen"]), "cycle": rec["cycle"],
                      "repo": t.get("repo") or rec.get("repo_label"), "ticket": t.get("ticket"), "pr": t.get("pr"), "pending_deliveries": pend,
-                     "dropped": rec["dropped"] or None, "dedup_overflow": rec["overflow"] or None})
+                     "dropped": rec["dropped"] or None})
     if args.json:
         print(json.dumps(rows, indent=1))
     else:

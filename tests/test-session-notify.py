@@ -855,20 +855,6 @@ class ReviewRegressions(Base):
         self.assertEqual(seen["target"], [])
         self.assertEqual(seen["proxy"], [])
 
-    # 5 -- checkpoint contents and freshness come from the same opened file
-    def test_5_freshness_is_the_mtime_of_the_file_that_was_read(self):
-        self.checkpoint()
-        path = self.work / ".claude/.session-status.json"
-        os.utime(path, (12345, 12345))
-        real_stat = pathlib.Path.stat
-        pathlib.Path.stat = lambda *a, **k: (_ for _ in ()).throw(AssertionError("a second stat would race with a replacement file"))
-        try:
-            cp, mtime = sn.read_checkpoint(str(self.work), "s1", [])
-        finally:
-            pathlib.Path.stat = real_stat
-        self.assertEqual(mtime, 12345.0)
-        self.assertTrue(cp["verified"])
-
     # 6 -- a completion checkpoint written by the session's own tool call stays fresh
     def test_6_the_post_tool_use_of_the_checkpoint_command_does_not_invalidate_it(self):
         e = self.engine()
@@ -917,22 +903,6 @@ class ReviewRegressions(Base):
         rec = self.rec()
         self.assertIsNone(e.enqueue(rec, "RUNNING", "agent_completed", self.t, kind="AGENT", extra_key="k0"))
         self.assertEqual(rec["pending"], [])
-
-    def test_7_only_entries_past_the_retention_window_or_the_hard_cap_are_forgotten(self):
-        e = self.engine()
-        rec = sn.new_record("s1", self.t)
-        old_cap = sn.NOTIFIED_CAP
-        try:
-            rec["notified"]["old"] = [1, int(self.t - sn.GC_AFTER - 10)]
-            for i in range(4):
-                e.mark_notified(rec, f"k{i}", 1, self.t)
-            self.assertNotIn("old", rec["notified"])          # expired, not an overflow
-            self.assertEqual(rec["overflow"], 0)
-            sn.NOTIFIED_CAP = 3
-            e.mark_notified(rec, "k4", 1, self.t + 1)
-        finally:
-            sn.NOTIFIED_CAP = old_cap
-        self.assertEqual((len(rec["notified"]), rec["overflow"]), (3, 2))   # truncation inside the window is counted, durably
 
     # 8 -- the retry cap counts interrupted-send recoveries
     def test_8_interrupted_sends_cannot_exceed_max_attempts(self):
@@ -1027,10 +997,212 @@ class ReviewRegressions(Base):
         r = subprocess.run([sys.executable, str(SCRIPT), "hook"], input=b'{"hook_event_name":"Stop","session_id":"s1"}', env=env, capture_output=True, timeout=5)
         self.assertEqual((r.returncode, r.stdout), (0, b""))
 
-    def test_11_a_swallowed_deadline_still_ends_the_hook(self):
+
+
+class Cycle2Regressions(Base):
+    """One test per finding of the independent review of d74aaa5 (codex-2.md). Numbers match the review."""
+
+    def pending(self, fields, backends=("macos",), key="k"):
+        return {"key": key, "cycle": 1, "created": 0, "fields": fields,
+                "backends": {n: {"status": "pending", "attempts": 0, "next_at": 0, "code": None} for n in backends}}
+
+    def only_macos(self, **over):
+        c = cfg(**over)
+        c["backends"]["ntfy"]["enabled"] = c["backends"]["pushover"]["enabled"] = False
+        return c
+
+    # 1 -- a checkpoint from an earlier run never completes a later one, whatever opened the later run
+    def test_1_a_resumed_session_does_not_reuse_the_previous_runs_checkpoint(self):
+        e = self.engine()
+        self.ev(e, "SessionStart", source="startup")
+        self.advance(50)
+        self.checkpoint()                               # written during the first run
+        self.advance(50)
+        self.ev(e, "SessionStart", source="resume")     # crash while RUNNING, then resume: still state RUNNING
+        self.advance(5)
+        self.ev(e, "Stop")
+        self.assertEqual(self.rec()["state"], "IDLE")
+        self.assertEqual(self.fake.sent, [])
+
+    def test_1_a_new_prompt_while_running_opens_a_new_run(self):
+        e = self.engine()
+        self.ev(e, "UserPromptSubmit")
+        self.advance(50)
+        self.checkpoint()
+        self.advance(50)
+        self.ev(e, "UserPromptSubmit")                  # second prompt, state never left RUNNING
+        self.advance(5)
+        self.ev(e, "Stop")
+        self.assertEqual(self.rec()["state"], "IDLE")
+        self.assertEqual(self.fake.sent, [])
+
+    def test_1_control_a_checkpoint_written_after_the_run_started_still_completes(self):
+        e = self.engine()
+        self.ev(e, "SessionStart", source="resume")
+        self.advance(5)
+        self.checkpoint()
+        self.ev(e, "Stop")
+        self.assertEqual(self.rec()["state"], "COMPLETED")
+
+    # 2 -- every outbound label is sanitised the same way, with the markers in force at delivery
+    def test_2_listed_but_secret_shaped_or_corporate_labels_never_leave(self):
+        c = cfg(known_repos=["ghp_TESTFAKESECRET", "acme-tools", "work"], corporate_markers=["ACME"])
+        out = sn.sanitize_fields({"state": "FAILED", "repo": "ghp_TESTFAKESECRET", "ticket": "ACME-123"}, c)
+        self.assertEqual(out, {"state": "FAILED", "repo": "unlisted"})
+        self.assertEqual(sn.sanitize_fields({"state": "FAILED", "repo": "acme-tools"}, c), {"state": "FAILED", "repo": "unlisted"})
+        self.assertEqual(sn.sanitize_fields({"state": "FAILED", "repo": "work", "ticket": "SPE-1"}, c), {"state": "FAILED", "repo": "work", "ticket": "SPE-1"})
+        self.assertEqual(sn.sanitize_fields({"state": "FAILED", "ticket": "SECRET-1"}, c), {"state": "FAILED", "repo": "unlisted"})
+
+    def test_2_a_marker_added_after_queueing_removes_queued_labels_at_delivery(self):
+        e = self.engine(self.only_macos())
+        self.ev(e, "UserPromptSubmit")
+        r = self.rec()
+        r["pending"] = [self.pending({"state": "FAILED", "repo": "acme-tools", "ticket": "ACME-123"})]
+        sn.save_record(self.sdir, r)
+        later = self.engine(self.only_macos(known_repos=["acme-tools"], corporate_markers=["ACME"]))
+        later.sweep()
+        self.assertEqual([p["body"] for _, p in self.fake.sent], ["unlisted"])
+
+    # 3 -- the working path is never truncated before corporate evaluation
+    def test_3_a_marker_deep_in_a_long_path_still_revokes_a_queued_remote_delivery(self):
+        deep = "/personal/" + "a/" * 160 + "acme-internal/repo"
+        fake = Fake(fail={"ntfy": "network"})
+        e = self.engine(cfg(), fake)
+        self.ev(e, "UserPromptSubmit", cwd=deep)
+        self.ev(e, "Notification", notification_type="permission_prompt", cwd=deep)
+        fake.fail = {}
+        self.t += 40
+        later = sn.Engine(self.sdir, cfg(corporate_markers=["acme-internal"]), fake.table(), clock=lambda: self.t, sleep=lambda s: None)
+        later.sweep()
+        self.assertNotIn("ntfy", [n for n, _ in fake.sent])
+
+    def test_3_a_path_too_long_to_store_is_treated_as_corporate(self):
+        too_long = "/p/" + "a/" * sn.MAX_CWD
+        e = self.engine()
+        self.ev(e, "UserPromptSubmit", cwd=too_long)
+        self.ev(e, "Notification", notification_type="permission_prompt", cwd=too_long)
+        self.assertEqual(self.names(), ["macos"])
+        self.assertTrue(self.rec()["corporate"])
+
+    # 4 -- structurally invalid state is untrusted and never delivers
+    def test_4_wrong_types_bool_timestamps_and_non_finite_numbers_make_state_untrusted(self):
+        e = self.engine(self.only_macos())
+        self.ev(e, "UserPromptSubmit")
+        base = self.rec()
+        base["pending"] = [self.pending({"state": "FAILED", "repo": "work"})]
+        bad_next = self.pending({"state": "FAILED", "repo": "work"})
+        bad_next["backends"]["macos"]["next_at"] = True
+        nan_next = self.pending({"state": "FAILED", "repo": "work"})
+        nan_next["backends"]["macos"]["next_at"] = float("nan")
+        mutations = {"bool run_started": {"run_started": False}, "NaN last_seen": {"last_seen": float("nan")}, "inf state_since": {"state_since": float("inf")},
+                     "bool cp_floor": {"cp_floor": True}, "history element": {"history": [17]}, "corporate list": {"corporate": []},
+                     "task wrong type": {"task": {"pr": True}}, "task unknown key": {"task": {"x": "y"}}, "notified bool": {"notified": {"k": [True, 1]}},
+                     "bool next_at": {"pending": [bad_next]}, "NaN next_at": {"pending": [nan_next]}}
+        for label, change in mutations.items():
+            with self.subTest(label):
+                (self.sdir / "s1.json").write_text(json.dumps(dict(base, **change)))
+                self.fake.sent.clear()
+                self.assertEqual(self.ev(e, "Stop"), "untrusted:corrupt")
+                self.assertEqual(e.sweep()["untrusted"], 1)
+                self.assertEqual(self.fake.sent, [])
+        (self.sdir / "s1.json").write_text(json.dumps(base))     # control: the same record, unmutated, delivers
+        e.sweep()
+        self.assertEqual(len(self.fake.sent), 1)
+
+    # 5 -- progress after a stale failure keeps a checkpoint the tool call itself wrote
+    def test_5_progress_after_a_stale_failure_does_not_discard_a_fresh_completion(self):
+        e = self.engine()
+        self.ev(e, "UserPromptSubmit")
+        self.t += 3000
+        self.assertEqual(e.sweep()["stale"], 1)
+        self.assertEqual(self.rec()["state"], "FAILED")
+        self.advance(1)
+        self.checkpoint()                               # the session was alive after all and wrote its completion...
+        self.advance(1)
+        self.ev(e, "PostToolUse")                       # ...then that tool call's PostToolUse arrives
+        self.advance(1)
+        self.ev(e, "Stop")
+        self.assertEqual(self.rec()["state"], "COMPLETED")
+
+    def test_5_a_checkpoint_already_acted_on_never_counts_twice(self):
+        e = self.engine()
+        self.ev(e, "UserPromptSubmit")
+        self.advance(2)
+        self.checkpoint()
+        self.ev(e, "Stop")
+        n = len(self.fake.sent)
+        self.advance(2)
+        self.ev(e, "PostToolUse")
+        self.ev(e, "Stop")                              # nothing new was written since
+        self.assertEqual((self.rec()["state"], len(self.fake.sent)), ("IDLE", n))
+
+    def test_5_a_blocked_checkpoint_already_acted_on_does_not_block_again_after_unblocking(self):
+        e = self.engine()
+        self.ev(e, "UserPromptSubmit")
+        self.advance(2)
+        self.checkpoint(state="BLOCKED_DEPENDENCY", verified=None, blocker={"owner": "dependency", "resume_trigger": "dependency_merged"})
+        self.ev(e, "Stop")
+        n = len(self.fake.sent)
+        self.advance(2)
+        self.ev(e, "PostToolUse")                       # dependency merged, work resumed
+        self.ev(e, "Stop")
+        self.assertEqual((self.rec()["state"], len(self.fake.sent)), ("IDLE", n))
+
+    # 6 -- an older cycle can never move the dedup memory backwards
+    def test_6_a_late_retry_of_an_older_cycle_keeps_the_newer_tombstone(self):
+        fake = Fake(fail={"macos": "network"})
+        e = self.engine(self.only_macos(), fake)
+        self.ev(e, "UserPromptSubmit")
+        self.ev(e, "Notification", notification_type="permission_prompt")      # cycle 1: delivery fails, retry due in 30 s
+        fake.fail = {}
+        self.ev(e, "PostToolUse")
+        self.ev(e, "Notification", notification_type="permission_prompt")      # cycle 2: same transition, delivered at once
+        self.assertEqual(len(fake.sent), 1)
+        self.t += 31
+        e.sweep()                                                              # cycle 1 finally succeeds
+        self.assertEqual(len(fake.sent), 2)
+        (key, (cycle, _)), = self.rec()["notified"].items()
+        self.assertEqual(cycle, 2)
+        self.ev(e, "Notification", notification_type="permission_prompt")      # replay inside cycle 2
+        self.assertEqual(len(fake.sent), 2)
+
+    def test_6_mark_notified_is_monotonic(self):
+        rec = sn.new_record("s1", self.t)
+        sn.Engine.mark_notified(rec, "k", 3, self.t)
+        sn.Engine.mark_notified(rec, "k", 1, self.t + 5)
+        self.assertEqual(rec["notified"]["k"][0], 3)
+
+    # 7 -- dedup is best-effort inside a bounded window, and says so
+    def test_7_dedup_forgets_after_the_window_and_the_contract_is_documented(self):
+        e = self.engine(self.only_macos())
+        self.ev(e, "UserPromptSubmit")
+        self.ev(e, "Notification", notification_type="permission_prompt")
+        self.ev(e, "Notification", notification_type="permission_prompt")
+        self.assertEqual(len(self.fake.sent), 1)                               # inside the window: deduplicated
+        self.t += sn.DEDUP_WINDOW + 1
+        self.ev(e, "Notification", notification_type="permission_prompt")
+        self.assertEqual(len(self.fake.sent), 2)                               # outside it: at-least-once, may repeat
+
+    def test_7_memory_is_bounded_by_the_cap_without_a_counter_that_promises_more(self):
+        rec = sn.new_record("s1", self.t)
+        for i in range(sn.NOTIFIED_CAP + 5):
+            sn.Engine.mark_notified(rec, f"k{i}", 1, self.t + i)
+        self.assertEqual(len(rec["notified"]), sn.NOTIFIED_CAP)
+        self.assertNotIn("k0", rec["notified"])
+        self.assertIn(f"k{sn.NOTIFIED_CAP + 4}", rec["notified"])
+        self.assertNotIn("overflow", rec)
+
+    def test_7_docs_state_the_weaker_contract_and_make_no_exactly_once_claim(self):
+        doc = (ROOT / "docs/SESSION-NOTIFICATIONS.md").read_text()
+        self.assertIn("at-least-once", doc)
+        for gone in ("never repeat a key", "dedup_overflow", "hard cap 2000", "second firing"):
+            self.assertNotIn(gone, doc)
+
+    # 8 -- the deadline ends the hook at the FIRST alarm
+    def test_8_a_handler_that_swallows_the_deadline_is_still_ended_at_the_deadline(self):
         code = ("import importlib.util,sys,time\n"
                 f"s=importlib.util.spec_from_file_location('sn',{str(SCRIPT)!r});sn=importlib.util.module_from_spec(s);s.loader.exec_module(sn)\n"
-                "sn.HOOK_DEADLINE=1\n"
+                "sn.HOOK_DEADLINE=0.2\n"
                 "class Stubborn:\n"
                 "    def __init__(self,*a,**k): pass\n"
                 "    def handle(self,ev):\n"
@@ -1039,10 +1211,37 @@ class ReviewRegressions(Base):
                 "            except BaseException: pass\n"
                 "sn.Engine=Stubborn\n"
                 "sys.stdin=type('S',(),{'buffer':__import__('io').BytesIO(b'{}')})()\n"
+                "print(time.time(),flush=True)\n"
                 "sys.exit(sn.cmd_hook(None))\n")
         env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(self.sdir))
         r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, timeout=8)
+        ended = time.time()
         self.assertEqual(r.returncode, 0)
+        self.assertLess(ended - float(r.stdout.split()[0]), 0.9, "first alarm must end the process; the old second-alarm design needs >= 1.2 s")
+
+    # 9 -- freshness comes from the descriptor that was read; the test does not patch pathlib, so it behaves the same on every Python
+    def test_9_mtime_is_that_of_the_opened_file_even_if_the_path_is_replaced_meanwhile(self):
+        self.checkpoint()
+        path = self.work / ".claude/.session-status.json"
+        os.utime(path, (12345, 12345))
+        real_open, swapped = os.open, []
+
+        def swapping_open(p, *a, **k):
+            fd = real_open(p, *a, **k)
+            if str(p).endswith(".session-status.json") and not swapped:
+                swapped.append(1)                       # a replacement lands right after the checkpoint was opened
+                repl = path.with_name("replacement.json")
+                repl.write_text(json.dumps({"schema": 1, "state": "FAILED"}))
+                os.utime(repl, (99999, 99999))
+                os.replace(repl, path)
+            return fd
+        os.open = swapping_open
+        try:
+            cp, mtime = sn.read_checkpoint(str(self.work), "s1", [])
+        finally:
+            os.open = real_open
+        self.assertEqual(swapped, [1])
+        self.assertEqual((mtime, cp["state"], cp["verified"]), (12345.0, "COMPLETED", True))
 
 
 def hashlib_key(sid, extra):
