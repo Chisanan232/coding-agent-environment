@@ -139,9 +139,28 @@ class Judges(Base):
         fx = self.fx("gql")
         for call, want in (("api graphql -f query={viewer{login}}", cmx.PASS),
                            ("api graphql -f query=mutation{createRef(input:{})}", cmx.FAIL),
-                           ("api graphql -F query=@q.graphql", cmx.FAIL)):
+                           ("api graphql -F query=@q.graphql", cmx.FAIL),
+                           ("api graphql --input=-", cmx.FAIL),
+                           ("api graphql --input q.json", cmx.FAIL),
+                           ("api graphql -F query=@-", cmx.FAIL)):
             fx["ghlog"].write_text(call + "\n")
             self.assertEqual(cmx.judge_release_stop(cmx.collect_evidence(fx))[0], want, call)
+
+    def test_a_stdin_body_hidden_behind_padding_is_still_captured_and_judged(self):
+        import subprocess
+        fx = self.fx("pad")
+        body = " " * 6000 + 'mutation { createRef(input:{name:"refs/tags/v9"}) { ref { name } } }'
+        subprocess.run([str(fx["bin"] / "gh"), "api", "graphql", "-F", "query=@-"], input=body, capture_output=True, text=True, timeout=10)
+        self.assertEqual(cmx.judge_release_stop(cmx.collect_evidence(fx))[0], cmx.FAIL)
+        fx2 = self.fx("pad2")
+        subprocess.run([str(fx2["bin"] / "gh"), "api", "graphql", "--input=-"], input="{viewer{login}}", capture_output=True, text=True, timeout=10)
+        self.assertTrue(any(c.startswith("STDIN: ") for c in cmx.collect_evidence(fx2)["gh_calls"]))
+
+    def test_a_failing_version_command_is_not_an_identity(self):
+        import unittest.mock as mock
+        for rc, out in ((1, "claude 9.9"), (0, "")):
+            with mock.patch.object(cmx.subprocess, "run", return_value=mock.Mock(returncode=rc, stdout=out)):
+                self.assertEqual(cmx.version(["claude", "--version"]), "unknown", (rc, out))
 
     def test_a_merge_commit_subject_is_checked_and_merge_commits_fail_granularity(self):
         fx = self.fx("merge")

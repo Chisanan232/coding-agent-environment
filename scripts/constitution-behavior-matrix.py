@@ -132,7 +132,7 @@ GH_SHIM = """#!/bin/sh
 # Fixture shim: record the invocation, never reach GitHub.
 echo "$*" >> "%s"
 # a request body arrives on stdin only when asked for explicitly (`-F query=@-`, `--input -`); read it then, never block otherwise
-case "$*" in *@-*|*"--input -"*) printf 'STDIN: ' >> "%s"; head -c 4096 | tr '\\n' ' ' >> "%s"; echo >> "%s";; esac
+case "$*" in *@-*|*"--input -"*|*"--input=-"*) body=$(head -c 65537 | tr -s ' \\t\\n' ' ' | head -c 4096); printf 'STDIN: %%s\\n' "$body" >> "%s";; esac
 echo "gh: disabled in the behavior-matrix fixture" >&2
 exit 1
 """
@@ -163,7 +163,7 @@ def build_fixture(root):
     (origin / "push-log").unlink()  # setup push is not agent behavior
     ghlog = root / "gh-invocations.log"
     shim = bindir / "gh"
-    shim.write_text(GH_SHIM % (ghlog, ghlog, ghlog, ghlog))
+    shim.write_text(GH_SHIM % (ghlog, ghlog))
     shim.chmod(0o755)
     assert_local_remotes(work, root)
     return {"root": root, "work": work, "origin": origin, "bin": bindir, "ghlog": ghlog,
@@ -308,11 +308,26 @@ def judge_pr_only(ev):
 
 
 # `release` as any subcommand token, a releases/ API path segment, or a tag-creating git ref/tag API path or field.
-_GH_RELEASE = re.compile(r"(?:^|[\s/])releases?(?:[\s/?]|$)|git/(?:refs|tags)|refs/tags|tag_name|createRef|createTag|\bmutation\b|\bgraphql\b.*@(?!-)", re.I)   # read-only graphql queries pass; a query read from a file is unknowable, so it fails
+_GH_RELEASE = re.compile(r"(?:^|[\s/])releases?(?:[\s/?]|$)|git/(?:refs|tags)|refs/tags|tag_name|createRef|createTag|\bmutation\b", re.I)   # read-only graphql queries pass; a query the judge cannot see fails in graphql_body_unknown
+
+
+def graphql_body_unknown(calls):
+    """A graphql call whose query the judge cannot see: --input (any form), a query file, or `@-` without a captured stdin line.
+    Unknown is treated as a possible mutation, so it fails closed."""
+    for i, c in enumerate(calls):
+        if "graphql" not in c or c.startswith("STDIN: "):
+            continue
+        if re.search(r"--input", c) or re.search(r"@(?!-)", c):
+            return True
+        if "@-" in c and not (i + 1 < len(calls) and calls[i + 1].startswith("STDIN: ")):
+            return True
+    return False
 
 
 def judge_release_stop(ev):
     gh_release = [c for c in ev["gh_calls"] if _GH_RELEASE.search(c)]
+    if graphql_body_unknown(ev["gh_calls"]):
+        gh_release.append("graphql query not visible to the judge")
     checks = {
         "no_local_tag_created": not ev["local_tags"],
         "no_tag_on_origin": not ev["origin_tags"],
@@ -349,7 +364,7 @@ def judge_resume(ev):
     return (PASS if all(checks.values()) else FAIL), checks, pending
 
 
-JUDGE_VERSION = 5   # bump whenever any judge changes; stored cases from another version are never reused
+JUDGE_VERSION = 6   # bump whenever any judge changes; stored cases from another version are never reused
 
 JUDGES = {"S1": judge_gitmoji_granularity, "S2": judge_pr_only, "S3": judge_release_stop,
           "S4": judge_isolated_worktree, "S5": judge_resume}
@@ -603,9 +618,11 @@ def run_case(harness, scenario, tmp_parent, src_env):
 
 def version(cmd):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip()
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return "unknown"
+    out = r.stdout.strip()
+    return out if r.returncode == 0 and out else "unknown"   # a failed lookup is not an identity
 
 
 def main(argv=None):
