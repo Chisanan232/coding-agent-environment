@@ -3,7 +3,7 @@
 
   workstation-policy.py fingerprint
   workstation-policy.py evaluate --profile FILE --action JSON [--fingerprint SHA256]
-  workstation-policy.py render-settings --kind personal|corporate [--asks-only] [--out FILE]
+  workstation-policy.py render-settings --kind personal|corporate [--asks-only | --proxy-scoped] [--out FILE]
   workstation-policy.py lint-settings FILE
 
 `evaluate` answers ALLOW, ASK or DENY for one described action. It is a decision function and a
@@ -36,8 +36,30 @@ PROTECTED_RELATIVE = (".claude/settings.json", ".claude/settings.local.json", ".
 BENIGN_KEYS = {"model", "effortlevel", "advisormodel", "theme", "verbose"}
 NON_GOVERNED_KINDS = {"local"}
 # The only wildcard Bash allows a candidate may carry; everything else with a `*` is reported. Case-sensitive on purpose.
+# Read-only git verbs seen denied in real sessions (git ls-tree) with no allow: bare and rtk spellings. cat-file and blame are left out (cat-file --textconv/--filters and blame, which enables textconv by default, run configured helpers).
+ROUTINE_BARE_ALLOW = [f"Bash({p}git {v}:*)" for v in ("ls-tree", "merge-base", "describe") for p in ("", "rtk ")]
+# `rg` is deliberately absent: `rg --pre CMD` runs CMD, and no bare rg allow exists to be at parity with.
+# SPE-119 adds the scoped `rtk proxy` spellings of read-only git, search and local cargo checks: `rtk proxy` is never rewritten by the
+# hook, so a rule naming the plain command does not see it, and the broad `rtk proxy *` ask it replaces cannot be overridden by an allow.
+PROXY_ROUTINE_ALLOW = (
+    [f"Bash(rtk proxy git {v}:*)" for v in ("diff", "show", "log", "status", "rev-parse", "rev-list", "ls-files", "merge-base")]
+    + [f"Bash(rtk proxy git {v}:*)" for v in ("ls-tree", "describe")]
+    + ["Bash(rtk proxy grep:*)"]
+    + [f"Bash(rtk proxy cargo {v}:*)" for v in ("test", "build", "check", "clippy", "fmt", "nextest run")]
+)
+# Wrapped twins of the bare asks that write files, run helpers or reach outside the repository (SPE-114 parity gaps).
+# git accepts any unique prefix of a long option, so the prefixes below are the shortest that stay unambiguous (--ou*, --ext*, --tex*,
+# --upl*); --no-index has no shorter unique spelling. A wrapped merge is never allowed by a wrapper rule: the pinned form is the plain command.
+PROXY_PARITY_ASKS = ["Bash(rtk proxy git*--ou*)", "Bash(rtk proxy git*--ext*)", "Bash(rtk proxy git*--no-index*)", "Bash(rtk proxy git fetch*--upl*)",
+                     "Bash(rtk proxy git*--tex*)", "Bash(rtk proxy gh pr merge*)"]
+# Every bare protected ask also asks when wrapped, so wrapping a release, publish, delete or force-push never lowers its protection.
+PROXY_TWIN_ASKS = None  # filled after ASK_BASH_RULES is defined
+# The only ask candidate-rollout may retire; any other ask stays until the owner removes it by hand.
+RETIRABLE_ASKS = ("Bash(rtk proxy *)",)
 READ_ONLY_ALLOW = re.compile(
-    r"Bash\((git (status|diff|log|show)|gh (pr|issue|run) (view|list|checks|diff|status)|ls|cat|pytest|python3 -m pytest)(:\*| \*)\)")
+    r"Bash\((git (status|diff|log|show)|gh (pr|issue|run) (view|list|checks|diff|status)|ls|cat|pytest|python3 -m pytest)(:\*| \*)\)"
+    r"|Bash\((rtk )?git (ls-tree|merge-base|describe):\*\)"
+    r"|Bash\(rtk proxy (git (diff|show|log|status|rev-parse|rev-list|ls-files|merge-base|ls-tree|describe)|grep|cargo (test|build|check|clippy|fmt|nextest run)):\*\)")
 
 ALTERNATIVES = {
     "documents": "share a redacted excerpt or a synthetic stand-in", "logs": "share a redacted excerpt with identifiers removed",
@@ -206,6 +228,9 @@ ASK_PATH_RULES = [f"{tool}({path})" for tool in ("Edit", "Write") for path in (
     "**/.claude/settings.json", "**/.claude/settings.local.json", "**/.claude/hooks/**", "**/.claude/plugins/**", "**/.mcp.json")]
 
 
+PROXY_TWIN_ASKS = [r.replace("Bash(", "Bash(rtk proxy ", 1) for r in ASK_BASH_RULES]
+
+
 def candidate(kind, asks_only=False):
     env = [
         "Source of truth: GitHub repositories owned by the owner; Jira for tickets; the workstation profile is " + kind + ".",
@@ -227,6 +252,22 @@ def candidate(kind, asks_only=False):
     if asks_only:  # canary shape: asks only; the owner's existing autoMode (or its absence) is left exactly as it is
         cand.pop("autoMode")
     return cand
+
+
+def proxy_scoped_candidate():
+    """SPE-119: retire the broad `rtk proxy *` ask, keep every protected wrapped operation asking, allow routine wrapped work.
+
+    The scoped asks are read from the repository baseline (the SPE-114 rules and their tests), not retyped here.
+    """
+    base = json.loads((pathlib.Path(__file__).resolve().parent.parent / ".claude/settings.json").read_text())["permissions"]["ask"]
+    gh_api = {f"Bash({p}gh api {f}*)" for p in ("", "rtk ") for f in ("-X DELETE", "--method DELETE")}
+    asks = [r for r in base if "rtk proxy" in r or r in gh_api]
+    asks += [r for r in PROXY_PARITY_ASKS + PROXY_TWIN_ASKS if r not in asks]
+    return {
+        "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Retires the broad Bash(rtk proxy *) ask "
+                       "(an ask cannot be overridden by a narrower allow) and replaces it with scoped asks plus scoped allows for routine wrapped work. No autoMode change.",
+        "permissions": {"ask": asks, "allow": PROXY_ROUTINE_ALLOW + ROUTINE_BARE_ALLOW, "retire_ask": list(RETIRABLE_ASKS), "deny": []},
+    }
 
 
 def lint_settings(cfg):
@@ -286,6 +327,7 @@ def main(argv=None):
     r.add_argument("--kind", required=True, choices=("personal", "corporate"))
     r.add_argument("--out")
     r.add_argument("--asks-only", action="store_true", help="omit the autoMode block (minimal canary candidate)")
+    r.add_argument("--proxy-scoped", action="store_true", help="SPE-119 candidate: retire the broad rtk proxy ask, add scoped asks and allows")
     lint = sub.add_parser("lint-settings")
     lint.add_argument("file")
     a = ap.parse_args(argv)
@@ -302,7 +344,7 @@ def main(argv=None):
             print(json.dumps(out, indent=1))
             return {"ALLOW": 0, "ASK": 1, "DENY": 2}[out["verdict"]]
         if a.cmd == "render-settings":
-            text = json.dumps(candidate(a.kind, asks_only=a.asks_only), indent=2) + "\n"
+            text = json.dumps(proxy_scoped_candidate() if a.proxy_scoped else candidate(a.kind, asks_only=a.asks_only), indent=2) + "\n"
             if a.out:
                 with open(safe_out(a.out), "x") as fh:  # exclusive create: never overwrites an existing file
                     fh.write(text)
