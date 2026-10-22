@@ -20,6 +20,7 @@ written after the current run started (every SessionStart and UserPromptSubmit o
 """
 import argparse
 import contextlib
+import copy
 import fcntl
 import hashlib
 import json
@@ -96,6 +97,136 @@ SECRET_WORDS = re.compile(r"(?i)(ghp_|gho_|ghs_|github_pat|sk-|xox[abprs]-|akia|
 SEGMENT_SPLIT = re.compile(r"[-_.: @#+/]")
 
 
+# ---- boundary validation: the ONLY place a value that came from outside is type-tested, indexed or iterated ----------------------
+# Everything external (hook payload, config file, checkpoint file, state file, pending deliveries) is checked against a declarative schema
+# BEFORE any other code touches it. Schemas: type, enum, bounds, required keys, closed key sets, nesting. No coercion, no repair.
+def v_str(mx=200, rx=None):
+    return ("str", mx, rx)
+
+
+def v_enum(allowed):
+    return ("enum", frozenset(allowed))
+
+
+def v_int(lo, hi):
+    return ("int", lo, hi)
+
+
+def v_bool():
+    return ("bool",)
+
+
+def v_num():
+    return ("num",)
+
+
+def v_opt(inner):
+    return ("opt", inner)
+
+
+def v_list(item, mx, mn=0):
+    return ("list", item, mx, mn)
+
+
+def v_map(key, item, mx):
+    return ("map", key, item, mx)
+
+
+def v_obj(fields, required=(), closed=True):
+    return ("obj", fields, frozenset(required), closed)
+
+
+def conforms(schema, value):
+    """True when value matches schema. Never raises; bool is never an int, NaN and infinity are never numbers. Nesting depth is the schema's."""
+    try:
+        return _conforms(schema, value)
+    except Exception:  # noqa: BLE001 - a validator that could raise would be a boundary hole
+        return False
+
+
+def _conforms(schema, v):
+    kind = schema[0]
+    if kind == "str":
+        return type(v) is str and len(v) <= schema[1] and (schema[2] is None or schema[2].fullmatch(v) is not None)
+    if kind == "enum":
+        return type(v) is str and v in schema[1]
+    if kind == "int":
+        return type(v) is int and schema[1] <= v <= schema[2]
+    if kind == "bool":
+        return type(v) is bool
+    if kind == "num":
+        return type(v) in (int, float) and math.isfinite(v)
+    if kind == "opt":
+        return v is None or _conforms(schema[1], v)
+    if kind == "list":
+        return type(v) is list and schema[3] <= len(v) <= schema[2] and all(_conforms(schema[1], x) for x in v)
+    if kind == "map":
+        return type(v) is dict and len(v) <= schema[3] and all(_conforms(schema[1], k) and _conforms(schema[2], x) for k, x in v.items())
+    if kind == "obj":
+        fields, required, closed = schema[1], schema[2], schema[3]
+        return (type(v) is dict and required <= set(v) and (not closed or set(v) <= set(fields))
+                and all(_conforms(fields[k], x) for k, x in v.items() if k in fields))
+    return False
+
+
+MISSING = object()
+
+
+def overlay(default, schema, user, bad, path=""):
+    """Config merge: `default` (a nested dict of leaves) overlaid with `user`, leaf by leaf. A leaf that does not conform, or a subtree of the
+    wrong container type, takes the default and is recorded in `bad`; unknown keys are recorded too (never silently dropped)."""
+    if type(schema) is dict:
+        if type(user) is not dict:
+            if user is not MISSING:
+                bad.append(path or "root")
+            user = {}
+        bad.extend(f"{path}.{k}".lstrip(".") for k in user if k not in schema)
+        return {k: overlay(default[k], schema[k], user.get(k, MISSING), bad, f"{path}.{k}".lstrip(".")) for k in default}
+    if user is not MISSING and conforms(schema, user):
+        return copy.deepcopy(user)
+    if user is not MISSING:
+        bad.append(path)
+    return copy.deepcopy(default)
+
+
+EVENT_SCHEMA = v_obj({"hook_event_name": v_str(64), "session_id": v_str(80, SAFE_ID), "cwd": v_opt(v_str(100_000)), "source": v_opt(v_str(100)),
+                      "reason": v_opt(v_str(100)), "notification_type": v_opt(v_str(100)), "error_type": v_opt(v_str(100)), "stop_hook_active": v_opt(v_bool())},
+                     required=("hook_event_name", "session_id"), closed=False)  # unknown payload keys are ignored, consumed ones must conform
+CHECKPOINT_SCHEMA = v_obj({"schema": v_int(1, 1), "state": v_enum(CHECKPOINT_STATES), "updated": v_opt(v_str(40)), "task": v_opt(v_str(200)),
+                           "repo": v_opt(v_str(200)), "ticket": v_opt(v_str(200)), "workflow_state": v_opt(v_str(200)), "session_id": v_opt(v_str(80)),
+                           "pr": v_opt(v_obj({"number": v_int(1, 10**7 - 1), "head": v_opt(v_str(100))}, required=("number",))),
+                           "blocker": v_opt(v_obj({"owner": v_opt(v_str(64)), "resume_trigger": v_opt(v_str(64))})),
+                           "verified": v_opt(v_obj({"by": v_str(100), "evidence": v_str(200)}, required=("by", "evidence")))}, required=("schema", "state"))
+_OPT_STR = v_opt(v_str(200))
+FIELDS_SCHEMA = v_obj({"state": v_str(200), "repo": _OPT_STR, "ticket": _OPT_STR, "pr": v_opt(v_int(0, 10**9)), "blocker_owner": _OPT_STR,
+                       "resume_trigger": _OPT_STR, "kind": _OPT_STR}, required=("state",))
+BACKEND_SCHEMA = v_obj({"status": v_enum(DELIVERY_STATUSES), "attempts": v_int(0, 100), "next_at": v_num(), "code": v_opt(v_str(40))},
+                       required=("status", "attempts", "next_at"))
+PENDING_SCHEMA = v_obj({"key": v_str(64, re.compile(r".+")), "cycle": v_int(0, 10**9), "created": v_int(-10**12, 10**12), "fields": FIELDS_SCHEMA,
+                        "backends": v_map(v_enum(BACKEND_NAMES), BACKEND_SCHEMA, 8)}, required=("key", "cycle", "created", "fields", "backends"))
+TASK_SCHEMA = v_obj({"task": v_str(100), "repo": v_str(100), "ticket": v_str(100), "pr": v_int(0, 10**9), "head": v_str(100), "workflow_state": v_str(100),
+                     "blocker_owner": v_str(100), "resume_trigger": v_str(100), "verified": v_bool()})
+HISTORY_SCHEMA = v_obj({"t": v_int(-10**12, 10**12), "from": v_enum(STATES), "to": v_enum(STATES), "why": v_str(100)}, required=("t", "from", "to", "why"))
+RECORD_SCHEMA = v_obj({"v": v_int(3, 3), "session_id": v_str(80, SAFE_ID), "state": v_enum(STATES), "state_since": v_num(), "last_seen": v_num(),
+                       "run_started": v_num(), "cp_floor": v_num(), "cycle": v_int(0, 10**9), "agent_done": v_int(0, 10**9), "dropped": v_int(0, 10**9),
+                       "task": TASK_SCHEMA, "history": v_list(HISTORY_SCHEMA, HISTORY_CAP),
+                       "notified": v_map(v_str(64), v_list(v_int(-10**12, 10**12), 2, 2), NOTIFIED_CAP), "pending": v_list(PENDING_SCHEMA, PENDING_CAP),
+                       "ended_reason": v_opt(v_str(30)), "cwd": v_str(MAX_CWD), "corporate": v_bool(), "repo_label": v_opt(v_str(64))},
+                      required=("v", "session_id", "state", "state_since", "last_seen", "run_started", "cp_floor", "cycle", "agent_done", "dropped", "task",
+                                "history", "notified", "pending", "ended_reason", "cwd", "corporate"))
+# Config: same shape as DEFAULT_CONFIG, one leaf schema per default value.
+_S200 = v_str(200)
+CONFIG_SCHEMA = {
+    "profile": v_enum(("personal", "corporate")), "corporate_markers": v_list(v_str(100, re.compile(r".+")), 100),
+    "known_repos": v_list(v_str(64, SAFE_REPO), 200), "stale_after_seconds": v_int(60, 10**7),
+    "notify": {"agent_completed": v_bool(), "idle": v_bool(), "session_ended": v_bool()},
+    "retry": {"max_attempts": v_int(1, 100), "base_seconds": v_int(1, 86400), "max_seconds": v_int(1, 86400)},
+    "backends": {"macos": {"enabled": v_bool()},
+                 "ntfy": {"enabled": v_bool(), "approved_destination": _S200, "server": _S200, "topic_env": _S200, "topic_file": _S200, "token_env": _S200, "token_file": _S200},
+                 "pushover": {"enabled": v_bool(), "approved_destination": _S200, "token_env": _S200, "token_file": _S200, "user_env": _S200, "user_file": _S200}},
+}
+
+
 def secret_shaped(value):
     """Token-shaped content: a known credential prefix or word, a very long unbroken run, or a long mixed letter-and-digit segment.
 
@@ -141,60 +272,37 @@ def clean_repo(value, markers=()):
     return None if any(m and m.lower() in low for m in markers) else value
 
 
-def is_member(value, allowed):
-    """Enum membership that cannot raise: lists and dicts are unhashable and would TypeError a bare `in` on a set or dict."""
-    return isinstance(value, str) and value in allowed
-
-
 def sanitize_fields(fields, cfg):
-    """Rebuild every outbound field from a strict validator or a fixed enum. None when the state itself is not a known state.
+    """Rebuild every outbound field from a strict validator or a fixed enum. None when `fields` is not a well-formed field set.
 
     Used when a notification is queued AND again at every delivery attempt, so nothing read back from disk is trusted.
     Repository and ticket labels pass the same secret and corporate-marker checks as every other label, with the markers of the
     config in force NOW; a repository must also be listed in `known_repos`. Free text has no field to travel in.
     """
-    if not isinstance(fields, dict) or not is_member(fields.get("state"), STATES):
+    if not conforms(FIELDS_SCHEMA, fields) or fields["state"] not in STATES:
         return None
-    markers = [m for m in cfg.get("corporate_markers", []) if isinstance(m, str)]
-    known = {r for r in cfg.get("known_repos", []) if isinstance(r, str)}
+    markers, known = cfg["corporate_markers"], set(cfg["known_repos"])
     repo = clean_repo(fields.get("repo"), markers)
     out = {"state": fields["state"], "repo": repo if repo in known else "unlisted"}
     ticket = clean_ticket(fields.get("ticket"), markers)
     if ticket:
         out["ticket"] = ticket
-    pr = fields.get("pr")
-    if type(pr) is int and 0 < pr < 10**7:
-        out["pr"] = pr
-    if is_member(fields.get("blocker_owner"), BLOCKER_OWNERS):
+    if fields.get("pr"):
+        out["pr"] = fields["pr"]
+    if fields.get("blocker_owner") in BLOCKER_OWNERS:
         out["blocker_owner"] = fields["blocker_owner"]
-    if is_member(fields.get("resume_trigger"), RESUME_TRIGGERS):
+    if fields.get("resume_trigger") in RESUME_TRIGGERS:
         out["resume_trigger"] = fields["resume_trigger"]
-    if is_member(fields.get("kind"), ALLOWED_KINDS):
+    if fields.get("kind") in ALLOWED_KINDS:
         out["kind"] = fields["kind"]
     return out
 
 
-def clean_sid(value):
-    if isinstance(value, str) and SAFE_ID.fullmatch(value):
-        return value
-    return None
-
-
-def clean_pr(value):
-    if isinstance(value, dict):
-        n, head = value.get("number"), value.get("head")
-    else:
-        n, head = value, None
-    n = n if type(n) is int and 0 < n < 10**7 else None
-    head = head if isinstance(head, str) and HEX_HEAD.fullmatch(head) else None
-    return n, head
-
-
 def is_corporate_path(cwd, cfg):
-    if cfg.get("profile") == "corporate":
+    if cfg["profile"] == "corporate":
         return True
-    low = str(cwd or "").lower()
-    return any(m and m.lower() in low for m in cfg.get("corporate_markers", []) if isinstance(m, str))
+    low = (cwd or "").lower()
+    return any(m.lower() in low for m in cfg["corporate_markers"])
 
 
 # ---- files ---------------------------------------------------------------------------------------------------------------------
@@ -305,43 +413,22 @@ def log_line(sdir, text):
 
 
 def load_config(path=None):
-    """Merge the owner's config over the defaults. A missing or invalid file means 'everything off'."""
-    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    """The owner's config over the defaults, leaf by leaf through CONFIG_SCHEMA. Returns (config, problem). A missing or invalid file means
+    everything off; an invalid leaf takes its default; an invalid `profile` or `corporate_markers` makes the profile corporate (stricter)."""
     raw, problem = read_regular(path or config_path(), 64 * 1024)
     if raw is None:
-        return cfg, problem
+        return copy.deepcopy(DEFAULT_CONFIG), problem
     try:
-        user = json.loads(raw.decode("utf-8"))
-        if not isinstance(user, dict):
-            raise ValueError
-    except ValueError:
+        user = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+    except (ValueError, RecursionError):
+        return copy.deepcopy(DEFAULT_CONFIG), "invalid-json"
+    bad = []
+    cfg = overlay(DEFAULT_CONFIG, CONFIG_SCHEMA, user if type(user) is dict else MISSING, bad)
+    if type(user) is not dict:
         return cfg, "invalid-json"
-    for key in ("profile", "corporate_markers", "known_repos", "stale_after_seconds"):
-        if key in user:
-            cfg[key] = user[key]
-    for key in ("notify", "retry"):
-        if isinstance(user.get(key), dict):
-            cfg[key].update({k: v for k, v in user[key].items() if k in cfg[key]})
-    for name, body in (user.get("backends") or {}).items():
-        if name in cfg["backends"] and isinstance(body, dict):
-            cfg["backends"][name].update({k: v for k, v in body.items() if k in cfg["backends"][name]})
-    if cfg["profile"] not in ("personal", "corporate"):
-        cfg["profile"] = "corporate"  # unknown profile fails towards the stricter one
-    cfg["corporate_markers"] = [m for m in cfg["corporate_markers"] if isinstance(m, str) and m] if isinstance(cfg["corporate_markers"], list) else []
-    for key, default in DEFAULT_CONFIG["notify"].items():
-        if type(cfg["notify"][key]) is not bool:
-            cfg["notify"][key] = default
-    for key, default in DEFAULT_CONFIG["retry"].items():
-        if type(cfg["retry"][key]) is not int or not 1 <= cfg["retry"][key] <= (100 if key == "max_attempts" else 86400):
-            cfg["retry"][key] = default
-    for name, body in cfg["backends"].items():
-        for key, default in DEFAULT_CONFIG["backends"][name].items():
-            if type(body[key]) is not type(default):
-                body[key] = default  # a wrongly typed value falls back to the safe default (off / empty), never raises later
-    cfg["known_repos"] = [r for r in cfg["known_repos"] if isinstance(r, str) and SAFE_REPO.fullmatch(r)] if isinstance(cfg["known_repos"], list) else []
-    if type(cfg["stale_after_seconds"]) is not int or cfg["stale_after_seconds"] < 60:
-        cfg["stale_after_seconds"] = DEFAULT_CONFIG["stale_after_seconds"]
-    return cfg, None
+    if "profile" in bad or "corporate_markers" in bad:
+        cfg["profile"] = "corporate"
+    return cfg, (f"invalid:{','.join(bad[:5])}"[:100] if bad else None)
 
 
 # ---- checkpoint: the only source of task identity, blocker and completion ----------------------------------------------------
@@ -378,44 +465,24 @@ def read_checkpoint(cwd, sid, markers):
         return None, 0.0
     try:
         d = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
-        cp = parse_checkpoint(d, sid, markers)
-    except (ValueError, TypeError, AttributeError):
-        return None, 0.0  # a malformed checkpoint is absent, never an exception that aborts event handling
-    return (cp, mtime) if cp else (None, 0.0)
-
-
-def parse_checkpoint(d, sid, markers):
-    """The sanitised checkpoint, or None when it or any field it carries has the wrong type. Every consumed field is type-checked first."""
-    if not isinstance(d, dict) or d.get("schema") != 1 or not is_member(d.get("state"), CHECKPOINT_STATES):
-        return None
-    if d.get("session_id") is not None and d.get("session_id") != sid:
-        return None
-    for key in ("blocker", "verified"):
-        if d.get(key) is not None and not isinstance(d.get(key), dict):
-            return None
-    if d.get("pr") is not None and not isinstance(d.get("pr"), (int, dict)):
-        return None
-    blocker, verified = d.get("blocker") or {}, d.get("verified") or {}
-    if any(blocker.get(k) is not None and not isinstance(blocker.get(k), str) for k in ("owner", "resume_trigger")):
-        return None
-    if any(verified.get(k) is not None and not isinstance(verified.get(k), str) for k in ("by", "evidence")):
-        return None
-    if any(d.get(k) is not None and not isinstance(d.get(k), str) for k in ("task", "repo", "ticket", "workflow_state")):
-        return None
-    pr, head = clean_pr(d.get("pr"))
+    except (ValueError, RecursionError):
+        return None, 0.0
+    if not conforms(CHECKPOINT_SCHEMA, d) or d.get("session_id") not in (None, sid):
+        return None, 0.0  # any wrong type, unknown key or foreign session anywhere: the whole checkpoint is absent
+    pr, blocker, verified = d.get("pr") or {}, d.get("blocker") or {}, d.get("verified") or {}
+    head = pr.get("head")
     ver_by = clean_text(verified.get("by"), 40, markers)
     ver_ev = verified.get("evidence")
-    ver_ev = ver_ev if isinstance(ver_ev, str) and EVIDENCE.fullmatch(ver_ev) and not SECRET_WORDS.search(ver_ev) else None  # a reference; never transmitted
-    owner = blocker.get("owner")
-    trigger = blocker.get("resume_trigger")
+    ver_ev = ver_ev if ver_ev is not None and EVIDENCE.fullmatch(ver_ev) and not SECRET_WORDS.search(ver_ev) else None  # a reference; never transmitted
+    owner, trigger = blocker.get("owner"), blocker.get("resume_trigger")
     return {
         "state": d["state"], "task": clean_text(d.get("task"), 64, markers), "repo": clean_repo(d.get("repo"), markers),
-        "ticket": clean_ticket(d.get("ticket"), markers), "pr": pr, "head": head or None,
+        "ticket": clean_ticket(d.get("ticket"), markers), "pr": pr.get("number"), "head": head if head and HEX_HEAD.fullmatch(head) else None,
         "workflow_state": clean_text(d.get("workflow_state"), 48, markers),
         "blocker_owner": owner if owner in BLOCKER_OWNERS else ("other" if owner else None),
         "resume_trigger": trigger if trigger in RESUME_TRIGGERS else None,
         "verified": bool(ver_by and ver_ev),
-    }
+    }, mtime
 
 
 def ticket_from_environment():
@@ -424,66 +491,9 @@ def ticket_from_environment():
 
 
 # ---- records -------------------------------------------------------------------------------------------------------------------
-TASK_TYPES = {"task": str, "repo": str, "ticket": str, "pr": int, "head": str, "workflow_state": str, "blocker_owner": str,
-              "resume_trigger": str, "verified": bool}
-
-
 def new_record(sid, now):
     return {"v": 3, "session_id": sid, "state": "IDLE", "state_since": now, "last_seen": now, "cycle": 0, "run_started": now, "cp_floor": 0, "agent_done": 0,
             "task": {}, "history": [], "notified": {}, "pending": [], "ended_reason": None, "dropped": 0, "cwd": "", "corporate": False}
-
-
-def is_num(x):
-    """A real, finite number. bool is an int subclass and NaN/inf survive json, so neither may stand in for a timestamp."""
-    return type(x) in (int, float) and math.isfinite(x)
-
-
-def short_str(x, limit):
-    return isinstance(x, str) and len(x) <= limit
-
-
-def valid_backend(n, b):
-    return (n in BACKEND_NAMES and isinstance(b, dict) and b.get("status") in DELIVERY_STATUSES and type(b.get("attempts")) is int and 0 <= b["attempts"] <= 100
-            and is_num(b.get("next_at")) and (b.get("code") is None or short_str(b.get("code"), 40)))
-
-
-FIELD_TYPES = {"state": str, "repo": str, "ticket": str, "pr": int, "blocker_owner": str, "resume_trigger": str, "kind": str}
-
-
-def valid_fields(f):
-    """Pending fields: only known keys, each of the right type and size. Enum VALUES are checked (and dropped) by sanitize_fields at delivery."""
-    return isinstance(f, dict) and all(k in FIELD_TYPES and type(v) is FIELD_TYPES[k] and (type(v) is not str or len(v) <= 200) for k, v in f.items())
-
-
-def valid_pending(e):
-    return (isinstance(e, dict) and short_str(e.get("key"), 64) and e["key"] and type(e.get("cycle")) is int and e["cycle"] >= 0
-            and type(e.get("created")) is int and valid_fields(e.get("fields")) and isinstance(e.get("backends"), dict) and len(e["backends"]) <= 8
-            and all(valid_backend(n, b) for n, b in e["backends"].items()))
-
-
-def valid_history(h):
-    return (isinstance(h, dict) and type(h.get("t")) is int and h.get("from") in STATES and h.get("to") in STATES and short_str(h.get("why"), 100))
-
-
-def valid_task(t):
-    return isinstance(t, dict) and all(k in TASK_TYPES and type(v) is TASK_TYPES[k] and (type(v) is not str or len(v) <= 100) for k, v in t.items())
-
-
-def valid_record(d, sid):
-    """Strict structure, fail-closed: any wrong type, bool-as-number, NaN/inf or unknown shape makes the whole record untrusted."""
-    try:
-        return (isinstance(d, dict) and d.get("v") == 3 and d.get("session_id") == sid and d.get("state") in STATES
-                and type(d.get("cycle")) is int and d["cycle"] >= 0
-                and isinstance(d.get("history"), list) and len(d["history"]) <= HISTORY_CAP and all(valid_history(h) for h in d["history"])
-                and isinstance(d.get("notified"), dict) and len(d["notified"]) <= NOTIFIED_CAP
-                and all(isinstance(k, str) and isinstance(v, list) and len(v) == 2 and all(type(x) is int for x in v) for k, v in d["notified"].items())
-                and isinstance(d.get("pending"), list) and len(d["pending"]) <= PENDING_CAP and all(valid_pending(e) for e in d["pending"])
-                and valid_task(d.get("task")) and short_str(d.get("cwd"), MAX_CWD) and type(d.get("corporate")) is bool
-                and all(is_num(d.get(k)) for k in ("last_seen", "state_since", "run_started", "cp_floor"))
-                and type(d.get("agent_done")) is int and type(d.get("dropped")) is int
-                and (d.get("ended_reason") is None or short_str(d.get("ended_reason"), 30)) and (d.get("repo_label") is None or short_str(d.get("repo_label"), 64)))
-    except Exception:
-        return False
 
 
 def reject_constant(name):
@@ -501,9 +511,9 @@ def load_record(sdir, sid):
         return None, problem
     try:
         d = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None, "corrupt"
-    return (d, None) if valid_record(d, sid) else (None, "corrupt")
+    return (d, None) if conforms(RECORD_SCHEMA, d) and d["session_id"] == sid else (None, "corrupt")
 
 
 def save_record(sdir, rec):
@@ -722,6 +732,9 @@ class Engine:
         done = [e for e in rec["pending"] if all(b["status"] in TERMINAL for b in e["backends"].values())]
         for e in done:
             self.mark_notified(rec, e["key"], e["cycle"], now)
+        for e in done:
+            if any(b["status"] == "dropped" for b in e["backends"].values()):
+                rec["dropped"] += 1  # retries exhausted (or unusable): the notification is dropped and counted, never silently lost
         if done:
             rec["pending"] = [e for e in rec["pending"] if e not in done]
             changed = True
@@ -730,6 +743,8 @@ class Engine:
     def deliver_entry(self, rec, entry, now, budget_end, corporate):
         """One pending entry. Returns whether state changed, or None when the time budget ran out (caller stops)."""
         retry, changed = self.cfg["retry"], False
+        if not conforms(PENDING_SCHEMA, entry):
+            raise ValueError("pending entry does not conform")  # handled by the caller: dropped, counted, never delivered
         fields = sanitize_fields(entry["fields"], self.cfg)
         if fields is None:
             for b in entry["backends"].values():
@@ -774,11 +789,11 @@ class Engine:
         return changed
 
     # -- events
-    def handle(self, ev):
-        name = ev.get("hook_event_name") if isinstance(ev, dict) else None
-        sid = clean_sid(ev.get("session_id")) if isinstance(ev, dict) else None
-        if not isinstance(name, str) or not sid:
-            return "ignored"
+    def handle(self, raw):
+        if not conforms(EVENT_SCHEMA, raw):
+            return "ignored"  # not an object, or a consumed field has the wrong type/size: nothing is read from it, nothing changes
+        ev = raw
+        name, sid = ev["hook_event_name"], ev["session_id"]
         path = record_path(self.sdir, sid)
         try:
             with session_lock(path, sleep=self.sleep):
@@ -790,11 +805,11 @@ class Engine:
                 created = rec is None
                 rec = rec or new_record(sid, now)
                 before = json.dumps(rec, sort_keys=True)
-                cwd = ev.get("cwd") if isinstance(ev.get("cwd"), str) else None
+                cwd = ev.get("cwd")
                 if cwd and len(cwd) <= MAX_CWD:
                     rec["cwd"] = cwd  # whole path, never truncated: corporate markers are re-evaluated against it at every delivery
                 rec["corporate"] = bool(is_corporate_path(cwd, self.cfg)) or bool(rec["corporate"]) or bool(cwd and len(cwd) > MAX_CWD)  # unstorable path: fail closed
-                markers = self.cfg.get("corporate_markers", [])
+                markers = self.cfg["corporate_markers"]
                 cp, cp_mtime = read_checkpoint(cwd, sid, markers)
                 if cp is None and not rec["task"] and ticket_from_environment():
                     rec["task"].update({"ticket": ticket_from_environment()})
@@ -811,21 +826,22 @@ class Engine:
             log_line(self.sdir, f"lock-timeout event={name[:30]}")
             return "busy"
 
-    def apply(self, rec, name, ev, cp, cp_mtime, now, created):
+    def apply(self, rec, name, event, cp, cp_mtime, now, created):
+        """`event` is an EVENT_SCHEMA-conforming payload (validated in `handle`); `cp` is a sanitised checkpoint or None."""
         state = rec["state"]
         if name == "SessionStart":
-            source = str(ev.get("source") or "unknown")
+            source = event.get("source") or "unknown"
             # a resume restores the same run: no new cycle, so an identical block already announced is not announced again
             rec["run_started"] = now
             self.set_state(rec, "RUNNING", f"start:{source[:12]}", now, cp, notify=False, bump=source != "resume")
             return
         if name == "SessionEnd":
-            reason = str(ev.get("reason") or "other")
+            reason = event.get("reason") or "other"
             reason = reason if reason in ("clear", "resume", "logout", "prompt_input_exit", "other") else "other"
             rec["ended_reason"] = reason
             was = state
             self.set_state(rec, "SESSION_ENDED", f"end:{reason}", now, cp, notify=False, force=True)
-            if was == "RUNNING" and reason in END_NOTIFY_REASONS and self.cfg["notify"].get("session_ended", True):
+            if was == "RUNNING" and reason in END_NOTIFY_REASONS and self.cfg["notify"]["session_ended"]:
                 self.enqueue(rec, "SESSION_ENDED", f"end:{reason}", now, kind="ENDED")
             return
         if state == "SESSION_ENDED" and name != "UserPromptSubmit":
@@ -847,25 +863,25 @@ class Engine:
                 rec["history"] = (rec["history"] + [{"t": int(now), "from": rec["state"], "to": rec["state"], "why": name.lower()}])[-HISTORY_CAP:]
             return
         if name == "Notification":
-            ntype = str(ev.get("notification_type") or "")
+            ntype = event.get("notification_type") or ""
             block = {"blocker_owner": "owner", "resume_trigger": "owner_decision" if ntype != "permission_prompt" else "owner_approval"}
             if ntype in OWNER_BLOCK_TYPES or (ntype == "idle_prompt" and state in ("RUNNING", "IDLE")):
                 self.set_state(rec, "BLOCKED_OWNER", ntype[:30], now, cp, notify=True, extra=block)
             elif ntype == "agent_completed":
                 rec["agent_done"] += 1
                 self.heartbeat(rec, now)
-                if self.cfg["notify"].get("agent_completed"):
+                if self.cfg["notify"]["agent_completed"]:
                     self.enqueue(rec, "RUNNING", "agent_completed", now, kind="AGENT", extra_key=str(rec["agent_done"]))
             else:
                 self.heartbeat(rec, now)
             return
         if name == "StopFailure":
-            kind = str(ev.get("error_type") or "unknown")
+            kind = event.get("error_type") or "unknown"
             kind = kind if kind in STOP_FAILURE_KINDS else "unknown"
             self.set_state(rec, "FAILED", f"stop_failure:{kind}", now, cp, notify=True)
             return
         if name == "Stop":
-            if ev.get("stop_hook_active") is True:
+            if event.get("stop_hook_active") is True:
                 self.heartbeat(rec, now)
                 return
             target, reason = "IDLE", "stop"
@@ -1042,7 +1058,7 @@ def cmd_checkpoint(args):
 
 
 def cmd_render_config(args):
-    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
     cfg["profile"] = args.profile
     cfg["_note"] = ("Everything is off until a backend sets enabled to true. Credentials are environment-variable NAMES or file paths, never values. "
                     "Remote backends also need approved_destination equal to the server host, and are refused on the corporate profile. "
