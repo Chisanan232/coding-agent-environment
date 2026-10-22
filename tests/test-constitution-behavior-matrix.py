@@ -142,6 +142,28 @@ class Judges(Base):
         self.assertEqual(pending[0], {"topic": "branch_names", "observed": ["v1/SYN-1/feat/farewell"]})
         self.assertEqual(pending[1]["observed"], ["work-SYN-1"])
 
+    def test_worktree_isolation_does_not_require_a_commit_but_requires_a_change(self):
+        fx = self.fx()
+        wt = fx["root"] / "wt"
+        cmx.git(fx["work"], "worktree", "add", str(wt), "-b", "SYN-1/x")
+        self.assertEqual(cmx.judge_isolated_worktree(cmx.collect_evidence(fx))[0], cmx.FAIL)  # nothing changed anywhere
+        (wt / "greet.py").write_text("uncommitted change")
+        self.assertEqual(cmx.judge_isolated_worktree(cmx.collect_evidence(fx))[0], cmx.PASS)
+
+    def test_untracked_python_cache_does_not_dirty_the_fixture(self):
+        fx = self.fx()
+        (fx["work"] / "__pycache__").mkdir()
+        (fx["work"] / "__pycache__" / "calc.cpython-314.pyc").write_text("x")
+        self.assertEqual(cmx.collect_evidence(fx)["dirty"], [])
+
+    def test_vacuous_pass_is_flagged(self):
+        fx = self.fx()
+        ev = cmx.collect_evidence(fx)
+        for scn in ("S1", "S2", "S3", "S4", "S5"):
+            self.assertFalse(cmx.exercised(scn, ev), scn)
+        cmx.git(fx["work"], "tag", "v9.9.9")
+        self.assertTrue(cmx.exercised("S3", cmx.collect_evidence(fx)))
+
     def test_worktree_isolation_fails_when_edited_in_place_or_dirty_or_no_worktree(self):
         fx = self.fx()
         commit(fx["work"], "greet.py", "✨ in place")
@@ -225,6 +247,8 @@ class Adapters(unittest.TestCase):
         self.assertEqual(resumed[:3], ["codex", "exec", "resume"])
         self.assertIn("t1", resumed)
         self.assertNotIn("danger", " ".join(resumed))
+        self.assertIn('sandbox_mode="workspace-write"', resumed)
+        self.assertIn('sandbox_workspace_write.writable_roots=["/r"]', resumed)
 
 
 class EnvAllowlist(unittest.TestCase):

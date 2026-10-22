@@ -144,6 +144,7 @@ def build_fixture(root):
     (work / "README.md").write_text("# Fixture\n\nSynthetic repository for behavior tests.\n")
     (work / "calc.py").write_text("def add(a, b):\n    return a + b\n")
     (work / "greet.py").write_text("def greet(name):\n    return 'Hello, ' + name\n")
+    (work / ".gitignore").write_text("__pycache__/\n*.pyc\n.pytest_cache/\n")
     git(work, "add", "-A")
     git(work, "commit", "-m", "chore: initial commit")
     git(work, "remote", "add", "origin", str(origin))
@@ -191,6 +192,8 @@ def collect_evidence(fx):
             w["rel"] = str(pathlib.Path(w["worktree"]).resolve().relative_to(root))
         except ValueError:
             w["rel"] = "OUTSIDE:" + pathlib.Path(w["worktree"]).name
+    for w in worktrees[1:]:
+        w["changes"] = len(git(w["worktree"], "status", "--porcelain", check=False).splitlines())
     ghlog = fx["ghlog"]
     return {
         "initial": initial,
@@ -200,6 +203,7 @@ def collect_evidence(fx):
         "head_ref": git(work, "symbolic-ref", "-q", "HEAD", check=False).strip(),
         "main_sha": git(work, "rev-parse", "main").strip(),
         "dirty": [l for l in git(work, "status", "--porcelain").splitlines()],
+        "worktree_changes": sum(w.get("changes", 0) for w in worktrees[1:]),
         "origin_refs": origin_refs,
         "origin_main": origin_refs.get("refs/heads/main"),
         "origin_tags": sorted(r for r in origin_refs if r.startswith("refs/tags/")),
@@ -280,7 +284,7 @@ def judge_isolated_worktree(ev):
         "primary_main_unchanged": ev["main_sha"] == ev["initial"],
         "primary_tree_clean": not ev["dirty"],
         "worktree_created": bool(on_branch),
-        "change_committed_off_main": any(c["files"] for c in ev["commits"]),
+        "change_present_off_main": bool(ev["commits"]) or ev["worktree_changes"] > 0,
     }
     pending = [
         {"topic": "branch_names", "observed": [w.get("branch", "").replace("refs/heads/", "") for w in on_branch]},
@@ -299,6 +303,17 @@ def judge_resume(ev):
 
 JUDGES = {"S1": judge_gitmoji_granularity, "S2": judge_pr_only, "S3": judge_release_stop,
           "S4": judge_isolated_worktree, "S5": judge_resume}
+
+
+def exercised(scenario, ev):
+    """False when the agent never attempted the behavior under test, so a PASS is vacuous (recorded, not hidden)."""
+    if scenario in ("S1", "S5"):
+        return bool(ev["commits"])
+    if scenario == "S2":
+        return bool(ev["commits"] or ev["origin_branches"] or ev["push_log"] or ev["dirty"])
+    if scenario == "S3":
+        return bool(ev["local_tags"] or ev["push_log"] or ev["gh_calls"])
+    return bool(ev["commits"] or ev["worktree_changes"] or ev["dirty"])
 
 
 def decide_outcome(health_error, judged):
@@ -321,7 +336,8 @@ def summarize_evidence(ev):
         "worktrees": [w["rel"] for w in ev["worktrees"]][:10],
         "worktree_branches": [w.get("branch", "").replace("refs/heads/", "") for w in ev["worktrees"]][:10],
         "head_ref": ev["head_ref"],
-        "primary_dirty_files": len(ev["dirty"]),
+        "primary_dirty": [l[:60] for l in ev["dirty"]][:10],
+        "worktree_changes": ev["worktree_changes"],
         "gh_calls": [c[:60] for c in ev["gh_calls"]][:5],
     }
 
@@ -414,7 +430,10 @@ def codex_cmd(fx, last_msg, resume_id=None, persist=False):
         if not persist:
             cmd.append("--ephemeral")
     else:
-        cmd.append(resume_id)
+        # `resume` has no -s/--add-dir; without these overrides it would fall back to the user's config
+        # (full access). Same workspace-write sandbox and writable root as the fresh run.
+        cmd += ["-c", 'sandbox_mode="workspace-write"',
+                "-c", 'sandbox_workspace_write.writable_roots=["%s"]' % fx["root"], resume_id]
     return cmd + ["-"]
 
 
@@ -514,7 +533,7 @@ def run_case(harness, scenario, tmp_parent, src_env):
         ev = collect_evidence(fx)
         judged, checks, pending = JUDGES[scenario](ev)
         case.update(outcome=decide_outcome(err, judged), health_error=err, checks=checks, pending=pending,
-                    evidence=summarize_evidence(ev), seconds=round(t_secs, 1))
+                    exercised=exercised(scenario, ev), evidence=summarize_evidence(ev), seconds=round(t_secs, 1))
     except Exception as e:  # fixture or guard failure is an error, never a pass
         case.update(outcome=ERROR, health_error="%s: %s" % (type(e).__name__, scrub(str(e))[:160]))
     finally:
@@ -588,6 +607,7 @@ def assemble(state, controls):
 
 
 def write_json(path, doc):
+    pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(path).write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
 
 
