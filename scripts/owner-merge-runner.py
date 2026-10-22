@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Structurally validated owner pull-request merge runner (SPE-118, Option A).
 
-  owner-merge-runner.py --repo OWNER/NAME --pr N --expect-head SHA40 --review-evidence PATH
-                        [--allowlist PATH] [--audit-log PATH] [--dry-run]
+  owner-merge-runner.py --repo OWNER/NAME --pr N --expect-head SHA40 --review-evidence PATH [--dry-run]
+
+The allowlist (~/.claude/owner-merge-runner-allowlist.json) and the audit log
+(~/.claude/audit/owner-merge-runner.jsonl) are fixed paths with no CLI override; only the module API
+(used by tests) can pass others. The allowlist must be owned by the current user, not a symlink, not
+group/world-writable, and outside any git worktree.
 
 Structured arguments only. Every input is validated by a strict regex before use, gh is started with
 fixed argv lists (shell=False), and the single mutating call is exactly:
@@ -21,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -45,8 +50,8 @@ SECRET_RE = re.compile(r"(gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,
 DENIAL_RE = re.compile(r"permission|denied|forbidden|not authori[sz]ed|HTTP 40[13]|must have|"
                        r"protected branch|required status|review is required|not allowed", re.I)
 DEFAULT_AUDIT = os.path.join(os.path.expanduser("~"), ".claude", "audit", "owner-merge-runner.jsonl")
-DEFAULT_ALLOWLIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                 "docs", "owner-merge-runner-allowlist.json")
+DEFAULT_ALLOWLIST = os.path.join(os.path.expanduser("~"), ".claude", "owner-merge-runner-allowlist.json")
+TRUSTED_ASSOC = {"OWNER", "MEMBER", "COLLABORATOR"}
 
 
 class Refused(Exception):
@@ -147,7 +152,39 @@ def validate_args(repo, pr, head):
         raise Refused(bad)
 
 
+def in_git_worktree(path):
+    d = os.path.dirname(os.path.realpath(path))
+    while True:
+        if os.path.lexists(os.path.join(d, ".git")):
+            return True
+        parent = os.path.dirname(d)
+        if parent == d:
+            return False
+        d = parent
+
+
+def check_allowlist_trust(path):
+    """Refuse an allowlist an agent could have written: symlink, foreign owner, loose mode, in a worktree."""
+    try:
+        st = os.lstat(path)
+        pst = os.lstat(os.path.dirname(os.path.abspath(path)))
+    except OSError:
+        raise Refused(["allowlist file missing or unparseable"])
+    bad = []
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        bad.append("allowlist is not a regular non-symlink file")
+    if st.st_uid != os.geteuid() or pst.st_uid != os.geteuid():
+        bad.append("allowlist or its directory is not owned by the current user")
+    if st.st_mode & 0o022 or pst.st_mode & 0o022:
+        bad.append("allowlist or its directory is group/world-writable")
+    if in_git_worktree(path):
+        bad.append("allowlist lives inside a git worktree")
+    if bad:
+        raise Refused(bad)
+
+
 def load_allowlist(path):
+    check_allowlist_trust(path)
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -250,8 +287,8 @@ def decide(p, repo, pr, head, me, allow):
         if not isinstance(who, str) or not isinstance(st, str):
             raise Refused(["review entry malformed"])
         if st in DECISIVE:
-            latest[who.lower()] = (st, ((r.get("commit") or {}).get("oid")))
-    if decision == "CHANGES_REQUESTED" or any(st == "CHANGES_REQUESTED" for st, _ in latest.values()):
+            latest[who.lower()] = (st, ((r.get("commit") or {}).get("oid")), r.get("authorAssociation"))
+    if decision == "CHANGES_REQUESTED" or any(v[0] == "CHANGES_REQUESTED" for v in latest.values()):
         bad.append("unresolved CHANGES_REQUESTED")
     checks, check_bad = summarize_checks(rollup)
     bad += check_bad
@@ -262,12 +299,17 @@ def decide(p, repo, pr, head, me, allow):
         pr_class = "B"
         if not BOT_BRANCH.match(branch) or cross:
             bad.append("bot PR lacks verified bot branch provenance")
-        if latest.get(me_l) != ("APPROVED", head):
+        if latest.get(me_l, (None, None))[:2] != ("APPROVED", head):
             bad.append("class B needs an APPROVED review by the authenticated user at the expected head")
     else:
         pr_class = "C"
-        if not any(who != a and st == "APPROVED" and oid == head for who, (st, oid) in latest.items()):
-            bad.append("class C needs an APPROVED review by a non-author at the expected head")
+        mine = latest.get(me_l, (None, None))[:2] == ("APPROVED", head)
+        trusted = any(who != a and st == "APPROVED" and oid == head and assoc in TRUSTED_ASSOC
+                      for who, (st, oid, assoc) in latest.items())
+        if cross and not mine:
+            bad.append("class C cross-repository PR needs an APPROVED review by the authenticated user at the expected head")
+        elif not trusted:
+            bad.append("class C needs an APPROVED review at the expected head by a non-author OWNER, MEMBER or COLLABORATOR")
     if bad:
         raise Refused(bad)
     return pr_class, checks
@@ -356,14 +398,12 @@ class _Parser(argparse.ArgumentParser):
         raise SystemExit(EXIT_USAGE)
 
 
-def main(argv=None, gh=None):
+def main(argv=None, gh=None, allowlist=None, audit=None):
     ap = _Parser(description="Guarded owner merge runner (merge commit only).", allow_abbrev=False)
     ap.add_argument("--repo", required=True)
     ap.add_argument("--pr", required=True)
     ap.add_argument("--expect-head", required=True)
     ap.add_argument("--review-evidence", required=True)
-    ap.add_argument("--allowlist", default=DEFAULT_ALLOWLIST)
-    ap.add_argument("--audit-log", default=DEFAULT_AUDIT)
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
     if gh is None:
@@ -372,7 +412,8 @@ def main(argv=None, gh=None):
         except RuntimeError as e:
             sys.stderr.write(f"error: {e}\n")
             return EXIT_ERROR
-    code, rec = run(a.repo, a.pr, a.expect_head, a.review_evidence, a.allowlist, a.audit_log, a.dry_run, gh)
+    code, rec = run(a.repo, a.pr, a.expect_head, a.review_evidence,
+                    allowlist or DEFAULT_ALLOWLIST, audit or DEFAULT_AUDIT, a.dry_run, gh)
     print(json.dumps({k: rec[k] for k in ("repo", "pr", "class", "decision", "outcome", "reasons")}))
     return code
 

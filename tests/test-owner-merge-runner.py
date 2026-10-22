@@ -125,23 +125,23 @@ class HappyPath(Base):
     def test_class_b_bot_needs_owner_approval_at_head(self):
         pr = base_pr(author={"login": "app/dependabot"}, headRefName="dependabot/npm/x")
         self.assertRefused(FakeGh(pr), "class B needs")
-        pr["reviews"] = [{"author": {"login": ME}, "state": "APPROVED", "commit": {"oid": HEAD}}]
+        pr["reviews"] = [{"author": {"login": ME}, "state": "APPROVED", "authorAssociation": "MEMBER", "commit": {"oid": HEAD}}]
         code, rec = self.go(FakeGh(pr))
         self.assertEqual((code, rec["class"]), (omr.EXIT_OK, "B"))
 
     def test_class_b_requires_bot_branch(self):
         pr = base_pr(author={"login": "dependabot"}, headRefName="feature/x",
-                     reviews=[{"author": {"login": ME}, "state": "APPROVED", "commit": {"oid": HEAD}}])
+                     reviews=[{"author": {"login": ME}, "state": "APPROVED", "authorAssociation": "MEMBER", "commit": {"oid": HEAD}}])
         self.assertRefused(FakeGh(pr), "provenance")
 
     def test_class_c_needs_nonauthor_approval_at_head(self):
         pr = base_pr(author={"login": "someone"})
         self.assertRefused(FakeGh(pr), "class C needs")
-        pr["reviews"] = [{"author": {"login": "someone"}, "state": "APPROVED", "commit": {"oid": HEAD}}]
+        pr["reviews"] = [{"author": {"login": "someone"}, "state": "APPROVED", "authorAssociation": "MEMBER", "commit": {"oid": HEAD}}]
         self.assertRefused(FakeGh(pr), "class C needs")  # self-approval does not count
-        pr["reviews"] = [{"author": {"login": "rev"}, "state": "APPROVED", "commit": {"oid": OTHER}}]
+        pr["reviews"] = [{"author": {"login": "rev"}, "state": "APPROVED", "authorAssociation": "MEMBER", "commit": {"oid": OTHER}}]
         self.assertRefused(FakeGh(pr), "class C needs")  # stale approval
-        pr["reviews"] = [{"author": {"login": "rev"}, "state": "APPROVED", "commit": {"oid": HEAD}}]
+        pr["reviews"] = [{"author": {"login": "rev"}, "state": "APPROVED", "authorAssociation": "MEMBER", "commit": {"oid": HEAD}}]
         code, rec = self.go(FakeGh(pr))
         self.assertEqual((code, rec["class"]), (omr.EXIT_OK, "C"))
 
@@ -183,7 +183,7 @@ class Refusals(Base):
 
     def test_changes_requested_superseded_by_later_approval_is_not_blocking(self):
         rv = [{"author": {"login": "rev"}, "state": "CHANGES_REQUESTED", "commit": {"oid": HEAD}},
-              {"author": {"login": "rev"}, "state": "APPROVED", "commit": {"oid": HEAD}}]
+              {"author": {"login": "rev"}, "state": "APPROVED", "authorAssociation": "MEMBER", "commit": {"oid": HEAD}}]
         code, _ = self.go(FakeGh(base_pr(reviews=rv)))
         self.assertEqual(code, omr.EXIT_OK)
 
@@ -239,6 +239,73 @@ class Refusals(Base):
                 gh = FakeGh()
                 code, _ = self.go(gh, **kw)
                 self.assertEqual((code, gh.calls), (omr.EXIT_REFUSED, []), (meta, kw))
+
+
+class AllowlistTrust(Base):
+    def test_shipped_example_is_never_trusted_by_default_path(self):
+        ex = ROOT / "docs/examples/owner-merge-runner-allowlist.example.json"
+        self.assertTrue(ex.exists())
+        self.assertNotEqual(os.path.realpath(omr.DEFAULT_ALLOWLIST), os.path.realpath(ex))
+        self.assertRefused(FakeGh(), "git worktree", allow=ex)  # the repo copy is refused even if pointed at
+
+    def test_symlink_refused(self):
+        link = pathlib.Path(self.tmp.name) / "link.json"
+        link.symlink_to(self.allow)
+        self.assertRefused(FakeGh(), "non-symlink", allow=link)
+
+    def test_group_or_world_writable_file_or_dir_refused(self):
+        for mode in (0o664, 0o666, 0o646):
+            os.chmod(self.allow, mode)
+            self.assertRefused(FakeGh(), "writable")
+        os.chmod(self.allow, 0o644)
+        os.chmod(self.tmp.name, 0o777)
+        try:
+            self.assertRefused(FakeGh(), "writable")
+        finally:
+            os.chmod(self.tmp.name, 0o700)
+
+    def test_inside_git_worktree_refused(self):
+        wt = pathlib.Path(self.tmp.name) / "wt"
+        wt.mkdir()
+        (wt / ".git").write_text("gitdir: /nowhere")
+        f = wt / "allow.json"
+        f.write_text(json.dumps({"repos": [REPO]}))
+        self.assertRefused(FakeGh(), "git worktree", allow=f)
+
+    def test_foreign_owner_refused(self):
+        real = os.geteuid
+        omr.os.geteuid = lambda: real() + 1
+        try:
+            self.assertRefused(FakeGh(), "not owned")
+        finally:
+            omr.os.geteuid = real
+
+    def test_trusted_file_is_accepted(self):
+        code, _ = self.go(FakeGh(), dry=True)
+        self.assertEqual(code, omr.EXIT_OK)
+
+
+class ClassCAssociation(Base):
+    def pr_with(self, assoc, **over):
+        return base_pr(author={"login": "someone"}, reviews=[
+            {"author": {"login": "rev"}, "state": "APPROVED", "authorAssociation": assoc, "commit": {"oid": HEAD}}], **over)
+
+    def test_untrusted_associations_refused(self):
+        for assoc in ("NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "MANNEQUIN", None):
+            self.assertRefused(FakeGh(self.pr_with(assoc)), "OWNER, MEMBER or COLLABORATOR")
+
+    def test_trusted_associations_accepted(self):
+        for assoc in ("OWNER", "MEMBER", "COLLABORATOR"):
+            code, _ = self.go(FakeGh(self.pr_with(assoc)))
+            self.assertEqual(code, omr.EXIT_OK, assoc)
+
+    def test_cross_repository_needs_authenticated_user_approval(self):
+        self.assertRefused(FakeGh(self.pr_with("OWNER", isCrossRepository=True)), "cross-repository")
+        pr = self.pr_with("OWNER", isCrossRepository=True)
+        pr["reviews"].append({"author": {"login": ME}, "state": "APPROVED", "authorAssociation": "OWNER",
+                              "commit": {"oid": HEAD}})
+        code, _ = self.go(FakeGh(pr))
+        self.assertEqual(code, omr.EXIT_OK)
 
 
 class Outcomes(Base):
@@ -346,17 +413,25 @@ class ArgvFixedness(Base):
         self.assertEqual((code, json.loads(rc_out)["login"]), (0, "chisanan232"))
         self.assertEqual(log.read_text().split(), ["api", "user", "---"])
 
-    def test_cli_has_no_gh_path_option(self):
-        r = subprocess.run([sys.executable, str(ROOT / "scripts/owner-merge-runner.py"), "--gh-path", "/bin/true",
-                            "--repo", REPO, "--pr", "7", "--expect-head", HEAD, "--review-evidence", "x"],
-                           capture_output=True, text=True)
-        self.assertEqual(r.returncode, omr.EXIT_USAGE)
+    def test_cli_has_no_gh_path_allowlist_or_audit_override(self):
+        for flag in ("--gh-path", "--allowlist", "--audit-log"):
+            r = subprocess.run([sys.executable, str(ROOT / "scripts/owner-merge-runner.py"), flag, "/tmp/x",
+                                "--repo", REPO, "--pr", "7", "--expect-head", HEAD, "--review-evidence", "x"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, omr.EXIT_USAGE, flag)
+
+    def test_default_paths_are_fixed_under_home_dot_claude_not_the_repo(self):
+        home = os.path.expanduser("~")
+        self.assertEqual(omr.DEFAULT_ALLOWLIST, os.path.join(home, ".claude", "owner-merge-runner-allowlist.json"))
+        self.assertEqual(omr.DEFAULT_AUDIT, os.path.join(home, ".claude", "audit", "owner-merge-runner.jsonl"))
+        self.assertFalse(str(ROOT) in omr.DEFAULT_ALLOWLIST)
+        self.assertFalse((ROOT / "docs/owner-merge-runner-allowlist.json").exists())
 
     def test_main_uses_injected_gh_and_returns_code(self):
         gh = FakeGh()
         with contextlib.redirect_stdout(io.StringIO()):
             rc = omr.main(["--repo", REPO, "--pr", "7", "--expect-head", HEAD, "--review-evidence", str(self.evidence),
-                       "--allowlist", str(self.allow), "--audit-log", str(self.audit), "--dry-run"], gh=gh)
+                       "--dry-run"], gh=gh, allowlist=str(self.allow), audit=str(self.audit))
         self.assertEqual(rc, omr.EXIT_OK)
 
 
