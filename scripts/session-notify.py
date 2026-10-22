@@ -891,7 +891,7 @@ class Engine:
         if name == "Notification":
             ntype = event.get("notification_type") or ""
             block = {"blocker_owner": "owner", "resume_trigger": "owner_decision" if ntype != "permission_prompt" else "owner_approval"}
-            if ntype in OWNER_BLOCK_TYPES or (ntype == "idle_prompt" and state in ("RUNNING", "IDLE")):
+            if (ntype in OWNER_BLOCK_TYPES or ntype == "idle_prompt") and state in ("RUNNING", "IDLE"):  # a finished or already-blocked session is never overwritten
                 self.set_state(rec, "BLOCKED_OWNER", ntype[:30], now, cp, notify=True, extra=block)
             elif ntype == "agent_completed":
                 rec["agent_done"] += 1

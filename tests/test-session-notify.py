@@ -1181,12 +1181,12 @@ class Cycle2Regressions(Base):
     def test_7_dedup_forgets_after_the_window_and_the_contract_is_documented(self):
         e = self.engine(self.only_macos())
         self.ev(e, "UserPromptSubmit")
-        self.ev(e, "Notification", notification_type="permission_prompt")
-        self.ev(e, "Notification", notification_type="permission_prompt")
+        self.ev(e, "StopFailure", error_type="rate_limit")
+        self.ev(e, "StopFailure", error_type="rate_limit")
         self.assertEqual(len(self.fake.sent), 1)                               # inside the window: deduplicated
         self.t += sn.DEDUP_WINDOW + 1
-        self.ev(e, "Notification", notification_type="permission_prompt")
-        self.assertEqual(len(self.fake.sent), 2)                               # outside it: at-least-once, may repeat
+        self.ev(e, "StopFailure", error_type="rate_limit")
+        self.assertEqual(len(self.fake.sent), 2)                               # outside it: best effort only, may repeat
 
     def test_7_memory_is_bounded_by_the_cap_without_a_counter_that_promises_more(self):
         rec = sn.new_record("s1", self.t)
@@ -1801,6 +1801,34 @@ class Cycle5Regressions(Base):
             self.assertFalse(sn.conforms(sn.CHECKPOINT_SCHEMA, m), label)
             self.assertFalse(ref_ok(sn.CHECKPOINT_SCHEMA, m), label)
         self.assertTrue(sn.conforms(sn.CHECKPOINT_SCHEMA, base))
+
+
+class Cycle6Regressions(Base):
+    def test_every_owner_block_type_leaves_a_finished_or_blocked_session_alone(self):
+        for ntype in sorted(sn.OWNER_BLOCK_TYPES) + ["idle_prompt"]:
+            with self.subTest(ntype):
+                e = self.engine()
+                sid = "n" + ntype
+                self.ev(e, "SessionStart", sid=sid, source="startup")
+                self.advance(2)
+                self.checkpoint()
+                self.ev(e, "Stop", sid=sid)
+                self.assertEqual(self.rec(sid)["state"], "COMPLETED")
+                sent = len(self.fake.sent)
+                self.ev(e, "Notification", sid=sid, notification_type=ntype)
+                self.assertEqual((self.rec(sid)["state"], len(self.fake.sent)), ("COMPLETED", sent))
+
+    def test_control_an_owner_block_still_applies_from_running_and_idle(self):
+        for ntype in sorted(sn.OWNER_BLOCK_TYPES):
+            e = self.engine()
+            self.ev(e, "UserPromptSubmit", sid="r" + ntype)
+            self.ev(e, "Notification", sid="r" + ntype, notification_type=ntype)
+            self.assertEqual(self.rec("r" + ntype)["state"], "BLOCKED_OWNER", ntype)
+        e = self.engine()
+        self.ev(e, "UserPromptSubmit", sid="i")
+        self.ev(e, "Stop", sid="i")
+        self.ev(e, "Notification", sid="i", notification_type="permission_prompt")
+        self.assertEqual(self.rec("i")["state"], "BLOCKED_OWNER")
 
 
 def hashlib_key(sid, extra):
