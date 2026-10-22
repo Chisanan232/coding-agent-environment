@@ -22,13 +22,17 @@
       "approved_destination": "",
       "server": "https://ntfy.sh",
       "topic_env": "NTFY_TOPIC",
-      "token_env": ""
+      "topic_file": "",
+      "token_env": "",
+      "token_file": ""
     },
     "pushover": {
       "enabled": false,
       "approved_destination": "",
       "token_env": "PUSHOVER_APP_TOKEN",
-      "user_env": "PUSHOVER_USER_KEY"
+      "token_file": "",
+      "user_env": "PUSHOVER_USER_KEY",
+      "user_file": ""
     }
   },
   "_note": "Everything is off until a backend sets enabled to true. Credentials are environment-variable NAMES or file paths, never values. Remote backends also need approved_destination equal to the server host, and are refused on the corporate profile. Notifications show a repository name only if it is listed in known_repos; otherwise they say 'unlisted'."

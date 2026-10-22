@@ -81,8 +81,8 @@ DEFAULT_CONFIG = {
     "retry": {"max_attempts": 5, "base_seconds": 30, "max_seconds": 900},
     "backends": {
         "macos": {"enabled": False},
-        "ntfy": {"enabled": False, "approved_destination": "", "server": "https://ntfy.sh", "topic_env": "NTFY_TOPIC", "token_env": ""},
-        "pushover": {"enabled": False, "approved_destination": "", "token_env": "PUSHOVER_APP_TOKEN", "user_env": "PUSHOVER_USER_KEY"},
+        "ntfy": {"enabled": False, "approved_destination": "", "server": "https://ntfy.sh", "topic_env": "NTFY_TOPIC", "topic_file": "", "token_env": "", "token_file": ""},
+        "pushover": {"enabled": False, "approved_destination": "", "token_env": "PUSHOVER_APP_TOKEN", "token_file": "", "user_env": "PUSHOVER_USER_KEY", "user_file": ""},
     },
 }
 
@@ -141,6 +141,11 @@ def clean_repo(value, markers=()):
     return None if any(m and m.lower() in low for m in markers) else value
 
 
+def is_member(value, allowed):
+    """Enum membership that cannot raise: lists and dicts are unhashable and would TypeError a bare `in` on a set or dict."""
+    return isinstance(value, str) and value in allowed
+
+
 def sanitize_fields(fields, cfg):
     """Rebuild every outbound field from a strict validator or a fixed enum. None when the state itself is not a known state.
 
@@ -148,7 +153,7 @@ def sanitize_fields(fields, cfg):
     Repository and ticket labels pass the same secret and corporate-marker checks as every other label, with the markers of the
     config in force NOW; a repository must also be listed in `known_repos`. Free text has no field to travel in.
     """
-    if not isinstance(fields, dict) or fields.get("state") not in STATES:
+    if not isinstance(fields, dict) or not is_member(fields.get("state"), STATES):
         return None
     markers = [m for m in cfg.get("corporate_markers", []) if isinstance(m, str)]
     known = {r for r in cfg.get("known_repos", []) if isinstance(r, str)}
@@ -160,11 +165,11 @@ def sanitize_fields(fields, cfg):
     pr = fields.get("pr")
     if type(pr) is int and 0 < pr < 10**7:
         out["pr"] = pr
-    if fields.get("blocker_owner") in BLOCKER_OWNERS:
+    if is_member(fields.get("blocker_owner"), BLOCKER_OWNERS):
         out["blocker_owner"] = fields["blocker_owner"]
-    if fields.get("resume_trigger") in RESUME_TRIGGERS:
+    if is_member(fields.get("resume_trigger"), RESUME_TRIGGERS):
         out["resume_trigger"] = fields["resume_trigger"]
-    if fields.get("kind") in ALLOWED_KINDS:
+    if is_member(fields.get("kind"), ALLOWED_KINDS):
         out["kind"] = fields["kind"]
     return out
 
@@ -322,8 +327,17 @@ def load_config(path=None):
             cfg["backends"][name].update({k: v for k, v in body.items() if k in cfg["backends"][name]})
     if cfg["profile"] not in ("personal", "corporate"):
         cfg["profile"] = "corporate"  # unknown profile fails towards the stricter one
-    if not isinstance(cfg["corporate_markers"], list):
-        cfg["corporate_markers"] = []
+    cfg["corporate_markers"] = [m for m in cfg["corporate_markers"] if isinstance(m, str) and m] if isinstance(cfg["corporate_markers"], list) else []
+    for key, default in DEFAULT_CONFIG["notify"].items():
+        if type(cfg["notify"][key]) is not bool:
+            cfg["notify"][key] = default
+    for key, default in DEFAULT_CONFIG["retry"].items():
+        if type(cfg["retry"][key]) is not int or not 1 <= cfg["retry"][key] <= (100 if key == "max_attempts" else 86400):
+            cfg["retry"][key] = default
+    for name, body in cfg["backends"].items():
+        for key, default in DEFAULT_CONFIG["backends"][name].items():
+            if type(body[key]) is not type(default):
+                body[key] = default  # a wrongly typed value falls back to the safe default (off / empty), never raises later
     cfg["known_repos"] = [r for r in cfg["known_repos"] if isinstance(r, str) and SAFE_REPO.fullmatch(r)] if isinstance(cfg["known_repos"], list) else []
     if type(cfg["stale_after_seconds"]) is not int or cfg["stale_after_seconds"] < 60:
         cfg["stale_after_seconds"] = DEFAULT_CONFIG["stale_after_seconds"]
@@ -363,16 +377,32 @@ def read_checkpoint(cwd, sid, markers):
     if raw is None:
         return None, 0.0
     try:
-        d = json.loads(raw.decode("utf-8"))
-    except ValueError:
-        return None, 0.0
-    if not isinstance(d, dict) or d.get("schema") != 1 or d.get("state") not in CHECKPOINT_STATES:
-        return None, 0.0
-    if d.get("session_id") not in (None, sid):
-        return None, 0.0
+        d = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+        cp = parse_checkpoint(d, sid, markers)
+    except (ValueError, TypeError, AttributeError):
+        return None, 0.0  # a malformed checkpoint is absent, never an exception that aborts event handling
+    return (cp, mtime) if cp else (None, 0.0)
+
+
+def parse_checkpoint(d, sid, markers):
+    """The sanitised checkpoint, or None when it or any field it carries has the wrong type. Every consumed field is type-checked first."""
+    if not isinstance(d, dict) or d.get("schema") != 1 or not is_member(d.get("state"), CHECKPOINT_STATES):
+        return None
+    if d.get("session_id") is not None and d.get("session_id") != sid:
+        return None
+    for key in ("blocker", "verified"):
+        if d.get(key) is not None and not isinstance(d.get(key), dict):
+            return None
+    if d.get("pr") is not None and not isinstance(d.get("pr"), (int, dict)):
+        return None
+    blocker, verified = d.get("blocker") or {}, d.get("verified") or {}
+    if any(blocker.get(k) is not None and not isinstance(blocker.get(k), str) for k in ("owner", "resume_trigger")):
+        return None
+    if any(verified.get(k) is not None and not isinstance(verified.get(k), str) for k in ("by", "evidence")):
+        return None
+    if any(d.get(k) is not None and not isinstance(d.get(k), str) for k in ("task", "repo", "ticket", "workflow_state")):
+        return None
     pr, head = clean_pr(d.get("pr"))
-    blocker = d.get("blocker") if isinstance(d.get("blocker"), dict) else {}
-    verified = d.get("verified") if isinstance(d.get("verified"), dict) else {}
     ver_by = clean_text(verified.get("by"), 40, markers)
     ver_ev = verified.get("evidence")
     ver_ev = ver_ev if isinstance(ver_ev, str) and EVIDENCE.fullmatch(ver_ev) and not SECRET_WORDS.search(ver_ev) else None  # a reference; never transmitted
@@ -385,7 +415,7 @@ def read_checkpoint(cwd, sid, markers):
         "blocker_owner": owner if owner in BLOCKER_OWNERS else ("other" if owner else None),
         "resume_trigger": trigger if trigger in RESUME_TRIGGERS else None,
         "verified": bool(ver_by and ver_ev),
-    }, mtime
+    }
 
 
 def ticket_from_environment():
@@ -417,9 +447,17 @@ def valid_backend(n, b):
             and is_num(b.get("next_at")) and (b.get("code") is None or short_str(b.get("code"), 40)))
 
 
+FIELD_TYPES = {"state": str, "repo": str, "ticket": str, "pr": int, "blocker_owner": str, "resume_trigger": str, "kind": str}
+
+
+def valid_fields(f):
+    """Pending fields: only known keys, each of the right type and size. Enum VALUES are checked (and dropped) by sanitize_fields at delivery."""
+    return isinstance(f, dict) and all(k in FIELD_TYPES and type(v) is FIELD_TYPES[k] and (type(v) is not str or len(v) <= 200) for k, v in f.items())
+
+
 def valid_pending(e):
     return (isinstance(e, dict) and short_str(e.get("key"), 64) and e["key"] and type(e.get("cycle")) is int and e["cycle"] >= 0
-            and type(e.get("created")) is int and isinstance(e.get("fields"), dict) and isinstance(e.get("backends"), dict) and len(e["backends"]) <= 8
+            and type(e.get("created")) is int and valid_fields(e.get("fields")) and isinstance(e.get("backends"), dict) and len(e["backends"]) <= 8
             and all(valid_backend(n, b) for n, b in e["backends"].items()))
 
 
@@ -473,15 +511,37 @@ def save_record(sdir, rec):
 
 
 # ---- delivery ------------------------------------------------------------------------------------------------------------------
+def read_secret_file(path):
+    """Value from a credential file, or None. The path must be absolute and name a regular, user-owned file that is neither group- nor
+    world-accessible; it is opened O_NOFOLLOW and nothing about the path or the value is ever logged."""
+    if not isinstance(path, str) or not path:
+        return None
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            return None
+        raw = os.read(fd, 513)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return raw.decode("utf-8", "replace").strip() if 0 < len(raw) <= 512 else None
+
+
 def read_secret(env_name=None, file_path=None):
-    """Value of a credential from a NAMED env var or a file, or None. The value is only ever passed to a transport."""
+    """Value of a credential from a NAMED env var, else from a file, or None. The value is only ever passed to a transport."""
     if env_name:
         v = os.environ.get(env_name)
-        return v.strip() if v else None
-    if file_path:
-        raw, _ = read_regular(os.path.expanduser(file_path), 512)
-        return raw.decode("utf-8", "replace").strip() if raw else None
-    return None
+        if v and v.strip():
+            return v.strip()
+    return read_secret_file(file_path) if file_path else None
 
 
 def host_of(url):
@@ -649,53 +709,68 @@ class Engine:
         retry, changed = self.cfg["retry"], False
         corporate = bool(rec.get("corporate")) or is_corporate_path(rec.get("cwd"), self.cfg)
         for entry in list(rec["pending"]):
-            fields = sanitize_fields(entry["fields"], self.cfg)
-            if fields is None:
-                for b in entry["backends"].values():
-                    if b["status"] not in TERMINAL:
-                        b.update(status="dropped", code="invalid-fields")
-                        changed = True
-            else:
-                if fields != entry["fields"]:
-                    entry["fields"], changed = fields, True
-                for name, b in entry["backends"].items():
-                    if b["status"] == "sending" and now - b["next_at"] > SENDING_STALE:
-                        b["status"], changed = "failed", True
-                    if b["status"] not in ("pending", "failed") or b["next_at"] > now:
-                        continue
-                    ok, why = backend_allowed(name, self.cfg, corporate)
-                    if not ok:
-                        b.update(status="skipped", code=why)
-                        changed = True
-                        continue
-                    if b["attempts"] >= int(retry["max_attempts"]):  # interrupted-send recoveries count: the cap is enforced BEFORE sending
-                        b.update(status="dropped", code="max-attempts")
-                        changed = True
-                        continue
-                    if budget_end is not None and self.clock() > budget_end:
-                        return changed
-                    payload = render(fields)
-                    b.update(status="sending", attempts=b["attempts"] + 1, next_at=now)
-                    save_record(self.sdir, rec)  # persisted BEFORE sending: a crash here retries once instead of looping or losing
-                    transport = self.transports.get(name)
-                    try:
-                        code = transport(payload, self.cfg["backends"][name]) if transport else "no-transport"
-                    except Exception as exc:
-                        code = f"error-{type(exc).__name__}"[:40]
-                    changed = True
-                    if code is None:
-                        b.update(status="sent", code=None)
-                    elif b["attempts"] >= int(retry["max_attempts"]):
-                        b.update(status="dropped", code=str(code)[:40])
-                    else:
-                        delay = min(int(retry["max_seconds"]), int(retry["base_seconds"]) * (2 ** (b["attempts"] - 1)))
-                        b.update(status="failed", code=str(code)[:40], next_at=now + delay)
+            try:
+                result = self.deliver_entry(rec, entry, now, budget_end, corporate)
+            except Exception:  # one malformed entry must not stall the others or raise after an earlier one was sent
+                rec["pending"] = [e for e in rec["pending"] if e is not entry]  # unusable: gone, counted, never retried
+                rec["dropped"] += 1
+                rec["history"] = (rec["history"] + [{"t": int(now), "from": rec["state"], "to": rec["state"], "why": "entry-error-dropped"}])[-HISTORY_CAP:]
+                result = True
+            if result is None:
+                return True
+            changed = changed or result
         done = [e for e in rec["pending"] if all(b["status"] in TERMINAL for b in e["backends"].values())]
         for e in done:
             self.mark_notified(rec, e["key"], e["cycle"], now)
         if done:
             rec["pending"] = [e for e in rec["pending"] if e not in done]
             changed = True
+        return changed
+
+    def deliver_entry(self, rec, entry, now, budget_end, corporate):
+        """One pending entry. Returns whether state changed, or None when the time budget ran out (caller stops)."""
+        retry, changed = self.cfg["retry"], False
+        fields = sanitize_fields(entry["fields"], self.cfg)
+        if fields is None:
+            for b in entry["backends"].values():
+                if b["status"] not in TERMINAL:
+                    b.update(status="dropped", code="invalid-fields")
+                    changed = True
+        else:
+            if fields != entry["fields"]:
+                entry["fields"], changed = fields, True
+            for name, b in entry["backends"].items():
+                if b["status"] == "sending" and now - b["next_at"] > SENDING_STALE:
+                    b["status"], changed = "failed", True
+                if b["status"] not in ("pending", "failed") or b["next_at"] > now:
+                    continue
+                ok, why = backend_allowed(name, self.cfg, corporate)
+                if not ok:
+                    b.update(status="skipped", code=why)
+                    changed = True
+                    continue
+                if b["attempts"] >= int(retry["max_attempts"]):  # interrupted-send recoveries count: the cap is enforced BEFORE sending
+                    b.update(status="dropped", code="max-attempts")
+                    changed = True
+                    continue
+                if budget_end is not None and self.clock() > budget_end:
+                    return None
+                payload = render(fields)
+                b.update(status="sending", attempts=b["attempts"] + 1, next_at=now)
+                save_record(self.sdir, rec)  # persisted BEFORE sending: a crash here retries once instead of looping or losing
+                transport = self.transports.get(name)
+                try:
+                    code = transport(payload, self.cfg["backends"][name]) if transport else "no-transport"
+                except Exception as exc:
+                    code = f"error-{type(exc).__name__}"[:40]
+                changed = True
+                if code is None:
+                    b.update(status="sent", code=None)
+                elif b["attempts"] >= int(retry["max_attempts"]):
+                    b.update(status="dropped", code=str(code)[:40])
+                else:
+                    delay = min(int(retry["max_seconds"]), int(retry["base_seconds"]) * (2 ** (b["attempts"] - 1)))
+                    b.update(status="failed", code=str(code)[:40], next_at=now + delay)
         return changed
 
     # -- events

@@ -1244,6 +1244,127 @@ class Cycle2Regressions(Base):
         self.assertEqual((mtime, cp["state"], cp["verified"]), (12345.0, "COMPLETED", True))
 
 
+class Cycle3Regressions(Base):
+    """One test per finding of the independent review of 3248352 (codex-3.md), plus the same-class sweep."""
+
+    def entry(self, fields, key="k"):
+        return {"key": key, "cycle": 1, "created": 0, "fields": fields,
+                "backends": {"macos": {"status": "pending", "attempts": 0, "next_at": 0, "code": None}}}
+
+    def only_macos(self):
+        c = cfg()
+        c["backends"]["ntfy"]["enabled"] = c["backends"]["pushover"]["enabled"] = False
+        return c
+
+    # 1 -- a malformed checkpoint is absent, never an exception that aborts event handling
+    def test_1_malformed_checkpoint_fields_never_abort_the_event(self):
+        bad = [{"blocker": {"owner": []}}, {"blocker": {"resume_trigger": {}}}, {"state": []}, {"pr": "x"}, {"blocker": []}, {"verified": {"by": []}},
+               {"task": []}, {"ticket": {}}, {"verified": 5}]
+        for i, change in enumerate(bad):
+            with self.subTest(change):
+                sid = f"s{i}"
+                e = self.engine(self.only_macos())
+                self.ev(e, "UserPromptSubmit", sid=sid)
+                self.advance(2)
+                self.checkpoint(**{"state": "RUNNING", "verified": None, **change})
+                self.fake.sent.clear()
+                self.assertEqual(self.ev(e, "StopFailure", sid=sid, error_type="rate_limit"), "ok")
+                self.assertEqual(self.rec(sid)["state"], "FAILED")
+                self.assertEqual(len(self.fake.sent), 1)
+
+    def test_1_a_malformed_checkpoint_is_not_honoured_at_stop(self):
+        e = self.engine(self.only_macos())
+        self.ev(e, "UserPromptSubmit")
+        self.advance(2)
+        self.checkpoint(blocker={"owner": []})
+        self.assertEqual(self.ev(e, "Stop"), "ok")
+        self.assertEqual(self.rec()["state"], "IDLE")
+
+    # 2 -- pending fields are validated by type, and one bad entry cannot stall the rest
+    def test_2_pending_fields_of_the_wrong_type_make_the_record_untrusted(self):
+        e = self.engine(self.only_macos())
+        self.ev(e, "UserPromptSubmit")
+        base = self.rec()
+        for label, fields in {"list owner": {"state": "FAILED", "blocker_owner": []}, "unknown key": {"state": "FAILED", "x": "y"},
+                              "bool pr": {"state": "FAILED", "pr": True}, "long text": {"state": "FAILED", "repo": "a" * 300}}.items():
+            with self.subTest(label):
+                (self.sdir / "s1.json").write_text(json.dumps(dict(base, pending=[self.entry({"state": "FAILED", "repo": "work"}), self.entry(fields, "k2")])))
+                self.fake.sent.clear()
+                self.assertEqual(self.ev(e, "Stop"), "untrusted:corrupt")
+                self.assertEqual(e.sweep()["untrusted"], 1)
+                self.assertEqual(self.fake.sent, [])
+
+    def test_2_delivery_survives_one_malformed_entry(self):
+        e = self.engine(self.only_macos())
+        rec = sn.new_record("s1", self.t)
+        rec["pending"] = [self.entry({"state": "FAILED", "repo": "work"}, "a"), self.entry({"state": "FAILED", "blocker_owner": []}, "b"),
+                          dict(self.entry({"state": "FAILED"}, "x"), backends={"macos": 5}), self.entry({"state": "FAILED", "repo": "work"}, "c")]
+        e.deliver(rec, self.t)                          # must not raise, and the entry after the unusable one is still delivered
+        self.assertEqual(len(self.fake.sent), 3)        # a, b (its bad enum is dropped by sanitising) and c
+        self.assertEqual((rec["pending"], rec["dropped"]), ([], 1))
+        self.assertIsNone(sn.sanitize_fields({"state": []}, cfg()))
+        self.assertEqual(sn.sanitize_fields({"state": "FAILED", "kind": {}, "resume_trigger": []}, cfg()), {"state": "FAILED", "repo": "unlisted"})
+
+    # 3 -- credential-file keys survive config loading and are read only from safe files
+    def test_3_credential_file_keys_are_kept_by_config_loading(self):
+        p = self.tmp / "c.json"
+        p.write_text(json.dumps({"backends": {"ntfy": {"enabled": True, "approved_destination": "ntfy.sh", "topic_env": "", "topic_file": "/x/topic", "token_file": "/x/tok"},
+                                              "pushover": {"token_file": "/x/p", "user_file": "/x/u"}}}))
+        c, problem = sn.load_config(p)
+        self.assertIsNone(problem)
+        self.assertEqual((c["backends"]["ntfy"]["topic_file"], c["backends"]["ntfy"]["token_file"]), ("/x/topic", "/x/tok"))
+        self.assertEqual((c["backends"]["pushover"]["token_file"], c["backends"]["pushover"]["user_file"]), ("/x/p", "/x/u"))
+
+    def test_3_transports_read_credentials_from_private_files_only(self):
+        posts = []
+        real = sn.http_post
+        sn.http_post = lambda url, data, headers, timeout=4: posts.append((url, data, headers)) or None
+        try:
+            def secret(name, mode=0o600, value="synthetic-value-123"):
+                f = self.tmp / name
+                f.write_text(value + "\n")
+                os.chmod(f, mode)
+                return str(f)
+            payload = {"title": "Claude Code: FAILED", "body": "work"}
+            ntfy = {"server": "https://ntfy.sh", "approved_destination": "ntfy.sh", "topic_env": "SN_UNSET_TOPIC", "topic_file": secret("topic")}
+            self.assertIsNone(sn.send_ntfy(payload, ntfy))
+            self.assertTrue(posts[0][0].endswith("/synthetic-value-123"))
+            for label, path in {"group/world readable": secret("open", 0o644), "relative": "topic", "missing": str(self.tmp / "nope"),
+                                "symlink": None}.items():
+                if label == "symlink":
+                    os.symlink(secret("real"), self.tmp / "link")
+                    path = str(self.tmp / "link")
+                self.assertEqual(sn.send_ntfy(payload, dict(ntfy, topic_file=path)), "not-configured", label)
+            push = {"approved_destination": "api.pushover.net", "token_env": "SN_UNSET_A", "token_file": secret("pt"), "user_env": "SN_UNSET_B", "user_file": secret("pu")}
+            self.assertIsNone(sn.send_pushover(payload, push))
+            self.assertEqual(sn.send_pushover(payload, dict(push, user_file=secret("pu2", 0o640))), "not-configured")
+        finally:
+            sn.http_post = real
+        self.assertEqual(len(posts), 2)
+
+    def test_3_rendered_and_example_configs_list_every_accepted_key(self):
+        rendered = json.loads(subprocess.run([sys.executable, str(SCRIPT), "render-config"], capture_output=True, text=True).stdout)
+        example = json.loads((ROOT / "docs/examples/session-notify.config.example.json").read_text())
+        for name, body in sn.DEFAULT_CONFIG["backends"].items():
+            self.assertEqual(set(rendered["backends"][name]), set(body))
+            self.assertEqual(set(example["backends"][name]), set(body))
+
+    # sweep of the same class: config values of the wrong type fall back to safe defaults instead of raising later
+    def test_config_values_of_the_wrong_type_fall_back_to_safe_defaults(self):
+        p = self.tmp / "c.json"
+        p.write_text(json.dumps({"corporate_markers": ["ok", 5, None, ""], "retry": {"max_attempts": "x", "base_seconds": 0, "max_seconds": True},
+                                 "notify": {"idle": "yes"}, "backends": {"ntfy": {"enabled": "yes", "server": 5, "topic_env": []}, "macos": {"enabled": True}}}))
+        c, _ = sn.load_config(p)
+        self.assertEqual(c["corporate_markers"], ["ok"])
+        self.assertEqual(c["retry"], sn.DEFAULT_CONFIG["retry"])
+        self.assertIs(c["notify"]["idle"], False)
+        self.assertEqual((c["backends"]["ntfy"]["enabled"], c["backends"]["ntfy"]["server"], c["backends"]["ntfy"]["topic_env"]), (False, "https://ntfy.sh", "NTFY_TOPIC"))
+        self.assertIsNone(sn.clean_text("ok text", 40, c["corporate_markers"]))  # "ok" is a marker here: no AttributeError from the dropped 5/None
+        e = self.engine(c)
+        self.ev(e, "UserPromptSubmit")
+        self.assertEqual(self.ev(e, "Notification", notification_type="permission_prompt"), "ok")
+
+
 def hashlib_key(sid, extra):
     import hashlib
     return hashlib.sha256("|".join([sid, "-", "AGENT", "", extra]).encode()).hexdigest()[:24]
