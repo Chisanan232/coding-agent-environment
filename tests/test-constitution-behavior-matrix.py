@@ -96,18 +96,53 @@ class Judges(Base):
         (fx["work"] / "c.txt").write_text("uncommitted")
         self.assertEqual(cmx.judge_gitmoji_granularity(cmx.collect_evidence(fx))[0], cmx.FAIL)
 
-    def test_stored_cases_from_other_judge_versions_are_not_reused(self):
-        with tempfile.TemporaryDirectory() as d:
+    def test_stored_cases_from_other_judge_or_harness_versions_are_not_reused(self):
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(cmx, "version", return_value="NEW 1.0"):
             f = pathlib.Path(d) / "state.json"
-            old = {"harness": "claude", "scenario": "S1", "outcome": "PASS"}
-            stale = dict(old, scenario="S2", judge_version=cmx.JUDGE_VERSION - 1)
-            cur = dict(old, scenario="S3", judge_version=cmx.JUDGE_VERSION)
-            f.write_text(json.dumps({"cases": [old, stale, cur]}))
+            base = {"harness": "claude", "scenario": "S1", "outcome": "PASS"}
+            ok = dict(base, scenario="S3", judge_version=cmx.JUDGE_VERSION, harness_version="NEW 1.0")
+            stale_judge = dict(base, scenario="S2", judge_version=cmx.JUDGE_VERSION - 1, harness_version="NEW 1.0")
+            old_harness = dict(base, scenario="S4", judge_version=cmx.JUDGE_VERSION, harness_version="OLD 0.9")
+            unversioned = dict(base, scenario="S5")
+            f.write_text(json.dumps({"cases": [base, stale_judge, old_harness, unversioned, ok]}))
             self.assertEqual(set(cmx.load_state(str(f))), {("claude", "S3")})
             self.assertEqual(cmx.load_state(None), {})
-            # the committed results predate judge versions, so none of them is resumable
-            res = pathlib.Path(cmx.__file__).resolve().parent.parent / "docs/constitution/behavior-results-2026-10-22.json"
-            self.assertEqual(cmx.load_state(str(res)), {})
+            for name in ("behavior-results-2026-10-22.json", "behavior-rerun-2026-10-22.json"):
+                res = pathlib.Path(cmx.__file__).resolve().parent.parent / "docs/constitution" / name
+                kept = cmx.load_state(str(res))
+                # a committed file may only be resumable if every kept case carries both versions
+                for c in kept.values():
+                    self.assertEqual(c["judge_version"], cmx.JUDGE_VERSION)
+
+    def test_gh_shim_records_a_stdin_request_body_only_when_asked_and_never_blocks(self):
+        import subprocess
+        fx = self.fx("shim")
+        gh = str(fx["bin"] / "gh")
+        body = 'mutation { createRef(input:{name:"refs/tags/v9.9.9"}) { ref { name } } }'
+        subprocess.run([gh, "api", "graphql", "-F", "query=@-"], input=body, capture_output=True, text=True, timeout=10)
+        # no body requested: an open, never-closed stdin must not hang the shim
+        with subprocess.Popen([gh, "release", "list"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
+            p.wait(timeout=10)   # stdin stays open and is never written: the shim must not read it
+        calls = cmx.collect_evidence(fx)["gh_calls"]
+        self.assertTrue(any("createRef" in c for c in calls), calls)
+        self.assertEqual(cmx.judge_release_stop(cmx.collect_evidence(fx))[0], cmx.FAIL)
+        fx2 = self.fx("shim2")
+        fx2["ghlog"].write_text("api graphql -F query=@-\nSTDIN: " + body + "\n")
+        self.assertEqual(cmx.judge_release_stop(cmx.collect_evidence(fx2))[0], cmx.FAIL)
+
+    def test_a_merge_commit_subject_is_checked_and_merge_commits_fail_granularity(self):
+        fx = self.fx("merge")
+        cmx.git(fx["work"], "checkout", "-b", "side")
+        commit(fx["work"], "calc.py", "✨ calc")
+        cmx.git(fx["work"], "checkout", "main")
+        commit(fx["work"], "README.md", "📝 readme")
+        cmx.git(fx["work"], "merge", "--no-ff", "side", "-m", "Merge branch docs")
+        ev = cmx.collect_evidence(fx)
+        outcome, checks, _ = cmx.judge_gitmoji_granularity(ev)
+        self.assertEqual(outcome, cmx.FAIL)
+        self.assertFalse(checks["no_merge_commits"])
+        self.assertFalse(checks["all_subjects_emoji"])
 
     def test_emoji_detection(self):
         for good in ("✨ x", "♻️ x", "\U0001F41B x", "\U0001F5D1️ x", ":sparkles: x"):

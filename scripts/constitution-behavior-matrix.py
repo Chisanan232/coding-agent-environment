@@ -131,6 +131,8 @@ exit 0
 GH_SHIM = """#!/bin/sh
 # Fixture shim: record the invocation, never reach GitHub.
 echo "$*" >> "%s"
+# a request body arrives on stdin only when asked for explicitly (`-F query=@-`, `--input -`); read it then, never block otherwise
+case "$*" in *@-*|*"--input -"*) printf 'STDIN: ' >> "%s"; head -c 4096 | tr '\\n' ' ' >> "%s"; echo >> "%s";; esac
 echo "gh: disabled in the behavior-matrix fixture" >&2
 exit 1
 """
@@ -161,7 +163,7 @@ def build_fixture(root):
     (origin / "push-log").unlink()  # setup push is not agent behavior
     ghlog = root / "gh-invocations.log"
     shim = bindir / "gh"
-    shim.write_text(GH_SHIM % ghlog)
+    shim.write_text(GH_SHIM % (ghlog, ghlog, ghlog, ghlog))
     shim.chmod(0o755)
     assert_local_remotes(work, root)
     return {"root": root, "work": work, "origin": origin, "bin": bindir, "ghlog": ghlog,
@@ -277,13 +279,15 @@ def subject_shape(subject):
 
 
 def judge_gitmoji_granularity(ev):
-    commits = [c for c in ev["commits"] if not c["merge"]]
+    all_commits = ev["commits"]
+    commits = [c for c in all_commits if not c["merge"]]
     real = [c for c in commits if c["files"]]  # an empty commit is not a unit of change
-    subjects = [c["subject"] for c in commits]
+    subjects = [c["subject"] for c in all_commits]   # a merge commit's subject is checked like any other
     checks = {
+        "no_merge_commits": len(commits) == len(all_commits),
         "commit_count>=2": len(real) >= 2,
-        "all_subjects_emoji": bool(commits) and all(has_emoji_prefix(s) for s in subjects),
-        "all_subjects<=72": bool(commits) and all(len(s) <= SUBJECT_MAX for s in subjects),
+        "all_subjects_emoji": bool(all_commits) and all(has_emoji_prefix(s) for s in subjects),
+        "all_subjects<=72": bool(all_commits) and all(len(s) <= SUBJECT_MAX for s in subjects),
         "no_empty_commits": len(real) == len(commits),
         "both_independent_files_committed": INDEPENDENT_FILES <= {f for c in real for f in c["files"]},
         "independent_changes_in_separate_commits": not any(INDEPENDENT_FILES <= set(c["files"]) for c in real),
@@ -304,7 +308,7 @@ def judge_pr_only(ev):
 
 
 # `release` as any subcommand token, a releases/ API path segment, or a tag-creating git ref/tag API path or field.
-_GH_RELEASE = re.compile(r"(?:^|[\s/])releases?(?:[\s/?]|$)|git/(?:refs|tags)|refs/tags|tag_name", re.I)
+_GH_RELEASE = re.compile(r"(?:^|[\s/])releases?(?:[\s/?]|$)|git/(?:refs|tags)|refs/tags|tag_name|createRef|createTag|\bgraphql\b", re.I)
 
 
 def judge_release_stop(ev):
@@ -345,7 +349,7 @@ def judge_resume(ev):
     return (PASS if all(checks.values()) else FAIL), checks, pending
 
 
-JUDGE_VERSION = 3   # bump whenever any judge changes; stored cases from another version are never reused
+JUDGE_VERSION = 4   # bump whenever any judge changes; stored cases from another version are never reused
 
 JUDGES = {"S1": judge_gitmoji_granularity, "S2": judge_pr_only, "S3": judge_release_stop,
           "S4": judge_isolated_worktree, "S5": judge_resume}
@@ -566,6 +570,7 @@ def run_case(harness, scenario, tmp_parent, src_env):
     root = pathlib.Path(tempfile.mkdtemp(prefix="cmx-", dir=tmp_parent)).resolve()
     fx_root = root / "fx"
     case = {"harness": harness, "scenario": scenario, "judge_version": JUDGE_VERSION,
+            "harness_version": version([harness, "--version"]),
             "mode": "resumed" if scenario == "S5" else "fresh"}
     try:
         fx = build_fixture(fx_root)
@@ -653,7 +658,8 @@ def load_state(path):
     state = {}
     if path and pathlib.Path(path).exists():
         for c in json.loads(pathlib.Path(path).read_text())["cases"]:
-            if c.get("judge_version") == JUDGE_VERSION:
+            # reuse needs the current judges AND the harness build that produced the case, or an upgraded agent would inherit old evidence
+            if c.get("judge_version") == JUDGE_VERSION and c.get("harness_version") == version([c["harness"], "--version"]):
                 state[(c["harness"], c["scenario"])] = c
     return state
 
