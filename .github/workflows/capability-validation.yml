@@ -16,6 +16,8 @@ on:
       - 'scripts/owner-merge-gate.py'
       - 'docs/ENGINEERING-CONSTITUTION.md'
       - 'tests/test-engineering-constitution.py'
+      - 'scripts/constitution-behavior-matrix.py'
+      - 'tests/test-constitution-behavior-matrix.py'
       - 'scripts/workstation-policy.py'
       - 'scripts/candidate-rollout.py'
       - 'scripts/workstation-policy-hook.py'
@@ -47,6 +49,8 @@ on:
       - 'scripts/owner-merge-gate.py'
       - 'docs/ENGINEERING-CONSTITUTION.md'
       - 'tests/test-engineering-constitution.py'
+      - 'scripts/constitution-behavior-matrix.py'
+      - 'tests/test-constitution-behavior-matrix.py'
       - 'scripts/workstation-policy.py'
       - 'scripts/candidate-rollout.py'
       - 'scripts/workstation-policy-hook.py'
@@ -104,6 +108,7 @@ jobs:
           python3 tests/test-owner-merge-gate.py
           python3 tests/test-owner-merge-gate-local.py
           python3 tests/test-engineering-constitution.py
+          python3 tests/test-constitution-behavior-matrix.py
           python3 tests/test-pr-merge-policy.py
           python3 tests/test-workstation-policy.py
           python3 tests/test-candidate-rollout.py
