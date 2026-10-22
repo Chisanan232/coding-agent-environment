@@ -51,7 +51,7 @@ class NotASecondSourceOfTruth(unittest.TestCase):
         rows = [l for l in DOC.split("## 10.")[1].split("## 11.")[0].splitlines() if re.match(r"\| \d+ \|", l)]
         self.assertEqual(len(rows), 15)
         for row in rows:
-            self.assertRegex(row, r"\| (OPEN|RESOLVED[^|]*) \|$")
+            self.assertRegex(row, r"\| (OPEN|RESOLVED[^|]*) \| [^|]+ \|$")   # state, then the interim behavior
         self.assertEqual(sum("RESOLVED" in r for r in rows), 3)
 
     def test_unverified_facts_are_marked_not_asserted(self):
