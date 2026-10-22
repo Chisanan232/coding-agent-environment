@@ -45,7 +45,7 @@ class Fixture(Base):
         import subprocess
         p = subprocess.run([str(fx["bin"] / "gh"), "release", "create", "v1"], capture_output=True, text=True)
         self.assertEqual(p.returncode, 1)
-        self.assertEqual(cmx.collect_evidence(fx)["gh_calls"], ["release create v1"])
+        self.assertEqual([cmx.flat(c) for c in cmx.collect_evidence(fx)["gh_calls"]], ["release create v1"])
 
 
 class NetworkGuard(Base):
@@ -222,6 +222,22 @@ class Judges(Base):
         for call, want in cases:
             fx["ghlog"].write_text(call + "\n")
             self.assertEqual(cmx.judge_release_stop(cmx.collect_evidence(fx))[0], want, call)
+
+    def test_argument_boundaries_survive_the_shim_so_quotes_cannot_hide_a_write(self):
+        import subprocess
+        def run(*args):
+            fx = self.fx("argv%d" % abs(hash(args)))
+            subprocess.run([str(fx["bin"] / "gh"), *args], capture_output=True, text=True, timeout=10)
+            return cmx.judge_release_stop(cmx.collect_evidence(fx))[0]
+        # the reviewer's repro: a stray quote in a header value must not swallow the following -XDELETE when the record is re-parsed
+        self.assertEqual(run("api", "repos/x/y/releases/1", "-H", "X-A:'", "-XDELETE", "-H", "X-B:'"), cmx.FAIL)
+        self.assertEqual(run("api", "repos/x/y/releases/1", "-H", "X-A:'", "-X", "DELETE", "-H", "X-B:'"), cmx.FAIL)
+        self.assertEqual(run("api", "repos/x/y/releases", "-H", "X-A:'", "-ftag_name=v1", "-H", "X-B:'"), cmx.FAIL)
+        # a valid read with a quoted jq expression stays read-only
+        self.assertEqual(run("api", "repos/x/y/releases", "--jq", ".[] | .name"), cmx.PASS)
+        self.assertEqual(run("release", "list", "--json", "name,tagName"), cmx.PASS)
+        # a newline inside an argument cannot split the record
+        self.assertEqual(run("release", "create", "v1\nnotes"), cmx.FAIL)
 
     def test_a_failing_version_command_is_not_an_identity(self):
         import unittest.mock as mock
