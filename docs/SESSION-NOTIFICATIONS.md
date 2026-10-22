@@ -21,7 +21,9 @@ Shared, product-neutral capability: a short-lived hook process records each Clau
 | `FAILED` | API failure, or no heartbeat | `StopFailure`; checkpoint `FAILED`; `sweep` finds a silent RUNNING session | yes |
 | `SESSION_ENDED` | Session closed | `SessionEnd` | only if it ended while RUNNING for reason `other`/`logout` |
 
-Notification key = session + task + transition + PR head + run number. A *run* starts each time the state enters RUNNING from something else, so approving a prompt and hitting a second prompt notifies again, while repeated hook calls, a resume, or a restart never repeat an old key.
+Notification key = session + task + transition + PR head, remembered together with the *cycle* it was sent in. A cycle starts each time the state enters RUNNING from something else, so approving a prompt and hitting a second prompt notifies again. A **resume does not open a new cycle** and repeated hook calls or a restart never repeat a key. The memory of delivered keys is kept for 14 days (hard cap 2000); only older entries are forgotten, and if the cap ever truncates inside that window the loss is counted in the record (`dedup_overflow` in `status`).
+
+Checkpoint freshness uses a separate marker, `run_started`: set by `SessionStart` and `UserPromptSubmit`, and by progress after an idle/finished state, but **not** when the owner unblocks a `BLOCKED_*` session. A completion checkpoint written by the very tool call the owner just approved therefore stays fresh, while a file left from before the run never counts.
 
 ## Hook events (verified against Claude Code 2.1.292)
 
@@ -43,10 +45,12 @@ The agent runs, from its worktree (nothing is hand-written):
 
 ```bash
 python3 scripts/session-notify.py checkpoint --state BLOCKED_OWNER --task "SPE-120 notifier" --ticket SPE-120 --pr 101 --head <sha> \
-  --blocker-owner owner --resume-trigger "Owner applies settings diff"
+  --blocker-owner owner --resume-trigger owner_decision
 python3 scripts/session-notify.py checkpoint --state COMPLETED --ticket SPE-120 --pr 101 --head <sha> \
   --verified-by codex-review --evidence "PR#101@<sha>"
 ```
+
+`--blocker-owner` takes one of `owner dependency resource ci reviewer other`; `--resume-trigger` takes one of `owner_approval owner_decision dependency_merged ci_green review_complete resource_available credentials_provided manual_restart other`. There is no free-text field that can reach a notification.
 
 Written to `.claude/.session-status.json` (gitignored, 0600) or `SESSION_STATUS_FILE`. Schema: `{schema:1, state, task, repo, ticket, pr:{number,head}, workflow_state, blocker:{owner,resume_trigger}, verified:{by,evidence}, session_id?, updated}`. One active session per worktree is assumed (the existing one-worktree-per-ticket rule); an optional `session_id` pins a file to one session. The ticket also falls back to `CLAUDE_CURRENT_TICKET`.
 
@@ -57,9 +61,9 @@ Two independent backends, both **off** until `~/.config/coding-agent-environment
 - `macos`: `osascript` `display notification`; title and body travel as separate argv items to an AppleScript `on run argv` handler, never through a shell or string-built script.
 - `ntfy`, `pushover`: disabled by default and **never contacted by this change or its tests** (tests inject fakes). Each needs `enabled: true` **and** `approved_destination` equal to the server host. Credentials are environment-variable **names** or file paths in the config, never values. Remote backends are refused for the `corporate` profile and for any session whose working path contains a configured `corporate_markers` entry.
 
-Payload allowlist: state, repo name, ticket, PR number, an enum blocker owner, a failure kind, timestamp. The local backend may also show the checkpoint's short resume trigger; remote backends never receive free text. Never sent: commands, environment values, keys, source, logs, transcripts, model text, corporate content. Every checkpoint string must be 1-96 plain characters (letters, digits, space, `._:#@+-`), no newline, no path, no shell character, nothing credential-shaped, no long mixed token, no corporate marker; anything else is dropped (the notification still goes out without that field).
+Payload: **only** the state, a repository name, a ticket, a PR number, an enum blocker owner, an enum resume trigger rendered as a fixed phrase, a failure kind and a fixed phrase for stale/ended/agent events. The same body goes to every backend. Each field is rebuilt from a strict validator or fixed enum, never copied: the ticket must match `ABC-123`, the PR must be an integer, enums must be members, and the **repository name must appear in `known_repos` in your config**, otherwise the notice says `unlisted` (list your repositories there; a lookalike or secret-shaped name cannot pass because only listed names do). The checkpoint's `task` and `workflow_state` are short plain text kept for local identity and dedup and are never sent. Never sent: commands, environment values, keys, source, logs, transcripts, model text, paths, corporate content. The check runs when a notification is queued **and again at every delivery attempt** on whatever is on disk, and corporate status (the `corporate` profile, or a `corporate_markers` match on the session's last working directory, sticky once seen) is also re-evaluated at delivery, so a queued remote notice is revoked if the session turns out to be corporate or a marker is added later. Remote requests are plain `https` POSTs to the approved host with **no redirect following and no environment proxies**, so the credential is never forwarded elsewhere.
 
-Reliability: state is persisted as `sending` before a transport runs; failures retry with backoff 30 s, 60 s, 120 s, 240 s (cap 900 s, 5 attempts) and are then dropped; retries run from the next hook of that session or from `sweep`. Delivery is at-least-once only across a crash during a send (one possible repeat after 5 minutes); in normal operation each key is sent once. A raising transport is a failed attempt, never a crash.
+Reliability: state is persisted as `sending` before a transport runs; failures retry with backoff 30 s, 60 s, 120 s, 240 s (cap 900 s, 5 attempts) and are then dropped; retries run from the next hook of that session or from `sweep`. A send interrupted by a crash is recovered after 5 minutes and **counts toward the same attempt cap** (checked before sending), so it can repeat at most within that cap. A queue limited to 20 entries never discards silently: the oldest entry gets a terminal `dropped` (`queue-overflow`) outcome, is remembered for dedup, adds a history line and increments `dropped` (shown by `status`). A raising transport is a failed attempt, never a crash.
 
 ## Crash and silence handling
 
@@ -73,18 +77,18 @@ Hooks cannot run after `kill -9`, power loss or a reboot. `session-notify.py swe
 
 ## Safety properties
 
-The hook always exits 0 with empty output, has a 10 s alarm, reads at most 256 KiB, and logs only event names and error classes (never payload content). State is opened with `O_NOFOLLOW`, must be a regular file owned by the user under 64 KiB with a matching session id, otherwise it is *not trusted*: no change, no notification, shown as `UNTRUSTED` by `status`. Session ids are restricted to `[A-Za-z0-9_-]{1,80}` so they cannot form a path. Concurrent hooks serialize on a per-session `flock`.
+The hook always exits 0 with empty output, has a 10 s alarm, reads at most 256 KiB, and logs only event names and error classes (never payload content). State is opened with `O_NOFOLLOW`, must be a regular file owned by the user under 256 KiB whose structure, pending deliveries included, validates, with a matching session id, otherwise it is *not trusted*: no change, no notification, shown as `UNTRUSTED` by `status`. The diagnostic log is written without ever blocking (`O_NONBLOCK`, regular files only, so a FIFO planted at its path is ignored) and the 10 s hook deadline repeats every second afterwards and ends the process outright on the second firing, so swallowing the first timeout cannot keep the hook alive. A session lock only counts if its path still names the inode that was locked, and garbage collection removes a lock only while holding it, so a waiter on a replaced lock file retries instead of running beside the new holder. Checkpoint contents and freshness come from the same opened file. Session ids are restricted to `[A-Za-z0-9_-]{1,80}` so they cannot form a path. Concurrent hooks serialize on a per-session `flock`.
 
 ## Deploy and rollback (owner-run; nothing here edits live settings)
 
-1. `python3 scripts/session-notify.py render-config > ~/.config/coding-agent-environment/session-notify.json`, then set `macos.enabled` to `true`. Leave `ntfy` and `pushover` disabled.
+1. `python3 scripts/session-notify.py render-config > ~/.config/coding-agent-environment/session-notify.json`, then set `macos.enabled` to `true` and list your repository names in `known_repos`. Leave `ntfy` and `pushover` disabled.
 2. Back up `~/.claude/settings.json` (`cp -p`, record `shasum -a 256`), then merge the `hooks` block of `docs/examples/session-notify-hooks.example.json` by hand after replacing the script path. The existing hooks (`rtk`, disk admission, others) stay; add these entries alongside, not instead.
 3. Start a **new** session; run the scenarios below. Existing sessions keep the hooks they loaded.
 4. Rollback: remove the added hook entries (or restore the backup), set `macos.enabled` to `false`. State under `~/.cache/coding-agent-environment/session-status/` is safe to delete.
 
 ## Validation scenarios (live validation is pending the owner's deployment)
 
-The unit tests replay each scenario against scratch state with fake transports (56 tests, incl. 13 mutation checks). The live check for each is below; none has been run live yet.
+The unit tests replay each scenario against scratch state with fake transports (76 tests, with a mutation check for every guard). The live check for each is below; none has been run live yet.
 
 | # | Scenario | Run | Observe |
 |---|---|---|---|
@@ -99,4 +103,4 @@ The unit tests replay each scenario against scratch state with fake transports (
 
 ## Owner decisions still open
 
-Whether and which mobile service to approve (ntfy or Pushover; no choice and no contact has been made); whether to wire `sweep` to launchd; the `stale_after_seconds` value for 10-30 hour runs; which paths count as `corporate_markers` on a corporate machine.
+Whether and which mobile service to approve (ntfy or Pushover; no choice and no contact has been made); whether to wire `sweep` to launchd; the `stale_after_seconds` value for 10-30 hour runs; which paths count as `corporate_markers` on a corporate machine; the repository names to list in `known_repos` (an empty list means every notice says `unlisted`).

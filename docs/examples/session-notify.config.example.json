@@ -1,6 +1,7 @@
 {
   "profile": "personal",
   "corporate_markers": [],
+  "known_repos": [],
   "stale_after_seconds": 2700,
   "notify": {
     "agent_completed": false,
@@ -30,5 +31,5 @@
       "user_env": "PUSHOVER_USER_KEY"
     }
   },
-  "_note": "Everything is off until a backend sets enabled to true. Credentials are environment-variable NAMES or file paths, never values. Remote backends also need approved_destination equal to the server host, and are refused on the corporate profile."
+  "_note": "Everything is off until a backend sets enabled to true. Credentials are environment-variable NAMES or file paths, never values. Remote backends also need approved_destination equal to the server host, and are refused on the corporate profile. Notifications show a repository name only if it is listed in known_repos; otherwise they say 'unlisted'."
 }
