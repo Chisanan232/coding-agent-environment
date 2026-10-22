@@ -154,6 +154,36 @@ class T(unittest.TestCase):
         self.assertTrue(self.out[0]["rolled_back"])
         self.assertEqual(self.run_cmd("rollback", gh, sha=self.sha()), 0)  # idempotent
 
+    def test_rollback_keeps_protection_strengthened_after_apply(self):
+        edits = {"required_linear_history": {"enabled": True}, "required_signatures": {"enabled": True},
+                 "required_conversation_resolution": {"enabled": True}, "required_pull_request_reviews": {"x": 1},
+                 "restrictions": {"users": []}, "lock_branch": {"enabled": True}, "surprise": {"enabled": False}}
+        for k, v in edits.items():
+            with self.subTest(k):
+                gh = FakeGh()
+                self.run_cmd("apply", gh, sha=self.sha())
+                gh.prot[k] = v
+                self.assertEqual(self.run_cmd("rollback", gh, sha=self.sha()), 2)
+                self.assertIsNotNone(gh.prot)
+        gh = FakeGh()
+        self.run_cmd("apply", gh, sha=self.sha())
+        gh.prot["required_status_checks"]["checks"][0]["app_id"] = 15368  # pinned check source
+        self.assertEqual(self.run_cmd("rollback", gh, sha=self.sha()), 2)
+
+    def test_apply_rereads_right_before_the_write(self):
+        class Racy(FakeGh):
+            reads = 0
+
+            def __call__(self, argv, stdin=None):
+                if argv[0] == "api" and argv[1].endswith("/protection") and len(argv) == 2:
+                    self.reads += 1
+                    if self.reads == 2:  # the read right before the write: someone protected the branch meanwhile
+                        self.prot = get_shape(bpr.payload(["x"], True))
+                return super().__call__(argv, stdin)
+        gh = Racy()
+        self.assertEqual(self.run_cmd("apply", gh, sha=self.sha()), 2)
+        self.assertEqual(gh.writes(), [])
+
     def test_bad_arguments_and_unreadable_state_fail_closed(self):
         self.assertEqual(bpr.main(["plan", "--repo", "bad repo", "--branch", "main", "--checks", "a"], gh=FakeGh(), out=print), 64)
         self.assertEqual(bpr.main(["plan", "--repo", REPO, "--branch", "a/../b", "--checks", "a"], gh=FakeGh(), out=print), 64)

@@ -350,18 +350,20 @@ A required check is exempted only when all of these hold, re-evaluated on both p
 
 1. Every non-SUCCESS rollup entry of that check is a hosted `CheckRun` with verdict `FAILURE`, `STARTUP_FAILURE` or `CANCELLED` (not `TIMED_OUT`, `SKIPPED`, `NEUTRAL`, `ACTION_REQUIRED`, pending, or a status context).
 2. Its `detailsUrl` is a job URL of this same repository, and `gh api repos/R/actions/jobs/ID` reports for that job: the same name, `head_sha` equal to the expected head, `status` completed, **no steps**, and **no runner** (`runner_id` null or 0, empty `runner_name`). That is GitHub's own statement that the job never executed, as opposed to a test failure (`CI_FAILED`, never bypassed).
-3. The review evidence carries a `local_ci` block that lists the check with `exit_code` 0, pinned to the same head, fresh within `max_evidence_age_hours`, classification `LOCAL_EQUIVALENT_PASS`. The block is covered by the evidence HMAC when signing is configured. Exact key sets; duplicates, booleans, extra keys refuse.
+3. Every check run of that name at the expected head (`gh api repos/R/commits/SHA/check-runs?check_name=...`, complete listing) belongs to the GitHub Actions app, so an integration cannot publish an executed failure under the same name and details URL as a never-started job.
+4. The review evidence carries a `local_ci` block that lists the check with `exit_code` 0, pinned to the same head, fresh within `max_evidence_age_hours`, classification `LOCAL_EQUIVALENT_PASS`. The block is covered by the evidence HMAC when signing is configured. Exact key sets; duplicates, booleans, extra keys refuse.
 
 ```json
 "local_ci": {"classification": "LOCAL_EQUIVALENT_PASS", "head": "<40-hex head>", "run_at": "2026-10-22T10:00:00Z",
              "checks": [{"name": "isolated-validation", "exit_code": 0, "tests": 125}]}
 ```
 
-A required check missing from the rollup, a failing check that is not required, an executed failure, a malformed or stale block, a job read that fails, or a job that changes between reads all refuse (or error); nothing merges. The audit record carries `checks.ci_class` (`CI_PASS` only when nothing was exempted, else `CI_UNAVAILABLE_EXTERNAL`) and `checks.local_equivalent` (the exempted names): an exempted check is never reported as passed hosted CI.
+The exemption is part of the audit-compared result: if the CI classification differs between the two passes, nothing merges. A required check missing from the rollup, a failing check that is not required, an executed failure, a malformed or stale block, a job read that fails, or a job that changes between reads all refuse (or error); nothing merges. The audit record carries `checks.ci_class` (`CI_PASS` only when nothing was exempted, else `CI_UNAVAILABLE_EXTERNAL`) and `checks.local_equivalent` (the exempted names): an exempted check is never reported as passed hosted CI.
 
 Not closed, stated plainly:
 - The runner cannot tell a billing or quota cause from any other reason a job never started; it verifies "never executed", and the founder policy's "verified billing or quota restriction" remains the person's attestation in the evidence.
 - The job-shape condition (`steps: []`, no runner) is not yet observed against a real billing outage; until it is, it is `NOT_VERIFIED` against reality and only unit-tested with a fake `gh`.
+- A workflow in the same repository can create check runs under the Actions app with its own token; that writer is inside the trust boundary the owner already has to accept.
 - The local evidence has the same same-user forgeability as the review evidence (section 8, residuals).
 - If the base branch has server-side required checks, GitHub itself blocks the merge while the check is unavailable; the runner does not and must not change that.
 
@@ -384,6 +386,8 @@ Owner/admin behavior to expect and to check after `apply` (the default sets `enf
 - `--no-enforce-admins` keeps the owner's bypass; then the runner correctly refuses, because the check does not bind its identity.
 - Force pushes and deletion of `main` are forbidden by the same rule.
 - Check (read-only): `verify` prints `matches_payload` and `runner_server_side_check`; then run `owner-merge-runner.py --dry-run` on a green PR to see APPROVE, and open any throwaway PR with a failing check to see GitHub block the owner's merge. Do not claim `MERGE_AUTONOMY_READY` until one real merge through the runner has been read back as `MERGED` on the pinned base.
+
+`apply` re-reads the protection and rulesets immediately before the write, but GitHub offers no compare-and-swap: protection created in that gap would be overwritten (the backup would then record `prior: null`). Run it when no one else is editing the branch settings. `rollback` keeps (refuses to delete) any protection with a field beyond what `apply` wrote: reviews, restrictions, signatures, linear history, conversation resolution, a pinned check source, lock or creation blocks.
 
 Interaction with the LOCAL_EQUIVALENT_CI exception (section 9): where a required hosted check cannot run (a private repository with a billing outage), GitHub blocks the merge while that check is required, and the runner will not and must not change that. For such a repository the owner either keeps protection off and relies on the runner's exception, or runs `rollback` for the outage window; that choice is the owner's, per repository. This repository's CI runs, so it does not need the exception.
 

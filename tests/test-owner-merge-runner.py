@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("omr", ROOT / "scripts/owner-merge-runner.py")
@@ -72,6 +73,7 @@ class FakeGh:
         self.rules = server_rules() if rules is None else rules
         self.ruleset = (0, json.dumps({"id": 11, "bypass_actors": []})) if ruleset is None else ruleset
         self.protection = protection  # (rc, stdout-or-stderr) for the branch-protection read
+        self.runs = None  # optional callable(name) -> check-runs body
         self.jobs = jobs if jobs is not None else {}  # job id -> (rc, job dict); a callable is invoked per read
         self.fetches = 0
         self.readback_base = None
@@ -100,6 +102,11 @@ class FakeGh:
                     return 0, json.dumps({"state": "MERGED", "mergeCommit": {"oid": MERGE_SHA},
                                           "baseRefName": self.readback_base or self.pr["baseRefName"]}), ""
                 return 0, json.dumps({"state": "OPEN", "mergeCommit": None, "baseRefName": self.pr["baseRefName"]}), ""
+        if argv[0] == "api" and "/check-runs?check_name=" in argv[1]:
+            name = urllib.parse.unquote(argv[1].split("check_name=")[1].split("&")[0])
+            body = self.runs(name) if self.runs else {"total_count": 1, "check_runs": [
+                {"name": name, "head_sha": HEAD, "app": {"slug": "github-actions"}}]}
+            return 0, json.dumps(body), ""
         if argv[0] == "api" and "/actions/jobs/" in argv[1]:
             job = self.jobs[argv[1].rsplit("/", 1)[1]]
             rc, body = job() if callable(job) else job
@@ -1540,6 +1547,31 @@ class LocalEquivalentCi(Base):
                     del roll[0]["detailsUrl"]
                 self.assertRefused(self.gh(rollup=roll, job=never_ran()), "check ci is FAILURE")
 
+    def test_a_non_actions_check_run_of_the_same_name_blocks_the_exemption(self):
+        def run(slug, **over):
+            r = {"name": "ci", "head_sha": HEAD, "app": {"slug": slug}}
+            r.update(over)
+            return r
+        cases = {"integration": [run("github-actions"), run("evil-checks-app")], "only integration": [run("evil-checks-app")],
+                 "other head": [run("github-actions", head_sha=OTHER)], "other name": [run("github-actions", name="x")],
+                 "no app": [run("github-actions", app=None)], "empty": []}
+        for label, runs in cases.items():
+            with self.subTest(label):
+                gh = self.gh()
+                gh.runs = lambda name, runs=runs: {"total_count": len(runs), "check_runs": runs}
+                self.assertRefused(gh, "check ci is FAILURE")
+        gh = self.gh()
+        gh.runs = lambda name: {"total_count": 150, "check_runs": [run("github-actions")]}  # truncated listing
+        self.assertRefused(gh, "check ci is FAILURE")
+
+    def test_second_evaluation_cannot_change_the_ci_class_unnoticed(self):
+        gh = FakeGh(base_pr(), jobs={JOB_ID: never_ran()})
+        gh.later = base_pr(statusCheckRollup=unavailable())  # green on the first pass, unavailable from the third read on
+        code, rec = self.go(gh)
+        self.assertEqual(code, omr.EXIT_REFUSED, rec)
+        self.assertIn("changed before execution", " | ".join(rec["reasons"]))
+        self.assertEqual(gh.merges(), [])
+
     def test_status_context_is_never_exempted(self):
         roll = [{"__typename": "StatusContext", "context": "ci", "state": "FAILURE"}, unavailable()[1]]
         self.assertRefused(self.gh(rollup=roll), "check ci is FAILURE")
@@ -1625,6 +1657,13 @@ class LocalEquivalentCi(Base):
 
     def test_check_argv_job_shape(self):
         self.assertEqual(omr.check_argv(["api", f"repos/{REPO}/actions/jobs/99"]), "job")
+        sha = "a" * 40
+        self.assertEqual(omr.check_argv(["api", f"repos/{REPO}/commits/{sha}/check-runs?check_name=ci&per_page=100"]), "check-runs")
+        for bad in (["api", f"repos/{REPO}/commits/{sha}/check-runs?check_name=ci&per_page=100&x=1"],
+                    ["api", f"repos/{REPO}/commits/{sha}/check-runs?check_name=a b&per_page=100"],
+                    ["api", f"repos/{REPO}/commits/main/check-runs?check_name=ci&per_page=100"]):
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                omr.check_argv(bad)
         for bad in (["api", f"repos/{REPO}/actions/jobs/9x"], ["api", f"repos/{REPO}/actions/jobs/99/logs"],
                     ["api", "repos/../x/actions/jobs/99"], ["api", f"repos/{REPO}/actions/jobs/99", "-X", "POST"],
                     ["api", "-X", "POST", f"repos/{REPO}/actions/jobs/99"]):

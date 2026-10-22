@@ -16,7 +16,7 @@ RUNNER = "scripts/owner-merge-runner.py"
 ALLOW_FD = "        if {}:\n            bad.append(f\"{{label}} is"
 MUTANTS = [
     ("head pin", '    if observed != head:\n        bad.append("observed head differs from expected head")', '    if False:\n        bad.append("observed head differs from expected head")'),
-    ("pre-exec full re-evaluation removed", '            observed2, class2, _, rec["server_side"], _ = evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin)', '            observed2, class2 = head, rec["class"]'),
+    ("pre-exec full re-evaluation removed", '            observed2, class2, checks2, rec["server_side"], _ = evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin)', '            observed2, class2, checks2 = head, rec["class"], rec["checks"]'),
     ("pre-exec class compare", 'or class2 != rec["class"]', 'or False'),
     ("pre-exec head compare", 'if observed2 != head', 'if False'),
     ("server protection check skipped", '        info = check_server_protection(runner, repo, base, cfg)', '        info = {"contexts": []}'),
@@ -164,6 +164,12 @@ MUTANTS = [
     ("lci: prepass validates other facts first", '    decide(facts, repo, pr, head, me, cfg, frozenset(cfg["required_checks"]) if cfg["local_equivalent_ci"] else frozenset())\n', ''),
     ("lci: config flag is boolean", 'for x in (prot, bypass, signed, lci))', 'for x in (prot, bypass, signed))'),
     ("lci: job argv shape", 'JOB_PATH_RE.fullmatch(a[1])', 'None'),
+    ("lci: all runs of the name are Actions app", 'r["app"].get("slug") == "github-actions" for r in runs)', 'True for r in runs)'),
+    ("lci: check-runs listing complete", 'data.get("total_count") != len(runs) or ', ''),
+    ("lci: check-runs head pinned", 'r.get("name") == name and r.get("head_sha") == head', 'r.get("name") == name'),
+    ("lci: actions-only gate used", '        ok = only_actions_runs(runner, repo, head, name)', '        ok = True'),
+    ("lci: second evaluation checks compared", '        if checks2 != rec["checks"]:', '        if False:'),
+    ("lci: check-runs argv shape", 'CHECK_RUNS_RE.fullmatch(a[1])', 'None'),
 ]
 
 

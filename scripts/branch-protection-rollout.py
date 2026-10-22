@@ -64,15 +64,26 @@ def covered_by_rulesets(gh, repo, branch):
     return [r.get("type") for r in json.loads(out)]
 
 
+EXTRA_FLAGS = ("required_linear_history", "required_signatures", "required_conversation_resolution", "block_creations",
+               "lock_branch", "allow_fork_syncing")
+KNOWN_KEYS = {"url", "required_status_checks", "enforce_admins", "restrictions", "allow_force_pushes", "allow_deletions",
+              *EXTRA_FLAGS}
+
+
 def matches(body, p):
-    """Readback equals what was asked for, on every field the payload sets."""
+    """Readback equals what was asked for AND nothing else is set: any other protection field present or enabled
+    (reviews, restrictions, signatures, linear history, a pinned check source...) makes this False, so rollback
+    never deletes protection somebody strengthened after apply."""
     rsc = body.get("required_status_checks") or {}
-    names = {c.get("context") for c in rsc.get("checks") or []} | set(rsc.get("contexts") or [])
+    checks = rsc.get("checks") or []
+    names = {c.get("context") for c in checks} | set(rsc.get("contexts") or [])
     flag = lambda k: (body.get(k) or {}).get("enabled")  # noqa: E731
     return (names == set(p["required_status_checks"]["contexts"]) and rsc.get("strict") is False
+            and all(c.get("app_id") in (None, -1) for c in checks)
+            and set(body) <= KNOWN_KEYS and set(rsc) <= {"url", "strict", "contexts", "checks", "contexts_url"}
             and flag("enforce_admins") is p["enforce_admins"] and flag("allow_force_pushes") is False
-            and flag("allow_deletions") is False and "required_pull_request_reviews" not in body
-            and not body.get("restrictions"))
+            and flag("allow_deletions") is False and not body.get("restrictions")
+            and all(not flag(k) for k in EXTRA_FLAGS))
 
 
 def backup(repo, branch, p, prior):
@@ -115,6 +126,10 @@ def run(cmd, repo, branch, checks, enforce_admins, expect_sha, gh, out):
     if cmd == "apply":
         if state != "absent" or covered_by_rulesets(gh, repo, branch):
             out({"error": "branch already has protection or ruleset coverage; refusing to overwrite", "state": state})
+            return 2
+        state, _ = read_state(gh, repo, branch)  # re-read right before the write: GitHub offers no compare-and-swap
+        if state != "absent" or covered_by_rulesets(gh, repo, branch):
+            out({"error": "protection appeared after the plan read; refusing to overwrite", "state": state})
             return 2
         path = backup(repo, branch, p, None)
         rc, _, err = gh(["api", "-X", "PUT", protection_path(repo, branch), "--input", "-"], stdin=json.dumps(p))

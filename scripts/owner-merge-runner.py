@@ -26,6 +26,7 @@ error (audited, fail closed; if a merge had been attempted the record says it ma
 import argparse
 import calendar
 import hashlib
+import urllib.parse
 import hmac
 import json
 import os
@@ -51,6 +52,7 @@ READ_PATHS = (re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rules/branches/
               re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/branches/([A-Za-z0-9._/-]{1,200})/protection"),
               re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rulesets/([1-9][0-9]{0,11})"))
 JOB_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/actions/runs/[0-9]{1,15}/job/([0-9]{1,15})")
+CHECK_RUNS_RE = re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/commits/([0-9a-f]{40})/check-runs\?check_name=([A-Za-z0-9%._~-]{1,300})&per_page=100")
 JOB_PATH_RE = re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/actions/jobs/([0-9]{1,15})")
 # A required check may be exempted only if it never executed (see unavailable_checks); these are the verdicts a
 # never-started hosted job shows. SKIPPED, TIMED_OUT, NEUTRAL, ACTION_REQUIRED and every other verdict stay blockers.
@@ -143,6 +145,10 @@ def check_argv(argv):
         m = JOB_PATH_RE.fullmatch(a[1])
         if m and REPO_RE.fullmatch(m.group(1)):
             return "job"
+    if len(a) == 2 and a[0] == "api":
+        m = CHECK_RUNS_RE.fullmatch(a[1])
+        if m and REPO_RE.fullmatch(m.group(1)):
+            return "check-runs"
     if len(a) == 8 and a == merge_argv(a[4], a[2], a[7]) and PR_RE.fullmatch(a[2]) \
             and REPO_RE.fullmatch(a[4]) and SHA_RE.fullmatch(a[7]):
         return "merge"
@@ -621,6 +627,24 @@ def job_never_ran(runner, repo, job_id, name, head):
             and job.get("steps") == [] and job.get("runner_id") in (None, 0) and not job.get("runner_name"))
 
 
+def only_actions_runs(runner, repo, head, name):
+    """Every check run of this name at this head belongs to the GitHub Actions app. A checks-writing integration
+    could otherwise publish an executed failure under the same name and details URL as a never-started job."""
+    path = f"repos/{repo}/commits/{head}/check-runs?check_name={urllib.parse.quote(name, safe='')}&per_page=100"
+    rc, out, err = runner.call(["api", path])
+    if rc != 0:
+        raise RuntimeError(gh_error(err, "check-runs-read"))
+    try:
+        data = json.loads(out)
+    except ValueError:
+        raise RuntimeError("gh returned unparseable JSON")
+    runs = data.get("check_runs") if isinstance(data, dict) else None
+    if not isinstance(runs, list) or data.get("total_count") != len(runs) or not runs or len(runs) > 100:
+        return False
+    return all(isinstance(r, dict) and r.get("name") == name and r.get("head_sha") == head
+               and isinstance(r.get("app"), dict) and r["app"].get("slug") == "github-actions" for r in runs)
+
+
 def unavailable_checks(runner, repo, facts, head, cfg, local):
     """Required checks the LOCAL_EQUIVALENT_CI exception may stand in for: every non-SUCCESS entry of the check
     is a hosted CheckRun that GitHub itself reports as never started (CI_UNAVAILABLE_EXTERNAL), and the local
@@ -642,7 +666,7 @@ def unavailable_checks(runner, repo, facts, head, cfg, local):
                 bad.append((c, verdict))
         if not bad:
             continue
-        ok = True
+        ok = only_actions_runs(runner, repo, head, name)
         for c, verdict in bad:
             m = JOB_URL_RE.fullmatch(c.get("detailsUrl") or "") if c.get("__typename") == "CheckRun" else None
             ok = ok and verdict in NOT_EXECUTED_VERDICTS and m is not None and m.group(1).lower() == repo.lower() \
@@ -823,9 +847,11 @@ def run(repo, pr, head, evidence, allowlist, audit, dry_run, gh, clock=time.time
         rec["decision"] = "APPROVE"
         # Full re-evaluation immediately before the one mutating call; any change refuses.
         try:
-            observed2, class2, _, rec["server_side"], _ = evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin)
+            observed2, class2, checks2, rec["server_side"], _ = evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin)
         except Refused as e:
             raise Refused(["changed before execution: " + x for x in e.reasons])
+        if checks2 != rec["checks"]:
+            raise Refused(["changed before execution: check results or CI classification differ"])
         if observed2 != head or class2 != rec["class"]:
             rec["observed_head"] = observed2
             raise Refused(["changed before execution: head or PR class differs"])
