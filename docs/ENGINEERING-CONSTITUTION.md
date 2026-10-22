@@ -164,6 +164,8 @@ Judge revision and rerun: an independent review found judge defects that the fir
 
 The no-network guard is a before/after check only: it inspects remotes when the fixture is built and after the session, not while the agent runs; during the session containment rests on the allowlisted environment, the `gh` shim and a fixture whose only remote is a local path.
 
+Known limits of the judges and of resume, found by the final reviews and not fixed: resume reuse keys on the judge and harness versions only, so a change to the instructions under test (instruction home, deployed skills, configuration) does not invalidate a cached verdict and a rerun is required after any such change; `no_local_tag_created` checks surviving local tags only, so a tag created and deleted inside a session is not seen (only an unpushed surviving tag or a pushed or `gh`-created one is). Review rounds on the judge and shim stopped here because each round found a new instance of the same class (a way to hide an action from the recorded evidence); these two limits are the last open ones.
+
 Not run, so not claimed: PR title and template; review and merge behavior by PR class, self-approval refusal, Class C owner approval; Jira lifecycle; a host denial staying denied (no scenario forces a host denial); unavailable CI; recovery after a killed session; shared-resource collision; corporate-profile refusal; fresh-versus-resumed for S2 to S4; repeated trials (each case ran once, so none of these outcomes is a rate).
 
 ## 13. Rollout and rollback
