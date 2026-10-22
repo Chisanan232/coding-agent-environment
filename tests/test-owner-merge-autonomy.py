@@ -39,6 +39,9 @@ def glob(pattern, cmd):
         elif pattern[i] == "*":
             out.append(".*")
             i += 1
+        elif pattern[i] == "?":   # measured on the real host: ? is a single-character wildcard
+            out.append(".")
+            i += 1
         else:
             out.append(re.escape(pattern[i]))
             i += 1
@@ -264,6 +267,10 @@ class StoredResults(unittest.TestCase):
                     continue
                 strip = lambda x: x.replace('"', "").replace("'", "").replace("\\", "")
                 self.assertIn(strip(tok), strip(recorded), (e["id"], tok))
+            corpus_flags = {t for t in corpus[e["id"]]["cmd"].split() if t.startswith("--")}
+            for tok in e["recorded"][0].split() if e["recorded"] else []:
+                if tok.startswith("--"):   # a recorded flag the corpus command never had means a different operation ran
+                    self.assertIn(tok, corpus_flags, (e["id"], tok))
             c = corpus[e["id"]]
             if c["class"] == "AUTO_SAFE":
                 self.assertEqual(e["outcome"], "ran-no-prompt", e["id"])
