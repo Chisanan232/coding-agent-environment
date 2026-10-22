@@ -364,3 +364,27 @@ Not closed, stated plainly:
 - The job-shape condition (`steps: []`, no runner) is not yet observed against a real billing outage; until it is, it is `NOT_VERIFIED` against reality and only unit-tested with a fake `gh`.
 - The local evidence has the same same-user forgeability as the review evidence (section 8, residuals).
 - If the base branch has server-side required checks, GitHub itself blocks the merge while the check is unavailable; the runner does not and must not change that.
+
+## 10. Server-side required checks: rollout, readback, owner/admin behavior, rollback (owner-run)
+
+The runner refuses a base branch without server-side required status checks (section 8). `scripts/branch-protection-rollout.py` is the hash-pinned way to add them. `plan` and `verify` only read; `apply` and `rollback` change repository settings and are run by the repository owner, not by an agent session. It creates protection only where there is none (an existing protection or any ruleset coverage is reported and refused) and never touches review, restriction or linear-history settings (merge commits stay possible).
+
+```bash
+R=Chisanan232/coding-agent-environment; C=isolated-validation,gitleaks,native-resource-wire
+python3 scripts/branch-protection-rollout.py plan --repo $R --branch main --checks $C         # prints payload + payload_sha256
+python3 scripts/branch-protection-rollout.py apply --repo $R --branch main --checks $C --expect-payload-sha <sha>
+python3 scripts/branch-protection-rollout.py verify --repo $R --branch main --checks $C       # readback + the runner's own check
+python3 scripts/branch-protection-rollout.py rollback --repo $R --branch main --checks $C --expect-payload-sha <sha>
+```
+
+`apply` writes a 0600 backup record (`~/.claude/backups/branch-protection.*.json`), PUTs, then reads the protection back and compares every field it set; a mismatch exits 5 and is reported, not assumed. `rollback` refuses unless the live protection still equals what `apply` wrote, so later edits are not silently lost, and then deletes it and reads back that it is gone.
+
+Owner/admin behavior to expect and to check after `apply` (the default sets `enforce_admins=true`):
+- Required checks then bind the owner's own identity, which is what lets the runner trust the server-side check (the runner refuses `enforce_admins=false` unless `accept_bypass_actors` is set). A PR whose three checks pass still merges normally for the owner. A PR with a failing or missing check is blocked for the owner too; `gh pr merge --admin` no longer bypasses it.
+- `--no-enforce-admins` keeps the owner's bypass; then the runner correctly refuses, because the check does not bind its identity.
+- Force pushes and deletion of `main` are forbidden by the same rule.
+- Check (read-only): `verify` prints `matches_payload` and `runner_server_side_check`; then run `owner-merge-runner.py --dry-run` on a green PR to see APPROVE, and open any throwaway PR with a failing check to see GitHub block the owner's merge. Do not claim `MERGE_AUTONOMY_READY` until one real merge through the runner has been read back as `MERGED` on the pinned base.
+
+Interaction with the LOCAL_EQUIVALENT_CI exception (section 9): where a required hosted check cannot run (a private repository with a billing outage), GitHub blocks the merge while that check is required, and the runner will not and must not change that. For such a repository the owner either keeps protection off and relies on the runner's exception, or runs `rollback` for the outage window; that choice is the owner's, per repository. This repository's CI runs, so it does not need the exception.
+
+The existing `scripts/owner-merge-gate.py --ci-unavailable` path (a posted `OWNER-MERGE-CI-UNAVAILABLE` record) and the runner's `local_equivalent_ci` are the two executable forms of the one policy in `docs/ENGINEERING-POLICY.md` section 8; neither is a second policy.
