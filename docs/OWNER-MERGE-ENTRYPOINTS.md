@@ -67,5 +67,11 @@ test per interface for the same guard. Each guard is tested once at the executor
 
 ## What is verified, and by whom
 
-See `OWNER-MERGE-ACCEPTANCE-LEDGER.md`. Unit tests (`tests/test-canonical-executor.py`) cover the executor choice; the runner's guards against real GitHub were observed on
-disposable private repos; the live "no prompt" claim for the runner is the founder's L1 in `OWNER-MERGE-TRUSTED-ALLOW-HANDOFF.md` section 6 and is not claimed before it is observed.
+Accepted record: `OWNER-MERGE-ACCEPTANCE-LEDGER.md` sections 6 and 7. In short: the installed runner merged a Class A canary PR at its pinned head with real Actions CI and **no host
+prompt** (L1, founder-observed; audit and `verify` read back by the agent); a direct `gh pr merge` prompted and was denied (L3, founder-observed); the stale-head guard is accepted by
+equivalent evidence (real-GitHub E3a/E3b plus unit and mutation tests) because the live L2 call was blocked by the Auto Mode classifier before the runner started.
+
+What this change adds is only the *selection* step: `tests/test-canonical-executor.py` covers which executor the gate offers and its ALLOW/ASK outcome (runner offered only when installed,
+allowlisted and host-allowed; ASK-first-only, unallowlisted repo, missing runner, non-owner PR, failing CI and host deny each fall back or stop). It does not prove that a live host
+accepts a given spelling; the rule-matching shape is the one already observed in L1. Not verified: a non-owner PR on a real repo, a live runner REFUSED verdict on the installed path,
+and any Codex host ASK (see the Codex limitation above).
