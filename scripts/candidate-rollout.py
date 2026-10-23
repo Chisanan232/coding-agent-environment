@@ -55,8 +55,9 @@ def union(*lists):
     out, seen = [], set()
     for lst in lists:
         for item in lst or []:
-            if item not in seen:
-                seen.add(item)
+            key = json.dumps(item, sort_keys=True)  # entries may be objects, which are unhashable
+            if key not in seen:
+                seen.add(key)
                 out.append(item)
     return out
 
@@ -72,8 +73,10 @@ def merge(live, candidate, baseline=None, hook_command=None, fail_closed=False):
     live_am = live.get("autoMode") or {}
     before_counts = {k: len(v) for k, v in live_am.items() if isinstance(v, list)}
     report = {"autoMode_before": before_counts, "denies_kept": {}, "dropped_from_live": {"environment": [], "allow": []}}
+    if "autoMode" in candidate and not isinstance(candidate["autoMode"], dict):
+        raise SystemExit("REFUSED: candidate autoMode must be an object (omit the key to leave the live autoMode alone)")
     if "autoMode" in candidate:  # an asks-only candidate (no autoMode key) leaves the live autoMode exactly as it is
-        am = json.loads(json.dumps(candidate["autoMode"]))
+        am =json.loads(json.dumps(candidate["autoMode"]))
         carried = [k for k in live_am if k not in am]  # a candidate that omits a key leaves the owner's live value alone
         for key in carried:
             am[key] = json.loads(json.dumps(live_am[key]))
@@ -128,10 +131,10 @@ def compat(live, merged, candidate, report_conflicts=()):
     for problem in wsp.lint_settings(candidate):
         out.append(f"BLOCKING candidate lint: {problem}")
     am = merged.get("autoMode") or {}
-    for key in ("allow", "soft_deny", "hard_deny", "environment"):
-        if key in am and (not am[key] or am[key][0] != "$defaults"):
-            out.append(f"BLOCKING autoMode.{key} lost $defaults")
     if "autoMode" in candidate:  # an asks-only candidate leaves the live autoMode untouched, so it is not judged here
+        for key in ("allow", "soft_deny", "hard_deny", "environment"):
+            if key in am and (not am[key] or am[key][0] != "$defaults"):
+                out.append(f"BLOCKING autoMode.{key} lost $defaults")
         for problem in wsp.lint_settings({"autoMode": am}):  # the merged autoMode, not only the candidate; untouched live allow/ask lists are judged elsewhere
             out.append(f"BLOCKING merged configuration lint: {problem}")
     for rule in (live.get("permissions") or {}).get("ask", []):
@@ -187,11 +190,16 @@ def plan(args, raw=None):
 
 def atomic_write(path, text):
     path = pathlib.Path(path).resolve()
+    data = text if isinstance(text, bytes) else text.encode("utf-8")  # bytes in, bytes out: no locale-dependent encoding
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".rollout-")
-    with os.fdopen(fd, "w") as fh:
-        fh.write(text)
-    os.chmod(tmp, path.stat().st_mode & 0o777)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.chmod(tmp, path.stat().st_mode & 0o777)
+        os.replace(tmp, path)
+    except BaseException:
+        pathlib.Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def apply(args):
@@ -226,7 +234,7 @@ def rollback(args):
     data = pathlib.Path(args.backup).read_bytes()
     if sha(data) != args.expect_backup_sha:
         raise SystemExit("REFUSED: backup hash does not match the pinned value")
-    atomic_write(args.live, data.decode())
+    atomic_write(args.live, data)
     return {"restored": True, "live_sha": sha(pathlib.Path(args.live).read_bytes())}
 
 

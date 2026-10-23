@@ -143,6 +143,48 @@ class Rollout(unittest.TestCase):
         findings = cr.compat(LIVE, merged, cand)
         self.assertTrue(any(f.startswith("BLOCKING merged configuration lint") and "standing merge" in f for f in findings), findings)
 
+    def test_asks_only_candidate_does_not_judge_an_untouched_live_autoMode(self):
+        live = json.loads(json.dumps(LIVE))
+        live["autoMode"] = {"allow": ["Custom allow rule"]}  # no $defaults, owner's own and untouched
+        self.live.write_text(json.dumps(live))
+        self.cand.write_text(json.dumps(cr.wsp.candidate("personal", asks_only=True)))
+        p = json.loads(self.run_cli("plan", "--live", str(self.live), "--candidate", str(self.cand))[1])
+        self.assertFalse(p["blocking"], p["compat"])
+        self.assertFalse(any("lost $defaults" in f for f in p["compat"]))
+        self.cand.write_text(json.dumps({"autoMode": {"allow": ["Custom allow rule"]}}))  # but an autoMode candidate still is judged
+        p2 = json.loads(self.run_cli("plan", "--live", str(self.live), "--candidate", str(self.cand))[1])
+        self.assertTrue(any("lost $defaults" in f for f in p2["compat"]), p2["compat"])
+
+    def test_non_object_autoMode_candidate_is_refused_with_a_reason(self):
+        for bad in (None, [], "x"):
+            with self.assertRaises(SystemExit) as ctx:
+                cr.merge(LIVE, {"autoMode": bad})
+            self.assertIn("must be an object", str(ctx.exception))
+
+    def test_owner_deny_entries_that_are_objects_are_carried_not_crashed_on(self):
+        live = json.loads(json.dumps(LIVE))
+        live["autoMode"] = {"hard_deny": ["$defaults", {"rule": "owner structured entry"}]}
+        merged, rep = cr.merge(live, cr.wsp.candidate("personal"))
+        self.assertIn({"rule": "owner structured entry"}, merged["autoMode"]["hard_deny"])
+        self.assertEqual(merged["autoMode"]["hard_deny"][0], "$defaults")
+
+    def test_non_ascii_live_bytes_roundtrip_exactly_and_no_temp_file_is_left(self):
+        live = json.loads(json.dumps(LIVE))
+        live["note"] = "café ✓ 日本"
+        self.live.write_bytes((json.dumps(live, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+        original = self.live.read_bytes()
+        self.cand.write_text(json.dumps({"autoMode": {"allow": ["$defaults"]}}))
+        args = ["--live", str(self.live), "--candidate", str(self.cand)]
+        p = json.loads(self.run_cli("plan", *args)[1])
+        rc, out = self.run_cli("apply", *args, "--expect-live-sha", p["live_sha"], "--expect-result-sha", p["result_sha"], "--backup-dir", str(self.d / "b"))
+        self.assertEqual(rc, 0, out)
+        res = json.loads(out)
+        self.assertEqual(cr.sha(self.live.read_bytes()), p["result_sha"])
+        rc, _ = self.run_cli("rollback", "--live", str(self.live), "--backup", res["backup"], "--expect-backup-sha", p["live_sha"], "--expect-live-sha", p["result_sha"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.live.read_bytes(), original)
+        self.assertEqual(list(self.d.glob(".rollout-*")), [])
+
     def test_compat_blocks_when_an_existing_ask_would_be_lost(self):
         cand = {"autoMode": {"allow": ["$defaults"]}}
         merged, _ = cr.merge(LIVE, cand)
