@@ -20,7 +20,7 @@ permission layer does not see. The plan refuses to apply if an ask or deny would
 | Flag | Status |
 |---|---|
 | `TRUSTED_ALLOW_IMPLEMENTED` | PASS (source, tests, scripts) |
-| `TRUSTED_ALLOW_DEPLOYED` | NOT_RUN: needs step 4 |
+| `TRUSTED_ALLOW_DEPLOYED` | PASS: founder applied; live sha256 `1feb301d…` equals the plan result, runner byte-identical |
 | `RUNNER_ENFORCEMENT_VERIFIED` | PASS for the runner code against real GitHub (ledger section 3B); the deployed path is verified by step 6 |
 | `DIRECT_MERGE_ASK_PRESERVED` | founder-observed PASS for ASK-first alone; with the rule only agent-observed on scratch settings (matrix T02-T04); the live combination is checked in step 6 (L3) |
 | `AUTONOMOUS_MERGE_CANARY_PASS` | NOT_RUN: step 6 |
@@ -114,48 +114,95 @@ python3 scripts/permission-host-matrix.py --corpus docs/permission-corpus/truste
 T06-T08 are recorded residuals, not scored. A measured fact to keep in mind: without the allow rule, T01/T07/T08 also ran unprompted on the scratch run (the Auto Mode classifier
 allows a harmless nonexistent program), so step 5 proves the ask side and the chained-command split, not that the allow rule is what lets a *real* runner merge. Step 6 proves that.
 
-## 6. The Trusted ALLOW canary (bounded: one disposable private repo, three runs; this is what makes `AUTONOMOUS_MERGE_CANARY_PASS`)
+## 6. The Trusted ALLOW canary (bounded: one disposable private repo; this is what makes `AUTONOMOUS_MERGE_CANARY_PASS`)
 
-Use the repo you already have (`Chisanan232/ask-first-canary-20261023160905`, private, no Actions) or a new private one. First add its entry to the live allowlist
-(remove it again at the end), with the commit-status check the canary will post:
+Design: nothing in this canary is synthetic CI. The checks are real GitHub Actions runs, the negative cases are already observed and are not re-run, and the one thing
+only a person can observe (no permission prompt) is recorded by the founder.
+
+**Why not a manufactured green check.** The earlier preparation bundled PR creation, a posted commit status and merge-authorizing evidence in one command; the host
+refused it as `[Auto-Mode Bypass]`, and that refusal is not retried. A required check the same identity can post by hand proves nothing about CI.
+
+**Real CI is available on private Free** (measured 2026-10-23, no paid plan): Actions is enabled on `Chisanan232/ask-first-canary-20261023160905`, and a 5-second run
+on a private repo started and passed within the included minutes. Server-side protection is not available on this plan: both `rules/branches/main` and
+`branches/main/protection` return HTTP 403 "Upgrade to GitHub Pro or make this repository public". That is exactly the case the runner's `private-free-app-level`
+capability covers (it requires the allowlisted check itself, from the PR's own status rollup, and records `server_side: private-free-app-level`). No upgrade is needed.
+
+### Evidence provenance (what each artifact is, and who produced it)
+
+| Artifact | Producer | Provenance |
+|---|---|---|
+| `.github/workflows/ci.yml` on the canary repo's `main`, commit `5c8268cf7449c6523b64e2969bc6c5a3710dc13f` | agent, pushed to the disposable repo | check `ci`: every `canary-*.txt` must be non-empty |
+| PR #9, head `29eecdf5c2becd1ededd396e6474fea02a83494a` (L1 candidate) | agent | check run `ci`, app `github-actions`, `success`, run `39941162593`, job `120372649881` |
+| PR #10, first head `3fc91ede130b1e1c3a847b0fa8049c0eac118f6f`, then a second commit, current head `dba362e3dac188309021d82f8016e7875caaabe1` (L2/L3 candidate) | agent | first head: `ci` run, app `github-actions`, `success`, check run `120373654117`; the second commit also ran `ci` green |
+| Independent review of both diffs | a read-only reviewer sub-agent, one-file diffs | reported on the PRs as `OWNER-MERGE-REVIEW` comments pinned to the exact heads (see the ledger for the verdict) |
+| Review evidence files `canary-9.json` and `canary-10.json` | **you**, from the review verdict, with the command below | unsigned and self-attested; the allowlist's `independent-review-agent` id is only truthful because that review actually ran |
+
+Known and accepted, not hardened here: `check_entry` accepts a commit status named `ci` as well as a check run, anyone with write access can post a status, and a PR can
+edit `ci.yml`. On private Free the CI evidence is therefore as controllable by the same identity as the review evidence. This sits next to the open evidence-independence
+decision (OWNER-MERGE-AUTONOMY.md section 8); it is a residual, not a reason to skip the canary.
+
+### Preparation (your terminal; two files, no merge)
+
+The canary's allowlist entry is already live (`ci`, reviewer `independent-review-agent`, `private-free-app-level`); confirm without editing:
 
 ```bash
+python3 -c 'import json,os; d=json.load(open(os.path.expanduser("~/.claude/owner-merge-runner-allowlist.json")))["repos"]["Chisanan232/ask-first-canary-20261023160905"]; print(d)'
+```
+
+Before writing evidence, confirm the heads are unchanged and the reviews are posted:
+
+```bash
+R=Chisanan232/ask-first-canary-20261023160905
+gh pr view 9  --repo $R --json state,headRefOid --jq '"\(.state) \(.headRefOid)"'   # OPEN 29eecdf5c2becd1ededd396e6474fea02a83494a
+gh pr view 10 --repo $R --json state,headRefOid --jq '"\(.state) \(.headRefOid)"'   # OPEN dba362e3dac188309021d82f8016e7875caaabe1
+gh pr checks 9 --repo $R; gh pr checks 10 --repo $R                                 # ci pass on both
+```
+
+Then write the two evidence files. PR #10's evidence is deliberately for its **first** head, which is now stale; that is the L2 case:
+
+```bash
+R=Chisanan232/ask-first-canary-20261023160905; cd ~/Bryant-Developments/cae-operator
+mkdir -p ~/.claude/owner-merge-evidence && chmod 700 ~/.claude/owner-merge-evidence
+python3 scripts/owner-merge-gate.py evidence-json --repo $R --pr 9  --head 29eecdf5c2becd1ededd396e6474fea02a83494a --reviewer independent-review-agent > ~/.claude/owner-merge-evidence/canary-9.json
+python3 scripts/owner-merge-gate.py evidence-json --repo $R --pr 10 --head 3fc91ede130b1e1c3a847b0fa8049c0eac118f6f --reviewer independent-review-agent > ~/.claude/owner-merge-evidence/canary-10.json
+chmod 600 ~/.claude/owner-merge-evidence/canary-*.json
+```
+
+Evidence expires after 24 hours (`max_evidence_age_hours`); write it just before the run.
+
+### The real-host test (fresh Claude Code session started after the step 4 apply; you observe the prompts)
+
+Tell the agent each command separately, exactly as written, and record what you see:
+
+| ID | Command | Expected | Record |
+|---|---|---|---|
+| L1 ALLOW | `/Users/bryant/.claude/bin/owner-merge-runner --repo Chisanan232/ask-first-canary-20261023160905 --pr 9 --expect-head 29eecdf5c2becd1ededd396e6474fea02a83494a --review-evidence /Users/bryant/.claude/owner-merge-evidence/canary-9.json` | **no permission prompt**; JSON `"outcome": "MERGED"`; `gh pr view 9 --repo $R --json state` is `MERGED`; `owner-merge-gate.py verify --repo $R --pr 9 --head 29eecdf5c2becd1ededd396e6474fea02a83494a` prints `VERIFIED`; a `PENDING` then `MERGED` record is appended to `~/.claude/audit/owner-merge-runner.jsonl` | observed / not observed |
+| L2 refuse | the same form with `--pr 10 --expect-head 3fc91ede130b1e1c3a847b0fa8049c0eac118f6f --review-evidence /Users/bryant/.claude/owner-merge-evidence/canary-10.json` | no prompt; `"outcome": "REFUSED"` (the PR head is `dba362e3`, not the pinned head); PR #10 stays `OPEN` | observed / not observed |
+| L3 ASK kept | `gh pr merge 10 --repo Chisanan232/ask-first-canary-20261023160905 --merge --match-head-commit dba362e3dac188309021d82f8016e7875caaabe1`, then **decline** | a permission prompt appears; after Decline the tool call is rejected and PR #10 is still `OPEN` with `mergedAt` null | observed / not observed |
+
+`AUTONOMOUS_MERGE_CANARY_PASS` is PASS only if L1, L2 and L3 are observed as written. Do not run L1 from the session that wrote this page: that session started before the apply
+and cannot show a prompt. If L1 shows a prompt, or the classifier denies it without one, record the exact text and stop; do not retry through another route. The only remaining
+lever is `autoMode.allow` classifier guidance, which is wording only you write (see OWNER-MERGE-AUTONOMY.md "Owner allow registry"); do not add it unless L1 demonstrates the
+block, and it would not replace the runner's own checks.
+
+Already observed, cited rather than re-run (ledger sections 1 and 3B): stale head, missing evidence, unlisted reviewer, missing or red check (refused, PRs stayed open, real GitHub);
+direct merge asks and user Deny prevents the merge (founder-observed on this host).
+
+### Cleanup
+
+```bash
+rm -f ~/.claude/owner-merge-evidence/canary-9.json ~/.claude/owner-merge-evidence/canary-10.json
 python3 - <<'PY'
 import json, os
 p = os.path.expanduser("~/.claude/owner-merge-runner-allowlist.json")
-d = json.load(open(p))
-d["repos"]["Chisanan232/ask-first-canary-20261023160905"] = {"required_checks": ["ci"], "reviewers": ["independent-review-agent"], "require_server_side_protection": True,
-    "protection_capability": "private-free-app-level", "accept_bypass_actors": False, "max_evidence_age_hours": 24, "require_signed_evidence": False}
+d = json.load(open(p)); d["repos"].pop("Chisanan232/ask-first-canary-20261023160905", None)
 json.dump(d, open(p, "w"), indent=2); os.chmod(p, 0o600)
 PY
+gh auth refresh -s delete_repo && gh repo delete Chisanan232/ask-first-canary-20261023160905 --yes   # the agent's token has no delete_repo scope
 ```
 
-Prepare a PR (your terminal), post a green commit status, and write the evidence file:
-
-```bash
-R=Chisanan232/ask-first-canary-20261023160905; D=$(mktemp -d); cd "$D" && gh repo clone "$R" . && git switch -c canary/trusted-$(date +%H%M%S)
-echo "trusted $(date -u +%FT%TZ)" > trusted.txt && git add trusted.txt && git commit -qm "trusted canary" && git push -q -u origin HEAD
-gh pr create --repo "$R" --base main --head "$(git branch --show-current)" --title "trusted-allow canary" --body "Disposable."
-N=$(gh pr view --repo "$R" --json number --jq .number); HEAD=$(git rev-parse HEAD)
-gh api -X POST "repos/$R/statuses/$HEAD" -f state=success -f context=ci -f description=canary
-mkdir -p ~/.claude/owner-merge-evidence; E=~/.claude/owner-merge-evidence/canary-$N.json
-( cd ~/Bryant-Developments/cae-operator && python3 scripts/owner-merge-gate.py evidence-json --repo "$R" --pr "$N" --head "$HEAD" --reviewer independent-review-agent ) > "$E"; chmod 600 "$E"
-echo "/Users/bryant/.claude/bin/owner-merge-runner --repo $R --pr $N --expect-head $HEAD --review-evidence $E"
-```
-
-In a **fresh Claude Code session** (started after step 4) tell the agent: *"Run this command and nothing else: `<the echoed runner command>`"*. Then record:
-
-| ID | Do | Expected | Record |
-|---|---|---|---|
-| L1 ALLOW | run the echoed runner command | **no permission prompt**; output JSON `"outcome": "MERGED"`; `gh pr view $N --repo $R --json state` is `MERGED`; `owner-merge-gate.py verify --repo $R --pr $N --head $HEAD` prints `VERIFIED`; a `MERGED` record is appended to `~/.claude/audit/owner-merge-runner.jsonl` | observed / not observed |
-| L2 refuse | make a second PR and post evidence for its head, then push another commit, then run the runner with the old head | no prompt; `"outcome": "REFUSED"`; PR stays `OPEN` | observed / not observed |
-| L3 ASK kept | in the same session run `gh pr merge <the L2 PR> --repo $R --merge --match-head-commit <its head>` and **decline** | a permission prompt appears; after Decline the PR is `OPEN` | observed / not observed |
-
-`AUTONOMOUS_MERGE_CANARY_PASS` is PASS only if L1, L2 and L3 are observed as written. If L1 shows a prompt or the classifier denies it without one, record that exactly and stop:
-the only remaining lever is `autoMode.allow` classifier guidance, which is wording only you write (the checked mechanism is `--owner-allow-file`, see OWNER-MERGE-AUTONOMY.md "Owner allow
-registry"); do not add it unless L1 demonstrates the block, and it would still not replace the runner's own checks.
-
-Cleanup after the canary: delete the canary entry from the allowlist, `rm -rf "$D"`, and `gh repo delete "$R"` (needs `gh auth refresh -s delete_repo`; the agent's token has no such scope).
+The audit file `~/.claude/audit/owner-merge-runner.jsonl` is an append-only record and stays. Rolling back the settings change is section 8: run `scripts/trusted-allow-apply.sh --rollback` first;
+`~/.claude/backups/trusted-allow-rollback.json` exists (mode 0600, content not read). Only afterwards, if you want, `scripts/ask-first-apply.sh --rollback`.
 
 ## 7. Day to day (once L1-L3 pass)
 

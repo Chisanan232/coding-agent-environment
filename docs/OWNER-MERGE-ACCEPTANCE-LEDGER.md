@@ -76,9 +76,22 @@ private repo above; nothing under `~/.claude` was touched):
 
 Audit (scratch audit file): 9 records for 8 runs: 6 `REFUSED`, 1 `DRY_RUN`, and for the merge a `PENDING` record written before the call followed by `MERGED`
 with `merge_attempted: true`. The merge record's `guarantees` say what is and is not backed: `ci: CI_PASS`, `head_pin: github-enforced (gh pr merge --match-head-commit)`,
-`review: local-evidence-attestation (not a GitHub approval)`, `server_side: private-free-app-level`. The check was a commit status (no Actions on the repo).
+`review: local-evidence-attestation (not a GitHub approval)`, `server_side: private-free-app-level`. That run's check was a commit status posted for the scratch test; section 3C replaces that with real Actions CI.
 
 The five refused canary PRs (#3-#7) were closed by the agent. The agent's token has no `delete_repo` scope, so the canary repo itself is left for you to delete.
+
+## 3C. Trusted ALLOW canary redesign: real CI on private Free (agent-observed, 2026-10-23, read-only plus disposable-repo pushes)
+
+Live state at the time (read-only): `~/.claude/settings.json` sha256 `1feb301d42005b7402024431793e852a6f32b7b6456619eea3ce55eac0a5f1ef` (equals the trusted-allow plan's `result_sha`), `~/.claude/bin/owner-merge-runner` is byte-identical to `scripts/owner-merge-runner.py`, the allowlist holds the canary entry, `~/.claude/backups/trusted-allow-rollback.json` exists, the evidence directory is empty. The prior bundled preparation was host-denied (`[Auto-Mode Bypass]`) and was not retried.
+
+| Question | Observed |
+|---|---|
+| Can a private Free repo run a real required check? | **Yes.** Actions is enabled; a 5-second `ci` run on PR #9 (run `39941162593`, job `120372649881`, app `github-actions`) completed `success`. No paid plan used. |
+| Can server-side protection meet the required checks on private Free? | **No.** `rules/branches/main` and `branches/main/protection` both return HTTP 403 "Upgrade to GitHub Pro or make this repository public". The runner's `private-free-app-level` capability is the designed answer: it requires the allowlisted check from the PR's own rollup and records `server_side: private-free-app-level`. |
+| Real PRs prepared | #9 (L1, head `29eecdf5`), #10 (L2/L3, first head `3fc91ede`, current head `dba362e3` after a second push; both heads ran `ci` green). Both reviewed PASS by a read-only sub-agent; `OWNER-MERGE-REVIEW` comments are pinned to the exact heads (for #10 only the current head was reviewed as such). |
+| Review evidence files | **not written**. The founder writes them (handoff section 6): they are merge-authorizing and self-attested. |
+
+Residual, recorded and not hardened (same owner decision as self-attested review): the runner accepts a commit status named `ci` as well as a check run, anyone with write access can post a status, and a PR can edit `ci.yml`; on private Free, CI evidence is as controllable by the same identity as the review evidence.
 
 ## 4. Not observed (stays NOT_RUN)
 
@@ -92,10 +105,10 @@ The five refused canary PRs (#3-#7) were closed by the agent. The agent's token 
 |---|---|
 | `ASK_FIRST_ACCEPTED` | PASS (founder) |
 | `TRUSTED_ALLOW_IMPLEMENTED` | PASS (source, tests, candidate, scripts; merge pending review at the time of writing, see the PR) |
-| `TRUSTED_ALLOW_DEPLOYED` | NOT_RUN |
+| `TRUSTED_ALLOW_DEPLOYED` | PASS by founder apply; agent-observed live hash equals the plan result and the installed runner is byte-identical (section 3C) |
 | `RUNNER_ENFORCEMENT_VERIFIED` | PASS for the real runner code against real GitHub (section 3B); not for the deployed `~/.claude/bin` path |
 | `DIRECT_MERGE_ASK_PRESERVED` | PASS on the real host for the accepted ASK-first settings (**founder-observed**). With the runner allow rule present it is **agent-observed on scratch settings only** (headless matrix T02-T04); the rule is not live yet, so the live combination is NOT_RUN |
-| `AUTONOMOUS_MERGE_CANARY_PASS` | NOT_RUN (needs the live apply, handoff step 6) |
+| `AUTONOMOUS_MERGE_CANARY_PASS` | NOT_RUN: L1/L2/L3 are founder-observed (handoff section 6; PRs #9/#10 prepared with real CI) |
 | `MERGE_AUTONOMY_READY` | BLOCKED until the two NOT_RUN rows above pass |
 
 ## 6. Live Trusted ALLOW canary: interim reconciliation (2026-10-23, historical)
