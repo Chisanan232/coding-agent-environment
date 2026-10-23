@@ -168,6 +168,16 @@ class Rollout(unittest.TestCase):
         self.assertIn({"rule": "owner structured entry"}, merged["autoMode"]["hard_deny"])
         self.assertEqual(merged["autoMode"]["hard_deny"][0], "$defaults")
 
+    def test_structured_ask_and_allow_entries_plan_without_crashing(self):
+        live = json.loads(json.dumps(LIVE))
+        live["permissions"]["allow"] = live["permissions"]["allow"] + [{"a": 1}]
+        live["permissions"]["ask"] = live["permissions"]["ask"] + [{"a": 1}]
+        self.live.write_text(json.dumps(live))
+        self.cand.write_text(json.dumps({"permissions": {"ask": [{"tool": "Bash", "pattern": "x"}]}}))
+        p = json.loads(self.run_cli("plan", "--live", str(self.live), "--candidate", str(self.cand))[1])
+        self.assertTrue(any("both allow and ask" in f and '"a": 1' in f for f in p["compat"]), p["compat"])
+        self.assertIn({"tool": "Bash", "pattern": "x"}, cr.merge(live, json.loads(self.cand.read_text()))[0]["permissions"]["ask"])
+
     def test_non_ascii_live_bytes_roundtrip_exactly_and_no_temp_file_is_left(self):
         live = json.loads(json.dumps(LIVE))
         live["note"] = "café ✓ 日本"

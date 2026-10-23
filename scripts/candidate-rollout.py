@@ -135,7 +135,7 @@ def compat(live, merged, candidate, report_conflicts=()):
         for key in ("allow", "soft_deny", "hard_deny", "environment"):
             if key in am and (not am[key] or am[key][0] != "$defaults"):
                 out.append(f"BLOCKING autoMode.{key} lost $defaults")
-        for problem in wsp.lint_settings({"autoMode": am}):  # the merged autoMode, not only the candidate; untouched live allow/ask lists are judged elsewhere
+        for problem in wsp.lint_settings({"autoMode": am}):  # the merged autoMode, including live values carried over when the candidate omits a key (the owner restates the key to replace them); permissions.allow/ask are judged elsewhere
             out.append(f"BLOCKING merged configuration lint: {problem}")
     for rule in (live.get("permissions") or {}).get("ask", []):
         if rule not in merged["permissions"]["ask"] and rule not in candidate_retired(candidate):
@@ -160,7 +160,8 @@ def compat(live, merged, candidate, report_conflicts=()):
         for cmd in pr.PROXY_ROUTINE_COMMANDS:
             if pr.static_decision(cmd, merged_perm) == "ask":
                 out.append(f"routine wrapped command still asks after the merge (informational): {cmd!r}")
-    allow, ask = set(live_allow), set(merged["permissions"]["ask"])
+    canon = lambda r: json.dumps(r, sort_keys=True)  # entries may be objects, which are unhashable
+    allow, ask = {canon(r) for r in live_allow}, {canon(r) for r in merged["permissions"]["ask"]}
     for rule in sorted(allow & ask):
         out.append(f"rule is in both allow and ask (ask wins per the permissions docs, informational): {rule[:80]}")
     for k in ("bypassPermissions",):
