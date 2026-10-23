@@ -70,7 +70,7 @@ changes it and fails closed when it cannot verify the author.
 | Class | Author | Extra requirement before PASS | Gate prints |
 |---|---|---|---|
 | A | The authenticated owner identity | Repository admin, or a verified code owner with write permission for every changed file (CODEOWNERS read from the default branch; teams and unsupported syntax never count; `dir/*` covers direct children only; a PR editing CODEOWNERS, renaming files or changing 30+ files never qualifies; only a 404 falls through to another CODEOWNERS file) | the pinned merge command |
-| B | A verified dependency bot (`dependabot`, `renovate`: bot flag, bot branch, bot-only commits, dependency manifests only) | A real GitHub APPROVE by the owner identity itself (not any other reviewer or bot) on the exact head | `WAIT` with `approve_command` until approved, then the pinned merge command |
+| B | A verified dependency bot (`dependabot`, `renovate`: bot flag, bot branch, bot-only commits, dependency manifests only) | A real GitHub APPROVE by the owner identity itself (not any other reviewer or bot) on the exact head | `WAIT` with `approve_command` until the owner (never the agent) approves, then the pinned merge command |
 | C | Anyone else, including a failed bot check | A genuine GitHub APPROVED review by the owner on the exact head; the agent's comment never substitutes; `--admin` is never printed | the pinned merge command |
 | unverified | Missing, deleted or ghost author | Refused: request owner review | nothing |
 

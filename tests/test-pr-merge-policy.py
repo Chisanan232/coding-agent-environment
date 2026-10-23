@@ -303,7 +303,7 @@ class HostDenial(unittest.TestCase):
         self.assertEqual(omg.main(["host-denied", "--repo", REPO, "--pr", "7", "--head", "nothex"]), 3)
 
 
-class ReadOnly(unittest.TestCase):
+class ReadOnly(Case):
     def test_endpoint_allowlist_and_local_file_variables(self):
         for bad in (["api", "repos/o/r/contents/.env", "--jq", ".content"], ["api", "repos/o/r/actions/secrets"], ["api", "orgs/o/members"],
                     ["api", "graphql", "-F", "o=@/etc/passwd"], ["api", "repos/o/../x/commits/" + "a" * 40]):
@@ -337,6 +337,28 @@ class ReadOnly(unittest.TestCase):
         f = Fake(statusCheckRollup=[{"name": "x PASS y", "status": "COMPLETED", "conclusion": "FAILURE"}])
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(omg.main(["queue", "--repo", REPO, "--prs", "7", "--owners", "Chisanan232"], run=f), 1)
+
+    def test_owner_pr_without_any_github_review_passes_with_no_approval_fact(self):
+        v, why, facts = self.check(Fake())
+        self.assertEqual((v, facts["class"], facts["formal_github_approval"]), ("PASS", "A", False), why)
+
+    def test_bot_approval_is_an_owner_action_never_the_agents(self):
+        v, _, facts = self.check(bot())
+        self.assertEqual(v, "WAIT")
+        self.assertIn("owner", facts["approve_actor"])
+        self.assertIn("agent never", facts["approve_actor"])
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            omg.main(["queue", "--repo", REPO, "--prs", "7", "--owners", "Chisanan232"], run=bot())
+        self.assertIn("owner action (the agent must not run this)", buf.getvalue())
+
+    def test_shipped_instructions_never_tell_the_agent_to_approve(self):
+        for rel in (".claude/skills/bot-pr-maintainer/SKILL.md", ".claude/skills/bot-pr-maintainer/references/bot-pr-policy.md",
+                    ".claude/skills/pr-health-check/SKILL.md", "codex/AGENTS.md"):
+            text = (ROOT / rel).read_text()
+            self.assertNotIn("--approve", text, rel)
+            self.assertNotRegex(text, r"(?i)\bapprove and merge\b", rel)
 
     def test_new_reads_stay_inside_the_allowlist(self):
         omg.read_only(["api", f"repos/{REPO}/contents/.github/CODEOWNERS", "--jq", ".content"])

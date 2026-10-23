@@ -296,8 +296,9 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None):
     if p["reviewDecision"] == "REVIEW_REQUIRED" and (klass in ("A", "UNVERIFIED") or (klass in ("B", "C") and owner_approved)):
         reasons.append("FORMAL_APPROVAL_REQUIRED: the repository requires a formal approving review; the gate never substitutes for it")
     if klass == "B" and not owner_approved:
-        wait.append("AWAITING_BOT_APPROVAL: all other gates passed or pending; submit the real GitHub APPROVE (approve_command), then re-run check")
+        wait.append("AWAITING_BOT_APPROVAL: all other gates passed or pending; the owner must submit the real GitHub APPROVE (approve_command), then re-run check")
         facts["needs_approval"] = True
+        facts["approve_actor"] = "owner personally; the agent never submits or simulates this approval"
         facts["approve_command"] = (f"gh pr review {pr} --repo {repo} --approve --body "
                                     f"\"Dependency review recorded for head {head[:12]} in the OWNER-MERGE-REVIEW comment.\"")
     latest = {}
@@ -352,6 +353,7 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None):
     if reasons or [w for w in wait if not w.startswith("AWAITING_BOT_APPROVAL")]:
         facts.pop("approve_command", None)  # approve only after every other gate has passed
         facts.pop("needs_approval", None)
+        facts.pop("approve_actor", None)
     if reasons:
         return "REFUSE", reasons + wait, facts
     if wait:
@@ -410,7 +412,7 @@ def queue_report(run, repo, prs, owners, ci_unavailable=False):
             continue
         lines.append(f"#{n} {verdict} [{facts.get('class', '?')}]" + (f"  {'; '.join(reasons)}" if reasons else ""))
         if verdict == "WAIT" and facts.get("approve_command"):
-            lines.append("  approve (only after the gate passes), then re-run check: " + facts["approve_command"])
+            lines.append("  owner action (the agent must not run this), then re-run check: " + facts["approve_command"])
         if verdict == "PASS":
             lines.append(("  run: " if first else "  after the previous merge, re-run check (this branch will then be behind): ")
                          + merge_command(facts))
