@@ -192,3 +192,21 @@ gh repo delete Chisanan232/ask-first-canary-20261023160905 --yes
 
 Keep `~/.claude/audit/owner-merge-runner.jsonl` (append-only history, including the PR #9 `PENDING`/`MERGED` records). The installed runner, the `settings.json` allow rule and the
 ASK rules stay in place. Close PR #10 before deleting the repo if you want the canary closed cleanly (deleting the repo removes it anyway).
+
+## 8. Merge record for the acceptance PR (2026-10-23)
+
+PR #119 (sections 6-7) was merged through the **direct ASK path**, not the runner: the gate returned `PASS` (class A, `decision.outcome: ASK`, resolver `host_prompt`), and the founder answered
+the host prompt for exactly `gh pr merge 119 --repo Chisanan232/coding-agent-environment --merge --match-head-commit 82ea83851e8274520382e32e7c091056daeed75a`.
+
+| Check | Result |
+|---|---|
+| GitHub state | `MERGED` 2026-10-23T11:08:42Z, merge commit `60ca111a` |
+| Reviewed head `82ea8385` | second parent of the merge commit; ancestor of `origin/main`; `owner-merge-gate.py verify` = `VERIFIED` |
+| Content on `main` | sections 6-7 present; the file is identical to the reviewed head |
+| Review | independent reviews at `23216d47` and `82ea8385`: PASS, 0 blocking (three non-blocking nits left unfixed) |
+
+This merge is a **one-time founder-authorized direct ASK merge**. It does **not** count as an L1 autonomous runner merge, and no QA case was repeated. `DIRECT_MERGE_ASK_PRESERVED`
+holds: a head-pinned direct merge still prompts. `L1_AUTONOMOUS_MERGE` rests only on canary PR #9 (section 7).
+
+Canary evidence is preserved and untouched: `~/.claude/owner-merge-evidence/canary-9.json` and `canary-10.json`, the live allowlist entry, the `before-canary` backup, and the two PR #9
+records in the runner audit log. Canary PR #10 is still `OPEN`. Cleanup stays owner-run (section 7).
