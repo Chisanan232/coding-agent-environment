@@ -232,7 +232,7 @@ lane at a time, never kill or delete another session's work, and treat a swap-us
 exhaustion. After a reboot treat earlier processes, locks, reservations and jobs as stale and reconcile before resuming.
 Use `gh` for GitHub; it never bypasses host authorization, PR classes, CI, reviews or the merge gate. Merge an eligible PR only with
 the `merge_command` that `scripts/owner-merge-gate.py check --settings` prints (the validating `owner-merge-runner` when offered, else the
-pinned `gh pr merge`, which asks); never choose another merge spelling or interface to avoid a prompt or a refusal. Details:
+pinned `gh pr merge`, which asks); never choose another merge spelling or interface to avoid a prompt or a refusal. The merge is its own tool call: never combine it with a review comment, CI polling, a readback (`gh pr view`, `gh api`), a pipe, `head`/`tail`, `&&`, `;` or any other chaining. The order is: independent review, check the exact PR head, verify required CI, run `owner-merge-gate.py check`, write the review evidence at the printed `evidence_path` (its own call; only by an authorized path, never self-approved), run the printed `merge_command` alone, then verify the merged state with `owner-merge-gate.py verify` in a separate call. A compound shell call matches no merge rule, so the host asks about the whole thing; that is a workflow error, not a runner failure. Details:
 [engineering-workflow](skills/engineering-workflow/SKILL.md).
 
 ## Decision Delegation
