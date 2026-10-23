@@ -5,6 +5,7 @@
   owner-merge-gate.py verify --repo OWNER/REPO --pr N --head SHA
   owner-merge-gate.py queue  --repo OWNER/REPO --prs 5,6 --owners a,b      (print-only plan)
   owner-merge-gate.py evidence-line --head SHA --reviewer ID               (prints the record line)
+  owner-merge-gate.py evidence-json --repo R --pr N --head SHA --reviewer ID   (prints the JSON file the owner-merge-runner reads)
 
 `check` evaluates the exact PR head and prints one JSON verdict (PASS, REFUSE or WAIT) plus the
 merge command to run, and a `decision` (ALLOW, ASK or DENY across five separate dimensions; see
@@ -514,6 +515,21 @@ def evidence_line(head, reviewer, verdict="PASS", blocking=0):
     return f"OWNER-MERGE-REVIEW head={head} verdict={verdict} blocking={blocking} reviewer={reviewer}"
 
 
+def evidence_json(repo, pr, base, head, reviewer, kind="independent-agent", now=None):
+    """The review-evidence record the validating runner reads (see owner-merge-runner.py load_evidence). Print-only; unsigned.
+
+    It records that an independent review of this exact head passed. It is never a GitHub approval, and the runner (not this
+    record) enforces the head pin, the checks and the class rules.
+    """
+    import time
+    if not REPO_RE.fullmatch(repo) or not re.fullmatch(r"[1-9][0-9]{0,8}", str(pr)) or not re.fullmatch(r"[0-9a-f]{40}", head) \
+            or not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", base) or not re.fullmatch(r"[A-Za-z0-9._:-]{3,64}", reviewer) \
+            or kind not in ("human", "independent-agent"):
+        raise ValueError("repo, pr, base, head (40-hex), reviewer and kind (human|independent-agent) must be well formed")
+    return {"repo": repo, "pr": int(pr), "base": base, "head": head, "verdict": "PASS", "reviewer": reviewer, "reviewer_kind": kind,
+            "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}
+
+
 def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None):
     """Text plan for the owner: gate verdict per PR, in the order given. Print-only."""
     lines, first = [], True
@@ -566,8 +582,18 @@ def main(argv=None, run=None):
     e.add_argument("--reviewer", required=True)
     e.add_argument("--verdict", default="PASS")
     e.add_argument("--blocking", type=int, default=0)
+    ej = sub.add_parser("evidence-json")
+    ej.add_argument("--repo", required=True)
+    ej.add_argument("--pr", required=True)
+    ej.add_argument("--base", default="main")
+    ej.add_argument("--head", required=True)
+    ej.add_argument("--reviewer", required=True)
+    ej.add_argument("--kind", default="independent-agent")
     a = ap.parse_args(argv)
     try:
+        if a.cmd == "evidence-json":
+            print(json.dumps(evidence_json(a.repo, a.pr, a.base, a.head, a.reviewer, a.kind), indent=1))
+            return 0
         if a.cmd == "evidence-line":
             print(evidence_line(a.head, a.reviewer, a.verdict, a.blocking))
             return 0

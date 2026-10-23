@@ -150,7 +150,7 @@ def compat(live, merged, candidate, report_conflicts=(), owner_allow=()):
         if r not in wsp.RETIRABLE_ASKS:
             out.append(f"BLOCKING candidate asks to retire an ask the tool may not retire: {r}")
     for r in cand_perms.get("allow", []):
-        if r not in wsp.PROXY_ROUTINE_ALLOW + wsp.ROUTINE_BARE_ALLOW:
+        if r not in wsp.PROXY_ROUTINE_ALLOW + wsp.ROUTINE_BARE_ALLOW and not (isinstance(r, str) and wsp.TRUSTED_RUNNER_RULE_RE.fullmatch(r)):
             out.append(f"BLOCKING candidate allow is not one of the scoped allows this tool may add: {r}")
     merged_perm = merged["permissions"]
     if cand_perms.get("allow") or any(r in cand_perms.get("retire_ask", []) for r in wsp.RETIRABLE_ASKS):
@@ -160,6 +160,16 @@ def compat(live, merged, candidate, report_conflicts=(), owner_allow=()):
         for cmd in pr.PROXY_ROUTINE_COMMANDS:
             if pr.static_decision(cmd, merged_perm) == "ask":
                 out.append(f"routine wrapped command still asks after the merge (informational): {cmd!r}")
+    runner_allows = [r for r in cand_perms.get("allow", []) if isinstance(r, str) and wsp.TRUSTED_RUNNER_RULE_RE.fullmatch(r)]
+    if runner_allows:  # a trusted-allow candidate is only safe on top of ASK-first, and no ask may swallow the runner form
+        for rule in runner_allows:
+            home = wsp.TRUSTED_RUNNER_RULE_RE.fullmatch(rule).group(1)
+            probe = f"{home}/.claude/bin/owner-merge-runner --repo o/r --pr 7 --expect-head {'a' * 40} --review-evidence /tmp/e.json"
+            if pr.static_decision(probe, merged_perm) != "allow":
+                out.append(f"BLOCKING the runner command would not be allowed after the merge (an ask or deny matches it, or no allow does): {pr.static_decision(probe, merged_perm)}")
+        for cmd in wsp.MERGE_SCOPE_COMMANDS + ["rtk " + c for c in wsp.MERGE_SCOPE_COMMANDS]:
+            if pr.static_decision(cmd, merged_perm) != "ask":
+                out.append(f"BLOCKING trusted allow requires ASK-first: direct merge would not ask (prefix-rule emulator): {cmd!r} -> {pr.static_decision(cmd, merged_perm)}")
     if any(isinstance(a, str) and a in wsp.MERGE_SCOPE_MARKERS for a in cand_perms.get("ask", [])):  # any merge-scope-only ask makes it a merge-scope candidate: all its shapes must ask
         for cmd in wsp.MERGE_SCOPE_COMMANDS + ["rtk " + c for c in wsp.MERGE_SCOPE_COMMANDS]:
             if pr.static_decision(cmd, merged_perm) != "ask":

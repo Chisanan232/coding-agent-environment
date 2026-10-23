@@ -269,6 +269,26 @@ MERGE_SCOPE_COMMANDS = ["gh pr merge 5", "gh pr merge 5 --repo o/r --merge --mat
                         "gh api graphql -f query=mutation{enablePullRequestAutoMerge}"]
 
 
+# Trusted ALLOW (SPE-118): the one allow rule that lets the validating runner merge without a prompt. The runner (structured args, exact head pin, evidence,
+# checks, audit) is the enforcement boundary; this rule only lets that one program start. It names no `gh` command, so none of the merge asks match it.
+TRUSTED_RUNNER_RULE_RE = re.compile(r"Bash\((/[^ *()]+)/\.claude/bin/owner-merge-runner --repo \* --pr \* --expect-head \* --review-evidence \*\)")
+
+
+def trusted_runner_rule(home):
+    return f"Bash({home}/.claude/bin/owner-merge-runner --repo * --pr * --expect-head * --review-evidence *)"
+
+
+def trusted_allow_candidate(home=None):
+    """One allow rule, nothing else: no ask, no deny, no autoMode, no hook. The merge asks stay, so a direct `gh pr merge` still asks."""
+    rule = trusted_runner_rule(home or os.path.expanduser("~"))
+    return {
+        "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Adds the single allow rule for the validating "
+                       "owner-merge-runner at its installed path. Adds no ask, no deny and no autoMode change; the direct-merge asks stay, so a direct gh pr merge still asks. "
+                       "Requires the ASK-first candidate to be applied and the runner installed at that exact path.",
+        "permissions": {"allow": [rule], "deny": []},
+    }
+
+
 def merge_scope_candidate():
     """SPE-118: make the common direct merge routes ask. Asks win over allows, so the broad `gh pr merge` / `gh pr *` / GitHub MCP merge
     allows stop working for these shapes without being removed. Prefix rules cannot cover every shape (a tab, `command gh`, `sh -c`,
@@ -375,6 +395,8 @@ def lint_settings(cfg, owner_allow=()):
             bad.append(f"blanket allow {r}")
         elif re.search(r"gh pr merge|gh api.*merge|--admin", r):
             bad.append(f"standing merge permission {r}")
+        elif TRUSTED_RUNNER_RULE_RE.fullmatch(r):
+            continue  # the one trusted-runner rule; the runner, not this rule, is the enforcement boundary
         elif "*" in r and not READ_ONLY_ALLOW.fullmatch(r):
             bad.append(f"wildcard allow outside the read-only allowlist {r}")
     return bad
@@ -402,6 +424,7 @@ def main(argv=None):
     r.add_argument("--out")
     r.add_argument("--asks-only", action="store_true", help="omit the autoMode block (minimal canary candidate)")
     r.add_argument("--proxy-scoped", action="store_true", help="SPE-119 candidate: retire the broad rtk proxy ask, add scoped asks and allows")
+    r.add_argument("--trusted-allow", action="store_true", help="SPE-118 candidate: the single allow rule for the installed owner-merge-runner (no ask, no autoMode)")
     r.add_argument("--merge-scope", action="store_true", help="SPE-118 candidate: ask for every direct merge route (no allow, no autoMode change)")
     r.add_argument("--owner-allow-file", help="JSON array of owner-authored autoMode.allow entries to append after $defaults (each is linted; the agent never writes this text)")
     lint = sub.add_parser("lint-settings")
@@ -421,9 +444,9 @@ def main(argv=None):
             print(json.dumps(out, indent=1))
             return {"ALLOW": 0, "ASK": 1, "DENY": 2}[out["verdict"]]
         if a.cmd == "render-settings":
-            if a.merge_scope and (a.proxy_scoped or a.asks_only):
-                raise ValueError("--merge-scope cannot be combined with --proxy-scoped or --asks-only")
-            cand = merge_scope_candidate() if a.merge_scope else proxy_scoped_candidate() if a.proxy_scoped else candidate(a.kind, asks_only=a.asks_only)
+            if (a.merge_scope or a.trusted_allow) and (a.proxy_scoped or a.asks_only or (a.merge_scope and a.trusted_allow)):
+                raise ValueError("--merge-scope and --trusted-allow cannot be combined with each other, --proxy-scoped or --asks-only")
+            cand = trusted_allow_candidate() if a.trusted_allow else merge_scope_candidate() if a.merge_scope else proxy_scoped_candidate() if a.proxy_scoped else candidate(a.kind, asks_only=a.asks_only)
             if a.owner_allow_file:
                 owner_allow = load_owner_allow(a.owner_allow_file)
                 if "autoMode" not in cand:
