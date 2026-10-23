@@ -24,6 +24,7 @@ and only together with --ci-unavailable and only when no check genuinely failed.
 import argparse
 import base64
 import json
+import os
 import re
 import subprocess
 import sys
@@ -385,6 +386,48 @@ def merge_command(facts):
     return (f"gh pr merge {facts['pr']} --repo {facts['repo']} --merge --match-head-commit {facts['head']}")
 
 
+# --- Canonical executor (SPE-118): one trusted way to run an eligible merge ------------------------------------------------
+# The runner (scripts/owner-merge-runner.py, installed at ~/.claude/bin/owner-merge-runner) re-validates the PR itself and is the
+# only command the single Trusted ALLOW rule names. check offers it when it is installed, the repo is in the owner's runner
+# allowlist and the host allows exactly that command; otherwise it offers the direct pinned command, which the host ASKs for.
+# A runner refusal is binding: no direct-merge fallback is ever printed alongside it.
+RUNNER_REL = os.path.join(".claude", "bin", "owner-merge-runner")
+ALLOWLIST_REL = os.path.join(".claude", "owner-merge-runner-allowlist.json")
+EVIDENCE_REL = os.path.join(".claude", "owner-merge-evidence")
+
+
+def evidence_path(facts, home):
+    return os.path.join(home, EVIDENCE_REL, f"{facts['repo'].replace('/', '__')}-{facts['pr']}-{facts['head'][:12]}.json")
+
+
+def runner_command(facts, home):
+    return (f"{os.path.join(home, RUNNER_REL)} --repo {facts['repo']} --pr {facts['pr']} --expect-head {facts['head']} "
+            f"--review-evidence {evidence_path(facts, home)}")
+
+
+def runner_available(home):
+    """(installed, allowlisted repo names lower-cased). Reads only the allowlist's repo keys; any problem means not available."""
+    runner = os.path.join(home, RUNNER_REL)
+    installed = os.path.isfile(runner) and not os.path.islink(runner) and os.access(runner, os.X_OK)
+    try:
+        with open(os.path.join(home, ALLOWLIST_REL)) as fh:
+            repos = {k.lower() for k in json.load(fh)["repos"]}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        repos = set()
+    return installed, repos
+
+
+def select_executor(settings, facts, home, installed, repos):
+    """Pure: the command to run for a PASS and the host permission that judges it. Runner only when it is host-allowed."""
+    if installed and facts["repo"].lower() in repos:
+        command = runner_command(facts, home)
+        host = host_permission(settings, command, rtk_twin=False)
+        if host == "allow":
+            return {"executor": "owner-merge-runner", "command": command, "host": host, "evidence_path": evidence_path(facts, home)}
+    command = merge_command(facts)
+    return {"executor": "direct-gh", "command": command, "host": host_permission(settings, command)}
+
+
 # --- Three-outcome decision (SPE-118): ALLOW / ASK / DENY -----------------------------------------------------------------
 # The gate verdict (PASS/WAIT/REFUSE) is only the engineering and GitHub dimensions. A decision also needs the host tool
 # permission, and a PASS in one dimension is never a PASS in all. DENY is reserved for constraints nobody here may waive;
@@ -426,7 +469,7 @@ HOST_OUTCOME = {"allow": "ALLOW", "ask": ASK, "deny": DENY, "classifier": ASK, "
 _HOST_RANK = {"deny": 3, "ask": 2, "classifier": 1, "allow": 0}
 
 
-def host_permission(settings_paths, command):
+def host_permission(settings_paths, command, rtk_twin=True):
     """HOST_TOOL_PERMISSION for the exact pinned command, from the permission rules of one or more settings files.
 
     Pass every layer you have (user, project, local, managed): rules are pooled and deny > ask > allow, and both the plain and the
@@ -457,11 +500,13 @@ def host_permission(settings_paths, command):
                     broken = True
                 else:
                     pooled[bucket].append(r)
-    result = max((mod.static_decision(c, pooled) for c in (command, "rtk " + command)), key=lambda d: _HOST_RANK[d])
+    # rtk_twin=False judges only the literal spelling: the rewrite hook only touches commands rtk knows (gh, git, ...), never an absolute-path program
+    spellings = (command, "rtk " + command) if rtk_twin else (command,)
+    result = max((mod.static_decision(c, pooled) for c in spellings), key=lambda d: _HOST_RANK[d])
     return "ask" if broken and _HOST_RANK[result] < _HOST_RANK["ask"] else result
 
 
-def decide(verdict, reasons, facts, host="not_evaluated"):
+def decide(verdict, reasons, facts, host="not_evaluated", command=None):
     """Combine the dimensions into ALLOW / ASK / DENY. Pure: no I/O, so every cell of the matrix is testable."""
     dims = {"PR_OWNER_CLASS": facts.get("class", "UNKNOWN"), "ENGINEERING_GATE": "PASS", "GITHUB_APPROVAL_REQUIREMENT": "SATISFIED",
             "GITHUB_MERGE_ELIGIBILITY": "ELIGIBLE", "HOST_TOOL_PERMISSION": host}
@@ -492,7 +537,7 @@ def decide(verdict, reasons, facts, host="not_evaluated"):
             denies.append({"reason": "HOST_TOOL_PERMISSION deny: a host rule denies this merge", "resolver": "none"})
     out = {"outcome": outcome, "dimensions": dims, "asks": asks, "denies": denies}
     if outcome in ("ALLOW", ASK) and verdict == "PASS":  # an approved ASK covers this one operation at this one head, nothing wider
-        out["approval_scope"] = "exactly the pinned operation: " + merge_command(facts)
+        out["approval_scope"] = "exactly the pinned operation: " + (command or merge_command(facts))
     return out
 
 
@@ -539,8 +584,8 @@ def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None):
         except Exception as e:
             lines.append(f"#{n} ERROR  {type(e).__name__}: {str(e)[:200]}")
             continue
-        host = host_permission(settings, merge_command(facts)) if verdict == "PASS" else "not_evaluated"
-        decision = decide(verdict, reasons, facts, host)
+        sel = select_executor(settings, facts, os.path.expanduser("~"), *runner_available(os.path.expanduser("~"))) if verdict == "PASS" else None
+        decision = decide(verdict, reasons, facts, sel["host"] if sel else "not_evaluated", sel and sel["command"])
         lines.append(f"#{n} {verdict} [{facts.get('class', '?')}] decision={decision['outcome']}" + (f"  {'; '.join(reasons)}" if reasons else ""))
         if verdict == "WAIT" and facts.get("approve_command"):
             lines.append("  owner action (the agent must not run this), then re-run check: " + facts["approve_command"])
@@ -548,7 +593,7 @@ def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None):
             lines.append("  not runnable: " + "; ".join(d["reason"] for d in decision["denies"]))
         elif verdict == "PASS":
             head = "  run: " if first else "  after the previous merge, re-run check (this branch will then be behind): "
-            lines.append(head + merge_command(facts))
+            lines.append(head + sel["command"])
             first = False
     return "\n".join(lines)
 
@@ -615,10 +660,17 @@ def main(argv=None, run=None):
                 return 1
             verdict, reasons, facts = evaluate(run, a.repo, a.pr, owners, a.ci_unavailable)
             out = {"verdict": verdict, "reasons": reasons, **facts}
-            host = host_permission(a.settings, merge_command(facts)) if verdict == "PASS" else "not_evaluated"
-            out["decision"] = decide(verdict, reasons, facts, host)
-            if verdict == "PASS" and out["decision"]["outcome"] != DENY:  # a host deny leaves nothing to run
-                out["merge_command"] = merge_command(facts)
+            sel = None
+            if verdict == "PASS":
+                sel = select_executor(a.settings, facts, os.path.expanduser("~"), *runner_available(os.path.expanduser("~")))
+            host = sel["host"] if sel else "not_evaluated"
+            out["decision"] = decide(verdict, reasons, facts, host, sel and sel["command"])
+            if sel and out["decision"]["outcome"] != DENY:  # a host deny leaves nothing to run
+                out["merge_command"], out["executor"] = sel["command"], sel["executor"]
+                if sel.get("evidence_path"):
+                    out["evidence_path"] = sel["evidence_path"]
+                    out["evidence_note"] = ("write this file only after an independent review PASS at this exact head "
+                                            "(owner-merge-gate.py evidence-json); the runner refuses without it")
             print(json.dumps(out, indent=1))
             if out["decision"]["outcome"] == DENY and verdict == "PASS":
                 return 1
