@@ -254,6 +254,23 @@ def candidate(kind, asks_only=False):
     return cand
 
 
+MERGE_SCOPE_BASH_ASKS = ["Bash(gh pr merge:*)", "Bash(gh pr merge *)", "Bash(gh api *pulls/*/merge*)"]
+MERGE_SCOPE_OTHER_ASKS = ["mcp__github__merge_pull_request"]
+
+
+def merge_scope_candidate():
+    """SPE-118: make every direct merge route ask. Asks win over allows, so the broad `gh pr merge` / `gh pr *` / GitHub MCP merge
+    allows stop working without being removed. Adds no allow, no autoMode change and no runner rule (that broadens host
+    authorization and stays an owner decision). Until the owner also allows the validating runner, every merge prompts."""
+    asks = MERGE_SCOPE_BASH_ASKS + [r.replace("Bash(", "Bash(rtk ", 1) for r in MERGE_SCOPE_BASH_ASKS] + MERGE_SCOPE_OTHER_ASKS
+    return {
+        "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Adds asks for the direct merge routes "
+                       "(gh pr merge, rtk gh pr merge, gh api .../merge, the GitHub MCP merge tool) so the broad merge allows no longer run silently. "
+                       "Adds no allow and no autoMode change; the validating runner's allow rule stays an owner step. Every merge prompts until that rule exists.",
+        "permissions": {"ask": asks, "deny": []},
+    }
+
+
 def proxy_scoped_candidate():
     """SPE-119: retire the broad `rtk proxy *` ask, keep every protected wrapped operation asking, allow routine wrapped work.
 
@@ -373,6 +390,7 @@ def main(argv=None):
     r.add_argument("--out")
     r.add_argument("--asks-only", action="store_true", help="omit the autoMode block (minimal canary candidate)")
     r.add_argument("--proxy-scoped", action="store_true", help="SPE-119 candidate: retire the broad rtk proxy ask, add scoped asks and allows")
+    r.add_argument("--merge-scope", action="store_true", help="SPE-118 candidate: ask for every direct merge route (no allow, no autoMode change)")
     r.add_argument("--owner-allow-file", help="JSON array of owner-authored autoMode.allow entries to append after $defaults (each is linted; the agent never writes this text)")
     lint = sub.add_parser("lint-settings")
     lint.add_argument("file")
@@ -391,7 +409,7 @@ def main(argv=None):
             print(json.dumps(out, indent=1))
             return {"ALLOW": 0, "ASK": 1, "DENY": 2}[out["verdict"]]
         if a.cmd == "render-settings":
-            cand = proxy_scoped_candidate() if a.proxy_scoped else candidate(a.kind, asks_only=a.asks_only)
+            cand = merge_scope_candidate() if a.merge_scope else proxy_scoped_candidate() if a.proxy_scoped else candidate(a.kind, asks_only=a.asks_only)
             if a.owner_allow_file:
                 owner_allow = load_owner_allow(a.owner_allow_file)
                 if "autoMode" not in cand:

@@ -358,6 +358,51 @@ class Rollout(unittest.TestCase):
         self.assertIn("REFUSED", str(rc))
 
 
+class MergeScope(unittest.TestCase):
+    setUp, run_cli, plan = Rollout.setUp, Rollout.run_cli, Rollout.plan
+    EXAMPLE = ROOT / "docs/examples/candidate-settings-merge-scope.example.json"
+
+    def test_example_matches_generator_and_lints_clean(self):
+        cand = json.loads(self.EXAMPLE.read_text())
+        self.assertEqual(cand, cr.wsp.merge_scope_candidate())
+        self.assertEqual(cr.wsp.lint_settings(cand), [])
+
+    def test_candidate_only_asks_and_never_grants_or_names_the_runner(self):
+        cand = cr.wsp.merge_scope_candidate()
+        self.assertEqual(set(cand), {"_scope_note", "permissions"})
+        self.assertEqual(set(cand["permissions"]), {"ask", "deny"})
+        self.assertNotIn("owner-merge-runner", json.dumps(cand))
+        asks = cand["permissions"]["ask"]
+        for route in ("Bash(gh pr merge:*)", "Bash(rtk gh pr merge:*)", "Bash(gh api *pulls/*/merge*)", "mcp__github__merge_pull_request"):
+            self.assertIn(route, asks)
+
+    def test_every_live_merge_allow_is_covered_by_an_ask_and_nothing_else_changes(self):
+        live = {**LIVE, "permissions": {**LIVE["permissions"], "allow": ["Bash(gh pr merge:*)", "Bash(gh pr *)", "mcp__github__merge_pull_request", "Bash(ls:*)"]}}
+        self.live.write_text(json.dumps(live, indent=2))
+        self.cand.write_text(json.dumps(cr.wsp.merge_scope_candidate()))
+        before = self.live.read_bytes()
+        p = self.plan()
+        self.assertFalse(p["blocking"], p["compat"])
+        self.assertEqual(self.live.read_bytes(), before)
+        merged = cr.merge(live, cr.wsp.merge_scope_candidate())[0]
+        self.assertEqual(merged["permissions"]["allow"], live["permissions"]["allow"])
+        self.assertEqual(merged["autoMode"], live["autoMode"])
+        self.assertEqual(merged["permissions"]["deny"], live["permissions"]["deny"])
+        for ask in live["permissions"]["ask"]:
+            self.assertIn(ask, merged["permissions"]["ask"])
+        for ask in ("Bash(gh pr merge:*)", "Bash(rtk gh pr merge:*)", "mcp__github__merge_pull_request"):
+            self.assertIn(ask, merged["permissions"]["ask"])
+
+    def test_cli_renders_the_example_and_refuses_the_registry_combination(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "c.json")
+            self.assertEqual(cr.wsp.main(["render-settings", "--kind", "personal", "--merge-scope", "--out", out]), 0)
+            self.assertEqual(json.load(open(out)), json.loads(self.EXAMPLE.read_text()))
+            reg = os.path.join(d, "r.json")
+            open(reg, "w").write("[]")
+            self.assertEqual(cr.wsp.main(["render-settings", "--kind", "personal", "--merge-scope", "--owner-allow-file", reg]), 3)
+
+
 class OwnerAllowRollout(unittest.TestCase):
     ENTRY = "Synthetic: a merge run through owner-merge-runner with --expect-head pinned to the reviewed head."
     setUp, run_cli, plan = Rollout.setUp, Rollout.run_cli, Rollout.plan
