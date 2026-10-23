@@ -140,6 +140,7 @@ jobs:
           python3 tests/test-branch-protection-rollout.py
           python3 tests/test-pr-merge-policy.py
           python3 tests/test-merge-decision.py
+          python3 tests/test-ask-first-apply.py
           python3 tests/test-workstation-policy.py
           python3 tests/test-candidate-rollout.py
           python3 tests/test-rtk-proxy-prompt-removal.py
