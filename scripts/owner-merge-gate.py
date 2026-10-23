@@ -422,7 +422,8 @@ def select_executor(settings, facts, home, installed, repos):
     if installed and facts["repo"].lower() in repos:
         command = runner_command(facts, home)
         host = host_permission(settings, command, rtk_twin=False)
-        if host == "allow":
+        # The twin is never an authorization, but an explicit deny aimed at it still turns the runner off (the baseline rtk asks are not a signal).
+        if host == "allow" and host_permission(settings, command) != "deny":
             return {"executor": "owner-merge-runner", "command": command, "host": host, "evidence_path": evidence_path(facts, home)}
     command = merge_command(facts)
     return {"executor": "direct-gh", "command": command, "host": host_permission(settings, command)}
@@ -594,6 +595,8 @@ def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None):
         elif verdict == "PASS":
             head = "  run: " if first else "  after the previous merge, re-run check (this branch will then be behind): "
             lines.append(head + sel["command"])
+            if sel.get("evidence_path"):
+                lines.append("  (write the review-evidence file named above only after an independent review PASS at this exact head)")
             first = False
     return "\n".join(lines)
 

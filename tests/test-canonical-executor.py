@@ -81,11 +81,22 @@ class Selection(unittest.TestCase):
             self.assertEqual(sel["command"], omg.merge_command(FACTS), label)
             self.assertEqual(omg.decide("PASS", [], FACTS, sel["host"], sel["command"])["outcome"], "ASK", label)
 
-    def test_a_host_deny_on_the_runner_command_is_never_routed_around(self):
+    def test_a_host_deny_on_the_runner_command_falls_back_to_ask_never_allow(self):
         h = Home(self, deny=["Bash(*owner-merge-runner*)"])
         sel = h.select()
         self.assertEqual(sel["executor"], "direct-gh")  # runner not offered; the direct command still asks (it is not made allow)
         self.assertNotEqual(sel["host"], "allow")
+
+    def test_a_deny_aimed_at_the_rtk_spelling_also_turns_the_runner_off(self):
+        sel = Home(self, deny=["Bash(rtk *owner-merge-runner*)"]).select()
+        self.assertEqual((sel["executor"], sel["host"]), ("direct-gh", "ask"))
+
+    def test_queue_offers_the_runner_with_the_evidence_note(self):
+        h = Home(self)
+        with mock.patch.dict(os.environ, {"HOME": h.home}):
+            text = omg.queue_report(pm.Fake(), REPO, [7], ["Chisanan232"], False, [h.settings])
+        self.assertIn("run: " + os.path.join(h.home, ".claude", "bin", "owner-merge-runner"), text)
+        self.assertIn("independent review PASS", text)
 
     def test_repo_match_is_case_insensitive_and_a_symlinked_or_non_executable_runner_is_unavailable(self):
         h = Home(self)

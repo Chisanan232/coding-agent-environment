@@ -27,6 +27,10 @@ re-validates everything itself before it starts the one mutating call, `gh pr me
 | Non-owner PR without the genuine owner approval, CI pending, unresolved review | none | **ASK** with a named resolver; no command is printed |
 | Failed CI, fork head, closed PR, repository rules, host deny rule, gate error | none | **DENY** |
 
+`ALLOW` means allowed by the settings layers passed with `--settings`; pass every layer you have (a project or managed deny still blocks, which fails safe). The review evidence is self-attested and unsigned unless the allowlist sets `require_signed_evidence`; that is the open evidence-independence decision, not something this selection step changes.
+
+`ALLOW` authorizes the executor, not the outcome: the runner can still refuse (for example a public repository with no branch protection, missing or stale evidence), and that refusal stands.
+
 A runner refusal is binding: the gate never prints a direct-merge command next to a runner command, and a refusal, a host denial or a GitHub rejection is not
 retried through another interface.
 
