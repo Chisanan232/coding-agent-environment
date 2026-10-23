@@ -150,6 +150,12 @@ Omit file chronology and unsupported completion claims.
   apply to every class: a repository that genuinely requires a formal review
   (`REVIEW_REQUIRED`) blocks, and the classes above never waive it; only narrow
   exception 2 below addresses an owner-only same-identity deadlock.
+- A merge decision is **ALLOW / ASK / DENY**, judged per dimension (owner class, engineering gate, GitHub approval
+  requirement, GitHub merge eligibility, host tool permission); `owner-merge-gate.py check --settings` prints it. Anything a
+  human, the author or the agent can resolve is ASK with a named resolver (a host prompt, a genuine owner review, a
+  revalidation), never an unrecoverable failure; DENY is for non-waivable constraints such as a failed check or a
+  cross-repository head. An approved ASK covers exactly the one pinned operation; the agent never simulates the answer.
+  Details: `docs/OWNER-MERGE-OPERATOR-GUIDE.md`.
 
 Do not merge until required checks, CODEOWNERS-required approvals, the class approvals above,
 conflict resolution, branch currency, and blocking review threads satisfy the

@@ -62,6 +62,14 @@ and pass `--ci-unavailable`. Any genuinely failing check still refuses.
 which checks a repository should have. It does not approve a PR, satisfy a required formal review, change branch protection, merge
 into a release or deployment branch, or authorize deployment or publication (it cannot see whether merging to the default branch deploys).
 
+## Merge decision: ALLOW / ASK / DENY (SPE-118)
+
+`check` also prints a `decision` that combines five separate dimensions (owner class, engineering gate, GitHub approval requirement, GitHub merge
+eligibility, host tool permission). With `--settings <settings.json>` it reads only the permission rules to judge the exact pinned command; without it the host
+dimension is `not_evaluated` and a passing PR is ASK, never ALLOW. A missing approval, stale evidence or a host prompt is ASK with a named resolver; a failed
+check, a cross-repository head, a closed PR, repository rules or a host deny rule is DENY. The gate verdict (PASS/WAIT/REFUSE) and its exit code are unchanged.
+The operator procedure, exact rules, apply and rollback commands and the test list are in [OWNER-MERGE-OPERATOR-GUIDE.md](OWNER-MERGE-OPERATOR-GUIDE.md).
+
 ## Pull request classes (SPE-116)
 
 `check` reports `class` in its output. The class decides who must approve; the gate never
