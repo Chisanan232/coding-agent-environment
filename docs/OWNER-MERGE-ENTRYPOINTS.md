@@ -57,6 +57,15 @@ changed. Under it, Codex has no prompt for any merge spelling, so for Codex the 
 host ASK for Codex, the owner sets the merge tool to `prompt` (the shipped template now does) and adds an exec-policy `prompt` rule for `gh pr merge`; that is an owner
 settings change and is not made here.
 
+## Observed limit: who writes the review evidence (2026-10-23, host-observed by the agent)
+
+On the real host the Auto Mode classifier denied the agent writing the runner's review-evidence file for its own coordinated PR (`[Self-Approval]`). The denial was recorded once and not
+retried through another tool, wrapper or sub-agent. So the end of the autonomous journey (step 4) holds only when the evidence file is produced by something the host does not read as the
+agent approving its own work; the runner and the gate cannot fix that. The founder's L1 canary worked because the founder wrote the evidence. This is the open evidence-independence
+decision, now with a measured symptom. Options for the owner, none implemented here: keep a one-line owner-run evidence step per merge; install an owner-controlled review-recording
+command as the only evidence writer (and allow exactly that command); or sign evidence with a key the agent cannot read (`require_signed_evidence`). Until one is chosen, `ALLOW` from the gate means
+the executor is authorized, and an owner PR autonomously merges only when valid evidence already exists.
+
 ## Golden user journey (the acceptance bar)
 
 1. Owner opens a PR; CI runs for real.
