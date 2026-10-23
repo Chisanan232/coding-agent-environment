@@ -48,19 +48,19 @@ out of boundary and fails the review.
 ## 4. Settings fact the owner must weigh
 
 The one Trusted ALLOW rule ends in `--review-evidence *`. A glob there also matches anything written after the evidence path, so a new flag placed after `--review-evidence PATH` is covered by the
-existing rule without any settings change; in any other position the call no longer matches and falls to Auto Mode. That keeps the installation small, and it also means the rule's scope silently grows when the runner grows. The packet therefore
+existing rule without any settings change. Each `*` in the rule also absorbs arbitrary text, so a flag between `--repo` and the final glob is covered too; only text before `--repo` or reordered literal tokens falls to Auto Mode (the exact host matcher semantics were not re-measured here). That keeps the installation small, and it also means the rule's scope silently grows when the runner grows. The packet therefore
 requires the runner to refuse any flag combination other than the documented ones, and the owner may choose to tighten the rule (owner-only edit, not made here).
 
 ## 5. Security review (design-level; the implementation still needs its own)
 
 | Threat | Control required | Residual |
 |---|---|---|
-| The author controls the reviewed diff and can write text meant to steer the reviewer (prompt injection) | reviewer sees diff as data; protected paths refused (list in the spec: `.github/workflows/`, `owner-merge-*`, `.claude/settings*`, CODEOWNERS, the allowlist); PASS needs explicit verdict; required CI still runs | a weak reviewer can be fooled; this is a second opinion only |
-| PR edits `ci.yml` so checks pass | protected-path refusal uses the spec's list (`.github/workflows/`, `owner-merge-*`, `.claude/settings*`, CODEOWNERS, the allowlist) | check named `ci` can still be a commit status; documented earlier |
+| The author controls the reviewed diff and can write text meant to steer the reviewer (prompt injection) | reviewer sees diff as data; protected paths refused (list in the spec: `.github/workflows/`, `scripts/owner-merge-*` (the runner, the gate, the install script, the signer), `.claude/settings*`, CODEOWNERS, the allowlist); PASS needs explicit verdict; required CI still runs | a weak reviewer can be fooled; this is a second opinion only |
+| PR edits `ci.yml` so checks pass | protected-path refusal uses the spec's list (`.github/workflows/`, `scripts/owner-merge-*` (the runner, the gate, the install script, the signer), `.claude/settings*`, CODEOWNERS, the allowlist) | check named `ci` can still be a commit status; documented earlier |
 | Head moves after review | head re-read after the review; `--match-head-commit` at merge | none beyond GitHub's guarantee |
 | Evidence tampering | evidence written by the runner only, 0600, in the owner evidence directory; `require_signed_evidence` unchanged | same OS user can still read the HMAC key; not an independent boundary |
 | Runner edited then installed | installed copy is separate; only the owner's `--update` changes it | the install step is the real authorization |
-| Spend or hang | timeout, cost cap (about $0.02 per call is an unmeasured estimate), diff cap | negligible |
+| Spend or hang | timeout and diff cap (cost is about $0.02 per call, an unmeasured estimate), diff cap | unmeasured |
 | Self-approval optics | audit and evidence label it `runner-recorded`, never `independent-agent` | host may still deny the agent calling `--record-review` (see 7) |
 
 ## 6. Test coverage required before the owner installs
@@ -84,7 +84,7 @@ Host mechanism (what is documented and what is not): the supported persistent me
 runner spelling, and owner-written `autoMode.allow` wording. Both are owner-only edits and the agent does not author them. Whether the Auto Mode classifier accepts the agent
 calling `--record-review` is **unmeasured**; only the canary in step 4 can show it. A denial there is recorded once and the journey falls back to ASK.
 
-Rollback: copy the saved file from step 2 back over `~/.claude/bin/owner-merge-runner`, and remove the `auto_review` key from the allowlist (the pre-change runner rejects unknown keys, so `false` only works while the new runner is installed). The system is then today's behaviour. Settings are unchanged
+Rollback, in this order: first remove the `auto_review` key from the allowlist (the pre-change runner rejects unknown keys, so `false` only works while the new runner is installed), then copy the saved file from step 2 back over `~/.claude/bin/owner-merge-runner`. Reversing the order blocks every merge for that repository (fail closed). The system is then today's behaviour. Settings are unchanged
 by the install, so there is nothing to roll back there.
 
 ## 8. Residual risks, plainly
