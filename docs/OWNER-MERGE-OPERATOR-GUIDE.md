@@ -132,7 +132,7 @@ restores them. Start a fresh Claude Code session after applying; do not rely on 
 | MCP `mcp__github__merge_pull_request` | permission prompt (the GitHub MCP server must be connected to test this) |
 | `gh api repos/.../pulls/N/merge`, `--admin`, GraphQL `mergePullRequest` | prompt (the first two were already asks) |
 | `gh pr view/list/checks N --json mergeable`, comments, `git status`, tests | no prompt, unchanged |
-| a tab-separated, `command gh`, `env X=1 gh`, `sh -c`, absolute-path or aliased merge; GraphQL passed by file | **not covered by any rule**; falls to the Auto Mode classifier |
+| a tab-separated, `command gh`, `env X=1 gh`, `sh -c`, absolute-path or aliased merge; a value glued to the flag (`gh -Ro/r pr merge`); GraphQL passed by file | **not covered by any rule**; falls to the Auto Mode classifier |
 
 The last row is a known limit of prefix rules, accepted for the Golden User Journey: the shapes that matter (the pinned `gh` merge, its `rtk`
 form, the GitHub API and GraphQL merge, the MCP tool) ask. Auto Mode's classifier remains an additional, non-deterministic layer; a denial from it
@@ -172,4 +172,4 @@ Negative
 
 `HOST_ENFORCEMENT_VERIFIED`, `POLICY_DEPLOYED`, `LIVE_VALIDATED` and `MERGE_AUTONOMY_READY` are not claimed. The candidate makes every common direct merge
 ask; it does not install the runner, add an ALLOW path, or constrain the Auto Mode classifier. The registry wording for `autoMode.allow` is still yours to write
-and review (`OWNER-MERGE-AUTONOMY.md`, "Owner allow registry"). Exhaustive coverage of every command spelling is intentionally out of scope.
+and review (`OWNER-MERGE-AUTONOMY.md`, "Owner allow registry"). Exhaustive coverage of every command spelling is intentionally out of scope; if it is ever wanted, the principled route is a PreToolUse hook that tokenizes argv and recognizes `pr merge` wherever the flags sit, not more glob prefixes.
