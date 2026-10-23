@@ -160,7 +160,7 @@ def compat(live, merged, candidate, report_conflicts=(), owner_allow=()):
         for cmd in pr.PROXY_ROUTINE_COMMANDS:
             if pr.static_decision(cmd, merged_perm) == "ask":
                 out.append(f"routine wrapped command still asks after the merge (informational): {cmd!r}")
-    if wsp.MERGE_SCOPE_BASH_ASKS[0] in cand_perms.get("ask", []):  # a merge-scope candidate must actually make its shapes ask
+    if any(isinstance(a, str) and a in wsp.MERGE_SCOPE_MARKERS for a in cand_perms.get("ask", [])):  # any merge-scope-only ask makes it a merge-scope candidate: all its shapes must ask
         for cmd in wsp.MERGE_SCOPE_COMMANDS + ["rtk " + c for c in wsp.MERGE_SCOPE_COMMANDS]:
             if pr.static_decision(cmd, merged_perm) != "ask":
                 out.append(f"BLOCKING merge-scope command would not ask after the merge (prefix-rule emulator, not the host matcher): {cmd!r} -> {pr.static_decision(cmd, merged_perm)}")

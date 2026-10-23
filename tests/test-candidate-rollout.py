@@ -392,11 +392,20 @@ class MergeScope(unittest.TestCase):
             self.assertIn(ask, merged["permissions"]["ask"])
         for cmd in cr.wsp.MERGE_SCOPE_COMMANDS + ["rtk " + c for c in cr.wsp.MERGE_SCOPE_COMMANDS]:
             self.assertEqual(cr.pr.static_decision(cmd, merged["permissions"]), "ask", cmd)
-        self.assertEqual(cr.pr.static_decision("gh pr view 5 --json mergeable", merged["permissions"]), "allow")  # reads stay silent
+        for read in ("gh pr view 5 --json mergeable", "gh pr view 5 --json mergeStateStatus,mergeable", "gh pr -R o/r view 5 --json mergeable",
+                     "gh pr --repo o/r list --json mergeable", "gh pr --repo=o/r checks 5", "gh -R o/r pr view 5 --json mergeable"):
+            for pre in ("", "rtk "):
+                self.assertNotEqual(cr.pr.static_decision(pre + read, merged["permissions"]), "ask", pre + read)  # reads stay silent
 
     def test_plan_blocks_when_the_merge_shapes_would_not_ask(self):
         weak = cr.wsp.merge_scope_candidate()
         weak["permissions"]["ask"] = [weak["permissions"]["ask"][0], "Bash(rtk gh pr merge:*)"]  # keeps the sentinel, drops the other shapes
+        self.cand.write_text(json.dumps(weak))
+        self.assertTrue(any("merge-scope command would not ask" in f for f in self.plan()["compat"]))
+
+    def test_dropping_the_first_ask_does_not_skip_the_plan_guard(self):
+        weak = cr.wsp.merge_scope_candidate()
+        weak["permissions"]["ask"] = [a for a in weak["permissions"]["ask"] if a != "Bash(gh pr merge:*)"][:2]
         self.cand.write_text(json.dumps(weak))
         self.assertTrue(any("merge-scope command would not ask" in f for f in self.plan()["compat"]))
 

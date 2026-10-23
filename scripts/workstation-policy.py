@@ -254,12 +254,18 @@ def candidate(kind, asks_only=False):
     return cand
 
 
-MERGE_SCOPE_BASH_ASKS = ["Bash(gh pr merge:*)", "Bash(gh pr merge *)", "Bash(gh pr  merge*)", "Bash(gh -R * pr merge*)", "Bash(gh --repo * pr merge*)",
-                         "Bash(gh api *pulls/*/merge*)", "Bash(gh api graphql*mergePullRequest*)"]
+MERGE_SCOPE_BASH_ASKS = ["Bash(gh pr merge:*)", "Bash(gh pr merge *)", "Bash(gh pr  merge*)", "Bash(gh -R * pr merge*)", "Bash(gh --repo * pr merge*)", "Bash(gh --repo=* pr merge*)",
+                         "Bash(gh pr -R * merge *)", "Bash(gh pr -R * merge)", "Bash(gh pr --repo * merge *)", "Bash(gh pr --repo * merge)",
+                         "Bash(gh pr --repo=* merge *)", "Bash(gh pr --repo=* merge)",
+                         "Bash(gh api *pulls/*/merge*)", "Bash(gh api graphql*mergePullRequest*)", "Bash(gh api graphql*enablePullRequestAutoMerge*)"]
 MERGE_SCOPE_OTHER_ASKS = ["mcp__github__merge_pull_request"]
+_bare_twin = lambda rules: list(rules) + [r.replace("Bash(", "Bash(rtk ", 1) for r in rules]
+# Asks only a merge-scope candidate adds (the default candidate already asks on the other shapes); their presence marks one.
+MERGE_SCOPE_MARKERS = [r for r in _bare_twin(MERGE_SCOPE_BASH_ASKS) if r not in _bare_twin(ASK_BASH_RULES)]
 # Invocation shapes the candidate must make ask; checked against the prefix-rule emulator, not the real host matcher.
 MERGE_SCOPE_COMMANDS = ["gh pr merge 5", "gh pr merge 5 --repo o/r --merge --match-head-commit " + "a" * 40, "gh pr  merge 5", "gh -R o/r pr merge 5",
-                        "gh --repo o/r pr merge 5", "gh api repos/o/r/pulls/5/merge -X PUT", "gh api graphql -f query=mutation{mergePullRequest}"]
+                        "gh --repo o/r pr merge 5", "gh --repo=o/r pr merge 5", "gh pr -R o/r merge 5", "gh pr --repo o/r merge 5", "gh pr --repo=o/r merge 5", "gh api repos/o/r/pulls/5/merge -X PUT", "gh api graphql -f query=mutation{mergePullRequest}",
+                        "gh api graphql -f query=mutation{enablePullRequestAutoMerge}"]
 
 
 def merge_scope_candidate():
