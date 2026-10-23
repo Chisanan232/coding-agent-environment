@@ -1,5 +1,7 @@
 # Owner merge: ALLOW / ASK / DENY operator guide (SPE-118)
 
+The one-command deployment procedure is [OWNER-MERGE-ASK-FIRST-HANDOFF.md](OWNER-MERGE-ASK-FIRST-HANDOFF.md) (`scripts/ask-first-apply.sh`).
+
 Status: source and candidate are in this repository; **nothing here has been applied to the live host**. Every live behavior below marked
 "expected" is unobserved until you run the matching test in section 7 and record the result.
 
