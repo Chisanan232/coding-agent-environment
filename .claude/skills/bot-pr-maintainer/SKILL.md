@@ -29,7 +29,8 @@ Auto-used. Run via `pr-health-check` when a PR is classified as
 3. Confirm no merge conflicts.
 4. Confirm scope is limited to the automated update (no unexpected file changes).
 5. Verify a genuine formal GitHub `APPROVED` review by the repository owner on the
-   **current** PR head (`scripts/owner-merge-gate.py check` reports it). A bot PR is
+   **current** PR head (`scripts/owner-merge-gate.py check` reports it as `owner_approved`; a stranger's approval
+   is not the owner's). A bot PR is
    non-owner: an agent review, comment, or a prior-head approval never substitutes, and
    the agent never submits or simulates that approval. If it is absent, request owner
    approval (report the gate's `approve_command` as an owner action), keep the PR

@@ -349,7 +349,8 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None):
         else:
             reasons.append("NO_CI_EVIDENCE: no completed checks on this head and no qualified CI_UNAVAILABLE_EXTERNAL record")
     facts["checks"] = len(checks)
-    facts["formal_github_approval"] = "APPROVED" in latest.values()
+    facts["formal_github_approval"] = "APPROVED" in latest.values()  # any reviewer; see owner_approved for the one that counts
+    facts["owner_approved"] = owner_approved
     if reasons or [w for w in wait if not w.startswith("AWAITING_BOT_APPROVAL")]:
         facts.pop("approve_command", None)  # approve only after every other gate has passed
         facts.pop("needs_approval", None)

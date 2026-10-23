@@ -81,8 +81,8 @@ The review record's `reviewer` id is self-attested by the same identity that pos
 
 Limit: the gate runs under the owner's own GitHub token, so GitHub shows an agent-submitted
 approval and a personal one identically. The gate can prove an approval exists for the exact
-head, not who typed it. For class C the agent must never submit the approval (the host's
-Self-Approval rule blocks it). For class B the approval is the owner's personal action: the
+head, not who typed it. For class C the agent must never submit the approval; that is
+process-only too, as the host's Self-Approval rule covers only agent-authored PRs. For class B the approval is the owner's personal action: the
 agent must not run `approve_command`. That separation is process-only; neither the gate nor
 the host enforces it, so an agent-submitted APPROVE would pass the gate and is a policy
 violation, not a control.

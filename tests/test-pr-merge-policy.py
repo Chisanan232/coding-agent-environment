@@ -354,6 +354,12 @@ class ReadOnly(Case):
             omg.main(["queue", "--repo", REPO, "--prs", "7", "--owners", "Chisanan232"], run=bot())
         self.assertIn("owner action (the agent must not run this)", buf.getvalue())
 
+    def test_owner_approved_fact_ignores_a_strangers_approval(self):
+        _, _, facts = self.check(bot(reviews=[approval("stranger")]))
+        self.assertEqual((facts["formal_github_approval"], facts["owner_approved"]), (True, False))
+        _, _, facts = self.check(bot(reviews=[approval()]))
+        self.assertTrue(facts["owner_approved"])
+
     def test_shipped_instructions_never_tell_the_agent_to_approve(self):
         for rel in (".claude/skills/bot-pr-maintainer/SKILL.md", ".claude/skills/bot-pr-maintainer/references/bot-pr-policy.md",
                     ".claude/skills/pr-health-check/SKILL.md", "codex/AGENTS.md", ".claude/CLAUDE.md",

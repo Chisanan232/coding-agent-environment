@@ -148,7 +148,8 @@ Omit file chronology and unsupported completion claims.
   eligibility and host authorization are four separate things; none stands in for another.
   GitHub's own required-review rules (branch protection, rulesets, CODEOWNERS) still
   apply to every class: a repository that genuinely requires a formal review
-  (`REVIEW_REQUIRED`) blocks, and the classes above never waive it.
+  (`REVIEW_REQUIRED`) blocks, and the classes above never waive it; only narrow
+  exception 2 below addresses an owner-only same-identity deadlock.
 
 Do not merge until required checks, CODEOWNERS-required approvals, the class approvals above,
 conflict resolution, branch currency, and blocking review threads satisfy the
