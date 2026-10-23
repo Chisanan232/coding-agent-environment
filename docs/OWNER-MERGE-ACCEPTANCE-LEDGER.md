@@ -103,7 +103,7 @@ The five refused canary PRs (#3-#7) were closed by the agent. The agent's token 
 Superseded by section 7 for the final verdicts; kept unchanged as the evidence as first recorded.
 
 Disposable private repo `Chisanan232/ask-first-canary-20261023160905`. Installed runner sha256 `22e3e8c8…0947e` equals `scripts/owner-merge-runner.py` at `e1896db`. No setting,
-runner, allowlist or permission was changed during the canary or this reconciliation. No denied call was retried through another route.
+runner, allowlist or permission was changed by the agent during the canary or this reconciliation (the live allowlist already held the canary entry when it started). No denied call was retried through another route.
 
 | ID | Result | Evidence class | Detail |
 |---|---|---|---|
@@ -137,6 +137,8 @@ fail closed); it only leaves the runner's refusal unobserved through the install
 | `FULL_MERGE_AUTONOMY_READY` | NO (live L2 runner verdict unobserved; non-owner path NOT_RUN) |
 
 ## 7. Final scoped acceptance (founder, 2026-10-23)
+
+Sections 2-5 are the pre-deploy snapshot, kept unedited as history; where they say NOT_RUN, BLOCKED or not deployed, sections 6 and 7 supersede them.
 
 Founder observations, recorded as stated:
 
@@ -174,16 +176,16 @@ The canary repo is disposable. Review each target before removing it.
 
 ```bash
 # 1. Temporary allowlist entry: restore the pre-canary allowlist (contains only coding-agent-environment).
-#    Check first that nothing else was added since the canary:
-diff <(python3 -c "import json;print(sorted(json.load(open('$HOME/.claude/owner-merge-runner-allowlist.json'))['repos']))") \
-     <(python3 -c "import json;print(sorted(json.load(open('$HOME/.claude/owner-merge-runner-allowlist.before-canary.json'))['repos']))")
-#    expected difference: only Chisanan232/ask-first-canary-20261023160905
+#    Check first that nothing else differs (the cp restores the whole file, not just the repos map):
+diff "$HOME/.claude/owner-merge-runner-allowlist.before-canary.json" "$HOME/.claude/owner-merge-runner-allowlist.json"
+#    expected difference: only the Chisanan232/ask-first-canary-20261023160905 entry
 cp "$HOME/.claude/owner-merge-runner-allowlist.before-canary.json" "$HOME/.claude/owner-merge-runner-allowlist.json"
 
 # 2. Canary evidence files (single-use, bound to the merged/closed heads):
 rm "$HOME/.claude/owner-merge-evidence/canary-9.json" "$HOME/.claude/owner-merge-evidence/canary-10.json"
 
-# 3. Canary repo (needs the delete_repo scope, which the agent's token lacks):
+# 3. Canary repo. Deleting it removes the GitHub-side evidence for PR #9, so re-run `owner-merge-gate.py verify --repo Chisanan232/ask-first-canary-20261023160905 --pr 9
+#    --head 29eecdf5c2becd1ededd396e6474fea02a83494a` first if you still need it. (Needs the delete_repo scope, which the agent's token lacks.)
 gh auth refresh -s delete_repo
 gh repo delete Chisanan232/ask-first-canary-20261023160905 --yes
 ```
