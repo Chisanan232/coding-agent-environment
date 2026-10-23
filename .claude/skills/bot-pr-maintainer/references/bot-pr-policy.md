@@ -14,7 +14,11 @@ If a bot PR meets all of the following:
 - No merge conflicts
 - No scope expansion beyond the automated update
 
-Then: **approve and merge automatically**.
+Then: **verify a genuine formal GitHub APPROVED review by the owner on the current PR
+head**. A bot PR is non-owner, so this approval is required; if it is absent, request it
+and keep the PR pending. Never submit it as the owner and never treat an agent review as
+a GitHub approval. Once owner approval and every other gate pass, **merge automatically**
+with a merge commit.
 
 ### Bot PR with lock-file conflicts
 
@@ -24,7 +28,8 @@ If a bot PR has lock-file conflicts (e.g., `poetry.lock`, `uv.lock`, `package-lo
    (e.g., comment `@dependabot rebase` or `@renovatebot rebase`).
 2. Wait for the bot to rebase and CI to rerun.
 3. Re-evaluate the PR against the standard bot PR handling criteria.
-4. Approve and merge only when it is clean and CI is green.
+4. Require genuine owner approval on the new head, then merge only when it is clean and
+   CI is green.
 
 Do not manually resolve lock-file conflicts in bot PRs — let the bot handle it.
 

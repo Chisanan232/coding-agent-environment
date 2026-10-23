@@ -132,8 +132,25 @@ references. Use the repository's `.github/PULL_REQUEST_TEMPLATE.md` when present
 Preserve any required repository pull-request template and fields otherwise.
 Omit file chronology and unsupported completion claims.
 
-Do not merge until required checks, code-owner approvals, conflict resolution,
-branch currency, and blocking review threads satisfy the repository's real gates.
+**PR classes and formal approval** (canonical; other files reference this, and
+`docs/OWNER-MERGE-WORKFLOW.md` has the gate table). The class is decided by
+`scripts/owner-merge-gate.py` from verified author identity, never from a PR claim:
+
+- **Owner-authored (Class A)**: no formal GitHub review approval is required merely because
+  the PR is owner-authored; no artificial self-approval and no second GitHub identity. An
+  empty review list or `reviewDecision` NONE is not a blocker. The PR merges automatically
+  once checks, independent engineering review, security and host gates pass.
+- **Non-owner and bot-authored (Class B/C)**: a genuine formal `APPROVED` review by the
+  authorized owner on the **current** head is required. Dependabot, Renovate and other bots
+  are non-owner even with write access. The agent never submits, simulates or substitutes
+  that approval; it requests it and continues automatically once it exists.
+- Independent agent engineering review, GitHub review approval, repository merge
+  eligibility and host authorization are four separate things; none stands in for another.
+  A repository that genuinely requires a formal review (`REVIEW_REQUIRED`) still blocks.
+
+Do not merge until required checks, applicable approvals (per the classes above),
+conflict resolution, branch currency, and blocking review threads satisfy the
+repository's real gates.
 Administrator merge is never a bypass for a genuine product, test, security,
 quality, conflict, or substantive review failure. Exactly two narrow exceptions
 are authorized below; neither grants blanket administrator authority.

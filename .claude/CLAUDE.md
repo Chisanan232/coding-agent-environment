@@ -206,9 +206,11 @@ Delegation section.
 
 ## Merge Policy
 
-Apply the required checks, code-owner approvals, conflict, branch-currency, and
-review-thread gates from
-[engineering-workflow](skills/engineering-workflow/SKILL.md). Use **Create a
+Apply the required checks, **applicable** code-owner approvals, conflict,
+branch-currency, and review-thread gates from
+[engineering-workflow](skills/engineering-workflow/SKILL.md), which owns the PR
+classes: owner-authored PRs need no formal GitHub approval; non-owner and bot PRs
+need a genuine owner `APPROVED` review on the current head. Use **Create a
 merge commit**; do not squash or rebase-merge unless a later explicit user
 instruction authorizes that strategy.
 

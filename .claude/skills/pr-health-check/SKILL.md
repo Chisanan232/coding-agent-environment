@@ -40,7 +40,7 @@ Classify each PR into one of:
 |---|---|
 | `ready-to-merge` | All `engineering-workflow` merge gates met |
 | `blocked-ci` | CI is red |
-| `blocked-review` | Missing required approvals or unresolved review requests |
+| `blocked-review` | Non-owner or bot PR without a genuine owner `APPROVED` review on the current head, or unresolved review requests. An owner-authored PR is never `blocked-review` for lacking a formal approval alone |
 | `blocked-conflict` | Merge conflict present |
 | `blocked-comments` | Unresolved blocking review comments |
 | `bot-pr-clean` | Bot author, CI green, no conflict |
@@ -52,7 +52,7 @@ Classify each PR into one of:
 
 | Class | Action |
 |---|---|
-| `ready-to-merge` | Approve and merge when the shared workflow gates are met |
+| `ready-to-merge` | Merge (merge commit) when the shared workflow gates are met; never submit an approval on the owner's behalf |
 | `blocked-ci` | Note the failure — invoke `ci-failure-triage` if repair is in scope |
 | `blocked-review` | Note awaiting reviewer — no action unless stale |
 | `blocked-conflict` | Note conflict — flag to engineer |
