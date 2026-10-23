@@ -1,0 +1,9 @@
+{
+  "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Adds the single allow rule for the validating owner-merge-runner at its installed path. Adds no ask, no deny and no autoMode change; the direct-merge asks stay, so a direct gh pr merge still asks. Requires the ASK-first candidate to be applied and the runner installed at that exact path.",
+  "permissions": {
+    "allow": [
+      "Bash(/Users/bryant/.claude/bin/owner-merge-runner --repo * --pr * --expect-head * --review-evidence *)"
+    ],
+    "deny": []
+  }
+}

@@ -5,6 +5,8 @@ This is the one procedure to deploy the ASK-first candidate. Background and the 
 
 ## Status (read this first)
 
+> **Update 2026-10-23:** the founder accepted this deployment after a real-host canary (`ASK_FIRST_DEPLOYED`, `HOST_PROMPT_VERIFIED`, `ASK_FIRST_ACCEPTED` = PASS; evidence and the observer of each fact in [OWNER-MERGE-ACCEPTANCE-LEDGER.md](OWNER-MERGE-ACCEPTANCE-LEDGER.md)). The table below is the pre-deployment state kept for the record. Next: [OWNER-MERGE-TRUSTED-ALLOW-HANDOFF.md](OWNER-MERGE-TRUSTED-ALLOW-HANDOFF.md).
+
 | Flag | Status | Meaning |
 |---|---|---|
 | `ASK_FIRST_READY` | **PASS** | Candidate generator output equals the committed example and lints CLEAN; a read-only plan against your live file is non-blocking (35 asks added, 0 allows added, `autoMode` and every other key untouched); `scripts/ask-first-apply.sh` is tested end to end on scratch settings |
