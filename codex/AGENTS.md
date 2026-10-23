@@ -55,6 +55,10 @@ owner-only same-identity review deadlock (owner-admin merge needs no separate hu
 Approve). Apply every evidence, identity, review,
 check and merge-strategy condition there; never bypass a genuine failing gate.
 
+Merge an eligible PR only with the `merge_command` that `scripts/owner-merge-gate.py check --settings` prints (the validating
+`owner-merge-runner` when offered, else the pinned `gh pr merge`, which needs approval); never choose another merge spelling or
+interface (including the GitHub MCP merge tool) to avoid a prompt or a refusal.
+
 Apply the installed engineering skills by their actual triggers: `ticket-intake`
 for new unaccepted work, `ticket-pickup-check` before ticket implementation,
 `task-decomposition` for approved outcome/dependency planning, and

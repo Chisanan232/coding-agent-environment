@@ -169,6 +169,14 @@ Check a merge before and after with `scripts/owner-merge-gate.py` (read-only PAS
 exact head; see `docs/OWNER-MERGE-WORKFLOW.md`). Its PASS is evidence, not a GitHub
 approval and not host authorization; a host denial of the merge stands and is reported.
 
+**Canonical merge executor** (interface independence; `docs/OWNER-MERGE-ENTRYPOINTS.md`). The agent never picks a merge
+spelling. `owner-merge-gate.py check --settings <user settings>` prints one `merge_command` and its `executor`:
+`owner-merge-runner` when the runner is installed, the repo is in the owner's runner allowlist and the host rule allows exactly that
+command (outcome ALLOW; run it as printed after writing the review-evidence file the gate names, and only after an independent review
+PASS at that exact head), otherwise the pinned `gh pr merge` (outcome ASK; the host prompts and a human answers). The runner re-validates
+class, head, checks and repository limits itself; its refusal, like any host or GitHub denial, is final: do not retry through `gh`, `rtk gh`,
+the GitHub MCP merge tool, the API or a wrapper. Non-owner and bot PRs still need the genuine owner approval first.
+
 ### Narrow administrator merge exceptions
 
 Use normal eligible independent review whenever it exists. Before any exception,

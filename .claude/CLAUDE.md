@@ -230,7 +230,9 @@ Before heavy work run `scripts/memory-admission.py check --weight heavy` from th
 SPE-109 disk gate; it is not installed into `~/.claude`); one heavy
 lane at a time, never kill or delete another session's work, and treat a swap-used number as history, not current
 exhaustion. After a reboot treat earlier processes, locks, reservations and jobs as stale and reconcile before resuming.
-Use `gh` for GitHub; it never bypasses host authorization, PR classes, CI, reviews or the merge gate. Details:
+Use `gh` for GitHub; it never bypasses host authorization, PR classes, CI, reviews or the merge gate. Merge an eligible PR only with
+the `merge_command` that `scripts/owner-merge-gate.py check --settings` prints (the validating `owner-merge-runner` when offered, else the
+pinned `gh pr merge`, which asks); never choose another merge spelling or interface to avoid a prompt or a refusal. Details:
 [engineering-workflow](skills/engineering-workflow/SKILL.md).
 
 ## Decision Delegation

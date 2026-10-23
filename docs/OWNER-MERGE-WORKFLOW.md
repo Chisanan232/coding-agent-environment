@@ -20,7 +20,7 @@ protection, host authorization, gate verdict).
    python3 scripts/owner-merge-gate.py check --repo OWNER/REPO --pr N --owners <owners>
    ```
 
-   - `PASS` (exit 0) prints the pinned merge command.
+   - `PASS` (exit 0) prints the `merge_command` and its `executor`: the owner-merge-runner when it is installed, allowlisted and host-allowed (ALLOW), otherwise the pinned `gh pr merge` (ASK). See `OWNER-MERGE-ENTRYPOINTS.md`.
    - `WAIT` (exit 2): CI pending or mergeability unknown. Run it again.
    - `ERROR` (exit 3): `gh` or the network failed. Fix that first; do not loop.
    - `REFUSE` (exit 1): read the reason codes and fix the cause; never reclassify a failure.
