@@ -61,6 +61,11 @@ def union(*lists):
     return out
 
 
+def candidate_retired(candidate):
+    """Asks the candidate explicitly retires, limited to what the tool may retire."""
+    return [r for r in ((candidate.get("permissions") or {}).get("retire_ask", [])) if r in wsp.RETIRABLE_ASKS]
+
+
 def merge(live, candidate, baseline=None, hook_command=None, fail_closed=False):
     """Pure function: returns (merged, report). `live` is not mutated."""
     merged = json.loads(json.dumps(live))
@@ -69,6 +74,10 @@ def merge(live, candidate, baseline=None, hook_command=None, fail_closed=False):
     report = {"autoMode_before": before_counts, "denies_kept": {}, "dropped_from_live": {"environment": [], "allow": []}}
     if "autoMode" in candidate:  # an asks-only candidate (no autoMode key) leaves the live autoMode exactly as it is
         am = json.loads(json.dumps(candidate["autoMode"]))
+        carried = [k for k in live_am if k not in am]  # a candidate that omits a key leaves the owner's live value alone
+        for key in carried:
+            am[key] = json.loads(json.dumps(live_am[key]))
+        report["autoMode_preserved"] = carried
         report["autoMode_after"] = {k: len(v) for k, v in am.items() if isinstance(v, list)}
         for key in ("soft_deny", "hard_deny"):  # an owner's own deny entries are never dropped
             extra = [x for x in live_am.get(key, []) if x != "$defaults"]
@@ -122,6 +131,12 @@ def compat(live, merged, candidate, report_conflicts=()):
     for key in ("allow", "soft_deny", "hard_deny", "environment"):
         if key in am and (not am[key] or am[key][0] != "$defaults"):
             out.append(f"BLOCKING autoMode.{key} lost $defaults")
+    if "autoMode" in candidate:  # an asks-only candidate leaves the live autoMode untouched, so it is not judged here
+        for problem in wsp.lint_settings({"autoMode": am}):  # the merged autoMode, not only the candidate; untouched live allow/ask lists are judged elsewhere
+            out.append(f"BLOCKING merged configuration lint: {problem}")
+    for rule in (live.get("permissions") or {}).get("ask", []):
+        if rule not in merged["permissions"]["ask"] and rule not in candidate_retired(candidate):
+            out.append(f"BLOCKING existing ask lost in the merge: {rule}")
     for msg in report_conflicts:
         out.append(f"BLOCKING {msg}")
     live_allow = (live.get("permissions") or {}).get("allow", [])

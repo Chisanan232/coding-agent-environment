@@ -88,7 +88,10 @@ class Rollout(unittest.TestCase):
 
     def test_autoMode_only_candidate_without_permissions_block_merges_and_plans(self):
         cand = {"autoMode": {"environment": ["$defaults", "Synthetic factual line for this test."]}}
-        merged, rep = cr.merge(LIVE, cand)
+        live = json.loads(json.dumps(LIVE))
+        live["autoMode"] = {"environment": ["$defaults", "Old fact."]}
+        self.live.write_text(json.dumps(live))
+        merged, rep = cr.merge(live, cand)
         self.assertEqual(merged["autoMode"], cand["autoMode"])
         self.assertEqual(merged["permissions"], LIVE["permissions"])  # asks, allow and deny exactly as live
         self.assertEqual(rep["asks_added"], [])
@@ -98,6 +101,69 @@ class Rollout(unittest.TestCase):
         self.assertFalse(p["blocking"])
         self.assertEqual(p["report"]["allow_added"], [])
         self.assertNotIn(DUMMY, json.dumps(p))
+
+    def test_candidate_that_omits_environment_and_denies_keeps_the_live_ones(self):
+        live = json.loads(json.dumps(LIVE))
+        live["autoMode"] = {"environment": ["$defaults", "Live trusted-source fact."], "soft_deny": ["$defaults", "owner soft"], "hard_deny": ["$defaults", "owner hard"]}
+        snapshot = json.dumps(live, sort_keys=True)
+        cand = {"autoMode": {"allow": ["$defaults"]}}
+        merged, rep = cr.merge(live, cand)
+        self.assertEqual(merged["autoMode"]["environment"], ["$defaults", "Live trusted-source fact."])
+        self.assertEqual(merged["autoMode"]["soft_deny"], ["$defaults", "owner soft"])
+        self.assertEqual(merged["autoMode"]["hard_deny"], ["$defaults", "owner hard"])
+        self.assertEqual(merged["autoMode"]["allow"], ["$defaults"])
+        self.assertEqual(sorted(rep["autoMode_preserved"]), ["environment", "hard_deny", "soft_deny"])
+        self.assertEqual(json.dumps(live, sort_keys=True), snapshot)  # live input is never mutated
+        merged["autoMode"]["environment"].append("x")  # the merged copy does not alias the live list
+        self.assertEqual(live["autoMode"]["environment"], ["$defaults", "Live trusted-source fact."])
+
+    def test_candidate_that_replaces_environment_still_replaces_it_and_reports_the_drop(self):
+        merged, rep = cr.merge(LIVE, {"autoMode": {"environment": ["$defaults", "New fact."]}})
+        self.assertEqual(merged["autoMode"]["environment"], ["$defaults", "New fact."])
+        self.assertNotIn("environment", rep["autoMode_preserved"])
+        self.assertIn("old long natural-language rule", rep["dropped_from_live"]["environment"])
+
+    def test_merged_autoMode_is_linted_so_a_preserved_live_entry_can_block(self):
+        live = json.loads(json.dumps(LIVE))
+        live["autoMode"] = {"environment": ["$defaults"] + [f"fact {i}" for i in range(9)]}  # too long once preserved
+        self.live.write_text(json.dumps(live))
+        self.cand.write_text(json.dumps({"autoMode": {"allow": ["$defaults"]}}))
+        p = json.loads(self.run_cli("plan", "--live", str(self.live), "--candidate", str(self.cand))[1])
+        self.assertTrue(p["blocking"])
+        self.assertTrue(any("merged configuration lint" in f for f in p["compat"]), p["compat"])
+        before = self.live.read_bytes()
+        rc, _ = self.run_cli("apply", "--live", str(self.live), "--candidate", str(self.cand), "--expect-live-sha", p["live_sha"], "--expect-result-sha", p["result_sha"], "--backup-dir", str(self.d / "b"))
+        self.assertIn("REFUSED", str(rc))
+        self.assertEqual(self.live.read_bytes(), before)
+
+    def test_preserved_live_standing_merge_text_blocks_instead_of_slipping_through(self):
+        cand = {"autoMode": {"environment": ["$defaults", "Fact."]}}  # omits allow, so the live allow text would be carried over
+        merged, rep = cr.merge(LIVE, cand)
+        self.assertIn("allow", rep["autoMode_preserved"])
+        findings = cr.compat(LIVE, merged, cand)
+        self.assertTrue(any(f.startswith("BLOCKING merged configuration lint") and "standing merge" in f for f in findings), findings)
+
+    def test_compat_blocks_when_an_existing_ask_would_be_lost(self):
+        cand = {"autoMode": {"allow": ["$defaults"]}}
+        merged, _ = cr.merge(LIVE, cand)
+        merged["permissions"]["ask"] = [a for a in merged["permissions"]["ask"] if a != "Bash(old ask:*)"]
+        self.assertTrue(any("existing ask lost" in f and "old ask" in f for f in cr.compat(LIVE, merged, cand)))
+        kept, _ = cr.merge(LIVE, cand)
+        self.assertFalse(any("existing ask lost" in f for f in cr.compat(LIVE, kept, cand)))
+
+    def test_autoMode_only_candidate_roundtrip_restores_the_exact_live_bytes(self):
+        original = self.live.read_bytes()
+        self.cand.write_text(json.dumps({"autoMode": {"allow": ["$defaults"]}}))
+        args = ["--live", str(self.live), "--candidate", str(self.cand)]
+        p = json.loads(self.run_cli("plan", *args)[1])
+        self.assertFalse(p["blocking"], p["compat"])
+        rc, out = self.run_cli("apply", *args, "--expect-live-sha", p["live_sha"], "--expect-result-sha", p["result_sha"], "--backup-dir", str(self.d / "b"))
+        self.assertEqual(rc, 0, out)
+        res = json.loads(out)
+        self.assertEqual(json.loads(self.live.read_text())["autoMode"]["environment"], LIVE["autoMode"]["environment"])
+        rc, _ = self.run_cli("rollback", "--live", str(self.live), "--backup", res["backup"], "--expect-backup-sha", p["live_sha"], "--expect-live-sha", p["result_sha"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.live.read_bytes(), original)
 
     def test_baseline_autoMode_text_is_never_applied(self):
         merged, _ = cr.merge(LIVE, cr.wsp.candidate("personal"), BASELINE)
