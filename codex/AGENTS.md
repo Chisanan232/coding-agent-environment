@@ -59,7 +59,7 @@ Merge an eligible PR only with the `merge_command` that `scripts/owner-merge-gat
 `owner-merge-runner` when offered, else the pinned `gh pr merge`, which needs approval); never choose another merge spelling or
 interface (including the GitHub MCP merge tool) to avoid a prompt or a refusal.
 
-The merge is its own tool call: never combine it with a review comment, CI polling, a readback (`gh pr view`, `gh api`), a pipe, `head`/`tail`, `&&`, `;` or any other chaining. The order is: independent review, check the exact PR head, verify required CI, run `owner-merge-gate.py check`, run the printed `merge_command` alone, then verify the merged state in a separate call. A compound shell call matches no merge rule, so the host asks about the whole thing; that is a workflow error, not a runner failure.
+The merge is its own tool call: never combine it with a review comment, CI polling, a readback (`gh pr view`, `gh api`), a pipe, `head`/`tail`, `&&`, `;` or any other chaining. The order is: independent review, check the exact PR head, verify required CI, run `owner-merge-gate.py check`, write the review evidence at the printed `evidence_path` (its own call; only by an authorized path, never self-approved), run the printed `merge_command` alone, then verify the merged state with `owner-merge-gate.py verify` in a separate call. A compound shell call matches no merge rule, so the host asks about the whole thing; that is a workflow error, not a runner failure.
 
 Apply the installed engineering skills by their actual triggers: `ticket-intake`
 for new unaccepted work, `ticket-pickup-check` before ticket implementation,
