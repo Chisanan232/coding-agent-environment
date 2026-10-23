@@ -82,7 +82,10 @@ The review record's `reviewer` id is self-attested by the same identity that pos
 Limit: the gate runs under the owner's own GitHub token, so GitHub shows an agent-submitted
 approval and a personal one identically. The gate can prove an approval exists for the exact
 head, not who typed it. For class C the agent must never submit the approval (the host's
-Self-Approval rule blocks it); for class B the approval is the documented action.
+Self-Approval rule blocks it). For class B the approval is the owner's personal action: the
+agent must not run `approve_command`. That separation is process-only; neither the gate nor
+the host enforces it, so an agent-submitted APPROVE would pass the gate and is a policy
+violation, not a control.
 
 Bot PRs merge one at a time: `queue` marks only the first PASS runnable. After each merge,
 refresh the base, update the next branch with a merge from the base (no history rewrite), let

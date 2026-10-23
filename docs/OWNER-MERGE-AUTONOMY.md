@@ -249,7 +249,7 @@ The list of holes is open-ended, not just the four above. Reviews also reproduce
 | Class | Author | Needed before the pinned merge |
 |---|---|---|
 | A | verified owner account, owner is ADMIN (or code owner with WRITE/MAINTAIN) | independent PASS comment `OWNER-MERGE-REVIEW head=<sha> verdict=PASS blocking=0 reviewer=<id>` at the current head; gate `PASS`. No formal self-approval. |
-| B | verified dependency bot | real GitHub APPROVE at the exact head from the authenticated owner identity, as the gate requires (`scripts/owner-merge-gate.py`); one at a time per repo; reconcile and re-gate after each merge. |
+| B | verified dependency bot | real GitHub APPROVE at the exact head from the authenticated owner identity, as the gate requires (`scripts/owner-merge-gate.py`). The owner submits it personally; the agent runs under the same identity, so the gate cannot tell the two apart and the separation is process-only. One at a time per repo; reconcile and re-gate after each merge. |
 | C | any other human | owner's genuine APPROVED review at the exact head, never submitted on the owner's behalf. |
 
 A new commit changes the head, so earlier evidence no longer matches and the gate refuses until a fresh review is recorded.

@@ -146,9 +146,11 @@ Omit file chronology and unsupported completion claims.
   that approval; it requests it and continues automatically once it exists.
 - Independent agent engineering review, GitHub review approval, repository merge
   eligibility and host authorization are four separate things; none stands in for another.
-  A repository that genuinely requires a formal review (`REVIEW_REQUIRED`) still blocks.
+  GitHub's own required-review rules (branch protection, rulesets, CODEOWNERS) still
+  apply to every class: a repository that genuinely requires a formal review
+  (`REVIEW_REQUIRED`) blocks, and the classes above never waive it.
 
-Do not merge until required checks, applicable approvals (per the classes above),
+Do not merge until required checks, CODEOWNERS-required approvals, the class approvals above,
 conflict resolution, branch currency, and blocking review threads satisfy the
 repository's real gates.
 Administrator merge is never a bypass for a genuine product, test, security,

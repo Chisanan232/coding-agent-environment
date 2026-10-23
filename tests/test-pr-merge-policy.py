@@ -342,7 +342,8 @@ class ReadOnly(Case):
         v, why, facts = self.check(Fake())
         self.assertEqual((v, facts["class"], facts["formal_github_approval"]), ("PASS", "A", False), why)
 
-    def test_bot_approval_is_an_owner_action_never_the_agents(self):
+    def test_bot_approval_wording_labels_it_an_owner_action(self):
+        # Text only: the gate runs under the owner's token, so it cannot enforce who submitted an approval.
         v, _, facts = self.check(bot())
         self.assertEqual(v, "WAIT")
         self.assertIn("owner", facts["approve_actor"])
@@ -355,10 +356,11 @@ class ReadOnly(Case):
 
     def test_shipped_instructions_never_tell_the_agent_to_approve(self):
         for rel in (".claude/skills/bot-pr-maintainer/SKILL.md", ".claude/skills/bot-pr-maintainer/references/bot-pr-policy.md",
-                    ".claude/skills/pr-health-check/SKILL.md", "codex/AGENTS.md"):
-            text = (ROOT / rel).read_text()
+                    ".claude/skills/pr-health-check/SKILL.md", "codex/AGENTS.md", ".claude/CLAUDE.md",
+                    ".claude/skills/engineering-workflow/SKILL.md"):
+            text = " ".join((ROOT / rel).read_text().split())
             self.assertNotIn("--approve", text, rel)
-            self.assertNotRegex(text, r"(?i)\bapprove and merge\b", rel)
+            self.assertNotRegex(text, r"(?i)\bapprove (and merge|the pr|it)\b|\bapproved and merged\b", rel)
 
     def test_new_reads_stay_inside_the_allowlist(self):
         omg.read_only(["api", f"repos/{REPO}/contents/.github/CODEOWNERS", "--jq", ".content"])
