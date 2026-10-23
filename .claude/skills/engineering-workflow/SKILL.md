@@ -177,6 +177,8 @@ PASS at that exact head), otherwise the pinned `gh pr merge` (outcome ASK; the h
 class, head, checks and repository limits itself; its refusal, like any host or GitHub denial, is final: do not retry through `gh`, `rtk gh`,
 the GitHub MCP merge tool, the API or a wrapper. Non-owner and bot PRs still need the genuine owner approval first.
 
+The merge is its own tool call: never combine it with a review comment, CI polling, a readback (`gh pr view`, `gh api`), a pipe, `head`/`tail`, `&&`, `;` or any other chaining. The order is: independent review, check the exact PR head, verify required CI, run `owner-merge-gate.py check`, run the printed `merge_command` alone, then verify the merged state in a separate call. A compound shell call matches no merge rule, so the host asks about the whole thing; that is a workflow error, not a runner failure.
+
 ### Narrow administrator merge exceptions
 
 Use normal eligible independent review whenever it exists. Before any exception,
