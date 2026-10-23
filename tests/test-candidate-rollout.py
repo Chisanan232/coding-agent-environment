@@ -399,7 +399,7 @@ class OwnerAllowRollout(unittest.TestCase):
         p = self.plan("--owner-allow-file", reg)
         backups = self.d / "backups"
         rc, out = self.run_cli("apply", *self.args, "--owner-allow-file", reg, "--expect-live-sha", p["live_sha"],
-                               "--expect-result-sha", p["result_sha"], "--backup-dir", str(backups))
+                               "--expect-result-sha", p["result_sha"], "--expect-registry-sha", p["registry_sha"], "--backup-dir", str(backups))
         self.assertEqual(rc, 0, out)
         self.assertEqual(json.loads(self.live.read_text())["autoMode"]["allow"], ["$defaults", self.ENTRY])
         backup = next(backups.iterdir())
@@ -408,12 +408,33 @@ class OwnerAllowRollout(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.live.read_bytes(), original)
 
+    def test_plan_lists_registry_entries_and_apply_needs_the_registry_pin(self):
+        reg = self.with_owner_candidate()
+        p = self.plan("--owner-allow-file", reg)
+        self.assertEqual(p["registry_sha"], cr.sha(pathlib.Path(reg).read_bytes()))
+        self.assertTrue(any(self.ENTRY in f for f in p["compat"]))
+        common = ["apply", *self.args, "--owner-allow-file", reg, "--expect-live-sha", p["live_sha"],
+                  "--expect-result-sha", p["result_sha"], "--backup-dir", str(self.d / "b")]
+        for extra in ([], ["--expect-registry-sha", "0" * 64]):
+            rc, _ = self.run_cli(*common, *extra)
+            self.assertIn("REFUSED", str(rc))
+        pathlib.Path(reg).write_text(json.dumps([self.ENTRY, self.ENTRY + " "]))  # registry edited after review
+        rc, _ = self.run_cli(*common, "--expect-registry-sha", p["registry_sha"])
+        self.assertIn("REFUSED", str(rc))
+        self.assertEqual(json.loads(self.live.read_text()), LIVE)
+
+    def test_registry_pin_without_a_registry_is_refused(self):
+        p = self.plan()
+        rc, _ = self.run_cli("apply", *self.args, "--expect-live-sha", p["live_sha"], "--expect-result-sha", p["result_sha"],
+                             "--expect-registry-sha", "0" * 64, "--backup-dir", str(self.d / "b"))
+        self.assertIn("REFUSED", str(rc))
+
     def test_concurrent_live_change_refuses_the_stale_plan(self):
         reg = self.with_owner_candidate()
         p = self.plan("--owner-allow-file", reg)
         self.live.write_text(self.live.read_text() + "\n")
         rc, _ = self.run_cli("apply", *self.args, "--owner-allow-file", reg, "--expect-live-sha", p["live_sha"],
-                             "--expect-result-sha", p["result_sha"], "--backup-dir", str(self.d / "b"))
+                             "--expect-result-sha", p["result_sha"], "--expect-registry-sha", p["registry_sha"], "--backup-dir", str(self.d / "b"))
         self.assertIn("REFUSED", str(rc))
 
 

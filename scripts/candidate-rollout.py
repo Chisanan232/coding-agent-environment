@@ -178,13 +178,18 @@ def plan(args, raw=None):
     baseline = load(args.baseline)[1] if args.baseline else None
     merged, report = merge(live, cand, baseline, args.hook_command, args.fail_closed)
     text = dump(merged)
-    owner_allow = wsp.load_owner_allow(args.owner_allow_file) if getattr(args, "owner_allow_file", None) else ()
+    owner_allow, registry_sha = (), None
+    if getattr(args, "owner_allow_file", None):
+        reg_raw = pathlib.Path(args.owner_allow_file).read_bytes()  # one read: the pin and the parsed entries use the same bytes
+        registry_sha, owner_allow = sha(reg_raw), wsp.parse_owner_allow(reg_raw)
     findings = compat(live, merged, cand, report.get("hook_conflict", []), owner_allow)
+    findings += [f"owner allow registry entry (informational, review it; the owner pins its hash on apply): {e}" for e in owner_allow]
     dropped = {k: v for k, v in report["dropped_from_live"].items() if v}
     if dropped:
         findings.append(f"live autoMode entries replaced by the candidate (informational, review them): {dropped}")
     return {"live_sha": sha(raw), "candidate_sha": sha(pathlib.Path(args.candidate).read_bytes()),
             "baseline_sha": sha(pathlib.Path(args.baseline).read_bytes()) if args.baseline else None,
+            "registry_sha": registry_sha,
             "result_sha": sha(text), "report": report, "compat": findings,
             "blocking": any(f.startswith("BLOCKING") for f in findings),
             "untouched_keys": sorted(k for k in live if k not in ("autoMode",)), "_text": text}
@@ -211,6 +216,9 @@ def apply(args):
         raise SystemExit(f"REFUSED: live file hash {p['live_sha']} != pinned {args.expect_live_sha}; re-run plan")
     if p["result_sha"] != args.expect_result_sha:
         raise SystemExit(f"REFUSED: predicted result {p['result_sha']} != pinned {args.expect_result_sha}; inputs changed, re-run plan")
+    if p["registry_sha"] != getattr(args, "expect_registry_sha", None):
+        raise SystemExit(f"REFUSED: owner allow registry hash {p['registry_sha']} != pinned {getattr(args, 'expect_registry_sha', None)}; "
+                         "pass --expect-registry-sha with the reviewed registry's hash (and only with --owner-allow-file)")
     if p["blocking"]:
         raise SystemExit("REFUSED: blocking compatibility findings; see plan")
     bdir = pathlib.Path(os.path.expanduser(args.backup_dir))
@@ -254,6 +262,7 @@ def main(argv=None):
     ap_apply = sub.choices["apply"]
     ap_apply.add_argument("--expect-live-sha", required=True)
     ap_apply.add_argument("--expect-result-sha", required=True)
+    ap_apply.add_argument("--expect-registry-sha", help="hash of the reviewed owner allow registry; required with --owner-allow-file, refused without it")
     ap_apply.add_argument("--backup-dir", default="~/.claude/backups")
     v = sub.add_parser("verify")
     v.add_argument("--live", required=True)

@@ -274,13 +274,20 @@ def proxy_scoped_candidate():
 # owner supplied that exact string in a registry file (the agent never authors this text) and it stays scoped to the
 # validating runner with an exact-head pin; the runner and gate remain the real enforcement.
 OWNER_ALLOW_REQUIRED = ("owner-merge-runner", "--expect-head")
-OWNER_ALLOW_FORBIDDEN = re.compile(r"--admin|gh pr merge|\b(any|every|all)\b.{0,30}\b(pull requests?|PRs?|merges?|repositor(y|ies))\b|\bwithout\b.{0,20}\b(review|gate)\b", re.I)
+OWNER_ALLOW_FORBIDDEN = re.compile(
+    r"--admin|gh pr merge|bypass|dangerously|Bash\(|\bstanding\b|\bwithout\b|\bskip|\balways\b|\bwhatever\b|\bautomatic|\bapprov"
+    r"|\b(any|every|all|each)\b.{0,30}\b(pull requests?|PRs?|merges?|repositor(y|ies))\b", re.I)
+STANDING_MERGE = re.compile(r"authorized pull request merge|standing\b.{0,40}\bmerge|merge\b.{0,40}\b(authori[sz]ation|without review)", re.I)
 OWNER_ALLOW_MAX = 3
 
 
 def load_owner_allow(path):
     """Owner-supplied registry: a JSON array of strings. Anything else is refused rather than guessed at."""
-    data = json.load(open(path))
+    return parse_owner_allow(pathlib.Path(path).read_bytes())
+
+
+def parse_owner_allow(raw):
+    data = json.loads(raw)
     if not isinstance(data, list) or not all(isinstance(e, str) and e for e in data):
         raise ValueError("owner allow registry must be a JSON array of non-empty strings")
     return data
@@ -290,7 +297,8 @@ def owner_allow_problems(entry):
     bad = [f"owner autoMode.allow entry must mention {t!r}: {entry[:60]}" for t in OWNER_ALLOW_REQUIRED if t not in entry]
     if len(entry) > 400:
         bad.append(f"owner autoMode.allow entry over 400 chars: {entry[:60]}")
-    if OWNER_ALLOW_FORBIDDEN.search(entry):
+    flat = " ".join(entry.split())  # newlines, tabs and runs of spaces must not split a forbidden phrase
+    if OWNER_ALLOW_FORBIDDEN.search(flat) or STANDING_MERGE.search(flat):
         bad.append(f"owner autoMode.allow entry is broader than the pinned runner: {entry[:60]}")
     return bad
 
@@ -299,14 +307,11 @@ def lint_settings(cfg, owner_allow=()):
     """Invariants every candidate must hold. Returns a list of violations (empty means clean)."""
     bad = []
     owner_allow = set(owner_allow)
-    accepted = [r for r in (cfg.get("autoMode") or {}).get("allow", [])[1:] if r in owner_allow]
+    accepted = [r for r in (cfg.get("autoMode") or {}).get("allow", [])[1:] if isinstance(r, str) and r in owner_allow]
     for rule in accepted:
         bad += owner_allow_problems(rule)
     if len(accepted) > OWNER_ALLOW_MAX:
         bad.append(f"more than {OWNER_ALLOW_MAX} owner autoMode.allow entries")
-    if accepted:  # judge the rest of the configuration without the owner-registered text
-        cfg = json.loads(json.dumps(cfg))
-        cfg["autoMode"]["allow"] = [r for r in cfg["autoMode"]["allow"] if r not in accepted]
     am = cfg.get("autoMode") or {}
     for key in ("allow", "soft_deny", "hard_deny", "environment"):
         if key in am and (not am[key] or am[key][0] != "$defaults"):
@@ -315,6 +320,8 @@ def lint_settings(cfg, owner_allow=()):
     if len(env) > 8 or any(len(str(e)) > 300 for e in env):
         bad.append("autoMode.environment must stay short and factual (<= 8 entries of <= 300 chars)")
     for rule in am.get("allow", [])[1:]:
+        if isinstance(rule, str) and rule in accepted:
+            continue  # owner-registered: judged by owner_allow_problems and, like all text, by the blob checks below
         bad.append(f"custom autoMode.allow entry needs an independently documented need: {str(rule)[:60]}")
     blob = json.dumps(cfg)
     if re.search(r'"Bash\(\*\)"|Bash\(\*:\*\)', blob):
@@ -323,7 +330,7 @@ def lint_settings(cfg, owner_allow=()):
         bad.append("bypassPermissions must not appear")
     if (cfg.get("permissions") or {}).get("defaultMode") in ("dontAsk", "bypassPermissions") or cfg.get("defaultMode") in ("dontAsk", "bypassPermissions"):
         bad.append("defaultMode removes prompts")
-    if re.search(r"authorized pull request merge|standing\b.{0,40}\bmerge|merge\b.{0,40}\b(authori[sz]ation|without review)", blob, re.I):
+    if STANDING_MERGE.search(blob):
         bad.append("standing merge authorization text must not return")
     asks = [str(r) for r in (cfg.get("permissions") or {}).get("ask", [])]
     for r in asks:

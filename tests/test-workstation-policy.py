@@ -327,6 +327,21 @@ class OwnerAllowRegistry(unittest.TestCase):
                     "Synthetic: --expect-head X merges"):
             self.assertTrue(wsp.lint_settings(self.cand(bad), [bad]), bad)
 
+    def test_registered_entry_cannot_smuggle_blob_level_violations(self):
+        base = "Synthetic: owner-merge-runner --expect-head X"
+        for bad in (base + ": standing authorization to merge pull requests", base + " bypassPermissions", base + " Bash(*)",
+                    base + " dangerously-skip-permissions", base + ": merge each pull request automatically",
+                    base + ": may merge all\nPRs", base + ": gh  pr\tmerge", base + ": merge without\nreview",
+                    base + ": merge whatever is open", base + ": skip review", base + ": always approve"):
+            self.assertTrue(wsp.lint_settings(self.cand(bad), [bad]), repr(bad))
+
+    def test_registered_entry_cannot_take_the_defaults_slot_or_be_a_non_string(self):
+        c = self.cand(self.ENTRY)
+        c["autoMode"]["allow"] = [self.ENTRY, "$defaults", self.ENTRY]
+        self.assertTrue(wsp.lint_settings(c, [self.ENTRY]))
+        c["autoMode"]["allow"] = ["$defaults", {"x": 1}]
+        self.assertTrue(wsp.lint_settings(c, [self.ENTRY]))
+
     def test_registry_does_not_excuse_other_violations(self):
         c = self.cand(self.ENTRY)
         c["permissions"]["allow"] = ["Bash(gh pr merge:*)"]
