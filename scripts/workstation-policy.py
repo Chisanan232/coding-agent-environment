@@ -270,9 +270,43 @@ def proxy_scoped_candidate():
     }
 
 
-def lint_settings(cfg):
+# A custom autoMode.allow entry is classifier guidance, never proof of review or authorization. It is accepted only when the
+# owner supplied that exact string in a registry file (the agent never authors this text) and it stays scoped to the
+# validating runner with an exact-head pin; the runner and gate remain the real enforcement.
+OWNER_ALLOW_REQUIRED = ("owner-merge-runner", "--expect-head")
+OWNER_ALLOW_FORBIDDEN = re.compile(r"--admin|gh pr merge|\b(any|every|all)\b.{0,30}\b(pull requests?|PRs?|merges?|repositor(y|ies))\b|\bwithout\b.{0,20}\b(review|gate)\b", re.I)
+OWNER_ALLOW_MAX = 3
+
+
+def load_owner_allow(path):
+    """Owner-supplied registry: a JSON array of strings. Anything else is refused rather than guessed at."""
+    data = json.load(open(path))
+    if not isinstance(data, list) or not all(isinstance(e, str) and e for e in data):
+        raise ValueError("owner allow registry must be a JSON array of non-empty strings")
+    return data
+
+
+def owner_allow_problems(entry):
+    bad = [f"owner autoMode.allow entry must mention {t!r}: {entry[:60]}" for t in OWNER_ALLOW_REQUIRED if t not in entry]
+    if len(entry) > 400:
+        bad.append(f"owner autoMode.allow entry over 400 chars: {entry[:60]}")
+    if OWNER_ALLOW_FORBIDDEN.search(entry):
+        bad.append(f"owner autoMode.allow entry is broader than the pinned runner: {entry[:60]}")
+    return bad
+
+
+def lint_settings(cfg, owner_allow=()):
     """Invariants every candidate must hold. Returns a list of violations (empty means clean)."""
     bad = []
+    owner_allow = set(owner_allow)
+    accepted = [r for r in (cfg.get("autoMode") or {}).get("allow", [])[1:] if r in owner_allow]
+    for rule in accepted:
+        bad += owner_allow_problems(rule)
+    if len(accepted) > OWNER_ALLOW_MAX:
+        bad.append(f"more than {OWNER_ALLOW_MAX} owner autoMode.allow entries")
+    if accepted:  # judge the rest of the configuration without the owner-registered text
+        cfg = json.loads(json.dumps(cfg))
+        cfg["autoMode"]["allow"] = [r for r in cfg["autoMode"]["allow"] if r not in accepted]
     am = cfg.get("autoMode") or {}
     for key in ("allow", "soft_deny", "hard_deny", "environment"):
         if key in am and (not am[key] or am[key][0] != "$defaults"):
@@ -328,8 +362,10 @@ def main(argv=None):
     r.add_argument("--out")
     r.add_argument("--asks-only", action="store_true", help="omit the autoMode block (minimal canary candidate)")
     r.add_argument("--proxy-scoped", action="store_true", help="SPE-119 candidate: retire the broad rtk proxy ask, add scoped asks and allows")
+    r.add_argument("--owner-allow-file", help="JSON array of owner-authored autoMode.allow entries to append after $defaults (each is linted; the agent never writes this text)")
     lint = sub.add_parser("lint-settings")
     lint.add_argument("file")
+    lint.add_argument("--owner-allow-file", help="owner registry that makes matching custom autoMode.allow entries acceptable")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "fingerprint":
@@ -344,14 +380,23 @@ def main(argv=None):
             print(json.dumps(out, indent=1))
             return {"ALLOW": 0, "ASK": 1, "DENY": 2}[out["verdict"]]
         if a.cmd == "render-settings":
-            text = json.dumps(proxy_scoped_candidate() if a.proxy_scoped else candidate(a.kind, asks_only=a.asks_only), indent=2) + "\n"
+            cand = proxy_scoped_candidate() if a.proxy_scoped else candidate(a.kind, asks_only=a.asks_only)
+            if a.owner_allow_file:
+                owner_allow = load_owner_allow(a.owner_allow_file)
+                if "autoMode" not in cand:
+                    raise ValueError("--owner-allow-file needs a candidate with an autoMode block (not --asks-only or --proxy-scoped)")
+                cand["autoMode"]["allow"] = ["$defaults"] + owner_allow
+                problems = lint_settings(cand, owner_allow)
+                if problems:
+                    raise ValueError("owner allow registry rejected: " + "; ".join(problems))
+            text = json.dumps(cand, indent=2) + "\n"
             if a.out:
                 with open(safe_out(a.out), "x") as fh:  # exclusive create: never overwrites an existing file
                     fh.write(text)
             else:
                 sys.stdout.write(text)
             return 0
-        problems = lint_settings(json.load(open(a.file)))
+        problems = lint_settings(json.load(open(a.file)), load_owner_allow(a.owner_allow_file) if a.owner_allow_file else ())
         print(json.dumps({"verdict": "CLEAN" if not problems else "VIOLATIONS", "problems": problems}, indent=1))
         return 0 if not problems else 1
     except Exception as ex:

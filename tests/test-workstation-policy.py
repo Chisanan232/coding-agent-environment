@@ -301,5 +301,72 @@ class Candidates(unittest.TestCase):
             self.assertEqual(wsp.main(["evaluate", "--profile", os.path.join(d, "missing"), "--action", "{}", "--fingerprint", FP]), 3)
 
 
+class OwnerAllowRegistry(unittest.TestCase):
+    """Synthetic text only: the agent never authors the real autoMode.allow wording (owner decision)."""
+    ENTRY = "Synthetic: a merge run through owner-merge-runner with --expect-head pinned to the reviewed head."
+
+    def cand(self, *entries):
+        c = wsp.candidate("personal")
+        c["autoMode"]["allow"] = ["$defaults", *entries]
+        return c
+
+    def test_unregistered_custom_allow_is_still_rejected(self):
+        self.assertTrue(wsp.lint_settings(self.cand(self.ENTRY)))
+        self.assertTrue(wsp.lint_settings(self.cand(self.ENTRY), owner_allow=["some other entry"]))
+
+    def test_registered_runner_scoped_entry_is_accepted(self):
+        self.assertEqual(wsp.lint_settings(self.cand(self.ENTRY), [self.ENTRY]), [])
+
+    def test_registered_entry_must_be_scoped_to_the_pinned_runner(self):
+        for bad in ("Synthetic: run gh pr merge with owner-merge-runner --expect-head X",
+                    "Synthetic: owner-merge-runner --expect-head X may merge any pull request",
+                    "Synthetic: owner-merge-runner --expect-head X merges all PRs",
+                    "Synthetic: owner-merge-runner --expect-head X --admin",
+                    "Synthetic: owner-merge-runner merges without review",
+                    "Synthetic: merge with owner-merge-runner",
+                    "Synthetic: --expect-head X merges"):
+            self.assertTrue(wsp.lint_settings(self.cand(bad), [bad]), bad)
+
+    def test_registry_does_not_excuse_other_violations(self):
+        c = self.cand(self.ENTRY)
+        c["permissions"]["allow"] = ["Bash(gh pr merge:*)"]
+        self.assertTrue(wsp.lint_settings(c, [self.ENTRY]))
+        c = self.cand(self.ENTRY)
+        c["autoMode"]["allow"][0] = "only mine"
+        self.assertTrue(wsp.lint_settings(c, [self.ENTRY]))
+
+    def test_at_most_three_entries(self):
+        es = [f"{self.ENTRY} #{i}" for i in range(4)]
+        self.assertTrue(wsp.lint_settings(self.cand(*es), es))
+
+    def test_registry_file_must_be_a_json_string_array(self):
+        with tempfile.TemporaryDirectory() as d:
+            for content in ('{"a": 1}', '[1]', '[""]', 'nope'):
+                p = os.path.join(d, "r.json")
+                open(p, "w").write(content)
+                with self.assertRaises(Exception):
+                    wsp.load_owner_allow(p)
+            open(p, "w").write(json.dumps([self.ENTRY]))
+            self.assertEqual(wsp.load_owner_allow(p), [self.ENTRY])
+
+    def test_render_with_registry_appends_after_defaults_and_lints_clean(self):
+        with tempfile.TemporaryDirectory() as d:
+            reg, out_ = os.path.join(d, "r.json"), os.path.join(d, "cand.json")
+            open(reg, "w").write(json.dumps([self.ENTRY]))
+            self.assertEqual(wsp.main(["render-settings", "--kind", "personal", "--owner-allow-file", reg, "--out", out_]), 0)
+            cand = json.load(open(out_))
+            self.assertEqual(cand["autoMode"]["allow"], ["$defaults", self.ENTRY])
+            self.assertEqual(wsp.main(["lint-settings", out_]), 1)
+            self.assertEqual(wsp.main(["lint-settings", out_, "--owner-allow-file", reg]), 0)
+
+    def test_render_refuses_a_broad_entry_and_an_asks_only_shape(self):
+        with tempfile.TemporaryDirectory() as d:
+            reg = os.path.join(d, "r.json")
+            open(reg, "w").write(json.dumps(["owner-merge-runner --expect-head X: any pull request"]))
+            self.assertEqual(wsp.main(["render-settings", "--kind", "personal", "--owner-allow-file", reg]), 3)
+            open(reg, "w").write(json.dumps([self.ENTRY]))
+            self.assertEqual(wsp.main(["render-settings", "--kind", "personal", "--asks-only", "--owner-allow-file", reg]), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -125,17 +125,17 @@ def merge(live, candidate, baseline=None, hook_command=None, fail_closed=False):
     return merged, report
 
 
-def compat(live, merged, candidate, report_conflicts=()):
+def compat(live, merged, candidate, report_conflicts=(), owner_allow=()):
     """Findings the owner should read before applying. Informational unless noted BLOCKING."""
     out = []
-    for problem in wsp.lint_settings(candidate):
+    for problem in wsp.lint_settings(candidate, owner_allow):
         out.append(f"BLOCKING candidate lint: {problem}")
     am = merged.get("autoMode") or {}
     if "autoMode" in candidate:  # an asks-only candidate leaves the live autoMode untouched, so it is not judged here
         for key in ("allow", "soft_deny", "hard_deny", "environment"):
             if key in am and (not am[key] or am[key][0] != "$defaults"):
                 out.append(f"BLOCKING autoMode.{key} lost $defaults")
-        for problem in wsp.lint_settings({"autoMode": am}):  # the merged autoMode, including live values carried over when the candidate omits a key (the owner restates the key to replace them); permissions.allow/ask are judged elsewhere
+        for problem in wsp.lint_settings({"autoMode": am}, owner_allow):  # the merged autoMode, including live values carried over when the candidate omits a key (the owner restates the key to replace them); permissions.allow/ask are judged elsewhere
             out.append(f"BLOCKING merged configuration lint: {problem}")
     for rule in (live.get("permissions") or {}).get("ask", []):
         if rule not in merged["permissions"]["ask"] and rule not in candidate_retired(candidate):
@@ -178,7 +178,8 @@ def plan(args, raw=None):
     baseline = load(args.baseline)[1] if args.baseline else None
     merged, report = merge(live, cand, baseline, args.hook_command, args.fail_closed)
     text = dump(merged)
-    findings = compat(live, merged, cand, report.get("hook_conflict", []))
+    owner_allow = wsp.load_owner_allow(args.owner_allow_file) if getattr(args, "owner_allow_file", None) else ()
+    findings = compat(live, merged, cand, report.get("hook_conflict", []), owner_allow)
     dropped = {k: v for k, v in report["dropped_from_live"].items() if v}
     if dropped:
         findings.append(f"live autoMode entries replaced by the candidate (informational, review them): {dropped}")
@@ -249,6 +250,7 @@ def main(argv=None):
         sp.add_argument("--baseline")
         sp.add_argument("--hook-command")
         sp.add_argument("--fail-closed", action="store_true")
+        sp.add_argument("--owner-allow-file", help="owner registry of exact autoMode.allow entries the lint may accept (see workstation-policy.py)")
     ap_apply = sub.choices["apply"]
     ap_apply.add_argument("--expect-live-sha", required=True)
     ap_apply.add_argument("--expect-result-sha", required=True)

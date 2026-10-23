@@ -431,6 +431,10 @@ Conclusion, with what is not shown: the rules involved are the shipped soft-deny
 
 What a user setting can do: the only documented lever is `autoMode.allow` and `autoMode.environment` text that tells the classifier a specific action is authorized. The agent may not write that text itself; the classifier denies it as instruction poisoning and self-modification, correctly. It is an owner edit, applied through `candidate-rollout.py`, and its effect cannot be measured until it is applied and a fresh session is tested.
 
+### Owner allow registry (SPE-118; mechanism only, nothing deployed)
+
+`workstation-policy.py lint_settings` still rejects every custom `autoMode.allow` entry unless the owner lists that exact string in a registry file (JSON array of strings, at most 3) passed with `--owner-allow-file` to `lint-settings`, `render-settings` and `candidate-rollout.py plan|apply`. A registered entry must name `owner-merge-runner` and `--expect-head`, stay under 400 characters, and must not mention `--admin`, `gh pr merge`, "any/every/all pull requests", or merging without review. Everything else in the candidate is linted as before, `$defaults` stays mandatory, and the rollout keeps its SHA pins, live-key preservation and byte-exact rollback. The agent writes no registry text. An accepted entry is classifier guidance only: the runner and gate remain the enforcement, and the entry proves no review or GitHub authorization. A candidate containing it is not deployed until the owner applies it and a fresh session is tested.
+
 ## 14. Private Free capability contract
 
 GitHub Free private repositories return `403 Upgrade to GitHub Pro or make this repository public` for branch protection and for rulesets. That does not stop the merge API (`gh pr merge` works there); it removes the server-side guarantee. The runner now says so instead of pretending:

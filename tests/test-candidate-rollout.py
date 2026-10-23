@@ -358,5 +358,64 @@ class Rollout(unittest.TestCase):
         self.assertIn("REFUSED", str(rc))
 
 
+class OwnerAllowRollout(unittest.TestCase):
+    ENTRY = "Synthetic: a merge run through owner-merge-runner with --expect-head pinned to the reviewed head."
+    setUp, run_cli, plan = Rollout.setUp, Rollout.run_cli, Rollout.plan
+
+    def with_owner_candidate(self):
+        cand = {"autoMode": {"allow": ["$defaults", self.ENTRY]}}
+        self.cand.write_text(json.dumps(cand))
+        reg = self.d / "owner-allow.json"
+        reg.write_text(json.dumps([self.ENTRY]))
+        return str(reg)
+
+    def test_custom_allow_blocks_without_the_owner_registry_and_plans_with_it(self):
+        reg = self.with_owner_candidate()
+        self.assertTrue(self.plan()["blocking"])
+        p = self.plan("--owner-allow-file", reg)
+        self.assertFalse(p["blocking"], p["compat"])
+
+    def test_registry_plan_preserves_every_other_live_key_and_original_bytes(self):
+        reg = self.with_owner_candidate()
+        before = self.live.read_bytes()
+        p = self.plan("--owner-allow-file", reg)
+        self.assertEqual(self.live.read_bytes(), before)
+        self.assertFalse(p["blocking"], p["compat"])
+        merged = cr.merge(LIVE, json.loads(self.cand.read_text()))[0]
+        self.assertEqual(merged["autoMode"]["allow"], ["$defaults", self.ENTRY])
+        self.assertEqual(merged["autoMode"]["environment"], LIVE["autoMode"]["environment"])
+        for key in ("env", "model", "effortLevel", "hooks", "statusLine"):
+            self.assertEqual(merged[key], LIVE[key])
+        self.assertEqual(merged["permissions"]["allow"], LIVE["permissions"]["allow"])
+
+    def test_candidate_without_defaults_is_blocked_even_with_the_registry(self):
+        reg = self.with_owner_candidate()
+        self.cand.write_text(json.dumps({"autoMode": {"allow": [self.ENTRY]}}))
+        self.assertTrue(self.plan("--owner-allow-file", reg)["blocking"])
+
+    def test_apply_with_registry_is_pinned_and_rolls_back_to_original_bytes(self):
+        reg = self.with_owner_candidate()
+        original = self.live.read_bytes()
+        p = self.plan("--owner-allow-file", reg)
+        backups = self.d / "backups"
+        rc, out = self.run_cli("apply", *self.args, "--owner-allow-file", reg, "--expect-live-sha", p["live_sha"],
+                               "--expect-result-sha", p["result_sha"], "--backup-dir", str(backups))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(json.loads(self.live.read_text())["autoMode"]["allow"], ["$defaults", self.ENTRY])
+        backup = next(backups.iterdir())
+        rc, out = self.run_cli("rollback", "--live", str(self.live), "--backup", str(backup), "--expect-backup-sha",
+                               cr.sha(original), "--expect-live-sha", p["result_sha"])
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.live.read_bytes(), original)
+
+    def test_concurrent_live_change_refuses_the_stale_plan(self):
+        reg = self.with_owner_candidate()
+        p = self.plan("--owner-allow-file", reg)
+        self.live.write_text(self.live.read_text() + "\n")
+        rc, _ = self.run_cli("apply", *self.args, "--owner-allow-file", reg, "--expect-live-sha", p["live_sha"],
+                             "--expect-result-sha", p["result_sha"], "--backup-dir", str(self.d / "b"))
+        self.assertIn("REFUSED", str(rc))
+
+
 if __name__ == "__main__":
     unittest.main()
