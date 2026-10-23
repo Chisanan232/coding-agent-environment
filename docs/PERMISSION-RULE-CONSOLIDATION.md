@@ -1,6 +1,6 @@
 # Permission rule consolidation: inventory and minimal reduction (SPE-118)
 
-Measured 2026-10-24, read-only, against `~/.claude/settings.json` (sha256 `1feb301d…5f1ef`, unchanged), Claude Code 2.1.306. There is no project, local or managed settings file on this machine for this repository.
+Measured 2026-10-24, read-only, against `~/.claude/settings.json` (sha256 `1feb301d…5f1ef`, unchanged), Claude Code 2.1.306. **Scope: the user file only.** Effective rules are the union of user, project and local files; this repository also tracks `.claude/settings.json` (191 allow, 209 ask, 0 deny as counted by the reviewer; it contains the same two merge allows named below, plus `rtk proxy` merge asks) and `~/.claude/settings.local.json` has 5 allow rules. Those two files were not classified here, no managed settings file was found, and every count and "no coverage lost" statement below is about the user file.
 **Nothing here is applied.** Editing `~/.claude/settings.json` is itself an ask rule (`Edit(~/.claude/settings.json)`) and an owner-only change; the reduction below is a proposal for the owner to apply.
 
 ## What the documentation says (code.claude.com permissions, permission-modes, hooks, settings pages; read by a docs lookup, not re-tested here)
@@ -36,14 +36,14 @@ Method: textual glob comparison of each rule against the others (the same `*` se
 | Kind | Rules | Effect of removing |
 |---|---|---|
 | Exact duplicate spelling (`:*` and ` *`), ask | `Bash(git push -f:*)`, `Bash(rtk git push -f:*)`, `Bash(gh repo delete:*)`, `Bash(rtk gh repo delete:*)`, `Bash(gh pr merge:*)`, `Bash(rtk gh pr merge:*)`. The ` *` twin of each stays. | none: same matches |
-| Dead allow, shadowed by an ask of the same text | `Bash(gh pr merge:*)`, `mcp__github__merge_pull_request` (allow side) | none today (ask wins); removes a latent merge allow that a future edit of the ask list could expose |
+| Dead allow, shadowed by an ask of the same text | `Bash(gh pr merge:*)`, `mcp__github__merge_pull_request` (allow side) | none today (ask wins). User-scope only: the same two allows also exist in the tracked project `.claude/settings.json`, so they stay inert only while the user-file merge asks survive. Dropping them from the project file would be its own reviewed change, not proposed here |
 | Subset asks kept on purpose | 18 narrower asks inside a broader one, for example the `--admin` merge forms inside `gh pr merge`, `git push --force-with-lease` inside `--force*`, `gh api -X DELETE` inside `gh api *DELETE*` | none, so they are kept as defense in depth: they stay protective if a broad rule is later narrowed |
 
 Net minimal reduction: ask 266 → 260, allow 182 → 180. **No routine prompt disappears from this**; rule count is the only gain. The broad allows `Bash(gh pr *)` and `Bash(rtk gh pr *)` also cover `gh pr merge` and are neutralized only by the merge asks; they are left alone, and no new allow rule is added.
 
 ## `rtk`
 
-`rtk` is a rewrite hook, so rules see the rewritten command. That is why every protected rule has an `rtk` twin and why the twins must stay: dropping a twin would leave the rewritten spelling unguarded. `Bash(rtk:*)` as an allow would not override an ask or the classifier on anything (ask outranks allow), and it would be a blanket allow over every rewritten command, so it is not proposed. The trusted runner is invoked by absolute path, which the rewrite does not touch, so its single allow rule is evaluated on the literal text.
+`rtk` is a rewrite hook, so rules see the rewritten command. That is why every protected rule has an `rtk` twin and why the twins must stay: dropping a twin would leave the rewritten spelling unguarded. `Bash(rtk:*)` as an allow would not override an ask (ask outranks allow), but it would resolve before the auto-mode classifier for every rewritten command no ask matches, which is a blanket pre-emption of the host's security classification, so it is not proposed. The trusted runner is invoked by absolute path, which the rewrite does not touch, so its single allow rule is evaluated on the literal text.
 
 ## What runs without a prompt, and what still needs authorization
 
@@ -56,8 +56,8 @@ Still requires host or owner authorization: every direct merge spelling; all des
 Owner applies, in an editor, outside an agent session:
 
 1. `cp -p ~/.claude/settings.json ~/.claude/settings.json.pre-consolidation` (the rollback copy).
-2. Remove the six ask and two allow entries named above, keeping every ` *` twin and every other rule byte-identical.
-3. Re-run `python3 -c 'import json;json.load(open("…/settings.json"))'` and open `/permissions` to confirm counts 260 ask and 180 allow.
-4. Validate with one standalone harmless command and one pinned `gh pr merge` that still asks.
+2. Remove from `permissions.ask` only: `Bash(git push -f:*)`, `Bash(rtk git push -f:*)`, `Bash(gh repo delete:*)`, `Bash(rtk gh repo delete:*)`, `Bash(gh pr merge:*)`, `Bash(rtk gh pr merge:*)`. Remove from `permissions.allow` only: `Bash(gh pr merge:*)`, `mcp__github__merge_pull_request`. The same two strings exist in both arrays, so edit each array separately. Keep every ` *` twin and every other rule byte-identical.
+3. Parse the file as JSON and open `/permissions` to confirm 260 ask and 180 allow, and that `permissions.ask` still contains `Bash(gh pr merge *)`, `Bash(rtk gh pr merge *)` and `mcp__github__merge_pull_request`.
+4. Validate with one standalone harmless command, and check that a merge still asks using a non-existent PR number (for example `gh pr merge 999999 --repo <repo> --merge --match-head-commit <sha>`), so a missed prompt fails harmlessly instead of merging.
 
 Rollback: copy the saved file back. Original sha256 is `1feb301d42005b7402024431793e852a6f32b7b6456619eea3ce55eac0a5f1ef`.
