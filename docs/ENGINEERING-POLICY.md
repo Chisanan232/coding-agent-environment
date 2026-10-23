@@ -112,7 +112,7 @@ copies). Not covered: any live GitHub, host-classifier or deployed-settings beha
 Nothing below is performed by this change. Do **not** use `permission-rollout.py apply`: it applies the
 repository baseline's `autoMode` block, which still contains the retired natural-language rules (including a
 standing merge-authorization entry). Use `scripts/candidate-rollout.py`, which merges only `autoMode`
-(replaced by the short candidate; owner `soft_deny`/`hard_deny` entries kept), the union of `permissions.ask`,
+(replaced by the short candidate; owner `soft_deny`/`hard_deny` entries kept, and any `autoMode` key the candidate omits keeps its live value; the merged `autoMode` is linted and a forbidden preserved entry blocks apply), the union of `permissions.ask` (an existing ask lost in the merge is blocking),
 and one optional PreToolUse hook entry, and never `allow`, `deny`, `env` or other keys.
 
 1. `candidate-rollout.py plan --live ~/.claude/settings.json --candidate <candidate> --baseline <repo .claude/settings.json> [--hook-command ... --fail-closed]`

@@ -55,10 +55,16 @@ def union(*lists):
     out, seen = [], set()
     for lst in lists:
         for item in lst or []:
-            if item not in seen:
-                seen.add(item)
+            key = json.dumps(item, sort_keys=True)  # entries may be objects, which are unhashable
+            if key not in seen:
+                seen.add(key)
                 out.append(item)
     return out
+
+
+def candidate_retired(candidate):
+    """Asks the candidate explicitly retires, limited to what the tool may retire."""
+    return [r for r in ((candidate.get("permissions") or {}).get("retire_ask", [])) if r in wsp.RETIRABLE_ASKS]
 
 
 def merge(live, candidate, baseline=None, hook_command=None, fail_closed=False):
@@ -67,8 +73,14 @@ def merge(live, candidate, baseline=None, hook_command=None, fail_closed=False):
     live_am = live.get("autoMode") or {}
     before_counts = {k: len(v) for k, v in live_am.items() if isinstance(v, list)}
     report = {"autoMode_before": before_counts, "denies_kept": {}, "dropped_from_live": {"environment": [], "allow": []}}
+    if "autoMode" in candidate and not isinstance(candidate["autoMode"], dict):
+        raise SystemExit("REFUSED: candidate autoMode must be an object (omit the key to leave the live autoMode alone)")
     if "autoMode" in candidate:  # an asks-only candidate (no autoMode key) leaves the live autoMode exactly as it is
-        am = json.loads(json.dumps(candidate["autoMode"]))
+        am =json.loads(json.dumps(candidate["autoMode"]))
+        carried = [k for k in live_am if k not in am]  # a candidate that omits a key leaves the owner's live value alone
+        for key in carried:
+            am[key] = json.loads(json.dumps(live_am[key]))
+        report["autoMode_preserved"] = carried
         report["autoMode_after"] = {k: len(v) for k, v in am.items() if isinstance(v, list)}
         for key in ("soft_deny", "hard_deny"):  # an owner's own deny entries are never dropped
             extra = [x for x in live_am.get(key, []) if x != "$defaults"]
@@ -82,14 +94,15 @@ def merge(live, candidate, baseline=None, hook_command=None, fail_closed=False):
     perms = merged.setdefault("permissions", {})
     before = list(perms.get("ask", []))
     base_asks = ((baseline or {}).get("permissions") or {}).get("ask", [])
-    perms["ask"] = union(before, base_asks, candidate["permissions"]["ask"])
-    retire = [r for r in candidate["permissions"].get("retire_ask", [])]
+    cand_perms = candidate.get("permissions") or {}  # an autoMode-only candidate carries no permissions block
+    perms["ask"] = union(before, base_asks, cand_perms.get("ask", []))
+    retire = [r for r in cand_perms.get("retire_ask", [])]
     report["asks_retired"] = [r for r in perms["ask"] if r in retire and r in wsp.RETIRABLE_ASKS]
     report["retire_refused"] = [r for r in retire if r not in wsp.RETIRABLE_ASKS]
     perms["ask"] = [r for r in perms["ask"] if r not in report["asks_retired"]]
     allow_before = list(perms.get("allow", []))
-    if candidate["permissions"].get("allow"):
-        perms["allow"] = union(allow_before, candidate["permissions"]["allow"])
+    if cand_perms.get("allow"):
+        perms["allow"] = union(allow_before, cand_perms["allow"])
     report["allow_added"] = [a for a in perms.get("allow", []) if a not in allow_before]
     report["asks_added"] = [a for a in perms["ask"] if a not in before]
     report["asks_kept"] = len(before)
@@ -118,29 +131,37 @@ def compat(live, merged, candidate, report_conflicts=()):
     for problem in wsp.lint_settings(candidate):
         out.append(f"BLOCKING candidate lint: {problem}")
     am = merged.get("autoMode") or {}
-    for key in ("allow", "soft_deny", "hard_deny", "environment"):
-        if key in am and (not am[key] or am[key][0] != "$defaults"):
-            out.append(f"BLOCKING autoMode.{key} lost $defaults")
+    if "autoMode" in candidate:  # an asks-only candidate leaves the live autoMode untouched, so it is not judged here
+        for key in ("allow", "soft_deny", "hard_deny", "environment"):
+            if key in am and (not am[key] or am[key][0] != "$defaults"):
+                out.append(f"BLOCKING autoMode.{key} lost $defaults")
+        for problem in wsp.lint_settings({"autoMode": am}):  # the merged autoMode, including live values carried over when the candidate omits a key (the owner restates the key to replace them); permissions.allow/ask are judged elsewhere
+            out.append(f"BLOCKING merged configuration lint: {problem}")
+    for rule in (live.get("permissions") or {}).get("ask", []):
+        if rule not in merged["permissions"]["ask"] and rule not in candidate_retired(candidate):
+            out.append(f"BLOCKING existing ask lost in the merge: {rule}")
     for msg in report_conflicts:
         out.append(f"BLOCKING {msg}")
     live_allow = (live.get("permissions") or {}).get("allow", [])
     for problem in wsp.lint_settings({"permissions": {"allow": live_allow}}):
         out.append(f"live allow list (untouched, informational): {problem}")
-    for r in candidate["permissions"].get("retire_ask", []):
+    cand_perms = candidate.get("permissions") or {}
+    for r in cand_perms.get("retire_ask", []):
         if r not in wsp.RETIRABLE_ASKS:
             out.append(f"BLOCKING candidate asks to retire an ask the tool may not retire: {r}")
-    for r in candidate["permissions"].get("allow", []):
+    for r in cand_perms.get("allow", []):
         if r not in wsp.PROXY_ROUTINE_ALLOW + wsp.ROUTINE_BARE_ALLOW:
             out.append(f"BLOCKING candidate allow is not one of the scoped allows this tool may add: {r}")
     merged_perm = merged["permissions"]
-    if candidate["permissions"].get("allow") or any(r in candidate["permissions"].get("retire_ask", []) for r in wsp.RETIRABLE_ASKS):
+    if cand_perms.get("allow") or any(r in cand_perms.get("retire_ask", []) for r in wsp.RETIRABLE_ASKS):
         for cmd in pr.PROXY_PROTECTED_COMMANDS:
             if pr.static_decision(cmd, merged_perm) != "ask":
                 out.append(f"BLOCKING protected wrapped command would not ask after the merge: {cmd!r} -> {pr.static_decision(cmd, merged_perm)}")
         for cmd in pr.PROXY_ROUTINE_COMMANDS:
             if pr.static_decision(cmd, merged_perm) == "ask":
                 out.append(f"routine wrapped command still asks after the merge (informational): {cmd!r}")
-    allow, ask = set(live_allow), set(merged["permissions"]["ask"])
+    canon = lambda r: json.dumps(r, sort_keys=True)  # entries may be objects, which are unhashable
+    allow, ask = {canon(r) for r in live_allow}, {canon(r) for r in merged["permissions"]["ask"]}
     for rule in sorted(allow & ask):
         out.append(f"rule is in both allow and ask (ask wins per the permissions docs, informational): {rule[:80]}")
     for k in ("bypassPermissions",):
@@ -170,11 +191,16 @@ def plan(args, raw=None):
 
 def atomic_write(path, text):
     path = pathlib.Path(path).resolve()
+    data = text if isinstance(text, bytes) else text.encode("utf-8")  # bytes in, bytes out: no locale-dependent encoding
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".rollout-")
-    with os.fdopen(fd, "w") as fh:
-        fh.write(text)
-    os.chmod(tmp, path.stat().st_mode & 0o777)
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.chmod(tmp, path.stat().st_mode & 0o777)
+        os.replace(tmp, path)
+    except BaseException:
+        pathlib.Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def apply(args):
@@ -209,7 +235,7 @@ def rollback(args):
     data = pathlib.Path(args.backup).read_bytes()
     if sha(data) != args.expect_backup_sha:
         raise SystemExit("REFUSED: backup hash does not match the pinned value")
-    atomic_write(args.live, data.decode())
+    atomic_write(args.live, data)
     return {"restored": True, "live_sha": sha(pathlib.Path(args.live).read_bytes())}
 
 
