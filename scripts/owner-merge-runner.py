@@ -59,6 +59,8 @@ JOB_PATH_RE = re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/actions/jobs/([
 NOT_EXECUTED_VERDICTS = {"FAILURE", "STARTUP_FAILURE", "CANCELLED"}
 LOCAL_CI_KEYS = {"classification", "head", "run_at", "checks"}
 LOCAL_CI_CHECK_KEYS = {"name", "exit_code", "tests"}
+PLAN_LIMIT_RE = re.compile(r"Upgrade to GitHub Pro or make this repository public")
+CAPABILITIES = {"server-enforced", "private-free-app-level"}
 TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 REVIEWER_KINDS = {"human", "independent-agent"}
 MAX_EVIDENCE_AGE_HOURS = 168
@@ -309,7 +311,7 @@ def load_allowlist(path):
 
 REPO_KEYS = {"required_checks", "reviewers", "require_server_side_protection", "accept_bypass_actors",
              "max_evidence_age_hours", "require_signed_evidence", "local_equivalent_ci",
-             "independent_github_reviewers"}
+             "independent_github_reviewers", "protection_capability"}
 
 
 def repo_config(allow, repo):
@@ -329,6 +331,8 @@ def repo_config(allow, repo):
     age = cfg.get("max_evidence_age_hours", 24) if ok else 24
     lci = cfg.get("local_equivalent_ci", False) if ok else False
     ind = cfg.get("independent_github_reviewers", []) if ok else []
+    cap = cfg.get("protection_capability", "server-enforced") if ok else "server-enforced"
+    ok = ok and cap in CAPABILITIES and not (cap == "private-free-app-level" and not prot)
     ok = ok and all(isinstance(x, bool) for x in (prot, bypass, signed, lci))
     ok = ok and isinstance(ind, list) and all(isinstance(x, str) and LOGIN_RE.fullmatch(x) for x in ind)
     ok = ok and isinstance(age, int) and not isinstance(age, bool) and 1 <= age <= MAX_EVIDENCE_AGE_HOURS
@@ -340,7 +344,7 @@ def repo_config(allow, repo):
     return {"required_checks": list(cfg["required_checks"]), "reviewers": list(cfg["reviewers"]),
             "require_server_side_protection": prot, "accept_bypass_actors": bypass,
             "max_evidence_age_hours": age, "require_signed_evidence": signed, "local_equivalent_ci": lci,
-            "independent_github_reviewers": [x.lower() for x in ind]}
+            "independent_github_reviewers": [x.lower() for x in ind], "protection_capability": cap}
 
 
 def canonical_evidence(ev):
@@ -551,6 +555,28 @@ def http_status(err):
     """The first `HTTP <token>` in gh's error, only if the whole token is exactly three digits."""
     m = HTTP_TOKEN_RE.search(err)
     return m.group(1) if m and STATUS_RE.fullmatch(m.group(1)) else None
+
+
+def server_kind(info):
+    """What actually backs the merge, as the audit states it."""
+    return info.get("capability", "waived" if info.get("waived") else "server-enforced")
+
+
+def plan_limited(err):
+    """True only for GitHub's own plan-limit refusal (HTTP 403 plus its fixed upgrade sentence); the text is matched
+    in memory and never stored."""
+    return http_status(err) == "403" and PLAN_LIMIT_RE.search(err) is not None
+
+
+def check_private_free(runner, repo, base):
+    """The honest Private Free contract: server-side protection and rulesets are unavailable on this repository's
+    plan, which GitHub itself states for BOTH reads. Returns the capability record, or None when anything else
+    happens (a readable or merely unconfigured feature, any other error) so the strict server-side check decides."""
+    rc1, _, err1 = runner.call(rules_argv(repo, base))
+    rc2, _, err2 = runner.call(protection_argv(repo, base))
+    if rc1 != 0 and rc2 != 0 and plan_limited(err1) and plan_limited(err2):
+        return {"capability": "private-free-app-level", "server_side": "unavailable-plan-limit"}
+    return None
 
 
 def check_server_protection(runner, repo, base, cfg):
@@ -771,7 +797,9 @@ def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin=None):
     if pin is not None and digest != pin["evidence"]:
         raise Refused(["evidence file changed since the first read"])
     info = {"waived": True}
-    if cfg["require_server_side_protection"]:
+    if cfg["protection_capability"] == "private-free-app-level":
+        info = check_private_free(runner, repo, base) or check_server_protection(runner, repo, base, cfg)
+    elif cfg["require_server_side_protection"]:
         info = check_server_protection(runner, repo, base, cfg)  # for the pinned base
     after = runner.json(pr_view_argv(repo, pr, PR_FIELDS))
     if after.get("baseRefName") != base or after.get("headRefOid") != head:
@@ -853,12 +881,21 @@ def run(repo, pr, head, evidence, allowlist, audit, dry_run, gh, clock=time.time
         rec["observed_head"], rec["class"], rec["checks"], rec["server_side"], pin = \
             evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock)
         rec["base"] = pin["base"]
+        kind = server_kind(rec["server_side"])
+        rec["guarantees"] = {
+            "head_pin": "github-enforced (gh pr merge --match-head-commit)",
+            "server_side": kind,
+            "review": "github-independent-approval" if cfg["independent_github_reviewers"]
+                      else "local-evidence-attestation (not a GitHub approval)",
+            "ci": rec["checks"]["ci_class"]}
         rec["decision"] = "APPROVE"
         # Full re-evaluation immediately before the one mutating call; any change refuses.
         try:
             observed2, class2, checks2, rec["server_side"], _ = evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin)
         except Refused as e:
             raise Refused(["changed before execution: " + x for x in e.reasons])
+        if server_kind(rec["server_side"]) != kind:
+            raise Refused(["changed before execution: the kind of server-side backing differs between passes"])
         if checks2 != rec["checks"]:
             raise Refused(["changed before execution: check results or CI classification differ"])
         if observed2 != head or class2 != rec["class"]:

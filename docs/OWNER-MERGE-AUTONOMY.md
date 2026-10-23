@@ -414,3 +414,30 @@ A temporary repository (private repositories on a free plan return 403 for branc
 | protection strengthened after `apply` (review requirement added) | `rollback` REFUSED and kept it |
 
 Not shown, so not claimed: `gh pr merge --admin` was not executed (an owner-ask command), so `enforce_admins=true` is confirmed by readback only; no second reviewer identity existed, so the independent-review path was exercised only as a refusal; the review evidence file was a synthetic fixture; the check was a commit status, not an Actions run. This is one merge in a throwaway repository and does not make `MERGE_AUTONOMY_READY` true for any production repository.
+
+## 13. Why merges were denied in one session and allowed in another (measured 2026-10-22)
+
+Failure classes, kept apart: A GitHub authorization, B branch protection, C Claude Code permission rule, D auto-mode soft denial, E auto-mode hard denial, F custom hook, G the runner's own fail-closed refusal. Every denial seen in the Config & Environment session was class D; none was A, B, C, E or F.
+
+| Observation | Source |
+|---|---|
+| Both sessions ran in the same project directory with the same user settings: `autoMode` is empty (`claude auto-mode config` shows only shipped defaults, `critique` finds no custom rules), `permissions.allow` contains `Bash(gh pr merge:*)`, no merge `ask` or `deny`, no managed settings, Claude Code 2.1.306 | `claude auto-mode config/critique`, `~/.claude/settings.json` |
+| The same GitHub identity (Chisanan232, ADMIN) merged `horonomy/internal-docs` #207 and #208 (no reviews, private repository with no protection) with plain `gh pr merge N -R R --merge --match-head-commit SHA` | GitHub merge events, session transcript |
+| In that session every merge without `--admin` succeeded (about 14); the only denials, all `[Merge Without Review]`, were `--admin` merges | transcript |
+| In the Config session, the same plain shape was denied twice in four days (`[Merge Without Review]` on 10-18, `[Self-Approval]` on #102) and allowed three times on 10-22 in disposable repositories: plain merge, plain merge after posting an OWNER-MERGE-REVIEW comment, and a runner merge | transcript, this section's experiments |
+| After a denial, unrelated benign commands in the same turn (a wait loop, reading another transcript) were also denied with a merge label | transcript |
+
+Conclusion, with what is not shown: the rules involved are the shipped soft-deny entries `Merge Without Review` and `Self-Approval`, which the classifier applies by judgment over the transcript, not by command shape or by any user setting, so the outcome is not deterministic and no configuration difference explains the two sessions. A regression of the model or Claude Code is not shown either. The denial text itself says a denial covers the outcome, so after a denial the classifier tends to deny related actions in that turn; that cascade is a reason to stop at the first denial, not a reason to re-route. Two things are known to trigger denials: `--admin`, and writing a positive review stamp on a PR the agent authored in the same turn as the merge (suspected for #102, not reproduced: the same sequence was allowed on a disposable PR).
+
+What a user setting can do: the only documented lever is `autoMode.allow` and `autoMode.environment` text that tells the classifier a specific action is authorized. The agent may not write that text itself; the classifier denies it as instruction poisoning and self-modification, correctly. It is an owner edit, applied through `candidate-rollout.py`, and its effect cannot be measured until it is applied and a fresh session is tested.
+
+## 14. Private Free capability contract
+
+GitHub Free private repositories return `403 Upgrade to GitHub Pro or make this repository public` for branch protection and for rulesets. That does not stop the merge API (`gh pr merge` works there); it removes the server-side guarantee. The runner now says so instead of pretending:
+
+- Opt in per repository: `"protection_capability": "private-free-app-level"` (with `require_server_side_protection` left true). Without it, a plan-limited repository still refuses.
+- The runner accepts the capability only when GitHub's own plan-limit refusal (HTTP 403 and its fixed sentence) comes back for both the rules read and the protection read. If either read works, or fails any other way, the strict server-side check decides, so a repository that can be protected but is not still refuses.
+- Everything else still applies: exact head (`--match-head-commit`, enforced by GitHub), observed required checks all SUCCESS, allowlisted review evidence bound to the head, freshness, class rules, final re-read, audit before exec.
+- The audit record's `guarantees` field states what is and is not backed: `server_side` is `private-free-app-level` (not `server-enforced`), `review` is `local-evidence-attestation (not a GitHub approval)` unless `independent_github_reviewers` is configured and satisfied (then `github-independent-approval`), `head_pin` is GitHub-enforced, `ci` is `CI_PASS` or `CI_UNAVAILABLE_EXTERNAL`.
+
+Measured on a disposable private repository (2026-10-22): a real runner merge, merge commit `1818b90b30884f6efcd91f515a54f886554d5bd0` with parents base and head read back from GitHub, a PENDING and a MERGED audit record carrying the `guarantees` above. Not shown: a second reviewer identity, a real review (the evidence was a synthetic fixture), an Actions check (the check was a commit status). Same-user evidence is never presented as a GitHub approval.

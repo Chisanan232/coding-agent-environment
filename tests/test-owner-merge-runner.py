@@ -65,7 +65,7 @@ def base_pr(**over):
 
 class FakeGh:
     def __init__(self, pr=None, merge_rc=0, merge_err="", merged=True, later=None, user=ME,
-                 rules=None, protection=(1, "HTTP 404: Not Found"), ruleset=None, jobs=None):
+                 rules=None, protection=(1, "HTTP 404: Not Found"), ruleset=None, jobs=None, plan_limited=False):
         self.pr = pr if pr is not None else base_pr()
         self.merge_rc, self.merge_err, self.merged = merge_rc, merge_err, merged
         self.later = later  # PR facts returned from the second full fetch (the pre-exec re-check) on
@@ -73,6 +73,7 @@ class FakeGh:
         self.rules = server_rules() if rules is None else rules
         self.ruleset = (0, json.dumps({"id": 11, "bypass_actors": []})) if ruleset is None else ruleset
         self.protection = protection  # (rc, stdout-or-stderr) for the branch-protection read
+        self.plan_limited = plan_limited
         self.runs = None  # optional callable(name) -> check-runs body
         self.jobs = jobs if jobs is not None else {}  # job id -> (rc, job dict); a callable is invoked per read
         self.fetches = 0
@@ -116,6 +117,8 @@ class FakeGh:
                 self.on_ruleset()
             rc, text = self.ruleset
             return (0, text, "") if rc == 0 else (1, "", text)
+        if self.plan_limited and argv[0] == "api" and ("/rules/branches/" in argv[1] or argv[1].endswith("/protection")):
+            return 1, "", "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)"
         if argv[0] == "api" and "/rules/branches/" in argv[1]:
             return 0, json.dumps(self.rules), ""
         if argv[0] == "api" and argv[1].endswith("/protection"):
@@ -1721,6 +1724,111 @@ class IndependentReviewReadback(Base):
             with self.subTest(bad=bad):
                 self.allow.write_text(json.dumps(allow_doc(independent_github_reviewers=bad)))
                 self.assertRefused(FakeGh(), "allowlist config")
+
+
+class PrivateFreeCapability(Base):
+    """Honest Private Free contract: no server-side protection exists on the plan, so the runner says so, records
+    it, and still requires exact head, observed checks, allowlisted review evidence and an audit trail."""
+
+    def setUp(self):
+        super().setUp()
+        self.allow.write_text(json.dumps(allow_doc(protection_capability="private-free-app-level")))
+
+    def test_plan_limit_on_both_reads_is_accepted_and_labelled(self):
+        code, rec = self.go(FakeGh(plan_limited=True), dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+        self.assertEqual(rec["server_side"], {"capability": "private-free-app-level", "server_side": "unavailable-plan-limit"})
+
+    def test_real_merge_records_what_is_and_is_not_guaranteed(self):
+        gh = FakeGh(plan_limited=True)
+        code, rec = self.go(gh)
+        self.assertEqual((code, rec["outcome"]), (omr.EXIT_OK, "MERGED"), rec)
+        g = self.records()[0]["guarantees"]  # already in the durable PENDING record
+        self.assertEqual(g["server_side"], "private-free-app-level")
+        self.assertEqual(g["head_pin"], "github-enforced (gh pr merge --match-head-commit)")
+        self.assertIn("not a GitHub approval", g["review"])
+        self.assertEqual(g["ci"], "CI_PASS")
+
+    def test_server_side_backing_cannot_change_between_passes(self):
+        class Flip(FakeGh):
+            n = 0
+
+            def __call__(self, argv, stdin=None):
+                if argv[0] == "api" and "/rules/branches/" in argv[1]:
+                    self.n += 1
+                    self.plan_limited = self.n > 2  # protected through the first pass (two rules reads), plan-limited from the second
+                return super().__call__(argv)
+        gh = Flip()
+        code, rec = self.go(gh)
+        self.assertEqual(code, omr.EXIT_REFUSED, rec)
+        self.assertIn("kind of server-side backing", " | ".join(rec["reasons"]))
+        self.assertEqual(gh.merges(), [])
+
+    def test_independent_github_reviewers_change_the_review_label(self):
+        self.allow.write_text(json.dumps(allow_doc(protection_capability="private-free-app-level",
+                                                   independent_github_reviewers=["second-reviewer"])))
+        gh = FakeGh(base_pr(reviews=[approval("second-reviewer")]), plan_limited=True)
+        code, rec = self.go(gh)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+        self.assertEqual(self.records()[0]["guarantees"]["review"], "github-independent-approval")
+
+    def test_without_the_opt_in_the_plan_limit_is_not_accepted(self):
+        self.allow.write_text(json.dumps(allow_doc()))
+        gh = FakeGh(plan_limited=True)
+        code, rec = self.go(gh)
+        self.assertNotEqual(code, omr.EXIT_OK, rec)
+        self.assertEqual(gh.merges(), [])
+
+    def test_only_the_exact_plan_limit_is_accepted(self):
+        class Other(FakeGh):
+            def __call__(self, argv, stdin=None):
+                if argv[0] == "api" and ("/rules/branches/" in argv[1] or argv[1].endswith("/protection")):
+                    return 1, "", self.err
+                return super().__call__(argv)
+        for err in ("gh: Resource not accessible (HTTP 403)", "gh: Upgrade to GitHub Pro or make this repository public (HTTP 500)",
+                    "gh: server error (HTTP 502)", "Upgrade to GitHub Pro or make this repository public"):
+            with self.subTest(err=err):
+                gh = Other()
+                gh.err = err
+                code, rec = self.go(gh)
+                self.assertNotEqual(code, omr.EXIT_OK, rec)
+                self.assertEqual(gh.merges(), [])
+
+    def test_one_limited_read_is_not_enough(self):
+        class Half(FakeGh):
+            def __call__(self, argv, stdin=None):
+                if argv[0] == "api" and argv[1].endswith("/protection"):
+                    return 1, "", "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)"
+                return super().__call__(argv)
+        gh = Half()
+        code, rec = self.go(gh)
+        self.assertEqual(code, omr.EXIT_REFUSED, rec)  # rules readable, protection limited: strict path, cannot be verified
+        self.assertEqual(gh.merges(), [])
+
+    def test_a_feature_that_is_available_but_unconfigured_still_refuses(self):
+        gh = FakeGh(rules=[], protection=(1, "HTTP 404: Not Found"))  # e.g. a public repo with no protection yet
+        self.assertRefused(gh, "no server-side required status checks")
+
+    def test_a_configured_server_side_set_is_used_and_not_relabelled(self):
+        code, rec = self.go(FakeGh(), dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+        self.assertNotIn("capability", rec["server_side"])
+
+    def test_every_other_guard_still_applies(self):
+        bad = base_pr(statusCheckRollup=[{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"}] + green()[1:])
+        self.assertRefused(FakeGh(bad, plan_limited=True), "check ci is FAILURE")
+        self.assertRefused(FakeGh(base_pr(isDraft=True), plan_limited=True), "draft")
+        self.write_evidence(verdict="FAIL")
+        self.assertRefused(FakeGh(plan_limited=True), "verdict is not PASS")
+        self.write_evidence()
+        self.assertRefused(FakeGh(base_pr(headRefOid=OTHER), plan_limited=True), "observed head differs")
+
+    def test_config_must_name_a_known_capability_and_keep_protection_required(self):
+        for cfg in ({"protection_capability": "none"}, {"protection_capability": True},
+                    {"protection_capability": "private-free-app-level", "require_server_side_protection": False}):
+            with self.subTest(cfg=cfg):
+                self.allow.write_text(json.dumps(allow_doc(**cfg)))
+                self.assertRefused(FakeGh(plan_limited=True), "allowlist config")
 
 
 if __name__ == "__main__":

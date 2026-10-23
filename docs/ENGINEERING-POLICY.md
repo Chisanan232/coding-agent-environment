@@ -172,4 +172,11 @@ security QA still blocks it. Tagging, publication and production deployment need
 **Executable form in this repository.** Two forms of this one policy, neither a second policy:
 `scripts/owner-merge-gate.py --ci-unavailable` (a posted `OWNER-MERGE-CI-UNAVAILABLE` record, see
 `docs/OWNER-MERGE-WORKFLOW.md`) and, per repository and off by default, `local_equivalent_ci` in the owner-merge
-runner allowlist (`docs/OWNER-MERGE-AUTONOMY.md` section 9, once that runner is merged).
+runner allowlist (`docs/OWNER-MERGE-AUTONOMY.md` section 9).
+
+**Merge guarantees are stated, never implied.** A merge's audit record says what backed it: head pin (always GitHub-enforced),
+server-side protection (`server-enforced`, or `private-free-app-level` where the plan makes protection unavailable, opt-in per
+repository), review basis (a GitHub approval from a second identity, or local evidence that is **not** a GitHub approval) and CI
+class. A host denial is classified (GitHub authorization, branch protection, permission rule, auto-mode soft or hard denial, hook,
+runner refusal), reported once and never re-routed; the measured inconsistency between sessions and the Private Free contract are in
+`docs/OWNER-MERGE-AUTONOMY.md` sections 13 and 14.
