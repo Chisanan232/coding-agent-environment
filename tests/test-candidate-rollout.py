@@ -376,22 +376,34 @@ class MergeScope(unittest.TestCase):
         for route in ("Bash(gh pr merge:*)", "Bash(rtk gh pr merge:*)", "Bash(gh api *pulls/*/merge*)", "mcp__github__merge_pull_request"):
             self.assertIn(route, asks)
 
-    def test_every_live_merge_allow_is_covered_by_an_ask_and_nothing_else_changes(self):
-        live = {**LIVE, "permissions": {**LIVE["permissions"], "allow": ["Bash(gh pr merge:*)", "Bash(gh pr *)", "mcp__github__merge_pull_request", "Bash(ls:*)"]}}
+    def test_merge_shapes_ask_under_broad_live_allows_and_nothing_else_changes(self):
+        live = {**LIVE, "permissions": {**LIVE["permissions"], "allow": ["Bash(gh pr merge:*)", "Bash(gh pr *)", "Bash(rtk gh pr *)", "mcp__github__merge_pull_request", "Bash(ls:*)"]}}
         self.live.write_text(json.dumps(live, indent=2))
         self.cand.write_text(json.dumps(cr.wsp.merge_scope_candidate()))
         before = self.live.read_bytes()
         p = self.plan()
         self.assertFalse(p["blocking"], p["compat"])
-        self.assertEqual(self.live.read_bytes(), before)
+        self.assertEqual(self.live.read_bytes(), before)  # plan never writes
         merged = cr.merge(live, cr.wsp.merge_scope_candidate())[0]
         self.assertEqual(merged["permissions"]["allow"], live["permissions"]["allow"])
         self.assertEqual(merged["autoMode"], live["autoMode"])
         self.assertEqual(merged["permissions"]["deny"], live["permissions"]["deny"])
         for ask in live["permissions"]["ask"]:
             self.assertIn(ask, merged["permissions"]["ask"])
-        for ask in ("Bash(gh pr merge:*)", "Bash(rtk gh pr merge:*)", "mcp__github__merge_pull_request"):
-            self.assertIn(ask, merged["permissions"]["ask"])
+        for cmd in cr.wsp.MERGE_SCOPE_COMMANDS + ["rtk " + c for c in cr.wsp.MERGE_SCOPE_COMMANDS]:
+            self.assertEqual(cr.pr.static_decision(cmd, merged["permissions"]), "ask", cmd)
+        self.assertEqual(cr.pr.static_decision("gh pr view 5 --json mergeable", merged["permissions"]), "allow")  # reads stay silent
+
+    def test_plan_blocks_when_the_merge_shapes_would_not_ask(self):
+        weak = cr.wsp.merge_scope_candidate()
+        weak["permissions"]["ask"] = [weak["permissions"]["ask"][0], "Bash(rtk gh pr merge:*)"]  # keeps the sentinel, drops the other shapes
+        self.cand.write_text(json.dumps(weak))
+        self.assertTrue(any("merge-scope command would not ask" in f for f in self.plan()["compat"]))
+
+    def test_known_uncovered_shapes_stay_documented_not_claimed(self):
+        perm = cr.merge(LIVE, cr.wsp.merge_scope_candidate())[0]["permissions"]
+        for cmd in ("gh pr\tmerge 5", "command gh pr merge 5", "env X=1 gh pr merge 5", "sh -c 'gh pr merge 5'", "/usr/bin/gh pr merge 5"):
+            self.assertNotEqual(cr.pr.static_decision(cmd, perm), "ask", cmd)  # prefix rules cannot cover these; fix this test if they ever do
 
     def test_cli_renders_the_example_and_refuses_the_registry_combination(self):
         with tempfile.TemporaryDirectory() as d:
@@ -401,6 +413,8 @@ class MergeScope(unittest.TestCase):
             reg = os.path.join(d, "r.json")
             open(reg, "w").write("[]")
             self.assertEqual(cr.wsp.main(["render-settings", "--kind", "personal", "--merge-scope", "--owner-allow-file", reg]), 3)
+            self.assertEqual(cr.wsp.main(["render-settings", "--kind", "personal", "--merge-scope", "--proxy-scoped"]), 3)
+            self.assertEqual(cr.wsp.main(["render-settings", "--kind", "personal", "--merge-scope", "--asks-only"]), 3)
 
 
 class OwnerAllowRollout(unittest.TestCase):

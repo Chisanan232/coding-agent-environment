@@ -1,13 +1,21 @@
 {
-  "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Adds asks for the direct merge routes (gh pr merge, rtk gh pr merge, gh api .../merge, the GitHub MCP merge tool) so the broad merge allows no longer run silently. Adds no allow and no autoMode change; the validating runner's allow rule stays an owner step. Every merge prompts until that rule exists.",
+  "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Adds asks for the common direct merge shapes (gh pr merge, rtk gh pr merge, gh -R/--repo ... pr merge, gh api .../merge, GraphQL mergePullRequest, the GitHub MCP merge tool) so the broad merge allows no longer run silently for them. Prefix rules cannot cover every shape; others fall to the Auto Mode classifier. Adds no allow and no autoMode change; the validating runner's allow rule stays an owner step.",
   "permissions": {
     "ask": [
       "Bash(gh pr merge:*)",
       "Bash(gh pr merge *)",
+      "Bash(gh pr  merge*)",
+      "Bash(gh -R * pr merge*)",
+      "Bash(gh --repo * pr merge*)",
       "Bash(gh api *pulls/*/merge*)",
+      "Bash(gh api graphql*mergePullRequest*)",
       "Bash(rtk gh pr merge:*)",
       "Bash(rtk gh pr merge *)",
+      "Bash(rtk gh pr  merge*)",
+      "Bash(rtk gh -R * pr merge*)",
+      "Bash(rtk gh --repo * pr merge*)",
       "Bash(rtk gh api *pulls/*/merge*)",
+      "Bash(rtk gh api graphql*mergePullRequest*)",
       "mcp__github__merge_pull_request"
     ],
     "deny": []

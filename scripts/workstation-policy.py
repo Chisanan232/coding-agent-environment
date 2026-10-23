@@ -254,19 +254,24 @@ def candidate(kind, asks_only=False):
     return cand
 
 
-MERGE_SCOPE_BASH_ASKS = ["Bash(gh pr merge:*)", "Bash(gh pr merge *)", "Bash(gh api *pulls/*/merge*)"]
+MERGE_SCOPE_BASH_ASKS = ["Bash(gh pr merge:*)", "Bash(gh pr merge *)", "Bash(gh pr  merge*)", "Bash(gh -R * pr merge*)", "Bash(gh --repo * pr merge*)",
+                         "Bash(gh api *pulls/*/merge*)", "Bash(gh api graphql*mergePullRequest*)"]
 MERGE_SCOPE_OTHER_ASKS = ["mcp__github__merge_pull_request"]
+# Invocation shapes the candidate must make ask; checked against the prefix-rule emulator, not the real host matcher.
+MERGE_SCOPE_COMMANDS = ["gh pr merge 5", "gh pr merge 5 --repo o/r --merge --match-head-commit " + "a" * 40, "gh pr  merge 5", "gh -R o/r pr merge 5",
+                        "gh --repo o/r pr merge 5", "gh api repos/o/r/pulls/5/merge -X PUT", "gh api graphql -f query=mutation{mergePullRequest}"]
 
 
 def merge_scope_candidate():
-    """SPE-118: make every direct merge route ask. Asks win over allows, so the broad `gh pr merge` / `gh pr *` / GitHub MCP merge
-    allows stop working without being removed. Adds no allow, no autoMode change and no runner rule (that broadens host
-    authorization and stays an owner decision). Until the owner also allows the validating runner, every merge prompts."""
+    """SPE-118: make the common direct merge routes ask. Asks win over allows, so the broad `gh pr merge` / `gh pr *` / GitHub MCP merge
+    allows stop working for these shapes without being removed. Prefix rules cannot cover every shape (a tab, `command gh`, `sh -c`,
+    env prefixes, aliases); those fall to the Auto Mode classifier, not to a rule. Adds no allow, no autoMode change and no runner
+    rule (that broadens host authorization and stays an owner decision)."""
     asks = MERGE_SCOPE_BASH_ASKS + [r.replace("Bash(", "Bash(rtk ", 1) for r in MERGE_SCOPE_BASH_ASKS] + MERGE_SCOPE_OTHER_ASKS
     return {
-        "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Adds asks for the direct merge routes "
-                       "(gh pr merge, rtk gh pr merge, gh api .../merge, the GitHub MCP merge tool) so the broad merge allows no longer run silently. "
-                       "Adds no allow and no autoMode change; the validating runner's allow rule stays an owner step. Every merge prompts until that rule exists.",
+        "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Adds asks for the common direct merge shapes "
+                       "(gh pr merge, rtk gh pr merge, gh -R/--repo ... pr merge, gh api .../merge, GraphQL mergePullRequest, the GitHub MCP merge tool) so the broad merge allows no longer run silently for them. "
+                       "Prefix rules cannot cover every shape; others fall to the Auto Mode classifier. Adds no allow and no autoMode change; the validating runner's allow rule stays an owner step.",
         "permissions": {"ask": asks, "deny": []},
     }
 
@@ -409,6 +414,8 @@ def main(argv=None):
             print(json.dumps(out, indent=1))
             return {"ALLOW": 0, "ASK": 1, "DENY": 2}[out["verdict"]]
         if a.cmd == "render-settings":
+            if a.merge_scope and (a.proxy_scoped or a.asks_only):
+                raise ValueError("--merge-scope cannot be combined with --proxy-scoped or --asks-only")
             cand = merge_scope_candidate() if a.merge_scope else proxy_scoped_candidate() if a.proxy_scoped else candidate(a.kind, asks_only=a.asks_only)
             if a.owner_allow_file:
                 owner_allow = load_owner_allow(a.owner_allow_file)

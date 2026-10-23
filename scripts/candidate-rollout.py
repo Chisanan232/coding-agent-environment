@@ -160,6 +160,10 @@ def compat(live, merged, candidate, report_conflicts=(), owner_allow=()):
         for cmd in pr.PROXY_ROUTINE_COMMANDS:
             if pr.static_decision(cmd, merged_perm) == "ask":
                 out.append(f"routine wrapped command still asks after the merge (informational): {cmd!r}")
+    if wsp.MERGE_SCOPE_BASH_ASKS[0] in cand_perms.get("ask", []):  # a merge-scope candidate must actually make its shapes ask
+        for cmd in wsp.MERGE_SCOPE_COMMANDS + ["rtk " + c for c in wsp.MERGE_SCOPE_COMMANDS]:
+            if pr.static_decision(cmd, merged_perm) != "ask":
+                out.append(f"BLOCKING merge-scope command would not ask after the merge (prefix-rule emulator, not the host matcher): {cmd!r} -> {pr.static_decision(cmd, merged_perm)}")
     canon = lambda r: json.dumps(r, sort_keys=True)  # entries may be objects, which are unhashable
     allow, ask = {canon(r) for r in live_allow}, {canon(r) for r in merged["permissions"]["ask"]}
     for rule in sorted(allow & ask):
