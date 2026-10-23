@@ -1,5 +1,7 @@
 # Owner merge: ALLOW / ASK / DENY operator guide (SPE-118)
 
+Acceptance evidence: [OWNER-MERGE-ACCEPTANCE-LEDGER.md](OWNER-MERGE-ACCEPTANCE-LEDGER.md). Trusted ALLOW (the runner allow rule): [OWNER-MERGE-TRUSTED-ALLOW-HANDOFF.md](OWNER-MERGE-TRUSTED-ALLOW-HANDOFF.md).
+
 The one-command deployment procedure is [OWNER-MERGE-ASK-FIRST-HANDOFF.md](OWNER-MERGE-ASK-FIRST-HANDOFF.md) (`scripts/ask-first-apply.sh`).
 
 Status: source and candidate are in this repository; **nothing here has been applied to the live host**. Every live behavior below marked
