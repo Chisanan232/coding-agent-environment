@@ -206,9 +206,11 @@ Delegation section.
 
 ## Merge Policy
 
-Apply the required checks, code-owner approvals, conflict, branch-currency, and
-review-thread gates from
-[engineering-workflow](skills/engineering-workflow/SKILL.md). Use **Create a
+Apply the required checks, CODEOWNERS-required approvals, conflict,
+branch-currency, and review-thread gates from
+[engineering-workflow](skills/engineering-workflow/SKILL.md), which owns the PR
+classes: owner-authored PRs need no formal GitHub approval; non-owner and bot PRs
+need a genuine owner `APPROVED` review on the current head. Use **Create a
 merge commit**; do not squash or rebase-merge unless a later explicit user
 instruction authorizes that strategy.
 
@@ -263,7 +265,8 @@ bodies, never edit comments this session did not create, read back every mutatio
 ## Bot PR Policy
 
 Bot PRs that are CI-green, conflict-free and limited to the automated update are
-approved and merged. Lock-file conflicts are resolved by asking the bot to rebase,
+merged once the owner has genuinely approved the current head (the agent never submits
+that approval). Lock-file conflicts are resolved by asking the bot to rebase,
 never by hand. If the update itself causes a CI failure, escalate and do not merge.
 `bot-pr-maintainer` and `pr-health-check` run this loop; the full policy is in
 [bot-pr-policy](skills/bot-pr-maintainer/references/bot-pr-policy.md).

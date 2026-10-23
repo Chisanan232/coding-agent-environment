@@ -81,6 +81,8 @@ Use `code-review-prep`, `pr-readiness`, `pr-health-check`, `ci-failure-triage`,
 `pr-feedback-response` and `post-merge-close` at their lifecycle boundaries.
 Use `dependency-upgrade-review`/`bot-pr-maintainer` for bot updates: inspect scope,
 compatibility/security and exact-head checks; bot rebase owns lockfile conflicts.
+Bot and other non-owner PRs need a genuine owner `APPROVED` review on the current head
+(never submitted by the agent); owner-authored PRs need no formal GitHub approval.
 A genuine unrelated required-check failure still blocks merge.
 
 Use `release-preparation`, `release-readiness` and `release-watch` for preparation
