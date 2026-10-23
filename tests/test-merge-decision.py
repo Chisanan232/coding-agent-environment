@@ -162,13 +162,88 @@ class Matrix(unittest.TestCase):
         for kept in BROAD_LIVE["permissions"]["allow"] + BROAD_LIVE["permissions"]["ask"]:
             self.assertIn(kept, perms["allow"] + perms["ask"])
 
-    def test_malformed_rules_in_settings_do_not_crash_the_decision(self):
-        path = self.settings({"permissions": {"allow": [{"x": 1}, "Bash(gh pr merge:*)", "Bash(rtk gh pr merge:*)"], "ask": [None], "deny": []}})
-        self.assertEqual(omg.host_permission(path, "gh pr merge 7"), "allow")
+    def test_unparseable_or_non_string_rules_fail_closed_to_ask(self):
+        both = ["Bash(gh pr merge:*)", "Bash(rtk gh pr merge:*)"]
+        for bad in ({"x": 1}, None, "Bash(gh pr merge"):
+            for bucket in ("allow", "ask", "deny"):
+                cfg = {"permissions": {"allow": list(both), "ask": [], "deny": []}}
+                cfg["permissions"][bucket] = cfg["permissions"][bucket] + [bad]
+                got = omg.host_permission(self.settings(cfg), "gh pr merge 7")
+                self.assertIn(got, ("ask", "deny"), (bad, bucket, got))
+        cfg = {"permissions": {"allow": list(both), "ask": ["Bash"], "deny": []}}  # a bare tool name in ask covers every Bash call
+        self.assertIn(omg.host_permission(self.settings(cfg), "gh pr merge 7"), ("ask", "deny"))
+        cfg = {"permissions": {"allow": list(both), "ask": [], "deny": ["Bash"]}}
+        self.assertEqual(omg.host_permission(self.settings(cfg), "gh pr merge 7"), "deny")
+
+    def test_rules_from_every_layer_are_pooled_and_deny_wins(self):
+        user = self.d / "user.json"
+        user.write_text(json.dumps(RUNNER_ALLOW))
+        project = self.d / "project.json"
+        project.write_text(json.dumps({"permissions": {"deny": ["Bash(gh pr merge:*)"]}}))
+        local = self.d / "local.json"
+        local.write_text(json.dumps({"permissions": {"ask": ["Bash(gh pr merge:*)", "Bash(rtk gh pr merge:*)"]}}))
+        cmd = "gh pr merge 7 --repo o/r --merge --match-head-commit " + "a" * 40
+        self.assertEqual(omg.host_permission([str(user)], cmd), "allow")
+        self.assertEqual(omg.host_permission([str(user), str(local)], cmd), "ask")
+        self.assertEqual(omg.host_permission([str(user), str(local), str(project)], cmd), "deny")
+
+    def test_repo_trust_failures_are_deny(self):
+        for code in ("UNAUTHORIZED_REPO", "NOT_CANONICAL_REPO"):
+            self.assertEqual(omg.decide("REFUSE", [f"{code}: x"], {}, "allow")["outcome"], "DENY", code)
+
+    def test_every_emitted_reason_code_is_in_the_table(self):
+        import re
+        text = (ROOT / "scripts/owner-merge-gate.py").read_text()
+        emitted = set(re.findall(r'(?:reasons|wait)\.append\(\s*f?"([A-Z][A-Z_]+)[:"(]', text))
+        self.assertTrue(emitted)
+        self.assertEqual(sorted(emitted - set(omg.REASON_TABLE)), [])
 
     def test_an_allow_for_only_one_spelling_is_not_an_allow(self):
         path = self.settings({"permissions": {"allow": ["Bash(gh pr merge:*)"], "ask": [], "deny": []}})  # the hook rewrites to `rtk gh ...`
         self.assertEqual(omg.host_permission(path, "gh pr merge 7"), "classifier")
+
+
+class QueueAndExit(unittest.TestCase):
+    def queue(self, fake, *settings):
+        args = ["queue", "--repo", REPO, "--prs", "7", "--owners", "Chisanan232"]
+        for s in settings:
+            args += ["--settings", s]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = omg.main(args, run=fake)
+        return rc, buf.getvalue()
+
+    def test_queue_prints_the_decision_and_does_not_offer_a_denied_merge(self):
+        rc, text = self.queue(pm.Fake())
+        self.assertIn("decision=ASK", text)
+        self.assertIn("  run: gh pr merge 7", text)  # ASK: run it and answer the host prompt
+        with tempfile.TemporaryDirectory() as d:
+            deny = pathlib.Path(d) / "d.json"
+            deny.write_text(json.dumps({"permissions": {"deny": ["Bash(gh pr merge:*)"]}}))
+            rc, text = self.queue(pm.Fake(), str(deny))
+        self.assertIn("decision=DENY", text)
+        self.assertNotIn("run: gh pr merge", text)
+        self.assertIn("not runnable", text)
+
+    def test_check_with_a_host_deny_has_no_merge_command_and_a_failing_exit(self):
+        with tempfile.TemporaryDirectory() as d:
+            deny = pathlib.Path(d) / "d.json"
+            deny.write_text(json.dumps({"permissions": {"deny": ["Bash(gh pr merge:*)"]}}))
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = omg.main(["check", "--repo", REPO, "--pr", "7", "--owners", "Chisanan232", "--settings", str(deny)], run=pm.Fake())
+        out = json.loads(buf.getvalue())
+        self.assertEqual((rc, out["verdict"], out["decision"]["outcome"]), (1, "PASS", "DENY"))
+        self.assertNotIn("merge_command", out)
+
+    def test_a_gate_error_prints_a_deny_decision(self):
+        def boom(*a):
+            raise RuntimeError("gh exploded")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = omg.main(["check", "--repo", REPO, "--pr", "7", "--owners", "Chisanan232"], run=boom)
+        out = json.loads(buf.getvalue())
+        self.assertEqual((rc, out["verdict"], out["decision"]["outcome"]), (3, "ERROR", "DENY"))
 
 
 class Cli(unittest.TestCase):

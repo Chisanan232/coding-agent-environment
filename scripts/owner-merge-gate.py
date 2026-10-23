@@ -391,6 +391,7 @@ def merge_command(facts):
 # (outcome, resolver, dimension) per reason code; resolver says who clears it.
 DENY, ASK = "DENY", "ASK"
 REASON_TABLE = {
+    "UNAUTHORIZED_REPO": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"), "NOT_CANONICAL_REPO": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"),
     "FORK_REPO": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"), "CROSS_REPOSITORY_HEAD": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"),
     "NOT_OPEN": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"), "BLOCKED_BY_REPOSITORY_RULES": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"),
     "NOT_REPO_ADMIN": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"), "NO_MERGE_PERMISSION": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"),
@@ -424,22 +425,39 @@ HOST_OUTCOME = {"allow": "ALLOW", "ask": ASK, "deny": DENY, "classifier": ASK, "
 _HOST_RANK = {"deny": 3, "ask": 2, "classifier": 1, "allow": 0}
 
 
-def host_permission(settings_path, command):
-    """HOST_TOOL_PERMISSION for the exact pinned command, from a settings file's permission rules only.
+def host_permission(settings_paths, command):
+    """HOST_TOOL_PERMISSION for the exact pinned command, from the permission rules of one or more settings files.
 
-    deny > ask > allow, and both the plain and the rtk-rewritten spelling are judged (the live hook rewrites commands). No rule
-    means the Auto Mode classifier decides, which is not an authorization, so it is reported as `classifier`.
+    Pass every layer you have (user, project, local, managed): rules are pooled and deny > ask > allow, and both the plain and the
+    rtk-rewritten spelling are judged (the live hook rewrites commands). Only the layers passed are read, so `allow` means "allowed by
+    these files", not "allowed by the host". Anything unparseable fails closed to `ask`: a non-string rule, a malformed `Bash(`
+    rule, or a bare `Bash` in ask. A bare `Bash` deny is a deny. No rule at all means the Auto Mode classifier decides, which is not
+    an authorization, so it is `classifier`. Nothing from the files is printed.
     """
-    if not settings_path:
+    if not settings_paths:
         return "not_evaluated"
+    if isinstance(settings_paths, str):
+        settings_paths = [settings_paths]
     import importlib.util
     import pathlib
     spec = importlib.util.spec_from_file_location("permission_rollout", pathlib.Path(__file__).resolve().with_name("permission-rollout.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    perms = (json.load(open(settings_path)).get("permissions") or {})
-    perms = {k: [r for r in perms.get(k, []) if isinstance(r, str)] for k in ("deny", "ask", "allow")}
-    return max((mod.static_decision(c, perms) for c in (command, "rtk " + command)), key=lambda d: _HOST_RANK[d])
+    pooled, broken = {"deny": [], "ask": [], "allow": []}, False
+    for path in settings_paths:
+        perms = (json.load(open(path)).get("permissions") or {})
+        for bucket in pooled:
+            for r in perms.get(bucket, []):
+                if not isinstance(r, str) or (r.startswith("Bash(") and not r.endswith(")")):
+                    broken = True
+                elif r == "Bash" and bucket == "deny":
+                    return "deny"
+                elif r == "Bash" and bucket == "ask":
+                    broken = True
+                else:
+                    pooled[bucket].append(r)
+    result = max((mod.static_decision(c, pooled) for c in (command, "rtk " + command)), key=lambda d: _HOST_RANK[d])
+    return "ask" if broken and _HOST_RANK[result] < _HOST_RANK["ask"] else result
 
 
 def decide(verdict, reasons, facts, host="not_evaluated"):
@@ -496,7 +514,7 @@ def evidence_line(head, reviewer, verdict="PASS", blocking=0):
     return f"OWNER-MERGE-REVIEW head={head} verdict={verdict} blocking={blocking} reviewer={reviewer}"
 
 
-def queue_report(run, repo, prs, owners, ci_unavailable=False):
+def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None):
     """Text plan for the owner: gate verdict per PR, in the order given. Print-only."""
     lines, first = [], True
     for n in prs:
@@ -505,12 +523,16 @@ def queue_report(run, repo, prs, owners, ci_unavailable=False):
         except Exception as e:
             lines.append(f"#{n} ERROR  {type(e).__name__}: {str(e)[:200]}")
             continue
-        lines.append(f"#{n} {verdict} [{facts.get('class', '?')}]" + (f"  {'; '.join(reasons)}" if reasons else ""))
+        host = host_permission(settings, merge_command(facts)) if verdict == "PASS" else "not_evaluated"
+        decision = decide(verdict, reasons, facts, host)
+        lines.append(f"#{n} {verdict} [{facts.get('class', '?')}] decision={decision['outcome']}" + (f"  {'; '.join(reasons)}" if reasons else ""))
         if verdict == "WAIT" and facts.get("approve_command"):
             lines.append("  owner action (the agent must not run this), then re-run check: " + facts["approve_command"])
-        if verdict == "PASS":
-            lines.append(("  run: " if first else "  after the previous merge, re-run check (this branch will then be behind): ")
-                         + merge_command(facts))
+        if verdict == "PASS" and decision["outcome"] == DENY:
+            lines.append("  not runnable: " + "; ".join(d["reason"] for d in decision["denies"]))
+        elif verdict == "PASS":
+            head = "  run: " if first else "  after the previous merge, re-run check (this branch will then be behind): "
+            lines.append(head + merge_command(facts))
             first = False
     return "\n".join(lines)
 
@@ -525,13 +547,15 @@ def main(argv=None, run=None):
         sp.add_argument("--pr", type=int, required=True)
     sub.choices["check"].add_argument("--owners", required=True)
     sub.choices["check"].add_argument("--ci-unavailable", action="store_true")
-    sub.choices["check"].add_argument("--settings", help="settings.json whose permission rules are read (never printed) to judge HOST_TOOL_PERMISSION")
+    SETTINGS_HELP = "settings.json whose permission rules are read (never printed) to judge HOST_TOOL_PERMISSION; repeat for every layer (user, project, local, managed)"
+    sub.choices["check"].add_argument("--settings", action="append", help=SETTINGS_HELP)
     sub.choices["verify"].add_argument("--head", required=True)
     q = sub.add_parser("queue")
     q.add_argument("--repo", required=True)
     q.add_argument("--prs", required=True, help="comma-separated PR numbers, in the order to consider")
     q.add_argument("--owners", required=True)
     q.add_argument("--ci-unavailable", action="store_true")
+    q.add_argument("--settings", action="append", help=SETTINGS_HELP)
     d = sub.add_parser("host-denied")
     d.add_argument("--repo", required=True)
     d.add_argument("--pr", type=int, required=True)
@@ -555,7 +579,7 @@ def main(argv=None, run=None):
             if not owners or not all(OWNER_RE.fullmatch(o) for o in owners):
                 print(json.dumps({"verdict": "REFUSE", "reasons": ["BAD_OWNERS"]}))
                 return 1
-            text = queue_report(run, a.repo, [int(x) for x in a.prs.split(",")], owners, a.ci_unavailable)
+            text = queue_report(run, a.repo, [int(x) for x in a.prs.split(",")], owners, a.ci_unavailable, a.settings)
             print(text)
             return 0 if all(re.match(r"#\d+ PASS ", l) for l in text.splitlines() if l.startswith("#")) else 1
         if a.cmd == "check":
@@ -565,17 +589,20 @@ def main(argv=None, run=None):
                 return 1
             verdict, reasons, facts = evaluate(run, a.repo, a.pr, owners, a.ci_unavailable)
             out = {"verdict": verdict, "reasons": reasons, **facts}
-            if verdict == "PASS":
-                out["merge_command"] = merge_command(facts)
             host = host_permission(a.settings, merge_command(facts)) if verdict == "PASS" else "not_evaluated"
             out["decision"] = decide(verdict, reasons, facts, host)
+            if verdict == "PASS" and out["decision"]["outcome"] != DENY:  # a host deny leaves nothing to run
+                out["merge_command"] = merge_command(facts)
             print(json.dumps(out, indent=1))
+            if out["decision"]["outcome"] == DENY and verdict == "PASS":
+                return 1
             return {"PASS": 0, "REFUSE": 1, "WAIT": 2}[verdict]
         out = verify(run, a.repo, a.pr, a.head)
         print(json.dumps(out, indent=1))
         return 0 if out["verdict"] == "VERIFIED" else 1
     except Exception as e:  # any failure is an ERROR (exit 3), never read as a REFUSE or a WAIT
-        print(json.dumps({"verdict": "ERROR", "reasons": [f"{type(e).__name__}: {str(e)[:300]}"]}))
+        print(json.dumps({"verdict": "ERROR", "reasons": [f"{type(e).__name__}: {str(e)[:300]}"],
+                          "decision": {"outcome": DENY, "denies": ["ERROR: the gate could not evaluate; fail closed"]}}))
         return 3
 
 

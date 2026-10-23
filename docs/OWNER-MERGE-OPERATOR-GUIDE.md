@@ -22,20 +22,29 @@ Five dimensions are judged separately. A PASS in one is never a PASS in all.
 | **DENY** | a non-waivable constraint | failed CI; fork or cross-repository head; closed PR; GitHub repository rules; a host deny rule; a gate error |
 
 `ASK` names who resolves it (`resolver`): `host_prompt`, `owner_github_approval`, `agent_runs_independent_review`, `agent_revalidates`,
-`author_fixes_findings`, `author_resolves_threads`, `author_resolves_conflicts`, `author_marks_ready`, `founder_risk_decision`,
+`author_fixes_findings`, `author_addresses_review`, `author_fixes_ci`, `author_resolves_threads`, `author_resolves_conflicts`, `author_marks_ready`, `founder_risk_decision`,
 `founder_authorizes_target`, `owner_review`. An ASK never simulates the answer: the agent does not submit a GitHub approval or a prompt
 approval, and an approved prompt covers exactly the one printed command at its pinned head. GitHub's rejection stays binding.
 
-`CI_FAILED` is DENY because a genuinely failed check is not waivable; remediate it. Only `NO_CI_EVIDENCE` (including a qualified
-`CI_UNAVAILABLE_EXTERNAL`) is a founder risk decision.
+`CI_FAILED` is DENY because a genuinely failed check is not waivable; remediate it. `NO_CI_EVIDENCE` (no completed checks and no qualified
+`CI_UNAVAILABLE_EXTERNAL` record) is a founder risk decision; a qualified record clears it. A gate `ERROR` prints a DENY decision (exit 3).
+`UNAUTHORIZED_REPO` and `NOT_CANONICAL_REPO` are DENY: a trust-boundary failure is never an ASK.
 
 Print the decision for a PR (reads GitHub and the permission rules of the settings file; prints no rule text or env values):
 
 ```bash
 python3 scripts/owner-merge-gate.py check --repo OWNER/REPO --pr N --owners OWNER --settings ~/.claude/settings.json
+python3 scripts/owner-merge-gate.py queue --repo OWNER/REPO --prs 5,6 --owners OWNER --settings ~/.claude/settings.json   # decision per PR
 ```
 
-Without `--settings` the host dimension is `not_evaluated` and a passing PR is reported ASK, never ALLOW.
+Pass `--settings` once per layer you have (user, project `.claude/settings.json`, `.claude/settings.local.json`, managed): the rules are pooled and deny beats
+ask beats allow. Only the files you pass are read, so ALLOW means "allowed by these files", not "allowed by the host"; the Auto Mode classifier is a further,
+unmodelled layer. An unparseable or non-string rule, or a bare `Bash` in ask, fails closed to ASK. Without `--settings` the host dimension is `not_evaluated`
+and a passing PR is reported ASK, never ALLOW. Exit codes keep their meaning: 0 = gate PASS (run the pinned command; for ASK a host prompt will appear and you
+answer it), 1 = REFUSE, or PASS with a host DENY (no `merge_command` is printed), 2 = WAIT, 3 = ERROR. Read `decision.outcome`, not the exit code, to tell ALLOW from ASK.
+
+Evidence independence is unchanged and still open: the review record is written by the same authenticated identity that runs `check`, so ALLOW depends on the
+process being followed (`OWNER-MERGE-AUTONOMY.md` section 8, evidence-independence decision), not on GitHub proving a second reviewer.
 
 ## 2. Paths
 
@@ -51,17 +60,18 @@ so you run `apply` yourself in a terminal (or with the `!` prefix in Claude Code
 
 ## 3. Exactly what changes
 
-The candidate adds **29 `permissions.ask` entries and nothing else**: no allow, no deny, no `autoMode`, no hook, no env, no model change.
-Measured by a read-only `plan` against your live file on 2026-10-23 (live sha256 begins `9ef7e199`): `asks_added 29`, `allow_added 0`,
+The candidate adds **35 `permissions.ask` entries and nothing else**: no allow, no deny, no `autoMode`, no hook, no env, no model change.
+Measured by a read-only `plan` against your live file on 2026-10-23 (live sha256 begins `9ef7e199`): `asks_added 35`, `allow_added 0`,
 `asks_retired 0`, `autoMode` unchanged (environment 2 before and after), `blocking: false`.
 
-Added (each bare form has an `rtk ` twin, 14 + 14) and one MCP tool:
+Added (each bare form has an `rtk ` twin, 17 + 17) and one MCP tool:
 
 ```
 Bash(gh pr merge:*)          Bash(gh pr merge *)            Bash(gh pr  merge*)
-Bash(gh -R * pr merge*)      Bash(gh --repo * pr merge*)    Bash(gh --repo=* pr merge*)
+Bash(gh -R * pr merge*)      Bash(gh --repo * pr merge*)    Bash(gh --repo=* pr merge*)   Bash(gh -R=* pr merge*)
 Bash(gh pr -R * merge *)     Bash(gh pr -R * merge)         Bash(gh pr --repo * merge *)
 Bash(gh pr --repo * merge)   Bash(gh pr --repo=* merge *)   Bash(gh pr --repo=* merge)
+Bash(gh pr -R=* merge *)     Bash(gh pr -R=* merge)
 Bash(gh api graphql*mergePullRequest*)   Bash(gh api graphql*enablePullRequestAutoMerge*)
 mcp__github__merge_pull_request
 ```
@@ -91,10 +101,10 @@ cd ~/Bryant-Developments/cae-operator
 # 1. read-only plan (writes nothing)
 python3 scripts/candidate-rollout.py plan --live ~/.claude/settings.json \
   --candidate docs/examples/candidate-settings-merge-scope.example.json
-#   expect: "blocking": false, asks_added 29, allow_added 0, asks_retired 0
+#   expect: "blocking": false, asks_added 35, allow_added 0, asks_retired 0
 #   observed 2026-10-23: live_sha     9ef7e199108614e9438cf6466d6028c0a99124a87bbab0e66e52e7f274f78c1b
-#                        candidate_sha 8f576e6f36801300c6d9b15ce87162655799f44bea47662f0d1f9d685b4f18fb
-#                        result_sha    53b45481c0d6ead9e4d836fabc976f0695580b626e7415d00c80face5b8435e3
+#                        candidate_sha 04169305bad4e7d2cc640612441d12d52287623074960e92bb4bd01344e5ad36
+#                        result_sha    c6c13ca48477007dad25d0bb8ee62fdc603fee1be12f9d04f1b406a40ed40ad7
 
 # 2. apply, pinned to the hashes plan printed (refuses if the live file changed since)
 python3 scripts/candidate-rollout.py apply --live ~/.claude/settings.json \
