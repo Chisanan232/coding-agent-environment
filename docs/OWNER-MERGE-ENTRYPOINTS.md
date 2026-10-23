@@ -63,7 +63,7 @@ On the real host the Auto Mode classifier denied the agent writing the runner's 
 retried through another tool, wrapper or sub-agent. So the end of the autonomous journey (step 4) holds only when the evidence file is produced by something the host does not read as the
 agent approving its own work; the runner and the gate cannot fix that. The founder's L1 canary worked because the founder wrote the evidence. This is the open evidence-independence
 decision, now with a measured symptom. Options for the owner, none implemented here: keep a one-line owner-run evidence step per merge; install an owner-controlled review-recording
-command as the only evidence writer (and allow exactly that command); or sign evidence with a key the agent cannot read (`require_signed_evidence`). Until one is chosen, `ALLOW` from the gate means
+command as the only evidence writer (and allow exactly that command); or sign evidence with a key the agent cannot read (`require_signed_evidence`). Feasibility, trust model and the one-decision owner packet: `OWNER-MERGE-EVIDENCE-RECORDER.md`. Until one is chosen, `ALLOW` from the gate means
 the executor is authorized, and an owner PR autonomously merges only when valid evidence already exists.
 
 ## Golden user journey (the acceptance bar)
