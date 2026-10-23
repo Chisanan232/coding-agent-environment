@@ -45,7 +45,7 @@ around the denial. Also not an option: signing with a key the agent can read; th
 Reply with one of: **"Authorize design 1"**, **"Authorize design 2"**, **"Authorize design 3"**, or **"Keep the owner-run evidence step"**.
 
 - **Design 1** (recommended): authorizes me to implement `--record-review` in `scripts/owner-merge-runner.py` and `auto_review` tests on a PR, with an independent review, and
-  authorizes you to run `scripts/install-owner-merge-runner.sh --update` and to set `"auto_review": true` plus the reviewer id `runner-independent-review` in
+  authorizes you to run `scripts/install-owner-merge-runner.sh --update` and to set `"auto_review": true` plus the reviewer id `runner-recorded-review` in
   `~/.claude/owner-merge-runner-allowlist.json` for each repository you want. Then one canary run on a disposable private repo shows whether the host accepts the agent calling
   `owner-merge-runner ... --record-review`; if it denies, that denial is recorded and the fallback below applies.
 - **Design 2**: authorizes the API-key secret and spend on named repositories.
@@ -81,24 +81,26 @@ The runner change has to enter the trust boundary through an owner-side act, not
 
 1. **Obtain the implementation outside this session** (the owner writes it, or directs a separate session or harness such as Codex to write it from the specification below), reviewed in a PR by an independent reviewer.
 2. Owner merges it (one prompt) and runs `scripts/install-owner-merge-runner.sh --update`.
-3. Owner sets `"auto_review": true` and adds the reviewer id `runner-independent-review` for the repositories where this standing opt-in is acceptable.
+3. Owner sets `"auto_review": true` and adds the reviewer id `runner-recorded-review` for the repositories where this standing opt-in is acceptable.
 4. One disposable-repo canary shows whether the host lets the agent call `owner-merge-runner ... --record-review` (the installed allow rule already ends in `--review-evidence *`, so no settings change). If it
    denies, the remaining owner-only lever is classifier guidance (`autoMode` wording, owner-written); if that is also refused, the fallback below stays the answer. Whether the host accepts it is unknown until step 4.
 
 ### Specification for the implementer (behaviour and tests, not code)
 
 - New flag `--record-review` on the existing runner; no new program, no new allow rule, no new gh verb except the read-only `pr diff N --repo R`.
-- Refuse unless the repository entry has `auto_review: true` and the reviewer id `runner-independent-review` is allowlisted; refuse if the evidence file exists (never overwrite), if the file name is not a plain
+- Refuse unless the repository entry has `auto_review: true` and the reviewer id `runner-recorded-review` is allowlisted; refuse if the evidence file exists (never overwrite), if the file name is not a plain
   `.json` inside the owner-merge-evidence directory, if the PR is not open, non-draft and at `--expect-head`, if the diff is empty or over a fixed size cap, or if the PR touches `.github/workflows/`, `owner-merge-*`,
   `.claude/settings*`, CODEOWNERS or the allowlist (those need a human-supervised review).
 - Reviewer: no tools, no user/project settings, no session persistence, token-like environment variables removed, diff delimited as untrusted data, one JSON verdict bound to the head; anything else is a refusal. Re-read the
   head after the review; any change refuses. Write evidence only on PASS; keep the review-output hash in the evidence and the audit.
 - Tests: red (FAIL verdict, malformed output, wrong head echo, head moved during review, protected path, oversize diff, existing file, path escape, disabled repo, reviewer id missing, reviewer crash/timeout) and green
-  (PASS writes a 0600 file the existing evidence loader accepts, then the normal guards still refuse stale head, red CI, missing check); an existing-behaviour regression that a run without the flag is unchanged; the audit
+  (PASS writes a 0600 file the evidence loader accepts once `REVIEWER_KINDS` is extended to recognise `runner-recorded` (today it accepts only `human` and `independent-agent`; that extension and its acceptance test are part of the work), then the normal guards still refuse stale head, red CI, missing check); an existing-behaviour regression that a run without the flag is unchanged; the audit
   carries `runner-recorded` and never `independent`.
 - Gate: when the evidence file is missing and the repository has `auto_review`, offer the runner command with `--record-review`; when it is missing and there is no `auto_review`, offer the pinned `gh pr merge` (ASK), never ALLOW.
 
-Fallback that stays correct until all of this exists: an unsupported automatic authorization is **ASK**, not a silent merge: the gate offers the pinned `gh pr merge` and the host prompts.
+Fallback behaviour today, stated exactly: the direct pinned `gh pr merge` always prompts (ASK-first), and the runner refuses at execution when the evidence file is missing, so nothing merges silently. The gate does **not** yet
+offer the ASK command when the evidence file is missing: `select_executor` ignores the evidence file, so it still prints ALLOW with the runner command and the runner then refuses. The evidence-aware gate behaviour in the Gate bullet
+above is part of the specified work, not existing behaviour.
 
 ## Reusable multi-repository owner merge workflow (works today)
 
