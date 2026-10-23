@@ -82,14 +82,15 @@ def merge(live, candidate, baseline=None, hook_command=None, fail_closed=False):
     perms = merged.setdefault("permissions", {})
     before = list(perms.get("ask", []))
     base_asks = ((baseline or {}).get("permissions") or {}).get("ask", [])
-    perms["ask"] = union(before, base_asks, candidate["permissions"]["ask"])
-    retire = [r for r in candidate["permissions"].get("retire_ask", [])]
+    cand_perms = candidate.get("permissions") or {}  # an autoMode-only candidate carries no permissions block
+    perms["ask"] = union(before, base_asks, cand_perms.get("ask", []))
+    retire = [r for r in cand_perms.get("retire_ask", [])]
     report["asks_retired"] = [r for r in perms["ask"] if r in retire and r in wsp.RETIRABLE_ASKS]
     report["retire_refused"] = [r for r in retire if r not in wsp.RETIRABLE_ASKS]
     perms["ask"] = [r for r in perms["ask"] if r not in report["asks_retired"]]
     allow_before = list(perms.get("allow", []))
-    if candidate["permissions"].get("allow"):
-        perms["allow"] = union(allow_before, candidate["permissions"]["allow"])
+    if cand_perms.get("allow"):
+        perms["allow"] = union(allow_before, cand_perms["allow"])
     report["allow_added"] = [a for a in perms.get("allow", []) if a not in allow_before]
     report["asks_added"] = [a for a in perms["ask"] if a not in before]
     report["asks_kept"] = len(before)
@@ -126,14 +127,15 @@ def compat(live, merged, candidate, report_conflicts=()):
     live_allow = (live.get("permissions") or {}).get("allow", [])
     for problem in wsp.lint_settings({"permissions": {"allow": live_allow}}):
         out.append(f"live allow list (untouched, informational): {problem}")
-    for r in candidate["permissions"].get("retire_ask", []):
+    cand_perms = candidate.get("permissions") or {}
+    for r in cand_perms.get("retire_ask", []):
         if r not in wsp.RETIRABLE_ASKS:
             out.append(f"BLOCKING candidate asks to retire an ask the tool may not retire: {r}")
-    for r in candidate["permissions"].get("allow", []):
+    for r in cand_perms.get("allow", []):
         if r not in wsp.PROXY_ROUTINE_ALLOW + wsp.ROUTINE_BARE_ALLOW:
             out.append(f"BLOCKING candidate allow is not one of the scoped allows this tool may add: {r}")
     merged_perm = merged["permissions"]
-    if candidate["permissions"].get("allow") or any(r in candidate["permissions"].get("retire_ask", []) for r in wsp.RETIRABLE_ASKS):
+    if cand_perms.get("allow") or any(r in cand_perms.get("retire_ask", []) for r in wsp.RETIRABLE_ASKS):
         for cmd in pr.PROXY_PROTECTED_COMMANDS:
             if pr.static_decision(cmd, merged_perm) != "ask":
                 out.append(f"BLOCKING protected wrapped command would not ask after the merge: {cmd!r} -> {pr.static_decision(cmd, merged_perm)}")

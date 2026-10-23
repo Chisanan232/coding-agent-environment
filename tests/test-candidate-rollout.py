@@ -86,6 +86,19 @@ class Rollout(unittest.TestCase):
         self.assertEqual(example, cr.wsp.candidate("personal", asks_only=True))
         self.assertEqual(cr.wsp.lint_settings(example), [])
 
+    def test_autoMode_only_candidate_without_permissions_block_merges_and_plans(self):
+        cand = {"autoMode": {"environment": ["$defaults", "Synthetic factual line for this test."]}}
+        merged, rep = cr.merge(LIVE, cand)
+        self.assertEqual(merged["autoMode"], cand["autoMode"])
+        self.assertEqual(merged["permissions"], LIVE["permissions"])  # asks, allow and deny exactly as live
+        self.assertEqual(rep["asks_added"], [])
+        self.assertEqual(rep["asks_retired"], [])
+        self.cand.write_text(json.dumps(cand))
+        p = json.loads(self.run_cli("plan", "--live", str(self.live), "--candidate", str(self.cand))[1])
+        self.assertFalse(p["blocking"])
+        self.assertEqual(p["report"]["allow_added"], [])
+        self.assertNotIn(DUMMY, json.dumps(p))
+
     def test_baseline_autoMode_text_is_never_applied(self):
         merged, _ = cr.merge(LIVE, cr.wsp.candidate("personal"), BASELINE)
         self.assertNotIn("Authorized pull request merge", json.dumps(merged["autoMode"]))
