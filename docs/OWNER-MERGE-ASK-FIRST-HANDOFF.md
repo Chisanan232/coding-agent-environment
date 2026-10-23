@@ -17,7 +17,9 @@ Fresh values measured 2026-10-23 on `main` `6df22b2`: live settings sha256 `9ef7
 (unchanged since the earlier checkpoint), result sha256 `c6c13ca48477007dad25d0bb8ee62fdc603fee1be12f9d04f1b406a40ed40ad7`. The script recomputes both
 every run; trust what it prints, not this page.
 
-## 1. Get an up-to-date checkout (once)
+## 1. Get an up-to-date checkout (once; do this after the PR that adds this page and `scripts/ask-first-apply.sh` is merged)
+
+Until then neither file exists on `origin/main`. If you need it earlier, check out branch `full/SPE-118/docs/ask_first_handoff` instead of `origin/main`.
 
 ```bash
 git -C ~/Bryant-Developments/coding-agent-environment fetch origin
@@ -106,7 +108,7 @@ In the fresh Claude Code session, tell the agent exactly: *"Run this command and
 `HOST_PROMPT_VERIFIED` is PASS only if H1 and H2 were both observed as written. If instead the command ran with no prompt, or the Auto Mode classifier denied it
 without a prompt, record that exactly and stop: that is the finding, and it means ASK-first alone does not give a prompt on this host.
 
-Cleanup (the delete itself prompts, by design; approve it):
+Cleanup. Run it in the same shell as the setup (it uses `$OWNER`, `$REPO` and `$D`). `--yes` only skips `gh`'s own confirmation; your host may still show its own prompt for `gh repo delete`, and if it does, approving it is expected:
 
 ```bash
 gh repo delete "$OWNER/$REPO" --yes; cd ~; rm -rf "$D"
@@ -119,7 +121,7 @@ scripts/ask-first-apply.sh --rollback
 # expect: "restored": true, then: ROLLED BACK: live file restored to sha256 9ef7e199...78c1b
 ```
 
-It restores the exact original bytes and refuses if the live file changed after the apply (it will not overwrite a newer edit). Manual equivalent:
+It restores the exact original bytes and refuses if the live file's hash changed after the apply. That check is a hash comparison, not a lock: a write landing in the instant between the check and the file replace is not prevented, so do not edit `settings.json` (or run another Claude Code session that does) while you apply or roll back. Manual equivalent:
 
 ```bash
 python3 scripts/candidate-rollout.py rollback --live ~/.claude/settings.json \
@@ -140,8 +142,8 @@ python3 scripts/candidate-rollout.py rollback --live ~/.claude/settings.json \
 | If missing | gate decision `ASK`, resolver `owner_github_approval` | gate decision `ASK`, resolver `host_prompt` |
 | If declined | the PR stays unmerged; GitHub's rules still bind | no merge runs; nothing is permanently denied |
 
-A host prompt is a request, not a denial: declining leaves the PR open and you can ask again. A true DENY is only a failed check, a cross-repository head, a
-closed PR, repository rules, a host deny rule, or a gate error.
+A host prompt is a request, not a denial: declining leaves the PR open and you can ask again. A DENY is reserved for non-waivable constraints: a failed check, a cross-repository or fork head,
+a closed PR, repository rules, a repository or identity trust failure (unauthorized or non-canonical repo, no merge permission), a host deny rule, or a gate error.
 
 ## 8. What reaching ALLOW needs (`TRUSTED_ALLOW_READY`; deliberately not part of this deployment)
 

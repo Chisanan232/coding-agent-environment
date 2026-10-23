@@ -104,6 +104,29 @@ class AskFirst(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertNotEqual(self.live.read_bytes(), self.original)
 
+    def test_failed_readback_still_leaves_a_working_rollback_and_names_the_backup(self):
+        shim = self.d / "bin"
+        shim.mkdir()
+        real = sys.executable
+        (shim / "python3").write_text(f'#!/bin/bash\nfor a in "$@"; do [ "$a" = verify ] && exit 1; done\nexec "{real}" "$@"\n')
+        (shim / "python3").chmod(0o755)
+        env = {**os.environ, "LIVE_SETTINGS": str(self.live), "BACKUP_DIR": str(self.backups), "PATH": f"{shim}:{os.environ['PATH']}"}
+        r = subprocess.run(["bash", str(SCRIPT), "--apply"], capture_output=True, text=True, env=env, timeout=120)
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("WAS modified", out)
+        self.assertIn(str(self.backups), out)
+        self.assertNotEqual(self.live.read_bytes(), self.original)
+        self.assertTrue((self.backups / "ask-first-rollback.json").exists())
+        rc, out = self.run_script("--rollback")  # real python3 again
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.live.read_bytes(), self.original)
+
+    def test_already_applied_means_the_hashes_match(self):
+        self.run_script("--apply")
+        rc, out = self.run_script("--apply")
+        self.assertIn("already applied", out)
+
     def test_missing_live_file_and_bad_argument_are_refused(self):
         self.live.unlink()
         rc, out = self.run_script()

@@ -49,7 +49,7 @@ EOF
 echo "plan: live_sha=$LIVE_SHA result_sha=$RESULT_SHA asks_added=$ADDED allow_added=$ALLOWS blocking=$BLOCKING"
 [ "$BLOCKING" = "false" ] || die "plan is blocking"
 [ "$ALLOWS" = "0" ] || die "candidate would add allow rules"
-if [ "$LIVE_SHA" = "$RESULT_SHA" ] || [ "$ADDED" = "0" ]; then echo "already applied: nothing to do"; exit 0; fi
+if [ "$LIVE_SHA" = "$RESULT_SHA" ]; then echo "already applied: nothing to do"; exit 0; fi
 
 if [ "$MODE" = "plan" ]; then
   echo "PLAN ONLY: nothing was changed. Re-run with --apply to apply exactly this plan."
@@ -61,7 +61,7 @@ EXTRA="$BACKUPS/settings.pre-ask-first.$(date +%Y%m%d-%H%M%S).json"
 cp -p "$LIVE" "$EXTRA"; chmod 600 "$EXTRA"
 python3 "$RO" apply --live "$LIVE" --candidate "$CAND" --expect-live-sha "$LIVE_SHA" --expect-result-sha "$RESULT_SHA" --backup-dir "$BACKUPS" > "$TMP/apply.json"
 BACKUP="$(field backup < "$TMP/apply.json")"
-python3 "$RO" verify --live "$LIVE" --expect-result-sha "$RESULT_SHA" | grep -q '"verdict": "VERIFIED"' || die "readback did not verify; roll back with: $0 --rollback"
+# Record the rollback pointer BEFORE reading back, so a failed readback still leaves a working --rollback.
 python3 - "$RECORD" "$BACKUP" "$LIVE_SHA" "$RESULT_SHA" <<'EOF'
 import json, os, sys
 path, backup, backup_sha, result_sha = sys.argv[1:]
@@ -69,6 +69,8 @@ fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as fh:
     json.dump({"backup": backup, "backup_sha": backup_sha, "result_sha": result_sha}, fh)
 EOF
+python3 "$RO" verify --live "$LIVE" --expect-result-sha "$RESULT_SHA" | grep -q '"verdict": "VERIFIED"' \
+  || die "readback did not verify. The live file WAS modified. Backup of the original: $BACKUP ; extra copy: $EXTRA ; restore with: $0 --rollback"
 echo "APPLIED and VERIFIED: live sha256 is now $RESULT_SHA"
 echo "backup (exact original bytes): $BACKUP"
 echo "extra copy: $EXTRA"
