@@ -174,8 +174,8 @@ def plan(args, raw=None):
     if raw is None:
         raw = pathlib.Path(args.live).read_bytes()
     live = json.loads(raw)
-    _, cand = load(args.candidate)
-    baseline = load(args.baseline)[1] if args.baseline else None
+    cand_raw, cand = load(args.candidate)
+    base_raw, baseline = load(args.baseline) if args.baseline else (None, None)
     merged, report = merge(live, cand, baseline, args.hook_command, args.fail_closed)
     text = dump(merged)
     owner_allow, registry_sha = (), None
@@ -183,12 +183,14 @@ def plan(args, raw=None):
         reg_raw = pathlib.Path(args.owner_allow_file).read_bytes()  # one read: the pin and the parsed entries use the same bytes
         registry_sha, owner_allow = sha(reg_raw), wsp.parse_owner_allow(reg_raw)
     findings = compat(live, merged, cand, report.get("hook_conflict", []), owner_allow)
-    findings += [f"owner allow registry entry (informational, review it; the owner pins its hash on apply): {e}" for e in owner_allow]
+    for e in owner_allow:  # every registry entry is judged, used by the candidate or not
+        findings += [f"BLOCKING owner allow registry: {problem}" for problem in wsp.owner_allow_problems(e)]
+        findings.append(f"owner allow registry entry (informational, review it; the owner pins its hash on apply): {e}")
     dropped = {k: v for k, v in report["dropped_from_live"].items() if v}
     if dropped:
         findings.append(f"live autoMode entries replaced by the candidate (informational, review them): {dropped}")
-    return {"live_sha": sha(raw), "candidate_sha": sha(pathlib.Path(args.candidate).read_bytes()),
-            "baseline_sha": sha(pathlib.Path(args.baseline).read_bytes()) if args.baseline else None,
+    return {"live_sha": sha(raw), "candidate_sha": sha(cand_raw),
+            "baseline_sha": sha(base_raw) if base_raw is not None else None,
             "registry_sha": registry_sha,
             "result_sha": sha(text), "report": report, "compat": findings,
             "blocking": any(f.startswith("BLOCKING") for f in findings),

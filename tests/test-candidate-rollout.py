@@ -423,6 +423,16 @@ class OwnerAllowRollout(unittest.TestCase):
         self.assertIn("REFUSED", str(rc))
         self.assertEqual(json.loads(self.live.read_text()), LIVE)
 
+    def test_unused_bad_registry_entry_still_blocks_the_plan(self):
+        reg = self.with_owner_candidate()
+        pathlib.Path(reg).write_text(json.dumps([self.ENTRY, "owner-merge-runner --expect-head X: auto-merge eligible PRs"]))
+        p = self.plan("--owner-allow-file", reg)
+        self.assertTrue(p["blocking"])
+
+    def test_reported_hashes_describe_the_bytes_that_were_merged(self):
+        p = self.plan()
+        self.assertEqual((p["candidate_sha"], p["baseline_sha"]), (cr.sha(self.cand.read_bytes()), cr.sha(self.base.read_bytes())))
+
     def test_registry_pin_without_a_registry_is_refused(self):
         p = self.plan()
         rc, _ = self.run_cli("apply", *self.args, "--expect-live-sha", p["live_sha"], "--expect-result-sha", p["result_sha"],

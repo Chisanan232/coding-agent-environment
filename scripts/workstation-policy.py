@@ -276,6 +276,8 @@ def proxy_scoped_candidate():
 OWNER_ALLOW_REQUIRED = ("owner-merge-runner", "--expect-head")
 OWNER_ALLOW_FORBIDDEN = re.compile(
     r"--admin|gh pr merge|bypass|dangerously|Bash\(|\bstanding\b|\bwithout\b|\bskip|\balways\b|\bwhatever\b|\bautomatic|\bapprov"
+    r"|\boverride|\bregardless|\bno review|\bnot needed|\boptional|\bomit|\bunreview|\bbot\b|\bpre-?authori|\bauto-?merge|\beligible"
+    r"|\bfuture\b|\bwaive|\bdisable|\bignore|\bauthori[sz]ed?\b.{0,40}\bmerge|\bmerge\w*\b.{0,40}\bauthori[sz]ed?\b"
     r"|\b(any|every|all|each)\b.{0,30}\b(pull requests?|PRs?|merges?|repositor(y|ies))\b", re.I)
 STANDING_MERGE = re.compile(r"authorized pull request merge|standing\b.{0,40}\bmerge|merge\b.{0,40}\b(authori[sz]ation|without review)", re.I)
 OWNER_ALLOW_MAX = 3
@@ -297,6 +299,8 @@ def owner_allow_problems(entry):
     bad = [f"owner autoMode.allow entry must mention {t!r}: {entry[:60]}" for t in OWNER_ALLOW_REQUIRED if t not in entry]
     if len(entry) > 400:
         bad.append(f"owner autoMode.allow entry over 400 chars: {entry[:60]}")
+    if not entry.isascii() or not entry.isprintable():  # homoglyphs and zero-width/format characters can hide a forbidden phrase
+        bad.append(f"owner autoMode.allow entry must be printable ASCII on one line: {entry[:60]!r}")
     flat = " ".join(entry.split())  # newlines, tabs and runs of spaces must not split a forbidden phrase
     if OWNER_ALLOW_FORBIDDEN.search(flat) or STANDING_MERGE.search(flat):
         bad.append(f"owner autoMode.allow entry is broader than the pinned runner: {entry[:60]}")
