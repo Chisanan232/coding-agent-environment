@@ -18,7 +18,7 @@ WSP="$ROOT/scripts/workstation-policy.py"
 MODE="${1:-plan}"
 # ASK_FIRST_KIND=trusted-allow (via scripts/trusted-allow-apply.sh) applies the single runner allow rule instead of the ask-first asks.
 KIND="${ASK_FIRST_KIND:-merge-scope}"
-RUNNER_BIN="${OWNER_MERGE_RUNNER_PATH:-$HOME/.claude/bin/owner-merge-runner}"
+RUNNER_BIN="$HOME/.claude/bin/owner-merge-runner"   # the exact path the allow rule names; deliberately not overridable
 case "$KIND" in
   merge-scope)   RENDER="--merge-scope";   CAND="$ROOT/docs/examples/candidate-settings-merge-scope.example.json"; RECORD="$BACKUPS/ask-first-rollback.json";;
   trusted-allow) RENDER="--trusted-allow"; CAND="";                                                                RECORD="$BACKUPS/trusted-allow-rollback.json";;
@@ -48,6 +48,7 @@ if [ "$KIND" = "merge-scope" ]; then
 else
   # The runner rule embeds your home directory, so the committed example is only a sample: judge the rendered file itself.
   CAND="$TMP/candidate.json"
+  [ ! -L "$RUNNER_BIN" ] || die "$RUNNER_BIN is a symlink; the allow rule must name a regular file"
   [ -f "$RUNNER_BIN" ] && [ -x "$RUNNER_BIN" ] || die "owner-merge-runner is not installed at $RUNNER_BIN; run scripts/install-owner-merge-runner.sh first"
   cmp -s "$ROOT/scripts/owner-merge-runner.py" "$RUNNER_BIN" || die "the installed runner differs from this checkout's scripts/owner-merge-runner.py; re-run scripts/install-owner-merge-runner.sh --update"
   echo "runner: installed at $RUNNER_BIN and identical to this checkout"

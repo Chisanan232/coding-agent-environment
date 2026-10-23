@@ -164,6 +164,8 @@ def compat(live, merged, candidate, report_conflicts=(), owner_allow=()):
     if runner_allows:  # a trusted-allow candidate is only safe on top of ASK-first, and no ask may swallow the runner form
         for rule in runner_allows:
             home = wsp.TRUSTED_RUNNER_RULE_RE.fullmatch(rule).group(1)
+            if home != os.path.expanduser("~"):
+                out.append(f"BLOCKING the runner allow rule names {home!r}, which is not this user's home; it would allow a program at a path nobody verified")
             probe = f"{home}/.claude/bin/owner-merge-runner --repo o/r --pr 7 --expect-head {'a' * 40} --review-evidence /tmp/e.json"
             if pr.static_decision(probe, merged_perm) != "allow":
                 out.append(f"BLOCKING the runner command would not be allowed after the merge (an ask or deny matches it, or no allow does): {pr.static_decision(probe, merged_perm)}")

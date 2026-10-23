@@ -22,7 +22,7 @@ permission layer does not see. The plan refuses to apply if an ask or deny would
 | `TRUSTED_ALLOW_IMPLEMENTED` | PASS (source, tests, scripts) |
 | `TRUSTED_ALLOW_DEPLOYED` | NOT_RUN: needs step 4 |
 | `RUNNER_ENFORCEMENT_VERIFIED` | PASS for the runner code against real GitHub (ledger section 3B); the deployed path is verified by step 6 |
-| `DIRECT_MERGE_ASK_PRESERVED` | PASS on the real host (founder canary; matrix T02-T04 with the rule in a scratch file); re-checked live in step 6 (L3) |
+| `DIRECT_MERGE_ASK_PRESERVED` | founder-observed PASS for ASK-first alone; with the rule only agent-observed on scratch settings (matrix T02-T04); the live combination is checked in step 6 (L3) |
 | `AUTONOMOUS_MERGE_CANARY_PASS` | NOT_RUN: step 6 |
 | `MERGE_AUTONOMY_READY` | BLOCKED until `TRUSTED_ALLOW_DEPLOYED` and `AUTONOMOUS_MERGE_CANARY_PASS` are PASS |
 
@@ -167,6 +167,7 @@ GitHub approval first (the runner refuses without it). Any refusal is a message,
 
 ```bash
 scripts/trusted-allow-apply.sh --rollback     # settings back to the exact bytes before the apply (ASK-first stays); expect: ROLLED BACK ...
+# roll back trusted-allow BEFORE ask-first: ask-first-apply.sh --rollback refuses while the trusted-allow result is live (its hash pin no longer matches)
 rm ~/.claude/bin/owner-merge-runner           # optional: remove the program (with the rule gone it is just an unreachable file)
 ```
 

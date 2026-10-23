@@ -94,6 +94,6 @@ The five refused canary PRs (#3-#7) were closed by the agent. The agent's token 
 | `TRUSTED_ALLOW_IMPLEMENTED` | PASS (source, tests, candidate, scripts; merge pending review at the time of writing, see the PR) |
 | `TRUSTED_ALLOW_DEPLOYED` | NOT_RUN |
 | `RUNNER_ENFORCEMENT_VERIFIED` | PASS for the real runner code against real GitHub (section 3B); not for the deployed `~/.claude/bin` path |
-| `DIRECT_MERGE_ASK_PRESERVED` | PASS on the real host for the accepted ASK-first settings (founder) and with the runner allow rule present (matrix T02-T04, scratch settings); not yet with the rule live |
+| `DIRECT_MERGE_ASK_PRESERVED` | PASS on the real host for the accepted ASK-first settings (**founder-observed**). With the runner allow rule present it is **agent-observed on scratch settings only** (headless matrix T02-T04); the rule is not live yet, so the live combination is NOT_RUN |
 | `AUTONOMOUS_MERGE_CANARY_PASS` | NOT_RUN (needs the live apply, handoff step 6) |
 | `MERGE_AUTONOMY_READY` | BLOCKED until the two NOT_RUN rows above pass |

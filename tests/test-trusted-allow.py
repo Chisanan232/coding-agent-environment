@@ -99,6 +99,9 @@ class Precedence(unittest.TestCase):
 
 class RolloutGuard(unittest.TestCase):
     def setUp(self):
+        saved = os.environ.get("HOME")
+        os.environ["HOME"] = HOME  # the guard requires the rule's home to be this user's home
+        self.addCleanup(lambda: os.environ.__setitem__("HOME", saved) if saved is not None else os.environ.pop("HOME", None))
         self.d = pathlib.Path(tempfile.mkdtemp(prefix="ta-"))
         self.addCleanup(__import__("shutil").rmtree, self.d, True)
         self.cand = self.d / "cand.json"
@@ -134,6 +137,13 @@ class RolloutGuard(unittest.TestCase):
             self.assertTrue(p["blocking"], bucket)
             self.assertTrue(any("runner command would not be allowed" in f for f in p["compat"]), bucket)
 
+    def test_plan_blocks_a_runner_rule_for_another_home(self):
+        cand = wsp.trusted_allow_candidate("/Users/someone-else")
+        self.cand.write_text(json.dumps(cand))
+        p = self.plan(live_with_ask_first())
+        self.assertTrue(p["blocking"])
+        self.assertTrue(any("not this user's home" in f for f in p["compat"]))
+
     def test_a_trusted_candidate_cannot_smuggle_another_allow(self):
         cand = wsp.trusted_allow_candidate(HOME)
         cand["permissions"]["allow"].append("Bash(gh pr merge:*)")
@@ -168,6 +178,35 @@ class Scripts(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertIn("differs", out)
         self.assertEqual(self.live.read_bytes(), self.original)
+
+    def test_a_symlinked_or_directory_runner_path_is_refused_and_the_override_is_gone(self):
+        self.runner.parent.mkdir(parents=True)
+        real = self.d / "elsewhere"
+        real.write_bytes((ROOT / "scripts/owner-merge-runner.py").read_bytes())
+        self.runner.symlink_to(real)
+        rc, out = self.sh("install-owner-merge-runner.sh", "--update")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("symlink", out)
+        rc, out = self.sh("trusted-allow-apply.sh", "--apply")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("symlink", out)
+        self.runner.unlink()
+        self.runner.mkdir()
+        rc, out = self.sh("install-owner-merge-runner.sh", "--update")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("directory", out)
+        self.assertEqual(self.live.read_bytes(), self.original)
+        # an override variable no longer redirects either script
+        other = self.d / "other-runner"
+        rc, out = self.sh("install-owner-merge-runner.sh", env={"OWNER_MERGE_RUNNER_PATH": str(other)})
+        self.assertFalse(other.exists())
+
+    def test_installer_fixes_the_mode_of_an_identical_non_executable_runner(self):
+        self.sh("install-owner-merge-runner.sh")
+        self.runner.chmod(0o644)
+        rc, out = self.sh("install-owner-merge-runner.sh")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.runner.stat().st_mode & 0o777, 0o755)
 
     def test_installer_installs_atomically_refuses_a_different_file_and_updates_on_request(self):
         rc, out = self.sh("install-owner-merge-runner.sh")
