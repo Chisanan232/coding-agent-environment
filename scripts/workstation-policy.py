@@ -254,6 +254,34 @@ def candidate(kind, asks_only=False):
     return cand
 
 
+MERGE_SCOPE_BASH_ASKS = ["Bash(gh pr merge:*)", "Bash(gh pr merge *)", "Bash(gh pr  merge*)", "Bash(gh -R * pr merge*)", "Bash(gh --repo * pr merge*)", "Bash(gh --repo=* pr merge*)",
+                         "Bash(gh pr -R * merge *)", "Bash(gh pr -R * merge)", "Bash(gh pr --repo * merge *)", "Bash(gh pr --repo * merge)",
+                         "Bash(gh pr --repo=* merge *)", "Bash(gh pr --repo=* merge)",
+                         "Bash(gh api *pulls/*/merge*)", "Bash(gh api graphql*mergePullRequest*)", "Bash(gh api graphql*enablePullRequestAutoMerge*)"]
+MERGE_SCOPE_OTHER_ASKS = ["mcp__github__merge_pull_request"]
+_bare_twin = lambda rules: list(rules) + [r.replace("Bash(", "Bash(rtk ", 1) for r in rules]
+# Asks only a merge-scope candidate adds (the default candidate already asks on the other shapes); their presence marks one.
+MERGE_SCOPE_MARKERS = [r for r in _bare_twin(MERGE_SCOPE_BASH_ASKS) if r not in _bare_twin(ASK_BASH_RULES)]
+# Invocation shapes the candidate must make ask; checked against the prefix-rule emulator, not the real host matcher.
+MERGE_SCOPE_COMMANDS = ["gh pr merge 5", "gh pr merge 5 --repo o/r --merge --match-head-commit " + "a" * 40, "gh pr  merge 5", "gh -R o/r pr merge 5",
+                        "gh --repo o/r pr merge 5", "gh --repo=o/r pr merge 5", "gh pr -R o/r merge 5", "gh pr --repo o/r merge 5", "gh pr --repo=o/r merge 5", "gh api repos/o/r/pulls/5/merge -X PUT", "gh api graphql -f query=mutation{mergePullRequest}",
+                        "gh api graphql -f query=mutation{enablePullRequestAutoMerge}"]
+
+
+def merge_scope_candidate():
+    """SPE-118: make the common direct merge routes ask. Asks win over allows, so the broad `gh pr merge` / `gh pr *` / GitHub MCP merge
+    allows stop working for these shapes without being removed. Prefix rules cannot cover every shape (a tab, `command gh`, `sh -c`,
+    env prefixes, aliases); those fall to the Auto Mode classifier, not to a rule. Adds no allow, no autoMode change and no runner
+    rule (that broadens host authorization and stays an owner decision)."""
+    asks = MERGE_SCOPE_BASH_ASKS + [r.replace("Bash(", "Bash(rtk ", 1) for r in MERGE_SCOPE_BASH_ASKS] + MERGE_SCOPE_OTHER_ASKS
+    return {
+        "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Adds asks for the common direct merge shapes "
+                       "(gh pr merge, rtk gh pr merge, gh -R/--repo ... pr merge, gh api .../merge, GraphQL mergePullRequest, the GitHub MCP merge tool) so the broad merge allows no longer run silently for them. "
+                       "Prefix rules cannot cover every shape; others fall to the Auto Mode classifier. Adds no allow and no autoMode change; the validating runner's allow rule stays an owner step.",
+        "permissions": {"ask": asks, "deny": []},
+    }
+
+
 def proxy_scoped_candidate():
     """SPE-119: retire the broad `rtk proxy *` ask, keep every protected wrapped operation asking, allow routine wrapped work.
 
@@ -373,6 +401,7 @@ def main(argv=None):
     r.add_argument("--out")
     r.add_argument("--asks-only", action="store_true", help="omit the autoMode block (minimal canary candidate)")
     r.add_argument("--proxy-scoped", action="store_true", help="SPE-119 candidate: retire the broad rtk proxy ask, add scoped asks and allows")
+    r.add_argument("--merge-scope", action="store_true", help="SPE-118 candidate: ask for every direct merge route (no allow, no autoMode change)")
     r.add_argument("--owner-allow-file", help="JSON array of owner-authored autoMode.allow entries to append after $defaults (each is linted; the agent never writes this text)")
     lint = sub.add_parser("lint-settings")
     lint.add_argument("file")
@@ -391,7 +420,9 @@ def main(argv=None):
             print(json.dumps(out, indent=1))
             return {"ALLOW": 0, "ASK": 1, "DENY": 2}[out["verdict"]]
         if a.cmd == "render-settings":
-            cand = proxy_scoped_candidate() if a.proxy_scoped else candidate(a.kind, asks_only=a.asks_only)
+            if a.merge_scope and (a.proxy_scoped or a.asks_only):
+                raise ValueError("--merge-scope cannot be combined with --proxy-scoped or --asks-only")
+            cand = merge_scope_candidate() if a.merge_scope else proxy_scoped_candidate() if a.proxy_scoped else candidate(a.kind, asks_only=a.asks_only)
             if a.owner_allow_file:
                 owner_allow = load_owner_allow(a.owner_allow_file)
                 if "autoMode" not in cand:
