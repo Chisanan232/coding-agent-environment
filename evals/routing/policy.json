@@ -29,7 +29,7 @@
       "own_tests": "original change touched only tests, so the arm's own tests are run",
       "review_only": "no oracle command; reviewer judgement and scope only"
     },
-    "note": "A reviewer finding that the result is correct but a name-coupled oracle fails it (oracle_coupled) is adjudicated in favour of the reviewer. A missing, errored or timed-out step is never accepted."
+    "note": "A failed oracle is never overridden by a model. A reviewer flag 'oracle_coupled' (correct but a name-coupled test fails) only marks the task for human adjudication and counts as not accepted in both arms. A missing, errored or timed-out step is never accepted."
   },
   "usage_vector": {
     "per_model_kinds": [
@@ -84,10 +84,11 @@
       "--no-session-persistence"
     ],
     "denied_paths": "arms may not read, search or write under ~/Bryant-Developments or ~/.claude (merged solutions, oracle tests, past transcripts); workdirs must live elsewhere",
-    "oracle_sandbox": "agent-authored test code runs under macOS sandbox-exec: no network, writes only inside the scratch directory",
+    "oracle_sandbox": "agent-authored test code runs under macOS sandbox-exec: no network, no reads of the dev tree or ~/.claude, writes only inside the scratch directory; symlinks resolving outside the scratch copy are removed first",
     "models": "Sonnet and Haiku are pinned by explicit id and the resolved ids are recorded",
     "settings": "--setting-sources project, so personal hooks and allow rules do not load into either arm",
-    "run_order": "recorded per run and alternated across tasks because the second arm benefits from a warm prompt cache"
+    "run_order": "recorded per run and alternated across tasks because the second arm benefits from a warm prompt cache",
+    "grading": "changes and diffs are computed in pure Python against a fresh extract of the base from the trusted repository; git never runs inside an arm's directory, which an arm can write to. Arms may not read or write their own .git."
   },
-  "amendment": "Amended once after independent review of PR 129 and before any arm was run: verdict semantics tightened (see decision_rule), isolation and oracle modes added. No result existed when this was changed."
+  "amendment": "Amended twice, both after independent review of PR 129 and before any arm was run: verdict semantics, isolation and oracle modes; then grading without git inside an arm's directory, symlink containment, sandbox read denial and no model override of a failed oracle. No result existed when this was changed."
 }
