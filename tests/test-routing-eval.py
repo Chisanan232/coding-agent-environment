@@ -259,6 +259,7 @@ class Invocation(unittest.TestCase):
             self.assertIn(f"{tool}(//{home}/Bryant-Developments/**)", denied)
             self.assertIn(f"{tool}(//{home}/.claude/**)", denied)
             self.assertIn(f"{tool}(//private/tmp/claude-501/**)", denied)
+            self.assertIn(f"{tool}(//tmp/claude-501/**)", denied)  # the /tmp -> /private/tmp alias
         for tool in ("Read", "Edit", "Write"):
             self.assertIn(f"{tool}(.git/**)", denied)
 
@@ -339,6 +340,29 @@ class FakeClaude(unittest.TestCase):
         clean = ev.audit_stream(json.dumps({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Edit", "input": {"new_string": "return 2"}}]}}))
         self.assertEqual(clean, [])
+
+    def test_audit_ignores_ordinary_source_text_but_flags_reach_outside_the_workdir(self):
+        def stream(name, **inp):
+            return json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": name, "input": inp}]}})
+        work = self.dir / "w"
+        work.mkdir()
+        # legitimate edits to code that mentions subprocess, os.environ and a ~/.local path are not reach
+        legit = stream("Edit", new_string="import subprocess\nos.environ.get('X')  # installs under ~/.local/lib")
+        self.assertEqual(ev.audit_stream(legit, work), [])
+        self.assertEqual(ev.audit_stream(stream("Read", file_path=str(work / "lib.py")), work), [])
+        for bad in ("/tmp/claude-501/pilot2/archive/x", "/private/tmp/claude-501/x", "/etc/hosts", "~/.ssh/id_rsa"):
+            flags = ev.audit_stream(stream("Read", file_path=bad), work)
+            self.assertTrue(flags, bad)
+        self.assertTrue(ev.audit_stream(stream("Grep", pattern="x", path="/Users/someone"), work))
+        self.assertEqual(ev.sensitive(["Edit: subprocess", "Bash: os.environ", "Edit: ~/", "Write: urllib",
+                                       "Read: path outside workdir /etc"]),
+                         ["Write: urllib", "Read: path outside workdir /etc"])
+
+    def test_the_raw_stream_is_kept_next_to_the_record_for_later_audit(self):
+        self.stub("echo '{\"type\": \"result\", \"is_error\": false, \"num_turns\": 1, \"modelUsage\": {}}'\n")
+        self.run_arm()
+        self.assertIn('"type": "result"', Path(str(self.dir / "run.json") + ".stream.jsonl").read_text())
 
     def test_a_flagged_run_is_recorded_and_stale_output_is_replaced(self):
         events = [{"type": "assistant", "message": {"model": ev.SONNET_ID, "content": [

@@ -60,7 +60,7 @@ def scrubbed_env() -> dict:
 def forbidden_roots() -> list[Path]:
     """Places an arm must not read: they hold the merged solutions, oracle tests and past transcripts."""
     home = Path.home()
-    return [home / "Bryant-Developments", home / ".claude", Path("/private/tmp/claude-501")]
+    return [home / "Bryant-Developments", home / ".claude", Path("/private/tmp/claude-501"), Path("/tmp/claude-501")]
 
 
 def deny_rules() -> list[str]:
@@ -161,11 +161,19 @@ def parse_stream(stdout: str) -> tuple[dict | None, list[str], dict]:
 
 
 AUDIT_NEEDLES = ("http://", "https://", "urllib", "socket", "requests", "curl ", "wget ", "ssh ", "/Users/",
-                 "/private/tmp/claude-501", "~/", "os.environ", "subprocess")
+                 "claude-501", "~/.ssh", "~/.config", "~/.claude", "~/.aws", "~/.gnupg")
+PATH_TOOLS = ("Read", "Grep", "Glob", "Edit", "Write")
 
 
-def audit_stream(stdout: str) -> list[str]:
-    """Tool inputs that show an arm reaching outside its task: the run-phase has no sandbox, so this is the check."""
+def sensitive(flags: list[str]) -> list[str]:
+    """Keep only flags that name network or secret reach (older records carried noisier ones)."""
+    return [f for f in flags if any(n.strip() in f for n in AUDIT_NEEDLES) or "outside workdir" in f]
+
+
+def audit_stream(stdout: str, workdir: Path | None = None) -> list[str]:
+    """Tool input that reaches the network, secrets or paths outside the arm's workdir. The run phase has no sandbox,
+    so this is detection after the fact, not a boundary; a substring audit can be evaded by obfuscated code."""
+    root = os.path.realpath(workdir) if workdir else None
     flags = []
     for line in stdout.splitlines():
         try:
@@ -177,10 +185,16 @@ def audit_stream(stdout: str) -> list[str]:
         for block in (ev_.get("message") or {}).get("content") or []:
             if not (isinstance(block, dict) and block.get("type") == "tool_use"):
                 continue
-            blob = json.dumps(block.get("input") or {})
-            if block.get("name") in ("Read", "Grep", "Glob") and "/Users/" not in blob and "/private/" not in blob:
-                continue
+            inp = block.get("input") or {}
+            blob = json.dumps(inp)
             flags.extend(f"{block.get('name')}: {n.strip()}" for n in AUDIT_NEEDLES if n in blob)
+            if root and block.get("name") in PATH_TOOLS:
+                for key in ("file_path", "path", "pattern"):
+                    v = inp.get(key)
+                    if isinstance(v, str) and (v.startswith("/") or v.startswith("~")):
+                        real = os.path.realpath(os.path.expanduser(v.split("*")[0] or "/"))
+                        if real != root and not real.startswith(root + os.sep):
+                            flags.append(f"{block.get('name')}: path outside workdir {v[:60]}")
     return sorted(set(flags))
 
 
@@ -375,7 +389,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         p = subprocess.run(argv, input=prompt, cwd=work, capture_output=True, text=True,
                            timeout=args.timeout, env=scrubbed_env())
         final, agents, side = parse_stream(p.stdout)
-        flags = audit_stream(p.stdout)
+        flags = audit_stream(p.stdout, work)
+        Path(str(args.out) + ".stream.jsonl").write_text(p.stdout)
         if final is None:
             record = error_record(task["id"], args.arm, f"no result event: {(p.stderr or p.stdout)[-300:]}", **extra)
         else:
@@ -561,7 +576,7 @@ def cmd_score(args: argparse.Namespace) -> None:
             review = _load_or_error(d / f"{task['id']}.{arm}.review.json", "review missing")
             arms[arm] = {"accepted": accepted(grade, review) and not run.get("is_error"), "usage": run.get("usage", {}),
                          "errored": bool(run.get("is_error") or grade.get("error") or review.get("error")),
-                         "audit_flags": run.get("audit_flags", []),
+                         "audit_flags": sensitive(run.get("audit_flags", [])),
                          "agent_types": run.get("agent_types", []), "accounting": run.get("accounting"),
                          "turns": run.get("num_turns"), "wall_ms": run.get("harness_wall_ms")}
         if "A" not in arms or "B" not in arms:
