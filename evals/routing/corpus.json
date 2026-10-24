@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "source": "Merged PRs on Chisanan232/coding-agent-environment. Entry state = first parent of the merge commit. The original change's test files are the hidden oracle. Task text describes behavior and acceptance criteria only.",
+  "tasks": [
+    {
+      "id": "t91-plan-differing-hook",
+      "pr": 91,
+      "class": "bounded",
+      "pilot": true,
+      "merge": "68575a5adb3c59c0706259770434968d2e908d5b",
+      "base": "5749062d8976ee0ea6a8e5c1ea0c7fd5afeb6796",
+      "oracle_cmd": "python3 -I tests/test-hook-rollout.py",
+      "task": "Bug in scripts/hook-rollout.py. `plan` reports \"change: none, already installed\" when the installed hook file differs from the merged hook source, although `apply` would replace it (with a backup; the settings entry stays unchanged). Fix `plan` so that: entry absent -> it says it will append a group (unchanged); entry installed with an identical file -> it prints \"none\"; entry installed with a differing file -> it says it will replace the hook file with a backup; entry installed with a missing file -> it says it will install the file, no backup; conflicting entry -> refused (unchanged). Do not change apply, verify, rollback or the WARN/ENFORCE behavior. Add tests to tests/test-hook-rollout.py for the new states."
+    },
+    {
+      "id": "t87-launcher-adapter",
+      "pr": 87,
+      "class": "bounded",
+      "pilot": true,
+      "merge": "5106b16569a0632db7c5351e5fbf64dafabec4b8",
+      "base": "873a1dbe2718f9787f578a470f822cacaff89fef",
+      "oracle_cmd": "python3 -I tests/test-launcher-runtime.py",
+      "task": "Bug: an installed disk-admission gate hook reports `disk-admission.py not found` because the launcher install never copies the adapter. Make scripts/launcher-install.py copy scripts/disk-admission.py and its sibling scripts/storage-integration.py into the runtime scripts directory under ~/.local/lib/coding-agent-environment/scripts/ (the fallback path that adapter_path() already searches). Do not change read_mode, the mode file, hook installation or enforcement. Add a test in tests/test-launcher-runtime.py that fails without the fix."
+    },
+    {
+      "id": "t84-refresher-plist",
+      "pr": 84,
+      "class": "bounded",
+      "pilot": true,
+      "merge": "157fd7143b3ddd571dde054f3049a584eca8f317",
+      "base": "a882a8253efe547396ac96d7246f796745a60cc6",
+      "oracle_cmd": "python3 -I tests/test-disk-admission.py",
+      "task": "The host resource snapshot (`scripts/disk-admission.py snapshot`) goes stale after 120 s and nothing republishes it. Add a `refresher-plist` subcommand to scripts/disk-admission.py that prints a launchd user agent named com.coding-agent-environment.admission-snapshot which runs `snapshot --json` every 60 s: no KeepAlive, RunAtLoad true, stdout and stderr to /dev/null. It installs nothing. Add a short \"Keeping the snapshot fresh\" section to docs/STORAGE-INTEGRATION.md (run from the stable merged checkout, verify, rollback, failure diagnosis) and tests in tests/test-disk-admission.py. Do not change enforcement or the gate."
+    },
+    {
+      "id": "t90-flaky-hold-retry",
+      "pr": 90,
+      "class": "ambiguous",
+      "pilot": true,
+      "merge": "bfedfd99bbfd241d98f7303f864a549bc86b567c",
+      "base": "7e4f7d23802723f3dead1eea06bad7c583ba0364",
+      "oracle_cmd": "python3 -I tests/test-resource-adapters.py",
+      "task": "tests/test-resource-adapters.py::test_permanent_initial_busy_is_bounded_and_never_launches fails intermittently on a loaded machine with `AssertionError: 1 not greater than or equal to 2`. Find the root cause and make the test deterministic without raising any threshold and without changing product code or what the test asserts."
+    },
+    {
+      "id": "t62-permission-hardening",
+      "pr": 62,
+      "class": "high_risk",
+      "pilot": true,
+      "merge": "554a9b854a2bb02f6e1829f600cc0d25642ab298",
+      "base": "eb74ff061bb942d4be6f50cd2e9632565fde4133",
+      "oracle_cmd": "python3 -I tests/test-permission-governance.py",
+      "task": "Permission-rule hardening after a security review of the permission templates. (1) Overlay template: make the asks space-free so `gcloud secrets create --data-file=/k s --project=P` and flag-first impersonation cannot match the allow rule. (2) `git worktree add`: narrow the allow to the `-b` and `--detach` shapes only, because clustered short options such as `-qBkeep` match the broad allow and can reset a branch. (3) Make the ask globs position- and quote-proof for `git*--output*`, `git*--ext-diff*`, `git*--no-index*`, `git fetch*--upl*`, and `git worktree add*-B*` / `-f*`. Document residual limits in an ADR. Keep and extend the tests in tests/test-permission-governance.py."
+    },
+    {
+      "id": "t92-ci-wire-test",
+      "pr": 92,
+      "class": "control",
+      "pilot": true,
+      "merge": "046b6c8b45729ad099f3f1cda5cab9a9c8ea604b",
+      "base": "68575a5adb3c59c0706259770434968d2e908d5b",
+      "oracle_cmd": null,
+      "task": "tests/test-hook-rollout.py is the only test file CI does not run. Add it to .github/workflows/capability-validation.yml, and make the workflow also trigger (pull request and push) on changes to scripts/hook-rollout.py. The change is additive only: do not skip, reorder or weaken any existing check."
+    },
+    {"id": "c81-managed-span-sections", "pr": 81, "class": "bounded", "pilot": false, "merge": null, "base": null, "oracle_cmd": "python3 -I tests/test-claude-md-invariants.py", "task": "Candidate only; not resolved."},
+    {"id": "c89-gh-first-fallback", "pr": 89, "class": "bounded", "pilot": false, "merge": null, "base": null, "oracle_cmd": "python3 -I tests/test-engineering-workflow.py", "task": "Candidate only; not resolved."},
+    {"id": "c60-native-probe-boundaries", "pr": 60, "class": "ambiguous", "pilot": false, "merge": null, "base": null, "oracle_cmd": "python3 -I tests/test-parity-dogfood.py", "task": "Candidate only; not resolved."},
+    {"id": "c85-reserve-then-exec", "pr": 85, "class": "ambiguous", "pilot": false, "merge": null, "base": null, "oracle_cmd": "python3 -I tests/test-disk-admission.py", "task": "Candidate only; not resolved."},
+    {"id": "c74-overlay-hardening", "pr": 74, "class": "high_risk", "pilot": false, "merge": null, "base": null, "oracle_cmd": "python3 -I tests/test-full-parity-install.py", "task": "Candidate only; not resolved."},
+    {"id": "c110-preserve-automode", "pr": 110, "class": "high_risk", "pilot": false, "merge": null, "base": null, "oracle_cmd": "python3 -I tests/test-candidate-rollout.py", "task": "Candidate only; not resolved."}
+  ]
+}
