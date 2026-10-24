@@ -28,11 +28,20 @@ try {
       const context = await browser.newContext({ viewport: { width, height }, colorScheme: scheme, reducedMotion: 'reduce' });
       const page = await context.newPage();
       await page.goto(fixture);
-      await page.keyboard.press('Tab');
-      const result = await page.evaluate(`(${checks})()`);
+      const focusable = await page.locator('a[href], button').count();
+      const focused = [];
+      for (let i = 0; i < focusable; i += 1) {
+        await page.keyboard.press('Tab');
+        focused.push(await page.evaluate(`(${checks})()`));
+      }
+      const result = focused[0];
       const label = `${width}px/${scheme}`;
       expect(!result.horizontalOverflow, `${label}: horizontal scroll (${result.scrollWidth} > ${result.clientWidth})`);
-      expect(result.focusedTag !== null && result.focusOutlineStyle !== 'none' && result.focusOutlineWidthPx >= 2, `${label}: focus indicator not visible`);
+      expect(focused.length >= 6 && new Set(focused.map((f) => f.focusedLabel)).size === focused.length, `${label}: Tab did not reach every control once`);
+      for (const f of focused) {
+        expect(f.focusOutlineStyle !== 'none' && f.focusOutlineWidthPx >= 2, `${label}: focus indicator not visible on ${f.focusedTag} "${f.focusedLabel}"`);
+      }
+      expect(focused.some((f) => f.focusedTag === 'BUTTON') && focused.some((f) => f.focusedTag === 'A'), `${label}: links and buttons were not both focused`);
       expect(result.reducedMotion && result.runningAnimations === 0, `${label}: reduced motion not honoured`);
       expect(result.colorScheme === scheme, `${label}: color scheme not applied`);
       await page.screenshot({ path: join(outDir, `smoke-${width}-${scheme}.png`), fullPage: true });

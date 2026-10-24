@@ -53,6 +53,33 @@ class UiUxPolicy(unittest.TestCase):
         self.assertNotIn('2ab3cae7ac2c2a55d7386ca789d03c4fcd31816c', self.text)
         self.assertNotIn('6376b7727bb9b1d5d37ad3e4d96d969a6499917b', self.text)
 
+    def test_third_party_decisions_and_blockers_are_stated(self):
+        impeccable = next(l for l in self.text.splitlines() if l.startswith('| [Impeccable]'))
+        self.assertIn('not deployed', impeccable)
+        self.assertIn('Release', impeccable)
+        vercel = next(l for l in self.text.splitlines() if l.startswith('| [Vercel `web-design-guidelines`]'))
+        self.assertIn('Not installed', vercel)
+        self.assertIn('main/command.md', vercel)
+        self.assertIn('Layers 4 and 5 are advisory until their tools are deployed', self.text)
+
+    def test_layer_seven_is_a_gate_not_a_rank_and_playwright_route_is_single(self):
+        layer7 = next(l for l in self.text.splitlines() if l.startswith('7. **Rendered verification.**'))
+        self.assertIn('A gate, not a rank', layer7)
+        self.assertNotIn('outranks', self.text)
+        row = next(l for l in self.text.splitlines() if l.startswith('| Render verification'))
+        self.assertIn('@playwright/mcp@latest', row)
+        self.assertIn('non-preferred', row)
+
+    def test_smoke_test_is_documented_as_manual_and_covers_both_widths(self):
+        self.assertTrue((SOURCE / 'tests/ui-smoke.mjs').exists())
+        self.assertIn('not gated in CI', self.text)
+        script = (SOURCE / 'tests/ui-smoke.mjs').read_text()
+        for needle in ('width: 375', 'width: 1280', "reducedMotion: 'reduce'", 'Tab did not reach every control'):
+            self.assertIn(needle, script)
+        self.assertNotIn('https://', script)
+        self.assertIn('Framelink', self.text)
+        self.assertIn('in `.mcp.json` only', self.text)
+
     def test_every_relative_link_resolves(self):
         for target in re.findall(r'\]\((?!https?://|#)([^)#]+)', self.text):
             self.assertTrue((POLICY.parent / target).resolve().exists(), target)

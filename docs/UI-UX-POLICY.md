@@ -14,8 +14,8 @@ Templates: [`DESIGN.md` skeleton](templates/DESIGN.md),
 
 ## Authority order
 
-When two sources disagree, the lower number wins. A third-party skill never
-overrides a higher layer.
+When two sources disagree, the lower number wins among layers 1 to 6. A third-party skill never
+overrides a higher layer. Layers 4 and 5 are advisory until their tools are deployed (see Third-party status); layer 7 is a gate, not a rank.
 
 1. **Product requirements and real users.** Stated requirements, user research, and the people who will actually use the surface.
 2. **Product-owned Design System, brand, and Design Constitution.** The product repository's own tokens, components, and written rules. The reference implementation is `horonomy/horonom-site/design/`: `VISUAL_DESIGN_CONSTITUTION.md`, `MOTION_CONSTITUTION.md`, `ACCESSIBILITY_CONTRACT.md`, and `AI_FRONTEND_CHECKLIST.md`. A repository without these starts from the [`DESIGN.md` skeleton](templates/DESIGN.md).
@@ -23,7 +23,7 @@ overrides a higher layer.
 4. **Impeccable art direction, critique, and refinement.** Preferred direction layer. Status: verified, not deployed (see [Third-party status](#third-party-status)).
 5. **Vercel Web Interface Guidelines review.** A manual review checklist, pinned by commit permalink. Status: skill not deployed (see below).
 6. **Optional references.** Everything listed under [Optional, not installed](#optional-not-installed).
-7. **Rendered verification.** Layers 1 to 6 describe intent; this layer decides whether the built UI actually meets it. Evidence from a rendered page outranks any claim in a document.
+7. **Rendered verification.** A gate, not a rank: layers 1 to 6 set the intent, and this layer checks whether the built UI actually meets it. A rendered failure sends the work back to the layer that was violated; it never changes what that layer requires.
 
 ## Tool roles
 
@@ -32,8 +32,8 @@ overrides a higher layer.
 | Implementation | `frontend-design` plugin (already installed on Claude) | Build with the product's existing components first. |
 | Art direction, critique, refinement | Exactly **one** primary skill per task | Impeccable is the preferred choice once deployed; until then use the product Design Constitution and `frontend-design` guidance. Never stack two art-direction skills on one task. |
 | Guidelines review | [Vercel Web Interface Guidelines at `434b7f9`](https://github.com/vercel-labs/web-interface-guidelines/blob/434b7f91364665f2f733b310ec54809bf8f37937/command.md) | Read as a checklist. Do not fetch the moving `main` copy. |
-| Render verification | Playwright (existing plugin on Claude) | Local screenshots only. |
-| Design source | The official **Figma plugin** (`figma@claude-plugins-official` on Claude, `figma@openai-curated` on Codex) | The one preferred Figma route. Framelink (`figma-developer-mcp`) is **non-preferred**: it duplicates the plugin, is launched with an unpinned `npx -y`, and passes the API key as a command-line argument. It remains configured in `.mcp.json` and `codex/config.toml` only because removal is a separate owner-reviewed change; do not use it when the plugin is available. |
+| Render verification | Playwright (`playwright@claude-plugins-official`, the preferred route on Claude) | Local screenshots only. `.mcp.json` also configures `npx -y @playwright/mcp@latest`; it is unpinned and non-preferred, so use the plugin. |
+| Design source | The official **Figma plugin** (`figma@claude-plugins-official` on Claude, `figma@openai-curated` on Codex) | The one preferred Figma route. Framelink (`figma-developer-mcp`) is **non-preferred**: it duplicates the plugin, is launched with an unpinned `npx -y`, and in `.mcp.json` only passes the API key as a command-line argument (`codex/config.toml` passes it through the environment). It remains configured in `.mcp.json` and `codex/config.toml` only because removal is a separate owner-reviewed change; do not use it when the plugin is available. |
 | Native Apple build and Simulator | XcodeBuildMCP (task-specific, not installed) | See [Platform QA: iOS](#ios). |
 
 ## Anti-generic-AI guidance
@@ -79,7 +79,7 @@ them or commit them.
 A runnable reference is [`tests/ui-smoke.mjs`](../tests/ui-smoke.mjs) with the
 synthetic fixture in [`tests/fixtures/ui-smoke/`](../tests/fixtures/ui-smoke/).
 It needs an already-installed `playwright` package and never downloads a
-browser.
+browser. It is a manual check and is not gated in CI: CI cannot assume Playwright, so only the policy test runs there.
 
 ### iOS
 

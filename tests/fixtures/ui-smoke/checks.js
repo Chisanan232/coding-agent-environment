@@ -9,6 +9,7 @@
     scrollWidth: doc.scrollWidth,
     clientWidth: doc.clientWidth,
     focusedTag: active ? active.tagName : null,
+    focusedLabel: active ? (active.textContent || '').trim().slice(0, 40) : null,
     focusOutlineWidthPx: style ? parseFloat(style.outlineWidth) : 0,
     focusOutlineStyle: style ? style.outlineStyle : 'none',
     runningAnimations: pulse ? pulse.getAnimations().filter((a) => a.playState === 'running').length : -1,
