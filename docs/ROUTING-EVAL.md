@@ -42,3 +42,12 @@ A first pilot attempt ran 8 of 12 arms before an independent review showed it wa
 - **One unsandboxed oracle:** only `t84-refresher-plist`, because its oracle runs `/bin/ps`, a setuid binary `sandbox-exec` cannot exec. It is graded unsandboxed only when the arm's run record exists and carries no network, secret or outside-workdir flag; otherwise grading is refused (fail closed). A test pins that exactly one task is exempt.
 - **Conservative false positives:** Haiku tokens with no recorded agent call invalidate an arm B run (the CLI using Haiku internally would also do that), and source or test text containing words like `socket` or `requests` can flag a run. Both fail toward "not scored", never toward promotion.
 - **Verdict scope:** SUPPORTS compares Sonnet tokens only; Haiku tokens and wall time are reported beside it and drive the cost discussion, not the rule. Operators run arms A, B and C of a task in separate workdirs; the driver script does.
+
+## Pilot result (2026-10-24)
+
+Six tasks, one trial per arm, Claude Code 2.1.306 on the claude.ai first-party route, pinned `claude-sonnet-5-5` and `claude-haiku-5-5`. Verdict under the precommitted rule: **INCONCLUSIVE_KEEP_OPT_IN**. Haiku does not currently justify promotion, and Sonnet main stays the default. Full detail is in Jira SPE-124 comment 28918.
+
+- Arm B (admission policy, worker available) made **0 agent calls and used 0 Haiku tokens in all six tasks**, including the three bounded ones, so no bounded task could support Haiku. The ambiguous task, the high-risk task and the no-delegate control were all declined; the high-risk task was solved by neither arm.
+- Diagnostic arm C (delegation forced) passed oracle and review on the three bounded tasks. Sonnet-side tokens fell (for example t84 cache write 18.5k to 8.8k, output 7.2k to 1.4k) but Haiku added more (t84 Haiku cache read 564k, output 8.2k) and wall time rose on every task (t91 16 to 28 s, t87 15 to 34 s, t84 48 to 66 s). Net plan usage is UNKNOWN.
+- Single-trial variance exceeded any effect: arm A failed the oracle on t87 where B, which did the same thing, passed.
+- Limits: the first attempt was invalid and unused; this pilot's raw streams were not retained and its audit was later narrowed; the `/tmp` alias and secret directories were not denied during it; N=6 cannot show non-inferiority.

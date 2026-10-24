@@ -47,6 +47,14 @@ class ModelRoutingDoc(unittest.TestCase):
         for target in re.findall(r"\]\((?!https?://|#)([^)#]+)", DOC):
             self.assertTrue((ROOT / "docs" / target).resolve().exists(), target)
 
+    def test_the_pilot_figures_cited_have_an_in_repo_source(self):
+        ev = (ROOT / "docs/ROUTING-EVAL.md").read_text()
+        self.assertIn("## Pilot result (2026-10-24)", ev)
+        self.assertIn("INCONCLUSIVE_KEEP_OPT_IN", ev)
+        self.assertIn("0 agent calls and used 0 Haiku tokens in all six tasks", ev)
+        self.assertIn("2.1.287 to 2.1.292", DOC)
+        self.assertIn("(SPE-122, SPE-126)", DOC.splitlines()[0])
+
     def test_worker_boundaries_are_stated(self):
         for phrase in ("never spawns agents", "never merges, publishes, closes tickets", "There is no retry loop"):
             self.assertIn(phrase, DOC)

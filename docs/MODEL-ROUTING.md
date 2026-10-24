@@ -1,4 +1,4 @@
-# Claude Code model routing: Sonnet default, Haiku opt-in (SPE-122)
+# Claude Code model routing: Sonnet default, Haiku opt-in (SPE-122, SPE-126)
 
 Status: evidence-gated. Nothing here is deployed to live configuration, and no Haiku agent is configured anywhere. The baseline is unchanged: Sonnet medium as main, selective Opus high through `opus-architect` ([ADR 0003](adr/0003-model-routing-strategy.md)). Codex routing belongs to SPE-93 ([CODEX-ROUTING.md](CODEX-ROUTING.md)); the engineering contract belongs to SPE-108 and SPE-121. This file adds only the Haiku admission table and the measured context rule.
 
@@ -19,9 +19,11 @@ A task that needs no subagent uses none. A coherent task is not split to create 
 
 ## Worker rules and stops
 
-A Haiku worker is pinned by explicit model id (the `haiku` alias resolved to Haiku 4.5 on Claude Code 2.1.292 and earlier and to Haiku 5.5 on 2.1.306), has the narrowest tools its task needs, never spawns agents, and never merges, publishes, closes tickets, touches credentials or certifies its own work. Sonnet main reviews the result and owns integration, the PR and Jira. The worker stops and returns the observed result, evidence and open decision when requirements are ambiguous, a public contract or schema must change, security or privacy appears, root cause stays unknown, scope grows, a test contradicts the intended behavior, or two targeted repairs fail. There is no retry loop.
+A Haiku worker is pinned by explicit model id (the `haiku` alias resolved to Haiku 4.5 on Claude Code 2.1.287 to 2.1.292 and to Haiku 5.5 on 2.1.306), has the narrowest tools its task needs, never spawns agents, and never merges, publishes, closes tickets, touches credentials or certifies its own work. Sonnet main reviews the result and owns integration, the PR and Jira. The worker stops and returns the observed result, evidence and open decision when requirements are ambiguous, a public contract or schema must change, security or privacy appears, root cause stays unknown, scope grows, a test contradicts the intended behavior, or two targeted repairs fail. There is no retry loop.
 
 ## What was measured
+
+Sources: the pilot figures are in [ROUTING-EVAL.md](ROUTING-EVAL.md#pilot-result-2026-10-24); the start-up and context figures are recorded in Jira (SPE-123 comment 28888 with correction 28890, SPE-127 comment 28923) from session transcripts and live `claude -p` probes on Claude Code 2.1.306, not from a committed script.
 
 - Route: claude.ai subscription, first-party, no proxy. Dollar cost is UNKNOWN: the subscription exposes no per-model weighting and `total_cost_usd` is a list-price estimate.
 - Subagent start-up (first call prompt tokens, median): Sonnet 5.5 about 70k, Opus 5.5 about 38k, Haiku 5.5 about 37k. A scout pays that before it does any work.
