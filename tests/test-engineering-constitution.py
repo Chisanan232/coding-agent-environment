@@ -68,6 +68,36 @@ class IndexOnly(unittest.TestCase):
         self.assertIn("Product-specific style overrides the general default", self.SEC3)
 
 
+class BoundedVerification(unittest.TestCase):
+    SEC6 = DOC.split("## 6.")[1].split("## 7.")[0]
+    SEC7 = DOC.split("## 7.")[1].split("## 8.")[0]
+
+    def test_review_breaker_is_the_founders_two_cycle_rule_not_three(self):
+        self.assertIn("at most two substantive independent review/fix cycles", self.SEC7)
+        self.assertNotIn("three consecutive", self.SEC7)
+
+    def test_ci_policy_is_quoted_verbatim_from_the_policy(self):
+        policy = " ".join((ROOT / "docs/ENGINEERING-POLICY.md").read_text().split())
+        quoted = [l[2:] for l in self.SEC6.splitlines() if l.startswith("> ") and len(l) > 2]
+        self.assertGreaterEqual(len(quoted), 5)
+        text = " ".join(" ".join(quoted).replace("**", "").split())
+        for sentence in ("`CI_PASS` hosted CI executed and passed.", "Unavailable CI is never reported as `CI_PASS`.",
+                         "`LOCAL_EQUIVALENT_PASS` satisfies the corresponding engineering or release gate"):
+            self.assertIn(sentence, text)
+            self.assertIn(sentence, policy.replace("**", ""))
+
+    def test_acceptance_is_golden_user_journey_and_risk_based(self):
+        self.assertIn("Golden User Journey", self.SEC6)
+        self.assertIn("speculative edge-case tests", self.SEC6)
+
+    def test_r2_r3_do_not_exceed_the_policy(self):
+        r2 = [l for l in self.SEC6.splitlines() if l.startswith("| R2")][0]
+        r3 = [l for l in self.SEC6.splitlines() if l.startswith("| R3")][0]
+        self.assertNotIn("independent review of the exact head", r2)
+        self.assertNotIn("hook-recorded ground truth", r3)
+        self.assertIn("where the component can be exercised", r3)
+
+
 class NotASecondSourceOfTruth(unittest.TestCase):
     def test_does_not_restate_what_the_owners_hold(self):
         policy = (ROOT / "docs/ENGINEERING-POLICY.md").read_text()

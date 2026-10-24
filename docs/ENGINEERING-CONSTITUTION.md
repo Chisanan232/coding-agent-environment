@@ -82,24 +82,40 @@ The same rule is not right in every context. State the context, then apply the m
 
 ## 6. Change-risk-based verification
 
-Verification effort follows the blast radius of the change, not its size.
+Verification effort follows the blast radius of the change, not its size. Acceptance is the Golden User Journey (the
+path the user actually takes through the change) plus material correctness; speculative edge-case tests and low-value QA
+are not required. The risk table below sets how much evidence a class of change needs; it does not add gates beyond
+`docs/ENGINEERING-POLICY.md` section 8, and where they differ section 8 wins.
+
+CI states are the founder's own wording, quoted and not paraphrased (`docs/ENGINEERING-POLICY.md` section 8):
+
+> **CI states, never merged into one.** `CI_PASS` hosted CI executed and passed. `CI_UNAVAILABLE_EXTERNAL` hosted
+> jobs never executed because of a verified billing or quota restriction. `LOCAL_EQUIVALENT_PASS` the corresponding
+> commands ran locally and passed against the exact revision. `LOCAL_EQUIVALENT_FAIL` they ran and found defects.
+> `NOT_VERIFIED` no valid evidence. Unavailable CI is never reported as `CI_PASS`. A check that executed and failed
+> is `CI_FAILED` and is never bypassed.
+>
+> For a verified billing or quota outage only, `LOCAL_EQUIVALENT_PASS` satisfies the corresponding engineering or
+> release gate when the local run is sufficiently equivalent.
+
+A repository's own CI contract may add to this (for example waiting for SonarCloud where the repository requires it).
 
 | Risk | Examples | Required evidence |
 |---|---|---|
 | R0 docs, comments | wording, typos | lint, link and reference checks |
 | R1 local logic | one module, no contract change | impacted tests, then the suite before push |
-| R2 shared behavior | multi-module, config, scripts | suite, pre-commit, independent review of the exact head |
-| R3 security, permissions, merge authority, data | rules, hooks, gates, credentials paths | measured on the real component with negative controls, hook-recorded ground truth, independent exact-head review, residuals stated |
+| R2 shared behavior | multi-module, config, scripts | suite, pre-commit, review proportional to risk (`docs/ENGINEERING-POLICY.md` section 8, bounded review) |
+| R3 security, permissions, merge authority, credentials | permission rules, merge gates, credential paths | measured on the real component with negative controls where the component can be exercised, independent exact-head review, residuals stated |
 | R4 release, deploy, production | tags, publish, migrations | everything above plus explicit founder approval of the exact scope and SHA |
 
-Evidence hierarchy, strongest first: ground truth recorded by the system under test (hook events, exit codes, hashes) over automated tests over a model's description of what happened. An emulation of a component (a Python glob for the host matcher) is a regression net, never the measurement: in SPE-118/119 an emulation passed five review rounds while the first real-host positive control failed. A check that could not run is UNKNOWN or BLOCKED, never PASS; a disabled or billing-blocked CI workflow is UNAVAILABLE. Distinguish `DEVELOPMENT_COMPLETE`, `QA_SIGNED_OFF`, `READY_FOR_RELEASE`, `RELEASE_APPROVED`, `RELEASED`.
+Evidence hierarchy, strongest first: ground truth recorded by the system under test (hook events, exit codes, hashes) over automated tests over a model's description of what happened. An emulation of a component (a Python glob for the host matcher) is a regression net, never the measurement: in SPE-118/119 an emulation passed five review rounds while the first real-host positive control failed. A check that could not run is UNKNOWN or BLOCKED, never PASS; a disabled or billing-blocked CI workflow is UNAVAILABLE. Report implemented, simulated or emulated, real-host verified and independently QA'd as separate labels, never as one. Distinguish `DEVELOPMENT_COMPLETE`, `QA_SIGNED_OFF`, `READY_FOR_RELEASE`, `RELEASE_APPROVED`, `RELEASED`.
 
 ## 7. Durable checkpoints and retry circuit breakers
 
 - Persist a checkpoint at each milestone: ticket, PR, branch, exact head SHA, evidence, active background task IDs and result paths, remaining work, blockers with owner and exact resume trigger. No secrets.
 - Recovery is idempotent: verify state against the repository and artifacts, never trust the last message, never repeat completed work.
 - Retries are bounded with backoff. An API outage, usage limit or terminated process is an infrastructure event, not a product failure; its results are discarded or re-run, never scored. A stale marker is not a running process.
-- **Review-loop breaker**: after three consecutive independent reviews that each find a new instance of the same class of defect, stop patching instances. Name the class, present the reproducible evidence and the architectural options, and escalate the decision. (SPE-118: six rounds found six more ways to disguise a flag against a trailing-wildcard allow; the measured conclusion is that the approach cannot be closed by enumeration.)
+- **Review-loop breaker**: the founder's bounded-review rule applies unchanged (`docs/ENGINEERING-POLICY.md` section 8): at most two substantive independent review/fix cycles per coherent candidate; later findings fix Critical and High defects and re-review only the affected area, and Medium and Low hardening becomes follow-ups. The limit never authorizes merging a known Critical or High security defect, and a blocker that persists becomes one decision packet. If two consecutive cycles find new instances of the same class of defect, stop patching instances: name the class, present the reproducible evidence and the architectural options, and escalate. (SPE-118: six rounds found six more ways to disguise a flag against a trailing-wildcard allow; enumeration cannot close that approach.)
 - Never convert a blocked task into a PASS or a wait into an assumption of approval. A task whose owner is the founder is WAIT_OWNER; independent work continues.
 
 ## 8. Multi-agent resource coordination
