@@ -136,9 +136,25 @@ class NotASecondSourceOfTruth(unittest.TestCase):
         for row in open_rows:
             self.assertRegex(row, r"\| OPEN[^|]* \|$")
 
+    def test_citations_name_the_source_that_actually_holds_the_rule(self):
+        row9 = [l for l in DOC.splitlines() if l.startswith("| 9 |")][0]
+        self.assertIn("~/.claude/CLAUDE.md", row9)
+        self.assertIn("feature-branch half", row9)
+        self.assertNotIn("release branches", row9)
+        pr_only = [l for l in DOC.splitlines() if l.startswith("| PR-only")][0]
+        self.assertIn("~/.claude/CLAUDE.md", pr_only)
+        for line in DOC.splitlines():
+            if "PR class" in line:
+                self.assertNotIn("founder-approved", line)
+
+    def test_r2_still_requires_independent_review_and_the_ci_quote_marks_its_truncation(self):
+        r2 = [l for l in DOC.splitlines() if l.startswith("| R2 ")][0]
+        self.assertIn("independent review of every PR", r2)
+        self.assertIn("[…]", DOC)
+
     def test_item_9_forbids_default_branch_pushes_but_keeps_feature_branch_pushes(self):
         row = [l for l in DOC.split("\n## 10. ")[1].splitlines() if l.startswith("| 9 |")][0]
-        self.assertIn("no commit or push to the default or release branches", row)
+        self.assertIn("no commit or push to the default or protected branches", row)
         self.assertIn("pushing a feature branch to open a PR stays autonomous", row)
         self.assertNotIn("remove the quick-fix", row)
 

@@ -14,7 +14,7 @@ This file is the principles, precedence and decision layer. It does not restate 
 | Topic | Canonical owner | Reaches Claude Code via | Reaches Codex via |
 |---|---|---|---|
 | Branch, worktree, commit, PR, validation, merge, cleanup lifecycle | `.claude/skills/engineering-workflow/SKILL.md` | managed skill and the marker span in `~/.claude/CLAUDE.md` | shared skill under `~/.codex/skills` |
-| Autonomy table, mechanism map, what is enforced today, PR classes, workstation profiles | `docs/ENGINEERING-POLICY.md` (founder-approved: PR classes in the engineering-workflow skill, founder correction 2026-10-23) | referenced from the span | referenced from `~/.codex/AGENTS.md` |
+| Autonomy table, mechanism map, what is enforced today, PR classes, workstation profiles | `docs/ENGINEERING-POLICY.md` (owner-approved PR classes: engineering-workflow skill and the Autonomous Pull Request Merge Policy in `~/.claude/CLAUDE.md`, SPE-118 record of 2026-10-23) | referenced from the span | referenced from `~/.codex/AGENTS.md` |
 | Merge gate and owner workflow | `docs/OWNER-MERGE-WORKFLOW.md`, ADR 0013, `scripts/owner-merge-gate.py` | skill | skill |
 | Decision delegation | `decision-delegation` skill, ADR 0014 | span | skill |
 | Resource admission, disk and memory | `docs/RESOURCE-ADMISSION.md`, `docs/MANAGED-RESOURCES.md` | skill | skill |
@@ -31,7 +31,7 @@ From highest to lowest authority:
 
 1. **Host and organization enforcement**: managed settings, sandbox, built-in classifier hard rules, GitHub protection. A denial is binding and is never routed through another tool, shell, subagent or operator (`HARNESS_PERMISSION_BLOCK`).
 2. **The founder's explicit current instruction**, within (1). It does not widen what (1) permits.
-3. **Release and approval gates** in this constitution and the skills (exact-tag founder approval; PR class rules of the engineering-workflow skill and `docs/ENGINEERING-POLICY.md` section 4, founder-approved).
+3. **Release and approval gates** in this constitution and the skills (exact-tag founder approval; PR class rules of the engineering-workflow skill and `docs/ENGINEERING-POLICY.md` section 4; owner-approved per the Autonomous Pull Request Merge Policy in `~/.claude/CLAUDE.md`).
 4. **This constitution and the shared skills.**
 5. **Repository instructions** (`AGENTS.md`, `.claude/CLAUDE.md`) for product constraints.
 6. **User-level legacy text** (`~/.claude/CLAUDE.md` body outside the managed span, `~/.codex/AGENTS.md` local sections).
@@ -47,7 +47,7 @@ This section states no rule of its own. Each principle is owned elsewhere and is
 |---|---|
 | GitEmoji commits; small, cohesive, bisectable commits (a tightly coupled regression test may share its implementation commit, per the founder's commit principle) | `.claude/skills/engineering-workflow/SKILL.md`, "Implement and commit" |
 | Branch and worktree format, verified approved base, one writer per branch | `.claude/skills/engineering-workflow/SKILL.md` |
-| PR-only: no feature work, commit or push on the default or release branches; pushing a feature branch to open a PR is autonomous | `.claude/skills/engineering-workflow/SKILL.md`, `docs/ENGINEERING-POLICY.md` section 1 |
+| PR-only: no feature work, commit or push on the default or protected branches; pushing a feature branch to open a PR is autonomous | default/protected-branch half: `~/.claude/CLAUDE.md` (quick-fix step 5, Push Gate Policy); feature-branch half: `.claude/skills/engineering-workflow/SKILL.md`, `docs/ENGINEERING-POLICY.md` section 1 |
 | Independent review, PR classes A/B/C, exact-head merge, no self-approval | `.claude/skills/engineering-workflow/SKILL.md`, `docs/ENGINEERING-POLICY.md` section 4 |
 | CI states and bounded review | `docs/ENGINEERING-POLICY.md` section 8 (quoted in section 6 below) |
 | Acceptance by Golden User Journey and risk | section 6 below |
@@ -96,7 +96,7 @@ CI states are the founder's own wording, quoted and not paraphrased (`docs/ENGIN
 > is `CI_FAILED` and is never bypassed.
 >
 > For a verified billing or quota outage only, `LOCAL_EQUIVALENT_PASS` satisfies the corresponding engineering or
-> release gate when the local run is sufficiently equivalent.
+> release gate when the local run is sufficiently equivalent. […] (the policy continues: record the exact evidence in the PR and Jira; do not claim hosted CI succeeded.)
 
 A repository's own CI contract may add to this (for example waiting for SonarCloud where the repository requires it).
 
@@ -104,7 +104,7 @@ A repository's own CI contract may add to this (for example waiting for SonarClo
 |---|---|---|
 | R0 docs, comments | wording, typos | lint, link and reference checks |
 | R1 local logic | one module, no contract change | impacted tests, then the suite before push |
-| R2 shared behavior | multi-module, config, scripts | suite, pre-commit, review proportional to risk (`docs/ENGINEERING-POLICY.md` section 8, bounded review) |
+| R2 shared behavior | multi-module, config, scripts | suite, pre-commit, independent review of every PR per the engineering-workflow skill, bounded by `docs/ENGINEERING-POLICY.md` section 8; R3 adds exact-head review |
 | R3 security, permissions, merge authority, credentials | permission rules, merge gates, credential paths | measured on the real component with negative controls where the component can be exercised, independent exact-head review, residuals stated |
 | R4 release, deploy, production | tags, publish, migrations | everything above plus explicit founder approval of the exact scope and SHA |
 
@@ -146,7 +146,7 @@ Each row is settled by a source cited here; the interim behavior is simply the r
 | 6 | Merge strategy | merge commit only; the legacy lines that let a repository choose squash/rebase are defects fixed by the owner-run rollout | live managed span; `.claude/skills/engineering-workflow/SKILL.md`; founder instruction 2026-10-23 |
 | 7 | Code-owner and formal approval | Class A owner-authored: no formal GitHub approval merely for authorship. Class B/C: genuine owner `APPROVED` on the current head. No self-approval, no `--admin`, squash or rebase; a host denial is reported, never bypassed | `docs/ENGINEERING-POLICY.md` section 4; `.claude/skills/engineering-workflow/SKILL.md` merge gate |
 | 8 | Commit granularity | small, cohesive, atomic commits; a tightly coupled regression test may share its implementation commit | founder commit principle; `.claude/skills/engineering-workflow/SKILL.md` |
-| 9 | Direct push | no commit or push to the default or release branches; pushing a feature branch to open a PR stays autonomous. The Codex blanket `git push` allow is managed config: owner item, reported only | `.claude/skills/engineering-workflow/SKILL.md`; `docs/ENGINEERING-POLICY.md` section 1 |
+| 9 | Direct push | no commit or push to the default or protected branches; pushing a feature branch to open a PR stays autonomous. The Codex blanket `git push` allow is managed config: owner item, reported only | default/protected half: `~/.claude/CLAUDE.md` (quick-fix step 5, Push Gate Policy); feature-branch half: `.claude/skills/engineering-workflow/SKILL.md`, `docs/ENGINEERING-POLICY.md` section 1 |
 | 10 | Enforcement claims | claim only what `docs/ENGINEERING-POLICY.md` section 3 lists as enforced; everything else is advisory text | `docs/ENGINEERING-POLICY.md` section 3 |
 | 11 | Worktree directory name | `<repo>-<phase>-<ticket>-<type>-<summary>` once item 1 is as above | `.claude/skills/engineering-workflow/SKILL.md` worktree formula |
 | 12 | Release approval | tagging, publishing and production deployment need separate authorization of the exact tag, SHA and scope | `docs/ENGINEERING-POLICY.md` sections 1 and 8 |
