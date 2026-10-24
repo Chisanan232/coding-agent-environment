@@ -138,6 +138,7 @@ jobs:
           python3 tests/test-owner-merge-autonomy.py
           python3 tests/test-owner-merge-runner.py
           python3 tests/test-branch-protection-rollout.py
+          python3 tests/test-routing-eval.py
           python3 tests/test-pr-merge-policy.py
           python3 tests/test-merge-decision.py
           python3 tests/test-ask-first-apply.py
