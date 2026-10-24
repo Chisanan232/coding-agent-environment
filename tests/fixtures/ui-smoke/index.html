@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UI smoke fixture</title>
+<style>
+  :root { color-scheme: light dark; --bg: #fafafa; --fg: #1a1a1a; --accent: #0b5fff; --card: #ffffff; --border: #d4d4d8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121214; --fg: #f4f4f5; --accent: #7aa2ff; --card: #1c1c1f; --border: #3f3f46; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  .skip { position: absolute; left: 8px; top: -48px; background: var(--accent); color: #fff; padding: 8px 12px; border-radius: 6px; }
+  .skip:focus-visible { top: 8px; outline: 3px solid var(--fg); outline-offset: 2px; }
+  header, main { max-width: 64rem; margin: 0 auto; padding: 16px; }
+  nav { display: flex; flex-wrap: wrap; gap: 8px; }
+  a, button { color: var(--accent); }
+  a:focus-visible, button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(16rem, 100%), 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; overflow-wrap: anywhere; }
+  .pulse { display: inline-block; width: 12px; height: 12px; border-radius: 50%; background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { transform: scale(1.6); opacity: .5; } }
+  @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+  button { font: inherit; padding: 8px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); min-height: 44px; }
+</style>
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header>
+  <h1>Synthetic status board</h1>
+  <nav aria-label="Primary">
+    <a href="#overview">Overview</a>
+    <a href="#activity">Activity</a>
+    <a href="#settings">Settings</a>
+  </nav>
+</header>
+<main id="content">
+  <p><span class="pulse" aria-hidden="true"></span> Live demo data, no real content.</p>
+  <div class="grid">
+    <section class="card" id="overview"><h2>Overview</h2><p>Three synthetic cards demonstrate wrapping at narrow widths, including averyveryveryverylongunbrokenidentifierthatmustwrapinsideitscardwithoutscrolling.</p><button type="button">Primary action</button></section>
+    <section class="card" id="activity"><h2>Activity</h2><p>Nothing happened. This is a fixture.</p><button type="button">Secondary action</button></section>
+    <section class="card" id="settings"><h2>Settings</h2><p>Controls keep a 44 pixel minimum target.</p><button type="button">Save</button></section>
+  </div>
+</main>
+</body>
+</html>
