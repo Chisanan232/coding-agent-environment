@@ -43,7 +43,7 @@ class ResolvedBySource(unittest.TestCase):
     def test_head_says_only_open_items_need_the_founder(self):
         head = DOC.split("\n## 1.")[0]
         self.assertIn("RESOLVED-BY-SOURCE", head)
-        self.assertIn("Only the items still", head)
+        self.assertIn("no\nitem is OPEN", head)
 
 
 class IndexOnly(unittest.TestCase):
@@ -126,15 +126,14 @@ class NotASecondSourceOfTruth(unittest.TestCase):
         sec = DOC.split("\n## 10. ")[1].split("\n## 11. ")[0]
         resolved = sec.split("### 10.2")[0]
         rows = [l for l in resolved.splitlines() if re.match(r"\| \d+ \|", l)]
-        self.assertEqual([int(re.match(r"\| (\d+)", r).group(1)) for r in rows], list(range(1, 15)))
+        self.assertEqual([int(re.match(r"\| (\d+)", r).group(1)) for r in rows], list(range(1, 16)))
         for row in rows:
             self.assertRegex(row, r"\| [^|]*(`[^`]+`|ADR \d+|founder|live)[^|]* \|$")   # every resolution carries a citation
             self.assertNotIn("OPEN", row)
         packet = sec.split("### 10.2")[1].split("### 10.3")[0]
-        open_rows = [l for l in packet.splitlines() if re.match(r"\| (\d+a?) \|", l)]
-        self.assertEqual([re.match(r"\| (\d+a?)", r).group(1) for r in open_rows], ["15", "1a"])
-        for row in open_rows:
-            self.assertRegex(row, r"\| OPEN[^|]* \|$")
+        self.assertEqual([l for l in packet.splitlines() if l.startswith("|")], [])  # no decision table remains
+        self.assertIn("None.", packet)
+        self.assertNotIn("OPEN |", DOC)
 
     def test_citations_name_the_source_that_actually_holds_the_rule(self):
         row9 = [l for l in DOC.splitlines() if l.startswith("| 9 |")][0]
@@ -161,6 +160,21 @@ class NotASecondSourceOfTruth(unittest.TestCase):
     def test_policy_is_not_called_proposed(self):
         for stale in ("proposed reference", "not an adopted", "not yet adopted", "a proposed reference"):
             self.assertNotIn(stale, DOC)
+
+    def test_secret_rule_is_invariant_only_and_stores_no_secret(self):
+        sec = DOC.split("### Secret handling: invariants only")[1].split("\n## 10.")[0]
+        for phrase in ("opaque capability", "length, an exit code, a boolean", "pipe or stdin", "recommend rotation",
+                       "stores no secret", "provisioning recipes"):
+            self.assertIn(phrase, sec)
+        self.assertEqual(len(re.findall(r"(?m)^\d\. ", sec)), 5)
+        self.assertNotRegex(sec, r"(gcloud|neonctl|sync-neon|horonom|openssl|/Users/)")  # no recipes, tools or personal paths
+
+    def test_branch_format_is_preserved_and_the_skill_gap_goes_to_its_owner(self):
+        row1 = [l for l in DOC.splitlines() if l.startswith("| 1 |")][0]
+        self.assertIn("<release-or-phase>/<ticket>/<type>/<summary>", row1)
+        self.assertIn("product-specific exception", row1)
+        self.assertIn("SPE-108 owner", row1)
+        self.assertIn("<phase>/<ticket>/<type>/<summary>", DOC.split("### 10.3")[1])
 
     def test_codex_is_not_said_to_lack_the_secrets_invariant(self):
         self.assertNotIn("Codex has no equivalent", DOC)

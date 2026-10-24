@@ -4,8 +4,9 @@ Status: **draft for founder review. Nothing here is deployed and no live behavio
 baseline text referenced by the 2026-10-22 directive was not present in the session; this draft is built only from
 policy that already exists (sources in section 1) and from measured evidence. When the baseline text is provided it
 is merged here, not placed beside this file. Items that an existing founder-approved source already settles are
-recorded as RESOLVED-BY-SOURCE in section 10 with their citation and are not founder decisions. Only the items still
-marked OPEN there need the founder.
+recorded as RESOLVED-BY-SOURCE in section 10 with their citation and are not founder decisions. The two items that were
+new (secrets rule delivery, branch type segment) were decided by the founder on 2026-10-24 and are applied below, so no
+item is OPEN; one follow-up belongs to the SPE-108 owner (section 10.3).
 
 ## 1. One source of truth, by topic
 
@@ -19,7 +20,7 @@ This file is the principles, precedence and decision layer. It does not restate 
 | Decision delegation | `decision-delegation` skill, ADR 0014 | span | skill |
 | Resource admission, disk and memory | `docs/RESOURCE-ADMISSION.md`, `docs/MANAGED-RESOURCES.md` | skill | skill |
 | Personal and corporate profiles | `docs/PROFILES.md`, `docs/ROLLOUT-CORPORATE-PROFILE.md`, workstation-policy tooling | launcher, managed settings | launcher, managed config |
-| Secrets | `~/.claude/rules/secret-handling.md` (live-only today; publication is open, section 10, item 15) | `@` import | the opaque-capability invariant is already in `codex/AGENTS.md`; the full provisioning rule is not delivered |
+| Secrets | `~/.claude/rules/secret-handling.md` (provisioning recipes stay live-only; the invariants are published in section 9, decided 2026-10-24) | `@` import | the opaque-capability invariant is already in `codex/AGENTS.md`; the full provisioning rule is not delivered |
 | Product constraints | each repository's own `AGENTS.md` / `.claude/CLAUDE.md` | project file | project file |
 
 A repository file may add product constraints and may be stricter; it must not restate lifecycle rules, it points here.
@@ -130,6 +131,17 @@ Evidence hierarchy, strongest first: ground truth recorded by the system under t
 
 Personal and corporate profiles stay separate (`docs/PROFILES.md`). Corporate restrictions are never weakened, overridden or routed through a personal service, and live in managed settings or a private overlay outside this repository. Credentials, authentication, model routing and sensitive host configuration are never overwritten by a rollout. Secrets are opaque capabilities: used, never read or printed. Protected settings are changed only by the owner through a hash-pinned, backed-up, reversible procedure.
 
+### Secret handling: invariants only (founder decision 2026-10-24)
+
+This section carries the invariants and nothing else. It stores no secret and names no personal infrastructure; provisioning recipes, tool names and destinations stay in each user's private rule.
+
+1. A secret is an opaque capability. It may be used (passed to the client or library that consumes it) and its presence may be checked; its value is never read, printed, echoed, logged, expanded into a command, committed, or placed in a ticket, PR, chat or file.
+2. A presence check must be one whose output cannot contain the value: a length, an exit code, a boolean.
+3. A permitted transfer moves a provider-derived or agent-generated non-production credential from source to destination through a pipe or stdin, so the value never enters model context, output, history or tracked files. It is verified afterwards only by application behavior or non-sensitive metadata, never by reading the value back.
+4. Human-origin, customer, billing and production credentials stay under their project's ownership policy; this rule does not loosen it.
+5. If a value is exposed anyway, stop using it, say so plainly, and recommend rotation.
+
+Sources: `codex/AGENTS.md` (the opaque-capability invariant, already delivered to Codex) and the global Safe Implementation Policy in `~/.claude/CLAUDE.md`.
 ## 10. Resolved by existing source, and the owner packet
 
 ### 10.1 Resolved by existing founder-approved source (not founder decisions)
@@ -138,7 +150,7 @@ Each row is settled by a source cited here; the interim behavior is simply the r
 
 | # | Topic | Resolution | Citation |
 |---|---|---|---|
-| 1 | Branch name | `<release-or-phase>/<ticket>/<type>/<summary>`; a phase prefix only where the repository uses one | founder worktree/branch principle; live `~/.claude/CLAUDE.md` Git Worktree Workflow. The skill text disagrees (see 10.2, item 1a) |
+| 1 | Branch name | `<release-or-phase>/<ticket>/<type>/<summary>`; a phase prefix only where the repository uses one | founder decision 2026-10-24 preserving this format; live `~/.claude/CLAUDE.md` Git Worktree Workflow. A repository's own established style is a product-specific exception resolved by the precedence in section 2 and the product-style override in section 3. The skill text still says there is no type segment (follow-up for the SPE-108 owner, section 10.3) |
 | 2 | Commit subject | the skill's parenthesised scope `<emoji> (<scope>):` is the general default; a repository with an established style keeps it and history is not rewritten | `.claude/skills/engineering-workflow/SKILL.md` "Implement and commit"; product-style override (section 3) |
 | 3 | PR title | follows item 2 | `.claude/skills/engineering-workflow/SKILL.md` PR title section |
 | 4 | Subagent ceiling | 7. The 8 in the live Codex files is stale; managed config is reported, not edited here | `.claude/skills/engineering-workflow/SKILL.md` Delegation; `docs/DEPLOY-SPE-108.md` |
@@ -152,19 +164,15 @@ Each row is settled by a source cited here; the interim behavior is simply the r
 | 12 | Release approval | tagging, publishing and production deployment need separate authorization of the exact tag, SHA and scope | `docs/ENGINEERING-POLICY.md` sections 1 and 8 |
 | 13 | Duplicated prose | one owner per topic; this file is an index (sections 1 and 3), not a fourth principles layer | founder one-canonical-layer principle |
 | 14 | CI definition | the CI states of `docs/ENGINEERING-POLICY.md` section 8, quoted in section 6 | `docs/ENGINEERING-POLICY.md` section 8 |
+| 15 | Secrets rule delivery | a sanitized, invariant-only rule is published in section 9; provisioning recipes stay private and no secret is stored | founder decision 2026-10-24; `codex/AGENTS.md`; global Safe Implementation Policy in `~/.claude/CLAUDE.md` |
 
-### 10.2 Owner packet: genuinely new decisions
+### 10.2 Founder decisions still open
 
-| # | Topic | Options | Recommended | State |
-|---|---|---|---|---|
-| 15 | Secrets rule delivery. The invariant (secrets are opaque capabilities, presence-only checks) is already in `codex/AGENTS.md` and the live Claude rule; only the full provisioning rule is live-only, and it names personal infrastructure | A: keep live-only, no repository change. B: add a sanitized, invariant-only rule to the repository and keep provisioning recipes private | B | OPEN |
-| 1a | Skill wording for the branch type segment (item 1): the skill says there is no change-type segment and `docs/DEPLOY-SPE-108.md` asserts the same, which disagrees with the founder's format | change the skill and its acceptance probe to include the type segment; the fix belongs to SPE-108's owner, not this file | change | OPEN (SPE-108 owner) |
-
-Interim until answered: item 15 stays live-only; branch names keep the type segment. Only these two items need the founder or the SPE-108 owner.
+None. Item 15 and the branch type segment (item 1) were decided on 2026-10-24 and are recorded in 10.1.
 
 ### 10.3 Not edited by this change
 
-The engineering-workflow skill, `codex/AGENTS.md`, `.claude/CLAUDE.md`, the SPE-108 scripts and the live `~/.claude` and `~/.codex` files belong to SPE-108, SPE-93 or the owner-run rollout. Mismatches found here (subagent ceiling 8, legacy commit-title and merge lines, `github` MCP sentence, duplicated hooks in Codex) are reported to those owners.
+The engineering-workflow skill, `codex/AGENTS.md`, `.claude/CLAUDE.md`, the SPE-108 scripts and the live `~/.claude` and `~/.codex` files belong to SPE-108, SPE-93 or the owner-run rollout. Mismatches found here (the skill and `docs/DEPLOY-SPE-108.md` saying branches have no change-type segment, which the founder format `<phase>/<ticket>/<type>/<summary>` contradicts; subagent ceiling 8, legacy commit-title and merge lines, `github` MCP sentence, duplicated hooks in Codex) are reported to those owners.
 
 ## 11. Harness integration facts (verified or not)
 
