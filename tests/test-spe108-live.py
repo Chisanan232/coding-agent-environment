@@ -367,6 +367,10 @@ class LiveScripts(unittest.TestCase):
             self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
             self.assertIn("must not be inside", done.stderr)
             self.assertFalse(inside.exists() and any(inside.iterdir()))
+        dotdot = self.run_script("bash", script, "--repo", str(self.repo), "--ledger", str(ledger), "--keep-dir",
+                                 str(Path(self.temp.name) / "new/../../.claude/x"), ok=False)
+        self.assertEqual(dotdot.returncode, 2)
+        self.assertIn("must not contain ..", dotdot.stderr)
 
 
 if __name__ == "__main__":
