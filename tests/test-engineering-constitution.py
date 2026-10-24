@@ -46,6 +46,28 @@ class ResolvedBySource(unittest.TestCase):
         self.assertIn("Only the items still", head)
 
 
+class IndexOnly(unittest.TestCase):
+    SEC3 = DOC.split("## 3.")[1].split("## 4.")[0]
+
+    def test_section_3_is_a_pointer_table_with_no_rule_of_its_own(self):
+        self.assertIn("states no rule of its own", self.SEC3)
+        rows = [l for l in self.SEC3.splitlines() if l.startswith("| ") and not l.startswith("| Principle") and not l.startswith("|---")]
+        self.assertGreaterEqual(len(rows), 10)
+        for row in rows:
+            self.assertEqual(row.count("|"), 3, row)   # principle | owner, no third layer of prose
+        for restated in ("--match-head-commit", "one worktree per ticket", "a shared GitHub identity"):
+            self.assertNotIn(restated, self.SEC3)
+
+    def test_commit_principle_names_the_coupled_test_exception_by_reference(self):
+        self.assertIn("tightly coupled regression test may share", self.SEC3)
+
+    def test_pr_only_does_not_forbid_feature_branch_pushes(self):
+        self.assertIn("pushing a feature branch to open a PR is autonomous", self.SEC3)
+
+    def test_product_style_override_is_stated(self):
+        self.assertIn("Product-specific style overrides the general default", self.SEC3)
+
+
 class NotASecondSourceOfTruth(unittest.TestCase):
     def test_does_not_restate_what_the_owners_hold(self):
         policy = (ROOT / "docs/ENGINEERING-POLICY.md").read_text()
