@@ -15,10 +15,11 @@ SECTIONS = ["One source of truth, by topic", "Instruction precedence and conflic
 
 
 class Structure(unittest.TestCase):
-    def test_declares_draft_and_the_missing_baseline(self):
+    def test_status_is_reconciled_not_draft_and_not_a_deployment_claim(self):
         head = DOC.split("\n## 1.")[0]
-        self.assertIn("DRAFT", head)
-        self.assertIn("Nothing here is deployed", head)
+        self.assertNotIn("DRAFT", head)
+        self.assertIn("merged to main", head)
+        self.assertIn("not a deployment", " ".join(head.split()))
         self.assertIn("baseline", head)
 
     def test_has_every_required_section_in_order(self):
@@ -43,7 +44,7 @@ class ResolvedBySource(unittest.TestCase):
     def test_head_says_only_open_items_need_the_founder(self):
         head = DOC.split("\n## 1.")[0]
         self.assertIn("RESOLVED-BY-SOURCE", head)
-        self.assertIn("no\nitem is OPEN", head)
+        self.assertIn("no item is OPEN", " ".join(head.split()))
 
 
 class IndexOnly(unittest.TestCase):
@@ -169,12 +170,12 @@ class NotASecondSourceOfTruth(unittest.TestCase):
         self.assertEqual(len(re.findall(r"(?m)^\d\. ", sec)), 5)
         self.assertNotRegex(sec, r"(gcloud|neonctl|sync-neon|horonom|openssl|/Users/)")  # no recipes, tools or personal paths
 
-    def test_branch_format_is_preserved_and_the_skill_gap_goes_to_its_owner(self):
+    def test_branch_format_is_preserved_and_the_skill_now_states_it(self):
         row1 = [l for l in DOC.splitlines() if l.startswith("| 1 |")][0]
         self.assertIn("<release-or-phase>/<ticket>/<type>/<summary>", row1)
         self.assertIn("product-specific exception", row1)
-        self.assertIn("SPE-108 owner", row1)
-        self.assertIn("<phase>/<ticket>/<type>/<summary>", DOC.split("### 10.3")[1])
+        self.assertIn("ticket-pickup-check", row1)
+        self.assertNotIn("no type segment", DOC)
 
     def test_codex_is_not_said_to_lack_the_secrets_invariant(self):
         self.assertNotIn("Codex has no equivalent", DOC)

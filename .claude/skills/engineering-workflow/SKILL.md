@@ -34,18 +34,19 @@ itself is a gate, not an integration error. A host permission or classifier deni
 (`HARNESS_PERMISSION_BLOCK`): do not wrap, split or reroute it, never retry it through another interface, and
 report the exact operator command. Never approve a PR with the account that authored it.
 
-Name a ticket branch with no change-type segment:
+Name a ticket branch with a change-type segment:
 
 ```
-<version-or-phase>/<ticket-id>/<short_summary>
+<version-or-phase>/<ticket-id>/<type>/<short_summary>
 ```
 
-Keep the summary at 2-4 snake_case words and 30 characters or fewer. Resolve the
+`<type>` is one of `feat`, `fix`, `refactor`, `test`, `docs`, `config`, `deps`, `remove`, `lint`. A repository whose
+established branch style differs keeps it (product-specific override). Keep the summary at 2-4 snake_case words and 30 characters or fewer. Resolve the
 version/phase and ticket from the authoritative tracker or established local
 context; do not invent them.
 
 Create the worktree as a sibling of the main checkout. Derive its directory name
-from the branch by replacing `/` with `-`: `<repo>-<phase>-<ticket>-<summary>`.
+from the branch by replacing `/` with `-`: `<repo>-<phase>-<ticket>-<type>-<summary>`.
 
 ## Implement and commit
 

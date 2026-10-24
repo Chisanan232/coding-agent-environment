@@ -54,10 +54,10 @@ pass before `dev-impl-loop` begins.
 10. If unassigned or owned by the current authorized identity: proceed to Check 4.
 
 ### Check 4 — Branch, worktree, self-assign, and state transition
-11. Derive the branch name with no change-type segment, as owned by
+11. Derive the branch name with a change-type segment, as owned by
     `engineering-workflow`:
     ```
-    <version-or-phase>/<ticket-id>/<short_summary>
+    <version-or-phase>/<ticket-id>/<type>/<short_summary>
     ```
     - `<version-or-phase>`: for `legacy_uncoordinated`, resolve the existing
       `$ENGINEERING_CURRENT_RELEASE` env/marker precedence, then the ticket's
@@ -66,17 +66,18 @@ pass before `dev-impl-loop` begins.
       Never consult legacy markers when status is `managed` or `unavailable`.
       Store the selected prefix in `RELEASE`. Examples: `v0.1.0`, `phase1`, `sprint3`.
     - `<ticket-id>`: exact ticket reference (e.g., `TEST-1`, `PROJ-123`, `42`).
+    - `<type>`: `feat`, `fix`, `refactor`, `test`, `docs`, `config`, `deps`, `remove` or `lint`.
     - `<short_summary>`: 2-4 words from the ticket title in `snake_case`, max 30 characters.
-    - Examples: `v0.1.0/TEST-1/add_new_endpoint`, `phase1/PROJ-123/auth_token_refresh`
+    - Examples: `v0.1.0/TEST-1/feat/add_new_endpoint`, `phase1/PROJ-123/fix/auth_token_refresh`
 
 12. Create a git worktree and branch for this ticket:
     ```bash
     REPO_ROOT=$(git rev-parse --show-toplevel)
     REPO_NAME=$(basename "$REPO_ROOT")
-    BRANCH_NAME="[version-or-phase]/[ticket-id]/[short_summary]"
-    # e.g. v0.1.0/TEST-1/add_new_endpoint
+    BRANCH_NAME="[version-or-phase]/[ticket-id]/[type]/[short_summary]"
+    # e.g. v0.1.0/TEST-1/feat/add_new_endpoint
 
-    # Worktree path <repo>-<phase>-<ticket>-<summary>: replace '/' with '-'
+    # Worktree path <repo>-<phase>-<ticket>-<type>-<summary>: replace '/' with '-'
     WORKTREE_SUFFIX=$(echo "$BRANCH_NAME" | tr '/' '-')
     WORKTREE_PATH="${REPO_ROOT}/../${REPO_NAME}-${WORKTREE_SUFFIX}"
 
