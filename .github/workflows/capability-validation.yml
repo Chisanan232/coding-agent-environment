@@ -43,6 +43,8 @@ on:
       - 'scripts/codex-routing.py'
       - 'scripts/verify-codex-routing.py'
       - 'scripts/visual-skills.py'
+      - 'docs/UI-UX-POLICY.md'
+      - 'docs/templates/**'
       - 'tests/**'
       - 'docs/examples/**'
       - 'bin/**'
@@ -91,6 +93,8 @@ on:
       - 'scripts/codex-routing.py'
       - 'scripts/verify-codex-routing.py'
       - 'scripts/visual-skills.py'
+      - 'docs/UI-UX-POLICY.md'
+      - 'docs/templates/**'
       - 'tests/**'
       - 'bin/**'
       - '.github/workflows/capability-validation.yml'
@@ -121,6 +125,7 @@ jobs:
           python3 tests/test-full-parity-install.py
           python3 tests/test-codex-routing.py
           python3 tests/test-visual-skills.py
+          python3 tests/test-ui-ux-policy.py
           python3 tests/test-storage-integration.py
           python3 tests/test-statusline-composition.py
           python3 tests/test-statusline-install.py
