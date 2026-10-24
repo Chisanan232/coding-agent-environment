@@ -6,7 +6,12 @@
     "A": "Sonnet direct: one headless session does the whole task.",
     "B": "Sonnet orchestrator plus one bounded Haiku worker defined only for the run, pinned to an explicit model id."
   },
-  "task_classes": ["bounded", "ambiguous", "high_risk", "control"],
+  "task_classes": [
+    "bounded",
+    "ambiguous",
+    "high_risk",
+    "control"
+  ],
   "expected_haiku": {
     "bounded": "may_delegate",
     "ambiguous": "decline",
@@ -16,21 +21,45 @@
   "accepted_outcome": {
     "oracle_passes": true,
     "independent_review_critical_high": 0,
+    "reviewer_says_correct": true,
     "changes_in_owned_scope": true,
-    "note": "A review finding that the result is correct but differs from the original is adjudicated by the reviewer, not rejected automatically."
+    "non_empty_change": true,
+    "oracle_modes": {
+      "overlay": "original test files copied over the result and run in a sandbox",
+      "own_tests": "original change touched only tests, so the arm's own tests are run",
+      "review_only": "no oracle command; reviewer judgement and scope only"
+    },
+    "note": "A reviewer finding that the result is correct but a name-coupled oracle fails it (oracle_coupled) is adjudicated in favour of the reviewer. A missing, errored or timed-out step is never accepted."
   },
   "usage_vector": {
-    "per_model_kinds": ["fresh_input", "cache_write", "cache_read", "output"],
-    "also": ["wall_ms", "num_turns", "worker_attempts"],
-    "money": "UNKNOWN. total_cost_usd from the CLI is a list-price estimate, never a bill; subscription utilization is not exposed per run."
+    "per_model_kinds": [
+      "fresh_input",
+      "cache_write",
+      "cache_read",
+      "output"
+    ],
+    "also": [
+      "wall_ms",
+      "num_turns",
+      "worker_attempts"
+    ],
+    "money": "UNKNOWN. total_cost_usd from the CLI is a list-price estimate, never a bill; subscription utilization is not exposed per run.",
+    "accounting": "modelUsage is trusted only if it shows Haiku whenever the main thread called an agent; otherwise the stream's sidechain usage is merged and labelled, and if neither shows it the accounting is 'unverified' and the task cannot support Haiku"
   },
   "decision_rule": {
-    "task_supports_haiku": "accepted AND Sonnet tokens in arm B <= arm A for every one of the four kinds",
-    "task_inconclusive": "accepted AND Sonnet tokens lower on some kinds but not all",
+    "task_supports_haiku": "accepted in both arms AND arm B actually delegated to the worker (agent call recorded) AND its Haiku usage was captured AND Sonnet tokens in arm B <= arm A for every one of the four kinds",
+    "task_inconclusive": "anything else with both arms accepted, including no delegation or Haiku usage that could not be captured (accounting unverified)",
     "task_rejects_haiku": "arm B not accepted while arm A accepted",
-    "decline_cases": "arm B passes only if it used zero Haiku tokens (the orchestrator declined or escalated)",
-    "pilot_verdicts": ["NO_HAIKU", "INCONCLUSIVE_KEEP_OPT_IN", "OPT_IN_CANDIDATE"],
-    "promotion": "never from a pilot. Fewer than 30 paired tasks cannot show non-inferiority; the provisional 5 percentage-point first-pass margin is evaluated only at 30 or more paired tasks."
+    "decline_cases": "arm B passes only if it made no agent call and used zero Haiku tokens AND was accepted; delegating at all is a failure; failing without delegating is inconclusive, not a delegation failure",
+    "pilot_verdicts": [
+      "NO_HAIKU",
+      "INCONCLUSIVE_KEEP_OPT_IN",
+      "OPT_IN_CANDIDATE"
+    ],
+    "promotion": "never from a pilot. Fewer than 30 paired tasks cannot show non-inferiority; the provisional 5 percentage-point first-pass margin is evaluated only at 30 or more paired tasks.",
+    "task_not_cheaper": "accepted in both arms, delegated, and Sonnet tokens in arm B higher than arm A on all four kinds",
+    "task_invalid": "arm B called any agent other than the pinned worker",
+    "pilot_verdict_rules": "NO_HAIKU if any decline task delegated or any bounded task rejects Haiku; OPT_IN_CANDIDATE only if every pilot task is scored, at least two bounded tasks all support Haiku, and every decline task passed; anything else INCONCLUSIVE_KEEP_OPT_IN"
   },
   "hard_gates": [
     "zero known critical security, data-loss or contract regressions",
@@ -49,6 +78,16 @@
   "isolation": {
     "workdir": "git archive of the task's base revision into a fresh one-commit repository, so no future history is reachable",
     "external_writes": "none; no Jira, Slack, GitHub write or merge from any arm",
-    "claude_flags": ["--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"]
-  }
+    "claude_flags": [
+      "--strict-mcp-config",
+      "--disable-slash-commands",
+      "--no-session-persistence"
+    ],
+    "denied_paths": "arms may not read, search or write under ~/Bryant-Developments or ~/.claude (merged solutions, oracle tests, past transcripts); workdirs must live elsewhere",
+    "oracle_sandbox": "agent-authored test code runs under macOS sandbox-exec: no network, writes only inside the scratch directory",
+    "models": "Sonnet and Haiku are pinned by explicit id and the resolved ids are recorded",
+    "settings": "--setting-sources project, so personal hooks and allow rules do not load into either arm",
+    "run_order": "recorded per run and alternated across tasks because the second arm benefits from a warm prompt cache"
+  },
+  "amendment": "Amended once after independent review of PR 129 and before any arm was run: verdict semantics tightened (see decision_rule), isolation and oracle modes added. No result existed when this was changed."
 }
