@@ -55,6 +55,14 @@ class ModelRoutingDoc(unittest.TestCase):
         self.assertIn("2.1.287 to 2.1.292", DOC)
         self.assertIn("(SPE-122, SPE-126)", DOC.splitlines()[0])
 
+    def test_decided_stance_is_recorded_and_the_pilot_is_not_presented_as_secure_isolation(self):
+        self.assertIn("deferred until a narrower pilot shows that delegation actually happens", DOC)
+        self.assertIn("Haiku delegation is not activated globally", DOC)
+        ev = (ROOT / "docs/ROUTING-EVAL.md").read_text()
+        self.assertIn("is not evidence of secure isolation", ev)
+        self.assertIn("does not block network access", ev)
+        self.assertIn("no expansion to 30 or more paired trials", ev)
+
     def test_worker_boundaries_are_stated(self):
         for phrase in ("never spawns agents", "never merges, publishes, closes tickets", "There is no retry loop"):
             self.assertIn(phrase, DOC)
