@@ -77,28 +77,67 @@ after install means the session did not load the policy: check `sync-check.sh --
 
 ## Live deployment order (operator scripts in `scripts/spe108-live/`)
 
-The scripts never print policy text. They were reviewed independently in three rounds. Run them from a
-clean checkout whose `HEAD` equals `origin/main` after `git fetch` (so it contains the managed-span change);
-`build-overlay.py` refuses anything else.
+The scripts never print policy text. Run them from a clean checkout whose `HEAD` equals `origin/main` after
+`git fetch` (`build-overlay.py` refuses anything else). Retiring the legacy sections is **optional**: zero
+managed drift and a correct effective contract do not need it, and it never runs without a lossless proof.
 
-1. Back up `~/.claude/CLAUDE.md` and `rules/*.md` (Preconditions above).
+### The disposition ledger (local only)
+
+`$CODING_AGENT_LOCAL_BASELINE_DIR/claude/policy-ledger.tsv` (default
+`~/.config/coding-agent-environment/local/baseline/claude/`), mode 0600, never committed. One tab-separated
+row per live policy line: `L:<12 hex hash>  DISPOSITION  citation  [replacement]`. It holds hashes, never
+text; the optional replacement is a PUBLIC canonical line. Dispositions (a line is classified by meaning,
+never by text similarity):
+
+| Disposition | Meaning | Citation |
+|---|---|---|
+| `SEMANTICALLY_PRESERVED` | the approved rule states the same obligation | `repo/path:line` in the pinned checkout |
+| `PRESERVE_IN_PRIVATE_OVERLAY` | unique founder text; must still exist after migration | the nearest canonical line |
+| `SUPERSEDED_BY_APPROVED_RULE` | an approved rule replaces it (a replacement may rewrite the line) | the approving line |
+| `REAL_CONFLICT_REQUIRING_OWNER_DECISION` | live and approved rules disagree; fails every gate until the owner records a decision by changing the row to another disposition with citation `owner-decision:<id>` | the approved rule |
+
+Every tool fails closed on a malformed row, a missing file mode, a symlink, a missing citation target or an
+open conflict. `claude-clause-drift.py` counts a dispositioned clause as covered and reports each open
+conflict by line number.
+
+### Rehearse first (scratch HOME, writes nothing real)
+
+`scripts/spe108-live/rehearse.sh --repo <checkout> --ledger <ledger> [--mode keep|retire]` copies the real
+instruction files and skill trees into a temporary HOME (it reads the real files, writes only under the scratch tree,
+and refuses a scratch dir inside the real config or the checkout) and runs the whole migration there: Claude install,
+overlay, install, line rewrite (keep) or retirement (retire), Codex install, the effective-file checks, a second
+apply that must change nothing, and a rollback that must restore every pre-migration byte.
+
+### Apply
+
+1. Back up `~/.claude/CLAUDE.md`, `~/.claude/rules/*.md` and `~/.codex/AGENTS.md` byte-exactly (Preconditions).
 2. `scripts/profile-install.sh --claude-skills --dry-run`, `--check`, then apply **with no overlay yet**.
-   This replaces the managed span with the current one (all delivery-contract sections inside it).
-3. `python3 scripts/spe108-live/build-overlay.py --repo <checkout>`. Creates the mode-0600 overlay from
-   live-only text only (nothing inside the managed span or an existing overlay block is copied, so no stale
-   duplicate of public policy). Refuses to overwrite.
+3. `python3 scripts/spe108-live/build-overlay.py --repo <checkout> --ledger <ledger>`. Creates the mode-0600
+   overlay from live-only text; with `--ledger` it also copies the `PRESERVE_IN_PRIVATE_OVERLAY` lines of the
+   legacy sections. Refuses to overwrite a different overlay; identical output is a no-op.
 4. `scripts/profile-install.sh --claude-skills` again to merge the overlay, then `--check`.
-5. `python3 scripts/spe108-live/retire-sections.py --repo <checkout>` (dry-run): lists the four legacy
-   unmarked sections (Commit Policy, Pull Request Policy, Git Worktree Workflow, Delegation Model) by line
-   range, per-section counts of lines absent from the public base (they survive only in the backup), and the
-   residual references to review by hand, labelled by region (original, managed span, overlay copy).
-6. `python3 scripts/spe108-live/retire-sections.py --apply --expect-sha256 <printed live hash>`. It refuses
-   unless the replacement sections are inside the managed span, takes a byte-exact 0600 backup, preserves the
-   file mode and writes atomically.
-7. Hand-edit the residual references in the original region of `~/.claude/CLAUDE.md` and in
-   `CLAUDE.private.md` (reinstall afterwards); never edit the managed span.
-8. `scripts/sync-check.sh --claude-clauses` must report `Claude clause drift: 0`; then the acceptance probes.
+5. **Keep path (default):** `python3 scripts/spe108-live/rewrite-lines.py --file ~/.claude/CLAUDE.md --ledger <ledger>
+   --expect-sha256 <sha>` (dry run, prints line numbers and hashes), then again with `--apply`. It replaces only the
+   ledger-named superseded lines with their approved canonical line, after a byte-exact backup.
+   **Retire path (optional):** `python3 scripts/spe108-live/retire-sections.py --repo <checkout> --ledger <ledger>`
+   (the lossless gate must print PASS), then `--apply --expect-sha256 <sha>`. `--apply` refuses without `--ledger` and
+   `--repo`, with any unledgered or conflicting line, or when an overlay line is not already present elsewhere.
+6. `scripts/profile-install.sh --global --dry-run`, `--check`, apply, `--check` for Codex.
+7. `python3 scripts/spe108-live/verify-effective.py --host claude --before <byte-exact backup of CLAUDE.md>
+   --after ~/.claude/CLAUDE.md --skills-dir ~/.claude/skills --ledger <ledger> --repo <checkout>`, and the same with
+   `--host codex` for `AGENTS.md`. It inspects the final instruction files and skills, not file counts: nothing
+   unaccounted for, no superseded format active, the approved formats and gates present, no open conflict.
+8. `scripts/sync-check.sh --claude-clauses` and the acceptance probes above.
 
-Rollback: copy the backup printed by `retire-sections.py` (or the step 1 backup) back over
-`~/.claude/CLAUDE.md`; delete the overlay file and re-run the installer if the overlay is to go too.
-Expect the live file to grow by roughly the overlay size, because the originals stay in place.
+Rollback (every step is backed up): copy the byte-exact backups back over `CLAUDE.md` and `AGENTS.md`, restore the
+installer `Prior state:` directories newest first (their paths are relative to HOME), then delete files that did not
+exist before (`rehearse.sh` proves this restores every byte). Removing the overlay file does not remove the live
+overlay span; the span is restored by the `CLAUDE.md` backup.
+
+Line-level matching: an overlay line counts as present when the same normalized text exists anywhere outside the
+removed blocks, so keep the ledger review (not the tool) as the judge of meaning. `verify-effective.py --strict`
+(the retire path) also fails while any superseded line is still present.
+
+Known cost: after the overlay is merged the original region and the overlay copy both exist, so the live
+file roughly doubles; `verify-effective.py` prints the duplicate-title count. Removing the 23 original duplicates is
+a separate owner decision.

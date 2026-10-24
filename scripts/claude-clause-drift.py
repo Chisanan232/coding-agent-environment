@@ -6,6 +6,7 @@ hashes, never clause text, so a private overlay cannot leak through the report.
 """
 import argparse
 import hashlib
+import importlib.util
 import os
 import re
 import stat
@@ -25,7 +26,7 @@ def digest(kind: str, text: str) -> str:
 def clauses(text: str):
     found = []
     fenced = False
-    for number, line in enumerate(text.splitlines(), 1):
+    for number, line in enumerate(text.split("\n"), 1):
         if line.lstrip().startswith("```"):
             fenced = not fenced
             continue
@@ -45,6 +46,7 @@ def overlay_path(home: Path) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--home", default=os.environ.get("CODING_AGENT_SYNC_HOME") or str(Path.home()))
+    parser.add_argument("--ledger", help="local policy ledger (default: the baseline policy-ledger.tsv when present)")
     args = parser.parse_args()
     home = Path(args.home)
     live_path = home / ".claude/CLAUDE.md"
@@ -65,6 +67,32 @@ def main() -> int:
     covered = {h for _, _, h in clauses(public)} | {h for _, _, h in clauses(overlay)}
     live = live_path.read_text()
     missing = [(n, k, h) for n, k, h in clauses(live) if h not in covered]
+    ledgered, conflicts = set(), []
+    ledger_file = Path(args.ledger) if args.ledger else None
+    if ledger_file is None:
+        spec = importlib.util.spec_from_file_location("ledger", ROOT / "scripts/spe108-live/ledger.py")
+        ledger_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ledger_mod)
+        candidate = ledger_mod.default_path(home)
+        ledger_file = candidate if candidate.is_file() else None
+    if ledger_file is not None:
+        spec = importlib.util.spec_from_file_location("ledger", ROOT / "scripts/spe108-live/ledger.py")
+        ledger_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ledger_mod)
+        try:
+            rows = ledger_mod.load(ledger_file)
+        except ledger_mod.LedgerError as error:
+            print(f"Policy ledger refused: {error}")
+            return 2
+        live_lines = live.split("\n")
+        # A clause is dispositioned when its own line is ledgered and not an open conflict.
+        ledgered = {n for n, _, _ in missing
+                    if rows.get(ledger_mod.line_key(live_lines[n - 1]), (None,))[0] not in (None, ledger_mod.CONFLICT)}
+        conflicts = [n for n, line in ledger_mod.content_lines(live)
+                     if rows.get(ledger_mod.line_key(line), (None,))[0] == ledger_mod.CONFLICT]
+        missing = [m for m in missing if m[0] not in ledgered]
+        for number in conflicts:
+            print(f"OPEN CONFLICT live line {number} (owner decision required; ledger disposition REAL_CONFLICT)")
     for number, kind, short in missing:
         print(f"UNTRACKED live {kind} at line {number} sha256:{short} (in neither public base nor private overlay)")
     live_folded = live.lower()
@@ -74,9 +102,10 @@ def main() -> int:
             if keyword.lower() not in live_folded:
                 keyword_drift += 1
                 print(f"MISSING overlay keyword sha256:{digest('keyword', keyword)} absent from the live policy")
-    print(f"Claude clause drift: {len(missing) + keyword_drift} "
-          f"(overlay {'present' if overlay_file.is_file() else 'absent'}; clause text not shown)")
-    return int(bool(missing or keyword_drift))
+    print(f"Claude clause drift: {len(missing) + keyword_drift + len(conflicts)} "
+          f"(overlay {'present' if overlay_file.is_file() else 'absent'}; {len(ledgered)} dispositioned by ledger; "
+          f"clause text not shown)")
+    return int(bool(missing or keyword_drift or conflicts))
 
 
 if __name__ == "__main__":
