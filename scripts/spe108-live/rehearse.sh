@@ -28,11 +28,19 @@ REAL_HOME="$(cd "$HOME" && pwd -P)"
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO="$(cd "$REPO" && pwd -P)"
 LEDGER="$(cd "$(dirname "$LEDGER")" && pwd -P)/$(basename "$LEDGER")"
-if [[ -n "$KEEP" ]]; then mkdir -p "$KEEP"; SIM="$(cd "$KEEP" && pwd -P)"; else SIM="$(cd "$(mktemp -d)" && pwd -P)"; fi
+if [[ -n "$KEEP" ]]; then
+    # Resolve through the nearest existing parent, guard, and only then create anything.
+    parent="$KEEP"; tail=""
+    while [[ ! -d "$parent" ]]; do tail="/$(basename "$parent")$tail"; parent="$(dirname "$parent")"; done
+    SIM="$(cd "$parent" && pwd -P)$tail"
+else
+    SIM="$(cd "${TMPDIR:-/tmp}" && pwd -P)/rehearse.$$"
+fi
 case "$SIM/" in
     "$REAL_HOME/.claude/"*|"$REAL_HOME/.codex/"*|"$REAL_HOME/.agents/"*|"$REAL_HOME/"|"$REPO/"*)
         echo "refusing: scratch dir must not be inside the real HOME config or the checkout" >&2; exit 2 ;;
 esac
+mkdir -p "$SIM"
 [[ -z "$(ls -A "$SIM")" ]] || { echo "scratch dir must be empty" >&2; exit 2; }
 BASE="$SIM/.config/coding-agent-environment/local/baseline/claude"
 mkdir -p -m 700 "$SIM/.claude" "$SIM/.codex" "$BASE"

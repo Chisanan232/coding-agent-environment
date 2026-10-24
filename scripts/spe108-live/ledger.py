@@ -22,7 +22,7 @@ DISPOSITIONS = (SEMANTIC, OVERLAY, SUPERSEDED, CONFLICT)
 CITATION = re.compile(r'^(?:owner-decision:[A-Za-z0-9._-]+|[A-Za-z0-9._/-]+:\d+)$')
 TABLE_RULE = re.compile(r'^\s*\|?[\s:|-]+\|[\s:|-]*$')
 FENCE = re.compile(r'^\s*```[A-Za-z0-9_+.-]*\s*$')
-MARKER = re.compile(r'<!-- coding-agent-environment:([\w-]+):(start|end) -->')
+MARKER = re.compile(r'^\s*<!-- coding-agent-environment:([\w-]+):(start|end) -->\s*$')
 # Spans the installer rewrites by design. The private overlay is NOT one: its text is founder text.
 REPLACED_BY_DESIGN = ('engineering-workflow', 'signal-first')
 
