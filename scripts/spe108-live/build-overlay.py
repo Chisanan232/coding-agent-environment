@@ -9,7 +9,10 @@ Auto-Merge Policy is not retired (its sub-agent-must-not-merge rule has no publi
 Requires --repo to be a clean checkout whose HEAD equals origin/main (prints the SHA), so a stale
 public base cannot misclassify. Fails closed. Prints counts only. Never overwrites.
 Atomic create (temp + link), file 0600, directory 0700, no symlinked path component.
-Usage: build-overlay.py --repo PATH_TO_CHECKOUT_OF_origin/main
+With --ledger, lines of the retired sections whose ledger disposition is PRESERVE_IN_PRIVATE_OVERLAY are
+also copied verbatim into a 'Retained legacy delivery rules' overlay section, so retiring those sections
+(retire-sections.py --ledger) loses nothing. Re-running with identical output is a no-op.
+Usage: build-overlay.py --repo PATH_TO_CHECKOUT_OF_origin/main [--ledger LEDGER]
 """
 import argparse
 import importlib.util
@@ -20,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import is_marker_line, managed_ranges, split_sections  # noqa: E402
+import ledger as L  # noqa: E402
 
 RETIRE = ('Commit Policy', 'Pull Request Policy', 'Git Worktree Workflow', 'Delegation Model')
 MARKERS = ('coding-agent-environment:engineering-workflow', 'coding-agent-environment:private-overlay')
@@ -28,7 +32,9 @@ MAX_BYTES = 262144
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--repo', required=True)
-repo = Path(parser.parse_args().repo).resolve()
+parser.add_argument('--ledger')
+cli = parser.parse_args()
+repo = Path(cli.repo).resolve()
 
 
 def git(*args):
@@ -85,6 +91,27 @@ for title, start, end in sections:
     else:
         left += 1
 
+if cli.ledger:
+    try:
+        rows = L.load(cli.ledger)
+    except L.LedgerError as error:
+        sys.exit('refusing: %s' % error)
+    retained, runs = [], 0
+    for title, start, end in sections:
+        if title not in RETIRE or any(r[0] < end and start <= r[1] for r in managed_ranges(live_lines)):
+            continue
+        picked = [i for i in range(start + 1, end) if not L.is_structural(live_lines[i])
+                  and rows.get(L.line_key(live_lines[i]), (None,))[0] == L.OVERLAY]
+        previous = None
+        for i in picked:
+            if previous is None or i - previous > 1:
+                retained += ['\n', '### Retained from: %s\n' % title]
+                runs += 1
+            retained.append(live_lines[i] if live_lines[i].endswith('\n') else live_lines[i] + '\n')
+            previous = i
+    if retained:
+        out += ['## Retained legacy delivery rules\n'] + retained + ['\n']
+        print('retained legacy runs %d' % runs)
 out += EXTRA
 data = ''.join(out).encode('utf-8')
 if not kept or not data.strip():
@@ -100,6 +127,9 @@ for part in [folder, *folder.parents]:
     if part.is_symlink():
         sys.exit('refusing: symlinked path component')
 target = folder / 'CLAUDE.private.md'
+if target.is_file() and not target.is_symlink() and target.read_bytes() == data:
+    print('overlay unchanged (identical output); nothing written')
+    sys.exit(0)
 if target.exists() or target.is_symlink():
     sys.exit('refusing: overlay already exists')
 for part in reversed([folder, *[p for p in folder.parents if not p.exists()]][:]):
