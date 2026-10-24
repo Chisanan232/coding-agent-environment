@@ -375,6 +375,16 @@ class FakeClaude(unittest.TestCase):
                           ("Bash", {"command": "ls /Users/someone"})):
             self.assertTrue(ev.audit_stream(stream(name, **inp), work), (name, inp))
         self.assertEqual(ev.audit_stream(stream("Read", file_path="tests/../lib.py"), work), [])
+        # ordinary searches must not flag: wildcard-leading globs, relative dirs, regex greps
+        for name, inp in (("Glob", {"pattern": "**/*.py"}), ("Glob", {"pattern": "*.py"}),
+                          ("Glob", {"pattern": "src/*.py"}), ("Glob", {"pattern": "tests/**", "path": str(work)}),
+                          ("Grep", {"pattern": "*foo"}), ("Grep", {"pattern": "def (f|g)\\(", "path": "tests"}),
+                          ("Grep", {"pattern": "x", "path": str(work / "tests")})):
+            self.assertEqual(ev.audit_stream(stream(name, **inp), work), [], (name, inp))
+        for cmd in ("cd .. && ls", "cd / ; ls", "cat ~/notes", "cd ~"):
+            self.assertTrue(ev.audit_stream(stream("Bash", command=cmd), work), cmd)
+        self.assertTrue(ev.audit_stream(stream("Glob", pattern="../other/**"), work))
+        self.assertTrue(ev.audit_stream(stream("Glob", pattern="/etc/*"), work))
 
     def test_a_run_without_a_result_keeps_its_flags_and_replaces_a_stale_stream(self):
         sidecar = Path(str(self.dir / "run.json") + ".stream.jsonl")
@@ -557,8 +567,20 @@ class RepoFixtures(unittest.TestCase):
                                 run_record=str(flagged)))
             self.assertIn("refused", json.loads(out.read_text())["error"])
             self.assertEqual(seen, [])  # arm code never ran unsandboxed
+            for bad in ({"task": "t", "arm": "A", "is_error": True, "audit_flags": []},   # errored run
+                        {"task": "t", "arm": "A", "is_error": False},                       # never audited
+                        {"task": "other", "arm": "A", "is_error": False, "audit_flags": []},  # wrong task
+                        {"task": "t", "arm": "B", "is_error": False, "audit_flags": []}):     # wrong arm
+                rec_path = self.dir / "bad.json"
+                rec_path.write_text(json.dumps(bad))
+                with redirect_stdout(io.StringIO()):
+                    ev.cmd_grade(ns(task="t", arm="A", workdir=str(work), out=str(out), repo=str(self.src),
+                                    timeout=60, run_record=str(rec_path)))
+                self.assertIn("refused", json.loads(out.read_text())["error"], bad)
+            self.assertEqual(seen, [])
             clean = self.dir / "clean.json"
-            clean.write_text(json.dumps({"audit_flags": ["Edit: subprocess"]}))  # ordinary text is not reach
+            clean.write_text(json.dumps({"task": "t", "arm": "A", "is_error": False,
+                                         "audit_flags": ["Edit: subprocess"]}))  # ordinary text is not reach
             with redirect_stdout(io.StringIO()):
                 ev.cmd_grade(ns(task="t", arm="A", workdir=str(work), out=str(out), repo=str(self.src), timeout=60,
                                 run_record=str(clean)))

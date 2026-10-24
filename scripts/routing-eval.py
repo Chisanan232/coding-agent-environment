@@ -14,6 +14,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -178,6 +179,20 @@ def sensitive(flags: list[str]) -> list[str]:
     return [f for f in flags if any(n.strip() in f for n in AUDIT_NEEDLES) or "outside workdir" in f]
 
 
+def _tool_paths(name: str, inp: dict) -> list[str]:
+    """The path-like inputs of a tool call. A Grep pattern is a regex and is not a path; a Glob pattern is a path
+    only up to its first wildcard, and a pattern that starts with a wildcard is relative to the workdir."""
+    out = []
+    if name in ("Read", "Edit", "Write") and isinstance(inp.get("file_path"), str):
+        out.append(inp["file_path"])
+    if name in ("Grep", "Glob") and isinstance(inp.get("path"), str) and inp["path"]:
+        out.append(inp["path"])
+    if name == "Glob" and isinstance(inp.get("pattern"), str):
+        prefix = re.split(r"[*?\[{]", inp["pattern"], maxsplit=1)[0]
+        out.append(prefix if prefix.endswith("/") or not prefix else os.path.dirname(prefix) or ".")
+    return [o or "." for o in out]
+
+
 def audit_stream(stdout: str, workdir: Path | None = None) -> list[str]:
     """Tool input that reaches the network, secrets or paths outside the arm's workdir. The run phase has no sandbox,
     so this is detection after the fact, not a boundary; a substring audit can be evaded by obfuscated code."""
@@ -198,19 +213,18 @@ def audit_stream(stdout: str, workdir: Path | None = None) -> list[str]:
             flags.extend(f"{block.get('name')}: {n.strip()}" for n in AUDIT_NEEDLES if n in blob)
             if block.get("name") == "Bash":
                 cmd = str(inp.get("command", ""))
-                if "../" in cmd or "$HOME" in cmd or "${HOME}" in cmd:
+                if "../" in cmd or "$HOME" in cmd or "${HOME}" in cmd or "~/" in cmd \
+                        or re.search(r"(^|[\s;&|])cd\s+(\.\.|/|~)", cmd):
                     flags.append("Bash: path traversal or HOME reference outside workdir")
             if root and block.get("name") in PATH_TOOLS:
-                for key in ("file_path", "path", "pattern"):
-                    v = inp.get(key)
-                    if isinstance(v, str) and v:
-                        raw = v.replace("${HOME}", str(Path.home())).replace("$HOME", str(Path.home()))
-                        target = os.path.expanduser(raw.split("*")[0] or "/")
-                        if not os.path.isabs(target):
-                            target = os.path.join(root, target)
-                        real = os.path.realpath(target)
-                        if real != root and not real.startswith(root + os.sep):
-                            flags.append(f"{block.get('name')}: path outside workdir {v[:60]}")
+                for target in _tool_paths(block.get("name"), inp):
+                    raw = target.replace("${HOME}", str(Path.home())).replace("$HOME", str(Path.home()))
+                    resolved = os.path.expanduser(raw)
+                    if not os.path.isabs(resolved):
+                        resolved = os.path.join(root, resolved)
+                    real = os.path.realpath(resolved)
+                    if real != root and not real.startswith(root + os.sep):
+                        flags.append(f"{block.get('name')}: path outside workdir {target[:60]}")
     return sorted(set(flags))
 
 
@@ -471,7 +485,11 @@ def cmd_grade(args: argparse.Namespace) -> None:
     if task.get("oracle_unsandboxed"):
         # arm-written code runs without a sandbox here, so only after a clean, recorded run (fail closed)
         rr = Path(args.run_record) if getattr(args, "run_record", None) else None
-        dirty = (not rr or not rr.exists() or sensitive(load_json(rr).get("audit_flags", [])))
+        dirty = True  # fail closed unless the record is a positive, matching, audited, error-free run
+        if rr and rr.exists():
+            rec = load_json(rr)
+            dirty = (rec.get("task") != task["id"] or rec.get("arm") != args.arm or rec.get("is_error") is not False
+                     or "audit_flags" not in rec or bool(sensitive(rec["audit_flags"])))
         if dirty:
             Path(args.out).write_text(json.dumps({"task": task["id"], "arm": args.arm,
                                                   "error": "unsandboxed oracle refused: run record missing or flagged"}))
