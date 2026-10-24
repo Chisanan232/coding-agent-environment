@@ -19,6 +19,10 @@ is descriptive; the full commit and digest are the integrity checks. Do not
 float these references to a branch or update one package by editing its
 materialized copy.
 
+For UI/UX design work (as opposed to diagrams), see
+[`UI-UX-POLICY.md`](UI-UX-POLICY.md), which records which design skills were
+verified and which are not deployed.
+
 ## Host entry points
 
 Codex receives Archify at `~/.agents/skills/archify` as a symlink into the
