@@ -31,7 +31,8 @@ _USAGE_KEYS = {
 }
 HEADLESS_FLAGS = ["--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"]
 # Bash is limited to the test runner shape and read-only git; no interpreter wildcard, no network tools.
-BASH_ALLOW = ["Bash(python3 -I tests/*)", "Bash(git diff*)", "Bash(git status*)"]
+BASH_ALLOW = ["Bash(python3 -I tests/*)", "Bash(git diff)", "Bash(git diff --stat)", "Bash(git status)",
+              "Bash(git status --short)"]
 WORK_TOOLS = ["Read", "Edit", "Write", "Grep", "Glob", *BASH_ALLOW]
 ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "TERM", "TMPDIR")
 

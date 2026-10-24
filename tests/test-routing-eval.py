@@ -136,6 +136,7 @@ class Invocation(unittest.TestCase):
             self.assertNotIn("bypass", joined)
             self.assertFalse(any(t.startswith("Bash(git push") for t in argv))
             self.assertNotIn("Bash(python3 *)", argv)
+            self.assertFalse(any(t.endswith("*)") and t.startswith("Bash(git") for t in argv), "git patterns must be exact")
             self.assertFalse(any(t == "Bash" for t in argv))
 
     def test_worker_gets_the_same_narrow_bash_and_env_is_scrubbed(self):
