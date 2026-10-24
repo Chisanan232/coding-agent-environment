@@ -85,7 +85,7 @@ ADMISSION = (
 )
 WORKER_PROMPT = (
     "You are a bounded implementation worker. Do exactly the task packet. Edit only files the packet names. "
-    "Run the stated test command. If requirements are ambiguous, the scope grows, a contract must change, or "
+    "Run the stated test command exactly as given, with no `rtk` prefix. If requirements are ambiguous, the scope grows, a contract must change, or "
     "two targeted repair attempts fail, stop and return the observed result, evidence and the open decision. "
     "Do not merge, publish, spawn agents, or claim the work is ready; report what you changed and tests run."
 )
@@ -306,7 +306,7 @@ def claude_args(arm: str, task: dict) -> tuple[list[str], str]:
             "--tools", ",".join(tools), "--disallowedTools", *deny_rules()]
     prompt = (
         "You are working in a repository at its base state. Complete the task below by editing files in "
-        "place. Run the relevant tests with `python3 -I tests/<file>`. Do not use git push, the network, "
+        "place. Run the relevant tests with exactly `python3 -I tests/<file>` and use plain commands, never an `rtk` prefix. Do not use git push, the network, "
         "or edit anything the task does not need. End with a short report of what changed and the tests you ran.\n\n"
         f"TASK:\n{task['task']}"
     )
