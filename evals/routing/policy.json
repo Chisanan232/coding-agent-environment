@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "ticket": "SPE-124",
+  "precommitted": "This file is committed before any arm is run; changing a threshold after results exist invalidates the comparison.",
+  "arms": {
+    "A": "Sonnet direct: one headless session does the whole task.",
+    "B": "Sonnet orchestrator plus one bounded Haiku worker defined only for the run, pinned to an explicit model id."
+  },
+  "task_classes": ["bounded", "ambiguous", "high_risk", "control"],
+  "expected_haiku": {
+    "bounded": "may_delegate",
+    "ambiguous": "decline",
+    "high_risk": "decline",
+    "control": "decline"
+  },
+  "accepted_outcome": {
+    "oracle_passes": true,
+    "independent_review_critical_high": 0,
+    "changes_in_owned_scope": true,
+    "note": "A review finding that the result is correct but differs from the original is adjudicated by the reviewer, not rejected automatically."
+  },
+  "usage_vector": {
+    "per_model_kinds": ["fresh_input", "cache_write", "cache_read", "output"],
+    "also": ["wall_ms", "num_turns", "worker_attempts"],
+    "money": "UNKNOWN. total_cost_usd from the CLI is a list-price estimate, never a bill; subscription utilization is not exposed per run."
+  },
+  "decision_rule": {
+    "task_supports_haiku": "accepted AND Sonnet tokens in arm B <= arm A for every one of the four kinds",
+    "task_inconclusive": "accepted AND Sonnet tokens lower on some kinds but not all",
+    "task_rejects_haiku": "arm B not accepted while arm A accepted",
+    "decline_cases": "arm B passes only if it used zero Haiku tokens (the orchestrator declined or escalated)",
+    "pilot_verdicts": ["NO_HAIKU", "INCONCLUSIVE_KEEP_OPT_IN", "OPT_IN_CANDIDATE"],
+    "promotion": "never from a pilot. Fewer than 30 paired tasks cannot show non-inferiority; the provisional 5 percentage-point first-pass margin is evaluated only at 30 or more paired tasks."
+  },
+  "hard_gates": [
+    "zero known critical security, data-loss or contract regressions",
+    "no mandatory validation bypassed",
+    "no unsupported completion claim",
+    "no edit outside the task's owned scope",
+    "a worker never merges, publishes, closes tickets or certifies readiness"
+  ],
+  "run_caps": {
+    "max_turns": 40,
+    "max_budget_usd_estimate": 3.0,
+    "trials_per_task_arm": 1,
+    "pilot_tasks": 6,
+    "retries_after_failed_run": 0
+  },
+  "isolation": {
+    "workdir": "git archive of the task's base revision into a fresh one-commit repository, so no future history is reachable",
+    "external_writes": "none; no Jira, Slack, GitHub write or merge from any arm",
+    "claude_flags": ["--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"]
+  }
+}
