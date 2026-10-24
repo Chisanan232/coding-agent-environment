@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""Hash-pinned, owner-operated merge of a settings candidate into a settings file (SPE-116).
+
+  candidate-rollout.py plan     --live F --candidate F [--baseline F] [--hook-command CMD [--fail-closed]]
+  candidate-rollout.py apply    --live F --candidate F [--baseline F] [--hook-command CMD] --expect-live-sha S --expect-result-sha S [--backup-dir D]
+  candidate-rollout.py verify   --live F --expect-result-sha S
+  candidate-rollout.py rollback --live F --backup F --expect-backup-sha S --expect-live-sha S
+
+SPE-119 extends the permission merge for one case: a candidate may carry `permissions.allow` (unioned in, and held to the
+read-only/routine allowlist by the candidate lint) and `permissions.retire_ask` (exact strings, and only those the tool is
+allowed to retire: today the broad `Bash(rtk proxy *)` ask). After the merge the plan checks that every protected `rtk proxy`
+operation still asks and every routine one no longer does.
+
+Only three things are merged: the `autoMode` block is replaced by the candidate's (a candidate with no `autoMode` key leaves it untouched), `permissions.ask` becomes the
+ordered union of live, baseline and candidate asks, and (optionally) one PreToolUse hook entry is added. Everything
+else (`allow`, `deny`, `env`, `model`, `statusLine`, other hooks) is left untouched, and the baseline's own `autoMode`
+text is never applied. `plan` and `verify` write nothing. `apply` and `rollback` write the live file, so the OWNER runs
+them; they refuse unless the file's current hash equals the one pinned from `plan`. Values under `env` are never printed.
+"""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import shutil
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+_spec = importlib.util.spec_from_file_location("wsp", HERE / "workstation-policy.py")
+wsp = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(wsp)
+_pr_spec = importlib.util.spec_from_file_location("pr", HERE / "permission-rollout.py")
+pr = importlib.util.module_from_spec(_pr_spec)
+_pr_spec.loader.exec_module(pr)
+HOOK_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash"
+
+
+def sha(data):
+    return hashlib.sha256(data if isinstance(data, bytes) else data.encode()).hexdigest()
+
+
+def dump(cfg):
+    return json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+
+
+def load(path):
+    raw = pathlib.Path(path).read_bytes()
+    return raw, json.loads(raw)
+
+
+def union(*lists):
+    out, seen = [], set()
+    for lst in lists:
+        for item in lst or []:
+            key = json.dumps(item, sort_keys=True)  # entries may be objects, which are unhashable
+            if key not in seen:
+                seen.add(key)
+                out.append(item)
+    return out
+
+
+def candidate_retired(candidate):
+    """Asks the candidate explicitly retires, limited to what the tool may retire."""
+    return [r for r in ((candidate.get("permissions") or {}).get("retire_ask", [])) if r in wsp.RETIRABLE_ASKS]
+
+
+def merge(live, candidate, baseline=None, hook_command=None, fail_closed=False):
+    """Pure function: returns (merged, report). `live` is not mutated."""
+    merged = json.loads(json.dumps(live))
+    live_am = live.get("autoMode") or {}
+    before_counts = {k: len(v) for k, v in live_am.items() if isinstance(v, list)}
+    report = {"autoMode_before": before_counts, "denies_kept": {}, "dropped_from_live": {"environment": [], "allow": []}}
+    if "autoMode" in candidate and not isinstance(candidate["autoMode"], dict):
+        raise SystemExit("REFUSED: candidate autoMode must be an object (omit the key to leave the live autoMode alone)")
+    if "autoMode" in candidate:  # an asks-only candidate (no autoMode key) leaves the live autoMode exactly as it is
+        am =json.loads(json.dumps(candidate["autoMode"]))
+        carried = [k for k in live_am if k not in am]  # a candidate that omits a key leaves the owner's live value alone
+        for key in carried:
+            am[key] = json.loads(json.dumps(live_am[key]))
+        report["autoMode_preserved"] = carried
+        report["autoMode_after"] = {k: len(v) for k, v in am.items() if isinstance(v, list)}
+        for key in ("soft_deny", "hard_deny"):  # an owner's own deny entries are never dropped
+            extra = [x for x in live_am.get(key, []) if x != "$defaults"]
+            report["denies_kept"][key] = len(extra)
+            if extra:
+                am[key] = ["$defaults"] + union(extra, [x for x in am.get(key, []) if x != "$defaults"])
+        report["dropped_from_live"] = {key: [str(x)[:100] for x in live_am.get(key, []) if x not in am.get(key, [])] for key in ("environment", "allow")}
+        merged["autoMode"] = am
+    else:
+        report["autoMode_after"] = before_counts
+    perms = merged.setdefault("permissions", {})
+    before = list(perms.get("ask", []))
+    base_asks = ((baseline or {}).get("permissions") or {}).get("ask", [])
+    cand_perms = candidate.get("permissions") or {}  # an autoMode-only candidate carries no permissions block
+    perms["ask"] = union(before, base_asks, cand_perms.get("ask", []))
+    retire = [r for r in cand_perms.get("retire_ask", [])]
+    report["asks_retired"] = [r for r in perms["ask"] if r in retire and r in wsp.RETIRABLE_ASKS]
+    report["retire_refused"] = [r for r in retire if r not in wsp.RETIRABLE_ASKS]
+    perms["ask"] = [r for r in perms["ask"] if r not in report["asks_retired"]]
+    allow_before = list(perms.get("allow", []))
+    if cand_perms.get("allow"):
+        perms["allow"] = union(allow_before, cand_perms["allow"])
+    report["allow_added"] = [a for a in perms.get("allow", []) if a not in allow_before]
+    report["asks_added"] = [a for a in perms["ask"] if a not in before]
+    report["asks_kept"] = len(before)
+    report["hook_added"] = False
+    if hook_command:
+        entry = {"type": "command", "command": hook_command}
+        if fail_closed:
+            entry["onFailure"] = "block"
+        groups = merged.setdefault("hooks", {}).setdefault("PreToolUse", [])
+        existing = [(g, h) for g in groups for h in g.get("hooks", []) if h.get("command") == hook_command]
+        report["hook_conflict"] = []
+        for g, h in existing:
+            if set(re.split(r"[|,\s]+", g.get("matcher", ""))) != set(HOOK_MATCHER.split("|")):
+                report["hook_conflict"].append(f"existing hook entry has matcher {g.get('matcher')!r}, expected {HOOK_MATCHER!r}")
+            if fail_closed and h.get("onFailure") != "block":
+                report["hook_conflict"].append("existing hook entry is not fail-closed (onFailure != block) but --fail-closed was requested")
+        if not existing:
+            groups.append({"matcher": HOOK_MATCHER, "hooks": [entry]})
+            report["hook_added"] = True
+    return merged, report
+
+
+def compat(live, merged, candidate, report_conflicts=(), owner_allow=()):
+    """Findings the owner should read before applying. Informational unless noted BLOCKING."""
+    out = []
+    for problem in wsp.lint_settings(candidate, owner_allow):
+        out.append(f"BLOCKING candidate lint: {problem}")
+    am = merged.get("autoMode") or {}
+    if "autoMode" in candidate:  # an asks-only candidate leaves the live autoMode untouched, so it is not judged here
+        for key in ("allow", "soft_deny", "hard_deny", "environment"):
+            if key in am and (not am[key] or am[key][0] != "$defaults"):
+                out.append(f"BLOCKING autoMode.{key} lost $defaults")
+        for problem in wsp.lint_settings({"autoMode": am}, owner_allow):  # the merged autoMode, including live values carried over when the candidate omits a key (the owner restates the key to replace them); permissions.allow/ask are judged elsewhere
+            out.append(f"BLOCKING merged configuration lint: {problem}")
+    for rule in (live.get("permissions") or {}).get("ask", []):
+        if rule not in merged["permissions"]["ask"] and rule not in candidate_retired(candidate):
+            out.append(f"BLOCKING existing ask lost in the merge: {rule}")
+    for msg in report_conflicts:
+        out.append(f"BLOCKING {msg}")
+    live_allow = (live.get("permissions") or {}).get("allow", [])
+    for problem in wsp.lint_settings({"permissions": {"allow": live_allow}}):
+        out.append(f"live allow list (untouched, informational): {problem}")
+    cand_perms = candidate.get("permissions") or {}
+    for r in cand_perms.get("retire_ask", []):
+        if r not in wsp.RETIRABLE_ASKS:
+            out.append(f"BLOCKING candidate asks to retire an ask the tool may not retire: {r}")
+    for r in cand_perms.get("allow", []):
+        if r not in wsp.PROXY_ROUTINE_ALLOW + wsp.ROUTINE_BARE_ALLOW and not (isinstance(r, str) and wsp.TRUSTED_RUNNER_RULE_RE.fullmatch(r)):
+            out.append(f"BLOCKING candidate allow is not one of the scoped allows this tool may add: {r}")
+    merged_perm = merged["permissions"]
+    if cand_perms.get("allow") or any(r in cand_perms.get("retire_ask", []) for r in wsp.RETIRABLE_ASKS):
+        for cmd in pr.PROXY_PROTECTED_COMMANDS:
+            if pr.static_decision(cmd, merged_perm) != "ask":
+                out.append(f"BLOCKING protected wrapped command would not ask after the merge: {cmd!r} -> {pr.static_decision(cmd, merged_perm)}")
+        for cmd in pr.PROXY_ROUTINE_COMMANDS:
+            if pr.static_decision(cmd, merged_perm) == "ask":
+                out.append(f"routine wrapped command still asks after the merge (informational): {cmd!r}")
+    runner_allows = [r for r in cand_perms.get("allow", []) if isinstance(r, str) and wsp.TRUSTED_RUNNER_RULE_RE.fullmatch(r)]
+    if runner_allows:  # a trusted-allow candidate is only safe on top of ASK-first, and no ask may swallow the runner form
+        for rule in runner_allows:
+            home = wsp.TRUSTED_RUNNER_RULE_RE.fullmatch(rule).group(1)
+            if home != os.path.expanduser("~"):
+                out.append(f"BLOCKING the runner allow rule names {home!r}, which is not this user's home; it would allow a program at a path nobody verified")
+            probe = f"{home}/.claude/bin/owner-merge-runner --repo o/r --pr 7 --expect-head {'a' * 40} --review-evidence /tmp/e.json"
+            if pr.static_decision(probe, merged_perm) != "allow":
+                out.append(f"BLOCKING the runner command would not be allowed after the merge (an ask or deny matches it, or no allow does): {pr.static_decision(probe, merged_perm)}")
+        for cmd in wsp.MERGE_SCOPE_COMMANDS + ["rtk " + c for c in wsp.MERGE_SCOPE_COMMANDS]:
+            if pr.static_decision(cmd, merged_perm) != "ask":
+                out.append(f"BLOCKING trusted allow requires ASK-first: direct merge would not ask (prefix-rule emulator): {cmd!r} -> {pr.static_decision(cmd, merged_perm)}")
+    if any(isinstance(a, str) and a in wsp.MERGE_SCOPE_MARKERS for a in cand_perms.get("ask", [])):  # any merge-scope-only ask makes it a merge-scope candidate: all its shapes must ask
+        for cmd in wsp.MERGE_SCOPE_COMMANDS + ["rtk " + c for c in wsp.MERGE_SCOPE_COMMANDS]:
+            if pr.static_decision(cmd, merged_perm) != "ask":
+                out.append(f"BLOCKING merge-scope command would not ask after the merge (prefix-rule emulator, not the host matcher): {cmd!r} -> {pr.static_decision(cmd, merged_perm)}")
+    canon = lambda r: json.dumps(r, sort_keys=True)  # entries may be objects, which are unhashable
+    allow, ask = {canon(r) for r in live_allow}, {canon(r) for r in merged["permissions"]["ask"]}
+    for rule in sorted(allow & ask):
+        out.append(f"rule is in both allow and ask (ask wins per the permissions docs, informational): {rule[:80]}")
+    for k in ("bypassPermissions",):
+        if k in json.dumps(live):
+            out.append(f"live settings mention {k} (untouched, informational)")
+    return out
+
+
+def plan(args, raw=None):
+    if raw is None:
+        raw = pathlib.Path(args.live).read_bytes()
+    live = json.loads(raw)
+    cand_raw, cand = load(args.candidate)
+    base_raw, baseline = load(args.baseline) if args.baseline else (None, None)
+    merged, report = merge(live, cand, baseline, args.hook_command, args.fail_closed)
+    text = dump(merged)
+    owner_allow, registry_sha = (), None
+    if getattr(args, "owner_allow_file", None):
+        reg_raw = pathlib.Path(args.owner_allow_file).read_bytes()  # one read: the pin and the parsed entries use the same bytes
+        registry_sha, owner_allow = sha(reg_raw), wsp.parse_owner_allow(reg_raw)
+    findings = compat(live, merged, cand, report.get("hook_conflict", []), owner_allow)
+    for e in owner_allow:  # every registry entry is judged, used by the candidate or not
+        findings += [f"BLOCKING owner allow registry: {problem}" for problem in wsp.owner_allow_problems(e)]
+        findings.append(f"owner allow registry entry (informational, review it; the owner pins its hash on apply): {e}")
+    dropped = {k: v for k, v in report["dropped_from_live"].items() if v}
+    if dropped:
+        findings.append(f"live autoMode entries replaced by the candidate (informational, review them): {dropped}")
+    return {"live_sha": sha(raw), "candidate_sha": sha(cand_raw),
+            "baseline_sha": sha(base_raw) if base_raw is not None else None,
+            "registry_sha": registry_sha,
+            "result_sha": sha(text), "report": report, "compat": findings,
+            "blocking": any(f.startswith("BLOCKING") for f in findings),
+            "untouched_keys": sorted(k for k in live if k not in ("autoMode",)), "_text": text}
+
+
+def atomic_write(path, text):
+    path = pathlib.Path(path).resolve()
+    data = text if isinstance(text, bytes) else text.encode("utf-8")  # bytes in, bytes out: no locale-dependent encoding
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".rollout-")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.chmod(tmp, path.stat().st_mode & 0o777)
+        os.replace(tmp, path)
+    except BaseException:
+        pathlib.Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def apply(args):
+    raw = pathlib.Path(args.live).read_bytes()  # one read: the pin check, the plan, and the backup all use these exact bytes
+    p = plan(args, raw)
+    if p["live_sha"] != args.expect_live_sha:
+        raise SystemExit(f"REFUSED: live file hash {p['live_sha']} != pinned {args.expect_live_sha}; re-run plan")
+    if p["result_sha"] != args.expect_result_sha:
+        raise SystemExit(f"REFUSED: predicted result {p['result_sha']} != pinned {args.expect_result_sha}; inputs changed, re-run plan")
+    if p["registry_sha"] != getattr(args, "expect_registry_sha", None):
+        raise SystemExit(f"REFUSED: owner allow registry hash {p['registry_sha']} != pinned {getattr(args, 'expect_registry_sha', None)}; "
+                         "pass --expect-registry-sha with the reviewed registry's hash (and only with --owner-allow-file)")
+    if p["blocking"]:
+        raise SystemExit("REFUSED: blocking compatibility findings; see plan")
+    bdir = pathlib.Path(os.path.expanduser(args.backup_dir))
+    bdir.mkdir(parents=True, exist_ok=True)
+    backup = bdir / f"settings.{p['live_sha'][:12]}.json"
+    fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(raw)
+    if sha(pathlib.Path(args.live).read_bytes()) != p["live_sha"]:
+        raise SystemExit("REFUSED: the live file changed while applying; nothing was written, re-run plan")
+    atomic_write(args.live, p["_text"])
+    return {"applied": True, "backup": str(backup), "backup_sha": p["live_sha"], "result_sha": sha(pathlib.Path(args.live).read_bytes())}
+
+
+def verify(args):
+    cur = sha(pathlib.Path(args.live).read_bytes())
+    return {"live_sha": cur, "expected": args.expect_result_sha, "verdict": "VERIFIED" if cur == args.expect_result_sha else "MISMATCH"}
+
+
+def rollback(args):
+    if sha(pathlib.Path(args.live).read_bytes()) != args.expect_live_sha:
+        raise SystemExit("REFUSED: the live file is not the one the rollback was pinned to (changes made since apply would be lost); re-check it first")
+    data = pathlib.Path(args.backup).read_bytes()
+    if sha(data) != args.expect_backup_sha:
+        raise SystemExit("REFUSED: backup hash does not match the pinned value")
+    atomic_write(args.live, data)
+    return {"restored": True, "live_sha": sha(pathlib.Path(args.live).read_bytes())}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("plan", "apply"):
+        sp = sub.add_parser(name)
+        sp.add_argument("--live", required=True)
+        sp.add_argument("--candidate", required=True)
+        sp.add_argument("--baseline")
+        sp.add_argument("--hook-command")
+        sp.add_argument("--fail-closed", action="store_true")
+        sp.add_argument("--owner-allow-file", help="owner registry of exact autoMode.allow entries the lint may accept (see workstation-policy.py)")
+    ap_apply = sub.choices["apply"]
+    ap_apply.add_argument("--expect-live-sha", required=True)
+    ap_apply.add_argument("--expect-result-sha", required=True)
+    ap_apply.add_argument("--expect-registry-sha", help="hash of the reviewed owner allow registry; required with --owner-allow-file, refused without it")
+    ap_apply.add_argument("--backup-dir", default="~/.claude/backups")
+    v = sub.add_parser("verify")
+    v.add_argument("--live", required=True)
+    v.add_argument("--expect-result-sha", required=True)
+    r = sub.add_parser("rollback")
+    r.add_argument("--live", required=True)
+    r.add_argument("--backup", required=True)
+    r.add_argument("--expect-backup-sha", required=True)
+    r.add_argument("--expect-live-sha", required=True, help="hash of the live file right now (the apply result unless it was edited since)")
+    a = ap.parse_args(argv)
+    out = {"plan": plan, "apply": apply, "verify": verify, "rollback": rollback}[a.cmd](a)
+    out.pop("_text", None)
+    print(json.dumps(out, indent=2))
+    return 1 if out.get("blocking") or out.get("verdict") == "MISMATCH" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

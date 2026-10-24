@@ -227,7 +227,7 @@ def validate(data, bodies, resolution, native_args=(), target_home=None):
     with tempfile.TemporaryDirectory(prefix='routing-schema-') as tmp:
         home = Path(tmp)
         (home / 'agents').mkdir()
-        probe = '[agents]\nenabled = true\nmax_concurrent_threads_per_session = 8\n'
+        probe = '[agents]\nenabled = true\nmax_concurrent_threads_per_session = 7\n'
         for role in ROLES:
             (home / 'agents' / (role + '.toml')).write_bytes(bodies[role])
             probe += '\n[agents.' + role + ']\nconfig_file = "agents/' + role + '.toml"\n'
@@ -357,7 +357,7 @@ def main():
         effective = data if args.launch_check else launch_context(data, [], home)
         fingerprint = validate(effective, bodies, args.resolution or (receipt or {}).get('resolution'),
                                catalog_args(native) if args.launch_check else (), target_home=home)
-    desired = {'agents.enabled': True, 'agents.max_concurrent_threads_per_session': 8}
+    desired = {'agents.enabled': True, 'agents.max_concurrent_threads_per_session': 7}
     for n in ROLES:
         desired['agents.' + n + '.description'] = tomllib.loads(bodies[n].decode())['description']
         desired['agents.' + n + '.config_file'] = 'agents/' + n + '.toml'

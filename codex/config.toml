@@ -102,8 +102,9 @@ approval_mode = "approve"
 [mcp_servers.github.tools.pull_request_review_write]
 approval_mode = "approve"
 
+# A direct MCP merge is one of several merge spellings; it must ask like `gh pr merge`. The validating owner-merge-runner is the autonomous route.
 [mcp_servers.github.tools.merge_pull_request]
-approval_mode = "approve"
+approval_mode = "prompt"
 
 [mcp_servers.memory]
 command = "npx"

@@ -4,7 +4,8 @@
 #
 # What it does:
 #   1. Symlinks bin/coding-agent-profile, bin/coding-agent-profile-explain,
-#      bin/ca-claude, bin/ca-codex into ~/.local/bin (or $INSTALL_BIN_DIR).
+#      bin/ca-claude, bin/ca-codex, bin/coding-agent-resource into ~/.local/bin
+#      (or $INSTALL_BIN_DIR).
 #   2. For each profile directory under $CODING_AGENT_PROFILE_DIR that has a
 #      codex/config.toml, symlinks it to
 #      $CODEX_DIR/<profile-name>.config.toml (Codex only reads --profile
@@ -18,9 +19,18 @@
 #   ./scripts/profile-install.sh --visuals [--dry-run | --check]
 #   ./scripts/profile-install.sh --global [--dry-run | --check]
 #   ./scripts/profile-install.sh --capabilities [--dry-run | --check | --remove]
+#   ./scripts/profile-install.sh --resource-policy [--dry-run | --check | --apply | --rollback]
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${1:-}" == "--storage" ]]; then
+    shift
+    exec python3 "$REPO_ROOT/scripts/storage-integration.py" "$@"
+fi
+if [[ "${1:-}" == "--resource-policy" ]]; then
+    shift
+    exec python3 "$REPO_ROOT/scripts/resource-policy-install.py" "$@"
+fi
 if [[ "${1:-}" == "--routing" ]]; then
     shift
     exec python3 "$REPO_ROOT/scripts/codex-routing.py" "$@"
@@ -38,6 +48,8 @@ HOST_MODE=codex
 CHECK=0
 CAPABILITIES=0
 REMOVE=0
+SHARED_SELECTION=""
+SHARED_SELECTION_SET=0
 
 for arg in "$@"; do
     case "$arg" in
@@ -47,9 +59,22 @@ for arg in "$@"; do
         --check) CHECK=1 ;;
         --capabilities) CAPABILITIES=1 ;;
         --remove) REMOVE=1 ;;
+        --shared-skills=*)
+            if (( SHARED_SELECTION_SET )); then
+                echo 'Specify --shared-skills exactly once.' >&2; exit 2
+            fi
+            SHARED_SELECTION_SET=1
+            SHARED_SELECTION="${arg#*=}"
+            [[ -n "$SHARED_SELECTION" ]] || { echo 'Shared skill selection must not be empty.' >&2; exit 2; }
+            ;;
         *) echo "profile-install.sh: unknown option: $arg" >&2; exit 2 ;;
     esac
 done
+
+if [[ -n "$SHARED_SELECTION" ]] && (( ! GLOBAL )); then
+    echo "--shared-skills requires --global or --claude-skills." >&2
+    exit 2
+fi
 
 if (( GLOBAL && CAPABILITIES )); then
     echo 'Choose --global or --capabilities, not both.' >&2
@@ -148,12 +173,13 @@ if (( GLOBAL )); then
         echo 'Global mode requires the standard user Codex home; custom CODEX_HOME is not managed.' >&2
         exit 2
     fi
-    python3 - "$REPO_ROOT" "${CODING_AGENT_SYNC_HOME:-$HOME}" "$DRY_RUN" "$CHECK" "$HOST_MODE" <<'PYGLOBAL'
+    python3 - "$REPO_ROOT" "${CODING_AGENT_SYNC_HOME:-$HOME}" "$DRY_RUN" "$CHECK" "$HOST_MODE" "$SHARED_SELECTION" <<'PYGLOBAL'
 import datetime
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -163,6 +189,7 @@ import tempfile
 root, live = map(Path, sys.argv[1:3])
 dry, check = map(int, sys.argv[3:5])
 host_mode = sys.argv[5]
+selection = sys.argv[6].split(',') if sys.argv[6] else []
 host_dir = '.' + host_mode
 drift_label = 'Managed Codex drift' if host_mode == 'codex' else 'Managed Claude practice drift'
 if dry and check:
@@ -219,13 +246,56 @@ elif prior:
     merged = prior + (b'' if prior.endswith(b'\n') else b'\n') + b'\n' + block + b'\n'
 else:
     merged = policy if host_mode == 'codex' else block + b'\n'
+if host_mode == 'claude':
+    # Optional private overlay (live-only clauses). It lives outside the repository, is never
+    # printed, and only its own marker span is replaced or appended in the live policy.
+    local_dir = Path(os.environ.get('CODING_AGENT_LOCAL_DIR') or live / '.config/coding-agent-environment/local')
+    overlay = Path(os.environ.get('CODING_AGENT_LOCAL_BASELINE_DIR') or local_dir / 'baseline') / 'claude/CLAUDE.private.md'
+    if overlay.is_symlink():
+        raise SystemExit('Refusing symlinked private overlay.')
+    if overlay.exists():
+        info = overlay.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise SystemExit('Private overlay must be a regular file owned by you with mode 0600.')
+        pstart = b'<!-- coding-agent-environment:private-overlay:start -->'
+        pend = b'<!-- coding-agent-environment:private-overlay:end -->'
+        if info.st_size > 262144:
+            raise SystemExit('Private overlay exceeds the 256 KiB limit.')
+        body = overlay.read_bytes()
+        if any(marker in body for marker in (pstart, pend, start, end)):
+            # A workflow marker inside the overlay would make every later run fail on an ambiguous pair.
+            raise SystemExit('Private overlay must not contain managed markers.')
+        private_block = pstart + b'\n' + body.rstrip(b'\n') + b'\n' + pend
+        if pstart in merged or pend in merged:
+            if merged.count(pstart) != 1 or merged.count(pend) != 1 or merged.index(pstart) > merged.index(pend):
+                raise SystemExit('Ambiguous private overlay markers in the live policy.')
+            merged = merged[:merged.index(pstart)] + private_block + merged[merged.index(pend) + len(pend):]
+        else:
+            merged = merged.rstrip(b'\n') + b'\n\n' + private_block + b'\n'
+        print(f'Private overlay merged into the managed policy ({len(body)} bytes; content not shown).')
 shared_skills = ['evidence-first-briefing', 'engineering-workflow']
 shared_manifest = json.loads((root / 'codex/shared-skills.json').read_text())
 shared_skills += [name for name in shared_manifest['skills'] if name not in shared_skills]
 actual_skills = {p.parent.name for p in (root / '.claude/skills').glob('*/SKILL.md')}
 if actual_skills != set(shared_skills):
     raise SystemExit('Shared skill manifest does not cover the complete authored inventory.')
-managed = [(agents, merged, 'managed instruction block; preserve outside bytes')]
+if selection and (len(selection) != len(set(selection)) or not set(selection).issubset(shared_skills)):
+    raise SystemExit('Unknown or duplicate shared skill selection.')
+managed = [] if selection else [(agents, merged, 'managed instruction block; preserve outside bytes')]
+host_specific = set()
+inventory_path = root / 'docs/full-parity-inventory.json'
+if inventory_path.exists():
+    host_specific = {row['id'] for row in json.loads(inventory_path.read_text())['rows']
+                     if row['classification'] == 'HOST_SPECIFIC_NO_PARITY'}
+stale_host_specific = []
+
+def codex_excluded(skill, relative):
+    # Claude-only references are not portable: they describe Claude hooks, env vars and models.
+    return (host_mode == 'codex' and (Path(relative).name.startswith('claude-')
+            or f'.claude/skills/{skill}/{relative}' in host_specific))
+
+if selection:
+    shared_skills = selection
 for skill in shared_skills:
     folder = root / '.claude/skills' / skill
     body = (folder / 'SKILL.md').read_text()
@@ -236,9 +306,17 @@ for skill in shared_skills:
         sources[relative] = root / source
     for relative, source in sources.items():
         target = live / host_dir / 'skills' / skill / relative
+        if codex_excluded(skill, relative):
+            if target.exists():
+                stale_host_specific.append(target)
+            continue
         reject_symlinks(target)
-        managed.append((target, source.read_bytes(), str(source.relative_to(root))))
-for name in shared_manifest['profiles'] if host_mode == 'codex' else []:
+        data = source.read_bytes()
+        if host_mode == 'codex' and source.suffix == '.md':
+            # Pointers to Claude-only files sit inside a claude-only span the Codex copy drops.
+            data = re.sub(rb'<!-- claude-only:start -->.*?<!-- claude-only:end -->\n?', b'', data, flags=re.S)
+        managed.append((target, data, str(source.relative_to(root))))
+for name in shared_manifest['profiles'] if host_mode == 'codex' and not selection else []:
     source = root / 'codex' / name
     target = live / '.codex' / name
     reject_symlinks(target)
@@ -259,7 +337,7 @@ for path, data, label in managed:
                 print(f'Desired SHA256: {hashlib.sha256(data).hexdigest()} ({len(data)} bytes)')
 manifest = json.loads((root / 'codex/subtraction-skills.json').read_text())
 missing = []
-for skill, spec in manifest['skills'].items() if host_mode == 'codex' else []:
+for skill, spec in manifest['skills'].items() if host_mode == 'codex' and not selection else []:
     folder = live / '.agents/skills' / skill
     bad = [name for name, digest in spec['files'].items()
            if not (folder / name).is_file()
@@ -272,8 +350,11 @@ for skill, spec in manifest['skills'].items() if host_mode == 'codex' else []:
         missing.append(skill)
         for name in bad:
             print(f'  {name} -> SHA256 {spec["files"][name]}')
+for path in stale_host_specific:
+    print(f'STALE host-specific file (report only; operator must delete): {path}')
 remaining = len(plans) + len(missing)
 if dry or check:
+    remaining += len(stale_host_specific)
     print(f'{drift_label}: {remaining}')
     raise SystemExit(int(bool(remaining) and check))
 if missing and live.resolve() != Path.home().resolve():
@@ -407,7 +488,7 @@ link_codex_profile() {
 }
 
 info "installing launcher symlinks into $INSTALL_BIN_DIR"
-for tool in coding-agent-profile coding-agent-profile-explain ca-claude ca-codex; do
+for tool in coding-agent-profile coding-agent-profile-explain ca-claude ca-codex coding-agent-resource; do
     link_bin "$tool" || true
 done
 
@@ -424,4 +505,4 @@ fi
 
 info "done. Add $INSTALL_BIN_DIR to PATH if it isn't already, then run:"
 info "  coding-agent-profile --help"
-info "  ca-claude / ca-codex   (drop-in replacements for claude/codex under a profile root)"
+info "  ca-claude / ca-codex   (profile-aware host launchers with optional resource holds)"

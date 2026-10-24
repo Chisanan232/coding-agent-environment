@@ -1,0 +1,70 @@
+{
+ "version": 1,
+ "description": "Trusted ALLOW corpus (SPE-118): the runner's literal allow form must run with no prompt (T01, T05), every direct or chained merge must prompt (T02-T04); UNKNOWN_REQUIRES_REVIEW entries are measured residuals that do not score. Owner home path /Users/bryant. Run with scripts/permission-host-matrix.py --candidate <scratch settings containing the live permissions plus the runner allow rule>. Probes use a nonexistent repository and a --dry-run runner, never a real PR.",
+ "commands": [
+  {
+   "id": "T01-runner-literal",
+   "family": "trusted-allow",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "/Users/bryant/.claude/bin/owner-merge-runner --repo Chisanan232/zz-nonexistent-probe-repo --pr 7 --expect-head 0123456789abcdef0123456789abcdef01234567 --review-evidence /nonexistent/zz-evidence.json --dry-run",
+   "note": "the one allowed runner form (dry-run, nonexistent repo and evidence)"
+  },
+  {
+   "id": "T02-runner-then-direct-merge",
+   "family": "trusted-allow",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "/Users/bryant/.claude/bin/owner-merge-runner --repo Chisanan232/zz-nonexistent-probe-repo --pr 7 --expect-head 0123456789abcdef0123456789abcdef01234567 --review-evidence /nonexistent/zz-evidence.json --dry-run ; gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "negative control: a glob allow must not let a chained direct merge run unprompted"
+  },
+  {
+   "id": "T03-direct-pinned-merge",
+   "family": "trusted-allow",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "ASK-first preserved with the runner allow present"
+  },
+  {
+   "id": "T04-direct-pinned-merge-rtk",
+   "family": "trusted-allow",
+   "class": "OWNER_ASK",
+   "expect": "ask",
+   "cmd": "rtk gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567",
+   "note": "rtk spelling of the direct merge"
+  },
+  {
+   "id": "T05-read-only-pr-view",
+   "family": "trusted-allow",
+   "class": "AUTO_SAFE",
+   "expect": "allow",
+   "cmd": "gh pr view 999999 --repo Chisanan232/zz-nonexistent-probe-repo --json mergeable",
+   "note": "read-only gh stays silent"
+  },
+  {
+   "id": "T06-runner-missing-evidence-flag",
+   "family": "trusted-allow",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "expect": "ask",
+   "cmd": "/Users/bryant/.claude/bin/owner-merge-runner --repo Chisanan232/zz-nonexistent-probe-repo --pr 7 --expect-head 0123456789abcdef0123456789abcdef01234567",
+   "note": "does not match the allow form (no --review-evidence): measured residual"
+  },
+  {
+   "id": "T07-python3-prefixed-runner",
+   "family": "trusted-allow",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "expect": "ask",
+   "cmd": "python3 /Users/bryant/.claude/bin/owner-merge-runner --repo Chisanan232/zz-nonexistent-probe-repo --pr 7 --expect-head 0123456789abcdef0123456789abcdef01234567 --review-evidence /nonexistent/zz-evidence.json --dry-run",
+   "note": "a python3 prefix does not match the allow form: measured residual"
+  },
+  {
+   "id": "T08-runner-other-binary",
+   "family": "trusted-allow",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "expect": "ask",
+   "cmd": "/Users/bryant/.claude/bin/not-the-runner --repo Chisanan232/zz-nonexistent-probe-repo --pr 7 --expect-head 0123456789abcdef0123456789abcdef01234567 --review-evidence /nonexistent/zz-evidence.json",
+   "note": "another program in the same directory must not be allowed"
+  }
+ ]
+}

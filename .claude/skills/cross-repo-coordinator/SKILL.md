@@ -208,3 +208,5 @@ bash "${ENGINEERING_RUNTIME}/session-memory.sh" append "[parent-ticket]" \
   ask the engineer to confirm integration manually before merging.
 - Do not close the parent ticket while any sub-ticket remains open.
 - Do not recreate sub-tickets on resume — check session notes for existing refs first.
+
+See the [reference](references/cross-repo-work.md) for the cross-repo work policy.

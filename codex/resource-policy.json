@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "classes": {
+    "managed_generated": {
+      "idle_threshold_secs": 86400,
+      "unattended": true
+    }
+  },
+  "max_actions": 3,
+  "max_bytes": 5368709120
+}

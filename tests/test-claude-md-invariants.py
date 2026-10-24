@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Invariant manifest: every always-loaded safety/contract clause stays reachable.
+
+Each clause names the file that owns it today and a whitespace-normalized phrase.
+A clause that lives outside `.claude/CLAUDE.md` must be named by `reach` text that
+appears in `.claude/CLAUDE.md`, so the always-loaded file still routes to it.
+Moving a clause means updating its `file` (and `reach`) in the same commit.
+"""
+import re
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CLAUDE = ".claude/CLAUDE.md"
+WORKFLOW = ".claude/skills/engineering-workflow/SKILL.md"
+
+# (id, file, phrase, reach) -- reach is required when file != CLAUDE.
+MANIFEST = [
+    # Safe implementation: validation sequence and safety items 16-20.
+    ("validation-impacted-first", CLAUDE, "After each logical unit of change, run impacted tests first.", None),
+    ("validation-full-suite", CLAUDE, "Before declaring work complete, run the full validation suite.", None),
+    ("validation-not-red", CLAUDE, "Do not mark a task done while any test or lint check is red.", None),
+    ("validation-unrunnable-check", CLAUDE, "If a check cannot be run locally, say so explicitly before committing.", None),
+    ("no-overwrite-uncommitted", CLAUDE, "Never overwrite uncommitted changes without explicit user confirmation.", None),
+    ("delete-in-scope", CLAUDE, "Delete only within authorized scope after checking dependents and risk.", None),
+    ("no-force-push-item", CLAUDE, "Never force-push without explicit user confirmation.", None),
+    ("no-verify-item", CLAUDE, "Never skip pre-commit hooks (`--no-verify`) without explicit user confirmation.", None),
+    ("unknown-state", CLAUDE, "Do not delete or overwrite unknown state.", None),
+    # Never-do list.
+    ("never-force-push", CLAUDE, "- Force-push to any branch", None),
+    ("never-reset-hard", CLAUDE, "- Run `git reset --hard`", None),
+    ("never-clean-fd", CLAUDE, "- Run `git clean -fd`", None),
+    ("never-drop-tables", CLAUDE, "- Drop or truncate database tables", None),
+    ("never-curl-shell", CLAUDE, "- Pipe remote content directly to a shell (`curl | bash`)", None),
+    ("never-publish", CLAUDE, "- Publish packages to registries", None),
+    ("never-edit-ci-defs", CLAUDE, "- Modify CI/CD pipeline definitions without review", None),
+    ("never-commit-credentials", CLAUDE, "- Commit `.env` or any file containing credentials", None),
+    ("never-unauthorised-delete", CLAUDE, "Delete outside the authorized scope or remove protective controls without owner approval", None),
+    # Delivery: PR-only, formats, worktree, Jira, QA, cleanup.
+    ("pr-only-claude", CLAUDE, "Never push directly to the default or protected branch.", None),
+    ("pr-only-workflow", WORKFLOW, "never push directly to the default or protected branch (main/master); merge only via PR", "engineering-workflow"),
+    ("formats-owned-by-workflow", CLAUDE, "which owns the branch, commit and pull-request rules", None),
+    ("commit-format", WORKFLOW, "<GitEmoji> (<scope>): <imperative summary>", "engineering-workflow"),
+    ("branch-format", WORKFLOW, "<version-or-phase>/<ticket-id>/<short_summary>", "engineering-workflow"),
+    ("pr-title-format", WORKFLOW, "[<TICKET>] <GitEmoji> (<scope>): <imperative summary under 60 chars>", "engineering-workflow"),
+    ("worktree-derivation", WORKFLOW, "<repo>-<phase>-<ticket>-<summary>", "engineering-workflow"),
+    ("small-commits", WORKFLOW, "one logically small change per commit", "engineering-workflow"),
+    ("jira-lifecycle", WORKFLOW, "Jira lifecycle", "engineering-workflow"),
+    ("jira-dates", WORKFLOW, "never fabricate dates", "engineering-workflow"),
+    ("frontend-qa", ".claude/skills/acceptance-validation/SKILL.md", "never invent screenshots", "acceptance-validation"),
+    ("cleanup-disk-check", ".claude/skills/post-merge-close/SKILL.md", "Check free disk space", "post-merge-close"),
+    ("worktree-per-ticket-resolution", CLAUDE, "Claude workflow skills resolve the active worktree from", None),
+    # Delegation.
+    ("subagent-maximum", WORKFLOW, "at most seven concurrent subagents (dynamic 0-7)", "engineering-workflow"),
+    ("one-owner-per-scope", WORKFLOW, "one owner per scope", "engineering-workflow"),
+    ("decision-levels", CLAUDE, "Test Level 4 overlay, then 3, 2, 1, else 0.", None),
+    ("host-refusal-not-bypassed", CLAUDE, "never bypassed or relabeled a product decision", None),
+    ("ready-for-release", ".claude/skills/decision-delegation/SKILL.md", "READY_FOR_RELEASE", "decision-delegation"),
+    ("no-deploy-via-merge", CLAUDE, "a merge that deploys or publishes needs its own authorization", None),
+    # Merge / CI.
+    ("merge-commit", CLAUDE, "Use **Create a merge commit**", None),
+    ("ci-unavailable-external", CLAUDE, "qualified `CI_UNAVAILABLE_EXTERNAL`", None),
+    ("owner-only-admin-merge", CLAUDE, "owner-only same-identity review deadlock", None),
+    ("owner-pr-no-formal-approval", WORKFLOW, "no formal GitHub review approval is required merely because the PR is owner-authored", "engineering-workflow"),
+    ("non-owner-needs-owner-approval", WORKFLOW, "a genuine formal `APPROVED` review by the authorized owner on the **current** head is required", "engineering-workflow"),
+    ("agent-never-submits-approval", WORKFLOW, "The agent never submits, simulates or substitutes that approval", "engineering-workflow"),
+    ("never-bypass-failing-gate", CLAUDE, "never bypass a genuine failing gate", None),
+    ("ci-no-merge-on-red", CLAUDE, "Do not merge on red CI.", None),
+    ("ci-no-suppression", CLAUDE, "Do not add suppression annotations to silence failures.", None),
+    ("ci-no-delete-failing-tests", CLAUDE, "Do not delete failing tests.", None),
+    ("ci-no-no-verify", CLAUDE, "Do not bypass pre-commit with `--no-verify`.", None),
+    ("ci-reproduce-locally", CLAUDE, "Reproduce locally", None),
+    ("ci-flaky-not-skipped", CLAUDE, "Do not mark them as skip.", None),
+    ("push-gate-no-no-verify", CLAUDE, "`full-test-gate.sh` and `precommit-gate.sh`", None),
+    # Release operations prohibitions.
+    ("release-no-manual-tags", CLAUDE, "Do not manually create git tags", None),
+    ("release-no-main-push", CLAUDE, "Do not push directly to `main` / `master` during a release window.", None),
+    ("release-no-ci-edits", CLAUDE, "Do not modify CI/CD pipeline definitions during active release.", None),
+    ("release-no-publish", CLAUDE, "Do not publish packages to registries", None),
+    # Routing and layering.
+    ("model-main", CLAUDE, "Main model: Sonnet, effort medium, permission mode Auto.", None),
+    ("model-opus-architect", CLAUDE, "delegate first to the `opus-architect` subagent", None),
+    ("mcp-prefer-capability", CLAUDE, "prefer it over manual", None),
+    ("mcp-active-servers", CLAUDE, "`fetch` is active by default", None),
+    ("layering-project-wins", CLAUDE, "Project values take precedence when both define the same concept.", None),
+    ("layering-global-applies", CLAUDE, "These global behavioral rules apply unless the project file explicitly overrides them.", None),
+    # Moved verbatim out of CLAUDE.md; CLAUDE.md names the owning reference.
+    ("circuit-breaker-stop", ".claude/skills/engineering-runtime/references/claude-runtime.md", "Do not attempt further repairs until the engineer reviews the situation", "claude-runtime reference"),
+    ("circuit-breaker-state", ".claude/skills/engineering-runtime/references/claude-runtime.md", "Write workflow state as `circuit_open`.", "claude-runtime reference"),
+    ("loop-no-recursion", ".claude/skills/engineering-runtime/references/claude-runtime.md", "A skill woken by a loop must not trigger another loop.", "claude-runtime reference"),
+    ("loop-no-self-repair", ".claude/skills/engineering-runtime/references/claude-runtime.md", "A skill must not enter a self-repair cycle", "claude-runtime reference"),
+    ("no-hardcoded-ticket", ".claude/skills/engineering-runtime/references/claude-runtime.md", "Skills\nmust never hardcode a ticket ref", "claude-runtime reference"),
+    ("bot-no-manual-lockfile", ".claude/skills/bot-pr-maintainer/references/bot-pr-policy.md", "Do not manually resolve lock-file conflicts in bot PRs", "bot-pr-policy"),
+    ("bot-escalate-on-update-failure", ".claude/skills/bot-pr-maintainer/references/bot-pr-policy.md", "escalate to the engineer", "bot-pr-policy"),
+    ("cross-repo-qa-gate", ".claude/skills/cross-repo-coordinator/references/cross-repo-work.md", "Every per-repo sub-ticket has passed QA.", "cross-repo-work"),
+    ("cross-repo-integration-gate", ".claude/skills/cross-repo-coordinator/references/cross-repo-work.md", "Integration tests pass", "cross-repo-work"),
+    ("tests-no-disabling", ".claude/skills/feature-implementation/references/quality-policies.md", "Do not disable failing tests.", "quality-policies"),
+    ("tests-regression", ".claude/skills/feature-implementation/references/quality-policies.md", "All bug fixes require a regression test.", "quality-policies"),
+    ("types-no-runtime-change", ".claude/skills/feature-implementation/references/quality-policies.md", "Type annotations must never change runtime behavior.", "quality-policies"),
+    ("types-scoped-suppression", ".claude/skills/feature-implementation/references/quality-policies.md", "never suppress an entire file or block without a documented reason", "quality-policies"),
+    ("lint-no-silent-suppression", ".claude/skills/feature-implementation/references/quality-policies.md", "Do not suppress lint warnings without a comment", "quality-policies"),
+    ("ci-no-surface-fixes", ".claude/skills/ci-failure-triage/references/claude-ci-triage.md", "Do not apply surface-level fixes.", "claude-ci-triage"),
+    ("release-observe-only", ".claude/skills/release-watch/references/release-operations.md", "Observe release workflow state", "release-operations"),
+    ("delegation-conditions", ".claude/skills/architecture-design/references/model-routing-and-delegation.md", "Spawn an isolated sub-agent only when one of these is genuinely true", "model-routing-and-delegation"),
+    ("model-skip-opus-trivial", ".claude/skills/architecture-design/references/model-routing-and-delegation.md", "Skip `opus-architect` for trivial work", "model-routing-and-delegation"),
+    ("project-section-table", ".claude/skills/project-setup/references/project-claude-md.md", "Merge Gates", "project CLAUDE.md reference"),
+    ("skill-table", ".claude/skills/README.md", "| `post-merge-close` | Auto |", "skills/README.md"),
+]
+
+
+def normalized(path: str) -> str:
+    return " ".join((ROOT / path).read_text().split())
+
+
+def claude_md_copy_commands(text: str) -> list[str]:
+    """Return `cp` commands (backslash continuations joined) that copy CLAUDE.md into ~/.claude."""
+    joined = re.sub(r"\\\n\s*", " ", text)
+    commands = re.findall(r"^\s*cp\b[^\n]*", joined, re.MULTILINE)
+    return [" ".join(c.split()) for c in commands if "CLAUDE.md" in c and "~/.claude" in c]
+
+
+class ClaudeMdInvariants(unittest.TestCase):
+    def test_manifest_has_unique_ids(self) -> None:
+        ids = [clause[0] for clause in MANIFEST]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_every_clause_exists_where_the_manifest_says(self) -> None:
+        for clause_id, path, phrase, _ in MANIFEST:
+            with self.subTest(clause=clause_id):
+                self.assertIn(" ".join(phrase.split()), normalized(path))
+
+    def test_claude_md_routes_to_every_moved_clause(self) -> None:
+        claude = normalized(CLAUDE)
+        for clause_id, path, _, reach in MANIFEST:
+            if path == CLAUDE:
+                continue
+            with self.subTest(clause=clause_id):
+                self.assertTrue(reach, "clause outside CLAUDE.md needs a reach pointer")
+                self.assertIn(reach, claude)
+
+    def test_every_relative_link_in_claude_md_resolves(self) -> None:
+        text = (ROOT / CLAUDE).read_text()
+        links = re.findall(r"\]\((?!https?:|#)([^)#]+)", text)
+        self.assertGreater(len(links), 5)
+        for link in links:
+            with self.subTest(link=link):
+                self.assertTrue(((ROOT / ".claude") / link).is_file())
+
+    def test_readme_never_tells_readers_to_copy_claude_md_over_the_live_file(self) -> None:
+        readme = (ROOT / "README.md").read_text()
+        self.assertEqual(claude_md_copy_commands(readme), [])
+        self.assertIn("scripts/profile-install.sh --claude-skills", readme)
+        self.assertIn("base layer", readme)
+
+    def test_bot_pr_maintainer_skill_links_its_reference(self) -> None:
+        text = (ROOT / ".claude/skills/bot-pr-maintainer/SKILL.md").read_text()
+        self.assertIn("(references/bot-pr-policy.md)", text)
+        self.assertTrue((ROOT / ".claude/skills/bot-pr-maintainer/references/bot-pr-policy.md").is_file())
+
+    def test_ci_failure_triage_skill_links_its_reference(self) -> None:
+        text = (ROOT / ".claude/skills/ci-failure-triage/SKILL.md").read_text()
+        self.assertIn("(references/claude-ci-triage.md)", text)
+        self.assertTrue((ROOT / ".claude/skills/ci-failure-triage/references/claude-ci-triage.md").is_file())
+
+    def test_cross_repo_coordinator_skill_links_its_reference(self) -> None:
+        text = (ROOT / ".claude/skills/cross-repo-coordinator/SKILL.md").read_text()
+        self.assertIn("(references/cross-repo-work.md)", text)
+        self.assertTrue((ROOT / ".claude/skills/cross-repo-coordinator/references/cross-repo-work.md").is_file())
+
+    def test_feature_implementation_skill_links_its_reference(self) -> None:
+        text = (ROOT / ".claude/skills/feature-implementation/SKILL.md").read_text()
+        self.assertIn("(references/quality-policies.md)", text)
+        self.assertTrue((ROOT / ".claude/skills/feature-implementation/references/quality-policies.md").is_file())
+
+    def test_project_setup_skill_links_its_reference(self) -> None:
+        text = (ROOT / ".claude/skills/project-setup/SKILL.md").read_text()
+        self.assertIn("(references/project-claude-md.md)", text)
+        self.assertTrue((ROOT / ".claude/skills/project-setup/references/project-claude-md.md").is_file())
+
+    def test_release_watch_skill_links_its_reference(self) -> None:
+        text = (ROOT / ".claude/skills/release-watch/SKILL.md").read_text()
+        self.assertIn("(references/release-operations.md)", text)
+        self.assertTrue((ROOT / ".claude/skills/release-watch/references/release-operations.md").is_file())
+
+    def test_architecture_design_skill_links_its_reference(self) -> None:
+        text = (ROOT / ".claude/skills/architecture-design/SKILL.md").read_text()
+        self.assertIn("(references/model-routing-and-delegation.md)", text)
+        self.assertTrue((ROOT / ".claude/skills/architecture-design/references/model-routing-and-delegation.md").is_file())
+
+    def test_claude_md_links_to_the_file_owning_each_moved_clause(self) -> None:
+        claude = (ROOT / CLAUDE).read_text()
+        for clause_id, path, _, _ in MANIFEST:
+            if path == CLAUDE:
+                continue
+            target = path.removeprefix(".claude/")
+            with self.subTest(clause=clause_id):
+                self.assertIn(f"]({target})", claude)
+
+    def test_copy_check_catches_a_multiline_overwrite_even_with_the_safe_phrases(self) -> None:
+        scratch = (ROOT / "README.md").read_text() + (
+            "\n```bash\ncp -R .claude/CLAUDE.md .claude/RTK.md .claude/settings.json \\\n"
+            "      .claude/hooks ~/.claude/\n```\n"
+        )
+        self.assertIn("base layer", scratch)
+        self.assertIn("scripts/profile-install.sh --claude-skills", scratch)
+        self.assertEqual(len(claude_md_copy_commands(scratch)), 1)
+        self.assertEqual(claude_md_copy_commands((ROOT / "README.md").read_text()), [])
+
+    def test_readme_states_that_the_claude_installer_also_overwrites_shared_skills(self) -> None:
+        readme = " ".join((ROOT / "README.md").read_text().split())
+        self.assertIn("overwrites every shared skill file under `~/.claude/skills`", readme)
+        self.assertIn("saves a backup of replaced files", readme)
+        self.assertIn("--dry-run` or `--check` first", readme)
+        self.assertNotIn("reads only the block", readme)
+
+    def test_deploy_packet_covers_evidence_side_effects_rollback_and_probes(self) -> None:
+        text = (ROOT / "docs/DEPLOY-SPE-108.md").read_text()
+        for heading in ["## Evidence from a scratch HOME", "## Apply", "## Rollback", "## Acceptance probes"]:
+            with self.subTest(heading=heading):
+                self.assertIn(heading, text)
+        self.assertIn("profile-install.sh --claude-skills --dry-run", text)
+        self.assertIn("overwrites\n   every shared skill file", text)
+        self.assertIn("Prior state:", text)
+        for probe in ["Subagent cap", "PR-only delivery", "Commit format"]:
+            self.assertIn(probe, text)
+
+    def test_delivery_contract_sections_sit_inside_the_installed_span(self) -> None:
+        # The installer replaces only the engineering-workflow marker span in the live file, so a section
+        # outside it is never delivered. Retiring the legacy live sections is safe only if these are inside.
+        text = (ROOT / CLAUDE).read_text()
+        start = text.index("<!-- coding-agent-environment:engineering-workflow:start -->")
+        end = text.index("<!-- coding-agent-environment:engineering-workflow:end -->")
+        span = text[start:end]
+        for heading in ["Workflow Path", "Engineering Workflow Contract", "Push Gate and Worktree Adapter",
+                        "Delegation Model", "Merge Policy", "Decision Delegation"]:
+            with self.subTest(heading=heading):
+                self.assertEqual(span.count("\n## " + heading + "\n"), 1)
+                self.assertEqual(text.count("\n## " + heading + "\n"), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

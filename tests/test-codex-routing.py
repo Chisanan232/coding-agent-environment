@@ -18,9 +18,11 @@ ROLES = ('architect', 'implementer', 'reviewer')
 
 class RoutingTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=REPO)
+        self.temp = tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()).resolve())
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.addCleanup(os.chdir, Path.cwd())
+        os.chdir(self.root)
         self.home = self.root / 'home'
         self.home.mkdir()
         self.bin = self.root / 'codex-fake'
@@ -45,7 +47,7 @@ else: sys.exit(3)
 
     def run_cli(self, *args, ok=True, cwd=None):
         result = subprocess.run([sys.executable, str(SCRIPT), *args], env=self.env,
-                                cwd=cwd, text=True, capture_output=True)
+                                cwd=self.root if cwd is None else cwd, text=True, capture_output=True)
         if ok:
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         else:
@@ -91,8 +93,23 @@ else: sys.exit(3)
         self.assertEqual(self.config.read_bytes(), original)
         self.assertFalse((self.state / 'routing-owned-state.json').exists())
 
+    def test_receipt_owned_eight_thread_install_reconciles_to_seven(self):
+        key = 'max_concurrent_threads_per_session'
+        self.write_config('model = "gpt-6-astra"\nmodel_provider = "openai"\n')
+        self.install()
+        # Reproduce a pre-SPE-108 installation: config and receipt both own 8.
+        self.config.write_text(self.config.read_text().replace(f'{key} = 7', f'{key} = 8'))
+        receipt_path = self.state / 'routing-owned-state.json'
+        receipt = json.loads(receipt_path.read_text())
+        receipt['desired']['agents.' + key] = 8
+        receipt_path.write_text(json.dumps(receipt))
+        self.install()
+        self.assertEqual(__import__('tomllib').loads(self.config.read_text())['agents'][key], 7)
+        self.assertEqual(json.loads(receipt_path.read_text())['desired']['agents.' + key], 7)
+        self.run_cli('--check')
+
     def test_unmarked_exact_roles_and_preexisting_owned_fields_require_adoption(self):
-        self.write_config('[agents]\nenabled = true\nmax_concurrent_threads_per_session = 8\n')
+        self.write_config('[agents]\nenabled = true\nmax_concurrent_threads_per_session = 7\n')
         (self.state / 'agents').mkdir()
         for n, body in self.role_bytes().items():
             (self.state / 'agents' / (n + '.toml')).write_bytes(body.split(b'\n', 1)[1])
@@ -133,6 +150,23 @@ else: sys.exit(3)
           'models': {n: ('gpt-6-astra' if n != 'implementer' else 'gpt-6-luna') for n in ROLES}}))
         self.run_cli('--apply', '--resolution', str(resolution))
         self.run_cli('--check')
+
+    def test_fixture_ignores_caller_routing_but_explicit_project_still_refuses(self):
+        caller = self.root / 'caller'
+        (caller / '.codex').mkdir(parents=True)
+        (caller / '.codex' / 'config.toml').write_text('[agents.custom]\nmodel = "gpt-6-luna"\n')
+        self.write_config('model_provider = "openai"\n')
+        previous = Path.cwd()
+        try:
+            os.chdir(caller)
+            self.install()
+            self.run_cli('--check')
+            before = self.config.read_bytes()
+            refused = self.run_cli('--launch-check', ok=False, cwd=caller)
+            self.assertIn('Project routing override', refused.stderr)
+            self.assertEqual(self.config.read_bytes(), before)
+        finally:
+            os.chdir(previous)
 
     def test_launch_overrides_that_can_change_routing_refuse_without_writes(self):
         self.write_config('model_provider = "openai"\n')
@@ -204,7 +238,7 @@ default_subagent_model = "gpt-6-luna"
 default_subagent_reasoning_effort = "medium"
 [agents]
 enabled = true
-max_concurrent_threads_per_session = 8
+max_concurrent_threads_per_session = 7
 default_subagent_model = "gpt-6-luna"
 default_subagent_reasoning_effort = "medium"
 ''') + ''.join(fields) + '''
@@ -234,7 +268,7 @@ config_file = "agents/custom.toml"
           'models': {n: ('gpt-6-astra' if n != 'implementer' else 'gpt-6-luna') for n in ROLES}}))
         self.install('--resolution', str(resolution))
         final = __import__('tomllib').loads(self.config.read_text())
-        self.assertEqual(final['agents']['max_concurrent_threads_per_session'], 8)
+        self.assertEqual(final['agents']['max_concurrent_threads_per_session'], 7)
         self.assertEqual(final['agents']['custom'], {'name': 'custom', 'model': 'gpt-6-astra',
           'model_reasoning_effort': 'high', 'config_file': 'agents/custom.toml'})
         self.assertEqual(final['default_subagent_model'], 'gpt-6-astra')
@@ -249,7 +283,7 @@ config_file = "agents/custom.toml"
         self.assertNotIn('default_subagent_model', tomllib.loads(omitted)['agents'])
 
     def test_ambiguous_inline_and_dotted_owned_layouts_refuse_without_mutation(self):
-        for config in ('agents = { enabled = true, max_concurrent_threads_per_session = 8 }\n',
+        for config in ('agents = { enabled = true, max_concurrent_threads_per_session = 7 }\n',
                        'agents.enabled = true\n'):
             with self.subTest(config=config):
                 self.write_config(config)
@@ -376,7 +410,7 @@ config_file = "agents/custom.toml"
         self.run_cli('--check')
 
     def test_wrong_scalar_types_are_not_exact_adoption(self):
-        for value in ('[agents]\nenabled = 1\n', '[agents]\nmax_concurrent_threads_per_session = 8.0\n'):
+        for value in ('[agents]\nenabled = 1\n', '[agents]\nmax_concurrent_threads_per_session = 7.0\n'):
             self.write_config(value)
             self.run_cli('--apply', '--adopt-existing', ok=False)
             self.assertEqual(self.config.read_text(), value)

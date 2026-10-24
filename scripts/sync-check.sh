@@ -4,14 +4,24 @@
 #
 # Defaults to reporting all tracked surfaces. --codex checks only managed
 # signal-first Codex state. Applying is owned by profile-install.sh --global.
-# Usage: ./scripts/sync-check.sh [--codex | --capabilities | --full-parity]
+# Usage: ./scripts/sync-check.sh [--claude-clauses | --codex | --capabilities | --resource-policy | --full-parity]
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 SYNC_HOME="${CODING_AGENT_SYNC_HOME:-$HOME}"
 
-if [[ "${1:-}" == "--routing" && "$#" == 1 ]]; then
+if [[ "${1:-}" == "--statusline" && "$#" == 1 ]]; then
+    exec "${CODING_AGENT_STATUSLINE_PYTHON:-python3}" "$REPO_ROOT/scripts/statusline-install.py" --home "$SYNC_HOME" --check
+elif [[ "${1:-}" == "--launchers" && "$#" == 1 ]]; then
+    exec "${CODING_AGENT_STATUSLINE_PYTHON:-python3}" "$REPO_ROOT/scripts/launcher-install.py" --home "$SYNC_HOME" --check
+elif [[ "${1:-}" == "--claude-clauses" && "$#" == 1 ]]; then
+    exec python3 "$REPO_ROOT/scripts/claude-clause-drift.py" --home "$SYNC_HOME"
+elif [[ "${1:-}" == "--storage" && "$#" == 1 ]]; then
+    exec bash "$REPO_ROOT/scripts/profile-install.sh" --storage --check
+elif [[ "${1:-}" == "--resource-policy" && "$#" == 1 ]]; then
+    exec bash "$REPO_ROOT/scripts/profile-install.sh" --resource-policy --check
+elif [[ "${1:-}" == "--routing" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --routing --check
 elif [[ "${1:-}" == "--visuals" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --visuals --check
@@ -25,7 +35,7 @@ elif [[ "${1:-}" == "--full-parity" && "$#" == 1 ]]; then
 elif [[ "${1:-}" == "--capabilities" && "$#" == 1 ]]; then
     exec bash "$REPO_ROOT/scripts/profile-install.sh" --capabilities --check
 elif [[ "$#" != 0 ]]; then
-    echo 'Usage: sync-check.sh [--codex | --capabilities | --full-parity | --visuals]' >&2
+    echo 'Usage: sync-check.sh [--codex | --capabilities | --resource-policy | --full-parity | --visuals]' >&2
     exit 2
 fi
 
@@ -68,19 +78,55 @@ for pair in "${PAIRS[@]}"; do
 
     if [[ "$repo_rel" == ".claude/settings.json" ]]; then
         # Native plugin installs add root fields; compare the owned settings only.
-        if python3 - "$repo_path" "$live_path" <<'PYEOF'
+        #
+        # permissions.allow/ask/deny and autoMode.environment/allow get a SEMANTIC
+        # (subset) comparison, not exact-equality: a live machine legitimately
+        # extends this repo's portable rule set with machine-specific or
+        # corporate-private entries (ADR-0012) — that is not drift. Only a
+        # desired rule that is MISSING on live, or a changed defaultMode, or
+        # any other top-level key differing, counts as real drift.
+        set +e
+        settings_report="$(python3 - "$repo_path" "$live_path" <<'PYEOF'
 import json, sys
+
+def subset_report(label, desired, live):
+    missing = sorted(set(desired) - set(live))
+    return [f"  missing {label}: {m}" for m in missing]
+
 try:
     desired, live = [json.load(open(p)) for p in sys.argv[1:]]
-    ok = all(live.get(k) == v for k, v in desired.items() if k != "_scope_note")
-except (OSError, ValueError):
-    ok = False
-sys.exit(0 if ok else 1)
+except (OSError, ValueError) as e:
+    print(f"  unreadable: {e}")
+    sys.exit(1)
+
+problems = []
+for k, v in desired.items():
+    if k == "_scope_note":
+        continue
+    if k == "permissions":
+        live_perm = live.get("permissions", {})
+        for rule_key in ("allow", "ask", "deny"):
+            problems += subset_report(f"permissions.{rule_key}", v.get(rule_key, []), live_perm.get(rule_key, []))
+        if v.get("defaultMode") != live_perm.get("defaultMode"):
+            problems.append(f"  permissions.defaultMode: desired {v.get('defaultMode')!r}, live {live_perm.get('defaultMode')!r}")
+    elif k == "autoMode":
+        live_auto = live.get("autoMode", {})
+        for auto_key in ("environment", "allow"):
+            problems += subset_report(f"autoMode.{auto_key}", v.get(auto_key, []), live_auto.get(auto_key, []))
+    elif live.get(k) != v:
+        problems.append(f"  {k}: differs")
+
+print("\n".join(problems))
+sys.exit(1 if problems else 0)
 PYEOF
-        then
+)"
+        settings_status=$?
+        set -e
+        if [[ "$settings_status" -eq 0 ]]; then
             IDENTICAL=$((IDENTICAL + 1))
         else
             echo "DIFFERS        $repo_rel (owned settings)"
+            [[ -n "$settings_report" ]] && echo "$settings_report"
             DIFFER=$((DIFFER + 1))
         fi
         continue

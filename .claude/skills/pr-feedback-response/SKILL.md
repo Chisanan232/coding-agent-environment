@@ -27,8 +27,7 @@ Auto-used. Run when a PR has new review comments or a "Request Changes" verdict.
 ## Steps
 
 ### Phase 1 — Triage feedback
-1. Fetch the PR's current review state using `code_repository` MCP
-   (GitHub MCP `pull_request_read`).
+1. Fetch the PR's current review state with `gh pr view` and `gh api`.
 2. Collect all unresolved review comments and Request Changes verdicts.
 3. Categorize each comment:
    - **Must-fix**: blocking issue (correctness, security, policy violation).
@@ -44,7 +43,7 @@ Auto-used. Run when a PR has new review comments or a "Request Changes" verdict.
    b. Apply the minimal change that satisfies the comment.
    c. Run impacted tests after the change.
    d. Commit the fix as a standalone atomic commit referencing the reviewer:
-      Example: `🔧 fix(module): Address review feedback — [short description]`
+      Example: `🔧 (module): Address review feedback - [short description]`
 7. For each Discuss comment:
    a. Post a reply on the PR explaining the trade-off or asking a clarifying
       question. Do not make the change until consensus is reached.

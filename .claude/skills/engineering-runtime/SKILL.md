@@ -23,6 +23,14 @@ handoff from another host, read that host's relevant notes/checkpoints explicitl
 and reconcile them against current Git, PR and tracker evidence. Do not copy
 history, OAuth, secrets or an entire state directory.
 
+Managed context is created only in a freshly and exclusively created host root;
+legacy roots are never adopted. When `.current-context.json` exists, its valid
+active tuple is authoritative, while a cleared tombstone or invalid/unreadable
+object suppresses all environment and marker fallback. Preserve this
+context-capability reader during rollback: restoring marker-only bootstrap
+behavior could resurrect stale environment values. Context CAS tokens coordinate
+updates; they grant no task-release or cleanup authority.
+
 Invoke the canonical helpers through `$ENGINEERING_RUNTIME`: `workflow-state.sh`,
 `session-memory.sh`, `circuit-breaker-gate.sh`, `decision-log.sh`, `audit_log.sh`,
 `full-test-gate.sh`, `precommit-gate.sh`, `quality_gate.sh`. State/notes/decisions
@@ -54,3 +62,47 @@ for overrides. State-directory, strict/skip and threshold overrides use the
 `ENGINEERING_` names exported by the bootstrap. Claude legacy `CLAUDE_` names
 remain supported in Claude only. Never store credentials in these files; use
 native supported authentication. Opt-outs never replace required validation.
+
+
+Storage recovery uses the established Glomeris CLI. Run the existing repository
+`profile-install.sh --storage --dry-run`, then `--storage --apply --checkout PATH`
+from an exact pinned clean public Glomeris checkout. `sync-check.sh --storage`
+checks deployment provenance. Bootstrap exports `ENGINEERING_STORAGE_BIN` only
+when the shared local receipt, artifact ownership, source pin and executable
+SHA-256 agree; `ENGINEERING_STORAGE_STATUS` explains missing/outdated/refused
+installation. It reads no other host's credentials/history/configuration.
+
+Use the verified binary directly for `status --json`, `detect`, `explain` and
+`clean --dry-run`; the latter cannot execute. Inspect native CLI help for typed
+execution/recovery options and actual refusal codes. Preserve policy decisions,
+exit codes (including busy 75), estimates versus measured free-space delta and
+safe-exhaustion diagnostics. Never fall back to raw deletion or pre-acquire
+Glomeris's execution lock. Shared/active/unknown resources stay protected.
+A verified installation is not proof that startup hooks, daemon monitoring,
+all toolchains or autonomous worktree ownership are enabled. Native Glomeris
+is the only storage monitor; no additional daemon is installed by this profile.
+
+Shared closeout receipts use `scripts/closeout.py`, as specified by
+`post-merge-close`. Its shared user-local state coordinates hosts without copying
+host-private history/configuration. Hold the same live process handle across
+observe/act/verify/record; a per-write lock alone cannot serialize external actions.
+Status/receipts are evidence, never a cleanup grant. Context markers remain
+preserved until all writers use a coordinated ownership protocol.
+
+Native notes, workflow and context operations use the manifest-installed
+`$ENGINEERING_RUNTIME/ticket-state.py` helper.
+Capture `session-memory.sh snapshot TICKET` / `workflow-state.sh snapshot TICKET`
+while observing the completed task. Clearing/archiving requires that original
+token; concurrent replacement, even identical content in a new generation,
+refuses. Notes are archived durably rather than destroyed. Legacy files remain
+readable but cannot be cleared without coordinated writer provenance. These
+tokens are state snapshots, never proof that a task or session has finished.
+
+Closeout schema 2 separately checkpoints archive, decision and notes finalization.
+Read `effective_complete`; legacy terminal flags leave finalization unverified.
+Install the same helper for both hosts before reconciling legacy receipts.
+
+<!-- claude-only:start -->
+Claude-specific variables, workflow state, circuit breaker, session memory, polling and
+MCP routing details are in the [Claude runtime reference](references/claude-runtime.md).
+<!-- claude-only:end -->

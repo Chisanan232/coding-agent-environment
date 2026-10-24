@@ -1,0 +1,39 @@
+{
+  "profile": "personal",
+  "corporate_markers": [],
+  "known_repos": [],
+  "stale_after_seconds": 2700,
+  "notify": {
+    "agent_completed": false,
+    "idle": false,
+    "session_ended": true
+  },
+  "retry": {
+    "max_attempts": 5,
+    "base_seconds": 30,
+    "max_seconds": 900
+  },
+  "backends": {
+    "macos": {
+      "enabled": false
+    },
+    "ntfy": {
+      "enabled": false,
+      "approved_destination": "",
+      "server": "https://ntfy.sh",
+      "topic_env": "NTFY_TOPIC",
+      "topic_file": "",
+      "token_env": "",
+      "token_file": ""
+    },
+    "pushover": {
+      "enabled": false,
+      "approved_destination": "",
+      "token_env": "PUSHOVER_APP_TOKEN",
+      "token_file": "",
+      "user_env": "PUSHOVER_USER_KEY",
+      "user_file": ""
+    }
+  },
+  "_note": "Everything is off until a backend sets enabled to true. Credentials are environment-variable NAMES or file paths, never values. Remote backends also need approved_destination equal to the server host, and are refused on the corporate profile. Notifications show a repository name only if it is listed in known_repos; otherwise they say 'unlisted'."
+}

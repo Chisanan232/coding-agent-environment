@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""Hold an opted-in managed resource through the pinned Glomeris core."""
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import shlex
+import subprocess
+import sys
+import time
+import uuid
+
+RENEW_INTERVAL = 20
+BUSY_RETRY_WINDOW = 2
+BUSY_RETRY_INITIAL_DELAY = 0.1
+HOLD_RETRY_WINDOW = 10
+HOLD_RETRY_MAX_DELAY = 0.5
+NATIVE_REQUEST_TIMEOUT = 8
+NATIVE_ID = re.compile(r"^[0-9a-f]{32}$")
+
+
+def failed(reply):
+    return not isinstance(reply, dict) or reply.get("status") != "ok"
+
+
+def refuse(message):
+    print(f"coding-agent-resource: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def storage_binary(host):
+    home = Path.home()
+    skill = home / (".claude" if host == "claude" else ".codex") / "skills/engineering-runtime/scripts"
+    bootstrap = skill / "bootstrap.py"
+    if not bootstrap.is_file():
+        refuse(f"{host} engineering-runtime bootstrap is unavailable")
+    try:
+        result = subprocess.run([sys.executable, str(bootstrap)], check=True,
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        exports = {}
+        for line in result.stdout.splitlines():
+            fields = shlex.split(line)
+            if len(fields) == 2 and fields[0] == "export" and "=" in fields[1]:
+                key, value = fields[1].split("=", 1)
+                exports[key] = value
+    except (OSError, subprocess.SubprocessError, ValueError):
+        refuse("engineering-runtime bootstrap failed")
+    binary = exports.get("ENGINEERING_STORAGE_BIN", "")
+    if exports.get("ENGINEERING_STORAGE_STATUS") != "verified_installation" or not binary:
+        refuse("pinned Glomeris installation is not verified")
+    return binary
+
+
+class Core:
+    def __init__(self, binary, resource_id, generation, host, session, owner_pid):
+        self.command = [binary, "resource", "hold", resource_id, generation, "--host", host,
+                        "--session", session, "--owner-pid", str(owner_pid)]
+        self.start()
+
+    def start(self):
+        if hasattr(self, "selector"):
+            self.selector.close()
+        try:
+            self.process = subprocess.Popen(self.command, stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE, bufsize=0)
+            os.set_blocking(self.process.stdout.fileno(), False)
+            self.selector = selectors.DefaultSelector()
+            self.selector.register(self.process.stdout, selectors.EVENT_READ)
+            self.pending = bytearray()
+            self.reply_bytes_seen = False
+            self.broken = False
+        except OSError:
+            refuse("could not start verified Glomeris core")
+
+    def initial_hold(self):
+        deadline = time.monotonic() + HOLD_RETRY_WINDOW
+        delay = BUSY_RETRY_INITIAL_DELAY
+        while True:
+            reply = self.read_reply(timeout=max(0.01, deadline - time.monotonic()))
+            if reply is not None or self.reply_bytes_seen:
+                return reply
+            remaining = deadline - time.monotonic()
+            try:
+                code = self.process.wait(timeout=max(0.01, min(0.1, remaining)))
+            except subprocess.TimeoutExpired:
+                return None
+            remaining = deadline - time.monotonic()
+            if code != 75 or remaining <= 0:
+                return None
+            time.sleep(min(delay, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            delay = min(delay * 2, HOLD_RETRY_MAX_DELAY)
+            self.start()
+
+    def request(self, value, timeout=5):
+        if self.broken or self.process.poll() is not None:
+            self.broken = True
+            return None
+        try:
+            self.process.stdin.write((json.dumps(value, separators=(",", ":")) + "\n").encode())
+            self.process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError, json.JSONDecodeError):
+            self.broken = True
+            return None
+        return self.read_reply(timeout)
+
+    def read_reply(self, timeout=5):
+        if self.broken:
+            return None
+        deadline = time.monotonic() + timeout
+        try:
+            while time.monotonic() < deadline:
+                if b"\n" in self.pending:
+                    line, _, rest = self.pending.partition(b"\n")
+                    self.pending = bytearray(rest)
+                    reply = json.loads(line)
+                    if isinstance(reply, dict) and isinstance(reply.get("status"), str):
+                        return reply
+                    self.broken = True
+                    return None
+                events = self.selector.select(max(0, deadline - time.monotonic()))
+                if not events:
+                    self.broken = True
+                    return None
+                chunk = os.read(self.process.stdout.fileno(), 65536)
+                if not chunk:
+                    self.broken = True
+                    return None
+                self.reply_bytes_seen = True
+                self.pending.extend(chunk)
+            self.broken = True
+        except (OSError, ValueError, json.JSONDecodeError):
+            self.broken = True
+        return None
+
+    def close(self):
+        if self.process.poll() is None:
+            try:
+                self.process.stdin.close()
+            except OSError:
+                pass
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+def renew(core):
+    request = {"op": "renew"}
+    reply = core.request(request)
+    if not isinstance(reply, dict) or reply.get("status") != "busy":
+        return reply
+    deadline = time.monotonic() + BUSY_RETRY_WINDOW
+    delay = BUSY_RETRY_INITIAL_DELAY
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        time.sleep(min(delay, remaining))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        reply = core.request(request, timeout=remaining)
+        if not isinstance(reply, dict) or reply.get("status") != "busy":
+            return reply
+        delay = min(delay * 2, 0.5)
+    return reply
+
+
+class NativeRefusal(Exception):
+    pass
+
+
+def native_resources(raw):
+    try:
+        values = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise NativeRefusal("native resource list is invalid") from exc
+    if not isinstance(values, list) or not 1 <= len(values) <= 8:
+        raise NativeRefusal("native resource list must contain 1 to 8 entries")
+    result = []
+    seen = set()
+    for value in values:
+        if (not isinstance(value, dict) or set(value) != {"id", "generation"}
+                or not all(isinstance(value[key], str) and NATIVE_ID.fullmatch(value[key])
+                           for key in ("id", "generation"))):
+            raise NativeRefusal("native resource identity is invalid")
+        if value["id"] in seen:
+            raise NativeRefusal("native resource list contains a duplicate ID")
+        seen.add(value["id"])
+        result.append({"id": value["id"], "generation": value["generation"]})
+    return result
+
+
+def native_session():
+    session = (os.environ.get("CODING_AGENT_RESOURCE_SESSION_ID") or
+               os.environ.get("CODEX_THREAD_ID") or "")
+    if (not session or len(session) > 256 or
+            any(ord(char) < 32 or ord(char) == 127 for char in session)):
+        raise NativeRefusal("native mode requires an existing session identity")
+    return session
+
+
+def native_run(binary, args, request=None):
+    try:
+        result = subprocess.run([binary, *args], input=None if request is None else
+                                json.dumps(request, separators=(",", ":")),
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=NATIVE_REQUEST_TIMEOUT, check=False)
+        if result.returncode != 0:
+            raise NativeRefusal("Glomeris native custody request was not acknowledged")
+        return json.loads(result.stdout)
+    except NativeRefusal:
+        raise
+    except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError) as exc:
+        raise NativeRefusal("Glomeris native custody response was unavailable") from exc
+
+
+def native_revision(binary, resource):
+    try:
+        records = native_run(binary, ["resource", "native", "inspect", "--json"])
+    except NativeRefusal:
+        raise
+    matches = [record for record in records if isinstance(record, dict)
+               and record.get("id") == resource["id"]
+               and record.get("generation") == resource["generation"]] if isinstance(records, list) else []
+    if len(matches) != 1 or type(matches[0].get("revision")) is not int or matches[0]["revision"] < 0:
+        raise NativeRefusal("native resource revision could not be verified")
+    return matches[0]["revision"]
+
+
+def native_request(binary, resource, body):
+    revision = native_revision(binary, resource)
+    request = {"op": body["op"], "request_id": uuid.uuid4().hex,
+               "id": resource["id"], "generation": resource["generation"],
+               "revision": revision, **body}
+    reply = native_run(binary, ["resource", "native", "request", "--json"], request)
+    if (not isinstance(reply, dict) or reply.get("status") != "acknowledged"
+            or reply.get("id") != resource["id"]
+            or reply.get("generation") != resource["generation"]
+            or type(reply.get("revision")) is not int or reply["revision"] != revision + 1):
+        raise NativeRefusal("Glomeris native custody transition was not acknowledged")
+    return reply
+
+
+def native_update(binary, claim, update):
+    body = {"op": "update", "claim": claim["claim"], "epoch": claim["epoch"],
+            "token": claim["token"], "update": update}
+    return native_request(binary, claim, body)
+
+
+def cancel_native_intents(binary, claims, launch_id):
+    for claim in claims:
+        if claim.get("prepared"):
+            try:
+                native_update(binary, claim, {"kind": "cancel_unlaunched", "launch_id": launch_id})
+            except NativeRefusal:
+                pass
+
+
+def run_native(host, command, raw_resources):
+    try:
+        resources = native_resources(raw_resources)
+        session = native_session()
+        binary = storage_binary(host)
+    except NativeRefusal as exc:
+        refuse(str(exc))
+    except SystemExit:
+        raise
+
+    claims = []
+    try:
+        for resource in resources:
+            reply = native_request(binary, resource, {
+                "op": "acquire", "host": host, "session": session, "owner_pid": os.getpid()
+            })
+            capability = reply.get("capability")
+            if (not isinstance(capability, dict) or set(capability) != {"claim", "epoch", "token"}
+                    or not isinstance(capability["claim"], str)
+                    or type(capability["epoch"]) is not int or capability["epoch"] < 1
+                    or not isinstance(capability["token"], str) or not capability["token"]):
+                raise NativeRefusal("native resource acquisition capability was not confirmed")
+            claims.append({**resource, **capability, "prepared": False, "confirmed": False,
+                           "renewable": True})
+    except NativeRefusal as exc:
+        refuse(str(exc))
+
+    launch_id = uuid.uuid4().hex
+    try:
+        for claim in claims:
+            native_update(binary, claim, {"kind": "prepare_child", "launch_id": launch_id})
+            claim["prepared"] = True
+    except NativeRefusal as exc:
+        cancel_native_intents(binary, claims, launch_id)
+        refuse(str(exc))
+
+    child_env = os.environ.copy()
+    child_env.pop("CODING_AGENT_NATIVE_RESOURCES", None)
+    try:
+        child = subprocess.Popen(command, env=child_env, start_new_session=True)
+    except OSError:
+        cancel_native_intents(binary, claims, launch_id)
+        refuse("native process could not be started")
+
+    for claim in claims:
+        try:
+            native_update(binary, claim, {"kind": "confirm_child", "launch_id": launch_id,
+                                          "pid": child.pid})
+            claim["confirmed"] = True
+        except NativeRefusal:
+            print("coding-agent-resource: child registration unconfirmed; child and native claims are preserved",
+                  file=sys.stderr)
+
+    next_renew = time.monotonic() + RENEW_INTERVAL
+    while child.poll() is None:
+        wait_for = max(0.05, min(1.0, next_renew - time.monotonic()))
+        try:
+            child.wait(timeout=wait_for)
+        except subprocess.TimeoutExpired:
+            pass
+        except KeyboardInterrupt:
+            print("coding-agent-resource: interrupted; child continues and native claims are preserved",
+                  file=sys.stderr)
+            return 130
+        if child.poll() is None and time.monotonic() >= next_renew:
+            for claim in claims:
+                if claim["renewable"]:
+                    try:
+                        native_update(binary, claim, {"kind": "renew"})
+                    except NativeRefusal:
+                        claim["renewable"] = False
+                        print("coding-agent-resource: renewal unconfirmed; child continues and native claims are preserved",
+                              file=sys.stderr)
+            next_renew = time.monotonic() + RENEW_INTERVAL
+
+    code = child.wait()
+    for claim in claims:
+        try:
+            native_update(binary, claim, {"kind": "wait"})
+        except NativeRefusal:
+            print("coding-agent-resource: final native wait transition unconfirmed; claims are preserved",
+                  file=sys.stderr)
+    return code if code >= 0 else 128 - code
+
+def main(argv):
+    if len(argv) < 4 or argv[0] != "--host" or argv[1] not in ("claude", "codex") or argv[2] != "--":
+        refuse("usage: coding-agent-resource --host claude|codex -- COMMAND [ARG ...]")
+    host, command = argv[1], argv[3:]
+    if not command:
+        refuse("native command is missing")
+    native_opt_in = os.environ.get("CODING_AGENT_NATIVE_RESOURCES")
+    resource_id = os.environ.get("CODING_AGENT_MANAGED_RESOURCE_ID", "")
+    generation = os.environ.get("CODING_AGENT_MANAGED_RESOURCE_GENERATION", "")
+    if native_opt_in is not None:
+        if resource_id or generation:
+            refuse("managed and native resource modes cannot be combined")
+        return run_native(host, command, native_opt_in)
+    session = (os.environ.get("CODING_AGENT_RESOURCE_SESSION_ID") or
+               os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID") or "")
+    if not resource_id or not generation:
+        refuse("managed resource ID and generation must both be set")
+    if not session:
+        refuse("managed mode requires an existing session identity")
+    core = Core(storage_binary(host), resource_id, generation, host, session, os.getpid())
+    held = core.initial_hold()
+    if (not held or held.get("status") != "held" or held.get("id") != resource_id
+            or held.get("generation") != generation or not isinstance(held.get("path"), str)
+            or not Path(held["path"]).is_absolute()):
+        core.close()
+        refuse("Glomeris did not confirm the requested persisted resource hold")
+    resource_dir = held["path"]
+    if failed(core.request({"op": "child_pending"})):
+        core.close()
+        refuse("Glomeris did not acknowledge pending child scope")
+    child_env = os.environ.copy()
+    child_env["GLOMERIS_RESOURCE_DIR"] = resource_dir
+    try:
+        child = subprocess.Popen(command, env=child_env, start_new_session=True)
+    except OSError:
+        core.close()
+        refuse("native process could not be started")
+    registered = core.request({"op": "register_child", "pid": child.pid, "pgid": child.pid})
+    scope_confirmed = not failed(registered)
+    if child.poll() is not None:
+        scope_confirmed = False
+        print("coding-agent-resource: child exited before registration was confirmed; preserving resource hold", file=sys.stderr)
+    if not scope_confirmed:
+        if child.poll() is None:
+            print("coding-agent-resource: child registration unconfirmed; preserving child and resource hold", file=sys.stderr)
+    next_renew = time.monotonic() + RENEW_INTERVAL
+    while child.poll() is None:
+        wait = max(0.05, min(1.0, next_renew - time.monotonic()))
+        try:
+            child.wait(timeout=wait)
+        except subprocess.TimeoutExpired:
+            pass
+        if child.poll() is None and time.monotonic() >= next_renew:
+            if failed(renew(core)):
+                print("coding-agent-resource: renewal unconfirmed; child continues under persisted hold", file=sys.stderr)
+                scope_confirmed = False
+            next_renew = time.monotonic() + RENEW_INTERVAL
+    code = child.wait()
+    if scope_confirmed and failed(core.request({"op": "release"})):
+        print("coding-agent-resource: release unconfirmed; preserving resource hold for core reconciliation", file=sys.stderr)
+    core.close()
+    return code if code >= 0 else 128 - code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

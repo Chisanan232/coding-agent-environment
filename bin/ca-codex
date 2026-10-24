@@ -40,7 +40,10 @@ fi
 if [[ -f "${CODEX_HOME:-$HOME/.codex}/routing-owned-state.json" ]]; then
     ROUTING_ROOT="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent.parent)' "${BASH_SOURCE[0]}")"
     CODING_AGENT_CODEX_BIN="$CODEX_BIN" python3 "$ROUTING_ROOT/scripts/codex-routing.py" \
-        --launch-check -- "${ARGS[@]+"${ARGS[@]}"}" "$@"
+        --launch-check -- "${ARGS[@]+"${ARGS[@]}"}" "$@" 1>&2
 fi
 
+if [[ -n "${CODING_AGENT_MANAGED_RESOURCE_ID:-}" || -n "${CODING_AGENT_MANAGED_RESOURCE_GENERATION:-}" || -n "${CODING_AGENT_NATIVE_RESOURCES+x}" ]]; then
+    exec "$HERE/coding-agent-resource" --host codex -- "$CODEX_BIN" "${ARGS[@]+"${ARGS[@]}"}" "$@"
+fi
 exec "$CODEX_BIN" "${ARGS[@]+"${ARGS[@]}"}" "$@"

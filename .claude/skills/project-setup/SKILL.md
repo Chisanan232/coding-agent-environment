@@ -23,3 +23,7 @@ the native host's discovery/trust mechanism; executable file count is not proof
 of registration. Never auto-trust a new hook. Verify actual tools and commands,
 then report readiness and remaining gaps. Use `engineering-workflow` for merge
 strategy and `evidence-first-briefing` for persistent output.
+
+<!-- claude-only:start -->
+See the [reference](references/project-claude-md.md) for the global versus project CLAUDE.md split.
+<!-- claude-only:end -->

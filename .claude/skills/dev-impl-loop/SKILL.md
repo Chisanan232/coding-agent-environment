@@ -27,7 +27,11 @@ Auto-used. Run immediately after `ticket-pickup-check` passes.
 ## Ticket context
 Resolve the active ticket reference at the start of every phase:
 ```bash
-TICKET="${ENGINEERING_CURRENT_TICKET:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-ticket" 2>/dev/null || echo '')}"
+if [[ ${ENGINEERING_CONTEXT_STATUS:-legacy_uncoordinated} == legacy_uncoordinated ]]; then
+  TICKET="${ENGINEERING_CURRENT_TICKET:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-ticket" 2>/dev/null || echo '')}"
+else
+  TICKET="${ENGINEERING_CURRENT_TICKET-}"
+fi
 ```
 If empty, stop and ask the engineer to run `ticket-pickup-check` first.
 
@@ -36,7 +40,11 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
 ### Phase 0 — Environment verification (before the loop starts)
 1. Resolve the active worktree and change into it:
    ```bash
-   WORKTREE="${ENGINEERING_CURRENT_WORKTREE:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-worktree" 2>/dev/null || echo '')}"
+   if [[ ${ENGINEERING_CONTEXT_STATUS:-legacy_uncoordinated} == legacy_uncoordinated ]]; then
+     WORKTREE="${ENGINEERING_CURRENT_WORKTREE:-$(cat "${ENGINEERING_CONTEXT_DIR}/.current-worktree" 2>/dev/null || echo '')}"
+   else
+     WORKTREE="${ENGINEERING_CURRENT_WORKTREE-}"
+   fi
    if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
      cd "$WORKTREE"
    elif [ -n "$WORKTREE" ]; then
@@ -88,13 +96,14 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
       iteration. Follow all conventions in the active repository instructions (naming, structure, type hints).
    b. Run **relative tests only** — tests in the affected module or package.
       Do not run the full suite here (too slow for iteration).
-   c. If relative tests pass → commit the change with a GitEmoji message.
-      One unit of work = one commit. Examples:
-      - `✨ model(order): Add OrderStatus enum with PENDING, CONFIRMED, CANCELLED`
-      - `✨ repo(order): Add OrderRepository.find_by_user_id()`
-      - `🐛 service(payment): Fix double-charge on retry by checking idempotency key`
-      - `♻️ api(user): Extract _build_response() to remove duplication`
-      - `✅ test(order): Add unit tests for OrderRepository.find_by_user_id`
+   c. If relative tests pass → commit the change as one small commit in the `engineering-workflow` format
+      (`<GitEmoji> (<scope>): <imperative summary>`). One unit of work = one commit.
+      Examples:
+      - `✨ (order): Add OrderStatus enum with PENDING, CONFIRMED, CANCELLED`
+      - `✨ (order): Add OrderRepository.find_by_user_id()`
+      - `🐛 (payment): Fix double-charge on retry by checking idempotency key`
+      - `♻️ (user): Extract _build_response() to remove duplication`
+      - `✅ (order): Add unit tests for OrderRepository.find_by_user_id`
    d. If relative tests fail:
       - Analyze the root cause (do not guess — read the failure output).
       - Apply the minimal fix.

@@ -129,3 +129,36 @@ Auto-used. Claude Code invokes this skill when <tool> reports errors.
 
 After creating a new skill, add it to the **Language-Specific Repair Skills**
 section in your project's `.claude/CLAUDE.md`.
+## Skill Invocation Guide
+
+The following skills are available. Invoke them by their slash command or by
+asking Claude Code to run the named procedure.
+
+| Skill | Type | When to use |
+|---|---|---|
+| `ticket-intake` | Auto | When a new ticket arrives — before decomposition |
+| `task-decomposition` | Auto | After ticket-intake marks a ticket Accepted |
+| `ticket-pickup-check` | Auto | Before starting any implementation task |
+| `dev-impl-loop` | Auto | Drives the full implement→test→QA→PR cycle |
+| `feature-implementation` | Auto | Within dev-impl-loop: when implementing a feature |
+| `test-design` | Auto | When designing tests for new or changed code |
+| `code-review-prep` | Auto | Before opening a PR |
+| `ci-failure-triage` | Auto | When CI is red |
+| `acceptance-validation` | Auto | Before declaring implementation complete |
+| `bot-pr-maintainer` | Auto | When a bot PR is classified as clean or conflicted |
+| `pr-feedback-response` | Auto | When a PR has new review comments or Request Changes |
+| `post-merge-close` | Auto | After a PR is merged — close ticket, delete branch |
+| `cross-repo-coordinator` | Auto | Coordinate multi-repo ticket: sub-tickets, PR monitoring, integration gate, coordinated merge |
+| `/project-setup` | Command | Onboard a new repo — scaffold `.claude/CLAUDE.md`, gitignore, verify hooks |
+| `/workflow-resume` | Command | Resume an interrupted agent session for a ticket |
+| `/pr-readiness` | Command | Before opening a PR (full checklist run) |
+| `/pr-health-check` | Command | At each polling interval to assess all open PRs |
+| `/release-readiness` | Command | Before tagging a release |
+| `/release-preparation` | Command | When a release window opens |
+| `/dependency-upgrade-review` | Command | Before merging a dependency bump PR |
+
+### Language-specific repair skills
+
+Load the matching skill only when its tool fails. The installed inventory and
+extension guidance live in [skills/README.md](skills/README.md).
+

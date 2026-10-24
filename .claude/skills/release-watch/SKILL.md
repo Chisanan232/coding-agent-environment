@@ -26,11 +26,11 @@ polling interval until the release pipeline resolves.
    - Tag created by the automated workflow, or
    - Workflow dispatch on a release branch.
 2. Locate the CI pipeline run linked to the release:
-   - Use GitHub MCP to find the workflow run associated with the release tag or branch.
+   - Use `gh run list` to find the workflow run associated with the release tag or branch.
 3. Record the pipeline start time, trigger ref, and workflow name.
 
 ### Phase 2 — Observe at each polling interval
-4. Fetch the current pipeline status via GitHub MCP.
+4. Fetch the current pipeline status with `gh run view`.
 5. Record the state of each job: queued / in-progress / success / failure / cancelled.
 6. If all jobs are success → proceed to Phase 3 (success summary).
 7. If any job is failure → proceed to Phase 4 (failure report).
@@ -72,3 +72,5 @@ notify only when decision-relevant state changes and posting is authorized.
 - Do not attempt to manually complete a partially failed release.
 - If the pipeline is stuck (no progress for more than 30 minutes), report it and
   escalate — do not assume it will self-recover.
+
+See the [reference](references/release-operations.md) for the release window duties.

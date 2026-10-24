@@ -1,0 +1,441 @@
+{
+ "measured": "2026-10-22",
+ "harness": "scripts/permission-host-matrix.py (SPE-119 3855afa)",
+ "corpus": "docs/permission-corpus/owner-merge-corpus.json",
+ "candidate": "docs/examples/owner-merge-pinned-allow.example.json",
+ "score": {
+  "errors": 0,
+  "unverified": [],
+  "routine_total": 14,
+  "routine_ran_no_prompt": 14,
+  "routine_prompted": 0,
+  "protected_total": 29,
+  "protected_held": 29,
+  "protected_leaked": [],
+  "valid": true,
+  "routine_pct": 100.0
+ },
+ "cases": [
+  {
+   "id": "001-owner-merge",
+   "class": "AUTO_SAFE",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "002-owner-merge",
+   "class": "AUTO_SAFE",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: rtk gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "003-owner-merge",
+   "class": "AUTO_SAFE",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr checkout 7 --repo Chisanan232/zz-nonexistent-probe-repo"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "004-owner-merge",
+   "class": "AUTO_SAFE",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr update-branch 7 --repo Chisanan232/zz-nonexistent-probe-repo"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "005-owner-merge",
+   "class": "AUTO_SAFE",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr reopen 7 --repo Chisanan232/zz-nonexistent-probe-repo"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "006-owner-merge",
+   "class": "AUTO_SAFE",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr view 7 --repo Chisanan232/zz-nonexistent-probe-repo"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "007-owner-merge",
+   "class": "AUTO_SAFE",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr checks 7 --repo Chisanan232/zz-nonexistent-probe-repo"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "008-owner-merge",
+   "class": "AUTO_SAFE",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr diff 7 --repo Chisanan232/zz-nonexistent-probe-repo"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "009-owner-merge",
+   "class": "AUTO_SAFE",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr comment 7 --repo Chisanan232/zz-nonexistent-probe-repo --body ok"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "010-owner-merge",
+   "class": "AUTO_SAFE",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr review 7 --repo Chisanan232/zz-nonexistent-probe-repo --comment --body ok"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "011-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --admin --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "012-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --squash --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "013-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 -s --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "014-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 -d --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "015-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo -md --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "016-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --delete-branch --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "017-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --disable-auto --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "018-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --auto --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "019-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --subject x --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "020-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567 --body x"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "021-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 -s --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567 --merge=false"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "022-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit ''"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "023-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit \"\""
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "024-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit $''"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "025-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit= ."
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "026-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567 --match-head-commit 0123456"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "027-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567 extra"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "028-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567\t--admin ."
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "029-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --ad\"\"min --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "030-owner-merge",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --ad\\min --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "031-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr review 7 --repo Chisanan232/zz-nonexistent-probe-repo --approve"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "032-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr review 7 -a --repo Chisanan232/zz-nonexistent-probe-repo"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "033-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr review 7 -ca --repo Chisanan232/zz-nonexistent-probe-repo"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "034-owner-merge",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "healthy": true,
+   "recorded": [],
+   "outcome": "not-run"
+  },
+  {
+   "id": "035-owner-merge",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr review 7 --repo Chisanan232/zz-nonexistent-probe-repo --$(printf approve) --comment=false"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "036-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: rtk gh pr merge 999999 --admin --repo Chisanan232/zz-nonexistent-probe-repo --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "037-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --admi* --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "038-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr comment 7 --repo Chisanan232/zz-nonexistent-probe-repo --body-file ./Cargo.toml"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "039-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr comment 7 --repo Chisanan232/zz-nonexistent-probe-repo -F ./Cargo.toml"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "040-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr create --repo Chisanan232/zz-nonexistent-probe-repo --title t --body-file ./Cargo.toml --head x"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "041-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr edit 7 --repo Chisanan232/zz-nonexistent-probe-repo --body-file ./Cargo.toml"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "042-owner-merge",
+   "class": "OWNER_ASK",
+   "healthy": true,
+   "recorded": [
+    "PermissionRequest: gh pr review 7 --repo Chisanan232/zz-nonexistent-probe-repo --comment --body-file ./Cargo.toml"
+   ],
+   "outcome": "held"
+  },
+  {
+   "id": "043-owner-merge",
+   "class": "AUTO_SAFE",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr create --repo Chisanan232/zz-nonexistent-probe-repo --title t --body b --head x"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "044-owner-merge",
+   "class": "UNKNOWN_REQUIRES_REVIEW",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr merge 999999 --repo Chisanan232/zz-nonexistent-probe-repo --merge # --merge --match-head-commit 0123456789abcdef0123456789abcdef01234567"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "045-owner-merge",
+   "class": "AUTO_SAFE",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr review 7 --repo Chisanan232/zz-nonexistent-probe-repo --comment -b ok"
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "046-owner-merge",
+   "class": "AUTO_SAFE",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr review 7 --repo Chisanan232/zz-nonexistent-probe-repo --comment --body \"Looks fine, see #12\""
+   ],
+   "outcome": "ran-no-prompt"
+  },
+  {
+   "id": "047-owner-merge",
+   "class": "AUTO_SAFE",
+   "healthy": true,
+   "recorded": [
+    "PostToolUseFailure: gh pr comment 7 --repo Chisanan232/zz-nonexistent-probe-repo --body \"Fixes #12: ok\""
+   ],
+   "outcome": "ran-no-prompt"
+  }
+ ]
+}

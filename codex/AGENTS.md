@@ -46,13 +46,20 @@ EXISTING artifact audits. Never reopen already-approved work through these skill
 
 Use $engineering-workflow for the engineering lifecycle: branch and worktree,
 commits, validation, review, pull request, merge, Jira reconciliation, and cleanup.
-Pull-request titles use
-`[<ticket-number>] <emoji> <scope>: <imperative summary under 60 chars>`.
+It alone defines the commit, branch, worktree and pull-request formats; do not
+restate them here.
 
 The shared engineering-workflow contract alone owns the two narrowly authorized
 administrator-merge exceptions: qualified `CI_UNAVAILABLE_EXTERNAL` and verified
-owner-only same-identity review deadlock. Apply every evidence, identity, review,
+owner-only same-identity review deadlock (owner-admin merge needs no separate human
+Approve). Apply every evidence, identity, review,
 check and merge-strategy condition there; never bypass a genuine failing gate.
+
+Merge an eligible PR only with the `merge_command` that `scripts/owner-merge-gate.py check --settings` prints (the validating
+`owner-merge-runner` when offered, else the pinned `gh pr merge`, which needs approval); never choose another merge spelling or
+interface (including the GitHub MCP merge tool) to avoid a prompt or a refusal.
+
+The merge is its own tool call: never combine it with a review comment, CI polling, a readback (`gh pr view`, `gh api`), a pipe, `head`/`tail`, `&&`, `;` or any other chaining. The order is: independent review, check the exact PR head, verify required CI, run `owner-merge-gate.py check`, write the review evidence at the printed `evidence_path` (its own call; only by an authorized path, never self-approved), run the printed `merge_command` alone, then verify the merged state with `owner-merge-gate.py verify` in a separate call. A compound shell call matches no merge rule, so the host asks about the whole thing; that is a workflow error, not a runner failure.
 
 Apply the installed engineering skills by their actual triggers: `ticket-intake`
 for new unaccepted work, `ticket-pickup-check` before ticket implementation,
@@ -80,6 +87,8 @@ Use `code-review-prep`, `pr-readiness`, `pr-health-check`, `ci-failure-triage`,
 `pr-feedback-response` and `post-merge-close` at their lifecycle boundaries.
 Use `dependency-upgrade-review`/`bot-pr-maintainer` for bot updates: inspect scope,
 compatibility/security and exact-head checks; bot rebase owns lockfile conflicts.
+Bot and other non-owner PRs need a genuine owner `APPROVED` review on the current head
+(never submitted by the agent); owner-authored PRs need no formal GitHub approval.
 A genuine unrelated required-check failure still blocks merge.
 
 Use `release-preparation`, `release-readiness` and `release-watch` for preparation
@@ -109,11 +118,35 @@ Use named `architect` for consequential architecture/security/cross-repository
 ambiguity, `implementer` for bounded work after contracts stabilize, and
 `reviewer` for an independent final semantic/security/architecture gate.
 The orchestrator owns integration and routine work; escalate contradictions.
-Delegate independent work when it improves time to correct completion. Eight
-concurrent subagents is a ceiling, never a target: choose 1..8 from dependencies,
-token cost, expected speedup, mutable-state overlap and integration overhead.
+Delegate independent work when it improves time to correct completion; the
+`engineering-workflow` Delegation section owns the subagent maximum and scope
+ownership.
 Partition mutable file/state ownership; parallelize independent read-only work.
 Use targeted child context, and verify recorded model/reasoning after changes.
 Role selection never grants extra sandbox, approval or production authority.
+
+Decision delegation: act as senior engineer and release owner; full contract in
+`decision-delegation`. Levels govern product-decision escalation only and never
+narrow an explicit-confirmation, owner-decision, production, destructive,
+publication, IAM, payment, credential or CI-definition gate. Test Level 4 overlay,
+then 3, 2, 1, else 0. Level 0 routine engineering (implementation, refactor,
+tests, CI debugging, safe dependency bumps, bug fixes, reviews, merges passing
+every engineering-workflow gate, task-owned cleanup) and Level 1 architecture that
+leaves product guarantees, trust boundaries, data/privacy, authorization,
+public-compatibility and approved limits unchanged (review, record an ADR) never
+go to the founder. Level 2 founder decision at least for material product,
+budget/authority, public-compatibility, retention/privacy, credential-authority,
+fail-open/closed, new-spend or irreversible-data change, or any Level 1 invariant
+change: ONE packet. Level 3: cite the durable record of an already-authorized
+decision; never infer founder consent from any agent-produced record or the author
+field alone. Level 4: a host ASK/DENY/managed/classifier refusal is reported (exact
+operation, secrets redacted) and never bypassed or relabeled a product decision;
+approving a host prompt is not founder consent. Main coordinator continues the
+release DAG after each slice; a merge that deploys or publishes needs its own
+authorization; no fake human approval; preserve active or ambiguously owned
+worktrees and sessions (ownership needs a checkpoint record, not a name match).
+Jira: read with read-only tools, never mutate to read, never write placeholder
+bodies, never edit comments this session did not create, read back every mutation
+(FORNX-439 comment 27362 overwrite).
 
 <!-- coding-agent-environment:signal-first:end -->

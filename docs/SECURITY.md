@@ -60,8 +60,99 @@ sit above any profile overlay in the validated precedence (see
 audits that this remains true against the currently installed `claude`
 binary, since it's observed behavior rather than a published contract.
 
+## Permission governance (Auto Mode `allow`/`ask`/`deny`)
+
+`.claude/settings.json#permissions` is this repo's own attack-surface
+boundary, not just a convenience list. Full rationale, root-cause evidence,
+and the 60→47 `ask`-rule history: [ADR-0012](adr/0012-autonomous-permission-governance.md).
+
+**Baseline**: `defaultMode: "auto"` — Auto Mode's classifier, not
+`bypassPermissions`. `ask` rules force a prompt even in Auto Mode; they
+would be silently ineffective under `bypassPermissions` (`allow` rules lose
+effect there too), so the two settings are not interchangeable — never
+switch this repo's default to `bypassPermissions` to "fix" prompting.
+
+**Mandatory `ask`-gated operations** (never move to `allow` without a
+fresh, documented decision — not merely to reduce prompts):
+
+| Category | Rules |
+|---|---|
+| Force-push, any branch | `git push --force*` / `-f*`, bare and RTK-rewritten forms |
+| Destructive local history | `git reset --hard`, `git clean -f*` |
+| Unattributable process kill | `kill -9`, `pkill`, `killall` |
+| Repo/resource deletion via API | `gh repo delete`, `gh api … -X DELETE` / `--method DELETE` (both flag orderings) |
+| Infrastructure mutation | `terraform apply` (can mutate/replace production without `destroy`) |
+| Arbitrary cloud execution | `mcp__gcloud__run_gcloud_command` |
+| IAM mutation and credential minting | `add-/remove-iam-policy-binding`, `set-iam-policy` (gcloud, bq), `service-accounts keys create/upload`, `iam roles create/update`, `gsutil iam ch/set` and `acl ch/set`, `kubectl create (cluster)rolebinding`; bare and RTK-rewritten forms |
+| Production monetization | `mcp__polar-production__execute_tool` |
+| Managed-DB/storage deletion | every `mcp__neon__*delete*`/`disable_auth`/`reset_from_parent`/`*_credential`, every `mcp__cloudflare-bindings__*_delete` |
+| Trust-boundary widening | `mcp__github__delete_file`, `create_repository`, `fork_repository`, `mcp__claude_ai_Google_Drive__share_file` |
+
+**Static `deny` is empty (SPE-106).** The personal policy carries no
+user-controlled `deny`; the former deny families are `ask`-gated, and `ask`
+prompts in every permission mode, `bypassPermissions` included:
+`terraform destroy` and `apply` (typed as `terraform`, with or without a global flag; env-prefixed, absolute-path, `tofu` and `terragrunt` spellings are classifier-judged), wrapped `rtk proxy` control-plane, process-kill, shell-wrapper and protected-git commands (rtk never
+rewrites its own wrapper, so the plain and `rtk` rules cannot see them, see
+[SPE-83](https://lightning-dust-mite.atlassian.net/browse/SPE-83); routine raw-output builds, tests and
+searches through the wrapper do not ask, ADR 0012 Amendment 4),
+`gcloud secrets versions access`, and `mcp__neon__get_connection_string` (its
+return value *is* the secret). Approving such a prompt authorizes that one call;
+it is not permission to echo, log or store the value (CLAUDE.md item 21).
+Platform classifier defaults (`hard_deny`, `soft_deny`) and managed settings are
+outside this file and cannot be removed here. Details: ADR-0012 Amendment 2.
+
+**Known unresolved defect**: [SPE-83](https://lightning-dust-mite.atlassian.net/browse/SPE-83)
+— RTK's own PreToolUse self-decision can match an `allow` rule at
+`git <subcommand>` granularity (ignoring flags) and bypass a configured
+`ask` rule for the same subcommand. This repo's mitigation is structural:
+**no `allow` rule in `.claude/settings.json` matches `git push` in any
+form.** Do not reintroduce one — here or in a private profile overlay —
+without first re-verifying SPE-83's reproduction steps against the
+installed RTK version.
+
+**Accepted breadth**: `Bash(gh pr *)`, `Bash(gh pr merge:*)`,
+`mcp__github__create_pull_request`, and `mcp__github__merge_pull_request`
+are intentionally broad — `gh pr *` alone covers `create`, `merge`,
+`close`, `edit`, and `review --approve`. This is a deliberate choice, not
+an oversight (flagged by an automated security review of this ADR's own
+commit, evaluated, and kept): every operation it reaches is PR-scoped and
+reversible (closing/editing a PR, even merging one, can be undone through
+GitHub itself), and none of it reaches repository deletion, organization
+settings, or credential material — those stay behind their own `ask`/`deny`
+rules regardless (`gh repo delete`, `gh api … DELETE`, `create_repository`,
+`fork_repository`). Narrowing this further would mean re-litigating merge
+policy per subcommand, which ADR-0012 Decision 4/Consequences already
+explains a text rule cannot reliably do.
+
+**What a text-based permission rule cannot do** (classifier/`autoMode.environment`
+territory instead, by design — not a gap to "fix" with more rules): judge
+whether a `gh api` POST/PATCH/PUT targets content vs. settings; judge
+whether a deletion is inside or outside the agent's authorized scope;
+enforce a specific merge strategy (flags cannot be reliably
+pattern-matched, since `*` spans arbitrary trailing text); distinguish a
+transient classifier failure (fail-closed `429`/`automode-unavailable`,
+expected and correct) from an actual policy decision.
+
+**`sync-check.sh`'s subset comparison only flags a desired rule missing on
+a live machine** — it has no way to detect a live-only `allow` rule that
+shadows this repo's own `ask`/`deny` rule for the same command shape
+(flagged by an independent review, 2026-10-11). That's intentional (a
+machine legitimately extends the portable profile), but it means a
+careless private-profile-overlay addition could silently reintroduce the
+exact SPE-83 shadowing class this file documents — outside this repo's
+own visibility. Review any local `allow` addition against the mandatory
+table above before adding it.
+
 ## Repository visibility
 
 This repo is PUBLIC (verified via `gh repo view`, unchanged across the
 SPE-71 rename). Visibility changes are a consequential decision and are
 never made without the repository owner's explicit request.
+
+## Permission refinements (SPE-105)
+
+See ADR-0012 Amendment 1. Worktree `remove --force`, `prune` and `move` are
+`ask`; read-only git is allowed; the merge `autoMode.allow` entry is classifier
+guidance, not a rule. Secret-metadata allows for a specific project belong in a
+private overlay (`docs/examples/secret-metadata-overlay.example.json`), never in
+the tracked baseline. `gcloud secrets versions access` remains denied.
