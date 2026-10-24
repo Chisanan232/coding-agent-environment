@@ -1,13 +1,13 @@
 ---
 name: bot-pr-maintainer
-description: "Handle dependency bot and pre-commit maintenance bot PRs according to the Bot PR Policy in the active repository instructions: approve and merge clean PRs; trigger rebase and re-evaluate conflicted PRs; escalate only when the update itself causes CI failure."
+description: "Handle dependency bot and pre-commit maintenance bot PRs according to the Bot PR Policy in the active repository instructions: merge clean PRs once the owner has genuinely approved the current head; trigger rebase and re-evaluate conflicted PRs; escalate only when the update itself causes CI failure."
 ---
 
 # SKILL.md — bot-pr-maintainer
 
 ## Purpose
 Handle dependency bot and pre-commit maintenance bot PRs according to the
-Bot PR Policy in the active repository instructions: approve and merge clean PRs; trigger rebase and
+Bot PR Policy in the active repository instructions: merge clean PRs once the owner has genuinely approved the current head; trigger rebase and
 re-evaluate conflicted PRs; escalate only when the update itself causes CI failure.
 
 ## Type
@@ -28,9 +28,17 @@ Auto-used. Run via `pr-health-check` when a PR is classified as
 2. Confirm CI is green (all required checks pass).
 3. Confirm no merge conflicts.
 4. Confirm scope is limited to the automated update (no unexpected file changes).
-5. Approve the PR with `gh pr review <n> --repo <owner/repo> --approve` (never without the explicit number and repository; see `engineering-workflow` GitHub tool selection).
-6. Merge the PR using **Create a merge commit**, as required by
-   `engineering-workflow`.
+5. Verify a genuine formal GitHub `APPROVED` review by the repository owner on the
+   **current** PR head (`scripts/owner-merge-gate.py check` reports it as `owner_approved`; a stranger's approval
+   is not the owner's). A bot PR is
+   non-owner: an agent review, comment, or a prior-head approval never substitutes, and
+   the agent never submits or simulates that approval. If it is absent, request owner
+   approval (report the gate's `approve_command` as an owner action), keep the PR
+   pending in the health report, and stop for this PR.
+6. Once owner approval and every other gate pass, merge the PR using **Create a merge
+   commit**, as required by `engineering-workflow`. No further manual confirmation is
+   needed for an already authorized merge; a host denial is recorded and reported, never
+   routed around.
 7. Record the merge in the health report.
 
 ### Path B — Bot PR with lock-file conflict

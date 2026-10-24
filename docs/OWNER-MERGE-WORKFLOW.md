@@ -20,7 +20,7 @@ protection, host authorization, gate verdict).
    python3 scripts/owner-merge-gate.py check --repo OWNER/REPO --pr N --owners <owners>
    ```
 
-   - `PASS` (exit 0) prints the pinned merge command.
+   - `PASS` (exit 0) prints the `merge_command` and its `executor`: the owner-merge-runner when it is installed, allowlisted and host-allowed (ALLOW), otherwise the pinned `gh pr merge` (ASK). See `OWNER-MERGE-ENTRYPOINTS.md`.
    - `WAIT` (exit 2): CI pending or mergeability unknown. Run it again.
    - `ERROR` (exit 3): `gh` or the network failed. Fix that first; do not loop.
    - `REFUSE` (exit 1): read the reason codes and fix the cause; never reclassify a failure.
@@ -62,6 +62,14 @@ and pass `--ci-unavailable`. Any genuinely failing check still refuses.
 which checks a repository should have. It does not approve a PR, satisfy a required formal review, change branch protection, merge
 into a release or deployment branch, or authorize deployment or publication (it cannot see whether merging to the default branch deploys).
 
+## Merge decision: ALLOW / ASK / DENY (SPE-118)
+
+`check` also prints a `decision` that combines five separate dimensions (owner class, engineering gate, GitHub approval requirement, GitHub merge
+eligibility, host tool permission). With `--settings <settings.json>` it reads only the permission rules to judge the exact pinned command; without it the host
+dimension is `not_evaluated` and a passing PR is ASK, never ALLOW. A missing approval, stale evidence or a host prompt is ASK with a named resolver; a failed
+check, a cross-repository head, a closed PR, repository rules or a host deny rule is DENY. The gate verdict (PASS/WAIT/REFUSE) and its exit code are unchanged.
+The operator procedure, exact rules, apply and rollback commands and the test list are in [OWNER-MERGE-OPERATOR-GUIDE.md](OWNER-MERGE-OPERATOR-GUIDE.md).
+
 ## Pull request classes (SPE-116)
 
 `check` reports `class` in its output. The class decides who must approve; the gate never
@@ -70,7 +78,7 @@ changes it and fails closed when it cannot verify the author.
 | Class | Author | Extra requirement before PASS | Gate prints |
 |---|---|---|---|
 | A | The authenticated owner identity | Repository admin, or a verified code owner with write permission for every changed file (CODEOWNERS read from the default branch; teams and unsupported syntax never count; `dir/*` covers direct children only; a PR editing CODEOWNERS, renaming files or changing 30+ files never qualifies; only a 404 falls through to another CODEOWNERS file) | the pinned merge command |
-| B | A verified dependency bot (`dependabot`, `renovate`: bot flag, bot branch, bot-only commits, dependency manifests only) | A real GitHub APPROVE by the owner identity itself (not any other reviewer or bot) on the exact head | `WAIT` with `approve_command` until approved, then the pinned merge command |
+| B | A verified dependency bot (`dependabot`, `renovate`: bot flag, bot branch, bot-only commits, dependency manifests only) | A real GitHub APPROVE by the owner identity itself (not any other reviewer or bot) on the exact head | `WAIT` with `approve_command` until the owner (never the agent) approves, then the pinned merge command |
 | C | Anyone else, including a failed bot check | A genuine GitHub APPROVED review by the owner on the exact head; the agent's comment never substitutes; `--admin` is never printed | the pinned merge command |
 | unverified | Missing, deleted or ghost author | Refused: request owner review | nothing |
 
@@ -81,8 +89,11 @@ The review record's `reviewer` id is self-attested by the same identity that pos
 
 Limit: the gate runs under the owner's own GitHub token, so GitHub shows an agent-submitted
 approval and a personal one identically. The gate can prove an approval exists for the exact
-head, not who typed it. For class C the agent must never submit the approval (the host's
-Self-Approval rule blocks it); for class B the approval is the documented action.
+head, not who typed it. For class C the agent must never submit the approval; that is
+process-only too, as the host's Self-Approval rule covers only agent-authored PRs. For class B the approval is the owner's personal action: the
+agent must not run `approve_command`. That separation is process-only; neither the gate nor
+the host enforces it, so an agent-submitted APPROVE would pass the gate and is a policy
+violation, not a control.
 
 Bot PRs merge one at a time: `queue` marks only the first PASS runnable. After each merge,
 refresh the base, update the next branch with a merge from the base (no history rewrite), let

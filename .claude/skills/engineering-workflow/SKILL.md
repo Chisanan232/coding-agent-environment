@@ -132,8 +132,34 @@ references. Use the repository's `.github/PULL_REQUEST_TEMPLATE.md` when present
 Preserve any required repository pull-request template and fields otherwise.
 Omit file chronology and unsupported completion claims.
 
-Do not merge until required checks, code-owner approvals, conflict resolution,
-branch currency, and blocking review threads satisfy the repository's real gates.
+**PR classes and formal approval** (canonical; other files reference this, and
+`docs/OWNER-MERGE-WORKFLOW.md` has the gate table). The class is decided by
+`scripts/owner-merge-gate.py` from verified author identity, never from a PR claim:
+
+- **Owner-authored (Class A)**: no formal GitHub review approval is required merely because
+  the PR is owner-authored; no artificial self-approval and no second GitHub identity. An
+  empty review list or `reviewDecision` NONE is not a blocker. The PR merges automatically
+  once checks, independent engineering review, security and host gates pass.
+- **Non-owner and bot-authored (Class B/C)**: a genuine formal `APPROVED` review by the
+  authorized owner on the **current** head is required. Dependabot, Renovate and other bots
+  are non-owner even with write access. The agent never submits, simulates or substitutes
+  that approval; it requests it and continues automatically once it exists.
+- Independent agent engineering review, GitHub review approval, repository merge
+  eligibility and host authorization are four separate things; none stands in for another.
+  GitHub's own required-review rules (branch protection, rulesets, CODEOWNERS) still
+  apply to every class: a repository that genuinely requires a formal review
+  (`REVIEW_REQUIRED`) blocks, and the classes above never waive it; only narrow
+  exception 2 below addresses an owner-only same-identity deadlock.
+- A merge decision is **ALLOW / ASK / DENY**, judged per dimension (owner class, engineering gate, GitHub approval
+  requirement, GitHub merge eligibility, host tool permission); `owner-merge-gate.py check --settings` prints it. Anything a
+  human, the author or the agent can resolve is ASK with a named resolver (a host prompt, a genuine owner review, a
+  revalidation), never an unrecoverable failure; DENY is for non-waivable constraints such as a failed check or a
+  cross-repository head. An approved ASK covers exactly the one pinned operation; the agent never simulates the answer.
+  Details: `docs/OWNER-MERGE-OPERATOR-GUIDE.md`.
+
+Do not merge until required checks, CODEOWNERS-required approvals, the class approvals above,
+conflict resolution, branch currency, and blocking review threads satisfy the
+repository's real gates.
 Administrator merge is never a bypass for a genuine product, test, security,
 quality, conflict, or substantive review failure. Exactly two narrow exceptions
 are authorized below; neither grants blanket administrator authority.
@@ -142,6 +168,16 @@ findings and evidence back to that coordinator.
 Check a merge before and after with `scripts/owner-merge-gate.py` (read-only PASS/REFUSE/WAIT at the
 exact head; see `docs/OWNER-MERGE-WORKFLOW.md`). Its PASS is evidence, not a GitHub
 approval and not host authorization; a host denial of the merge stands and is reported.
+
+**Canonical merge executor** (interface independence; `docs/OWNER-MERGE-ENTRYPOINTS.md`). The agent never picks a merge
+spelling. `owner-merge-gate.py check --settings <user settings>` prints one `merge_command` and its `executor`:
+`owner-merge-runner` when the runner is installed, the repo is in the owner's runner allowlist and the host rule allows exactly that
+command (outcome ALLOW; run it as printed after writing the review-evidence file the gate names, and only after an independent review
+PASS at that exact head), otherwise the pinned `gh pr merge` (outcome ASK; the host prompts and a human answers). The runner re-validates
+class, head, checks and repository limits itself; its refusal, like any host or GitHub denial, is final: do not retry through `gh`, `rtk gh`,
+the GitHub MCP merge tool, the API or a wrapper. Non-owner and bot PRs still need the genuine owner approval first.
+
+The merge is its own tool call: never combine it with a review comment, CI polling, a readback (`gh pr view`, `gh api`), a pipe, `head`/`tail`, `&&`, `;` or any other chaining. The order is: independent review, check the exact PR head, verify required CI, run `owner-merge-gate.py check`, write the review evidence at the printed `evidence_path` (its own call; only by an authorized path, never self-approved), run the printed `merge_command` alone, then verify the merged state with `owner-merge-gate.py verify` in a separate call. A compound shell call matches no merge rule, so the host asks about the whole thing; that is a workflow error, not a runner failure.
 
 ### Narrow administrator merge exceptions
 

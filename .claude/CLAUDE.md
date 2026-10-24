@@ -206,9 +206,11 @@ Delegation section.
 
 ## Merge Policy
 
-Apply the required checks, code-owner approvals, conflict, branch-currency, and
-review-thread gates from
-[engineering-workflow](skills/engineering-workflow/SKILL.md). Use **Create a
+Apply the required checks, CODEOWNERS-required approvals, conflict,
+branch-currency, and review-thread gates from
+[engineering-workflow](skills/engineering-workflow/SKILL.md), which owns the PR
+classes: owner-authored PRs need no formal GitHub approval; non-owner and bot PRs
+need a genuine owner `APPROVED` review on the current head. Use **Create a
 merge commit**; do not squash or rebase-merge unless a later explicit user
 instruction authorizes that strategy.
 
@@ -228,7 +230,9 @@ Before heavy work run `scripts/memory-admission.py check --weight heavy` from th
 SPE-109 disk gate; it is not installed into `~/.claude`); one heavy
 lane at a time, never kill or delete another session's work, and treat a swap-used number as history, not current
 exhaustion. After a reboot treat earlier processes, locks, reservations and jobs as stale and reconcile before resuming.
-Use `gh` for GitHub; it never bypasses host authorization, PR classes, CI, reviews or the merge gate. Details:
+Use `gh` for GitHub; it never bypasses host authorization, PR classes, CI, reviews or the merge gate. Merge an eligible PR only with
+the `merge_command` that `scripts/owner-merge-gate.py check --settings` prints (the validating `owner-merge-runner` when offered, else the
+pinned `gh pr merge`, which asks); never choose another merge spelling or interface to avoid a prompt or a refusal. The merge is its own tool call: never combine it with a review comment, CI polling, a readback (`gh pr view`, `gh api`), a pipe, `head`/`tail`, `&&`, `;` or any other chaining. The order is: independent review, check the exact PR head, verify required CI, run `owner-merge-gate.py check`, write the review evidence at the printed `evidence_path` (its own call; only by an authorized path, never self-approved), run the printed `merge_command` alone, then verify the merged state with `owner-merge-gate.py verify` in a separate call. A compound shell call matches no merge rule, so the host asks about the whole thing; that is a workflow error, not a runner failure. Details:
 [engineering-workflow](skills/engineering-workflow/SKILL.md).
 
 ## Decision Delegation
@@ -263,7 +267,8 @@ bodies, never edit comments this session did not create, read back every mutatio
 ## Bot PR Policy
 
 Bot PRs that are CI-green, conflict-free and limited to the automated update are
-approved and merged. Lock-file conflicts are resolved by asking the bot to rebase,
+merged once the owner has genuinely approved the current head (the agent never submits
+that approval). Lock-file conflicts are resolved by asking the bot to rebase,
 never by hand. If the update itself causes a CI failure, escalate and do not merge.
 `bot-pr-maintainer` and `pr-health-check` run this loop; the full policy is in
 [bot-pr-policy](skills/bot-pr-maintainer/references/bot-pr-policy.md).

@@ -42,3 +42,5 @@
 
 # Private policy overlay (live-only clauses) — never committed.
 **/CLAUDE.private.md
+# SPE-120: per-worktree structured session checkpoint (written by session-notify.py checkpoint)
+.claude/.session-status.json

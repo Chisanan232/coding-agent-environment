@@ -1,0 +1,104 @@
+{
+  "_note": "Template only. The owner merges the `hooks` block into ~/.claude/settings.json by hand after replacing the path; nothing in this repository writes that file. Every hook is the same short-lived process, exits 0 and never blocks Claude. PostToolUse is the heartbeat that keeps a long run from looking stale; drop it only if you accept a longer stale_after_seconds.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/coding-agent-environment/scripts/session-notify.py hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/coding-agent-environment/scripts/session-notify.py hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/coding-agent-environment/scripts/session-notify.py hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/coding-agent-environment/scripts/session-notify.py hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/coding-agent-environment/scripts/session-notify.py hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/coding-agent-environment/scripts/session-notify.py hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/coding-agent-environment/scripts/session-notify.py hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/coding-agent-environment/scripts/session-notify.py hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /ABSOLUTE/PATH/TO/coding-agent-environment/scripts/session-notify.py hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

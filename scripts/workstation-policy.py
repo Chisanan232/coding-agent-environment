@@ -3,7 +3,7 @@
 
   workstation-policy.py fingerprint
   workstation-policy.py evaluate --profile FILE --action JSON [--fingerprint SHA256]
-  workstation-policy.py render-settings --kind personal|corporate [--asks-only] [--out FILE]
+  workstation-policy.py render-settings --kind personal|corporate [--asks-only | --proxy-scoped] [--out FILE]
   workstation-policy.py lint-settings FILE
 
 `evaluate` answers ALLOW, ASK or DENY for one described action. It is a decision function and a
@@ -36,8 +36,30 @@ PROTECTED_RELATIVE = (".claude/settings.json", ".claude/settings.local.json", ".
 BENIGN_KEYS = {"model", "effortlevel", "advisormodel", "theme", "verbose"}
 NON_GOVERNED_KINDS = {"local"}
 # The only wildcard Bash allows a candidate may carry; everything else with a `*` is reported. Case-sensitive on purpose.
+# Read-only git verbs seen denied in real sessions (git ls-tree) with no allow: bare and rtk spellings. cat-file and blame are left out (cat-file --textconv/--filters and blame, which enables textconv by default, run configured helpers).
+ROUTINE_BARE_ALLOW = [f"Bash({p}git {v}:*)" for v in ("ls-tree", "merge-base", "describe") for p in ("", "rtk ")]
+# `rg` is deliberately absent: `rg --pre CMD` runs CMD, and no bare rg allow exists to be at parity with.
+# SPE-119 adds the scoped `rtk proxy` spellings of read-only git, search and local cargo checks: `rtk proxy` is never rewritten by the
+# hook, so a rule naming the plain command does not see it, and the broad `rtk proxy *` ask it replaces cannot be overridden by an allow.
+PROXY_ROUTINE_ALLOW = (
+    [f"Bash(rtk proxy git {v}:*)" for v in ("diff", "show", "log", "status", "rev-parse", "rev-list", "ls-files", "merge-base")]
+    + [f"Bash(rtk proxy git {v}:*)" for v in ("ls-tree", "describe")]
+    + ["Bash(rtk proxy grep:*)"]
+    + [f"Bash(rtk proxy cargo {v}:*)" for v in ("test", "build", "check", "clippy", "fmt", "nextest run")]
+)
+# Wrapped twins of the bare asks that write files, run helpers or reach outside the repository (SPE-114 parity gaps).
+# git accepts any unique prefix of a long option, so the prefixes below are the shortest that stay unambiguous (--ou*, --ext*, --tex*,
+# --upl*); --no-index has no shorter unique spelling. A wrapped merge is never allowed by a wrapper rule: the pinned form is the plain command.
+PROXY_PARITY_ASKS = ["Bash(rtk proxy git*--ou*)", "Bash(rtk proxy git*--ext*)", "Bash(rtk proxy git*--no-index*)", "Bash(rtk proxy git fetch*--upl*)",
+                     "Bash(rtk proxy git*--tex*)", "Bash(rtk proxy gh pr merge*)"]
+# Every bare protected ask also asks when wrapped, so wrapping a release, publish, delete or force-push never lowers its protection.
+PROXY_TWIN_ASKS = None  # filled after ASK_BASH_RULES is defined
+# The only ask candidate-rollout may retire; any other ask stays until the owner removes it by hand.
+RETIRABLE_ASKS = ("Bash(rtk proxy *)",)
 READ_ONLY_ALLOW = re.compile(
-    r"Bash\((git (status|diff|log|show)|gh (pr|issue|run) (view|list|checks|diff|status)|ls|cat|pytest|python3 -m pytest)(:\*| \*)\)")
+    r"Bash\((git (status|diff|log|show)|gh (pr|issue|run) (view|list|checks|diff|status)|ls|cat|pytest|python3 -m pytest)(:\*| \*)\)"
+    r"|Bash\((rtk )?git (ls-tree|merge-base|describe):\*\)"
+    r"|Bash\(rtk proxy (git (diff|show|log|status|rev-parse|rev-list|ls-files|merge-base|ls-tree|describe)|grep|cargo (test|build|check|clippy|fmt|nextest run)):\*\)")
 
 ALTERNATIVES = {
     "documents": "share a redacted excerpt or a synthetic stand-in", "logs": "share a redacted excerpt with identifiers removed",
@@ -206,6 +228,9 @@ ASK_PATH_RULES = [f"{tool}({path})" for tool in ("Edit", "Write") for path in (
     "**/.claude/settings.json", "**/.claude/settings.local.json", "**/.claude/hooks/**", "**/.claude/plugins/**", "**/.mcp.json")]
 
 
+PROXY_TWIN_ASKS = [r.replace("Bash(", "Bash(rtk proxy ", 1) for r in ASK_BASH_RULES]
+
+
 def candidate(kind, asks_only=False):
     env = [
         "Source of truth: GitHub repositories owned by the owner; Jira for tickets; the workstation profile is " + kind + ".",
@@ -229,9 +254,117 @@ def candidate(kind, asks_only=False):
     return cand
 
 
-def lint_settings(cfg):
+MERGE_SCOPE_BASH_ASKS = ["Bash(gh pr merge:*)", "Bash(gh pr merge *)", "Bash(gh pr  merge*)", "Bash(gh -R * pr merge*)", "Bash(gh --repo * pr merge*)", "Bash(gh --repo=* pr merge*)", "Bash(gh -R=* pr merge*)",
+                         "Bash(gh pr -R=* merge *)", "Bash(gh pr -R=* merge)",
+                         "Bash(gh pr -R * merge *)", "Bash(gh pr -R * merge)", "Bash(gh pr --repo * merge *)", "Bash(gh pr --repo * merge)",
+                         "Bash(gh pr --repo=* merge *)", "Bash(gh pr --repo=* merge)",
+                         "Bash(gh api *pulls/*/merge*)", "Bash(gh api graphql*mergePullRequest*)", "Bash(gh api graphql*enablePullRequestAutoMerge*)"]
+MERGE_SCOPE_OTHER_ASKS = ["mcp__github__merge_pull_request"]
+_bare_twin = lambda rules: list(rules) + [r.replace("Bash(", "Bash(rtk ", 1) for r in rules]
+# Asks only a merge-scope candidate adds (the default candidate already asks on the other shapes); their presence marks one.
+MERGE_SCOPE_MARKERS = [r for r in _bare_twin(MERGE_SCOPE_BASH_ASKS) if r not in _bare_twin(ASK_BASH_RULES)]
+# Invocation shapes the candidate must make ask; checked against the prefix-rule emulator, not the real host matcher.
+MERGE_SCOPE_COMMANDS = ["gh pr merge 5", "gh pr merge 5 --repo o/r --merge --match-head-commit " + "a" * 40, "gh pr  merge 5", "gh -R o/r pr merge 5",
+                        "gh --repo o/r pr merge 5", "gh --repo=o/r pr merge 5", "gh -R=o/r pr merge 5", "gh pr -R=o/r merge 5", "gh pr -R o/r merge 5", "gh pr --repo o/r merge 5", "gh pr --repo=o/r merge 5", "gh api repos/o/r/pulls/5/merge -X PUT", "gh api graphql -f query=mutation{mergePullRequest}",
+                        "gh api graphql -f query=mutation{enablePullRequestAutoMerge}"]
+
+
+# Trusted ALLOW (SPE-118): the one allow rule that lets the validating runner merge without a prompt. The runner (structured args, exact head pin, evidence,
+# checks, audit) is the enforcement boundary; this rule only lets that one program start. It names no `gh` command, so none of the merge asks match it.
+TRUSTED_RUNNER_RULE_RE = re.compile(r"Bash\((/[^ *()]+)/\.claude/bin/owner-merge-runner --repo \* --pr \* --expect-head \* --review-evidence \*\)")
+
+
+def trusted_runner_rule(home):
+    return f"Bash({home}/.claude/bin/owner-merge-runner --repo * --pr * --expect-head * --review-evidence *)"
+
+
+def trusted_allow_candidate(home=None):
+    """One allow rule, nothing else: no ask, no deny, no autoMode, no hook. The merge asks stay, so a direct `gh pr merge` still asks."""
+    rule = trusted_runner_rule(home or os.path.expanduser("~"))
+    return {
+        "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Adds the single allow rule for the validating "
+                       "owner-merge-runner at its installed path. Adds no ask, no deny and no autoMode change; the direct-merge asks stay, so a direct gh pr merge still asks. "
+                       "Requires the ASK-first candidate to be applied and the runner installed at that exact path.",
+        "permissions": {"allow": [rule], "deny": []},
+    }
+
+
+def merge_scope_candidate():
+    """SPE-118: make the common direct merge routes ask. Asks win over allows, so the broad `gh pr merge` / `gh pr *` / GitHub MCP merge
+    allows stop working for these shapes without being removed. Prefix rules cannot cover every shape (a tab, `command gh`, `sh -c`,
+    env prefixes, aliases); those fall to the Auto Mode classifier, not to a rule. Adds no allow, no autoMode change and no runner
+    rule (that broadens host authorization and stays an owner decision)."""
+    asks = MERGE_SCOPE_BASH_ASKS + [r.replace("Bash(", "Bash(rtk ", 1) for r in MERGE_SCOPE_BASH_ASKS] + MERGE_SCOPE_OTHER_ASKS
+    return {
+        "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Adds asks for the common direct merge shapes "
+                       "(gh pr merge, rtk gh pr merge, gh -R/--repo ... pr merge, gh api .../merge, GraphQL mergePullRequest, the GitHub MCP merge tool) so the broad merge allows no longer run silently for them. "
+                       "Prefix rules cannot cover every shape; others fall to the Auto Mode classifier. Adds no allow and no autoMode change; the validating runner's allow rule stays an owner step.",
+        "permissions": {"ask": asks, "deny": []},
+    }
+
+
+def proxy_scoped_candidate():
+    """SPE-119: retire the broad `rtk proxy *` ask, keep every protected wrapped operation asking, allow routine wrapped work.
+
+    The scoped asks are read from the repository baseline (the SPE-114 rules and their tests), not retyped here.
+    """
+    base = json.loads((pathlib.Path(__file__).resolve().parent.parent / ".claude/settings.json").read_text())["permissions"]["ask"]
+    gh_api = {f"Bash({p}gh api {f}*)" for p in ("", "rtk ") for f in ("-X DELETE", "--method DELETE")}
+    asks = [r for r in base if "rtk proxy" in r or r in gh_api]
+    asks += [r for r in PROXY_PARITY_ASKS + PROXY_TWIN_ASKS if r not in asks]
+    return {
+        "_scope_note": "Candidate only. Review and deploy by hand with candidate-rollout.py; never applied automatically. Retires the broad Bash(rtk proxy *) ask "
+                       "(an ask cannot be overridden by a narrower allow) and replaces it with scoped asks plus scoped allows for routine wrapped work. No autoMode change.",
+        "permissions": {"ask": asks, "allow": PROXY_ROUTINE_ALLOW + ROUTINE_BARE_ALLOW, "retire_ask": list(RETIRABLE_ASKS), "deny": []},
+    }
+
+
+# A custom autoMode.allow entry is classifier guidance, never proof of review or authorization. It is accepted only when the
+# owner supplied that exact string in a registry file (the agent never authors this text) and it stays scoped to the
+# validating runner with an exact-head pin; the runner and gate remain the real enforcement.
+OWNER_ALLOW_REQUIRED = ("owner-merge-runner", "--expect-head")
+OWNER_ALLOW_FORBIDDEN = re.compile(
+    r"--admin|gh pr merge|bypass|dangerously|Bash\(|\bstanding\b|\bwithout\b|\bskip|\balways\b|\bwhatever\b|\bautomatic|\bapprov"
+    r"|\boverride|\bregardless|\bno review|\bnot needed|\boptional|\bomit|\bunreview|\bbot\b|\bpre-?authori|\bauto-?merge|\beligible"
+    r"|\bfuture\b|\bwaive|\bdisable|\bignore|\bauthori[sz]ed?\b.{0,40}\bmerge|\bmerge\w*\b.{0,40}\bauthori[sz]ed?\b"
+    r"|\b(any|every|all|each)\b.{0,30}\b(pull requests?|PRs?|merges?|repositor(y|ies))\b", re.I)
+STANDING_MERGE = re.compile(r"authorized pull request merge|standing\b.{0,40}\bmerge|merge\b.{0,40}\b(authori[sz]ation|without review)", re.I)
+OWNER_ALLOW_MAX = 3
+
+
+def load_owner_allow(path):
+    """Owner-supplied registry: a JSON array of strings. Anything else is refused rather than guessed at."""
+    return parse_owner_allow(pathlib.Path(path).read_bytes())
+
+
+def parse_owner_allow(raw):
+    data = json.loads(raw)
+    if not isinstance(data, list) or not all(isinstance(e, str) and e for e in data):
+        raise ValueError("owner allow registry must be a JSON array of non-empty strings")
+    return data
+
+
+def owner_allow_problems(entry):
+    bad = [f"owner autoMode.allow entry must mention {t!r}: {entry[:60]}" for t in OWNER_ALLOW_REQUIRED if t not in entry]
+    if len(entry) > 400:
+        bad.append(f"owner autoMode.allow entry over 400 chars: {entry[:60]}")
+    if not entry.isascii() or not entry.isprintable():  # homoglyphs and zero-width/format characters can hide a forbidden phrase
+        bad.append(f"owner autoMode.allow entry must be printable ASCII on one line: {entry[:60]!r}")
+    flat = " ".join(entry.split())  # newlines, tabs and runs of spaces must not split a forbidden phrase
+    if OWNER_ALLOW_FORBIDDEN.search(flat) or STANDING_MERGE.search(flat):
+        bad.append(f"owner autoMode.allow entry is broader than the pinned runner: {entry[:60]}")
+    return bad
+
+
+def lint_settings(cfg, owner_allow=()):
     """Invariants every candidate must hold. Returns a list of violations (empty means clean)."""
     bad = []
+    owner_allow = set(owner_allow)
+    accepted = [r for r in (cfg.get("autoMode") or {}).get("allow", [])[1:] if isinstance(r, str) and r in owner_allow]
+    for rule in accepted:
+        bad += owner_allow_problems(rule)
+    if len(accepted) > OWNER_ALLOW_MAX:
+        bad.append(f"more than {OWNER_ALLOW_MAX} owner autoMode.allow entries")
     am = cfg.get("autoMode") or {}
     for key in ("allow", "soft_deny", "hard_deny", "environment"):
         if key in am and (not am[key] or am[key][0] != "$defaults"):
@@ -240,6 +373,8 @@ def lint_settings(cfg):
     if len(env) > 8 or any(len(str(e)) > 300 for e in env):
         bad.append("autoMode.environment must stay short and factual (<= 8 entries of <= 300 chars)")
     for rule in am.get("allow", [])[1:]:
+        if isinstance(rule, str) and rule in accepted:
+            continue  # owner-registered: judged by owner_allow_problems and, like all text, by the blob checks below
         bad.append(f"custom autoMode.allow entry needs an independently documented need: {str(rule)[:60]}")
     blob = json.dumps(cfg)
     if re.search(r'"Bash\(\*\)"|Bash\(\*:\*\)', blob):
@@ -248,7 +383,7 @@ def lint_settings(cfg):
         bad.append("bypassPermissions must not appear")
     if (cfg.get("permissions") or {}).get("defaultMode") in ("dontAsk", "bypassPermissions") or cfg.get("defaultMode") in ("dontAsk", "bypassPermissions"):
         bad.append("defaultMode removes prompts")
-    if re.search(r"authorized pull request merge|standing\b.{0,40}\bmerge|merge\b.{0,40}\b(authori[sz]ation|without review)", blob, re.I):
+    if STANDING_MERGE.search(blob):
         bad.append("standing merge authorization text must not return")
     asks = [str(r) for r in (cfg.get("permissions") or {}).get("ask", [])]
     for r in asks:
@@ -260,6 +395,8 @@ def lint_settings(cfg):
             bad.append(f"blanket allow {r}")
         elif re.search(r"gh pr merge|gh api.*merge|--admin", r):
             bad.append(f"standing merge permission {r}")
+        elif TRUSTED_RUNNER_RULE_RE.fullmatch(r):
+            continue  # the one trusted-runner rule; the runner, not this rule, is the enforcement boundary
         elif "*" in r and not READ_ONLY_ALLOW.fullmatch(r):
             bad.append(f"wildcard allow outside the read-only allowlist {r}")
     return bad
@@ -286,8 +423,13 @@ def main(argv=None):
     r.add_argument("--kind", required=True, choices=("personal", "corporate"))
     r.add_argument("--out")
     r.add_argument("--asks-only", action="store_true", help="omit the autoMode block (minimal canary candidate)")
+    r.add_argument("--proxy-scoped", action="store_true", help="SPE-119 candidate: retire the broad rtk proxy ask, add scoped asks and allows")
+    r.add_argument("--trusted-allow", action="store_true", help="SPE-118 candidate: the single allow rule for the installed owner-merge-runner (no ask, no autoMode)")
+    r.add_argument("--merge-scope", action="store_true", help="SPE-118 candidate: ask for every direct merge route (no allow, no autoMode change)")
+    r.add_argument("--owner-allow-file", help="JSON array of owner-authored autoMode.allow entries to append after $defaults (each is linted; the agent never writes this text)")
     lint = sub.add_parser("lint-settings")
     lint.add_argument("file")
+    lint.add_argument("--owner-allow-file", help="owner registry that makes matching custom autoMode.allow entries acceptable")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "fingerprint":
@@ -302,14 +444,25 @@ def main(argv=None):
             print(json.dumps(out, indent=1))
             return {"ALLOW": 0, "ASK": 1, "DENY": 2}[out["verdict"]]
         if a.cmd == "render-settings":
-            text = json.dumps(candidate(a.kind, asks_only=a.asks_only), indent=2) + "\n"
+            if (a.merge_scope or a.trusted_allow) and (a.proxy_scoped or a.asks_only or (a.merge_scope and a.trusted_allow)):
+                raise ValueError("--merge-scope and --trusted-allow cannot be combined with each other, --proxy-scoped or --asks-only")
+            cand = trusted_allow_candidate() if a.trusted_allow else merge_scope_candidate() if a.merge_scope else proxy_scoped_candidate() if a.proxy_scoped else candidate(a.kind, asks_only=a.asks_only)
+            if a.owner_allow_file:
+                owner_allow = load_owner_allow(a.owner_allow_file)
+                if "autoMode" not in cand:
+                    raise ValueError("--owner-allow-file needs a candidate with an autoMode block (not --asks-only or --proxy-scoped)")
+                cand["autoMode"]["allow"] = ["$defaults"] + owner_allow
+                problems = lint_settings(cand, owner_allow)
+                if problems:
+                    raise ValueError("owner allow registry rejected: " + "; ".join(problems))
+            text = json.dumps(cand, indent=2) + "\n"
             if a.out:
                 with open(safe_out(a.out), "x") as fh:  # exclusive create: never overwrites an existing file
                     fh.write(text)
             else:
                 sys.stdout.write(text)
             return 0
-        problems = lint_settings(json.load(open(a.file)))
+        problems = lint_settings(json.load(open(a.file)), load_owner_allow(a.owner_allow_file) if a.owner_allow_file else ())
         print(json.dumps({"verdict": "CLEAN" if not problems else "VIOLATIONS", "problems": problems}, indent=1))
         return 0 if not problems else 1
     except Exception as ex:

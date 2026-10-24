@@ -18,10 +18,28 @@ on:
       - 'tests/test-engineering-constitution.py'
       - 'scripts/constitution-behavior-matrix.py'
       - 'tests/test-constitution-behavior-matrix.py'
+      - 'scripts/owner-merge-runner.py'
+      - 'scripts/owner-merge-evidence-sign.py'
+      - 'scripts/branch-protection-rollout.py'
+      - 'docs/OWNER-MERGE-AUTONOMY.md'
+      - 'tests/test-owner-merge-autonomy.py'
+      - 'tests/test-owner-merge-runner.py'
+      - 'tests/test-branch-protection-rollout.py'
+      - 'docs/permission-corpus/owner-merge-corpus.json'
+      - 'docs/examples/owner-merge-pinned-allow.example.json'
       - 'scripts/workstation-policy.py'
       - 'scripts/candidate-rollout.py'
+      - 'tests/test-rtk-proxy-prompt-removal.py'
+      - 'tests/test-permission-host-matrix.py'
+      - 'scripts/permission-host-matrix.py'
+      - 'docs/permission-corpus/routine-command-corpus.json'
+      - 'docs/ROLLOUT-RTK-PROXY-SCOPING.md'
       - 'scripts/workstation-policy-hook.py'
       - 'scripts/memory-admission.py'
+      - 'scripts/session-notify.py'
+      - 'tests/test-session-notify.py'
+      - 'docs/SESSION-NOTIFICATIONS.md'
+      - 'docs/examples/session-notify*.json'
       - 'scripts/mcp-scope-inspect.py'
       - 'scripts/campaign-resume.py'
       - 'scripts/spe108-live/**'
@@ -51,10 +69,28 @@ on:
       - 'tests/test-engineering-constitution.py'
       - 'scripts/constitution-behavior-matrix.py'
       - 'tests/test-constitution-behavior-matrix.py'
+      - 'scripts/owner-merge-runner.py'
+      - 'scripts/owner-merge-evidence-sign.py'
+      - 'scripts/branch-protection-rollout.py'
+      - 'docs/OWNER-MERGE-AUTONOMY.md'
+      - 'tests/test-owner-merge-autonomy.py'
+      - 'tests/test-owner-merge-runner.py'
+      - 'tests/test-branch-protection-rollout.py'
+      - 'docs/permission-corpus/owner-merge-corpus.json'
+      - 'docs/examples/owner-merge-pinned-allow.example.json'
       - 'scripts/workstation-policy.py'
       - 'scripts/candidate-rollout.py'
+      - 'tests/test-rtk-proxy-prompt-removal.py'
+      - 'tests/test-permission-host-matrix.py'
+      - 'scripts/permission-host-matrix.py'
+      - 'docs/permission-corpus/routine-command-corpus.json'
+      - 'docs/ROLLOUT-RTK-PROXY-SCOPING.md'
       - 'scripts/workstation-policy-hook.py'
       - 'scripts/memory-admission.py'
+      - 'scripts/session-notify.py'
+      - 'tests/test-session-notify.py'
+      - 'docs/SESSION-NOTIFICATIONS.md'
+      - 'docs/examples/session-notify*.json'
       - 'scripts/mcp-scope-inspect.py'
       - 'scripts/campaign-resume.py'
       - 'scripts/spe108-live/**'
@@ -109,11 +145,21 @@ jobs:
           python3 tests/test-owner-merge-gate-local.py
           python3 tests/test-engineering-constitution.py
           python3 tests/test-constitution-behavior-matrix.py
+          python3 tests/test-owner-merge-autonomy.py
+          python3 tests/test-owner-merge-runner.py
+          python3 tests/test-branch-protection-rollout.py
           python3 tests/test-pr-merge-policy.py
+          python3 tests/test-merge-decision.py
+          python3 tests/test-ask-first-apply.py
+          python3 tests/test-trusted-allow.py
+          python3 tests/test-canonical-executor.py
           python3 tests/test-workstation-policy.py
           python3 tests/test-candidate-rollout.py
+          python3 tests/test-rtk-proxy-prompt-removal.py
+          python3 tests/test-permission-host-matrix.py
           python3 tests/test-workstation-policy-hook.py
           python3 tests/test-memory-admission.py
+          python3 tests/test-session-notify.py
           python3 tests/test-mcp-scope-inspect.py
           python3 tests/test-spe108-live.py
           python3 tests/test-parity-dogfood.py

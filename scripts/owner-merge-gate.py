@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Read-only gate for autonomous owner pull-request merges (SPE-115).
 
-  owner-merge-gate.py check  --repo OWNER/REPO --pr N --owners a,b[,c] [--ci-unavailable]
+  owner-merge-gate.py check  --repo OWNER/REPO --pr N --owners a,b[,c] [--ci-unavailable] [--settings settings.json]
   owner-merge-gate.py verify --repo OWNER/REPO --pr N --head SHA
   owner-merge-gate.py queue  --repo OWNER/REPO --prs 5,6 --owners a,b      (print-only plan)
   owner-merge-gate.py evidence-line --head SHA --reviewer ID               (prints the record line)
+  owner-merge-gate.py evidence-json --repo R --pr N --head SHA --reviewer ID   (prints the JSON file the owner-merge-runner reads)
 
 `check` evaluates the exact PR head and prints one JSON verdict (PASS, REFUSE or WAIT) plus the
-merge command to run. It never merges, comments, approves or posts a status: the merge stays a
+merge command to run, and a `decision` (ALLOW, ASK or DENY across five separate dimensions; see
+docs/OWNER-MERGE-OPERATOR-GUIDE.md). It never merges, comments, approves or posts a status: the merge stays a
 separate, visible `gh pr merge` that the host classifier and the repository judge on their own.
 `verify` is the read-only post-merge check (merge commit exists, has the reviewed head as a parent
 and is on the base branch).
@@ -22,6 +24,7 @@ and only together with --ci-unavailable and only when no check genuinely failed.
 import argparse
 import base64
 import json
+import os
 import re
 import subprocess
 import sys
@@ -296,8 +299,9 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None):
     if p["reviewDecision"] == "REVIEW_REQUIRED" and (klass in ("A", "UNVERIFIED") or (klass in ("B", "C") and owner_approved)):
         reasons.append("FORMAL_APPROVAL_REQUIRED: the repository requires a formal approving review; the gate never substitutes for it")
     if klass == "B" and not owner_approved:
-        wait.append("AWAITING_BOT_APPROVAL: all other gates passed or pending; submit the real GitHub APPROVE (approve_command), then re-run check")
+        wait.append("AWAITING_BOT_APPROVAL: all other gates passed or pending; the owner must submit the real GitHub APPROVE (approve_command), then re-run check")
         facts["needs_approval"] = True
+        facts["approve_actor"] = "owner personally; the agent never submits or simulates this approval"
         facts["approve_command"] = (f"gh pr review {pr} --repo {repo} --approve --body "
                                     f"\"Dependency review recorded for head {head[:12]} in the OWNER-MERGE-REVIEW comment.\"")
     latest = {}
@@ -348,10 +352,12 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None):
         else:
             reasons.append("NO_CI_EVIDENCE: no completed checks on this head and no qualified CI_UNAVAILABLE_EXTERNAL record")
     facts["checks"] = len(checks)
-    facts["formal_github_approval"] = "APPROVED" in latest.values()
+    facts["formal_github_approval"] = "APPROVED" in latest.values()  # any reviewer; see owner_approved for the one that counts
+    facts["owner_approved"] = owner_approved
     if reasons or [w for w in wait if not w.startswith("AWAITING_BOT_APPROVAL")]:
         facts.pop("approve_command", None)  # approve only after every other gate has passed
         facts.pop("needs_approval", None)
+        facts.pop("approve_actor", None)
     if reasons:
         return "REFUSE", reasons + wait, facts
     if wait:
@@ -380,6 +386,162 @@ def merge_command(facts):
     return (f"gh pr merge {facts['pr']} --repo {facts['repo']} --merge --match-head-commit {facts['head']}")
 
 
+# --- Canonical executor (SPE-118): one trusted way to run an eligible merge ------------------------------------------------
+# The runner (scripts/owner-merge-runner.py, installed at ~/.claude/bin/owner-merge-runner) re-validates the PR itself and is the
+# only command the single Trusted ALLOW rule names. check offers it when it is installed, the repo is in the owner's runner
+# allowlist and the host allows exactly that command; otherwise it offers the direct pinned command, which the host ASKs for.
+# A runner refusal is binding: no direct-merge fallback is ever printed alongside it.
+RUNNER_REL = os.path.join(".claude", "bin", "owner-merge-runner")
+ALLOWLIST_REL = os.path.join(".claude", "owner-merge-runner-allowlist.json")
+EVIDENCE_REL = os.path.join(".claude", "owner-merge-evidence")
+
+
+def evidence_path(facts, home):
+    return os.path.join(home, EVIDENCE_REL, f"{facts['repo'].replace('/', '__')}-{facts['pr']}-{facts['head'][:12]}.json")
+
+
+def runner_command(facts, home):
+    return (f"{os.path.join(home, RUNNER_REL)} --repo {facts['repo']} --pr {facts['pr']} --expect-head {facts['head']} "
+            f"--review-evidence {evidence_path(facts, home)}")
+
+
+def runner_available(home):
+    """(installed, allowlisted repo names lower-cased). Reads only the allowlist's repo keys; any problem means not available."""
+    runner = os.path.join(home, RUNNER_REL)
+    installed = os.path.isfile(runner) and not os.path.islink(runner) and os.access(runner, os.X_OK)
+    try:
+        with open(os.path.join(home, ALLOWLIST_REL)) as fh:
+            repos = {k.lower() for k in json.load(fh)["repos"]}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        repos = set()
+    return installed, repos
+
+
+def select_executor(settings, facts, home, installed, repos):
+    """Pure: the command to run for a PASS and the host permission that judges it. Runner only when it is host-allowed."""
+    if installed and facts["repo"].lower() in repos:
+        command = runner_command(facts, home)
+        host = host_permission(settings, command, rtk_twin=False)
+        # The twin is never an authorization, but an explicit deny aimed at it still turns the runner off (the baseline rtk asks are not a signal).
+        if host == "allow" and host_permission(settings, command) != "deny":
+            return {"executor": "owner-merge-runner", "command": command, "host": host, "evidence_path": evidence_path(facts, home)}
+    command = merge_command(facts)
+    return {"executor": "direct-gh", "command": command, "host": host_permission(settings, command)}
+
+
+# --- Three-outcome decision (SPE-118): ALLOW / ASK / DENY -----------------------------------------------------------------
+# The gate verdict (PASS/WAIT/REFUSE) is only the engineering and GitHub dimensions. A decision also needs the host tool
+# permission, and a PASS in one dimension is never a PASS in all. DENY is reserved for constraints nobody here may waive;
+# everything a human, the author or the agent can resolve is ASK, so a missing approval is a request, not a dead end.
+# (outcome, resolver, dimension) per reason code; resolver says who clears it.
+DENY, ASK = "DENY", "ASK"
+REASON_TABLE = {
+    "UNAUTHORIZED_REPO": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"), "NOT_CANONICAL_REPO": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"),
+    "FORK_REPO": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"), "CROSS_REPOSITORY_HEAD": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"),
+    "NOT_OPEN": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"), "BLOCKED_BY_REPOSITORY_RULES": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"),
+    "NOT_REPO_ADMIN": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"), "NO_MERGE_PERMISSION": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"),
+    "OWNER_NOT_ADMINISTERED_BY_VIEWER": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"),
+    "OWNER_IDENTITY_NOT_VERIFIED": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"),
+    "CI_FAILED": (DENY, "author_fixes_ci", "ENGINEERING_GATE"),  # a genuinely failed check is not waivable here; remediate
+    "DRAFT": (ASK, "author_marks_ready", "GITHUB_MERGE_ELIGIBILITY"), "CONFLICTS": (ASK, "author_resolves_conflicts", "GITHUB_MERGE_ELIGIBILITY"),
+    "STALE_BRANCH": (ASK, "agent_revalidates", "GITHUB_MERGE_ELIGIBILITY"),
+    "MERGE_STATE_NOT_CLEAN": (ASK, "agent_revalidates", "GITHUB_MERGE_ELIGIBILITY"),
+    "BASE_NOT_DEFAULT_OR_DEPLOY": (ASK, "founder_authorizes_target", "GITHUB_MERGE_ELIGIBILITY"),
+    "MERGEABILITY_UNKNOWN": (ASK, "agent_revalidates", "GITHUB_MERGE_ELIGIBILITY"),
+    "MERGE_STATE_UNKNOWN": (ASK, "agent_revalidates", "GITHUB_MERGE_ELIGIBILITY"),
+    "THIRD_PARTY_NEEDS_OWNER_APPROVAL": (ASK, "owner_github_approval", "GITHUB_APPROVAL_REQUIREMENT"),
+    "OWNER_APPROVAL_STALE": (ASK, "owner_github_approval", "GITHUB_APPROVAL_REQUIREMENT"),
+    "AWAITING_BOT_APPROVAL": (ASK, "owner_github_approval", "GITHUB_APPROVAL_REQUIREMENT"),
+    "FORMAL_APPROVAL_REQUIRED": (ASK, "owner_github_approval", "GITHUB_APPROVAL_REQUIREMENT"),
+    "UNVERIFIED_AUTHOR": (ASK, "owner_review", "GITHUB_APPROVAL_REQUIREMENT"),
+    "CHANGES_REQUESTED": (ASK, "author_addresses_review", "GITHUB_APPROVAL_REQUIREMENT"),
+    "NO_REVIEW_EVIDENCE": (ASK, "agent_runs_independent_review", "ENGINEERING_GATE"),
+    "REVIEW_STALE": (ASK, "agent_runs_independent_review", "ENGINEERING_GATE"),
+    "REVIEW_NOT_INDEPENDENT": (ASK, "agent_runs_independent_review", "ENGINEERING_GATE"),
+    "REVIEW_NOT_CLEAN": (ASK, "author_fixes_findings", "ENGINEERING_GATE"),
+    "UNRESOLVED_REVIEW_THREADS": (ASK, "author_resolves_threads", "ENGINEERING_GATE"),
+    "REVIEW_THREADS_TRUNCATED": (ASK, "owner_review", "ENGINEERING_GATE"),
+    "EVIDENCE_TRUNCATED": (ASK, "owner_review", "ENGINEERING_GATE"),
+    "CI_PENDING": (ASK, "agent_revalidates", "ENGINEERING_GATE"),
+    "NO_CI_EVIDENCE": (ASK, "founder_risk_decision", "ENGINEERING_GATE"),
+}
+SEVERITY = {"ALLOW": 0, ASK: 1, DENY: 2}
+HOST_OUTCOME = {"allow": "ALLOW", "ask": ASK, "deny": DENY, "classifier": ASK, "not_evaluated": ASK}
+_HOST_RANK = {"deny": 3, "ask": 2, "classifier": 1, "allow": 0}
+
+
+def host_permission(settings_paths, command, rtk_twin=True):
+    """HOST_TOOL_PERMISSION for the exact pinned command, from the permission rules of one or more settings files.
+
+    Pass every layer you have (user, project, local, managed): rules are pooled and deny > ask > allow, and both the plain and the
+    rtk-rewritten spelling are judged (the live hook rewrites commands). Only the layers passed are read, so `allow` means "allowed by
+    these files", not "allowed by the host". Anything unparseable fails closed to `ask`: a non-string rule, a malformed `Bash(`
+    rule, or a bare `Bash` in ask. A bare `Bash` deny is a deny. No rule at all means the Auto Mode classifier decides, which is not
+    an authorization, so it is `classifier`. Nothing from the files is printed.
+    """
+    if not settings_paths:
+        return "not_evaluated"
+    if isinstance(settings_paths, str):
+        settings_paths = [settings_paths]
+    import importlib.util
+    import pathlib
+    spec = importlib.util.spec_from_file_location("permission_rollout", pathlib.Path(__file__).resolve().with_name("permission-rollout.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    pooled, broken = {"deny": [], "ask": [], "allow": []}, False
+    for path in settings_paths:
+        perms = (json.load(open(path)).get("permissions") or {})
+        for bucket in pooled:
+            for r in perms.get(bucket, []):
+                if not isinstance(r, str) or (r.startswith("Bash(") and not r.endswith(")")):
+                    broken = True
+                elif r == "Bash" and bucket == "deny":
+                    return "deny"
+                elif r == "Bash" and bucket == "ask":
+                    broken = True
+                else:
+                    pooled[bucket].append(r)
+    # rtk_twin=False judges only the literal spelling: the rewrite hook only touches commands rtk knows (gh, git, ...), never an absolute-path program
+    spellings = (command, "rtk " + command) if rtk_twin else (command,)
+    result = max((mod.static_decision(c, pooled) for c in spellings), key=lambda d: _HOST_RANK[d])
+    return "ask" if broken and _HOST_RANK[result] < _HOST_RANK["ask"] else result
+
+
+def decide(verdict, reasons, facts, host="not_evaluated", command=None):
+    """Combine the dimensions into ALLOW / ASK / DENY. Pure: no I/O, so every cell of the matrix is testable."""
+    dims = {"PR_OWNER_CLASS": facts.get("class", "UNKNOWN"), "ENGINEERING_GATE": "PASS", "GITHUB_APPROVAL_REQUIREMENT": "SATISFIED",
+            "GITHUB_MERGE_ELIGIBILITY": "ELIGIBLE", "HOST_TOOL_PERMISSION": host}
+    if facts.get("class") == "A":
+        dims["GITHUB_APPROVAL_REQUIREMENT"] = "NOT_REQUIRED"
+    outcome, asks, denies = "ALLOW", [], []
+    if verdict == "ERROR":
+        return {"outcome": DENY, "dimensions": dims, "asks": [], "denies": ["ERROR: the gate could not evaluate; fail closed"]}
+    for text in reasons:
+        code = text.split(":", 1)[0].strip()
+        o, resolver, dim = REASON_TABLE.get(code, (ASK, "owner_review", "ENGINEERING_GATE"))  # an unknown reason is never ALLOW
+        state = "BLOCKED" if o == DENY else "PENDING"
+        if dim == "ENGINEERING_GATE":
+            state = "FAIL" if o == DENY else "PENDING"
+        elif dim == "GITHUB_APPROVAL_REQUIREMENT":
+            state = "OWNER_APPROVAL_MISSING" if resolver == "owner_github_approval" else "PENDING"
+        if dims[dim] in ("PASS", "SATISFIED", "NOT_REQUIRED", "ELIGIBLE") or state in ("BLOCKED", "FAIL"):
+            dims[dim] = state  # a hard state is never softened by a later, milder reason
+        (denies if o == DENY else asks).append({"reason": text, "resolver": resolver})
+        if SEVERITY[o] > SEVERITY[outcome]:
+            outcome = o
+    if outcome == "ALLOW":  # every engineering/GitHub dimension passed; the host tool permission is the last, separate gate
+        outcome = HOST_OUTCOME[host]
+        if outcome == ASK:
+            asks.append({"reason": f"HOST_TOOL_PERMISSION {host}: the host does not allow this merge to run without a prompt",
+                         "resolver": "host_prompt"})
+        elif outcome == DENY:
+            denies.append({"reason": "HOST_TOOL_PERMISSION deny: a host rule denies this merge", "resolver": "none"})
+    out = {"outcome": outcome, "dimensions": dims, "asks": asks, "denies": denies}
+    if outcome in ("ALLOW", ASK) and verdict == "PASS":  # an approved ASK covers this one operation at this one head, nothing wider
+        out["approval_scope"] = "exactly the pinned operation: " + (command or merge_command(facts))
+    return out
+
+
 def host_denied(repo, pr, head, message):
     """Print-only record of a host refusal. A denial stands: no alternate route is ever offered."""
     if not REPO_RE.fullmatch(repo) or not re.fullmatch(r"[0-9a-f]{40}", head):
@@ -399,7 +561,22 @@ def evidence_line(head, reviewer, verdict="PASS", blocking=0):
     return f"OWNER-MERGE-REVIEW head={head} verdict={verdict} blocking={blocking} reviewer={reviewer}"
 
 
-def queue_report(run, repo, prs, owners, ci_unavailable=False):
+def evidence_json(repo, pr, base, head, reviewer, kind="independent-agent", now=None):
+    """The review-evidence record the validating runner reads (see owner-merge-runner.py load_evidence). Print-only; unsigned.
+
+    It records that an independent review of this exact head passed. It is never a GitHub approval, and the runner (not this
+    record) enforces the head pin, the checks and the class rules.
+    """
+    import time
+    if not REPO_RE.fullmatch(repo) or not re.fullmatch(r"[1-9][0-9]{0,8}", str(pr)) or not re.fullmatch(r"[0-9a-f]{40}", head) \
+            or not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", base) or not re.fullmatch(r"[A-Za-z0-9._:-]{3,64}", reviewer) \
+            or kind not in ("human", "independent-agent"):
+        raise ValueError("repo, pr, base, head (40-hex), reviewer and kind (human|independent-agent) must be well formed")
+    return {"repo": repo, "pr": int(pr), "base": base, "head": head, "verdict": "PASS", "reviewer": reviewer, "reviewer_kind": kind,
+            "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}
+
+
+def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None):
     """Text plan for the owner: gate verdict per PR, in the order given. Print-only."""
     lines, first = [], True
     for n in prs:
@@ -408,12 +585,18 @@ def queue_report(run, repo, prs, owners, ci_unavailable=False):
         except Exception as e:
             lines.append(f"#{n} ERROR  {type(e).__name__}: {str(e)[:200]}")
             continue
-        lines.append(f"#{n} {verdict} [{facts.get('class', '?')}]" + (f"  {'; '.join(reasons)}" if reasons else ""))
+        sel = select_executor(settings, facts, os.path.expanduser("~"), *runner_available(os.path.expanduser("~"))) if verdict == "PASS" else None
+        decision = decide(verdict, reasons, facts, sel["host"] if sel else "not_evaluated", sel and sel["command"])
+        lines.append(f"#{n} {verdict} [{facts.get('class', '?')}] decision={decision['outcome']}" + (f"  {'; '.join(reasons)}" if reasons else ""))
         if verdict == "WAIT" and facts.get("approve_command"):
-            lines.append("  approve (only after the gate passes), then re-run check: " + facts["approve_command"])
-        if verdict == "PASS":
-            lines.append(("  run: " if first else "  after the previous merge, re-run check (this branch will then be behind): ")
-                         + merge_command(facts))
+            lines.append("  owner action (the agent must not run this), then re-run check: " + facts["approve_command"])
+        if verdict == "PASS" and decision["outcome"] == DENY:
+            lines.append("  not runnable: " + "; ".join(d["reason"] for d in decision["denies"]))
+        elif verdict == "PASS":
+            head = "  run: " if first else "  after the previous merge, re-run check (this branch will then be behind): "
+            lines.append(head + sel["command"])
+            if sel.get("evidence_path"):
+                lines.append("  (write the review-evidence file named above only after an independent review PASS at this exact head)")
             first = False
     return "\n".join(lines)
 
@@ -428,12 +611,15 @@ def main(argv=None, run=None):
         sp.add_argument("--pr", type=int, required=True)
     sub.choices["check"].add_argument("--owners", required=True)
     sub.choices["check"].add_argument("--ci-unavailable", action="store_true")
+    SETTINGS_HELP = "settings.json whose permission rules are read (never printed) to judge HOST_TOOL_PERMISSION; repeat for every layer (user, project, local, managed)"
+    sub.choices["check"].add_argument("--settings", action="append", help=SETTINGS_HELP)
     sub.choices["verify"].add_argument("--head", required=True)
     q = sub.add_parser("queue")
     q.add_argument("--repo", required=True)
     q.add_argument("--prs", required=True, help="comma-separated PR numbers, in the order to consider")
     q.add_argument("--owners", required=True)
     q.add_argument("--ci-unavailable", action="store_true")
+    q.add_argument("--settings", action="append", help=SETTINGS_HELP)
     d = sub.add_parser("host-denied")
     d.add_argument("--repo", required=True)
     d.add_argument("--pr", type=int, required=True)
@@ -444,8 +630,18 @@ def main(argv=None, run=None):
     e.add_argument("--reviewer", required=True)
     e.add_argument("--verdict", default="PASS")
     e.add_argument("--blocking", type=int, default=0)
+    ej = sub.add_parser("evidence-json")
+    ej.add_argument("--repo", required=True)
+    ej.add_argument("--pr", required=True)
+    ej.add_argument("--base", default="main")
+    ej.add_argument("--head", required=True)
+    ej.add_argument("--reviewer", required=True)
+    ej.add_argument("--kind", default="independent-agent")
     a = ap.parse_args(argv)
     try:
+        if a.cmd == "evidence-json":
+            print(json.dumps(evidence_json(a.repo, a.pr, a.base, a.head, a.reviewer, a.kind), indent=1))
+            return 0
         if a.cmd == "evidence-line":
             print(evidence_line(a.head, a.reviewer, a.verdict, a.blocking))
             return 0
@@ -457,7 +653,7 @@ def main(argv=None, run=None):
             if not owners or not all(OWNER_RE.fullmatch(o) for o in owners):
                 print(json.dumps({"verdict": "REFUSE", "reasons": ["BAD_OWNERS"]}))
                 return 1
-            text = queue_report(run, a.repo, [int(x) for x in a.prs.split(",")], owners, a.ci_unavailable)
+            text = queue_report(run, a.repo, [int(x) for x in a.prs.split(",")], owners, a.ci_unavailable, a.settings)
             print(text)
             return 0 if all(re.match(r"#\d+ PASS ", l) for l in text.splitlines() if l.startswith("#")) else 1
         if a.cmd == "check":
@@ -467,15 +663,27 @@ def main(argv=None, run=None):
                 return 1
             verdict, reasons, facts = evaluate(run, a.repo, a.pr, owners, a.ci_unavailable)
             out = {"verdict": verdict, "reasons": reasons, **facts}
+            sel = None
             if verdict == "PASS":
-                out["merge_command"] = merge_command(facts)
+                sel = select_executor(a.settings, facts, os.path.expanduser("~"), *runner_available(os.path.expanduser("~")))
+            host = sel["host"] if sel else "not_evaluated"
+            out["decision"] = decide(verdict, reasons, facts, host, sel and sel["command"])
+            if sel and out["decision"]["outcome"] != DENY:  # a host deny leaves nothing to run
+                out["merge_command"], out["executor"] = sel["command"], sel["executor"]
+                if sel.get("evidence_path"):
+                    out["evidence_path"] = sel["evidence_path"]
+                    out["evidence_note"] = ("write this file only after an independent review PASS at this exact head "
+                                            "(owner-merge-gate.py evidence-json); the runner refuses without it")
             print(json.dumps(out, indent=1))
+            if out["decision"]["outcome"] == DENY and verdict == "PASS":
+                return 1
             return {"PASS": 0, "REFUSE": 1, "WAIT": 2}[verdict]
         out = verify(run, a.repo, a.pr, a.head)
         print(json.dumps(out, indent=1))
         return 0 if out["verdict"] == "VERIFIED" else 1
     except Exception as e:  # any failure is an ERROR (exit 3), never read as a REFUSE or a WAIT
-        print(json.dumps({"verdict": "ERROR", "reasons": [f"{type(e).__name__}: {str(e)[:300]}"]}))
+        print(json.dumps({"verdict": "ERROR", "reasons": [f"{type(e).__name__}: {str(e)[:300]}"],
+                          "decision": {"outcome": DENY, "denies": ["ERROR: the gate could not evaluate; fail closed"]}}))
         return 3
 
 
