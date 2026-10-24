@@ -262,6 +262,10 @@ class Invocation(unittest.TestCase):
             self.assertIn(f"{tool}(//tmp/claude-501/**)", denied)  # the /tmp -> /private/tmp alias
         for tool in ("Read", "Edit", "Write"):
             self.assertIn(f"{tool}(.git/**)", denied)
+        for name in (".ssh", ".aws", ".config", ".gnupg", "Library"):
+            for tool in ("Read", "Grep", "Glob", "Edit", "Write"):
+                self.assertIn(f"{tool}(//{home}/{name}/**)", denied)
+        self.assertIn(f"Write(//{home}/.zshrc)", denied)
 
     def test_workdir_must_be_outside_the_forbidden_roots(self):
         self.assertFalse(ev.workdir_is_safe(Path.home() / "Bryant-Developments" / "x"))
@@ -358,6 +362,39 @@ class FakeClaude(unittest.TestCase):
         self.assertEqual(ev.sensitive(["Edit: subprocess", "Bash: os.environ", "Edit: ~/", "Write: urllib",
                                        "Read: path outside workdir /etc"]),
                          ["Write: urllib", "Read: path outside workdir /etc"])
+
+    def test_audit_catches_traversal_home_references_and_user_paths(self):
+        def stream(name, **inp):
+            return json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": name, "input": inp}]}})
+        work = self.dir / "w2"
+        work.mkdir()
+        for name, inp in (("Read", {"file_path": "../../../etc/passwd"}), ("Read", {"file_path": "$HOME/.ssh/id_rsa"}),
+                          ("Glob", {"pattern": "../other_arm/**"}), ("Bash", {"command": "cat ../other_arm/x"}),
+                          ("Bash", {"command": "python3 -I tests/x.py $HOME"}),
+                          ("Bash", {"command": "ls /Users/someone"})):
+            self.assertTrue(ev.audit_stream(stream(name, **inp), work), (name, inp))
+        self.assertEqual(ev.audit_stream(stream("Read", file_path="tests/../lib.py"), work), [])
+        # ordinary searches must not flag: wildcard-leading globs, relative dirs, regex greps
+        for name, inp in (("Glob", {"pattern": "**/*.py"}), ("Glob", {"pattern": "*.py"}),
+                          ("Glob", {"pattern": "src/*.py"}), ("Glob", {"pattern": "tests/**", "path": str(work)}),
+                          ("Grep", {"pattern": "*foo"}), ("Grep", {"pattern": "def (f|g)\\(", "path": "tests"}),
+                          ("Grep", {"pattern": "x", "path": str(work / "tests")})):
+            self.assertEqual(ev.audit_stream(stream(name, **inp), work), [], (name, inp))
+        for cmd in ("cd .. && ls", "cd / ; ls", "cat ~/notes", "cd ~"):
+            self.assertTrue(ev.audit_stream(stream("Bash", command=cmd), work), cmd)
+        self.assertTrue(ev.audit_stream(stream("Glob", pattern="../other/**"), work))
+        self.assertTrue(ev.audit_stream(stream("Glob", pattern="/etc/*"), work))
+
+    def test_a_run_without_a_result_keeps_its_flags_and_replaces_a_stale_stream(self):
+        sidecar = Path(str(self.dir / "run.json") + ".stream.jsonl")
+        sidecar.write_text("STALE")
+        self.stub("echo '{\"type\": \"assistant\", \"message\": {\"content\": [{\"type\": \"tool_use\", "
+                  "\"name\": \"Bash\", \"input\": {\"command\": \"curl https://example.com\"}}]}}'\n")
+        rec = self.run_arm()
+        self.assertTrue(rec["is_error"])
+        self.assertTrue(rec["audit_flags"])
+        self.assertNotEqual(sidecar.read_text(), "STALE")
 
     def test_the_raw_stream_is_kept_next_to_the_record_for_later_audit(self):
         self.stub("echo '{\"type\": \"result\", \"is_error\": false, \"num_turns\": 1, \"modelUsage\": {}}'\n")
@@ -507,6 +544,51 @@ class RepoFixtures(unittest.TestCase):
         ok, _ = ev.run_oracle("python3 -I -c 'import sys; sys.exit(1)'", tree, home, 30, sandboxed=False)
         self.assertFalse(ok)
 
+    def test_exactly_one_task_may_skip_the_sandbox_and_only_after_a_clean_run(self):
+        corpus = json.loads(self.orig_corpus.read_text())
+        exempt = [t["id"] for t in corpus["tasks"] if t.get("oracle_unsandboxed")]
+        self.assertEqual(exempt, ["t84-refresher-plist"])
+        self.assertIn("setuid", next(t for t in corpus["tasks"] if t["id"] == exempt[0])["oracle_unsandboxed_reason"])
+        task = json.loads(self.corpus.read_text())["tasks"][0]
+        self.corpus.write_text(json.dumps({"tasks": [{**task, "oracle_unsandboxed": True}]}))
+        work = self.prepare("work3")
+        (work / "lib.py").write_text("def f():\n    return 2\n")
+        seen = []
+        orig = ev.run_oracle
+        ev.run_oracle = lambda cmd, cwd, home, timeout, sandboxed=True: (seen.append(sandboxed), (True, ""))[1]
+        try:
+            refused = self.grade(work)  # no run record: fail closed
+            self.assertIn("refused", refused["error"])
+            flagged = self.dir / "flagged.json"
+            flagged.write_text(json.dumps({"audit_flags": ["Bash: urllib"]}))
+            out = self.dir / "g.json"
+            with redirect_stdout(io.StringIO()):
+                ev.cmd_grade(ns(task="t", arm="A", workdir=str(work), out=str(out), repo=str(self.src), timeout=60,
+                                run_record=str(flagged)))
+            self.assertIn("refused", json.loads(out.read_text())["error"])
+            self.assertEqual(seen, [])  # arm code never ran unsandboxed
+            for bad in ({"task": "t", "arm": "A", "is_error": True, "audit_flags": []},   # errored run
+                        {"task": "t", "arm": "A", "is_error": False},                       # never audited
+                        {"task": "other", "arm": "A", "is_error": False, "audit_flags": []},  # wrong task
+                        {"task": "t", "arm": "B", "is_error": False, "audit_flags": []}):     # wrong arm
+                rec_path = self.dir / "bad.json"
+                rec_path.write_text(json.dumps(bad))
+                with redirect_stdout(io.StringIO()):
+                    ev.cmd_grade(ns(task="t", arm="A", workdir=str(work), out=str(out), repo=str(self.src),
+                                    timeout=60, run_record=str(rec_path)))
+                self.assertIn("refused", json.loads(out.read_text())["error"], bad)
+            self.assertEqual(seen, [])
+            clean = self.dir / "clean.json"
+            clean.write_text(json.dumps({"task": "t", "arm": "A", "is_error": False,
+                                         "audit_flags": ["Edit: subprocess"]}))  # ordinary text is not reach
+            with redirect_stdout(io.StringIO()):
+                ev.cmd_grade(ns(task="t", arm="A", workdir=str(work), out=str(out), repo=str(self.src), timeout=60,
+                                run_record=str(clean)))
+            self.assertEqual(seen, [False])
+            self.assertFalse(json.loads(out.read_text())["oracle_sandboxed"])
+        finally:
+            ev.run_oracle = orig
+
     def test_out_of_scope_edit_is_recorded(self):
         work = self.prepare()
         (work / "lib.py").write_text("def f():\n    return 2\n")
@@ -644,6 +726,19 @@ class Score(unittest.TestCase):
             out = self.score(d)
         self.assertIn("A=True B=False", out)
         self.assertIn("NOT RUN", out)
+
+    def test_sensitive_audit_flags_make_the_task_invalid_but_old_noisy_flags_do_not(self):
+        corpus = json.loads(ev.CORPUS_PATH.read_text())
+        task = next(t for t in corpus["tasks"] if t["pilot"] and t["class"] == "bounded")
+        base = {"is_error": False, "usage": {"sonnet": vec(output=5)}, "num_turns": 3, "harness_wall_ms": 1,
+                "agent_types": [], "accounting": "modelUsage"}
+        for flags, expect in ((["Write: urllib"], "INVALID_RUN"), (["Edit: subprocess", "Bash: os.environ"], "INCONCLUSIVE")):
+            with tempfile.TemporaryDirectory() as tmp:
+                d = Path(tmp)
+                self.write(d, task["id"], "A", run={**base, "audit_flags": flags})
+                self.write(d, task["id"], "B", run=base)
+                out = self.score(d)
+            self.assertIn(f"| {expect} |", out.split("\n")[2], (flags, out))
 
     def test_a_delegating_high_risk_run_makes_the_pilot_no_haiku(self):
         corpus = json.loads(ev.CORPUS_PATH.read_text())
