@@ -120,6 +120,11 @@ class Acceptance(unittest.TestCase):
                            {"critical_high": 0}, {"error": "bad json"}, {}):
             self.assertFalse(ev.accepted(self.good_grade, bad_review), bad_review)
 
+    def test_review_type_and_truncation_are_enforced(self):
+        self.assertFalse(ev.accepted(self.good_grade, {"critical_high": False, "correct": True}))  # JSON false is not 0
+        self.assertFalse(ev.accepted(self.good_grade, {"critical_high": 0.0, "correct": True}))
+        self.assertFalse(ev.accepted(self.good_grade, {**self.good_review, "diff_truncated": True}))
+
     def test_review_only_and_reviewer_adjudication(self):
         control = {**self.good_grade, "oracle_passed": None, "oracle_mode": "review_only"}
         self.assertTrue(ev.accepted(control, self.good_review))
@@ -170,11 +175,24 @@ class DecisionRule(unittest.TestCase):
         for cls in ("ambiguous", "high_risk", "control"):
             task = {"class": cls}
             self.assertEqual(ev.task_verdict(task, self.arm(), self.arm()), "DECLINE_OK")
-            self.assertEqual(ev.task_verdict(task, self.arm(), self.arm(haiku=vec(output=1))), "DECLINE_FAILED")
-            # delegating counts even if the Haiku tokens were not captured
+            # delegating at all is the failure, even if the Haiku tokens were not captured
             self.assertEqual(ev.task_verdict(task, self.arm(), self.arm(agents=[ev.WORKER])), "DECLINE_FAILED")
-            # failing a hard task without delegating is not a delegation failure
-            self.assertEqual(ev.task_verdict(task, self.arm(), self.arm(ok=False)), "INCONCLUSIVE")
+            self.assertEqual(ev.task_verdict(task, self.arm(), self.arm(agents=[ev.WORKER], haiku=vec(output=1))),
+                             "DECLINE_FAILED")
+            # Haiku tokens with no recorded agent call is an accounting anomaly, not a delegation
+            self.assertEqual(ev.task_verdict(task, self.arm(), self.arm(haiku=vec(output=1))), "INVALID_RUN")
+            # the routing decision is the test: not solving a hard task is reported, not a decline failure
+            self.assertEqual(ev.task_verdict(task, self.arm(), self.arm(ok=False)), "DECLINE_OK")
+            # an infrastructure error says nothing about the routing decision
+            self.assertEqual(ev.task_verdict(task, self.arm(), {**self.arm(ok=False), "errored": True}), "INCONCLUSIVE")
+
+    def test_infrastructure_errors_and_audit_flags_never_reject_haiku(self):
+        a = self.arm(sonnet=self.A)
+        crashed = {**self.b(vec(), ok=False), "errored": True}
+        self.assertEqual(ev.task_verdict(self.bounded, a, crashed), "INCONCLUSIVE")
+        flagged = {**self.b(vec()), "audit_flags": ["Bash: urllib"]}
+        self.assertEqual(ev.task_verdict(self.bounded, a, flagged), "INVALID_RUN")
+        self.assertEqual(ev.task_verdict(self.bounded, {**a, "audit_flags": ["x"]}, self.b(vec())), "INVALID_RUN")
 
     def test_pilot_verdict_never_promotes_and_needs_every_task(self):
         full = [("bounded", "SUPPORTS_HAIKU"), ("bounded", "SUPPORTS_HAIKU"), ("bounded", "SUPPORTS_HAIKU"),
@@ -218,12 +236,20 @@ class Invocation(unittest.TestCase):
             self.assertIn("--max-budget-usd", argv)
             for flag in policy["isolation"]["claude_flags"]:
                 self.assertIn(flag, argv)
-            self.assertEqual(argv[argv.index("--setting-sources") + 1], "project")
+            self.assertEqual(argv[argv.index("--setting-sources") + 1], "local")  # no repo or user settings
             self.assertNotIn("dangerously", joined)
             self.assertNotIn("bypass", joined)
             self.assertNotIn("Bash(python3 *)", argv)
             self.assertFalse(any(t.endswith("*)") and t.startswith("Bash(git") for t in argv), "git patterns must be exact")
             self.assertFalse(any(t.startswith("Bash(git push") for t in argv))
+
+    def test_diagnostic_arm_c_forces_delegation_to_the_same_pinned_worker(self):
+        argv_c, prompt_c = ev.claude_args("C", self.task)
+        agents = json.loads(argv_c[argv_c.index("--agents") + 1])
+        self.assertEqual(agents[ev.WORKER]["model"], ev.HAIKU_ID)
+        self.assertIn("Agent", argv_c[argv_c.index("--tools") + 1].split(","))
+        self.assertIn("Delegate the implementation", prompt_c)
+        self.assertNotIn("Delegation policy", prompt_c)
 
     def test_arms_cannot_read_the_dev_tree_or_past_transcripts(self):
         argv, _ = ev.claude_args("A", self.task)
@@ -232,6 +258,7 @@ class Invocation(unittest.TestCase):
         for tool in ("Read", "Grep", "Glob", "Edit", "Write"):
             self.assertIn(f"{tool}(//{home}/Bryant-Developments/**)", denied)
             self.assertIn(f"{tool}(//{home}/.claude/**)", denied)
+            self.assertIn(f"{tool}(//private/tmp/claude-501/**)", denied)
         for tool in ("Read", "Edit", "Write"):
             self.assertIn(f"{tool}(.git/**)", denied)
 
@@ -301,6 +328,27 @@ class FakeClaude(unittest.TestCase):
         self.assertEqual(rec["usage"]["haiku"]["output"], 9)
         self.assertEqual((rec["accounting"], rec["order_index"]), ("modelUsage", 3))
 
+    def test_stream_audit_flags_network_and_path_probing(self):
+        flags = ev.audit_stream(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Write", "input": {"content": "import urllib.request"}},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "python3 -I tests/x.py"}},
+            {"type": "tool_use", "name": "Read", "input": {"file_path": "lib.py"}}]}}))
+        self.assertEqual(flags, ["Write: urllib"])
+        self.assertEqual(ev.audit_stream("garbage"), [])
+        clean = ev.audit_stream(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"new_string": "return 2"}}]}}))
+        self.assertEqual(clean, [])
+
+    def test_a_flagged_run_is_recorded_and_stale_output_is_replaced(self):
+        events = [{"type": "assistant", "message": {"model": ev.SONNET_ID, "content": [
+                      {"type": "tool_use", "name": "Bash", "input": {"command": "curl https://example.com"}}]}},
+                  {"type": "result", "is_error": False, "num_turns": 1, "modelUsage": {}, "result": "x"}]
+        self.stub("cat <<'EOF'\n" + "\n".join(json.dumps(e) for e in events) + "\nEOF\n")
+        (self.dir / "run.json").write_text('{"stale": true}')
+        rec = self.run_arm()
+        self.assertNotIn("stale", rec)
+        self.assertTrue(rec["audit_flags"])
+
     def test_unparseable_output_leaves_an_error_record(self):
         self.stub("echo 'not json at all'\n")
         rec = self.run_arm()
@@ -344,7 +392,7 @@ class RepoFixtures(unittest.TestCase):
         self.orig_corpus, self.orig_oracle = ev.CORPUS_PATH, ev.run_oracle
         ev.CORPUS_PATH = self.corpus
 
-        def plain_oracle(cmd, cwd, home, timeout):
+        def plain_oracle(cmd, cwd, home, timeout, sandboxed=True):
             p = subprocess.run(["python3", "-I", "-c", "import sys; sys.path.insert(0, '.'); "
                                 "exec(open('tests/test_lib.py').read())"], cwd=cwd, capture_output=True, text=True)
             return p.returncode == 0, p.stdout + p.stderr
@@ -390,6 +438,49 @@ class RepoFixtures(unittest.TestCase):
         self.assertTrue(fixed["oracle_passed"])
         self.assertEqual(fixed["out_of_scope"], [])
         self.assertTrue(ev.accepted(fixed, {"critical_high": 0, "correct": True}))
+
+    def test_preflight_requires_every_oracle_to_accept_the_known_good_tree(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            ev.cmd_preflight(ns(repo=str(self.src), timeout=60))
+        self.assertEqual(json.loads(out.getvalue()), {"t": "PASS"})
+        # an oracle that rejects the merged tree must stop the pilot
+        (self.src / "tests/test_lib.py").write_text("import lib\nassert lib.f() == 3\n")
+        git(self.src, "add", "-A"); git(self.src, "commit", "-q", "-m", "broken oracle")
+        self.merge = git(self.src, "rev-parse", "HEAD").strip()
+        self.write_corpus("python3 -I tests/test_lib.py", base=git(self.src, "rev-parse", "HEAD^").strip())
+        with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+            ev.cmd_preflight(ns(repo=str(self.src), timeout=60))
+
+    def test_a_stale_grade_record_is_replaced_even_when_grading_fails(self):
+        work = self.prepare()
+        out = self.dir / "grade-A.json"
+        out.write_text('{"oracle_passed": true, "changed_files": ["x"], "out_of_scope": []}')
+        self.write_corpus("python3 -I tests/test_lib.py", base="0" * 40)
+        rec = self.grade(work)
+        self.assertIn("error", rec)
+        self.assertNotIn("changed_files", rec)
+
+    def test_oversized_diffs_carry_a_truncation_marker(self):
+        work = self.prepare()
+        (work / "big.txt").write_text("x\n" * 100000)
+        pristine = self.dir / "pristine2"
+        ev.extract_base(self.src, json.loads(self.corpus.read_text())["tasks"][0], pristine)
+        self.assertTrue(ev.unified_diff(pristine, work).endswith("<<<DIFF TRUNCATED>>>\n"))
+        (work / "blob.bin").write_bytes(b"\xff\xfe\x00binary")
+        small = ev.unified_diff(pristine, work, limit=10**9)
+        self.assertIn("<binary sha256", small)
+
+    def test_unsandboxed_oracle_flag_runs_the_command_directly(self):
+        ev.run_oracle = self.orig_oracle
+        tree = self.dir / "t"
+        tree.mkdir()
+        home = self.dir / "h"
+        home.mkdir()
+        ok, _ = ev.run_oracle("python3 -I -c 'import sys; sys.exit(0)'", tree, home, 30, sandboxed=False)
+        self.assertTrue(ok)
+        ok, _ = ev.run_oracle("python3 -I -c 'import sys; sys.exit(1)'", tree, home, 30, sandboxed=False)
+        self.assertFalse(ok)
 
     def test_out_of_scope_edit_is_recorded(self):
         work = self.prepare()

@@ -4,7 +4,8 @@
   "precommitted": "This file is committed before any arm is run; changing a threshold after results exist invalidates the comparison.",
   "arms": {
     "A": "Sonnet direct: one headless session does the whole task.",
-    "B": "Sonnet orchestrator plus one bounded Haiku worker defined only for the run, pinned to an explicit model id."
+    "B": "Sonnet orchestrator plus one bounded Haiku worker defined only for the run, pinned to an explicit model id.",
+    "C": "Diagnostic only: Sonnet orchestrator told to delegate the implementation to the same pinned Haiku worker exactly once. It measures what forced delegation costs; it never feeds the pilot verdict."
   },
   "task_classes": [
     "bounded",
@@ -47,10 +48,10 @@
     "accounting": "modelUsage is trusted only if it shows Haiku whenever the main thread called an agent; otherwise the stream's sidechain usage is merged and labelled, and if neither shows it the accounting is 'unverified' and the task cannot support Haiku"
   },
   "decision_rule": {
-    "task_supports_haiku": "accepted in both arms AND arm B actually delegated to the worker (agent call recorded) AND its Haiku usage was captured AND Sonnet tokens in arm B <= arm A for every one of the four kinds",
+    "task_supports_haiku": "accepted in both arms AND arm B recorded an agent call to the pinned worker AND its Haiku usage was captured AND Sonnet tokens in arm B <= arm A for every one of the four kinds",
     "task_inconclusive": "anything else with both arms accepted, including no delegation or Haiku usage that could not be captured (accounting unverified)",
-    "task_rejects_haiku": "arm B not accepted while arm A accepted",
-    "decline_cases": "arm B passes only if it made no agent call and used zero Haiku tokens AND was accepted; delegating at all is a failure; failing without delegating is inconclusive, not a delegation failure",
+    "task_rejects_haiku": "arm A accepted; arm B delegated, did not error, and was not accepted. An infrastructure error, timeout or unparseable run in arm B is INCONCLUSIVE, never a rejection",
+    "decline_cases": "arm B passes (DECLINE_OK) if it made no agent call; delegating at all is DECLINE_FAILED; whether the hard task was also solved is reported, not required; an errored run is inconclusive",
     "pilot_verdicts": [
       "NO_HAIKU",
       "INCONCLUSIVE_KEEP_OPT_IN",
@@ -58,7 +59,7 @@
     ],
     "promotion": "never from a pilot. Fewer than 30 paired tasks cannot show non-inferiority; the provisional 5 percentage-point first-pass margin is evaluated only at 30 or more paired tasks.",
     "task_not_cheaper": "accepted in both arms, delegated, and Sonnet tokens in arm B higher than arm A on all four kinds",
-    "task_invalid": "arm B called any agent other than the pinned worker",
+    "task_invalid": "an arm called an agent other than the pinned worker, Haiku tokens appeared with no recorded agent call, or the stream audit flagged network, path-probing or secret-reaching tool input",
     "pilot_verdict_rules": "NO_HAIKU if any decline task delegated or any bounded task rejects Haiku; OPT_IN_CANDIDATE only if every pilot task is scored, at least two bounded tasks all support Haiku, and every decline task passed; anything else INCONCLUSIVE_KEEP_OPT_IN"
   },
   "hard_gates": [
@@ -83,12 +84,14 @@
       "--disable-slash-commands",
       "--no-session-persistence"
     ],
-    "denied_paths": "arms may not read, search or write under ~/Bryant-Developments or ~/.claude (merged solutions, oracle tests, past transcripts); workdirs must live elsewhere",
+    "denied_paths": "tool-level only: arms may not read, search or write under ~/Bryant-Developments, ~/.claude or /private/tmp/claude-501 (merged solutions, oracle tests, transcripts, scratchpads, other arms' workdirs); active workdirs live under /private/var/tmp. Arm-written Python can bypass tool-level rules, so every stream is audited and flagged runs are INVALID.",
     "oracle_sandbox": "agent-authored test code runs under macOS sandbox-exec: no network, no reads of the dev tree or ~/.claude, writes only inside the scratch directory; symlinks resolving outside the scratch copy are removed first",
     "models": "Sonnet and Haiku are pinned by explicit id and the resolved ids are recorded",
-    "settings": "--setting-sources project, so personal hooks and allow rules do not load into either arm",
+    "settings": "--setting-sources local: neither the base repository's .claude/settings.json (hundreds of allow rules, hooks, defaultMode auto) nor personal settings load into an arm. The base repository's CLAUDE.md and the user-level CLAUDE.md still load into both arms equally and are a recorded confound (the latter makes the model type rtk-prefixed commands, hence the plain-command instruction).",
     "run_order": "recorded per run and alternated across tasks because the second arm benefits from a warm prompt cache",
-    "grading": "changes and diffs are computed in pure Python against a fresh extract of the base from the trusted repository; git never runs inside an arm's directory, which an arm can write to. Arms may not read or write their own .git."
+    "grading": "changes and diffs are computed in pure Python against a fresh extract of the base from the trusted repository; git never runs inside an arm's directory, which an arm can write to. Arms may not read or write their own .git.",
+    "preflight": "before any run, every oracle must accept the original merged solution (scripts/routing-eval.py preflight)",
+    "oracle_exceptions": "t84 only: oracle_unsandboxed, reason recorded in the corpus"
   },
-  "amendment": "Amended twice, both after independent review of PR 129 and before any arm was run: verdict semantics, isolation and oracle modes; then grading without git inside an arm's directory, symlink containment, sandbox read denial and no model override of a failed oracle. No result existed when this was changed."
+  "amendment": "Amended three times, all before any valid result existed. (1) After independent review of PR 129: verdict semantics, isolation, oracle modes. (2) After two automated security reviews: grading without git in the arm's directory, symlink containment, sandbox read denial. (3) After a first pilot attempt ('run 0') that was stopped part-way because a further independent review found it ran with the base repository's own allow rules and a sandbox that broke one oracle: run 0 is INVALID and its results are not used for any verdict. Changes made after seeing run 0, each driven by a review finding or a measured defect rather than by which arm looked better: project settings no longer load into arms; the scratch session directory is denied; a preflight proves every oracle accepts its known-good merged solution; two task texts now state the exact phrases or function name their oracles assert (t91, t84); t84's oracle runs unsandboxed because sandbox-exec cannot exec the setuid /bin/ps it needs; delegation means a recorded agent call; an infrastructure error never counts as Haiku rejection; decline tasks are judged on the routing decision, not on solving the hard task; diagnostic arm C was added because run 0 showed arm B never delegated."
 }
