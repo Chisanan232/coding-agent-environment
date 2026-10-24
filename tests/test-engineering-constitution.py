@@ -10,7 +10,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 DOC = (ROOT / "docs/ENGINEERING-CONSTITUTION.md").read_text()
 SECTIONS = ["One source of truth, by topic", "Instruction precedence and conflict handling", "Principles carried over unchanged", "Context-sensitive principles",
             "Abstraction and extensibility policy", "Change-risk-based verification", "Durable checkpoints and retry circuit breakers",
-            "Multi-agent resource coordination", "Security profiles", "Open decisions (founder), with recommended defaults",
+            "Multi-agent resource coordination", "Security profiles", "Resolved by existing source, and the owner packet",
             "Harness integration facts (verified or not)", "Behavioral acceptance: first results (partial, not parity)", "Rollout and rollback"]
 
 
@@ -106,12 +106,33 @@ class NotASecondSourceOfTruth(unittest.TestCase):
         for needle in ("--match-head-commit <", "candidate-rollout.py plan --live", "branch protection"):
             self.assertNotIn(needle, DOC)
 
-    def test_the_open_decision_table_is_complete_and_states_each_item(self):
-        rows = [l for l in DOC.split("## 10.")[1].split("## 11.")[0].splitlines() if re.match(r"\| \d+ \|", l)]
-        self.assertEqual(len(rows), 15)
+    def test_existing_source_resolutions_are_cited_and_only_new_decisions_stay_open(self):
+        sec = DOC.split("\n## 10. ")[1].split("\n## 11. ")[0]
+        resolved = sec.split("### 10.2")[0]
+        rows = [l for l in resolved.splitlines() if re.match(r"\| \d+ \|", l)]
+        self.assertEqual([int(re.match(r"\| (\d+)", r).group(1)) for r in rows], list(range(1, 15)))
         for row in rows:
-            self.assertRegex(row, r"\| (OPEN|RESOLVED[^|]*) \| [^|]+ \|$")   # state, then the interim behavior
-        self.assertEqual(sum("RESOLVED" in r for r in rows), 3)
+            self.assertRegex(row, r"\| [^|]*(`[^`]+`|ADR \d+|founder|live)[^|]* \|$")   # every resolution carries a citation
+            self.assertNotIn("OPEN", row)
+        packet = sec.split("### 10.2")[1].split("### 10.3")[0]
+        open_rows = [l for l in packet.splitlines() if re.match(r"\| (\d+a?) \|", l)]
+        self.assertEqual([re.match(r"\| (\d+a?)", r).group(1) for r in open_rows], ["15", "1a"])
+        for row in open_rows:
+            self.assertRegex(row, r"\| OPEN[^|]* \|$")
+
+    def test_item_9_forbids_default_branch_pushes_but_keeps_feature_branch_pushes(self):
+        row = [l for l in DOC.split("\n## 10. ")[1].splitlines() if l.startswith("| 9 |")][0]
+        self.assertIn("no commit or push to the default or release branches", row)
+        self.assertIn("pushing a feature branch to open a PR stays autonomous", row)
+        self.assertNotIn("remove the quick-fix", row)
+
+    def test_policy_is_not_called_proposed(self):
+        for stale in ("proposed reference", "not an adopted", "not yet adopted", "a proposed reference"):
+            self.assertNotIn(stale, DOC)
+
+    def test_codex_is_not_said_to_lack_the_secrets_invariant(self):
+        self.assertNotIn("Codex has no equivalent", DOC)
+        self.assertIn("already in `codex/AGENTS.md`", DOC)
 
     def test_unverified_facts_are_marked_not_asserted(self):
         self.assertRegex(DOC, r"Codex 0\.163\.0 loads[^|]*\|\s*\*\*UNVERIFIED\*\*")
