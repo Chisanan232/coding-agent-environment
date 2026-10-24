@@ -1,12 +1,13 @@
-# Engineering Constitution (DRAFT revision 0, SPE-121)
+# Engineering Constitution (revision 1, SPE-121)
 
-Status: **draft for founder review. Nothing here is deployed and no live behavior changes.** The founder-supplied
-baseline text referenced by the 2026-10-22 directive was not present in the session; this draft is built only from
-policy that already exists (sources in section 1) and from measured evidence. When the baseline text is provided it
-is merged here, not placed beside this file. Items that an existing founder-approved source already settles are
-recorded as RESOLVED-BY-SOURCE in section 10 with their citation and are not founder decisions. The two items that were
-new (secrets rule delivery, branch type segment) were decided by the founder on 2026-10-24 and are applied below, so no
-item is OPEN; one follow-up belongs to the SPE-108 owner (section 10.3).
+Status: **merged to main; the founder decided the two items that were new (secrets rule delivery, branch type segment)
+on 2026-10-24 and they are applied below, so no item is OPEN.** This file is an index and reconciliation, not a
+deployment: live `~/.claude` and `~/.codex` behavior changes only through the owner-run rollout tools, and whether a
+host actually follows these rules is a behavioral-acceptance question (section 12), not something merging proves. The
+founder-supplied baseline text referenced by the 2026-10-22 directive was never provided; this document is built from
+policy that already exists (sources in section 1) and from measured evidence. If that baseline text arrives it is
+merged here, not placed beside this file. Items that an existing founder-approved source already settles are recorded
+as RESOLVED-BY-SOURCE in section 10 with their citation and are not founder decisions.
 
 ## 1. One source of truth, by topic
 
@@ -150,7 +151,7 @@ Each row is settled by a source cited here; the interim behavior is simply the r
 
 | # | Topic | Resolution | Citation |
 |---|---|---|---|
-| 1 | Branch name | `<release-or-phase>/<ticket>/<type>/<summary>`; a phase prefix only where the repository uses one | founder decision 2026-10-24 preserving this format; live `~/.claude/CLAUDE.md` Git Worktree Workflow. A repository's own established style is a product-specific exception resolved by the precedence in section 2 and the product-style override in section 3. The skill text still says there is no type segment (follow-up for the SPE-108 owner, section 10.3) |
+| 1 | Branch name | `<release-or-phase>/<ticket>/<type>/<summary>`; a phase prefix only where the repository uses one | founder decision 2026-10-24 preserving this format; live `~/.claude/CLAUDE.md` Git Worktree Workflow. A repository's own established style is a product-specific exception resolved by the precedence in section 2 and the product-style override in section 3. The engineering-workflow skill, `ticket-pickup-check` and `docs/DEPLOY-SPE-108.md` now state this format (SPE-121 follow-up, 2026-10-24) |
 | 2 | Commit subject | the skill's parenthesised scope `<emoji> (<scope>):` is the general default; a repository with an established style keeps it and history is not rewritten | `.claude/skills/engineering-workflow/SKILL.md` "Implement and commit"; product-style override (section 3) |
 | 3 | PR title | follows item 2 | `.claude/skills/engineering-workflow/SKILL.md` PR title section |
 | 4 | Subagent ceiling | 7. The 8 in the live Codex files is stale; managed config is reported, not edited here | `.claude/skills/engineering-workflow/SKILL.md` Delegation; `docs/DEPLOY-SPE-108.md` |
@@ -172,7 +173,7 @@ None. Item 15 and the branch type segment (item 1) were decided on 2026-10-24 an
 
 ### 10.3 Not edited by this change
 
-The engineering-workflow skill, `codex/AGENTS.md`, `.claude/CLAUDE.md`, the SPE-108 scripts and the live `~/.claude` and `~/.codex` files belong to SPE-108, SPE-93 or the owner-run rollout. Mismatches found here (the skill and `docs/DEPLOY-SPE-108.md` saying branches have no change-type segment, which the founder format `<phase>/<ticket>/<type>/<summary>` contradicts; subagent ceiling 8, legacy commit-title and merge lines, `github` MCP sentence, duplicated hooks in Codex) are reported to those owners.
+The engineering-workflow skill, `codex/AGENTS.md`, `.claude/CLAUDE.md`, the SPE-108 scripts and the live `~/.claude` and `~/.codex` files belong to SPE-108, SPE-93 or the owner-run rollout. Mismatches found here (subagent ceiling 8, legacy commit-title and merge lines, `github` MCP sentence, duplicated hooks in Codex) are reported to those owners.
 
 ## 11. Harness integration facts (verified or not)
 
