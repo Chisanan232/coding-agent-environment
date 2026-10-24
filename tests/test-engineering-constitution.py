@@ -39,6 +39,13 @@ class Structure(unittest.TestCase):
         self.assertIn("stricter safety rule wins", sec)
 
 
+class ResolvedBySource(unittest.TestCase):
+    def test_head_says_only_open_items_need_the_founder(self):
+        head = DOC.split("\n## 1.")[0]
+        self.assertIn("RESOLVED-BY-SOURCE", head)
+        self.assertIn("Only the items still", head)
+
+
 class NotASecondSourceOfTruth(unittest.TestCase):
     def test_does_not_restate_what_the_owners_hold(self):
         policy = (ROOT / "docs/ENGINEERING-POLICY.md").read_text()

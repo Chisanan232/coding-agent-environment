@@ -3,8 +3,9 @@
 Status: **draft for founder review. Nothing here is deployed and no live behavior changes.** The founder-supplied
 baseline text referenced by the 2026-10-22 directive was not present in the session; this draft is built only from
 policy that already exists (sources in section 1) and from measured evidence. When the baseline text is provided it
-is merged here, not placed beside this file. Contested values are listed in section 10 with a recommended default and
-are the founder's decision.
+is merged here, not placed beside this file. Items that an existing founder-approved source already settles are
+recorded as RESOLVED-BY-SOURCE in section 10 with their citation and are not founder decisions. Only the items still
+marked OPEN there need the founder.
 
 ## 1. One source of truth, by topic
 
@@ -13,12 +14,12 @@ This file is the principles, precedence and decision layer. It does not restate 
 | Topic | Canonical owner | Reaches Claude Code via | Reaches Codex via |
 |---|---|---|---|
 | Branch, worktree, commit, PR, validation, merge, cleanup lifecycle | `.claude/skills/engineering-workflow/SKILL.md` | managed skill and the marker span in `~/.claude/CLAUDE.md` | shared skill under `~/.codex/skills` |
-| Autonomy table, mechanism map, what is enforced today, PR classes, workstation profiles | `docs/ENGINEERING-POLICY.md` (proposed reference; not an adopted owner while section 10 is open) | referenced from the span | referenced from `~/.codex/AGENTS.md` |
+| Autonomy table, mechanism map, what is enforced today, PR classes, workstation profiles | `docs/ENGINEERING-POLICY.md` (founder-approved: PR classes in the engineering-workflow skill, founder correction 2026-10-23) | referenced from the span | referenced from `~/.codex/AGENTS.md` |
 | Merge gate and owner workflow | `docs/OWNER-MERGE-WORKFLOW.md`, ADR 0013, `scripts/owner-merge-gate.py` | skill | skill |
 | Decision delegation | `decision-delegation` skill, ADR 0014 | span | skill |
 | Resource admission, disk and memory | `docs/RESOURCE-ADMISSION.md`, `docs/MANAGED-RESOURCES.md` | skill | skill |
 | Personal and corporate profiles | `docs/PROFILES.md`, `docs/ROLLOUT-CORPORATE-PROFILE.md`, workstation-policy tooling | launcher, managed settings | launcher, managed config |
-| Secrets | `~/.claude/rules/secret-handling.md` (live-only today, see section 10, item 15) | `@` import | not delivered |
+| Secrets | `~/.claude/rules/secret-handling.md` (live-only today; publication is open, section 10, item 15) | `@` import | the opaque-capability invariant is already in `codex/AGENTS.md`; the full provisioning rule is not delivered |
 | Product constraints | each repository's own `AGENTS.md` / `.claude/CLAUDE.md` | project file | project file |
 
 A repository file may add product constraints and may be stricter; it must not restate lifecycle rules, it points here.
@@ -30,7 +31,7 @@ From highest to lowest authority:
 
 1. **Host and organization enforcement**: managed settings, sandbox, built-in classifier hard rules, GitHub protection. A denial is binding and is never routed through another tool, shell, subagent or operator (`HARNESS_PERMISSION_BLOCK`).
 2. **The founder's explicit current instruction**, within (1). It does not widen what (1) permits.
-3. **Release and approval gates** in this constitution and the skills (exact-tag founder approval; PR class rules as proposed in `docs/ENGINEERING-POLICY.md`, not yet adopted).
+3. **Release and approval gates** in this constitution and the skills (exact-tag founder approval; PR class rules of the engineering-workflow skill and `docs/ENGINEERING-POLICY.md` section 4, founder-approved).
 4. **This constitution and the shared skills.**
 5. **Repository instructions** (`AGENTS.md`, `.claude/CLAUDE.md`) for product constraints.
 6. **User-level legacy text** (`~/.claude/CLAUDE.md` body outside the managed span, `~/.codex/AGENTS.md` local sections).
