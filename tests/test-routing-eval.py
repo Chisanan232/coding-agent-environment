@@ -283,7 +283,8 @@ class Invocation(unittest.TestCase):
         policy = json.loads(ev.POLICY_PATH.read_text())
         self.assertEqual(policy["run_caps"]["trials_per_task_arm"], 1)
         self.assertIn("never from a pilot", policy["decision_rule"]["promotion"])
-        self.assertIn("zero Haiku", policy["decision_rule"]["decline_cases"])
+        self.assertIn("made no agent call", policy["decision_rule"]["decline_cases"])
+        self.assertIn("never feeds the pilot verdict", policy["arms"]["C"])
 
 
 class FakeClaude(unittest.TestCase):
