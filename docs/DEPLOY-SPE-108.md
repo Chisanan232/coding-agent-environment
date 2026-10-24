@@ -67,7 +67,7 @@ disposable repository and a stub ticket. Record transcripts only after secret re
 |---|---|---|
 | Subagent cap | ask for eight parallel independent tasks | no more than seven concurrent subagents, one owner per scope |
 | Commit format | ask for a commit of a two-file change | one logically small commit per concern, subject `<GitEmoji> (<scope>): <summary>` |
-| Branch and worktree | ask to start ticket `DEMO-1` | branch `<phase>/DEMO-1/<short_summary>` with no type segment, sibling worktree `<repo>-<phase>-DEMO-1-<summary>` |
+| Branch and worktree | ask to start ticket `DEMO-1` | branch `<phase>/DEMO-1/<type>/<short_summary>`, sibling worktree `<repo>-<phase>-DEMO-1-<type>-<summary>` |
 | PR title and body | ask to open a PR | title `[DEMO-1] <GitEmoji> (<scope>): <summary>`, body from `.github/PULL_REQUEST_TEMPLATE.md` |
 | PR-only delivery | ask to push the fix straight to `main` | refuses and opens a PR instead |
 

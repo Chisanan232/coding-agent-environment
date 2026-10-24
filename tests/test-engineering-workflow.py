@@ -17,12 +17,12 @@ TITLE = re.compile(
 )
 
 BRANCH = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._-]*/(?:[A-Z][A-Z0-9]*-[0-9]+|[0-9]+)/[a-z0-9]+(?:_[a-z0-9]+){1,3}$"
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*/(?:[A-Z][A-Z0-9]*-[0-9]+|[0-9]+)/(?:feat|fix|refactor|test|docs|config|deps|remove|lint)/[a-z0-9]+(?:_[a-z0-9]+){1,3}$"
 )
 
 
 def valid_branch(name: str) -> bool:
-    """Phase/ticket/summary only; a type segment would add a fourth part."""
+    """Phase/ticket/type/summary: four parts, the type from the fixed list."""
     return bool(BRANCH.fullmatch(name)) and len(name.rsplit("/", 1)[1]) <= 30
 
 
@@ -47,7 +47,7 @@ class EngineeringWorkflowContract(unittest.TestCase):
     def test_contract_owns_required_lifecycle_boundaries(self) -> None:
         text = WORKFLOW.read_text()
         required = [
-            "<version-or-phase>/<ticket-id>/<short_summary>",
+            "<version-or-phase>/<ticket-id>/<type>/<short_summary>",
             "<GitEmoji> (<scope>): <imperative summary>",
             "CI_UNAVAILABLE_EXTERNAL",
             "meaningful independent review",
@@ -293,21 +293,22 @@ class EngineeringWorkflowContract(unittest.TestCase):
         self.assertEqual(workflow.count("- '.claude/skills/**'"), 2)
         self.assertIn("python3 tests/test-engineering-workflow.py", workflow)
 
-    def test_branch_name_has_no_type_segment_and_derives_the_worktree(self) -> None:
-        valid = ["full/SPE-108/restore_dev_contract", "v0.1.0/TEST-1/add_endpoint", "sprint3/42/extract_payment_service"]
+    def test_branch_name_has_a_type_segment_and_derives_the_worktree(self) -> None:
+        valid = ["full/SPE-108/config/restore_dev_contract", "v0.1.0/TEST-1/fix/auth_token_refresh", "sprint3/42/refactor/extract_payment_service"]
         invalid = [
-            "full/SPE-108/feat/restore_dev_contract",
-            "v0.1.0/TEST-1/fix/auth_token_refresh",
+            "full/SPE-108/restore_dev_contract",
+            "v0.1.0/TEST-1/add_endpoint",
+            "full/SPE-108/unknown/restore_dev_contract",
             "full/SPE-108",
             "full/spe-108/restore_dev_contract",
-            "full/SPE-108/single",
-            "full/SPE-108/" + "_".join(["word"] * 7),
+            "full/SPE-108/feat/single",
+            "full/SPE-108/feat/" + "_".join(["word"] * 7),
         ]
         self.assertTrue(all(valid_branch(name) for name in valid))
         self.assertFalse(any(valid_branch(name) for name in invalid))
         text = WORKFLOW.read_text()
-        self.assertNotIn("<type>", text)
-        self.assertIn("<repo>-<phase>-<ticket>-<summary>", text)
+        self.assertIn("<type>", text)
+        self.assertIn("<repo>-<phase>-<ticket>-<type>-<summary>", text)
 
     def test_commit_subject_requires_parenthesized_scope(self) -> None:
         valid = [
@@ -375,14 +376,12 @@ class EngineeringWorkflowContract(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, text)
 
-    def test_ticket_pickup_uses_the_typeless_branch_and_worktree_format(self) -> None:
+    def test_ticket_pickup_uses_the_typed_branch_and_worktree_format(self) -> None:
         text = " ".join((ROOT / ".claude/skills/ticket-pickup-check/SKILL.md").read_text().split())
-        self.assertIn("<version-or-phase>/<ticket-id>/<short_summary>", text)
-        self.assertNotIn("<type>", text)
-        self.assertNotIn("[type]", text)
+        self.assertIn("<version-or-phase>/<ticket-id>/<type>/<short_summary>", text)
+        self.assertIn("[type]", text)
         config = (ROOT / ".claude/hooks/config.env").read_text()
-        self.assertIn("<version-or-phase>/<ticket-id>/<short_summary>", config)
-        self.assertNotIn("<type>", config)
+        self.assertIn("<version-or-phase>/<ticket-id>/<type>/<short_summary>", config)
 
     def test_skill_commit_examples_use_the_current_subject_format(self) -> None:
         example = re.compile(r"`(?:✨|🐛|♻️|✅|📝|🔧|🔌|🪝|🗑️|🚨|🔒|⬆️) [^`\n]*`")
