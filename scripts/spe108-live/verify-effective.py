@@ -58,6 +58,7 @@ parser.add_argument('--after', required=True)
 parser.add_argument('--skills-dir', required=True)
 parser.add_argument('--ledger', required=True)
 parser.add_argument('--repo', required=True)
+parser.add_argument('--strict', action='store_true', help='also fail when any superseded line is still present (retire path)')
 args = parser.parse_args()
 try:
     rows = L.load(args.ledger)
@@ -75,21 +76,9 @@ def record(ok, name, where):
     results.append((0 if ok else 1, name, where))
 
 
-def installer_owned(text):
-    """Line numbers inside a coding-agent-environment marker pair: replaced by design, not founder text."""
-    owned, start = set(), {}
-    for number, line in enumerate(text.splitlines(), 1):
-        match = re.search(r'<!-- coding-agent-environment:([\w-]+):(start|end) -->', line)
-        if match and match.group(2) == 'start':
-            start[match.group(1)] = number
-        elif match and match.group(1) in start:
-            owned.update(range(start.pop(match.group(1)), number + 1))
-    return owned
-
-
 present = {L.normalize(line) for _, line in L.content_lines(after)}
 overlay_missing, open_conflicts, unledgered = [], [], []
-managed_before = installer_owned(before)
+managed_before = L.marker_lines(before, L.REPLACED_BY_DESIGN)
 replaced = []
 for number, line in L.content_lines(before):
     if number in managed_before:
@@ -107,25 +96,46 @@ for number, line in L.content_lines(before):
 for name, numbers in (('lossless-unaccounted-line', unledgered), ('lossless-overlay-line-missing', overlay_missing),
                       ('open-conflict-in-ledger', open_conflicts)):
     record(not numbers, name, 'before:' + (','.join(map(str, numbers[:20])) or '-'))
+after_owned = L.marker_lines(after, L.REPLACED_BY_DESIGN)
+after_active = {}  # key -> first line number, outside installer-replaced spans
+for number, line in L.content_lines(after):
+    if number not in after_owned:
+        after_active.setdefault(L.line_key(line), number)
+before_keys = {L.line_key(l) for n, l in L.content_lines(before) if n not in managed_before}
+still_there, tolerated = [], 0
+for key, (disposition, _, replacement) in sorted(rows.items()):
+    if disposition != L.SUPERSEDED:
+        continue
+    if replacement and key in before_keys:
+        if key in after_active:
+            still_there.append(after_active[key])
+    elif not replacement and key in after_active:
+        if args.strict:
+            still_there.append(after_active[key])
+        else:
+            tolerated += 1
+record(not still_there, 'superseded-line-still-active', 'after:' + (','.join(map(str, sorted(set(still_there))[:20])) or '-'))
 bad = L.check_citations(rows, args.repo)
 record(not bad, 'citations-exist-in-pinned-checkout', ','.join(bad[:10]) or '-')
 
+skill_files = sorted(Path(args.skills_dir).rglob('*.md')) if Path(args.skills_dir).is_dir() else []
 for name, pattern in sorted(FORBIDDEN.items()):
     hits = []
-    for label, text in (('main', after), ('skill', skill)):
-        hits += ['%s:%d' % (label, n) for n, line in enumerate(text.splitlines(), 1) if pattern.search(line)]
+    for label, text in [('main', after)] + [(f.relative_to(args.skills_dir).as_posix(), f.read_text(encoding='utf-8', errors='replace')) for f in skill_files]:
+        hits += ['%s:%d' % (label, n) for n, line in enumerate(L.split_lines(text), 1) if pattern.search(line)]
     record(not hits, 'forbidden-' + name, ','.join(hits[:10]) or '-')
 
 for name, where, pattern in REQUIRED[args.host]:
     text = skill if where == 'skill' else after
-    hit = next((n for n, line in enumerate(text.splitlines(), 1) if re.search(pattern, line, re.IGNORECASE)), None)
+    hit = next((n for n, line in enumerate(L.split_lines(text), 1) if re.search(pattern, line, re.IGNORECASE)), None)
     record(hit is not None, 'required-' + name, '%s:%s' % (where, hit or '-'))
 
-titles = [l for l in after.splitlines() if l.startswith('## ')]
+titles = [l for l in L.split_lines(after) if l.startswith('## ')]
 for failed, name, where in sorted(results):
     print('%s %s %s' % ('FAIL' if failed else 'PASS', name, where))
 print('info installer-owned-before-lines-replaced=%d (review: marker-span text the installer rewrote) first=%s' % (
     len(replaced), ','.join(map(str, replaced[:12])) or '-'))
+print('info superseded-lines-still-present-tolerated=%d (use --strict on the retire path)' % tolerated)
 print('info lines before=%d after=%d duplicate-titles=%d' % (
-    len(before.splitlines()), len(after.splitlines()), len(titles) - len(set(titles))))
+    len(L.split_lines(before)), len(L.split_lines(after)), len(titles) - len(set(titles))))
 sys.exit(1 if any(r[0] for r in results) else 0)

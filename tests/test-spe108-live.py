@@ -300,5 +300,73 @@ class LiveScripts(unittest.TestCase):
         self.assertIn("OPEN CONFLICT live line 5", open_conflict.stdout)
 
 
+    def test_ledger_rejects_replacement_on_conflict_escaping_citation_and_text_fence(self):
+        path = Path(self.temp.name) / "l.tsv"
+        path.write_text("L:0123456789ab\tREAL_CONFLICT_REQUIRING_OWNER_DECISION\tREADME.md:1\tnew\n")
+        path.chmod(0o600)
+        with self.assertRaises(L.LedgerError):  # a tool must never resolve an owner decision by rewriting
+            L.load(path)
+        for citation in ("/etc/hosts:1", "../outside.md:1", "README.md:999999", "README.md:0"):
+            path.write_text("L:0123456789ab\tSEMANTICALLY_PRESERVED\t%s\n" % citation)
+            self.assertEqual(L.check_citations(L.load(path), ROOT), ["L:0123456789ab"], citation)
+        self.assertTrue(L.is_structural("```"))
+        self.assertTrue(L.is_structural("```bash"))
+        self.assertFalse(L.is_structural("```bash Never push to master"))  # trailing words are a rule, not a fence
+        self.assertEqual(L.split_lines("a\x0cb\nc\n"), ["a\x0cb", "c"])  # newline-only, like an editor
+
+    def test_rewrite_lines_skips_marker_regions_open_conflicts_and_odd_line_breaks(self):
+        target = self.home / "doc.md"
+        old = "old format line"
+        target.write_text("%s\n<!-- coding-agent-environment:private-overlay:start -->\n%s\n"
+                          "<!-- coding-agent-environment:private-overlay:end -->\nA\x0c%s\n" % (old, old, old))
+        ledger = Path(self.temp.name) / "r.tsv"
+        ledger.write_text("%s\tSUPERSEDED_BY_APPROVED_RULE\tREADME.md:1\tnew canonical\n" % L.line_key(old))
+        ledger.chmod(0o600)
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        self.run_script(sys.executable, str(LIVE / "rewrite-lines.py"), "--file", str(target), "--ledger", str(ledger),
+                        "--expect-sha256", digest, "--apply")
+        # Only the plain line changed: not the overlay copy, and not a text that merely contains a form feed.
+        self.assertEqual(target.read_text().splitlines(keepends=False)[0], "new canonical")
+        self.assertEqual(target.read_text().count(old), 2)
+
+    def verify_args(self, before, after, skills, ledger, *extra):
+        return (sys.executable, str(LIVE / "verify-effective.py"), "--host", "claude", "--before", str(before), "--after",
+                str(after), "--skills-dir", str(skills), "--ledger", str(ledger), "--repo", str(self.repo), *extra)
+
+    def test_verify_effective_flags_a_superseded_line_left_active_and_an_overlay_loss(self):
+        skills = self.home / "skills"
+        (skills / "engineering-workflow").mkdir(parents=True)
+        (skills / "engineering-workflow/SKILL.md").write_text("x\n")
+        before, after = self.home / "b.md", self.home / "a.md"
+        before.write_text("keep\nold commit form\n<!-- coding-agent-environment:private-overlay:start -->\nonly in overlay\n"
+                          "<!-- coding-agent-environment:private-overlay:end -->\n")
+        after.write_text("keep\nold commit form\n")  # the overlay block vanished and the old form stayed
+        ledger = Path(self.temp.name) / "s.tsv"
+        ledger.write_text("%s\tSUPERSEDED_BY_APPROVED_RULE\tREADME.md:1\tnew commit form\n" % L.line_key("old commit form"))
+        ledger.chmod(0o600)
+        done = self.run_script(*self.verify_args(before, after, skills, ledger), ok=False)
+        self.assertIn("FAIL superseded-line-still-active after:2", done.stdout)
+        self.assertRegex(done.stdout, r"FAIL lossless-unaccounted-line before:[\d,]*4")  # overlay text is founder text, not installer-owned
+        plain = Path(self.temp.name) / "p.tsv"
+        plain.write_text("%s\tSUPERSEDED_BY_APPROVED_RULE\tREADME.md:1\n" % L.line_key("old commit form"))
+        plain.chmod(0o600)
+        after.write_text("keep\nold commit form\nonly in overlay\n")
+        relaxed = self.run_script(*self.verify_args(before, after, skills, plain), ok=False)
+        self.assertNotIn("FAIL superseded", relaxed.stdout)  # tolerated while the legacy section is kept
+        strict = self.run_script(*self.verify_args(before, after, skills, plain, "--strict"), ok=False)
+        self.assertIn("FAIL superseded-line-still-active", strict.stdout)
+
+    def test_rehearse_refuses_a_scratch_dir_inside_the_real_config_or_checkout(self):
+        ledger = Path(self.temp.name) / "e.tsv"
+        ledger.write_text("")
+        ledger.chmod(0o600)
+        script = str(LIVE / "rehearse.sh")
+        for inside in (self.home / ".claude/scratch", self.repo / "scratch"):
+            done = self.run_script("bash", script, "--repo", str(self.repo), "--ledger", str(ledger), "--keep-dir", str(inside), ok=False)
+            self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+            self.assertIn("must not be inside", done.stderr)
+            self.assertFalse(inside.exists() and any(inside.iterdir()))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -41,7 +41,7 @@ if live.is_symlink():
     sys.exit('refusing: live file is a symlink')
 raw = live.read_bytes()
 digest = hashlib.sha256(raw).hexdigest()
-lines = raw.decode('utf-8').splitlines(keepends=True)
+lines = L.split_keepends(raw.decode('utf-8'))
 text = ''.join(lines)
 if text.count(SPAN_START) != 1 or text.count(SPAN_END) != 1:
     sys.exit('refusing: managed span absent; run profile-install.sh --claude-skills first')

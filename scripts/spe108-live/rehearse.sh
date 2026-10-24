@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Rehearse the whole SPE-108 live migration in a SCRATCH HOME built from copies of the operator's real files.
-# Nothing under the real HOME is written (the scratch tree is the only HOME the scripts see). Prints
+# It reads the real files and writes only under the scratch tree (HOME and every install-location override point
+# there). The one exception is the Codex installer, which may fetch pinned shared skills when ~/.agents is absent. Prints
 # PASS/FAIL lines and never any policy text; exit status is non-zero on the first failed assertion.
 #
 # Usage: rehearse.sh --repo CHECKOUT_AT_origin/main --ledger LEDGER [--mode keep|retire] [--keep-dir DIR]
@@ -21,10 +22,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ -d "$REPO" && -f "$LEDGER" && ( "$MODE" == keep || "$MODE" == retire ) ]] || { echo "usage: see header" >&2; exit 2; }
-REAL_HOME="$HOME"
-TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SIM="${KEEP:-$(mktemp -d)}"
-[[ -z "$KEEP" ]] || mkdir -p "$SIM"
+# Absolute, symlink-resolved paths first: the scripts below run with HOME=$SIM and from inside $REPO, so a
+# relative path would otherwise resolve somewhere else.
+REAL_HOME="$(cd "$HOME" && pwd -P)"
+TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO="$(cd "$REPO" && pwd -P)"
+LEDGER="$(cd "$(dirname "$LEDGER")" && pwd -P)/$(basename "$LEDGER")"
+if [[ -n "$KEEP" ]]; then mkdir -p "$KEEP"; SIM="$(cd "$KEEP" && pwd -P)"; else SIM="$(cd "$(mktemp -d)" && pwd -P)"; fi
+case "$SIM/" in
+    "$REAL_HOME/.claude/"*|"$REAL_HOME/.codex/"*|"$REAL_HOME/.agents/"*|"$REAL_HOME/"|"$REPO/"*)
+        echo "refusing: scratch dir must not be inside the real HOME config or the checkout" >&2; exit 2 ;;
+esac
 [[ -z "$(ls -A "$SIM")" ]] || { echo "scratch dir must be empty" >&2; exit 2; }
 BASE="$SIM/.config/coding-agent-environment/local/baseline/claude"
 mkdir -p -m 700 "$SIM/.claude" "$SIM/.codex" "$BASE"
@@ -39,7 +47,8 @@ cp -PR "$REAL_HOME/.claude/rules" "$SIM/.claude/rules"
 cp -PR "$REAL_HOME/.claude/skills" "$SIM/.claude/skills"
 cp -p "$REAL_HOME/.codex/AGENTS.md" "$SIM/.codex/"
 cp -PR "$REAL_HOME/.codex/skills" "$SIM/.codex/skills"
-[[ ! -d "$REAL_HOME/.agents" ]] || cp -PR "$REAL_HOME/.agents" "$SIM/.agents"  # pinned shared skills: no network fetch
+# Pinned shared skills. Without a copy the Codex installer may fetch them over the network (npx) into the scratch HOME.
+[[ ! -d "$REAL_HOME/.agents" ]] || cp -PR "$REAL_HOME/.agents" "$SIM/.agents"
 cp -p "$LEDGER" "$BASE/policy-ledger.tsv"
 chmod 600 "$BASE/policy-ledger.tsv"
 mkdir -p -m 700 "$SIM/before"
@@ -49,9 +58,15 @@ before_claude="$(tree_sha "$SIM/.claude")" before_codex="$(tree_sha "$SIM/.codex
 (cd "$SIM" && find .claude .codex -type f ! -path '*/backups/*' | sort) > "$SIM/before/files.txt"
 
 export HOME="$SIM" CODING_AGENT_SYNC_HOME="$SIM"
-unset CODEX_HOME CODING_AGENT_LOCAL_DIR CODING_AGENT_LOCAL_BASELINE_DIR
+# Every location override the installers read, so none can point at the operator's real files.
+unset CODEX_HOME CODING_AGENT_LOCAL_DIR CODING_AGENT_LOCAL_BASELINE_DIR CODING_AGENT_PROFILE_DIR XDG_CONFIG_HOME \
+    CODING_AGENT_MANAGED_SETTINGS_PATH CODING_AGENT_CODEX_MANAGED_CONFIG_PATH
+export INSTALL_BIN_DIR="$SIM/.local/bin"
 cd "$REPO"
 LED="$BASE/policy-ledger.tsv"
+
+MODE_FLAG=""
+[[ "$MODE" != retire ]] || MODE_FLAG="--strict"
 
 # 2. apply in the documented order
 scripts/profile-install.sh --claude-skills --dry-run >/dev/null
@@ -70,7 +85,7 @@ scripts/profile-install.sh --global >/dev/null
 scripts/profile-install.sh --global --check | tail -1 | grep -q 'drift: 0' && pass "codex managed drift 0" || fail "codex managed drift"
 
 # 3. effective final instruction files
-python3 "$TOOLS/verify-effective.py" --host claude --before "$SIM/before/CLAUDE.md" --after "$SIM/.claude/CLAUDE.md" \
+python3 "$TOOLS/verify-effective.py" ${MODE_FLAG:+$MODE_FLAG} --host claude --before "$SIM/before/CLAUDE.md" --after "$SIM/.claude/CLAUDE.md" \
     --skills-dir "$SIM/.claude/skills" --ledger "$LED" --repo "$REPO" | sed 's/^/claude: /' | tee "$SIM/claude-effective.txt" | grep -E '^claude: (FAIL|info)' || true
 ! grep -q 'claude: FAIL' "$SIM/claude-effective.txt" && pass "claude effective checks" || fail "claude effective checks"
 python3 "$TOOLS/verify-effective.py" --host codex --before "$SIM/before/AGENTS.md" --after "$SIM/.codex/AGENTS.md" \

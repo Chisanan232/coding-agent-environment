@@ -26,7 +26,7 @@ def digest(kind: str, text: str) -> str:
 def clauses(text: str):
     found = []
     fenced = False
-    for number, line in enumerate(text.splitlines(), 1):
+    for number, line in enumerate(text.split("\n"), 1):
         if line.lstrip().startswith("```"):
             fenced = not fenced
             continue
@@ -84,7 +84,7 @@ def main() -> int:
         except ledger_mod.LedgerError as error:
             print(f"Policy ledger refused: {error}")
             return 2
-        live_lines = live.splitlines()
+        live_lines = live.split("\n")
         # A clause is dispositioned when its own line is ledgered and not an open conflict.
         ledgered = {n for n, _, _ in missing
                     if rows.get(ledger_mod.line_key(live_lines[n - 1]), (None,))[0] not in (None, ledger_mod.CONFLICT)}

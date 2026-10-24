@@ -37,14 +37,16 @@ raw = target.read_bytes()
 digest = hashlib.sha256(raw).hexdigest()
 if digest != args.expect_sha256:
     sys.exit('refusing: file hash %s differs from --expect-sha256' % digest[:16])
-lines = raw.decode('utf-8').splitlines(keepends=True)
-plans = {k: v[2] for k, v in rows.items() if v[2]}
-if any(L.line_key(text) in plans for text in plans.values()):
+text = raw.decode('utf-8')
+lines = L.split_keepends(text)
+owned = L.marker_lines(text)  # installer and overlay spans are rewritten by the installer, never here
+plans = {k: v[2] for k, v in rows.items() if v[0] == L.SUPERSEDED and v[2]}
+if any(L.line_key(new) in plans for new in plans.values()):
     sys.exit('refusing: a replacement line is itself listed for rewriting')
 out, changed = [], []
 for number, line in enumerate(lines, 1):
     key = L.line_key(line)
-    if key in plans:
+    if key in plans and number not in owned:
         body = line.rstrip('\r\n')
         indent = body[:len(body) - len(body.lstrip())]
         out.append(indent + plans[key] + line[len(body):])

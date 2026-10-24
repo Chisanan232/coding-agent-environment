@@ -56,7 +56,7 @@ public_lines = {' '.join(l.split()).lower() for l in public_text.splitlines() if
 live = (Path.home() / '.claude/CLAUDE.md')
 if live.is_symlink():
     sys.exit('refusing: live file is a symlink')
-live_lines = live.read_text(encoding='utf-8').splitlines(keepends=True)
+live_lines = L.split_keepends(live.read_text(encoding='utf-8'))
 
 sections = split_sections(live_lines)
 titles = [t for t, _, _ in sections]

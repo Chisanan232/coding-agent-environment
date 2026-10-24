@@ -103,7 +103,8 @@ conflict by line number.
 ### Rehearse first (scratch HOME, writes nothing real)
 
 `scripts/spe108-live/rehearse.sh --repo <checkout> --ledger <ledger> [--mode keep|retire]` copies the real
-instruction files and skill trees into a temporary HOME and runs the whole migration there: Claude install,
+instruction files and skill trees into a temporary HOME (it reads the real files, writes only under the scratch tree,
+and refuses a scratch dir inside the real config or the checkout) and runs the whole migration there: Claude install,
 overlay, install, line rewrite (keep) or retirement (retire), Codex install, the effective-file checks, a second
 apply that must change nothing, and a rollback that must restore every pre-migration byte.
 
@@ -132,6 +133,10 @@ Rollback (every step is backed up): copy the byte-exact backups back over `CLAUD
 installer `Prior state:` directories newest first (their paths are relative to HOME), then delete files that did not
 exist before (`rehearse.sh` proves this restores every byte). Removing the overlay file does not remove the live
 overlay span; the span is restored by the `CLAUDE.md` backup.
+
+Line-level matching: an overlay line counts as present when the same normalized text exists anywhere outside the
+removed blocks, so keep the ledger review (not the tool) as the judge of meaning. `verify-effective.py --strict`
+(the retire path) also fails while any superseded line is still present.
 
 Known cost: after the overlay is merged the original region and the overlay copy both exist, so the live
 file roughly doubles; `verify-effective.py` prints the duplicate-title count. Removing the 23 original duplicates is
