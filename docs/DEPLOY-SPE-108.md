@@ -112,9 +112,10 @@ apply that must change nothing, and a rollback that must restore every pre-migra
 
 1. Back up `~/.claude/CLAUDE.md`, `~/.claude/rules/*.md` and `~/.codex/AGENTS.md` byte-exactly (Preconditions).
 2. `scripts/profile-install.sh --claude-skills --dry-run`, `--check`, then apply **with no overlay yet**.
-3. `python3 scripts/spe108-live/build-overlay.py --repo <checkout> --ledger <ledger>`. Creates the mode-0600
-   overlay from live-only text; with `--ledger` it also copies the `PRESERVE_IN_PRIVATE_OVERLAY` lines of the
-   legacy sections. Refuses to overwrite a different overlay; identical output is a no-op.
+3. `python3 scripts/spe108-live/build-overlay.py --repo <checkout>`. Creates the mode-0600 overlay from live-only
+   text. Pass `--ledger <ledger>` only on the retire path: it also copies the `PRESERVE_IN_PRIVATE_OVERLAY` lines of
+   the legacy sections, which on the keep path would just duplicate lines that stay in place. Refuses to overwrite a
+   different overlay (so decide the path before the first build); identical output is a no-op.
 4. `scripts/profile-install.sh --claude-skills` again to merge the overlay, then `--check`.
 5. **Keep path (default):** `python3 scripts/spe108-live/rewrite-lines.py --file ~/.claude/CLAUDE.md --ledger <ledger>
    --expect-sha256 <sha>` (dry run, prints line numbers and hashes), then again with `--apply`. It replaces only the
@@ -139,5 +140,5 @@ removed blocks, so keep the ledger review (not the tool) as the judge of meaning
 (the retire path) also fails while any superseded line is still present.
 
 Known cost: after the overlay is merged the original region and the overlay copy both exist, so the live
-file roughly doubles; `verify-effective.py` prints the duplicate-title count. Removing the 23 original duplicates is
+file roughly doubles (`rehearse.sh` prints the byte counts; `verify-effective.py` prints the duplicate-title count). Removing the 23 original duplicates is
 a separate owner decision.
