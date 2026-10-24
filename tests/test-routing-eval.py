@@ -135,6 +135,21 @@ class Invocation(unittest.TestCase):
             self.assertNotIn("dangerously", joined)
             self.assertNotIn("bypass", joined)
             self.assertFalse(any(t.startswith("Bash(git push") for t in argv))
+            self.assertNotIn("Bash(python3 *)", argv)
+            self.assertFalse(any(t == "Bash" for t in argv))
+
+    def test_worker_gets_the_same_narrow_bash_and_env_is_scrubbed(self):
+        argv, _ = ev.claude_args("B", self.task)
+        tools = json.loads(argv[argv.index("--agents") + 1])["haiku-worker"]["tools"]
+        self.assertNotIn("Bash", tools)
+        self.assertIn("Bash(python3 -I tests/*)", tools)
+        import os
+        os.environ["GH_TOKEN_TEST_SENTINEL"] = "x"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "x"
+        env = ev.scrubbed_env()
+        self.assertNotIn("GH_TOKEN_TEST_SENTINEL", env)
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", env)
+        self.assertLessEqual(set(env), set(ev.ENV_KEEP))
 
     def test_policy_was_committed_with_the_gates_it_describes(self):
         policy = json.loads(ev.POLICY_PATH.read_text())

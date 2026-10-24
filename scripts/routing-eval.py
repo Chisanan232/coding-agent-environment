@@ -30,8 +30,15 @@ _USAGE_KEYS = {
     "output": "outputTokens",
 }
 HEADLESS_FLAGS = ["--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"]
-WORK_TOOLS = ["Read", "Edit", "Write", "Grep", "Glob", "Bash(python3 *)", "Bash(git diff*)",
-              "Bash(git status*)", "Bash(ls *)", "Bash(cat *)"]
+# Bash is limited to the test runner shape and read-only git; no interpreter wildcard, no network tools.
+BASH_ALLOW = ["Bash(python3 -I tests/*)", "Bash(git diff*)", "Bash(git status*)"]
+WORK_TOOLS = ["Read", "Edit", "Write", "Grep", "Glob", *BASH_ALLOW]
+ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "TERM", "TMPDIR")
+
+
+def scrubbed_env() -> dict:
+    """Only what the CLI needs to find its own login; no cloud, GitHub or API credentials."""
+    return {k: os.environ[k] for k in ENV_KEEP if k in os.environ}
 
 ADMISSION = (
     "Delegation policy. You may delegate to the Agent `haiku-worker` only when the required behavior, "
@@ -152,7 +159,7 @@ def claude_args(arm: str, task: dict) -> tuple[list[str], str]:
     if arm == "B":
         agents = {"haiku-worker": {"description": "Bounded low-risk implementation worker",
                                    "prompt": WORKER_PROMPT, "model": HAIKU_ID,
-                                   "tools": ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]}}
+                                   "tools": ["Read", "Edit", "Write", "Grep", "Glob", *BASH_ALLOW]}}
         base += ["--agents", json.dumps(agents)]
         tools.append("Agent")
         prompt = ADMISSION + "\n\n" + prompt
@@ -164,7 +171,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     argv, prompt = claude_args(args.arm, task)
     t0 = time.time()
     p = subprocess.run(argv, input=prompt, cwd=args.workdir, capture_output=True, text=True,
-                       timeout=args.timeout)
+                       timeout=args.timeout, env=scrubbed_env())
     wall_ms = int((time.time() - t0) * 1000)
     try:
         result = json.loads(p.stdout)
@@ -224,7 +231,7 @@ def cmd_review(args: argparse.Namespace) -> None:
     )
     p = subprocess.run(["claude", "-p", "--output-format", "json", "--model", "sonnet", "--max-turns", "1",
                         "--tools", "", *HEADLESS_FLAGS], input=prompt, capture_output=True, text=True,
-                       timeout=args.timeout)
+                       timeout=args.timeout, env=scrubbed_env())
     res = json.loads(p.stdout)
     text = res.get("result", "")
     review = json.loads(text[text.index("{"): text.rindex("}") + 1])

@@ -18,3 +18,7 @@ Gates, arms and the decision rule are in `evals/routing/policy.json`, committed 
 - Usage is a vector per model (fresh input, cache write, cache read, output), plus wall time and turns. No weights are invented. The CLI's `total_cost_usd` is a list-price estimate, not a bill, and subscription utilization is not exposed per run.
 - Headless runs load a slimmed context (`--strict-mcp-config --disable-slash-commands`) so both arms pay the same startup. Measured on 2.1.306: a one-word reply cost 190,961 prompt tokens with the default context and about 30,800 with those flags. Realistic interactive subagent startup is measured separately from transcripts (median about 70k for Sonnet, about 37k for Haiku 5.5).
 - The `haiku` alias resolved to Haiku 4.5 on Claude Code 2.1.287 to 2.1.292 and to Haiku 5.5 on 2.1.306, so runs pin the explicit id and record the resolved id.
+
+## Isolation limits (stated, not hidden)
+
+Arms are not in a container or VM. Bash is limited to `python3 -I tests/*` and read-only git, the worker gets the same set, and each run gets a scrubbed environment (PATH, HOME, USER, LANG, TERM, TMPDIR only). HOME is kept because the CLI finds its subscription login there, so an arm can still read files under HOME with the Read tool. The corpus is therefore public-repository work only, and no corporate or secret-bearing task may be added to it.
