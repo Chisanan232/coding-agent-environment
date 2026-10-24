@@ -16,6 +16,7 @@
 #
 # Usage:
 #   ./scripts/profile-install.sh [--dry-run]
+#   ./scripts/profile-install.sh --visuals [--dry-run | --check]
 #   ./scripts/profile-install.sh --global [--dry-run | --check]
 #   ./scripts/profile-install.sh --capabilities [--dry-run | --check | --remove]
 #   ./scripts/profile-install.sh --resource-policy [--dry-run | --check | --apply | --rollback]
@@ -33,6 +34,10 @@ fi
 if [[ "${1:-}" == "--routing" ]]; then
     shift
     exec python3 "$REPO_ROOT/scripts/codex-routing.py" "$@"
+fi
+if [[ "${1:-}" == "--visuals" ]]; then
+    shift
+    exec python3 "$REPO_ROOT/scripts/visual-skills.py" "$@"
 fi
 INSTALL_BIN_DIR="${INSTALL_BIN_DIR:-$HOME/.local/bin}"
 PROFILE_DIR="${CODING_AGENT_PROFILE_DIR:-$HOME/.coding-agent-profiles}"

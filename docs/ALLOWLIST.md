@@ -21,8 +21,9 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 | `codex/agents/*.toml` | Canonical named architect/implementer/reviewer routing policy; see `docs/CODEX-ROUTING.md` |
 | `codex/capabilities-readonly.config.toml` | Opt-in native Codex external profile: broad Neon app disabled, official read-only Neon MCP allowlisted |
 | `codex/AGENTS.md` | Global instruction template; signal-first block is managed; exact known legacy routing policy is migrated, unknown/unrelated instructions are preserved |
-| `codex/subtraction-skills.json` | External canonical skill revision and consumed-file digests; no vendored bodies |
-| `scripts/check.sh`, `scripts/install.sh`, `scripts/profile-install.sh`, `scripts/sync-check.sh`, `scripts/codex-routing.py`, `scripts/verify-codex-routing.py` | Bootstrap/diagnosis, prerequisite install, profile setup, focused Codex routing reconciliation and live/repo drift report |
+| `codex/subtraction-skills.json` | External canonical skill pins and consumed-tree integrity digests; package bodies remain upstream and are not vendored |
+| `docs/VISUAL-SKILLS.md` | Pinned Archify and Visual Explainer source, host integration, and installation lifecycle |
+| `scripts/check.sh`, `scripts/install.sh`, `scripts/profile-install.sh`, `scripts/sync-check.sh`, `scripts/codex-routing.py`, `scripts/verify-codex-routing.py`, `scripts/visual-skills.py` | Bootstrap/diagnosis, prerequisite install, profile setup, focused Codex routing and visual-skill reconciliation, live/repo drift report |
 | `.gitleaks.toml`, `.pre-commit-config.yaml`, `.github/workflows/secret-scan.yml` | Layered secret-scanning config (see `docs/SECURITY.md`) |
 | `docs/ARCHITECTURE.md`, `docs/adr/` | Design goals, layering, and ADRs for durable decisions |
 | `docs/CODEX-ROUTING.md` | Portable Codex named-role routing, ownership, lifecycle and evidence boundaries |
@@ -36,6 +37,10 @@ state — not because a whole `~/.claude`/`~/.codex` tree was copied.
 
 - `.claude.json`, `auth.json`, OAuth credentials (Keychain), session/history state
 - `~/.codex/backups/`, materialized `~/.codex/skills/`, installed `~/.agents/skills/` and `.skill-lock.json` — runtime/install state, not authored truth
+- `~/.local/share/coding-agent-environment/visual-skills/<name>/<SHA>/` — immutable machine-local visual skill source snapshots; source package content is pinned and verified against `codex/subtraction-skills.json`, never committed as vendored skill bodies
+- `~/.agents/skills/archify`, `~/.claude/skills/archify` — managed Archify symlinks into the immutable snapshot
+- `~/.agents/skills/visual-explainer` — generated physical copy of the complete pinned plugin leaf for Codex; its `codex_copy` receipt is at `~/.local/share/coding-agent-environment/visual-skills/receipt.json`, and staged/prior directories support resumable two-rename activation. All remain machine-local
+- Claude marketplace/plugin registries and installed plugin state for Visual Explainer — machine-local integration state; do not commit marketplace checkout paths or plugin installation metadata
 - `~/.codex/*.sqlite*`, `logs_*`, `history.jsonl`, `session_index.jsonl`
 - `~/.codex/config.toml`'s `[projects."<path>"]` trust entries — machine-specific
 - `~/.codex/config.toml`'s `notify` field — points at a local `.app` bundle path

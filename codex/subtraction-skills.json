@@ -22,5 +22,46 @@
         "references/evidence.md": "6303d565aab40f4465d7a1fbfa3b4c8fdc43142e3d5e58ee8cae7ba0467682e0"
       }
     }
+  },
+  "visuals": {
+    "packages": {
+      "archify": {
+        "repository": "https://github.com/tt-a1i/archify.git",
+        "tag": "v3.0.1",
+        "revision": "2ab3cae7ac2c2a55d7386ca789d03c4fcd31816c",
+        "paths": [
+          "LICENSE",
+          "archify"
+        ],
+        "integrity": "sha256:285491e7cd9cf4508809b42ac0fd468c443b3a0efde969564270c2f5c3cd554d",
+        "agents": [
+          "claude-code",
+          "codex"
+        ],
+        "deployment": {
+          "codex": "user-agent-skill-link",
+          "claude-code": "user-agent-skill-link"
+        }
+      },
+      "visual-explainer": {
+        "repository": "https://github.com/nicobailon/visual-explainer.git",
+        "tag": "v0.12.0",
+        "revision": "6376b7727bb9b1d5d37ad3e4d96d969a6499917b",
+        "paths": [
+          "LICENSE",
+          ".claude-plugin",
+          "plugins/visual-explainer"
+        ],
+        "integrity": "sha256:cdc10effc193f61940c932154b007551279bb96886bfad50565931894dd8ce4e",
+        "agents": [
+          "claude-code",
+          "codex"
+        ],
+        "deployment": {
+          "codex": "verified-generated-user-skill-copy",
+          "claude-code": "native-user-marketplace-plugin"
+        }
+      }
+    }
   }
 }
