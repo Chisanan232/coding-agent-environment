@@ -14,6 +14,10 @@ on:
       - 'scripts/launcher-install.py'
       - 'scripts/hook-rollout.py'
       - 'scripts/owner-merge-gate.py'
+      - 'docs/ENGINEERING-CONSTITUTION.md'
+      - 'tests/test-engineering-constitution.py'
+      - 'scripts/constitution-behavior-matrix.py'
+      - 'tests/test-constitution-behavior-matrix.py'
       - 'scripts/owner-merge-runner.py'
       - 'scripts/owner-merge-evidence-sign.py'
       - 'scripts/branch-protection-rollout.py'
@@ -64,6 +68,10 @@ on:
       - 'scripts/launcher-install.py'
       - 'scripts/hook-rollout.py'
       - 'scripts/owner-merge-gate.py'
+      - 'docs/ENGINEERING-CONSTITUTION.md'
+      - 'tests/test-engineering-constitution.py'
+      - 'scripts/constitution-behavior-matrix.py'
+      - 'tests/test-constitution-behavior-matrix.py'
       - 'scripts/owner-merge-runner.py'
       - 'scripts/owner-merge-evidence-sign.py'
       - 'scripts/branch-protection-rollout.py'
@@ -143,6 +151,8 @@ jobs:
           python3 tests/test-hook-rollout.py
           python3 tests/test-owner-merge-gate.py
           python3 tests/test-owner-merge-gate-local.py
+          python3 tests/test-engineering-constitution.py
+          python3 tests/test-constitution-behavior-matrix.py
           python3 tests/test-owner-merge-autonomy.py
           python3 tests/test-owner-merge-runner.py
           python3 tests/test-branch-protection-rollout.py

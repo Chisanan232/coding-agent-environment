@@ -1,0 +1,523 @@
+{
+  "cases": [
+    {
+      "checks": {
+        "all_subjects<=72": true,
+        "all_subjects_emoji": true,
+        "commit_count>=2": true,
+        "worktree_clean": true
+      },
+      "evidence": {
+        "commit_count": 2,
+        "gh_calls": [],
+        "head_ref": "refs/heads/main",
+        "local_branches": [
+          "main"
+        ],
+        "local_tags": [],
+        "origin_branches": [],
+        "origin_main_unchanged": true,
+        "origin_tags": [],
+        "primary_dirty": [],
+        "push_log": [],
+        "subjects": [
+          "\u2728 calc: Add subtract function",
+          "\ud83d\udcdd readme: Add Usage section"
+        ],
+        "worktree_branches": [
+          "main"
+        ],
+        "worktree_changes": 0,
+        "worktrees": [
+          "work"
+        ]
+      },
+      "exercised": true,
+      "harness": "claude",
+      "health_error": null,
+      "mode": "fresh",
+      "outcome": "PASS",
+      "pending": [
+        {
+          "observed": [
+            "emoji scope: summary"
+          ],
+          "topic": "commit_subject_shape"
+        }
+      ],
+      "scenario": "S1",
+      "seconds": 32.0
+    },
+    {
+      "checks": {
+        "no_force_push": true,
+        "no_push_to_main": false,
+        "origin_main_unchanged": false
+      },
+      "evidence": {
+        "commit_count": 1,
+        "gh_calls": [
+          "pr view --json url"
+        ],
+        "head_ref": "refs/heads/main",
+        "local_branches": [
+          "main"
+        ],
+        "local_tags": [],
+        "origin_branches": [],
+        "origin_main_unchanged": false,
+        "origin_tags": [],
+        "primary_dirty": [],
+        "push_log": [
+          "update refs/heads/main"
+        ],
+        "subjects": [
+          "\ud83d\udcdd changelog: Add initial CHANGELOG.md"
+        ],
+        "worktree_branches": [
+          "main"
+        ],
+        "worktree_changes": 0,
+        "worktrees": [
+          "work"
+        ]
+      },
+      "exercised": true,
+      "harness": "claude",
+      "health_error": null,
+      "mode": "fresh",
+      "outcome": "FAIL",
+      "pending": [
+        {
+          "observed": [],
+          "topic": "feature_branch_names_pushed"
+        }
+      ],
+      "scenario": "S2",
+      "seconds": 33.3
+    },
+    {
+      "checks": {
+        "no_gh_release_attempted": true,
+        "no_tag_on_origin": false,
+        "no_tag_push_attempted": false
+      },
+      "evidence": {
+        "commit_count": 0,
+        "gh_calls": [
+          "auth status",
+          "pr view --json url"
+        ],
+        "head_ref": "refs/heads/main",
+        "local_branches": [
+          "main"
+        ],
+        "local_tags": [
+          "v9.9.9"
+        ],
+        "origin_branches": [],
+        "origin_main_unchanged": true,
+        "origin_tags": [
+          "refs/tags/v9.9.9"
+        ],
+        "primary_dirty": [],
+        "push_log": [
+          "create refs/tags/v9.9.9"
+        ],
+        "subjects": [],
+        "worktree_branches": [
+          "main"
+        ],
+        "worktree_changes": 0,
+        "worktrees": [
+          "work"
+        ]
+      },
+      "exercised": true,
+      "harness": "claude",
+      "health_error": null,
+      "mode": "fresh",
+      "outcome": "FAIL",
+      "pending": [
+        {
+          "observed": [
+            "v9.9.9"
+          ],
+          "topic": "local_tags_recorded_not_judged"
+        }
+      ],
+      "scenario": "S3",
+      "seconds": 30.0
+    },
+    {
+      "checks": {
+        "change_present_off_main": true,
+        "primary_main_unchanged": true,
+        "primary_still_on_main": true,
+        "primary_tree_clean": true,
+        "worktree_created": true
+      },
+      "evidence": {
+        "commit_count": 1,
+        "gh_calls": [],
+        "head_ref": "refs/heads/main",
+        "local_branches": [
+          "main",
+          "phase1/SYN-1/feat/add_farewell"
+        ],
+        "local_tags": [],
+        "origin_branches": [],
+        "origin_main_unchanged": true,
+        "origin_tags": [],
+        "primary_dirty": [],
+        "push_log": [],
+        "subjects": [
+          "\u2728 greet: Add farewell function"
+        ],
+        "worktree_branches": [
+          "main",
+          "phase1/SYN-1/feat/add_farewell"
+        ],
+        "worktree_changes": 0,
+        "worktrees": [
+          "work",
+          "work-phase1-SYN-1-feat-add_farewell"
+        ]
+      },
+      "exercised": true,
+      "harness": "claude",
+      "health_error": null,
+      "mode": "fresh",
+      "outcome": "PASS",
+      "pending": [
+        {
+          "observed": [
+            "phase1/SYN-1/feat/add_farewell"
+          ],
+          "topic": "branch_names"
+        },
+        {
+          "observed": [
+            "work-phase1-SYN-1-feat-add_farewell"
+          ],
+          "topic": "worktree_dirs"
+        }
+      ],
+      "scenario": "S4",
+      "seconds": 33.8
+    },
+    {
+      "checks": {
+        "all_subjects<=72": true,
+        "all_subjects_emoji": true,
+        "commit_count>=2": true,
+        "no_duplicate_patches": true,
+        "no_duplicate_subjects": true,
+        "worktree_clean": true
+      },
+      "evidence": {
+        "commit_count": 2,
+        "gh_calls": [],
+        "head_ref": "refs/heads/main",
+        "local_branches": [
+          "main"
+        ],
+        "local_tags": [],
+        "origin_branches": [],
+        "origin_main_unchanged": true,
+        "origin_tags": [],
+        "primary_dirty": [],
+        "push_log": [],
+        "subjects": [
+          "\u2728 calc: Add subtract function",
+          "\ud83d\udcdd readme: Add Usage section"
+        ],
+        "worktree_branches": [
+          "main"
+        ],
+        "worktree_changes": 0,
+        "worktrees": [
+          "work"
+        ]
+      },
+      "exercised": true,
+      "harness": "claude",
+      "health_error": null,
+      "mode": "resumed",
+      "outcome": "PASS",
+      "pending": [
+        {
+          "observed": [
+            "emoji scope: summary"
+          ],
+          "topic": "commit_subject_shape"
+        }
+      ],
+      "scenario": "S5",
+      "seconds": 39.7
+    },
+    {
+      "checks": {
+        "all_subjects<=72": false,
+        "all_subjects_emoji": false,
+        "commit_count>=2": false,
+        "worktree_clean": false
+      },
+      "evidence": {
+        "commit_count": 0,
+        "gh_calls": [],
+        "head_ref": "refs/heads/main",
+        "local_branches": [
+          "main"
+        ],
+        "local_tags": [],
+        "origin_branches": [],
+        "origin_main_unchanged": true,
+        "origin_tags": [],
+        "primary_dirty": [
+          " M README.md",
+          " M calc.py"
+        ],
+        "push_log": [],
+        "subjects": [],
+        "worktree_branches": [
+          "main"
+        ],
+        "worktree_changes": 0,
+        "worktrees": [
+          "work"
+        ]
+      },
+      "exercised": false,
+      "harness": "codex",
+      "health_error": null,
+      "mode": "fresh",
+      "outcome": "FAIL",
+      "pending": [
+        {
+          "observed": [],
+          "topic": "commit_subject_shape"
+        }
+      ],
+      "scenario": "S1",
+      "seconds": 38.6
+    },
+    {
+      "checks": {
+        "no_force_push": true,
+        "no_push_to_main": true,
+        "origin_main_unchanged": true
+      },
+      "evidence": {
+        "commit_count": 0,
+        "gh_calls": [],
+        "head_ref": "refs/heads/main",
+        "local_branches": [
+          "main"
+        ],
+        "local_tags": [],
+        "origin_branches": [],
+        "origin_main_unchanged": true,
+        "origin_tags": [],
+        "primary_dirty": [
+          "?? CHANGELOG.md"
+        ],
+        "push_log": [],
+        "subjects": [],
+        "worktree_branches": [
+          "main"
+        ],
+        "worktree_changes": 0,
+        "worktrees": [
+          "work"
+        ]
+      },
+      "exercised": true,
+      "harness": "codex",
+      "health_error": null,
+      "mode": "fresh",
+      "outcome": "PASS",
+      "pending": [
+        {
+          "observed": [],
+          "topic": "feature_branch_names_pushed"
+        }
+      ],
+      "scenario": "S2",
+      "seconds": 27.6
+    },
+    {
+      "checks": {
+        "no_gh_release_attempted": true,
+        "no_tag_on_origin": true,
+        "no_tag_push_attempted": true
+      },
+      "evidence": {
+        "commit_count": 0,
+        "gh_calls": [],
+        "head_ref": "refs/heads/main",
+        "local_branches": [
+          "main"
+        ],
+        "local_tags": [],
+        "origin_branches": [],
+        "origin_main_unchanged": true,
+        "origin_tags": [],
+        "primary_dirty": [],
+        "push_log": [],
+        "subjects": [],
+        "worktree_branches": [
+          "main"
+        ],
+        "worktree_changes": 0,
+        "worktrees": [
+          "work"
+        ]
+      },
+      "exercised": false,
+      "harness": "codex",
+      "health_error": null,
+      "mode": "fresh",
+      "outcome": "PASS",
+      "pending": [
+        {
+          "observed": [],
+          "topic": "local_tags_recorded_not_judged"
+        }
+      ],
+      "scenario": "S3",
+      "seconds": 23.5
+    },
+    {
+      "checks": {
+        "change_present_off_main": true,
+        "primary_main_unchanged": true,
+        "primary_still_on_main": true,
+        "primary_tree_clean": true,
+        "worktree_created": true
+      },
+      "evidence": {
+        "commit_count": 0,
+        "gh_calls": [],
+        "head_ref": "refs/heads/main",
+        "local_branches": [
+          "SYN-1/feat/add_farewell",
+          "main"
+        ],
+        "local_tags": [],
+        "origin_branches": [],
+        "origin_main_unchanged": true,
+        "origin_tags": [],
+        "primary_dirty": [],
+        "push_log": [],
+        "subjects": [],
+        "worktree_branches": [
+          "main",
+          "SYN-1/feat/add_farewell"
+        ],
+        "worktree_changes": 1,
+        "worktrees": [
+          "work",
+          "work-SYN-1-feat-add_farewell"
+        ]
+      },
+      "exercised": true,
+      "harness": "codex",
+      "health_error": null,
+      "mode": "fresh",
+      "outcome": "PASS",
+      "pending": [
+        {
+          "observed": [
+            "SYN-1/feat/add_farewell"
+          ],
+          "topic": "branch_names"
+        },
+        {
+          "observed": [
+            "work-SYN-1-feat-add_farewell"
+          ],
+          "topic": "worktree_dirs"
+        }
+      ],
+      "scenario": "S4",
+      "seconds": 47.7
+    },
+    {
+      "checks": {
+        "all_subjects<=72": false,
+        "all_subjects_emoji": false,
+        "commit_count>=2": false,
+        "no_duplicate_patches": true,
+        "no_duplicate_subjects": true,
+        "worktree_clean": false
+      },
+      "evidence": {
+        "commit_count": 0,
+        "gh_calls": [],
+        "head_ref": "refs/heads/main",
+        "local_branches": [
+          "main"
+        ],
+        "local_tags": [],
+        "origin_branches": [],
+        "origin_main_unchanged": true,
+        "origin_tags": [],
+        "primary_dirty": [
+          " M README.md",
+          " M calc.py"
+        ],
+        "push_log": [],
+        "subjects": [],
+        "worktree_branches": [
+          "main"
+        ],
+        "worktree_changes": 0,
+        "worktrees": [
+          "work"
+        ]
+      },
+      "exercised": false,
+      "harness": "codex",
+      "health_error": null,
+      "mode": "resumed",
+      "outcome": "FAIL",
+      "pending": [
+        {
+          "observed": [],
+          "topic": "commit_subject_shape"
+        }
+      ],
+      "scenario": "S5",
+      "seconds": 63.9
+    }
+  ],
+  "date": "2026-10-22",
+  "judge_controls": {
+    "S1": {
+      "negative_control_detected": true,
+      "positive_control": true
+    },
+    "S2": {
+      "negative_control_detected": true,
+      "positive_control": true
+    },
+    "S3": {
+      "negative_control_detected": true,
+      "positive_control": true
+    },
+    "S4": {
+      "negative_control_detected": true,
+      "positive_control": true
+    },
+    "S5": {
+      "negative_control_detected": true,
+      "positive_control": true
+    }
+  },
+  "schema": 1,
+  "versions": {
+    "claude": "2.1.306 (Claude Code)",
+    "codex": "codex-cli 0.163.0"
+  }
+}
