@@ -63,8 +63,16 @@ def forbidden_roots() -> list[Path]:
     return [home / "Bryant-Developments", home / ".claude", Path("/private/tmp/claude-501"), Path("/tmp/claude-501")]
 
 
+SENSITIVE_HOME = (".ssh", ".aws", ".config", ".gnupg", "Library", ".zshrc", ".zprofile", ".bashrc", ".gitconfig",
+                  ".netrc", ".npmrc")
+
+
 def deny_rules() -> list[str]:
     rules = [f"{tool}(.git/**)" for tool in ("Read", "Edit", "Write")]
+    home = str(Path.home()).lstrip("/")
+    for name in SENSITIVE_HOME:
+        for tool in ("Read", "Grep", "Glob", "Edit", "Write"):
+            rules += [f"{tool}(//{home}/{name})", f"{tool}(//{home}/{name}/**)"]
     for root in forbidden_roots():
         for tool in ("Read", "Grep", "Glob", "Edit", "Write"):
             rules.append(f"{tool}(//{str(root).lstrip('/')}/**)")
@@ -188,11 +196,19 @@ def audit_stream(stdout: str, workdir: Path | None = None) -> list[str]:
             inp = block.get("input") or {}
             blob = json.dumps(inp)
             flags.extend(f"{block.get('name')}: {n.strip()}" for n in AUDIT_NEEDLES if n in blob)
+            if block.get("name") == "Bash":
+                cmd = str(inp.get("command", ""))
+                if "../" in cmd or "$HOME" in cmd or "${HOME}" in cmd:
+                    flags.append("Bash: path traversal or HOME reference outside workdir")
             if root and block.get("name") in PATH_TOOLS:
                 for key in ("file_path", "path", "pattern"):
                     v = inp.get(key)
-                    if isinstance(v, str) and (v.startswith("/") or v.startswith("~")):
-                        real = os.path.realpath(os.path.expanduser(v.split("*")[0] or "/"))
+                    if isinstance(v, str) and v:
+                        raw = v.replace("${HOME}", str(Path.home())).replace("$HOME", str(Path.home()))
+                        target = os.path.expanduser(raw.split("*")[0] or "/")
+                        if not os.path.isabs(target):
+                            target = os.path.join(root, target)
+                        real = os.path.realpath(target)
                         if real != root and not real.startswith(root + os.sep):
                             flags.append(f"{block.get('name')}: path outside workdir {v[:60]}")
     return sorted(set(flags))
@@ -382,6 +398,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         raise SystemExit(f"{work} is under a directory arms may not read")
     argv, prompt = claude_args(args.arm, task)
     Path(args.out).unlink(missing_ok=True)
+    Path(str(args.out) + ".stream.jsonl").unlink(missing_ok=True)
     started = datetime.now(timezone.utc).isoformat()
     t0 = time.time()
     extra = {"order_index": args.order_index, "started_at": started}
@@ -392,7 +409,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         flags = audit_stream(p.stdout, work)
         Path(str(args.out) + ".stream.jsonl").write_text(p.stdout)
         if final is None:
-            record = error_record(task["id"], args.arm, f"no result event: {(p.stderr or p.stdout)[-300:]}", **extra)
+            record = error_record(task["id"], args.arm, f"no result event: {(p.stderr or p.stdout)[-300:]}",
+                                  audit_flags=flags, **extra)
         else:
             mu = usage_vector(final)
             usage, accounting = effective_usage(mu, agents, side)
@@ -450,6 +468,15 @@ def contain_symlinks(sandbox: Path) -> list[str]:
 
 def cmd_grade(args: argparse.Namespace) -> None:
     task = find_task(load_json(CORPUS_PATH), args.task)
+    if task.get("oracle_unsandboxed"):
+        # arm-written code runs without a sandbox here, so only after a clean, recorded run (fail closed)
+        rr = Path(args.run_record) if getattr(args, "run_record", None) else None
+        dirty = (not rr or not rr.exists() or sensitive(load_json(rr).get("audit_flags", [])))
+        if dirty:
+            Path(args.out).write_text(json.dumps({"task": task["id"], "arm": args.arm,
+                                                  "error": "unsandboxed oracle refused: run record missing or flagged"}))
+            print(json.dumps({"task": task["id"], "error": "unsandboxed oracle refused"}))
+            return
     repo, work = Path(args.repo), Path(args.workdir)
     Path(args.out).unlink(missing_ok=True)  # a stale record from an earlier attempt must never be scored
     record = {"task": task["id"], "arm": args.arm}
@@ -610,6 +637,7 @@ def main() -> None:
     p = sub.add_parser("grade"); p.add_argument("task"); p.add_argument("--arm", choices=("A", "B", "C"), required=True)
     p.add_argument("--workdir", required=True)
     p.add_argument("--out", required=True); p.add_argument("--repo", default=str(ROOT))
+    p.add_argument("--run-record", help="the arm's run record; required to grade an unsandboxed-oracle task")
     p.add_argument("--timeout", type=int, default=600); p.set_defaults(fn=cmd_grade)
     p = sub.add_parser("review"); p.add_argument("task"); p.add_argument("--workdir", required=True)
     p.add_argument("--out", required=True); p.add_argument("--repo", default=str(ROOT))
