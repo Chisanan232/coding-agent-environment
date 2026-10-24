@@ -258,7 +258,8 @@ class LiveScripts(unittest.TestCase):
         (skills / "SKILL.md").write_text("\n".join((
             "<version-or-phase>/<ticket-id>/<type>/<short_summary>", "<repo>-<phase>-<ticket>-<type>-<summary>",
             "<GitEmoji> (<scope>): <imperative summary>", "[<TICKET>] <GitEmoji> (<scope>): <imperative summary under 60 chars>",
-            "independent review", "at most seven concurrent subagents", "never push directly")) + "\n")
+            "independent review", "at most seven concurrent subagents", "never push directly",
+            "✨ (model): Add property to TestModel", "[PROJ-123] ✨ (restapi): Add user authentication")) + "\n")
         ledger = Path(self.temp.name) / "v.tsv"
         rows = [(L.line_key("old <emoji> <scope>: format"), L.SUPERSEDED), (L.line_key("cited rule"), L.SEMANTIC)]
         ledger.write_text("".join("%s\t%s\tREADME.md:1\n" % row for row in rows))

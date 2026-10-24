@@ -79,7 +79,10 @@ MODE_FLAG=""
 # 2. apply in the documented order
 scripts/profile-install.sh --claude-skills --dry-run >/dev/null
 scripts/profile-install.sh --claude-skills >/dev/null
-python3 "$TOOLS/build-overlay.py" --repo "$REPO" --ledger "$LED" >/dev/null
+# The retained-legacy overlay section only exists for the retire path; on the keep path the originals stay in place
+# and copying them again would just add duplicate lines to every session.
+if [[ "$MODE" == retire ]]; then OVERLAY_LEDGER=(--ledger "$LED"); else OVERLAY_LEDGER=(); fi
+python3 "$TOOLS/build-overlay.py" --repo "$REPO" ${OVERLAY_LEDGER[@]+"${OVERLAY_LEDGER[@]}"} >/dev/null
 scripts/profile-install.sh --claude-skills >/dev/null
 scripts/profile-install.sh --claude-skills --check | tail -1 | grep -q 'drift: 0' && pass "claude managed drift 0" || fail "claude managed drift"
 if [[ "$MODE" == retire ]]; then
@@ -101,12 +104,24 @@ python3 "$TOOLS/verify-effective.py" --host codex --before "$SIM/before/AGENTS.m
 ! grep -q 'codex: FAIL' "$SIM/codex-effective.txt" && pass "codex effective checks" || fail "codex effective checks"
 python3 "$TOOLS/../claude-clause-drift.py" | tail -1 | grep -q 'Claude clause drift: 0' && pass "clause drift 0 (ledger dispositioned)" || fail "clause drift"
 
+# what the migration costs every session
+python3 - "$SIM/before/CLAUDE.md" "$SIM/.claude/CLAUDE.md" "$SIM/before/AGENTS.md" "$SIM/.codex/AGENTS.md" <<'PY'
+import sys
+for label, a, b in (("claude", sys.argv[1], sys.argv[2]), ("codex", sys.argv[3], sys.argv[4])):
+    print("info %s context: %d -> %d bytes" % (label, len(open(a, "rb").read()), len(open(b, "rb").read())))
+PY
+
 # 4. idempotent second apply
 after_claude="$(tree_sha "$SIM/.claude")" after_codex="$(tree_sha "$SIM/.codex")"
 scripts/profile-install.sh --claude-skills >/dev/null
 scripts/profile-install.sh --global >/dev/null
-python3 "$TOOLS/build-overlay.py" --repo "$REPO" --ledger "$LED" >/dev/null 2>&1 || true
+python3 "$TOOLS/build-overlay.py" --repo "$REPO" ${OVERLAY_LEDGER[@]+"${OVERLAY_LEDGER[@]}"} >/dev/null 2>&1 || true
 [[ "$(tree_sha "$SIM/.claude")" == "$after_claude" && "$(tree_sha "$SIM/.codex")" == "$after_codex" ]] && pass "second apply changes nothing" || fail "second apply changed files"
+
+# keep the migrated instruction files for inspection (the rollback below restores the originals)
+mkdir -p -m 700 "$SIM/final"
+cp -p "$SIM/.claude/CLAUDE.md" "$SIM/final/CLAUDE.md"
+cp -p "$SIM/.codex/AGENTS.md" "$SIM/final/AGENTS.md"
 
 # 5. rollback, exactly as the operator packet says: installer "Prior state" dirs newest first, then the byte-exact
 #    pre-migration copies of the two instruction files, then delete files that did not exist before
