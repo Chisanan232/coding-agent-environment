@@ -310,6 +310,16 @@ class EngineeringWorkflowContract(unittest.TestCase):
         self.assertIn("<type>", text)
         self.assertIn("<repo>-<phase>-<ticket>-<type>-<summary>", text)
 
+    def test_skills_list_every_branch_type_and_use_typed_examples(self) -> None:
+        types = ["feat", "fix", "refactor", "test", "docs", "config", "deps", "remove", "lint"]
+        for rel in ("engineering-workflow", "ticket-pickup-check"):
+            text = (ROOT / ".claude/skills" / rel / "SKILL.md").read_text()
+            for kind in types:
+                with self.subTest(skill=rel, type=kind):
+                    self.assertIn("`" + kind + "`", text)
+        pickup = (ROOT / ".claude/skills/ticket-pickup-check/SKILL.md").read_text()
+        self.assertIn("v0.1.0/TEST-1/feat/add_new_endpoint", pickup)
+
     def test_commit_subject_requires_parenthesized_scope(self) -> None:
         valid = [
             "✨ (model): Add property to TestModel",
