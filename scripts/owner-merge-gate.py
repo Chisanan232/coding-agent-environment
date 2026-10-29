@@ -39,8 +39,18 @@ OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 DEPLOY_BASES = re.compile(r"(^|/)(prod|production|release|releases|gh-pages|deploy)([-/].*)?$", re.I)
 
 # Environment and release names that must never become an approved integration base, even when an owner lists them.
-POLICY_FORBIDDEN = re.compile(r"(^|/)(staged|staging|beta|alpha|canary|hotfix)([-/._].*)?$|[-/._](prod|production|release|releases|deploy)$",
+POLICY_FORBIDDEN = re.compile(r"(^|/)(staged?|staging|stg|beta|alpha|canary|hotfix|uat|qa|live|preprod)([-/._].*)?$|[-/._](prod|production|release|releases|deploy|stage|stg|uat|live)$",
                               re.I)
+POLICY_MAX_BYTES = 65536
+
+
+def _no_duplicate_keys(pairs):
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("version policy has a duplicate JSON key")
+    return dict(pairs)
+
+
 VERSION_POLICY_DEFAULT = "~/.config/coding-agent-environment/local/version-branches.json"
 VERSION_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
 
@@ -51,7 +61,7 @@ def load_version_policy(obj):
     Development-Ahead / Sequential Release: `main` is the protected cumulative release baseline, but a founder-approved
     version integration branch may receive eligible feature PRs before that version ships. The list is explicit and lives
     outside every product repository, so a PR cannot authorize its own base. A deployment/release branch can never be listed."""
-    if not isinstance(obj, dict) or obj.get("schema") != 1 or not isinstance(obj.get("repos"), dict):
+    if not isinstance(obj, dict) or type(obj.get("schema")) is not int or obj["schema"] != 1 or not isinstance(obj.get("repos"), dict):
         raise ValueError("version policy must be an object with schema 1 and a repos object")
     out = {}
     for repo, entry in obj["repos"].items():
@@ -62,13 +72,16 @@ def load_version_policy(obj):
             raise ValueError(f"version policy branches for {repo} must be a list")
         for b in entry["branches"]:
             name = b.get("branch") if isinstance(b, dict) else None
-            if not isinstance(name, str) or not VERSION_REF_RE.fullmatch(name) or ".." in name or name.endswith(("/", ".lock")):
+            if not isinstance(name, str) or not VERSION_REF_RE.fullmatch(name) or ".." in name or "//" in name or name.endswith(("/", ".lock")):
                 raise ValueError(f"version policy branch {name!r} for {repo} is malformed")
             if DEPLOY_BASES.search(name) or POLICY_FORBIDDEN.search(name):
                 raise ValueError(f"version policy branch {name!r} for {repo} is a deployment/release base and cannot be approved")
             branches.add(name)
-        for pre in entry.get("future_head_prefixes", []):
-            if not isinstance(pre, str) or not VERSION_REF_RE.fullmatch(pre) or ".." in pre:
+        pres = entry.get("future_head_prefixes", [])
+        if not isinstance(pres, list):
+            raise ValueError(f"version policy future_head_prefixes for {repo} must be a list")
+        for pre in pres:
+            if not isinstance(pre, str) or not VERSION_REF_RE.fullmatch(pre) or ".." in pre or "//" in pre:
                 raise ValueError(f"version policy prefix {pre!r} for {repo} is malformed")
             prefixes.append(pre)
         if repo.lower() in out:
@@ -90,7 +103,7 @@ def read_version_policy(path, required, root=None):
     if os.path.commonpath([root, real]) != root:
         raise ValueError(f"version policy must live under {root}")
     try:
-        fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         if required:
             raise
@@ -107,7 +120,9 @@ def read_version_policy(path, required, root=None):
             if d == root:
                 break
             d = os.path.dirname(d)
-        return load_version_policy(json.load(f))
+        if st.st_size > POLICY_MAX_BYTES:
+            raise ValueError(f"version policy file is larger than {POLICY_MAX_BYTES} bytes")
+        return load_version_policy(json.loads(f.read(POLICY_MAX_BYTES + 1), object_pairs_hook=_no_duplicate_keys))
 
 
 # One entry per refusal reason so callers and tests can match on a stable code.

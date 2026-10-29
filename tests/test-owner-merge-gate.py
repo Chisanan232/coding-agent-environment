@@ -290,6 +290,31 @@ class VersionBranches(unittest.TestCase):
                      "FUTURE_VERSION_INTO_MAIN")
         self.refused(Fake(defaultBranchRef={"name": "master"}, baseRefName="main"), "BASE_NOT_DEFAULT_OR_DEPLOY")
 
+    def test_loader_hardening_spe_133(self):
+        import os, tempfile
+        entry = POLICY["repos"]["Chisanan232/r"]
+        bad = [{"schema": True, "repos": {}}, {"schema": 1.0, "repos": {}},
+               {"schema": 1, "repos": {"Chisanan232/r": dict(entry, future_head_prefixes="mvp-6.0/")}},
+               {"schema": 1, "repos": {"Chisanan232/r": dict(entry, future_head_prefixes=[""])}}]
+        for name in ("a//b", "stage", "stg", "uat", "qa", "live", "preprod", "integration/uat-1", "env/live"):
+            bad.append({"schema": 1, "repos": {"Chisanan232/r": {"branches": [{"branch": name, "version": "1"}]}}})
+        for b in bad:
+            with self.assertRaises(ValueError, msg=b):
+                omg.load_version_policy(b)
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(os.path.realpath(d), "local")
+            os.mkdir(root, 0o700)
+            dup = os.path.join(root, "dup.json")
+            pathlib.Path(dup).write_text('{"schema": 1, "repos": {}, "repos": {}}')
+            big = os.path.join(root, "big.json")
+            pathlib.Path(big).write_text('{"schema": 1, "repos": {}, "pad": "' + "x" * 70000 + '"}')
+            fifo = os.path.join(root, "fifo.json")
+            os.mkfifo(fifo, 0o600)
+            for f in (dup, big, fifo):
+                os.chmod(f, 0o600)
+                with self.assertRaises(ValueError, msg=f):
+                    omg.read_version_policy(f, True, root)
+
     def test_malformed_policy_fails_closed(self):
         for bad in ({}, {"schema": 2, "repos": {}}, {"schema": 1, "repos": {"x": {"branches": [{"branch": "../x"}]}}},
                     {"schema": 1, "repos": {"Chisanan232/r": {"branches": "integration/mvp-5.0"}}}):
