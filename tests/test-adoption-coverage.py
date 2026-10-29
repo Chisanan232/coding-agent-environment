@@ -75,9 +75,43 @@ class ClassifyTests(unittest.TestCase):
         outside.write_text("squash everything <emoji> <scope>: x\n")
         p = make_project(self.tmp.name, "linked")
         (p / "CLAUDE.md").symlink_to(outside)
-        info = ac.classify(p)["files"]["CLAUDE.md"]
-        self.assertEqual(info["skipped"], "symlink leaves the checkout")
+        row = ac.classify(p)
+        info = row["files"]["CLAUDE.md"]
+        self.assertEqual(info["skipped"], "resolves outside the checkout")
         self.assertEqual(info["merge_override"] + info["legacy_format"], [])
+        self.assertEqual(row["status"], "UNVERIFIED")  # never ADOPTED when a file could not be inspected
+        os.utime(outside, (5000, 5000))
+        self.assertEqual(ac.classify(p)["files"]["CLAUDE.md"]["mtime"], 5000)  # the target's mtime, not the link's
+
+    def test_symlinked_parent_directory_is_not_read(self):
+        outside = Path(self.tmp.name) / "elsewhere"
+        outside.mkdir()
+        (outside / "CLAUDE.md").write_text("squash all PRs\n")
+        p = Path(self.tmp.name) / "proj"
+        p.mkdir()
+        (p / ".git").mkdir()
+        (p / ".claude").symlink_to(outside)
+        row = ac.classify(p)
+        self.assertEqual(row["status"], "UNVERIFIED")
+        self.assertEqual(row["files"][".claude/CLAUDE.md"]["merge_override"], [])
+
+    def test_symlink_inside_the_checkout_is_scanned(self):
+        p = make_project(self.tmp.name, "inner", claude="Branch: `<phase>/<ticket-id>/<short_summary>`\n")
+        (p / "AGENTS.md").symlink_to(p / ".claude/CLAUDE.md")
+        self.assertEqual(ac.classify(p)["files"]["AGENTS.md"]["old_branch_format"], [1])
+
+    def test_oversized_file_is_unverified_not_adopted(self):
+        p = make_project(self.tmp.name, "big", claude="x" * (ac.MAX_BYTES + 10) + "\nsquash all PRs\n")
+        row = ac.classify(p)
+        self.assertEqual(row["status"], "UNVERIFIED")
+        self.assertEqual(row["files"][".claude/CLAUDE.md"]["skipped"], "larger than 1 MiB")
+
+    def test_squash_negation_attaches_to_the_term_only(self):
+        for text in ("Merge: never rebase. Squash all PRs.", "Squash merge, not rebase.", "Use squash for feature PRs"):
+            self.assertTrue(ac.permits_squash(text), text)
+        for text in ("Use merge commits instead of squash.", "Rather than squash, merge.", "Don\u2019t squash.",
+                     "Never squash or rebase.", "Squash merge is disabled."):
+            self.assertFalse(ac.permits_squash(text), text)
 
     def test_missing_checkout_and_missing_files(self):
         self.assertEqual(ac.classify(Path(self.tmp.name) / "nope")["status"], "NOT_FOUND")
@@ -124,13 +158,15 @@ class SessionTests(unittest.TestCase):
         started = int((time.time() - ac.elapsed_seconds(os.getpid())) * 1000)
         (sess / "a.json").write_text(json.dumps({"pid": os.getpid(), "cwd": str(proj / "sub"), "startedAt": started}))
         os.utime(proj / ".claude/CLAUDE.md", (time.time() + 5, time.time() + 5))  # edited after the session started
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        (sess / "broken.json").write_text("not json")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             ac.main(["--map", str(mapping), "--global-file", str(glob), "--sessions-dir", str(sess), "--json"])
         result = json.loads(out.getvalue())
         self.assertEqual(result["projects"]["P"][0]["status"], "OVERRIDE_REVIEW")
         self.assertEqual([x["reload"] for x in result["sessions"]], ["RELOAD_NEEDED"])
-        for bad in ('{"P": "/abs"}', '["x"]', '{"P": []}'):
+        self.assertIn("1 session records could not be parsed", err.getvalue())
+        for bad in ('{"P": "/abs"}', '["x"]', '{"P": []}', '{"P": [""]}', '{"P": ["relative/dir"]}'):
             mapping.write_text(bad)
             with self.assertRaises(SystemExit):
                 ac.main(["--map", str(mapping), "--sessions-dir", str(sess)])
