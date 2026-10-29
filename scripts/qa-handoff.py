@@ -239,12 +239,18 @@ def check_tree(source, manifest):
     return problems
 
 
-def untracked_created(source, manifest, limit=20000):
+def untracked_created(source, manifest, limit=20000, seconds=20):
     """(names, truncated): files under the clone, outside .git, that the manifest does not list. Informational: a QA run
-    may legitimately build or cache here, but a reviewer should see what else existed beside the tracked tree."""
+    may legitimately build or cache here, but a reviewer should see what else existed beside the tracked tree. Every
+    directory visited counts toward the cap and there is a time budget, so a QA-made tree of empty directories cannot
+    stall the wrapper."""
     tracked, found, seen = set(manifest['files']), [], 0
     root = str(source)
+    deadline = time.monotonic() + seconds
     for current, dirs, files in os.walk(root, followlinks=False):
+        seen += 1 + len(dirs)
+        if seen > limit or time.monotonic() > deadline:
+            return found, True
         dirs[:] = [d for d in dirs if not (current == root and d == '.git')]
         for name in files + [d for d in dirs if os.path.islink(os.path.join(current, d))]:
             seen += 1
