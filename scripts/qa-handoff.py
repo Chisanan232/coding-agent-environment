@@ -320,11 +320,29 @@ def packet_digest(packet):
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
 
+class PacketInvalid(Exception):
+    """packet.json is unreadable, malformed or no longer matches its digest: an integrity failure (QA_INVALID)."""
+
+
 def load_packet(run_dir):
-    packet = json.loads((Path(run_dir) / 'packet.json').read_text())
-    if packet.get('digest') != packet_digest(packet):
-        raise SystemExit('refusing: packet digest does not match (edited after prepare)')
+    try:
+        packet = json.loads((Path(run_dir) / 'packet.json').read_text())
+        ok = isinstance(packet, dict) and packet.get('digest') == packet_digest(packet)
+    except (OSError, ValueError, RecursionError):
+        raise PacketInvalid('packet.json is unreadable or malformed')
+    if not ok:
+        raise PacketInvalid('packet digest does not match (edited after prepare)')
     return packet
+
+
+def packet_invalid(run_dir, error):
+    """QA_INVALID for a tampered packet. Nothing in it is trusted, so the result carries no identity from it."""
+    stub = {'sha': 'unknown', 'ticket': 'unknown', 'product': 'unknown'}
+    try:
+        return write_result(run_dir, stub, 'QA_INVALID', [str(error)])
+    except OSError:
+        print('QA_INVALID %s' % error)
+        return EXIT['QA_INVALID']
 
 
 def read_small(path):
@@ -681,9 +699,12 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    if args.cmd == 'verdict':
-        return evaluate(args.run_dir)
-    return {'prepare': prepare, 'run': run}[args.cmd](args)
+    try:
+        if args.cmd == 'verdict':
+            return evaluate(args.run_dir)
+        return {'prepare': prepare, 'run': run}[args.cmd](args)
+    except PacketInvalid as error:
+        return packet_invalid(Path(args.run_dir).resolve(), error)
 
 
 if __name__ == '__main__':

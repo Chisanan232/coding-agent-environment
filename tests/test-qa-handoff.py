@@ -436,6 +436,20 @@ class VerdictTests(Base):
     def test_command_items_without_an_id_are_not_counted(self):
         self.assertEqual(self.outcome(verdict(), mode="noids")[0], 11)
 
+    def test_an_edited_or_corrupt_packet_is_qa_invalid_not_a_crash(self):
+        self.fake_verdict(verdict())
+        self.fake_mode("pass")
+        run_dir = self.prepare()
+        packet = json.loads((run_dir / "packet.json").read_text())
+        packet["criteria"] = "weakened after prepare"                 # digest left unchanged
+        (run_dir / "packet.json").write_text(json.dumps(packet))
+        code, out = self.run_qa(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)
+        self.assertEqual(json.loads((run_dir / "RESULT.json").read_text())["state"], "QA_INVALID")
+        (run_dir / "packet.json").write_text("{not json")
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)
+
     def test_a_mode_only_change_to_a_tracked_file_is_invalid(self):
         self.assertEqual(self.outcome(verdict(), mode="modebit")[0], 12)
 
