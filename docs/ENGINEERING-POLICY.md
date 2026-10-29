@@ -166,8 +166,9 @@ command, then continue other work.
 
 **Release readiness.** Eight states stay separate, each reported with its own recorded evidence. A skipped or
 unavailable check is never PASS. `ENGINEERING_COMPLETE` and `INDEPENDENT_QA_SIGNED_OFF` replace the earlier
-`DEVELOPMENT_COMPLETE` and `QA_SIGNED_OFF`; the earlier spellings are accepted only when the stricter evidence below
-exists (merged work, post-merge CI at the exact SHA, and both QA states).
+`DEVELOPMENT_COMPLETE` and `QA_SIGNED_OFF`, which are no longer valid in reports. Read an older record under the
+new name only if it also carries the stricter evidence below (merged work, post-merge CI at the exact SHA, and both
+QA states).
 
 | State | Holds when | Evidence |
 |---|---|---|

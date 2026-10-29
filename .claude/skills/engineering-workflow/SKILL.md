@@ -221,8 +221,8 @@ security, production, release, payment, or destructive-operation authority chang
 
 A campaign is the approved scope of related tickets. The campaign, not one task or
 one prompt, is the unit of completion: `TASK_DONE` is not `CAMPAIGN_DONE`,
-`PR_MERGED` is not `QA_SIGNED_OFF`, and `QA_SIGNED_OFF` is not
-`RELEASE_PUBLISHED`. Never invent new mandatory release scope.
+`PR_MERGED` is not `INDEPENDENT_QA_SIGNED_OFF`, and `INDEPENDENT_QA_SIGNED_OFF` is not
+`RELEASED`. Never invent new mandatory release scope.
 
 - **Task-scoped blockers.** Classify each task independently as `READY`, `RUNNING`,
   `WAITING_RESOURCE`, `WAITING_DEPENDENCY`, `WAITING_OPERATOR`,

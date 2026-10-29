@@ -135,8 +135,8 @@ class EngineeringWorkflowContract(unittest.TestCase):
         flat = " ".join(section.split())
         required = [
             "`TASK_DONE` is not `CAMPAIGN_DONE`",
-            "`PR_MERGED` is not `QA_SIGNED_OFF`",
-            "`QA_SIGNED_OFF` is not `RELEASE_PUBLISHED`",
+            "`PR_MERGED` is not `INDEPENDENT_QA_SIGNED_OFF`",
+            "`INDEPENDENT_QA_SIGNED_OFF` is not `RELEASED`",
             "One blocked task never freezes the campaign",
             "`WAITING_RESOURCE`", "`WAITING_DEPENDENCY`", "`WAITING_OPERATOR`",
             "snapshot older than its freshness window (120 seconds) is stale",
