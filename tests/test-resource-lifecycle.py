@@ -36,6 +36,7 @@ class Fixture(unittest.TestCase):
         self.root = Path(self.tmp.name).resolve()
         self.handles = (set(), True)
         self.patch(rl, "open_paths", lambda: self.handles)
+        self.patch(rl.os, "getloadavg", lambda: (0.0, 0.0, 0.0))   # tests never depend on the host's real load
         self.sessions = self.root / "sessions"
         self.sessions.mkdir()
 
@@ -221,6 +222,32 @@ class ApplyTests(Fixture):
                                "--sessions-dir", str(self.sessions))
         self.assertEqual(code, 0)
         return next(out.glob("manifest-%s-*.json" % cls)), out
+
+    def test_inventory_refuses_to_start_on_a_busy_host(self):
+        self.patch(rl.os, "getloadavg", lambda: (10_000.0, 0, 0))
+        out = self.root / "state"
+        code, _ = self.run_cli("inventory", "--self-session", SELF, "--consumers", str(self.root / "none.json"),
+                               "--out", str(out))
+        self.assertEqual(code, 75)
+        self.assertFalse(out.exists())
+
+    def test_inventory_stops_at_its_time_budget_and_marks_the_report_partial(self):
+        for n in ("a", "b"):
+            self.make(n)
+        consumers = self.root / "c.json"
+        consumers.write_text(json.dumps([["cargo_target", [str(self.root / "a"), str(self.root / "b")]]]))
+        out = self.root / "state"
+        code, _ = self.run_cli("inventory", "--self-session", SELF, "--consumers", str(consumers), "--out", str(out),
+                               "--sessions-dir", str(self.sessions), "--max-seconds", "-1")
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(next(out.glob("inventory-*.json")).read_text())["partial"])
+
+    def test_scan_over_its_entry_budget_fails_closed(self):
+        d = self.make("big")
+        for i in range(30):
+            (d / ("f%d" % i)).write_text("x")
+        markers, complete = rl.scan_markers(d, shallow=False, limit=10)
+        self.assertFalse(complete)
 
     def test_inventory_writes_private_report_and_manifests(self):
         d = self.make("t")
