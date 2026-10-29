@@ -66,6 +66,19 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(ac.classify(three)["files"][".claude/CLAUDE.md"]["old_branch_format"], [1])
         self.assertEqual(ac.classify(four)["status"], "ADOPTED")
 
+    def test_squash_phrased_with_a_negation_elsewhere_is_still_a_permission(self):
+        p = make_project(self.tmp.name, "sq", agents="Merge strategy: squash all PRs (no merge commits).\n")
+        self.assertEqual(ac.classify(p)["files"]["AGENTS.md"]["merge_override"], [1])
+
+    def test_symlink_leaving_the_checkout_is_not_read(self):
+        outside = Path(self.tmp.name) / "outside.md"
+        outside.write_text("squash everything <emoji> <scope>: x\n")
+        p = make_project(self.tmp.name, "linked")
+        (p / "CLAUDE.md").symlink_to(outside)
+        info = ac.classify(p)["files"]["CLAUDE.md"]
+        self.assertEqual(info["skipped"], "symlink leaves the checkout")
+        self.assertEqual(info["merge_override"] + info["legacy_format"], [])
+
     def test_missing_checkout_and_missing_files(self):
         self.assertEqual(ac.classify(Path(self.tmp.name) / "nope")["status"], "NOT_FOUND")
         empty = Path(self.tmp.name) / "empty"
@@ -98,7 +111,36 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(newer[0]["reload"], "RELOAD_NEEDED")
         self.assertEqual(older[0]["reload"], "current")
 
+    def test_main_end_to_end_and_malformed_map(self):
+        import contextlib
+        import io
+        proj = make_project(self.tmp.name, "proj", claude="Branch: `<phase>/<ticket-id>/<short_summary>`\n")
+        mapping = Path(self.tmp.name) / "map.json"
+        mapping.write_text(json.dumps({"P": [str(proj)]}))
+        glob = Path(self.tmp.name) / "global.md"
+        glob.write_text("g\n")
+        sess = Path(self.tmp.name) / "sessions"
+        sess.mkdir()
+        started = int((time.time() - ac.elapsed_seconds(os.getpid())) * 1000)
+        (sess / "a.json").write_text(json.dumps({"pid": os.getpid(), "cwd": str(proj / "sub"), "startedAt": started}))
+        os.utime(proj / ".claude/CLAUDE.md", (time.time() + 5, time.time() + 5))  # edited after the session started
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ac.main(["--map", str(mapping), "--global-file", str(glob), "--sessions-dir", str(sess), "--json"])
+        result = json.loads(out.getvalue())
+        self.assertEqual(result["projects"]["P"][0]["status"], "OVERRIDE_REVIEW")
+        self.assertEqual([x["reload"] for x in result["sessions"]], ["RELOAD_NEEDED"])
+        for bad in ('{"P": "/abs"}', '["x"]', '{"P": []}'):
+            mapping.write_text(bad)
+            with self.assertRaises(SystemExit):
+                ac.main(["--map", str(mapping), "--sessions-dir", str(sess)])
+
     def test_etime_formats(self):
+        import subprocess
+        from unittest import mock
+        for text, want in (("05:07", 307), ("02:03:04", 7384), ("3-02:03:04", 266584)):
+            with mock.patch.object(subprocess, "run", return_value=mock.Mock(stdout=text + "\n")):
+                self.assertEqual(ac.elapsed_seconds(1), want)
         self.assertIsNotNone(ac.elapsed_seconds(os.getpid()))
         self.assertIsNone(ac.elapsed_seconds(2**22 + 12345))
 
