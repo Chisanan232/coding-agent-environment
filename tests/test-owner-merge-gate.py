@@ -265,6 +265,28 @@ class VersionBranches(unittest.TestCase):
             with self.assertRaises(ValueError):  # group/world-writable directory
                 omg.read_version_policy(ok, True, root)
 
+    def test_environment_and_release_names_can_never_be_listed(self):
+        for name in ("staged", "beta", "alpha", "canary", "hotfix/x", "v1-prod", "v1.0-release", "deploy"):
+            bad = {"schema": 1, "repos": {"Chisanan232/r": {"branches": [{"branch": name, "version": "1"}]}}}
+            with self.assertRaises(ValueError, msg=name):
+                omg.load_version_policy(bad)
+
+    def test_future_head_match_ignores_case(self):
+        self.refused(Fake(headRefName="MVP-6.0/x"), "FUTURE_VERSION_INTO_MAIN")
+        self.refused(Fake(headRefName="Integration/MVP-5.0"), "FUTURE_VERSION_INTO_MAIN")
+
+    def test_case_variant_duplicate_repo_is_rejected(self):
+        entry = {"branches": [{"branch": "integration/mvp-5.0", "version": "5.0"}]}
+        with self.assertRaises(ValueError):
+            omg.load_version_policy({"schema": 1, "repos": {"Chisanan232/r": entry, "chisanan232/R": entry}})
+
+    def test_default_branch_other_than_main(self):
+        v, reasons, _ = self.evaluate(Fake(defaultBranchRef={"name": "master"}, baseRefName="integration/mvp-5.0"))
+        self.assertEqual((v, reasons), ("PASS", []))
+        self.refused(Fake(defaultBranchRef={"name": "master"}, baseRefName="master", headRefName="integration/mvp-5.0"),
+                     "FUTURE_VERSION_INTO_MAIN")
+        self.refused(Fake(defaultBranchRef={"name": "master"}, baseRefName="main"), "BASE_NOT_DEFAULT_OR_DEPLOY")
+
     def test_malformed_policy_fails_closed(self):
         for bad in ({}, {"schema": 2, "repos": {}}, {"schema": 1, "repos": {"x": {"branches": [{"branch": "../x"}]}}},
                     {"schema": 1, "repos": {"Chisanan232/r": {"branches": "integration/mvp-5.0"}}}):
