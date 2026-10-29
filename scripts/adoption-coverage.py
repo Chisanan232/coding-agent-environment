@@ -55,7 +55,7 @@ def attached_after(after):
     tail = tail.strip()
     lead = re.match(r"\S+(?:\s+\S+){0,2}", tail)
     opens_other = OTHER_TERM.search(lead.group(0)) if lead else None
-    is_list = re.match(r"^[\w\- ]{1,40}\band\b[^,]*\b(?:are|is)\b", tail, re.IGNORECASE) and len(head.split()) <= 2
+    is_list = re.match(r"^[\w\- ]{1,40}\band\b[^,]*\b(?:are|is)\b", tail, re.IGNORECASE) and len(head.split()) <= 1
     if opens_other and not is_list:
         return head[:80]
     return (head + " " + tail)[:80]
