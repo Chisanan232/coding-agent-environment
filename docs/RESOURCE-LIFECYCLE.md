@@ -48,6 +48,22 @@ is now a symlink, the inode changed, a handle or live session appeared, a marker
 the manifest (any class: a changed entry needs a fresh manifest). Deletion uses the fd-based symlink-safe remover and never follows a link. Every decision is appended to
 `gc-audit.jsonl` (0600). A manifest generated for a different owner is refused.
 
+## Hardening from the independent review (PR #138)
+
+- Open-handle detection compares the root both as listed and resolved, case-folded (`/tmp` is `/private/tmp`).
+- The protected-root guard compares case-folded, NFC-normalised paths and inodes (APFS is case-insensitive).
+- Removal opens the resolved parent without following a link, looks the leaf up relative to that descriptor, requires the
+  manifest's device and inode, and removes from the descriptor. A second `lsof` runs immediately before each deletion.
+- Unknown session liveness (missing or unreadable sessions directory, an unparseable record) and unattributable scratch are
+  class C, not "owner not alive".
+- A receipt is read only when it is a small regular file owned by this user that is not group- or world-writable
+  (not `umask 002` output); a forged receipt is ignored, so it cannot promote a directory to A.
+- Worktrees are scanned six levels deep for credential and evidence names (dependency and build trees skipped), because
+  `git status` does not show ignored local files such as `.env.local`. A failing `git status` is `unknown`, and git runs
+  with `--no-optional-locks`.
+- Known limits: nested mount points are not detected before `rmtree`; submodule checkouts look like worktrees; class B is
+  always an exact-path ASK.
+
 ## Retention and reclaim order (warm caches)
 
 Keep a warm Cargo target when its cold rebuild is more expensive than the space it holds and the floor is not threatened.
