@@ -270,10 +270,14 @@ def classify(rec, ctx):
         why.append('unknown-kind')
     if why:
         return 'C', why
-    if owned and kind in ('cargo_target', 'package_cache', 'ide_cache', 'tmp_tree', 'session_scratch'):
+    # SPE-109/ADR-0001: shared or redirected Cargo targets are never preauthorizable. A target is class A only when its
+    # receipt claims it is private to the owner, and the machine-wide shared target never is.
+    shared_target = os.path.realpath(root) == os.path.realpath(str(HOME / '.cargo/shared-target'))
+    private_ok = kind != 'cargo_target' or (receipt.get('private') is True and not shared_target) if owned else False
+    if owned and private_ok and kind in ('cargo_target', 'package_cache', 'ide_cache', 'tmp_tree', 'session_scratch'):
         return 'A', ['owned-reproducible-idle']
     if reproducible or kind in ('session_scratch', 'tmp_tree', 'worktree'):
-        reason = ['shared-or-foreign']
+        reason = ['shared-or-foreign'] if not owned else ['owned-but-not-claimed-private-needs-ask']
         if kind in ('session_scratch', 'tmp_tree'):
             reason = ['owner-session-not-alive', 'may-hold-unique-evidence']
         elif kind == 'worktree':
