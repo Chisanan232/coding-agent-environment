@@ -139,7 +139,11 @@ def write_private(path, data, mode=0o600):
 
 
 MAX_VERDICT_BYTES = 5 << 20
-MIN_COMMANDS = 2   # the mandatory `git rev-parse HEAD` plus at least one command that exercises the change
+MIN_COMMANDS = 2   # the mandatory `git rev-parse HEAD` plus at least one more successful command recorded in the stream
+MAX_EVENTS_BYTES = 256 << 20
+MAX_EVENT_LINE = 1 << 20
+MAX_INPUT_BYTES = 1 << 20
+SETTLE_SECONDS = 2
 
 
 def open_regular(path):
@@ -199,7 +203,7 @@ def hash_path(full):
     try:
         if os.path.islink(full):
             return ['link', os.readlink(full)]
-        return ['file', sha256_file(full)]
+        return ['file', sha256_file(full), os.lstat(full).st_mode & 0o111]
     except OSError:
         return ['missing', '']
 
@@ -242,23 +246,33 @@ def check_tree(source, manifest):
 def untracked_created(source, manifest, limit=20000, seconds=20):
     """(names, truncated): files under the clone, outside .git, that the manifest does not list. Informational: a QA run
     may legitimately build or cache here, but a reviewer should see what else existed beside the tracked tree. Every
-    directory visited counts toward the cap and there is a time budget, so a QA-made tree of empty directories cannot
-    stall the wrapper."""
+    entry visited counts toward the cap (entries are read lazily, so one huge flat directory cannot defeat it) and
+    there is a time budget."""
     tracked, found, seen = set(manifest['files']), [], 0
     root = str(source)
     deadline = time.monotonic() + seconds
-    for current, dirs, files in os.walk(root, followlinks=False):
-        seen += 1 + len(dirs)
-        if seen > limit or time.monotonic() > deadline:
-            return found, True
-        dirs[:] = [d for d in dirs if not (current == root and d == '.git')]
-        for name in files + [d for d in dirs if os.path.islink(os.path.join(current, d))]:
-            seen += 1
-            if seen > limit:
-                return found, True
-            rel = os.path.relpath(os.path.join(current, name), root)
-            if rel not in tracked:
-                found.append(rel)
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        if time.monotonic() > deadline:
+            return sorted(found), True
+        try:
+            iterator = os.scandir(current)
+        except OSError:
+            continue
+        with iterator:
+            for entry in iterator:
+                seen += 1
+                if seen > limit or (seen % 256 == 0 and time.monotonic() > deadline):
+                    return sorted(found), True
+                if current == root and entry.name == '.git':
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(entry.path)
+                    continue
+                rel = os.path.relpath(entry.path, root)
+                if rel not in tracked:
+                    found.append(rel)
     return sorted(found), False
 
 
@@ -274,8 +288,16 @@ def load_packet(run_dir):
     return packet
 
 
+def read_small(path):
+    """Text of a small regular file given as input; refuses links, FIFOs and anything over 1 MiB."""
+    try:
+        return read_nofollow(path, MAX_INPUT_BYTES).decode('utf-8', errors='replace')
+    except OSError as error:
+        raise SystemExit('refusing: input %s must be a small regular file (%s)' % (path, error))
+
+
 def read_optional(path):
-    return Path(path).read_text() if path else '(none supplied)'
+    return read_small(path) if path else '(none supplied)'
 
 
 NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
@@ -283,12 +305,16 @@ NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 
 def prepare(args):
     for label, value in (('product', args.product), ('ticket', args.ticket)):
-        if not NAME.match(value) or '..' in value:
+        if not NAME.fullmatch(value) or '..' in value:
             raise SystemExit('refusing: --%s must match %s' % (label, NAME.pattern))
     if args.sha.startswith('-'):
         raise SystemExit('refusing: --sha must not start with -')
+    # Read every input before anything is created, so a bad input leaves no half-made run directory behind.
+    criteria, producer, notes = read_small(args.criteria), read_optional(args.producer_evidence), read_optional(args.qa_notes)
     repo = Path(args.repo).resolve()
     sha = git(repo, 'rev-parse', '--verify', '--end-of-options', args.sha + '^{commit}').stdout.strip()
+    if not re.fullmatch(r'[0-9a-f]{40,64}', sha):
+        raise SystemExit('refusing: could not resolve --sha to a full commit id')
     parent = Path(args.root or DEFAULT_ROOT) / args.product / args.ticket
     parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     n = 1
@@ -303,12 +329,12 @@ def prepare(args):
     # producer's repository (a clone --local would share inodes the QA process could modify), no history, no remote.
     source.mkdir(mode=0o700)
     git(source, 'init', '-q')
-    git(source, 'fetch', '-q', '--depth', '1', repo.as_uri(), sha)
+    git(source, 'fetch', '-q', '--depth', '1', '--', repo.as_uri(), sha)
     git(source, 'checkout', '-q', '--detach', sha)
     write_private(run_dir / 'tree-manifest.json', {'__head__': sha, 'files': tree_manifest(source)})
     packet = {'schema': 1, 'product': args.product, 'ticket': args.ticket, 'repo': str(repo), 'sha': sha,
-              'created': now(), 'criteria': Path(args.criteria).read_text(),
-              'producer_evidence': read_optional(args.producer_evidence), 'qa_notes': read_optional(args.qa_notes)}
+              'created': now(), 'criteria': criteria,
+              'producer_evidence': producer, 'qa_notes': notes}
     packet['digest'] = packet_digest(packet)
     write_private(run_dir / 'packet.json', packet)
     print(run_dir)
@@ -349,10 +375,15 @@ def codex_argv(codex_bin, run_dir):
 
 
 def count_commands(events_path):
-    """(completed, succeeded) command_execution items in the codex JSON event stream; succeeded means exit code 0."""
+    """(completed, succeeded) distinct command_execution items in the codex JSON event stream; succeeded means exit
+    code 0. Lines over 1 MiB are ignored. Verified on codex-cli 0.163.0: text printed by a command stays inside an
+    escaped string field and cannot become an event line of its own; this is a property of that version."""
     completed = succeeded = 0
+    seen = set()
     with open_regular(events_path) as handle:
-        for line in handle:
+        for number, line in enumerate(handle):
+            if len(line) > MAX_EVENT_LINE:
+                continue
             try:
                 event = json.loads(line)
             except (ValueError, RecursionError):
@@ -360,10 +391,15 @@ def count_commands(events_path):
             if not isinstance(event, dict) or event.get('type') != 'item.completed':
                 continue
             item = event.get('item')
-            if isinstance(item, dict) and item.get('type') == 'command_execution':
-                completed += 1
-                if str(item.get('exit_code')) == '0':
-                    succeeded += 1
+            if not (isinstance(item, dict) and item.get('type') == 'command_execution'):
+                continue
+            key = item.get('id') or ('line', number)
+            if key in seen:
+                continue
+            seen.add(key)
+            completed += 1
+            if str(item.get('exit_code')) == '0':
+                succeeded += 1
     return completed, succeeded
 
 
@@ -406,6 +442,33 @@ def run(args):
         return write_result(run_dir, packet, 'QA_INVALID', problems or ['manifest does not match the packet'])
     if not admitted(args):
         return write_result(run_dir, packet, 'WAITING_RESOURCE', ['disk admission refused; codex was not started'])
+    try:
+        os.close(os.open(run_dir / 'RUN.lock', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+    except FileExistsError:
+        raise SystemExit('refusing: a run is in progress or was interrupted for this directory; prepare a new attempt')
+    try:
+        return run_locked(args, run_dir, packet, source)
+    finally:
+        try:
+            os.unlink(run_dir / 'RUN.lock')
+        except OSError:
+            pass
+
+
+def kill_group(proc):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)   # our own child's process group only
+        except OSError:
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def run_locked(args, run_dir, packet, source):
     out = run_dir / 'out'
     # Wrapper-owned inputs sit in the run directory itself, which the QA sandbox cannot write (only source, out, tmp,
     # home and cargo-target are writable roots).
@@ -422,21 +485,21 @@ def run(args):
         os.chmod(events, 0o600)
         proc = subprocess.Popen(argv, cwd=str(source), env=isolated_env(run_dir), stdin=subprocess.PIPE, stdout=ev,
                                 stderr=err, start_new_session=True)
+        def interrupted(signum, frame):
+            raise KeyboardInterrupt
+        old = signal.signal(signal.SIGTERM, interrupted)
         try:
             proc.communicate(prompt.encode(), timeout=args.timeout)
         except subprocess.TimeoutExpired:
             timed_out = True
-            for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.killpg(proc.pid, sig)   # our own child's process group only
-                except OSError:
-                    break
-                try:
-                    proc.wait(timeout=5)
-                    break
-                except subprocess.TimeoutExpired:
-                    continue
+            kill_group(proc)
+        except BaseException:
+            kill_group(proc)           # Ctrl-C or SIGTERM to the wrapper must not leave codex running
+            raise
+        finally:
+            signal.signal(signal.SIGTERM, old)
     os.chmod(run_dir / 'stderr.log', 0o600)
+    time.sleep(getattr(args, 'settle', SETTLE_SECONDS))   # let any straggler finish writing before the tree is checked
     verdict = run_dir / 'verdict.json'
     meta = {'argv': argv[:-1], 'exit_code': proc.returncode, 'seconds': round(time.time() - t0, 1), 'timed_out': timed_out,
             'events_sha256': sha256_file(events), 'verdict_sha256': safe_digest(verdict),
@@ -491,6 +554,13 @@ def evaluate_files(run_dir, packet):
     bad = []
     if safe_digest(events) != meta['events_sha256']:
         bad.append('event stream changed after the run')
+    try:
+        if os.lstat(events).st_size > MAX_EVENTS_BYTES:
+            return write_result(run_dir, packet, 'QA_INVALID', bad + ['event stream is too large'])
+    except OSError:
+        return write_result(run_dir, packet, 'QA_INVALID', bad + ['event stream is missing'])
+    # Recount from the hashed stream itself: RUNMETA is a convenience record, not the source of truth for the gate.
+    commands_completed, commands_succeeded = count_commands(events)
     if meta['verdict_sha256'] == 'UNREADABLE' or safe_digest(verdict_path) == 'UNREADABLE':
         return write_result(run_dir, packet, 'QA_INVALID', bad + ['verdict is not a regular file (link planted?)'])
     if not os.path.lexists(verdict_path):
@@ -515,7 +585,7 @@ def evaluate_files(run_dir, packet):
         return write_result(run_dir, packet, 'QA_INVALID', bad)
     created, truncated = untracked_created(run_dir / 'source', json.loads((run_dir / 'tree-manifest.json').read_text()))
     extra = {'verdict_sha256': meta['verdict_sha256'], 'events_sha256': meta['events_sha256'],
-             'commands_completed': meta['commands_completed'], 'commands_succeeded': meta.get('commands_succeeded', 0),
+             'commands_completed': commands_completed, 'commands_succeeded': commands_succeeded,
              'codex_exit_code': meta['exit_code'], 'untracked_files_present': len(created) if not truncated else 'many',
              'untracked_sample': [clean(n, 80) for n in created[:10]],
              'findings': [{'id': clean(f['id'], 40), 'severity': f['severity'], 'surface': clean(f['surface'], 80)}
@@ -525,10 +595,11 @@ def evaluate_files(run_dir, packet):
     if failing:
         return write_result(run_dir, packet, 'QA_FAIL', failing[:10], extra)
     incomplete = []
-    # A PASS is the QA process's own report. What the wrapper adds is that the run really executed things: the baseline
-    # command plus at least one more, all with exit code 0 recorded in the hashed event stream, and codex exited cleanly.
-    if meta.get('commands_succeeded', 0) < MIN_COMMANDS:
-        incomplete.append('fewer than %d successful commands in the event stream (the change was not exercised)' % MIN_COMMANDS)
+    # A PASS is the QA process's own report. What the wrapper adds is a floor, not proof of exercise: at least the baseline
+    # command plus one more with exit code 0 recorded in the hashed event stream, and codex exited cleanly. A no-op
+    # command satisfies the count, so the evidence text and the event stream remain for a reviewer to audit.
+    if commands_succeeded < MIN_COMMANDS:
+        incomplete.append('fewer than %d successful commands recorded in the event stream' % MIN_COMMANDS)
     if meta.get('timed_out'):
         incomplete.append('timed out')
     elif meta['exit_code'] != 0:
@@ -562,6 +633,7 @@ def build_parser():
     r.add_argument('--run-dir', required=True)
     r.add_argument('--timeout', type=int, default=1800)
     r.add_argument('--codex-bin', default='codex', help=argparse.SUPPRESS)       # test hook
+    r.add_argument('--settle', type=float, default=SETTLE_SECONDS, help=argparse.SUPPRESS)  # test hook
     r.add_argument('--admission-cmd', type=shlex.split, help=argparse.SUPPRESS)   # test hook (one quoted string)
     v = sub.add_parser('verdict')
     v.add_argument('--run-dir', required=True)
