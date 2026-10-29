@@ -116,6 +116,9 @@ class ClassifyTests(unittest.TestCase):
         for text in ("Use merge commits instead of squash.", "Rather than squash, merge.", "Don\u2019t squash.",
                      "Never squash or rebase.", "Squash merge is disabled.",
                      "Squash and rebase merges are disabled for this repository.", "squash merge (it is disabled)",
+                     "Squash, rebase and merge commits are disabled", "squash (the old way) is disabled",
+                     "squash merging, which is forbidden here", "squash (disabled)", "Squash merge, prohibited",
+                     "Squash merges (the default) are disabled", "Squash, however, is disabled",
                      "Squash merge is disabled on purpose. The atomic history is the audit trail; squashing destroys it."):
             self.assertFalse(ac.permits_squash(text), text)
 
