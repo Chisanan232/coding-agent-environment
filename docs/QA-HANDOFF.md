@@ -96,3 +96,32 @@ and no model override, because the live Codex configuration is full-access with 
 - Product release flows (`/release-qa-gate`, frozen candidates, release evidence) are not touched by this tool.
 - Adoption is per product and opt-in: a pilot is shown only when the product's own session runs the hop and acts on the
   verdict. No general migration, managed skill or global instruction change is part of this.
+
+### Demonstration (2026-10-29, real Codex, disposable repository)
+
+A scripted producer that acts only on the exit code, with a defect seeded where the producer's own tests do not look
+(`subtract` returned an absolute value and the visible tests checked only positive results):
+
+| Round | SHA | Result | Notes |
+|---|---|---|---|
+| 1 | defective commit | `QA_FAIL`, exit 10 | AC2 failed: `subtract(2, 5)` returned 3; one High finding; 5 commands executed |
+| (producer) | | fix and regression test, new commit | no human copied a prompt or a verdict |
+| 2 | fixed commit | `QA_PASS`, exit 0 | 6 commands executed, no finding, nothing untested |
+
+The same run showed that real Codex accepts the pinned sandbox settings and that the private shallow clone works for a
+non-tip commit. The offline suite (`tests/test-qa-handoff.py`) covers the wrapper's guarantees with a fake `codex`.
+This demonstrates the mechanism, not any product's adoption: a product counts as adopted only when its own session runs
+the hop and acts on the verdict.
+
+### Known gaps (stated, not closed)
+
+- A `QA_PASS` is the QA process's own report, bound to a hashed event stream a reviewer can audit. It is not a
+  cryptographic attestation, and the producer and the QA process run as the same OS user.
+- The sandbox can read files this user can read (including Codex's own login directory) and the run inherits the user's
+  Codex configuration (hooks, MCP servers). Sandbox network and writable roots are pinned per call, but read access is not
+  restricted.
+- QA-controlled text reaches the producer through `RESULT.json` and the console. It is stripped, capped and marked
+  untrusted, but the producer must still treat it as data.
+- A sandboxed command that detaches into its own session (`setsid`) can outlive the timeout kill.
+- Untracked files that QA creates in the clone are reported (count and sample), not forbidden: builds and caches are
+  legitimate, so a reviewer decides whether they matter.
