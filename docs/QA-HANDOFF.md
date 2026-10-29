@@ -122,6 +122,7 @@ the hop and acts on the verdict.
   restricted.
 - QA-controlled text reaches the producer through `RESULT.json` and the console. It is stripped, capped and marked
   untrusted, but the producer must still treat it as data.
+- The event stream is the `codex exec` process's own stdout. The wrapper counts only `command_execution` completions that carry a unique id (a model cannot write to that stream; text it prints stays inside an escaped string field on the verified codex version), but a process that can write the stream itself, such as a replaced or compromised codex binary, can forge items and obtain `QA_PASS`. Codex QA reproduced this only with the offline fake codex, which is that process. Defending against it needs an attestation the producer's own user cannot create; that is the open evidence-independence decision, not something this wrapper can close.
 - A sandboxed command that detaches into its own session (`setsid`) can outlive the timeout kill.
 - Untracked files that QA creates in the clone are reported (count and sample), not forbidden: builds and caches are
   legitimate, so a reviewer decides whether they matter.
