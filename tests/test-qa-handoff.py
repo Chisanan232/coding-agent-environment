@@ -529,6 +529,31 @@ class VerdictTests(Base):
             self.assertIn(".git", out)
             self.assertFalse((self.fake_dir / "CANARY3").exists())
 
+    def test_control_digest_fails_closed(self):
+        import tempfile as tf
+        with tf.TemporaryDirectory() as d:
+            src = Path(d)
+            (src / ".git/hooks").mkdir(parents=True)
+            (src / ".git/HEAD").write_text("ref: refs/heads/main\n")
+            base = qa.git_control_digest(src)
+            manifest = {"__head__": "ref: refs/heads/main", "files": {}}
+            self.assertTrue(any("control" in p for p in qa.check_tree(src, manifest)))   # no digest recorded: not a pass
+            manifest["__control__"] = base
+            self.assertFalse(any("control" in p for p in qa.check_tree(src, manifest)))
+            (src / ".git/info").mkdir()
+            (src / ".git/info/attributes").write_text("x")             # absent -> present
+            self.assertNotEqual(qa.git_control_digest(src), base)
+            (src / ".git/info/attributes").unlink()
+            (src / ".git/info").rmdir()
+            self.assertEqual(qa.git_control_digest(src), base)
+            (src / ".git/config").write_bytes(b"x" * (qa.MAX_VERDICT_BYTES + 10))   # oversized is not "missing"
+            self.assertNotEqual(qa.git_control_digest(src), base)
+            (src / ".git/config").unlink()
+            elsewhere = src / "elsewhere"
+            elsewhere.mkdir()
+            (src / ".git/objects").symlink_to(elsewhere)                # a linked intermediate directory
+            self.assertNotEqual(qa.git_control_digest(src), base)
+
     def test_planting_a_symlink_as_the_verdict_is_invalid_and_never_read(self):
         code, out, _ = self.outcome(verdict(), mode="linkverdict")
         self.assertEqual(code, 12)

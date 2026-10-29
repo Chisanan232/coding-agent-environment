@@ -227,22 +227,34 @@ GIT_CONTROL_FILES = ('config', 'config.worktree', 'commondir', 'info/attributes'
 def git_control_digest(source):
     """Digest of every git control file in the clone that can make a later git run execute code or read elsewhere:
     config, config.worktree, commondir, info/attributes, objects/info/alternates and each file under hooks/. Read without
-    following links and without running git. A QA process has no reason to change any of them."""
+    following links and without running git. Absent, present-but-unreadable (too large, not a regular file, a link) and
+    a linked or non-directory parent are recorded as different states, so none of them can stand in for another.
+    A QA process has no reason to change any of them."""
     git_dir = Path(source) / '.git'
-    seen = []
-    for rel in GIT_CONTROL_FILES:
+
+    def state(path):
+        if not os.path.lexists(path):
+            return 'absent'
         try:
-            seen.append((rel, hashlib.sha256(read_nofollow(git_dir / rel)).hexdigest()))
+            return hashlib.sha256(read_nofollow(path)).hexdigest()
         except OSError:
-            seen.append((rel, 'missing'))
+            return 'present-unreadable'
+
+    seen = []
+    for rel in ('hooks', 'info', 'objects', 'objects/info'):
+        try:
+            seen.append((rel + '/', 'dir' if stat.S_ISDIR(os.lstat(git_dir / rel).st_mode) else 'not-a-directory'))
+        except FileNotFoundError:
+            seen.append((rel + '/', 'absent'))
+        except OSError:
+            seen.append((rel + '/', 'unreadable'))
+    for rel in GIT_CONTROL_FILES:
+        seen.append((rel, state(git_dir / rel)))
     try:
         for entry in sorted(os.scandir(git_dir / 'hooks'), key=lambda e: e.name):
-            try:
-                seen.append(('hooks/' + entry.name, hashlib.sha256(read_nofollow(entry.path)).hexdigest()))
-            except OSError:
-                seen.append(('hooks/' + entry.name, 'unreadable'))
+            seen.append(('hooks/' + entry.name, state(entry.path)))
     except OSError:
-        seen.append(('hooks/', 'missing'))
+        pass
     return hashlib.sha256(json.dumps(seen).encode()).hexdigest()
 
 
@@ -261,7 +273,7 @@ def check_tree(source, manifest):
         head = ''
     if head != manifest['__head__']:
         problems.append('HEAD of the pinned clone moved off the packet SHA')
-    if manifest.get('__control__') not in (None, git_control_digest(source)):
+    if manifest.get('__control__') != git_control_digest(source):  # a manifest without the digest is not trusted
         problems.append('.git control files (config, hooks, attributes, alternates) of the pinned clone were modified')
     changed = [p for p, want in manifest['files'].items()
                if has_link_component(source, p) or hash_path(Path(source) / p) != want]
