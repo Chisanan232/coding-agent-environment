@@ -510,7 +510,9 @@ class VerdictTests(Base):
         code, out, run_dir = self.outcome(verdict(), mode="fsmonitor")
         self.assertFalse((self.fake_dir / "CANARY").exists())            # core.fsmonitor never ran
         self.assertFalse((self.fake_dir / "CANARY2").exists())           # the filter driver never ran
-        self.assertEqual(code, 0, out)                                    # evaluated from files only; nothing tracked changed
+        self.assertEqual(code, 12, out)                                   # rewriting .git/config is tampering, not a pass
+        self.assertIn(".git/config", out)
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)   # re-evaluation agrees
 
     def test_planting_a_symlink_as_the_verdict_is_invalid_and_never_read(self):
         code, out, _ = self.outcome(verdict(), mode="linkverdict")

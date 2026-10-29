@@ -221,6 +221,15 @@ def has_link_component(source, rel):
     return False
 
 
+def git_config_digest(source):
+    """Digest of the clone's .git/config, read without following links or running git. A QA process has no reason to
+    change it, and the usual reason to is to make a later git run execute a command."""
+    try:
+        return hashlib.sha256(read_nofollow(Path(source) / '.git/config')).hexdigest()
+    except OSError:
+        return 'missing'
+
+
 def check_tree(source, manifest):
     """Problems found comparing the clone to the manifest; reads files and .git/HEAD only, executes nothing."""
     problems = []
@@ -236,6 +245,8 @@ def check_tree(source, manifest):
         head = ''
     if head != manifest['__head__']:
         problems.append('HEAD of the pinned clone moved off the packet SHA')
+    if manifest.get('__config__') not in (None, git_config_digest(source)):
+        problems.append('.git/config of the pinned clone was modified')
     changed = [p for p, want in manifest['files'].items()
                if has_link_component(source, p) or hash_path(Path(source) / p) != want]
     if changed:
@@ -331,7 +342,7 @@ def prepare(args):
     git(source, 'init', '-q')
     git(source, 'fetch', '-q', '--depth', '1', '--', repo.as_uri(), sha)
     git(source, 'checkout', '-q', '--detach', sha)
-    write_private(run_dir / 'tree-manifest.json', {'__head__': sha, 'files': tree_manifest(source)})
+    write_private(run_dir / 'tree-manifest.json', {'__head__': sha, '__config__': git_config_digest(source), 'files': tree_manifest(source)})
     packet = {'schema': 1, 'product': args.product, 'ticket': args.ticket, 'repo': str(repo), 'sha': sha,
               'created': now(), 'criteria': criteria,
               'producer_evidence': producer, 'qa_notes': notes}
