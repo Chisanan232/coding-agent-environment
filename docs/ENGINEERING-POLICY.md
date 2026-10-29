@@ -164,9 +164,10 @@ approval. On a self-approval, branch-protection or host denial: record it once, 
 other syntax, and hand over the PR URL, head SHA, local evidence, review verdict and the head-pinned owner merge
 command, then continue other work.
 
-**Release readiness.** Nine states stay separate, each reported with its own recorded evidence. A skipped or
-unavailable check is never PASS. `DEVELOPMENT_COMPLETE` and `QA_SIGNED_OFF` are the earlier names of
-`ENGINEERING_COMPLETE` and `INDEPENDENT_QA_SIGNED_OFF`; both spellings mean the same state.
+**Release readiness.** Eight states stay separate, each reported with its own recorded evidence. A skipped or
+unavailable check is never PASS. `ENGINEERING_COMPLETE` and `INDEPENDENT_QA_SIGNED_OFF` replace the earlier
+`DEVELOPMENT_COMPLETE` and `QA_SIGNED_OFF`; the earlier spellings are accepted only when the stricter evidence below
+exists (merged work, post-merge CI at the exact SHA, and both QA states).
 
 | State | Holds when | Evidence |
 |---|---|---|
@@ -175,7 +176,7 @@ unavailable check is never PASS. `DEVELOPMENT_COMPLETE` and `QA_SIGNED_OFF` are 
 | `SECURITY_QA_PASS` | Independent QA ran a real negative control for every security-critical claim and verified artifact provenance | QA report with positive and negative control results |
 | `INDEPENDENT_QA_SIGNED_OFF` | Both QA states PASS at one SHA and artifact set, no open Critical or High finding | signed-off QA verdict naming SHA and digests |
 | `RELEASE_CHECKLIST_PASS` | The `release-readiness` skill checklist is complete for that SHA | checklist with results |
-| `READY_FOR_RELEASE` | All earlier states hold and every owner acceptance item is recorded | the state table itself |
+| `READY_FOR_RELEASE` | All earlier states hold, every other in-scope integration, dogfooding and cleanup gate is satisfied by live evidence, and every owner acceptance item is recorded | the records of those states and gates; if only a founder-only gate remains, report `RELEASE_BLOCKED_BY_OPERATOR` |
 | `RELEASE_APPROVED` | A durable founder GO record names the exact version, SHA and artifact digests | the record, not an agent summary |
 | `RELEASED` | The authorized path tagged and published, and the published digests match the approved ones | release record |
 
