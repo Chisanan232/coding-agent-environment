@@ -38,6 +38,15 @@ BRANCH_THREE_PART = re.compile(r'<ticket(?:-?id|-?number)?>/<(?:short|summary)',
 MAX_BYTES = 1 << 20
 
 
+def attached_after(after):
+    """The text after `squash` that a strong negation can still be about: up to the first comma or parenthesis, plus a
+    directly following parenthetical that speaks of squash itself (`(it is disabled)`). `Squash all PRs, never merge
+    commits` and `Squash only, rebase disabled` negate another term and must keep permitting."""
+    head = re.split(r'[,(]', after)[0]
+    paren = re.match(r'\(\s*(?:it|this|they|squash\w*)\b[^)]*\)', after[len(head):])
+    return (head + (paren.group(0) if paren else ''))[:80]
+
+
 def permits_squash(clause):
     """Names squash with no negation attached to it. `never rebase. Squash all PRs`, `Squash merge, not rebase` and
     `squash all PRs (no merge commits)` still permit; `never squash`, `squash is disabled`, `Squash and rebase
@@ -46,7 +55,7 @@ def permits_squash(clause):
         before = re.split(r'[.!?]', clause[:hit.start()])[-1]
         after = re.split(r'[.!?]', clause[hit.end():])[0]
         near_after = re.split(r'[,(]', after)[0][:20]
-        if (STRONG_NEGATION.search(before[-40:]) or STRONG_NEGATION.search(after[:80])
+        if (STRONG_NEGATION.search(before[-40:]) or STRONG_NEGATION.search(attached_after(after))
                 or WEAK_NEGATION.search(before[-30:]) or WEAK_NEGATION.search(near_after)):
             continue
         return True
