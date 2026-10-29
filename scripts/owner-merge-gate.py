@@ -2,6 +2,7 @@
 """Read-only gate for autonomous owner pull-request merges (SPE-115).
 
   owner-merge-gate.py check  --repo OWNER/REPO --pr N --owners a,b[,c] [--ci-unavailable] [--settings settings.json]
+  (check and queue also take [--version-policy FILE]: founder-approved version integration branches, see docs/OWNER-MERGE-WORKFLOW.md)
   owner-merge-gate.py verify --repo OWNER/REPO --pr N --head SHA
   owner-merge-gate.py queue  --repo OWNER/REPO --prs 5,6 --owners a,b      (print-only plan)
   owner-merge-gate.py evidence-line --head SHA --reviewer ID               (prints the record line)
@@ -36,6 +37,108 @@ REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.{1,2}$)[A-Za-z0-9._-]{
 FAIL = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR", "STALE"}
 OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 DEPLOY_BASES = re.compile(r"(^|/)(prod|production|release|releases|gh-pages|deploy)([-/].*)?$", re.I)
+
+# Environment and release names that must never become an approved integration base, even when an owner lists them.
+# Environment words: a path segment that merely starts with one is refused (stagingeu, betafix, stg2, qa2, livefix), as
+# is any such word as a whole token anywhere in the name (mvp-staging, x-beta, mvp-qa, prod). Deliberately over-broad and fail-closed; an owner renames a legitimate branch instead of listing it.
+POLICY_FORBIDDEN = re.compile(
+    r"(^|/)(staged?|staging|stg|beta|alpha|canary|hotfix|uat|preprod|qa|live)"
+    r"|(^|[-/._])(staged?|staging|stg|beta|alpha|canary|hotfix|uat|preprod|qa|live|prd|prod|production|release|releases|deploy|"
+    r"sandbox)([-/._0-9]|$)", re.I)
+POLICY_MAX_BYTES = 65536
+
+
+def _no_duplicate_keys(pairs):
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("version policy has a duplicate JSON key")
+    return dict(pairs)
+
+
+VERSION_POLICY_DEFAULT = "~/.config/coding-agent-environment/local/version-branches.json"
+VERSION_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+
+
+def bad_ref_parts(name, prefix=False):
+    """True when a path component could not be part of a valid git ref (empty, leading dot, trailing dot, `.lock`).
+    A prefix may end with one slash."""
+    parts = name.split("/")
+    if prefix and parts[-1] == "":
+        parts = parts[:-1]
+    return any(p == "" or p.startswith(".") or p.endswith(".") or p.endswith(".lock") for p in parts)
+
+
+def load_version_policy(obj):
+    """Validate the owner-governed approved-version-branch policy and return {repo.lower(): {branches, prefixes}}.
+
+    Development-Ahead / Sequential Release: `main` is the protected cumulative release baseline, but a founder-approved
+    version integration branch may receive eligible feature PRs before that version ships. The list is explicit and lives
+    outside every product repository, so a PR cannot authorize its own base. A deployment/release branch can never be listed."""
+    if not isinstance(obj, dict) or type(obj.get("schema")) is not int or obj["schema"] != 1 or not isinstance(obj.get("repos"), dict):
+        raise ValueError("version policy must be an object with schema 1 and a repos object")
+    out = {}
+    for repo, entry in obj["repos"].items():
+        if not isinstance(repo, str) or not REPO_RE.fullmatch(repo) or not isinstance(entry, dict):
+            raise ValueError(f"version policy repo {repo!r} is malformed")
+        branches, prefixes = set(), []
+        if not isinstance(entry.get("branches"), list):
+            raise ValueError(f"version policy branches for {repo} must be a list")
+        for b in entry["branches"]:
+            name = b.get("branch") if isinstance(b, dict) else None
+            if not isinstance(name, str) or not VERSION_REF_RE.fullmatch(name) or ".." in name or bad_ref_parts(name) or name.endswith("/"):
+                raise ValueError(f"version policy branch {name!r} for {repo} is malformed")
+            if DEPLOY_BASES.search(name) or POLICY_FORBIDDEN.search(name):
+                raise ValueError(f"version policy branch {name!r} for {repo} is a deployment/release base and cannot be approved")
+            branches.add(name)
+        pres = entry.get("future_head_prefixes", [])
+        if not isinstance(pres, list):
+            raise ValueError(f"version policy future_head_prefixes for {repo} must be a list")
+        for pre in pres:
+            if not isinstance(pre, str) or not VERSION_REF_RE.fullmatch(pre) or ".." in pre or bad_ref_parts(pre, prefix=True):
+                raise ValueError(f"version policy prefix {pre!r} for {repo} is malformed")
+            prefixes.append(pre)
+        if repo.lower() in out:
+            raise ValueError(f"version policy lists {repo} more than once (repository names are case-insensitive)")
+        out[repo.lower()] = {"branches": branches, "prefixes": tuple(x.lower() for x in prefixes)}
+    return out
+
+
+def read_version_policy(path, required, root=None):
+    """Load the policy file. A missing default file means no policy (old behaviour); an explicit path must load.
+
+    The policy is the trust anchor for which bases are mergeable, so it is accepted only from the fixed owner-config
+    directory: the real path must sit under `root`, the file and every directory from `root` down must be owned by the
+    caller and not group/world-writable, and it is opened without following a symlink and judged on the open descriptor."""
+    import stat
+    root = os.path.realpath(os.path.expanduser(root or os.path.dirname(VERSION_POLICY_DEFAULT)))
+    full = os.path.expanduser(path)
+    if os.path.islink(full):
+        raise ValueError("version policy must be the file itself, not a symlink")
+    real = os.path.realpath(full)
+    if os.path.commonpath([root, real]) != root:
+        raise ValueError(f"version policy must live under {root}")
+    try:
+        fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        if required:
+            raise
+        return None
+    with os.fdopen(fd) as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+            raise ValueError("version policy file must be a regular file owned by the caller and not group/world-writable")
+        d = os.path.dirname(real)
+        while True:
+            ds = os.stat(d)
+            if ds.st_uid != os.getuid() or ds.st_mode & 0o022:
+                raise ValueError(f"version policy directory {d} must be owned by the caller and not group/world-writable")
+            if d == root:
+                break
+            d = os.path.dirname(d)
+        if st.st_size > POLICY_MAX_BYTES:
+            raise ValueError(f"version policy file is larger than {POLICY_MAX_BYTES} bytes")
+        return load_version_policy(json.loads(f.read(POLICY_MAX_BYTES + 1), object_pairs_hook=_no_duplicate_keys))
+
 
 # One entry per refusal reason so callers and tests can match on a stable code.
 PR_FIELDS = ("number,state,isDraft,baseRefName,headRefName,headRefOid,author,mergeable,mergeStateStatus,"
@@ -190,7 +293,7 @@ def _json(run, *args):
     return json.loads(run(*args))
 
 
-def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None):
+def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_policy=None):
     """Return (verdict, reasons, facts). `run` executes gh and returns stdout (injected in tests)."""
     bots = {norm_bot(b) for b in (bots or BOT_LOGINS)}
     reasons, wait = [], []
@@ -263,8 +366,17 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None):
         reasons.append("DRAFT")
     if p["isCrossRepository"]:
         reasons.append("CROSS_REPOSITORY_HEAD: head lives in another repository")
-    if base != meta["defaultBranchRef"]["name"] or DEPLOY_BASES.search(base):
+    default_branch = meta["defaultBranchRef"]["name"]
+    pol = (version_policy or {}).get(repo.lower())
+    head_ref = p.get("headRefName") or ""
+    if pol and base == default_branch and (head_ref.lower() in {b.lower() for b in pol["branches"]} or head_ref.lower().startswith(pol["prefixes"])):
+        reasons.append(f"FUTURE_VERSION_INTO_MAIN: head {head_ref!r} is future-version work; it reaches {base!r} only through a "
+                       "release step, never through this gate")
+    if DEPLOY_BASES.search(base) or (base != default_branch and not (pol and base in pol["branches"])) \
+            or (base != default_branch and POLICY_FORBIDDEN.search(base)):
         reasons.append(f"BASE_NOT_DEFAULT_OR_DEPLOY: base {base!r}; deployment, release and non-default bases need their own authorization")
+    elif base != default_branch:
+        facts["base_policy"] = "approved version integration branch"
     if p["mergeable"] == "CONFLICTING" or p["mergeStateStatus"] == "DIRTY":
         reasons.append("CONFLICTS")
     elif p["mergeable"] == "UNKNOWN":
@@ -447,6 +559,7 @@ REASON_TABLE = {
     "STALE_BRANCH": (ASK, "agent_revalidates", "GITHUB_MERGE_ELIGIBILITY"),
     "MERGE_STATE_NOT_CLEAN": (ASK, "agent_revalidates", "GITHUB_MERGE_ELIGIBILITY"),
     "BASE_NOT_DEFAULT_OR_DEPLOY": (ASK, "founder_authorizes_target", "GITHUB_MERGE_ELIGIBILITY"),
+    "FUTURE_VERSION_INTO_MAIN": (ASK, "founder_authorizes_release", "GITHUB_MERGE_ELIGIBILITY"),
     "MERGEABILITY_UNKNOWN": (ASK, "agent_revalidates", "GITHUB_MERGE_ELIGIBILITY"),
     "MERGE_STATE_UNKNOWN": (ASK, "agent_revalidates", "GITHUB_MERGE_ELIGIBILITY"),
     "THIRD_PARTY_NEEDS_OWNER_APPROVAL": (ASK, "owner_github_approval", "GITHUB_APPROVAL_REQUIREMENT"),
@@ -576,12 +689,12 @@ def evidence_json(repo, pr, base, head, reviewer, kind="independent-agent", now=
             "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}
 
 
-def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None):
+def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None, version_policy=None):
     """Text plan for the owner: gate verdict per PR, in the order given. Print-only."""
     lines, first = [], True
     for n in prs:
         try:
-            verdict, reasons, facts = evaluate(run, repo, n, owners, ci_unavailable)
+            verdict, reasons, facts = evaluate(run, repo, n, owners, ci_unavailable, version_policy=version_policy)
         except Exception as e:
             lines.append(f"#{n} ERROR  {type(e).__name__}: {str(e)[:200]}")
             continue
@@ -613,6 +726,9 @@ def main(argv=None, run=None):
     sub.choices["check"].add_argument("--ci-unavailable", action="store_true")
     SETTINGS_HELP = "settings.json whose permission rules are read (never printed) to judge HOST_TOOL_PERMISSION; repeat for every layer (user, project, local, managed)"
     sub.choices["check"].add_argument("--settings", action="append", help=SETTINGS_HELP)
+    POLICY_HELP = ("approved version-branch policy (JSON, schema 1, owner-governed, outside every product repo); "
+                   f"default {VERSION_POLICY_DEFAULT} when it exists")
+    sub.choices["check"].add_argument("--version-policy", help=POLICY_HELP)
     sub.choices["verify"].add_argument("--head", required=True)
     q = sub.add_parser("queue")
     q.add_argument("--repo", required=True)
@@ -620,6 +736,7 @@ def main(argv=None, run=None):
     q.add_argument("--owners", required=True)
     q.add_argument("--ci-unavailable", action="store_true")
     q.add_argument("--settings", action="append", help=SETTINGS_HELP)
+    q.add_argument("--version-policy", help=POLICY_HELP)
     d = sub.add_parser("host-denied")
     d.add_argument("--repo", required=True)
     d.add_argument("--pr", type=int, required=True)
@@ -653,7 +770,8 @@ def main(argv=None, run=None):
             if not owners or not all(OWNER_RE.fullmatch(o) for o in owners):
                 print(json.dumps({"verdict": "REFUSE", "reasons": ["BAD_OWNERS"]}))
                 return 1
-            text = queue_report(run, a.repo, [int(x) for x in a.prs.split(",")], owners, a.ci_unavailable, a.settings)
+            policy = read_version_policy(a.version_policy or VERSION_POLICY_DEFAULT, bool(a.version_policy))
+            text = queue_report(run, a.repo, [int(x) for x in a.prs.split(",")], owners, a.ci_unavailable, a.settings, policy)
             print(text)
             return 0 if all(re.match(r"#\d+ PASS ", l) for l in text.splitlines() if l.startswith("#")) else 1
         if a.cmd == "check":
@@ -661,7 +779,8 @@ def main(argv=None, run=None):
             if not owners or not all(OWNER_RE.fullmatch(o) for o in owners):
                 print(json.dumps({"verdict": "REFUSE", "reasons": ["BAD_OWNERS"]}))
                 return 1
-            verdict, reasons, facts = evaluate(run, a.repo, a.pr, owners, a.ci_unavailable)
+            policy = read_version_policy(a.version_policy or VERSION_POLICY_DEFAULT, bool(a.version_policy))
+            verdict, reasons, facts = evaluate(run, a.repo, a.pr, owners, a.ci_unavailable, version_policy=policy)
             out = {"verdict": verdict, "reasons": reasons, **facts}
             sel = None
             if verdict == "PASS":

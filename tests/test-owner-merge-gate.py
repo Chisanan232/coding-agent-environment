@@ -26,7 +26,7 @@ class Fake:
     """Answers the gh calls the gate makes from a mutable state dict."""
 
     def __init__(self, **over):
-        self.pr = {"number": 7, "state": "OPEN", "isDraft": False, "baseRefName": "main", "headRefOid": HEAD,
+        self.pr = {"number": 7, "state": "OPEN", "isDraft": False, "baseRefName": "main", "headRefName": "feat/x", "headRefOid": HEAD,
                    "author": {"login": "chisanan232"}, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
                    "reviewDecision": "", "reviews": [], "isCrossRepository": False, "mergeCommit": None,
                    "comments": [{"author": {"login": "chisanan232"}, "body": REVIEW}],
@@ -62,6 +62,12 @@ class Fake:
 
 def run(fake, **kw):
     return omg.evaluate(fake, "Chisanan232/r", 7, OWNERS, **kw)
+
+
+POLICY = {"schema": 1, "repos": {"Chisanan232/r": {
+    "branches": [{"branch": "integration/mvp-5.0", "version": "5.0"},
+                 {"branch": "mvp-4.0/HORO-2046/integration", "version": "4.0"}],
+    "future_head_prefixes": ["mvp-6.0/"]}}}
 
 
 class Gate(unittest.TestCase):
@@ -159,6 +165,187 @@ class Gate(unittest.TestCase):
         comments = [{"author": {"login": "chisanan232"}, "body": REVIEW}, {"author": {"login": "chisanan232"}, "body": record}]
         bad = [{"name": "t", "status": "COMPLETED", "conclusion": "FAILURE"}]
         self.refused(Fake(statusCheckRollup=bad, comments=comments), "CI_FAILED", ci_unavailable=True)
+
+
+class VersionBranches(unittest.TestCase):
+    """Development-Ahead / Sequential Release: approved version integration branches are merge targets, main is not."""
+
+    def evaluate(self, fake, policy=POLICY):
+        return run(fake, version_policy=omg.load_version_policy(policy))
+
+    def refused(self, fake, code, policy=POLICY):
+        v, reasons, _ = self.evaluate(fake, policy)
+        self.assertEqual(v, "REFUSE", reasons)
+        self.assertTrue(any(r.startswith(code) for r in reasons), reasons)
+
+    def test_eligible_pr_into_approved_version_branch_passes(self):
+        for base in ("integration/mvp-5.0", "mvp-4.0/HORO-2046/integration"):
+            v, reasons, facts = self.evaluate(Fake(baseRefName=base))
+            self.assertEqual((v, reasons), ("PASS", []), base)
+            self.assertEqual(facts["base_policy"], "approved version integration branch")
+            self.assertIn("--merge", omg.merge_command(facts))
+
+    def test_unlisted_branch_is_still_refused(self):
+        self.refused(Fake(baseRefName="integration/mvp-9.0"), "BASE_NOT_DEFAULT_OR_DEPLOY")
+        self.refused(Fake(baseRefName="feature-x"), "BASE_NOT_DEFAULT_OR_DEPLOY")
+
+    def test_branch_approved_for_another_repo_does_not_authorize(self):
+        other = {"schema": 1, "repos": {"Chisanan232/other": POLICY["repos"]["Chisanan232/r"]}}
+        self.refused(Fake(baseRefName="integration/mvp-5.0"), "BASE_NOT_DEFAULT_OR_DEPLOY", other)
+
+    def test_no_policy_keeps_the_old_behaviour(self):
+        v, reasons, _ = run(Fake(baseRefName="integration/mvp-5.0"))
+        self.assertEqual(v, "REFUSE")
+        self.assertTrue(any(r.startswith("BASE_NOT_DEFAULT_OR_DEPLOY") for r in reasons))
+
+    def test_policy_can_never_approve_a_deployment_base(self):
+        bad = {"schema": 1, "repos": {"Chisanan232/r": {"branches": [{"branch": "release/1.0", "version": "1.0"}]}}}
+        with self.assertRaises(ValueError):
+            omg.load_version_policy(bad)
+
+    def test_approved_base_still_needs_review_ci_and_threads(self):
+        base = "integration/mvp-5.0"
+        self.refused(Fake(baseRefName=base, comments=[]), "NO_REVIEW_EVIDENCE")
+        self.refused(Fake(baseRefName=base, statusCheckRollup=[]), "NO_CI_EVIDENCE")
+        self.refused(Fake(baseRefName=base, statusCheckRollup=[{"name": "t", "status": "COMPLETED", "conclusion": "FAILURE"}]), "CI_FAILED")
+        self.refused(Fake(baseRefName=base, headRefOid="c" * 40), "REVIEW_STALE")
+        self.refused(Fake(baseRefName=base, threads=[{"isResolved": False, "isOutdated": False}]), "UNRESOLVED_REVIEW_THREADS")
+        self.refused(Fake(baseRefName=base, mergeable="CONFLICTING", mergeStateStatus="DIRTY"), "CONFLICTS")
+        self.refused(Fake(baseRefName=base, behind=2), "STALE_BRANCH")
+
+    def test_future_version_code_cannot_enter_the_default_branch(self):
+        self.refused(Fake(headRefName="integration/mvp-5.0"), "FUTURE_VERSION_INTO_MAIN")
+        self.refused(Fake(headRefName="mvp-4.0/HORO-2046/integration"), "FUTURE_VERSION_INTO_MAIN")
+        self.refused(Fake(headRefName="mvp-6.0/HORO-2087/path_boundary_experiment"), "FUTURE_VERSION_INTO_MAIN")
+
+    def test_ordinary_default_branch_merge_is_unchanged(self):
+        v, reasons, facts = self.evaluate(Fake())
+        self.assertEqual((v, reasons), ("PASS", []))
+        self.assertNotIn("base_policy", facts)
+
+    def test_deployment_base_stays_refused_with_a_policy_loaded(self):
+        self.refused(Fake(baseRefName="release"), "BASE_NOT_DEFAULT_OR_DEPLOY")
+
+    def test_policy_file_must_be_private_and_missing_default_means_no_policy(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(os.path.realpath(d), "local")
+            os.mkdir(root, 0o700)
+            missing = os.path.join(root, "none.json")
+            self.assertIsNone(omg.read_version_policy(missing, False, root))
+            with self.assertRaises(FileNotFoundError):
+                omg.read_version_policy(missing, True, root)
+            f = os.path.join(root, "p.json")
+            pathlib.Path(f).write_text(json.dumps(POLICY))
+            os.chmod(f, 0o600)
+            self.assertIn("chisanan232/r", omg.read_version_policy(f, True, root))
+            os.chmod(f, 0o666)
+            with self.assertRaises(ValueError):
+                omg.read_version_policy(f, True, root)
+
+    def test_policy_outside_the_owner_config_root_or_via_symlink_is_refused(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.realpath(d)
+            root = os.path.join(real, "local")
+            os.mkdir(root, 0o700)
+            elsewhere = os.path.join(real, "repo-worktree.json")  # e.g. a file a PR could edit
+            pathlib.Path(elsewhere).write_text(json.dumps(POLICY))
+            os.chmod(elsewhere, 0o600)
+            with self.assertRaises(ValueError):
+                omg.read_version_policy(elsewhere, True, root)
+            link = os.path.join(root, "link.json")
+            os.symlink(elsewhere, link)
+            with self.assertRaises(ValueError):  # the real path escapes the root, so the link buys nothing
+                omg.read_version_policy(link, True, root)
+            os.chmod(root, 0o777)
+            ok = os.path.join(root, "p.json")
+            pathlib.Path(ok).write_text(json.dumps(POLICY))
+            os.chmod(ok, 0o600)
+            with self.assertRaises(ValueError):  # group/world-writable directory
+                omg.read_version_policy(ok, True, root)
+
+    def test_environment_and_release_names_can_never_be_listed(self):
+        for name in ("staged", "beta", "alpha", "canary", "hotfix/x", "x/staging/y", "staging-eu", "beta-2", "hotfix-1", "integration/beta-fix", "v1-prod", "v1.0-release", "deploy"):
+            bad = {"schema": 1, "repos": {"Chisanan232/r": {"branches": [{"branch": name, "version": "1"}]}}}
+            with self.assertRaises(ValueError, msg=name):
+                omg.load_version_policy(bad)
+
+    def test_base_approval_is_case_exact(self):
+        self.refused(Fake(baseRefName="Integration/MVP-5.0"), "BASE_NOT_DEFAULT_OR_DEPLOY")
+
+    def test_future_head_match_ignores_case(self):
+        self.refused(Fake(headRefName="MVP-6.0/x"), "FUTURE_VERSION_INTO_MAIN")
+        self.refused(Fake(headRefName="Integration/MVP-5.0"), "FUTURE_VERSION_INTO_MAIN")
+
+    def test_case_variant_duplicate_repo_is_rejected(self):
+        entry = {"branches": [{"branch": "integration/mvp-5.0", "version": "5.0"}]}
+        with self.assertRaises(ValueError):
+            omg.load_version_policy({"schema": 1, "repos": {"Chisanan232/r": entry, "chisanan232/R": entry}})
+
+    def test_default_branch_other_than_main(self):
+        v, reasons, _ = self.evaluate(Fake(defaultBranchRef={"name": "master"}, baseRefName="integration/mvp-5.0"))
+        self.assertEqual((v, reasons), ("PASS", []))
+        self.refused(Fake(defaultBranchRef={"name": "master"}, baseRefName="master", headRefName="integration/mvp-5.0"),
+                     "FUTURE_VERSION_INTO_MAIN")
+        self.refused(Fake(defaultBranchRef={"name": "master"}, baseRefName="main"), "BASE_NOT_DEFAULT_OR_DEPLOY")
+
+    def test_loader_hardening_spe_133(self):
+        import os, tempfile
+        entry = POLICY["repos"]["Chisanan232/r"]
+        bad = [{"schema": True, "repos": {}}, {"schema": 1.0, "repos": {}},
+               {"schema": 1, "repos": {"Chisanan232/r": dict(entry, future_head_prefixes="mvp-6.0/")}},
+               {"schema": 1, "repos": {"Chisanan232/r": dict(entry, future_head_prefixes=[""])}}]
+        for name in ("a//b", "stage", "stg", "uat", "qa", "live", "preprod", "integration/uat-1", "env/live"):
+            bad.append({"schema": 1, "repos": {"Chisanan232/r": {"branches": [{"branch": name, "version": "1"}]}}})
+        for b in bad:
+            with self.assertRaises(ValueError, msg=b):
+                omg.load_version_policy(b)
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(os.path.realpath(d), "local")
+            os.mkdir(root, 0o700)
+            dup = os.path.join(root, "dup.json")
+            pathlib.Path(dup).write_text('{"schema": 1, "repos": {}, "repos": {}}')
+            big = os.path.join(root, "big.json")
+            pathlib.Path(big).write_text('{"schema": 1, "repos": {}, "pad": "' + "x" * 70000 + '"}')
+            fifo = os.path.join(root, "fifo.json")
+            os.mkfifo(fifo, 0o600)
+            for f in (dup, big, fifo):
+                os.chmod(f, 0o600)
+                with self.assertRaises(ValueError, msg=f):
+                    omg.read_version_policy(f, True, root)
+
+    def test_codex_review_findings_spe_132(self):
+        import os, tempfile
+        def listed(name):
+            return {"schema": 1, "repos": {"Chisanan232/r": {"branches": [{"branch": name, "version": "1"}]}}}
+        for name in ("integration/.hidden/bar", "integration/x.lock/y", "integration/trailing.", "integration/betafix",
+                     "stagingeu", "integration/stg2", "uatx", "preprod1", "StG", "STAGE", "integration/stg/x", "qa2", "livefix", "integration/qa2", "integration/livefix",
+                     "mvp-staging", "mvp-5-staging", "x-beta", "mvp-beta", "mvp-canary", "mvp-preprod", "mvp-qa", "mvp-QA",
+                     "mvp-prd", "prd", "sandbox", "mvp-sandbox", "integration/release-notes", "mvp.live.v2"):
+            with self.assertRaises(ValueError, msg=name):
+                omg.load_version_policy(listed(name))
+        for name in ("integration/mvp-5.0", "mvp-4.0/HORO-2046/integration", "mvp-5.0/integration"):
+            omg.load_version_policy(listed(name))
+        pre = {"schema": 1, "repos": {"Chisanan232/r": {"branches": [], "future_head_prefixes": ["mvp-6.0/", ".x/"]}}}
+        with self.assertRaises(ValueError):
+            omg.load_version_policy(pre)
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(os.path.realpath(d), "local")
+            os.mkdir(root, 0o700)
+            real = os.path.join(root, "real.json")
+            pathlib.Path(real).write_text(json.dumps(POLICY))
+            os.chmod(real, 0o600)
+            link = os.path.join(root, "link.json")
+            os.symlink(real, link)
+            with self.assertRaises(ValueError):
+                omg.read_version_policy(link, True, root)
+
+    def test_malformed_policy_fails_closed(self):
+        for bad in ({}, {"schema": 2, "repos": {}}, {"schema": 1, "repos": {"x": {"branches": [{"branch": "../x"}]}}},
+                    {"schema": 1, "repos": {"Chisanan232/r": {"branches": "integration/mvp-5.0"}}}):
+            with self.assertRaises(ValueError):
+                omg.load_version_policy(bad)
 
 
 class Verify(unittest.TestCase):
