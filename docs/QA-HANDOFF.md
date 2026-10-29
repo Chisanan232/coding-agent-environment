@@ -83,8 +83,8 @@ clone at the exact commit, never the producer's transcript, with producer eviden
 **not** filesystem or configuration isolation: the sandbox can still read files this user can read, and the run inherits
 the user's Codex configuration (hooks, MCP servers) because no credential is copied into a private home. The wrapper
 therefore checks facts instead of trusting the verdict text: the clone's `.git/HEAD` and every tracked file match a
-manifest taken before the run (no git is run against the clone afterwards, because the QA process can write its
-`.git/config`), commands were really executed in the event stream, and the event stream and verdict are hashed at exit.
+manifest taken before the run, and so does a digest of `.git/config` (a rewritten config is `QA_INVALID`; no git is run
+against the clone afterwards, because the QA process can write it), commands were really executed in the event stream, and the event stream and verdict are hashed at exit.
 A run in which no command executed is `QA_INCOMPLETE`, never a pass. Every call carries explicit `-s workspace-write`
 and no model override, because the live Codex configuration is full-access with approvals off.
 
