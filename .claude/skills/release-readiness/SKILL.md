@@ -52,6 +52,13 @@ Before tagging a release version. After all PRs for the release are merged.
 - [ ] If `static_analysis` MCP capability is available: confirm quality gate passes.
 - [ ] If `coverage_reporting` MCP capability is available: confirm coverage meets threshold.
 
+## Release states
+
+This checklist produces `RELEASE_CHECKLIST_PASS` only. Report it separately from `ENGINEERING_COMPLETE`,
+`FUNCTIONAL_QA_PASS`, `SECURITY_QA_PASS`, `INDEPENDENT_QA_SIGNED_OFF`, `READY_FOR_RELEASE`, `RELEASE_APPROVED` and
+`RELEASED`, each with its own evidence and exact SHA (`docs/ENGINEERING-POLICY.md`, section 8). A skipped or
+unavailable check is not PASS. Never tag, publish or deploy from this skill.
+
 ## Output
 
 Apply [evidence-first-briefing](../evidence-first-briefing/SKILL.md) to persistent/shared output.

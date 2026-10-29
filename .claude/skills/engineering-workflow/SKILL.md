@@ -52,7 +52,9 @@ from the branch by replacing `/` with `-`: `<repo>-<phase>-<ticket>-<type>-<summ
 
 Keep each commit atomic and bisectable: one logically small change per commit,
 one new test per commit, and utilities and mocks land in earlier commits than the
-tests that use them. Use imperative summaries under 72 characters:
+tests that use them. An implementation and its tests are separate commits when each is
+independently meaningful; they share one commit only when together they form one inseparable
+correctness change. Use imperative summaries under 72 characters:
 
 ```
 <GitEmoji> (<scope>): <imperative summary>
@@ -103,8 +105,10 @@ expected speedup, mutable-state overlap, and integration overhead.
 ## Review and open the pull request
 
 Review the complete diff and commit range yourself. Then obtain a
-meaningful independent review from a separate reviewer or isolated review context. Resolve
-material findings and rerun affected checks. The implementation author's assertion
+meaningful independent review from a separate reviewer or isolated review context. Address or
+explicitly disposition every reviewer comment: fix all Critical and High findings, material Medium
+issues (unless an owner-approved exception applies) and cheap, meaningful Low findings; track other
+Lows with a specific rationale. Rerun affected checks, and do not loop on review without bound. The implementation author's assertion
 does not count as independent evidence.
 
 Keep one concern per pull request and under 500 changed lines when practical. Split
@@ -217,8 +221,8 @@ security, production, release, payment, or destructive-operation authority chang
 
 A campaign is the approved scope of related tickets. The campaign, not one task or
 one prompt, is the unit of completion: `TASK_DONE` is not `CAMPAIGN_DONE`,
-`PR_MERGED` is not `QA_SIGNED_OFF`, and `QA_SIGNED_OFF` is not
-`RELEASE_PUBLISHED`. Never invent new mandatory release scope.
+`PR_MERGED` is not `INDEPENDENT_QA_SIGNED_OFF`, and `INDEPENDENT_QA_SIGNED_OFF` is not
+`RELEASED`. Never invent new mandatory release scope.
 
 - **Task-scoped blockers.** Classify each task independently as `READY`, `RUNNING`,
   `WAITING_RESOURCE`, `WAITING_DEPENDENCY`, `WAITING_OPERATOR`,
@@ -336,5 +340,7 @@ merge commit, outcome, validation, and material remaining uncertainty. Transitio
 it only when its acceptance criteria are actually satisfied.
 
 Remove the owned worktree, local and remote topic branch when appropriate, temporary
-artifacts, and owned background processes after merge verification. Never remove
+artifacts, and owned background processes after merge verification, but only when the
+worktree is inactive, clean and fully reconciled; never run a broad `git worktree prune` or other
+automatic destructive cleanup. Never remove
 unrelated state or a resource still owned by active work.
