@@ -43,6 +43,14 @@ if mode == "fsmonitor":     # QA tries to make the wrapper's later git run execu
     open(".git/config", "a").write("\n[core]\n\tfsmonitor = touch " + d + "/CANARY\n")
     open(".git/info/attributes", "a").write("* filter=evil\n")
     open(".git/config", "a").write("[filter \"evil\"]\n\tclean = touch " + d + "/CANARY2\n")
+if mode == "hook":          # a hook that a later git run in the clone would execute
+    os.makedirs(".git/hooks", exist_ok=True)
+    open(".git/hooks/post-checkout", "w").write("#!/bin/sh\ntouch " + d + "/CANARY3\n")
+if mode == "alternates":    # object store redirected outside the clone
+    os.makedirs(".git/objects/info", exist_ok=True)
+    open(".git/objects/info/alternates", "w").write("/tmp\n")
+if mode == "commondir":
+    open(".git/commondir", "w").write("../elsewhere\n")
 if mode == "linkverdict":
     open(d + "/decoy.json", "w").write(json.dumps(verdict))
     out = argv[argv.index("-o") + 1]
@@ -511,8 +519,15 @@ class VerdictTests(Base):
         self.assertFalse((self.fake_dir / "CANARY").exists())            # core.fsmonitor never ran
         self.assertFalse((self.fake_dir / "CANARY2").exists())           # the filter driver never ran
         self.assertEqual(code, 12, out)                                   # rewriting .git/config is tampering, not a pass
-        self.assertIn(".git/config", out)
+        self.assertIn(".git control files", out)
         self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)   # re-evaluation agrees
+
+    def test_other_git_control_files_are_covered_too(self):
+        for mode in ("hook", "alternates", "commondir"):
+            code, out, run_dir = self.outcome(verdict(), mode=mode)
+            self.assertEqual(code, 12, (mode, out))
+            self.assertIn(".git", out)
+            self.assertFalse((self.fake_dir / "CANARY3").exists())
 
     def test_planting_a_symlink_as_the_verdict_is_invalid_and_never_read(self):
         code, out, _ = self.outcome(verdict(), mode="linkverdict")
