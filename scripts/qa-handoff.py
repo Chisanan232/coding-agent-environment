@@ -414,13 +414,13 @@ def codex_argv(codex_bin, run_dir):
 
 
 def count_commands(events_path):
-    """(completed, succeeded) distinct command_execution items in the codex JSON event stream; succeeded means exit
+    """(completed, succeeded) distinct command_execution items (each needs a non-empty id) in the codex JSON event stream; succeeded means exit
     code 0. Lines over 1 MiB are ignored. Verified on codex-cli 0.163.0: text printed by a command stays inside an
     escaped string field and cannot become an event line of its own; this is a property of that version."""
     completed = succeeded = 0
     seen = set()
     with open_regular(events_path) as handle:
-        for number, line in enumerate(handle):
+        for line in handle:
             if len(line) > MAX_EVENT_LINE:
                 continue
             try:
@@ -432,8 +432,8 @@ def count_commands(events_path):
             item = event.get('item')
             if not (isinstance(item, dict) and item.get('type') == 'command_execution'):
                 continue
-            key = item.get('id') or ('line', number)
-            if key in seen:
+            key = item.get('id')
+            if not isinstance(key, str) or not key or key in seen:   # without a unique id a repeat cannot be told from a forgery
                 continue
             seen.add(key)
             completed += 1

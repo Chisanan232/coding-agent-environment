@@ -93,7 +93,10 @@ if mode == "trackedfifo":
 code = 1 if mode == "cmdfail" else 0
 for i in range(ncmd):
     print(json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": "x"}}))
-    print(json.dumps({"type": "item.completed", "item": {"type": "command_execution", "command": "x", "exit_code": code}}))
+    item = {"type": "command_execution", "command": "x", "exit_code": code}
+    if mode != "noids":         # codex gives every command item an id; an id-less repeat is not evidence of two commands
+        item["id"] = "c%d" % i
+    print(json.dumps({"type": "item.completed", "item": item}))
 print(json.dumps({"type": "agent_message_note", "text": "5"}))
 print("5")
 print(json.dumps({"type": "turn.completed"}))
@@ -429,6 +432,9 @@ class VerdictTests(Base):
 
     def test_a_repeated_command_item_counts_once(self):
         self.assertEqual(self.outcome(verdict(), mode="dupitems")[0], 11)
+
+    def test_command_items_without_an_id_are_not_counted(self):
+        self.assertEqual(self.outcome(verdict(), mode="noids")[0], 11)
 
     def test_a_mode_only_change_to_a_tracked_file_is_invalid(self):
         self.assertEqual(self.outcome(verdict(), mode="modebit")[0], 12)
