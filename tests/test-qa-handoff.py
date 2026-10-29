@@ -30,6 +30,9 @@ argv = sys.argv[1:]
 json.dump({"argv": argv, "env": sorted(os.environ), "cwd": os.getcwd()}, open(d + "/seen.json", "w"))
 open(d + "/prompt.txt", "w").write(sys.stdin.read())
 mode = open(d + "/mode").read().strip()
+if mode == "hangdirty":     # tamper, then never produce a verdict
+    open("tracked.txt", "a").write("modified by QA")
+    time.sleep(120)
 if mode == "hang":
     child = subprocess.Popen(["sleep", "120"])
     open(d + "/child.pid", "w").write(str(child.pid))
@@ -449,6 +452,35 @@ class VerdictTests(Base):
         self.assertEqual(json.loads((run_dir / "RESULT.json").read_text())["state"], "QA_INVALID")
         (run_dir / "packet.json").write_text("{not json")
         self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)
+
+    def test_corrupt_manifest_before_run_is_qa_invalid_not_a_crash(self):
+        for content in ("{", "[]", None):
+            self.fake_verdict(verdict())
+            self.fake_mode("pass")
+            run_dir = self.prepare()
+            if content is None:
+                (run_dir / "tree-manifest.json").unlink()
+            else:
+                (run_dir / "tree-manifest.json").write_text(content)
+            code, out = self.run_qa(run_dir)
+            self.assertEqual(code, 12, (content, out))
+            self.assertNotIn("Traceback", out)
+
+    def test_tampering_then_timing_out_is_invalid_not_incomplete(self):
+        self.fake_mode("hangdirty")
+        run_dir = self.prepare()
+        code, out = self.run_qa(run_dir, extra=("--timeout", "8"))
+        self.assertEqual(code, 12, out)
+
+    def test_a_fifo_as_packet_json_does_not_hang_verdict(self):
+        self.fake_verdict(verdict())
+        self.fake_mode("pass")
+        run_dir = self.prepare()
+        (run_dir / "packet.json").unlink()
+        os.mkfifo(run_dir / "packet.json")
+        start = time.time()
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)
+        self.assertLess(time.time() - start, 20)
 
     def test_a_mode_only_change_to_a_tracked_file_is_invalid(self):
         self.assertEqual(self.outcome(verdict(), mode="modebit")[0], 12)

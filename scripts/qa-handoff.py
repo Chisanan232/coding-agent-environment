@@ -324,9 +324,20 @@ class PacketInvalid(Exception):
     """packet.json is unreadable, malformed or no longer matches its digest: an integrity failure (QA_INVALID)."""
 
 
+MAX_RUN_JSON_BYTES = 64 << 20
+LOAD_ERRORS = (OSError, ValueError, KeyError, TypeError, RecursionError, AttributeError)
+
+
+def read_run_json(path):
+    """JSON of a wrapper-written run file, read without following a link or blocking on a FIFO (a FIFO planted in the run
+    directory must not hang the wrapper). Any problem is an OSError or ValueError."""
+    with open_regular(path) as handle:
+        return json.loads(handle.read(MAX_RUN_JSON_BYTES))
+
+
 def load_packet(run_dir):
     try:
-        packet = json.loads((Path(run_dir) / 'packet.json').read_text())
+        packet = read_run_json(Path(run_dir) / 'packet.json')
         ok = isinstance(packet, dict) and packet.get('digest') == packet_digest(packet)
     except (OSError, ValueError, RecursionError):
         raise PacketInvalid('packet.json is unreadable or malformed')
@@ -493,9 +504,13 @@ def run(args):
     source = run_dir / 'source'
     if (run_dir / 'RUNMETA.json').exists():
         raise SystemExit('refusing: this run directory has already been run; prepare a new attempt')
-    manifest = json.loads((run_dir / 'tree-manifest.json').read_text())
-    problems = check_tree(source, manifest)
-    if problems or manifest['__head__'] != packet['sha']:
+    try:
+        manifest = read_run_json(run_dir / 'tree-manifest.json')
+        problems = check_tree(source, manifest)
+        mismatch = manifest['__head__'] != packet['sha']
+    except LOAD_ERRORS as error:
+        return write_result(run_dir, packet, 'QA_INVALID', ['tree manifest is unreadable (%s)' % type(error).__name__])
+    if problems or mismatch:
         return write_result(run_dir, packet, 'QA_INVALID', problems or ['manifest does not match the packet'])
     if not admitted(args):
         return write_result(run_dir, packet, 'WAITING_RESOURCE', ['disk admission refused; codex was not started'])
@@ -607,7 +622,7 @@ def evaluate_files(run_dir, packet):
     meta_path, verdict_path, events = run_dir / 'RUNMETA.json', run_dir / 'verdict.json', run_dir / 'events.jsonl'
     if not meta_path.exists():
         return write_result(run_dir, packet, 'QA_INVALID', ['no run record'])
-    meta = json.loads(meta_path.read_text())
+    meta = read_run_json(meta_path)
     bad = []
     if safe_digest(events) != meta['events_sha256']:
         bad.append('event stream changed after the run')
@@ -622,11 +637,17 @@ def evaluate_files(run_dir, packet):
         return write_result(run_dir, packet, 'QA_INVALID', bad + ['verdict is not a regular file (link planted?)'])
     if not os.path.lexists(verdict_path):
         if meta.get('timed_out'):
+            tampered = check_tree(run_dir / 'source', read_run_json(run_dir / 'tree-manifest.json'))
+            if tampered:                      # a timeout does not excuse a modified clone
+                return write_result(run_dir, packet, 'QA_INVALID', bad + tampered)
             return write_result(run_dir, packet, 'QA_INCOMPLETE', ['timed out before a verdict'])
         return write_result(run_dir, packet, 'QA_INVALID', ['no verdict file'])
     if safe_digest(verdict_path) != meta['verdict_sha256']:
         bad.append('verdict changed after the run (tampered)')
-    bad += check_tree(run_dir / 'source', json.loads((run_dir / 'tree-manifest.json').read_text()))
+    manifest = read_run_json(run_dir / 'tree-manifest.json')
+    bad += check_tree(run_dir / 'source', manifest)
+    if manifest['__head__'] != packet['sha']:
+        bad.append('tree manifest head does not match the packet')
     try:
         verdict = json.loads(read_nofollow(verdict_path))
     except OSError:
@@ -640,7 +661,7 @@ def evaluate_files(run_dir, packet):
         bad.append('verdict baseline is not exactly "<product> @ <full packet sha>"')
     if bad:
         return write_result(run_dir, packet, 'QA_INVALID', bad)
-    created, truncated = untracked_created(run_dir / 'source', json.loads((run_dir / 'tree-manifest.json').read_text()))
+    created, truncated = untracked_created(run_dir / 'source', manifest)
     extra = {'verdict_sha256': meta['verdict_sha256'], 'events_sha256': meta['events_sha256'],
              'commands_completed': commands_completed, 'commands_succeeded': commands_succeeded,
              'codex_exit_code': meta['exit_code'], 'untracked_files_present': len(created) if not truncated else 'many',
