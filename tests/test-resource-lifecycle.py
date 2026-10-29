@@ -211,6 +211,58 @@ class ClassificationTests(Fixture):
         self.assertEqual(self.classify(wt, kind="worktree")[0][0], "B")
 
 
+class ProcessTests(Fixture):
+    def table(self):
+        hour = 3600
+        return {
+            10: dict(ppid=1, age_s=5 * hour, cpu=0.0, rss_kb=100, state='Ss', comm='claude'),       # live foreign session
+            20: dict(ppid=10, age_s=50 * hour, cpu=0.0, rss_kb=100, state='Ss', comm='zsh'),
+            21: dict(ppid=20, age_s=50 * hour, cpu=30.0, rss_kb=2048, state='RN', comm='zsh'),      # foreign spinning test
+            22: dict(ppid=20, age_s=50 * hour, cpu=25.0, rss_kb=2048, state='RN', comm='zsh'),
+            30: dict(ppid=1, age_s=200 * hour, cpu=0.0, rss_kb=100, state='Ss+', comm='bash'),
+            31: dict(ppid=30, age_s=200 * hour, cpu=40.0, rss_kb=500, state='R+', comm='age'),      # orphaned test process
+            40: dict(ppid=1, age_s=2 * hour, cpu=0.0, rss_kb=100, state='Ss', comm='claude'),       # this session
+            41: dict(ppid=40, age_s=2 * hour, cpu=0.0, rss_kb=100, state='Ss', comm='zsh'),
+            42: dict(ppid=41, age_s=20 * hour, cpu=60.0, rss_kb=900, state='R', comm='cargo'),      # own leftover
+            50: dict(ppid=1, age_s=10 * hour, cpu=1.0, rss_kb=100, state='S', comm='quiet'),        # below the CPU threshold
+            51: dict(ppid=1, age_s=60, cpu=90.0, rss_kb=100, state='R', comm='fresh'),              # too young to be stale
+        }
+
+    def run_procs(self, extra=()):
+        self.patch(rl, "process_table", self.table)
+        self.patch(rl, "process_cwds", lambda pids: {p: "/work/%d" % p for p in pids})
+        self.patch(rl, "live_sessions", lambda d: {"sess-foreign": 10, SELF: 40})
+        out = self.root / "pstate"
+        code, text = self.run_cli("procs", "--self-session", SELF, "--out", str(out), *extra)
+        data = json.loads(next(out.glob("procs-*.json")).read_text())
+        return code, text, {tuple(g["pids"]): g for g in data["groups"]}
+
+    def test_groups_are_classified_by_owner_chain(self):
+        code, text, groups = self.run_procs()
+        self.assertEqual(code, 0)
+        self.assertEqual(groups[(21, 22)]["class"], "B")          # another live session's spinning children
+        self.assertEqual(groups[(21, 22)]["owner_session"], "sess-foreign")
+        self.assertEqual(groups[(31,)]["class"], "C")             # orphaned: unknown owner, never automatic
+        self.assertEqual(groups[(31,)]["attribution"], "orphan")
+        self.assertEqual(groups[(42,)]["class"], "A")             # descended from this session
+        self.assertNotIn((50,), groups)
+        self.assertNotIn((51,), groups)
+
+    def test_no_command_line_or_session_name_is_recorded(self):
+        code, text, groups = self.run_procs()
+        blob = json.dumps(list(groups.values())) + text
+        for forbidden in ("argv", "command", "name"):
+            self.assertNotIn('"%s"' % forbidden, blob)
+        self.assertEqual(oct(next((self.root / "pstate").glob("procs-*.json")).stat().st_mode & 0o777), "0o600")
+
+    def test_nothing_is_signalled(self):
+        import signal
+        calls = []
+        self.patch(rl.os, "kill", lambda *a: calls.append(a))
+        self.run_procs()
+        self.assertEqual(calls, [])
+
+
 class ApplyTests(Fixture):
     def inventory_manifest(self, kind="cargo_target", cls="A", names=("t",)):
         consumers = self.root / "consumers.json"
