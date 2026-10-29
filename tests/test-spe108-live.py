@@ -362,15 +362,34 @@ class LiveScripts(unittest.TestCase):
         ledger.write_text("")
         ledger.chmod(0o600)
         script = str(LIVE / "rehearse.sh")
-        for inside in (self.home / ".claude/scratch", self.repo / "scratch"):
+        for inside in (self.home / ".claude/scratch", self.home / ".codex/scratch", self.home / ".agents/scratch",
+                       self.home, self.repo / "scratch"):
             done = self.run_script("bash", script, "--repo", str(self.repo), "--ledger", str(ledger), "--keep-dir", str(inside), ok=False)
             self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
             self.assertIn("must not be inside", done.stderr)
-            self.assertFalse(inside.exists() and any(inside.iterdir()))
+            if inside != self.home:  # HOME itself exists; every other refused path must not have been created
+                self.assertFalse(inside.exists(), inside)
         dotdot = self.run_script("bash", script, "--repo", str(self.repo), "--ledger", str(ledger), "--keep-dir",
                                  str(Path(self.temp.name) / "new/../../.claude/x"), ok=False)
         self.assertEqual(dotdot.returncode, 2)
         self.assertIn("must not contain ..", dotdot.stderr)
+        empty = self.run_script("bash", script, "--repo", str(self.repo), "--ledger", str(ledger), "--keep-dir", "", ok=False)
+        self.assertEqual(empty.returncode, 2)
+        self.assertIn("non-empty path", empty.stderr)
+
+    def test_rehearse_leaves_a_non_empty_scratch_dir_untouched(self):
+        ledger = Path(self.temp.name) / "e.tsv"
+        ledger.write_text("")
+        ledger.chmod(0o600)
+        shared = Path(self.temp.name) / "shared"
+        shared.mkdir()
+        (shared / "keep.txt").write_text("x")
+        shared.chmod(0o755)
+        done = self.run_script("bash", str(LIVE / "rehearse.sh"), "--repo", str(self.repo), "--ledger", str(ledger),
+                               "--keep-dir", str(shared), ok=False)
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("must be empty", done.stderr)
+        self.assertEqual(oct(shared.stat().st_mode & 0o777), "0o755")
 
 
 if __name__ == "__main__":
