@@ -320,7 +320,9 @@ class VersionBranches(unittest.TestCase):
         def listed(name):
             return {"schema": 1, "repos": {"Chisanan232/r": {"branches": [{"branch": name, "version": "1"}]}}}
         for name in ("integration/.hidden/bar", "integration/x.lock/y", "integration/trailing.", "integration/betafix",
-                     "stagingeu", "integration/stg2", "uatx", "preprod1", "StG", "STAGE", "integration/stg/x", "qa2", "livefix", "integration/qa2", "integration/livefix"):
+                     "stagingeu", "integration/stg2", "uatx", "preprod1", "StG", "STAGE", "integration/stg/x", "qa2", "livefix", "integration/qa2", "integration/livefix",
+                     "mvp-staging", "mvp-5-staging", "x-beta", "mvp-beta", "mvp-canary", "mvp-preprod", "mvp-qa", "mvp-QA",
+                     "mvp-prd", "prd", "sandbox", "mvp-sandbox", "integration/release-notes", "mvp.live.v2"):
             with self.assertRaises(ValueError, msg=name):
                 omg.load_version_policy(listed(name))
         for name in ("integration/mvp-5.0", "mvp-4.0/HORO-2046/integration", "mvp-5.0/integration"):

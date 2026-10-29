@@ -40,9 +40,11 @@ DEPLOY_BASES = re.compile(r"(^|/)(prod|production|release|releases|gh-pages|depl
 
 # Environment and release names that must never become an approved integration base, even when an owner lists them.
 # Environment words: a path segment that merely starts with one is refused (stagingeu, betafix, stg2, qa2, livefix), as
-# are names ending in an environment suffix. Deliberately over-broad and fail-closed; an owner renames a legitimate branch instead of listing it.
-POLICY_FORBIDDEN = re.compile(r"(^|/)(staged?|staging|stg|beta|alpha|canary|hotfix|uat|preprod|qa|live)"
-                              r"|[-/._](prod|production|release|releases|deploy|stage|stg|uat|live)$", re.I)
+# is any such word as a whole token anywhere in the name (mvp-staging, x-beta, mvp-qa, prod). Deliberately over-broad and fail-closed; an owner renames a legitimate branch instead of listing it.
+POLICY_FORBIDDEN = re.compile(
+    r"(^|/)(staged?|staging|stg|beta|alpha|canary|hotfix|uat|preprod|qa|live)"
+    r"|(^|[-/._])(staged?|staging|stg|beta|alpha|canary|hotfix|uat|preprod|qa|live|prd|prod|production|release|releases|deploy|"
+    r"sandbox)([-/._0-9]|$)", re.I)
 POLICY_MAX_BYTES = 65536
 
 
