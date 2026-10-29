@@ -125,3 +125,12 @@ the hop and acts on the verdict.
 - A sandboxed command that detaches into its own session (`setsid`) can outlive the timeout kill.
 - Untracked files that QA creates in the clone are reported (count and sample), not forbidden: builds and caches are
   legitimate, so a reviewer decides whether they matter.
+- The two-command floor is a floor, not proof: a no-op command satisfies it. The command count is recomputed from the
+  hashed event stream (not from the saved run record), and the evidence text and stream remain for a reviewer.
+- Your Codex hooks and MCP servers run unsandboxed inside the Codex client during a QA run, as this user. A write-capable
+  one could act on the run directory. The sandbox pins cover the QA commands, not those components; whether the
+  system `/tmp` is writable to QA was not verified.
+- The saved run record and result files are wrapper-owned and protected from the QA process, but not from the same user.
+  Re-run `verdict` just before relying on a pass (a straggler process could still write to the clone after `run` returns).
+- On codex-cli 0.163.0, text printed by a QA command stays inside an escaped field of the event stream and cannot forge
+  an event line. This was observed on that version, not guaranteed for others.
