@@ -109,7 +109,7 @@ class ClassifyTests(unittest.TestCase):
     def test_squash_negation_attaches_to_the_term_only(self):
         for text in ("Merge: never rebase. Squash all PRs.", "Squash merge, not rebase.", "Use squash for feature PRs",
                      "Merge strategy: squash all PRs (no merge commits).",
-                     "Squash all PRs, never merge commits", "Squash all PRs, merge commits are disabled",
+                     "Squash all PRs, never merge commits", "Squash all PRs, rebase and merge commits are disabled", "Squash all PRs, merge commits are disabled",
                      "Squash merge only, rebase disabled", "Squash merge, avoid rebase",
                      "Use squash (never rebase) for all PRs", "| Merge | **Squash** for feature PRs"):
             self.assertTrue(ac.permits_squash(text), text)
