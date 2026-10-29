@@ -70,11 +70,25 @@ class Fixture(unittest.TestCase):
 class ClassificationTests(Fixture):
     def test_owned_reproducible_idle_target_is_class_a(self):
         d = self.make("t")
-        receipt(d)
+        receipt(d, private=True)
         (cls, why), rec = self.classify(d)
         self.assertEqual((cls, why), ("A", ["owned-reproducible-idle"]))
         self.assertIsInstance(rec["allocated_bytes"], int)
         self.assertIsInstance(rec["logical_bytes"], int)
+
+    def test_cargo_target_without_a_private_claim_is_never_a(self):
+        d = self.make("t")
+        receipt(d)                                  # owned, but not claimed private to the owner
+        cls, why = self.classify(d)[0]
+        self.assertEqual(cls, "B")
+        self.assertIn("owned-but-not-claimed-private-needs-ask", why)
+
+    def test_the_shared_target_is_never_a_even_with_a_private_claim(self):
+        shared = rl.HOME / ".cargo/shared-target"
+        ctx = rl.make_ctx(SELF, self.sessions)
+        rec = {"path": str(shared), "kind": "cargo_target", "markers": [], "scan_complete": True,
+               "receipt": {"session_id": SELF, "reproducible": True, "private": True}}
+        self.assertNotEqual(rl.classify(rec, ctx)[0], "A")
 
     def test_unowned_target_is_class_b_not_a(self):
         d = self.make("t")
@@ -208,7 +222,7 @@ class ApplyTests(Fixture):
 
     def test_inventory_writes_private_report_and_manifests(self):
         d = self.make("t")
-        receipt(d)
+        receipt(d, private=True)
         manifest, out = self.inventory_manifest()
         report = next(out.glob("inventory-*.json"))
         self.assertEqual(oct(report.stat().st_mode & 0o777), "0o600")
@@ -220,7 +234,7 @@ class ApplyTests(Fixture):
 
     def test_apply_removes_only_class_a_and_audits_with_measured_delta(self):
         d = self.make("t")
-        receipt(d)
+        receipt(d, private=True)
         manifest, out = self.inventory_manifest()
         code, text = self.run_cli("apply", "--manifest", str(manifest), "--self-session", SELF, "--out", str(out))
         self.assertEqual(code, 0)
@@ -233,7 +247,7 @@ class ApplyTests(Fixture):
 
     def test_dry_run_removes_nothing(self):
         d = self.make("t")
-        receipt(d)
+        receipt(d, private=True)
         manifest, out = self.inventory_manifest()
         self.run_cli("apply", "--manifest", str(manifest), "--self-session", SELF, "--out", str(out), "--dry-run")
         self.assertTrue(d.exists())
@@ -245,7 +259,7 @@ class ApplyTests(Fixture):
         self.assertNotEqual(code, 0)
         self.assertTrue(d.exists())
         c_dir = self.make("c")
-        receipt(c_dir)
+        receipt(c_dir, private=True)
         self.handles = ({str(c_dir)}, True)
         cmanifest, _ = self.inventory_manifest(cls="C", names=("c",))
         code, _ = self.run_cli("apply", "--manifest", str(cmanifest), "--self-session", SELF, "--out", str(out))
@@ -262,7 +276,7 @@ class ApplyTests(Fixture):
 
     def test_resource_that_becomes_active_after_the_manifest_is_skipped(self):
         d = self.make("t")
-        receipt(d)
+        receipt(d, private=True)
         manifest, out = self.inventory_manifest()
         self.handles = ({str(d)}, True)           # a build starts using it
         self.run_cli("apply", "--manifest", str(manifest), "--self-session", SELF, "--out", str(out))
@@ -271,11 +285,11 @@ class ApplyTests(Fixture):
 
     def test_identity_change_after_the_manifest_is_skipped(self):
         d = self.make("t")
-        receipt(d)
+        receipt(d, private=True)
         manifest, out = self.inventory_manifest()
         d2 = self.root / "t_new"
         self.make("t_new")
-        receipt(d2)
+        receipt(d2, private=True)
         import shutil
         shutil.rmtree(d)
         d2.rename(d)                               # same path, different directory
@@ -287,7 +301,7 @@ class ApplyTests(Fixture):
         outside.mkdir()
         (outside / "data").write_text("keep")
         d = self.make("t")
-        receipt(d)
+        receipt(d, private=True)
         manifest, out = self.inventory_manifest()
         import shutil
         shutil.rmtree(d)
@@ -300,7 +314,7 @@ class ApplyTests(Fixture):
         outside.mkdir()
         (outside / "data").write_text("keep")
         d = self.make("t")
-        receipt(d)
+        receipt(d, private=True)
         manifest, out = self.inventory_manifest()
         (d / "late-link").symlink_to(outside)     # appears after the manifest; revalidation sees an escaping link
         self.run_cli("apply", "--manifest", str(manifest), "--self-session", SELF, "--out", str(out))
@@ -309,7 +323,7 @@ class ApplyTests(Fixture):
 
     def test_verify_flags_changed_entries(self):
         d = self.make("t")
-        receipt(d)
+        receipt(d, private=True)
         manifest, _ = self.inventory_manifest()
         self.assertEqual(self.run_cli("verify", "--manifest", str(manifest))[0], 0)
         self.handles = ({str(d)}, True)
@@ -317,7 +331,7 @@ class ApplyTests(Fixture):
 
     def test_manifest_for_a_different_owner_is_refused(self):
         d = self.make("t")
-        receipt(d)
+        receipt(d, private=True)
         manifest, out = self.inventory_manifest()
         code, _ = self.run_cli("apply", "--manifest", str(manifest), "--self-session", OTHER, "--out", str(out))
         self.assertNotEqual(code, 0)
@@ -325,7 +339,7 @@ class ApplyTests(Fixture):
 
     def test_a_comma_separated_owner_list_matches_either_id(self):
         d = self.make("t")
-        receipt(d, session=OTHER)
+        receipt(d, session=OTHER, private=True)
         ctx = rl.make_ctx(SELF + "," + OTHER, self.sessions)
         self.assertEqual(rl.classify(rl.measure(d, "cargo_target", ctx), ctx)[0], "A")
 
