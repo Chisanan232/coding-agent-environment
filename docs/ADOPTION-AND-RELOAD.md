@@ -16,6 +16,7 @@ repository because paths are machine-local. For each checkout the report lists l
 |---|---|---|
 | `ADOPTED` | A project file exists and none of the checks below fire | none |
 | `OVERRIDE_REVIEW` | A project file permits squash merging, uses the three-part branch form, or uses the unparenthesised commit form | read the lines; keep a documented override, otherwise fix in a per-repo ticket and PR |
+| `UNVERIFIED` | A project file was not read: it resolves outside the checkout (a link, or a linked parent directory), exceeds 1 MiB, or is unreadable | inspect it by hand; it is never reported as adopted |
 | `NO_PROJECT_FILE` | No `.claude/CLAUDE.md`, `CLAUDE.md` or `AGENTS.md` | the shared policy applies unchanged; add a file only if the repo needs overrides |
 | `NOT_FOUND` | The mapped path is missing | fix the map; do not guess a checkout |
 

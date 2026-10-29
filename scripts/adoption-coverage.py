@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -25,69 +26,85 @@ from pathlib import Path
 FILES = ('.claude/CLAUDE.md', 'CLAUDE.md', 'AGENTS.md')
 # Legacy commit/PR form: scope without parentheses after an emoji or the placeholder pair.
 LEGACY_FORMAT = re.compile(r'<emoji>\s*<?scope>?\s*:|(?:✨|🐛|♻️|✅|📝|🔧|🔌|🪝|🧭|⬆️|🗑️|🚨)\s+[A-Za-z][\w/-]*:')
-# A clause (split on ; and |) that permits squash merging: it names squash and carries no negation.
+# A clause (split on ; and |) that permits squash merging: it names squash and no negation attaches to it.
 SQUASH = re.compile(r'squash', re.IGNORECASE)
-NEGATION = re.compile(r"\b(?:never|no|not|disabled|forbidden|prohibit\w*|destroy\w*|avoid|don't|without)\b", re.IGNORECASE)
+NEGATION = re.compile(r"\b(?:never|no|not|disabled|forbidden|prohibit\w*|destroy\w*|avoid|don['\u2019]t|without|"
+                      r"instead of|rather than)\b", re.IGNORECASE)
 # Three-part branch form: the ticket is followed directly by the summary, with no <type> segment.
 BRANCH_THREE_PART = re.compile(r'<ticket(?:-?id|-?number)?>/<(?:short|summary)', re.IGNORECASE)
+MAX_BYTES = 1 << 20
 
 
 def permits_squash(clause):
-    """Names squash with no negation in the words just before it or just after it (a wider window would let
-    `squash all PRs (no merge commits)` read as a prohibition)."""
+    """Names squash with no negation attached to it. Negation counts only inside the same sentence and the words
+    right around the term, so `never rebase. Squash all PRs` and `Squash merge, not rebase` still permit, while
+    `never squash`, `squash is disabled` and `instead of squash` do not."""
     for hit in SQUASH.finditer(clause):
-        before, after = clause[max(0, hit.start() - 25):hit.start()], clause[hit.end():hit.end() + 25]
-        if not NEGATION.search(before) and not NEGATION.search(after.split('(')[0]):
+        before = re.split(r'[.!?]', clause[:hit.start()])[-1][-30:]
+        after = re.split(r'[.,(]', clause[hit.end():])[0][:30]
+        if not NEGATION.search(before) and not NEGATION.search(after):
             return True
     return False
 
 
-MAX_BYTES = 1 << 20
-
-
 def scan_file(path):
-    """{lines: [n...]} per finding kind; line numbers only."""
+    """(found, skipped): line numbers per finding kind, or why the file was not scanned. Opens the already
+    resolved path without blocking and only if it is a regular file."""
     found = {'legacy_format': [], 'merge_override': [], 'old_branch_format': []}
     try:
-        with open(path, 'rb') as handle:
-            text = handle.read(MAX_BYTES).decode('utf-8', errors='replace')
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None, 'not a regular file'
+            raw = handle.read(MAX_BYTES + 1)
     except OSError:
-        return None
-    for number, line in enumerate(text.split('\n'), 1):
+        return None, 'unreadable'
+    if len(raw) > MAX_BYTES:
+        return None, 'larger than 1 MiB'
+    for number, line in enumerate(raw.decode('utf-8', errors='replace').split('\n'), 1):
         if LEGACY_FORMAT.search(line):
             found['legacy_format'].append(number)
         if any(permits_squash(c) for c in re.split(r'[;|]', line)):
             found['merge_override'].append(number)
         if BRANCH_THREE_PART.search(line):
             found['old_branch_format'].append(number)
-    return found
+    return found, None
 
 
 def classify(checkout):
     checkout = Path(checkout)
     if not checkout.is_dir():
         return {'path': str(checkout), 'status': 'NOT_FOUND', 'files': {}}
+    root = checkout.resolve()
     git = checkout / '.git'
     kind = 'main checkout' if git.is_dir() else ('linked worktree' if git.exists() else 'not a git checkout')
-    files, flagged = {}, False
+    files, flagged, unverified = {}, False, False
     for name in FILES:
         target = checkout / name
-        if not target.is_file():
+        resolved = target.resolve()
+        if not resolved.is_file():
             continue
-        if target.is_symlink() and not target.resolve().is_relative_to(checkout.resolve()):
-            # Never read through a link that leaves the checkout (it could point at anything).
-            files[name] = {'mtime': target.lstat().st_mtime, 'symlink': True, 'legacy_format': [], 'merge_override': [],
-                           'old_branch_format': [], 'skipped': 'symlink leaves the checkout'}
-            continue
-        found = scan_file(target)
+        entry = {'mtime': resolved.stat().st_mtime, 'symlink': target.is_symlink(), 'legacy_format': [],
+                 'merge_override': [], 'old_branch_format': []}
+        # Every path component counts: a linked parent directory or file that resolves outside the checkout
+        # is not read, because it could point at anything.
+        if not resolved.is_relative_to(root):
+            found, skipped = None, 'resolves outside the checkout'
+        else:
+            found, skipped = scan_file(resolved)
         if found is None:
-            continue
-        files[name] = {'mtime': target.stat().st_mtime, 'symlink': target.is_symlink(), **found}
-        flagged = flagged or any(found[k] for k in found)
+            entry['skipped'] = skipped
+            unverified = True
+        else:
+            entry.update(found)
+            flagged = flagged or any(found.values())
+        files[name] = entry
     if not files:
         status = 'NO_PROJECT_FILE'
     elif flagged:
         status = 'OVERRIDE_REVIEW'
+    elif unverified:
+        status = 'UNVERIFIED'
     else:
         status = 'ADOPTED'
     return {'path': str(checkout), 'checkout': kind, 'status': status, 'files': files}
@@ -117,13 +134,16 @@ def process_matches(pid, started_ms, tolerance=120):
     return 'live' if abs((time.time() - elapsed) - started_ms / 1000) <= tolerance else 'pid-reused'
 
 
-def sessions(directory, instruction_mtime):
+def sessions(directory, instruction_mtime, stats=None):
     rows = []
+    stats = stats if stats is not None else {}
+    stats.setdefault('unparsed', 0)
     for record in sorted(Path(directory).glob('*.json')):
         try:
             data = json.loads(record.read_text())
             pid, cwd, started = int(data['pid']), str(data['cwd']), int(data['startedAt'])
         except (OSError, ValueError, KeyError, TypeError):
+            stats['unparsed'] += 1
             continue
         state = process_matches(pid, started)
         if state != 'live':
@@ -147,8 +167,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     mapping = json.loads(Path(args.map).read_text())
     if not isinstance(mapping, dict) or not all(
-            isinstance(v, list) and v and all(isinstance(p, str) for p in v) for v in mapping.values()):
-        sys.exit('refusing: --map must be {"Product": ["/path", ...]} with a non-empty list of paths per product')
+            isinstance(v, list) and v and all(isinstance(p, str) and os.path.isabs(os.path.expanduser(p)) for p in v)
+            for v in mapping.values()):
+        sys.exit('refusing: --map must be {"Product": ["/abs/path", ...]} with a non-empty list of absolute paths')
     projects = {name: [classify(os.path.realpath(os.path.expanduser(p))) for p in paths] for name, paths in mapping.items()}
     global_mtime = Path(args.global_file).stat().st_mtime if Path(args.global_file).is_file() else 0
     per_cwd = {'*': global_mtime}
@@ -156,10 +177,10 @@ def main(argv=None):
         for row in rows:
             if row['files']:
                 per_cwd[row['path']] = max(global_mtime, max(i['mtime'] for i in row['files'].values()))
-    live = sessions(args.sessions_dir, per_cwd) if Path(args.sessions_dir).is_dir() else []
-    records = len(list(Path(args.sessions_dir).glob('*.json'))) if Path(args.sessions_dir).is_dir() else 0
-    if records and not live:
-        print('note: %d session records, none live and matching; check the record format if this is unexpected' % records,
+    stats = {}
+    live = sessions(args.sessions_dir, per_cwd, stats) if Path(args.sessions_dir).is_dir() else []
+    if stats.get('unparsed'):
+        print('note: %d session records could not be parsed; the record format may have changed' % stats['unparsed'],
               file=sys.stderr)
     result = {'projects': projects, 'sessions': live}
     if args.json:
@@ -173,6 +194,9 @@ def main(argv=None):
                 for kind in ('legacy_format', 'merge_override', 'old_branch_format'):
                     if info[kind]:
                         marks.append('%s %s@%s' % (file_name, kind, ','.join(map(str, info[kind][:5]))))
+            for file_name, info in row['files'].items():
+                if info.get('skipped'):
+                    marks.append('%s not scanned (%s)' % (file_name, info['skipped']))
             print('%-12s %-16s %-15s %s' % (name, row['status'], row.get('checkout', '-'), '; '.join(marks) or '-'))
             print('             %s' % row['path'])
     print('live sessions: %d; reload needed: %d' % (len(live), sum(r['reload'] == 'RELOAD_NEEDED' for r in live)))
