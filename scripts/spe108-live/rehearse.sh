@@ -17,7 +17,7 @@ while [[ $# -gt 0 ]]; do
         --repo) REPO="$2"; shift 2 ;;
         --ledger) LEDGER="$2"; shift 2 ;;
         --mode) MODE="$2"; shift 2 ;;
-        --keep-dir) KEEP="$2"; shift 2 ;;
+        --keep-dir) [[ -n "${2:-}" ]] || { echo "refusing: --keep-dir needs a non-empty path" >&2; exit 2; }; KEEP="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -46,8 +46,9 @@ case "$SIM/" in
         echo "refusing: scratch dir must not be inside the real HOME config or the checkout" >&2; exit 2 ;;
 esac
 mkdir -p "$SIM"
-chmod 700 "$SIM"
+# Check emptiness before touching the mode: an operator-supplied non-empty dir must be left exactly as found.
 [[ -z "$(ls -A "$SIM")" ]] || { echo "scratch dir must be empty" >&2; exit 2; }
+chmod 700 "$SIM"
 BASE="$SIM/.config/coding-agent-environment/local/baseline/claude"
 mkdir -p -m 700 "$SIM/.claude" "$SIM/.codex" "$BASE"
 
