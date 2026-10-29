@@ -38,13 +38,27 @@ BRANCH_THREE_PART = re.compile(r'<ticket(?:-?id|-?number)?>/<(?:short|summary)',
 MAX_BYTES = 1 << 20
 
 
+OTHER_TERM = re.compile(r"\b(?:rebase\w*|merge commits?|force|fast-forward)\b", re.IGNORECASE)
+NEGATION_WORD = r"(?:never|disabled|forbidden|prohibit\w*|destroy\w*|avoid|no|not|don['\u2019]t|without)"
+SAME_SUBJECT = re.compile(r"^(?:it|this|they|squash\w*|" + NEGATION_WORD + r")\b", re.IGNORECASE)
+
+
 def attached_after(after):
-    """The text after `squash` that a strong negation can still be about: up to the first comma or parenthesis, plus a
-    directly following parenthetical that speaks of squash itself (`(it is disabled)`). `Squash all PRs, never merge
-    commits` and `Squash only, rebase disabled` negate another term and must keep permitting."""
-    head = re.split(r'[,(]', after)[0]
-    paren = re.match(r'\(\s*(?:it|this|they|squash\w*)\b[^)]*\)', after[len(head):])
-    return (head + (paren.group(0) if paren else ''))[:80]
+    """The text after `squash` that a strong negation can still be about. A parenthetical is dropped unless it speaks of
+    squash itself (`(it is disabled)`, `(disabled)`); a comma tail is dropped when it opens a new predicate about
+    another merge term (`Squash all PRs, never merge commits`, `Squash merge, avoid rebase`) and kept when it is an
+    aside or a list continuation (`Squash, which is forbidden`, `Squash, rebase and merge commits are disabled`)."""
+    after = re.sub(r"\(([^)]*)\)", lambda m: m.group(0) if SAME_SUBJECT.match(m.group(1).strip()) and not OTHER_TERM.search(m.group(1)) else "", after)
+    head, sep, tail = after.partition(",")
+    if not sep:
+        return after[:80]
+    tail = tail.strip()
+    lead = re.match(r"\S+(?:\s+\S+){0,2}", tail)
+    opens_other = OTHER_TERM.search(lead.group(0)) if lead else None
+    is_list = re.match(r"^[\w\- ]{1,40}\band\b[^,]*\b(?:are|is)\b", tail, re.IGNORECASE) and len(head.split()) <= 2
+    if opens_other and not is_list:
+        return head[:80]
+    return (head + " " + tail)[:80]
 
 
 def permits_squash(clause):
