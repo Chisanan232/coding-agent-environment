@@ -362,7 +362,7 @@ class LiveScripts(unittest.TestCase):
         ledger.write_text("")
         ledger.chmod(0o600)
         script = str(LIVE / "rehearse.sh")
-        for inside in (self.home / ".claude/scratch", self.home / ".codex/scratch", self.home / ".agents/scratch",
+        for inside in (self.home / ".claude/scratch", self.home / ".codex/scratch", self.home / ".agents/scratch", self.home / ".config/coding-agent-environment/local/scratch",
                        self.home, self.repo / "scratch"):
             done = self.run_script("bash", script, "--repo", str(self.repo), "--ledger", str(ledger), "--keep-dir", str(inside), ok=False)
             self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
@@ -375,7 +375,24 @@ class LiveScripts(unittest.TestCase):
         self.assertIn("must not contain ..", dotdot.stderr)
         empty = self.run_script("bash", script, "--repo", str(self.repo), "--ledger", str(ledger), "--keep-dir", "", ok=False)
         self.assertEqual(empty.returncode, 2)
-        self.assertIn("non-empty path", empty.stderr)
+        self.assertIn("not empty or an option", empty.stderr)
+        for odd in (" ", "--mode"):
+            bad = self.run_script("bash", script, "--repo", str(self.repo), "--ledger", str(ledger), "--keep-dir", odd, ok=False)
+            self.assertEqual(bad.returncode, 2, odd)
+
+    def test_rehearse_refuses_an_unreadable_non_empty_dir_without_chmod(self):
+        ledger = Path(self.temp.name) / "e.tsv"
+        ledger.write_text("")
+        ledger.chmod(0o600)
+        shared = Path(self.temp.name) / "locked"
+        shared.mkdir()
+        (shared / "keep.txt").write_text("x")
+        shared.chmod(0o311)
+        self.addCleanup(shared.chmod, 0o755)
+        done = self.run_script("bash", str(LIVE / "rehearse.sh"), "--repo", str(self.repo), "--ledger", str(ledger),
+                               "--keep-dir", str(shared), ok=False)
+        self.assertEqual(done.returncode, 2)
+        self.assertEqual(oct(shared.stat().st_mode & 0o777), "0o311")
 
     def test_rehearse_leaves_a_non_empty_scratch_dir_untouched(self):
         ledger = Path(self.temp.name) / "e.tsv"
