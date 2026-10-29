@@ -58,7 +58,7 @@ KINDS = {
     'ide_cache': (True, 'low: indexes rebuild', True),
     'session_scratch': (False, 'not reproducible: may hold unique QA evidence', False),
     'tmp_tree': (False, 'not reproducible: may hold copies of private files', False),
-    'worktree': (False, 'not reproducible: branch state', False),
+    'worktree': (False, 'not reproducible: branch state', True),
     'unknown': (False, 'unknown', False),
 }
 # Never a deletion root, whatever a consumers file says.
@@ -86,13 +86,18 @@ def default_consumers(tmp=None):
     return spec
 
 
+DU_TIMEOUT = 90
+SCAN_SECONDS = 20
+SCAN_LIMIT = 20000
+
+
 def du_kb(path, apparent=False):
-    """Block (or apparent) kilobytes of one path via du; None on failure or timeout."""
+    """Block (or apparent) kilobytes of one path via du; None on failure or timeout (the record then fails closed)."""
     cmd = ['du', '-sk']
     if apparent:
         cmd.insert(1, '-A' if sys.platform == 'darwin' else '--apparent-size')
     try:
-        out = subprocess.run(cmd + [str(path)], capture_output=True, text=True, timeout=300).stdout.split()
+        out = subprocess.run(cmd + [str(path)], capture_output=True, text=True, timeout=DU_TIMEOUT).stdout.split()
         return int(out[0]) if out else None
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
@@ -106,10 +111,13 @@ def free_bytes(path='/System/Volumes/Data'):
 
 def open_paths():
     """(paths with an open handle or used as a working directory, known). One lsof for everything."""
-    try:
-        out = subprocess.run(['lsof', '-nP', '-w', '-F', 'n'], capture_output=True, text=True, timeout=120).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return set(), False
+    out = ''
+    for timeout in (120, 300):
+        try:
+            out = subprocess.run(['lsof', '-nP', '-w', '-F', 'n'], capture_output=True, text=True, timeout=timeout).stdout
+            break
+        except (OSError, subprocess.TimeoutExpired):
+            continue
     paths = {l[1:] for l in out.splitlines() if l.startswith('n/')}
     return paths, bool(paths)
 
@@ -143,8 +151,11 @@ def live_sessions(sessions_dir):
     return live
 
 
-def scan_markers(root, shallow, limit=200000):
-    """Protective markers and symlink escapes. Shallow kinds look two levels deep only. Returns (markers, complete)."""
+def scan_markers(root, shallow, limit=None, seconds=None):
+    """Protective markers and symlink escapes. Shallow kinds look two levels deep only. Returns (markers, complete);
+    complete is False when the entry or time budget ran out, which classifies the resource C."""
+    limit = SCAN_LIMIT if limit is None else limit
+    deadline = time.monotonic() + (SCAN_SECONDS if seconds is None else seconds)
     markers, count = set(), 0
     root = str(root)
     real_root = os.path.realpath(root)
@@ -158,7 +169,7 @@ def scan_markers(root, shallow, limit=200000):
             continue
         for e in entries:
             count += 1
-            if count > limit:
+            if count > limit or (count % 256 == 0 and time.monotonic() > deadline):
                 return markers, False
             name = e.name
             if name == KEEP_MARKER:
@@ -331,20 +342,36 @@ def discover(consumers):
 
 
 def inventory(args):
+    cores = os.cpu_count() or 1
+    load = os.getloadavg()[0] / cores
+    if load > args.max_load_per_core and not args.force_busy:
+        print('refusing: load per core %.1f > %.1f; an inventory reads a lot of the disk. Retry when the host is calmer '
+              'or pass --force-busy.' % (load, args.max_load_per_core), file=sys.stderr)
+        return 75
     consumers = load_consumers(args.consumers)
+    if args.only:
+        consumers = [c for c in consumers if c[0] in args.only.split(',')]
     ctx = make_ctx(args.self_session, args.sessions_dir)
     before = free_bytes()
-    records = []
-    for kind, hit, real in discover(consumers):
+    records, found = [], discover(consumers)
+    started, partial = time.monotonic(), False
+    for n, (kind, hit, real) in enumerate(found, 1):
+        if time.monotonic() - started > args.max_seconds:
+            partial = True
+            print('stopping: --max-seconds reached after %d of %d resources; the report is partial' % (n - 1, len(found)),
+                  file=sys.stderr)
+            break
+        t0 = time.monotonic()
         rec = measure(hit, kind, ctx)
         rec['class'], rec['reasons'] = classify(rec, ctx)
         records.append(rec)
+        print('[%d/%d] %s %s %.0fs' % (n, len(found), rec['class'], kind, time.monotonic() - t0), file=sys.stderr, flush=True)
     records.sort(key=lambda r: -(r['allocated_bytes'] or 0))
     out = Path(args.out or HOME / '.local/state/coding-agent-environment/gc')
     out.mkdir(parents=True, exist_ok=True, mode=0o700)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     report = {'schema': 1, 'generated': stamp, 'free_bytes': before, 'self_session': args.self_session,
-              'handles_known': ctx['handles_known'], 'resources': records,
+              'handles_known': ctx['handles_known'], 'partial': partial, 'resources': records,
               'note': 'allocated_bytes is an upper bound (APFS clones/shared blocks); only measured free-space change counts as reclaimed'}
     path = out / ('inventory-%s.json' % stamp)
     write_private(path, report)
@@ -510,6 +537,10 @@ def main(argv=None):
     inv.add_argument('--out')
     inv.add_argument('--consumers')
     inv.add_argument('--sessions-dir')
+    inv.add_argument('--only', help='comma separated kinds, e.g. cargo_target,session_scratch')
+    inv.add_argument('--max-seconds', type=int, default=900)
+    inv.add_argument('--max-load-per-core', type=float, default=8.0)
+    inv.add_argument('--force-busy', action='store_true')
     ver = sub.add_parser('verify')
     ver.add_argument('--manifest', required=True)
     ver.add_argument('--out')
