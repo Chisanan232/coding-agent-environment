@@ -266,7 +266,7 @@ class VersionBranches(unittest.TestCase):
                 omg.read_version_policy(ok, True, root)
 
     def test_environment_and_release_names_can_never_be_listed(self):
-        for name in ("staged", "beta", "alpha", "canary", "hotfix/x", "x/staging/y", "v1-prod", "v1.0-release", "deploy"):
+        for name in ("staged", "beta", "alpha", "canary", "hotfix/x", "x/staging/y", "staging-eu", "beta-2", "hotfix-1", "integration/beta-fix", "v1-prod", "v1.0-release", "deploy"):
             bad = {"schema": 1, "repos": {"Chisanan232/r": {"branches": [{"branch": name, "version": "1"}]}}}
             with self.assertRaises(ValueError, msg=name):
                 omg.load_version_policy(bad)

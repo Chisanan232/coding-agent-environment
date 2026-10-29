@@ -39,7 +39,7 @@ OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 DEPLOY_BASES = re.compile(r"(^|/)(prod|production|release|releases|gh-pages|deploy)([-/].*)?$", re.I)
 
 # Environment and release names that must never become an approved integration base, even when an owner lists them.
-POLICY_FORBIDDEN = re.compile(r"(^|/)(staged|staging|beta|alpha|canary|hotfix)(/|$)|[-/._](prod|production|release|releases|deploy)$",
+POLICY_FORBIDDEN = re.compile(r"(^|/)(staged|staging|beta|alpha|canary|hotfix)([-/._].*)?$|[-/._](prod|production|release|releases|deploy)$",
                               re.I)
 VERSION_POLICY_DEFAULT = "~/.config/coding-agent-environment/local/version-branches.json"
 VERSION_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
