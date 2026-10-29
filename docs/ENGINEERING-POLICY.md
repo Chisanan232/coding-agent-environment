@@ -164,10 +164,27 @@ approval. On a self-approval, branch-protection or host denial: record it once, 
 other syntax, and hand over the PR URL, head SHA, local evidence, review verdict and the head-pinned owner merge
 command, then continue other work.
 
-**Release readiness.** `DEVELOPMENT_COMPLETE`, `QA_SIGNED_OFF`, `READY_FOR_RELEASE`, `RELEASE_APPROVED` and
-`RELEASED` stay separate. An unavailable hosted workflow alone does not keep `READY_FOR_RELEASE` false when an
-approved local equivalent satisfies that requirement; missing platform evidence, owner acceptance or required
-security QA still blocks it. Tagging, publication and production deployment need separate authorization.
+**Release readiness.** Nine states stay separate, each reported with its own recorded evidence. A skipped or
+unavailable check is never PASS. `DEVELOPMENT_COMPLETE` and `QA_SIGNED_OFF` are the earlier names of
+`ENGINEERING_COMPLETE` and `INDEPENDENT_QA_SIGNED_OFF`; both spellings mean the same state.
+
+| State | Holds when | Evidence |
+|---|---|---|
+| `ENGINEERING_COMPLETE` | Scoped PRs merged; post-merge main CI (or an approved local equivalent) passed at the exact SHA | producer evidence: PRs, SHAs, CI runs |
+| `FUNCTIONAL_QA_PASS` | Independent QA exercised the acceptance criteria at that SHA | QA report, `docs/QA-HANDOFF.md` |
+| `SECURITY_QA_PASS` | Independent QA ran a real negative control for every security-critical claim and verified artifact provenance | QA report with positive and negative control results |
+| `INDEPENDENT_QA_SIGNED_OFF` | Both QA states PASS at one SHA and artifact set, no open Critical or High finding | signed-off QA verdict naming SHA and digests |
+| `RELEASE_CHECKLIST_PASS` | The `release-readiness` skill checklist is complete for that SHA | checklist with results |
+| `READY_FOR_RELEASE` | All earlier states hold and every owner acceptance item is recorded | the state table itself |
+| `RELEASE_APPROVED` | A durable founder GO record names the exact version, SHA and artifact digests | the record, not an agent summary |
+| `RELEASED` | The authorized path tagged and published, and the published digests match the approved ones | release record |
+
+Any new commit or artifact change invalidates every state above it until requalified. `RELEASE_APPROVED` is
+never inferred from an agent-produced record, an author field, or an approval of a different version, SHA or
+artifact. An unavailable hosted workflow alone does not keep `READY_FOR_RELEASE` false when an approved local
+equivalent satisfies that requirement; missing platform evidence, owner acceptance or required security QA still
+blocks it. Tagging, publication and production deployment need separate authorization, and ordinary engineering
+work never performs them.
 
 **Executable form in this repository.** Two forms of this one policy, neither a second policy:
 `scripts/owner-merge-gate.py --ci-unavailable` (a posted `OWNER-MERGE-CI-UNAVAILABLE` record, see
