@@ -56,11 +56,33 @@ Only with a verified billing, quota or outage cause: run the full local equivale
 `OWNER-MERGE-CI-UNAVAILABLE head=<sha> cause=<billing|quota|outage> local_equivalent=PASS`,
 and pass `--ci-unavailable`. Any genuinely failing check still refuses.
 
+## Version integration branches (Development-Ahead / Sequential Release)
+
+`main` is the protected cumulative release baseline. A founder-approved version integration branch (for example
+`integration/mvp-5.0`, or `mvp-4.0/HORO-2046/integration`) may receive eligible feature PRs before that version ships; future-version
+work never enters `main` early. The gate recognises such a base only when it is listed in an explicit policy file:
+
+```json
+{"schema": 1, "repos": {"Owner/Repo": {"branches": [{"branch": "integration/mvp-5.0", "version": "5.0"}],
+                                       "future_head_prefixes": ["mvp-6.0/"]}}}
+```
+
+- Path: `--version-policy FILE`, else `~/.config/coding-agent-environment/local/version-branches.json` when it exists. It is local, owner-governed,
+  a regular file owned by the caller and not group/world-writable. It lives outside every product repository, so a PR cannot authorize its own
+  base. No file means the previous behaviour (every non-default base is refused).
+- Naming is never inferred; only listed branches count, per repository. A `release`/`prod`/`deploy`/`gh-pages` branch cannot be listed (the
+  policy refuses to load).
+- Listing a base changes one thing: `BASE_NOT_DEFAULT_OR_DEPLOY` no longer applies to it. Exact-head independent review, CI, threads,
+  conflicts, staleness, class and merge-commit rules are evaluated exactly as for `main`.
+- A PR into the default branch whose head is a listed integration branch (or starts with a `future_head_prefixes` entry) is refused with
+  `FUTURE_VERSION_INTO_MAIN`. Promoting an integration branch to `main` is a release step with its own founder GO; this gate never performs it.
+- Adding or removing an entry is a founder decision recorded outside the PR it unblocks.
+
 ## What this does not do
 
 `PASS` means every check GitHub reported on that head passed (at least one succeeded); it cannot know
 which checks a repository should have. It does not approve a PR, satisfy a required formal review, change branch protection, merge
-into a release or deployment branch, or authorize deployment or publication (it cannot see whether merging to the default branch deploys).
+into a release or deployment branch (or promote an integration branch to the default branch), or authorize deployment or publication (it cannot see whether merging to the default branch deploys).
 
 ## Merge decision: ALLOW / ASK / DENY (SPE-118)
 
