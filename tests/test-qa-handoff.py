@@ -297,6 +297,17 @@ class RunTests(Base):
         self.assertTrue(links and all(n == 1 for n in links))             # no hardlinks into the producer's object store
         self.assertFalse((run_dir / "source/.git/config").read_text().count("[remote"))   # no remote to the producer
 
+    def test_a_tree_of_empty_directories_cannot_stall_the_untracked_scan(self):
+        run_dir = self.prepare()
+        base = run_dir / "source/emptytree"
+        for i in range(60):
+            (base / ("d%d" % i)).mkdir(parents=True)
+        manifest = json.loads((run_dir / "tree-manifest.json").read_text())
+        names, truncated = qa.untracked_created(run_dir / "source", manifest, limit=25)
+        self.assertTrue(truncated)
+        names, truncated = qa.untracked_created(run_dir / "source", manifest, limit=10 ** 6, seconds=-1)
+        self.assertTrue(truncated)
+
     def test_product_ticket_and_sha_are_validated(self):
         for bad in ("../x", "/abs", ".hidden", "a b", ""):
             code, _ = self.call("prepare", "--repo", str(self.repo), "--sha", "HEAD", "--ticket", bad, "--product", "prod",
