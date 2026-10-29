@@ -2,6 +2,7 @@
 """Shared development resource lifecycle (SPE-130): evidence-driven inventory, classification and bounded GC.
 
   resource-lifecycle.py inventory --self-session ID[,ID...] [--out DIR] [--consumers FILE] [--sessions-dir DIR]
+  resource-lifecycle.py procs     --self-session ID[,ID...] [--min-cpu PCT] [--min-age-hours H] [--out DIR]
   resource-lifecycle.py verify    --manifest FILE
   resource-lifecycle.py apply     --manifest FILE --self-session ID [--ids a,b] [--dry-run]
 
@@ -529,6 +530,98 @@ def apply(args):
     return 0
 
 
+def etime_to_seconds(text):
+    m = re.fullmatch(r'(?:(?:(\d+)-)?(\d+):)?(\d+):(\d+)', text.strip())
+    if not m:
+        return None
+    d, h, mi, s = (int(g or 0) for g in m.groups())
+    return ((d * 24 + h) * 60 + mi) * 60 + s
+
+
+def process_table():
+    """{pid: {ppid, age_s, cpu, rss_kb, state, comm}} from ps. The command line is never read or stored."""
+    out = subprocess.run(['ps', '-axo', 'pid=,ppid=,etime=,pcpu=,rss=,state=,comm='], capture_output=True, text=True).stdout
+    table = {}
+    for line in out.splitlines():
+        parts = line.split(None, 6)
+        if len(parts) < 7:
+            continue
+        age = etime_to_seconds(parts[2])
+        try:
+            table[int(parts[0])] = {'ppid': int(parts[1]), 'age_s': age, 'cpu': float(parts[3]), 'rss_kb': int(parts[4]),
+                                    'state': parts[5], 'comm': os.path.basename(parts[6])}
+        except ValueError:
+            continue
+    return table
+
+
+def process_cwds(pids):
+    if not pids:
+        return {}
+    try:
+        out = subprocess.run(['lsof', '-a', '-d', 'cwd', '-p', ','.join(map(str, pids)), '-Fpn'], capture_output=True,
+                             text=True, timeout=60).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    cwds, pid = {}, None
+    for line in out.splitlines():
+        if line.startswith('p'):
+            pid = int(line[1:])
+        elif line.startswith('n') and pid is not None:
+            cwds[pid] = line[1:]
+    return cwds
+
+
+def owner_of(pid, table, pid_to_session):
+    """Walk the parent chain to a live session process: (session id or None, 'orphan' | 'session' | 'unknown')."""
+    seen = set()
+    while pid in table and pid not in seen:
+        seen.add(pid)
+        if pid in pid_to_session:
+            return pid_to_session[pid], 'session'
+        pid = table[pid]['ppid']
+        if pid == 1:
+            return None, 'orphan'
+    return None, 'unknown'
+
+
+def procs(args):
+    table = process_table()
+    live = live_sessions(args.sessions_dir or HOME / '.claude/sessions')
+    pid_to_session = {pid: sid for sid, pid in live.items()}
+    own = set(filter(None, args.self_session.split(',')))
+    flagged = {p: r for p, r in table.items() if r['cpu'] >= args.min_cpu and (r['age_s'] or 0) >= args.min_age_hours * 3600}
+    cwds = process_cwds(sorted(flagged))
+    groups = {}
+    for pid, r in flagged.items():
+        sid, how = owner_of(pid, table, pid_to_session)
+        key = (r['ppid'], r['comm'], sid, how)
+        g = groups.setdefault(key, {'ppid': r['ppid'], 'comm': r['comm'], 'owner_session': sid, 'attribution': how,
+                                    'pids': [], 'cpu': 0.0, 'rss_kb': 0, 'oldest_age_s': 0, 'cwd': cwds.get(pid)})
+        g['pids'].append(pid)
+        g['cpu'] += r['cpu']
+        g['rss_kb'] += r['rss_kb']
+        g['oldest_age_s'] = max(g['oldest_age_s'], r['age_s'] or 0)
+    result = []
+    for g in groups.values():
+        # A: descended from this session's own process. B: another live session's. C: orphaned or unknown owner.
+        g['class'] = 'A' if g['owner_session'] in own else ('B' if g['attribution'] == 'session' else 'C')
+        g['pids'].sort()
+        result.append(g)
+    result.sort(key=lambda g: -g['cpu'])
+    out = state_dir(args.out)
+    out.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    write_private(out / ('procs-%s.json' % stamp), {'schema': 1, 'generated': stamp, 'groups': result,
+                                                   'note': 'attribution by parent chain; command lines are never read; nothing is signalled'})
+    print('stale busy processes (>= %.0f%% cpu, >= %.0f h old): %d groups' % (args.min_cpu, args.min_age_hours, len(result)))
+    for g in result:
+        print('  %s %-8s x%-3d %6.0f%% cpu %5.1f GiB  oldest %s  %s  pids %s%s' % (
+            g['class'], g['comm'][:10], len(g['pids']), g['cpu'], g['rss_kb'] / 2 ** 20, '%dh' % (g['oldest_age_s'] // 3600),
+            g['attribution'], ','.join(map(str, g['pids'][:6])), '...' if len(g['pids']) > 6 else ''))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest='cmd', required=True)
@@ -541,6 +634,12 @@ def main(argv=None):
     inv.add_argument('--max-seconds', type=int, default=900)
     inv.add_argument('--max-load-per-core', type=float, default=8.0)
     inv.add_argument('--force-busy', action='store_true')
+    pr = sub.add_parser('procs')
+    pr.add_argument('--self-session', required=True)
+    pr.add_argument('--min-cpu', type=float, default=5.0)
+    pr.add_argument('--min-age-hours', type=float, default=6.0)
+    pr.add_argument('--sessions-dir')
+    pr.add_argument('--out')
     ver = sub.add_parser('verify')
     ver.add_argument('--manifest', required=True)
     ver.add_argument('--out')
@@ -553,7 +652,7 @@ def main(argv=None):
     app.add_argument('--consumers')
     app.add_argument('--dry-run', action='store_true')
     args = parser.parse_args(argv)
-    return {'inventory': inventory, 'verify': verify, 'apply': apply}[args.cmd](args)
+    return {'inventory': inventory, 'verify': verify, 'apply': apply, 'procs': procs}[args.cmd](args)
 
 
 if __name__ == '__main__':
