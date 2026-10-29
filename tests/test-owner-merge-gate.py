@@ -315,6 +315,30 @@ class VersionBranches(unittest.TestCase):
                 with self.assertRaises(ValueError, msg=f):
                     omg.read_version_policy(f, True, root)
 
+    def test_codex_review_findings_spe_132(self):
+        import os, tempfile
+        def listed(name):
+            return {"schema": 1, "repos": {"Chisanan232/r": {"branches": [{"branch": name, "version": "1"}]}}}
+        for name in ("integration/.hidden/bar", "integration/x.lock/y", "integration/trailing.", "integration/betafix",
+                     "stagingeu", "integration/stg2", "uatx", "preprod1", "StG", "STAGE", "integration/stg/x"):
+            with self.assertRaises(ValueError, msg=name):
+                omg.load_version_policy(listed(name))
+        for name in ("integration/mvp-5.0", "mvp-4.0/HORO-2046/integration", "mvp-5.0/integration", "integration/liveness-fix"):
+            omg.load_version_policy(listed(name))
+        pre = {"schema": 1, "repos": {"Chisanan232/r": {"branches": [], "future_head_prefixes": ["mvp-6.0/", ".x/"]}}}
+        with self.assertRaises(ValueError):
+            omg.load_version_policy(pre)
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(os.path.realpath(d), "local")
+            os.mkdir(root, 0o700)
+            real = os.path.join(root, "real.json")
+            pathlib.Path(real).write_text(json.dumps(POLICY))
+            os.chmod(real, 0o600)
+            link = os.path.join(root, "link.json")
+            os.symlink(real, link)
+            with self.assertRaises(ValueError):
+                omg.read_version_policy(link, True, root)
+
     def test_malformed_policy_fails_closed(self):
         for bad in ({}, {"schema": 2, "repos": {}}, {"schema": 1, "repos": {"x": {"branches": [{"branch": "../x"}]}}},
                     {"schema": 1, "repos": {"Chisanan232/r": {"branches": "integration/mvp-5.0"}}}):

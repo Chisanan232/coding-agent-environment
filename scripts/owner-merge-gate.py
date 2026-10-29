@@ -39,8 +39,11 @@ OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 DEPLOY_BASES = re.compile(r"(^|/)(prod|production|release|releases|gh-pages|deploy)([-/].*)?$", re.I)
 
 # Environment and release names that must never become an approved integration base, even when an owner lists them.
-POLICY_FORBIDDEN = re.compile(r"(^|/)(staged?|staging|stg|beta|alpha|canary|hotfix|uat|qa|live|preprod)([-/._].*)?$|[-/._](prod|production|release|releases|deploy|stage|stg|uat|live)$",
-                              re.I)
+# Environment words: a path segment that merely starts with one is refused (stagingeu, betafix, stg2), as are the short
+# words qa/live as whole segment prefixes and names ending in an environment suffix. Deliberately over-broad and
+# fail-closed; an owner renames a legitimate branch instead of listing it.
+POLICY_FORBIDDEN = re.compile(r"(^|/)(staged?|staging|stg|beta|alpha|canary|hotfix|uat|preprod)|(^|/)(qa|live)([-/._].*)?$"
+                              r"|[-/._](prod|production|release|releases|deploy|stage|stg|uat|live)$", re.I)
 POLICY_MAX_BYTES = 65536
 
 
@@ -53,6 +56,15 @@ def _no_duplicate_keys(pairs):
 
 VERSION_POLICY_DEFAULT = "~/.config/coding-agent-environment/local/version-branches.json"
 VERSION_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+
+
+def bad_ref_parts(name, prefix=False):
+    """True when a path component could not be part of a valid git ref (empty, leading dot, trailing dot, `.lock`).
+    A prefix may end with one slash."""
+    parts = name.split("/")
+    if prefix and parts[-1] == "":
+        parts = parts[:-1]
+    return any(p == "" or p.startswith(".") or p.endswith(".") or p.endswith(".lock") for p in parts)
 
 
 def load_version_policy(obj):
@@ -72,7 +84,7 @@ def load_version_policy(obj):
             raise ValueError(f"version policy branches for {repo} must be a list")
         for b in entry["branches"]:
             name = b.get("branch") if isinstance(b, dict) else None
-            if not isinstance(name, str) or not VERSION_REF_RE.fullmatch(name) or ".." in name or "//" in name or name.endswith(("/", ".lock")):
+            if not isinstance(name, str) or not VERSION_REF_RE.fullmatch(name) or ".." in name or bad_ref_parts(name) or name.endswith("/"):
                 raise ValueError(f"version policy branch {name!r} for {repo} is malformed")
             if DEPLOY_BASES.search(name) or POLICY_FORBIDDEN.search(name):
                 raise ValueError(f"version policy branch {name!r} for {repo} is a deployment/release base and cannot be approved")
@@ -81,7 +93,7 @@ def load_version_policy(obj):
         if not isinstance(pres, list):
             raise ValueError(f"version policy future_head_prefixes for {repo} must be a list")
         for pre in pres:
-            if not isinstance(pre, str) or not VERSION_REF_RE.fullmatch(pre) or ".." in pre or "//" in pre:
+            if not isinstance(pre, str) or not VERSION_REF_RE.fullmatch(pre) or ".." in pre or bad_ref_parts(pre, prefix=True):
                 raise ValueError(f"version policy prefix {pre!r} for {repo} is malformed")
             prefixes.append(pre)
         if repo.lower() in out:
@@ -99,6 +111,8 @@ def read_version_policy(path, required, root=None):
     import stat
     root = os.path.realpath(os.path.expanduser(root or os.path.dirname(VERSION_POLICY_DEFAULT)))
     full = os.path.expanduser(path)
+    if os.path.islink(full):
+        raise ValueError("version policy must be the file itself, not a symlink")
     real = os.path.realpath(full)
     if os.path.commonpath([root, real]) != root:
         raise ValueError(f"version policy must live under {root}")
