@@ -32,17 +32,31 @@ NEGATION = re.compile(r"\b(?:never|no|not|disabled|forbidden|prohibit\w*|destroy
 BRANCH_THREE_PART = re.compile(r'<ticket(?:-?id|-?number)?>/<(?:short|summary)', re.IGNORECASE)
 
 
+def permits_squash(clause):
+    """Names squash with no negation in the words just before it or just after it (a wider window would let
+    `squash all PRs (no merge commits)` read as a prohibition)."""
+    for hit in SQUASH.finditer(clause):
+        before, after = clause[max(0, hit.start() - 25):hit.start()], clause[hit.end():hit.end() + 25]
+        if not NEGATION.search(before) and not NEGATION.search(after.split('(')[0]):
+            return True
+    return False
+
+
+MAX_BYTES = 1 << 20
+
+
 def scan_file(path):
     """{lines: [n...]} per finding kind; line numbers only."""
     found = {'legacy_format': [], 'merge_override': [], 'old_branch_format': []}
     try:
-        text = path.read_text(encoding='utf-8', errors='replace')
+        with open(path, 'rb') as handle:
+            text = handle.read(MAX_BYTES).decode('utf-8', errors='replace')
     except OSError:
         return None
     for number, line in enumerate(text.split('\n'), 1):
         if LEGACY_FORMAT.search(line):
             found['legacy_format'].append(number)
-        if any(SQUASH.search(c) and not NEGATION.search(c) for c in re.split(r'[;|]', line)):
+        if any(permits_squash(c) for c in re.split(r'[;|]', line)):
             found['merge_override'].append(number)
         if BRANCH_THREE_PART.search(line):
             found['old_branch_format'].append(number)
@@ -60,11 +74,15 @@ def classify(checkout):
         target = checkout / name
         if not target.is_file():
             continue
-        symlink = target.is_symlink()
+        if target.is_symlink() and not target.resolve().is_relative_to(checkout.resolve()):
+            # Never read through a link that leaves the checkout (it could point at anything).
+            files[name] = {'mtime': target.lstat().st_mtime, 'symlink': True, 'legacy_format': [], 'merge_override': [],
+                           'old_branch_format': [], 'skipped': 'symlink leaves the checkout'}
+            continue
         found = scan_file(target)
         if found is None:
             continue
-        files[name] = {'mtime': int(target.stat().st_mtime), 'symlink': symlink, **found}
+        files[name] = {'mtime': target.stat().st_mtime, 'symlink': target.is_symlink(), **found}
         flagged = flagged or any(found[k] for k in found)
     if not files:
         status = 'NO_PROJECT_FILE'
@@ -111,6 +129,7 @@ def sessions(directory, instruction_mtime):
         if state != 'live':
             continue
         # Longest project path that contains the session's cwd, else the global file alone.
+        cwd = os.path.realpath(cwd)
         owner = max((p for p in instruction_mtime if p != '*' and (cwd == p or cwd.startswith(p + '/'))), key=len, default='*')
         stale = started / 1000 < instruction_mtime[owner]
         rows.append({'pid': pid, 'cwd': cwd, 'status': data.get('status', '?'),
@@ -127,14 +146,21 @@ def main(argv=None):
     parser.add_argument('--json', action='store_true')
     args = parser.parse_args(argv)
     mapping = json.loads(Path(args.map).read_text())
-    projects = {name: [classify(p) for p in paths] for name, paths in mapping.items()}
-    global_mtime = int(Path(args.global_file).stat().st_mtime) if Path(args.global_file).is_file() else 0
+    if not isinstance(mapping, dict) or not all(
+            isinstance(v, list) and v and all(isinstance(p, str) for p in v) for v in mapping.values()):
+        sys.exit('refusing: --map must be {"Product": ["/path", ...]} with a non-empty list of paths per product')
+    projects = {name: [classify(os.path.realpath(os.path.expanduser(p))) for p in paths] for name, paths in mapping.items()}
+    global_mtime = Path(args.global_file).stat().st_mtime if Path(args.global_file).is_file() else 0
     per_cwd = {'*': global_mtime}
     for rows in projects.values():
         for row in rows:
             if row['files']:
                 per_cwd[row['path']] = max(global_mtime, max(i['mtime'] for i in row['files'].values()))
     live = sessions(args.sessions_dir, per_cwd) if Path(args.sessions_dir).is_dir() else []
+    records = len(list(Path(args.sessions_dir).glob('*.json'))) if Path(args.sessions_dir).is_dir() else 0
+    if records and not live:
+        print('note: %d session records, none live and matching; check the record format if this is unexpected' % records,
+              file=sys.stderr)
     result = {'projects': projects, 'sessions': live}
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))

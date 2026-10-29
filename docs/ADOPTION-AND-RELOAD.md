@@ -30,7 +30,8 @@ product repository is its own ticket, branch and PR in that repository.
 The same command lists live Claude sessions. It reads each session record (pid, working directory, start time), confirms
 the pid is alive and is the same process by start time (a reused pid is ignored), and never reads a process command line or
 a session name. A session is `RELOAD_NEEDED` when it started before the newest of the global file or its project file last
-changed.
+changed. Only checkouts listed in the map contribute a project file; a session in an unmapped repository is judged
+against the global file alone.
 
 ## Reload without losing work
 
