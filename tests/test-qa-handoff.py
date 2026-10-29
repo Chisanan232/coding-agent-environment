@@ -39,8 +39,19 @@ sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=Tru
 verdict = json.loads(open(d + "/verdict").read().replace("@SHA@", sha))
 if mode == "dirty":
     open("tracked.txt", "a").write("modified by QA")
+if mode == "fsmonitor":     # QA tries to make the wrapper's later git run execute a command
+    open(".git/config", "a").write("\n[core]\n\tfsmonitor = touch " + d + "/CANARY\n")
+    open(".git/info/attributes", "a").write("* filter=evil\n")
+    open(".git/config", "a").write("[filter \"evil\"]\n\tclean = touch " + d + "/CANARY2\n")
+if mode == "linkverdict":
+    open(d + "/decoy.json", "w").write(json.dumps(verdict))
+    out = argv[argv.index("-o") + 1]
+    os.symlink(d + "/decoy.json", out)
+if mode == "headmove":
+    open(".git/HEAD", "w").write("0" * 40 + "\n")
 out = argv[argv.index("-o") + 1]
-open(out, "w").write(json.dumps(verdict))
+if mode != "linkverdict":
+    open(out, "w").write(json.dumps(verdict))
 if mode != "nocommands":
     print(json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": "x"}}))
     print(json.dumps({"type": "item.completed", "item": {"type": "command_execution", "command": "x", "exit_code": 0}}))
@@ -191,6 +202,23 @@ class RunTests(Base):
         self.assertIn("WAITING_RESOURCE", out)
         self.assertFalse((self.fake_dir / "seen.json").exists())
 
+    def test_a_run_directory_cannot_be_run_twice(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_qa(run_dir)[0], 0)
+        code, _ = self.run_qa(run_dir)
+        self.assertNotEqual(code, 0)
+
+    def test_wrapper_owned_inputs_live_outside_the_qa_writable_roots(self):
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        for name in ("prompt.txt", "verdict.schema.json", "tree-manifest.json", "packet.json", "RUNMETA.json"):
+            self.assertTrue((run_dir / name).is_file(), name)
+        argv = self.seen()["argv"]
+        writable = [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"] + [argv[argv.index("-C") + 1]]
+        for name in ("prompt.txt", "verdict.schema.json", "tree-manifest.json", "packet.json"):
+            self.assertNotIn(str(run_dir), writable)                      # the run directory itself is not a writable root
+            self.assertFalse(any(str(run_dir / name).startswith(w + "/") for w in writable), name)
+
     def test_modified_clone_before_the_run_is_invalid_and_codex_is_not_started(self):
         run_dir = self.prepare()
         (run_dir / "source/tracked.txt").write_text("edited")
@@ -262,6 +290,22 @@ class VerdictTests(Base):
 
     def test_qa_that_modifies_a_tracked_file_is_invalid(self):
         self.assertEqual(self.outcome(verdict(), mode="dirty")[0], 12)
+
+    def test_qa_cannot_make_the_wrapper_execute_git_config(self):
+        code, out, run_dir = self.outcome(verdict(), mode="fsmonitor")
+        self.assertFalse((self.fake_dir / "CANARY").exists())            # core.fsmonitor never ran
+        self.assertFalse((self.fake_dir / "CANARY2").exists())           # the filter driver never ran
+        self.assertIn(code, (0, 12))                                      # evaluated from files only
+
+    def test_planting_a_symlink_as_the_verdict_is_invalid_and_never_read(self):
+        code, out, _ = self.outcome(verdict(), mode="linkverdict")
+        self.assertEqual(code, 12)
+        self.assertIn("not a regular file", out)
+
+    def test_qa_moving_head_in_the_clone_is_invalid(self):
+        code, out, _ = self.outcome(verdict(), mode="headmove")
+        self.assertEqual(code, 12)
+        self.assertIn("HEAD", out)
 
     def test_verdict_edited_after_the_run_is_detected(self):
         code, _, run_dir = self.outcome(verdict(verified=[{"check": "AC1", "result": "FAIL", "evidence": "x"}]))
