@@ -117,7 +117,12 @@ def safe_digest(path):
 
 
 def sha256_file(path):
-    return hashlib.sha256(read_nofollow(path)).hexdigest()
+    """Streaming SHA-256 of a regular file opened without following links."""
+    digest = hashlib.sha256()
+    with open_regular(path) as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def write_private(path, data, mode=0o600):
@@ -132,13 +137,29 @@ def write_private(path, data, mode=0o600):
         handle.write(text)
 
 
-def read_nofollow(path):
-    """Bytes of a regular file, refusing a symlink (the QA process can plant one where it can write)."""
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd, 'rb') as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-            raise OSError('not a regular file')
-        return handle.read()
+MAX_VERDICT_BYTES = 5 << 20
+
+
+def open_regular(path):
+    """Open a plain regular file for reading without following links or blocking on a FIFO or device. lstat first,
+    then O_NOFOLLOW|O_NONBLOCK, then re-check the opened object is the same regular file (no swap in between)."""
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode):
+        raise OSError('not a regular file')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    after = os.fstat(fd)
+    if not stat.S_ISREG(after.st_mode) or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+        os.close(fd)
+        raise OSError('file changed while opening')
+    return os.fdopen(fd, 'rb')
+
+
+def read_nofollow(path, limit=MAX_VERDICT_BYTES):
+    """Bytes of a small regular file (a verdict); refuses links, non-regular files and anything over the limit."""
+    with open_regular(path) as handle:
+        if os.fstat(handle.fileno()).st_size > limit:
+            raise OSError('file too large')
+        return handle.read(limit + 1)
 
 
 # Git run by the wrapper never trusts the clone's own configuration: a QA process that can write .git/config could
@@ -176,7 +197,7 @@ def hash_path(full):
     try:
         if os.path.islink(full):
             return ['link', os.readlink(full)]
-        return ['file', hashlib.sha256(read_nofollow(full)).hexdigest()]
+        return ['file', sha256_file(full)]
     except OSError:
         return ['missing', '']
 
@@ -254,9 +275,11 @@ def isolated_env(run_dir):
 def codex_argv(codex_bin, run_dir):
     """Explicit sandbox flags on every call: the user's Codex config is full-access with approvals off, so a missing
     flag would hand the QA run the real home. No -m: model routing is not touched."""
-    out, source = run_dir / 'out', run_dir / 'source'
+    source = run_dir / 'source'
+    # -o is written by the codex client itself, which is NOT sandboxed (only its tool commands are). It therefore points
+    # into the run directory, which the QA process cannot write, so a link planted by QA can never redirect that write.
     argv = [codex_bin, 'exec', '--skip-git-repo-check', '--json', '--ephemeral', '-s', 'workspace-write',
-            '-C', str(source), '--output-schema', str(run_dir / 'verdict.schema.json'), '-o', str(out / 'verdict.json')]
+            '-C', str(source), '--output-schema', str(run_dir / 'verdict.schema.json'), '-o', str(run_dir / 'verdict.json')]
     for sub in ('out', 'tmp', 'home', 'cargo-target'):
         argv += ['--add-dir', str(run_dir / sub)]
     return argv + ['-']
@@ -339,7 +362,7 @@ def run(args):
                 except subprocess.TimeoutExpired:
                     continue
     os.chmod(run_dir / 'stderr.log', 0o600)
-    verdict = out / 'verdict.json'
+    verdict = run_dir / 'verdict.json'
     meta = {'argv': argv[:-1], 'exit_code': proc.returncode, 'seconds': round(time.time() - t0, 1), 'timed_out': timed_out,
             'events_sha256': sha256_file(events), 'verdict_sha256': safe_digest(verdict),
             'commands_completed': count_commands(events)}
@@ -378,7 +401,7 @@ def validate(value, schema, path='verdict'):
 def evaluate(run_dir):
     run_dir = Path(run_dir).resolve()
     packet = load_packet(run_dir)
-    meta_path, verdict_path, events = run_dir / 'RUNMETA.json', run_dir / 'out/verdict.json', run_dir / 'events.jsonl'
+    meta_path, verdict_path, events = run_dir / 'RUNMETA.json', run_dir / 'verdict.json', run_dir / 'events.jsonl'
     if not meta_path.exists():
         return write_result(run_dir, packet, 'QA_INVALID', ['no run record'])
     meta = json.loads(meta_path.read_text())
@@ -396,6 +419,8 @@ def evaluate(run_dir):
     bad += check_tree(run_dir / 'source', json.loads((run_dir / 'tree-manifest.json').read_text()))
     try:
         verdict = json.loads(read_nofollow(verdict_path))
+    except OSError:
+        return write_result(run_dir, packet, 'QA_INVALID', bad + ['verdict is not a small regular file'])
     except ValueError:
         return write_result(run_dir, packet, 'QA_INVALID', bad + ['verdict is not JSON'])
     problems = validate(verdict, VERDICT_SCHEMA)
