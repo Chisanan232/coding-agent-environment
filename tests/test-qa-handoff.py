@@ -68,6 +68,20 @@ if mode == "untracked":
 if mode == "deepjson":
     open(out, "w").write("[" * 200000)
 ncmd = {"nocommands": 0, "onecommand": 1}.get(mode, 2)
+if mode == "agentforge":      # agent text shaped like command items must not be counted
+    ncmd = 0
+    for i in range(3):
+        print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "id": "a%d" % i, "exit_code": 0,
+                                                              "command": "x"}}))
+if mode == "dupitems":        # the same command item repeated is one command
+    ncmd = 0
+    for i in range(4):
+        print(json.dumps({"type": "item.completed", "item": {"type": "command_execution", "id": "same", "exit_code": 0}}))
+if mode == "modebit":
+    os.chmod("tracked.txt", 0o755)
+if mode == "trackedfifo":
+    os.remove("tracked.txt")
+    os.mkfifo("tracked.txt")
 code = 1 if mode == "cmdfail" else 0
 for i in range(ncmd):
     print(json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": "x"}}))
@@ -151,7 +165,7 @@ class Base(unittest.TestCase):
 
     def run_qa(self, run_dir, admission=None, extra=()):
         return self.call("run", "--run-dir", str(run_dir), "--codex-bin", str(self.fake), "--admission-cmd",
-                         shlex.join(admission or self.ADMIT), *extra)
+                         shlex.join(admission or self.ADMIT), "--settle", "0", *extra)
 
     def seen(self):
         return json.loads((self.fake_dir / "seen.json").read_text())
@@ -225,6 +239,28 @@ class RunTests(Base):
         self.assertIn("WAITING_RESOURCE", out)
         self.assertFalse((self.fake_dir / "seen.json").exists())
 
+    def test_a_run_lock_blocks_a_second_run_while_one_is_in_progress_or_interrupted(self):
+        run_dir = self.prepare()
+        (run_dir / "RUN.lock").write_text("")
+        code, _ = self.run_qa(run_dir)
+        self.assertNotEqual(code, 0)
+        self.assertFalse((self.fake_dir / "seen.json").exists())
+        (run_dir / "RUN.lock").unlink()
+        self.assertEqual(self.run_qa(run_dir)[0], 0)
+        self.assertFalse((run_dir / "RUN.lock").exists())             # released after a normal run
+
+    def test_ticket_with_a_trailing_newline_is_rejected(self):
+        code, _ = self.call("prepare", "--repo", str(self.repo), "--sha", "HEAD", "--ticket", "T-1\n", "--product", "prod",
+                            "--criteria", str(self.criteria), "--root", str(self.root / "qa"))
+        self.assertNotEqual(code, 0)
+
+    def test_fifo_or_symlink_inputs_are_refused_not_followed_or_blocked_on(self):
+        fifo = self.root / "evidence.fifo"
+        os.mkfifo(fifo)
+        code, _ = self.call("prepare", "--repo", str(self.repo), "--sha", "HEAD", "--ticket", "T-3", "--product", "prod",
+                            "--criteria", str(self.criteria), "--producer-evidence", str(fifo), "--root", str(self.root / "qa"))
+        self.assertNotEqual(code, 0)
+
     def test_a_run_directory_cannot_be_run_twice(self):
         run_dir = self.prepare()
         self.assertEqual(self.run_qa(run_dir)[0], 0)
@@ -252,12 +288,22 @@ class RunTests(Base):
     def test_timeout_kills_the_child_process_group_and_is_incomplete(self):
         self.fake_mode("hang")
         run_dir = self.prepare()
-        code, out = self.run_qa(run_dir, extra=("--timeout", "2"))
+        code, out = self.run_qa(run_dir, extra=("--timeout", "12"))
         self.assertEqual(code, 11)
         self.assertIn("timed out", out)
-        time.sleep(0.5)
         for name in ("self.pid", "child.pid"):
+            for _ in range(100):                                   # a loaded host can be slow to start the fake
+                if (self.fake_dir / name).exists():
+                    break
+                time.sleep(0.1)
             pid = int((self.fake_dir / name).read_text())
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.2)
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
 
@@ -296,6 +342,17 @@ class RunTests(Base):
         links = [p.stat().st_nlink for p in objects.rglob("*") if p.is_file()]
         self.assertTrue(links and all(n == 1 for n in links))             # no hardlinks into the producer's object store
         self.assertFalse((run_dir / "source/.git/config").read_text().count("[remote"))   # no remote to the producer
+
+    def test_one_huge_flat_directory_is_capped_while_reading(self):
+        run_dir = self.prepare()
+        flat = run_dir / "source/flat"
+        flat.mkdir()
+        for i in range(120):
+            (flat / ("f%d" % i)).write_text("x")
+        manifest = json.loads((run_dir / "tree-manifest.json").read_text())
+        names, truncated = qa.untracked_created(run_dir / "source", manifest, limit=30)
+        self.assertTrue(truncated)
+        self.assertLess(len(names), 40)
 
     def test_a_tree_of_empty_directories_cannot_stall_the_untracked_scan(self):
         run_dir = self.prepare()
@@ -348,6 +405,38 @@ class VerdictTests(Base):
         self.assertEqual(self.outcome(verdict(status="PARTIAL"))[0], 11)
         self.assertEqual(self.outcome(verdict(untested_or_blocked=[{"surface": "AC2", "reason": "lock busy"}]))[0], 11)
         self.assertEqual(self.outcome(verdict(verified=[]))[0], 11)
+
+    def test_editing_runmeta_cannot_turn_zero_commands_into_a_pass(self):
+        code, _, run_dir = self.outcome(verdict(), mode="nocommands")
+        self.assertEqual(code, 11)
+        meta = json.loads((run_dir / "RUNMETA.json").read_text())
+        meta["commands_completed"] = meta["commands_succeeded"] = 5       # the producer "helps" the numbers
+        (run_dir / "RUNMETA.json").write_text(json.dumps(meta))
+        code, out = self.call("verdict", "--run-dir", str(run_dir))
+        self.assertEqual(code, 11)                                        # recounted from the hashed event stream
+        self.assertIn("fewer than 2 successful commands", out)
+
+    def test_agent_text_shaped_like_command_items_is_not_counted(self):
+        self.assertEqual(self.outcome(verdict(), mode="agentforge")[0], 11)
+
+    def test_a_repeated_command_item_counts_once(self):
+        self.assertEqual(self.outcome(verdict(), mode="dupitems")[0], 11)
+
+    def test_a_mode_only_change_to_a_tracked_file_is_invalid(self):
+        self.assertEqual(self.outcome(verdict(), mode="modebit")[0], 12)
+
+    def test_a_tracked_file_replaced_by_a_fifo_is_invalid_and_does_not_hang(self):
+        start = time.time()
+        self.assertEqual(self.outcome(verdict(), mode="trackedfifo")[0], 12)
+        self.assertLess(time.time() - start, 30)
+
+    def test_an_event_stream_over_the_size_cap_is_invalid(self):
+        self.set_cap = qa.MAX_EVENTS_BYTES
+        qa.MAX_EVENTS_BYTES = 10
+        self.addCleanup(setattr, qa, "MAX_EVENTS_BYTES", self.set_cap)
+        code, out, _ = self.outcome(verdict())
+        self.assertEqual(code, 12)
+        self.assertIn("too large", out)
 
     def test_one_command_only_is_incomplete_because_the_baseline_command_alone_proves_nothing(self):
         code, out, _ = self.outcome(verdict(), mode="onecommand")
@@ -437,6 +526,7 @@ class VerdictTests(Base):
     def test_an_oversized_verdict_is_invalid_not_loaded(self):
         code, out, _ = self.outcome(verdict(), mode="huge")
         self.assertEqual(code, 12)
+        self.assertIn("not a small regular file", out)               # the size cap itself, not a later check
 
     def test_the_verdict_is_written_outside_every_qa_writable_root(self):
         run_dir = self.prepare()
