@@ -37,6 +37,7 @@ import json
 import os
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -105,26 +106,94 @@ def now():
     return datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
 
 
+def safe_digest(path):
+    """Digest of a regular file, 'ABSENT' if missing, 'UNREADABLE' if it is a link or otherwise not a plain file."""
+    if not os.path.lexists(path):
+        return 'ABSENT'
+    try:
+        return sha256_file(path)
+    except OSError:
+        return 'UNREADABLE'
+
+
 def sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, 'rb') as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b''):
-            h.update(chunk)
-    return h.hexdigest()
+    return hashlib.sha256(read_nofollow(path)).hexdigest()
 
 
 def write_private(path, data, mode=0o600):
+    """Create or replace a wrapper-owned file without ever following a link: unlink first, then exclusive create."""
     text = data if isinstance(data, str) else json.dumps(data, indent=2, sort_keys=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
     with os.fdopen(fd, 'w') as handle:
         handle.write(text)
 
 
+def read_nofollow(path):
+    """Bytes of a regular file, refusing a symlink (the QA process can plant one where it can write)."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError('not a regular file')
+        return handle.read()
+
+
+# Git run by the wrapper never trusts the clone's own configuration: a QA process that can write .git/config could
+# otherwise make `git status` execute a command (core.fsmonitor, filter drivers) outside the sandbox. After the QA
+# run the wrapper does not run git against the clone at all; see check_tree.
+SAFE_GIT = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.pager=cat',
+            '-c', 'protocol.ext.allow=never', '-c', 'core.untrackedCache=false']
+
+
 def git(repo, *args, check=True):
-    done = subprocess.run(['git', '-C', str(repo)] + list(args), capture_output=True, text=True, timeout=300)
+    env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
+           'GIT_OPTIONAL_LOCKS': '0', 'GIT_TERMINAL_PROMPT': '0', 'HOME': '/nonexistent'}
+    done = subprocess.run(['git', '-C', str(repo)] + SAFE_GIT + list(args), capture_output=True, text=True, timeout=300,
+                          env=env)
     if check and done.returncode != 0:
         raise SystemExit('git %s failed: %s' % (args[0], done.stderr.strip()[:200]))
     return done
+
+
+def tree_manifest(source):
+    """{path: [kind, digest]} for every tracked path at HEAD, hashed from the working tree without executing git
+    config. Taken at prepare time from the fresh clone, which is trusted."""
+    listing = git(source, 'ls-tree', '-r', '-z', 'HEAD').stdout
+    manifest = {}
+    for entry in filter(None, listing.split('\0')):
+        meta, path = entry.split('\t', 1)
+        mode = meta.split()[0]
+        if mode == '160000':
+            continue
+        manifest[path] = hash_path(Path(source) / path)
+    return manifest
+
+
+def hash_path(full):
+    try:
+        if os.path.islink(full):
+            return ['link', os.readlink(full)]
+        return ['file', hashlib.sha256(read_nofollow(full)).hexdigest()]
+    except OSError:
+        return ['missing', '']
+
+
+def check_tree(source, manifest):
+    """Problems found comparing the clone to the manifest; reads files and .git/HEAD only, executes nothing."""
+    problems = []
+    try:
+        head = read_nofollow(Path(source) / '.git/HEAD').decode().strip()
+    except OSError:
+        head = ''
+    if head != manifest['__head__']:
+        problems.append('HEAD of the pinned clone moved off the packet SHA')
+    changed = [p for p, want in manifest['files'].items() if hash_path(Path(source) / p) != want]
+    if changed:
+        problems.append('tracked files changed in the pinned clone: %s' % ', '.join(sorted(changed)[:5]))
+    return problems
 
 
 def packet_digest(packet):
@@ -159,6 +228,7 @@ def prepare(args):
     subprocess.run(['git', 'clone', '--local', '--no-checkout', '-q', str(repo), str(source)], check=True,
                    capture_output=True, timeout=600)
     git(source, 'checkout', '-q', '--detach', sha)
+    write_private(run_dir / 'tree-manifest.json', {'__head__': sha, 'files': tree_manifest(source)})
     packet = {'schema': 1, 'product': args.product, 'ticket': args.ticket, 'repo': str(repo), 'sha': sha,
               'created': now(), 'criteria': Path(args.criteria).read_text(),
               'producer_evidence': read_optional(args.producer_evidence), 'qa_notes': read_optional(args.qa_notes)}
@@ -186,7 +256,7 @@ def codex_argv(codex_bin, run_dir):
     flag would hand the QA run the real home. No -m: model routing is not touched."""
     out, source = run_dir / 'out', run_dir / 'source'
     argv = [codex_bin, 'exec', '--skip-git-repo-check', '--json', '--ephemeral', '-s', 'workspace-write',
-            '-C', str(source), '--output-schema', str(out / 'verdict.schema.json'), '-o', str(out / 'verdict.json')]
+            '-C', str(source), '--output-schema', str(run_dir / 'verdict.schema.json'), '-o', str(out / 'verdict.json')]
     for sub in ('out', 'tmp', 'home', 'cargo-target'):
         argv += ['--add-dir', str(run_dir / sub)]
     return argv + ['-']
@@ -230,17 +300,22 @@ def run(args):
     run_dir = Path(args.run_dir).resolve()
     packet = load_packet(run_dir)
     source = run_dir / 'source'
-    head = git(source, 'rev-parse', 'HEAD').stdout.strip()
-    if head != packet['sha'] or git(source, 'status', '--porcelain', '--untracked-files=no').stdout.strip():
-        return write_result(run_dir, packet, 'QA_INVALID', ['pinned clone is not at the packet SHA or is modified'])
+    if (run_dir / 'RUNMETA.json').exists():
+        raise SystemExit('refusing: this run directory has already been run; prepare a new attempt')
+    manifest = json.loads((run_dir / 'tree-manifest.json').read_text())
+    problems = check_tree(source, manifest)
+    if problems or manifest['__head__'] != packet['sha']:
+        return write_result(run_dir, packet, 'QA_INVALID', problems or ['manifest does not match the packet'])
     if not admitted(args):
         return write_result(run_dir, packet, 'WAITING_RESOURCE', ['disk admission refused; codex was not started'])
     out = run_dir / 'out'
-    write_private(out / 'verdict.schema.json', VERDICT_SCHEMA)
+    # Wrapper-owned inputs sit in the run directory itself, which the QA sandbox cannot write (only source, out, tmp,
+    # home and cargo-target are writable roots).
+    write_private(run_dir / 'verdict.schema.json', VERDICT_SCHEMA)
     prompt = PROMPT.format(product=packet['product'], ticket=packet['ticket'], sha=packet['sha'],
                            criteria=packet['criteria'], producer=packet['producer_evidence'], notes=packet['qa_notes'],
                            out=out)
-    write_private(out / 'prompt.txt', prompt)
+    write_private(run_dir / 'prompt.txt', prompt)
     argv = codex_argv(args.codex_bin, run_dir)
     events = run_dir / 'events.jsonl'
     t0 = time.time()
@@ -266,7 +341,7 @@ def run(args):
     os.chmod(run_dir / 'stderr.log', 0o600)
     verdict = out / 'verdict.json'
     meta = {'argv': argv[:-1], 'exit_code': proc.returncode, 'seconds': round(time.time() - t0, 1), 'timed_out': timed_out,
-            'events_sha256': sha256_file(events), 'verdict_sha256': sha256_file(verdict) if verdict.exists() else None,
+            'events_sha256': sha256_file(events), 'verdict_sha256': safe_digest(verdict),
             'commands_completed': count_commands(events)}
     write_private(run_dir / 'RUNMETA.json', meta)
     return evaluate(run_dir)
@@ -308,21 +383,19 @@ def evaluate(run_dir):
         return write_result(run_dir, packet, 'QA_INVALID', ['no run record'])
     meta = json.loads(meta_path.read_text())
     bad = []
-    if sha256_file(events) != meta['events_sha256']:
+    if safe_digest(events) != meta['events_sha256']:
         bad.append('event stream changed after the run')
-    if not verdict_path.exists():
+    if meta['verdict_sha256'] == 'UNREADABLE' or safe_digest(verdict_path) == 'UNREADABLE':
+        return write_result(run_dir, packet, 'QA_INVALID', bad + ['verdict is not a regular file (link planted?)'])
+    if not os.path.lexists(verdict_path):
         if meta.get('timed_out'):
             return write_result(run_dir, packet, 'QA_INCOMPLETE', ['timed out before a verdict'])
         return write_result(run_dir, packet, 'QA_INVALID', ['no verdict file'])
-    if sha256_file(verdict_path) != meta['verdict_sha256']:
+    if safe_digest(verdict_path) != meta['verdict_sha256']:
         bad.append('verdict changed after the run (tampered)')
-    source = run_dir / 'source'
-    if git(source, 'rev-parse', 'HEAD').stdout.strip() != packet['sha']:
-        bad.append('pinned clone moved off the packet SHA')
-    if git(source, 'status', '--porcelain', '--untracked-files=no').stdout.strip():
-        bad.append('QA modified tracked files in the pinned clone')
+    bad += check_tree(run_dir / 'source', json.loads((run_dir / 'tree-manifest.json').read_text()))
     try:
-        verdict = json.loads(verdict_path.read_text())
+        verdict = json.loads(read_nofollow(verdict_path))
     except ValueError:
         return write_result(run_dir, packet, 'QA_INVALID', bad + ['verdict is not JSON'])
     problems = validate(verdict, VERDICT_SCHEMA)
