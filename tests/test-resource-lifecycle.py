@@ -490,5 +490,130 @@ class ApplyTests(Fixture):
         self.assertNotEqual(self.run_cli("verify", "--manifest", str(bad))[0], 0)
 
 
+class ReviewRegressionTests(Fixture):
+    """Independent security review of PR #138: each defect has a test that fails on the reviewed head."""
+    inventory_manifest = ApplyTests.inventory_manifest
+
+    def test_handle_under_a_symlinked_prefix_is_still_seen(self):
+        real = self.root / "real"
+        d = real / "t"
+        d.mkdir(parents=True)
+        (d / "CACHEDIR.TAG").write_text("c")
+        receipt(d, private=True)
+        (self.root / "via").symlink_to(real)                     # like /tmp -> /private/tmp
+        self.handles = ({str(d / "CACHEDIR.TAG")}, True)         # lsof prints the real path
+        cls, why = self.classify(self.root / "via" / "t")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("active:open-handle-or-cwd", why)
+
+    def test_protected_root_is_matched_case_insensitively(self):
+        self.patch(rl, "PROTECTED_ROOTS", (str(self.root / "prot"),))
+        ctx = rl.make_ctx(SELF, self.sessions)
+        rec = {"path": str(self.root / "PROT"), "kind": "cargo_target", "markers": [], "scan_complete": True, "receipt": None}
+        self.assertIn("protected-root", rl.classify(rec, ctx)[1])
+        rec["path"] = str(self.root)                              # a root that contains a protected root
+        (self.root / "prot").mkdir()
+        self.assertIn("protected-root", rl.classify(rec, ctx)[1])
+
+    def test_removal_refuses_a_parent_swapped_for_a_symlink(self):
+        parent = self.root / "par"
+        (parent / "t").mkdir(parents=True)
+        fp = rl.fingerprint(parent / "t")
+        victim = self.root / "victim"
+        (victim / "t").mkdir(parents=True)
+        (victim / "t" / "PRECIOUS").write_text("keep")
+        (parent / "t").rmdir()
+        parent.rmdir()
+        parent.symlink_to(victim)
+        with self.assertRaises((SystemExit, OSError)):
+            rl.safe_remove(str(parent / "t"), fp)
+        self.assertTrue((victim / "t" / "PRECIOUS").exists())
+
+    def test_removal_refuses_a_leaf_swapped_for_another_directory(self):
+        d = self.make("t")
+        fp = rl.fingerprint(d)
+        other = self.root / "other"
+        other.mkdir()
+        (other / "PRECIOUS").write_text("keep")
+        rl.shutil.rmtree(d)
+        other.rename(d)
+        with self.assertRaises((SystemExit, OSError)):
+            rl.safe_remove(str(d), fp)
+        self.assertTrue((d / "PRECIOUS").exists())
+
+    def test_a_handle_that_appears_just_before_deletion_stops_it(self):
+        d = self.make("t")
+        receipt(d, private=True)
+        manifest, out = self.inventory_manifest()
+        calls = {"n": 0}
+
+        def late():
+            calls["n"] += 1
+            return ({str(d / "blob")}, True) if calls["n"] >= 2 else (set(), True)
+        self.patch(rl, "open_paths", late)
+        self.run_cli("apply", "--manifest", str(manifest), "--self-session", SELF, "--out", str(out))
+        self.assertTrue(d.exists())
+        audit = [json.loads(l) for l in (out / "gc-audit.jsonl").read_text().splitlines()]
+        self.assertEqual(audit[-1]["action"], "skipped")
+
+    def test_unknown_session_liveness_fails_closed(self):
+        self.patch(rl, "session_from_path", lambda p: OTHER)
+        d = self.make("s")
+        ctx = rl.make_ctx(SELF, self.root / "no-such-sessions-dir")
+        rec = rl.measure(d, "session_scratch", ctx)
+        cls, why = rl.classify(rec, ctx)
+        self.assertEqual(cls, "C")
+        self.assertIn("session-liveness-unknown", why)
+        (self.sessions / "bad.json").write_text(json.dumps({"pid": 1, "sessionId": OTHER, "startedAt": "garbage"}))
+        ctx = rl.make_ctx(SELF, self.sessions)
+        self.assertIn("session-liveness-unknown", rl.classify(rl.measure(d, "session_scratch", ctx), ctx)[1])
+
+    def test_unattributable_scratch_is_class_c_and_uppercase_session_ids_parse(self):
+        self.assertEqual(rl.session_from_path("/private/tmp/claude-501/p/" + OTHER.upper() + "/x"), OTHER.upper())
+        d = self.make("s")
+        cls, why = self.classify(d, kind="session_scratch")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("owner-unattributed", why)
+
+    def test_credentials_deep_inside_a_worktree_are_found(self):
+        d = self.make("wt")
+        deep = d / "apps/web/config/more"
+        deep.mkdir(parents=True)
+        (deep / ".env.local").write_text("k=v")
+        (d / "node_modules/x").mkdir(parents=True)
+        ctx = rl.make_ctx(SELF, self.sessions)
+        self.assertIn("credential-name", rl.measure(d, "worktree", ctx)["markers"])
+
+    def test_a_failing_git_status_is_unknown_not_clean(self):
+        env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+        repo = self.root / "r"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True, env=env)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"],
+                       cwd=repo, check=True, env=env, capture_output=True)
+        (repo / ".git/index").write_bytes(b"corrupt")
+        self.assertEqual(rl.worktree_state(repo), "unknown")
+
+    def test_status_takes_no_optional_locks(self):
+        seen = []
+        real_run = rl.subprocess.run
+        self.patch(rl.subprocess, "run", lambda cmd, *a, **k: (seen.append(cmd), real_run(cmd, *a, **k))[1])
+        rl.worktree_state(self.make("plain"))
+        self.assertTrue(any("--no-optional-locks" in c for c in seen if c and c[0] == "git"))
+
+    def test_a_forged_receipt_is_ignored(self):
+        d = self.make("t")
+        receipt(d, private=True)
+        os.chmod(d / rl.OWNER_RECEIPT, 0o666)                    # anyone could have written it
+        self.assertEqual(self.classify(d)[0][0], "B")
+        os.chmod(d / rl.OWNER_RECEIPT, 0o600)
+        self.assertEqual(self.classify(d)[0][0], "A")
+        (d / rl.OWNER_RECEIPT).unlink()
+        elsewhere = self.root / "elsewhere.json"
+        elsewhere.write_text(json.dumps({"session_id": SELF, "reproducible": True, "private": True}))
+        (d / rl.OWNER_RECEIPT).symlink_to(elsewhere)
+        self.assertIn(self.classify(d)[0][0], ("B", "C"))         # never A: a linked receipt is not read at all
+        self.assertIsNone(rl.read_receipt(d))
+
+
 if __name__ == "__main__":
     unittest.main()

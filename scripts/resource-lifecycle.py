@@ -40,6 +40,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 HOME = Path.home()
@@ -123,9 +124,20 @@ def open_paths():
     return paths, bool(paths)
 
 
+def fold(text):
+    """Comparison form for paths on a case-insensitive, normalization-insensitive volume (APFS)."""
+    return unicodedata.normalize('NFC', str(text)).casefold()
+
+
 def has_handle(root, paths):
-    prefix = str(root).rstrip('/') + '/'
-    return any(p == str(root) or p.startswith(prefix) for p in paths)
+    """True when an open file or working directory sits at or under the root. lsof prints real paths, so the root is
+    compared both as given and resolved (`/tmp` is `/private/tmp`, `/var` is `/private/var` on macOS)."""
+    roots = {fold(str(root).rstrip('/')), fold(os.path.realpath(root))}
+    for p in paths:
+        q = fold(p)
+        if any(q == r or q.startswith(r + '/') for r in roots):
+            return True
+    return False
 
 
 def etime_seconds(pid):
@@ -137,22 +149,38 @@ def etime_seconds(pid):
     return ((d * 24 + h) * 60 + mi) * 60 + s
 
 
-def live_sessions(sessions_dir):
-    """{sessionId: pid} for session records whose pid is alive and whose start time still matches (pid reuse safe)."""
-    live = {}
-    for record in Path(sessions_dir).glob('*.json'):
+def live_sessions_checked(sessions_dir):
+    """({sessionId: pid}, known). A session is live when its pid is alive and its start time still matches (pid reuse
+    safe). `known` is False when the sessions directory is missing or unreadable or a record cannot be parsed, because
+    then absence from the map proves nothing."""
+    live, known = {}, True
+    try:
+        records = list(Path(sessions_dir).glob('*.json'))
+        known = Path(sessions_dir).is_dir()
+    except OSError:
+        return live, False
+    for record in records:
         try:
             d = json.loads(record.read_text())
             pid, sid, started = int(d['pid']), str(d['sessionId']), int(d['startedAt'])
         except (OSError, ValueError, KeyError, TypeError):
+            known = False
             continue
         elapsed = etime_seconds(pid)
         if elapsed is not None and abs((time.time() - elapsed) - started / 1000) <= 120:
             live[sid] = pid
-    return live
+    return live, known
 
 
-def scan_markers(root, shallow, limit=None, seconds=None):
+def live_sessions(sessions_dir):
+    return live_sessions_checked(sessions_dir)[0]
+
+
+WORKTREE_SKIP = frozenset(('node_modules', 'target', '.venv', 'venv', '__pycache__'))
+WORKTREE_DEPTH = 6
+
+
+def scan_markers(root, shallow, limit=None, seconds=None, max_depth=None, skip=()):
     """Protective markers and symlink escapes. Shallow kinds look two levels deep only. Returns (markers, complete);
     complete is False when the entry or time budget ran out, which classifies the resource C."""
     limit = SCAN_LIMIT if limit is None else limit
@@ -187,14 +215,15 @@ def scan_markers(root, shallow, limit=None, seconds=None):
             if e.is_dir(follow_symlinks=False):
                 if name == '.git':
                     markers.add('git-metadata')
-                if not shallow or depth < 1:
+                cap = 1 if shallow else max_depth
+                if name not in skip and (cap is None or depth < cap):
                     stack.append((e.path, depth + 1))
     return markers, True
 
 
 def session_from_path(path):
     """Session id for anything under /private/tmp/claude-UID/<project>/<sessionId>/..., else None."""
-    m = re.match(r'^/private/tmp/claude-\d+/[^/]+/([0-9a-f-]{36})(/|$)', str(path))
+    m = re.match(r'^/private/tmp/claude-\d+/[^/]+/([0-9a-fA-F-]{36})(/|$)', str(path))
     return m.group(1) if m else None
 
 
@@ -215,11 +244,24 @@ def newest_mtime(path, depth=2):
 
 
 def read_receipt(root):
+    """The owner receipt, only if it is a small regular file owned by this user that nobody else can write. A receipt
+    anyone could have forged would promote a directory to class A, so it is ignored instead."""
+    path = Path(root) / OWNER_RECEIPT
     try:
-        d = json.loads((Path(root) / OWNER_RECEIPT).read_text())
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022
+                or info.st_size > 65536):
+            return None
+        d = json.loads(os.read(fd, 65537).decode('utf-8'))
         return d if isinstance(d, dict) else None
     except (OSError, ValueError):
         return None
+    finally:
+        os.close(fd)
 
 
 def product_of(path):
@@ -232,14 +274,21 @@ def product_of(path):
 def worktree_state(root):
     """('clean-reconciled' | 'dirty' | 'unpushed' | 'unknown') for a linked git worktree."""
     def git(*a):
-        return subprocess.run(['git', '-C', str(root)] + list(a), capture_output=True, text=True, timeout=60)
+        return subprocess.run(['git', '-C', str(root), '--no-optional-locks'] + list(a), capture_output=True, text=True,
+                              timeout=60)
     try:
-        if git('status', '--porcelain').stdout.strip():
+        status = git('status', '--porcelain')
+        if status.returncode != 0:
+            return 'unknown'
+        if status.stdout.strip():
             return 'dirty'
         up = git('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}')
         if up.returncode != 0:
             return 'unpushed'
-        if git('rev-list', '--count', '@{u}..HEAD').stdout.strip() not in ('0', ''):
+        ahead = git('rev-list', '--count', '@{u}..HEAD')
+        if ahead.returncode != 0:
+            return 'unknown'
+        if ahead.stdout.strip() not in ('0', ''):
             return 'unpushed'
         return 'clean-reconciled'
     except (OSError, subprocess.TimeoutExpired):
@@ -249,6 +298,19 @@ def worktree_state(root):
 def fingerprint(root):
     st = os.lstat(root)
     return {'dev': st.st_dev, 'ino': st.st_ino, 'mtime': int(st.st_mtime)}
+
+
+def touches_protected(real, protected):
+    """True when the resolved root equals or contains a protected root. Compared case-folded and NFC-normalised (APFS is
+    case-insensitive, and realpath does not canonicalise case) and by inode, so a case variant cannot slip through."""
+    pr = os.path.realpath(protected)
+    a, b = fold(real).rstrip('/'), fold(pr).rstrip('/')
+    if a == b or b.startswith(a + '/'):
+        return True
+    try:
+        return os.path.samefile(real, pr)
+    except OSError:
+        return False
 
 
 def classify(rec, ctx):
@@ -262,7 +324,7 @@ def classify(rec, ctx):
         why.append('root-is-symlink')
     real = os.path.realpath(root)
     # A deletion root may sit inside a protected tree (a target under ~/.cargo) but may never equal one or contain one.
-    if any(real == os.path.realpath(p) or os.path.realpath(p).startswith(real.rstrip('/') + '/') for p in PROTECTED_ROOTS):
+    if any(touches_protected(real, p) for p in PROTECTED_ROOTS):
         why.append('protected-root')
     for m in sorted(rec['markers']):
         # An owner may assert, in its receipt, that name-based evidence guesses (a copied ledger file) are false
@@ -278,6 +340,10 @@ def classify(rec, ctx):
         why.append('active:open-handle-or-cwd')
     if rec.get('session_alive') and not (owned and rec.get('session') in ctx['self_sessions']):
         why.append('active:live-session')
+    if rec.get('session') and not ctx.get('sessions_known', True) and not owned:
+        why.append('session-liveness-unknown')
+    if kind == 'session_scratch' and not rec.get('session') and not owned:
+        why.append('owner-unattributed')
     if kind == 'worktree' and rec.get('worktree_state') != 'clean-reconciled':
         why.append('worktree-' + str(rec.get('worktree_state')))
     if kind == 'unknown':
@@ -302,7 +368,12 @@ def classify(rec, ctx):
 
 def measure(path, kind, ctx):
     shallow = KINDS.get(kind, KINDS['unknown'])[2]
-    markers, complete = scan_markers(path, shallow)
+    if kind == 'worktree':
+        # Ignored local files (.env.local, a sqlite database) are invisible to `git status`: scan deep, skipping the
+        # reproducible dependency and build trees.
+        markers, complete = scan_markers(path, False, max_depth=WORKTREE_DEPTH, skip=WORKTREE_SKIP)
+    else:
+        markers, complete = scan_markers(path, shallow)
     logical, allocated = du_kb(path, apparent=True), du_kb(path)
     session_id = session_from_path(path)
     session_alive = bool(session_id) and (session_id in ctx['live_sessions'] or session_id in ctx['self_sessions'])
@@ -322,9 +393,9 @@ def measure(path, kind, ctx):
 
 def make_ctx(self_session, sessions_dir=None):
     handles, known = open_paths()
+    live, sessions_known = live_sessions_checked(sessions_dir or HOME / '.claude/sessions')
     return {'self_session': self_session, 'self_sessions': set(filter(None, (self_session or '').split(','))),
-            'handles': handles, 'handles_known': known,
-            'live_sessions': live_sessions(sessions_dir or HOME / '.claude/sessions')}
+            'handles': handles, 'handles_known': known, 'live_sessions': live, 'sessions_known': sessions_known}
 
 
 def discover(consumers):
@@ -478,11 +549,22 @@ def verify(args):
     return 1 if bad else 0
 
 
-def safe_remove(path):
-    """Remove one directory tree with the fd-based symlink-safe remover; never follows a link."""
+def safe_remove(path, fingerprint):
+    """Remove one directory tree. The parent is resolved once and opened without following a link, the leaf is looked
+    up relative to that descriptor and must still be the directory the manifest recorded (device and inode), and the
+    recursive remover then works from that descriptor, so swapping a path component after revalidation cannot redirect
+    the deletion."""
     if not shutil.rmtree.avoids_symlink_attacks:
         raise SystemExit('refusing: this platform has no symlink-safe recursive remover')
-    shutil.rmtree(path)
+    parent, name = os.path.split(str(path).rstrip('/'))
+    pfd = os.open(os.path.realpath(parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.lstat(name, dir_fd=pfd)
+        if (not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != (fingerprint['dev'], fingerprint['ino'])):
+            raise SystemExit('refusing: %s is no longer the directory that was listed' % name)
+        shutil.rmtree(name, dir_fd=pfd)
+    finally:
+        os.close(pfd)
 
 
 def apply(args):
@@ -513,17 +595,23 @@ def apply(args):
         elif args.dry_run:
             record['action'] = 'would-remove'
         else:
-            before = free_bytes()
-            try:
-                safe_remove(entry['path'])
-                record['action'] = 'removed'
-                removed += 1
-            except OSError as error:
-                record['action'] = 'failed:%s' % type(error).__name__
-            record['free_delta_bytes'] = free_bytes() - before
-        with open(audit, 'a') as handle:
+            # The handle snapshot taken for revalidation predates a measurement that can run for minutes: look again,
+            # immediately before deleting.
+            last = make_ctx(args.self_session)
+            if not last['handles_known'] or has_handle(entry['path'], last['handles']):
+                record['action'] = 'skipped'
+                record['why'] = why = ['active:handle-appeared-before-delete']
+            else:
+                before = free_bytes()
+                try:
+                    safe_remove(entry['path'], entry['fingerprint'])
+                    record['action'] = 'removed'
+                    removed += 1
+                except (OSError, SystemExit) as error:
+                    record['action'] = 'failed:%s' % type(error).__name__
+                record['free_delta_bytes'] = free_bytes() - before
+        with os.fdopen(os.open(audit, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), 'a') as handle:
             handle.write(json.dumps(record, sort_keys=True) + '\n')
-        os.chmod(audit, 0o600)
         print('%-12s %s %s' % (record['action'], entry['id'], ','.join(why)))
     print('removed %d; measured free-space change over the batch: %+d bytes (%s)' %
           (removed, free_bytes() - free_start, 'ground truth, not the logical sizes'))
