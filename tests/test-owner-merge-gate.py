@@ -229,16 +229,41 @@ class VersionBranches(unittest.TestCase):
     def test_policy_file_must_be_private_and_missing_default_means_no_policy(self):
         import os, tempfile
         with tempfile.TemporaryDirectory() as d:
-            self.assertIsNone(omg.read_version_policy(os.path.join(d, "none.json"), False))
+            root = os.path.join(os.path.realpath(d), "local")
+            os.mkdir(root, 0o700)
+            missing = os.path.join(root, "none.json")
+            self.assertIsNone(omg.read_version_policy(missing, False, root))
             with self.assertRaises(FileNotFoundError):
-                omg.read_version_policy(os.path.join(d, "none.json"), True)
-            f = os.path.join(d, "p.json")
+                omg.read_version_policy(missing, True, root)
+            f = os.path.join(root, "p.json")
             pathlib.Path(f).write_text(json.dumps(POLICY))
             os.chmod(f, 0o600)
-            self.assertIn("chisanan232/r", omg.read_version_policy(f, True))
+            self.assertIn("chisanan232/r", omg.read_version_policy(f, True, root))
             os.chmod(f, 0o666)
             with self.assertRaises(ValueError):
-                omg.read_version_policy(f, True)
+                omg.read_version_policy(f, True, root)
+
+    def test_policy_outside_the_owner_config_root_or_via_symlink_is_refused(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.realpath(d)
+            root = os.path.join(real, "local")
+            os.mkdir(root, 0o700)
+            elsewhere = os.path.join(real, "repo-worktree.json")  # e.g. a file a PR could edit
+            pathlib.Path(elsewhere).write_text(json.dumps(POLICY))
+            os.chmod(elsewhere, 0o600)
+            with self.assertRaises(ValueError):
+                omg.read_version_policy(elsewhere, True, root)
+            link = os.path.join(root, "link.json")
+            os.symlink(elsewhere, link)
+            with self.assertRaises(ValueError):  # the real path escapes the root, so the link buys nothing
+                omg.read_version_policy(link, True, root)
+            os.chmod(root, 0o777)
+            ok = os.path.join(root, "p.json")
+            pathlib.Path(ok).write_text(json.dumps(POLICY))
+            os.chmod(ok, 0o600)
+            with self.assertRaises(ValueError):  # group/world-writable directory
+                omg.read_version_policy(ok, True, root)
 
     def test_malformed_policy_fails_closed(self):
         for bad in ({}, {"schema": 2, "repos": {}}, {"schema": 1, "repos": {"x": {"branches": [{"branch": "../x"}]}}},

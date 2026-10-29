@@ -72,20 +72,36 @@ def load_version_policy(obj):
     return out
 
 
-def read_version_policy(path, required):
+def read_version_policy(path, required, root=None):
     """Load the policy file. A missing default file means no policy (old behaviour); an explicit path must load.
-    The file must be a regular file owned by the caller and not writable by group or others."""
+
+    The policy is the trust anchor for which bases are mergeable, so it is accepted only from the fixed owner-config
+    directory: the real path must sit under `root`, the file and every directory from `root` down must be owned by the
+    caller and not group/world-writable, and it is opened without following a symlink and judged on the open descriptor."""
+    import stat
+    root = os.path.realpath(os.path.expanduser(root or os.path.dirname(VERSION_POLICY_DEFAULT)))
     full = os.path.expanduser(path)
+    real = os.path.realpath(full)
+    if os.path.commonpath([root, real]) != root:
+        raise ValueError(f"version policy must live under {root}")
     try:
-        st = os.lstat(full)
+        fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:
         if required:
             raise
         return None
-    import stat
-    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
-        raise ValueError("version policy file must be a regular file owned by the caller and not group/world-writable")
-    with open(full) as f:
+    with os.fdopen(fd) as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+            raise ValueError("version policy file must be a regular file owned by the caller and not group/world-writable")
+        d = os.path.dirname(real)
+        while True:
+            ds = os.stat(d)
+            if ds.st_uid != os.getuid() or ds.st_mode & 0o022:
+                raise ValueError(f"version policy directory {d} must be owned by the caller and not group/world-writable")
+            if d == root:
+                break
+            d = os.path.dirname(d)
         return load_version_policy(json.load(f))
 
 
