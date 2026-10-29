@@ -248,7 +248,9 @@ def classify(rec, ctx):
     reproducible = KINDS.get(kind, KINDS['unknown'])[0]
     if os.path.islink(root):
         why.append('root-is-symlink')
-    if any(root == p or root == p + '/' for p in PROTECTED_ROOTS):
+    real = os.path.realpath(root)
+    # A deletion root may sit inside a protected tree (a target under ~/.cargo) but may never equal one or contain one.
+    if any(real == os.path.realpath(p) or os.path.realpath(p).startswith(real.rstrip('/') + '/') for p in PROTECTED_ROOTS):
         why.append('protected-root')
     for m in sorted(rec['markers']):
         # An owner may assert, in its receipt, that name-based evidence guesses (a copied ledger file) are false
@@ -300,7 +302,7 @@ def measure(path, kind, ctx):
            'session_alive': session_alive, 'logical_bytes': None if logical is None else logical * 1024,
            'allocated_bytes': None if allocated is None else allocated * 1024, 'newest_mtime': newest,
            'rebuild_cost': KINDS.get(kind, KINDS['unknown'])[1], 'markers': sorted(markers), 'scan_complete': complete,
-           'receipt': read_receipt(path), 'fingerprint': fingerprint(path)}
+           'receipt': read_receipt(path), 'fingerprint': fingerprint(path), 'realpath': os.path.realpath(path)}
     if kind == 'worktree':
         rec['worktree_state'] = worktree_state(path)
     return rec
@@ -329,7 +331,7 @@ def discover(consumers):
 
 
 def inventory(args):
-    consumers = json.loads(Path(args.consumers).read_text()) if args.consumers else default_consumers()
+    consumers = load_consumers(args.consumers)
     ctx = make_ctx(args.self_session, args.sessions_dir)
     before = free_bytes()
     records = []
@@ -385,11 +387,35 @@ def summary(records, free):
                                             ','.join(r['reasons'])[:60]))
 
 
-def load_manifest(path):
-    d = json.loads(Path(path).read_text())
+def state_dir(arg=None):
+    return Path(arg) if arg else HOME / '.local/state/coding-agent-environment/gc'
+
+
+def load_manifest(path, directory=None):
+    """Only a manifest this tool wrote: inside the private state directory, owned by this user, mode 0600."""
+    path, base = Path(path), state_dir(directory)
+    try:
+        info, dinfo = path.lstat(), base.lstat()
+    except OSError:
+        raise SystemExit('refusing: manifest or state directory is missing')
+    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600 or stat.S_ISLNK(dinfo.st_mode) or stat.S_IMODE(dinfo.st_mode) != 0o700
+            or path.resolve().parent != base.resolve()):
+        raise SystemExit('refusing: manifest must be a private file inside the private state directory')
+    d = json.loads(path.read_text())
     if d.get('schema') != 1 or not isinstance(d.get('entries'), list):
         raise SystemExit('refusing: unrecognised manifest')
     return d
+
+
+def check_binding(manifest, consumers):
+    """Every entry must be what the inventory would have produced: id, real path and (kind, path) under a consumer."""
+    known = {(kind, hit) for kind, hit, _ in discover(consumers)}
+    for entry in manifest['entries']:
+        path = entry.get('path')
+        if (not isinstance(path, str) or not os.path.isabs(path) or entry.get('id') != hashlib.sha256(path.encode()).hexdigest()[:12]
+                or entry.get('realpath') != os.path.realpath(path) or (entry.get('kind'), path) not in known):
+            raise SystemExit('refusing: manifest entry does not match the configured consumers (tampered or stale)')
 
 
 def revalidate(entry, ctx):
@@ -403,12 +429,17 @@ def revalidate(entry, ctx):
     cls, why = classify(now, ctx)
     if now['newest_mtime'] != entry['newest_mtime']:
         why = list(why) + ['modified-since-manifest']
-        cls = 'C' if cls == 'A' else cls
+        cls = 'C'  # something changed since it was listed: it needs a fresh manifest, whatever its class was
     return cls, why
 
 
+def load_consumers(path):
+    return json.loads(Path(path).read_text()) if path else default_consumers()
+
+
 def verify(args):
-    manifest = load_manifest(args.manifest)
+    manifest = load_manifest(args.manifest, args.out)
+    check_binding(manifest, load_consumers(args.consumers))
     ctx = make_ctx(manifest.get('self_session'))
     bad = 0
     for entry in manifest['entries']:
@@ -427,7 +458,8 @@ def safe_remove(path):
 
 
 def apply(args):
-    manifest = load_manifest(args.manifest)
+    manifest = load_manifest(args.manifest, args.out)
+    check_binding(manifest, load_consumers(args.consumers))
     if set(filter(None, (manifest.get('self_session') or '').split(','))) != set(filter(None, args.self_session.split(','))):
         raise SystemExit('refusing: the manifest was generated for a different owner session')
     ids = set(filter(None, (args.ids or '').split(',')))
@@ -436,8 +468,7 @@ def apply(args):
         raise SystemExit('refusing: class C is never deleted')
     if cls == 'B' and not ids:
         raise SystemExit('refusing: class B needs explicit --ids (the host ASK covers exactly these entries)')
-    state = Path(args.out or HOME / '.local/state/coding-agent-environment/gc')
-    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state = state_dir(args.out)
     audit = state / 'gc-audit.jsonl'
     removed = 0
     free_start = free_bytes()
@@ -481,11 +512,14 @@ def main(argv=None):
     inv.add_argument('--sessions-dir')
     ver = sub.add_parser('verify')
     ver.add_argument('--manifest', required=True)
+    ver.add_argument('--out')
+    ver.add_argument('--consumers')
     app = sub.add_parser('apply')
     app.add_argument('--manifest', required=True)
     app.add_argument('--self-session', required=True)
     app.add_argument('--ids')
     app.add_argument('--out')
+    app.add_argument('--consumers')
     app.add_argument('--dry-run', action='store_true')
     args = parser.parse_args(argv)
     return {'inventory': inventory, 'verify': verify, 'apply': apply}[args.cmd](args)
