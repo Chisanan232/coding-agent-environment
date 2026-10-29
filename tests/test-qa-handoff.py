@@ -50,7 +50,12 @@ if mode == "linkverdict":
 if mode == "headmove":
     open(".git/HEAD", "w").write("0" * 40 + "\n")
 out = argv[argv.index("-o") + 1]
-if mode != "linkverdict":
+if mode == "fifo":
+    os.mkfifo(out)
+elif mode == "huge":
+    verdict["baseline"] += " " + "x" * (6 << 20)
+    open(out, "w").write(json.dumps(verdict))
+elif mode != "linkverdict":
     open(out, "w").write(json.dumps(verdict))
 if mode != "nocommands":
     print(json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": "x"}}))
@@ -302,6 +307,27 @@ class VerdictTests(Base):
         self.assertEqual(code, 12)
         self.assertIn("not a regular file", out)
 
+    def test_a_fifo_planted_as_the_verdict_never_blocks_the_wrapper(self):
+        start = time.time()
+        code, out, _ = self.outcome(verdict(), mode="fifo")
+        self.assertLess(time.time() - start, 30)
+        self.assertEqual(code, 12)
+
+    def test_an_oversized_verdict_is_invalid_not_loaded(self):
+        code, out, _ = self.outcome(verdict(), mode="huge")
+        self.assertEqual(code, 12)
+
+    def test_the_verdict_is_written_outside_every_qa_writable_root(self):
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        argv = self.seen()["argv"]
+        target = Path(argv[argv.index("-o") + 1])
+        writable = [Path(argv[i + 1]) for i, a in enumerate(argv) if a in ("--add-dir", "-C")]
+        self.assertEqual(target, run_dir / "verdict.json")
+        for root in writable:
+            self.assertNotIn(root, target.parents)
+            self.assertNotEqual(root, target)
+
     def test_qa_moving_head_in_the_clone_is_invalid(self):
         code, out, _ = self.outcome(verdict(), mode="headmove")
         self.assertEqual(code, 12)
@@ -310,7 +336,7 @@ class VerdictTests(Base):
     def test_verdict_edited_after_the_run_is_detected(self):
         code, _, run_dir = self.outcome(verdict(verified=[{"check": "AC1", "result": "FAIL", "evidence": "x"}]))
         self.assertEqual(code, 10)
-        (run_dir / "out/verdict.json").write_text(verdict())                 # producer "fixes" the verdict
+        (run_dir / "verdict.json").write_text(verdict())                 # producer "fixes" the verdict
         code, out = self.call("verdict", "--run-dir", str(run_dir))
         self.assertEqual(code, 12)
         self.assertIn("tampered", out)
