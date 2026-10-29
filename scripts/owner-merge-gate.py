@@ -39,7 +39,7 @@ OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 DEPLOY_BASES = re.compile(r"(^|/)(prod|production|release|releases|gh-pages|deploy)([-/].*)?$", re.I)
 
 # Environment and release names that must never become an approved integration base, even when an owner lists them.
-POLICY_FORBIDDEN = re.compile(r"(^|/)(staged|staging|beta|alpha|canary|hotfix)([-/].*)?$|[-/._](prod|production|release|releases|deploy)$",
+POLICY_FORBIDDEN = re.compile(r"(^|/)(staged|staging|beta|alpha|canary|hotfix)(/|$)|[-/._](prod|production|release|releases|deploy)$",
                               re.I)
 VERSION_POLICY_DEFAULT = "~/.config/coding-agent-environment/local/version-branches.json"
 VERSION_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
@@ -73,7 +73,7 @@ def load_version_policy(obj):
             prefixes.append(pre)
         if repo.lower() in out:
             raise ValueError(f"version policy lists {repo} more than once (repository names are case-insensitive)")
-        out[repo.lower()] = {"branches": {b.lower() for b in branches}, "prefixes": tuple(x.lower() for x in prefixes)}
+        out[repo.lower()] = {"branches": branches, "prefixes": tuple(x.lower() for x in prefixes)}
     return out
 
 
@@ -339,10 +339,10 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
     default_branch = meta["defaultBranchRef"]["name"]
     pol = (version_policy or {}).get(repo.lower())
     head_ref = p.get("headRefName") or ""
-    if pol and base == default_branch and (head_ref.lower() in pol["branches"] or head_ref.lower().startswith(pol["prefixes"])):
+    if pol and base == default_branch and (head_ref.lower() in {b.lower() for b in pol["branches"]} or head_ref.lower().startswith(pol["prefixes"])):
         reasons.append(f"FUTURE_VERSION_INTO_MAIN: head {head_ref!r} is future-version work; it reaches {base!r} only through a "
                        "release step, never through this gate")
-    if DEPLOY_BASES.search(base) or (base != default_branch and not (pol and base.lower() in pol["branches"])) \
+    if DEPLOY_BASES.search(base) or (base != default_branch and not (pol and base in pol["branches"])) \
             or (base != default_branch and POLICY_FORBIDDEN.search(base)):
         reasons.append(f"BASE_NOT_DEFAULT_OR_DEPLOY: base {base!r}; deployment, release and non-default bases need their own authorization")
     elif base != default_branch:

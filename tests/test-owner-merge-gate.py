@@ -266,10 +266,13 @@ class VersionBranches(unittest.TestCase):
                 omg.read_version_policy(ok, True, root)
 
     def test_environment_and_release_names_can_never_be_listed(self):
-        for name in ("staged", "beta", "alpha", "canary", "hotfix/x", "v1-prod", "v1.0-release", "deploy"):
+        for name in ("staged", "beta", "alpha", "canary", "hotfix/x", "x/staging/y", "v1-prod", "v1.0-release", "deploy"):
             bad = {"schema": 1, "repos": {"Chisanan232/r": {"branches": [{"branch": name, "version": "1"}]}}}
             with self.assertRaises(ValueError, msg=name):
                 omg.load_version_policy(bad)
+
+    def test_base_approval_is_case_exact(self):
+        self.refused(Fake(baseRefName="Integration/MVP-5.0"), "BASE_NOT_DEFAULT_OR_DEPLOY")
 
     def test_future_head_match_ignores_case(self):
         self.refused(Fake(headRefName="MVP-6.0/x"), "FUTURE_VERSION_INTO_MAIN")

@@ -78,7 +78,9 @@ work never enters `main` early. The gate recognises such a base only when it is 
   `FUTURE_VERSION_INTO_MAIN`. Promoting an integration branch to `main` is a release step with its own founder GO; this gate never performs it.
 - Known limit: the `FUTURE_VERSION_INTO_MAIN` check is by head name (case-insensitive), not commit ancestry. A differently named branch cut from an
   integration branch is not detected by this gate; the exact-head independent review must check that no future-version commits are included.
-- Environment/release names (`staged`, `beta`, `alpha`, `canary`, `hotfix/*`, `*-prod`, `*-release`, ...) cannot be listed.
+- Environment names as a whole path segment (`staged`, `staging`, `beta`, `alpha`, `canary`, `hotfix`) and names ending `-prod`/`-release`/`-deploy` cannot be
+  listed. Base matching is case-exact; head (future-version) matching is case-insensitive. An invalid entry makes the whole policy fail to load
+  (exit 3, nothing is approved), never a partial approval.
 - Adding or removing an entry is a founder decision recorded outside the PR it unblocks.
 
 ## What this does not do
