@@ -213,7 +213,9 @@ class ClassificationTests(Fixture):
 class ApplyTests(Fixture):
     def inventory_manifest(self, kind="cargo_target", cls="A", names=("t",)):
         consumers = self.root / "consumers.json"
-        consumers.write_text(json.dumps([[kind, [str(self.root / n) for n in names]]]))
+        spec = [[kind, [str(self.root / n) for n in names]]]
+        consumers.write_text(json.dumps(spec))
+        self.patch(rl, "default_consumers", lambda tmp=None: spec)   # apply/verify re-derive the same configured scope
         out = self.root / "state"
         code, _ = self.run_cli("inventory", "--self-session", SELF, "--consumers", str(consumers), "--out", str(out),
                                "--sessions-dir", str(self.sessions))
@@ -324,10 +326,10 @@ class ApplyTests(Fixture):
     def test_verify_flags_changed_entries(self):
         d = self.make("t")
         receipt(d, private=True)
-        manifest, _ = self.inventory_manifest()
-        self.assertEqual(self.run_cli("verify", "--manifest", str(manifest))[0], 0)
+        manifest, out = self.inventory_manifest()
+        self.assertEqual(self.run_cli("verify", "--manifest", str(manifest), "--out", str(out))[0], 0)
         self.handles = ({str(d)}, True)
-        self.assertEqual(self.run_cli("verify", "--manifest", str(manifest))[0], 1)
+        self.assertEqual(self.run_cli("verify", "--manifest", str(manifest), "--out", str(out))[0], 1)
 
     def test_manifest_for_a_different_owner_is_refused(self):
         d = self.make("t")
@@ -342,6 +344,66 @@ class ApplyTests(Fixture):
         receipt(d, session=OTHER, private=True)
         ctx = rl.make_ctx(SELF + "," + OTHER, self.sessions)
         self.assertEqual(rl.classify(rl.measure(d, "cargo_target", ctx), ctx)[0], "A")
+
+    def edited(self, manifest, out, mutate):
+        data = json.loads(manifest.read_text())
+        mutate(data)
+        new = out / "manifest-A-edited.json"
+        fd = os.open(new, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(data, handle)
+        return new
+
+    def test_tampered_entry_id_is_refused(self):
+        d = self.make("t")
+        receipt(d, private=True)
+        manifest, out = self.inventory_manifest()
+        bad = self.edited(manifest, out, lambda m: m["entries"][0].update(id="000000000000"))
+        code, _ = self.run_cli("apply", "--manifest", str(bad), "--self-session", SELF, "--out", str(out))
+        self.assertNotEqual(code, 0)
+        self.assertTrue(d.exists())
+
+    def test_entry_pointing_outside_the_configured_consumers_is_refused(self):
+        d, other = self.make("t"), self.make("other")
+        receipt(d, private=True)
+        receipt(other, private=True)
+        manifest, out = self.inventory_manifest()
+        import hashlib
+        def retarget(m):
+            e = m["entries"][0]
+            e["path"] = str(other)
+            e["realpath"] = os.path.realpath(other)
+            e["id"] = hashlib.sha256(str(other).encode()).hexdigest()[:12]
+        bad = self.edited(manifest, out, retarget)
+        code, _ = self.run_cli("apply", "--manifest", str(bad), "--self-session", SELF, "--out", str(out))
+        self.assertNotEqual(code, 0)
+        self.assertTrue(other.exists() and d.exists())
+
+    def test_manifest_outside_the_state_dir_or_with_loose_mode_is_refused(self):
+        d = self.make("t")
+        receipt(d, private=True)
+        manifest, out = self.inventory_manifest()
+        copy = self.root / "elsewhere.json"
+        copy.write_text(manifest.read_text())
+        copy.chmod(0o600)
+        self.assertNotEqual(self.run_cli("apply", "--manifest", str(copy), "--self-session", SELF, "--out", str(out))[0], 0)
+        manifest.chmod(0o644)
+        self.assertNotEqual(self.run_cli("apply", "--manifest", str(manifest), "--self-session", SELF, "--out", str(out))[0], 0)
+        self.assertTrue(d.exists())
+
+    def test_class_b_entry_modified_since_the_manifest_is_skipped(self):
+        d = self.make("t")
+        manifest, out = self.inventory_manifest(cls="B")
+        entry_id = json.loads(manifest.read_text())["entries"][0]["id"]
+        (d / "late-file").write_text("new work")
+        os.utime(d, (time.time() + 5, time.time() + 5))
+        self.run_cli("apply", "--manifest", str(manifest), "--self-session", SELF, "--out", str(out), "--ids", entry_id)
+        self.assertTrue(d.exists())
+
+    def test_a_root_that_contains_a_protected_root_is_class_c(self):
+        ctx = rl.make_ctx(SELF, self.sessions)
+        rec = {"path": str(rl.HOME.parent), "kind": "cargo_target", "markers": [], "scan_complete": True, "receipt": None}
+        self.assertIn("protected-root", rl.classify(rec, ctx)[1])
 
     def test_unrecognised_manifest_is_refused(self):
         bad = self.root / "bad.json"
