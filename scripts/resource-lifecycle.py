@@ -150,15 +150,15 @@ def etime_seconds(pid):
 
 
 def live_sessions_checked(sessions_dir):
-    """({sessionId: pid}, known). A session is live when its pid is alive and its start time still matches (pid reuse
+    """({sessionId: pid}, known, uncertain ids). A session is live when its pid is alive and its start time still matches (pid reuse
     safe). `known` is False when the sessions directory is missing or unreadable or a record cannot be parsed, because
     then absence from the map proves nothing."""
-    live, known = {}, True
+    live, known, uncertain = {}, True, set()
     try:
         records = list(Path(sessions_dir).glob('*.json'))
         known = Path(sessions_dir).is_dir()
     except OSError:
-        return live, False
+        return live, False, uncertain
     for record in records:
         try:
             d = json.loads(record.read_text())
@@ -167,9 +167,13 @@ def live_sessions_checked(sessions_dir):
             known = False
             continue
         elapsed = etime_seconds(pid)
-        if elapsed is not None and abs((time.time() - elapsed) - started / 1000) <= 120:
-            live[sid] = pid
-    return live, known
+        if elapsed is None:
+            continue                                   # the pid is gone: the session is not running
+        if abs((time.time() - elapsed) - started / 1000) <= 120:
+            live[sid.lower()] = pid
+        else:
+            uncertain.add(sid.lower())                 # a process holds the pid but is not the recorded session
+    return live, known, uncertain
 
 
 def live_sessions(sessions_dir):
@@ -340,7 +344,8 @@ def classify(rec, ctx):
         why.append('active:open-handle-or-cwd')
     if rec.get('session_alive') and not (owned and rec.get('session') in ctx['self_sessions']):
         why.append('active:live-session')
-    if rec.get('session') and not ctx.get('sessions_known', True) and not owned:
+    if rec.get('session') and not owned and (not ctx.get('sessions_known', True)
+                                              or str(rec['session']).lower() in ctx.get('uncertain_sessions', ())):
         why.append('session-liveness-unknown')
     if kind == 'session_scratch' and not rec.get('session') and not owned:
         why.append('owner-unattributed')
@@ -376,7 +381,7 @@ def measure(path, kind, ctx):
         markers, complete = scan_markers(path, shallow)
     logical, allocated = du_kb(path, apparent=True), du_kb(path)
     session_id = session_from_path(path)
-    session_alive = bool(session_id) and (session_id in ctx['live_sessions'] or session_id in ctx['self_sessions'])
+    session_alive = bool(session_id) and (session_id.lower() in ctx['live_sessions'] or session_id in ctx['self_sessions'])
     try:
         newest = newest_mtime(path)
     except OSError:
@@ -393,9 +398,10 @@ def measure(path, kind, ctx):
 
 def make_ctx(self_session, sessions_dir=None):
     handles, known = open_paths()
-    live, sessions_known = live_sessions_checked(sessions_dir or HOME / '.claude/sessions')
+    live, sessions_known, uncertain = live_sessions_checked(sessions_dir or HOME / '.claude/sessions')
     return {'self_session': self_session, 'self_sessions': set(filter(None, (self_session or '').split(','))),
-            'handles': handles, 'handles_known': known, 'live_sessions': live, 'sessions_known': sessions_known}
+            'handles': handles, 'handles_known': known, 'live_sessions': live, 'sessions_known': sessions_known,
+            'uncertain_sessions': uncertain}
 
 
 def discover(consumers):

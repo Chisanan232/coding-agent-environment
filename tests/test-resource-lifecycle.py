@@ -575,6 +575,18 @@ class ReviewRegressionTests(Fixture):
         self.assertEqual(cls, "C")
         self.assertIn("owner-unattributed", why)
 
+    def test_session_ids_compare_case_insensitively_and_a_mismatched_start_is_unknown(self):
+        started = int((time.time() - rl.etime_seconds(os.getpid())) * 1000)
+        (self.sessions / "a.json").write_text(json.dumps({"pid": os.getpid(), "sessionId": OTHER, "startedAt": started}))
+        d = self.make("s")
+        self.patch(rl, "session_from_path", lambda p: OTHER.upper())
+        ctx = rl.make_ctx(SELF, self.sessions)
+        self.assertEqual(rl.classify(rl.measure(d, "session_scratch", ctx), ctx)[0], "C")   # live, only the case differs
+        (self.sessions / "a.json").write_text(json.dumps({"pid": os.getpid(), "sessionId": OTHER, "startedAt": started - 10_000_000}))
+        ctx = rl.make_ctx(SELF, self.sessions)
+        self.assertIn(OTHER, ctx["uncertain_sessions"])          # alive pid, wrong start: liveness cannot be established
+        self.assertIn("session-liveness-unknown", rl.classify(rl.measure(d, "session_scratch", ctx), ctx)[1])
+
     def test_credentials_deep_inside_a_worktree_are_found(self):
         d = self.make("wt")
         deep = d / "apps/web/config/more"
