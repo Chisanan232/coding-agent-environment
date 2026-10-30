@@ -513,21 +513,50 @@ class Reservations(unittest.TestCase):
         self.assertEqual(live, [])
         self.assertFalse(file.exists())
 
-    def test_expired_reservation_is_pruned_and_only_own_files(self):
+    def test_expired_and_dead_reservation_is_pruned_and_only_own_files(self):
         expired = self.reserve_file('job-old', hours=-1)
         fresh = self.reserve_file('job-new')
         foreign = expired.parent / 'notes.json'
         foreign.write_text('{"unrelated": true}')
         stranger = expired.parent / 'readme.txt'
         stranger.write_text('keep')
-        live, problems = self.live()
+        with da.state_lock(self.path):
+            record = json.loads(expired.read_text())
+            record['start_token'] = 'Mon Jan  1 00:00:00 2001'  # holder exited and the pid was reused
+            expired.write_text(json.dumps(record))
+            live, problems = da.live_reservations(self.path, self.now)
         self.assertEqual([r['label'] for r in live], ['job-new'])
         self.assertFalse(expired.exists())
         self.assertTrue(fresh.exists())
-        # Foreign files are reported or ignored, never deleted.
         self.assertTrue(foreign.exists() and stranger.exists())
         self.assertEqual(len(problems), 1)
         self.assertIn('notes.json', problems[0])
+
+    def test_expired_but_alive_holder_keeps_its_lane(self):
+        file = self.reserve_file('job-long', hours=-1)
+        live, problems = self.live()
+        self.assertTrue(file.exists(), 'a running job must not lose its lane when its time limit passes')
+        self.assertEqual([r['label'] for r in live], ['job-long'])
+        self.assertTrue(live[0]['past_ttl'])
+        self.assertEqual(problems, [])
+
+    def test_in_time_reservation_is_not_marked_past_ttl(self):
+        self.reserve_file('job-ok')
+        live, _ = self.live()
+        self.assertFalse(live[0].get('past_ttl', False))
+
+    def test_second_lane_refused_while_expired_holder_still_runs(self):
+        self.reserve_file('job-long', hours=-1)
+        refused = da.reserve('job-next', 10 * GIB, os.getppid(), self.path, lambda: 400 * GIB, now=self.now)
+        self.assertFalse(refused['admit'], refused)
+        self.assertIn('job-long', refused['reason'])  # names the holder so the caller knows what to release
+        self.assertIn('past its time limit', refused['reason'])
+
+    def test_snapshot_reports_past_ttl_holder_as_blocker(self):
+        self.reserve_file('job-long', hours=-1)
+        record = da.snapshot(self.path, lambda: (400 * GIB, 'test'), self.now)
+        self.assertEqual(record['active_heavy_jobs'], 1)
+        self.assertTrue(any('past-ttl' in b and 'job-long' in b for b in record['blockers']), record['blockers'])
 
     def take(self, label, nbytes, free, pid=None, **extra):
         return da.reserve(label, nbytes, pid or os.getpid(), self.path, lambda: free, now=self.now, **extra)

@@ -119,11 +119,14 @@ State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
 - `reservations/<label>.json`: `reserve --bytes N --pid P --label L` admits a
   heavy job only if the tier and latch admit it, a lane is free, P is a live
   process of the current user, and free bytes minus live reservations minus N
-  stay at or above 100 GiB. The hold lasts at most 4 h (`--ttl-s`), or up to 24 h
-  with an explicit `--max-hold`. A reservation records pid, process start time
-  and expiry; one whose process is gone, whose start time differs (pid reuse) or
-  that expired is ignored and deleted. A process that cannot be inspected stays
-  counted. Only well-formed files of this schema are ever deleted, and
+  stay at or above 100 GiB. `--ttl-s` (at most 4 h, or 24 h with an explicit `--max-hold`)
+  is the planned hold, not a release: it only decides when a still-running holder is reported as past its time limit.
+  The lane is held until the holder exits or `release --label L` runs, so reserve with the pid of the job itself, never a
+  long-lived shell. A reservation records pid, process start time
+  and expiry; one whose process is gone or whose start time differs (pid reuse)
+  is ignored and deleted. One that is past its time limit but whose holder is still the same
+  live process keeps its lane (reported as `reservation-past-ttl-holder-alive` in the snapshot): a time limit is
+  not evidence of release. A process that cannot be inspected stays counted. Only well-formed files of this schema are ever deleted, and
   `release --label L` deletes just that one. An unreadable or damaged file blocks
   reservations and is never deleted. These are byte claims for admission only;
   native Glomeris leases own resource claims and reaping.
@@ -134,17 +137,65 @@ State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
 
 `disk-admission.py run --bytes N --label L [--ttl-s S] [--max-hold] -- COMMAND [ARG...]` reserves for its own process and
 then `exec`s the job. `exec` keeps the pid and start time, so the reservation is held by the job itself, nothing
-runs before admission, and no release step exists: exit, pid reuse and TTL expiry are reaped lazily. A refusal
+runs before admission, and no release step exists: exit and pid reuse are reaped lazily; TTL expiry alone never frees the lane of a live holder. A refusal
 (latched, no free lane, over capacity, bad label or bytes, TTL above 4 h without `--max-hold`) never starts the job
 and exits 77; a failed `exec` releases the reservation and exits 127. Messages go to stderr (the reserved line only
 when stderr is a terminal, so a captured job stderr is not polluted), `--` between the options and the command is
 mandatory, and the job starts with default SIGPIPE/SIGXFSZ dispositions (a caller's own ignore of those signals is not preserved, because Python overwrites it at startup). The exit codes 77/127 are authoritative only
 until the job starts; afterwards the exit code is the job's own, so a job that can exit 77 or 127 is ambiguous (argparse
 errors exit 2). Only the exec'd process is tracked: a job that forks a daemon and exits, or backgrounds work, loses its
-reservation while the real consumer continues. A running job past its TTL silently loses its
-reservation, and an exited job that its parent has not reaped is still counted. Reservations only coordinate
+reservation while the real consumer continues. A running job past its TTL keeps its lane until it exits, and an exited job that its parent has not reaped is still counted. Reservations only coordinate
 callers that use them: the gate hook still decides on tier and latch alone, so an unwrapped heavy command can run
 beside a reserved one. This state is advisory (same-user), not a security boundary.
+### Heavy-lane queue (`queue`, SPE-111)
+
+A first-in-first-out, non-preemptive queue for the one heavy lane. It never signals, releases or reaps a holder; it only
+decides who is granted the lane after the current holder is gone.
+
+- `queue enqueue --label L --ticket T [--ticket T2] --repo R --worktree W --harness claude|codex --session-id ID --bytes N
+  [--wait-s S] [--again] -- COMMAND...` writes one private entry (`queue/qNNNNNN.json`, 0600, atomic, under the same flock
+  as reservations) with task and owner identity. Only a SHA-256 digest of repo, worktree, tickets, argv and bytes is stored,
+  never the argv. The same live job returns the existing entry; a RELEASED, EXPIRED or CANCELLED job needs `--again`.
+- `queue advance` runs one step under the lock: it expires lapsed grants and waits, then grants the FIRST entry in line only
+  if live reservations (including past-TTL and unverifiable ones) plus unclaimed grants are fewer than the tier's heavy
+  lanes and the latch is off. A tier or latch without a heavy lane marks the first entry ELIGIBLE and grants nothing.
+  The first entry is granted only if its bytes also fit (`free - reserved - bytes >= 100 GiB`); otherwise nothing is granted and
+  the reason says so. `ELIGIBLE` means "first in line but the tier or latch offers no heavy lane right now", not "ready".
+  A grant lasts 60 min (at most 4 h) and writes `queue/granted/<id>` plus a receipt line in `queue/receipts.jsonl`
+  (a failed receipt write reports `receipt_ok: false`; the change itself is already persisted).
+- `queue status --json` is read-only and prints, for a GRANTED entry, the resume and claim commands for the owner. They are
+  printed, never executed: resuming the owning session is an explicit handoff for Claude and for Codex
+  (`codex exec resume` is unverified here). There is no daemon and no polling; state advances only when a queue-aware
+  command runs.
+- `queue cancel --id Q` cancels a waiting or unclaimed entry.
+- While any QUEUED, ELIGIBLE or GRANTED entry exists whose wait limit or grant window has not passed, a plain `reserve`/`run` of a label that does not already hold a live
+  reservation is refused with `queue-ahead`, so a direct reservation cannot take the lane ahead of the queue. A same-label
+  refresh by the live holder still passes. A lapsed entry stops blocking at once (read-only test); `advance` records its expiry.
+  The same job queued by a different session is refused rather than handed the first session's entry; `cancel --session-id`
+  refuses another session's entry. The job digest is an HMAC with a per-store salt, so a low-entropy argv cannot be brute-forced from an entry file. An unreadable queue file blocks the queue and is never deleted.
+- `run --queue-id Q --label L --bytes N [--ttl-s S] -- COMMAND...` claims a grant for this very process, then `exec`s the
+  job. Before anything runs it revalidates, outside the lock: entry GRANTED and unlapsed, owned by this uid, label, bytes,
+  current worktree and job fingerprint all match; then a fresh `memory-admission.py check --weight heavy --memory-only`
+  (memory pressure, swap I/O, CPU load, other heavy processes). Under the lock it checks the entry again, then tier, latch,
+  heavy lanes (the grant itself does not count), the 100 GiB disk floor and that the claiming process is alive and owned, and
+  writes the holder reservation (with `queue_id`) and the CLAIMED entry in one critical section. A refusal exits 77 and keeps
+  the grant; retrying is one explicit call, never a loop. A second claim of the same grant is refused; a failed `exec`
+  releases the reservation and marks the entry RELEASED (`exec-failed`, exit 127).
+- `queue claim --id Q --label L --bytes N --pid P [--ttl-s S] -- COMMAND...` is the same claim for a supervising process: the
+  lane is held by live process P, which must be a strict ancestor of this command (a wrapper that runs the job as
+  its child, e.g. the coordinator runner) and stay alive as long as the job; any other pid is refused. Nothing is exec'd. The command after `--` must be the exact job the grant was queued for
+  (fingerprint). Prints one JSON object; exit 0 claimed, 77 refused (the grant is kept). The SPE-96 coordinator's runner uses
+  it, so a resumed session holds the lane exactly as long as its runner.
+- Release evidence: `advance` marks a CLAIMED entry RELEASED only on verified evidence: `holder-exited` (the pid is gone) or
+  `pid-reused` (a different start token). A holder that is past its time limit but alive, that cannot be inspected, or whose
+  reservation file was removed by an explicit `release` while the job still runs, keeps its lane and bytes (reserve, run, claim
+  and grant all count it). A timeout or a deleted file alone is never evidence.
+- Automation status: release detection, the grant and its durable record happen only when `queue advance` runs (reserve, run
+  and claim never grant or record releases); nothing polls and no daemon runs it. Resuming the owning Claude or Codex session is an explicit handoff:
+  `queue status` prints the resume and claim commands and never runs them. No automatic wakeup is claimed until a live
+  release-and-resume test passes; SPE-96's coordinator remains the only resume owner and has no queue event yet.
+- The queue only coordinates callers that use it; the gate hook stays in warn mode and unwrapped commands bypass it.
+
 ### Keeping the snapshot fresh (`refresher-plist`)
 
 The snapshot is stale after 120 s, so something has to republish it. `disk-admission.py refresher-plist` prints a
