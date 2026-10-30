@@ -959,9 +959,14 @@ CRONTAB, ATQ, LS, LAUNCHCTL = '/usr/bin/crontab', '/usr/bin/atq', '/bin/ls', '/b
 # launchd's default ThrottleInterval is 10 s: a job it keeps alive comes back within that, so the seal looks again later.
 RESPAWN_SECONDS = 12
 LAUNCHD_ABSENT = 'Could not find domain'
-# An existing account with no GUI session answers `print gui/<uid>` with exit 125 and this text (observed on the real QA
-# account's uid by a peer's read-only probes; an unknown uid answers 112 'Could not find domain').
+# An existing account with no GUI session answers `print gui/<uid>` with exit 125 and this text, and nothing on stdout (a
+# present session prints rc 0, an unknown uid answers 112 'Could not find domain'). Observed as the QA user and as root
+# against the real QA account and an unused one (SPE-145 part 5), so the exit code and text alone are not trusted: the
+# QA user's launchd manager must be a background one and none of its processes may belong to a GUI session.
 LAUNCHD_NO_SESSION = (125, 'Domain does not support specified action')
+BACKGROUND_MANAGERS = ('Background', 'System')
+GUI_SESSION_PROCESSES = frozenset({'loginwindow', 'WindowServer', 'Dock', 'Finder', 'SystemUIServer', 'ControlCenter',
+                                   'NotificationCenter', 'Spotlight'})
 # After the QA user's first hop macOS creates a launchd user domain for it and runs Apple services under it (first real
 # account, macOS 27.0.1, 2026-10-30: 48 loaded services, all com.apple.*, 8 running; the set varies as on-demand agents
 # such as the mdworker.* ones start and stop). So a present domain is normal and the run cannot require it absent. What
@@ -1634,18 +1639,59 @@ def qa_exec(args):
 
 def launchd_problems(domain, done):
     """A launchd domain of the QA user passes only when launchctl reports it absent in the documented form: a non-zero
-    exit and "Could not find domain", or for an account without a GUI session exit 125 with
-    "Domain does not support specified action" and empty stdout. Any present domain (whatever its services, com.apple.* included), empty or other
+    exit and "Could not find domain". Any present domain (whatever its services, com.apple.* included), empty or other
     output, or any other error is a problem. Nothing is parsed, so there is no label allowlist to get around. Used for
     gui/<uid>; user/<uid> goes through verify_user_domain, which a present domain can pass."""
-    text = (done.stdout or '') + (done.stderr or '')
-    if done.returncode != 0 and LAUNCHD_ABSENT in text:
-        return []
-    # The no-session form must match both the exact exit code and the exact text, and print nothing on stdout: a domain
-    # that is present prints rc 0 with its services, which stays a problem.
-    if done.returncode == LAUNCHD_NO_SESSION[0] and LAUNCHD_NO_SESSION[1] in (done.stderr or '') and not (done.stdout or '').strip():
+    if done.returncode != 0 and LAUNCHD_ABSENT in (done.stdout or '') + (done.stderr or ''):
         return []
     return ['launchd domain %s is present or could not be read (exit %s)' % (domain, done.returncode)]
+
+
+def is_no_gui_session(done):
+    """True for exactly the answer an existing account without a GUI session gives: the exit code, the text on stderr and
+    an empty stdout. It is only the first condition of no_gui_session_problems."""
+    return (done.returncode == LAUNCHD_NO_SESSION[0] and LAUNCHD_NO_SESSION[1] in (done.stderr or '')
+            and not (done.stdout or '').strip())
+
+
+def no_gui_session_problems(ident, domain):
+    """Problems that keep an exit-125 answer for gui/<uid> from meaning "no GUI session", read as the QA user: its launchd
+    manager (`launchctl managername`) must be exactly Background or System, and no process of the uid may be a GUI-session
+    one (loginwindow, WindowServer, Dock, Finder ...), judged by the kernel-reported executable. Anything that cannot be
+    read is a problem (fail closed). Background helpers such as distnoted and cfprefsd are normal and ignored."""
+    qis = _qis()
+    try:
+        name = subprocess.run([qis.SUDO, '-n', '-u', ident.name, LAUNCHCTL, 'managername'], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30, cwd='/', env=HOP_ENV)
+        listed = subprocess.run([PS, '-U', str(ident.uid), '-o', 'pid=,stat='], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as error:
+        return ['launchd domain %s: the no-GUI-session answer could not be corroborated (%s)' % (domain, type(error).__name__)]
+    if sudo_refused(name.stderr) or name.returncode != 0 or name.stdout.strip() not in BACKGROUND_MANAGERS:
+        return ['launchd domain %s: exit 125 but the launchd manager of %s is not Background or System' % (domain, ident.name)]
+    if listed.returncode == 1 and not listed.stdout.strip() and not listed.stderr.strip():
+        return []   # ps exits 1 with an empty table: no process of the uid
+    if listed.returncode != 0:
+        return ['launchd domain %s: the process table of %s could not be read' % (domain, ident.name)]
+    for line in listed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            return ['launchd domain %s: the process table of %s could not be read' % (domain, ident.name)]
+        if fields[1].startswith('Z'):
+            continue
+        pid = int(fields[0])
+        path = executable_path(pid)
+        if path is None:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:   # gone between the listing and the lookup
+                continue
+            except PermissionError:
+                pass
+            return ['launchd domain %s: a process of %s could not be identified' % (domain, ident.name)]
+        if os.path.basename(path) in GUI_SESSION_PROCESSES:
+            return ['launchd domain %s: exit 125 but %s runs a GUI-session process (%s)' % (domain, ident.name, os.path.basename(path))]
+    return []
 
 
 def parse_user_domain(text, uid):
@@ -1889,6 +1935,8 @@ def persistence_problems(ident):
     else:
         if sudo_refused(done.stderr):
             problems.append('launchd domain %s could not be read (sudo -n refused)' % domain)
+        elif is_no_gui_session(done):
+            problems += no_gui_session_problems(ident, domain)
         else:
             problems += launchd_problems(domain, done)
     return problems
