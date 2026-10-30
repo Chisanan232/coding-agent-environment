@@ -609,6 +609,15 @@ class IdleOrphan(unittest.TestCase):
         ok = self.take(ps_out(ps_line(10, 500, "S", "05:00", "0:01.00", "0.0", "/bin/zsh")))
         self.assertEqual(ok["heavy_procs"], {})                      # positive control: well-formed rows stay readable
 
+    def test_a_row_with_unreadable_fields_is_unknown_even_when_its_name_is_not_heavy(self):
+        good = ps_line(10, 500, "S", "05:00", "0:01.00", "0.0", "/bin/zsh")
+        for bad in (ps_line(11, 500, "S", "garbage", "0:01.00", "0.0", "/bin/zsh"),
+                    ps_line(11, 500, "S", "05:00", "nope", "0.0", "/bin/zsh"),
+                    ps_line(11, 500, "S", "05:00", "0:01.00", "x.y", "/bin/zsh"),
+                    "abc def S 05:00 0:01.00 0.0 /bin/zsh"):
+            self.assertIsNone(self.take(ps_out(good, bad))["heavy_procs"], bad)
+        self.assertEqual(self.take(ps_out(good))["heavy_procs"], {})
+
 
 if __name__ == "__main__":
     unittest.main()

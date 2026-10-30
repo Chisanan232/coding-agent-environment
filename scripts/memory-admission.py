@@ -116,6 +116,14 @@ def parse_clock(text, days=True):
     return ((int(d or 0) * 24 + int(h or 0)) * 60 + int(mi)) * 60 + float(sec)
 
 
+def _not_float(text):
+    try:
+        float(text)
+        return False
+    except ValueError:
+        return True
+
+
 def classify_heavy(ps_text):
     """(active, idle, cpu_by_pid) from `ps -axo PS_FIELDS`; (None, None, None, None) when the list is unreadable. Anything that
     cannot be fully parsed counts as active: an unknown process is never treated as an abandoned one. cpu_by_pid holds the
@@ -137,6 +145,8 @@ def classify_heavy(ps_text):
             if base not in HEAVY_COMMS:
                 return None, None, None, None   # a row that cannot be read might be a heavy process: the list is unknown
         if base not in HEAVY_COMMS:
+            if parsed and (parsed[3] is None or parsed[4] is None or _not_float(parsed[5])):
+                return None, None, None, None   # fields that cannot be read: the row is not trusted, the list is unknown
             continue
         orphan = False
         if parsed:
