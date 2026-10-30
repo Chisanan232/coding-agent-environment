@@ -128,7 +128,9 @@ the hop and acts on the verdict.
   separate OS user or an allowlist-read profile is needed to prevent that; it is not implemented here. Treat the evidence
   text as possibly containing anything this user can read.
 - SIGTERM, SIGINT and SIGHUP to the wrapper are handled: codex's group is killed and a hashed interrupted record is
-  written, so `verdict` reports `QA_INCOMPLETE` and a later edit is `QA_INVALID`. A signal that lands in the few bytecodes
+  written, so `verdict` reports `QA_INCOMPLETE` and a later edit is `QA_INVALID`. An interrupt only removes the chance of a
+  pass: if the verdict codex had already written records a failing check or a Medium-or-higher finding, the state stays
+  `QA_FAIL`, because a recorded defect is more useful to the producer than a retry. A signal that lands in the few bytecodes
   between the child being forked and `Popen` returning can leave codex unmonitored; the wrapper's exit then closes codex's
   stdin pipe, so it reads an empty prompt. SIGKILL of the wrapper cannot be handled at all and leaves no record.
 - After a clean codex exit the wrapper sends SIGKILL to the codex process group. If that group were fully gone and its id
