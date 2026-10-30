@@ -1682,6 +1682,13 @@ def parse_user_domain(text, uid):
     return services, problems
 
 
+def is_interpreter(program):
+    """True when the program's name, lower-cased and without a trailing version (python3.9, perl5.34), is an interpreter or
+    shell. An exact match after the version is stripped, not a prefix: legitimate system programs begin with the same letters
+    (shortcutsd, sharingd, opendirectoryd)."""
+    return re.sub(r'[0-9._-]+$', '', os.path.basename(program).casefold()) in INTERPRETERS
+
+
 def service_problem(text, uid, label):
     """None when `launchctl print user/<uid>/<label>` shows a service defined by a plist on the sealed system volume;
     otherwise the reason. `path` is launchd's own report of the loaded plist; a job submitted by the QA user has none or
@@ -1729,7 +1736,7 @@ def service_problem(text, uid, label):
     program = seen.get('program')
     allowed = (path + '/',) if kind == 'XPCService' else SERVICE_PROGRAM_PREFIXES   # an XPC program lives inside its bundle
     if (program is None or not program.startswith(allowed) or '..' in program
-            or os.path.basename(program).casefold().startswith(tuple(INTERPRETERS))):
+            or is_interpreter(program)):
         return 'has no program, or one that is not a system daemon'
     return None
 

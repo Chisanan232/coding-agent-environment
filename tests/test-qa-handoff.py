@@ -1483,6 +1483,14 @@ class LaunchdDomainTests(unittest.TestCase):
                 self.assertIsNotNone(REAL_SEALED_PROBLEM(path, "file"))
         self.assertIsNone(self.sealed("/usr/libexec/lsd", "file", self.system_tree(("/usr/libexec/lsd", ("f", 0, 0o755))), ("/usr/libexec/", "/usr/sbin/")))
 
+    def test_interpreters_are_matched_by_name_without_version_not_by_prefix(self):
+        for name in ("python3", "Python", "python3.9", "perl5.34", "sh", "bash", "ZSH", "osascript", "env", "node18", "swift-frontend"):
+            with self.subTest(name):
+                self.assertTrue(qa.is_interpreter("/usr/libexec/" + name), name)
+        for name in ("shortcutsd", "sharingd", "opendirectoryd", "envd", "pkd", "cfprefsd", "mdbulkimport", "nodeagentd", "swiftd"):
+            with self.subTest(name):
+                self.assertFalse(qa.is_interpreter("/usr/libexec/" + name), name)
+
     def test_the_real_xpc_service_header_is_accepted(self):
         xpc = (FIXTURES / "qa-launchd-service-xpc-mediaaccessibilityd.txt").read_text()
         label = "com.apple.accessibility.mediaaccessibilityd"
