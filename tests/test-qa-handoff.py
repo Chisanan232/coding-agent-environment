@@ -782,6 +782,16 @@ class ReviewFollowUpTests(Base):
         self.assertNotIn("Traceback", err)
         code, _ = self.call("verdict", "--run-dir", str(run_dir))   # later evaluation keeps the interruption, not "tampering"
         self.assertEqual(code, 11)
+        self.assertTrue(json.loads((run_dir / "RUNMETA.json").read_text())["interrupted"])   # hashed record, not a bypass
+        with open(run_dir / "events.jsonl", "a") as handle:                                   # tampering after the interrupt is still caught
+            handle.write("{}\n")
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)
+
+    def test_a_removed_run_record_beside_a_stored_incomplete_result_is_still_invalid(self):
+        run_dir = self.prepare()
+        (run_dir / "RESULT.json").write_text(json.dumps({"state": "QA_INCOMPLETE", "reasons": ["interrupted before a verdict"]}))
+        (run_dir / "events.jsonl").write_text('{"type": "thread.started"}\n')
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)
 
     def test_the_header_documents_every_exit_code(self):
         header = Path(SCRIPT).read_text().split('"""')[1]

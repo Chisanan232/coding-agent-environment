@@ -531,8 +531,10 @@ def run(args):
         return refuse('a run is in progress or was interrupted for this directory; prepare a new attempt')
     try:
         return run_locked(args, run_dir, packet, source)
-    except KeyboardInterrupt:      # Ctrl-C or SIGTERM: codex's group is already killed; say so instead of a traceback
-        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['interrupted before a verdict'])
+    except KeyboardInterrupt:      # Ctrl-C or SIGTERM: codex's group is killed and a hashed run record written; evaluate it
+        if (run_dir / 'RUNMETA.json').exists():
+            return evaluate(run_dir)
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['interrupted before codex started'])
     finally:
         try:
             os.unlink(run_dir / 'RUN.lock')
@@ -551,6 +553,14 @@ def kill_group(proc):
             return
         except subprocess.TimeoutExpired:
             continue
+
+
+def write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=False):
+    counts = count_commands(events)
+    meta = {'argv': argv[:-1], 'exit_code': proc.returncode, 'seconds': round(time.time() - t0, 1), 'timed_out': timed_out,
+            'interrupted': interrupted, 'events_sha256': sha256_file(events), 'verdict_sha256': safe_digest(run_dir / 'verdict.json'),
+            'commands_completed': counts[0], 'commands_succeeded': counts[1]}
+    write_private(run_dir / 'RUNMETA.json', meta)
 
 
 def run_locked(args, run_dir, packet, source):
@@ -592,16 +602,13 @@ def run_locked(args, run_dir, packet, source):
             kill_group(proc)
         except BaseException:
             kill_group(proc)           # Ctrl-C or SIGTERM to the wrapper must not leave codex running
+            write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=True)   # hashed, so a later edit is still caught
             raise
         finally:
             signal.signal(signal.SIGTERM, old)
     os.chmod(run_dir / 'stderr.log', 0o600)
     time.sleep(getattr(args, 'settle', SETTLE_SECONDS))   # let any straggler finish writing before the tree is checked
-    verdict = run_dir / 'verdict.json'
-    meta = {'argv': argv[:-1], 'exit_code': proc.returncode, 'seconds': round(time.time() - t0, 1), 'timed_out': timed_out,
-            'events_sha256': sha256_file(events), 'verdict_sha256': safe_digest(verdict),
-            'commands_completed': count_commands(events)[0], 'commands_succeeded': count_commands(events)[1]}
-    write_private(run_dir / 'RUNMETA.json', meta)
+    write_meta(run_dir, argv, proc, t0, timed_out, events)
     return evaluate(run_dir)
 
 
@@ -644,9 +651,11 @@ def evaluate(run_dir):
 
 
 def no_run_record(run_dir, packet, verdict_path, events):
-    """No RUNMETA.json: codex never finished a run. An earlier WAITING_RESOURCE or QA_INCOMPLETE (interrupted, could not
-    start) result is kept even when partial output exists, because without a run record nothing can pass. Output beside
-    any other earlier result (a pass or fail whose record was removed) is an integrity failure."""
+    """No RUNMETA.json: codex never finished or even started a run. Any output without a record is an integrity failure
+    (a record could have been removed). With no output, an earlier WAITING_RESOURCE or QA_INCOMPLETE (interrupted before
+    codex started, could not start) result is kept, because nothing ran that could pass."""
+    if os.path.lexists(verdict_path) or (os.path.lexists(events) and os.lstat(events).st_size):
+        return write_result(run_dir, packet, 'QA_INVALID', ['run output exists but the run record is missing'])
     try:
         previous = read_run_json(run_dir / 'RESULT.json')
     except LOAD_ERRORS:
@@ -654,8 +663,6 @@ def no_run_record(run_dir, packet, verdict_path, events):
     if isinstance(previous, dict) and previous.get('state') in ('WAITING_RESOURCE', 'QA_INCOMPLETE'):
         print('%s %s' % (previous['state'], '; '.join(clean(r) for r in previous.get('reasons', []) if isinstance(r, str))))
         return EXIT[previous['state']]
-    if os.path.lexists(verdict_path) or (os.path.lexists(events) and os.lstat(events).st_size):
-        return write_result(run_dir, packet, 'QA_INVALID', ['run output exists but the run record is missing'])
     return write_result(run_dir, packet, 'NOT_RUN', ['codex has not been run for this attempt'])
 
 
@@ -677,6 +684,11 @@ def evaluate_files(run_dir, packet):
     if meta['verdict_sha256'] == 'UNREADABLE' or safe_digest(verdict_path) == 'UNREADABLE':
         return write_result(run_dir, packet, 'QA_INVALID', bad + ['verdict is not a regular file (link planted?)'])
     if not os.path.lexists(verdict_path):
+        if meta.get('interrupted'):
+            tampered = check_tree(run_dir / 'source', read_run_json(run_dir / 'tree-manifest.json'))
+            if tampered or bad:
+                return write_result(run_dir, packet, 'QA_INVALID', bad + tampered)
+            return write_result(run_dir, packet, 'QA_INCOMPLETE', ['interrupted before a verdict'])
         if meta.get('timed_out'):
             tampered = check_tree(run_dir / 'source', read_run_json(run_dir / 'tree-manifest.json'))
             if tampered or bad:               # a timeout does not excuse a modified clone or a changed event stream
