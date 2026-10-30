@@ -47,7 +47,7 @@ This section states no rule of its own. Each principle is owned elsewhere and is
 
 | Principle | Owner |
 |---|---|
-| GitEmoji commits; small, cohesive, bisectable commits (a tightly coupled regression test may share its implementation commit, per the founder's commit principle) | `.claude/skills/engineering-workflow/SKILL.md`, "Implement and commit" |
+| GitEmoji commits; small, cohesive, bisectable commits (one new test per commit, test utilities and mocks in earlier commits; an implementation and its test share a commit only as one inseparable correctness change; commit granularity is separate from validation frequency) | `.claude/skills/engineering-workflow/SKILL.md`, "Implement and commit" |
 | Branch and worktree format, verified approved base, one writer per branch | `.claude/skills/engineering-workflow/SKILL.md` |
 | PR-only: no feature work, commit or push on the default or protected branches; pushing a feature branch to open a PR is autonomous | default/protected-branch half: `~/.claude/CLAUDE.md` (quick-fix step 5, Push Gate Policy); feature-branch half: `.claude/skills/engineering-workflow/SKILL.md`, `docs/ENGINEERING-POLICY.md` section 1 |
 | Independent review, PR classes A/B/C, exact-head merge, no self-approval | `.claude/skills/engineering-workflow/SKILL.md`, `docs/ENGINEERING-POLICY.md` section 4 |
@@ -158,7 +158,7 @@ Each row is settled by a source cited here; the interim behavior is simply the r
 | 5 | GitHub interface | `gh` first, MCP retired; the live sentence is fixed by the owner-run rollout | `.claude/skills/engineering-workflow/SKILL.md`; ADR 0015; `docs/ROLLOUT-USER-CLAUDE-MD.md` |
 | 6 | Merge strategy | merge commit only; the legacy lines that let a repository choose squash/rebase are defects fixed by the owner-run rollout | live managed span; `.claude/skills/engineering-workflow/SKILL.md`; founder instruction 2026-10-23 |
 | 7 | Code-owner and formal approval | Class A owner-authored: no formal GitHub approval merely for authorship. Class B/C: genuine owner `APPROVED` on the current head. No self-approval, no `--admin`, squash or rebase; a host denial is reported, never bypassed | `docs/ENGINEERING-POLICY.md` section 4; `.claude/skills/engineering-workflow/SKILL.md` merge gate |
-| 8 | Commit granularity | small, cohesive, atomic commits; a tightly coupled regression test may share its implementation commit | founder commit principle; `.claude/skills/engineering-workflow/SKILL.md` |
+| 8 | Commit granularity | small, cohesive, atomic commits; one new test per commit with its utilities and mocks in earlier commits; commit granularity does not set test frequency (batch into validation checkpoints) | founder commit principle; `.claude/skills/engineering-workflow/SKILL.md` |
 | 9 | Direct push | no commit or push to the default or protected branches; pushing a feature branch to open a PR stays autonomous. The Codex blanket `git push` allow is managed config: owner item, reported only | default/protected half: `~/.claude/CLAUDE.md` (quick-fix step 5, Push Gate Policy); feature-branch half: `.claude/skills/engineering-workflow/SKILL.md`, `docs/ENGINEERING-POLICY.md` section 1 |
 | 10 | Enforcement claims | claim only what `docs/ENGINEERING-POLICY.md` section 3 lists as enforced; everything else is advisory text | `docs/ENGINEERING-POLICY.md` section 3 |
 | 11 | Worktree directory name | `<repo>-<phase>-<ticket>-<type>-<summary>` once item 1 is as above | `.claude/skills/engineering-workflow/SKILL.md` worktree formula |
