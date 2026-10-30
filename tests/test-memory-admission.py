@@ -42,9 +42,10 @@ def vm(swapins=0, swapouts=0, compressor_pages=0):
 ZERO_SWAP = {"total": 0, "used": 0, "free": 0}   # a fresh post-reboot machine: no swap files yet
 
 
-def sample(t, level=1, swapins=0, swapouts=0, compressor=0.0, load=2.0, cpus=16, disk=494 * GIB, swap=ZERO_SWAP, heavy=None):
+def sample(t, level=1, swapins=0, swapouts=0, compressor=0.0, load=2.0, cpus=16, disk=494 * GIB, swap=ZERO_SWAP, heavy=None, idle=None):
     return {"time": t, "mono": t, "ram": RAM, "pressure_level": level, "swap": swap, "vm": vm(swapins, swapouts, int(compressor * RAM / PAGE)),
-            "load1": load, "cpus": cpus, "disk_free": disk, "heavy_procs": {} if heavy is None else heavy}
+            "load1": load, "cpus": cpus, "disk_free": disk, "heavy_procs": {} if heavy is None else heavy,
+            "idle_procs": [] if idle is None else idle}
 
 
 def metrics(**kw):
@@ -52,6 +53,14 @@ def metrics(**kw):
     pages = int(io_mib * 1024 ** 2 * 10 / PAGE)  # over a 10 s window
     return ma.derive(sample(0, **{k: v for k, v in kw.items() if k not in ("swapins", "swapouts")}),
                      sample(10, swapins=pages, **kw))
+
+
+def ps_line(pid, ppid, state, etime, cputime, pcpu, comm):
+    return f"{pid:>6} {ppid:>6} {state:<2} {etime:>12} {cputime:>10} {pcpu:>5} {comm}"
+
+
+def ps_out(*lines):
+    return "\n".join(lines) + "\n"
 
 
 class Parsing(unittest.TestCase):
@@ -74,7 +83,9 @@ class Parsing(unittest.TestCase):
     def test_take_sample_counts_heavy_process_names_only(self):
         def run(cmd, **kw):
             self.assertTrue(os.path.isabs(cmd[0]), cmd)   # PATH is never consulted
-            out = {"ps": "/usr/bin/cargo\n/bin/zsh\n/x/y/rustc\n/x/rustc\nclaude\n", "vm_stat": VM_STAT,
+            out = {"ps": ps_out(ps_line(10, 500, "S", "05:00", "0:01.00", "0.0", "/usr/bin/cargo"), ps_line(11, 10, "S", "05:00", "0:01.00", "0.0", "/bin/zsh"),
+                           ps_line(12, 10, "R", "05:00", "0:09.00", "90.0", "/x/y/rustc"), ps_line(13, 10, "S", "05:00", "0:01.00", "0.0", "/x/rustc"),
+                           ps_line(14, 10, "S", "05:00", "0:01.00", "0.0", "claude")), "vm_stat": VM_STAT,
                    "sysctl": {"hw.memsize": str(RAM), "kern.memorystatus_vm_pressure_level": "2", "vm.swapusage": SWAP}.get(cmd[-1], "")}[os.path.basename(cmd[0])]
             return type("R", (), {"returncode": 0, "stdout": out})()
         s = ma.take_sample(run=run, now_fn=lambda: 5.0, mono_fn=lambda: 5.0, load_fn=lambda: (1.0, 1.0, 1.0), cpu_fn=lambda: 16, disk_free_fn=lambda: GIB)
@@ -457,6 +468,94 @@ class ReviewHardening(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             ma.main(["status", "--window", "nan", "--json"], {"sample": lambda: next(calls), "sleep": seen.append, "now": lambda: 1.0, "disk": lambda w: (True, "")})
         self.assertEqual(seen, [10.0])
+
+
+class IdleOrphan(unittest.TestCase):
+    """SPE-134: a heavy lane is live work, not a process name. Idle orphans are reported, never counted."""
+
+    ORPHAN = ps_line(25830, 1, "S", "3-22:10:05", "0:10.00", "0.0", "/Users/x/.rustup/bin/rustc")
+
+    def take(self, ps, lsof="p25830\nn/work/tree\n", calls=None):
+        def run(cmd, **kw):
+            if calls is not None:
+                calls.append(list(cmd))
+            name = os.path.basename(cmd[0])
+            if name == "lsof" and lsof is None:
+                raise OSError("no lsof")
+            out = {"ps": ps, "lsof": lsof, "vm_stat": VM_STAT,
+                   "sysctl": {"hw.memsize": str(RAM), "kern.memorystatus_vm_pressure_level": "1", "vm.swapusage": SWAP}.get(cmd[-1], "")}[name]
+            return type("R", (), {"returncode": 0, "stdout": out})()
+        return ma.take_sample(run=run, now_fn=lambda: 5.0, mono_fn=lambda: 5.0, load_fn=lambda: (1.0, 1.0, 1.0), cpu_fn=lambda: 16, disk_free_fn=lambda: GIB)
+
+    def test_idle_orphan_is_reported_with_pid_age_and_cwd_and_not_counted(self):
+        s = self.take(ps_out(self.ORPHAN, ps_line(1, 0, "Ss", "9-00:00:00", "1:00.00", "0.0", "/sbin/launchd")))
+        self.assertEqual(s["heavy_procs"], {})
+        (o,) = s["idle_procs"]
+        self.assertEqual((o["pid"], o["comm"], o["ppid"]), (25830, "rustc", 1))
+        self.assertEqual(o["age_s"], 3 * 86400 + 22 * 3600 + 10 * 60 + 5)
+        self.assertEqual(o["cwd"], "/work/tree")
+
+    def test_a_process_with_a_live_parent_counts_even_when_quiet(self):
+        s = self.take(ps_out(ps_line(40, 39, "S", "02:00:00", "0:01.00", "0.0", "/x/rustc")))
+        self.assertEqual((s["heavy_procs"], s["idle_procs"]), ({"rustc": 1}, []))
+
+    def test_orphan_that_is_running_busy_young_or_uninterruptible_still_counts(self):
+        for line in (ps_line(41, 1, "R", "3-00:00:00", "0:10.00", "0.0", "/x/rustc"),
+                     ps_line(42, 1, "S", "3-00:00:00", "0:10.00", "40.0", "/x/rustc"),
+                     ps_line(43, 1, "S", "00:30", "0:00.10", "0.0", "/x/rustc"),
+                     ps_line(44, 1, "U", "3-00:00:00", "0:10.00", "0.0", "/x/rustc")):
+            s = self.take(ps_out(line))
+            self.assertEqual(s["heavy_procs"], {"rustc": 1}, line)
+            self.assertEqual(s["idle_procs"], [], line)
+
+    def test_unparseable_heavy_line_fails_closed_as_active(self):
+        s = self.take(ps_out("garbage that still ends in /x/y/rustc", ps_line(45, 1, "S", "bad", "0:10.00", "0.0", "/x/rustc")))
+        self.assertEqual(s["heavy_procs"], {"rustc": 2})
+
+    def test_unreadable_process_list_stays_unknown(self):
+        self.assertIsNone(self.take("")["heavy_procs"])
+
+    def test_no_command_line_is_ever_requested(self):
+        calls = []
+        self.take(ps_out(self.ORPHAN), calls=calls)
+        for cmd in calls:
+            joined = " ".join(cmd)
+            for forbidden in ("args", "command", "-ww", "ucomm", "-Eo"):
+                self.assertNotIn(forbidden, joined.replace("comm=", ""), joined)
+
+    def test_cwd_lookup_failure_only_drops_the_cwd(self):
+        (o,) = self.take(ps_out(self.ORPHAN), lsof=None)["idle_procs"]
+        self.assertEqual((o["pid"], o["cwd"]), (25830, None))
+
+    def test_idle_orphan_alone_does_not_refuse_but_is_reported_with_its_owner_hint(self):
+        idle = [{"pid": 25830, "comm": "rustc", "ppid": 1, "age_s": 340000, "cpu_s": 10.0, "cwd": "/work/tree"}]
+        m = ma.derive(sample(0, idle=idle), sample(10, idle=idle))
+        verdict, _ = ma.decide("heavy", m, None, 1000.0)
+        self.assertTrue(verdict["admit"], verdict)
+        note = " ".join(verdict["warnings"])
+        self.assertIn("25830", note)
+        self.assertIn("/work/tree", note)
+        self.assertIn("3d", note)
+
+    def test_active_lane_and_real_load_still_refuse_next_to_an_idle_orphan(self):
+        idle = [{"pid": 25830, "comm": "rustc", "ppid": 1, "age_s": 340000, "cpu_s": 10.0, "cwd": None}]
+        m = ma.derive(sample(0, idle=idle, heavy={"cargo": 1}), sample(10, idle=idle, heavy={"cargo": 1}))
+        verdict, _ = ma.decide("heavy", m, None, 1000.0)
+        self.assertFalse(verdict["admit"])
+        self.assertIn("one heavy lane at a time", " ".join(verdict["reasons"]))
+        loaded = ma.derive(sample(0, idle=idle, load=100.0), sample(10, idle=idle, load=100.0))
+        self.assertFalse(ma.decide("heavy", loaded, None, 1000.0)[0]["admit"])
+
+    def test_an_orphan_that_used_cpu_during_the_window_is_reclassified_active(self):
+        first = [{"pid": 25830, "comm": "rustc", "ppid": 1, "age_s": 340000, "cpu_s": 10.0, "cwd": None}]
+        second = [dict(first[0], cpu_s=12.5)]
+        m = ma.derive(sample(0, idle=first), sample(10, idle=second))
+        self.assertEqual(m["heavy_procs"], {"rustc": 1})
+        self.assertEqual(m["idle_procs"], [])
+
+    def test_unreadable_idle_data_does_not_hide_an_unknown_process_list(self):
+        m = ma.derive(sample(0), dict(sample(10), heavy_procs=None))
+        self.assertFalse(ma.decide("heavy", m, None, 1000.0)[0]["admit"])
 
 
 if __name__ == "__main__":

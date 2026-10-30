@@ -48,10 +48,19 @@ SWAP_LOW_FREE = 4 * GIB
 SWAP_GROWTH_DISK_FLOOR = 100 * GIB   # same figure as the SPE-109 heavy floor: below it swap cannot be trusted to grow
 HEAVY_COMMS = frozenset({"cargo", "rustc", "rust-lld", "cc1", "cc1plus", "clang", "clang++", "ld", "xcodebuild",
                          "swift-build", "swift-frontend", "gradle", "buildkitd"})
+# A heavy-named process is a running lane only with evidence of work or ownership. An orphan (parent is launchd) that is
+# not runnable, has used almost no CPU recently and has been around a while is a leftover: reported, never counted.
+IDLE_MIN_AGE = 900          # seconds
+IDLE_PCPU = 1.0             # ps %cpu, a decaying recent average
+CPU_ACTIVE_DELTA = 0.05     # CPU seconds an orphan may use across the sampling window and still be idle
+MAX_IDLE_REPORT = 5
+IDLE_STATES = frozenset({"S", "I", "T", "Z"})   # first letter of the ps state; R (running) and U (uninterruptible) are work
 DEFAULT_STATE = pathlib.Path.home() / ".cache/coding-agent-environment/memory-admission/state.json"
 REFUSE_RC = 77
 VALID_LEVELS = frozenset({1, 2, 4})   # the only values the kernel reports
 SYSCTL, PS, VM_STAT = "/usr/sbin/sysctl", "/bin/ps", "/usr/bin/vm_stat"   # absolute: PATH is not trusted
+LSOF = "/usr/sbin/lsof"
+PS_FIELDS = "pid=,ppid=,state=,etime=,time=,pcpu=,comm="   # never args/command: command lines can carry secrets
 MAX_STATE_BYTES = 64 * 1024
 LOCK_WAIT = 10.0
 
@@ -99,6 +108,58 @@ def _run(cmd, run=subprocess.run):
         return None
 
 
+def parse_clock(text, days=True):
+    """ps elapsed/cpu time: [[dd-]hh:]mm:ss[.ss] -> seconds, or None when it is not that shape."""
+    m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)", text or "")
+    if not m:
+        return None
+    d, h, mi, sec = m.groups()
+    return ((int(d or 0) * 24 + int(h or 0)) * 60 + int(mi)) * 60 + float(sec)
+
+
+def classify_heavy(ps_text):
+    """(active, idle) from `ps -axo PS_FIELDS`; (None, None) when the list is unreadable. Anything that cannot be fully
+    parsed counts as active: an unknown process is never treated as an abandoned one."""
+    if ps_text is None or not ps_text.strip():
+        return None, None
+    active, idle = {}, []
+    for line in ps_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 6)
+        parsed = None
+        if len(parts) == 7 and parts[0].isdigit() and parts[1].isdigit():
+            base = os.path.basename(parts[6].strip())
+            parsed = (int(parts[0]), int(parts[1]), parts[2], parse_clock(parts[3]), parse_clock(parts[4]), parts[5])
+        else:
+            base = os.path.basename(line.split()[-1])
+        if base not in HEAVY_COMMS:
+            continue
+        orphan = False
+        if parsed:
+            pid, ppid, state, age, cpu, pcpu = parsed
+            try:
+                pcpu_v = float(pcpu)
+            except ValueError:
+                pcpu_v = None
+            orphan = (ppid == 1 and state[:1] in IDLE_STATES and age is not None and age >= IDLE_MIN_AGE
+                      and cpu is not None and pcpu_v is not None and pcpu_v <= IDLE_PCPU)
+        if orphan:
+            idle.append({"pid": pid, "comm": base, "ppid": ppid, "age_s": int(age), "cpu_s": cpu, "cwd": None})
+        else:
+            active[base] = active.get(base, 0) + 1
+    return active, idle
+
+
+def lookup_cwd(pid, run):
+    out = _run([LSOF, "-a", "-d", "cwd", "-p", str(pid), "-Fn"], run)
+    for line in (out or "").splitlines():
+        if line.startswith("n") and len(line) > 1:
+            return "".join(c for c in line[1:] if c.isprintable())[:200]
+    return None
+
+
 def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu_fn=os.cpu_count, disk_free_fn=None, mono_fn=time.monotonic):
     """One reading of the machine. Every field may be None when it could not be read (fail closed upstream)."""
     def sysctl_int(name):
@@ -107,14 +168,11 @@ def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu
             return int(t.strip())
         except (AttributeError, ValueError):
             return None
-    comms = _run([PS, "-axo", "comm="], run)
-    heavy = None   # None = the process list could not be read (unknown), never "no heavy process"
-    if comms is not None and comms.strip():   # empty output from a successful ps is not "nothing running": a live system always has processes
-        heavy = {}
-        for line in comms.splitlines():
-            base = os.path.basename(line.strip())
-            if base in HEAVY_COMMS:
-                heavy[base] = heavy.get(base, 0) + 1
+    # None = the process list could not be read (unknown), never "no heavy process"; empty output from a successful ps is
+    # not "nothing running" either, because a live system always has processes.
+    heavy, idle = classify_heavy(_run([PS, "-axo", PS_FIELDS], run))
+    for rec in (idle or [])[:MAX_IDLE_REPORT]:
+        rec["cwd"] = lookup_cwd(rec["pid"], run)
     try:
         load1 = load_fn()[0]
     except OSError:
@@ -129,13 +187,21 @@ def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu
         disk_free = None
     return {"time": now_fn(), "mono": mono_fn(), "ram": sysctl_int("hw.memsize"), "pressure_level": sysctl_int("kern.memorystatus_vm_pressure_level"),
             "swap": parse_swapusage(_run([SYSCTL, "-n", "vm.swapusage"], run)), "vm": parse_vm_stat(_run([VM_STAT], run)),
-            "load1": load1, "cpus": cpu_fn() or None, "disk_free": disk_free, "heavy_procs": heavy}
+            "load1": load1, "cpus": cpu_fn() or None, "disk_free": disk_free, "heavy_procs": heavy, "idle_procs": idle or []}
 
 
 def derive(s1, s2):
     """Rates and ratios from two samples taken `window` seconds apart. None means unknown."""
     d = {"pressure_level": s2.get("pressure_level"), "ram": s2.get("ram"), "disk_free": s2.get("disk_free"),
          "heavy_procs": s2.get("heavy_procs"), "swap": s2.get("swap")}
+    # An orphan that spent CPU between the two samples is working, whatever its history says.
+    before = {r["pid"]: r["cpu_s"] for r in s1.get("idle_procs") or []}
+    d["idle_procs"] = []
+    for rec in s2.get("idle_procs") or []:
+        if rec["pid"] in before and rec["cpu_s"] - before[rec["pid"]] > CPU_ACTIVE_DELTA and d["heavy_procs"] is not None:
+            d["heavy_procs"] = dict(d["heavy_procs"], **{rec["comm"]: d["heavy_procs"].get(rec["comm"], 0) + 1})
+        else:
+            d["idle_procs"].append(rec)
     key = "mono" if s1.get("mono") is not None and s2.get("mono") is not None else "time"   # monotonic: a wall-clock step must not dilute the rate
     dt = (s2.get(key) or 0) - (s1.get(key) or 0)
     v1, v2 = s1.get("vm"), s2.get("vm")
@@ -152,6 +218,12 @@ def derive(s1, s2):
 
 
 # ---- decision (pure) -------------------------------------------------------------------------------------------------
+def format_age(seconds):
+    d, rem = divmod(int(seconds), 86400)
+    h, rem = divmod(rem, 3600)
+    return f"{d}d{h}h" if d else (f"{h}h{rem // 60}m" if h else f"{rem // 60}m")
+
+
 def swap_cannot_grow(m):
     sw = m.get("swap")
     if not sw or not sw.get("total") or m.get("disk_free") is None:
@@ -233,6 +305,10 @@ def decide(weight, m, state, now):
     sw = m.get("swap")
     if sw and sw["total"] and sw["used"] / sw["total"] >= SWAP_FULL_FRACTION and not swap_cannot_grow(m) and not reasons:
         warnings.append("swap is mostly used but current swap I/O and pressure are low: historical, not current exhaustion")
+    if weight == "heavy":
+        for rec in m.get("idle_procs") or []:
+            warnings.append(f"idle orphan {rec['comm']} pid {rec['pid']} (age {format_age(rec['age_s'])}, cwd {rec.get('cwd') or 'unknown'}) "
+                            "is not counted as a heavy lane; its owner can reclaim it, nothing is signalled")
     if weight == "light":
         verdict = {"admit": not reasons, "reasons": reasons, "warnings": warnings + [f"unknown: {u}" for u in unknown]}
         return dict(verdict, weight=weight), st
@@ -358,6 +434,7 @@ def assess(weight, window, state_path, memory_only, deps):
             verdict["reasons"] = verdict["reasons"] + [f"{exc}: heavy work fails closed"]
     else:
         verdict, _ = decide(weight, m, None, deps["now"]())
+    verdict["idle_orphans"] = [{k: r.get(k) for k in ("pid", "comm", "age_s", "cwd")} for r in m.get("idle_procs") or []]
     verdict["memory"] = {k: m[k] for k in ("pressure_level", "swap_io_mib_s", "compressor_ratio", "load_per_core", "disk_free")}
     verdict["memory"]["swap_used_fraction"] = (m["swap"]["used"] / m["swap"]["total"]) if m.get("swap") and m["swap"]["total"] else None
     if not memory_only and weight:
