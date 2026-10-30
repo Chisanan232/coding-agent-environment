@@ -116,3 +116,12 @@ with a live parent (a `rustc` under `cargo` or a shell), and any line `ps` print
 process list still fails closed. Load, memory pressure, swap and disk reasons are unchanged. The live parent chain is the
 ownership signal: an SPE-109 reservation is held by the job that reserved it, whose build processes have that job as a
 live ancestor, so a reservation-holding build is never an orphan; reservation records are not read here.
+
+## Unreaped lane holders (SPE-111)
+
+A holder that has exited but whose parent never reaped it is a zombie. The zombie wrapper alone is not proof that the lane is
+free: the job it started keeps running in the wrapper's process group. `disk-admission.py` therefore treats a zombie holder as
+exited only when it led its own process group (pgid equals pid) and no other live process remains in that group. A zombie that
+shares a group with other processes, or a process table that cannot be read, keeps the lane occupied (fail closed): reap the
+zombie (its parent) or have the owner release it. A job that left the group with `setsid` is not visible to this check; that
+residual is accepted and is why a lane holder should supervise its job from a process that stays alive.
