@@ -197,6 +197,49 @@ class ProbeFailsClosedTest(unittest.TestCase):
         self.assertFalse(any("DONE" in line for line in out))
 
 
+class IsolationRecordTest(unittest.TestCase):
+    """isolation_record is what qa-handoff.py calls before each QA run: it reports, it never prompts and never raises Stop."""
+
+    def record(self, stdout, procenv_ok=True):
+        s = qis.Setup("qauser", 777, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"))
+        pw = mock.Mock(pw_dir="/Users/owner", pw_name="owner", pw_uid=501)
+        calls, holder = [], {}
+        real_token = qis.secrets.token_hex
+
+        def token(n):
+            holder["t"] = real_token(n)
+            return holder["t"]
+
+        def fake_run(argv, **kw):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0 if stdout else 1, stdout, "sudo: a password is required\n")
+
+        def no_prompt():
+            raise AssertionError("isolation_record must never ask for a password")
+
+        env = (lambda pid: ("QA_SENTINEL=qa-sentinel-%s" % holder["t"]).encode()) if procenv_ok else (lambda pid: None)
+        with mock.patch.object(qis, "run", fake_run), mock.patch.object(qis, "sudo_refresh", no_prompt), \
+                mock.patch.object(qis.subprocess, "Popen", lambda *a, **k: FakeSibling()), \
+                mock.patch.object(qis.secrets, "token_hex", token), mock.patch.object(qis, "procenv", env):
+            return s.isolation_record(pw), calls
+
+    def test_isolation_record_never_prompts_and_returns_fails(self):
+        import json
+        (o, fails), calls = self.record(json.dumps(dict(GOOD, foreign_env_leaked=True)) + "\n")
+        self.assertIsInstance(o, dict)
+        self.assertTrue(any("producer's process environment" in f for f in fails))
+        self.assertEqual(calls[0][:2], [qis.SUDO, "-n"])                       # never an interactive sudo
+        (o, fails), _ = self.record(json.dumps(GOOD) + "\n")
+        self.assertEqual(fails, [])
+        (o, fails), _ = self.record("")                                         # sudo -n refused: no record, not a Stop
+        self.assertIsNone(o)
+        self.assertTrue(fails and "did not run" in fails[0])
+        (o, fails), calls = self.record(json.dumps(GOOD) + "\n", procenv_ok=False)
+        self.assertIsNone(o)
+        self.assertTrue("control invalid" in fails[0])
+        self.assertEqual(calls, [])                                             # no QA-user probe without a valid control
+
+
 class CommandShapeTest(unittest.TestCase):
     def test_qa_argv_clears_env_and_detaches(self):
         a = qis.qa_argv("fornaxqa", Path("/Users/fornaxqa"), ["/usr/bin/id"])
