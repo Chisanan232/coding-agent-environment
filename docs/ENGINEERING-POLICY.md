@@ -160,9 +160,11 @@ blocker that persists becomes one decision packet.
 
 **Merge.** Eligible PRs merge automatically when the authenticated identity, GitHub rules and host policy allow it.
 Self-review and independent agent review count as engineering validation but never as a manufactured GitHub
-approval. On a self-approval, branch-protection or host denial: record it once, do not retry through aliases or
-other syntax, and hand over the PR URL, head SHA, local evidence, review verdict and the head-pinned owner merge
-command, then continue other work.
+approval. The agent runs the gate's printed `merge_command` itself, or reaches the normal host ASK so the owner can
+approve the actual operation; it does not hand the owner a command to run by default. On a self-approval,
+branch-protection or host denial: record it once, do not retry through aliases or other syntax. Only when no
+supported approval path exists, report the exact restriction and the minimum unavoidable owner action once (PR URL,
+head SHA, local evidence, review verdict, the head-pinned command), then continue other work.
 
 **Release readiness.** Eight states stay separate, each reported with its own recorded evidence. A skipped or
 unavailable check is never PASS. `ENGINEERING_COMPLETE` and `INDEPENDENT_QA_SIGNED_OFF` replace the earlier
