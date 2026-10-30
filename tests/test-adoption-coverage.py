@@ -107,10 +107,19 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(row["files"][".claude/CLAUDE.md"]["skipped"], "larger than 1 MiB")
 
     def test_squash_negation_attaches_to_the_term_only(self):
-        for text in ("Merge: never rebase. Squash all PRs.", "Squash merge, not rebase.", "Use squash for feature PRs"):
+        for text in ("Merge: never rebase. Squash all PRs.", "Squash merge, not rebase.", "Use squash for feature PRs",
+                     "Merge strategy: squash all PRs (no merge commits).",
+                     "Squash all PRs, never merge commits", "Squash all PRs, rebase and merge commits are disabled", "Squash all PRs, merge commits are disabled",
+                     "Squash merge only, rebase disabled", "Squash merge, avoid rebase",
+                     "Use squash (never rebase) for all PRs", "| Merge | **Squash** for feature PRs"):
             self.assertTrue(ac.permits_squash(text), text)
         for text in ("Use merge commits instead of squash.", "Rather than squash, merge.", "Don\u2019t squash.",
-                     "Never squash or rebase.", "Squash merge is disabled."):
+                     "Never squash or rebase.", "Squash merge is disabled.",
+                     "Squash and rebase merges are disabled for this repository.", "squash merge (it is disabled)",
+                     "Squash, rebase and merge commits are disabled", "squash (the old way) is disabled",
+                     "squash merging, which is forbidden here", "squash (disabled)", "Squash merge, prohibited",
+                     "Squash merges (the default) are disabled", "Squash, however, is disabled",
+                     "Squash merge is disabled on purpose. The atomic history is the audit trail; squashing destroys it."):
             self.assertFalse(ac.permits_squash(text), text)
 
     def test_missing_checkout_and_missing_files(self):

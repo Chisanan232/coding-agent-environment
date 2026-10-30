@@ -28,22 +28,51 @@ FILES = ('.claude/CLAUDE.md', 'CLAUDE.md', 'AGENTS.md')
 LEGACY_FORMAT = re.compile(r'<emoji>\s*<?scope>?\s*:|(?:✨|🐛|♻️|✅|📝|🔧|🔌|🪝|🧭|⬆️|🗑️|🚨)\s+[A-Za-z][\w/-]*:')
 # A clause (split on ; and |) that permits squash merging: it names squash and no negation attaches to it.
 SQUASH = re.compile(r'squash', re.IGNORECASE)
-NEGATION = re.compile(r"\b(?:never|no|not|disabled|forbidden|prohibit\w*|destroy\w*|avoid|don['\u2019]t|without|"
-                      r"instead of|rather than)\b", re.IGNORECASE)
+# Strong negations attach to squash anywhere in the same sentence; weak ones ("no", "not") only when they sit right
+# next to it, because `squash all PRs (no merge commits)` and `squash, not rebase` negate something else.
+STRONG_NEGATION = re.compile(r"\b(?:never|disabled|forbidden|prohibit\w*|destroy\w*|avoid|instead of|rather than)\b",
+                             re.IGNORECASE)
+WEAK_NEGATION = re.compile(r"\b(?:no|not|don['\u2019]t|without)\b", re.IGNORECASE)
 # Three-part branch form: the ticket is followed directly by the summary, with no <type> segment.
 BRANCH_THREE_PART = re.compile(r'<ticket(?:-?id|-?number)?>/<(?:short|summary)', re.IGNORECASE)
 MAX_BYTES = 1 << 20
 
 
+OTHER_TERM = re.compile(r"\b(?:rebase\w*|merge commits?|force|fast-forward)\b", re.IGNORECASE)
+NEGATION_WORD = r"(?:never|disabled|forbidden|prohibit\w*|destroy\w*|avoid|no|not|don['\u2019]t|without)"
+SAME_SUBJECT = re.compile(r"^(?:it|this|they|squash\w*|" + NEGATION_WORD + r")\b", re.IGNORECASE)
+
+
+def attached_after(after):
+    """The text after `squash` that a strong negation can still be about. A parenthetical is dropped unless it speaks of
+    squash itself (`(it is disabled)`, `(disabled)`); a comma tail is dropped when it opens a new predicate about
+    another merge term (`Squash all PRs, never merge commits`, `Squash merge, avoid rebase`) and kept when it is an
+    aside or a list continuation (`Squash, which is forbidden`, `Squash, rebase and merge commits are disabled`)."""
+    after = re.sub(r"\(([^)]*)\)", lambda m: m.group(0) if SAME_SUBJECT.match(m.group(1).strip()) and not OTHER_TERM.search(m.group(1)) else "", after)
+    head, sep, tail = after.partition(",")
+    if not sep:
+        return after[:80]
+    tail = tail.strip()
+    lead = re.match(r"\S+(?:\s+\S+){0,2}", tail)
+    opens_other = OTHER_TERM.search(lead.group(0)) if lead else None
+    is_list = re.match(r"^[\w\- ]{1,40}\band\b[^,]*\b(?:are|is)\b", tail, re.IGNORECASE) and len(head.split()) <= 1
+    if opens_other and not is_list:
+        return head[:80]
+    return (head + " " + tail)[:80]
+
+
 def permits_squash(clause):
-    """Names squash with no negation attached to it. Negation counts only inside the same sentence and the words
-    right around the term, so `never rebase. Squash all PRs` and `Squash merge, not rebase` still permit, while
-    `never squash`, `squash is disabled` and `instead of squash` do not."""
+    """Names squash with no negation attached to it. `never rebase. Squash all PRs`, `Squash merge, not rebase` and
+    `squash all PRs (no merge commits)` still permit; `never squash`, `squash is disabled`, `Squash and rebase
+    merges are disabled` and `instead of squash` do not."""
     for hit in SQUASH.finditer(clause):
-        before = re.split(r'[.!?]', clause[:hit.start()])[-1][-30:]
-        after = re.split(r'[.,(]', clause[hit.end():])[0][:30]
-        if not NEGATION.search(before) and not NEGATION.search(after):
-            return True
+        before = re.split(r'[.!?]', clause[:hit.start()])[-1]
+        after = re.split(r'[.!?]', clause[hit.end():])[0]
+        near_after = re.split(r'[,(]', after)[0][:20]
+        if (STRONG_NEGATION.search(before[-40:]) or STRONG_NEGATION.search(attached_after(after))
+                or WEAK_NEGATION.search(before[-30:]) or WEAK_NEGATION.search(near_after)):
+            continue
+        return True
     return False
 
 
