@@ -1156,8 +1156,13 @@ class IdentityGuardTests(Base):
             self.assertEqual(argv[:4], [qa._qis().SUDO, "-n", "-u", "qauser"])
             name = os.path.basename(argv[4])
             if name == "launchctl":
-                self.assertEqual(argv[5:], ["print", "%s/%d" % (argv[-1].split("/")[0], ident.uid)])
-                name += ":" + argv[-1].split("/")[0]
+                target = argv[-1].split("/")
+                self.assertEqual(argv[5], "print")
+                if len(target) == 3:                                        # a service of a domain: user/<uid>/<label>
+                    name = "service"
+                else:
+                    self.assertEqual(argv[5:], ["print", "%s/%d" % (target[0], ident.uid)])
+                    name += ":" + target[0]
             answer = answers.get(name, (0, "", ""))
             if answer == "timeout":
                 raise subprocess.TimeoutExpired(argv, 30)
@@ -1195,7 +1200,7 @@ class IdentityGuardTests(Base):
 
     IDENT = qa.Identity("qauser", os.getuid() + 4321, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
 
-    def sweep_with(self, tables, paths, recheck=0, gone=(), stderr=""):
+    def sweep_with(self, tables, paths, recheck=0, gone=(), stderr="", trusted=()):
         """Run sweep_identity against fake `ps` tables (lists of "pid ppid stat" rows) and a pid -> executable path map."""
         tables = list(tables)
         slept = []
@@ -1211,28 +1216,40 @@ class IdentityGuardTests(Base):
                 raise ProcessLookupError
         with unittest.mock.patch.object(qa.subprocess, "run", fake_run), \
                 unittest.mock.patch.object(qa, "executable_path", lambda pid: paths.get(pid)), \
+                unittest.mock.patch.object(qa, "verified_service_pids", lambda ident: set(trusted)), \
                 unittest.mock.patch.object(qa.os, "kill", fake_kill), \
                 unittest.mock.patch.object(qa.time, "sleep", slept.append):
             return qa.sweep_identity(self.IDENT, recheck=recheck), slept
 
-    # The eight services and their paths observed on the first real QA account (macOS 27.0.1, 2026-10-30), all PPID 1.
+    # The eight running services and their programs on the first real QA account (macOS 27.0.1, 2026-10-30), all PPID 1.
     SERVICES = {28114: "/usr/sbin/distnoted", 28127: "/usr/sbin/cfprefsd", 28135: "/usr/libexec/pkd", 28152: "/usr/libexec/lsd",
                 28171: "/usr/libexec/trustd", 28582: "/usr/libexec/secd", 29055: "/usr/libexec/containermanagerd",
                 28121: "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/"
                        "Versions/A/Support/mdbulkimport"}
 
-    def test_the_real_macos_system_services_of_the_qa_user_are_not_survivors(self):
+    def test_running_services_of_the_verified_domain_are_not_survivors(self):
         rows = ["%d 1 Ss" % pid for pid in self.SERVICES]
-        self.assertEqual(self.sweep_with([rows], self.SERVICES)[0], 0)
-        self.assertEqual(set(self.SERVICES.values()), set(qa.QA_SYSTEM_SERVICES))       # the table is exactly the observed set
+        self.assertEqual(self.sweep_with([rows], self.SERVICES, trusted=self.SERVICES)[0], 0)
 
-    def test_anything_else_of_the_qa_user_is_a_survivor(self):
-        rows = ["%d 1 Ss" % pid for pid in self.SERVICES] + ["500 1 S", "501 777 S", "502 1 S"]
+    def test_an_on_demand_service_started_later_is_not_a_survivor_either(self):
         paths = dict(self.SERVICES)
-        paths.update({500: "/bin/sleep", 501: "/usr/libexec/pkd", 502: "/Users/qauser/evil"})
-        # 500: not a listed path even at PPID 1 (a name set through argv[0] changes nothing: only the kernel path counts);
-        # 501: a listed path but not a child of launchd; 502: an unlisted path
-        self.assertEqual(self.sweep_with([rows], paths)[0], 3)
+        paths[31000] = "/System/Library/PrivateFrameworks/Spotlight.framework/Versions/A/Support/mdworker_shared"
+        rows = ["%d 1 Ss" % pid for pid in paths]
+        self.assertEqual(self.sweep_with([rows], paths, trusted=paths)[0], 0)     # no per-binary table to go stale
+
+    def test_only_processes_that_are_running_services_of_the_verified_domain_are_tolerated(self):
+        rows = ["%d 1 Ss" % pid for pid in self.SERVICES] + ["500 1 S", "501 777 S", "502 1 S", "503 1 S"]
+        paths = dict(self.SERVICES)
+        paths.update({500: "/bin/sleep", 501: "/usr/libexec/pkd", 502: "/Users/qauser/evil", 503: "/usr/libexec/lsd"})
+        trusted = set(self.SERVICES) | {501, 502}
+        # 500: a system path at PPID 1 but not a service of the domain (a name set through argv[0] changes nothing);
+        # 501: a trusted pid, but not a child of launchd; 502: a trusted pid whose executable is outside the system prefixes;
+        # 503: another process running a service binary that launchd does not list as running
+        self.assertEqual(self.sweep_with([rows], paths, trusted=trusted)[0], 4)
+
+    def test_an_unverifiable_domain_trusts_nothing(self):
+        rows = ["%d 1 Ss" % pid for pid in self.SERVICES]
+        self.assertEqual(self.sweep_with([rows], self.SERVICES, trusted=())[0], len(self.SERVICES))
 
     def test_an_exited_unreaped_process_and_one_that_vanished_are_not_survivors(self):
         rows = ["600 1 Z", "601 1 S", "602 1 S"]
@@ -1255,7 +1272,7 @@ class IdentityGuardTests(Base):
         services = ["%d 1 Ss" % pid for pid in self.SERVICES]
         paths = dict(self.SERVICES)
         paths[4242] = "/bin/sleep"
-        count, slept = self.sweep_with([services, services + ["4242 1 S"]], paths, recheck=qa.RESPAWN_SECONDS)
+        count, slept = self.sweep_with([services, services + ["4242 1 S"]], paths, recheck=qa.RESPAWN_SECONDS, trusted=self.SERVICES)
         self.assertEqual(count, 1)
         self.assertIn(qa.RESPAWN_SECONDS, slept)
         self.assertGreater(qa.RESPAWN_SECONDS, qa.SETTLE_SECONDS)
@@ -1272,6 +1289,254 @@ class IdentityGuardTests(Base):
     def test_executable_path_is_none_where_libproc_does_not_exist(self):
         with unittest.mock.patch("ctypes.CDLL", side_effect=OSError("no libproc")):
             self.assertIsNone(qa.executable_path(os.getpid()))
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+REAL_DOMAIN = (FIXTURES / "qa-launchd-user-domain.txt").read_text()            # launchctl print user/530 on the first real QA account
+REAL_SERVICE = (FIXTURES / "qa-launchd-service-cfprefsd.txt").read_text()      # launchctl print user/530/com.apple.cfprefsd.xpc.agent
+REAL_RUNNING = {28171, 28121, 28582, 28152, 29055, 28127, 28135, 28114}
+
+
+class LaunchdDomainTests(unittest.TestCase):
+    """The QA user's launchd user domain: present is normal, but every service must be defined by a system-volume plist."""
+
+    IDENT = qa.Identity("qauser", 530, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
+
+    def setUp(self):
+        if os.getuid() == 530:
+            self.skipTest("fixture uid is the running uid")
+
+    def runner(self, domain=REAL_DOMAIN, service=REAL_SERVICE, per_label=None, rc=0, domain_rc=0, domain_err="", service_err=""):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv[-1])
+            self.assertEqual(argv[:4], [qa._qis().SUDO, "-n", "-u", "qauser"])
+            self.assertEqual(argv[4:6], [qa.LAUNCHCTL, "print"])
+            target = argv[-1]
+            if target == "user/530":
+                return subprocess.CompletedProcess(argv, domain_rc, domain, domain_err)
+            label = target.split("/", 2)[2]
+            text = (per_label or {}).get(label, service).replace("user/530/com.apple.cfprefsd.xpc.agent = {", "user/530/%s = {" % label, 1)
+            return subprocess.CompletedProcess(argv, rc, text, service_err)
+        return fake_run, calls
+
+    def test_the_real_domain_output_parses(self):
+        services, problems = qa.parse_user_domain(REAL_DOMAIN, 530)
+        self.assertEqual(problems, [])
+        self.assertEqual(len(services), 48)
+        self.assertTrue(all(label.startswith("com.apple.") for _, label in services))
+        self.assertEqual({pid for pid, _ in services if pid}, REAL_RUNNING)
+
+    def test_a_domain_that_cannot_be_trusted_is_a_problem(self):
+        bad = {
+            "wrong header": REAL_DOMAIN.replace("user/530 = {", "user/531 = {", 1),
+            "no services block": REAL_DOMAIN.replace("services = {", "svc = {", 1),
+            "unmanaged process": REAL_DOMAIN.replace("unmanaged processes = {\n", "unmanaged processes = {\n\t\t4242 /tmp/x\n", 1),
+            "no unmanaged block": REAL_DOMAIN.replace("unmanaged processes = {", "other = {", 1),
+            "garbled row": REAL_DOMAIN.replace("com.apple.lsd\n", "com.apple.lsd extra tokens here\n", 1),
+            "count mismatch": REAL_DOMAIN.replace("service count = 48", "service count = 47", 1),
+            "label with a path": REAL_DOMAIN.replace("com.apple.lsd\n", "../../x\n", 1),
+        }
+        for name, text in bad.items():
+            with self.subTest(name):
+                self.assertTrue(qa.parse_user_domain(text, 530)[1], name)
+        self.assertTrue(qa.parse_user_domain("", 530)[1])
+
+    def test_a_service_is_trusted_only_when_launchd_reports_a_system_volume_plist(self):
+        self.assertIsNone(qa.service_problem(REAL_SERVICE, 530, "com.apple.cfprefsd.xpc.agent"))
+        self.assertIsNone(qa.service_problem(REAL_SERVICE, 530, "com.apple.cfprefsd.xpc.agent"))
+        self.assertEqual(qa.service_problem(REAL_SERVICE, 530, "com.apple.lsd"), "unexpected header")
+        path = "\tpath = /System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist\n"
+        for name, text in {
+            "plist in the user's home": REAL_SERVICE.replace(path, "\tpath = /Users/qauser/Library/LaunchAgents/com.apple.lsd.plist\n"),
+            "plist in a temp dir": REAL_SERVICE.replace(path, "\tpath = /private/tmp/x.plist\n"),
+            "no plist path (submitted job)": REAL_SERVICE.replace(path, ""),
+            "traversal": REAL_SERVICE.replace(path, "\tpath = /System/../Users/qauser/x.plist\n"),
+            "not a plist": REAL_SERVICE.replace(path, "\tpath = /System/Library/LaunchAgents/x.sh\n"),
+            "a daemon": REAL_SERVICE.replace("\ttype = LaunchAgent", "\ttype = LaunchDaemon"),
+            "program outside the system": REAL_SERVICE.replace("\tprogram = /usr/sbin/cfprefsd", "\tprogram = /Users/qauser/evil"),
+            "empty": "",
+        }.items():
+            with self.subTest(name):
+                self.assertIsNotNone(qa.service_problem(text, 530, "com.apple.cfprefsd.xpc.agent"))
+
+    def test_the_writable_data_volume_is_not_the_system_volume(self):
+        path = "\tpath = /System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist\n"
+        for name, text in {
+            "plist on the data volume": REAL_SERVICE.replace(path, "\tpath = /System/Volumes/Data/Users/qauser/e.plist\n"),
+            "program on the data volume": REAL_SERVICE.replace("\tprogram = /usr/sbin/cfprefsd", "\tprogram = /System/Volumes/Data/Users/qauser/x"),
+            "other system tree": REAL_SERVICE.replace(path, "\tpath = /System/Cryptexes/App/x.plist\n"),
+        }.items():
+            with self.subTest(name):
+                self.assertIsNotNone(qa.service_problem(text, 530, "com.apple.cfprefsd.xpc.agent"))
+        self.assertFalse(any(p.startswith(("/System/Volumes/", "/System/Cryptexes/")) for p in qa.SERVICE_PROGRAM_PREFIXES))
+        self.assertEqual(qa.SERVICE_PLIST_PREFIX, "/System/Library/")
+
+    def test_a_header_line_forged_inside_a_value_cannot_make_a_service_trusted(self):
+        forged = "\tpath = /System/Library/LaunchAgents/forged.plist"
+        # a submitted job has no path of its own; the forged line sits in a value the job's owner chooses
+        pathless = "user/530/x.job = {\n\tactive count = 1\n\ttype = LaunchAgent\n\tstate = running\n"
+        for name, text in {
+            "inside the program value": pathless + "\tprogram = /bin/sh\n%s\n\targuments = {\n\t\t/bin/sh\n\t}\n}\n" % forged,
+            "inside the arguments block": pathless + "\tprogram = /bin/sh\n\targuments = {\n\t\t/bin/sh\n%s\n\t}\n}\n" % forged,
+            "inside the environment block": pathless + "\tenvironment = {\n\t\tX => y\n%s\n\t}\n}\n" % forged,
+            "a second path after the real one": REAL_SERVICE.replace("\tprogram = /usr/sbin/cfprefsd", "\tprogram = /usr/sbin/cfprefsd\n" + forged),
+            "a second type": REAL_SERVICE.replace("\tprogram = /usr/sbin/cfprefsd", "\tprogram = /usr/sbin/cfprefsd\n\ttype = LaunchAgent"),
+            "a path that follows the program": pathless.replace("\ttype = LaunchAgent\n", "") + "\tprogram = /bin/sh\n%s\n\ttype = LaunchAgent\n}\n" % forged,
+        }.items():
+            with self.subTest(name):
+                self.assertIsNotNone(qa.service_problem(text, 530, "x.job"), name)
+
+    def test_a_launchd_copy_of_a_system_service_is_accepted(self):
+        copy = REAL_SERVICE.replace("user/530/com.apple.cfprefsd.xpc.agent = {\n", "user/530/com.apple.cfprefsd.xpc.agent.19000000-0300 = {\n\toriginal = com.apple.cfprefsd.xpc.agent\n", 1)
+        self.assertIsNone(qa.service_problem(copy, 530, "com.apple.cfprefsd.xpc.agent.19000000-0300"))
+
+    def test_nothing_a_job_chooses_may_precede_or_separate_the_path_and_type(self):
+        forged = "\tpath = /System/Library/LaunchAgents/forged.plist\n\ttype = LaunchAgent\n"
+        pathless = "user/530/x.job = {\n\tactive count = 1\n"
+        for name, text in {
+            "a scalar before the path carries the forged lines": pathless + "\tstdout path = /tmp/a\n" + forged + "\tstate = running\n\tprogram = /bin/sh\n\targuments = {\n\t}\n}\n",
+            "a line between the path and the type": REAL_SERVICE.replace("\ttype = LaunchAgent", "\tcomment = x\n\ttype = LaunchAgent"),
+            "an unknown key before the path": REAL_SERVICE.replace("\tpath = ", "\tcomment = x\n\tpath = ", 1),
+            "an original that is not a label": REAL_SERVICE.replace("\tpath = ", "\toriginal = a b\n\tpath = ", 1),
+            "a non-numeric counter": REAL_SERVICE.replace("\tactive count = 2", "\tactive count = 2 extra"),
+        }.items():
+            with self.subTest(name):
+                self.assertIsNotNone(qa.service_problem(text, 530, "x.job" if "x.job" in text else "com.apple.cfprefsd.xpc.agent"), name)
+
+    def test_a_present_domain_of_system_services_passes_and_names_the_running_pids(self):
+        fake, calls = self.runner()
+        with unittest.mock.patch.object(qa.subprocess, "run", fake):
+            pids, problems = qa.verify_user_domain(self.IDENT)
+        self.assertEqual((pids, problems), (REAL_RUNNING, []))
+        self.assertEqual(len(calls), 1 + 48)                                   # the domain and every loaded service
+        fake, calls = self.runner()
+        with unittest.mock.patch.object(qa.subprocess, "run", fake):
+            self.assertEqual(qa.verify_user_domain(self.IDENT, running_only=True), (REAL_RUNNING, []))
+        self.assertEqual(len(calls), 1 + 8)                                    # only the running ones are looked up
+
+    def test_one_service_defined_outside_the_system_volume_fails_the_domain(self):
+        evil = REAL_SERVICE.replace("/System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist", "/Users/qauser/x.plist")
+        fake, _ = self.runner(per_label={"com.apple.geod": evil})                # idle, StartInterval-style persistence
+        with unittest.mock.patch.object(qa.subprocess, "run", fake):
+            pids, problems = qa.verify_user_domain(self.IDENT)
+        self.assertEqual(pids, set())
+        self.assertTrue(any("com.apple.geod" in p for p in problems), problems)
+
+    def test_an_absent_domain_is_clean(self):
+        fake, _ = self.runner(domain="", domain_rc=113, domain_err="Could not find domain for user/530\n")
+        with unittest.mock.patch.object(qa.subprocess, "run", fake):
+            self.assertEqual(qa.verify_user_domain(self.IDENT), (set(), []))
+
+    def test_every_failure_to_read_the_domain_is_a_problem(self):
+        for name, kwargs in {
+            "sudo refused on the domain": dict(domain_rc=1, domain_err="sudo: a password is required\n"),
+            "other launchctl error": dict(domain_rc=5, domain_err="Bad request.\n"),
+            "service unreadable": dict(rc=113, service=""),
+            "sudo refused on a service": dict(rc=1, service_err="sudo: a password is required\n"),
+        }.items():
+            with self.subTest(name):
+                fake, _ = self.runner(**kwargs)
+                with unittest.mock.patch.object(qa.subprocess, "run", fake):
+                    pids, problems = qa.verify_user_domain(self.IDENT)
+                self.assertEqual(pids, set())
+                self.assertTrue(problems)
+
+        def timeout(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, 30)
+        with unittest.mock.patch.object(qa.subprocess, "run", timeout):
+            self.assertTrue(qa.verify_user_domain(self.IDENT)[1])
+
+    def test_root_and_your_own_uid_are_refused_before_any_subprocess(self):
+        with unittest.mock.patch.object(qa.subprocess, "run", side_effect=AssertionError("must not run")):
+            for uid in (0, os.getuid()):
+                self.assertTrue(qa.verify_user_domain(self.IDENT._replace(uid=uid))[1])
+
+    def test_the_persistence_check_accepts_the_real_domain_and_still_requires_the_gui_domain_absent(self):
+        answers = dict(CLEAN_PERSISTENCE)
+        fake_domain, _ = self.runner()
+
+        def fake_run(argv, **kwargs):
+            name = os.path.basename(argv[4])
+            if name == "launchctl" and argv[-1].startswith("user/"):
+                return fake_domain(argv, **kwargs)
+            rc, out, err = answers["launchctl:gui"] if name == "launchctl" else answers.get(name, (0, "", ""))
+            return subprocess.CompletedProcess(argv, rc, out, err)
+        with unittest.mock.patch.object(qa.subprocess, "run", fake_run):
+            self.assertEqual(qa.persistence_problems(self.IDENT), [])
+            answers["launchctl:gui"] = (0, "gui/530 = {\n}\n", "")
+            self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))
+
+
+class SiblingFileTests(unittest.TestCase):
+    """qa-handoff.py loads qa-identity-setup.py and runs disk-admission.py from its own directory: a copy without them must
+    say so, not die with a traceback or report a resource refusal."""
+
+    def test_a_missing_identity_setup_script_is_a_clear_refusal(self):
+        with tempfile.TemporaryDirectory() as empty, unittest.mock.patch.object(qa, "__file__", str(Path(empty) / "qa-handoff.py")), \
+                unittest.mock.patch.object(qa, "_QIS", None):
+            with self.assertRaises(qa.Refused) as caught:
+                qa._qis()
+        self.assertIn("qa-identity-setup.py must sit next to qa-handoff.py", str(caught.exception))
+
+    def test_a_missing_admission_tool_is_missing_not_refused(self):
+        args = argparse.Namespace(admission_cmd=None)
+        with tempfile.TemporaryDirectory() as empty, unittest.mock.patch.object(qa, "__file__", str(Path(empty) / "qa-handoff.py")):
+            self.assertEqual(qa.admission_state(args), "missing")
+        self.assertEqual(qa.admission_state(argparse.Namespace(admission_cmd=["/nonexistent/admission-tool"])), "missing")
+        self.assertEqual(qa.admission_state(argparse.Namespace(admission_cmd=[sys.executable, "-c", "raise SystemExit(3)"])), "refused")
+        self.assertEqual(qa.admission_state(argparse.Namespace(admission_cmd=[sys.executable, "-c", "pass"])), "ok")
+
+
+class RuntimeFilesTests(unittest.TestCase):
+    """A copy of qa-handoff.py without a sibling, or with an unsafe one, is refused (exit 64) before anything runs."""
+
+    def copy_dir(self, skip=None, extra=()):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        for name in ("qa-handoff.py", "disk-admission.py", "qa-identity-setup.py"):
+            if name != skip:
+                shutil.copy(Path(qa.__file__).resolve().parent / name, root / name)
+        return root
+
+    def problems(self, root, identity, admission_cmd=False):
+        with unittest.mock.patch.object(qa, "__file__", str(root / "qa-handoff.py")):
+            return qa.runtime_problems(identity, admission_cmd)
+
+    def test_a_complete_copy_has_no_problems(self):
+        self.assertEqual(self.problems(self.copy_dir(), True), [])
+
+    def test_each_missing_sibling_is_named(self):
+        for sibling, identity in (("disk-admission.py", False), ("disk-admission.py", True), ("qa-identity-setup.py", True)):
+            with self.subTest(sibling=sibling, identity=identity):
+                found = self.problems(self.copy_dir(skip=sibling), identity)
+                self.assertTrue(any("missing" in p and sibling in p for p in found), found)
+
+    def test_the_identity_script_is_not_required_without_an_identity_nor_the_admission_script_with_a_custom_command(self):
+        self.assertEqual(self.problems(self.copy_dir(skip="qa-identity-setup.py"), False), [])
+        self.assertEqual(self.problems(self.copy_dir(skip="disk-admission.py"), False, admission_cmd=True), [])
+
+    def test_a_linked_or_writable_sibling_is_refused(self):
+        root = self.copy_dir()
+        (root / "disk-admission.py").unlink()
+        (root / "disk-admission.py").symlink_to(root / "qa-handoff.py")
+        self.assertTrue(any("not a regular file" in p for p in self.problems(root, False)))
+        root = self.copy_dir()
+        os.chmod(root / "qa-identity-setup.py", 0o666)
+        self.assertTrue(any("not group/world writable" in p for p in self.problems(root, True)))
+
+    def test_run_refuses_with_exit_64_not_a_traceback_or_a_resource_wait(self):
+        root = self.copy_dir(skip="disk-admission.py")
+        run_dir = root / "run"
+        run_dir.mkdir()
+        proc = subprocess.run([sys.executable, str(root / "qa-handoff.py"), "run", "--run-dir", str(run_dir)],
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 64, proc.stdout + proc.stderr)
+        self.assertIn("REFUSED required runtime files are missing or unsafe: missing", proc.stdout)
+        self.assertIn("disk-admission.py", proc.stdout)
+        self.assertNotIn("Traceback", proc.stderr)
 
 
 class KillChildTests(Base):
