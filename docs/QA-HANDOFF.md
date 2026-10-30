@@ -274,9 +274,12 @@ the hop and acts on the verdict.
   on-demand agents (the `mdworker.*` ones) start and stop. A present `user/<uid>` domain is therefore normal, and the run
   does not require it absent. It requires instead, checked through `sudo -n` as the QA user: the `launchctl print` output
   parses (header, `services` block, an empty `unmanaged processes` block, a service count that matches), and for every loaded
-  service `launchctl print user/<uid>/<label>` reports `type = LaunchAgent`, a `path` that is a `.plist` under `/System/`
-  (the sealed system volume the QA user cannot write: a job it submits or bootstraps has no path or one it controls, and
-  a name or label proves nothing because it can pick any) and a `program` under a system prefix. Any service that fails,
+  service `launchctl print user/<uid>/<label>` reports `type = LaunchAgent`, a `path` that is a `.plist` under
+  `/System/Library/` (the sealed system volume the QA user cannot write; `/System/Volumes/Data` is the writable data volume
+  and is refused, and a job it submits or bootstraps has no path or one it controls; a name or label proves nothing because
+  it can pick any) and a `program` under a system prefix. The program, arguments and environment printed for a job are chosen by
+  its owner, so only the header counts: `path` and `type` must each appear once, in launchd's order, before `program` and
+  before the first nested block, so a line forged inside a value is refused. Any service that fails,
   any call that fails, times out or is refused by sudo, and an unparsable output fails the check. A process of the QA user is
   not a survivor only if its pid is a running service of that verified domain, its parent is launchd (PPID 1) and its
   kernel-reported executable path (libproc, not `ps comm`, which a process can set through argv[0]) is under a system prefix;
