@@ -968,11 +968,12 @@ LAUNCHD_ABSENT = 'Could not find domain'
 # verified domain with a launchd parent and an executable under a system prefix. The QA user cannot write under /System, so
 # a job it submits or bootstraps has a different path (or none) and fails the check; the `path` is launchd's own report,
 # not a name or a label, which a QA job can choose freely.
-SERVICE_PLIST_PREFIX = '/System/'
-SERVICE_PROGRAM_PREFIXES = ('/System/', '/usr/libexec/', '/usr/sbin/', '/usr/bin/', '/usr/lib/', '/sbin/', '/bin/')
+# Not plain /System/: /System/Volumes/Data/... is the writable data volume (the QA user's home is on it).
+SERVICE_PLIST_PREFIX = '/System/Library/'
+SERVICE_PROGRAM_PREFIXES = ('/System/Library/', '/usr/libexec/', '/usr/sbin/', '/usr/bin/', '/usr/lib/', '/sbin/', '/bin/')
 MAX_DOMAIN_SERVICES = 200
 SERVICE_LABEL_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}')
-SERVICE_ROW_RE = re.compile(r'(\d+)\s+(-|-?\d+)\s+(\S+)')
+SERVICE_ROW_RE = re.compile(r'(\d+)\s+(-|-?\d+|\(\w+\))\s+(\S+)')
 DOMAIN_SECONDS = 90   # all launchctl calls of one domain verification
 HOP_ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
 _QIS = None
@@ -1675,21 +1676,37 @@ def parse_user_domain(text, uid):
     return services, problems
 
 
-def service_problem(text):
+def service_problem(text, uid=None, label=None):
     """None when `launchctl print user/<uid>/<label>` shows a service defined by a plist on the sealed system volume;
     otherwise the reason. `path` is launchd's own report of the loaded plist; a job submitted by the QA user has none or
-    a path it can write."""
-    fields = {}
-    for line in (text or '').splitlines():
-        match = re.fullmatch(r'\t(path|type|program) = (.+)', line.rstrip())
-        if match and match.group(1) not in fields:
-            fields[match.group(1)] = match.group(2).strip()
-    path = fields.get('path', '')
-    if not (path.startswith(SERVICE_PLIST_PREFIX) and path.endswith('.plist') and '/../' not in path and '\n' not in path):
+    a path it can write. The program, arguments and environment of a job are printed too and are chosen by its owner, so
+    only the header counts: `path` and `type` must each appear exactly once at the top level, in the order launchd prints
+    them, before `program` and before the first nested block. A line forged inside a value (a newline in a program name,
+    an argument or an environment variable) can only come after those and is refused."""
+    lines = (text or '').splitlines()
+    if uid is not None and label is not None and (not lines or lines[0].strip() != 'user/%d/%s = {' % (uid, label)):
+        return 'unexpected header'
+    key = re.compile(r'\t(path|type|program) = (.+)')
+    nested = re.compile(r'\t\S.* = \{\s*$')
+    seen, first = {}, {}
+    for index, line in enumerate(lines[1:], 1):
+        if nested.match(line) and 'nested' not in first:
+            first['nested'] = index
+        match = key.fullmatch(line.rstrip())
+        if match:
+            if match.group(1) in seen:
+                return 'repeats %s' % match.group(1)
+            seen[match.group(1)] = match.group(2).strip()
+            first[match.group(1)] = index
+    path = seen.get('path', '')
+    if not (path.startswith(SERVICE_PLIST_PREFIX) and path.endswith('.plist') and '/../' not in path):
         return 'defined outside the system volume or without a plist'
-    if fields.get('type') != 'LaunchAgent':
+    if seen.get('type') != 'LaunchAgent':
         return 'not a LaunchAgent'
-    if 'program' in fields and not fields['program'].startswith(SERVICE_PROGRAM_PREFIXES):
+    order = [first['path'], first['type']] + ([first['program']] if 'program' in first else [])
+    if order != sorted(order) or ('nested' in first and first['nested'] < max(order)):
+        return 'header fields out of the order launchd prints them'
+    if 'program' in seen and not seen['program'].startswith(SERVICE_PROGRAM_PREFIXES):
         return 'runs a program outside the system prefixes'
     return None
 
@@ -1727,7 +1744,7 @@ def verify_user_domain(ident, running_only=False):
             answer = launchctl('%s/%s' % (domain, label))
             if sudo_refused(answer.stderr):
                 return set(), ['launchd domain %s could not be read (sudo -n refused)' % domain]
-            reason = service_problem(answer.stdout) if answer.returncode == 0 else 'could not be read (exit %s)' % answer.returncode
+            reason = service_problem(answer.stdout, ident.uid, label) if answer.returncode == 0 else 'could not be read (exit %s)' % answer.returncode
             if reason:
                 problems.append('launchd service %s: %s' % (label, reason))
             elif pid:
