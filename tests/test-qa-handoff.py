@@ -829,6 +829,17 @@ class ReviewFollowUpTests(Base):
         self.assertEqual(code, qa.EXIT["REFUSED"], out)
         self.assertEqual((run_dir / "RESULT.json").read_text(), before)
 
+    def test_a_locked_directory_never_rewrites_its_result_whatever_else_is_wrong(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_qa(run_dir, admission=self.REFUSE)[0], 75)
+        time.sleep(1.1)
+        (run_dir / "RUN.lock").write_text("")
+        (run_dir / "source/tracked.txt").write_text("edited")        # the clone is also modified
+        before = (run_dir / "RESULT.json").read_text()
+        code, out = self.run_qa(run_dir)
+        self.assertEqual(code, qa.EXIT["REFUSED"], out)
+        self.assertEqual((run_dir / "RESULT.json").read_text(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

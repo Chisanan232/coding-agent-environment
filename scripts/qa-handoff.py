@@ -515,6 +515,8 @@ def run(args):
     source = run_dir / 'source'
     if (run_dir / 'RUNMETA.json').exists():
         return refuse('this run directory has already been run; prepare a new attempt')
+    if os.path.lexists(run_dir / 'RUN.lock'):   # checked before anything can write RESULT.json: another run owns this directory and its result
+        return refuse('a run is in progress or was interrupted for this directory; prepare a new attempt')
     try:
         manifest = read_run_json(run_dir / 'tree-manifest.json')
         problems = check_tree(source, manifest)
@@ -523,8 +525,6 @@ def run(args):
         return write_result(run_dir, packet, 'QA_INVALID', ['tree manifest is unreadable (%s)' % type(error).__name__])
     if problems or mismatch:
         return write_result(run_dir, packet, 'QA_INVALID', problems or ['manifest does not match the packet'])
-    if os.path.lexists(run_dir / 'RUN.lock'):   # checked before admission: another run owns this directory and its result
-        return refuse('a run is in progress or was interrupted for this directory; prepare a new attempt')
     if not admitted(args):
         return write_result(run_dir, packet, 'WAITING_RESOURCE', ['disk admission refused; codex was not started'])
     try:
