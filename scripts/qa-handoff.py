@@ -34,10 +34,13 @@ Exit codes of `run` and `verdict` (the producer's continuation rule):
 A Codex verdict is QA evidence only. It is never merge evidence and must not be written as an owner-merge review.
 """
 import argparse
+import collections
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -640,6 +643,20 @@ def refuse(message):
 
 def run(args):
     run_dir = Path(args.run_dir).resolve()
+    # Usage refusals first: nothing is read, written or started for a flag combination that cannot be honoured.
+    name = getattr(args, 'qa_identity', None)
+    if getattr(args, 'require_env_isolation', False) and not name:
+        return refuse('--require-env-isolation needs --qa-identity: a same-user run cannot isolate process environments')
+    if getattr(args, 'exchange', None) and not name:
+        return refuse('--exchange needs --qa-identity')
+    ident = None
+    if name:
+        if getattr(args, 'read_root', None):
+            return refuse('--read-root cannot be combined with --qa-identity (it names directories of your own HOME)')
+        try:
+            ident = resolve_identity(name, getattr(args, 'exchange', None))
+        except Refused as error:
+            return refuse(str(error))
     # First, before anything that can write RESULT.json (a bad packet or tree included): an already-run or locked
     # directory belongs to another run and its result.
     if (run_dir / 'RUNMETA.json').exists():
@@ -669,6 +686,8 @@ def run(args):
     except FileExistsError:
         return refuse('a run is in progress or was interrupted for this directory; prepare a new attempt')
     try:
+        if ident is not None:
+            return refuse('--qa-identity runs are not available in this build')
         return run_locked(args, run_dir, packet, source, read_roots)
     except KeyboardInterrupt:      # Ctrl-C or SIGTERM: codex's group is killed and a hashed run record written; evaluate it
         if (run_dir / 'RUNMETA.json').exists():
@@ -821,6 +840,87 @@ def seal_failed(error):
     """The fail-closed record of a seal that raised: identity mode stays on, nothing about the outbox is trusted."""
     return {'qa_identity': {'seal_error': type(error).__name__}, 'path_ok': False, 'stragglers': None,
             'tree_problems': ['seal failed (%s)' % type(error).__name__], 'untracked': {'count': 0, 'sample': []}}
+
+
+# ---------------------------------------------------------------- dedicated QA OS identity (SPE-142)
+# The QA run executes as a separate, unprivileged OS user set up by scripts/qa-identity-setup.py, so a QA tool command
+# cannot read the environment of the producer's processes (same-uid KERN_PROCARGS2). Only the producer side loads that
+# script; the copy of this file that runs as the QA user has no sibling and never calls _qis().
+Identity = collections.namedtuple('Identity', 'name uid home exchange exchange_owner')
+KILL, PGREP = '/bin/kill', '/usr/bin/pgrep'
+HOP_ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
+_QIS = None
+
+
+class Refused(Exception):
+    """A usage refusal (REFUSED, exit 64): nothing was read, written or started."""
+
+
+def _qis():
+    global _QIS
+    if _QIS is None:
+        path = Path(__file__).resolve().parent / 'qa-identity-setup.py'
+        spec = importlib.util.spec_from_file_location('qa_identity_setup', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _QIS = module
+    return _QIS
+
+
+def resolve_identity(name, exchange):
+    """The QA account and exchange directory, validated with the setup script's own rules. Root and the caller's own uid
+    are refused before anything else, so no later step can run QA as the producer."""
+    qis = _qis()
+    if not isinstance(name, str) or not qis.NAME_RE.match(name) or name in qis.RESERVED:
+        raise Refused('--qa-identity must be a QA account name matching %s' % qis.NAME_RE.pattern)
+    try:
+        pw = pwd.getpwnam(name)
+    except KeyError:
+        raise Refused('--qa-identity %s is not a local account (set it up with qa-identity-setup.py)' % name)
+    if pw.pw_uid in (0, os.getuid()):
+        raise Refused('--qa-identity must be a different, unprivileged OS user, not root or your own account')
+    try:
+        home, xroot = qis.check_args(name, pw.pw_uid, exchange)
+    except qis.Stop as error:
+        raise Refused(str(error))
+    if Path(pw.pw_dir) != home:
+        raise Refused('--qa-identity %s has home %s, expected %s' % (name, pw.pw_dir, home))
+    return Identity(name, pw.pw_uid, home, xroot, qis.ROOT_UID)
+
+
+def sudo_refused(stderr):
+    """sudo -n reports a missing cached credential (or any other refusal) on its own stderr, prefixed `sudo:`."""
+    return any(line.startswith('sudo:') for line in (stderr or '').splitlines())
+
+
+def sweep_identity(ident):
+    """Kill every process of the QA user, then count the survivors (process ids only). None means the sweep could not run,
+    which callers treat as failed. Root and the caller's own uid are refused before any subprocess: `kill -1` as yourself
+    would end your own session."""
+    if not isinstance(ident.uid, int) or isinstance(ident.uid, bool) or ident.uid in (0, os.getuid()):
+        return None
+    qis = _qis()
+    try:
+        done = subprocess.run([qis.SUDO, '-n', '-u', ident.name, KILL, '-KILL', '-1'], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30, cwd='/', env=HOP_ENV)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if sudo_refused(done.stderr):
+        return None
+    count = None
+    for _ in range(25):                     # killed processes take a moment to disappear from the table
+        try:
+            listed = subprocess.run([PGREP, '-U', str(ident.uid)], stdin=subprocess.DEVNULL, capture_output=True,
+                                    text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if listed.returncode == 1:
+            return 0
+        if listed.returncode != 0:
+            return None
+        count = len(listed.stdout.split())
+        time.sleep(0.2)
+    return count
 
 
 def validate(value, schema, path='verdict'):
@@ -990,6 +1090,9 @@ def build_parser():
     r.add_argument('--timeout', type=int, default=1800)
     r.add_argument('--read-root', action='append', default=[], metavar='DIR',
                    help='extra read-only directory for toolchains (absolute; not HOME, / or a credential directory)')
+    r.add_argument('--qa-identity', metavar='NAME', help='run QA as this dedicated OS user (set up by qa-identity-setup.py)')
+    r.add_argument('--exchange', metavar='DIR', help='exchange directory of that identity (default /Users/Shared/NAME-qa)')
+    r.add_argument('--require-env-isolation', action='store_true', help='refuse to run unless --qa-identity is given')
     r.add_argument('--codex-bin', default='codex', help=argparse.SUPPRESS)       # test hook
     r.add_argument('--settle', type=float, default=SETTLE_SECONDS, help=argparse.SUPPRESS)  # test hook
     r.add_argument('--admission-cmd', type=shlex.split, help=argparse.SUPPRESS)   # test hook (one quoted string)

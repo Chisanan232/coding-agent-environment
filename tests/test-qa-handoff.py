@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts/qa-handoff.py"
@@ -1070,6 +1071,50 @@ class ReviewFollowUpTests(Base):
         self.assertEqual(code, 11, out)                              # never QA_PASS once a signal was received
         self.assertTrue(json.loads((run_dir / "RUNMETA.json").read_text())["interrupted"])
         self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 11)
+
+
+def no_subprocess(*args, **kwargs):
+    raise AssertionError("no subprocess may start here: %r" % (args[:1],))
+
+
+class IdentityGuardTests(Base):
+    """SPE-142 usage refusals: REFUSED (64), no RESULT.json, nothing started."""
+
+    def assert_refused(self, code, out, run_dir, text):
+        self.assertEqual(code, qa.EXIT["REFUSED"], out)
+        self.assertIn(text, out)
+        self.assertFalse((run_dir / "RESULT.json").exists())
+        self.assertFalse((self.fake_dir / "seen.json").exists())
+        self.assertFalse((self.fake_dir / "probes.json").exists())
+
+    def test_require_env_isolation_without_identity_is_refused(self):
+        run_dir = self.prepare()
+        code, out = self.run_qa(run_dir, extra=("--require-env-isolation",))
+        self.assert_refused(code, out, run_dir, "--require-env-isolation needs --qa-identity")
+
+    def test_identity_own_uid_or_root_is_refused(self):
+        run_dir = self.prepare()
+        for uid in (os.getuid(), 0):
+            pw = unittest.mock.Mock(pw_uid=uid, pw_dir="/Users/qauser")
+            with unittest.mock.patch.object(qa.pwd, "getpwnam", lambda name, pw=pw: pw), \
+                    unittest.mock.patch.object(qa.subprocess, "run", no_subprocess), \
+                    unittest.mock.patch.object(qa.subprocess, "Popen", no_subprocess):
+                code, out = self.run_qa(run_dir, extra=("--qa-identity", "qauser", "--exchange", "/Users/Shared/qauser-qa"))
+            self.assert_refused(code, out, run_dir, "not root or your own account")
+
+    def test_identity_with_read_root_is_refused(self):
+        run_dir = self.prepare()
+        good = self.root / "toolchain"
+        good.mkdir()
+        code, out = self.run_qa(run_dir, extra=("--qa-identity", "qauser", "--read-root", str(good)))
+        self.assert_refused(code, out, run_dir, "--read-root cannot be combined with --qa-identity")
+
+    def test_sweep_refuses_own_uid_and_root_without_subprocess(self):
+        with unittest.mock.patch.object(qa.subprocess, "run", no_subprocess), \
+                unittest.mock.patch.object(qa.subprocess, "Popen", no_subprocess):
+            for uid in (os.getuid(), 0, True):
+                ident = qa.Identity("qauser", uid, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
+                self.assertIsNone(qa.sweep_identity(ident))           # never `kill -1` as yourself or as root
 
 
 if __name__ == "__main__":
