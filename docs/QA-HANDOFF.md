@@ -274,10 +274,13 @@ the hop and acts on the verdict.
   on-demand agents (the `mdworker.*` ones) start and stop. A present `user/<uid>` domain is therefore normal, and the run
   does not require it absent. It requires instead, checked through `sudo -n` as the QA user: the `launchctl print` output
   parses (header, `services` block, an empty `unmanaged processes` block, a service count that matches), and for every loaded
-  service `launchctl print user/<uid>/<label>` reports `type = LaunchAgent`, a `path` that is a `.plist` under
-  `/System/Library/` (the sealed system volume the QA user cannot write; `/System/Volumes/Data` is the writable data volume
-  and is refused, and a job it submits or bootstraps has no path or one it controls; a name or label proves nothing because
-  it can pick any) and a `program` under a system prefix. The program, arguments and environment printed for a job are chosen by
+  service `launchctl print user/<uid>/<label>` reports `type = LaunchAgent`, a `path` that is a `.plist` directly inside
+  `/System/Library/LaunchAgents/` or `/System/Library/LaunchDaemons/` (not the rest of `/System/Library/`: parts of it are
+  writable, for example `AssetsV2/downloadDir` is mode 777 on a real host, and `/System/Volumes/Data` is the data volume),
+  checked on the producer side to be a regular, root-owned file nobody else can write, and a `program` that is present,
+  absolute, free of `..`, under `/System/Library/`, `/usr/libexec/` or `/usr/sbin/`, and not an interpreter or shell. A job
+  the QA user submits or bootstraps has no such path or a plist it owns; a name or label proves nothing because it can pick
+  any. The program, arguments and environment printed for a job are chosen by
   its owner, so only the header counts: `path` and `type` must each appear once, `type` on the line right after `path`, before
   `program` and before the first nested block, with nothing before the `path` but numeric counters (`active count`,
   `copy count`) and the label in `original =` that launchd prints for on-demand copies (`mdworker.shared.<uuid>`), so a
@@ -289,7 +292,10 @@ the hop and acts on the verdict.
   absent. VERIFIED-ON-THIS-HOST only; another macOS version that prints a different layout fails closed until the parser is
   extended from a real sample. Tolerating a verified service does not cover inherited descriptors or Mach rights, or the
   per-user data these services read and the QA user can write; whether `mdbulkimport` loads importer plugins from the user's
-  home is NOT_VERIFIED.
+  home is NOT_VERIFIED. Known gaps: the final sweep does not re-run the persistence check (it runs at the seal), only the
+  `user/` and `gui/` domains are read (not `session/` or `login/`), the preflight does not cover `sudo` or the python
+  interpreter, and tolerance proves where a service was defined, not what it does at run time (`launchctl setenv`,
+  `kickstart`).
 - Identity mode sees only the QA user's processes, crontab, at queue, `~/Library/LaunchAgents` and whether a launchd
   `user/` or `gui/` domain exists for it. It does not see a system-domain job or LaunchDaemon (which needs root to
   install), login items, or shell startup files (`.zshrc`, `.zprofile` and similar, which run if anything later starts a
