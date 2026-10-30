@@ -100,13 +100,23 @@ directories under HOME (`~/.codex`, `~/.ssh`, `~/.aws`, `~/.config`, `~/.claude`
 `~/.npmrc`, `Library/Keychains`, cargo credentials) and the real Codex home are denied explicitly. No `-s` or `--add-dir`
 is passed (those select the legacy write-only sandbox). The login reaches the Codex client, which is not sandboxed, only as
 a link to the real `auth.json`; no credential is copied, and the link is unreadable to the QA tool commands.
+The clone is deliberately not marked trusted and `exec` also selects the profile explicitly (`-c default_permissions=...`):
+the clone is the commit under test, and a trusted project lets its own `.codex/config.toml` widen the profile (measured:
+a planted allowlist entry turned a denied canary read into ALLOWED).
 Before codex starts, the wrapper proves the profile with the exact private home through `codex sandbox -P` (no model): it
-plants a synthetic canary under HOME and requires that reading it, listing the real Codex home and writing outside the roots
-are denied while reading the clone and writing `out` still work. Any control that fails or cannot run ends the run as
-`QA_INVALID` (`read confinement not established`) with codex never started; the controls are recorded in
-`CONFINEMENT.json` and summarised in `RESULT.json`. A missing `codex` binary is `QA_INCOMPLETE`. The profile is
+plants a synthetic canary under HOME and requires that reading it, listing the real Codex home, opening the real login file
+(open only, no content is read), reading the canary from a scratch clone whose own `.codex/config.toml` tries to allow it, and
+writing outside the roots are all denied with EPERM or EACCES (ENOENT or any other text proves nothing and fails), while
+reading the clone and writing `out` still work. A control that is mis-reported or allowed ends the run as `QA_INVALID`
+(`read confinement not established`) with codex never started; a probe that could not run at all (no output, timeout, codex
+sandbox unavailable) is `QA_INCOMPLETE` (`read confinement could not be checked`, retry). The controls are recorded in
+`CONFINEMENT.json` and summarised in `RESULT.json`. A missing `codex` binary is `QA_INCOMPLETE`. `--read-root` refuses HOME and
+its ancestors, credential directories, the real Codex home, the QA state and canary roots, and the run directory and any
+directory containing it. The profile is
 allowlist-based under HOME; it does not cover `/etc`, `/private/var/tmp` or unlisted directories under `/private/tmp`, so
-never keep a secret there.
+never keep a secret there. Evidence the QA agent must cite has to be inside its read allowlist (the clone, `out`, or a
+`--read-root`), or the criterion must be left out of its verdict (AASM, ASK #3: a criterion verified elsewhere was reported NOT_RUN by
+the model, as it should).
 
 ### Boundaries
 
