@@ -512,9 +512,10 @@ def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None
                 return dict(result, admit=False, reason='label-in-use: %s belongs to another live process' % label)
             others = [r for r in live if r['label'] != label]
             queued, queue_problems = _queue_entries(state_path)
-            if queue_problems:
+            if queue_problems and not same:
                 return dict(result, admit=False, reason=queue_problems[0])
-            orphans = _claimed_orphans(queued, live, token_fn)
+            # A live holder may always refresh its own reservation; its own removed-file entry is not another lane.
+            orphans = [] if queue_problems else [e for e in _claimed_orphans(queued, live, token_fn) if e['label'] != label]
             if not same:
                 ahead = [e for e in queued if e['state'] in WAITING_STATES and not _entry_lapsed(e, now)]
                 if ahead:
@@ -1111,8 +1112,10 @@ def queue_cancel(state_path, qid, now=None, session_id=None):
             for entry in entries:
                 if entry['id'] != qid:
                     continue
-                if entry['state'] not in LIVE_STATES:
-                    return {'ok': False, 'reason': '%s is already %s' % (qid, entry['state'])}
+                if entry['state'] not in WAITING_STATES:
+                    return {'ok': False, 'reason': '%s is %s; cancel never stops a running job%s' % (
+                        qid, entry['state'], ' (stop the job itself, then queue advance records the release)'
+                        if entry['state'] == 'CLAIMED' else '')}
                 if session_id is not None and entry.get('session_id') != session_id:
                     return {'ok': False, 'reason': '%s belongs to another session' % qid}
                 was = entry['state']

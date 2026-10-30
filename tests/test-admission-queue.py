@@ -431,6 +431,23 @@ class ReleaseEvidence(QueueBase):
         self.assertEqual(out['granted'], [c])
         self.assertEqual(self.entries()[a]['release']['evidence'], 'holder-exited')
 
+    def test_cancel_cannot_free_the_lane_of_a_running_claimed_job(self):
+        a, job = self.claimed()
+        b = self.enqueue('HORO-2071')['id']
+        self.assertFalse(da.queue_cancel(self.path, a, now=self.now)['ok'])
+        da.release('nda-horo-2070', self.path)
+        self.assertEqual(self.advance()['granted'], [])
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+
+    def test_live_holder_can_refresh_its_own_label_after_release_and_with_a_corrupt_queue(self):
+        a, job = self.claimed()
+        da.release('nda-horo-2070', self.path)
+        again = da.reserve('nda-horo-2070', 20 * GIB, job.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertTrue(again['admit'], again)
+        (self.path.parent / 'queue/q000099.json').write_text('{"bad"')
+        refreshed = da.reserve('nda-horo-2070', 20 * GIB, job.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertTrue(refreshed['admit'], refreshed)
+
     def test_per_entry_unverifiable_holder_keeps_the_lane(self):
         a, job = self.claimed()
         self.enqueue('HORO-2071')
