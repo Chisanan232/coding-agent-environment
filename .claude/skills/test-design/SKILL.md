@@ -56,4 +56,4 @@ Auto-used. The coding agent invokes this skill when designing or reviewing tests
 
 ## Validation Guidance
 - After writing new tests: run only those tests first.
-- After completing test design: run the full suite.
+- After completing test design, at the next validation checkpoint: run the relevant full validation (not after each test commit).
