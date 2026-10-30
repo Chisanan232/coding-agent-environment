@@ -136,16 +136,20 @@ credential cache belongs to the terminal that typed the password, so an agent se
 sudo -v && python3 scripts/qa-handoff.py run --run-dir DIR --qa-identity NAME --exchange /Users/Shared/NAME-qa
 ```
 
-No sudoers change is made or needed. A `sudo -n` refusal is `QA_INCOMPLETE` with codex not started.
+No sudoers change is made or needed. A `sudo -n` refusal is `QA_INCOMPLETE` with codex not started. Every sudo hop,
+the codex hop included, stays in the session of the Terminal that ran `sudo -v` (sudo's default timestamp is per
+terminal session; only the QA side detaches itself, as the QA user). The codex hop is therefore stopped by signalling the
+sudo child directly, and the seal's sweep removes anything left. How this behaves with a real terminal, real sudo and
+signal relay through setuid sudo is not verified until the first owner run.
 
 Three hops, each through `qa_argv`, with the QA side running a producer-owned copy of this script under `/usr/bin/python3 -I`:
 
 | Hop | Runs as | What happens | What the producer trusts |
 |---|---|---|---|
-| sweep | QA user | `kill -KILL -1` as that user, then `pgrep -U uid` (ids only): no QA process from an earlier run survives | the survivor count |
+| sweep | QA user | `kill -KILL -1` as that user, then `pgrep -U uid` (ids only): no QA process from an earlier run survives; then the persistence check (crontab, at, LaunchAgents, launchd domains) must be clean | the survivor count and the persistence result |
 | 0 env canary | producer + QA user | producer holds a synthetic sentinel in a sibling's environment and proves it can read it itself (positive control); the setup script's probe runs as the QA user and must not read it, plus the uid, groups, tty, `~/.codex` mode and exchange checks | the probe record, emitted before any model; `ISOLATION.json` |
-| 1 `qa-stage` | QA user | creates the outbox attempt `O`, copies the inbox clone to `O/source`, a private Codex home under `/Users/NAME/.local/state/coding-agent-environment/qa/<attempt>/codexhome`, and runs the confinement probe there; prints exactly one JSON record | the observed control results only: `established` is re-derived from the expected control set, never taken from the QA side; `CONFINEMENT.json` |
-| 2 `qa-exec` | QA user | moves its stderr to `O/stderr.log`, runs `codex exec` with the prompt from the inbox file, kills codex's group on timeout or signal (exit 124 / 130) | the codex stdout captured through the pipe into `R/events.jsonl` |
+| 1 `qa-stage` | QA user | creates the outbox attempt `O`, copies the inbox clone to `O/source`, a private Codex home under `/Users/NAME/.local/state/coding-agent-environment/qa/<attempt>/codexhome`, and runs the confinement probe there; prints exactly one JSON record with the SHA-256 of the profile it proved | the observed control results only: `established` is re-derived from the expected control set, never taken from the QA side; the profile digest; `CONFINEMENT.json` |
+| 2 `qa-exec` | QA user | moves its stderr to `O/stderr.log`, refuses to start codex unless the profile still has the digest hop 1 proved (exit 125), runs `codex exec` with the prompt from the inbox file, kills codex's group on timeout or signal (exit 124 / 130) | the codex stdout captured through the pipe into `R/events.jsonl` |
 | seal | producer | sweep again and list the QA user's processes once more after 12 s (longer than launchd's 10 s respawn throttle); read the QA user's crontab, at queue, `~/Library/LaunchAgents` and whether its launchd `user/<uid>` and `gui/<uid>` domains exist (as that user, `sudo -n`; any entry fails, and each launchd domain passes only when `launchctl print` exits non-zero with "Could not find domain"); open the exchange, outbox, `O` and `O/source` once each relative to the parent descriptor with `O_NOFOLLOW\|O_DIRECTORY` and check the owner of what was opened; read `O/verdict.json` relative to the held `O` descriptor, only if a single-link regular file owned by the QA user and at most 5 MiB; compare `O/source` with the producer's manifest once; then confirm every path component still names the directory that was opened (device and inode) | the sealed values in `RUNMETA.json` (`qa_identity`, `stragglers`, `persistence`, `path_ok`, `tree_problems`, `untracked`) |
 
 Paths: `X` exchange, `R` the producer's run directory, attempt `A=<product>-<ticket>-<R name>-<8 hex>`, inbox
@@ -154,7 +158,12 @@ of the verified clone that is deleted after hop 1), outbox `O=X/outbox/A` (QA-wr
 producer truth: `ISOLATION.json`, `CONFINEMENT.json`, `events.jsonl`, `stderr.log` (sudo's), the sealed `verdict.json`
 copy, `RUNMETA.json` (with the script copy's digest) and `RESULT.json`. `verdict` never reads `O` again, so editing or
 deleting the outbox later changes nothing. `X/inbox/RUN.lock` is the identity lock: one run per QA user at a time
-(the sweep kills every process of that user). A run killed with SIGKILL can leave it behind; remove it by hand once no QA
+(the sweep kills every process of that user). It is taken and cleaned up with TERM, INT and HUP ignored, so a signal
+cannot leak it; from the end of codex until the run record exists, signals only mark the run interrupted, so a second
+Ctrl-C cannot erase the record. `R/LAUNCHED` is written just before the codex hop starts: a directory in which codex may
+have run is never run again (REFUSED), and without a record `verdict` is `QA_INVALID`. `R/MODE.json` records the mode of
+the first attempt (`qa_identity`, `exchange`, `require_env_isolation`, also in `RESULT.json` as `mode`); a later run of the
+same directory in another mode is REFUSED. A run killed with SIGKILL can leave the lock behind; remove it by hand once no QA
 run is active.
 
 Trust boundary: the producer trusts its own pipe capture (hashed and recounted as before), the hop 0 and hop 1 output
@@ -165,7 +174,9 @@ stderr, or the QA side's own `established` flag.
 |---|---|
 | `--require-env-isolation` without an identity; identity with `--read-root`; identity is root or your own uid; bad name or exchange | `REFUSED` (64), nothing written |
 | identity lock held by another run | `WAITING_RESOURCE` (75) |
-| exchange owners or modes wrong; `sudo -n` refused; sweep could not run; a hop printed nothing; codex missing on the QA side; confinement could not be checked | `QA_INCOMPLETE`, codex not started |
+| codex was started for this directory (`LAUNCHED` or `RUNMETA.json`), or it was attempted in another mode | `REFUSED` (64) |
+| exchange owners or modes wrong; `sudo -n` refused (at any hop, the codex hop included); sweep could not run; QA-user persistence before the run; a hop printed nothing; codex missing on the QA side; confinement could not be checked | `QA_INCOMPLETE`, codex not started |
+| the permission profile changed between hop 1 and hop 2 | `QA_INVALID`, codex not started |
 | env probe ran and failed (leak, detector invalid, tty, uid, groups, `~/.codex` mode) | `QA_INVALID`, codex not started |
 | confinement failed, malformed, incomplete or not exactly one record | `QA_INVALID`, codex not started |
 | survivors after the seal's sweep; a crontab, at job or launch agent of the QA user (or a check that could not run); linked, foreign-owned or replaced outbox directory; unreadable or linked verdict; sealed clone problems; `ISOLATION.json` or `CONFINEMENT.json` missing or not established | `QA_INVALID` |
