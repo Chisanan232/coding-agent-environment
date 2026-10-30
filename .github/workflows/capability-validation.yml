@@ -10,6 +10,8 @@ on:
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
       - 'scripts/storage-integration.py'
+      - 'scripts/build-baseline.py'
+      - 'docs/ENGINEERING-BASELINE.md'
       - 'scripts/resource-policy-install.py'
       - 'scripts/launcher-install.py'
       - 'scripts/hook-rollout.py'
@@ -64,6 +66,8 @@ on:
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
       - 'scripts/storage-integration.py'
+      - 'scripts/build-baseline.py'
+      - 'docs/ENGINEERING-BASELINE.md'
       - 'scripts/resource-policy-install.py'
       - 'scripts/launcher-install.py'
       - 'scripts/hook-rollout.py'
@@ -173,6 +177,7 @@ jobs:
           python3 tests/test-mcp-scope-inspect.py
           python3 tests/test-spe108-live.py
           python3 tests/test-adoption-coverage.py
+          python3 tests/test-build-baseline.py
           python3 tests/test-resource-lifecycle.py
           python3 tests/test-qa-handoff.py
           python3 tests/test-parity-dogfood.py
