@@ -1195,7 +1195,7 @@ class IdentityGuardTests(Base):
 
     IDENT = qa.Identity("qauser", os.getuid() + 4321, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
 
-    def sweep_with(self, tables, paths, recheck=0, gone=()):
+    def sweep_with(self, tables, paths, recheck=0, gone=(), stderr=""):
         """Run sweep_identity against fake `ps` tables (lists of "pid ppid stat" rows) and a pid -> executable path map."""
         tables = list(tables)
         slept = []
@@ -1203,7 +1203,7 @@ class IdentityGuardTests(Base):
         def fake_run(argv, **kwargs):
             if argv[0] == qa.PS:
                 rows = tables.pop(0) if len(tables) > 1 else tables[0]
-                return subprocess.CompletedProcess(argv, 0 if rows else 1, "".join(r + "\n" for r in rows), "")
+                return subprocess.CompletedProcess(argv, 0 if rows else 1, "".join(r + "\n" for r in rows), stderr)
             return subprocess.CompletedProcess(argv, 0, "", "")
 
         def fake_kill(pid, sig):
@@ -1240,6 +1240,11 @@ class IdentityGuardTests(Base):
 
     def test_an_unreadable_path_of_a_process_that_still_exists_is_a_survivor(self):
         self.assertEqual(self.sweep_with([["700 1 S"]], {})[0], 1)
+
+    def test_a_failed_ps_that_exits_1_is_not_zero_survivors(self):
+        # ps exits 1 with an empty table and a message for an unknown uid or a bad option: that is a failure, not "none"
+        self.assertIsNone(self.sweep_with([[]], {}, stderr="ps: No ruser name or ID matches\n")[0])
+        self.assertEqual(self.sweep_with([[]], {})[0], 0)                      # a genuinely empty table is zero
 
     def test_an_unreadable_process_table_fails_the_sweep(self):
         for bad in (["not a row"], ["12 x S"]):

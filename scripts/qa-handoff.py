@@ -1067,8 +1067,8 @@ def sweep_identity(ident, recheck=0):
                                     capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             return None
-        if listed.returncode == 1 and not listed.stdout.strip():
-            return 0
+        if listed.returncode == 1 and not listed.stdout.strip() and not listed.stderr.strip():
+            return 0   # ps exits 1 with an empty table and a message on stderr for an unknown uid or a bad option: not zero
         if listed.returncode != 0:
             return None
         count = 0
@@ -1079,9 +1079,10 @@ def sweep_identity(ident, recheck=0):
             pid, ppid = int(fields[0]), int(fields[1])
             if fields[2].startswith('Z'):   # exited, only waiting to be reaped: nothing is running
                 continue
-            if ppid == 1 and executable_path(pid) in QA_SYSTEM_SERVICES:
+            path = executable_path(pid)
+            if ppid == 1 and path in QA_SYSTEM_SERVICES:
                 continue
-            if executable_path(pid) is None:
+            if path is None:
                 try:
                     os.kill(pid, 0)
                 except ProcessLookupError:   # gone between the listing and the lookup
