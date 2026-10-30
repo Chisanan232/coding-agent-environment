@@ -14,7 +14,7 @@ Scope, exactly: the local user and group NAME (id UID), /Users/NAME (mode 0700) 
 copies any credential, and never touches any other user, process, session or file. Anything unexpected stops it (fail
 closed). Re-running is safe: each step reads the current state first and changes only what differs.
 """
-import argparse, json, os, platform, pwd, re, secrets, signal, stat, subprocess, sys, time
+import argparse, json, os, platform, pwd, re, secrets, shlex, stat, subprocess, sys
 from pathlib import Path
 
 # Constants, not environment: nothing here can be redirected by the caller's environment. Tests replace them on the module.
@@ -364,8 +364,9 @@ class Setup:
         say("rollback finished; verify with: dscl . -read /Users/%s ; ls -d %s %s" % (n, self.home, self.xroot))
 
     def login_command(self):
-        """Printed for the owner; this script never logs in. A separate Codex device-code login, as the QA user only."""
-        return "sudo -u %s -H /usr/bin/env -i HOME=%s PATH=%s %s login --device-auth" % (self.name, self.home, SAFE_PATH, CODEX)
+        """Printed for the owner; this script never logs in. Same detach hop as the probe: a plain `sudo -u` would hand the
+        QA process the owner's controlling terminal (TIOCSTI keystroke injection into the owner's shell)."""
+        return shlex.join(qa_argv(self.name, self.home, [CODEX, "login", "--device-auth"], alarm=900))
 
 
 def main(argv=None):
@@ -408,7 +409,7 @@ def main(argv=None):
                     raise Stop("%s  (undo also stopped: %s)" % (orig, e2))
             raise orig
         say("DONE: the QA identity %s is set up and its isolation verified. No Codex login or model run happened." % a.name)
-        say("Next, as a separate owner step (a Codex device-code login as that user only; it uses your Terminal):")
+        say("Next, as a separate owner step (a Codex device-code login as that user only; run `sudo -K` in the same Terminal afterwards):")
         say("    %s" % s.login_command())
         say("Verify at any time, read-only: /usr/bin/python3 -I %s --name %s --uid %s --check" % (Path(__file__).resolve(), a.name, a.uid))
         return 0

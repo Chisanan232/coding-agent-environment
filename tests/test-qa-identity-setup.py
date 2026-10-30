@@ -90,6 +90,14 @@ class CommandShapeTest(unittest.TestCase):
         self.assertIn("login --device-auth", c)
         self.assertIn("env -i", c)
 
+    def test_login_command_drops_owner_terminal(self):
+        # sudo'd login must not inherit the owner's tty (TIOCSTI keystroke injection into the owner's shell)
+        s = qis.Setup("fornaxqa", 777, Path("/Users/fornaxqa"), Path("/Users/Shared/fornaxqa-qa"))
+        c = s.login_command()
+        self.assertIn("os.setsid()", c)
+        self.assertIn("-I", c)
+        self.assertTrue(c.startswith(qis.SUDO))
+
 
 class RollbackGuardTest(unittest.TestCase):
     def setUp(self):
