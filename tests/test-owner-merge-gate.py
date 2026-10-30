@@ -30,7 +30,7 @@ class Fake:
         self.pr = {"number": 7, "state": "OPEN", "isDraft": False, "baseRefName": "main", "headRefName": "feat/x", "headRefOid": HEAD,
                    "author": {"login": "chisanan232"}, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
                    "reviewDecision": "", "reviews": [], "isCrossRepository": False, "mergeCommit": None,
-                   "comments": [{"author": {"login": "chisanan232"}, "body": REVIEW}], "files": [],
+                   "comments": [{"author": {"login": "chisanan232"}, "body": REVIEW}],
                    "statusCheckRollup": green()}
         self.repo = {"nameWithOwner": "Chisanan232/r", "defaultBranchRef": {"name": "main"}, "isFork": False,
                      "viewerPermission": "ADMIN", "owner": {"login": "Chisanan232"}}
@@ -174,68 +174,73 @@ class Gate(unittest.TestCase):
 
     NOCI = f"OWNER-MERGE-CI-EXCEPTION head={HEAD} basis=no-hosted-ci local_equivalent=PASS"
 
+    def noci_fake(self, files=None, comments=None, **over):
+        fake = Fake(statusCheckRollup=over.pop("statusCheckRollup", []), comments=comments if comments is not None else self.noci_comments(), **over)
+        fake.pr["files"] = SRC if files is None else files
+        return fake
+
     def noci_comments(self, record=None):
         return [{"author": {"login": "chisanan232"}, "body": REVIEW}, {"author": {"login": "chisanan232"}, "body": record or self.NOCI}]
 
     def test_no_hosted_ci_exception_needs_flag_record_zero_checks_and_no_workflows(self):
-        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments()), "NO_CI_EVIDENCE")                  # flag missing
-        v, _, facts = run(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments()), ci_exception=True)
+        self.refused(self.noci_fake(comments=self.noci_comments()), "NO_CI_EVIDENCE")                  # flag missing
+        v, _, facts = run(self.noci_fake(comments=self.noci_comments()), ci_exception=True)
         self.assertEqual((v, facts["ci_exception"]), ("PASS", "no-hosted-ci"))
-        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=[self.noci_comments()[0]]), "NO_CI_EVIDENCE", ci_exception=True)   # no record
+        self.refused(self.noci_fake(comments=[self.noci_comments()[0]]), "NO_CI_EVIDENCE", ci_exception=True)   # no record
         stale = self.noci_comments(self.NOCI.replace(HEAD, "d" * 40))
-        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=stale), "NO_CI_EVIDENCE", ci_exception=True)            # another head
-        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(self.NOCI.replace("PASS", "FAIL"))), "NO_CI_EVIDENCE", ci_exception=True)
+        self.refused(self.noci_fake(comments=stale), "NO_CI_EVIDENCE", ci_exception=True)            # another head
+        self.refused(self.noci_fake(comments=self.noci_comments(self.NOCI.replace("PASS", "FAIL"))), "NO_CI_EVIDENCE", ci_exception=True)
         other = [self.noci_comments()[0], {"author": {"login": "someone-else"}, "body": self.NOCI}]
-        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=other), "NO_CI_EVIDENCE", ci_exception=True)            # not the authenticated user
+        self.refused(self.noci_fake(comments=other), "NO_CI_EVIDENCE", ci_exception=True)            # not the authenticated user
 
     def test_no_hosted_ci_exception_is_refused_where_workflows_exist_or_cannot_be_read(self):
         for workflows in (3, 1, 0, "empty", "error", "ratelimit", {"main": None, "*": 2}, {HEAD: 2, "*": None}):
             with self.subTest(workflows=workflows):
-                self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(), workflows=workflows), "NO_CI_EVIDENCE", ci_exception=True)
+                self.refused(self.noci_fake(comments=self.noci_comments(), workflows=workflows), "NO_CI_EVIDENCE", ci_exception=True)
 
     def test_a_repository_name_containing_404_cannot_imitate_a_missing_directory(self):
-        fake = Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(), workflows="ratelimit")
+        fake = self.noci_fake(comments=self.noci_comments(), workflows="ratelimit")
         self.assertTrue(omg.has_workflows(fake, "a/app404", "main"))                      # "404" only in the repo name and the path
         self.refused(fake, "NO_CI_EVIDENCE", ci_exception=True)
 
     def test_the_workflow_directory_is_read_at_the_base_and_at_the_head(self):
-        fake = Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments())
+        fake = self.noci_fake(comments=self.noci_comments())
         v, _, _ = run(fake, ci_exception=True)
         self.assertEqual(v, "PASS")
         self.assertEqual(sorted(fake.workflow_reads), sorted(["main", HEAD]))
         # workflows only at the head (a PR that brings them) or only at the base both refuse
-        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(), workflows={HEAD: 1, "*": None}), "NO_CI_EVIDENCE", ci_exception=True)
-        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(), workflows={"main": 1, "*": None}), "NO_CI_EVIDENCE", ci_exception=True)
+        self.refused(self.noci_fake(comments=self.noci_comments(), workflows={HEAD: 1, "*": None}), "NO_CI_EVIDENCE", ci_exception=True)
+        self.refused(self.noci_fake(comments=self.noci_comments(), workflows={"main": 1, "*": None}), "NO_CI_EVIDENCE", ci_exception=True)
 
     def test_a_pr_that_adds_or_touches_a_workflow_or_has_an_unknown_file_list_cannot_use_the_exception(self):
         for files in ([{"path": ".github/workflows/ci.yml"}], [{"path": "src/a.py"}, {"path": ".github/workflows/x.yml"}],
                       [{"path": ".GitHub/Workflows/x.yml"}], [{"path": "pkg/.github/workflows/a.yml"}], [], [{"path": f"f{i}"} for i in range(100)]):
             with self.subTest(files=files[:2]):
-                self.refused(Fake(statusCheckRollup=[], comments=self.noci_comments(), files=files), "NO_CI_EVIDENCE", ci_exception=True)
-        v, _, _ = run(Fake(statusCheckRollup=[], comments=self.noci_comments(), files=SRC), ci_exception=True)
+                self.refused(self.noci_fake(files=files), "NO_CI_EVIDENCE", ci_exception=True)
+        v, _, _ = run(self.noci_fake(), ci_exception=True)
         self.assertEqual(v, "PASS")
 
     def test_a_pull_request_from_a_fork_cannot_use_the_exception(self):
-        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(), isCrossRepository=True), "NO_CI_EVIDENCE", ci_exception=True)
+        self.refused(self.noci_fake(comments=self.noci_comments(), isCrossRepository=True), "NO_CI_EVIDENCE", ci_exception=True)
 
     def test_a_check_that_ran_without_failing_still_blocks_the_exception(self):
         for conclusion in ("SKIPPED", "NEUTRAL", "SUCCESS"):
             with self.subTest(conclusion=conclusion):
-                v, _, facts = run(Fake(files=SRC, statusCheckRollup=[{"name": "t", "status": "COMPLETED", "conclusion": conclusion}], comments=self.noci_comments()), ci_exception=True)
+                v, _, facts = run(self.noci_fake(statusCheckRollup=[{"name": "t", "status": "COMPLETED", "conclusion": conclusion}]), ci_exception=True)
                 self.assertNotIn("ci_exception", facts)
 
     def test_no_hosted_ci_exception_never_excuses_checks_that_ran_or_a_missing_review(self):
         bad = [{"name": "t", "status": "COMPLETED", "conclusion": "FAILURE"}]
-        self.refused(Fake(files=SRC, statusCheckRollup=bad, comments=self.noci_comments()), "CI_FAILED", ci_exception=True)
+        self.refused(self.noci_fake(statusCheckRollup=bad), "CI_FAILED", ci_exception=True)
         pending = [{"name": "t", "status": "IN_PROGRESS", "conclusion": ""}]
-        v, _, _ = run(Fake(files=SRC, statusCheckRollup=pending, comments=self.noci_comments()), ci_exception=True)
+        v, _, _ = run(self.noci_fake(statusCheckRollup=pending), ci_exception=True)
         self.assertEqual(v, "WAIT")
-        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=[self.noci_comments()[1]]), "NO_REVIEW_EVIDENCE", ci_exception=True)
+        self.refused(self.noci_fake(comments=[self.noci_comments()[1]]), "NO_REVIEW_EVIDENCE", ci_exception=True)
 
     def test_the_two_ci_exceptions_do_not_substitute_for_each_other(self):
         unavailable = f"OWNER-MERGE-CI-UNAVAILABLE head={HEAD} cause=billing local_equivalent=PASS"
-        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(unavailable)), "NO_CI_EVIDENCE", ci_exception=True)
-        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments()), "NO_CI_EVIDENCE", ci_unavailable=True)
+        self.refused(self.noci_fake(comments=self.noci_comments(unavailable)), "NO_CI_EVIDENCE", ci_exception=True)
+        self.refused(self.noci_fake(comments=self.noci_comments()), "NO_CI_EVIDENCE", ci_unavailable=True)
 
     def test_the_workflow_read_is_an_allowed_read_only_call(self):
         omg.read_only(("api", "repos/Chisanan232/r/contents/.github/workflows?ref=main", "--jq", "length"))
