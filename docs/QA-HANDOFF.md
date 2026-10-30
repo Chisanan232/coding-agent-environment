@@ -127,6 +127,10 @@ the hop and acts on the verdict.
   including the Codex login the run needs (`CODEX_HOME`) and other home secrets, and could quote them in evidence. A
   separate OS user or an allowlist-read profile is needed to prevent that; it is not implemented here. Treat the evidence
   text as possibly containing anything this user can read.
+- SIGTERM, SIGINT and SIGHUP to the wrapper are handled: codex's group is killed and a hashed interrupted record is
+  written, so `verdict` reports `QA_INCOMPLETE` and a later edit is `QA_INVALID`. A signal that lands in the few bytecodes
+  between the child being forked and `Popen` returning can leave codex unmonitored; the wrapper's exit then closes codex's
+  stdin pipe, so it reads an empty prompt. SIGKILL of the wrapper cannot be handled at all and leaves no record.
 - After a clean codex exit the wrapper sends SIGKILL to the codex process group. If that group were fully gone and its id
   recycled by an unrelated group leader within the same moment, that group would be signalled; this is negligible in
   practice and not defended against.
