@@ -448,6 +448,23 @@ class ReleaseEvidence(QueueBase):
         refreshed = da.reserve('nda-horo-2070', 20 * GIB, job.pid, self.path, lambda: 400 * GIB, now=self.now)
         self.assertTrue(refreshed['admit'], refreshed)
 
+    def test_a_different_process_cannot_take_a_running_claimed_jobs_label_or_lane(self):
+        a, job = self.claimed()
+        da.release('nda-horo-2070', self.path)
+        other = subprocess.Popen(['/bin/sleep', '300'])
+        self.holders.append(other)
+        out = da.reserve('nda-horo-2070', 20 * GIB, other.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertFalse(out['admit'], out)
+        self.assertIn('label-in-use', out['reason'])
+
+    def test_damaged_queue_allows_only_a_non_growing_refresh(self):
+        a, job = self.claimed()
+        (self.path.parent / 'queue/q000099.json').write_text('{"bad"')
+        grow = da.reserve('nda-horo-2070', 30 * GIB, job.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertFalse(grow['admit'], grow)
+        same = da.reserve('nda-horo-2070', 20 * GIB, job.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertTrue(same['admit'], same)
+
     def test_per_entry_unverifiable_holder_keeps_the_lane(self):
         a, job = self.claimed()
         self.enqueue('HORO-2071')

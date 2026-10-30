@@ -512,10 +512,16 @@ def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None
                 return dict(result, admit=False, reason='label-in-use: %s belongs to another live process' % label)
             others = [r for r in live if r['label'] != label]
             queued, queue_problems = _queue_entries(state_path)
-            if queue_problems and not same:
+            if queue_problems and (not same or nbytes > same[0]['bytes']):
+                # With a damaged queue only a same-process refresh that does not grow its bytes can pass.
                 return dict(result, admit=False, reason=queue_problems[0])
-            # A live holder may always refresh its own reservation; its own removed-file entry is not another lane.
-            orphans = [] if queue_problems else [e for e in _claimed_orphans(queued, live, token_fn) if e['label'] != label]
+            # Only the claiming process itself (same pid and start token) is excused from the orphan count; an orphan that
+            # holds this label under another process keeps its lane and the label.
+            orphans = [] if queue_problems else [e for e in _claimed_orphans(queued, live, token_fn)
+                                                  if not (e['label'] == label and e['holder']['pid'] == pid
+                                                          and e['holder']['start_token'] == token)]
+            if not same and any(e['label'] == label for e in orphans):
+                return dict(result, admit=False, reason='label-in-use: %s belongs to a running claimed job' % label)
             if not same:
                 ahead = [e for e in queued if e['state'] in WAITING_STATES and not _entry_lapsed(e, now)]
                 if ahead:
