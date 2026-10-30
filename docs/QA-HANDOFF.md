@@ -146,7 +146,7 @@ Three hops, each through `qa_argv`, with the QA side running a producer-owned co
 | 0 env canary | producer + QA user | producer holds a synthetic sentinel in a sibling's environment and proves it can read it itself (positive control); the setup script's probe runs as the QA user and must not read it, plus the uid, groups, tty, `~/.codex` mode and exchange checks | the probe record, emitted before any model; `ISOLATION.json` |
 | 1 `qa-stage` | QA user | creates the outbox attempt `O`, copies the inbox clone to `O/source`, a private Codex home under `/Users/NAME/.local/state/coding-agent-environment/qa/<attempt>/codexhome`, and runs the confinement probe there; prints exactly one JSON record | the observed control results only: `established` is re-derived from the expected control set, never taken from the QA side; `CONFINEMENT.json` |
 | 2 `qa-exec` | QA user | moves its stderr to `O/stderr.log`, runs `codex exec` with the prompt from the inbox file, kills codex's group on timeout or signal (exit 124 / 130) | the codex stdout captured through the pipe into `R/events.jsonl` |
-| seal | producer | sweep again, `lstat` the exchange, outbox, `O` and `O/source` (real directories, expected owners), copy `O/verdict.json` only if a single-link regular file owned by the QA user and at most 5 MiB, compare `O/source` with the producer's manifest once | the sealed values in `RUNMETA.json` (`qa_identity`, `stragglers`, `path_ok`, `tree_problems`, `untracked`) |
+| seal | producer | sweep again; read the QA user's crontab, at queue and `~/Library/LaunchAgents` (as that user, `sudo -n`; any entry or unreadable check fails); open the exchange, outbox, `O` and `O/source` once each relative to the parent descriptor with `O_NOFOLLOW\|O_DIRECTORY` and check the owner of what was opened; read `O/verdict.json` relative to the held `O` descriptor, only if a single-link regular file owned by the QA user and at most 5 MiB; compare `O/source` with the producer's manifest once; then confirm every path component still names the directory that was opened (device and inode) | the sealed values in `RUNMETA.json` (`qa_identity`, `stragglers`, `persistence`, `path_ok`, `tree_problems`, `untracked`) |
 
 Paths: `X` exchange, `R` the producer's run directory, attempt `A=<product>-<ticket>-<R name>-<8 hex>`, inbox
 `I=X/inbox/A` (producer-owned, read-only to the QA user through the inherited ACE: script copy, packet, prompt, and a copy
@@ -168,7 +168,8 @@ stderr, or the QA side's own `established` flag.
 | exchange owners or modes wrong; `sudo -n` refused; sweep could not run; a hop printed nothing; codex missing on the QA side; confinement could not be checked | `QA_INCOMPLETE`, codex not started |
 | env probe ran and failed (leak, detector invalid, tty, uid, groups, `~/.codex` mode) | `QA_INVALID`, codex not started |
 | confinement failed, malformed, incomplete or not exactly one record | `QA_INVALID`, codex not started |
-| survivors after the seal's sweep; linked or foreign-owned outbox path; unreadable or linked verdict; sealed clone problems; `ISOLATION.json` or `CONFINEMENT.json` missing or not established | `QA_INVALID` |
+| survivors after the seal's sweep; a crontab, at job or launch agent of the QA user (or a check that could not run); linked, foreign-owned or replaced outbox directory; unreadable or linked verdict; sealed clone problems; `ISOLATION.json` or `CONFINEMENT.json` missing or not established | `QA_INVALID` |
+| the QA user has no Codex login | `QA_INCOMPLETE`, codex not started (the login control is required in identity mode, never exempt) |
 | timeout (inner exit 124), interrupt, crash | the existing paths (`QA_INCOMPLETE`) |
 
 What is verified offline: the producer's mapping and sealing, through the real hop code with an injected fake `sudo`
@@ -242,6 +243,12 @@ the hop and acts on the verdict.
   With `--qa-identity` the seal kills every process of the QA user and a survivor is `QA_INVALID`. On a real hidden macOS
   account, per-user system agents (if any appear for that uid) would also count as survivors, so such a run could never
   pass; this has not been checked on a real account.
+- Identity mode sees only the QA user's processes, crontab, at queue and `~/Library/LaunchAgents`. It does not see a
+  system-domain job (which needs root to install) or any other way the account could be started later.
+  `qa-identity-setup.py` does not yet deny cron and at to the account (`/usr/lib/cron/cron.deny`, `at.deny`); doing so is a
+  follow-up for the setup script, not part of SPE-142.
+- The seal reads the clone by path between two descriptor-identity checks of every outbox directory. A replacement is
+  caught; a replace-and-restore while the scan runs would need a live QA-user process, which the sweep has removed.
 - Identity mode leaves every attempt's outbox in place: the producer cannot delete files the QA user owns, so outbox disk
   use grows until the owner removes old attempts (for example as the QA user, or through `--rollback` of the setup).
 - Identity mode still trusts the codex binary the QA user runs: a replaced codex can forge its own event stream, exactly
