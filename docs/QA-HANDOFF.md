@@ -272,7 +272,9 @@ the hop and acts on the verdict.
   kernel-reported executable path (libproc, not `ps comm`, which a process can set through argv[0]) and a parent of
   launchd, are not survivors; any other process, a listed path under a different parent, or an unreadable table is. The
   set is VERIFIED-ON-THIS-HOST only: add a path after the owner's `--check` shows it. A QA process that executes one of
-  those same Apple binaries is tolerated. Still open: the persistence check treats any present launchd `user/<uid>`
+  those same Apple binaries is tolerated (it stops running its own code; it keeps inherited descriptors and Mach rights,
+  and these services read per-user data the QA user can write, which the sweep does not defend against; whether
+  `mdbulkimport` loads importer plugins from the user's home is NOT_VERIFIED). Still open: the persistence check treats any present launchd `user/<uid>`
   domain as a problem, which on this account fails every run closed until the domain check is replaced by one built from
   a real `launchctl print user/<uid>` sample (SPE-145).
 - Identity mode sees only the QA user's processes, crontab, at queue, `~/Library/LaunchAgents` and whether a launchd
