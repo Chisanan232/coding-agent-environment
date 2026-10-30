@@ -274,13 +274,19 @@ the hop and acts on the verdict.
   on-demand agents (the `mdworker.*` ones) start and stop. A present `user/<uid>` domain is therefore normal, and the run
   does not require it absent. It requires instead, checked through `sudo -n` as the QA user: the `launchctl print` output
   parses (header, `services` block, an empty `unmanaged processes` block, a service count that matches), and for every loaded
-  service `launchctl print user/<uid>/<label>` reports `type = LaunchAgent`, a `path` that is a `.plist` directly inside
-  `/System/Library/LaunchAgents/` or `/System/Library/LaunchDaemons/` (not the rest of `/System/Library/`: parts of it are
-  writable, for example `AssetsV2/downloadDir` is mode 777 on a real host, and `/System/Volumes/Data` is the data volume),
-  checked on the producer side to be a regular, root-owned file nobody else can write, and a `program` that is present,
-  absolute, free of `..`, under `/System/Library/`, `/usr/libexec/` or `/usr/sbin/`, and not an interpreter or shell. A job
-  the QA user submits or bootstraps has no such path or a plist it owns; a name or label proves nothing because it can pick
-  any. The program, arguments and environment printed for a job are chosen by
+  service `launchctl print user/<uid>/<label>` reports one of two shapes that macOS itself registers: a `type = LaunchAgent`
+  whose `path` is a `.plist` directly inside `/System/Library/LaunchAgents/` or `/System/Library/LaunchDaemons/`, or a
+  `type = XPCService` whose `path` is a `.xpc` bundle directory directly inside an `XPCServices` directory under
+  `/System/Library/` (about a fifth of the services of a fresh account are of this second kind), with a `program` that is
+  present, absolute, free of `..`, and for an XPC service inside its own bundle, for a launch agent under
+  `/System/Library/`, `/usr/libexec/` or `/usr/sbin/`, and in both cases not an interpreter or shell (matched by name prefix,
+  case-insensitively). On the producer side the plist or bundle and the program must also be sealed: every component of the
+  path as given and of its resolved form must be owned by root, closed to group and other, with links followed only to a
+  target that passes too (some frameworks reach `Resources` through `Versions/Current`), and the resolved path must stay
+  under the allowed roots. A mode-777 directory anywhere in the chain fails closed; this replaces a device-number test,
+  which cannot see it because `AssetsV2/downloadDir` is firmlinked to the data volume yet reports the sealed volume's device.
+  A job the QA user submits or bootstraps has no such path or one in a directory it can write; a name or label proves
+  nothing because it can pick any. The program, arguments and environment printed for a job are chosen by
   its owner, so only the header counts: `path` and `type` must each appear once, `type` on the line right after `path`, before
   `program` and before the first nested block, with nothing before the `path` but numeric counters (`active count`,
   `copy count`) and the label in `original =` that launchd prints for on-demand copies (`mdworker.shared.<uuid>`), so a
