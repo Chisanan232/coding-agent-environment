@@ -1624,6 +1624,10 @@ class LaunchdDomainTests(unittest.TestCase):
             self.assertEqual(qa.persistence_problems(self.IDENT), [])
             answers["launchctl:gui"] = (0, "gui/530 = {\n}\n", "")
             self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))
+            answers["launchctl:gui"] = (125, "", "Could not print domain: 125: Domain does not support specified action\n")
+            self.assertEqual(qa.persistence_problems(self.IDENT), [])
+            answers["launchctl:gui"] = (1, "", "sudo: a password is required\n")
+            self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))
 
 
 class LaunchdGuiAbsentTests(unittest.TestCase):
