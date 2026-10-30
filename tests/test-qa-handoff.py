@@ -1626,6 +1626,41 @@ class LaunchdDomainTests(unittest.TestCase):
             self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))
 
 
+class LaunchdGuiAbsentTests(unittest.TestCase):
+    """gui/<uid> passes only in the documented absent forms (SPE-145 part 5): an unknown uid ("Could not find domain") or an
+    existing account with no GUI session (exit 125, "Domain does not support specified action", nothing on stdout)."""
+    NO_SESSION = "Could not print domain: 125: Domain does not support specified action\n"
+
+    def problems(self, rc, out="", err=""):
+        return qa.launchd_problems("gui/530", subprocess.CompletedProcess([], rc, out, err))
+
+    def test_an_account_without_a_gui_session_passes(self):
+        self.assertEqual(self.problems(125, "", self.NO_SESSION), [])
+
+    def test_an_unknown_uid_still_passes(self):
+        self.assertEqual(self.problems(112, "", "Could not find domain for user gui: 9999\n"), [])
+
+    def test_a_printed_domain_is_a_problem(self):
+        self.assertTrue(self.problems(0, "gui/530 = {\n\tservices = {\n\t}\n}\n", ""))
+
+    def test_125_with_other_text_is_a_problem(self):
+        self.assertTrue(self.problems(125, "", "Could not print domain: 125: something else\n"))
+
+    def test_the_no_session_text_with_another_exit_code_is_a_problem(self):
+        for rc in (0, 1, 112, 113, 126):
+            self.assertTrue(self.problems(rc, "", self.NO_SESSION), rc)
+
+    def test_empty_output_is_a_problem(self):
+        self.assertTrue(self.problems(125, "", ""))
+        self.assertTrue(self.problems(1, "", ""))
+
+    def test_125_with_stdout_is_a_problem(self):
+        self.assertTrue(self.problems(125, "gui/530 = {\n}\n", self.NO_SESSION))
+
+    def test_the_no_session_text_on_stdout_only_is_a_problem(self):
+        self.assertTrue(self.problems(125, self.NO_SESSION, ""))
+
+
 class SiblingFileTests(unittest.TestCase):
     """qa-handoff.py loads qa-identity-setup.py and runs disk-admission.py from its own directory: a copy without them must
     say so, not die with a traceback or report a resource refusal."""
