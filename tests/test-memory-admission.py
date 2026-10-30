@@ -643,6 +643,17 @@ class IdleOrphan(unittest.TestCase):
         self.assertLessEqual(len(calls), 3)
         self.assertTrue(all(c is not None and c <= 5 for c in calls))
 
+    def test_each_cwd_lookup_is_clamped_to_the_remaining_budget(self):
+        timeouts = []
+        def run(cmd, **kw):
+            timeouts.append(kw.get("timeout"))
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        recs = [{"pid": n, "comm": "rustc", "ppid": 1, "age_s": 3600, "cpu_s": 1.0, "cwd": None} for n in range(5)]
+        clock = iter([0, 0, 3, 6, 9, 12])                           # start, then one reading per lookup: three seconds pass each time
+        ma.fill_cwds(recs, run, budget=8, now=lambda: next(clock))
+        self.assertEqual(timeouts, [4, 4, 2])                         # the third is clamped to what is left of the 8 s
+        self.assertLessEqual(sum(timeouts), 8)
+
 
 if __name__ == "__main__":
     unittest.main()

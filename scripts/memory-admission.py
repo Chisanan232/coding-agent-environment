@@ -168,8 +168,8 @@ def classify_heavy(ps_text):
     return active, idle, cpus, active_pids
 
 
-def lookup_cwd(pid, run):
-    out = _run([LSOF, "-a", "-d", "cwd", "-p", str(pid), "-Fn"], run, timeout=CWD_LOOKUP_TIMEOUT)
+def lookup_cwd(pid, run, timeout=CWD_LOOKUP_TIMEOUT):
+    out = _run([LSOF, "-a", "-d", "cwd", "-p", str(pid), "-Fn"], run, timeout=timeout)
     for line in (out or "").splitlines():
         if line.startswith("n") and len(line) > 1:
             return "".join(c for c in line[1:] if c.isprintable())[:200]
@@ -180,9 +180,10 @@ def fill_cwds(recs, run, budget=CWD_LOOKUP_BUDGET, now=time.monotonic):
     """Best-effort cwd for the first few idle orphans; a stuck lsof can never stall an admission check beyond `budget`."""
     start = now()
     for rec in recs[:MAX_IDLE_REPORT]:
-        if now() - start >= budget:
+        left = budget - (now() - start)
+        if left <= 0:
             break
-        rec["cwd"] = lookup_cwd(rec["pid"], run)
+        rec["cwd"] = lookup_cwd(rec["pid"], run, timeout=min(CWD_LOOKUP_TIMEOUT, left))
 
 
 def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu_fn=os.cpu_count, disk_free_fn=None, mono_fn=time.monotonic):
