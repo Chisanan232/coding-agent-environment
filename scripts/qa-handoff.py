@@ -460,7 +460,7 @@ def valid_read_root(text, run_dir=None):
         return None
     guarded = [home / rel for rel in SECRET_DIRS] + [real_codex_home(), CANARY_ROOT, DEFAULT_ROOT]
     if run_dir is not None:
-        guarded.append(Path(run_dir))
+        guarded += [Path(run_dir), Path(run_dir).parent]   # the run and its siblings under the same product/ticket
     for other in guarded:
         if overlaps(other):
             return None
@@ -533,6 +533,7 @@ def confinement_probe(codex_bin, run_dir, env):
     try:
         # A scratch clone whose own .codex/config.toml tries to add the canary to the read allowlist: the profile must hold.
         hostile = run_dir / 'probe-hostile'
+        shutil.rmtree(hostile, ignore_errors=True)       # a wrapper killed mid-probe may have left one behind
         (hostile / '.codex').mkdir(parents=True)
         (hostile / '.codex/config.toml').write_text('[permissions.%s.filesystem]\n%s = "read"\n' % (PROFILE, json.dumps(str(canary_dir))))
         for name, snippet, expect in CONTROLS:

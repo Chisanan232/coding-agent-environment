@@ -31,7 +31,9 @@ if argv and argv[0] == "sandbox":   # the wrapper's confinement probe: `codex sa
     probes = json.load(open(d + "/probes.json")) if os.path.exists(d + "/probes.json") else []
     code = argv[-1]
     control = code.splitlines()[0].replace("# CONTROL=", "")
-    probes.append({"control": control, "argv": argv[:-1], "home": os.environ.get("CODEX_HOME")})
+    cwd_cfg = argv[argv.index("-C") + 1] + "/.codex/config.toml"
+    probes.append({"control": control, "argv": argv[:-1], "home": os.environ.get("CODEX_HOME"),
+                   "cwd_config": open(cwd_cfg).read() if os.path.exists(cwd_cfg) else None})
     json.dump(probes, open(d + "/probes.json", "w"))
     smode = open(d + "/sandbox_mode").read().strip() if os.path.exists(d + "/sandbox_mode") else "confined"
     if smode == "broken":
@@ -487,10 +489,28 @@ class RunTests(Base):
         self.assertIn("neg_project_config_ignored", {c["control"] for c in record["controls"]})
         self.assertFalse((run_dir / "probe-hostile").exists())                   # the scratch clone is removed after the probe
 
+    def test_the_hostile_control_really_plants_an_allowlist_widening_config(self):
+        # The control can only fail if the planted project config really tries to widen the profile, so assert what it plants.
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        probes = json.loads((self.fake_dir / "probes.json").read_text())
+        hostile = [p for p in probes if p["control"] == "neg_project_config_ignored"][0]
+        record = json.loads((run_dir / "CONFINEMENT.json").read_text())
+        self.assertIn("[permissions.qa_confined.filesystem]", hostile["cwd_config"])
+        self.assertIn('"%s" = "read"' % record["canary_dir"], hostile["cwd_config"])
+        self.assertNotEqual(hostile["argv"][hostile["argv"].index("-C") + 1], str(run_dir / "source"))   # a scratch clone, not the QA clone
+
+    def test_a_leftover_scratch_clone_from_a_killed_wrapper_does_not_break_the_next_probe(self):
+        run_dir = self.prepare()
+        (run_dir / "probe-hostile/.codex").mkdir(parents=True)                   # what a SIGKILLed wrapper leaves behind
+        self.assertEqual(self.run_qa(run_dir)[0], 0)
+
     def test_extra_read_roots_are_validated(self):
         run_dir = self.prepare()
+        (run_dir.parent / "sibling-run").mkdir()                                  # a sibling run's packets and verdicts
         for bad in ("relative/dir", str(qa.HOME), "/", str(qa.HOME / ".ssh"), str(qa.HOME / ".codex/sessions"), str(self.root / "missing"),
-                    str(run_dir), str(run_dir.parent), str(run_dir.parent.parent), str(qa.CANARY_ROOT.parent), str(qa.DEFAULT_ROOT)):
+                    str(run_dir), str(run_dir.parent), str(run_dir.parent.parent), str(qa.CANARY_ROOT.parent), str(qa.DEFAULT_ROOT),
+                    str(run_dir.parent / "sibling-run")):
             code, out = self.run_qa(run_dir, extra=("--read-root", bad))
             self.assertEqual(code, qa.EXIT["REFUSED"] if False else code)
             self.assertNotEqual(code, 0, bad)
