@@ -59,8 +59,9 @@ class IndexOnly(unittest.TestCase):
         for restated in ("--match-head-commit", "one worktree per ticket", "a shared GitHub identity"):
             self.assertNotIn(restated, self.SEC3)
 
-    def test_commit_principle_names_the_coupled_test_exception_by_reference(self):
-        self.assertIn("tightly coupled regression test may share", self.SEC3)
+    def test_commit_principle_states_test_granularity_and_that_it_is_not_test_frequency(self):
+        self.assertIn("one new test per commit", self.SEC3)
+        self.assertIn("commit granularity is separate from validation frequency", self.SEC3)
 
     def test_pr_only_does_not_forbid_feature_branch_pushes(self):
         self.assertIn("pushing a feature branch to open a PR is autonomous", self.SEC3)
