@@ -116,12 +116,13 @@ def parse_clock(text, days=True):
     return ((int(d or 0) * 24 + int(h or 0)) * 60 + int(mi)) * 60 + float(sec)
 
 
-def _not_float(text):
+def parse_pcpu(text):
+    """ps %cpu as a finite, non-negative float, else None (nan, inf and negatives are not readings)."""
     try:
-        float(text)
-        return False
+        value = float(text)
     except ValueError:
-        return True
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
 
 
 def classify_heavy(ps_text):
@@ -145,7 +146,7 @@ def classify_heavy(ps_text):
             if base not in HEAVY_COMMS:
                 return None, None, None, None   # a row that cannot be read might be a heavy process: the list is unknown
         if base not in HEAVY_COMMS:
-            if parsed and (parsed[3] is None or parsed[4] is None or _not_float(parsed[5])):
+            if parsed and (parsed[3] is None or parsed[4] is None or parse_pcpu(parsed[5]) is None):
                 return None, None, None, None   # fields that cannot be read: the row is not trusted, the list is unknown
             continue
         orphan = False
@@ -153,10 +154,7 @@ def classify_heavy(ps_text):
             pid, ppid, state, age, cpu, pcpu = parsed
             if cpu is not None:
                 cpus[pid] = cpu
-            try:
-                pcpu_v = float(pcpu)
-            except ValueError:
-                pcpu_v = None
+            pcpu_v = parse_pcpu(pcpu)
             orphan = (ppid == 1 and state[:1] in IDLE_STATES and age is not None and age >= IDLE_MIN_AGE
                       and cpu is not None and pcpu_v is not None and pcpu_v <= IDLE_PCPU)
         if orphan:

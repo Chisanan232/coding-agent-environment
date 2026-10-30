@@ -618,6 +618,14 @@ class IdleOrphan(unittest.TestCase):
             self.assertIsNone(self.take(ps_out(good, bad))["heavy_procs"], bad)
         self.assertEqual(self.take(ps_out(good))["heavy_procs"], {})
 
+    def test_non_finite_or_negative_cpu_percent_is_unreadable(self):
+        good = ps_line(10, 500, "S", "05:00", "0:01.00", "0.0", "/bin/zsh")
+        for pcpu in ("nan", "NaN", "inf", "-inf", "-1.0", "1e999"):
+            self.assertIsNone(self.take(ps_out(good, ps_line(11, 500, "S", "05:00", "0:01.00", pcpu, "/bin/zsh")))["heavy_procs"], pcpu)
+            orphan = ps_line(25830, 1, "S", "3-22:10:05", "0:10.00", pcpu, "/x/rustc")
+            s = self.take(ps_out(good, orphan))
+            self.assertEqual((s["heavy_procs"], s["idle_procs"]), ({"rustc": 1}, []), pcpu)   # never idle on a bogus reading
+
 
 if __name__ == "__main__":
     unittest.main()
