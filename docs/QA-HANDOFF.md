@@ -55,6 +55,7 @@ no existing workflow.
 ```
 qa-handoff.py prepare --repo PATH --sha SHA --ticket T --product P --criteria FILE [--producer-evidence FILE] [--qa-notes FILE]
 qa-handoff.py run     --run-dir DIR [--timeout SECONDS]     # hand off, wait, validate, print the state
+qa-handoff.py run     --run-dir DIR --qa-identity NAME --exchange DIR [--require-env-isolation]   # as the QA OS user (SPE-142)
 qa-handoff.py verdict --run-dir DIR                         # re-evaluate the saved files (idempotent)
 ```
 
@@ -83,7 +84,8 @@ UNTESTED_OR_BLOCKED / CONFIDENCE`), mapped to these states; it is the same shape
 
 Independent means a separate Codex process with a fresh `--ephemeral` model context that sees only the packet and a clean
 clone at the exact commit, never the producer's transcript, with producer evidence labelled as an unverified claim. It is
-**not** an OS-user boundary: the QA process runs as this user. File reads are confined by a per-run Codex permission
+**not** an OS-user boundary in the default mode: the QA process runs as this user (see `--qa-identity` below for the
+mode that is). File reads are confined by a per-run Codex permission
 profile (below), and the run uses a private `CODEX_HOME`, so the user's own Codex configuration, hooks and MCP servers are
 not loaded. The wrapper therefore checks facts instead of trusting the verdict text: the clone's `.git/HEAD` and every tracked file match a
 manifest taken before the run, and so does a digest of the git control files (`config`, `hooks/`, `info/attributes`, `objects/info/alternates`, `commondir`; a rewritten config, hook, attributes or alternates file is `QA_INVALID`; no git is run
@@ -118,6 +120,62 @@ never keep a secret there. Evidence the QA agent must cite has to be inside its 
 `--read-root`), or the criterion must be left out of its verdict (AASM, ASK #3: a criterion verified elsewhere was reported NOT_RUN by
 the model, as it should).
 
+### Run as a dedicated QA identity (SPE-142)
+
+`run --qa-identity NAME --exchange DIR` runs the same hop as the unprivileged OS user that
+`scripts/qa-identity-setup.py` created, so a QA tool command can no longer read the environment of the producer's
+processes (a same-uid sysctl the Codex profile cannot deny). `--require-env-isolation` refuses any run without an
+identity, for callers that must never fall back to the same-user mode. `--read-root` is refused with an identity (it names
+directories of the producer's HOME).
+
+**Launch it from your own Terminal.** Every hop uses `sudo -n` (never a password prompt) through the setup script's
+terminal-detaching hop (`sudo -n -u NAME -H env -i HOME=/Users/NAME PATH=... python3 -I -c DETACH ...`). sudo's
+credential cache belongs to the terminal that typed the password, so an agent session cannot use it. The owner runs:
+
+```
+sudo -v && python3 scripts/qa-handoff.py run --run-dir DIR --qa-identity NAME --exchange /Users/Shared/NAME-qa
+```
+
+No sudoers change is made or needed. A `sudo -n` refusal is `QA_INCOMPLETE` with codex not started.
+
+Three hops, each through `qa_argv`, with the QA side running a producer-owned copy of this script under `/usr/bin/python3 -I`:
+
+| Hop | Runs as | What happens | What the producer trusts |
+|---|---|---|---|
+| sweep | QA user | `kill -KILL -1` as that user, then `pgrep -U uid` (ids only): no QA process from an earlier run survives | the survivor count |
+| 0 env canary | producer + QA user | producer holds a synthetic sentinel in a sibling's environment and proves it can read it itself (positive control); the setup script's probe runs as the QA user and must not read it, plus the uid, groups, tty, `~/.codex` mode and exchange checks | the probe record, emitted before any model; `ISOLATION.json` |
+| 1 `qa-stage` | QA user | creates the outbox attempt `O`, copies the inbox clone to `O/source`, a private Codex home under `/Users/NAME/.local/state/coding-agent-environment/qa/<attempt>/codexhome`, and runs the confinement probe there; prints exactly one JSON record | the observed control results only: `established` is re-derived from the expected control set, never taken from the QA side; `CONFINEMENT.json` |
+| 2 `qa-exec` | QA user | moves its stderr to `O/stderr.log`, runs `codex exec` with the prompt from the inbox file, kills codex's group on timeout or signal (exit 124 / 130) | the codex stdout captured through the pipe into `R/events.jsonl` |
+| seal | producer | sweep again, `lstat` the exchange, outbox, `O` and `O/source` (real directories, expected owners), copy `O/verdict.json` only if a single-link regular file owned by the QA user and at most 5 MiB, compare `O/source` with the producer's manifest once | the sealed values in `RUNMETA.json` (`qa_identity`, `stragglers`, `path_ok`, `tree_problems`, `untracked`) |
+
+Paths: `X` exchange, `R` the producer's run directory, attempt `A=<product>-<ticket>-<R name>-<8 hex>`, inbox
+`I=X/inbox/A` (producer-owned, read-only to the QA user through the inherited ACE: script copy, packet, prompt, and a copy
+of the verified clone that is deleted after hop 1), outbox `O=X/outbox/A` (QA-written, untrusted). `R` keeps only
+producer truth: `ISOLATION.json`, `CONFINEMENT.json`, `events.jsonl`, `stderr.log` (sudo's), the sealed `verdict.json`
+copy, `RUNMETA.json` (with the script copy's digest) and `RESULT.json`. `verdict` never reads `O` again, so editing or
+deleting the outbox later changes nothing. `X/inbox/RUN.lock` is the identity lock: one run per QA user at a time
+(the sweep kills every process of that user). A run killed with SIGKILL can leave it behind; remove it by hand once no QA
+run is active.
+
+Trust boundary: the producer trusts its own pipe capture (hashed and recounted as before), the hop 0 and hop 1 output
+(emitted before any model runs, after the sweep), and the values it sealed. It never trusts `O` after the seal, codex's
+stderr, or the QA side's own `established` flag.
+
+| Condition | State |
+|---|---|
+| `--require-env-isolation` without an identity; identity with `--read-root`; identity is root or your own uid; bad name or exchange | `REFUSED` (64), nothing written |
+| identity lock held by another run | `WAITING_RESOURCE` (75) |
+| exchange owners or modes wrong; `sudo -n` refused; sweep could not run; a hop printed nothing; codex missing on the QA side; confinement could not be checked | `QA_INCOMPLETE`, codex not started |
+| env probe ran and failed (leak, detector invalid, tty, uid, groups, `~/.codex` mode) | `QA_INVALID`, codex not started |
+| confinement failed, malformed, incomplete or not exactly one record | `QA_INVALID`, codex not started |
+| survivors after the seal's sweep; linked or foreign-owned outbox path; unreadable or linked verdict; sealed clone problems; `ISOLATION.json` or `CONFINEMENT.json` missing or not established | `QA_INVALID` |
+| timeout (inner exit 124), interrupt, crash | the existing paths (`QA_INCOMPLETE`) |
+
+What is verified offline: the producer's mapping and sealing, through the real hop code with an injected fake `sudo`
+that runs the rest of the command as the test user (`tests/test-qa-handoff.py`, `IdentityTests`). Not verified by the
+tests: a real QA account, real `sudo`, real ACL inheritance into the outbox, signal relay through setuid `sudo`, and real
+codex as the QA user.
+
 ### Boundaries
 
 - A Codex verdict is QA evidence, not merge evidence. It is never written as an owner-merge review record.
@@ -150,11 +208,12 @@ the hop and acts on the verdict.
   (valid schema, baseline, clean tree, no failing check or Medium+ finding, two successful commands, clean exit,
   COMPLETE, not LOW). Structured criteria with required per-id results are a possible later schema change, not part of
   this slice; until then a reviewer compares `criteria_sha256` and the verified checks with the ticket.
-- File reads are confined by the permission profile (see Read confinement), but **environments of other processes of the
-  same OS user stay readable** to a QA tool command (a sysctl the seatbelt cannot deny): a secret held in the environment
-  of any same-user process, including your own sessions, is reachable and could be quoted in evidence. Closing that needs a
-  separate OS user for the QA run plus the profile, which is an administrator step outside this tool. Until then do not run
-  QA where an environment variable carries a secret you cannot afford to expose, and treat the evidence text as untrusted.
+- File reads are confined by the permission profile (see Read confinement). In the same-user mode **environments of
+  other processes of the same OS user stay readable** to a QA tool command (a sysctl the seatbelt cannot deny): a secret
+  held in the environment of any same-user process, including your own sessions, is reachable and could be quoted in
+  evidence. `--qa-identity` closes this (the QA run is a different OS user, proven per run by the environment canary);
+  without it, do not run QA where an environment variable carries a secret you cannot afford to expose, and use
+  `--require-env-isolation` where that must never happen.
 - SIGTERM, SIGINT and SIGHUP to the wrapper are handled: codex's group is killed and a hashed interrupted record is
   written, so `verdict` reports `QA_INCOMPLETE` and a later edit is `QA_INVALID`. An interrupt only removes the chance of a
   pass: if the verdict codex had already written records a failing check or a Medium-or-higher finding, the state stays
@@ -170,14 +229,26 @@ the hop and acts on the verdict.
   records `criteria_sha256`, but the wrapper does not verify them against the ticket; a producer that narrows the criteria
   narrows what a `QA_PASS` covers. A reviewer compares the hash and text with the ticket.
 - A `QA_PASS` is the QA process's own report, bound to a hashed event stream a reviewer can audit. It is not a
-  cryptographic attestation, and the producer and the QA process run as the same OS user.
+  cryptographic attestation. In the same-user mode the producer and the QA process run as the same OS user; with
+  `--qa-identity` they do not, but the run directory `R` is still writable by the producer's own user (and by any process
+  of it), so the record protects against the QA process, not against the producer.
 - The permission profile was measured on codex-cli 0.163.0 (macOS seatbelt, directory rules only, no globs). Another
   version or platform can behave differently; the pre-run probe is what detects that, so a failed probe is a stop, not a
   warning. Codex's own client (not sandboxed) still writes to the private home.
 - QA-controlled text reaches the producer through `RESULT.json` and the console. It is stripped, capped and marked
   untrusted, but the producer must still treat it as data.
 - The event stream is the `codex exec` process's own stdout. The wrapper counts only `command_execution` completions that carry a unique id (a model cannot write to that stream; text it prints stays inside an escaped string field on the verified codex version), but a process that can write the stream itself, such as a replaced or compromised codex binary, can forge items and obtain `QA_PASS`. Codex QA reproduced this only with the offline fake codex, which is that process. Defending against it needs an attestation the producer's own user cannot create; that is the open evidence-independence decision, not something this wrapper can close.
-- A sandboxed command that detaches into its own session (`setsid`) can outlive the timeout kill.
+- In the same-user mode a sandboxed command that detaches into its own session (`setsid`) can outlive the timeout kill.
+  With `--qa-identity` the seal kills every process of the QA user and a survivor is `QA_INVALID`. On a real hidden macOS
+  account, per-user system agents (if any appear for that uid) would also count as survivors, so such a run could never
+  pass; this has not been checked on a real account.
+- Identity mode leaves every attempt's outbox in place: the producer cannot delete files the QA user owns, so outbox disk
+  use grows until the owner removes old attempts (for example as the QA user, or through `--rollback` of the setup).
+- Identity mode still trusts the codex binary the QA user runs: a replaced codex can forge its own event stream, exactly
+  as in the same-user mode.
+- The outbox read access is cooperative: the producer reads `O` through the ACE the outbox passes on. If the QA user
+  strips it, the seal cannot read the clone or the verdict and the result fails closed (`QA_INVALID` or
+  `QA_INCOMPLETE`), never a pass.
 - Untracked files that QA creates in the clone are reported (count and sample), not forbidden: builds and caches are
   legitimate, so a reviewer decides whether they matter.
 - The two-command floor is a floor, not proof: a no-op command satisfies it. The command count is recomputed from the
