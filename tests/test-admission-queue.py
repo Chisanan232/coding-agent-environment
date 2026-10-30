@@ -425,6 +425,103 @@ class ReleaseEvidence(QueueBase):
         self.assertEqual(self.entries()[b]['state'], 'RELEASED')
 
 
+class ReviewRegressions(QueueBase):
+    def test_rewound_sequence_counter_never_reuses_an_id(self):
+        a = self.enqueue('HORO-2070')['id']
+        (self.path.parent / 'queue/seq.json').write_text('{"next": 1}')
+        b = self.enqueue('HORO-2071')['id']
+        self.assertNotEqual(a, b)
+        self.assertEqual(len(self.entries()), 2)
+
+    def test_lapsed_entries_do_not_block_plain_reserve(self):
+        self.enqueue(wait_s=3600)
+        proc = subprocess.Popen(['/bin/sleep', '300'])
+        self.holders.append(proc)
+        later = self.now + timedelta(days=3)
+        out = da.reserve('plain', 10 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=later)
+        self.assertTrue(out['admit'], out)
+
+    def test_lapsed_grant_does_not_block_plain_reserve(self):
+        self.enqueue()
+        self.advance()
+        proc = subprocess.Popen(['/bin/sleep', '300'])
+        self.holders.append(proc)
+        out = da.reserve('plain', 10 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now + timedelta(hours=2))
+        self.assertTrue(out['admit'], out)
+
+    def test_grant_requires_the_bytes_to_fit_above_the_floor(self):
+        big = self.enqueue('HORO-2070', nbytes=500 * GIB)['id']
+        out = self.advance(free=210 * GIB)
+        self.assertEqual(out['granted'], [])
+        self.assertIn('over-capacity', out['reason'])
+        self.assertEqual(self.entries()[big]['state'], 'QUEUED')
+
+    def test_symlinked_seq_file_is_refused(self):
+        self.enqueue('HORO-2070')
+        seq = self.path.parent / 'queue/seq.json'
+        seq.unlink()
+        target = Path(self.temp.name) / 'victim.json'
+        target.write_text('{"next": 7}')
+        os.symlink(target, seq)
+        out = self.enqueue('HORO-2071')
+        self.assertFalse(out['ok'])
+
+    def test_status_on_a_symlinked_queue_dir_is_a_clean_refusal(self):
+        self.enqueue()
+        queue = self.path.parent / 'queue'
+        moved = self.path.parent / 'queue-real'
+        queue.rename(moved)
+        os.symlink(moved, queue)
+        out = da.queue_status(self.path, now=self.now)
+        self.assertEqual(out['entries'], [])
+        self.assertTrue(out['problems'])
+
+    def test_status_hides_the_handoff_of_a_lapsed_grant(self):
+        self.enqueue()
+        self.advance()
+        later = self.now + timedelta(hours=2)
+        entry = list(da.queue_status(self.path, now=later)['entries'])[0]
+        self.assertNotIn('handoff', entry)
+
+    def test_same_job_from_another_session_is_not_handed_the_first_sessions_entry(self):
+        first = self.enqueue()
+        other = self.enqueue(session_id='ffffffff-aaaa-bbbb-cccc-000000000000')
+        self.assertFalse(other['ok'])
+        self.assertIn(first['id'], other['reason'])
+
+    def test_cancel_refuses_another_sessions_entry_when_a_session_is_given(self):
+        a = self.enqueue()['id']
+        self.assertFalse(da.queue_cancel(self.path, a, now=self.now, session_id='ffffffff-aaaa-bbbb-cccc-000000000000')['ok'])
+        self.assertTrue(da.queue_cancel(self.path, a, now=self.now, session_id='0b1d2e3f-aaaa-bbbb-cccc-1234567890ab')['ok'])
+
+    def test_fingerprint_is_salted_per_store(self):
+        a = self.enqueue()['id']
+        fp1 = self.entries()[a]['fingerprint']
+        other = Path(self.temp.name) / 'other/state.json'
+        da.queue_enqueue(other, label='nda-horo-2070', tickets=['HORO-2070'], repo='horonom/nda', worktree=str(self.worktree),
+                         harness='codex', session_id='0b1d2e3f-aaaa-bbbb-cccc-1234567890ab', nbytes=20 * GIB,
+                         argv=['cargo', 'nextest', 'run', '--token', SECRET_ARG], now=self.now)
+        fp2 = [e for e in da.queue_status(other)['entries']][0]['fingerprint']
+        self.assertNotEqual(fp1, fp2)
+
+    def test_empty_salt_file_is_a_clean_refusal_with_recovery_advice(self):
+        self.enqueue('HORO-2070')
+        (self.path.parent / 'queue/fingerprint.salt').write_text('')
+        out = self.enqueue('HORO-2071')
+        self.assertFalse(out['ok'])
+        self.assertIn('queue-salt-unreadable', out['reason'])
+
+    def test_a_failing_receipt_does_not_report_a_persisted_change_as_failed(self):
+        receipts = self.path.parent / 'queue/receipts.jsonl'
+        self.enqueue('HORO-2070')
+        receipts.unlink()
+        os.symlink(Path(self.temp.name) / 'nowhere', receipts)
+        out = self.enqueue('HORO-2071')
+        self.assertTrue(out['ok'], out)
+        self.assertIn(out['id'], self.entries())
+        self.assertFalse(out['receipt_ok'])
+
+
 class Cli(QueueBase):
     def run_cli(self, *argv):
         out = io.StringIO()

@@ -51,6 +51,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -514,7 +515,7 @@ def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None
                 queued, queue_problems = _queue_entries(state_path)
                 if queue_problems:
                     return dict(result, admit=False, reason=queue_problems[0])
-                ahead = [e for e in queued if e['state'] in WAITING_STATES]
+                ahead = [e for e in queued if e['state'] in WAITING_STATES and not _entry_lapsed(e, now)]
                 if ahead:
                     return dict(result, admit=False, reason='queue-ahead: %d queued entries wait for the heavy lane (first %s, %s); '
                                 'enqueue instead of reserving directly' % (len(ahead), ahead[0]['id'], ahead[0]['label']))
@@ -595,17 +596,21 @@ def _queue_receipt(state_path, event, entry, now, **extra):
     directory = queue_dir(state_path)
     path = directory / 'receipts.jsonl'
     try:
-        if path.stat().st_size > RECEIPT_ROTATE_BYTES:
+        if path.lstat().st_size > RECEIPT_ROTATE_BYTES and not path.is_symlink():
             os.replace(path, directory / 'receipts.jsonl.1')
-    except FileNotFoundError:
+    except OSError:
         pass
     line = dict({'ts': iso_utc(now), 'event': event, 'id': entry['id'], 'label': entry['label'],
                  'tickets': entry['tickets']}, **extra)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(descriptor, 'a') as handle:
-        handle.write(json.dumps(line, sort_keys=True) + '\n')
-        handle.flush()
-        os.fsync(handle.fileno())
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'a') as handle:
+            handle.write(json.dumps(line, sort_keys=True) + '\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        return False  # the state change already happened; the caller reports it with receipt_ok=False
+    return True
 
 
 def _read_queue_entry(path):
@@ -655,10 +660,51 @@ def _parse_time(text):
     return moment
 
 
-def _fingerprint(repo, worktree, tickets, argv, nbytes):
+def _read_small_json(path, limit=4096):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, 'rb') as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError('not a regular file')
+        return json.loads(handle.read(limit))
+
+
+def _queue_salt(state_path):
+    """Per-store random salt so a digest of a low-entropy argv cannot be brute-forced from an entry file. Under the lock."""
+    path = queue_dir(state_path) / 'fingerprint.salt'
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'w') as handle:
+            handle.write(secrets.token_hex(32))
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError:
+        pass
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, 'rb') as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError('salt is not a regular file')
+        salt = handle.read(256)
+    if len(salt) < 32:
+        raise ValueError('salt is too short')
+    return salt
+
+
+def _fingerprint(salt, repo, worktree, tickets, argv, nbytes):
     canonical = json.dumps({'repo': repo, 'worktree': worktree, 'tickets': sorted(tickets), 'argv': list(argv), 'bytes': nbytes},
                            sort_keys=True, separators=(',', ':'))
-    return hashlib.sha256(canonical.encode()).hexdigest()
+    return hmac.new(salt, canonical.encode(), hashlib.sha256).hexdigest()
+
+
+def _entry_lapsed(entry, now):
+    """True when a waiting entry's wait limit or a grant's window has passed (read-only; advance records the expiry)."""
+    try:
+        if entry['state'] == 'GRANTED':
+            return _parse_time(entry['grant']['expires']) <= now
+        if entry['state'] in ('QUEUED', 'ELIGIBLE'):
+            return _parse_time(entry['wait_expires']) <= now
+    except (KeyError, ValueError, TypeError):
+        return False  # unparseable stays counted (fail closed)
+    return False
 
 
 def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_id, nbytes, argv, again=False, now=None,
@@ -688,42 +734,56 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
     if bad:
         return {'ok': False, 'reason': 'invalid-request: %s is missing or out of range' % bad}
     real_worktree = os.path.realpath(worktree)
-    fingerprint = _fingerprint(repo, real_worktree, tickets, argv, nbytes)
     try:
         with state_lock(state_path):
             _queue_prepare(state_path)
             entries, problems = _queue_entries(state_path)
             if problems:
                 return {'ok': False, 'reason': problems[0]}
+            try:
+                salt = _queue_salt(state_path)
+            except ValueError as exc:
+                return {'ok': False, 'reason': 'queue-salt-unreadable: %s; remove queue/fingerprint.salt only when no entry is live '
+                                               '(a new salt stops dedupe of existing entries)' % exc}
+            fingerprint = _fingerprint(salt, repo, real_worktree, tickets, argv, nbytes)
             for entry in entries:
                 if entry['fingerprint'] != fingerprint:
                     continue
-                if entry['state'] in LIVE_STATES:
+                if entry['state'] in LIVE_STATES and not _entry_lapsed(entry, now):
+                    if entry.get('session_id') != session_id:
+                        return {'ok': False, 'reason': 'this job is already queued as %s by another session (%s)' % (
+                            entry['id'], entry['label'])}
                     return {'ok': True, 'id': entry['id'], 'reason': 'already queued as %s' % entry['id'], 'existing': True}
+                if entry['state'] in LIVE_STATES:
+                    continue  # lapsed: advance will record the expiry; a fresh entry may be queued
                 if entry['state'] == 'RELEASED' and not again:
                     return {'ok': False, 'reason': '%s already ran this job (RELEASED); pass --again to queue it again' % entry['id']}
                 if entry['state'] in ('CANCELLED', 'EXPIRED') and not again:
                     return {'ok': False, 'reason': '%s was %s; pass --again to queue it again' % (entry['id'], entry['state'])}
             seq_path = queue_dir(state_path) / 'seq.json'
+            floor = 1 + max([e['seq'] for e in entries] or [0])
             try:
-                seq = json.loads(seq_path.read_text())['next']
+                seq = _read_small_json(seq_path)['next']
                 if type(seq) is not int or seq < 1:
                     raise ValueError('bad counter')
             except FileNotFoundError:
-                seq = 1 + max([e['seq'] for e in entries] or [0])
-            except (ValueError, KeyError, TypeError) as exc:
+                seq = floor
+            except (OSError, ValueError, KeyError, TypeError) as exc:
                 return {'ok': False, 'reason': 'queue-entry-unreadable: seq.json: %s' % exc}
+            seq = max(seq, floor)  # a rewound counter must never reuse an id
             if seq > 999999:
                 return {'ok': False, 'reason': 'queue-full: sequence exhausted'}
             entry = {'version': QUEUE_VERSION, 'id': 'q%06d' % seq, 'seq': seq, 'label': label, 'state': 'QUEUED',
                      'tickets': list(tickets), 'repo': repo, 'worktree': real_worktree, 'harness': harness,
                      'session_id': session_id, 'owner_uid': os.getuid(), 'bytes': nbytes, 'fingerprint': fingerprint,
                      'created': iso_utc(now), 'wait_expires': iso_utc(now + timedelta(seconds=wait_s)), 'grant': None}
+            if (queue_dir(state_path) / (entry['id'] + '.json')).exists():
+                return {'ok': False, 'reason': 'queue-entry-unreadable: %s already exists' % entry['id']}
+            write_json_atomic(seq_path, {'next': seq + 1})  # counter first: a crash leaves a gap, never a reused id
             _write_queue_entry(state_path, entry)
-            write_json_atomic(seq_path, {'next': seq + 1})
-            _queue_receipt(state_path, 'enqueued', entry, now)
-            return {'ok': True, 'id': entry['id'], 'reason': 'queued as %s (position %d)' % (
-                entry['id'], 1 + sum(1 for e in entries if e['state'] in WAITING_STATES))}
+            receipt_ok = _queue_receipt(state_path, 'enqueued', entry, now)
+            return {'ok': True, 'id': entry['id'], 'receipt_ok': receipt_ok, 'reason': 'queued as %s (position %d)' % (
+                entry['id'], 1 + sum(1 for e in entries if e['state'] in WAITING_STATES and not _entry_lapsed(e, now)))}
     except StateError as exc:
         return {'ok': False, 'reason': '%s: %s' % (exc.kind, exc)}
     except OSError as exc:
@@ -817,6 +877,11 @@ def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=pro
             if len(live) + len(granted) >= lanes:
                 out['reason'] = 'lane occupied'
                 return out
+            reserved = sum(r['bytes'] for r in live)
+            if result['free_bytes'] - reserved - first['bytes'] < HEAVY_FLOOR:
+                out['reason'] = 'over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested for %s, floor 100 GiB' % (
+                    result['free_bytes'] / GIB, reserved / GIB, first['bytes'] / GIB, first['id'])
+                return out
             window = min(grant_s, QUEUE_MAX_GRANT_S)
             first['state'] = 'GRANTED'
             first['grant'] = {'at': iso_utc(now), 'expires': iso_utc(now + timedelta(seconds=window))}
@@ -884,7 +949,11 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
             return '%s was granted for label %s and %d bytes' % (qid, entry['label'], entry['bytes'])
         if os.path.realpath(cwd) != entry['worktree']:
             return '%s was granted for worktree %s' % (qid, entry['worktree'])
-        if _fingerprint(entry['repo'], entry['worktree'], entry['tickets'], argv, nbytes) != entry['fingerprint']:
+        try:
+            salt = _queue_salt(state_path)
+        except (OSError, ValueError) as exc:
+            return 'queue-salt-unreadable: %s' % exc
+        if _fingerprint(salt, entry['repo'], entry['worktree'], entry['tickets'], argv, nbytes) != entry['fingerprint']:
             return '%s was granted for a different job (fingerprint mismatch)' % qid
         return None
 
@@ -982,17 +1051,21 @@ def _handoff(entry):
 
 def queue_status(state_path, now=None):
     """Read-only: entries (no argv, digest only) with handoff text for granted ones. Writes and deletes nothing."""
-    entries, problems = _queue_entries(state_path)
+    now = now or datetime.now(timezone.utc)
+    try:
+        entries, problems = _queue_entries(state_path)
+    except (StateError, OSError) as exc:
+        return {'entries': [], 'problems': ['queue-unreadable: %s' % exc]}
     shown = []
     for entry in entries:
         item = {k: v for k, v in entry.items()}
-        if entry['state'] == 'GRANTED':
+        if entry['state'] == 'GRANTED' and not _entry_lapsed(entry, now):
             item['handoff'] = _handoff(entry)
         shown.append(item)
     return {'entries': shown, 'problems': problems}
 
 
-def queue_cancel(state_path, qid, now=None):
+def queue_cancel(state_path, qid, now=None, session_id=None):
     """Cancel a waiting or unclaimed-granted entry. Never signals a process."""
     now = now or datetime.now(timezone.utc)
     if not (isinstance(qid, str) and QUEUE_ID_RE.fullmatch(qid)):
@@ -1007,12 +1080,14 @@ def queue_cancel(state_path, qid, now=None):
                     continue
                 if entry['state'] not in LIVE_STATES:
                     return {'ok': False, 'reason': '%s is already %s' % (qid, entry['state'])}
+                if session_id is not None and entry.get('session_id') != session_id:
+                    return {'ok': False, 'reason': '%s belongs to another session' % qid}
                 was = entry['state']
                 entry['state'] = 'CANCELLED'
                 _write_queue_entry(state_path, entry)
                 _drop_marker(state_path, qid)
-                _queue_receipt(state_path, 'cancelled', entry, now, was=was)
-                return {'ok': True, 'reason': 'cancelled %s' % qid}
+                receipt_ok = _queue_receipt(state_path, 'cancelled', entry, now, was=was)
+                return {'ok': True, 'receipt_ok': receipt_ok, 'reason': 'cancelled %s' % qid}
             return {'ok': False, 'reason': 'no queue entry %s' % qid}
     except StateError as exc:
         return {'ok': False, 'reason': '%s: %s' % (exc.kind, exc)}
@@ -1204,6 +1279,7 @@ def build_parser():
     qst.add_argument('--json', action='store_true', required=True)
     qcx = qcmds.add_parser('cancel', allow_abbrev=False, help='cancel a waiting or unclaimed entry')
     qcx.add_argument('--id', required=True, dest='qid')
+    qcx.add_argument('--session-id', dest='session_id', help='refuse unless the entry belongs to this session')
     return parser
 
 
@@ -1220,7 +1296,7 @@ def _queue_cli(args, state_path, free_fn):
         out['ok'] = out['reason'] in ('ok',) or bool(out['granted'] or out['expired'] or out['eligible']) or out['reason'] in (
             'lane occupied',) or out['reason'].startswith('no heavy lane')
     elif command == 'cancel':
-        out = queue_cancel(state_path, args.qid)
+        out = queue_cancel(state_path, args.qid, session_id=args.session_id)
     else:
         out = dict(queue_status(state_path), ok=True)
     print(json.dumps(out, sort_keys=True))

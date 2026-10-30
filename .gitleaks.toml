@@ -13,6 +13,7 @@ regexes = [
   '''sk-ant-\.\.\.''',                 # README's illustrative "sk-ant-..." example
   '''ghp_\.\.\.''',                    # README's illustrative "ghp_..." example
   '''figd_[A-Za-z0-9_-]*EXAMPLE''',    # reserved pattern for any future redacted-figma-key fixture
+  '''sk-test-ARGV-SECRET-0123456789''', # synthetic marker in tests/test-admission-queue.py proving argv is never stored
 ]
 paths = [
   '''(^|/)tests/fixtures/''',          # test fixtures never contain real credentials by design
