@@ -1010,16 +1010,19 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
             result = _evaluate_locked('heavy', state_path, free_fn, now)
             if not result['admit']:
                 return refuse(result['reason'])
-            live, res_problems = live_reservations(state_path, now, token_fn)
-            if res_problems:
-                return refuse(res_problems[0])
-            token = token_fn(pid)
-            if token is None:
-                return refuse('process-not-running: pid %d' % pid)
             try:
-                owner = owner_fn(pid)
+                live, res_problems = live_reservations(state_path, now, token_fn)
             except ReservationError as exc:
                 return refuse('process-unverifiable: %s' % exc)
+            if res_problems:
+                return refuse(res_problems[0])
+            try:
+                token = token_fn(pid)
+                owner = owner_fn(pid) if token is not None else None
+            except ReservationError as exc:
+                return refuse('process-unverifiable: %s' % exc)
+            if token is None:
+                return refuse('process-not-running: pid %d' % pid)
             if owner != os.getuid():
                 return refuse('process-not-owned: pid %d is not run by this user' % pid)
             if any(r['label'] == label for r in live):
@@ -1319,10 +1322,40 @@ def build_parser():
     adv.add_argument('--grant-s', type=int, default=QUEUE_GRANT_S, dest='grant_s')
     qst = qcmds.add_parser('status', allow_abbrev=False, help='read-only listing with the handoff commands')
     qst.add_argument('--json', action='store_true', required=True)
+    clm = qcmds.add_parser('claim', allow_abbrev=False, help='claim a granted entry for a supervising --pid; does not exec')
+    clm.add_argument('--id', required=True, dest='qid')
+    clm.add_argument('--label', required=True)
+    clm.add_argument('--bytes', type=int, required=True, dest='nbytes')
+    clm.add_argument('--pid', type=int, required=True, help='the live process of this user that holds the lane until it exits')
+    clm.add_argument('--ttl-s', type=int, default=DEFAULT_TTL, dest='ttl')
+    clm.add_argument('--max-hold', action='store_true', dest='allow_long')
+    clm.add_argument('job', nargs=argparse.REMAINDER, help='-- COMMAND [ARG...] (the exact job the grant was queued for)')
     qcx = qcmds.add_parser('cancel', allow_abbrev=False, help='cancel a waiting or unclaimed entry')
     qcx.add_argument('--id', required=True, dest='qid')
     qcx.add_argument('--session-id', dest='session_id', help='refuse unless the entry belongs to this session')
     return parser
+
+
+def _is_strict_ancestor(pid, ppid_fn=None, limit=64):
+    """True when pid is a strict ancestor of this process (this command exits right after claiming, so itself would
+    consume the grant for nothing); unknown means False (fail closed). Name kept for the callers' readability."""
+    def ppid_of(p):
+        done = subprocess.run(['/bin/ps', '-o', 'ppid=', '-p', str(p)], capture_output=True, text=True, timeout=5,
+                              stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/bin:/usr/bin'})
+        return int(done.stdout.strip()) if done.returncode == 0 and done.stdout.strip().isdigit() else None
+
+    ppid_fn = ppid_fn or ppid_of
+    current = os.getppid()
+    for _ in range(limit):
+        if current == pid:
+            return True
+        try:
+            current = ppid_fn(current)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return False
+        if current is None or current <= 1:
+            return False
+    return False
 
 
 def _queue_cli(args, state_path, free_fn):
@@ -1337,6 +1370,18 @@ def _queue_cli(args, state_path, free_fn):
         out = queue_advance(state_path, free_fn, grant_s=args.grant_s)
         out['ok'] = out['reason'] in ('ok',) or bool(out['granted'] or out['expired'] or out['eligible']) or out['reason'] in (
             'lane occupied',) or out['reason'].startswith('no heavy lane')
+    elif command == 'claim':
+        if args.pid <= 0 or not _is_strict_ancestor(args.pid):
+            print(json.dumps({'ok': False, 'reason': 'invalid-request: --pid must be a live ancestor of this command '
+                                                     '(the supervising process that runs it), not an arbitrary process'}))
+            return REFUSED_EXIT
+        if args.job[:1] != ['--']:
+            print(json.dumps({'ok': False, 'reason': 'invalid-request: put -- between the options and the command'}))
+            return REFUSED_EXIT
+        out = queue_claim(state_path, args.qid, args.label, args.nbytes, args.job[1:], os.getcwd(), free_fn, pid=args.pid,
+                          ttl=args.ttl, allow_long=args.allow_long, memory_fn=lambda: _memory_precondition(),
+                          exec_fn=lambda program, argv: None)
+        out.pop('exit', None)
     elif command == 'cancel':
         out = queue_cancel(state_path, args.qid, session_id=args.session_id)
     else:
