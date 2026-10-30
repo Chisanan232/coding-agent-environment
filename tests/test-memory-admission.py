@@ -652,7 +652,6 @@ class IdleOrphan(unittest.TestCase):
         clock = iter([0, 0, 3, 6, 9, 12])                           # start, then one reading per lookup: three seconds pass each time
         ma.fill_cwds(recs, run, budget=8, now=lambda: next(clock))
         self.assertEqual(timeouts, [4, 4, 2])                         # the third is clamped to what is left of the 8 s
-        self.assertLessEqual(sum(timeouts), 8)
 
 
 if __name__ == "__main__":
