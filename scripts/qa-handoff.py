@@ -624,7 +624,18 @@ def run_locked(args, run_dir, packet, source):
         except BaseException:
             write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=True)
             raise
-        write_meta(run_dir, argv, proc, t0, timed_out, events)
+        # The run record is written with the interrupt signals blocked, so one cannot land half-way through it. A signal
+        # that arrives after the record is complete leaves a finished run finished; one that raises inside the write
+        # (it cannot with the signals blocked, but a failure can) is recorded as an interrupt.
+        blocked = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+        try:
+            write_meta(run_dir, argv, proc, t0, timed_out, events)
+        except BaseException:
+            write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=True)
+            raise
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
     finally:
         signal.signal(signal.SIGTERM, old)
         if old_hup is not signal.SIG_IGN:

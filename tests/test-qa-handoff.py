@@ -870,6 +870,23 @@ class ReviewFollowUpTests(Base):
         self.assertEqual(proc.returncode, 0, err)                  # the hang-up was ignored; the run completed and passed
         self.assertFalse(json.loads((run_dir / "RUNMETA.json").read_text())["interrupted"])
 
+    def test_an_interrupt_inside_the_final_record_write_still_leaves_an_interrupted_record(self):
+        run_dir = self.prepare()
+        real = qa.write_meta
+        state = {"n": 0}
+
+        def flaky(*args, **kwargs):
+            state["n"] += 1
+            if state["n"] == 1 and not kwargs.get("interrupted"):
+                raise KeyboardInterrupt                              # lands while the normal record is being written
+            return real(*args, **kwargs)
+        qa.write_meta = flaky
+        self.addCleanup(setattr, qa, "write_meta", real)
+        code, out = self.run_qa(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertTrue(json.loads((run_dir / "RUNMETA.json").read_text())["interrupted"])
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 11)
+
 
 if __name__ == "__main__":
     unittest.main()
