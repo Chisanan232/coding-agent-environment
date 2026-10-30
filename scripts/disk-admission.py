@@ -1319,6 +1319,14 @@ def build_parser():
     adv.add_argument('--grant-s', type=int, default=QUEUE_GRANT_S, dest='grant_s')
     qst = qcmds.add_parser('status', allow_abbrev=False, help='read-only listing with the handoff commands')
     qst.add_argument('--json', action='store_true', required=True)
+    clm = qcmds.add_parser('claim', allow_abbrev=False, help='claim a granted entry for a supervising --pid; does not exec')
+    clm.add_argument('--id', required=True, dest='qid')
+    clm.add_argument('--label', required=True)
+    clm.add_argument('--bytes', type=int, required=True, dest='nbytes')
+    clm.add_argument('--pid', type=int, required=True, help='the live process of this user that holds the lane until it exits')
+    clm.add_argument('--ttl-s', type=int, default=DEFAULT_TTL, dest='ttl')
+    clm.add_argument('--max-hold', action='store_true', dest='allow_long')
+    clm.add_argument('job', nargs=argparse.REMAINDER, help='-- COMMAND [ARG...] (the exact job the grant was queued for)')
     qcx = qcmds.add_parser('cancel', allow_abbrev=False, help='cancel a waiting or unclaimed entry')
     qcx.add_argument('--id', required=True, dest='qid')
     qcx.add_argument('--session-id', dest='session_id', help='refuse unless the entry belongs to this session')
@@ -1337,6 +1345,14 @@ def _queue_cli(args, state_path, free_fn):
         out = queue_advance(state_path, free_fn, grant_s=args.grant_s)
         out['ok'] = out['reason'] in ('ok',) or bool(out['granted'] or out['expired'] or out['eligible']) or out['reason'] in (
             'lane occupied',) or out['reason'].startswith('no heavy lane')
+    elif command == 'claim':
+        if args.job[:1] != ['--']:
+            print(json.dumps({'ok': False, 'reason': 'invalid-request: put -- between the options and the command'}))
+            return REFUSED_EXIT
+        out = queue_claim(state_path, args.qid, args.label, args.nbytes, args.job[1:], os.getcwd(), free_fn, pid=args.pid,
+                          ttl=args.ttl, allow_long=args.allow_long, memory_fn=lambda: _memory_precondition(),
+                          exec_fn=lambda program, argv: None)
+        out.pop('exit', None)
     elif command == 'cancel':
         out = queue_cancel(state_path, args.qid, session_id=args.session_id)
     else:

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -599,6 +600,60 @@ class ReviewRegressions(QueueBase):
         self.assertTrue(out['ok'], out)
         self.assertIn(out['id'], self.entries())
         self.assertFalse(out['receipt_ok'])
+
+
+class ClaimCli(QueueBase):
+    """`queue claim` is the supervising-process claim: it takes the lane for --pid and does NOT exec."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = datetime.now(timezone.utc)  # the CLI judges grant lapse by the real clock
+
+    def run_cli(self, *argv, memory_ok=True):
+        out = io.StringIO()
+        with unittest.mock.patch.object(da, '_memory_precondition', lambda: (memory_ok, 'ok' if memory_ok else 'pressure')), \
+                contextlib.redirect_stdout(out):
+            rc = da.run(list(argv), state_path=self.path, free_fn=lambda: 400 * GIB)
+        return rc, out.getvalue()
+
+    def test_claim_for_a_supervising_pid_does_not_exec_and_records_the_holder(self):
+        qid = self.enqueue('HORO-2070', argv=['claude', '-p', '--resume', 'abc', 'do it'])['id']
+        self.advance()
+        job = subprocess.Popen(['/bin/sleep', '300'])
+        self.holders.append(job)
+        cwd = os.getcwd()
+        os.chdir(self.worktree)
+        try:
+            rc, out = self.run_cli('queue', 'claim', '--id', qid, '--label', 'nda-horo-2070', '--bytes', str(20 * GIB),
+                                   '--pid', str(job.pid), '--', 'claude', '-p', '--resume', 'abc', 'do it')
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(json.loads(out)['ok'], True)
+        entry = self.entries()[qid]
+        self.assertEqual((entry['state'], entry['holder']['pid']), ('CLAIMED', job.pid))
+        job.kill()
+        job.wait()
+        self.advance()
+        self.assertEqual(self.entries()[qid]['release']['evidence'], 'holder-exited')
+
+    def test_claim_refusals_exit_77_and_keep_the_grant(self):
+        qid = self.enqueue('HORO-2070')['id']
+        self.advance()
+        cwd = os.getcwd()
+        os.chdir(self.worktree)
+        try:
+            rc, out = self.run_cli('queue', 'claim', '--id', qid, '--label', 'nda-horo-2070', '--bytes', str(20 * GIB),
+                                   '--pid', str(os.getpid()), '--', 'cargo', 'nextest', 'run', '--token', SECRET_ARG, memory_ok=False)
+            self.assertEqual(rc, 77)
+            self.assertIn('memory-gate', out)
+            rc, out = self.run_cli('queue', 'claim', '--id', qid, '--label', 'nda-horo-2070', '--bytes', str(20 * GIB),
+                                   '--pid', str(os.getpid()), '--', 'wrong', 'job')
+            self.assertEqual(rc, 77)
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(self.entries()[qid]['state'], 'GRANTED')
+        self.assertNotIn(SECRET_ARG, out)
 
 
 class Cli(QueueBase):
