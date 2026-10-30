@@ -47,7 +47,7 @@ Auto-used. The coding agent invokes this skill when designing or reviewing tests
 12. Run new tests in isolation to confirm they pass.
 13. Remove one behavior from the implementation and confirm the test fails.
     If the test still passes, it is not testing what you think it is.
-14. Run the full test suite to confirm no regressions.
+14. At the validation checkpoint, run the relevant full validation to confirm no regressions.
 
 ## Safe-Fix Guidance
 - Never disable a failing test without understanding why it fails.
