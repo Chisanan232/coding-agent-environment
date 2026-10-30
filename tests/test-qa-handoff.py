@@ -1340,7 +1340,10 @@ class IdentityTests(Base):
         def sweep(ident, recheck=0):
             self.assertEqual(ident, self.ident)
             self.rechecks.append(recheck)
-            return self.sweeps.pop(0) if self.sweeps else 0
+            value = self.sweeps.pop(0) if self.sweeps else 0
+            if isinstance(value, Exception):
+                raise value
+            return value
         for patch in (unittest.mock.patch.object(qis, "SUDO", str(self.sudo)), unittest.mock.patch.object(qis, "PY", sys.executable),
                       unittest.mock.patch.object(qa, "resolve_identity", lambda name, exchange: self.ident),
                       unittest.mock.patch.object(qa, "sweep_identity", sweep),
@@ -1591,17 +1594,77 @@ class IdentityTests(Base):
         self.assertTrue(meta["sudo_keepalive"]["failures"])                 # recorded, not silent
         self.assertIn("sudo -n refused", (run_dir / "CLEANUP.json").read_text())
 
-    def test_a_failed_cleanup_sweep_is_reported_to_the_owner(self):
+    def test_a_failed_cleanup_sweep_is_reported_and_a_pass_does_not_stand(self):
         self.sweeps = [0, 0, None]               # pre-run, seal, and the final cleanup sweep that cannot run
         run_dir = self.prepare()
         code, out = self.run_ident(run_dir)
-        self.assertEqual(code, 0, out)           # the seal's own sweep was clean; the note does not change the state
+        self.assertEqual(code, 12, out)          # the seal was clean, but the QA user is not confirmed idle
         self.assertIn("NOTE QA-user processes may survive", out)
-        self.assertIsNone(self.json(run_dir / "RESULT.json")["cleanup"]["sweep"])
+        result = self.json(run_dir / "RESULT.json")
+        self.assertEqual(result["state"], "QA_INVALID")
+        self.assertIsNone(result["cleanup"]["sweep"])
         self.assertFalse((self.x / "inbox/RUN.lock").exists())
         code, _ = self.call("verdict", "--run-dir", str(run_dir))
-        self.assertEqual(code, 0)
-        self.assertIn("cleanup", self.json(run_dir / "RESULT.json"))      # kept when the result is re-evaluated
+        self.assertEqual(code, 12)               # a re-evaluation cannot turn it back into a pass
+        self.assertEqual(self.json(run_dir / "RESULT.json")["state"], "QA_INVALID")
+        self.assertIn("cleanup", self.json(run_dir / "RESULT.json"))
+
+    def test_survivors_at_the_final_sweep_do_not_leave_a_pass(self):
+        self.sweeps = [0, 0, 3]                  # three QA-user processes survive the final sweep
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("3 left", out)
+        self.assertEqual(self.json(run_dir / "RESULT.json")["state"], "QA_INVALID")
+
+    def test_an_unexpected_error_in_the_final_sweep_is_not_silent_and_not_a_pass(self):
+        self.sweeps = [0, 0, RuntimeError("boom")]
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("NOTE QA-user processes may survive", out)
+        self.assertIsNone(self.json(run_dir / "RESULT.json")["cleanup"]["sweep"])
+
+    def test_a_cleanup_write_failure_still_removes_the_lock_and_voids_the_pass(self):
+        self.sweeps = [0, 0, 2]
+        real = qa.write_private
+
+        def flaky(path, data):
+            if Path(path).name == "CLEANUP.json":
+                raise OSError("disk full")
+            return real(path, data)
+        run_dir = self.prepare()
+        with unittest.mock.patch.object(qa, "write_private", flaky):
+            code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())      # a failed note must never strand the lock
+
+    def test_an_unreadable_result_at_the_final_sweep_still_voids_the_pass_in_the_exit_code(self):
+        self.sweeps = [0, 0, 2]
+        real = qa.read_run_json
+        state = {"armed": False}
+
+        def unreadable(path, *a, **k):
+            if state["armed"] and Path(path).name == "RESULT.json":
+                raise ValueError("corrupt")
+            return real(path, *a, **k)
+        real_sweep = qa.sweep_identity
+
+        def arm(ident, recheck=0):
+            value = real_sweep(ident, recheck)
+            state["armed"] = len(self.sweeps) == 0              # the final sweep has just been consumed
+            return value
+        run_dir = self.prepare()
+        with unittest.mock.patch.object(qa, "read_run_json", unreadable), unittest.mock.patch.object(qa, "sweep_identity", arm):
+            code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)                         # the exit code does not depend on RESULT.json being readable
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())
+
+    def test_a_clean_final_sweep_keeps_the_pass(self):
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 0, out)
+        self.assertFalse((run_dir / "CLEANUP.json").exists())
 
     def test_a_tampered_packet_id_is_never_used_as_an_exchange_path(self):
         run_dir = self.prepare()
