@@ -853,7 +853,7 @@ KILL, PGREP = '/bin/kill', '/usr/bin/pgrep'
 CRONTAB, ATQ, LS, LAUNCHCTL = '/usr/bin/crontab', '/usr/bin/atq', '/bin/ls', '/bin/launchctl'
 # launchd's default ThrottleInterval is 10 s: a job it keeps alive comes back within that, so the seal looks again later.
 RESPAWN_SECONDS = 12
-SERVICE_ROW = re.compile(r'^(-|\d+)\s+(-|-?\d+|\([^)]*\))\s+(\S+)$')
+LAUNCHD_ABSENT = 'Could not find domain'
 HOP_ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
 _QIS = None
 
@@ -1301,35 +1301,18 @@ def qa_exec(args):
 
 
 def launchd_problems(domain, done):
-    """Problems in `launchctl print <domain>` output: any loaded service whose label is not com.apple.*, or output that is
-    not the expected services block. A domain that does not exist (the documented "could not find domain" error) is clean;
-    any other error or unrecognised output is a problem, never a pass."""
-    text = (done.stdout or '') + (done.stderr or '')
-    if done.returncode != 0:
-        if 'could not find domain' in text.lower():
-            return []
-        return ['could not read launchd domain %s (exit %s)' % (domain, done.returncode)]
-    lines = [line.strip() for line in (done.stdout or '').splitlines()]
-    if 'services = {' not in lines:
-        return ['launchd domain %s output is not understood' % domain]
-    problems = []
-    for body in lines[lines.index('services = {') + 1:]:
-        if body == '}':
-            return problems
-        if not body:
-            continue
-        row = SERVICE_ROW.match(body)
-        if not row:
-            return problems + ['launchd domain %s has an unreadable service line' % domain]
-        if not row.group(3).startswith('com.apple.'):
-            problems.append('launchd domain %s has a loaded non-system service %s' % (domain, clean(row.group(3), 60)))
-    return problems + ['launchd domain %s services block is not closed' % domain]
+    """A launchd domain of the QA user passes only when launchctl reports it absent in the documented form: a non-zero
+    exit and "Could not find domain". Any present domain (whatever its services, com.apple.* included), empty or other
+    output, or any other error is a problem. Nothing is parsed, so there is no label allowlist to get around."""
+    if done.returncode != 0 and LAUNCHD_ABSENT in (done.stdout or '') + (done.stderr or ''):
+        return []
+    return ['launchd domain %s is present or could not be read (exit %s)' % (domain, done.returncode)]
 
 
 def persistence_problems(ident):
     """Ways the QA user could still act after the process sweep that the producer can see: a crontab, queued at jobs, or
-    entries in ~/Library/LaunchAgents, and non-system services loaded in its launchd user/ and gui/ domains, each read as
-    the QA user through sudo -n. Anything present, or anything that
+    entries in ~/Library/LaunchAgents, and any launchd user/ or gui/ domain of it at all, each read as the QA user through
+    sudo -n. Anything present, or anything that
     could not be read, is a problem (fail closed). Root and the caller's own uid are refused before any subprocess."""
     if not isinstance(ident.uid, int) or isinstance(ident.uid, bool) or ident.uid in (0, os.getuid()):
         return ['persistence check refused for root or your own uid']
@@ -1356,10 +1339,10 @@ def persistence_problems(ident):
             done = subprocess.run([qis.SUDO, '-n', '-u', ident.name, LAUNCHCTL, 'print', domain], stdin=subprocess.DEVNULL,
                                   capture_output=True, text=True, timeout=30, cwd='/', env=HOP_ENV)
         except (OSError, subprocess.SubprocessError) as error:
-            problems.append('could not read launchd domain %s (%s)' % (domain, type(error).__name__))
+            problems.append('launchd domain %s could not be read (%s)' % (domain, type(error).__name__))
             continue
         if sudo_refused(done.stderr):
-            problems.append('could not read launchd domain %s (sudo -n refused)' % domain)
+            problems.append('launchd domain %s could not be read (sudo -n refused)' % domain)
         else:
             problems += launchd_problems(domain, done)
     return problems

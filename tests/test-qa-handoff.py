@@ -1140,7 +1140,10 @@ class IdentityGuardTests(Base):
             if name == "launchctl":
                 self.assertEqual(argv[5:], ["print", "%s/%d" % (argv[-1].split("/")[0], ident.uid)])
                 name += ":" + argv[-1].split("/")[0]
-            rc, out, err = answers.get(name, (0, "", ""))
+            answer = answers.get(name, (0, "", ""))
+            if answer == "timeout":
+                raise subprocess.TimeoutExpired(argv, 30)
+            rc, out, err = answer
             return subprocess.CompletedProcess(argv, rc, out, err)
         with unittest.mock.patch.object(qa.subprocess, "run", fake_run):
             answers.update(CLEAN_PERSISTENCE)
@@ -1151,16 +1154,15 @@ class IdentityGuardTests(Base):
                                        ("ls", (0, "evil.plist\n", ""), "LaunchAgents"),
                                        ("atq", (1, "", "atq: cannot open lockfile\n"), "could not check the at queue"),
                                        ("crontab", (1, "", "sudo: a password is required\n"), "sudo -n refused"),
-                                       ("launchctl:user", (0, launchd_domain("0\t-\tcom.apple.cfprefsd.xpc.agent",
-                                                                             "-\t0\tdev.evil.agent"), ""),
-                                        "non-system service dev.evil.agent"),
+                                       ("launchctl:user", (0, launchd_domain("0\t-\tcom.apple.cfprefsd.xpc.agent"), ""),
+                                        "launchd domain user/"),                    # present, even with only com.apple.*
                                        ("launchctl:gui", (0, launchd_domain("123\t-\torg.example.helper"), ""),
-                                        "non-system service org.example.helper"),
-                                       ("launchctl:user", (0, "user/777 = {\n\ttype = User\n}\n", ""), "not understood"),
-                                       ("launchctl:user", (0, launchd_domain("this is not a service line"), ""), "unreadable"),
-                                       ("launchctl:user", (0, "user/777 = {\n\tservices = {\n\t\t0\t-\tcom.apple.x\n", ""),
-                                        "not closed"),
-                                       ("launchctl:gui", (5, "", "Bad request.\n"), "could not read launchd domain gui"),
+                                        "launchd domain gui/"),
+                                       ("launchctl:user", (0, "", ""), "launchd domain user/"),           # empty
+                                       ("launchctl:user", (0, "garbled \x00 output", ""), "launchd domain user/"),
+                                       ("launchctl:gui", (5, "", "Bad request.\n"), "launchd domain gui/"),
+                                       ("launchctl:user", (113, "could not find domain\n", ""), "launchd domain user/"),  # not the exact form
+                                       ("launchctl:user", "timeout", "launchd domain user/"),
                                        ("launchctl:user", (1, "", "sudo: a password is required\n"), "sudo -n refused")):
                 saved = dict(answers)
                 answers[name] = answer
@@ -1200,7 +1202,7 @@ def launchd_domain(*services):
 CLEAN_PERSISTENCE = {
     "crontab": (1, "", "crontab: no crontab for qauser\n"),
     "ls": (1, "", "ls: /Users/qauser/Library/LaunchAgents: No such file or directory\n"),
-    "launchctl:user": (0, launchd_domain("0\t-\tcom.apple.cfprefsd.xpc.agent", "-\t0\tcom.apple.distnoted.xpc.agent"), ""),
+    "launchctl:user": (113, "Could not find domain for user/777\n", ""),
     "launchctl:gui": (113, "Could not find domain for port identifier: gui/777\n", ""),   # never logged in
 }
 
