@@ -385,10 +385,13 @@ def _read_reservation(path):
 def live_reservations(state_path, now=None, token_fn=process_token):
     """Return (live records, problems); call while holding state_lock.
 
-    A reservation whose process is gone, whose start token no longer matches
-    (pid reuse) or whose expiry passed is deleted. Only well-formed files of
-    this schema are ever deleted; anything else is reported as a problem and
-    left alone. A process that cannot be inspected stays counted (fail closed).
+    A reservation whose process is gone or whose start token no longer matches
+    (pid reuse) is deleted. An expired reservation whose holder is still the
+    same live process keeps its lane (marked past_ttl): the time limit is not
+    evidence of release, and freeing the lane would double-book a running job.
+    Only well-formed files of this schema are ever deleted; anything else is
+    reported as a problem and left alone. A process that cannot be inspected
+    stays counted (fail closed).
     """
     now = now or datetime.now(timezone.utc)
     directory = reservations_dir(state_path)
@@ -406,11 +409,15 @@ def live_reservations(state_path, now=None, token_fn=process_token):
             current = token_fn(record['pid'])
         except ReservationError as exc:
             problems.append('reservation-unverifiable: %s: %s' % (path.name, exc))
+            if record['expires_at'] <= now:
+                record['past_ttl'] = True
             live.append(record)
             continue
-        if current is None or current != record['start_token'] or record['expires_at'] <= now:
+        if current is None or current != record['start_token']:
             path.unlink()
             continue
+        if record['expires_at'] <= now:
+            record['past_ttl'] = True
         live.append(record)
     return live, problems
 
@@ -503,7 +510,9 @@ def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None
             reserved = sum(r['bytes'] for r in others)
             if len(others) >= lanes:
                 return dict(result, admit=False, reserved_bytes=reserved,
-                            reason='lane-cap: %d of %d heavy lanes in use' % (len(others), lanes))
+                            reason='lane-cap: %d of %d heavy lanes in use (%s)' % (len(others), lanes, ', '.join(
+                                '%s pid %d%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '')
+                                for r in others)))
             if result['free_bytes'] - reserved - nbytes < HEAVY_FLOOR:
                 return dict(result, admit=False, reserved_bytes=reserved,
                             reason='over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
@@ -591,6 +600,9 @@ def snapshot(state_path, source_fn=measure_with_source, now=None, token_fn=proce
             result = _evaluate_locked(None, state_path, free, now)
             live, problems = live_reservations(state_path, now, token_fn)
             blockers = list(problems)
+            blockers += ['reservation-past-ttl-holder-alive: %s (pid %d) is past its time limit but still running; '
+                         'its lane stays occupied until it exits or is released' % (r['label'], r['pid'])
+                         for r in live if r.get('past_ttl')]
             if result['tier'] is None:
                 blockers.insert(0, result['reason'])
             elif result['latch']:
@@ -645,7 +657,7 @@ def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, tt
     """Reserve for this very process, then exec the job: nothing runs before admission.
 
     execv keeps the pid and the start time, so the reservation is held by the job itself and ends with it
-    (lazy reaping handles exit, pid reuse and TTL). A refusal never execs and returns 77; a failed exec
+    (lazy reaping handles exit and pid reuse; a live holder keeps its lane past its TTL). A refusal never execs and returns 77; a failed exec
     releases the reservation and returns 127. Every message goes to stderr; the exit code is the contract,
     and it is authoritative only until the job starts (after exec the exit code is the job's own).
     """

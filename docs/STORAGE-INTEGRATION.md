@@ -119,11 +119,14 @@ State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
 - `reservations/<label>.json`: `reserve --bytes N --pid P --label L` admits a
   heavy job only if the tier and latch admit it, a lane is free, P is a live
   process of the current user, and free bytes minus live reservations minus N
-  stay at or above 100 GiB. The hold lasts at most 4 h (`--ttl-s`), or up to 24 h
-  with an explicit `--max-hold`. A reservation records pid, process start time
-  and expiry; one whose process is gone, whose start time differs (pid reuse) or
-  that expired is ignored and deleted. A process that cannot be inspected stays
-  counted. Only well-formed files of this schema are ever deleted, and
+  stay at or above 100 GiB. `--ttl-s` (at most 4 h, or 24 h with an explicit `--max-hold`)
+  is the planned hold, not a release: it only decides when a still-running holder is reported as past its time limit.
+  The lane is held until the holder exits or `release --label L` runs, so reserve with the pid of the job itself, never a
+  long-lived shell. A reservation records pid, process start time
+  and expiry; one whose process is gone or whose start time differs (pid reuse)
+  is ignored and deleted. One that is past its time limit but whose holder is still the same
+  live process keeps its lane (reported as `reservation-past-ttl-holder-alive` in the snapshot): a time limit is
+  not evidence of release. A process that cannot be inspected stays counted. Only well-formed files of this schema are ever deleted, and
   `release --label L` deletes just that one. An unreadable or damaged file blocks
   reservations and is never deleted. These are byte claims for admission only;
   native Glomeris leases own resource claims and reaping.
@@ -134,15 +137,14 @@ State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
 
 `disk-admission.py run --bytes N --label L [--ttl-s S] [--max-hold] -- COMMAND [ARG...]` reserves for its own process and
 then `exec`s the job. `exec` keeps the pid and start time, so the reservation is held by the job itself, nothing
-runs before admission, and no release step exists: exit, pid reuse and TTL expiry are reaped lazily. A refusal
+runs before admission, and no release step exists: exit and pid reuse are reaped lazily; TTL expiry alone never frees the lane of a live holder. A refusal
 (latched, no free lane, over capacity, bad label or bytes, TTL above 4 h without `--max-hold`) never starts the job
 and exits 77; a failed `exec` releases the reservation and exits 127. Messages go to stderr (the reserved line only
 when stderr is a terminal, so a captured job stderr is not polluted), `--` between the options and the command is
 mandatory, and the job starts with default SIGPIPE/SIGXFSZ dispositions (a caller's own ignore of those signals is not preserved, because Python overwrites it at startup). The exit codes 77/127 are authoritative only
 until the job starts; afterwards the exit code is the job's own, so a job that can exit 77 or 127 is ambiguous (argparse
 errors exit 2). Only the exec'd process is tracked: a job that forks a daemon and exits, or backgrounds work, loses its
-reservation while the real consumer continues. A running job past its TTL silently loses its
-reservation, and an exited job that its parent has not reaped is still counted. Reservations only coordinate
+reservation while the real consumer continues. A running job past its TTL keeps its lane until it exits, and an exited job that its parent has not reaped is still counted. Reservations only coordinate
 callers that use them: the gate hook still decides on tier and latch alone, so an unwrapped heavy command can run
 beside a reserved one. This state is advisory (same-user), not a security boundary.
 ### Keeping the snapshot fresh (`refresher-plist`)
