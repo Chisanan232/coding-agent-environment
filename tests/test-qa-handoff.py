@@ -30,6 +30,10 @@ argv = sys.argv[1:]
 json.dump({"argv": argv, "env": sorted(os.environ), "cwd": os.getcwd()}, open(d + "/seen.json", "w"))
 open(d + "/prompt.txt", "w").write(sys.stdin.read())
 mode = open(d + "/mode").read().strip()
+if mode == "crash":         # auth, rate limit or crash: codex dies before it writes any verdict
+    sys.exit(3)
+if mode == "leftover":      # a background process that outlives codex and edits the clone afterwards
+    subprocess.Popen(["sh", "-c", "sleep 3; echo late >> tracked.txt"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 if mode == "hangdirty":     # tamper, then never produce a verdict
     open("tracked.txt", "a").write("modified by QA")
     time.sleep(120)
@@ -656,6 +660,99 @@ class VerdictTests(Base):
         _, _, run_dir = self.outcome(verdict())
         self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 0)
         self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 0)
+
+
+class ReviewFollowUpTests(Base):
+    """Independent review of PR 137 (five findings): exit-code contract, never-run state, labels, timeout hash, stragglers."""
+
+    def result(self, run_dir):
+        return json.loads((run_dir / "RESULT.json").read_text())
+
+    def test_codex_crash_before_a_verdict_is_retryable_not_an_integrity_failure(self):
+        self.fake_mode("crash")
+        run_dir = self.prepare()
+        code, out = self.run_qa(run_dir)
+        self.assertEqual(code, 11)
+        self.assertEqual(self.result(run_dir)["state"], "QA_INCOMPLETE")
+        self.assertIn("exited 3", out)
+
+    def test_a_clean_codex_exit_with_no_verdict_stays_invalid(self):
+        run_dir = self.prepare()
+        (run_dir / "events.jsonl").write_text("")
+        meta = {"argv": [], "exit_code": 0, "seconds": 0, "timed_out": False, "events_sha256": qa.sha256_file(run_dir / "events.jsonl"),
+                "verdict_sha256": "ABSENT", "commands_completed": 0, "commands_succeeded": 0}
+        (run_dir / "RUNMETA.json").write_text(json.dumps(meta))
+        code, _ = self.call("verdict", "--run-dir", str(run_dir))   # codex exited 0 yet left no verdict: not a crash
+        self.assertEqual(code, 12)
+
+    def test_missing_codex_binary_is_incomplete_with_a_result_and_can_be_retried(self):
+        run_dir = self.prepare()
+        code, out = self.call("run", "--run-dir", str(run_dir), "--codex-bin", str(self.root / "nope"), "--admission-cmd",
+                              shlex.join(self.ADMIT), "--settle", "0")
+        self.assertEqual(code, 11)
+        self.assertEqual(self.result(run_dir)["state"], "QA_INCOMPLETE")
+        self.assertFalse((run_dir / "RUN.lock").exists())
+        self.assertEqual(self.run_qa(run_dir)[0], 0)                    # nothing ran, so the same attempt may run
+
+    def test_run_refusals_use_a_documented_exit_and_keep_the_existing_result(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_qa(run_dir)[0], 0)
+        before = (run_dir / "RESULT.json").read_text()
+        code, out = self.run_qa(run_dir)
+        self.assertEqual(code, qa.EXIT["REFUSED"])
+        self.assertIn("REFUSED", out)
+        self.assertEqual((run_dir / "RESULT.json").read_text(), before)
+        fresh = self.prepare()
+        (fresh / "RUN.lock").write_text("")
+        code, out = self.run_qa(fresh)
+        self.assertEqual(code, qa.EXIT["REFUSED"])
+        self.assertFalse((fresh / "RESULT.json").exists())
+
+    def test_verdict_after_a_resource_wait_does_not_turn_it_into_tampering(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_qa(run_dir, admission=self.REFUSE)[0], 75)
+        code, out = self.call("verdict", "--run-dir", str(run_dir))
+        self.assertEqual(code, 75)
+        self.assertEqual(self.result(run_dir)["state"], "WAITING_RESOURCE")
+
+    def test_verdict_for_a_run_that_never_started_is_not_run(self):
+        run_dir = self.prepare()
+        code, out = self.call("verdict", "--run-dir", str(run_dir))
+        self.assertEqual(code, 75)
+        self.assertEqual(self.result(run_dir)["state"], "NOT_RUN")
+        self.assertIn("NOT_RUN", out)
+
+    def test_a_verdict_without_a_run_record_is_still_invalid(self):
+        run_dir = self.prepare()
+        (run_dir / "verdict.json").write_text(verdict())
+        code, _ = self.call("verdict", "--run-dir", str(run_dir))
+        self.assertEqual(code, 12)
+
+    def test_criteria_and_notes_are_labelled_producer_supplied_and_hashed(self):
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        prompt = (self.fake_dir / "prompt.txt").read_text()
+        self.assertNotIn("verbatim from the ticket", prompt)
+        self.assertIn("supplied by the producer", prompt)
+        self.assertEqual(len(self.result(run_dir)["criteria_sha256"]), 64)
+
+    def test_timeout_with_a_changed_event_stream_is_invalid(self):
+        self.fake_mode("hang")
+        run_dir = self.prepare()
+        self.assertEqual(self.run_qa(run_dir, extra=("--timeout", "12"))[0], 11)
+        with open(run_dir / "events.jsonl", "a") as handle:
+            handle.write('{"type": "item.completed", "item": {"type": "command_execution", "id": "forged", "exit_code": 0}}\n')
+        code, out = self.call("verdict", "--run-dir", str(run_dir))
+        self.assertEqual(code, 12)
+        self.assertIn("event stream changed", out)
+
+    def test_a_straggler_left_by_a_clean_codex_exit_cannot_flip_the_verdict_later(self):
+        self.fake_mode("leftover")
+        run_dir = self.prepare()
+        self.assertEqual(self.run_qa(run_dir)[0], 0)
+        time.sleep(4)                                                   # longer than the straggler's sleep
+        code, out = self.call("verdict", "--run-dir", str(run_dir))
+        self.assertEqual(code, 0, out)
 
 
 if __name__ == "__main__":

@@ -48,7 +48,9 @@ HOME = Path.home()
 DEFAULT_ROOT = HOME / '.local/state/coding-agent-environment/qa'
 SEVERITIES = ('Critical', 'High', 'Medium', 'Low')
 FAILING = ('Critical', 'High', 'Medium')
-EXIT = {'QA_PASS': 0, 'QA_FAIL': 10, 'QA_INCOMPLETE': 11, 'QA_INVALID': 12, 'WAITING_RESOURCE': 75}
+# REFUSED is a usage refusal (the run directory is not runnable) and writes no RESULT.json; NOT_RUN and WAITING_RESOURCE
+# both mean codex never started, so the same attempt can be run again.
+EXIT = {'QA_PASS': 0, 'QA_FAIL': 10, 'QA_INCOMPLETE': 11, 'QA_INVALID': 12, 'REFUSED': 64, 'WAITING_RESOURCE': 75, 'NOT_RUN': 75}
 ENV_ALLOW = ('PATH', 'LANG', 'LC_ALL', 'TERM', 'TZ', 'USER', 'LOGNAME', 'SHELL')
 
 STR = {'type': 'string'}
@@ -90,7 +92,7 @@ Rules:
 
 PACKET (product={product}, ticket={ticket}, commit={sha})
 
-ACCEPTANCE CRITERIA (verbatim from the ticket):
+ACCEPTANCE CRITERIA (supplied by the producer; the wrapper does not check them against the ticket):
 {criteria}
 
 PRODUCER-CLAIMED EVIDENCE (unverified; do not rely on it):
@@ -498,12 +500,18 @@ def write_result(run_dir, packet, state, reasons, extra=None):
     return EXIT[state]
 
 
+def refuse(message):
+    """A run directory that cannot be run is a usage refusal, not a QA state: RESULT.json is left as it is."""
+    print('REFUSED %s' % message)
+    return EXIT['REFUSED']
+
+
 def run(args):
     run_dir = Path(args.run_dir).resolve()
     packet = load_packet(run_dir)
     source = run_dir / 'source'
     if (run_dir / 'RUNMETA.json').exists():
-        raise SystemExit('refusing: this run directory has already been run; prepare a new attempt')
+        return refuse('this run directory has already been run; prepare a new attempt')
     try:
         manifest = read_run_json(run_dir / 'tree-manifest.json')
         problems = check_tree(source, manifest)
@@ -517,7 +525,7 @@ def run(args):
     try:
         os.close(os.open(run_dir / 'RUN.lock', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
     except FileExistsError:
-        raise SystemExit('refusing: a run is in progress or was interrupted for this directory; prepare a new attempt')
+        return refuse('a run is in progress or was interrupted for this directory; prepare a new attempt')
     try:
         return run_locked(args, run_dir, packet, source)
     finally:
@@ -555,13 +563,20 @@ def run_locked(args, run_dir, packet, source):
     timed_out = False
     with open(events, 'wb') as ev, open(run_dir / 'stderr.log', 'wb') as err:
         os.chmod(events, 0o600)
-        proc = subprocess.Popen(argv, cwd=str(source), env=isolated_env(run_dir), stdin=subprocess.PIPE, stdout=ev,
-                                stderr=err, start_new_session=True)
+        try:
+            proc = subprocess.Popen(argv, cwd=str(source), env=isolated_env(run_dir), stdin=subprocess.PIPE, stdout=ev,
+                                    stderr=err, start_new_session=True)
+        except OSError as error:       # codex is not installed or not executable: nothing ran, so the attempt stays retryable
+            return write_result(run_dir, packet, 'QA_INCOMPLETE', ['codex could not be started (%s)' % type(error).__name__])
         def interrupted(signum, frame):
             raise KeyboardInterrupt
         old = signal.signal(signal.SIGTERM, interrupted)
         try:
             proc.communicate(prompt.encode(), timeout=args.timeout)
+            try:                       # a background process codex left behind must not keep editing the clone after the verdict
+                os.killpg(proc.pid, signal.SIGKILL)   # codex is already reaped; this reaches only what it left in its own group
+            except OSError:
+                pass
         except subprocess.TimeoutExpired:
             timed_out = True
             kill_group(proc)
@@ -618,10 +633,25 @@ def evaluate(run_dir):
         return write_result(run_dir, packet, 'QA_INVALID', ['unexpected %s while evaluating' % type(error).__name__])
 
 
+def not_run(run_dir, packet):
+    """Codex never started (admission wait, interruption before launch, or a run directory only prepared). Say so, and
+    keep an earlier WAITING_RESOURCE result instead of rewriting it as tampering."""
+    try:
+        previous = read_run_json(run_dir / 'RESULT.json')
+    except LOAD_ERRORS:
+        previous = {}
+    if isinstance(previous, dict) and previous.get('state') == 'WAITING_RESOURCE':
+        print('WAITING_RESOURCE %s' % '; '.join(clean(r) for r in previous.get('reasons', []) if isinstance(r, str)))
+        return EXIT['WAITING_RESOURCE']
+    return write_result(run_dir, packet, 'NOT_RUN', ['codex has not been run for this attempt'])
+
+
 def evaluate_files(run_dir, packet):
     meta_path, verdict_path, events = run_dir / 'RUNMETA.json', run_dir / 'verdict.json', run_dir / 'events.jsonl'
     if not meta_path.exists():
-        return write_result(run_dir, packet, 'QA_INVALID', ['no run record'])
+        if os.path.lexists(verdict_path) or os.path.lexists(events) and os.lstat(events).st_size:
+            return write_result(run_dir, packet, 'QA_INVALID', ['run output exists but the run record is missing'])
+        return not_run(run_dir, packet)
     meta = read_run_json(meta_path)
     bad = []
     if safe_digest(events) != meta['events_sha256']:
@@ -638,9 +668,14 @@ def evaluate_files(run_dir, packet):
     if not os.path.lexists(verdict_path):
         if meta.get('timed_out'):
             tampered = check_tree(run_dir / 'source', read_run_json(run_dir / 'tree-manifest.json'))
-            if tampered:                      # a timeout does not excuse a modified clone
+            if tampered or bad:               # a timeout does not excuse a modified clone or a changed event stream
                 return write_result(run_dir, packet, 'QA_INVALID', bad + tampered)
             return write_result(run_dir, packet, 'QA_INCOMPLETE', ['timed out before a verdict'])
+        if meta['exit_code'] not in (0, None):    # auth, rate limit or crash: codex died before it could answer
+            tampered = check_tree(run_dir / 'source', read_run_json(run_dir / 'tree-manifest.json'))
+            if tampered or bad:
+                return write_result(run_dir, packet, 'QA_INVALID', bad + tampered)
+            return write_result(run_dir, packet, 'QA_INCOMPLETE', ['codex exited %s before writing a verdict; retry with a new attempt' % meta['exit_code']])
         return write_result(run_dir, packet, 'QA_INVALID', ['no verdict file'])
     if safe_digest(verdict_path) != meta['verdict_sha256']:
         bad.append('verdict changed after the run (tampered)')
@@ -662,7 +697,8 @@ def evaluate_files(run_dir, packet):
     if bad:
         return write_result(run_dir, packet, 'QA_INVALID', bad)
     created, truncated = untracked_created(run_dir / 'source', manifest)
-    extra = {'verdict_sha256': meta['verdict_sha256'], 'events_sha256': meta['events_sha256'],
+    extra = {'criteria_sha256': hashlib.sha256(packet['criteria'].encode()).hexdigest(),
+             'verdict_sha256': meta['verdict_sha256'], 'events_sha256': meta['events_sha256'],
              'commands_completed': commands_completed, 'commands_succeeded': commands_succeeded,
              'codex_exit_code': meta['exit_code'], 'untracked_files_present': len(created) if not truncated else 'many',
              'untracked_sample': [clean(n, 80) for n in created[:10]],
