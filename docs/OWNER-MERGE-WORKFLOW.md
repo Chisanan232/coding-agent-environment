@@ -56,6 +56,18 @@ Only with a verified billing, quota or outage cause: run the full local equivale
 `OWNER-MERGE-CI-UNAVAILABLE head=<sha> cause=<billing|quota|outage> local_equivalent=PASS`,
 and pass `--ci-unavailable`. Any genuinely failing check still refuses.
 
+## Repository with no hosted CI (founder-approved per PR)
+
+A repository that defines no CI workflow at all (its `.github/workflows` directory does not exist) can never report a check, so
+`NO_CI_EVIDENCE` would block every PR. When the founder has approved the exception for a named PR, post, as the authenticated
+user and in a comment that also states the actual local validation and review evidence (commands, revision, exit status, test
+counts, review verdict, what was not run),
+`OWNER-MERGE-CI-EXCEPTION head=<sha> basis=no-hosted-ci local_equivalent=PASS` (`owner-merge-gate.py ci-exception-line --head SHA`
+prints it) and pass `--ci-exception`. The gate accepts it only for that exact head, with zero checks on the head, when the
+workflows directory is absent (a 404; any other answer counts as "has workflows"), and with a clean review record. Checks that
+ran and failed or are pending still refuse or wait. It records that local evidence stands in for CI; it is not a CI pass and is
+never reported as one. It does not replace `--ci-unavailable`, which is for a verified external outage of CI that exists.
+
 ## Version integration branches (Development-Ahead / Sequential Release)
 
 `main` is the protected cumulative release baseline. A founder-approved version integration branch (for example
