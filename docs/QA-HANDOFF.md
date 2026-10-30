@@ -59,8 +59,11 @@ qa-handoff.py verdict --run-dir DIR                         # re-evaluate the sa
 ```
 
 The producer's own session runs `run` (in the foreground, or in the background and read when it completes) and continues
-by exit code: 0 `QA_PASS`, 10 `QA_FAIL` (fix, new SHA, requalify), 11 `QA_INCOMPLETE`, 12 `QA_INVALID`, 75
-`WAITING_RESOURCE` (admission refused; Codex was not started; not a QA failure). `RESULT.json` records the state, reasons,
+by exit code: 0 `QA_PASS`, 10 `QA_FAIL` (fix, new SHA, requalify), 11 `QA_INCOMPLETE` (also: Codex could not be started,
+or exited non-zero before writing any verdict, for example an auth or rate-limit failure; retry with a new attempt), 12
+`QA_INVALID` (integrity: tampering or an unreadable record), 64 `REFUSED` (the run directory was already run or is locked;
+a usage refusal, `RESULT.json` is left untouched), 75 `WAITING_RESOURCE` or `NOT_RUN` (Codex was not started; not a QA
+failure, and `verdict` never rewrites either as `QA_INVALID`). `RESULT.json` records the state, reasons,
 SHA and hashes. The verdict schema is AASM's worker result contract (`STATUS / BASELINE / VERIFIED / SUSPECTED_FINDINGS /
 UNTESTED_OR_BLOCKED / CONFIDENCE`), mapped to these states; it is the same shape the release-QA workers already return.
 
@@ -115,6 +118,9 @@ the hop and acts on the verdict.
 
 ### Known gaps (stated, not closed)
 
+- `--criteria` and `--qa-notes` are files the producer chooses. The prompt labels them producer-supplied and `RESULT.json`
+  records `criteria_sha256`, but the wrapper does not verify them against the ticket; a producer that narrows the criteria
+  narrows what a `QA_PASS` covers. A reviewer compares the hash and text with the ticket.
 - A `QA_PASS` is the QA process's own report, bound to a hashed event stream a reviewer can audit. It is not a
   cryptographic attestation, and the producer and the QA process run as the same OS user.
 - The sandbox can read files this user can read (including Codex's own login directory) and the run inherits the user's
