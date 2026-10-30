@@ -915,11 +915,26 @@ def seal_failed(error):
 # cannot read the environment of the producer's processes (same-uid KERN_PROCARGS2). Only the producer side loads that
 # script; the copy of this file that runs as the QA user has no sibling and never calls _qis().
 Identity = collections.namedtuple('Identity', 'name uid home exchange exchange_owner')
-KILL, PGREP = '/bin/kill', '/usr/bin/pgrep'
+KILL, PS = '/bin/kill', '/bin/ps'
 CRONTAB, ATQ, LS, LAUNCHCTL = '/usr/bin/crontab', '/usr/bin/atq', '/bin/ls', '/bin/launchctl'
 # launchd's default ThrottleInterval is 10 s: a job it keeps alive comes back within that, so the seal looks again later.
 RESPAWN_SECONDS = 12
 LAUNCHD_ABSENT = 'Could not find domain'
+# After the QA user's first hop macOS creates a launchd user domain for it and keeps these Apple services running under it,
+# each with PPID 1 and respawned by launchd after a kill. They are not stragglers. Identified by the kernel-reported
+# executable path (libproc), never by argv[0] or `ps comm`, which a QA process can set to anything. VERIFIED-ON-THIS-HOST
+# only (macOS 27.0.1, first real-account run, 2026-10-30): the set can differ on other macOS versions. A service not
+# listed counts as a survivor and fails the run closed; add a path only after the owner's `--check` shows it.
+QA_SYSTEM_SERVICES = frozenset({
+    '/usr/sbin/distnoted',
+    '/usr/sbin/cfprefsd',
+    '/usr/libexec/pkd',
+    '/usr/libexec/lsd',
+    '/usr/libexec/trustd',
+    '/usr/libexec/secd',
+    '/usr/libexec/containermanagerd',
+    '/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdbulkimport',
+})
 HOP_ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
 _QIS = None
 
@@ -1016,6 +1031,19 @@ def sudo_refused(stderr):
     return any(line.startswith('sudo:') for line in (stderr or '').splitlines())
 
 
+def executable_path(pid):
+    """The kernel-reported path of the running executable of `pid` (libproc proc_pidpath), None when unavailable.
+    Readable for other users' processes without privilege, and, unlike `ps comm`, not set by the process itself."""
+    try:
+        import ctypes
+        lib = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+        buf = ctypes.create_string_buffer(4096)
+        length = lib.proc_pidpath(pid, buf, 4096)
+    except (OSError, AttributeError):
+        return None
+    return buf.value.decode('utf-8', 'replace') if length > 0 else None
+
+
 def sweep_identity(ident, recheck=0):
     """Kill every process of the QA user, then count the survivors (process ids only). None means the sweep could not run,
     which callers treat as failed. With `recheck` seconds, a clean table is listed once more after that delay, so a job
@@ -1032,14 +1060,37 @@ def sweep_identity(ident, recheck=0):
     if sudo_refused(done.stderr):
         return None
     def survivors():
+        """Processes of the QA user that are not one of its macOS system services (see QA_SYSTEM_SERVICES); None when the
+        table cannot be read."""
         try:
-            listed = subprocess.run([PGREP, '-U', str(ident.uid)], stdin=subprocess.DEVNULL, capture_output=True,
-                                    text=True, timeout=10)
+            listed = subprocess.run([PS, '-U', str(ident.uid), '-o', 'pid=,ppid=,stat='], stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             return None
-        if listed.returncode == 1:
-            return 0
-        return len(listed.stdout.split()) if listed.returncode == 0 else None
+        if listed.returncode == 1 and not listed.stdout.strip() and not listed.stderr.strip():
+            return 0   # ps exits 1 with an empty table and a message on stderr for an unknown uid or a bad option: not zero
+        if listed.returncode != 0:
+            return None
+        count = 0
+        for line in listed.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
+                return None
+            pid, ppid = int(fields[0]), int(fields[1])
+            if fields[2].startswith('Z'):   # exited, only waiting to be reaped: nothing is running
+                continue
+            path = executable_path(pid)
+            if ppid == 1 and path in QA_SYSTEM_SERVICES:
+                continue
+            if path is None:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:   # gone between the listing and the lookup
+                    continue
+                except PermissionError:
+                    pass
+            count += 1
+        return count
 
     count = None
     for _ in range(25):                     # killed processes take a moment to disappear from the table

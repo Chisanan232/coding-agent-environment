@@ -1193,22 +1193,85 @@ class IdentityGuardTests(Base):
                 self.assertTrue(qa.persistence_problems(ident._replace(uid=uid)))
             self.assertEqual(calls, [])                                       # refused before any subprocess
 
-    def test_a_straggler_respawned_after_the_settle_is_counted(self):
-        ident = qa.Identity("qauser", os.getuid() + 4321, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
-        listings = [(1, ""), (0, "4242\n")]          # gone at first, then launchd brings one back after its throttle
+    IDENT = qa.Identity("qauser", os.getuid() + 4321, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
+
+    def sweep_with(self, tables, paths, recheck=0, gone=(), stderr=""):
+        """Run sweep_identity against fake `ps` tables (lists of "pid ppid stat" rows) and a pid -> executable path map."""
+        tables = list(tables)
         slept = []
 
         def fake_run(argv, **kwargs):
-            if argv[0] == qa.PGREP:
-                rc, out = listings.pop(0) if listings else (1, "")
-                return subprocess.CompletedProcess(argv, rc, out, "")
+            if argv[0] == qa.PS:
+                rows = tables.pop(0) if len(tables) > 1 else tables[0]
+                return subprocess.CompletedProcess(argv, 0 if rows else 1, "".join(r + "\n" for r in rows), stderr)
             return subprocess.CompletedProcess(argv, 0, "", "")
+
+        def fake_kill(pid, sig):
+            if pid in gone:
+                raise ProcessLookupError
         with unittest.mock.patch.object(qa.subprocess, "run", fake_run), \
+                unittest.mock.patch.object(qa, "executable_path", lambda pid: paths.get(pid)), \
+                unittest.mock.patch.object(qa.os, "kill", fake_kill), \
                 unittest.mock.patch.object(qa.time, "sleep", slept.append):
-            self.assertEqual(qa.sweep_identity(ident, recheck=qa.RESPAWN_SECONDS), 1)
+            return qa.sweep_identity(self.IDENT, recheck=recheck), slept
+
+    # The eight services and their paths observed on the first real QA account (macOS 27.0.1, 2026-10-30), all PPID 1.
+    SERVICES = {28114: "/usr/sbin/distnoted", 28127: "/usr/sbin/cfprefsd", 28135: "/usr/libexec/pkd", 28152: "/usr/libexec/lsd",
+                28171: "/usr/libexec/trustd", 28582: "/usr/libexec/secd", 29055: "/usr/libexec/containermanagerd",
+                28121: "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/"
+                       "Versions/A/Support/mdbulkimport"}
+
+    def test_the_real_macos_system_services_of_the_qa_user_are_not_survivors(self):
+        rows = ["%d 1 Ss" % pid for pid in self.SERVICES]
+        self.assertEqual(self.sweep_with([rows], self.SERVICES)[0], 0)
+        self.assertEqual(set(self.SERVICES.values()), set(qa.QA_SYSTEM_SERVICES))       # the table is exactly the observed set
+
+    def test_anything_else_of_the_qa_user_is_a_survivor(self):
+        rows = ["%d 1 Ss" % pid for pid in self.SERVICES] + ["500 1 S", "501 777 S", "502 1 S"]
+        paths = dict(self.SERVICES)
+        paths.update({500: "/bin/sleep", 501: "/usr/libexec/pkd", 502: "/Users/qauser/evil"})
+        # 500: not a listed path even at PPID 1 (a name set through argv[0] changes nothing: only the kernel path counts);
+        # 501: a listed path but not a child of launchd; 502: an unlisted path
+        self.assertEqual(self.sweep_with([rows], paths)[0], 3)
+
+    def test_an_exited_unreaped_process_and_one_that_vanished_are_not_survivors(self):
+        rows = ["600 1 Z", "601 1 S", "602 1 S"]
+        self.assertEqual(self.sweep_with([rows], {602: "/bin/sleep"}, gone=(601,))[0], 1)   # 600 zombie; 601 gone; 602 runs
+
+    def test_an_unreadable_path_of_a_process_that_still_exists_is_a_survivor(self):
+        self.assertEqual(self.sweep_with([["700 1 S"]], {})[0], 1)
+
+    def test_a_failed_ps_that_exits_1_is_not_zero_survivors(self):
+        # ps exits 1 with an empty table and a message for an unknown uid or a bad option: that is a failure, not "none"
+        self.assertIsNone(self.sweep_with([[]], {}, stderr="ps: No ruser name or ID matches\n")[0])
+        self.assertEqual(self.sweep_with([[]], {})[0], 0)                      # a genuinely empty table is zero
+
+    def test_an_unreadable_process_table_fails_the_sweep(self):
+        for bad in (["not a row"], ["12 x S"]):
+            self.assertIsNone(self.sweep_with([bad], {})[0])
+
+    def test_a_straggler_respawned_after_the_settle_is_counted(self):
+        # gone at first, then launchd brings one back after its throttle; the services alone never count
+        services = ["%d 1 Ss" % pid for pid in self.SERVICES]
+        paths = dict(self.SERVICES)
+        paths[4242] = "/bin/sleep"
+        count, slept = self.sweep_with([services, services + ["4242 1 S"]], paths, recheck=qa.RESPAWN_SECONDS)
+        self.assertEqual(count, 1)
         self.assertIn(qa.RESPAWN_SECONDS, slept)
         self.assertGreater(qa.RESPAWN_SECONDS, qa.SETTLE_SECONDS)
         self.assertLessEqual(qa.RESPAWN_SECONDS, 30)                  # bounded
+
+    @unittest.skipUnless(sys.platform == "darwin", "libproc proc_pidpath exists only on macOS; the QA identity is macOS-only")
+    def test_executable_path_is_the_kernel_path_not_argv0(self):
+        proc = subprocess.Popen(["/bin/sh", "-c", "exec -a /usr/libexec/pkd /bin/sleep 30"])
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        time.sleep(0.5)
+        self.assertEqual(qa.executable_path(proc.pid), "/bin/sleep")                       # not the name it claims
+        self.assertIsNone(qa.executable_path(99999999))
+
+    def test_executable_path_is_none_where_libproc_does_not_exist(self):
+        with unittest.mock.patch("ctypes.CDLL", side_effect=OSError("no libproc")):
+            self.assertIsNone(qa.executable_path(os.getpid()))
 
 
 class KillChildTests(Base):
