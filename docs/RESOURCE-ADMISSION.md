@@ -109,7 +109,7 @@ binding; give the operator the exact command instead.
 
 A heavy-named process is a running lane, not a name match. A process counts as an **idle orphan** only when all of these
 hold: its parent is launchd (ppid 1), its state is not running or uninterruptible, `%cpu` is at most 1.0, it has been alive
-for at least 15 minutes, and it spent no CPU between the two samples of the check. An idle orphan does not refuse
+for at least 15 minutes, and it spent no CPU between the two samples of the check (any increase, even 10 ms, or no first-sample reading at all, makes it active). An idle orphan does not refuse
 heavy work. It is reported as a note with its pid, age and working directory (read with `lsof`, never the command line) so
 its owner can reclaim it; nothing is ever signalled. Everything else counts as an active lane, including a quiet process
 with a live parent (a `rustc` under `cargo` or a shell), and any line `ps` printed that cannot be parsed. An unreadable
