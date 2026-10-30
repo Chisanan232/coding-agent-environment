@@ -277,10 +277,10 @@ The merge gate (`scripts/owner-merge-gate.py`) is deterministic when it is run, 
 |---|---|---|
 | A. Validating merge runner (SELECTED by the founder; implemented, not deployed) | A small program that re-checks the exact argument vector (40-hex pin, repository, PR number, merge strategy only) and the gate verdict, then runs `gh pr merge`; the allow rule covers that program only | Moves the bypass surface into code that can be tested exhaustively. A policy change: ADR 0013 makes the gate read-only and non-merging, and an allow rule over a merge-executing program must be the owner's decision. Built in section 8; the allow rule is still an owner step |
 | B. PreToolUse hook | A hook that receives the Bash command as an unexpanded string (the documented PreToolUse input; it does not see the resolved argument vector) and approves only the exact pinned shape, rejecting any expansion, quoting or escape syntax rather than interpreting it | Same property as A without a new executable; whether a hook's allow bypasses the classifier is untested |
-| C. Keep the per-merge `!` run | The agent prints the pinned command; the owner runs it with the `!` prefix | No new exposure; one owner action per merge. This is the current supported fallback |
+| C. Keep the per-merge `!` run | Fallback only when no supported approval path exists: the agent has already reached the normal host ASK for the pinned `gh pr merge` and been refused or given no path; it then reports the exact restriction once and the owner may run the pinned command with the `!` prefix | No new exposure; one owner action per merge. The agent never defaults to this |
 | D. Apply section 2 knowingly | Accept the residuals above | Not recommended: the holes are open-ended and some are exfiltration paths |
 
-The founder selected A. Until the runner's allow rule is applied and verified, the supported state is C, and the live broad `Bash(gh pr merge:*)` allow remains the unresolved exposure it is today.
+The founder selected A. Until the runner's allow rule is applied and verified, the supported state is the agent running the pinned `gh pr merge` through the normal host ASK (C only as the no-approval-path fallback), and the live broad `Bash(gh pr merge:*)` allow remains the unresolved exposure it is today.
 
 ## 7. What is and is not claimed
 
