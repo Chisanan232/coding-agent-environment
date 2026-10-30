@@ -23,7 +23,7 @@ Standing contract (universal; specialised procedure loads only when it applies):
 - Acceptance criteria are proportional to the core user value. A costly non-core criterion may be proposed as KEEP, SIMPLIFY, DEFER, WAIVE or REMOVE with the reason. SIMPLIFY and DEFER are recorded on the ticket (owner and trigger named), the criterion is reported DEFERRED or NOT_VERIFIED, never PASS, and the ticket is not closed as fully passing; criteria of a non-local gate are never relaxed to obtain a green result. WAIVE and REMOVE of a written criterion, and any change to a core criterion, go to the founder as one options packet; a core failure is never downgraded and stays blocking.
 - A pending decision, ASK or owner-run step blocks only the work that depends on it; continue independent work and record the resume trigger.
 - Adapt to resources: before heavy work run `scripts/memory-admission.py check --weight heavy`; on pressure reduce parallelism or defer, do not freeze and do not kill another session's work. Subagent limits are owned by the `engineering-workflow` Delegation section.
-- Delegated agents and QA runs carry this contract: put the relevant obligations and acceptance criteria in their prompt; do not assume a subagent loaded your skills. Use `qa-handoff.py` for traceable Codex QA dispatch and record its run id and verdict.
+- Delegated agents and QA runs carry this contract: put the relevant obligations and acceptance criteria in their prompt; do not assume a subagent loaded your skills.. Use `qa-handoff.py` for traceable Codex QA dispatch and record its run id and verdict.
 - Load `engineering-workflow` for branch, review, merge and cleanup mechanics, `decision-delegation` for who decides, `acceptance-validation` when planning or reporting verification.
 - Secrets are opaque capabilities: use them, verify presence only, never print or log a value.
 <!-- /block:standing-contract -->
@@ -77,22 +77,22 @@ disappears, when a baseline phrase is missing from either host entry point, or w
 <!-- map -->
 | Behavior | Owner | Phrases (all required, separated by ` || `) |
 |---|---|---|
-| ship: deliver by PR from an isolated worktree, never push the default branch | baseline | Deliver by pull request only, from the fetched base branch || never push to the default branch |
-| ship: atomic Gitmoji commits, tests separate from code | baseline | Commits are atomic Gitmoji commits || a new or changed test is its own commit |
-| ship: run tests at checkpoints, not after every commit | baseline | Commit granularity is separate from validation frequency || not after every commit |
-| ship: self-review, then a meaningful independent review before merge | skill:engineering-workflow | Review the complete diff and commit range yourself || meaningful independent review from a separate reviewer or isolated review context |
-| ship: the agent merges an eligible PR and answers a host ASK itself | baseline | An eligible PR is merged by the agent || If the host asks, submit that exact operation and continue || report the exact denial once |
+| ship: deliver by PR from an isolated worktree, never push the default branch | baseline | Deliver by pull request only, from the fetched base branch || never push to the default branch. |
+| ship: atomic Gitmoji commits, tests separate from code | baseline | Commits are atomic Gitmoji commits; || a new or changed test is its own commit |
+| ship: run tests at checkpoints, not after every commit | baseline | Commit granularity is separate from validation frequency || not after every commit; |
+| ship: self-review, then a meaningful independent review before merge | skill:engineering-workflow | Review the complete diff and commit range yourself. || meaningful independent review from a separate reviewer or isolated review context. |
+| ship: the agent merges an eligible PR and answers a host ASK itself | baseline | An eligible PR is merged by the agent || If the host asks, submit that exact operation and continue; || report the exact denial once |
 | ship: the merge is its own tool call in a fixed order | baseline | The merge is its own tool call || The order is: independent review, check the exact PR head, verify required CI |
-| ship: post-merge, verify acceptance and reconcile the ticket | skill:post-merge-close | verify actual acceptance, required checks and review gates before transition || do not infer completion |
-| ship: a merged PR, passing batch or status report is never completion; run the next task | baseline | is an intermediate result, never completion || select and run the next executable task || blocks only the work that depends on it |
-| ship: technical readiness is not release approval | baseline | needs the founder's separate explicit approval || evidence-backed technical `READY_FOR_RELEASE` |
-| ship: never claim READY_FOR_RELEASE without evidence for every node | skill:decision-delegation | Never claim `READY_FOR_RELEASE` without verified evidence for every acceptance node |
+| ship: post-merge, verify acceptance and reconcile the ticket | skill:post-merge-close | verify actual acceptance, required checks and review gates before transition. || do not infer completion |
+| ship: a merged PR, passing batch or status report is never completion; run the next task | baseline | is an intermediate result, never completion || select and run the next executable task. || blocks only the work that depends on it; |
+| ship: technical readiness is not release approval | baseline | needs the founder's separate explicit approval. || evidence-backed technical `READY_FOR_RELEASE` |
+| ship: never claim READY_FOR_RELEASE without evidence for every node | skill:decision-delegation | Never claim `READY_FOR_RELEASE` without verified evidence for every acceptance node. |
 | ship: heavy-admission refusal does not forbid light work | baseline | A refused heavy admission does not forbid light work || queue the heavy task through the admission mechanism |
-| ship: real watchers only, no claimed automatic resumption | baseline | record its identifier, trigger, expiry and next action || claim automatic resumption only if it exists |
-| verify: independent QA is dispatched and traced | baseline | Use `qa-handoff.py` for traceable Codex QA dispatch || record its run id and verdict |
-| verify: results use distinct states, never collapsed; local runs are not CI | baseline | Report results as PASS, FAIL, BLOCKED, NOT_RUN, DEFERRED, WAIVED or NOT_VERIFIED || never collapse one into another || a local-equivalent run is never reported as required-CI PASS || names the command, revision and exit status |
-| verify: non-core gaps are DEFERRED, a core failure is never downgraded | baseline | the criterion is reported DEFERRED or NOT_VERIFIED, never PASS || a core failure is never downgraded and stays blocking |
+| ship: real watchers only, no claimed automatic resumption | baseline | record its identifier, trigger, expiry and next action; || claim automatic resumption only if it exists. |
+| verify: independent QA is dispatched and traced | baseline | Use `qa-handoff.py` for traceable Codex QA dispatch || record its run id and verdict. |
+| verify: results use distinct states, never collapsed; local runs are not CI | baseline | Report results as PASS, FAIL, BLOCKED, NOT_RUN, DEFERRED, WAIVED or NOT_VERIFIED; || never collapse one into another. || a local-equivalent run is never reported as required-CI PASS. || names the command, revision and exit status. |
+| verify: non-core gaps are DEFERRED, a core failure is never downgraded | baseline | the criterion is reported DEFERRED or NOT_VERIFIED, never PASS || a core failure is never downgraded and stays blocking. |
 | verify: delegated agents are told the obligations | baseline | Delegated agents and QA runs carry this contract: put the relevant obligations and acceptance criteria in their prompt; do not assume a subagent loaded your skills |
-| verify: QA evidence is not merge evidence | doc:docs/QA-HANDOFF.md | A Codex verdict is QA evidence, not merge evidence |
+| verify: QA evidence is not merge evidence | doc:docs/QA-HANDOFF.md | A Codex verdict is QA evidence, not merge evidence. |
 | verify: no invented UI evidence | skill:acceptance-validation | never invent screenshots |
 <!-- /map -->
