@@ -79,6 +79,12 @@ subject. Choose the GitEmoji by the primary change:
 | 🚨 | Lint or type repair |
 | 🔒 | Security |
 
+Commit granularity and validation frequency are separate: a commit is never a reason to run a test.
+Batch related atomic commits into a validation checkpoint, run the narrowest meaningful affected
+checks first, reuse valid incremental build artifacts, and repeat validation only for new changes,
+failures, invalidated evidence or unresolved risk. Record the exact tested revision and never claim
+that untested intermediate commits were tested.
+
 Do not bypass hooks, security checks, or a genuinely failing product check. Run
 focused checks while iterating, then the repository's full relevant build, lint,
 type, test, security, privacy, documentation, and link gates before review.

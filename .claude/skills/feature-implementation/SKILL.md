@@ -47,10 +47,10 @@ task is confirmed by the engineer.
 13. Implement the feature to make the tests pass.
 14. Follow all conventions from the active repository instructions: naming, structure, type hints, error handling.
 15. Change only what is necessary. Do not refactor adjacent code.
-16. Run impacted tests after each logical unit of change.
+16. Run impacted tests at your validation checkpoints (a batch of related commits), not after every commit.
 
 ### Phase 5 — Validation
-17. Run the full test suite.
+17. At the validation checkpoint before the PR is ready, run the relevant full validation once for the exact revision.
 18. Run the linter.
 19. Run the type checker.
 20. Run pre-commit hooks.
@@ -60,7 +60,7 @@ task is confirmed by the engineer.
 22. Stage only the files changed for this feature.
 23. Write a commit message following the the active repository instructions commit conventions.
 24. Commit in small, logical increments — one concern per commit.
-25. Confirm the repository is in a healthy state after each commit.
+25. Keep every commit bisectable by construction (one concern each); prove it at the checkpoint with the repository's range or build gate, and never claim an untested intermediate commit was tested.
 
 ## Safe-Fix Guidance
 - If a test fails unexpectedly during implementation, stop and investigate before
@@ -73,6 +73,6 @@ task is confirmed by the engineer.
 ## Validation Guidance
 - Impacted validation: run tests in the module or package you changed.
 - Full validation: run the complete test suite plus lint and type checks.
-- Order: impacted validation during iteration → full validation before committing.
+- Order: impacted validation during iteration → relevant full validation at the checkpoint before the PR is ready (not after every commit).
 
 See the [reference](references/quality-policies.md) for the testing, type and lint policies.
