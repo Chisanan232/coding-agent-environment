@@ -134,6 +134,8 @@ def classify_heavy(ps_text):
             parsed = (int(parts[0]), int(parts[1]), parts[2], parse_clock(parts[3]), parse_clock(parts[4]), parts[5])
         else:
             base = os.path.basename(line.split()[-1])
+            if base not in HEAVY_COMMS:
+                return None, None, None, None   # a row that cannot be read might be a heavy process: the list is unknown
         if base not in HEAVY_COMMS:
             continue
         orphan = False

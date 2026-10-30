@@ -600,6 +600,15 @@ class IdleOrphan(unittest.TestCase):
         self.assertFalse(verdict["admit"])
         self.assertIn("process list unreadable", " ".join(verdict["reasons"]))
 
+    def test_a_truncated_or_malformed_process_row_fails_closed(self):
+        for bad in ("25830 1 S", "  7    "):
+            s = self.take(ps_out(ps_line(10, 500, "S", "05:00", "0:01.00", "0.0", "/bin/zsh"), bad))
+            self.assertIsNone(s["heavy_procs"], bad)                  # cannot tell what it was: the list is unknown
+        s = self.take(ps_out("abc 1 S 05:00 0:01.00 0.0 /x/rustc"))   # unreadable pid but a heavy name: counted as a lane
+        self.assertEqual(s["heavy_procs"], {"rustc": 1})
+        ok = self.take(ps_out(ps_line(10, 500, "S", "05:00", "0:01.00", "0.0", "/bin/zsh")))
+        self.assertEqual(ok["heavy_procs"], {})                      # positive control: well-formed rows stay readable
+
 
 if __name__ == "__main__":
     unittest.main()
