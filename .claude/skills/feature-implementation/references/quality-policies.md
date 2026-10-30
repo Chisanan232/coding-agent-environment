@@ -9,7 +9,7 @@ Moved verbatim from `.claude/CLAUDE.md`; that file keeps a short pointer.
 - Test behavior, not implementation. Tests must not assert on private internals.
 - Do not disable failing tests. Fix them or escalate.
 - Coverage is a metric, not the goal. Meaningful tests matter more than coverage %.
-- Run impacted tests during iteration. Run the full suite before committing.
+- Run impacted tests during iteration. Run the relevant full validation at meaningful checkpoints and before a PR is ready, not after every commit; record the exact tested revision.
 
 > **Project-specific**: test runner, coverage tool, fixture strategy, mocking library,
 > test directory layout, coverage threshold, and database test strategy belong in the
