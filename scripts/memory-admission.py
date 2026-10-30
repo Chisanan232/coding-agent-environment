@@ -198,6 +198,8 @@ def derive(s1, s2):
     """Rates and ratios from two samples taken `window` seconds apart. None means unknown."""
     d = {"pressure_level": s2.get("pressure_level"), "ram": s2.get("ram"), "disk_free": s2.get("disk_free"),
          "heavy_procs": s2.get("heavy_procs"), "swap": s2.get("swap")}
+    if s1.get("heavy_procs") is None:
+        d["heavy_procs"] = None   # a window with an unreadable first process list cannot show an orphan idle, or any lane absent
     # An orphan is idle only if it is proven so across the window: seen in the first sample with no more CPU time than now.
     # Any CPU spent, or no first reading at all (it may have been busy and unparsed), makes it a running lane.
     before = {r["pid"]: r["cpu_s"] for r in s1.get("idle_procs") or []}

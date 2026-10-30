@@ -592,6 +592,14 @@ class IdleOrphan(unittest.TestCase):
         s = self.take(ps_out(ps_line(41, 1, "R", "3-00:00:00", "0:10.00", "0.0", "/x/rustc"), self.ORPHAN))
         self.assertEqual(s["active_pids"], [41])
 
+    def test_an_unreadable_first_process_list_is_not_forgotten_by_a_readable_second(self):
+        first = dict(sample(0), heavy_procs=None, idle_procs=[], cpu_by_pid={})
+        m = ma.derive(first, sample(10))
+        self.assertIsNone(m["heavy_procs"])
+        verdict, _ = ma.decide("heavy", m, None, 1000.0)
+        self.assertFalse(verdict["admit"])
+        self.assertIn("process list unreadable", " ".join(verdict["reasons"]))
+
 
 if __name__ == "__main__":
     unittest.main()
