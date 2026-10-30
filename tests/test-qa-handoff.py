@@ -800,7 +800,7 @@ class ReviewFollowUpTests(Base):
 
     def test_a_signal_during_the_settle_window_still_leaves_a_hashed_interrupted_record(self):
         import signal
-        for sig in (signal.SIGTERM, signal.SIGINT):
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             run_dir = self.prepare()
             proc = subprocess.Popen([sys.executable, str(SCRIPT), "run", "--run-dir", str(run_dir), "--codex-bin", str(self.fake),
                                      "--admission-cmd", shlex.join(self.ADMIT), "--settle", "8"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -818,6 +818,16 @@ class ReviewFollowUpTests(Base):
             self.assertTrue(meta["interrupted"])
             self.assertEqual(self.result(run_dir)["state"], "QA_INCOMPLETE")
             self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 11)   # an interrupted run is never a pass
+
+    def test_a_locked_run_is_refused_before_admission_and_never_overwrites_the_result(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_qa(run_dir, admission=self.REFUSE)[0], 75)   # an earlier wait left a result
+        time.sleep(1.1)                                              # RESULT.json carries a timestamp: a rewrite would differ
+        (run_dir / "RUN.lock").write_text("")                        # another run is in progress for this directory
+        before = (run_dir / "RESULT.json").read_text()
+        code, out = self.run_qa(run_dir, admission=self.REFUSE)      # admission would also refuse right now
+        self.assertEqual(code, qa.EXIT["REFUSED"], out)
+        self.assertEqual((run_dir / "RESULT.json").read_text(), before)
 
 
 if __name__ == "__main__":
