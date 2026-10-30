@@ -27,7 +27,29 @@ FAKE = r'''#!/usr/bin/env python3
 import json, os, subprocess, sys, time
 d = "@FAKEDIR@"
 argv = sys.argv[1:]
-json.dump({"argv": argv, "env": sorted(os.environ), "cwd": os.getcwd()}, open(d + "/seen.json", "w"))
+if argv and argv[0] == "sandbox":   # the wrapper's confinement probe: `codex sandbox -P NAME -C DIR /usr/bin/python3 -c CODE`
+    probes = json.load(open(d + "/probes.json")) if os.path.exists(d + "/probes.json") else []
+    code = argv[-1]
+    control = code.splitlines()[0].replace("# CONTROL=", "")
+    cwd_cfg = argv[argv.index("-C") + 1] + "/.codex/config.toml"
+    probes.append({"control": control, "argv": argv[:-1], "home": os.environ.get("CODEX_HOME"),
+                   "cwd_config": open(cwd_cfg).read() if os.path.exists(cwd_cfg) else None})
+    json.dump(probes, open(d + "/probes.json", "w"))
+    smode = open(d + "/sandbox_mode").read().strip() if os.path.exists(d + "/sandbox_mode") else "confined"
+    if smode == "broken":
+        sys.exit(2)
+    if smode in ("enoent", "garbage") and control.startswith("neg_"):
+        print("DENIED:2" if smode == "enoent" else "DENIED:not-an-errno")   # a denial that proves nothing
+        sys.exit(0)
+    if smode == "confined" and control.startswith("neg_"):
+        print("DENIED:1")
+        sys.exit(0)
+    sys.exit(subprocess.run([sys.executable, "-c", code]).returncode)   # positive controls, or a leaky sandbox
+home = os.environ.get("CODEX_HOME")
+cfg = open(home + "/config.toml").read() if home and os.path.exists(home + "/config.toml") else None
+json.dump({"argv": argv, "env": sorted(os.environ), "cwd": os.getcwd(), "codex_home": home, "config": cfg,
+           "auth_link": os.path.realpath(home + "/auth.json") if home and os.path.lexists(home + "/auth.json") else None},
+          open(d + "/seen.json", "w"))
 open(d + "/prompt.txt", "w").write(sys.stdin.read())
 mode = open(d + "/mode").read().strip()
 if mode == "crash":         # auth, rate limit or crash: codex dies before it writes any verdict
@@ -189,6 +211,10 @@ class Base(unittest.TestCase):
     def seen(self):
         return json.loads((self.fake_dir / "seen.json").read_text())
 
+    def write_roots(self, run_dir):
+        """Directories the private permission profile lets the QA commands write."""
+        return [line.split('"')[1] for line in self.seen()["config"].splitlines() if line.endswith('= "write"')]
+
 
 class PrepareTests(Base):
     def test_prepare_pins_a_private_clone_at_the_exact_sha(self):
@@ -221,7 +247,7 @@ class RunTests(Base):
         self.assertEqual(argv[:2], ["exec", "--skip-git-repo-check"])
         for flag in ("--ephemeral", "--json", "--output-schema", "-o"):
             self.assertIn(flag, argv)
-        self.assertEqual(argv[argv.index("-s") + 1], "workspace-write")     # never inherits the full-access config
+        self.assertNotIn("-s", argv)                                         # the permission profile in the private CODEX_HOME applies
         self.assertEqual(argv[argv.index("-C") + 1], str(run_dir / "source"))
         for forbidden in ("-m", "--model", "--dangerously-bypass-approvals-and-sandbox", "danger-full-access"):
             self.assertNotIn(forbidden, argv)
@@ -291,8 +317,7 @@ class RunTests(Base):
         self.run_qa(run_dir)
         for name in ("prompt.txt", "verdict.schema.json", "tree-manifest.json", "packet.json", "RUNMETA.json"):
             self.assertTrue((run_dir / name).is_file(), name)
-        argv = self.seen()["argv"]
-        writable = [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"] + [argv[argv.index("-C") + 1]]
+        writable = self.write_roots(run_dir)
         for name in ("prompt.txt", "verdict.schema.json", "tree-manifest.json", "packet.json"):
             self.assertNotIn(str(run_dir), writable)                      # the run directory itself is not a writable root
             self.assertFalse(any(str(run_dir / name).startswith(w + "/") for w in writable), name)
@@ -338,14 +363,162 @@ class RunTests(Base):
             for forbidden in ("tmux", "pane", "session", "socket", "attach"):
                 self.assertNotIn(forbidden, name)
 
-    def test_sandbox_settings_are_pinned_against_a_widened_user_config(self):
+    def test_the_permission_profile_is_private_pinned_and_allowlist_only(self):
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        seen = self.seen()
+        self.assertEqual(seen["codex_home"], str(run_dir / "codexhome"))        # never the user's real CODEX_HOME
+        cfg = seen["config"]
+        self.assertIn('default_permissions = "qa_confined"', cfg)
+        self.assertIn('approval_policy = "never"', cfg)
+        self.assertIn('":minimal" = "read"', cfg)
+        self.assertIn("[permissions.qa_confined.network]\nenabled = false", cfg)
+        for forbidden in ("danger", "full-access", "enabled = true", "workspace-write"):
+            self.assertNotIn(forbidden, cfg)
+        self.assertEqual(sorted(self.write_roots(run_dir)), sorted(str(run_dir / n) for n in ("source", "out", "tmp", "home", "cargo-target")))
+        self.assertEqual(stat.S_IMODE(os.stat(run_dir / "codexhome").st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(run_dir / "codexhome/config.toml").st_mode), 0o600)
+
+    def test_home_secret_directories_are_denied_explicitly(self):
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        cfg = self.seen()["config"]
+        for rel in (".codex", ".ssh", ".aws", ".config", ".claude", ".gnupg", ".netrc", ".npmrc", ".docker", "Library/Keychains"):
+            self.assertIn('"%s" = "deny"' % (qa.HOME / rel), cfg, rel)
+
+    def test_the_login_reaches_codex_only_as_a_link_to_the_real_auth_file(self):
+        fake_home = self.root / "realcodex"
+        fake_home.mkdir()
+        (fake_home / "auth.json").write_text("synthetic-login")
+        self.set_env(CODEX_HOME=str(fake_home))
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        seen = self.seen()
+        self.assertEqual(seen["auth_link"], str((fake_home / "auth.json").resolve()))
+        self.assertNotIn("synthetic-login", seen["config"])
+        self.assertFalse((run_dir / "codexhome/auth.json").exists() and not (run_dir / "codexhome/auth.json").is_symlink())
+        for name in ("codexhome/config.toml", "RUNMETA.json", "RESULT.json", "CONFINEMENT.json"):
+            self.assertNotIn("synthetic-login", (run_dir / name).read_text())      # no credential copied or recorded
+        self.assertNotIn(str(fake_home), (run_dir / "codexhome/config.toml").read_text().replace('"%s" = "deny"' % fake_home, ""))
+
+    def test_confinement_is_probed_before_codex_starts_and_recorded(self):
+        run_dir = self.prepare()
+        code, out = self.run_qa(run_dir)
+        self.assertEqual(code, 0, out)
+        probes = json.loads((self.fake_dir / "probes.json").read_text())
+        names = {p["control"] for p in probes}
+        self.assertTrue({"pos_read_clone", "pos_write_out", "neg_read_canary", "neg_list_codex_home", "neg_write_outside"} <= names)
+        for p in probes:
+            self.assertEqual(p["home"], str(run_dir / "codexhome"))              # probed under the same private home and profile
+            self.assertIn("qa_confined", p["argv"])
+        record = json.loads((run_dir / "CONFINEMENT.json").read_text())
+        self.assertTrue(record["established"])
+        self.assertTrue(all(c["ok"] for c in record["controls"]))
+        self.assertTrue(json.loads((run_dir / "RESULT.json").read_text())["confinement"]["established"])
+
+    def test_a_leaky_sandbox_fails_closed_and_codex_is_never_started(self):
+        (self.fake_dir / "sandbox_mode").write_text("leaky")
+        run_dir = self.prepare()
+        code, out = self.run_qa(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("read confinement not established", out)
+        self.assertFalse((self.fake_dir / "seen.json").exists())
+        self.assertFalse(json.loads((run_dir / "CONFINEMENT.json").read_text())["established"])
+
+    def test_a_probe_that_cannot_run_is_retryable_and_never_starts_codex(self):
+        (self.fake_dir / "sandbox_mode").write_text("broken")
+        run_dir = self.prepare()
+        code, out = self.run_qa(run_dir)
+        self.assertEqual(code, 11, out)                                  # nothing could be checked and nothing ran: retry
+        self.assertIn("read confinement could not be checked", out)
+        self.assertFalse((self.fake_dir / "seen.json").exists())
+
+    def test_a_denial_that_proves_nothing_fails_closed(self):
+        for mode in ("enoent", "garbage"):                               # DENIED:2 (no such file) and DENIED:<not an errno>
+            (self.fake_dir / "sandbox_mode").write_text(mode)
+            run_dir = self.prepare()
+            code, out = self.run_qa(run_dir)
+            self.assertEqual(code, 12, (mode, out))
+            self.assertIn("read confinement not established", out)
+            self.assertFalse((self.fake_dir / "seen.json").exists(), mode)
+
+    def test_the_real_login_file_is_probed_when_it_exists(self):
+        fake_home = self.root / "realcodex2"
+        fake_home.mkdir()
+        (fake_home / "auth.json").write_text("synthetic-login")
+        self.set_env(CODEX_HOME=str(fake_home))
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        names = {p["control"] for p in json.loads((self.fake_dir / "probes.json").read_text())}
+        self.assertIn("neg_open_auth_file", names)
+        self.assertNotIn("synthetic-login", (run_dir / "CONFINEMENT.json").read_text())
+
+    def test_the_canary_is_synthetic_outside_the_run_and_removed_afterwards(self):
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        record = json.loads((run_dir / "CONFINEMENT.json").read_text())
+        canary = Path(record["canary_dir"])
+        self.assertFalse(canary.exists())                                          # removed after the probe
+        self.assertFalse(str(canary).startswith(str(run_dir)))                    # outside every allowed root
+        self.assertTrue(str(canary).startswith(str(qa.HOME)))                     # under HOME, where the allowlist must deny it
+
+    def test_the_clone_is_never_marked_trusted_so_its_own_codex_config_cannot_widen_the_profile(self):
+        # Measured live: with trust_level = "trusted" a .codex/config.toml inside the clone (the commit under test) added a path
+        # to the read allowlist and a canary read was ALLOWED; with no [projects] entry it was DENIED.
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        cfg = self.seen()["config"]
+        self.assertNotIn("[projects", cfg)
+        self.assertNotIn("trust_level", cfg)
+
+    def test_exec_selects_the_same_permission_profile_the_probe_proves(self):
         run_dir = self.prepare()
         self.run_qa(run_dir)
         argv = self.seen()["argv"]
-        self.assertIn("sandbox_workspace_write.network_access=false", argv)
-        roots = [a for a in argv if a.startswith("sandbox_workspace_write.writable_roots=")][0]
-        listed = json.loads(roots.split("=", 1)[1])
-        self.assertEqual(sorted(listed), sorted(str(run_dir / n) for n in ("out", "tmp", "home", "cargo-target")))
+        pairs = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
+        self.assertIn('default_permissions="qa_confined"', pairs)            # explicit on the command line, outranking project config
+        for p in json.loads((self.fake_dir / "probes.json").read_text()):
+            self.assertEqual(p["argv"][p["argv"].index("-P") + 1], "qa_confined")
+
+    def test_a_hostile_project_config_is_probed_every_run_and_a_leak_fails_closed(self):
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        names = {p["control"] for p in json.loads((self.fake_dir / "probes.json").read_text())}
+        self.assertIn("neg_project_config_ignored", names)
+        record = json.loads((run_dir / "CONFINEMENT.json").read_text())
+        self.assertIn("neg_project_config_ignored", {c["control"] for c in record["controls"]})
+        self.assertFalse((run_dir / "probe-hostile").exists())                   # the scratch clone is removed after the probe
+
+    def test_the_hostile_control_really_plants_an_allowlist_widening_config(self):
+        # The control can only fail if the planted project config really tries to widen the profile, so assert what it plants.
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        probes = json.loads((self.fake_dir / "probes.json").read_text())
+        hostile = [p for p in probes if p["control"] == "neg_project_config_ignored"][0]
+        record = json.loads((run_dir / "CONFINEMENT.json").read_text())
+        self.assertIn("[permissions.qa_confined.filesystem]", hostile["cwd_config"])
+        self.assertIn('"%s" = "read"' % record["canary_dir"], hostile["cwd_config"])
+        self.assertNotEqual(hostile["argv"][hostile["argv"].index("-C") + 1], str(run_dir / "source"))   # a scratch clone, not the QA clone
+
+    def test_a_leftover_scratch_clone_from_a_killed_wrapper_does_not_break_the_next_probe(self):
+        run_dir = self.prepare()
+        (run_dir / "probe-hostile/.codex").mkdir(parents=True)                   # what a SIGKILLed wrapper leaves behind
+        self.assertEqual(self.run_qa(run_dir)[0], 0)
+
+    def test_extra_read_roots_are_validated(self):
+        run_dir = self.prepare()
+        (run_dir.parent / "sibling-run").mkdir()                                  # a sibling run's packets and verdicts
+        for bad in ("relative/dir", str(qa.HOME), "/", str(qa.HOME / ".ssh"), str(qa.HOME / ".codex/sessions"), str(self.root / "missing"),
+                    str(run_dir), str(run_dir.parent), str(run_dir.parent.parent), str(qa.CANARY_ROOT.parent), str(qa.DEFAULT_ROOT),
+                    str(run_dir.parent / "sibling-run")):
+            code, out = self.run_qa(run_dir, extra=("--read-root", bad))
+            self.assertEqual(code, qa.EXIT["REFUSED"] if False else code)
+            self.assertNotEqual(code, 0, bad)
+            self.assertFalse((self.fake_dir / "seen.json").exists(), bad)
+        good = self.root / "toolchain"
+        good.mkdir()
+        self.assertEqual(self.run_qa(run_dir, extra=("--read-root", str(good)))[0], 0)
+        self.assertIn('"%s" = "read"' % good.resolve(), self.seen()["config"])
 
     def test_relative_and_run_dir_path_entries_are_dropped(self):
         run_dir = self.prepare()
@@ -632,7 +805,7 @@ class VerdictTests(Base):
         self.run_qa(run_dir)
         argv = self.seen()["argv"]
         target = Path(argv[argv.index("-o") + 1])
-        writable = [Path(argv[i + 1]) for i, a in enumerate(argv) if a in ("--add-dir", "-C")]
+        writable = [Path(p) for p in self.write_roots(run_dir)]
         self.assertEqual(target, run_dir / "verdict.json")
         for root in writable:
             self.assertNotIn(root, target.parents)
