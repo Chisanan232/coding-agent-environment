@@ -69,7 +69,10 @@ slash commands, project settings only and no session persistence, in an empty di
 fail). The founder's own `~/.claude/CLAUDE.md` still loads, because the login depends on the real HOME, so a PASS shows the whole
 loaded stack answering well, not that the repository file alone did. `--with-control` repeats each case without the repository
 file and marks a case STEERED only where the control fails; where it also passes the result is NOT_ATTRIBUTABLE. Judging is on
-prose, so a FAIL is a prompt to read the reply. The resumed and delegated contexts are reported NOT_RUN: they need a prior session
+prose with patterns, so it can pass a wrong stance phrased in a way nobody listed and it can fail a good reply: a PASS is not
+proof, a FAIL is a prompt to read the reply, and STEERED is itself weak (a control FAIL can be a pattern miss). The resumed and delegated contexts are reported NOT_RUN: they need a prior session
 or a real subagent and are not simulated. The behavior map (`docs/ENGINEERING-BASELINE.md`, "Required behavior map") and
 `tests/test-baseline-behavior-map.py` are the contract-level check that the behavior is still written down in the shared source
-and in both host entry points.
+and in both host entry points. The map proves a rule's phrases are present (clause-ending punctuation included, so an appended
+qualifier fails), not that the rule is unchanged; a reworded rule is caught by review and by the generated-span drift check
+(`build-baseline.py check`).
