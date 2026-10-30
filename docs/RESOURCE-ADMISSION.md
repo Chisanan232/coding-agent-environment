@@ -15,7 +15,7 @@ subagent fan-out. Run `scripts/memory-admission.py check --weight heavy` first; 
 | Physical RAM and compressed memory | `hw.memsize`, `vm_stat` "occupied by compressor" | A large compressor share means the machine is already holding memory it cannot drop cheaply |
 | Swap used **and** sustained swap I/O | `vm.swapusage`, swapins+swapouts over a measured window | Used swap alone is history; the I/O rate is current behaviour |
 | Disk and swap-growth headroom | free bytes of the Data volume | Swap files grow on that volume; a full disk means swap cannot grow |
-| Active build/test processes | executable names only (`cargo`, `rustc`, `clang`, `ld`, `xcodebuild`, ...) | One heavy lane at a time |
+| Active build/test processes | `ps` pid, ppid, state, elapsed and CPU time, %cpu and the executable name (`cargo`, `rustc`, `clang`, `ld`, `xcodebuild`, ...); never the command line | One heavy lane at a time; see "Idle orphans" below |
 | Load per core | `getloadavg` / CPU count | Scheduler saturation that RAM numbers do not show |
 | Reservations and ownership | the existing `disk-admission.py` gate (reserve, lane cap, process identity) | Task ownership already lives there; it is not duplicated |
 
@@ -104,3 +104,15 @@ binding; give the operator the exact command instead.
 1. Approve, change or reject the proposed thresholds above.
 2. Decide whether `disk-admission.py run` or a hook should call `memory-admission.py` automatically.
 3. Decide whether the SPE-109 gate itself should take a memory input (this change does not touch it).
+
+## Idle orphans (SPE-134)
+
+A heavy-named process is a running lane, not a name match. A process counts as an **idle orphan** only when all of these
+hold: its parent is launchd (ppid 1), its state is not running, uninterruptible or stopped (a stopped process is a deliberate pause that can resume), `%cpu` is at most 1.0, it has been alive
+for at least 15 minutes, and it spent no CPU between the two samples of the check (any increase, even 10 ms, or no first-sample reading at all, or having been counted as active in the first sample, makes it active). An idle orphan does not refuse
+heavy work. It is reported as a note with its pid, age and working directory (read with `lsof`, 4 seconds per call and never more than 8 seconds in total per sample, never the command line) so
+its owner can reclaim it; nothing is ever signalled. Everything else counts as an active lane, including a quiet process
+with a live parent (a `rustc` under `cargo` or a shell), and any line `ps` printed that cannot be parsed. An unreadable
+process list still fails closed. Load, memory pressure, swap and disk reasons are unchanged. The live parent chain is the
+ownership signal: an SPE-109 reservation is held by the job that reserved it, whose build processes have that job as a
+live ancestor, so a reservation-holding build is never an orphan; reservation records are not read here.
