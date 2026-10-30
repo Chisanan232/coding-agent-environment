@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import pathlib
 import stat
 import sys
@@ -625,6 +626,22 @@ class IdleOrphan(unittest.TestCase):
             orphan = ps_line(25830, 1, "S", "3-22:10:05", "0:10.00", pcpu, "/x/rustc")
             s = self.take(ps_out(good, orphan))
             self.assertEqual((s["heavy_procs"], s["idle_procs"]), ({"rustc": 1}, []), pcpu)   # never idle on a bogus reading
+
+    def test_a_stopped_orphan_counts_as_a_lane(self):
+        # SIGSTOP is a deliberate pause: the process holds its memory and disk and can be continued next to a second lane.
+        s = self.take(ps_out(ps_line(4242, 1, "T", "01:00:00", "0:05.00", "0.0", "/Users/x/.cargo/bin/cargo")))
+        self.assertEqual((s["heavy_procs"], s["idle_procs"]), ({"cargo": 1}, []))
+
+    def test_cwd_lookups_share_one_small_time_budget(self):
+        calls = []
+        def run(cmd, **kw):
+            calls.append(kw.get("timeout"))
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        recs = [{"pid": n, "comm": "rustc", "ppid": 1, "age_s": 3600, "cpu_s": 1.0, "cwd": None} for n in range(5)]
+        clock = iter(range(0, 1000, 4))                             # each lookup "takes" 4 seconds
+        ma.fill_cwds(recs, run, budget=8, now=lambda: next(clock))
+        self.assertLessEqual(len(calls), 3)
+        self.assertTrue(all(c is not None and c <= 5 for c in calls))
 
 
 if __name__ == "__main__":

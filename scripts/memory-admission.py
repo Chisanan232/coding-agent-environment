@@ -53,7 +53,9 @@ HEAVY_COMMS = frozenset({"cargo", "rustc", "rust-lld", "cc1", "cc1plus", "clang"
 IDLE_MIN_AGE = 900          # seconds
 IDLE_PCPU = 1.0             # ps %cpu, a decaying recent average
 MAX_IDLE_REPORT = 5
-IDLE_STATES = frozenset({"S", "I", "T", "Z"})   # first letter of the ps state; R (running) and U (uninterruptible) are work
+CWD_LOOKUP_TIMEOUT = 4      # seconds per lsof call
+CWD_LOOKUP_BUDGET = 8       # seconds for all cwd lookups of one sample
+IDLE_STATES = frozenset({"S", "I", "Z"})   # first letter of the ps state; R and U are work, T (stopped) is a deliberate pause that can resume
 DEFAULT_STATE = pathlib.Path.home() / ".cache/coding-agent-environment/memory-admission/state.json"
 REFUSE_RC = 77
 VALID_LEVELS = frozenset({1, 2, 4})   # the only values the kernel reports
@@ -99,15 +101,15 @@ def parse_vm_stat(text):
     return out if needed <= out.keys() else None
 
 
-def _run(cmd, run=subprocess.run):
+def _run(cmd, run=subprocess.run, timeout=20):
     try:
-        r = run(cmd, capture_output=True, text=True, timeout=20)
+        r = run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.stdout if r.returncode == 0 else None
     except (OSError, subprocess.SubprocessError):
         return None
 
 
-def parse_clock(text, days=True):
+def parse_clock(text):
     """ps elapsed/cpu time: [[dd-]hh:]mm:ss[.ss] -> seconds, or None when it is not that shape."""
     m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)", text or "")
     if not m:
@@ -167,11 +169,20 @@ def classify_heavy(ps_text):
 
 
 def lookup_cwd(pid, run):
-    out = _run([LSOF, "-a", "-d", "cwd", "-p", str(pid), "-Fn"], run)
+    out = _run([LSOF, "-a", "-d", "cwd", "-p", str(pid), "-Fn"], run, timeout=CWD_LOOKUP_TIMEOUT)
     for line in (out or "").splitlines():
         if line.startswith("n") and len(line) > 1:
             return "".join(c for c in line[1:] if c.isprintable())[:200]
     return None
+
+
+def fill_cwds(recs, run, budget=CWD_LOOKUP_BUDGET, now=time.monotonic):
+    """Best-effort cwd for the first few idle orphans; a stuck lsof can never stall an admission check beyond `budget`."""
+    start = now()
+    for rec in recs[:MAX_IDLE_REPORT]:
+        if now() - start >= budget:
+            break
+        rec["cwd"] = lookup_cwd(rec["pid"], run)
 
 
 def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu_fn=os.cpu_count, disk_free_fn=None, mono_fn=time.monotonic):
@@ -185,8 +196,7 @@ def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu
     # None = the process list could not be read (unknown), never "no heavy process"; empty output from a successful ps is
     # not "nothing running" either, because a live system always has processes.
     heavy, idle, cpus, active_pids = classify_heavy(_run([PS, "-axo", PS_FIELDS], run))
-    for rec in (idle or [])[:MAX_IDLE_REPORT]:
-        rec["cwd"] = lookup_cwd(rec["pid"], run)
+    fill_cwds(idle or [], run)
     try:
         load1 = load_fn()[0]
     except OSError:
