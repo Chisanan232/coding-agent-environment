@@ -962,7 +962,9 @@ LAUNCHD_ABSENT = 'Could not find domain'
 # An existing account with no GUI session answers `print gui/<uid>` with exit 125 and this text, and nothing on stdout (a
 # present session prints rc 0, an unknown uid answers 112 'Could not find domain'). Observed as the QA user and as root
 # against the real QA account and an unused one (SPE-145 part 5), so the exit code and text alone are not trusted: the
-# QA user's launchd manager must be a background one and none of its processes may belong to a GUI session.
+# QA user's launchd manager must be a background one and none of its processes may belong to a GUI session. `managername`
+# was never observed on an account that has a GUI session, and sudo may hand the command the caller's bootstrap, so the
+# process check is the one that discriminates; neither check sees a GUI session that appears after it.
 LAUNCHD_NO_SESSION = (125, 'Domain does not support specified action')
 BACKGROUND_MANAGERS = ('Background', 'System')
 GUI_SESSION_PROCESSES = frozenset({'loginwindow', 'WindowServer', 'Dock', 'Finder', 'SystemUIServer', 'ControlCenter',

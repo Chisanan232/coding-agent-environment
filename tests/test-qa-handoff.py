@@ -1625,7 +1625,7 @@ class LaunchdDomainTests(unittest.TestCase):
             answers["launchctl:gui"] = (0, "gui/530 = {\n}\n", "")
             self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))
             answers["launchctl:gui"] = (125, "", "Could not print domain: 125: Domain does not support specified action\n")
-            self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))   # 125 alone is not trusted
+            self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))   # 125 alone is not trusted (see LaunchdGuiAbsentTests)
             answers["launchctl:gui"] = (1, "", "sudo: a password is required\n")
             self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))
 
@@ -1719,6 +1719,18 @@ class LaunchdGuiAbsentTests(unittest.TestCase):
 
     def test_a_timeout_is_a_problem(self):
         self.assertTrue(self.gui_problems(timeout_on="launchctl"))
+
+    def test_a_timeout_while_corroborating_is_a_problem(self):
+        def raises(argv, **kwargs):
+            if argv[-1] == "managername" or argv[0] == qa.PS:
+                raise subprocess.TimeoutExpired(argv, 30)
+            return subprocess.CompletedProcess(argv, 125, "", self.NO_SESSION)
+        with unittest.mock.patch.object(qa.subprocess, "run", raises):
+            self.assertTrue(qa.no_gui_session_problems(self.IDENT, "gui/530"))
+
+    def test_zombies_and_vanished_processes_are_skipped(self):
+        with unittest.mock.patch.object(qa.os, "kill", side_effect=ProcessLookupError):
+            self.assertEqual(self.gui_problems(ps=(0, "52266 Z\n93967 S\n", ""), paths={}), [])
 
 
 class SiblingFileTests(unittest.TestCase):
