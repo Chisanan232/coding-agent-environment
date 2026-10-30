@@ -1229,7 +1229,11 @@ def run_identity(args, run_dir, packet, source, ident):
             signal.signal(sig, signal.SIG_IGN)
         try:
             if have_lock:
-                downgraded = cleanup_sweep(run_dir, ident, keepalive)   # whatever happened, no QA-user process outlives the run
+                try:
+                    unclean = cleanup_sweep(run_dir, ident, keepalive)   # whatever happened, no QA-user process outlives the run
+                except Exception:   # cleanup_sweep itself failed (disk, pipe): the QA user is not confirmed idle either
+                    unclean = True
+                downgraded = unclean and outcome == EXIT['QA_PASS']
                 try:
                     os.unlink(lock)
                 except OSError:
@@ -1243,30 +1247,35 @@ def run_identity(args, run_dir, packet, source, ident):
 
 def cleanup_sweep(run_dir, ident, keepalive):
     """The last sweep of a run. A sweep that could not run or left survivors is never silent: one line for the owner, and
-    CLEANUP.json, which RESULT.json carries as `cleanup` (also after `verdict`). A QA_PASS cannot stand on it: the QA
-    user may still be running something, so a sealed QA_PASS becomes QA_INVALID. Any other state is left as sealed. Returns
-    True when it downgraded a pass."""
+    CLEANUP.json, which RESULT.json carries as `cleanup` (also after `verdict`). A QA_PASS cannot stand on it: run_identity
+    turns the exit code into QA_INVALID, and RESULT.json is rewritten on a best-effort basis (`verdict` enforces it from
+    CLEANUP.json). Returns True when the QA user was not confirmed idle. Nothing here raises: the lock must still go."""
     refreshed = False
     swept = None
+    error = None
     try:
         try:
             refreshed = keepalive.refresh()
             swept = sweep_identity(ident)
         finally:
             keepalive.stop()
-    except Exception:   # an unexpected failure is "could not run", exactly as loud as a refused sweep
+    except Exception as exc:   # an unexpected failure is "could not run", exactly as loud as a refused sweep
         swept = None
+        error = type(exc).__name__
     if refreshed and swept == 0 and type(swept) is int:
         return False
-    note = {'sweep': swept, 'sudo_refreshed': refreshed, 'sudo_keepalive': keepalive.summary(),
+    note = {'sweep': swept, 'sudo_refreshed': refreshed, 'sudo_keepalive': keepalive.summary(), 'error': error,
             'note': 'QA-user processes may survive; run `sudo -v` in the owner Terminal, then the next run\'s pre-sweep '
                     'removes them'}
-    print('NOTE QA-user processes may survive this run (cleanup sweep %s%s); run `sudo -v` in the owner Terminal, then '
-          'the next run\'s pre-sweep removes them' % ('could not run' if swept is None else '%s left' % swept,
-                                                      '' if refreshed else ', sudo -n refused'))
-    write_private(run_dir / 'CLEANUP.json', note)
-    downgraded = False
     try:
+        print('NOTE QA-user processes may survive this run (cleanup sweep %s%s); run `sudo -v` in the owner Terminal, then '
+              'the next run\'s pre-sweep removes them' % ('could not run' if swept is None else '%s left' % swept,
+                                                          '' if refreshed else ', sudo -n refused'))
+        print('QA_INVALID final cleanup sweep did not confirm the QA user is idle; any QA_PASS printed above does not stand')
+    except OSError:
+        pass
+    try:
+        write_private(run_dir / 'CLEANUP.json', note)
         result = read_run_json(run_dir / 'RESULT.json')
         if isinstance(result, dict):
             result['cleanup'] = note
@@ -1274,12 +1283,10 @@ def cleanup_sweep(run_dir, ident, keepalive):
                 result['state'] = 'QA_INVALID'
                 result['reasons'] = [clean('final cleanup sweep %s: QA-user processes may still be running, so a pass is not clean'
                                            % ('could not run' if swept is None else 'left %s' % swept))] + list(result.get('reasons') or [])
-                downgraded = True
-                print('QA_INVALID final cleanup sweep did not confirm the QA user is idle; the pass above does not stand')
             write_private(run_dir / 'RESULT.json', result)
-    except LOAD_ERRORS:
+    except (OSError, ValueError, *LOAD_ERRORS):
         pass
-    return downgraded
+    return True
 
 
 def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
