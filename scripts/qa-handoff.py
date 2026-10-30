@@ -592,7 +592,10 @@ def run_locked(args, run_dir, packet, source):
     # Installed before codex starts and kept until the run record is written, so no window leaves a signal to kill the
     # wrapper without a record (the settle sleep included).
     old = signal.signal(signal.SIGTERM, interrupted)
-    old_hup = signal.signal(signal.SIGHUP, interrupted)   # a closed terminal or dropped ssh must not strand codex either
+    # A closed terminal or dropped ssh must not strand codex either, but a deliberate `nohup` (SIGHUP ignored on entry) stays ignored.
+    old_hup = signal.getsignal(signal.SIGHUP)
+    if old_hup is not signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, interrupted)
     try:
         with open(events, 'wb') as ev, open(run_dir / 'stderr.log', 'wb') as err:
             os.chmod(events, 0o600)
@@ -624,7 +627,8 @@ def run_locked(args, run_dir, packet, source):
         write_meta(run_dir, argv, proc, t0, timed_out, events)
     finally:
         signal.signal(signal.SIGTERM, old)
-        signal.signal(signal.SIGHUP, old_hup)
+        if old_hup is not signal.SIG_IGN:
+            signal.signal(signal.SIGHUP, old_hup)
     return evaluate(run_dir)
 
 

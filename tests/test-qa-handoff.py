@@ -855,6 +855,21 @@ class ReviewFollowUpTests(Base):
         self.assertEqual(self.run_qa(run_dir)[0], qa.EXIT["REFUSED"])
         self.assertEqual((run_dir / "RESULT.json").read_text(), before)
 
+    def test_an_inherited_ignore_of_sighup_is_kept_so_nohup_runs_survive(self):
+        import signal
+        run_dir = self.prepare()
+        proc = subprocess.Popen([sys.executable, str(SCRIPT), "run", "--run-dir", str(run_dir), "--codex-bin", str(self.fake),
+                                 "--admission-cmd", shlex.join(self.ADMIT), "--settle", "4"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))   # what `nohup` does
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        deadline = time.time() + 40
+        while time.time() < deadline and not (run_dir / "verdict.json").exists():
+            time.sleep(0.05)
+        proc.send_signal(signal.SIGHUP)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, err)                  # the hang-up was ignored; the run completed and passed
+        self.assertFalse(json.loads((run_dir / "RUNMETA.json").read_text())["interrupted"])
+
 
 if __name__ == "__main__":
     unittest.main()
