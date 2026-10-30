@@ -313,12 +313,12 @@ def has_workflows(run, repo, ref):
     return True
 
 
-def no_hosted_ci(run, repo, base, head, files):
+def no_hosted_ci(run, repo, base, head, files, cross_repository=False):
     """True only when no workflow exists at the base or at the reviewed head and the PR changes none (a PR that adds a
     workflow which has not run yet must not use the exception). Unknown or truncated file lists refuse."""
-    if not files or len(files) >= 100:
+    if cross_repository or not files or len(files) >= 100:   # a fork's head commit is not readable through the base repository
         return False
-    if any(str(f.get("path", "")).startswith(".github/workflows/") for f in files):
+    if any(".github/workflows" in str(f.get("path", "")).casefold() for f in files):
         return False
     return not has_workflows(run, repo, base) and not has_workflows(run, repo, head)
 
@@ -492,7 +492,7 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
         noci = [m for t in texts for m in NOCI_RE.findall(t) if m[0] == head and m[1] == "PASS"]
         if ci_unavailable and ci and not checks:
             facts["ci_exception"] = ci[-1][1]
-        elif ci_exception and noci and not checks and no_hosted_ci(run, repo, base, head, p.get("files") or []):
+        elif ci_exception and noci and not checks and no_hosted_ci(run, repo, base, head, p.get("files") or [], bool(p.get("isCrossRepository"))):
             facts["ci_exception"] = "no-hosted-ci"
         else:
             reasons.append("NO_CI_EVIDENCE: no completed checks on this head and no qualified CI_UNAVAILABLE_EXTERNAL record")

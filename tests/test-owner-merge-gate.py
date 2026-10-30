@@ -208,11 +208,15 @@ class Gate(unittest.TestCase):
         self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(), workflows={"main": 1, "*": None}), "NO_CI_EVIDENCE", ci_exception=True)
 
     def test_a_pr_that_adds_or_touches_a_workflow_or_has_an_unknown_file_list_cannot_use_the_exception(self):
-        for files in ([{"path": ".github/workflows/ci.yml"}], [{"path": "src/a.py"}, {"path": ".github/workflows/x.yml"}], [], [{"path": f"f{i}"} for i in range(100)]):
+        for files in ([{"path": ".github/workflows/ci.yml"}], [{"path": "src/a.py"}, {"path": ".github/workflows/x.yml"}],
+                      [{"path": ".GitHub/Workflows/x.yml"}], [{"path": "pkg/.github/workflows/a.yml"}], [], [{"path": f"f{i}"} for i in range(100)]):
             with self.subTest(files=files[:2]):
                 self.refused(Fake(statusCheckRollup=[], comments=self.noci_comments(), files=files), "NO_CI_EVIDENCE", ci_exception=True)
         v, _, _ = run(Fake(statusCheckRollup=[], comments=self.noci_comments(), files=SRC), ci_exception=True)
         self.assertEqual(v, "PASS")
+
+    def test_a_pull_request_from_a_fork_cannot_use_the_exception(self):
+        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(), isCrossRepository=True), "NO_CI_EVIDENCE", ci_exception=True)
 
     def test_a_check_that_ran_without_failing_still_blocks_the_exception(self):
         for conclusion in ("SKIPPED", "NEUTRAL", "SUCCESS"):
