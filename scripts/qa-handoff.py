@@ -40,6 +40,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -54,6 +55,12 @@ FAILING = ('Critical', 'High', 'Medium')
 # REFUSED is a usage refusal (the run directory is not runnable) and writes no RESULT.json; NOT_RUN and WAITING_RESOURCE
 # both mean codex never started, so the same attempt can be run again.
 EXIT = {'QA_PASS': 0, 'QA_FAIL': 10, 'QA_INCOMPLETE': 11, 'QA_INVALID': 12, 'REFUSED': 64, 'WAITING_RESOURCE': 75, 'NOT_RUN': 75}
+PROFILE = 'qa_confined'
+# Directories under HOME that hold credentials. Directory rules only: the Codex permission profile does not take globs.
+SECRET_DIRS = ('.codex', '.ssh', '.aws', '.config', '.claude', '.gnupg', '.netrc', '.npmrc', '.docker', '.kube',
+               'Library/Keychains', '.cargo/credentials.toml', '.cargo/credentials')
+SYSTEM_READ = ('/usr', '/bin', '/opt/homebrew', '/Library/Developer/CommandLineTools')
+CANARY_ROOT = HOME / '.local/state/coding-agent-environment/qa-canary'
 ENV_ALLOW = ('PATH', 'LANG', 'LC_ALL', 'TERM', 'TZ', 'USER', 'LOGNAME', 'SHELL')
 
 STR = {'type': 'string'}
@@ -423,28 +430,124 @@ def isolated_env(run_dir):
     env.update({'HOME': home, 'TMPDIR': str(run_dir / 'tmp'), 'XDG_CONFIG_HOME': home + '/.config',
                 'XDG_DATA_HOME': home + '/.local/share', 'XDG_CACHE_HOME': home + '/.cache',
                 'CARGO_TARGET_DIR': str(run_dir / 'cargo-target'), 'CARGO_NET_OFFLINE': 'true',
-                # Codex finds its own login here; no credential is copied into the isolated HOME.
-                'CODEX_HOME': os.environ.get('CODEX_HOME') or str(HOME / '.codex')})
+                # A private Codex home holding only the permission profile and a link to the login (codex_home()).
+                'CODEX_HOME': str(run_dir / 'codexhome')})
     if os.environ.get('CARGO_HOME'):
         env['CARGO_HOME'] = os.environ['CARGO_HOME']
     return env
 
 
+def real_codex_home():
+    return Path(os.environ.get('CODEX_HOME') or HOME / '.codex')
+
+
+def valid_read_root(text):
+    """An extra read-only root for toolchains (for example a Rust toolchain under HOME). Absolute, existing, a directory,
+    and never HOME itself, the filesystem root, or anything at or below a credential directory."""
+    path = Path(text)
+    if not path.is_absolute() or not path.is_dir():
+        return None
+    resolved = path.resolve()
+    if resolved in (HOME, Path('/'), HOME.parent):
+        return None
+    for rel in SECRET_DIRS:
+        secret = HOME / rel
+        if resolved == secret or secret in resolved.parents or resolved in secret.parents:
+            return None
+    if real_codex_home().resolve() in (resolved, *resolved.parents) or resolved in real_codex_home().resolve().parents:
+        return None
+    return resolved
+
+
+def profile_toml(run_dir, read_roots=()):
+    """Allowlist-only reads, writes confined to the clone and scratch, no network. Measured by the AASM QA campaign with
+    `codex sandbox -P` and a real `codex exec` on codex-cli 0.163.0; the wrapper re-proves it before every run (see
+    confinement_probe). NOT enforced by the seatbelt: other processes' environments of the same OS user stay readable."""
+    fs = {':minimal': 'read'}
+    for root in SYSTEM_READ:
+        fs[root] = 'read'
+    for root in read_roots:
+        fs[str(root)] = 'read'
+    for sub in ('source', 'out', 'tmp', 'home', 'cargo-target'):
+        fs[str(run_dir / sub)] = 'write'
+    for rel in SECRET_DIRS:
+        fs[str(HOME / rel)] = 'deny'
+    fs[str(real_codex_home())] = 'deny'
+    lines = ['approval_policy = "never"', 'cli_auth_credentials_store = "file"', 'default_permissions = "%s"' % PROFILE, '',
+             '[projects.%s]' % json.dumps(str(run_dir / 'source')), 'trust_level = "trusted"', '',
+             '[permissions.%s.filesystem]' % PROFILE]
+    lines += ['%s = "%s"' % (json.dumps(k), v) for k, v in fs.items()]
+    lines += ['', '[permissions.%s.network]' % PROFILE, 'enabled = false', '']
+    return '\n'.join(lines)
+
+
+def prepare_codex_home(run_dir, read_roots=()):
+    """A private CODEX_HOME per run: the permission profile, and the login only as a link to the real auth file. The link
+    is readable by the Codex client (not sandboxed) and denied to the tool commands, whose profile denies the real home.
+    A private home also stops the user's own MCP servers and hooks from loading."""
+    home = run_dir / 'codexhome'
+    home.mkdir(mode=0o700, exist_ok=True)
+    write_private(home / 'config.toml', profile_toml(run_dir, read_roots))
+    auth = real_codex_home() / 'auth.json'
+    link = home / 'auth.json'
+    if auth.exists() and not os.path.lexists(link):
+        os.symlink(auth.resolve(), link)
+    return home
+
+
+CONTROLS = (
+    # (name, python snippet printing ALLOWED or DENIED:<errno>; the name is the first line so a test double can tell them apart)
+    ('pos_read_clone', "import sys\ntry:\n    open({clone!r} + '/.git/HEAD').read()\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'ALLOWED'),
+    ('pos_write_out', "import sys\ntry:\n    open({out!r} + '/probe.txt', 'w').write('x')\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'ALLOWED'),
+    ('neg_read_canary', "import sys\ntry:\n    open({canary!r}, 'rb').read()\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
+    ('neg_list_codex_home', "import os\ntry:\n    os.listdir({codex_home!r})\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
+    ('neg_write_outside', "import sys\ntry:\n    open({canary_dir!r} + '/written.txt', 'w').write('x')\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
+)
+
+
+def confinement_probe(codex_bin, run_dir, env):
+    """Prove, with the exact private home and profile the QA run will use, that a tool command cannot read a planted
+    synthetic canary under HOME or list the real Codex home, cannot write outside the roots, and still can read the clone
+    and write the out directory. Uses `codex sandbox -P` (no model). Any failed or unrunnable control means the run does not
+    start. Returns (record, problems); the canary is removed afterwards."""
+    token = os.urandom(8).hex()
+    canary_dir = CANARY_ROOT / token
+    canary_dir.mkdir(parents=True, mode=0o700)
+    canary = canary_dir / 'canary.txt'
+    canary.write_text('synthetic-qa-canary-%s' % token)
+    values = {'clone': str(run_dir / 'source'), 'out': str(run_dir / 'out'), 'canary': str(canary), 'canary_dir': str(canary_dir),
+              'codex_home': str(real_codex_home())}
+    results, problems = [], []
+    try:
+        for name, snippet, expect in CONTROLS:
+            code = '# CONTROL=%s\n%s' % (name, snippet.format(**values))
+            argv = [codex_bin, 'sandbox', '-P', PROFILE, '-C', str(run_dir / 'source'), '/usr/bin/python3', '-c', code]
+            try:
+                done = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=env)
+                got = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else ''
+                ok = done.returncode == 0 and got.split(':')[0] == expect
+                detail = got or 'exit %s' % done.returncode
+            except (OSError, subprocess.SubprocessError) as error:
+                ok, detail = False, type(error).__name__
+            results.append({'control': name, 'expected': expect, 'observed': clean(detail, 40), 'ok': ok})
+            if not ok:
+                problems.append('%s expected %s, observed %s' % (name, expect, clean(detail, 40)))
+    finally:
+        for leftover in (canary_dir / 'written.txt', canary, canary_dir):
+            try:
+                leftover.unlink() if leftover.is_file() else leftover.rmdir()
+            except OSError:
+                pass
+    return {'profile': PROFILE, 'established': not problems, 'controls': results, 'canary_dir': str(canary_dir)}, problems
+
+
 def codex_argv(codex_bin, run_dir):
-    """Explicit sandbox flags on every call: the user's Codex config is full-access with approvals off, so a missing
-    flag would hand the QA run the real home. No -m: model routing is not touched."""
-    source = run_dir / 'source'
+    """The permission profile in the private CODEX_HOME applies; there is deliberately no -s, --add-dir or sandbox -c
+    override (the legacy write-only sandbox). No -m: model routing is not touched."""
     # -o is written by the codex client itself, which is NOT sandboxed (only its tool commands are). It therefore points
     # into the run directory, which the QA process cannot write, so a link planted by QA can never redirect that write.
-    argv = [codex_bin, 'exec', '--skip-git-repo-check', '--json', '--ephemeral', '-s', 'workspace-write',
-            '-C', str(source), '--output-schema', str(run_dir / 'verdict.schema.json'), '-o', str(run_dir / 'verdict.json')]
-    roots = [str(run_dir / sub) for sub in ('out', 'tmp', 'home', 'cargo-target')]
-    for root in roots:
-        argv += ['--add-dir', root]
-    # Pin the sandbox's own settings so a widened user config (extra writable roots, network) cannot reach the QA run.
-    argv += ['-c', 'sandbox_workspace_write.network_access=false',
-             '-c', 'sandbox_workspace_write.writable_roots=%s' % json.dumps(roots)]
-    return argv + ['-']
+    return [codex_bin, 'exec', '--skip-git-repo-check', '--json', '--ephemeral', '-C', str(run_dir / 'source'),
+            '--output-schema', str(run_dir / 'verdict.schema.json'), '-o', str(run_dir / 'verdict.json'), '-']
 
 
 def count_commands(events_path):
@@ -517,6 +620,12 @@ def run(args):
         return refuse('this run directory has already been run; prepare a new attempt')
     if os.path.lexists(run_dir / 'RUN.lock'):
         return refuse('a run is in progress or was interrupted for this directory; prepare a new attempt')
+    read_roots = []
+    for text in getattr(args, 'read_root', None) or []:
+        root = valid_read_root(text)
+        if root is None:
+            return refuse('--read-root must be an existing absolute directory that is not HOME, / or a credential directory')
+        read_roots.append(root)
     packet = load_packet(run_dir)
     source = run_dir / 'source'
     try:
@@ -534,7 +643,7 @@ def run(args):
     except FileExistsError:
         return refuse('a run is in progress or was interrupted for this directory; prepare a new attempt')
     try:
-        return run_locked(args, run_dir, packet, source)
+        return run_locked(args, run_dir, packet, source, read_roots)
     except KeyboardInterrupt:      # Ctrl-C or SIGTERM: codex's group is killed and a hashed run record written; evaluate it
         if (run_dir / 'RUNMETA.json').exists():
             return evaluate(run_dir)
@@ -567,7 +676,7 @@ def write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=False):
     write_private(run_dir / 'RUNMETA.json', meta)
 
 
-def run_locked(args, run_dir, packet, source):
+def run_locked(args, run_dir, packet, source, read_roots=()):
     out = run_dir / 'out'
     # Wrapper-owned inputs sit in the run directory itself, which the QA sandbox cannot write (only source, out, tmp,
     # home and cargo-target are writable roots).
@@ -583,6 +692,15 @@ def run_locked(args, run_dir, packet, source):
         os.unlink(run_dir / 'verdict.json')
     except FileNotFoundError:
         pass
+    # Reads are confined by a private permission profile; prove it with this exact home before any model starts, and
+    # never run unconfined: a control that fails or cannot run means the run does not start.
+    if not shutil.which(args.codex_bin):   # nothing can run, so nothing ran: retryable, not an integrity failure
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['codex could not be started (FileNotFoundError)'])
+    prepare_codex_home(run_dir, read_roots)
+    record, problems = confinement_probe(args.codex_bin, run_dir, isolated_env(run_dir))
+    write_private(run_dir / 'CONFINEMENT.json', record)
+    if problems:
+        return write_result(run_dir, packet, 'QA_INVALID', ['read confinement not established: ' + '; '.join(problems[:3])])
     t0 = time.time()
     timed_out = False
     proc = None
@@ -755,7 +873,13 @@ def evaluate_files(run_dir, packet):
     if bad:
         return write_result(run_dir, packet, 'QA_INVALID', bad)
     created, truncated = untracked_created(run_dir / 'source', manifest)
-    extra = {'criteria_sha256': hashlib.sha256(packet['criteria'].encode()).hexdigest(),
+    try:
+        confinement = read_run_json(run_dir / 'CONFINEMENT.json')
+        confinement = {'profile': confinement['profile'], 'established': confinement['established'],
+                       'controls_passed': sum(1 for c in confinement['controls'] if c['ok']), 'controls': len(confinement['controls'])}
+    except LOAD_ERRORS:
+        confinement = None
+    extra = {'confinement': confinement, 'criteria_sha256': hashlib.sha256(packet['criteria'].encode()).hexdigest(),
              'verdict_sha256': meta['verdict_sha256'], 'events_sha256': meta['events_sha256'],
              'commands_completed': commands_completed, 'commands_succeeded': commands_succeeded,
              'codex_exit_code': meta['exit_code'], 'untracked_files_present': len(created) if not truncated else 'many',
@@ -806,6 +930,8 @@ def build_parser():
     r = sub.add_parser('run')
     r.add_argument('--run-dir', required=True)
     r.add_argument('--timeout', type=int, default=1800)
+    r.add_argument('--read-root', action='append', default=[], metavar='DIR',
+                   help='extra read-only directory for toolchains (absolute; not HOME, / or a credential directory)')
     r.add_argument('--codex-bin', default='codex', help=argparse.SUPPRESS)       # test hook
     r.add_argument('--settle', type=float, default=SETTLE_SECONDS, help=argparse.SUPPRESS)  # test hook
     r.add_argument('--admission-cmd', type=shlex.split, help=argparse.SUPPRESS)   # test hook (one quoted string)
