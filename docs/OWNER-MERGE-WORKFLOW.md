@@ -56,11 +56,38 @@ Only with a verified billing, quota or outage cause: run the full local equivale
 `OWNER-MERGE-CI-UNAVAILABLE head=<sha> cause=<billing|quota|outage> local_equivalent=PASS`,
 and pass `--ci-unavailable`. Any genuinely failing check still refuses.
 
+## Version integration branches (Development-Ahead / Sequential Release)
+
+`main` is the protected cumulative release baseline. A founder-approved version integration branch (for example
+`integration/mvp-5.0`, or `mvp-4.0/HORO-2046/integration`) may receive eligible feature PRs before that version ships; future-version
+work never enters `main` early. The gate recognises such a base only when it is listed in an explicit policy file:
+
+```json
+{"schema": 1, "repos": {"Owner/Repo": {"branches": [{"branch": "integration/mvp-5.0", "version": "5.0"}],
+                                       "future_head_prefixes": ["mvp-6.0/"]}}}
+```
+
+- Path: `--version-policy FILE`, else `~/.config/coding-agent-environment/local/version-branches.json` when it exists. It is local, owner-governed,
+  a regular file owned by the caller and not group/world-writable. It lives outside every product repository, so a PR cannot authorize its own
+  base. No file means the previous behaviour (every non-default base is refused).
+- Naming is never inferred; only listed branches count, per repository. A `release`/`prod`/`deploy`/`gh-pages` branch cannot be listed (the
+  policy refuses to load).
+- Listing a base changes one thing: `BASE_NOT_DEFAULT_OR_DEPLOY` no longer applies to it. Exact-head independent review, CI, threads,
+  conflicts, staleness, class and merge-commit rules are evaluated exactly as for `main`.
+- A PR into the default branch whose head is a listed integration branch (or starts with a `future_head_prefixes` entry) is refused with
+  `FUTURE_VERSION_INTO_MAIN`. Promoting an integration branch to `main` is a release step with its own founder GO; this gate never performs it.
+- Known limit: the `FUTURE_VERSION_INTO_MAIN` check is by head name (case-insensitive), not commit ancestry. A differently named branch cut from an
+  integration branch is not detected by this gate; the exact-head independent review must check that no future-version commits are included.
+- A path segment that starts with an environment word cannot be listed: `staged`/`stage`, `staging`, `stg`, `beta`, `alpha`, `canary`, `hotfix`, `uat`, `preprod`, `qa`, `live` as a bare prefix (so `staging-eu`, `stagingeu`, `betafix`, `stg2`, `qa2` and `livefix` too), and any of those words (plus `prd`, `prod`, `production`, `release`, `deploy`, `sandbox`) as a whole `-`/`/`/`.`/`_`-separated token anywhere in the name (`mvp-staging`, `x-beta`, `mvp-qa`). A future-head prefix is a literal `startswith` (`mvp-6.0/` does not cover a head named exactly `mvp-6.0`; list that branch under `branches`), and a future head is refused only into the default branch, not into another listed version line. This is a deliberate fail-closed over-match: rename the branch instead of listing it. A name that is not a valid git ref (an empty, dot-leading, dot-trailing or `.lock` component, `..`) cannot be listed either. Base matching is case-exact; head (future-version) matching is case-insensitive. An invalid entry makes the whole policy fail to load
+  (exit 3, nothing is approved), never a partial approval.
+- Loader limits (SPE-133): the file is read without blocking (a FIFO or device is refused), at most 64 KiB, with `schema` exactly integer `1`, a regular file rather than a symlink, no duplicate JSON keys, `future_head_prefixes` a list of non-empty refs, and no `//` in any ref. Directories above the owner-config root are not permission-checked.
+- Adding or removing an entry is a founder decision recorded outside the PR it unblocks.
+
 ## What this does not do
 
 `PASS` means every check GitHub reported on that head passed (at least one succeeded); it cannot know
 which checks a repository should have. It does not approve a PR, satisfy a required formal review, change branch protection, merge
-into a release or deployment branch, or authorize deployment or publication (it cannot see whether merging to the default branch deploys).
+into a release or deployment branch (or promote an integration branch to the default branch), or authorize deployment or publication (it cannot see whether merging to the default branch deploys).
 
 ## Merge decision: ALLOW / ASK / DENY (SPE-118)
 
