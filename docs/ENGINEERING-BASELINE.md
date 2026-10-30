@@ -11,7 +11,7 @@ Everything in a block is advisory text the model reads, except what
 `docs/ENGINEERING-POLICY.md` §3 lists as enforced. A block does not implement scheduling,
 dispatch, enforcement or recovery; it points at the reviewed tool that does.
 Specialised procedure lives in skills and loads only when it applies
-(`ship-product`, `verify-product`, `engineering-workflow`, `decision-delegation`).
+(`engineering-workflow`, `decision-delegation`, `acceptance-validation`).
 Size budget: all blocks together ≤ 8 KiB, checked by the build script.
 
 <!-- block:standing-contract -->
