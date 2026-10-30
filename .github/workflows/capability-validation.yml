@@ -153,6 +153,7 @@ jobs:
           python3 tests/test-launcher-runtime.py
           python3 tests/test-campaign-resume.py
           python3 tests/test-disk-admission-gate.py
+          python3 tests/test-admission-queue.py
           python3 tests/test-disk-admission.py
           python3 tests/test-hook-rollout.py
           python3 tests/test-owner-merge-gate.py
