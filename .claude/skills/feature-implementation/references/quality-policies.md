@@ -9,7 +9,7 @@ Moved verbatim from `.claude/CLAUDE.md`; that file keeps a short pointer.
 - Test behavior, not implementation. Tests must not assert on private internals.
 - Do not disable failing tests. Fix them or escalate.
 - Coverage is a metric, not the goal. Meaningful tests matter more than coverage %.
-- Run impacted tests during iteration. Run the full suite before committing.
+- Run impacted tests during iteration. Run the relevant full validation at meaningful checkpoints and before a PR is ready, not after every commit; record the exact tested revision.
 
 > **Project-specific**: test runner, coverage tool, fixture strategy, mocking library,
 > test directory layout, coverage threshold, and database test strategy belong in the
@@ -24,7 +24,7 @@ Moved verbatim from `.claude/CLAUDE.md`; that file keeps a short pointer.
 - Suppress type errors only with the language-specific scoped suppression mechanism,
   never suppress an entire file or block without a documented reason.
 - Type annotations must never change runtime behavior.
-- Run the configured type checker before every commit.
+- Run the configured type checker at each validation checkpoint and before a PR is ready; pre-commit keeps only fast lint and format checks per commit.
 
 > **Project-specific**: which type checker (mypy, pyright, tsc, etc.), config file
 > location, and language-specific annotation syntax belong in the project's `.claude/CLAUDE.md`.
