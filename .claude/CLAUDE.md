@@ -164,6 +164,15 @@ Standing contract (universal; specialised procedure loads only when it applies):
 - Secrets are opaque capabilities: use them, verify presence only, never print or log a value.
 <!-- coding-agent-environment:baseline:standing-contract:end -->
 
+<!-- coding-agent-environment:baseline:campaign-completion:start -->
+Campaign completion (mission and stop condition; detailed loop in `decision-delegation`):
+
+- The mission is evidence-backed technical `READY_FOR_RELEASE` of the approved scope. A merged PR, passing test batch, review, checkpoint, handoff or status report is an intermediate result, never completion: after each, select and run the next executable task. Status accompanies work, never replaces it. Release, deployment or publication needs the founder's separate explicit approval.
+- When blocked, find whether the blocker covers one task or all remaining scope and continue the independent work. For a CI, resource or dependency wait use a real watcher or resume mechanism and record its identifier, trigger, expiry and next action; claim automatic resumption only if it exists. If nothing can proceed, report the exact dependency, evidence and smallest intervention, never completion.
+- A refused heavy admission does not forbid light work (docs, reviews, focused tests, ticket reconciliation): queue the heavy task through the admission mechanism, work the rest, resume on grant. Never override a resource safety limit or touch another owner's workload.
+- Do not re-ask for already-authorized work. Ask only for material product or scope decisions, actions outside authorization, or unavoidable credential or host interaction, with the proposal, recommendation, impact and minimal action, and keep working.
+<!-- coding-agent-environment:baseline:campaign-completion:end -->
+
 ---
 
 ## Workflow Path
