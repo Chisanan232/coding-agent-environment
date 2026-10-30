@@ -10,6 +10,7 @@ on:
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
       - 'scripts/storage-integration.py'
+      - 'scripts/qa-identity-setup.py'
       - 'scripts/resource-policy-install.py'
       - 'scripts/launcher-install.py'
       - 'scripts/hook-rollout.py'
@@ -64,6 +65,7 @@ on:
       - 'scripts/profile-install.sh'
       - 'scripts/sync-check.sh'
       - 'scripts/storage-integration.py'
+      - 'scripts/qa-identity-setup.py'
       - 'scripts/resource-policy-install.py'
       - 'scripts/launcher-install.py'
       - 'scripts/hook-rollout.py'
@@ -175,6 +177,7 @@ jobs:
           python3 tests/test-adoption-coverage.py
           python3 tests/test-resource-lifecycle.py
           python3 tests/test-qa-handoff.py
+          python3 tests/test-qa-identity-setup.py
           python3 tests/test-parity-dogfood.py
   native-resource-wire:
     runs-on: macos-14
