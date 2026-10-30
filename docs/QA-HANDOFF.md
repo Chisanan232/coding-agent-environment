@@ -147,8 +147,9 @@ sudo forgets the credential after its timestamp window (5 minutes by default), a
 refresh until the run ends, and once more right before the seal and the final sweep. Every failed refresh is recorded in
 `RUNMETA.json` (`sudo_keepalive`). If sudo refuses before the seal, the result says exactly that ("could not check the QA
 user after codex ran: sudo -n refused") and stays `QA_INVALID`, because codex ran and nothing was checked. If the final
-cleanup sweep cannot run or leaves processes, the producer prints one `NOTE` line and records it as `cleanup` in
-`RESULT.json`; run `sudo -v` in the owner Terminal and the next run's pre-sweep removes them. Whether the keepalive behaves
+cleanup sweep cannot run (including an unexpected error) or leaves processes, the producer prints one `NOTE` line, records it
+as `cleanup` in `RESULT.json`, and a sealed `QA_PASS` becomes `QA_INVALID` (exit 12; a later `verdict` cannot restore the
+pass, and any other sealed state is unchanged); run `sudo -v` in the owner Terminal and the next run's pre-sweep removes them. Whether the keepalive behaves
 the same against a real terminal's sudo timestamp is not verified until the first owner run.
 
 Three hops, each through `qa_argv`, with the QA side running a producer-owned copy of this script under `/usr/bin/python3 -I`:
