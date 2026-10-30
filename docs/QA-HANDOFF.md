@@ -156,7 +156,7 @@ Three hops, each through `qa_argv`, with the QA side running a producer-owned co
 
 | Hop | Runs as | What happens | What the producer trusts |
 |---|---|---|---|
-| sweep | QA user | `kill -KILL -1` as that user, then `pgrep -U uid` (ids only): no QA process from an earlier run survives; then the persistence check (crontab, at, LaunchAgents, launchd domains) must be clean | the survivor count and the persistence result |
+| sweep | QA user | `kill -KILL -1` as that user, then list the user's processes (`ps -U uid`, ids only; the eight macOS per-user system services listed below do not count): no QA process from an earlier run survives; then the persistence check (crontab, at, LaunchAgents, launchd domains) must be clean | the survivor count and the persistence result |
 | 0 env canary | producer + QA user | producer holds a synthetic sentinel in a sibling's environment and proves it can read it itself (positive control); the setup script's probe runs as the QA user and must not read it, plus the uid, groups, tty, `~/.codex` mode and exchange checks | the probe record, emitted before any model; `ISOLATION.json` |
 | 1 `qa-stage` | QA user | creates the outbox attempt `O`, copies the inbox clone to `O/source`, a private Codex home under `/Users/NAME/.local/state/coding-agent-environment/qa/<attempt>/codexhome`, and runs the confinement probe there; prints exactly one JSON record with the SHA-256 of the profile it proved | the observed control results only: `established` is re-derived from the expected control set, never taken from the QA side; the profile digest; `CONFINEMENT.json` |
 | 2 `qa-exec` | QA user | moves its stderr to `O/stderr.log`, refuses to start codex unless the profile still has the digest hop 1 proved (exit 125), runs `codex exec` with the prompt from the inbox file, kills codex's group on timeout or signal (exit 124 / 130) | the codex stdout captured through the pipe into `R/events.jsonl` |
@@ -265,9 +265,16 @@ the hop and acts on the verdict.
   untrusted, but the producer must still treat it as data.
 - The event stream is the `codex exec` process's own stdout. The wrapper counts only `command_execution` completions that carry a unique id (a model cannot write to that stream; text it prints stays inside an escaped string field on the verified codex version), but a process that can write the stream itself, such as a replaced or compromised codex binary, can forge items and obtain `QA_PASS`. Codex QA reproduced this only with the offline fake codex, which is that process. Defending against it needs an attestation the producer's own user cannot create; that is the open evidence-independence decision, not something this wrapper can close.
 - In the same-user mode a sandboxed command that detaches into its own session (`setsid`) can outlive the timeout kill.
-  With `--qa-identity` the seal kills every process of the QA user and a survivor is `QA_INVALID`. On a real hidden macOS
-  account, per-user system agents (if any appear for that uid) would also count as survivors, so such a run could never
-  pass; this has not been checked on a real account.
+  With `--qa-identity` the seal kills every process of the QA user and a survivor is `QA_INVALID`. The first real hidden
+  account (macOS 27.0.1, 2026-10-30) showed that macOS creates a launchd user domain for it on the first hop and keeps
+  eight Apple services running under it with PPID 1: `distnoted`, `cfprefsd`, `pkd`, `lsd`, `trustd`, `secd`,
+  `containermanagerd` and `mdbulkimport` (full paths in `QA_SYSTEM_SERVICES`). Exactly those, identified by the
+  kernel-reported executable path (libproc, not `ps comm`, which a process can set through argv[0]) and a parent of
+  launchd, are not survivors; any other process, a listed path under a different parent, or an unreadable table is. The
+  set is VERIFIED-ON-THIS-HOST only: add a path after the owner's `--check` shows it. A QA process that executes one of
+  those same Apple binaries is tolerated. Still open: the persistence check treats any present launchd `user/<uid>`
+  domain as a problem, which on this account fails every run closed until the domain check is replaced by one built from
+  a real `launchctl print user/<uid>` sample (SPE-145).
 - Identity mode sees only the QA user's processes, crontab, at queue, `~/Library/LaunchAgents` and whether a launchd
   `user/` or `gui/` domain exists for it. It does not see a system-domain job or LaunchDaemon (which needs root to
   install), login items, or shell startup files (`.zshrc`, `.zprofile` and similar, which run if anything later starts a
