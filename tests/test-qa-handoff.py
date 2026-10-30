@@ -1214,7 +1214,11 @@ argv = sys.argv[1:]
 mode = open(d + "/sudo_mode").read().strip() if os.path.exists(d + "/sudo_mode") else "ok"
 with open(d + "/sudo_calls.jsonl", "a") as log:
     log.write(json.dumps([a for a in argv if "\n" not in a]) + "\n")
-if mode == "refuse":
+with open(d + "/sudo_sids", "a") as log:
+    log.write("%d\n" % os.getsid(0))
+# sudo's timestamp is per terminal session: a hop started in a new session does not see the owner's `sudo -v`
+cached_sid = int(open(d + "/sid").read()) if os.path.exists(d + "/sid") else None
+if mode == "refuse" or (mode == "refuse_exec" and "qa-exec" in argv) or (cached_sid is not None and os.getsid(0) != cached_sid):
     sys.stderr.write("sudo: a password is required\n")
     sys.exit(1)
 if argv[:2] != ["-n", "-u"]:
@@ -1249,6 +1253,7 @@ class IdentityTests(Base):
         self.x.chmod(0o711)
         for sub in ("inbox", "outbox"):
             (self.x / sub).mkdir(mode=0o700)
+        (self.fake_dir / "sid").write_text(str(os.getsid(0)))                 # where the owner's `sudo -v` was cached
         self.sudo = self.root / "sudo"
         self.sudo.write_text(FAKE_SUDO.replace("@PY@", sys.executable).replace("@FAKEDIR@", str(self.fake_dir)))
         self.sudo.chmod(0o755)
@@ -1266,7 +1271,8 @@ class IdentityTests(Base):
         for patch in (unittest.mock.patch.object(qis, "SUDO", str(self.sudo)), unittest.mock.patch.object(qis, "PY", sys.executable),
                       unittest.mock.patch.object(qa, "resolve_identity", lambda name, exchange: self.ident),
                       unittest.mock.patch.object(qa, "sweep_identity", sweep),
-                      unittest.mock.patch.object(qa, "persistence_problems", lambda ident: list(self.persistence)),
+                      unittest.mock.patch.object(qa, "persistence_problems",
+                                                 lambda ident: list(self.persistence.pop(0) if self.persistence else [])),
                       unittest.mock.patch.object(qis.Setup, "isolation_record", lambda setup, pw: self.isolation)):
             patch.start()
             self.addCleanup(patch.stop)
@@ -1483,12 +1489,65 @@ class IdentityTests(Base):
         self.assertEqual(self.run_ident(run_dir)[0], 12)
 
     def test_scheduled_job_present_is_invalid(self):
-        self.persistence = ["the crontab of qauser is not empty"]
+        self.persistence = [["the crontab of qauser is not empty"]]         # appears while codex runs
         run_dir = self.prepare()
         code, out = self.run_ident(run_dir)
         self.assertEqual(code, 12, out)
         self.assertIn("scheduled jobs or launch agents", out)
-        self.assertEqual(self.json(run_dir / "RUNMETA.json")["persistence"], self.persistence)
+        self.assertEqual(self.json(run_dir / "RUNMETA.json")["persistence"], ["the crontab of qauser is not empty"])
+
+    def test_hop_2_runs_in_the_same_session_as_hops_0_and_1(self):
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 0, out)
+        sids = (self.fake_dir / "sudo_sids").read_text().split()
+        self.assertEqual(len(sids), 2)                                       # qa-stage and qa-exec
+        self.assertEqual(set(sids), {str(os.getsid(0))})                     # where the owner's credential is cached
+
+    def test_sudo_refused_at_the_codex_hop_is_incomplete_codex_not_started(self):
+        (self.fake_dir / "sudo_mode").write_text("refuse_exec")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertIn("sudo -n refused the codex hop", out)
+        self.assertIn("codex was not started", out)
+        self.assertFalse((self.fake_dir / "seen.json").exists())
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 11)          # idempotent
+        self.assertEqual(self.run_ident(run_dir)[0], qa.EXIT["REFUSED"])                   # a new attempt, not a re-run
+
+    def test_two_interrupts_during_the_seal_keep_the_record_and_release_the_lock(self):
+        import signal
+
+        def interrupt_twice(ident):
+            os.kill(os.getpid(), signal.SIGINT)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return list(self.persistence.pop(0) if self.persistence else [])
+        run_dir = self.prepare()
+        calls = {"n": 0}
+
+        def persistence(ident):
+            calls["n"] += 1
+            return interrupt_twice(ident)                                 # the seal's call
+        with unittest.mock.patch.object(qa, "persistence_problems", persistence):
+            code, out = self.run_ident(run_dir)
+        self.assertNotEqual(code, 0, out)
+        meta = self.json(run_dir / "RUNMETA.json")                           # the record survived both signals
+        self.assertTrue(meta["interrupted"])
+        self.assertEqual(meta["qa_identity"]["name"], "qauser")
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())
+        self.assertNotEqual(self.json(run_dir / "RESULT.json")["state"], "QA_PASS")
+        self.assertEqual(self.run_ident(run_dir)[0], qa.EXIT["REFUSED"])
+
+    def test_a_started_run_without_a_record_is_never_rerunnable(self):
+        run_dir = self.prepare()
+        def no_record(*args, **kwargs):
+            raise OSError("disk full")                                        # the record cannot be written at all
+        with unittest.mock.patch.object(qa, "write_meta", no_record), self.assertRaises(OSError):
+            self.run_ident(run_dir)                                           # an I/O failure surfaces, it is not a state
+        self.assertFalse((run_dir / "RUNMETA.json").exists())
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)          # codex started, no record
+        self.assertEqual(self.run_ident(run_dir)[0], qa.EXIT["REFUSED"])
 
     def test_identity_lock_busy_is_waiting_resource(self):
         (self.x / "inbox/RUN.lock").write_text("")

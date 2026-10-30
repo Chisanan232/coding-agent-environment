@@ -663,6 +663,8 @@ def run(args):
     # directory belongs to another run and its result.
     if (run_dir / 'RUNMETA.json').exists():
         return refuse('this run directory has already been run; prepare a new attempt')
+    if os.path.lexists(run_dir / 'LAUNCHED'):
+        return refuse('codex was started for this directory; prepare a new attempt')
     if os.path.lexists(run_dir / 'RUN.lock'):
         return refuse('a run is in progress or was interrupted for this directory; prepare a new attempt')
     read_roots = []
@@ -692,7 +694,7 @@ def run(args):
             return run_identity(args, run_dir, packet, source, ident)
         return run_locked(args, run_dir, packet, source, read_roots)
     except KeyboardInterrupt:      # Ctrl-C or SIGTERM: codex's group is killed and a hashed run record written; evaluate it
-        if (run_dir / 'RUNMETA.json').exists():
+        if (run_dir / 'RUNMETA.json').exists() or os.path.lexists(run_dir / 'LAUNCHED'):
             return evaluate(run_dir)
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['interrupted before codex started'])
     finally:
@@ -755,19 +757,40 @@ def run_locked(args, run_dir, packet, source, read_roots=()):
     return launch(args, run_dir, argv, isolated_env(run_dir), str(source), prompt.encode())
 
 
-def launch(args, run_dir, argv, env, cwd, stdin_data, seal=None, timeout=None):
-    """Run the QA process with its stdout captured into run_dir/events.jsonl, kill its group on timeout or signal, and
-    write the hashed run record. `seal(proc)`, when given, runs once before the record is written (also on the interrupt
-    path) and returns values merged into it; a seal that fails yields `seal_failed(error)` so the record fails closed."""
+def kill_child(proc):
+    """Stop a child that is not a process-group leader (the sudo hop): signal it directly, then wait. sudo relays the
+    signal to the QA side, which kills codex's own group; the seal's sweep removes anything else of the QA user."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            proc.send_signal(sig)
+        except OSError:
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def launch(args, run_dir, argv, env, cwd, stdin_data, seal=None, timeout=None, new_session=True):
+    """Run the QA process with its stdout captured into run_dir/events.jsonl, kill it on timeout or signal, and write the
+    hashed run record. `seal(proc)`, when given, runs once before the record is written (also on the interrupt path) and
+    returns values merged into it; a seal that fails yields `seal_failed(error)` so the record fails closed.
+    new_session=False keeps the child in the caller's session: sudo's credential cache is tied to the terminal session,
+    so the identity hop must stay where `sudo -v` was typed (the QA side detaches itself)."""
     events = run_dir / 'events.jsonl'
     sealed = {}
+    stop = kill_group if new_session else kill_child
+    noted = []
 
     def seal_once(proc):
         if seal is not None and not sealed:
             try:
                 sealed.update(seal(proc))
-            except Exception as error:     # a seal that could not run must never leave a record that looks clean
+            except BaseException as error:  # a seal that could not finish must never leave a record that looks clean
                 sealed.update(seal_failed(error))
+                if not isinstance(error, Exception):
+                    raise
 
     def record(proc, timed_out, interrupted):
         seal_once(proc)
@@ -779,60 +802,74 @@ def launch(args, run_dir, argv, env, cwd, stdin_data, seal=None, timeout=None):
 
     def interrupted(signum, frame):
         raise KeyboardInterrupt
+
+    def note(signum, frame):
+        noted.append(signum)
     # Installed before codex starts and kept until the run record is written, so no window leaves a signal to kill the
     # wrapper without a record (the settle sleep included).
     old = signal.signal(signal.SIGTERM, interrupted)
+    old_int = signal.getsignal(signal.SIGINT)
     # A closed terminal or dropped ssh must not strand codex either, but a deliberate `nohup` (SIGHUP ignored on entry) stays ignored.
     old_hup = signal.getsignal(signal.SIGHUP)
     if old_hup is not signal.SIG_IGN:
         signal.signal(signal.SIGHUP, interrupted)
+
+    def quiet():
+        """From here on a signal marks the run interrupted but cannot raise: sealing and the record always complete, so
+        a second Ctrl-C can no longer erase the record of a run in which codex was started."""
+        signal.signal(signal.SIGTERM, note)
+        signal.signal(signal.SIGINT, note)
+        if old_hup is not signal.SIG_IGN:
+            signal.signal(signal.SIGHUP, note)
+    blocked = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
     try:
         with open(events, 'wb') as ev, open(run_dir / 'stderr.log', 'wb') as err:
             os.chmod(events, 0o600)
             try:
                 try:
+                    # Written before the process exists and kept unless it never started: a directory in which codex may
+                    # have run is never run again, even if no record could be written (SIGKILL of the wrapper).
+                    write_private(run_dir / 'LAUNCHED', now())
                     proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL if stdin_data is None else subprocess.PIPE,
-                                            stdout=ev, stderr=err, start_new_session=True)
+                                            stdout=ev, stderr=err, start_new_session=new_session)
                 except OSError as error:   # codex is not installed or not executable: nothing ran, so the attempt stays retryable
+                    try:
+                        os.unlink(run_dir / 'LAUNCHED')
+                    except OSError:
+                        pass
                     return write_result(run_dir, load_packet(run_dir), 'QA_INCOMPLETE', ['codex could not be started (%s)' % type(error).__name__])
                 proc.communicate(stdin_data, timeout=args.timeout if timeout is None else timeout)
-                try:                       # a background process codex left behind must not keep editing the clone after the verdict
-                    os.killpg(proc.pid, signal.SIGKILL)   # codex is already reaped; this reaches only what it left in its own group
-                except OSError:
-                    pass
+                if new_session:
+                    try:                   # a background process codex left behind must not keep editing the clone after the verdict
+                        os.killpg(proc.pid, signal.SIGKILL)   # codex is already reaped; this reaches only what it left in its own group
+                    except OSError:
+                        pass
             except subprocess.TimeoutExpired:
                 timed_out = True
-                kill_group(proc)
+                stop(proc)
             except BaseException:
                 if proc is not None:
-                    kill_group(proc)       # Ctrl-C or SIGTERM to the wrapper must not leave codex running
+                    quiet()
+                    stop(proc)             # Ctrl-C or SIGTERM to the wrapper must not leave codex running
                     record(proc, timed_out, True)   # hashed, so a later edit is still caught
                 raise
         os.chmod(run_dir / 'stderr.log', 0o600)
+        quiet()
         try:
             time.sleep(getattr(args, 'settle', SETTLE_SECONDS))   # let any straggler finish writing before the tree is checked
-            seal_once(proc)                 # outside the signal-blocked window below: sealing can take seconds
-        except BaseException:
-            record(proc, timed_out, True)
-            raise
-        # The run record is written with the interrupt signals blocked, so one cannot land half-way through it. A signal
-        # that arrives after the record is complete leaves a finished run finished; one that raises inside the write
-        # (it cannot with the signals blocked, but a failure can) is recorded as an interrupt.
-        blocked = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
-        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
-        try:
-            # Any signal received before the unmask below marks the run interrupted, so an interrupted run never passes.
-            got_signal = bool(signal.sigpending() & blocked)
+            seal_once(proc)
+            # Any signal received before the record is complete marks the run interrupted, so it never passes.
+            got_signal = bool(noted) or bool(signal.sigpending() & blocked)
             record(proc, timed_out, got_signal)
-            if not got_signal and signal.sigpending() & blocked:
+            if not got_signal and (noted or signal.sigpending() & blocked):
                 record(proc, timed_out, True)
         except BaseException:
             record(proc, timed_out, True)
             raise
-        finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
     finally:
         signal.signal(signal.SIGTERM, old)
+        if old_int is not None:
+            signal.signal(signal.SIGINT, old_int)
         if old_hup is not signal.SIG_IGN:
             signal.signal(signal.SIGHUP, old_hup)
     return evaluate(run_dir)
@@ -1071,33 +1108,45 @@ def run_identity(args, run_dir, packet, source, ident):
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['exchange is not usable: ' + '; '.join(problems[:3]),
                                                                'codex was not started'])
     lock = ident.exchange / 'inbox/RUN.lock'
-    try:
-        os.close(os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
-    except FileExistsError:       # another run's lock: never removed here
-        return write_result(run_dir, packet, 'WAITING_RESOURCE', ['another QA run holds %s; codex was not started' % lock])
 
     def interrupted(signum, frame):
         raise KeyboardInterrupt
-    # From the lock on, TERM and HUP end the run through the normal cleanup, so the identity lock is never left behind
-    # by a signal (a SIGKILL still can: remove the lock by hand once no QA run is active).
-    old = signal.signal(signal.SIGTERM, interrupted)
-    old_hup = signal.getsignal(signal.SIGHUP)
-    if old_hup is not signal.SIG_IGN:
-        signal.signal(signal.SIGHUP, interrupted)
+    guarded = [signal.SIGTERM, signal.SIGINT]
+    if signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN:   # a deliberate `nohup` stays ignored
+        guarded.append(signal.SIGHUP)
+    saved = {sig: signal.getsignal(sig) for sig in guarded}
+    have_lock = False
+    # Taking the lock and cleaning it up run with these signals ignored, so no signal can land between creating the lock
+    # and owning its cleanup, or interrupt the cleanup itself (a SIGKILL still can: remove the lock by hand once no QA
+    # run is active). In between, TERM, HUP and INT end the run through the normal interrupt path.
+    for sig in guarded:
+        signal.signal(sig, signal.SIG_IGN)
     try:
+        try:
+            os.close(os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+            have_lock = True
+        except FileExistsError:   # another run's lock: never removed here
+            return write_result(run_dir, packet, 'WAITING_RESOURCE', ['another QA run holds %s; codex was not started' % lock])
+        for sig in guarded:
+            signal.signal(sig, signal.default_int_handler if sig == signal.SIGINT else interrupted)
         return run_identity_locked(args, run_dir, packet, source, ident)
     finally:
+        for sig in guarded:
+            signal.signal(sig, signal.SIG_IGN)
         try:
-            sweep_identity(ident)  # whatever happened, no QA-user process outlives the run
-        except Exception:
-            pass
-        try:
-            os.unlink(lock)
-        except OSError:
-            pass
-        signal.signal(signal.SIGTERM, old)
-        if old_hup is not signal.SIG_IGN:
-            signal.signal(signal.SIGHUP, old_hup)
+            if have_lock:
+                try:
+                    sweep_identity(ident)   # whatever happened, no QA-user process outlives the run
+                except Exception:
+                    pass
+                try:
+                    os.unlink(lock)
+                except OSError:
+                    pass
+        finally:
+            for sig, handler in saved.items():
+                if handler is not None:
+                    signal.signal(sig, handler)
 
 
 def run_identity_locked(args, run_dir, packet, source, ident):
@@ -1183,7 +1232,9 @@ def run_identity_locked(args, run_dir, packet, source, ident):
                        alarm=alarm)
     manifest = read_run_json(run_dir / 'tree-manifest.json')
     info = {'name': ident.name, 'uid': ident.uid, 'exchange': str(ident.exchange), 'attempt': attempt, 'script_sha256': script_sha}
-    return launch(args, run_dir, argv, dict(HOP_ENV), '/', None, timeout=alarm + 60,
+    # Same session as hops 0 and 1 (new_session=False): sudo -n only sees the owner's cached credential from the
+    # terminal session it was typed in. The QA side detaches itself (DETACH: setsid as the QA user).
+    return launch(args, run_dir, argv, dict(HOP_ENV), '/', None, timeout=alarm + 60, new_session=False,
                   seal=lambda proc: seal(run_dir, ident, outbox, manifest, info, proc))
 
 
@@ -1201,6 +1252,12 @@ def seal(run_dir, ident, outbox, manifest, info, proc):
         extra['timed_out'] = True
     elif proc.returncode == 130:
         extra['interrupted'] = True
+    if proc.returncode not in (0, None):
+        try:              # sudo's own stderr, producer-owned; the QA side's stderr goes to the outbox, never here
+            refused = sudo_refused(read_nofollow(run_dir / 'stderr.log', MAX_INPUT_BYTES).decode('utf-8', 'replace'))
+        except OSError:
+            refused = False
+        extra['sudo_refused'] = refused
     fds, why = open_outbox(ident, outbox)
     try:
         if why:
@@ -1392,6 +1449,8 @@ def no_run_record(run_dir, packet, verdict_path, events):
     codex started, could not start) result is kept, because nothing ran that could pass."""
     if os.path.lexists(verdict_path) or (os.path.lexists(events) and os.lstat(events).st_size):
         return write_result(run_dir, packet, 'QA_INVALID', ['run output exists but the run record is missing'])
+    if os.path.lexists(run_dir / 'LAUNCHED'):
+        return write_result(run_dir, packet, 'QA_INVALID', ['codex was started but no run record was written'])
     try:
         previous = read_run_json(run_dir / 'RESULT.json')
     except LOAD_ERRORS:
@@ -1445,6 +1504,10 @@ def evaluate_files(run_dir, packet):
     if safe_digest(events) != meta['events_sha256']:
         bad.append('event stream changed after the run')
     if 'qa_identity' in meta:
+        if (meta.get('sudo_refused') is True and not bad and not os.path.lexists(verdict_path)
+                and os.lstat(events).st_size == 0):
+            return write_result(run_dir, packet, 'QA_INCOMPLETE', ['sudo -n refused the codex hop (no cached credential in '
+                                                                   'this terminal session); codex was not started'])
         bad += identity_gate(run_dir, meta)
     try:
         if os.lstat(events).st_size > MAX_EVENTS_BYTES:
