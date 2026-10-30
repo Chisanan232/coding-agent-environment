@@ -52,7 +52,6 @@ HEAVY_COMMS = frozenset({"cargo", "rustc", "rust-lld", "cc1", "cc1plus", "clang"
 # not runnable, has used almost no CPU recently and has been around a while is a leftover: reported, never counted.
 IDLE_MIN_AGE = 900          # seconds
 IDLE_PCPU = 1.0             # ps %cpu, a decaying recent average
-CPU_ACTIVE_DELTA = 0.05     # CPU seconds an orphan may use across the sampling window and still be idle
 MAX_IDLE_REPORT = 5
 IDLE_STATES = frozenset({"S", "I", "T", "Z"})   # first letter of the ps state; R (running) and U (uninterruptible) are work
 DEFAULT_STATE = pathlib.Path.home() / ".cache/coding-agent-environment/memory-admission/state.json"
@@ -118,11 +117,12 @@ def parse_clock(text, days=True):
 
 
 def classify_heavy(ps_text):
-    """(active, idle) from `ps -axo PS_FIELDS`; (None, None) when the list is unreadable. Anything that cannot be fully
-    parsed counts as active: an unknown process is never treated as an abandoned one."""
+    """(active, idle, cpu_by_pid) from `ps -axo PS_FIELDS`; (None, None, None) when the list is unreadable. Anything that
+    cannot be fully parsed counts as active: an unknown process is never treated as an abandoned one. cpu_by_pid holds the
+    CPU seconds of every heavy-named process, so a later sample can tell whether any of them worked in between."""
     if ps_text is None or not ps_text.strip():
-        return None, None
-    active, idle = {}, []
+        return None, None, None
+    active, idle, cpus = {}, [], {}
     for line in ps_text.splitlines():
         line = line.strip()
         if not line:
@@ -139,6 +139,8 @@ def classify_heavy(ps_text):
         orphan = False
         if parsed:
             pid, ppid, state, age, cpu, pcpu = parsed
+            if cpu is not None:
+                cpus[pid] = cpu
             try:
                 pcpu_v = float(pcpu)
             except ValueError:
@@ -149,7 +151,7 @@ def classify_heavy(ps_text):
             idle.append({"pid": pid, "comm": base, "ppid": ppid, "age_s": int(age), "cpu_s": cpu, "cwd": None})
         else:
             active[base] = active.get(base, 0) + 1
-    return active, idle
+    return active, idle, cpus
 
 
 def lookup_cwd(pid, run):
@@ -170,7 +172,7 @@ def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu
             return None
     # None = the process list could not be read (unknown), never "no heavy process"; empty output from a successful ps is
     # not "nothing running" either, because a live system always has processes.
-    heavy, idle = classify_heavy(_run([PS, "-axo", PS_FIELDS], run))
+    heavy, idle, cpus = classify_heavy(_run([PS, "-axo", PS_FIELDS], run))
     for rec in (idle or [])[:MAX_IDLE_REPORT]:
         rec["cwd"] = lookup_cwd(rec["pid"], run)
     try:
@@ -187,19 +189,22 @@ def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu
         disk_free = None
     return {"time": now_fn(), "mono": mono_fn(), "ram": sysctl_int("hw.memsize"), "pressure_level": sysctl_int("kern.memorystatus_vm_pressure_level"),
             "swap": parse_swapusage(_run([SYSCTL, "-n", "vm.swapusage"], run)), "vm": parse_vm_stat(_run([VM_STAT], run)),
-            "load1": load1, "cpus": cpu_fn() or None, "disk_free": disk_free, "heavy_procs": heavy, "idle_procs": idle or []}
+            "load1": load1, "cpus": cpu_fn() or None, "disk_free": disk_free, "heavy_procs": heavy, "idle_procs": idle or [], "cpu_by_pid": cpus or {}}
 
 
 def derive(s1, s2):
     """Rates and ratios from two samples taken `window` seconds apart. None means unknown."""
     d = {"pressure_level": s2.get("pressure_level"), "ram": s2.get("ram"), "disk_free": s2.get("disk_free"),
          "heavy_procs": s2.get("heavy_procs"), "swap": s2.get("swap")}
-    # An orphan that spent CPU between the two samples is working, whatever its history says.
+    # An orphan is idle only if it is proven so across the window: seen in the first sample with no more CPU time than now.
+    # Any CPU spent, or no first reading at all (it may have been busy and unparsed), makes it a running lane.
     before = {r["pid"]: r["cpu_s"] for r in s1.get("idle_procs") or []}
+    before.update(s1.get("cpu_by_pid") or {})
     d["idle_procs"] = []
     for rec in s2.get("idle_procs") or []:
-        if rec["pid"] in before and rec["cpu_s"] - before[rec["pid"]] > CPU_ACTIVE_DELTA and d["heavy_procs"] is not None:
-            d["heavy_procs"] = dict(d["heavy_procs"], **{rec["comm"]: d["heavy_procs"].get(rec["comm"], 0) + 1})
+        if rec["pid"] not in before or rec["cpu_s"] > before[rec["pid"]]:
+            if d["heavy_procs"] is not None:   # None stays None: an unreadable list already fails closed
+                d["heavy_procs"] = dict(d["heavy_procs"], **{rec["comm"]: d["heavy_procs"].get(rec["comm"], 0) + 1})
         else:
             d["idle_procs"].append(rec)
     key = "mono" if s1.get("mono") is not None and s2.get("mono") is not None else "time"   # monotonic: a wall-clock step must not dilute the rate

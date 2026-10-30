@@ -42,10 +42,11 @@ def vm(swapins=0, swapouts=0, compressor_pages=0):
 ZERO_SWAP = {"total": 0, "used": 0, "free": 0}   # a fresh post-reboot machine: no swap files yet
 
 
-def sample(t, level=1, swapins=0, swapouts=0, compressor=0.0, load=2.0, cpus=16, disk=494 * GIB, swap=ZERO_SWAP, heavy=None, idle=None):
+def sample(t, level=1, swapins=0, swapouts=0, compressor=0.0, load=2.0, cpus=16, disk=494 * GIB, swap=ZERO_SWAP, heavy=None, idle=None, cpu_by_pid=None):
     return {"time": t, "mono": t, "ram": RAM, "pressure_level": level, "swap": swap, "vm": vm(swapins, swapouts, int(compressor * RAM / PAGE)),
             "load1": load, "cpus": cpus, "disk_free": disk, "heavy_procs": {} if heavy is None else heavy,
-            "idle_procs": [] if idle is None else idle}
+            "idle_procs": [] if idle is None else idle,
+            "cpu_by_pid": {} if cpu_by_pid is None else cpu_by_pid}
 
 
 def metrics(**kw):
@@ -556,6 +557,29 @@ class IdleOrphan(unittest.TestCase):
     def test_unreadable_idle_data_does_not_hide_an_unknown_process_list(self):
         m = ma.derive(sample(0), dict(sample(10), heavy_procs=None))
         self.assertFalse(ma.decide("heavy", m, None, 1000.0)[0]["admit"])
+
+    def test_any_cpu_spent_in_the_window_makes_an_orphan_active(self):
+        first = [{"pid": 25830, "comm": "rustc", "ppid": 1, "age_s": 3600, "cpu_s": 10.0, "cwd": None}]
+        m = ma.derive(sample(0, idle=first), sample(10, idle=[dict(first[0], cpu_s=10.01)]))
+        self.assertEqual((m["heavy_procs"], m["idle_procs"]), ({"rustc": 1}, []))
+
+    def test_cpu_seen_only_in_the_first_sample_still_counts(self):
+        rec = {"pid": 25830, "comm": "rustc", "ppid": 1, "age_s": 3600, "cpu_s": 12.5, "cwd": None}
+        busy_first = sample(0, heavy={"rustc": 1}, cpu_by_pid={25830: 10.0})   # active then (pcpu 2.0), quiet now
+        m = ma.derive(busy_first, sample(10, idle=[rec], cpu_by_pid={25830: 12.5}))
+        self.assertEqual((m["heavy_procs"], m["idle_procs"]), ({"rustc": 1}, []))
+        verdict, _ = ma.decide("heavy", m, None, 1000.0)
+        self.assertFalse(verdict["admit"])
+
+    def test_an_orphan_missing_from_the_first_sample_cannot_be_proven_idle(self):
+        rec = {"pid": 25830, "comm": "rustc", "ppid": 1, "age_s": 3600, "cpu_s": 10.0, "cwd": None}
+        m = ma.derive(sample(0), sample(10, idle=[rec], cpu_by_pid={25830: 10.0}))
+        self.assertEqual(m["heavy_procs"], {"rustc": 1})
+
+    def test_unchanged_cpu_in_both_samples_stays_idle(self):
+        rec = {"pid": 25830, "comm": "rustc", "ppid": 1, "age_s": 3600, "cpu_s": 10.0, "cwd": None}
+        m = ma.derive(sample(0, idle=[rec], cpu_by_pid={25830: 10.0}), sample(10, idle=[rec], cpu_by_pid={25830: 10.0}))
+        self.assertEqual((m["heavy_procs"], len(m["idle_procs"])), ({}, 1))
 
 
 if __name__ == "__main__":
