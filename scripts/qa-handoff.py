@@ -25,9 +25,12 @@ interactive session: an interactive session that is not callable through a suppo
 Exit codes of `run` and `verdict` (the producer's continuation rule):
   0  QA_PASS            complete, every check passed, nothing untested, no Critical/High/Medium finding
   10 QA_FAIL            a check failed or a Critical/High/Medium finding exists: fix, new SHA, requalify
-  11 QA_INCOMPLETE      partial, blocked, untested items, timeout, or no command was executed: not a pass
+  11 QA_INCOMPLETE      partial, blocked, untested items, timeout, interruption, codex could not start or died before
+                        answering, or no command was executed: not a pass
   12 QA_INVALID         integrity failure (SHA mismatch, modified source, tampered or malformed verdict)
+  64 REFUSED            the run directory was already run or is locked: prepare a new attempt; RESULT.json is untouched
   75 WAITING_RESOURCE   admission refused: retry later; this is not a QA failure and codex was not started
+  75 NOT_RUN            `verdict` on an attempt codex never started; same meaning as WAITING_RESOURCE
 A Codex verdict is QA evidence only. It is never merge evidence and must not be written as an owner-merge review.
 """
 import argparse
@@ -528,6 +531,8 @@ def run(args):
         return refuse('a run is in progress or was interrupted for this directory; prepare a new attempt')
     try:
         return run_locked(args, run_dir, packet, source)
+    except KeyboardInterrupt:      # Ctrl-C or SIGTERM: codex's group is already killed; say so instead of a traceback
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['interrupted before a verdict'])
     finally:
         try:
             os.unlink(run_dir / 'RUN.lock')
@@ -559,6 +564,11 @@ def run_locked(args, run_dir, packet, source):
     write_private(run_dir / 'prompt.txt', prompt)
     argv = codex_argv(args.codex_bin, run_dir)
     events = run_dir / 'events.jsonl'
+    # A verdict left by an earlier interrupted attempt must never be paired with this attempt's exit code and commands.
+    try:
+        os.unlink(run_dir / 'verdict.json')
+    except FileNotFoundError:
+        pass
     t0 = time.time()
     timed_out = False
     with open(events, 'wb') as ev, open(run_dir / 'stderr.log', 'wb') as err:
@@ -640,9 +650,10 @@ def not_run(run_dir, packet):
         previous = read_run_json(run_dir / 'RESULT.json')
     except LOAD_ERRORS:
         previous = {}
-    if isinstance(previous, dict) and previous.get('state') == 'WAITING_RESOURCE':
-        print('WAITING_RESOURCE %s' % '; '.join(clean(r) for r in previous.get('reasons', []) if isinstance(r, str)))
-        return EXIT['WAITING_RESOURCE']
+    # With no run record nothing can pass, so keeping these earlier results loses no integrity information.
+    if isinstance(previous, dict) and previous.get('state') in ('WAITING_RESOURCE', 'QA_INCOMPLETE'):
+        print('%s %s' % (previous['state'], '; '.join(clean(r) for r in previous.get('reasons', []) if isinstance(r, str))))
+        return EXIT[previous['state']]
     return write_result(run_dir, packet, 'NOT_RUN', ['codex has not been run for this attempt'])
 
 

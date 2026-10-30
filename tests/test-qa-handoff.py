@@ -70,7 +70,7 @@ if mode == "fifo":
 elif mode == "huge":
     verdict["baseline"] += " " + "x" * (6 << 20)
     open(out, "w").write(json.dumps(verdict))
-elif mode not in ("linkverdict", "deepjson"):
+elif mode not in ("linkverdict", "deepjson", "silent"):
     open(out, "w").write(json.dumps(verdict))
 if mode == "gitlink":
     os.rename(".git", d + "/gitreal")
@@ -753,6 +753,39 @@ class ReviewFollowUpTests(Base):
         time.sleep(4)                                                   # longer than the straggler's sleep
         code, out = self.call("verdict", "--run-dir", str(run_dir))
         self.assertEqual(code, 0, out)
+
+    def test_a_verdict_left_by_an_earlier_interrupted_attempt_is_never_reused(self):
+        run_dir = self.prepare()
+        stale = verdict().replace("@SHA@", self.sha)
+        (run_dir / "verdict.json").write_text(stale)               # codex wrote it, then the earlier attempt was interrupted
+        self.fake_mode("silent")                                   # this attempt exits 0 without writing any verdict
+        code, out = self.run_qa(run_dir)
+        self.assertNotEqual(code, 0, out)
+        self.assertNotEqual(self.result(run_dir)["state"], "QA_PASS")
+        self.assertFalse((run_dir / "verdict.json").exists())
+
+    def test_interrupting_the_wrapper_is_incomplete_not_a_traceback(self):
+        import signal
+        self.fake_mode("hang")
+        run_dir = self.prepare()
+        proc = subprocess.Popen([sys.executable, str(SCRIPT), "run", "--run-dir", str(run_dir), "--codex-bin", str(self.fake),
+                                 "--admission-cmd", shlex.join(self.ADMIT), "--settle", "0"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        deadline = time.time() + 30
+        while time.time() < deadline and not (self.fake_dir / "child.pid").exists():
+            time.sleep(0.1)
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 11, err)
+        self.assertEqual(self.result(run_dir)["state"], "QA_INCOMPLETE")
+        self.assertNotIn("Traceback", err)
+        code, _ = self.call("verdict", "--run-dir", str(run_dir))   # later evaluation keeps the interruption, not "tampering"
+        self.assertEqual(code, 11)
+
+    def test_the_header_documents_every_exit_code(self):
+        header = Path(SCRIPT).read_text().split('"""')[1]
+        for token in ("64", "REFUSED", "NOT_RUN"):
+            self.assertIn(token, header)
 
 
 if __name__ == "__main__":
