@@ -506,6 +506,56 @@ class Reservations(unittest.TestCase):
         self.assertEqual((live, problems), ([], []))
         self.assertFalse(file.exists())
 
+    def wait_for_zombie(self, pid):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = subprocess.run(['/bin/ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+            if state.startswith('Z'):
+                return
+            time.sleep(0.05)
+        self.fail('process %d did not become a zombie' % pid)
+
+    def test_unreaped_group_leader_with_no_workload_is_exited(self):
+        leader = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)   # exits, never waited on
+        self.addCleanup(leader.wait)
+        self.wait_for_zombie(leader.pid)
+        file = self.reserve_file('job-zombie', leader.pid, 'Mon Jan  1 00:00:00 2001')
+        self.assertIsNone(da.process_token(leader.pid))
+        self.assertEqual(self.live(), ([], []))
+        self.assertFalse(file.exists())
+
+    def test_unreaped_wrapper_does_not_free_the_lane_while_its_job_runs(self):
+        leader = subprocess.Popen(['/bin/sh', '-c', 'sleep 60 & exit 0'], start_new_session=True)
+        self.addCleanup(leader.wait)
+        self.addCleanup(lambda: os.killpg(leader.pid, 9) if self._group_alive(leader.pid) else None)
+        self.wait_for_zombie(leader.pid)
+        token = da.process_token(leader.pid)
+        self.assertIsNotNone(token)                      # the wrapper is a zombie but its job is running
+        self.reserve_file('job-wrapper', leader.pid, token)
+        self.assertEqual(len(self.live()[0]), 1)
+        os.killpg(leader.pid, 9)
+        deadline = time.monotonic() + 5
+        while da.process_token(leader.pid) is not None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertIsNone(da.process_token(leader.pid))  # job gone, zombie alone: the lane is free
+        self.assertEqual(self.live(), ([], []))
+
+    def test_unreaped_process_sharing_a_group_cannot_prove_an_empty_workload(self):
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        self.addCleanup(os.waitpid, pid, 0)
+        self.wait_for_zombie(pid)
+        self.assertIsNotNone(da.process_token(pid))      # not its own group leader: fail closed
+
+    @staticmethod
+    def _group_alive(pgid):
+        try:
+            os.killpg(pgid, 0)
+            return True
+        except OSError:
+            return False
+
     def test_pid_reuse_token_mismatch_is_pruned(self):
         file = self.reserve_file('job-reused', token='Mon Jan  1 00:00:00 2001')
         self.assertTrue(file.exists())
