@@ -11,6 +11,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -88,6 +89,12 @@ if mode == "linkverdict":
     os.symlink(d + "/decoy.json", out)
 if mode == "headmove":
     open(".git/HEAD", "w").write("0" * 40 + "\n")
+if mode == "linksource":    # the clone is swapped for a link to an untouched copy outside the outbox
+    import shutil
+    src = os.getcwd()
+    shutil.copytree(src, d + "/srccopy", symlinks=True)
+    os.rename(src, d + "/srcmoved")
+    os.symlink(d + "/srccopy", src)
 out = argv[argv.index("-o") + 1]
 if mode == "fifo":
     os.mkfifo(out)
@@ -112,6 +119,11 @@ if mode == "agentforge":      # agent text shaped like command items must not be
     for i in range(3):
         print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "id": "a%d" % i, "exit_code": 0,
                                                               "command": "x"}}))
+if mode == "stderrforge":     # command-shaped events on stderr must never reach the counted stream
+    ncmd = 0
+    for i in range(3):
+        sys.stderr.write(json.dumps({"type": "item.completed", "item": {"type": "command_execution", "id": "e%d" % i,
+                                                                         "exit_code": 0}}) + "\n")
 if mode == "dupitems":        # the same command item repeated is one command
     ncmd = 0
     for i in range(4):
@@ -1115,6 +1127,295 @@ class IdentityGuardTests(Base):
             for uid in (os.getuid(), 0, True):
                 ident = qa.Identity("qauser", uid, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
                 self.assertIsNone(qa.sweep_identity(ident))           # never `kill -1` as yourself or as root
+
+
+FAKE_SUDO = r"""#!@PY@
+import json, os, sys
+d = "@FAKEDIR@"
+argv = sys.argv[1:]
+mode = open(d + "/sudo_mode").read().strip() if os.path.exists(d + "/sudo_mode") else "ok"
+with open(d + "/sudo_calls.jsonl", "a") as log:
+    log.write(json.dumps([a for a in argv if "\n" not in a]) + "\n")
+if mode == "refuse":
+    sys.stderr.write("sudo: a password is required\n")
+    sys.exit(1)
+if argv[:2] != ["-n", "-u"]:
+    sys.exit(98)                          # only the non-interactive form is ever expected
+rest = argv[3:]
+if rest[:1] == ["-H"]:
+    rest = rest[1:]
+if not rest or os.path.basename(rest[0]) in ("kill", "pkill", "killall"):
+    sys.exit(99)                          # a test must never `kill -1` as the developer
+if "qa-stage" in rest and os.path.exists(d + "/stage_forge"):
+    sys.stdout.write(open(d + "/stage_forge").read())
+    sys.exit(0)
+os.execv(rest[0], rest)
+"""
+
+
+class IdentityTests(Base):
+    """SPE-142: `run --qa-identity` through the real hop code with an injected fake sudo that drops `-n -u NAME -H` and
+    runs the rest as the current user. No real sudo, account, ACL or codex is used; resolve_identity, sweep_identity and
+    the macOS-only environment probe are replaced, so these tests prove the producer's mapping and sealing, not the OS."""
+
+    def setUp(self):
+        super().setUp()
+        # PATH is the setup script's SAFE_PATH under `env -i`, so the fakes name their interpreter explicitly
+        self.fake.write_text(FAKE.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1).replace("@FAKEDIR@", str(self.fake_dir)))
+        self.qahome = self.root / "qahome"
+        self.qahome.mkdir(mode=0o700)
+        self.x = self.root / "x"
+        self.x.mkdir()
+        self.x.chmod(0o711)
+        for sub in ("inbox", "outbox"):
+            (self.x / sub).mkdir(mode=0o700)
+        self.sudo = self.root / "sudo"
+        self.sudo.write_text(FAKE_SUDO.replace("@PY@", sys.executable).replace("@FAKEDIR@", str(self.fake_dir)))
+        self.sudo.chmod(0o755)
+        self.ident = qa.Identity("qauser", os.getuid(), self.qahome, self.x, os.getuid())
+        self.sweeps = []
+        self.isolation = ({"uid": os.getuid(), "foreign_env_leaked": False, "own_env_read": "ok"}, [])
+        qis = qa._qis()
+
+        def sweep(ident):
+            self.assertEqual(ident, self.ident)
+            return self.sweeps.pop(0) if self.sweeps else 0
+        for patch in (unittest.mock.patch.object(qis, "SUDO", str(self.sudo)), unittest.mock.patch.object(qis, "PY", sys.executable),
+                      unittest.mock.patch.object(qa, "resolve_identity", lambda name, exchange: self.ident),
+                      unittest.mock.patch.object(qa, "sweep_identity", sweep),
+                      unittest.mock.patch.object(qis.Setup, "isolation_record", lambda setup, pw: self.isolation)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def run_ident(self, run_dir, extra=()):
+        return self.run_qa(run_dir, extra=("--qa-identity", "qauser", "--exchange", str(self.x)) + tuple(extra))
+
+    def outbox(self):
+        entries = list((self.x / "outbox").iterdir())
+        self.assertEqual(len(entries), 1, entries)
+        return entries[0]
+
+    def inbox(self):
+        entries = [e for e in (self.x / "inbox").iterdir() if e.name != "RUN.lock"]
+        self.assertEqual(len(entries), 1, entries)
+        return entries[0]
+
+    def json(self, path):
+        return json.loads(Path(path).read_text())
+
+    def assert_not_started(self, run_dir, state):
+        self.assertFalse((self.fake_dir / "seen.json").exists())             # codex exec never ran
+        self.assertEqual(self.json(run_dir / "RESULT.json")["state"], state)
+        self.assertFalse((run_dir / "RUNMETA.json").exists())
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())               # the identity lock is released
+
+    def test_identity_run_passes_through_hop_and_seals(self):
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 0, out)
+        meta = self.json(run_dir / "RUNMETA.json")
+        outbox = self.outbox()
+        self.assertEqual(meta["qa_identity"]["name"], "qauser")
+        self.assertEqual(meta["qa_identity"]["attempt"], outbox.name)
+        self.assertEqual((meta["stragglers"], meta["path_ok"], meta["tree_problems"]), (0, True, []))
+        seen = self.seen()
+        codex_home = self.qahome / ".local/state/coding-agent-environment/qa" / outbox.name / "codexhome"
+        self.assertEqual(seen["cwd"], str(outbox / "source"))                 # QA works on its own copy, not R/source
+        self.assertEqual(seen["codex_home"], str(codex_home))                # under the QA user's HOME, outside the outbox
+        self.assertEqual(seen["argv"][seen["argv"].index("-o") + 1], str(outbox / "verdict.json"))
+        self.assertEqual((run_dir / "verdict.json").read_bytes(), (outbox / "verdict.json").read_bytes())   # sealed copy
+        self.assertIn(str(outbox / "out"), (self.fake_dir / "prompt.txt").read_text())
+        self.assertTrue(self.json(run_dir / "ISOLATION.json")["established"])
+        confinement = self.json(run_dir / "CONFINEMENT.json")
+        self.assertTrue(confinement["established"])
+        self.assertEqual(confinement["derived_by"], "producer")
+        for probe in self.json(self.fake_dir / "probes.json"):
+            self.assertEqual(probe["home"], str(codex_home))                  # probed under the exact home codex then uses
+        calls = [json.loads(line) for line in (self.fake_dir / "sudo_calls.jsonl").read_text().splitlines()]
+        self.assertEqual(len(calls), 2)                                      # qa-stage and qa-exec (sweep and probe replaced)
+        for call in calls:
+            self.assertEqual(call[:7], ["-n", "-u", "qauser", "-H", "/usr/bin/env", "-i", "HOME=%s" % self.qahome])
+        self.assertIn("qa-stage", calls[0])
+        self.assertIn("qa-exec", calls[1])
+        self.assertEqual(qa.check_tree(run_dir / "source", self.json(run_dir / "tree-manifest.json")), [])
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())
+        self.assertEqual(self.json(run_dir / "RESULT.json")["state"], "QA_PASS")
+
+    def test_forged_event_on_qa_stderr_is_not_counted(self):
+        self.fake_mode("stderrforge")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertIn("fewer than 2 successful commands", out)
+        self.assertIn('"e0"', (self.outbox() / "stderr.log").read_text())    # it went to the QA-side file
+        self.assertNotIn('"e0"', (run_dir / "events.jsonl").read_text())     # never into the producer's capture
+
+    def test_sudo_not_cached_is_incomplete_codex_not_started(self):
+        (self.fake_dir / "sudo_mode").write_text("refuse")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertIn("sudo -n refused", out)
+        self.assert_not_started(run_dir, "QA_INCOMPLETE")
+
+    def test_env_canary_leak_is_invalid_codex_not_started(self):
+        self.isolation = ({"uid": os.getuid(), "foreign_env_leaked": True}, ["the QA user could read the producer's process environment"])
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("environment isolation not established", out)
+        self.assert_not_started(run_dir, "QA_INVALID")
+        self.assertFalse(self.json(run_dir / "ISOLATION.json")["established"])
+        self.assertEqual(list((self.x / "outbox").iterdir()), [])              # nothing was handed to the QA user
+
+    def test_env_probe_not_run_is_incomplete(self):
+        self.isolation = (None, ["QA-user probe did not run (rc 1): sudo: a password is required"])
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertIn("environment isolation probe did not run", out)
+        self.assert_not_started(run_dir, "QA_INCOMPLETE")
+
+    def test_qa_side_leaky_confinement_is_invalid(self):
+        (self.fake_dir / "sandbox_mode").write_text("leaky")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("read confinement not established", out)
+        self.assert_not_started(run_dir, "QA_INVALID")
+        self.assertFalse(self.json(run_dir / "CONFINEMENT.json")["established"])
+
+    def test_forged_confinement_record_missing_controls_is_invalid(self):
+        forged = [{"control": "pos_read_clone", "observed": "ALLOWED", "ok": True}]            # "established" but incomplete
+        allowed = [{"control": n, "observed": "ALLOWED", "ok": True} for n, _, _ in qa.CONTROLS]  # every control claims ok
+        for controls, text in ((forged, "controls missing"), (allowed, "neg_read_canary expected DENIED")):
+            (self.fake_dir / "stage_forge").write_text(json.dumps({"confinement": {"established": True, "controls": controls}}) + "\n")
+            run_dir = self.prepare()
+            code, out = self.run_ident(run_dir)
+            self.assertEqual(code, 12, out)
+            self.assertIn(text, out)
+            self.assert_not_started(run_dir, "QA_INVALID")
+        (self.fake_dir / "stage_forge").write_text('{"confinement": {}}\n{"second": 1}\n')       # not exactly one record
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("exactly one JSON record", out)
+
+    def test_symlinked_outbox_source_is_invalid(self):
+        self.fake_mode("linksource")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertFalse(self.json(run_dir / "RUNMETA.json")["path_ok"])
+        self.assertIn("outbox", out)
+
+    def test_modified_qa_clone_is_invalid(self):
+        self.fake_mode("dirty")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("tracked files changed", out)
+        self.assertEqual((run_dir / "source/tracked.txt").read_text(), "v1\n")       # the producer's clone was never handed over
+
+    def test_outbox_verdict_link_is_invalid(self):
+        self.fake_mode("linkverdict")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("not a regular file", out)
+        self.assertFalse(os.path.lexists(run_dir / "verdict.json"))                  # the link was never followed or copied
+
+    def test_verdict_idempotent_after_outbox_deleted_or_edited(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir)[0], 0)
+        outbox = self.outbox()
+        (outbox / "verdict.json").write_text(verdict(verified=[{"check": "AC1", "result": "FAIL", "evidence": "x"}]))
+        with open(outbox / "source/tracked.txt", "a") as handle:
+            handle.write("edited after the seal")
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 0)     # sealed values, not the outbox
+        shutil.rmtree(outbox)
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 0)
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 0)
+
+    def test_stragglers_after_sweep_never_pass(self):
+        self.sweeps = [0, 1]                    # clean before the run, one QA-user process survives the seal's sweep
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("survived the sweep", out)
+        self.sweeps = [0, None]                 # a sweep that could not run is no better
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir)[0], 12)
+
+    def test_identity_lock_busy_is_waiting_resource(self):
+        (self.x / "inbox/RUN.lock").write_text("")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 75, out)
+        self.assertEqual(self.json(run_dir / "RESULT.json")["state"], "WAITING_RESOURCE")
+        self.assertTrue((self.x / "inbox/RUN.lock").exists())                       # another run's lock is never removed
+        self.assertFalse((self.fake_dir / "seen.json").exists())
+        self.assertFalse((self.fake_dir / "sudo_calls.jsonl").exists())
+
+    def test_identity_timeout_kills_codex_group_and_is_incomplete(self):
+        self.fake_mode("hang")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir, extra=("--timeout", "12"))
+        self.assertEqual(code, 11, out)
+        self.assertIn("timed out", out)
+        self.assertTrue(self.json(run_dir / "RUNMETA.json")["timed_out"])
+        for name in ("self.pid", "child.pid"):
+            pid = int((self.fake_dir / name).read_text())
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.2)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_missing_isolation_record_after_run_is_invalid(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir)[0], 0)
+        (run_dir / "ISOLATION.json").unlink()
+        code, out = self.call("verdict", "--run-dir", str(run_dir))
+        self.assertEqual(code, 12, out)
+        self.assertIn("ISOLATION.json", out)
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir)[0], 0)
+        record = self.json(run_dir / "CONFINEMENT.json")
+        record["established"] = False
+        (run_dir / "CONFINEMENT.json").write_text(json.dumps(record))
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)
+
+    def test_inbox_source_removed_and_script_sha_recorded(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir)[0], 0)
+        inbox = self.inbox()
+        self.assertFalse((inbox / "source").exists())
+        sha = qa.sha256_file(inbox / "qa-handoff.py")
+        self.assertEqual(sha, qa.sha256_file(SCRIPT))
+        self.assertEqual(self.json(run_dir / "RUNMETA.json")["qa_identity"]["script_sha256"], sha)
+
+    def test_a_seal_that_raises_never_passes(self):
+        run_dir = self.prepare()
+        with unittest.mock.patch.object(qa, "outbox_problems", lambda *a: (_ for _ in ()).throw(RuntimeError("x"))):
+            code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        meta = self.json(run_dir / "RUNMETA.json")
+        self.assertIn("seal failed (RuntimeError)", meta["tree_problems"])
+        self.assertFalse(meta["path_ok"])
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)
+
+    def test_wrong_exchange_layout_is_incomplete_and_nothing_starts(self):
+        self.x.chmod(0o755)
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertIn("exchange is not usable", out)
+        self.assertFalse((self.fake_dir / "sudo_calls.jsonl").exists())
 
 
 if __name__ == "__main__":

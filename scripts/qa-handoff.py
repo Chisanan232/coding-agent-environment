@@ -4,6 +4,8 @@
   qa-handoff.py prepare --repo PATH --sha SHA --ticket T --product P --criteria FILE
                         [--producer-evidence FILE] [--qa-notes FILE] [--root DIR]
   qa-handoff.py run     --run-dir DIR [--timeout SECONDS]
+  qa-handoff.py run     --run-dir DIR --qa-identity NAME --exchange DIR [--require-env-isolation]
+                        (as the dedicated QA OS user; the owner launches it from Terminal: `sudo -v && ...`, SPE-142)
   qa-handoff.py verdict --run-dir DIR
 
 Automates only the missing hop. It follows the existing independent-QA campaign convention (a pinned private clone at
@@ -687,7 +689,7 @@ def run(args):
         return refuse('a run is in progress or was interrupted for this directory; prepare a new attempt')
     try:
         if ident is not None:
-            return refuse('--qa-identity runs are not available in this build')
+            return run_identity(args, run_dir, packet, source, ident)
         return run_locked(args, run_dir, packet, source, read_roots)
     except KeyboardInterrupt:      # Ctrl-C or SIGTERM: codex's group is killed and a hashed run record written; evaluate it
         if (run_dir / 'RUNMETA.json').exists():
@@ -923,6 +925,322 @@ def sweep_identity(ident):
     return count
 
 
+STAGE_SECONDS = 60 * len(CONTROLS) + 60       # the QA-side confinement probe: up to 60 s per control
+
+
+def exchange_problems(ident):
+    """The exchange layout qa-identity-setup.py creates: root-owned 0711 root, producer-owned private inbox, QA-owned
+    private outbox, none of them a link. The ACLs are not re-read here; a missing ACL makes a hop fail, which fails closed."""
+    problems = []
+    for path, uid, mode in ((ident.exchange, ident.exchange_owner, 0o711), (ident.exchange / 'inbox', os.getuid(), 0o700),
+                            (ident.exchange / 'outbox', ident.uid, 0o700)):
+        try:
+            st = os.lstat(path)
+        except OSError:
+            problems.append('%s is missing' % path)
+            continue
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or stat.S_IMODE(st.st_mode) != mode:
+            problems.append('%s must be a directory owned by uid %d with mode %o' % (path, uid, mode))
+    return problems
+
+
+def outbox_problems(ident, outbox):
+    """Every directory component the producer reads the QA output through, checked with lstat after the sweep (no QA
+    process is left to swap one): a real directory, not a link, with the expected owner."""
+    for path, uid in ((ident.exchange, ident.exchange_owner), (ident.exchange / 'outbox', ident.uid), (outbox, ident.uid),
+                      (outbox / 'source', ident.uid)):
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return ['%s is missing' % path]
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            return ['%s is a link or not a directory' % path]
+        if st.st_uid != uid:
+            return ['%s is owned by uid %d, expected %d' % (path, st.st_uid, uid)]
+    return []
+
+
+def read_sealed(path, uid):
+    """Bytes of a QA-written file: a single-link regular file owned by the QA user, at most MAX_VERDICT_BYTES."""
+    with open_regular(path) as handle:
+        st = os.fstat(handle.fileno())
+        if st.st_uid != uid or st.st_nlink != 1 or st.st_size > MAX_VERDICT_BYTES:
+            raise OSError('not a sealed QA file')
+        data = handle.read(MAX_VERDICT_BYTES + 1)
+    if len(data) > MAX_VERDICT_BYTES:
+        raise OSError('file too large')
+    return data
+
+
+def hop(ident, argv, seconds):
+    """(stdout, problem) of one short command run as the QA user through the terminal-detaching sudo hop. Never prompts:
+    a sudo -n refusal is a problem, not a password request."""
+    qis = _qis()
+    try:
+        done = subprocess.run(qis.qa_argv(ident.name, ident.home, argv, alarm=seconds), stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=seconds + 60, cwd='/', env=HOP_ENV)
+    except subprocess.TimeoutExpired:
+        return '', 'timed out'
+    except OSError as error:
+        return '', 'could not start sudo (%s)' % type(error).__name__
+    if sudo_refused(done.stderr):
+        return '', 'sudo -n refused (no cached credential: run `sudo -v` in the owner Terminal first)'
+    if not done.stdout.strip():
+        return '', 'produced no output (exit %s)' % done.returncode
+    return done.stdout, None
+
+
+def parse_confinement(record):
+    """(established, could_not_check, controls, problems) re-derived by the producer from the QA-side probe record: every
+    control of CONTROLS must be present once (the login control only when there is a login), and each one's result is
+    recomputed from what was observed, never taken from the QA side's own `ok` or `established`."""
+    expected = {name: expect for name, _, expect in CONTROLS}
+    rows = record.get('controls') if isinstance(record, dict) else None
+    if not isinstance(rows, list) or not all(isinstance(c, dict) for c in rows):
+        return False, False, [], ['confinement record is malformed']
+    controls, problems, seen = [], [], set()
+    for row in rows:
+        name, observed = row.get('control'), row.get('observed')
+        if name not in expected or name in seen or not isinstance(observed, str):
+            problems.append('unknown, repeated or malformed control %s' % clean(name, 40))
+            continue
+        seen.add(name)
+        want = expected[name]
+        ok = observed == 'ALLOWED' if want == 'ALLOWED' else observed in ('DENIED:1', 'DENIED:13')
+        controls.append({'control': name, 'expected': want, 'observed': clean(observed, 40), 'ok': ok,
+                         'unrunnable': row.get('unrunnable') is True})
+        if not ok:
+            problems.append('%s expected %s, observed %s' % (name, want, clean(observed, 40)))
+    missing = sorted(set(expected) - {'neg_open_auth_file'} - seen)
+    if missing:
+        problems.append('controls missing: %s' % ', '.join(missing))
+    failed = [c for c in controls if not c['ok']]
+    could_not_check = (bool(failed) and not missing and len(controls) == len(rows)
+                       and all(c['unrunnable'] for c in failed))
+    return not problems, could_not_check, controls, problems
+
+
+def run_identity(args, run_dir, packet, source, ident):
+    """The run as the dedicated QA user. One run per identity at a time (X/inbox/RUN.lock): the sweep kills every process
+    of that user, so a second concurrent run would be killed by the first."""
+    problems = exchange_problems(ident)
+    if problems:
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['exchange is not usable: ' + '; '.join(problems[:3]),
+                                                               'codex was not started'])
+    lock = ident.exchange / 'inbox/RUN.lock'
+    try:
+        os.close(os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+    except FileExistsError:       # another run's lock: never removed here
+        return write_result(run_dir, packet, 'WAITING_RESOURCE', ['another QA run holds %s; codex was not started' % lock])
+
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt
+    # From the lock on, TERM and HUP end the run through the normal cleanup, so the identity lock is never left behind
+    # by a signal (a SIGKILL still can: remove the lock by hand once no QA run is active).
+    old = signal.signal(signal.SIGTERM, interrupted)
+    old_hup = signal.getsignal(signal.SIGHUP)
+    if old_hup is not signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, interrupted)
+    try:
+        return run_identity_locked(args, run_dir, packet, source, ident)
+    finally:
+        try:
+            sweep_identity(ident)  # whatever happened, no QA-user process outlives the run
+        except Exception:
+            pass
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
+        signal.signal(signal.SIGTERM, old)
+        if old_hup is not signal.SIG_IGN:
+            signal.signal(signal.SIGHUP, old_hup)
+
+
+def run_identity_locked(args, run_dir, packet, source, ident):
+    qis = _qis()
+    for stale in ('verdict.json', 'ISOLATION.json', 'CONFINEMENT.json'):   # never paired with this attempt
+        try:
+            os.unlink(run_dir / stale)
+        except FileNotFoundError:
+            pass
+    # Hop 0/1 output is trusted only because no model has run yet; a QA-user process left by an earlier run killed
+    # without cleanup could otherwise write into this attempt's outbox while it is being set up.
+    swept = sweep_identity(ident)
+    if swept is None:
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['could not sweep the QA user before the run (sudo -n refused? '
+                                                               'run `sudo -v` in the owner Terminal first); codex was not started'])
+    if swept:
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['%d QA-user processes survived the sweep before the run; '
+                                                               'codex was not started' % swept])
+    # Hop 0: the environment canary. The producer holds a synthetic sentinel in a sibling's environment, proves it can read
+    # it itself, and the probe running as the QA user must not.
+    setup = qis.Setup(ident.name, ident.uid, ident.home, ident.exchange)
+    try:
+        probe, fails = setup.isolation_record(pwd.getpwuid(os.getuid()))
+    except Exception as error:
+        probe, fails = None, ['the isolation probe raised %s' % type(error).__name__]
+    probe = probe if isinstance(probe, dict) else None
+    fails = [clean(f, 300) for f in fails]
+    write_private(run_dir / 'ISOLATION.json', {'established': probe is not None and not fails, 'identity': ident.name,
+                                               'uid': ident.uid, 'fails': fails, 'probe': probe})
+    if probe is None:
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['environment isolation probe did not run: ' + '; '.join(fails[:2]),
+                                                               'codex was not started'])
+    if fails:
+        return write_result(run_dir, packet, 'QA_INVALID', ['environment isolation not established: ' + '; '.join(fails[:3])])
+    attempt = '%s-%s-%s-%s' % (packet['product'], packet['ticket'], run_dir.name, os.urandom(4).hex())
+    inbox, outbox = ident.exchange / 'inbox' / attempt, ident.exchange / 'outbox' / attempt
+    codex_home = ident.home / '.local/state/coding-agent-environment/qa' / attempt / 'codexhome'
+    # The inbox is producer-owned and read-only to the QA user (its inherited ACE): the script, packet, prompt and a copy
+    # of the verified clone. The QA side runs only this copy, with /usr/bin/python3 -I, and its digest is recorded.
+    inbox.mkdir(mode=0o700)
+    script = inbox / 'qa-handoff.py'
+    write_private(script, read_nofollow(Path(__file__).resolve(), 16 << 20))
+    script_sha = sha256_file(script)
+    write_private(inbox / 'packet.json', packet)
+    write_private(inbox / 'prompt.txt', PROMPT.format(product=packet['product'], ticket=packet['ticket'], sha=packet['sha'],
+                                                      criteria=packet['criteria'], producer=packet['producer_evidence'],
+                                                      notes=packet['qa_notes'], out=outbox / 'out'))
+    shutil.copytree(source, inbox / 'source', symlinks=True)
+    tail = ['--inbox', str(inbox), '--outbox', str(outbox), '--codex-home', str(codex_home), '--codex-bin', args.codex_bin]
+    # Hop 1: the QA side creates the outbox, its clone and its private Codex home, and proves read confinement there.
+    try:
+        out, problem = hop(ident, [qis.PY, '-I', str(script), 'qa-stage'] + tail, STAGE_SECONDS)
+    finally:
+        shutil.rmtree(inbox / 'source', ignore_errors=True)   # the QA side has its own copy now
+    if problem:
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['qa-stage %s; codex was not started' % problem])
+    lines = [line for line in out.splitlines() if line.strip()]
+    try:
+        stage = json.loads(lines[0]) if len(lines) == 1 else None
+    except (ValueError, RecursionError):
+        stage = None
+    if not isinstance(stage, dict):
+        write_private(run_dir / 'CONFINEMENT.json', {'profile': PROFILE, 'established': False, 'controls': [], 'malformed': True})
+        return write_result(run_dir, packet, 'QA_INVALID', ['qa-stage did not print exactly one JSON record'])
+    if stage.get('codex_missing') is True:
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['codex could not be started on the QA side (FileNotFoundError)'])
+    if 'error' in stage:
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['qa-stage failed (%s); codex was not started' % clean(stage['error'], 40)])
+    established, could_not_check, controls, problems = parse_confinement(stage.get('confinement'))
+    write_private(run_dir / 'CONFINEMENT.json', {'profile': PROFILE, 'established': established, 'could_not_check': could_not_check,
+                                                 'controls': controls, 'problems': problems, 'derived_by': 'producer',
+                                                 'qa_identity': ident.name})
+    if not established and could_not_check:
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['read confinement could not be checked: ' + '; '.join(problems[:3])])
+    if not established:
+        return write_result(run_dir, packet, 'QA_INVALID', ['read confinement not established: ' + '; '.join(problems[:3])])
+    # Hop 2: codex itself. Its stdout is the pipe the producer captures; the QA side has moved its own stderr to a file.
+    alarm = args.timeout + 60
+    argv = qis.qa_argv(ident.name, ident.home, [qis.PY, '-I', str(script), 'qa-exec'] + tail + ['--timeout', str(args.timeout)],
+                       alarm=alarm)
+    manifest = read_run_json(run_dir / 'tree-manifest.json')
+    info = {'name': ident.name, 'uid': ident.uid, 'exchange': str(ident.exchange), 'attempt': attempt, 'script_sha256': script_sha}
+    return launch(args, run_dir, argv, dict(HOP_ENV), '/', None, timeout=alarm + 60,
+                  seal=lambda proc: seal(run_dir, ident, outbox, manifest, info, proc))
+
+
+def seal(run_dir, ident, outbox, manifest, info, proc):
+    """Freeze what the QA user produced into producer-owned values, so `verdict` never reads the outbox again: sweep the
+    QA user's processes first (nothing can swap a path afterwards), check every outbox component, copy the verdict,
+    compare the QA clone with the manifest once."""
+    extra = {'qa_identity': dict(info), 'stragglers': sweep_identity(ident), 'path_ok': False, 'tree_problems': [],
+             'untracked': {'count': 0, 'sample': []}}
+    if proc.returncode == 124:
+        extra['timed_out'] = True
+    elif proc.returncode == 130:
+        extra['interrupted'] = True
+    verdict = outbox / 'verdict.json'
+    why = outbox_problems(ident, outbox)
+    if why:
+        extra['tree_problems'] = ['the outbox is not a plain QA-owned directory: ' + why[0]]
+        extra['verdict_sha256'] = 'UNREADABLE'
+        return extra
+    extra['path_ok'] = True
+    if os.path.lexists(verdict):
+        try:
+            write_private(run_dir / 'verdict.json', read_sealed(verdict, ident.uid))
+        except OSError:
+            extra['verdict_sha256'] = 'UNREADABLE'
+    extra['tree_problems'] = check_tree(outbox / 'source', manifest)
+    names, truncated = untracked_created(outbox / 'source', manifest)
+    extra['untracked'] = {'count': 'many' if truncated else len(names), 'sample': [clean(n, 80) for n in names[:10]]}
+    return extra
+
+
+def qa_stage(args):
+    """QA side, hop 1 (runs as the QA user). Prints exactly one JSON record on stdout, before any model starts."""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)           # the hop joins stderr to the pipe; only the record may reach the producer
+    os.close(devnull)
+    os.umask(0o077)
+    try:
+        record = stage_outbox(args)
+    except Exception as error:
+        record = {'error': type(error).__name__}
+    sys.stdout.write(json.dumps(record) + '\n')
+    sys.stdout.flush()
+    return 0
+
+
+def stage_outbox(args):
+    inbox, outbox = Path(args.inbox), Path(args.outbox)
+    outbox.mkdir(mode=0o700)      # fails if anything already exists under this attempt name
+    for sub in ('out', 'tmp', 'home', 'cargo-target'):
+        (outbox / sub).mkdir(mode=0o700)
+    shutil.copytree(inbox / 'source', outbox / 'source', symlinks=True)
+    write_private(outbox / 'verdict.schema.json', VERDICT_SCHEMA)
+    if not shutil.which(args.codex_bin):
+        return {'codex_missing': True}
+    home = prepare_codex_home(outbox, home=Path(args.codex_home))
+    record, _ = confinement_probe(args.codex_bin, outbox, isolated_env(outbox, home))
+    return {'confinement': record}
+
+
+class QAStop(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+def qa_exec(args):
+    """QA side, hop 2 (runs as the QA user). Only codex writes fd 1 (the producer's pipe); stderr goes to the outbox; the
+    prompt comes from the producer-owned inbox file. Exit: codex's code, 124 on timeout or alarm, 130 on a signal."""
+    inbox, outbox = Path(args.inbox), Path(args.outbox)
+    err = os.open(outbox / 'stderr.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    os.dup2(err, 2)
+    os.close(err)
+    os.umask(0o077)
+    proc = None
+
+    def stop(signum, frame):
+        raise QAStop(124 if signum == signal.SIGALRM else 130)
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGALRM):
+        signal.signal(sig, stop)
+    try:
+        with open_regular(inbox / 'prompt.txt') as prompt:
+            try:
+                proc = subprocess.Popen(codex_argv(args.codex_bin, outbox), cwd=str(outbox / 'source'),
+                                        env=isolated_env(outbox, Path(args.codex_home)), stdin=prompt, start_new_session=True)
+            except OSError:
+                return 127
+        try:
+            code = proc.wait(timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            kill_group(proc)
+            return 124
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)   # stragglers in codex's own group
+        except OSError:
+            pass
+        return code if code >= 0 else 128 - code
+    except QAStop as stopped:
+        if proc is not None:
+            kill_group(proc)
+        return stopped.code
+
+
 def validate(value, schema, path='verdict'):
     """Minimal JSON-schema check for the subset VERDICT_SCHEMA uses; returns a list of problems."""
     problems = []
@@ -977,6 +1295,36 @@ def no_run_record(run_dir, packet, verdict_path, events):
     return write_result(run_dir, packet, 'NOT_RUN', ['codex has not been run for this attempt'])
 
 
+def tree_problems(run_dir, meta, manifest):
+    """Clone problems: in identity mode the values sealed from the QA clone at the end of the run (the producer's own
+    R/source was never handed to QA), otherwise a live check of R/source."""
+    if 'qa_identity' in meta:
+        sealed = meta.get('tree_problems')
+        if not isinstance(sealed, list) or not all(isinstance(p, str) for p in sealed):
+            return ['sealed clone check is missing']
+        return sealed
+    return check_tree(run_dir / 'source', manifest)
+
+
+def identity_gate(run_dir, meta):
+    """An identity run counts only if the environment canary and read confinement were both established before codex
+    started, every QA-user process was gone after the sweep, and every outbox path was a plain QA-owned directory."""
+    problems = []
+    for name in ('ISOLATION.json', 'CONFINEMENT.json'):
+        try:
+            ok = read_run_json(run_dir / name).get('established') is True
+        except LOAD_ERRORS:
+            ok = False
+        if not ok:
+            problems.append('%s is missing or not established' % name)
+    stragglers = meta.get('stragglers')
+    if type(stragglers) is not int or stragglers != 0:
+        problems.append('QA-user processes survived the sweep or it could not run (%s)' % clean(stragglers, 20))
+    if meta.get('path_ok') is not True:
+        problems.append('the outbox was a link or not owned by the QA user')
+    return problems
+
+
 def evaluate_files(run_dir, packet):
     meta_path, verdict_path, events = run_dir / 'RUNMETA.json', run_dir / 'verdict.json', run_dir / 'events.jsonl'
     if not meta_path.exists():
@@ -985,6 +1333,8 @@ def evaluate_files(run_dir, packet):
     bad = []
     if safe_digest(events) != meta['events_sha256']:
         bad.append('event stream changed after the run')
+    if 'qa_identity' in meta:
+        bad += identity_gate(run_dir, meta)
     try:
         if os.lstat(events).st_size > MAX_EVENTS_BYTES:
             return write_result(run_dir, packet, 'QA_INVALID', bad + ['event stream is too large'])
@@ -996,17 +1346,17 @@ def evaluate_files(run_dir, packet):
         return write_result(run_dir, packet, 'QA_INVALID', bad + ['verdict is not a regular file (link planted?)'])
     if not os.path.lexists(verdict_path):
         if meta.get('interrupted'):
-            tampered = check_tree(run_dir / 'source', read_run_json(run_dir / 'tree-manifest.json'))
+            tampered = tree_problems(run_dir, meta, read_run_json(run_dir / 'tree-manifest.json'))
             if tampered or bad:
                 return write_result(run_dir, packet, 'QA_INVALID', bad + tampered)
             return write_result(run_dir, packet, 'QA_INCOMPLETE', ['interrupted before a verdict'])
         if meta.get('timed_out'):
-            tampered = check_tree(run_dir / 'source', read_run_json(run_dir / 'tree-manifest.json'))
+            tampered = tree_problems(run_dir, meta, read_run_json(run_dir / 'tree-manifest.json'))
             if tampered or bad:               # a timeout does not excuse a modified clone or a changed event stream
                 return write_result(run_dir, packet, 'QA_INVALID', bad + tampered)
             return write_result(run_dir, packet, 'QA_INCOMPLETE', ['timed out before a verdict'])
         if meta['exit_code'] not in (0, None):    # auth, rate limit or crash: codex died before it could answer
-            tampered = check_tree(run_dir / 'source', read_run_json(run_dir / 'tree-manifest.json'))
+            tampered = tree_problems(run_dir, meta, read_run_json(run_dir / 'tree-manifest.json'))
             if tampered or bad:
                 return write_result(run_dir, packet, 'QA_INVALID', bad + tampered)
             return write_result(run_dir, packet, 'QA_INCOMPLETE', ['codex exited %s before writing a verdict; retry with a new attempt' % meta['exit_code']])
@@ -1014,7 +1364,7 @@ def evaluate_files(run_dir, packet):
     if safe_digest(verdict_path) != meta['verdict_sha256']:
         bad.append('verdict changed after the run (tampered)')
     manifest = read_run_json(run_dir / 'tree-manifest.json')
-    bad += check_tree(run_dir / 'source', manifest)
+    bad += tree_problems(run_dir, meta, manifest)
     if manifest['__head__'] != packet['sha']:
         bad.append('tree manifest head does not match the packet')
     try:
@@ -1030,7 +1380,12 @@ def evaluate_files(run_dir, packet):
         bad.append('verdict baseline is not exactly "<product> @ <full packet sha>"')
     if bad:
         return write_result(run_dir, packet, 'QA_INVALID', bad)
-    created, truncated = untracked_created(run_dir / 'source', manifest)
+    if 'qa_identity' in meta:            # sealed at the end of the run: the outbox is never read again
+        untracked = meta['untracked']
+        present, sample = untracked['count'], [clean(n, 80) for n in untracked['sample'][:10]]
+    else:
+        created, truncated = untracked_created(run_dir / 'source', manifest)
+        present, sample = (len(created) if not truncated else 'many'), [clean(n, 80) for n in created[:10]]
     try:
         confinement = read_run_json(run_dir / 'CONFINEMENT.json')
         confinement = {'profile': confinement['profile'], 'established': confinement['established'],
@@ -1040,8 +1395,7 @@ def evaluate_files(run_dir, packet):
     extra = {'confinement': confinement, 'criteria_sha256': hashlib.sha256(packet['criteria'].encode()).hexdigest(),
              'verdict_sha256': meta['verdict_sha256'], 'events_sha256': meta['events_sha256'],
              'commands_completed': commands_completed, 'commands_succeeded': commands_succeeded,
-             'codex_exit_code': meta['exit_code'], 'untracked_files_present': len(created) if not truncated else 'many',
-             'untracked_sample': [clean(n, 80) for n in created[:10]],
+             'codex_exit_code': meta['exit_code'], 'untracked_files_present': present, 'untracked_sample': sample,
              'findings': [{'id': clean(f['id'], 40), 'severity': f['severity'], 'surface': clean(f['surface'], 80)}
                           for f in verdict['suspected_findings']]}
     failing = [c['check'] for c in verdict['verified'] if c['result'] == 'FAIL']
@@ -1075,7 +1429,7 @@ def evaluate_files(run_dir, packet):
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    sub = parser.add_subparsers(dest='cmd', required=True)
+    sub = parser.add_subparsers(dest='cmd', required=True, metavar='{prepare,run,verdict}')
     p = sub.add_parser('prepare')
     p.add_argument('--repo', required=True)
     p.add_argument('--sha', required=True)
@@ -1098,6 +1452,14 @@ def build_parser():
     r.add_argument('--admission-cmd', type=shlex.split, help=argparse.SUPPRESS)   # test hook (one quoted string)
     v = sub.add_parser('verdict')
     v.add_argument('--run-dir', required=True)
+    for name in ('qa-stage', 'qa-exec'):     # internal: run as the QA user by `run --qa-identity`, never by hand
+        q = sub.add_parser(name, help=argparse.SUPPRESS)
+        q.add_argument('--inbox', required=True)
+        q.add_argument('--outbox', required=True)
+        q.add_argument('--codex-home', required=True)
+        q.add_argument('--codex-bin', default='codex')
+        if name == 'qa-exec':
+            q.add_argument('--timeout', type=int, default=1800)
     return parser
 
 
@@ -1106,7 +1468,7 @@ def main(argv=None):
     try:
         if args.cmd == 'verdict':
             return evaluate(args.run_dir)
-        return {'prepare': prepare, 'run': run}[args.cmd](args)
+        return {'prepare': prepare, 'run': run, 'qa-stage': qa_stage, 'qa-exec': qa_exec}[args.cmd](args)
     except PacketInvalid as error:
         return packet_invalid(Path(args.run_dir).resolve(), error)
 
