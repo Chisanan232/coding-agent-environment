@@ -58,6 +58,8 @@ if mode == "crash":         # auth, rate limit or crash: codex dies before it wr
     sys.exit(3)
 if mode == "leftover":      # a background process that outlives codex and edits the clone afterwards
     subprocess.Popen(["sh", "-c", "sleep 3; echo late >> tracked.txt"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+if mode == "slow":          # a long but healthy QA run
+    time.sleep(float(open(d + "/slow_seconds").read()) if os.path.exists(d + "/slow_seconds") else 5)
 if mode == "hangdirty":     # tamper, then never produce a verdict
     open("tracked.txt", "a").write("modified by QA")
     time.sleep(120)
@@ -1207,7 +1209,7 @@ CLEAN_PERSISTENCE = {
 
 
 FAKE_SUDO = r"""#!@PY@
-import json, os, sys
+import json, os, sys, time
 d = "@FAKEDIR@"
 argv = sys.argv[1:]
 mode = open(d + "/sudo_mode").read().strip() if os.path.exists(d + "/sudo_mode") else "ok"
@@ -1220,6 +1222,16 @@ cached_sid = int(open(d + "/sid").read()) if os.path.exists(d + "/sid") else Non
 if mode == "refuse" or (mode == "refuse_exec" and "qa-exec" in argv) or (cached_sid is not None and os.getsid(0) != cached_sid):
     sys.stderr.write("sudo: a password is required\n")
     sys.exit(1)
+# a credential that expires after cred_ttl seconds unless `sudo -n -v` refreshes it (models sudo's timestamp_timeout)
+if os.path.exists(d + "/cred_ttl"):
+    last = float(open(d + "/cred").read()) if os.path.exists(d + "/cred") else 0.0
+    if time.time() - last > float(open(d + "/cred_ttl").read()):
+        sys.stderr.write("sudo: a password is required\n")
+        sys.exit(1)
+if argv == ["-n", "-v"]:
+    if os.path.exists(d + "/cred_ttl"):
+        open(d + "/cred", "w").write(str(time.time()))
+    sys.exit(0)
 if argv[:2] != ["-n", "-u"]:
     sys.exit(98)                          # only the non-interactive form is ever expected
 rest = argv[3:]
@@ -1322,6 +1334,8 @@ class IdentityTests(Base):
         for probe in self.json(self.fake_dir / "probes.json"):
             self.assertEqual(probe["home"], str(codex_home))                  # probed under the exact home codex then uses
         calls = [json.loads(line) for line in (self.fake_dir / "sudo_calls.jsonl").read_text().splitlines()]
+        self.assertTrue(all(call == ["-n", "-v"] for call in calls if "-u" not in call))   # keepalive refreshes only
+        calls = [call for call in calls if "-u" in call]
         self.assertEqual(len(calls), 2)                                      # qa-stage and qa-exec (sweep and probe replaced)
         for call in calls:
             self.assertEqual(call[:7], ["-n", "-u", "qauser", "-H", "/usr/bin/env", "-i", "HOME=%s" % self.qahome])
@@ -1487,6 +1501,46 @@ class IdentityTests(Base):
         run_dir = self.prepare()
         self.assertEqual(self.run_ident(run_dir)[0], 12)
 
+    def slow_run_with_expiring_credential(self, keepalive_seconds):
+        (self.fake_dir / "cred_ttl").write_text("10")                         # sudo forgets the owner after 10 s
+        (self.fake_dir / "cred").write_text(str(time.time()))
+        (self.fake_dir / "slow_seconds").write_text("15")                     # codex runs longer than that
+        self.fake_mode("slow")
+        run_dir = self.prepare()
+        with unittest.mock.patch.object(qa, "KEEPALIVE_SECONDS", keepalive_seconds):
+            code, out = self.run_ident(run_dir)
+        return code, out, run_dir
+
+    def test_sudo_keepalive_keeps_a_long_healthy_run_alive(self):
+        code, out, run_dir = self.slow_run_with_expiring_credential(1)
+        self.assertEqual(code, 0, out)
+        keepalive = self.json(run_dir / "RUNMETA.json")["sudo_keepalive"]
+        self.assertGreaterEqual(keepalive["refreshes"], 5)
+        self.assertEqual(keepalive["failures"], [])
+        self.assertFalse((run_dir / "CLEANUP.json").exists())
+
+    def test_an_expired_sudo_credential_at_the_seal_is_invalid_with_the_true_reason(self):
+        code, out, run_dir = self.slow_run_with_expiring_credential(1000)   # no refresh during the run
+        self.assertEqual(code, 12, out)
+        self.assertIn("sudo -n refused (the sudo credential expired", out)
+        self.assertNotIn("survived the sweep", out)
+        meta = self.json(run_dir / "RUNMETA.json")
+        self.assertTrue(meta["sudo_refused_at_seal"])
+        self.assertTrue(meta["sudo_keepalive"]["failures"])                 # recorded, not silent
+        self.assertIn("sudo -n refused", (run_dir / "CLEANUP.json").read_text())
+
+    def test_a_failed_cleanup_sweep_is_reported_to_the_owner(self):
+        self.sweeps = [0, 0, None]               # pre-run, seal, and the final cleanup sweep that cannot run
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 0, out)           # the seal's own sweep was clean; the note does not change the state
+        self.assertIn("NOTE QA-user processes may survive", out)
+        self.assertIsNone(self.json(run_dir / "RESULT.json")["cleanup"]["sweep"])
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())
+        code, _ = self.call("verdict", "--run-dir", str(run_dir))
+        self.assertEqual(code, 0)
+        self.assertIn("cleanup", self.json(run_dir / "RESULT.json"))      # kept when the result is re-evaluated
+
     def test_scheduled_job_present_is_invalid(self):
         self.persistence = [[], ["the crontab of qauser is not empty"]]      # appears while codex runs
         run_dir = self.prepare()
@@ -1509,7 +1563,7 @@ class IdentityTests(Base):
         code, out = self.run_ident(run_dir)
         self.assertEqual(code, 0, out)
         sids = (self.fake_dir / "sudo_sids").read_text().split()
-        self.assertEqual(len(sids), 2)                                       # qa-stage and qa-exec
+        self.assertGreaterEqual(len(sids), 3)                                # keepalive, qa-stage and qa-exec
         self.assertEqual(set(sids), {str(os.getsid(0))})                     # where the owner's credential is cached
 
     def test_sudo_refused_at_the_codex_hop_is_incomplete_codex_not_started(self):

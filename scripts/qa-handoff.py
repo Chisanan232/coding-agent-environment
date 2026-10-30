@@ -50,6 +50,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -630,6 +631,12 @@ def write_result(run_dir, packet, state, reasons, extra=None):
               'product': packet['product'], 'generated': now(),
               'note': 'QA evidence only; never merge evidence and never an owner-merge review record',
               'mode': run_mode(run_dir)}
+    try:
+        cleanup = read_run_json(Path(run_dir) / 'CLEANUP.json')
+        if isinstance(cleanup, dict):
+            result['cleanup'] = cleanup
+    except LOAD_ERRORS:
+        pass
     result.update(extra or {})
     write_private(Path(run_dir) / 'RESULT.json', result)
     print('%s %s' % (state, '; '.join(reasons) if reasons else ''))
@@ -948,6 +955,57 @@ def resolve_identity(name, exchange):
     return Identity(name, pw.pw_uid, home, xroot, qis.ROOT_UID)
 
 
+KEEPALIVE_SECONDS = 60       # well inside sudo's default 5-minute credential window
+
+
+class SudoKeepalive:
+    """Keeps the owner's cached sudo credential alive for exactly one identity run: `sudo -n -v` (never a prompt) on a
+    daemon thread every KEEPALIVE_SECONDS, from the first successful refresh until stop(). Without it a long codex hop
+    would outlive sudo's window and the seal's sweep would be refused. Every failure is recorded, never dropped."""
+
+    def __init__(self, interval=None):
+        self.interval = KEEPALIVE_SECONDS if interval is None else interval
+        self.refreshes, self.failures = 0, []
+        self._stopped = threading.Event()
+        self._thread = None
+        self._lock = threading.Lock()
+
+    def refresh(self):
+        try:
+            done = subprocess.run([_qis().SUDO, '-n', '-v'], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  timeout=30, cwd='/', env=HOP_ENV)
+            ok = done.returncode == 0
+            why = 'sudo -n refused' if sudo_refused(done.stderr) else 'exit %s' % done.returncode
+        except (OSError, subprocess.SubprocessError) as error:
+            ok, why = False, type(error).__name__
+        with self._lock:
+            if ok:
+                self.refreshes += 1
+            else:
+                self.failures.append('%s %s' % (now(), why))
+        return ok
+
+    def start(self):
+        if not self.refresh():
+            return False
+        self._thread = threading.Thread(target=self._loop, name='sudo-keepalive', daemon=True)
+        self._thread.start()
+        return True
+
+    def _loop(self):
+        while not self._stopped.wait(self.interval):
+            self.refresh()
+
+    def stop(self):
+        self._stopped.set()
+        if self._thread is not None:
+            self._thread.join(timeout=40)
+
+    def summary(self):
+        with self._lock:
+            return {'interval_seconds': self.interval, 'refreshes': self.refreshes, 'failures': list(self.failures[-10:])}
+
+
 def sudo_refused(stderr):
     """sudo -n reports a missing cached credential (or any other refusal) on its own stderr, prefixed `sudo:`."""
     return any(line.startswith('sudo:') for line in (stderr or '').splitlines())
@@ -1145,16 +1203,21 @@ def run_identity(args, run_dir, packet, source, ident):
             have_lock = True
         except FileExistsError:   # another run's lock: never removed here
             return write_result(run_dir, packet, 'WAITING_RESOURCE', ['another QA run holds %s; codex was not started' % lock])
+        keepalive = SudoKeepalive()
+        try:
+            os.unlink(run_dir / 'CLEANUP.json')   # never carried over from an earlier attempt
+        except FileNotFoundError:
+            pass
         for sig in guarded:
             signal.signal(sig, signal.default_int_handler if sig == signal.SIGINT else interrupted)
-        return run_identity_locked(args, run_dir, packet, source, ident)
+        return run_identity_locked(args, run_dir, packet, source, ident, keepalive)
     finally:
         for sig in guarded:
             signal.signal(sig, signal.SIG_IGN)
         try:
             if have_lock:
                 try:
-                    sweep_identity(ident)   # whatever happened, no QA-user process outlives the run
+                    cleanup_sweep(run_dir, ident, keepalive)   # whatever happened, no QA-user process outlives the run
                 except Exception:
                     pass
                 try:
@@ -1167,13 +1230,44 @@ def run_identity(args, run_dir, packet, source, ident):
                     signal.signal(sig, handler)
 
 
-def run_identity_locked(args, run_dir, packet, source, ident):
+def cleanup_sweep(run_dir, ident, keepalive):
+    """The last sweep of a run. A sweep that could not run or left survivors is never silent: one line for the owner, and
+    CLEANUP.json, which RESULT.json carries as `cleanup` (also after `verdict`). It does not change a sealed state: the
+    seal's own sweep already decided that; this only says what may still be running now."""
+    refreshed = keepalive.refresh()
+    try:
+        swept = sweep_identity(ident)
+    finally:
+        keepalive.stop()
+    if refreshed and swept == 0 and type(swept) is int:
+        return
+    note = {'sweep': swept, 'sudo_refreshed': refreshed, 'sudo_keepalive': keepalive.summary(),
+            'note': 'QA-user processes may survive; run `sudo -v` in the owner Terminal, then the next run\'s pre-sweep '
+                    'removes them'}
+    print('NOTE QA-user processes may survive this run (cleanup sweep %s%s); run `sudo -v` in the owner Terminal, then '
+          'the next run\'s pre-sweep removes them' % ('could not run' if swept is None else '%s left' % swept,
+                                                      '' if refreshed else ', sudo -n refused'))
+    write_private(run_dir / 'CLEANUP.json', note)
+    try:
+        result = read_run_json(run_dir / 'RESULT.json')
+        if isinstance(result, dict):
+            result['cleanup'] = note
+            write_private(run_dir / 'RESULT.json', result)
+    except LOAD_ERRORS:
+        pass
+
+
+def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
     qis = _qis()
     for stale in ('verdict.json', 'ISOLATION.json', 'CONFINEMENT.json'):   # never paired with this attempt
         try:
             os.unlink(run_dir / stale)
         except FileNotFoundError:
             pass
+    # Every later hop uses sudo -n; the keepalive starts only after this first refresh succeeds and stops with the run.
+    if not keepalive.start():
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['sudo -n refused (no cached credential: run `sudo -v` in the '
+                                                               'owner Terminal first); codex was not started'])
     # Hop 0/1 output is trusted only because no model has run yet; a QA-user process left by an earlier run killed
     # without cleanup could otherwise write into this attempt's outbox while it is being set up.
     swept = sweep_identity(ident)
@@ -1264,17 +1358,21 @@ def run_identity_locked(args, run_dir, packet, source, ident):
     # Same session as hops 0 and 1 (new_session=False): sudo -n only sees the owner's cached credential from the
     # terminal session it was typed in. The QA side detaches itself (DETACH: setsid as the QA user).
     return launch(args, run_dir, argv, dict(HOP_ENV), '/', None, timeout=alarm + 60, new_session=False,
-                  seal=lambda proc: seal(run_dir, ident, outbox, manifest, info, proc))
+                  seal=lambda proc: seal(run_dir, ident, outbox, manifest, info, proc, keepalive))
 
 
-def seal(run_dir, ident, outbox, manifest, info, proc):
+def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None):
     """Freeze what the QA user produced into producer-owned values, so `verdict` never reads the outbox again: sweep the
     QA user's processes first, open every outbox directory once without following links and check its owner, read the
     verdict relative to the opened outbox, compare the QA clone with the manifest once, then confirm that every path
     component still names the directory that was opened (so the path-based clone check read what was checked)."""
-    extra = {'qa_identity': dict(info), 'stragglers': sweep_identity(ident, recheck=RESPAWN_SECONDS), 'path_ok': False,
-             'tree_problems': [],
+    # A refused refresh here means the checks below cannot run: recorded as such, not as surviving processes.
+    refused = keepalive is not None and not keepalive.refresh()
+    extra = {'qa_identity': dict(info), 'sudo_refused_at_seal': refused,
+             'stragglers': sweep_identity(ident, recheck=RESPAWN_SECONDS), 'path_ok': False, 'tree_problems': [],
              'untracked': {'count': 0, 'sample': []}}
+    if keepalive is not None:
+        extra['sudo_keepalive'] = keepalive.summary()
     # Zero processes is not enough if the QA user can be started again later by the system on its behalf.
     extra['persistence'] = persistence_problems(ident)
     if proc.returncode == 124:
@@ -1524,7 +1622,10 @@ def identity_gate(run_dir, meta):
     if meta.get('profile_changed') is not None and meta.get('profile_changed') is not False:
         problems.append('the permission profile changed between the confinement probe and codex; codex was not started')
     stragglers = meta.get('stragglers')
-    if type(stragglers) is not int or stragglers != 0:
+    if meta.get('sudo_refused_at_seal') is True:
+        problems.append('could not check the QA user after codex ran: sudo -n refused (the sudo credential expired or was '
+                        'revoked); fail closed')
+    elif type(stragglers) is not int or stragglers != 0:
         problems.append('QA-user processes survived the sweep or it could not run (%s)' % clean(stragglers, 20))
     if meta.get('path_ok') is not True:
         problems.append('the outbox was a link or not owned by the QA user')
