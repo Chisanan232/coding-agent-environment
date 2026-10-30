@@ -352,7 +352,7 @@ def reservations_dir(state_path):
     return state_path.parent / RESERVATIONS_DIR
 
 
-def write_reservation(state_path, label, nbytes, pid, token, expires):
+def write_reservation(state_path, label, nbytes, pid, token, expires, queue_id=None):
     """Create or replace this job's reservation file; call while holding state_lock."""
     directory = reservations_dir(state_path)
     _refuse_symlinks(directory / label)
@@ -360,6 +360,8 @@ def write_reservation(state_path, label, nbytes, pid, token, expires):
     os.chmod(directory, 0o700)
     record = {'version': STATE_VERSION, 'label': label, 'bytes': nbytes, 'pid': pid,
               'start_token': token, 'expires': iso_utc(expires)}
+    if queue_id:
+        record['queue_id'] = queue_id
     write_json_atomic(directory / (label + '.json'), record)
     return record
 
@@ -509,17 +511,25 @@ def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None
             if same and (same[0]['pid'], same[0]['start_token']) != (pid, token):
                 return dict(result, admit=False, reason='label-in-use: %s belongs to another live process' % label)
             others = [r for r in live if r['label'] != label]
+            queued, queue_problems = _queue_entries(state_path)
+            if queue_problems and (not same or nbytes > same[0]['bytes']):
+                # With a damaged queue only a same-process refresh that does not grow its bytes can pass.
+                return dict(result, admit=False, reason=queue_problems[0])
+            # Only the claiming process itself (same pid and start token) is excused from the orphan count; an orphan that
+            # holds this label under another process keeps its lane and the label.
+            orphans = [] if queue_problems else [e for e in _claimed_orphans(queued, live, token_fn)
+                                                  if not (e['label'] == label and e['holder']['pid'] == pid
+                                                          and e['holder']['start_token'] == token)]
+            if not same and any(e['label'] == label for e in orphans):
+                return dict(result, admit=False, reason='label-in-use: %s belongs to a running claimed job' % label)
             if not same:
-                queued, queue_problems = _queue_entries(state_path)
-                if queue_problems:
-                    return dict(result, admit=False, reason=queue_problems[0])
-                ahead = [e for e in queued if e['state'] in LIVE_STATES and not _entry_lapsed(e, now)]
+                ahead = [e for e in queued if e['state'] in WAITING_STATES and not _entry_lapsed(e, now)]
                 if ahead:
                     return dict(result, admit=False, reason='queue-ahead: %d queued entries wait for the heavy lane (first %s, %s); '
                                 'enqueue instead of reserving directly' % (len(ahead), ahead[0]['id'], ahead[0]['label']))
             lanes = HEAVY_LANES[result['tier']]
-            reserved = sum(r['bytes'] for r in others)
-            if len(others) >= lanes:
+            reserved = sum(r['bytes'] for r in others) + sum(e['bytes'] for e in orphans)
+            if len(others) + len(orphans) >= lanes:
                 return dict(result, admit=False, reserved_bytes=reserved,
                             reason='lane-cap: %d of %d heavy lanes in use (%s)' % (len(others), lanes, ', '.join(
                                 '%s pid %d%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '')
@@ -566,7 +576,8 @@ QUEUE_VERSION = 1
 QUEUE_WAIT_S = 24 * 3600
 QUEUE_GRANT_S = 3600
 QUEUE_MAX_GRANT_S = 4 * 3600
-LIVE_STATES = ('QUEUED', 'ELIGIBLE', 'GRANTED')
+WAITING_STATES = ('QUEUED', 'ELIGIBLE', 'GRANTED')
+LIVE_STATES = WAITING_STATES + ('CLAIMED',)
 TERMINAL_STATES = ('RELEASED', 'EXPIRED', 'CANCELLED')
 HARNESSES = ('claude', 'codex')
 TICKET_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,31}')
@@ -623,7 +634,9 @@ def _read_queue_entry(path):
              and isinstance(entry.get('tickets'), list) and entry.get('harness') in HARNESSES
              and isinstance(entry.get('fingerprint'), str) and len(entry['fingerprint']) == 64
              and isinstance(entry.get('wait_expires'), str)
-             and (entry.get('grant') is None or (isinstance(entry['grant'], dict) and isinstance(entry['grant'].get('expires'), str))))
+             and (entry.get('grant') is None or (isinstance(entry['grant'], dict) and isinstance(entry['grant'].get('expires'), str)))
+             and (entry['state'] != 'CLAIMED' or (isinstance(entry.get('holder'), dict) and type(entry['holder'].get('pid')) is int
+                                                  and isinstance(entry['holder'].get('start_token'), str))))
     if not valid:
         raise ValueError('wrong schema')
     return entry
@@ -702,6 +715,24 @@ def _entry_lapsed(entry, now):
     return False
 
 
+def _claimed_orphans(entries, live, token_fn):
+    """CLAIMED entries whose holder is still the same live process but whose reservation file is gone (explicit `release`
+    while the job runs). They keep occupying a lane and their bytes: a deleted file is not evidence the job stopped."""
+    held = {(r['label'], r['pid']) for r in live}
+    orphans = []
+    for entry in entries:
+        if entry['state'] != 'CLAIMED' or (entry['label'], entry['holder']['pid']) in held:
+            continue
+        try:
+            current = token_fn(entry['holder']['pid'])
+        except ReservationError:
+            orphans.append(entry)  # unverifiable stays counted
+            continue
+        if current is not None and current == entry['holder']['start_token']:
+            orphans.append(entry)
+    return orphans
+
+
 def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_id, nbytes, argv, again=False, now=None,
                   wait_s=QUEUE_WAIT_S):
     """Add one durable entry, or return the live one with the same fingerprint. Never stores argv."""
@@ -778,7 +809,7 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
             _write_queue_entry(state_path, entry)
             receipt_ok = _queue_receipt(state_path, 'enqueued', entry, now)
             return {'ok': True, 'id': entry['id'], 'receipt_ok': receipt_ok, 'reason': 'queued as %s (position %d)' % (
-                entry['id'], 1 + sum(1 for e in entries if e['state'] in LIVE_STATES and not _entry_lapsed(e, now)))}
+                entry['id'], 1 + sum(1 for e in entries if e['state'] in WAITING_STATES and not _entry_lapsed(e, now)))}
     except StateError as exc:
         return {'ok': False, 'reason': '%s: %s' % (exc.kind, exc)}
     except OSError as exc:
@@ -799,7 +830,7 @@ def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=pro
     unlapsed grant. Nothing here ever signals or releases a holder.
     """
     now = now or datetime.now(timezone.utc)
-    out = {'granted': [], 'expired': [], 'eligible': [], 'reason': 'ok'}
+    out = {'granted': [], 'expired': [], 'eligible': [], 'released': [], 'reason': 'ok'}
     if not (type(grant_s) is int and 0 < grant_s <= QUEUE_MAX_GRANT_S):
         out['reason'] = 'invalid-request: grant window out of range'
         return out
@@ -812,6 +843,33 @@ def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=pro
             if problems:
                 out['reason'] = problems[0]
                 return out
+            result = _evaluate_locked(None, state_path, free_fn, now)
+            if result['tier'] is None:
+                out['reason'] = result['reason']
+                return out
+            live, res_problems = live_reservations(state_path, now, token_fn)
+            if res_problems:
+                out['reason'] = res_problems[0]
+                return out
+            for entry in entries:
+                if entry['state'] != 'CLAIMED':
+                    continue
+                holder = entry['holder']
+                try:
+                    current = token_fn(holder['pid'])
+                except ReservationError:
+                    continue  # unverifiable: the lane stays occupied (fail closed)
+                if current is None:
+                    evidence, alive = 'holder-exited', False
+                elif current != holder['start_token']:
+                    evidence, alive = 'pid-reused', False
+                else:
+                    continue  # still the same live process: the lane stays occupied, with or without its reservation file
+                entry['state'] = 'RELEASED'
+                entry['release'] = {'at': iso_utc(now), 'evidence': evidence, 'holder_alive': alive}
+                _write_queue_entry(state_path, entry)
+                _queue_receipt(state_path, 'released', entry, now, evidence=evidence, holder_alive=alive)
+                out['released'].append(entry['id'])
             for entry in entries:
                 try:
                     lapsed = (entry['state'] == 'GRANTED' and _parse_time(entry['grant']['expires']) <= now) or (
@@ -826,14 +884,6 @@ def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=pro
                     _drop_marker(state_path, entry['id'])
                     _queue_receipt(state_path, 'expired', entry, now, was=was)
                     out['expired'].append(entry['id'])
-            result = _evaluate_locked(None, state_path, free_fn, now)
-            if result['tier'] is None:
-                out['reason'] = result['reason']
-                return out
-            live, res_problems = live_reservations(state_path, now, token_fn)
-            if res_problems:
-                out['reason'] = res_problems[0]
-                return out
             waiting = [e for e in entries if e['state'] in ('QUEUED', 'ELIGIBLE')]
             granted = [e for e in entries if e['state'] == 'GRANTED']
             if not waiting:
@@ -848,10 +898,11 @@ def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=pro
                 out['eligible'].append(first['id'])
                 out['reason'] = 'no heavy lane at tier %s' % result['tier']
                 return out
-            if len(live) + len(granted) >= lanes:
+            orphans = _claimed_orphans(entries, live, token_fn)
+            if len(live) + len(granted) + len(orphans) >= lanes:
                 out['reason'] = 'lane occupied'
                 return out
-            reserved = sum(r['bytes'] for r in live)
+            reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
             if result['free_bytes'] - reserved - first['bytes'] < HEAVY_FLOOR:
                 out['reason'] = 'over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested for %s, floor 100 GiB' % (
                     result['free_bytes'] / GIB, reserved / GIB, first['bytes'] / GIB, first['id'])
@@ -874,6 +925,158 @@ def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=pro
         return out
 
 
+def _memory_precondition():
+    """Fresh memory, CPU and heavy-process check via the existing SPE-117 gate (memory only: disk is judged under our lock)."""
+    script = Path(__file__).resolve().with_name('memory-admission.py')
+    try:
+        done = subprocess.run([sys.executable, str(script), 'check', '--weight', 'heavy', '--memory-only'], capture_output=True,
+                              text=True, timeout=120, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, 'memory-gate-unavailable: %s' % exc
+    lines = [line.strip() for line in done.stdout.splitlines() if line.strip()]
+    return done.returncode == 0, (lines[0] if lines else 'memory gate exit %d' % done.returncode)
+
+
+def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_bytes, pid=None, now=None, token_fn=process_token,
+                owner_fn=process_owner, ttl=DEFAULT_TTL, memory_fn=_memory_precondition, exec_fn=None, allow_long=False):
+    """Claim a granted lane for this very process, then exec the job; every precondition is revalidated first.
+
+    Outside the lock: the entry must be GRANTED and unlapsed, owned by this uid, and match label, bytes, worktree and job
+    fingerprint; then fresh memory/CPU/heavy-process admission. Under the lock: the entry again, then tier, latch, lane
+    count (the grant itself does not count), disk floor and our own process; the reservation and the holder are written in
+    one critical section. A refusal keeps the grant. Returns a dict with ok, reason and exit (77 refused, 127 exec failed).
+    """
+    fresh_clock = now is None
+    now = now or datetime.now(timezone.utc)
+    pid = pid or os.getpid()
+    exec_fn = exec_fn or _exec_job
+
+    def refuse(reason):
+        return {'ok': False, 'reason': reason, 'exit': REFUSED_EXIT}
+
+    if not (isinstance(qid, str) and QUEUE_ID_RE.fullmatch(qid) and isinstance(label, str) and LABEL_RE.fullmatch(label)
+            and type(nbytes) is int and nbytes > 0 and type(ttl) is int and 0 < ttl <= (MAX_TTL if allow_long else DEFAULT_TTL)
+            and isinstance(argv, list) and argv and all(isinstance(a, str) and '\0' not in a for a in argv) and argv[0]):
+        return refuse('invalid-request: queue id, label, bytes, ttl or command is out of range')
+
+    def check_entry(entry):
+        if entry is None:
+            return 'no queue entry %s' % qid
+        if entry['state'] != 'GRANTED':
+            return '%s is not granted (state %s)' % (qid, entry['state'])
+        try:
+            if _parse_time(entry['grant']['expires']) <= now:
+                return 'grant for %s lapsed; run queue advance and wait for the next grant' % qid
+        except (KeyError, ValueError, TypeError):
+            return 'queue-entry-unreadable: %s grant time' % qid
+        if entry['owner_uid'] != os.getuid():
+            return '%s belongs to another user' % qid
+        if entry['label'] != label or entry['bytes'] != nbytes:
+            return '%s was granted for label %s and %d bytes' % (qid, entry['label'], entry['bytes'])
+        if os.path.realpath(cwd) != entry['worktree']:
+            return '%s was granted for worktree %s' % (qid, entry['worktree'])
+        try:
+            salt = _queue_salt(state_path)
+        except (OSError, ValueError) as exc:
+            return 'queue-salt-unreadable: %s' % exc
+        if _fingerprint(salt, entry['repo'], entry['worktree'], entry['tickets'], argv, nbytes) != entry['fingerprint']:
+            return '%s was granted for a different job (fingerprint mismatch)' % qid
+        return None
+
+    def find(entries):
+        return next((e for e in entries if e['id'] == qid), None)
+
+    try:
+        with state_lock(state_path):
+            entries, problems = _queue_entries(state_path)
+            if problems:
+                return refuse(problems[0])
+            why = check_entry(find(entries))
+        if why:
+            return refuse(why)
+        admitted, memory_reason = memory_fn()
+        if not admitted:
+            return refuse('memory-gate: %s' % memory_reason)
+        if fresh_clock:
+            now = datetime.now(timezone.utc)  # the memory gate takes 10 s or more; judge lapse and expiry at the real time
+        with state_lock(state_path):
+            entries, problems = _queue_entries(state_path)
+            if problems:
+                return refuse(problems[0])
+            entry = find(entries)
+            why = check_entry(entry)
+            if why:
+                return refuse(why)
+            result = _evaluate_locked('heavy', state_path, free_fn, now)
+            if not result['admit']:
+                return refuse(result['reason'])
+            live, res_problems = live_reservations(state_path, now, token_fn)
+            if res_problems:
+                return refuse(res_problems[0])
+            token = token_fn(pid)
+            if token is None:
+                return refuse('process-not-running: pid %d' % pid)
+            try:
+                owner = owner_fn(pid)
+            except ReservationError as exc:
+                return refuse('process-unverifiable: %s' % exc)
+            if owner != os.getuid():
+                return refuse('process-not-owned: pid %d is not run by this user' % pid)
+            if any(r['label'] == label for r in live):
+                return refuse('label-in-use: %s already holds a reservation' % label)
+            orphans = _claimed_orphans(entries, live, token_fn)
+            lanes = HEAVY_LANES[result['tier']]
+            if len(live) + len(orphans) >= lanes:
+                return refuse('lane-cap: %d of %d heavy lanes in use (%s)' % (len(live) + len(orphans), lanes, ', '.join(
+                    ['%s pid %d%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '') for r in live] +
+                    ['%s pid %d (reservation removed, job still running)' % (e['label'], e['holder']['pid']) for e in orphans])))
+            reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
+            if result['free_bytes'] - reserved - nbytes < HEAVY_FLOOR:
+                return refuse('over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
+                    result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB))
+            write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), queue_id=qid)
+            try:
+                entry['state'] = 'CLAIMED'
+                entry['holder'] = {'pid': pid, 'start_token': token, 'claimed_at': iso_utc(now)}
+                _write_queue_entry(state_path, entry)
+            except OSError:
+                try:
+                    (reservations_dir(state_path) / (label + '.json')).unlink()  # no half claim: the job is not exec'd
+                except OSError:
+                    pass
+                raise
+            try:
+                _drop_marker(state_path, qid)
+            except OSError:
+                pass  # a stale marker is harmless: the entry is CLAIMED and the grant cannot be claimed again
+            _queue_receipt(state_path, 'claimed', entry, now, pid=pid)
+    except StateError as exc:
+        return refuse('%s: %s' % (exc.kind, exc))
+    except OSError as exc:
+        return refuse('state-unwritable: %s' % exc)
+    try:
+        exec_fn(argv[0], argv)
+    except OSError as exc:
+        release(label, state_path)
+        _queue_mark_released(state_path, qid, now, 'exec-failed', False)
+        return {'ok': False, 'reason': 'exec failed: %s' % exc, 'exit': 127}
+    return {'ok': True, 'reason': 'claimed %s for %s' % (qid, label), 'exit': 0}
+
+
+def _queue_mark_released(state_path, qid, now, evidence, alive):
+    try:
+        with state_lock(state_path):
+            entries, _ = _queue_entries(state_path)
+            for entry in entries:
+                if entry['id'] == qid and entry['state'] == 'CLAIMED':
+                    entry['state'] = 'RELEASED'
+                    entry['release'] = {'at': iso_utc(now), 'evidence': evidence, 'holder_alive': alive}
+                    _write_queue_entry(state_path, entry)
+                    _queue_receipt(state_path, 'released', entry, now, evidence=evidence, holder_alive=alive)
+    except (StateError, OSError):
+        pass
+
+
 def _handoff(entry):
     """Commands for the owner to run. They are printed, never executed; resuming a session is explicit."""
     if entry['harness'] == 'claude':
@@ -881,8 +1084,8 @@ def _handoff(entry):
     else:
         resume = ('cd %s && codex exec resume %s  # codex exec resume is unverified in this environment' %
                   (shlex.quote(entry['worktree']), entry['session_id']))
-    claim = ('disk-admission.py run --queue-id %s --label %s --bytes %d -- <the exact job>  '
-             '# claim lands with the next SPE-111 increment' % (entry['id'], entry['label'], entry['bytes']))
+    claim = ('cd %s && disk-admission.py run --queue-id %s --label %s --bytes %d -- <the exact job>' % (
+        shlex.quote(entry['worktree']), entry['id'], entry['label'], entry['bytes']))
     return {'resume': resume, 'claim': claim}
 
 
@@ -915,8 +1118,10 @@ def queue_cancel(state_path, qid, now=None, session_id=None):
             for entry in entries:
                 if entry['id'] != qid:
                     continue
-                if entry['state'] not in LIVE_STATES:
-                    return {'ok': False, 'reason': '%s is already %s' % (qid, entry['state'])}
+                if entry['state'] not in WAITING_STATES:
+                    return {'ok': False, 'reason': '%s is %s; cancel never stops a running job%s' % (
+                        qid, entry['state'], ' (stop the job itself, then queue advance records the release)'
+                        if entry['state'] == 'CLAIMED' else '')}
                 if session_id is not None and entry.get('session_id') != session_id:
                     return {'ok': False, 'reason': '%s belongs to another session' % qid}
                 was = entry['state']
@@ -1093,6 +1298,7 @@ def build_parser():
     go.add_argument('--label', required=True)
     go.add_argument('--ttl-s', type=int, default=DEFAULT_TTL, dest='ttl', help='seconds, at most 4 h unless --max-hold')
     go.add_argument('--max-hold', action='store_true', dest='allow_long')
+    go.add_argument('--queue-id', dest='queue_id', help='claim a granted heavy-lane queue entry (revalidated first)')
     go.add_argument('job', nargs=argparse.REMAINDER, help='-- COMMAND [ARG...]')
     drop = commands.add_parser('release', allow_abbrev=False, help='release a reservation by label')
     drop.add_argument('--label', required=True)
@@ -1154,6 +1360,12 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
             print('refused: invalid-request: put -- between the options and the command', file=sys.stderr)
             return REFUSED_EXIT
         job = args.job[1:]
+        if args.queue_id:
+            out = queue_claim(state_path, args.queue_id, args.label, args.nbytes, job, os.getcwd(), free_fn, ttl=args.ttl,
+                              allow_long=args.allow_long)
+            if not out['ok']:
+                print(out['reason'], file=sys.stderr)
+            return out['exit'] if not out['ok'] else 0
         return run_reserved(args.label, args.nbytes, job, state_path, free_fn, args.ttl, args.allow_long)
     if args.command == 'queue':
         return _queue_cli(args, state_path, free_fn)

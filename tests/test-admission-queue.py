@@ -231,6 +231,279 @@ class Receipts(QueueBase):
         self.assertEqual(stat.S_IMODE(receipts.stat().st_mode), 0o600)
 
 
+class Claim(QueueBase):
+    ARGV = ['cargo', 'nextest', 'run', '--token', SECRET_ARG]
+
+    def grant(self, ticket='HORO-2070'):
+        qid = self.enqueue(ticket)['id']
+        self.advance()
+        return qid
+
+    def claim(self, qid, argv=None, label=None, nbytes=20 * GIB, cwd=None, free=400 * GIB, pid=None, now=None, memory_ok=True,
+              token_fn=None):
+        calls = {'exec': [], 'memory': 0}
+
+        def exec_fn(program, args):
+            calls['exec'].append((program, list(args)))
+
+        def memory_fn():
+            calls['memory'] += 1
+            return (True, 'ok') if memory_ok else (False, 'memory pressure')
+
+        kwargs = {} if token_fn is None else {'token_fn': token_fn}
+        out = da.queue_claim(self.path, qid, label or 'nda-horo-2070', nbytes, self.ARGV if argv is None else argv,
+                             str(cwd or self.worktree), lambda: free, pid=pid or os.getpid(), now=now or self.now,
+                             memory_fn=memory_fn, exec_fn=exec_fn, **kwargs)
+        out['calls'] = calls
+        return out
+
+    def test_valid_claim_writes_the_holder_reservation_and_execs(self):
+        qid = self.grant()
+        out = self.claim(qid)
+        self.assertTrue(out['ok'], out)
+        self.assertEqual(out['calls']['exec'], [('cargo', self.ARGV)])
+        self.assertEqual(out['calls']['memory'], 1)
+        entry = self.entries()[qid]
+        self.assertEqual(entry['state'], 'CLAIMED')
+        self.assertEqual(entry['holder']['pid'], os.getpid())
+        record = json.loads((self.path.parent / 'reservations/nda-horo-2070.json').read_text())
+        self.assertEqual(record['queue_id'], qid)
+        events = [json.loads(line)['event'] for line in (self.path.parent / 'queue/receipts.jsonl').read_text().splitlines()]
+        self.assertEqual(events, ['enqueued', 'granted', 'claimed'])
+        self.assertFalse((self.path.parent / 'queue/granted' / qid).exists())
+
+    def test_wrong_job_worktree_label_or_bytes_is_refused_and_keeps_the_grant(self):
+        qid = self.grant()
+        other = Path(self.temp.name) / 'elsewhere'
+        other.mkdir()
+        cases = [dict(argv=['cargo', 'test']), dict(cwd=other), dict(label='someone-else'), dict(nbytes=21 * GIB)]
+        for bad in cases:
+            out = self.claim(qid, **bad)
+            self.assertFalse(out['ok'], bad)
+            self.assertEqual(out['calls']['exec'], [])
+        self.assertEqual(self.entries()[qid]['state'], 'GRANTED')
+        self.assertTrue(self.claim(qid)['ok'])
+
+    def test_not_granted_or_lapsed_or_unknown_is_refused(self):
+        qid = self.grant('HORO-2070')
+        waiting = self.enqueue('HORO-2071')['id']
+        self.assertIn('not granted', self.claim(waiting, label='nda-horo-2071')['reason'])
+        late = self.claim(qid, now=self.now + timedelta(hours=3))
+        self.assertFalse(late['ok'])
+        self.assertIn('lapsed', late['reason'])
+        self.assertFalse(self.claim('q999999')['ok'])
+
+    def test_failed_entry_write_leaves_no_reservation_and_no_exec(self):
+        qid = self.grant()
+        real = da._write_queue_entry
+
+        def broken(state_path, entry):
+            raise OSError('disk full')
+
+        da._write_queue_entry = broken
+        try:
+            out = self.claim(qid)
+        finally:
+            da._write_queue_entry = real
+        self.assertFalse(out['ok'])
+        self.assertEqual(out['calls']['exec'], [])
+        self.assertFalse((self.path.parent / 'reservations/nda-horo-2070.json').exists())
+        self.assertEqual(self.entries()[qid]['state'], 'GRANTED')
+
+    def test_second_claim_of_the_same_grant_is_refused(self):
+        qid = self.grant()
+        self.assertTrue(self.claim(qid)['ok'])
+        again = self.claim(qid)
+        self.assertFalse(again['ok'])
+        self.assertEqual(again['calls']['exec'], [])
+
+    def test_memory_refusal_keeps_the_grant_and_a_retry_succeeds(self):
+        qid = self.grant()
+        refused = self.claim(qid, memory_ok=False)
+        self.assertFalse(refused['ok'])
+        self.assertEqual(refused['exit'], 77)
+        self.assertEqual(self.entries()[qid]['state'], 'GRANTED')
+        self.assertTrue(self.claim(qid)['ok'])
+
+    def test_a_holder_that_appeared_after_the_grant_blocks_the_claim(self):
+        qid = self.grant()
+        intruder = subprocess.Popen(['/bin/sleep', '300'])
+        self.holders.append(intruder)
+        with da.state_lock(self.path):  # bypasses reserve(): a wrapper that does not honour the queue guard
+            da.write_reservation(self.path, 'late-intruder', 10 * GIB, intruder.pid, da.process_token(intruder.pid),
+                                 self.now + timedelta(hours=1))
+        out = self.claim(qid)
+        self.assertFalse(out['ok'])
+        self.assertIn('lane-cap', out['reason'])
+        self.assertEqual(self.entries()[qid]['state'], 'GRANTED')
+
+    def test_disk_floor_is_revalidated_at_claim_time(self):
+        qid = self.grant()
+        out = self.claim(qid, free=110 * GIB)
+        self.assertFalse(out['ok'])
+        self.assertIn('over-capacity', out['reason'])
+        out = self.claim(qid, free=50 * GIB)
+        self.assertFalse(out['ok'])
+
+    def test_exec_failure_releases_the_reservation_and_the_entry(self):
+        qid = self.grant()
+        out = da.queue_claim(self.path, qid, 'nda-horo-2070', 20 * GIB, self.ARGV, str(self.worktree), lambda: 400 * GIB,
+                             pid=os.getpid(), now=self.now, memory_fn=lambda: (True, 'ok'),
+                             exec_fn=lambda program, args: (_ for _ in ()).throw(OSError('boom')))
+        self.assertEqual(out['exit'], 127)
+        self.assertFalse((self.path.parent / 'reservations/nda-horo-2070.json').exists())
+        entry = self.entries()[qid]
+        self.assertEqual((entry['state'], entry['release']['evidence']), ('RELEASED', 'exec-failed'))
+
+
+class ReleaseEvidence(QueueBase):
+    def claimed(self, ticket='HORO-2070'):
+        """Entry claimed by a real subprocess standing in for the exec'd job."""
+        qid = self.enqueue(ticket)['id']
+        self.advance()
+        job = subprocess.Popen(['/bin/sleep', '300'])
+        self.holders.append(job)
+        out = da.queue_claim(self.path, qid, 'nda-' + ticket.lower(), 20 * GIB, Claim.ARGV, str(self.worktree), lambda: 400 * GIB,
+                             pid=job.pid, now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda program, args: None)
+        self.assertTrue(out['ok'], out)
+        return qid, job
+
+    def test_exit_of_the_verified_holder_releases_and_grants_the_next_entry(self):
+        a, job = self.claimed('HORO-2070')
+        b = self.enqueue('HORO-2071')['id']
+        self.assertEqual(self.advance()['granted'], [])
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+        job.kill()
+        job.wait()
+        out = self.advance()
+        self.assertEqual(out['granted'], [b])
+        release = self.entries()[a]['release']
+        self.assertEqual((self.entries()[a]['state'], release['evidence'], release['holder_alive']), ('RELEASED', 'holder-exited', False))
+        self.assertTrue((self.path.parent / 'queue/granted' / b).exists())
+
+    def test_past_ttl_but_alive_holder_is_not_released(self):
+        a, job = self.claimed()
+        self.enqueue('HORO-2071')
+        out = self.advance(now=self.now + timedelta(hours=12))
+        self.assertEqual(out['granted'], [])
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+
+    def test_pid_reuse_is_recorded_as_such(self):
+        a, job = self.claimed()
+        reservation = self.path.parent / 'reservations/nda-horo-2070.json'
+        entry_path = self.path.parent / 'queue' / (a + '.json')
+        entry = json.loads(entry_path.read_text())
+        entry['holder']['start_token'] = 'Mon Jan  1 00:00:00 2001'
+        entry_path.write_text(json.dumps(entry))
+        record = json.loads(reservation.read_text())
+        record['start_token'] = 'Mon Jan  1 00:00:00 2001'
+        reservation.write_text(json.dumps(record))
+        self.advance()
+        self.assertEqual(self.entries()[a]['release']['evidence'], 'pid-reused')
+
+    def test_unverifiable_holder_stays_claimed(self):
+        a, job = self.claimed()
+        self.enqueue('HORO-2071')
+
+        def broken(pid):
+            raise da.ReservationError('ps unavailable')
+
+        out = da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, token_fn=broken)
+        self.assertEqual(out['granted'], [])
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+
+    def test_explicit_release_of_a_live_holder_does_not_free_the_lane(self):
+        a, job = self.claimed()
+        b = self.enqueue('HORO-2071')['id']
+        da.release('nda-horo-2070', self.path)  # any same-uid caller can do this while the job runs
+        out = self.advance()
+        self.assertEqual(out['granted'], [])
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+        proc = subprocess.Popen(['/bin/sleep', '300'])
+        self.holders.append(proc)
+        da.queue_cancel(self.path, b, now=self.now)
+        refused = da.reserve('plain', 10 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertFalse(refused['admit'], 'a removed reservation file must not free a running job lane')
+        c = self.enqueue('HORO-2072')['id']
+        job.kill()
+        job.wait()
+        out = self.advance()
+        self.assertEqual(out['granted'], [c])
+        self.assertEqual(self.entries()[a]['release']['evidence'], 'holder-exited')
+
+    def test_cancel_cannot_free_the_lane_of_a_running_claimed_job(self):
+        a, job = self.claimed()
+        b = self.enqueue('HORO-2071')['id']
+        self.assertFalse(da.queue_cancel(self.path, a, now=self.now)['ok'])
+        da.release('nda-horo-2070', self.path)
+        self.assertEqual(self.advance()['granted'], [])
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+
+    def test_live_holder_can_refresh_its_own_label_after_release_and_with_a_corrupt_queue(self):
+        a, job = self.claimed()
+        da.release('nda-horo-2070', self.path)
+        again = da.reserve('nda-horo-2070', 20 * GIB, job.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertTrue(again['admit'], again)
+        (self.path.parent / 'queue/q000099.json').write_text('{"bad"')
+        refreshed = da.reserve('nda-horo-2070', 20 * GIB, job.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertTrue(refreshed['admit'], refreshed)
+
+    def test_a_different_process_cannot_take_a_running_claimed_jobs_label_or_lane(self):
+        a, job = self.claimed()
+        da.release('nda-horo-2070', self.path)
+        other = subprocess.Popen(['/bin/sleep', '300'])
+        self.holders.append(other)
+        out = da.reserve('nda-horo-2070', 20 * GIB, other.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertFalse(out['admit'], out)
+        self.assertIn('label-in-use', out['reason'])
+
+    def test_damaged_queue_allows_only_a_non_growing_refresh(self):
+        a, job = self.claimed()
+        (self.path.parent / 'queue/q000099.json').write_text('{"bad"')
+        grow = da.reserve('nda-horo-2070', 30 * GIB, job.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertFalse(grow['admit'], grow)
+        same = da.reserve('nda-horo-2070', 20 * GIB, job.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertTrue(same['admit'], same)
+
+    def test_per_entry_unverifiable_holder_keeps_the_lane(self):
+        a, job = self.claimed()
+        self.enqueue('HORO-2071')
+        calls = {'n': 0}
+        real = da.process_token
+
+        def flaky(pid):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                return real(pid)  # live_reservations sees a healthy holder
+            raise da.ReservationError('ps unavailable')
+
+        out = da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, token_fn=flaky)
+        self.assertGreaterEqual(calls['n'], 2)
+        self.assertEqual((out['granted'], self.entries()[a]['state']), ([], 'CLAIMED'))
+
+    def test_end_to_end_release_grant_claim_and_no_duplicate_run(self):
+        libra = self.holder('libra-c1-fullgate')
+        b = self.enqueue('HORO-2070')['id']
+        self.assertEqual(self.advance()['granted'], [])
+        self.assertIsNone(libra.poll())
+        libra.kill()
+        libra.wait()
+        self.assertEqual(self.advance()['granted'], [b])
+        self.assertTrue((self.path.parent / 'queue/granted' / b).exists())
+        job = subprocess.Popen(['/bin/sleep', '300'])
+        self.holders.append(job)
+        runs = []
+        first = da.queue_claim(self.path, b, 'nda-horo-2070', 20 * GIB, Claim.ARGV, str(self.worktree), lambda: 400 * GIB, pid=job.pid,
+                               now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda p, a: runs.append(p))
+        second = da.queue_claim(self.path, b, 'nda-horo-2070', 20 * GIB, Claim.ARGV, str(self.worktree), lambda: 400 * GIB, pid=job.pid,
+                                now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda p, a: runs.append(p))
+        self.assertEqual((first['ok'], second['ok'], runs), (True, False, ['cargo']))
+        job.kill()
+        job.wait()
+        self.advance()
+        self.assertEqual(self.entries()[b]['state'], 'RELEASED')
+
+
 class ReviewRegressions(QueueBase):
     def test_rewound_sequence_counter_never_reuses_an_id(self):
         a = self.enqueue('HORO-2070')['id']

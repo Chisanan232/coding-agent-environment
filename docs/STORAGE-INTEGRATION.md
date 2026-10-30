@@ -173,8 +173,22 @@ decides who is granted the lane after the current holder is gone.
   refresh by the live holder still passes. A lapsed entry stops blocking at once (read-only test); `advance` records its expiry.
   The same job queued by a different session is refused rather than handed the first session's entry; `cancel --session-id`
   refuses another session's entry. The job digest is an HMAC with a per-store salt, so a low-entropy argv cannot be brute-forced from an entry file. An unreadable queue file blocks the queue and is never deleted.
-- Claiming a grant (`run --queue-id`) with grant-time revalidation lands in the next SPE-111 increment. Until it merges,
-  do not enqueue real work: a grant could not be used and would only block the lane until it lapses.
+- `run --queue-id Q --label L --bytes N [--ttl-s S] -- COMMAND...` claims a grant for this very process, then `exec`s the
+  job. Before anything runs it revalidates, outside the lock: entry GRANTED and unlapsed, owned by this uid, label, bytes,
+  current worktree and job fingerprint all match; then a fresh `memory-admission.py check --weight heavy --memory-only`
+  (memory pressure, swap I/O, CPU load, other heavy processes). Under the lock it checks the entry again, then tier, latch,
+  heavy lanes (the grant itself does not count), the 100 GiB disk floor and that the claiming process is alive and owned, and
+  writes the holder reservation (with `queue_id`) and the CLAIMED entry in one critical section. A refusal exits 77 and keeps
+  the grant; retrying is one explicit call, never a loop. A second claim of the same grant is refused; a failed `exec`
+  releases the reservation and marks the entry RELEASED (`exec-failed`, exit 127).
+- Release evidence: `advance` marks a CLAIMED entry RELEASED only on verified evidence: `holder-exited` (the pid is gone) or
+  `pid-reused` (a different start token). A holder that is past its time limit but alive, that cannot be inspected, or whose
+  reservation file was removed by an explicit `release` while the job still runs, keeps its lane and bytes (reserve, run, claim
+  and grant all count it). A timeout or a deleted file alone is never evidence.
+- Automation status: release detection, the grant and its durable record happen only when `queue advance` runs (reserve, run
+  and claim never grant or record releases); nothing polls and no daemon runs it. Resuming the owning Claude or Codex session is an explicit handoff:
+  `queue status` prints the resume and claim commands and never runs them. No automatic wakeup is claimed until a live
+  release-and-resume test passes; SPE-96's coordinator remains the only resume owner and has no queue event yet.
 - The queue only coordinates callers that use it; the gate hook stays in warn mode and unwrapped commands bypass it.
 
 ### Keeping the snapshot fresh (`refresher-plist`)
