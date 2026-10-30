@@ -1261,12 +1261,17 @@ class IdentityGuardTests(Base):
         self.assertGreater(qa.RESPAWN_SECONDS, qa.SETTLE_SECONDS)
         self.assertLessEqual(qa.RESPAWN_SECONDS, 30)                  # bounded
 
+    @unittest.skipUnless(sys.platform == "darwin", "libproc proc_pidpath exists only on macOS; the QA identity is macOS-only")
     def test_executable_path_is_the_kernel_path_not_argv0(self):
         proc = subprocess.Popen(["/bin/sh", "-c", "exec -a /usr/libexec/pkd /bin/sleep 30"])
         self.addCleanup(lambda: (proc.kill(), proc.wait()))
         time.sleep(0.5)
         self.assertEqual(qa.executable_path(proc.pid), "/bin/sleep")                       # not the name it claims
         self.assertIsNone(qa.executable_path(99999999))
+
+    def test_executable_path_is_none_where_libproc_does_not_exist(self):
+        with unittest.mock.patch("ctypes.CDLL", side_effect=OSError("no libproc")):
+            self.assertIsNone(qa.executable_path(os.getpid()))
 
 
 class KillChildTests(Base):
