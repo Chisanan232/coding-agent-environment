@@ -119,8 +119,10 @@ State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
 - `reservations/<label>.json`: `reserve --bytes N --pid P --label L` admits a
   heavy job only if the tier and latch admit it, a lane is free, P is a live
   process of the current user, and free bytes minus live reservations minus N
-  stay at or above 100 GiB. The hold lasts at most 4 h (`--ttl-s`), or up to 24 h
-  with an explicit `--max-hold`. A reservation records pid, process start time
+  stay at or above 100 GiB. `--ttl-s` (at most 4 h, or 24 h with an explicit `--max-hold`)
+  is the planned hold, not a release: it only decides when a still-running holder is reported as past its time limit.
+  The lane is held until the holder exits or `release --label L` runs, so reserve with the pid of the job itself, never a
+  long-lived shell. A reservation records pid, process start time
   and expiry; one whose process is gone or whose start time differs (pid reuse)
   is ignored and deleted. One that is past its time limit but whose holder is still the same
   live process keeps its lane (reported as `reservation-past-ttl-holder-alive` in the snapshot): a time limit is

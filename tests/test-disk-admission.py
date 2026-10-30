@@ -549,6 +549,8 @@ class Reservations(unittest.TestCase):
         self.reserve_file('job-long', hours=-1)
         refused = da.reserve('job-next', 10 * GIB, os.getppid(), self.path, lambda: 400 * GIB, now=self.now)
         self.assertFalse(refused['admit'], refused)
+        self.assertIn('job-long', refused['reason'])  # names the holder so the caller knows what to release
+        self.assertIn('past its time limit', refused['reason'])
 
     def test_snapshot_reports_past_ttl_holder_as_blocker(self):
         self.reserve_file('job-long', hours=-1)

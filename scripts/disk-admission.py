@@ -409,6 +409,8 @@ def live_reservations(state_path, now=None, token_fn=process_token):
             current = token_fn(record['pid'])
         except ReservationError as exc:
             problems.append('reservation-unverifiable: %s: %s' % (path.name, exc))
+            if record['expires_at'] <= now:
+                record['past_ttl'] = True
             live.append(record)
             continue
         if current is None or current != record['start_token']:
@@ -508,7 +510,9 @@ def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None
             reserved = sum(r['bytes'] for r in others)
             if len(others) >= lanes:
                 return dict(result, admit=False, reserved_bytes=reserved,
-                            reason='lane-cap: %d of %d heavy lanes in use' % (len(others), lanes))
+                            reason='lane-cap: %d of %d heavy lanes in use (%s)' % (len(others), lanes, ', '.join(
+                                '%s pid %d%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '')
+                                for r in others)))
             if result['free_bytes'] - reserved - nbytes < HEAVY_FLOOR:
                 return dict(result, admit=False, reserved_bytes=reserved,
                             reason='over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
@@ -653,7 +657,7 @@ def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, tt
     """Reserve for this very process, then exec the job: nothing runs before admission.
 
     execv keeps the pid and the start time, so the reservation is held by the job itself and ends with it
-    (lazy reaping handles exit, pid reuse and TTL). A refusal never execs and returns 77; a failed exec
+    (lazy reaping handles exit and pid reuse; a live holder keeps its lane past its TTL). A refusal never execs and returns 77; a failed exec
     releases the reservation and returns 127. Every message goes to stderr; the exit code is the contract,
     and it is authoritative only until the job starts (after exec the exit code is the job's own).
     """
