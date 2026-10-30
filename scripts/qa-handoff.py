@@ -140,13 +140,13 @@ def sha256_file(path):
 
 def write_private(path, data, mode=0o600):
     """Create or replace a wrapper-owned file without ever following a link: unlink first, then exclusive create."""
-    text = data if isinstance(data, str) else json.dumps(data, indent=2, sort_keys=True)
+    text = data if isinstance(data, (str, bytes)) else json.dumps(data, indent=2, sort_keys=True)
     try:
         os.unlink(path)
     except FileNotFoundError:
         pass
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
-    with os.fdopen(fd, 'w') as handle:
+    with os.fdopen(fd, 'wb' if isinstance(text, bytes) else 'w') as handle:
         handle.write(text)
 
 
@@ -421,7 +421,7 @@ def prepare(args):
     return 0
 
 
-def isolated_env(run_dir):
+def isolated_env(run_dir, codex_home=None):
     env = {k: os.environ[k] for k in ENV_ALLOW if k in os.environ}
     # A relative or run-directory PATH entry would resolve helper binaries from a directory the QA process can write.
     entries = [e for e in os.environ.get('PATH', '/usr/bin:/bin').split(':') if os.path.isabs(e) and not e.startswith(str(run_dir))]
@@ -431,7 +431,7 @@ def isolated_env(run_dir):
                 'XDG_DATA_HOME': home + '/.local/share', 'XDG_CACHE_HOME': home + '/.cache',
                 'CARGO_TARGET_DIR': str(run_dir / 'cargo-target'), 'CARGO_NET_OFFLINE': 'true',
                 # A private Codex home holding only the permission profile and a link to the login (codex_home()).
-                'CODEX_HOME': str(run_dir / 'codexhome')})
+                'CODEX_HOME': str(codex_home or run_dir / 'codexhome')})
     if os.environ.get('CARGO_HOME'):
         env['CARGO_HOME'] = os.environ['CARGO_HOME']
     return env
@@ -490,12 +490,12 @@ def profile_toml(run_dir, read_roots=()):
     return '\n'.join(lines)
 
 
-def prepare_codex_home(run_dir, read_roots=()):
+def prepare_codex_home(run_dir, read_roots=(), home=None):
     """A private CODEX_HOME per run: the permission profile, and the login only as a link to the real auth file. The link
     is readable by the Codex client (not sandboxed) and denied to the tool commands, whose profile denies the real home.
     A private home also stops the user's own MCP servers and hooks from loading."""
-    home = run_dir / 'codexhome'
-    home.mkdir(mode=0o700, exist_ok=True)
+    home = Path(home or run_dir / 'codexhome')
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
     write_private(home / 'config.toml', profile_toml(run_dir, read_roots))
     auth = real_codex_home() / 'auth.json'
     link = home / 'auth.json'
@@ -694,11 +694,14 @@ def kill_group(proc):
             continue
 
 
-def write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=False):
+def write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=False, extra=None):
     counts = count_commands(events)
     meta = {'argv': argv[:-1], 'exit_code': proc.returncode, 'seconds': round(time.time() - t0, 1), 'timed_out': timed_out,
             'interrupted': interrupted, 'events_sha256': sha256_file(events), 'verdict_sha256': safe_digest(run_dir / 'verdict.json'),
             'commands_completed': counts[0], 'commands_succeeded': counts[1]}
+    for key, value in (extra or {}).items():
+        # sealed values may only add a timeout or an interruption, never clear one the wrapper observed itself
+        meta[key] = bool(meta[key] or value) if key in ('timed_out', 'interrupted') else value
     write_private(run_dir / 'RUNMETA.json', meta)
 
 
@@ -712,7 +715,6 @@ def run_locked(args, run_dir, packet, source, read_roots=()):
                            out=out)
     write_private(run_dir / 'prompt.txt', prompt)
     argv = codex_argv(args.codex_bin, run_dir)
-    events = run_dir / 'events.jsonl'
     # A verdict left by an earlier interrupted attempt must never be paired with this attempt's exit code and commands.
     try:
         os.unlink(run_dir / 'verdict.json')
@@ -729,6 +731,27 @@ def run_locked(args, run_dir, packet, source, read_roots=()):
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['read confinement could not be checked: ' + '; '.join(problems[:3])])
     if problems:
         return write_result(run_dir, packet, 'QA_INVALID', ['read confinement not established: ' + '; '.join(problems[:3])])
+    return launch(args, run_dir, argv, isolated_env(run_dir), str(source), prompt.encode())
+
+
+def launch(args, run_dir, argv, env, cwd, stdin_data, seal=None, timeout=None):
+    """Run the QA process with its stdout captured into run_dir/events.jsonl, kill its group on timeout or signal, and
+    write the hashed run record. `seal(proc)`, when given, runs once before the record is written (also on the interrupt
+    path) and returns values merged into it; a seal that fails yields `seal_failed(error)` so the record fails closed."""
+    events = run_dir / 'events.jsonl'
+    sealed = {}
+
+    def seal_once(proc):
+        if seal is not None and not sealed:
+            try:
+                sealed.update(seal(proc))
+            except Exception as error:     # a seal that could not run must never leave a record that looks clean
+                sealed.update(seal_failed(error))
+
+    def record(proc, timed_out, interrupted):
+        seal_once(proc)
+        write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=interrupted, extra=sealed or None)
+
     t0 = time.time()
     timed_out = False
     proc = None
@@ -747,11 +770,11 @@ def run_locked(args, run_dir, packet, source, read_roots=()):
             os.chmod(events, 0o600)
             try:
                 try:
-                    proc = subprocess.Popen(argv, cwd=str(source), env=isolated_env(run_dir), stdin=subprocess.PIPE, stdout=ev,
-                                            stderr=err, start_new_session=True)
+                    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL if stdin_data is None else subprocess.PIPE,
+                                            stdout=ev, stderr=err, start_new_session=True)
                 except OSError as error:   # codex is not installed or not executable: nothing ran, so the attempt stays retryable
-                    return write_result(run_dir, packet, 'QA_INCOMPLETE', ['codex could not be started (%s)' % type(error).__name__])
-                proc.communicate(prompt.encode(), timeout=args.timeout)
+                    return write_result(run_dir, load_packet(run_dir), 'QA_INCOMPLETE', ['codex could not be started (%s)' % type(error).__name__])
+                proc.communicate(stdin_data, timeout=args.timeout if timeout is None else timeout)
                 try:                       # a background process codex left behind must not keep editing the clone after the verdict
                     os.killpg(proc.pid, signal.SIGKILL)   # codex is already reaped; this reaches only what it left in its own group
                 except OSError:
@@ -762,13 +785,14 @@ def run_locked(args, run_dir, packet, source, read_roots=()):
             except BaseException:
                 if proc is not None:
                     kill_group(proc)       # Ctrl-C or SIGTERM to the wrapper must not leave codex running
-                    write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=True)   # hashed, so a later edit is still caught
+                    record(proc, timed_out, True)   # hashed, so a later edit is still caught
                 raise
         os.chmod(run_dir / 'stderr.log', 0o600)
         try:
             time.sleep(getattr(args, 'settle', SETTLE_SECONDS))   # let any straggler finish writing before the tree is checked
+            seal_once(proc)                 # outside the signal-blocked window below: sealing can take seconds
         except BaseException:
-            write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=True)
+            record(proc, timed_out, True)
             raise
         # The run record is written with the interrupt signals blocked, so one cannot land half-way through it. A signal
         # that arrives after the record is complete leaves a finished run finished; one that raises inside the write
@@ -778,11 +802,11 @@ def run_locked(args, run_dir, packet, source, read_roots=()):
         try:
             # Any signal received before the unmask below marks the run interrupted, so an interrupted run never passes.
             got_signal = bool(signal.sigpending() & blocked)
-            write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=got_signal)
+            record(proc, timed_out, got_signal)
             if not got_signal and signal.sigpending() & blocked:
-                write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=True)
+                record(proc, timed_out, True)
         except BaseException:
-            write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=True)
+            record(proc, timed_out, True)
             raise
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
@@ -791,6 +815,12 @@ def run_locked(args, run_dir, packet, source, read_roots=()):
         if old_hup is not signal.SIG_IGN:
             signal.signal(signal.SIGHUP, old_hup)
     return evaluate(run_dir)
+
+
+def seal_failed(error):
+    """The fail-closed record of a seal that raised: identity mode stays on, nothing about the outbox is trusted."""
+    return {'qa_identity': {'seal_error': type(error).__name__}, 'path_ok': False, 'stragglers': None,
+            'tree_problems': ['seal failed (%s)' % type(error).__name__], 'untracked': {'count': 0, 'sample': []}}
 
 
 def validate(value, schema, path='verdict'):
