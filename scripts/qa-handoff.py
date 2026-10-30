@@ -992,7 +992,8 @@ def hop(ident, argv, seconds):
 
 def parse_confinement(record):
     """(established, could_not_check, controls, problems) re-derived by the producer from the QA-side probe record: every
-    control of CONTROLS must be present once (the login control only when there is a login), and each one's result is
+    control of CONTROLS must be present exactly once, the login control included (the QA side reports a missing login
+    before probing, and codex cannot run without one, so it is never exempt), and each one's result is
     recomputed from what was observed, never taken from the QA side's own `ok` or `established`."""
     expected = {name: expect for name, _, expect in CONTROLS}
     rows = record.get('controls') if isinstance(record, dict) else None
@@ -1011,7 +1012,7 @@ def parse_confinement(record):
                          'unrunnable': row.get('unrunnable') is True})
         if not ok:
             problems.append('%s expected %s, observed %s' % (name, want, clean(observed, 40)))
-    missing = sorted(set(expected) - {'neg_open_auth_file'} - seen)
+    missing = sorted(set(expected) - seen)
     if missing:
         problems.append('controls missing: %s' % ', '.join(missing))
     failed = [c for c in controls if not c['ok']]
@@ -1119,6 +1120,9 @@ def run_identity_locked(args, run_dir, packet, source, ident):
     if not isinstance(stage, dict):
         write_private(run_dir / 'CONFINEMENT.json', {'profile': PROFILE, 'established': False, 'controls': [], 'malformed': True})
         return write_result(run_dir, packet, 'QA_INVALID', ['qa-stage did not print exactly one JSON record'])
+    if stage.get('login_missing') is True:
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['the QA user has no Codex login (log in with the command '
+                                                               'qa-identity-setup.py prints); codex was not started'])
     if stage.get('codex_missing') is True:
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['codex could not be started on the QA side (FileNotFoundError)'])
     if 'error' in stage:
@@ -1193,6 +1197,8 @@ def stage_outbox(args):
     write_private(outbox / 'verdict.schema.json', VERDICT_SCHEMA)
     if not shutil.which(args.codex_bin):
         return {'codex_missing': True}
+    if not (real_codex_home() / 'auth.json').exists():
+        return {'login_missing': True}     # otherwise the probe would skip the login control, which the producer requires
     home = prepare_codex_home(outbox, home=Path(args.codex_home))
     record, _ = confinement_probe(args.codex_bin, outbox, isolated_env(outbox, home))
     return {'confinement': record}

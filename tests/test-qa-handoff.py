@@ -1164,6 +1164,8 @@ class IdentityTests(Base):
         self.fake.write_text(FAKE.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1).replace("@FAKEDIR@", str(self.fake_dir)))
         self.qahome = self.root / "qahome"
         self.qahome.mkdir(mode=0o700)
+        (self.qahome / ".codex").mkdir(mode=0o700)
+        (self.qahome / ".codex/auth.json").write_text("synthetic-qa-login")   # not a credential; the login control needs a file
         self.x = self.root / "x"
         self.x.mkdir()
         self.x.chmod(0o711)
@@ -1300,6 +1302,31 @@ class IdentityTests(Base):
         code, out = self.run_ident(run_dir)
         self.assertEqual(code, 12, out)
         self.assertIn("exactly one JSON record", out)
+
+    def test_record_without_the_login_control_is_invalid(self):
+        rows = [{"control": n, "observed": "ALLOWED" if e == "ALLOWED" else "DENIED:1", "ok": True, "unrunnable": False}
+                for n, _, e in qa.CONTROLS if n != "neg_open_auth_file"]          # every other control is correct
+        (self.fake_dir / "stage_forge").write_text(json.dumps({"confinement": {"established": True, "controls": rows}}) + "\n")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("controls missing: neg_open_auth_file", out)
+        self.assert_not_started(run_dir, "QA_INVALID")
+
+    def test_the_real_stage_probes_the_login_control(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir)[0], 0)
+        names = {c["control"] for c in self.json(run_dir / "CONFINEMENT.json")["controls"]}
+        self.assertEqual(names, {n for n, _, _ in qa.CONTROLS})
+        self.assertNotIn("synthetic-qa-login", (run_dir / "CONFINEMENT.json").read_text())
+
+    def test_qa_user_without_a_codex_login_is_incomplete(self):
+        (self.qahome / ".codex/auth.json").unlink()
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertIn("no Codex login", out)
+        self.assert_not_started(run_dir, "QA_INCOMPLETE")
 
     def test_symlinked_outbox_source_is_invalid(self):
         self.fake_mode("linksource")
