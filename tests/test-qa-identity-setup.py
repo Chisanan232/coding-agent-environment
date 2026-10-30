@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Offline tests for scripts/qa-identity-setup.py: pure checks and command construction. No account is ever created."""
 import importlib.util
+import os
+import platform
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -14,7 +17,7 @@ spec.loader.exec_module(qis)
 
 GOOD = {"uid": 777, "gid": 777, "groups": [777, 12, 61], "ctty": "ENXIO", "list_inbox": "ok", "write_inbox": "EACCES",
         "write_outbox": "ok", "write_exchange": "EACCES", "list_producer_home": "EACCES", "stat_producer_auth": "EACCES",
-        "open_producer_ssh": "EPERM", "own_env_read": "ok", "foreign_env_leaked": False}
+        "open_producer_ssh": "EPERM", "std_isatty": [False, False, False], "own_env_read": "ok", "foreign_env_leaked": False}
 
 
 class ArgsTest(unittest.TestCase):
@@ -64,6 +67,7 @@ class PureChecksTest(unittest.TestCase):
             "env leaked": dict(GOOD, foreign_env_leaked=True),
             "env unknown": dict(GOOD, foreign_env_leaked=None),
             "outbox not writable": dict(GOOD, write_outbox="EACCES"),
+            "tty on a std fd": dict(GOOD, std_isatty=[False, True, False]),
         }
         for label, probe in cases.items():
             self.assertTrue(qis.evaluate_probe(probe, 777), label)
@@ -71,6 +75,40 @@ class PureChecksTest(unittest.TestCase):
     def test_detector_invalid_blocks_even_when_no_leak(self):
         fails = qis.evaluate_probe(dict(GOOD, own_env_read="unreadable", foreign_env_leaked=False), 777)
         self.assertTrue(any("detector invalid" in f for f in fails))
+
+
+@unittest.skipUnless(platform.system() == "Darwin", "KERN_PROCARGS2 is macOS")
+class LocalProbeTest(unittest.TestCase):
+    """Executes the real PROBE string as the current user. Same uid, so the env control is expected to LEAK (a free positive
+    control that the sentinel is in the sibling's environment) while the own-child detector must be valid."""
+
+    def test_probe_detector_valid_and_sentinel_readable_for_same_uid(self):
+        sentinel = "qa-sentinel-test-" + os.urandom(8).hex()
+        sib = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"], env={"PATH": "/usr/bin:/bin", "QA_SENTINEL": sentinel})
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                (Path(d) / "in").mkdir()
+                (Path(d) / "out").mkdir()
+                r = subprocess.run([sys.executable, "-I", "-c", qis.PROBE, str(Path(d) / "in"), str(Path(d) / "out"), d, d, str(sib.pid), sentinel],
+                                   capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            import json
+            o = json.loads(r.stdout.strip().splitlines()[-1])
+            self.assertEqual(o["own_env_read"], "ok", "the own-child detector must be readable (python3 child, not a platform binary)")
+            self.assertIs(o["foreign_env_leaked"], True)
+            self.assertEqual(o["std_isatty"], [False, False, False])
+            self.assertEqual(qis.procenv(sib.pid) is not None and sentinel.encode() in qis.procenv(sib.pid), True)
+        finally:
+            sib.kill()
+            sib.wait()
+
+
+class DetachTest(unittest.TestCase):
+    def test_detach_relays_stdout_and_exit_status_without_tty_fds(self):
+        code = "import os,sys;print(os.isatty(0),os.isatty(1),os.isatty(2),os.getsid(0)==os.getpid());sys.exit(3)"
+        r = subprocess.run([sys.executable, "-I", "-c", qis.DETACH, "0", sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 3)
+        self.assertEqual(r.stdout.strip(), "False False False True")
 
 
 class CommandShapeTest(unittest.TestCase):
@@ -90,13 +128,50 @@ class CommandShapeTest(unittest.TestCase):
         self.assertIn("login --device-auth", c)
         self.assertIn("env -i", c)
 
+    def test_login_command_uses_file_store_and_refreshes_sudo(self):
+        s = qis.Setup("fornaxqa", 777, Path("/Users/fornaxqa"), Path("/Users/Shared/fornaxqa-qa"))
+        c = s.login_command()
+        self.assertTrue(c.startswith("sudo -v && "))
+        self.assertIn("cli_auth_credentials_store=", c)
+
     def test_login_command_drops_owner_terminal(self):
         # sudo'd login must not inherit the owner's tty (TIOCSTI keystroke injection into the owner's shell)
         s = qis.Setup("fornaxqa", 777, Path("/Users/fornaxqa"), Path("/Users/Shared/fornaxqa-qa"))
         c = s.login_command()
         self.assertIn("os.setsid()", c)
         self.assertIn("-I", c)
-        self.assertTrue(c.startswith(qis.SUDO))
+        self.assertIn(qis.SUDO, c)
+
+
+class ExchangeRollbackTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.x = Path(self.tmp.name) / "x-qa"
+        self.x.mkdir()
+        self.s = qis.Setup("qauser", 777, Path("/Users/qauser"), self.x)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_refuses_non_managed_shape(self):
+        # not root-owned 0711 in the test sandbox, so it must be refused before anything is removed
+        calls = []
+        with mock.patch.object(qis, "run", lambda argv, **kw: calls.append(argv)):
+            with self.assertRaises(qis.Stop):
+                self.s.remove_managed_exchange()
+        self.assertEqual(calls, [])
+
+    def test_partial_rollback_removes_only_dirs_this_run_created(self):
+        made, other = self.x / "inbox", self.x / "keep"
+        made.mkdir()
+        other.mkdir()
+        self.s.state["created_dirs"] = [made]
+        calls = []
+        with mock.patch.object(qis, "dscl", lambda p, k: None), mock.patch.object(qis, "sudo_refresh", lambda: None), \
+                mock.patch.object(qis, "run", lambda argv, **kw: calls.append(list(argv))):
+            self.s.rollback(only_created=True)
+        rm = [c for c in calls if c and c[0] == "/bin/rmdir"]
+        self.assertEqual(rm, [["/bin/rmdir", str(made)]])
 
 
 class RollbackGuardTest(unittest.TestCase):

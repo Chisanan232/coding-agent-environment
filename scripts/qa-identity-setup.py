@@ -9,6 +9,8 @@ Why: a file permission profile cannot stop a QA tool command from reading the en
 OS user (sysctl KERN_PROCARGS2, kernel-enforced per uid). A guarantee that credentials are unreachable needs the QA run to be
 a different OS user. This generalizes the AASM setup (setup_aasmqa.py, reviewed there) without its AASM-specific pieces.
 
+--check changes nothing but still asks for the sudo password (it must run the isolation probe as the QA user).
+
 Scope, exactly: the local user and group NAME (id UID), /Users/NAME (mode 0700) and the exchange directory
 (default /Users/Shared/NAME-qa). It never edits sudoers, never logs in to Codex, never starts a model session, never reads or
 copies any credential, and never touches any other user, process, session or file. Anything unexpected stops it (fail
@@ -84,6 +86,8 @@ def evaluate_probe(o, uid):
         fails.append("effective uid/gid %s/%s != %s/%s" % (o.get("uid"), o.get("gid"), uid, uid))
     if o.get("ctty") == "ok":
         fails.append("the QA process still has the owner's controlling terminal (/dev/tty opened)")
+    if o.get("std_isatty") != [False, False, False]:
+        fails.append("the QA process holds a terminal on a standard fd: %s" % (o.get("std_isatty"),))
     groups = o.get("groups")
     if not isinstance(groups, list) or set(groups) & PRIV_GIDS:
         fails.append("the QA process carries a privileged group: %s" % (groups,))
@@ -100,16 +104,10 @@ def evaluate_probe(o, uid):
     return fails
 
 
-# The probe runs as the QA user with this tiny script (-I: isolated). It only tests access; it never reads a credential.
-PROBE = r"""
-import ctypes, ctypes.util, errno, json, os, subprocess, sys, struct
-inbox, outbox, xroot, prodhome, pid, sentinel = sys.argv[1:7]
-def tryit(f):
-    try: f(); return "ok"
-    except OSError as e: return errno.errorcode.get(e.errno, str(e.errno))
-def wr(d):
-    p = os.path.join(d, ".probe-" + str(os.getpid()))
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600); os.close(fd); os.unlink(p)
+# KERN_PROCARGS2 reader shared by the probe (runs as the QA user) and the producer-side control. Measured on macOS: platform
+# binaries (/bin/sleep, /bin/sh) are NOT readable even for the same uid, python3 children are, so the detector child is python3.
+PROCENV_SRC = r"""
+import ctypes, ctypes.util
 def procenv(p):
     libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
     libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
@@ -122,14 +120,28 @@ def procenv(p):
     if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
         return None
     return buf.raw[: size.value]
+"""
+exec(PROCENV_SRC)  # defines procenv() for the producer-side control; the probe embeds the same source
+
+# The probe runs as the QA user with this tiny script (-I: isolated). It only tests access; it never reads a credential.
+PROBE = PROCENV_SRC + r"""
+import errno, json, os, subprocess, sys
+inbox, outbox, xroot, prodhome, pid, sentinel = sys.argv[1:7]
+def tryit(f):
+    try: f(); return "ok"
+    except OSError as e: return errno.errorcode.get(e.errno, str(e.errno))
+def wr(d):
+    p = os.path.join(d, ".probe-" + str(os.getpid()))
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600); os.close(fd); os.unlink(p)
 mine = "mine-" + os.urandom(6).hex()
-child = subprocess.Popen(["/bin/sleep", "30"], env={"PATH": "/usr/bin:/bin", "QA_OWN_MARK": mine})
+child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(30)"], env={"PATH": "/usr/bin:/bin", "QA_OWN_MARK": mine})
 own = procenv(child.pid)
 own_ok = "ok" if own is not None and mine.encode() in own else "unreadable"
 child.kill(); child.wait()
 foreign = procenv(pid)
 out = {"uid": os.getuid(), "gid": os.getgid(), "groups": sorted(os.getgroups()),
   "ctty": tryit(lambda: os.close(os.open("/dev/tty", os.O_RDWR))),
+  "std_isatty": [os.isatty(0), os.isatty(1), os.isatty(2)],
   "list_inbox": tryit(lambda: os.listdir(inbox)), "write_inbox": tryit(lambda: wr(inbox)),
   "write_outbox": tryit(lambda: wr(outbox)), "write_exchange": tryit(lambda: wr(xroot)),
   "list_producer_home": tryit(lambda: os.listdir(prodhome)),
@@ -142,10 +154,13 @@ print(json.dumps(out))
 # sudo's credential cache is keyed to the owner's terminal, so sudo itself keeps it; the QA child drops it (new session, cwd "/")
 # before running anything, so it cannot inject keystrokes into the owner's shell or open /dev/tty. argv[1] is a wall-clock limit in
 # seconds (SIGALRM armed in the child, survives exec). The waiting parent forwards INT/TERM/HUP to the setsid-ed child.
-DETACH = ("import os,sys,signal\npid=os.fork()\nif pid:\n"
+DETACH = ("import os,sys,signal\nr,w=os.pipe()\npid=os.fork()\nif pid:\n"
+          " os.close(w)\n"
           " for s in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP): signal.signal(s, lambda n,f: os.kill(pid, n))\n"
+          " while True:\n  try: b=os.read(r,65536)\n  except InterruptedError: continue\n  if not b: break\n  os.write(1,b)\n"
           " _,st=os.waitpid(pid,0)\n sys.exit(os.waitstatus_to_exitcode(st))\n"
-          "os.setsid()\nos.chdir('/')\nn=int(sys.argv[1])\nif n: signal.alarm(n)\nos.execv(sys.argv[2], sys.argv[2:])")
+          "os.close(r)\nos.setsid()\nos.chdir('/')\nz=os.open('/dev/null',os.O_RDWR)\nos.dup2(z,0)\nos.dup2(w,1)\nos.dup2(w,2)\n"
+          "os.close(z)\nos.close(w)\nn=int(sys.argv[1])\nif n: signal.alarm(n)\nos.execv(sys.argv[2], sys.argv[2:])")
 
 
 def qa_argv(name, home, argv, alarm=VERIFY_TIMEOUT + 60):
@@ -185,7 +200,7 @@ class Setup:
 
     def __init__(self, name, uid, home, xroot):
         self.name, self.uid, self.home, self.xroot = name, uid, home, xroot
-        self.state = {"created_user": False, "created_group": False}
+        self.state = {"created_user": False, "created_group": False, "created_dirs": []}
 
     # ---- account
     def ensure_account(self, apply):
@@ -246,6 +261,12 @@ class Setup:
             run([CHMOD, "700", str(self.home)], sudo=True)
             if os.lstat(self.home).st_mode & 0o077:
                 die("account", "could not make %s private" % self.home)
+        cdir = self.home / ".codex"
+        if os.path.lexists(cdir):
+            cst = os.lstat(cdir)
+            if stat.S_ISLNK(cst.st_mode) or not stat.S_ISDIR(cst.st_mode) or cst.st_uid != self.uid or cst.st_mode & 0o077:
+                die("account", "%s must be a private (0700) directory owned by the QA user (Codex leaves it 0755 after login: "
+                               "run sudo chmod 700 %s, then re-run)" % (cdir, cdir))
         say("ok  account %s: uid/gid %s, own private group, not admin, no sudo rights, private home" % (n, u))
 
     # ---- exchange area
@@ -265,6 +286,7 @@ class Setup:
             if not apply:
                 die("exchange", "%s missing (check mode)" % p)
             run([MKDIR, "-m", mode, str(p)], sudo=True)
+            self.state["created_dirs"].append(p)
             st = os.lstat(p)
             if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
                 die("exchange", "%s was replaced by a non-directory while being created" % p)
@@ -317,9 +339,12 @@ class Setup:
         sudo_refresh()
         sentinel = "qa-sentinel-" + secrets.token_hex(16)  # random, synthetic: not a credential
         # the sibling process of the PRODUCER's user that holds the sentinel in its environment
-        sib = subprocess.Popen([PY, "-I", "-c", "import time; time.sleep(120)"], env={"PATH": "/usr/bin:/bin", "QA_SENTINEL": sentinel},
+        sib = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(120)"], env={"PATH": "/usr/bin:/bin", "QA_SENTINEL": sentinel},
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         try:
+            pe = procenv(sib.pid)  # producer-side positive control: the sentinel really is in the sibling's environment block
+            if pe is None or sentinel.encode() not in pe:
+                die("isolation", "control invalid: the producer cannot read its own sibling's environment, so a denial would prove nothing")
             r = run(qa_argv(self.name, self.home, [PY, "-I", "-c", PROBE, str(self.xroot / "inbox"), str(self.xroot / "outbox"),
                                                     str(self.xroot), pw.pw_dir, str(sib.pid), sentinel]), check=False, timeout=VERIFY_TIMEOUT)
             try:
@@ -327,6 +352,8 @@ class Setup:
             except (ValueError, IndexError):
                 die("isolation", "QA-user probe did not run (rc %s): %s" % (r.returncode, (r.stderr or r.stdout)[-300:]))
             fails = evaluate_probe(o, self.uid)
+            if sib.poll() is not None:
+                fails.append("the producer sibling exited during the probe; the environment result is void")
             if fails:
                 die("isolation", "; ".join(fails))
             if run(["/bin/ls", str(self.xroot / "outbox")], check=False).returncode != 0:
@@ -354,19 +381,45 @@ class Setup:
                     or (st is not None and (stat.S_ISLNK(st.st_mode) or st.st_uid != self.uid))):
                 die("rollback", "the %s record does not point at a private %s owned by uid %s; not deleting it automatically "
                                 "(remove it yourself after inspecting it)" % (n, self.home, u))
+            if dscl("/Users/%s" % n, "RealName") != "QA identity %s" % n and not self.state["created_user"]:
+                die("rollback", "the %s record was not created by this script (RealName differs); not deleting it" % n)
             run([SYSADMIN, "-deleteUser", n], sudo=True, check=False)
         if dscl("/Groups/%s" % n, "PrimaryGroupID") == u and (not only_created or self.state["created_group"]):
             run([DSEDIT, "-o", "delete", n], sudo=True, check=False)
-        if not only_created:
-            if self.xroot.is_symlink():
-                die("rollback", "%s is a symlink; not removing" % self.xroot)
-            run([RM, "-rf", str(self.xroot)], sudo=True)
+        if only_created:
+            for d in reversed(self.state["created_dirs"]):
+                if d.is_symlink() or not d.is_dir():
+                    continue
+                run(["/bin/rmdir", str(d)], sudo=True, check=False)  # only dirs this run made, and only if empty
+        else:
+            self.remove_managed_exchange()
         say("rollback finished; verify with: dscl . -read /Users/%s ; ls -d %s %s" % (n, self.home, self.xroot))
+
+    def remove_managed_exchange(self):
+        x = self.xroot
+        if not os.path.lexists(x):
+            return
+        if x.is_symlink() or not x.is_dir():
+            die("rollback", "%s is a symlink or not a directory; not removing" % x)
+        st = os.lstat(x)
+        if st.st_uid != ROOT_UID or (st.st_mode & 0o7777) != 0o711:
+            die("rollback", "%s is not root-owned 0711; it is not the directory this script manages, not removing" % x)
+        names = set(os.listdir(x))
+        if not names <= {"inbox", "outbox"}:
+            die("rollback", "%s holds entries other than inbox/outbox (%s); not removing" % (x, sorted(names - {"inbox", "outbox"})))
+        for n in sorted(names):
+            if (x / n).is_symlink() or not (x / n).is_dir():
+                die("rollback", "%s/%s is not a plain directory; not removing" % (x, n))
+        if input("Type the exchange path %s to remove it and everything under it: " % x).strip() != str(x):
+            die("rollback", "path not confirmed; exchange area left in place")
+        run([RM, "-rf", str(x)], sudo=True)
 
     def login_command(self):
         """Printed for the owner; this script never logs in. Same detach hop as the probe: a plain `sudo -u` would hand the
         QA process the owner's controlling terminal (TIOCSTI keystroke injection into the owner's shell)."""
-        return shlex.join(qa_argv(self.name, self.home, [CODEX, "login", "--device-auth"], alarm=900))
+        # no login keychain for the QA user: credentials go to a file in its own private ~/.codex. sudo -v first because the hop uses sudo -n.
+        hop = shlex.join(qa_argv(self.name, self.home, [CODEX, "-c", 'cli_auth_credentials_store="file"', "login", "--device-auth"], alarm=900))
+        return "sudo -v && " + hop
 
 
 def main(argv=None):
