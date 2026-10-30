@@ -142,6 +142,15 @@ terminal session; only the QA side detaches itself, as the QA user). The codex h
 sudo child directly, and the seal's sweep removes anything left. How this behaves with a real terminal, real sudo and
 signal relay through setuid sudo is not verified until the first owner run.
 
+sudo forgets the credential after its timestamp window (5 minutes by default), and a codex hop can run for the whole
+`--timeout`. The producer therefore refreshes it with `sudo -n -v` (never a prompt) every 60 s from the first successful
+refresh until the run ends, and once more right before the seal and the final sweep. Every failed refresh is recorded in
+`RUNMETA.json` (`sudo_keepalive`). If sudo refuses before the seal, the result says exactly that ("could not check the QA
+user after codex ran: sudo -n refused") and stays `QA_INVALID`, because codex ran and nothing was checked. If the final
+cleanup sweep cannot run or leaves processes, the producer prints one `NOTE` line and records it as `cleanup` in
+`RESULT.json`; run `sudo -v` in the owner Terminal and the next run's pre-sweep removes them. Whether the keepalive behaves
+the same against a real terminal's sudo timestamp is not verified until the first owner run.
+
 Three hops, each through `qa_argv`, with the QA side running a producer-owned copy of this script under `/usr/bin/python3 -I`:
 
 | Hop | Runs as | What happens | What the producer trusts |
@@ -176,6 +185,10 @@ stderr, or the QA side's own `established` flag.
 | identity lock held by another run | `WAITING_RESOURCE` (75) |
 | codex was started for this directory (`LAUNCHED` or `RUNMETA.json`), or it was attempted in another mode | `REFUSED` (64) |
 | exchange owners or modes wrong; `sudo -n` refused (at any hop, the codex hop included); sweep could not run; QA-user persistence before the run; a hop printed nothing; codex missing on the QA side; confinement could not be checked | `QA_INCOMPLETE`, codex not started |
+| packet product, ticket or sha (or the run directory name) not a valid name | `QA_INVALID`, nothing handed to the QA user |
+
+A `sudo -n` refusal at the codex hop happens after `R/LAUNCHED` is written, so it consumes the run directory: run
+`prepare` again for a new attempt (the result says codex was not started).
 | the permission profile changed between hop 1 and hop 2 | `QA_INVALID`, codex not started |
 | env probe ran and failed (leak, detector invalid, tty, uid, groups, `~/.codex` mode) | `QA_INVALID`, codex not started |
 | confinement failed, malformed, incomplete or not exactly one record | `QA_INVALID`, codex not started |
@@ -255,7 +268,9 @@ the hop and acts on the verdict.
   account, per-user system agents (if any appear for that uid) would also count as survivors, so such a run could never
   pass; this has not been checked on a real account.
 - Identity mode sees only the QA user's processes, crontab, at queue, `~/Library/LaunchAgents` and whether a launchd
-  `user/` or `gui/` domain exists for it. It does not see a system-domain job (which needs root to install). The launchd
+  `user/` or `gui/` domain exists for it. It does not see a system-domain job or LaunchDaemon (which needs root to
+  install), login items, or shell startup files (`.zshrc`, `.zprofile` and similar, which run if anything later starts a
+  login or interactive shell as the account). The launchd
   rule is deliberately absent-only, with no parsing and no label allowlist: a domain that exists at all fails the run. If
   the sudo hop itself makes launchd bootstrap a user domain for the QA account, every identity run will be a false
   `QA_INVALID` (fail closed). How a real hidden QA account behaves here is unverified until the first owner run. Nothing
