@@ -1128,6 +1128,37 @@ class IdentityGuardTests(Base):
                 ident = qa.Identity("qauser", uid, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
                 self.assertIsNone(qa.sweep_identity(ident))           # never `kill -1` as yourself or as root
 
+    def test_persistence_check_reads_cron_at_and_launch_agents_as_the_qa_user(self):
+        ident = qa.Identity("qauser", os.getuid() + 4321, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
+        answers = {}
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            self.assertEqual(argv[:4], [qa._qis().SUDO, "-n", "-u", "qauser"])
+            rc, out, err = answers.get(os.path.basename(argv[4]), (0, "", ""))
+            return subprocess.CompletedProcess(argv, rc, out, err)
+        with unittest.mock.patch.object(qa.subprocess, "run", fake_run):
+            answers.update({"crontab": (1, "", "crontab: no crontab for qauser\n"),
+                            "ls": (1, "", "ls: /Users/qauser/Library/LaunchAgents: No such file or directory\n")})
+            self.assertEqual(qa.persistence_problems(ident), [])
+            self.assertEqual([os.path.basename(c[4]) for c in calls], ["crontab", "atq", "ls"])
+            for name, answer, text in (("crontab", (0, "* * * * * /tmp/x\n", ""), "crontab"),
+                                       ("atq", (0, "3\tFri Oct 30 12:00:00 2026\n", ""), "at queue"),
+                                       ("ls", (0, "evil.plist\n", ""), "LaunchAgents"),
+                                       ("atq", (1, "", "atq: cannot open lockfile\n"), "could not check the at queue"),
+                                       ("crontab", (1, "", "sudo: a password is required\n"), "sudo -n refused")):
+                saved = dict(answers)
+                answers[name] = answer
+                problems = qa.persistence_problems(ident)
+                self.assertTrue(any(text in p for p in problems), (name, problems))
+                answers.clear()
+                answers.update(saved)
+            calls.clear()
+            for uid in (os.getuid(), 0):
+                self.assertTrue(qa.persistence_problems(ident._replace(uid=uid)))
+            self.assertEqual(calls, [])                                       # refused before any subprocess
+
 
 FAKE_SUDO = r"""#!@PY@
 import json, os, sys
@@ -1176,6 +1207,7 @@ class IdentityTests(Base):
         self.sudo.chmod(0o755)
         self.ident = qa.Identity("qauser", os.getuid(), self.qahome, self.x, os.getuid())
         self.sweeps = []
+        self.persistence = []
         self.isolation = ({"uid": os.getuid(), "foreign_env_leaked": False, "own_env_read": "ok"}, [])
         qis = qa._qis()
 
@@ -1185,6 +1217,7 @@ class IdentityTests(Base):
         for patch in (unittest.mock.patch.object(qis, "SUDO", str(self.sudo)), unittest.mock.patch.object(qis, "PY", sys.executable),
                       unittest.mock.patch.object(qa, "resolve_identity", lambda name, exchange: self.ident),
                       unittest.mock.patch.object(qa, "sweep_identity", sweep),
+                      unittest.mock.patch.object(qa, "persistence_problems", lambda ident: list(self.persistence)),
                       unittest.mock.patch.object(qis.Setup, "isolation_record", lambda setup, pw: self.isolation)):
             patch.start()
             self.addCleanup(patch.stop)
@@ -1398,6 +1431,14 @@ class IdentityTests(Base):
         self.sweeps = [0, None]                 # a sweep that could not run is no better
         run_dir = self.prepare()
         self.assertEqual(self.run_ident(run_dir)[0], 12)
+
+    def test_scheduled_job_present_is_invalid(self):
+        self.persistence = ["the crontab of qauser is not empty"]
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("scheduled jobs or launch agents", out)
+        self.assertEqual(self.json(run_dir / "RUNMETA.json")["persistence"], self.persistence)
 
     def test_identity_lock_busy_is_waiting_resource(self):
         (self.x / "inbox/RUN.lock").write_text("")

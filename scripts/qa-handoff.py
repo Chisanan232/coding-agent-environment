@@ -840,7 +840,7 @@ def launch(args, run_dir, argv, env, cwd, stdin_data, seal=None, timeout=None):
 
 def seal_failed(error):
     """The fail-closed record of a seal that raised: identity mode stays on, nothing about the outbox is trusted."""
-    return {'qa_identity': {'seal_error': type(error).__name__}, 'path_ok': False, 'stragglers': None,
+    return {'qa_identity': {'seal_error': type(error).__name__}, 'path_ok': False, 'stragglers': None, 'persistence': None,
             'tree_problems': ['seal failed (%s)' % type(error).__name__], 'untracked': {'count': 0, 'sample': []}}
 
 
@@ -850,6 +850,7 @@ def seal_failed(error):
 # script; the copy of this file that runs as the QA user has no sibling and never calls _qis().
 Identity = collections.namedtuple('Identity', 'name uid home exchange exchange_owner')
 KILL, PGREP = '/bin/kill', '/usr/bin/pgrep'
+CRONTAB, ATQ, LS = '/usr/bin/crontab', '/usr/bin/atq', '/bin/ls'
 HOP_ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
 _QIS = None
 
@@ -1180,6 +1181,8 @@ def seal(run_dir, ident, outbox, manifest, info, proc):
     component still names the directory that was opened (so the path-based clone check read what was checked)."""
     extra = {'qa_identity': dict(info), 'stragglers': sweep_identity(ident), 'path_ok': False, 'tree_problems': [],
              'untracked': {'count': 0, 'sample': []}}
+    # Zero processes is not enough if the QA user can be started again later by the system on its behalf.
+    extra['persistence'] = persistence_problems(ident)
     if proc.returncode == 124:
         extra['timed_out'] = True
     elif proc.returncode == 130:
@@ -1283,6 +1286,33 @@ def qa_exec(args):
         return stopped.code
 
 
+def persistence_problems(ident):
+    """Ways the QA user could still act after the process sweep that the producer can see: a crontab, queued at jobs, or
+    entries in ~/Library/LaunchAgents, each read as the QA user through sudo -n. Anything present, or anything that
+    could not be read, is a problem (fail closed). Root and the caller's own uid are refused before any subprocess."""
+    if not isinstance(ident.uid, int) or isinstance(ident.uid, bool) or ident.uid in (0, os.getuid()):
+        return ['persistence check refused for root or your own uid']
+    qis = _qis()
+    checks = (('crontab', [CRONTAB, '-l'], 'no crontab'), ('at queue', [ATQ], None),
+              ('LaunchAgents', [LS, '-A', str(ident.home / 'Library/LaunchAgents')], 'no such file'))
+    problems = []
+    for label, argv, absent in checks:
+        try:
+            done = subprocess.run([qis.SUDO, '-n', '-u', ident.name] + argv, stdin=subprocess.DEVNULL, capture_output=True,
+                                  text=True, timeout=30, cwd='/', env=HOP_ENV)
+        except (OSError, subprocess.SubprocessError) as error:
+            problems.append('could not check the %s of %s (%s)' % (label, ident.name, type(error).__name__))
+            continue
+        if sudo_refused(done.stderr):
+            problems.append('could not check the %s of %s (sudo -n refused)' % (label, ident.name))
+        elif done.returncode == 0:
+            if done.stdout.strip():
+                problems.append('the %s of %s is not empty' % (label, ident.name))
+        elif not (absent and absent in (done.stderr or '').lower()):
+            problems.append('could not check the %s of %s (exit %s)' % (label, ident.name, done.returncode))
+    return problems
+
+
 def validate(value, schema, path='verdict'):
     """Minimal JSON-schema check for the subset VERDICT_SCHEMA uses; returns a list of problems."""
     problems = []
@@ -1364,6 +1394,10 @@ def identity_gate(run_dir, meta):
         problems.append('QA-user processes survived the sweep or it could not run (%s)' % clean(stragglers, 20))
     if meta.get('path_ok') is not True:
         problems.append('the outbox was a link or not owned by the QA user')
+    persistence = meta.get('persistence')
+    if not isinstance(persistence, list) or persistence:
+        problems.append('the QA user has scheduled jobs or launch agents, or they could not be checked: %s'
+                        % clean('; '.join(persistence) if isinstance(persistence, list) else persistence, 80))
     return problems
 
 
