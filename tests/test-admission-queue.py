@@ -310,6 +310,13 @@ class ReviewRegressions(QueueBase):
         fp2 = [e for e in da.queue_status(other)['entries']][0]['fingerprint']
         self.assertNotEqual(fp1, fp2)
 
+    def test_empty_salt_file_is_a_clean_refusal_with_recovery_advice(self):
+        self.enqueue('HORO-2070')
+        (self.path.parent / 'queue/fingerprint.salt').write_text('')
+        out = self.enqueue('HORO-2071')
+        self.assertFalse(out['ok'])
+        self.assertIn('queue-salt-unreadable', out['reason'])
+
     def test_a_failing_receipt_does_not_report_a_persisted_change_as_failed(self):
         receipts = self.path.parent / 'queue/receipts.jsonl'
         self.enqueue('HORO-2070')

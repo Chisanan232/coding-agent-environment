@@ -735,7 +735,12 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
             entries, problems = _queue_entries(state_path)
             if problems:
                 return {'ok': False, 'reason': problems[0]}
-            fingerprint = _fingerprint(_queue_salt(state_path), repo, real_worktree, tickets, argv, nbytes)
+            try:
+                salt = _queue_salt(state_path)
+            except ValueError as exc:
+                return {'ok': False, 'reason': 'queue-salt-unreadable: %s; remove queue/fingerprint.salt only when no entry is live '
+                                               '(a new salt stops dedupe of existing entries)' % exc}
+            fingerprint = _fingerprint(salt, repo, real_worktree, tickets, argv, nbytes)
             for entry in entries:
                 if entry['fingerprint'] != fingerprint:
                     continue
