@@ -887,6 +887,17 @@ class ReviewFollowUpTests(Base):
         self.assertTrue(json.loads((run_dir / "RUNMETA.json").read_text())["interrupted"])
         self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 11)
 
+    def test_a_signal_pending_while_the_record_is_written_marks_the_run_interrupted(self):
+        import signal
+        run_dir = self.prepare()
+        real = signal.sigpending
+        signal.sigpending = lambda: {signal.SIGTERM}                 # a SIGTERM arrived while the signals were blocked
+        self.addCleanup(setattr, signal, "sigpending", real)
+        code, out = self.run_qa(run_dir)
+        self.assertEqual(code, 11, out)                              # never QA_PASS once a signal was received
+        self.assertTrue(json.loads((run_dir / "RUNMETA.json").read_text())["interrupted"])
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 11)
+
 
 if __name__ == "__main__":
     unittest.main()

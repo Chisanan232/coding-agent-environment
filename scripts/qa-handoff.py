@@ -630,7 +630,11 @@ def run_locked(args, run_dir, packet, source):
         blocked = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
         previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
         try:
-            write_meta(run_dir, argv, proc, t0, timed_out, events)
+            # Any signal received before the unmask below marks the run interrupted, so an interrupted run never passes.
+            got_signal = bool(signal.sigpending() & blocked)
+            write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=got_signal)
+            if not got_signal and signal.sigpending() & blocked:
+                write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=True)
         except BaseException:
             write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=True)
             raise
