@@ -63,8 +63,13 @@ fix ticket, or unknown). Never infer adoption from a file existing.
 `python3 scripts/adoption-probe.py plan` lists the seven scenario questions (continue after an intermediate result, light work
 while heavy admission is refused, batching tests across small commits, answering a host ASK, readiness versus release approval,
 not re-asking for authorized work, briefing a delegated agent). `adoption-probe.py run --max-budget-usd N` (N at most 1.0, split
-evenly) starts one fresh `claude -p` haiku session per case in an empty directory carrying this repository's `.claude/CLAUDE.md`
-and judges the reply with simple patterns. That is prose, so a PASS is weak evidence and a FAIL is a prompt to read the reply.
-The resumed and delegated contexts are reported NOT_RUN: they need a prior session or a real subagent and are not simulated.
-The behavior map (`docs/ENGINEERING-BASELINE.md`, "Required behavior map") and `tests/test-baseline-behavior-map.py` are the
-contract-level check that the behavior is still written down in the shared source and in both host entry points.
+evenly and rounded down per session) starts one fresh `claude -p` haiku session per case with no tools, MCP servers, skills or
+slash commands, project settings only and no session persistence, in an empty directory carrying this repository's
+`.claude/CLAUDE.md`, and judges the reply with patterns about the stance (wrong stances that use the right words are tested to
+fail). The founder's own `~/.claude/CLAUDE.md` still loads, because the login depends on the real HOME, so a PASS shows the whole
+loaded stack answering well, not that the repository file alone did. `--with-control` repeats each case without the repository
+file and marks a case STEERED only where the control fails; where it also passes the result is NOT_ATTRIBUTABLE. Judging is on
+prose, so a FAIL is a prompt to read the reply. The resumed and delegated contexts are reported NOT_RUN: they need a prior session
+or a real subagent and are not simulated. The behavior map (`docs/ENGINEERING-BASELINE.md`, "Required behavior map") and
+`tests/test-baseline-behavior-map.py` are the contract-level check that the behavior is still written down in the shared source
+and in both host entry points.
