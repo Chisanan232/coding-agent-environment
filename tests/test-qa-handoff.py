@@ -840,6 +840,21 @@ class ReviewFollowUpTests(Base):
         self.assertEqual(code, qa.EXIT["REFUSED"], out)
         self.assertEqual((run_dir / "RESULT.json").read_text(), before)
 
+    def test_a_locked_or_already_run_directory_is_refused_even_with_a_malformed_packet(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_qa(run_dir, admission=self.REFUSE)[0], 75)
+        time.sleep(1.1)
+        (run_dir / "RUN.lock").write_text("")
+        (run_dir / "packet.json").write_text("{not json")
+        before = (run_dir / "RESULT.json").read_text()
+        code, out = self.run_qa(run_dir)
+        self.assertEqual(code, qa.EXIT["REFUSED"], out)
+        self.assertEqual((run_dir / "RESULT.json").read_text(), before)
+        (run_dir / "RUN.lock").unlink()
+        (run_dir / "RUNMETA.json").write_text("{}")
+        self.assertEqual(self.run_qa(run_dir)[0], qa.EXIT["REFUSED"])
+        self.assertEqual((run_dir / "RESULT.json").read_text(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

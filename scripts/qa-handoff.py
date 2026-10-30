@@ -511,12 +511,14 @@ def refuse(message):
 
 def run(args):
     run_dir = Path(args.run_dir).resolve()
-    packet = load_packet(run_dir)
-    source = run_dir / 'source'
+    # First, before anything that can write RESULT.json (a bad packet or tree included): an already-run or locked
+    # directory belongs to another run and its result.
     if (run_dir / 'RUNMETA.json').exists():
         return refuse('this run directory has already been run; prepare a new attempt')
-    if os.path.lexists(run_dir / 'RUN.lock'):   # checked before anything can write RESULT.json: another run owns this directory and its result
+    if os.path.lexists(run_dir / 'RUN.lock'):
         return refuse('a run is in progress or was interrupted for this directory; prepare a new attempt')
+    packet = load_packet(run_dir)
+    source = run_dir / 'source'
     try:
         manifest = read_run_json(run_dir / 'tree-manifest.json')
         problems = check_tree(source, manifest)
