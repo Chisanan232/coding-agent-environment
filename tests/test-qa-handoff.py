@@ -525,8 +525,7 @@ class RunTests(Base):
                     str(run_dir), str(run_dir.parent), str(run_dir.parent.parent), str(qa.CANARY_ROOT.parent), str(qa.DEFAULT_ROOT),
                     str(run_dir.parent / "sibling-run")):
             code, out = self.run_qa(run_dir, extra=("--read-root", bad))
-            self.assertEqual(code, qa.EXIT["REFUSED"] if False else code)
-            self.assertNotEqual(code, 0, bad)
+            self.assertEqual(code, qa.EXIT["REFUSED"], (bad, out))
             self.assertFalse((self.fake_dir / "seen.json").exists(), bad)
         good = self.root / "toolchain"
         good.mkdir()
@@ -1575,6 +1574,22 @@ class IdentityTests(Base):
         self.assertFalse((self.x / "inbox/RUN.lock").exists())
         self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)          # codex started, no record
         self.assertEqual(self.run_ident(run_dir)[0], qa.EXIT["REFUSED"])
+
+    def test_the_mode_is_recorded_and_a_different_mode_is_refused(self):
+        (self.x / "inbox/RUN.lock").write_text("")                            # the identity attempt has to wait
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir, extra=("--require-env-isolation",))[0], 75)
+        mode = self.json(run_dir / "RESULT.json")["mode"]
+        self.assertEqual(mode, {"qa_identity": "qauser", "exchange": str(self.x), "require_env_isolation": True})
+        before = (run_dir / "RESULT.json").read_text()
+        code, out = self.run_qa(run_dir)                                      # the same attempt as the producer itself
+        self.assertEqual(code, qa.EXIT["REFUSED"], out)
+        self.assertIn("another mode", out)
+        self.assertEqual((run_dir / "RESULT.json").read_text(), before)
+        self.assertEqual(self.run_ident(run_dir)[0], qa.EXIT["REFUSED"])     # without --require-env-isolation: another mode
+        (self.x / "inbox/RUN.lock").unlink()
+        self.assertEqual(self.run_ident(run_dir, extra=("--require-env-isolation",))[0], 0)
+        self.assertTrue(self.json(run_dir / "RUNMETA.json")["qa_identity"]["require_env_isolation"])
 
     def test_identity_lock_busy_is_waiting_resource(self):
         (self.x / "inbox/RUN.lock").write_text("")
