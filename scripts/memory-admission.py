@@ -117,12 +117,12 @@ def parse_clock(text, days=True):
 
 
 def classify_heavy(ps_text):
-    """(active, idle, cpu_by_pid) from `ps -axo PS_FIELDS`; (None, None, None) when the list is unreadable. Anything that
+    """(active, idle, cpu_by_pid) from `ps -axo PS_FIELDS`; (None, None, None, None) when the list is unreadable. Anything that
     cannot be fully parsed counts as active: an unknown process is never treated as an abandoned one. cpu_by_pid holds the
     CPU seconds of every heavy-named process, so a later sample can tell whether any of them worked in between."""
     if ps_text is None or not ps_text.strip():
-        return None, None, None
-    active, idle, cpus = {}, [], {}
+        return None, None, None, None
+    active, idle, cpus, active_pids = {}, [], {}, []
     for line in ps_text.splitlines():
         line = line.strip()
         if not line:
@@ -151,7 +151,9 @@ def classify_heavy(ps_text):
             idle.append({"pid": pid, "comm": base, "ppid": ppid, "age_s": int(age), "cpu_s": cpu, "cwd": None})
         else:
             active[base] = active.get(base, 0) + 1
-    return active, idle, cpus
+            if parsed:
+                active_pids.append(parsed[0])
+    return active, idle, cpus, active_pids
 
 
 def lookup_cwd(pid, run):
@@ -172,7 +174,7 @@ def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu
             return None
     # None = the process list could not be read (unknown), never "no heavy process"; empty output from a successful ps is
     # not "nothing running" either, because a live system always has processes.
-    heavy, idle, cpus = classify_heavy(_run([PS, "-axo", PS_FIELDS], run))
+    heavy, idle, cpus, active_pids = classify_heavy(_run([PS, "-axo", PS_FIELDS], run))
     for rec in (idle or [])[:MAX_IDLE_REPORT]:
         rec["cwd"] = lookup_cwd(rec["pid"], run)
     try:
@@ -189,7 +191,7 @@ def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu
         disk_free = None
     return {"time": now_fn(), "mono": mono_fn(), "ram": sysctl_int("hw.memsize"), "pressure_level": sysctl_int("kern.memorystatus_vm_pressure_level"),
             "swap": parse_swapusage(_run([SYSCTL, "-n", "vm.swapusage"], run)), "vm": parse_vm_stat(_run([VM_STAT], run)),
-            "load1": load1, "cpus": cpu_fn() or None, "disk_free": disk_free, "heavy_procs": heavy, "idle_procs": idle or [], "cpu_by_pid": cpus or {}}
+            "load1": load1, "cpus": cpu_fn() or None, "disk_free": disk_free, "heavy_procs": heavy, "idle_procs": idle or [], "cpu_by_pid": cpus or {}, "active_pids": active_pids or []}
 
 
 def derive(s1, s2):
@@ -200,9 +202,10 @@ def derive(s1, s2):
     # Any CPU spent, or no first reading at all (it may have been busy and unparsed), makes it a running lane.
     before = {r["pid"]: r["cpu_s"] for r in s1.get("idle_procs") or []}
     before.update(s1.get("cpu_by_pid") or {})
+    was_active = set(s1.get("active_pids") or [])   # counted as a lane a moment ago: a decaying %cpu must not release it at once
     d["idle_procs"] = []
     for rec in s2.get("idle_procs") or []:
-        if rec["pid"] not in before or rec["cpu_s"] > before[rec["pid"]]:
+        if rec["pid"] not in before or rec["cpu_s"] > before[rec["pid"]] or rec["pid"] in was_active:
             if d["heavy_procs"] is not None:   # None stays None: an unreadable list already fails closed
                 d["heavy_procs"] = dict(d["heavy_procs"], **{rec["comm"]: d["heavy_procs"].get(rec["comm"], 0) + 1})
         else:

@@ -42,11 +42,12 @@ def vm(swapins=0, swapouts=0, compressor_pages=0):
 ZERO_SWAP = {"total": 0, "used": 0, "free": 0}   # a fresh post-reboot machine: no swap files yet
 
 
-def sample(t, level=1, swapins=0, swapouts=0, compressor=0.0, load=2.0, cpus=16, disk=494 * GIB, swap=ZERO_SWAP, heavy=None, idle=None, cpu_by_pid=None):
+def sample(t, level=1, swapins=0, swapouts=0, compressor=0.0, load=2.0, cpus=16, disk=494 * GIB, swap=ZERO_SWAP, heavy=None, idle=None, cpu_by_pid=None, active_pids=None):
     return {"time": t, "mono": t, "ram": RAM, "pressure_level": level, "swap": swap, "vm": vm(swapins, swapouts, int(compressor * RAM / PAGE)),
             "load1": load, "cpus": cpus, "disk_free": disk, "heavy_procs": {} if heavy is None else heavy,
             "idle_procs": [] if idle is None else idle,
-            "cpu_by_pid": {} if cpu_by_pid is None else cpu_by_pid}
+            "cpu_by_pid": {} if cpu_by_pid is None else cpu_by_pid,
+            "active_pids": [] if active_pids is None else active_pids}
 
 
 def metrics(**kw):
@@ -580,6 +581,16 @@ class IdleOrphan(unittest.TestCase):
         rec = {"pid": 25830, "comm": "rustc", "ppid": 1, "age_s": 3600, "cpu_s": 10.0, "cwd": None}
         m = ma.derive(sample(0, idle=[rec], cpu_by_pid={25830: 10.0}), sample(10, idle=[rec], cpu_by_pid={25830: 10.0}))
         self.assertEqual((m["heavy_procs"], len(m["idle_procs"])), ({}, 1))
+
+    def test_busy_in_the_first_sample_and_quiet_in_the_second_with_the_same_cpu_stays_active(self):
+        rec = {"pid": 25830, "comm": "rustc", "ppid": 1, "age_s": 3600, "cpu_s": 10.0, "cwd": None}
+        first = sample(0, heavy={"rustc": 1}, cpu_by_pid={25830: 10.0}, active_pids=[25830])   # %cpu 2.0 then
+        m = ma.derive(first, sample(10, idle=[rec], cpu_by_pid={25830: 10.0}))                  # %cpu 0.0 and unchanged CPU time now
+        self.assertEqual((m["heavy_procs"], m["idle_procs"]), ({"rustc": 1}, []))
+
+    def test_take_sample_records_which_pids_it_counted_as_active(self):
+        s = self.take(ps_out(ps_line(41, 1, "R", "3-00:00:00", "0:10.00", "0.0", "/x/rustc"), self.ORPHAN))
+        self.assertEqual(s["active_pids"], [41])
 
 
 if __name__ == "__main__":
