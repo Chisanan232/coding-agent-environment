@@ -111,8 +111,8 @@ reading the clone and writing `out` still work. A control that is mis-reported o
 (`read confinement not established`) with codex never started; a probe that could not run at all (no output, timeout, codex
 sandbox unavailable) is `QA_INCOMPLETE` (`read confinement could not be checked`, retry). The controls are recorded in
 `CONFINEMENT.json` and summarised in `RESULT.json`. A missing `codex` binary is `QA_INCOMPLETE`. `--read-root` refuses HOME and
-its ancestors, credential directories, the real Codex home, the QA state and canary roots, and the run directory and any
-directory containing it. The profile is
+its ancestors, credential directories, the real Codex home, the QA state and canary roots, and the run directory, its
+siblings under the same product/ticket and any directory containing it. The profile is
 allowlist-based under HOME; it does not cover `/etc`, `/private/var/tmp` or unlisted directories under `/private/tmp`, so
 never keep a secret there. Evidence the QA agent must cite has to be inside its read allowlist (the clone, `out`, or a
 `--read-root`), or the criterion must be left out of its verdict (AASM, ASK #3: a criterion verified elsewhere was reported NOT_RUN by
