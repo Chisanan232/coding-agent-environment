@@ -118,6 +118,18 @@ the hop and acts on the verdict.
 
 ### Known gaps (stated, not closed)
 
+- A `QA_PASS` does not prove every criterion was covered. Criteria are free text and nothing maps a verified check to a
+  criterion id: a model that verifies one thing and lists the rest nowhere can still pass if it clears the floor
+  (valid schema, baseline, clean tree, no failing check or Medium+ finding, two successful commands, clean exit,
+  COMPLETE, not LOW). Structured criteria with required per-id results are a possible later schema change, not part of
+  this slice; until then a reviewer compares `criteria_sha256` and the verified checks with the ticket.
+- Reads are not confined: `-s workspace-write` restricts writes, so a QA command can read this user's real files,
+  including the Codex login the run needs (`CODEX_HOME`) and other home secrets, and could quote them in evidence. A
+  separate OS user or an allowlist-read profile is needed to prevent that; it is not implemented here. Treat the evidence
+  text as possibly containing anything this user can read.
+- After a clean codex exit the wrapper sends SIGKILL to the codex process group. If that group were fully gone and its id
+  recycled by an unrelated group leader within the same moment, that group would be signalled; this is negligible in
+  practice and not defended against.
 - `--criteria` and `--qa-notes` are files the producer chooses. The prompt labels them producer-supplied and `RESULT.json`
   records `criteria_sha256`, but the wrapper does not verify them against the ticket; a producer that narrows the criteria
   narrows what a `QA_PASS` covers. A reviewer compares the hash and text with the ticket.
