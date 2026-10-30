@@ -159,15 +159,20 @@ decides who is granted the lane after the current holder is gone.
 - `queue advance` runs one step under the lock: it expires lapsed grants and waits, then grants the FIRST entry in line only
   if live reservations (including past-TTL and unverifiable ones) plus unclaimed grants are fewer than the tier's heavy
   lanes and the latch is off. A tier or latch without a heavy lane marks the first entry ELIGIBLE and grants nothing.
-  A grant lasts 60 min (at most 4 h) and writes `queue/granted/<id>` plus a receipt line in `queue/receipts.jsonl`.
+  The first entry is granted only if its bytes also fit (`free - reserved - bytes >= 100 GiB`); otherwise nothing is granted and
+  the reason says so. `ELIGIBLE` means "first in line but the tier or latch offers no heavy lane right now", not "ready".
+  A grant lasts 60 min (at most 4 h) and writes `queue/granted/<id>` plus a receipt line in `queue/receipts.jsonl`
+  (a failed receipt write reports `receipt_ok: false`; the change itself is already persisted).
 - `queue status --json` is read-only and prints, for a GRANTED entry, the resume and claim commands for the owner. They are
   printed, never executed: resuming the owning session is an explicit handoff for Claude and for Codex
   (`codex exec resume` is unverified here). There is no daemon and no polling; state advances only when a queue-aware
   command runs.
 - `queue cancel --id Q` cancels a waiting or unclaimed entry.
-- While any QUEUED, ELIGIBLE or GRANTED entry exists, a plain `reserve`/`run` of a label that does not already hold a live
+- While any QUEUED, ELIGIBLE or GRANTED entry exists whose wait limit or grant window has not passed, a plain `reserve`/`run` of a label that does not already hold a live
   reservation is refused with `queue-ahead`, so a direct reservation cannot take the lane ahead of the queue. A same-label
-  refresh by the live holder still passes. An unreadable queue file blocks the queue and is never deleted.
+  refresh by the live holder still passes. A lapsed entry stops blocking at once (read-only test); `advance` records its expiry.
+  The same job queued by a different session is refused rather than handed the first session's entry; `cancel --session-id`
+  refuses another session's entry. The job digest is an HMAC with a per-store salt, so a low-entropy argv cannot be brute-forced from an entry file. An unreadable queue file blocks the queue and is never deleted.
 - Claiming a grant (`run --queue-id`) with grant-time revalidation lands in the next SPE-111 increment. Until it merges,
   do not enqueue real work: a grant could not be used and would only block the lane until it lapses.
 - The queue only coordinates callers that use it; the gate hook stays in warn mode and unwrapped commands bypass it.
