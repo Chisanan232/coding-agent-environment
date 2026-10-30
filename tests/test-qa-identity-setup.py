@@ -118,6 +118,36 @@ class DetachTest(unittest.TestCase):
         self.assertEqual(r.returncode, 3)
         self.assertEqual(r.stdout.strip(), "False False False True")
 
+    def test_detach_relays_a_signal_sent_to_the_wrapper_to_the_detached_child(self):
+        # qa-handoff.py stops the identity hop by signalling sudo, whose child is this wrapper; the setsid-ed QA child only
+        # hears it through the relay line. Without that line the wrapper dies and the child keeps running.
+        import signal
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            ready, mark = Path(d) / "ready", Path(d) / "mark"
+            code = ("import os, signal, sys, time\n"
+                    "def h(n, f):\n    open(%r, 'w').write('got %%d' %% n)\n    sys.exit(7)\n"
+                    "signal.signal(signal.SIGTERM, h)\n"
+                    "open(%r, 'w').write(str(os.getpid()))\n"
+                    "time.sleep(60)\n") % (str(mark), str(ready))
+            proc = subprocess.Popen([sys.executable, "-I", "-c", qis.DETACH, "0", sys.executable, "-I", "-c", code],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                deadline = time.time() + 30
+                while time.time() < deadline and not (ready.exists() and ready.read_text()):
+                    time.sleep(0.05)
+                proc.send_signal(signal.SIGTERM)
+                proc.communicate(timeout=30)
+                self.assertEqual(proc.returncode, 7)                       # the child's own exit status, relayed back
+                self.assertEqual(mark.read_text(), "got %d" % signal.SIGTERM)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                try:
+                    os.kill(int(ready.read_text()), signal.SIGKILL)       # never leave the detached child behind
+                except (OSError, ValueError):
+                    pass
+
 
 class FakeSibling:
     pid = 4242

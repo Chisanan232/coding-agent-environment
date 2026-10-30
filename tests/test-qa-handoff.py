@@ -4,6 +4,7 @@
 The fake records its argv, environment names and prompt, writes the verdict named by -o and prints a JSON event stream,
 so the tests prove what the wrapper guarantees regardless of what a model says.
 """
+import argparse
 import contextlib
 import importlib.util
 import sys
@@ -12,6 +13,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -1192,6 +1194,51 @@ class IdentityGuardTests(Base):
         self.assertIn(qa.RESPAWN_SECONDS, slept)
         self.assertGreater(qa.RESPAWN_SECONDS, qa.SETTLE_SECONDS)
         self.assertLessEqual(qa.RESPAWN_SECONDS, 30)                  # bounded
+
+
+class KillChildTests(Base):
+    """kill_child stops the sudo hop, which is not a process-group leader (it stays in the owner's session)."""
+
+    HOLD = ("import os, signal, sys, time\n"
+            "if sys.argv[1] == 'ignore': signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "open(sys.argv[2], 'w').write(str(os.getpid()))\n"
+            "time.sleep(120)\n")
+
+    def child(self, behaviour):
+        ready = self.root / ("ready-" + behaviour)
+        proc = subprocess.Popen([sys.executable, "-c", self.HOLD, behaviour, str(ready)])
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        deadline = time.time() + 30
+        while time.time() < deadline and not (ready.exists() and ready.read_text()):
+            time.sleep(0.05)
+        return proc
+
+    def test_kill_child_stops_a_child_by_pid(self):
+        proc = self.child("exit")
+        qa.kill_child(proc)
+        self.assertEqual(proc.returncode, -signal.SIGTERM)
+
+    def test_kill_child_escalates_from_term_to_kill(self):
+        proc = self.child("ignore")
+        qa.kill_child(proc)
+        self.assertEqual(proc.returncode, -signal.SIGKILL)
+
+    def test_an_identity_hop_timeout_really_stops_the_hop(self):
+        # launch(new_session=False) must stop a child that is not a group leader: a no-op stop, or killpg (swapped in),
+        # would leave it running and this fails.
+        run_dir = self.prepare()
+        pid_file = self.root / "hop.pid"
+        argv = [sys.executable, "-c", self.HOLD, "ignore", str(pid_file)]
+        args = argparse.Namespace(timeout=1, settle=0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = qa.launch(args, run_dir, argv, dict(os.environ), str(self.root), None, new_session=False, timeout=1)
+        pid = int(pid_file.read_text())
+        self.addCleanup(lambda: subprocess.run(["kill", "-9", str(pid)], capture_output=True))
+        self.assertEqual(code, 11, out.getvalue())
+        self.assertTrue(json.loads((run_dir / "RUNMETA.json").read_text())["timed_out"])
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
 
 
 def launchd_domain(*services):
