@@ -15,8 +15,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE = ROOT / "docs" / "ENGINEERING-BASELINE.md"
 TARGETS = {
-    ROOT / ".claude" / "CLAUDE.md": ("standing-contract", "merge-sequence", "decision-delegation"),
-    ROOT / "codex" / "AGENTS.md": ("standing-contract", "merge-sequence", "decision-delegation"),
+    ROOT / ".claude" / "CLAUDE.md": ("standing-contract", "campaign-completion", "merge-sequence", "decision-delegation"),
+    ROOT / "codex" / "AGENTS.md": ("standing-contract", "campaign-completion", "merge-sequence", "decision-delegation"),
 }
 SIZE_BUDGET = 8 * 1024
 BLOCK_RE = re.compile(r"<!-- block:([a-z0-9-]+) -->\n(.*?)\n<!-- /block:\1 -->", re.S)
