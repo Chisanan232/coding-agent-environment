@@ -1,0 +1,15 @@
+{
+  "scenarios": [
+    {"id": "pr-merged-work-remains", "state": {"event": "pr_merged", "dag_nodes_remaining": 3}, "expected": "RUN_NEXT_TASK"},
+    {"id": "test-batch-passed-work-remains", "state": {"event": "tests_passed", "dag_nodes_remaining": 1}, "expected": "RUN_NEXT_TASK"},
+    {"id": "handoff-sent-work-remains", "state": {"event": "handoff_sent", "dag_nodes_remaining": 2}, "expected": "RUN_NEXT_TASK"},
+    {"id": "heavy-refused-light-work-exists", "state": {"event": "heavy_admission_refused", "light_tasks": 2, "dag_nodes_remaining": 4}, "expected": "QUEUE_HEAVY_AND_DO_LIGHT_WORK"},
+    {"id": "heavy-refused-nothing-light", "state": {"event": "heavy_admission_refused", "light_tasks": 0, "dag_nodes_remaining": 1, "watcher": true}, "expected": "REPORT_BLOCKED_WITH_WATCHER"},
+    {"id": "merge-host-asks", "state": {"event": "merge_host_ask"}, "expected": "SUBMIT_EXACT_MERGE_OPERATION"},
+    {"id": "merge-host-denied", "state": {"event": "merge_host_denied"}, "expected": "REPORT_DENIAL_ONCE_AND_CONTINUE"},
+    {"id": "all-nodes-verified", "state": {"event": "pr_merged", "dag_nodes_remaining": 0}, "expected": "REPORT_READY_FOR_RELEASE_AND_REQUEST_RELEASE_APPROVAL"},
+    {"id": "all-nodes-verified-release-approved-for-exact-scope", "state": {"event": "pr_merged", "dag_nodes_remaining": 0, "release_approved": true}, "expected": "RELEASE_WITHIN_APPROVED_SCOPE"},
+    {"id": "wait-without-watcher", "state": {"event": "ci_wait", "dag_nodes_remaining": 2, "watcher": false}, "expected": "ARM_WATCHER_THEN_CONTINUE"},
+    {"id": "commits-small-batch-tests", "state": {"event": "small_commits_made", "tests_per_commit": true}, "expected": "BATCH_TESTS_AT_CHECKPOINT"}
+  ]
+}
