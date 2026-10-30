@@ -959,6 +959,9 @@ CRONTAB, ATQ, LS, LAUNCHCTL = '/usr/bin/crontab', '/usr/bin/atq', '/bin/ls', '/b
 # launchd's default ThrottleInterval is 10 s: a job it keeps alive comes back within that, so the seal looks again later.
 RESPAWN_SECONDS = 12
 LAUNCHD_ABSENT = 'Could not find domain'
+# An existing account with no GUI session answers `print gui/<uid>` with exit 125 and this text (observed on the real QA
+# account's uid by a peer's read-only probes; an unknown uid answers 112 'Could not find domain').
+LAUNCHD_NO_SESSION = (125, 'Domain does not support specified action')
 # After the QA user's first hop macOS creates a launchd user domain for it and runs Apple services under it (first real
 # account, macOS 27.0.1, 2026-10-30: 48 loaded services, all com.apple.*, 8 running; the set varies as on-demand agents
 # such as the mdworker.* ones start and stop). So a present domain is normal and the run cannot require it absent. What
@@ -1631,10 +1634,16 @@ def qa_exec(args):
 
 def launchd_problems(domain, done):
     """A launchd domain of the QA user passes only when launchctl reports it absent in the documented form: a non-zero
-    exit and "Could not find domain". Any present domain (whatever its services, com.apple.* included), empty or other
+    exit and "Could not find domain", or for an account without a GUI session exit 125 with
+    "Domain does not support specified action" and empty stdout. Any present domain (whatever its services, com.apple.* included), empty or other
     output, or any other error is a problem. Nothing is parsed, so there is no label allowlist to get around. Used for
     gui/<uid>; user/<uid> goes through verify_user_domain, which a present domain can pass."""
-    if done.returncode != 0 and LAUNCHD_ABSENT in (done.stdout or '') + (done.stderr or ''):
+    text = (done.stdout or '') + (done.stderr or '')
+    if done.returncode != 0 and LAUNCHD_ABSENT in text:
+        return []
+    # The no-session form must match both the exact exit code and the exact text, and print nothing on stdout: a domain
+    # that is present prints rc 0 with its services, which stays a problem.
+    if done.returncode == LAUNCHD_NO_SESSION[0] and LAUNCHD_NO_SESSION[1] in (done.stderr or '') and not (done.stdout or '').strip():
         return []
     return ['launchd domain %s is present or could not be read (exit %s)' % (domain, done.returncode)]
 
