@@ -66,3 +66,32 @@ Jira: read with read-only tools, never mutate to read, never write placeholder
 bodies, never edit comments this session did not create, read back every mutation
 (FORNX-439 comment 27362 overwrite).
 <!-- /block:decision-delegation -->
+
+## Required behavior map (ship and verify)
+
+The founder asked for `ship-product` and `verify-product` behavior. Existing workflows already carry it, so no new skill is added
+(dedicated skills stay an implementation choice; this map is what keeps the behavior from being dropped). Each row names a required
+behavior, the file that owns it, and a phrase that must stay in that file; `tests/test-baseline-behavior-map.py` fails when a phrase
+disappears, when a baseline phrase is missing from either host entry point, or when a named skill is not shipped to both hosts.
+
+<!-- map -->
+| Behavior | Owner | Phrase |
+|---|---|---|
+| ship: deliver by PR from an isolated worktree, never push the default branch | baseline | Deliver by pull request only, from the fetched base branch |
+| ship: atomic Gitmoji commits, tests separate from code | baseline | Commits are atomic Gitmoji commits |
+| ship: run tests at checkpoints, not after every commit | baseline | Commit granularity is separate from validation frequency |
+| ship: self-review then independent review before merge | skill:engineering-workflow | Review the complete diff and commit range yourself |
+| ship: the agent merges an eligible PR and answers a host ASK itself | baseline | An eligible PR is merged by the agent |
+| ship: the merge is its own tool call in a fixed order | baseline | The merge is its own tool call |
+| ship: post-merge, verify acceptance and reconcile the ticket | skill:post-merge-close | do not infer completion |
+| ship: a merged PR or passing batch is never campaign completion | baseline | is an intermediate result, never completion |
+| ship: technical readiness is not release approval | baseline | needs the founder's separate explicit approval |
+| ship: heavy-admission refusal does not forbid light work | baseline | A refused heavy admission does not forbid light work |
+| ship: real watchers only, no claimed automatic resumption | baseline | claim automatic resumption only if it exists |
+| verify: independent QA is dispatched and traced | baseline | Use `qa-handoff.py` for traceable Codex QA dispatch |
+| verify: results use distinct states, never collapsed | baseline | never collapse one into another |
+| verify: non-core gaps are DEFERRED, never PASS | baseline | the criterion is reported DEFERRED or NOT_VERIFIED, never PASS |
+| verify: delegated agents are told the obligations | baseline | Delegated agents and QA runs carry this contract |
+| verify: QA evidence is not merge evidence | doc:docs/QA-HANDOFF.md | A Codex verdict is QA evidence, not merge evidence |
+| verify: no invented UI evidence | skill:acceptance-validation | never invent screenshots |
+<!-- /map -->
