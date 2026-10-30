@@ -115,6 +115,47 @@ completion implies no new publication or deployment authorization. A merge whose
 pipeline deploys to production or publishes is itself a deployment/publication
 action needing its own Level 3 record or Level 2 packet.
 
+### Campaign completion loop
+
+The mission is evidence-backed technical `READY_FOR_RELEASE`, which means every
+acceptance node verified, nothing more. It never includes a release, deployment or
+publication; those need the founder's separate explicit approval.
+
+Intermediate results, none of them completion: a merged PR, a passing test batch,
+a review, a checkpoint, a handoff, a status report. After each, select the next
+executable task from the acceptance DAG and run it. A progress update states four
+things: what was started or completed, the remaining core release blockers, any
+real watcher and its next action, and any intervention genuinely needed from the
+founder.
+
+When blocked, decide whether the blocker covers one task or all remaining scope.
+Continue independent implementation, focused tests, reviews, documentation and
+acceptance reconciliation. For a CI, resource or dependency wait, arm a supported
+watcher or resume mechanism (a Monitor `until` loop, the SPE-96 coordinator, a
+scheduled check) and record its identifier, trigger, expiry and next action. A
+watcher that does not exist is not claimed. If nothing can proceed, report the exact
+dependency, the evidence and the smallest required intervention; that is a blocked
+report, not completion.
+
+Light work versus heavy work: `memory-admission.py check --weight heavy` or a queue
+refusal defers heavy builds and full suites only. Documentation, reviews, ticket
+reconciliation, focused unit tests and read-only analysis proceed. Queue the heavy
+task through the existing admission queue, release the lane promptly and resume when
+it is granted; never preempt another owner's reservation or override a safety limit.
+
+Verification follows changed behavior and risk. Commit granularity (one test per
+commit, helpers separate from tests) does not require a build or full suite per
+commit: run the relevant tests once across the commits at a logical checkpoint, and
+the full relevant suite for the exact head before the PR is ready. Reuse valid
+evidence; rerun when code, dependencies, environment or a finding invalidates it.
+
+A host ASK on the merge is answered by submitting the exact printed operation, and a
+host denial is reported once with that operation. Neither returns the merge to the
+founder to do by hand, and neither stops independent work.
+
+Respect an explicit single-run limit, spend cap, host restriction and the final
+release approval. Do not re-ask for already-authorized work.
+
 ## Resource and data safety
 
 Preserve active or ambiguously owned worktrees, branches, background processes,
