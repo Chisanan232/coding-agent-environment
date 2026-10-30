@@ -1044,6 +1044,21 @@ class ReviewFollowUpTests(Base):
         self.assertEqual(self.run_qa(run_dir)[0], qa.EXIT["REFUSED"])
         self.assertEqual((run_dir / "RESULT.json").read_text(), before)
 
+    def test_a_signal_right_after_codex_ends_still_marks_the_run_interrupted(self):
+        run_dir = self.prepare()
+        real = subprocess.Popen.communicate
+
+        def communicate_then_signal(proc, *a, **k):
+            result = real(proc, *a, **k)
+            if proc.args[0] == str(self.fake) and proc.args[1] == "exec":
+                os.kill(os.getpid(), signal.SIGTERM)                      # lands just after codex ended
+            return result
+        with unittest.mock.patch.object(subprocess.Popen, "communicate", communicate_then_signal):
+            code, out = self.run_qa(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertTrue(json.loads((run_dir / "RUNMETA.json").read_text())["interrupted"])
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 11)
+
     def test_an_inherited_ignore_of_sighup_is_kept_so_nohup_runs_survive(self):
         import signal
         run_dir = self.prepare()
@@ -1587,6 +1602,18 @@ class IdentityTests(Base):
         code, _ = self.call("verdict", "--run-dir", str(run_dir))
         self.assertEqual(code, 0)
         self.assertIn("cleanup", self.json(run_dir / "RESULT.json"))      # kept when the result is re-evaluated
+
+    def test_a_tampered_packet_id_is_never_used_as_an_exchange_path(self):
+        run_dir = self.prepare()
+        packet = self.json(run_dir / "packet.json")
+        packet["ticket"] = "../../escape"
+        packet["digest"] = qa.packet_digest(packet)                           # a consistent but hostile packet
+        (run_dir / "packet.json").write_text(json.dumps(packet))
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("not valid", out)
+        self.assertEqual([e.name for e in (self.x / "inbox").iterdir()], [])
+        self.assertEqual(list((self.x / "outbox").iterdir()), [])
 
     def test_scheduled_job_present_is_invalid(self):
         self.persistence = [[], ["the crontab of qauser is not empty"]]      # appears while codex runs

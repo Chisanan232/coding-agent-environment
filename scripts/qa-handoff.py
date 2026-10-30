@@ -863,12 +863,14 @@ def launch(args, run_dir, argv, env, cwd, stdin_data, seal=None, timeout=None, n
                         pass
                     return write_result(run_dir, load_packet(run_dir), 'QA_INCOMPLETE', ['codex could not be started (%s)' % type(error).__name__])
                 proc.communicate(stdin_data, timeout=args.timeout if timeout is None else timeout)
+                quiet()                    # codex has ended: from here a signal can only mark the run interrupted
                 if new_session:
                     try:                   # a background process codex left behind must not keep editing the clone after the verdict
                         os.killpg(proc.pid, signal.SIGKILL)   # codex is already reaped; this reaches only what it left in its own group
                     except OSError:
                         pass
             except subprocess.TimeoutExpired:
+                quiet()
                 timed_out = True
                 stop(proc)
             except BaseException:
@@ -1179,6 +1181,12 @@ def parse_confinement(record):
 def run_identity(args, run_dir, packet, source, ident):
     """The run as the dedicated QA user. One run per identity at a time (X/inbox/RUN.lock): the sweep kills every process
     of that user, so a second concurrent run would be killed by the first."""
+    # The ids name directories in the shared exchange: re-check them here, whatever wrote packet.json.
+    if not (all(isinstance(packet.get(k), str) and NAME.fullmatch(packet[k]) and '..' not in packet[k] for k in ('product', 'ticket'))
+            and isinstance(packet.get('sha'), str) and re.fullmatch(r'[0-9a-f]{40,64}', packet['sha'])
+            and NAME.fullmatch(run_dir.name)):
+        return write_result(run_dir, packet, 'QA_INVALID', ['packet product, ticket, sha or run directory name is not valid; '
+                                                            'nothing was handed to the QA user'])
     problems = exchange_problems(ident)
     if problems:
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['exchange is not usable: ' + '; '.join(problems[:3]),
