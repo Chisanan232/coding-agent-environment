@@ -1336,6 +1336,31 @@ class IdentityTests(Base):
         self.assertFalse(self.json(run_dir / "RUNMETA.json")["path_ok"])
         self.assertIn("outbox", out)
 
+    def test_outbox_component_swapped_after_check_is_invalid(self):
+        real = qa.check_tree
+
+        def swap_then_check(source, manifest):
+            # between the descriptor checks and the path-based read, O/source is replaced by an identical copy
+            moved = Path(str(source) + ".orig")
+            os.rename(source, moved)
+            shutil.copytree(moved, source, symlinks=True)
+            return real(source, manifest)
+        run_dir = self.prepare()
+        with unittest.mock.patch.object(qa, "check_tree", swap_then_check):
+            code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        meta = self.json(run_dir / "RUNMETA.json")
+        self.assertFalse(meta["path_ok"])
+        self.assertIn("replaced while it was being sealed", " ".join(meta["tree_problems"]))
+
+    def test_outbox_owned_by_someone_else_is_invalid(self):
+        self.ident = self.ident._replace(exchange_owner=os.getuid() + 1)       # the exchange root is not the expected owner
+        run_dir = self.prepare()
+        with unittest.mock.patch.object(qa, "exchange_problems", lambda ident: []):
+            code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("owned by uid", " ".join(self.json(run_dir / "RUNMETA.json")["tree_problems"]))
+
     def test_modified_qa_clone_is_invalid(self):
         self.fake_mode("dirty")
         run_dir = self.prepare()
@@ -1428,7 +1453,7 @@ class IdentityTests(Base):
 
     def test_a_seal_that_raises_never_passes(self):
         run_dir = self.prepare()
-        with unittest.mock.patch.object(qa, "outbox_problems", lambda *a: (_ for _ in ()).throw(RuntimeError("x"))):
+        with unittest.mock.patch.object(qa, "open_outbox", lambda *a: (_ for _ in ()).throw(RuntimeError("x"))):
             code, out = self.run_ident(run_dir)
         self.assertEqual(code, 12, out)
         meta = self.json(run_dir / "RUNMETA.json")

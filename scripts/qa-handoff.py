@@ -944,27 +944,55 @@ def exchange_problems(ident):
     return problems
 
 
-def outbox_problems(ident, outbox):
-    """Every directory component the producer reads the QA output through, checked with lstat after the sweep (no QA
-    process is left to swap one): a real directory, not a link, with the expected owner."""
-    for path, uid in ((ident.exchange, ident.exchange_owner), (ident.exchange / 'outbox', ident.uid), (outbox, ident.uid),
-                      (outbox / 'source', ident.uid)):
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def outbox_chain(ident, outbox):
+    """The directories the producer reads QA output through, outermost first, with the owner each must have."""
+    return [(ident.exchange, ident.exchange_owner), (ident.exchange / 'outbox', ident.uid), (outbox, ident.uid),
+            (outbox / 'source', ident.uid)]
+
+
+def open_outbox(ident, outbox):
+    """(fds, problems): open X, X/outbox, O and O/source once each, every one relative to its parent's descriptor with
+    O_NOFOLLOW|O_DIRECTORY (a link or non-directory fails the open), and check the owner of the object actually opened.
+    The caller closes the fds."""
+    fds = []
+    for path, uid in outbox_chain(ident, outbox):
         try:
-            st = os.lstat(path)
+            fd = os.open(str(path) if not fds else path.name, DIR_FLAGS, dir_fd=fds[-1] if fds else None)
         except OSError:
-            return ['%s is missing' % path]
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-            return ['%s is a link or not a directory' % path]
-        if st.st_uid != uid:
-            return ['%s is owned by uid %d, expected %d' % (path, st.st_uid, uid)]
-    return []
+            return fds, ['%s is missing, a link or not a directory' % path]
+        fds.append(fd)
+        owner = os.fstat(fd).st_uid
+        if owner != uid:
+            return fds, ['%s is owned by uid %d, expected %d' % (path, owner, uid)]
+    return fds, []
 
 
-def read_sealed(path, uid):
-    """Bytes of a QA-written file: a single-link regular file owned by the QA user, at most MAX_VERDICT_BYTES."""
-    with open_regular(path) as handle:
+def outbox_unchanged(ident, outbox, fds):
+    """True if every path component still names the very directory opened earlier (same device and inode, not a link):
+    the path-based clone check that ran in between read the directories that were checked."""
+    for (path, _), fd in zip(outbox_chain(ident, outbox), fds):
+        try:
+            now, held = os.lstat(path), os.fstat(fd)
+        except OSError:
+            return False
+        if stat.S_ISLNK(now.st_mode) or (now.st_dev, now.st_ino) != (held.st_dev, held.st_ino):
+            return False
+    return len(fds) == len(outbox_chain(ident, outbox))
+
+
+def read_sealed(dir_fd, name, uid):
+    """Bytes of a QA-written file opened relative to its directory's descriptor: a single-link regular file owned by the
+    QA user, at most MAX_VERDICT_BYTES. None if it does not exist."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, 'rb') as handle:
         st = os.fstat(handle.fileno())
-        if st.st_uid != uid or st.st_nlink != 1 or st.st_size > MAX_VERDICT_BYTES:
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != uid or st.st_nlink != 1 or st.st_size > MAX_VERDICT_BYTES:
             raise OSError('not a sealed QA file')
         data = handle.read(MAX_VERDICT_BYTES + 1)
     if len(data) > MAX_VERDICT_BYTES:
@@ -1147,30 +1175,38 @@ def run_identity_locked(args, run_dir, packet, source, ident):
 
 def seal(run_dir, ident, outbox, manifest, info, proc):
     """Freeze what the QA user produced into producer-owned values, so `verdict` never reads the outbox again: sweep the
-    QA user's processes first (nothing can swap a path afterwards), check every outbox component, copy the verdict,
-    compare the QA clone with the manifest once."""
+    QA user's processes first, open every outbox directory once without following links and check its owner, read the
+    verdict relative to the opened outbox, compare the QA clone with the manifest once, then confirm that every path
+    component still names the directory that was opened (so the path-based clone check read what was checked)."""
     extra = {'qa_identity': dict(info), 'stragglers': sweep_identity(ident), 'path_ok': False, 'tree_problems': [],
              'untracked': {'count': 0, 'sample': []}}
     if proc.returncode == 124:
         extra['timed_out'] = True
     elif proc.returncode == 130:
         extra['interrupted'] = True
-    verdict = outbox / 'verdict.json'
-    why = outbox_problems(ident, outbox)
-    if why:
-        extra['tree_problems'] = ['the outbox is not a plain QA-owned directory: ' + why[0]]
-        extra['verdict_sha256'] = 'UNREADABLE'
-        return extra
-    extra['path_ok'] = True
-    if os.path.lexists(verdict):
+    fds, why = open_outbox(ident, outbox)
+    try:
+        if why:
+            extra['tree_problems'] = ['the outbox is not a plain QA-owned directory: ' + why[0]]
+            extra['verdict_sha256'] = 'UNREADABLE'
+            return extra
         try:
-            write_private(run_dir / 'verdict.json', read_sealed(verdict, ident.uid))
+            data = read_sealed(fds[2], 'verdict.json', ident.uid)
+            if data is not None:
+                write_private(run_dir / 'verdict.json', data)
         except OSError:
             extra['verdict_sha256'] = 'UNREADABLE'
-    extra['tree_problems'] = check_tree(outbox / 'source', manifest)
-    names, truncated = untracked_created(outbox / 'source', manifest)
-    extra['untracked'] = {'count': 'many' if truncated else len(names), 'sample': [clean(n, 80) for n in names[:10]]}
-    return extra
+        extra['tree_problems'] = check_tree(outbox / 'source', manifest)
+        names, truncated = untracked_created(outbox / 'source', manifest)
+        extra['untracked'] = {'count': 'many' if truncated else len(names), 'sample': [clean(n, 80) for n in names[:10]]}
+        if outbox_unchanged(ident, outbox, fds):
+            extra['path_ok'] = True
+        else:
+            extra['tree_problems'] = extra['tree_problems'] + ['an outbox directory was replaced while it was being sealed']
+        return extra
+    finally:
+        for fd in fds:
+            os.close(fd)
 
 
 def qa_stage(args):
