@@ -17,7 +17,7 @@ WORKFLOW = ".claude/skills/engineering-workflow/SKILL.md"
 # (id, file, phrase, reach) -- reach is required when file != CLAUDE.
 MANIFEST = [
     # Safe implementation: validation sequence and safety items 16-20.
-    ("validation-impacted-first", CLAUDE, "After each logical unit of change, run impacted tests first.", None),
+    ("validation-impacted-first", CLAUDE, "At each validation checkpoint (a batch of related commits, not every commit), run impacted tests first.", None),
     ("validation-full-suite", CLAUDE, "Before declaring work complete, run the full validation suite.", None),
     ("validation-not-red", CLAUDE, "Do not mark a task done while any test or lint check is red.", None),
     ("validation-unrunnable-check", CLAUDE, "If a check cannot be run locally, say so explicitly before committing.", None),

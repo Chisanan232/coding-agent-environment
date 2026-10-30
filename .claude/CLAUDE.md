@@ -53,7 +53,7 @@ Claude Code must follow these rules on every implementation task, without except
 
 ### Validation sequence
 
-12. After each logical unit of change, run impacted tests first.
+12. At each validation checkpoint (a batch of related commits, not every commit), run impacted tests first.
 13. Before declaring work complete, run the full validation suite.
 14. Do not mark a task done while any test or lint check is red.
 15. If a check cannot be run locally, say so explicitly before committing.
@@ -75,7 +75,8 @@ Claude Code must follow these rules on every implementation task, without except
 New features need tests and bug fixes need a regression test. Tests are
 deterministic, isolated, fast, and assert behavior rather than private internals.
 Do not disable failing tests; fix them or escalate. Run impacted tests while
-iterating and the full suite before committing. Details are in
+iterating and the relevant full validation at meaningful checkpoints and before a PR is
+ready, never merely because a commit was made; record the exact tested revision. Details are in
 [quality-policies](skills/feature-implementation/references/quality-policies.md).
 
 ---
