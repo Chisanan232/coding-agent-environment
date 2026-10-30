@@ -148,6 +148,8 @@ jobs:
           python3 tests/test-permission-rollout.py
           python3 tests/test-decision-delegation.py
           python3 tests/test-campaign-completion.py
+          python3 tests/test-baseline-behavior-map.py
+          python3 tests/test-adoption-probe.py
           python3 tests/test-resource-adapters.py
           python3 tests/test-native-resource-adapters.py
           python3 tests/test-resource-policy-install.py
