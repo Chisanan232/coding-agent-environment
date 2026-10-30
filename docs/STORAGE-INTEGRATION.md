@@ -181,6 +181,11 @@ decides who is granted the lane after the current holder is gone.
   writes the holder reservation (with `queue_id`) and the CLAIMED entry in one critical section. A refusal exits 77 and keeps
   the grant; retrying is one explicit call, never a loop. A second claim of the same grant is refused; a failed `exec`
   releases the reservation and marks the entry RELEASED (`exec-failed`, exit 127).
+- `queue claim --id Q --label L --bytes N --pid P [--ttl-s S] -- COMMAND...` is the same claim for a supervising process: the
+  lane is held by live process P (it must be a process of this user that stays alive as long as the job, e.g. a wrapper that
+  runs the job as its child) and nothing is exec'd. The command after `--` must be the exact job the grant was queued for
+  (fingerprint). Prints one JSON object; exit 0 claimed, 77 refused (the grant is kept). The SPE-96 coordinator's runner uses
+  it, so a resumed session holds the lane exactly as long as its runner.
 - Release evidence: `advance` marks a CLAIMED entry RELEASED only on verified evidence: `holder-exited` (the pid is gone) or
   `pid-reused` (a different start token). A holder that is past its time limit but alive, that cannot be inspected, or whose
   reservation file was removed by an explicit `release` while the job still runs, keeps its lane and bytes (reserve, run, claim
