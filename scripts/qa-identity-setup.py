@@ -342,8 +342,10 @@ class Setup:
         say("ok  exchange area %s: root-owned, private inbox (you write, the QA user reads) and outbox (the QA user writes, you read)" % self.xroot)
 
     # ---- isolation probe, run as the QA user (access tests only)
-    def probe_isolation(self, pw):
-        sudo_refresh()
+    def isolation_record(self, pw):
+        """Run the isolation probe as the QA user and return (probe output, failures); output is None when the probe never
+        produced a record (sudo -n refused, crash, or the producer-side positive control failed). Never prompts and never
+        raises Stop, so qa-handoff.py can call it before every QA run and map the outcome itself (SPE-142)."""
         sentinel = "qa-sentinel-" + secrets.token_hex(16)  # random, synthetic: not a credential
         # the sibling process of the PRODUCER's user that holds the sentinel in its environment
         sib = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(120)"], env={"PATH": "/usr/bin:/bin", "QA_SENTINEL": sentinel},
@@ -351,23 +353,30 @@ class Setup:
         try:
             pe = procenv(sib.pid)  # producer-side positive control: the sentinel really is in the sibling's environment block
             if pe is None or sentinel.encode() not in pe:
-                die("isolation", "control invalid: the producer cannot read its own sibling's environment, so a denial would prove nothing")
+                return None, ["control invalid: the producer cannot read its own sibling's environment, so a denial would prove nothing"]
             r = run(qa_argv(self.name, self.home, [PY, "-I", "-c", PROBE, str(self.xroot / "inbox"), str(self.xroot / "outbox"),
                                                     str(self.xroot), pw.pw_dir, str(sib.pid), sentinel]), check=False, timeout=VERIFY_TIMEOUT)
             try:
                 o = json.loads(r.stdout.strip().splitlines()[-1])
             except (ValueError, IndexError):
-                die("isolation", "QA-user probe did not run (rc %s): %s" % (r.returncode, (r.stderr or r.stdout)[-300:]))
+                o = None
+            if not isinstance(o, dict):
+                return None, ["QA-user probe did not run (rc %s): %s" % (r.returncode, (r.stderr or r.stdout or "")[-300:])]
             fails = evaluate_probe(o, self.uid)
             if sib.poll() is not None:
                 fails.append("the producer sibling exited during the probe; the environment result is void")
-            if fails:
-                die("isolation", "; ".join(fails))
-            if run(["/bin/ls", str(self.xroot / "outbox")], check=False).returncode != 0:
-                die("isolation", "the owner cannot read the outbox (ACL not effective)")
+            if not fails and run(["/bin/ls", str(self.xroot / "outbox")], check=False).returncode != 0:
+                fails.append("the owner cannot read the outbox (ACL not effective)")
+            return o, fails
         finally:
             sib.kill()
             sib.wait()
+
+    def probe_isolation(self, pw):
+        sudo_refresh()
+        o, fails = self.isolation_record(pw)
+        if o is None or fails:
+            die("isolation", "; ".join(fails))
         say("ok  isolation as uid %s: reads inbox, writes outbox only; cannot list your home or reach .codex/.ssh; "
             "cannot read your processes' environment (detector validated on its own child first)" % self.uid)
 

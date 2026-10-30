@@ -4,6 +4,7 @@
 The fake records its argv, environment names and prompt, writes the verdict named by -o and prints a JSON event stream,
 so the tests prove what the wrapper guarantees regardless of what a model says.
 """
+import argparse
 import contextlib
 import importlib.util
 import sys
@@ -11,11 +12,14 @@ import io
 import json
 import os
 import shlex
+import shutil
+import signal
 import stat
 import subprocess
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts/qa-handoff.py"
@@ -56,6 +60,8 @@ if mode == "crash":         # auth, rate limit or crash: codex dies before it wr
     sys.exit(3)
 if mode == "leftover":      # a background process that outlives codex and edits the clone afterwards
     subprocess.Popen(["sh", "-c", "sleep 3; echo late >> tracked.txt"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+if mode == "slow":          # a long but healthy QA run
+    time.sleep(float(open(d + "/slow_seconds").read()) if os.path.exists(d + "/slow_seconds") else 5)
 if mode == "hangdirty":     # tamper, then never produce a verdict
     open("tracked.txt", "a").write("modified by QA")
     time.sleep(120)
@@ -87,6 +93,12 @@ if mode == "linkverdict":
     os.symlink(d + "/decoy.json", out)
 if mode == "headmove":
     open(".git/HEAD", "w").write("0" * 40 + "\n")
+if mode == "linksource":    # the clone is swapped for a link to an untouched copy outside the outbox
+    import shutil
+    src = os.getcwd()
+    shutil.copytree(src, d + "/srccopy", symlinks=True)
+    os.rename(src, d + "/srcmoved")
+    os.symlink(d + "/srccopy", src)
 out = argv[argv.index("-o") + 1]
 if mode == "fifo":
     os.mkfifo(out)
@@ -111,6 +123,11 @@ if mode == "agentforge":      # agent text shaped like command items must not be
     for i in range(3):
         print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "id": "a%d" % i, "exit_code": 0,
                                                               "command": "x"}}))
+if mode == "stderrforge":     # command-shaped events on stderr must never reach the counted stream
+    ncmd = 0
+    for i in range(3):
+        sys.stderr.write(json.dumps({"type": "item.completed", "item": {"type": "command_execution", "id": "e%d" % i,
+                                                                         "exit_code": 0}}) + "\n")
 if mode == "dupitems":        # the same command item repeated is one command
     ncmd = 0
     for i in range(4):
@@ -512,8 +529,7 @@ class RunTests(Base):
                     str(run_dir), str(run_dir.parent), str(run_dir.parent.parent), str(qa.CANARY_ROOT.parent), str(qa.DEFAULT_ROOT),
                     str(run_dir.parent / "sibling-run")):
             code, out = self.run_qa(run_dir, extra=("--read-root", bad))
-            self.assertEqual(code, qa.EXIT["REFUSED"] if False else code)
-            self.assertNotEqual(code, 0, bad)
+            self.assertEqual(code, qa.EXIT["REFUSED"], (bad, out))
             self.assertFalse((self.fake_dir / "seen.json").exists(), bad)
         good = self.root / "toolchain"
         good.mkdir()
@@ -1028,6 +1044,21 @@ class ReviewFollowUpTests(Base):
         self.assertEqual(self.run_qa(run_dir)[0], qa.EXIT["REFUSED"])
         self.assertEqual((run_dir / "RESULT.json").read_text(), before)
 
+    def test_a_signal_right_after_codex_ends_still_marks_the_run_interrupted(self):
+        run_dir = self.prepare()
+        real = subprocess.Popen.communicate
+
+        def communicate_then_signal(proc, *a, **k):
+            result = real(proc, *a, **k)
+            if proc.args[0] == str(self.fake) and proc.args[1] == "exec":
+                os.kill(os.getpid(), signal.SIGTERM)                      # lands just after codex ended
+            return result
+        with unittest.mock.patch.object(subprocess.Popen, "communicate", communicate_then_signal):
+            code, out = self.run_qa(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertTrue(json.loads((run_dir / "RUNMETA.json").read_text())["interrupted"])
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 11)
+
     def test_an_inherited_ignore_of_sighup_is_kept_so_nohup_runs_survive(self):
         import signal
         run_dir = self.prepare()
@@ -1070,6 +1101,693 @@ class ReviewFollowUpTests(Base):
         self.assertEqual(code, 11, out)                              # never QA_PASS once a signal was received
         self.assertTrue(json.loads((run_dir / "RUNMETA.json").read_text())["interrupted"])
         self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 11)
+
+
+def no_subprocess(*args, **kwargs):
+    raise AssertionError("no subprocess may start here: %r" % (args[:1],))
+
+
+class IdentityGuardTests(Base):
+    """SPE-142 usage refusals: REFUSED (64), no RESULT.json, nothing started."""
+
+    def assert_refused(self, code, out, run_dir, text):
+        self.assertEqual(code, qa.EXIT["REFUSED"], out)
+        self.assertIn(text, out)
+        self.assertFalse((run_dir / "RESULT.json").exists())
+        self.assertFalse((self.fake_dir / "seen.json").exists())
+        self.assertFalse((self.fake_dir / "probes.json").exists())
+
+    def test_require_env_isolation_without_identity_is_refused(self):
+        run_dir = self.prepare()
+        code, out = self.run_qa(run_dir, extra=("--require-env-isolation",))
+        self.assert_refused(code, out, run_dir, "--require-env-isolation needs --qa-identity")
+
+    def test_identity_own_uid_or_root_is_refused(self):
+        run_dir = self.prepare()
+        for uid in (os.getuid(), 0):
+            pw = unittest.mock.Mock(pw_uid=uid, pw_dir="/Users/qauser")
+            with unittest.mock.patch.object(qa.pwd, "getpwnam", lambda name, pw=pw: pw), \
+                    unittest.mock.patch.object(qa.subprocess, "run", no_subprocess), \
+                    unittest.mock.patch.object(qa.subprocess, "Popen", no_subprocess):
+                code, out = self.run_qa(run_dir, extra=("--qa-identity", "qauser", "--exchange", "/Users/Shared/qauser-qa"))
+            self.assert_refused(code, out, run_dir, "not root or your own account")
+
+    def test_identity_with_read_root_is_refused(self):
+        run_dir = self.prepare()
+        good = self.root / "toolchain"
+        good.mkdir()
+        code, out = self.run_qa(run_dir, extra=("--qa-identity", "qauser", "--read-root", str(good)))
+        self.assert_refused(code, out, run_dir, "--read-root cannot be combined with --qa-identity")
+
+    def test_sweep_refuses_own_uid_and_root_without_subprocess(self):
+        with unittest.mock.patch.object(qa.subprocess, "run", no_subprocess), \
+                unittest.mock.patch.object(qa.subprocess, "Popen", no_subprocess):
+            for uid in (os.getuid(), 0, True):
+                ident = qa.Identity("qauser", uid, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
+                self.assertIsNone(qa.sweep_identity(ident))           # never `kill -1` as yourself or as root
+
+    def test_persistence_check_reads_cron_at_and_launch_agents_as_the_qa_user(self):
+        ident = qa.Identity("qauser", os.getuid() + 4321, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
+        answers = {}
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            self.assertEqual(argv[:4], [qa._qis().SUDO, "-n", "-u", "qauser"])
+            name = os.path.basename(argv[4])
+            if name == "launchctl":
+                self.assertEqual(argv[5:], ["print", "%s/%d" % (argv[-1].split("/")[0], ident.uid)])
+                name += ":" + argv[-1].split("/")[0]
+            answer = answers.get(name, (0, "", ""))
+            if answer == "timeout":
+                raise subprocess.TimeoutExpired(argv, 30)
+            rc, out, err = answer
+            return subprocess.CompletedProcess(argv, rc, out, err)
+        with unittest.mock.patch.object(qa.subprocess, "run", fake_run):
+            answers.update(CLEAN_PERSISTENCE)
+            self.assertEqual(qa.persistence_problems(ident), [])
+            self.assertEqual([os.path.basename(c[4]) for c in calls], ["crontab", "atq", "ls", "launchctl", "launchctl"])
+            for name, answer, text in (("crontab", (0, "* * * * * /tmp/x\n", ""), "crontab"),
+                                       ("atq", (0, "3\tFri Oct 30 12:00:00 2026\n", ""), "at queue"),
+                                       ("ls", (0, "evil.plist\n", ""), "LaunchAgents"),
+                                       ("atq", (1, "", "atq: cannot open lockfile\n"), "could not check the at queue"),
+                                       ("crontab", (1, "", "sudo: a password is required\n"), "sudo -n refused"),
+                                       ("launchctl:user", (0, launchd_domain("0\t-\tcom.apple.cfprefsd.xpc.agent"), ""),
+                                        "launchd domain user/"),                    # present, even with only com.apple.*
+                                       ("launchctl:gui", (0, launchd_domain("123\t-\torg.example.helper"), ""),
+                                        "launchd domain gui/"),
+                                       ("launchctl:user", (0, "", ""), "launchd domain user/"),           # empty
+                                       ("launchctl:user", (0, "garbled \x00 output", ""), "launchd domain user/"),
+                                       ("launchctl:gui", (5, "", "Bad request.\n"), "launchd domain gui/"),
+                                       ("launchctl:user", (113, "could not find domain\n", ""), "launchd domain user/"),  # not the exact form
+                                       ("launchctl:user", "timeout", "launchd domain user/"),
+                                       ("launchctl:user", (1, "", "sudo: a password is required\n"), "sudo -n refused")):
+                saved = dict(answers)
+                answers[name] = answer
+                problems = qa.persistence_problems(ident)
+                self.assertTrue(any(text in p for p in problems), (name, problems))
+                answers.clear()
+                answers.update(saved)
+            calls.clear()
+            for uid in (os.getuid(), 0):
+                self.assertTrue(qa.persistence_problems(ident._replace(uid=uid)))
+            self.assertEqual(calls, [])                                       # refused before any subprocess
+
+    def test_a_straggler_respawned_after_the_settle_is_counted(self):
+        ident = qa.Identity("qauser", os.getuid() + 4321, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
+        listings = [(1, ""), (0, "4242\n")]          # gone at first, then launchd brings one back after its throttle
+        slept = []
+
+        def fake_run(argv, **kwargs):
+            if argv[0] == qa.PGREP:
+                rc, out = listings.pop(0) if listings else (1, "")
+                return subprocess.CompletedProcess(argv, rc, out, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with unittest.mock.patch.object(qa.subprocess, "run", fake_run), \
+                unittest.mock.patch.object(qa.time, "sleep", slept.append):
+            self.assertEqual(qa.sweep_identity(ident, recheck=qa.RESPAWN_SECONDS), 1)
+        self.assertIn(qa.RESPAWN_SECONDS, slept)
+        self.assertGreater(qa.RESPAWN_SECONDS, qa.SETTLE_SECONDS)
+        self.assertLessEqual(qa.RESPAWN_SECONDS, 30)                  # bounded
+
+
+class KillChildTests(Base):
+    """kill_child stops the sudo hop, which is not a process-group leader (it stays in the owner's session)."""
+
+    HOLD = ("import os, signal, sys, time\n"
+            "if sys.argv[1] == 'ignore': signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "open(sys.argv[2], 'w').write(str(os.getpid()))\n"
+            "time.sleep(120)\n")
+
+    def child(self, behaviour):
+        ready = self.root / ("ready-" + behaviour)
+        proc = subprocess.Popen([sys.executable, "-c", self.HOLD, behaviour, str(ready)])
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        deadline = time.time() + 30
+        while time.time() < deadline and not (ready.exists() and ready.read_text()):
+            time.sleep(0.05)
+        return proc
+
+    def test_kill_child_stops_a_child_by_pid(self):
+        proc = self.child("exit")
+        qa.kill_child(proc)
+        self.assertEqual(proc.returncode, -signal.SIGTERM)
+
+    def test_kill_child_escalates_from_term_to_kill(self):
+        proc = self.child("ignore")
+        qa.kill_child(proc)
+        self.assertEqual(proc.returncode, -signal.SIGKILL)
+
+    def test_an_identity_hop_timeout_really_stops_the_hop(self):
+        # launch(new_session=False) must stop a child that is not a group leader: a no-op stop, or killpg (swapped in),
+        # would leave it running and this fails.
+        run_dir = self.prepare()
+        pid_file = self.root / "hop.pid"
+        argv = [sys.executable, "-c", self.HOLD, "ignore", str(pid_file)]
+        args = argparse.Namespace(timeout=1, settle=0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = qa.launch(args, run_dir, argv, dict(os.environ), str(self.root), None, new_session=False, timeout=1)
+        pid = int(pid_file.read_text())
+        self.addCleanup(lambda: subprocess.run(["kill", "-9", str(pid)], capture_output=True))
+        self.assertEqual(code, 11, out.getvalue())
+        self.assertTrue(json.loads((run_dir / "RUNMETA.json").read_text())["timed_out"])
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+
+def launchd_domain(*services):
+    """The shape `launchctl print user/<uid>` prints: a domain block with a services block of `pid status label` rows."""
+    rows = "".join("\t\t%s\n" % row for row in services)
+    return "user/777 = {\n\ttype = User\n\tservices = {\n%s\t}\n\tendpoints = {\n\t}\n}\n" % rows
+
+
+CLEAN_PERSISTENCE = {
+    "crontab": (1, "", "crontab: no crontab for qauser\n"),
+    "ls": (1, "", "ls: /Users/qauser/Library/LaunchAgents: No such file or directory\n"),
+    "launchctl:user": (113, "Could not find domain for user/777\n", ""),
+    "launchctl:gui": (113, "Could not find domain for port identifier: gui/777\n", ""),   # never logged in
+}
+
+
+FAKE_SUDO = r"""#!@PY@
+import json, os, sys, time
+d = "@FAKEDIR@"
+argv = sys.argv[1:]
+mode = open(d + "/sudo_mode").read().strip() if os.path.exists(d + "/sudo_mode") else "ok"
+with open(d + "/sudo_calls.jsonl", "a") as log:
+    log.write(json.dumps([a for a in argv if "\n" not in a]) + "\n")
+with open(d + "/sudo_sids", "a") as log:
+    log.write("%d\n" % os.getsid(0))
+# sudo's timestamp is per terminal session: a hop started in a new session does not see the owner's `sudo -v`
+cached_sid = int(open(d + "/sid").read()) if os.path.exists(d + "/sid") else None
+if mode == "refuse" or (mode == "refuse_exec" and "qa-exec" in argv) or (cached_sid is not None and os.getsid(0) != cached_sid):
+    sys.stderr.write("sudo: a password is required\n")
+    sys.exit(1)
+# a credential that expires after cred_ttl seconds unless `sudo -n -v` refreshes it (models sudo's timestamp_timeout)
+if os.path.exists(d + "/cred_ttl"):
+    last = float(open(d + "/cred").read()) if os.path.exists(d + "/cred") else 0.0
+    if time.time() - last > float(open(d + "/cred_ttl").read()):
+        sys.stderr.write("sudo: a password is required\n")
+        sys.exit(1)
+if argv == ["-n", "-v"]:
+    if os.path.exists(d + "/cred_ttl"):
+        open(d + "/cred", "w").write(str(time.time()))
+    sys.exit(0)
+if argv[:2] != ["-n", "-u"]:
+    sys.exit(98)                          # only the non-interactive form is ever expected
+rest = argv[3:]
+if rest[:1] == ["-H"]:
+    rest = rest[1:]
+if not rest or os.path.basename(rest[0]) in ("kill", "pkill", "killall"):
+    sys.exit(99)                          # a test must never `kill -1` as the developer
+if "qa-stage" in rest and os.path.exists(d + "/stage_forge"):
+    sys.stdout.write(open(d + "/stage_forge").read())
+    sys.exit(0)
+os.execv(rest[0], rest)
+"""
+
+
+class IdentityTests(Base):
+    """SPE-142: `run --qa-identity` through the real hop code with an injected fake sudo that drops `-n -u NAME -H` and
+    runs the rest as the current user. No real sudo, account, ACL or codex is used; resolve_identity, sweep_identity and
+    the macOS-only environment probe are replaced, so these tests prove the producer's mapping and sealing, not the OS."""
+
+    def setUp(self):
+        super().setUp()
+        # PATH is the setup script's SAFE_PATH under `env -i`, so the fakes name their interpreter explicitly
+        self.fake.write_text(FAKE.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1).replace("@FAKEDIR@", str(self.fake_dir)))
+        self.qahome = self.root / "qahome"
+        self.qahome.mkdir(mode=0o700)
+        (self.qahome / ".codex").mkdir(mode=0o700)
+        (self.qahome / ".codex/auth.json").write_text("synthetic-qa-login")   # not a credential; the login control needs a file
+        self.x = self.root / "x"
+        self.x.mkdir()
+        self.x.chmod(0o711)
+        for sub in ("inbox", "outbox"):
+            (self.x / sub).mkdir(mode=0o700)
+        (self.fake_dir / "sid").write_text(str(os.getsid(0)))                 # where the owner's `sudo -v` was cached
+        self.sudo = self.root / "sudo"
+        self.sudo.write_text(FAKE_SUDO.replace("@PY@", sys.executable).replace("@FAKEDIR@", str(self.fake_dir)))
+        self.sudo.chmod(0o755)
+        self.ident = qa.Identity("qauser", os.getuid(), self.qahome, self.x, os.getuid())
+        self.sweeps = []
+        self.persistence = []
+        self.rechecks = []
+        self.isolation = ({"uid": os.getuid(), "foreign_env_leaked": False, "own_env_read": "ok"}, [])
+        qis = qa._qis()
+
+        def sweep(ident, recheck=0):
+            self.assertEqual(ident, self.ident)
+            self.rechecks.append(recheck)
+            return self.sweeps.pop(0) if self.sweeps else 0
+        for patch in (unittest.mock.patch.object(qis, "SUDO", str(self.sudo)), unittest.mock.patch.object(qis, "PY", sys.executable),
+                      unittest.mock.patch.object(qa, "resolve_identity", lambda name, exchange: self.ident),
+                      unittest.mock.patch.object(qa, "sweep_identity", sweep),
+                      unittest.mock.patch.object(qa, "persistence_problems",
+                                                 lambda ident: list(self.persistence.pop(0) if self.persistence else [])),
+                      unittest.mock.patch.object(qis.Setup, "isolation_record", lambda setup, pw: self.isolation)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def run_ident(self, run_dir, extra=()):
+        return self.run_qa(run_dir, extra=("--qa-identity", "qauser", "--exchange", str(self.x)) + tuple(extra))
+
+    def outbox(self):
+        entries = list((self.x / "outbox").iterdir())
+        self.assertEqual(len(entries), 1, entries)
+        return entries[0]
+
+    def inbox(self):
+        entries = [e for e in (self.x / "inbox").iterdir() if e.name != "RUN.lock"]
+        self.assertEqual(len(entries), 1, entries)
+        return entries[0]
+
+    def json(self, path):
+        return json.loads(Path(path).read_text())
+
+    def assert_not_started(self, run_dir, state):
+        self.assertFalse((self.fake_dir / "seen.json").exists())             # codex exec never ran
+        self.assertEqual(self.json(run_dir / "RESULT.json")["state"], state)
+        self.assertFalse((run_dir / "RUNMETA.json").exists())
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())               # the identity lock is released
+
+    def test_identity_run_passes_through_hop_and_seals(self):
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 0, out)
+        meta = self.json(run_dir / "RUNMETA.json")
+        outbox = self.outbox()
+        self.assertEqual(meta["qa_identity"]["name"], "qauser")
+        self.assertEqual(meta["qa_identity"]["attempt"], outbox.name)
+        self.assertEqual((meta["stragglers"], meta["path_ok"], meta["tree_problems"]), (0, True, []))
+        self.assertIn(qa.RESPAWN_SECONDS, self.rechecks)                     # the seal's sweep looks again after the throttle
+        seen = self.seen()
+        codex_home = self.qahome / ".local/state/coding-agent-environment/qa" / outbox.name / "codexhome"
+        self.assertEqual(seen["cwd"], str(outbox / "source"))                 # QA works on its own copy, not R/source
+        self.assertEqual(seen["codex_home"], str(codex_home))                # under the QA user's HOME, outside the outbox
+        self.assertEqual(seen["argv"][seen["argv"].index("-o") + 1], str(outbox / "verdict.json"))
+        self.assertEqual((run_dir / "verdict.json").read_bytes(), (outbox / "verdict.json").read_bytes())   # sealed copy
+        self.assertIn(str(outbox / "out"), (self.fake_dir / "prompt.txt").read_text())
+        self.assertTrue(self.json(run_dir / "ISOLATION.json")["established"])
+        confinement = self.json(run_dir / "CONFINEMENT.json")
+        self.assertTrue(confinement["established"])
+        self.assertEqual(confinement["derived_by"], "producer")
+        for probe in self.json(self.fake_dir / "probes.json"):
+            self.assertEqual(probe["home"], str(codex_home))                  # probed under the exact home codex then uses
+        calls = [json.loads(line) for line in (self.fake_dir / "sudo_calls.jsonl").read_text().splitlines()]
+        self.assertTrue(all(call == ["-n", "-v"] for call in calls if "-u" not in call))   # keepalive refreshes only
+        calls = [call for call in calls if "-u" in call]
+        self.assertEqual(len(calls), 2)                                      # qa-stage and qa-exec (sweep and probe replaced)
+        for call in calls:
+            self.assertEqual(call[:7], ["-n", "-u", "qauser", "-H", "/usr/bin/env", "-i", "HOME=%s" % self.qahome])
+        self.assertIn("qa-stage", calls[0])
+        self.assertIn("qa-exec", calls[1])
+        self.assertEqual(qa.check_tree(run_dir / "source", self.json(run_dir / "tree-manifest.json")), [])
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())
+        self.assertEqual(self.json(run_dir / "RESULT.json")["state"], "QA_PASS")
+
+    def test_forged_event_on_qa_stderr_is_not_counted(self):
+        self.fake_mode("stderrforge")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertIn("fewer than 2 successful commands", out)
+        self.assertIn('"e0"', (self.outbox() / "stderr.log").read_text())    # it went to the QA-side file
+        self.assertNotIn('"e0"', (run_dir / "events.jsonl").read_text())     # never into the producer's capture
+
+    def test_sudo_not_cached_is_incomplete_codex_not_started(self):
+        (self.fake_dir / "sudo_mode").write_text("refuse")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertIn("sudo -n refused", out)
+        self.assert_not_started(run_dir, "QA_INCOMPLETE")
+
+    def test_env_canary_leak_is_invalid_codex_not_started(self):
+        self.isolation = ({"uid": os.getuid(), "foreign_env_leaked": True}, ["the QA user could read the producer's process environment"])
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("environment isolation not established", out)
+        self.assert_not_started(run_dir, "QA_INVALID")
+        self.assertFalse(self.json(run_dir / "ISOLATION.json")["established"])
+        self.assertEqual(list((self.x / "outbox").iterdir()), [])              # nothing was handed to the QA user
+
+    def test_env_probe_not_run_is_incomplete(self):
+        self.isolation = (None, ["QA-user probe did not run (rc 1): sudo: a password is required"])
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertIn("environment isolation probe did not run", out)
+        self.assert_not_started(run_dir, "QA_INCOMPLETE")
+
+    def test_qa_side_leaky_confinement_is_invalid(self):
+        (self.fake_dir / "sandbox_mode").write_text("leaky")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("read confinement not established", out)
+        self.assert_not_started(run_dir, "QA_INVALID")
+        self.assertFalse(self.json(run_dir / "CONFINEMENT.json")["established"])
+
+    def test_forged_confinement_record_missing_controls_is_invalid(self):
+        forged = [{"control": "pos_read_clone", "observed": "ALLOWED", "ok": True}]            # "established" but incomplete
+        allowed = [{"control": n, "observed": "ALLOWED", "ok": True} for n, _, _ in qa.CONTROLS]  # every control claims ok
+        for controls, text in ((forged, "controls missing"), (allowed, "neg_read_canary expected DENIED")):
+            (self.fake_dir / "stage_forge").write_text(json.dumps({"confinement": {"established": True, "controls": controls}}) + "\n")
+            run_dir = self.prepare()
+            code, out = self.run_ident(run_dir)
+            self.assertEqual(code, 12, out)
+            self.assertIn(text, out)
+            self.assert_not_started(run_dir, "QA_INVALID")
+        (self.fake_dir / "stage_forge").write_text('{"confinement": {}}\n{"second": 1}\n')       # not exactly one record
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("exactly one JSON record", out)
+
+    def test_record_without_the_login_control_is_invalid(self):
+        rows = [{"control": n, "observed": "ALLOWED" if e == "ALLOWED" else "DENIED:1", "ok": True, "unrunnable": False}
+                for n, _, e in qa.CONTROLS if n != "neg_open_auth_file"]          # every other control is correct
+        (self.fake_dir / "stage_forge").write_text(json.dumps({"confinement": {"established": True, "controls": rows}}) + "\n")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("controls missing: neg_open_auth_file", out)
+        self.assert_not_started(run_dir, "QA_INVALID")
+
+    def test_the_real_stage_probes_the_login_control(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir)[0], 0)
+        names = {c["control"] for c in self.json(run_dir / "CONFINEMENT.json")["controls"]}
+        self.assertEqual(names, {n for n, _, _ in qa.CONTROLS})
+        self.assertNotIn("synthetic-qa-login", (run_dir / "CONFINEMENT.json").read_text())
+
+    def test_qa_user_without_a_codex_login_is_incomplete(self):
+        (self.qahome / ".codex/auth.json").unlink()
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertIn("no Codex login", out)
+        self.assert_not_started(run_dir, "QA_INCOMPLETE")
+
+    def test_symlinked_outbox_source_is_invalid(self):
+        self.fake_mode("linksource")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertFalse(self.json(run_dir / "RUNMETA.json")["path_ok"])
+        self.assertIn("outbox", out)
+
+    def test_outbox_component_swapped_after_check_is_invalid(self):
+        real = qa.check_tree
+
+        def swap_then_check(source, manifest):
+            # between the descriptor checks and the path-based read, O/source is replaced by an identical copy
+            moved = Path(str(source) + ".orig")
+            os.rename(source, moved)
+            shutil.copytree(moved, source, symlinks=True)
+            return real(source, manifest)
+        run_dir = self.prepare()
+        with unittest.mock.patch.object(qa, "check_tree", swap_then_check):
+            code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        meta = self.json(run_dir / "RUNMETA.json")
+        self.assertFalse(meta["path_ok"])
+        self.assertIn("replaced while it was being sealed", " ".join(meta["tree_problems"]))
+
+    def test_outbox_owned_by_someone_else_is_invalid(self):
+        self.ident = self.ident._replace(exchange_owner=os.getuid() + 1)       # the exchange root is not the expected owner
+        run_dir = self.prepare()
+        with unittest.mock.patch.object(qa, "exchange_problems", lambda ident: []):
+            code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("owned by uid", " ".join(self.json(run_dir / "RUNMETA.json")["tree_problems"]))
+
+    def test_modified_qa_clone_is_invalid(self):
+        self.fake_mode("dirty")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("tracked files changed", out)
+        self.assertEqual((run_dir / "source/tracked.txt").read_text(), "v1\n")       # the producer's clone was never handed over
+
+    def test_outbox_verdict_link_is_invalid(self):
+        self.fake_mode("linkverdict")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("not a regular file", out)
+        self.assertFalse(os.path.lexists(run_dir / "verdict.json"))                  # the link was never followed or copied
+
+    def test_verdict_idempotent_after_outbox_deleted_or_edited(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir)[0], 0)
+        outbox = self.outbox()
+        (outbox / "verdict.json").write_text(verdict(verified=[{"check": "AC1", "result": "FAIL", "evidence": "x"}]))
+        with open(outbox / "source/tracked.txt", "a") as handle:
+            handle.write("edited after the seal")
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 0)     # sealed values, not the outbox
+        shutil.rmtree(outbox)
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 0)
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 0)
+
+    def test_stragglers_after_sweep_never_pass(self):
+        self.sweeps = [0, 1]                    # clean before the run, one QA-user process survives the seal's sweep
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("survived the sweep", out)
+        self.sweeps = [0, None]                 # a sweep that could not run is no better
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir)[0], 12)
+
+    def slow_run_with_expiring_credential(self, keepalive_seconds):
+        (self.fake_dir / "cred_ttl").write_text("10")                         # sudo forgets the owner after 10 s
+        (self.fake_dir / "cred").write_text(str(time.time()))
+        (self.fake_dir / "slow_seconds").write_text("15")                     # codex runs longer than that
+        self.fake_mode("slow")
+        run_dir = self.prepare()
+        with unittest.mock.patch.object(qa, "KEEPALIVE_SECONDS", keepalive_seconds):
+            code, out = self.run_ident(run_dir)
+        return code, out, run_dir
+
+    def test_sudo_keepalive_keeps_a_long_healthy_run_alive(self):
+        code, out, run_dir = self.slow_run_with_expiring_credential(1)
+        self.assertEqual(code, 0, out)
+        keepalive = self.json(run_dir / "RUNMETA.json")["sudo_keepalive"]
+        self.assertGreaterEqual(keepalive["refreshes"], 5)
+        self.assertEqual(keepalive["failures"], [])
+        self.assertFalse((run_dir / "CLEANUP.json").exists())
+
+    def test_an_expired_sudo_credential_at_the_seal_is_invalid_with_the_true_reason(self):
+        code, out, run_dir = self.slow_run_with_expiring_credential(1000)   # no refresh during the run
+        self.assertEqual(code, 12, out)
+        self.assertIn("sudo -n refused (the sudo credential expired", out)
+        self.assertNotIn("survived the sweep", out)
+        meta = self.json(run_dir / "RUNMETA.json")
+        self.assertTrue(meta["sudo_refused_at_seal"])
+        self.assertTrue(meta["sudo_keepalive"]["failures"])                 # recorded, not silent
+        self.assertIn("sudo -n refused", (run_dir / "CLEANUP.json").read_text())
+
+    def test_a_failed_cleanup_sweep_is_reported_to_the_owner(self):
+        self.sweeps = [0, 0, None]               # pre-run, seal, and the final cleanup sweep that cannot run
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 0, out)           # the seal's own sweep was clean; the note does not change the state
+        self.assertIn("NOTE QA-user processes may survive", out)
+        self.assertIsNone(self.json(run_dir / "RESULT.json")["cleanup"]["sweep"])
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())
+        code, _ = self.call("verdict", "--run-dir", str(run_dir))
+        self.assertEqual(code, 0)
+        self.assertIn("cleanup", self.json(run_dir / "RESULT.json"))      # kept when the result is re-evaluated
+
+    def test_a_tampered_packet_id_is_never_used_as_an_exchange_path(self):
+        run_dir = self.prepare()
+        packet = self.json(run_dir / "packet.json")
+        packet["ticket"] = "../../escape"
+        packet["digest"] = qa.packet_digest(packet)                           # a consistent but hostile packet
+        (run_dir / "packet.json").write_text(json.dumps(packet))
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("not valid", out)
+        self.assertEqual([e.name for e in (self.x / "inbox").iterdir()], [])
+        self.assertEqual(list((self.x / "outbox").iterdir()), [])
+
+    def test_scheduled_job_present_is_invalid(self):
+        self.persistence = [[], ["the crontab of qauser is not empty"]]      # appears while codex runs
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("scheduled jobs or launch agents", out)
+        self.assertEqual(self.json(run_dir / "RUNMETA.json")["persistence"], ["the crontab of qauser is not empty"])
+
+    def test_scheduled_job_before_the_run_refuses_to_start(self):
+        self.persistence = [["launchd domain user/777 is present or could not be read (exit 0)"]]
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertIn("not clean before the run", out)
+        self.assert_not_started(run_dir, "QA_INCOMPLETE")
+        self.assertEqual(list((self.x / "outbox").iterdir()), [])              # nothing was handed to the QA user
+
+    def test_hop_2_runs_in_the_same_session_as_hops_0_and_1(self):
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 0, out)
+        sids = (self.fake_dir / "sudo_sids").read_text().split()
+        self.assertGreaterEqual(len(sids), 3)                                # keepalive, qa-stage and qa-exec
+        self.assertEqual(set(sids), {str(os.getsid(0))})                     # where the owner's credential is cached
+
+    def test_sudo_refused_at_the_codex_hop_is_incomplete_codex_not_started(self):
+        (self.fake_dir / "sudo_mode").write_text("refuse_exec")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertIn("sudo -n refused the codex hop", out)
+        self.assertIn("codex was not started", out)
+        self.assertFalse((self.fake_dir / "seen.json").exists())
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 11)          # idempotent
+        self.assertEqual(self.run_ident(run_dir)[0], qa.EXIT["REFUSED"])                   # a new attempt, not a re-run
+
+    def test_a_profile_changed_between_hops_fails_closed(self):
+        real = qa.hop
+
+        def hop_then_tamper(ident, argv, seconds):
+            out = real(ident, argv, seconds)
+            for cfg in self.qahome.glob(".local/state/coding-agent-environment/qa/*/codexhome/config.toml"):
+                with open(cfg, "a") as handle:
+                    handle.write('\n"/" = "read"\n')                       # widened after it was proved
+            return out
+        run_dir = self.prepare()
+        with unittest.mock.patch.object(qa, "hop", hop_then_tamper):
+            code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("profile changed", out)
+        self.assertFalse((self.fake_dir / "seen.json").exists())             # codex never started
+        self.assertEqual(self.json(run_dir / "RUNMETA.json")["exit_code"], qa.PROFILE_CHANGED)
+
+    def test_two_interrupts_during_the_seal_keep_the_record_and_release_the_lock(self):
+        import signal
+
+        def interrupt_twice(ident):
+            os.kill(os.getpid(), signal.SIGINT)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return list(self.persistence.pop(0) if self.persistence else [])
+        self.persistence = [[]]                                               # the pre-run check stays clean
+        run_dir = self.prepare()
+        calls = {"n": 0}
+
+        def persistence(ident):
+            calls["n"] += 1
+            return [] if calls["n"] == 1 else interrupt_twice(ident)     # the second call is inside the seal
+        with unittest.mock.patch.object(qa, "persistence_problems", persistence):
+            code, out = self.run_ident(run_dir)
+        self.assertNotEqual(code, 0, out)
+        meta = self.json(run_dir / "RUNMETA.json")                           # the record survived both signals
+        self.assertTrue(meta["interrupted"])
+        self.assertEqual(meta["qa_identity"]["name"], "qauser")
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())
+        self.assertNotEqual(self.json(run_dir / "RESULT.json")["state"], "QA_PASS")
+        self.assertEqual(self.run_ident(run_dir)[0], qa.EXIT["REFUSED"])
+
+    def test_a_started_run_without_a_record_is_never_rerunnable(self):
+        run_dir = self.prepare()
+        def no_record(*args, **kwargs):
+            raise OSError("disk full")                                        # the record cannot be written at all
+        with unittest.mock.patch.object(qa, "write_meta", no_record), self.assertRaises(OSError):
+            self.run_ident(run_dir)                                           # an I/O failure surfaces, it is not a state
+        self.assertFalse((run_dir / "RUNMETA.json").exists())
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)          # codex started, no record
+        self.assertEqual(self.run_ident(run_dir)[0], qa.EXIT["REFUSED"])
+
+    def test_the_mode_is_recorded_and_a_different_mode_is_refused(self):
+        (self.x / "inbox/RUN.lock").write_text("")                            # the identity attempt has to wait
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir, extra=("--require-env-isolation",))[0], 75)
+        mode = self.json(run_dir / "RESULT.json")["mode"]
+        self.assertEqual(mode, {"qa_identity": "qauser", "exchange": str(self.x), "require_env_isolation": True})
+        before = (run_dir / "RESULT.json").read_text()
+        code, out = self.run_qa(run_dir)                                      # the same attempt as the producer itself
+        self.assertEqual(code, qa.EXIT["REFUSED"], out)
+        self.assertIn("another mode", out)
+        self.assertEqual((run_dir / "RESULT.json").read_text(), before)
+        self.assertEqual(self.run_ident(run_dir)[0], qa.EXIT["REFUSED"])     # without --require-env-isolation: another mode
+        (self.x / "inbox/RUN.lock").unlink()
+        self.assertEqual(self.run_ident(run_dir, extra=("--require-env-isolation",))[0], 0)
+        self.assertTrue(self.json(run_dir / "RUNMETA.json")["qa_identity"]["require_env_isolation"])
+
+    def test_identity_lock_busy_is_waiting_resource(self):
+        (self.x / "inbox/RUN.lock").write_text("")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 75, out)
+        self.assertEqual(self.json(run_dir / "RESULT.json")["state"], "WAITING_RESOURCE")
+        self.assertTrue((self.x / "inbox/RUN.lock").exists())                       # another run's lock is never removed
+        self.assertFalse((self.fake_dir / "seen.json").exists())
+        self.assertFalse((self.fake_dir / "sudo_calls.jsonl").exists())
+
+    def test_identity_timeout_kills_codex_group_and_is_incomplete(self):
+        self.fake_mode("hang")
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir, extra=("--timeout", "12"))
+        self.assertEqual(code, 11, out)
+        self.assertIn("timed out", out)
+        self.assertTrue(self.json(run_dir / "RUNMETA.json")["timed_out"])
+        for name in ("self.pid", "child.pid"):
+            pid = int((self.fake_dir / name).read_text())
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.2)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_missing_isolation_record_after_run_is_invalid(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir)[0], 0)
+        (run_dir / "ISOLATION.json").unlink()
+        code, out = self.call("verdict", "--run-dir", str(run_dir))
+        self.assertEqual(code, 12, out)
+        self.assertIn("ISOLATION.json", out)
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir)[0], 0)
+        record = self.json(run_dir / "CONFINEMENT.json")
+        record["established"] = False
+        (run_dir / "CONFINEMENT.json").write_text(json.dumps(record))
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)
+
+    def test_inbox_source_removed_and_script_sha_recorded(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir)[0], 0)
+        inbox = self.inbox()
+        self.assertFalse((inbox / "source").exists())
+        sha = qa.sha256_file(inbox / "qa-handoff.py")
+        self.assertEqual(sha, qa.sha256_file(SCRIPT))
+        self.assertEqual(self.json(run_dir / "RUNMETA.json")["qa_identity"]["script_sha256"], sha)
+
+    def test_a_seal_that_raises_never_passes(self):
+        run_dir = self.prepare()
+        with unittest.mock.patch.object(qa, "open_outbox", lambda *a: (_ for _ in ()).throw(RuntimeError("x"))):
+            code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        meta = self.json(run_dir / "RUNMETA.json")
+        self.assertIn("seal failed (RuntimeError)", meta["tree_problems"])
+        self.assertFalse(meta["path_ok"])
+        self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 12)
+
+    def test_wrong_exchange_layout_is_incomplete_and_nothing_starts(self):
+        self.x.chmod(0o755)
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertIn("exchange is not usable", out)
+        self.assertFalse((self.fake_dir / "sudo_calls.jsonl").exists())
 
 
 if __name__ == "__main__":
