@@ -148,6 +148,24 @@ owns the `READY_FOR_RELEASE` completion token and decision levels.
 ---
 
 <!-- coding-agent-environment:engineering-workflow:start -->
+## Standing Contract
+
+<!-- coding-agent-environment:baseline:standing-contract:start -->
+Standing contract (universal; specialised procedure loads only when it applies):
+
+- Deliver by pull request only, from fetched `main`, in an isolated worktree, one ticket per PR; never push to the default branch. Commits are atomic Gitmoji commits; each new or changed test is its own commit. Commit granularity is separate from validation frequency: run impacted tests at a logical checkpoint and the relevant full suite once per exact revision before the PR is ready, not after every commit.
+- An eligible PR is merged by the agent: run the printed `merge_command`. If the host asks, submit that exact operation and continue; if the host denies it, report the exact denial once with the minimum owner action and keep independent work running. Merge commit only. Release approval stays a separate founder decision.
+- Report results as PASS, FAIL, BLOCKED, NOT_RUN, DEFERRED, WAIVED or NOT_VERIFIED; never merge them. A claim of "tested" names the command, revision and exit status.
+- Acceptance criteria are proportional to the core user value. A non-core criterion that is costly may be KEPT, SIMPLIFIED, DEFERRED (recorded, owner and trigger named), WAIVED or REMOVED with the reason; a core failure is never downgraded and stays blocking. Removing or waiving a written criterion goes to the founder as one options packet.
+- A pending decision, ASK or owner-run step blocks only the work that depends on it; continue independent work and record the resume trigger.
+- Adapt to resources: before heavy work run `scripts/memory-admission.py check --weight heavy`; on pressure reduce parallelism or defer, do not freeze and do not kill another session's work. Treat 7 subagents as a ceiling, not a target.
+- Delegated agents and QA runs carry this contract: put the relevant obligations and acceptance criteria in their prompt; do not assume a subagent loaded your skills. Use `qa-handoff.py` for traceable Codex QA dispatch and record its run id and verdict.
+- Load `ship-product` when delivering a user-facing outcome end to end, `verify-product` when planning or reporting verification, `engineering-workflow` for branch, review, merge and cleanup mechanics, `decision-delegation` for who decides.
+- Secrets are opaque capabilities: use them, verify presence only, never print or log a value.
+<!-- coding-agent-environment:baseline:standing-contract:end -->
+
+---
+
 ## Workflow Path
 
 Every repository code change, however small, goes through a pull request that
@@ -232,13 +250,18 @@ Before heavy work run `scripts/memory-admission.py check --weight heavy` from th
 SPE-109 disk gate; it is not installed into `~/.claude`); one heavy
 lane at a time, never kill or delete another session's work, and treat a swap-used number as history, not current
 exhaustion. After a reboot treat earlier processes, locks, reservations and jobs as stale and reconcile before resuming.
-Use `gh` for GitHub; it never bypasses host authorization, PR classes, CI, reviews or the merge gate. Merge an eligible PR only with
-the `merge_command` that `scripts/owner-merge-gate.py check --settings` prints (the validating `owner-merge-runner` when offered, else the
-pinned `gh pr merge`, which asks); never choose another merge spelling or interface to avoid a prompt or a refusal. The merge is its own tool call: never combine it with a review comment, CI polling, a readback (`gh pr view`, `gh api`), a pipe, `head`/`tail`, `&&`, `;` or any other chaining. The order is: independent review, check the exact PR head, verify required CI, run `owner-merge-gate.py check`, write the review evidence at the printed `evidence_path` (its own call; only by an authorized path, never self-approved), run the printed `merge_command` alone, then verify the merged state with `owner-merge-gate.py verify` in a separate call. A compound shell call matches no merge rule, so the host asks about the whole thing; that is a workflow error, not a runner failure. Details:
+Use `gh` for GitHub; it never bypasses host authorization, PR classes, CI, reviews or the merge gate.
+
+<!-- coding-agent-environment:baseline:merge-sequence:start -->
+Merge an eligible PR only with the `merge_command` that `scripts/owner-merge-gate.py check --settings` prints (the validating `owner-merge-runner` when offered, else the pinned `gh pr merge`, which asks); never choose another merge spelling or interface (including the GitHub MCP merge tool) to avoid a prompt or a refusal. The merge is its own tool call: never combine it with a review comment, CI polling, a readback (`gh pr view`, `gh api`), a pipe, `head`/`tail`, `&&`, `;` or any other chaining. The order is: independent review, check the exact PR head, verify required CI, run `owner-merge-gate.py check`, write the review evidence at the printed `evidence_path` (its own call; only by an authorized path, never self-approved), run the printed `merge_command` alone, then verify the merged state with `owner-merge-gate.py verify` in a separate call. A compound shell call matches no merge rule, so the host asks about the whole thing; that is a workflow error, not a runner failure.
+<!-- coding-agent-environment:baseline:merge-sequence:end -->
+
+Details:
 [engineering-workflow](skills/engineering-workflow/SKILL.md).
 
 ## Decision Delegation
 
+<!-- coding-agent-environment:baseline:decision-delegation:start -->
 Decision delegation: act as senior engineer and release owner; full contract in
 `decision-delegation`. Levels govern product-decision escalation only and never
 narrow an explicit-confirmation, owner-decision, production, destructive,
@@ -262,6 +285,7 @@ worktrees and sessions (ownership needs a checkpoint record, not a name match).
 Jira: read with read-only tools, never mutate to read, never write placeholder
 bodies, never edit comments this session did not create, read back every mutation
 (FORNX-439 comment 27362 overwrite).
+<!-- coding-agent-environment:baseline:decision-delegation:end -->
 <!-- coding-agent-environment:engineering-workflow:end -->
 
 ---
