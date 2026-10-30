@@ -110,6 +110,6 @@ Checkpoints and receipts under `~/.cache/coding-agent-environment/campaigns/` ar
 | Events: PR merged, marker file, QA artifact path | Done (`pr_merged`, `file_exists`, `not_before`). Admission-tier and ticket-state events are deferred. |
 | Lock, lease, duplicate prevention, one reclaim with audit | Done. |
 | Bounded `claude --resume -p`, no permission bypass | Done. One attempt per event, lifetime budget plus cooldown (stricter than N per day). |
-| Heavy-lane reservation and queue | Queue store and FIFO grant exist in `disk-admission.py queue` (SPE-111, see STORAGE-INTEGRATION); claim and automatic resume are NOT wired: resuming the owning session is an explicit handoff, and heavy automatic resumes stay refused. |
+| Heavy-lane reservation and queue | Queue store, FIFO grant, claim with revalidation and release evidence exist in `disk-admission.py queue`/`run --queue-id` (SPE-111, see STORAGE-INTEGRATION); automatic resume is NOT wired: resuming the owning session is an explicit handoff, and heavy automatic resumes stay refused. |
 | Receipts | Done, keyed by event content rather than a set hash. |
 | Operator-installed launchd with rollback | Packet above; intentionally NOT installed (see Ownership). |
