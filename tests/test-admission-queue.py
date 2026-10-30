@@ -612,7 +612,7 @@ class ClaimCli(QueueBase):
     def run_cli(self, *argv, memory_ok=True, ancestor=True):
         out = io.StringIO()
         with unittest.mock.patch.object(da, '_memory_precondition', lambda: (memory_ok, 'ok' if memory_ok else 'pressure')), \
-                unittest.mock.patch.object(da, '_is_self_or_ancestor', lambda pid: ancestor), \
+                unittest.mock.patch.object(da, '_is_strict_ancestor', lambda pid: ancestor), \
                 contextlib.redirect_stdout(out):
             rc = da.run(list(argv), state_path=self.path, free_fn=lambda: 400 * GIB)
         return rc, out.getvalue()
@@ -667,12 +667,21 @@ class ClaimCli(QueueBase):
             self.assertIn('ancestor', out)
         self.assertEqual(self.entries()[qid]['state'], 'GRANTED')
 
-    def test_ancestor_walk_fails_closed(self):
-        chain = {100: 50, 50: 10, 10: 1}
-        self.assertTrue(da._is_self_or_ancestor(os.getpid()))
-        self.assertTrue(da._is_self_or_ancestor(50, ppid_fn=lambda p: chain.get(p, 100) if p == os.getpid() else chain.get(p)))
-        self.assertFalse(da._is_self_or_ancestor(999, ppid_fn=lambda p: chain.get(p, 100) if p == os.getpid() else chain.get(p)))
-        self.assertFalse(da._is_self_or_ancestor(50, ppid_fn=lambda p: (_ for _ in ()).throw(ValueError('ps broke'))))
+    def test_ancestor_walk_is_strict_and_fails_closed(self):
+        me, parent = os.getpid(), os.getppid()
+        chain = {parent: 50, 50: 10, 10: 1}
+        self.assertFalse(da._is_strict_ancestor(me), 'the claiming command itself exits right after the claim')
+        self.assertTrue(da._is_strict_ancestor(parent, ppid_fn=chain.get))
+        self.assertTrue(da._is_strict_ancestor(50, ppid_fn=chain.get))
+        self.assertFalse(da._is_strict_ancestor(999, ppid_fn=chain.get))
+        self.assertFalse(da._is_strict_ancestor(1, ppid_fn=chain.get))
+        self.assertFalse(da._is_strict_ancestor(50, ppid_fn=lambda p: (_ for _ in ()).throw(ValueError('ps broke'))))
+
+    def test_real_parent_chain_matches_when_the_claim_runs_as_a_child_of_the_supervisor(self):
+        script = 'import importlib.util,sys,os;s=importlib.util.spec_from_file_location("da",sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);print(m._is_strict_ancestor(int(sys.argv[2])))'
+        out = subprocess.run([sys.executable, '-c', script, str(ROOT / 'scripts/disk-admission.py'), str(os.getpid())],
+                             capture_output=True, text=True, timeout=20)
+        self.assertEqual(out.stdout.strip(), 'True')
 
     def test_an_unverifiable_process_is_a_refusal_not_a_crash(self):
         qid = self.enqueue('HORO-2070')['id']

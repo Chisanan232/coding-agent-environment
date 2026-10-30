@@ -1336,15 +1336,16 @@ def build_parser():
     return parser
 
 
-def _is_self_or_ancestor(pid, ppid_fn=None, limit=64):
-    """True when pid is this process or one of its ancestors; unknown means False (fail closed)."""
+def _is_strict_ancestor(pid, ppid_fn=None, limit=64):
+    """True when pid is a strict ancestor of this process (this command exits right after claiming, so itself would
+    consume the grant for nothing); unknown means False (fail closed). Name kept for the callers' readability."""
     def ppid_of(p):
         done = subprocess.run(['/bin/ps', '-o', 'ppid=', '-p', str(p)], capture_output=True, text=True, timeout=5,
                               stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/bin:/usr/bin'})
         return int(done.stdout.strip()) if done.returncode == 0 and done.stdout.strip().isdigit() else None
 
     ppid_fn = ppid_fn or ppid_of
-    current = os.getpid()
+    current = os.getppid()
     for _ in range(limit):
         if current == pid:
             return True
@@ -1370,7 +1371,7 @@ def _queue_cli(args, state_path, free_fn):
         out['ok'] = out['reason'] in ('ok',) or bool(out['granted'] or out['expired'] or out['eligible']) or out['reason'] in (
             'lane occupied',) or out['reason'].startswith('no heavy lane')
     elif command == 'claim':
-        if args.pid <= 0 or not _is_self_or_ancestor(args.pid):
+        if args.pid <= 0 or not _is_strict_ancestor(args.pid):
             print(json.dumps({'ok': False, 'reason': 'invalid-request: --pid must be a live ancestor of this command '
                                                      '(the supervising process that runs it), not an arbitrary process'}))
             return REFUSED_EXIT

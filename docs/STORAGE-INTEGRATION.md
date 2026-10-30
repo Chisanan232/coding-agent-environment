@@ -182,7 +182,7 @@ decides who is granted the lane after the current holder is gone.
   the grant; retrying is one explicit call, never a loop. A second claim of the same grant is refused; a failed `exec`
   releases the reservation and marks the entry RELEASED (`exec-failed`, exit 127).
 - `queue claim --id Q --label L --bytes N --pid P [--ttl-s S] -- COMMAND...` is the same claim for a supervising process: the
-  lane is held by live process P, which must be this command itself or one of its ancestors (a wrapper that runs the job as
+  lane is held by live process P, which must be a strict ancestor of this command (a wrapper that runs the job as
   its child, e.g. the coordinator runner) and stay alive as long as the job; any other pid is refused. Nothing is exec'd. The command after `--` must be the exact job the grant was queued for
   (fingerprint). Prints one JSON object; exit 0 claimed, 77 refused (the grant is kept). The SPE-96 coordinator's runner uses
   it, so a resumed session holds the lane exactly as long as its runner.
