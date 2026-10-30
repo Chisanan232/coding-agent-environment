@@ -278,8 +278,10 @@ the hop and acts on the verdict.
   `/System/Library/` (the sealed system volume the QA user cannot write; `/System/Volumes/Data` is the writable data volume
   and is refused, and a job it submits or bootstraps has no path or one it controls; a name or label proves nothing because
   it can pick any) and a `program` under a system prefix. The program, arguments and environment printed for a job are chosen by
-  its owner, so only the header counts: `path` and `type` must each appear once, in launchd's order, before `program` and
-  before the first nested block, so a line forged inside a value is refused. Any service that fails,
+  its owner, so only the header counts: `path` and `type` must each appear once, `type` on the line right after `path`, before
+  `program` and before the first nested block, with nothing before the `path` but numeric counters (`active count`,
+  `copy count`) and the label in `original =` that launchd prints for on-demand copies (`mdworker.shared.<uuid>`), so a
+  line forged inside a value is refused. Any service that fails,
   any call that fails, times out or is refused by sudo, and an unparsable output fails the check. A process of the QA user is
   not a survivor only if its pid is a running service of that verified domain, its parent is launchd (PPID 1) and its
   kernel-reported executable path (libproc, not `ps comm`, which a process can set through argv[0]) is under a system prefix;
