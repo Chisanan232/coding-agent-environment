@@ -36,6 +36,9 @@ if argv and argv[0] == "sandbox":   # the wrapper's confinement probe: `codex sa
     smode = open(d + "/sandbox_mode").read().strip() if os.path.exists(d + "/sandbox_mode") else "confined"
     if smode == "broken":
         sys.exit(2)
+    if smode in ("enoent", "garbage") and control.startswith("neg_"):
+        print("DENIED:2" if smode == "enoent" else "DENIED:not-an-errno")   # a denial that proves nothing
+        sys.exit(0)
     if smode == "confined" and control.startswith("neg_"):
         print("DENIED:1")
         sys.exit(0)
@@ -420,12 +423,33 @@ class RunTests(Base):
         self.assertFalse((self.fake_dir / "seen.json").exists())
         self.assertFalse(json.loads((run_dir / "CONFINEMENT.json").read_text())["established"])
 
-    def test_a_probe_that_cannot_run_fails_closed(self):
+    def test_a_probe_that_cannot_run_is_retryable_and_never_starts_codex(self):
         (self.fake_dir / "sandbox_mode").write_text("broken")
         run_dir = self.prepare()
         code, out = self.run_qa(run_dir)
-        self.assertEqual(code, 12, out)
+        self.assertEqual(code, 11, out)                                  # nothing could be checked and nothing ran: retry
+        self.assertIn("read confinement could not be checked", out)
         self.assertFalse((self.fake_dir / "seen.json").exists())
+
+    def test_a_denial_that_proves_nothing_fails_closed(self):
+        for mode in ("enoent", "garbage"):                               # DENIED:2 (no such file) and DENIED:<not an errno>
+            (self.fake_dir / "sandbox_mode").write_text(mode)
+            run_dir = self.prepare()
+            code, out = self.run_qa(run_dir)
+            self.assertEqual(code, 12, (mode, out))
+            self.assertIn("read confinement not established", out)
+            self.assertFalse((self.fake_dir / "seen.json").exists(), mode)
+
+    def test_the_real_login_file_is_probed_when_it_exists(self):
+        fake_home = self.root / "realcodex2"
+        fake_home.mkdir()
+        (fake_home / "auth.json").write_text("synthetic-login")
+        self.set_env(CODEX_HOME=str(fake_home))
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        names = {p["control"] for p in json.loads((self.fake_dir / "probes.json").read_text())}
+        self.assertIn("neg_open_auth_file", names)
+        self.assertNotIn("synthetic-login", (run_dir / "CONFINEMENT.json").read_text())
 
     def test_the_canary_is_synthetic_outside_the_run_and_removed_afterwards(self):
         run_dir = self.prepare()
@@ -436,9 +460,37 @@ class RunTests(Base):
         self.assertFalse(str(canary).startswith(str(run_dir)))                    # outside every allowed root
         self.assertTrue(str(canary).startswith(str(qa.HOME)))                     # under HOME, where the allowlist must deny it
 
+    def test_the_clone_is_never_marked_trusted_so_its_own_codex_config_cannot_widen_the_profile(self):
+        # Measured live: with trust_level = "trusted" a .codex/config.toml inside the clone (the commit under test) added a path
+        # to the read allowlist and a canary read was ALLOWED; with no [projects] entry it was DENIED.
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        cfg = self.seen()["config"]
+        self.assertNotIn("[projects", cfg)
+        self.assertNotIn("trust_level", cfg)
+
+    def test_exec_selects_the_same_permission_profile_the_probe_proves(self):
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        argv = self.seen()["argv"]
+        pairs = [argv[i + 1] for i, a in enumerate(argv) if a == "-c"]
+        self.assertIn('default_permissions="qa_confined"', pairs)            # explicit on the command line, outranking project config
+        for p in json.loads((self.fake_dir / "probes.json").read_text()):
+            self.assertEqual(p["argv"][p["argv"].index("-P") + 1], "qa_confined")
+
+    def test_a_hostile_project_config_is_probed_every_run_and_a_leak_fails_closed(self):
+        run_dir = self.prepare()
+        self.run_qa(run_dir)
+        names = {p["control"] for p in json.loads((self.fake_dir / "probes.json").read_text())}
+        self.assertIn("neg_project_config_ignored", names)
+        record = json.loads((run_dir / "CONFINEMENT.json").read_text())
+        self.assertIn("neg_project_config_ignored", {c["control"] for c in record["controls"]})
+        self.assertFalse((run_dir / "probe-hostile").exists())                   # the scratch clone is removed after the probe
+
     def test_extra_read_roots_are_validated(self):
         run_dir = self.prepare()
-        for bad in ("relative/dir", str(qa.HOME), "/", str(qa.HOME / ".ssh"), str(qa.HOME / ".codex/sessions"), str(self.root / "missing")):
+        for bad in ("relative/dir", str(qa.HOME), "/", str(qa.HOME / ".ssh"), str(qa.HOME / ".codex/sessions"), str(self.root / "missing"),
+                    str(run_dir), str(run_dir.parent), str(run_dir.parent.parent), str(qa.CANARY_ROOT.parent), str(qa.DEFAULT_ROOT)):
             code, out = self.run_qa(run_dir, extra=("--read-root", bad))
             self.assertEqual(code, qa.EXIT["REFUSED"] if False else code)
             self.assertNotEqual(code, 0, bad)

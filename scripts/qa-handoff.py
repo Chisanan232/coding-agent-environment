@@ -441,21 +441,29 @@ def real_codex_home():
     return Path(os.environ.get('CODEX_HOME') or HOME / '.codex')
 
 
-def valid_read_root(text):
+def valid_read_root(text, run_dir=None):
     """An extra read-only root for toolchains (for example a Rust toolchain under HOME). Absolute, existing, a directory,
-    and never HOME itself, the filesystem root, or anything at or below a credential directory."""
+    and never HOME (or its parent) itself, the filesystem root, anything at or below a credential directory, the real Codex
+    home, the QA state, canary or default roots, or the run directory and any directory that contains it (other runs'
+    packets, prompts and verdicts would be readable)."""
     path = Path(text)
     if not path.is_absolute() or not path.is_dir():
         return None
     resolved = path.resolve()
-    if resolved in (HOME, Path('/'), HOME.parent):
+    home = HOME.resolve()
+
+    def overlaps(other):
+        other = Path(other).resolve()
+        return resolved == other or other in resolved.parents or resolved in other.parents
+
+    if resolved == home or resolved in home.parents:   # HOME itself or any ancestor, the filesystem root included
         return None
-    for rel in SECRET_DIRS:
-        secret = HOME / rel
-        if resolved == secret or secret in resolved.parents or resolved in secret.parents:
+    guarded = [home / rel for rel in SECRET_DIRS] + [real_codex_home(), CANARY_ROOT, DEFAULT_ROOT]
+    if run_dir is not None:
+        guarded.append(Path(run_dir))
+    for other in guarded:
+        if overlaps(other):
             return None
-    if real_codex_home().resolve() in (resolved, *resolved.parents) or resolved in real_codex_home().resolve().parents:
-        return None
     return resolved
 
 
@@ -473,8 +481,9 @@ def profile_toml(run_dir, read_roots=()):
     for rel in SECRET_DIRS:
         fs[str(HOME / rel)] = 'deny'
     fs[str(real_codex_home())] = 'deny'
+    # No [projects] table on purpose: the clone is the commit under test, and a trusted project lets its own
+    # .codex/config.toml widen this profile (measured: a planted allowlist entry made a canary read ALLOWED).
     lines = ['approval_policy = "never"', 'cli_auth_credentials_store = "file"', 'default_permissions = "%s"' % PROFILE, '',
-             '[projects.%s]' % json.dumps(str(run_dir / 'source')), 'trust_level = "trusted"', '',
              '[permissions.%s.filesystem]' % PROFILE]
     lines += ['%s = "%s"' % (json.dumps(k), v) for k, v in fs.items()]
     lines += ['', '[permissions.%s.network]' % PROFILE, 'enabled = false', '']
@@ -501,6 +510,8 @@ CONTROLS = (
     ('pos_write_out', "import sys\ntry:\n    open({out!r} + '/probe.txt', 'w').write('x')\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'ALLOWED'),
     ('neg_read_canary', "import sys\ntry:\n    open({canary!r}, 'rb').read()\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
     ('neg_list_codex_home', "import os\ntry:\n    os.listdir({codex_home!r})\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
+    ('neg_project_config_ignored', "import sys\ntry:\n    open({canary!r}, 'rb').read()\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
+    ('neg_open_auth_file', "try:\n    open({auth!r}, 'rb').close()\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
     ('neg_write_outside', "import sys\ntry:\n    open({canary_dir!r} + '/written.txt', 'w').write('x')\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
 )
 
@@ -515,30 +526,43 @@ def confinement_probe(codex_bin, run_dir, env):
     canary_dir.mkdir(parents=True, mode=0o700)
     canary = canary_dir / 'canary.txt'
     canary.write_text('synthetic-qa-canary-%s' % token)
-    values = {'clone': str(run_dir / 'source'), 'out': str(run_dir / 'out'), 'canary': str(canary), 'canary_dir': str(canary_dir),
+    auth = real_codex_home() / 'auth.json'
+    values = {'auth': str(auth), 'clone': str(run_dir / 'source'), 'out': str(run_dir / 'out'), 'canary': str(canary), 'canary_dir': str(canary_dir),
               'codex_home': str(real_codex_home())}
     results, problems = [], []
     try:
+        # A scratch clone whose own .codex/config.toml tries to add the canary to the read allowlist: the profile must hold.
+        hostile = run_dir / 'probe-hostile'
+        (hostile / '.codex').mkdir(parents=True)
+        (hostile / '.codex/config.toml').write_text('[permissions.%s.filesystem]\n%s = "read"\n' % (PROFILE, json.dumps(str(canary_dir))))
         for name, snippet, expect in CONTROLS:
+            if name == 'neg_open_auth_file' and not auth.exists():
+                continue          # no login file to protect; the open() is the denied operation, no content is read
             code = '# CONTROL=%s\n%s' % (name, snippet.format(**values))
-            argv = [codex_bin, 'sandbox', '-P', PROFILE, '-C', str(run_dir / 'source'), '/usr/bin/python3', '-c', code]
+            cwd = hostile if name == 'neg_project_config_ignored' else run_dir / 'source'
+            argv = [codex_bin, 'sandbox', '-P', PROFILE, '-C', str(cwd), '/usr/bin/python3', '-c', code]
             try:
                 done = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=env)
                 got = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else ''
-                ok = done.returncode == 0 and got.split(':')[0] == expect
+                # A denial only counts as one when it is EPERM or EACCES: ENOENT (a wrong path), a missing errno or any
+                # other text proves nothing about confinement.
+                ok = done.returncode == 0 and (got == 'ALLOWED' if expect == 'ALLOWED' else got in ('DENIED:1', 'DENIED:13'))
                 detail = got or 'exit %s' % done.returncode
+                unrunnable = done.returncode != 0 or not got
             except (OSError, subprocess.SubprocessError) as error:
-                ok, detail = False, type(error).__name__
-            results.append({'control': name, 'expected': expect, 'observed': clean(detail, 40), 'ok': ok})
+                ok, detail, unrunnable = False, type(error).__name__, True
+            results.append({'control': name, 'expected': expect, 'observed': clean(detail, 40), 'ok': ok, 'unrunnable': unrunnable})
             if not ok:
                 problems.append('%s expected %s, observed %s' % (name, expect, clean(detail, 40)))
     finally:
+        shutil.rmtree(run_dir / 'probe-hostile', ignore_errors=True)
         for leftover in (canary_dir / 'written.txt', canary, canary_dir):
             try:
                 leftover.unlink() if leftover.is_file() else leftover.rmdir()
             except OSError:
                 pass
-    return {'profile': PROFILE, 'established': not problems, 'controls': results, 'canary_dir': str(canary_dir)}, problems
+    return {'profile': PROFILE, 'established': not problems, 'controls': results, 'canary_dir': str(canary_dir),
+            'could_not_check': bool(problems) and all(c['unrunnable'] for c in results if not c['ok'])}, problems
 
 
 def codex_argv(codex_bin, run_dir):
@@ -546,7 +570,8 @@ def codex_argv(codex_bin, run_dir):
     override (the legacy write-only sandbox). No -m: model routing is not touched."""
     # -o is written by the codex client itself, which is NOT sandboxed (only its tool commands are). It therefore points
     # into the run directory, which the QA process cannot write, so a link planted by QA can never redirect that write.
-    return [codex_bin, 'exec', '--skip-git-repo-check', '--json', '--ephemeral', '-C', str(run_dir / 'source'),
+    return [codex_bin, 'exec', '--skip-git-repo-check', '--json', '--ephemeral', '-c', 'default_permissions="%s"' % PROFILE,
+            '-C', str(run_dir / 'source'),
             '--output-schema', str(run_dir / 'verdict.schema.json'), '-o', str(run_dir / 'verdict.json'), '-']
 
 
@@ -622,7 +647,7 @@ def run(args):
         return refuse('a run is in progress or was interrupted for this directory; prepare a new attempt')
     read_roots = []
     for text in getattr(args, 'read_root', None) or []:
-        root = valid_read_root(text)
+        root = valid_read_root(text, run_dir)
         if root is None:
             return refuse('--read-root must be an existing absolute directory that is not HOME, / or a credential directory')
         read_roots.append(root)
@@ -699,6 +724,8 @@ def run_locked(args, run_dir, packet, source, read_roots=()):
     prepare_codex_home(run_dir, read_roots)
     record, problems = confinement_probe(args.codex_bin, run_dir, isolated_env(run_dir))
     write_private(run_dir / 'CONFINEMENT.json', record)
+    if problems and record['could_not_check']:   # nothing could be checked and nothing ran: retryable, not an integrity result
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['read confinement could not be checked: ' + '; '.join(problems[:3])])
     if problems:
         return write_result(run_dir, packet, 'QA_INVALID', ['read confinement not established: ' + '; '.join(problems[:3])])
     t0 = time.time()
