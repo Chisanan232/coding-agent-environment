@@ -968,9 +968,15 @@ LAUNCHD_ABSENT = 'Could not find domain'
 # verified domain with a launchd parent and an executable under a system prefix. The QA user cannot write under /System, so
 # a job it submits or bootstraps has a different path (or none) and fails the check; the `path` is launchd's own report,
 # not a name or a label, which a QA job can choose freely.
-# Not plain /System/: /System/Volumes/Data/... is the writable data volume (the QA user's home is on it).
-SERVICE_PLIST_PREFIX = '/System/Library/'
-SERVICE_PROGRAM_PREFIXES = ('/System/Library/', '/usr/libexec/', '/usr/sbin/', '/usr/bin/', '/usr/lib/', '/sbin/', '/bin/')
+# Not /System/ and not all of /System/Library/: parts of both are writable (/System/Volumes/Data is the data volume,
+# /System/Library/AssetsV2/downloadDir is mode 777 on the first real host). The plist of a trusted service sits directly in
+# one of these two directories, is a root-owned file nobody else can write, and its program is a system daemon, never an
+# interpreter. The prefixes are exactly those seen on a live domain (all 40 system services of one host, and the 8 running
+# ones of the real QA account); anything else fails closed until an owner `--check` shows it.
+SERVICE_PLIST_DIRS = ('/System/Library/LaunchAgents/', '/System/Library/LaunchDaemons/')
+SERVICE_PROGRAM_PREFIXES = ('/System/Library/', '/usr/libexec/', '/usr/sbin/')
+INTERPRETERS = frozenset({'python', 'python3', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'csh', 'tcsh', 'fish', 'env', 'perl', 'ruby',
+                          'osascript', 'php', 'node', 'tclsh', 'wish', 'lua', 'java', 'swift', 'swift-frontend', 'xcrun', 'open'})
 MAX_DOMAIN_SERVICES = 200
 SERVICE_LABEL_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}')
 SERVICE_ROW_RE = re.compile(r'(\d+)\s+(-|-?\d+|\(\w+\))\s+(\S+)')
@@ -1699,8 +1705,9 @@ def service_problem(text, uid, label):
             seen[match.group(1)] = match.group(2).strip()
             first[match.group(1)] = index
     path = seen.get('path', '')
-    if not (path.startswith(SERVICE_PLIST_PREFIX) and path.endswith('.plist') and '/../' not in path):
-        return 'defined outside the system volume or without a plist'
+    rest = next((path[len(d):] for d in SERVICE_PLIST_DIRS if path.startswith(d)), None)
+    if rest is None or not rest.endswith('.plist') or '/' in rest or '..' in rest:
+        return 'defined outside the system launch directories or without a plist'
     if seen.get('type') != 'LaunchAgent':
         return 'not a LaunchAgent'
     order = [first['path'], first['type']] + ([first['program']] if 'program' in first else [])
@@ -1712,8 +1719,22 @@ def service_problem(text, uid, label):
     if first['type'] != first['path'] + 1 or not all(re.fullmatch(r'\t(active count|copy count) = \d+|\toriginal = [A-Za-z0-9_][A-Za-z0-9_.-]{0,199}', line)
                                                      for line in lines[1:first['path']]):
         return 'header does not have the shape launchd prints for a system service'
-    if 'program' in seen and not seen['program'].startswith(SERVICE_PROGRAM_PREFIXES):
-        return 'runs a program outside the system prefixes'
+    program = seen.get('program')
+    if (program is None or not program.startswith(SERVICE_PROGRAM_PREFIXES) or '..' in program
+            or os.path.basename(program) in INTERPRETERS):
+        return 'has no program, or one that is not a system daemon'
+    return None
+
+
+def plist_problem(path):
+    """None when the plist launchd says defines a service is a regular file owned by root that no one else can write, read
+    on this side (the producer's), where the QA user's ownership or a firmlink into the data volume would show."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return 'its plist %s cannot be read' % path
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+        return 'its plist %s is not a root-owned regular file that only root can write' % path
     return None
 
 
@@ -1751,6 +1772,8 @@ def verify_user_domain(ident, running_only=False):
             if sudo_refused(answer.stderr):
                 return set(), ['launchd domain %s could not be read (sudo -n refused)' % domain]
             reason = service_problem(answer.stdout, ident.uid, label) if answer.returncode == 0 else 'could not be read (exit %s)' % answer.returncode
+            if reason is None:
+                reason = plist_problem(re.search(r'^\tpath = (.+)$', answer.stdout, re.M).group(1).strip())
             if reason:
                 problems.append('launchd service %s: %s' % (label, reason))
             elif pid:

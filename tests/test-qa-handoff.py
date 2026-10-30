@@ -1294,6 +1294,7 @@ class IdentityGuardTests(Base):
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 REAL_DOMAIN = (FIXTURES / "qa-launchd-user-domain.txt").read_text()            # launchctl print user/530 on the first real QA account
 REAL_SERVICE = (FIXTURES / "qa-launchd-service-cfprefsd.txt").read_text()      # launchctl print user/530/com.apple.cfprefsd.xpc.agent
+REAL_PLIST_PROBLEM = qa.plist_problem
 REAL_RUNNING = {28171, 28121, 28582, 28152, 29055, 28127, 28135, 28114}
 
 
@@ -1305,6 +1306,10 @@ class LaunchdDomainTests(unittest.TestCase):
     def setUp(self):
         if os.getuid() == 530:
             self.skipTest("fixture uid is the running uid")
+        # The real plists exist only on a Mac; plist_problem has its own tests below.
+        patcher = unittest.mock.patch.object(qa, "plist_problem", lambda path: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def runner(self, domain=REAL_DOMAIN, service=REAL_SERVICE, per_label=None, rc=0, domain_rc=0, domain_err="", service_err=""):
         calls = []
@@ -1371,7 +1376,46 @@ class LaunchdDomainTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertIsNotNone(qa.service_problem(text, 530, "com.apple.cfprefsd.xpc.agent"))
         self.assertFalse(any(p.startswith(("/System/Volumes/", "/System/Cryptexes/")) for p in qa.SERVICE_PROGRAM_PREFIXES))
-        self.assertEqual(qa.SERVICE_PLIST_PREFIX, "/System/Library/")
+        self.assertEqual(qa.SERVICE_PLIST_DIRS, ("/System/Library/LaunchAgents/", "/System/Library/LaunchDaemons/"))
+
+    def test_writable_parts_of_system_library_and_unsafe_programs_are_refused(self):
+        path = "\tpath = /System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist\n"
+        program = "\tprogram = /usr/sbin/cfprefsd"
+        for name, text in {
+            "plist in the mode-777 AssetsV2 download directory": REAL_SERVICE.replace(path, "\tpath = /System/Library/AssetsV2/downloadDir/x.plist\n"),
+            "plist under System Library Caches": REAL_SERVICE.replace(path, "\tpath = /System/Library/Caches/x.plist\n"),
+            "plist in a subdirectory of LaunchAgents": REAL_SERVICE.replace(path, "\tpath = /System/Library/LaunchAgents/sub/x.plist\n"),
+            "plist with a traversal": REAL_SERVICE.replace(path, "\tpath = /System/Library/LaunchAgents/../AssetsV2/downloadDir/x.plist\n"),
+            "a service with arguments only": REAL_SERVICE.replace(program + "\n", ""),
+            "program with a traversal": REAL_SERVICE.replace(program, "\tprogram = /usr/libexec/../../Users/qauser/x"),
+            "an interpreter as the program": REAL_SERVICE.replace(program, "\tprogram = /usr/libexec/python3"),
+            "a shell as the program": REAL_SERVICE.replace(program, "\tprogram = /System/Library/CoreServices/sh"),
+            "a general tool directory": REAL_SERVICE.replace(program, "\tprogram = /usr/bin/python3"),
+            "a relative program": REAL_SERVICE.replace(program, "\tprogram = cfprefsd"),
+        }.items():
+            with self.subTest(name):
+                self.assertIsNotNone(qa.service_problem(text, 530, "com.apple.cfprefsd.xpc.agent"), name)
+        for directory in ("LaunchAgents", "LaunchDaemons"):
+            self.assertIsNone(qa.service_problem(REAL_SERVICE.replace("/LaunchAgents/", "/%s/" % directory), 530, "com.apple.cfprefsd.xpc.agent"))
+
+    def test_the_plist_must_be_a_root_owned_file_nobody_else_can_write(self):
+        plist_problem = REAL_PLIST_PROBLEM   # setUp replaced qa.plist_problem for the other tests
+        with tempfile.TemporaryDirectory() as tmp:
+            plist = Path(tmp) / "x.plist"
+            plist.write_text("x")
+            self.assertIn("root-owned", plist_problem(str(plist)))                       # owned by the test user, not root
+            link = Path(tmp) / "link.plist"
+            link.symlink_to(plist)
+            self.assertIn("root-owned", plist_problem(str(link)))
+            self.assertIn("cannot be read", plist_problem(str(Path(tmp) / "absent.plist")))
+
+            def stat_as(uid, mode):
+                return unittest.mock.patch.object(qa.os, "lstat", lambda p: os.stat_result((stat.S_IFREG | mode, 1, 1, 1, uid, 0, 1, 0, 0, 0)))
+            with stat_as(0, 0o644):
+                self.assertIsNone(plist_problem(str(plist)))
+            for uid, mode in ((0, 0o666), (0, 0o664), (0, 0o646), (530, 0o644)):
+                with stat_as(uid, mode):
+                    self.assertIsNotNone(plist_problem(str(plist)), (uid, mode))
 
     def test_a_header_line_forged_inside_a_value_cannot_make_a_service_trusted(self):
         forged = "\tpath = /System/Library/LaunchAgents/forged.plist"
