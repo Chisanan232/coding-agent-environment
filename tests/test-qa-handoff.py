@@ -1136,18 +1136,32 @@ class IdentityGuardTests(Base):
         def fake_run(argv, **kwargs):
             calls.append(list(argv))
             self.assertEqual(argv[:4], [qa._qis().SUDO, "-n", "-u", "qauser"])
-            rc, out, err = answers.get(os.path.basename(argv[4]), (0, "", ""))
+            name = os.path.basename(argv[4])
+            if name == "launchctl":
+                self.assertEqual(argv[5:], ["print", "%s/%d" % (argv[-1].split("/")[0], ident.uid)])
+                name += ":" + argv[-1].split("/")[0]
+            rc, out, err = answers.get(name, (0, "", ""))
             return subprocess.CompletedProcess(argv, rc, out, err)
         with unittest.mock.patch.object(qa.subprocess, "run", fake_run):
-            answers.update({"crontab": (1, "", "crontab: no crontab for qauser\n"),
-                            "ls": (1, "", "ls: /Users/qauser/Library/LaunchAgents: No such file or directory\n")})
+            answers.update(CLEAN_PERSISTENCE)
             self.assertEqual(qa.persistence_problems(ident), [])
-            self.assertEqual([os.path.basename(c[4]) for c in calls], ["crontab", "atq", "ls"])
+            self.assertEqual([os.path.basename(c[4]) for c in calls], ["crontab", "atq", "ls", "launchctl", "launchctl"])
             for name, answer, text in (("crontab", (0, "* * * * * /tmp/x\n", ""), "crontab"),
                                        ("atq", (0, "3\tFri Oct 30 12:00:00 2026\n", ""), "at queue"),
                                        ("ls", (0, "evil.plist\n", ""), "LaunchAgents"),
                                        ("atq", (1, "", "atq: cannot open lockfile\n"), "could not check the at queue"),
-                                       ("crontab", (1, "", "sudo: a password is required\n"), "sudo -n refused")):
+                                       ("crontab", (1, "", "sudo: a password is required\n"), "sudo -n refused"),
+                                       ("launchctl:user", (0, launchd_domain("0\t-\tcom.apple.cfprefsd.xpc.agent",
+                                                                             "-\t0\tdev.evil.agent"), ""),
+                                        "non-system service dev.evil.agent"),
+                                       ("launchctl:gui", (0, launchd_domain("123\t-\torg.example.helper"), ""),
+                                        "non-system service org.example.helper"),
+                                       ("launchctl:user", (0, "user/777 = {\n\ttype = User\n}\n", ""), "not understood"),
+                                       ("launchctl:user", (0, launchd_domain("this is not a service line"), ""), "unreadable"),
+                                       ("launchctl:user", (0, "user/777 = {\n\tservices = {\n\t\t0\t-\tcom.apple.x\n", ""),
+                                        "not closed"),
+                                       ("launchctl:gui", (5, "", "Bad request.\n"), "could not read launchd domain gui"),
+                                       ("launchctl:user", (1, "", "sudo: a password is required\n"), "sudo -n refused")):
                 saved = dict(answers)
                 answers[name] = answer
                 problems = qa.persistence_problems(ident)
@@ -1158,6 +1172,37 @@ class IdentityGuardTests(Base):
             for uid in (os.getuid(), 0):
                 self.assertTrue(qa.persistence_problems(ident._replace(uid=uid)))
             self.assertEqual(calls, [])                                       # refused before any subprocess
+
+    def test_a_straggler_respawned_after_the_settle_is_counted(self):
+        ident = qa.Identity("qauser", os.getuid() + 4321, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
+        listings = [(1, ""), (0, "4242\n")]          # gone at first, then launchd brings one back after its throttle
+        slept = []
+
+        def fake_run(argv, **kwargs):
+            if argv[0] == qa.PGREP:
+                rc, out = listings.pop(0) if listings else (1, "")
+                return subprocess.CompletedProcess(argv, rc, out, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with unittest.mock.patch.object(qa.subprocess, "run", fake_run), \
+                unittest.mock.patch.object(qa.time, "sleep", slept.append):
+            self.assertEqual(qa.sweep_identity(ident, recheck=qa.RESPAWN_SECONDS), 1)
+        self.assertIn(qa.RESPAWN_SECONDS, slept)
+        self.assertGreater(qa.RESPAWN_SECONDS, qa.SETTLE_SECONDS)
+        self.assertLessEqual(qa.RESPAWN_SECONDS, 30)                  # bounded
+
+
+def launchd_domain(*services):
+    """The shape `launchctl print user/<uid>` prints: a domain block with a services block of `pid status label` rows."""
+    rows = "".join("\t\t%s\n" % row for row in services)
+    return "user/777 = {\n\ttype = User\n\tservices = {\n%s\t}\n\tendpoints = {\n\t}\n}\n" % rows
+
+
+CLEAN_PERSISTENCE = {
+    "crontab": (1, "", "crontab: no crontab for qauser\n"),
+    "ls": (1, "", "ls: /Users/qauser/Library/LaunchAgents: No such file or directory\n"),
+    "launchctl:user": (0, launchd_domain("0\t-\tcom.apple.cfprefsd.xpc.agent", "-\t0\tcom.apple.distnoted.xpc.agent"), ""),
+    "launchctl:gui": (113, "Could not find domain for port identifier: gui/777\n", ""),   # never logged in
+}
 
 
 FAKE_SUDO = r"""#!@PY@
@@ -1208,11 +1253,13 @@ class IdentityTests(Base):
         self.ident = qa.Identity("qauser", os.getuid(), self.qahome, self.x, os.getuid())
         self.sweeps = []
         self.persistence = []
+        self.rechecks = []
         self.isolation = ({"uid": os.getuid(), "foreign_env_leaked": False, "own_env_read": "ok"}, [])
         qis = qa._qis()
 
-        def sweep(ident):
+        def sweep(ident, recheck=0):
             self.assertEqual(ident, self.ident)
+            self.rechecks.append(recheck)
             return self.sweeps.pop(0) if self.sweeps else 0
         for patch in (unittest.mock.patch.object(qis, "SUDO", str(self.sudo)), unittest.mock.patch.object(qis, "PY", sys.executable),
                       unittest.mock.patch.object(qa, "resolve_identity", lambda name, exchange: self.ident),
@@ -1253,6 +1300,7 @@ class IdentityTests(Base):
         self.assertEqual(meta["qa_identity"]["name"], "qauser")
         self.assertEqual(meta["qa_identity"]["attempt"], outbox.name)
         self.assertEqual((meta["stragglers"], meta["path_ok"], meta["tree_problems"]), (0, True, []))
+        self.assertIn(qa.RESPAWN_SECONDS, self.rechecks)                     # the seal's sweep looks again after the throttle
         seen = self.seen()
         codex_home = self.qahome / ".local/state/coding-agent-environment/qa" / outbox.name / "codexhome"
         self.assertEqual(seen["cwd"], str(outbox / "source"))                 # QA works on its own copy, not R/source

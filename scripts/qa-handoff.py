@@ -850,7 +850,10 @@ def seal_failed(error):
 # script; the copy of this file that runs as the QA user has no sibling and never calls _qis().
 Identity = collections.namedtuple('Identity', 'name uid home exchange exchange_owner')
 KILL, PGREP = '/bin/kill', '/usr/bin/pgrep'
-CRONTAB, ATQ, LS = '/usr/bin/crontab', '/usr/bin/atq', '/bin/ls'
+CRONTAB, ATQ, LS, LAUNCHCTL = '/usr/bin/crontab', '/usr/bin/atq', '/bin/ls', '/bin/launchctl'
+# launchd's default ThrottleInterval is 10 s: a job it keeps alive comes back within that, so the seal looks again later.
+RESPAWN_SECONDS = 12
+SERVICE_ROW = re.compile(r'^(-|\d+)\s+(-|-?\d+|\([^)]*\))\s+(\S+)$')
 HOP_ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
 _QIS = None
 
@@ -896,10 +899,11 @@ def sudo_refused(stderr):
     return any(line.startswith('sudo:') for line in (stderr or '').splitlines())
 
 
-def sweep_identity(ident):
+def sweep_identity(ident, recheck=0):
     """Kill every process of the QA user, then count the survivors (process ids only). None means the sweep could not run,
-    which callers treat as failed. Root and the caller's own uid are refused before any subprocess: `kill -1` as yourself
-    would end your own session."""
+    which callers treat as failed. With `recheck` seconds, a clean table is listed once more after that delay, so a job
+    launchd restarts after its throttle is still counted. Root and the caller's own uid are refused before any
+    subprocess: `kill -1` as yourself would end your own session."""
     if not isinstance(ident.uid, int) or isinstance(ident.uid, bool) or ident.uid in (0, os.getuid()):
         return None
     qis = _qis()
@@ -910,8 +914,7 @@ def sweep_identity(ident):
         return None
     if sudo_refused(done.stderr):
         return None
-    count = None
-    for _ in range(25):                     # killed processes take a moment to disappear from the table
+    def survivors():
         try:
             listed = subprocess.run([PGREP, '-U', str(ident.uid)], stdin=subprocess.DEVNULL, capture_output=True,
                                     text=True, timeout=10)
@@ -919,10 +922,20 @@ def sweep_identity(ident):
             return None
         if listed.returncode == 1:
             return 0
-        if listed.returncode != 0:
-            return None
-        count = len(listed.stdout.split())
-        time.sleep(0.2)
+        return len(listed.stdout.split()) if listed.returncode == 0 else None
+
+    count = None
+    for _ in range(25):                     # killed processes take a moment to disappear from the table
+        count = survivors()
+        if count != 0:
+            if count is None:
+                return None
+            time.sleep(0.2)
+            continue
+        if not recheck:
+            return 0
+        time.sleep(recheck)
+        return survivors()
     return count
 
 
@@ -1179,7 +1192,8 @@ def seal(run_dir, ident, outbox, manifest, info, proc):
     QA user's processes first, open every outbox directory once without following links and check its owner, read the
     verdict relative to the opened outbox, compare the QA clone with the manifest once, then confirm that every path
     component still names the directory that was opened (so the path-based clone check read what was checked)."""
-    extra = {'qa_identity': dict(info), 'stragglers': sweep_identity(ident), 'path_ok': False, 'tree_problems': [],
+    extra = {'qa_identity': dict(info), 'stragglers': sweep_identity(ident, recheck=RESPAWN_SECONDS), 'path_ok': False,
+             'tree_problems': [],
              'untracked': {'count': 0, 'sample': []}}
     # Zero processes is not enough if the QA user can be started again later by the system on its behalf.
     extra['persistence'] = persistence_problems(ident)
@@ -1286,9 +1300,36 @@ def qa_exec(args):
         return stopped.code
 
 
+def launchd_problems(domain, done):
+    """Problems in `launchctl print <domain>` output: any loaded service whose label is not com.apple.*, or output that is
+    not the expected services block. A domain that does not exist (the documented "could not find domain" error) is clean;
+    any other error or unrecognised output is a problem, never a pass."""
+    text = (done.stdout or '') + (done.stderr or '')
+    if done.returncode != 0:
+        if 'could not find domain' in text.lower():
+            return []
+        return ['could not read launchd domain %s (exit %s)' % (domain, done.returncode)]
+    lines = [line.strip() for line in (done.stdout or '').splitlines()]
+    if 'services = {' not in lines:
+        return ['launchd domain %s output is not understood' % domain]
+    problems = []
+    for body in lines[lines.index('services = {') + 1:]:
+        if body == '}':
+            return problems
+        if not body:
+            continue
+        row = SERVICE_ROW.match(body)
+        if not row:
+            return problems + ['launchd domain %s has an unreadable service line' % domain]
+        if not row.group(3).startswith('com.apple.'):
+            problems.append('launchd domain %s has a loaded non-system service %s' % (domain, clean(row.group(3), 60)))
+    return problems + ['launchd domain %s services block is not closed' % domain]
+
+
 def persistence_problems(ident):
     """Ways the QA user could still act after the process sweep that the producer can see: a crontab, queued at jobs, or
-    entries in ~/Library/LaunchAgents, each read as the QA user through sudo -n. Anything present, or anything that
+    entries in ~/Library/LaunchAgents, and non-system services loaded in its launchd user/ and gui/ domains, each read as
+    the QA user through sudo -n. Anything present, or anything that
     could not be read, is a problem (fail closed). Root and the caller's own uid are refused before any subprocess."""
     if not isinstance(ident.uid, int) or isinstance(ident.uid, bool) or ident.uid in (0, os.getuid()):
         return ['persistence check refused for root or your own uid']
@@ -1310,6 +1351,17 @@ def persistence_problems(ident):
                 problems.append('the %s of %s is not empty' % (label, ident.name))
         elif not (absent and absent in (done.stderr or '').lower()):
             problems.append('could not check the %s of %s (exit %s)' % (label, ident.name, done.returncode))
+    for domain in ('user/%d' % ident.uid, 'gui/%d' % ident.uid):
+        try:
+            done = subprocess.run([qis.SUDO, '-n', '-u', ident.name, LAUNCHCTL, 'print', domain], stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=30, cwd='/', env=HOP_ENV)
+        except (OSError, subprocess.SubprocessError) as error:
+            problems.append('could not read launchd domain %s (%s)' % (domain, type(error).__name__))
+            continue
+        if sudo_refused(done.stderr):
+            problems.append('could not read launchd domain %s (sudo -n refused)' % domain)
+        else:
+            problems += launchd_problems(domain, done)
     return problems
 
 
