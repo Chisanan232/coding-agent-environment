@@ -47,8 +47,12 @@ def render(text, name, body):
 
 def run(mode, baseline=BASELINE, targets=None):
     targets = TARGETS if targets is None else targets
-    blocks = parse_blocks(baseline.read_text())
+    btext = baseline.read_text()
+    blocks = parse_blocks(btext)
     problems = []
+    if btext.count("<!-- block:") != len(blocks) or btext.count("<!-- /block:") != len(blocks):
+        problems.append("baseline has a block tag that does not parse (name must match [a-z0-9-]+ and each block needs a matching close tag)")
+    pending = {}
     size = sum(len(b.encode()) for b in blocks.values())
     if size > SIZE_BUDGET:
         problems.append("baseline blocks are %d bytes, budget is %d" % (size, SIZE_BUDGET))
@@ -63,9 +67,14 @@ def run(mode, baseline=BASELINE, targets=None):
                 problems.append("%s: %s" % (path.name, err))
         if text != original:
             if mode == "write":
-                path.write_text(text)
+                pending[path] = text
             else:
                 problems.append("%s: drift from the baseline (run: python3 scripts/build-baseline.py write)" % path)
+    if mode == "write" and not problems:  # all-or-nothing: nothing is written while any problem exists
+        for path, text in pending.items():
+            tmp = path.with_name(path.name + ".baseline-tmp")
+            tmp.write_text(text)
+            tmp.replace(path)
     return problems
 
 

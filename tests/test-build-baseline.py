@@ -55,6 +55,20 @@ class Generator(unittest.TestCase):
         with self.assertRaises(ValueError):
             bb.run("check", self.base, self.targets)
 
+    def test_write_is_all_or_nothing_and_leaves_no_temp_file(self):
+        other = self.host.with_name("other.md")
+        other.write_text(HOST)
+        self.base.write_text(BASE + "<!-- block:Bad_Name -->\nx\n<!-- /block:Bad_Name -->\n")
+        before = (self.host.read_text(), other.read_text())
+        problems = bb.run("write", self.base, {self.host: ("one", "two"), other: ("one", "nope")})
+        self.assertTrue(problems)
+        self.assertEqual((self.host.read_text(), other.read_text()), before)
+        self.assertEqual(list(self.host.parent.glob("*.baseline-tmp")), [])
+
+    def test_unparseable_block_tag_is_reported(self):
+        self.base.write_text(BASE + "<!-- block:Bad_Name -->\nx\n<!-- /block:Bad_Name -->\n")
+        self.assertTrue(any("does not parse" in p for p in bb.run("check", self.base, self.targets)))
+
     def test_size_budget(self):
         self.base.write_text("<!-- block:one -->\n" + "x" * (bb.SIZE_BUDGET + 1) + "\n<!-- /block:one -->\n")
         self.assertTrue(any("budget" in p for p in bb.run("check", self.base, {self.host: ("one",)})))
