@@ -798,6 +798,27 @@ class ReviewFollowUpTests(Base):
         for token in ("64", "REFUSED", "NOT_RUN"):
             self.assertIn(token, header)
 
+    def test_a_signal_during_the_settle_window_still_leaves_a_hashed_interrupted_record(self):
+        import signal
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            run_dir = self.prepare()
+            proc = subprocess.Popen([sys.executable, str(SCRIPT), "run", "--run-dir", str(run_dir), "--codex-bin", str(self.fake),
+                                     "--admission-cmd", shlex.join(self.ADMIT), "--settle", "8"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(lambda p=proc: p.poll() is None and p.kill())
+            deadline = time.time() + 40
+            while time.time() < deadline and not (run_dir / "verdict.json").exists():
+                time.sleep(0.05)
+            time.sleep(1.0)                                            # codex has exited; the wrapper is now settling
+            self.assertIsNone(proc.poll())
+            proc.send_signal(sig)
+            out, err = proc.communicate(timeout=30)
+            self.assertEqual(proc.returncode, 11, (sig, err))
+            self.assertNotIn("Traceback", err)
+            meta = json.loads((run_dir / "RUNMETA.json").read_text())
+            self.assertTrue(meta["interrupted"])
+            self.assertEqual(self.result(run_dir)["state"], "QA_INCOMPLETE")
+            self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 11)   # an interrupted run is never a pass
+
 
 if __name__ == "__main__":
     unittest.main()

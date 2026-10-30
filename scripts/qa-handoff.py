@@ -581,34 +581,44 @@ def run_locked(args, run_dir, packet, source):
         pass
     t0 = time.time()
     timed_out = False
-    with open(events, 'wb') as ev, open(run_dir / 'stderr.log', 'wb') as err:
-        os.chmod(events, 0o600)
+    proc = None
+
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt
+    # Installed before codex starts and kept until the run record is written, so no window leaves a signal to kill the
+    # wrapper without a record (the settle sleep included).
+    old = signal.signal(signal.SIGTERM, interrupted)
+    try:
+        with open(events, 'wb') as ev, open(run_dir / 'stderr.log', 'wb') as err:
+            os.chmod(events, 0o600)
+            try:
+                try:
+                    proc = subprocess.Popen(argv, cwd=str(source), env=isolated_env(run_dir), stdin=subprocess.PIPE, stdout=ev,
+                                            stderr=err, start_new_session=True)
+                except OSError as error:   # codex is not installed or not executable: nothing ran, so the attempt stays retryable
+                    return write_result(run_dir, packet, 'QA_INCOMPLETE', ['codex could not be started (%s)' % type(error).__name__])
+                proc.communicate(prompt.encode(), timeout=args.timeout)
+                try:                       # a background process codex left behind must not keep editing the clone after the verdict
+                    os.killpg(proc.pid, signal.SIGKILL)   # codex is already reaped; this reaches only what it left in its own group
+                except OSError:
+                    pass
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                kill_group(proc)
+            except BaseException:
+                if proc is not None:
+                    kill_group(proc)       # Ctrl-C or SIGTERM to the wrapper must not leave codex running
+                    write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=True)   # hashed, so a later edit is still caught
+                raise
+        os.chmod(run_dir / 'stderr.log', 0o600)
         try:
-            proc = subprocess.Popen(argv, cwd=str(source), env=isolated_env(run_dir), stdin=subprocess.PIPE, stdout=ev,
-                                    stderr=err, start_new_session=True)
-        except OSError as error:       # codex is not installed or not executable: nothing ran, so the attempt stays retryable
-            return write_result(run_dir, packet, 'QA_INCOMPLETE', ['codex could not be started (%s)' % type(error).__name__])
-        def interrupted(signum, frame):
-            raise KeyboardInterrupt
-        old = signal.signal(signal.SIGTERM, interrupted)
-        try:
-            proc.communicate(prompt.encode(), timeout=args.timeout)
-            try:                       # a background process codex left behind must not keep editing the clone after the verdict
-                os.killpg(proc.pid, signal.SIGKILL)   # codex is already reaped; this reaches only what it left in its own group
-            except OSError:
-                pass
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            kill_group(proc)
+            time.sleep(getattr(args, 'settle', SETTLE_SECONDS))   # let any straggler finish writing before the tree is checked
         except BaseException:
-            kill_group(proc)           # Ctrl-C or SIGTERM to the wrapper must not leave codex running
-            write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=True)   # hashed, so a later edit is still caught
+            write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=True)
             raise
-        finally:
-            signal.signal(signal.SIGTERM, old)
-    os.chmod(run_dir / 'stderr.log', 0o600)
-    time.sleep(getattr(args, 'settle', SETTLE_SECONDS))   # let any straggler finish writing before the tree is checked
-    write_meta(run_dir, argv, proc, t0, timed_out, events)
+        write_meta(run_dir, argv, proc, t0, timed_out, events)
+    finally:
+        signal.signal(signal.SIGTERM, old)
     return evaluate(run_dir)
 
 
@@ -741,6 +751,8 @@ def evaluate_files(run_dir, packet):
         incomplete.append('timed out')
     elif meta['exit_code'] != 0:
         incomplete.append('codex did not exit cleanly (exit %s)' % meta['exit_code'])
+    if meta.get('interrupted'):
+        incomplete.append('interrupted')
     if verdict['status'] != 'COMPLETE':
         incomplete.append('status %s' % verdict['status'])
     if verdict['confidence'] == 'LOW':
