@@ -24,7 +24,7 @@ Moved verbatim from `.claude/CLAUDE.md`; that file keeps a short pointer.
 - Suppress type errors only with the language-specific scoped suppression mechanism,
   never suppress an entire file or block without a documented reason.
 - Type annotations must never change runtime behavior.
-- Run the configured type checker before every commit.
+- Run the configured type checker at each validation checkpoint and before a PR is ready; pre-commit keeps only fast lint and format checks per commit.
 
 > **Project-specific**: which type checker (mypy, pyright, tsc, etc.), config file
 > location, and language-specific annotation syntax belong in the project's `.claude/CLAUDE.md`.

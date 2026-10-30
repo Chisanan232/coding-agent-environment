@@ -84,8 +84,9 @@ ready, never merely because a commit was made; record the exact tested revision.
 ## Type Checking Policy
 
 Annotate all public APIs, signatures and class attributes; justify any "any" escape
-hatch and use only scoped type suppressions. Run the configured type checker before
-every commit. Details are in
+hatch and use only scoped type suppressions. Run the configured type checker at each validation
+checkpoint and before a PR is ready (pre-commit keeps only fast lint and format checks per
+commit). Details are in
 [quality-policies](skills/feature-implementation/references/quality-policies.md).
 
 ---
