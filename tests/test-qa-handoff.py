@@ -38,6 +38,7 @@ if mode == "hangdirty":     # tamper, then never produce a verdict
     open("tracked.txt", "a").write("modified by QA")
     time.sleep(120)
 if mode == "hang":
+    print(json.dumps({"type": "thread.started"}), flush=True)   # events already exist when the wrapper is interrupted
     child = subprocess.Popen(["sleep", "120"])
     open(d + "/child.pid", "w").write(str(child.pid))
     open(d + "/self.pid", "w").write(str(os.getpid()))

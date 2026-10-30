@@ -643,26 +643,26 @@ def evaluate(run_dir):
         return write_result(run_dir, packet, 'QA_INVALID', ['unexpected %s while evaluating' % type(error).__name__])
 
 
-def not_run(run_dir, packet):
-    """Codex never started (admission wait, interruption before launch, or a run directory only prepared). Say so, and
-    keep an earlier WAITING_RESOURCE result instead of rewriting it as tampering."""
+def no_run_record(run_dir, packet, verdict_path, events):
+    """No RUNMETA.json: codex never finished a run. An earlier WAITING_RESOURCE or QA_INCOMPLETE (interrupted, could not
+    start) result is kept even when partial output exists, because without a run record nothing can pass. Output beside
+    any other earlier result (a pass or fail whose record was removed) is an integrity failure."""
     try:
         previous = read_run_json(run_dir / 'RESULT.json')
     except LOAD_ERRORS:
         previous = {}
-    # With no run record nothing can pass, so keeping these earlier results loses no integrity information.
     if isinstance(previous, dict) and previous.get('state') in ('WAITING_RESOURCE', 'QA_INCOMPLETE'):
         print('%s %s' % (previous['state'], '; '.join(clean(r) for r in previous.get('reasons', []) if isinstance(r, str))))
         return EXIT[previous['state']]
+    if os.path.lexists(verdict_path) or (os.path.lexists(events) and os.lstat(events).st_size):
+        return write_result(run_dir, packet, 'QA_INVALID', ['run output exists but the run record is missing'])
     return write_result(run_dir, packet, 'NOT_RUN', ['codex has not been run for this attempt'])
 
 
 def evaluate_files(run_dir, packet):
     meta_path, verdict_path, events = run_dir / 'RUNMETA.json', run_dir / 'verdict.json', run_dir / 'events.jsonl'
     if not meta_path.exists():
-        if os.path.lexists(verdict_path) or os.path.lexists(events) and os.lstat(events).st_size:
-            return write_result(run_dir, packet, 'QA_INVALID', ['run output exists but the run record is missing'])
-        return not_run(run_dir, packet)
+        return no_run_record(run_dir, packet, verdict_path, events)
     meta = read_run_json(meta_path)
     bad = []
     if safe_digest(events) != meta['events_sha256']:
