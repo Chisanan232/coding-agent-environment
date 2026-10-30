@@ -1344,7 +1344,7 @@ class LaunchdDomainTests(unittest.TestCase):
         self.assertTrue(qa.parse_user_domain("", 530)[1])
 
     def test_a_service_is_trusted_only_when_launchd_reports_a_system_volume_plist(self):
-        self.assertIsNone(qa.service_problem(REAL_SERVICE))
+        self.assertIsNone(qa.service_problem(REAL_SERVICE, 530, "com.apple.cfprefsd.xpc.agent"))
         self.assertIsNone(qa.service_problem(REAL_SERVICE, 530, "com.apple.cfprefsd.xpc.agent"))
         self.assertEqual(qa.service_problem(REAL_SERVICE, 530, "com.apple.lsd"), "unexpected header")
         path = "\tpath = /System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist\n"
@@ -1359,7 +1359,7 @@ class LaunchdDomainTests(unittest.TestCase):
             "empty": "",
         }.items():
             with self.subTest(name):
-                self.assertIsNotNone(qa.service_problem(text))
+                self.assertIsNotNone(qa.service_problem(text, 530, "com.apple.cfprefsd.xpc.agent"))
 
     def test_the_writable_data_volume_is_not_the_system_volume(self):
         path = "\tpath = /System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist\n"
@@ -1369,7 +1369,7 @@ class LaunchdDomainTests(unittest.TestCase):
             "other system tree": REAL_SERVICE.replace(path, "\tpath = /System/Cryptexes/App/x.plist\n"),
         }.items():
             with self.subTest(name):
-                self.assertIsNotNone(qa.service_problem(text))
+                self.assertIsNotNone(qa.service_problem(text, 530, "com.apple.cfprefsd.xpc.agent"))
         self.assertFalse(any(p.startswith(("/System/Volumes/", "/System/Cryptexes/")) for p in qa.SERVICE_PROGRAM_PREFIXES))
         self.assertEqual(qa.SERVICE_PLIST_PREFIX, "/System/Library/")
 
@@ -1387,6 +1387,23 @@ class LaunchdDomainTests(unittest.TestCase):
         }.items():
             with self.subTest(name):
                 self.assertIsNotNone(qa.service_problem(text, 530, "x.job"), name)
+
+    def test_a_launchd_copy_of_a_system_service_is_accepted(self):
+        copy = REAL_SERVICE.replace("user/530/com.apple.cfprefsd.xpc.agent = {\n", "user/530/com.apple.cfprefsd.xpc.agent.19000000-0300 = {\n\toriginal = com.apple.cfprefsd.xpc.agent\n", 1)
+        self.assertIsNone(qa.service_problem(copy, 530, "com.apple.cfprefsd.xpc.agent.19000000-0300"))
+
+    def test_nothing_a_job_chooses_may_precede_or_separate_the_path_and_type(self):
+        forged = "\tpath = /System/Library/LaunchAgents/forged.plist\n\ttype = LaunchAgent\n"
+        pathless = "user/530/x.job = {\n\tactive count = 1\n"
+        for name, text in {
+            "a scalar before the path carries the forged lines": pathless + "\tstdout path = /tmp/a\n" + forged + "\tstate = running\n\tprogram = /bin/sh\n\targuments = {\n\t}\n}\n",
+            "a line between the path and the type": REAL_SERVICE.replace("\ttype = LaunchAgent", "\tcomment = x\n\ttype = LaunchAgent"),
+            "an unknown key before the path": REAL_SERVICE.replace("\tpath = ", "\tcomment = x\n\tpath = ", 1),
+            "an original that is not a label": REAL_SERVICE.replace("\tpath = ", "\toriginal = a b\n\tpath = ", 1),
+            "a non-numeric counter": REAL_SERVICE.replace("\tactive count = 2", "\tactive count = 2 extra"),
+        }.items():
+            with self.subTest(name):
+                self.assertIsNotNone(qa.service_problem(text, 530, "x.job" if "x.job" in text else "com.apple.cfprefsd.xpc.agent"), name)
 
     def test_a_present_domain_of_system_services_passes_and_names_the_running_pids(self):
         fake, calls = self.runner()

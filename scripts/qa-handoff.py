@@ -1676,7 +1676,7 @@ def parse_user_domain(text, uid):
     return services, problems
 
 
-def service_problem(text, uid=None, label=None):
+def service_problem(text, uid, label):
     """None when `launchctl print user/<uid>/<label>` shows a service defined by a plist on the sealed system volume;
     otherwise the reason. `path` is launchd's own report of the loaded plist; a job submitted by the QA user has none or
     a path it can write. The program, arguments and environment of a job are printed too and are chosen by its owner, so
@@ -1684,7 +1684,7 @@ def service_problem(text, uid=None, label=None):
     them, before `program` and before the first nested block. A line forged inside a value (a newline in a program name,
     an argument or an environment variable) can only come after those and is refused."""
     lines = (text or '').splitlines()
-    if uid is not None and label is not None and (not lines or lines[0].strip() != 'user/%d/%s = {' % (uid, label)):
+    if not lines or lines[0].strip() != 'user/%d/%s = {' % (uid, label):
         return 'unexpected header'
     key = re.compile(r'\t(path|type|program) = (.+)')
     nested = re.compile(r'\t\S.* = \{\s*$')
@@ -1706,6 +1706,12 @@ def service_problem(text, uid=None, label=None):
     order = [first['path'], first['type']] + ([first['program']] if 'program' in first else [])
     if order != sorted(order) or ('nested' in first and first['nested'] < max(order)):
         return 'header fields out of the order launchd prints them'
+    # Nothing but numeric counters and the label of the service a copy was made from (launchd's on-demand copies, such as
+    # the mdworker.shared.<uuid> ones) may precede the path, and the type follows it directly: the only text a job's owner
+    # chooses is printed further down, so no line of it can stand in for these two.
+    if first['type'] != first['path'] + 1 or not all(re.fullmatch(r'\t(active count|copy count) = \d+|\toriginal = [A-Za-z0-9_][A-Za-z0-9_.-]{0,199}', line)
+                                                     for line in lines[1:first['path']]):
+        return 'header does not have the shape launchd prints for a system service'
     if 'program' in seen and not seen['program'].startswith(SERVICE_PROGRAM_PREFIXES):
         return 'runs a program outside the system prefixes'
     return None
