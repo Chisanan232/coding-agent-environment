@@ -511,17 +511,18 @@ def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None
             if same and (same[0]['pid'], same[0]['start_token']) != (pid, token):
                 return dict(result, admit=False, reason='label-in-use: %s belongs to another live process' % label)
             others = [r for r in live if r['label'] != label]
+            queued, queue_problems = _queue_entries(state_path)
+            if queue_problems:
+                return dict(result, admit=False, reason=queue_problems[0])
+            orphans = _claimed_orphans(queued, live, token_fn)
             if not same:
-                queued, queue_problems = _queue_entries(state_path)
-                if queue_problems:
-                    return dict(result, admit=False, reason=queue_problems[0])
                 ahead = [e for e in queued if e['state'] in WAITING_STATES and not _entry_lapsed(e, now)]
                 if ahead:
                     return dict(result, admit=False, reason='queue-ahead: %d queued entries wait for the heavy lane (first %s, %s); '
                                 'enqueue instead of reserving directly' % (len(ahead), ahead[0]['id'], ahead[0]['label']))
             lanes = HEAVY_LANES[result['tier']]
-            reserved = sum(r['bytes'] for r in others)
-            if len(others) >= lanes:
+            reserved = sum(r['bytes'] for r in others) + sum(e['bytes'] for e in orphans)
+            if len(others) + len(orphans) >= lanes:
                 return dict(result, admit=False, reserved_bytes=reserved,
                             reason='lane-cap: %d of %d heavy lanes in use (%s)' % (len(others), lanes, ', '.join(
                                 '%s pid %d%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '')
@@ -707,6 +708,24 @@ def _entry_lapsed(entry, now):
     return False
 
 
+def _claimed_orphans(entries, live, token_fn):
+    """CLAIMED entries whose holder is still the same live process but whose reservation file is gone (explicit `release`
+    while the job runs). They keep occupying a lane and their bytes: a deleted file is not evidence the job stopped."""
+    held = {(r['label'], r['pid']) for r in live}
+    orphans = []
+    for entry in entries:
+        if entry['state'] != 'CLAIMED' or (entry['label'], entry['holder']['pid']) in held:
+            continue
+        try:
+            current = token_fn(entry['holder']['pid'])
+        except ReservationError:
+            orphans.append(entry)  # unverifiable stays counted
+            continue
+        if current is not None and current == entry['holder']['start_token']:
+            orphans.append(entry)
+    return orphans
+
+
 def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_id, nbytes, argv, again=False, now=None,
                   wait_s=QUEUE_WAIT_S):
     """Add one durable entry, or return the live one with the same fingerprint. Never stores argv."""
@@ -837,10 +856,8 @@ def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=pro
                     evidence, alive = 'holder-exited', False
                 elif current != holder['start_token']:
                     evidence, alive = 'pid-reused', False
-                elif not any(r['label'] == entry['label'] and r['pid'] == holder['pid'] for r in live):
-                    evidence, alive = 'reservation-released', True
                 else:
-                    continue
+                    continue  # still the same live process: the lane stays occupied, with or without its reservation file
                 entry['state'] = 'RELEASED'
                 entry['release'] = {'at': iso_utc(now), 'evidence': evidence, 'holder_alive': alive}
                 _write_queue_entry(state_path, entry)
@@ -874,10 +891,11 @@ def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=pro
                 out['eligible'].append(first['id'])
                 out['reason'] = 'no heavy lane at tier %s' % result['tier']
                 return out
-            if len(live) + len(granted) >= lanes:
+            orphans = _claimed_orphans(entries, live, token_fn)
+            if len(live) + len(granted) + len(orphans) >= lanes:
                 out['reason'] = 'lane occupied'
                 return out
-            reserved = sum(r['bytes'] for r in live)
+            reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
             if result['free_bytes'] - reserved - first['bytes'] < HEAVY_FLOOR:
                 out['reason'] = 'over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested for %s, floor 100 GiB' % (
                     result['free_bytes'] / GIB, reserved / GIB, first['bytes'] / GIB, first['id'])
@@ -921,6 +939,7 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
     count (the grant itself does not count), disk floor and our own process; the reservation and the holder are written in
     one critical section. A refusal keeps the grant. Returns a dict with ok, reason and exit (77 refused, 127 exec failed).
     """
+    fresh_clock = now is None
     now = now or datetime.now(timezone.utc)
     pid = pid or os.getpid()
     exec_fn = exec_fn or _exec_job
@@ -971,6 +990,8 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
         admitted, memory_reason = memory_fn()
         if not admitted:
             return refuse('memory-gate: %s' % memory_reason)
+        if fresh_clock:
+            now = datetime.now(timezone.utc)  # the memory gate takes 10 s or more; judge lapse and expiry at the real time
         with state_lock(state_path):
             entries, problems = _queue_entries(state_path)
             if problems:
@@ -996,19 +1017,31 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
                 return refuse('process-not-owned: pid %d is not run by this user' % pid)
             if any(r['label'] == label for r in live):
                 return refuse('label-in-use: %s already holds a reservation' % label)
+            orphans = _claimed_orphans(entries, live, token_fn)
             lanes = HEAVY_LANES[result['tier']]
-            if len(live) >= lanes:
-                return refuse('lane-cap: %d of %d heavy lanes in use (%s)' % (len(live), lanes, ', '.join(
-                    '%s pid %d%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '') for r in live)))
-            reserved = sum(r['bytes'] for r in live)
+            if len(live) + len(orphans) >= lanes:
+                return refuse('lane-cap: %d of %d heavy lanes in use (%s)' % (len(live) + len(orphans), lanes, ', '.join(
+                    ['%s pid %d%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '') for r in live] +
+                    ['%s pid %d (reservation removed, job still running)' % (e['label'], e['holder']['pid']) for e in orphans])))
+            reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
             if result['free_bytes'] - reserved - nbytes < HEAVY_FLOOR:
                 return refuse('over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
                     result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB))
             write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), queue_id=qid)
-            entry['state'] = 'CLAIMED'
-            entry['holder'] = {'pid': pid, 'start_token': token, 'claimed_at': iso_utc(now)}
-            _write_queue_entry(state_path, entry)
-            _drop_marker(state_path, qid)
+            try:
+                entry['state'] = 'CLAIMED'
+                entry['holder'] = {'pid': pid, 'start_token': token, 'claimed_at': iso_utc(now)}
+                _write_queue_entry(state_path, entry)
+            except OSError:
+                try:
+                    (reservations_dir(state_path) / (label + '.json')).unlink()  # no half claim: the job is not exec'd
+                except OSError:
+                    pass
+                raise
+            try:
+                _drop_marker(state_path, qid)
+            except OSError:
+                pass  # a stale marker is harmless: the entry is CLAIMED and the grant cannot be claimed again
             _queue_receipt(state_path, 'claimed', entry, now, pid=pid)
     except StateError as exc:
         return refuse('%s: %s' % (exc.kind, exc))

@@ -293,6 +293,23 @@ class Claim(QueueBase):
         self.assertIn('lapsed', late['reason'])
         self.assertFalse(self.claim('q999999')['ok'])
 
+    def test_failed_entry_write_leaves_no_reservation_and_no_exec(self):
+        qid = self.grant()
+        real = da._write_queue_entry
+
+        def broken(state_path, entry):
+            raise OSError('disk full')
+
+        da._write_queue_entry = broken
+        try:
+            out = self.claim(qid)
+        finally:
+            da._write_queue_entry = real
+        self.assertFalse(out['ok'])
+        self.assertEqual(out['calls']['exec'], [])
+        self.assertFalse((self.path.parent / 'reservations/nda-horo-2070.json').exists())
+        self.assertEqual(self.entries()[qid]['state'], 'GRANTED')
+
     def test_second_claim_of_the_same_grant_is_refused(self):
         qid = self.grant()
         self.assertTrue(self.claim(qid)['ok'])
@@ -395,12 +412,40 @@ class ReleaseEvidence(QueueBase):
         self.assertEqual(out['granted'], [])
         self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
 
-    def test_explicit_release_of_a_live_holder_is_recorded_with_holder_alive(self):
+    def test_explicit_release_of_a_live_holder_does_not_free_the_lane(self):
         a, job = self.claimed()
-        da.release('nda-horo-2070', self.path)
-        self.advance()
-        release = self.entries()[a]['release']
-        self.assertEqual((release['evidence'], release['holder_alive']), ('reservation-released', True))
+        b = self.enqueue('HORO-2071')['id']
+        da.release('nda-horo-2070', self.path)  # any same-uid caller can do this while the job runs
+        out = self.advance()
+        self.assertEqual(out['granted'], [])
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+        proc = subprocess.Popen(['/bin/sleep', '300'])
+        self.holders.append(proc)
+        da.queue_cancel(self.path, b, now=self.now)
+        refused = da.reserve('plain', 10 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertFalse(refused['admit'], 'a removed reservation file must not free a running job lane')
+        c = self.enqueue('HORO-2072')['id']
+        job.kill()
+        job.wait()
+        out = self.advance()
+        self.assertEqual(out['granted'], [c])
+        self.assertEqual(self.entries()[a]['release']['evidence'], 'holder-exited')
+
+    def test_per_entry_unverifiable_holder_keeps_the_lane(self):
+        a, job = self.claimed()
+        self.enqueue('HORO-2071')
+        calls = {'n': 0}
+        real = da.process_token
+
+        def flaky(pid):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                return real(pid)  # live_reservations sees a healthy holder
+            raise da.ReservationError('ps unavailable')
+
+        out = da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, token_fn=flaky)
+        self.assertGreaterEqual(calls['n'], 2)
+        self.assertEqual((out['granted'], self.entries()[a]['state']), ([], 'CLAIMED'))
 
     def test_end_to_end_release_grant_claim_and_no_duplicate_run(self):
         libra = self.holder('libra-c1-fullgate')

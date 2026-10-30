@@ -181,12 +181,12 @@ decides who is granted the lane after the current holder is gone.
   writes the holder reservation (with `queue_id`) and the CLAIMED entry in one critical section. A refusal exits 77 and keeps
   the grant; retrying is one explicit call, never a loop. A second claim of the same grant is refused; a failed `exec`
   releases the reservation and marks the entry RELEASED (`exec-failed`, exit 127).
-- Release evidence: `advance` marks a CLAIMED entry RELEASED only on verified evidence: `holder-exited` (the pid is gone),
-  `pid-reused` (a different start token) or `reservation-released` (an explicit `release` while the holder still runs,
-  recorded with `holder_alive: true`). A holder that is past its time limit but alive, or that cannot be inspected, keeps
-  the lane. A timeout alone is never evidence.
-- Automation status: release detection, the grant and its durable record happen when a queue-aware command runs (`advance`,
-  `reserve`, `run`, `queue ...`); nothing polls. Resuming the owning Claude or Codex session is an explicit handoff:
+- Release evidence: `advance` marks a CLAIMED entry RELEASED only on verified evidence: `holder-exited` (the pid is gone) or
+  `pid-reused` (a different start token). A holder that is past its time limit but alive, that cannot be inspected, or whose
+  reservation file was removed by an explicit `release` while the job still runs, keeps its lane and bytes (reserve, run, claim
+  and grant all count it). A timeout or a deleted file alone is never evidence.
+- Automation status: release detection, the grant and its durable record happen only when `queue advance` runs (reserve, run
+  and claim never grant or record releases); nothing polls and no daemon runs it. Resuming the owning Claude or Codex session is an explicit handoff:
   `queue status` prints the resume and claim commands and never runs them. No automatic wakeup is claimed until a live
   release-and-resume test passes; SPE-96's coordinator remains the only resume owner and has no queue event yet.
 - The queue only coordinates callers that use it; the gate hook stays in warn mode and unwrapped commands bypass it.
