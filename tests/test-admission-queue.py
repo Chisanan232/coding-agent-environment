@@ -609,25 +609,27 @@ class ClaimCli(QueueBase):
         super().setUp()
         self.now = datetime.now(timezone.utc)  # the CLI judges grant lapse by the real clock
 
-    def run_cli(self, *argv, memory_ok=True):
+    def run_cli(self, *argv, memory_ok=True, ancestor=True):
         out = io.StringIO()
         with unittest.mock.patch.object(da, '_memory_precondition', lambda: (memory_ok, 'ok' if memory_ok else 'pressure')), \
+                unittest.mock.patch.object(da, '_is_self_or_ancestor', lambda pid: ancestor), \
                 contextlib.redirect_stdout(out):
             rc = da.run(list(argv), state_path=self.path, free_fn=lambda: 400 * GIB)
         return rc, out.getvalue()
+
+    def in_worktree(self):
+        cwd = os.getcwd()
+        os.chdir(self.worktree)
+        self.addCleanup(os.chdir, cwd)
 
     def test_claim_for_a_supervising_pid_does_not_exec_and_records_the_holder(self):
         qid = self.enqueue('HORO-2070', argv=['claude', '-p', '--resume', 'abc', 'do it'])['id']
         self.advance()
         job = subprocess.Popen(['/bin/sleep', '300'])
         self.holders.append(job)
-        cwd = os.getcwd()
-        os.chdir(self.worktree)
-        try:
-            rc, out = self.run_cli('queue', 'claim', '--id', qid, '--label', 'nda-horo-2070', '--bytes', str(20 * GIB),
-                                   '--pid', str(job.pid), '--', 'claude', '-p', '--resume', 'abc', 'do it')
-        finally:
-            os.chdir(cwd)
+        self.in_worktree()
+        rc, out = self.run_cli('queue', 'claim', '--id', qid, '--label', 'nda-horo-2070', '--bytes', str(20 * GIB),
+                               '--pid', str(job.pid), '--', 'claude', '-p', '--resume', 'abc', 'do it')
         self.assertEqual(rc, 0, out)
         self.assertEqual(json.loads(out)['ok'], True)
         entry = self.entries()[qid]
@@ -637,23 +639,53 @@ class ClaimCli(QueueBase):
         self.advance()
         self.assertEqual(self.entries()[qid]['release']['evidence'], 'holder-exited')
 
-    def test_claim_refusals_exit_77_and_keep_the_grant(self):
+    def test_claim_refusals_exit_77_keep_the_grant_and_never_print_argv(self):
         qid = self.enqueue('HORO-2070')['id']
         self.advance()
-        cwd = os.getcwd()
-        os.chdir(self.worktree)
-        try:
-            rc, out = self.run_cli('queue', 'claim', '--id', qid, '--label', 'nda-horo-2070', '--bytes', str(20 * GIB),
-                                   '--pid', str(os.getpid()), '--', 'cargo', 'nextest', 'run', '--token', SECRET_ARG, memory_ok=False)
-            self.assertEqual(rc, 77)
-            self.assertIn('memory-gate', out)
-            rc, out = self.run_cli('queue', 'claim', '--id', qid, '--label', 'nda-horo-2070', '--bytes', str(20 * GIB),
-                                   '--pid', str(os.getpid()), '--', 'wrong', 'job')
-            self.assertEqual(rc, 77)
-        finally:
-            os.chdir(cwd)
+        self.in_worktree()
+        rc, memory_out = self.run_cli('queue', 'claim', '--id', qid, '--label', 'nda-horo-2070', '--bytes', str(20 * GIB),
+                                      '--pid', str(os.getpid()), '--', 'cargo', 'nextest', 'run', '--token', SECRET_ARG,
+                                      memory_ok=False)
+        self.assertEqual(rc, 77)
+        self.assertIn('memory-gate', memory_out)
+        rc, wrong_out = self.run_cli('queue', 'claim', '--id', qid, '--label', 'nda-horo-2070', '--bytes', str(20 * GIB),
+                                     '--pid', str(os.getpid()), '--', 'wrong', 'job', SECRET_ARG)
+        self.assertEqual(rc, 77)
+        self.assertIn('fingerprint mismatch', wrong_out)
         self.assertEqual(self.entries()[qid]['state'], 'GRANTED')
-        self.assertNotIn(SECRET_ARG, out)
+        for text in (memory_out, wrong_out):
+            self.assertNotIn(SECRET_ARG, text)
+
+    def test_pid_must_be_positive_and_a_live_ancestor_of_the_caller(self):
+        qid = self.enqueue('HORO-2070')['id']
+        self.advance()
+        self.in_worktree()
+        for pid, ancestor in (('0', True), ('-5', True), (str(os.getpid()), False)):
+            rc, out = self.run_cli('queue', 'claim', '--id', qid, '--label', 'nda-horo-2070', '--bytes', str(20 * GIB),
+                                   '--pid', pid, '--', 'cargo', 'nextest', 'run', '--token', SECRET_ARG, ancestor=ancestor)
+            self.assertEqual(rc, 77, (pid, out))
+            self.assertIn('ancestor', out)
+        self.assertEqual(self.entries()[qid]['state'], 'GRANTED')
+
+    def test_ancestor_walk_fails_closed(self):
+        chain = {100: 50, 50: 10, 10: 1}
+        self.assertTrue(da._is_self_or_ancestor(os.getpid()))
+        self.assertTrue(da._is_self_or_ancestor(50, ppid_fn=lambda p: chain.get(p, 100) if p == os.getpid() else chain.get(p)))
+        self.assertFalse(da._is_self_or_ancestor(999, ppid_fn=lambda p: chain.get(p, 100) if p == os.getpid() else chain.get(p)))
+        self.assertFalse(da._is_self_or_ancestor(50, ppid_fn=lambda p: (_ for _ in ()).throw(ValueError('ps broke'))))
+
+    def test_an_unverifiable_process_is_a_refusal_not_a_crash(self):
+        qid = self.enqueue('HORO-2070')['id']
+        self.advance()
+
+        def broken(pid):
+            raise da.ReservationError('ps unavailable')
+
+        out = da.queue_claim(self.path, qid, 'nda-horo-2070', 20 * GIB, ['cargo', 'nextest', 'run', '--token', SECRET_ARG],
+                             str(self.worktree), lambda: 400 * GIB, pid=os.getpid(), now=self.now, token_fn=broken,
+                             memory_fn=lambda: (True, 'ok'), exec_fn=lambda p, a: None)
+        self.assertFalse(out['ok'])
+        self.assertEqual(out['exit'], 77)
 
 
 class Cli(QueueBase):

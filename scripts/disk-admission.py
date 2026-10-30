@@ -1010,16 +1010,19 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
             result = _evaluate_locked('heavy', state_path, free_fn, now)
             if not result['admit']:
                 return refuse(result['reason'])
-            live, res_problems = live_reservations(state_path, now, token_fn)
-            if res_problems:
-                return refuse(res_problems[0])
-            token = token_fn(pid)
-            if token is None:
-                return refuse('process-not-running: pid %d' % pid)
             try:
-                owner = owner_fn(pid)
+                live, res_problems = live_reservations(state_path, now, token_fn)
             except ReservationError as exc:
                 return refuse('process-unverifiable: %s' % exc)
+            if res_problems:
+                return refuse(res_problems[0])
+            try:
+                token = token_fn(pid)
+                owner = owner_fn(pid) if token is not None else None
+            except ReservationError as exc:
+                return refuse('process-unverifiable: %s' % exc)
+            if token is None:
+                return refuse('process-not-running: pid %d' % pid)
             if owner != os.getuid():
                 return refuse('process-not-owned: pid %d is not run by this user' % pid)
             if any(r['label'] == label for r in live):
@@ -1333,6 +1336,27 @@ def build_parser():
     return parser
 
 
+def _is_self_or_ancestor(pid, ppid_fn=None, limit=64):
+    """True when pid is this process or one of its ancestors; unknown means False (fail closed)."""
+    def ppid_of(p):
+        done = subprocess.run(['/bin/ps', '-o', 'ppid=', '-p', str(p)], capture_output=True, text=True, timeout=5,
+                              stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/bin:/usr/bin'})
+        return int(done.stdout.strip()) if done.returncode == 0 and done.stdout.strip().isdigit() else None
+
+    ppid_fn = ppid_fn or ppid_of
+    current = os.getpid()
+    for _ in range(limit):
+        if current == pid:
+            return True
+        try:
+            current = ppid_fn(current)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return False
+        if current is None or current <= 1:
+            return False
+    return False
+
+
 def _queue_cli(args, state_path, free_fn):
     command = args.queue_command
     if command == 'enqueue':
@@ -1346,6 +1370,10 @@ def _queue_cli(args, state_path, free_fn):
         out['ok'] = out['reason'] in ('ok',) or bool(out['granted'] or out['expired'] or out['eligible']) or out['reason'] in (
             'lane occupied',) or out['reason'].startswith('no heavy lane')
     elif command == 'claim':
+        if args.pid <= 0 or not _is_self_or_ancestor(args.pid):
+            print(json.dumps({'ok': False, 'reason': 'invalid-request: --pid must be a live ancestor of this command '
+                                                     '(the supervising process that runs it), not an arbitrary process'}))
+            return REFUSED_EXIT
         if args.job[:1] != ['--']:
             print(json.dumps({'ok': False, 'reason': 'invalid-request: put -- between the options and the command'}))
             return REFUSED_EXIT
