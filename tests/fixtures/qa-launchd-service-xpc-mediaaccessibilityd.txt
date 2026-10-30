@@ -1,0 +1,21 @@
+user/530/com.apple.accessibility.mediaaccessibilityd = {
+	active count = 2
+	path = /System/Library/Frameworks/MediaAccessibility.framework/Versions/A/XPCServices/com.apple.accessibility.mediaaccessibilityd.xpc
+	type = XPCService
+	state = running
+	bundle id = com.apple.accessibility.mediaaccessibilityd
+	bundle version = 1
+
+	program = /System/Library/Frameworks/MediaAccessibility.framework/Versions/A/XPCServices/com.apple.accessibility.mediaaccessibilityd.xpc/Contents/MacOS/com.apple.accessibility.mediaaccessibilityd
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.apple.accessibility.mediaaccessibilityd
+	}
+
+	domain = user/530
+	state = running
+}
