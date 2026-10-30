@@ -133,6 +133,8 @@ the hop and acts on the verdict.
   `QA_FAIL`, because a recorded defect is more useful to the producer than a retry. A signal that lands in the few bytecodes
   between the child being forked and `Popen` returning can leave codex unmonitored; the wrapper's exit then closes codex's
   stdin pipe, so it reads an empty prompt. SIGKILL of the wrapper cannot be handled at all and leaves no record.
+  The run record itself is written with these signals blocked; a signal that arrives after it is complete leaves a finished
+  run finished (its verdict stands, and `verdict` can still be run later).
 - After a clean codex exit the wrapper sends SIGKILL to the codex process group. If that group were fully gone and its id
   recycled by an unrelated group leader within the same moment, that group would be signalled; this is negligible in
   practice and not defended against.
