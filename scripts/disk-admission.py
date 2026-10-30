@@ -315,20 +315,56 @@ class ReservationError(Exception):
     """A reservation or its owning process cannot be verified."""
 
 
+PS_ENV = {'LC_ALL': 'C', 'PATH': '/bin:/usr/bin'}
+
+
+def _ps(args, pid_text):
+    try:
+        return subprocess.run(['/bin/ps'] + args, capture_output=True, text=True, timeout=5,
+                              stdin=subprocess.DEVNULL, env=PS_ENV)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReservationError('cannot inspect process %s: %s' % (pid_text, exc))
+
+
+def zombie_workload_remains(pid, ppid, pgid):
+    """True unless the zombie provably leaves no running workload behind.
+
+    A wrapper that has exited but not been reaped says nothing about the job it started: that job keeps the wrapper's
+    process group even after it is reparented. That only identifies the workload when the wrapper led its own group
+    (pgid == pid); a zombie inside a group it shares with others cannot be separated from them, so the answer is "may
+    remain" and the lane stays occupied. A live member of the group, or an unreadable process table, also answers True.
+    A job that left the group with setsid is not visible (a known limit, documented in docs/RESOURCE-ADMISSION.md).
+    """
+    if pgid != pid:
+        return True
+    done = _ps(['-ax', '-o', 'pid=,ppid=,pgid=,stat='], 'table')
+    if done.returncode != 0:
+        raise ReservationError('cannot read the process table: ps exit %d' % done.returncode)
+    for line in done.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or not all(f.isdigit() for f in fields[:3]):
+            raise ReservationError('cannot parse the process table')
+        other, _, other_pgid = (int(f) for f in fields[:3])
+        if other in (pid, ppid) or other_pgid != pgid or fields[3].startswith('Z'):
+            continue
+        return True
+    return False
+
+
 def process_token(pid):
     """Start-time token of a live process, None when it is gone.
 
-    pid plus start time identifies one process; a reused pid has a new token.
+    pid plus start time identifies one process; a reused pid has a new token. An exited-but-unreaped (zombie) process
+    is gone only when nothing else of its process group is running; otherwise its token is still returned, so a
+    lane held through that process stays occupied while the job it started runs.
     """
-    try:
-        done = subprocess.run(['/bin/ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True,
-                              timeout=5, stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/bin:/usr/bin'})
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ReservationError('cannot inspect process %d: %s' % (pid, exc))
-    token = done.stdout.strip()
-    if done.returncode == 0 and token:
-        return token
-    if done.returncode == 1 and not token:
+    done = _ps(['-o', 'stat=,ppid=,pgid=,lstart=', '-p', str(pid)], str(pid))
+    fields = done.stdout.strip().split(None, 3)
+    if done.returncode == 0 and len(fields) == 4 and fields[1].isdigit() and fields[2].isdigit():
+        if fields[0].startswith('Z') and not zombie_workload_remains(pid, int(fields[1]), int(fields[2])):
+            return None
+        return fields[3]
+    if done.returncode == 1 and not done.stdout.strip():
         return None
     raise ReservationError('cannot inspect process %d: ps exit %d' % (pid, done.returncode))
 
