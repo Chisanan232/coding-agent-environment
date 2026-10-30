@@ -17,7 +17,7 @@ spec.loader.exec_module(qis)
 
 GOOD = {"uid": 777, "gid": 777, "groups": [777, 12, 61], "ctty": "ENXIO", "list_inbox": "ok", "write_inbox": "EACCES",
         "write_outbox": "ok", "write_exchange": "EACCES", "list_producer_home": "EACCES", "stat_producer_auth": "EACCES",
-        "open_producer_ssh": "EPERM", "std_isatty": [False, False, False], "own_env_read": "ok", "foreign_env_leaked": False}
+        "open_producer_ssh": "EPERM", "std_isatty": [False, False, False], "codex_dir": "absent", "own_env_read": "ok", "foreign_env_leaked": False}
 
 
 class ArgsTest(unittest.TestCase):
@@ -68,9 +68,17 @@ class PureChecksTest(unittest.TestCase):
             "env unknown": dict(GOOD, foreign_env_leaked=None),
             "outbox not writable": dict(GOOD, write_outbox="EACCES"),
             "tty on a std fd": dict(GOOD, std_isatty=[False, True, False]),
+            "codex dir 0755": dict(GOOD, codex_dir={"dir": True, "uid": 777, "mode": 0o755}),
+            "codex dir wrong owner": dict(GOOD, codex_dir={"dir": True, "uid": 501, "mode": 0o700}),
+            "codex dir a symlink/file": dict(GOOD, codex_dir={"dir": False, "uid": 777, "mode": 0o700}),
+            "codex dir unreadable fails closed": dict(GOOD, codex_dir="ERR:EACCES"),
+            "codex dir key missing fails closed": {k: v for k, v in GOOD.items() if k != "codex_dir"},
         }
         for label, probe in cases.items():
             self.assertTrue(qis.evaluate_probe(probe, 777), label)
+
+    def test_private_codex_dir_passes(self):
+        self.assertEqual(qis.evaluate_probe(dict(GOOD, codex_dir={"dir": True, "uid": 777, "mode": 0o700}), 777), [])
 
     def test_detector_invalid_blocks_even_when_no_leak(self):
         fails = qis.evaluate_probe(dict(GOOD, own_env_read="unreadable", foreign_env_leaked=False), 777)
@@ -109,6 +117,84 @@ class DetachTest(unittest.TestCase):
         r = subprocess.run([sys.executable, "-I", "-c", qis.DETACH, "0", sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 3)
         self.assertEqual(r.stdout.strip(), "False False False True")
+
+
+class FakeSibling:
+    pid = 4242
+
+    def __init__(self, alive=True):
+        self.alive = alive
+
+    def poll(self):
+        return None if self.alive else 1
+
+    def kill(self):
+        pass
+
+    def wait(self):
+        pass
+
+
+class ProbeFailsClosedTest(unittest.TestCase):
+    """A security control never counts as passed when its positive control, detector or sibling fails: the setup stops."""
+
+    def run_probe(self, probe, procenv_ok=True, sibling_alive=True, owner_ls_rc=0):
+        import json
+        s = qis.Setup("qauser", 777, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"))
+        pw = mock.Mock(pw_dir="/Users/owner", pw_name="owner", pw_uid=501)
+
+        def fake_run(argv, **kw):
+            if argv and argv[0] == "/bin/ls":
+                return subprocess.CompletedProcess(argv, owner_ls_rc, "", "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(probe) + "\n", "")
+
+        sentinel_holder = {}
+        real_token = qis.secrets.token_hex
+
+        def token(n):
+            sentinel_holder["t"] = real_token(n)
+            return sentinel_holder["t"]
+
+        env = (lambda pid: ("QA_SENTINEL=qa-sentinel-%s" % sentinel_holder["t"]).encode()) if procenv_ok else (lambda pid: None)
+        with mock.patch.object(qis, "run", fake_run), mock.patch.object(qis, "sudo_refresh", lambda: None), \
+                mock.patch.object(qis.subprocess, "Popen", lambda *a, **k: FakeSibling(sibling_alive)), \
+                mock.patch.object(qis.secrets, "token_hex", token), mock.patch.object(qis, "procenv", env):
+            s.probe_isolation(pw)
+
+    def test_good_probe_passes(self):
+        self.run_probe(GOOD)
+
+    def test_producer_side_control_failure_stops(self):
+        with self.assertRaises(qis.Stop):
+            self.run_probe(GOOD, procenv_ok=False)
+
+    def test_sibling_dead_after_probe_stops(self):
+        with self.assertRaises(qis.Stop):
+            self.run_probe(GOOD, sibling_alive=False)
+
+    def test_own_child_detector_failure_stops(self):
+        with self.assertRaises(qis.Stop):
+            self.run_probe(dict(GOOD, own_env_read="unreadable"))
+
+    def test_foreign_env_leak_stops(self):
+        with self.assertRaises(qis.Stop):
+            self.run_probe(dict(GOOD, foreign_env_leaked=True))
+
+    def test_owner_cannot_read_outbox_stops(self):
+        with self.assertRaises(qis.Stop):
+            self.run_probe(GOOD, owner_ls_rc=1)
+
+    def test_main_does_not_report_done_when_probe_stops(self):
+        out = []
+        with mock.patch.object(qis.Setup, "ensure_account", lambda *a: None), mock.patch.object(qis.Setup, "ensure_exchange", lambda *a: None), \
+                mock.patch.object(qis.Setup, "probe_isolation", lambda *a: (_ for _ in ()).throw(qis.Stop("[isolation] x"))), \
+                mock.patch.object(qis, "sudo_refresh", lambda: None), mock.patch.object(qis.platform, "system", lambda: "Darwin"), \
+                mock.patch.object(qis.os, "geteuid", lambda: 501), mock.patch.dict(qis.os.environ, {}, clear=False), \
+                mock.patch.object(qis, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "yes", "")), \
+                mock.patch.object(qis, "say", out.append):
+            rc = qis.main(["--name", "someqa", "--uid", "778"])
+        self.assertEqual(rc, 1)
+        self.assertFalse(any("DONE" in line for line in out))
 
 
 class CommandShapeTest(unittest.TestCase):

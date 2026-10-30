@@ -88,6 +88,13 @@ def evaluate_probe(o, uid):
         fails.append("the QA process still has the owner's controlling terminal (/dev/tty opened)")
     if o.get("std_isatty") != [False, False, False]:
         fails.append("the QA process holds a terminal on a standard fd: %s" % (o.get("std_isatty"),))
+    cd = o.get("codex_dir")
+    if cd != "absent":
+        if not isinstance(cd, dict):
+            fails.append("could not check the QA user's ~/.codex (%s); failing closed" % (cd,))
+        elif not cd.get("dir") or cd.get("uid") != uid or cd.get("mode", 0o777) & 0o077:
+            fails.append("~/.codex must be a private (0700) directory owned by the QA user, found %s (after login run: "
+                         "sudo -n -u NAME chmod 700 ~NAME/.codex via the owner Terminal, then re-run)" % (cd,))
     groups = o.get("groups")
     if not isinstance(groups, list) or set(groups) & PRIV_GIDS:
         fails.append("the QA process carries a privileged group: %s" % (groups,))
@@ -125,7 +132,7 @@ exec(PROCENV_SRC)  # defines procenv() for the producer-side control; the probe 
 
 # The probe runs as the QA user with this tiny script (-I: isolated). It only tests access; it never reads a credential.
 PROBE = PROCENV_SRC + r"""
-import errno, json, os, subprocess, sys
+import errno, json, os, stat, subprocess, sys
 inbox, outbox, xroot, prodhome, pid, sentinel = sys.argv[1:7]
 def tryit(f):
     try: f(); return "ok"
@@ -133,6 +140,12 @@ def tryit(f):
 def wr(d):
     p = os.path.join(d, ".probe-" + str(os.getpid()))
     fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600); os.close(fd); os.unlink(p)
+def codex_dir():
+    # /Users/NAME is 0700, so only the QA user can see its own ~/.codex; Codex leaves it 0755 after login
+    try: st = os.lstat(os.path.join(os.environ.get("HOME", "/nonexistent"), ".codex"))
+    except FileNotFoundError: return "absent"
+    except OSError as e: return "ERR:" + errno.errorcode.get(e.errno, str(e.errno))
+    return {"dir": stat.S_ISDIR(st.st_mode), "uid": st.st_uid, "mode": st.st_mode & 0o777}
 mine = "mine-" + os.urandom(6).hex()
 child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(30)"], env={"PATH": "/usr/bin:/bin", "QA_OWN_MARK": mine})
 own = procenv(child.pid)
@@ -147,7 +160,7 @@ out = {"uid": os.getuid(), "gid": os.getgid(), "groups": sorted(os.getgroups()),
   "list_producer_home": tryit(lambda: os.listdir(prodhome)),
   "stat_producer_auth": tryit(lambda: os.stat(os.path.join(prodhome, ".codex", "auth.json"))),
   "open_producer_ssh": tryit(lambda: os.listdir(os.path.join(prodhome, ".ssh"))),
-  "own_env_read": own_ok, "foreign_env_leaked": (foreign is not None and sentinel.encode() in foreign)}
+  "codex_dir": codex_dir(), "own_env_read": own_ok, "foreign_env_leaked": (foreign is not None and sentinel.encode() in foreign)}
 print(json.dumps(out))
 """
 
@@ -157,7 +170,7 @@ print(json.dumps(out))
 DETACH = ("import os,sys,signal\nr,w=os.pipe()\npid=os.fork()\nif pid:\n"
           " os.close(w)\n"
           " for s in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP): signal.signal(s, lambda n,f: os.kill(pid, n))\n"
-          " while True:\n  try: b=os.read(r,65536)\n  except InterruptedError: continue\n  if not b: break\n  os.write(1,b)\n"
+          " while True:\n  try: b=os.read(r,65536)\n  except InterruptedError: continue\n  if not b: break\n  while b: b=b[os.write(1,b):]\n"
           " _,st=os.waitpid(pid,0)\n sys.exit(os.waitstatus_to_exitcode(st))\n"
           "os.close(r)\nos.setsid()\nos.chdir('/')\nz=os.open('/dev/null',os.O_RDWR)\nos.dup2(z,0)\nos.dup2(w,1)\nos.dup2(w,2)\n"
           "os.close(z)\nos.close(w)\nn=int(sys.argv[1])\nif n: signal.alarm(n)\nos.execv(sys.argv[2], sys.argv[2:])")
@@ -261,12 +274,6 @@ class Setup:
             run([CHMOD, "700", str(self.home)], sudo=True)
             if os.lstat(self.home).st_mode & 0o077:
                 die("account", "could not make %s private" % self.home)
-        cdir = self.home / ".codex"
-        if os.path.lexists(cdir):
-            cst = os.lstat(cdir)
-            if stat.S_ISLNK(cst.st_mode) or not stat.S_ISDIR(cst.st_mode) or cst.st_uid != self.uid or cst.st_mode & 0o077:
-                die("account", "%s must be a private (0700) directory owned by the QA user (Codex leaves it 0755 after login: "
-                               "run sudo chmod 700 %s, then re-run)" % (cdir, cdir))
         say("ok  account %s: uid/gid %s, own private group, not admin, no sudo rights, private home" % (n, u))
 
     # ---- exchange area
@@ -370,6 +377,11 @@ class Setup:
         if not only_created:
             if input("Type %s to remove the user, its group and %s: " % (n, self.xroot)).strip() != n:
                 die("rollback", "not confirmed; nothing changed")
+            if os.path.lexists(self.xroot):
+                self.check_managed_exchange()
+                cnt = sum(len(os.listdir(self.xroot / d)) for d in os.listdir(self.xroot))
+                if input("Type the exchange path %s to remove it (%d entries under inbox/outbox, sealed QA records included): " % (self.xroot, cnt)).strip() != str(self.xroot):
+                    die("rollback", "path not confirmed; nothing changed")
         sudo_refresh()
         have_user = dscl("/Users/%s" % n, "UniqueID") == u
         if dscl("/Users/%s" % n, "UniqueID") not in (None, u):
@@ -395,10 +407,8 @@ class Setup:
             self.remove_managed_exchange()
         say("rollback finished; verify with: dscl . -read /Users/%s ; ls -d %s %s" % (n, self.home, self.xroot))
 
-    def remove_managed_exchange(self):
+    def check_managed_exchange(self):
         x = self.xroot
-        if not os.path.lexists(x):
-            return
         if x.is_symlink() or not x.is_dir():
             die("rollback", "%s is a symlink or not a directory; not removing" % x)
         st = os.lstat(x)
@@ -410,9 +420,11 @@ class Setup:
         for n in sorted(names):
             if (x / n).is_symlink() or not (x / n).is_dir():
                 die("rollback", "%s/%s is not a plain directory; not removing" % (x, n))
-        if input("Type the exchange path %s to remove it and everything under it: " % x).strip() != str(x):
-            die("rollback", "path not confirmed; exchange area left in place")
-        run([RM, "-rf", str(x)], sudo=True)
+
+    def remove_managed_exchange(self):
+        if os.path.lexists(self.xroot):
+            self.check_managed_exchange()  # re-checked right before the removal
+            run([RM, "-rf", str(self.xroot)], sudo=True)
 
     def login_command(self):
         """Printed for the owner; this script never logs in. Same detach hop as the probe: a plain `sudo -u` would hand the
