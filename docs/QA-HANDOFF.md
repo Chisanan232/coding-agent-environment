@@ -83,13 +83,30 @@ UNTESTED_OR_BLOCKED / CONFIDENCE`), mapped to these states; it is the same shape
 
 Independent means a separate Codex process with a fresh `--ephemeral` model context that sees only the packet and a clean
 clone at the exact commit, never the producer's transcript, with producer evidence labelled as an unverified claim. It is
-**not** filesystem or configuration isolation: the sandbox can still read files this user can read, and the run inherits
-the user's Codex configuration (hooks, MCP servers) because no credential is copied into a private home. The wrapper
-therefore checks facts instead of trusting the verdict text: the clone's `.git/HEAD` and every tracked file match a
+**not** an OS-user boundary: the QA process runs as this user. File reads are confined by a per-run Codex permission
+profile (below), and the run uses a private `CODEX_HOME`, so the user's own Codex configuration, hooks and MCP servers are
+not loaded. The wrapper therefore checks facts instead of trusting the verdict text: the clone's `.git/HEAD` and every tracked file match a
 manifest taken before the run, and so does a digest of the git control files (`config`, `hooks/`, `info/attributes`, `objects/info/alternates`, `commondir`; a rewritten config, hook, attributes or alternates file is `QA_INVALID`; no git is run
 against the clone afterwards, because the QA process can write it), commands were really executed in the event stream, and the event stream and verdict are hashed at exit.
-What is persisted: the wrapper's own Codex launch arguments (`RUNMETA.json`) and the worker's executed commands (`events.jsonl`), as evidence. No host process listing is read or stored, and the worker environment is built from an allowlist so credentials in the producer's environment never reach it. A run in which no command executed is `QA_INCOMPLETE`, never a pass. Every call carries explicit `-s workspace-write`
-and no model override, because the live Codex configuration is full-access with approvals off.
+What is persisted: the wrapper's own Codex launch arguments (`RUNMETA.json`) and the worker's executed commands (`events.jsonl`), as evidence. No host process listing is read or stored, and the worker environment is built from an allowlist so credentials in the producer's environment never reach it. A run in which no command executed is `QA_INCOMPLETE`, never a pass. No model override is passed. The private home carries only the permission profile and a link to the login, so the live
+full-access configuration is never inherited.
+
+### Read confinement (SPE-136)
+
+Each run gets `<run>/codexhome/` with a `config.toml` that sets `default_permissions = "qa_confined"`: reads are an allowlist
+(`:minimal`, `/usr`, `/bin`, `/opt/homebrew`, the Command Line Tools, plus any `--read-root DIR` the producer adds for a
+toolchain), writes only the clone, `out`, `tmp`, `home` and `cargo-target`, network disabled, and the credential
+directories under HOME (`~/.codex`, `~/.ssh`, `~/.aws`, `~/.config`, `~/.claude`, `~/.gnupg`, `~/.docker`, `~/.kube`, `~/.netrc`,
+`~/.npmrc`, `Library/Keychains`, cargo credentials) and the real Codex home are denied explicitly. No `-s` or `--add-dir`
+is passed (those select the legacy write-only sandbox). The login reaches the Codex client, which is not sandboxed, only as
+a link to the real `auth.json`; no credential is copied, and the link is unreadable to the QA tool commands.
+Before codex starts, the wrapper proves the profile with the exact private home through `codex sandbox -P` (no model): it
+plants a synthetic canary under HOME and requires that reading it, listing the real Codex home and writing outside the roots
+are denied while reading the clone and writing `out` still work. Any control that fails or cannot run ends the run as
+`QA_INVALID` (`read confinement not established`) with codex never started; the controls are recorded in
+`CONFINEMENT.json` and summarised in `RESULT.json`. A missing `codex` binary is `QA_INCOMPLETE`. The profile is
+allowlist-based under HOME; it does not cover `/etc`, `/private/var/tmp` or unlisted directories under `/private/tmp`, so
+never keep a secret there.
 
 ### Boundaries
 
@@ -123,10 +140,11 @@ the hop and acts on the verdict.
   (valid schema, baseline, clean tree, no failing check or Medium+ finding, two successful commands, clean exit,
   COMPLETE, not LOW). Structured criteria with required per-id results are a possible later schema change, not part of
   this slice; until then a reviewer compares `criteria_sha256` and the verified checks with the ticket.
-- Reads are not confined: `-s workspace-write` restricts writes, so a QA command can read this user's real files,
-  including the Codex login the run needs (`CODEX_HOME`) and other home secrets, and could quote them in evidence. A
-  separate OS user or an allowlist-read profile is needed to prevent that; it is not implemented here. Treat the evidence
-  text as possibly containing anything this user can read.
+- File reads are confined by the permission profile (see Read confinement), but **environments of other processes of the
+  same OS user stay readable** to a QA tool command (a sysctl the seatbelt cannot deny): a secret held in the environment
+  of any same-user process, including your own sessions, is reachable and could be quoted in evidence. Closing that needs a
+  separate OS user for the QA run plus the profile, which is an administrator step outside this tool. Until then do not run
+  QA where an environment variable carries a secret you cannot afford to expose, and treat the evidence text as untrusted.
 - SIGTERM, SIGINT and SIGHUP to the wrapper are handled: codex's group is killed and a hashed interrupted record is
   written, so `verdict` reports `QA_INCOMPLETE` and a later edit is `QA_INVALID`. An interrupt only removes the chance of a
   pass: if the verdict codex had already written records a failing check or a Medium-or-higher finding, the state stays
@@ -143,9 +161,9 @@ the hop and acts on the verdict.
   narrows what a `QA_PASS` covers. A reviewer compares the hash and text with the ticket.
 - A `QA_PASS` is the QA process's own report, bound to a hashed event stream a reviewer can audit. It is not a
   cryptographic attestation, and the producer and the QA process run as the same OS user.
-- The sandbox can read files this user can read (including Codex's own login directory) and the run inherits the user's
-  Codex configuration (hooks, MCP servers). Sandbox network and writable roots are pinned per call, but read access is not
-  restricted.
+- The permission profile was measured on codex-cli 0.163.0 (macOS seatbelt, directory rules only, no globs). Another
+  version or platform can behave differently; the pre-run probe is what detects that, so a failed probe is a stop, not a
+  warning. Codex's own client (not sandboxed) still writes to the private home.
 - QA-controlled text reaches the producer through `RESULT.json` and the console. It is stripped, capped and marked
   untrusted, but the producer must still treat it as data.
 - The event stream is the `codex exec` process's own stdout. The wrapper counts only `command_execution` completions that carry a unique id (a model cannot write to that stream; text it prints stays inside an escaped string field on the verified codex version), but a process that can write the stream itself, such as a replaced or compromised codex binary, can forge items and obtain `QA_PASS`. Codex QA reproduced this only with the offline fake codex, which is that process. Defending against it needs an attestation the producer's own user cannot create; that is the open evidence-independence decision, not something this wrapper can close.
