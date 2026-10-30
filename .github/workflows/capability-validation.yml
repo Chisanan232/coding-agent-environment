@@ -173,6 +173,7 @@ jobs:
           python3 tests/test-mcp-scope-inspect.py
           python3 tests/test-spe108-live.py
           python3 tests/test-adoption-coverage.py
+          python3 tests/test-qa-handoff.py
           python3 tests/test-parity-dogfood.py
   native-resource-wire:
     runs-on: macos-14
