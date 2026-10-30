@@ -1704,12 +1704,19 @@ def service_problem(text, uid, label):
                 return 'repeats %s' % match.group(1)
             seen[match.group(1)] = match.group(2).strip()
             first[match.group(1)] = index
-    path = seen.get('path', '')
-    rest = next((path[len(d):] for d in SERVICE_PLIST_DIRS if path.startswith(d)), None)
-    if rest is None or not rest.endswith('.plist') or '/' in rest or '..' in rest:
-        return 'defined outside the system launch directories or without a plist'
-    if seen.get('type') != 'LaunchAgent':
-        return 'not a LaunchAgent'
+    path, kind = seen.get('path', ''), seen.get('type')
+    if kind == 'LaunchAgent':
+        rest = next((path[len(d):] for d in SERVICE_PLIST_DIRS if path.startswith(d)), None)
+        if rest is None or not rest.endswith('.plist') or '/' in rest or '..' in rest:
+            return 'defined outside the system launch directories or without a plist'
+    elif kind == 'XPCService':
+        # macOS registers its on-demand XPC services in the user domain from a bundle directory, not from a launch plist
+        head, _, name = path.rpartition('/')
+        if (not path.startswith('/System/Library/') or '..' in path or not name.endswith('.xpc') or len(name) <= len('.xpc')
+                or not head.endswith('/XPCServices')):
+            return 'an XPC service outside a sealed XPCServices directory'
+    else:
+        return 'not a LaunchAgent or XPCService'
     order = [first['path'], first['type']] + ([first['program']] if 'program' in first else [])
     if order != sorted(order) or ('nested' in first and first['nested'] < max(order)):
         return 'header fields out of the order launchd prints them'
@@ -1720,22 +1727,64 @@ def service_problem(text, uid, label):
                                                      for line in lines[1:first['path']]):
         return 'header does not have the shape launchd prints for a system service'
     program = seen.get('program')
-    if (program is None or not program.startswith(SERVICE_PROGRAM_PREFIXES) or '..' in program
-            or os.path.basename(program) in INTERPRETERS):
+    allowed = (path + '/',) if kind == 'XPCService' else SERVICE_PROGRAM_PREFIXES   # an XPC program lives inside its bundle
+    if (program is None or not program.startswith(allowed) or '..' in program
+            or os.path.basename(program).casefold().startswith(tuple(INTERPRETERS))):
         return 'has no program, or one that is not a system daemon'
     return None
 
 
-def plist_problem(path):
-    """None when the plist launchd says defines a service is a regular file owned by root that no one else can write, read
-    on this side (the producer's), where the QA user's ownership or a firmlink into the data volume would show."""
+def sealed_problem(path, want, roots=('/System/Library/',)):
+    """None when `path` is on the sealed part of the system volume: it must lie under /System/Library/ (no '..'), and every
+    component, both along the path as given and along its fully resolved form, must be owned by root, not writable by group
+    or other, and (on the resolved path) not a link. `want` is 'file' or 'dir' for the final component. A mode-777 directory
+    anywhere in the chain (for example /System/Library/AssetsV2/downloadDir, a firmlink into the data volume) fails it, which
+    a device-number comparison cannot see. A link inside the system volume is followed only to a target that passes too
+    (some frameworks reach Resources through Versions/Current)."""
+    if not path.startswith(roots) or '..' in path.split('/'):
+        return 'path not under %s' % ' or '.join(roots)
+
+    def walk(full, links_ok):
+        current = ''
+        for part in full.strip('/').split('/'):
+            current += '/' + part
+            try:
+                st = os.lstat(current)
+            except OSError:
+                return 'cannot read: ...%s' % current[-40:]
+            if st.st_uid != 0 or (st.st_mode & 0o022 and not stat.S_ISLNK(st.st_mode)):
+                return 'not root-owned/closed: ...%s' % current[-40:]
+            if stat.S_ISLNK(st.st_mode) and not links_ok:
+                return 'link: ...%s' % current[-40:]
+        return None
+    reason = walk(path, True)
+    if reason:
+        return reason
+    real = os.path.realpath(path)
+    if not real.startswith(roots):
+        return 'resolves outside %s' % ' or '.join(roots)
+    reason = walk(real, False)
+    if reason:
+        return reason
     try:
-        st = os.lstat(path)
+        mode = os.lstat(real).st_mode
     except OSError:
-        return 'its plist %s cannot be read' % path
-    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
-        return 'its plist %s is not a root-owned regular file that only root can write' % path
+        return 'cannot read: ...%s' % real[-40:]
+    if not (stat.S_ISDIR(mode) if want == 'dir' else stat.S_ISREG(mode)):
+        return 'not a %s: ...%s' % ('directory' if want == 'dir' else 'file', real[-40:])
     return None
+
+
+def service_files_problem(text):
+    """None when the plist or XPC bundle that launchd reports for a service, and its program, are on the sealed system
+    volume (sealed_problem). Run after service_problem has pinned the header, so the `path` and `program` read here are
+    the ones it accepted."""
+    fields = {}
+    for key in ('path', 'type', 'program'):
+        found = re.search(r'^\t%s = (.+)$' % key, text or '', re.M)
+        fields[key] = found.group(1).strip() if found else ''
+    reason = sealed_problem(fields['path'], 'dir' if fields['type'] == 'XPCService' else 'file')
+    return reason or sealed_problem(fields['program'], 'file', SERVICE_PROGRAM_PREFIXES)
 
 
 def verify_user_domain(ident, running_only=False):
@@ -1773,9 +1822,9 @@ def verify_user_domain(ident, running_only=False):
                 return set(), ['launchd domain %s could not be read (sudo -n refused)' % domain]
             reason = service_problem(answer.stdout, ident.uid, label) if answer.returncode == 0 else 'could not be read (exit %s)' % answer.returncode
             if reason is None:
-                reason = plist_problem(re.search(r'^\tpath = (.+)$', answer.stdout, re.M).group(1).strip())
+                reason = service_files_problem(answer.stdout)
             if reason:
-                problems.append('launchd service %s: %s' % (label, reason))
+                problems.append('service %s: %s' % (label[:60], reason))   # the owner reads only the first 120 characters
             elif pid:
                 pids.add(pid)
         return (set(), problems) if problems else (pids, [])

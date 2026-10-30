@@ -1294,7 +1294,7 @@ class IdentityGuardTests(Base):
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 REAL_DOMAIN = (FIXTURES / "qa-launchd-user-domain.txt").read_text()            # launchctl print user/530 on the first real QA account
 REAL_SERVICE = (FIXTURES / "qa-launchd-service-cfprefsd.txt").read_text()      # launchctl print user/530/com.apple.cfprefsd.xpc.agent
-REAL_PLIST_PROBLEM = qa.plist_problem
+REAL_SEALED_PROBLEM = qa.sealed_problem
 REAL_RUNNING = {28171, 28121, 28582, 28152, 29055, 28127, 28135, 28114}
 
 
@@ -1306,8 +1306,8 @@ class LaunchdDomainTests(unittest.TestCase):
     def setUp(self):
         if os.getuid() == 530:
             self.skipTest("fixture uid is the running uid")
-        # The real plists exist only on a Mac; plist_problem has its own tests below.
-        patcher = unittest.mock.patch.object(qa, "plist_problem", lambda path: None)
+        # The real plists exist only on a Mac; sealed_problem has its own tests below.
+        patcher = unittest.mock.patch.object(qa, "service_files_problem", lambda text: None)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -1398,24 +1398,129 @@ class LaunchdDomainTests(unittest.TestCase):
         for directory in ("LaunchAgents", "LaunchDaemons"):
             self.assertIsNone(qa.service_problem(REAL_SERVICE.replace("/LaunchAgents/", "/%s/" % directory), 530, "com.apple.cfprefsd.xpc.agent"))
 
-    def test_the_plist_must_be_a_root_owned_file_nobody_else_can_write(self):
-        plist_problem = REAL_PLIST_PROBLEM   # setUp replaced qa.plist_problem for the other tests
-        with tempfile.TemporaryDirectory() as tmp:
-            plist = Path(tmp) / "x.plist"
-            plist.write_text("x")
-            self.assertIn("root-owned", plist_problem(str(plist)))                       # owned by the test user, not root
-            link = Path(tmp) / "link.plist"
-            link.symlink_to(plist)
-            self.assertIn("root-owned", plist_problem(str(link)))
-            self.assertIn("cannot be read", plist_problem(str(Path(tmp) / "absent.plist")))
+    class FakeFs:
+        """A virtual file tree for sealed_problem: path -> (kind, uid, mode); a link is ('l', uid, mode, target)."""
 
-            def stat_as(uid, mode):
-                return unittest.mock.patch.object(qa.os, "lstat", lambda p: os.stat_result((stat.S_IFREG | mode, 1, 1, 1, uid, 0, 1, 0, 0, 0)))
-            with stat_as(0, 0o644):
-                self.assertIsNone(plist_problem(str(plist)))
-            for uid, mode in ((0, 0o666), (0, 0o664), (0, 0o646), (530, 0o644)):
-                with stat_as(uid, mode):
-                    self.assertIsNotNone(plist_problem(str(plist)), (uid, mode))
+        def __init__(self, tree):
+            self.tree = tree
+
+        def lstat(self, path):
+            if path not in self.tree:
+                raise FileNotFoundError(path)
+            entry = self.tree[path]
+            kind = {"d": stat.S_IFDIR, "f": stat.S_IFREG, "l": stat.S_IFLNK}[entry[0]]
+            return os.stat_result((kind | entry[2], 1, 1, 1, entry[1], 0, 1, 0, 0, 0))
+
+        def realpath(self, path):
+            parts, resolved = path.strip("/").split("/"), ""
+            for part in parts:
+                resolved += "/" + part
+                entry = self.tree.get(resolved)
+                if entry and entry[0] == "l":
+                    resolved = entry[3]
+            return resolved
+
+        def patch(self):
+            return unittest.mock.patch.multiple(qa.os, lstat=self.lstat), unittest.mock.patch.object(qa.os.path, "realpath", self.realpath)
+
+    def sealed(self, path, want, tree, roots=("/System/Library/",)):
+        lstat, realpath = self.FakeFs(tree).patch()
+        with lstat, realpath:
+            return REAL_SEALED_PROBLEM(path, want, roots)
+
+    @staticmethod
+    def system_tree(*extra):
+        tree = {"/System": ("d", 0, 0o755), "/System/Library": ("d", 0, 0o755), "/usr": ("d", 0, 0o755), "/usr/libexec": ("d", 0, 0o755)}
+        for path, entry in extra:
+            tree[path] = entry
+        return tree
+
+    def test_a_path_is_sealed_only_if_every_component_is_root_owned_and_closed(self):
+        agent = "/System/Library/LaunchAgents/com.apple.x.plist"
+        good = self.system_tree(("/System/Library/LaunchAgents", ("d", 0, 0o755)), (agent, ("f", 0, 0o644)))
+        self.assertIsNone(self.sealed(agent, "file", good))
+        xpc = "/System/Library/Frameworks/M.framework/Versions/A/XPCServices/x.xpc"
+        tree = self.system_tree(*[(p, ("d", 0, 0o755)) for p in ("/System/Library/Frameworks", "/System/Library/Frameworks/M.framework",
+                                                                    "/System/Library/Frameworks/M.framework/Versions",
+                                                                    "/System/Library/Frameworks/M.framework/Versions/A",
+                                                                    "/System/Library/Frameworks/M.framework/Versions/A/XPCServices", xpc)])
+        self.assertIsNone(self.sealed(xpc, "dir", tree))
+        self.assertIsNotNone(self.sealed(xpc, "file", tree))                    # a bundle is a directory, not a file
+        downloads = "/System/Library/AssetsV2/downloadDir/XPCServices/x.xpc"    # mode 777 on a real host: a firmlink into the data volume
+        bad = self.system_tree(("/System/Library/AssetsV2", ("d", 0, 0o755)), ("/System/Library/AssetsV2/downloadDir", ("d", 0, 0o777)),
+                               ("/System/Library/AssetsV2/downloadDir/XPCServices", ("d", 0, 0o755)), (downloads, ("d", 0, 0o755)))
+        self.assertIn("downloadDir", self.sealed(downloads, "dir", bad))
+        self.assertLessEqual(len(self.sealed(downloads, "dir", bad)), 70)
+        for name, change in {"owned by a user": ("d", 530, 0o755), "group writable": ("d", 0, 0o775), "world writable": ("d", 0, 0o757)}.items():
+            with self.subTest(name):
+                broken = dict(good)
+                broken["/System/Library/LaunchAgents"] = change
+                self.assertIsNotNone(self.sealed(agent, "file", broken))
+        missing = dict(good)
+        del missing["/System/Library/LaunchAgents"]
+        self.assertIn("cannot read", self.sealed(agent, "file", missing))
+
+    def test_links_are_followed_only_to_a_target_that_is_sealed_too(self):
+        program = "/System/Library/F.framework/Resources/helper"
+        tree = self.system_tree(("/System/Library/F.framework", ("d", 0, 0o755)), ("/System/Library/F.framework/Versions", ("d", 0, 0o755)),
+                                ("/System/Library/F.framework/Versions/A", ("d", 0, 0o755)),
+                                ("/System/Library/F.framework/Versions/A/Resources", ("d", 0, 0o755)),
+                                ("/System/Library/F.framework/Versions/A/Resources/helper", ("f", 0, 0o755)),
+                                ("/System/Library/F.framework/Resources", ("l", 0, 0o755, "/System/Library/F.framework/Versions/A/Resources")),
+                                (program, ("f", 0, 0o755)))          # the file is reached through the Resources link
+        fs = self.FakeFs(tree)
+        with unittest.mock.patch.object(qa.os, "lstat", fs.lstat), unittest.mock.patch.object(qa.os.path, "realpath", fs.realpath):
+            self.assertIsNone(REAL_SEALED_PROBLEM(program, "file", ("/System/Library/",)))
+            tree["/System/Library/F.framework/Resources"] = ("l", 0, 0o755, "/Users/qauser/evil")   # a link out of the sealed tree
+            self.assertIsNotNone(REAL_SEALED_PROBLEM(program, "file", ("/System/Library/",)))
+            tree["/System/Library/F.framework/Resources"] = ("l", 0, 0o755, "/System/Library/F.framework/Versions/A/Resources")
+            tree["/System/Library/F.framework/Versions/A/Resources"] = ("d", 0, 0o777)                # a writable real target
+            self.assertIsNotNone(REAL_SEALED_PROBLEM(program, "file", ("/System/Library/",)))
+
+    def test_paths_outside_the_roots_or_with_traversal_are_refused_without_touching_the_disk(self):
+        for path in ("/Users/qauser/x.plist", "/System/Volumes/Data/Users/q/x", "/System/Library/../../Users/q/x", "relative/x", "/usr/bin/python3"):
+            with self.subTest(path):
+                self.assertIsNotNone(REAL_SEALED_PROBLEM(path, "file"))
+        self.assertIsNone(self.sealed("/usr/libexec/lsd", "file", self.system_tree(("/usr/libexec/lsd", ("f", 0, 0o755))), ("/usr/libexec/", "/usr/sbin/")))
+
+    def test_the_real_xpc_service_header_is_accepted(self):
+        xpc = (FIXTURES / "qa-launchd-service-xpc-mediaaccessibilityd.txt").read_text()
+        label = "com.apple.accessibility.mediaaccessibilityd"
+        self.assertIsNone(qa.service_problem(xpc, 530, label))
+        path = "/System/Library/Frameworks/MediaAccessibility.framework/Versions/A/XPCServices/com.apple.accessibility.mediaaccessibilityd.xpc"
+        for name, text in {
+            "a bundle outside XPCServices": xpc.replace("/XPCServices/com.apple", "/Other/com.apple", 1).replace("/XPCServices/" + label, "/Other/" + label),
+            "a bundle under the writable data volume": xpc.replace(path, "/System/Volumes/Data/Users/q/XPCServices/x.xpc"),
+            "a bundle in the AssetsV2 download directory": xpc.replace(path, "/System/Library/AssetsV2/downloadDir/x.xpc"),
+            "a program outside its bundle": xpc.replace("\tprogram = " + path + "/Contents", "\tprogram = /usr/libexec/lsd#"),
+            "a program with traversal": xpc.replace(path + "/Contents/MacOS", path + "/Contents/../../x"),
+            "an interpreter inside the bundle": xpc.replace("Contents/MacOS/" + label, "Contents/MacOS/python3"),
+            "a type that is neither": xpc.replace("type = XPCService", "type = Application"),
+            "a second type line": xpc.replace("\tstate = running\n", "\tstate = running\n\ttype = XPCService\n", 1),
+            "an XPC type on a launch plist path": xpc.replace(path, "/System/Library/LaunchAgents/x.plist"),
+            "a LaunchAgent type on a bundle path": xpc.replace("type = XPCService", "type = LaunchAgent"),
+            "no program": xpc.replace("\tprogram = ", "\tprogam = "),
+        }.items():
+            with self.subTest(name):
+                self.assertIsNotNone(qa.service_problem(text, 530, label), name)
+
+    def test_a_loaded_idle_xpc_service_outside_the_system_volume_fails_the_domain(self):
+        xpc = (FIXTURES / "qa-launchd-service-xpc-mediaaccessibilityd.txt").read_text()
+        evil = xpc.replace("/System/Library/Frameworks/MediaAccessibility.framework/Versions/A/XPCServices", "/System/Library/AssetsV2/downloadDir/XPCServices")
+        fake, _ = self.runner(per_label={"com.apple.geod": evil})                  # pid 0: loaded, not running
+        with unittest.mock.patch.object(qa.subprocess, "run", fake), \
+                unittest.mock.patch.object(qa, "service_files_problem", lambda text: None):
+            pids, problems = qa.verify_user_domain(self.IDENT)
+        self.assertEqual(pids, set())
+        self.assertTrue(any("geod" in p for p in problems), problems)
+
+    def test_the_reason_the_owner_reads_is_not_cut_before_the_label(self):
+        fake, _ = self.runner(per_label={"com.apple.geod": "user/530/com.apple.geod = {\n}\n"})
+        with unittest.mock.patch.object(qa.subprocess, "run", fake):
+            _, problems = qa.verify_user_domain(self.IDENT)
+        message = qa.clean(problems[0])                                           # the 120 characters the owner sees
+        self.assertTrue(message.startswith("service com.apple.geod: "), message)
+        self.assertGreater(len(message), len("service com.apple.geod: ") + 10)
 
     def test_a_header_line_forged_inside_a_value_cannot_make_a_service_trusted(self):
         forged = "\tpath = /System/Library/LaunchAgents/forged.plist"
