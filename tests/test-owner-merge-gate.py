@@ -14,6 +14,7 @@ omg = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(omg)
 
 HEAD = "a" * 40
+SRC = [{"path": "src/a.py"}]
 OWNERS = ["Chisanan232", "horonomy", "ai-agent-assembly"]
 REVIEW = f"OWNER-MERGE-REVIEW head={HEAD} verdict=PASS blocking=0 reviewer=independent-agent-1"
 
@@ -29,7 +30,7 @@ class Fake:
         self.pr = {"number": 7, "state": "OPEN", "isDraft": False, "baseRefName": "main", "headRefName": "feat/x", "headRefOid": HEAD,
                    "author": {"login": "chisanan232"}, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
                    "reviewDecision": "", "reviews": [], "isCrossRepository": False, "mergeCommit": None,
-                   "comments": [{"author": {"login": "chisanan232"}, "body": REVIEW}],
+                   "comments": [{"author": {"login": "chisanan232"}, "body": REVIEW}], "files": [],
                    "statusCheckRollup": green()}
         self.repo = {"nameWithOwner": "Chisanan232/r", "defaultBranchRef": {"name": "main"}, "isFork": False,
                      "viewerPermission": "ADMIN", "owner": {"login": "Chisanan232"}}
@@ -55,12 +56,17 @@ class Fake:
             return json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"pageInfo": {"hasNextPage": self.more_threads}, "nodes": self.threads}}}}})
         if a[0] == "api" and a[1].startswith("orgs/"):
             return self.org_role + "\n"
-        if a[0] == "api" and a[1].endswith("/contents/.github/workflows"):
-            if getattr(self, "workflows", None) is None:
-                raise RuntimeError("gh api repos failed: gh: Not Found (HTTP 404)")
-            if self.workflows == "error":
-                raise RuntimeError("gh api failed: HTTP 502")
-            return str(self.workflows) + "\n"
+        if a[0] == "api" and "/contents/.github/workflows?ref=" in a[1]:
+            ref = a[1].rpartition("?ref=")[2]
+            self.workflow_reads = getattr(self, "workflow_reads", []) + [ref]
+            answer = self.workflows.get(ref, self.workflows.get("*")) if isinstance(getattr(self, "workflows", None), dict) else getattr(self, "workflows", None)
+            if answer is None:
+                raise RuntimeError(f"gh api repos/{a[1].split('/')[1]}/{a[1].split('/')[2]}/contents/.github/workflows failed: gh: Not Found (HTTP 404)")
+            if answer == "error":
+                raise RuntimeError("gh api repos/x/y/contents/.github/workflows failed: HTTP 502")
+            if answer == "ratelimit":
+                raise RuntimeError("gh api repos/a/app404/contents/.github/workflows failed: gh: API rate limit exceeded (HTTP 403)")
+            return "" if answer == "empty" else str(answer) + "\n"
         if a[0] == "api" and "/commits/" in a[1]:
             return json.dumps(self.parents)
         raise AssertionError(a)
@@ -172,38 +178,68 @@ class Gate(unittest.TestCase):
         return [{"author": {"login": "chisanan232"}, "body": REVIEW}, {"author": {"login": "chisanan232"}, "body": record or self.NOCI}]
 
     def test_no_hosted_ci_exception_needs_flag_record_zero_checks_and_no_workflows(self):
-        self.refused(Fake(statusCheckRollup=[], comments=self.noci_comments()), "NO_CI_EVIDENCE")                  # flag missing
-        v, _, facts = run(Fake(statusCheckRollup=[], comments=self.noci_comments()), ci_exception=True)
+        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments()), "NO_CI_EVIDENCE")                  # flag missing
+        v, _, facts = run(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments()), ci_exception=True)
         self.assertEqual((v, facts["ci_exception"]), ("PASS", "no-hosted-ci"))
-        self.refused(Fake(statusCheckRollup=[], comments=[self.noci_comments()[0]]), "NO_CI_EVIDENCE", ci_exception=True)   # no record
+        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=[self.noci_comments()[0]]), "NO_CI_EVIDENCE", ci_exception=True)   # no record
         stale = self.noci_comments(self.NOCI.replace(HEAD, "d" * 40))
-        self.refused(Fake(statusCheckRollup=[], comments=stale), "NO_CI_EVIDENCE", ci_exception=True)            # another head
-        self.refused(Fake(statusCheckRollup=[], comments=self.noci_comments(self.NOCI.replace("PASS", "FAIL"))), "NO_CI_EVIDENCE", ci_exception=True)
+        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=stale), "NO_CI_EVIDENCE", ci_exception=True)            # another head
+        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(self.NOCI.replace("PASS", "FAIL"))), "NO_CI_EVIDENCE", ci_exception=True)
         other = [self.noci_comments()[0], {"author": {"login": "someone-else"}, "body": self.NOCI}]
-        self.refused(Fake(statusCheckRollup=[], comments=other), "NO_CI_EVIDENCE", ci_exception=True)            # not the authenticated user
+        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=other), "NO_CI_EVIDENCE", ci_exception=True)            # not the authenticated user
 
     def test_no_hosted_ci_exception_is_refused_where_workflows_exist_or_cannot_be_read(self):
-        for workflows in (3, 1, "error"):
+        for workflows in (3, 1, 0, "empty", "error", "ratelimit", {"main": None, "*": 2}, {HEAD: 2, "*": None}):
             with self.subTest(workflows=workflows):
-                self.refused(Fake(statusCheckRollup=[], comments=self.noci_comments(), workflows=workflows), "NO_CI_EVIDENCE", ci_exception=True)
+                self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(), workflows=workflows), "NO_CI_EVIDENCE", ci_exception=True)
+
+    def test_a_repository_name_containing_404_cannot_imitate_a_missing_directory(self):
+        fake = Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(), workflows="ratelimit")
+        self.assertTrue(omg.has_workflows(fake, "a/app404", "main"))                      # "404" only in the repo name and the path
+        self.refused(fake, "NO_CI_EVIDENCE", ci_exception=True)
+
+    def test_the_workflow_directory_is_read_at_the_base_and_at_the_head(self):
+        fake = Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments())
+        v, _, _ = run(fake, ci_exception=True)
+        self.assertEqual(v, "PASS")
+        self.assertEqual(sorted(fake.workflow_reads), sorted(["main", HEAD]))
+        # workflows only at the head (a PR that brings them) or only at the base both refuse
+        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(), workflows={HEAD: 1, "*": None}), "NO_CI_EVIDENCE", ci_exception=True)
+        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(), workflows={"main": 1, "*": None}), "NO_CI_EVIDENCE", ci_exception=True)
+
+    def test_a_pr_that_adds_or_touches_a_workflow_or_has_an_unknown_file_list_cannot_use_the_exception(self):
+        for files in ([{"path": ".github/workflows/ci.yml"}], [{"path": "src/a.py"}, {"path": ".github/workflows/x.yml"}], [], [{"path": f"f{i}"} for i in range(100)]):
+            with self.subTest(files=files[:2]):
+                self.refused(Fake(statusCheckRollup=[], comments=self.noci_comments(), files=files), "NO_CI_EVIDENCE", ci_exception=True)
+        v, _, _ = run(Fake(statusCheckRollup=[], comments=self.noci_comments(), files=SRC), ci_exception=True)
+        self.assertEqual(v, "PASS")
+
+    def test_a_check_that_ran_without_failing_still_blocks_the_exception(self):
+        for conclusion in ("SKIPPED", "NEUTRAL", "SUCCESS"):
+            with self.subTest(conclusion=conclusion):
+                v, _, facts = run(Fake(files=SRC, statusCheckRollup=[{"name": "t", "status": "COMPLETED", "conclusion": conclusion}], comments=self.noci_comments()), ci_exception=True)
+                self.assertNotIn("ci_exception", facts)
 
     def test_no_hosted_ci_exception_never_excuses_checks_that_ran_or_a_missing_review(self):
         bad = [{"name": "t", "status": "COMPLETED", "conclusion": "FAILURE"}]
-        self.refused(Fake(statusCheckRollup=bad, comments=self.noci_comments()), "CI_FAILED", ci_exception=True)
+        self.refused(Fake(files=SRC, statusCheckRollup=bad, comments=self.noci_comments()), "CI_FAILED", ci_exception=True)
         pending = [{"name": "t", "status": "IN_PROGRESS", "conclusion": ""}]
-        v, _, _ = run(Fake(statusCheckRollup=pending, comments=self.noci_comments()), ci_exception=True)
+        v, _, _ = run(Fake(files=SRC, statusCheckRollup=pending, comments=self.noci_comments()), ci_exception=True)
         self.assertEqual(v, "WAIT")
-        self.refused(Fake(statusCheckRollup=[], comments=[self.noci_comments()[1]]), "NO_REVIEW_EVIDENCE", ci_exception=True)
+        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=[self.noci_comments()[1]]), "NO_REVIEW_EVIDENCE", ci_exception=True)
 
     def test_the_two_ci_exceptions_do_not_substitute_for_each_other(self):
         unavailable = f"OWNER-MERGE-CI-UNAVAILABLE head={HEAD} cause=billing local_equivalent=PASS"
-        self.refused(Fake(statusCheckRollup=[], comments=self.noci_comments(unavailable)), "NO_CI_EVIDENCE", ci_exception=True)
-        self.refused(Fake(statusCheckRollup=[], comments=self.noci_comments()), "NO_CI_EVIDENCE", ci_unavailable=True)
+        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments(unavailable)), "NO_CI_EVIDENCE", ci_exception=True)
+        self.refused(Fake(files=SRC, statusCheckRollup=[], comments=self.noci_comments()), "NO_CI_EVIDENCE", ci_unavailable=True)
 
     def test_the_workflow_read_is_an_allowed_read_only_call(self):
-        omg.read_only(("api", "repos/Chisanan232/r/contents/.github/workflows", "--jq", "length"))
-        with self.assertRaises(RuntimeError):
-            omg.read_only(("api", "repos/Chisanan232/r/contents/.github/workflows/ci.yml"))
+        omg.read_only(("api", "repos/Chisanan232/r/contents/.github/workflows?ref=main", "--jq", "length"))
+        omg.read_only(("api", f"repos/Chisanan232/r/contents/.github/workflows?ref={'a' * 40}", "--jq", "length"))
+        for bad in ("repos/Chisanan232/r/contents/.github/workflows", "repos/Chisanan232/r/contents/.github/workflows/ci.yml?ref=main",
+                    "repos/Chisanan232/r/contents/.github/workflows?ref=../x", "repos/Chisanan232/r/contents/.github/workflows?ref=main&x=1"):
+            with self.subTest(bad), self.assertRaises(RuntimeError):
+                omg.read_only(("api", bad, "--jq", "length"))
 
     def test_ci_unavailable_never_excuses_a_genuine_failure(self):
         record = f"OWNER-MERGE-CI-UNAVAILABLE head={HEAD} cause=billing local_equivalent=PASS"

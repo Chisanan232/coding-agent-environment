@@ -157,7 +157,7 @@ _RO = r"repos/[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.{1,2}/)[A-Za-z0-9._-]{1,100}"
 _REF = r"(?!.*(?:^|/)\.\.(?:/|$))[A-Za-z0-9._/-]{1,200}"
 API_READS = [re.compile(x) for x in (
     _RO + rf"/compare/{_REF}\.\.\.{_REF}", _RO + r"/commits/[0-9a-f]{40}", _RO + r"/pulls/\d{1,9}/files",
-    _RO + r"/contents/(\.github/CODEOWNERS|CODEOWNERS|docs/CODEOWNERS)", _RO + r"/contents/\.github/workflows",
+    _RO + r"/contents/(\.github/CODEOWNERS|CODEOWNERS|docs/CODEOWNERS)", _RO + r"/contents/\.github/workflows\?ref=(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]{0,199}",
     r"orgs/[A-Za-z0-9][A-Za-z0-9-]{0,38}/memberships/[A-Za-z0-9][A-Za-z0-9-]{0,38}")]
 SAFE_FLAGS = {"--json", "--jq", "--repo"}
 GRAPHQL_VARS = {"query", "o", "r", "n"}
@@ -299,14 +299,28 @@ def _json(run, *args):
     return json.loads(run(*args))
 
 
-def has_workflows(run, repo):
-    """True when the repository defines hosted CI workflows, False only when the API says the directory does not exist (404).
-    Any other answer or error is treated as 'has workflows' (fail closed): the no-hosted-CI exception must never cover a
-    repository whose CI merely has not reported yet."""
+def has_workflows(run, repo, ref):
+    """True unless GitHub says, for this exact ref (the base branch or the head commit), that the repository has no
+    `.github/workflows` directory (HTTP 404 in the error text gh reports, after its own `failed:` prefix so that a repository
+    name cannot imitate it). Every other outcome counts as 'has workflows' (fail closed): a successful answer, empty output,
+    a rate limit, a 5xx, an unreadable reply. The no-hosted-CI exception must never cover a repository whose CI merely has
+    not reported yet. It speaks for GitHub Actions only: an external CI app is invisible here."""
     try:
-        return bool(run("api", f"repos/{repo}/contents/.github/workflows", "--jq", "length").strip() not in ("", "0"))
+        run("api", f"repos/{repo}/contents/.github/workflows?ref={ref}", "--jq", "length")
     except RuntimeError as error:
-        return not ("404" in str(error) or "Not Found" in str(error))
+        detail = str(error).partition(" failed: ")[2]
+        return not re.search(r"\bHTTP 404\b", detail)
+    return True
+
+
+def no_hosted_ci(run, repo, base, head, files):
+    """True only when no workflow exists at the base or at the reviewed head and the PR changes none (a PR that adds a
+    workflow which has not run yet must not use the exception). Unknown or truncated file lists refuse."""
+    if not files or len(files) >= 100:
+        return False
+    if any(str(f.get("path", "")).startswith(".github/workflows/") for f in files):
+        return False
+    return not has_workflows(run, repo, base) and not has_workflows(run, repo, head)
 
 
 def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_policy=None, ci_exception=False):
@@ -478,7 +492,7 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
         noci = [m for t in texts for m in NOCI_RE.findall(t) if m[0] == head and m[1] == "PASS"]
         if ci_unavailable and ci and not checks:
             facts["ci_exception"] = ci[-1][1]
-        elif ci_exception and noci and not checks and not has_workflows(run, repo):
+        elif ci_exception and noci and not checks and no_hosted_ci(run, repo, base, head, p.get("files") or []):
             facts["ci_exception"] = "no-hosted-ci"
         else:
             reasons.append("NO_CI_EVIDENCE: no completed checks on this head and no qualified CI_UNAVAILABLE_EXTERNAL record")
