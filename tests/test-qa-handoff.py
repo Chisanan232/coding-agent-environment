@@ -1489,12 +1489,21 @@ class IdentityTests(Base):
         self.assertEqual(self.run_ident(run_dir)[0], 12)
 
     def test_scheduled_job_present_is_invalid(self):
-        self.persistence = [["the crontab of qauser is not empty"]]         # appears while codex runs
+        self.persistence = [[], ["the crontab of qauser is not empty"]]      # appears while codex runs
         run_dir = self.prepare()
         code, out = self.run_ident(run_dir)
         self.assertEqual(code, 12, out)
         self.assertIn("scheduled jobs or launch agents", out)
         self.assertEqual(self.json(run_dir / "RUNMETA.json")["persistence"], ["the crontab of qauser is not empty"])
+
+    def test_scheduled_job_before_the_run_refuses_to_start(self):
+        self.persistence = [["launchd domain user/777 is present or could not be read (exit 0)"]]
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 11, out)
+        self.assertIn("not clean before the run", out)
+        self.assert_not_started(run_dir, "QA_INCOMPLETE")
+        self.assertEqual(list((self.x / "outbox").iterdir()), [])              # nothing was handed to the QA user
 
     def test_hop_2_runs_in_the_same_session_as_hops_0_and_1(self):
         run_dir = self.prepare()
@@ -1515,6 +1524,23 @@ class IdentityTests(Base):
         self.assertEqual(self.call("verdict", "--run-dir", str(run_dir))[0], 11)          # idempotent
         self.assertEqual(self.run_ident(run_dir)[0], qa.EXIT["REFUSED"])                   # a new attempt, not a re-run
 
+    def test_a_profile_changed_between_hops_fails_closed(self):
+        real = qa.hop
+
+        def hop_then_tamper(ident, argv, seconds):
+            out = real(ident, argv, seconds)
+            for cfg in self.qahome.glob(".local/state/coding-agent-environment/qa/*/codexhome/config.toml"):
+                with open(cfg, "a") as handle:
+                    handle.write('\n"/" = "read"\n')                       # widened after it was proved
+            return out
+        run_dir = self.prepare()
+        with unittest.mock.patch.object(qa, "hop", hop_then_tamper):
+            code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("profile changed", out)
+        self.assertFalse((self.fake_dir / "seen.json").exists())             # codex never started
+        self.assertEqual(self.json(run_dir / "RUNMETA.json")["exit_code"], qa.PROFILE_CHANGED)
+
     def test_two_interrupts_during_the_seal_keep_the_record_and_release_the_lock(self):
         import signal
 
@@ -1522,12 +1548,13 @@ class IdentityTests(Base):
             os.kill(os.getpid(), signal.SIGINT)
             os.kill(os.getpid(), signal.SIGTERM)
             return list(self.persistence.pop(0) if self.persistence else [])
+        self.persistence = [[]]                                               # the pre-run check stays clean
         run_dir = self.prepare()
         calls = {"n": 0}
 
         def persistence(ident):
             calls["n"] += 1
-            return interrupt_twice(ident)                                 # the seal's call
+            return [] if calls["n"] == 1 else interrupt_twice(ident)     # the second call is inside the seal
         with unittest.mock.patch.object(qa, "persistence_problems", persistence):
             code, out = self.run_ident(run_dir)
         self.assertNotEqual(code, 0, out)

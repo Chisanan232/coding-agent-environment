@@ -977,6 +977,7 @@ def sweep_identity(ident, recheck=0):
 
 
 STAGE_SECONDS = 60 * len(CONTROLS) + 60       # the QA-side confinement probe: up to 60 s per control
+PROFILE_CHANGED = 125                          # qa-exec: the profile is not the one hop 1 proved; codex was not started
 
 
 def exchange_problems(ident):
@@ -1165,6 +1166,11 @@ def run_identity_locked(args, run_dir, packet, source, ident):
     if swept:
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['%d QA-user processes survived the sweep before the run; '
                                                                'codex was not started' % swept])
+    # Nothing may be able to start as the QA user while the attempt is set up either (cron, at, launchd).
+    persistent = persistence_problems(ident)
+    if persistent:
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['the QA user is not clean before the run: ' + '; '.join(persistent[:3]),
+                                                               'codex was not started'])
     # Hop 0: the environment canary. The producer holds a synthetic sentinel in a sibling's environment, proves it can read
     # it itself, and the probe running as the QA user must not.
     setup = qis.Setup(ident.name, ident.uid, ident.home, ident.exchange)
@@ -1219,19 +1225,25 @@ def run_identity_locked(args, run_dir, packet, source, ident):
     if 'error' in stage:
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['qa-stage failed (%s); codex was not started' % clean(stage['error'], 40)])
     established, could_not_check, controls, problems = parse_confinement(stage.get('confinement'))
+    profile_sha = stage.get('profile_sha256')
+    if not (isinstance(profile_sha, str) and re.fullmatch(r'[0-9a-f]{64}', profile_sha)):
+        established, could_not_check = False, False
+        problems = problems + ['qa-stage did not report the digest of the profile it proved']
     write_private(run_dir / 'CONFINEMENT.json', {'profile': PROFILE, 'established': established, 'could_not_check': could_not_check,
                                                  'controls': controls, 'problems': problems, 'derived_by': 'producer',
-                                                 'qa_identity': ident.name})
+                                                 'qa_identity': ident.name, 'profile_sha256': profile_sha})
     if not established and could_not_check:
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['read confinement could not be checked: ' + '; '.join(problems[:3])])
     if not established:
         return write_result(run_dir, packet, 'QA_INVALID', ['read confinement not established: ' + '; '.join(problems[:3])])
     # Hop 2: codex itself. Its stdout is the pipe the producer captures; the QA side has moved its own stderr to a file.
     alarm = args.timeout + 60
-    argv = qis.qa_argv(ident.name, ident.home, [qis.PY, '-I', str(script), 'qa-exec'] + tail + ['--timeout', str(args.timeout)],
-                       alarm=alarm)
+    # qa-exec refuses to start codex unless the profile is byte-for-byte the one hop 1 proved (exit PROFILE_CHANGED).
+    argv = qis.qa_argv(ident.name, ident.home, [qis.PY, '-I', str(script), 'qa-exec'] + tail
+                       + ['--timeout', str(args.timeout), '--profile-sha256', profile_sha], alarm=alarm)
     manifest = read_run_json(run_dir / 'tree-manifest.json')
-    info = {'name': ident.name, 'uid': ident.uid, 'exchange': str(ident.exchange), 'attempt': attempt, 'script_sha256': script_sha}
+    info = {'name': ident.name, 'uid': ident.uid, 'exchange': str(ident.exchange), 'attempt': attempt, 'script_sha256': script_sha,
+            'profile_sha256': profile_sha}
     # Same session as hops 0 and 1 (new_session=False): sudo -n only sees the owner's cached credential from the
     # terminal session it was typed in. The QA side detaches itself (DETACH: setsid as the QA user).
     return launch(args, run_dir, argv, dict(HOP_ENV), '/', None, timeout=alarm + 60, new_session=False,
@@ -1252,6 +1264,8 @@ def seal(run_dir, ident, outbox, manifest, info, proc):
         extra['timed_out'] = True
     elif proc.returncode == 130:
         extra['interrupted'] = True
+    elif proc.returncode == PROFILE_CHANGED:
+        extra['profile_changed'] = True
     if proc.returncode not in (0, None):
         try:              # sudo's own stderr, producer-owned; the QA side's stderr goes to the outbox, never here
             refused = sudo_refused(read_nofollow(run_dir / 'stderr.log', MAX_INPUT_BYTES).decode('utf-8', 'replace'))
@@ -1311,7 +1325,7 @@ def stage_outbox(args):
         return {'login_missing': True}     # otherwise the probe would skip the login control, which the producer requires
     home = prepare_codex_home(outbox, home=Path(args.codex_home))
     record, _ = confinement_probe(args.codex_bin, outbox, isolated_env(outbox, home))
-    return {'confinement': record}
+    return {'confinement': record, 'profile_sha256': sha256_file(home / 'config.toml')}
 
 
 class QAStop(Exception):
@@ -1335,6 +1349,13 @@ def qa_exec(args):
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGALRM):
         signal.signal(sig, stop)
     try:
+        try:
+            profile = sha256_file(Path(args.codex_home) / 'config.toml')
+        except OSError:
+            profile = None
+        if profile != args.profile_sha256:
+            sys.stderr.write('qa-exec: the permission profile changed since it was proved; codex not started\n')
+            return PROFILE_CHANGED
         with open_regular(inbox / 'prompt.txt') as prompt:
             try:
                 proc = subprocess.Popen(codex_argv(args.codex_bin, outbox), cwd=str(outbox / 'source'),
@@ -1483,6 +1504,8 @@ def identity_gate(run_dir, meta):
             ok = False
         if not ok:
             problems.append('%s is missing or not established' % name)
+    if meta.get('profile_changed') is not None and meta.get('profile_changed') is not False:
+        problems.append('the permission profile changed between the confinement probe and codex; codex was not started')
     stragglers = meta.get('stragglers')
     if type(stragglers) is not int or stragglers != 0:
         problems.append('QA-user processes survived the sweep or it could not run (%s)' % clean(stragglers, 20))
@@ -1634,6 +1657,7 @@ def build_parser():
         q.add_argument('--codex-bin', default='codex')
         if name == 'qa-exec':
             q.add_argument('--timeout', type=int, default=1800)
+            q.add_argument('--profile-sha256', required=True)
     return parser
 
 
