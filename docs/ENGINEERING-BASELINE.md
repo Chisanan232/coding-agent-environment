@@ -28,6 +28,15 @@ Standing contract (universal; specialised procedure loads only when it applies):
 - Secrets are opaque capabilities: use them, verify presence only, never print or log a value.
 <!-- /block:standing-contract -->
 
+<!-- block:campaign-completion -->
+Campaign completion (mission and stop condition; detailed loop in `decision-delegation`):
+
+- The mission is evidence-backed technical `READY_FOR_RELEASE` of the approved scope. A merged PR, passing test batch, review, checkpoint, handoff or status report is an intermediate result, never completion: after each, select and run the next executable task. Status accompanies work, never replaces it. Release, deployment or publication needs the founder's separate explicit approval.
+- When blocked, find whether the blocker covers one task or all remaining scope and continue the independent work. For a CI, resource or dependency wait use a real watcher or resume mechanism and record its identifier, trigger, expiry and next action; claim automatic resumption only if it exists. If nothing can proceed, report the exact dependency, evidence and smallest intervention, never completion.
+- A refused heavy admission does not forbid light work (docs, reviews, focused tests, ticket reconciliation): queue the heavy task through the admission mechanism, work the rest, resume on grant. Never override a resource safety limit or touch another owner's workload.
+- Do not re-ask for already-authorized work. Ask only for material product or scope decisions, actions outside authorization, or unavoidable credential or host interaction, with the proposal, recommendation, impact and minimal action, and keep working.
+<!-- /block:campaign-completion -->
+
 <!-- block:merge-sequence -->
 Merge an eligible PR only with the `merge_command` that `scripts/owner-merge-gate.py check --settings` prints (the validating `owner-merge-runner` when offered, else the pinned `gh pr merge`, which asks); never choose another merge spelling or interface (including the GitHub MCP merge tool) to avoid a prompt or a refusal. The merge is its own tool call: never combine it with a review comment, CI polling, a readback (`gh pr view`, `gh api`), a pipe, `head`/`tail`, `&&`, `;` or any other chaining. The order is: independent review, check the exact PR head, verify required CI, run `owner-merge-gate.py check`, write the review evidence at the printed `evidence_path` (its own call; only by an authorized path, never self-approved), run the printed `merge_command` alone, then verify the merged state with `owner-merge-gate.py verify` in a separate call. A compound shell call matches no merge rule, so the host asks about the whole thing; that is a workflow error, not a runner failure.
 <!-- /block:merge-sequence -->
