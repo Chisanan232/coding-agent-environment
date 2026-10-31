@@ -64,9 +64,19 @@ class GrantEnv(unittest.TestCase):
         self.assertEqual(da.grant_env(budget(), fields(), env), {'CARGO_BUILD_JOBS': '2', 'RUST_TEST_THREADS': '4'})
         self.assertEqual(da.grant_env(budget(), fields(), {'CARGO_BUILD_JOBS': '4'})['CARGO_BUILD_JOBS'], '4')
 
-    def test_unusable_existing_values_take_the_grant(self):
-        for bad in ('', 'many', '0', '-1', '2.5'):
-            self.assertEqual(da.grant_env(budget(), fields(), {'CARGO_BUILD_JOBS': bad})['CARGO_BUILD_JOBS'], '4', bad)
+    def test_unset_and_empty_take_the_grant(self):
+        for value in (None, '', '   '):
+            env = {} if value is None else {'CARGO_BUILD_JOBS': value}
+            self.assertEqual(da.grant_env(budget(), fields(), env)['CARGO_BUILD_JOBS'], '4', value)
+
+    def test_a_setting_that_is_not_a_positive_integer_is_never_touched(self):
+        for bad in ('0', '-1', 'default', 'num-cpus-2', 'abc', '2.5', '+3', '\u0663'):
+            env = {'CARGO_BUILD_JOBS': bad, 'RUST_TEST_THREADS': bad, 'NEXTEST_TEST_THREADS': bad}
+            self.assertEqual(da.grant_env(budget('build-workspace'), fields('build-workspace'), env), {}, bad)
+
+    def test_only_the_unusable_variable_is_left_alone(self):
+        out = da.grant_env(budget(), fields(), {'CARGO_BUILD_JOBS': '-1'})
+        self.assertEqual(out, {'RUST_TEST_THREADS': '4'})
 
     def test_the_cap_is_still_one_lane(self):
         self.assertEqual(da.HEAVY_LANES, {'emergency': 0, 'low': 0, 'stable': 1, 'wide': 1})
@@ -123,6 +133,25 @@ class RunEnv(queue_tests.QueueBase):
         self.assertEqual(self.seen, [])
         self.assertIsNone(os.environ.get('CARGO_BUILD_JOBS'))
         del proc
+
+    def test_queue_claim_takes_the_class_from_the_entry_not_the_caller(self):
+        self.assertTrue(self.enqueue(declared=fields())['ok'])
+        qid = da.queue_advance(self.path, lambda: 400 * GIB, now=self.now)['granted'][0]
+        entry = self.entries()[qid]
+        kw = dict(pid=os.getpid(), now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda p, a: None, host_fn=self.host_fn())
+        # A claim declaring another class is refused before any export (the entry keeps the grant) ...
+        refused = da.queue_claim(self.path, qid, entry['label'], entry['bytes'], shadow.ARGV, str(self.worktree), lambda: 400 * GIB,
+                                 declared=fields('container-suite'), **kw)
+        self.assertFalse(refused['ok'])
+        self.assertIsNone(os.environ.get('CARGO_BUILD_JOBS'))
+        # ... and an accepted claim passes the entry's recorded fields to the exporter, whatever the caller held.
+        with unittest.mock.patch.object(da, 'apply_grant_env') as exporter:
+            ok = da.queue_claim(self.path, qid, entry['label'], entry['bytes'], shadow.ARGV, str(self.worktree), lambda: 400 * GIB,
+                                declared=fields(), **kw)
+        self.assertTrue(ok['ok'], ok)
+        (_, used), _ = exporter.call_args
+        self.assertEqual(used['class'], 'build-crate')
+        self.assertEqual(used['cpu_slots'], entry['cpu_slots'])
 
     def test_queue_claim_exports_the_same_grant(self):
         self.assertTrue(self.enqueue(declared=fields())['ok'])
