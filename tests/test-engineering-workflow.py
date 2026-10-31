@@ -211,7 +211,7 @@ class EngineeringWorkflowContract(unittest.TestCase):
             "`scripts/memory-admission.py check --weight heavy`",
             "A single swap-used figure is history, not proof of current exhaustion",
             "do not change the disk gate's thresholds",
-            "Run one admitted heavy lane at a time",
+            "Run one admitted heavy lane today",
             "Never kill another active session or delete its worktree, runtime, cache, container, reservation or scratch",
             "Age alone never justifies deletion",
             "never delete unknown or active work to reach an admission threshold",
