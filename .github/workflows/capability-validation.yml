@@ -105,6 +105,7 @@ jobs:
           python3 tests/test-disk-admission-gate.py
           python3 tests/test-admission-queue.py
           python3 tests/test-disk-admission.py
+          python3 tests/test-admission-measurements.py
           python3 tests/test-hook-rollout.py
           python3 tests/test-owner-merge-gate.py
           python3 tests/test-owner-merge-gate-local.py
