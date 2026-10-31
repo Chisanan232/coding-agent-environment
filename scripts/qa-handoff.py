@@ -1435,7 +1435,7 @@ def no_gui_session_problems(ident, domain):
     except (OSError, subprocess.SubprocessError) as error:
         return [head + 'ps not run (%s)' % type(error).__name__]
     owner = (console.stdout or '').strip()
-    if console.returncode != 0 or not owner.isdigit():
+    if console.returncode != 0 or not (owner.isascii() and owner.isdigit()):
         return [head + 'console owner unreadable rc=%d out="%s" err="%s"' % (
             console.returncode, ascii_field(console.stdout, 8), ascii_field(console.stderr, 24))]
     if int(owner) == ident.uid:
