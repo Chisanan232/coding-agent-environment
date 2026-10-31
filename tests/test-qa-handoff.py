@@ -1156,8 +1156,13 @@ class IdentityGuardTests(Base):
             self.assertEqual(argv[:4], [qa._qis().SUDO, "-n", "-u", "qauser"])
             name = os.path.basename(argv[4])
             if name == "launchctl":
-                self.assertEqual(argv[5:], ["print", "%s/%d" % (argv[-1].split("/")[0], ident.uid)])
-                name += ":" + argv[-1].split("/")[0]
+                target = argv[-1].split("/")
+                self.assertEqual(argv[5], "print")
+                if len(target) == 3:                                        # a service of a domain: user/<uid>/<label>
+                    name = "service"
+                else:
+                    self.assertEqual(argv[5:], ["print", "%s/%d" % (target[0], ident.uid)])
+                    name += ":" + target[0]
             answer = answers.get(name, (0, "", ""))
             if answer == "timeout":
                 raise subprocess.TimeoutExpired(argv, 30)
@@ -1193,22 +1198,609 @@ class IdentityGuardTests(Base):
                 self.assertTrue(qa.persistence_problems(ident._replace(uid=uid)))
             self.assertEqual(calls, [])                                       # refused before any subprocess
 
-    def test_a_straggler_respawned_after_the_settle_is_counted(self):
-        ident = qa.Identity("qauser", os.getuid() + 4321, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
-        listings = [(1, ""), (0, "4242\n")]          # gone at first, then launchd brings one back after its throttle
+    IDENT = qa.Identity("qauser", os.getuid() + 4321, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
+
+    def sweep_with(self, tables, paths, recheck=0, gone=(), stderr="", trusted=()):
+        """Run sweep_identity against fake `ps` tables (lists of "pid ppid stat" rows) and a pid -> executable path map."""
+        tables = list(tables)
         slept = []
 
         def fake_run(argv, **kwargs):
-            if argv[0] == qa.PGREP:
-                rc, out = listings.pop(0) if listings else (1, "")
-                return subprocess.CompletedProcess(argv, rc, out, "")
+            if argv[0] == qa.PS:
+                rows = tables.pop(0) if len(tables) > 1 else tables[0]
+                return subprocess.CompletedProcess(argv, 0 if rows else 1, "".join(r + "\n" for r in rows), stderr)
             return subprocess.CompletedProcess(argv, 0, "", "")
+
+        def fake_kill(pid, sig):
+            if pid in gone:
+                raise ProcessLookupError
         with unittest.mock.patch.object(qa.subprocess, "run", fake_run), \
+                unittest.mock.patch.object(qa, "executable_path", lambda pid: paths.get(pid)), \
+                unittest.mock.patch.object(qa, "verified_service_pids", lambda ident: set(trusted)), \
+                unittest.mock.patch.object(qa.os, "kill", fake_kill), \
                 unittest.mock.patch.object(qa.time, "sleep", slept.append):
-            self.assertEqual(qa.sweep_identity(ident, recheck=qa.RESPAWN_SECONDS), 1)
+            return qa.sweep_identity(self.IDENT, recheck=recheck), slept
+
+    # The eight running services and their programs on the first real QA account (macOS 27.0.1, 2026-10-30), all PPID 1.
+    SERVICES = {28114: "/usr/sbin/distnoted", 28127: "/usr/sbin/cfprefsd", 28135: "/usr/libexec/pkd", 28152: "/usr/libexec/lsd",
+                28171: "/usr/libexec/trustd", 28582: "/usr/libexec/secd", 29055: "/usr/libexec/containermanagerd",
+                28121: "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/"
+                       "Versions/A/Support/mdbulkimport"}
+
+    def test_running_services_of_the_verified_domain_are_not_survivors(self):
+        rows = ["%d 1 Ss" % pid for pid in self.SERVICES]
+        self.assertEqual(self.sweep_with([rows], self.SERVICES, trusted=self.SERVICES)[0], 0)
+
+    def test_an_on_demand_service_started_later_is_not_a_survivor_either(self):
+        paths = dict(self.SERVICES)
+        paths[31000] = "/System/Library/PrivateFrameworks/Spotlight.framework/Versions/A/Support/mdworker_shared"
+        rows = ["%d 1 Ss" % pid for pid in paths]
+        self.assertEqual(self.sweep_with([rows], paths, trusted=paths)[0], 0)     # no per-binary table to go stale
+
+    def test_only_processes_that_are_running_services_of_the_verified_domain_are_tolerated(self):
+        rows = ["%d 1 Ss" % pid for pid in self.SERVICES] + ["500 1 S", "501 777 S", "502 1 S", "503 1 S"]
+        paths = dict(self.SERVICES)
+        paths.update({500: "/bin/sleep", 501: "/usr/libexec/pkd", 502: "/Users/qauser/evil", 503: "/usr/libexec/lsd"})
+        trusted = set(self.SERVICES) | {501, 502}
+        # 500: a system path at PPID 1 but not a service of the domain (a name set through argv[0] changes nothing);
+        # 501: a trusted pid, but not a child of launchd; 502: a trusted pid whose executable is outside the system prefixes;
+        # 503: another process running a service binary that launchd does not list as running
+        self.assertEqual(self.sweep_with([rows], paths, trusted=trusted)[0], 4)
+
+    def test_an_unverifiable_domain_trusts_nothing(self):
+        rows = ["%d 1 Ss" % pid for pid in self.SERVICES]
+        self.assertEqual(self.sweep_with([rows], self.SERVICES, trusted=())[0], len(self.SERVICES))
+
+    def test_an_exited_unreaped_process_and_one_that_vanished_are_not_survivors(self):
+        rows = ["600 1 Z", "601 1 S", "602 1 S"]
+        self.assertEqual(self.sweep_with([rows], {602: "/bin/sleep"}, gone=(601,))[0], 1)   # 600 zombie; 601 gone; 602 runs
+
+    def test_an_unreadable_path_of_a_process_that_still_exists_is_a_survivor(self):
+        self.assertEqual(self.sweep_with([["700 1 S"]], {})[0], 1)
+
+    def test_a_failed_ps_that_exits_1_is_not_zero_survivors(self):
+        # ps exits 1 with an empty table and a message for an unknown uid or a bad option: that is a failure, not "none"
+        self.assertIsNone(self.sweep_with([[]], {}, stderr="ps: No ruser name or ID matches\n")[0])
+        self.assertEqual(self.sweep_with([[]], {})[0], 0)                      # a genuinely empty table is zero
+
+    def test_an_unreadable_process_table_fails_the_sweep(self):
+        for bad in (["not a row"], ["12 x S"]):
+            self.assertIsNone(self.sweep_with([bad], {})[0])
+
+    def test_a_straggler_respawned_after_the_settle_is_counted(self):
+        # gone at first, then launchd brings one back after its throttle; the services alone never count
+        services = ["%d 1 Ss" % pid for pid in self.SERVICES]
+        paths = dict(self.SERVICES)
+        paths[4242] = "/bin/sleep"
+        count, slept = self.sweep_with([services, services + ["4242 1 S"]], paths, recheck=qa.RESPAWN_SECONDS, trusted=self.SERVICES)
+        self.assertEqual(count, 1)
         self.assertIn(qa.RESPAWN_SECONDS, slept)
         self.assertGreater(qa.RESPAWN_SECONDS, qa.SETTLE_SECONDS)
         self.assertLessEqual(qa.RESPAWN_SECONDS, 30)                  # bounded
+
+    @unittest.skipUnless(sys.platform == "darwin", "libproc proc_pidpath exists only on macOS; the QA identity is macOS-only")
+    def test_executable_path_is_the_kernel_path_not_argv0(self):
+        proc = subprocess.Popen(["/bin/sh", "-c", "exec -a /usr/libexec/pkd /bin/sleep 30"])
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        time.sleep(0.5)
+        self.assertEqual(qa.executable_path(proc.pid), "/bin/sleep")                       # not the name it claims
+        self.assertIsNone(qa.executable_path(99999999))
+
+    def test_executable_path_is_none_where_libproc_does_not_exist(self):
+        with unittest.mock.patch("ctypes.CDLL", side_effect=OSError("no libproc")):
+            self.assertIsNone(qa.executable_path(os.getpid()))
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+REAL_DOMAIN = (FIXTURES / "qa-launchd-user-domain.txt").read_text()            # launchctl print user/530 on the first real QA account
+REAL_SERVICE = (FIXTURES / "qa-launchd-service-cfprefsd.txt").read_text()      # launchctl print user/530/com.apple.cfprefsd.xpc.agent
+REAL_SEALED_PROBLEM = qa.sealed_problem
+REAL_RUNNING = {28171, 28121, 28582, 28152, 29055, 28127, 28135, 28114}
+
+
+class LaunchdDomainTests(unittest.TestCase):
+    """The QA user's launchd user domain: present is normal, but every service must be defined by a system-volume plist."""
+
+    IDENT = qa.Identity("qauser", 530, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
+
+    def setUp(self):
+        if os.getuid() == 530:
+            self.skipTest("fixture uid is the running uid")
+        # The real plists exist only on a Mac; sealed_problem has its own tests below.
+        patcher = unittest.mock.patch.object(qa, "service_files_problem", lambda text: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def runner(self, domain=REAL_DOMAIN, service=REAL_SERVICE, per_label=None, rc=0, domain_rc=0, domain_err="", service_err=""):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv[-1])
+            self.assertEqual(argv[:4], [qa._qis().SUDO, "-n", "-u", "qauser"])
+            self.assertEqual(argv[4:6], [qa.LAUNCHCTL, "print"])
+            target = argv[-1]
+            if target == "user/530":
+                return subprocess.CompletedProcess(argv, domain_rc, domain, domain_err)
+            label = target.split("/", 2)[2]
+            text = (per_label or {}).get(label, service).replace("user/530/com.apple.cfprefsd.xpc.agent = {", "user/530/%s = {" % label, 1)
+            return subprocess.CompletedProcess(argv, rc, text, service_err)
+        return fake_run, calls
+
+    def test_the_real_domain_output_parses(self):
+        services, problems = qa.parse_user_domain(REAL_DOMAIN, 530)
+        self.assertEqual(problems, [])
+        self.assertEqual(len(services), 48)
+        self.assertTrue(all(label.startswith("com.apple.") for _, label in services))
+        self.assertEqual({pid for pid, _ in services if pid}, REAL_RUNNING)
+
+    def test_a_domain_that_cannot_be_trusted_is_a_problem(self):
+        bad = {
+            "wrong header": REAL_DOMAIN.replace("user/530 = {", "user/531 = {", 1),
+            "no services block": REAL_DOMAIN.replace("services = {", "svc = {", 1),
+            "unmanaged process": REAL_DOMAIN.replace("unmanaged processes = {\n", "unmanaged processes = {\n\t\t4242 /tmp/x\n", 1),
+            "no unmanaged block": REAL_DOMAIN.replace("unmanaged processes = {", "other = {", 1),
+            "garbled row": REAL_DOMAIN.replace("com.apple.lsd\n", "com.apple.lsd extra tokens here\n", 1),
+            "count mismatch": REAL_DOMAIN.replace("service count = 48", "service count = 47", 1),
+            "label with a path": REAL_DOMAIN.replace("com.apple.lsd\n", "../../x\n", 1),
+        }
+        for name, text in bad.items():
+            with self.subTest(name):
+                self.assertTrue(qa.parse_user_domain(text, 530)[1], name)
+        self.assertTrue(qa.parse_user_domain("", 530)[1])
+
+    def test_a_service_is_trusted_only_when_launchd_reports_a_system_volume_plist(self):
+        self.assertIsNone(qa.service_problem(REAL_SERVICE, 530, "com.apple.cfprefsd.xpc.agent"))
+        self.assertIsNone(qa.service_problem(REAL_SERVICE, 530, "com.apple.cfprefsd.xpc.agent"))
+        self.assertEqual(qa.service_problem(REAL_SERVICE, 530, "com.apple.lsd"), "unexpected header")
+        path = "\tpath = /System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist\n"
+        for name, text in {
+            "plist in the user's home": REAL_SERVICE.replace(path, "\tpath = /Users/qauser/Library/LaunchAgents/com.apple.lsd.plist\n"),
+            "plist in a temp dir": REAL_SERVICE.replace(path, "\tpath = /private/tmp/x.plist\n"),
+            "no plist path (submitted job)": REAL_SERVICE.replace(path, ""),
+            "traversal": REAL_SERVICE.replace(path, "\tpath = /System/../Users/qauser/x.plist\n"),
+            "not a plist": REAL_SERVICE.replace(path, "\tpath = /System/Library/LaunchAgents/x.sh\n"),
+            "a daemon": REAL_SERVICE.replace("\ttype = LaunchAgent", "\ttype = LaunchDaemon"),
+            "program outside the system": REAL_SERVICE.replace("\tprogram = /usr/sbin/cfprefsd", "\tprogram = /Users/qauser/evil"),
+            "empty": "",
+        }.items():
+            with self.subTest(name):
+                self.assertIsNotNone(qa.service_problem(text, 530, "com.apple.cfprefsd.xpc.agent"))
+
+    def test_the_writable_data_volume_is_not_the_system_volume(self):
+        path = "\tpath = /System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist\n"
+        for name, text in {
+            "plist on the data volume": REAL_SERVICE.replace(path, "\tpath = /System/Volumes/Data/Users/qauser/e.plist\n"),
+            "program on the data volume": REAL_SERVICE.replace("\tprogram = /usr/sbin/cfprefsd", "\tprogram = /System/Volumes/Data/Users/qauser/x"),
+            "other system tree": REAL_SERVICE.replace(path, "\tpath = /System/Cryptexes/App/x.plist\n"),
+        }.items():
+            with self.subTest(name):
+                self.assertIsNotNone(qa.service_problem(text, 530, "com.apple.cfprefsd.xpc.agent"))
+        self.assertFalse(any(p.startswith(("/System/Volumes/", "/System/Cryptexes/")) for p in qa.SERVICE_PROGRAM_PREFIXES))
+        self.assertEqual(qa.SERVICE_PLIST_DIRS, ("/System/Library/LaunchAgents/", "/System/Library/LaunchDaemons/"))
+
+    def test_writable_parts_of_system_library_and_unsafe_programs_are_refused(self):
+        path = "\tpath = /System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist\n"
+        program = "\tprogram = /usr/sbin/cfprefsd"
+        for name, text in {
+            "plist in the mode-777 AssetsV2 download directory": REAL_SERVICE.replace(path, "\tpath = /System/Library/AssetsV2/downloadDir/x.plist\n"),
+            "plist under System Library Caches": REAL_SERVICE.replace(path, "\tpath = /System/Library/Caches/x.plist\n"),
+            "plist in a subdirectory of LaunchAgents": REAL_SERVICE.replace(path, "\tpath = /System/Library/LaunchAgents/sub/x.plist\n"),
+            "plist with a traversal": REAL_SERVICE.replace(path, "\tpath = /System/Library/LaunchAgents/../AssetsV2/downloadDir/x.plist\n"),
+            "a service with arguments only": REAL_SERVICE.replace(program + "\n", ""),
+            "program with a traversal": REAL_SERVICE.replace(program, "\tprogram = /usr/libexec/../../Users/qauser/x"),
+            "an interpreter as the program": REAL_SERVICE.replace(program, "\tprogram = /usr/libexec/python3"),
+            "a shell as the program": REAL_SERVICE.replace(program, "\tprogram = /System/Library/CoreServices/sh"),
+            "a general tool directory": REAL_SERVICE.replace(program, "\tprogram = /usr/bin/python3"),
+            "a relative program": REAL_SERVICE.replace(program, "\tprogram = cfprefsd"),
+        }.items():
+            with self.subTest(name):
+                self.assertIsNotNone(qa.service_problem(text, 530, "com.apple.cfprefsd.xpc.agent"), name)
+        for directory in ("LaunchAgents", "LaunchDaemons"):
+            self.assertIsNone(qa.service_problem(REAL_SERVICE.replace("/LaunchAgents/", "/%s/" % directory), 530, "com.apple.cfprefsd.xpc.agent"))
+
+    class FakeFs:
+        """A virtual file tree for sealed_problem: path -> (kind, uid, mode); a link is ('l', uid, mode, target)."""
+
+        def __init__(self, tree):
+            self.tree = tree
+
+        def lstat(self, path):
+            if path not in self.tree:
+                raise FileNotFoundError(path)
+            entry = self.tree[path]
+            kind = {"d": stat.S_IFDIR, "f": stat.S_IFREG, "l": stat.S_IFLNK}[entry[0]]
+            return os.stat_result((kind | entry[2], 1, 1, 1, entry[1], 0, 1, 0, 0, 0))
+
+        def realpath(self, path):
+            parts, resolved = path.strip("/").split("/"), ""
+            for part in parts:
+                resolved += "/" + part
+                entry = self.tree.get(resolved)
+                if entry and entry[0] == "l":
+                    resolved = entry[3]
+            return resolved
+
+        def patch(self):
+            return unittest.mock.patch.multiple(qa.os, lstat=self.lstat), unittest.mock.patch.object(qa.os.path, "realpath", self.realpath)
+
+    def sealed(self, path, want, tree, roots=("/System/Library/",)):
+        lstat, realpath = self.FakeFs(tree).patch()
+        with lstat, realpath:
+            return REAL_SEALED_PROBLEM(path, want, roots)
+
+    @staticmethod
+    def system_tree(*extra):
+        tree = {"/System": ("d", 0, 0o755), "/System/Library": ("d", 0, 0o755), "/usr": ("d", 0, 0o755), "/usr/libexec": ("d", 0, 0o755)}
+        for path, entry in extra:
+            tree[path] = entry
+        return tree
+
+    def test_a_path_is_sealed_only_if_every_component_is_root_owned_and_closed(self):
+        agent = "/System/Library/LaunchAgents/com.apple.x.plist"
+        good = self.system_tree(("/System/Library/LaunchAgents", ("d", 0, 0o755)), (agent, ("f", 0, 0o644)))
+        self.assertIsNone(self.sealed(agent, "file", good))
+        xpc = "/System/Library/Frameworks/M.framework/Versions/A/XPCServices/x.xpc"
+        tree = self.system_tree(*[(p, ("d", 0, 0o755)) for p in ("/System/Library/Frameworks", "/System/Library/Frameworks/M.framework",
+                                                                    "/System/Library/Frameworks/M.framework/Versions",
+                                                                    "/System/Library/Frameworks/M.framework/Versions/A",
+                                                                    "/System/Library/Frameworks/M.framework/Versions/A/XPCServices", xpc)])
+        self.assertIsNone(self.sealed(xpc, "dir", tree))
+        self.assertIsNotNone(self.sealed(xpc, "file", tree))                    # a bundle is a directory, not a file
+        downloads = "/System/Library/AssetsV2/downloadDir/XPCServices/x.xpc"    # mode 777 on a real host: a firmlink into the data volume
+        bad = self.system_tree(("/System/Library/AssetsV2", ("d", 0, 0o755)), ("/System/Library/AssetsV2/downloadDir", ("d", 0, 0o777)),
+                               ("/System/Library/AssetsV2/downloadDir/XPCServices", ("d", 0, 0o755)), (downloads, ("d", 0, 0o755)))
+        self.assertIn("downloadDir", self.sealed(downloads, "dir", bad))
+        self.assertLessEqual(len(self.sealed(downloads, "dir", bad)), 70)
+        for name, change in {"owned by a user": ("d", 530, 0o755), "group writable": ("d", 0, 0o775), "world writable": ("d", 0, 0o757)}.items():
+            with self.subTest(name):
+                broken = dict(good)
+                broken["/System/Library/LaunchAgents"] = change
+                self.assertIsNotNone(self.sealed(agent, "file", broken))
+        missing = dict(good)
+        del missing["/System/Library/LaunchAgents"]
+        self.assertIn("cannot read", self.sealed(agent, "file", missing))
+
+    def test_links_are_followed_only_to_a_target_that_is_sealed_too(self):
+        program = "/System/Library/F.framework/Resources/helper"
+        tree = self.system_tree(("/System/Library/F.framework", ("d", 0, 0o755)), ("/System/Library/F.framework/Versions", ("d", 0, 0o755)),
+                                ("/System/Library/F.framework/Versions/A", ("d", 0, 0o755)),
+                                ("/System/Library/F.framework/Versions/A/Resources", ("d", 0, 0o755)),
+                                ("/System/Library/F.framework/Versions/A/Resources/helper", ("f", 0, 0o755)),
+                                ("/System/Library/F.framework/Resources", ("l", 0, 0o755, "/System/Library/F.framework/Versions/A/Resources")),
+                                (program, ("f", 0, 0o755)))          # the file is reached through the Resources link
+        fs = self.FakeFs(tree)
+        with unittest.mock.patch.object(qa.os, "lstat", fs.lstat), unittest.mock.patch.object(qa.os.path, "realpath", fs.realpath):
+            self.assertIsNone(REAL_SEALED_PROBLEM(program, "file", ("/System/Library/",)))
+            tree["/System/Library/F.framework/Resources"] = ("l", 0, 0o755, "/Users/qauser/evil")   # a link out of the sealed tree
+            self.assertIsNotNone(REAL_SEALED_PROBLEM(program, "file", ("/System/Library/",)))
+            tree["/System/Library/F.framework/Resources"] = ("l", 0, 0o755, "/System/Library/F.framework/Versions/A/Resources")
+            tree["/System/Library/F.framework/Versions/A/Resources"] = ("d", 0, 0o777)                # a writable real target
+            self.assertIsNotNone(REAL_SEALED_PROBLEM(program, "file", ("/System/Library/",)))
+
+    def test_paths_outside_the_roots_or_with_traversal_are_refused_without_touching_the_disk(self):
+        for path in ("/Users/qauser/x.plist", "/System/Volumes/Data/Users/q/x", "/System/Library/../../Users/q/x", "relative/x", "/usr/bin/python3"):
+            with self.subTest(path):
+                self.assertIsNotNone(REAL_SEALED_PROBLEM(path, "file"))
+        self.assertIsNone(self.sealed("/usr/libexec/lsd", "file", self.system_tree(("/usr/libexec/lsd", ("f", 0, 0o755))), ("/usr/libexec/", "/usr/sbin/")))
+
+    def test_interpreters_are_matched_by_name_without_version_not_by_prefix(self):
+        for name in ("python3", "Python", "python3.9", "perl5.34", "sh", "bash", "ZSH", "osascript", "env", "node18", "swift-frontend"):
+            with self.subTest(name):
+                self.assertTrue(qa.is_interpreter("/usr/libexec/" + name), name)
+        for name in ("shortcutsd", "sharingd", "opendirectoryd", "envd", "pkd", "cfprefsd", "mdbulkimport", "nodeagentd", "swiftd"):
+            with self.subTest(name):
+                self.assertFalse(qa.is_interpreter("/usr/libexec/" + name), name)
+
+    def test_the_real_xpc_service_header_is_accepted(self):
+        xpc = (FIXTURES / "qa-launchd-service-xpc-mediaaccessibilityd.txt").read_text()
+        label = "com.apple.accessibility.mediaaccessibilityd"
+        self.assertIsNone(qa.service_problem(xpc, 530, label))
+        path = "/System/Library/Frameworks/MediaAccessibility.framework/Versions/A/XPCServices/com.apple.accessibility.mediaaccessibilityd.xpc"
+        for name, text in {
+            "a bundle outside XPCServices": xpc.replace("/XPCServices/com.apple", "/Other/com.apple", 1).replace("/XPCServices/" + label, "/Other/" + label),
+            "a bundle under the writable data volume": xpc.replace(path, "/System/Volumes/Data/Users/q/XPCServices/x.xpc"),
+            "a bundle in the AssetsV2 download directory": xpc.replace(path, "/System/Library/AssetsV2/downloadDir/x.xpc"),
+            "a program outside its bundle": xpc.replace("\tprogram = " + path + "/Contents", "\tprogram = /usr/libexec/lsd#"),
+            "a program with traversal": xpc.replace(path + "/Contents/MacOS", path + "/Contents/../../x"),
+            "an interpreter inside the bundle": xpc.replace("Contents/MacOS/" + label, "Contents/MacOS/python3"),
+            "a type that is neither": xpc.replace("type = XPCService", "type = Application"),
+            "a second type line": xpc.replace("\tstate = running\n", "\tstate = running\n\ttype = XPCService\n", 1),
+            "an XPC type on a launch plist path": xpc.replace(path, "/System/Library/LaunchAgents/x.plist"),
+            "a LaunchAgent type on a bundle path": xpc.replace("type = XPCService", "type = LaunchAgent"),
+            "no program": xpc.replace("\tprogram = ", "\tprogam = "),
+        }.items():
+            with self.subTest(name):
+                self.assertIsNotNone(qa.service_problem(text, 530, label), name)
+
+    def test_a_loaded_idle_xpc_service_outside_the_system_volume_fails_the_domain(self):
+        xpc = (FIXTURES / "qa-launchd-service-xpc-mediaaccessibilityd.txt").read_text()
+        evil = xpc.replace("/System/Library/Frameworks/MediaAccessibility.framework/Versions/A/XPCServices", "/System/Library/AssetsV2/downloadDir/XPCServices")
+        fake, _ = self.runner(per_label={"com.apple.geod": evil})                  # pid 0: loaded, not running
+        with unittest.mock.patch.object(qa.subprocess, "run", fake), \
+                unittest.mock.patch.object(qa, "service_files_problem", lambda text: None):
+            pids, problems = qa.verify_user_domain(self.IDENT)
+        self.assertEqual(pids, set())
+        self.assertTrue(any("geod" in p for p in problems), problems)
+
+    def test_the_reason_the_owner_reads_is_not_cut_before_the_label(self):
+        fake, _ = self.runner(per_label={"com.apple.geod": "user/530/com.apple.geod = {\n}\n"})
+        with unittest.mock.patch.object(qa.subprocess, "run", fake):
+            _, problems = qa.verify_user_domain(self.IDENT)
+        message = qa.clean(problems[0])                                           # the 120 characters the owner sees
+        self.assertTrue(message.startswith("service com.apple.geod: "), message)
+        self.assertGreater(len(message), len("service com.apple.geod: ") + 10)
+
+    def test_a_header_line_forged_inside_a_value_cannot_make_a_service_trusted(self):
+        forged = "\tpath = /System/Library/LaunchAgents/forged.plist"
+        # a submitted job has no path of its own; the forged line sits in a value the job's owner chooses
+        pathless = "user/530/x.job = {\n\tactive count = 1\n\ttype = LaunchAgent\n\tstate = running\n"
+        for name, text in {
+            "inside the program value": pathless + "\tprogram = /bin/sh\n%s\n\targuments = {\n\t\t/bin/sh\n\t}\n}\n" % forged,
+            "inside the arguments block": pathless + "\tprogram = /bin/sh\n\targuments = {\n\t\t/bin/sh\n%s\n\t}\n}\n" % forged,
+            "inside the environment block": pathless + "\tenvironment = {\n\t\tX => y\n%s\n\t}\n}\n" % forged,
+            "a second path after the real one": REAL_SERVICE.replace("\tprogram = /usr/sbin/cfprefsd", "\tprogram = /usr/sbin/cfprefsd\n" + forged),
+            "a second type": REAL_SERVICE.replace("\tprogram = /usr/sbin/cfprefsd", "\tprogram = /usr/sbin/cfprefsd\n\ttype = LaunchAgent"),
+            "a path that follows the program": pathless.replace("\ttype = LaunchAgent\n", "") + "\tprogram = /bin/sh\n%s\n\ttype = LaunchAgent\n}\n" % forged,
+        }.items():
+            with self.subTest(name):
+                self.assertIsNotNone(qa.service_problem(text, 530, "x.job"), name)
+
+    def test_a_launchd_copy_of_a_system_service_is_accepted(self):
+        copy = REAL_SERVICE.replace("user/530/com.apple.cfprefsd.xpc.agent = {\n", "user/530/com.apple.cfprefsd.xpc.agent.19000000-0300 = {\n\toriginal = com.apple.cfprefsd.xpc.agent\n", 1)
+        self.assertIsNone(qa.service_problem(copy, 530, "com.apple.cfprefsd.xpc.agent.19000000-0300"))
+
+    def test_nothing_a_job_chooses_may_precede_or_separate_the_path_and_type(self):
+        forged = "\tpath = /System/Library/LaunchAgents/forged.plist\n\ttype = LaunchAgent\n"
+        pathless = "user/530/x.job = {\n\tactive count = 1\n"
+        for name, text in {
+            "a scalar before the path carries the forged lines": pathless + "\tstdout path = /tmp/a\n" + forged + "\tstate = running\n\tprogram = /bin/sh\n\targuments = {\n\t}\n}\n",
+            "a line between the path and the type": REAL_SERVICE.replace("\ttype = LaunchAgent", "\tcomment = x\n\ttype = LaunchAgent"),
+            "an unknown key before the path": REAL_SERVICE.replace("\tpath = ", "\tcomment = x\n\tpath = ", 1),
+            "an original that is not a label": REAL_SERVICE.replace("\tpath = ", "\toriginal = a b\n\tpath = ", 1),
+            "a non-numeric counter": REAL_SERVICE.replace("\tactive count = 2", "\tactive count = 2 extra"),
+        }.items():
+            with self.subTest(name):
+                self.assertIsNotNone(qa.service_problem(text, 530, "x.job" if "x.job" in text else "com.apple.cfprefsd.xpc.agent"), name)
+
+    def test_a_present_domain_of_system_services_passes_and_names_the_running_pids(self):
+        fake, calls = self.runner()
+        with unittest.mock.patch.object(qa.subprocess, "run", fake):
+            pids, problems = qa.verify_user_domain(self.IDENT)
+        self.assertEqual((pids, problems), (REAL_RUNNING, []))
+        self.assertEqual(len(calls), 1 + 48)                                   # the domain and every loaded service
+        fake, calls = self.runner()
+        with unittest.mock.patch.object(qa.subprocess, "run", fake):
+            self.assertEqual(qa.verify_user_domain(self.IDENT, running_only=True), (REAL_RUNNING, []))
+        self.assertEqual(len(calls), 1 + 8)                                    # only the running ones are looked up
+
+    def test_one_service_defined_outside_the_system_volume_fails_the_domain(self):
+        evil = REAL_SERVICE.replace("/System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist", "/Users/qauser/x.plist")
+        fake, _ = self.runner(per_label={"com.apple.geod": evil})                # idle, StartInterval-style persistence
+        with unittest.mock.patch.object(qa.subprocess, "run", fake):
+            pids, problems = qa.verify_user_domain(self.IDENT)
+        self.assertEqual(pids, set())
+        self.assertTrue(any("com.apple.geod" in p for p in problems), problems)
+
+    def test_an_absent_domain_is_clean(self):
+        fake, _ = self.runner(domain="", domain_rc=113, domain_err="Could not find domain for user/530\n")
+        with unittest.mock.patch.object(qa.subprocess, "run", fake):
+            self.assertEqual(qa.verify_user_domain(self.IDENT), (set(), []))
+
+    def test_every_failure_to_read_the_domain_is_a_problem(self):
+        for name, kwargs in {
+            "sudo refused on the domain": dict(domain_rc=1, domain_err="sudo: a password is required\n"),
+            "other launchctl error": dict(domain_rc=5, domain_err="Bad request.\n"),
+            "service unreadable": dict(rc=113, service=""),
+            "sudo refused on a service": dict(rc=1, service_err="sudo: a password is required\n"),
+        }.items():
+            with self.subTest(name):
+                fake, _ = self.runner(**kwargs)
+                with unittest.mock.patch.object(qa.subprocess, "run", fake):
+                    pids, problems = qa.verify_user_domain(self.IDENT)
+                self.assertEqual(pids, set())
+                self.assertTrue(problems)
+
+        def timeout(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, 30)
+        with unittest.mock.patch.object(qa.subprocess, "run", timeout):
+            self.assertTrue(qa.verify_user_domain(self.IDENT)[1])
+
+    def test_root_and_your_own_uid_are_refused_before_any_subprocess(self):
+        with unittest.mock.patch.object(qa.subprocess, "run", side_effect=AssertionError("must not run")):
+            for uid in (0, os.getuid()):
+                self.assertTrue(qa.verify_user_domain(self.IDENT._replace(uid=uid))[1])
+
+    def test_the_persistence_check_accepts_the_real_domain_and_still_requires_the_gui_domain_absent(self):
+        answers = dict(CLEAN_PERSISTENCE)
+        fake_domain, _ = self.runner()
+
+        def fake_run(argv, **kwargs):
+            name = os.path.basename(argv[4])
+            if name == "launchctl" and argv[-1].startswith("user/"):
+                return fake_domain(argv, **kwargs)
+            rc, out, err = answers["launchctl:gui"] if name == "launchctl" else answers.get(name, (0, "", ""))
+            return subprocess.CompletedProcess(argv, rc, out, err)
+        with unittest.mock.patch.object(qa.subprocess, "run", fake_run):
+            self.assertEqual(qa.persistence_problems(self.IDENT), [])
+            answers["launchctl:gui"] = (0, "gui/530 = {\n}\n", "")
+            self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))
+            answers["launchctl:gui"] = (125, "", "Could not print domain: 125: Domain does not support specified action\n")
+            self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))   # 125 alone is not trusted (see LaunchdGuiAbsentTests)
+            answers["launchctl:gui"] = (1, "", "sudo: a password is required\n")
+            self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))
+
+
+class LaunchdGuiAbsentTests(unittest.TestCase):
+    """gui/<uid> passes only in the documented absent forms (SPE-145 part 5). An unknown uid answers 112 "Could not find
+    domain". An existing account without a GUI session answers exit 125, "Domain does not support specified action", nothing
+    on stdout, and is accepted only when the QA user's launchd manager is Background/System and none of its processes is a
+    GUI-session one. The strings are the raw answers captured as the QA user and as root on the real account."""
+    NO_SESSION = "Could not print domain: 125: Domain does not support specified action\n"
+    NOT_FOUND = "Bad request.\nCould not find domain for user gui: 9999\n"
+    IDENT = qa.Identity("qauser", 530, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
+
+    def setUp(self):
+        if os.getuid() == 530:
+            self.skipTest("fixture uid is the running uid")
+
+    def gui_problems(self, gui=(125, "", NO_SESSION), manager=(0, "Background\n", ""), ps=(0, "52266 S\n93967 S\n", ""),
+                     paths=None, timeout_on=None):
+        paths = paths or {52266: "/usr/sbin/distnoted", 93967: "/usr/sbin/cfprefsd"}
+
+        def fake_run(argv, **kwargs):
+            if timeout_on == os.path.basename(argv[4] if argv[0] != qa.PS else argv[0]):
+                raise subprocess.TimeoutExpired(argv, 30)
+            if argv[0] == qa.PS:
+                rc, out, err = ps
+            elif argv[-1] == "managername":
+                rc, out, err = manager
+            else:
+                self.assertEqual(argv[-2:], ["print", "gui/530"])
+                rc, out, err = gui
+            return subprocess.CompletedProcess(argv, rc, out, err)
+        clean = {"crontab": (1, "", "no crontab for qauser\n"), "atq": (0, "", ""), "ls": (1, "", "ls: no such file\n")}
+
+        def run(argv, **kwargs):
+            if argv[0] != qa.PS and os.path.basename(argv[4]) in clean:
+                rc, out, err = clean[os.path.basename(argv[4])]
+                return subprocess.CompletedProcess(argv, rc, out, err)
+            if argv[-1] == "user/530":
+                return subprocess.CompletedProcess(argv, 1, "", "Could not find domain for user: 530\n")
+            return fake_run(argv, **kwargs)
+        with unittest.mock.patch.object(qa.subprocess, "run", run), \
+                unittest.mock.patch.object(qa, "executable_path", lambda pid: paths.get(pid)):
+            return [p for p in qa.persistence_problems(self.IDENT) if "gui/530" in p]
+
+    def test_the_captured_no_session_answer_with_background_helpers_passes(self):
+        self.assertEqual(self.gui_problems(), [])
+
+    def test_a_system_manager_and_an_empty_process_table_pass(self):
+        self.assertEqual(self.gui_problems(manager=(0, "System\n", ""), ps=(1, "", "")), [])
+
+    def test_an_unknown_uid_passes_without_corroboration(self):
+        self.assertEqual(self.gui_problems(gui=(112, "", self.NOT_FOUND), manager=(0, "Aqua\n", "")), [])
+
+    def test_a_printed_domain_is_a_problem(self):
+        self.assertTrue(self.gui_problems(gui=(0, "gui/530 = {\n\ttype = login\n}\n", "")))
+
+    def test_125_with_stdout_is_a_problem(self):
+        self.assertTrue(self.gui_problems(gui=(125, "gui/530 = {\n}\n", self.NO_SESSION)))
+
+    def test_125_with_other_or_no_text_is_a_problem(self):
+        self.assertTrue(self.gui_problems(gui=(125, "", "Could not print domain: 125: something else\n")))
+        self.assertTrue(self.gui_problems(gui=(125, "", "")))
+
+    def test_the_no_session_text_with_another_exit_code_is_a_problem(self):
+        for rc in (0, 1, 113, 126):
+            self.assertTrue(self.gui_problems(gui=(rc, "", self.NO_SESSION)), rc)
+
+    def test_112_with_the_no_session_text_is_a_problem(self):
+        self.assertTrue(self.gui_problems(gui=(112, "", self.NO_SESSION)))
+
+    def test_an_unreadable_domain_is_a_problem(self):
+        self.assertTrue(self.gui_problems(gui=(1, "", "Operation not permitted\n")))
+        self.assertTrue(self.gui_problems(gui=(1, "", "sudo: a password is required\n")))
+
+    def test_an_aqua_or_unreadable_manager_is_a_problem(self):
+        for manager in ((0, "Aqua\n", ""), (0, "", ""), (1, "", "Operation not permitted\n"),
+                        (1, "", "sudo: a password is required\n"), (0, "Background extra\n", "")):
+            self.assertTrue(self.gui_problems(manager=manager), manager)
+
+    def test_a_gui_session_process_is_a_problem(self):
+        for name in ("loginwindow", "WindowServer", "Dock", "Finder"):
+            paths = {52266: "/usr/sbin/distnoted", 93967: "/System/Library/CoreServices/%s" % name}
+            self.assertTrue(self.gui_problems(paths=paths), name)
+
+    def test_an_unreadable_process_table_or_process_is_a_problem(self):
+        self.assertTrue(self.gui_problems(ps=(2, "", "ps: illegal option\n")))
+        self.assertTrue(self.gui_problems(ps=(0, "garbled\n", "")))
+        with unittest.mock.patch.object(qa.os, "kill", return_value=None):
+            self.assertTrue(self.gui_problems(paths={52266: "/usr/sbin/distnoted"}))   # 93967 has no readable executable
+
+    def test_a_timeout_is_a_problem(self):
+        self.assertTrue(self.gui_problems(timeout_on="launchctl"))
+
+    def test_a_timeout_while_corroborating_is_a_problem(self):
+        def raises(argv, **kwargs):
+            if argv[-1] == "managername" or argv[0] == qa.PS:
+                raise subprocess.TimeoutExpired(argv, 30)
+            return subprocess.CompletedProcess(argv, 125, "", self.NO_SESSION)
+        with unittest.mock.patch.object(qa.subprocess, "run", raises):
+            self.assertTrue(qa.no_gui_session_problems(self.IDENT, "gui/530"))
+
+    def test_zombies_and_vanished_processes_are_skipped(self):
+        with unittest.mock.patch.object(qa.os, "kill", side_effect=ProcessLookupError):
+            self.assertEqual(self.gui_problems(ps=(0, "52266 Z\n93967 S\n", ""), paths={}), [])
+
+
+class SiblingFileTests(unittest.TestCase):
+    """qa-handoff.py loads qa-identity-setup.py and runs disk-admission.py from its own directory: a copy without them must
+    say so, not die with a traceback or report a resource refusal."""
+
+    def test_a_missing_identity_setup_script_is_a_clear_refusal(self):
+        with tempfile.TemporaryDirectory() as empty, unittest.mock.patch.object(qa, "__file__", str(Path(empty) / "qa-handoff.py")), \
+                unittest.mock.patch.object(qa, "_QIS", None):
+            with self.assertRaises(qa.Refused) as caught:
+                qa._qis()
+        self.assertIn("qa-identity-setup.py must sit next to qa-handoff.py", str(caught.exception))
+
+    def test_a_missing_admission_tool_is_missing_not_refused(self):
+        args = argparse.Namespace(admission_cmd=None)
+        with tempfile.TemporaryDirectory() as empty, unittest.mock.patch.object(qa, "__file__", str(Path(empty) / "qa-handoff.py")):
+            self.assertEqual(qa.admission_state(args), "missing")
+        self.assertEqual(qa.admission_state(argparse.Namespace(admission_cmd=["/nonexistent/admission-tool"])), "missing")
+        self.assertEqual(qa.admission_state(argparse.Namespace(admission_cmd=[sys.executable, "-c", "raise SystemExit(3)"])), "refused")
+        self.assertEqual(qa.admission_state(argparse.Namespace(admission_cmd=[sys.executable, "-c", "pass"])), "ok")
+
+
+class RuntimeFilesTests(unittest.TestCase):
+    """A copy of qa-handoff.py without a sibling, or with an unsafe one, is refused (exit 64) before anything runs."""
+
+    def copy_dir(self, skip=None, extra=()):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        for name in ("qa-handoff.py", "disk-admission.py", "qa-identity-setup.py"):
+            if name != skip:
+                shutil.copy(Path(qa.__file__).resolve().parent / name, root / name)
+        return root
+
+    def problems(self, root, identity, admission_cmd=False):
+        with unittest.mock.patch.object(qa, "__file__", str(root / "qa-handoff.py")):
+            return qa.runtime_problems(identity, admission_cmd)
+
+    def test_a_complete_copy_has_no_problems(self):
+        self.assertEqual(self.problems(self.copy_dir(), True), [])
+
+    def test_each_missing_sibling_is_named(self):
+        for sibling, identity in (("disk-admission.py", False), ("disk-admission.py", True), ("qa-identity-setup.py", True)):
+            with self.subTest(sibling=sibling, identity=identity):
+                found = self.problems(self.copy_dir(skip=sibling), identity)
+                self.assertTrue(any("missing" in p and sibling in p for p in found), found)
+
+    def test_the_identity_script_is_not_required_without_an_identity_nor_the_admission_script_with_a_custom_command(self):
+        self.assertEqual(self.problems(self.copy_dir(skip="qa-identity-setup.py"), False), [])
+        self.assertEqual(self.problems(self.copy_dir(skip="disk-admission.py"), False, admission_cmd=True), [])
+
+    def test_a_linked_or_writable_sibling_is_refused(self):
+        root = self.copy_dir()
+        (root / "disk-admission.py").unlink()
+        (root / "disk-admission.py").symlink_to(root / "qa-handoff.py")
+        self.assertTrue(any("not a regular file" in p for p in self.problems(root, False)))
+        root = self.copy_dir()
+        os.chmod(root / "qa-identity-setup.py", 0o666)
+        self.assertTrue(any("not group/world writable" in p for p in self.problems(root, True)))
+
+    def test_run_refuses_with_exit_64_not_a_traceback_or_a_resource_wait(self):
+        root = self.copy_dir(skip="disk-admission.py")
+        run_dir = root / "run"
+        run_dir.mkdir()
+        proc = subprocess.run([sys.executable, str(root / "qa-handoff.py"), "run", "--run-dir", str(run_dir)],
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 64, proc.stdout + proc.stderr)
+        self.assertIn("REFUSED required runtime files are missing or unsafe: missing", proc.stdout)
+        self.assertIn("disk-admission.py", proc.stdout)
+        self.assertNotIn("Traceback", proc.stderr)
 
 
 class KillChildTests(Base):
@@ -1340,7 +1932,10 @@ class IdentityTests(Base):
         def sweep(ident, recheck=0):
             self.assertEqual(ident, self.ident)
             self.rechecks.append(recheck)
-            return self.sweeps.pop(0) if self.sweeps else 0
+            value = self.sweeps.pop(0) if self.sweeps else 0
+            if isinstance(value, Exception):
+                raise value
+            return value
         for patch in (unittest.mock.patch.object(qis, "SUDO", str(self.sudo)), unittest.mock.patch.object(qis, "PY", sys.executable),
                       unittest.mock.patch.object(qa, "resolve_identity", lambda name, exchange: self.ident),
                       unittest.mock.patch.object(qa, "sweep_identity", sweep),
@@ -1591,17 +2186,77 @@ class IdentityTests(Base):
         self.assertTrue(meta["sudo_keepalive"]["failures"])                 # recorded, not silent
         self.assertIn("sudo -n refused", (run_dir / "CLEANUP.json").read_text())
 
-    def test_a_failed_cleanup_sweep_is_reported_to_the_owner(self):
+    def test_a_failed_cleanup_sweep_is_reported_and_a_pass_does_not_stand(self):
         self.sweeps = [0, 0, None]               # pre-run, seal, and the final cleanup sweep that cannot run
         run_dir = self.prepare()
         code, out = self.run_ident(run_dir)
-        self.assertEqual(code, 0, out)           # the seal's own sweep was clean; the note does not change the state
+        self.assertEqual(code, 12, out)          # the seal was clean, but the QA user is not confirmed idle
         self.assertIn("NOTE QA-user processes may survive", out)
-        self.assertIsNone(self.json(run_dir / "RESULT.json")["cleanup"]["sweep"])
+        result = self.json(run_dir / "RESULT.json")
+        self.assertEqual(result["state"], "QA_INVALID")
+        self.assertIsNone(result["cleanup"]["sweep"])
         self.assertFalse((self.x / "inbox/RUN.lock").exists())
         code, _ = self.call("verdict", "--run-dir", str(run_dir))
-        self.assertEqual(code, 0)
-        self.assertIn("cleanup", self.json(run_dir / "RESULT.json"))      # kept when the result is re-evaluated
+        self.assertEqual(code, 12)               # a re-evaluation cannot turn it back into a pass
+        self.assertEqual(self.json(run_dir / "RESULT.json")["state"], "QA_INVALID")
+        self.assertIn("cleanup", self.json(run_dir / "RESULT.json"))
+
+    def test_survivors_at_the_final_sweep_do_not_leave_a_pass(self):
+        self.sweeps = [0, 0, 3]                  # three QA-user processes survive the final sweep
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("3 left", out)
+        self.assertEqual(self.json(run_dir / "RESULT.json")["state"], "QA_INVALID")
+
+    def test_an_unexpected_error_in_the_final_sweep_is_not_silent_and_not_a_pass(self):
+        self.sweeps = [0, 0, RuntimeError("boom")]
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertIn("NOTE QA-user processes may survive", out)
+        self.assertIsNone(self.json(run_dir / "RESULT.json")["cleanup"]["sweep"])
+
+    def test_a_cleanup_write_failure_still_removes_the_lock_and_voids_the_pass(self):
+        self.sweeps = [0, 0, 2]
+        real = qa.write_private
+
+        def flaky(path, data):
+            if Path(path).name == "CLEANUP.json":
+                raise OSError("disk full")
+            return real(path, data)
+        run_dir = self.prepare()
+        with unittest.mock.patch.object(qa, "write_private", flaky):
+            code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())      # a failed note must never strand the lock
+
+    def test_an_unreadable_result_at_the_final_sweep_still_voids_the_pass_in_the_exit_code(self):
+        self.sweeps = [0, 0, 2]
+        real = qa.read_run_json
+        state = {"armed": False}
+
+        def unreadable(path, *a, **k):
+            if state["armed"] and Path(path).name == "RESULT.json":
+                raise ValueError("corrupt")
+            return real(path, *a, **k)
+        real_sweep = qa.sweep_identity
+
+        def arm(ident, recheck=0):
+            value = real_sweep(ident, recheck)
+            state["armed"] = len(self.sweeps) == 0              # the final sweep has just been consumed
+            return value
+        run_dir = self.prepare()
+        with unittest.mock.patch.object(qa, "read_run_json", unreadable), unittest.mock.patch.object(qa, "sweep_identity", arm):
+            code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 12, out)                         # the exit code does not depend on RESULT.json being readable
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())
+
+    def test_a_clean_final_sweep_keeps_the_pass(self):
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 0, out)
+        self.assertFalse((run_dir / "CLEANUP.json").exists())
 
     def test_a_tampered_packet_id_is_never_used_as_an_exchange_path(self):
         run_dir = self.prepare()

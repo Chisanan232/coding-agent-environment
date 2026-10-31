@@ -61,7 +61,7 @@ REFUSE_RC = 77
 VALID_LEVELS = frozenset({1, 2, 4})   # the only values the kernel reports
 SYSCTL, PS, VM_STAT = "/usr/sbin/sysctl", "/bin/ps", "/usr/bin/vm_stat"   # absolute: PATH is not trusted
 LSOF = "/usr/sbin/lsof"
-PS_FIELDS = "pid=,ppid=,state=,etime=,time=,pcpu=,comm="   # never args/command: command lines can carry secrets
+PS_FIELDS = "pid=,ppid=,state=,etime=,time=,pcpu=,rss=,comm="   # comm last (it may contain spaces); never args/command: command lines can carry secrets
 MAX_STATE_BYTES = 64 * 1024
 LOCK_WAIT = 10.0
 
@@ -128,44 +128,96 @@ def parse_pcpu(text):
 
 
 def classify_heavy(ps_text):
-    """(active, idle, cpu_by_pid) from `ps -axo PS_FIELDS`; (None, None, None, None) when the list is unreadable. Anything that
-    cannot be fully parsed counts as active: an unknown process is never treated as an abandoned one. cpu_by_pid holds the
-    CPU seconds of every heavy-named process, so a later sample can tell whether any of them worked in between."""
+    """(active, idle, cpu_by_pid, active_pids, workloads) from `ps -axo PS_FIELDS`; five Nones when the list is unreadable.
+    Anything that cannot be fully parsed counts as active: an unknown process is never treated as an abandoned one.
+    cpu_by_pid holds the CPU seconds of every heavy-named process, so a later sample can tell whether any of them worked in
+    between. A workload is a heavy-named process with no heavy-named ancestor plus its whole process subtree (test binaries
+    and shells included); it is idle only when its root is an idle orphan and every member is idle."""
+    unknown = (None, None, None, None, None)
     if ps_text is None or not ps_text.strip():
-        return None, None, None, None
+        return unknown
     active, idle, cpus, active_pids = {}, [], {}, []
+    rows, loose = {}, []   # pid -> row for every parsed line; heavy lines that could not be parsed
     for line in ps_text.splitlines():
         line = line.strip()
         if not line:
             continue
-        parts = line.split(None, 6)
+        parts = line.split(None, 7)
         parsed = None
-        if len(parts) == 7 and parts[0].isdigit() and parts[1].isdigit():
-            base = os.path.basename(parts[6].strip())
-            parsed = (int(parts[0]), int(parts[1]), parts[2], parse_clock(parts[3]), parse_clock(parts[4]), parts[5])
+        if len(parts) == 8 and parts[0].isdigit() and parts[1].isdigit():
+            base = os.path.basename(parts[7].strip())
+            rss = int(parts[6]) * 1024 if parts[6].isdigit() else None   # ps reports KiB
+            parsed = (int(parts[0]), int(parts[1]), parts[2], parse_clock(parts[3]), parse_clock(parts[4]), parts[5], rss)
         else:
             base = os.path.basename(line.split()[-1])
             if base not in HEAVY_COMMS:
-                return None, None, None, None   # a row that cannot be read might be a heavy process: the list is unknown
+                return unknown   # a row that cannot be read might be a heavy process: the list is unknown
         if base not in HEAVY_COMMS:
-            if parsed and (parsed[3] is None or parsed[4] is None or parse_pcpu(parsed[5]) is None):
-                return None, None, None, None   # fields that cannot be read: the row is not trusted, the list is unknown
+            if parsed and (parsed[3] is None or parsed[4] is None or parse_pcpu(parsed[5]) is None or parsed[6] is None):
+                return unknown   # fields that cannot be read: the row is not trusted, the list is unknown
+            rows.setdefault(parsed[0], {"ppid": parsed[1], "heavy": False, "rss": parsed[6], "cpu": parsed[4],
+                                        "quiet": _quiet(parsed), "comm": base})
             continue
         orphan = False
         if parsed:
-            pid, ppid, state, age, cpu, pcpu = parsed
+            pid, ppid, state, age, cpu, pcpu, rss = parsed
             if cpu is not None:
                 cpus[pid] = cpu
-            pcpu_v = parse_pcpu(pcpu)
-            orphan = (ppid == 1 and state[:1] in IDLE_STATES and age is not None and age >= IDLE_MIN_AGE
-                      and cpu is not None and pcpu_v is not None and pcpu_v <= IDLE_PCPU)
+            quiet = _quiet(parsed)
+            orphan = ppid == 1 and quiet
+            rows.setdefault(pid, {"ppid": ppid, "heavy": True, "rss": rss, "cpu": cpu, "quiet": quiet, "comm": base})
+        else:
+            loose.append(base)
         if orphan:
             idle.append({"pid": pid, "comm": base, "ppid": ppid, "age_s": int(age), "cpu_s": cpu, "cwd": None})
         else:
             active[base] = active.get(base, 0) + 1
             if parsed:
                 active_pids.append(parsed[0])
-    return active, idle, cpus, active_pids
+    return active, idle, cpus, active_pids, _workloads(rows, loose)
+
+
+def _quiet(parsed):
+    """True when a row shows no sign of work (idle state, old enough, almost no recent CPU, every field readable)."""
+    _, _, state, age, cpu, pcpu, rss = parsed
+    pcpu_v = parse_pcpu(pcpu)
+    return (state[:1] in IDLE_STATES and age is not None and age >= IDLE_MIN_AGE and cpu is not None
+            and pcpu_v is not None and pcpu_v <= IDLE_PCPU and rss is not None)
+
+
+def _workloads(rows, loose):
+    children = {}
+    for pid, r in rows.items():
+        children.setdefault(r["ppid"], []).append(pid)
+    out = []
+    for pid in sorted(rows):
+        if not rows[pid]["heavy"]:
+            continue
+        seen, up, nested = {pid}, rows[pid]["ppid"], False
+        while up in rows and up not in seen:   # topmost heavy-named process owns the tree
+            if rows[up]["heavy"]:
+                nested = True
+                break
+            seen.add(up)
+            up = rows[up]["ppid"]
+        if nested:
+            continue
+        members, stack = [], [pid]
+        while stack:
+            cur = stack.pop()
+            if cur in members:
+                continue
+            members.append(cur)
+            stack.extend(children.get(cur, []))
+        root = rows[pid]
+        out.append({"root_pid": pid, "root_comm": root["comm"], "procs": len(members),
+                    "rss_bytes": sum(rows[m]["rss"] or 0 for m in members),
+                    "cpu_s": sum(rows[m]["cpu"] or 0.0 for m in members),
+                    "idle": root["ppid"] == 1 and all(rows[m]["quiet"] for m in members),
+                    "member_cpu": {m: rows[m]["cpu"] for m in members}})
+    for base in loose:   # an unparsed heavy line has no tree: one active workload each
+        out.append({"root_pid": None, "root_comm": base, "procs": 1, "rss_bytes": 0, "cpu_s": 0.0, "idle": False, "member_cpu": {}})
+    return out
 
 
 def lookup_cwd(pid, run, timeout=CWD_LOOKUP_TIMEOUT):
@@ -196,7 +248,7 @@ def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu
             return None
     # None = the process list could not be read (unknown), never "no heavy process"; empty output from a successful ps is
     # not "nothing running" either, because a live system always has processes.
-    heavy, idle, cpus, active_pids = classify_heavy(_run([PS, "-axo", PS_FIELDS], run))
+    heavy, idle, cpus, active_pids, workloads = classify_heavy(_run([PS, "-axo", PS_FIELDS], run))
     fill_cwds(idle or [], run)
     try:
         load1 = load_fn()[0]
@@ -212,7 +264,35 @@ def take_sample(run=subprocess.run, now_fn=time.time, load_fn=os.getloadavg, cpu
         disk_free = None
     return {"time": now_fn(), "mono": mono_fn(), "ram": sysctl_int("hw.memsize"), "pressure_level": sysctl_int("kern.memorystatus_vm_pressure_level"),
             "swap": parse_swapusage(_run([SYSCTL, "-n", "vm.swapusage"], run)), "vm": parse_vm_stat(_run([VM_STAT], run)),
-            "load1": load1, "cpus": cpu_fn() or None, "disk_free": disk_free, "heavy_procs": heavy, "idle_procs": idle or [], "cpu_by_pid": cpus or {}, "active_pids": active_pids or []}
+            "load1": load1, "cpus": cpu_fn() or None, "disk_free": disk_free, "heavy_procs": heavy, "idle_procs": idle or [], "cpu_by_pid": cpus or {}, "active_pids": active_pids or [], "heavy_workloads": workloads}
+
+
+def _derive_workloads(s1, s2, before, d):
+    """Workloads of the second sample with `idle` re-proven across the window. Every member follows the re-add rules of a lone
+    orphan: CPU spent in the window, absent from the first sample, or part of a tree that was active in the first sample makes
+    the whole tree active. A root that this turns active is no longer reported as an idle orphan."""
+    works = s2.get("heavy_workloads")
+    if works is None or d["heavy_procs"] is None:
+        return None   # no workload view (unreadable list or a hand-built sample): the name counts in heavy_procs decide
+    first = s1.get("heavy_workloads") or []
+    first_cpu, first_active = {}, set()
+    for w in first:
+        first_cpu.update(w.get("member_cpu") or {})
+        if not w["idle"]:
+            first_active.update((w.get("member_cpu") or {}))
+    out = []
+    for w in works:
+        w = dict(w)
+        if w["idle"]:
+            for pid, cpu in (w.get("member_cpu") or {}).items():
+                prior = first_cpu.get(pid, before.get(pid))
+                if prior is None or cpu is None or cpu > prior or pid in first_active:
+                    w["idle"] = False
+                    break
+        if not w["idle"]:
+            d["idle_procs"] = [r for r in d["idle_procs"] if r["pid"] != w["root_pid"]]
+        out.append(w)
+    return out
 
 
 def derive(s1, s2):
@@ -233,6 +313,7 @@ def derive(s1, s2):
                 d["heavy_procs"] = dict(d["heavy_procs"], **{rec["comm"]: d["heavy_procs"].get(rec["comm"], 0) + 1})
         else:
             d["idle_procs"].append(rec)
+    d["heavy_workloads"] = _derive_workloads(s1, s2, before, d)
     key = "mono" if s1.get("mono") is not None and s2.get("mono") is not None else "time"   # monotonic: a wall-clock step must not dilute the rate
     dt = (s2.get(key) or 0) - (s1.get(key) or 0)
     v1, v2 = s1.get("vm"), s2.get("vm")
@@ -293,6 +374,11 @@ def refusal_reasons(weight, m):
         procs = m.get("heavy_procs")
         if procs is None:
             unknown.append("process list unreadable")
+        elif m.get("heavy_workloads"):   # an empty list with heavy-named processes present falls to the name count below: fail closed
+            running = [w for w in m["heavy_workloads"] if not w["idle"]]
+            if running:
+                detail = "; ".join(f"{w['root_comm']}: {w['procs']} procs, {w['rss_bytes'] / GIB:.1f} GiB" for w in running)
+                r.append(f"{len(running)} heavy build workload(s) running ({detail}): one heavy lane at a time")
         elif procs:
             names = ", ".join(f"{k} x{v}" for k, v in sorted(procs.items()))
             r.append(f"another heavy build/test process is running ({names}): one heavy lane at a time")

@@ -1,61 +1,8 @@
 name: Capability profile validation
 on:
+  # No path filter on pull_request: isolated-validation and native-resource-wire are required status checks, and a
+  # required check that never runs on a PR leaves it waiting forever.
   pull_request:
-    paths:
-      - '.claude/CLAUDE.md'
-      - '.claude/settings.json'
-      - '.claude/skills/**'
-      - '.claude/hooks/**'
-      - 'codex/**'
-      - 'scripts/profile-install.sh'
-      - 'scripts/sync-check.sh'
-      - 'scripts/storage-integration.py'
-      - 'scripts/build-baseline.py'
-      - 'docs/ENGINEERING-BASELINE.md'
-      - 'scripts/qa-identity-setup.py'
-      - 'scripts/resource-policy-install.py'
-      - 'scripts/launcher-install.py'
-      - 'scripts/hook-rollout.py'
-      - 'scripts/owner-merge-gate.py'
-      - 'docs/ENGINEERING-CONSTITUTION.md'
-      - 'tests/test-engineering-constitution.py'
-      - 'scripts/constitution-behavior-matrix.py'
-      - 'tests/test-constitution-behavior-matrix.py'
-      - 'scripts/owner-merge-runner.py'
-      - 'scripts/owner-merge-evidence-sign.py'
-      - 'scripts/branch-protection-rollout.py'
-      - 'docs/OWNER-MERGE-AUTONOMY.md'
-      - 'tests/test-owner-merge-autonomy.py'
-      - 'tests/test-owner-merge-runner.py'
-      - 'tests/test-branch-protection-rollout.py'
-      - 'docs/permission-corpus/owner-merge-corpus.json'
-      - 'docs/examples/owner-merge-pinned-allow.example.json'
-      - 'scripts/workstation-policy.py'
-      - 'scripts/candidate-rollout.py'
-      - 'tests/test-rtk-proxy-prompt-removal.py'
-      - 'tests/test-permission-host-matrix.py'
-      - 'scripts/permission-host-matrix.py'
-      - 'docs/permission-corpus/routine-command-corpus.json'
-      - 'docs/ROLLOUT-RTK-PROXY-SCOPING.md'
-      - 'scripts/workstation-policy-hook.py'
-      - 'scripts/memory-admission.py'
-      - 'scripts/session-notify.py'
-      - 'tests/test-session-notify.py'
-      - 'docs/SESSION-NOTIFICATIONS.md'
-      - 'docs/examples/session-notify*.json'
-      - 'scripts/mcp-scope-inspect.py'
-      - 'scripts/campaign-resume.py'
-      - 'scripts/spe108-live/**'
-      - 'scripts/parity-dogfood.py'
-      - 'scripts/codex-routing.py'
-      - 'scripts/verify-codex-routing.py'
-      - 'scripts/visual-skills.py'
-      - 'docs/UI-UX-POLICY.md'
-      - 'docs/templates/**'
-      - 'tests/**'
-      - 'docs/examples/**'
-      - 'bin/**'
-      - '.github/workflows/capability-validation.yml'
   push:
     branches: [main]
     paths:
@@ -148,6 +95,8 @@ jobs:
           python3 tests/test-permission-rollout.py
           python3 tests/test-decision-delegation.py
           python3 tests/test-campaign-completion.py
+          python3 tests/test-baseline-behavior-map.py
+          python3 tests/test-adoption-probe.py
           python3 tests/test-resource-adapters.py
           python3 tests/test-native-resource-adapters.py
           python3 tests/test-resource-policy-install.py

@@ -611,13 +611,19 @@ def count_commands(events_path):
     return completed, succeeded
 
 
-def admitted(args):
-    cmd = args.admission_cmd or [sys.executable, str(Path(__file__).resolve().parent / 'disk-admission.py'), 'check',
-                                 '--weight', 'light']
+def admission_state(args):
+    """'ok', 'refused' (the tool ran and said no) or 'missing' (the tool could not run, for example disk-admission.py is not
+    next to qa-handoff.py). A missing tool is not a resource refusal and must not be reported as one."""
+    script = Path(__file__).resolve().parent / 'disk-admission.py'
+    if not args.admission_cmd and not script.is_file():
+        return 'missing'
+    cmd = args.admission_cmd or [sys.executable, str(script), 'check', '--weight', 'light']
     try:
-        return subprocess.run(cmd, capture_output=True, timeout=60).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+        return 'ok' if subprocess.run(cmd, capture_output=True, timeout=60).returncode == 0 else 'refused'
+    except subprocess.TimeoutExpired:
+        return 'refused'
+    except OSError:
+        return 'missing'
 
 
 def clean(text, limit=120):
@@ -635,6 +641,9 @@ def write_result(run_dir, packet, state, reasons, extra=None):
         cleanup = read_run_json(Path(run_dir) / 'CLEANUP.json')
         if isinstance(cleanup, dict):
             result['cleanup'] = cleanup
+            if state == 'QA_PASS':   # a final sweep that did not confirm the QA user idle outlives any re-evaluation
+                state = result['state'] = 'QA_INVALID'
+                reasons = result['reasons'] = ['final cleanup sweep did not confirm the QA user is idle (CLEANUP.json): a pass is not clean']
     except LOAD_ERRORS:
         pass
     result.update(extra or {})
@@ -660,10 +669,39 @@ def refuse(message):
     return EXIT['REFUSED']
 
 
+SIBLINGS = ('disk-admission.py', 'qa-identity-setup.py')   # the second only with --qa-identity; copy all from one revision
+
+
+def runtime_problems(identity, admission_cmd=False):
+    """Files this run needs that are missing or unsafe, as messages. Siblings next to this script, and (macOS only, which is
+    the only platform the QA identity works on) the system tools the identity hops call. Each must exist, be a regular
+    file rather than a link, belong to root or the invoking user, and not be group or world writable: a replaced helper
+    would run with the producer's authority."""
+    here = Path(__file__).resolve().parent
+    wanted = [here / name for name in SIBLINGS if (name != 'disk-admission.py' or not admission_cmd) and (identity or name != 'qa-identity-setup.py')]
+    if identity and sys.platform == 'darwin':
+        wanted += [Path(p) for p in (PS, KILL, CRONTAB, ATQ, LS, LAUNCHCTL)]
+    problems = []
+    for path in wanted:
+        try:
+            st = os.lstat(path)
+        except OSError:
+            problems.append('missing %s%s' % (path, ' (must sit next to qa-handoff.py)' if path.parent == here else ''))
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            problems.append('%s is not a regular file' % path)
+        elif st.st_uid not in (0, os.getuid()) or st.st_mode & 0o022:
+            problems.append('%s must be owned by root or you and not group/world writable' % path)
+    return problems
+
+
 def run(args):
     run_dir = Path(args.run_dir).resolve()
     # Usage refusals first: nothing is read, written or started for a flag combination that cannot be honoured.
     name = getattr(args, 'qa_identity', None)
+    missing = runtime_problems(bool(name), bool(getattr(args, 'admission_cmd', None)))
+    if missing:
+        return refuse('required runtime files are missing or unsafe: ' + '; '.join(missing[:4]))
     if getattr(args, 'require_env_isolation', False) and not name:
         return refuse('--require-env-isolation needs --qa-identity: a same-user run cannot isolate process environments')
     if getattr(args, 'exchange', None) and not name:
@@ -707,7 +745,11 @@ def run(args):
         return write_result(run_dir, packet, 'QA_INVALID', ['tree manifest is unreadable (%s)' % type(error).__name__])
     if problems or mismatch:
         return write_result(run_dir, packet, 'QA_INVALID', problems or ['manifest does not match the packet'])
-    if not admitted(args):
+    admission = admission_state(args)
+    if admission == 'missing':
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['the disk admission tool could not run (disk-admission.py must sit next to '
+                                                               'qa-handoff.py, or --admission-cmd must be runnable); codex was not started'])
+    if admission != 'ok':
         return write_result(run_dir, packet, 'WAITING_RESOURCE', ['disk admission refused; codex was not started'])
     try:
         os.close(os.open(run_dir / 'RUN.lock', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
@@ -912,11 +954,43 @@ def seal_failed(error):
 # cannot read the environment of the producer's processes (same-uid KERN_PROCARGS2). Only the producer side loads that
 # script; the copy of this file that runs as the QA user has no sibling and never calls _qis().
 Identity = collections.namedtuple('Identity', 'name uid home exchange exchange_owner')
-KILL, PGREP = '/bin/kill', '/usr/bin/pgrep'
+KILL, PS = '/bin/kill', '/bin/ps'
 CRONTAB, ATQ, LS, LAUNCHCTL = '/usr/bin/crontab', '/usr/bin/atq', '/bin/ls', '/bin/launchctl'
 # launchd's default ThrottleInterval is 10 s: a job it keeps alive comes back within that, so the seal looks again later.
 RESPAWN_SECONDS = 12
 LAUNCHD_ABSENT = 'Could not find domain'
+# An existing account with no GUI session answers `print gui/<uid>` with exit 125 and this text, and nothing on stdout (a
+# present session prints rc 0, an unknown uid answers 112 'Could not find domain'). Observed as the QA user and as root
+# against the real QA account and an unused one (SPE-145 part 5), so the exit code and text alone are not trusted: the
+# QA user's launchd manager must be a background one and none of its processes may belong to a GUI session. `managername`
+# was never observed on an account that has a GUI session, and sudo may hand the command the caller's bootstrap, so the
+# process check is the one that discriminates; neither check sees a GUI session that appears after it.
+LAUNCHD_NO_SESSION = (125, 'Domain does not support specified action')
+BACKGROUND_MANAGERS = ('Background', 'System')
+GUI_SESSION_PROCESSES = frozenset({'loginwindow', 'WindowServer', 'Dock', 'Finder', 'SystemUIServer', 'ControlCenter',
+                                   'NotificationCenter', 'Spotlight'})
+# After the QA user's first hop macOS creates a launchd user domain for it and runs Apple services under it (first real
+# account, macOS 27.0.1, 2026-10-30: 48 loaded services, all com.apple.*, 8 running; the set varies as on-demand agents
+# such as the mdworker.* ones start and stop). So a present domain is normal and the run cannot require it absent. What
+# is required instead is that launchd itself says every loaded service of the domain was defined by a plist on the sealed
+# system volume (`path = /System/...plist`, `type = LaunchAgent`), that nothing runs outside launchd's services
+# (`unmanaged processes` empty), and that a process of the user is tolerated only if it is a running service of that
+# verified domain with a launchd parent and an executable under a system prefix. The QA user cannot write under /System, so
+# a job it submits or bootstraps has a different path (or none) and fails the check; the `path` is launchd's own report,
+# not a name or a label, which a QA job can choose freely.
+# Not /System/ and not all of /System/Library/: parts of both are writable (/System/Volumes/Data is the data volume,
+# /System/Library/AssetsV2/downloadDir is mode 777 on the first real host). The plist of a trusted service sits directly in
+# one of these two directories, is a root-owned file nobody else can write, and its program is a system daemon, never an
+# interpreter. The prefixes are exactly those seen on a live domain (all 40 system services of one host, and the 8 running
+# ones of the real QA account); anything else fails closed until an owner `--check` shows it.
+SERVICE_PLIST_DIRS = ('/System/Library/LaunchAgents/', '/System/Library/LaunchDaemons/')
+SERVICE_PROGRAM_PREFIXES = ('/System/Library/', '/usr/libexec/', '/usr/sbin/')
+INTERPRETERS = frozenset({'python', 'python3', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'csh', 'tcsh', 'fish', 'env', 'perl', 'ruby',
+                          'osascript', 'php', 'node', 'tclsh', 'wish', 'lua', 'java', 'swift', 'swift-frontend', 'xcrun', 'open'})
+MAX_DOMAIN_SERVICES = 200
+SERVICE_LABEL_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}')
+SERVICE_ROW_RE = re.compile(r'(\d+)\s+(-|-?\d+|\(\w+\))\s+(\S+)')
+DOMAIN_SECONDS = 90   # all launchctl calls of one domain verification
 HOP_ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
 _QIS = None
 
@@ -929,6 +1003,8 @@ def _qis():
     global _QIS
     if _QIS is None:
         path = Path(__file__).resolve().parent / 'qa-identity-setup.py'
+        if not path.is_file():
+            raise Refused('qa-identity-setup.py must sit next to qa-handoff.py (not found at %s); copy both from the same revision' % path)
         spec = importlib.util.spec_from_file_location('qa_identity_setup', path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -1013,6 +1089,19 @@ def sudo_refused(stderr):
     return any(line.startswith('sudo:') for line in (stderr or '').splitlines())
 
 
+def executable_path(pid):
+    """The kernel-reported path of the running executable of `pid` (libproc proc_pidpath), None when unavailable.
+    Readable for other users' processes without privilege, and, unlike `ps comm`, not set by the process itself."""
+    try:
+        import ctypes
+        lib = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+        buf = ctypes.create_string_buffer(4096)
+        length = lib.proc_pidpath(pid, buf, 4096)
+    except (OSError, AttributeError):
+        return None
+    return buf.value.decode('utf-8', 'replace') if length > 0 else None
+
+
 def sweep_identity(ident, recheck=0):
     """Kill every process of the QA user, then count the survivors (process ids only). None means the sweep could not run,
     which callers treat as failed. With `recheck` seconds, a clean table is listed once more after that delay, so a job
@@ -1029,14 +1118,42 @@ def sweep_identity(ident, recheck=0):
     if sudo_refused(done.stderr):
         return None
     def survivors():
+        """Processes of the QA user that are not running services of its verified launchd domain (see the rule above);
+        None when the process table cannot be read."""
         try:
-            listed = subprocess.run([PGREP, '-U', str(ident.uid)], stdin=subprocess.DEVNULL, capture_output=True,
-                                    text=True, timeout=10)
+            listed = subprocess.run([PS, '-U', str(ident.uid), '-o', 'pid=,ppid=,stat='], stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             return None
-        if listed.returncode == 1:
-            return 0
-        return len(listed.stdout.split()) if listed.returncode == 0 else None
+        if listed.returncode == 1 and not listed.stdout.strip() and not listed.stderr.strip():
+            return 0   # ps exits 1 with an empty table and a message on stderr for an unknown uid or a bad option: not zero
+        if listed.returncode != 0:
+            return None
+        rows = []
+        for line in listed.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
+                return None
+            if not fields[2].startswith('Z'):   # exited, only waiting to be reaped: nothing is running
+                rows.append((int(fields[0]), int(fields[1])))
+        trusted = None   # looked up once, and only if some process could be a service
+        count = 0
+        for pid, ppid in rows:
+            path = executable_path(pid)
+            if ppid == 1 and path is not None and path.startswith(SERVICE_PROGRAM_PREFIXES):
+                if trusted is None:
+                    trusted = verified_service_pids(ident)
+                if pid in trusted:
+                    continue
+            if path is None:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:   # gone between the listing and the lookup
+                    continue
+                except PermissionError:
+                    pass
+            count += 1
+        return count
 
     count = None
     for _ in range(25):                     # killed processes take a moment to disappear from the table
@@ -1200,6 +1317,8 @@ def run_identity(args, run_dir, packet, source, ident):
         guarded.append(signal.SIGHUP)
     saved = {sig: signal.getsignal(sig) for sig in guarded}
     have_lock = False
+    downgraded = False
+    outcome = None
     # Taking the lock and cleaning it up run with these signals ignored, so no signal can land between creating the lock
     # and owning its cleanup, or interrupt the cleanup itself (a SIGKILL still can: remove the lock by hand once no QA
     # run is active). In between, TERM, HUP and INT end the run through the normal interrupt path.
@@ -1218,16 +1337,17 @@ def run_identity(args, run_dir, packet, source, ident):
             pass
         for sig in guarded:
             signal.signal(sig, signal.default_int_handler if sig == signal.SIGINT else interrupted)
-        return run_identity_locked(args, run_dir, packet, source, ident, keepalive)
+        outcome = run_identity_locked(args, run_dir, packet, source, ident, keepalive)
     finally:
         for sig in guarded:
             signal.signal(sig, signal.SIG_IGN)
         try:
             if have_lock:
                 try:
-                    cleanup_sweep(run_dir, ident, keepalive)   # whatever happened, no QA-user process outlives the run
-                except Exception:
-                    pass
+                    unclean = cleanup_sweep(run_dir, ident, keepalive)   # whatever happened, no QA-user process outlives the run
+                except Exception:   # cleanup_sweep itself failed (disk, pipe): the QA user is not confirmed idle either
+                    unclean = True
+                downgraded = unclean and outcome == EXIT['QA_PASS']
                 try:
                     os.unlink(lock)
                 except OSError:
@@ -1236,33 +1356,51 @@ def run_identity(args, run_dir, packet, source, ident):
             for sig, handler in saved.items():
                 if handler is not None:
                     signal.signal(sig, handler)
+    return EXIT['QA_INVALID'] if downgraded else outcome
 
 
 def cleanup_sweep(run_dir, ident, keepalive):
     """The last sweep of a run. A sweep that could not run or left survivors is never silent: one line for the owner, and
-    CLEANUP.json, which RESULT.json carries as `cleanup` (also after `verdict`). It does not change a sealed state: the
-    seal's own sweep already decided that; this only says what may still be running now."""
-    refreshed = keepalive.refresh()
+    CLEANUP.json, which RESULT.json carries as `cleanup` (also after `verdict`). A QA_PASS cannot stand on it: run_identity
+    turns the exit code into QA_INVALID, and RESULT.json is rewritten on a best-effort basis (`verdict` enforces it from
+    CLEANUP.json). Returns True when the QA user was not confirmed idle. Nothing here raises: the lock must still go."""
+    refreshed = False
+    swept = None
+    error = None
     try:
-        swept = sweep_identity(ident)
-    finally:
-        keepalive.stop()
+        try:
+            refreshed = keepalive.refresh()
+            swept = sweep_identity(ident)
+        finally:
+            keepalive.stop()
+    except Exception as exc:   # an unexpected failure is "could not run", exactly as loud as a refused sweep
+        swept = None
+        error = type(exc).__name__
     if refreshed and swept == 0 and type(swept) is int:
-        return
-    note = {'sweep': swept, 'sudo_refreshed': refreshed, 'sudo_keepalive': keepalive.summary(),
+        return False
+    note = {'sweep': swept, 'sudo_refreshed': refreshed, 'sudo_keepalive': keepalive.summary(), 'error': error,
             'note': 'QA-user processes may survive; run `sudo -v` in the owner Terminal, then the next run\'s pre-sweep '
                     'removes them'}
-    print('NOTE QA-user processes may survive this run (cleanup sweep %s%s); run `sudo -v` in the owner Terminal, then '
-          'the next run\'s pre-sweep removes them' % ('could not run' if swept is None else '%s left' % swept,
-                                                      '' if refreshed else ', sudo -n refused'))
-    write_private(run_dir / 'CLEANUP.json', note)
     try:
+        print('NOTE QA-user processes may survive this run (cleanup sweep %s%s); run `sudo -v` in the owner Terminal, then '
+              'the next run\'s pre-sweep removes them' % ('could not run' if swept is None else '%s left' % swept,
+                                                          '' if refreshed else ', sudo -n refused'))
+        print('QA_INVALID final cleanup sweep did not confirm the QA user is idle; any QA_PASS printed above does not stand')
+    except OSError:
+        pass
+    try:
+        write_private(run_dir / 'CLEANUP.json', note)
         result = read_run_json(run_dir / 'RESULT.json')
         if isinstance(result, dict):
             result['cleanup'] = note
+            if result.get('state') == 'QA_PASS':
+                result['state'] = 'QA_INVALID'
+                result['reasons'] = [clean('final cleanup sweep %s: QA-user processes may still be running, so a pass is not clean'
+                                           % ('could not run' if swept is None else 'left %s' % swept))] + list(result.get('reasons') or [])
             write_private(run_dir / 'RESULT.json', result)
-    except LOAD_ERRORS:
+    except (OSError, ValueError, *LOAD_ERRORS):
         pass
+    return True
 
 
 def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
@@ -1504,10 +1642,264 @@ def qa_exec(args):
 def launchd_problems(domain, done):
     """A launchd domain of the QA user passes only when launchctl reports it absent in the documented form: a non-zero
     exit and "Could not find domain". Any present domain (whatever its services, com.apple.* included), empty or other
-    output, or any other error is a problem. Nothing is parsed, so there is no label allowlist to get around."""
+    output, or any other error is a problem. Nothing is parsed, so there is no label allowlist to get around. Used for
+    gui/<uid>; user/<uid> goes through verify_user_domain, which a present domain can pass."""
     if done.returncode != 0 and LAUNCHD_ABSENT in (done.stdout or '') + (done.stderr or ''):
         return []
     return ['launchd domain %s is present or could not be read (exit %s)' % (domain, done.returncode)]
+
+
+def is_no_gui_session(done):
+    """True for exactly the answer an existing account without a GUI session gives: the exit code, the text on stderr and
+    an empty stdout. It is only the first condition of no_gui_session_problems."""
+    return (done.returncode == LAUNCHD_NO_SESSION[0] and LAUNCHD_NO_SESSION[1] in (done.stderr or '')
+            and not (done.stdout or '').strip())
+
+
+def no_gui_session_problems(ident, domain):
+    """Problems that keep an exit-125 answer for gui/<uid> from meaning "no GUI session", read as the QA user: its launchd
+    manager (`launchctl managername`) must be exactly Background or System, and no process of the uid may be a GUI-session
+    one (loginwindow, WindowServer, Dock, Finder ...), judged by the kernel-reported executable. Anything that cannot be
+    read is a problem (fail closed). Background helpers such as distnoted and cfprefsd are normal and ignored."""
+    qis = _qis()
+    try:
+        name = subprocess.run([qis.SUDO, '-n', '-u', ident.name, LAUNCHCTL, 'managername'], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30, cwd='/', env=HOP_ENV)
+        listed = subprocess.run([PS, '-U', str(ident.uid), '-o', 'pid=,stat='], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as error:
+        return ['launchd domain %s: the no-GUI-session answer could not be corroborated (%s)' % (domain, type(error).__name__)]
+    if sudo_refused(name.stderr) or name.returncode != 0 or name.stdout.strip() not in BACKGROUND_MANAGERS:
+        return ['launchd domain %s: exit 125 but the launchd manager of %s is not Background or System' % (domain, ident.name)]
+    if listed.returncode == 1 and not listed.stdout.strip() and not listed.stderr.strip():
+        return []   # ps exits 1 with an empty table: no process of the uid
+    if listed.returncode != 0:
+        return ['launchd domain %s: the process table of %s could not be read' % (domain, ident.name)]
+    for line in listed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            return ['launchd domain %s: the process table of %s could not be read' % (domain, ident.name)]
+        if fields[1].startswith('Z'):
+            continue
+        pid = int(fields[0])
+        path = executable_path(pid)
+        if path is None:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:   # gone between the listing and the lookup
+                continue
+            except PermissionError:
+                pass
+            return ['launchd domain %s: a process of %s could not be identified' % (domain, ident.name)]
+        if os.path.basename(path) in GUI_SESSION_PROCESSES:
+            return ['launchd domain %s: exit 125 but %s runs a GUI-session process (%s)' % (domain, ident.name, os.path.basename(path))]
+    return []
+
+
+def parse_user_domain(text, uid):
+    """(services, problems) from `launchctl print user/<uid>`: services is [(pid, label)] (pid 0 when not running). The
+    header, the `services` block and the `unmanaged processes` block must be there and well formed; a process outside
+    launchd's services, an unparsable row, or a count that disagrees with the rows is a problem."""
+    lines = (text or '').splitlines()
+    if not lines or lines[0].strip() != 'user/%d = {' % uid:
+        return [], ['the launchd user domain output does not have the expected header']
+
+    def block(title):
+        try:
+            start = next(i for i, line in enumerate(lines) if line.strip() == title + ' = {')
+        except StopIteration:
+            return None
+        body = []
+        for line in lines[start + 1:]:
+            if line.strip() == '}':
+                return body
+            body.append(line)
+        return None
+    services, problems = [], []
+    rows = block('services')
+    if rows is None:
+        return [], ['the launchd user domain output has no services block']
+    for line in rows:
+        if not line.strip():
+            continue
+        match = SERVICE_ROW_RE.fullmatch(line.strip())
+        if not match or not SERVICE_LABEL_RE.fullmatch(match.group(3)):
+            return [], ['the launchd user domain lists a service row that cannot be read']
+        services.append((int(match.group(1)), match.group(3)))
+    unmanaged = block('unmanaged processes')
+    if unmanaged is None:
+        problems.append('the launchd user domain output has no unmanaged processes block')
+    elif any(line.strip() for line in unmanaged):
+        problems.append('the launchd user domain has %d unmanaged process(es) outside its services' % sum(1 for l in unmanaged if l.strip()))
+    declared = re.search(r'^\s*service count = (\d+)\s*$', text, re.M)
+    if declared and int(declared.group(1)) != len(services):
+        problems.append('the launchd user domain service count does not match its rows')
+    if len(services) > MAX_DOMAIN_SERVICES:
+        problems.append('the launchd user domain has more than %d services' % MAX_DOMAIN_SERVICES)
+    return services, problems
+
+
+def is_interpreter(program):
+    """True when the program's name, lower-cased and without a trailing version (python3.9, perl5.34), is an interpreter or
+    shell. An exact match after the version is stripped, not a prefix: legitimate system programs begin with the same letters
+    (shortcutsd, sharingd, opendirectoryd)."""
+    return re.sub(r'[0-9._-]+$', '', os.path.basename(program).casefold()) in INTERPRETERS
+
+
+def service_problem(text, uid, label):
+    """None when `launchctl print user/<uid>/<label>` shows a service defined by a plist on the sealed system volume;
+    otherwise the reason. `path` is launchd's own report of the loaded plist; a job submitted by the QA user has none or
+    a path it can write. The program, arguments and environment of a job are printed too and are chosen by its owner, so
+    only the header counts: `path` and `type` must each appear exactly once at the top level, in the order launchd prints
+    them, before `program` and before the first nested block. A line forged inside a value (a newline in a program name,
+    an argument or an environment variable) can only come after those and is refused."""
+    lines = (text or '').splitlines()
+    if not lines or lines[0].strip() != 'user/%d/%s = {' % (uid, label):
+        return 'unexpected header'
+    key = re.compile(r'\t(path|type|program) = (.+)')
+    nested = re.compile(r'\t\S.* = \{\s*$')
+    seen, first = {}, {}
+    for index, line in enumerate(lines[1:], 1):
+        if nested.match(line) and 'nested' not in first:
+            first['nested'] = index
+        match = key.fullmatch(line.rstrip())
+        if match:
+            if match.group(1) in seen:
+                return 'repeats %s' % match.group(1)
+            seen[match.group(1)] = match.group(2).strip()
+            first[match.group(1)] = index
+    path, kind = seen.get('path', ''), seen.get('type')
+    if kind == 'LaunchAgent':
+        rest = next((path[len(d):] for d in SERVICE_PLIST_DIRS if path.startswith(d)), None)
+        if rest is None or not rest.endswith('.plist') or '/' in rest or '..' in rest:
+            return 'defined outside the system launch directories or without a plist'
+    elif kind == 'XPCService':
+        # macOS registers its on-demand XPC services in the user domain from a bundle directory, not from a launch plist
+        head, _, name = path.rpartition('/')
+        if (not path.startswith('/System/Library/') or '..' in path or not name.endswith('.xpc') or len(name) <= len('.xpc')
+                or not head.endswith('/XPCServices')):
+            return 'an XPC service outside a sealed XPCServices directory'
+    else:
+        return 'not a LaunchAgent or XPCService'
+    order = [first['path'], first['type']] + ([first['program']] if 'program' in first else [])
+    if order != sorted(order) or ('nested' in first and first['nested'] < max(order)):
+        return 'header fields out of the order launchd prints them'
+    # Nothing but numeric counters and the label of the service a copy was made from (launchd's on-demand copies, such as
+    # the mdworker.shared.<uuid> ones) may precede the path, and the type follows it directly: the only text a job's owner
+    # chooses is printed further down, so no line of it can stand in for these two.
+    if first['type'] != first['path'] + 1 or not all(re.fullmatch(r'\t(active count|copy count) = \d+|\toriginal = [A-Za-z0-9_][A-Za-z0-9_.-]{0,199}', line)
+                                                     for line in lines[1:first['path']]):
+        return 'header does not have the shape launchd prints for a system service'
+    program = seen.get('program')
+    allowed = (path + '/',) if kind == 'XPCService' else SERVICE_PROGRAM_PREFIXES   # an XPC program lives inside its bundle
+    if (program is None or not program.startswith(allowed) or '..' in program
+            or is_interpreter(program)):
+        return 'has no program, or one that is not a system daemon'
+    return None
+
+
+def sealed_problem(path, want, roots=('/System/Library/',)):
+    """None when `path` is on the sealed part of the system volume: it must lie under /System/Library/ (no '..'), and every
+    component, both along the path as given and along its fully resolved form, must be owned by root, not writable by group
+    or other, and (on the resolved path) not a link. `want` is 'file' or 'dir' for the final component. A mode-777 directory
+    anywhere in the chain (for example /System/Library/AssetsV2/downloadDir, a firmlink into the data volume) fails it, which
+    a device-number comparison cannot see. A link inside the system volume is followed only to a target that passes too
+    (some frameworks reach Resources through Versions/Current)."""
+    if not path.startswith(roots) or '..' in path.split('/'):
+        return 'path not under %s' % ' or '.join(roots)
+
+    def walk(full, links_ok):
+        current = ''
+        for part in full.strip('/').split('/'):
+            current += '/' + part
+            try:
+                st = os.lstat(current)
+            except OSError:
+                return 'cannot read: ...%s' % current[-40:]
+            if st.st_uid != 0 or (st.st_mode & 0o022 and not stat.S_ISLNK(st.st_mode)):
+                return 'not root-owned/closed: ...%s' % current[-40:]
+            if stat.S_ISLNK(st.st_mode) and not links_ok:
+                return 'link: ...%s' % current[-40:]
+        return None
+    reason = walk(path, True)
+    if reason:
+        return reason
+    real = os.path.realpath(path)
+    if not real.startswith(roots):
+        return 'resolves outside %s' % ' or '.join(roots)
+    reason = walk(real, False)
+    if reason:
+        return reason
+    try:
+        mode = os.lstat(real).st_mode
+    except OSError:
+        return 'cannot read: ...%s' % real[-40:]
+    if not (stat.S_ISDIR(mode) if want == 'dir' else stat.S_ISREG(mode)):
+        return 'not a %s: ...%s' % ('directory' if want == 'dir' else 'file', real[-40:])
+    return None
+
+
+def service_files_problem(text):
+    """None when the plist or XPC bundle that launchd reports for a service, and its program, are on the sealed system
+    volume (sealed_problem). Run after service_problem has pinned the header, so the `path` and `program` read here are
+    the ones it accepted."""
+    fields = {}
+    for key in ('path', 'type', 'program'):
+        found = re.search(r'^\t%s = (.+)$' % key, text or '', re.M)
+        fields[key] = found.group(1).strip() if found else ''
+    reason = sealed_problem(fields['path'], 'dir' if fields['type'] == 'XPCService' else 'file')
+    return reason or sealed_problem(fields['program'], 'file', SERVICE_PROGRAM_PREFIXES)
+
+
+def verify_user_domain(ident, running_only=False):
+    """(running service pids, problems) of the QA user's launchd user domain. An absent domain (the account never ran
+    anything) is clean and has no pids. A present one passes when parse_user_domain finds no problem and every loaded
+    service (or, with running_only, every running one) is defined by a system-volume plist. Any call that fails, times out
+    or is refused by sudo is a problem (fail closed). Root and the caller's own uid are refused before any subprocess."""
+    if not isinstance(ident.uid, int) or isinstance(ident.uid, bool) or ident.uid in (0, os.getuid()):
+        return set(), ['launchd check refused for root or your own uid']
+    qis = _qis()
+    domain = 'user/%d' % ident.uid
+    deadline = time.monotonic() + DOMAIN_SECONDS
+
+    def launchctl(target):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired('launchctl', DOMAIN_SECONDS)
+        return subprocess.run([qis.SUDO, '-n', '-u', ident.name, LAUNCHCTL, 'print', target], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=min(30, left), cwd='/', env=HOP_ENV)
+    try:
+        done = launchctl(domain)
+        if sudo_refused(done.stderr):
+            return set(), ['launchd domain %s could not be read (sudo -n refused)' % domain]
+        if done.returncode != 0:
+            return set(), launchd_problems(domain, done)
+        services, problems = parse_user_domain(done.stdout, ident.uid)
+        if problems:
+            return set(), ['launchd domain %s: %s' % (domain, p) for p in problems]
+        pids = set()
+        for pid, label in services:
+            if running_only and not pid:
+                continue
+            answer = launchctl('%s/%s' % (domain, label))
+            if sudo_refused(answer.stderr):
+                return set(), ['launchd domain %s could not be read (sudo -n refused)' % domain]
+            reason = service_problem(answer.stdout, ident.uid, label) if answer.returncode == 0 else 'could not be read (exit %s)' % answer.returncode
+            if reason is None:
+                reason = service_files_problem(answer.stdout)
+            if reason:
+                problems.append('service %s: %s' % (label[:60], reason))   # the owner reads only the first 120 characters
+            elif pid:
+                pids.add(pid)
+        return (set(), problems) if problems else (pids, [])
+    except (OSError, subprocess.SubprocessError) as error:
+        return set(), ['launchd domain %s could not be read (%s)' % (domain, type(error).__name__)]
+
+
+def verified_service_pids(ident):
+    """Pids of the running services of the QA user's launchd domain, only when every running one is defined by a system
+    plist; an empty set (so nothing is tolerated) on any problem."""
+    return verify_user_domain(ident, running_only=True)[0]
 
 
 def persistence_problems(ident):
@@ -1535,15 +1927,18 @@ def persistence_problems(ident):
                 problems.append('the %s of %s is not empty' % (label, ident.name))
         elif not (absent and absent in (done.stderr or '').lower()):
             problems.append('could not check the %s of %s (exit %s)' % (label, ident.name, done.returncode))
-    for domain in ('user/%d' % ident.uid, 'gui/%d' % ident.uid):
-        try:
-            done = subprocess.run([qis.SUDO, '-n', '-u', ident.name, LAUNCHCTL, 'print', domain], stdin=subprocess.DEVNULL,
-                                  capture_output=True, text=True, timeout=30, cwd='/', env=HOP_ENV)
-        except (OSError, subprocess.SubprocessError) as error:
-            problems.append('launchd domain %s could not be read (%s)' % (domain, type(error).__name__))
-            continue
+    problems += verify_user_domain(ident)[1]
+    domain = 'gui/%d' % ident.uid
+    try:
+        done = subprocess.run([qis.SUDO, '-n', '-u', ident.name, LAUNCHCTL, 'print', domain], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30, cwd='/', env=HOP_ENV)
+    except (OSError, subprocess.SubprocessError) as error:
+        problems.append('launchd domain %s could not be read (%s)' % (domain, type(error).__name__))
+    else:
         if sudo_refused(done.stderr):
             problems.append('launchd domain %s could not be read (sudo -n refused)' % domain)
+        elif is_no_gui_session(done):
+            problems += no_gui_session_problems(ident, domain)
         else:
             problems += launchd_problems(domain, done)
     return problems

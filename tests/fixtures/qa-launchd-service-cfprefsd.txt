@@ -1,0 +1,59 @@
+user/530/com.apple.cfprefsd.xpc.agent = {
+	active count = 2
+	path = /System/Library/LaunchAgents/com.apple.cfprefsd.xpc.agent.plist
+	type = LaunchAgent
+	state = running
+
+	program = /usr/sbin/cfprefsd
+	arguments = {
+		/usr/sbin/cfprefsd
+		agent
+	}
+
+
+
+	domain = user/530
+	asid = 103437
+	minimum runtime = 10
+	base minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	pid = 28127
+	immediate reason = ipc (mach)
+	forks = 0
+	execs = 1
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxy started suspended = 0
+	checked allocations = 0 (queried = 1)
+	checked allocations reason = no host
+	checked allocations flags = 0x0
+	last exit code = (never exited)
+
+	endpoints = {
+		"com.apple.cfprefsd.agent" = {
+			port = 0x56a7b
+			active = 1
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 0
+		}
+	}
+
+	resource coalition = {
+		ID = 154922
+		type = resource
+		state = active
+		active count = 1
+		name = com.apple.cfprefsd.xpc.agent
+	}
+
+	jetsam coalition = {
+		ID = 154923
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.apple.cfprefsd.xpc.agent
+	}

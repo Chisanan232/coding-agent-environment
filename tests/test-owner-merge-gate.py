@@ -14,6 +14,7 @@ omg = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(omg)
 
 HEAD = "a" * 40
+SRC = [{"path": "src/a.py"}]
 OWNERS = ["Chisanan232", "horonomy", "ai-agent-assembly"]
 REVIEW = f"OWNER-MERGE-REVIEW head={HEAD} verdict=PASS blocking=0 reviewer=independent-agent-1"
 
@@ -55,6 +56,17 @@ class Fake:
             return json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"pageInfo": {"hasNextPage": self.more_threads}, "nodes": self.threads}}}}})
         if a[0] == "api" and a[1].startswith("orgs/"):
             return self.org_role + "\n"
+        if a[0] == "api" and "/contents/.github/workflows?ref=" in a[1]:
+            ref = a[1].rpartition("?ref=")[2]
+            self.workflow_reads = getattr(self, "workflow_reads", []) + [ref]
+            answer = self.workflows.get(ref, self.workflows.get("*")) if isinstance(getattr(self, "workflows", None), dict) else getattr(self, "workflows", None)
+            if answer is None:
+                raise RuntimeError(f"gh api repos/{a[1].split('/')[1]}/{a[1].split('/')[2]}/contents/.github/workflows failed: gh: Not Found (HTTP 404)")
+            if answer == "error":
+                raise RuntimeError("gh api repos/x/y/contents/.github/workflows failed: HTTP 502")
+            if answer == "ratelimit":
+                raise RuntimeError("gh api repos/a/app404/contents/.github/workflows failed: gh: API rate limit exceeded (HTTP 403)")
+            return "" if answer == "empty" else str(answer) + "\n"
         if a[0] == "api" and "/commits/" in a[1]:
             return json.dumps(self.parents)
         raise AssertionError(a)
@@ -159,6 +171,84 @@ class Gate(unittest.TestCase):
         self.assertEqual((v, facts["ci_exception"]), ("PASS", "billing"))
         stale = [comments[0], {"author": {"login": "chisanan232"}, "body": record.replace(HEAD, "d" * 40)}]
         self.refused(Fake(statusCheckRollup=[], comments=stale), "NO_CI_EVIDENCE", ci_unavailable=True)
+
+    NOCI = f"OWNER-MERGE-CI-EXCEPTION head={HEAD} basis=no-hosted-ci local_equivalent=PASS"
+
+    def noci_fake(self, files=None, comments=None, **over):
+        fake = Fake(statusCheckRollup=over.pop("statusCheckRollup", []), comments=comments if comments is not None else self.noci_comments(), **over)
+        fake.pr["files"] = SRC if files is None else files
+        return fake
+
+    def noci_comments(self, record=None):
+        return [{"author": {"login": "chisanan232"}, "body": REVIEW}, {"author": {"login": "chisanan232"}, "body": record or self.NOCI}]
+
+    def test_no_hosted_ci_exception_needs_flag_record_zero_checks_and_no_workflows(self):
+        self.refused(self.noci_fake(comments=self.noci_comments()), "NO_CI_EVIDENCE")                  # flag missing
+        v, _, facts = run(self.noci_fake(comments=self.noci_comments()), ci_exception=True)
+        self.assertEqual((v, facts["ci_exception"]), ("PASS", "no-hosted-ci"))
+        self.refused(self.noci_fake(comments=[self.noci_comments()[0]]), "NO_CI_EVIDENCE", ci_exception=True)   # no record
+        stale = self.noci_comments(self.NOCI.replace(HEAD, "d" * 40))
+        self.refused(self.noci_fake(comments=stale), "NO_CI_EVIDENCE", ci_exception=True)            # another head
+        self.refused(self.noci_fake(comments=self.noci_comments(self.NOCI.replace("PASS", "FAIL"))), "NO_CI_EVIDENCE", ci_exception=True)
+        other = [self.noci_comments()[0], {"author": {"login": "someone-else"}, "body": self.NOCI}]
+        self.refused(self.noci_fake(comments=other), "NO_CI_EVIDENCE", ci_exception=True)            # not the authenticated user
+
+    def test_no_hosted_ci_exception_is_refused_where_workflows_exist_or_cannot_be_read(self):
+        for workflows in (3, 1, 0, "empty", "error", "ratelimit", {"main": None, "*": 2}, {HEAD: 2, "*": None}):
+            with self.subTest(workflows=workflows):
+                self.refused(self.noci_fake(comments=self.noci_comments(), workflows=workflows), "NO_CI_EVIDENCE", ci_exception=True)
+
+    def test_a_repository_name_containing_404_cannot_imitate_a_missing_directory(self):
+        fake = self.noci_fake(comments=self.noci_comments(), workflows="ratelimit")
+        self.assertTrue(omg.has_workflows(fake, "a/app404", "main"))                      # "404" only in the repo name and the path
+        self.refused(fake, "NO_CI_EVIDENCE", ci_exception=True)
+
+    def test_the_workflow_directory_is_read_at_the_base_and_at_the_head(self):
+        fake = self.noci_fake(comments=self.noci_comments())
+        v, _, _ = run(fake, ci_exception=True)
+        self.assertEqual(v, "PASS")
+        self.assertEqual(sorted(fake.workflow_reads), sorted(["main", HEAD]))
+        # workflows only at the head (a PR that brings them) or only at the base both refuse
+        self.refused(self.noci_fake(comments=self.noci_comments(), workflows={HEAD: 1, "*": None}), "NO_CI_EVIDENCE", ci_exception=True)
+        self.refused(self.noci_fake(comments=self.noci_comments(), workflows={"main": 1, "*": None}), "NO_CI_EVIDENCE", ci_exception=True)
+
+    def test_a_pr_that_adds_or_touches_a_workflow_or_has_an_unknown_file_list_cannot_use_the_exception(self):
+        for files in ([{"path": ".github/workflows/ci.yml"}], [{"path": "src/a.py"}, {"path": ".github/workflows/x.yml"}],
+                      [{"path": ".GitHub/Workflows/x.yml"}], [{"path": "pkg/.github/workflows/a.yml"}], [], [{"path": f"f{i}"} for i in range(100)]):
+            with self.subTest(files=files[:2]):
+                self.refused(self.noci_fake(files=files), "NO_CI_EVIDENCE", ci_exception=True)
+        v, _, _ = run(self.noci_fake(), ci_exception=True)
+        self.assertEqual(v, "PASS")
+
+    def test_a_pull_request_from_a_fork_cannot_use_the_exception(self):
+        self.refused(self.noci_fake(comments=self.noci_comments(), isCrossRepository=True), "NO_CI_EVIDENCE", ci_exception=True)
+
+    def test_a_check_that_ran_without_failing_still_blocks_the_exception(self):
+        for conclusion in ("SKIPPED", "NEUTRAL", "SUCCESS"):
+            with self.subTest(conclusion=conclusion):
+                v, _, facts = run(self.noci_fake(statusCheckRollup=[{"name": "t", "status": "COMPLETED", "conclusion": conclusion}]), ci_exception=True)
+                self.assertNotIn("ci_exception", facts)
+
+    def test_no_hosted_ci_exception_never_excuses_checks_that_ran_or_a_missing_review(self):
+        bad = [{"name": "t", "status": "COMPLETED", "conclusion": "FAILURE"}]
+        self.refused(self.noci_fake(statusCheckRollup=bad), "CI_FAILED", ci_exception=True)
+        pending = [{"name": "t", "status": "IN_PROGRESS", "conclusion": ""}]
+        v, _, _ = run(self.noci_fake(statusCheckRollup=pending), ci_exception=True)
+        self.assertEqual(v, "WAIT")
+        self.refused(self.noci_fake(comments=[self.noci_comments()[1]]), "NO_REVIEW_EVIDENCE", ci_exception=True)
+
+    def test_the_two_ci_exceptions_do_not_substitute_for_each_other(self):
+        unavailable = f"OWNER-MERGE-CI-UNAVAILABLE head={HEAD} cause=billing local_equivalent=PASS"
+        self.refused(self.noci_fake(comments=self.noci_comments(unavailable)), "NO_CI_EVIDENCE", ci_exception=True)
+        self.refused(self.noci_fake(comments=self.noci_comments()), "NO_CI_EVIDENCE", ci_unavailable=True)
+
+    def test_the_workflow_read_is_an_allowed_read_only_call(self):
+        omg.read_only(("api", "repos/Chisanan232/r/contents/.github/workflows?ref=main", "--jq", "length"))
+        omg.read_only(("api", f"repos/Chisanan232/r/contents/.github/workflows?ref={'a' * 40}", "--jq", "length"))
+        for bad in ("repos/Chisanan232/r/contents/.github/workflows", "repos/Chisanan232/r/contents/.github/workflows/ci.yml?ref=main",
+                    "repos/Chisanan232/r/contents/.github/workflows?ref=../x", "repos/Chisanan232/r/contents/.github/workflows?ref=main&x=1"):
+            with self.subTest(bad), self.assertRaises(RuntimeError):
+                omg.read_only(("api", bad, "--jq", "length"))
 
     def test_ci_unavailable_never_excuses_a_genuine_failure(self):
         record = f"OWNER-MERGE-CI-UNAVAILABLE head={HEAD} cause=billing local_equivalent=PASS"
@@ -458,6 +548,128 @@ class ReviewHardening(unittest.TestCase):
     def test_verify_rejects_bad_repo_or_head(self):
         self.assertEqual(omg.verify(lambda *a: self.fail("gh"), "Chisanan232/r\n", 7, HEAD)["verdict"], "ERROR")
         self.assertEqual(omg.verify(lambda *a: self.fail("gh"), "Chisanan232/r", 7, "abc")["verdict"], "ERROR")
+
+
+class BillingCI(unittest.TestCase):
+    """--ci-unavailable with cause=billing waives only Actions jobs that never ran a step (SPE-149)."""
+
+    RECORD = f"OWNER-MERGE-CI-UNAVAILABLE head={HEAD} cause=billing local_equivalent=PASS"
+    TEXT = "The job was not started because recent account payments have failed or your spending limit needs to be increased."
+
+    def job(self, jid, name, conclusion="FAILURE", **over):
+        c = {"__typename": "CheckRun", "name": name, "status": "COMPLETED", "conclusion": conclusion,
+             "detailsUrl": f"https://github.com/Chisanan232/r/actions/runs/900/job/{jid}"}
+        c.update(over)
+        return c
+
+    def fake(self, checks, notes, steps=None, record=None, errors=(), **over):
+        comments = [{"author": {"login": "chisanan232"}, "body": REVIEW},
+                    {"author": {"login": "chisanan232"}, "body": record or self.RECORD}]
+        fake = Fake(statusCheckRollup=checks, comments=comments, **over)
+        base = fake.__call__
+        by_id = {str(c["detailsUrl"]).rpartition("/")[2]: c for c in checks if c.get("detailsUrl")}
+
+        def call(*a):
+            if a[0] == "api" and a[1].startswith("repos/Chisanan232/r/") and ("/check-runs/" in a[1] or "/actions/jobs/" in a[1]):
+                jid = a[1].split("/")[4 if "/check-runs/" in a[1] else 5].split("?")[0]
+                if jid in errors:
+                    raise RuntimeError("gh api failed: HTTP 502")
+                c = by_id[jid]
+                if "/annotations" in a[1]:
+                    return json.dumps([{"message": m} for m in notes.get(jid, [])])
+                if "/check-runs/" in a[1]:
+                    return json.dumps({"id": int(jid), "head_sha": HEAD, "name": c["name"], "app": {"slug": "github-actions"}})
+                return json.dumps({"id": int(jid), "run_id": 900, "head_sha": HEAD, "name": c["name"],
+                                   "steps": (steps or {}).get(jid, [])})
+            return base(*a)
+        return call
+
+    def verdict(self, *a, **k):
+        return run(self.fake(*a, **k), ci_unavailable=True)
+
+    def test_billing_annotated_job_with_no_steps_is_waived_and_never_called_green(self):
+        v, reasons, facts = self.verdict([self.job("1", "t"), self.job("2", "lint", "SUCCESS")], {"1": [self.TEXT]})
+        self.assertEqual((v, reasons, facts["ci_exception"]), ("PASS", [], "billing"))
+        self.assertEqual([c["name"] for c in facts["ci_unavailable_checks"]], ["t"])
+        self.assertEqual(facts["ci_unavailable_checks"][0]["conclusion"], "FAILURE")
+        self.assertTrue(facts["ci_verdict"].startswith("NOT_A_CI_PASS"))
+
+    def test_skipped_only_steps_count_as_not_executed(self):
+        v, _, _ = self.verdict([self.job("1", "t")], {"1": [self.TEXT]}, steps={"1": [{"conclusion": "skipped"}]})
+        self.assertEqual(v, "PASS")
+
+    def test_matrix_sibling_cancelled_by_a_billing_blocked_job_is_waived(self):
+        cancel = 'The strategy configuration was canceled because "t._py311" failed'
+        v, _, facts = self.verdict([self.job("1", "t (py311)"), self.job("2", "t (py312)", "CANCELLED")],
+                                   {"1": [self.TEXT], "2": [cancel]})
+        self.assertEqual(v, "PASS")
+        self.assertEqual(len(facts["ci_unavailable_checks"]), 2)
+
+    def test_matrix_sibling_of_a_real_failure_refuses(self):
+        cancel = 'The strategy configuration was canceled because "t._py311" failed'
+        for notes in ({"1": ["Process completed with exit code 1."], "2": [cancel]}, {"2": [cancel]}):
+            with self.subTest(notes=notes):
+                checks = [self.job("1", "t (py311)"), self.job("2", "t (py312)", "CANCELLED")]
+                v, reasons, _ = self.verdict(checks, notes, steps={"1": [{"conclusion": "failure"}]})
+                self.assertEqual(v, "REFUSE")
+                self.assertTrue(any(r.startswith("CI_FAILED") for r in reasons))
+
+    def test_a_job_that_executed_a_step_refuses_even_with_the_billing_text(self):
+        v, reasons, _ = self.verdict([self.job("1", "t")], {"1": [self.TEXT]}, steps={"1": [{"conclusion": "success"}]})
+        self.assertEqual(v, "REFUSE")
+        self.assertTrue(reasons[0].startswith("CI_FAILED"))
+
+    def test_non_actions_check_failing_refuses(self):
+        sonar = {"__typename": "StatusContext", "context": "SonarCloud", "state": "FAILURE"}
+        v, reasons, _ = self.verdict([self.job("1", "t"), sonar], {"1": [self.TEXT]})
+        self.assertEqual(v, "REFUSE")
+        sonar_run = self.job("3", "Sonar", detailsUrl="https://sonarcloud.io/dashboard?id=x")
+        self.assertEqual(self.verdict([self.job("1", "t"), sonar_run], {"1": [self.TEXT]})[0], "REFUSE")
+
+    def test_a_non_failed_but_unsuccessful_check_blocks_the_waiver(self):
+        sonar = {"__typename": "StatusContext", "context": "SonarCloud", "state": "ERRORISH"}
+        v, reasons, _ = self.verdict([self.job("1", "t"), sonar], {"1": [self.TEXT]})
+        self.assertEqual(v, "REFUSE")
+
+    def test_pending_check_still_waits(self):
+        pend = {"__typename": "CheckRun", "name": "slow", "status": "IN_PROGRESS", "conclusion": ""}
+        self.assertEqual(self.verdict([self.job("1", "t"), pend], {"1": [self.TEXT]})[0], "WAIT")
+
+    def test_flag_record_head_and_cause_are_all_required(self):
+        checks, notes = [self.job("1", "t")], {"1": [self.TEXT]}
+        v, reasons, _ = run(self.fake(checks, notes))  # no flag
+        self.assertEqual(v, "REFUSE")
+        for record in (self.RECORD.replace(HEAD, "d" * 40), self.RECORD.replace("billing", "quota"),
+                       self.RECORD.replace("billing", "outage"), self.RECORD.replace("PASS", "FAIL")):
+            with self.subTest(record=record):
+                v, reasons, _ = self.verdict(checks, notes, record=record)
+                self.assertEqual(v, "REFUSE")
+                self.assertTrue(reasons[0].startswith("CI_FAILED"))
+        v, _, _ = omg.evaluate(self.fake(checks, notes, record="unrelated"), "Chisanan232/r", 7, OWNERS, ci_unavailable=True)
+        self.assertEqual(v, "REFUSE")
+
+    def test_a_later_non_billing_record_overrides_a_billing_one(self):
+        fake = self.fake([self.job("1", "t")], {"1": [self.TEXT]})
+        # rebuild with both records, billing first then quota
+        comments = [{"author": {"login": "chisanan232"}, "body": b} for b in (REVIEW, self.RECORD, self.RECORD.replace("billing", "quota"))]
+        f2 = Fake(statusCheckRollup=[self.job("1", "t")], comments=comments)
+        self.assertEqual(run(lambda *a: fake(*a) if a[:2] != ("pr", "view") else f2(*a), ci_unavailable=True)[0], "REFUSE")
+
+    def test_unknown_missing_or_truncated_annotation_refuses(self):
+        for notes in ({"1": ["Process completed with exit code 1."]}, {}, {"1": [self.TEXT] * 100}):
+            with self.subTest(n=len(notes.get("1", []))):
+                self.assertEqual(self.verdict([self.job("1", "t")], notes)[0], "REFUSE")
+
+    def test_api_error_refuses(self):
+        v, reasons, facts = self.verdict([self.job("1", "t")], {"1": [self.TEXT]}, errors=("1",))
+        self.assertEqual(v, "REFUSE")
+        self.assertIn("ci_unavailable_refused", facts)
+
+    def test_only_cancelled_and_failed_actions_jobs_for_this_repo_qualify(self):
+        for over in ({"conclusion": "TIMED_OUT"}, {"__typename": "StatusContext"},
+                     {"detailsUrl": "https://github.com/other/r/actions/runs/900/job/1"}, {"detailsUrl": ""}):
+            with self.subTest(over=over):
+                self.assertEqual(self.verdict([self.job("1", "t", **over)], {"1": [self.TEXT]})[0], "REFUSE")
 
 
 if __name__ == "__main__":

@@ -147,19 +147,20 @@ sudo forgets the credential after its timestamp window (5 minutes by default), a
 refresh until the run ends, and once more right before the seal and the final sweep. Every failed refresh is recorded in
 `RUNMETA.json` (`sudo_keepalive`). If sudo refuses before the seal, the result says exactly that ("could not check the QA
 user after codex ran: sudo -n refused") and stays `QA_INVALID`, because codex ran and nothing was checked. If the final
-cleanup sweep cannot run or leaves processes, the producer prints one `NOTE` line and records it as `cleanup` in
-`RESULT.json`; run `sudo -v` in the owner Terminal and the next run's pre-sweep removes them. Whether the keepalive behaves
+cleanup sweep cannot run (including an unexpected error) or leaves processes, the producer prints one `NOTE` line, records it
+as `cleanup` in `RESULT.json`, and a sealed `QA_PASS` becomes `QA_INVALID` (exit 12; a later `verdict` cannot restore the
+pass, and any other sealed state is unchanged); run `sudo -v` in the owner Terminal and the next run's pre-sweep removes them. Whether the keepalive behaves
 the same against a real terminal's sudo timestamp is not verified until the first owner run.
 
 Three hops, each through `qa_argv`, with the QA side running a producer-owned copy of this script under `/usr/bin/python3 -I`:
 
 | Hop | Runs as | What happens | What the producer trusts |
 |---|---|---|---|
-| sweep | QA user | `kill -KILL -1` as that user, then `pgrep -U uid` (ids only): no QA process from an earlier run survives; then the persistence check (crontab, at, LaunchAgents, launchd domains) must be clean | the survivor count and the persistence result |
+| sweep | QA user | `kill -KILL -1` as that user, then list the user's processes (`ps -U uid`, ids only; running services of the verified launchd domain described below do not count): no QA process from an earlier run survives; then the persistence check (crontab, at, LaunchAgents, launchd domains) must be clean | the survivor count and the persistence result |
 | 0 env canary | producer + QA user | producer holds a synthetic sentinel in a sibling's environment and proves it can read it itself (positive control); the setup script's probe runs as the QA user and must not read it, plus the uid, groups, tty, `~/.codex` mode and exchange checks | the probe record, emitted before any model; `ISOLATION.json` |
 | 1 `qa-stage` | QA user | creates the outbox attempt `O`, copies the inbox clone to `O/source`, a private Codex home under `/Users/NAME/.local/state/coding-agent-environment/qa/<attempt>/codexhome`, and runs the confinement probe there; prints exactly one JSON record with the SHA-256 of the profile it proved | the observed control results only: `established` is re-derived from the expected control set, never taken from the QA side; the profile digest; `CONFINEMENT.json` |
 | 2 `qa-exec` | QA user | moves its stderr to `O/stderr.log`, refuses to start codex unless the profile still has the digest hop 1 proved (exit 125), runs `codex exec` with the prompt from the inbox file, kills codex's group on timeout or signal (exit 124 / 130) | the codex stdout captured through the pipe into `R/events.jsonl` |
-| seal | producer | sweep again and list the QA user's processes once more after 12 s (longer than launchd's 10 s respawn throttle); read the QA user's crontab, at queue, `~/Library/LaunchAgents` and whether its launchd `user/<uid>` and `gui/<uid>` domains exist (as that user, `sudo -n`; any entry fails, and each launchd domain passes only when `launchctl print` exits non-zero with "Could not find domain"); open the exchange, outbox, `O` and `O/source` once each relative to the parent descriptor with `O_NOFOLLOW\|O_DIRECTORY` and check the owner of what was opened; read `O/verdict.json` relative to the held `O` descriptor, only if a single-link regular file owned by the QA user and at most 5 MiB; compare `O/source` with the producer's manifest once; then confirm every path component still names the directory that was opened (device and inode) | the sealed values in `RUNMETA.json` (`qa_identity`, `stragglers`, `persistence`, `path_ok`, `tree_problems`, `untracked`) |
+| seal | producer | sweep again and list the QA user's processes once more after 12 s (longer than launchd's 10 s respawn throttle); read the QA user's crontab, at queue, `~/Library/LaunchAgents` and its launchd `user/<uid>` domain (a present domain passes only when it verifies, see below) and whether its `gui/<uid>` domain exists (as that user, `sudo -n`; any entry fails, and the `gui/` domain passes only when `launchctl print` exits non-zero with "Could not find domain"); open the exchange, outbox, `O` and `O/source` once each relative to the parent descriptor with `O_NOFOLLOW\|O_DIRECTORY` and check the owner of what was opened; read `O/verdict.json` relative to the held `O` descriptor, only if a single-link regular file owned by the QA user and at most 5 MiB; compare `O/source` with the producer's manifest once; then confirm every path component still names the directory that was opened (device and inode) | the sealed values in `RUNMETA.json` (`qa_identity`, `stragglers`, `persistence`, `path_ok`, `tree_problems`, `untracked`) |
 
 Paths: `X` exchange, `R` the producer's run directory, attempt `A=<product>-<ticket>-<R name>-<8 hex>`, inbox
 `I=X/inbox/A` (producer-owned, read-only to the QA user through the inherited ACE: script copy, packet, prompt, and a copy
@@ -205,7 +206,10 @@ codex as the QA user.
 
 - A Codex verdict is QA evidence, not merge evidence. It is never written as an owner-merge review record.
 - Admission is checked with `disk-admission.py check --weight light`; heavy commands inside the QA run must use the
-  product's own resource wrapper, and contention is reported as blocked, not failed.
+  product's own resource wrapper, and contention is reported as blocked, not failed. `qa-handoff.py` runs from a directory
+  that also holds `disk-admission.py`, and `--qa-identity` additionally needs `qa-identity-setup.py` there (copy all from
+  the same revision). A missing `qa-identity-setup.py` is a `REFUSED` with that message; a missing `disk-admission.py` is
+  `QA_INCOMPLETE` saying so, not a `WAITING_RESOURCE` resource refusal.
 - Product release flows (`/release-qa-gate`, frozen candidates, release evidence) are not touched by this tool.
 - Adoption is per product and opt-in: a pilot is shown only when the product's own session runs the hop and acts on the
   verdict. No general migration, managed skill or global instruction change is part of this.
@@ -264,9 +268,40 @@ the hop and acts on the verdict.
   untrusted, but the producer must still treat it as data.
 - The event stream is the `codex exec` process's own stdout. The wrapper counts only `command_execution` completions that carry a unique id (a model cannot write to that stream; text it prints stays inside an escaped string field on the verified codex version), but a process that can write the stream itself, such as a replaced or compromised codex binary, can forge items and obtain `QA_PASS`. Codex QA reproduced this only with the offline fake codex, which is that process. Defending against it needs an attestation the producer's own user cannot create; that is the open evidence-independence decision, not something this wrapper can close.
 - In the same-user mode a sandboxed command that detaches into its own session (`setsid`) can outlive the timeout kill.
-  With `--qa-identity` the seal kills every process of the QA user and a survivor is `QA_INVALID`. On a real hidden macOS
-  account, per-user system agents (if any appear for that uid) would also count as survivors, so such a run could never
-  pass; this has not been checked on a real account.
+  With `--qa-identity` the seal kills every process of the QA user and a survivor is `QA_INVALID`. The first real hidden
+  account (macOS 27.0.1, 2026-10-30; output in `tests/fixtures/qa-launchd-*.txt`) showed that macOS creates a launchd user
+  domain for it on the first hop: 48 loaded services, all `com.apple.*`, 8 running with PPID 1, and the set changes as
+  on-demand agents (the `mdworker.*` ones) start and stop. A present `user/<uid>` domain is therefore normal, and the run
+  does not require it absent. It requires instead, checked through `sudo -n` as the QA user: the `launchctl print` output
+  parses (header, `services` block, an empty `unmanaged processes` block, a service count that matches), and for every loaded
+  service `launchctl print user/<uid>/<label>` reports one of two shapes that macOS itself registers: a `type = LaunchAgent`
+  whose `path` is a `.plist` directly inside `/System/Library/LaunchAgents/` or `/System/Library/LaunchDaemons/`, or a
+  `type = XPCService` whose `path` is a `.xpc` bundle directory directly inside an `XPCServices` directory under
+  `/System/Library/` (about a fifth of the services of a fresh account are of this second kind), with a `program` that is
+  present, absolute, free of `..`, and for an XPC service inside its own bundle, for a launch agent under
+  `/System/Library/`, `/usr/libexec/` or `/usr/sbin/`, and in both cases not an interpreter or shell (matched by name prefix,
+  case-insensitively). On the producer side the plist or bundle and the program must also be sealed: every component of the
+  path as given and of its resolved form must be owned by root, closed to group and other, with links followed only to a
+  target that passes too (some frameworks reach `Resources` through `Versions/Current`), and the resolved path must stay
+  under the allowed roots. A mode-777 directory anywhere in the chain fails closed; this replaces a device-number test,
+  which cannot see it because `AssetsV2/downloadDir` is firmlinked to the data volume yet reports the sealed volume's device.
+  A job the QA user submits or bootstraps has no such path or one in a directory it can write; a name or label proves
+  nothing because it can pick any. The program, arguments and environment printed for a job are chosen by
+  its owner, so only the header counts: `path` and `type` must each appear once, `type` on the line right after `path`, before
+  `program` and before the first nested block, with nothing before the `path` but numeric counters (`active count`,
+  `copy count`) and the label in `original =` that launchd prints for on-demand copies (`mdworker.shared.<uuid>`), so a
+  line forged inside a value is refused. Any service that fails,
+  any call that fails, times out or is refused by sudo, and an unparsable output fails the check. A process of the QA user is
+  not a survivor only if its pid is a running service of that verified domain, its parent is launchd (PPID 1) and its
+  kernel-reported executable path (libproc, not `ps comm`, which a process can set through argv[0]) is under a system prefix;
+  everything else, including a process that merely executes a system binary, is one. The `gui/<uid>` domain must still be
+  absent. VERIFIED-ON-THIS-HOST only; another macOS version that prints a different layout fails closed until the parser is
+  extended from a real sample. Tolerating a verified service does not cover inherited descriptors or Mach rights, or the
+  per-user data these services read and the QA user can write; whether `mdbulkimport` loads importer plugins from the user's
+  home is NOT_VERIFIED. Known gaps: the final sweep does not re-run the persistence check (it runs at the seal), only the
+  `user/` and `gui/` domains are read (not `session/` or `login/`), the preflight does not cover `sudo` or the python
+  interpreter, and tolerance proves where a service was defined, not what it does at run time (`launchctl setenv`,
+  `kickstart`).
 - Identity mode sees only the QA user's processes, crontab, at queue, `~/Library/LaunchAgents` and whether a launchd
   `user/` or `gui/` domain exists for it. It does not see a system-domain job or LaunchDaemon (which needs root to
   install), login items, or shell startup files (`.zshrc`, `.zprofile` and similar, which run if anything later starts a

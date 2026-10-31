@@ -56,6 +56,41 @@ Only with a verified billing, quota or outage cause: run the full local equivale
 `OWNER-MERGE-CI-UNAVAILABLE head=<sha> cause=<billing|quota|outage> local_equivalent=PASS`,
 and pass `--ci-unavailable`. Any genuinely failing check still refuses.
 
+With `cause=billing` only, a failed or cancelled GitHub Actions job that GitHub refused to start for billing is not treated as a
+genuine failure. Every failed check must qualify, otherwise the PR is `CI_FAILED` as before:
+
+- It is a completed `CheckRun` of this repository's Actions (`detailsUrl` is `.../actions/runs/<run>/job/<job>`) on the exact head,
+  concluded `FAILURE` or `CANCELLED`, confirmed by the check-run API (GitHub Actions app, same head and name) and the job API.
+- The job executed zero steps (steps empty or all `skipped`).
+- Its check-run annotations contain "recent account payments have failed or your spending limit needs to be increased"; or it is
+  `CANCELLED` and its annotation says the strategy was canceled because job `X` failed, where `X` is exactly one billing-annotated,
+  zero-step job of the same workflow run. A cancelled sibling of a real failure refuses.
+- Anything else refuses: a job that ran a step, a non-Actions check (for example SonarCloud) that is not successful, a missing,
+  truncated (100 or more) or unrecognised annotation, any API error or unexpected shape, or a record for another head or another
+  cause (the latest record at the head must be `cause=billing`; `quota` and `outage` keep the old behaviour where any failed check
+  refuses). Pending checks still `WAIT`, and any non-failed check must be successful.
+
+The waived jobs stay `FAILURE`/`CANCELLED` in `facts.ci_unavailable_checks` (name, conclusion, job id, reason) and `facts.ci_verdict`
+says `NOT_A_CI_PASS`: the verdict records that the local-equivalent evidence stands in for jobs that never ran, not that CI passed.
+If the waiver is declined, `facts.ci_unavailable_refused` lists why. The record and flag are supplied by the authenticated
+identity, so the gate bounds what the record can cover; it does not independently verify the billing cause beyond GitHub's own annotation.
+
+## Repository with no hosted CI (founder-approved per PR)
+
+A repository that defines no CI workflow at all (its `.github/workflows` directory does not exist) can never report a check, so
+`NO_CI_EVIDENCE` would block every PR. When the founder has approved the exception for a named PR, post, as the authenticated
+user and in a comment that also states the actual local validation and review evidence (commands, revision, exit status, test
+counts, review verdict, what was not run),
+`OWNER-MERGE-CI-EXCEPTION head=<sha> basis=no-hosted-ci local_equivalent=PASS` (`owner-merge-gate.py ci-exception-line --head SHA`
+prints it) and pass `--ci-exception`. The gate accepts it only for that exact head, with zero checks on the head, when the
+workflows directory is absent at both the base branch and the reviewed head (a 404 in gh's own error text; a successful answer, empty
+output, a rate limit, a 5xx or anything else counts as "has workflows"), the PR changes no file under `.github/workflows/` (an unknown or
+truncated file list refuses), and with a clean review record. It speaks for GitHub Actions only: an external CI app that has not
+reported yet looks the same as no CI. The record and the flag are both supplied by the authenticated identity, so the gate cannot
+verify the founder's per-PR approval; it bounds what the record can cover, it does not make it independent. Checks that
+ran and failed or are pending still refuse or wait. It records that local evidence stands in for CI; it is not a CI pass and is
+never reported as one. It does not replace `--ci-unavailable`, which is for a verified external outage of CI that exists.
+
 ## Version integration branches (Development-Ahead / Sequential Release)
 
 `main` is the protected cumulative release baseline. A founder-approved version integration branch (for example
