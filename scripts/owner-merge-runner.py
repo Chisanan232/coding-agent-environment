@@ -676,17 +676,20 @@ def only_actions_runs(runner, repo, head, name):
 
 
 def unavailable_checks(runner, repo, facts, head, cfg, local):
-    """Required checks the LOCAL_EQUIVALENT_CI exception may stand in for: every non-SUCCESS entry of the check
-    is a hosted CheckRun that GitHub itself reports as never started (CI_UNAVAILABLE_EXTERNAL), and the local
-    evidence lists the check as passed at this head. A check that executed and failed is CI_FAILED and is never
-    exempted; a required check missing from the rollup is never exempted."""
+    """Checks the LOCAL_EQUIVALENT_CI exception may stand in for: every non-SUCCESS entry of the check is a hosted
+    CheckRun that GitHub itself reports as never started (CI_UNAVAILABLE_EXTERNAL), and the local evidence lists
+    the check as passed at this head. Required checks and, equally, non-required checks named in the local
+    evidence qualify (private repos without branch protection cannot allowlist path-filtered workflows). A check
+    that executed and failed is CI_FAILED and is never exempted; a required check missing from the rollup is
+    never exempted."""
     if local is None or not cfg["local_equivalent_ci"]:
         return frozenset()
     rollup = facts.get("statusCheckRollup")
     if not isinstance(rollup, list):
         return frozenset()
     exempt = set()
-    for name in cfg["required_checks"]:
+    optional = {check_entry(c)[0] for c in rollup} - set(cfg["required_checks"])
+    for name in list(cfg["required_checks"]) + sorted(optional):
         if name not in local:
             continue
         bad = []
@@ -704,6 +707,15 @@ def unavailable_checks(runner, repo, facts, head, cfg, local):
         if ok:
             exempt.add(name)
     return frozenset(exempt)
+
+
+def unstable_is_covered(rollup, exempt):
+    """mergeStateStatus UNSTABLE means only non-required checks are not green. It is acceptable only when something
+    was exempted and every non-SUCCESS rollup entry belongs to an exempted check (so nothing is pending or failing)."""
+    if not exempt:
+        return False
+    entries = [check_entry(c) for c in rollup]
+    return all(v == "SUCCESS" or n in exempt for n, v in entries)
 
 
 def decide(p, repo, pr, head, me, cfg, exempt=frozenset()):
@@ -736,7 +748,7 @@ def decide(p, repo, pr, head, me, cfg, exempt=frozenset()):
         bad.append("observed head differs from expected head")
     if mergeable != "MERGEABLE":
         bad.append(f"mergeable is {mergeable}")
-    if mss != "CLEAN":
+    if mss != "CLEAN" and not (mss == "UNSTABLE" and unstable_is_covered(rollup, exempt)):
         bad.append(f"mergeStateStatus is {mss}")
     latest = {}
     for r in reviews:
@@ -790,7 +802,9 @@ def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin=None):
         raise Refused(["base branch changed since the first read"])
     # With the exception enabled, check verdicts can only be judged after the local evidence is read, so every
     # other fact is validated first; a required check is never skipped by this pre-pass in the real decision below.
-    decide(facts, repo, pr, head, me, cfg, frozenset(cfg["required_checks"]) if cfg["local_equivalent_ci"] else frozenset())
+    pre = frozenset(cfg["required_checks"]) | {check_entry(c)[0] for c in facts.get("statusCheckRollup") or ()} \
+        if cfg["local_equivalent_ci"] else frozenset()
+    decide(facts, repo, pr, head, me, cfg, pre)
     digest, local = load_evidence(evidence, head, repo, pr, base, cfg, key, clock())
     exempt = unavailable_checks(runner, repo, facts, head, cfg, local)
     pr_class, checks = decide(facts, repo, pr, head, me, cfg, exempt)
@@ -811,7 +825,7 @@ def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin=None):
     if final_class != pr_class:
         raise Refused(["PR class changed while server-side state was being read"])
     checks = dict(checks, ci_class="CI_UNAVAILABLE_EXTERNAL" if exempt else "CI_PASS",
-                  local_equivalent=sorted(exempt))  # an exempted check is never reported as CI_PASS
+                  local_equivalent=sorted(exempt), merge_state=after.get("mergeStateStatus"))  # an exempted check is never reported as CI_PASS
     return observed, pr_class, checks, info, {"base": base, "evidence": digest}
 
 
