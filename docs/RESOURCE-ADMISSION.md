@@ -15,7 +15,7 @@ subagent fan-out. Run `scripts/memory-admission.py check --weight heavy` first; 
 | Physical RAM and compressed memory | `hw.memsize`, `vm_stat` "occupied by compressor" | A large compressor share means the machine is already holding memory it cannot drop cheaply |
 | Swap used **and** sustained swap I/O | `vm.swapusage`, swapins+swapouts over a measured window | Used swap alone is history; the I/O rate is current behaviour |
 | Disk and swap-growth headroom | free bytes of the Data volume | Swap files grow on that volume; a full disk means swap cannot grow |
-| Active build/test processes | `ps` pid, ppid, state, elapsed and CPU time, %cpu and the executable name (`cargo`, `rustc`, `clang`, `ld`, `xcodebuild`, ...); never the command line | One heavy lane at a time; see "Idle orphans" below |
+| Active build/test processes | `ps` pid, ppid, state, elapsed and CPU time, %cpu, rss and the executable name (`cargo`, `rustc`, `clang`, `ld`, `xcodebuild`, ...); never the command line | One heavy lane at a time, counted as a process tree (workload), not per process; see "Idle orphans" below |
 | Load per core | `getloadavg` / CPU count | Scheduler saturation that RAM numbers do not show |
 | Reservations and ownership | the existing `disk-admission.py` gate (reserve, lane cap, process identity) | Task ownership already lives there; it is not duplicated |
 
@@ -116,3 +116,8 @@ with a live parent (a `rustc` under `cargo` or a shell), and any line `ps` print
 process list still fails closed. Load, memory pressure, swap and disk reasons are unchanged. The live parent chain is the
 ownership signal: an SPE-109 reservation is held by the job that reserved it, whose build processes have that job as a
 live ancestor, so a reservation-holding build is never an orphan; reservation records are not read here.
+
+Workloads (SPE-150): the lane count is the number of process trees, not of heavy-named processes. A workload is a heavy-named
+process with no heavy-named ancestor plus its whole subtree (shells and test binaries included); `cargo` with three `rustc`
+children and a test binary is one workload, reported with its process count and summed RSS. A workload is idle only when its root is an idle orphan
+and every member is quiet by the same tests, so an orphan `cargo` with an idle `rustc` child no longer refuses; any member that spends CPU, is new, or was active in the first sample makes the whole tree active.
