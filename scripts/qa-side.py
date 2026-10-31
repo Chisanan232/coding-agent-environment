@@ -525,6 +525,11 @@ def read_request(config, verb, attempt, fds):
 
 
 PROMPT_MAX = 1 << 20
+# Clone copy budget (generous for a source checkout without build output; a bigger tree is refused, not truncated).
+MAX_COPY_ENTRIES = 500000
+MAX_COPY_BYTES = 8 << 30
+MAX_COPY_DEPTH = 100
+HELPER_PATH = '/Library/cae-qa/qa-side'
 
 
 def open_source_dir(afd, producer):
@@ -541,32 +546,53 @@ def open_prompt_at(afd, producer):
     """prompt.txt of a validated attempt as a binary file object: no link followed, regular, producer-owned, size-capped."""
     fd = os.open('prompt.txt', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=afd)
     st = os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode) or st.st_uid != producer or st.st_mode & 0o022 or st.st_size > PROMPT_MAX:
+    if (not stat.S_ISREG(st.st_mode) or st.st_uid != producer or st.st_mode & 0o022 or st.st_nlink != 1
+            or st.st_size > PROMPT_MAX):
         os.close(fd)
         raise Refuse()
     return os.fdopen(fd, 'rb')
 
 
-def copy_tree_at(src_fd, dst, producer):
+class CopyLimits:
+    """Budget for one clone copy, so a hostile or runaway tree cannot fill the QA user's disk or hang the stage hop."""
+
+    def __init__(self):
+        self.entries = 0
+        self.bytes = 0
+
+    def entry(self):
+        self.entries += 1
+        _need(self.entries <= MAX_COPY_ENTRIES)
+
+    def data(self, count):
+        self.bytes += count
+        _need(self.bytes <= MAX_COPY_BYTES)
+
+
+def copy_tree_at(src_fd, dst, producer, limits=None, depth=0):
     """Copy the directory held open as src_fd to the new directory dst. Every entry is examined and opened relative to its
     parent descriptor with O_NOFOLLOW, so a swap of any path after validation cannot redirect the copy. Links are recreated
     as links (like copytree symlinks=True) and never followed; anything that is not a directory, regular file or link is
-    refused. Every directory and file must be owned by `producer`, and a file must have a single link: a hard link
-    could expose an inode the producer does not own. Any violation raises and the copy is abandoned."""
-    _need(os.fstat(src_fd).st_uid == producer)
+    refused. Every directory and file must be owned by `producer`, and a file must have a single link: a hard link could
+    expose an inode the producer does not own. Entry count, total bytes and depth are capped, and permission bits are masked
+    to 0o777 (no set-id or sticky bit is carried over). Any violation raises and the copy is abandoned."""
+    limits = limits or CopyLimits()
+    _need(depth <= MAX_COPY_DEPTH and os.fstat(src_fd).st_uid == producer)
     os.mkdir(dst, 0o700)
     with os.scandir(src_fd) as entries:
         names = [entry.name for entry in entries]
     for name in names:
+        limits.entry()
         st = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
         target = os.path.join(dst, name)
+        mode = stat.S_IMODE(st.st_mode) & 0o777
         if stat.S_ISLNK(st.st_mode):
             os.symlink(os.readlink(name, dir_fd=src_fd), target)
         elif stat.S_ISDIR(st.st_mode):
             child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=src_fd)
             try:
-                copy_tree_at(child, target, producer)
-                os.chmod(target, stat.S_IMODE(st.st_mode) | 0o700)
+                copy_tree_at(child, target, producer, limits, depth + 1)
+                os.chmod(target, mode | 0o700)
             finally:
                 os.close(child)
         elif stat.S_ISREG(st.st_mode):
@@ -574,9 +600,11 @@ def copy_tree_at(src_fd, dst, producer):
             with os.fdopen(fd, 'rb') as source:
                 opened = os.fstat(source.fileno())
                 _need(stat.S_ISREG(opened.st_mode) and opened.st_uid == producer and opened.st_nlink == 1)
-                out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, stat.S_IMODE(st.st_mode) | 0o600)
+                out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode | 0o600)
                 with os.fdopen(out, 'wb') as sink:
-                    shutil.copyfileobj(source, sink)
+                    for chunk in iter(lambda: source.read(1 << 20), b''):
+                        limits.data(len(chunk))
+                        sink.write(chunk)
         else:
             raise Refuse()
 
@@ -650,9 +678,45 @@ def pin_process(qa_home):
     CANARY_ROOT = HOME / '.local/state/coding-agent-environment/qa-canary'
 
 
+RELAYED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+def relay_and_exit(child):
+    """The parent half of detach(): forward TERM, INT and HUP to the detached child, wait for it and exit with its status
+    (128+n when a signal ended it). It never returns. It holds no descriptor above 2, so the prompt, the exchange and the
+    request files live only in the child."""
+    os.closerange(3, 1024)
+
+    def forward(signum, frame):
+        try:
+            os.kill(child, signum)
+        except OSError:
+            pass
+    for sig in RELAYED:
+        signal.signal(sig, forward)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, RELAYED)
+    while True:
+        try:
+            _, status = os.waitpid(child, 0)
+            break
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            os._exit(2)
+    code = os.waitstatus_to_exitcode(status)
+    os._exit(code if code >= 0 else 128 - code)
+
+
 def detach(alarm_seconds, keep=()):
-    """New session (no controlling terminal), cwd /, stdin /dev/null, nothing inherited but 0-2 and the descriptors in keep,
-    SIGALRM armed."""
+    """Fork, and in the child: new session (no controlling terminal), cwd /, stdin /dev/null, nothing inherited but 0-2 and
+    the descriptors in keep, SIGALRM armed. Returns only in the child. The parent (the process the privilege tool started,
+    and the one the producer signals) relays signals and passes the exit status on. The fork is what makes setsid safe: a
+    process that leads its process group (the tool may start the helper that way) cannot call setsid, its child can."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, RELAYED)      # no signal is lost between the fork and the parent's relay
+    pid = os.fork()
+    if pid:
+        relay_and_exit(pid)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, RELAYED)
     os.setsid()
     os.chdir('/')
     zero = os.open(os.devnull, os.O_RDWR)
