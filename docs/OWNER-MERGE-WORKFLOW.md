@@ -56,6 +56,25 @@ Only with a verified billing, quota or outage cause: run the full local equivale
 `OWNER-MERGE-CI-UNAVAILABLE head=<sha> cause=<billing|quota|outage> local_equivalent=PASS`,
 and pass `--ci-unavailable`. Any genuinely failing check still refuses.
 
+With `cause=billing` only, a failed or cancelled GitHub Actions job that GitHub refused to start for billing is not treated as a
+genuine failure. Every failed check must qualify, otherwise the PR is `CI_FAILED` as before:
+
+- It is a completed `CheckRun` of this repository's Actions (`detailsUrl` is `.../actions/runs/<run>/job/<job>`) on the exact head,
+  concluded `FAILURE` or `CANCELLED`, confirmed by the check-run API (GitHub Actions app, same head and name) and the job API.
+- The job executed zero steps (steps empty or all `skipped`).
+- Its check-run annotations contain "recent account payments have failed or your spending limit needs to be increased"; or it is
+  `CANCELLED` and its annotation says the strategy was canceled because job `X` failed, where `X` is exactly one billing-annotated,
+  zero-step job of the same workflow run. A cancelled sibling of a real failure refuses.
+- Anything else refuses: a job that ran a step, a non-Actions check (for example SonarCloud) that is not successful, a missing,
+  truncated (100 or more) or unrecognised annotation, any API error or unexpected shape, or a record for another head or another
+  cause (the latest record at the head must be `cause=billing`; `quota` and `outage` keep the old behaviour where any failed check
+  refuses). Pending checks still `WAIT`, and any non-failed check must be successful.
+
+The waived jobs stay `FAILURE`/`CANCELLED` in `facts.ci_unavailable_checks` (name, conclusion, job id, reason) and `facts.ci_verdict`
+says `NOT_A_CI_PASS`: the verdict records that the local-equivalent evidence stands in for jobs that never ran, not that CI passed.
+If the waiver is declined, `facts.ci_unavailable_refused` lists why. The record and flag are supplied by the authenticated
+identity, so the gate bounds what the record can cover; it does not independently verify the billing cause beyond GitHub's own annotation.
+
 ## Repository with no hosted CI (founder-approved per PR)
 
 A repository that defines no CI workflow at all (its `.github/workflows` directory does not exist) can never report a check, so
