@@ -20,22 +20,34 @@ PORT = 23456
 
 
 class FakeProc:
+    """exited = the process is gone but its exit status is not collected yet (a zombie); reaped = poll() or wait() collected it."""
+
     def __init__(self, pid):
         self.pid = pid
-        self.returncode = None
+        self.exited = False
+        self.reaped = False
+        self.code = None
         self.waits = []
 
+    @property
+    def returncode(self):
+        return self.code if self.reaped else None
+
     def poll(self):
+        if self.exited:
+            self.reaped = True
         return self.returncode
 
     def wait(self, timeout=None):
         self.waits.append(timeout)
-        if self.returncode is None:
+        if not self.exited:
             raise subprocess.TimeoutExpired("x", timeout)
-        return self.returncode
+        self.reaped = True
+        return self.code
 
     def exit(self, code=0):
-        self.returncode = code
+        self.exited = True
+        self.code = code
 
 
 class Clock:
@@ -69,6 +81,9 @@ class Fakes:
         self.expect = {}
         self.signals = []
         self.leave_sockets = True
+        self.table = []                   # [(pid, ppid, start)] of everything else
+        self.kills = []
+        self.sigkill_while_unreaped = []
 
     # -- ops --
     def run(self, argv, env, timeout):
@@ -100,28 +115,43 @@ class Fakes:
         if "daemon" not in self.procs:
             return 0 if self.port_busy else side.ECONNREFUSED
         proc = self.procs["daemon"]
-        if self.torn_down(proc):
+        if proc.exited:
             return side.ECONNREFUSED
         return self.connect_after_start
-
-    def torn_down(self, proc):
-        return proc.returncode is not None and ("daemon", proc.pid) in self.signals_seen()
-
-    def signals_seen(self):
-        return {(k, p) for k, p, s in [(self.kind_of(pid), pid, sig) for pid, sig in self.signals]}
 
     def kind_of(self, pid):
         return next((k for k, p in self.procs.items() if p.pid == pid), "?")
 
-    def listeners(self, pid):
-        self.log.append(("listeners", pid))
-        return self.listeners_result
+    def listeners(self, port):
+        self.log.append(("listeners", port))
+        result = self.listeners_result
+        if callable(result):
+            return result()
+        if result is None:
+            return None
+        daemon = self.procs.get("daemon")
+        return [(daemon.pid if daemon else 0, name) if isinstance(name, str) else name for name in result]
+
+    def leader_exited(self, proc):
+        return proc.exited
+
+    def process_table(self):
+        rows = [(self.procs[k].pid, 1, "t0") for k in self.procs if not self.procs[k].exited]
+        return rows + list(self.table)
+
+    def kill(self, pid, sig):
+        self.kills.append((pid, sig))
+        self.table = [r for r in self.table if r[0] != pid and r[0] not in getattr(self, "immortal", ())]
+        if pid in getattr(self, "immortal", ()):
+            self.table = self.table + [r for r in self.immortal_rows if r[0] == pid and r not in self.table]
 
     def killpg(self, pid, sig):
         self.signals.append((pid, sig))
         self.log.append(("signal", self.kind_of(pid), sig))
         proc = next((p for p in self.procs.values() if p.pid == pid), None)
-        if proc is not None and proc.returncode is None and not (sig == signal.SIGTERM and pid in self.stubborn):
+        if proc is not None and sig == signal.SIGKILL:
+            self.sigkill_while_unreaped.append(not proc.reaped)
+        if proc is not None and not proc.exited and not (sig == signal.SIGTERM and pid in self.stubborn):
             proc.exit(-int(sig))
             if self.kind_of(pid) == "daemon" and not self.leave_sockets and self.e.daemon_sock.exists():
                 self.e.daemon_sock.unlink()
@@ -142,7 +172,7 @@ class Fakes:
     def ops(self):
         return side.EndpointOps(popen=self.popen, run=self.run, sleep=self.clock.sleep, monotonic=self.clock.now, connect=self.connect,
                                 listeners=self.listeners, killpg=self.killpg, rmtree=self.rmtree, canary_listener=self.canary_listener,
-                                decoy_socket=self.decoy_socket)
+                                decoy_socket=self.decoy_socket, leader_exited=self.leader_exited, process_table=self.process_table, kill=self.kill)
 
 
 class LifecycleBase(unittest.TestCase):
@@ -304,6 +334,7 @@ class StartTests(LifecycleBase):
         kinds = [e[0] for e in self.fakes.log]
         self.assertLess(kinds.index("listeners"), len(kinds) - 1 - kinds[::-1].index("spawn"))      # the port is proved before the relay starts
         self.assertEqual(self.life.record["port_proof"]["listeners"], ["127.0.0.1:%d" % PORT])
+        self.assertEqual(self.life.record["port_proof"]["daemon_pid"], self.fakes.procs["daemon"].pid)
         self.assertTrue(self.life.record["daemon_started"] and self.life.record["relay_started"])
 
     def test_wildcard_ipv6_extra_or_missing_listeners_fail_the_port_proof(self):
@@ -317,6 +348,34 @@ class StartTests(LifecycleBase):
             with self.assertRaises(side.EndpointFailed, msg=str(listeners)):
                 life.start()
             self.assertEqual([s[1] for s in fakes.log if s[0] == "spawn"], ["daemon"], listeners)     # the relay never starts
+
+    def test_another_process_listening_on_the_port_fails_the_proof_whoever_owns_it(self):
+        addr = "127.0.0.1:%d" % PORT
+        cases = (lambda d: [(4242, addr)],                                  # someone else holds it
+                 lambda d: [(d, addr), (4242, addr)],                       # a second listener appeared
+                 lambda d: [(d, addr), (d, "[::1]:%d" % PORT)],             # the daemon also listens on ::1
+                 lambda d: [(d, "*:%d" % PORT)])                            # wildcard
+        for make in cases:
+            fakes = Fakes(self.endpoint)
+            fakes.listeners_result = lambda fakes=fakes, make=make: make(fakes.procs["daemon"].pid)
+            life = side.EndpointLifecycle(self.endpoint, self.record_dir, fakes.ops())
+            if self.endpoint.daemon_sock.exists():
+                self.endpoint.daemon_sock.unlink()
+            with self.assertRaises(side.EndpointFailed):
+                life.start()
+
+    def test_the_port_proof_is_repeated_on_every_supervision_step(self):
+        self.life.start()
+        self.assertTrue(self.life.supervise())
+        before = len([e for e in self.fakes.log if e[0] == "listeners"])
+        self.assertTrue(self.life.supervise())
+        self.assertEqual(len([e for e in self.fakes.log if e[0] == "listeners"]), before + 1)
+        daemon_pid = self.fakes.procs["daemon"].pid
+        self.fakes.listeners_result = lambda: [(daemon_pid, "127.0.0.1:%d" % PORT), (daemon_pid, "*:%d" % PORT)]     # the daemon rebinds wide
+        self.assertFalse(self.life.supervise())
+        self.assertIn("port_proof_lost", self.life.record)
+        relay = self.fakes.procs["relay"]
+        self.assertIn((relay.pid, signal.SIGTERM), self.fakes.signals)                      # the relay stops carrying traffic
 
     def test_a_port_that_does_not_accept_connections_fails(self):
         self.fakes.connect_after_start = 61
@@ -337,7 +396,7 @@ class StartTests(LifecycleBase):
         self.assertFalse(self.life.supervise())
         relay = self.fakes.procs["relay"]
         self.assertIn((relay.pid, signal.SIGTERM), self.fakes.signals)
-        self.assertEqual(self.life.record["daemon_exited_early"], 7)
+        self.assertTrue(self.life.record["daemon_exited_early"])
 
 
 class TeardownTests(LifecycleBase):
@@ -367,6 +426,37 @@ class TeardownTests(LifecycleBase):
         steps = self.life.teardown()
         self.assertTrue(steps["daemon_stopped"] and steps["relay_stopped"], steps)
         self.assertIn((self.fakes.procs["daemon"].pid, signal.SIGKILL), self.fakes.signals)
+
+    def test_the_group_is_killed_before_the_leader_is_reaped_and_a_reaped_process_is_never_signalled(self):
+        self.life.teardown()
+        self.assertTrue(self.fakes.sigkill_while_unreaped)
+        self.assertTrue(all(self.fakes.sigkill_while_unreaped), self.fakes.sigkill_while_unreaped)    # every SIGKILL came while the pid was still held
+        sent = len(self.fakes.signals)
+        self.life.teardown()                                                              # both are reaped now
+        self.assertEqual(len(self.fakes.signals), sent)
+
+    def test_a_descendant_that_survives_the_group_kill_is_found_killed_and_reported(self):
+        daemon = self.fakes.procs["daemon"]
+        self.fakes.table = [(9001, daemon.pid, "t1"), (9002, 9001, "t2")]                 # grandchild escaped the group
+        steps = self.life.teardown()
+        self.assertEqual(sorted(p for p, _ in self.fakes.kills), [9001, 9002])
+        self.assertEqual(steps["descendants_left"], [])
+        self.assertTrue(steps["clean"], steps)
+
+    def test_a_descendant_that_cannot_be_killed_makes_teardown_unclean(self):
+        daemon = self.fakes.procs["daemon"]
+        self.fakes.immortal = {9001}
+        self.fakes.immortal_rows = [(9001, daemon.pid, "t1")]
+        self.fakes.table = list(self.fakes.immortal_rows)
+        steps = self.life.teardown()
+        self.assertEqual(steps["descendants_left"], [9001])
+        self.assertFalse(steps["clean"])
+
+    def test_an_unreadable_process_table_is_not_clean(self):
+        self.life.ops.process_table = lambda: None
+        steps = self.life.teardown()
+        self.assertEqual(steps["descendants_left"], ["unknown"])
+        self.assertFalse(steps["clean"])
 
     def test_an_open_port_after_teardown_is_not_clean(self):
         self.life.ops.connect = lambda port: 0
