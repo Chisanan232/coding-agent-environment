@@ -571,5 +571,75 @@ class StageTests(Scratch):
                 self.stage(env)
 
 
+class ManifestHelperTests(Scratch):
+    HELPER = SCRIPTS / "qa-payload-manifest.py"
+
+    def run_helper(self, *argv):
+        return subprocess.run([sys.executable, "-I", str(self.HELPER), *argv], capture_output=True, text=True, timeout=60)
+
+    def make_dir(self):
+        directory = self.root / "payload-dir"
+        for path, (data, kind) in FILES.items():
+            (directory / path).parent.mkdir(parents=True, exist_ok=True)
+            (directory / path).write_bytes(data)
+            os.chmod(directory / path, 0o755 if kind == "exec" else 0o644)
+        return directory
+
+    def test_plan_then_write_then_verify_round_trip(self):
+        directory = self.make_dir()
+        tests = self.root / "tests.json"
+        tests.write_text(json.dumps([test_entry("t1")]))
+        planned = self.run_helper("plan", "--dir", str(directory), "--scope", "offline checks", "--producer-run", "harness/transcript.txt",
+                                  "--selftests", str(tests))
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        manifest = json.loads(planned.stdout)
+        self.assertEqual([f["path"] for f in manifest["files"]], sorted(FILES))
+        self.assertEqual({f["path"]: f["kind"] for f in manifest["files"]}["bin/tool"], "exec")
+        self.assertIn("manifest sha256 " + SH(planned.stdout.encode()), planned.stderr)
+        self.assertFalse((directory / "MANIFEST.json").exists())
+        written = self.run_helper("plan", "--dir", str(directory), "--scope", "offline checks", "--producer-run", "harness/transcript.txt",
+                                  "--selftests", str(tests), "--write")
+        self.assertEqual(written.returncode, 0, written.stderr)
+        self.assertEqual((directory / "MANIFEST.json").read_bytes(), planned.stdout.encode())
+        checked = self.run_helper("verify", "--dir", str(directory))
+        self.assertEqual(checked.returncode, 0, checked.stdout)
+        self.assertIn("OK manifest sha256 " + SH(planned.stdout.encode()), checked.stdout)
+        # the QA side's own verification agrees with the helper's
+        fd = self.open_dir(directory)
+        raw = (directory / "MANIFEST.json").read_bytes()
+        self.assertEqual(side.verify_tree(fd, side.parse_manifest(raw), raw, ME), [])
+
+    def test_verify_catches_every_deviation(self):
+        directory = self.make_dir()
+        self.run_helper("plan", "--dir", str(directory), "--scope", "s", "--write")
+        (directory / "extra.txt").write_text("x")
+        self.assertEqual(self.run_helper("verify", "--dir", str(directory)).returncode, 1)
+        os.unlink(directory / "extra.txt")
+        (directory / "vectors/a.json").write_bytes(b"changed")
+        out = self.run_helper("verify", "--dir", str(directory))
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("vectors/a.json", out.stdout)
+
+    def test_plan_refuses_links_bad_selftests_and_unlisted_references(self):
+        directory = self.make_dir()
+        os.symlink("/etc/hosts", directory / "link")
+        out = self.run_helper("plan", "--dir", str(directory), "--scope", "s")
+        self.assertNotEqual(out.returncode, 0)
+        os.unlink(directory / "link")
+        tests = self.root / "bad.json"
+        tests.write_text(json.dumps([test_entry("t1", argv=("bin/missing",))]))
+        out = self.run_helper("plan", "--dir", str(directory), "--scope", "s", "--selftests", str(tests))
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("kind=exec", out.stdout)
+        out = self.run_helper("plan", "--dir", str(directory), "--scope", "s", "--producer-run", "bin/tool")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("producer_run", out.stdout)
+
+    def test_the_helper_carries_no_second_copy_of_the_rules(self):
+        text = self.HELPER.read_text()
+        self.assertNotIn("cae-qa-payload/1'", text.replace("side.PAYLOAD_SCHEMA", ""))
+        self.assertIn("qa-side.py", text)
+
+
 if __name__ == "__main__":
     unittest.main()
