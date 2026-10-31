@@ -151,6 +151,39 @@ The helper digest the producer records is the SHA-256 of the bytes it holds in m
 bytes it wrote into the inbox); unattended mode records the digest of the verified install. The `chmod` after the login may need
 a fresh sudo credential (`sudo -v`) in the owner Terminal; if it was refused, repeat it.
 
+**Installing the delegation (one root command).** `scripts/qa-hop-install.py` is the installer of ADR 0016. `plan` is read-only and
+unprivileged; it prints the exact text below with your values filled in (digests included), runs `visudo -c -f` on the rendered
+drop-in, and changes nothing. There is no flag, variable or prefix that moves its paths, and nothing is downloaded: the Codex binary
+to pin and its SHA-256 are explicit arguments (decision D1, about 300 MB).
+
+```
+python3 -I scripts/qa-hop-install.py plan --qa-name NAME --qa-uid UID --codex-source /path/to/codex --codex-sha256 HEX
+```
+
+The consolidated approval is this one command, run through your own `sudo` (the installer never asks for or stores a password
+and never calls sudo itself):
+
+```
+sudo /usr/bin/python3 -I scripts/qa-hop-install.py apply --qa-name NAME --qa-uid UID --codex-source /path/to/codex --codex-sha256 HEX
+```
+
+In order, it: refuses unless it is root with your uid known and re-validates every input; creates `/Library/cae-qa` (root:wheel
+0755) and installs `qa-side` (0555), `qa-side.json` (0444) and the pinned `codex` (0555), each written to a temporary name, owner
+and mode set, digest checked, then renamed; writes the drop-in beside `/etc/sudoers.d/cae-qa`, runs `visudo -c -f` on it and only
+then renames it into place (last, root:wheel 0440); runs `visudo -c` on the live configuration and removes the drop-in at once if
+that fails; and re-runs, read-only, the same producer-side checks `--unattended` uses. No helper verb runs as root. The drop-in is
+the seven fixed-argv commands of the ADR as the QA user (`kill -KILL -1`; `crontab -l`; `atq ""`; `ls -A <QA home>/Library/LaunchAgents`;
+`launchctl print user/UID`, `gui/UID`, `user/UID/<label>`) plus the pinned helper's `version` and `probe|stage|exec <attempt>`, with
+`NOPASSWD: NOSETENV:`, never `ALL` or root as the target.
+
+Afterwards, unprivileged: `python3 -I scripts/qa-hop-install.py verify <same arguments>`, then `sudo -n -u NAME /Library/cae-qa/qa-side
+version`. Rollback (root, removes the drop-in first, then the files, safe to repeat):
+`sudo /usr/bin/python3 -I scripts/qa-hop-install.py rollback --qa-name NAME --qa-uid UID`.
+
+Eliminated: `sudo -v` before every run, launching from that Terminal, the keepalive. Still yours: this one root command;
+reinstalling when `qa-side.py` or the pinned Codex changes (the digest is part of the install); the QA user's Codex device login
+(then `chmod 700 ~/.codex` and a `--check` re-run); rechecking after a macOS major upgrade.
+
 After the one-time Codex login, run the `chmod 700 ~/.codex` step printed with the login command (Codex leaves the directory
 readable), then re-run `qa-identity-setup.py --check`: only that check proves the final state.
 
