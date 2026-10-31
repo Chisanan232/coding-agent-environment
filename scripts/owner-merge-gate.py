@@ -161,6 +161,8 @@ _REF = r"(?!.*(?:^|/)\.\.(?:/|$))[A-Za-z0-9._/-]{1,200}"
 API_READS = [re.compile(x) for x in (
     _RO + rf"/compare/{_REF}\.\.\.{_REF}", _RO + r"/commits/[0-9a-f]{40}", _RO + r"/pulls/\d{1,9}/files",
     _RO + r"/contents/(\.github/CODEOWNERS|CODEOWNERS|docs/CODEOWNERS)", _RO + r"/contents/\.github/workflows\?ref=(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]{0,199}",
+    # The billing waiver (--ci-unavailable) reads one check run, its job and its annotations by numeric id.
+    _RO + r"/check-runs/\d{1,15}", _RO + r"/actions/jobs/\d{1,15}", _RO + r"/check-runs/\d{1,15}/annotations\?per_page=100",
     r"orgs/[A-Za-z0-9][A-Za-z0-9-]{0,38}/memberships/[A-Za-z0-9][A-Za-z0-9-]{0,38}")]
 SAFE_FLAGS = {"--json", "--jq", "--repo"}
 GRAPHQL_VARS = {"query", "o", "r", "n"}
