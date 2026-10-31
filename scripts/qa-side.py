@@ -19,6 +19,7 @@ import re
 import resource
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -309,6 +310,308 @@ def endpoint_digests(endpoint):
     return {'daemon_profile_sha256': hashlib.sha256(daemon_sb(endpoint).encode()).hexdigest(),
             'relay_profile_sha256': hashlib.sha256(relay_sb(endpoint).encode()).hexdigest(),
             'relay_source_sha256': hashlib.sha256(RELAY_SRC.encode()).hexdigest()}
+
+
+# --- endpoint lifecycle (SPE-145 PR-b3): create, prove, start, supervise, tear down -----------------------------------------------------
+# Runs as the QA user inside the digest-pinned helper. Nothing here is wired into stage or exec yet (that is the next slice), and every
+# system touch goes through EndpointOps so tests can prove ORDER: the candidate daemon starts only after both generated profiles passed
+# their negative controls, and teardown always runs.
+DAEMON_START_SECONDS = 30
+RELAY_START_SECONDS = 15
+RELAY_GRACE_SECONDS = 3
+DAEMON_GRACE_SECONDS = 10
+ECONNREFUSED = 61          # macOS errno: a connect to a port nobody listens on
+ENDPOINT_FSIZE = 256 << 20
+
+
+class EndpointFailed(Exception):
+    """The endpoint could not be brought up or proved; the message is for the owner and carries no process output."""
+
+
+class EndpointOps:
+    """Every way the lifecycle touches the system, injectable. The defaults are the real thing."""
+
+    def __init__(self, popen=None, run=None, sleep=None, monotonic=None, connect=None, listeners=None, killpg=None, rmtree=None,
+                 canary_listener=None, decoy_socket=None, which=None):
+        self.popen = popen or subprocess.Popen
+        self.run = run or self._run
+        self.sleep = sleep or time.sleep
+        self.monotonic = monotonic or time.monotonic
+        self.connect = connect or self._connect
+        self.listeners = listeners or self._listeners
+        self.killpg = killpg or os.killpg
+        self.rmtree = rmtree or self._rmtree
+        self.canary_listener = canary_listener or self._canary_listener
+        self.decoy_socket = decoy_socket or self._decoy_socket
+        self.which = which or (lambda path: os.path.exists(path))
+
+    @staticmethod
+    def _run(argv, env, timeout):
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env, cwd='/', stdin=subprocess.DEVNULL)
+        return done.returncode, done.stdout
+
+    @staticmethod
+    def _connect(port):
+        """errno of an unsandboxed connect to 127.0.0.1:port (0 when it connects)."""
+        with socket.socket() as probe:
+            probe.settimeout(2)
+            return probe.connect_ex(('127.0.0.1', port))
+
+    @staticmethod
+    def _listeners(pid):
+        """TCP listening sockets held by pid as 'address:port' strings, or None when they cannot be listed. lsof, not a guess: the bind
+        scope of a sandbox-exec rule cannot be pinned to 127.0.0.1, so the socket itself is the proof."""
+        try:
+            done = subprocess.run(['/usr/sbin/lsof', '-nP', '-a', '-p', str(pid), '-iTCP', '-sTCP:LISTEN', '-Fn'], capture_output=True, text=True,
+                                  timeout=20, cwd='/', stdin=subprocess.DEVNULL, env={'PATH': '/usr/bin:/bin:/usr/sbin'})
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if done.returncode not in (0, 1):
+            return None
+        return [line[1:] for line in done.stdout.splitlines() if line.startswith('n')]
+
+    @staticmethod
+    def _rmtree(path):
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise EndpointFailed('this platform cannot remove a directory tree without following links')
+        shutil.rmtree(path)
+
+    @staticmethod
+    def _canary_listener():
+        """A live loopback listener the profiles must keep unreachable: returns (port, close)."""
+        server = socket.socket()
+        server.bind(('127.0.0.1', 0))
+        server.listen(1)
+        return server.getsockname()[1], server.close
+
+    @staticmethod
+    def _decoy_socket(path):
+        """A live Unix socket outside every allowed path: returns close()."""
+        server = socket.socket(socket.AF_UNIX)
+        cwd = os.getcwd()
+        try:
+            os.chdir(os.path.dirname(path))
+            server.bind(os.path.basename(path))
+        finally:
+            os.chdir(cwd)
+        server.listen(1)
+        return server.close
+
+
+def _probe(body_lines):
+    """A python snippet that prints ALLOWED, DENIED:<errno> or REFUSED (a connect that the sandbox let through and nobody answered)."""
+    return 'import os, socket, sqlite3\ntry:\n' + ''.join('    %s\n' % line for line in body_lines) + (
+        "    print('ALLOWED')\nexcept OSError as e:\n    print('REFUSED' if e.errno == %d else 'DENIED:%%s' %% e.errno)" % ECONNREFUSED)
+
+
+def endpoint_probe_table(endpoint, canary, auth, canary_port, decoy, state_probe):
+    """(name, profile, python snippet, expected) for the controls that must pass under the generated daemon and relay profiles BEFORE any
+    candidate code starts. expected is ALLOWED, DENIED (EPERM or EACCES), DENIED_EPERM (EPERM only) or REFUSED."""
+    e = endpoint
+    tcp = lambda host, port, fam='socket.AF_INET': ["s = socket.socket(%s)" % fam, 's.settimeout(3)', "s.connect(('%s', %d))" % (host, port)]
+    udp = ["s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)", "s.sendto(b'x', ('192.0.2.1', 9))"]
+    uds = lambda path: ["s = socket.socket(socket.AF_UNIX)", 's.settimeout(3)', "os.chdir(%r)" % os.path.dirname(path), "s.connect(%r)" % os.path.basename(path)]
+    write = lambda path: ["open(%r, 'w').write('x')" % str(path)]
+    read = lambda path: ["open(%r, 'rb').read(1)" % str(path)]
+    table = []
+    for who, profile in (('d', 'daemon.sb'), ('r', 'relay.sb')):
+        net = [('neg_%s_testnet4' % who, tcp('192.0.2.1', 443)), ('neg_%s_testnet6' % who, tcp('2001:db8::1', 443, 'socket.AF_INET6')),
+               ('neg_%s_udp' % who, udp), ('neg_%s_resolver' % who, uds('/var/run/mDNSResponder')),
+               ('neg_%s_canary_listener' % who, tcp('127.0.0.1', canary_port)), ('neg_%s_decoy_socket' % who, uds(decoy))]
+        table += [(n, profile, b, 'DENIED_EPERM') for n, b in net]
+        table += [('neg_%s_bind_other_port' % who, profile, ["s = socket.socket()", "s.bind(('127.0.0.1', %d))" % (e.port + 1)], 'DENIED_EPERM'),
+                  ('neg_%s_read_canary' % who, profile, read(canary), 'DENIED'), ('neg_%s_read_login' % who, profile, read(auth), 'DENIED'),
+                  ('neg_%s_list_home' % who, profile, ["os.listdir(%r)" % e.home], 'DENIED'),
+                  ('neg_%s_list_exchange' % who, profile, ["os.listdir(%r)" % e.exchange], 'DENIED'),
+                  ('neg_%s_write_home' % who, profile, write(Path(e.home) / 'qa-endpoint-probe'), 'DENIED'),
+                  ('pos_%s_stat_ancestor' % who, profile, ["os.stat(%r)" % e.home], 'ALLOWED')]
+    table += [('neg_d_write_rl', 'daemon.sb', write(e.rl / 'probe'), 'DENIED'), ('neg_d_list_rl', 'daemon.sb', ["os.listdir(%r)" % str(e.rl)], 'DENIED'),
+              ('pos_d_write_state', 'daemon.sb', write(e.state / 'qa-probe'), 'ALLOWED'), ('pos_d_write_tmp', 'daemon.sb', write(e.tmp / 'qa-probe'), 'ALLOWED'),
+              ('pos_d_read_payload', 'daemon.sb', read(e.daemon_binary), 'ALLOWED'),
+              ('pos_d_sqlite_state', 'daemon.sb', ["c = sqlite3.connect(%r)" % str(e.state / 'qa-probe.db'), "c.execute('create table t(x)')"], 'ALLOWED'),
+              ('pos_d_bind_port', 'daemon.sb', ["s = socket.socket()", "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
+                                                "s.bind(('127.0.0.1', %d))" % e.port], 'ALLOWED'),
+              ('pos_d_bind_state_socket', 'daemon.sb', ["os.chdir(%r)" % str(e.state), "s = socket.socket(socket.AF_UNIX)", "s.bind('qa-probe.sock')"], 'ALLOWED'),
+              ('neg_r_write_state', 'relay.sb', write(e.state / 'probe'), 'DENIED'), ('neg_r_write_tmp', 'relay.sb', write(e.tmp / 'probe'), 'DENIED'),
+              ('neg_r_read_state', 'relay.sb', read(e.state / 'qa-probe'), 'DENIED'), ('neg_r_read_payload', 'relay.sb', read(e.daemon_binary), 'DENIED'),
+              ('pos_r_write_rl', 'relay.sb', write(e.rl / 'qa-probe'), 'ALLOWED'),
+              ('pos_r_bind_rl_socket', 'relay.sb', ["os.chdir(%r)" % str(e.rl), "s = socket.socket(socket.AF_UNIX)", "s.bind('qa-probe.sock')"], 'ALLOWED'),
+              ('pos_r_connect_daemon_port', 'relay.sb', tcp('127.0.0.1', e.port), 'REFUSED')]
+    return [(name, profile, _probe(body), expect) for name, profile, body, expect in table]
+
+
+def endpoint_result_ok(expect, observed):
+    if expect in ('ALLOWED', 'REFUSED'):
+        return observed == expect
+    return control_ok(expect, observed)
+
+
+class EndpointLifecycle:
+    """One run's endpoint: create the directories, write and run the two generated profiles' negative controls, start the daemon and the
+    relay, prove the port is the daemon's and loopback-only, and tear everything down. The order is the point: the candidate daemon is
+    the first producer code and starts only after every control of both profiles has passed."""
+
+    def __init__(self, endpoint, record_dir, ops=None, sandbox_exec='/usr/bin/sandbox-exec', python='/usr/bin/python3'):
+        self.endpoint, self.record_dir, self.ops = endpoint, Path(record_dir), ops or EndpointOps()
+        self.sandbox_exec, self.python = sandbox_exec, python
+        self.daemon = self.relay = None
+        self.record = {'port': endpoint.port, 'mode': 'daemon-endpoint', 'controls': [], 'problems': [], 'daemon_started': False,
+                       'relay_started': False, 'port_proof': None, 'teardown': None}
+        self._closers = []
+
+    # -- directories ----------------------------------------------------------------------------------------------------------------------
+    def create(self):
+        """e/ under the QA home (created 0700 if absent, then checked), the endpoint directory with an exclusive mkdir (already present is a
+        failure), and s/, t/, rl/. Nothing is followed through a link."""
+        e = self.endpoint
+        parent = e.dir.parent
+        try:
+            os.mkdir(parent, 0o700)
+        except FileExistsError:
+            pass
+        info = os.lstat(parent)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise EndpointFailed('the endpoint parent directory is not a private directory of this user')
+        try:
+            os.mkdir(e.dir, 0o700)
+        except FileExistsError:
+            raise EndpointFailed('the endpoint directory already exists')
+        for sub in (e.state, e.tmp, e.rl):
+            os.mkdir(sub, 0o700)
+        self.record_dir.mkdir(mode=0o700, exist_ok=True)
+        for name, text in (('daemon.sb', daemon_sb(e)), ('relay.sb', relay_sb(e))):
+            write_private(self.record_dir / name, text, 0o400)
+        self.record.update(endpoint_digests(e))
+
+    # -- proof before any candidate code --------------------------------------------------------------------------------------------------
+    def prove_profiles(self, canary, auth, decoy_dir):
+        """Run every control of endpoint_probe_table under the real profiles. A control that fails or cannot run fails the endpoint; no
+        candidate code has run yet. The canary listener and the decoy socket are live objects the profiles must not let a process reach."""
+        e = self.endpoint
+        if self.ops.connect(e.port) != ECONNREFUSED:
+            raise EndpointFailed('the endpoint port is already in use')
+        canary_port, closer = self.ops.canary_listener()
+        self._closers.append(closer)
+        decoy = os.path.join(str(decoy_dir), 'qa-decoy.sock')
+        self._closers.append(self.ops.decoy_socket(decoy))
+        env = {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent'}
+        failed = []
+        for name, profile, code, expect in endpoint_probe_table(e, str(canary), str(auth), canary_port, decoy, None):
+            argv = [self.sandbox_exec, '-f', str(self.record_dir / profile), self.python, '-I', '-c', code]
+            try:
+                returncode, out = self.ops.run(argv, env, 60)
+                lines = out.strip().splitlines()
+                observed = lines[-1].strip() if returncode == 0 and lines else 'NO_OUTPUT'
+            except (OSError, subprocess.SubprocessError):
+                observed = 'UNRUNNABLE'
+            ok = endpoint_result_ok(expect, observed)
+            self.record['controls'].append({'control': name, 'expected': expect, 'observed': clean(observed, 40), 'ok': ok})
+            if not ok:
+                failed.append(name)
+        if failed:
+            raise EndpointFailed('endpoint profile controls failed: %s' % ', '.join(failed[:6]))
+
+    # -- start ----------------------------------------------------------------------------------------------------------------------------
+    def _spawn(self, argv, env, log):
+        return self.ops.popen(argv, env=env, cwd='/', stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                              preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (ENDPOINT_FSIZE, ENDPOINT_FSIZE)))
+
+    def _wait_for(self, predicate, seconds, what):
+        end = self.ops.monotonic() + seconds
+        while self.ops.monotonic() < end:
+            if predicate():
+                return
+            self.ops.sleep(0.2)
+        raise EndpointFailed('%s did not come up in %d s' % (what, seconds))
+
+    def start(self):
+        e = self.endpoint
+        with open(self.record_dir / 'daemon.log', 'ab') as dlog:
+            self.daemon = self._spawn([self.sandbox_exec, '-f', str(self.record_dir / 'daemon.sb'), e.daemon_binary], e.daemon_env(), dlog)
+        self.record['daemon_started'] = True
+        self._wait_for(lambda: self.daemon.poll() is None and os.path.exists(e.daemon_sock), DAEMON_START_SECONDS, 'the daemon')
+        self.record['port_proof'] = self.prove_port()
+        with open(self.record_dir / 'relay.log', 'ab') as rlog:
+            self.relay = self._spawn([self.sandbox_exec, '-f', str(self.record_dir / 'relay.sb'), self.python, '-I', '-c', RELAY_SRC,
+                                      str(e.relay_sock), str(e.port)], {'PATH': '/usr/bin:/bin'}, rlog)
+        self.record['relay_started'] = True
+        self._wait_for(lambda: self.relay.poll() is None and os.path.exists(e.relay_sock), RELAY_START_SECONDS, 'the relay')
+
+    def prove_port(self):
+        """The port is the daemon's, held by exactly its pid, and bound to loopback only. A wildcard or IPv6 listener fails the endpoint:
+        the sandbox rule cannot forbid it, so this is the only control on it."""
+        names = self.ops.listeners(self.daemon.pid)
+        if names is None:
+            raise EndpointFailed('the daemon\'s listening sockets could not be read')
+        want = '127.0.0.1:%d' % self.endpoint.port
+        if names.count(want) != 1 or any(n != want for n in names):
+            raise EndpointFailed('the daemon does not listen on %s only (%d listener%s)' % (want, len(names), '' if len(names) == 1 else 's'))
+        if self.ops.connect(self.endpoint.port) != 0:
+            raise EndpointFailed('the daemon\'s port does not accept connections')
+        return {'listeners': names, 'daemon_pid': self.daemon.pid}
+
+    def supervise(self):
+        """One poll step for the helper's wait loop: the moment the daemon exits the relay is killed, so another process that takes the freed
+        port never receives QA traffic. Returns False once the daemon is gone."""
+        if self.daemon is not None and self.daemon.poll() is not None:
+            self.record['daemon_exited_early'] = self.daemon.returncode
+            self._stop(self.relay, 0)
+            return False
+        return True
+
+    # -- teardown -------------------------------------------------------------------------------------------------------------------------
+    def _stop(self, proc, grace):
+        if proc is None:
+            return
+        for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 2)):
+            try:
+                self.ops.killpg(proc.pid, sig)
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                proc.wait(timeout=wait)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        try:
+            self.ops.killpg(proc.pid, signal.SIGKILL)           # stragglers in the process's own group
+        except (OSError, ProcessLookupError):
+            pass
+
+    def teardown(self):
+        """Relay first, then daemon, then verify: the port refuses, both sockets are gone (unlinked here if the daemon left one, and
+        said so), the endpoint directory is removed. Safe to call twice and after a failed start."""
+        e = self.endpoint
+        steps = {'relay_stopped': False, 'daemon_stopped': False, 'port_closed': False, 'socket_removed_by_helper': [], 'sockets_gone': False,
+                 'dir_removed': False}
+        self._stop(self.relay, RELAY_GRACE_SECONDS)
+        steps['relay_stopped'] = self.relay is None or self.relay.poll() is not None
+        self._stop(self.daemon, DAEMON_GRACE_SECONDS)
+        steps['daemon_stopped'] = self.daemon is None or self.daemon.poll() is not None
+        for close in self._closers:
+            try:
+                close()
+            except OSError:
+                pass
+        self._closers = []
+        steps['port_closed'] = self.ops.connect(e.port) == ECONNREFUSED
+        for sock in (e.daemon_sock, e.relay_sock):
+            if os.path.lexists(sock):
+                try:
+                    os.unlink(sock)
+                    steps['socket_removed_by_helper'].append(sock.name)
+                except OSError:
+                    pass
+        steps['sockets_gone'] = not any(os.path.lexists(s) for s in (e.daemon_sock, e.relay_sock))
+        if os.path.lexists(e.dir):
+            try:
+                self.ops.rmtree(e.dir)
+            except (OSError, EndpointFailed):
+                pass
+        steps['dir_removed'] = not os.path.lexists(e.dir)
+        steps['clean'] = all(steps[k] for k in ('relay_stopped', 'daemon_stopped', 'port_closed', 'sockets_gone', 'dir_removed'))
+        self.record['teardown'] = steps
+        return steps
 
 
 def prepare_codex_home(run_dir, read_roots=(), home=None):
