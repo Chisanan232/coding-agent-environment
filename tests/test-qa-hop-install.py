@@ -43,10 +43,16 @@ class Env:
         (self.base / "etc/sudoers.d").mkdir(parents=True, mode=0o755)
         for d in (self.base / "Library", self.base / "etc", self.base / "etc/sudoers.d"):
             os.chmod(d, 0o755)
+        self.install = self.base / "install"           # the "root-owned copy" of the four scripts
+        self.install.mkdir(mode=0o755)
+        os.chmod(self.install, 0o755)
+        for name in inst.BUNDLE_NAMES:
+            shutil.copy(SCRIPTS / name, self.install / name)
+            os.chmod(self.install / name, 0o644)
         self.layout = inst.Layout(lib=self.base / "Library/cae-qa", sudoers=self.base / "etc/sudoers.d/cae-qa", root_uid=ME,
-                                  wheel_gid=os.getgid(), anchor=self.base)
+                                  wheel_gid=os.getgid(), anchor=self.base, bundle_dir=self.install)
         self.source = self.base / "codex-src"
-        self.source.write_bytes(b"#!/bin/sh\necho codex 0.163.0\n" * 100)
+        self.source.write_bytes(b"\xcf\xfa\xed\xfe" + b"codex 0.163.0 pretend Mach-O payload\n" * 100)
         os.chmod(self.source, 0o755)
         self.digest = hashlib.sha256(self.source.read_bytes()).hexdigest()
         self.events = []
@@ -89,6 +95,9 @@ class Env:
             argv += ["--producer-uid", str(values["producer_uid"])]
         if mode != "rollback":
             argv += ["--codex-source", values["codex_source"], "--codex-sha256", values["codex_sha256"]]
+        if mode == "apply":
+            bundle = inst.Bundle(self.install)
+            argv += ["--bundle-sha256", over.get("bundle_sha256", bundle.combined), "--helper-sha256", over.get("helper_sha256", bundle.helper_sha)]
         return argv
 
     def main(self, mode="plan", **over):
@@ -149,27 +158,30 @@ class RenderTests(Case):
             block = block.replace(old, new)
         self.assertEqual(self.render().rstrip("\n"), block.rstrip("\n"))
 
-    def test_seven_commands_and_no_findings(self):
+    def test_seven_commands_and_exact_line_comparison(self):
         text = self.render()
-        self.assertEqual(inst.sudoers_findings(text, "qauser"), [])
+        self.assertEqual(inst.sudoers_findings(text, self.render()), [])
         self.assertEqual(text.count("/bin/kill -KILL -1"), 1)
         self.assertEqual(text.count("/bin/launchctl print"), 3)
         self.assertEqual(len(re.findall(r"^\s*(?:Cmnd_Alias CAE_QA_\w+\s+= )?(?:/\S+|sha256:\S+ /\S+)", text, re.M)), 9)  # 7 + 2 helper shapes
         self.assertIn("NOPASSWD: NOSETENV:", text)
         self.assertIn("(qauser)", text)
 
-    def test_widened_variants_are_flagged(self):
+    def test_any_deviation_from_the_rendered_lines_is_a_finding(self):
         good = self.render()
+        lines = good.splitlines()
         for label, bad in (("nopasswd all", good.replace("CAE_QA_SWEEP, CAE_QA_SEE, CAE_QA_SIDE", "ALL")),
                            ("root target", good.replace("(qauser)", "(root)")),
-                           ("all target", good.replace("(qauser)", "(ALL)")),
                            ("wildcard", good.replace("/bin/kill -KILL -1", "/bin/kill *")),
                            ("setenv", good.replace("NOSETENV:", "SETENV:")),
                            ("shell", good + "bryant ALL = (qauser) NOPASSWD: /bin/sh\n"),
                            ("interpreter", good.replace("/usr/bin/atq \"\"", "/usr/bin/python3")),
-                           ("extra grant", good + good.splitlines()[-1] + "\n"),
+                           ("extra grant", good + lines[-1] + "\n"),
+                           ("dropped line", "\n".join(l for l in lines if "crontab" not in l) + "\n"),
+                           ("reordered", "\n".join(reversed(lines)) + "\n"),
+                           ("other uid", good.replace("user/599", "user/0")),
                            ("dotdot", good.replace("user/599, ", "user/599/../0, "))):
-            self.assertTrue(inst.sudoers_findings(bad, "qauser"), label)
+            self.assertTrue(inst.sudoers_findings(bad, good), label)
 
     @unittest.skipUnless(HAVE_VISUDO, "visudo not available")
     def test_visudo_parses_the_rendered_text_unprivileged(self):
@@ -252,8 +264,9 @@ class ApplyTests(Case):
         config = json.loads(Path(lay.config).read_text())
         self.assertEqual(config, {"qa_name": "fornaxqa", "qa_uid": 777, "producer_uid": ME, "exchange": "/Users/Shared/fornaxqa-qa",
                                   "codex_path": lay.codex, "codex_sha256": self.env.digest})
-        planned = inst.sudoers_findings(Path(lay.sudoers).read_text(), "fornaxqa")
-        self.assertEqual(planned, [])
+        helper_sha = hashlib.sha256((SCRIPTS / "qa-side.py").read_bytes()).hexdigest()
+        want = inst.render_sudoers(MY_NAME, "fornaxqa", 777, "/Users/fornaxqa", helper_sha, lay.helper)
+        self.assertEqual(inst.sudoers_findings(Path(lay.sudoers).read_text(), want), [])
         self.assertEqual(sorted(os.listdir(lay.lib)), ["codex", "qa-side", "qa-side.json"])
         self.assertEqual(sorted(os.listdir(os.path.dirname(lay.sudoers))), ["cae-qa"])           # no temp files left
         runs = [e[1] for e in self.env.events if e[0] == "run"]
@@ -316,8 +329,8 @@ class ApplyTests(Case):
     def test_source_changed_after_the_plan_is_caught_while_copying(self):
         real = inst.resolve_inputs
 
-        def tamper(args, ops, need_codex=True):
-            result = real(args, ops, need_codex)
+        def tamper(args, ops, bundle, need_codex=True):
+            result = real(args, ops, bundle, need_codex)
             self.env.source.write_bytes(b"swapped after hashing")
             return result
         with mock.patch.object(inst, "resolve_inputs", side_effect=tamper):
@@ -436,6 +449,230 @@ class RollbackTests(Case):
         code, out = self.env.main("rollback")
         self.assertEqual(code, 1)
         self.assertFalse(os.path.lexists(self.env.layout.sudoers))          # the grant was already gone before the refusal
+
+
+class RootRunsOnlyTrustedCodeTests(Case):
+    """H1: root must never execute or install code a less-privileged user can change."""
+
+    def refused_apply(self, expect=None):
+        code, out = self.env.main("apply")
+        self.assertEqual(code, 1, out)
+        self.assertIn("REFUSED", out)
+        if expect:
+            self.assertIn(expect, out)
+        self.assertFalse(os.path.lexists(self.env.layout.lib))
+        self.assertFalse(os.path.lexists(self.env.layout.sudoers))
+        self.assertEqual([e for e in self.env.events if e[0] in ("fchown", "chown")], [])
+        return out
+
+    def test_a_writable_script_is_refused(self):
+        for name in inst.BUNDLE_NAMES:
+            env = Env()
+            self.addCleanup(env.close)
+            os.chmod(env.install / name, 0o664)
+            code, out = (lambda lines: (inst.main(env.args("apply"), layout=env.layout, ops=env.ops, out=lines.append), "\n".join(lines)))([])
+            self.assertEqual(code, 1, name)
+            self.assertIn("writable by group or other", out)
+            self.assertFalse(os.path.lexists(env.layout.lib))
+
+    def test_a_writable_or_foreign_directory_in_the_chain_is_refused(self):
+        os.chmod(self.env.install, 0o775)
+        self.refused_apply("writable by group or other")
+        os.chmod(self.env.install, 0o755)
+        os.chmod(self.env.base, 0o757)
+        self.refused_apply("writable by group or other")
+
+    def test_a_chain_that_root_does_not_own_is_refused(self):
+        self.env.layout.root_uid = ME + 1            # the scratch tree is owned by the current user, not by "root"
+        self.env.euid = ME + 1
+        self.refused_apply("not root-owned")
+
+    def test_links_in_the_chain_or_as_scripts_are_refused(self):
+        real = self.env.base / "install-real"
+        os.rename(self.env.install, real)
+        os.symlink(real, self.env.install)
+        self.refused_apply("is a link")
+        os.unlink(self.env.install)
+        os.rename(real, self.env.install)
+        approved = self.env.args("apply")
+        victim = self.env.install / "qa-side.py"
+        os.rename(victim, self.env.install / "qa-side.real")
+        os.symlink(self.env.install / "qa-side.real", victim)
+        lines = []
+        with fake_accounts():
+            code = inst.main(approved, layout=self.env.layout, ops=self.env.ops, out=lines.append)
+        self.assertEqual(code, 1, lines)
+        self.assertFalse(os.path.lexists(self.env.layout.lib))
+
+    def test_rollback_also_refuses_a_writable_installer(self):
+        self.installed()
+        os.chmod(self.env.install / "qa-hop-install.py", 0o666)
+        code, out = self.env.main("rollback")
+        self.assertEqual(code, 1)
+        self.assertTrue(os.path.lexists(self.env.layout.sudoers))
+
+    def test_the_pins_are_required_checked_and_bound_to_the_bytes(self):
+        bundle = inst.Bundle(self.env.install)
+        for over in ({"bundle_sha256": "0" * 64}, {"helper_sha256": "0" * 64}, {"bundle_sha256": "xyz"}, {"helper_sha256": bundle.combined},
+                     {"bundle_sha256": bundle.combined.upper()}):
+            code, out = self.env.main("apply", **over)
+            self.assertEqual(code, 1, over)
+            self.assertFalse(os.path.lexists(self.env.layout.lib))
+        for flag in ("--bundle-sha256", "--helper-sha256"):
+            argv = self.env.args("apply")
+            i = argv.index(flag)
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                inst.build_parser().parse_args(argv[:i] + argv[i + 2:])
+
+    def test_a_script_changed_between_plan_and_apply_is_caught(self):
+        code, plan = self.env.main("plan")
+        self.assertEqual(code, 0)
+        bundle = inst.Bundle(self.env.install)
+        self.assertIn("--bundle-sha256 " + bundle.combined, plan)
+        approved = self.env.args("apply")
+        os.chmod(self.env.install / "qa-handoff.py", 0o644)
+        with open(self.env.install / "qa-handoff.py", "ab") as handle:
+            handle.write(b"\n# changed after approval\n")
+        lines = []
+        with fake_accounts():
+            code = inst.main(approved, layout=self.env.layout, ops=self.env.ops, out=lines.append)
+        self.assertEqual(code, 1)
+        self.assertIn("do not match the digests you approved", "\n".join(lines))
+        self.assertFalse(os.path.lexists(self.env.layout.lib))
+
+    def test_the_installed_helper_is_the_bytes_the_digest_covers(self):
+        self.installed()
+        bundle = inst.Bundle(self.env.install)
+        self.assertEqual(hashlib.sha256(Path(self.env.layout.helper).read_bytes()).hexdigest(), bundle.helper_sha)
+        self.assertEqual(Path(self.env.layout.helper).read_bytes(), bundle.data["qa-side.py"])
+
+    def test_plan_prints_every_digest_the_combined_digest_and_the_copy_step(self):
+        code, out = self.env.main("plan")
+        self.assertEqual(code, 0, out)
+        bundle = inst.Bundle(self.env.install)
+        for name, digest in bundle.sha.items():
+            self.assertIn(name, out)
+            self.assertIn(digest, out)
+        lines = "".join("%s %s\n" % (n, bundle.sha[n]) for n in sorted(bundle.sha))
+        self.assertEqual(bundle.combined, hashlib.sha256(lines.encode()).hexdigest())
+        for needle in ("sudo install -d -m 755 -o root -g wheel /Library/cae-qa-install", "sudo install -m 644 -o root -g wheel",
+                       "sudo /usr/bin/python3 -I -B /Library/cae-qa-install/qa-hop-install.py apply", "--bundle-sha256 " + bundle.combined,
+                       "--helper-sha256 " + bundle.helper_sha, "--version", "Unverified until the owner pilot", "Mach-O"):
+            self.assertIn(needle, out)
+
+    def test_bytecode_is_never_written(self):
+        self.assertTrue(sys.dont_write_bytecode)
+        self.installed()
+        self.env.main("verify")
+        found = [str(p) for p in self.env.base.rglob("__pycache__")] + [str(p) for p in self.env.base.rglob("*.pyc")]
+        self.assertEqual(found, [])
+        self.assertIn("sys.dont_write_bytecode = True", (SCRIPTS / "qa-hop-install.py").read_text())
+        self.assertIn("python3 -I -B", (SCRIPTS.parent / "docs/QA-HANDOFF.md").read_text())
+
+    def test_loaded_modules_are_executed_from_the_bytes_that_were_hashed(self):
+        bundle = inst.Bundle(self.env.install)
+        before = bundle.sha["qa-identity-setup.py"]
+        (self.env.install / "qa-identity-setup.py").write_text("raise SystemExit('swapped after the bundle was read')\n")
+        module = bundle.module("qa-identity-setup")           # still the original bytes
+        self.assertTrue(hasattr(module, "NAME_RE"))
+        self.assertEqual(bundle.sha["qa-identity-setup.py"], before)
+
+
+class SudoersDirectoryTests(Case):
+    def test_symlinked_or_writable_sudoers_dir_is_refused(self):
+        d = self.env.base / "etc/sudoers.d"
+        real = self.env.base / "etc/real.d"
+        os.rename(d, real)
+        os.symlink(real, d)
+        code, out = self.env.main("apply")
+        self.assertEqual(code, 1, out)
+        self.assertEqual(os.listdir(real), [])
+        os.unlink(d)
+        os.rename(real, d)
+        os.chmod(d, 0o777)
+        code, out = self.env.main("apply")
+        self.assertEqual(code, 1, out)
+        self.assertEqual(os.listdir(d), [])
+
+    def test_only_the_known_etc_link_is_accepted(self):
+        lay = inst.Layout(sudoers="/etc/sudoers.d/cae-qa")
+        with mock.patch.object(inst.os.path, "isdir", return_value=True), mock.patch.object(inst, "chain_problems", return_value=[]):
+            with mock.patch.object(inst.os.path, "realpath", return_value="/private/etc/sudoers.d"):
+                self.assertEqual(inst.sudoers_real(lay), "/private/etc/sudoers.d/cae-qa")
+            with mock.patch.object(inst.os.path, "realpath", return_value="/Users/Shared/evil"):
+                with self.assertRaises(inst.Stop):
+                    inst.sudoers_real(lay)
+
+
+class CodexPinTests(Case):
+    def test_only_mach_o_binaries_are_accepted(self):
+        for magic in inst.MACHO_MAGIC:
+            self.env.source.write_bytes(magic + b"payload")
+            digest = hashlib.sha256(self.env.source.read_bytes()).hexdigest()
+            code, out = self.env.main("plan", codex_sha256=digest)
+            self.assertEqual(code, 0, (magic, out))
+        for data in (b"#!/bin/sh\necho hi\n", b"#!/usr/bin/env node\n", b"MZ\x90\x00", b"\x7fELF", b""):
+            self.env.source.write_bytes(data)
+            digest = hashlib.sha256(data).hexdigest()
+            code, out = self.env.main("plan", codex_sha256=digest)
+            self.assertEqual(code, 1, data)
+            self.assertIn("Mach-O", out)
+
+
+class FailClosedTests(Case):
+    def test_producer_account_names(self):
+        bundle = inst.Bundle(self.env.install)
+        for name, good in (("Bryant", True), ("bryant.l-2", True), ("_svc", True), ("a b", False), ("x,y", False), ("#0", False),
+                           ("ALL", False), ("root", False), ("1abc", False), ("a" * 40, False), ("a:b", False), ("a\nb", False)):
+            record = FakePw(name, ME, "/Users/x")
+            with mock.patch.object(pwd, "getpwnam", lambda n: QA if n == QA.pw_name else pwd.getpwnam.__wrapped__(n) if False else QA), \
+                    mock.patch.object(pwd, "getpwuid", lambda uid: record if uid == ME else QA):
+                if good:
+                    self.assertEqual(inst.validate_identity(bundle, "fornaxqa", 777, ME, None)[2], name)
+                else:
+                    with self.assertRaises(inst.Stop, msg=repr(name)):
+                        inst.validate_identity(bundle, "fornaxqa", 777, ME, None)
+
+    def test_an_undeletable_drop_in_after_a_failed_live_check_is_reported_loudly(self):
+        self.env.visudo_result = lambda argv: (1, "broken") if argv == ["/usr/sbin/visudo", "-c"] else None
+        real = os.unlink
+
+        def failing(path, *a, **k):
+            if str(path).endswith("/cae-qa") and "sudoers.d" in str(path):
+                raise PermissionError(1, "denied")
+            return real(path, *a, **k)
+        with mock.patch("os.unlink", side_effect=failing):
+            code, out = self.env.main("apply")
+        self.assertEqual(code, 1)
+        self.assertIn("STILL ACTIVE", out)
+        self.assertIn("sudo rm -f " + str(self.env.base / "etc/sudoers.d/cae-qa"), out)
+
+    def test_failed_post_install_verification_removes_the_drop_in(self):
+        with mock.patch.object(inst, "verify_installed", return_value=(None, ["pretend problem"])):
+            code, out = self.env.main("apply")
+        self.assertEqual(code, 1)
+        self.assertIn("removed again (fail closed)", out)
+        self.assertFalse(os.path.lexists(self.env.layout.sudoers))
+
+    def test_failed_post_install_verification_and_undeletable_drop_in_is_loud(self):
+        real = os.unlink
+
+        def failing(path, *a, **k):
+            if str(path).endswith("/sudoers.d/cae-qa"):
+                raise PermissionError(1, "denied")
+            return real(path, *a, **k)
+        with mock.patch.object(inst, "verify_installed", return_value=(None, ["pretend problem"])), mock.patch("os.unlink", side_effect=failing):
+            code, out = self.env.main("apply")
+        self.assertEqual(code, 1)
+        self.assertIn("STILL ACTIVE", out)
+
+    def test_a_drop_in_that_reads_back_differently_is_never_installed(self):
+        real = inst.read_regular
+        with mock.patch.object(inst, "read_regular", side_effect=lambda path, *a: b"tampered\n" if str(path).endswith(".cae-qa.new") else real(path, *a)):
+            code, out = self.env.main("apply")
+        self.assertEqual(code, 1)
+        self.assertFalse(os.path.lexists(self.env.layout.sudoers))
+        self.assertEqual(os.listdir(os.path.dirname(self.env.layout.sudoers)), [])
 
 
 class SourceHygieneTests(unittest.TestCase):
