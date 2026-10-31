@@ -128,7 +128,7 @@ processes (a same-uid sysctl the Codex profile cannot deny). `--require-env-isol
 identity, for callers that must never fall back to the same-user mode. `--read-root` is refused with an identity (it names
 directories of the producer's HOME).
 
-**Launch it from your own Terminal.** Every hop uses `sudo -n` (never a password prompt) through the setup script's
+**Launch it from your own Terminal (attended mode).** Every hop uses `sudo -n` (never a password prompt) through the setup script's
 terminal-detaching hop (`sudo -n -u NAME -H env -i HOME=/Users/NAME PATH=... python3 -I -c DETACH ...`). sudo's
 credential cache belongs to the terminal that typed the password, so an agent session cannot use it. The owner runs:
 
@@ -136,7 +136,10 @@ credential cache belongs to the terminal that typed the password, so an agent se
 sudo -v && python3 scripts/qa-handoff.py run --run-dir DIR --qa-identity NAME --exchange /Users/Shared/NAME-qa
 ```
 
-No sudoers change is made or needed. A `sudo -n` refusal is `QA_INCOMPLETE` with codex not started. Every sudo hop,
+No sudoers change is made or needed **by this attended mode**, and `qa-identity-setup.py` itself never edits sudoers. The
+unattended alternative decided in [ADR 0016](adr/0016-unattended-qa-hop.md) (a one-time owner-installed sudoers drop-in that lets
+the producer act as the QA user for eight fixed commands, plus a pinned helper) reverses that statement for its own installed mode
+only. It is a design: not implemented, nothing is installed, and this attended path stays the default and the fallback. A `sudo -n` refusal is `QA_INCOMPLETE` with codex not started. Every sudo hop,
 the codex hop included, stays in the session of the Terminal that ran `sudo -v` (sudo's default timestamp is per
 terminal session; only the QA side detaches itself, as the QA user). The codex hop is therefore stopped by signalling the
 sudo child directly, and the seal's sweep removes anything left. How this behaves with a real terminal, real sudo and
