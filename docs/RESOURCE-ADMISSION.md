@@ -122,11 +122,48 @@ process with no heavy-named ancestor plus its whole subtree (shells and test bin
 children and a test binary is one workload, reported with its process count and summed RSS. A workload is idle only when its root is an idle orphan
 and every member is quiet by the same tests, so an orphan `cargo` with an idle `rustc` child no longer refuses; any member that spends CPU, is new, or was active in the first sample makes the whole tree active.
 
-## Unreaped lane holders (SPE-111)
+## Lane holders, workloads and the UNRESOLVED state (SPE-111)
 
-A holder that has exited but whose parent never reaped it is a zombie. The zombie wrapper alone is not proof that the lane is
-free: the job it started keeps running in the wrapper's process group. `disk-admission.py` therefore treats a zombie holder as
-exited only when it led its own process group (pgid equals pid) and no other live process remains in that group. A zombie that
-shares a group with other processes, or a process table that cannot be read, keeps the lane occupied (fail closed): reap the
-zombie (its parent) or have the owner release it. A job that left the group with `setsid` is not visible to this check; that
-residual is accepted and is why a lane holder should supervise its job from a process that stays alive.
+A lane belongs to a **workload**, not to the wrapper process that reserved it. A wrapper that exited (even one nobody reaped,
+a zombie) proves nothing about the work it started: that work can outlive it through `setsid`, a double fork or plain
+reparenting to launchd. The wrapper's death is therefore never, by itself, a release.
+
+What is recorded. At reserve and claim time, and again every time a reservation is inspected while its wrapper is still
+alive (every reserve, claim, queue advance and the 60-second snapshot refresher), the reservation stores a bounded workload
+identity: the wrapper's process group when it leads one (`pgid == pid`) and up to 256 descendant `pid` + start-token pairs
+(the wrapper's process subtree, their subtrees, and live members of the wrapper's own group). Only `pid`, `ppid`, `pgid`,
+`stat` and `lstart` are read from `ps`, never a command line. The record is kept on the queue entry's holder as well, so it
+survives an explicit `release` of a job that is still running.
+
+Decision per holder (`holder_status`):
+
+| Situation | State | Lane and bytes |
+|---|---|---|
+| Wrapper is the same running process (start token matches, not a zombie) | alive | kept |
+| Wrapper gone, a zombie, or its pid reused, and a recorded member still runs (start token matches, not a zombie) | **unresolved** | kept, reason reported |
+| Holder or process table cannot be inspected (`ps` error, unparseable table) | **unresolved** | kept, reported as a problem (refuses admission) |
+| Wrapper is an unreaped zombie and its workload was never recorded, or more than 256 descendants were seen | **unresolved** | kept |
+| Wrapper gone or zombie and every recorded identity is gone | exited | released |
+| Record written before this change (no workload): wrapper token mismatch or absent | exited | released |
+
+`unresolved` is a reported state, never a silent one: `live_reservations` returns it as `unresolved` on the record, lane-cap
+refusals print `UNRESOLVED: <reason>`, and the snapshot lists `reservation-unresolved: <label> ...` in `blockers`. Release
+happens only on positive evidence (all recorded identities gone, or an explicit `release` by the owner). The time limit is not
+evidence: a past-TTL holder keeps its lane exactly as before, marked `past_ttl`. A reused pid never counts as the wrapper or as
+a member, because every comparison includes the start token; a group is attributed to the wrapper only while the group's leader
+pid is still the recorded wrapper or already gone. Queue grants are unchanged: FIFO, non-preemptive, one grant at a time, and
+the lane counts are untouched. A grant-time resource check, where one exists, is defense in depth and is never used to certify
+that a previous workload ended.
+
+Known limits (not guaranteed):
+
+- Detached work is found only if it was seen while linked to the workload. Work that left the wrapper's process tree and group
+  (`setsid`, or a double fork) **before any inspection ran** after it started is invisible, and so is work launched in that
+  window after the last refresh. There is no polling; inspections happen when a queue-aware command or the snapshot refresher
+  runs. Where the wrapper does not lead its own group, group co-members are not attributed to it.
+- The session id (`sess`) is deliberately not used: on macOS it is a kernel pointer, and a shared terminal session would pin
+  lanes to unrelated shells. Working-directory or target-dir ownership is not used either (it needs `lsof`).
+- More than 256 descendants make the record non-exhaustive and the holder unresolved once the recorded ones end; the owner
+  releases it explicitly.
+- An unresolved reservation is cleared only by the workload ending or by the owner's explicit `release`. Nothing here signals,
+  kills or deletes another session's process or state.
