@@ -483,8 +483,18 @@ def read_config(config_path, chain_anchor):
     return config
 
 
+# The exchange root is root:wheel 0711: the QA user may only SEARCH it. Directories that are only traversed (exchange, inbox,
+# attempt) are opened with O_SEARCH (macOS: O_EXEC|O_DIRECTORY = 0x40100000); there is no fallback to a read-mode open.
+_O_SEARCH = getattr(os, 'O_SEARCH', None) or (0x40100000 if sys.platform == 'darwin' else None)
+
+
+def search_flags():
+    _need(_O_SEARCH is not None)
+    return _O_SEARCH | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
 def open_dir_at(parent_fd, name, fds):
-    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    fd = os.open(name, search_flags(), dir_fd=parent_fd)
     fds.append(fd)
     return fd
 
@@ -492,7 +502,7 @@ def open_dir_at(parent_fd, name, fds):
 def read_request(config, verb, attempt, fds):
     """X/inbox/<attempt>/request.json, opened relative to parent descriptors without following a link at any step."""
     producer = config['producer_uid']
-    xfd = os.open(config['exchange'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    xfd = os.open(config['exchange'], search_flags())
     fds.append(xfd)
     st = os.fstat(xfd)
     _need(st.st_uid == ROOT_UID and not st.st_mode & 0o022)
