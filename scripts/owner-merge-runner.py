@@ -487,8 +487,17 @@ def check_entry(c):
     return name, verdict
 
 
+def entry_blocks(name, verdict, required, exempt):
+    """The one rule for whether a rollup entry blocks: only SUCCESS, an exempted name, or a SKIPPED entry of a
+    non-required check does not."""
+    return verdict != "SUCCESS" and name not in exempt and not (verdict == "SKIPPED" and name not in required)
+
+
 def summarize_checks(rollup, required, exempt=frozenset()):
-    """Every named required check must be present and SUCCESS; every other entry must also be SUCCESS.
+    """Every named required check must be present and SUCCESS; every other entry must also be SUCCESS, except that a
+    non-required entry that SKIPPED (a job whose `if:` did not select this event, such as a release job that only runs on
+    tag pushes) is not a blocker: it never ran, and it is not one of the allowlisted checks. A required check that
+    skipped, and every other non-SUCCESS verdict of any check, still blocks.
     A name in `exempt` (verified never executed, covered by local evidence) may have non-SUCCESS entries."""
     seen, bad = {}, []
     for c in rollup:
@@ -499,10 +508,11 @@ def summarize_checks(rollup, required, exempt=frozenset()):
             bad.append(f"required check {name} is missing")
     for name, verdicts in seen.items():
         for v in verdicts:
-            if v != "SUCCESS" and name not in exempt:
+            if entry_blocks(name, v, required, exempt):
                 bad.append(f"check {name} is {v}")
     return {"total": len(rollup), "required": len(required),
-            "success": sum(v == "SUCCESS" for vs in seen.values() for v in vs), "not_success": len(bad)}, bad
+            "success": sum(v == "SUCCESS" for vs in seen.values() for v in vs), "not_success": len(bad),
+            "skipped_ignored": sum(v == "SKIPPED" for n, vs in seen.items() if n not in required and n not in exempt for v in vs)}, bad
 
 
 def parse_rule_contexts(rules):
@@ -676,17 +686,20 @@ def only_actions_runs(runner, repo, head, name):
 
 
 def unavailable_checks(runner, repo, facts, head, cfg, local):
-    """Required checks the LOCAL_EQUIVALENT_CI exception may stand in for: every non-SUCCESS entry of the check
-    is a hosted CheckRun that GitHub itself reports as never started (CI_UNAVAILABLE_EXTERNAL), and the local
-    evidence lists the check as passed at this head. A check that executed and failed is CI_FAILED and is never
-    exempted; a required check missing from the rollup is never exempted."""
+    """Checks the LOCAL_EQUIVALENT_CI exception may stand in for: every non-SUCCESS entry of the check is a hosted
+    CheckRun that GitHub itself reports as never started (CI_UNAVAILABLE_EXTERNAL), and the local evidence lists
+    the check as passed at this head. Required checks and, equally, non-required checks named in the local
+    evidence qualify (private repos without branch protection cannot allowlist path-filtered workflows). A check
+    that executed and failed is CI_FAILED and is never exempted; a required check missing from the rollup is
+    never exempted."""
     if local is None or not cfg["local_equivalent_ci"]:
         return frozenset()
     rollup = facts.get("statusCheckRollup")
     if not isinstance(rollup, list):
         return frozenset()
     exempt = set()
-    for name in cfg["required_checks"]:
+    optional = {check_entry(c)[0] for c in rollup} - set(cfg["required_checks"])
+    for name in list(cfg["required_checks"]) + sorted(optional):
         if name not in local:
             continue
         bad = []
@@ -704,6 +717,15 @@ def unavailable_checks(runner, repo, facts, head, cfg, local):
         if ok:
             exempt.add(name)
     return frozenset(exempt)
+
+
+def unstable_is_covered(rollup, required, exempt):
+    """mergeStateStatus UNSTABLE means only non-required checks are not green. It is acceptable only when something
+    was exempted and no rollup entry blocks by the same rule as summarize_checks (so nothing is pending, or an
+    executed failure, or a skipped required check)."""
+    if not exempt:
+        return False
+    return not any(entry_blocks(n, v, required, exempt) for n, v in map(check_entry, rollup))
 
 
 def decide(p, repo, pr, head, me, cfg, exempt=frozenset()):
@@ -736,7 +758,7 @@ def decide(p, repo, pr, head, me, cfg, exempt=frozenset()):
         bad.append("observed head differs from expected head")
     if mergeable != "MERGEABLE":
         bad.append(f"mergeable is {mergeable}")
-    if mss != "CLEAN":
+    if mss != "CLEAN" and not (mss == "UNSTABLE" and unstable_is_covered(rollup, cfg["required_checks"], exempt)):
         bad.append(f"mergeStateStatus is {mss}")
     latest = {}
     for r in reviews:
@@ -790,7 +812,9 @@ def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin=None):
         raise Refused(["base branch changed since the first read"])
     # With the exception enabled, check verdicts can only be judged after the local evidence is read, so every
     # other fact is validated first; a required check is never skipped by this pre-pass in the real decision below.
-    decide(facts, repo, pr, head, me, cfg, frozenset(cfg["required_checks"]) if cfg["local_equivalent_ci"] else frozenset())
+    pre = frozenset(cfg["required_checks"]) | {check_entry(c)[0] for c in facts.get("statusCheckRollup") or ()} \
+        if cfg["local_equivalent_ci"] else frozenset()
+    decide(facts, repo, pr, head, me, cfg, pre)
     digest, local = load_evidence(evidence, head, repo, pr, base, cfg, key, clock())
     exempt = unavailable_checks(runner, repo, facts, head, cfg, local)
     pr_class, checks = decide(facts, repo, pr, head, me, cfg, exempt)
@@ -810,8 +834,13 @@ def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin=None):
     final_class, _ = decide(after, repo, pr, head, me, cfg, exempt_after)  # every blocking fact in the last read refuses
     if final_class != pr_class:
         raise Refused(["PR class changed while server-side state was being read"])
+    req = set(cfg["required_checks"])
+    entries = [check_entry(c) for c in after["statusCheckRollup"]]
     checks = dict(checks, ci_class="CI_UNAVAILABLE_EXTERNAL" if exempt else "CI_PASS",
-                  local_equivalent=sorted(exempt))  # an exempted check is never reported as CI_PASS
+                  local_equivalent=sorted(exempt),  # union, kept for compatibility
+                  local_equivalent_required=sorted(exempt & req), local_equivalent_optional=sorted(exempt - req),
+                  exempted_entries=sum(v != "SUCCESS" and n in exempt for n, v in entries),
+                  merge_state=after.get("mergeStateStatus"))  # an exempted check is never reported as CI_PASS
     return observed, pr_class, checks, info, {"base": base, "evidence": digest}
 
 

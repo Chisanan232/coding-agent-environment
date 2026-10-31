@@ -1531,6 +1531,24 @@ class LocalEquivalentCi(Base):
             with self.subTest(job=job):
                 self.assertRefused(self.gh(job=job), "check ci is FAILURE")
 
+    def test_a_skipped_non_required_check_does_not_block_but_nothing_else_is_relaxed(self):
+        def entry(name, conclusion):
+            return {"__typename": "CheckRun", "name": name, "status": "COMPLETED", "conclusion": conclusion}
+        ok = [entry("ci", "SUCCESS")]
+        counts, bad = omr.summarize_checks(ok + [entry("publish GitHub Release", "SKIPPED"), entry("attest provenance (x)", "SKIPPED")], ["ci"])
+        self.assertEqual(bad, [])
+        self.assertEqual((counts["skipped_ignored"], counts["success"], counts["total"]), (2, 1, 3))   # the omission is visible
+        for verdict in ("FAILURE", "CANCELLED", "TIMED_OUT", "NEUTRAL", "ACTION_REQUIRED", "STARTUP_FAILURE"):
+            with self.subTest(verdict=verdict):
+                self.assertTrue(omr.summarize_checks(ok + [entry("other", verdict)], ["ci"])[1])
+        pending = {"__typename": "CheckRun", "name": "other", "status": "IN_PROGRESS"}
+        self.assertTrue(omr.summarize_checks(ok + [pending], ["ci"])[1])
+        # a required check that skipped, or is missing, still blocks
+        self.assertTrue(omr.summarize_checks([entry("ci", "SKIPPED")], ["ci"])[1])
+        self.assertTrue(omr.summarize_checks([entry("lint", "SKIPPED")], ["ci"])[1])
+        # one skipped entry and one failed entry of the same non-required name: the failure blocks
+        self.assertTrue(omr.summarize_checks(ok + [entry("x", "SKIPPED"), entry("x", "FAILURE")], ["ci"])[1])
+
     def test_only_not_started_verdicts_qualify(self):
         for verdict in ("TIMED_OUT", "SKIPPED", "NEUTRAL", "ACTION_REQUIRED", "IN_PROGRESS", "QUEUED"):
             with self.subTest(verdict=verdict):
@@ -1672,6 +1690,142 @@ class LocalEquivalentCi(Base):
                     ["api", "-X", "POST", f"repos/{REPO}/actions/jobs/99"]):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 omr.check_argv(bad)
+
+
+CIRC_UBU, CIRC_MAC, CIRC_SONAR = "test (ubuntu-latest)", "test (macos-latest)", "SonarCloud Code Analysis"
+
+
+def circinus_rollup(ubuntu="FAILURE", macos="CANCELLED"):
+    def run(name, verdict, job):
+        return {"__typename": "CheckRun", "name": name, "status": "COMPLETED", "conclusion": verdict,
+                "detailsUrl": f"https://github.com/{REPO}/actions/runs/5/job/{job}"}
+    return [run(CIRC_UBU, ubuntu, "91"), run(CIRC_MAC, macos, "92"),
+            {"__typename": "StatusContext", "context": CIRC_SONAR, "state": "SUCCESS"}]
+
+
+class NonRequiredNeverStarted(Base):
+    """Circinus shape: path-filtered matrix jobs cannot be allowlisted as required, never started (billing block),
+    mergeStateStatus is UNSTABLE. Exempt them only on the same proof as a required check, nothing else."""
+
+    LOCAL = {"classification": "LOCAL_EQUIVALENT_PASS", "head": HEAD, "run_at": "2026-10-20T11:00:00Z",
+             "checks": [{"name": CIRC_UBU, "exit_code": 0, "tests": 5}, {"name": CIRC_MAC, "exit_code": 0, "tests": 5}]}
+
+    def setUp(self):
+        super().setUp()
+        self.allow.write_text(json.dumps(allow_doc(local_equivalent_ci=True, required_checks=[CIRC_SONAR])))
+        self.write_evidence(local_ci=dict(self.LOCAL))
+
+    def jobs(self):
+        return {"91": never_ran(name=CIRC_UBU), "92": never_ran(name=CIRC_MAC, conclusion="cancelled")}
+
+    def gh(self, rollup=None, mss="UNSTABLE", jobs=None, **kw):
+        return FakeGh(base_pr(statusCheckRollup=rollup or circinus_rollup(), mergeStateStatus=mss),
+                      jobs=jobs or self.jobs(), **kw)
+
+    def test_circinus_shape_is_approved_and_recorded_as_unavailable(self):
+        gh = self.gh()
+        code, rec = self.go(gh)
+        self.assertEqual((code, rec["outcome"]), (omr.EXIT_OK, "MERGED"), rec)
+        self.assertEqual(rec["checks"]["ci_class"], "CI_UNAVAILABLE_EXTERNAL")
+        self.assertEqual(rec["checks"]["local_equivalent"], [CIRC_MAC, CIRC_UBU])
+        self.assertEqual(rec["checks"]["merge_state"], "UNSTABLE")
+
+    def test_unstable_without_any_exemption_refuses(self):
+        self.allow.write_text(json.dumps(allow_doc(local_equivalent_ci=False, required_checks=[CIRC_SONAR])))
+        self.assertRefused(self.gh(), "mergeStateStatus is UNSTABLE")
+        self.allow.write_text(json.dumps(allow_doc(local_equivalent_ci=True, required_checks=[CIRC_SONAR])))
+        self.write_evidence()  # no local_ci block
+        self.assertRefused(self.gh(), "mergeStateStatus is UNSTABLE")
+
+    def test_unstable_with_all_green_rollup_is_not_accepted(self):
+        roll = [dict(c, conclusion="SUCCESS") if c["__typename"] == "CheckRun" else c for c in circinus_rollup()]
+        self.assertRefused(self.gh(rollup=roll), "mergeStateStatus is UNSTABLE")
+
+    def test_other_merge_states_keep_their_refusal(self):
+        for mss in ("BLOCKED", "DIRTY", "BEHIND", "UNKNOWN", "HAS_HOOKS", "DRAFT"):
+            with self.subTest(mss=mss):
+                self.assertRefused(self.gh(mss=mss), f"mergeStateStatus is {mss}")
+
+    def test_job_not_listed_in_local_evidence_blocks(self):
+        self.write_evidence(local_ci=dict(self.LOCAL, checks=[{"name": CIRC_UBU, "exit_code": 0, "tests": 5}]))
+        self.assertRefused(self.gh(), f"check {CIRC_MAC} is CANCELLED")
+
+    def test_executed_or_forged_job_blocks(self):
+        for label, job in {"steps": never_ran(name=CIRC_UBU, steps=[{"name": "pytest"}]),
+                           "runner": never_ran(name=CIRC_UBU, runner_id=4),
+                           "other head": never_ran(name=CIRC_UBU, head_sha=OTHER),
+                           "name swap": never_ran(name=CIRC_MAC)}.items():
+            with self.subTest(label):
+                jobs = self.jobs()
+                jobs["91"] = job
+                self.assertRefused(self.gh(jobs=jobs), f"check {CIRC_UBU} is FAILURE")
+
+    def test_forged_billing_annotation_alone_is_not_enough(self):
+        # The proof never reads annotations: a step-less failure for another reason is still judged by job facts
+        # only, and a failing job that did run (steps present) is never exempted whatever its annotations say.
+        jobs = self.jobs()
+        jobs["91"] = (0, dict(never_ran(name=CIRC_UBU)[1], steps=[{"name": "x"}], annotations=["billing"]))
+        self.assertRefused(self.gh(jobs=jobs), f"check {CIRC_UBU} is FAILURE")
+
+    def test_non_actions_app_publishing_same_name_blocks(self):
+        gh = self.gh()
+        gh.runs = lambda name: {"total_count": 2, "check_runs": [
+            {"name": name, "head_sha": HEAD, "app": {"slug": "github-actions"}},
+            {"name": name, "head_sha": HEAD, "app": {"slug": "evil-checks-app"}}]}
+        self.assertRefused(gh, "is FAILURE")
+
+    def test_status_context_with_a_listed_name_is_never_exempted(self):
+        roll = circinus_rollup()
+        roll[0] = {"__typename": "StatusContext", "context": CIRC_UBU, "state": "FAILURE"}
+        self.assertRefused(self.gh(rollup=roll), f"check {CIRC_UBU} is FAILURE")
+
+    def test_pending_or_timed_out_or_executed_failure_blocks_even_when_others_exempt(self):
+        for verdict in ("IN_PROGRESS", "QUEUED", "TIMED_OUT"):
+            with self.subTest(verdict=verdict):
+                self.assertRefused(self.gh(rollup=circinus_rollup(macos=verdict)), f"check {CIRC_MAC} is {verdict}")
+        extra = circinus_rollup() + [{"__typename": "CheckRun", "name": "lint", "status": "COMPLETED",
+                                      "conclusion": "FAILURE", "detailsUrl": f"https://github.com/{REPO}/actions/runs/5/job/93"}]
+        self.assertRefused(self.gh(rollup=extra), "check lint is FAILURE")
+
+    def test_required_check_must_still_be_present_and_green(self):
+        roll = circinus_rollup()[:2]
+        self.assertRefused(self.gh(rollup=roll), f"required check {CIRC_SONAR} is missing")
+        roll = circinus_rollup()
+        roll[2] = {"__typename": "StatusContext", "context": CIRC_SONAR, "state": "FAILURE"}
+        self.assertRefused(self.gh(rollup=roll), f"check {CIRC_SONAR} is FAILURE")
+
+    def test_required_name_reused_by_a_failing_check_gets_no_free_pass(self):
+        # A same-named executed entry next to a never-started one blocks the whole name.
+        roll = circinus_rollup() + [dict(circinus_rollup()[0], detailsUrl=f"https://github.com/{REPO}/actions/runs/6/job/94")]
+        jobs = self.jobs()
+        jobs["94"] = never_ran(name=CIRC_UBU, steps=[{"name": "t"}])
+        self.assertRefused(self.gh(rollup=roll, jobs=jobs), f"check {CIRC_UBU} is FAILURE")
+
+    def test_skipped_non_required_beside_billing_blocked_is_accepted_but_skipped_required_refuses(self):
+        skipped = {"__typename": "CheckRun", "name": "release", "status": "COMPLETED", "conclusion": "SKIPPED"}
+        code, rec = self.go(self.gh(rollup=circinus_rollup() + [skipped]), dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+        self.assertEqual(rec["checks"]["skipped_ignored"], 1)
+        self.assertEqual(rec["checks"]["exempted_entries"], 2)
+        self.assertEqual((rec["checks"]["local_equivalent_required"], rec["checks"]["local_equivalent_optional"]),
+                         ([], [CIRC_MAC, CIRC_UBU]))
+        roll = circinus_rollup()
+        roll[2] = {"__typename": "CheckRun", "name": CIRC_SONAR, "status": "COMPLETED", "conclusion": "SKIPPED"}
+        self.assertRefused(self.gh(rollup=roll), f"check {CIRC_SONAR} is SKIPPED")
+
+    def test_exemption_changing_between_passes_refuses(self):
+        state = {"n": 0}
+
+        def flip():
+            state["n"] += 1
+            return never_ran(name=CIRC_UBU) if state["n"] <= 1 else never_ran(name=CIRC_UBU, steps=[{"name": "x"}])
+
+        jobs = self.jobs()
+        jobs["91"] = flip
+        gh = self.gh(jobs=jobs)
+        code, rec = self.go(gh)
+        self.assertEqual(code, omr.EXIT_REFUSED, rec)
+        self.assertEqual(gh.merges(), [])
 
 
 def approval(login, oid=HEAD, state="APPROVED", assoc="COLLABORATOR"):

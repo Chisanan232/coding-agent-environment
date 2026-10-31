@@ -315,22 +315,183 @@ class ReservationError(Exception):
     """A reservation or its owning process cannot be verified."""
 
 
-def process_token(pid):
-    """Start-time token of a live process, None when it is gone.
+PS_ENV = {'LC_ALL': 'C', 'PATH': '/bin:/usr/bin'}
 
-    pid plus start time identifies one process; a reused pid has a new token.
-    """
+
+def _ps(args, pid_text):
     try:
-        done = subprocess.run(['/bin/ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True,
-                              timeout=5, stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/bin:/usr/bin'})
+        return subprocess.run(['/bin/ps'] + args, capture_output=True, text=True, timeout=5,
+                              stdin=subprocess.DEVNULL, env=PS_ENV)
     except (OSError, subprocess.SubprocessError) as exc:
-        raise ReservationError('cannot inspect process %d: %s' % (pid, exc))
+        raise ReservationError('cannot inspect process %s: %s' % (pid_text, exc))
+
+
+def process_token(pid):
+    """Start-time token of a process, None when it is gone.
+
+    pid plus start time identifies one process; a reused pid has a new token. An exited-but-unreaped (zombie) process
+    still has a token: whether its lane is free is decided from the whole workload by holder_status, never from the
+    wrapper alone.
+    """
+    done = _ps(['-o', 'lstart=', '-p', str(pid)], str(pid))
     token = done.stdout.strip()
     if done.returncode == 0 and token:
         return token
     if done.returncode == 1 and not token:
         return None
     raise ReservationError('cannot inspect process %d: ps exit %d' % (pid, done.returncode))
+
+
+def process_table():
+    """{pid: (ppid, pgid, stat, start token)} for every process; raises ReservationError when it cannot be read.
+
+    Only these fields are read, never a command line. An unparseable line fails the whole read (fail closed).
+    """
+    done = _ps(['-axo', 'pid=,ppid=,pgid=,stat=,lstart='], 'table')
+    if done.returncode != 0:
+        raise ReservationError('cannot read the process table: ps exit %d' % done.returncode)
+    table = {}
+    for line in done.stdout.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split(None, 4)
+        if len(fields) < 5 or not all(f.isdigit() for f in fields[:3]):
+            raise ReservationError('cannot parse the process table')
+        table[int(fields[0])] = (int(fields[1]), int(fields[2]), fields[3], fields[4].strip())
+    if not table:
+        raise ReservationError('the process table is empty')
+    return table
+
+
+# Workload identity (SPE-111). A wrapper that exited (even one nobody reaped) says nothing about the work it started, which
+# can outlive it through setsid, a double fork or plain reparenting. The reservation therefore also records the wrapper's
+# process group (when it led one) and a bounded set of descendant pid + start-token pairs, refreshed whenever the holder is
+# inspected while its wrapper is alive. A lane is freed only when none of those identities is running any more.
+MAX_WORKLOAD_MEMBERS = 256
+WITNESSES_REQUIRED = 1  # inspections of the running wrapper, after the capture, needed before an exit can be certified
+MAX_PID = 2 ** 31
+
+
+def _running(table, pid, token):
+    entry = table.get(pid)
+    return entry is not None and entry[3] == token and not entry[2].startswith('Z')
+
+
+def capture_workload(pid, token, table_fn=None):
+    """Identity snapshot of a holder, taken while it is alive; `observed` is False when the table cannot be read."""
+    try:
+        table = (table_fn or process_table)()
+    except ReservationError:
+        return {'pgid': None, 'leader': False, 'members': [], 'observed': False, 'truncated': False, 'refreshes': 0}
+    entry = table.get(pid)
+    pgid = entry[1] if entry is not None and entry[3] == token else None
+    workload = {'pgid': pgid, 'leader': pgid == pid, 'members': [], 'observed': True, 'truncated': False, 'refreshes': 0}
+    return _grown(workload, pid, token, table, wrapper_alive=entry is not None and entry[3] == token)[0]
+
+
+def merge_workload(old, new):
+    """Fold a stored workload (same wrapper pid and token) into a fresh capture of the same wrapper, so a re-reserve cannot
+    forget a member that was reparented since. Old members are kept only if they are still in `new` or the caller already
+    filtered them as running; the group and witness history is kept."""
+    if old is None:
+        return new
+    members = {(m['pid'], m['token']): m for m in old['members'] + new['members']}
+    kept = sorted(members.values(), key=lambda m: m['pid'])
+    return dict(new, members=kept[:MAX_WORKLOAD_MEMBERS], truncated=old['truncated'] or new['truncated'] or len(kept) > MAX_WORKLOAD_MEMBERS,
+                pgid=old['pgid'] if old['pgid'] is not None else new['pgid'], leader=old['leader'] or new['leader'],
+                observed=old['observed'] or new['observed'], refreshes=max(old.get('refreshes', 0), new.get('refreshes', 0)))
+
+
+def wrapper_is_zombie(pid, token, table_fn=None):
+    """True when pid is the process with this start token and has exited without being reaped. Unreadable table: False
+    (the caller's own checks and capture_workload's `observed` flag cover it)."""
+    try:
+        entry = (table_fn or process_table)().get(pid)
+    except ReservationError:
+        return False
+    return entry is not None and entry[3] == token and entry[2].startswith('Z')
+
+
+def _grown(workload, pid, token, table, wrapper_alive):
+    """(workload with its running members refreshed, set of running member pids). Dead members are dropped."""
+    children = {}
+    for other, (ppid, _, _, _) in table.items():
+        children.setdefault(ppid, []).append(other)
+    running = {m['pid']: m['token'] for m in workload['members'] if m['pid'] != pid and _running(table, m['pid'], m['token'])}
+    if workload['leader'] and workload['pgid'] is not None:
+        leader = table.get(workload['pgid'])
+        # Group members count only while the group's leader pid is still the recorded wrapper (or already gone): a
+        # different process holding that pid is a reused pid, not our group.
+        if leader is None or leader[3] == token:
+            for other, (_, group, stat_, start) in table.items():
+                if group == workload['pgid'] and other != pid and not stat_.startswith('Z'):
+                    running[other] = start
+    queue = list(running) + ([pid] if wrapper_alive else [])
+    seen = set(queue)
+    while queue:
+        for child in children.get(queue.pop(), []):
+            entry = table[child]
+            if child not in seen and child != 1 and not entry[2].startswith('Z'):
+                seen.add(child)
+                running[child] = entry[3]
+                queue.append(child)
+    running.pop(pid, None)
+    truncated = workload['truncated'] or len(running) > MAX_WORKLOAD_MEMBERS
+    kept = sorted(running.items())[:MAX_WORKLOAD_MEMBERS]
+    grown = dict(workload, members=[{'pid': p, 'token': t} for p, t in kept], truncated=truncated)
+    return grown, set(running)
+
+
+class HolderStatus:
+    """state is alive, unresolved or exited. evidence explains an exit; reason explains an unresolved state."""
+    __slots__ = ('state', 'evidence', 'reason', 'workload', 'failed')
+
+    def __init__(self, state, evidence='', reason='', workload=None, failed=False):
+        self.state, self.evidence, self.reason, self.workload, self.failed = state, evidence, reason, workload, failed
+
+
+def holder_status(pid, token, workload, token_fn=None, table_fn=None):
+    """Classify one lane holder from its wrapper identity and its recorded workload.
+
+    alive: the wrapper is the same running process. unresolved: the lane must be kept and the reason is reported, because
+    either the holder or the process table could not be inspected, or the wrapper is gone (reaped, a zombie or its pid
+    reused) while a recorded workload process still runs, or the workload was never fully recorded. exited: the wrapper is
+    gone and every recorded identity (descendants, and the wrapper's own process group when it led one) is gone. A reused
+    pid is compared by start token, so it never counts as the wrapper nor as a member. A record without a workload
+    (written before SPE-111) is judged by its wrapper alone.
+    """
+    try:
+        current = (token_fn or process_token)(pid)
+    except ReservationError as exc:
+        return HolderStatus('unresolved', reason='holder-uninspectable: %s' % exc, workload=workload, failed=True)
+    same = current is not None and current == token
+    gone = 'pid-reused' if current is not None and not same else 'holder-exited'
+    if workload is None:
+        return HolderStatus('alive', workload=None) if same else HolderStatus('exited', evidence=gone)
+    try:
+        table = (table_fn or process_table)()
+    except ReservationError as exc:
+        return HolderStatus('unresolved', reason='process-table-unreadable: %s' % exc, workload=workload, failed=True)
+    entry = table.get(pid)
+    zombie = same and entry is not None and entry[3] == token and entry[2].startswith('Z')
+    if same and not zombie:
+        grown = _grown(workload, pid, token, table, wrapper_alive=True)[0]
+        # A witness: the wrapper was inspected while running, after the capture. Capped so a steady holder stops writing.
+        grown['observed'], grown['refreshes'] = True, min(workload.get('refreshes', 0) + 1, WITNESSES_REQUIRED + 1)
+        return HolderStatus('alive', workload=grown)
+    grown, running = _grown(workload, pid, token, table, wrapper_alive=False)
+    if running:
+        return HolderStatus('unresolved', reason='workload-outlives-wrapper: wrapper pid %d is %s but %d recorded process(es) '
+                            'still run (%s)' % (pid, 'an unreaped zombie' if zombie else 'gone', len(running),
+                                                ', '.join(str(p) for p in sorted(running)[:8])), workload=grown)
+    if grown['truncated']:
+        return HolderStatus('unresolved', reason='workload-not-fully-recorded: more than %d descendants were seen, so an '
+                            'empty remainder cannot prove the workload ended' % MAX_WORKLOAD_MEMBERS, workload=grown)
+    if workload.get('refreshes', 0) < WITNESSES_REQUIRED:
+        return HolderStatus('unresolved', reason='workload-not-witnessed: the wrapper ended before any inspection saw it '
+                            'running, so detached work cannot be ruled out; release it explicitly once the job is over',
+                            workload=grown)
+    return HolderStatus('exited', evidence=gone, workload=grown)
 
 
 def process_owner(pid):
@@ -352,7 +513,7 @@ def reservations_dir(state_path):
     return state_path.parent / RESERVATIONS_DIR
 
 
-def write_reservation(state_path, label, nbytes, pid, token, expires, queue_id=None):
+def write_reservation(state_path, label, nbytes, pid, token, expires, queue_id=None, workload=None):
     """Create or replace this job's reservation file; call while holding state_lock."""
     directory = reservations_dir(state_path)
     _refuse_symlinks(directory / label)
@@ -362,8 +523,27 @@ def write_reservation(state_path, label, nbytes, pid, token, expires, queue_id=N
               'start_token': token, 'expires': iso_utc(expires)}
     if queue_id:
         record['queue_id'] = queue_id
+    if workload is not None:
+        record['workload'] = workload
     write_json_atomic(directory / (label + '.json'), record)
     return record
+
+
+def _valid_pid(value):
+    return type(value) is int and 1 < value < MAX_PID
+
+
+def _valid_workload(workload, wrapper_pid=None):
+    """Schema check. A leader's group is its own pid (never init's or anyone else's group), so a hand-edited record cannot
+    attribute an unrelated group to a holder."""
+    return (isinstance(workload, dict) and type(workload.get('leader')) is bool and type(workload.get('observed')) is bool
+            and type(workload.get('truncated')) is bool and type(workload.get('refreshes', 0)) is int
+            and 0 <= workload.get('refreshes', 0) <= 1000
+            and (workload.get('pgid') is None or _valid_pid(workload['pgid']))
+            and (not workload['leader'] or (workload.get('pgid') is not None and (wrapper_pid is None or workload['pgid'] == wrapper_pid)))
+            and isinstance(workload.get('members'), list) and len(workload['members']) <= MAX_WORKLOAD_MEMBERS
+            and all(isinstance(m, dict) and _valid_pid(m.get('pid')) and isinstance(m.get('token'), str)
+                    and m['pid'] != wrapper_pid for m in workload['members']))
 
 
 def _read_reservation(path):
@@ -377,7 +557,7 @@ def _read_reservation(path):
              and type(record.get('bytes')) is int and record['bytes'] > 0
              and type(record.get('pid')) is int and record['pid'] > 0
              and isinstance(record.get('start_token'), str) and isinstance(record.get('expires'), str))
-    if not valid:
+    if not valid or ('workload' in record and not _valid_workload(record['workload'], record['pid'])):
         raise ValueError('wrong schema')
     expires_at = datetime.fromisoformat(record['expires'].replace('Z', '+00:00'))
     if expires_at.tzinfo is None:
@@ -387,16 +567,46 @@ def _read_reservation(path):
     return record
 
 
-def live_reservations(state_path, now=None, token_fn=process_token):
+def _persist_workload(state_path, path, record, workload):
+    """Best effort: keep the refreshed workload on the reservation and on its queue entry. A failed write only means the
+    next inspection starts from the older snapshot."""
+    if workload is None or workload == record.get('workload'):
+        return
+    try:
+        fresh = {k: v for k, v in record.items() if k not in ('expires_at', 'past_ttl', 'unresolved')}
+        fresh['workload'] = workload
+        write_json_atomic(path, fresh)
+        record['workload'] = workload
+        qid = record.get('queue_id')
+        if qid and QUEUE_ID_RE.fullmatch(qid):
+            entry = _read_queue_entry(queue_dir(state_path) / (qid + '.json'))
+            if entry['state'] == 'CLAIMED' and entry['holder']['pid'] == record['pid']:
+                _persist_holder_workload(state_path, entry, workload)
+    except (OSError, ValueError, StateError):
+        pass
+
+
+def _persist_holder_workload(state_path, entry, workload):
+    """Best effort: keep the refreshed workload on a CLAIMED entry, also after an explicit release removed its reservation."""
+    if workload is None or workload == entry['holder'].get('workload') or state_path is None:
+        return
+    try:
+        entry['holder']['workload'] = workload
+        _write_queue_entry(state_path, entry)
+    except OSError:
+        pass
+
+
+def live_reservations(state_path, now=None, token_fn=process_token, table_fn=None):
     """Return (live records, problems); call while holding state_lock.
 
-    A reservation whose process is gone or whose start token no longer matches
-    (pid reuse) is deleted. An expired reservation whose holder is still the
-    same live process keeps its lane (marked past_ttl): the time limit is not
-    evidence of release, and freeing the lane would double-book a running job.
-    Only well-formed files of this schema are ever deleted; anything else is
-    reported as a problem and left alone. A process that cannot be inspected
-    stays counted (fail closed).
+    A reservation is deleted only on positive evidence that its holder is finished: the wrapper is gone (or its pid was
+    reused, compared by start token) and every recorded workload identity is gone too. A wrapper that is gone or an
+    unreaped zombie while recorded workload processes still run, or a holder or process table that cannot be inspected,
+    keeps its lane and bytes and is returned with `unresolved` set to the reason (an inspection failure is also a
+    problem). An expired reservation whose holder is still running keeps its lane too (marked past_ttl): the time limit is
+    not evidence of release, and freeing the lane would double-book a running job. Only well-formed files of this schema
+    are ever deleted; anything else is reported as a problem and left alone.
     """
     now = now or datetime.now(timezone.utc)
     directory = reservations_dir(state_path)
@@ -404,23 +614,34 @@ def live_reservations(state_path, now=None, token_fn=process_token):
     if not directory.exists():
         return live, problems
     _refuse_symlinks(directory / 'x')
+    cache = {}
+
+    def table():
+        # One process-table read per pass; a failure is cached too so every record reports the same inspection failure.
+        if not cache:
+            try:
+                cache['table'] = (table_fn or process_table)()
+            except ReservationError as exc:
+                cache['error'] = exc
+        if 'error' in cache:
+            raise cache['error']
+        return cache['table']
+
     for path in sorted(directory.glob('*.json')):
         try:
             record = _read_reservation(path)
         except (OSError, ValueError) as exc:
             problems.append('reservation-unreadable: %s: %s' % (path.name, exc))
             continue
-        try:
-            current = token_fn(record['pid'])
-        except ReservationError as exc:
-            problems.append('reservation-unverifiable: %s: %s' % (path.name, exc))
-            if record['expires_at'] <= now:
-                record['past_ttl'] = True
-            live.append(record)
-            continue
-        if current is None or current != record['start_token']:
+        status = holder_status(record['pid'], record['start_token'], record.get('workload'), token_fn, table)
+        if status.state == 'exited':
             path.unlink()
             continue
+        if status.state == 'unresolved':
+            record['unresolved'] = status.reason
+            if status.failed:
+                problems.append('reservation-unverifiable: %s: %s' % (path.name, status.reason))
+        _persist_workload(state_path, path, record, status.workload)
         if record['expires_at'] <= now:
             record['past_ttl'] = True
         live.append(record)
@@ -478,16 +699,16 @@ def _refusal(reason, **extra):
 
 
 def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None,
-            token_fn=process_token, ttl=DEFAULT_TTL, owner_fn=process_owner, allow_long=False):
+            token_fn=process_token, ttl=DEFAULT_TTL, owner_fn=process_owner, allow_long=False, table_fn=None):
     """Admit or refuse via _reserve, then record a measurement sample outside the lock for an admitted reservation."""
     now = now or datetime.now(timezone.utc)
-    result = _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long)
+    result = _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long, table_fn)
     if result.get('admit') and str(result.get('reason', '')).startswith('reserved '):
         _measure(state_path, 'reserve', result.get('free_bytes'), now)
     return result
 
 
-def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long):
+def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long, table_fn=None):
     """Admit one heavy job and record its byte reservation, or refuse.
 
     Admission needs: heavy admitted by tier and latch, a free heavy lane, and
@@ -504,12 +725,15 @@ def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_
             result = _evaluate_locked('heavy', state_path, free_fn, now)
             if not result['admit']:
                 return result
-            live, problems = live_reservations(state_path, now, token_fn)
+            live, problems = live_reservations(state_path, now, token_fn, table_fn)
             if problems:
                 return dict(result, admit=False, reason=problems[0])
             token = token_fn(pid)
             if token is None:
                 return dict(result, admit=False, reason='process-not-running: pid %d' % pid)
+            if wrapper_is_zombie(pid, token, table_fn):
+                return dict(result, admit=False, reason='process-not-running: pid %d has exited' % pid)
+            workload = capture_workload(pid, token, table_fn)
             try:
                 owner = owner_fn(pid)
             except ReservationError as exc:
@@ -526,7 +750,7 @@ def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_
                 return dict(result, admit=False, reason=queue_problems[0])
             # Only the claiming process itself (same pid and start token) is excused from the orphan count; an orphan that
             # holds this label under another process keeps its lane and the label.
-            orphans = [] if queue_problems else [e for e in _claimed_orphans(queued, live, token_fn)
+            orphans = [] if queue_problems else [e for e in _claimed_orphans(queued, live, token_fn, table_fn, state_path)
                                                   if not (e['label'] == label and e['holder']['pid'] == pid
                                                           and e['holder']['start_token'] == token)]
             if not same and any(e['label'] == label for e in orphans):
@@ -536,18 +760,21 @@ def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_
                 if ahead:
                     return dict(result, admit=False, reason='queue-ahead: %d queued entries wait for the heavy lane (first %s, %s); '
                                 'enqueue instead of reserving directly' % (len(ahead), ahead[0]['id'], ahead[0]['label']))
+            if same and same[0].get('workload') is not None:
+                workload = merge_workload(same[0]['workload'], workload)   # a refresh must not forget reparented members
             lanes = HEAVY_LANES[result['tier']]
             reserved = sum(r['bytes'] for r in others) + sum(e['bytes'] for e in orphans)
             if len(others) + len(orphans) >= lanes:
                 return dict(result, admit=False, reserved_bytes=reserved,
                             reason='lane-cap: %d of %d heavy lanes in use (%s)' % (len(others), lanes, ', '.join(
-                                '%s pid %d%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '')
+                                '%s pid %d%s%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '',
+                                                   ' UNRESOLVED: ' + r['unresolved'] if r.get('unresolved') else '')
                                 for r in others)))
             if result['free_bytes'] - reserved - nbytes < HEAVY_FLOOR:
                 return dict(result, admit=False, reserved_bytes=reserved,
                             reason='over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
                                 result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB))
-            write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl))
+            write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), workload=workload)
             return dict(result, reserved_bytes=reserved + nbytes,
                         reason='reserved %.1f GiB for %s (lane %d of %d)' % (nbytes / GIB, label, len(others) + 1, lanes))
     except StateError as exc:
@@ -910,7 +1137,8 @@ def _read_queue_entry(path):
              and isinstance(entry.get('wait_expires'), str)
              and (entry.get('grant') is None or (isinstance(entry['grant'], dict) and isinstance(entry['grant'].get('expires'), str)))
              and (entry['state'] != 'CLAIMED' or (isinstance(entry.get('holder'), dict) and type(entry['holder'].get('pid')) is int
-                                                  and isinstance(entry['holder'].get('start_token'), str))))
+                                                  and isinstance(entry['holder'].get('start_token'), str)
+                                                  and ('workload' not in entry['holder'] or _valid_workload(entry['holder']['workload'], entry['holder']['pid'])))))
     if not valid:
         raise ValueError('wrong schema')
     return entry
@@ -989,21 +1217,20 @@ def _entry_lapsed(entry, now):
     return False
 
 
-def _claimed_orphans(entries, live, token_fn):
-    """CLAIMED entries whose holder is still the same live process but whose reservation file is gone (explicit `release`
-    while the job runs). They keep occupying a lane and their bytes: a deleted file is not evidence the job stopped."""
+def _claimed_orphans(entries, live, token_fn, table_fn=None, state_path=None):
+    """CLAIMED entries whose reservation file is gone (explicit `release` while the job runs) but whose holder is not
+    finished. They keep occupying a lane and their bytes: a deleted file is not evidence the job stopped. A holder is
+    finished only by holder_status: unresolved (uninspectable, or workload still running behind a gone wrapper) stays counted."""
     held = {(r['label'], r['pid']) for r in live}
     orphans = []
     for entry in entries:
         if entry['state'] != 'CLAIMED' or (entry['label'], entry['holder']['pid']) in held:
             continue
-        try:
-            current = token_fn(entry['holder']['pid'])
-        except ReservationError:
-            orphans.append(entry)  # unverifiable stays counted
-            continue
-        if current is not None and current == entry['holder']['start_token']:
+        holder = entry['holder']
+        status = holder_status(holder['pid'], holder['start_token'], holder.get('workload'), token_fn, table_fn)
+        if status.state != 'exited':
             orphans.append(entry)
+            _persist_holder_workload(state_path, entry, status.workload)
     return orphans
 
 
@@ -1097,7 +1324,7 @@ def _drop_marker(state_path, qid):
         pass
 
 
-def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=process_token, grant_s=QUEUE_GRANT_S):
+def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=process_token, grant_s=QUEUE_GRANT_S, table_fn=None):
     """_queue_advance, then a measurement sample per reservation holder outside the lock."""
     now = now or datetime.now(timezone.utc)
     seen = {}
@@ -1106,12 +1333,12 @@ def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=pro
         seen['free'] = free_fn()
         return seen['free']
 
-    out = _queue_advance(state_path, free, now, token_fn, grant_s)
+    out = _queue_advance(state_path, free, now, token_fn, grant_s, table_fn)
     _measure(state_path, 'advance', seen.get('free'), now)
     return out
 
 
-def _queue_advance(state_path, free_fn, now, token_fn, grant_s):
+def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None):
     """One advance step under the lock: expire lapsed grants and waits, then grant the first in line if a lane is free.
 
     A lane is occupied by a live reservation (including one past its time limit or unverifiable) and by an unclaimed,
@@ -1135,7 +1362,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s):
             if result['tier'] is None:
                 out['reason'] = result['reason']
                 return out
-            live, res_problems = live_reservations(state_path, now, token_fn)
+            live, res_problems = live_reservations(state_path, now, token_fn, table_fn)
             if res_problems:
                 out['reason'] = res_problems[0]
                 return out
@@ -1143,16 +1370,11 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s):
                 if entry['state'] != 'CLAIMED':
                     continue
                 holder = entry['holder']
-                try:
-                    current = token_fn(holder['pid'])
-                except ReservationError:
-                    continue  # unverifiable: the lane stays occupied (fail closed)
-                if current is None:
-                    evidence, alive = 'holder-exited', False
-                elif current != holder['start_token']:
-                    evidence, alive = 'pid-reused', False
-                else:
-                    continue  # still the same live process: the lane stays occupied, with or without its reservation file
+                status = holder_status(holder['pid'], holder['start_token'], holder.get('workload'), token_fn, table_fn)
+                if status.state != 'exited':
+                    _persist_holder_workload(state_path, entry, status.workload)
+                    continue  # alive, or unresolved (uninspectable / workload still running): the lane stays occupied
+                evidence, alive = status.evidence, False
                 entry['state'] = 'RELEASED'
                 entry['release'] = {'at': iso_utc(now), 'evidence': evidence, 'holder_alive': alive}
                 _write_queue_entry(state_path, entry)
@@ -1186,7 +1408,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s):
                 out['eligible'].append(first['id'])
                 out['reason'] = 'no heavy lane at tier %s' % result['tier']
                 return out
-            orphans = _claimed_orphans(entries, live, token_fn)
+            orphans = _claimed_orphans(entries, live, token_fn, table_fn, state_path)
             if len(live) + len(granted) + len(orphans) >= lanes:
                 out['reason'] = 'lane occupied'
                 return out
@@ -1226,7 +1448,8 @@ def _memory_precondition():
 
 
 def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_bytes, pid=None, now=None, token_fn=process_token,
-                owner_fn=process_owner, ttl=DEFAULT_TTL, memory_fn=_memory_precondition, exec_fn=None, allow_long=False):
+                owner_fn=process_owner, ttl=DEFAULT_TTL, memory_fn=_memory_precondition, exec_fn=None, allow_long=False,
+                table_fn=None):
     """Claim a granted lane for this very process, then exec the job; every precondition is revalidated first.
 
     Outside the lock: the entry must be GRANTED and unlapsed, owned by this uid, and match label, bytes, worktree and job
@@ -1299,7 +1522,7 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
             if not result['admit']:
                 return refuse(result['reason'])
             try:
-                live, res_problems = live_reservations(state_path, now, token_fn)
+                live, res_problems = live_reservations(state_path, now, token_fn, table_fn)
             except ReservationError as exc:
                 return refuse('process-unverifiable: %s' % exc)
             if res_problems:
@@ -1315,20 +1538,24 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
                 return refuse('process-not-owned: pid %d is not run by this user' % pid)
             if any(r['label'] == label for r in live):
                 return refuse('label-in-use: %s already holds a reservation' % label)
-            orphans = _claimed_orphans(entries, live, token_fn)
+            orphans = _claimed_orphans(entries, live, token_fn, table_fn, state_path)
             lanes = HEAVY_LANES[result['tier']]
             if len(live) + len(orphans) >= lanes:
                 return refuse('lane-cap: %d of %d heavy lanes in use (%s)' % (len(live) + len(orphans), lanes, ', '.join(
-                    ['%s pid %d%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '') for r in live] +
+                    ['%s pid %d%s%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '',
+                                    ' UNRESOLVED: ' + r['unresolved'] if r.get('unresolved') else '') for r in live] +
                     ['%s pid %d (reservation removed, job still running)' % (e['label'], e['holder']['pid']) for e in orphans])))
             reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
             if result['free_bytes'] - reserved - nbytes < HEAVY_FLOOR:
                 return refuse('over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
                     result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB))
-            write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), queue_id=qid)
+            if wrapper_is_zombie(pid, token, table_fn):
+                return refuse('process-not-running: pid %d has exited' % pid)
+            workload = capture_workload(pid, token, table_fn)
+            write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), queue_id=qid, workload=workload)
             try:
                 entry['state'] = 'CLAIMED'
-                entry['holder'] = {'pid': pid, 'start_token': token, 'claimed_at': iso_utc(now)}
+                entry['holder'] = {'pid': pid, 'start_token': token, 'claimed_at': iso_utc(now), 'workload': workload}
                 _write_queue_entry(state_path, entry)
             except OSError:
                 try:
@@ -1395,6 +1622,70 @@ def queue_status(state_path, now=None):
             item['handoff'] = _handoff(entry)
         shown.append(item)
     return {'entries': shown, 'problems': problems}
+
+
+def queue_release(state_path, qid, now=None, session_id=None, token_fn=process_token, table_fn=None, confirm_ended=False):
+    """Owner's explicit release of a CLAIMED entry whose holder is unresolved (or already exited). Never signals a process.
+
+    The only way out for a job that cannot be proved finished (an invisible detached workload, a job that ended before any
+    inspection, a truncated record). Refused while the wrapper is alive and running (stop the job; advance records that),
+    for another user's entry, when the holder or process table cannot be inspected (fail closed), and unless the caller
+    proves ownership with the entry's own session id or states `confirm_ended` (the owner verified the workload ended).
+    It also removes the entry's reservation file.
+    """
+    now = now or datetime.now(timezone.utc)
+    if not (isinstance(qid, str) and QUEUE_ID_RE.fullmatch(qid)):
+        return {'ok': False, 'reason': 'invalid-request: bad queue id'}
+    if session_id is None and not confirm_ended:
+        return {'ok': False, 'reason': 'refused: give --session-id (the entry\'s own session) or --confirm-ended (you verified '
+                                       'the workload has ended); a same-user process alone is not enough'}
+    try:
+        with state_lock(state_path):
+            entries, problems = _queue_entries(state_path)
+            if problems:
+                return {'ok': False, 'reason': problems[0]}
+            entry = next((e for e in entries if e['id'] == qid), None)
+            if entry is None:
+                return {'ok': False, 'reason': 'no queue entry %s' % qid}
+            if entry['state'] != 'CLAIMED':
+                return {'ok': False, 'reason': '%s is %s; only a claimed entry is released here' % (qid, entry['state'])}
+            if entry.get('owner_uid') != os.getuid():
+                return {'ok': False, 'reason': '%s belongs to another user' % qid}
+            if session_id is not None and entry.get('session_id') != session_id:
+                return {'ok': False, 'reason': '%s belongs to another session' % qid}
+            holder = entry['holder']
+            status = holder_status(holder['pid'], holder['start_token'], holder.get('workload'), token_fn, table_fn)
+            if status.failed:
+                return {'ok': False, 'reason': '%s: cannot inspect the holder (%s); refusing to release what cannot be '
+                                               'checked' % (qid, status.reason)}
+            if status.state == 'alive':
+                return {'ok': False, 'reason': '%s: its wrapper (pid %d) is still running; stop the job, then queue advance '
+                                               'records the release' % (qid, holder['pid'])}
+            path = reservations_dir(state_path) / (entry['label'] + '.json')
+            _refuse_symlinks(path)
+            try:
+                record = _read_reservation(path)
+            except FileNotFoundError:
+                record = None
+            except (OSError, ValueError) as exc:
+                return {'ok': False, 'reason': 'reservation-unreadable: %s' % exc}
+            if record is not None and (record.get('queue_id') != qid or record['pid'] != holder['pid']):
+                return {'ok': False, 'reason': 'label %s is held by another reservation' % entry['label']}
+            if record is not None:
+                path.unlink()
+            evidence = 'owner-release'
+            entry['state'] = 'RELEASED'
+            entry['release'] = {'at': iso_utc(now), 'evidence': evidence, 'holder_alive': status.state == 'unresolved',
+                                'was': status.state, 'reason': status.reason[:200]}
+            _write_queue_entry(state_path, entry)
+            receipt_ok = _queue_receipt(state_path, 'released', entry, now, evidence=evidence, holder_alive=status.state == 'unresolved')
+            return {'ok': True, 'receipt_ok': receipt_ok, 'label': entry['label'], 'holder_pid': holder['pid'],
+                    'was': status.state, 'detail': status.reason[:200],
+                    'reason': 'released %s (label %s, holder pid %d, was %s)' % (qid, entry['label'], holder['pid'], status.state)}
+    except StateError as exc:
+        return {'ok': False, 'reason': '%s: %s' % (exc.kind, exc)}
+    except OSError as exc:
+        return {'ok': False, 'reason': 'state-unwritable: %s' % exc}
 
 
 def queue_cancel(state_path, qid, now=None, session_id=None):
@@ -1471,16 +1762,16 @@ def read_snapshot(state_path):
     return record
 
 
-def snapshot(state_path, source_fn=measure_with_source, now=None, token_fn=process_token):
+def snapshot(state_path, source_fn=measure_with_source, now=None, token_fn=process_token, table_fn=None):
     """Publish the host resource snapshot, then sample each reservation holder outside the lock."""
     now = now or datetime.now(timezone.utc)
-    record = _snapshot(state_path, source_fn, now, token_fn)
+    record = _snapshot(state_path, source_fn, now, token_fn, table_fn)
     if 'error' not in record:
         _measure(state_path, 'snapshot', record.get('free_bytes'), now)
     return record
 
 
-def _snapshot(state_path, source_fn, now, token_fn):
+def _snapshot(state_path, source_fn, now, token_fn, table_fn=None):
     """Refresh state and publish the host resource snapshot next to it."""
     seen = {}
 
@@ -1491,8 +1782,11 @@ def _snapshot(state_path, source_fn, now, token_fn):
     try:
         with state_lock(state_path):
             result = _evaluate_locked(None, state_path, free, now)
-            live, problems = live_reservations(state_path, now, token_fn)
+            live, problems = live_reservations(state_path, now, token_fn, table_fn)
             blockers = list(problems)
+            blockers += ['reservation-unresolved: %s (pid %d) keeps its lane and %d bytes: %s' % (
+                r['label'], r['pid'], r['bytes'], r['unresolved']) for r in live
+                if r.get('unresolved') and not r['unresolved'].startswith(('holder-uninspectable', 'process-table-unreadable'))]
             blockers += ['reservation-past-ttl-holder-alive: %s (pid %d) is past its time limit but still running; '
                          'its lane stays occupied until it exits or is released' % (r['label'], r['pid'])
                          for r in live if r.get('past_ttl')]
@@ -1604,7 +1898,7 @@ def build_parser():
     go.add_argument('job', nargs=argparse.REMAINDER, help='-- COMMAND [ARG...]')
     drop = commands.add_parser('release', allow_abbrev=False, help='release a reservation by label')
     drop.add_argument('--label', required=True)
-    queue = commands.add_parser('queue', allow_abbrev=False, help='heavy-lane queue: enqueue, advance, status, cancel')
+    queue = commands.add_parser('queue', allow_abbrev=False, help='heavy-lane queue: enqueue, advance, status, cancel, release')
     qcmds = queue.add_subparsers(dest='queue_command', required=True)
     enq = qcmds.add_parser('enqueue', allow_abbrev=False, help='queue a heavy job; argv is hashed, never stored')
     enq.add_argument('--label', required=True)
@@ -1632,6 +1926,11 @@ def build_parser():
     qcx = qcmds.add_parser('cancel', allow_abbrev=False, help='cancel a waiting or unclaimed entry')
     qcx.add_argument('--id', required=True, dest='qid')
     qcx.add_argument('--session-id', dest='session_id', help='refuse unless the entry belongs to this session')
+    qrl = qcmds.add_parser('release', allow_abbrev=False, help='owner release of a claimed entry that cannot be proved finished')
+    qrl.add_argument('--id', required=True, dest='qid')
+    qrl.add_argument('--session-id', dest='session_id', help='the entry\'s own session id (proves ownership)')
+    qrl.add_argument('--confirm-ended', action='store_true', dest='confirm_ended',
+                     help='state that you verified the claimed job and everything it started has ended')
     return parser
 
 
@@ -1683,6 +1982,8 @@ def _queue_cli(args, state_path, free_fn):
         out.pop('exit', None)
     elif command == 'cancel':
         out = queue_cancel(state_path, args.qid, session_id=args.session_id)
+    elif command == 'release':
+        out = queue_release(state_path, args.qid, session_id=args.session_id, confirm_ended=args.confirm_ended)
     else:
         out = dict(queue_status(state_path), ok=True)
     print(json.dumps(out, sort_keys=True))
