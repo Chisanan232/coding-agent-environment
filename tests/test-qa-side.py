@@ -73,6 +73,15 @@ class Tree:
                        "codex_path": str(self.codex), "codex_sha256": self.digest}
         self.cfg = self.cfg_dir / "qa-side.json"
         self.write_config()
+        self.source = self.attempt / "source"
+        (self.source / "sub").mkdir(parents=True)
+        (self.source / "a.txt").write_text("alpha")
+        (self.source / "sub" / "b.sh").write_text("#!/bin/sh\n")
+        os.chmod(self.source / "sub" / "b.sh", 0o755)
+        os.symlink("a.txt", self.source / "link")
+        os.symlink("/etc/hosts", self.source / "abs-link")
+        (self.attempt / "prompt.txt").write_text("review this")
+        os.chmod(self.attempt / "prompt.txt", 0o444)
         self.request = request if request is not None else self.good_request(verb)
         self.write_request()
 
@@ -458,9 +467,9 @@ class EnvironmentTests(InstalledCase):
         """Run the real action path with every launcher replaced by a recorder; returns what each would have received."""
         seen = {}
         with self.poisoned(), \
-                mock.patch.object(side, "detach", side_effect=lambda n: seen.setdefault("alarm", n)), \
-                mock.patch.object(side, "qa_stage", side_effect=lambda ns, build: seen.update(ns=ns, env=build(), environ=dict(os.environ)) or 0), \
-                mock.patch.object(side, "qa_exec", side_effect=lambda ns, build: seen.update(ns=ns, env=build(), environ=dict(os.environ)) or 0), \
+                mock.patch.object(side, "detach", side_effect=lambda n, keep=(): seen.setdefault("alarm", n)), \
+                mock.patch.object(side, "qa_stage", side_effect=lambda ns, build, copy: seen.update(ns=ns, env=build(), copy=copy, environ=dict(os.environ)) or 0), \
+                mock.patch.object(side, "qa_exec", side_effect=lambda ns, build, prompt: seen.update(ns=ns, env=build(), prompt=prompt, environ=dict(os.environ)) or 0), \
                 mock.patch("os.execve", side_effect=lambda *a: seen.update(execve=a) or (_ for _ in ()).throw(SystemExit(0))), \
                 mock.patch("os.dup2"):
             try:
@@ -546,6 +555,142 @@ class NoExecutionTests(InstalledCase):
             self.assertRefused(t, ["exec", ATTEMPT])
         for fd in opened:
             self.assertIn(fd, closed)
+
+
+class DescriptorRelativeTests(InstalledCase):
+    """The QA side must use only the descriptors it validated: a path swapped after validation is never followed."""
+
+    def attempt_fd(self, t):
+        return os.open(t.attempt, os.O_RDONLY | os.O_DIRECTORY)
+
+    def test_copy_is_exact_and_keeps_links_as_links(self):
+        t = self.tree()
+        afd = self.attempt_fd(t)
+        self.addCleanup(os.close, afd)
+        sfd = side.open_source_dir(afd, ME)
+        self.addCleanup(os.close, sfd)
+        dst = t.base / "copy"
+        side.copy_tree_at(sfd, dst)
+        self.assertEqual((dst / "a.txt").read_text(), "alpha")
+        self.assertEqual(os.readlink(dst / "link"), "a.txt")
+        self.assertEqual(os.readlink(dst / "abs-link"), "/etc/hosts")
+        self.assertTrue(os.access(dst / "sub" / "b.sh", os.X_OK))
+        self.assertFalse(os.path.islink(dst / "sub"))
+
+    def test_symlinked_source_or_prompt_is_refused(self):
+        t = self.tree()
+        elsewhere = t.base / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "secret.txt").write_text("do not copy")
+        os.rename(t.source, t.attempt / "real-source")
+        os.symlink(elsewhere, t.source)
+        afd = self.attempt_fd(t)
+        self.addCleanup(os.close, afd)
+        with self.assertRaises(OSError):
+            side.open_source_dir(afd, ME)
+        os.unlink(t.attempt / "prompt.txt")
+        os.symlink(elsewhere / "secret.txt", t.attempt / "prompt.txt")
+        with self.assertRaises(OSError):
+            side.open_prompt_at(afd, ME)
+
+    def test_foreign_owned_source_and_prompt_and_oversize_prompt(self):
+        t = self.tree()
+        afd = self.attempt_fd(t)
+        self.addCleanup(os.close, afd)
+        with self.assertRaises(side.Refuse):
+            side.open_source_dir(afd, ME + 1)
+        with self.assertRaises(side.Refuse):
+            side.open_prompt_at(afd, ME + 1)
+        os.chmod(t.attempt / "prompt.txt", 0o644)
+        (t.attempt / "prompt.txt").write_bytes(b"x" * ((1 << 20) + 1))
+        with self.assertRaises(side.Refuse):
+            side.open_prompt_at(afd, ME)
+
+    def test_a_link_planted_inside_the_tree_is_copied_as_a_link_not_followed(self):
+        t = self.tree()
+        os.symlink(t.base / "cfg", t.source / "to-dir")
+        afd = self.attempt_fd(t)
+        self.addCleanup(os.close, afd)
+        sfd = side.open_source_dir(afd, ME)
+        self.addCleanup(os.close, sfd)
+        side.copy_tree_at(sfd, t.base / "copy2")
+        self.assertTrue(os.path.islink(t.base / "copy2" / "to-dir"))
+        self.assertFalse((t.base / "copy2" / "to-dir" / "qa-side.json").exists() and not os.path.islink(t.base / "copy2" / "to-dir"))
+
+    def swap_attempt_dir(self, t):
+        """Replace inbox/<attempt> by a symlink to a hostile tree, as an attacker would between validation and use."""
+        evil = t.base / "evil"
+        (evil / "source").mkdir(parents=True)
+        (evil / "source" / "stolen.txt").write_text("hostile")
+        (evil / "prompt.txt").write_text("hostile prompt")
+        os.rename(t.attempt, t.inbox / "moved-away")
+        os.symlink(evil, t.attempt)
+
+    def test_stage_copy_after_the_attempt_directory_is_swapped_uses_the_validated_one(self):
+        t = self.tree(verb="stage")
+        fds = []
+        with mock.patch.object(side, "ROOT_UID", ME):
+            plan = side.validate_installed(["stage", ATTEMPT], str(t.cfg), str(t.base), fds)
+        self.addCleanup(lambda: [os.close(f) for f in fds if self._open(f)])
+        sfd = side.open_source_dir(plan["afd"], ME)
+        self.addCleanup(os.close, sfd)
+        self.swap_attempt_dir(t)
+        side.copy_tree_at(sfd, t.base / "after-swap")
+        self.assertTrue((t.base / "after-swap" / "a.txt").exists())
+        self.assertFalse((t.base / "after-swap" / "stolen.txt").exists())
+
+    def test_prompt_after_the_attempt_directory_is_swapped_is_the_validated_one(self):
+        t = self.tree()
+        fds = []
+        plan = side.validate_installed(["exec", ATTEMPT], str(t.cfg), str(t.base), fds)
+        self.addCleanup(lambda: [os.close(f) for f in fds if self._open(f)])
+        self.swap_attempt_dir(t)
+        with side.open_prompt_at(plan["afd"], ME) as handle:
+            self.assertEqual(handle.read(), b"review this")
+
+    @staticmethod
+    def _open(fd):
+        try:
+            os.fstat(fd)
+            return True
+        except OSError:
+            return False
+
+    def test_the_action_path_hands_the_installed_callables_not_paths(self):
+        t = self.tree(verb="stage")
+        seen = self.run_action_with_live_fds(t, "stage")
+        self.assertEqual(seen["copy_result"], "alpha")
+        t = self.tree()
+        seen = self.run_action_with_live_fds(t, "exec")
+        self.assertEqual(seen["prompt_text"], b"review this")
+
+    def run_action_with_live_fds(self, t, verb):
+        """Like EnvironmentTests.run_action, but the recorders use the callables before the descriptors are closed."""
+        seen = {}
+
+        def stage(ns, build, copy):
+            copy(Path(t.base) / "staged")
+            seen["copy_result"] = (t.base / "staged" / "a.txt").read_text()
+            return 0
+
+        def execute(ns, build, prompt):
+            with prompt() as handle:
+                seen["prompt_text"] = handle.read()
+            return 0
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(side, "HOME", side.HOME), \
+                mock.patch.object(side, "CANARY_ROOT", side.CANARY_ROOT), mock.patch.object(side, "detach"), \
+                mock.patch.object(side, "qa_stage", side_effect=stage), mock.patch.object(side, "qa_exec", side_effect=execute):
+            self.assertEqual(side.run_installed([verb, ATTEMPT], config_path=str(t.cfg), chain_anchor=str(t.base)), 0)
+        return seen
+
+    def test_missing_source_or_prompt_fails_the_action_silently(self):
+        t = self.tree(verb="stage")
+        shutil.rmtree(t.source)
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(side, "HOME", side.HOME), \
+                mock.patch.object(side, "CANARY_ROOT", side.CANARY_ROOT):
+            rc, out, err = self.run_side(t, ["stage", ATTEMPT])
+        self.assertEqual((out, err), ("", ""))
+        self.assertNotEqual(rc, 0)
 
 
 class SharedPartsTests(unittest.TestCase):
