@@ -449,6 +449,40 @@ class RollbackTests(Case):
         self.assertIn("sudo rm -f %s" % self.env.layout.sudoers, out)
         self.assertFalse(os.path.lexists(self.env.layout.helper))          # the rest was still removed
 
+    def test_a_drop_in_without_our_marker_is_not_removed_and_the_exit_is_non_zero(self):
+        self.installed()
+        lay = self.env.layout
+        os.unlink(lay.sudoers)
+        Path(lay.sudoers).write_text("# someone else's\nuser ALL = (ALL) NOPASSWD: ALL\n")
+        code, out = self.env.main("rollback")
+        self.assertEqual(code, 1, out)
+        self.assertTrue(os.path.lexists(lay.sudoers))
+        self.assertIn("NOT removed", out)
+        self.assertIn("sudo rm -f %s" % lay.sudoers, out)
+        self.assertFalse(os.path.lexists(lay.helper))                 # our own files still went
+
+    def test_a_link_or_unmarked_candidate_is_left_alone_but_a_marked_one_is_removed(self):
+        self.installed()
+        directory = os.path.dirname(self.env.layout.sudoers)
+        candidate = os.path.join(directory, ".cae-qa.new")
+        Path(candidate).write_text(inst.HEAD + "\nleftover\n")
+        code, out = self.env.main("rollback")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.lexists(candidate))
+        self.installed()
+        os.symlink(self.env.base / "victim", candidate)
+        code, out = self.env.main("rollback")
+        self.assertEqual(code, 1, out)
+        self.assertTrue(os.path.islink(candidate))
+        self.assertIn("sudo rm -f %s" % candidate, out)
+
+    def test_the_marker_check_does_not_make_rollback_blockable_by_an_untrusted_directory(self):
+        self.installed()
+        os.chmod(os.path.dirname(self.env.layout.sudoers), 0o777)
+        code, out = self.env.main("rollback")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.lexists(self.env.layout.sudoers))
+
     def test_a_linked_sudoers_directory_is_not_followed_by_the_fallback(self):
         victim = self.env.base / "elsewhere"
         victim.mkdir()
@@ -625,37 +659,98 @@ class RootRunsOnlyTrustedCodeTests(Case):
             self.assertIn(digest, out)
         lines = "".join("%s %s\n" % (n, bundle.sha[n]) for n in sorted(bundle.sha))
         self.assertEqual(bundle.combined, hashlib.sha256(lines.encode()).hexdigest())
-        for needle in ("sudo install -d -m 755 -o root -g wheel /Library/cae-qa-install", "git -C <REPO> archive <REVIEWED_HEAD>",
-                       "sudo tar -x -o -C /Library/cae-qa-install --strip-components=1", "sudo chown -R root:wheel /Library/cae-qa-install",
-                       "AFTER the copy", "git -C <REPO> show <REVIEWED_HEAD>:scripts/$f.py | shasum -a 256", "SHA-1 blob ids: informational only",
-                       "cd / && sudo -u fornaxqa",
+        for needle in ('git -C "${REPO}" archive "${H}"', 'sudo tar -x -o -C "${D}" --strip-components=1', "chown -R -h root:wheel",
+                       "chmod -h 644", "AFTER the copy", 'git -C "${REPO}" show "${H}:scripts/${f}.py" | shasum -a 256', "SHA-1 blob ids",
+                       "cd / && sudo -u fornaxqa", "REFUSED: the extract holds a link",
                        "sudo /usr/bin/python3 -I -B /Library/cae-qa-install/qa-hop-install.py apply", "--bundle-sha256 " + bundle.combined,
                        "--helper-sha256 " + bundle.helper_sha, "--version", "Unverified until the owner pilot", "Mach-O"):
             self.assertIn(needle, out)
 
-    def test_the_printed_git_flow_reproduces_the_pins_from_objects(self):
-        """Run the printed archive-extract and combined-digest commands (minus sudo) against a scratch git repo of the scripts."""
+    def make_repo(self, link=None):
         repo = self.env.base / "repo"
         (repo / "scripts").mkdir(parents=True)
         for name in inst.BUNDLE_NAMES:
             shutil.copy(self.env.install / name, repo / "scripts" / name)
+        if link:
+            (repo / "scripts" / link).unlink()
+            os.symlink("/etc/hosts", repo / "scripts" / link)
         git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
-        subprocess.run(git + ["init", "-q"], check=True)
-        subprocess.run(git + ["add", "-A"], check=True)
-        subprocess.run(git + ["commit", "-q", "-m", "x"], check=True)
+        for argv in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "x"]):
+            subprocess.run(git + argv, check=True, capture_output=True)
         head = subprocess.run(git + ["rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
-        code, out = self.env.main("plan")
-        lines = out.splitlines()
-        archive = next(l for l in lines if "archive <REVIEWED_HEAD>" in l)
-        combined = next(l for l in lines if "printf" in l)
-        target = self.env.base / "copy"
-        target.mkdir()
-        fill = lambda text: text.replace("<REPO>", str(repo)).replace("<REVIEWED_HEAD>", head)
-        run = lambda text: subprocess.run(["/bin/sh", "-c", text], check=True, capture_output=True, text=True).stdout
-        run(fill(archive.strip()).replace("sudo tar -x -o -C /Library/cae-qa-install", "tar -x -o -C %s" % target))
+        return repo, head
+
+    def flow(self, repo, head, target, preload=None):
+        """Run the printed block with sudo and the root-only options removed, against a scratch target."""
+        if preload:
+            target.mkdir()
+            (target / preload).write_text("old")
+        text = "\n".join(inst.copy_flow())
+        text = text.replace("<REPO>", str(repo)).replace("<REVIEWED_HEAD>", head).replace("D=/Library/cae-qa-install", "D='%s'" % target)
+        text = text.replace("sudo install -d -m 755 -o root -g wheel", "mkdir -p").replace("sudo ", "")
+        text = text.replace("chown -R -h root:wheel", "true").replace("chmod -h 644", "chmod 644")
+        return subprocess.run(["/bin/sh", "-c", text], capture_output=True, text=True)
+
+    def test_the_printed_git_flow_reproduces_the_pins_from_objects(self):
+        repo, head = self.make_repo()
+        target = self.env.base / "copy dir"                    # a space: every expansion must be quoted
+        done = self.flow(repo, head, target)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn("REFUSED", done.stdout + done.stderr)
         for name in inst.BUNDLE_NAMES:
             self.assertEqual((target / name).read_bytes(), (self.env.install / name).read_bytes())
-        self.assertEqual(run(fill(combined.strip())).split()[0], inst.Bundle(self.env.install).combined)
+        lines = done.stdout.splitlines()
+        shas = [l.split()[0] for l in lines]
+        self.assertEqual(shas[0:8:2], shas[1:8:2], done.stdout)               # copy digest == git object digest, per file
+        self.assertEqual(shas[8], inst.Bundle(self.env.install).combined)
+
+    def test_the_printed_flow_refuses_an_extracted_link_and_a_non_empty_directory(self):
+        repo, head = self.make_repo(link="qa-side.py")
+        done = self.flow(repo, head, self.env.base / "copy")
+        self.assertIn("REFUSED: the extract holds a link", done.stdout)
+        done = self.flow(repo, head, self.env.base / "full", preload="stale.txt")
+        self.assertIn("REFUSED: ", done.stdout)
+        self.assertIn("already has content", done.stdout)
+
+    def test_the_printed_block_has_no_unquoted_expansion(self):
+        def unquoted(line):
+            """Positions of a '$' outside any double or single quote (command substitutions inside double quotes are protected)."""
+            stack, found, i = [], [], 0
+            while i < len(line):
+                c, top = line[i], (stack[-1] if stack else None)
+                if top == "sq":
+                    stack.pop() if c == "'" else None
+                elif c == "\\":
+                    i += 1
+                elif top == "dq" and c == '"':
+                    stack.pop()
+                elif top != "dq" and c == "'":
+                    stack.append("sq")
+                elif c == '"':
+                    stack.append("dq")
+                elif c == "$" and line[i + 1:i + 2] == "(":
+                    if "dq" not in stack:
+                        found.append(i)
+                    stack.append("cmd")
+                    i += 1
+                elif c == ")" and top == "cmd":
+                    stack.pop()
+                elif c == "$" and "dq" not in stack:
+                    found.append(i)
+                i += 1
+            return found
+        flow = [l for l in inst.copy_flow() if not l.startswith("#")]
+        self.assertTrue(flow)
+        for line in flow:
+            self.assertEqual(unquoted(line), [], line)
+        self.assertEqual(unquoted("rm -rf $D"), [7])                      # the checker itself catches a bare expansion
+        self.assertEqual(unquoted('echo "$(ls $D)" $E'), [16])
+
+    def test_the_docs_block_is_the_printed_block(self):
+        docs = (SCRIPTS.parent / "docs/QA-HANDOFF.md").read_text()
+        self.assertIn("```\n" + "\n".join(inst.copy_flow()) + "\n```", docs)
+        _, out = self.env.main("plan")
+        self.assertIn("\n".join("  " + l for l in inst.copy_flow()), out)
 
     def test_bytecode_is_never_written(self):
         self.assertTrue(sys.dont_write_bytecode)
