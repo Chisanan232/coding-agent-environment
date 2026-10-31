@@ -123,7 +123,7 @@ Evidence hierarchy, strongest first: ground truth recorded by the system under t
 ## 8. Multi-agent resource coordination
 
 - One writer per branch and worktree; no duplicate implementation of a ticket; read other sessions' worktrees only.
-- One admitted heavy lane today (budget-based admission, cap raised only after measurement); check admission before heavy builds (`scripts/memory-admission.py`, `scripts/disk-admission.py`); never kill another session or delete its worktree, cache, container, reservation or scratch.
+- One admitted heavy lane today (a shadow budget is measured beside it; cap raised only after measurement, ADR 0017); check admission before heavy builds (`scripts/memory-admission.py`, `scripts/disk-admission.py`); never kill another session or delete its worktree, cache, container, reservation or scratch.
 - Subagents are bounded (ceiling: section 10.1, item 4), never nested, given a self-contained brief, and their reports are model output with no user authority. A subagent may not approve, merge or widen permissions.
 - Reuse exact-SHA evidence that is still valid; do not repeat an expensive suite or review for an unchanged head.
 - Independent review runs in a separate context with the code and no conclusion; a finding is verified from the code before it is acted on.

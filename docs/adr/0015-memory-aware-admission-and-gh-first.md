@@ -1,7 +1,7 @@
 # ADR 0015: Memory-aware admission, `gh`-first GitHub operations, GitHub MCP retirement (SPE-117)
 
 Status: accepted for the repository (policy and tooling merged); **not deployed to any machine**. Decision 3's "one heavy lane" clause is
-superseded by [ADR 0017](0017-resource-aware-workload-scheduling.md) (budget-based admission; the cap is still 1 today).
+superseded by [ADR 0017](0017-resource-aware-workload-scheduling.md) (a shadow budget is measured beside the lane; the cap is still 1 today).
 
 ## Context
 
@@ -18,7 +18,7 @@ refused a healthy machine right after the reboot, when no swap files exist. Sepa
    grow. It composes with the SPE-109 disk gate (reservations and lane caps stay there) and admits only when both admit.
 2. **Conservative, reviewable thresholds with hysteresis**, as constants with tests; they are *proposed* until the owner approves them,
    and the existing disk gate thresholds are not changed.
-3. **One heavy lane (superseded by ADR 0017: one lane today, budget-based admission); no destructive shortcuts.** Never kill another session or delete its worktree, runtime, cache, container,
+3. **One heavy lane (superseded by ADR 0017: one lane today with a shadow budget measured beside it); no destructive shortcuts.** Never kill another session or delete its worktree, runtime, cache, container,
    reservation or scratch. Cleanup is by proven idleness and ownership, never age alone; ask-only resources stay ask-only.
 4. **`gh` is the GitHub interface; the GitHub MCP is retired** (repository snapshot entry removed, inspector and owner-run removal
    runbook provided). Host authorization, PR classes A/B/C, checks, reviews and the merge gate are unchanged, and a host denial is

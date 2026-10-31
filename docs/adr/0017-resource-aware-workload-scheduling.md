@@ -14,7 +14,7 @@ shipped it behind the old cap so it could be measured before it decides anything
 
 ## Decision
 
-The long-term rule is **budget-based admission**; "one heavy lane at a time" is today's cap, not a permanent rule.
+The intended long-term rule is admission by a measured resource budget; "one heavy lane at a time" is today's cap, not a permanent rule. Today only a shadow budget exists beside the cap.
 
 1. **Workloads, not processes.** A workload is a process tree (the wrapper that exec'd the job and every descendant), owned by one
    reservation or queue entry. Admission reasons about owned workloads; an unowned running heavy tree is *unmanaged*.
@@ -55,7 +55,7 @@ The constants (class estimates, 8 GiB allowance, headroom, `host_used` = active 
 
 ## Staged concurrency: what must be measured first
 
-Raising the cap is **pre-authorized by the founder once measured**; it is a later change that cites this section. Evidence required:
+The founder instructed, in a coordinator session on 2026-10-31 (not a repo-durable record), that staged concurrency may proceed once measured. This ADR does not itself authorize it. Raising the cap is a later reviewed change that cites the evidence below, and it does not lower any explicit-confirmation, owner, production, destructive or publication gate or any Decision Delegation level. Without a durable record of the instruction, treat the step as needing the owner's decision. Evidence required:
 
 1. Over N real runs, the shadow `fits_if_cap_were_2` against actual contention (pressure, swap I/O, load, wall time, failures) when
    two workloads did overlap by hand. N is chosen with the first data; `measurements` needs at least three solo runs per class
@@ -70,8 +70,8 @@ Raising the cap is **pre-authorized by the founder once measured**; it is a late
 
 ## Consequences
 
-- Text that says "one heavy lane at a time" as a permanent rule is replaced with "one heavy lane today; budget-based admission, cap
-  raised only after measurement" in this repository. The reason string the memory gate prints still contains the old sentence
+- Text that says "one heavy lane at a time" as a permanent rule is replaced with "one heavy lane today (a shadow budget is measured beside it; cap
+  raised only after measurement, ADR 0017)" in this repository. The reason string the memory gate prints still contains the old sentence
   because tests pin it; it is accurate while the cap is 1.
 - User-level copies (`~/.claude/CLAUDE.md`, installed skills) still carry the old wording until an owner-run deploy.
 - A future cap of 2 changes one constant and its enforcing code path, behind this evidence, with the invariants above unchanged.
