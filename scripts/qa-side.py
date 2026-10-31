@@ -114,7 +114,7 @@ def real_codex_home():
 
 
 def profile_toml(run_dir, read_roots=()):
-    """Allowlist-only reads, writes confined to the clone and scratch, no network. Measured by the AASM QA campaign with
+    """Allowlist-only reads, writes confined to the clone and scratch, direct socket access refused. Measured by the AASM QA campaign with
     `codex sandbox -P` and a real `codex exec` on codex-cli 0.163.0; the wrapper re-proves it before every run (see
     confinement_probe). NOT enforced by the seatbelt: other processes' environments of the same OS user stay readable."""
     fs = {':minimal': 'read'}
@@ -194,7 +194,11 @@ def control_ok(expect, observed):
     EPERM counts, so ECONNREFUSED, ENETUNREACH, EHOSTUNREACH and a timeout (all of which can happen with no sandbox at all) fail."""
     if expect == 'ALLOWED':
         return observed == 'ALLOWED'
-    return observed == 'DENIED:1' if expect == 'DENIED_EPERM' else observed in ('DENIED:1', 'DENIED:13')
+    if expect == 'DENIED_EPERM':
+        return observed == 'DENIED:1'
+    if expect == 'DENIED':
+        return observed in ('DENIED:1', 'DENIED:13')
+    return False          # an unknown expectation (a typo in CONTROLS) never passes
 
 
 SELFTEST_FSIZE_FLOOR = 16 << 20
