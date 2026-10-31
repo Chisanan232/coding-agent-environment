@@ -245,6 +245,30 @@ Remains: the one-time administrator install; reinstalling when `qa-side.py` or t
 the install), and regenerating the sudoers drop-in whenever the helper digest pin changes; the QA user's Codex device login (`qa-identity-setup.py` prints the command); rechecking the install after a macOS
 major upgrade (sudo version, `launchctl` output format, SIP/Python path).
 
+## Payload staging and the self-test gate (SPE-145 part 9)
+
+A producer may stage a manifest-described payload (`docs/QA-PAYLOAD.md`) that is mounted read-only and executable in the permission
+profile and exercised by model-free self-tests under the real profile before Codex may start. In installed mode it needs **no new
+verb, request key or sudoers shape**: `stage` discovers `inbox/<attempt>/payload` through the validated attempt descriptor, copies it
+file by file (descriptor-relative, no link, producer-owned, single link, exact modes by `kind`, manifest verified before and after),
+adds it to the profile, runs the controls and then the self-tests, and reports both in its one JSON record. The producer derives the
+required control set from the manifest it holds and recomputes every self-test verdict itself.
+
+**Ordering rule.** Producer-supplied code runs under the sandbox only on a profile that has just been proved. The base controls
+(including the loopback bind, UNIX-socket bind and TEST-NET-1 connect that prove the network is off) and the non-executing payload
+control `neg_write_payload` run first; `pos_exec_payload` and every self-test run only if all of them ran and passed, otherwise they
+are recorded `NOT RUN`. Payload processes use the self-test allowlist environment, start in their own session and have their whole
+process group killed on completion or timeout; the seal's sweep still must report zero QA-user processes.
+
+**Seal and result.** The producer re-hashes `outbox/payload` through the opened outbox descriptor and binds the manifest digest in
+the packet, `MODE.json`, `RUNMETA.json` (the digest is not written into `events.jsonl`, which is Codex's own hashed stream) and
+`RESULT.json`, which also carries the producer's scope text, the `PRODUCER-RUN` labels and the statement that the probe covers only
+offline, library-level checks. `--no-model` runs everything up to and including the seal and sweep and stops with `QA_INCOMPLETE`
+marked `no_model`.
+
+Because `qa-side.py` changed, its SHA-256, and therefore `HELPERHEX` in the drop-in, changes: the owner reinstalls. The command
+shapes do not change.
+
 ## Statement against earlier documentation
 
 `docs/QA-HANDOFF.md` says "No sudoers change is made or needed." That is true of the attended mode and stays true of it. This ADR

@@ -151,6 +151,14 @@ The helper digest the producer records is the SHA-256 of the bytes it holds in m
 bytes it wrote into the inbox); unattended mode records the digest of the verified install. The `chmod` after the login may need
 a fresh sudo credential (`sudo -v`) in the owner Terminal; if it was refused, repeat it.
 
+**Payload and self-test gate (`prepare --payload DIR`, `run --no-model`).** A producer can stage its own built tools and vectors for
+the QA run: `scripts/qa-payload-manifest.py plan|verify` builds and checks the `MANIFEST.json`, `prepare --payload DIR` binds it into
+the packet, and a run copies it into the QA outbox, mounts it read-only and executable, proves confinement (now including loopback and
+UNIX-socket bind and a TEST-NET connect that must be refused), and runs the producer's self-tests under the real profile before Codex
+starts; a failed self-test is `QA_INCOMPLETE` and Codex is never launched. `--no-model` stops after that gate, the seal and the sweep
+and can never be a pass. The probe and self-tests cover only offline, library-level checks; daemon-level and end-to-end results are
+producer-run and are not independently reproduced, and RESULT says so. Format, rules and a worked example: [QA-PAYLOAD.md](QA-PAYLOAD.md).
+
 **Installing the delegation (a root-owned copy, then one root command).** `scripts/qa-hop-install.py` is the installer of ADR 0016.
 `plan` is read-only and unprivileged; it prints the exact text below with your values filled in, runs `visudo -c -f` on the
 rendered drop-in, and changes nothing. There is no flag, variable or prefix that moves its paths, and nothing is downloaded: the
