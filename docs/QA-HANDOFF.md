@@ -147,6 +147,10 @@ candidate binding, the sweeps and the cleanup verification are the attended ones
 and `RUNMETA.json` the helper and Codex digests. `--timeout` must be 60 to 14400 seconds. Nothing is installed by this
 repository yet (the installer is a later PR), so until then the flag fails closed with `QA_INCOMPLETE`.
 
+The helper digest the producer records is the SHA-256 of the bytes it holds in memory for the run (attended mode: the
+bytes it wrote into the inbox); unattended mode records the digest of the verified install. The `chmod` after the login may need
+a fresh sudo credential (`sudo -v`) in the owner Terminal; if it was refused, repeat it.
+
 After the one-time Codex login, run the `chmod 700 ~/.codex` step printed with the login command (Codex leaves the directory
 readable), then re-run `qa-identity-setup.py --check`: only that check proves the final state.
 
