@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -391,6 +392,7 @@ class ReleaseEvidence(QueueBase):
 
     def test_pid_reuse_is_recorded_as_such(self):
         a, job = self.claimed()
+        self.advance()                    # witnessed running before the pid is "reused"
         reservation = self.path.parent / 'reservations/nda-horo-2070.json'
         entry_path = self.path.parent / 'queue' / (a + '.json')
         entry = json.loads(entry_path.read_text())
@@ -499,6 +501,7 @@ class ReleaseEvidence(QueueBase):
         second = da.queue_claim(self.path, b, 'nda-horo-2070', 20 * GIB, Claim.ARGV, str(self.worktree), lambda: 400 * GIB, pid=job.pid,
                                 now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda p, a: runs.append(p))
         self.assertEqual((first['ok'], second['ok'], runs), (True, False, ['cargo']))
+        self.advance()                    # a snapshot cycle sees the job running: its exit can now be certified
         job.kill()
         job.wait()
         self.advance()
@@ -634,6 +637,7 @@ class ClaimCli(QueueBase):
         self.assertEqual(json.loads(out)['ok'], True)
         entry = self.entries()[qid]
         self.assertEqual((entry['state'], entry['holder']['pid']), ('CLAIMED', job.pid))
+        self.advance()                    # a snapshot cycle sees the job running: its exit can now be certified
         job.kill()
         job.wait()
         self.advance()
@@ -720,6 +724,173 @@ class Cli(QueueBase):
         self.assertNotIn(SECRET_ARG, out)
         self.assertEqual(self.run_cli('queue', 'cancel', '--id', qid)[0], 0)
         self.assertNotEqual(self.run_cli('queue', 'cancel', '--id', 'q999999')[0], 0)
+
+
+DETACHER = """
+import os, sys, time
+pid = os.fork()
+if pid == 0:
+    os.close(0)
+    os.setsid()
+    open(sys.argv[1], 'w').write(str(os.getpid()))
+    time.sleep(120)
+    os._exit(0)
+deadline = time.time() + 10
+while not os.path.exists(sys.argv[1]) and time.time() < deadline:
+    time.sleep(0.02)
+print('ready', flush=True)
+sys.stdin.read()
+"""
+
+
+class DetachedWorkload(QueueBase):
+    """A claimed job whose wrapper exits unreaped while detached work still runs keeps its lane; grants stay FIFO."""
+
+    def claimed_with_detached_child(self):
+        qid = self.enqueue('HORO-2070')['id']
+        self.advance()
+        marker = self.path.parent.parent / 'child.pid'
+        wrapper = subprocess.Popen([sys.executable, '-c', DETACHER, str(marker)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   start_new_session=True)
+        self.holders.append(wrapper)
+        self.assertEqual(wrapper.stdout.readline().strip(), b'ready')
+        child = int(marker.read_text())
+        self.addCleanup(lambda: os.kill(child, 9) if self.alive(child) else None)
+        out = da.queue_claim(self.path, qid, 'nda-horo-2070', 20 * GIB, Claim.ARGV, str(self.worktree), lambda: 400 * GIB,
+                             pid=wrapper.pid, now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda program, args: None)
+        self.assertTrue(out['ok'], out)
+        with da.state_lock(self.path):
+            da.live_reservations(self.path, self.now)       # a later inspection records the descendant
+        return qid, wrapper, child
+
+    @staticmethod
+    def alive(pid):
+        state = subprocess.run(['/bin/ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+        return bool(state) and not state.startswith('Z')
+
+    def test_zombie_wrapper_with_detached_child_blocks_the_grant_until_the_child_ends_then_fifo(self):
+        a, wrapper, child = self.claimed_with_detached_child()
+        b = self.enqueue('HORO-2071')['id']
+        c = self.enqueue('HORO-2072')['id']
+        wrapper.stdin.close()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not subprocess.run(
+                ['/bin/ps', '-o', 'stat=', '-p', str(wrapper.pid)], capture_output=True, text=True).stdout.strip().startswith('Z'):
+            time.sleep(0.02)
+        out = self.advance()
+        self.assertEqual((out['granted'], out['released']), ([], []))
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+        reservation = json.loads((self.path.parent / 'reservations/nda-horo-2070.json').read_text())
+        self.assertEqual(reservation['bytes'], 20 * GIB)
+        os.kill(child, 9)
+        deadline = time.monotonic() + 5
+        while self.alive(child) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        out = self.advance()
+        self.assertEqual((out['released'], out['granted']), ([a], [b]))       # first in line, not preempted by c
+        self.assertEqual(self.entries()[a]['release']['evidence'], 'holder-exited')
+        self.assertEqual(self.entries()[c]['state'], 'QUEUED')
+
+    def test_explicitly_released_job_with_detached_child_still_counts_as_an_orphan_lane(self):
+        a, wrapper, child = self.claimed_with_detached_child()
+        da.release('nda-horo-2070', self.path)
+        wrapper.stdin.close()
+        wrapper.wait()                                   # wrapper reaped and gone, detached child runs
+        b = self.enqueue('HORO-2071')['id']
+        out = self.advance()
+        self.assertEqual((out['granted'], out['released']), ([], []))
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+        self.assertEqual(self.entries()[b]['state'], 'QUEUED')
+
+    def test_unreadable_process_table_does_not_release_a_claimed_holder(self):
+        a, wrapper, child = self.claimed_with_detached_child()
+        self.enqueue('HORO-2071')
+
+        def broken():
+            raise da.ReservationError('ps unavailable')
+
+        out = da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, table_fn=broken)
+        self.assertEqual((out['granted'], out['released']), ([], []))
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+
+
+    def zombie_unresolved(self):
+        """Claimed holder whose wrapper is gone while detached work runs; both later entries wait behind it."""
+        a, wrapper, child = self.claimed_with_detached_child()
+        b = self.enqueue('HORO-2071')['id']
+        c = self.enqueue('HORO-2072')['id']
+        wrapper.stdin.close()
+        wrapper.wait()
+        self.assertEqual(self.advance()['granted'], [])
+        return a, b, c, child
+
+    def test_owner_release_frees_an_unresolved_claim_and_fifo_resumes(self):
+        a, b, c, child = self.zombie_unresolved()
+        out = da.queue_release(self.path, a, now=self.now, confirm_ended=True)
+        self.assertTrue(out['ok'], out)
+        entry = self.entries()[a]
+        self.assertEqual((entry['state'], entry['release']['evidence'], entry['release']['was']), ('RELEASED', 'owner-release', 'unresolved'))
+        self.assertFalse((self.path.parent / 'reservations/nda-horo-2070.json').exists())
+        self.assertTrue(self.alive(child))                  # nothing was signalled
+        self.assertEqual(self.advance()['granted'], [b])    # first in line, never c
+        self.assertEqual(self.entries()[c]['state'], 'QUEUED')
+
+    def test_owner_release_is_refused_for_a_running_wrapper_other_users_and_other_sessions(self):
+        a, wrapper, child = self.claimed_with_detached_child()
+        self.assertFalse(da.queue_release(self.path, a, now=self.now, confirm_ended=True)['ok'])            # wrapper alive
+        wrapper.stdin.close()
+        wrapper.wait()
+        self.assertFalse(da.queue_release(self.path, a, session_id='someone-else-entirely', now=self.now)['ok'])
+        entry_path = self.path.parent / 'queue' / (a + '.json')
+        entry = json.loads(entry_path.read_text())
+        entry['owner_uid'] = os.getuid() + 1
+        entry_path.write_text(json.dumps(entry))
+        self.assertIn('another user', da.queue_release(self.path, a, now=self.now, confirm_ended=True)['reason'])
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+        self.assertFalse(da.queue_release(self.path, 'q999999')['ok'])
+
+    def test_owner_release_needs_the_entry_session_or_an_explicit_confirmation(self):
+        a, b, c, child = self.zombie_unresolved()
+        bare = da.queue_release(self.path, a, now=self.now)
+        self.assertFalse(bare['ok'])
+        self.assertIn('--confirm-ended', bare['reason'])
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+        own = self.entries()[a]['session_id']
+        out = da.queue_release(self.path, a, session_id=own, now=self.now)
+        self.assertTrue(out['ok'], out)
+        self.assertEqual((out['label'], out['was']), ('nda-horo-2070', 'unresolved'))
+
+    def test_owner_release_refuses_when_the_holder_cannot_be_inspected(self):
+        a, b, c, child = self.zombie_unresolved()
+
+        def broken():
+            raise da.ReservationError('ps unavailable')
+
+        out = da.queue_release(self.path, a, now=self.now, confirm_ended=True, table_fn=broken)
+        self.assertFalse(out['ok'])
+        self.assertIn('cannot inspect', out['reason'])
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+        self.assertTrue((self.path.parent / 'reservations/nda-horo-2070.json').exists())
+
+    def run_cli(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = da.run(list(argv), state_path=self.path, free_fn=lambda: 400 * GIB)
+        return rc, out.getvalue()
+
+    def test_queue_release_cli(self):
+        a, b, c, child = self.zombie_unresolved()
+        rc, out = self.run_cli('queue', 'release', '--id', a, '--confirm-ended')
+        self.assertEqual((rc, json.loads(out)['ok']), (0, True), out)
+        self.assertEqual(self.entries()[a]['state'], 'RELEASED')
+
+    def test_orphan_claim_keeps_its_workload_refreshed_after_an_explicit_release(self):
+        a, wrapper, child = self.claimed_with_detached_child()
+        da.release('nda-horo-2070', self.path)              # the reservation file is gone, the job still runs
+        self.advance()
+        holder = json.loads((self.path.parent / 'queue' / (a + '.json')).read_text())['holder']
+        self.assertGreaterEqual(holder['workload']['refreshes'], 1)
+        self.assertIn(child, [m['pid'] for m in holder['workload']['members']])
 
 
 if __name__ == '__main__':
