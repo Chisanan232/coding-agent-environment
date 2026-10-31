@@ -325,3 +325,30 @@ changes.
 Known and accepted. The `shadow-budget` lines share `queue/receipts.jsonl` (and its single 1 MiB rotation) with the queue's own
 receipts, so a busy shadow stream rotates queue history sooner. The `budget` result key is additive: a caller that compares
 whole result dictionaries while requesting a host sample sees the extra key.
+
+## Reservation-aware lane veto (SPE-150)
+
+The memory precondition's heavy-lane veto no longer reads "a heavy-named process exists". `lane_occupancy` in
+`scripts/memory-admission.py` counts each running (non-idle) heavy build tree as one lane and matches it to an admitted
+reservation: a tree is **reserved** when a reservation's pid, or a pid recorded in its workload, is the tree's root, a member or
+an ancestor of its root (the wrapper that exec'd the job); otherwise it is **unmanaged**. The reservations are read, read-only,
+from the `admission/reservations` directory next to this tool's state directory (`read_owned`); an unreadable directory only makes
+trees look unmanaged.
+
+The veto fires when lanes in use reach `HEAVY_LANE_CAP` (1, mirroring `HEAVY_LANES` for the stable and wide tiers; a test pins the
+equality). At cap 1 nothing changes: any running tree still refuses, still latches the hysteresis, and nothing is newly admitted
+or refused. The first sentence of the reason is unchanged and a budget part is appended, for example
+`... one heavy lane at a time [lane budget: 1 of 1 heavy lane(s) in use, 5.0 GiB resident: reserved nda-x (cargo, 5.0 GiB resident,
+est 6.0 GiB)]` or `... unmanaged cargo (5.0 GiB resident, no reservation accounts for it)`. With a cap above 1 (not configured; there is
+no `CAE_HEAVY_LANES` knob yet) one running tree would be neither a veto nor a latch, and a second workload would be decided by
+the budget arithmetic above. The verdict's other fields are unchanged.
+
+### Distinct `CARGO_TARGET_DIR` per workload (policy for gates)
+
+Cargo serialises on the target directory's build lock and two builds sharing one directory invalidate each other's artifacts, so a
+shared target is a hidden second resource that the lane cap and the memory budget do not see. Every gate or build that may run
+beside another workload must set its own `CARGO_TARGET_DIR` (for example a per-label directory under the job's scratch space,
+class `build-cold-isolated`), and must not rely on a shared `build.target-dir` in `~/.cargo/config.toml`. The admission record's
+`cargo-target:<path>` exclusion key is how a future enforcing change refuses two live workloads that share a directory; today it is
+recorded and reported by the shadow budget only. The key resolution limits are listed under "Declared workload classes".
+
