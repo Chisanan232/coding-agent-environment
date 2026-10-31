@@ -1008,8 +1008,8 @@ def helper_hop(ident, verb, attempt, seconds):
         return '', 'could not start the delegated helper (%s)' % type(error).__name__
     if sudo_refused(done.stderr):
         return '', 'sudo -n refused the delegated helper (is the delegation installed and unchanged?)'
-    if not done.stdout.strip():
-        return '', 'produced no output (exit %s)' % done.returncode
+    if done.returncode != 0 or not done.stdout.strip():
+        return '', 'failed or produced no output (exit %s)' % done.returncode
     return done.stdout, None
 
 
@@ -1232,6 +1232,13 @@ def run_identity(args, run_dir, packet, source, ident):
             and NAME.fullmatch(run_dir.name)):
         return write_result(run_dir, packet, 'QA_INVALID', ['packet product, ticket, sha or run directory name is not valid; '
                                                             'nothing was handed to the QA user'])
+    if getattr(args, 'unattended', False):
+        # The worst-case attempt id (product-ticket-run-<8 hex>) must be one the helper accepts (<= 151 chars, no `..`).
+        worst = '%s-%s-%s-%s' % (packet['product'], packet['ticket'], run_dir.name, '0' * 8)
+        if not (_SIDE.ATTEMPT_RE.fullmatch(worst) and '..' not in worst):
+            return write_result(run_dir, packet, 'QA_INCOMPLETE', ['the attempt id built from product, ticket and run directory '
+                                                                   'name is not one the delegated helper accepts (too long or '
+                                                                   'contains ".."); codex was not started'])
     problems = exchange_problems(ident)
     if problems:
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['exchange is not usable: ' + '; '.join(problems[:3]),
@@ -1306,13 +1313,15 @@ def cleanup_sweep(run_dir, ident, keepalive):
         error = type(exc).__name__
     if refreshed and swept == 0 and type(swept) is int:
         return False
+    # Attended: the cure for a refused sweep is a fresh cached credential. Unattended has none; the rule may be missing.
+    cure = ('check that the installed delegation still allows `kill -KILL -1` as the QA user' if isinstance(keepalive, NoKeepalive)
+            else 'run `sudo -v` in the owner Terminal')
     note = {'sweep': swept, 'sudo_refreshed': refreshed, 'sudo_keepalive': keepalive.summary(), 'error': error,
-            'note': 'QA-user processes may survive; run `sudo -v` in the owner Terminal, then the next run\'s pre-sweep '
-                    'removes them'}
+            'note': 'QA-user processes may survive; %s, then the next run\'s pre-sweep removes them' % cure}
     try:
-        print('NOTE QA-user processes may survive this run (cleanup sweep %s%s); run `sudo -v` in the owner Terminal, then '
+        print('NOTE QA-user processes may survive this run (cleanup sweep %s%s); %s, then '
               'the next run\'s pre-sweep removes them' % ('could not run' if swept is None else '%s left' % swept,
-                                                          '' if refreshed else ', sudo -n refused'))
+                                                          '' if refreshed else ', sudo -n refused', cure))
         print('QA_INVALID final cleanup sweep did not confirm the QA user is idle; any QA_PASS printed above does not stand')
     except OSError:
         pass
@@ -1362,8 +1371,9 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
     # without cleanup could otherwise write into this attempt's outbox while it is being set up.
     swept = sweep_identity(ident)
     if swept is None:
-        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['could not sweep the QA user before the run (sudo -n refused? '
-                                                               'run `sudo -v` in the owner Terminal first); codex was not started'])
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', [
+            'could not sweep the QA user before the run (%s); codex was not started' % (
+                'sudo -n refused the delegated kill rule?' if unattended else 'sudo -n refused? run `sudo -v` in the owner Terminal first')])
     if swept:
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['%d QA-user processes survived the sweep before the run; '
                                                                'codex was not started' % swept])
@@ -1392,6 +1402,8 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
         probe, fails = None, ['the isolation probe raised %s' % type(error).__name__]
     probe = probe if isinstance(probe, dict) else None
     fails = [clean(f, 300) for f in fails]
+    if unattended and (probe is None or fails):
+        shutil.rmtree(inbox, ignore_errors=True)    # only request.json is in it; the attempt is over
     write_private(run_dir / 'ISOLATION.json', {'established': probe is not None and not fails, 'identity': ident.name,
                                                'uid': ident.uid, 'fails': fails, 'probe': probe})
     if probe is None:

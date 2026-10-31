@@ -204,7 +204,7 @@ class ArgvTests(Case):
     def test_helper_hop_maps_refusal_and_silence_to_a_problem(self):
         ident = self.ident()
         for stderr, out, rc, expect in (("sudo: a password is required\n", "", 1, "refused"), ("", "", 2, "no output"),
-                                        ("", '{"ok": 1}\n', 0, None)):
+                                        ("", '{"ok": 1}\n', 3, "exit 3"), ("", '{"ok": 1}\n', 0, None)):
             done = subprocess.CompletedProcess([], rc, stdout=out, stderr=stderr)
             with mock.patch.object(qa.subprocess, "run", return_value=done) as run:
                 text, problem = qa.helper_hop(ident, "stage", ATTEMPT, 60)
@@ -256,7 +256,7 @@ class RefusalTests(Case):
         self.assertTrue(qa.build_parser().parse_args(["run", "--run-dir", "x", "--unattended"]).unattended)
 
 
-class RunTests(Case):
+class RunBase(Case):
     """run_identity_locked with every boundary replaced: what is asked of sudo, what is written, what is never done."""
 
     def setUp(self):
@@ -339,6 +339,8 @@ class RunTests(Case):
             self.stack.close()
         return code, out.getvalue(), mocks
 
+
+class RunTests(RunBase):
     def test_the_happy_path_asks_for_exactly_the_fixed_verbs_and_never_for_a_credential(self):
         code, out, mocks = self.go()
         self.assertEqual(code, 0)
@@ -420,6 +422,70 @@ class RunTests(Case):
         code, out, mocks = self.go(sweep=mock.patch.object(qa, "sweep_identity", return_value=None))
         self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"])
         mocks["launch"].assert_not_called()
+
+
+class LowFindingsTests(RunBase):
+    def test_a_failed_probe_removes_the_precreated_inbox(self):
+        def failing(setup, pw, argv_for=None):
+            argv_for(1, "qa-sentinel-" + "ab" * 16)
+            return {"uid": QA.pw_uid}, ["write_inbox must be denied"]
+        qis = qa._qis()
+        code, out, mocks = self.go(isolation=mock.patch.object(qis.Setup, "isolation_record", autospec=True, side_effect=failing))
+        self.assertEqual(code, qa.EXIT["QA_INVALID"])
+        self.assertEqual(list((self.exchange / "inbox").iterdir()), [])
+        mocks["launch"].assert_not_called()
+
+    def test_a_probe_that_did_not_run_also_removes_it(self):
+        def silent(setup, pw, argv_for=None):
+            argv_for(1, "qa-sentinel-" + "ab" * 16)
+            return None, ["probe did not run"]
+        qis = qa._qis()
+        code, out, mocks = self.go(isolation=mock.patch.object(qis.Setup, "isolation_record", autospec=True, side_effect=silent))
+        self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"])
+        self.assertEqual(list((self.exchange / "inbox").iterdir()), [])
+
+    def test_a_run_directory_name_that_makes_an_unacceptable_attempt_id_is_incomplete_early(self):
+        run_dir = self.run_dir.parent / ("r" * 64)
+        run_dir.mkdir()
+        packet = dict(self.packet, ticket="T" * 60, product="p" * 40)
+        self.patches()
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), mock.patch.object(qa, "exchange_problems", side_effect=forbidden):
+                code = qa.run_identity(self.args, run_dir, packet, self.source, self.ident)
+        finally:
+            self.stack.close()
+        self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"])
+        self.assertIn("not one the delegated helper accepts", out.getvalue())
+        self.assertEqual(self.calls, [])
+
+    def cleanup(self, keepalive, swept):
+        out = io.StringIO()
+        with mock.patch.object(qa, "sweep_identity", return_value=swept), contextlib.redirect_stdout(out):
+            unclean = qa.cleanup_sweep(self.run_dir, self.ident, keepalive)
+        return unclean, out.getvalue(), json.loads((self.run_dir / "CLEANUP.json").read_text())
+
+    def test_unattended_cleanup_note_does_not_tell_the_owner_to_run_sudo_v(self):
+        unclean, out, note = self.cleanup(qa.NoKeepalive(), None)
+        self.assertTrue(unclean)
+        self.assertNotIn("sudo -v", out)
+        self.assertNotIn("sudo -v", note["note"])
+        self.assertIn("delegation", note["note"])
+
+    def test_attended_cleanup_note_is_unchanged(self):
+        class Stub:
+            def refresh(self):
+                return True
+
+            def stop(self):
+                pass
+
+            def summary(self):
+                return {}
+        unclean, out, note = self.cleanup(Stub(), None)
+        self.assertTrue(unclean)
+        self.assertIn("run `sudo -v` in the owner Terminal", out)
+        self.assertIn("run `sudo -v` in the owner Terminal", note["note"])
 
 
 class AttendedUnchangedTests(Case):
