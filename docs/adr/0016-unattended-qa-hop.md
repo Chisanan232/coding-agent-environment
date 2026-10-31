@@ -29,10 +29,10 @@ Every place the producer reaches the QA user or root during a run. "Runs as" is 
 | 3 | hop 0 isolation probe: `python3 -I -c PROBE ...` | `qa-identity-setup.py:357` via `qa_argv` (`:179`), called from `qa-handoff.py:1436` | QA user | prove the QA uid cannot read the producer's process environment (sentinel in a producer sibling) | the claim is about what the QA uid can read, so the probe must execute as the QA uid | helper verb `probe` |
 | 4 | hop 1 `qa-stage` | `qa-handoff.py:1465` through `hop()` (`:1249`, `:1254`) | QA user | create the outbox, copy the clone, build the private Codex home, run the confinement probe | the outbox and Codex home must be QA-owned, and the probe must run under the QA uid's sandbox | helper verb `stage` |
 | 5 | hop 2 `qa-exec` (`codex exec`) | `qa-handoff.py:1500`, launched at `:1507` | QA user | run Codex with the QA user's login; stdout is the producer-held pipe | Codex must run as the QA uid to use its login and to be confined from the producer's files | helper verb `exec` |
-| 6 | `launchctl managername` | `qa-handoff.py:1677` (`no_gui_session_problems`) | QA user | corroborate that an exit-125 answer for `gui/<uid>` means "no GUI session" | the answer is the launchd manager of the calling uid | sudoers rule 5 |
-| 7 | `launchctl print user/<uid>` and `user/<uid>/<label>` | `qa-handoff.py:1888` (`verify_user_domain`) | QA user | verify every loaded service of the QA user's launchd domain is a sealed system service | a per-uid launchd domain is printed only to that uid (or root) | sudoers rules 6 and 8 |
-| 8 | `crontab -l`, `atq`, `ls -A <QA home>/Library/LaunchAgents` | `qa-handoff.py:1932-1937` (`persistence_problems`) | QA user | no scheduled job or launch agent survives the run | crontab and the at queue are per user and the QA home is mode 0700 | sudoers rules 2, 3, 4 |
-| 9 | `launchctl print gui/<uid>` | `qa-handoff.py:1952` (`persistence_problems`) | QA user | a GUI session of the QA user must be absent | per-uid domain | sudoers rule 7 |
+| 6 | `launchctl print user/<uid>` and `user/<uid>/<label>` | `qa-handoff.py:1888` (`verify_user_domain`) | QA user | verify every loaded service of the QA user's launchd domain is a sealed system service | a per-uid launchd domain is printed only to that uid (or root) | sudoers rules 5 and 7 |
+| 7 | `crontab -l`, `atq`, `ls -A <QA home>/Library/LaunchAgents` | `qa-handoff.py:1932-1937` (`persistence_problems`) | QA user | no scheduled job or launch agent survives the run | crontab and the at queue are per user and the QA home is mode 0700 | sudoers rules 2, 3, 4 |
+| 8 | `launchctl print gui/<uid>` | `qa-handoff.py:1952` (`persistence_problems`) | QA user | a GUI session of the QA user must be absent | per-uid domain | sudoers rule 6 |
+| 9 | `/usr/bin/stat -f %u /dev/console` (added by cae PR #172, replaces `launchctl managername`) | `qa-handoff.py` (console owner check) | producer | learn which uid owns the console, to corroborate that an exit-125 answer for `gui/<uid>` means "no GUI session" | **no privilege needed**: it runs as the producer and reads only the console device owner | none (unprivileged) |
 | - | one-time account, group, home and exchange creation, ACLs, rollback | `qa-identity-setup.py:235-436` | root via the owner's sudo password | create the QA identity | administrative | **unchanged**: owner-run, still password-gated |
 | - | QA user Codex device login | `qa-identity-setup.py:442` (printed for the owner) | QA user via the owner's `sudo -v` | give the QA user its own Codex login | interactive device-code login | **unchanged**: owner step |
 
@@ -46,7 +46,7 @@ Reads that need no privilege stay as they are: `ps -U <uid>` (process ids only) 
 | **`NOPASSWD: ALL` as the QA user** | Rejected. Any code that runs as the producer can run anything as the QA user (read its Codex login, plant jobs, defeat the sweep and the seal). It turns the QA identity from a boundary into a convenience. |
 | **A QA-user worker daemon** | Rejected. (a) Codex's stdout would land in a file the QA user can write, so `events.jsonl` stops being producer ground truth (today it is the pipe the producer holds and hashes). (b) A resident QA-user process breaks the zero-survivor sweep: the daemon is a survivor by construction. (c) Post-run inspection (sweep, persistence, launchd checks) would still need sudoers, so it removes none of the privilege. |
 | **Root-owned helper with verbs** | Rejected. Nothing in the audit needs root: every operation is "act as the QA user". A root helper adds a root attack surface for no capability. |
-| **Chosen: exact-argv sudoers as the QA user plus a root-owned, pinned helper run as the QA user** | One drop-in grants the producer eight fixed-argv inspection and sweep commands and one helper path with four fixed verbs, all as the QA user only. The helper replaces the three code-running hops. Codex stdout stays on the producer-held pipe. |
+| **Chosen: exact-argv sudoers as the QA user plus a root-owned, pinned helper run as the QA user** | One drop-in grants the producer seven fixed-argv inspection and sweep commands and one helper path with four fixed verbs, all as the QA user only. The helper replaces the three code-running hops. Codex stdout stays on the producer-held pipe. |
 
 ## Decision
 
@@ -63,7 +63,7 @@ Add an optional **installed mode** of the QA hop. The attended mode is unchanged
   producer and the QA user cannot change it. Everything the helper trusts about itself comes from here.
 - The helper never runs as root and the sudoers rules never name root or `ALL` as the target user.
 
-### Sudoers drop-in: the eight fixed-argv commands
+### Sudoers drop-in: the seven fixed-argv commands
 
 `/etc/sudoers.d/cae-qa`, shown with `PRODUCER`, `QA` and `QAUID` as the values for the machine:
 
@@ -75,7 +75,6 @@ Cmnd_Alias CAE_QA_SWEEP = /bin/kill -KILL -1
 Cmnd_Alias CAE_QA_SEE   = /usr/bin/crontab -l, \
                           /usr/bin/atq "", \
                           /bin/ls -A /Users/QA/Library/LaunchAgents, \
-                          /bin/launchctl managername, \
                           /bin/launchctl print user/QAUID, \
                           /bin/launchctl print gui/QAUID, \
                           /bin/launchctl print "^user/QAUID/[A-Za-z0-9_][A-Za-z0-9_.-]*$"
@@ -85,7 +84,7 @@ Cmnd_Alias CAE_QA_SIDE  = sha256:HELPERHEX /Library/cae-qa/qa-side version, \
 PRODUCER ALL = (QA) NOPASSWD: NOSETENV: CAE_QA_SWEEP, CAE_QA_SEE, CAE_QA_SIDE
 ```
 
-The eight commands, numbered as the audit table refers to them (all as the QA user, nothing else, never root):
+The seven commands, numbered as the audit table refers to them (all as the QA user, nothing else, never root):
 
 | Rule | Exact argv |
 |---|---|
@@ -93,10 +92,9 @@ The eight commands, numbered as the audit table refers to them (all as the QA us
 | 2 | `/usr/bin/crontab -l` |
 | 3 | `/usr/bin/atq ""` (no arguments) |
 | 4 | `/bin/ls -A <QA home>/Library/LaunchAgents` |
-| 5 | `/bin/launchctl managername` |
-| 6 | `/bin/launchctl print user/<uid>` |
-| 7 | `/bin/launchctl print gui/<uid>` |
-| 8 | `/bin/launchctl print user/<uid>/<label>`, label matching `[A-Za-z0-9_][A-Za-z0-9_.-]*` in sudoers; the 200-character cap of the producer's `SERVICE_LABEL_RE` is enforced by the producer, not by sudoers |
+| 5 | `/bin/launchctl print user/<uid>` |
+| 6 | `/bin/launchctl print gui/<uid>` |
+| 7 | `/bin/launchctl print user/<uid>/<label>`, label matching `[A-Za-z0-9_][A-Za-z0-9_.-]*` in sudoers; the 200-character cap of the producer's `SERVICE_LABEL_RE` is enforced by the producer, not by sudoers |
 
 The helper is granted separately (`CAE_QA_SIDE`): its argv is also fixed, a verb from `{version, probe, stage, exec}` and, for the
 last three, an attempt id.
@@ -115,7 +113,8 @@ helper rejects `..` and paths are never built from argv.
 
 Validation note (2026-10-31): the exact drop-in above, rendered with a throwaway user `qauser`, uid 599, producer `bryant` and a
 placeholder 64-hex digest, was run through `/usr/sbin/visudo -c -f <file>` unprivileged (sudo 1.9.17p2, macOS) and reported
-`parsed OK`. This proves syntax only, not behaviour under a real `sudo`.
+`parsed OK`. Re-validated 2026-10-31 after `launchctl managername` was removed (seven commands, rule 5 gone): the exact rendered
+text, with the same throwaway values, again reported `parsed OK` under an unprivileged `visudo -c -f`. This proves syntax only, not behaviour under a real `sudo`.
 
 Two things in this text are **not verified until the installer runs on the real host**: regular-expression arguments need
 sudo 1.9.10 or newer (the installer checks `sudo -V`), and the rendered file for the real host is checked by `visudo` on that machine. If the host's sudo is older, the per-label `launchctl print` moves into a helper verb and this ADR is amended
@@ -199,7 +198,7 @@ The producer writes `X/inbox/<attempt>/request.json` (producer-owned, read-only 
 
 Must pass (each run as the producer, non-interactively):
 
-- `sudo -n -u QA` of each of the eight commands exits with the command's own status and no "password is required" message;
+- `sudo -n -u QA` of each of the seven commands exits with the command's own status and no "password is required" message;
 - `qa-side version` prints the digest of the installed file and the pinned Codex digest, both equal to what the installer recorded;
 - the ownership and mode of every path in the table above, and the root-owned chain, are as specified;
 - `sudo -V` is 1.9.10 or newer;
