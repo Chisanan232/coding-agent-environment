@@ -16,6 +16,7 @@ import json
 import os
 import pwd
 import re
+import resource
 import shutil
 import signal
 import stat
@@ -24,6 +25,7 @@ import sys
 import tempfile
 import time
 import types
+import unicodedata
 from pathlib import Path
 
 HOME = Path.home()
@@ -183,12 +185,23 @@ def controls_for(manifest=None):
     return CONTROLS + tuple(c for c in PAYLOAD_CONTROLS if c[0] in wanted)
 
 
-def run_group(argv, env, timeout, cwd=None, stdin=None):
+SELFTEST_FSIZE_FLOOR = 16 << 20
+
+
+def fsize_limit(cap):
+    """Largest file any process of a probe or self-test may write (RLIMIT_FSIZE, inherited by everything it starts): its output cap plus
+    slack, never below a floor for the sandbox's own bookkeeping. A flood is cut off by the kernel, not by a timeout."""
+    return max(cap + 4096, SELFTEST_FSIZE_FLOOR)
+
+
+def run_group(argv, env, timeout, cwd=None, stdin=None, fsize=None):
     """Run argv in a session of its own and always kill the whole process group afterwards (a payload that forks and sleeps leaves
     nothing behind). Returns (exit code or None on timeout, up to 64 KiB of stdout). The environment is exactly `env`."""
     with tempfile.TemporaryFile() as out:
+        limit = fsize_limit(OUTPUT_CAP) if fsize is None else fsize
         proc = subprocess.Popen(argv, stdin=stdin if stdin is not None else subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
-                                cwd=cwd, env=env, start_new_session=True)
+                                cwd=cwd, env=env, start_new_session=True,
+                                preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit)))
         try:
             try:
                 code = proc.wait(timeout=timeout)
@@ -315,6 +328,19 @@ def _exact(value, keys, what):
     _check(not missing, '%s is missing keys: %s' % (what, ', '.join(missing[:3])))
 
 
+def _no_duplicate_keys(pairs):
+    keys = [k for k, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError('duplicate key')
+    return dict(pairs)
+
+
+def unsafe_text(text):
+    """True for control characters and for Unicode format, bidi, surrogate, private-use or unassigned code points: text that can hide
+    or reorder what a reader sees. Newline and tab are the only control characters allowed (and only where the caller allows them)."""
+    return any(unicodedata.category(c) in ('Cc', 'Cf', 'Cs', 'Co', 'Cn', 'Zl', 'Zp') and c not in '\n\t' for c in text)
+
+
 def _int(value):
     return type(value) is int
 
@@ -324,7 +350,7 @@ def valid_payload_path(path):
     8 components, and never the manifest's own name."""
     if not (isinstance(path, str) and 0 < len(path) <= PAYLOAD_PATH_MAX) or path == MANIFEST_NAME:
         return False
-    if path.startswith('/') or any(ord(c) < 32 or c in '\\\x7f' for c in path):
+    if path.startswith('/') or '\\' in path or unsafe_text(path) or '\n' in path or '\t' in path:
         return False
     parts = path.split('/')
     return len(parts) <= PAYLOAD_MAX_DEPTH and all(part not in ('', '.', '..') for part in parts)
@@ -339,9 +365,9 @@ def parse_manifest(raw):
     return the parsed document. Raises PayloadError naming the first rule broken."""
     _check(isinstance(raw, bytes) and 0 < len(raw) <= MANIFEST_MAX, 'MANIFEST.json is empty or larger than 64 KiB')
     try:
-        doc = json.loads(raw.decode('utf-8'))
+        doc = json.loads(raw.decode('utf-8'), object_pairs_hook=_no_duplicate_keys)
     except (ValueError, RecursionError):
-        raise PayloadError('MANIFEST.json is not UTF-8 JSON')
+        raise PayloadError('MANIFEST.json is not UTF-8 JSON without duplicate keys')
     _exact(doc, ('schema', 'files', 'selftests', 'scope', 'producer_run'), 'MANIFEST.json')
     _check(doc['schema'] == PAYLOAD_SCHEMA, 'MANIFEST.json schema is not %s' % PAYLOAD_SCHEMA)
     files, tests, scope, producer = doc['files'], doc['selftests'], doc['scope'], doc['producer_run']
@@ -358,6 +384,7 @@ def parse_manifest(raw):
         kinds[entry['path']] = entry['kind']
         total += entry['size']
     _check(paths == sorted(paths) and len(set(paths)) == len(paths), 'files must be sorted by path and unique')
+    _check(len({p.casefold() for p in paths}) == len(paths), 'two paths differ only by letter case (a case-insensitive volume would merge them)')
     _check(total <= PAYLOAD_MAX_BYTES, 'the payload is larger than %d bytes' % PAYLOAD_MAX_BYTES)
     directories = set()
     for path in paths:
@@ -390,7 +417,7 @@ def parse_manifest(raw):
         _check(_int(test['max_output_bytes']) and 1 <= test['max_output_bytes'] <= OUTPUT_CAP, 'max_output_bytes of %s is not 1..1048576' % ident)
         wall += test['timeout_s']
     _check(wall <= SELFTEST_TOTAL_SECONDS, 'the self-tests may take %d s in total, more than %d' % (wall, SELFTEST_TOTAL_SECONDS))
-    _check(isinstance(scope, str) and 0 < len(scope) <= SCOPE_MAX and all(c in '\n\t' or ord(c) >= 32 for c in scope),
+    _check(isinstance(scope, str) and 0 < len(scope) <= SCOPE_MAX and not unsafe_text(scope),
            'scope is not 1..2048 characters of text')
     _check(isinstance(producer, list) and len(producer) <= PRODUCER_RUN_MAX and len(set(map(str, producer))) == len(producer),
            'producer_run is not a list of unique paths')
@@ -629,7 +656,9 @@ def run_selftests(codex_bin, outbox, manifest, env):
             with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
                 stdin = open_regular(payload_dir / test['stdin']) if test['stdin'] is not None else open(os.devnull, 'rb')
                 try:
-                    proc = subprocess.Popen(argv, stdin=stdin, stdout=out, stderr=err, cwd=str(outbox / 'tmp'), env=env, start_new_session=True)
+                    limit = fsize_limit(test['max_output_bytes'])
+                    proc = subprocess.Popen(argv, stdin=stdin, stdout=out, stderr=err, cwd=str(outbox / 'tmp'), env=env, start_new_session=True,
+                                            preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit)))
                 except OSError:
                     record['unrunnable'] = True
                     continue

@@ -435,8 +435,14 @@ def prepare(args):
               'producer_evidence': producer, 'qa_notes': notes}
     if payload is not None:
         # Copied into the run directory (producer-private, immutable from here: run re-verifies it) and bound by the packet digest.
-        _SIDE.copy_payload(payload['fd'], str(run_dir / 'payload'), payload['manifest'], payload['raw'], _SIDE.INBOX_MODES)
-        os.close(payload['fd'])
+        try:
+            _SIDE.copy_payload(payload['fd'], str(run_dir / 'payload'), payload['manifest'], payload['raw'], _SIDE.INBOX_MODES)
+        except (_SIDE.PayloadError, OSError) as error:
+            shutil.rmtree(run_dir, ignore_errors=True)         # no half-made attempt is left behind
+            raise SystemExit('refusing: payload could not be copied (%s); the new run directory was removed' % (
+                error if isinstance(error, _SIDE.PayloadError) else type(error).__name__))
+        finally:
+            os.close(payload['fd'])
         manifest = payload['manifest']
         packet['payload'] = {'schema': _SIDE.PAYLOAD_SCHEMA, 'manifest_sha256': _SIDE.manifest_sha256(payload['raw']),
                              'files': len(manifest['files']), 'bytes': sum(f['size'] for f in manifest['files']),
@@ -1361,7 +1367,7 @@ def payload_result(packet, selftests=None, sealed=None):
     """The `payload` block of RESULT.json: what the producer claimed and what was and was not independently established."""
     info = packet['payload']
     block = {'manifest_sha256': info['manifest_sha256'], 'scope': info['scope'], 'scope_statement': _SIDE.PROBE_SCOPE,
-             'producer_run': ['PRODUCER-RUN: %s' % path for path in info['producer_run']]}
+             'producer_run': ['PRODUCER-RUN: %s' % clean(path, 200) for path in info['producer_run']]}
     if selftests is not None:
         block['selftests'] = selftests
     if sealed is not None:
@@ -1659,6 +1665,16 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload
                                                   'staged': True, 'tests': verdicts, 'qa_identity': ident.name})
         if first is not None:
             return write_result(run_dir, packet, 'QA_INCOMPLETE', [first + '; codex was not started'],
+                                {'payload': payload_result(packet, selftest)})
+    if payload is not None:
+        # Payload code has run as the QA user. Its processes were killed by group, but one that left its session would still hold the
+        # write roots while Codex runs: sweep first, and start nothing unless the QA user is confirmed idle.
+        left = sweep_identity(ident)
+        if left is None or left:
+            reason = ('could not sweep the QA user after the payload code ran' if left is None
+                      else '%d QA-user processes remain after the payload code ran' % left)
+            write_private(run_dir / 'SELFTEST.json', dict(read_run_json(run_dir / 'SELFTEST.json'), post_run_sweep=left))
+            return write_result(run_dir, packet, 'QA_INCOMPLETE', [reason + '; codex was not started'],
                                 {'payload': payload_result(packet, selftest)})
     # Hop 2: codex itself. Its stdout is the pipe the producer captures; the QA side has moved its own stderr to a file.
     alarm = args.timeout + 60
