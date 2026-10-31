@@ -121,3 +121,23 @@ Workloads (SPE-150): the lane count is the number of process trees, not of heavy
 process with no heavy-named ancestor plus its whole subtree (shells and test binaries included); `cargo` with three `rustc`
 children and a test binary is one workload, reported with its process count and summed RSS. A workload is idle only when its root is an idle orphan
 and every member is quiet by the same tests, so an orphan `cargo` with an idle `rustc` child no longer refuses; any member that spends CPU, is new, or was active in the first sample makes the whole tree active.
+
+## Measured workload peaks (SPE-150)
+
+Observation only; no admission decision reads it. `disk-admission.py` appends one line per live reservation holder to
+`measurements.jsonl` in the admission state directory (mode 0600, rotated once at 1 MiB to `.1`, like `receipts.jsonl`)
+on `snapshot` (the 60 s refresher), `reserve` (and so `run`), `queue advance` and `queue claim`, and an `end` line on
+`release` with the run's duration and its free-bytes change. A line carries the label, queue id, pid and start token,
+the holder's whole process subtree (summed RSS, CPU seconds, process count), the kernel pressure level, how many
+reservations were live, and free bytes. It never carries argv, a command line or the environment; `ps` is asked for
+`pid,ppid,rss,time` only. Sampling runs after the admission lock is released, and any failure is swallowed (counted
+in-process), so a log problem cannot change a reserve, release or advance result. A job that exits without `release`
+gets no `end` line; its samples still count. The `end` free-bytes change uses a plain volume reading, so it can differ
+slightly from the Glomeris-minimum figure on sample lines.
+
+`disk-admission.py measurements [--json]` is read-only. Per class (the reservation `class` when present, otherwise its
+label) it reports runs, max RSS, p95 of per-run peaks, solo versus concurrent runs, and samples taken under pressure above 1.
+**All figures are lower bounds**: processes are sampled about every 60 s, so a short peak can be missed. A class gets an
+estimate only from at least 3 solo runs with pressure 1 throughout (the estimate is the largest such peak); otherwise it
+reports "insufficient evidence". Because labels are usually per job, most classes will stay at "insufficient evidence"
+until jobs share a stable label or class.
