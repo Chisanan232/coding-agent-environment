@@ -477,6 +477,32 @@ class ReviewHardening(unittest.TestCase):
                      ("api", "graphql", "-f", "query=query($o:String!){x}", "-F", "o=o", "-F", "n=7")):
             omg.read_only(call)
 
+    def test_read_only_allowlist_accepts_exactly_the_billing_waiver_reads(self):
+        # The waiver's three reads must pass the real filter (the fake-gh tests of BillingCI bypass it).
+        for call in (("api", "repos/o/r/check-runs/124163437007"), ("api", "repos/o/r/actions/jobs/124163437345"),
+                     ("api", "repos/o/r/check-runs/124163437007/annotations?per_page=100")):
+            omg.read_only(call)
+        for bad in ("repos/o/r/check-runs/abc", "repos/o/r/check-runs/1/annotations", "repos/o/r/check-runs/1/annotations?per_page=100&x=1",
+                    "repos/o/r/actions/jobs/1/logs", "repos/o/r/actions/runs/1/rerun", "repos/o/r/check-runs/1234567890123456",
+                    "repos/o/r/check-runs/../x"):
+            with self.assertRaises(RuntimeError, msg=bad):
+                omg.read_only(("api", bad))
+        with self.assertRaises(RuntimeError):
+            omg.read_only(("api", "repos/o/r/check-runs/1", "-XPOST"))
+
+    def test_billing_waiver_reads_go_through_the_real_read_only_filter(self):
+        calls = []
+
+        def run(*args):
+            omg.read_only(args)   # what the real gate runner does before starting gh
+            calls.append(args)
+            raise RuntimeError("stop after the filter")
+        try:
+            omg._billing_job_facts(run, "Chisanan232/r", "a" * 40, "test (ubuntu-latest)", "9", "124163437007")
+        except Exception:
+            pass
+        self.assertTrue(calls and calls[0][1].startswith("repos/Chisanan232/r/check-runs/124163437007"), calls)
+
     def test_repo_name_with_newline_or_dot_segments_is_refused(self):
         for bad in ("Chisanan232/r\n", "Chisanan232/..", "Chisanan232/."):
             v, reasons, _ = omg.evaluate(lambda *a: self.fail("gh called"), bad, 7, OWNERS)
