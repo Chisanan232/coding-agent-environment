@@ -215,6 +215,30 @@ class ManifestRuleTests(Scratch):
         self.refused(dict(good, producer_run=["nope.txt"]), "producer_run")
         self.refused(dict(good, producer_run=["harness/transcript.txt"] * 2), "unique")
 
+    def test_duplicate_json_keys_are_refused_at_any_depth(self):
+        good = self.doc()
+        raw = json.dumps(good).encode()
+        top = raw.replace(b'"scope"', b'"scope": "first", "scope"', 1)
+        nested = raw.replace(b'"kind": "exec"', b'"kind": "data", "kind": "exec"', 1)
+        for label, data in (("top level", top), ("nested", nested)):
+            with self.assertRaises(side.PayloadError, msg=label) as caught:
+                side.parse_manifest(data)
+            self.assertIn("duplicate", str(caught.exception))
+
+    def test_case_colliding_and_hiding_paths_are_refused(self):
+        good = self.doc()
+        entry = good["files"][0]
+        for label, paths in (("case collision", ["A.txt", "a.txt"]), ("bidi override", ["bin/\u202etxt.exe"]), ("zero width", ["a\u200bb"]),
+                             ("bidi isolate", ["a\u2066b"]), ("line separator", ["a\u2028b"]), ("DEL", ["a\x7fb"]), ("newline", ["a\nb"]),
+                             ("unassigned", ["a\u0378b"])):
+            files = [dict(entry, path=p, kind="data") for p in sorted(paths)]
+            with self.assertRaises(side.PayloadError, msg=label):
+                self.parse(dict(good, files=files, selftests=[], producer_run=[]))
+        for text in ("scope \u202e hidden", "scope \u200b", "bell\x07"):
+            self.refused(dict(good, scope=text), "scope")
+        self.assertTrue(self.parse(dict(good, scope="plain text\nsecond line\twith a tab")))
+        self.assertTrue(self.parse(dict(good, files=[dict(entry, path="d\u00e9j\u00e0/vu.txt", kind="data")], selftests=[], producer_run=[])))
+
     def test_payload_token_expansion_is_a_whole_prefix_only(self):
         test = test_entry(argv=("bin/tool", "@payload", "@payload/vectors/a.json", "@payloadX", "x@payload/y", "--f=@payload/z", "/etc/hosts"))
         out = side.expand_selftest_argv(test, "/run/payload")
@@ -501,6 +525,39 @@ class SelftestRunnerTests(Scratch):
         _, first = side.derive_selftest_verdicts(manifest, records)
         self.assertIn("could not be run", first)
 
+    def test_a_flood_of_output_is_cut_off_by_the_kernel_not_the_timeout(self):
+        flood = {**FILES, "bin/yes": (b"#!/bin/sh\nexec yes\n", "exec")}
+        with mock.patch.object(side, "SELFTEST_FSIZE_FLOOR", 64 << 10):
+            env, manifest, records = self.run_tests([test_entry("flood", argv=("bin/yes",), timeout=20, cap=100, stdout=b"")], files=flood)
+        record = records[0]
+        self.assertFalse(record["timed_out"], record)
+        self.assertLess(record["elapsed"], 15)
+        self.assertLessEqual(record["stdout_bytes"], side.fsize_limit(100))
+        verdicts, first = side.derive_selftest_verdicts(manifest, records)
+        self.assertIn("more than 100 bytes", first)
+
+    def test_the_exec_control_has_a_file_size_limit_too(self):
+        seen = {}
+        real = subprocess.Popen
+
+        def spy(argv, **kw):
+            seen["preexec"] = kw.get("preexec_fn")
+            return real(argv, **kw)
+        with mock.patch.object(side.subprocess, "Popen", side_effect=spy):
+            side.run_group([sys.executable, "-c", "pass"], {"PATH": "/usr/bin:/bin"}, 10)
+        self.assertIsNotNone(seen["preexec"])
+        self.assertEqual(side.fsize_limit(100), side.SELFTEST_FSIZE_FLOOR)
+
+    def test_labels_are_sanitized_before_they_reach_a_result(self):
+        spec2 = importlib.util.spec_from_file_location("qa_handoff_for_label_test", SCRIPTS / "qa-handoff.py")
+        qa = importlib.util.module_from_spec(spec2)
+        spec2.loader.exec_module(qa)
+        packet = {"payload": {"manifest_sha256": "a" * 64, "scope": "s", "producer_run": ["ok.txt", "bad\x1b[31m\u202ename.txt"]}}
+        labels = qa.payload_result(packet)["producer_run"]
+        self.assertEqual(labels[0], "PRODUCER-RUN: ok.txt")
+        self.assertTrue(all(c.isprintable() and "\x1b" not in c and "\u202e" not in c for c in labels[1]) or "\u202e" not in labels[1])
+        self.assertNotIn("\x1b", labels[1])
+
     def test_stage_budget_covers_every_test(self):
         _, manifest, _ = self.payload(selftests=[test_entry("a", timeout=100), test_entry("b", timeout=20)])
         self.assertEqual(side.payload_stage_seconds(manifest), 120 + 110 + 30)
@@ -602,7 +659,7 @@ class StageTests(Scratch):
             self.assertEqual((env.outbox / "payload/bin/tool").read_bytes(), TOOL)
             self.assertEqual(stat.S_IMODE((env.outbox / "payload/bin/tool").stat().st_mode), 0o555)
 
-    def test_no_payload_means_no_payload_keys_and_the_old_record(self):
+    def test_no_payload_means_no_payload_keys_in_the_stage_record(self):
         with Env(self) as env:
             record = self.stage(env)
         self.assertEqual(set(record), {"confinement", "profile_sha256"})

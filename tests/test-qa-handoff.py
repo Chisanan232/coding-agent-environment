@@ -2103,11 +2103,10 @@ class IdentityTests(Base):
         self.assertEqual(self.json(run_dir / "RESULT.json")["state"], "QA_PASS")
 
     # ---- payload staging and the model-free self-test gate (SPE-145 part 9)
-    def make_payload(self, selftest_stdout=b"ok\n", exit_=0, extra_tests=()):
+    def make_payload(self, selftest_stdout=b"ok\n", exit_=0, extra_tests=(), tool=b"#!/bin/sh\necho ok\n"):
         directory = self.root / ("payload-src-%d" % len(list(self.root.glob("payload-src-*"))))
         (directory / "bin").mkdir(parents=True)
         (directory / "vectors").mkdir()
-        tool = b"#!/bin/sh\necho ok\n"
         data = b'{"a": 1}\n'
         (directory / "bin/tool").write_bytes(tool)
         os.chmod(directory / "bin/tool", 0o755)
@@ -2289,7 +2288,72 @@ class IdentityTests(Base):
         self.assertEqual(code, qa.EXIT["REFUSED"], out)
         self.assertIn("payload runs need --qa-identity", out)
 
-    def test_no_payload_run_keeps_its_old_shape(self):
+    def escaping_tool(self, pidfile):
+        """A self-test whose process leaves its session (so the group kill cannot reach it) and keeps sleeping."""
+        return ("#!%s\nimport os, sys, time\nif os.fork() == 0:\n    os.setsid()\n    open(%r, 'w').write(str(os.getpid()))\n    time.sleep(120)\n"
+                "    os._exit(0)\nfor _ in range(100):\n    if os.path.exists(%r):\n        break\n    time.sleep(0.05)\nprint('ok')\n"
+                % (sys.executable, str(pidfile), str(pidfile))).encode()
+
+    def alive(self, pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def test_a_payload_process_that_leaves_its_session_stops_the_run_before_codex(self):
+        pidfile = self.root / "escaped.pid"
+        run_dir = self.prepare_with_payload(self.make_payload(tool=self.escaping_tool(pidfile)))
+        self.sweeps = [0, 1]                                                                       # pre-run clean, one survivor after the payload ran
+        try:
+            code, out = self.run_ident(run_dir)
+            self.assertTrue(self.alive(int(pidfile.read_text())), "the setsid child must have outlived the group kill (the scenario)")
+        finally:
+            if pidfile.exists():
+                try:
+                    os.kill(int(pidfile.read_text()), 9)
+                except OSError:
+                    pass
+        self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"], out)
+        self.assertFalse((self.fake_dir / "seen.json").exists())
+        self.assertFalse(os.path.lexists(run_dir / "LAUNCHED"))
+        self.assertFalse((run_dir / "RUNMETA.json").exists())
+        reason = self.json(run_dir / "RESULT.json")["reasons"][0]
+        self.assertIn("1 QA-user processes remain after the payload code ran", reason)
+        self.assertEqual(self.json(run_dir / "SELFTEST.json")["post_run_sweep"], 1)
+        self.assertTrue(self.json(run_dir / "SELFTEST.json")["passed"])                           # the evidence of what ran is kept
+
+    def test_a_sweep_that_cannot_run_after_the_payload_also_stops_the_run_and_no_model_too(self):
+        for extra in ((), ("--no-model",)):
+            run_dir = self.prepare_with_payload(self.make_payload())
+            self.sweeps = [0, None]
+            code, out = self.run_ident(run_dir, extra)
+            self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"], out)
+            self.assertIn("could not sweep the QA user after the payload code ran", self.json(run_dir / "RESULT.json")["reasons"][0])
+            self.assertFalse((run_dir / "RUNMETA.json").exists())
+            self.assertFalse((self.fake_dir / "seen.json").exists())
+            for leftover in list((self.x / "inbox").iterdir()) + list((self.x / "outbox").iterdir()):
+                if leftover.name != "RUN.lock":
+                    shutil.rmtree(leftover, ignore_errors=True)
+
+    def test_a_clean_post_payload_sweep_lets_the_run_go_on(self):
+        run_dir = self.prepare_with_payload(self.make_payload())
+        self.sweeps = [0, 0]
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 0, out)
+        self.assertIsNone(self.json(run_dir / "SELFTEST.json").get("post_run_sweep"))
+
+    def test_prepare_removes_the_half_made_run_directory_when_the_payload_copy_fails(self):
+        directory = self.make_payload()
+        args = ("prepare", "--repo", str(self.repo), "--sha", "HEAD", "--ticket", "T-1", "--product", "prod", "--criteria", str(self.criteria),
+                "--root", str(self.root / "qa"), "--payload", str(directory))
+        with unittest.mock.patch.object(qa._SIDE, "copy_payload", side_effect=qa._SIDE.PayloadError("disk full, say")):
+            code, out = self.call(*args)
+        self.assertIsInstance(code, str)
+        self.assertIn("payload could not be copied", code)
+        self.assertEqual(list((self.root / "qa" / "prod" / "T-1").iterdir()), [])
+
+    def test_no_payload_run_keeps_the_same_packet_mode_prompt_runmeta_and_result_keys(self):
         run_dir = self.prepare()
         code, out = self.run_ident(run_dir)
         self.assertEqual(code, 0, out)
@@ -2943,6 +3007,29 @@ class OpenOutboxSearchOnlyTests(unittest.TestCase):
         self.assertIn("wrong owner", str(caught.exception))
         self.assertNotIn("link", str(caught.exception))
         self.assertIsNone(qa.read_sealed(dfd, "absent", self.me))
+
+
+class ChangedBaseControlSetTests(unittest.TestCase):
+    """The base control set grew for EVERY run (loopback bind, UNIX-socket bind, TEST-NET connect): a record from an older helper that
+    lacks them is refused, and a host that cannot give a clean EPERM refusal fails closed. Real macOS behaviour is unverified."""
+
+    def record(self, names):
+        return {"controls": [{"control": n, "observed": "ALLOWED" if e == "ALLOWED" else "DENIED:1"} for n, _, e in qa._SIDE.CONTROLS if n in names]}
+
+    def test_an_older_helper_record_without_the_network_controls_is_rejected(self):
+        old = {c[0] for c in qa._SIDE.CONTROLS} - {"neg_loopback_bind", "neg_uds_bind", "neg_testnet_connect"}
+        established, could_not_check, controls, problems = qa.parse_confinement(self.record(old))
+        self.assertFalse(established)
+        self.assertTrue(any("controls missing" in p and "neg_loopback_bind" in p for p in problems), problems)
+
+    def test_an_unreachable_network_style_answer_fails_closed(self):
+        record = self.record({c[0] for c in qa._SIDE.CONTROLS})
+        for row in record["controls"]:
+            if row["control"] == "neg_testnet_connect":
+                row["observed"] = "DENIED:51"            # ENETUNREACH: not a sandbox refusal, so it proves nothing
+        established, _, _, problems = qa.parse_confinement(record)
+        self.assertFalse(established)
+        self.assertTrue(any("neg_testnet_connect" in p for p in problems))
 
 
 if __name__ == "__main__":
