@@ -702,6 +702,11 @@ def _measure(state_path, source, free_bytes=None, now=None):
             return
         pressure = _read_pressure()
         for record in holders:
+            try:
+                if process_token(record['pid']) != record['start_token']:
+                    continue  # pid reused (or gone): another process's memory must not be attributed to this run
+            except ReservationError:
+                continue
             tree = _subtree(rows, record['pid'])
             if tree is None:
                 continue  # the holder is gone: the lazy reaper owns that, and a dead process has nothing to measure
@@ -729,7 +734,12 @@ def _read_measurement_lines(state_path):
         with os.fdopen(descriptor, 'rb') as handle:
             if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
                 continue
-            for raw in handle.read(4 * RECEIPT_ROTATE_BYTES).splitlines():
+            size, cap = os.fstat(handle.fileno()).st_size, 4 * RECEIPT_ROTATE_BYTES
+            handle.seek(max(0, size - cap))  # newest data wins if rotation ever fails to keep the file small
+            data = handle.read(cap)
+            if size > cap:
+                data = data.partition(b'\n')[2]  # drop the cut-off first line
+            for raw in data.splitlines():
                 try:
                     line = json.loads(raw)
                     if not (isinstance(line, dict) and isinstance(line.get('label'), str) and isinstance(line.get('ts'), str)):
@@ -854,9 +864,15 @@ def _queue_prepare(state_path):
 
 def _rotate_once(path):
     """Move a private JSONL log aside to <name>.1 once it passes 1 MiB; one backup, never a symlink."""
+    # Unlocked writers can race here: the size is re-read right before the move and the same file must still be
+    # over the limit, so a concurrent rotation that already ran is never replayed over the backup. A line written
+    # in the remaining microsecond window lands in the backup, not lost.
     try:
-        if path.lstat().st_size > RECEIPT_ROTATE_BYTES and not path.is_symlink():
-            os.replace(path, path.with_name(path.name + '.1'))
+        first = path.lstat()
+        if first.st_size > RECEIPT_ROTATE_BYTES and not path.is_symlink():
+            again = path.lstat()
+            if again.st_ino == first.st_ino and again.st_size > RECEIPT_ROTATE_BYTES:
+                os.replace(path, path.with_name(path.name + '.1'))
     except OSError:
         pass
 

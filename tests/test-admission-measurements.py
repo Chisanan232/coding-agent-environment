@@ -138,6 +138,43 @@ class Append(Base):
         self.assertEqual(len(self.lines()), 1)
 
 
+class Review(Base):
+    def test_reused_pid_with_a_different_start_token_is_not_sampled(self):
+        proc = self.real_holder()
+        self.reserve(proc=proc)
+        self.log.unlink()
+        record = json.loads((self.path.parent / 'reservations/build-a.json').read_text())
+        record['start_token'] = 'Thu Jan  1 00:00:00 1970'
+        (self.path.parent / 'reservations/build-a.json').write_text(json.dumps(record))
+        da._measure(self.path, 'snapshot', None, NOW)
+        self.assertFalse(self.log.exists())
+
+    def test_unreadable_token_skips_the_sample(self):
+        self.reserve()
+        self.log.unlink()
+        self.patch('process_token', unittest.mock.Mock(side_effect=da.ReservationError('no ps')))
+        da._measure(self.path, 'snapshot', None, NOW)
+        self.assertFalse(self.log.exists())
+
+    def test_oversized_log_is_read_from_the_newest_end(self):
+        write_runs(self.log, 'old', [(1, 5, 1, 1)])
+        with open(self.log, 'a') as handle:
+            handle.write(('x' * 99 + '\n') * (4 * da.RECEIPT_ROTATE_BYTES // 100 + 10))
+        write_runs(self.log, 'new', [(2, 6, 1, 1)])
+        classes = da.measurements_summary(self.path)['classes']
+        self.assertIn('new', classes)
+        self.assertNotIn('old', classes)
+
+    def test_second_rotation_attempt_never_replaces_the_backup_with_a_fresh_file(self):
+        self.path.parent.mkdir(parents=True)
+        self.log.write_text('x' * (da.RECEIPT_ROTATE_BYTES + 1))
+        da._rotate_once(self.log)
+        self.log.write_text('fresh\n')
+        da._rotate_once(self.log)
+        self.assertEqual(self.log.read_text(), 'fresh\n')
+        self.assertEqual(self.log.with_name('measurements.jsonl.1').stat().st_size, da.RECEIPT_ROTATE_BYTES + 1)
+
+
 class Isolation(Base):
     def test_log_failure_does_not_change_the_reserve_result(self):
         proc = self.real_holder()
