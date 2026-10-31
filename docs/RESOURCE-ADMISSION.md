@@ -366,8 +366,15 @@ exactly `min_jobs`, 2 for `build-crate` and 4 for the workspace classes), RED no
 class with an entry in `GRANT_ENV` was declared; the budget status is `ok`; the grant is positive. Variables: `CARGO_BUILD_JOBS` and
 `RUST_TEST_THREADS` for `build-crate`, plus `NEXTEST_TEST_THREADS` for `build-workspace` and `build-cold-isolated`. `light`, `remote`,
 `container-suite` and legacy runs (no class) export nothing, and so does an unavailable or RED budget. A value the job already set is
-never raised: the child gets the smaller of its own setting and the grant, and an unset, non-numeric or non-positive setting takes
-the grant.
+never raised, by this rule exactly: an unset or empty variable takes the grant; a positive integer is lowered to the grant if it is
+above it; any other value (0, negative, `default`, `num-cpus-2`, garbage) has a meaning only the tool knows and is left untouched.
+`queue claim` takes the class and the numbers from the queue entry's recorded fields, never from the caller (a claim that declares
+something else is refused before any export).
+
+AMBER is the larger of the class `min_jobs` and half the request (RED and unavailable export nothing). In the shadow era RED and
+an unavailable budget therefore leave the job's environment alone, and the job runs as it would have. **Note for the later
+enforcing change:** when the budget is enforced, RED must still export `min_jobs` (and its test threads) rather than nothing, or a
+RED host would be given a job with no cap at all.
 
 Nothing about admission changes: the lane cap stays 1 and admit or refuse is decided by the lane check exactly as before; a refused
 run never reaches the exec. Limits: the caps bind only jobs that read these variables (a `cargo` invocation passing `-j` still
