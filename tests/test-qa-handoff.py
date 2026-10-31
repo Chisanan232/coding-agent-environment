@@ -1615,8 +1615,13 @@ class LaunchdDomainTests(unittest.TestCase):
     def test_the_persistence_check_accepts_the_real_domain_and_still_requires_the_gui_domain_absent(self):
         answers = dict(CLEAN_PERSISTENCE)
         fake_domain, _ = self.runner()
+        console = {"owner": "501\n"}
 
         def fake_run(argv, **kwargs):
+            if argv[0] == qa.STAT:
+                return subprocess.CompletedProcess(argv, 0, console["owner"], "")
+            if argv[0] == qa.PS:
+                return subprocess.CompletedProcess(argv, 1, "", "")
             name = os.path.basename(argv[4])
             if name == "launchctl" and argv[-1].startswith("user/"):
                 return fake_domain(argv, **kwargs)
@@ -1627,16 +1632,21 @@ class LaunchdDomainTests(unittest.TestCase):
             answers["launchctl:gui"] = (0, "gui/530 = {\n}\n", "")
             self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))
             answers["launchctl:gui"] = (125, "", "Could not print domain: 125: Domain does not support specified action\n")
+            self.assertEqual(qa.persistence_problems(self.IDENT), [])   # 125 + a console owned by someone else + no GUI process
+            console["owner"] = "530\n"
             self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))   # 125 alone is not trusted (see LaunchdGuiAbsentTests)
+            console["owner"] = "501\n"
             answers["launchctl:gui"] = (1, "", "sudo: a password is required\n")
             self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))
 
 
 class LaunchdGuiAbsentTests(unittest.TestCase):
-    """gui/<uid> passes only in the documented absent forms (SPE-145 part 5). An unknown uid answers 112 "Could not find
+    """gui/<uid> passes only in the documented absent forms (SPE-145 part 5/6). An unknown uid answers 112 "Could not find
     domain". An existing account without a GUI session answers exit 125, "Domain does not support specified action", nothing
-    on stdout, and is accepted only when the QA user's launchd manager is Background/System and none of its processes is a
-    GUI-session one. The strings are the raw answers captured as the QA user and as root on the real account."""
+    on stdout, and is accepted only when the console owner is readable and is not the QA uid and none of the uid's
+    processes is a GUI-session one. `launchctl managername` is not used: it reports the caller's bootstrap context (Aqua from
+    a GUI Terminal, Background over ssh; measured), so it must neither gate nor be needed. The strings are the raw
+    answers captured as the QA user and as root on the real account."""
     NO_SESSION = "Could not print domain: 125: Domain does not support specified action\n"
     NOT_FOUND = "Bad request.\nCould not find domain for user gui: 9999\n"
     IDENT = qa.Identity("qauser", 530, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
@@ -1645,25 +1655,29 @@ class LaunchdGuiAbsentTests(unittest.TestCase):
         if os.getuid() == 530:
             self.skipTest("fixture uid is the running uid")
 
-    def gui_problems(self, gui=(125, "", NO_SESSION), manager=(0, "Background\n", ""), ps=(0, "52266 S\n93967 S\n", ""),
-                     paths=None, timeout_on=None):
+    def gui_problems(self, gui=(125, "", NO_SESSION), console=(0, "501\n", ""), ps=(0, "52266 S\n93967 S\n", ""),
+                     paths=None, timeout_on=None, calls=None):
         paths = paths or {52266: "/usr/sbin/distnoted", 93967: "/usr/sbin/cfprefsd"}
 
         def fake_run(argv, **kwargs):
-            if timeout_on == os.path.basename(argv[4] if argv[0] != qa.PS else argv[0]):
+            if calls is not None:
+                calls.append(list(argv))
+            if timeout_on == ("ps" if argv[0] == qa.PS else "stat" if argv[0] == qa.STAT else os.path.basename(argv[4])):
                 raise subprocess.TimeoutExpired(argv, 30)
             if argv[0] == qa.PS:
                 rc, out, err = ps
-            elif argv[-1] == "managername":
-                rc, out, err = manager
+            elif argv[0] == qa.STAT:
+                self.assertEqual(argv[1:], ["-f", "%u", "/dev/console"])
+                rc, out, err = console
             else:
+                self.assertNotEqual(argv[-1], "managername")   # never asked: it reports the caller's context
                 self.assertEqual(argv[-2:], ["print", "gui/530"])
                 rc, out, err = gui
             return subprocess.CompletedProcess(argv, rc, out, err)
         clean = {"crontab": (1, "", "no crontab for qauser\n"), "atq": (0, "", ""), "ls": (1, "", "ls: no such file\n")}
 
         def run(argv, **kwargs):
-            if argv[0] != qa.PS and os.path.basename(argv[4]) in clean:
+            if argv[0] not in (qa.PS, qa.STAT) and os.path.basename(argv[4]) in clean:
                 rc, out, err = clean[os.path.basename(argv[4])]
                 return subprocess.CompletedProcess(argv, rc, out, err)
             if argv[-1] == "user/530":
@@ -1676,11 +1690,19 @@ class LaunchdGuiAbsentTests(unittest.TestCase):
     def test_the_captured_no_session_answer_with_background_helpers_passes(self):
         self.assertEqual(self.gui_problems(), [])
 
-    def test_a_system_manager_and_an_empty_process_table_pass(self):
-        self.assertEqual(self.gui_problems(manager=(0, "System\n", ""), ps=(1, "", "")), [])
+    def test_an_empty_process_table_passes(self):
+        self.assertEqual(self.gui_problems(ps=(1, "", "")), [])
+
+    def test_the_callers_bootstrap_context_is_irrelevant(self):
+        # r2 printed managername Background, r3 printed Aqua for the SAME clean QA state: neither is asked or trusted
+        calls = []
+        self.assertEqual(self.gui_problems(calls=calls), [])
+        self.assertFalse(any(a[-1] == "managername" for a in calls), calls)
 
     def test_an_unknown_uid_passes_without_corroboration(self):
-        self.assertEqual(self.gui_problems(gui=(112, "", self.NOT_FOUND), manager=(0, "Aqua\n", "")), [])
+        calls = []
+        self.assertEqual(self.gui_problems(gui=(112, "", self.NOT_FOUND), console=(0, "530\n", ""), calls=calls), [])
+        self.assertFalse(any(a[0] == qa.STAT for a in calls), calls)
 
     def test_a_printed_domain_is_a_problem(self):
         self.assertTrue(self.gui_problems(gui=(0, "gui/530 = {\n\ttype = login\n}\n", "")))
@@ -1703,10 +1725,16 @@ class LaunchdGuiAbsentTests(unittest.TestCase):
         self.assertTrue(self.gui_problems(gui=(1, "", "Operation not permitted\n")))
         self.assertTrue(self.gui_problems(gui=(1, "", "sudo: a password is required\n")))
 
-    def test_an_aqua_or_unreadable_manager_is_a_problem(self):
-        for manager in ((0, "Aqua\n", ""), (0, "", ""), (1, "", "Operation not permitted\n"),
-                        (1, "", "sudo: a password is required\n"), (0, "Background extra\n", "")):
-            self.assertTrue(self.gui_problems(manager=manager), manager)
+    def test_a_console_owned_by_the_qa_uid_is_a_problem(self):
+        text = self.reason(console=(0, "530\n", ""))
+        self.assertEqual(text, "gui/530 125-no-session unconfirmed: the console is owned by the QA uid 530")
+
+    def test_an_unreadable_console_owner_is_a_problem(self):
+        for console in ((1, "", "stat: /dev/console: Operation not permitted\n"), (0, "", ""), (0, "root\n", ""),
+                        (0, "-1\n", ""), (0, "501 502\n", "")):
+            with self.subTest(console=console):
+                text = self.reason(console=console)
+                self.assertIn("console owner unreadable", text)
 
     def test_a_gui_session_process_is_a_problem(self):
         for name in ("loginwindow", "WindowServer", "Dock", "Finder"):
@@ -1722,14 +1750,6 @@ class LaunchdGuiAbsentTests(unittest.TestCase):
     def test_a_timeout_is_a_problem(self):
         self.assertTrue(self.gui_problems(timeout_on="launchctl"))
 
-    def test_a_timeout_while_corroborating_is_a_problem(self):
-        def raises(argv, **kwargs):
-            if argv[-1] == "managername" or argv[0] == qa.PS:
-                raise subprocess.TimeoutExpired(argv, 30)
-            return subprocess.CompletedProcess(argv, 125, "", self.NO_SESSION)
-        with unittest.mock.patch.object(qa.subprocess, "run", raises):
-            self.assertTrue(qa.no_gui_session_problems(self.IDENT, "gui/530"))
-
     def reason(self, **kwargs):
         """The one reason the owner reads for a gui/530 problem, after write_result's clean()."""
         problems = self.gui_problems(**kwargs)
@@ -1740,49 +1760,20 @@ class LaunchdGuiAbsentTests(unittest.TestCase):
         self.assertTrue(all(" " <= c <= "~" for c in text), text)
         return text
 
-    def test_a_failed_managername_query_says_so_with_rc_stdout_and_stderr(self):
-        text = self.reason(manager=(1, "", "Operation not permitted\n"))
-        self.assertTrue(text.startswith("gui/530 125-no-session unconfirmed: managername rc=1"), text)
-        self.assertIn('out=""', text)
-        self.assertIn('err="Operation not permitted"', text)
-        self.assertNotIn("not Background", text)
-
-    def test_a_non_background_manager_names_the_manager(self):
-        for out in ("Aqua\n", "Background extra\n", "LoginWindow\n"):
-            text = self.reason(manager=(0, out, ""))
-            self.assertIn('manager is "%s"' % out.strip(), text)
-            self.assertNotIn("rc=", text)
-
-    def test_an_empty_manager_answer_with_rc_0_is_a_problem_and_is_not_a_failed_query(self):
-        text = self.reason(manager=(0, "", ""))
-        self.assertIn('manager is ""', text)
-
-    def test_a_sudo_refusal_says_sudo_refused(self):
-        text = self.reason(manager=(1, "", "sudo: a password is required\n"))
-        self.assertIn("managername sudo refused", text)
-        self.assertIn("sudo: a password", text)
-
-    def test_the_three_managername_conditions_have_distinct_text(self):
-        texts = {self.reason(manager=m) for m in ((1, "", "x\n"), (0, "Aqua\n", ""), (1, "", "sudo: no\n"))}
-        self.assertEqual(len(texts), 3)
-
-    def test_stdout_and_stderr_are_bounded_and_sanitized(self):
+    def test_console_stdout_and_stderr_are_bounded_and_sanitized(self):
         noisy = "\x1b[31mA\x00B\r\tC" + "z" * 5000 + "\n second line"
-        text = self.reason(manager=(2, "\x07" + "o" * 5000, noisy))
+        text = self.reason(console=(2, "\x07" + "o" * 5000, noisy))
         self.assertNotIn("\n", text)
         self.assertNotIn("second line", text)
         self.assertEqual(text.count("o" * 17), 0)
-        self.assertIn('out="?' + "o" * 15 + '"', text)
         self.assertEqual(text.count("z" * 29), 0)
-        self.assertIn('err="caf? ?"', self.reason(manager=(1, "", "caf\u00e9 \u202e\u2028x")))   # U+2028 ends the first line
-        self.assertNotIn('""quoted', self.reason(manager=(1, "", '"quoted"')))
+        self.assertIn("console owner unreadable rc=2", text)
+        self.assertNotIn('""quoted', self.reason(console=(1, "", '"quoted"')))
 
     def test_the_longest_reason_fits_for_the_largest_uid(self):
         ident = self.IDENT._replace(uid=4294967295)
-        calls = []
 
         def run(argv, **kwargs):
-            calls.append(argv)
             if argv[0] == qa.PS:
                 return subprocess.CompletedProcess(argv, 0, "1 S\n", "")
             return subprocess.CompletedProcess(argv, -9, "o" * 99, "e" * 99)
@@ -1811,11 +1802,11 @@ class LaunchdGuiAbsentTests(unittest.TestCase):
     def test_a_timeout_names_which_command_timed_out(self):
         def raises(which):
             def run(argv, **kwargs):
-                if (which == "ps") == (argv[0] == qa.PS) and (which == "ps" or argv[-1] == "managername"):
+                if (which == "ps") == (argv[0] == qa.PS) and (which == "ps" or argv[0] == qa.STAT):
                     raise subprocess.TimeoutExpired(argv, 30)
-                return subprocess.CompletedProcess(argv, 0, "Background\n", "")
+                return subprocess.CompletedProcess(argv, 0, "501\n", "")
             return run
-        for which, expected in (("managername", "managername not run (TimeoutExpired)"), ("ps", "ps not run (TimeoutExpired)")):
+        for which, expected in (("stat", "console owner not read (TimeoutExpired)"), ("ps", "ps not run (TimeoutExpired)")):
             with unittest.mock.patch.object(qa.subprocess, "run", raises(which)):
                 problems = qa.no_gui_session_problems(self.IDENT, "gui/530")
             self.assertEqual(len(problems), 1)
@@ -1824,14 +1815,8 @@ class LaunchdGuiAbsentTests(unittest.TestCase):
 
     def test_nothing_is_retried(self):
         calls = []
-
-        def run(argv, **kwargs):
-            calls.append(argv)
-            return subprocess.CompletedProcess(argv, 1, "", "Operation not permitted\n") if argv[-1] == "managername" else \
-                subprocess.CompletedProcess(argv, 0, "", "")
-        with unittest.mock.patch.object(qa.subprocess, "run", run):
-            self.assertTrue(qa.no_gui_session_problems(self.IDENT, "gui/530"))
-        self.assertEqual(sum(1 for a in calls if a[-1] == "managername"), 1)
+        self.assertTrue(self.gui_problems(console=(1, "", "Operation not permitted\n"), calls=calls))
+        self.assertEqual(sum(1 for a in calls if a[0] == qa.STAT), 1)
 
     def test_zombies_and_vanished_processes_are_skipped(self):
         with unittest.mock.patch.object(qa.os, "kill", side_effect=ProcessLookupError):

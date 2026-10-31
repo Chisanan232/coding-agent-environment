@@ -788,17 +788,16 @@ def seal_failed(error):
 Identity = collections.namedtuple('Identity', 'name uid home exchange exchange_owner')
 KILL, PS = '/bin/kill', '/bin/ps'
 CRONTAB, ATQ, LS, LAUNCHCTL = '/usr/bin/crontab', '/usr/bin/atq', '/bin/ls', '/bin/launchctl'
+STAT = '/usr/bin/stat'
 # launchd's default ThrottleInterval is 10 s: a job it keeps alive comes back within that, so the seal looks again later.
 RESPAWN_SECONDS = 12
 LAUNCHD_ABSENT = 'Could not find domain'
 # An existing account with no GUI session answers `print gui/<uid>` with exit 125 and this text, and nothing on stdout (a
 # present session prints rc 0, an unknown uid answers 112 'Could not find domain'). Observed as the QA user and as root
 # against the real QA account and an unused one (SPE-145 part 5), so the exit code and text alone are not trusted: the
-# QA user's launchd manager must be a background one and none of its processes may belong to a GUI session. `managername`
-# was never observed on an account that has a GUI session, and sudo may hand the command the caller's bootstrap, so the
-# process check is the one that discriminates; neither check sees a GUI session that appears after it.
+# console owner must be readable and not the QA uid, and none of the uid's processes may belong to a GUI session.
+# `launchctl managername` was tried and dropped: it reports the caller's bootstrap context, not the QA user's (SPE-145 part 6).
 LAUNCHD_NO_SESSION = (125, 'Domain does not support specified action')
-BACKGROUND_MANAGERS = ('Background', 'System')
 GUI_SESSION_PROCESSES = frozenset({'loginwindow', 'WindowServer', 'Dock', 'Finder', 'SystemUIServer', 'ControlCenter',
                                    'NotificationCenter', 'Spotlight'})
 # After the QA user's first hop macOS creates a launchd user domain for it and runs Apple services under it (first real
@@ -1415,31 +1414,32 @@ def ascii_field(text, limit):
 
 
 def no_gui_session_problems(ident, domain):
-    """Problems that keep an exit-125 answer for gui/<uid> from meaning "no GUI session", read as the QA user: its launchd
-    manager (`launchctl managername`) must be exactly Background or System, and no process of the uid may be a GUI-session
-    one (loginwindow, WindowServer, Dock, Finder ...), judged by the kernel-reported executable. Anything that cannot be
-    read is a problem (fail closed). Background helpers such as distnoted and cfprefsd are normal and ignored.
-    Each reason starts with the failed sub-condition and stays well inside the 120 characters `clean` keeps, so the owner
-    can tell an unreadable query from a real non-Background manager."""
-    qis = _qis()
+    """Problems that keep an exit-125 answer for gui/<uid> from meaning "no GUI session". The console owner
+    (`stat -f %u /dev/console`) must be readable and must not be the QA uid, and no process of the uid may be a
+    GUI-session one (loginwindow, WindowServer, Dock, Finder ...), judged by the kernel-reported executable. Anything
+    that cannot be read is a problem (fail closed). Background helpers such as distnoted and cfprefsd are normal.
+    `launchctl managername` is deliberately not used: it reports the bootstrap context of the CALLER (Aqua from a GUI
+    Terminal, Background over ssh), which `sudo -u` does not change, so it says nothing about the QA user's own launchd
+    manager (SPE-145 part 6, measured). The console owner is a limit: a fast-user-switched GUI session of the QA
+    user owns /dev/console only while it is the active one; the process check covers the rest.
+    Each reason starts with the failed sub-condition and stays well inside the 120 characters `clean` keeps."""
     head = '%s 125-no-session unconfirmed: ' % domain
     try:
-        name = subprocess.run([qis.SUDO, '-n', '-u', ident.name, LAUNCHCTL, 'managername'], stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=30, cwd='/', env=HOP_ENV)
+        console = subprocess.run([STAT, '-f', '%u', '/dev/console'], stdin=subprocess.DEVNULL, capture_output=True,
+                                 text=True, timeout=10, cwd='/', env=HOP_ENV)
     except (OSError, subprocess.SubprocessError) as error:
-        return [head + 'managername not run (%s)' % type(error).__name__]
+        return [head + 'console owner not read (%s)' % type(error).__name__]
     try:
         listed = subprocess.run([PS, '-U', str(ident.uid), '-o', 'pid=,stat='], stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError) as error:
         return [head + 'ps not run (%s)' % type(error).__name__]
-    manager = ascii_field(name.stdout, 16)
-    if sudo_refused(name.stderr):
-        return [head + 'managername sudo refused err="%s"' % ascii_field(name.stderr, 30)]
-    if name.returncode != 0:
-        return [head + 'managername rc=%d out="%s" err="%s"' % (name.returncode, manager, ascii_field(name.stderr, 28))]
-    if (name.stdout or '').strip() not in BACKGROUND_MANAGERS:
-        return [head + 'manager is "%s", not Background/System' % manager]
+    owner = (console.stdout or '').strip()
+    if console.returncode != 0 or not owner.isdigit():
+        return [head + 'console owner unreadable rc=%d out="%s" err="%s"' % (
+            console.returncode, ascii_field(console.stdout, 8), ascii_field(console.stderr, 24))]
+    if int(owner) == ident.uid:
+        return [head + 'the console is owned by the QA uid %s' % ascii_field(owner, 12)]
     if listed.returncode == 1 and not listed.stdout.strip() and not listed.stderr.strip():
         return []   # ps exits 1 with an empty table: no process of the uid
     if listed.returncode != 0:
