@@ -1531,12 +1531,13 @@ class LocalEquivalentCi(Base):
             with self.subTest(job=job):
                 self.assertRefused(self.gh(job=job), "check ci is FAILURE")
 
-    def test_a_skipped_non_required_check_does_not_block_but_nothing_else_does_not(self):
+    def test_a_skipped_non_required_check_does_not_block_but_nothing_else_is_relaxed(self):
         def entry(name, conclusion):
             return {"__typename": "CheckRun", "name": name, "status": "COMPLETED", "conclusion": conclusion}
         ok = [entry("ci", "SUCCESS")]
-        _, bad = omr.summarize_checks(ok + [entry("publish GitHub Release", "SKIPPED"), entry("attest provenance (x)", "SKIPPED")], ["ci"])
+        counts, bad = omr.summarize_checks(ok + [entry("publish GitHub Release", "SKIPPED"), entry("attest provenance (x)", "SKIPPED")], ["ci"])
         self.assertEqual(bad, [])
+        self.assertEqual((counts["skipped_ignored"], counts["success"], counts["total"]), (2, 1, 3))   # the omission is visible
         for verdict in ("FAILURE", "CANCELLED", "TIMED_OUT", "NEUTRAL", "ACTION_REQUIRED", "STARTUP_FAILURE"):
             with self.subTest(verdict=verdict):
                 self.assertTrue(omr.summarize_checks(ok + [entry("other", verdict)], ["ci"])[1])

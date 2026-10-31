@@ -505,7 +505,8 @@ def summarize_checks(rollup, required, exempt=frozenset()):
             if v != "SUCCESS" and name not in exempt and not (v == "SKIPPED" and name not in required):
                 bad.append(f"check {name} is {v}")
     return {"total": len(rollup), "required": len(required),
-            "success": sum(v == "SUCCESS" for vs in seen.values() for v in vs), "not_success": len(bad)}, bad
+            "success": sum(v == "SUCCESS" for vs in seen.values() for v in vs), "not_success": len(bad),
+            "skipped_ignored": sum(v == "SKIPPED" for n, vs in seen.items() if n not in required and n not in exempt for v in vs)}, bad
 
 
 def parse_rule_contexts(rules):
