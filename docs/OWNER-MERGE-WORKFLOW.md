@@ -118,6 +118,18 @@ work never enters `main` early. The gate recognises such a base only when it is 
 - Loader limits (SPE-133): the file is read without blocking (a FIFO or device is refused), at most 64 KiB, with `schema` exactly integer `1`, a regular file rather than a symlink, no duplicate JSON keys, `future_head_prefixes` a list of non-empty refs, and no `//` in any ref. Directories above the owner-config root are not permission-checked.
 - Adding or removing an entry is a founder decision recorded outside the PR it unblocks.
 
+## Independent AI review (founder correction 2026-10-31)
+
+A second human reviewer is not required for the founder's owner-controlled repositories. The review before an agent-performed merge may come from another AI agent or session, as long as it is genuinely independent of the author and the coordinator.
+
+- Runner evidence uses a stable reviewer id that the repository's allowlist lists under `reviewers`: by convention `claude-independent-agent` (or `codex-independent` for a Codex session), with kind `independent-agent`. The id names a reviewer type, not a person and not a particular run.
+- If a repository's allowlist sets `independent_github_reviewers`, the runner additionally requires a real GitHub APPROVED review at the exact head from one of those other logins; this rule does not remove that option.
+- Provenance stays in the review comment: the actual agent, session or run identifier, the exact reviewed SHA, the findings and the evidence. If a later commit lands after the review, say what changed and whether it was re-reviewed. Never relabel a self-review as independent and never invent an identity.
+- The author, or the coordinator that wrote a fix, is not the reviewer of that fix. A reviewed fix still needs a review of its own head.
+- The runner reads `~/.claude/owner-merge-runner-allowlist.json`: a repository needs an entry with its real `required_checks` and `reviewers` before the runner will merge it, and its base branch needs server-side required checks that cover them (`protection_capability: private-free-app-level` only for a private repository on a plan without branch protection; that mode is app-level enforcement, not server-side protection). Editing that file is an owner-authorized step, so a session reports the repository name instead of editing it.
+- Pull requests by anyone other than the owner (class B and C below) still need the owner's genuine GitHub approval on the exact head. Agent review does not replace it.
+- Publication, tagging and deployment are not covered by any of this and keep their own approval.
+
 ## What this does not do
 
 `PASS` means every check GitHub reported on that head passed (at least one succeeded); it cannot know
