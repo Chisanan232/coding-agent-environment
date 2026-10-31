@@ -487,6 +487,12 @@ def check_entry(c):
     return name, verdict
 
 
+def entry_blocks(name, verdict, required, exempt):
+    """The one rule for whether a rollup entry blocks: only SUCCESS, an exempted name, or a SKIPPED entry of a
+    non-required check does not."""
+    return verdict != "SUCCESS" and name not in exempt and not (verdict == "SKIPPED" and name not in required)
+
+
 def summarize_checks(rollup, required, exempt=frozenset()):
     """Every named required check must be present and SUCCESS; every other entry must also be SUCCESS, except that a
     non-required entry that SKIPPED (a job whose `if:` did not select this event, such as a release job that only runs on
@@ -502,7 +508,7 @@ def summarize_checks(rollup, required, exempt=frozenset()):
             bad.append(f"required check {name} is missing")
     for name, verdicts in seen.items():
         for v in verdicts:
-            if v != "SUCCESS" and name not in exempt and not (v == "SKIPPED" and name not in required):
+            if entry_blocks(name, v, required, exempt):
                 bad.append(f"check {name} is {v}")
     return {"total": len(rollup), "required": len(required),
             "success": sum(v == "SUCCESS" for vs in seen.values() for v in vs), "not_success": len(bad),
@@ -713,13 +719,13 @@ def unavailable_checks(runner, repo, facts, head, cfg, local):
     return frozenset(exempt)
 
 
-def unstable_is_covered(rollup, exempt):
+def unstable_is_covered(rollup, required, exempt):
     """mergeStateStatus UNSTABLE means only non-required checks are not green. It is acceptable only when something
-    was exempted and every non-SUCCESS rollup entry belongs to an exempted check (so nothing is pending or failing)."""
+    was exempted and no rollup entry blocks by the same rule as summarize_checks (so nothing is pending, or an
+    executed failure, or a skipped required check)."""
     if not exempt:
         return False
-    entries = [check_entry(c) for c in rollup]
-    return all(v == "SUCCESS" or n in exempt for n, v in entries)
+    return not any(entry_blocks(n, v, required, exempt) for n, v in map(check_entry, rollup))
 
 
 def decide(p, repo, pr, head, me, cfg, exempt=frozenset()):
@@ -752,7 +758,7 @@ def decide(p, repo, pr, head, me, cfg, exempt=frozenset()):
         bad.append("observed head differs from expected head")
     if mergeable != "MERGEABLE":
         bad.append(f"mergeable is {mergeable}")
-    if mss != "CLEAN" and not (mss == "UNSTABLE" and unstable_is_covered(rollup, exempt)):
+    if mss != "CLEAN" and not (mss == "UNSTABLE" and unstable_is_covered(rollup, cfg["required_checks"], exempt)):
         bad.append(f"mergeStateStatus is {mss}")
     latest = {}
     for r in reviews:
@@ -828,8 +834,13 @@ def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin=None):
     final_class, _ = decide(after, repo, pr, head, me, cfg, exempt_after)  # every blocking fact in the last read refuses
     if final_class != pr_class:
         raise Refused(["PR class changed while server-side state was being read"])
+    req = set(cfg["required_checks"])
+    entries = [check_entry(c) for c in after["statusCheckRollup"]]
     checks = dict(checks, ci_class="CI_UNAVAILABLE_EXTERNAL" if exempt else "CI_PASS",
-                  local_equivalent=sorted(exempt), merge_state=after.get("mergeStateStatus"))  # an exempted check is never reported as CI_PASS
+                  local_equivalent=sorted(exempt),  # union, kept for compatibility
+                  local_equivalent_required=sorted(exempt & req), local_equivalent_optional=sorted(exempt - req),
+                  exempted_entries=sum(v != "SUCCESS" and n in exempt for n, v in entries),
+                  merge_state=after.get("mergeStateStatus"))  # an exempted check is never reported as CI_PASS
     return observed, pr_class, checks, info, {"base": base, "evidence": digest}
 
 

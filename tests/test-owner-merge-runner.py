@@ -1779,8 +1779,8 @@ class NonRequiredNeverStarted(Base):
         roll[0] = {"__typename": "StatusContext", "context": CIRC_UBU, "state": "FAILURE"}
         self.assertRefused(self.gh(rollup=roll), f"check {CIRC_UBU} is FAILURE")
 
-    def test_pending_or_skipped_or_executed_failure_blocks_even_when_others_exempt(self):
-        for verdict in ("IN_PROGRESS", "QUEUED", "SKIPPED", "TIMED_OUT"):
+    def test_pending_or_timed_out_or_executed_failure_blocks_even_when_others_exempt(self):
+        for verdict in ("IN_PROGRESS", "QUEUED", "TIMED_OUT"):
             with self.subTest(verdict=verdict):
                 self.assertRefused(self.gh(rollup=circinus_rollup(macos=verdict)), f"check {CIRC_MAC} is {verdict}")
         extra = circinus_rollup() + [{"__typename": "CheckRun", "name": "lint", "status": "COMPLETED",
@@ -1800,6 +1800,18 @@ class NonRequiredNeverStarted(Base):
         jobs = self.jobs()
         jobs["94"] = never_ran(name=CIRC_UBU, steps=[{"name": "t"}])
         self.assertRefused(self.gh(rollup=roll, jobs=jobs), f"check {CIRC_UBU} is FAILURE")
+
+    def test_skipped_non_required_beside_billing_blocked_is_accepted_but_skipped_required_refuses(self):
+        skipped = {"__typename": "CheckRun", "name": "release", "status": "COMPLETED", "conclusion": "SKIPPED"}
+        code, rec = self.go(self.gh(rollup=circinus_rollup() + [skipped]), dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+        self.assertEqual(rec["checks"]["skipped_ignored"], 1)
+        self.assertEqual(rec["checks"]["exempted_entries"], 2)
+        self.assertEqual((rec["checks"]["local_equivalent_required"], rec["checks"]["local_equivalent_optional"]),
+                         ([], [CIRC_MAC, CIRC_UBU]))
+        roll = circinus_rollup()
+        roll[2] = {"__typename": "CheckRun", "name": CIRC_SONAR, "status": "COMPLETED", "conclusion": "SKIPPED"}
+        self.assertRefused(self.gh(rollup=roll), f"check {CIRC_SONAR} is SKIPPED")
 
     def test_exemption_changing_between_passes_refuses(self):
         state = {"n": 0}
