@@ -1426,8 +1426,9 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
     # Nothing may be able to start as the QA user while the attempt is set up either (cron, at, launchd).
     persistent = persistence_problems(ident)
     if persistent:
-        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['the QA user is not clean before the run: ' + '; '.join(persistent[:3]),
-                                                               'codex was not started'])
+        # One reason per problem: write_result keeps 120 characters of each, so a shared line would cut all but the first.
+        return write_result(run_dir, packet, 'QA_INCOMPLETE', ['the QA user is not clean before the run'] + persistent[:3]
+                            + ['codex was not started'])
     # Hop 0: the environment canary. The producer holds a synthetic sentinel in a sibling's environment, proves it can read
     # it itself, and the probe running as the QA user must not.
     setup = qis.Setup(ident.name, ident.uid, ident.home, ident.exchange)
@@ -1656,29 +1657,47 @@ def is_no_gui_session(done):
             and not (done.stdout or '').strip())
 
 
+def ascii_field(text, limit):
+    """Untrusted subprocess output as one bounded, printable-ASCII token for a reason line: the first non-empty line only,
+    anything outside printable ASCII becomes `?`, a double quote becomes `'` (the field is printed inside double quotes)."""
+    line = next((l for l in str(text or '').splitlines() if l.strip()), '')[:limit]
+    return ''.join(c if ' ' <= c <= '~' and c != '"' else ("'" if c == '"' else '?') for c in line)
+
+
 def no_gui_session_problems(ident, domain):
     """Problems that keep an exit-125 answer for gui/<uid> from meaning "no GUI session", read as the QA user: its launchd
     manager (`launchctl managername`) must be exactly Background or System, and no process of the uid may be a GUI-session
     one (loginwindow, WindowServer, Dock, Finder ...), judged by the kernel-reported executable. Anything that cannot be
-    read is a problem (fail closed). Background helpers such as distnoted and cfprefsd are normal and ignored."""
+    read is a problem (fail closed). Background helpers such as distnoted and cfprefsd are normal and ignored.
+    Each reason starts with the failed sub-condition and stays well inside the 120 characters `clean` keeps, so the owner
+    can tell an unreadable query from a real non-Background manager."""
     qis = _qis()
+    head = '%s 125-no-session unconfirmed: ' % domain
     try:
         name = subprocess.run([qis.SUDO, '-n', '-u', ident.name, LAUNCHCTL, 'managername'], stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=30, cwd='/', env=HOP_ENV)
+    except (OSError, subprocess.SubprocessError) as error:
+        return [head + 'managername not run (%s)' % type(error).__name__]
+    try:
         listed = subprocess.run([PS, '-U', str(ident.uid), '-o', 'pid=,stat='], stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError) as error:
-        return ['launchd domain %s: the no-GUI-session answer could not be corroborated (%s)' % (domain, type(error).__name__)]
-    if sudo_refused(name.stderr) or name.returncode != 0 or name.stdout.strip() not in BACKGROUND_MANAGERS:
-        return ['launchd domain %s: exit 125 but the launchd manager of %s is not Background or System' % (domain, ident.name)]
+        return [head + 'ps not run (%s)' % type(error).__name__]
+    manager = ascii_field(name.stdout, 16)
+    if sudo_refused(name.stderr):
+        return [head + 'managername sudo refused err="%s"' % ascii_field(name.stderr, 30)]
+    if name.returncode != 0:
+        return [head + 'managername rc=%d out="%s" err="%s"' % (name.returncode, manager, ascii_field(name.stderr, 28))]
+    if (name.stdout or '').strip() not in BACKGROUND_MANAGERS:
+        return [head + 'manager is "%s", not Background/System' % manager]
     if listed.returncode == 1 and not listed.stdout.strip() and not listed.stderr.strip():
         return []   # ps exits 1 with an empty table: no process of the uid
     if listed.returncode != 0:
-        return ['launchd domain %s: the process table of %s could not be read' % (domain, ident.name)]
+        return [head + 'ps rc=%d err="%s"' % (listed.returncode, ascii_field(listed.stderr, 28))]
     for line in listed.stdout.splitlines():
         fields = line.split()
         if len(fields) != 2 or not fields[0].isdigit():
-            return ['launchd domain %s: the process table of %s could not be read' % (domain, ident.name)]
+            return [head + 'ps row unparsable "%s"' % ascii_field(line, 30)]
         if fields[1].startswith('Z'):
             continue
         pid = int(fields[0])
@@ -1690,9 +1709,9 @@ def no_gui_session_problems(ident, domain):
                 continue
             except PermissionError:
                 pass
-            return ['launchd domain %s: a process of %s could not be identified' % (domain, ident.name)]
+            return [head + 'pid %s executable unidentified' % ascii_field(fields[0], 12)]
         if os.path.basename(path) in GUI_SESSION_PROCESSES:
-            return ['launchd domain %s: exit 125 but %s runs a GUI-session process (%s)' % (domain, ident.name, os.path.basename(path))]
+            return ['%s 125 but GUI-session process %s runs' % (domain, ascii_field(os.path.basename(path), 30))]
     return []
 
 
@@ -2034,8 +2053,8 @@ def identity_gate(run_dir, meta):
         problems.append('the outbox was a link or not owned by the QA user')
     persistence = meta.get('persistence')
     if not isinstance(persistence, list) or persistence:
-        problems.append('the QA user has scheduled jobs or launch agents, or they could not be checked: %s'
-                        % clean('; '.join(persistence) if isinstance(persistence, list) else persistence, 80))
+        problems.append('the QA user has scheduled jobs or launch agents, or they could not be checked')
+        problems += [clean(p) for p in persistence[:3]] if isinstance(persistence, list) else [clean(persistence, 80)]
     return problems
 
 
