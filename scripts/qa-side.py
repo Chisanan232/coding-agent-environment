@@ -238,7 +238,7 @@ def kill_group(proc):
 PROFILE_CHANGED = 125                          # qa-exec: the profile is not the one hop 1 proved; codex was not started
 
 
-def qa_stage(args, build_env=None):
+def qa_stage(args, build_env=None, copy_source=None):
     """QA side, hop 1 (runs as the QA user). Prints exactly one JSON record on stdout, before any model starts.
     build_env is the installed mode's allowlist environment; the attended mode passes none and uses isolated_env."""
     devnull = os.open(os.devnull, os.O_WRONLY)
@@ -246,7 +246,7 @@ def qa_stage(args, build_env=None):
     os.close(devnull)
     os.umask(0o077)
     try:
-        record = stage_outbox(args, build_env)
+        record = stage_outbox(args, build_env, copy_source)
     except Exception as error:
         record = {'error': type(error).__name__}
     sys.stdout.write(json.dumps(record) + '\n')
@@ -254,12 +254,15 @@ def qa_stage(args, build_env=None):
     return 0
 
 
-def stage_outbox(args, build_env=None):
+def stage_outbox(args, build_env=None, copy_source=None):
     inbox, outbox = Path(args.inbox), Path(args.outbox)
     outbox.mkdir(mode=0o700)      # fails if anything already exists under this attempt name
     for sub in ('out', 'tmp', 'home', 'cargo-target'):
         (outbox / sub).mkdir(mode=0o700)
-    shutil.copytree(inbox / 'source', outbox / 'source', symlinks=True)
+    if copy_source:
+        copy_source(outbox / 'source')       # installed mode: copied from a validated descriptor, never from a path
+    else:
+        shutil.copytree(inbox / 'source', outbox / 'source', symlinks=True)
     write_private(outbox / 'verdict.schema.json', VERDICT_SCHEMA)
     if not shutil.which(args.codex_bin):
         return {'codex_missing': True}
@@ -276,7 +279,7 @@ class QAStop(Exception):
         self.code = code
 
 
-def qa_exec(args, build_env=None):
+def qa_exec(args, build_env=None, open_prompt=None):
     """QA side, hop 2 (runs as the QA user). Only codex writes fd 1 (the producer's pipe); stderr goes to the outbox; the
     prompt comes from the producer-owned inbox file. Exit: codex's code, 124 on timeout or alarm, 130 on a signal."""
     inbox, outbox = Path(args.inbox), Path(args.outbox)
@@ -298,7 +301,7 @@ def qa_exec(args, build_env=None):
         if profile != args.profile_sha256:
             sys.stderr.write('qa-exec: the permission profile changed since it was proved; codex not started\n')
             return PROFILE_CHANGED
-        with open_regular(inbox / 'prompt.txt') as prompt:
+        with (open_prompt() if open_prompt else open_regular(inbox / 'prompt.txt')) as prompt:
             try:
                 proc = subprocess.Popen(codex_argv(args.codex_bin, outbox), cwd=str(outbox / 'source'),
                                         env=build_env() if build_env else isolated_env(outbox, Path(args.codex_home)), stdin=prompt, start_new_session=True)
@@ -518,7 +521,61 @@ def read_request(config, verb, attempt, fds):
         _need(request['pid'] > 1 and SENTINEL_RE.fullmatch(request['sentinel']) is not None)
     if verb == 'exec':
         _need(60 <= request['timeout'] <= 14400 and SHA256_RE.fullmatch(request['profile_sha256']) is not None)
-    return request
+    return request, afd
+
+
+PROMPT_MAX = 1 << 20
+
+
+def open_source_dir(afd, producer):
+    """The clone directory of a validated attempt, opened relative to the attempt descriptor without following a link."""
+    fd = os.open('source', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=afd)
+    st = os.fstat(fd)
+    if st.st_uid != producer or st.st_mode & 0o022:
+        os.close(fd)
+        raise Refuse()
+    return fd
+
+
+def open_prompt_at(afd, producer):
+    """prompt.txt of a validated attempt as a binary file object: no link followed, regular, producer-owned, size-capped."""
+    fd = os.open('prompt.txt', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=afd)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != producer or st.st_mode & 0o022 or st.st_size > PROMPT_MAX:
+        os.close(fd)
+        raise Refuse()
+    return os.fdopen(fd, 'rb')
+
+
+def copy_tree_at(src_fd, dst):
+    """Copy the directory held open as src_fd to the new directory dst. Every entry is examined and opened relative to its
+    parent descriptor with O_NOFOLLOW, so a swap of any path after validation cannot redirect the copy. Links are recreated
+    as links (like copytree symlinks=True) and never followed; anything that is not a directory, regular file or link is
+    refused."""
+    os.mkdir(dst, 0o700)
+    with os.scandir(src_fd) as entries:
+        names = [entry.name for entry in entries]
+    for name in names:
+        st = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
+        target = os.path.join(dst, name)
+        if stat.S_ISLNK(st.st_mode):
+            os.symlink(os.readlink(name, dir_fd=src_fd), target)
+        elif stat.S_ISDIR(st.st_mode):
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=src_fd)
+            try:
+                copy_tree_at(child, target)
+                os.chmod(target, stat.S_IMODE(st.st_mode) | 0o700)
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(st.st_mode):
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=src_fd)
+            with os.fdopen(fd, 'rb') as source:
+                _need(stat.S_ISREG(os.fstat(source.fileno()).st_mode))
+                out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, stat.S_IMODE(st.st_mode) | 0o600)
+                with os.fdopen(out, 'wb') as sink:
+                    shutil.copyfileobj(source, sink)
+        else:
+            raise Refuse()
 
 
 def base_env(qa_home):
@@ -547,14 +604,14 @@ def validate_installed(argv, config_path, chain_anchor, fds):
     _need(record.pw_name == config['qa_name'] and os.path.isabs(record.pw_dir))
     trusted_chain(config['codex_path'], chain_anchor)
     _need(sha256_file(config['codex_path']) == config['codex_sha256'])
-    plan = {'verb': verb, 'dry_run': dry, 'qa_name': config['qa_name'], 'qa_home': record.pw_dir, 'codex': config['codex_path'],
+    plan = {'verb': verb, 'dry_run': dry, 'qa_name': config['qa_name'], 'qa_home': record.pw_dir, 'producer_uid': config['producer_uid'], 'codex': config['codex_path'],
             'codex_sha256': config['codex_sha256'], 'exchange': config['exchange']}
     if verb == 'version':
         return plan
-    request = read_request(config, verb, attempt, fds)
+    request, afd = read_request(config, verb, attempt, fds)
     exchange = config['exchange']
     outbox = os.path.join(exchange, 'outbox', attempt)
-    plan.update({'attempt': attempt, 'request': request, 'inbox_root': os.path.join(exchange, 'inbox'),
+    plan.update({'attempt': attempt, 'request': request, 'afd': afd, 'inbox_root': os.path.join(exchange, 'inbox'),
                  'outbox_root': os.path.join(exchange, 'outbox'), 'inbox': os.path.join(exchange, 'inbox', attempt),
                  'outbox': outbox, 'producer_home': pwd.getpwuid(config['producer_uid']).pw_dir,
                  'codex_home': os.path.join(record.pw_dir, '.local/state/coding-agent-environment/qa', attempt, 'codexhome')})
@@ -590,14 +647,19 @@ def pin_process(qa_home):
     CANARY_ROOT = HOME / '.local/state/coding-agent-environment/qa-canary'
 
 
-def detach(alarm_seconds):
-    """New session (no controlling terminal), cwd /, stdin /dev/null, nothing inherited but 0-2, SIGALRM armed."""
+def detach(alarm_seconds, keep=()):
+    """New session (no controlling terminal), cwd /, stdin /dev/null, nothing inherited but 0-2 and the descriptors in keep,
+    SIGALRM armed."""
     os.setsid()
     os.chdir('/')
     zero = os.open(os.devnull, os.O_RDWR)
     os.dup2(zero, 0)
     os.close(zero)
-    os.closerange(3, 1024)
+    start = 3
+    for fd in sorted(keep):
+        os.closerange(start, fd)
+        start = fd + 1
+    os.closerange(start, 1024)
     signal.alarm(alarm_seconds)
 
 
@@ -606,15 +668,19 @@ def run_installed(argv, config_path=None, chain_anchor='/'):
     never passes them, so in a real run the path is the constant and nothing from argv or the environment moves it."""
     fds = []
     try:
-        plan = validate_installed(argv, config_path or CONFIG_PATH, chain_anchor, fds)
+        return _act(validate_installed(argv, config_path or CONFIG_PATH, chain_anchor, fds))
     except Exception:
         return 2
     finally:
+        # The validated descriptors stay open until the action is over: every later inbox access goes through them.
         for fd in fds:
             try:
                 os.close(fd)
             except OSError:
                 pass
+
+
+def _act(plan):
     try:
         if plan['dry_run']:
             sys.stdout.write(json.dumps(describe(plan), sort_keys=True) + '\n')
@@ -628,11 +694,13 @@ def run_installed(argv, config_path=None, chain_anchor='/'):
         env = installed_env(plan['qa_name'], plan['qa_home'], outbox, codex_home)
         ns = argparse.Namespace(inbox=plan['inbox'], outbox=outbox, codex_home=codex_home, codex_bin=plan['codex'])
         if plan['verb'] == 'stage':
-            return qa_stage(ns, lambda: env)
+            source_fd = open_source_dir(plan['afd'], plan['producer_uid'])
+            return qa_stage(ns, lambda: env, lambda dst: copy_tree_at(source_fd, dst))
         if plan['verb'] == 'exec':
             ns.timeout, ns.profile_sha256 = plan['request']['timeout'], plan['request']['profile_sha256']
-            detach(ns.timeout + ALARM_SLACK)
-            return qa_exec(ns, lambda: env)
+            prompt = open_prompt_at(plan['afd'], plan['producer_uid'])
+            detach(ns.timeout + ALARM_SLACK, keep=(prompt.fileno(),))
+            return qa_exec(ns, lambda: env, lambda: prompt)
         detach(120)
         os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
         request = plan['request']
