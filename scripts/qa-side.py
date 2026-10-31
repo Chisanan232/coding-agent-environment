@@ -463,6 +463,11 @@ def confinement_probe(codex_bin, run_dir, env, manifest=None):
 # producer, the QA side and the producer's manifest helper must agree byte for byte. See docs/QA-PAYLOAD.md.
 # ---------------------------------------------------------------------------------------------------------------------
 PAYLOAD_SCHEMA = 'cae-qa-payload/1'
+PAYLOAD_SCHEMA_2 = 'cae-qa-payload/2'        # adds the endpoint block and the per-self-test needs_endpoint flag; /1 stays valid and means no endpoint
+PAYLOAD_SCHEMAS = (PAYLOAD_SCHEMA, PAYLOAD_SCHEMA_2)
+# The daemon-endpoint run mode is built in slices. Until the slice that starts the endpoint lands this stays False, and a /2 manifest that
+# names an endpoint is refused where payloads are accepted (prepare, run, stage) instead of being run without it.
+ENDPOINT_RUNS_SUPPORTED = False
 MANIFEST_NAME = 'MANIFEST.json'
 MANIFEST_MAX = 64 << 10
 PAYLOAD_MAX_FILES = 2000
@@ -543,8 +548,9 @@ def parse_manifest(raw):
         doc = json.loads(raw.decode('utf-8'), object_pairs_hook=_no_duplicate_keys)
     except (ValueError, RecursionError):
         raise PayloadError('MANIFEST.json is not UTF-8 JSON without duplicate keys')
-    _exact(doc, ('schema', 'files', 'selftests', 'scope', 'producer_run'), 'MANIFEST.json')
-    _check(doc['schema'] == PAYLOAD_SCHEMA, 'MANIFEST.json schema is not %s' % PAYLOAD_SCHEMA)
+    _check(isinstance(doc, dict) and doc.get('schema') in PAYLOAD_SCHEMAS, 'MANIFEST.json schema is not %s' % ' or '.join(PAYLOAD_SCHEMAS))
+    version2 = doc['schema'] == PAYLOAD_SCHEMA_2
+    _exact(doc, ('schema', 'files', 'selftests', 'scope', 'producer_run') + (('endpoint',) if version2 else ()), 'MANIFEST.json')
     files, tests, scope, producer = doc['files'], doc['selftests'], doc['scope'], doc['producer_run']
     _check(isinstance(files, list) and len(files) <= PAYLOAD_MAX_FILES, 'files is not a list of at most %d entries' % PAYLOAD_MAX_FILES)
     paths, kinds, total = [], {}, 0
@@ -569,7 +575,8 @@ def parse_manifest(raw):
     _check(isinstance(tests, list) and len(tests) <= SELFTEST_MAX, 'selftests is not a list of at most %d entries' % SELFTEST_MAX)
     seen_ids, wall = set(), 0
     for test in tests:
-        _exact(test, ('id', 'argv', 'stdin', 'expect_exit', 'expect_stdout_sha256', 'timeout_s', 'max_output_bytes'), 'a selftests entry')
+        _exact(test, ('id', 'argv', 'stdin', 'expect_exit', 'expect_stdout_sha256', 'timeout_s', 'max_output_bytes')
+               + (('needs_endpoint',) if version2 else ()), 'a selftests entry')
         ident = test['id']
         _check(isinstance(ident, str) and TEST_ID_RE.fullmatch(ident) is not None and ident not in seen_ids,
                'selftest id %r is invalid or repeated' % str(ident)[:40])
@@ -591,6 +598,9 @@ def parse_manifest(raw):
         _check(_int(test['timeout_s']) and 1 <= test['timeout_s'] <= 120, 'timeout_s of %s is not 1..120' % ident)
         _check(_int(test['max_output_bytes']) and 1 <= test['max_output_bytes'] <= OUTPUT_CAP, 'max_output_bytes of %s is not 1..1048576' % ident)
         wall += test['timeout_s']
+        if version2:
+            _check(type(test['needs_endpoint']) is bool, 'needs_endpoint of %s is not true or false' % ident)
+            _check(not test['needs_endpoint'] or doc['endpoint'] is not None, 'needs_endpoint of %s needs an endpoint block' % ident)
     _check(wall <= SELFTEST_TOTAL_SECONDS, 'the self-tests may take %d s in total, more than %d' % (wall, SELFTEST_TOTAL_SECONDS))
     _check(isinstance(scope, str) and 0 < len(scope) <= SCOPE_MAX and not unsafe_text(scope),
            'scope is not 1..2048 characters of text')
@@ -598,7 +608,25 @@ def parse_manifest(raw):
            'producer_run is not a list of unique paths')
     for path in producer:
         _check(isinstance(path, str) and kinds.get(path) == 'data', 'producer_run entry %r is not a listed kind=data file' % str(path)[:60])
+    if version2:
+        endpoint = doc['endpoint']
+        if endpoint is not None:
+            _exact(endpoint, ('daemon', 'contract'), 'the endpoint block')
+            _check(isinstance(endpoint['contract'], str) and endpoint['contract'] in ENDPOINT_CONTRACTS, 'the endpoint contract is not one cae knows')
+            _check(isinstance(endpoint['daemon'], str) and kinds.get(endpoint['daemon']) == 'exec', 'the endpoint daemon is not a listed kind=exec file')
+    else:
+        doc['endpoint'] = None                     # a /1 manifest has no endpoint; callers can rely on the key
+        for test in tests:
+            test['needs_endpoint'] = False
     return doc
+
+
+def endpoint_refusal(manifest):
+    """Why a payload cannot be accepted by this build, or None. A manifest that names an endpoint is refused until the endpoint lifecycle
+    exists, so it is never run (or self-tested) without the daemon it describes."""
+    if manifest.get('endpoint') is not None and not ENDPOINT_RUNS_SUPPORTED:
+        return 'the payload names a daemon endpoint, which this build cannot start yet; it was not run'
+    return None
 
 
 def expand_selftest_argv(test, payload_dir):
@@ -896,10 +924,12 @@ def derive_selftest_verdicts(manifest, records):
 def exec_probe_argv(manifest, payload_dir):
     """What the pos_exec_payload control runs inside the sandbox: the first self-test's own expanded argv (the producer's definition
     of a safe invocation), else the first kind=exec file with no arguments. None when the payload has no executable."""
-    if manifest['selftests']:
-        return expand_selftest_argv(manifest['selftests'][0], payload_dir)
+    daemon = (manifest.get('endpoint') or {}).get('daemon')
+    for test in manifest['selftests']:
+        if not test.get('needs_endpoint'):                  # a self-test that needs the endpoint cannot run before it exists
+            return expand_selftest_argv(test, payload_dir)
     for entry in manifest['files']:
-        if entry['kind'] == 'exec':
+        if entry['kind'] == 'exec' and entry['path'] != daemon:       # never start the candidate daemon as a probe
             return [os.path.join(str(payload_dir), entry['path'])]
     return None
 
@@ -992,6 +1022,10 @@ def stage_payload(opened, outbox):
         raw = read_manifest_at(fd, producer)
         record['manifest_sha256'] = manifest_sha256(raw)
         manifest = parse_manifest(raw)
+        refusal = endpoint_refusal(manifest)
+        if refusal:
+            record['problems'] = [refusal]
+            return None, record
         record['problems'] = verify_tree(fd, manifest, raw, producer)
         if record['problems']:
             return None, record
