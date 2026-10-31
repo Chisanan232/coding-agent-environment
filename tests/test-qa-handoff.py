@@ -1624,6 +1624,113 @@ class LaunchdDomainTests(unittest.TestCase):
             self.assertEqual(qa.persistence_problems(self.IDENT), [])
             answers["launchctl:gui"] = (0, "gui/530 = {\n}\n", "")
             self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))
+            answers["launchctl:gui"] = (125, "", "Could not print domain: 125: Domain does not support specified action\n")
+            self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))   # 125 alone is not trusted (see LaunchdGuiAbsentTests)
+            answers["launchctl:gui"] = (1, "", "sudo: a password is required\n")
+            self.assertTrue(any("gui/530" in p for p in qa.persistence_problems(self.IDENT)))
+
+
+class LaunchdGuiAbsentTests(unittest.TestCase):
+    """gui/<uid> passes only in the documented absent forms (SPE-145 part 5). An unknown uid answers 112 "Could not find
+    domain". An existing account without a GUI session answers exit 125, "Domain does not support specified action", nothing
+    on stdout, and is accepted only when the QA user's launchd manager is Background/System and none of its processes is a
+    GUI-session one. The strings are the raw answers captured as the QA user and as root on the real account."""
+    NO_SESSION = "Could not print domain: 125: Domain does not support specified action\n"
+    NOT_FOUND = "Bad request.\nCould not find domain for user gui: 9999\n"
+    IDENT = qa.Identity("qauser", 530, Path("/Users/qauser"), Path("/Users/Shared/qauser-qa"), 0)
+
+    def setUp(self):
+        if os.getuid() == 530:
+            self.skipTest("fixture uid is the running uid")
+
+    def gui_problems(self, gui=(125, "", NO_SESSION), manager=(0, "Background\n", ""), ps=(0, "52266 S\n93967 S\n", ""),
+                     paths=None, timeout_on=None):
+        paths = paths or {52266: "/usr/sbin/distnoted", 93967: "/usr/sbin/cfprefsd"}
+
+        def fake_run(argv, **kwargs):
+            if timeout_on == os.path.basename(argv[4] if argv[0] != qa.PS else argv[0]):
+                raise subprocess.TimeoutExpired(argv, 30)
+            if argv[0] == qa.PS:
+                rc, out, err = ps
+            elif argv[-1] == "managername":
+                rc, out, err = manager
+            else:
+                self.assertEqual(argv[-2:], ["print", "gui/530"])
+                rc, out, err = gui
+            return subprocess.CompletedProcess(argv, rc, out, err)
+        clean = {"crontab": (1, "", "no crontab for qauser\n"), "atq": (0, "", ""), "ls": (1, "", "ls: no such file\n")}
+
+        def run(argv, **kwargs):
+            if argv[0] != qa.PS and os.path.basename(argv[4]) in clean:
+                rc, out, err = clean[os.path.basename(argv[4])]
+                return subprocess.CompletedProcess(argv, rc, out, err)
+            if argv[-1] == "user/530":
+                return subprocess.CompletedProcess(argv, 1, "", "Could not find domain for user: 530\n")
+            return fake_run(argv, **kwargs)
+        with unittest.mock.patch.object(qa.subprocess, "run", run), \
+                unittest.mock.patch.object(qa, "executable_path", lambda pid: paths.get(pid)):
+            return [p for p in qa.persistence_problems(self.IDENT) if "gui/530" in p]
+
+    def test_the_captured_no_session_answer_with_background_helpers_passes(self):
+        self.assertEqual(self.gui_problems(), [])
+
+    def test_a_system_manager_and_an_empty_process_table_pass(self):
+        self.assertEqual(self.gui_problems(manager=(0, "System\n", ""), ps=(1, "", "")), [])
+
+    def test_an_unknown_uid_passes_without_corroboration(self):
+        self.assertEqual(self.gui_problems(gui=(112, "", self.NOT_FOUND), manager=(0, "Aqua\n", "")), [])
+
+    def test_a_printed_domain_is_a_problem(self):
+        self.assertTrue(self.gui_problems(gui=(0, "gui/530 = {\n\ttype = login\n}\n", "")))
+
+    def test_125_with_stdout_is_a_problem(self):
+        self.assertTrue(self.gui_problems(gui=(125, "gui/530 = {\n}\n", self.NO_SESSION)))
+
+    def test_125_with_other_or_no_text_is_a_problem(self):
+        self.assertTrue(self.gui_problems(gui=(125, "", "Could not print domain: 125: something else\n")))
+        self.assertTrue(self.gui_problems(gui=(125, "", "")))
+
+    def test_the_no_session_text_with_another_exit_code_is_a_problem(self):
+        for rc in (0, 1, 113, 126):
+            self.assertTrue(self.gui_problems(gui=(rc, "", self.NO_SESSION)), rc)
+
+    def test_112_with_the_no_session_text_is_a_problem(self):
+        self.assertTrue(self.gui_problems(gui=(112, "", self.NO_SESSION)))
+
+    def test_an_unreadable_domain_is_a_problem(self):
+        self.assertTrue(self.gui_problems(gui=(1, "", "Operation not permitted\n")))
+        self.assertTrue(self.gui_problems(gui=(1, "", "sudo: a password is required\n")))
+
+    def test_an_aqua_or_unreadable_manager_is_a_problem(self):
+        for manager in ((0, "Aqua\n", ""), (0, "", ""), (1, "", "Operation not permitted\n"),
+                        (1, "", "sudo: a password is required\n"), (0, "Background extra\n", "")):
+            self.assertTrue(self.gui_problems(manager=manager), manager)
+
+    def test_a_gui_session_process_is_a_problem(self):
+        for name in ("loginwindow", "WindowServer", "Dock", "Finder"):
+            paths = {52266: "/usr/sbin/distnoted", 93967: "/System/Library/CoreServices/%s" % name}
+            self.assertTrue(self.gui_problems(paths=paths), name)
+
+    def test_an_unreadable_process_table_or_process_is_a_problem(self):
+        self.assertTrue(self.gui_problems(ps=(2, "", "ps: illegal option\n")))
+        self.assertTrue(self.gui_problems(ps=(0, "garbled\n", "")))
+        with unittest.mock.patch.object(qa.os, "kill", return_value=None):
+            self.assertTrue(self.gui_problems(paths={52266: "/usr/sbin/distnoted"}))   # 93967 has no readable executable
+
+    def test_a_timeout_is_a_problem(self):
+        self.assertTrue(self.gui_problems(timeout_on="launchctl"))
+
+    def test_a_timeout_while_corroborating_is_a_problem(self):
+        def raises(argv, **kwargs):
+            if argv[-1] == "managername" or argv[0] == qa.PS:
+                raise subprocess.TimeoutExpired(argv, 30)
+            return subprocess.CompletedProcess(argv, 125, "", self.NO_SESSION)
+        with unittest.mock.patch.object(qa.subprocess, "run", raises):
+            self.assertTrue(qa.no_gui_session_problems(self.IDENT, "gui/530"))
+
+    def test_zombies_and_vanished_processes_are_skipped(self):
+        with unittest.mock.patch.object(qa.os, "kill", side_effect=ProcessLookupError):
+            self.assertEqual(self.gui_problems(ps=(0, "52266 Z\n93967 S\n", ""), paths={}), [])
 
 
 class SiblingFileTests(unittest.TestCase):
