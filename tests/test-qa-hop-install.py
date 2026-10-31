@@ -483,15 +483,29 @@ class RollbackTests(Case):
         self.assertEqual(code, 0, out)
         self.assertFalse(os.path.lexists(self.env.layout.sudoers))
 
-    def test_a_linked_sudoers_directory_is_not_followed_by_the_fallback(self):
+    def test_a_linked_sudoers_directory_is_not_followed_and_the_exit_is_non_zero(self):
         victim = self.env.base / "elsewhere"
         victim.mkdir()
         (victim / "cae-qa").write_text("keep")
         shutil.rmtree(os.path.dirname(self.env.layout.sudoers))
         os.symlink(victim, os.path.dirname(self.env.layout.sudoers))
         code, out = self.env.main("rollback")
-        self.assertEqual(code, 0, out)
-        self.assertEqual((victim / "cae-qa").read_text(), "keep")
+        self.assertEqual(code, 1, out)
+        self.assertEqual((victim / "cae-qa").read_text(), "keep")             # not touched
+        self.assertIn("THE PRODUCER MAY STILL HAVE THE GRANT", out)
+        target = os.path.join(os.path.realpath(victim), "cae-qa")
+        self.assertIn("is a link", out)
+        self.assertIn("sudo rm -f %s" % target, out)
+        self.assertNotIn("being removed at its fixed paths anyway", out)
+
+    def test_a_torn_or_empty_candidate_is_left_with_exit_one_and_the_manual_command(self):
+        self.installed()
+        candidate = os.path.join(os.path.dirname(self.env.layout.sudoers), ".cae-qa.new")
+        Path(candidate).write_text("")
+        code, out = self.env.main("rollback")
+        self.assertEqual(code, 1, out)
+        self.assertTrue(os.path.exists(candidate))
+        self.assertIn("sudo rm -f %s" % candidate, out)
 
     def test_requires_root(self):
         self.installed()
@@ -708,9 +722,14 @@ class RootRunsOnlyTrustedCodeTests(Case):
         repo, head = self.make_repo(link="qa-side.py")
         done = self.flow(repo, head, self.env.base / "copy")
         self.assertIn("REFUSED: the extract holds a link", done.stdout)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(done.stdout.count("\n"), 1, done.stdout)          # nothing after the refusal ran: no hashes were printed
         done = self.flow(repo, head, self.env.base / "full", preload="stale.txt")
         self.assertIn("REFUSED: ", done.stdout)
         self.assertIn("already has content", done.stdout)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(done.stdout.count("\n"), 1, done.stdout)
+        self.assertEqual(sorted(p.name for p in (self.env.base / "full").iterdir()), ["stale.txt"])        # no extraction happened
 
     def test_the_printed_block_has_no_unquoted_expansion(self):
         def unquoted(line):
