@@ -57,8 +57,10 @@ Each test is `codex sandbox -P qa_confined -C <clone> <absolute argv>` as the QA
 with an allowlist environment only: `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME` and `TMPDIR` inside the run directory, and
 `CODEX_HOME` (the profile cannot be found without it); nothing is inherited. The working directory is the run's tmp, there is no
 shell and no network, and a daemon cannot start (binding is denied), so self-tests must be pure command-line checks. Each runs in its
-own session with a file-size limit (RLIMIT_FSIZE: its output cap plus slack, at least 16 MiB, so a flood is cut off by the kernel and not
-only by the timeout), and its process group is killed on completion or timeout. A process that left its session (setsid) is not
+own session with a per-file size limit (RLIMIT_FSIZE: its output cap plus slack, at least 16 MiB, so a single-file flood is cut off by the
+kernel and not only by the timeout; many small files are not limited by it). The limit applies to every file the command writes, so a
+self-test that writes one file larger than 16 MiB (for example a debug build artifact) is killed with SIGXFSZ and recorded as "exited -25,
+expected 0": keep self-tests small. Its process group is killed on completion or timeout. A process that left its session (setsid) is not
 reached by a group kill, so after the payload code has run and **before Codex starts** (or before the seal in a `--no-model` run) the
 QA user is swept; if any process cannot be removed the run is refused as `QA_INCOMPLETE` naming the survivors, with no `LAUNCHED`
 record. The guarantee is therefore group kill plus a sweep before launch, not the group kill alone. Each is recorded with its id, argv, exit status, stdout
