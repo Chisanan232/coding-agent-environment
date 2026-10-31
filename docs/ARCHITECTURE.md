@@ -145,3 +145,4 @@ Rationale: [ADR-0008](adr/0008-repository-rename.md).
 | [0008](adr/0008-repository-rename.md) | Repository rename to `coding-agent-environment` |
 | [0009](adr/0009-bootstrap-mechanism.md) | Bootstrap/apply mechanism: plain scripts, not a config-management tool |
 | [0012](adr/0012-autonomous-permission-governance.md) | Autonomous-first permission governance (Auto Mode `allow`/`ask`/`deny`) |
+| [0017](adr/0017-resource-aware-workload-scheduling.md) | Resource-aware workload scheduling: budget-based admission, cap 1 today, staged concurrency after measurement |
