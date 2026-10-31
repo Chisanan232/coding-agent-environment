@@ -488,7 +488,10 @@ def check_entry(c):
 
 
 def summarize_checks(rollup, required, exempt=frozenset()):
-    """Every named required check must be present and SUCCESS; every other entry must also be SUCCESS.
+    """Every named required check must be present and SUCCESS; every other entry must also be SUCCESS, except that a
+    non-required entry that SKIPPED (a job whose `if:` did not select this event, such as a release job that only runs on
+    tag pushes) is not a blocker: it never ran, and it is not one of the allowlisted checks. A required check that
+    skipped, and every other non-SUCCESS verdict of any check, still blocks.
     A name in `exempt` (verified never executed, covered by local evidence) may have non-SUCCESS entries."""
     seen, bad = {}, []
     for c in rollup:
@@ -499,7 +502,7 @@ def summarize_checks(rollup, required, exempt=frozenset()):
             bad.append(f"required check {name} is missing")
     for name, verdicts in seen.items():
         for v in verdicts:
-            if v != "SUCCESS" and name not in exempt:
+            if v != "SUCCESS" and name not in exempt and not (v == "SKIPPED" and name not in required):
                 bad.append(f"check {name} is {v}")
     return {"total": len(rollup), "required": len(required),
             "success": sum(v == "SUCCESS" for vs in seen.values() for v in vs), "not_success": len(bad)}, bad
