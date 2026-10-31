@@ -332,7 +332,7 @@ class EndpointOps:
     """Every way the lifecycle touches the system, injectable. The defaults are the real thing."""
 
     def __init__(self, popen=None, run=None, sleep=None, monotonic=None, connect=None, listeners=None, killpg=None, rmtree=None,
-                 canary_listener=None, decoy_socket=None, which=None):
+                 canary_listener=None, decoy_socket=None, which=None, leader_exited=None, process_table=None, kill=None):
         self.popen = popen or subprocess.Popen
         self.run = run or self._run
         self.sleep = sleep or time.sleep
@@ -344,6 +344,9 @@ class EndpointOps:
         self.canary_listener = canary_listener or self._canary_listener
         self.decoy_socket = decoy_socket or self._decoy_socket
         self.which = which or (lambda path: os.path.exists(path))
+        self.leader_exited = leader_exited or self._leader_exited
+        self.process_table = process_table or self._process_table
+        self.kill = kill or os.kill
 
     @staticmethod
     def _run(argv, env, timeout):
@@ -358,17 +361,51 @@ class EndpointOps:
             return probe.connect_ex(('127.0.0.1', port))
 
     @staticmethod
-    def _listeners(pid):
-        """TCP listening sockets held by pid as 'address:port' strings, or None when they cannot be listed. lsof, not a guess: the bind
-        scope of a sandbox-exec rule cannot be pinned to 127.0.0.1, so the socket itself is the proof."""
+    def _listeners(port):
+        """[(pid, 'address:port')] for EVERY TCP listener on the port system-wide, or None when they cannot be listed. lsof, not a guess:
+        the bind scope of a sandbox-exec rule cannot be pinned to 127.0.0.1, so the sockets themselves are the proof, and a second
+        listener on the same port from another process shows up here too."""
         try:
-            done = subprocess.run(['/usr/sbin/lsof', '-nP', '-a', '-p', str(pid), '-iTCP', '-sTCP:LISTEN', '-Fn'], capture_output=True, text=True,
+            done = subprocess.run(['/usr/sbin/lsof', '-nP', '-iTCP:%d' % port, '-sTCP:LISTEN', '-Fpn'], capture_output=True, text=True,
                                   timeout=20, cwd='/', stdin=subprocess.DEVNULL, env={'PATH': '/usr/bin:/bin:/usr/sbin'})
         except (OSError, subprocess.SubprocessError):
             return None
         if done.returncode not in (0, 1):
             return None
-        return [line[1:] for line in done.stdout.splitlines() if line.startswith('n')]
+        found, pid = [], None
+        for line in done.stdout.splitlines():
+            if line.startswith('p') and line[1:].isdigit():
+                pid = int(line[1:])
+            elif line.startswith('n') and pid is not None:
+                found.append((pid, line[1:]))
+        return found
+
+    @staticmethod
+    def _leader_exited(proc):
+        """True once the process we started has exited, WITHOUT reaping it: an unreaped child keeps its pid (and so its process group id),
+        which is what makes a later group kill safe from a recycled id."""
+        try:
+            done = subprocess.run(['/bin/ps', '-o', 'stat=', '-p', str(proc.pid)], capture_output=True, text=True, timeout=10, cwd='/',
+                                  stdin=subprocess.DEVNULL, env={'PATH': '/usr/bin:/bin'})
+        except (OSError, subprocess.SubprocessError):
+            return False
+        state = done.stdout.strip()
+        return state == '' or state.startswith('Z')
+
+    @staticmethod
+    def _process_table():
+        """[(pid, ppid, start)] of every process, start being ps's lstart text: pid plus start time identifies a process across a recycled id."""
+        try:
+            done = subprocess.run(['/bin/ps', '-axo', 'pid=,ppid=,lstart='], capture_output=True, text=True, timeout=20, cwd='/',
+                                  stdin=subprocess.DEVNULL, env={'PATH': '/usr/bin:/bin'})
+        except (OSError, subprocess.SubprocessError):
+            return None
+        rows = []
+        for line in done.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+                rows.append((int(parts[0]), int(parts[1]), parts[2].strip()))
+        return rows
 
     @staticmethod
     def _rmtree(path):
@@ -529,65 +566,117 @@ class EndpointLifecycle:
         with open(self.record_dir / 'daemon.log', 'ab') as dlog:
             self.daemon = self._spawn([self.sandbox_exec, '-f', str(self.record_dir / 'daemon.sb'), e.daemon_binary], e.daemon_env(), dlog)
         self.record['daemon_started'] = True
-        self._wait_for(lambda: self.daemon.poll() is None and os.path.exists(e.daemon_sock), DAEMON_START_SECONDS, 'the daemon')
+        self._wait_for(lambda: not self.ops.leader_exited(self.daemon) and os.path.exists(e.daemon_sock), DAEMON_START_SECONDS, 'the daemon')
         self.record['port_proof'] = self.prove_port()
         with open(self.record_dir / 'relay.log', 'ab') as rlog:
             self.relay = self._spawn([self.sandbox_exec, '-f', str(self.record_dir / 'relay.sb'), self.python, '-I', '-c', RELAY_SRC,
                                       str(e.relay_sock), str(e.port)], {'PATH': '/usr/bin:/bin'}, rlog)
         self.record['relay_started'] = True
-        self._wait_for(lambda: self.relay.poll() is None and os.path.exists(e.relay_sock), RELAY_START_SECONDS, 'the relay')
+        self._wait_for(lambda: not self.ops.leader_exited(self.relay) and os.path.exists(e.relay_sock), RELAY_START_SECONDS, 'the relay')
 
     def prove_port(self):
-        """The port is the daemon's, held by exactly its pid, and bound to loopback only. A wildcard or IPv6 listener fails the endpoint:
-        the sandbox rule cannot forbid it, so this is the only control on it."""
-        names = self.ops.listeners(self.daemon.pid)
-        if names is None:
-            raise EndpointFailed('the daemon\'s listening sockets could not be read')
-        want = '127.0.0.1:%d' % self.endpoint.port
-        if names.count(want) != 1 or any(n != want for n in names):
-            raise EndpointFailed('the daemon does not listen on %s only (%d listener%s)' % (want, len(names), '' if len(names) == 1 else 's'))
+        """The port is the daemon's alone and bound to loopback only: EVERY TCP listener on the port, system-wide, must be exactly one, owned
+        by the daemon's pid, at 127.0.0.1. A wildcard or IPv6 listener, a second listener, or one held by another process fails the
+        endpoint. The sandbox rule cannot forbid a wildcard bind, so this is the only control on it, and supervise() repeats it."""
+        found = self.ops.listeners(self.endpoint.port)
+        if found is None:
+            raise EndpointFailed('the listeners on the daemon\'s port could not be read')
+        want = [(self.daemon.pid, '127.0.0.1:%d' % self.endpoint.port)]
+        if found != want:
+            raise EndpointFailed('the port is not held by the daemon on 127.0.0.1 alone (%d listener%s)' % (len(found), '' if len(found) == 1 else 's'))
         if self.ops.connect(self.endpoint.port) != 0:
             raise EndpointFailed('the daemon\'s port does not accept connections')
-        return {'listeners': names, 'daemon_pid': self.daemon.pid}
+        return {'listeners': [name for _, name in found], 'daemon_pid': self.daemon.pid}
 
     def supervise(self):
-        """One poll step for the helper's wait loop: the moment the daemon exits the relay is killed, so another process that takes the freed
-        port never receives QA traffic. Returns False once the daemon is gone."""
-        if self.daemon is not None and self.daemon.poll() is not None:
-            self.record['daemon_exited_early'] = self.daemon.returncode
+        """One poll step for the helper's wait loop. The moment the daemon exits, or the port proof stops holding (a second listener, a
+        wildcard bind, another owner), the relay is killed so nobody else's process receives QA traffic. Returns False then."""
+        if self.daemon is None:
+            return False
+        if self.ops.leader_exited(self.daemon):                 # not poll(): reaping now would lose the process group
+            self.record['daemon_exited_early'] = True
+            self._stop(self.relay, 0)
+            return False
+        try:
+            self.prove_port()
+        except EndpointFailed as error:
+            self.record['port_proof_lost'] = str(error)
+            self.record['problems'].append(str(error))
             self._stop(self.relay, 0)
             return False
         return True
 
     # -- teardown -------------------------------------------------------------------------------------------------------------------------
+    def _descendants(self, procs):
+        """{(pid, start)} of everything below the given processes right now. A process that escaped its parent before this snapshot (setsid,
+        then the parent exited) is not found here; the producer's sweep of the whole QA user after the run is the net for those."""
+        table = self.ops.process_table()
+        if table is None:
+            return None
+        children = {}
+        for pid, ppid, start in table:
+            children.setdefault(ppid, []).append((pid, start))
+        found, todo = set(), [p.pid for p in procs if p is not None]
+        while todo:
+            for child in children.get(todo.pop(), []):
+                if child not in found:
+                    found.add(child)
+                    todo.append(child[0])
+        return found
+
     def _stop(self, proc, grace):
-        if proc is None:
+        """SIGTERM the group, give it `grace` seconds, then SIGKILL the group BEFORE the leader is reaped (an unreaped leader keeps its pid, so
+        the group id cannot have been recycled), and only then reap. A process that was already reaped is never signalled."""
+        if proc is None or proc.returncode is not None:
             return
-        for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 2)):
-            try:
-                self.ops.killpg(proc.pid, sig)
-            except (OSError, ProcessLookupError):
-                pass
-            try:
-                proc.wait(timeout=wait)
-                break
-            except subprocess.TimeoutExpired:
-                continue
         try:
-            self.ops.killpg(proc.pid, signal.SIGKILL)           # stragglers in the process's own group
+            self.ops.killpg(proc.pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
             pass
+        end = self.ops.monotonic() + grace
+        while not self.ops.leader_exited(proc) and self.ops.monotonic() < end:
+            self.ops.sleep(0.1)
+        try:
+            self.ops.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def _reap_stragglers(self, before):
+        """Anything that was below the daemon or relay at the start of teardown and still exists with the same start time is killed by pid;
+        the result is what teardown reports. None when the process table could not be read."""
+        if before is None:
+            return None
+        table = self.ops.process_table()
+        if table is None:
+            return None
+        alive = {(pid, start) for pid, _, start in table}
+        left = sorted(before & alive)
+        for pid, start in left:
+            try:
+                self.ops.kill(pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        again = self.ops.process_table()
+        return [pid for pid, _ in sorted(before & {(pid, start) for pid, _, start in (again or [])})] if left else []
 
     def teardown(self):
-        """Relay first, then daemon, then verify: the port refuses, both sockets are gone (unlinked here if the daemon left one, and
-        said so), the endpoint directory is removed. Safe to call twice and after a failed start."""
+        """Relay first, then daemon, then verify: both stopped, nothing that descended from either is left, the port refuses, both sockets
+        are gone (unlinked here if the daemon left one, and said so), the endpoint directory is removed. Safe to call twice and after a failed
+        start."""
         e = self.endpoint
-        steps = {'relay_stopped': False, 'daemon_stopped': False, 'port_closed': False, 'socket_removed_by_helper': [], 'sockets_gone': False,
-                 'dir_removed': False}
+        steps = {'relay_stopped': False, 'daemon_stopped': False, 'descendants_left': [], 'port_closed': False, 'socket_removed_by_helper': [],
+                 'sockets_gone': False, 'dir_removed': False}
+        before = self._descendants([self.relay, self.daemon]) if (self.relay is not None or self.daemon is not None) else set()
         self._stop(self.relay, RELAY_GRACE_SECONDS)
         steps['relay_stopped'] = self.relay is None or self.relay.poll() is not None
         self._stop(self.daemon, DAEMON_GRACE_SECONDS)
         steps['daemon_stopped'] = self.daemon is None or self.daemon.poll() is not None
+        left = self._reap_stragglers(before)
+        steps['descendants_left'] = left if left is not None else ['unknown']
         for close in self._closers:
             try:
                 close()
@@ -609,7 +698,8 @@ class EndpointLifecycle:
             except (OSError, EndpointFailed):
                 pass
         steps['dir_removed'] = not os.path.lexists(e.dir)
-        steps['clean'] = all(steps[k] for k in ('relay_stopped', 'daemon_stopped', 'port_closed', 'sockets_gone', 'dir_removed'))
+        steps['clean'] = (all(steps[k] for k in ('relay_stopped', 'daemon_stopped', 'port_closed', 'sockets_gone', 'dir_removed'))
+                          and steps['descendants_left'] == [])
         self.record['teardown'] = steps
         return steps
 
