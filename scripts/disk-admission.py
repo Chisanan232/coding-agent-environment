@@ -1774,6 +1774,7 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
     except OSError as exc:
         return refuse('state-unwritable: %s' % exc)
     _measure(state_path, 'claim', _free_or_none(free_fn), now)
+    apply_grant_env(budget, declared)
     try:
         exec_fn(argv[0], argv)
     except OSError as exc:
@@ -2113,6 +2114,49 @@ def budget_decision(host, reservations, request, caps):
     return out
 
 
+# Banded per-job caps (SPE-150 PR6). The one place the budget touches a job: a declared Cargo class gets its granted jobs and test
+# threads exported to the child, only from a budget with status ok. Admission itself (lane cap, floor, grant order) is untouched.
+# Which variables a class exports is "what the class says": build classes cap Cargo and libtest; the workspace classes also cap
+# nextest. Classes without an entry (light, remote, container-suite) export nothing, and so do legacy runs (no class).
+GRANT_ENV = {
+    'build-crate': ('CARGO_BUILD_JOBS', ('RUST_TEST_THREADS',)),
+    'build-workspace': ('CARGO_BUILD_JOBS', ('RUST_TEST_THREADS', 'NEXTEST_TEST_THREADS')),
+    'build-cold-isolated': ('CARGO_BUILD_JOBS', ('RUST_TEST_THREADS', 'NEXTEST_TEST_THREADS')),
+}
+
+
+def _lowered(existing, grant):
+    """min(existing explicit setting, grant); an unset, non-numeric or non-positive existing value yields the grant."""
+    try:
+        value = int(existing)
+    except (TypeError, ValueError):
+        return grant
+    return min(value, grant) if value > 0 else grant
+
+
+def grant_env(budget, declared, environ):
+    """{variable: value} to export to a job. Empty unless a Cargo class was declared and the budget is status ok with a positive
+    grant (RED grants none; an unavailable budget changes nothing). Never raises a variable the job already set above the grant."""
+    spec = GRANT_ENV.get((declared or {}).get('class'))
+    if not spec or not budget or budget.get('status') != 'ok':
+        return {}
+    out = {}
+    jobs, threads = budget.get('granted_jobs'), budget.get('granted_test_threads')
+    if type(jobs) is int and jobs > 0:
+        out[spec[0]] = str(_lowered(environ.get(spec[0]), jobs))
+    if type(threads) is int and threads > 0:
+        out.update({name: str(_lowered(environ.get(name), threads)) for name in spec[1]})
+    return out
+
+
+def apply_grant_env(budget, declared):
+    """Export the grant into this process's environment, which the exec'd job inherits. Never raises."""
+    try:
+        os.environ.update(grant_env(budget, declared, os.environ))
+    except Exception:
+        pass
+
+
 def budget_line(budget):
     """One human line; always carries the shadow note."""
     if budget.get('status') != 'ok':
@@ -2414,6 +2458,7 @@ def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, tt
         print(result['reason'], file=sys.stderr)  # never injected into a captured job stderr
         if result.get('budget'):
             print(budget_line(result['budget']), file=sys.stderr)
+    apply_grant_env(result.get('budget'), declared)
     try:
         exec_fn(argv[0], argv)
     except OSError as exc:
