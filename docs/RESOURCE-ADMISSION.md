@@ -345,10 +345,13 @@ the budget arithmetic above. The verdict's other fields are unchanged.
 
 ### Distinct `CARGO_TARGET_DIR` per workload (policy for gates)
 
-Cargo serialises on the target directory's build lock and two builds sharing one directory invalidate each other's artifacts, so a
-shared target is a hidden second resource that the lane cap and the memory budget do not see. Every gate or build that may run
-beside another workload must set its own `CARGO_TARGET_DIR` (for example a per-label directory under the job's scratch space,
-class `build-cold-isolated`), and must not rely on a shared `build.target-dir` in `~/.cargo/config.toml`. The admission record's
+Cargo serialises on the target directory's build lock, and concurrent builds with different flags or features can rebuild each
+other's artifacts, so a shared target is a hidden second resource that the lane cap and the memory budget do not see. Every gate or
+build that really runs beside another workload must set its own `CARGO_TARGET_DIR` (for example a per-label directory under the job's
+scratch space, class `build-cold-isolated`), and must not rely on a shared `build.target-dir` in `~/.cargo/config.toml` for that
+case. The home `~/.cargo/config.toml` deliberately shares one target to bound disk use (per-worktree and per-ticket targets caused
+the measured disk incidents), so a distinct target is a byte reservation too: size it in the admission record and delete it with the
+workload. Serial builds keep the shared target. The admission record's
 `cargo-target:<path>` exclusion key is how a future enforcing change refuses two live workloads that share a directory; today it is
 recorded and reported by the shadow budget only. The key resolution limits are listed under "Declared workload classes".
 
