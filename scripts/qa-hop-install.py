@@ -290,6 +290,33 @@ def visudo_check(layout, ops, path):
     return code == 0 and 'parsed OK' in out, out
 
 
+def copy_flow(names=BUNDLE_NAMES):
+    """The owner's copy-and-verify block, printed by `plan` and quoted verbatim in docs/QA-HANDOFF.md (a test keeps them equal).
+    Variables, every expansion double-quoted (paths with spaces; zsh-safe), a new empty directory, git objects instead of the
+    working tree, a refusal of links/directories/extras before chown or chmod touch anything, and hashing after the copy."""
+    scripts = ' '.join('scripts/' + n for n in names)
+    stems, ordered = ' '.join(n[:-3] for n in names), ' '.join(n[:-3] for n in sorted(names))
+    return [
+        '# 1. Set REPO (your checkout) and H (the full commit id you reviewed) once; D is fixed.',
+        "REPO='<REPO>'; H='<REVIEWED_HEAD>'; D=%s" % INSTALL_COPY,
+        '# 2. A new or empty directory only; stop if any step prints REFUSED.',
+        'sudo install -d -m 755 -o root -g wheel "${D}" && test -z "$(sudo ls -A "${D}")" || '
+        '{ echo "REFUSED: ${D} already has content; move it aside"; false; }',
+        '# 3. Extract from git objects of the reviewed commit, never from the working tree.',
+        'git -C "${REPO}" archive "${H}" %s | sudo tar -x -o -C "${D}" --strip-components=1' % scripts,
+        '# 4. Refuse a link, directory or extra file BEFORE any chown or chmod could follow it.',
+        'test -z "$(sudo find "${D}" -mindepth 1 ! -type f)" && test "$(sudo find "${D}" -type f | wc -l | tr -d \' \')" = %d || '
+        '{ echo "REFUSED: the extract holds a link, a directory or an unexpected file"; false; }' % len(names),
+        '# 5. Root-own the copy (-h: never follow a link).',
+        'sudo chown -R -h root:wheel "${D}" && sudo chmod 755 "${D}" && sudo chmod -h 644 "${D}"/*.py',
+        '# 6. Hash the copy AFTER the copy; each pair of lines must be identical.',
+        'for f in %s; do shasum -a 256 "${D}/${f}.py"; git -C "${REPO}" show "${H}:scripts/${f}.py" | shasum -a 256; done' % stems,
+        '# 7. Rebuild the combined bundle digest from the git objects (sha256 of the sorted "name sha256" lines); it must equal the',
+        '#    combined digest printed by plan. git rev-parse blob ids are SHA-1: informational only, never the pin.',
+        'for f in %s; do printf \'%%s %%s\\n\' "${f}.py" "$(git -C "${REPO}" show "${H}:scripts/${f}.py" | shasum -a 256 | cut -d\' \' -f1)"; '
+        'done | shasum -a 256' % ordered]
+
+
 def plan_text(inputs, layout, ops, args_line, bundle):
     files, dropin, _, config = planned(inputs, layout, bundle)
     import tempfile
@@ -315,19 +342,11 @@ def plan_text(inputs, layout, ops, args_line, bundle):
         'Config %s:' % layout.config] + ['  ' + l for l in config.decode().splitlines()] + [
         '', 'Sudoers drop-in %s (visudo -c -f on this exact text, unprivileged: %s):' % (layout.sudoers, 'parsed OK' if ok else 'NOT VERIFIED')]
     lines += ['  ' + l for l in dropin.splitlines()]
-    scripts = ' '.join('scripts/' + n for n in BUNDLE_NAMES)
     lines += ['', 'Root must run a root-owned copy of the four scripts, never the checkout, and that copy must come from GIT OBJECTS of the',
               'commit you reviewed, not from a working tree (this plan was computed by the checkout\'s own code, which proves nothing about',
-              'itself). Set REPO to your checkout and use <REVIEWED_HEAD>, the full commit id you reviewed:',
-              '  sudo install -d -m 755 -o root -g wheel %s' % INSTALL_COPY,
-              '  git -C <REPO> archive <REVIEWED_HEAD> %s | sudo tar -x -o -C %s --strip-components=1' % (scripts, INSTALL_COPY),
-              '  sudo chown -R root:wheel %s && sudo chmod 755 %s && sudo chmod 644 %s/*.py' % (INSTALL_COPY, INSTALL_COPY, INSTALL_COPY),
-              'Then hash the files AFTER the copy and compare each with the reviewed objects (the two columns must match):',
-              '  for f in %s; do' % ' '.join(n[:-3] for n in BUNDLE_NAMES),
-              '    shasum -a 256 %s/$f.py; git -C <REPO> show <REVIEWED_HEAD>:scripts/$f.py | shasum -a 256; done' % INSTALL_COPY,
-              'Reproduce the combined bundle digest above from the reviewed objects (sha256 of the sorted lines "name sha256"):',
-              '  for f in %s; do printf \'%%s %%s\\n\' $f.py "$(git -C <REPO> show <REVIEWED_HEAD>:scripts/$f.py | shasum -a 256 | cut -d\' \' -f1)"; done | shasum -a 256' % ' '.join(n[:-3] for n in sorted(BUNDLE_NAMES)),
-              '  (the ids from `git -C <REPO> rev-parse <REVIEWED_HEAD>:scripts/<file>` are git SHA-1 blob ids: informational only, never the pin)',
+              'itself). Run this block line by line in your shell, with REPO and H set on its first line:'] + [
+        '  ' + l for l in copy_flow()] + [
+              '  (the ids from `git -C "${REPO}" rev-parse "${H}:scripts/<file>"` are git SHA-1 blob ids: informational only, never the pin)',
               'Only if every pair matches and the combined digest equals the one printed above, run the one command that then needs root',
               '(your own sudo; it never asks for or stores a password):',
               '  sudo /usr/bin/python3 -I -B %s apply %s %s' % (copy, args_line, pins), '',
@@ -523,6 +542,17 @@ def grant_paths(layout):
     return [real, os.path.join(os.path.dirname(real), '.cae-qa.new')], None
 
 
+def is_ours_dropin(path):
+    """True only for a regular file (never a link) whose first line is the marker our renderer writes."""
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 64 << 10:
+            return False
+        return read_regular(path, 64 << 10).decode('utf-8', 'replace').split('\n', 1)[0] == HEAD
+    except (OSError, Stop):
+        return False
+
+
 def rollback(layout, ops, say):
     """Remove the grant first, then the files. Never raises before trying everything: a failure to remove is collected, printed
     with the exact manual command, and makes the exit non-zero."""
@@ -539,6 +569,11 @@ def rollback(layout, ops, say):
         st = os.lstat(path)
         if stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode):
             say('%s is a directory, not one of our files; refusing to remove it' % path)
+            failed.append(path)
+            continue
+        if path in grant and not is_ours_dropin(path):
+            say('WARNING: %s is not a regular file carrying this installer\'s first-line marker, so it was NOT removed (it may be '
+                'someone else\'s, and if it grants anything it is still active). Inspect it, then remove it by hand if it is yours.' % path)
             failed.append(path)
             continue
         try:
