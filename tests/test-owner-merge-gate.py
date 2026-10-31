@@ -620,6 +620,28 @@ class BillingCI(unittest.TestCase):
         self.assertEqual(facts["ci_unavailable_checks"][0]["conclusion"], "FAILURE")
         self.assertTrue(facts["ci_verdict"].startswith("NOT_A_CI_PASS"))
 
+    def test_unstable_merge_state_is_explained_only_by_a_fully_waived_billing_failure(self):
+        v, reasons, facts = self.verdict([self.job("1", "t"), self.job("2", "lint", "SUCCESS")], {"1": [self.TEXT]}, mergeStateStatus="UNSTABLE")
+        self.assertEqual((v, reasons), ("PASS", []))
+        self.assertIn("UNSTABLE", facts["merge_state"])
+        self.assertTrue(facts["ci_verdict"].startswith("NOT_A_CI_PASS"))
+
+    def test_unstable_still_refuses_without_the_waiver_or_with_other_states(self):
+        # no billing record: the failed check keeps CI_FAILED and UNSTABLE stays a reason
+        v, reasons, _ = run(self.fake([self.job("1", "t")], {"1": [self.TEXT]}, record="no record", mergeStateStatus="UNSTABLE"), ci_unavailable=True)
+        self.assertEqual(v, "REFUSE")
+        self.assertTrue(any(r.startswith("MERGE_STATE_NOT_CLEAN") for r in reasons), reasons)
+        # a real step failure is not waived, so UNSTABLE is not explained
+        v, reasons, _ = self.verdict([self.job("1", "t")], {"1": ["Process completed with exit code 1."]},
+                                     steps={"1": [{"conclusion": "failure"}]}, mergeStateStatus="UNSTABLE")
+        self.assertEqual(v, "REFUSE")
+        self.assertTrue(any(r.startswith("CI_FAILED") for r in reasons) and any(r.startswith("MERGE_STATE_NOT_CLEAN") for r in reasons), reasons)
+        # BLOCKED and BEHIND-type states are never explained by the waiver
+        for state in ("BLOCKED", "DIRTY"):
+            with self.subTest(state=state):
+                v, reasons, _ = self.verdict([self.job("1", "t")], {"1": [self.TEXT]}, mergeStateStatus=state)
+                self.assertEqual(v, "REFUSE", reasons)
+
     def test_skipped_only_steps_count_as_not_executed(self):
         v, _, _ = self.verdict([self.job("1", "t")], {"1": [self.TEXT]}, steps={"1": [{"conclusion": "skipped"}]})
         self.assertEqual(v, "PASS")
