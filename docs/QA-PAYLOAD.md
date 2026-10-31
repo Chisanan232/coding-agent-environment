@@ -57,10 +57,21 @@ Each test is `codex sandbox -P qa_confined -C <clone> <absolute argv>` as the QA
 with an allowlist environment only: `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME` and `TMPDIR` inside the run directory, and
 `CODEX_HOME` (the profile cannot be found without it); nothing is inherited. The working directory is the run's tmp, there is no
 shell and no network, and a daemon cannot start (binding is denied), so self-tests must be pure command-line checks. Each runs in its
-own session and the whole process group is killed on completion or timeout. Each is recorded with its id, argv, exit status, stdout
+own session with a file-size limit (RLIMIT_FSIZE: its output cap plus slack, at least 16 MiB, so a flood is cut off by the kernel and not
+only by the timeout), and its process group is killed on completion or timeout. A process that left its session (setsid) is not
+reached by a group kill, so after the payload code has run and **before Codex starts** (or before the seal in a `--no-model` run) the
+QA user is swept; if any process cannot be removed the run is refused as `QA_INCOMPLETE` naming the survivors, with no `LAUNCHED`
+record. The guarantee is therefore group kill plus a sweep before launch, not the group kill alone. Each is recorded with its id, argv, exit status, stdout
 and stderr SHA-256, elapsed time and verdict in `SELFTEST.json`. Pass or fail is **recomputed by the producer** from the manifest it
-holds, never taken from what the QA side reports. Any mismatch, timeout, oversize output or test that could not run fails the gate:
+holds and the raw observations (exit status, stdout hash, sizes) in the QA side's stage record; the QA side's own `ok` is never used.
+The observations themselves come from the QA side: they are trusted because no model has run yet and the payload is hash-bound, and
+the independent proof of the payload is the producer's re-hash of `outbox/payload` at the seal. Any mismatch, timeout, oversize output or test that could not run fails the gate:
 Codex is not launched, no `LAUNCHED` record is written, and the result is `QA_INCOMPLETE` naming the test id and the reason.
+
+Further manifest rules: duplicate keys anywhere in the JSON are refused; two paths that differ only by letter case are refused (a
+case-insensitive volume would merge them); and control characters, Unicode format/bidi characters, line and paragraph separators,
+surrogates, private-use and unassigned code points are refused in paths, `producer_run` entries and `scope`. Labels are sanitized again
+before they reach a RESULT.
 
 ## Order of proof (nothing of yours runs on an unproved profile)
 
@@ -73,6 +84,14 @@ Codex is not launched, no `LAUNCHED` record is written, and the result is `QA_IN
 
 A denial counts only when it is EPERM or EACCES. A timeout, an unreachable network or a "path too long" proves nothing and fails the
 control. A profile that opens the network fails the probe; the profile is never widened to make a control pass.
+
+## A changed base control set (read before upgrading)
+
+The three network controls (loopback bind, UNIX-socket bind, TEST-NET-1 connect) are part of the **base** set for every run, payload
+or not. A record from an older helper that lacks them is refused, so the helper must be reinstalled for `--unattended` runs; and a host
+whose network stack answers a TEST-NET connect with something other than an immediate EPERM or EACCES (for example ENETUNREACH) now
+fails closed. How these three controls behave on real macOS under the real profile is unverified until an owner run. What stays
+unchanged when no payload is given is the packet, `MODE.json`, the prompt, `RUNMETA.json` and `RESULT.json` content and keys.
 
 ## Staging, sealing and `--no-model`
 

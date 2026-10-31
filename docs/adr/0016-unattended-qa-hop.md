@@ -252,19 +252,27 @@ profile and exercised by model-free self-tests under the real profile before Cod
 verb, request key or sudoers shape**: `stage` discovers `inbox/<attempt>/payload` through the validated attempt descriptor, copies it
 file by file (descriptor-relative, no link, producer-owned, single link, exact modes by `kind`, manifest verified before and after),
 adds it to the profile, runs the controls and then the self-tests, and reports both in its one JSON record. The producer derives the
-required control set from the manifest it holds and recomputes every self-test verdict itself.
+required control set from the manifest it holds and recomputes every self-test verdict from the manifest and the QA side's raw
+observations (exit status, stdout hash). Those observations come from the QA side and are trusted because no model has run yet and the
+payload is hash-bound; the independent proof of the payload itself is the seal's re-hash.
 
 **Ordering rule.** Producer-supplied code runs under the sandbox only on a profile that has just been proved. The base controls
 (including the loopback bind, UNIX-socket bind and TEST-NET-1 connect that prove the network is off) and the non-executing payload
 control `neg_write_payload` run first; `pos_exec_payload` and every self-test run only if all of them ran and passed, otherwise they
-are recorded `NOT RUN`. Payload processes use the self-test allowlist environment, start in their own session and have their whole
-process group killed on completion or timeout; the seal's sweep still must report zero QA-user processes.
+are recorded `NOT RUN`. Payload processes use the self-test allowlist environment, start in their own session with a file-size limit and have their
+process group killed on completion or timeout. A process that leaves its session is not reached by that, so the producer sweeps the QA
+user after the payload code ran and before the exec hop (or the seal, for `--no-model`) and refuses the run, with no `LAUNCHED`, if
+anything remains: the guarantee is group kill plus a sweep before launch, and the seal's sweep must still report zero QA-user processes.
 
 **Seal and result.** The producer re-hashes `outbox/payload` through the opened outbox descriptor and binds the manifest digest in
 the packet, `MODE.json`, `RUNMETA.json` (the digest is not written into `events.jsonl`, which is Codex's own hashed stream) and
 `RESULT.json`, which also carries the producer's scope text, the `PRODUCER-RUN` labels and the statement that the probe covers only
 offline, library-level checks. `--no-model` runs everything up to and including the seal and sweep and stops with `QA_INCOMPLETE`
 marked `no_model`.
+
+**Changed base control set.** The loopback bind, UNIX-socket bind and TEST-NET connect controls are in the base set of every run, so an older
+helper's probe record (without them) is rejected and the helper must be reinstalled for unattended runs; a host that answers the TEST-NET
+connect with anything but an immediate EPERM or EACCES fails closed. Their real macOS behaviour is unverified until an owner run.
 
 Because `qa-side.py` changed, its SHA-256, and therefore `HELPERHEX` in the drop-in, changes: the owner reinstalls. The command
 shapes do not change.

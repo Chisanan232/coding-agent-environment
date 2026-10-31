@@ -157,7 +157,10 @@ the packet, and a run copies it into the QA outbox, mounts it read-only and exec
 UNIX-socket bind and a TEST-NET connect that must be refused), and runs the producer's self-tests under the real profile before Codex
 starts; a failed self-test is `QA_INCOMPLETE` and Codex is never launched. `--no-model` stops after that gate, the seal and the sweep
 and can never be a pass. The probe and self-tests cover only offline, library-level checks; daemon-level and end-to-end results are
-producer-run and are not independently reproduced, and RESULT says so. Format, rules and a worked example: [QA-PAYLOAD.md](QA-PAYLOAD.md).
+producer-run and are not independently reproduced, and RESULT says so. Note that the base confinement control set itself grew for every
+run (loopback bind, UNIX-socket bind, TEST-NET connect): an older helper's record is rejected, `--unattended` needs the helper reinstalled,
+and a host that does not answer the TEST-NET connect with an immediate EPERM or EACCES fails closed; real macOS behaviour of these three
+controls is unverified until an owner run. Format, rules and a worked example: [QA-PAYLOAD.md](QA-PAYLOAD.md).
 
 **Installing the delegation (a root-owned copy, then one root command).** `scripts/qa-hop-install.py` is the installer of ADR 0016.
 `plan` is read-only and unprivileged; it prints the exact text below with your values filled in, runs `visudo -c -f` on the
