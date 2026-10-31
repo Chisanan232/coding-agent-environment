@@ -297,24 +297,30 @@ def copy_flow(names=BUNDLE_NAMES):
     scripts = ' '.join('scripts/' + n for n in names)
     stems, ordered = ' '.join(n[:-3] for n in names), ' '.join(n[:-3] for n in sorted(names))
     return [
-        '# 1. Set REPO (your checkout) and H (the full commit id you reviewed) once; D is fixed.',
+        '# Paste the whole block: it runs in a subshell and stops at the first failure or REFUSED. Set REPO (your checkout) and H',
+        '# (the full commit id you reviewed) on the first line; D is fixed.',
+        '(',
+        'set -e',
         "REPO='<REPO>'; H='<REVIEWED_HEAD>'; D=%s" % INSTALL_COPY,
-        '# 2. A new or empty directory only; stop if any step prints REFUSED.',
-        'sudo install -d -m 755 -o root -g wheel "${D}" && test -z "$(sudo ls -A "${D}")" || '
-        '{ echo "REFUSED: ${D} already has content; move it aside"; false; }',
-        '# 3. Extract from git objects of the reviewed commit, never from the working tree.',
+        '# 1. A new or empty directory only.',
+        'sudo install -d -m 755 -o root -g wheel "${D}"',
+        'test -z "$(sudo ls -A "${D}")" || { echo "REFUSED: ${D} already has content; move it aside"; exit 1; }',
+        '# 2. Extract from git objects of the reviewed commit, never from the working tree.',
         'git -C "${REPO}" archive "${H}" %s | sudo tar -x -o -C "${D}" --strip-components=1' % scripts,
-        '# 4. Refuse a link, directory or extra file BEFORE any chown or chmod could follow it.',
-        'test -z "$(sudo find "${D}" -mindepth 1 ! -type f)" && test "$(sudo find "${D}" -type f | wc -l | tr -d \' \')" = %d || '
-        '{ echo "REFUSED: the extract holds a link, a directory or an unexpected file"; false; }' % len(names),
-        '# 5. Root-own the copy (-h: never follow a link).',
-        'sudo chown -R -h root:wheel "${D}" && sudo chmod 755 "${D}" && sudo chmod -h 644 "${D}"/*.py',
-        '# 6. Hash the copy AFTER the copy; each pair of lines must be identical.',
+        '# 3. Refuse a link, directory or extra file BEFORE any chown or chmod could follow it.',
+        'test -z "$(sudo find "${D}" -mindepth 1 ! -type f)" || { echo "REFUSED: the extract holds a link, a directory or an unexpected file"; exit 1; }',
+        'test "$(sudo find "${D}" -type f | wc -l | tr -d \' \')" = %d || { echo "REFUSED: the extract is not exactly %d files"; exit 1; }' % (len(names), len(names)),
+        '# 4. Root-own the copy (-h: never follow a link).',
+        'sudo chown -R -h root:wheel "${D}"',
+        'sudo chmod 755 "${D}"',
+        'sudo chmod -h 644 "${D}"/*.py',
+        '# 5. Hash the copy AFTER the copy; each pair of lines must be identical.',
         'for f in %s; do shasum -a 256 "${D}/${f}.py"; git -C "${REPO}" show "${H}:scripts/${f}.py" | shasum -a 256; done' % stems,
-        '# 7. Rebuild the combined bundle digest from the git objects (sha256 of the sorted "name sha256" lines); it must equal the',
+        '# 6. Rebuild the combined bundle digest from the git objects (sha256 of the sorted "name sha256" lines); it must equal the',
         '#    combined digest printed by plan. git rev-parse blob ids are SHA-1: informational only, never the pin.',
         'for f in %s; do printf \'%%s %%s\\n\' "${f}.py" "$(git -C "${REPO}" show "${H}:scripts/${f}.py" | shasum -a 256 | cut -d\' \' -f1)"; '
-        'done | shasum -a 256' % ordered]
+        'done | shasum -a 256' % ordered,
+        ')']
 
 
 def plan_text(inputs, layout, ops, args_line, bundle):
@@ -534,7 +540,7 @@ def grant_paths(layout):
     except Stop as error:
         directory = os.path.dirname(layout.sudoers)
         if os.path.islink(directory):
-            return [], '%s (the directory is a link, so nothing was touched there)' % error
+            return [], 'LINK'
         real = os.path.join(directory, os.path.basename(layout.sudoers))
         return [real, os.path.join(directory, '.cae-qa.new')], str(error)
     if real is None:
@@ -559,7 +565,13 @@ def rollback(layout, ops, say):
     need_root(layout, ops)
     removed, failed = [], []
     grant, warning = grant_paths(layout)
-    if warning:
+    if warning == 'LINK':
+        directory = os.path.dirname(layout.sudoers)
+        target = os.path.join(os.path.realpath(directory), os.path.basename(layout.sudoers))
+        say('THE PRODUCER MAY STILL HAVE THE GRANT: %s is a link, so nothing was touched there; remove %s manually with: sudo rm -f %s '
+            '(inspect the link target first)' % (directory, target, target))
+        failed.append(target)
+    elif warning:
         say('WARNING: %s. The drop-in is being removed at its fixed paths anyway; inspect %s afterwards.' % (
             warning, os.path.dirname(layout.sudoers)))
     for path in (*grant, layout.helper, layout.config, layout.codex,
