@@ -210,13 +210,13 @@ def _workloads(rows, loose):
             members.append(cur)
             stack.extend(children.get(cur, []))
         root = rows[pid]
-        out.append({"root_pid": pid, "root_comm": root["comm"], "procs": len(members),
+        out.append({"root_pid": pid, "root_comm": root["comm"], "procs": len(members), "ancestors": sorted(seen - {pid}),
                     "rss_bytes": sum(rows[m]["rss"] or 0 for m in members),
                     "cpu_s": sum(rows[m]["cpu"] or 0.0 for m in members),
                     "idle": root["ppid"] == 1 and all(rows[m]["quiet"] for m in members),
                     "member_cpu": {m: rows[m]["cpu"] for m in members}})
     for base in loose:   # an unparsed heavy line has no tree: one active workload each
-        out.append({"root_pid": None, "root_comm": base, "procs": 1, "rss_bytes": 0, "cpu_s": 0.0, "idle": False, "member_cpu": {}})
+        out.append({"root_pid": None, "root_comm": base, "procs": 1, "ancestors": [], "rss_bytes": 0, "cpu_s": 0.0, "idle": False, "member_cpu": {}})
     return out
 
 
@@ -373,6 +373,41 @@ def swap_cannot_grow(m):
     return sw["used"] / sw["total"] >= SWAP_FULL_FRACTION and sw["free"] < SWAP_LOW_FREE and m["disk_free"] < SWAP_GROWTH_DISK_FLOOR
 
 
+# Mirrors HEAVY_LANES for the stable and wide disk tiers in disk-admission.py (a test pins the equality). Lane occupancy below is
+# judged against this cap from the workloads actually running, owned or not, instead of from "any heavy process exists".
+HEAVY_LANE_CAP = 1
+
+
+def lane_occupancy(m, owned=None):
+    """Reservation-aware lane accounting. Every running (non-idle) heavy workload tree occupies one lane. A tree is OWNED when an
+    admitted reservation's pid, or a pid recorded in its workload, is the tree's root, a member or an ancestor of its root (the
+    wrapper that exec'd the job); otherwise it is UNMANAGED. Pure and read-only: `owned` is a list of
+    {"label","pid","members","mem_bytes","class"} the caller read from the reservations."""
+    trees = []
+    for w in m.get("heavy_workloads") or []:
+        if w["idle"]:
+            continue
+        pids = ({w["root_pid"]} | set(w.get("member_cpu") or {}) | set(w.get("ancestors") or [])) - {None}
+        hit = next((o for o in owned or [] if o["pid"] in pids or pids & set(o.get("members") or [])), None)
+        trees.append({"comm": w["root_comm"], "procs": w["procs"], "rss_bytes": w["rss_bytes"],
+                      "label": hit["label"] if hit else None, "class": hit.get("class") if hit else None,
+                      "est_mem_bytes": hit.get("mem_bytes") if hit else None})
+    return {"cap": HEAVY_LANE_CAP, "in_use": len(trees), "workloads": trees}
+
+
+def lane_budget_text(occ):
+    """The numbers behind a lane veto: lanes used of the cap, resident memory, and which tree is reserved or unmanaged."""
+    parts = []
+    for t in occ["workloads"]:
+        if t["label"]:
+            est = f", est {t['est_mem_bytes'] / GIB:.1f} GiB" if t["est_mem_bytes"] else ", legacy: no estimate"
+            parts.append(f"reserved {t['label']} ({t['comm']}, {t['rss_bytes'] / GIB:.1f} GiB resident{est})")
+        else:
+            parts.append(f"unmanaged {t['comm']} ({t['rss_bytes'] / GIB:.1f} GiB resident, no reservation accounts for it)")
+    resident = sum(t["rss_bytes"] for t in occ["workloads"]) / GIB
+    return f"lane budget: {occ['in_use']} of {occ['cap']} heavy lane(s) in use, {resident:.1f} GiB resident: " + "; ".join(parts)
+
+
 def refusal_reasons(weight, m):
     """Reasons memory alone would refuse `weight` work right now (ENTER thresholds)."""
     r, unknown = [], []
@@ -406,9 +441,11 @@ def refusal_reasons(weight, m):
             unknown.append("process list unreadable")
         elif m.get("heavy_workloads"):   # an empty list with heavy-named processes present falls to the name count below: fail closed
             running = [w for w in m["heavy_workloads"] if not w["idle"]]
-            if running:
+            occ = lane_occupancy(m, m.get("owned"))
+            if running and occ["in_use"] >= occ["cap"]:
                 detail = "; ".join(f"{w['root_comm']}: {w['procs']} procs, {w['rss_bytes'] / GIB:.1f} GiB" for w in running)
-                r.append(f"{len(running)} heavy build workload(s) running ({detail}): one heavy lane at a time")
+                r.append(f"{len(running)} heavy build workload(s) running ({detail}): one heavy lane at a time "
+                         f"[{lane_budget_text(occ)}]")
         elif procs:
             names = ", ".join(f"{k} x{v}" for k, v in sorted(procs.items()))
             r.append(f"another heavy build/test process is running ({names}): one heavy lane at a time")
@@ -556,6 +593,29 @@ def disk_gate(weight, run=subprocess.run):
     return r.returncode == 0, (msg[0] if msg else f"disk gate rc={r.returncode}")[:200]
 
 
+def read_owned(state_path):
+    """Admitted reservations as {"label","pid","members","mem_bytes","class"}, read-only and never raising. They live next to this
+    tool's state dir (`<cache>/admission/reservations`); an unreadable or absent directory means none are known, which only makes
+    a running tree look unmanaged (the veto at cap 1 is the same either way)."""
+    try:
+        from importlib.util import module_from_spec, spec_from_file_location
+        spec = spec_from_file_location("disk_admission_readonly", HERE / "disk-admission.py")
+        disk = module_from_spec(spec)
+        spec.loader.exec_module(disk)
+        directory = pathlib.Path(state_path).parent.parent / "admission" / "reservations"
+        owned = []
+        for path in sorted(directory.glob("*.json")):
+            try:
+                rec = disk._read_reservation(path)
+            except (OSError, ValueError):
+                continue
+            owned.append({"label": rec["label"], "pid": rec["pid"], "class": rec.get("class"), "mem_bytes": rec.get("mem_bytes"),
+                          "members": [x["pid"] for x in (rec.get("workload") or {}).get("members", [])]})
+        return owned
+    except Exception:
+        return []
+
+
 # ---- CLI -------------------------------------------------------------------------------------------------------------
 def assess(weight, window, state_path, memory_only, deps):
     s1 = deps["sample"]()
@@ -563,6 +623,7 @@ def assess(weight, window, state_path, memory_only, deps):
     s2 = deps["sample"]()
     m = derive(s1, s2)
     if weight == "heavy":
+        m["owned"] = deps["owned"](state_path) if deps.get("owned") else read_owned(state_path)
         try:
             with deps["lock"](state_path):
                 state, problem = load_state(state_path)
