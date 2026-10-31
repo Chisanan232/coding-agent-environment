@@ -986,6 +986,126 @@ class SharedPartsTests(unittest.TestCase):
         self.assertEqual((args.codex_bin, args.timeout), ("codex", 1800))
 
 
+class EndpointProfileTests(unittest.TestCase):
+    """Pure generators for the daemon-endpoint mode (SPE-145 PR-b1). Nothing starts a process; the real behaviour of these profiles is
+    measured by the model-free demo as the QA user, and a uid-501 spike recorded in the PR."""
+    HOME = "/Users/qa"
+    EX = "/Users/Shared/qa-qa"
+    PAY = "/Users/Shared/qa-qa/outbox/att-1/payload"
+
+    def endpoint(self, **over):
+        args = dict(qa_home=self.HOME, exchange=self.EX, attempt="att-1", port=23456, contract="fornax-daemon/1",
+                    payload_dir=self.PAY, daemon_binary=self.PAY + "/bin/daemon")
+        args.update(over)
+        return side.Endpoint(**args)
+
+    def test_none_mode_is_unchanged_and_has_no_endpoint_text(self):
+        text = side.profile_toml(Path("/Users/Shared/qa-qa/outbox/att-1"), [], home=self.HOME, codex_home=self.HOME + "/.codex")
+        self.assertIn("[permissions.qa_confined.network]\nenabled = false\n", text)
+        for banned in ("unix_sockets", "[features]", "network_proxy", "allow_local_binding", "mode ="):
+            self.assertNotIn(banned, text)
+        self.assertIn('"/Users/qa/.codex" = "deny"', text)
+        self.assertIn('"/Users/qa/.ssh" = "deny"', text)
+        self.assertEqual(text, side.profile_toml(Path("/Users/Shared/qa-qa/outbox/att-1"), [], home=self.HOME, codex_home=self.HOME + "/.codex",
+                                                 endpoint=None))
+
+    def test_endpoint_mode_allows_exactly_two_sockets_and_no_tcp(self):
+        e = self.endpoint()
+        text = side.profile_toml(Path("/Users/Shared/qa-qa/outbox/att-1"), [], home=self.HOME, codex_home=self.HOME + "/.codex", endpoint=e)
+        self.assertIn("[features]\nnetwork_proxy = true\n", text)
+        self.assertIn('enabled = true\nmode = "limited"\nallow_local_binding = false\nenable_socks5 = false\n', text)
+        table = text.split("[permissions.qa_confined.network.unix_sockets]\n")[1].strip().splitlines()
+        self.assertEqual(table, ['"%s" = "allow"' % e.daemon_sock, '"%s" = "allow"' % e.relay_sock])
+        for banned in ("domains", "allow_upstream_proxy", "dangerously", "allow_local_binding = true", "proxy_url", "mitm"):
+            self.assertNotIn(banned, text)
+        self.assertIn('"%s" = "read"' % e.state, text)                 # state readable to tool commands, never writable
+        self.assertNotIn('"%s" = "write"' % e.state, text)
+        self.assertNotIn(str(e.rl) + '" = "', text.split("[permissions.qa_confined.network]")[0].replace(str(e.state), ""))
+        self.assertNotIn(str(e.port), text)                           # the TCP port never appears in what tool commands can read
+
+    def test_endpoint_paths_are_short_derived_and_inside_the_qa_home(self):
+        e = self.endpoint()
+        self.assertEqual(e.dir.parent, Path(self.HOME) / "e")
+        self.assertRegex(e.dir.name, r"^[0-9a-f]{12}$")
+        self.assertEqual(self.endpoint().dir, e.dir)                    # both hops derive the same path
+        self.assertNotEqual(self.endpoint(attempt="att-2").dir, e.dir)
+        for sock in (e.daemon_sock, e.relay_sock):
+            self.assertLess(len(str(sock).encode()), side.SUN_PATH_LIMIT)
+        self.assertEqual(e.daemon_sock.name, "fornax.sock")
+
+    def test_bad_parameters_are_refused(self):
+        for over in ({"port": 0}, {"port": 19999}, {"port": 32768}, {"port": True}, {"port": "23456"}, {"port": None},
+                     {"contract": "other/1"}, {"contract": None},
+                     {"qa_home": "/Users/qa dir"}, {"qa_home": '/Users/q"a'}, {"qa_home": "/Users/qa\\x"}, {"qa_home": "/Users/qa/../x"},
+                     {"qa_home": "relative/home"}, {"qa_home": "/"}, {"exchange": "/Users/Shared//qa-qa"}, {"exchange": "/Users/qa)(allow default"},
+                     {"payload_dir": self.PAY + "\n(allow default)"}, {"daemon_binary": "/usr/bin/true"},
+                     {"daemon_binary": self.PAY + "/../../x"}, {"qa_home": "/Users/" + "q" * 80}):
+            with self.assertRaises(side.EndpointError, msg=str(over)):
+                self.endpoint(**over)
+
+    def test_daemon_profile_denies_before_it_allows_and_writes_only_its_state_and_tmp(self):
+        e = self.endpoint()
+        sb = side.daemon_sb(e)
+        lines = sb.splitlines()
+        self.assertEqual(lines[:3], ["(version 1)", "(allow default)", "(deny network*)"])
+        for name in side.MACH_DENY:
+            self.assertIn('(global-name "%s")' % name, sb)
+        self.assertIn('(allow network-bind (local ip "localhost:23456"))', lines)
+        self.assertIn('(allow network-inbound (local ip "localhost:23456"))', lines)
+        self.assertIn('(allow network-bind (local unix-socket (subpath "%s")))' % e.state, lines)
+        deny = next(i for i, l in enumerate(lines) if l.startswith("(deny file-read*"))
+        allow = next(i for i, l in enumerate(lines) if l.startswith("(allow file-read* "))
+        self.assertLess(deny, allow)                                    # SBPL: the later rule wins, so the re-allow must come last
+        self.assertIn('(subpath "/Users")', lines[deny])
+        self.assertIn('(subpath "%s")' % self.HOME, lines[deny])
+        self.assertIn('(subpath "%s")' % self.EX, lines[deny])
+        self.assertEqual(lines[allow], '(allow file-read* (subpath "%s") (subpath "%s"))' % (e.dir, self.PAY))
+        meta = next(l for l in lines if l.startswith("(allow file-read-metadata"))
+        for anc in ("/Users", self.HOME, self.HOME + "/e", "/Users/Shared", self.EX, self.EX + "/outbox", self.EX + "/outbox/att-1"):
+            self.assertIn('(literal "%s")' % anc, meta)
+        self.assertNotIn("subpath", meta)                               # metadata only on the literal ancestors: no listing, no content
+        self.assertIn("(deny file-write*)", lines)
+        writes = next(l for l in lines if l.startswith("(allow file-write*"))
+        self.assertEqual(writes, '(allow file-write* (subpath "%s") (subpath "%s") (literal "/dev/null") (literal "/dev/dtracehelper"))' % (e.state, e.tmp))
+        self.assertLess(lines.index("(deny file-write*)"), lines.index(writes))
+        self.assertNotIn("network-outbound", sb)
+
+    def test_relay_profile_reaches_one_port_and_writes_only_its_socket_directory(self):
+        e = self.endpoint()
+        lines = side.relay_sb(e).splitlines()
+        self.assertEqual(lines[:3], ["(version 1)", "(allow default)", "(deny network*)"])
+        self.assertIn('(allow network-outbound (remote ip "localhost:23456"))', lines)
+        self.assertEqual([l for l in lines if "network-outbound" in l], ['(allow network-outbound (remote ip "localhost:23456"))'])
+        self.assertIn('(allow network-bind (local unix-socket (subpath "%s")))' % e.rl, lines)
+        self.assertEqual(next(l for l in lines if l.startswith("(allow file-write*")), '(allow file-write* (subpath "%s") (literal "/dev/null"))' % e.rl)
+        self.assertEqual(next(l for l in lines if l.startswith("(allow file-read* ")), '(allow file-read* (subpath "%s"))' % e.dir)
+        self.assertNotIn(self.PAY, "\n".join(lines))                    # the relay never needs the payload
+
+    def test_relay_source_is_fixed_and_forwards_to_loopback_only(self):
+        self.assertIn("open_connection('127.0.0.1', PORT)", side.RELAY_SRC)
+        self.assertEqual(side.RELAY_SRC.count("open_connection"), 1)
+        self.assertNotIn("sys.argv[3]", side.RELAY_SRC)
+        compile(side.RELAY_SRC, "relay", "exec")
+
+    def test_digests_follow_the_text_and_the_environment_is_exact(self):
+        e, other = self.endpoint(), self.endpoint(port=23457)
+        d = side.endpoint_digests(e)
+        self.assertEqual(set(d), {"daemon_profile_sha256", "relay_profile_sha256", "relay_source_sha256"})
+        self.assertEqual(d["daemon_profile_sha256"], hashlib.sha256(side.daemon_sb(e).encode()).hexdigest())
+        self.assertNotEqual(side.endpoint_digests(other)["daemon_profile_sha256"], d["daemon_profile_sha256"])
+        self.assertEqual(e.daemon_env(), {"PATH": "/usr/bin:/bin", "FORNAX_HOME": str(e.state), "FORNAX_HTTP_PORT": "23456", "TMPDIR": str(e.tmp)})
+        self.assertEqual(set(e.tool_env()), {"QA_ENDPOINT_STATE", "QA_ENDPOINT_SOCK", "QA_ENDPOINT_HTTP_SOCK"})
+        self.assertNotIn("23456", "".join(e.tool_env().values()))
+
+    def test_ancestors_are_outermost_first_and_unique(self):
+        e = self.endpoint()
+        got = e.ancestors(e.dir, self.PAY)
+        self.assertEqual(got[0], "/Users")
+        self.assertEqual(len(got), len(set(got)))
+        self.assertNotIn("/", got)
+        self.assertNotIn(str(e.dir), got)
+
+
 class NetworkControlTests(unittest.TestCase):
     NET = ("neg_loopback_bind", "neg_uds_bind", "neg_testnet_connect", "neg_testnet6_connect", "neg_udp_testnet", "neg_resolver_socket")
 
