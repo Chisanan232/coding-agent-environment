@@ -420,6 +420,45 @@ class RollbackTests(Case):
         self.assertEqual(code, 0)
         self.assertIn("nothing (already rolled back)", out)
 
+    def test_an_untrusted_sudoers_directory_cannot_block_removing_the_grant(self):
+        self.installed()
+        sudoers_dir = os.path.dirname(self.env.layout.sudoers)
+        os.chmod(sudoers_dir, 0o777)                          # group/other writable: strict resolution would refuse
+        with self.assertRaises(inst.Stop):
+            inst.sudoers_real(self.env.layout)
+        code, out = self.env.main("rollback")
+        self.assertEqual(code, 0, out)
+        self.assertIn("WARNING", out)
+        self.assertIn("not trustworthy", out)
+        self.assertFalse(os.path.lexists(self.env.layout.sudoers))
+        self.assertFalse(os.path.lexists(self.env.layout.helper))
+
+    def test_an_unremovable_grant_is_reported_with_the_manual_command_and_a_non_zero_exit(self):
+        self.installed()
+        os.chmod(os.path.dirname(self.env.layout.sudoers), 0o777)
+        real_unlink = os.unlink
+
+        def deny(path, *a, **k):
+            if os.path.basename(str(path)) == "cae-qa":
+                raise PermissionError(1, "denied")
+            return real_unlink(path, *a, **k)
+        with mock.patch("os.unlink", side_effect=deny):
+            code, out = self.env.main("rollback")
+        self.assertEqual(code, 1)
+        self.assertIn("STILL HAS THE GRANT", out)
+        self.assertIn("sudo rm -f %s" % self.env.layout.sudoers, out)
+        self.assertFalse(os.path.lexists(self.env.layout.helper))          # the rest was still removed
+
+    def test_a_linked_sudoers_directory_is_not_followed_by_the_fallback(self):
+        victim = self.env.base / "elsewhere"
+        victim.mkdir()
+        (victim / "cae-qa").write_text("keep")
+        shutil.rmtree(os.path.dirname(self.env.layout.sudoers))
+        os.symlink(victim, os.path.dirname(self.env.layout.sudoers))
+        code, out = self.env.main("rollback")
+        self.assertEqual(code, 0, out)
+        self.assertEqual((victim / "cae-qa").read_text(), "keep")
+
     def test_requires_root(self):
         self.installed()
         self.env.euid = ME + 1
@@ -449,6 +488,37 @@ class RollbackTests(Case):
         code, out = self.env.main("rollback")
         self.assertEqual(code, 1)
         self.assertFalse(os.path.lexists(self.env.layout.sudoers))          # the grant was already gone before the refusal
+
+
+class SmallFindingsTests(Case):
+    def test_64_bit_fat_mach_o_magics_are_accepted_and_others_refused(self):
+        for magic in (b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca", b"\xca\xfe\xba\xbe", b"\xcf\xfa\xed\xfe"):
+            self.env.source.write_bytes(magic + b"payload" * 20)
+            digest = hashlib.sha256(self.env.source.read_bytes()).hexdigest()
+            code, out = self.env.main("plan", codex_sha256=digest)
+            self.assertEqual(code, 0, (magic, out))
+        self.env.source.write_bytes(b"#!/bin/sh\n" + b"x" * 40)
+        code, out = self.env.main("plan", codex_sha256=hashlib.sha256(self.env.source.read_bytes()).hexdigest())
+        self.assertEqual(code, 1)
+        self.assertIn("not a Mach-O", out)
+
+    def test_the_read_back_candidate_is_compared_as_exact_bytes(self):
+        real = inst.read_regular
+
+        def altered(path, *a, **k):
+            data = real(path, *a, **k)
+            return data.replace(b"\n", b"\r\n") if str(path).endswith(".cae-qa.new") else data
+        with mock.patch.object(inst, "read_regular", altered):
+            code, out = self.env.main("apply")
+        self.assertEqual(code, 1)
+        self.assertIn("written bytes differ", out)
+        self.assertFalse(os.path.lexists(self.env.layout.sudoers))
+        self.assertEqual(os.listdir(os.path.dirname(self.env.layout.sudoers)), [])
+
+    def test_the_smoke_test_changes_directory_first(self):
+        code, out = self.env.main("plan")
+        self.assertIn("cd / && sudo -u fornaxqa", out)
+        self.assertIn("cd / && sudo -u NAME /Library/cae-qa/codex --version", (SCRIPTS.parent / "docs/QA-HANDOFF.md").read_text())
 
 
 class RootRunsOnlyTrustedCodeTests(Case):
@@ -555,10 +625,37 @@ class RootRunsOnlyTrustedCodeTests(Case):
             self.assertIn(digest, out)
         lines = "".join("%s %s\n" % (n, bundle.sha[n]) for n in sorted(bundle.sha))
         self.assertEqual(bundle.combined, hashlib.sha256(lines.encode()).hexdigest())
-        for needle in ("sudo install -d -m 755 -o root -g wheel /Library/cae-qa-install", "sudo install -m 644 -o root -g wheel",
+        for needle in ("sudo install -d -m 755 -o root -g wheel /Library/cae-qa-install", "git -C <REPO> archive <REVIEWED_HEAD>",
+                       "sudo tar -x -o -C /Library/cae-qa-install --strip-components=1", "sudo chown -R root:wheel /Library/cae-qa-install",
+                       "AFTER the copy", "git -C <REPO> show <REVIEWED_HEAD>:scripts/$f.py | shasum -a 256", "SHA-1 blob ids: informational only",
+                       "cd / && sudo -u fornaxqa",
                        "sudo /usr/bin/python3 -I -B /Library/cae-qa-install/qa-hop-install.py apply", "--bundle-sha256 " + bundle.combined,
                        "--helper-sha256 " + bundle.helper_sha, "--version", "Unverified until the owner pilot", "Mach-O"):
             self.assertIn(needle, out)
+
+    def test_the_printed_git_flow_reproduces_the_pins_from_objects(self):
+        """Run the printed archive-extract and combined-digest commands (minus sudo) against a scratch git repo of the scripts."""
+        repo = self.env.base / "repo"
+        (repo / "scripts").mkdir(parents=True)
+        for name in inst.BUNDLE_NAMES:
+            shutil.copy(self.env.install / name, repo / "scripts" / name)
+        git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
+        subprocess.run(git + ["init", "-q"], check=True)
+        subprocess.run(git + ["add", "-A"], check=True)
+        subprocess.run(git + ["commit", "-q", "-m", "x"], check=True)
+        head = subprocess.run(git + ["rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        code, out = self.env.main("plan")
+        lines = out.splitlines()
+        archive = next(l for l in lines if "archive <REVIEWED_HEAD>" in l)
+        combined = next(l for l in lines if "printf" in l)
+        target = self.env.base / "copy"
+        target.mkdir()
+        fill = lambda text: text.replace("<REPO>", str(repo)).replace("<REVIEWED_HEAD>", head)
+        run = lambda text: subprocess.run(["/bin/sh", "-c", text], check=True, capture_output=True, text=True).stdout
+        run(fill(archive.strip()).replace("sudo tar -x -o -C /Library/cae-qa-install", "tar -x -o -C %s" % target))
+        for name in inst.BUNDLE_NAMES:
+            self.assertEqual((target / name).read_bytes(), (self.env.install / name).read_bytes())
+        self.assertEqual(run(fill(combined.strip())).split()[0], inst.Bundle(self.env.install).combined)
 
     def test_bytecode_is_never_written(self):
         self.assertTrue(sys.dont_write_bytecode)
