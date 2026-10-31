@@ -146,44 +146,67 @@ until jobs share a stable label or class.
 
 A lane belongs to a **workload**, not to the wrapper process that reserved it. A wrapper that exited (even one nobody reaped,
 a zombie) proves nothing about the work it started: that work can outlive it through `setsid`, a double fork or plain
-reparenting to launchd. The wrapper's death is therefore never, by itself, a release.
+reparenting to launchd. The wrapper's death is therefore never, by itself, a release, and neither is an empty-looking process
+table: **absence of evidence is not evidence of exit**.
 
-What is recorded. At reserve and claim time, and again every time a reservation is inspected while its wrapper is still
-alive (every reserve, claim, queue advance and the 60-second snapshot refresher), the reservation stores a bounded workload
-identity: the wrapper's process group when it leads one (`pgid == pid`) and up to 256 descendant `pid` + start-token pairs
-(the wrapper's process subtree, their subtrees, and live members of the wrapper's own group). Only `pid`, `ppid`, `pgid`,
-`stat` and `lstart` are read from `ps`, never a command line. The record is kept on the queue entry's holder as well, so it
-survives an explicit `release` of a job that is still running.
+What is recorded. At reserve and claim time (a zombie pid is refused there as `process-not-running`), and again every time a
+reservation is inspected while its wrapper is still running (every reserve, claim, queue advance and the 60-second snapshot
+refresher), the reservation stores a bounded workload identity: the wrapper's process group when it leads one (`pgid == pid`),
+up to 256 descendant `pid` + start-token pairs (the wrapper's process subtree, their subtrees, and live members of the
+wrapper's own group), and a **witness count**, the number of inspections that found the wrapper running after the capture.
+Only `pid`, `ppid`, `pgid`, `stat` and `lstart` are read from `ps`, never a command line. A same-label re-reserve merges the
+stored members into the new capture, so a member reparented since is not forgotten. The record is mirrored on the queue
+entry's holder and refreshed there even after an explicit `release` removed the reservation file of a still-running job.
+Records with an implausible shape (a leader whose group is not its own pid, pids at or below 1, booleans as numbers) are
+rejected as `reservation-unreadable` problems: left on disk, never trusted, never deleted.
 
 Decision per holder (`holder_status`):
 
 | Situation | State | Lane and bytes |
 |---|---|---|
-| Wrapper is the same running process (start token matches, not a zombie) | alive | kept |
+| Wrapper is the same running process (start token matches, not a zombie); witness count goes up | alive | kept |
 | Wrapper gone, a zombie, or its pid reused, and a recorded member still runs (start token matches, not a zombie) | **unresolved** | kept, reason reported |
 | Holder or process table cannot be inspected (`ps` error, unparseable table) | **unresolved** | kept, reported as a problem (refuses admission) |
-| Wrapper is an unreaped zombie and its workload was never recorded, or more than 256 descendants were seen | **unresolved** | kept |
-| Wrapper gone or zombie and every recorded identity is gone | exited | released |
+| More than 256 descendants were seen | **unresolved** | kept |
+| Wrapper gone or zombie, nothing recorded runs, but **no inspection ever saw the wrapper running** (witness count 0) | **unresolved** (`workload-not-witnessed`) | kept |
+| Wrapper gone or zombie, every recorded identity gone, and the wrapper was witnessed running at least once | exited | released |
 | Record written before this change (no workload): wrapper token mismatch or absent | exited | released |
 
+The exit rule, precisely. A lane is released automatically only when (1) the wrapper is gone, a zombie or a reused pid,
+(2) every recorded identity (members and the wrapper's own group) is gone, (3) the record is not truncated, and (4) at least
+one inspection saw the wrapper running after the capture. Condition (4) is the cheapest honest positive evidence available: it
+means the workload was looked at while it existed, so its descendants had a chance to be recorded. It also means the
+following. A job that runs across at least one snapshot cycle (the refresher runs every 60 s) and exits normally is released
+on the next inspection. A job that ends **before its first inspection** (shorter than the gap to the next refresher run,
+reserve-and-exit, or a wrapper that spawns detached work and ends before anyone looks) stays `unresolved` and keeps its lane
+until the owner releases it. That is a deliberate starvation trade-off: a short job whose owner never runs `release` blocks the
+lane (and its queue) rather than risk freeing a lane under hidden detached work. Wrappers should run `release --label` (or
+`queue release --id`) when their job ends.
+
 `unresolved` is a reported state, never a silent one: `live_reservations` returns it as `unresolved` on the record, lane-cap
-refusals print `UNRESOLVED: <reason>`, and the snapshot lists `reservation-unresolved: <label> ...` in `blockers`. Release
-happens only on positive evidence (all recorded identities gone, or an explicit `release` by the owner). The time limit is not
-evidence: a past-TTL holder keeps its lane exactly as before, marked `past_ttl`. A reused pid never counts as the wrapper or as
-a member, because every comparison includes the start token; a group is attributed to the wrapper only while the group's leader
-pid is still the recorded wrapper or already gone. Queue grants are unchanged: FIFO, non-preemptive, one grant at a time, and
-the lane counts are untouched. A grant-time resource check, where one exists, is defense in depth and is never used to certify
-that a previous workload ended.
+refusals print `UNRESOLVED: <reason>`, and the snapshot lists `reservation-unresolved: <label> ...` in `blockers`. The time
+limit is not evidence: a past-TTL holder keeps its lane exactly as before, marked `past_ttl`. A reused pid never counts as the
+wrapper or as a member, because every comparison includes the start token; a group is attributed to the wrapper only while the
+group's leader pid is still the recorded wrapper or already gone. Queue grants are unchanged: FIFO, non-preemptive, one grant at
+a time, and the lane counts are untouched. A grant-time resource check, where one exists, is defense in depth and is never used
+to certify that a previous workload ended.
+
+Owner escape hatches (neither signals anything). `disk-admission.py release --label L` deletes the reservation file of a direct
+reservation. For a claimed queue entry, plain `release` deliberately does **not** free the lane (any same-user caller could
+otherwise free a running job): use `disk-admission.py queue release --id qNNNNNN [--session-id S]`. It is refused while the
+holder's wrapper is still running, for another user's entry, or for another session when one is given; otherwise it removes the
+entry's reservation, marks the entry `RELEASED` with evidence `owner-release` (recording what the state was) and leaves the next
+`queue advance` to grant the first waiter in order.
 
 Known limits (not guaranteed):
 
 - Detached work is found only if it was seen while linked to the workload. Work that left the wrapper's process tree and group
-  (`setsid`, or a double fork) **before any inspection ran** after it started is invisible, and so is work launched in that
-  window after the last refresh. There is no polling; inspections happen when a queue-aware command or the snapshot refresher
-  runs. Where the wrapper does not lead its own group, group co-members are not attributed to it.
+  (`setsid`, or a double fork) and was started **after the last inspection that saw the wrapper running** is invisible once the
+  wrapper ends: the witness requirement closes this only for a wrapper that was never inspected, not for the interval between
+  the last inspection and its exit (up to one refresher period). There is no polling beyond the refresher.
+- Where the wrapper does not lead its own group, group co-members are not attributed to it.
 - The session id (`sess`) is deliberately not used: on macOS it is a kernel pointer, and a shared terminal session would pin
   lanes to unrelated shells. Working-directory or target-dir ownership is not used either (it needs `lsof`).
 - More than 256 descendants make the record non-exhaustive and the holder unresolved once the recorded ones end; the owner
   releases it explicitly.
-- An unresolved reservation is cleared only by the workload ending or by the owner's explicit `release`. Nothing here signals,
-  kills or deletes another session's process or state.
+- An unresolved reservation is cleared only by the workload ending (with the witness) or by the owner's explicit release.

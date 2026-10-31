@@ -501,6 +501,48 @@ sys.stdin.read()
 """
 
 
+LATE = r"""
+import os, sys, time
+out = sys.argv[1]
+print('ready', flush=True)
+sys.stdin.readline()
+pid = os.fork()
+if pid == 0:
+    os.close(0)
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    open(out + '.%d' % os.getpid(), 'w').write('up')
+    time.sleep(120)
+    os._exit(0)
+os.waitpid(pid, 0)
+deadline = time.time() + 10
+while not [n for n in os.listdir(os.path.dirname(out)) if n.startswith(os.path.basename(out) + '.')] and time.time() < deadline:
+    time.sleep(0.02)
+print('spawned', flush=True)
+"""
+
+CHAIN = r"""
+import os, sys, time
+out = sys.argv[1]
+pid = os.fork()
+if pid == 0:
+    os.close(0)
+    os.setsid()
+    if os.fork() == 0:
+        open(out + '.%d' % os.getpid(), 'w').write('up')
+        time.sleep(120)
+        os._exit(0)
+    time.sleep(1.5)                       # the middle process leaves: the grandchild is reparented to launchd
+    os._exit(0)
+deadline = time.time() + 10
+while not [n for n in os.listdir(os.path.dirname(out)) if n.startswith(os.path.basename(out) + '.')] and time.time() < deadline:
+    time.sleep(0.02)
+print('ready', flush=True)
+sys.stdin.read()
+"""
+
+
 class Workloads(unittest.TestCase):
     """Real processes: the lane follows the whole workload, never the wrapper alone (SPE-111)."""
 
@@ -651,7 +693,7 @@ class Workloads(unittest.TestCase):
         child = subprocess.Popen(['/bin/sleep', '120'], process_group=impostor.pid)
         self.procs.append(child)
         token = da.process_token(impostor.pid)
-        workload = {'pgid': impostor.pid, 'leader': True, 'members': [], 'observed': True, 'truncated': False}
+        workload = {'pgid': impostor.pid, 'leader': True, 'members': [], 'observed': True, 'truncated': False, 'refreshes': 1}
         with da.state_lock(self.path):
             da.write_reservation(self.path, 'job-impostor', 10 * GIB, impostor.pid, 'Mon Jan  1 00:00:00 2001',
                                  self.now + timedelta(hours=1), workload=workload)
@@ -704,7 +746,7 @@ class Workloads(unittest.TestCase):
             da.write_reservation(self.path, 'job-unobserved', 10 * GIB, proc.pid, token, self.now + timedelta(hours=1), workload=blind)
         self.finish_wrapper(proc)
         live, _ = self.live()
-        self.assertIn('workload-never-observed', live[0]['unresolved'])
+        self.assertIn('workload-not-witnessed', live[0]['unresolved'])
 
     def test_unresolved_holder_blocks_admission_and_is_reported_in_the_snapshot(self):
         proc = self.wrapper('setsid')
@@ -716,6 +758,90 @@ class Workloads(unittest.TestCase):
         record = da.snapshot(self.path, lambda: (400 * GIB, 'test'), now=self.now)
         self.assertTrue(any(b.startswith('reservation-unresolved: job-blocking') for b in record['blockers']), record['blockers'])
         self.assertEqual(record['reserved_bytes'], 10 * GIB)
+
+    def popen(self, code):
+        proc = subprocess.Popen([sys.executable, '-c', code, str(self.root / 'mark')], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, start_new_session=True)
+        self.procs.append(proc)
+        self.assertEqual(proc.stdout.readline().strip(), b'ready')
+        return proc
+
+    def test_detached_work_started_after_the_last_inspection_is_not_declared_free(self):
+        # Reviewer E1: the wrapper is idle at reserve, then double-forks setsid work and exits with no inspection between.
+        proc = self.popen(LATE)
+        file = self.path.parent / 'reservations/job-late.json'
+        self.assertTrue(da.reserve('job-late', 10 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now)['admit'])
+        proc.stdin.write(b'go\n')
+        proc.stdin.flush()
+        self.assertEqual(proc.stdout.readline().strip(), b'spawned')
+        self.wait_zombie(proc.pid)
+        live, _ = self.live()
+        self.assertEqual(len(live), 1)
+        self.assertIn('workload-not-witnessed', live[0]['unresolved'])
+        proc.wait()                                         # reaped as well: still not proof
+        live, _ = self.live()
+        self.assertEqual(len(live), 1)
+        for pid in self.survivors():
+            os.kill(pid, 9)
+            self.wait_gone(pid)
+        self.assertEqual(len(self.live()[0]), 1)            # nothing can certify the end; only the owner can
+        self.assertTrue(file.exists())
+        self.assertTrue(da.release('job-late', self.path)['admit'])
+        self.assertEqual(self.live(), ([], []))
+
+    def test_job_that_ended_before_any_inspection_stays_unresolved_until_released(self):
+        proc = self.wrapper('plain', count=0)
+        self.assertTrue(da.reserve('job-short', 10 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now)['admit'])
+        proc.stdin.close()
+        proc.wait()
+        live, _ = self.live()
+        self.assertIn('workload-not-witnessed', live[0]['unresolved'])
+
+    def test_reserve_again_keeps_members_that_were_reparented_since(self):
+        proc = self.popen(CHAIN)
+        file = self.hold('job-chain', proc)
+        members = lambda: json.loads(file.read_text())['workload']['members']
+        grandchild = self.survivors()[0]
+        ppid = lambda: subprocess.run(['/bin/ps', '-o', 'ppid=', '-p', str(grandchild)], capture_output=True, text=True).stdout.strip()
+        deadline = time.monotonic() + 8
+        while ppid() != '1' and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(ppid(), '1')                       # reparented while the wrapper is alive
+        self.assertIn(grandchild, [m['pid'] for m in members()])
+        again = da.reserve('job-chain', 10 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertTrue(again['admit'], again)
+        self.assertIn(grandchild, [m['pid'] for m in members()])   # a fresh capture alone cannot see it
+        self.finish_wrapper(proc)
+        live, _ = self.live()
+        self.assertEqual(len(live), 1)
+        self.assertIn('workload-outlives-wrapper', live[0]['unresolved'])
+
+    def test_reserving_an_unreaped_zombie_pid_is_refused(self):
+        proc = self.wrapper('plain', count=0)
+        self.finish_wrapper(proc)
+        result = da.reserve('job-zombie', GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertFalse(result['admit'])
+        self.assertIn('process-not-running', result['reason'])
+
+    def test_implausible_workload_records_are_rejected_not_trusted(self):
+        base = {'pgid': None, 'leader': False, 'members': [], 'observed': True, 'truncated': False, 'refreshes': 1}
+        bad = [dict(base, pgid=1, leader=True), dict(base, pgid=-5, leader=True), dict(base, pgid=10 ** 30),
+               dict(base, pgid=True), dict(base, leader=True), dict(base, pgid=50, leader=True),
+               dict(base, members=[{'pid': 1, 'token': 't'}]), dict(base, members=[{'pid': -1, 'token': 't'}]),
+               dict(base, members=[{'pid': True, 'token': 't'}]), dict(base, refreshes=-1)]
+        for workload in bad:
+            self.assertFalse(da._valid_workload(workload, 999), workload)
+        self.assertTrue(da._valid_workload(dict(base, pgid=999, leader=True), 999))
+        proc = self.wrapper('plain', count=0)
+        token = da.process_token(proc.pid)
+        with da.state_lock(self.path):
+            da.write_reservation(self.path, 'job-bad', GIB, proc.pid, token, self.now + timedelta(hours=1),
+                                 workload=dict(base, pgid=1, leader=True))
+        live, problems = self.live()
+        self.assertEqual(live, [])
+        self.assertTrue(problems and problems[0].startswith('reservation-unreadable'))
+        self.assertTrue((self.path.parent / 'reservations/job-bad.json').exists())      # left alone, never deleted
+
 
     def test_process_listing_reads_no_command_line(self):
         table = da.process_table()
