@@ -148,7 +148,7 @@ jobs:
           python3 tests/test-qa-payload.py
           python3 tests/test-parity-dogfood.py
   native-resource-wire:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
