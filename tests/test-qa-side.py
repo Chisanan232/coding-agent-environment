@@ -668,6 +668,53 @@ class DescriptorRelativeTests(InstalledCase):
         side.copy_tree_at(sfd, t.base / "nested", ME)
         self.assertEqual((t.base / "nested" / "d1" / "d2" / "d3" / "f").read_text(), "deep")
 
+    def test_prompt_with_a_second_link_is_refused(self):
+        t = self.tree()
+        os.link(t.attempt / "prompt.txt", t.base / "prompt-twin")
+        afd = self.attempt_fd(t)
+        self.addCleanup(os.close, afd)
+        with self.assertRaises(side.Refuse):
+            side.open_prompt_at(afd, ME)
+
+    def test_set_id_and_sticky_bits_are_not_carried_into_the_copy(self):
+        t = self.tree()
+        os.chmod(t.source / "a.txt", 0o4755)
+        os.mkdir(t.source / "stick")
+        os.chmod(t.source / "stick", 0o1777)
+        afd = self.attempt_fd(t)
+        self.addCleanup(os.close, afd)
+        sfd = os.open(t.source, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, sfd)
+        side.copy_tree_at(sfd, t.base / "masked", ME)
+        self.assertEqual(stat.S_IMODE(os.stat(t.base / "masked" / "a.txt").st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.stat(t.base / "masked" / "stick").st_mode), 0o777)
+
+    def test_clone_limits_entries_bytes_and_depth(self):
+        t = self.tree()
+        sfd = os.open(t.source, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, sfd)
+        count = 0
+        entries = sum(len(files) + len(dirs) for _, dirs, files in os.walk(t.source))
+        for label, patch, ok in (("entries", {"MAX_COPY_ENTRIES": entries - 1}, False), ("entries ok", {"MAX_COPY_ENTRIES": entries}, True),
+                                 ("bytes", {"MAX_COPY_BYTES": 8}, False), ("bytes ok", {"MAX_COPY_BYTES": 5 + 10}, True),
+                                 ("depth", {"MAX_COPY_DEPTH": 0}, False), ("depth ok", {"MAX_COPY_DEPTH": 1}, True)):
+            count += 1
+            dst = t.base / ("limit-%d" % count)
+            with mock.patch.multiple(side, **patch):
+                if ok:
+                    side.copy_tree_at(sfd, dst, ME)
+                else:
+                    with self.assertRaises(side.Refuse, msg=label):
+                        side.copy_tree_at(sfd, dst, ME)
+
+    def test_a_file_that_grows_past_the_byte_cap_during_the_copy_is_refused(self):
+        t = self.tree()
+        (t.source / "big").write_bytes(b"x" * (3 << 20))
+        sfd = os.open(t.source, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, sfd)
+        with mock.patch.object(side, "MAX_COPY_BYTES", 2 << 20), self.assertRaises(side.Refuse):
+            side.copy_tree_at(sfd, t.base / "toobig", ME)
+
     def swap_attempt_dir(self, t):
         """Replace inbox/<attempt> by a symlink to a hostile tree, as an attacker would between validation and use."""
         evil = t.base / "evil"

@@ -145,29 +145,36 @@ no controlling terminal.
 
 The producer writes `X/inbox/<attempt>/request.json` (producer-owned, read-only to the QA user through the inherited ACE, beside
 `packet.json` and `prompt.txt` as today). `X` is the exchange directory. The helper validates, in this order, and fails closed
-(prints one JSON error record, exit non-zero, nothing started) on any miss:
+on any miss: **a silent exit 2** (nothing printed, nothing started; the producer maps it to `QA_INCOMPLETE`). The one exception is
+`stage` after validation has passed: an exception inside the stage work prints the record `{"error": "<ExceptionName>"}` and exits 0, which
+the producer also maps to `QA_INCOMPLETE`. As implemented, the order is argv shape, attempt, the configuration chain and its contents
+(the QA uid comes from it), uids, the caller-uid variable, the Codex chain and digest, then the request:
 
 1. verb is in `{version, probe, stage, exec}` and the request names the same verb as argv;
 2. attempt matches `[A-Za-z0-9][A-Za-z0-9._-]{0,150}` and contains no `..`;
 3. real and effective uid both equal the configured QA uid (the helper refuses to run as root or as any other user);
 4. `SUDO_UID` equals the configured producer uid (like `RUN.lock` in item 8, this only guards against stray calls; sudoers is the authorization);
-5. the configuration chain is root-owned and not group or world writable, none a link: `/Library`, `/Library/cae-qa`, the helper
-   and `config.json` (a tripwire only; see "Helper integrity" for what actually protects the helper);
-6. the Codex binary digest equals the pinned digest in `config.json` (decision D1);
+5. the configuration chain and the Codex chain are root-owned and not group or world writable, none a link, each component from
+   `/` down: `/Library`, `/Library/cae-qa`, `qa-side.json`, and the pinned Codex path (a tripwire only). The helper's own path is
+   **not** checked by the helper (it cannot vouch for its own replacement); the producer verifies it before every run and sudoers
+   pins its digest (see "Helper integrity");
+6. the Codex binary digest equals the pinned digest in `qa-side.json` (decision D1);
 7. every open of `request.json`, `prompt.txt`, `packet.json` and the clone uses `O_NOFOLLOW`, rejects non-regular files and
-   enforces size caps (request 64 KiB, prompt 1 MiB, packet 64 MiB);
+   enforces size caps (request 4096 B, prompt 1 MiB; the helper does not read `packet.json`), requires the request, the attempt
+   directory and the inbox to be owned by the producer uid and not group or world writable, requires a single link on the
+   request and the prompt, and copies the clone only through descriptors with entry, byte and depth caps;
 8. `X/inbox/RUN.lock` exists (a run is in progress under the producer's lock protocol; this is a guard against a stray call, not
    authentication);
-9. all paths (exchange, inbox, outbox, QA home, Codex home, Codex binary) are derived from `config.json` and the validated
+9. all paths (exchange, inbox, outbox, QA home, Codex home, Codex binary) are derived from `qa-side.json` and the validated
    attempt id, never from argv or from the request;
 10. the child environment is built from an allowlist and **nothing is taken from the caller**: `HOME` comes from
     `pwd.getpwuid(<configured QA uid>)`, `PATH` is the fixed `/usr/bin:/bin:/usr/sbin:/sbin`, `CODEX_HOME`, `TMPDIR` and the
-    other variables are derived from `config.json` and the attempt id, and `CODEX_HOME`, `PATH`, `LANG`, `TERM`, `SHELL`
+    other variables are derived from `qa-side.json` and the attempt id, and `CODEX_HOME`, `PATH`, `LANG`, `TERM`, `SHELL`
     and everything else in the inherited environment are ignored. The attended code (`isolated_env`) copies `PATH`, `LANG`,
     `TERM`, `SHELL` and a `CODEX_HOME` from `os.environ`, so the installed helper needs its own environment builder (PR 2).
     sudoers backs this with `env_reset`, `!setenv`, the `NOSETENV` tag, a fixed `secure_path` and `always_set_home`.
 
-`config.json` (root:wheel 0444) holds the QA name, QA uid, producer uid, exchange path, the pinned Codex path and digest.
+`qa-side.json` (root:wheel 0444) holds the QA name, QA uid, producer uid, exchange path, the pinned Codex path and digest.
 
 ### File ownership and modes
 
@@ -176,7 +183,7 @@ The producer writes `X/inbox/<attempt>/request.json` (producer-owned, read-only 
 | `/etc/sudoers.d/cae-qa` | root:wheel | 0440 | written last, after `visudo -c -f` |
 | `/Library`, `/Library/cae-qa/` | root:wheel | 0755 | directories; nothing under them writable by group or other |
 | `/Library/cae-qa/qa-side` | root:wheel | 0555 | `scripts/qa-side.py`, first line `#!/usr/bin/python3 -I` |
-| `/Library/cae-qa/config.json` | root:wheel | 0444 | digests and ids, no secret |
+| `/Library/cae-qa/qa-side.json` | root:wheel | 0444 | digests and ids, no secret |
 | `/Library/cae-qa/codex` | root:wheel | 0555 | pinned copy of the Codex binary (about 300 MB) |
 | `X` exchange | root | 0711 | unchanged (qa-identity-setup.py) |
 | `X/inbox` | producer | 0700 + read ACE for the QA user | unchanged |
@@ -185,7 +192,7 @@ The producer writes `X/inbox/<attempt>/request.json` (producer-owned, read-only 
 ### Install procedure (owner, as administrator; a later PR provides the tool)
 
 1. Review the plan the installer prints (no change is made by `--plan`).
-2. Copy the helper, `config.json` and the pinned Codex into `/Library/cae-qa/` with the modes above; compute and record
+2. Copy the helper, `qa-side.json` and the pinned Codex into `/Library/cae-qa/` with the modes above; compute and record
    the digests.
 3. Write the candidate sudoers text to an owner-owned temporary file and run `visudo -c -f <file>`. Stop on any error.
 4. Install the sudoers file **last**: `install -o root -g wheel -m 0440 <file> /etc/sudoers.d/cae-qa`.
@@ -240,8 +247,8 @@ change `qa-identity-setup.py`, which still never edits sudoers; the drop-in is w
 A grant that matches only a path would run whatever sits there. Controls, in order of strength: (1) the install lives under
 `/Library/cae-qa/`, root:wheel, no group/other write on any component, a place Homebrew never touches; (2) the sudoers entries
 pin the helper's SHA-256 (racy without `fexecve`, stated above); (3) before **every** run the producer `lstat`-verifies each
-component of the helper path, `config.json` and the pinned Codex (root-owned, no group/other write, no symlinks) and fails closed
-with `QA_INCOMPLETE`, codex not started (PR 3 adds this to `qa-handoff.py`); (4) the helper's own chain check, which can only
+component of the helper path, `qa-side.json` and the pinned Codex (root-owned, no group/other write, no symlinks) and fails closed
+with `QA_INCOMPLETE`, codex not started (PR 3: `qa-handoff.py --unattended`; the helper path, `qa-side.json` and the Codex path are all covered); (4) the helper's own chain check, which can only
 detect, not prevent, its replacement.
 
 ## Risks and unknowns
