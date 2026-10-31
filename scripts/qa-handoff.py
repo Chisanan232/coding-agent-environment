@@ -38,6 +38,7 @@ A Codex verdict is QA evidence only. It is never merge evidence and must not be 
 import argparse
 import collections
 import datetime
+import errno
 import hashlib
 import importlib.util
 import json
@@ -1122,7 +1123,25 @@ def exchange_problems(ident):
     return problems
 
 
-DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+# The exchange root is root:wheel 0711: the producer may only SEARCH it, not read it, so a read-mode open fails with EACCES even
+# though nothing is wrong. Every chain component is therefore opened for search only (O_SEARCH; macOS defines it as
+# O_EXEC|O_DIRECTORY = 0x40100000). There is deliberately no retry with O_RDONLY: that would hide a real permission change.
+def _search_flag():
+    """O_SEARCH where it exists (macOS: O_EXEC|O_DIRECTORY, 0x40100000 if Python does not expose it). Linux has no O_SEARCH;
+    O_PATH is its search-only stand-in (fstat and openat through such a descriptor work). Any other platform: None, and the
+    open is refused rather than made with a read-mode flag."""
+    flag = getattr(os, 'O_SEARCH', None)
+    if flag:
+        return flag
+    if sys.platform == 'darwin':
+        return 0x40100000
+    return getattr(os, 'O_PATH', None) if sys.platform.startswith('linux') else None
+
+
+_O_SEARCH = _search_flag()
+DIR_FLAGS = (_O_SEARCH | os.O_DIRECTORY | os.O_NOFOLLOW) if _O_SEARCH is not None else None
+OPEN_REASONS = {errno.EACCES: 'cannot be searched (permission denied)', errno.EPERM: 'cannot be searched (operation not permitted)',
+                errno.ENOENT: 'does not exist', errno.ELOOP: 'is a symbolic link', errno.ENOTDIR: 'is not a directory'}
 
 
 def outbox_chain(ident, outbox):
@@ -1131,16 +1150,32 @@ def outbox_chain(ident, outbox):
             (outbox / 'source', ident.uid)]
 
 
+def open_reason(error, name, dir_fd):
+    """Why a directory open failed, in words that match the cause. macOS answers ENOTDIR for a symbolic link opened with
+    O_NOFOLLOW|O_DIRECTORY (as for a file), so that one case is told apart by a no-follow lstat; it only classifies the
+    refusal, it never makes an open succeed."""
+    if error.errno in (errno.ENOTDIR, errno.ELOOP):
+        try:
+            kind = os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode
+        except OSError:
+            kind = None
+        return 'is a symbolic link' if kind is not None and stat.S_ISLNK(kind) else OPEN_REASONS[errno.ENOTDIR]
+    return OPEN_REASONS.get(error.errno) or 'could not be opened (%s)' % errno.errorcode.get(error.errno, error.errno)
+
+
 def open_outbox(ident, outbox):
     """(fds, problems): open X, X/outbox, O and O/source once each, every one relative to its parent's descriptor with
-    O_NOFOLLOW|O_DIRECTORY (a link or non-directory fails the open), and check the owner of the object actually opened.
-    The caller closes the fds."""
+    O_SEARCH|O_NOFOLLOW|O_DIRECTORY (a link or non-directory fails the open), and check the owner of the object actually
+    opened. A failure names its real cause (permission, missing, link, not a directory, other errno). The caller closes the
+    fds."""
     fds = []
+    if DIR_FLAGS is None:
+        return fds, ['this platform has no O_SEARCH, so the exchange cannot be opened safely']
     for path, uid in outbox_chain(ident, outbox):
         try:
             fd = os.open(str(path) if not fds else path.name, DIR_FLAGS, dir_fd=fds[-1] if fds else None)
-        except OSError:
-            return fds, ['%s is missing, a link or not a directory' % path]
+        except OSError as error:
+            return fds, ['%s %s' % (path, open_reason(error, str(path) if not fds else path.name, fds[-1] if fds else None))]
         fds.append(fd)
         owner = os.fstat(fd).st_uid
         if owner != uid:
@@ -1170,8 +1205,14 @@ def read_sealed(dir_fd, name, uid):
         return None
     with os.fdopen(fd, 'rb') as handle:
         st = os.fstat(handle.fileno())
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != uid or st.st_nlink != 1 or st.st_size > MAX_VERDICT_BYTES:
-            raise OSError('not a sealed QA file')
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError('%s is not a regular file' % name)
+        if st.st_uid != uid:
+            raise OSError('%s has the wrong owner' % name)
+        if st.st_nlink != 1:
+            raise OSError('%s has more than one link' % name)
+        if st.st_size > MAX_VERDICT_BYTES:
+            raise OSError('%s is too large' % name)
         data = handle.read(MAX_VERDICT_BYTES + 1)
     if len(data) > MAX_VERDICT_BYTES:
         raise OSError('file too large')
