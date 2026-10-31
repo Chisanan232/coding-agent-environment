@@ -1728,6 +1728,109 @@ class LaunchdGuiAbsentTests(unittest.TestCase):
         with unittest.mock.patch.object(qa.subprocess, "run", raises):
             self.assertTrue(qa.no_gui_session_problems(self.IDENT, "gui/530"))
 
+    def reason(self, **kwargs):
+        """The one reason the owner reads for a gui/530 problem, after write_result's clean()."""
+        problems = self.gui_problems(**kwargs)
+        self.assertEqual(len(problems), 1, problems)
+        text = qa.clean(problems[0])
+        self.assertEqual(text, problems[0], "cut by clean(): %r" % problems[0])
+        self.assertLessEqual(len(text), 120)
+        self.assertTrue(all(" " <= c <= "~" for c in text), text)
+        return text
+
+    def test_a_failed_managername_query_says_so_with_rc_stdout_and_stderr(self):
+        text = self.reason(manager=(1, "", "Operation not permitted\n"))
+        self.assertTrue(text.startswith("gui/530 125-no-session unconfirmed: managername rc=1"), text)
+        self.assertIn('out=""', text)
+        self.assertIn('err="Operation not permitted"', text)
+        self.assertNotIn("not Background", text)
+
+    def test_a_non_background_manager_names_the_manager(self):
+        for out in ("Aqua\n", "Background extra\n", "LoginWindow\n"):
+            text = self.reason(manager=(0, out, ""))
+            self.assertIn('manager is "%s"' % out.strip(), text)
+            self.assertNotIn("rc=", text)
+
+    def test_an_empty_manager_answer_with_rc_0_is_a_problem_and_is_not_a_failed_query(self):
+        text = self.reason(manager=(0, "", ""))
+        self.assertIn('manager is ""', text)
+
+    def test_a_sudo_refusal_says_sudo_refused(self):
+        text = self.reason(manager=(1, "", "sudo: a password is required\n"))
+        self.assertIn("managername sudo refused", text)
+        self.assertIn("sudo: a password", text)
+
+    def test_the_three_managername_conditions_have_distinct_text(self):
+        texts = {self.reason(manager=m) for m in ((1, "", "x\n"), (0, "Aqua\n", ""), (1, "", "sudo: no\n"))}
+        self.assertEqual(len(texts), 3)
+
+    def test_stdout_and_stderr_are_bounded_and_sanitized(self):
+        noisy = "\x1b[31mA\x00B\r\tC" + "z" * 5000 + "\n second line"
+        text = self.reason(manager=(2, "\x07" + "o" * 5000, noisy))
+        self.assertNotIn("\n", text)
+        self.assertNotIn("second line", text)
+        self.assertEqual(text.count("o" * 17), 0)
+        self.assertIn('out="?' + "o" * 15 + '"', text)
+        self.assertEqual(text.count("z" * 29), 0)
+        self.assertIn('err="caf? ?"', self.reason(manager=(1, "", "caf\u00e9 \u202e\u2028x")))   # U+2028 ends the first line
+        self.assertNotIn('""quoted', self.reason(manager=(1, "", '"quoted"')))
+
+    def test_the_longest_reason_fits_for_the_largest_uid(self):
+        ident = self.IDENT._replace(uid=4294967295)
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            if argv[0] == qa.PS:
+                return subprocess.CompletedProcess(argv, 0, "1 S\n", "")
+            return subprocess.CompletedProcess(argv, -9, "o" * 99, "e" * 99)
+        with unittest.mock.patch.object(qa.subprocess, "run", run):
+            problems = qa.no_gui_session_problems(ident, "gui/4294967295")
+        self.assertEqual([qa.clean(p) for p in problems], problems)
+        self.assertLessEqual(len(problems[0]), 120)
+        self.assertIn("rc=-9", problems[0])
+
+    def test_an_unreadable_process_table_starts_with_ps(self):
+        text = self.reason(ps=(2, "", "ps: illegal option\n"))
+        self.assertTrue(text.startswith("gui/530 125-no-session unconfirmed: ps rc=2"), text)
+        self.assertIn("illegal option", text)
+        self.assertIn("ps row unparsable", self.reason(ps=(0, "garbled\n", "")))
+
+    def test_a_gui_session_process_is_named_first(self):
+        paths = {52266: "/usr/sbin/distnoted", 93967: "/System/Library/CoreServices/Finder"}
+        text = self.reason(paths=paths)
+        self.assertEqual(text, "gui/530 125 but GUI-session process Finder runs")
+
+    def test_an_unidentified_process_names_the_pid(self):
+        with unittest.mock.patch.object(qa.os, "kill", return_value=None):
+            text = self.reason(paths={52266: "/usr/sbin/distnoted"})
+        self.assertIn("pid 93967 executable unidentified", text)
+
+    def test_a_timeout_names_which_command_timed_out(self):
+        def raises(which):
+            def run(argv, **kwargs):
+                if (which == "ps") == (argv[0] == qa.PS) and (which == "ps" or argv[-1] == "managername"):
+                    raise subprocess.TimeoutExpired(argv, 30)
+                return subprocess.CompletedProcess(argv, 0, "Background\n", "")
+            return run
+        for which, expected in (("managername", "managername not run (TimeoutExpired)"), ("ps", "ps not run (TimeoutExpired)")):
+            with unittest.mock.patch.object(qa.subprocess, "run", raises(which)):
+                problems = qa.no_gui_session_problems(self.IDENT, "gui/530")
+            self.assertEqual(len(problems), 1)
+            self.assertIn(expected, problems[0])
+            self.assertLessEqual(len(qa.clean(problems[0])), 120)
+
+    def test_nothing_is_retried(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 1, "", "Operation not permitted\n") if argv[-1] == "managername" else \
+                subprocess.CompletedProcess(argv, 0, "", "")
+        with unittest.mock.patch.object(qa.subprocess, "run", run):
+            self.assertTrue(qa.no_gui_session_problems(self.IDENT, "gui/530"))
+        self.assertEqual(sum(1 for a in calls if a[-1] == "managername"), 1)
+
     def test_zombies_and_vanished_processes_are_skipped(self):
         with unittest.mock.patch.object(qa.os, "kill", side_effect=ProcessLookupError):
             self.assertEqual(self.gui_problems(ps=(0, "52266 Z\n93967 S\n", ""), paths={}), [])
