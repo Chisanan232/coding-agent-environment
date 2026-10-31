@@ -224,7 +224,7 @@ Known limits (not guaranteed):
 Record-only. `run`, `reserve`, `queue enqueue` and `queue claim` accept optional `--class NAME`, `--mem-gib N` and `--cpus N`
 (next to the existing `--bytes`). They are stored, validated, shown and measured. **No admission decision reads them**: the lane
 cap (1), the byte floor, queue order and grants are exactly as before, and a record without them means what it always meant
-(the whole budget, all cores).
+(the whole budget, all cores). The shadow budget below reads them for reporting only.
 
 Classes live in one table, `WORKLOAD_CLASSES` in `scripts/disk-admission.py`. The numbers are guesses, conservative on purpose,
 to be lowered only by a reviewed constants change backed by `disk-admission.py measurements` evidence.
@@ -239,8 +239,7 @@ to be lowered only by a reviewed constants change backed by `disk-admission.py m
 | none (legacy) | whole budget | all cores | as given | none |
 
 Rules. An unknown class is refused (fail closed). `--mem-gib`, `--cpus` and `--bytes` may raise an estimate and are refused when
-below the class default; with no class they are recorded as given. `min jobs` is documented for a later admission change and is
-not read. The exclusion key is resolved without executing anything: `CARGO_TARGET_DIR`, else `build.target-dir` in
+below the class default; with no class they are recorded as given. `min jobs` is read only by the shadow budget's AMBER report. The exclusion key is resolved without executing anything: `CARGO_TARGET_DIR`, else `build.target-dir` in
 `~/.cargo/config.toml` (one small file read), else `./target`, recorded as `cargo-target:<normalised path>`.
 
 Exclusion-key limits (record-only for now, so none changes a decision, but a later change that enforces exclusivity must
@@ -264,3 +263,65 @@ claimability are unchanged.
 Display. `status --json` and `snapshot` add a `workloads` list (label, pid and the fields) only when a live reservation declared
 something, so legacy output is byte-identical. `queue status --json` already lists whole entries. Measurement lines carry the
 reservation `class`, which `measurements` already groups by.
+
+## Resource budget in shadow (SPE-150)
+
+**Shadow: not enforced.** At the three lane sites (`reserve`, `queue advance` "lane occupied", `queue claim` lane cap) the
+resource budget is computed and recorded beside the decision, and the existing `HEAVY_LANES` check (1 everywhere) still decides
+alone. No admit, refusal, grant order or reason string changes. The record is for measurement: it shows when resources would have
+allowed more than one lane. Nothing is persisted except a `shadow-budget` line in the existing `queue/receipts.jsonl` (only when
+the queue directory exists and a host sample was readable).
+
+Where it appears. A `budget` object on the result of `reserve`/`run`, `queue advance` and `queue claim` (absent when no host
+sample was requested, so library callers and tests see the old shape); a `budget` section in `snapshot --json` and `status --json`
+(state of the occupied budget plus a probe with the reference class `build-crate`); and, on a terminal only, one line starting
+`budget (shadow: not enforced): ...` after `reserve`/`run`. Every record carries `"shadow": "shadow: not enforced"`.
+
+Sampling. The host is never sampled inside the lock. A windowed sample (two `memory-admission` samples `SHADOW_WINDOW_S` = 2 s
+apart, plus two process-table readings for per-holder rss and cpu) is taken before it, as `queue claim` already does for the
+memory gate. `queue advance` samples only when something is waiting. A sample that fails marks the budget `unavailable` and never
+alters the outcome. An injected free-space reading (tests) takes no host sample.
+
+Added latency and limits. Each sampled call costs about the 2 s window plus the ps, vm_stat and lsof rounds, and the whole sample
+is capped by `SHADOW_DEADLINE_S` = 3 s of wall time: past it the budget is `unavailable` (`host-sample-timeout`) and the
+abandoned worker thread, which only reads, is left to finish. Building the budget under the lock is guarded: any `Exception` from
+a malformed record or sample (never `BaseException`) yields `{"status": "unavailable", "reason": "budget-computation-failed: ..."}`
+and the lane decision proceeds as without it.
+
+Arithmetic (`budget_decision(host, reservations, request, caps)`, pure):
+
+    projected = host_used
+              + sum over holders of max(0, est_mem - measured_rss)
+              + UNMANAGED_ALLOWANCE (8 GiB) x unmanaged heavy trees
+              + est_mem of the request
+
+- `host_used` is (active + wired + compressed pages) from `vm_stat`: an approximation to be calibrated, not a promise.
+- `measured_rss` is the holder's process subtree in the sample, counted only when the sample is newer than the record's
+  `created`; an older or undated record is charged in full.
+- An unmanaged tree is a running heavy-build tree no holder accounts for. Its own usage is already in `host_used`; it adds the
+  allowance and is never a refusal by itself.
+- Who counts: live reservations (past their time limit or UNRESOLVED too), claimed orphans, and unclaimed unlapsed GRANTED queue
+  entries (not the grant being claimed), each at its recorded class cost. A record with no class and no declared estimate is
+  legacy: it costs the whole memory budget and all cores. A legacy *request* needs an otherwise free host.
+- The shadow verdict `would_admit` needs all of: projected <= RAM x (1 - headroom) (headroom 0.30 GREEN, 0.40 AMBER, whole
+  percent so the boundary is exact); sum of `cpu_slots` + request <= cores x 1.0; no `excl_key` shared with a holder; the unchanged
+  byte floor (free - reserved - requested >= 100 GiB); band not RED; and count + 1 <= `MAX_CONCURRENT[tier]` (1 wherever a lane
+  exists, so `would_admit` is `false` for a second job today). `fits_if_cap_were_2` is the same verdict with the cap at 2, so a
+  reviewer can see when resources alone would have allowed more. `resource_reasons` and `cap_reason` say which part failed.
+- Bands come from `memory-admission` through two read-only accessors (`budget_view`, `budget_band`); thresholds, latch and
+  decisions there are unchanged. RED: any current ENTER refusal or unreadable input. AMBER: not RED but some EXIT bound unmet.
+  GREEN: all met. The heavy-lane-count refusal ("one heavy lane at a time") is left out of the band, because the lane count is what
+  the budget replaces and every admitted job would otherwise turn the host RED. The load used for banding is corrected for admitted
+  work: `max(0, load1 - sum min(cpu_slots_r, measured_cpu_r)) / cores`.
+- In AMBER the report shows `granted_jobs` = max(class `min_jobs`, requested / 2) and halved `granted_test_threads`. These are
+  reported only; no job is told to run smaller.
+
+Known gaps. All constants are guesses until `measurements` backs them. A heavy-named process the process list could not parse
+into a tree is not counted as unmanaged. `status` reads records without verification (it takes no lock), so it can briefly show a
+holder that has just exited. A 2 s window is shorter than the 10 s `memory-admission check` uses, so its swap-I/O reading is
+noisier; the band is advisory here for that reason. Enforcement, a cap above 1 and degrading jobs are separate, owner-approved
+changes.
+
+Known and accepted. The `shadow-budget` lines share `queue/receipts.jsonl` (and its single 1 MiB rotation) with the queue's own
+receipts, so a busy shadow stream rotates queue history sooner. The `budget` result key is additive: a caller that compares
+whole result dictionaries while requesting a host sample sees the extra key.

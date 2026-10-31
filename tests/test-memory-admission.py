@@ -747,5 +747,75 @@ class WorkloadTree(unittest.TestCase):
         self.assertFalse(s["heavy_workloads"][0]["idle"])
 
 
+class BudgetAccessors(unittest.TestCase):
+    """Read-only accessors for the shadow budget (SPE-150 PR4): they report, they do not change a decision or a threshold."""
+
+    @staticmethod
+    def pair(load=2.0, level=1, io_pages=0, compressor=0.0, workloads=None):
+        first = sample(0, load=load, level=level, compressor=compressor)
+        second = sample(10, load=load, level=level, swapins=io_pages, compressor=compressor)
+        second["vm"] = dict(second["vm"], active=100, wired=50)
+        if workloads is not None:
+            second["heavy_workloads"] = workloads
+            first["heavy_workloads"] = workloads
+        return first, second
+
+    def test_view_reports_used_cores_load_and_only_running_trees(self):
+        running = {"root_pid": 10, "root_comm": "cargo", "procs": 3, "rss_bytes": 5, "cpu_s": 1.0, "idle": False, "member_cpu": {10: 1.0, 11: 0.5}}
+        idle = dict(running, root_pid=20, idle=True, member_cpu={20: 0.0})
+        view = ma.budget_view(*self.pair(workloads=[running, idle]))
+        self.assertEqual((view["ram"], view["cores"], view["load1"]), (RAM, 16, 2.0))
+        self.assertEqual(view["used_bytes"], (100 + 50) * PAGE)
+        self.assertEqual([(t["root_pid"], t["members"]) for t in view["workloads"]], [(10, [10, 11])])
+        self.assertIn("swap_io_mib_s", view["m"])
+
+    def test_used_bytes_is_unknown_when_a_page_counter_is_missing(self):
+        first, second = self.pair()
+        second["vm"].pop("wired")
+        self.assertIsNone(ma.budget_view(first, second)["used_bytes"])
+
+    def test_band_green_amber_red(self):
+        green = ma.derive(*self.pair())
+        self.assertEqual(ma.budget_band(green, None), ("GREEN", []))
+        # Load per core 2.0 is the EXIT bound: a hair above it is AMBER (still under the 4.0 ENTER refusal), at 4.0 it is RED.
+        self.assertEqual(ma.budget_band(green, 2.01)[0], "AMBER")
+        self.assertEqual(ma.budget_band(green, 3.99)[0], "AMBER")
+        band, reasons = ma.budget_band(green, 4.0)
+        self.assertEqual(band, "RED")
+        self.assertIn("load per core", reasons[0])
+        self.assertEqual(ma.budget_band(ma.derive(*self.pair(level=2)), None)[0], "RED")
+        self.assertEqual(ma.budget_band(ma.derive(*self.pair(compressor=0.30)), None)[0], "AMBER")
+        self.assertEqual(ma.budget_band(ma.derive(*self.pair(compressor=0.40)), None)[0], "RED")
+
+    def test_the_load_override_replaces_the_sampled_load(self):
+        loaded = ma.derive(*self.pair(load=80.0))       # 5.0 per core: a RED reading
+        self.assertEqual(ma.budget_band(loaded, None)[0], "RED")
+        self.assertEqual(ma.budget_band(loaded, 1.0)[0], "GREEN")
+
+    def test_running_heavy_trees_do_not_make_the_band_red(self):
+        running = {"root_pid": 10, "root_comm": "cargo", "procs": 3, "rss_bytes": 5, "cpu_s": 1.0, "idle": False, "member_cpu": {10: 1.0}}
+        m = ma.derive(*self.pair(workloads=[running]))
+        self.assertTrue(ma.refusal_reasons("heavy", m)[0])           # the existing gate still refuses on the lane count
+        self.assertEqual(ma.budget_band(m, None), ("GREEN", []))
+
+    def test_unreadable_input_fails_closed_to_red(self):
+        first, second = self.pair()
+        second["pressure_level"] = None
+        band, reasons = ma.budget_band(ma.derive(first, second), None)
+        self.assertEqual(band, "RED")
+        self.assertIn("fails closed", reasons[0])
+        unreadable_list, ok = self.pair()
+        unreadable_list["heavy_procs"] = None      # the process list could not be read: unknown, never "no heavy process"
+        self.assertEqual(ma.budget_band(ma.derive(unreadable_list, ok), None)[0], "RED")
+
+    def test_thresholds_and_decisions_are_unchanged(self):
+        self.assertEqual((ma.ENTER["load_per_core_heavy"], ma.EXIT["load_per_core"], ma.EXIT_SAMPLES), (4.0, 2.0, 3))
+        m = ma.derive(*self.pair())
+        before = ma.decide("heavy", m, None, 1000.0)
+        ma.budget_view(*self.pair())
+        ma.budget_band(m, 9.9)
+        self.assertEqual(ma.decide("heavy", m, None, 1000.0), before)
+
+
 if __name__ == "__main__":
     unittest.main()

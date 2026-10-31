@@ -329,6 +329,36 @@ def derive(s1, s2):
     return d
 
 
+# ---- read-only accessors for disk-admission's SHADOW resource budget (SPE-150 PR4) -----------------------------------------
+# They only re-read what derive() and refusal_reasons() already compute; no threshold, latch or decision here changes.
+def budget_view(s1, s2):
+    """What the shadow budget needs from a pair of samples: RAM, host used bytes (active + wired + compressed pages; an
+    approximation to be calibrated), cores, load, the derived metrics `m`, and the running heavy-build trees (idle orphans
+    excluded) with their pids. A value that could not be read is None."""
+    m = derive(s1, s2)
+    vm_ = s2.get("vm") or {}
+    used = None
+    if vm_.get("page_size") and all(type(vm_.get(k)) is int for k in ("active", "wired", "compressor")):
+        used = (vm_["active"] + vm_["wired"] + vm_["compressor"]) * vm_["page_size"]
+    trees = [{"root_pid": w["root_pid"], "root_comm": w["root_comm"], "procs": w["procs"], "rss_bytes": w["rss_bytes"],
+              "members": sorted(w.get("member_cpu") or {})} for w in m.get("heavy_workloads") or [] if not w["idle"]]
+    return {"m": m, "ram": s2.get("ram"), "used_bytes": used, "cores": s2.get("cpus"), "load1": s2.get("load1"), "workloads": trees}
+
+
+def budget_band(m, load_per_core):
+    """(band, reasons) for the shadow budget. RED: any current ENTER refusal or unreadable input (heavy-lane count reasons are
+    left out: the lane count is what the budget replaces, and every admitted job would otherwise make the host RED). AMBER:
+    not RED but an EXIT bound is unmet. GREEN: all met. `load_per_core` replaces the measured one (load corrected for admitted
+    work); None keeps the sampled value."""
+    view = dict(m, heavy_workloads=[], heavy_procs=None if m.get("heavy_procs") is None else {})
+    if load_per_core is not None:
+        view["load_per_core"] = load_per_core
+    refuse, unknown = refusal_reasons("heavy", view)
+    if refuse or unknown:
+        return "RED", refuse + [f"{u}: fails closed" for u in unknown]
+    return ("GREEN" if exit_ok(view) else "AMBER"), []
+
+
 # ---- decision (pure) -------------------------------------------------------------------------------------------------
 def format_age(seconds):
     d, rem = divmod(int(seconds), 86400)
