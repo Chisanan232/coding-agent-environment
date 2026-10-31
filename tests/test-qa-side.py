@@ -12,10 +12,12 @@ import json
 import os
 import pwd
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -789,6 +791,132 @@ class DescriptorRelativeTests(InstalledCase):
             rc, out, err = self.run_side(t, ["stage", ATTEMPT])
         self.assertEqual((out, err), ("", ""))
         self.assertNotEqual(rc, 0)
+
+
+class DetachTests(unittest.TestCase):
+    """detach() forks, so it works for a process-group leader (where a bare setsid raises EPERM). These tests really fork
+    short-lived children of the test process; nothing is signalled except those children."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.pids = []
+        self.addCleanup(self.reap)
+
+    def reap(self):
+        for pid in self.pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+
+    def fork_leader(self, body):
+        """Fork a child that leads its own process group, as the privilege tool may start the helper, and run body there.
+        Returns its pid; the child exits 99 if body raises."""
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.setpgid(0, 0)
+                body()
+            except BaseException:
+                os._exit(99)
+            os._exit(0)
+        self.pids.append(pid)
+        return pid
+
+    def finish(self, pid):
+        _, status = os.waitpid(pid, 0)
+        self.pids.remove(pid)
+        return os.waitstatus_to_exitcode(status)
+
+    def test_a_bare_setsid_fails_for_a_group_leader_which_is_why_detach_forks(self):
+        pid = self.fork_leader(lambda: os._exit(0 if self._setsid_refused() else 5))
+        self.assertEqual(self.finish(pid), 0)
+
+    @staticmethod
+    def _is_open(fd):
+        try:
+            os.fstat(fd)
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _setsid_refused():
+        try:
+            os.setsid()
+        except PermissionError:
+            return True
+        return False
+
+    def test_detach_succeeds_for_a_group_leader_and_the_child_is_a_clean_session_leader(self):
+        marker = self.dir / "marker.json"
+        extra = os.open(os.devnull, os.O_RDONLY)          # an inherited descriptor that must not survive
+        held = os.open(self.dir, os.O_RDONLY)             # the held prompt stand-in that must survive
+
+        def body():
+            side.detach(300, keep=(held,))
+            alarm = signal.alarm(0)
+            marker.write_text(json.dumps({"pid": os.getpid(), "sid": os.getsid(0), "pgid": os.getpgid(0), "cwd": os.getcwd(),
+                                          "stdin": os.readlink("/dev/fd/0") if os.path.islink("/dev/fd/0") else os.fstat(0).st_rdev,
+                                          "alarm": alarm, "extra_open": self._is_open(extra), "held_open": self._is_open(held),
+                                          "stdin_is_null": os.fstat(0).st_rdev == os.stat(os.devnull).st_rdev}))
+            os._exit(7)
+        pid = self.fork_leader(body)
+        self.assertEqual(self.finish(pid), 7)            # the grandchild's status is the parent's status
+        info = json.loads(marker.read_text())
+        self.assertNotEqual(info["pid"], pid)
+        self.assertEqual((info["sid"], info["pgid"]), (info["pid"], info["pid"]))
+        self.assertEqual(info["cwd"], "/")
+        self.assertTrue(info["stdin_is_null"])
+        self.assertGreater(info["alarm"], 0)
+        self.assertFalse(info["extra_open"])
+        self.assertTrue(info["held_open"])
+        os.close(extra)
+        os.close(held)
+
+    def test_a_signal_sent_to_the_parent_is_relayed_to_the_detached_child(self):
+        ready, got = self.dir / "ready", self.dir / "got"
+
+        def body():
+            side.detach(300)
+            signal.signal(signal.SIGTERM, lambda n, f: (got.write_text(str(n)), os._exit(9)))
+            ready.write_text("1")
+            time.sleep(30)
+            os._exit(1)
+        pid = self.fork_leader(body)
+        for _ in range(200):
+            if ready.exists():
+                break
+            time.sleep(0.05)
+        self.assertTrue(ready.exists())
+        os.kill(pid, signal.SIGTERM)
+        self.assertEqual(self.finish(pid), 9)
+        self.assertEqual(got.read_text(), str(int(signal.SIGTERM)))
+
+    def test_a_child_killed_by_a_signal_gives_128_plus_the_signal(self):
+        pid = self.fork_leader(lambda: (side.detach(300), os.kill(os.getpid(), signal.SIGKILL)))
+        self.assertEqual(self.finish(pid), 128 + int(signal.SIGKILL))
+
+    def test_the_parent_holds_no_descriptor_above_two(self):
+        report = self.dir / "parent-fds"
+        held = os.open(self.dir, os.O_RDONLY)
+
+        def body():
+            real_waitpid = os.waitpid
+
+            def spy(child, flags):
+                report.write_text(json.dumps([n for n in range(3, 64) if self._is_open(n)]))
+                return real_waitpid(child, flags)
+            os.waitpid = spy
+            side.detach(300, keep=(held,))
+            os._exit(0)
+        pid = self.fork_leader(body)
+        self.assertEqual(self.finish(pid), 0)
+        self.assertNotIn(held, json.loads(report.read_text()))
+        os.close(held)
 
 
 class SharedPartsTests(unittest.TestCase):

@@ -678,9 +678,45 @@ def pin_process(qa_home):
     CANARY_ROOT = HOME / '.local/state/coding-agent-environment/qa-canary'
 
 
+RELAYED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+def relay_and_exit(child):
+    """The parent half of detach(): forward TERM, INT and HUP to the detached child, wait for it and exit with its status
+    (128+n when a signal ended it). It never returns. It holds no descriptor above 2, so the prompt, the exchange and the
+    request files live only in the child."""
+    os.closerange(3, 1024)
+
+    def forward(signum, frame):
+        try:
+            os.kill(child, signum)
+        except OSError:
+            pass
+    for sig in RELAYED:
+        signal.signal(sig, forward)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, RELAYED)
+    while True:
+        try:
+            _, status = os.waitpid(child, 0)
+            break
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            os._exit(2)
+    code = os.waitstatus_to_exitcode(status)
+    os._exit(code if code >= 0 else 128 - code)
+
+
 def detach(alarm_seconds, keep=()):
-    """New session (no controlling terminal), cwd /, stdin /dev/null, nothing inherited but 0-2 and the descriptors in keep,
-    SIGALRM armed."""
+    """Fork, and in the child: new session (no controlling terminal), cwd /, stdin /dev/null, nothing inherited but 0-2 and
+    the descriptors in keep, SIGALRM armed. Returns only in the child. The parent (the process the privilege tool started,
+    and the one the producer signals) relays signals and passes the exit status on. The fork is what makes setsid safe: a
+    process that leads its process group (the tool may start the helper that way) cannot call setsid, its child can."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, RELAYED)      # no signal is lost between the fork and the parent's relay
+    pid = os.fork()
+    if pid:
+        relay_and_exit(pid)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, RELAYED)
     os.setsid()
     os.chdir('/')
     zero = os.open(os.devnull, os.O_RDWR)

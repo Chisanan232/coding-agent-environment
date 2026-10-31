@@ -141,6 +141,16 @@ The helper also takes over what the terminal-detaching `env -i ... python3 -I -c
 inherited environment (it builds one from scratch), starts a new session and closes everything but stdout, so the QA process has
 no controlling terminal.
 
+How it detaches, and what the producer's signals reach: like the attended `DETACH` wrapper, the helper **forks first** and calls
+`setsid` only in the child. A process that leads its process group cannot call `setsid` (EPERM), and the privilege tool may
+start the helper as such a leader, so an in-place `setsid` could fail on a real host while passing every offline test. The
+resulting process tree is: producer's `sudo` child, then the helper parent (the process sudo started), then the detached
+child in its own session (it supervises Codex, kills Codex's group on timeout or signal, and is the one with SIGALRM armed).
+The parent holds no descriptor above 2, forwards TERM, INT and HUP to the child, waits for it and exits with its status (128
+plus the signal number if a signal ended it). The producer therefore still stops a run by signalling its sudo child, sudo
+relays to the helper parent, and the parent relays into the new session; stdout is inherited by the child, so the producer's
+pipe is unchanged. The held prompt descriptor lives only in the child.
+
 ### Protocol
 
 The producer writes `X/inbox/<attempt>/request.json` (producer-owned, read-only to the QA user through the inherited ACE, beside
