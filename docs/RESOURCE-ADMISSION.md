@@ -282,6 +282,12 @@ apart, plus two process-table readings for per-holder rss and cpu) is taken befo
 memory gate. `queue advance` samples only when something is waiting. A sample that fails marks the budget `unavailable` and never
 alters the outcome. An injected free-space reading (tests) takes no host sample.
 
+Added latency and limits. Each sampled call costs about the 2 s window plus the ps, vm_stat and lsof rounds, and the whole sample
+is capped by `SHADOW_DEADLINE_S` = 3 s of wall time: past it the budget is `unavailable` (`host-sample-timeout`) and the
+abandoned worker thread, which only reads, is left to finish. Building the budget under the lock is guarded: any `Exception` from
+a malformed record or sample (never `BaseException`) yields `{"status": "unavailable", "reason": "budget-computation-failed: ..."}`
+and the lane decision proceeds as without it.
+
 Arithmetic (`budget_decision(host, reservations, request, caps)`, pure):
 
     projected = host_used
@@ -315,3 +321,7 @@ into a tree is not counted as unmanaged. `status` reads records without verifica
 holder that has just exited. A 2 s window is shorter than the 10 s `memory-admission check` uses, so its swap-I/O reading is
 noisier; the band is advisory here for that reason. Enforcement, a cap above 1 and degrading jobs are separate, owner-approved
 changes.
+
+Known and accepted. The `shadow-budget` lines share `queue/receipts.jsonl` (and its single 1 MiB rotation) with the queue's own
+receipts, so a busy shadow stream rotates queue history sooner. The `budget` result key is additive: a caller that compares
+whole result dictionaries while requesting a host sample sees the extra key.
