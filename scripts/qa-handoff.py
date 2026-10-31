@@ -77,6 +77,9 @@ def _load_side():
             raise SystemExit(64)
         data = handle.read()
     # One read: these exact bytes are executed here, hashed, and (with --qa-identity) copied into the inbox for the QA user.
+    # Defence in depth, not the pin: when the installer runs this module it has already executed its own single read of qa-side.py
+    # (the bytes its digest binds). This is a second, independent read of the same path; the installer's trust check (root-owned,
+    # link-free, not writable) is what makes the two reads equal, so a hole there is a hole in both.
     module = types.ModuleType('qa_side')
     module.__file__ = str(path)
     exec(compile(data, str(path), 'exec'), module.__dict__)

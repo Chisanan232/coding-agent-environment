@@ -38,8 +38,9 @@ sys.dont_write_bytecode = True        # root must never write __pycache__ into a
 HERE = Path(__file__).resolve().parent
 HEX64 = re.compile(r'[0-9a-f]{64}')
 BUNDLE_NAMES = ('qa-hop-install.py', 'qa-identity-setup.py', 'qa-handoff.py', 'qa-side.py')
+# 32- and 64-bit thin Mach-O in both byte orders, then the 32- and 64-bit fat (universal) headers in both byte orders.
 MACHO_MAGIC = (b'\xfe\xed\xfa\xce', b'\xfe\xed\xfa\xcf', b'\xce\xfa\xed\xfe', b'\xcf\xfa\xed\xfe',
-               b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca')
+               b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca', b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca')
 PRODUCER_RE = re.compile(r'[A-Za-z_][A-Za-z0-9._-]{0,31}')
 INSTALL_COPY = '/Library/cae-qa-install'
 MAX_CODEX_BYTES = 2 << 30
@@ -314,10 +315,21 @@ def plan_text(inputs, layout, ops, args_line, bundle):
         'Config %s:' % layout.config] + ['  ' + l for l in config.decode().splitlines()] + [
         '', 'Sudoers drop-in %s (visudo -c -f on this exact text, unprivileged: %s):' % (layout.sudoers, 'parsed OK' if ok else 'NOT VERIFIED')]
     lines += ['  ' + l for l in dropin.splitlines()]
-    lines += ['', 'Root must run a root-owned copy of the four scripts, never the checkout:',
+    scripts = ' '.join('scripts/' + n for n in BUNDLE_NAMES)
+    lines += ['', 'Root must run a root-owned copy of the four scripts, never the checkout, and that copy must come from GIT OBJECTS of the',
+              'commit you reviewed, not from a working tree (this plan was computed by the checkout\'s own code, which proves nothing about',
+              'itself). Set REPO to your checkout and use <REVIEWED_HEAD>, the full commit id you reviewed:',
               '  sudo install -d -m 755 -o root -g wheel %s' % INSTALL_COPY,
-              '  sudo install -m 644 -o root -g wheel %s %s/' % (' '.join('scripts/' + n for n in BUNDLE_NAMES), INSTALL_COPY),
-              'The one command that then needs root (your own sudo; it never asks for or stores a password):',
+              '  git -C <REPO> archive <REVIEWED_HEAD> %s | sudo tar -x -o -C %s --strip-components=1' % (scripts, INSTALL_COPY),
+              '  sudo chown -R root:wheel %s && sudo chmod 755 %s && sudo chmod 644 %s/*.py' % (INSTALL_COPY, INSTALL_COPY, INSTALL_COPY),
+              'Then hash the files AFTER the copy and compare each with the reviewed objects (the two columns must match):',
+              '  for f in %s; do' % ' '.join(n[:-3] for n in BUNDLE_NAMES),
+              '    shasum -a 256 %s/$f.py; git -C <REPO> show <REVIEWED_HEAD>:scripts/$f.py | shasum -a 256; done' % INSTALL_COPY,
+              'Reproduce the combined bundle digest above from the reviewed objects (sha256 of the sorted lines "name sha256"):',
+              '  for f in %s; do printf \'%%s %%s\\n\' $f.py "$(git -C <REPO> show <REVIEWED_HEAD>:scripts/$f.py | shasum -a 256 | cut -d\' \' -f1)"; done | shasum -a 256' % ' '.join(n[:-3] for n in sorted(BUNDLE_NAMES)),
+              '  (the ids from `git -C <REPO> rev-parse <REVIEWED_HEAD>:scripts/<file>` are git SHA-1 blob ids: informational only, never the pin)',
+              'Only if every pair matches and the combined digest equals the one printed above, run the one command that then needs root',
+              '(your own sudo; it never asks for or stores a password):',
               '  sudo /usr/bin/python3 -I -B %s apply %s %s' % (copy, args_line, pins), '',
               'What that command does, in order:',
               '  1. refuses unless it is root, the four scripts and every directory above them are root-owned, not group/world writable and',
@@ -332,7 +344,7 @@ def plan_text(inputs, layout, ops, args_line, bundle):
               'Afterwards, unprivileged: python3 -I -B %s verify %s' % (Path(__file__).resolve(), args_line),
               '  and, as you, `sudo -n -u %s %s version` (must print the digests above).' % (inputs.qa_name, layout.helper),
               '  Codex smoke test (the delegation refuses the pinned codex on purpose, so use your own password-gated sudo):',
-              '    sudo -u %s %s --version' % (inputs.qa_name, layout.codex),
+              '    cd / && sudo -u %s %s --version' % (inputs.qa_name, layout.codex),
               '  Unverified until the owner pilot: regex arguments and digest pinning under a real sudo, setsid and signal relay.', '',
               'Rollback (root; removes the drop-in FIRST, then the files; safe to repeat):',
               '  sudo /usr/bin/python3 -I -B %s rollback --qa-name %s --qa-uid %d' % (copy, inputs.qa_name, inputs.qa_uid), '',
@@ -455,8 +467,10 @@ def apply(inputs, layout, ops, say, bundle):
     # Last: the grant itself. Candidate beside the destination under a name sudo ignores, compared, validated, then renamed.
     candidate = os.path.join(os.path.dirname(dropin_path), '.cae-qa.new')
     install_file(layout, ops, candidate, 0o440, data=dropin.encode())
-    written = read_regular(candidate).decode('utf-8', 'replace')
-    findings = sudoers_findings(written, dropin)
+    written_bytes = read_regular(candidate)
+    findings = sudoers_findings(written_bytes.decode('utf-8', 'replace'), dropin)
+    if written_bytes != dropin.encode():          # exact bytes, not only the lines: a stray byte or line ending is a finding
+        findings.append('the written bytes differ from the rendered text')
     ok, out = visudo_check(layout, ops, candidate) if not findings else (False, 'the written text differs from the rendered one')
     if not ok:
         os.unlink(candidate)
@@ -473,7 +487,7 @@ def apply(inputs, layout, ops, say, bundle):
         remove_dropin(dropin_path, 'post-install verification failed')
         raise Stop('post-install verification failed (%s); the drop-in was removed again (fail closed); run rollback to remove the rest' % '; '.join(problems[:3]))
     say('verified: helper %s, codex %s' % (record['helper_sha256'], record['codex_sha256']))
-    say('Next, as yourself (not root): verify, then `sudo -n -u %s %s version`; Codex smoke test: `sudo -u %s %s --version`.' % (
+    say('Next, as yourself (not root): verify, then `sudo -n -u %s %s version`; Codex smoke test: `cd / && sudo -u %s %s --version`.' % (
         inputs.qa_name, layout.helper, inputs.qa_name, layout.codex))
 
 
@@ -493,23 +507,49 @@ def verify_installed(inputs, layout, bundle, producer_uid=None):
     return record, problems
 
 
+def grant_paths(layout):
+    """([drop-in, candidate], warning). The grant must be removable even when sudoers.d is not trustworthy, so when the strict
+    resolution refuses, the fixed constant paths are used best-effort (a link at the directory itself is never followed)."""
+    try:
+        real = sudoers_real(layout, must_exist=False)
+    except Stop as error:
+        directory = os.path.dirname(layout.sudoers)
+        if os.path.islink(directory):
+            return [], '%s (the directory is a link, so nothing was touched there)' % error
+        real = os.path.join(directory, os.path.basename(layout.sudoers))
+        return [real, os.path.join(directory, '.cae-qa.new')], str(error)
+    if real is None:
+        return [], None
+    return [real, os.path.join(os.path.dirname(real), '.cae-qa.new')], None
+
+
 def rollback(layout, ops, say):
+    """Remove the grant first, then the files. Never raises before trying everything: a failure to remove is collected, printed
+    with the exact manual command, and makes the exit non-zero."""
     need_root(layout, ops)
-    removed = []
-    real = sudoers_real(layout, must_exist=False)
-    grant = [real, os.path.join(os.path.dirname(real), '.cae-qa.new')] if real else []
+    removed, failed = [], []
+    grant, warning = grant_paths(layout)
+    if warning:
+        say('WARNING: %s. The drop-in is being removed at its fixed paths anyway; inspect %s afterwards.' % (
+            warning, os.path.dirname(layout.sudoers)))
     for path in (*grant, layout.helper, layout.config, layout.codex,
                  *(os.path.join(layout.lib, '.%s.new' % n) for n in ('qa-side', 'qa-side.json', 'codex'))):
-        if os.path.lexists(path):
-            st = os.lstat(path)
-            if stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode):
-                raise Stop('%s is a directory, not one of our files; refusing to remove it' % path)
-            if path == real:
-                remove_dropin(path, 'rollback')
-                say('removed %s (the producer has no grant now)' % path)
-            else:
-                os.unlink(path)           # a link is removed itself, never followed
-            removed.append(path)
+        if not os.path.lexists(path):
+            continue
+        st = os.lstat(path)
+        if stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode):
+            say('%s is a directory, not one of our files; refusing to remove it' % path)
+            failed.append(path)
+            continue
+        try:
+            os.unlink(path)               # a link is removed itself, never followed
+        except OSError as error:
+            say('COULD NOT REMOVE %s (%s)%s' % (path, type(error).__name__, ' - THE PRODUCER STILL HAS THE GRANT' if path in grant else ''))
+            failed.append(path)
+            continue
+        removed.append(path)
+        if path == (grant[0] if grant else None):
+            say('removed %s (the producer has no grant now)' % path)
     if os.path.isdir(layout.lib) and not os.path.islink(layout.lib):
         if not os.listdir(layout.lib):
             os.rmdir(layout.lib)
@@ -517,6 +557,8 @@ def rollback(layout, ops, say):
         else:
             say('left %s in place: it holds files this installer did not create' % layout.lib)
     say('removed: ' + (', '.join(removed) if removed else 'nothing (already rolled back)'))
+    if failed:
+        raise Stop('rollback incomplete. Run by hand, in this order: %s' % '; '.join('sudo rm -f %s' % p for p in failed))
     return removed
 
 
