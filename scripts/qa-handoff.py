@@ -1122,7 +1122,19 @@ def exchange_problems(ident):
 # The exchange root is root:wheel 0711: the producer may only SEARCH it, not read it, so a read-mode open fails with EACCES even
 # though nothing is wrong. Every chain component is therefore opened for search only (O_SEARCH; macOS defines it as
 # O_EXEC|O_DIRECTORY = 0x40100000). There is deliberately no retry with O_RDONLY: that would hide a real permission change.
-_O_SEARCH = getattr(os, 'O_SEARCH', None) or (0x40100000 if sys.platform == 'darwin' else None)
+def _search_flag():
+    """O_SEARCH where it exists (macOS: O_EXEC|O_DIRECTORY, 0x40100000 if Python does not expose it). Linux has no O_SEARCH;
+    O_PATH is its search-only stand-in (fstat and openat through such a descriptor work). Any other platform: None, and the
+    open is refused rather than made with a read-mode flag."""
+    flag = getattr(os, 'O_SEARCH', None)
+    if flag:
+        return flag
+    if sys.platform == 'darwin':
+        return 0x40100000
+    return getattr(os, 'O_PATH', None) if sys.platform.startswith('linux') else None
+
+
+_O_SEARCH = _search_flag()
 DIR_FLAGS = (_O_SEARCH | os.O_DIRECTORY | os.O_NOFOLLOW) if _O_SEARCH is not None else None
 OPEN_REASONS = {errno.EACCES: 'cannot be searched (permission denied)', errno.EPERM: 'cannot be searched (operation not permitted)',
                 errno.ENOENT: 'does not exist', errno.ELOOP: 'is a symbolic link', errno.ENOTDIR: 'is not a directory'}
@@ -1191,8 +1203,10 @@ def read_sealed(dir_fd, name, uid):
         st = os.fstat(handle.fileno())
         if not stat.S_ISREG(st.st_mode):
             raise OSError('%s is not a regular file' % name)
-        if st.st_uid != uid or st.st_nlink != 1:
-            raise OSError('%s has the wrong owner or more than one link' % name)
+        if st.st_uid != uid:
+            raise OSError('%s has the wrong owner' % name)
+        if st.st_nlink != 1:
+            raise OSError('%s has more than one link' % name)
         if st.st_size > MAX_VERDICT_BYTES:
             raise OSError('%s is too large' % name)
         data = handle.read(MAX_VERDICT_BYTES + 1)

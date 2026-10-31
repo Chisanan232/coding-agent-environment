@@ -485,7 +485,18 @@ def read_config(config_path, chain_anchor):
 
 # The exchange root is root:wheel 0711: the QA user may only SEARCH it. Directories that are only traversed (exchange, inbox,
 # attempt) are opened with O_SEARCH (macOS: O_EXEC|O_DIRECTORY = 0x40100000); there is no fallback to a read-mode open.
-_O_SEARCH = getattr(os, 'O_SEARCH', None) or (0x40100000 if sys.platform == 'darwin' else None)
+def _search_flag():
+    """O_SEARCH where it exists (macOS: O_EXEC|O_DIRECTORY, 0x40100000 if Python does not expose it). Linux has no O_SEARCH;
+    O_PATH is its search-only stand-in. Any other platform: None, and the open is refused, never made read-mode."""
+    flag = getattr(os, 'O_SEARCH', None)
+    if flag:
+        return flag
+    if sys.platform == 'darwin':
+        return 0x40100000
+    return getattr(os, 'O_PATH', None) if sys.platform.startswith('linux') else None
+
+
+_O_SEARCH = _search_flag()
 
 
 def search_flags():
