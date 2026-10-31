@@ -304,6 +304,18 @@ class RequestTests(InstalledCase):
         os.symlink(t.cfg, t.inbox / "RUN.lock")
         self.assertRefused(t, ["exec", ATTEMPT])
 
+    def test_search_only_exchange_root_is_accepted(self):
+        """The real exchange root is root:wheel 0711, so the QA user can search but not read it. 0o311 reproduces that for the
+        owner: a read-mode open of it fails with EACCES, the search open must not."""
+        t = self.tree()
+        os.chmod(t.x, 0o311)
+        self.addCleanup(os.chmod, t.x, 0o700)
+        with self.assertRaises(PermissionError):
+            os.close(os.open(t.x, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+        self.assertEqual(self.dry(t)["verb"], "exec")
+        os.chmod(t.x, 0o000)
+        self.assertRefused(t, ["exec", ATTEMPT])
+
     def test_symlinked_inbox_attempt_or_request(self):
         t = self.tree()
         os.rename(t.inbox, t.x / "inbox-real")

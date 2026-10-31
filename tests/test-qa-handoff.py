@@ -2590,5 +2590,145 @@ class QASideModuleTests(unittest.TestCase):
             qa.main(["qa-stage", "--inbox", "a", "--outbox", "b", "--codex-home", "c"])
 
 
+
+class OpenOutboxSearchOnlyTests(unittest.TestCase):
+    """SPE-145: the exchange root is root:wheel 0711, search-only for the producer. The chain must open for search, keep every
+    ownership/no-follow/swap check, and name the real cause of a refusal. Unprivileged: the scratch root is 0o311 (the owner
+    cannot read it, exactly as the producer cannot read the real one)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(os.path.realpath(self.tmp.name))
+        self.x = self.base / "X"
+        self.outbox = self.x / "outbox" / "attempt-1"
+        (self.outbox / "source").mkdir(parents=True)
+        self.me = os.getuid()
+        self.ident = qa.Identity("qa", self.me, self.base / "home", self.x, self.me)
+        self.addCleanup(lambda: os.chmod(self.x, 0o700) if self.x.exists() and not self.x.is_symlink() else None)
+
+    def chain(self):
+        return [p for p, _ in qa.outbox_chain(self.ident, self.outbox)]
+
+    def opened(self):
+        fds, why = qa.open_outbox(self.ident, self.outbox)
+        self.addCleanup(lambda: [os.close(f) for f in fds])
+        return fds, why
+
+    def test_search_only_exchange_root_opens(self):
+        os.chmod(self.x, 0o311)                      # owner: write+search, no read: what the producer has on the real root
+        with self.assertRaises(PermissionError):     # the old read-mode open, shown to fail on this exact mode
+            os.close(os.open(self.x, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+        fds, why = self.opened()
+        self.assertEqual(why, [])
+        self.assertEqual(len(fds), 4)
+        self.assertTrue(qa.outbox_unchanged(self.ident, self.outbox, fds))
+
+    def test_every_open_is_for_search_and_there_is_no_read_mode_retry(self):
+        os.chmod(self.x, 0o311)
+        flags = []
+        real = os.open
+        with unittest.mock.patch("os.open", side_effect=lambda p, f, *a, **k: (flags.append(f), real(p, f, *a, **k))[1]):
+            self.opened()
+        self.assertEqual(len(flags), 4)
+        self.assertTrue(all(f & qa.DIR_FLAGS == qa.DIR_FLAGS for f in flags))
+        os.chmod(self.x, 0o000)
+        flags.clear()
+        with unittest.mock.patch("os.open", side_effect=lambda p, f, *a, **k: (flags.append(f), real(p, f, *a, **k))[1]):
+            fds, why = qa.open_outbox(self.ident, self.outbox)
+        self.assertEqual(len(flags), 1)              # one attempt, not a second try with another mode
+        self.assertEqual(fds, [])
+
+    def test_permission_denied_is_reported_as_such_never_as_a_link(self):
+        os.chmod(self.x, 0o000)
+        fds, why = self.opened()
+        self.assertEqual(fds, [])
+        self.assertIn("cannot be searched (permission denied)", why[0])
+        self.assertNotIn("link", why[0])
+        self.assertNotIn("missing", why[0])
+
+    def test_symlink_at_each_component_is_refused_as_a_symlink(self):
+        for index, path in enumerate(self.chain()):
+            real = path.with_name(path.name + "-real")
+            os.rename(path, real)
+            os.symlink(real, path)
+            try:
+                fds, why = self.opened()
+                self.assertEqual(len(fds), index, path)
+                self.assertEqual(len(why), 1)
+                self.assertIn("is a symbolic link", why[0], path)
+                self.assertIn(str(path), why[0])
+            finally:
+                os.unlink(path)
+                os.rename(real, path)
+
+    def test_file_in_place_of_a_directory_and_a_missing_one(self):
+        for index, path in enumerate(self.chain()[1:], start=1):
+            held = path.with_name(path.name + "-held")
+            os.rename(path, held)
+            path.write_text("not a directory")
+            try:
+                fds, why = self.opened()
+                self.assertIn("is not a directory", why[0], path)
+                self.assertNotIn("link", why[0])
+            finally:
+                os.unlink(path)
+                os.rename(held, path)
+        gone = self.outbox / "source"
+        os.rename(gone, self.outbox / "elsewhere")
+        fds, why = self.opened()
+        self.assertIn("does not exist", why[0])
+
+    def test_wrong_owner_is_refused_with_the_owner_named(self):
+        for index, ident in ((0, qa.Identity("qa", self.me, self.base, self.x, self.me + 1)),
+                             (1, qa.Identity("qa", self.me + 1, self.base, self.x, self.me))):
+            fds, why = qa.open_outbox(ident, self.outbox)
+            self.addCleanup(lambda f=fds: [os.close(x) for x in f])
+            self.assertEqual(len(fds), index + 1)
+            self.assertIn("is owned by uid %d" % self.me, why[0])
+
+    def test_a_directory_swapped_after_the_open_is_detected(self):
+        for index, path in enumerate(self.chain()):
+            fds, why = self.opened()
+            self.assertEqual(why, [])
+            moved = path.with_name(path.name + "-moved")
+            os.rename(path, moved)
+            os.mkdir(path)
+            try:
+                self.assertFalse(qa.outbox_unchanged(self.ident, self.outbox, fds), path)
+            finally:
+                os.rmdir(path)
+                os.rename(moved, path)
+            self.assertTrue(qa.outbox_unchanged(self.ident, self.outbox, fds), path)
+            os.symlink(path, path.with_name(path.name + "-l"))
+            os.unlink(path.with_name(path.name + "-l"))
+
+    def test_sealed_file_refusals_name_their_cause(self):
+        dfd = os.open(self.outbox, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, dfd)
+        (self.outbox / "d").mkdir()
+        os.symlink("/etc/hosts", self.outbox / "l")
+        (self.outbox / "f").write_text("x")
+        os.link(self.outbox / "f", self.outbox / "g")
+        with self.assertRaises(OSError):                 # a directory: refused by the open/fdopen itself
+            qa.read_sealed(dfd, "d", self.me)
+        with self.assertRaises(OSError) as caught:
+            qa.read_sealed(dfd, "g", self.me)
+        self.assertIn("more than one link", str(caught.exception))
+        with self.assertRaises(OSError):
+            qa.read_sealed(dfd, "l", self.me)
+        with self.assertRaises(OSError) as caught:
+            qa.read_sealed(dfd, "f", self.me + 1)
+        self.assertIn("wrong owner", str(caught.exception))
+        self.assertIsNone(qa.read_sealed(dfd, "absent", self.me))
+
+    def test_audit_only_two_directory_opens_in_the_qa_side_still_need_read(self):
+        text = (SCRIPT.parent / "qa-side.py").read_text()
+        reading = [l.strip() for l in text.splitlines() if "O_DIRECTORY" in l and "O_RDONLY" in l]
+        self.assertEqual(len(reading), 2, reading)      # the clone directory and its children: they are listed, so read is needed
+        self.assertTrue(any("'source'" in l for l in reading))
+        self.assertTrue(any("dir_fd=src_fd" in l for l in reading))
+
+
 if __name__ == "__main__":
     unittest.main()
