@@ -161,7 +161,14 @@ PORT_RANGE = (20000, 32767)               # outside the ephemeral range, so a ra
 # System helpers a process could use to reach the network on someone else's behalf; denied to the daemon and the relay. This is a
 # measured deny list, not a proof that no such helper exists (Codex tool commands still reach trustd; see docs/QA-HANDOFF.md).
 MACH_DENY = ('com.apple.trustd', 'com.apple.trustd.agent', 'com.apple.ocspd', 'com.apple.dnssd.service', 'com.apple.nsurlsessiond',
-             'com.apple.nesessionmanager', 'com.apple.cfnetwork.cfnetworkagent')
+             'com.apple.nesessionmanager', 'com.apple.cfnetwork.cfnetworkagent',
+             # Keychain access (securityd reads the QA user's keychain files on a denied process's behalf; measured: `security list-keychains`
+             # fails with this name denied) and LaunchServices (`open`).
+             'com.apple.SecurityServer', 'com.apple.coreservices.launchservicesd')
+# Paths whose contents a daemon or relay may not read although the QA user could: other users' homes, the QA home and the exchange (added
+# per endpoint), and the shared temporary areas tool commands can write. This is a deny list, not a read allowlist: anything else the QA
+# user can read (system and library paths, /opt, /Library) stays readable, which is acceptable only because neither process has a network.
+READ_DENY = ('/Users', '/private/tmp', '/private/var/tmp', '/private/var/folders', '/Volumes')
 SAFE_PATH_RE = re.compile(r'/[A-Za-z0-9._/-]*')
 
 
@@ -172,7 +179,7 @@ class EndpointError(ValueError):
 def _safe_abs(path, what):
     """An absolute, normalised path made of a conservative character set, so it can sit inside a quoted profile string unchanged."""
     text = str(path)
-    if not SAFE_PATH_RE.fullmatch(text) or os.path.normpath(text) != text or text == '/':
+    if not SAFE_PATH_RE.fullmatch(text) or os.path.normpath(text) != text or text == '/' or text.startswith('//'):
         raise EndpointError('%s is not a plain absolute normalised path' % what)
     return text
 
@@ -194,6 +201,13 @@ class Endpoint:
         self.daemon_binary = _safe_abs(daemon_binary, 'daemon binary')
         if not self.daemon_binary.startswith(self.payload_dir + '/'):
             raise EndpointError('the daemon binary is not inside the payload')
+        # A wrong root would silently cancel a read-deny (a later allow wins), so the three roots must be distinct, unnested, and the payload
+        # must sit strictly inside the exchange.
+        if not self.payload_dir.startswith(self.exchange + '/'):
+            raise EndpointError('the payload is not inside the exchange')
+        for a, b in ((self.home, self.exchange), (self.exchange, self.home)):
+            if a == b or a.startswith(b + '/'):
+                raise EndpointError('the QA home and the exchange must be separate directories')
         self.dir = Path(self.home) / 'e' / hashlib.sha256(str(attempt).encode()).hexdigest()[:12]
         self.state, self.tmp, self.rl = self.dir / 's', self.dir / 't', self.dir / 'rl'
         self.daemon_sock = self.state / spec['sock']
@@ -229,7 +243,7 @@ def _sb_header():
 
 
 def _read_deny(endpoint):
-    roots = ['/Users', endpoint.home, endpoint.exchange]
+    roots = list(READ_DENY) + [endpoint.home, endpoint.exchange]
     out = []
     for root in roots:
         if root not in out:
@@ -239,15 +253,17 @@ def _read_deny(endpoint):
 
 def daemon_sb(endpoint):
     """sandbox-exec profile of the candidate daemon: no network except binding its one loopback port and a socket under its state
-    directory; reads denied under /Users, the QA home and the exchange except its own endpoint directory and the payload; writes only
-    to its state and tmp. File-read-metadata on the ancestors is what lets sqlite open a database below a denied directory."""
+    directory; reads denied under READ_DENY, the QA home and the exchange except its own state, tmp and the payload; writes only to its
+    state and tmp. SBPL cannot restrict the bind to 127.0.0.1 (`localhost:P` also admits 0.0.0.0 and ::, measured), so the lifecycle must
+    prove from the listening socket that the daemon bound loopback. File-read-metadata on the ancestors is what lets sqlite open a database below a denied directory."""
     lines = _sb_header()
     lines += ['(allow network-bind (local ip "localhost:%d"))' % endpoint.port, '(allow network-inbound (local ip "localhost:%d"))' % endpoint.port,
               '(allow network-bind (local unix-socket (subpath "%s")))' % endpoint.state,
               '(allow network-inbound (local unix-socket (subpath "%s")))' % endpoint.state]
     lines += _read_deny(endpoint)
-    lines += ['(allow file-read-metadata %s)' % ' '.join('(literal "%s")' % a for a in endpoint.ancestors(endpoint.dir, endpoint.payload_dir)),
-              '(allow file-read* (subpath "%s") (subpath "%s"))' % (endpoint.dir, endpoint.payload_dir), '(deny file-write*)',
+    lines += ['(allow file-read-metadata %s)' % ' '.join('(literal "%s")' % a for a in endpoint.ancestors(endpoint.state, endpoint.tmp, endpoint.payload_dir)),
+              '(allow file-read* (subpath "%s") (subpath "%s") (subpath "%s"))' % (endpoint.state, endpoint.tmp, endpoint.payload_dir),
+              '(deny file-write*)',
               '(allow file-write* (subpath "%s") (subpath "%s") (literal "/dev/null") (literal "/dev/dtracehelper"))' % (endpoint.state, endpoint.tmp)]
     return '\n'.join(lines) + '\n'
 
@@ -260,8 +276,8 @@ def relay_sb(endpoint):
               '(allow network-bind (local unix-socket (subpath "%s")))' % endpoint.rl,
               '(allow network-inbound (local unix-socket (subpath "%s")))' % endpoint.rl]
     lines += _read_deny(endpoint)
-    lines += ['(allow file-read-metadata %s)' % ' '.join('(literal "%s")' % a for a in endpoint.ancestors(endpoint.dir)),
-              '(allow file-read* (subpath "%s"))' % endpoint.dir, '(deny file-write*)',
+    lines += ['(allow file-read-metadata %s)' % ' '.join('(literal "%s")' % a for a in endpoint.ancestors(endpoint.rl)),
+              '(allow file-read* (subpath "%s"))' % endpoint.rl, '(deny file-write*)',
               '(allow file-write* (subpath "%s") (literal "/dev/null"))' % endpoint.rl]
     return '\n'.join(lines) + '\n'
 
