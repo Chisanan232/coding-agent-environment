@@ -166,25 +166,30 @@ you pin two digests that it recomputes from the bytes it loads and copies. `plan
 combined bundle digest and the helper digest. **But `plan` is computed by the checkout's own code, so on its own it proves nothing
 about that checkout** (a tampered installer could print genuine digests while the files differ). The root-owned copy is therefore
 populated from **git objects of the commit you reviewed**, never from the working tree, and you hash the copy yourself before
-approving. `<REPO>` is your checkout, `<REVIEWED_HEAD>` the full commit id you reviewed (`plan` prints these lines with the
-placeholders):
+approving. `plan` prints the block below (the same text; a test keeps them equal); run it line by line in your shell after setting
+`REPO` and `H` on its first line, and stop at any `REFUSED`. Every expansion is double-quoted (paths with spaces, zsh), the target is
+a new or empty directory, an extracted link, directory or extra file is refused **before** any `chown` or `chmod` could follow it,
+and `chown`/`chmod` use `-h` so a link is never followed:
 
 ```
-sudo install -d -m 755 -o root -g wheel /Library/cae-qa-install
-git -C <REPO> archive <REVIEWED_HEAD> scripts/qa-hop-install.py scripts/qa-identity-setup.py scripts/qa-handoff.py scripts/qa-side.py \
-  | sudo tar -x -o -C /Library/cae-qa-install --strip-components=1
-sudo chown -R root:wheel /Library/cae-qa-install && sudo chmod 755 /Library/cae-qa-install && sudo chmod 644 /Library/cae-qa-install/*.py
-
-# hash the files AFTER the copy and compare each with the reviewed object (the two columns must match)
-for f in qa-hop-install qa-identity-setup qa-handoff qa-side; do
-  shasum -a 256 /Library/cae-qa-install/$f.py; git -C <REPO> show <REVIEWED_HEAD>:scripts/$f.py | shasum -a 256; done
-
-# the combined bundle digest: sha256 of the lines "name sha256" for the names in sorted order, rebuilt from the git objects
-for f in qa-handoff qa-hop-install qa-identity-setup qa-side; do
-  printf '%s %s\n' $f.py "$(git -C <REPO> show <REVIEWED_HEAD>:scripts/$f.py | shasum -a 256 | cut -d' ' -f1)"; done | shasum -a 256
+# 1. Set REPO (your checkout) and H (the full commit id you reviewed) once; D is fixed.
+REPO='<REPO>'; H='<REVIEWED_HEAD>'; D=/Library/cae-qa-install
+# 2. A new or empty directory only; stop if any step prints REFUSED.
+sudo install -d -m 755 -o root -g wheel "${D}" && test -z "$(sudo ls -A "${D}")" || { echo "REFUSED: ${D} already has content; move it aside"; false; }
+# 3. Extract from git objects of the reviewed commit, never from the working tree.
+git -C "${REPO}" archive "${H}" scripts/qa-hop-install.py scripts/qa-identity-setup.py scripts/qa-handoff.py scripts/qa-side.py | sudo tar -x -o -C "${D}" --strip-components=1
+# 4. Refuse a link, directory or extra file BEFORE any chown or chmod could follow it.
+test -z "$(sudo find "${D}" -mindepth 1 ! -type f)" && test "$(sudo find "${D}" -type f | wc -l | tr -d ' ')" = 4 || { echo "REFUSED: the extract holds a link, a directory or an unexpected file"; false; }
+# 5. Root-own the copy (-h: never follow a link).
+sudo chown -R -h root:wheel "${D}" && sudo chmod 755 "${D}" && sudo chmod -h 644 "${D}"/*.py
+# 6. Hash the copy AFTER the copy; each pair of lines must be identical.
+for f in qa-hop-install qa-identity-setup qa-handoff qa-side; do shasum -a 256 "${D}/${f}.py"; git -C "${REPO}" show "${H}:scripts/${f}.py" | shasum -a 256; done
+# 7. Rebuild the combined bundle digest from the git objects (sha256 of the sorted "name sha256" lines); it must equal the
+#    combined digest printed by plan. git rev-parse blob ids are SHA-1: informational only, never the pin.
+for f in qa-handoff qa-hop-install qa-identity-setup qa-side; do printf '%s %s\n' "${f}.py" "$(git -C "${REPO}" show "${H}:scripts/${f}.py" | shasum -a 256 | cut -d' ' -f1)"; done | shasum -a 256
 ```
 
-The combined digest must equal the one `plan` printed. The ids from `git -C <REPO> rev-parse <REVIEWED_HEAD>:scripts/<file>` are git
+The combined digest must equal the one `plan` printed. The ids from `git -C "${REPO}" rev-parse "${H}:scripts/<file>"` are git
 SHA-1 blob ids: informational only (they are what the PR shows), never the pin. Only if every pair and the combined digest match,
 run the one root command, through your own `sudo` (the installer never asks for or stores a password and never calls sudo itself);
 the digests are the ones `plan` printed:
@@ -211,7 +216,8 @@ Afterwards, unprivileged: `python3 -I -B scripts/qa-hop-install.py verify <same 
 /Library/cae-qa/qa-side version`. Codex smoke test: the delegation refuses the pinned `codex` on purpose, so run it through your
 own password-gated sudo: `cd / && sudo -u NAME /Library/cae-qa/codex --version`. Rollback (root, from the same copy; removes the drop-in first,
 then the files, safe to repeat; it removes the drop-in at its fixed paths even if `/etc/sudoers.d` fails the trust check, warning loudly, and if
-anything cannot be removed it exits non-zero and prints the exact `sudo rm -f` commands): `sudo /usr/bin/python3 -I -B /Library/cae-qa-install/qa-hop-install.py rollback --qa-name NAME
+anything cannot be removed it exits non-zero and prints the exact `sudo rm -f` commands; it removes the drop-in only if it is a regular file
+whose first line is the marker this installer writes, otherwise it leaves it, warns and exits non-zero): `sudo /usr/bin/python3 -I -B /Library/cae-qa-install/qa-hop-install.py rollback --qa-name NAME
 --qa-uid UID`.
 
 **Unverified until the owner pilot:** regular-expression arguments and digest pinning under a real `sudo`, `setsid` under it, signal
