@@ -509,11 +509,154 @@ def process_owner(pid):
     raise ReservationError('cannot inspect process %d: ps exit %d' % (pid, done.returncode))
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Declared workload classes and estimates (SPE-150 PR3). RECORD-ONLY: these fields are validated, stored and shown, and no
+# admission decision (lane cap, byte floor, grant order) reads them yet. A job declares what it expects to need; an
+# estimate can be raised by the caller but never lowered below the class default.
+#
+# THE NUMBERS BELOW ARE GUESSES, deliberately conservative. They may be lowered only by a reviewed constants change
+# backed by evidence from `disk-admission.py measurements`, never by a caller and never in passing.
+# mem = mem_base_mib + mem_per_job_mib * jobs; jobs/min_jobs are the default and the lowest degraded parallelism
+# (min_jobs is documented for the later admission change and is not read by this one); disk_gib is the default for
+# --bytes; excl names what two jobs of the class must not share ('target' = the Cargo target directory, 'docker' = the
+# Docker daemon). A class with no entry values (light, remote) has no defaults. No class means the legacy meaning: the
+# whole budget and all cores, recorded as nothing.
+WORKLOAD_CLASSES = {
+    'light': {},
+    'remote': {},
+    'build-crate': {'mem_base_mib': 2048, 'mem_per_job_mib': 1024, 'jobs': 4, 'min_jobs': 2, 'disk_gib': 10, 'excl': 'target'},
+    'build-workspace': {'mem_base_mib': 4096, 'mem_per_job_mib': 1536, 'jobs': 8, 'min_jobs': 4, 'disk_gib': 40, 'excl': 'target'},
+    'build-cold-isolated': {'mem_base_mib': 4096, 'mem_per_job_mib': 1536, 'jobs': 8, 'min_jobs': 4, 'disk_gib': 60,
+                            'excl': 'target'},
+    'container-suite': {'mem_base_mib': 12288, 'mem_per_job_mib': 0, 'jobs': 4, 'min_jobs': 2, 'disk_gib': 20, 'excl': 'docker'},
+}
+CLASS_RE = re.compile(r'[a-z][a-z0-9-]{0,31}')
+MAX_MEM_BYTES = 2 ** 44      # 16 TiB: far above any real host, small enough to reject absurd or hostile values
+MAX_CPU_SLOTS = 1024
+MAX_EXCL_KEYS = 8
+MAX_EXCL_KEY_LEN = 512
+WORKLOAD_FIELDS = ('class', 'mem_bytes', 'cpu_slots', 'test_threads', 'excl_keys', 'created', 'owner')
+DECLARED_FIELDS = ('class', 'mem_bytes', 'cpu_slots', 'test_threads')   # compared at claim; the rest is provenance
+MIB = 1024 ** 2
+
+
+def _cargo_target_dir(env, home, cwd):
+    """The Cargo target directory this job would use, resolved from CARGO_TARGET_DIR, else the user's Cargo config
+    (`build.target-dir`), else ./target. Reads one small file; executes nothing."""
+    def absolute(value, base):
+        return os.path.normpath(value if os.path.isabs(value) else os.path.join(base, value))
+
+    value = env.get('CARGO_TARGET_DIR')
+    if isinstance(value, str) and value:
+        return absolute(value, cwd)
+    try:
+        import tomllib
+        descriptor = os.open(Path(home) / '.cargo/config.toml', os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, 'rb') as handle:
+            if stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                configured = tomllib.loads(handle.read(65536).decode()).get('build', {}).get('target-dir')
+                if isinstance(configured, str) and configured and '\0' not in configured:
+                    return absolute(configured, str(home))
+    except Exception:
+        pass
+    return absolute('target', cwd)
+
+
+def resolve_workload(name, mem_gib, cpus, nbytes, env=None, home=None, cwd=None, session_id=None, ticket=None, now=None):
+    """(fields, error). fields is {} when nothing was declared (the legacy meaning), else the optional record fields.
+
+    Unknown class names fail closed. --mem-gib, --cpus and --bytes may raise an estimate and never lower it below the class
+    default. Nothing is executed and nothing outside the Cargo config is read.
+    """
+    if name is None and mem_gib is None and cpus is None:
+        return {}, None
+    spec = None
+    if name is not None:
+        if not (isinstance(name, str) and name in WORKLOAD_CLASSES):
+            return None, 'invalid-request: unknown workload class (known: %s)' % ', '.join(sorted(WORKLOAD_CLASSES))
+        spec = WORKLOAD_CLASSES[name]
+    if mem_gib is not None and not (type(mem_gib) in (int, float) and 0 < mem_gib <= MAX_MEM_BYTES / GIB and mem_gib == mem_gib):
+        return None, 'invalid-request: --mem-gib is out of range'
+    if cpus is not None and not (type(cpus) is int and 0 < cpus <= MAX_CPU_SLOTS):
+        return None, 'invalid-request: --cpus is out of range'
+    default_mem = default_cpus = None
+    if spec:
+        default_cpus = spec['jobs']
+        default_mem = (spec['mem_base_mib'] + spec['mem_per_job_mib'] * spec['jobs']) * MIB
+        if nbytes is not None and nbytes < spec['disk_gib'] * GIB:
+            return None, 'invalid-request: --bytes is below the %s default of %d GiB (an estimate can be raised, never lowered)' % (
+                name, spec['disk_gib'])
+    mem_bytes = int(mem_gib * GIB) if mem_gib is not None else None
+    if default_mem is not None and mem_bytes is not None and mem_bytes < default_mem:
+        return None, 'invalid-request: --mem-gib is below the %s default of %.2f GiB (an estimate can be raised, never lowered)' % (
+            name, default_mem / GIB)
+    if default_cpus is not None and cpus is not None and cpus < default_cpus:
+        return None, 'invalid-request: --cpus is below the %s default of %d (an estimate can be raised, never lowered)' % (
+            name, default_cpus)
+    mem_bytes = mem_bytes if mem_bytes is not None else default_mem
+    slots = cpus if cpus is not None else default_cpus
+    fields = {}
+    if name is not None:
+        fields['class'] = name
+    if mem_bytes is not None:
+        fields['mem_bytes'] = mem_bytes
+    if slots is not None:
+        fields['cpu_slots'] = slots
+        fields['test_threads'] = slots
+    if spec:
+        env = os.environ if env is None else env
+        if spec['excl'] == 'target':
+            key = 'cargo-target:' + _cargo_target_dir(env, home if home is not None else account_home(), cwd or os.getcwd())
+        else:
+            key = spec['excl']
+        fields['excl_keys'] = [key]
+    elif name is not None:
+        fields['excl_keys'] = []
+    fields['created'] = iso_utc(now or datetime.now(timezone.utc))
+    fields['owner'] = {'uid': os.getuid(), 'session_id': session_id, 'ticket': ticket}
+    return fields, None
+
+
+def _valid_declared(record):
+    """Schema check of the optional SPE-150 fields on a reservation or queue entry. Absent fields are fine (legacy);
+    present ones must be well typed and in range, with booleans never accepted as numbers."""
+    def number(key, upper):
+        return key not in record or (type(record[key]) is int and 0 < record[key] <= upper)
+
+    owner = record.get('owner')
+    return (('class' not in record or (isinstance(record['class'], str) and CLASS_RE.fullmatch(record['class']) is not None))
+            and number('mem_bytes', MAX_MEM_BYTES) and number('cpu_slots', MAX_CPU_SLOTS) and number('test_threads', MAX_CPU_SLOTS)
+            and ('excl_keys' not in record or (isinstance(record['excl_keys'], list) and len(record['excl_keys']) <= MAX_EXCL_KEYS
+                                               and all(isinstance(k, str) and 0 < len(k) <= MAX_EXCL_KEY_LEN
+                                                       and not any(ord(c) < 32 or ord(c) == 127 for c in k) for k in record['excl_keys'])))
+            and ('created' not in record or _valid_time_text(record['created']))
+            and ('owner' not in record or (isinstance(owner, dict) and type(owner.get('uid')) is int and 0 <= owner['uid'] < 2 ** 32
+                                           and (owner.get('session_id') is None or (isinstance(owner['session_id'], str)
+                                                and SESSION_RE.fullmatch(owner['session_id']) is not None))
+                                           and (owner.get('ticket') is None or (isinstance(owner['ticket'], str)
+                                                and TICKET_RE.fullmatch(owner['ticket']) is not None)))))
+
+
+def _valid_time_text(text):
+    try:
+        return isinstance(text, str) and len(text) <= 64 and datetime.fromisoformat(text.replace('Z', '+00:00')).tzinfo is not None
+    except ValueError:
+        return False
+
+
+def _declared(record):
+    return tuple(record.get(key) for key in DECLARED_FIELDS)
+
+
+def _declared_fields(record):
+    return {key: record[key] for key in WORKLOAD_FIELDS if key in record}
+
+
 def reservations_dir(state_path):
     return state_path.parent / RESERVATIONS_DIR
 
 
-def write_reservation(state_path, label, nbytes, pid, token, expires, queue_id=None, workload=None):
+def write_reservation(state_path, label, nbytes, pid, token, expires, queue_id=None, workload=None, declared=None):
     """Create or replace this job's reservation file; call while holding state_lock."""
     directory = reservations_dir(state_path)
     _refuse_symlinks(directory / label)
@@ -521,6 +664,8 @@ def write_reservation(state_path, label, nbytes, pid, token, expires, queue_id=N
     os.chmod(directory, 0o700)
     record = {'version': STATE_VERSION, 'label': label, 'bytes': nbytes, 'pid': pid,
               'start_token': token, 'expires': iso_utc(expires)}
+    if declared:
+        record.update(declared)
     if queue_id:
         record['queue_id'] = queue_id
     if workload is not None:
@@ -557,7 +702,8 @@ def _read_reservation(path):
              and type(record.get('bytes')) is int and record['bytes'] > 0
              and type(record.get('pid')) is int and record['pid'] > 0
              and isinstance(record.get('start_token'), str) and isinstance(record.get('expires'), str))
-    if not valid or ('workload' in record and not _valid_workload(record['workload'], record['pid'])):
+    if (not valid or ('workload' in record and not _valid_workload(record['workload'], record['pid']))
+            or not _valid_declared(record)):
         raise ValueError('wrong schema')
     expires_at = datetime.fromisoformat(record['expires'].replace('Z', '+00:00'))
     if expires_at.tzinfo is None:
@@ -699,16 +845,16 @@ def _refusal(reason, **extra):
 
 
 def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None,
-            token_fn=process_token, ttl=DEFAULT_TTL, owner_fn=process_owner, allow_long=False, table_fn=None):
+            token_fn=process_token, ttl=DEFAULT_TTL, owner_fn=process_owner, allow_long=False, table_fn=None, declared=None):
     """Admit or refuse via _reserve, then record a measurement sample outside the lock for an admitted reservation."""
     now = now or datetime.now(timezone.utc)
-    result = _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long, table_fn)
+    result = _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long, table_fn, declared)
     if result.get('admit') and str(result.get('reason', '')).startswith('reserved '):
         _measure(state_path, 'reserve', result.get('free_bytes'), now)
     return result
 
 
-def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long, table_fn=None):
+def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long, table_fn=None, declared=None):
     """Admit one heavy job and record its byte reservation, or refuse.
 
     Admission needs: heavy admitted by tier and latch, a free heavy lane, and
@@ -719,6 +865,8 @@ def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_
     if not (isinstance(label, str) and LABEL_RE.fullmatch(label) and type(nbytes) is int and nbytes > 0
             and type(pid) is int and pid > 0 and type(ttl) is int and 0 < ttl <= (MAX_TTL if allow_long else DEFAULT_TTL)):
         return _refusal('invalid-request: label, bytes, pid or ttl is out of range')
+    if declared and not (isinstance(declared, dict) and set(declared) <= set(WORKLOAD_FIELDS) and _valid_declared(declared)):
+        return _refusal('invalid-request: workload class or estimates are malformed')
     now = now or datetime.now(timezone.utc)
     try:
         with state_lock(state_path):
@@ -760,6 +908,8 @@ def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_
                 if ahead:
                     return dict(result, admit=False, reason='queue-ahead: %d queued entries wait for the heavy lane (first %s, %s); '
                                 'enqueue instead of reserving directly' % (len(ahead), ahead[0]['id'], ahead[0]['label']))
+            if same and not declared and any(_declared(same[0])):
+                declared = _declared_fields(same[0])   # a refresh without a declaration keeps what the job declared before
             if same and same[0].get('workload') is not None:
                 workload = merge_workload(same[0]['workload'], workload)   # a refresh must not forget reparented members
             lanes = HEAVY_LANES[result['tier']]
@@ -774,7 +924,7 @@ def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_
                 return dict(result, admit=False, reserved_bytes=reserved,
                             reason='over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
                                 result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB))
-            write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), workload=workload)
+            write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), workload=workload, declared=declared)
             return dict(result, reserved_bytes=reserved + nbytes,
                         reason='reserved %.1f GiB for %s (lane %d of %d)' % (nbytes / GIB, label, len(others) + 1, lanes))
     except StateError as exc:
@@ -1139,7 +1289,7 @@ def _read_queue_entry(path):
              and (entry['state'] != 'CLAIMED' or (isinstance(entry.get('holder'), dict) and type(entry['holder'].get('pid')) is int
                                                   and isinstance(entry['holder'].get('start_token'), str)
                                                   and ('workload' not in entry['holder'] or _valid_workload(entry['holder']['workload'], entry['holder']['pid'])))))
-    if not valid:
+    if not valid or not _valid_declared(entry):
         raise ValueError('wrong schema')
     return entry
 
@@ -1199,9 +1349,13 @@ def _queue_salt(state_path):
     return salt
 
 
-def _fingerprint(salt, repo, worktree, tickets, argv, nbytes):
-    canonical = json.dumps({'repo': repo, 'worktree': worktree, 'tickets': sorted(tickets), 'argv': list(argv), 'bytes': nbytes},
-                           sort_keys=True, separators=(',', ':'))
+def _fingerprint(salt, repo, worktree, tickets, argv, nbytes, declared=None):
+    """Salted digest of the job. `declared` (class, mem_bytes, cpu_slots, test_threads) joins the digest only when something was
+    declared, so a legacy entry's fingerprint is byte-identical to what it was before SPE-150 PR3."""
+    material = {'repo': repo, 'worktree': worktree, 'tickets': sorted(tickets), 'argv': list(argv), 'bytes': nbytes}
+    if declared and any(value is not None for value in declared):
+        material['declared'] = list(declared)
+    canonical = json.dumps(material, sort_keys=True, separators=(',', ':'))
     return hmac.new(salt, canonical.encode(), hashlib.sha256).hexdigest()
 
 
@@ -1235,7 +1389,7 @@ def _claimed_orphans(entries, live, token_fn, table_fn=None, state_path=None):
 
 
 def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_id, nbytes, argv, again=False, now=None,
-                  wait_s=QUEUE_WAIT_S):
+                  wait_s=QUEUE_WAIT_S, declared=None):
     """Add one durable entry, or return the live one with the same fingerprint. Never stores argv."""
     now = now or datetime.now(timezone.utc)
     bad = None
@@ -1258,6 +1412,8 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
         bad = 'wait'
     elif not (isinstance(worktree, str) and os.path.isabs(worktree) and os.path.isdir(worktree)):
         bad = 'worktree'
+    elif declared and not (isinstance(declared, dict) and set(declared) <= set(WORKLOAD_FIELDS) and _valid_declared(declared)):
+        bad = 'workload'
     if bad:
         return {'ok': False, 'reason': 'invalid-request: %s is missing or out of range' % bad}
     real_worktree = os.path.realpath(worktree)
@@ -1272,7 +1428,7 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
             except ValueError as exc:
                 return {'ok': False, 'reason': 'queue-salt-unreadable: %s; remove queue/fingerprint.salt only when no entry is live '
                                                '(a new salt stops dedupe of existing entries)' % exc}
-            fingerprint = _fingerprint(salt, repo, real_worktree, tickets, argv, nbytes)
+            fingerprint = _fingerprint(salt, repo, real_worktree, tickets, argv, nbytes, _declared(declared or {}))
             for entry in entries:
                 if entry['fingerprint'] != fingerprint:
                     continue
@@ -1304,6 +1460,7 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
                      'tickets': list(tickets), 'repo': repo, 'worktree': real_worktree, 'harness': harness,
                      'session_id': session_id, 'owner_uid': os.getuid(), 'bytes': nbytes, 'fingerprint': fingerprint,
                      'created': iso_utc(now), 'wait_expires': iso_utc(now + timedelta(seconds=wait_s)), 'grant': None}
+            entry.update({k: v for k, v in (declared or {}).items() if k != 'created'})  # the entry already has `created`
             if (queue_dir(state_path) / (entry['id'] + '.json')).exists():
                 return {'ok': False, 'reason': 'queue-entry-unreadable: %s already exists' % entry['id']}
             write_json_atomic(seq_path, {'next': seq + 1})  # counter first: a crash leaves a gap, never a reused id
@@ -1449,7 +1606,7 @@ def _memory_precondition():
 
 def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_bytes, pid=None, now=None, token_fn=process_token,
                 owner_fn=process_owner, ttl=DEFAULT_TTL, memory_fn=_memory_precondition, exec_fn=None, allow_long=False,
-                table_fn=None):
+                table_fn=None, declared=None):
     """Claim a granted lane for this very process, then exec the job; every precondition is revalidated first.
 
     Outside the lock: the entry must be GRANTED and unlapsed, owned by this uid, and match label, bytes, worktree and job
@@ -1484,13 +1641,16 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
             return '%s belongs to another user' % qid
         if entry['label'] != label or entry['bytes'] != nbytes:
             return '%s was granted for label %s and %d bytes' % (qid, entry['label'], entry['bytes'])
+        if _declared(entry) != _declared(declared or {}):
+            return '%s was queued with a different workload class or estimate (class %s, mem_bytes %s, cpu_slots %s)' % (
+                qid, entry.get('class'), entry.get('mem_bytes'), entry.get('cpu_slots'))
         if os.path.realpath(cwd) != entry['worktree']:
             return '%s was granted for worktree %s' % (qid, entry['worktree'])
         try:
             salt = _queue_salt(state_path)
         except (OSError, ValueError) as exc:
             return 'queue-salt-unreadable: %s' % exc
-        if _fingerprint(salt, entry['repo'], entry['worktree'], entry['tickets'], argv, nbytes) != entry['fingerprint']:
+        if _fingerprint(salt, entry['repo'], entry['worktree'], entry['tickets'], argv, nbytes, _declared(entry)) != entry['fingerprint']:
             return '%s was granted for a different job (fingerprint mismatch)' % qid
         return None
 
@@ -1552,7 +1712,8 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
             if wrapper_is_zombie(pid, token, table_fn):
                 return refuse('process-not-running: pid %d has exited' % pid)
             workload = capture_workload(pid, token, table_fn)
-            write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), queue_id=qid, workload=workload)
+            write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), queue_id=qid, workload=workload,
+                              declared=dict(_declared_fields(entry), created=iso_utc(now)) if any(_declared(entry)) else None)
             try:
                 entry['state'] = 'CLAIMED'
                 entry['holder'] = {'pid': pid, 'start_token': token, 'claimed_at': iso_utc(now), 'workload': workload}
@@ -1605,6 +1766,12 @@ def _handoff(entry):
                   (shlex.quote(entry['worktree']), entry['session_id']))
     claim = ('cd %s && disk-admission.py run --queue-id %s --label %s --bytes %d -- <the exact job>' % (
         shlex.quote(entry['worktree']), entry['id'], entry['label'], entry['bytes']))
+    if any(_declared(entry)):
+        # Always the recorded values: the claim re-resolves them and must match the entry exactly, raised estimates included.
+        claim = claim.replace(' -- <the exact job>', ''.join(
+            [' --class ' + entry['class']] * ('class' in entry) +
+            [' --mem-gib %s' % (entry['mem_bytes'] / GIB)] * ('mem_bytes' in entry) +
+            [' --cpus %d' % entry['cpu_slots']] * ('cpu_slots' in entry)) + ' -- <the exact job>')
     return {'resume': resume, 'claim': claim}
 
 
@@ -1721,6 +1888,11 @@ def queue_cancel(state_path, qid, now=None, session_id=None):
 
 
 
+def declared_summary(records):
+    """One row per reservation that declared a class or estimate; empty for legacy reservations. Read-only display."""
+    return [dict({'label': r['label'], 'pid': r['pid']}, **_declared_fields(r)) for r in records if any(_declared(r))]
+
+
 SNAPSHOT_SCHEMA = 1
 SNAPSHOT_NAME = 'snapshot.json'
 STALE_AFTER_S = 120
@@ -1803,6 +1975,8 @@ def _snapshot(state_path, source_fn, now, token_fn, table_fn=None):
                       'reserved_bytes': sum(r['bytes'] for r in live),
                       'protection': 'wired' if GATE_PROVEN_WIRED else 'advisory-not-wired',
                       'blockers': blockers, 'source': seen.get('source')}
+            if declared_summary(live):
+                record['workloads'] = declared_summary(live)   # display only: no decision reads it
             write_json_atomic(state_path.with_name(SNAPSHOT_NAME), record)
             return record
     except StateError as exc:
@@ -1840,7 +2014,7 @@ def _exec_job(program, args):
 
 
 def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, ttl=DEFAULT_TTL, allow_long=False,
-                 exec_fn=_exec_job):
+                 exec_fn=_exec_job, declared=None):
     """Reserve for this very process, then exec the job: nothing runs before admission.
 
     execv keeps the pid and the start time, so the reservation is held by the job itself and ends with it
@@ -1852,7 +2026,7 @@ def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, tt
     if not argv or not all(isinstance(part, str) and '\0' not in part for part in argv) or not argv[0]:
         print('refused: invalid-request: a command is required after --', file=sys.stderr)
         return REFUSED_EXIT
-    result = reserve(label, nbytes, os.getpid(), state_path, free_fn, ttl=ttl, allow_long=allow_long)
+    result = reserve(label, nbytes, os.getpid(), state_path, free_fn, ttl=ttl, allow_long=allow_long, declared=declared)
     if not result['admit']:
         print(result['reason'], file=sys.stderr)
         return REFUSED_EXIT
@@ -1865,6 +2039,18 @@ def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, tt
         print('exec failed: %s' % exc, file=sys.stderr)
         return 127
     return 0  # only reachable with an injected exec_fn
+
+
+def _add_workload_args(parser):
+    parser.add_argument('--class', dest='workload_class', help='declared workload class (%s); recorded, not yet used to admit' %
+                        ', '.join(sorted(WORKLOAD_CLASSES)))
+    parser.add_argument('--mem-gib', type=float, dest='mem_gib', help='declared memory estimate; may raise the class default, never lower it')
+    parser.add_argument('--cpus', type=int, dest='cpus', help='declared CPU slots; may raise the class default, never lower it')
+
+
+def _declared_from_args(args, nbytes, session_id=None, ticket=None):
+    """(fields, error) for the CLI: resolves the declared class and estimates without executing anything."""
+    return resolve_workload(args.workload_class, args.mem_gib, args.cpus, nbytes, session_id=session_id, ticket=ticket)
 
 
 def build_parser():
@@ -1881,6 +2067,7 @@ def build_parser():
     take.add_argument('--label', required=True)
     take.add_argument('--ttl-s', type=int, default=DEFAULT_TTL, dest='ttl', help='seconds, at most 4 h unless --max-hold')
     take.add_argument('--max-hold', action='store_true', dest='allow_long', help='allow a hold of up to 24 h')
+    _add_workload_args(take)
     shot = commands.add_parser('snapshot', allow_abbrev=False, help='publish the host resource snapshot')
     mode = shot.add_mutually_exclusive_group(required=True)
     mode.add_argument('--json', action='store_true', help='write and print a fresh snapshot')
@@ -1894,6 +2081,7 @@ def build_parser():
     go.add_argument('--label', required=True)
     go.add_argument('--ttl-s', type=int, default=DEFAULT_TTL, dest='ttl', help='seconds, at most 4 h unless --max-hold')
     go.add_argument('--max-hold', action='store_true', dest='allow_long')
+    _add_workload_args(go)
     go.add_argument('--queue-id', dest='queue_id', help='claim a granted heavy-lane queue entry (revalidated first)')
     go.add_argument('job', nargs=argparse.REMAINDER, help='-- COMMAND [ARG...]')
     drop = commands.add_parser('release', allow_abbrev=False, help='release a reservation by label')
@@ -1910,6 +2098,7 @@ def build_parser():
     enq.add_argument('--bytes', type=int, required=True, dest='nbytes')
     enq.add_argument('--wait-s', type=int, default=QUEUE_WAIT_S, dest='wait_s')
     enq.add_argument('--again', action='store_true')
+    _add_workload_args(enq)
     enq.add_argument('job', nargs=argparse.REMAINDER, help='-- COMMAND [ARG...]')
     adv = qcmds.add_parser('advance', allow_abbrev=False, help='expire lapsed entries and grant the first in line if a lane is free')
     adv.add_argument('--grant-s', type=int, default=QUEUE_GRANT_S, dest='grant_s')
@@ -1922,6 +2111,7 @@ def build_parser():
     clm.add_argument('--pid', type=int, required=True, help='the live process of this user that holds the lane until it exits')
     clm.add_argument('--ttl-s', type=int, default=DEFAULT_TTL, dest='ttl')
     clm.add_argument('--max-hold', action='store_true', dest='allow_long')
+    _add_workload_args(clm)
     clm.add_argument('job', nargs=argparse.REMAINDER, help='-- COMMAND [ARG...] (the exact job the grant was queued for)')
     qcx = qcmds.add_parser('cancel', allow_abbrev=False, help='cancel a waiting or unclaimed entry')
     qcx.add_argument('--id', required=True, dest='qid')
@@ -1962,8 +2152,12 @@ def _queue_cli(args, state_path, free_fn):
         if args.job[:1] != ['--']:
             print('refused: invalid-request: put -- between the options and the command', file=sys.stderr)
             return REFUSED_EXIT
+        declared, error = _declared_from_args(args, args.nbytes, args.session_id, args.tickets[0] if args.tickets else None)
+        if error:
+            print(json.dumps({'ok': False, 'reason': error}))
+            return REFUSED_EXIT
         out = queue_enqueue(state_path, args.label, args.tickets, args.repo, args.worktree, args.harness, args.session_id,
-                            args.nbytes, args.job[1:], again=args.again, wait_s=args.wait_s)
+                            args.nbytes, args.job[1:], again=args.again, wait_s=args.wait_s, declared=declared)
     elif command == 'advance':
         out = queue_advance(state_path, free_fn, grant_s=args.grant_s)
         out['ok'] = out['reason'] in ('ok',) or bool(out['granted'] or out['expired'] or out['eligible']) or out['reason'] in (
@@ -1976,9 +2170,13 @@ def _queue_cli(args, state_path, free_fn):
         if args.job[:1] != ['--']:
             print(json.dumps({'ok': False, 'reason': 'invalid-request: put -- between the options and the command'}))
             return REFUSED_EXIT
+        declared, error = _declared_from_args(args, args.nbytes)
+        if error:
+            print(json.dumps({'ok': False, 'reason': error}))
+            return REFUSED_EXIT
         out = queue_claim(state_path, args.qid, args.label, args.nbytes, args.job[1:], os.getcwd(), free_fn, pid=args.pid,
                           ttl=args.ttl, allow_long=args.allow_long, memory_fn=lambda: _memory_precondition(),
-                          exec_fn=lambda program, argv: None)
+                          exec_fn=lambda program, argv: None, declared=declared)
         out.pop('exit', None)
     elif command == 'cancel':
         out = queue_cancel(state_path, args.qid, session_id=args.session_id)
@@ -2005,13 +2203,17 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
             print('refused: invalid-request: put -- between the options and the command', file=sys.stderr)
             return REFUSED_EXIT
         job = args.job[1:]
+        declared, error = _declared_from_args(args, args.nbytes)
+        if error:
+            print('refused: ' + error, file=sys.stderr)
+            return REFUSED_EXIT
         if args.queue_id:
             out = queue_claim(state_path, args.queue_id, args.label, args.nbytes, job, os.getcwd(), free_fn, ttl=args.ttl,
-                              allow_long=args.allow_long)
+                              allow_long=args.allow_long, declared=declared)
             if not out['ok']:
                 print(out['reason'], file=sys.stderr)
             return out['exit'] if not out['ok'] else 0
-        return run_reserved(args.label, args.nbytes, job, state_path, free_fn, args.ttl, args.allow_long)
+        return run_reserved(args.label, args.nbytes, job, state_path, free_fn, args.ttl, args.allow_long, declared=declared)
     if args.command == 'measurements':
         summary = measurements_summary(state_path)
         print(json.dumps(summary, sort_keys=True) if args.json else format_measurements(summary))
@@ -2019,7 +2221,12 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
     if args.command == 'queue':
         return _queue_cli(args, state_path, free_fn)
     if args.command in ('reserve', 'release'):
-        result = (reserve(args.label, args.nbytes, args.pid, state_path, free_fn, ttl=args.ttl, allow_long=args.allow_long)
+        declared, error = _declared_from_args(args, args.nbytes) if args.command == 'reserve' else ({}, None)
+        if error:
+            print('refused: ' + error)
+            return REFUSED_EXIT
+        result = (reserve(args.label, args.nbytes, args.pid, state_path, free_fn, ttl=args.ttl, allow_long=args.allow_long,
+                          declared=declared)
                   if args.command == 'reserve' else release(args.label, state_path))
         print(result['reason'])
         return 0 if result['admit'] else REFUSED_EXIT
@@ -2042,7 +2249,14 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
     result = evaluate(args.weight if args.command == 'check' else None, state_path, free_fn)
     if args.command == 'status':
         keys = ('tier', 'free_bytes', 'latch', 'timestamp')
-        print(json.dumps(dict({key: result[key] for key in keys}, **({} if result['tier'] else {'error': result['reason']})), sort_keys=True))
+        shown = dict({key: result[key] for key in keys}, **({} if result['tier'] else {'error': result['reason']}))
+        try:
+            workloads = declared_summary(_reservation_holders(state_path))
+        except OSError:
+            workloads = []
+        if workloads:
+            shown['workloads'] = workloads
+        print(json.dumps(shown, sort_keys=True))
         return 0 if result['tier'] else REFUSED_EXIT
     free = 'unknown' if result['free_bytes'] is None else '%.1f GiB' % (result['free_bytes'] / GIB)
     exact = 'unknown' if result['free_bytes'] is None else result['free_bytes']
