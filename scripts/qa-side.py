@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 
 HOME = Path.home()
@@ -164,10 +165,12 @@ CONTROLS = (
     ('neg_testnet_connect', "import socket\ntry:\n    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    s.settimeout(3)\n    s.connect(('192.0.2.1', 9))\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
 )
 # Only with a payload. pos_exec_payload runs inside the sandbox whatever exec_probe_argv() names: ALLOWED when the process started (any exit
-# status, even a timeout), DENIED:<errno> when the spawn itself is refused.
+# status, even a timeout), DENIED:<errno> when the spawn itself is refused. It executes producer-supplied code, so it is the one control
+# that is held back until every other control (the base set and neg_write_payload) has run and passed; see confinement_probe.
+PAYLOAD_EXEC_CONTROLS = ('pos_exec_payload',)
 PAYLOAD_CONTROLS = (
-    ('pos_exec_payload', "import subprocess\ntry:\n    subprocess.run({exec_argv!r}, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)\n    print('ALLOWED')\nexcept subprocess.TimeoutExpired:\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'ALLOWED'),
     ('neg_write_payload', "import os\nname = {payload!r} + '/qa-write-probe'\ntry:\n    open(name, 'w').write('x')\n    print('ALLOWED')\n    os.unlink(name)\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
+    ('pos_exec_payload', "import subprocess\ntry:\n    subprocess.run({exec_argv!r}, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)\n    print('ALLOWED')\nexcept subprocess.TimeoutExpired:\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'ALLOWED'),
 )
 
 
@@ -178,6 +181,27 @@ def controls_for(manifest=None):
         return CONTROLS
     wanted = ['neg_write_payload'] + (['pos_exec_payload'] if exec_probe_argv(manifest, '/') else [])
     return CONTROLS + tuple(c for c in PAYLOAD_CONTROLS if c[0] in wanted)
+
+
+def run_group(argv, env, timeout, cwd=None, stdin=None):
+    """Run argv in a session of its own and always kill the whole process group afterwards (a payload that forks and sleeps leaves
+    nothing behind). Returns (exit code or None on timeout, up to 64 KiB of stdout). The environment is exactly `env`."""
+    with tempfile.TemporaryFile() as out:
+        proc = subprocess.Popen(argv, stdin=stdin if stdin is not None else subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
+                                cwd=cwd, env=env, start_new_session=True)
+        try:
+            try:
+                code = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                code = None
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+        out.seek(0)
+        return code, out.read(64 << 10)
 
 
 def confinement_probe(codex_bin, run_dir, env, manifest=None):
@@ -205,11 +229,23 @@ def confinement_probe(codex_bin, run_dir, env, manifest=None):
         for name, snippet, expect in controls_for(manifest):
             if name == 'neg_open_auth_file' and not auth.exists():
                 continue          # no login file to protect; the open() is the denied operation, no content is read
+            if name in PAYLOAD_EXEC_CONTROLS and problems:
+                # Producer code runs only on a profile that has just been proved. Anything failing or not running before this point
+                # means it never starts, and the record says so instead of leaving the control out.
+                results.append({'control': name, 'expected': expect, 'observed': 'NOT RUN: an earlier control failed', 'ok': False,
+                                'unrunnable': True, 'not_run': True})
+                problems.append('%s not run: an earlier control failed' % name)
+                continue
             code = '# CONTROL=%s\n%s' % (name, snippet.format(**values))
             cwd = hostile if name == 'neg_project_config_ignored' else run_dir / 'source'
             argv = [codex_bin, 'sandbox', '-P', PROFILE, '-C', str(cwd), '/usr/bin/python3', '-c', code]
             try:
-                done = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=env)
+                if name in PAYLOAD_EXEC_CONTROLS:
+                    # allowlist environment, own session, whole group killed afterwards: the payload cannot leave a process behind
+                    returncode, stdout = run_group(argv, selftest_env(run_dir, env.get('CODEX_HOME', '')), 60)
+                    done = types.SimpleNamespace(returncode=returncode, stdout=stdout.decode('utf-8', 'replace'))
+                else:
+                    done = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=env)
                 got = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else ''
                 # A denial only counts as one when it is EPERM or EACCES: ENOENT (a wrong path), a missing errno or any
                 # other text proves nothing about confinement.

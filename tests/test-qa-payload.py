@@ -37,7 +37,9 @@ code = cmd[-1] if cmd and cmd[0] == "/usr/bin/python3" else ""
 if code.startswith("# CONTROL="):
     control = code.splitlines()[0].replace("# CONTROL=", "")
     mode = open(d + "/mode").read().strip() if os.path.exists(d + "/mode") else "confined"
-    if control.startswith("neg_") and mode == "confined":
+    if mode == "leak-canary" and control == "neg_read_canary":
+        print("ALLOWED"); sys.exit(0)
+    if control.startswith("neg_") and mode in ("confined", "leak-canary"):
         print("DENIED:1"); sys.exit(0)
     if control.startswith("neg_") and mode == "open-network" and control.endswith(("bind", "connect")):
         print("ALLOWED"); sys.exit(0)
@@ -502,6 +504,84 @@ class SelftestRunnerTests(Scratch):
     def test_stage_budget_covers_every_test(self):
         _, manifest, _ = self.payload(selftests=[test_entry("a", timeout=100), test_entry("b", timeout=20)])
         self.assertEqual(side.payload_stage_seconds(manifest), 120 + 110 + 30)
+
+
+class PayloadCodeOnlyRunsOnAProvedProfileTests(Scratch):
+    """The security rule: producer-supplied code is executed under the sandbox only after every other control ran and passed."""
+
+    def payload_dir(self, marker, extra=""):
+        tool = ("#!/bin/sh\ntouch %s\n%secho ok\n" % (marker, extra)).encode()
+        return self.payload(files={"bin/tool": (tool, "exec")}, selftests=[test_entry("good", argv=("bin/tool",))])
+
+    def test_a_failing_base_control_means_the_payload_binary_never_runs(self):
+        marker = self.root / "EXECUTED"
+        directory, manifest, raw = self.payload_dir(marker)
+        with Env(self, directory=directory) as env, mock.patch.object(side, "run_group", side_effect=AssertionError("payload exec control ran")), \
+                mock.patch.object(side, "run_selftests", side_effect=AssertionError("self-tests ran")):
+            env.mode("leak-canary")
+            record = side.stage_outbox(env.args)
+        self.assertFalse(marker.exists())
+        self.assertFalse(record["confinement"]["established"])
+        self.assertNotIn("selftests", record)
+        names = [c["control"] for c in record["confinement"]["controls"]]
+        self.assertEqual(names[-1], "pos_exec_payload")
+        last = record["confinement"]["controls"][-1]
+        self.assertTrue(last["observed"].startswith("NOT RUN") and last["unrunnable"] and not last["ok"])
+
+    def test_with_every_base_control_passing_it_runs_and_the_order_is_base_then_payload(self):
+        marker = self.root / "EXECUTED"
+        directory, manifest, raw = self.payload_dir(marker)
+        with Env(self, directory=directory) as env:
+            record = side.stage_outbox(env.args)
+        self.assertTrue(marker.exists())
+        self.assertTrue(record["confinement"]["established"], record["confinement"])
+        names = [c["control"] for c in record["confinement"]["controls"]]
+        self.assertEqual(names[:len(side.CONTROLS)], [c[0] for c in side.CONTROLS])
+        self.assertEqual(names[len(side.CONTROLS):], ["neg_write_payload", "pos_exec_payload"])
+        self.assertEqual(len(record["selftests"]), 1)
+
+    def test_the_exec_control_uses_the_allowlist_environment_and_leaves_no_process_behind(self):
+        pidfile = self.root / "pid"
+        marker = self.root / "EXECUTED"
+        directory, manifest, raw = self.payload_dir(marker, "sleep 60 &\necho $! > %s\n" % pidfile)
+        with mock.patch.dict(os.environ, {"LANG": "xx", "SECRET_TOKEN": "nope"}):
+            with Env(self, directory=directory) as env:
+                record = side.stage_outbox(env.args)
+        self.assertTrue(record["confinement"]["established"], record["confinement"])
+        child = int(pidfile.read_text())
+        self.assertFalse(self.alive(child), "the background child of the payload survived the control")
+        env_seen = [e["env"] for e in env.seen()]
+        self.assertTrue(env_seen)
+        for seen in env_seen:
+            self.assertEqual(set(clean_env(seen)), {"PATH", "HOME", "TMPDIR", "CODEX_HOME"})
+
+    @staticmethod
+    def alive(pid):
+        import time
+        for _ in range(40):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            time.sleep(0.05)
+        return True
+
+    def test_a_selftest_that_forks_and_sleeps_is_killed_by_group_at_the_timeout(self):
+        pidfile = self.root / "pid2"
+        tool = ("#!/bin/sh\nsleep 60 &\necho $! > %s\nsleep 60\n" % pidfile).encode()
+        directory, manifest, raw = self.payload(files={"bin/tool": (tool, "exec")}, selftests=[test_entry("slow", argv=("bin/tool",), timeout=1, stdout=b"")])
+        with Env(self, directory=directory) as env:
+            env.outbox.mkdir()
+            for sub in ("out", "tmp", "home", "source"):
+                (env.outbox / sub).mkdir()
+            fd = side.open_payload_path(env.inbox / "payload")
+            side.copy_payload(fd[0], str(env.outbox / "payload"), manifest, raw, side.OUTBOX_MODES)
+            os.close(fd[0])
+            records = side.run_selftests(str(env.codex), env.outbox, manifest, side.selftest_env(env.outbox, env.private_home))
+        self.assertTrue(records[0]["timed_out"])
+        self.assertFalse(self.alive(int(pidfile.read_text())))
 
 
 class StageTests(Scratch):
