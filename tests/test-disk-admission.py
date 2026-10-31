@@ -467,6 +467,263 @@ class Hardening(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
 
 
+WRAPPER = r"""
+import os, sys, time
+kind, out, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+pids = []
+for _ in range(count):
+    pid = os.fork()
+    if pid == 0:
+        os.close(0)
+        if kind == 'setsid':
+            os.setsid()
+        if kind == 'double':
+            if os.fork():
+                os._exit(0)
+        if kind == 'double-setsid':
+            os.setsid()
+            if os.fork():
+                os._exit(0)
+        with open(out + '.%d' % os.getpid(), 'w') as handle:
+            handle.write('up')
+        time.sleep(120)
+        os._exit(0)
+    pids.append(pid)
+for pid in pids:
+    if kind not in ('double', 'double-setsid'):
+        continue
+    os.waitpid(pid, 0)
+deadline = time.time() + 10
+while len([n for n in os.listdir(os.path.dirname(out)) if n.startswith(os.path.basename(out) + '.')]) < count and time.time() < deadline:
+    time.sleep(0.02)
+print('ready', flush=True)
+sys.stdin.read()
+"""
+
+
+class Workloads(unittest.TestCase):
+    """Real processes: the lane follows the whole workload, never the wrapper alone (SPE-111)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.path = self.root / 'admission/state.json'
+        self.now = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+        self.procs = []
+        self.addCleanup(self.reap)
+
+    def reap(self):
+        for pid in self.survivors():
+            with contextlib.suppress(OSError):
+                os.kill(pid, 9)
+        for proc in self.procs:
+            if proc.stdin is None:
+                proc.kill()                      # a plain sleeper this test started
+            else:
+                proc.stdin.close()
+            proc.wait()
+
+    def survivors(self):
+        found = []
+        for file in self.root.glob('mark.*'):
+            pid = int(file.suffix[1:])
+            state = subprocess.run(['/bin/ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+            if state and not state.startswith('Z'):
+                found.append(pid)
+        return found
+
+    def wrapper(self, kind='plain', count=1, new_session=True):
+        proc = subprocess.Popen([sys.executable, '-c', WRAPPER, kind, str(self.root / 'mark'), str(count)],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, start_new_session=new_session)
+        self.procs.append(proc)
+        self.assertEqual(proc.stdout.readline().strip(), b'ready')
+        return proc
+
+    def finish_wrapper(self, proc):
+        """The wrapper exits and is never waited on, so it stays a zombie."""
+        proc.stdin.close()
+        self.wait_zombie(proc.pid)
+
+    @staticmethod
+    def stat_of(pid):
+        return subprocess.run(['/bin/ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+
+    def wait_zombie(self, pid):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not self.stat_of(pid).startswith('Z'):
+            time.sleep(0.02)
+        self.assertTrue(self.stat_of(pid).startswith('Z'), 'pid %d did not become a zombie' % pid)
+
+    def wait_gone(self, pid):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and self.stat_of(pid) and not self.stat_of(pid).startswith('Z'):
+            time.sleep(0.02)
+
+    def hold(self, label, proc, nbytes=10 * GIB):
+        """Reserve for the wrapper while it is alive, then refresh once so its descendants are on record."""
+        result = da.reserve(label, nbytes, proc.pid, self.path, lambda: 400 * GIB, now=self.now)
+        self.assertTrue(result['admit'], result)
+        self.live()
+        return self.path.parent / 'reservations' / (label + '.json')
+
+    def live(self, **kwargs):
+        with da.state_lock(self.path):
+            return da.live_reservations(self.path, self.now, **kwargs)
+
+    def test_detached_setsid_descendant_outlives_a_zombie_wrapper_and_keeps_the_lane(self):
+        proc = self.wrapper('setsid')
+        file = self.hold('job-detached', proc)
+        self.finish_wrapper(proc)
+        live, problems = self.live()
+        self.assertEqual([r['label'] for r in live], ['job-detached'])
+        self.assertIn('workload-outlives-wrapper', live[0]['unresolved'])
+        self.assertEqual(problems, [])
+        self.assertTrue(file.exists())
+        self.assertEqual(live[0]['bytes'], 10 * GIB)
+
+    def test_reparented_descendant_in_the_wrappers_group_keeps_the_lane(self):
+        proc = self.wrapper('double')           # grandchild reparented to launchd, still in the leader's group
+        self.hold('job-double', proc)
+        self.finish_wrapper(proc)
+        live, _ = self.live()
+        self.assertEqual(len(live), 1)
+        self.assertIn('workload-outlives-wrapper', live[0]['unresolved'])
+
+    def test_lane_is_released_once_the_detached_workload_ends(self):
+        proc = self.wrapper('setsid')
+        file = self.hold('job-ends', proc)
+        self.finish_wrapper(proc)
+        self.assertEqual(len(self.live()[0]), 1)
+        for pid in self.survivors():
+            os.kill(pid, 9)
+            self.wait_gone(pid)
+        self.assertEqual(self.live(), ([], []))
+        self.assertFalse(file.exists())
+
+    def test_normal_completion_releases(self):
+        proc = self.wrapper('plain')
+        file = self.hold('job-normal', proc)
+        for pid in self.survivors():
+            os.kill(pid, 9)
+            self.wait_gone(pid)
+        proc.stdin.close()
+        proc.wait()                              # reaped: the wrapper is gone
+        self.assertEqual(self.live(), ([], []))
+        self.assertFalse(file.exists())
+
+    def test_zombie_wrapper_with_nothing_left_is_released(self):
+        proc = self.wrapper('plain', count=0)
+        file = self.hold('job-empty', proc)
+        self.finish_wrapper(proc)
+        self.assertEqual(self.live(), ([], []))
+        self.assertFalse(file.exists())
+
+    def test_only_some_descendants_remaining_keeps_the_lane_until_the_last_ends(self):
+        proc = self.wrapper('setsid', count=3)
+        self.hold('job-many', proc)
+        self.finish_wrapper(proc)
+        pids = sorted(self.survivors())
+        self.assertEqual(len(pids), 3)
+        for killed, pid in enumerate(pids[:2], 1):
+            os.kill(pid, 9)
+            self.wait_gone(pid)
+            live, _ = self.live()
+            self.assertIn('%d recorded process' % (3 - killed), live[0]['unresolved'])
+        os.kill(pids[2], 9)
+        self.wait_gone(pids[2])
+        self.assertEqual(self.live(), ([], []))
+
+    def test_reused_pid_of_a_member_is_not_the_workload(self):
+        proc = self.wrapper('setsid')
+        file = self.hold('job-member-reuse', proc)
+        record = json.loads(file.read_text())
+        self.assertEqual(len(record['workload']['members']), 1)
+        record['workload']['members'][0]['token'] = 'Mon Jan  1 00:00:00 2001'   # same pid, different process
+        file.write_text(json.dumps(record))
+        self.finish_wrapper(proc)
+        self.assertEqual(self.live(), ([], []))
+        self.assertEqual(len(self.survivors()), 1)         # the process with that pid is untouched and not counted
+
+    def test_reused_pid_of_the_wrapper_does_not_resurrect_it(self):
+        impostor = subprocess.Popen(['/bin/sleep', '120'], process_group=0)   # leads its own group, has a member
+        self.procs.append(impostor)
+        child = subprocess.Popen(['/bin/sleep', '120'], process_group=impostor.pid)
+        self.procs.append(child)
+        token = da.process_token(impostor.pid)
+        workload = {'pgid': impostor.pid, 'leader': True, 'members': [], 'observed': True, 'truncated': False}
+        with da.state_lock(self.path):
+            da.write_reservation(self.path, 'job-impostor', 10 * GIB, impostor.pid, 'Mon Jan  1 00:00:00 2001',
+                                 self.now + timedelta(hours=1), workload=workload)
+        self.assertEqual(token, da.process_token(impostor.pid))
+        self.assertEqual(self.live(), ([], []))       # other start token: neither the pid nor its group is the workload
+
+    def test_unreadable_process_table_is_unresolved_not_free(self):
+        proc = self.wrapper('setsid')
+        file = self.hold('job-blind', proc)
+        self.finish_wrapper(proc)
+
+        def broken():
+            raise da.ReservationError('ps unavailable')
+
+        live, problems = self.live(table_fn=broken)
+        self.assertEqual(len(live), 1)
+        self.assertIn('process-table-unreadable', live[0]['unresolved'])
+        self.assertTrue(problems and problems[0].startswith('reservation-unverifiable'))
+        self.assertTrue(file.exists())
+
+    def test_unreadable_wrapper_is_unresolved_not_free(self):
+        proc = self.wrapper('plain', count=0)
+        file = self.hold('job-blind-wrapper', proc)
+
+        def broken(pid):
+            raise da.ReservationError('ps unavailable')
+
+        live, problems = self.live(token_fn=broken)
+        self.assertEqual(len(live), 1)
+        self.assertIn('holder-uninspectable', live[0]['unresolved'])
+        self.assertTrue(problems and file.exists())
+
+    def test_workload_not_fully_recorded_is_unresolved_after_the_wrapper_is_gone(self):
+        with mock.patch.object(da, 'MAX_WORKLOAD_MEMBERS', 1):
+            proc = self.wrapper('setsid', count=2)
+            self.hold('job-big', proc)
+        self.finish_wrapper(proc)
+        for pid in self.survivors():
+            os.kill(pid, 9)
+            self.wait_gone(pid)
+        live, _ = self.live()
+        self.assertEqual(len(live), 1)
+        self.assertIn('workload-not-fully-recorded', live[0]['unresolved'])
+
+    def test_unobserved_workload_of_a_zombie_wrapper_is_unresolved(self):
+        proc = self.wrapper('plain', count=0)
+        token = da.process_token(proc.pid)
+        blind = {'pgid': None, 'leader': False, 'members': [], 'observed': False, 'truncated': False}
+        with da.state_lock(self.path):
+            da.write_reservation(self.path, 'job-unobserved', 10 * GIB, proc.pid, token, self.now + timedelta(hours=1), workload=blind)
+        self.finish_wrapper(proc)
+        live, _ = self.live()
+        self.assertIn('workload-never-observed', live[0]['unresolved'])
+
+    def test_unresolved_holder_blocks_admission_and_is_reported_in_the_snapshot(self):
+        proc = self.wrapper('setsid')
+        self.hold('job-blocking', proc)
+        self.finish_wrapper(proc)
+        refused = da.reserve('job-next', 10 * GIB, os.getpid(), self.path, lambda: 400 * GIB, now=self.now)
+        self.assertFalse(refused['admit'])
+        self.assertIn('UNRESOLVED', refused['reason'])
+        record = da.snapshot(self.path, lambda: (400 * GIB, 'test'), now=self.now)
+        self.assertTrue(any(b.startswith('reservation-unresolved: job-blocking') for b in record['blockers']), record['blockers'])
+        self.assertEqual(record['reserved_bytes'], 10 * GIB)
+
+    def test_process_listing_reads_no_command_line(self):
+        table = da.process_table()
+        self.assertIn(os.getpid(), table)
+        self.assertEqual(len(table[os.getpid()]), 4)
+        self.assertNotIn('args', json.dumps(table))
+
+
 class Reservations(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -505,56 +762,6 @@ class Reservations(unittest.TestCase):
         live, problems = self.live()
         self.assertEqual((live, problems), ([], []))
         self.assertFalse(file.exists())
-
-    def wait_for_zombie(self, pid):
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            state = subprocess.run(['/bin/ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
-            if state.startswith('Z'):
-                return
-            time.sleep(0.05)
-        self.fail('process %d did not become a zombie' % pid)
-
-    def test_unreaped_group_leader_with_no_workload_is_exited(self):
-        leader = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)   # exits, never waited on
-        self.addCleanup(leader.wait)
-        self.wait_for_zombie(leader.pid)
-        file = self.reserve_file('job-zombie', leader.pid, 'Mon Jan  1 00:00:00 2001')
-        self.assertIsNone(da.process_token(leader.pid))
-        self.assertEqual(self.live(), ([], []))
-        self.assertFalse(file.exists())
-
-    def test_unreaped_wrapper_does_not_free_the_lane_while_its_job_runs(self):
-        leader = subprocess.Popen(['/bin/sh', '-c', 'sleep 60 & exit 0'], start_new_session=True)
-        self.addCleanup(leader.wait)
-        self.addCleanup(lambda: os.killpg(leader.pid, 9) if self._group_alive(leader.pid) else None)
-        self.wait_for_zombie(leader.pid)
-        token = da.process_token(leader.pid)
-        self.assertIsNotNone(token)                      # the wrapper is a zombie but its job is running
-        self.reserve_file('job-wrapper', leader.pid, token)
-        self.assertEqual(len(self.live()[0]), 1)
-        os.killpg(leader.pid, 9)
-        deadline = time.monotonic() + 5
-        while da.process_token(leader.pid) is not None and time.monotonic() < deadline:
-            time.sleep(0.05)
-        self.assertIsNone(da.process_token(leader.pid))  # job gone, zombie alone: the lane is free
-        self.assertEqual(self.live(), ([], []))
-
-    def test_unreaped_process_sharing_a_group_cannot_prove_an_empty_workload(self):
-        pid = os.fork()
-        if pid == 0:
-            os._exit(0)
-        self.addCleanup(os.waitpid, pid, 0)
-        self.wait_for_zombie(pid)
-        self.assertIsNotNone(da.process_token(pid))      # not its own group leader: fail closed
-
-    @staticmethod
-    def _group_alive(pgid):
-        try:
-            os.killpg(pgid, 0)
-            return True
-        except OSError:
-            return False
 
     def test_pid_reuse_token_mismatch_is_pruned(self):
         file = self.reserve_file('job-reused', token='Mon Jan  1 00:00:00 2001')
