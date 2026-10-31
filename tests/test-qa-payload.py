@@ -134,7 +134,8 @@ class ManifestRuleTests(Scratch):
         good = self.doc()
         self.refused(dict(good, extra=1), "unknown keys")
         self.refused({k: v for k, v in good.items() if k != "scope"}, "missing keys")
-        self.refused(dict(good, schema="cae-qa-payload/2"), "schema")
+        self.refused(dict(good, schema="cae-qa-payload/3"), "schema")
+        self.refused(dict(good, schema="cae-qa-payload/2"), "missing keys")      # /2 needs its endpoint block and per-test flag
         self.refused(dict(good, scope=""), "scope")
         self.refused(dict(good, scope="x" * 2049), "scope")
         self.refused(dict(good, scope=5), "scope")
@@ -706,6 +707,140 @@ class StageTests(Scratch):
             os.symlink(directory, env.inbox / "payload")
             with self.assertRaises(OSError):
                 self.stage(env)
+
+
+class EndpointSchemaTests(Scratch):
+    """cae-qa-payload/2 (SPE-145 PR-b2): the endpoint block and needs_endpoint. /1 stays valid and means no endpoint. Until the endpoint
+    lifecycle lands (ENDPOINT_RUNS_SUPPORTED False) a payload that names an endpoint is refused where payloads are accepted."""
+
+    def v2(self, endpoint="default", tests=None, **over):
+        files = dict(FILES)
+        files["bin/daemon"] = (b"#!/bin/sh\nexit 0\n", "exec")
+        _, manifest, _ = self.payload(files=files, selftests=[], producer_run=["harness/transcript.txt"])
+        manifest["schema"] = "cae-qa-payload/2"
+        manifest["endpoint"] = {"daemon": "bin/daemon", "contract": "fornax-daemon/1"} if endpoint == "default" else endpoint
+        manifest["selftests"] = [dict(test_entry("t1"), needs_endpoint=False)] if tests is None else tests
+        manifest.update(over)
+        return manifest
+
+    def parse(self, manifest):
+        return side.parse_manifest(json.dumps(manifest).encode())
+
+    def refused(self, manifest, word):
+        with self.assertRaises(side.PayloadError) as caught:
+            self.parse(manifest)
+        self.assertIn(word, str(caught.exception))
+
+    def test_a_v2_manifest_with_and_without_an_endpoint_parses(self):
+        self.assertEqual(self.parse(self.v2())["endpoint"], {"daemon": "bin/daemon", "contract": "fornax-daemon/1"})
+        self.assertIsNone(self.parse(self.v2(endpoint=None))["endpoint"])
+
+    def test_v1_gets_no_endpoint_and_refuses_the_v2_keys(self):
+        v1 = side.parse_manifest(self.payload(selftests=[test_entry()])[2])
+        self.assertIsNone(v1["endpoint"])
+        self.assertFalse(v1["selftests"][0]["needs_endpoint"])
+        _, manifest, _ = self.payload(selftests=[test_entry()])
+        self.refused(dict(manifest, endpoint=None), "unknown keys")
+        self.refused(dict(manifest, selftests=[dict(test_entry(), needs_endpoint=False)]), "unknown keys")
+
+    def test_v2_requires_both_new_keys(self):
+        manifest = self.v2()
+        del manifest["endpoint"]
+        self.refused(manifest, "missing keys")
+        self.refused(self.v2(tests=[test_entry("t1")]), "missing keys")
+
+    def test_endpoint_block_rules(self):
+        self.refused(self.v2(endpoint={"daemon": "bin/daemon"}), "missing keys")
+        self.refused(self.v2(endpoint={"daemon": "bin/daemon", "contract": "fornax-daemon/1", "port": 1}), "unknown keys")
+        self.refused(self.v2(endpoint={"daemon": "bin/daemon", "contract": "other/1"}), "contract")
+        self.refused(self.v2(endpoint={"daemon": "bin/daemon", "contract": None}), "contract")
+        self.refused(self.v2(endpoint={"daemon": "vectors/a.json", "contract": "fornax-daemon/1"}), "kind=exec")
+        self.refused(self.v2(endpoint={"daemon": "bin/missing", "contract": "fornax-daemon/1"}), "kind=exec")
+        self.refused(self.v2(endpoint={"daemon": 7, "contract": "fornax-daemon/1"}), "kind=exec")
+        self.refused(self.v2(endpoint="x"), "not a JSON object")
+
+    def test_needs_endpoint_must_be_a_boolean_and_needs_an_endpoint_block(self):
+        for bad in (1, 0, "true", None, [], {}):
+            self.refused(self.v2(tests=[dict(test_entry("t1"), needs_endpoint=bad)]), "needs_endpoint")
+        self.refused(self.v2(endpoint=None, tests=[dict(test_entry("t1"), needs_endpoint=True)]), "needs an endpoint block")
+        self.assertTrue(self.parse(self.v2(tests=[dict(test_entry("t1"), needs_endpoint=True)]))["selftests"][0]["needs_endpoint"])
+
+    def test_schema_must_be_exactly_one_of_the_two(self):
+        for bad in ("cae-qa-payload/3", "cae-qa-payload/1 ", "", None, 2):
+            self.refused(self.v2(schema=bad), "schema")
+
+    def test_the_manifest_digest_covers_the_endpoint_and_the_flag(self):
+        a = json.dumps(self.v2()).encode()
+        b = json.dumps(self.v2(endpoint={"daemon": "bin/tool", "contract": "fornax-daemon/1"})).encode()
+        c = json.dumps(self.v2(tests=[dict(test_entry("t1"), needs_endpoint=True)])).encode()
+        self.assertEqual(len({side.manifest_sha256(x) for x in (a, b, c)}), 3)
+
+    def test_the_exec_probe_skips_endpoint_tests_and_never_picks_the_daemon(self):
+        needs = dict(test_entry("t2", argv=("bin/tool", "y")), needs_endpoint=True)
+        m = self.parse(self.v2(tests=[needs, dict(test_entry("t1"), needs_endpoint=False)]))
+        self.assertEqual(side.exec_probe_argv(m, "/p"), ["/p/bin/tool", "x"])
+        m = self.parse(self.v2(tests=[needs]))
+        self.assertEqual(side.exec_probe_argv(m, "/p"), ["/p/bin/tool"])           # first exec file that is not the daemon
+        only = self.v2(tests=[], endpoint={"daemon": "bin/tool", "contract": "fornax-daemon/1"})
+        only["files"] = [f for f in only["files"] if f["path"] != "bin/daemon"]
+        self.assertIsNone(side.exec_probe_argv(self.parse(only), "/p"))
+
+    def test_this_build_refuses_a_payload_that_names_an_endpoint(self):
+        self.assertFalse(side.ENDPOINT_RUNS_SUPPORTED)
+        self.assertIsNone(side.endpoint_refusal(self.parse(self.v2(endpoint=None))))
+        self.assertIn("cannot start", side.endpoint_refusal(self.parse(self.v2())))
+        self.assertIsNone(side.endpoint_refusal(side.parse_manifest(self.payload(selftests=[test_entry()])[2])))
+
+    def test_stage_refuses_before_copying_anything(self):
+        directory, manifest, _ = self.payload(files=dict(FILES, **{"bin/daemon": (b"#!/bin/sh\n", "exec")}), selftests=[])
+        manifest.update(schema="cae-qa-payload/2", endpoint={"daemon": "bin/daemon", "contract": "fornax-daemon/1"})
+        (directory / "MANIFEST.json").write_bytes(json.dumps(manifest).encode())
+        outbox = self.root / "outbox"
+        outbox.mkdir()
+        fd = self.open_dir(directory)
+        parsed, record = side.stage_payload((os.dup(fd), ME), outbox)
+        self.assertIsNone(parsed)
+        self.assertFalse(record["staged"])
+        self.assertIn("cannot start", record["problems"][0])
+        self.assertFalse((outbox / "payload").exists())
+
+
+class EndpointManifestHelperTests(Scratch):
+    HELPER = SCRIPTS / "qa-payload-manifest.py"
+
+    def run_helper(self, *argv):
+        return subprocess.run([sys.executable, "-I", str(self.HELPER), *argv], capture_output=True, text=True, timeout=60)
+
+    def make_dir(self):
+        directory = self.root / "payload-dir"
+        for path, (data, kind) in dict(FILES, **{"bin/daemon": (b"#!/bin/sh\n", "exec")}).items():
+            (directory / path).parent.mkdir(parents=True, exist_ok=True)
+            (directory / path).write_bytes(data)
+            os.chmod(directory / path, 0o755 if kind == "exec" else 0o644)
+        return directory
+
+    def test_plan_writes_v2_only_when_an_endpoint_is_given(self):
+        directory = self.make_dir()
+        plain = self.run_helper("plan", "--dir", str(directory), "--scope", "s")
+        self.assertEqual(json.loads(plain.stdout)["schema"], "cae-qa-payload/1")
+        tests = self.root / "t.json"
+        tests.write_text(json.dumps([test_entry("t1"), dict(test_entry("t2"), needs_endpoint=True)]))
+        out = self.run_helper("plan", "--dir", str(directory), "--scope", "s", "--selftests", str(tests),
+                              "--endpoint-daemon", "bin/daemon", "--endpoint-contract", "fornax-daemon/1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        doc = json.loads(out.stdout)
+        self.assertEqual(doc["schema"], "cae-qa-payload/2")
+        self.assertEqual(doc["endpoint"], {"daemon": "bin/daemon", "contract": "fornax-daemon/1"})
+        self.assertEqual([t["needs_endpoint"] for t in doc["selftests"]], [False, True])
+
+    def test_plan_refuses_half_an_endpoint_and_flag_without_endpoint(self):
+        directory = self.make_dir()
+        self.assertNotEqual(self.run_helper("plan", "--dir", str(directory), "--scope", "s", "--endpoint-daemon", "bin/daemon").returncode, 0)
+        self.assertNotEqual(self.run_helper("plan", "--dir", str(directory), "--scope", "s", "--endpoint-contract", "fornax-daemon/1").returncode, 0)
+        tests = self.root / "t.json"
+        tests.write_text(json.dumps([dict(test_entry("t1"), needs_endpoint=True)]))
+        out = self.run_helper("plan", "--dir", str(directory), "--scope", "s", "--selftests", str(tests))
+        self.assertNotEqual(out.returncode, 0)
 
 
 class ManifestHelperTests(Scratch):
