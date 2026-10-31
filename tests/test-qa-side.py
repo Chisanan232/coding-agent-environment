@@ -999,6 +999,11 @@ class NetworkControlTests(unittest.TestCase):
             self.assertFalse(side.control_ok("DENIED_EPERM", observed), observed)
         self.assertTrue(side.control_ok("DENIED_EPERM", "DENIED:1"))
 
+    def test_an_unknown_expectation_never_passes(self):
+        for expect in ("DENIED_EPREM", "", None, "denied"):
+            for observed in ("DENIED:1", "DENIED:13", "ALLOWED"):
+                self.assertFalse(side.control_ok(expect, observed), (expect, observed))
+
     def test_filesystem_denials_still_accept_eperm_and_eacces(self):
         self.assertTrue(side.control_ok("DENIED", "DENIED:1"))
         self.assertTrue(side.control_ok("DENIED", "DENIED:13"))
