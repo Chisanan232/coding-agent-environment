@@ -2615,6 +2615,7 @@ class OpenOutboxSearchOnlyTests(unittest.TestCase):
         self.addCleanup(lambda: [os.close(f) for f in fds])
         return fds, why
 
+    @unittest.skipIf(os.geteuid() == 0, "root can read a mode 0o311 directory, so the old read-mode open would not fail")
     def test_search_only_exchange_root_opens(self):
         os.chmod(self.x, 0o311)                      # owner: write+search, no read: what the producer has on the real root
         with self.assertRaises(PermissionError):     # the old read-mode open, shown to fail on this exact mode
@@ -2632,6 +2633,15 @@ class OpenOutboxSearchOnlyTests(unittest.TestCase):
             self.opened()
         self.assertEqual(len(flags), 4)
         self.assertTrue(all(f & qa.DIR_FLAGS == qa.DIR_FLAGS for f in flags))
+
+    DARWIN_ONLY = unittest.skipUnless(sys.platform == "darwin", "Linux O_PATH does not check search permission on the directory "
+                                      "itself (the denial surfaces at the next component); the exchange only exists on macOS")
+
+    @DARWIN_ONLY
+    @unittest.skipIf(os.geteuid() == 0, "root can search a mode 0o000 directory")
+    def test_a_denied_root_gets_exactly_one_open_attempt(self):
+        flags = []
+        real = os.open
         os.chmod(self.x, 0o000)
         flags.clear()
         with unittest.mock.patch("os.open", side_effect=lambda p, f, *a, **k: (flags.append(f), real(p, f, *a, **k))[1]):
@@ -2639,6 +2649,8 @@ class OpenOutboxSearchOnlyTests(unittest.TestCase):
         self.assertEqual(len(flags), 1)              # one attempt, not a second try with another mode
         self.assertEqual(fds, [])
 
+    @DARWIN_ONLY
+    @unittest.skipIf(os.geteuid() == 0, "root can search a mode 0o000 directory")
     def test_permission_denied_is_reported_as_such_never_as_a_link(self):
         os.chmod(self.x, 0o000)
         fds, why = self.opened()
@@ -2715,19 +2727,14 @@ class OpenOutboxSearchOnlyTests(unittest.TestCase):
         with self.assertRaises(OSError) as caught:
             qa.read_sealed(dfd, "g", self.me)
         self.assertIn("more than one link", str(caught.exception))
+        self.assertNotIn("owner", str(caught.exception))
         with self.assertRaises(OSError):
             qa.read_sealed(dfd, "l", self.me)
         with self.assertRaises(OSError) as caught:
             qa.read_sealed(dfd, "f", self.me + 1)
         self.assertIn("wrong owner", str(caught.exception))
+        self.assertNotIn("link", str(caught.exception))
         self.assertIsNone(qa.read_sealed(dfd, "absent", self.me))
-
-    def test_audit_only_two_directory_opens_in_the_qa_side_still_need_read(self):
-        text = (SCRIPT.parent / "qa-side.py").read_text()
-        reading = [l.strip() for l in text.splitlines() if "O_DIRECTORY" in l and "O_RDONLY" in l]
-        self.assertEqual(len(reading), 2, reading)      # the clone directory and its children: they are listed, so read is needed
-        self.assertTrue(any("'source'" in l for l in reading))
-        self.assertTrue(any("dir_fd=src_fd" in l for l in reading))
 
 
 if __name__ == "__main__":

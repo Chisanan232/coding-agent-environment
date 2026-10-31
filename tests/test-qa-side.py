@@ -77,6 +77,8 @@ class Tree:
         self.write_config()
         self.source = self.attempt / "source"
         (self.source / "sub").mkdir(parents=True)
+        for d in (self.source, self.source / "sub"):
+            os.chmod(d, 0o755)               # not group-writable whatever the umask (a 0002 umask made these 0775 and tripped the check)
         (self.source / "a.txt").write_text("alpha")
         (self.source / "sub" / "b.sh").write_text("#!/bin/sh\n")
         os.chmod(self.source / "sub" / "b.sh", 0o755)
@@ -304,6 +306,7 @@ class RequestTests(InstalledCase):
         os.symlink(t.cfg, t.inbox / "RUN.lock")
         self.assertRefused(t, ["exec", ATTEMPT])
 
+    @unittest.skipIf(os.geteuid() == 0, "root can read a mode 0o311 directory, so the old read-mode open would not fail")
     def test_search_only_exchange_root_is_accepted(self):
         """The real exchange root is root:wheel 0711, so the QA user can search but not read it. 0o311 reproduces that for the
         owner: a read-mode open of it fails with EACCES, the search open must not."""
@@ -315,6 +318,36 @@ class RequestTests(InstalledCase):
         self.assertEqual(self.dry(t)["verb"], "exec")
         os.chmod(t.x, 0o000)
         self.assertRefused(t, ["exec", ATTEMPT])
+
+    def test_directory_opens_use_search_flags_only_where_the_directory_is_just_traversed(self):
+        """Behaviour, not source text: the exchange, inbox and attempt directories are opened for search only; the clone
+        directory and its children, which are listed, are opened for reading. Recorded through an os.open spy."""
+        t = self.tree(verb="stage")
+        opened = []
+        real = os.open
+
+        def spy(path, flags, *a, **k):
+            opened.append((str(path), flags))
+            return real(path, flags, *a, **k)
+        search_bit = side.search_flags() & ~os.O_DIRECTORY & ~os.O_NOFOLLOW
+        self.assertTrue(search_bit)
+        fds = []
+        with mock.patch("os.open", side_effect=spy):
+            plan = side.validate_installed(["stage", ATTEMPT], str(t.cfg), str(t.base), fds)
+            sfd = side.open_source_dir(plan["afd"], ME)
+            side.copy_tree_at(sfd, t.base / "audit-copy", ME)
+        self.addCleanup(lambda: [os.close(f) for f in fds + [sfd]])
+        dirs = [(p, f) for p, f in opened if f & os.O_DIRECTORY]
+        traversed = [(p, f) for p, f in dirs if os.path.basename(p) in (str(t.x), "inbox", ATTEMPT) or p == str(t.x)]
+        self.assertEqual(len(traversed), 3, dirs)
+        for path, flags in traversed:
+            self.assertEqual(flags & side.search_flags(), side.search_flags(), path)
+            self.assertTrue(flags & os.O_NOFOLLOW, path)
+        listed = [(p, f) for p, f in dirs if (p, f) not in traversed]
+        self.assertTrue(listed)                                   # source plus the child directories of the copy
+        for path, flags in listed:
+            self.assertFalse(flags & search_bit, path)
+            self.assertTrue(flags & os.O_NOFOLLOW, path)
 
     def test_symlinked_inbox_attempt_or_request(self):
         t = self.tree()
