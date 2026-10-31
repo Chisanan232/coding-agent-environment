@@ -826,7 +826,7 @@ class DetachedWorkload(QueueBase):
 
     def test_owner_release_frees_an_unresolved_claim_and_fifo_resumes(self):
         a, b, c, child = self.zombie_unresolved()
-        out = da.queue_release(self.path, a, now=self.now)
+        out = da.queue_release(self.path, a, now=self.now, confirm_ended=True)
         self.assertTrue(out['ok'], out)
         entry = self.entries()[a]
         self.assertEqual((entry['state'], entry['release']['evidence'], entry['release']['was']), ('RELEASED', 'owner-release', 'unresolved'))
@@ -837,7 +837,7 @@ class DetachedWorkload(QueueBase):
 
     def test_owner_release_is_refused_for_a_running_wrapper_other_users_and_other_sessions(self):
         a, wrapper, child = self.claimed_with_detached_child()
-        self.assertFalse(da.queue_release(self.path, a, now=self.now)['ok'])            # wrapper alive
+        self.assertFalse(da.queue_release(self.path, a, now=self.now, confirm_ended=True)['ok'])            # wrapper alive
         wrapper.stdin.close()
         wrapper.wait()
         self.assertFalse(da.queue_release(self.path, a, session_id='someone-else-entirely', now=self.now)['ok'])
@@ -845,9 +845,32 @@ class DetachedWorkload(QueueBase):
         entry = json.loads(entry_path.read_text())
         entry['owner_uid'] = os.getuid() + 1
         entry_path.write_text(json.dumps(entry))
-        self.assertIn('another user', da.queue_release(self.path, a, now=self.now)['reason'])
+        self.assertIn('another user', da.queue_release(self.path, a, now=self.now, confirm_ended=True)['reason'])
         self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
         self.assertFalse(da.queue_release(self.path, 'q999999')['ok'])
+
+    def test_owner_release_needs_the_entry_session_or_an_explicit_confirmation(self):
+        a, b, c, child = self.zombie_unresolved()
+        bare = da.queue_release(self.path, a, now=self.now)
+        self.assertFalse(bare['ok'])
+        self.assertIn('--confirm-ended', bare['reason'])
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+        own = self.entries()[a]['session_id']
+        out = da.queue_release(self.path, a, session_id=own, now=self.now)
+        self.assertTrue(out['ok'], out)
+        self.assertEqual((out['label'], out['was']), ('nda-horo-2070', 'unresolved'))
+
+    def test_owner_release_refuses_when_the_holder_cannot_be_inspected(self):
+        a, b, c, child = self.zombie_unresolved()
+
+        def broken():
+            raise da.ReservationError('ps unavailable')
+
+        out = da.queue_release(self.path, a, now=self.now, confirm_ended=True, table_fn=broken)
+        self.assertFalse(out['ok'])
+        self.assertIn('cannot inspect', out['reason'])
+        self.assertEqual(self.entries()[a]['state'], 'CLAIMED')
+        self.assertTrue((self.path.parent / 'reservations/nda-horo-2070.json').exists())
 
     def run_cli(self, *argv):
         out = io.StringIO()
@@ -857,7 +880,7 @@ class DetachedWorkload(QueueBase):
 
     def test_queue_release_cli(self):
         a, b, c, child = self.zombie_unresolved()
-        rc, out = self.run_cli('queue', 'release', '--id', a)
+        rc, out = self.run_cli('queue', 'release', '--id', a, '--confirm-ended')
         self.assertEqual((rc, json.loads(out)['ok']), (0, True), out)
         self.assertEqual(self.entries()[a]['state'], 'RELEASED')
 

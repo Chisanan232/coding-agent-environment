@@ -1624,16 +1624,21 @@ def queue_status(state_path, now=None):
     return {'entries': shown, 'problems': problems}
 
 
-def queue_release(state_path, qid, now=None, session_id=None, token_fn=process_token, table_fn=None):
+def queue_release(state_path, qid, now=None, session_id=None, token_fn=process_token, table_fn=None, confirm_ended=False):
     """Owner's explicit release of a CLAIMED entry whose holder is unresolved (or already exited). Never signals a process.
 
     The only way out for a job that cannot be proved finished (an invisible detached workload, a job that ended before any
     inspection, a truncated record). Refused while the wrapper is alive and running (stop the job; advance records that),
-    for another user's entry, or for another session when one is given. It also removes the entry's reservation file.
+    for another user's entry, when the holder or process table cannot be inspected (fail closed), and unless the caller
+    proves ownership with the entry's own session id or states `confirm_ended` (the owner verified the workload ended).
+    It also removes the entry's reservation file.
     """
     now = now or datetime.now(timezone.utc)
     if not (isinstance(qid, str) and QUEUE_ID_RE.fullmatch(qid)):
         return {'ok': False, 'reason': 'invalid-request: bad queue id'}
+    if session_id is None and not confirm_ended:
+        return {'ok': False, 'reason': 'refused: give --session-id (the entry\'s own session) or --confirm-ended (you verified '
+                                       'the workload has ended); a same-user process alone is not enough'}
     try:
         with state_lock(state_path):
             entries, problems = _queue_entries(state_path)
@@ -1650,6 +1655,9 @@ def queue_release(state_path, qid, now=None, session_id=None, token_fn=process_t
                 return {'ok': False, 'reason': '%s belongs to another session' % qid}
             holder = entry['holder']
             status = holder_status(holder['pid'], holder['start_token'], holder.get('workload'), token_fn, table_fn)
+            if status.failed:
+                return {'ok': False, 'reason': '%s: cannot inspect the holder (%s); refusing to release what cannot be '
+                                               'checked' % (qid, status.reason)}
             if status.state == 'alive':
                 return {'ok': False, 'reason': '%s: its wrapper (pid %d) is still running; stop the job, then queue advance '
                                                'records the release' % (qid, holder['pid'])}
@@ -1671,7 +1679,9 @@ def queue_release(state_path, qid, now=None, session_id=None, token_fn=process_t
                                 'was': status.state, 'reason': status.reason[:200]}
             _write_queue_entry(state_path, entry)
             receipt_ok = _queue_receipt(state_path, 'released', entry, now, evidence=evidence, holder_alive=status.state == 'unresolved')
-            return {'ok': True, 'receipt_ok': receipt_ok, 'reason': 'released %s (was %s)' % (qid, status.state)}
+            return {'ok': True, 'receipt_ok': receipt_ok, 'label': entry['label'], 'holder_pid': holder['pid'],
+                    'was': status.state, 'detail': status.reason[:200],
+                    'reason': 'released %s (label %s, holder pid %d, was %s)' % (qid, entry['label'], holder['pid'], status.state)}
     except StateError as exc:
         return {'ok': False, 'reason': '%s: %s' % (exc.kind, exc)}
     except OSError as exc:
@@ -1918,7 +1928,9 @@ def build_parser():
     qcx.add_argument('--session-id', dest='session_id', help='refuse unless the entry belongs to this session')
     qrl = qcmds.add_parser('release', allow_abbrev=False, help='owner release of a claimed entry that cannot be proved finished')
     qrl.add_argument('--id', required=True, dest='qid')
-    qrl.add_argument('--session-id', dest='session_id', help='refuse unless the entry belongs to this session')
+    qrl.add_argument('--session-id', dest='session_id', help='the entry\'s own session id (proves ownership)')
+    qrl.add_argument('--confirm-ended', action='store_true', dest='confirm_ended',
+                     help='state that you verified the claimed job and everything it started has ended')
     return parser
 
 
@@ -1971,7 +1983,7 @@ def _queue_cli(args, state_path, free_fn):
     elif command == 'cancel':
         out = queue_cancel(state_path, args.qid, session_id=args.session_id)
     elif command == 'release':
-        out = queue_release(state_path, args.qid, session_id=args.session_id)
+        out = queue_release(state_path, args.qid, session_id=args.session_id, confirm_ended=args.confirm_ended)
     else:
         out = dict(queue_status(state_path), ok=True)
     print(json.dumps(out, sort_keys=True))

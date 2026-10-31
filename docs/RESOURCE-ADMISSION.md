@@ -192,11 +192,19 @@ a time, and the lane counts are untouched. A grant-time resource check, where on
 to certify that a previous workload ended.
 
 Owner escape hatches (neither signals anything). `disk-admission.py release --label L` deletes the reservation file of a direct
-reservation. For a claimed queue entry, plain `release` deliberately does **not** free the lane (any same-user caller could
-otherwise free a running job): use `disk-admission.py queue release --id qNNNNNN [--session-id S]`. It is refused while the
-holder's wrapper is still running, for another user's entry, or for another session when one is given; otherwise it removes the
-entry's reservation, marks the entry `RELEASED` with evidence `owner-release` (recording what the state was) and leaves the next
+reservation. For a claimed queue entry, plain `release` deliberately does **not** free the lane: any same-user process could
+otherwise free a running job. `disk-admission.py queue release --id qNNNNNN` is gated the same way, so it needs one of
+`--session-id S` (the entry's own recorded session) or `--confirm-ended` (the owner states they verified the job and everything
+it started has ended; the result prints the label, holder pid and prior state that were released). It is also refused while
+the holder's wrapper is still running, for another user's entry, for a non-matching session id, and when the holder or the
+process table cannot be inspected (fail closed: what cannot be checked is not released). Otherwise it removes the entry's
+reservation, marks the entry `RELEASED` with evidence `owner-release` (recording what the state was) and leaves the next
 `queue advance` to grant the first waiter in order.
+
+Operational note. The 60-second refresher (`refresher-plist`) is only printed, never installed by this tool. Without it,
+inspections happen only when a reserve, claim or queue command runs, so a short job that ends before any inspection stays
+unresolved until an owner runs `release --label` / `queue release`. Callers of `run` and `claim` should release when their job
+ends.
 
 Known limits (not guaranteed):
 
