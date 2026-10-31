@@ -495,12 +495,14 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
     if behind:
         reasons.append(f"STALE_BRANCH: head is {behind} commit(s) behind {base}; rebase or merge the base and revalidate")
     mss = p["mergeStateStatus"]
+    unstable_reason = None
     if mss == "BLOCKED" and p["reviewDecision"] != "REVIEW_REQUIRED":
         reasons.append("BLOCKED_BY_REPOSITORY_RULES: mergeStateStatus BLOCKED (branch protection or ruleset)")
     elif mss == "UNKNOWN":
         wait.append("MERGE_STATE_UNKNOWN: GitHub has not computed the merge state yet")
     elif mss not in ("CLEAN", "HAS_HOOKS", "BLOCKED", "DIRTY", "BEHIND"):
         reasons.append(f"MERGE_STATE_NOT_CLEAN: mergeStateStatus {mss!r} (unstable or unrecognized state fails closed)")
+        unstable_reason = reasons[-1] if mss == "UNSTABLE" else None
     if p["reviewDecision"] == "CHANGES_REQUESTED":
         reasons.append("CHANGES_REQUESTED")
     # A genuine GitHub approval counts only when it is for the exact current head (no commit id = not provable).
@@ -578,6 +580,11 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
         if all((c.get("conclusion") or c.get("state") or "").upper() in OK for c in done):
             facts["ci_exception"] = "billing"
             facts["ci_unavailable_checks"] = waived
+            if unstable_reason in reasons:
+                # GitHub reports UNSTABLE while a non-required check has failed. Here every failed check is one the billing
+                # waiver covers and nothing is pending, so the state is explained; BLOCKED, DIRTY, BEHIND and others still refuse.
+                reasons.remove(unstable_reason)
+                facts["merge_state"] = "UNSTABLE, explained by the billing-waived checks (not a CI pass)"
             facts["ci_verdict"] = ("NOT_A_CI_PASS: these Actions jobs were blocked by billing and never ran; the recorded "
                                    "local-equivalent evidence stands in for them, they are not green")
         else:
