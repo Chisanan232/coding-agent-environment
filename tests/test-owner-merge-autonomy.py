@@ -296,5 +296,15 @@ class DocumentedBlock(unittest.TestCase):
             self.assertFalse(glob(a, "gh pr review 7 --approve") or glob(a, "rtk gh pr review 7 --approve"), a)
 
 
+class LocalEquivalentDocs(unittest.TestCase):
+    """SPE-155: the documented exemption states its limits plainly."""
+
+    def test_doc_states_non_required_unstable_and_coverage_limits(self):
+        for phrase in ("non-required", "`UNSTABLE` is accepted only when", "`BLOCKED`, `DIRTY`, `BEHIND`",
+                       "one machine and one OS/Python version", "uncovered platforms",
+                       "never presents the exemption as a CI pass", "CI_UNAVAILABLE_EXTERNAL"):
+            self.assertIn(phrase, DOC)
+
+
 if __name__ == "__main__":
     unittest.main()
