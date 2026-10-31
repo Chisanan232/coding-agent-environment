@@ -105,7 +105,7 @@ class Hostile(unittest.TestCase):
     def test_malformed_values_are_rejected(self):
         bad = {'class': [5, 'X y', '', 'a' * 40, None, True], 'mem_bytes': [0, -1, True, 1.5, '6', 2 ** 80, None],
                'cpu_slots': [0, True, 10 ** 9, '4', 1.0], 'test_threads': [0, False, 2 ** 40],
-               'excl_keys': ['x', [1], ['a\nb'], ['a\0b'], [''], ['k' * 600], ['k'] * 9, None],
+               'excl_keys': ['x', [1], ['a\nb'], ['a\0b'], ['a\tb'], ['a\x1bb'], ['a\x7fb'], [''], ['k' * 600], ['k'] * 9, None],
                'created': ['yesterday', '2026-10-31T00:00:00', 7, 'z' * 100, None],
                'owner': ['me', {'uid': True}, {'uid': -1}, {'uid': 2 ** 40}, {'uid': 1, 'session_id': 'x y'},
                          {'uid': 1, 'ticket': '../x'}, {'uid': 1, 'session_id': 5}, None, []]}
@@ -217,6 +217,33 @@ class Records(QueueBase):
         self.assertTrue(ok['admit'], ok)
         record = da._read_reservation(self.path.parent / 'reservations/job.json')
         self.assertEqual(record['class'], 'build-crate')
+
+    def test_printed_handoff_claim_is_accepted_verbatim_for_default_and_raised_estimates(self):
+        import shlex
+        for ticket, kwargs in (('HORO-2070', {}), ('HORO-2071', dict(mem=20, cpus=6))):
+            declared = self.declared(**kwargs)
+            qid = self.enqueue(ticket, label='job-' + ticket.lower(), argv=ARGV, declared=declared)['id']
+            self.advance()
+            printed = self.entries()[qid]['handoff']['claim']
+            tokens = shlex.split(printed.split('&&', 1)[1])
+            self.assertEqual(tokens[-4:], ['--', '<the', 'exact', 'job>'])
+            args = da.build_parser().parse_args(tokens[1:-4])
+            fields, error = da._declared_from_args(args, args.nbytes)
+            self.assertIsNone(error)
+            out = da.queue_claim(self.path, args.queue_id, args.label, args.nbytes, ARGV, str(self.worktree), lambda: 400 * GIB,
+                                 pid=os.getpid(), now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda p, a: None,
+                                 declared=fields)
+            self.assertTrue(out['ok'], (printed, out))
+            os.unlink(self.path.parent / ('reservations/job-' + ticket.lower() + '.json'))
+            da._queue_mark_released(self.path, qid, self.now, 'test', False)
+
+    def test_same_label_refresh_without_declaration_keeps_recorded_fields(self):
+        proc = subprocess.Popen(['/bin/sleep', '300'], stdin=subprocess.DEVNULL)
+        self.holders.append(proc)
+        args = ('job', 20 * GIB, proc.pid, self.path, lambda: 400 * GIB)
+        self.assertTrue(da.reserve(*args, now=self.now, declared=self.declared())['admit'])
+        self.assertTrue(da.reserve(*args, now=self.now)['admit'])
+        self.assertEqual(da._read_reservation(self.path.parent / 'reservations/job.json')['class'], 'build-crate')
 
 
 class Decisions(QueueBase):

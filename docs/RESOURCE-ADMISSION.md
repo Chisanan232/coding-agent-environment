@@ -243,6 +243,12 @@ below the class default; with no class they are recorded as given. `min jobs` is
 not read. The exclusion key is resolved without executing anything: `CARGO_TARGET_DIR`, else `build.target-dir` in
 `~/.cargo/config.toml` (one small file read), else `./target`, recorded as `cargo-target:<normalised path>`.
 
+Exclusion-key limits (record-only for now, so none changes a decision, but a later change that enforces exclusivity must
+close them): only `~/.cargo/config.toml` is read, so `CARGO_HOME`, an extension-less `config`, a workspace or parent
+`.cargo/config.toml` and `CARGO_BUILD_TARGET_DIR` are ignored; the path is normalised, not symlink-resolved, so two spellings
+of one directory give two keys; and if `tomllib` is missing or the file does not parse the key silently falls back to
+`./target`, which fails open for exclusivity. A same-label refresh without a declaration keeps the previously recorded fields.
+
 Record fields (all optional, version stays 1), on a reservation and on a queue entry: `class`, `mem_bytes`, `cpu_slots`,
 `test_threads` (equal to `cpu_slots` for now), `excl_keys`, `created` and `owner` (`uid`, `session_id`, `ticket`). A queue entry
 already had `created`; a claim copies the fields onto the reservation. Readers ignore unknown keys, but a present field with a bad

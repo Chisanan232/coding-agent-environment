@@ -628,7 +628,7 @@ def _valid_declared(record):
             and number('mem_bytes', MAX_MEM_BYTES) and number('cpu_slots', MAX_CPU_SLOTS) and number('test_threads', MAX_CPU_SLOTS)
             and ('excl_keys' not in record or (isinstance(record['excl_keys'], list) and len(record['excl_keys']) <= MAX_EXCL_KEYS
                                                and all(isinstance(k, str) and 0 < len(k) <= MAX_EXCL_KEY_LEN
-                                                       and '\0' not in k and '\n' not in k for k in record['excl_keys'])))
+                                                       and not any(ord(c) < 32 or ord(c) == 127 for c in k) for k in record['excl_keys'])))
             and ('created' not in record or _valid_time_text(record['created']))
             and ('owner' not in record or (isinstance(owner, dict) and type(owner.get('uid')) is int and 0 <= owner['uid'] < 2 ** 32
                                            and (owner.get('session_id') is None or (isinstance(owner['session_id'], str)
@@ -908,6 +908,8 @@ def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_
                 if ahead:
                     return dict(result, admit=False, reason='queue-ahead: %d queued entries wait for the heavy lane (first %s, %s); '
                                 'enqueue instead of reserving directly' % (len(ahead), ahead[0]['id'], ahead[0]['label']))
+            if same and not declared and any(_declared(same[0])):
+                declared = _declared_fields(same[0])   # a refresh without a declaration keeps what the job declared before
             if same and same[0].get('workload') is not None:
                 workload = merge_workload(same[0]['workload'], workload)   # a refresh must not forget reparented members
             lanes = HEAVY_LANES[result['tier']]
@@ -1765,10 +1767,11 @@ def _handoff(entry):
     claim = ('cd %s && disk-admission.py run --queue-id %s --label %s --bytes %d -- <the exact job>' % (
         shlex.quote(entry['worktree']), entry['id'], entry['label'], entry['bytes']))
     if any(_declared(entry)):
+        # Always the recorded values: the claim re-resolves them and must match the entry exactly, raised estimates included.
         claim = claim.replace(' -- <the exact job>', ''.join(
             [' --class ' + entry['class']] * ('class' in entry) +
-            [' --mem-gib %s' % (entry['mem_bytes'] / GIB)] * ('mem_bytes' in entry and 'class' not in entry) +
-            [' --cpus %d' % entry['cpu_slots']] * ('cpu_slots' in entry and 'class' not in entry)) + ' -- <the exact job>')
+            [' --mem-gib %s' % (entry['mem_bytes'] / GIB)] * ('mem_bytes' in entry) +
+            [' --cpus %d' % entry['cpu_slots']] * ('cpu_slots' in entry)) + ' -- <the exact job>')
     return {'resume': resume, 'claim': claim}
 
 
