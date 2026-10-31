@@ -154,13 +154,16 @@ a fresh sudo credential (`sudo -v`) in the owner Terminal; if it was refused, re
 **Payload and self-test gate (`prepare --payload DIR`, `run --no-model`).** A producer can stage its own built tools and vectors for
 the QA run: `scripts/qa-payload-manifest.py plan|verify` builds and checks the `MANIFEST.json`, `prepare --payload DIR` binds it into
 the packet, and a run copies it into the QA outbox, mounts it read-only and executable, proves confinement (now including loopback and
-UNIX-socket bind and a TEST-NET connect that must be refused), and runs the producer's self-tests under the real profile before Codex
+UNIX-socket bind, IPv4 and IPv6 TEST-NET connects, a UDP send and the system resolver's socket, each of which must be refused with EPERM), and runs the producer's self-tests under the real profile before Codex
 starts; a failed self-test is `QA_INCOMPLETE` and Codex is never launched. `--no-model` stops after that gate, the seal and the sweep
 and can never be a pass. The probe and self-tests cover only offline, library-level checks; daemon-level and end-to-end results are
 producer-run and are not independently reproduced, and RESULT says so. Note that the base confinement control set itself grew for every
-run (loopback bind, UNIX-socket bind, TEST-NET connect): an older helper's record is rejected, `--unattended` needs the helper reinstalled,
-and a host that does not answer the TEST-NET connect with an immediate EPERM or EACCES fails closed; real macOS behaviour of these three
-controls is unverified until an owner run. Format, rules and a worked example: [QA-PAYLOAD.md](QA-PAYLOAD.md).
+run (loopback bind, UNIX-socket bind, IPv4 and IPv6 TEST-NET connects, UDP send, resolver socket): an older helper's record is rejected,
+`--unattended` needs the helper reinstalled, and a host that does not answer one of them with an immediate EPERM fails closed; real macOS
+behaviour of the three older controls is unverified until an owner run (the new three were measured as the owner's user with `codex sandbox`).
+What these show is that direct socket access is restricted for tool commands. They do not show complete network isolation: system helpers
+such as `trustd` can act on a process's behalf (measured: a certificate fetch for a sandboxed command), so a URL or host name a command
+asks the system to verify may leave the machine, and the run does not claim otherwise. Format, rules and a worked example: [QA-PAYLOAD.md](QA-PAYLOAD.md).
 
 **Installing the delegation (a root-owned copy, then one root command).** `scripts/qa-hop-install.py` is the installer of ADR 0016.
 `plan` is read-only and unprivileged; it prints the exact text below with your values filled in, runs `visudo -c -f` on the
