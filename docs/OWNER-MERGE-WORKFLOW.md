@@ -75,6 +75,8 @@ says `NOT_A_CI_PASS`: the verdict records that the local-equivalent evidence sta
 If the waiver is declined, `facts.ci_unavailable_refused` lists why. The record and flag are supplied by the authenticated
 identity, so the gate bounds what the record can cover; it does not independently verify the billing cause beyond GitHub's own annotation.
 
+GitHub reports `mergeStateStatus` UNSTABLE while a non-required check has failed. When the billing waiver covers every failed check and nothing is pending, the gate treats that UNSTABLE as explained (`facts.merge_state`) and does not refuse on it; any other merge state (BLOCKED, DIRTY, BEHIND, unrecognized) and any failure the waiver does not cover still refuse.
+
 ## Repository with no hosted CI (founder-approved per PR)
 
 A repository that defines no CI workflow at all (its `.github/workflows` directory does not exist) can never report a check, so
