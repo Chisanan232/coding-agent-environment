@@ -845,16 +845,21 @@ def _refusal(reason, **extra):
 
 
 def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None,
-            token_fn=process_token, ttl=DEFAULT_TTL, owner_fn=process_owner, allow_long=False, table_fn=None, declared=None):
-    """Admit or refuse via _reserve, then record a measurement sample outside the lock for an admitted reservation."""
+            token_fn=process_token, ttl=DEFAULT_TTL, owner_fn=process_owner, allow_long=False, table_fn=None, declared=None,
+            host_fn=None):
+    """Admit or refuse via _reserve, then record a measurement sample outside the lock for an admitted reservation.
+
+    host_fn (optional) supplies the host sample for the SHADOW budget, taken here before the lock; it never changes the result."""
     now = now or datetime.now(timezone.utc)
-    result = _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long, table_fn, declared)
+    result = _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long, table_fn, declared,
+                      _host_or_error(host_fn))
     if result.get('admit') and str(result.get('reason', '')).startswith('reserved '):
         _measure(state_path, 'reserve', result.get('free_bytes'), now)
     return result
 
 
-def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long, table_fn=None, declared=None):
+def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long, table_fn=None, declared=None,
+             host=None):
     """Admit one heavy job and record its byte reservation, or refuse.
 
     Admission needs: heavy admitted by tier and latch, a free heavy lane, and
@@ -914,19 +919,28 @@ def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_
                 workload = merge_workload(same[0]['workload'], workload)   # a refresh must not forget reparented members
             lanes = HEAVY_LANES[result['tier']]
             reserved = sum(r['bytes'] for r in others) + sum(e['bytes'] for e in orphans)
-            if len(others) + len(orphans) >= lanes:
-                return dict(result, admit=False, reserved_bytes=reserved,
-                            reason='lane-cap: %d of %d heavy lanes in use (%s)' % (len(others), lanes, ', '.join(
-                                '%s pid %d%s%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '',
-                                                   ' UNRESOLVED: ' + r['unresolved'] if r.get('unresolved') else '')
-                                for r in others)))
+            lane_full = len(others) + len(orphans) >= lanes
+            budget = None
+            if host is not None:
+                budget = _shadow_site(host, 'reserve', label, budget_holders(others, orphans, queued, now), budget_request(
+                    declared or {}, nbytes, label), result['tier'], result['free_bytes'], reserved,
+                    not lane_full and result['free_bytes'] - reserved - nbytes >= HEAVY_FLOOR)
+                if queue_dir(state_path).exists():
+                    _budget_receipt(state_path, {'id': '-', 'label': label, 'tickets': []}, now, budget)
+            if lane_full:
+                return _with_budget(dict(result, admit=False, reserved_bytes=reserved,
+                                         reason='lane-cap: %d of %d heavy lanes in use (%s)' % (len(others), lanes, ', '.join(
+                                             '%s pid %d%s%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '',
+                                                                ' UNRESOLVED: ' + r['unresolved'] if r.get('unresolved') else '')
+                                             for r in others))), budget)
             if result['free_bytes'] - reserved - nbytes < HEAVY_FLOOR:
-                return dict(result, admit=False, reserved_bytes=reserved,
-                            reason='over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
-                                result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB))
+                return _with_budget(dict(result, admit=False, reserved_bytes=reserved,
+                                         reason='over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
+                                             result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB)), budget)
             write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), workload=workload, declared=declared)
-            return dict(result, reserved_bytes=reserved + nbytes,
-                        reason='reserved %.1f GiB for %s (lane %d of %d)' % (nbytes / GIB, label, len(others) + 1, lanes))
+            return _with_budget(dict(result, reserved_bytes=reserved + nbytes,
+                                     reason='reserved %.1f GiB for %s (lane %d of %d)' % (nbytes / GIB, label, len(others) + 1, lanes)),
+                                budget)
     except StateError as exc:
         return _refusal('%s: %s' % (exc.kind, exc))
     except OSError as exc:
@@ -1481,21 +1495,31 @@ def _drop_marker(state_path, qid):
         pass
 
 
-def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=process_token, grant_s=QUEUE_GRANT_S, table_fn=None):
-    """_queue_advance, then a measurement sample per reservation holder outside the lock."""
+def _has_waiting(state_path):
+    """Read-only, unlocked: is any entry waiting for a lane? Only then is a host sample worth taking for the shadow budget."""
+    try:
+        return any(e['state'] in ('QUEUED', 'ELIGIBLE') for e in _queue_entries(state_path)[0])
+    except (StateError, OSError):
+        return False
+
+
+def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=process_token, grant_s=QUEUE_GRANT_S, table_fn=None,
+                  host_fn=None):
+    """_queue_advance, then a measurement sample per reservation holder outside the lock. host_fn feeds the SHADOW budget."""
     now = now or datetime.now(timezone.utc)
+    host = _host_or_error(host_fn) if host_fn is not None and _has_waiting(state_path) else None
     seen = {}
 
     def free():
         seen['free'] = free_fn()
         return seen['free']
 
-    out = _queue_advance(state_path, free, now, token_fn, grant_s, table_fn)
+    out = _queue_advance(state_path, free, now, token_fn, grant_s, table_fn, host)
     _measure(state_path, 'advance', seen.get('free'), now)
     return out
 
 
-def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None):
+def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, host=None):
     """One advance step under the lock: expire lapsed grants and waits, then grant the first in line if a lane is free.
 
     A lane is occupied by a live reservation (including one past its time limit or unverifiable) and by an unclaimed,
@@ -1566,10 +1590,17 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None):
                 out['reason'] = 'no heavy lane at tier %s' % result['tier']
                 return out
             orphans = _claimed_orphans(entries, live, token_fn, table_fn, state_path)
-            if len(live) + len(granted) + len(orphans) >= lanes:
+            occupied = len(live) + len(granted) + len(orphans) >= lanes
+            reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
+            if host is not None:
+                out['budget'] = _shadow_site(host, 'advance', first['label'], budget_holders(live, orphans, granted, now),
+                                             budget_request(first, first['bytes'], first['label']), result['tier'],
+                                             result['free_bytes'], reserved,
+                                             not occupied and result['free_bytes'] - reserved - first['bytes'] >= HEAVY_FLOOR)
+                _budget_receipt(state_path, first, now, out['budget'])
+            if occupied:
                 out['reason'] = 'lane occupied'
                 return out
-            reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
             if result['free_bytes'] - reserved - first['bytes'] < HEAVY_FLOOR:
                 out['reason'] = 'over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested for %s, floor 100 GiB' % (
                     result['free_bytes'] / GIB, reserved / GIB, first['bytes'] / GIB, first['id'])
@@ -1606,8 +1637,9 @@ def _memory_precondition():
 
 def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_bytes, pid=None, now=None, token_fn=process_token,
                 owner_fn=process_owner, ttl=DEFAULT_TTL, memory_fn=_memory_precondition, exec_fn=None, allow_long=False,
-                table_fn=None, declared=None):
+                table_fn=None, declared=None, host_fn=None):
     """Claim a granted lane for this very process, then exec the job; every precondition is revalidated first.
+    host_fn feeds the SHADOW budget (sampled after the memory gate, before the lock); it never changes the outcome.
 
     Outside the lock: the entry must be GRANTED and unlapsed, owned by this uid, and match label, bytes, worktree and job
     fingerprint; then fresh memory/CPU/heavy-process admission. Under the lock: the entry again, then tier, latch, lane
@@ -1618,6 +1650,7 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
     now = now or datetime.now(timezone.utc)
     pid = pid or os.getpid()
     exec_fn = exec_fn or _exec_job
+    budget = None
 
     def refuse(reason):
         return {'ok': False, 'reason': reason, 'exit': REFUSED_EXIT}
@@ -1668,6 +1701,7 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
         admitted, memory_reason = memory_fn()
         if not admitted:
             return refuse('memory-gate: %s' % memory_reason)
+        host = _host_or_error(host_fn)
         if fresh_clock:
             now = datetime.now(timezone.utc)  # the memory gate takes 10 s or more; judge lapse and expiry at the real time
         with state_lock(state_path):
@@ -1700,15 +1734,21 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
                 return refuse('label-in-use: %s already holds a reservation' % label)
             orphans = _claimed_orphans(entries, live, token_fn, table_fn, state_path)
             lanes = HEAVY_LANES[result['tier']]
-            if len(live) + len(orphans) >= lanes:
-                return refuse('lane-cap: %d of %d heavy lanes in use (%s)' % (len(live) + len(orphans), lanes, ', '.join(
+            reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
+            lane_full = len(live) + len(orphans) >= lanes
+            if host is not None:
+                budget = _shadow_site(host, 'claim', label, budget_holders(live, orphans, entries, now, skip_id=qid),
+                                      budget_request(entry, nbytes, label), result['tier'], result['free_bytes'], reserved,
+                                      not lane_full and result['free_bytes'] - reserved - nbytes >= HEAVY_FLOOR)
+                _budget_receipt(state_path, entry, now, budget)
+            if lane_full:
+                return _with_budget(refuse('lane-cap: %d of %d heavy lanes in use (%s)' % (len(live) + len(orphans), lanes, ', '.join(
                     ['%s pid %d%s%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '',
                                     ' UNRESOLVED: ' + r['unresolved'] if r.get('unresolved') else '') for r in live] +
-                    ['%s pid %d (reservation removed, job still running)' % (e['label'], e['holder']['pid']) for e in orphans])))
-            reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
+                    ['%s pid %d (reservation removed, job still running)' % (e['label'], e['holder']['pid']) for e in orphans]))), budget)
             if result['free_bytes'] - reserved - nbytes < HEAVY_FLOOR:
-                return refuse('over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
-                    result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB))
+                return _with_budget(refuse('over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
+                    result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB)), budget)
             if wrapper_is_zombie(pid, token, table_fn):
                 return refuse('process-not-running: pid %d has exited' % pid)
             workload = capture_workload(pid, token, table_fn)
@@ -1739,8 +1779,8 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
     except OSError as exc:
         release(label, state_path)
         _queue_mark_released(state_path, qid, now, 'exec-failed', False)
-        return {'ok': False, 'reason': 'exec failed: %s' % exc, 'exit': 127}
-    return {'ok': True, 'reason': 'claimed %s for %s' % (qid, label), 'exit': 0}
+        return _with_budget({'ok': False, 'reason': 'exec failed: %s' % exc, 'exit': 127}, budget)
+    return _with_budget({'ok': True, 'reason': 'claimed %s for %s' % (qid, label), 'exit': 0}, budget)
 
 
 def _queue_mark_released(state_path, qid, now, evidence, alive):
@@ -1887,6 +1927,285 @@ def queue_cancel(state_path, qid, now=None, session_id=None):
         return {'ok': False, 'reason': 'state-unwritable: %s' % exc}
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Shadow resource budget (SPE-150 PR4). SHADOW: NOT ENFORCED. At the three lane sites (reserve, queue advance, queue claim)
+# the budget below is computed and recorded beside the decision (a `budget` key in the result, a receipts line, the snapshot
+# and status `budget` sections) while the HEAVY_LANES check still decides alone. Nothing here changes an admit, a refusal,
+# a grant order or a reason string. It persists nothing but receipts lines, and any failure to sample the host only marks the
+# budget `unavailable`.
+#
+# Arithmetic, under the existing flock and over reservation records (host memory is never sampled inside the lock; a
+# windowed host sample is taken BEFORE it):
+#   projected = host_used + sum_r max(0, est_mem_r - measured_rss_r) + unmanaged_trees * UNMANAGED_ALLOWANCE + est_mem_new
+# measured_rss_r (the holder's process subtree in the sample) counts only when the sample is newer than the record's
+# `created`; an older or undated record is charged in full. A running heavy tree that no record accounts for is UNMANAGED: it
+# adds the allowance (its own usage is already in host_used) and is never a refusal by itself. A legacy record (no class and
+# no declared estimate) costs the whole memory budget and all cores; a legacy REQUEST needs the whole host, so it fits only
+# beside no other workload. Who counts: live reservations (also past their TTL or unresolved), claimed orphans and unclaimed,
+# unlapsed GRANTED queue entries, each at its recorded class cost.
+# All numbers are guesses to be calibrated from `disk-admission.py measurements`; headroom is whole percent so a boundary
+# comparison is exact.
+SHADOW_NOTE = 'shadow: not enforced'
+UNMANAGED_ALLOWANCE = 8 * GIB
+HEADROOM_PERCENT = {'GREEN': 30, 'AMBER': 40}        # memory kept free: 0.30 / 0.40 of RAM
+CPU_BUDGET_PERCENT = 100                              # cpu_slots may sum to cores x 1.0
+MAX_CONCURRENT = {'emergency': 0, 'low': 0, 'stable': 1, 'wide': 1}   # constant 1 everywhere a heavy lane exists
+PROBE_CAP = 2                                         # `fits_if_cap_were_2` asks what a second concurrent job would have met
+SHADOW_WINDOW_S = 2.0                                 # host sample window; memory-admission's own check uses 10 s
+BAND_RANK = {'GREEN': 0, 'AMBER': 1, 'RED': 2}
+REFERENCE_CLASS = 'build-crate'                       # the snapshot's "would a typical job fit" probe
+
+
+def _legacy(record):
+    return not any(key in record for key in ('class', 'mem_bytes', 'cpu_slots'))
+
+
+def _created_time(text):
+    try:
+        return _parse_time(text) if isinstance(text, str) else None
+    except ValueError:
+        return None
+
+
+def budget_holder(kind, record, created=None, pid=None, workload=None):
+    """Normalised cost record of one thing that occupies the budget. `created` is when its reservation began (None: charge in
+    full); pid is None for a grant nobody has claimed yet (nothing runs, nothing is measured)."""
+    return {'kind': kind, 'label': record['label'], 'class': record.get('class'), 'legacy': _legacy(record),
+            'mem_bytes': record.get('mem_bytes') or 0, 'cpu_slots': record.get('cpu_slots') or 0,
+            'excl_keys': list(record.get('excl_keys') or []), 'created': _created_time(created), 'pid': pid,
+            'members': [m['pid'] for m in (workload or {}).get('members', [])],
+            'flags': [flag for flag in ('past_ttl', 'unresolved') if record.get(flag)]}
+
+
+def budget_request(record, nbytes, label):
+    return {'label': label, 'bytes': nbytes, 'class': record.get('class'), 'legacy': _legacy(record),
+            'mem_bytes': record.get('mem_bytes') or 0, 'cpu_slots': record.get('cpu_slots') or 0,
+            'test_threads': record.get('test_threads') or 0, 'excl_keys': list(record.get('excl_keys') or [])}
+
+
+def budget_holders(live, orphans, entries, now, skip_id=None):
+    """Holders for the budget from lane-site data: live reservations, claimed orphans (judged from their claim time) and the
+    unlapsed GRANTED entries other than skip_id (the grant being claimed does not count against itself)."""
+    holders = [budget_holder('reservation', r, r.get('created'), r['pid'], r.get('workload')) for r in live]
+    holders += [budget_holder('orphan', e, e['holder'].get('claimed_at'), e['holder']['pid'], e['holder'].get('workload'))
+                for e in orphans]
+    holders += [budget_holder('granted', e, None) for e in entries
+                if e['state'] == 'GRANTED' and e['id'] != skip_id and not _entry_lapsed(e, now)]
+    return holders
+
+
+def _subtree_pids(rows, roots):
+    """Every pid at or below any of `roots` in {pid: (ppid, rss_kib, cpu_s)}."""
+    children = {}
+    for pid, (ppid, _, _) in rows.items():
+        children.setdefault(ppid, []).append(pid)
+    seen, stack = set(), [r for r in roots if r in rows]
+    while stack:
+        pid = stack.pop()
+        if pid not in seen:
+            seen.add(pid)
+            stack.extend(children.get(pid, ()))
+    return seen
+
+
+def _gib(value):
+    return '%.1f GiB' % (value / GIB)
+
+
+def budget_decision(host, reservations, request, caps):
+    """Pure. What the resource budget WOULD decide for `request` beside `reservations` (shadow: not enforced).
+
+    host: {'ram','used','cores','load1','time' (aware datetime),'window_s','rows','rows_prev','workloads','band' or
+    'band_fn'(corrected load per core -> (band, reasons))} or None/{'error':..}. request: budget_request() or None for state
+    only. caps: {'max_concurrent','free_bytes','reserved_bytes','floor'}. Returns a JSON-safe dict; `would_admit` honours the
+    concurrency cap, `fits_if_cap_were_2` is the same verdict with the cap raised to 2, `resource_reasons` explains every
+    non-cap refusal and `cap_reason` the cap.
+    """
+    out = {'shadow': SHADOW_NOTE, 'status': 'ok'}
+    if not host or host.get('error') or any(host.get(k) is None for k in ('ram', 'used', 'cores')):
+        return dict(out, status='unavailable', reason=(host or {}).get('error') or 'no host sample')
+    ram, cores, rows, prev = host['ram'], host['cores'], host.get('rows') or {}, host.get('rows_prev') or {}
+    sampled, window = host.get('time'), host.get('window_s') or 0
+    managed, holders, residual, measured_cpu, load_credit, legacy = set(), [], 0, 0.0, 0.0, 0
+    for h in reservations:
+        pids = _subtree_pids(rows, ([h['pid']] if h['pid'] is not None else []) + h['members'])
+        managed |= pids
+        fresh = sampled is not None and h['created'] is not None and sampled > h['created']
+        rss = sum(rows[p][1] for p in pids) * 1024 if fresh else 0
+        rate = sum(max(0.0, rows[p][2] - prev[p][2]) for p in pids if p in prev) / window if fresh and window > 0 else 0.0
+        slots = cores if h['legacy'] else h['cpu_slots']
+        load_credit += min(slots, rate)
+        measured_cpu += rate
+        legacy += h['legacy']
+        charge = None if h['legacy'] else max(0, h['mem_bytes'] - rss)   # a legacy record is charged the whole budget below
+        residual += charge or 0
+        holders.append({'label': h['label'], 'kind': h['kind'], 'class': h['class'], 'legacy': h['legacy'], 'est_mem_bytes': h['mem_bytes'],
+                        'measured_rss_bytes': rss, 'charge_bytes': charge, 'cpu_slots': slots, 'measured_cpu': round(rate, 2),
+                        'counted_measurement': bool(fresh), 'flags': h['flags']})
+    unmanaged = [w for w in host.get('workloads') or []
+                 if w.get('root_pid') is None or (w['root_pid'] not in managed and not managed & set(w.get('members') or []))]
+    lpc = None
+    if host.get('load1') is not None:
+        lpc = max(0.0, host['load1'] - load_credit) / cores
+    if host.get('band_fn'):
+        band, band_reasons = host['band_fn'](lpc)
+    else:
+        band, band_reasons = host.get('band', 'GREEN'), host.get('band_reasons', [])
+    headroom = HEADROOM_PERCENT['GREEN' if band == 'GREEN' else 'AMBER']
+    limit = ram * (100 - headroom) // 100
+    for entry in holders:
+        if entry['legacy']:
+            entry['charge_bytes'] = limit
+    residual += limit * legacy
+    allowance = len(unmanaged) * UNMANAGED_ALLOWANCE
+    cpu_used = sum(e['cpu_slots'] for e in holders)
+    cpu_limit = cores * CPU_BUDGET_PERCENT // 100
+    count = len(reservations)
+    out.update(band=band, band_reasons=list(band_reasons), headroom_percent=headroom, ram_bytes=ram, host_used_bytes=host['used'],
+               limit_bytes=limit, residual_bytes=residual, unmanaged_trees=len(unmanaged), unmanaged_allowance_bytes=allowance,
+               cpu_slots_used=cpu_used, cpu_limit=cpu_limit, corrected_load_per_core=None if lpc is None else round(lpc, 2),
+               count=count, holders=holders)
+    base = host['used'] + residual + allowance
+    out['projected_bytes'] = base
+    cap = caps.get('max_concurrent', 0)
+    out['max_concurrent'] = cap
+    if request is None:
+        return out
+    reasons = []
+    if band == 'RED':
+        reasons.append('band RED: %s' % ('; '.join(band_reasons) or 'memory-admission refuses'))
+    if request['legacy']:
+        # No declared estimate means the legacy meaning: the whole budget and all cores, so only a free host fits it.
+        if count or unmanaged:
+            reasons.append('legacy request needs the whole budget and all cores: %d workload(s) and %d unmanaged tree(s) hold some'
+                           % (count, len(unmanaged)))
+        out['projected_bytes'] = base + limit
+        cpu_need = cores
+    else:
+        out['projected_bytes'] = base + request['mem_bytes']
+        cpu_need = request['cpu_slots']
+        if out['projected_bytes'] > limit:
+            reasons.append('memory: projected %s > %s (RAM x (1 - %d%%))' % (_gib(out['projected_bytes']), _gib(limit), headroom))
+        if cpu_used + cpu_need > cpu_limit:
+            reasons.append('cpu: %d slots in use + %d requested > %d cores' % (cpu_used, cpu_need, cpu_limit))
+    taken = set(request['excl_keys'])
+    clash = sorted({h['label'] for h in reservations if taken & set(h['excl_keys'])})
+    if clash:
+        reasons.append('excl_key overlap with %s' % ', '.join(clash))
+    if caps.get('free_bytes') is not None and caps['free_bytes'] - caps.get('reserved_bytes', 0) - request['bytes'] < caps.get('floor', 0):
+        reasons.append('byte floor: %s free - %s reserved - %s requested < %s' % (
+            _gib(caps['free_bytes']), _gib(caps.get('reserved_bytes', 0)), _gib(request['bytes']), _gib(caps['floor'])))
+
+    def fits(limit_count):
+        return not reasons and count + 1 <= limit_count
+
+    out.update(resource_reasons=reasons, would_admit=fits(cap), fits_if_cap_were_2=fits(PROBE_CAP if cap > 0 else 0),
+               cap_reason=None if count + 1 <= cap else 'cap: %d running + 1 > max concurrent %d' % (count, cap))
+    jobs, threads = request['cpu_slots'], request['test_threads']
+    floor_jobs = WORKLOAD_CLASSES.get(request['class'], {}).get('min_jobs') or 1
+    if band == 'AMBER' and jobs:
+        out['granted_jobs'], out['granted_test_threads'] = min(jobs, max(floor_jobs, jobs // 2)), max(1, threads // 2)
+    elif band == 'GREEN':
+        out['granted_jobs'], out['granted_test_threads'] = jobs, threads
+    else:
+        out['granted_jobs'] = out['granted_test_threads'] = 0
+    return out
+
+
+def budget_line(budget):
+    """One human line; always carries the shadow note."""
+    if budget.get('status') != 'ok':
+        return 'budget (%s): unavailable: %s' % (SHADOW_NOTE, budget.get('reason'))
+    if 'would_admit' not in budget:
+        return 'budget (%s): band %s, projected %s of %s, %d/%d cpu slots' % (
+            SHADOW_NOTE, budget['band'], _gib(budget['projected_bytes']), _gib(budget['limit_bytes']), budget['cpu_slots_used'],
+            budget['cpu_limit'])
+    why = budget['resource_reasons'] + ([budget['cap_reason']] if budget['cap_reason'] else [])
+    return 'budget (%s): would %s%s; fits_if_cap_were_2=%s; band %s; projected %s of %s; %d/%d cpu slots; lane check decided %s' % (
+        SHADOW_NOTE, 'admit' if budget['would_admit'] else 'refuse', ' (%s)' % '; '.join(why) if why else '',
+        str(budget['fits_if_cap_were_2']).lower(), budget['band'], _gib(budget['projected_bytes']), _gib(budget['limit_bytes']),
+        budget['cpu_slots_used'] + budget.get('request_cpu_slots', 0), budget['cpu_limit'], budget.get('enforced', 'n/a'))
+
+
+def _memory_module():
+    from importlib.util import module_from_spec, spec_from_file_location
+    spec = spec_from_file_location('memory_admission', Path(__file__).with_name('memory-admission.py'))
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def read_host_sample(window_s=SHADOW_WINDOW_S, sleep=time.sleep, sample_fn=None, rows_fn=None, memory=None):
+    """Windowed host sample for the shadow budget, taken OUTSIDE the admission lock. Never raises: a failure returns
+    {'error': ...}. Reads the same fields as memory-admission (never a command line) plus per-process rss and cpu."""
+    try:
+        memory = memory or _memory_module()
+        sample_fn, rows_fn = sample_fn or memory.take_sample, rows_fn or _process_rows
+        first, rows_prev = sample_fn(), rows_fn()
+        sleep(window_s)
+        second, rows = sample_fn(), rows_fn()
+        view = memory.budget_view(first, second)
+        if rows is None or rows_prev is None:
+            return {'error': 'process table unreadable'}
+        return {'ram': view['ram'], 'used': view['used_bytes'], 'cores': view['cores'], 'load1': view['load1'],
+                'time': datetime.fromtimestamp(second['time'], timezone.utc), 'window_s': max(0.0, second['time'] - first['time']),
+                'rows': rows, 'rows_prev': rows_prev, 'workloads': view['workloads'],
+                'band_fn': lambda load_per_core: memory.budget_band(view['m'], load_per_core)}
+    except Exception as exc:   # observation must never change an admission outcome
+        return {'error': 'host-sample-unavailable: %s' % type(exc).__name__}
+
+
+def _host_or_error(host_fn):
+    if host_fn is None:
+        return None
+    try:
+        return host_fn() or {'error': 'no host sample'}
+    except Exception as exc:
+        return {'error': 'host-sample-unavailable: %s' % type(exc).__name__}
+
+
+def _shadow_site(host, site, label, holders, request, tier, free_bytes, reserved, enforced_admit):
+    """The budget record for one lane site. The lane check has already decided (`enforced_admit`); this only reports."""
+    caps = {'max_concurrent': MAX_CONCURRENT.get(tier, 0), 'free_bytes': free_bytes, 'reserved_bytes': reserved, 'floor': HEAVY_FLOOR}
+    budget = budget_decision(host, holders, request, caps)
+    budget.update(site=site, label=label, enforced='admit' if enforced_admit else 'refuse')
+    if request is not None:
+        budget['request_cpu_slots'] = request['cpu_slots']
+    return budget
+
+
+def _compact_budget(budget):
+    keys = ('shadow', 'status', 'reason', 'site', 'enforced', 'band', 'would_admit', 'fits_if_cap_were_2', 'resource_reasons',
+            'cap_reason', 'projected_bytes', 'limit_bytes', 'cpu_slots_used', 'cpu_limit', 'count', 'max_concurrent',
+            'unmanaged_trees', 'granted_jobs', 'granted_test_threads')
+    return {k: budget[k] for k in keys if k in budget}
+
+
+def _budget_receipt(state_path, entry, now, budget):
+    """Append the shadow verdict to the existing receipts log (the only thing the shadow budget persists). Under the lock."""
+    if budget.get('status') == 'ok':
+        _queue_receipt(state_path, 'shadow-budget', entry, now, budget=_compact_budget(budget))
+
+
+def _with_budget(result, budget):
+    return result if budget is None else dict(result, budget=budget)
+
+
+def _state_budget(host, state_path, now, tier, free_bytes, live, entries, orphans):
+    """Budget section for snapshot and status: the occupied budget plus a probe with the reference class."""
+    holders = budget_holders(live, orphans, entries, now)
+    reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
+    state = _shadow_site(host, 'state', None, holders, None, tier, free_bytes, reserved, True)
+    if state['status'] == 'ok':
+        spec = WORKLOAD_CLASSES[REFERENCE_CLASS]
+        probe = budget_request({'class': REFERENCE_CLASS, 'mem_bytes': (spec['mem_base_mib'] + spec['mem_per_job_mib'] * spec['jobs']) * MIB,
+                                'cpu_slots': spec['jobs'], 'test_threads': spec['jobs']}, spec['disk_gib'] * GIB, 'reference')
+        verdict = _shadow_site(host, 'state', None, holders, probe, tier, free_bytes, reserved, True)
+        state['reference'] = dict({'class': REFERENCE_CLASS}, **{k: verdict[k] for k in (
+            'would_admit', 'fits_if_cap_were_2', 'resource_reasons', 'cap_reason', 'granted_jobs', 'granted_test_threads')})
+    state.pop('enforced', None)
+    return state
+
 
 def declared_summary(records):
     """One row per reservation that declared a class or estimate; empty for legacy reservations. Read-only display."""
@@ -1934,16 +2253,17 @@ def read_snapshot(state_path):
     return record
 
 
-def snapshot(state_path, source_fn=measure_with_source, now=None, token_fn=process_token, table_fn=None):
-    """Publish the host resource snapshot, then sample each reservation holder outside the lock."""
+def snapshot(state_path, source_fn=measure_with_source, now=None, token_fn=process_token, table_fn=None, host_fn=None):
+    """Publish the host resource snapshot, then sample each reservation holder outside the lock. host_fn adds the SHADOW
+    `budget` section (sampled before the lock)."""
     now = now or datetime.now(timezone.utc)
-    record = _snapshot(state_path, source_fn, now, token_fn, table_fn)
+    record = _snapshot(state_path, source_fn, now, token_fn, table_fn, _host_or_error(host_fn))
     if 'error' not in record:
         _measure(state_path, 'snapshot', record.get('free_bytes'), now)
     return record
 
 
-def _snapshot(state_path, source_fn, now, token_fn, table_fn=None):
+def _snapshot(state_path, source_fn, now, token_fn, table_fn=None, host=None):
     """Refresh state and publish the host resource snapshot next to it."""
     seen = {}
 
@@ -1977,12 +2297,34 @@ def _snapshot(state_path, source_fn, now, token_fn, table_fn=None):
                       'blockers': blockers, 'source': seen.get('source')}
             if declared_summary(live):
                 record['workloads'] = declared_summary(live)   # display only: no decision reads it
+            if host is not None and result['tier'] is not None:
+                try:
+                    entries, queue_problems = _queue_entries(state_path)
+                    entries = [] if queue_problems else entries
+                    record['budget'] = _state_budget(host, state_path, now, result['tier'], result['free_bytes'], live, entries,
+                                                     _claimed_orphans(entries, live, token_fn, table_fn, state_path))
+                except (StateError, OSError, ReservationError, ValueError) as exc:   # the shadow section never fails a snapshot
+                    record['budget'] = {'shadow': SHADOW_NOTE, 'status': 'unavailable', 'reason': 'records unreadable: %s' % exc}
             write_json_atomic(state_path.with_name(SNAPSHOT_NAME), record)
             return record
     except StateError as exc:
         return {'error': '%s: %s' % (exc.kind, exc)}
     except OSError as exc:
         return {'error': 'state-unwritable: %s' % exc}
+
+
+def status_budget(state_path, result, host_fn, now=None):
+    """Read-only `budget` section for `status`: unlocked reads of the records, no verification writes. Shadow: not enforced."""
+    now = now or datetime.now(timezone.utc)
+    host = _host_or_error(host_fn)
+    try:
+        live = _reservation_holders(state_path)
+        entries, problems = _queue_entries(state_path)
+        entries = [] if problems else entries
+        orphans = _claimed_orphans(entries, live, process_token, None, None)
+        return _state_budget(host, state_path, now, result['tier'], result['free_bytes'], live, entries, orphans)
+    except (StateError, OSError, ReservationError) as exc:
+        return {'shadow': SHADOW_NOTE, 'status': 'unavailable', 'reason': 'records unreadable: %s' % exc}
 
 
 REFUSED_EXIT = 77
@@ -2014,7 +2356,7 @@ def _exec_job(program, args):
 
 
 def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, ttl=DEFAULT_TTL, allow_long=False,
-                 exec_fn=_exec_job, declared=None):
+                 exec_fn=_exec_job, declared=None, host_fn=None):
     """Reserve for this very process, then exec the job: nothing runs before admission.
 
     execv keeps the pid and the start time, so the reservation is held by the job itself and ends with it
@@ -2026,12 +2368,16 @@ def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, tt
     if not argv or not all(isinstance(part, str) and '\0' not in part for part in argv) or not argv[0]:
         print('refused: invalid-request: a command is required after --', file=sys.stderr)
         return REFUSED_EXIT
-    result = reserve(label, nbytes, os.getpid(), state_path, free_fn, ttl=ttl, allow_long=allow_long, declared=declared)
+    result = reserve(label, nbytes, os.getpid(), state_path, free_fn, ttl=ttl, allow_long=allow_long, declared=declared, host_fn=host_fn)
     if not result['admit']:
         print(result['reason'], file=sys.stderr)
+        if result.get('budget'):
+            print(budget_line(result['budget']), file=sys.stderr)
         return REFUSED_EXIT
     if sys.stderr.isatty():
         print(result['reason'], file=sys.stderr)  # never injected into a captured job stderr
+        if result.get('budget'):
+            print(budget_line(result['budget']), file=sys.stderr)
     try:
         exec_fn(argv[0], argv)
     except OSError as exc:
@@ -2146,7 +2492,7 @@ def _is_strict_ancestor(pid, ppid_fn=None, limit=64):
     return False
 
 
-def _queue_cli(args, state_path, free_fn):
+def _queue_cli(args, state_path, free_fn, host_fn=None):
     command = args.queue_command
     if command == 'enqueue':
         if args.job[:1] != ['--']:
@@ -2159,7 +2505,7 @@ def _queue_cli(args, state_path, free_fn):
         out = queue_enqueue(state_path, args.label, args.tickets, args.repo, args.worktree, args.harness, args.session_id,
                             args.nbytes, args.job[1:], again=args.again, wait_s=args.wait_s, declared=declared)
     elif command == 'advance':
-        out = queue_advance(state_path, free_fn, grant_s=args.grant_s)
+        out = queue_advance(state_path, free_fn, grant_s=args.grant_s, host_fn=host_fn)
         out['ok'] = out['reason'] in ('ok',) or bool(out['granted'] or out['expired'] or out['eligible']) or out['reason'] in (
             'lane occupied',) or out['reason'].startswith('no heavy lane')
     elif command == 'claim':
@@ -2176,7 +2522,7 @@ def _queue_cli(args, state_path, free_fn):
             return REFUSED_EXIT
         out = queue_claim(state_path, args.qid, args.label, args.nbytes, args.job[1:], os.getcwd(), free_fn, pid=args.pid,
                           ttl=args.ttl, allow_long=args.allow_long, memory_fn=lambda: _memory_precondition(),
-                          exec_fn=lambda program, argv: None, declared=declared)
+                          exec_fn=lambda program, argv: None, declared=declared, host_fn=host_fn)
         out.pop('exit', None)
     elif command == 'cancel':
         out = queue_cancel(state_path, args.qid, session_id=args.session_id)
@@ -2188,8 +2534,10 @@ def _queue_cli(args, state_path, free_fn):
     return 0 if out.get('ok') else REFUSED_EXIT
 
 
-def main(argv=None, free_fn=measure_free_bytes, state_path=None):
+def main(argv=None, free_fn=measure_free_bytes, state_path=None, host_fn=None):
     state_path = state_path or default_state_path()
+    if host_fn is None and free_fn is measure_free_bytes:
+        host_fn = read_host_sample   # an injected free-space reading means a test or a caller that wants no host sampling
     args = build_parser().parse_args(argv)
     if args.command == 'refresher-plist':
         script = Path(__file__).resolve()
@@ -2209,26 +2557,29 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
             return REFUSED_EXIT
         if args.queue_id:
             out = queue_claim(state_path, args.queue_id, args.label, args.nbytes, job, os.getcwd(), free_fn, ttl=args.ttl,
-                              allow_long=args.allow_long, declared=declared)
+                              allow_long=args.allow_long, declared=declared, host_fn=host_fn)
             if not out['ok']:
                 print(out['reason'], file=sys.stderr)
             return out['exit'] if not out['ok'] else 0
-        return run_reserved(args.label, args.nbytes, job, state_path, free_fn, args.ttl, args.allow_long, declared=declared)
+        return run_reserved(args.label, args.nbytes, job, state_path, free_fn, args.ttl, args.allow_long, declared=declared,
+                            host_fn=host_fn)
     if args.command == 'measurements':
         summary = measurements_summary(state_path)
         print(json.dumps(summary, sort_keys=True) if args.json else format_measurements(summary))
         return 0
     if args.command == 'queue':
-        return _queue_cli(args, state_path, free_fn)
+        return _queue_cli(args, state_path, free_fn, host_fn)
     if args.command in ('reserve', 'release'):
         declared, error = _declared_from_args(args, args.nbytes) if args.command == 'reserve' else ({}, None)
         if error:
             print('refused: ' + error)
             return REFUSED_EXIT
         result = (reserve(args.label, args.nbytes, args.pid, state_path, free_fn, ttl=args.ttl, allow_long=args.allow_long,
-                          declared=declared)
+                          declared=declared, host_fn=host_fn)
                   if args.command == 'reserve' else release(args.label, state_path))
         print(result['reason'])
+        if result.get('budget') and sys.stderr.isatty():
+            print(budget_line(result['budget']), file=sys.stderr)
         return 0 if result['admit'] else REFUSED_EXIT
     if args.command == 'snapshot' and args.check_fresh:
         if not 0 < args.max_age <= STALE_AFTER_S:
@@ -2243,7 +2594,8 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
             print('snapshot unusable: %s' % exc)
         return 0 if fresh else REFUSED_EXIT
     if args.command == 'snapshot':
-        record = snapshot(state_path, (lambda: (free_fn(), 'injected')) if free_fn is not measure_free_bytes else measure_with_source)
+        record = snapshot(state_path, (lambda: (free_fn(), 'injected')) if free_fn is not measure_free_bytes else measure_with_source,
+                          host_fn=host_fn)
         print(json.dumps(record, sort_keys=True))
         return REFUSED_EXIT if 'error' in record else 0
     result = evaluate(args.weight if args.command == 'check' else None, state_path, free_fn)
@@ -2256,6 +2608,8 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
             workloads = []
         if workloads:
             shown['workloads'] = workloads
+        if host_fn is not None and result['tier']:
+            shown['budget'] = status_budget(state_path, result, host_fn)   # shadow: not enforced
         print(json.dumps(shown, sort_keys=True))
         return 0 if result['tier'] else REFUSED_EXIT
     free = 'unknown' if result['free_bytes'] is None else '%.1f GiB' % (result['free_bytes'] / GIB)
