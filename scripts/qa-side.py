@@ -547,11 +547,13 @@ def open_prompt_at(afd, producer):
     return os.fdopen(fd, 'rb')
 
 
-def copy_tree_at(src_fd, dst):
+def copy_tree_at(src_fd, dst, producer):
     """Copy the directory held open as src_fd to the new directory dst. Every entry is examined and opened relative to its
     parent descriptor with O_NOFOLLOW, so a swap of any path after validation cannot redirect the copy. Links are recreated
     as links (like copytree symlinks=True) and never followed; anything that is not a directory, regular file or link is
-    refused."""
+    refused. Every directory and file must be owned by `producer`, and a file must have a single link: a hard link
+    could expose an inode the producer does not own. Any violation raises and the copy is abandoned."""
+    _need(os.fstat(src_fd).st_uid == producer)
     os.mkdir(dst, 0o700)
     with os.scandir(src_fd) as entries:
         names = [entry.name for entry in entries]
@@ -563,14 +565,15 @@ def copy_tree_at(src_fd, dst):
         elif stat.S_ISDIR(st.st_mode):
             child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=src_fd)
             try:
-                copy_tree_at(child, target)
+                copy_tree_at(child, target, producer)
                 os.chmod(target, stat.S_IMODE(st.st_mode) | 0o700)
             finally:
                 os.close(child)
         elif stat.S_ISREG(st.st_mode):
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=src_fd)
             with os.fdopen(fd, 'rb') as source:
-                _need(stat.S_ISREG(os.fstat(source.fileno()).st_mode))
+                opened = os.fstat(source.fileno())
+                _need(stat.S_ISREG(opened.st_mode) and opened.st_uid == producer and opened.st_nlink == 1)
                 out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, stat.S_IMODE(st.st_mode) | 0o600)
                 with os.fdopen(out, 'wb') as sink:
                     shutil.copyfileobj(source, sink)
@@ -695,7 +698,7 @@ def _act(plan):
         ns = argparse.Namespace(inbox=plan['inbox'], outbox=outbox, codex_home=codex_home, codex_bin=plan['codex'])
         if plan['verb'] == 'stage':
             source_fd = open_source_dir(plan['afd'], plan['producer_uid'])
-            return qa_stage(ns, lambda: env, lambda dst: copy_tree_at(source_fd, dst))
+            return qa_stage(ns, lambda: env, lambda dst: copy_tree_at(source_fd, dst, plan['producer_uid']))
         if plan['verb'] == 'exec':
             ns.timeout, ns.profile_sha256 = plan['request']['timeout'], plan['request']['profile_sha256']
             prompt = open_prompt_at(plan['afd'], plan['producer_uid'])
