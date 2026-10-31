@@ -525,7 +525,7 @@ def runtime_problems(identity, admission_cmd=False):
     here = Path(__file__).resolve().parent
     wanted = [here / name for name in SIBLINGS if (name != 'disk-admission.py' or not admission_cmd) and (identity or name != 'qa-identity-setup.py')]
     if identity and sys.platform == 'darwin':
-        wanted += [Path(p) for p in (PS, KILL, CRONTAB, ATQ, LS, LAUNCHCTL)]
+        wanted += [Path(p) for p in (PS, KILL, CRONTAB, ATQ, LS, LAUNCHCTL, STAT)]
     problems = []
     for path in wanted:
         try:
@@ -551,6 +551,11 @@ def run(args):
         return refuse('--require-env-isolation needs --qa-identity: a same-user run cannot isolate process environments')
     if getattr(args, 'exchange', None) and not name:
         return refuse('--exchange needs --qa-identity')
+    unattended = bool(getattr(args, 'unattended', False))
+    if unattended and not name:
+        return refuse('--unattended needs --qa-identity: the delegation only exists for a dedicated QA user')
+    if unattended and not UNATTENDED_TIMEOUT[0] <= args.timeout <= UNATTENDED_TIMEOUT[1]:
+        return refuse('--unattended needs --timeout between %d and %d seconds' % UNATTENDED_TIMEOUT)
     ident = None
     if name:
         if getattr(args, 'read_root', None):
@@ -569,6 +574,8 @@ def run(args):
         return refuse('a run is in progress or was interrupted for this directory; prepare a new attempt')
     mode = {'qa_identity': name or None, 'exchange': str(ident.exchange) if ident else None,
             'require_env_isolation': bool(getattr(args, 'require_env_isolation', False))}
+    if unattended:
+        mode['unattended'] = True       # added only then, so an attended run's MODE.json is byte-for-byte what it was
     if os.path.lexists(run_dir / 'MODE.json') and run_mode(run_dir) != mode:
         return refuse('this run directory was attempted in another mode (%s); prepare a new attempt'
                       % json.dumps(run_mode(run_dir), sort_keys=True))
@@ -826,6 +833,9 @@ HOP_ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
 _QIS = None
 
 
+UNATTENDED_TIMEOUT = (60, 14400)     # the helper's request range (qa-side.py REQUEST validation)
+
+
 class Refused(Exception):
     """A usage refusal (REFUSED, exit 64): nothing was read, written or started."""
 
@@ -913,6 +923,94 @@ class SudoKeepalive:
     def summary(self):
         with self._lock:
             return {'interval_seconds': self.interval, 'refreshes': self.refreshes, 'failures': list(self.failures[-10:])}
+
+
+class NoKeepalive:
+    """Unattended mode needs no sudo credential: the delegation is a NOPASSWD rule for fixed argv, so nothing is refreshed
+    and no thread runs. It keeps the SudoKeepalive interface so seal() and cleanup_sweep() need no second code path."""
+
+    def __init__(self):
+        self.interval = None
+
+    def refresh(self):
+        return True
+
+    def start(self):
+        return True
+
+    def stop(self):
+        pass
+
+    def summary(self):
+        return {'mode': 'unattended', 'interval_seconds': None, 'refreshes': 0, 'failures': []}
+
+
+def unattended_install(ident, config_path=None, helper_path=None, anchor='/'):
+    """Per-run verification of the installed delegation, as the producer and without sudo: the helper, qa-side.json and the
+    pinned Codex are each reached through root-owned, non-writable, non-link components from `anchor` (so a swapped or
+    writable link anywhere in /Library/cae-qa fails the run), the config names exactly this identity, this user and this
+    exchange, and the helper and Codex digests are recomputed here. Returns (record, problems); record is None on any
+    problem. Messages carry no file contents."""
+    side = _SIDE
+    config_path = config_path or side.CONFIG_PATH
+    helper_path = helper_path or side.HELPER_PATH
+    try:
+        config = side.read_config(config_path, anchor)
+        side.trusted_chain(helper_path, anchor)
+        side.trusted_chain(config['codex_path'], anchor)
+        problems = []
+        if config['qa_name'] != ident.name or config['qa_uid'] != ident.uid:
+            problems.append('qa-side.json names another QA identity')
+        if config['producer_uid'] != os.getuid():
+            problems.append('qa-side.json names another producer user')
+        if config['exchange'] != str(ident.exchange):
+            problems.append('qa-side.json names another exchange directory')
+        helper_sha, codex_sha = sha256_file(helper_path), sha256_file(config['codex_path'])
+        if codex_sha != config['codex_sha256']:
+            problems.append('the pinned Codex does not match its recorded digest')
+    except Exception as error:      # Refuse carries no message by design; an OSError message could name a path, keep the type
+        return None, ['the installed delegation failed verification (%s)' % type(error).__name__]
+    if problems:
+        return None, problems
+    return {'helper_path': helper_path, 'helper_sha256': helper_sha, 'codex_path': config['codex_path'],
+            'codex_sha256': codex_sha}, []
+
+
+def helper_argv(ident, verb, attempt=None, helper_path=None):
+    """The fixed argv that runs one helper verb as the QA user only: the shape comes from qa-side.py's ALLOWED_ARGV (the table
+    the delegation drop-in is generated from), so nothing is composed here. Never root, never a shell, no extra flag."""
+    shape = _SIDE.ALLOWED_ARGV[verb]
+    if ident.uid in (0, os.getuid()):
+        raise Refused('the delegated helper must run as an unprivileged QA user, not root or you')
+    if (attempt is None) != (_SIDE.ATTEMPT_SLOT not in shape):
+        raise Refused('helper verb %s %s an attempt id' % (verb, 'takes no' if attempt else 'needs'))
+    if attempt is not None and not (_SIDE.ATTEMPT_RE.fullmatch(attempt) and '..' not in attempt):
+        raise Refused('invalid attempt id')
+    words = [attempt if word == _SIDE.ATTEMPT_SLOT else word for word in shape]
+    return [_qis().SUDO, '-n', '-u', ident.name, helper_path or _SIDE.HELPER_PATH, *words]
+
+
+def write_request(inbox, request):
+    """request.json for the helper: producer-owned, replaced (never followed) before each verb."""
+    write_private(inbox / 'request.json', request)
+
+
+def helper_hop(ident, verb, attempt, seconds):
+    """(stdout, problem) of one helper verb. Nothing is ever prompted; the helper fails silently, so an empty answer is the
+    refusal."""
+    try:
+        argv = helper_argv(ident, verb, attempt)
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=seconds + 60, cwd='/',
+                              env=HOP_ENV)
+    except subprocess.TimeoutExpired:
+        return '', 'timed out'
+    except (OSError, Refused) as error:
+        return '', 'could not start the delegated helper (%s)' % type(error).__name__
+    if sudo_refused(done.stderr):
+        return '', 'sudo -n refused the delegated helper (is the delegation installed and unchanged?)'
+    if not done.stdout.strip():
+        return '', 'produced no output (exit %s)' % done.returncode
+    return done.stdout, None
 
 
 def sudo_refused(stderr):
@@ -1160,7 +1258,7 @@ def run_identity(args, run_dir, packet, source, ident):
             have_lock = True
         except FileExistsError:   # another run's lock: never removed here
             return write_result(run_dir, packet, 'WAITING_RESOURCE', ['another QA run holds %s; codex was not started' % lock])
-        keepalive = SudoKeepalive()
+        keepalive = NoKeepalive() if getattr(args, 'unattended', False) else SudoKeepalive()
         try:
             os.unlink(run_dir / 'CLEANUP.json')   # never carried over from an earlier attempt
         except FileNotFoundError:
@@ -1240,10 +1338,26 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
             os.unlink(run_dir / stale)
         except FileNotFoundError:
             pass
+    unattended = bool(getattr(args, 'unattended', False))
     # Every later hop uses sudo -n; the keepalive starts only after this first refresh succeeds and stops with the run.
     if not keepalive.start():
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['sudo -n refused (no cached credential: run `sudo -v` in the '
                                                                'owner Terminal first); codex was not started'])
+    helper = None
+    if unattended:
+        helper, problems = unattended_install(ident)
+        if problems:
+            return write_result(run_dir, packet, 'QA_INCOMPLETE', ['delegated helper not verified: ' + '; '.join(problems[:2]),
+                                                                   'codex was not started'])
+        text, problem = helper_hop(ident, 'version', None, 60)
+        try:
+            version = json.loads(text) if not problem else None
+        except (ValueError, RecursionError):
+            version = None
+        if not (isinstance(version, dict) and version.get('protocol') == _SIDE.PROTOCOL
+                and version.get('helper_sha256') == helper['helper_sha256'] and version.get('codex_sha256') == helper['codex_sha256']):
+            return write_result(run_dir, packet, 'QA_INCOMPLETE', ['the delegated helper did not answer `version` with the verified '
+                                                                   'digests (%s); codex was not started' % (problem or 'mismatch')])
     # Hop 0/1 output is trusted only because no model has run yet; a QA-user process left by an earlier run killed
     # without cleanup could otherwise write into this attempt's outbox while it is being set up.
     swept = sweep_identity(ident)
@@ -1262,8 +1376,18 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
     # Hop 0: the environment canary. The producer holds a synthetic sentinel in a sibling's environment, proves it can read
     # it itself, and the probe running as the QA user must not.
     setup = qis.Setup(ident.name, ident.uid, ident.home, ident.exchange)
+    attempt = '%s-%s-%s-%s' % (packet['product'], packet['ticket'], run_dir.name, os.urandom(4).hex())
+    inbox, outbox = ident.exchange / 'inbox' / attempt, ident.exchange / 'outbox' / attempt
+    codex_home = ident.home / '.local/state/coding-agent-environment/qa' / attempt / 'codexhome'
+    argv_for = None
+    if unattended:
+        inbox.mkdir(mode=0o700)       # the helper reads request.json from it, so it exists before the probe
+
+        def argv_for(pid, sentinel):
+            write_request(inbox, {'verb': 'probe', 'attempt': attempt, 'pid': pid, 'sentinel': sentinel})
+            return helper_argv(ident, 'probe', attempt)
     try:
-        probe, fails = setup.isolation_record(pwd.getpwuid(os.getuid()))
+        probe, fails = setup.isolation_record(pwd.getpwuid(os.getuid()), *([argv_for] if argv_for else []))
     except Exception as error:
         probe, fails = None, ['the isolation probe raised %s' % type(error).__name__]
     probe = probe if isinstance(probe, dict) else None
@@ -1275,15 +1399,14 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
                                                                'codex was not started'])
     if fails:
         return write_result(run_dir, packet, 'QA_INVALID', ['environment isolation not established: ' + '; '.join(fails[:3])])
-    attempt = '%s-%s-%s-%s' % (packet['product'], packet['ticket'], run_dir.name, os.urandom(4).hex())
-    inbox, outbox = ident.exchange / 'inbox' / attempt, ident.exchange / 'outbox' / attempt
-    codex_home = ident.home / '.local/state/coding-agent-environment/qa' / attempt / 'codexhome'
     # The inbox is producer-owned and read-only to the QA user (its inherited ACE): the script, packet, prompt and a copy
     # of the verified clone. The QA side runs only this copy, with /usr/bin/python3 -I, and its digest is recorded.
-    inbox.mkdir(mode=0o700)
     script = inbox / SIDE_SCRIPT
-    write_private(script, SIDE_BYTES)
-    script_sha = sha256_file(script)
+    if not unattended:                  # unattended: the helper is the pinned, root-owned install, not a copy handed over
+        inbox.mkdir(mode=0o700)
+        write_private(script, SIDE_BYTES)
+    # the very bytes written above (or the verified install), not a second read of a file
+    script_sha = helper['helper_sha256'] if unattended else hashlib.sha256(SIDE_BYTES).hexdigest()
     write_private(inbox / 'packet.json', packet)
     write_private(inbox / 'prompt.txt', PROMPT.format(product=packet['product'], ticket=packet['ticket'], sha=packet['sha'],
                                                       criteria=packet['criteria'], producer=packet['producer_evidence'],
@@ -1292,7 +1415,11 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
     tail = ['--inbox', str(inbox), '--outbox', str(outbox), '--codex-home', str(codex_home), '--codex-bin', args.codex_bin]
     # Hop 1: the QA side creates the outbox, its clone and its private Codex home, and proves read confinement there.
     try:
-        out, problem = hop(ident, [qis.PY, '-I', str(script), 'qa-stage'] + tail, STAGE_SECONDS)
+        if unattended:
+            write_request(inbox, {'verb': 'stage', 'attempt': attempt})
+            out, problem = helper_hop(ident, 'stage', attempt, STAGE_SECONDS)
+        else:
+            out, problem = hop(ident, [qis.PY, '-I', str(script), 'qa-stage'] + tail, STAGE_SECONDS)
     finally:
         shutil.rmtree(inbox / 'source', ignore_errors=True)   # the QA side has its own copy now
     if problem:
@@ -1327,13 +1454,22 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
     # Hop 2: codex itself. Its stdout is the pipe the producer captures; the QA side has moved its own stderr to a file.
     alarm = args.timeout + 60
     # qa-exec refuses to start codex unless the profile is byte-for-byte the one hop 1 proved (exit PROFILE_CHANGED).
-    argv = qis.qa_argv(ident.name, ident.home, [qis.PY, '-I', str(script), 'qa-exec'] + tail
-                       + ['--timeout', str(args.timeout), '--profile-sha256', profile_sha], alarm=alarm)
+    if unattended:
+        write_request(inbox, {'verb': 'exec', 'attempt': attempt, 'timeout': args.timeout, 'profile_sha256': profile_sha})
+        argv = helper_argv(ident, 'exec', attempt)
+    else:
+        argv = qis.qa_argv(ident.name, ident.home, [qis.PY, '-I', str(script), 'qa-exec'] + tail
+                           + ['--timeout', str(args.timeout), '--profile-sha256', profile_sha], alarm=alarm)
     manifest = read_run_json(run_dir / 'tree-manifest.json')
     info = {'name': ident.name, 'uid': ident.uid, 'exchange': str(ident.exchange), 'attempt': attempt, 'script_sha256': script_sha,
             'require_env_isolation': bool(getattr(args, 'require_env_isolation', False)), 'profile_sha256': profile_sha}
+    if unattended:
+        info.update({'mode': 'unattended', 'helper_path': helper['helper_path'], 'helper_sha256': helper['helper_sha256'],
+                     'codex_path': helper['codex_path'], 'codex_sha256': helper['codex_sha256']})
     # Same session as hops 0 and 1 (new_session=False): sudo -n only sees the owner's cached credential from the
     # terminal session it was typed in. The QA side detaches itself (DETACH: setsid as the QA user).
+    # Unattended mode has no credential, but keeps this session and the child-signalling stop on purpose: process ownership
+    # and kill semantics stay exactly the attended ones, and the helper detaches itself (setsid as the QA user).
     return launch(args, run_dir, argv, dict(HOP_ENV), '/', None, timeout=alarm + 60, new_session=False,
                   seal=lambda proc: seal(run_dir, ident, outbox, manifest, info, proc, keepalive))
 
@@ -1933,6 +2069,8 @@ def build_parser():
                    help='extra read-only directory for toolchains (absolute; not HOME, / or a credential directory)')
     r.add_argument('--qa-identity', metavar='NAME', help='run QA as this dedicated OS user (set up by qa-identity-setup.py)')
     r.add_argument('--exchange', metavar='DIR', help='exchange directory of that identity (default /Users/Shared/NAME-qa)')
+    r.add_argument('--unattended', action='store_true',
+                   help='run the QA hops through the installed, owner-approved delegation (ADR 0016) instead of a cached sudo credential')
     r.add_argument('--require-env-isolation', action='store_true', help='refuse to run unless --qa-identity is given')
     r.add_argument('--codex-bin', default='codex', help=argparse.SUPPRESS)       # test hook
     r.add_argument('--settle', type=float, default=SETTLE_SECONDS, help=argparse.SUPPRESS)  # test hook

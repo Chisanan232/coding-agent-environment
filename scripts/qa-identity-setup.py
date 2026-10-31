@@ -342,7 +342,7 @@ class Setup:
         say("ok  exchange area %s: root-owned, private inbox (you write, the QA user reads) and outbox (the QA user writes, you read)" % self.xroot)
 
     # ---- isolation probe, run as the QA user (access tests only)
-    def isolation_record(self, pw):
+    def isolation_record(self, pw, argv_for=None):
         """Run the isolation probe as the QA user and return (probe output, failures); output is None when the probe never
         produced a record (sudo -n refused, crash, or the producer-side positive control failed). Never prompts and never
         raises Stop, so qa-handoff.py can call it before every QA run and map the outcome itself (SPE-142)."""
@@ -354,8 +354,12 @@ class Setup:
             pe = procenv(sib.pid)  # producer-side positive control: the sentinel really is in the sibling's environment block
             if pe is None or sentinel.encode() not in pe:
                 return None, ["control invalid: the producer cannot read its own sibling's environment, so a denial would prove nothing"]
-            r = run(qa_argv(self.name, self.home, [PY, "-I", "-c", PROBE, str(self.xroot / "inbox"), str(self.xroot / "outbox"),
-                                                    str(self.xroot), pw.pw_dir, str(sib.pid), sentinel]), check=False, timeout=VERIFY_TIMEOUT)
+            # argv_for (unattended mode) supplies the whole command, e.g. the installed helper's `probe` verb, once it knows the
+            # sibling's pid and the sentinel it must write into the request.
+            argv = argv_for(sib.pid, sentinel) if argv_for else qa_argv(
+                self.name, self.home, [PY, "-I", "-c", PROBE, str(self.xroot / "inbox"), str(self.xroot / "outbox"),
+                                       str(self.xroot), pw.pw_dir, str(sib.pid), sentinel])
+            r = run(argv, check=False, timeout=VERIFY_TIMEOUT)
             try:
                 o = json.loads(r.stdout.strip().splitlines()[-1])
             except (ValueError, IndexError):
@@ -440,7 +444,9 @@ class Setup:
         QA process the owner's controlling terminal (TIOCSTI keystroke injection into the owner's shell)."""
         # no login keychain for the QA user: credentials go to a file in its own private ~/.codex. sudo -v first because the hop uses sudo -n.
         hop = shlex.join(qa_argv(self.name, self.home, [CODEX, "-c", 'cli_auth_credentials_store="file"', "login", "--device-auth"], alarm=900))
-        return "sudo -v && " + hop
+        # Codex leaves ~/.codex group/world readable after login; the isolation probe (and --check) require 0700, so the same
+        # owner command tightens it right after the login. Re-run --check afterwards: only it proves the final state.
+        return "sudo -v && " + hop + " && " + shlex.join([SUDO, "-n", "-u", self.name, "/bin/chmod", "700", str(self.home / ".codex")])
 
 
 def main(argv=None):
@@ -485,6 +491,7 @@ def main(argv=None):
         say("DONE: the QA identity %s is set up and its isolation verified. No Codex login or model run happened." % a.name)
         say("Next, as a separate owner step (a Codex device-code login as that user only; run `sudo -K` in the same Terminal afterwards):")
         say("    %s" % s.login_command())
+        say("After the login command finishes, re-run the check below: it must pass before the first QA run (it fails closed if ~/.codex is not 0700).")
         say("Verify at any time, read-only: /usr/bin/python3 -I %s --name %s --uid %s --check" % (Path(__file__).resolve(), a.name, a.uid))
         return 0
     except Stop as e:
