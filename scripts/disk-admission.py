@@ -510,14 +510,15 @@ def process_owner(pid):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Declared workload classes and estimates (SPE-150 PR3). RECORD-ONLY: these fields are validated, stored and shown, and no
-# admission decision (lane cap, byte floor, grant order) reads them yet. A job declares what it expects to need; an
-# estimate can be raised by the caller but never lowered below the class default.
+# Declared workload classes and estimates (SPE-150 PR3). These fields are validated, stored and shown, and no admission
+# decision (lane cap, byte floor, grant order) reads them. Only the shadow budget (reported, not enforced) and the banded job
+# caps exported to a Cargo job's environment (GRANT_ENV) read them. A job declares what it expects to need; an estimate can be
+# raised by the caller but never lowered below the class default.
 #
 # THE NUMBERS BELOW ARE GUESSES, deliberately conservative. They may be lowered only by a reviewed constants change
 # backed by evidence from `disk-admission.py measurements`, never by a caller and never in passing.
 # mem = mem_base_mib + mem_per_job_mib * jobs; jobs/min_jobs are the default and the lowest degraded parallelism
-# (min_jobs is documented for the later admission change and is not read by this one); disk_gib is the default for
+# (min_jobs is read by the shadow budget's AMBER grant only); disk_gib is the default for
 # --bytes; excl names what two jobs of the class must not share ('target' = the Cargo target directory, 'docker' = the
 # Docker daemon). A class with no entry values (light, remote) has no defaults. No class means the legacy meaning: the
 # whole budget and all cores, recorded as nothing.
@@ -1774,6 +1775,7 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
     except OSError as exc:
         return refuse('state-unwritable: %s' % exc)
     _measure(state_path, 'claim', _free_or_none(free_fn), now)
+    apply_grant_env(budget, _declared_fields(entry))   # the entry's recorded class: one source for the table and the numbers
     try:
         exec_fn(argv[0], argv)
     except OSError as exc:
@@ -2113,6 +2115,54 @@ def budget_decision(host, reservations, request, caps):
     return out
 
 
+# Banded per-job caps (SPE-150 PR6). The one place the budget touches a job: a declared Cargo class gets its granted jobs and test
+# threads exported to the child, only from a budget with status ok. Admission itself (lane cap, floor, grant order) is untouched.
+# Which variables a class exports is "what the class says": build classes cap Cargo and libtest; the workspace classes also cap
+# nextest. Classes without an entry (light, remote, container-suite) export nothing, and so do legacy runs (no class).
+GRANT_ENV = {
+    'build-crate': ('CARGO_BUILD_JOBS', ('RUST_TEST_THREADS',)),
+    'build-workspace': ('CARGO_BUILD_JOBS', ('RUST_TEST_THREADS', 'NEXTEST_TEST_THREADS')),
+    'build-cold-isolated': ('CARGO_BUILD_JOBS', ('RUST_TEST_THREADS', 'NEXTEST_TEST_THREADS')),
+}
+
+
+def _lowered(existing, grant):
+    """The value to export, or None to leave the job's own setting alone. Unset or empty takes the grant; a positive integer is
+    lowered to the grant if above it; anything else (0, negative, 'default', 'num-cpus-2', garbage) has a meaning only the tool
+    knows and is never touched."""
+    if existing is None or not existing.strip():
+        return grant
+    text = existing.strip()
+    if not (text.isascii() and text.isdigit() and int(text) > 0):
+        return None
+    return min(int(text), grant)
+
+
+def grant_env(budget, declared, environ):
+    """{variable: value} to export to a job. Empty unless a Cargo class was declared and the budget is status ok with a positive
+    grant (RED grants none; an unavailable budget changes nothing). Never raises a variable the job already set above the grant."""
+    spec = GRANT_ENV.get((declared or {}).get('class'))
+    if not spec or not budget or budget.get('status') != 'ok':
+        return {}
+    out = {}
+    jobs, threads = budget.get('granted_jobs'), budget.get('granted_test_threads')
+    wanted = ([(spec[0], jobs)] if type(jobs) is int and jobs > 0 else []) + (
+        [(name, threads) for name in spec[1]] if type(threads) is int and threads > 0 else [])
+    for name, grant in wanted:
+        value = _lowered(environ.get(name), grant)
+        if value is not None:
+            out[name] = str(value)
+    return out
+
+
+def apply_grant_env(budget, declared):
+    """Export the grant into this process's environment, which the exec'd job inherits. Never raises."""
+    try:
+        os.environ.update(grant_env(budget, declared, os.environ))
+    except Exception:
+        pass
+
+
 def budget_line(budget):
     """One human line; always carries the shadow note."""
     if budget.get('status') != 'ok':
@@ -2414,6 +2464,7 @@ def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, tt
         print(result['reason'], file=sys.stderr)  # never injected into a captured job stderr
         if result.get('budget'):
             print(budget_line(result['budget']), file=sys.stderr)
+    apply_grant_env(result.get('budget'), declared)
     try:
         exec_fn(argv[0], argv)
     except OSError as exc:

@@ -355,3 +355,29 @@ workload. Serial builds keep the shared target. The admission record's
 `cargo-target:<path>` exclusion key is how a future enforcing change refuses two live workloads that share a directory; today it is
 recorded and reported by the shadow budget only. The key resolution limits are listed under "Declared workload classes".
 
+## Banded per-job caps (SPE-150)
+
+The budget's band now reaches the job, and only through its environment. The grant is `granted_jobs` and `granted_test_threads` in
+the `budget` object of the `run`, `reserve` and `queue claim` results: GREEN gives the full class values (the class defaults, or the
+raised estimate), AMBER the reduced values (the larger of the class `min_jobs` and half the request; for every class default that is
+exactly `min_jobs`, 2 for `build-crate` and 4 for the workspace classes), RED none.
+
+`disk-admission.py run` (and `run --queue-id`) export them to the child just before the exec, and only when all of these hold: a
+class with an entry in `GRANT_ENV` was declared; the budget status is `ok`; the grant is positive. Variables: `CARGO_BUILD_JOBS` and
+`RUST_TEST_THREADS` for `build-crate`, plus `NEXTEST_TEST_THREADS` for `build-workspace` and `build-cold-isolated`. `light`, `remote`,
+`container-suite` and legacy runs (no class) export nothing, and so does an unavailable or RED budget. A value the job already set is
+never raised, by this rule exactly: an unset or empty variable takes the grant; a positive integer is lowered to the grant if it is
+above it; any other value (0, negative, `default`, `num-cpus-2`, garbage) has a meaning only the tool knows and is left untouched.
+`queue claim` takes the class and the numbers from the queue entry's recorded fields, never from the caller (a claim that declares
+something else is refused before any export).
+
+AMBER is the larger of the class `min_jobs` and half the request (RED and unavailable export nothing). In the shadow era RED and
+an unavailable budget therefore leave the job's environment alone, and the job runs as it would have. **Note for the later
+enforcing change:** when the budget is enforced, RED must still export `min_jobs` (and its test threads) rather than nothing, or a
+RED host would be given a job with no cap at all.
+
+Nothing about admission changes: the lane cap stays 1 and admit or refuse is decided by the lane check exactly as before; a refused
+run never reaches the exec. Limits: the caps bind only jobs that read these variables (a `cargo` invocation passing `-j` still
+wins); the band comes from the 2 s shadow sample, so it is as noisy as that sample; and the pre-existing `queue claim` subcommand,
+which does not exec, applies the grant only to its own process.
+
