@@ -152,7 +152,7 @@ as `cleanup` in `RESULT.json`, and a sealed `QA_PASS` becomes `QA_INVALID` (exit
 pass, and any other sealed state is unchanged); run `sudo -v` in the owner Terminal and the next run's pre-sweep removes them. Whether the keepalive behaves
 the same against a real terminal's sudo timestamp is not verified until the first owner run.
 
-Three hops, each through `qa_argv`, with the QA side running a producer-owned copy of this script under `/usr/bin/python3 -I`:
+Three hops, each through `qa_argv`, with the QA side running a producer-owned copy of `scripts/qa-side.py` (the QA-side module, standard library only, SPE-153) under `/usr/bin/python3 -I`:
 
 | Hop | Runs as | What happens | What the producer trusts |
 |---|---|---|---|
@@ -163,10 +163,10 @@ Three hops, each through `qa_argv`, with the QA side running a producer-owned co
 | seal | producer | sweep again and list the QA user's processes once more after 12 s (longer than launchd's 10 s respawn throttle); read the QA user's crontab, at queue, `~/Library/LaunchAgents` and its launchd `user/<uid>` domain (a present domain passes only when it verifies, see below) and whether its `gui/<uid>` domain exists (as that user, `sudo -n`; any entry fails, and the `gui/` domain passes only when `launchctl print` exits non-zero with "Could not find domain"); open the exchange, outbox, `O` and `O/source` once each relative to the parent descriptor with `O_NOFOLLOW\|O_DIRECTORY` and check the owner of what was opened; read `O/verdict.json` relative to the held `O` descriptor, only if a single-link regular file owned by the QA user and at most 5 MiB; compare `O/source` with the producer's manifest once; then confirm every path component still names the directory that was opened (device and inode) | the sealed values in `RUNMETA.json` (`qa_identity`, `stragglers`, `persistence`, `path_ok`, `tree_problems`, `untracked`) |
 
 Paths: `X` exchange, `R` the producer's run directory, attempt `A=<product>-<ticket>-<R name>-<8 hex>`, inbox
-`I=X/inbox/A` (producer-owned, read-only to the QA user through the inherited ACE: script copy, packet, prompt, and a copy
+`I=X/inbox/A` (producer-owned, read-only to the QA user through the inherited ACE: the `qa-side.py` copy, packet, prompt, and a copy
 of the verified clone that is deleted after hop 1), outbox `O=X/outbox/A` (QA-written, untrusted). `R` keeps only
 producer truth: `ISOLATION.json`, `CONFINEMENT.json`, `events.jsonl`, `stderr.log` (sudo's), the sealed `verdict.json`
-copy, `RUNMETA.json` (with the script copy's digest) and `RESULT.json`. `verdict` never reads `O` again, so editing or
+copy, `RUNMETA.json` (`script_sha256`, the digest of the `qa-side.py` copy) and `RESULT.json`. `verdict` never reads `O` again, so editing or
 deleting the outbox later changes nothing. `X/inbox/RUN.lock` is the identity lock: one run per QA user at a time
 (the sweep kills every process of that user). It is taken and cleaned up with TERM, INT and HUP ignored, so a signal
 cannot leak it; from the end of codex until the run record exists, signals only mark the run interrupted, so a second
@@ -207,7 +207,7 @@ codex as the QA user.
 - A Codex verdict is QA evidence, not merge evidence. It is never written as an owner-merge review record.
 - Admission is checked with `disk-admission.py check --weight light`; heavy commands inside the QA run must use the
   product's own resource wrapper, and contention is reported as blocked, not failed. `qa-handoff.py` runs from a directory
-  that also holds `disk-admission.py`, and `--qa-identity` additionally needs `qa-identity-setup.py` there (copy all from
+  that also holds `disk-admission.py` and `qa-side.py` (imported at start-up; a missing one is a `REFUSED`), and `--qa-identity` additionally needs `qa-identity-setup.py` there (copy all from
   the same revision). A missing `qa-identity-setup.py` is a `REFUSED` with that message; a missing `disk-admission.py` is
   `QA_INCOMPLETE` saying so, not a `WAITING_RESOURCE` resource refusal.
 - Product release flows (`/release-qa-gate`, frozen candidates, release evidence) are not touched by this tool.
