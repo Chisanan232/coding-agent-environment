@@ -218,3 +218,43 @@ Known limits (not guaranteed):
 - More than 256 descendants make the record non-exhaustive and the holder unresolved once the recorded ones end; the owner
   releases it explicitly.
 - An unresolved reservation is cleared only by the workload ending (with the witness) or by the owner's explicit release.
+
+## Declared workload classes and estimates (SPE-150)
+
+Record-only. `run`, `reserve`, `queue enqueue` and `queue claim` accept optional `--class NAME`, `--mem-gib N` and `--cpus N`
+(next to the existing `--bytes`). They are stored, validated, shown and measured. **No admission decision reads them**: the lane
+cap (1), the byte floor, queue order and grants are exactly as before, and a record without them means what it always meant
+(the whole budget, all cores).
+
+Classes live in one table, `WORKLOAD_CLASSES` in `scripts/disk-admission.py`. The numbers are guesses, conservative on purpose,
+to be lowered only by a reviewed constants change backed by `disk-admission.py measurements` evidence.
+
+| Class | Memory | Jobs (default / min) | Default disk | Exclusion key |
+|---|---|---|---|---|
+| `light`, `remote` | none | none | none | none |
+| `build-crate` | 2 GiB + 1 GiB per job | 4 / 2 | 10 GiB | Cargo target dir |
+| `build-workspace` | 4 GiB + 1.5 GiB per job | 8 / 4 | 40 GiB | Cargo target dir |
+| `build-cold-isolated` | 4 GiB + 1.5 GiB per job | 8 / 4 | 60 GiB | Cargo target dir (its own) |
+| `container-suite` | 12 GiB | 4 / 2 | 20 GiB | `docker` |
+| none (legacy) | whole budget | all cores | as given | none |
+
+Rules. An unknown class is refused (fail closed). `--mem-gib`, `--cpus` and `--bytes` may raise an estimate and are refused when
+below the class default; with no class they are recorded as given. `min jobs` is documented for a later admission change and is
+not read. The exclusion key is resolved without executing anything: `CARGO_TARGET_DIR`, else `build.target-dir` in
+`~/.cargo/config.toml` (one small file read), else `./target`, recorded as `cargo-target:<normalised path>`.
+
+Record fields (all optional, version stays 1), on a reservation and on a queue entry: `class`, `mem_bytes`, `cpu_slots`,
+`test_threads` (equal to `cpu_slots` for now), `excl_keys`, `created` and `owner` (`uid`, `session_id`, `ticket`). A queue entry
+already had `created`; a claim copies the fields onto the reservation. Readers ignore unknown keys, but a present field with a bad
+type or range (booleans as numbers, zero, negative or huge numbers, malformed class, session or ticket text, more than 8 or
+overlong keys, a timestamp without a timezone) makes the file a `reservation-unreadable` or `queue-entry-unreadable` problem:
+never trusted and never deleted.
+
+Claim. `class`, `mem_bytes`, `cpu_slots` and `test_threads` are checked at claim like `bytes`: a claim that declares a different
+class or estimate from the enqueued entry (including declaring one for a legacy entry, or none for a classed entry) is refused and
+keeps the grant. They also join the job fingerprint, but only when something was declared, so a legacy entry's fingerprint and
+claimability are unchanged.
+
+Display. `status --json` and `snapshot` add a `workloads` list (label, pid and the fields) only when a live reservation declared
+something, so legacy output is byte-identical. `queue status --json` already lists whole entries. Measurement lines carry the
+reservation `class`, which `measurements` already groups by.
