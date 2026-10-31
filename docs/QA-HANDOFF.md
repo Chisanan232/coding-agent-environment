@@ -138,7 +138,7 @@ sudo -v && python3 scripts/qa-handoff.py run --run-dir DIR --qa-identity NAME --
 
 No sudoers change is made or needed **by this attended mode**, and `qa-identity-setup.py` itself never edits sudoers. The
 unattended alternative decided in [ADR 0016](adr/0016-unattended-qa-hop.md) (a one-time owner-installed sudoers drop-in that lets
-the producer act as the QA user for eight fixed commands, plus a pinned helper) reverses that statement for its own installed mode
+the producer act as the QA user for seven fixed commands, plus a pinned helper) reverses that statement for its own installed mode
 only. It is a design: not implemented, nothing is installed, and this attended path stays the default and the fallback. A `sudo -n` refusal is `QA_INCOMPLETE` with codex not started. Every sudo hop,
 the codex hop included, stays in the session of the Terminal that ran `sudo -v` (sudo's default timestamp is per
 terminal session; only the QA side detaches itself, as the QA user). The codex hop is therefore stopped by signalling the
