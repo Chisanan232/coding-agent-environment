@@ -24,7 +24,7 @@ Every place the producer reaches the QA user or root during a run. "Runs as" is 
 
 | # | Operation | Where (file:line) | Runs as | Purpose | Why normal permissions are not enough | New path |
 |---|---|---|---|---|---|---|
-| 1 | `sudo -n -v` credential refresh, every 60 s, at start, before the seal and before the final sweep | `qa-handoff.py:1053` (started `:1414`, `:1372`, `:1517`); owner types `sudo -v` first (`qa-handoff.py:8`) | root (no command runs) | keep the owner's cached sudo credential alive for one run | the credential is tty/session-coupled, so only the Terminal that typed it can use it | **eliminated**: the sudoers rules below need no credential |
+| 1 | `sudo -n -v` credential refresh, every 60 s, at start, before the seal and before the final sweep | `qa-handoff.py:1050-1056` (started `:1414`, `:1372`, `:1517`); owner types `sudo -v` first (`qa-handoff.py:8`) | root (no command runs) | keep the owner's cached sudo credential alive for one run | the credential is tty/session-coupled, so only the Terminal that typed it can use it | **eliminated**: the sudoers rules below need no credential |
 | 2 | `kill -KILL -1` | `qa-handoff.py:1114` (`sweep_identity`) | QA user | zero-survivor sweep before the run, at the seal, after the seal (respawn recheck) and in the final cleanup | only the owner of a process (or root) can signal it; the producer cannot signal QA-uid processes | sudoers rule 1 |
 | 3 | hop 0 isolation probe: `python3 -I -c PROBE ...` | `qa-identity-setup.py:357` via `qa_argv` (`:179`), called from `qa-handoff.py:1436` | QA user | prove the QA uid cannot read the producer's process environment (sentinel in a producer sibling) | the claim is about what the QA uid can read, so the probe must execute as the QA uid | helper verb `probe` |
 | 4 | hop 1 `qa-stage` | `qa-handoff.py:1465` through `hop()` (`:1249`, `:1254`) | QA user | create the outbox, copy the clone, build the private Codex home, run the confinement probe | the outbox and Codex home must be QA-owned, and the probe must run under the QA uid's sandbox | helper verb `stage` |
@@ -59,7 +59,7 @@ Add an optional **installed mode** of the QA hop. The attended mode is unchanged
   commands below, nothing else.
 - **QA user** (unprivileged, no sudo rights, private home, not admin): untrusted after the run starts, exactly as today. Its
   outbox is never read again after the seal.
-- **Root-owned install** (`/usr/local/libexec/cae-qa/`, `/etc/sudoers.d/cae-qa`): written once by the owner as administrator; the
+- **Root-owned install** (`/Library/cae-qa/`, `/etc/sudoers.d/cae-qa`): written once by the owner as administrator; the
   producer and the QA user cannot change it. Everything the helper trusts about itself comes from here.
 - The helper never runs as root and the sudoers rules never name root or `ALL` as the target user.
 
@@ -69,7 +69,7 @@ Add an optional **installed mode** of the QA hop. The attended mode is unchanged
 
 ```
 # cae-qa (SPE-153, ADR 0016). Managed file: reinstall, never edit by hand.
-Defaults>QA env_reset, !setenv
+Defaults>QA env_reset, !setenv, secure_path="/usr/bin:/bin:/usr/sbin:/sbin", always_set_home
 
 Cmnd_Alias CAE_QA_SWEEP = /bin/kill -KILL -1
 Cmnd_Alias CAE_QA_SEE   = /usr/bin/crontab -l, \
@@ -79,10 +79,10 @@ Cmnd_Alias CAE_QA_SEE   = /usr/bin/crontab -l, \
                           /bin/launchctl print user/QAUID, \
                           /bin/launchctl print gui/QAUID, \
                           /bin/launchctl print "^user/QAUID/[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}$"
-Cmnd_Alias CAE_QA_SIDE  = /usr/local/libexec/cae-qa/qa-side version, \
-                          /usr/local/libexec/cae-qa/qa-side "^(probe|stage|exec) [A-Za-z0-9][A-Za-z0-9._-]{0,150}$"
+Cmnd_Alias CAE_QA_SIDE  = sha256:HELPERHEX /Library/cae-qa/qa-side version, \
+                          sha256:HELPERHEX /Library/cae-qa/qa-side "^(probe|stage|exec) [A-Za-z0-9][A-Za-z0-9._-]{0,150}$"
 
-PRODUCER ALL = (QA) NOPASSWD: CAE_QA_SWEEP, CAE_QA_SEE, CAE_QA_SIDE
+PRODUCER ALL = (QA) NOPASSWD: NOSETENV: CAE_QA_SWEEP, CAE_QA_SEE, CAE_QA_SIDE
 ```
 
 The eight commands, numbered as the audit table refers to them (all as the QA user, nothing else, never root):
@@ -101,6 +101,13 @@ The eight commands, numbered as the audit table refers to them (all as the QA us
 The helper is granted separately (`CAE_QA_SIDE`): its argv is also fixed, a verb from `{version, probe, stage, exec}` and, for the
 last three, an attempt id.
 
+`Defaults>runasuser`, the `sha256:` digest form (SHA-2 hex or base64, placed before the command) and the `NOSETENV` tag are
+documented in sudoers(5) of the sudo 1.9.17 on the authoring Mac; the full file is still only validated by `visudo -c -f` at
+install. `HELPERHEX` is the digest of the installed helper, so **the drop-in is regenerated whenever the helper changes**.
+The digest check is racy: macOS has no `fexecve(2)`, so sudo verifies the file and then executes the path. That is why the
+helper lives where neither the producer nor Homebrew can write (below) and the producer verifies the path before every run;
+the digest is defence in depth, not the barrier.
+
 Two things in this text are **not verified until the installer runs on the real host**: regular-expression arguments need
 sudo 1.9.10 or newer (the installer checks `sudo -V`), and the exact quoting of the two regex lines is checked only by `visudo`
 on that machine. If the host's sudo is older, the per-label `launchctl print` moves into a helper verb and this ADR is amended
@@ -108,7 +115,12 @@ first; no wildcard (`*`) is ever substituted, because sudoers wildcards also mat
 
 ### Pinned helper
 
-`/usr/local/libexec/cae-qa/qa-side` is `scripts/qa-side.py` (PR 1 creates it as a standard-library-only module with the same
+The location is `/Library/cae-qa/`, not `/usr/local/libexec`: `/usr/local` can be writable by the producer (Homebrew, a stray
+`chown`), and a sudoers grant that matches a path runs whatever sits at that path as the QA user. The helper checking its own
+chain cannot protect against its own replacement, so integrity is enforced from outside it: the root-only location, the sudoers
+digest pin, and a producer-side check (below).
+
+`/Library/cae-qa/qa-side` is `scripts/qa-side.py` (PR 1 creates it as a standard-library-only module with the same
 code the attended hop copies today) installed root-owned. It is run as the QA user with `/usr/bin/python3 -I`. Verbs:
 
 | Verb | Replaces | Does |
@@ -131,9 +143,9 @@ The producer writes `X/inbox/<attempt>/request.json` (producer-owned, read-only 
 1. verb is in `{version, probe, stage, exec}` and the request names the same verb as argv;
 2. attempt matches `[A-Za-z0-9][A-Za-z0-9._-]{0,150}` and contains no `..`;
 3. real and effective uid both equal the configured QA uid (the helper refuses to run as root or as any other user);
-4. `SUDO_UID` equals the configured producer uid;
-5. the configuration chain is root-owned and not group or world writable: `/usr`, `/usr/local`, `/usr/local/libexec`,
-   `/usr/local/libexec/cae-qa`, the helper itself and `config.json`, none a link;
+4. `SUDO_UID` equals the configured producer uid (like `RUN.lock` in item 8, this only guards against stray calls; sudoers is the authorization);
+5. the configuration chain is root-owned and not group or world writable, none a link: `/Library`, `/Library/cae-qa`, the helper
+   and `config.json` (a tripwire only; see "Helper integrity" for what actually protects the helper);
 6. the Codex binary digest equals the pinned digest in `config.json` (decision D1);
 7. every open of `request.json`, `prompt.txt`, `packet.json` and the clone uses `O_NOFOLLOW`, rejects non-regular files and
    enforces size caps (request 64 KiB, prompt 1 MiB, packet 64 MiB);
@@ -141,7 +153,12 @@ The producer writes `X/inbox/<attempt>/request.json` (producer-owned, read-only 
    authentication);
 9. all paths (exchange, inbox, outbox, QA home, Codex home, Codex binary) are derived from `config.json` and the validated
    attempt id, never from argv or from the request;
-10. the environment handed to Codex is built from scratch (`isolated_env`), never copied from the caller.
+10. the child environment is built from an allowlist and **nothing is taken from the caller**: `HOME` comes from
+    `pwd.getpwuid(<configured QA uid>)`, `PATH` is the fixed `/usr/bin:/bin:/usr/sbin:/sbin`, `CODEX_HOME`, `TMPDIR` and the
+    other variables are derived from `config.json` and the attempt id, and `CODEX_HOME`, `PATH`, `LANG`, `TERM`, `SHELL`
+    and everything else in the inherited environment are ignored. The attended code (`isolated_env`) copies `PATH`, `LANG`,
+    `TERM`, `SHELL` and a `CODEX_HOME` from `os.environ`, so the installed helper needs its own environment builder (PR 2).
+    sudoers backs this with `env_reset`, `!setenv`, the `NOSETENV` tag, a fixed `secure_path` and `always_set_home`.
 
 `config.json` (root:wheel 0444) holds the QA name, QA uid, producer uid, exchange path, the pinned Codex path and digest.
 
@@ -150,11 +167,10 @@ The producer writes `X/inbox/<attempt>/request.json` (producer-owned, read-only 
 | Path | Owner | Mode | Notes |
 |---|---|---|---|
 | `/etc/sudoers.d/cae-qa` | root:wheel | 0440 | written last, after `visudo -c -f` |
-| `/usr/local/libexec/cae-qa/` | root:wheel | 0755 | directory |
-| `/usr/local/libexec/cae-qa/qa-side` | root:wheel | 0555 | `scripts/qa-side.py`, first line `#!/usr/bin/python3 -I` |
-| `/usr/local/libexec/cae-qa/config.json` | root:wheel | 0444 | digests and ids, no secret |
-| `/usr/local/libexec/cae-qa/codex` | root:wheel | 0555 | pinned copy of the Codex binary (about 300 MB) |
-| `/usr`, `/usr/local`, `/usr/local/libexec` | root | not group/other writable | checked by the helper |
+| `/Library`, `/Library/cae-qa/` | root:wheel | 0755 | directories; nothing under them writable by group or other |
+| `/Library/cae-qa/qa-side` | root:wheel | 0555 | `scripts/qa-side.py`, first line `#!/usr/bin/python3 -I` |
+| `/Library/cae-qa/config.json` | root:wheel | 0444 | digests and ids, no secret |
+| `/Library/cae-qa/codex` | root:wheel | 0555 | pinned copy of the Codex binary (about 300 MB) |
 | `X` exchange | root | 0711 | unchanged (qa-identity-setup.py) |
 | `X/inbox` | producer | 0700 + read ACE for the QA user | unchanged |
 | `X/outbox` | QA user | 0700 + ACE for the producer | unchanged |
@@ -162,7 +178,7 @@ The producer writes `X/inbox/<attempt>/request.json` (producer-owned, read-only 
 ### Install procedure (owner, as administrator; a later PR provides the tool)
 
 1. Review the plan the installer prints (no change is made by `--plan`).
-2. Copy the helper, `config.json` and the pinned Codex into `/usr/local/libexec/cae-qa/` with the modes above; compute and record
+2. Copy the helper, `config.json` and the pinned Codex into `/Library/cae-qa/` with the modes above; compute and record
    the digests.
 3. Write the candidate sudoers text to an owner-owned temporary file and run `visudo -c -f <file>`. Stop on any error.
 4. Install the sudoers file **last**: `install -o root -g wheel -m 0440 <file> /etc/sudoers.d/cae-qa`.
@@ -180,7 +196,9 @@ Must pass (each run as the producer, non-interactively):
 - the ownership and mode of every path in the table above, and the root-owned chain, are as specified;
 - `sudo -V` is 1.9.10 or newer.
 
-Must be refused (non-zero with a sudo refusal, nothing executed): `sudo -n -u QA /usr/bin/id`; `sudo -n -u QA /bin/sh -c id`;
+Must be refused (non-zero with a sudo refusal, nothing executed): `sudo -n -u QA -g wheel ...`; `-u '#0'`; `-u '#<QA uid>'`
+(numeric spellings); `-u ALL`; `-i`; `-s`; `sudo -l`; the helper invoked by a relative path, through a symlink or after a
+`cd`; `sudo -n -u QA /usr/bin/id`; `sudo -n -u QA /bin/sh -c id`;
 `sudo -n -u QA /usr/bin/env`; `sudo -n -u root /usr/bin/true`; `sudo -n /usr/bin/true`; `sudo -n -u QA -E ...`;
 `kill -KILL 1`, `kill -TERM -1`, `kill -KILL -1 123`; `crontab -r`, `crontab -e`, `atq x`; `ls -A /Users/QA` and
 `ls -A /Users/QA/Library/LaunchAgents/x`; `launchctl print system`, `launchctl print user/0`, `launchctl print gui/QAUID/x`,
@@ -190,7 +208,7 @@ Must be refused (non-zero with a sudo refusal, nothing executed): `sudo -n -u QA
 ### Rollback
 
 Remove `/etc/sudoers.d/cae-qa` (one step; the producer immediately loses every grant) and confirm `sudo -n -u QA /usr/bin/atq ""`
-is refused. Removing `/usr/local/libexec/cae-qa/` is optional and independent. The attended mode never depended on either, so it
+is refused. Removing `/Library/cae-qa/` is optional and independent. The attended mode never depended on either, so it
 works unchanged afterwards.
 
 ## What this changes for the owner
@@ -199,7 +217,7 @@ Eliminated: typing `sudo -v` before every run, launching from the Terminal that 
 takes no sudo credential and sends no `sudo -n -v`).
 
 Remains: the one-time administrator install; reinstalling when `qa-side.py` or the pinned Codex changes (the digests are part of
-the install); the QA user's Codex device login (`qa-identity-setup.py` prints the command); rechecking the install after a macOS
+the install), and regenerating the sudoers drop-in whenever the helper digest pin changes; the QA user's Codex device login (`qa-identity-setup.py` prints the command); rechecking the install after a macOS
 major upgrade (sudo version, `launchctl` output format, SIP/Python path).
 
 ## Statement against earlier documentation
@@ -209,7 +227,21 @@ major upgrade (sudo version, `launchctl` output format, SIP/Python path).
 change `qa-identity-setup.py`, which still never edits sudoers; the drop-in is written by a separate owner-run installer
 (PR 3 below) and never by an agent.
 
+### Helper integrity
+
+A grant that matches only a path would run whatever sits there. Controls, in order of strength: (1) the install lives under
+`/Library/cae-qa/`, root:wheel, no group/other write on any component, a place Homebrew never touches; (2) the sudoers entries
+pin the helper's SHA-256 (racy without `fexecve`, stated above); (3) before **every** run the producer `lstat`-verifies each
+component of the helper path, `config.json` and the pinned Codex (root-owned, no group/other write, no symlinks) and fails closed
+with `QA_INCOMPLETE`, codex not started (PR 3 adds this to `qa-handoff.py`); (4) the helper's own chain check, which can only
+detect, not prevent, its replacement.
+
 ## Risks and unknowns
+
+- **Residual risk, stated plainly.** A compromised producer can choose the prompt and packet the pinned Codex runs. That is
+  effectively a sandboxed arbitrary-command primitive as the QA user, using the QA user's Codex login and quota. The limits are
+  those of the permission profile (read allowlist, writes only to the clone and scratch, no network) and the seal; they are not
+  a promise that the QA user cannot do anything. Anything the QA user can read, a command it runs can read.
 
 - **The human gate moves.** Today a person types the password per run. After install, any process running as the producer user
   can start a QA run, and so can drive the QA user's Codex login with a prompt it chooses (the prompt is the producer's input
@@ -240,8 +272,8 @@ installed mode is not offered.
 |---|---|---|
 | 0 | this ADR and the `docs/QA-HANDOFF.md` corrections (docs only) | none |
 | 1 | move the QA-side code into a self-contained `scripts/qa-side.py`; the attended mode copies and runs it with identical behaviour | none |
-| 2 | helper verbs and `request.json` validation in `qa-side.py`, and the installed-mode producer path in `qa-handoff.py`, tested against a fake sudo | none (offline tests) |
-| 3 | owner-run installer with `--plan`, `--check`, `--rollback`, the sudoers text generator and the install-time controls | writes root files only when the owner runs it with sudo |
+| 2 | helper verbs and `request.json` validation in `qa-side.py`, **an allowlist environment builder for the helper (HOME from `pwd.getpwuid`, fixed PATH, no caller environment, `CODEX_HOME` ignored) with tests that poison `PATH`, `HOME`, `CODEX_HOME`, `LANG`, `TERM`, `SHELL`**, and the installed-mode producer path in `qa-handoff.py`, tested against a fake sudo | none (offline tests) |
+| 3 | owner-run installer with `--plan`, `--check`, `--rollback`, the sudoers text generator (digest pin) and the install-time controls; the producer-side pre-run `lstat` verification of the helper path | writes root files only when the owner runs it with sudo |
 | 4 | runbook, then a pilot unattended run after the owner installs | owner install |
 
 The current Fornax candidate QA stays on the attended path: its bundle and run directory are not touched, and attended
