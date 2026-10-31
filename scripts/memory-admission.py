@@ -374,7 +374,7 @@ def refusal_reasons(weight, m):
         procs = m.get("heavy_procs")
         if procs is None:
             unknown.append("process list unreadable")
-        elif m.get("heavy_workloads") is not None:
+        elif m.get("heavy_workloads"):   # an empty list with heavy-named processes present falls to the name count below: fail closed
             running = [w for w in m["heavy_workloads"] if not w["idle"]]
             if running:
                 detail = "; ".join(f"{w['root_comm']}: {w['procs']} procs, {w['rss_bytes'] / GIB:.1f} GiB" for w in running)

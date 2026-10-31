@@ -706,6 +706,16 @@ class WorkloadTree(unittest.TestCase):
         reasons, _ = ma.refusal_reasons("heavy", m)
         self.assertIn("one heavy lane at a time", " ".join(reasons))
 
+    def test_heavy_processes_that_form_no_workload_still_refuse(self):
+        # A ppid cycle or a duplicate pid leaves no workload root; heavy-named processes without a workload must not be admitted.
+        cycle = [self.line(100, 101, "/x/cargo", state="R"), self.line(101, 100, "/x/rustc", state="R")]
+        dup = [self.line(100, 1, "/usr/bin/zsh", state="R"), self.line(100, 1, "/x/cargo", state="R")]
+        for lines in (cycle, dup):
+            m = ma.derive(self.take(ps_out(*lines)), self.take(ps_out(*lines)))
+            self.assertEqual(m["heavy_workloads"], [])
+            reasons, _ = ma.refusal_reasons("heavy", m)
+            self.assertIn("one heavy lane at a time", " ".join(reasons))
+
     def test_a_non_heavy_member_spending_cpu_makes_the_tree_active(self):
         first = self.take(ps_out(*self.tree(root_ppid=1)))
         busier = self.tree(root_ppid=1)
