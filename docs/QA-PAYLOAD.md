@@ -56,7 +56,7 @@ files that record the producer's own runs; they are shown to QA as `PRODUCER-RUN
 Each test is `codex sandbox -P qa_confined -C <clone> <absolute argv>` as the QA user, the same path the confinement probe uses,
 with an allowlist environment only: `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME` and `TMPDIR` inside the run directory, and
 `CODEX_HOME` (the profile cannot be found without it); nothing is inherited. The working directory is the run's tmp, there is no
-shell and no network, and a daemon cannot start (binding is denied), so self-tests must be pure command-line checks. Each runs in its
+shell and no direct socket access, and a daemon cannot start (binding is denied), so self-tests must be pure command-line checks. Each runs in its
 own session with a per-file size limit (RLIMIT_FSIZE: its output cap plus slack, at least 16 MiB, so a single-file flood is cut off by the
 kernel and not only by the timeout; many small files are not limited by it). The limit applies to every file the command writes, so a
 self-test that writes one file larger than 16 MiB (for example a debug build artifact) is killed with SIGXFSZ and recorded as "exited -25,
