@@ -479,6 +479,15 @@ def _refusal(reason, **extra):
 
 def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None,
             token_fn=process_token, ttl=DEFAULT_TTL, owner_fn=process_owner, allow_long=False):
+    """Admit or refuse via _reserve, then record a measurement sample outside the lock for an admitted reservation."""
+    now = now or datetime.now(timezone.utc)
+    result = _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long)
+    if result.get('admit') and str(result.get('reason', '')).startswith('reserved '):
+        _measure(state_path, 'reserve', result.get('free_bytes'), now)
+    return result
+
+
+def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long):
     """Admit one heavy job and record its byte reservation, or refuse.
 
     Admission needs: heavy admitted by tier and latch, a free heavy lane, and
@@ -547,8 +556,21 @@ def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None
         return _refusal('state-unwritable: %s' % exc)
 
 
-def release(label, state_path):
-    """Delete this tool's reservation file for label; a missing one is success."""
+def release(label, state_path, free_fn=read_free_bytes):
+    """Delete this tool's reservation file for label (a missing one is success); log an end line when one was deleted."""
+    held = None
+    if isinstance(label, str) and LABEL_RE.fullmatch(label):
+        try:
+            held = _read_reservation(reservations_dir(state_path) / (label + '.json'))
+        except (OSError, ValueError):
+            held = None
+    result = _release(label, state_path)
+    if held is not None and result.get('admit') and str(result.get('reason', '')).startswith('released '):
+        _end_measurement(state_path, held, _free_or_none(free_fn), datetime.now(timezone.utc))
+    return result
+
+
+def _release(label, state_path):
     if not (isinstance(label, str) and LABEL_RE.fullmatch(label)):
         return _refusal('invalid-request: bad label')
     try:
@@ -564,6 +586,237 @@ def release(label, state_path):
         return _refusal('%s: %s' % (exc.kind, exc))
     except (OSError, ValueError) as exc:
         return _refusal('reservation-unreadable: %s' % exc)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Measurement log (SPE-150 PR2). Observational only: it records how much memory a reservation holder's process tree
+# really used so a later change can size lanes from evidence. It never feeds an admission decision, never runs under the
+# admission lock, and every failure is swallowed (counted in MEASUREMENT_FAILURES). Lines hold numbers and the label,
+# pid and start token only: never argv, a command line or the environment.
+MEASUREMENTS_NAME = 'measurements.jsonl'
+MEASUREMENT_VERSION = 1
+MEASUREMENT_FAILURES = 0
+SAMPLE_INTERVAL_S = 60  # the snapshot refresher's cadence, so figures are lower bounds
+MIN_SOLO_RUNS = 3
+PS_ROW_RE = re.compile(r'\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s*$')
+
+
+def _parse_cpu_time(text):
+    """ps TIME ([dd-][hh:]mm:ss[.ff]) in seconds; None when unparsable."""
+    try:
+        days, _, rest = text.rpartition('-')
+        total = 0.0
+        for part in rest.split(':'):
+            total = total * 60 + float(part)
+        return total + (int(days) * 86400 if days else 0)
+    except ValueError:
+        return None
+
+
+def _process_rows():
+    """{pid: (ppid, rss_kib, cpu_s)} from one ps call (no args column); None when ps fails."""
+    try:
+        done = subprocess.run(['/bin/ps', '-axo', 'pid=,ppid=,rss=,time='], capture_output=True, text=True, timeout=5,
+                              stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/bin:/usr/bin'})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    rows = {}
+    for line in done.stdout.splitlines():
+        match = PS_ROW_RE.fullmatch(line)
+        cpu = _parse_cpu_time(match.group(4)) if match else None
+        if match and cpu is not None:
+            rows[int(match.group(1))] = (int(match.group(2)), int(match.group(3)), cpu)
+    return rows
+
+
+def _read_pressure():
+    """Kernel memory pressure level (1 normal, 2 warn, 4 critical); None when unreadable."""
+    try:
+        done = subprocess.run(['/usr/sbin/sysctl', '-n', 'kern.memorystatus_vm_pressure_level'], capture_output=True,
+                              text=True, timeout=5, stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/usr/sbin:/usr/bin'})
+        level = int(done.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return level if level in (1, 2, 4) else None
+
+
+def _subtree(rows, root):
+    """(rss_bytes, cpu_s, process count) of root and every descendant; None when root is not running."""
+    if root not in rows:
+        return None
+    children = {}
+    for pid, (ppid, _, _) in rows.items():
+        children.setdefault(ppid, []).append(pid)
+    seen, stack = set(), [root]
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        stack.extend(children.get(pid, ()))
+    return (sum(rows[p][1] for p in seen) * 1024, sum(rows[p][2] for p in seen), len(seen))
+
+
+def _reservation_holders(state_path):
+    """Reservation records as currently on disk, read-only and without verification; unreadable ones are skipped."""
+    holders = []
+    directory = reservations_dir(state_path)
+    for path in sorted(directory.glob('*.json')):
+        try:
+            holders.append(_read_reservation(path))
+        except (OSError, ValueError):
+            continue
+    return holders
+
+
+def _measurements_path(state_path):
+    return state_path.parent / MEASUREMENTS_NAME
+
+
+def _append_measurement(state_path, line):
+    path = _measurements_path(state_path)
+    _rotate_once(path)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, 'a') as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(json.dumps(line, sort_keys=True) + '\n')
+
+
+def _run_key(record):
+    return {'label': record['label'], 'pid': record['pid'], 'start_token': record['start_token']}
+
+
+def _measure(state_path, source, free_bytes=None, now=None):
+    """Append one sample line per live reservation holder; never raises and never alters the caller's result."""
+    global MEASUREMENT_FAILURES
+    try:
+        now = now or datetime.now(timezone.utc)
+        holders = _reservation_holders(state_path)
+        if not holders:
+            return
+        rows = _process_rows()
+        if rows is None:
+            MEASUREMENT_FAILURES += 1
+            return
+        pressure = _read_pressure()
+        for record in holders:
+            tree = _subtree(rows, record['pid'])
+            if tree is None:
+                continue  # the holder is gone: the lazy reaper owns that, and a dead process has nothing to measure
+            line = dict(_run_key(record), v=MEASUREMENT_VERSION, ts=iso_utc(now), event=source, rss_bytes=tree[0],
+                        cpu_s=round(tree[1], 2), procs=tree[2], pressure=pressure, concurrent=len(holders),
+                        free_bytes=free_bytes)
+            if record.get('queue_id'):
+                line['queue_id'] = record['queue_id']
+            if isinstance(record.get('class'), str):
+                line['class'] = record['class']
+            _append_measurement(state_path, line)
+    except Exception:  # observation must never change an admission outcome
+        MEASUREMENT_FAILURES += 1
+
+
+def _read_measurement_lines(state_path):
+    """Parsed lines from the rotated and current log, oldest first, plus the count of lines skipped as unreadable."""
+    lines, skipped = [], 0
+    base = _measurements_path(state_path)
+    for path in (base.with_name(base.name + '.1'), base):
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        with os.fdopen(descriptor, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                continue
+            for raw in handle.read(4 * RECEIPT_ROTATE_BYTES).splitlines():
+                try:
+                    line = json.loads(raw)
+                    if not (isinstance(line, dict) and isinstance(line.get('label'), str) and isinstance(line.get('ts'), str)):
+                        raise ValueError
+                    lines.append(line)
+                except ValueError:
+                    skipped += 1
+    return lines, skipped
+
+
+def _end_measurement(state_path, record, free_bytes, now):
+    """Close a run: duration and free-bytes change since its first line. Never raises."""
+    global MEASUREMENT_FAILURES
+    try:
+        key = _run_key(record)
+        mine = [ln for ln in _read_measurement_lines(state_path)[0]
+                if all(ln.get(k) == v for k, v in key.items()) and ln.get('event') != 'end']
+        line = dict(key, v=MEASUREMENT_VERSION, ts=iso_utc(now), event='end', duration_s=None, free_delta_bytes=None,
+                    free_bytes=free_bytes)
+        if mine:
+            started = _parse_time(mine[0]['ts'])
+            line['duration_s'] = max(0, int((now - started).total_seconds()))
+            first = mine[0].get('free_bytes')
+            if type(first) is int and type(free_bytes) is int:
+                line['free_delta_bytes'] = free_bytes - first
+        _append_measurement(state_path, line)
+    except Exception:
+        MEASUREMENT_FAILURES += 1
+
+
+def _free_or_none(free_fn):
+    try:
+        return free_fn()
+    except Exception:
+        return None
+
+
+def _percentile95(values):
+    ordered = sorted(values)
+    return ordered[max(0, -(-95 * len(ordered) // 100) - 1)]
+
+
+def measurements_summary(state_path):
+    """Per-class evidence from the log. Read-only. Peaks are lower bounds: a sample is taken about every 60 s."""
+    lines, skipped = _read_measurement_lines(state_path)
+    runs = {}
+    for line in lines:
+        if line.get('event') == 'end' or type(line.get('rss_bytes')) is not int:
+            continue
+        key = (line['label'], line.get('pid'), line.get('start_token'))
+        run = runs.setdefault(key, {'class': line.get('class') or line['label'] or 'unclassified', 'peak': 0, 'concurrent': False,
+                                    'pressured': 0, 'unknown_pressure': 0, 'samples': 0})
+        run['samples'] += 1
+        run['peak'] = max(run['peak'], line['rss_bytes'])
+        run['concurrent'] = run['concurrent'] or (type(line.get('concurrent')) is int and line['concurrent'] > 1)
+        pressure = line.get('pressure')
+        if type(pressure) is not int:
+            run['unknown_pressure'] += 1
+        elif pressure > 1:
+            run['pressured'] += 1
+    classes = {}
+    for run in runs.values():
+        classes.setdefault(run['class'], []).append(run)
+    out = {}
+    for name, group in sorted(classes.items()):
+        peaks = [r['peak'] for r in group]
+        qualifying = [r['peak'] for r in group if not r['concurrent'] and not r['pressured'] and not r['unknown_pressure']]
+        entry = {'runs': len(group), 'max_rss_bytes': max(peaks), 'p95_rss_bytes': _percentile95(peaks),
+                 'solo_runs': sum(1 for r in group if not r['concurrent']),
+                 'concurrent_runs': sum(1 for r in group if r['concurrent']),
+                 'pressured_samples': sum(r['pressured'] for r in group),
+                 'qualifying_solo_runs': len(qualifying)}
+        entry['estimate_rss_bytes'] = max(qualifying) if len(qualifying) >= MIN_SOLO_RUNS else None
+        entry['estimate'] = ('%.2f GiB' % (entry['estimate_rss_bytes'] / GIB) if len(qualifying) >= MIN_SOLO_RUNS
+                             else 'insufficient evidence')
+        out[name] = entry
+    return {'classes': out, 'skipped_lines': skipped, 'failures_this_process': MEASUREMENT_FAILURES,
+            'note': 'lower bounds: processes are sampled about every %d s, so a short peak can be missed; an estimate needs '
+                    '>= %d solo runs with pressure 1 throughout' % (SAMPLE_INTERVAL_S, MIN_SOLO_RUNS)}
+
+
+def format_measurements(summary):
+    rows = ['%-32s runs=%d max=%.2f GiB p95=%.2f GiB solo=%d concurrent=%d pressured_samples=%d estimate=%s' % (
+        name, e['runs'], e['max_rss_bytes'] / GIB, e['p95_rss_bytes'] / GIB, e['solo_runs'], e['concurrent_runs'],
+        e['pressured_samples'], e['estimate']) for name, e in summary['classes'].items()]
+    return '\n'.join(rows + ['no measurements recorded'] * (not rows) +
+                     ['note: ' + summary['note'], 'unreadable lines skipped: %d' % summary['skipped_lines']])
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -829,6 +1082,20 @@ def _drop_marker(state_path, qid):
 
 
 def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=process_token, grant_s=QUEUE_GRANT_S):
+    """_queue_advance, then a measurement sample per reservation holder outside the lock."""
+    now = now or datetime.now(timezone.utc)
+    seen = {}
+
+    def free():
+        seen['free'] = free_fn()
+        return seen['free']
+
+    out = _queue_advance(state_path, free, now, token_fn, grant_s)
+    _measure(state_path, 'advance', seen.get('free'), now)
+    return out
+
+
+def _queue_advance(state_path, free_fn, now, token_fn, grant_s):
     """One advance step under the lock: expire lapsed grants and waits, then grant the first in line if a lane is free.
 
     A lane is occupied by a live reservation (including one past its time limit or unverifiable) and by an unclaimed,
@@ -1062,6 +1329,7 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
         return refuse('%s: %s' % (exc.kind, exc))
     except OSError as exc:
         return refuse('state-unwritable: %s' % exc)
+    _measure(state_path, 'claim', _free_or_none(free_fn), now)
     try:
         exec_fn(argv[0], argv)
     except OSError as exc:
@@ -1188,8 +1456,16 @@ def read_snapshot(state_path):
 
 
 def snapshot(state_path, source_fn=measure_with_source, now=None, token_fn=process_token):
-    """Refresh state and publish the host resource snapshot next to it."""
+    """Publish the host resource snapshot, then sample each reservation holder outside the lock."""
     now = now or datetime.now(timezone.utc)
+    record = _snapshot(state_path, source_fn, now, token_fn)
+    if 'error' not in record:
+        _measure(state_path, 'snapshot', record.get('free_bytes'), now)
+    return record
+
+
+def _snapshot(state_path, source_fn, now, token_fn):
+    """Refresh state and publish the host resource snapshot next to it."""
     seen = {}
 
     def free():
@@ -1300,6 +1576,8 @@ def build_parser():
     mode.add_argument('--json', action='store_true', help='write and print a fresh snapshot')
     mode.add_argument('--check-fresh', action='store_true', help='read-only: exit 0 when the snapshot is fresh, else 77')
     shot.add_argument('--max-age', type=int, default=STALE_AFTER_S, help='seconds, 1..120; with --check-fresh only')
+    meas = commands.add_parser('measurements', allow_abbrev=False, help='read-only summary of the measured workload peaks')
+    meas.add_argument('--json', action='store_true')
     commands.add_parser('refresher-plist', allow_abbrev=False, help='print the snapshot-refresher launchd agent; installs nothing')
     go = commands.add_parser('run', allow_abbrev=False, help='reserve bytes for this process, then exec the job')
     go.add_argument('--bytes', type=int, required=True, dest='nbytes')
@@ -1417,6 +1695,10 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None):
                 print(out['reason'], file=sys.stderr)
             return out['exit'] if not out['ok'] else 0
         return run_reserved(args.label, args.nbytes, job, state_path, free_fn, args.ttl, args.allow_long)
+    if args.command == 'measurements':
+        summary = measurements_summary(state_path)
+        print(json.dumps(summary, sort_keys=True) if args.json else format_measurements(summary))
+        return 0
     if args.command == 'queue':
         return _queue_cli(args, state_path, free_fn)
     if args.command in ('reserve', 'release'):
