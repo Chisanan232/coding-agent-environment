@@ -54,39 +54,46 @@ import threading
 import time
 from pathlib import Path
 
-HOME = Path.home()
+
+SIDE_SCRIPT = 'qa-side.py'
+
+
+def _load_side():
+    """The QA-side module, loaded from the file next to this one. It is the exact file the attended hop copies into the
+    inbox and runs as the QA user, and the producer reuses its shared pieces (permission profile, confinement controls,
+    isolated environment, verdict schema, file helpers) so the two sides cannot drift apart. Loaded only from a regular
+    file the invoking user or root owns and nobody else can write, like the helpers runtime_problems checks."""
+    path = Path(__file__).resolve().parent / SIDE_SCRIPT
+    try:
+        st = os.lstat(path)
+    except OSError:
+        print('REFUSED %s must sit next to qa-handoff.py (not found at %s); copy all scripts from the same revision' % (SIDE_SCRIPT, path))
+        raise SystemExit(64)   # EXIT['REFUSED'], which is not defined yet
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, os.getuid()) or st.st_mode & 0o022:
+        print('REFUSED %s must be a regular file owned by root or you and not group/world writable' % path)
+        raise SystemExit(64)
+    spec = importlib.util.spec_from_file_location('qa_side', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_SIDE = _load_side()
+HOME, SEVERITIES, PROFILE, SECRET_DIRS, SYSTEM_READ, CANARY_ROOT, ENV_ALLOW = (
+    _SIDE.HOME, _SIDE.SEVERITIES, _SIDE.PROFILE, _SIDE.SECRET_DIRS, _SIDE.SYSTEM_READ, _SIDE.CANARY_ROOT, _SIDE.ENV_ALLOW)
+CONTROLS, VERDICT_SCHEMA, PROFILE_CHANGED = _SIDE.CONTROLS, _SIDE.VERDICT_SCHEMA, _SIDE.PROFILE_CHANGED
+(clean, kill_group, sha256_file, write_private, open_regular, isolated_env, real_codex_home, profile_toml, prepare_codex_home,
+ confinement_probe, codex_argv) = (
+    _SIDE.clean, _SIDE.kill_group, _SIDE.sha256_file, _SIDE.write_private, _SIDE.open_regular, _SIDE.isolated_env,
+    _SIDE.real_codex_home, _SIDE.profile_toml, _SIDE.prepare_codex_home, _SIDE.confinement_probe, _SIDE.codex_argv)
+
+
 DEFAULT_ROOT = HOME / '.local/state/coding-agent-environment/qa'
-SEVERITIES = ('Critical', 'High', 'Medium', 'Low')
 FAILING = ('Critical', 'High', 'Medium')
 # REFUSED is a usage refusal (the run directory is not runnable) and writes no RESULT.json; NOT_RUN and WAITING_RESOURCE
 # both mean codex never started, so the same attempt can be run again.
 EXIT = {'QA_PASS': 0, 'QA_FAIL': 10, 'QA_INCOMPLETE': 11, 'QA_INVALID': 12, 'REFUSED': 64, 'WAITING_RESOURCE': 75, 'NOT_RUN': 75}
-PROFILE = 'qa_confined'
-# Directories under HOME that hold credentials. Directory rules only: the Codex permission profile does not take globs.
-SECRET_DIRS = ('.codex', '.ssh', '.aws', '.config', '.claude', '.gnupg', '.netrc', '.npmrc', '.docker', '.kube',
-               'Library/Keychains', '.cargo/credentials.toml', '.cargo/credentials')
-SYSTEM_READ = ('/usr', '/bin', '/opt/homebrew', '/Library/Developer/CommandLineTools')
-CANARY_ROOT = HOME / '.local/state/coding-agent-environment/qa-canary'
-ENV_ALLOW = ('PATH', 'LANG', 'LC_ALL', 'TERM', 'TZ', 'USER', 'LOGNAME', 'SHELL')
 
-STR = {'type': 'string'}
-
-
-def _obj(props, required=None):
-    return {'type': 'object', 'additionalProperties': False, 'required': list(required or props), 'properties': props}
-
-
-VERDICT_SCHEMA = _obj({
-    'status': {'type': 'string', 'enum': ['COMPLETE', 'PARTIAL', 'BLOCKED']},
-    'baseline': STR,
-    'verified': {'type': 'array', 'items': _obj({'check': STR, 'result': {'type': 'string', 'enum': ['PASS', 'FAIL']},
-                                                  'evidence': STR})},
-    'suspected_findings': {'type': 'array', 'items': _obj({
-        'id': STR, 'severity': {'type': 'string', 'enum': list(SEVERITIES)}, 'surface': STR, 'expected': STR,
-        'actual': STR, 'evidence': STR, 'confidence': {'type': 'string', 'enum': ['HIGH', 'MEDIUM', 'LOW']}})},
-    'untested_or_blocked': {'type': 'array', 'items': _obj({'surface': STR, 'reason': STR})},
-    'confidence': {'type': 'string', 'enum': ['HIGH', 'MEDIUM', 'LOW']},
-})
 
 PROMPT = """You are an independent QA reviewer. You have no connection to the producer of this change and you have not
 seen their work: you receive only the packet below and a clean checkout of the repository at the exact commit.
@@ -135,47 +142,12 @@ def safe_digest(path):
         return 'UNREADABLE'
 
 
-def sha256_file(path):
-    """Streaming SHA-256 of a regular file opened without following links."""
-    digest = hashlib.sha256()
-    with open_regular(path) as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def write_private(path, data, mode=0o600):
-    """Create or replace a wrapper-owned file without ever following a link: unlink first, then exclusive create."""
-    text = data if isinstance(data, (str, bytes)) else json.dumps(data, indent=2, sort_keys=True)
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
-    with os.fdopen(fd, 'wb' if isinstance(text, bytes) else 'w') as handle:
-        handle.write(text)
-
-
 MAX_VERDICT_BYTES = 5 << 20
 MIN_COMMANDS = 2   # the mandatory `git rev-parse HEAD` plus at least one more successful command recorded in the stream
 MAX_EVENTS_BYTES = 256 << 20
 MAX_EVENT_LINE = 1 << 20
 MAX_INPUT_BYTES = 1 << 20
 SETTLE_SECONDS = 2
-
-
-def open_regular(path):
-    """Open a plain regular file for reading without following links or blocking on a FIFO or device. lstat first,
-    then O_NOFOLLOW|O_NONBLOCK, then re-check the opened object is the same regular file (no swap in between)."""
-    before = os.lstat(path)
-    if not stat.S_ISREG(before.st_mode):
-        raise OSError('not a regular file')
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    after = os.fstat(fd)
-    if not stat.S_ISREG(after.st_mode) or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
-        os.close(fd)
-        raise OSError('file changed while opening')
-    return os.fdopen(fd, 'rb')
 
 
 def read_nofollow(path, limit=MAX_VERDICT_BYTES):
@@ -427,26 +399,6 @@ def prepare(args):
     return 0
 
 
-def isolated_env(run_dir, codex_home=None):
-    env = {k: os.environ[k] for k in ENV_ALLOW if k in os.environ}
-    # A relative or run-directory PATH entry would resolve helper binaries from a directory the QA process can write.
-    entries = [e for e in os.environ.get('PATH', '/usr/bin:/bin').split(':') if os.path.isabs(e) and not e.startswith(str(run_dir))]
-    env['PATH'] = ':'.join(entries) or '/usr/bin:/bin'
-    home = str(run_dir / 'home')
-    env.update({'HOME': home, 'TMPDIR': str(run_dir / 'tmp'), 'XDG_CONFIG_HOME': home + '/.config',
-                'XDG_DATA_HOME': home + '/.local/share', 'XDG_CACHE_HOME': home + '/.cache',
-                'CARGO_TARGET_DIR': str(run_dir / 'cargo-target'), 'CARGO_NET_OFFLINE': 'true',
-                # A private Codex home holding only the permission profile and a link to the login (codex_home()).
-                'CODEX_HOME': str(codex_home or run_dir / 'codexhome')})
-    if os.environ.get('CARGO_HOME'):
-        env['CARGO_HOME'] = os.environ['CARGO_HOME']
-    return env
-
-
-def real_codex_home():
-    return Path(os.environ.get('CODEX_HOME') or HOME / '.codex')
-
-
 def valid_read_root(text, run_dir=None):
     """An extra read-only root for toolchains (for example a Rust toolchain under HOME). Absolute, existing, a directory,
     and never HOME (or its parent) itself, the filesystem root, anything at or below a credential directory, the real Codex
@@ -471,115 +423,6 @@ def valid_read_root(text, run_dir=None):
         if overlaps(other):
             return None
     return resolved
-
-
-def profile_toml(run_dir, read_roots=()):
-    """Allowlist-only reads, writes confined to the clone and scratch, no network. Measured by the AASM QA campaign with
-    `codex sandbox -P` and a real `codex exec` on codex-cli 0.163.0; the wrapper re-proves it before every run (see
-    confinement_probe). NOT enforced by the seatbelt: other processes' environments of the same OS user stay readable."""
-    fs = {':minimal': 'read'}
-    for root in SYSTEM_READ:
-        fs[root] = 'read'
-    for root in read_roots:
-        fs[str(root)] = 'read'
-    for sub in ('source', 'out', 'tmp', 'home', 'cargo-target'):
-        fs[str(run_dir / sub)] = 'write'
-    for rel in SECRET_DIRS:
-        fs[str(HOME / rel)] = 'deny'
-    fs[str(real_codex_home())] = 'deny'
-    # No [projects] table on purpose: the clone is the commit under test, and a trusted project lets its own
-    # .codex/config.toml widen this profile (measured: a planted allowlist entry made a canary read ALLOWED).
-    lines = ['approval_policy = "never"', 'cli_auth_credentials_store = "file"', 'default_permissions = "%s"' % PROFILE, '',
-             '[permissions.%s.filesystem]' % PROFILE]
-    lines += ['%s = "%s"' % (json.dumps(k), v) for k, v in fs.items()]
-    lines += ['', '[permissions.%s.network]' % PROFILE, 'enabled = false', '']
-    return '\n'.join(lines)
-
-
-def prepare_codex_home(run_dir, read_roots=(), home=None):
-    """A private CODEX_HOME per run: the permission profile, and the login only as a link to the real auth file. The link
-    is readable by the Codex client (not sandboxed) and denied to the tool commands, whose profile denies the real home.
-    A private home also stops the user's own MCP servers and hooks from loading."""
-    home = Path(home or run_dir / 'codexhome')
-    home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    write_private(home / 'config.toml', profile_toml(run_dir, read_roots))
-    auth = real_codex_home() / 'auth.json'
-    link = home / 'auth.json'
-    if auth.exists() and not os.path.lexists(link):
-        os.symlink(auth.resolve(), link)
-    return home
-
-
-CONTROLS = (
-    # (name, python snippet printing ALLOWED or DENIED:<errno>; the name is the first line so a test double can tell them apart)
-    ('pos_read_clone', "import sys\ntry:\n    open({clone!r} + '/.git/HEAD').read()\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'ALLOWED'),
-    ('pos_write_out', "import sys\ntry:\n    open({out!r} + '/probe.txt', 'w').write('x')\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'ALLOWED'),
-    ('neg_read_canary', "import sys\ntry:\n    open({canary!r}, 'rb').read()\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
-    ('neg_list_codex_home', "import os\ntry:\n    os.listdir({codex_home!r})\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
-    ('neg_project_config_ignored', "import sys\ntry:\n    open({canary!r}, 'rb').read()\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
-    ('neg_open_auth_file', "try:\n    open({auth!r}, 'rb').close()\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
-    ('neg_write_outside', "import sys\ntry:\n    open({canary_dir!r} + '/written.txt', 'w').write('x')\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
-)
-
-
-def confinement_probe(codex_bin, run_dir, env):
-    """Prove, with the exact private home and profile the QA run will use, that a tool command cannot read a planted
-    synthetic canary under HOME or list the real Codex home, cannot write outside the roots, and still can read the clone
-    and write the out directory. Uses `codex sandbox -P` (no model). Any failed or unrunnable control means the run does not
-    start. Returns (record, problems); the canary is removed afterwards."""
-    token = os.urandom(8).hex()
-    canary_dir = CANARY_ROOT / token
-    canary_dir.mkdir(parents=True, mode=0o700)
-    canary = canary_dir / 'canary.txt'
-    canary.write_text('synthetic-qa-canary-%s' % token)
-    auth = real_codex_home() / 'auth.json'
-    values = {'auth': str(auth), 'clone': str(run_dir / 'source'), 'out': str(run_dir / 'out'), 'canary': str(canary), 'canary_dir': str(canary_dir),
-              'codex_home': str(real_codex_home())}
-    results, problems = [], []
-    try:
-        # A scratch clone whose own .codex/config.toml tries to add the canary to the read allowlist: the profile must hold.
-        hostile = run_dir / 'probe-hostile'
-        shutil.rmtree(hostile, ignore_errors=True)       # a wrapper killed mid-probe may have left one behind
-        (hostile / '.codex').mkdir(parents=True)
-        (hostile / '.codex/config.toml').write_text('[permissions.%s.filesystem]\n%s = "read"\n' % (PROFILE, json.dumps(str(canary_dir))))
-        for name, snippet, expect in CONTROLS:
-            if name == 'neg_open_auth_file' and not auth.exists():
-                continue          # no login file to protect; the open() is the denied operation, no content is read
-            code = '# CONTROL=%s\n%s' % (name, snippet.format(**values))
-            cwd = hostile if name == 'neg_project_config_ignored' else run_dir / 'source'
-            argv = [codex_bin, 'sandbox', '-P', PROFILE, '-C', str(cwd), '/usr/bin/python3', '-c', code]
-            try:
-                done = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=env)
-                got = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else ''
-                # A denial only counts as one when it is EPERM or EACCES: ENOENT (a wrong path), a missing errno or any
-                # other text proves nothing about confinement.
-                ok = done.returncode == 0 and (got == 'ALLOWED' if expect == 'ALLOWED' else got in ('DENIED:1', 'DENIED:13'))
-                detail = got or 'exit %s' % done.returncode
-                unrunnable = done.returncode != 0 or not got
-            except (OSError, subprocess.SubprocessError) as error:
-                ok, detail, unrunnable = False, type(error).__name__, True
-            results.append({'control': name, 'expected': expect, 'observed': clean(detail, 40), 'ok': ok, 'unrunnable': unrunnable})
-            if not ok:
-                problems.append('%s expected %s, observed %s' % (name, expect, clean(detail, 40)))
-    finally:
-        shutil.rmtree(run_dir / 'probe-hostile', ignore_errors=True)
-        for leftover in (canary_dir / 'written.txt', canary, canary_dir):
-            try:
-                leftover.unlink() if leftover.is_file() else leftover.rmdir()
-            except OSError:
-                pass
-    return {'profile': PROFILE, 'established': not problems, 'controls': results, 'canary_dir': str(canary_dir),
-            'could_not_check': bool(problems) and all(c['unrunnable'] for c in results if not c['ok'])}, problems
-
-
-def codex_argv(codex_bin, run_dir):
-    """The permission profile in the private CODEX_HOME applies; there is deliberately no -s, --add-dir or sandbox -c
-    override (the legacy write-only sandbox). No -m: model routing is not touched."""
-    # -o is written by the codex client itself, which is NOT sandboxed (only its tool commands are). It therefore points
-    # into the run directory, which the QA process cannot write, so a link planted by QA can never redirect that write.
-    return [codex_bin, 'exec', '--skip-git-repo-check', '--json', '--ephemeral', '-c', 'default_permissions="%s"' % PROFILE,
-            '-C', str(run_dir / 'source'),
-            '--output-schema', str(run_dir / 'verdict.schema.json'), '-o', str(run_dir / 'verdict.json'), '-']
 
 
 def count_commands(events_path):
@@ -626,11 +469,6 @@ def admission_state(args):
         return 'missing'
 
 
-def clean(text, limit=120):
-    """QA-controlled text is data for a human or agent to read, never instructions: strip control characters, cap it."""
-    return ''.join(c if c.isprintable() else ' ' for c in str(text))[:limit]
-
-
 def write_result(run_dir, packet, state, reasons, extra=None):
     reasons = [clean(r) for r in reasons]
     result = {'state': state, 'reasons': reasons, 'reasons_are_untrusted_qa_text': True, 'sha': packet['sha'], 'ticket': packet['ticket'],
@@ -669,7 +507,9 @@ def refuse(message):
     return EXIT['REFUSED']
 
 
-SIBLINGS = ('disk-admission.py', 'qa-identity-setup.py')   # the second only with --qa-identity; copy all from one revision
+# qa-identity-setup.py only with --qa-identity; qa-side.py is imported at start-up and, with --qa-identity, copied into the
+# inbox and run as the QA user. Copy all from one revision.
+SIBLINGS = ('disk-admission.py', 'qa-identity-setup.py', SIDE_SCRIPT)
 
 
 def runtime_problems(identity, admission_cmd=False):
@@ -768,19 +608,6 @@ def run(args):
             os.unlink(run_dir / 'RUN.lock')
         except OSError:
             pass
-
-
-def kill_group(proc):
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(proc.pid, sig)   # our own child's process group only
-        except OSError:
-            return
-        try:
-            proc.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            continue
 
 
 def write_meta(run_dir, argv, proc, t0, timed_out, events, interrupted=False, extra=None):
@@ -952,7 +779,7 @@ def seal_failed(error):
 # ---------------------------------------------------------------- dedicated QA OS identity (SPE-142)
 # The QA run executes as a separate, unprivileged OS user set up by scripts/qa-identity-setup.py, so a QA tool command
 # cannot read the environment of the producer's processes (same-uid KERN_PROCARGS2). Only the producer side loads that
-# script; the copy of this file that runs as the QA user has no sibling and never calls _qis().
+# script; the copy of qa-side.py that runs as the QA user has no sibling and never calls _qis().
 Identity = collections.namedtuple('Identity', 'name uid home exchange exchange_owner')
 KILL, PS = '/bin/kill', '/bin/ps'
 CRONTAB, ATQ, LS, LAUNCHCTL = '/usr/bin/crontab', '/usr/bin/atq', '/bin/ls', '/bin/launchctl'
@@ -1171,7 +998,6 @@ def sweep_identity(ident, recheck=0):
 
 
 STAGE_SECONDS = 60 * len(CONTROLS) + 60       # the QA-side confinement probe: up to 60 s per control
-PROFILE_CHANGED = 125                          # qa-exec: the profile is not the one hop 1 proved; codex was not started
 
 
 def exchange_problems(ident):
@@ -1451,8 +1277,8 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
     # The inbox is producer-owned and read-only to the QA user (its inherited ACE): the script, packet, prompt and a copy
     # of the verified clone. The QA side runs only this copy, with /usr/bin/python3 -I, and its digest is recorded.
     inbox.mkdir(mode=0o700)
-    script = inbox / 'qa-handoff.py'
-    write_private(script, read_nofollow(Path(__file__).resolve(), 16 << 20))
+    script = inbox / SIDE_SCRIPT
+    write_private(script, read_nofollow(Path(_SIDE.__file__).resolve(), 16 << 20))
     script_sha = sha256_file(script)
     write_private(inbox / 'packet.json', packet)
     write_private(inbox / 'prompt.txt', PROMPT.format(product=packet['product'], ticket=packet['ticket'], sha=packet['sha'],
@@ -1557,87 +1383,6 @@ def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None):
     finally:
         for fd in fds:
             os.close(fd)
-
-
-def qa_stage(args):
-    """QA side, hop 1 (runs as the QA user). Prints exactly one JSON record on stdout, before any model starts."""
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, 2)           # the hop joins stderr to the pipe; only the record may reach the producer
-    os.close(devnull)
-    os.umask(0o077)
-    try:
-        record = stage_outbox(args)
-    except Exception as error:
-        record = {'error': type(error).__name__}
-    sys.stdout.write(json.dumps(record) + '\n')
-    sys.stdout.flush()
-    return 0
-
-
-def stage_outbox(args):
-    inbox, outbox = Path(args.inbox), Path(args.outbox)
-    outbox.mkdir(mode=0o700)      # fails if anything already exists under this attempt name
-    for sub in ('out', 'tmp', 'home', 'cargo-target'):
-        (outbox / sub).mkdir(mode=0o700)
-    shutil.copytree(inbox / 'source', outbox / 'source', symlinks=True)
-    write_private(outbox / 'verdict.schema.json', VERDICT_SCHEMA)
-    if not shutil.which(args.codex_bin):
-        return {'codex_missing': True}
-    if not (real_codex_home() / 'auth.json').exists():
-        return {'login_missing': True}     # otherwise the probe would skip the login control, which the producer requires
-    home = prepare_codex_home(outbox, home=Path(args.codex_home))
-    record, _ = confinement_probe(args.codex_bin, outbox, isolated_env(outbox, home))
-    return {'confinement': record, 'profile_sha256': sha256_file(home / 'config.toml')}
-
-
-class QAStop(Exception):
-    def __init__(self, code):
-        super().__init__(code)
-        self.code = code
-
-
-def qa_exec(args):
-    """QA side, hop 2 (runs as the QA user). Only codex writes fd 1 (the producer's pipe); stderr goes to the outbox; the
-    prompt comes from the producer-owned inbox file. Exit: codex's code, 124 on timeout or alarm, 130 on a signal."""
-    inbox, outbox = Path(args.inbox), Path(args.outbox)
-    err = os.open(outbox / 'stderr.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    os.dup2(err, 2)
-    os.close(err)
-    os.umask(0o077)
-    proc = None
-
-    def stop(signum, frame):
-        raise QAStop(124 if signum == signal.SIGALRM else 130)
-    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGALRM):
-        signal.signal(sig, stop)
-    try:
-        try:
-            profile = sha256_file(Path(args.codex_home) / 'config.toml')
-        except OSError:
-            profile = None
-        if profile != args.profile_sha256:
-            sys.stderr.write('qa-exec: the permission profile changed since it was proved; codex not started\n')
-            return PROFILE_CHANGED
-        with open_regular(inbox / 'prompt.txt') as prompt:
-            try:
-                proc = subprocess.Popen(codex_argv(args.codex_bin, outbox), cwd=str(outbox / 'source'),
-                                        env=isolated_env(outbox, Path(args.codex_home)), stdin=prompt, start_new_session=True)
-            except OSError:
-                return 127
-        try:
-            code = proc.wait(timeout=args.timeout)
-        except subprocess.TimeoutExpired:
-            kill_group(proc)
-            return 124
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)   # stragglers in codex's own group
-        except OSError:
-            pass
-        return code if code >= 0 else 128 - code
-    except QAStop as stopped:
-        if proc is not None:
-            kill_group(proc)
-        return stopped.code
 
 
 def launchd_problems(domain, done):
@@ -2189,15 +1934,6 @@ def build_parser():
     r.add_argument('--admission-cmd', type=shlex.split, help=argparse.SUPPRESS)   # test hook (one quoted string)
     v = sub.add_parser('verdict')
     v.add_argument('--run-dir', required=True)
-    for name in ('qa-stage', 'qa-exec'):     # internal: run as the QA user by `run --qa-identity`, never by hand
-        q = sub.add_parser(name, help=argparse.SUPPRESS)
-        q.add_argument('--inbox', required=True)
-        q.add_argument('--outbox', required=True)
-        q.add_argument('--codex-home', required=True)
-        q.add_argument('--codex-bin', default='codex')
-        if name == 'qa-exec':
-            q.add_argument('--timeout', type=int, default=1800)
-            q.add_argument('--profile-sha256', required=True)
     return parser
 
 
@@ -2206,7 +1942,7 @@ def main(argv=None):
     try:
         if args.cmd == 'verdict':
             return evaluate(args.run_dir)
-        return {'prepare': prepare, 'run': run, 'qa-stage': qa_stage, 'qa-exec': qa_exec}[args.cmd](args)
+        return {'prepare': prepare, 'run': run}[args.cmd](args)
     except PacketInvalid as error:
         return packet_invalid(Path(args.run_dir).resolve(), error)
 

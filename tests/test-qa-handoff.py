@@ -5,6 +5,7 @@ The fake records its argv, environment names and prompt, writes the verdict name
 so the tests prove what the wrapper guarantees regardless of what a model says.
 """
 import argparse
+import ast
 import contextlib
 import importlib.util
 import sys
@@ -23,6 +24,7 @@ import unittest.mock
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts/qa-handoff.py"
+SIDE_SCRIPT = SCRIPT.parent / "qa-side.py"
 spec = importlib.util.spec_from_file_location("qa_handoff", SCRIPT)
 qa = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(qa)
@@ -1863,7 +1865,7 @@ class RuntimeFilesTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
-        for name in ("qa-handoff.py", "disk-admission.py", "qa-identity-setup.py"):
+        for name in ("qa-handoff.py", "disk-admission.py", "qa-identity-setup.py", "qa-side.py"):
             if name != skip:
                 shutil.copy(Path(qa.__file__).resolve().parent / name, root / name)
         return root
@@ -2525,9 +2527,25 @@ class IdentityTests(Base):
         self.assertEqual(self.run_ident(run_dir)[0], 0)
         inbox = self.inbox()
         self.assertFalse((inbox / "source").exists())
-        sha = qa.sha256_file(inbox / "qa-handoff.py")
-        self.assertEqual(sha, qa.sha256_file(SCRIPT))
+        sha = qa.sha256_file(inbox / "qa-side.py")          # SPE-153: only the QA-side module is handed over, not the producer
+        self.assertEqual(sha, qa.sha256_file(SIDE_SCRIPT))
         self.assertEqual(self.json(run_dir / "RUNMETA.json")["qa_identity"]["script_sha256"], sha)
+        self.assertFalse((inbox / "qa-handoff.py").exists())
+
+    def test_the_hops_run_the_copied_qa_side_module_with_the_same_argv_shape(self):
+        run_dir = self.prepare()
+        self.assertEqual(self.run_ident(run_dir, extra=("--timeout", "77"))[0], 0)
+        inbox, outbox = self.inbox(), self.outbox()
+        codex_home = self.qahome / ".local/state/coding-agent-environment/qa" / outbox.name / "codexhome"
+        calls = [json.loads(line) for line in (self.fake_dir / "sudo_calls.jsonl").read_text().splitlines()]
+        calls = [call for call in calls if "-u" in call]
+        tail = ["--inbox", str(inbox), "--outbox", str(outbox), "--codex-home", str(codex_home), "--codex-bin", str(self.fake)]
+        stage, execute = calls
+        at = stage.index("qa-stage")
+        self.assertEqual(stage[at - 2:], ["-I", str(inbox / "qa-side.py"), "qa-stage"] + tail)
+        profile = self.json(run_dir / "CONFINEMENT.json")["profile_sha256"]
+        at = execute.index("qa-exec")
+        self.assertEqual(execute[at - 2:], ["-I", str(inbox / "qa-side.py"), "qa-exec"] + tail + ["--timeout", "77", "--profile-sha256", profile])
 
     def test_a_seal_that_raises_never_passes(self):
         run_dir = self.prepare()
@@ -2546,6 +2564,42 @@ class IdentityTests(Base):
         self.assertEqual(code, 11, out)
         self.assertIn("exchange is not usable", out)
         self.assertFalse((self.fake_dir / "sudo_calls.jsonl").exists())
+
+
+class QASideModuleTests(unittest.TestCase):
+    """SPE-153: scripts/qa-side.py is the one file the attended hop copies into the inbox and runs as the QA user."""
+
+    def test_it_imports_only_the_standard_library_and_has_no_sudo_in_it(self):
+        text = SIDE_SCRIPT.read_text()
+        self.assertNotIn("sudo", text.lower())
+        modules = set()
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.Import):
+                modules.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                self.assertEqual(node.level, 0, "no relative import")
+                modules.add((node.module or "").split(".")[0])
+        self.assertTrue(modules)
+        self.assertEqual(modules - set(sys.stdlib_module_names), set())
+
+    def test_it_runs_alone_from_an_empty_directory_with_isolated_python(self):
+        with tempfile.TemporaryDirectory() as empty:
+            alone = Path(empty) / "qa-side.py"
+            shutil.copy(SIDE_SCRIPT, alone)
+            proc = subprocess.run([sys.executable, "-I", str(alone), "qa-stage"], capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 2)                          # argparse usage error: it imported and parsed
+            self.assertIn("--inbox", proc.stderr)
+
+    def test_the_producer_reuses_the_shared_pieces_of_the_same_module(self):
+        side = qa._SIDE
+        self.assertEqual(Path(side.__file__).resolve(), SIDE_SCRIPT.resolve())
+        for name in ("CONTROLS", "VERDICT_SCHEMA", "PROFILE", "PROFILE_CHANGED", "isolated_env", "codex_argv", "confinement_probe"):
+            self.assertIs(getattr(qa, name), getattr(side, name), name)
+
+    def test_the_producer_names_no_qa_side_entry_point_any_more(self):
+        self.assertFalse(hasattr(qa, "qa_stage") or hasattr(qa, "qa_exec"))
+        with self.assertRaises(SystemExit):
+            qa.main(["qa-stage", "--inbox", "a", "--outbox", "b", "--codex-home", "c"])
 
 
 if __name__ == "__main__":
