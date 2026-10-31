@@ -78,9 +78,9 @@ Cmnd_Alias CAE_QA_SEE   = /usr/bin/crontab -l, \
                           /bin/launchctl managername, \
                           /bin/launchctl print user/QAUID, \
                           /bin/launchctl print gui/QAUID, \
-                          /bin/launchctl print "^user/QAUID/[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}$"
+                          /bin/launchctl print "^user/QAUID/[A-Za-z0-9_][A-Za-z0-9_.-]*$"
 Cmnd_Alias CAE_QA_SIDE  = sha256:HELPERHEX /Library/cae-qa/qa-side version, \
-                          sha256:HELPERHEX /Library/cae-qa/qa-side "^(probe|stage|exec) [A-Za-z0-9][A-Za-z0-9._-]{0,150}$"
+                          sha256:HELPERHEX /Library/cae-qa/qa-side "^(probe|stage|exec) [A-Za-z0-9][A-Za-z0-9._-]*$"
 
 PRODUCER ALL = (QA) NOPASSWD: NOSETENV: CAE_QA_SWEEP, CAE_QA_SEE, CAE_QA_SIDE
 ```
@@ -96,7 +96,7 @@ The eight commands, numbered as the audit table refers to them (all as the QA us
 | 5 | `/bin/launchctl managername` |
 | 6 | `/bin/launchctl print user/<uid>` |
 | 7 | `/bin/launchctl print gui/<uid>` |
-| 8 | `/bin/launchctl print user/<uid>/<label>`, label matching `[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}` (the producer's own `SERVICE_LABEL_RE`) |
+| 8 | `/bin/launchctl print user/<uid>/<label>`, label matching `[A-Za-z0-9_][A-Za-z0-9_.-]*` in sudoers; the 200-character cap of the producer's `SERVICE_LABEL_RE` is enforced by the producer, not by sudoers |
 
 The helper is granted separately (`CAE_QA_SIDE`): its argv is also fixed, a verb from `{version, probe, stage, exec}` and, for the
 last three, an attempt id.
@@ -108,9 +108,17 @@ The digest check is racy: macOS has no `fexecve(2)`, so sudo verifies the file a
 helper lives where neither the producer nor Homebrew can write (below) and the producer verifies the path before every run;
 the digest is defence in depth, not the barrier.
 
+Sudoers regular expressions here contain no comma: a comma inside `{m,n}` is read as a list separator even in double quotes
+(`visudo` rejects it), so lengths are not limited in sudoers. The helper enforces the attempt-name cap (150 characters, validation
+item 2), and the producer enforces the service-label cap (200). Sudoers still lets a name contain dots, which is harmless: the
+helper rejects `..` and paths are never built from argv.
+
+Validation note (2026-10-31): the exact drop-in above, rendered with a throwaway user `qauser`, uid 599, producer `bryant` and a
+placeholder 64-hex digest, was run through `/usr/sbin/visudo -c -f <file>` unprivileged (sudo 1.9.17p2, macOS) and reported
+`parsed OK`. This proves syntax only, not behaviour under a real `sudo`.
+
 Two things in this text are **not verified until the installer runs on the real host**: regular-expression arguments need
-sudo 1.9.10 or newer (the installer checks `sudo -V`), and the exact quoting of the two regex lines is checked only by `visudo`
-on that machine. If the host's sudo is older, the per-label `launchctl print` moves into a helper verb and this ADR is amended
+sudo 1.9.10 or newer (the installer checks `sudo -V`), and the rendered file for the real host is checked by `visudo` on that machine. If the host's sudo is older, the per-label `launchctl print` moves into a helper verb and this ADR is amended
 first; no wildcard (`*`) is ever substituted, because sudoers wildcards also match spaces and slashes.
 
 ### Pinned helper
@@ -194,7 +202,8 @@ Must pass (each run as the producer, non-interactively):
 - `sudo -n -u QA` of each of the eight commands exits with the command's own status and no "password is required" message;
 - `qa-side version` prints the digest of the installed file and the pinned Codex digest, both equal to what the installer recorded;
 - the ownership and mode of every path in the table above, and the root-owned chain, are as specified;
-- `sudo -V` is 1.9.10 or newer.
+- `sudo -V` is 1.9.10 or newer;
+- `visudo -c -f` on the exact rendered text reports `parsed OK` (a test of the installer, run before the file is installed).
 
 Must be refused (non-zero with a sudo refusal, nothing executed): `sudo -n -u QA -g wheel ...`; `-u '#0'`; `-u '#<QA uid>'`
 (numeric spellings); `-u ALL`; `-i`; `-s`; `sudo -l`; the helper invoked by a relative path, through a symlink or after a
@@ -250,7 +259,7 @@ detect, not prevent, its replacement.
   QA quota.
 - **Sudoers syntax is a lockout risk.** A bad file can break sudo for administrators. Mitigated by `visudo -c -f` first, installing
   last, `visudo -c` after, an open administrator Terminal, and one-step rollback.
-- **Regex arguments and exit codes are unverified.** sudoers regex quoting and the exit status of `kill -KILL -1` with no QA
+- **Regex arguments and exit codes are unverified.** sudoers regex matching (syntax parses, matching is untested) and the exit status of `kill -KILL -1` with no QA
   process are observed at install time, not assumed here.
 - **Codex pin staleness.** A Codex update on the producer does not reach the QA run until the owner reinstalls; the run fails
   closed (digest mismatch) rather than running an unpinned binary.
@@ -273,7 +282,7 @@ installed mode is not offered.
 | 0 | this ADR and the `docs/QA-HANDOFF.md` corrections (docs only) | none |
 | 1 | move the QA-side code into a self-contained `scripts/qa-side.py`; the attended mode copies and runs it with identical behaviour | none |
 | 2 | helper verbs and `request.json` validation in `qa-side.py`, **an allowlist environment builder for the helper (HOME from `pwd.getpwuid`, fixed PATH, no caller environment, `CODEX_HOME` ignored) with tests that poison `PATH`, `HOME`, `CODEX_HOME`, `LANG`, `TERM`, `SHELL`**, and the installed-mode producer path in `qa-handoff.py`, tested against a fake sudo | none (offline tests) |
-| 3 | owner-run installer with `--plan`, `--check`, `--rollback`, the sudoers text generator (digest pin) and the install-time controls; the producer-side pre-run `lstat` verification of the helper path | writes root files only when the owner runs it with sudo |
+| 3 | owner-run installer with `--plan`, `--check`, `--rollback`, the sudoers text generator (digest pin) and the install-time controls, including a test that `visudo -c -f` parses the exact rendered text; the producer-side pre-run `lstat` verification of the helper path | writes root files only when the owner runs it with sudo |
 | 4 | runbook, then a pilot unattended run after the owner installs | owner install |
 
 The current Fornax candidate QA stays on the attended path: its bundle and run directory are not touched, and attended
