@@ -515,7 +515,7 @@ class EnvironmentTests(InstalledCase):
         seen = {}
         with self.poisoned(), \
                 mock.patch.object(side, "detach", side_effect=lambda n, keep=(): seen.setdefault("alarm", n)), \
-                mock.patch.object(side, "qa_stage", side_effect=lambda ns, build, copy: seen.update(ns=ns, env=build(), copy=copy, environ=dict(os.environ)) or 0), \
+                mock.patch.object(side, "qa_stage", side_effect=lambda ns, build, copy, payload=None: seen.update(ns=ns, env=build(), copy=copy, environ=dict(os.environ)) or 0), \
                 mock.patch.object(side, "qa_exec", side_effect=lambda ns, build, prompt: seen.update(ns=ns, env=build(), prompt=prompt, environ=dict(os.environ)) or 0), \
                 mock.patch("os.execve", side_effect=lambda *a: seen.update(execve=a) or (_ for _ in ()).throw(SystemExit(0))), \
                 mock.patch("os.dup2"):
@@ -813,7 +813,7 @@ class DescriptorRelativeTests(InstalledCase):
         """Like EnvironmentTests.run_action, but the recorders use the callables before the descriptors are closed."""
         seen = {}
 
-        def stage(ns, build, copy):
+        def stage(ns, build, copy, payload=None):
             copy(Path(t.base) / "staged")
             seen["copy_result"] = (t.base / "staged" / "a.txt").read_text()
             return 0

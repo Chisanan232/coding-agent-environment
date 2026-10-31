@@ -488,6 +488,110 @@ class LowFindingsTests(RunBase):
         self.assertIn("run `sudo -v` in the owner Terminal", note["note"])
 
 
+class UnattendedPayloadTests(RunBase):
+    """The payload rides on the existing stage verb and request.json: no new verb, no new key, the same fixed sudo argv."""
+
+    def setUp(self):
+        super().setUp()
+        import hashlib
+        src = self.run_dir / "payload-src"
+        (src / "bin").mkdir(parents=True)
+        tool = b"#!/bin/sh\necho ok\n"
+        (src / "bin/tool").write_bytes(tool)
+        os.chmod(src / "bin/tool", 0o755)
+        self.tool_out = hashlib.sha256(b"ok\n").hexdigest()
+        manifest = {"schema": "cae-qa-payload/1", "scope": "offline", "producer_run": [],
+                    "files": [{"path": "bin/tool", "sha256": hashlib.sha256(tool).hexdigest(), "size": len(tool), "kind": "exec"}],
+                    "selftests": [{"id": "t", "argv": ["bin/tool"], "stdin": None, "expect_exit": 0, "expect_stdout_sha256": self.tool_out,
+                                   "timeout_s": 30, "max_output_bytes": 100}]}
+        raw = json.dumps(manifest).encode()
+        (src / "MANIFEST.json").write_bytes(raw)
+        fd = os.open(src, os.O_RDONLY | os.O_DIRECTORY)
+        SIDE.copy_payload(fd, str(self.run_dir / "payload"), SIDE.parse_manifest(raw), raw, SIDE.INBOX_MODES)
+        os.close(fd)
+        self.payload = qa.PayloadRun(SIDE.parse_manifest(raw), raw)
+        self.packet["payload"] = {"schema": "cae-qa-payload/1", "manifest_sha256": self.payload.sha, "files": 1, "bytes": len(tool),
+                                  "selftests": ["t"], "scope": "offline", "producer_run": []}
+        self.observed = {}
+
+    def run_payload(self, **over):
+        controls = SIDE.controls_for(self.payload.manifest)
+        self.stage_record = {"confinement": {"controls": [{"control": n, "observed": "ALLOWED" if e == "ALLOWED" else "DENIED:1"}
+                                                           for n, _, e in controls]},
+                             "profile_sha256": self.profile, "payload": {"manifest_sha256": self.payload.sha, "staged": True, "problems": []},
+                             "selftests": [{"id": "t", "exit": 0, "timed_out": False, "unrunnable": False, "stdout_bytes": 3,
+                                            "stdout_sha256": self.tool_out, "stderr_bytes": 0, "stderr_sha256": "0" * 64, "elapsed": 0.1}]}
+        self.stage_record.update(over)
+        original = self.hop
+
+        def hop(ident, verb, attempt, seconds):
+            if verb == "stage":
+                (inbox,) = [p for p in (self.exchange / "inbox").iterdir() if p.is_dir()]
+                self.observed.update(seconds=seconds, payload_files=sorted(str(p.relative_to(inbox / "payload")) for p in (inbox / "payload").rglob("*")),
+                                     request=json.loads((inbox / "request.json").read_text()), mode=stat.S_IMODE((inbox / "payload/bin/tool").stat().st_mode))
+            return original(ident, verb, attempt, seconds)
+        return self.go(helper_hop=unittest.mock.patch.object(qa, "helper_hop", side_effect=hop), payload=self.payload)
+
+    def go(self, payload=None, **over):
+        mocks = self.patches(**over)
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                code = qa.run_identity_locked(self.args, self.run_dir, self.packet, self.source, self.ident, qa.NoKeepalive(), payload)
+        finally:
+            self.stack.close()
+        return code, out.getvalue(), mocks
+
+    def test_payload_is_staged_into_the_inbox_and_the_stage_budget_covers_the_self_tests(self):
+        code, out, mocks = self.run_payload()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.observed["request"], {"verb": "stage", "attempt": self.calls[1][1]})      # request.json is unchanged
+        self.assertEqual(self.observed["payload_files"], ["MANIFEST.json", "bin", "bin/tool"])
+        self.assertEqual(self.observed["mode"], 0o500)                                                   # owner-only in the inbox
+        self.assertGreaterEqual(self.observed["seconds"], qa.STAGE_SECONDS + SIDE.payload_stage_seconds(self.payload.manifest))
+        self.assertEqual([v for v, _ in self.calls], ["version", "stage"])
+        self.assertTrue(json.loads((self.run_dir / "SELFTEST.json").read_text())["passed"])
+        self.assertEqual(mocks["launch"].call_count, 1)
+        (attempt,) = [p for p in (self.exchange / "inbox").iterdir() if p.is_dir()]
+        self.assertFalse((attempt / "payload").exists())
+
+    def test_the_sudo_argv_set_is_the_same_with_a_payload(self):
+        self.run_payload()
+        self.assertEqual({v for v, _ in self.calls}, {"version", "stage"})
+        self.assertEqual(set(SIDE.ALLOWED_ARGV), {"version", "probe", "stage", "exec"})
+        self.assertEqual(SIDE.REQUEST_KEYS["stage"], {"verb": str, "attempt": str})
+
+    def test_a_failed_self_test_never_reaches_the_exec_hop(self):
+        bad = [{"id": "t", "exit": 1, "timed_out": False, "unrunnable": False, "stdout_bytes": 3, "stdout_sha256": self.tool_out,
+                "stderr_bytes": 0, "stderr_sha256": "0" * 64, "elapsed": 0.1}]
+        code, out, mocks = self.run_payload(selftests=bad)
+        self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"])
+        self.assertIn("self-test t exited 1, expected 0", out)
+        mocks["launch"].assert_not_called()
+        self.assertNotIn("exec", [v for v, _ in self.calls])
+        self.assertFalse(os.path.lexists(self.run_dir / "LAUNCHED"))
+
+    def test_a_qa_side_that_omits_a_payload_control_cannot_make_it_optional(self):
+        controls = [c for c in SIDE.controls_for(self.payload.manifest) if c[0] != "pos_exec_payload"]
+        record = {"confinement": {"controls": [{"control": n, "observed": "ALLOWED" if e == "ALLOWED" else "DENIED:1"} for n, _, e in controls]}}
+        code, out, mocks = self.run_payload(confinement=record["confinement"])
+        self.assertEqual(code, qa.EXIT["QA_INVALID"])
+        self.assertIn("pos_exec_payload", out)
+        mocks["launch"].assert_not_called()
+
+    def test_staging_problems_stop_the_run_with_their_reasons(self):
+        code, out, mocks = self.run_payload(payload={"manifest_sha256": self.payload.sha, "staged": False, "problems": ["vectors/a.json does not match"]},
+                                            selftests=None)
+        self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"])
+        self.assertIn("payload staging failed: vectors/a.json", out)
+        mocks["launch"].assert_not_called()
+        for leftover in (self.exchange / "inbox").iterdir():
+            shutil.rmtree(leftover, ignore_errors=True)
+        self.calls.clear()
+        code, out, mocks = self.run_payload(payload={"manifest_sha256": "9" * 64, "staged": True, "problems": []})
+        self.assertEqual(code, qa.EXIT["QA_INVALID"])
+
+
 class AttendedUnchangedTests(Case):
     def test_attended_mode_json_and_keepalive_are_untouched(self):
         text = SCRIPT.read_text()

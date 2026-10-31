@@ -136,6 +136,16 @@ QA NOTES (scope, allowed commands, how to run things):
 Out directory for any evidence files: {out}
 """
 
+PAYLOAD_PROMPT = """
+PAYLOAD (built by the producer; read-only and executable, mounted into your sandbox):
+  Path: {path}
+  Manifest SHA-256: {digest} ({files} files). The wrapper verified every file against the manifest before you started and ran the
+  producer's self-tests ({tests}) under your sandbox profile; a failed self-test would have stopped this run before you began.
+  Producer scope statement: {scope}
+  {producer_run}
+  {probe_scope}
+"""
+
 
 def now():
     return datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
@@ -370,6 +380,26 @@ def read_optional(path):
 NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 
 
+def read_payload_source(directory):
+    """The producer's payload directory, opened and fully verified against its MANIFEST.json before anything is created: a dict with
+    the open descriptor, the parsed manifest and its raw bytes. Any broken rule is a refusal that names it."""
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise SystemExit('refusing: --payload must be a directory (not a link) you own')
+    try:
+        raw = _SIDE.read_manifest_at(fd, os.getuid())
+        manifest = _SIDE.parse_manifest(raw)
+        problems = _SIDE.verify_tree(fd, manifest, raw, os.getuid())
+    except _SIDE.PayloadError as error:
+        os.close(fd)
+        raise SystemExit('refusing: payload: %s' % error)
+    if problems:
+        os.close(fd)
+        raise SystemExit('refusing: payload does not match its manifest: ' + '; '.join(problems[:5]))
+    return {'fd': fd, 'manifest': manifest, 'raw': raw}
+
+
 def prepare(args):
     for label, value in (('product', args.product), ('ticket', args.ticket)):
         if not NAME.fullmatch(value) or '..' in value:
@@ -378,6 +408,7 @@ def prepare(args):
         raise SystemExit('refusing: --sha must not start with -')
     # Read every input before anything is created, so a bad input leaves no half-made run directory behind.
     criteria, producer, notes = read_small(args.criteria), read_optional(args.producer_evidence), read_optional(args.qa_notes)
+    payload = read_payload_source(args.payload) if getattr(args, 'payload', None) else None
     repo = Path(args.repo).resolve()
     sha = git(repo, 'rev-parse', '--verify', '--end-of-options', args.sha + '^{commit}').stdout.strip()
     if not re.fullmatch(r'[0-9a-f]{40,64}', sha):
@@ -402,6 +433,21 @@ def prepare(args):
     packet = {'schema': 1, 'product': args.product, 'ticket': args.ticket, 'repo': str(repo), 'sha': sha,
               'created': now(), 'criteria': criteria,
               'producer_evidence': producer, 'qa_notes': notes}
+    if payload is not None:
+        # Copied into the run directory (producer-private, immutable from here: run re-verifies it) and bound by the packet digest.
+        try:
+            _SIDE.copy_payload(payload['fd'], str(run_dir / 'payload'), payload['manifest'], payload['raw'], _SIDE.INBOX_MODES)
+        except (_SIDE.PayloadError, OSError) as error:
+            shutil.rmtree(run_dir, ignore_errors=True)         # no half-made attempt is left behind
+            raise SystemExit('refusing: payload could not be copied (%s); the new run directory was removed' % (
+                error if isinstance(error, _SIDE.PayloadError) else type(error).__name__))
+        finally:
+            os.close(payload['fd'])
+        manifest = payload['manifest']
+        packet['payload'] = {'schema': _SIDE.PAYLOAD_SCHEMA, 'manifest_sha256': _SIDE.manifest_sha256(payload['raw']),
+                             'files': len(manifest['files']), 'bytes': sum(f['size'] for f in manifest['files']),
+                             'selftests': [t['id'] for t in manifest['selftests']], 'scope': manifest['scope'],
+                             'producer_run': list(manifest['producer_run'])}
     packet['digest'] = packet_digest(packet)
     write_private(run_dir / 'packet.json', packet)
     print(run_dir)
@@ -544,6 +590,16 @@ def runtime_problems(identity, admission_cmd=False):
     return problems
 
 
+def packet_payload_digest(run_dir):
+    """The payload manifest digest named by packet.json, read tolerantly (a bad packet is reported later by load_packet)."""
+    try:
+        info = read_run_json(Path(run_dir) / 'packet.json').get('payload')
+        digest = info.get('manifest_sha256') if isinstance(info, dict) else None
+    except LOAD_ERRORS:
+        return None
+    return digest if isinstance(digest, str) else None
+
+
 def run(args):
     run_dir = Path(args.run_dir).resolve()
     # Usage refusals first: nothing is read, written or started for a flag combination that cannot be honoured.
@@ -555,6 +611,8 @@ def run(args):
         return refuse('--require-env-isolation needs --qa-identity: a same-user run cannot isolate process environments')
     if getattr(args, 'exchange', None) and not name:
         return refuse('--exchange needs --qa-identity')
+    if getattr(args, 'no_model', False) and not name:
+        return refuse('--no-model needs --qa-identity: the self-test gate runs as the QA user under the real profile')
     unattended = bool(getattr(args, 'unattended', False))
     if unattended and not name:
         return refuse('--unattended needs --qa-identity: the delegation only exists for a dedicated QA user')
@@ -580,6 +638,11 @@ def run(args):
             'require_env_isolation': bool(getattr(args, 'require_env_isolation', False))}
     if unattended:
         mode['unattended'] = True       # added only then, so an attended run's MODE.json is byte-for-byte what it was
+    if getattr(args, 'no_model', False):
+        mode['no_model'] = True         # a no-model attempt can never be continued with a model, nor the reverse
+    payload_sha = packet_payload_digest(run_dir)
+    if payload_sha:
+        mode['payload'] = payload_sha
     if os.path.lexists(run_dir / 'MODE.json') and run_mode(run_dir) != mode:
         return refuse('this run directory was attempted in another mode (%s); prepare a new attempt'
                       % json.dumps(run_mode(run_dir), sort_keys=True))
@@ -590,6 +653,8 @@ def run(args):
             return refuse('--read-root must be an existing absolute directory that is not HOME, / or a credential directory')
         read_roots.append(root)
     packet = load_packet(run_dir)
+    if packet.get('payload') is not None and ident is None:
+        return refuse('this run directory carries a payload; payload runs need --qa-identity (the self-tests run as the QA user)')
     if run_dir.is_dir():
         write_private(run_dir / 'MODE.json', mode)    # one mode per run directory; recorded in RESULT.json too
     source = run_dir / 'source'
@@ -1237,12 +1302,12 @@ def hop(ident, argv, seconds):
     return done.stdout, None
 
 
-def parse_confinement(record):
+def parse_confinement(record, manifest=None):
     """(established, could_not_check, controls, problems) re-derived by the producer from the QA-side probe record: every
     control of CONTROLS must be present exactly once, the login control included (the QA side reports a missing login
     before probing, and codex cannot run without one, so it is never exempt), and each one's result is
     recomputed from what was observed, never taken from the QA side's own `ok` or `established`."""
-    expected = {name: expect for name, _, expect in CONTROLS}
+    expected = {name: expect for name, _, expect in _SIDE.controls_for(manifest)}
     rows = record.get('controls') if isinstance(record, dict) else None
     if not isinstance(rows, list) or not all(isinstance(c, dict) for c in rows):
         return False, False, [], ['confinement record is malformed']
@@ -1268,6 +1333,54 @@ def parse_confinement(record):
     return not problems, could_not_check, controls, problems
 
 
+class PayloadRun:
+    """The producer's own, re-verified view of the payload for this run: its manifest, raw bytes and digest."""
+
+    def __init__(self, manifest, raw):
+        self.manifest, self.raw, self.sha = manifest, raw, _SIDE.manifest_sha256(raw)
+
+
+def producer_payload(run_dir, packet):
+    """(PayloadRun or None, problems): the payload `prepare` copied into the run directory, verified again now against the manifest
+    and the digest the packet carries."""
+    info = packet.get('payload')
+    if info is None:
+        return None, []
+    try:
+        fd = os.open(run_dir / 'payload', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None, ['payload directory is missing or a link']
+    try:
+        raw = _SIDE.read_manifest_at(fd, os.getuid())
+        if not isinstance(info, dict) or _SIDE.manifest_sha256(raw) != info.get('manifest_sha256'):
+            return None, ['MANIFEST.json is not the one the packet names']
+        manifest = _SIDE.parse_manifest(raw)
+        problems = _SIDE.verify_tree(fd, manifest, raw, os.getuid())
+    except _SIDE.PayloadError as error:
+        return None, [str(error)]
+    finally:
+        os.close(fd)
+    return (None, problems) if problems else (PayloadRun(manifest, raw), [])
+
+
+def payload_result(packet, selftests=None, sealed=None):
+    """The `payload` block of RESULT.json: what the producer claimed and what was and was not independently established."""
+    info = packet['payload']
+    block = {'manifest_sha256': info['manifest_sha256'], 'scope': info['scope'], 'scope_statement': _SIDE.PROBE_SCOPE,
+             'producer_run': ['PRODUCER-RUN: %s' % clean(path, 200) for path in info['producer_run']]}
+    if selftests is not None:
+        block['selftests'] = selftests
+    if sealed is not None:
+        block['sealed'] = sealed
+    return block
+
+
+def selftest_summary(verdicts):
+    return {'ran': len(verdicts), 'passed': sum(1 for v in verdicts if v['ok']),
+            'tests': [{'id': v['id'], 'ok': v['ok'], 'exit': v['exit'], 'stdout_sha256': v['stdout_sha256'],
+                       'stderr_sha256': v['stderr_sha256'], 'reasons': [clean(r, 80) for r in v['reasons']]} for v in verdicts]}
+
+
 def run_identity(args, run_dir, packet, source, ident):
     """The run as the dedicated QA user. One run per identity at a time (X/inbox/RUN.lock): the sweep kills every process
     of that user, so a second concurrent run would be killed by the first."""
@@ -1288,6 +1401,10 @@ def run_identity(args, run_dir, packet, source, ident):
     if problems:
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['exchange is not usable: ' + '; '.join(problems[:3]),
                                                                'codex was not started'])
+    payload, payload_problems = producer_payload(run_dir, packet)
+    if payload_problems:
+        return write_result(run_dir, packet, 'QA_INVALID', ['the payload no longer matches its manifest: ' + '; '.join(payload_problems[:3]),
+                                                            'nothing was handed to the QA user'])
     lock = ident.exchange / 'inbox/RUN.lock'
 
     def interrupted(signum, frame):
@@ -1317,7 +1434,7 @@ def run_identity(args, run_dir, packet, source, ident):
             pass
         for sig in guarded:
             signal.signal(sig, signal.default_int_handler if sig == signal.SIGINT else interrupted)
-        outcome = run_identity_locked(args, run_dir, packet, source, ident, keepalive)
+        outcome = run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload)
     finally:
         for sig in guarded:
             signal.signal(sig, signal.SIG_IGN)
@@ -1327,7 +1444,7 @@ def run_identity(args, run_dir, packet, source, ident):
                     unclean = cleanup_sweep(run_dir, ident, keepalive)   # whatever happened, no QA-user process outlives the run
                 except Exception:   # cleanup_sweep itself failed (disk, pipe): the QA user is not confirmed idle either
                     unclean = True
-                downgraded = unclean and outcome == EXIT['QA_PASS']
+                downgraded = unclean and (outcome == EXIT['QA_PASS'] or bool(getattr(args, 'no_model', False)))
                 try:
                     os.unlink(lock)
                 except OSError:
@@ -1375,7 +1492,7 @@ def cleanup_sweep(run_dir, ident, keepalive):
         result = read_run_json(run_dir / 'RESULT.json')
         if isinstance(result, dict):
             result['cleanup'] = note
-            if result.get('state') == 'QA_PASS':
+            if result.get('state') == 'QA_PASS' or result.get('no_model') is True:
                 result['state'] = 'QA_INVALID'
                 result['reasons'] = [clean('final cleanup sweep %s: QA-user processes may still be running, so a pass is not clean'
                                            % ('could not run' if swept is None else 'left %s' % swept))] + list(result.get('reasons') or [])
@@ -1385,9 +1502,9 @@ def cleanup_sweep(run_dir, ident, keepalive):
     return True
 
 
-def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
+def run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload=None):
     qis = _qis()
-    for stale in ('verdict.json', 'ISOLATION.json', 'CONFINEMENT.json'):   # never paired with this attempt
+    for stale in ('verdict.json', 'ISOLATION.json', 'CONFINEMENT.json', 'SELFTEST.json'):   # never paired with this attempt
         try:
             os.unlink(run_dir / stale)
         except FileNotFoundError:
@@ -1465,20 +1582,37 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
     # the very bytes written above (or the verified install), not a second read of a file
     script_sha = helper['helper_sha256'] if unattended else hashlib.sha256(SIDE_BYTES).hexdigest()
     write_private(inbox / 'packet.json', packet)
-    write_private(inbox / 'prompt.txt', PROMPT.format(product=packet['product'], ticket=packet['ticket'], sha=packet['sha'],
-                                                      criteria=packet['criteria'], producer=packet['producer_evidence'],
-                                                      notes=packet['qa_notes'], out=outbox / 'out'))
+    prompt = PROMPT.format(product=packet['product'], ticket=packet['ticket'], sha=packet['sha'], criteria=packet['criteria'],
+                           producer=packet['producer_evidence'], notes=packet['qa_notes'], out=outbox / 'out')
+    if payload is not None:
+        info = packet['payload']
+        prompt += PAYLOAD_PROMPT.format(
+            path=outbox / 'payload', digest=payload.sha, files=info['files'], scope=info['scope'],
+            tests=', '.join(info['selftests']) or 'none listed',
+            producer_run=('PRODUCER-RUN evidence (not independently reproduced): ' + ', '.join(info['producer_run'])) if info['producer_run']
+            else 'The producer listed no PRODUCER-RUN evidence files.', probe_scope=_SIDE.PROBE_SCOPE)
+    write_private(inbox / 'prompt.txt', prompt)
     shutil.copytree(source, inbox / 'source', symlinks=True)
+    stage_seconds = STAGE_SECONDS
+    if payload is not None:
+        # The producer's private copy was verified at the start of the run; the inbox copy is made from it, hash-checked as it is copied.
+        run_fd = os.open(run_dir / 'payload', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            _SIDE.copy_payload(run_fd, str(inbox / 'payload'), payload.manifest, payload.raw, _SIDE.INBOX_MODES)
+        finally:
+            os.close(run_fd)
+        stage_seconds += _SIDE.payload_stage_seconds(payload.manifest) + 60 * len(_SIDE.PAYLOAD_CONTROLS)
     tail = ['--inbox', str(inbox), '--outbox', str(outbox), '--codex-home', str(codex_home), '--codex-bin', args.codex_bin]
     # Hop 1: the QA side creates the outbox, its clone and its private Codex home, and proves read confinement there.
     try:
         if unattended:
             write_request(inbox, {'verb': 'stage', 'attempt': attempt})
-            out, problem = helper_hop(ident, 'stage', attempt, STAGE_SECONDS)
+            out, problem = helper_hop(ident, 'stage', attempt, stage_seconds)
         else:
-            out, problem = hop(ident, [qis.PY, '-I', str(script), 'qa-stage'] + tail, STAGE_SECONDS)
+            out, problem = hop(ident, [qis.PY, '-I', str(script), 'qa-stage'] + tail, stage_seconds)
     finally:
         shutil.rmtree(inbox / 'source', ignore_errors=True)   # the QA side has its own copy now
+        shutil.rmtree(inbox / 'payload', ignore_errors=True)
     if problem:
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['qa-stage %s; codex was not started' % problem])
     lines = [line for line in out.splitlines() if line.strip()]
@@ -1496,7 +1630,20 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['codex could not be started on the QA side (FileNotFoundError)'])
     if 'error' in stage:
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['qa-stage failed (%s); codex was not started' % clean(stage['error'], 40)])
-    established, could_not_check, controls, problems = parse_confinement(stage.get('confinement'))
+    if payload is not None:
+        staged = stage.get('payload')
+        if not isinstance(staged, dict):
+            return write_result(run_dir, packet, 'QA_INVALID', ['qa-stage did not report on the payload it was given'],
+                                {'payload': payload_result(packet)})
+        if staged.get('manifest_sha256') not in (None, payload.sha):
+            return write_result(run_dir, packet, 'QA_INVALID', ['qa-stage staged a payload manifest other than the one it was handed'],
+                                {'payload': payload_result(packet)})
+        if staged.get('staged') is not True:
+            reasons = [clean(p, 120) for p in (staged.get('problems') if isinstance(staged.get('problems'), list) else [])[:3]]
+            write_private(run_dir / 'SELFTEST.json', {'manifest_sha256': payload.sha, 'passed': False, 'staged': False, 'problems': reasons})
+            return write_result(run_dir, packet, 'QA_INCOMPLETE', ['payload staging failed: ' + '; '.join(reasons or ['no reason given']),
+                                                                   'codex was not started'], {'payload': payload_result(packet)})
+    established, could_not_check, controls, problems = parse_confinement(stage.get('confinement'), payload.manifest if payload else None)
     profile_sha = stage.get('profile_sha256')
     if not (isinstance(profile_sha, str) and re.fullmatch(r'[0-9a-f]{64}', profile_sha)):
         established, could_not_check = False, False
@@ -1508,30 +1655,75 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['read confinement could not be checked: ' + '; '.join(problems[:3])])
     if not established:
         return write_result(run_dir, packet, 'QA_INVALID', ['read confinement not established: ' + '; '.join(problems[:3])])
+    selftest = None
+    if payload is not None:
+        # The model-free gate: re-derived here from the manifest, never from what the QA side calls ok. A failure leaves the evidence
+        # (SELFTEST.json), writes no LAUNCHED record and never reaches the hop that starts Codex.
+        verdicts, first = _SIDE.derive_selftest_verdicts(payload.manifest, stage.get('selftests'))
+        selftest = selftest_summary(verdicts)
+        write_private(run_dir / 'SELFTEST.json', {'manifest_sha256': payload.sha, 'scope': packet['payload']['scope'], 'passed': first is None,
+                                                  'staged': True, 'tests': verdicts, 'qa_identity': ident.name})
+        if first is not None:
+            return write_result(run_dir, packet, 'QA_INCOMPLETE', [first + '; codex was not started'],
+                                {'payload': payload_result(packet, selftest)})
+    if payload is not None:
+        # Payload code has run as the QA user. Its processes were killed by group, but one that left its session would still hold the
+        # write roots while Codex runs: sweep first, and start nothing unless the QA user is confirmed idle.
+        left = sweep_identity(ident)
+        if left is None or left:
+            reason = ('could not sweep the QA user after the payload code ran' if left is None
+                      else '%d QA-user processes remain after the payload code ran' % left)
+            write_private(run_dir / 'SELFTEST.json', dict(read_run_json(run_dir / 'SELFTEST.json'), post_run_sweep=left))
+            return write_result(run_dir, packet, 'QA_INCOMPLETE', [reason + '; codex was not started'],
+                                {'payload': payload_result(packet, selftest)})
     # Hop 2: codex itself. Its stdout is the pipe the producer captures; the QA side has moved its own stderr to a file.
     alarm = args.timeout + 60
     # qa-exec refuses to start codex unless the profile is byte-for-byte the one hop 1 proved (exit PROFILE_CHANGED).
-    if unattended:
-        write_request(inbox, {'verb': 'exec', 'attempt': attempt, 'timeout': args.timeout, 'profile_sha256': profile_sha})
-        argv = helper_argv(ident, 'exec', attempt)
-    else:
-        argv = qis.qa_argv(ident.name, ident.home, [qis.PY, '-I', str(script), 'qa-exec'] + tail
-                           + ['--timeout', str(args.timeout), '--profile-sha256', profile_sha], alarm=alarm)
+    no_model = bool(getattr(args, 'no_model', False))
+    if not no_model:
+        if unattended:
+            write_request(inbox, {'verb': 'exec', 'attempt': attempt, 'timeout': args.timeout, 'profile_sha256': profile_sha})
+            argv = helper_argv(ident, 'exec', attempt)
+        else:
+            argv = qis.qa_argv(ident.name, ident.home, [qis.PY, '-I', str(script), 'qa-exec'] + tail
+                               + ['--timeout', str(args.timeout), '--profile-sha256', profile_sha], alarm=alarm)
     manifest = read_run_json(run_dir / 'tree-manifest.json')
     info = {'name': ident.name, 'uid': ident.uid, 'exchange': str(ident.exchange), 'attempt': attempt, 'script_sha256': script_sha,
             'require_env_isolation': bool(getattr(args, 'require_env_isolation', False)), 'profile_sha256': profile_sha}
     if unattended:
         info.update({'mode': 'unattended', 'helper_path': helper['helper_path'], 'helper_sha256': helper['helper_sha256'],
                      'codex_path': helper['codex_path'], 'codex_sha256': helper['codex_sha256']})
+    if payload is not None:
+        info['payload'] = {'manifest_sha256': payload.sha}
+    seal_extra = {'payload': payload} if payload is not None else {}
+    if no_model:
+        # Stop here: no hop starts Codex, no LAUNCHED record exists, and the run is sealed and swept like any other.
+        info['no_model'] = True
+        return finish_no_model(run_dir, packet, ident, outbox, manifest, info, keepalive, seal_extra)
     # Same session as hops 0 and 1 (new_session=False): sudo -n only sees the owner's cached credential from the
     # terminal session it was typed in. The QA side detaches itself (DETACH: setsid as the QA user).
     # Unattended mode has no credential, but keeps this session and the child-signalling stop on purpose: process ownership
     # and kill semantics stay exactly the attended ones, and the helper detaches itself (setsid as the QA user).
     return launch(args, run_dir, argv, dict(HOP_ENV), '/', None, timeout=alarm + 60, new_session=False,
-                  seal=lambda proc: seal(run_dir, ident, outbox, manifest, info, proc, keepalive))
+                  seal=lambda proc: seal(run_dir, ident, outbox, manifest, info, proc, keepalive, **seal_extra))
 
 
-def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None):
+class NoProcess:
+    """Stands in for the Codex hop in a --no-model run: nothing ran, so there is no exit status."""
+    returncode = None
+
+
+def finish_no_model(run_dir, packet, ident, outbox, manifest, info, keepalive, seal_extra):
+    """Seal, record and evaluate a run that stopped before the model. RUNMETA carries `no_model` and no event stream, so the verdict
+    path can never turn it into a pass, now or when `verdict` is run later."""
+    extra = seal(run_dir, ident, outbox, manifest, info, NoProcess(), keepalive, **seal_extra)
+    meta = {'no_model': True, 'argv': None, 'exit_code': None, 'generated': now()}
+    meta.update(extra)
+    write_private(run_dir / 'RUNMETA.json', meta)
+    return evaluate(run_dir)
+
+
+def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None, payload=None):
     """Freeze what the QA user produced into producer-owned values, so `verdict` never reads the outbox again: sweep the
     QA user's processes first, open every outbox directory once without following links and check its owner, read the
     verdict relative to the opened outbox, compare the QA clone with the manifest once, then confirm that every path
@@ -1562,6 +1754,8 @@ def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None):
         if why:
             extra['tree_problems'] = ['the outbox is not a plain QA-owned directory: ' + why[0]]
             extra['verdict_sha256'] = 'UNREADABLE'
+            if payload is not None:
+                extra['payload'] = {'manifest_sha256': payload.sha, 'verified': False, 'problems': ['the outbox could not be opened']}
             return extra
         try:
             data = read_sealed(fds[2], 'verdict.json', ident.uid)
@@ -1569,6 +1763,8 @@ def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None):
                 write_private(run_dir / 'verdict.json', data)
         except OSError:
             extra['verdict_sha256'] = 'UNREADABLE'
+        if payload is not None:
+            extra['payload'] = seal_payload(fds[2], payload, ident.uid)
         extra['tree_problems'] = check_tree(outbox / 'source', manifest)
         names, truncated = untracked_created(outbox / 'source', manifest)
         extra['untracked'] = {'count': 'many' if truncated else len(names), 'sample': [clean(n, 80) for n in names[:10]]}
@@ -1580,6 +1776,20 @@ def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None):
     finally:
         for fd in fds:
             os.close(fd)
+
+
+def seal_payload(outbox_fd, payload, uid):
+    """Re-hash outbox/payload against the manifest through the descriptor of the opened outbox directory (no path is re-resolved):
+    exact file set, sizes, SHA-256, single links, exact modes, QA ownership. The result is frozen into RUNMETA."""
+    try:
+        fd = os.open('payload', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=outbox_fd)
+    except OSError as error:
+        return {'manifest_sha256': payload.sha, 'verified': False, 'problems': ['outbox/payload %s' % open_reason(error, 'payload', outbox_fd)]}
+    try:
+        problems = _SIDE.verify_tree(fd, payload.manifest, payload.raw, uid, check_modes=True)
+    finally:
+        os.close(fd)
+    return {'manifest_sha256': payload.sha, 'verified': not problems, 'problems': [clean(p, 120) for p in problems[:10]]}
 
 
 def launchd_problems(domain, done):
@@ -1973,6 +2183,47 @@ def tree_problems(run_dir, meta, manifest):
     return check_tree(run_dir / 'source', manifest)
 
 
+def payload_gate(run_dir, packet, meta):
+    """Problems with the payload of an identity run: the sealed re-hash must be present, match the packet's manifest and be clean, and
+    the self-test gate must have passed for that same manifest before Codex started."""
+    info = packet.get('payload')
+    if info is None:
+        return []
+    problems = []
+    sealed = meta.get('payload')
+    if not isinstance(sealed, dict) or sealed.get('manifest_sha256') != info.get('manifest_sha256') or sealed.get('verified') is not True:
+        problems.append('the payload was not verified clean at the seal' + (': ' + clean(sealed.get('problems', [''])[0], 100)
+                                                                           if isinstance(sealed, dict) and sealed.get('problems') else ''))
+    try:
+        gate = read_run_json(run_dir / 'SELFTEST.json')
+        passed = gate.get('passed') is True and gate.get('manifest_sha256') == info.get('manifest_sha256')
+    except LOAD_ERRORS:
+        passed = False
+    if not passed:
+        problems.append('SELFTEST.json is missing or the self-test gate did not pass')
+    return problems
+
+
+def no_model_result(run_dir, packet, meta):
+    """A run that stopped before the model: never a pass. QA_INCOMPLETE says so, unless the seal found a problem (then QA_INVALID)."""
+    bad = identity_gate(run_dir, meta) + payload_gate(run_dir, packet, meta)
+    bad += tree_problems(run_dir, meta, read_run_json(run_dir / 'tree-manifest.json'))
+    extra = {'no_model': True, 'verdict': None}
+    if packet.get('payload') is not None:
+        try:
+            gate = read_run_json(run_dir / 'SELFTEST.json')
+            summary = selftest_summary(gate['tests'])
+        except LOAD_ERRORS:
+            summary = None
+        extra['payload'] = payload_result(packet, summary, meta.get('payload'))
+    if bad:
+        return write_result(run_dir, packet, 'QA_INVALID', bad[:5], extra)
+    tests = extra.get('payload', {}).get('selftests') or {}
+    return write_result(run_dir, packet, 'QA_INCOMPLETE',
+                        ['no-model run done (gate%s, seal, sweep); no model was started, no verdict by design'
+                         % (': %d self-tests' % tests['ran'] if tests else '')], extra)
+
+
 def identity_gate(run_dir, meta):
     """An identity run counts only if the environment canary and read confinement were both established before codex
     started, every QA-user process was gone after the sweep, and every outbox path was a plain QA-owned directory."""
@@ -2006,6 +2257,8 @@ def evaluate_files(run_dir, packet):
     if not meta_path.exists():
         return no_run_record(run_dir, packet, verdict_path, events)
     meta = read_run_json(meta_path)
+    if meta.get('no_model') is True:
+        return no_model_result(run_dir, packet, meta)
     bad = []
     if safe_digest(events) != meta['events_sha256']:
         bad.append('event stream changed after the run')
@@ -2015,6 +2268,9 @@ def evaluate_files(run_dir, packet):
             return write_result(run_dir, packet, 'QA_INCOMPLETE', ['sudo -n refused the codex hop (no cached credential in '
                                                                    'this terminal session); codex was not started'])
         bad += identity_gate(run_dir, meta)
+        bad += payload_gate(run_dir, packet, meta)
+    elif packet.get('payload') is not None:
+        bad.append('a payload run without a QA identity')
     try:
         if os.lstat(events).st_size > MAX_EVENTS_BYTES:
             return write_result(run_dir, packet, 'QA_INVALID', bad + ['event stream is too large'])
@@ -2078,6 +2334,12 @@ def evaluate_files(run_dir, packet):
              'codex_exit_code': meta['exit_code'], 'untracked_files_present': present, 'untracked_sample': sample,
              'findings': [{'id': clean(f['id'], 40), 'severity': f['severity'], 'surface': clean(f['surface'], 80)}
                           for f in verdict['suspected_findings']]}
+    if packet.get('payload') is not None:
+        try:
+            gate_tests = selftest_summary(read_run_json(run_dir / 'SELFTEST.json')['tests'])
+        except LOAD_ERRORS:
+            gate_tests = None
+        extra['payload'] = payload_result(packet, gate_tests, meta.get('payload'))
     failing = [c['check'] for c in verdict['verified'] if c['result'] == 'FAIL']
     failing += ['%s %s' % (f['severity'], f['id']) for f in verdict['suspected_findings'] if f['severity'] in FAILING]
     if failing:
@@ -2118,6 +2380,7 @@ def build_parser():
     p.add_argument('--criteria', required=True)
     p.add_argument('--producer-evidence')
     p.add_argument('--qa-notes')
+    p.add_argument('--payload', metavar='DIR', help='a payload directory with a MANIFEST.json (cae-qa-payload/1; see docs/QA-PAYLOAD.md)')
     p.add_argument('--root')
     r = sub.add_parser('run')
     r.add_argument('--run-dir', required=True)
@@ -2129,6 +2392,8 @@ def build_parser():
     r.add_argument('--unattended', action='store_true',
                    help='run the QA hops through the installed, owner-approved delegation (ADR 0016) instead of a cached sudo credential')
     r.add_argument('--require-env-isolation', action='store_true', help='refuse to run unless --qa-identity is given')
+    r.add_argument('--no-model', action='store_true', help='stage, prove confinement, run the payload self-tests, seal and sweep, then stop: '
+                                                         'no model starts and there is no verdict (needs --qa-identity)')
     r.add_argument('--codex-bin', default='codex', help=argparse.SUPPRESS)       # test hook
     r.add_argument('--settle', type=float, default=SETTLE_SECONDS, help=argparse.SUPPRESS)  # test hook
     r.add_argument('--admission-cmd', type=shlex.split, help=argparse.SUPPRESS)   # test hook (one quoted string)

@@ -34,6 +34,12 @@ import json, os, subprocess, sys, time
 d = "@FAKEDIR@"
 argv = sys.argv[1:]
 if argv and argv[0] == "sandbox":   # the wrapper's confinement probe: `codex sandbox -P NAME -C DIR /usr/bin/python3 -c CODE`
+    cmd = argv[argv.index("-C") + 2:]
+    if not (len(cmd) >= 3 and cmd[1] == "-c" and cmd[2].startswith("# CONTROL=")):   # a payload self-test, not a probe control
+        tests = json.load(open(d + "/selftests.json")) if os.path.exists(d + "/selftests.json") else []
+        tests.append({"cmd": cmd, "cwd": os.getcwd(), "env": sorted(os.environ)})
+        json.dump(tests, open(d + "/selftests.json", "w"))
+        sys.exit(subprocess.run(cmd, stdin=sys.stdin, env=dict(os.environ)).returncode)
     probes = json.load(open(d + "/probes.json")) if os.path.exists(d + "/probes.json") else []
     code = argv[-1]
     control = code.splitlines()[0].replace("# CONTROL=", "")
@@ -73,6 +79,10 @@ if mode == "hang":
     open(d + "/child.pid", "w").write(str(child.pid))
     open(d + "/self.pid", "w").write(str(os.getpid()))
     time.sleep(120)
+if mode == "payloadtamper":  # QA edits the producer's payload after the self-tests passed
+    victim = os.path.join(os.path.dirname(os.getcwd()), "payload", "vectors", "a.json")
+    os.chmod(victim, 0o644)
+    open(victim, "a").write("tampered")
 sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
 verdict = json.loads(open(d + "/verdict").read().replace("@SHA@", sha))
 if mode == "dirty":
@@ -2092,6 +2102,268 @@ class IdentityTests(Base):
         self.assertFalse((self.x / "inbox/RUN.lock").exists())
         self.assertEqual(self.json(run_dir / "RESULT.json")["state"], "QA_PASS")
 
+    # ---- payload staging and the model-free self-test gate (SPE-145 part 9)
+    def make_payload(self, selftest_stdout=b"ok\n", exit_=0, extra_tests=(), tool=b"#!/bin/sh\necho ok\n"):
+        directory = self.root / ("payload-src-%d" % len(list(self.root.glob("payload-src-*"))))
+        (directory / "bin").mkdir(parents=True)
+        (directory / "vectors").mkdir()
+        data = b'{"a": 1}\n'
+        (directory / "bin/tool").write_bytes(tool)
+        os.chmod(directory / "bin/tool", 0o755)
+        (directory / "vectors/a.json").write_bytes(data)
+        (directory / "transcript.txt").write_bytes(b"producer transcript\n")
+        import hashlib
+        sha = lambda b: hashlib.sha256(b).hexdigest()   # noqa: E731
+        tests = [{"id": "tool-ok", "argv": ["bin/tool", "@payload/vectors/a.json"], "stdin": None, "expect_exit": exit_,
+                  "expect_stdout_sha256": sha(selftest_stdout), "timeout_s": 20, "max_output_bytes": 4096}] + list(extra_tests)
+        manifest = {"schema": "cae-qa-payload/1", "scope": "offline library-level checks of the CLI", "producer_run": ["transcript.txt"],
+                    "files": [{"path": "bin/tool", "sha256": sha(tool), "size": len(tool), "kind": "exec"},
+                              {"path": "transcript.txt", "sha256": sha(b"producer transcript\n"), "size": 20, "kind": "data"},
+                              {"path": "vectors/a.json", "sha256": sha(data), "size": len(data), "kind": "data"}],
+                    "selftests": tests}
+        (directory / "MANIFEST.json").write_text(json.dumps(manifest, indent=2))
+        return directory
+
+    def prepare_with_payload(self, directory):
+        code, out = self.call("prepare", "--repo", str(self.repo), "--sha", "HEAD", "--ticket", "T-1", "--product", "prod",
+                              "--criteria", str(self.criteria), "--root", str(self.root / "qa"), "--payload", str(directory))
+        self.assertEqual(code, 0, out)
+        return Path(out.strip().splitlines()[-1])
+
+    def test_payload_run_stages_proves_gates_and_binds_the_manifest(self):
+        run_dir = self.prepare_with_payload(self.make_payload())
+        packet = self.json(run_dir / "packet.json")
+        digest = packet["payload"]["manifest_sha256"]
+        self.assertEqual(packet["payload"]["producer_run"], ["transcript.txt"])
+        self.assertEqual(packet["digest"], qa.packet_digest(packet))                     # the payload is inside the packet digest
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 0, out)
+        outbox = self.outbox()
+        self.assertEqual(self.json(run_dir / "MODE.json")["payload"], digest)
+        meta = self.json(run_dir / "RUNMETA.json")
+        self.assertEqual(meta["qa_identity"]["payload"], {"manifest_sha256": digest})
+        self.assertEqual(meta["payload"], {"manifest_sha256": digest, "verified": True, "problems": []})
+        gate = self.json(run_dir / "SELFTEST.json")
+        self.assertTrue(gate["passed"] and gate["tests"][0]["ok"])
+        names = [c["control"] for c in self.json(run_dir / "CONFINEMENT.json")["controls"]]
+        self.assertEqual(names[-2:], ["neg_write_payload", "pos_exec_payload"])                # base controls first, payload code last
+        self.assertTrue({"neg_loopback_bind", "neg_uds_bind", "neg_testnet_connect"} <= set(names))
+        prompt = (self.fake_dir / "prompt.txt").read_text()
+        self.assertIn(str(outbox / "payload"), prompt)
+        self.assertIn(digest, prompt)
+        self.assertIn("PRODUCER-RUN evidence (not independently reproduced): transcript.txt", prompt)
+        result = self.json(run_dir / "RESULT.json")
+        self.assertEqual(result["state"], "QA_PASS")
+        self.assertEqual(result["payload"]["manifest_sha256"], digest)
+        self.assertEqual(result["payload"]["producer_run"], ["PRODUCER-RUN: transcript.txt"])
+        self.assertIn("not independently reproduced", result["payload"]["scope_statement"])
+        self.assertEqual(result["payload"]["selftests"]["passed"], 1)
+        profile = (self.qahome / ".local/state/coding-agent-environment/qa" / outbox.name / "codexhome/config.toml").read_text()
+        self.assertIn('"%s" = "read"' % (outbox / "payload"), profile)
+        self.assertEqual(stat.S_IMODE((outbox / "payload/bin/tool").stat().st_mode), 0o555)
+        self.assertFalse((self.inbox() / "payload").exists())                                  # the inbox copy is removed after staging
+        selftest = json.loads((self.fake_dir / "selftests.json").read_text())[0]
+        self.assertEqual(selftest["cmd"], [str(outbox / "payload/bin/tool"), str(outbox / "payload/vectors/a.json")])
+        self.assertEqual(selftest["cwd"], str(outbox / "tmp"))
+        calls = [json.loads(line) for line in (self.fake_dir / "sudo_calls.jsonl").read_text().splitlines()]
+        self.assertEqual(len([c for c in calls if "-u" in c]), 2)                              # still exactly the stage and exec hops
+
+    def test_a_failing_self_test_refuses_to_launch_codex_and_keeps_the_evidence(self):
+        run_dir = self.prepare_with_payload(self.make_payload(selftest_stdout=b"something else\n"))
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"], out)
+        self.assertFalse((self.fake_dir / "seen.json").exists())                               # codex exec never ran
+        self.assertFalse((run_dir / "RUNMETA.json").exists())
+        self.assertFalse(os.path.lexists(run_dir / "LAUNCHED"))
+        result = self.json(run_dir / "RESULT.json")
+        self.assertEqual(result["state"], "QA_INCOMPLETE")
+        self.assertTrue(result["reasons"][0].startswith("self-test tool-ok stdout SHA-256"), result["reasons"])
+        self.assertIn("codex was not started", result["reasons"][0])
+        gate = self.json(run_dir / "SELFTEST.json")
+        self.assertFalse(gate["passed"])
+        self.assertEqual(gate["tests"][0]["exit"], 0)                                          # what actually ran is preserved
+        self.assertEqual(result["payload"]["selftests"]["passed"], 0)
+        self.assertFalse((self.x / "inbox/RUN.lock").exists())
+
+    def test_the_gate_is_rederived_from_the_manifest_not_from_the_qa_report(self):
+        run_dir = self.prepare_with_payload(self.make_payload(exit_=3))                         # the tool exits 0 but 3 is expected
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"], out)
+        self.assertIn("exited 0, expected 3", self.json(run_dir / "RESULT.json")["reasons"][0])
+
+    def test_no_model_stops_after_the_gate_seal_and_sweep_and_is_never_a_pass(self):
+        run_dir = self.prepare_with_payload(self.make_payload())
+        code, out = self.run_ident(run_dir, ("--no-model",))
+        self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"], out)
+        self.assertFalse((self.fake_dir / "seen.json").exists())
+        self.assertFalse(os.path.lexists(run_dir / "LAUNCHED"))
+        self.assertFalse((run_dir / "events.jsonl").exists())
+        meta = self.json(run_dir / "RUNMETA.json")
+        self.assertIs(meta["no_model"], True)
+        self.assertEqual((meta["stragglers"], meta["path_ok"], meta["payload"]["verified"]), (0, True, True))
+        self.assertIn(qa.RESPAWN_SECONDS, self.rechecks)                                        # sealed and swept like a model run
+        result = self.json(run_dir / "RESULT.json")
+        self.assertEqual(result["state"], "QA_INCOMPLETE")
+        self.assertIs(result["no_model"], True)
+        self.assertIn("no verdict by design", result["reasons"][0])
+        self.assertEqual(result["payload"]["selftests"]["passed"], 1)
+        self.assertIs(self.json(run_dir / "MODE.json")["no_model"], True)
+        self.assertEqual(qa.main(["verdict", "--run-dir", str(run_dir)]), qa.EXIT["QA_INCOMPLETE"])   # also when re-evaluated later
+        self.assertEqual(self.json(run_dir / "RESULT.json")["state"], "QA_INCOMPLETE")
+        code, out = self.run_ident(run_dir)                                                      # and the directory cannot be continued
+        self.assertEqual(code, qa.EXIT["REFUSED"], out)
+
+    def test_no_model_with_a_failing_gate_still_does_not_launch_or_seal_a_run(self):
+        run_dir = self.prepare_with_payload(self.make_payload(selftest_stdout=b"nope\n"))
+        code, out = self.run_ident(run_dir, ("--no-model",))
+        self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"], out)
+        self.assertFalse((run_dir / "RUNMETA.json").exists())
+        self.assertIn("self-test tool-ok", self.json(run_dir / "RESULT.json")["reasons"][0])
+
+    def test_no_model_needs_an_identity_and_works_without_a_payload(self):
+        run_dir = self.prepare()
+        code, out = self.run_qa(run_dir, extra=("--no-model",))
+        self.assertEqual(code, qa.EXIT["REFUSED"], out)
+        code, out = self.run_ident(run_dir, ("--no-model",))
+        self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"], out)
+        self.assertNotIn("payload", self.json(run_dir / "RESULT.json"))
+        self.assertFalse((self.fake_dir / "seen.json").exists())
+
+    def test_a_dirty_final_sweep_downgrades_a_no_model_result(self):
+        run_dir = self.prepare()
+        self.sweeps = [0, 0, 2]                                                                   # pre-run, seal, final cleanup leaves two
+        code, out = self.run_ident(run_dir, ("--no-model",))
+        self.assertEqual(code, qa.EXIT["QA_INVALID"], out)
+        self.assertEqual(self.json(run_dir / "RESULT.json")["state"], "QA_INVALID")
+
+    def test_payload_edited_by_qa_after_the_gate_is_caught_at_the_seal(self):
+        run_dir = self.prepare_with_payload(self.make_payload())
+        self.fake_mode("payloadtamper")
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, qa.EXIT["QA_INVALID"], out)
+        meta = self.json(run_dir / "RUNMETA.json")
+        self.assertFalse(meta["payload"]["verified"])
+        self.assertTrue(any("vectors/a.json" in p for p in meta["payload"]["problems"]), meta["payload"])
+        self.assertTrue(any("payload was not verified clean" in r for r in self.json(run_dir / "RESULT.json")["reasons"]))
+
+    def test_payload_edited_in_the_run_directory_is_caught_before_the_qa_user_is_touched(self):
+        run_dir = self.prepare_with_payload(self.make_payload())
+        victim = run_dir / "payload/vectors/a.json"
+        os.chmod(victim, 0o600)
+        victim.write_bytes(b"tampered")
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, qa.EXIT["QA_INVALID"], out)
+        self.assertIn("payload no longer matches", self.json(run_dir / "RESULT.json")["reasons"][0])
+        self.assertEqual(list((self.x / "inbox").iterdir()), [])
+        self.assertEqual(self.rechecks, [])
+
+    def test_packet_digest_edit_of_the_payload_block_is_an_integrity_failure(self):
+        run_dir = self.prepare_with_payload(self.make_payload())
+        packet = self.json(run_dir / "packet.json")
+        packet["payload"]["scope"] = "everything was verified end to end"
+        (run_dir / "packet.json").write_text(json.dumps(packet))
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, qa.EXIT["QA_INVALID"], out)
+
+    def test_prepare_refuses_a_payload_that_breaks_its_manifest(self):
+        directory = self.make_payload()
+        (directory / "extra.bin").write_bytes(b"x")
+        args = ("prepare", "--repo", str(self.repo), "--sha", "HEAD", "--ticket", "T-1", "--product", "prod", "--criteria", str(self.criteria),
+                "--root", str(self.root / "qa"))
+        code, out = self.call(*args, "--payload", str(directory))          # call() hands back a SystemExit's message as the code
+        self.assertIsInstance(code, str)
+        self.assertIn("unexpected file extra.bin", code)
+        self.assertFalse((self.root / "qa").exists())                                             # nothing was created
+        os.unlink(directory / "extra.bin")
+        link = self.root / "payload-link"
+        os.symlink(directory, link)
+        code, out = self.call(*args, "--payload", str(link))
+        self.assertIsInstance(code, str)
+        self.assertIn("--payload must be a directory", code)
+        self.assertFalse((self.root / "qa").exists())
+
+    def test_a_payload_run_without_an_identity_is_refused(self):
+        run_dir = self.prepare_with_payload(self.make_payload())
+        code, out = self.run_qa(run_dir)
+        self.assertEqual(code, qa.EXIT["REFUSED"], out)
+        self.assertIn("payload runs need --qa-identity", out)
+
+    def escaping_tool(self, pidfile):
+        """A self-test whose process leaves its session (so the group kill cannot reach it) and keeps sleeping."""
+        return ("#!%s\nimport os, sys, time\nif os.fork() == 0:\n    os.setsid()\n    open(%r, 'w').write(str(os.getpid()))\n    time.sleep(120)\n"
+                "    os._exit(0)\nfor _ in range(100):\n    if os.path.exists(%r):\n        break\n    time.sleep(0.05)\nprint('ok')\n"
+                % (sys.executable, str(pidfile), str(pidfile))).encode()
+
+    def alive(self, pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def test_a_payload_process_that_leaves_its_session_stops_the_run_before_codex(self):
+        pidfile = self.root / "escaped.pid"
+        run_dir = self.prepare_with_payload(self.make_payload(tool=self.escaping_tool(pidfile)))
+        self.sweeps = [0, 1]                                                                       # pre-run clean, one survivor after the payload ran
+        try:
+            code, out = self.run_ident(run_dir)
+            self.assertTrue(self.alive(int(pidfile.read_text())), "the setsid child must have outlived the group kill (the scenario)")
+        finally:
+            if pidfile.exists():
+                try:
+                    os.kill(int(pidfile.read_text()), 9)
+                except OSError:
+                    pass
+        self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"], out)
+        self.assertFalse((self.fake_dir / "seen.json").exists())
+        self.assertFalse(os.path.lexists(run_dir / "LAUNCHED"))
+        self.assertFalse((run_dir / "RUNMETA.json").exists())
+        reason = self.json(run_dir / "RESULT.json")["reasons"][0]
+        self.assertIn("1 QA-user processes remain after the payload code ran", reason)
+        self.assertEqual(self.json(run_dir / "SELFTEST.json")["post_run_sweep"], 1)
+        self.assertTrue(self.json(run_dir / "SELFTEST.json")["passed"])                           # the evidence of what ran is kept
+
+    def test_a_sweep_that_cannot_run_after_the_payload_also_stops_the_run_and_no_model_too(self):
+        for extra in ((), ("--no-model",)):
+            run_dir = self.prepare_with_payload(self.make_payload())
+            self.sweeps = [0, None]
+            code, out = self.run_ident(run_dir, extra)
+            self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"], out)
+            self.assertIn("could not sweep the QA user after the payload code ran", self.json(run_dir / "RESULT.json")["reasons"][0])
+            self.assertFalse((run_dir / "RUNMETA.json").exists())
+            self.assertFalse((self.fake_dir / "seen.json").exists())
+            for leftover in list((self.x / "inbox").iterdir()) + list((self.x / "outbox").iterdir()):
+                if leftover.name != "RUN.lock":
+                    shutil.rmtree(leftover, ignore_errors=True)
+
+    def test_a_clean_post_payload_sweep_lets_the_run_go_on(self):
+        run_dir = self.prepare_with_payload(self.make_payload())
+        self.sweeps = [0, 0]
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 0, out)
+        self.assertIsNone(self.json(run_dir / "SELFTEST.json").get("post_run_sweep"))
+
+    def test_prepare_removes_the_half_made_run_directory_when_the_payload_copy_fails(self):
+        directory = self.make_payload()
+        args = ("prepare", "--repo", str(self.repo), "--sha", "HEAD", "--ticket", "T-1", "--product", "prod", "--criteria", str(self.criteria),
+                "--root", str(self.root / "qa"), "--payload", str(directory))
+        with unittest.mock.patch.object(qa._SIDE, "copy_payload", side_effect=qa._SIDE.PayloadError("disk full, say")):
+            code, out = self.call(*args)
+        self.assertIsInstance(code, str)
+        self.assertIn("payload could not be copied", code)
+        self.assertEqual(list((self.root / "qa" / "prod" / "T-1").iterdir()), [])
+
+    def test_no_payload_run_keeps_the_same_packet_mode_prompt_runmeta_and_result_keys(self):
+        run_dir = self.prepare()
+        code, out = self.run_ident(run_dir)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("payload", self.json(run_dir / "packet.json"))
+        self.assertNotIn("payload", self.json(run_dir / "MODE.json"))
+        self.assertNotIn("payload", self.json(run_dir / "RUNMETA.json"))
+        self.assertNotIn("payload", self.json(run_dir / "RESULT.json"))
+        self.assertFalse((run_dir / "SELFTEST.json").exists())
+        self.assertNotIn("PAYLOAD", (self.fake_dir / "prompt.txt").read_text())
+
     def test_forged_event_on_qa_stderr_is_not_counted(self):
         self.fake_mode("stderrforge")
         run_dir = self.prepare()
@@ -2735,6 +3007,29 @@ class OpenOutboxSearchOnlyTests(unittest.TestCase):
         self.assertIn("wrong owner", str(caught.exception))
         self.assertNotIn("link", str(caught.exception))
         self.assertIsNone(qa.read_sealed(dfd, "absent", self.me))
+
+
+class ChangedBaseControlSetTests(unittest.TestCase):
+    """The base control set grew for EVERY run (loopback bind, UNIX-socket bind, TEST-NET connect): a record from an older helper that
+    lacks them is refused, and a host that cannot give a clean EPERM refusal fails closed. Real macOS behaviour is unverified."""
+
+    def record(self, names):
+        return {"controls": [{"control": n, "observed": "ALLOWED" if e == "ALLOWED" else "DENIED:1"} for n, _, e in qa._SIDE.CONTROLS if n in names]}
+
+    def test_an_older_helper_record_without_the_network_controls_is_rejected(self):
+        old = {c[0] for c in qa._SIDE.CONTROLS} - {"neg_loopback_bind", "neg_uds_bind", "neg_testnet_connect"}
+        established, could_not_check, controls, problems = qa.parse_confinement(self.record(old))
+        self.assertFalse(established)
+        self.assertTrue(any("controls missing" in p and "neg_loopback_bind" in p for p in problems), problems)
+
+    def test_an_unreachable_network_style_answer_fails_closed(self):
+        record = self.record({c[0] for c in qa._SIDE.CONTROLS})
+        for row in record["controls"]:
+            if row["control"] == "neg_testnet_connect":
+                row["observed"] = "DENIED:51"            # ENETUNREACH: not a sandbox refusal, so it proves nothing
+        established, _, _, problems = qa.parse_confinement(record)
+        self.assertFalse(established)
+        self.assertTrue(any("neg_testnet_connect" in p for p in problems))
 
 
 if __name__ == "__main__":
