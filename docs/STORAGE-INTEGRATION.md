@@ -149,7 +149,7 @@ callers that use them: the gate hook still decides on tier and latch alone, so a
 beside a reserved one. This state is advisory (same-user), not a security boundary.
 ### Heavy-lane queue (`queue`, SPE-111)
 
-A first-in-first-out, non-preemptive queue for the one heavy lane. It never signals, releases or reaps a holder; it only
+A first-in-first-out, non-preemptive queue for the heavy lane (one lane today). It never signals, releases or reaps a holder; it only
 decides who is granted the lane after the current holder is gone.
 
 - `queue enqueue --label L --ticket T [--ticket T2] --repo R --worktree W --harness claude|codex --session-id ID --bytes N
