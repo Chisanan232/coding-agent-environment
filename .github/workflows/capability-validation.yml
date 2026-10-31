@@ -139,6 +139,7 @@ jobs:
           python3 tests/test-qa-handoff.py
           python3 tests/test-qa-identity-setup.py
           python3 tests/test-qa-side.py
+          python3 tests/test-qa-handoff-unattended.py
           python3 tests/test-parity-dogfood.py
   native-resource-wire:
     runs-on: macos-14

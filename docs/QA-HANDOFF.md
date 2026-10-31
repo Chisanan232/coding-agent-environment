@@ -136,6 +136,20 @@ credential cache belongs to the terminal that typed the password, so an agent se
 sudo -v && python3 scripts/qa-handoff.py run --run-dir DIR --qa-identity NAME --exchange /Users/Shared/NAME-qa
 ```
 
+**Unattended mode (`run --unattended`, SPE-153).** With `--qa-identity NAME` and the owner-installed delegation of
+[ADR 0016](adr/0016-unattended-qa-hop.md) in place, no `sudo -v` and no keepalive are needed and the run can start from an
+agent session. Every QA-side step is `sudo -n -u NAME /Library/cae-qa/qa-side <verb> [attempt]` with `version`, `probe`,
+`stage` or `exec` as the verb (the fixed shapes of `ALLOWED_ARGV` in `qa-side.py`), as the QA user only, never root. Before
+every run the producer verifies, without sudo, that `/Library/cae-qa/qa-side`, `qa-side.json` and the pinned Codex are each
+reached through root-owned, non-writable, non-link components, that the config names this identity, user and exchange, and
+that `qa-side version` reports the digests it computed itself; any miss is `QA_INCOMPLETE`, codex not started. Sealing,
+candidate binding, the sweeps and the cleanup verification are the attended ones; `MODE.json` records `"unattended": true`
+and `RUNMETA.json` the helper and Codex digests. `--timeout` must be 60 to 14400 seconds. Nothing is installed by this
+repository yet (the installer is a later PR), so until then the flag fails closed with `QA_INCOMPLETE`.
+
+After the one-time Codex login, run the `chmod 700 ~/.codex` step printed with the login command (Codex leaves the directory
+readable), then re-run `qa-identity-setup.py --check`: only that check proves the final state.
+
 No sudoers change is made or needed **by this attended mode**, and `qa-identity-setup.py` itself never edits sudoers. The
 unattended alternative decided in [ADR 0016](adr/0016-unattended-qa-hop.md) (a one-time owner-installed sudoers drop-in that lets
 the producer act as the QA user for seven fixed commands, plus a pinned helper) reverses that statement for its own installed mode
