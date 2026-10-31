@@ -570,7 +570,7 @@ class DescriptorRelativeTests(InstalledCase):
         sfd = side.open_source_dir(afd, ME)
         self.addCleanup(os.close, sfd)
         dst = t.base / "copy"
-        side.copy_tree_at(sfd, dst)
+        side.copy_tree_at(sfd, dst, ME)
         self.assertEqual((dst / "a.txt").read_text(), "alpha")
         self.assertEqual(os.readlink(dst / "link"), "a.txt")
         self.assertEqual(os.readlink(dst / "abs-link"), "/etc/hosts")
@@ -613,9 +613,60 @@ class DescriptorRelativeTests(InstalledCase):
         self.addCleanup(os.close, afd)
         sfd = side.open_source_dir(afd, ME)
         self.addCleanup(os.close, sfd)
-        side.copy_tree_at(sfd, t.base / "copy2")
+        side.copy_tree_at(sfd, t.base / "copy2", ME)
         self.assertTrue(os.path.islink(t.base / "copy2" / "to-dir"))
         self.assertFalse((t.base / "copy2" / "to-dir" / "qa-side.json").exists() and not os.path.islink(t.base / "copy2" / "to-dir"))
+
+    def copy_fails(self, t, producer=ME):
+        afd = self.attempt_fd(t)
+        self.addCleanup(os.close, afd)
+        sfd = os.open(t.source, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, sfd)
+        dst = t.base / ("out-%d" % len(os.listdir(t.base)))
+        with self.assertRaises(side.Refuse):
+            side.copy_tree_at(sfd, dst, producer)
+
+    def test_hard_linked_file_is_refused_at_any_depth(self):
+        t = self.tree()
+        os.link(t.source / "a.txt", t.base / "other-name")
+        self.copy_fails(t)
+        t = self.tree()
+        deep = t.source / "d1" / "d2" / "d3"
+        deep.mkdir(parents=True)
+        (deep / "f").write_text("x")
+        os.link(deep / "f", t.base / "elsewhere")
+        self.copy_fails(t)
+
+    def test_foreign_owned_file_or_directory_is_refused_at_any_depth(self):
+        # the producer uid is what is compared, so a different value stands in for "someone else owns it"
+        t = self.tree()
+        self.copy_fails(t, producer=ME + 1)
+        t = self.tree()
+        deep = t.source / "d1" / "d2"
+        deep.mkdir(parents=True)
+        real = os.fstat
+        ino = os.stat(deep).st_ino
+
+        def fake(fd):
+            st = real(fd)
+            if st.st_ino == ino:
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1, st.st_gid, st.st_size,
+                                       st.st_atime, st.st_mtime, st.st_ctime))
+            return st
+        with mock.patch("os.fstat", side_effect=fake):
+            self.copy_fails(t)
+
+    def test_nested_tree_of_owned_single_link_files_copies(self):
+        t = self.tree()
+        deep = t.source / "d1" / "d2" / "d3"
+        deep.mkdir(parents=True)
+        (deep / "f").write_text("deep")
+        afd = self.attempt_fd(t)
+        self.addCleanup(os.close, afd)
+        sfd = side.open_source_dir(afd, ME)
+        self.addCleanup(os.close, sfd)
+        side.copy_tree_at(sfd, t.base / "nested", ME)
+        self.assertEqual((t.base / "nested" / "d1" / "d2" / "d3" / "f").read_text(), "deep")
 
     def swap_attempt_dir(self, t):
         """Replace inbox/<attempt> by a symlink to a hostile tree, as an attacker would between validation and use."""
@@ -635,7 +686,7 @@ class DescriptorRelativeTests(InstalledCase):
         sfd = side.open_source_dir(plan["afd"], ME)
         self.addCleanup(os.close, sfd)
         self.swap_attempt_dir(t)
-        side.copy_tree_at(sfd, t.base / "after-swap")
+        side.copy_tree_at(sfd, t.base / "after-swap", ME)
         self.assertTrue((t.base / "after-swap" / "a.txt").exists())
         self.assertFalse((t.base / "after-swap" / "stolen.txt").exists())
 
