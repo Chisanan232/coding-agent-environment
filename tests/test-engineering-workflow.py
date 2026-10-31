@@ -289,8 +289,11 @@ class EngineeringWorkflowContract(unittest.TestCase):
 
     def test_ci_tracks_both_policy_adapters_and_contract_tests(self) -> None:
         workflow = (ROOT / ".github/workflows/capability-validation.yml").read_text()
-        self.assertEqual(workflow.count("- '.claude/CLAUDE.md'"), 2)
-        self.assertEqual(workflow.count("- '.claude/skills/**'"), 2)
+        # Only the push filter lists paths: pull_request has none, so the required checks report on every PR.
+        self.assertEqual(workflow.count("- '.claude/CLAUDE.md'"), 1)
+        self.assertEqual(workflow.count("- '.claude/skills/**'"), 1)
+        pull_request = workflow.split("  pull_request:\n", 1)[1].split("  push:\n", 1)[0]
+        self.assertNotIn("paths:", pull_request)
         self.assertIn("python3 tests/test-engineering-workflow.py", workflow)
 
     def test_branch_name_has_a_type_segment_and_derives_the_worktree(self) -> None:
