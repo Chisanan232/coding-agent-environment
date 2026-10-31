@@ -52,6 +52,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 
@@ -61,24 +62,28 @@ SIDE_SCRIPT = 'qa-side.py'
 def _load_side():
     """The QA-side module, loaded from the file next to this one. It is the exact file the attended hop copies into the
     inbox and runs as the QA user, and the producer reuses its shared pieces (permission profile, confinement controls,
-    isolated environment, verdict schema, file helpers) so the two sides cannot drift apart. Loaded only from a regular
+    isolated environment, verdict schema, file helpers) so the two sides cannot drift apart. Read once, from a regular
     file the invoking user or root owns and nobody else can write, like the helpers runtime_problems checks."""
     path = Path(__file__).resolve().parent / SIDE_SCRIPT
     try:
-        st = os.lstat(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         print('REFUSED %s must sit next to qa-handoff.py (not found at %s); copy all scripts from the same revision' % (SIDE_SCRIPT, path))
         raise SystemExit(64)   # EXIT['REFUSED'], which is not defined yet
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, os.getuid()) or st.st_mode & 0o022:
-        print('REFUSED %s must be a regular file owned by root or you and not group/world writable' % path)
-        raise SystemExit(64)
-    spec = importlib.util.spec_from_file_location('qa_side', path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    with os.fdopen(fd, 'rb') as handle:
+        st = os.fstat(handle.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, os.getuid()) or st.st_mode & 0o022 or st.st_size > 16 << 20:
+            print('REFUSED %s must be a regular file owned by root or you and not group/world writable' % path)
+            raise SystemExit(64)
+        data = handle.read()
+    # One read: these exact bytes are executed here, hashed, and (with --qa-identity) copied into the inbox for the QA user.
+    module = types.ModuleType('qa_side')
+    module.__file__ = str(path)
+    exec(compile(data, str(path), 'exec'), module.__dict__)
+    return module, data
 
 
-_SIDE = _load_side()
+_SIDE, SIDE_BYTES = _load_side()
 HOME, SEVERITIES, PROFILE, SECRET_DIRS, SYSTEM_READ, CANARY_ROOT, ENV_ALLOW = (
     _SIDE.HOME, _SIDE.SEVERITIES, _SIDE.PROFILE, _SIDE.SECRET_DIRS, _SIDE.SYSTEM_READ, _SIDE.CANARY_ROOT, _SIDE.ENV_ALLOW)
 CONTROLS, VERDICT_SCHEMA, PROFILE_CHANGED = _SIDE.CONTROLS, _SIDE.VERDICT_SCHEMA, _SIDE.PROFILE_CHANGED
@@ -1278,7 +1283,7 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive):
     # of the verified clone. The QA side runs only this copy, with /usr/bin/python3 -I, and its digest is recorded.
     inbox.mkdir(mode=0o700)
     script = inbox / SIDE_SCRIPT
-    write_private(script, read_nofollow(Path(_SIDE.__file__).resolve(), 16 << 20))
+    write_private(script, SIDE_BYTES)
     script_sha = sha256_file(script)
     write_private(inbox / 'packet.json', packet)
     write_private(inbox / 'prompt.txt', PROMPT.format(product=packet['product'], ticket=packet['ticket'], sha=packet['sha'],

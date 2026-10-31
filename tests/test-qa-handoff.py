@@ -2596,6 +2596,9 @@ class QASideModuleTests(unittest.TestCase):
         for name in ("CONTROLS", "VERDICT_SCHEMA", "PROFILE", "PROFILE_CHANGED", "isolated_env", "codex_argv", "confinement_probe"):
             self.assertIs(getattr(qa, name), getattr(side, name), name)
 
+    def test_the_bytes_executed_hashed_and_copied_are_one_read(self):
+        self.assertEqual(qa.SIDE_BYTES, SIDE_SCRIPT.read_bytes())
+
     def test_the_producer_names_no_qa_side_entry_point_any_more(self):
         self.assertFalse(hasattr(qa, "qa_stage") or hasattr(qa, "qa_exec"))
         with self.assertRaises(SystemExit):
