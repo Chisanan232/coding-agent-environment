@@ -3031,6 +3031,16 @@ class ChangedBaseControlSetTests(unittest.TestCase):
         self.assertFalse(established)
         self.assertTrue(any("neg_testnet_connect" in p for p in problems))
 
+    def test_eacces_fails_every_socket_control_through_the_producer_recompute(self):
+        for name in ("neg_loopback_bind", "neg_uds_bind", "neg_testnet_connect", "neg_testnet6_connect", "neg_udp_testnet", "neg_resolver_socket"):
+            record = self.record({c[0] for c in qa._SIDE.CONTROLS})
+            for row in record["controls"]:
+                if row["control"] == name:
+                    row["observed"] = "DENIED:13"
+            established, _, _, problems = qa.parse_confinement(record)
+            self.assertFalse(established, name)
+            self.assertTrue(any(name in p for p in problems), name)
+
 
 if __name__ == "__main__":
     unittest.main()

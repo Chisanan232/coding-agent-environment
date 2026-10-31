@@ -986,5 +986,39 @@ class SharedPartsTests(unittest.TestCase):
         self.assertEqual((args.codex_bin, args.timeout), ("codex", 1800))
 
 
+class NetworkControlTests(unittest.TestCase):
+    NET = ("neg_loopback_bind", "neg_uds_bind", "neg_testnet_connect", "neg_testnet6_connect", "neg_udp_testnet", "neg_resolver_socket")
+
+    def test_all_six_network_controls_are_in_the_base_set_and_expect_eperm(self):
+        got = {name: expect for name, _, expect in side.CONTROLS}
+        for name in self.NET:
+            self.assertEqual(got.get(name), "DENIED_EPERM", name)
+
+    def test_a_socket_denial_counts_only_as_eperm(self):
+        for observed in ("DENIED:13", "DENIED:61", "DENIED:65", "DENIED:51", "DENIED:None", "ALLOWED", "DENIED:1 ", ""):
+            self.assertFalse(side.control_ok("DENIED_EPERM", observed), observed)
+        self.assertTrue(side.control_ok("DENIED_EPERM", "DENIED:1"))
+
+    def test_an_unknown_expectation_never_passes(self):
+        for expect in ("DENIED_EPREM", "", None, "denied"):
+            for observed in ("DENIED:1", "DENIED:13", "ALLOWED"):
+                self.assertFalse(side.control_ok(expect, observed), (expect, observed))
+
+    def test_filesystem_denials_still_accept_eperm_and_eacces(self):
+        self.assertTrue(side.control_ok("DENIED", "DENIED:1"))
+        self.assertTrue(side.control_ok("DENIED", "DENIED:13"))
+        self.assertFalse(side.control_ok("DENIED", "DENIED:2"))
+        self.assertFalse(side.control_ok("DENIED", "ALLOWED"))
+        self.assertTrue(side.control_ok("ALLOWED", "ALLOWED"))
+        self.assertFalse(side.control_ok("ALLOWED", "DENIED:1"))
+
+    def test_every_network_snippet_prints_only_the_two_tokens(self):
+        for name, snippet, _ in side.CONTROLS:
+            if name in self.NET:
+                self.assertIn("print('ALLOWED')", snippet, name)
+                self.assertIn("print('DENIED:%s' % e.errno)", snippet, name)
+                compile(snippet.format(out="/tmp"), name, "exec")
+
+
 if __name__ == "__main__":
     unittest.main()

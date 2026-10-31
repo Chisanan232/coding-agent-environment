@@ -1319,7 +1319,7 @@ def parse_confinement(record, manifest=None):
             continue
         seen.add(name)
         want = expected[name]
-        ok = observed == 'ALLOWED' if want == 'ALLOWED' else observed in ('DENIED:1', 'DENIED:13')
+        ok = _SIDE.control_ok(want, observed)
         controls.append({'control': name, 'expected': want, 'observed': clean(observed, 40), 'ok': ok,
                          'unrunnable': row.get('unrunnable') is True})
         if not ok:

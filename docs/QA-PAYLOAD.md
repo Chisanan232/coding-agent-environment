@@ -56,7 +56,7 @@ files that record the producer's own runs; they are shown to QA as `PRODUCER-RUN
 Each test is `codex sandbox -P qa_confined -C <clone> <absolute argv>` as the QA user, the same path the confinement probe uses,
 with an allowlist environment only: `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME` and `TMPDIR` inside the run directory, and
 `CODEX_HOME` (the profile cannot be found without it); nothing is inherited. The working directory is the run's tmp, there is no
-shell and no network, and a daemon cannot start (binding is denied), so self-tests must be pure command-line checks. Each runs in its
+shell and no direct socket access, and a daemon cannot start (binding is denied), so self-tests must be pure command-line checks. Each runs in its
 own session with a per-file size limit (RLIMIT_FSIZE: its output cap plus slack, at least 16 MiB, so a single-file flood is cut off by the
 kernel and not only by the timeout; many small files are not limited by it). The limit applies to every file the command writes, so a
 self-test that writes one file larger than 16 MiB (for example a debug build artifact) is killed with SIGXFSZ and recorded as "exited -25,
@@ -78,7 +78,8 @@ before they reach a RESULT.
 ## Order of proof (nothing of yours runs on an unproved profile)
 
 1. The base controls (reads and writes confined, the canary, the Codex home and login denied, the profile not widened by the clone, and
-   no network: loopback bind, a UNIX-socket bind, and a TEST-NET-1 connect that must be refused outright) all run first.
+   direct socket access refused: loopback bind, a UNIX-socket bind, IPv4 and IPv6 TEST-NET connects, a UDP send and the system resolver's
+   socket, each refused with EPERM) all run first.
 2. `neg_write_payload` (the payload root is not writable) joins that set.
 3. Only if every one of those passed does `pos_exec_payload` run a payload executable (the first self-test's own command, else the first
    `kind=exec` file with no arguments). If any earlier control failed or could not run, it is recorded `NOT RUN` and no payload code
@@ -89,10 +90,12 @@ control. A profile that opens the network fails the probe; the profile is never 
 
 ## A changed base control set (read before upgrading)
 
-The three network controls (loopback bind, UNIX-socket bind, TEST-NET-1 connect) are part of the **base** set for every run, payload
-or not. A record from an older helper that lacks them is refused, so the helper must be reinstalled for `--unattended` runs; and a host
-whose network stack answers a TEST-NET connect with something other than an immediate EPERM or EACCES (for example ENETUNREACH) now
-fails closed. How these three controls behave on real macOS under the real profile is unverified until an owner run. What stays
+The six network controls (loopback bind, UNIX-socket bind, IPv4 and IPv6 TEST-NET-1 connects, UDP send, resolver socket) are part of the
+**base** set for every run, payload or not. A record from an older helper that lacks them is refused, so the helper must be reinstalled for `--unattended` runs; and a host
+whose network stack answers one of them with anything but an immediate EPERM (EACCES no longer counts for a socket; for example ENETUNREACH
+fails) now fails closed. How the first three behave on real macOS under the real profile is unverified until an owner run; the last three
+were measured as the owner's user. They show that direct socket access is restricted, not that the machine is network-isolated: system
+helpers such as `trustd` may act on a process's behalf. What stays
 unchanged when no payload is given is the packet, `MODE.json`, the prompt, `RUNMETA.json` and `RESULT.json` content and keys.
 
 ## Staging, sealing and `--no-model`

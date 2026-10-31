@@ -257,7 +257,7 @@ observations (exit status, stdout hash). Those observations come from the QA sid
 payload is hash-bound; the independent proof of the payload itself is the seal's re-hash.
 
 **Ordering rule.** Producer-supplied code runs under the sandbox only on a profile that has just been proved. The base controls
-(including the loopback bind, UNIX-socket bind and TEST-NET-1 connect that prove the network is off) and the non-executing payload
+(including the six socket controls, each of which must be refused with EPERM: loopback bind, UNIX-socket bind, IPv4 and IPv6 TEST-NET-1 connects, a UDP send and the system resolver's socket; they show that direct socket access is restricted, not that the machine is isolated) and the non-executing payload
 control `neg_write_payload` run first; `pos_exec_payload` and every self-test run only if all of them ran and passed, otherwise they
 are recorded `NOT RUN`. Payload processes use the self-test allowlist environment, start in their own session with a file-size limit and have their
 process group killed on completion or timeout. A process that leaves its session is not reached by that, so the producer sweeps the QA
@@ -270,9 +270,10 @@ the packet, `MODE.json`, `RUNMETA.json` (the digest is not written into `events.
 offline, library-level checks. `--no-model` runs everything up to and including the seal and sweep and stops with `QA_INCOMPLETE`
 marked `no_model`.
 
-**Changed base control set.** The loopback bind, UNIX-socket bind and TEST-NET connect controls are in the base set of every run, so an older
-helper's probe record (without them) is rejected and the helper must be reinstalled for unattended runs; a host that answers the TEST-NET
-connect with anything but an immediate EPERM or EACCES fails closed. Their real macOS behaviour is unverified until an owner run.
+**Changed base control set.** Six socket controls (loopback bind, UNIX-socket bind, IPv4 and IPv6 TEST-NET connects, UDP send, resolver socket)
+are in the base set of every run, so an older helper's probe record (without them) is rejected and the helper must be reinstalled for
+unattended runs; a host that answers any of them with anything but an immediate EPERM (EACCES no longer counts for a socket) fails closed.
+Their real macOS behaviour under the QA identity is unverified until an owner run; the last three were measured as the owner's user.
 
 Because `qa-side.py` changed, its SHA-256, and therefore `HELPERHEX` in the drop-in, changes: the owner reinstalls. The command
 shapes do not change.
@@ -297,7 +298,7 @@ detect, not prevent, its replacement.
 
 - **Residual risk, stated plainly.** A compromised producer can choose the prompt and packet the pinned Codex runs. That is
   effectively a sandboxed arbitrary-command primitive as the QA user, using the QA user's Codex login and quota. The limits are
-  those of the permission profile (read allowlist, writes only to the clone and scratch, no network) and the seal; they are not
+  those of the permission profile (read allowlist, writes only to the clone and scratch, direct socket access refused; system helpers such as `trustd` may still act on a process's behalf) and the seal; they are not
   a promise that the QA user cannot do anything. Anything the QA user can read, a command it runs can read.
 
 - **The human gate moves.** Today a person types the password per run. After install, any process running as the producer user

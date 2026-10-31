@@ -114,7 +114,7 @@ def real_codex_home():
 
 
 def profile_toml(run_dir, read_roots=()):
-    """Allowlist-only reads, writes confined to the clone and scratch, no network. Measured by the AASM QA campaign with
+    """Allowlist-only reads, writes confined to the clone and scratch, direct socket access refused. Measured by the AASM QA campaign with
     `codex sandbox -P` and a real `codex exec` on codex-cli 0.163.0; the wrapper re-proves it before every run (see
     confinement_probe). NOT enforced by the seatbelt: other processes' environments of the same OS user stay readable."""
     fs = {':minimal': 'read'}
@@ -161,10 +161,14 @@ CONTROLS = (
     ('neg_write_outside', "import sys\ntry:\n    open({canary_dir!r} + '/written.txt', 'w').write('x')\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
     # Network: the profile disables it. A bind that works, or a connect that is not refused outright, means it is not. A denial counts
     # only as EPERM or EACCES (the check below), so a timeout, an unreachable network or 'path too long' (errno None) prove nothing.
-    ('neg_loopback_bind', "import socket\ntry:\n    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    s.bind(('127.0.0.1', 0))\n    s.listen(1)\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
-    ('neg_uds_bind', "import os, socket\nname = 'qa-uds.sock'\ntry:\n    os.chdir({out!r})\n    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.bind(name)\n    s.listen(1)\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)\nfinally:\n    try:\n        os.unlink(name)\n    except OSError:\n        pass", 'DENIED'),
+    ('neg_loopback_bind', "import socket\ntry:\n    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    s.bind(('127.0.0.1', 0))\n    s.listen(1)\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED_EPERM'),
+    ('neg_uds_bind', "import os, socket\nname = 'qa-uds.sock'\ntry:\n    os.chdir({out!r})\n    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.bind(name)\n    s.listen(1)\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)\nfinally:\n    try:\n        os.unlink(name)\n    except OSError:\n        pass", 'DENIED_EPERM'),
     # 192.0.2.1 is TEST-NET-1 (RFC 5737): never routed. A sandbox refuses at once with EPERM; a timeout would mean nothing.
-    ('neg_testnet_connect', "import socket\ntry:\n    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    s.settimeout(3)\n    s.connect(('192.0.2.1', 9))\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
+    ('neg_testnet_connect', "import socket\ntry:\n    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    s.settimeout(3)\n    s.connect(('192.0.2.1', 9))\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED_EPERM'),
+    ('neg_testnet6_connect', "import socket\ntry:\n    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)\n    s.settimeout(3)\n    s.connect(('2001:db8::1', 9))\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED_EPERM'),
+    ('neg_udp_testnet', "import socket\ntry:\n    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n    s.settimeout(3)\n    s.sendto(b'x', ('192.0.2.1', 9))\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED_EPERM'),
+    # The system resolver's socket: a process that can reach it gets name lookups answered by a system daemon on its behalf.
+    ('neg_resolver_socket', "import socket\ntry:\n    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.settimeout(3)\n    s.connect('/var/run/mDNSResponder')\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED_EPERM'),
 )
 # Only with a payload. pos_exec_payload runs inside the sandbox whatever exec_probe_argv() names: ALLOWED when the process started (any exit
 # status, even a timeout), DENIED:<errno> when the spawn itself is refused. It executes producer-supplied code, so it is the one control
@@ -183,6 +187,18 @@ def controls_for(manifest=None):
         return CONTROLS
     wanted = ['neg_write_payload'] + (['pos_exec_payload'] if exec_probe_argv(manifest, '/') else [])
     return CONTROLS + tuple(c for c in PAYLOAD_CONTROLS if c[0] in wanted)
+
+
+def control_ok(expect, observed):
+    """ALLOWED must be ALLOWED. DENIED accepts EPERM or EACCES (a filesystem rule). DENIED_EPERM is for sockets: only the sandbox's own
+    EPERM counts, so ECONNREFUSED, ENETUNREACH, EHOSTUNREACH and a timeout (all of which can happen with no sandbox at all) fail."""
+    if expect == 'ALLOWED':
+        return observed == 'ALLOWED'
+    if expect == 'DENIED_EPERM':
+        return observed == 'DENIED:1'
+    if expect == 'DENIED':
+        return observed in ('DENIED:1', 'DENIED:13')
+    return False          # an unknown expectation (a typo in CONTROLS) never passes
 
 
 SELFTEST_FSIZE_FLOOR = 16 << 20
@@ -262,7 +278,7 @@ def confinement_probe(codex_bin, run_dir, env, manifest=None):
                 got = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else ''
                 # A denial only counts as one when it is EPERM or EACCES: ENOENT (a wrong path), a missing errno or any
                 # other text proves nothing about confinement.
-                ok = done.returncode == 0 and (got == 'ALLOWED' if expect == 'ALLOWED' else got in ('DENIED:1', 'DENIED:13'))
+                ok = done.returncode == 0 and control_ok(expect, got)
                 detail = got or 'exit %s' % done.returncode
                 unrunnable = done.returncode != 0 or not got
             except (OSError, subprocess.SubprocessError) as error:
