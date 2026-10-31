@@ -599,15 +599,20 @@ def _queue_prepare(state_path):
     return directory
 
 
+def _rotate_once(path):
+    """Move a private JSONL log aside to <name>.1 once it passes 1 MiB; one backup, never a symlink."""
+    try:
+        if path.lstat().st_size > RECEIPT_ROTATE_BYTES and not path.is_symlink():
+            os.replace(path, path.with_name(path.name + '.1'))
+    except OSError:
+        pass
+
+
 def _queue_receipt(state_path, event, entry, now, **extra):
     """Append one private JSONL line per transition; rotated once at 1 MiB. Call while holding state_lock."""
     directory = queue_dir(state_path)
     path = directory / 'receipts.jsonl'
-    try:
-        if path.lstat().st_size > RECEIPT_ROTATE_BYTES and not path.is_symlink():
-            os.replace(path, directory / 'receipts.jsonl.1')
-    except OSError:
-        pass
+    _rotate_once(path)
     line = dict({'ts': iso_utc(now), 'event': event, 'id': entry['id'], 'label': entry['label'],
                  'tickets': entry['tickets']}, **extra)
     try:
