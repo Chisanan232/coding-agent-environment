@@ -1531,6 +1531,24 @@ class LocalEquivalentCi(Base):
             with self.subTest(job=job):
                 self.assertRefused(self.gh(job=job), "check ci is FAILURE")
 
+    def test_a_skipped_non_required_check_does_not_block_but_nothing_else_is_relaxed(self):
+        def entry(name, conclusion):
+            return {"__typename": "CheckRun", "name": name, "status": "COMPLETED", "conclusion": conclusion}
+        ok = [entry("ci", "SUCCESS")]
+        counts, bad = omr.summarize_checks(ok + [entry("publish GitHub Release", "SKIPPED"), entry("attest provenance (x)", "SKIPPED")], ["ci"])
+        self.assertEqual(bad, [])
+        self.assertEqual((counts["skipped_ignored"], counts["success"], counts["total"]), (2, 1, 3))   # the omission is visible
+        for verdict in ("FAILURE", "CANCELLED", "TIMED_OUT", "NEUTRAL", "ACTION_REQUIRED", "STARTUP_FAILURE"):
+            with self.subTest(verdict=verdict):
+                self.assertTrue(omr.summarize_checks(ok + [entry("other", verdict)], ["ci"])[1])
+        pending = {"__typename": "CheckRun", "name": "other", "status": "IN_PROGRESS"}
+        self.assertTrue(omr.summarize_checks(ok + [pending], ["ci"])[1])
+        # a required check that skipped, or is missing, still blocks
+        self.assertTrue(omr.summarize_checks([entry("ci", "SKIPPED")], ["ci"])[1])
+        self.assertTrue(omr.summarize_checks([entry("lint", "SKIPPED")], ["ci"])[1])
+        # one skipped entry and one failed entry of the same non-required name: the failure blocks
+        self.assertTrue(omr.summarize_checks(ok + [entry("x", "SKIPPED"), entry("x", "FAILURE")], ["ci"])[1])
+
     def test_only_not_started_verdicts_qualify(self):
         for verdict in ("TIMED_OUT", "SKIPPED", "NEUTRAL", "ACTION_REQUIRED", "IN_PROGRESS", "QUEUED"):
             with self.subTest(verdict=verdict):
