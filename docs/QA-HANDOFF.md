@@ -163,25 +163,38 @@ python3 -I -B scripts/qa-hop-install.py plan --qa-name NAME --qa-uid UID --codex
 Root must not run code that a less-privileged user can change, so the installer refuses unless it, `qa-identity-setup.py`,
 `qa-handoff.py`, `qa-side.py` and every directory above them are root-owned, not group or world writable and link-free, and unless
 you pin two digests that it recomputes from the bytes it loads and copies. `plan` prints the SHA-256 of each of the four files, the
-combined bundle digest and the helper digest. **Your responsibility before approving:** compare them with the reviewed PR head, for
-example (`<head>` is the commit you reviewed):
-
-```
-for f in qa-hop-install qa-identity-setup qa-handoff qa-side; do git show <head>:scripts/$f.py | shasum -a 256; done
-git rev-parse <head>:scripts/qa-side.py        # the blob id of the helper, as shown on the PR
-```
-
-The approval is the copy and then one command, each through your own `sudo` (the installer never asks for or stores a password and
-never calls sudo itself); the digests are the ones `plan` printed:
+combined bundle digest and the helper digest. **But `plan` is computed by the checkout's own code, so on its own it proves nothing
+about that checkout** (a tampered installer could print genuine digests while the files differ). The root-owned copy is therefore
+populated from **git objects of the commit you reviewed**, never from the working tree, and you hash the copy yourself before
+approving. `<REPO>` is your checkout, `<REVIEWED_HEAD>` the full commit id you reviewed (`plan` prints these lines with the
+placeholders):
 
 ```
 sudo install -d -m 755 -o root -g wheel /Library/cae-qa-install
-sudo install -m 644 -o root -g wheel scripts/qa-hop-install.py scripts/qa-identity-setup.py scripts/qa-handoff.py scripts/qa-side.py /Library/cae-qa-install/
+git -C <REPO> archive <REVIEWED_HEAD> scripts/qa-hop-install.py scripts/qa-identity-setup.py scripts/qa-handoff.py scripts/qa-side.py \
+  | sudo tar -x -o -C /Library/cae-qa-install --strip-components=1
+sudo chown -R root:wheel /Library/cae-qa-install && sudo chmod 755 /Library/cae-qa-install && sudo chmod 644 /Library/cae-qa-install/*.py
+
+# hash the files AFTER the copy and compare each with the reviewed object (the two columns must match)
+for f in qa-hop-install qa-identity-setup qa-handoff qa-side; do
+  shasum -a 256 /Library/cae-qa-install/$f.py; git -C <REPO> show <REVIEWED_HEAD>:scripts/$f.py | shasum -a 256; done
+
+# the combined bundle digest: sha256 of the lines "name sha256" for the names in sorted order, rebuilt from the git objects
+for f in qa-handoff qa-hop-install qa-identity-setup qa-side; do
+  printf '%s %s\n' $f.py "$(git -C <REPO> show <REVIEWED_HEAD>:scripts/$f.py | shasum -a 256 | cut -d' ' -f1)"; done | shasum -a 256
+```
+
+The combined digest must equal the one `plan` printed. The ids from `git -C <REPO> rev-parse <REVIEWED_HEAD>:scripts/<file>` are git
+SHA-1 blob ids: informational only (they are what the PR shows), never the pin. Only if every pair and the combined digest match,
+run the one root command, through your own `sudo` (the installer never asks for or stores a password and never calls sudo itself);
+the digests are the ones `plan` printed:
+
+```
 sudo /usr/bin/python3 -I -B /Library/cae-qa-install/qa-hop-install.py apply --qa-name NAME --qa-uid UID \
      --codex-source /path/to/codex --codex-sha256 HEX --bundle-sha256 HEX --helper-sha256 HEX
 ```
 
-(`-B` and `sys.dont_write_bytecode` keep root from writing `__pycache__` anywhere.) In order, `apply`: refuses unless it is root with
+(`-B` and `sys.dont_write_bytecode` keep root from writing `__pycache__` anywhere.) Known and accepted: `qa-handoff.py` reads `qa-side.py` a second time on its own when the installer executes it (defence in depth, not the pin: the installer's trust check, root-owned and link-free, is what keeps the two reads equal). In order, `apply`: refuses unless it is root with
 your uid known, the four scripts and their directories are trusted and both digests match; re-validates every input; creates
 `/Library/cae-qa` (root:wheel 0755) and installs `qa-side` (0555), `qa-side.json` (0444) and the pinned `codex` (0555), each written to
 a temporary name, owner and mode set, digest checked, then renamed; resolves `/etc/sudoers.d` once (it must be a root-owned, link-free
@@ -196,8 +209,9 @@ upper case (`[A-Za-z_][A-Za-z0-9._-]{0,31}`); the QA account name must be lower 
 
 Afterwards, unprivileged: `python3 -I -B scripts/qa-hop-install.py verify <same arguments>`, then `sudo -n -u NAME
 /Library/cae-qa/qa-side version`. Codex smoke test: the delegation refuses the pinned `codex` on purpose, so run it through your
-own password-gated sudo: `sudo -u NAME /Library/cae-qa/codex --version`. Rollback (root, from the same copy; removes the drop-in first,
-then the files, safe to repeat): `sudo /usr/bin/python3 -I -B /Library/cae-qa-install/qa-hop-install.py rollback --qa-name NAME
+own password-gated sudo: `cd / && sudo -u NAME /Library/cae-qa/codex --version`. Rollback (root, from the same copy; removes the drop-in first,
+then the files, safe to repeat; it removes the drop-in at its fixed paths even if `/etc/sudoers.d` fails the trust check, warning loudly, and if
+anything cannot be removed it exits non-zero and prints the exact `sudo rm -f` commands): `sudo /usr/bin/python3 -I -B /Library/cae-qa-install/qa-hop-install.py rollback --qa-name NAME
 --qa-uid UID`.
 
 **Unverified until the owner pilot:** regular-expression arguments and digest pinning under a real `sudo`, `setsid` under it, signal
