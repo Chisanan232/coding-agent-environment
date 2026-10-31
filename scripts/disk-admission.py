@@ -922,8 +922,8 @@ def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_
             lane_full = len(others) + len(orphans) >= lanes
             budget = None
             if host is not None:
-                budget = _shadow_site(host, 'reserve', label, budget_holders(others, orphans, queued, now), budget_request(
-                    declared or {}, nbytes, label), result['tier'], result['free_bytes'], reserved,
+                budget = _shadow_site(host, 'reserve', label, lambda: (budget_holders(others, orphans, queued, now), budget_request(
+                    declared or {}, nbytes, label)), result['tier'], result['free_bytes'], reserved,
                     not lane_full and result['free_bytes'] - reserved - nbytes >= HEAVY_FLOOR)
                 if queue_dir(state_path).exists():
                     _budget_receipt(state_path, {'id': '-', 'label': label, 'tickets': []}, now, budget)
@@ -1593,8 +1593,8 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
             occupied = len(live) + len(granted) + len(orphans) >= lanes
             reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
             if host is not None:
-                out['budget'] = _shadow_site(host, 'advance', first['label'], budget_holders(live, orphans, granted, now),
-                                             budget_request(first, first['bytes'], first['label']), result['tier'],
+                out['budget'] = _shadow_site(host, 'advance', first['label'], lambda: (
+                    budget_holders(live, orphans, granted, now), budget_request(first, first['bytes'], first['label'])), result['tier'],
                                              result['free_bytes'], reserved,
                                              not occupied and result['free_bytes'] - reserved - first['bytes'] >= HEAVY_FLOOR)
                 _budget_receipt(state_path, first, now, out['budget'])
@@ -1737,8 +1737,8 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
             reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
             lane_full = len(live) + len(orphans) >= lanes
             if host is not None:
-                budget = _shadow_site(host, 'claim', label, budget_holders(live, orphans, entries, now, skip_id=qid),
-                                      budget_request(entry, nbytes, label), result['tier'], result['free_bytes'], reserved,
+                budget = _shadow_site(host, 'claim', label, lambda: (budget_holders(live, orphans, entries, now, skip_id=qid),
+                                                          budget_request(entry, nbytes, label)), result['tier'], result['free_bytes'], reserved,
                                       not lane_full and result['free_bytes'] - reserved - nbytes >= HEAVY_FLOOR)
                 _budget_receipt(state_path, entry, now, budget)
             if lane_full:
@@ -1951,6 +1951,7 @@ HEADROOM_PERCENT = {'GREEN': 30, 'AMBER': 40}        # memory kept free: 0.30 / 
 CPU_BUDGET_PERCENT = 100                              # cpu_slots may sum to cores x 1.0
 MAX_CONCURRENT = {'emergency': 0, 'low': 0, 'stable': 1, 'wide': 1}   # constant 1 everywhere a heavy lane exists
 PROBE_CAP = 2                                         # `fits_if_cap_were_2` asks what a second concurrent job would have met
+SHADOW_DEADLINE_S = 3.0                              # overall wall-time cap on one host sample, ps rounds included
 SHADOW_WINDOW_S = 2.0                                 # host sample window; memory-admission's own check uses 10 s
 BAND_RANK = {'GREEN': 0, 'AMBER': 1, 'RED': 2}
 REFERENCE_CLASS = 'build-crate'                       # the snapshot's "would a typical job fit" probe
@@ -2135,9 +2136,24 @@ def _memory_module():
     return module
 
 
-def read_host_sample(window_s=SHADOW_WINDOW_S, sleep=time.sleep, sample_fn=None, rows_fn=None, memory=None):
-    """Windowed host sample for the shadow budget, taken OUTSIDE the admission lock. Never raises: a failure returns
-    {'error': ...}. Reads the same fields as memory-admission (never a command line) plus per-process rss and cpu."""
+def read_host_sample(window_s=SHADOW_WINDOW_S, sleep=time.sleep, sample_fn=None, rows_fn=None, memory=None,
+                     deadline_s=SHADOW_DEADLINE_S):
+    """Windowed host sample for the shadow budget, taken OUTSIDE the admission lock, within an overall wall-time deadline
+    (the window plus every ps/vm_stat/lsof round). Never raises: a failure or a missed deadline returns {'error': ...}; the
+    abandoned worker thread is a daemon that only reads and cannot affect any decision."""
+    import threading
+    box = {}
+
+    def work():
+        box['sample'] = _read_host_sample(window_s, sleep, sample_fn, rows_fn, memory)
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    worker.join(deadline_s)
+    return box.get('sample') or {'error': 'host-sample-timeout: no sample within %g s' % deadline_s}
+
+
+def _read_host_sample(window_s, sleep, sample_fn, rows_fn, memory):
     try:
         memory = memory or _memory_module()
         sample_fn, rows_fn = sample_fn or memory.take_sample, rows_fn or _process_rows
@@ -2164,14 +2180,22 @@ def _host_or_error(host_fn):
         return {'error': 'host-sample-unavailable: %s' % type(exc).__name__}
 
 
-def _shadow_site(host, site, label, holders, request, tier, free_bytes, reserved, enforced_admit):
-    """The budget record for one lane site. The lane check has already decided (`enforced_admit`); this only reports."""
-    caps = {'max_concurrent': MAX_CONCURRENT.get(tier, 0), 'free_bytes': free_bytes, 'reserved_bytes': reserved, 'floor': HEAVY_FLOOR}
-    budget = budget_decision(host, holders, request, caps)
-    budget.update(site=site, label=label, enforced='admit' if enforced_admit else 'refuse')
-    if request is not None:
-        budget['request_cpu_slots'] = request['cpu_slots']
-    return budget
+def _shadow_site(host, site, label, build, tier, free_bytes, reserved, enforced_admit):
+    """The budget record for one lane site. The lane check has already decided (`enforced_admit`); this only reports.
+
+    `build()` returns (holders, request) and runs here, inside the guard: it runs under the admission lock on records that
+    may be malformed, and a failure must only mark the budget unavailable, never change or abort the lane decision."""
+    try:
+        holders, request = build()
+        caps = {'max_concurrent': MAX_CONCURRENT.get(tier, 0), 'free_bytes': free_bytes, 'reserved_bytes': reserved, 'floor': HEAVY_FLOOR}
+        budget = budget_decision(host, holders, request, caps)
+        budget.update(site=site, label=label, enforced='admit' if enforced_admit else 'refuse')
+        if request is not None:
+            budget['request_cpu_slots'] = request['cpu_slots']
+        return budget
+    except Exception as exc:   # never BaseException: Ctrl-C and exit must still work
+        return {'shadow': SHADOW_NOTE, 'status': 'unavailable', 'site': site, 'label': label,
+                'reason': 'budget-computation-failed: %s' % type(exc).__name__}
 
 
 def _compact_budget(budget):
@@ -2183,8 +2207,11 @@ def _compact_budget(budget):
 
 def _budget_receipt(state_path, entry, now, budget):
     """Append the shadow verdict to the existing receipts log (the only thing the shadow budget persists). Under the lock."""
-    if budget.get('status') == 'ok':
-        _queue_receipt(state_path, 'shadow-budget', entry, now, budget=_compact_budget(budget))
+    try:
+        if budget.get('status') == 'ok':
+            _queue_receipt(state_path, 'shadow-budget', entry, now, budget=_compact_budget(budget))
+    except Exception:   # a receipt is observation; it must never abort the lane decision
+        pass
 
 
 def _with_budget(result, budget):
@@ -2193,16 +2220,25 @@ def _with_budget(result, budget):
 
 def _state_budget(host, state_path, now, tier, free_bytes, live, entries, orphans):
     """Budget section for snapshot and status: the occupied budget plus a probe with the reference class."""
-    holders = budget_holders(live, orphans, entries, now)
-    reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
-    state = _shadow_site(host, 'state', None, holders, None, tier, free_bytes, reserved, True)
+    try:
+        reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
+    except Exception:
+        reserved = 0
+    holders = []
+
+    def build(request=None):
+        holders[:] = budget_holders(live, orphans, entries, now)
+        return holders, request
+
+    state = _shadow_site(host, 'state', None, build, tier, free_bytes, reserved, True)
     if state['status'] == 'ok':
         spec = WORKLOAD_CLASSES[REFERENCE_CLASS]
         probe = budget_request({'class': REFERENCE_CLASS, 'mem_bytes': (spec['mem_base_mib'] + spec['mem_per_job_mib'] * spec['jobs']) * MIB,
                                 'cpu_slots': spec['jobs'], 'test_threads': spec['jobs']}, spec['disk_gib'] * GIB, 'reference')
-        verdict = _shadow_site(host, 'state', None, holders, probe, tier, free_bytes, reserved, True)
-        state['reference'] = dict({'class': REFERENCE_CLASS}, **{k: verdict[k] for k in (
-            'would_admit', 'fits_if_cap_were_2', 'resource_reasons', 'cap_reason', 'granted_jobs', 'granted_test_threads')})
+        verdict = _shadow_site(host, 'state', None, lambda: (holders, probe), tier, free_bytes, reserved, True)
+        if verdict['status'] == 'ok':
+            state['reference'] = dict({'class': REFERENCE_CLASS}, **{k: verdict[k] for k in (
+                'would_admit', 'fits_if_cap_were_2', 'resource_reasons', 'cap_reason', 'granted_jobs', 'granted_test_threads')})
     state.pop('enforced', None)
     return state
 

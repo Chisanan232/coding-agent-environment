@@ -407,6 +407,92 @@ class HostSample(unittest.TestCase):
         self.assertEqual(out, {'error': 'process table unreadable'})
 
 
+class Guarded(QueueBase):
+    """A malformed record or sample inside the budget code must leave every admission outcome exactly as without it."""
+
+    def spawn(self):
+        proc = subprocess.Popen(['/bin/sleep', '300'], stdin=subprocess.DEVNULL)
+        self.holders.append(proc)
+        return proc
+
+    def bad_host(self, pid=None):
+        rows = {pid: 'not-a-tuple'} if pid else {}
+        return lambda: host(rows=rows, ram='not-a-number', time=self.now + timedelta(seconds=1))
+
+    def assert_unavailable(self, budget):
+        self.assertEqual((budget['status'], budget['shadow']), ('unavailable', 'shadow: not enforced'))
+        self.assertIn('budget-computation-failed', budget['reason'])
+
+    def test_reserve_admit_and_refuse_are_identical_with_a_malformed_sample(self):
+        first, second = self.spawn(), self.spawn()
+        args = (20 * GIB, first.pid, self.path, lambda: 400 * GIB)
+        admitted = da.reserve('one', *args, now=self.now, host_fn=self.bad_host(first.pid), declared=CRATE)
+        self.assertTrue(admitted['admit'], admitted)
+        self.assert_unavailable(admitted['budget'])
+        plain = da.reserve('two', 20 * GIB, second.pid, self.path, lambda: 400 * GIB, now=self.now)
+        guarded = da.reserve('two', 20 * GIB, second.pid, self.path, lambda: 400 * GIB, now=self.now, host_fn=self.bad_host(first.pid))
+        self.assertFalse(guarded['admit'])
+        self.assertEqual({k: v for k, v in guarded.items() if k != 'budget'}, plain)
+        self.assert_unavailable(guarded['budget'])
+
+    def test_advance_decides_the_same_with_a_malformed_sample(self):
+        busy = self.holder('busy')
+        self.assertTrue(self.enqueue()['ok'])
+        out = da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, host_fn=self.bad_host(busy.pid))
+        self.assertEqual((out['reason'], out['granted']), ('lane occupied', []))
+        self.assert_unavailable(out['budget'])
+        self.assertEqual([r for r in (self.path.parent / 'queue/receipts.jsonl').read_text().splitlines() if 'shadow-budget' in r], [])
+
+    def test_claim_decides_the_same_with_a_malformed_sample(self):
+        self.assertTrue(self.enqueue()['ok'])
+        qid = da.queue_advance(self.path, lambda: 400 * GIB, now=self.now)['granted'][0]
+        entry = self.entries()[qid]
+        blocker = self.spawn()
+        with da.state_lock(self.path):
+            da.write_reservation(self.path, 'blocker', 10 * GIB, blocker.pid, da.process_token(blocker.pid), self.now + timedelta(hours=1))
+        kw = dict(pid=os.getpid(), now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda p, a: None)
+        refused = da.queue_claim(self.path, qid, entry['label'], entry['bytes'], ARGV, str(self.worktree), lambda: 400 * GIB,
+                                 host_fn=self.bad_host(blocker.pid), **kw)
+        self.assertFalse(refused['ok'])
+        self.assertTrue(refused['reason'].startswith('lane-cap'))
+        self.assert_unavailable(refused['budget'])
+        with da.state_lock(self.path):
+            (self.path.parent / 'reservations/blocker.json').unlink()
+        ok = da.queue_claim(self.path, qid, entry['label'], entry['bytes'], ARGV, str(self.worktree), lambda: 400 * GIB,
+                            host_fn=self.bad_host(), **kw)
+        self.assertTrue(ok['ok'], ok)
+        self.assert_unavailable(ok['budget'])
+
+    def test_malformed_holder_records_are_guarded_at_the_builder(self):
+        for bad in (lambda: ([{'label': 'x'}], request()), lambda: ([da.budget_holder('orphan', {'label': 'x'}, None, 5, {'members': [{}]})], None)):
+            self.assert_unavailable(da._shadow_site(host(), 'reserve', 'x', bad, 'wide', 400 * GIB, 0, True))
+        self.assertEqual(da._shadow_site(host(), 'reserve', 'x', lambda: ([], request()), 'wide', 400 * GIB, 0, True)['status'], 'ok')
+
+    def test_state_budget_with_a_malformed_record_is_unavailable_not_an_error(self):
+        out = da._state_budget(host(), self.path, self.now, 'wide', 400 * GIB, [{'bytes': 1}], [], [])
+        self.assert_unavailable(out)
+
+    def test_base_exceptions_are_not_swallowed(self):
+        def interrupt():
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            da._shadow_site(host(), 'reserve', 'x', interrupt, 'wide', 400 * GIB, 0, True)
+
+
+class Deadline(unittest.TestCase):
+    def test_a_slow_sampler_marks_the_sample_unavailable_within_the_deadline(self):
+        import time
+        started = time.monotonic()
+        out = da.read_host_sample(window_s=0, sleep=lambda s: None, sample_fn=lambda: time.sleep(2) or {}, rows_fn=lambda: {},
+                                  deadline_s=0.2)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIn('host-sample-timeout', out['error'])
+        self.assertEqual(da.budget_decision(out, [], request(), CAPS)['status'], 'unavailable')
+
+    def test_the_default_deadline_covers_the_window(self):
+        self.assertGreater(da.SHADOW_DEADLINE_S, da.SHADOW_WINDOW_S)
+
+
 class Unchanged(unittest.TestCase):
     def test_the_lane_caps_and_concurrency_constants(self):
         self.assertEqual(da.HEAVY_LANES, {'emergency': 0, 'low': 0, 'stable': 1, 'wide': 1})
