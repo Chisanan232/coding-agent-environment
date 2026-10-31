@@ -58,8 +58,8 @@ def metrics(**kw):
                      sample(10, swapins=pages, **kw))
 
 
-def ps_line(pid, ppid, state, etime, cputime, pcpu, comm):
-    return f"{pid:>6} {ppid:>6} {state:<2} {etime:>12} {cputime:>10} {pcpu:>5} {comm}"
+def ps_line(pid, ppid, state, etime, cputime, pcpu, comm, rss="1024"):
+    return f"{pid:>6} {ppid:>6} {state:<2} {etime:>12} {cputime:>10} {pcpu:>5} {rss:>9} {comm}"
 
 
 def ps_out(*lines):
@@ -93,6 +93,8 @@ class Parsing(unittest.TestCase):
             return type("R", (), {"returncode": 0, "stdout": out})()
         s = ma.take_sample(run=run, now_fn=lambda: 5.0, mono_fn=lambda: 5.0, load_fn=lambda: (1.0, 1.0, 1.0), cpu_fn=lambda: 16, disk_free_fn=lambda: GIB)
         self.assertEqual(s["heavy_procs"], {"cargo": 1, "rustc": 2})
+        (w,) = s["heavy_workloads"]   # zsh, both rustc and claude hang under the one cargo
+        self.assertEqual((w["root_pid"], w["root_comm"], w["procs"], w["rss_bytes"], w["idle"]), (10, "cargo", 5, 5 * 1024 * 1024, False))
         self.assertEqual((s["pressure_level"], s["ram"]), (2, RAM))
 
     def test_take_sample_survives_failing_commands(self):
@@ -652,6 +654,87 @@ class IdleOrphan(unittest.TestCase):
         clock = iter([0, 0, 3, 6, 9, 12])                           # start, then one reading per lookup: three seconds pass each time
         ma.fill_cwds(recs, run, budget=8, now=lambda: next(clock))
         self.assertEqual(timeouts, [4, 4, 2])                         # the third is clamped to what is left of the 8 s
+
+
+class WorkloadTree(unittest.TestCase):
+    """SPE-150: a build is one workload (a process tree), not one lane per heavy-named process."""
+
+    take = IdleOrphan.take
+    OLD = ("3-00:00:00", "0:10.00", "0.0")   # etime, cputime, pcpu of a quiet process that has been around a while
+
+    def line(self, pid, ppid, comm, state="S", rss="1048576", times=None):
+        return ps_line(pid, ppid, state, *(times or self.OLD), comm, rss)
+
+    def tree(self, root_ppid=500, **kw):
+        return [self.line(100, root_ppid, "/x/cargo", **kw), self.line(101, 100, "/x/rustc", **kw), self.line(102, 100, "/x/rustc", **kw),
+                self.line(103, 100, "/x/rustc", **kw), self.line(104, 100, "/work/target/debug/deps/app-abc", **kw)]
+
+    def test_cargo_with_rustc_children_and_a_test_binary_is_one_workload_with_summed_rss(self):
+        s = self.take(ps_out(*self.tree(state="R")))
+        (w,) = s["heavy_workloads"]
+        self.assertEqual((w["root_pid"], w["root_comm"], w["procs"], w["rss_bytes"], w["idle"]), (100, "cargo", 5, 5 * GIB, False))
+        self.assertEqual(s["heavy_procs"], {"cargo": 1, "rustc": 3})   # name counts are unchanged for compatibility
+        m = ma.derive(sample(0), dict(sample(10), heavy_workloads=s["heavy_workloads"]))
+        reasons, _ = ma.refusal_reasons("heavy", m)
+        self.assertEqual(len([r for r in reasons if "heavy build workload" in r]), 1)
+        self.assertIn("1 heavy build workload(s) running (cargo: 5 procs, 5.0 GiB): one heavy lane at a time", " ".join(reasons))
+
+    def test_two_separate_trees_are_two_workloads(self):
+        other = [self.line(200, 500, "/x/cargo", state="R"), self.line(201, 200, "/x/rustc", state="R")]
+        s = self.take(ps_out(*self.tree(state="R"), *other))
+        self.assertEqual([(w["root_pid"], w["procs"]) for w in s["heavy_workloads"]], [(100, 5), (200, 2)])
+
+    def test_a_heavy_process_under_a_shell_inside_a_build_belongs_to_the_outer_workload(self):
+        s = self.take(ps_out(self.line(100, 500, "/x/cargo", state="R"), self.line(101, 100, "/bin/sh", state="R"), self.line(102, 101, "/usr/bin/cc1", state="R")))
+        (w,) = s["heavy_workloads"]
+        self.assertEqual((w["root_pid"], w["procs"]), (100, 3))
+
+    def test_idle_orphan_cargo_with_an_idle_rustc_child_is_an_idle_tree_and_does_not_refuse(self):
+        s = self.take(ps_out(*self.tree(root_ppid=1)))
+        (w,) = s["heavy_workloads"]
+        self.assertTrue(w["idle"])
+        m = ma.derive(s, s)
+        self.assertTrue(m["heavy_workloads"][0]["idle"])
+        self.assertEqual([r for r in ma.refusal_reasons("heavy", m)[0] if "workload" in r], [])
+
+    def test_one_member_spending_cpu_makes_the_tree_active(self):
+        first = self.take(ps_out(*self.tree(root_ppid=1)))
+        busier = self.tree(root_ppid=1)
+        busier[2] = self.line(102, 100, "/x/rustc", times=("3-00:00:00", "0:10.50", "0.0"))
+        m = ma.derive(first, self.take(ps_out(*busier)))
+        self.assertFalse(m["heavy_workloads"][0]["idle"])
+        reasons, _ = ma.refusal_reasons("heavy", m)
+        self.assertIn("one heavy lane at a time", " ".join(reasons))
+
+    def test_a_non_heavy_member_spending_cpu_makes_the_tree_active(self):
+        first = self.take(ps_out(*self.tree(root_ppid=1)))
+        busier = self.tree(root_ppid=1)
+        busier[4] = self.line(104, 100, "/work/target/debug/deps/app-abc", times=("3-00:00:00", "0:10.50", "0.0"))
+        self.assertFalse(ma.derive(first, self.take(ps_out(*busier)))["heavy_workloads"][0]["idle"])
+
+    def test_a_member_missing_from_the_first_sample_makes_the_tree_active(self):
+        first = self.take(ps_out(*self.tree(root_ppid=1)[:4]))
+        self.assertFalse(ma.derive(first, self.take(ps_out(*self.tree(root_ppid=1))))["heavy_workloads"][0]["idle"])
+
+    def test_a_tree_that_was_active_in_the_first_sample_stays_active_when_quiet_now(self):
+        first = self.take(ps_out(*self.tree(root_ppid=1, state="R")))
+        self.assertFalse(ma.derive(first, self.take(ps_out(*self.tree(root_ppid=1))))["heavy_workloads"][0]["idle"])
+
+    def test_an_active_member_keeps_the_orphan_root_out_of_the_idle_report(self):
+        first = self.take(ps_out(*self.tree(root_ppid=1)))
+        busier = self.tree(root_ppid=1)
+        busier[1] = self.line(101, 100, "/x/rustc", state="R")
+        m = ma.derive(first, self.take(ps_out(*busier)))
+        self.assertEqual(m["idle_procs"], [])
+
+    def test_missing_or_garbled_rss_fails_closed(self):
+        no_rss = "   100      1 S    3-00:00:00    0:10.00   0.0 /x/cargo"   # the rss column is absent
+        self.assertEqual(self.take(ps_out(no_rss, self.line(7, 500, "/bin/zsh")))["heavy_procs"], {"cargo": 1})
+        self.assertIsNone(self.take(ps_out(self.line(7, 500, "/bin/zsh", rss="12x"), self.line(8, 500, "/bin/zsh")))["heavy_procs"])
+        self.assertIsNone(self.take(ps_out(no_rss.replace("cargo", "zsh")))["heavy_procs"])
+        s = self.take(ps_out(self.line(100, 1, "/x/cargo", rss="garbled")))
+        self.assertEqual(s["heavy_procs"], {"cargo": 1})
+        self.assertFalse(s["heavy_workloads"][0]["idle"])
 
 
 if __name__ == "__main__":
