@@ -78,6 +78,9 @@ def _load_side():
             raise SystemExit(64)
         data = handle.read()
     # One read: these exact bytes are executed here, hashed, and (with --qa-identity) copied into the inbox for the QA user.
+    # Defence in depth, not the pin: when the installer runs this module it has already executed its own single read of qa-side.py
+    # (the bytes its digest binds). This is a second, independent read of the same path; the installer's trust check (root-owned,
+    # link-free, not writable) is what makes the two reads equal, so a hole there is a hole in both.
     module = types.ModuleType('qa_side')
     module.__file__ = str(path)
     exec(compile(data, str(path), 'exec'), module.__dict__)
@@ -946,11 +949,12 @@ class NoKeepalive:
         return {'mode': 'unattended', 'interval_seconds': None, 'refreshes': 0, 'failures': []}
 
 
-def unattended_install(ident, config_path=None, helper_path=None, anchor='/'):
+def unattended_install(ident, config_path=None, helper_path=None, anchor='/', producer_uid=None):
     """Per-run verification of the installed delegation, as the producer and without sudo: the helper, qa-side.json and the
     pinned Codex are each reached through root-owned, non-writable, non-link components from `anchor` (so a swapped or
     writable link anywhere in /Library/cae-qa fails the run), the config names exactly this identity, this user and this
-    exchange, and the helper and Codex digests are recomputed here. Returns (record, problems); record is None on any
+    exchange, and the helper and Codex digests are recomputed here. `producer_uid` defaults to the caller; the installer
+    passes the invoking owner's uid because it runs this same check as root. Returns (record, problems); record is None on any
     problem. Messages carry no file contents."""
     side = _SIDE
     config_path = config_path or side.CONFIG_PATH
@@ -962,7 +966,7 @@ def unattended_install(ident, config_path=None, helper_path=None, anchor='/'):
         problems = []
         if config['qa_name'] != ident.name or config['qa_uid'] != ident.uid:
             problems.append('qa-side.json names another QA identity')
-        if config['producer_uid'] != os.getuid():
+        if config['producer_uid'] != (os.getuid() if producer_uid is None else producer_uid):
             problems.append('qa-side.json names another producer user')
         if config['exchange'] != str(ident.exchange):
             problems.append('qa-side.json names another exchange directory')

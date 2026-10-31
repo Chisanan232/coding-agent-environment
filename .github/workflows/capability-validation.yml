@@ -18,6 +18,7 @@ on:
       - 'docs/ENGINEERING-BASELINE.md'
       - 'scripts/qa-identity-setup.py'
       - 'scripts/qa-side.py'
+      - 'scripts/qa-hop-install.py'
       - 'scripts/resource-policy-install.py'
       - 'scripts/launcher-install.py'
       - 'scripts/hook-rollout.py'
@@ -142,6 +143,7 @@ jobs:
           python3 tests/test-qa-identity-setup.py
           python3 tests/test-qa-side.py
           python3 tests/test-qa-handoff-unattended.py
+          python3 tests/test-qa-hop-install.py
           python3 tests/test-parity-dogfood.py
   native-resource-wire:
     runs-on: macos-14
