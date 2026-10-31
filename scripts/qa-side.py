@@ -113,8 +113,9 @@ def real_codex_home():
     return Path(os.environ.get('CODEX_HOME') or HOME / '.codex')
 
 
-def profile_toml(run_dir, read_roots=()):
-    """Allowlist-only reads, writes confined to the clone and scratch, direct socket access refused. Measured by the AASM QA campaign with
+def profile_toml(run_dir, read_roots=(), home=None, codex_home=None, endpoint=None):
+    """Allowlist-only reads, writes confined to the clone and scratch, direct socket access refused (with `endpoint`, only the two
+    sockets of the per-run daemon endpoint can be reached). Measured by the AASM QA campaign with
     `codex sandbox -P` and a real `codex exec` on codex-cli 0.163.0; the wrapper re-proves it before every run (see
     confinement_probe). NOT enforced by the seatbelt: other processes' environments of the same OS user stay readable."""
     fs = {':minimal': 'read'}
@@ -125,15 +126,173 @@ def profile_toml(run_dir, read_roots=()):
     for sub in ('source', 'out', 'tmp', 'home', 'cargo-target'):
         fs[str(run_dir / sub)] = 'write'
     for rel in SECRET_DIRS:
-        fs[str(HOME / rel)] = 'deny'
-    fs[str(real_codex_home())] = 'deny'
+        fs[str(Path(home or HOME) / rel)] = 'deny'
+    fs[str(codex_home or real_codex_home())] = 'deny'
+    if endpoint is not None:
+        fs[str(endpoint.state)] = 'read'        # the daemon's state is what the independent QA inspects; it may not change it
     # No [projects] table on purpose: the clone is the commit under test, and a trusted project lets its own
     # .codex/config.toml widen this profile (measured: a planted allowlist entry made a canary read ALLOWED).
     lines = ['approval_policy = "never"', 'cli_auth_credentials_store = "file"', 'default_permissions = "%s"' % PROFILE, '',
              '[permissions.%s.filesystem]' % PROFILE]
     lines += ['%s = "%s"' % (json.dumps(k), v) for k, v in fs.items()]
-    lines += ['', '[permissions.%s.network]' % PROFILE, 'enabled = false', '']
+    if endpoint is None:
+        lines += ['', '[permissions.%s.network]' % PROFILE, 'enabled = false', '']
+        return '\n'.join(lines)
+    # Daemon-endpoint mode: no TCP at all. Codex's managed proxy must be on for the unix_sockets table to apply (with enabled=false it is
+    # ignored, measured), and with allow_local_binding=false and no domains every TCP, UDP and DNS path stays refused. Only the daemon's
+    # socket and the relay's socket may be reached.
+    lines += ['', '[features]', 'network_proxy = true', '', '[permissions.%s.network]' % PROFILE, 'enabled = true', 'mode = "limited"',
+              'allow_local_binding = false', 'enable_socks5 = false', '', '[permissions.%s.network.unix_sockets]' % PROFILE,
+              '%s = "allow"' % json.dumps(str(endpoint.daemon_sock)), '%s = "allow"' % json.dumps(str(endpoint.relay_sock)), '']
     return '\n'.join(lines)
+
+
+# --- daemon endpoint (SPE-145 PR-b): pure generators; nothing here starts a process -------------------------------------------------
+# A producer's candidate daemon cannot run inside the Codex profile (it binds a TCP port, which the profile refuses), so cae starts it
+# outside Codex under a sandbox-exec profile generated here, plus a relay between one Unix socket and that one port. Every value that
+# reaches a profile comes from cae (QA home, exchange, attempt, port, contract table); the payload supplies only a binary path that
+# is checked against its manifest. Profiles are never written from payload text.
+ENDPOINT_CONTRACTS = {
+    'fornax-daemon/1': {'state_env': 'FORNAX_HOME', 'port_env': 'FORNAX_HTTP_PORT', 'sock': 'fornax.sock'},
+}
+RELAY_SOCK_NAME = 'http.sock'
+SUN_PATH_LIMIT = 104                      # sockaddr_un.sun_path on macOS, including the terminating NUL
+PORT_RANGE = (20000, 32767)               # outside the ephemeral range, so a random pick rarely collides with an outgoing connection
+# System helpers a process could use to reach the network on someone else's behalf; denied to the daemon and the relay. This is a
+# measured deny list, not a proof that no such helper exists (Codex tool commands still reach trustd; see docs/QA-HANDOFF.md).
+MACH_DENY = ('com.apple.trustd', 'com.apple.trustd.agent', 'com.apple.ocspd', 'com.apple.dnssd.service', 'com.apple.nsurlsessiond',
+             'com.apple.nesessionmanager', 'com.apple.cfnetwork.cfnetworkagent')
+SAFE_PATH_RE = re.compile(r'/[A-Za-z0-9._/-]*')
+
+
+class EndpointError(ValueError):
+    pass
+
+
+def _safe_abs(path, what):
+    """An absolute, normalised path made of a conservative character set, so it can sit inside a quoted profile string unchanged."""
+    text = str(path)
+    if not SAFE_PATH_RE.fullmatch(text) or os.path.normpath(text) != text or text == '/':
+        raise EndpointError('%s is not a plain absolute normalised path' % what)
+    return text
+
+
+class Endpoint:
+    """Where one run's daemon endpoint lives and what it may touch. dir is <qa_home>/e/<12 hex of sha256(attempt)>: short enough for a
+    Unix socket, outside every directory a tool command may write, and derivable by both hops so no request carries it."""
+
+    def __init__(self, qa_home, exchange, attempt, port, contract, payload_dir, daemon_binary):
+        spec = ENDPOINT_CONTRACTS.get(contract)
+        if spec is None:
+            raise EndpointError('unknown endpoint contract')
+        if isinstance(port, bool) or not isinstance(port, int) or not PORT_RANGE[0] <= port <= PORT_RANGE[1]:
+            raise EndpointError('port outside %d-%d' % PORT_RANGE)
+        self.contract, self.spec, self.port = contract, spec, port
+        self.home = _safe_abs(qa_home, 'QA home')
+        self.exchange = _safe_abs(exchange, 'exchange')
+        self.payload_dir = _safe_abs(payload_dir, 'payload directory')
+        self.daemon_binary = _safe_abs(daemon_binary, 'daemon binary')
+        if not self.daemon_binary.startswith(self.payload_dir + '/'):
+            raise EndpointError('the daemon binary is not inside the payload')
+        self.dir = Path(self.home) / 'e' / hashlib.sha256(str(attempt).encode()).hexdigest()[:12]
+        self.state, self.tmp, self.rl = self.dir / 's', self.dir / 't', self.dir / 'rl'
+        self.daemon_sock = self.state / spec['sock']
+        self.relay_sock = self.rl / RELAY_SOCK_NAME
+        for sock in (self.daemon_sock, self.relay_sock):
+            _safe_abs(sock, 'socket path')
+            if len(str(sock).encode()) >= SUN_PATH_LIMIT:
+                raise EndpointError('socket path %s is %d bytes; the limit is %d' % (sock.name, len(str(sock).encode()), SUN_PATH_LIMIT - 1))
+
+    def ancestors(self, *leaves):
+        """Every directory above the given paths, outermost first. A read-deny profile has to allow stat (metadata only) on these or a
+        process cannot open its own allowed directory; listing and content stay refused."""
+        seen = []
+        for leaf in leaves:
+            for parent in reversed(Path(leaf).parents):
+                if str(parent) != '/' and str(parent) not in seen:
+                    seen.append(str(parent))
+        return seen
+
+    def daemon_env(self):
+        """The whole environment of the daemon: nothing is inherited."""
+        return {'PATH': '/usr/bin:/bin', self.spec['state_env']: str(self.state), self.spec['port_env']: str(self.port),
+                'TMPDIR': str(self.tmp)}
+
+    def tool_env(self):
+        """Variables for tool commands and needs_endpoint self-tests (paths only, never the port)."""
+        return {'QA_ENDPOINT_STATE': str(self.state), 'QA_ENDPOINT_SOCK': str(self.daemon_sock), 'QA_ENDPOINT_HTTP_SOCK': str(self.relay_sock)}
+
+
+def _sb_header():
+    return ['(version 1)', '(allow default)', '(deny network*)',
+            '(deny mach-lookup %s)' % ' '.join('(global-name "%s")' % name for name in MACH_DENY)]
+
+
+def _read_deny(endpoint):
+    roots = ['/Users', endpoint.home, endpoint.exchange]
+    out = []
+    for root in roots:
+        if root not in out:
+            out.append(root)
+    return ['(deny file-read* %s)' % ' '.join('(subpath "%s")' % root for root in out)]
+
+
+def daemon_sb(endpoint):
+    """sandbox-exec profile of the candidate daemon: no network except binding its one loopback port and a socket under its state
+    directory; reads denied under /Users, the QA home and the exchange except its own endpoint directory and the payload; writes only
+    to its state and tmp. File-read-metadata on the ancestors is what lets sqlite open a database below a denied directory."""
+    lines = _sb_header()
+    lines += ['(allow network-bind (local ip "localhost:%d"))' % endpoint.port, '(allow network-inbound (local ip "localhost:%d"))' % endpoint.port,
+              '(allow network-bind (local unix-socket (subpath "%s")))' % endpoint.state,
+              '(allow network-inbound (local unix-socket (subpath "%s")))' % endpoint.state]
+    lines += _read_deny(endpoint)
+    lines += ['(allow file-read-metadata %s)' % ' '.join('(literal "%s")' % a for a in endpoint.ancestors(endpoint.dir, endpoint.payload_dir)),
+              '(allow file-read* (subpath "%s") (subpath "%s"))' % (endpoint.dir, endpoint.payload_dir), '(deny file-write*)',
+              '(allow file-write* (subpath "%s") (subpath "%s") (literal "/dev/null") (literal "/dev/dtracehelper"))' % (endpoint.state, endpoint.tmp)]
+    return '\n'.join(lines) + '\n'
+
+
+def relay_sb(endpoint):
+    """sandbox-exec profile of the relay: it may connect only to the daemon's loopback port, bind only its own socket, and write only
+    there. The relay code is RELAY_SRC, run as `python3 -I -c`, so nothing under a denied directory is read."""
+    lines = _sb_header()
+    lines += ['(allow network-outbound (remote ip "localhost:%d"))' % endpoint.port,
+              '(allow network-bind (local unix-socket (subpath "%s")))' % endpoint.rl,
+              '(allow network-inbound (local unix-socket (subpath "%s")))' % endpoint.rl]
+    lines += _read_deny(endpoint)
+    lines += ['(allow file-read-metadata %s)' % ' '.join('(literal "%s")' % a for a in endpoint.ancestors(endpoint.dir)),
+              '(allow file-read* (subpath "%s"))' % endpoint.dir, '(deny file-write*)',
+              '(allow file-write* (subpath "%s") (literal "/dev/null"))' % endpoint.rl]
+    return '\n'.join(lines) + '\n'
+
+
+# Forwards bytes between one Unix socket and one fixed 127.0.0.1 port, nothing else. argv: socket path, port.
+RELAY_SRC = '''import asyncio, os, sys
+SOCK, PORT = sys.argv[1], int(sys.argv[2])
+async def pipe(r, w):
+    try:
+        while (d := await r.read(65536)):
+            w.write(d); await w.drain()
+    except Exception: pass
+    finally:
+        try: w.close()
+        except Exception: pass
+async def handle(cr, cw):
+    try: ur, uw = await asyncio.open_connection('127.0.0.1', PORT)
+    except Exception: cw.close(); return
+    await asyncio.gather(pipe(cr, uw), pipe(ur, cw))
+async def main():
+    srv = await asyncio.start_unix_server(handle, SOCK); os.chmod(SOCK, 0o600)
+    async with srv: await srv.serve_forever()
+asyncio.run(main())
+'''
+
+
+def endpoint_digests(endpoint):
+    """The values a record binds so a changed profile or relay is visible to the producer, which regenerates all of them itself."""
+    return {'daemon_profile_sha256': hashlib.sha256(daemon_sb(endpoint).encode()).hexdigest(),
+            'relay_profile_sha256': hashlib.sha256(relay_sb(endpoint).encode()).hexdigest(),
+            'relay_source_sha256': hashlib.sha256(RELAY_SRC.encode()).hexdigest()}
 
 
 def prepare_codex_home(run_dir, read_roots=(), home=None):
