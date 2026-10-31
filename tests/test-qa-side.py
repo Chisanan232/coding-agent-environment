@@ -1039,6 +1039,13 @@ class EndpointProfileTests(unittest.TestCase):
                      {"qa_home": "/Users/qa dir"}, {"qa_home": '/Users/q"a'}, {"qa_home": "/Users/qa\\x"}, {"qa_home": "/Users/qa/../x"},
                      {"qa_home": "relative/home"}, {"qa_home": "/"}, {"exchange": "/Users/Shared//qa-qa"}, {"exchange": "/Users/qa)(allow default"},
                      {"payload_dir": self.PAY + "\n(allow default)"}, {"daemon_binary": "/usr/bin/true"},
+                     {"qa_home": "//Users/qa"}, {"exchange": "//Users/Shared/qa-qa"},
+                     {"payload_dir": "/Users", "daemon_binary": "/Users/x"},                        # would cancel the read-deny
+                     {"payload_dir": self.EX, "daemon_binary": self.EX + "/bin/daemon"},           # not strictly inside the exchange
+                     {"payload_dir": self.HOME + "/p", "daemon_binary": self.HOME + "/p/d"},       # outside the exchange
+                     {"exchange": self.HOME}, {"exchange": self.HOME + "/ex", "payload_dir": self.HOME + "/ex/p",
+                                               "daemon_binary": self.HOME + "/ex/p/d"},             # exchange inside the home
+                     {"qa_home": self.EX + "/home"},                                                # home inside the exchange
                      {"daemon_binary": self.PAY + "/../../x"}, {"qa_home": "/Users/" + "q" * 80}):
             with self.assertRaises(side.EndpointError, msg=str(over)):
                 self.endpoint(**over)
@@ -1055,14 +1062,17 @@ class EndpointProfileTests(unittest.TestCase):
         self.assertIn('(allow network-bind (local unix-socket (subpath "%s")))' % e.state, lines)
         deny = next(i for i, l in enumerate(lines) if l.startswith("(deny file-read*"))
         allow = next(i for i, l in enumerate(lines) if l.startswith("(allow file-read* "))
-        self.assertLess(deny, allow)                                    # SBPL: the later rule wins, so the re-allow must come last
-        self.assertIn('(subpath "/Users")', lines[deny])
-        self.assertIn('(subpath "%s")' % self.HOME, lines[deny])
-        self.assertIn('(subpath "%s")' % self.EX, lines[deny])
-        self.assertEqual(lines[allow], '(allow file-read* (subpath "%s") (subpath "%s"))' % (e.dir, self.PAY))
-        meta = next(l for l in lines if l.startswith("(allow file-read-metadata"))
-        for anc in ("/Users", self.HOME, self.HOME + "/e", "/Users/Shared", self.EX, self.EX + "/outbox", self.EX + "/outbox/att-1"):
+        meta_at = next(i for i, l in enumerate(lines) if l.startswith("(allow file-read-metadata"))
+        self.assertLess(deny, meta_at)                                  # SBPL: the later rule wins, so every re-allow must come after the deny
+        self.assertLess(deny, allow)
+        for root in side.READ_DENY + (self.HOME, self.EX):
+            self.assertIn('(subpath "%s")' % root, lines[deny])
+        self.assertEqual(lines[allow], '(allow file-read* (subpath "%s") (subpath "%s") (subpath "%s"))' % (e.state, e.tmp, self.PAY))
+        self.assertNotIn('(subpath "%s")' % e.rl, lines[allow])         # the daemon has no business in the relay directory
+        meta = lines[meta_at]
+        for anc in ("/Users", self.HOME, self.HOME + "/e", str(e.dir), "/Users/Shared", self.EX, self.EX + "/outbox", self.EX + "/outbox/att-1"):
             self.assertIn('(literal "%s")' % anc, meta)
+        self.assertLess(lines.index("(allow default)"), next(i for i, l in enumerate(lines) if l.startswith("(deny mach-lookup")))
         self.assertNotIn("subpath", meta)                               # metadata only on the literal ancestors: no listing, no content
         self.assertIn("(deny file-write*)", lines)
         writes = next(l for l in lines if l.startswith("(allow file-write*"))
@@ -1078,8 +1088,15 @@ class EndpointProfileTests(unittest.TestCase):
         self.assertEqual([l for l in lines if "network-outbound" in l], ['(allow network-outbound (remote ip "localhost:23456"))'])
         self.assertIn('(allow network-bind (local unix-socket (subpath "%s")))' % e.rl, lines)
         self.assertEqual(next(l for l in lines if l.startswith("(allow file-write*")), '(allow file-write* (subpath "%s") (literal "/dev/null"))' % e.rl)
-        self.assertEqual(next(l for l in lines if l.startswith("(allow file-read* ")), '(allow file-read* (subpath "%s"))' % e.dir)
+        self.assertEqual(next(l for l in lines if l.startswith("(allow file-read* ")), '(allow file-read* (subpath "%s"))' % e.rl)
         self.assertNotIn(self.PAY, "\n".join(lines))                    # the relay never needs the payload
+        deny = next(i for i, l in enumerate(lines) if l.startswith("(deny file-read*"))
+        self.assertLess(deny, next(i for i, l in enumerate(lines) if l.startswith("(allow file-read-metadata")))
+        self.assertLess(deny, next(i for i, l in enumerate(lines) if l.startswith("(allow file-read* ")))
+        for root in side.READ_DENY + (self.HOME, self.EX):
+            self.assertIn('(subpath "%s")' % root, lines[deny])
+        self.assertLess(lines.index("(allow default)"), next(i for i, l in enumerate(lines) if l.startswith("(deny mach-lookup")))
+        self.assertLess(lines.index("(deny file-write*)"), next(i for i, l in enumerate(lines) if l.startswith("(allow file-write*")))
 
     def test_relay_source_is_fixed_and_forwards_to_loopback_only(self):
         self.assertIn("open_connection('127.0.0.1', PORT)", side.RELAY_SRC)
@@ -1099,11 +1116,12 @@ class EndpointProfileTests(unittest.TestCase):
 
     def test_ancestors_are_outermost_first_and_unique(self):
         e = self.endpoint()
-        got = e.ancestors(e.dir, self.PAY)
+        got = e.ancestors(e.state, self.PAY)
         self.assertEqual(got[0], "/Users")
         self.assertEqual(len(got), len(set(got)))
         self.assertNotIn("/", got)
-        self.assertNotIn(str(e.dir), got)
+        self.assertIn(str(e.dir), got)
+        self.assertNotIn(str(e.state), got)
 
 
 class NetworkControlTests(unittest.TestCase):
