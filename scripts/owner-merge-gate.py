@@ -20,7 +20,10 @@ Review evidence (self-attested by the authenticated identity) is a PR comment wr
 It pins the reviewed head, so any later push invalidates it. It records an independent review; it is
 never a GitHub approval and the gate never presents it as one. External-CI-unavailable exception:
   OWNER-MERGE-CI-UNAVAILABLE head=<40-hex> cause=<billing|quota|outage> local_equivalent=PASS
-and only together with --ci-unavailable and only when no check genuinely failed.
+and only together with --ci-unavailable and only when no check genuinely failed. With cause=billing, a failed or cancelled
+GitHub Actions job is not 'genuinely failed' when it executed zero steps and its check-run annotation carries GitHub's billing text
+(or it is a matrix job cancelled because such a billing-blocked sibling failed); everything else (a job that ran a step, a non-Actions
+check, an unknown annotation, any API error) still refuses. Waived jobs are listed in facts.ci_unavailable_checks and are never a CI pass.
 No-hosted-CI exception (a repository that defines no CI workflow at all, founder-approved per PR; not a CI pass):
   OWNER-MERGE-CI-EXCEPTION head=<40-hex> basis=no-hosted-ci local_equivalent=PASS
 and only together with --ci-exception, only when the head has zero checks, only when the repository's .github/workflows
@@ -323,6 +326,81 @@ def no_hosted_ci(run, repo, base, head, files, cross_repository=False):
     return not has_workflows(run, repo, base) and not has_workflows(run, repo, head)
 
 
+BILLING_TEXT = "recent account payments have failed or your spending limit needs to be increased"
+SIBLING_CANCEL_RE = re.compile(r'The strategy configuration was canceled because "([^"]+)" failed')
+WAIVABLE_CONCLUSIONS = {"FAILURE", "CANCELLED"}
+
+
+def _norm_job(name):
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+def _billing_job_facts(run, repo, head, name, run_id, job_id):
+    """Read-only look at one GitHub Actions job. Returns (billing_annotated, canceled_because_of, zero_steps).
+    Any unexpected shape, truncation or API error raises: the caller treats that as 'not waivable'."""
+    check = _json(run, "api", f"repos/{repo}/check-runs/{job_id}")
+    if not isinstance(check, dict) or str(check.get("id")) != job_id or check.get("head_sha") != head \
+            or (check.get("app") or {}).get("slug") != "github-actions" or check.get("name") != name:
+        raise ValueError("check run is not this head's GitHub Actions job")
+    job = _json(run, "api", f"repos/{repo}/actions/jobs/{job_id}")
+    if not isinstance(job, dict) or str(job.get("id")) != job_id or str(job.get("run_id")) != run_id \
+            or job.get("head_sha") != head or not isinstance(job.get("steps"), list):
+        raise ValueError("job record does not match the check run or the steps are unknown")
+    zero_steps = all(isinstance(s, dict) and s.get("conclusion") == "skipped" for s in job["steps"])
+    notes = _json(run, "api", f"repos/{repo}/check-runs/{job_id}/annotations?per_page=100")
+    if not isinstance(notes, list) or not notes or len(notes) >= 100 or not all(isinstance(n, dict) for n in notes):
+        raise ValueError("annotations missing, malformed or possibly truncated")
+    messages = [str(n.get("message") or "") for n in notes]
+    billing = any(BILLING_TEXT in m.lower() for m in messages)
+    sibling = None
+    if not billing:
+        found = {m.group(1) for t in messages for m in [SIBLING_CANCEL_RE.search(t)] if m}
+        if len(found) == 1:
+            sibling = found.pop()
+    return billing, sibling, zero_steps
+
+
+def billing_waiver(run, repo, head, checks):
+    """Waive failed checks only when each is a GitHub Actions job that executed zero steps and is either annotated with
+    GitHub's billing text or is a matrix job cancelled because one billing-blocked sibling of the same workflow run failed.
+    Returns (waived entries, []) when every failed check qualifies, otherwise (None, reasons). Never presents any of them as passing."""
+    url_re = re.compile(r"https://github\.com/" + re.escape(repo) + r"/actions/runs/(\d+)/job/(\d+)", re.I)
+    failed = [c for c in checks if (c.get("conclusion") or c.get("state") or "").upper() in FAIL]
+    info, bad = [], []
+    for c in failed:
+        name = c.get("name") or ""
+        m = url_re.fullmatch(c.get("detailsUrl") or "")
+        conclusion = (c.get("conclusion") or "").upper()
+        if c.get("__typename") != "CheckRun" or not m or not name or conclusion not in WAIVABLE_CONCLUSIONS \
+                or c.get("status") != "COMPLETED":
+            bad.append(f"{name or '?'}: not a completed failed/cancelled GitHub Actions job")
+            continue
+        try:
+            billing, sibling, zero = _billing_job_facts(run, repo, head, name, m.group(1), m.group(2))
+        except Exception as ex:  # fail closed on any API or parsing problem
+            bad.append(f"{name}: evidence unreadable ({type(ex).__name__})")
+            continue
+        if not zero:
+            bad.append(f"{name}: the job executed steps")
+        elif not billing and not (sibling and conclusion == "CANCELLED"):
+            bad.append(f"{name}: no recognised billing annotation")
+        else:
+            info.append({"name": name, "conclusion": conclusion, "run_id": m.group(1), "job_id": m.group(2),
+                         "billing": billing, "sibling": sibling})
+    for e in info:
+        if e["billing"]:
+            e["reason"] = "billing-annotated job, zero steps executed"
+            continue
+        direct = [d for d in info if d["billing"] and d["run_id"] == e["run_id"] and _norm_job(d["name"]) == _norm_job(e["sibling"])]
+        if len(direct) == 1:
+            e["reason"] = f"matrix sibling cancelled because billing-blocked job {direct[0]['name']!r} failed, zero steps executed"
+        else:
+            bad.append(f"{e['name']}: cancelled sibling not tied to exactly one billing-blocked job of the same run")
+    if bad or not info or len(info) != len(failed):
+        return None, bad or ["no failed checks to waive"]
+    return [{"name": e["name"], "conclusion": e["conclusion"], "job_id": e["job_id"], "reason": e["reason"]} for e in info], []
+
+
 def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_policy=None, ci_exception=False):
     """Return (verdict, reasons, facts). `run` executes gh and returns stdout (injected in tests)."""
     bots = {norm_bot(b) for b in (bots or BOT_LOGINS)}
@@ -482,10 +560,26 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
               if (c.get("conclusion") or c.get("state") or "").upper() in FAIL]
     pending = [c.get("name") or c.get("context") for c in checks
                if c.get("status") not in (None, "COMPLETED") or (c.get("state") or "").upper() in ("PENDING", "EXPECTED")]
-    if failed:
+    waived = None
+    if failed and ci_unavailable:
+        recs = [m for t in texts for m in CI_RE.findall(t) if m[0] == head and m[2] == "PASS"]
+        if recs and recs[-1][1] == "billing":  # quota and outage keep the old behaviour: a failed check still refuses
+            waived, why = billing_waiver(run, repo, head, checks)
+            if waived is None:
+                facts["ci_unavailable_refused"] = why[:10]
+    if failed and waived is None:
         reasons.append(f"CI_FAILED: {sorted(set(failed))[:5]}")
     elif pending:
         wait.append(f"CI_PENDING: {sorted(set(pending))[:5]}")
+    elif waived is not None:
+        done = [c for c in checks if (c.get("conclusion") or c.get("state") or "").upper() not in FAIL]
+        if all((c.get("conclusion") or c.get("state") or "").upper() in OK for c in done):
+            facts["ci_exception"] = "billing"
+            facts["ci_unavailable_checks"] = waived
+            facts["ci_verdict"] = ("NOT_A_CI_PASS: these Actions jobs were blocked by billing and never ran; the recorded "
+                                   "local-equivalent evidence stands in for them, they are not green")
+        else:
+            reasons.append("NO_CI_EVIDENCE: a non-failed check is not in a successful state alongside the billing-blocked jobs")
     elif not checks or not all((c.get("conclusion") or c.get("state") or "").upper() in OK for c in checks) \
             or not any((c.get("conclusion") or c.get("state") or "").upper() == "SUCCESS" for c in checks):
         ci = [m for t in texts for m in CI_RE.findall(t) if m[0] == head and m[2] == "PASS"]

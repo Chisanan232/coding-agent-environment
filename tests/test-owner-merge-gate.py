@@ -550,5 +550,127 @@ class ReviewHardening(unittest.TestCase):
         self.assertEqual(omg.verify(lambda *a: self.fail("gh"), "Chisanan232/r", 7, "abc")["verdict"], "ERROR")
 
 
+class BillingCI(unittest.TestCase):
+    """--ci-unavailable with cause=billing waives only Actions jobs that never ran a step (SPE-149)."""
+
+    RECORD = f"OWNER-MERGE-CI-UNAVAILABLE head={HEAD} cause=billing local_equivalent=PASS"
+    TEXT = "The job was not started because recent account payments have failed or your spending limit needs to be increased."
+
+    def job(self, jid, name, conclusion="FAILURE", **over):
+        c = {"__typename": "CheckRun", "name": name, "status": "COMPLETED", "conclusion": conclusion,
+             "detailsUrl": f"https://github.com/Chisanan232/r/actions/runs/900/job/{jid}"}
+        c.update(over)
+        return c
+
+    def fake(self, checks, notes, steps=None, record=None, errors=(), **over):
+        comments = [{"author": {"login": "chisanan232"}, "body": REVIEW},
+                    {"author": {"login": "chisanan232"}, "body": record or self.RECORD}]
+        fake = Fake(statusCheckRollup=checks, comments=comments, **over)
+        base = fake.__call__
+        by_id = {str(c["detailsUrl"]).rpartition("/")[2]: c for c in checks if c.get("detailsUrl")}
+
+        def call(*a):
+            if a[0] == "api" and a[1].startswith("repos/Chisanan232/r/") and ("/check-runs/" in a[1] or "/actions/jobs/" in a[1]):
+                jid = a[1].split("/")[4 if "/check-runs/" in a[1] else 5].split("?")[0]
+                if jid in errors:
+                    raise RuntimeError("gh api failed: HTTP 502")
+                c = by_id[jid]
+                if "/annotations" in a[1]:
+                    return json.dumps([{"message": m} for m in notes.get(jid, [])])
+                if "/check-runs/" in a[1]:
+                    return json.dumps({"id": int(jid), "head_sha": HEAD, "name": c["name"], "app": {"slug": "github-actions"}})
+                return json.dumps({"id": int(jid), "run_id": 900, "head_sha": HEAD, "name": c["name"],
+                                   "steps": (steps or {}).get(jid, [])})
+            return base(*a)
+        return call
+
+    def verdict(self, *a, **k):
+        return run(self.fake(*a, **k), ci_unavailable=True)
+
+    def test_billing_annotated_job_with_no_steps_is_waived_and_never_called_green(self):
+        v, reasons, facts = self.verdict([self.job("1", "t"), self.job("2", "lint", "SUCCESS")], {"1": [self.TEXT]})
+        self.assertEqual((v, reasons, facts["ci_exception"]), ("PASS", [], "billing"))
+        self.assertEqual([c["name"] for c in facts["ci_unavailable_checks"]], ["t"])
+        self.assertEqual(facts["ci_unavailable_checks"][0]["conclusion"], "FAILURE")
+        self.assertTrue(facts["ci_verdict"].startswith("NOT_A_CI_PASS"))
+
+    def test_skipped_only_steps_count_as_not_executed(self):
+        v, _, _ = self.verdict([self.job("1", "t")], {"1": [self.TEXT]}, steps={"1": [{"conclusion": "skipped"}]})
+        self.assertEqual(v, "PASS")
+
+    def test_matrix_sibling_cancelled_by_a_billing_blocked_job_is_waived(self):
+        cancel = 'The strategy configuration was canceled because "t._py311" failed'
+        v, _, facts = self.verdict([self.job("1", "t (py311)"), self.job("2", "t (py312)", "CANCELLED")],
+                                   {"1": [self.TEXT], "2": [cancel]})
+        self.assertEqual(v, "PASS")
+        self.assertEqual(len(facts["ci_unavailable_checks"]), 2)
+
+    def test_matrix_sibling_of_a_real_failure_refuses(self):
+        cancel = 'The strategy configuration was canceled because "t._py311" failed'
+        for notes in ({"1": ["Process completed with exit code 1."], "2": [cancel]}, {"2": [cancel]}):
+            with self.subTest(notes=notes):
+                checks = [self.job("1", "t (py311)"), self.job("2", "t (py312)", "CANCELLED")]
+                v, reasons, _ = self.verdict(checks, notes, steps={"1": [{"conclusion": "failure"}]})
+                self.assertEqual(v, "REFUSE")
+                self.assertTrue(any(r.startswith("CI_FAILED") for r in reasons))
+
+    def test_a_job_that_executed_a_step_refuses_even_with_the_billing_text(self):
+        v, reasons, _ = self.verdict([self.job("1", "t")], {"1": [self.TEXT]}, steps={"1": [{"conclusion": "success"}]})
+        self.assertEqual(v, "REFUSE")
+        self.assertTrue(reasons[0].startswith("CI_FAILED"))
+
+    def test_non_actions_check_failing_refuses(self):
+        sonar = {"__typename": "StatusContext", "context": "SonarCloud", "state": "FAILURE"}
+        v, reasons, _ = self.verdict([self.job("1", "t"), sonar], {"1": [self.TEXT]})
+        self.assertEqual(v, "REFUSE")
+        sonar_run = self.job("3", "Sonar", detailsUrl="https://sonarcloud.io/dashboard?id=x")
+        self.assertEqual(self.verdict([self.job("1", "t"), sonar_run], {"1": [self.TEXT]})[0], "REFUSE")
+
+    def test_a_non_failed_but_unsuccessful_check_blocks_the_waiver(self):
+        sonar = {"__typename": "StatusContext", "context": "SonarCloud", "state": "ERRORISH"}
+        v, reasons, _ = self.verdict([self.job("1", "t"), sonar], {"1": [self.TEXT]})
+        self.assertEqual(v, "REFUSE")
+
+    def test_pending_check_still_waits(self):
+        pend = {"__typename": "CheckRun", "name": "slow", "status": "IN_PROGRESS", "conclusion": ""}
+        self.assertEqual(self.verdict([self.job("1", "t"), pend], {"1": [self.TEXT]})[0], "WAIT")
+
+    def test_flag_record_head_and_cause_are_all_required(self):
+        checks, notes = [self.job("1", "t")], {"1": [self.TEXT]}
+        v, reasons, _ = run(self.fake(checks, notes))  # no flag
+        self.assertEqual(v, "REFUSE")
+        for record in (self.RECORD.replace(HEAD, "d" * 40), self.RECORD.replace("billing", "quota"),
+                       self.RECORD.replace("billing", "outage"), self.RECORD.replace("PASS", "FAIL")):
+            with self.subTest(record=record):
+                v, reasons, _ = self.verdict(checks, notes, record=record)
+                self.assertEqual(v, "REFUSE")
+                self.assertTrue(reasons[0].startswith("CI_FAILED"))
+        v, _, _ = omg.evaluate(self.fake(checks, notes, record="unrelated"), "Chisanan232/r", 7, OWNERS, ci_unavailable=True)
+        self.assertEqual(v, "REFUSE")
+
+    def test_a_later_non_billing_record_overrides_a_billing_one(self):
+        fake = self.fake([self.job("1", "t")], {"1": [self.TEXT]})
+        # rebuild with both records, billing first then quota
+        comments = [{"author": {"login": "chisanan232"}, "body": b} for b in (REVIEW, self.RECORD, self.RECORD.replace("billing", "quota"))]
+        f2 = Fake(statusCheckRollup=[self.job("1", "t")], comments=comments)
+        self.assertEqual(run(lambda *a: fake(*a) if a[:2] != ("pr", "view") else f2(*a), ci_unavailable=True)[0], "REFUSE")
+
+    def test_unknown_missing_or_truncated_annotation_refuses(self):
+        for notes in ({"1": ["Process completed with exit code 1."]}, {}, {"1": [self.TEXT] * 100}):
+            with self.subTest(n=len(notes.get("1", []))):
+                self.assertEqual(self.verdict([self.job("1", "t")], notes)[0], "REFUSE")
+
+    def test_api_error_refuses(self):
+        v, reasons, facts = self.verdict([self.job("1", "t")], {"1": [self.TEXT]}, errors=("1",))
+        self.assertEqual(v, "REFUSE")
+        self.assertIn("ci_unavailable_refused", facts)
+
+    def test_only_cancelled_and_failed_actions_jobs_for_this_repo_qualify(self):
+        for over in ({"conclusion": "TIMED_OUT"}, {"__typename": "StatusContext"},
+                     {"detailsUrl": "https://github.com/other/r/actions/runs/900/job/1"}, {"detailsUrl": ""}):
+            with self.subTest(over=over):
+                self.assertEqual(self.verdict([self.job("1", "t", **over)], {"1": [self.TEXT]})[0], "REFUSE")
+
+
 if __name__ == "__main__":
     unittest.main()
