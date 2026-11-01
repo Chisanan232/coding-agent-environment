@@ -849,6 +849,20 @@ class EndpointManifestHelperTests(Scratch):
         self.assertEqual(doc["endpoint"], {"daemon": "bin/daemon", "contract": "fornax-daemon/1"})
         self.assertEqual([t["needs_endpoint"] for t in doc["selftests"]], [False, True])
 
+    def test_plan_accepts_the_unix_contract_and_checks_its_seed_files(self):
+        directory = self.make_dir()
+        (directory / "state-seed").mkdir()
+        (directory / "state-seed" / "install.json").write_bytes(b"{}\n")
+        out = self.run_helper("plan", "--dir", str(directory), "--scope", "s", "--endpoint-daemon", "bin/daemon", "--endpoint-contract", "circinus-daemon/1")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout)["endpoint"], {"daemon": "bin/daemon", "contract": "circinus-daemon/1"})
+        os.chmod(directory / "state-seed" / "install.json", 0o755)          # an executable seed file is kind=exec: refused by the seed rules
+        out = self.run_helper("plan", "--dir", str(directory), "--scope", "s", "--endpoint-daemon", "bin/daemon", "--endpoint-contract", "circinus-daemon/1")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("kind=data", out.stdout)
+        out = self.run_helper("plan", "--help")
+        self.assertIn("circinus-daemon/1", out.stdout)
+
     def test_plan_refuses_half_an_endpoint_and_flag_without_endpoint(self):
         directory = self.make_dir()
         self.assertNotEqual(self.run_helper("plan", "--dir", str(directory), "--scope", "s", "--endpoint-daemon", "bin/daemon").returncode, 0)
