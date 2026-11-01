@@ -633,7 +633,8 @@ class UnattendedEndpointTests(PayloadBase):
                 "codex_controls": [{"control": n, "observed": {"ALLOWED": "ALLOWED", "DENIED_PROXY": "DENIED_PROXY"}.get(x, "DENIED:1")}
                                    for n, _, x in SIDE.ENDPOINT_CODEX_CONTROLS],
                 "port_proof": {"listeners": ["127.0.0.1:%d" % endpoint.port], "daemon_pid": 7},
-                "teardown": {"clean": True, "descendants_left": [], "not_ours": False},
+                "teardown": {"clean": True, "descendants_left": [], "not_ours": False, "relay_stopped": True, "daemon_stopped": True,
+                             "port_closed": True, "sockets_gone": True, "dir_removed": True},
                 "selftests": [{"id": "t", "exit": 0, "timed_out": False, "unrunnable": False, "stdout_bytes": 3, "stdout_sha256": self.tool_out,
                                "stderr_bytes": 0, "stderr_sha256": "0" * 64, "elapsed": 0.1}],
                 **SIDE.endpoint_digests(endpoint)}
