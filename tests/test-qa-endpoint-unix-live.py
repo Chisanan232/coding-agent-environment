@@ -103,6 +103,14 @@ def usable():
     return sys.platform == "darwin" and CODEX and os.access(CODEX, os.X_OK) and (side.real_codex_home() / "auth.json").exists()
 
 
+def remove(path):
+    """The staged payload is 0555 like a real outbox copy: make every directory writable again, then remove the tree."""
+    for top, dirs, _ in os.walk(path):
+        for name in dirs:
+            os.chmod(os.path.join(top, name), 0o700)
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def peer_pid(conn):
     return struct.unpack("i", conn.getsockopt(side.SOL_LOCAL, side.LOCAL_PEERPID, 4))[0]
 
@@ -110,7 +118,7 @@ def peer_pid(conn):
 class Base(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix=".cae-unix-live-", dir=str(Path.home())))
-        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.addCleanup(remove, self.root)
         self.qa_home, self.ex = self.root / "qa", self.root / "x"
         (self.qa_home / ".codex").mkdir(parents=True)
         os.symlink(side.real_codex_home() / "auth.json", self.qa_home / ".codex" / "auth.json")      # the login, as a link only: never read here
