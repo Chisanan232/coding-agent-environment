@@ -379,7 +379,8 @@ chooses the interpreter that runs every root-pinned Python script, including the
   framework version tree is root-owned and not group/other writable; a link stays inside the tree or under `/System` or `/usr/lib`; at most 50000 entries.
   Run by `plan`, by `apply` (as root, which also refuses to run under any other interpreter), by `verify` and before every `--unattended` run; the installed
   helper's first line must equal `SHEBANG`. About 20 ms on the measured tree (2006 entries).
-- **Residual:** ACLs are not visible to this Python check (the owner readback lists them with `ls -le`); a Command Line Tools update changes the path or
+- **Rollback is covered too:** `apply` and `rollback` both refuse to run as root under any other interpreter (the installer carries its own copy of the constant, asserted equal to the helper's); the refusal message names the manual `rm -f` of the drop-in.
+- **Residual:** `qa-identity-setup.py` (the attended identity setup) and `qa-payload-manifest.py` still use `/usr/bin/python3`; they are outside the unattended helper's interpreter choice and are not run under the sudo delegation. ACLs are not visible to this Python check (the owner readback lists them with `ls -le`); a Command Line Tools update changes the path or
   tree and fails closed until the install is redone.
 
 ## Version history
