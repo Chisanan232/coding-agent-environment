@@ -352,7 +352,7 @@ class RunTests(RunBase):
         self.assertEqual(self.launched["probe_request"], {"verb": "probe", "attempt": attempt, "pid": 4242,
                                                            "sentinel": "qa-sentinel-" + "ab" * 16})
         self.assertEqual(self.launched["argv"], qa.helper_argv(self.ident, "exec", attempt))
-        self.assertEqual(self.launched["request"], {"verb": "exec", "attempt": attempt, "timeout": 900, "profile_sha256": self.profile})
+        self.assertEqual(self.launched["request"], {"verb": "exec", "attempt": attempt, "timeout": 900, "profile_sha256": self.profile, "network": "none", "port": 0})
         mocks["hop"].assert_not_called()                     # the attended terminal-detaching hop is never used
         self.assertNotIn("qa-side.py", self.launched["inbox"])  # no helper copy is handed over: the pinned install runs
         self.assertIn("packet.json", self.launched["inbox"])
@@ -488,7 +488,7 @@ class LowFindingsTests(RunBase):
         self.assertIn("run `sudo -v` in the owner Terminal", note["note"])
 
 
-class UnattendedPayloadTests(RunBase):
+class PayloadBase(RunBase):
     """The payload rides on the existing stage verb and request.json: no new verb, no new key, the same fixed sudo argv."""
 
     def setUp(self):
@@ -542,10 +542,13 @@ class UnattendedPayloadTests(RunBase):
             self.stack.close()
         return code, out.getvalue(), mocks
 
+class UnattendedPayloadTests(PayloadBase):
+    """The payload rides on the existing stage verb and request.json."""
+
     def test_payload_is_staged_into_the_inbox_and_the_stage_budget_covers_the_self_tests(self):
         code, out, mocks = self.run_payload()
         self.assertEqual(code, 0)
-        self.assertEqual(self.observed["request"], {"verb": "stage", "attempt": self.calls[1][1]})      # request.json is unchanged
+        self.assertEqual(self.observed["request"], {"verb": "stage", "attempt": self.calls[1][1], "network": "none", "port": 0})
         self.assertEqual(self.observed["payload_files"], ["MANIFEST.json", "bin", "bin/tool"])
         self.assertEqual(self.observed["mode"], 0o500)                                                   # owner-only in the inbox
         self.assertGreaterEqual(self.observed["seconds"], qa.STAGE_SECONDS + SIDE.payload_stage_seconds(self.payload.manifest))
@@ -591,6 +594,104 @@ class UnattendedPayloadTests(RunBase):
         code, out, mocks = self.run_payload(payload={"manifest_sha256": "9" * 64, "staged": True, "problems": []})
         self.assertEqual(code, qa.EXIT["QA_INVALID"])
 
+
+class UnattendedEndpointTests(PayloadBase):
+    """A daemon-endpoint run (--no-model): the request carries network and port, the producer expects the QA side's record to match what it
+    derives itself, and nothing that fails that check reaches the next step."""
+
+    def setUp(self):
+        super().setUp()
+        import hashlib
+        shutil_rm = __import__("shutil").rmtree
+        shutil_rm(self.run_dir / "payload")
+        src = self.run_dir / "payload-src"
+        daemon = b"#!/bin/sh\nexit 0\n"
+        (src / "bin/daemon").write_bytes(daemon)
+        os.chmod(src / "bin/daemon", 0o755)
+        manifest = json.loads((src / "MANIFEST.json").read_text())
+        manifest["schema"] = "cae-qa-payload/2"
+        manifest["files"].append({"path": "bin/daemon", "sha256": hashlib.sha256(daemon).hexdigest(), "size": len(daemon), "kind": "exec"})
+        manifest["files"].sort(key=lambda f: f["path"])
+        manifest["endpoint"] = {"daemon": "bin/daemon", "contract": "fornax-daemon/1"}
+        manifest["selftests"][0]["needs_endpoint"] = True
+        raw = json.dumps(manifest).encode()
+        (src / "MANIFEST.json").write_bytes(raw)
+        fd = os.open(src, os.O_RDONLY | os.O_DIRECTORY)
+        SIDE.copy_payload(fd, str(self.run_dir / "payload"), SIDE.parse_manifest(raw), raw, SIDE.INBOX_MODES)
+        os.close(fd)
+        self.payload = qa.PayloadRun(SIDE.parse_manifest(raw), raw)
+        self.packet["payload"].update(schema="cae-qa-payload/2", manifest_sha256=self.payload.sha, files=2)
+        self.packet["network"] = "daemon-endpoint"
+        self.args = qa.build_parser().parse_args(["run", "--run-dir", str(self.run_dir), "--unattended", "--qa-identity", QA.pw_name,
+                                                  "--timeout", "900", "--no-model"])
+        self.ident = qa.Identity(QA.pw_name, QA.pw_uid, Path("/tmp/qahome-t"), self.exchange, 0)      # short: a Unix socket path must fit 104 bytes
+
+    def endpoint_record(self, endpoint):
+        return {"established": True, "problems": [],
+                "controls": [{"control": n, "observed": {"ALLOWED": "ALLOWED", "REFUSED": "REFUSED"}.get(x, "DENIED:1")}
+                             for n, x in SIDE.endpoint_control_expectations(endpoint).items()],
+                "codex_controls": [{"control": n, "observed": {"ALLOWED": "ALLOWED", "DENIED_PROXY": "DENIED_PROXY"}.get(x, "DENIED:1")}
+                                   for n, _, x in SIDE.ENDPOINT_CODEX_CONTROLS],
+                "port_proof": {"listeners": ["127.0.0.1:%d" % endpoint.port], "daemon_pid": 7},
+                "teardown": {"clean": True, "descendants_left": [], "not_ours": False},
+                "selftests": [{"id": "t", "exit": 0, "timed_out": False, "unrunnable": False, "stdout_bytes": 3, "stdout_sha256": self.tool_out,
+                               "stderr_bytes": 0, "stderr_sha256": "0" * 64, "elapsed": 0.1}],
+                **SIDE.endpoint_digests(endpoint)}
+
+    def run_endpoint(self, mutate=None):
+        seen = {}
+        original_hop = self.hop
+
+        def hop(ident, verb, attempt, seconds):
+            if verb == "stage":
+                (inbox,) = [p for p in (self.exchange / "inbox").iterdir() if p.is_dir()]
+                request = json.loads((inbox / "request.json").read_text())
+                seen["request"], seen["seconds"] = request, seconds
+                outbox = self.exchange / "outbox" / attempt
+                endpoint = qa.endpoint_for(self.ident, attempt, outbox, request["port"], self.payload.manifest)
+                record = self.endpoint_record(endpoint)
+                profile = qa.expected_endpoint_profile_sha(self.ident, outbox, endpoint)
+                controls = SIDE.controls_for(self.payload.manifest)
+                self.stage_record = {"confinement": {"controls": [{"control": n, "observed": "ALLOWED" if e == "ALLOWED" else "DENIED:1"}
+                                                                   for n, _, e in controls]},
+                                     "profile_sha256": profile, "payload": {"manifest_sha256": self.payload.sha, "staged": True, "problems": []},
+                                     "endpoint": record}
+                if mutate:
+                    mutate(self.stage_record, record)
+            return original_hop(ident, verb, attempt, seconds)
+        finished = []
+        code, out, mocks = self.go(helper_hop=unittest.mock.patch.object(qa, "helper_hop", side_effect=hop), payload=self.payload,
+                                   finish=unittest.mock.patch.object(qa, "finish_no_model", side_effect=lambda *a, **k: finished.append(1) or 0))
+        return code, out, seen, finished
+
+    def test_the_request_carries_network_and_a_port_in_range_and_the_budget_grows(self):
+        code, out, seen, finished = self.run_endpoint()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(finished, [1])
+        self.assertEqual(seen["request"]["network"], "daemon-endpoint")
+        self.assertTrue(SIDE.PORT_RANGE[0] <= seen["request"]["port"] <= SIDE.PORT_RANGE[1])
+        self.assertGreaterEqual(seen["seconds"], qa.STAGE_SECONDS + SIDE.ENDPOINT_STAGE_SECONDS)
+        confinement = json.loads((self.run_dir / "CONFINEMENT.json").read_text())
+        self.assertTrue(confinement["established"])
+        self.assertEqual(confinement["endpoint"]["derived_by"], "producer")
+        self.assertTrue(json.loads((self.run_dir / "SELFTEST.json").read_text())["passed"])
+
+    def test_a_profile_digest_the_producer_does_not_compute_is_not_established(self):
+        code, out, seen, finished = self.run_endpoint(lambda stage, record: stage.update(profile_sha256="3" * 64))
+        self.assertEqual(code, qa.EXIT["QA_INVALID"])
+        self.assertEqual(finished, [])
+        self.assertIn("not the one this producer computes", out)
+
+    def test_a_bad_endpoint_record_stops_before_the_self_test_gate_and_the_next_hop(self):
+        for label, change in (("teardown", lambda s, r: r["teardown"].update(clean=False)),
+                              ("missing record", lambda s, r: s.pop("endpoint")),
+                              ("control", lambda s, r: r["codex_controls"][2].update(observed="ALLOWED")),
+                              ("port", lambda s, r: r["port_proof"].update(listeners=["*:1"]))):
+            self.setUp()
+            code, out, seen, finished = self.run_endpoint(change)
+            self.assertEqual(code, qa.EXIT["QA_INVALID"], label)
+            self.assertEqual(finished, [], label)
+            self.assertFalse((self.run_dir / "SELFTEST.json").exists(), label)
 
 class AttendedUnchangedTests(Case):
     def test_attended_mode_json_and_keepalive_are_untouched(self):

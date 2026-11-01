@@ -481,6 +481,17 @@ def endpoint_probe_table(endpoint, canary, auth, canary_port, decoy, state_probe
     return [(name, profile, _probe(body), expect) for name, profile, body, expect in table]
 
 
+# Time budget of an endpoint stage beyond the base probe: both generated profiles' controls, the Codex-side controls (60 s each at most),
+# the daemon and relay start-up waits and teardown.
+ENDPOINT_STAGE_SECONDS = 60 * 46 + 300
+
+
+def endpoint_control_expectations(endpoint):
+    """{control name: expected} for the controls EndpointLifecycle.prove_profiles runs, so the producer can demand every one of them by
+    name and recompute each result itself. The table does not depend on the placeholder values."""
+    return {name: expect for name, _, _, expect in endpoint_probe_table(endpoint, '/canary', '/auth', 1, '/decoy', None)}
+
+
 def endpoint_result_ok(expect, observed):
     if expect in ('ALLOWED', 'REFUSED'):
         return observed == expect
