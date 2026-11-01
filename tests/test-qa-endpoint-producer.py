@@ -405,6 +405,12 @@ class UnixVerifyTests(UnixBase):
         record["socket_recheck"].update(daemon_pid=7100, peer_pgid=7100)
         self.assertTrue(any("proved again" in p for p in self.verify(record)[1]))
 
+    def test_the_recheck_must_be_of_the_same_socket_inode(self):
+        record = copy.deepcopy(self.record)
+        record["socket_recheck"].update(inode_before_connect=record["socket_proof"]["inode_before_connect"] + 1,
+                                        inode_after_connect=record["socket_proof"]["inode_before_connect"] + 1)
+        self.assertTrue(any("proved again" in p for p in self.verify(record)[1]))
+
     def test_the_uid_comes_from_the_producer_not_the_record(self):
         self.assertTrue(self.verify(uid=None)[1])
         self.assertTrue(self.verify(uid=UID + 1)[1])

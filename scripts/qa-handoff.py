@@ -1547,8 +1547,8 @@ def verify_unix_endpoint_record(record, endpoint, codex, manifest, uid):
     proof, recheck = socket_proof_view(record.get('socket_proof'), endpoint, uid), socket_proof_view(record.get('socket_recheck'), endpoint, uid)
     if proof is None:
         problems.append('the socket proof does not show the daemon\'s process group serving %s as the QA user' % endpoint.daemon_sock.name)
-    if recheck is None or (proof is not None and recheck['daemon_pid'] != proof['daemon_pid']):
-        problems.append('the socket was not proved again, for the same daemon, before the endpoint was torn down')
+    if recheck is None or (proof is not None and (recheck['daemon_pid'] != proof['daemon_pid'] or recheck['inode_before_connect'] != proof['inode_before_connect'])):
+        problems.append('the socket was not proved again, for the same daemon and the same socket inode, before the endpoint was torn down')
         recheck = None
     teardown = record.get('teardown')
     steps = _SIDE.ENDPOINT_TEARDOWN_STEPS['unix']

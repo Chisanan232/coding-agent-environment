@@ -437,7 +437,10 @@ Decision:
   The helper would then talk to that socket as a confused deputy. So the helper first connects, then reads the peer's uid and process
   group and walks the path with lstat again, which must give the same inode (recorded as `inode_before_connect` and
   `inode_after_connect`). Only then does it send the ping. On any mismatch the connection is closed with no byte written. Readiness pings
-  use the same check.
+  use the same check. The two inode readings are not independent evidence: a daemon can point a link at another socket, let `connect()` resolve it, and put the
+  original node back before the second walk. The guarantee is the peer check (uid and process group), made on the connected socket; and because
+  `LOCAL_PEERPID` names the last process to do I/O on the socket and can name one that has exited, a daemon that forks until it gets that pid back
+  inside its own group could pass the guard for another listener of the QA user. The impact is one fixed 18-byte ping, of which only `ping_mode` is kept.
 - **What the peer and inet checks cannot see.** `LOCAL_PEERPID`, its process group and `lsof -g<pgid>` all miss a descendant that called
   `setsid()` and holds the listener or an inet socket. The inet check therefore also asks `lsof -p` for every process below the daemon by
   parent pid, which covers a `setpgid()` escape. A descendant that called `setsid()` and lost its parent is still missed. For such a process

@@ -950,14 +950,14 @@ class EndpointLifecycle:
             raise EndpointFailed('the daemon holds %d IPv4 or IPv6 socket%s' % (len(found), '' if len(found) == 1 else 's'))
 
     def _socket_still_held(self):
-        """The cheap check of every supervision poll: the same socket inode, and no IPv4 or IPv6 socket in the daemon's group."""
+        """The cheap check of every supervision poll: the same socket inode, and no IPv4 or IPv6 socket in the daemon's group or among its descendants."""
         if self._socket_node() != self._sock_node:
             raise EndpointFailed('the daemon socket was replaced')
         self._check_no_inet()
 
     def supervise(self, final=False):
         """One poll step for the helper's wait loop. The moment the daemon exits, or the ownership proof stops holding (tcp-relay: a second
-        listener, a wildcard bind, another owner; unix: the socket replaced, an IPv4/IPv6 socket in the daemon's group), the relay is killed
+        listener, a wildcard bind, another owner; unix: the socket replaced, an IPv4/IPv6 socket in the daemon's group or below it), the relay is killed
         so nobody else's process receives QA traffic, and the daemon is stopped. Returns False then. `final` (the last step before teardown)
         repeats the full unix proof, peer and ping included, and records it as `socket_recheck`; a tcp-relay poll is always the full proof."""
         if self.daemon is None:
