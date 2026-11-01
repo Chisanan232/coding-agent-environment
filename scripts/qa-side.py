@@ -160,6 +160,10 @@ SUN_PATH_LIMIT = 104                      # sockaddr_un.sun_path on macOS, inclu
 PORT_RANGE = (20000, 32767)               # outside the ephemeral range, so a random pick rarely collides with an outgoing connection
 # System helpers a process could use to reach the network on someone else's behalf; denied to the daemon and the relay. This is a
 # measured deny list, not a proof that no such helper exists (Codex tool commands still reach trustd; see docs/QA-HANDOFF.md).
+# Known gap, measured on macOS 27: AppleEvents to an already-running process of the SAME uid are not stopped by any SBPL rule
+# (`appleevent-send`, `mach*`, `ipc*`, `lsopen` or a blanket `mach-lookup` deny all still let `osascript` reach System Events). The
+# boundary is the uid: the QA user (uid 530) has no GUI session, so nothing of its own is there to answer. The owner demo must show
+# `osascript` failing as uid 530 before installation; see docs/QA-HANDOFF.md.
 MACH_DENY = ('com.apple.trustd', 'com.apple.trustd.agent', 'com.apple.ocspd', 'com.apple.dnssd.service', 'com.apple.nsurlsessiond',
              'com.apple.nesessionmanager', 'com.apple.cfnetwork.cfnetworkagent',
              # Keychain access (securityd reads the QA user's keychain files on a denied process's behalf; measured: `security list-keychains`

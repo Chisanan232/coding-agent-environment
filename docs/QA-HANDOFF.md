@@ -165,6 +165,8 @@ What these show is that direct socket access is restricted for tool commands. Th
 such as `trustd` can act on a process's behalf (measured: a certificate fetch for a sandboxed command), so a URL or host name a command
 asks the system to verify may leave the machine, and the run does not claim otherwise. Format, rules and a worked example: [QA-PAYLOAD.md](QA-PAYLOAD.md).
 
+AppleEvents are a second gap. A sandboxed process can still send an AppleEvent to a running process of the same user (measured on a developer session: `osascript` reached System Events under every deny rule tried). The QA user has no GUI session, so there is no such process to answer; the owner demo must run `osascript -e 'tell application "System Events" to return 1'` as that user under the daemon profile and see it fail. Until then this is unproven for the real account.
+
 **Installing the delegation (a root-owned copy, then one root command).** `scripts/qa-hop-install.py` is the installer of ADR 0016.
 `plan` is read-only and unprivileged; it prints the exact text below with your values filled in, runs `visudo -c -f` on the
 rendered drop-in, and changes nothing. There is no flag, variable or prefix that moves its paths, and nothing is downloaded: the
