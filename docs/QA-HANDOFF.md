@@ -221,9 +221,11 @@ run the one root command, through your own `sudo` (the installer never asks for 
 the digests are the ones `plan` printed:
 
 ```
-sudo /usr/bin/python3 -I -B /Library/cae-qa-install/qa-hop-install.py apply --qa-name NAME --qa-uid UID \
+sudo /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -B /Library/cae-qa-install/qa-hop-install.py apply --qa-name NAME --qa-uid UID \
      --codex-source /path/to/codex --codex-sha256 HEX --codex-host-source /path/to/codex-code-mode-host --codex-host-sha256 HEX --bundle-sha256 HEX --helper-sha256 HEX
 ```
+
+The interpreter is the real Command Line Tools binary, not the `/usr/bin/python3` shim: the shim picks its interpreter through `xcode-select`, whose link (`/var/db/xcode_select_link`) can name a directory under `/Applications` that the `admin` group may create, which would let a same-user process substitute the interpreter for every root-pinned script. The installer refuses to run under any other interpreter, and `plan`, `apply`, `verify` and every `--unattended` run check that the binary is reached through root-owned, non-writable, non-link components and that its whole framework version tree (dylib, standard library, site-packages) is root-owned and not group/world writable (ACLs are not visible to that check; `ls -le` in the owner readback covers them). A Command Line Tools update that changes the path fails closed until the install is redone.
 
 (`-B` and `sys.dont_write_bytecode` keep root from writing `__pycache__` anywhere.) Known and accepted: `qa-handoff.py` reads `qa-side.py` a second time on its own when the installer executes it (defence in depth, not the pin: the installer's trust check, root-owned and link-free, is what keeps the two reads equal). In order, `apply`: refuses unless it is root with
 your uid known, the four scripts and their directories are trusted and both digests match; re-validates every input; creates
