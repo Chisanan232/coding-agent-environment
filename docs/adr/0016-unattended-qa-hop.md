@@ -77,9 +77,9 @@ Cmnd_Alias CAE_QA_SEE   = /usr/bin/crontab -l, \
                           /bin/ls -A /Users/QA/Library/LaunchAgents, \
                           /bin/launchctl print user/QAUID, \
                           /bin/launchctl print gui/QAUID, \
-                          /bin/launchctl print "^user/QAUID/[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+                          /bin/launchctl ^print[[:blank:]]user/QAUID/[A-Za-z0-9_][A-Za-z0-9_.-]*$
 Cmnd_Alias CAE_QA_SIDE  = sha256:HELPERHEX /Library/cae-qa/qa-side version, \
-                          sha256:HELPERHEX /Library/cae-qa/qa-side "^(probe|stage|exec) [A-Za-z0-9][A-Za-z0-9._-]*$"
+                          sha256:HELPERHEX /Library/cae-qa/qa-side ^(probe|stage|exec)[[:blank:]][A-Za-z0-9][A-Za-z0-9._-]*$
 
 PRODUCER ALL = (QA) NOPASSWD: NOSETENV: CAE_QA_SWEEP, CAE_QA_SEE, CAE_QA_SIDE
 ```
@@ -106,10 +106,25 @@ The digest check is racy: macOS has no `fexecve(2)`, so sudo verifies the file a
 helper lives where neither the producer nor Homebrew can write (below) and the producer verifies the path before every run;
 the digest is defence in depth, not the barrier.
 
-Sudoers regular expressions here contain no comma: a comma inside `{m,n}` is read as a list separator even in double quotes
-(`visudo` rejects it), so lengths are not limited in sudoers. The helper enforces the attempt-name cap (150 characters, validation
+**Regular-expression arguments (rev 4, 2026-11-01).** The two regex rules are written exactly as sudoers(5) defines them for sudo 1.9.10+:
+the argument string starts with `^`, ends with `$`, is NOT quoted, and is matched against all arguments joined by single spaces, so the
+verb belongs to the expression (`^print[[:blank:]]user/QAUID/...$`) and a blank is `[[:blank:]]`. The earlier revisions wrote them in
+double quotes, which sudo reads as a literal string that never matches: `visudo -c` accepted it, the owner readback passed (it only ran the
+literal `version` rule), and the first real producer run stopped at `launchd domain user/530 could not be read (sudo -n refused)`.
+`tests/test-qa-hop-install.py` now checks every rendered rule for this syntax and matches sample argv against the expressions.
+Parsing alone proves nothing about matching: the post-install readback must run one allowed shape of each rule for real.
+
+Sudoers regular expressions here contain no comma, `#`, backslash or second `$` (a conservative house rule: the sudoers(5) text only requires `^`...`$` and an escaped `#`; a
+static test checks this), so lengths are not limited in sudoers: the helper and producer enforce them. The helper enforces the attempt-name cap (150 characters, validation
 item 2), and the producer enforces the service-label cap (200). Sudoers still lets a name contain dots, which is harmless: the
 helper rejects `..` and paths are never built from argv.
+
+**Tool environment (rev 4).** Every environment the helper builds for QA-side commands (the attended `isolated_env`, the installed `base_env` and `installed_env`,
+self-tests, the daemon, the relay and the confinement probes) carries `DEVELOPER_DIR=/Library/Developer/CommandLineTools`; helper-internal observation commands (`lsof`, `ps`) run absolute system binaries that the
+shims do not affect. The `/usr/bin` developer shims (`git`, `python3`, `make`)
+choose their real tool through xcode-select, whose link names an Xcode path that does not exist and whose parent directory a
+producer in `admin` can create; without the variable that is a way to put producer-chosen binaries under the QA user. The variable makes the
+shims use the root-owned Command Line Tools. Payload exec files should still use absolute Command Line Tools paths.
 
 Validation note (2026-10-31): the exact drop-in above, rendered with a throwaway user `qauser`, uid 599, producer `bryant` and a
 placeholder 64-hex digest, was run through `/usr/sbin/visudo -c -f <file>` unprivileged (sudo 1.9.17p2, macOS) and reported

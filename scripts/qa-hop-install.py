@@ -242,8 +242,11 @@ def resolve_inputs(args, ops, bundle, need_codex=True):
 
 # ------------------------------------------------------------------ drop-in
 HEAD = '# cae-qa (SPE-153, ADR 0016). Managed file: reinstall, never edit by hand.'
-ATTEMPT_RULE = '"^(probe|stage|exec) [A-Za-z0-9][A-Za-z0-9._-]*$"'
-LABEL_RULE = '"^user/%d/[A-Za-z0-9_][A-Za-z0-9_.-]*$"'
+# sudoers(5), sudo 1.9.10+: command-line arguments are a regular expression only when the WHOLE argument string starts with '^' and ends with '$',
+# written unquoted (a double-quoted '"^...$"' is a literal string that never matches, as the first real uid-530 attempt showed) and matched
+# against all arguments joined by single spaces, so the verb is part of the expression. A blank inside the expression is [[:blank:]].
+ATTEMPT_RULE = '^(probe|stage|exec)[[:blank:]][A-Za-z0-9][A-Za-z0-9._-]*$'
+LABEL_RULE = '^print[[:blank:]]user/%d/[A-Za-z0-9_][A-Za-z0-9_.-]*$'
 SECURE_PATH = '/usr/bin:/bin:/usr/sbin:/sbin'
 
 
@@ -261,7 +264,7 @@ def render_sudoers(producer, qa_name, qa_uid, qa_home, helper_sha, helper_path='
         pad + '/bin/ls -A %s/Library/LaunchAgents, \\' % qa_home,
         pad + '/bin/launchctl print user/%d, \\' % qa_uid,
         pad + '/bin/launchctl print gui/%d, \\' % qa_uid,
-        pad + '/bin/launchctl print ' + LABEL_RULE % qa_uid,
+        pad + '/bin/launchctl ' + LABEL_RULE % qa_uid,
         'Cmnd_Alias CAE_QA_SIDE  = sha256:%s %s version, \\' % (helper_sha, helper_path),
         pad + 'sha256:%s %s %s' % (helper_sha, helper_path, ATTEMPT_RULE),
         '',

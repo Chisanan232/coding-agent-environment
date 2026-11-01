@@ -469,14 +469,14 @@ class SelftestRunnerTests(Scratch):
         outbox = str(env.outbox)
         self.assertEqual(seen["cmd"], [outbox + "/payload/bin/tool", outbox + "/payload/vectors/a.json", "lit"])
         self.assertEqual(seen["cwd"], outbox + "/tmp")
-        self.assertEqual(clean_env(seen["env"]), {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": outbox + "/home", "TMPDIR": outbox + "/tmp",
+        self.assertEqual(clean_env(seen["env"]), {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "DEVELOPER_DIR": "/Library/Developer/CommandLineTools", "HOME": outbox + "/home", "TMPDIR": outbox + "/tmp",
                                        "CODEX_HOME": str(env.private_home)})
 
     def test_poisoned_caller_environment_never_reaches_the_test(self):
         with mock.patch.dict(os.environ, {"PATH": "/tmp/evil", "LANG": "xx", "SECRET_TOKEN": "nope", "HOME": "/tmp/evilhome"}):
             env, manifest, records = self.run_tests([test_entry("good")])
         (seen,) = env.seen()
-        self.assertEqual(set(clean_env(seen["env"])), {"PATH", "HOME", "TMPDIR", "CODEX_HOME"})
+        self.assertEqual(set(clean_env(seen["env"])), {"PATH", "DEVELOPER_DIR", "HOME", "TMPDIR", "CODEX_HOME"})
         self.assertNotIn("evil", json.dumps(seen["env"]))
 
     def test_stdin_file_is_fed(self):
@@ -611,7 +611,7 @@ class PayloadCodeOnlyRunsOnAProvedProfileTests(Scratch):
         env_seen = [e["env"] for e in env.seen()]
         self.assertTrue(env_seen)
         for seen in env_seen:
-            self.assertEqual(set(clean_env(seen)), {"PATH", "HOME", "TMPDIR", "CODEX_HOME"})
+            self.assertEqual(set(clean_env(seen)), {"PATH", "DEVELOPER_DIR", "HOME", "TMPDIR", "CODEX_HOME"})
 
     @staticmethod
     def alive(pid):

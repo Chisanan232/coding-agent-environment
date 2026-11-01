@@ -537,7 +537,7 @@ class EnvironmentTests(InstalledCase):
     def expected(self, t, verb="exec"):
         home = QA.pw_dir
         outbox = str(t.x / "outbox" / ATTEMPT)
-        return {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": home, "USER": QA.pw_name, "LOGNAME": QA.pw_name,
+        return {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "DEVELOPER_DIR": "/Library/Developer/CommandLineTools", "HOME": home, "USER": QA.pw_name, "LOGNAME": QA.pw_name,
                 "TMPDIR": outbox + "/tmp", "XDG_CONFIG_HOME": outbox + "/home/.config", "XDG_DATA_HOME": outbox + "/home/.local/share",
                 "XDG_CACHE_HOME": outbox + "/home/.cache", "CARGO_TARGET_DIR": outbox + "/cargo-target",
                 "CARGO_NET_OFFLINE": "true", "CODEX_HOME": home + "/.local/state/coding-agent-environment/qa/%s/codexhome" % ATTEMPT}
@@ -548,6 +548,15 @@ class EnvironmentTests(InstalledCase):
         stack.enter_context(mock.patch.object(side, "HOME", side.HOME))
         stack.enter_context(mock.patch.object(side, "CANARY_ROOT", side.CANARY_ROOT))
         return stack
+
+    def test_every_environment_the_helper_builds_pins_developer_dir(self):
+        """The /usr/bin developer shims follow the xcode-select link, which a producer in admin can redirect: every builder must set the pin."""
+        t = self.tree()
+        with self.poisoned():
+            built = [side.base_env(QA.pw_dir), side.installed_env(QA.pw_name, QA.pw_dir, str(t.x / "outbox" / ATTEMPT), QA.pw_dir + "/c"),
+                     side.selftest_env(str(t.x / "outbox" / ATTEMPT), QA.pw_dir + "/c"), side.isolated_env(t.x / "outbox" / ATTEMPT)]
+        for env in built:
+            self.assertEqual(env.get("DEVELOPER_DIR"), "/Library/Developer/CommandLineTools", env)
 
     def test_builder_equals_the_allowlist_whatever_the_caller_set(self):
         t = self.tree()
@@ -588,7 +597,7 @@ class EnvironmentTests(InstalledCase):
             seen = self.run_action(t, verb)
             self.assertEqual(seen["rc"], 0, verb)
             self.assertEqual(seen["env"], self.expected(t), verb)
-            self.assertEqual(seen["environ"], {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": QA.pw_dir}, verb)
+            self.assertEqual(seen["environ"], {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "DEVELOPER_DIR": "/Library/Developer/CommandLineTools", "HOME": QA.pw_dir}, verb)
             self.assertEqual(seen["ns"].codex_bin, str(t.codex))
             self.assertEqual(seen["ns"].inbox, str(t.x / "inbox" / ATTEMPT))
             self.assertEqual(seen["ns"].outbox, str(t.x / "outbox" / ATTEMPT))
@@ -608,7 +617,7 @@ class EnvironmentTests(InstalledCase):
         self.assertEqual(argv[:3], [side.TRUSTED_PYTHON, "-I", "-c"])
         self.assertEqual(argv[3], side.PROBE)
         self.assertEqual(argv[4:], [str(t.x / "inbox"), str(t.x / "outbox"), str(t.x), pwd.getpwuid(ME).pw_dir, "4242", SENTINEL])
-        self.assertEqual(env, {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": QA.pw_dir})
+        self.assertEqual(env, {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "DEVELOPER_DIR": "/Library/Developer/CommandLineTools", "HOME": QA.pw_dir})
 
     def test_the_attended_builder_is_untouched_and_does_copy_the_caller(self):
         with self.poisoned():
@@ -620,7 +629,7 @@ class EnvironmentTests(InstalledCase):
     def test_pin_process_scrubs_the_environment_and_retargets_home(self):
         with self.poisoned():
             side.pin_process("/Users/qa")
-            self.assertEqual(dict(os.environ), {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": "/Users/qa"})
+            self.assertEqual(dict(os.environ), {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "DEVELOPER_DIR": "/Library/Developer/CommandLineTools", "HOME": "/Users/qa"})
             self.assertEqual(side.HOME, Path("/Users/qa"))
             self.assertEqual(side.real_codex_home(), Path("/Users/qa/.codex"))
             self.assertEqual(side.CANARY_ROOT, Path("/Users/qa/.local/state/coding-agent-environment/qa-canary"))
@@ -1274,7 +1283,7 @@ class EndpointProfileTests(unittest.TestCase):
         self.assertEqual(set(d), {"daemon_profile_sha256", "relay_profile_sha256", "relay_source_sha256"})
         self.assertEqual(d["daemon_profile_sha256"], hashlib.sha256(side.daemon_sb(e).encode()).hexdigest())
         self.assertNotEqual(side.endpoint_digests(other)["daemon_profile_sha256"], d["daemon_profile_sha256"])
-        self.assertEqual(e.daemon_env(), {"PATH": "/usr/bin:/bin", "FORNAX_HOME": str(e.state), "FORNAX_HTTP_PORT": "23456", "TMPDIR": str(e.tmp)})
+        self.assertEqual(e.daemon_env(), {"PATH": "/usr/bin:/bin", "DEVELOPER_DIR": "/Library/Developer/CommandLineTools", "FORNAX_HOME": str(e.state), "FORNAX_HTTP_PORT": "23456", "TMPDIR": str(e.tmp)})
         self.assertEqual(set(e.tool_env()), {"QA_ENDPOINT_STATE", "QA_ENDPOINT_SOCK", "QA_ENDPOINT_HTTP_SOCK"})
         self.assertNotIn("23456", "".join(e.tool_env().values()))
 
