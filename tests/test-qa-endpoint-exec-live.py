@@ -160,6 +160,17 @@ class EndpointExecLiveTests(unittest.TestCase):
         self.assertEqual(self.run_exec(), side.PROFILE_CHANGED)
         self.assertFalse((self.outbox / "out" / "fake-codex.txt").exists())
 
+    def test_a_daemon_lost_in_the_last_moments_is_still_caught(self):
+        """The loop polls every two seconds; codex returning inside that window must not hide a dead daemon (the final check)."""
+        killer = subprocess.Popen([sys.executable, "-I", "-c",
+                                   "import os,signal,subprocess,time\nfor _ in range(300):\n    out = subprocess.run(['/usr/sbin/lsof','-nP','-iTCP:%d','-sTCP:LISTEN','-Fp'],capture_output=True,text=True).stdout\n    pids=[int(l[1:]) for l in out.split() if l.startswith('p')]\n    if pids:\n        time.sleep(0.4)\n        os.kill(pids[0], signal.SIGKILL)\n        break\n    time.sleep(0.05)\n" % self.port])
+        self.addCleanup(killer.wait)
+        code = self.run_exec(FAKE_CODEX_WAIT="1.2")
+        self.assertEqual(code, side.ENDPOINT_FAILED)
+        record = self.record()
+        self.assertFalse(record["established"])
+        self.assertTrue(record["daemon_exited_early"] or record.get("port_proof_lost"), record)
+
     def test_a_daemon_that_dies_while_codex_runs_stops_codex(self):
         killer = subprocess.Popen([sys.executable, "-I", "-c",
                                    "import os,signal,subprocess,time\nfor _ in range(300):\n    out = subprocess.run(['/usr/sbin/lsof','-nP','-iTCP:%d','-sTCP:LISTEN','-Fp'],capture_output=True,text=True).stdout\n    pids=[int(l[1:]) for l in out.split() if l.startswith('p')]\n    if pids:\n        time.sleep(1.0)\n        os.kill(pids[0], signal.SIGKILL)\n        break\n    time.sleep(0.1)\n" % self.port])

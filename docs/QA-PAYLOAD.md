@@ -180,6 +180,8 @@ The producer decides for itself: it demands every control by name and recomputes
 clean teardown, regenerates the daemon profile, relay profile and relay source digests and the Codex profile digest from its own values, and takes
 the self-test observations from the verified record. Raw evidence stays in `CONFINEMENT.json` (`endpoint`), `SELFTEST.json` and the run's outbox.
 
+The exec-time record (`endpoint-exec/record.json`, including the state-copy result) is written by the QA-side helper, which is installed, root-owned and hash-pinned code, and judged by the producer for consistency; the producer cannot see inside the QA user's processes. `endpoint-exec/state` is a copy to inspect, and a consumer must read `teardown.state_snapshot.copied` first (a failed copy can leave a partial tree). Exit code 123 is the endpoint-failed code; a Codex that exits 123 by itself with a verified endpoint is treated as an ordinary Codex failure.
+
 What this does not do: the daemon's port is reachable by any local process while the run lasts (the sandbox cannot pin a loopback bind; the
 listener proof is the control), the read-deny list is a deny list, system helpers such as `trustd` may still act on a process's behalf, and
 AppleEvents to a same-user process cannot be blocked by a sandbox profile, so the QA user must have no GUI session (see QA-HANDOFF.md).

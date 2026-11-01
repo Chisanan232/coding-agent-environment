@@ -482,6 +482,8 @@ def endpoint_probe_table(endpoint, canary, auth, canary_port, decoy, state_probe
 
 
 SNAPSHOT_MAX_BYTES = 512 << 20
+SNAPSHOT_MAX_ENTRIES = 100000
+SNAPSHOT_MAX_SECONDS = 120
 ENDPOINT_FAILED = 123                        # qa-exec: the endpoint could not be started or was lost; codex was stopped or not started
 
 
@@ -595,6 +597,15 @@ class EndpointLifecycle:
         self.record['relay_started'] = True
         self._wait_for(lambda: not self.ops.leader_exited(self.relay) and os.path.exists(e.relay_sock), RELAY_START_SECONDS, 'the relay')
 
+    def release_probes(self):
+        """Close the canary listener and the decoy socket made for the profile controls."""
+        for close in self._closers:
+            try:
+                close()
+            except OSError:
+                pass
+        self._closers = []
+
     def prove_port(self):
         """The port is the daemon's alone and bound to loopback only: every TCP listener on the port that lsof lists for this user must be exactly one, owned
         by the daemon's pid, at 127.0.0.1. A wildcard or IPv6 listener, a second listener, or one held by another process fails the
@@ -690,7 +701,8 @@ class EndpointLifecycle:
         directories are copied, bytes are counted as they are copied (limit SNAPSHOT_MAX_BYTES). A link, a hard-linked file (the daemon could
         have linked something it must not read into its state), a socket or any other node is not copied and makes the snapshot `copied: False`
         with the names listed, because this copy runs as the QA user without the daemon's sandbox."""
-        refused, budget = [], [SNAPSHOT_MAX_BYTES]
+        refused, skipped, budget = [], [], [SNAPSHOT_MAX_BYTES]
+        entries, deadline = [SNAPSHOT_MAX_ENTRIES], time.monotonic() + SNAPSHOT_MAX_SECONDS
 
         def walk(dir_fd, target, depth):
             if depth > 20:
@@ -698,10 +710,14 @@ class EndpointLifecycle:
                 return
             os.mkdir(target, 0o700)
             for name in sorted(os.listdir(dir_fd)):
+                entries[0] -= 1
+                if entries[0] < 0 or time.monotonic() > deadline:
+                    raise OverflowError          # a flood of tiny files costs no bytes but does cost inodes and time
                 info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
                 label = clean(name, 40)
                 if stat.S_ISSOCK(info.st_mode):
-                    continue                                    # the daemon's own listening socket
+                    skipped.append(label)               # a listening socket carries no state; named in the record, not copied
+                    continue
                 if stat.S_ISDIR(info.st_mode):
                     sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
                     try:
@@ -740,11 +756,11 @@ class EndpointLifecycle:
             finally:
                 os.close(root)
         except OverflowError:
-            return {'copied': False, 'bytes': SNAPSHOT_MAX_BYTES, 'error': 'larger than the %d byte limit' % SNAPSHOT_MAX_BYTES, 'refused': refused[:10]}
+            return {'copied': False, 'bytes': SNAPSHOT_MAX_BYTES - budget[0], 'error': 'larger than the byte, entry or time limit', 'refused': refused[:10]}
         except OSError as error:
             return {'copied': False, 'bytes': None, 'error': type(error).__name__, 'refused': refused[:10]}
         return {'copied': not refused, 'bytes': SNAPSHOT_MAX_BYTES - budget[0], 'error': None if not refused else 'not copied: links, hard links or special files',
-                'refused': refused[:10]}
+                'refused': refused[:10], 'skipped_sockets': skipped[:10]}
 
     def teardown(self, snapshot=None):
         """Relay first, then daemon, then verify: both stopped, nothing that descended from either is left, the port refuses, both sockets
@@ -763,7 +779,8 @@ class EndpointLifecycle:
         left = self._reap_stragglers(before)
         steps['descendants_left'] = left if left is not None else ['unknown']
         if snapshot is not None and self._owns_dir:
-            steps['state_snapshot'] = self._snapshot_state(Path(snapshot))
+            steps['state_snapshot'] = (self._snapshot_state(Path(snapshot)) if steps['descendants_left'] == [] else
+                                       {'copied': False, 'bytes': None, 'error': 'a process of the endpoint was still running', 'refused': []})
         for close in self._closers:
             try:
                 close()
@@ -1704,6 +1721,12 @@ def start_exec_endpoint(args, outbox):
         life.create()
         life.prove_profiles(canary_dir / 'canary.txt', real_codex_home() / 'auth.json', outbox / 'tmp')
         life.start()
+        life.release_probes()                  # the canary listener and the decoy served the controls; nothing keeps them alive during the run
+        for leftover in (canary_dir / 'canary.txt', canary_dir, outbox / 'tmp' / 'qa-decoy.sock'):
+            try:
+                leftover.rmdir() if leftover.is_dir() and not leftover.is_symlink() else leftover.unlink()
+            except OSError:
+                pass
     except BaseException as error:
         life.record['problems'].append(clean(str(error), 160))
         finish_exec_endpoint(life, outbox, canary_dir)
@@ -1714,6 +1737,8 @@ def start_exec_endpoint(args, outbox):
 def finish_exec_endpoint(life, outbox, canary_dir):
     """Stop the endpoint, keep a copy of the daemon's state in the outbox, remove the canary and the decoy, and write the record the producer
     judges (outbox/endpoint-exec/record.json)."""
+    masked = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGALRM}
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, masked)      # a second signal must not abandon the teardown half way
     try:
         life.record['teardown'] = life.teardown(snapshot=outbox / 'endpoint-exec' / 'state')
     finally:
@@ -1728,6 +1753,8 @@ def finish_exec_endpoint(life, outbox, canary_dir):
         write_private(outbox / 'endpoint-exec' / 'record.json', life.record)
     except OSError:
         pass
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def qa_exec(args, build_env=None, open_prompt=None):
@@ -1774,6 +1801,8 @@ def qa_exec(args, build_env=None, open_prompt=None):
                 return 127
         try:
             code = wait_supervised(proc, args.timeout, life)
+            if life is not None and not life.supervise():        # the last couple of seconds, and the moment codex returned
+                raise EndpointLost()
         except subprocess.TimeoutExpired:
             kill_group(proc)
             return 124
@@ -1781,6 +1810,10 @@ def qa_exec(args, build_env=None, open_prompt=None):
             endpoint_lost = True
             kill_group(proc)
             return ENDPOINT_FAILED
+        except Exception:
+            kill_group(proc)                  # an unexpected failure of the supervision must not leave codex running
+            endpoint_lost = life is not None
+            raise
         try:
             os.killpg(proc.pid, signal.SIGKILL)   # stragglers in codex's own group
         except OSError:
