@@ -89,6 +89,8 @@ class Case(unittest.TestCase):
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(mock.patch.object(SIDE, "ROOT_UID", ME))
+        self.interpreter_findings = []
+        stack.enter_context(mock.patch.object(SIDE, "interpreter_problems", lambda *a, **k: list(self.interpreter_findings)))
         self.installs = []
         self.addCleanup(lambda: [i.close() for i in self.installs])
 
@@ -99,6 +101,22 @@ class Case(unittest.TestCase):
 
 
 class InstallVerificationTests(Case):
+    def test_an_untrusted_interpreter_fails_the_install_check(self):
+        i = self.install()
+        self.interpreter_findings = ["/Library/x/os.py is writable by group or other"]
+        record, problems = i.verify()
+        self.assertIsNone(record)
+        self.assertTrue(any("writable by group or other" in p for p in problems), problems)
+
+    def test_a_helper_with_another_first_line_fails_the_install_check(self):
+        i = self.install()
+        os.chmod(i.helper, 0o755)
+        i.helper.write_bytes(b"#!/usr/bin/python3 -I\n" + SIDE_SOURCE.split(b"\n", 1)[1])
+        os.chmod(i.helper, 0o555)
+        record, problems = i.verify()
+        self.assertIsNone(record)
+        self.assertTrue(any("trusted-interpreter line" in p for p in problems), problems)
+
     def test_a_good_install_returns_the_recomputed_digests(self):
         i = self.install()
         record, problems = i.verify()
