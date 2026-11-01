@@ -1489,6 +1489,48 @@ class UnixEndpointProfileTests(unittest.TestCase):
             self.assertEqual(got, [b'{"event": "ping"}\n'])        # read to EOF: the client half-closed after exactly the 18 bytes
 
 
+class SeedPlanTests(unittest.TestCase):
+    """The state-seed convention (SPE-155): which manifest files are seeded, and every rule that refuses a seed."""
+
+    def manifest(self, files, contract="circinus-daemon/1"):
+        entries = [{"path": "bin/python3.13", "sha256": "a" * 64, "size": 10, "kind": "exec"}]
+        entries += [{"path": p, "sha256": "b" * 64, "size": size, "kind": kind} for p, size, kind in files]
+        return {"schema": "cae-qa-payload/2", "files": sorted(entries, key=lambda f: f["path"]), "selftests": [], "scope": "s", "producer_run": [],
+                "endpoint": {"daemon": "bin/python3.13", "contract": contract}}
+
+    def raw(self, manifest):
+        return json.dumps(manifest).encode()
+
+    def test_listed_seed_files_are_planned_and_others_are_not(self):
+        m = self.manifest([("state-seed/circinus/mode.json", 30, "data"), ("state-seed/install.json", 20, "data"), ("lib/x.zip", 5, "data")])
+        self.assertEqual(side.seed_plan(m), [("state-seed/circinus/mode.json", "circinus/mode.json", "b" * 64, 30),
+                                             ("state-seed/install.json", "install.json", "b" * 64, 20)])
+        self.assertEqual(side.seed_record(m), [{"path": "circinus/mode.json", "sha256": "b" * 64}, {"path": "install.json", "sha256": "b" * 64}])
+        side.parse_manifest(self.raw(m))
+
+    def test_a_contract_without_a_seed_directory_seeds_nothing(self):
+        m = self.manifest([("state-seed/install.json", 20, "data")], contract="fornax-daemon/1")
+        self.assertEqual(side.seed_plan(m), [])
+        self.assertEqual(side.seed_plan({"endpoint": None, "files": []}), [])
+
+    def test_every_rule_refuses(self):
+        cases = {"exec": [("state-seed/run.sh", 5, "exec")],
+                 "deep": [("state-seed/a/b/c/d/e/f/g", 5, "data")],
+                 "reserved": [("state-seed/qa-probe.db", 5, "data")],
+                 "socket": [("state-seed/circinus/circinusd.sock", 5, "data")],
+                 "big": [("state-seed/big", side.SEED_FILE_MAX + 1, "data")],
+                 "many": [("state-seed/f%02d" % n, 1, "data") for n in range(side.SEED_MAX_FILES + 1)],
+                 "total": [("state-seed/f%d" % n, side.SEED_FILE_MAX, "data") for n in range(5)]}
+        for label, files in cases.items():
+            m = self.manifest(files)
+            with self.assertRaises(side.PayloadError, msg=label):
+                side.seed_plan(m)
+            with self.assertRaises(side.PayloadError, msg=label):
+                side.parse_manifest(self.raw(m))
+        ok = self.manifest([("state-seed/a/b/c/d/e/f", 5, "data")] + [("state-seed/g%d" % n, side.SEED_FILE_MAX, "data") for n in range(3)])
+        self.assertEqual(len(side.seed_plan(ok)), 4)         # depth 6 and three full-size files (768 KiB) are inside the limits
+
+
 class NetworkControlTests(unittest.TestCase):
     NET = ("neg_loopback_bind", "neg_uds_bind", "neg_testnet_connect", "neg_testnet6_connect", "neg_udp_testnet", "neg_resolver_socket")
 
