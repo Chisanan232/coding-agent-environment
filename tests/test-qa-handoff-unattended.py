@@ -122,6 +122,22 @@ class InstallVerificationTests(Case):
             i.write_config()
             self.assertFails(i)
 
+    def test_the_tool_host_is_verified_like_the_codex_binary(self):
+        i = self.install()
+        os.chmod(i.host, 0o755)
+        i.host.write_bytes(b"tampered")
+        os.chmod(i.host, 0o555)
+        self.assertFails(i)
+        i = self.install()
+        os.chmod(i.host, 0o557)
+        self.assertFails(i)
+        i = self.install()
+        os.unlink(i.host)
+        self.assertFails(i)
+        i = self.install()
+        os.chmod(i.lib, 0o775)
+        self.assertFails(i)
+
     def test_codex_digest_drift(self):
         i = self.install()
         os.chmod(i.codex, 0o755)

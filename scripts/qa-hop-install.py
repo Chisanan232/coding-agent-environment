@@ -539,6 +539,8 @@ def verify_installed(inputs, layout, bundle, producer_uid=None):
     handoff._SIDE.ROOT_UID = layout.root_uid
     ident = handoff.Identity(inputs.qa_name, inputs.qa_uid, Path(inputs.qa_home), Path(inputs.exchange), layout.root_uid)
     record, problems = handoff.unattended_install(ident, layout.config, layout.helper, layout.anchor, producer_uid)
+    if record is not None and (record['codex_sha256'] != inputs.codex_sha256 or record['codex_host_sha256'] != inputs.host_sha256):
+        problems = list(problems) + ['the installed Codex or its tool host is not the one pinned on this command line']
     if os.path.lexists(layout.sudoers):
         st = os.lstat(layout.sudoers)
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_uid != layout.root_uid or st.st_mode & 0o7777 != 0o440:
