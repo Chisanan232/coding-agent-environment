@@ -711,7 +711,7 @@ class StageTests(Scratch):
 
 class EndpointSchemaTests(Scratch):
     """cae-qa-payload/2 (SPE-145 PR-b2): the endpoint block and needs_endpoint. /1 stays valid and means no endpoint. Until the endpoint
-    lifecycle lands (ENDPOINT_RUNS_SUPPORTED False) a payload that names an endpoint is refused where payloads are accepted."""
+    run is started with an endpoint, a payload that names one is refused where payloads are accepted."""
 
     def v2(self, endpoint="default", tests=None, **over):
         files = dict(FILES)
@@ -785,10 +785,11 @@ class EndpointSchemaTests(Scratch):
         only["files"] = [f for f in only["files"] if f["path"] != "bin/daemon"]
         self.assertIsNone(side.exec_probe_argv(self.parse(only), "/p"))
 
-    def test_this_build_refuses_a_payload_that_names_an_endpoint(self):
-        self.assertFalse(side.ENDPOINT_RUNS_SUPPORTED)
+    def test_a_payload_naming_an_endpoint_needs_an_endpoint_run_and_the_reverse(self):
         self.assertIsNone(side.endpoint_refusal(self.parse(self.v2(endpoint=None))))
-        self.assertIn("cannot start", side.endpoint_refusal(self.parse(self.v2())))
+        self.assertIn("not started with one", side.endpoint_refusal(self.parse(self.v2())))
+        self.assertIsNone(side.endpoint_refusal(self.parse(self.v2()), "daemon-endpoint"))
+        self.assertIn("names none", side.endpoint_refusal(self.parse(self.v2(endpoint=None)), "daemon-endpoint"))
         self.assertIsNone(side.endpoint_refusal(side.parse_manifest(self.payload(selftests=[test_entry()])[2])))
 
     def test_the_producer_reverification_refuses_a_payload_that_names_an_endpoint(self):
@@ -804,7 +805,7 @@ class EndpointSchemaTests(Scratch):
         found, problems = handoff.producer_payload(run_dir, {"payload": {"manifest_sha256": side.manifest_sha256(raw)}})
         self.assertIsNone(found)
         self.assertEqual(len(problems), 1)
-        self.assertIn("cannot start", problems[0])
+        self.assertIn("not started with one", problems[0])
 
     def test_stage_refuses_before_copying_anything(self):
         directory, manifest, _ = self.payload(files=dict(FILES, **{"bin/daemon": (b"#!/bin/sh\n", "exec")}), selftests=[])
@@ -816,7 +817,7 @@ class EndpointSchemaTests(Scratch):
         parsed, record = side.stage_payload((os.dup(fd), ME), outbox)
         self.assertIsNone(parsed)
         self.assertFalse(record["staged"])
-        self.assertIn("cannot start", record["problems"][0])
+        self.assertIn("not started with one", record["problems"][0])
         self.assertFalse((outbox / "payload").exists())
 
 
