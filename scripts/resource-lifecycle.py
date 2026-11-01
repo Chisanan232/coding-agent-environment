@@ -73,7 +73,7 @@ def default_consumers(tmp=None):
     tmp = Path(tmp or os.environ.get('TMPDIR') or '/tmp')
     dev = d / 'Bryant-Developments'
     spec = [
-        ('cargo_target', [str(d / '.cargo/shared-target'), str(d / '.cargo/nda-targets'), str(d / '.cargo/isolated-target*'),
+        ('cargo_target', [str(d / '.cargo/shared-target'), str(d / '.cargo/nda-targets/*'), str(d / '.cargo/isolated-target*'),
                           str(d / '.cargo/isolated-targets/*'), str(d / 'aaasm-campaign-*'), str(d / '*-target-*'),
                           str(dev / '.cargo-target*'), str(dev / '.cargo-targets/*'), str(dev / '.*-target')]),
         ('package_cache', [str(dev / '.pnpm-store'), str(d / 'Library/pnpm'), str(d / '.npm'), str(d / '.cache/uv'),
@@ -353,6 +353,11 @@ def classify(rec, ctx):
         why.append('worktree-' + str(rec.get('worktree_state')))
     if kind == 'unknown':
         why.append('unknown-kind')
+    # A directory below a Cargo target that is itself a build directory (its own .rustc_info.json) is a piece of that one
+    # target (debug/, a target-triple dir, tmp/), not a target of its own: an open handle on a sibling would not protect it.
+    if kind == 'cargo_target' and os.path.isfile(os.path.join(os.path.dirname(root), '.rustc_info.json')) \
+            and not os.path.isfile(os.path.join(root, '.rustc_info.json')):
+        why.append('not-a-target-root')
     if why:
         return 'C', why
     # SPE-109/ADR-0001: shared or redirected Cargo targets are never preauthorizable. A target is class A only when its
