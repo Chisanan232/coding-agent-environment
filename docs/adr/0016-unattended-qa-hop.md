@@ -119,6 +119,12 @@ Sudoers regular expressions here contain no comma: a comma inside `{m,n}` is rea
 item 2), and the producer enforces the service-label cap (200). Sudoers still lets a name contain dots, which is harmless: the
 helper rejects `..` and paths are never built from argv.
 
+**Tool environment (rev 4).** Every environment the helper builds for QA-side commands (Codex, self-tests, the daemon, the relay and the
+confinement probes) carries `DEVELOPER_DIR=/Library/Developer/CommandLineTools`. The `/usr/bin` developer shims (`git`, `python3`, `make`)
+choose their real tool through xcode-select, whose link names an Xcode path that does not exist and whose parent directory a
+producer in `admin` can create; without the variable that is a way to put producer-chosen binaries under the QA user. The variable makes the
+shims use the root-owned Command Line Tools. Payload exec files should still use absolute Command Line Tools paths.
+
 Validation note (2026-10-31): the exact drop-in above, rendered with a throwaway user `qauser`, uid 599, producer `bryant` and a
 placeholder 64-hex digest, was run through `/usr/sbin/visudo -c -f <file>` unprivileged (sudo 1.9.17p2, macOS) and reported
 `parsed OK`. Re-validated 2026-10-31 after `launchctl managername` was removed (seven commands, rule 5 gone): the exact rendered

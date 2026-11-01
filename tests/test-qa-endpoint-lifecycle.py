@@ -343,7 +343,7 @@ class StartTests(LifecycleBase):
         self.assertEqual(relay[2][:4], ("/usr/bin/sandbox-exec", "-f", str(self.record_dir / "relay.sb"), side.tool_python()))
         self.assertEqual(relay[2][4:6], ("-I", "-c"))
         self.assertEqual(relay[2][6:], (side.RELAY_SRC, str(self.endpoint.relay_sock), str(PORT)))
-        self.assertEqual(relay[3], {"PATH": "/usr/bin:/bin"})
+        self.assertEqual(relay[3], {"PATH": "/usr/bin:/bin", "DEVELOPER_DIR": "/Library/Developer/CommandLineTools"})
         kinds = [e[0] for e in self.fakes.log]
         self.assertLess(kinds.index("listeners"), len(kinds) - 1 - kinds[::-1].index("spawn"))      # the port is proved before the relay starts
         self.assertEqual(self.life.record["port_proof"]["listeners"], ["127.0.0.1:%d" % PORT])

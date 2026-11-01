@@ -47,6 +47,10 @@ SHEBANG = '#!' + TRUSTED_PYTHON + ' -I'
 SHIM_PYTHON = '/usr/bin/python3'        # only where no trusted interpreter exists: the attended hop on a host without Command Line Tools
 CANARY_ROOT = HOME / '.local/state/coding-agent-environment/qa-canary'
 ENV_ALLOW = ('PATH', 'LANG', 'LC_ALL', 'TERM', 'TZ', 'USER', 'LOGNAME', 'SHELL')
+# The /usr/bin developer shims (git, python3, make, ...) pick their real tool through xcode-select. Its link names an Xcode path that does not
+# exist here and whose parent the producer (an admin) can write, so without this variable the producer could redirect every tool command the
+# QA user runs. The variable makes the shims use the root-owned Command Line Tools and ignore that link.
+DEVELOPER_DIR = '/Library/Developer/CommandLineTools'
 
 STR = {'type': 'string'}
 
@@ -108,6 +112,7 @@ def isolated_env(run_dir, codex_home=None):
     # A relative or run-directory PATH entry would resolve helper binaries from a directory the QA process can write.
     entries = [e for e in os.environ.get('PATH', '/usr/bin:/bin').split(':') if os.path.isabs(e) and not e.startswith(str(run_dir))]
     env['PATH'] = ':'.join(entries) or '/usr/bin:/bin'
+    env['DEVELOPER_DIR'] = DEVELOPER_DIR
     home = str(run_dir / 'home')
     env.update({'HOME': home, 'TMPDIR': str(run_dir / 'tmp'), 'XDG_CONFIG_HOME': home + '/.config',
                 'XDG_DATA_HOME': home + '/.local/share', 'XDG_CACHE_HOME': home + '/.cache',
@@ -243,7 +248,7 @@ class Endpoint:
 
     def daemon_env(self):
         """The whole environment of the daemon: nothing is inherited."""
-        return {'PATH': '/usr/bin:/bin', self.spec['state_env']: str(self.state), self.spec['port_env']: str(self.port),
+        return {'PATH': '/usr/bin:/bin', 'DEVELOPER_DIR': DEVELOPER_DIR, self.spec['state_env']: str(self.state), self.spec['port_env']: str(self.port),
                 'TMPDIR': str(self.tmp)}
 
     def tool_env(self):
@@ -563,7 +568,7 @@ class EndpointLifecycle:
         self._closers.append(closer)
         decoy = os.path.join(str(decoy_dir), 'qa-decoy.sock')
         self._closers.append(self.ops.decoy_socket(decoy))
-        env = {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent'}
+        env = {'PATH': '/usr/bin:/bin', 'DEVELOPER_DIR': DEVELOPER_DIR, 'HOME': '/nonexistent'}
         failed = []
         for name, profile, code, expect in endpoint_probe_table(e, str(canary), str(auth), canary_port, decoy, None):
             argv = [self.sandbox_exec, '-f', str(self.record_dir / profile), self.python, '-I', '-c', code]
@@ -602,7 +607,7 @@ class EndpointLifecycle:
         self.record['port_proof'] = self.prove_port()
         with open(self.record_dir / 'relay.log', 'ab') as rlog:
             self.relay = self._spawn([self.sandbox_exec, '-f', str(self.record_dir / 'relay.sb'), self.python, '-I', '-c', RELAY_SRC,
-                                      str(e.relay_sock), str(e.port)], {'PATH': '/usr/bin:/bin'}, rlog)
+                                      str(e.relay_sock), str(e.port)], {'PATH': '/usr/bin:/bin', 'DEVELOPER_DIR': DEVELOPER_DIR}, rlog)
         self.record['relay_started'] = True
         self._wait_for(lambda: not self.ops.leader_exited(self.relay) and os.path.exists(e.relay_sock), RELAY_START_SECONDS, 'the relay')
 
@@ -1349,7 +1354,7 @@ def selftest_env(outbox, codex_home):
     """Allowlist for self-tests: a fixed PATH, the run's own home and tmp, and CODEX_HOME because `codex sandbox -P` cannot
     find the profile without it. Nothing is inherited."""
     outbox = str(outbox)
-    return {'PATH': SELFTEST_PATH, 'HOME': outbox + '/home', 'TMPDIR': outbox + '/tmp', 'CODEX_HOME': str(codex_home)}
+    return {'PATH': SELFTEST_PATH, 'DEVELOPER_DIR': DEVELOPER_DIR, 'HOME': outbox + '/home', 'TMPDIR': outbox + '/tmp', 'CODEX_HOME': str(codex_home)}
 
 
 def _digest_of(handle, cap):

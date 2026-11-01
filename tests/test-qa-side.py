@@ -1274,7 +1274,7 @@ class EndpointProfileTests(unittest.TestCase):
         self.assertEqual(set(d), {"daemon_profile_sha256", "relay_profile_sha256", "relay_source_sha256"})
         self.assertEqual(d["daemon_profile_sha256"], hashlib.sha256(side.daemon_sb(e).encode()).hexdigest())
         self.assertNotEqual(side.endpoint_digests(other)["daemon_profile_sha256"], d["daemon_profile_sha256"])
-        self.assertEqual(e.daemon_env(), {"PATH": "/usr/bin:/bin", "FORNAX_HOME": str(e.state), "FORNAX_HTTP_PORT": "23456", "TMPDIR": str(e.tmp)})
+        self.assertEqual(e.daemon_env(), {"PATH": "/usr/bin:/bin", "DEVELOPER_DIR": "/Library/Developer/CommandLineTools", "FORNAX_HOME": str(e.state), "FORNAX_HTTP_PORT": "23456", "TMPDIR": str(e.tmp)})
         self.assertEqual(set(e.tool_env()), {"QA_ENDPOINT_STATE", "QA_ENDPOINT_SOCK", "QA_ENDPOINT_HTTP_SOCK"})
         self.assertNotIn("23456", "".join(e.tool_env().values()))
 
