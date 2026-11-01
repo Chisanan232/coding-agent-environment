@@ -146,6 +146,7 @@ jobs:
           python3 tests/test-qa-handoff-unattended.py
           python3 tests/test-qa-hop-install.py
           python3 tests/test-qa-payload.py
+          python3 tests/test-qa-endpoint-live.py
           python3 tests/test-parity-dogfood.py
   native-resource-wire:
     runs-on: macos-15
@@ -178,3 +179,5 @@ jobs:
         run: |
           cargo build --locked --manifest-path native-core/Cargo.toml --bin glomeris --target-dir "$RUNNER_TEMP/core-target"
           GLOMERIS_NATIVE_WIRE_BINARY="$RUNNER_TEMP/core-target/debug/glomeris" python3 tests/test-resource-native-wire.py
+      - name: Daemon-endpoint sandbox profiles behave (sandbox-exec, no model)
+        run: python3 tests/test-qa-endpoint-live.py -v
