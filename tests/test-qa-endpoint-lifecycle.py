@@ -892,7 +892,10 @@ class UnixStartTests(UnixBase):
             self.fakes.bind_socket(real)
             self.endpoint.daemon_sock.unlink()
             os.symlink(real, self.endpoint.daemon_sock)
-        for mutate in (loose_socket, loose_dir, linked):
+        def hard_linked():
+            os.link(self.endpoint.daemon_sock, self.endpoint.state / "second-name")
+
+        for mutate in (loose_socket, loose_dir, linked, hard_linked):
             self.setUp()
             original = self.fakes.popen
 
