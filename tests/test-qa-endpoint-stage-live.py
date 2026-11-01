@@ -104,7 +104,7 @@ class EndpointStageLiveTests(unittest.TestCase):
         self.assertTrue(result["confinement"]["established"], result["confinement"])
         endpoint = result["endpoint"]
         self.assertTrue(endpoint["established"], endpoint)
-        self.assertEqual([c["control"] for c in endpoint["codex_controls"]], [c[0] for c in side.ENDPOINT_CODEX_CONTROLS])
+        self.assertEqual([c["control"] for c in endpoint["codex_controls"]], [c[0] for c in side.RELAY_CODEX_CONTROLS])
         self.assertTrue(all(c["ok"] for c in endpoint["codex_controls"]), endpoint["codex_controls"])
         self.assertTrue(all(c["ok"] for c in endpoint["controls"]))
         self.assertEqual(len(endpoint["selftests"]), 1)

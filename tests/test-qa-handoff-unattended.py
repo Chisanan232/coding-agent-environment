@@ -672,7 +672,7 @@ class UnattendedEndpointTests(PayloadBase):
                 "controls": [{"control": n, "observed": {"ALLOWED": "ALLOWED", "REFUSED": "REFUSED"}.get(x, "DENIED:1")}
                              for n, x in SIDE.endpoint_control_expectations(endpoint).items()],
                 "codex_controls": [{"control": n, "observed": {"ALLOWED": "ALLOWED", "DENIED_PROXY": "DENIED_PROXY"}.get(x, "DENIED:1")}
-                                   for n, _, x in SIDE.ENDPOINT_CODEX_CONTROLS],
+                                   for n, _, x in SIDE.endpoint_codex_controls(endpoint)],
                 "port_proof": {"listeners": ["127.0.0.1:%d" % endpoint.port], "daemon_pid": 7},
                 "teardown": {"clean": True, "descendants_left": [], "not_ours": False, "relay_stopped": True, "daemon_stopped": True,
                              "port_closed": True, "sockets_gone": True, "dir_removed": True},

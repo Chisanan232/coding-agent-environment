@@ -110,7 +110,7 @@ class ControlWordingTests(unittest.TestCase):
             self.assertFalse(side.control_ok("DENIED_PROXY", observed), observed)
 
     def test_the_decoy_is_where_the_codex_profile_can_otherwise_write(self):
-        decoy = [c for c in side.ENDPOINT_CODEX_CONTROLS if c[0] == "neg_uds_decoy"][0]
+        decoy = [c for c in side.RELAY_CODEX_CONTROLS if c[0] == "neg_uds_decoy"][0]
         self.assertIn("chdir", decoy[1])          # a long attempt path never turns the refusal into ENAMETOOLONG
 
 

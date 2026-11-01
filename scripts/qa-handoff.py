@@ -1459,7 +1459,7 @@ def verify_endpoint_record(record, endpoint, codex=True):
         return out
 
     profile_controls = judge(record.get('controls'), _SIDE.endpoint_control_expectations(endpoint), _SIDE.endpoint_result_ok, 'profile')
-    codex_controls = judge(record.get('codex_controls'), {n: e for n, _, e in _SIDE.ENDPOINT_CODEX_CONTROLS}, _SIDE.control_ok, 'codex') if codex else []
+    codex_controls = judge(record.get('codex_controls'), {n: e for n, _, e in _SIDE.endpoint_codex_controls(endpoint)}, _SIDE.control_ok, 'codex') if codex else []
     proof = record.get('port_proof')
     want_listener = ['127.0.0.1:%d' % endpoint.port]
     if not (isinstance(proof, dict) and proof.get('listeners') == want_listener and type(proof.get('daemon_pid')) is int and proof['daemon_pid'] > 1):

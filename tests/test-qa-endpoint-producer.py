@@ -35,7 +35,7 @@ class Base(unittest.TestCase):
         self.record = {
             "established": True, "problems": [], "daemon_started": True, "relay_started": True,
             "controls": [{"control": n, "observed": good_observation(x)} for n, x in side.endpoint_control_expectations(e).items()],
-            "codex_controls": [{"control": n, "observed": good_observation(x)} for n, _, x in side.ENDPOINT_CODEX_CONTROLS],
+            "codex_controls": [{"control": n, "observed": good_observation(x)} for n, _, x in side.endpoint_codex_controls(e)],
             "port_proof": {"listeners": ["127.0.0.1:%d" % PORT], "daemon_pid": 42},
             "teardown": {"clean": True, "descendants_left": [], "not_ours": False, "socket_removed_by_helper": ["http.sock"], "relay_stopped": True,
                          "daemon_stopped": True, "port_closed": True, "sockets_gone": True, "dir_removed": True},
