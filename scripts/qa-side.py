@@ -713,13 +713,13 @@ class EndpointLifecycle:
         return steps
 
 
-def prepare_codex_home(run_dir, read_roots=(), home=None):
+def prepare_codex_home(run_dir, read_roots=(), home=None, endpoint=None):
     """A private CODEX_HOME per run: the permission profile, and the login only as a link to the real auth file. The link
     is readable by the Codex client (not sandboxed) and denied to the tool commands, whose profile denies the real home.
     A private home also stops the user's own MCP servers and hooks from loading."""
     home = Path(home or run_dir / 'codexhome')
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    write_private(home / 'config.toml', profile_toml(run_dir, read_roots))
+    write_private(home / 'config.toml', profile_toml(run_dir, read_roots, endpoint=endpoint))
     auth = real_codex_home() / 'auth.json'
     link = home / 'auth.json'
     if auth.exists() and not os.path.lexists(link):
@@ -775,6 +775,8 @@ def control_ok(expect, observed):
         return observed == 'DENIED:1'
     if expect == 'DENIED':
         return observed in ('DENIED:1', 'DENIED:13')
+    if expect == 'DENIED_PROXY':
+        return observed == 'DENIED_PROXY'          # the managed proxy itself answered 403 or 407; no proxy, a dead one or a 5xx proves nothing
     return False          # an unknown expectation (a typo in CONTROLS) never passes
 
 
@@ -885,7 +887,6 @@ PAYLOAD_SCHEMA_2 = 'cae-qa-payload/2'        # adds the endpoint block and the p
 PAYLOAD_SCHEMAS = (PAYLOAD_SCHEMA, PAYLOAD_SCHEMA_2)
 # The daemon-endpoint run mode is built in slices. Until the slice that starts the endpoint lands this stays False, and a /2 manifest that
 # names an endpoint is refused where payloads are accepted (prepare, run, stage) instead of being run without it.
-ENDPOINT_RUNS_SUPPORTED = False
 MANIFEST_NAME = 'MANIFEST.json'
 MANIFEST_MAX = 64 << 10
 PAYLOAD_MAX_FILES = 2000
@@ -1039,11 +1040,14 @@ def parse_manifest(raw):
     return doc
 
 
-def endpoint_refusal(manifest):
-    """Why a payload cannot be accepted by this build, or None. A manifest that names an endpoint is refused until the endpoint lifecycle
-    exists, so it is never run (or self-tested) without the daemon it describes."""
-    if manifest.get('endpoint') is not None and not ENDPOINT_RUNS_SUPPORTED:
-        return 'the payload names a daemon endpoint, which this build cannot start yet; it was not run'
+def endpoint_refusal(manifest, network='none'):
+    """Why a payload cannot be run in this network mode, or None. A payload that names a daemon is never run (or self-tested) without
+    the endpoint it describes, and a run that asks for an endpoint needs a payload that names one."""
+    named = manifest.get('endpoint') is not None
+    if network == 'daemon-endpoint':
+        return None if named else 'the run asks for a daemon endpoint but the payload names none; it was not run'
+    if named:
+        return 'the payload names a daemon endpoint but this run was not started with one; it was not run'
     return None
 
 
@@ -1258,11 +1262,12 @@ def _digest_of(handle, cap):
     return size, digest.hexdigest()
 
 
-def run_selftests(codex_bin, outbox, manifest, env):
+def run_selftests(codex_bin, outbox, manifest, env, endpoint=None):
     """Run each listed self-test as `codex sandbox -P qa_confined -C <clone> <absolute argv>` with the allowlist environment,
     cwd = the run's tmp, stdin from the listed file or /dev/null, stdout and stderr to temporary files (raw bytes, capped).
     Returns one observation per test: exit code, timeout, sizes and SHA-256 of stdout and of the truncated stderr. Nothing is
-    judged here: the producer re-derives pass or fail from the manifest it holds."""
+    judged here: the producer re-derives pass or fail from the manifest it holds. With `endpoint` (its daemon already up) a test that
+    needs it also gets the QA_ENDPOINT_* paths; every other test gets the plain environment."""
     outbox = Path(outbox)
     payload_dir = outbox / 'payload'
     records = []
@@ -1271,6 +1276,7 @@ def run_selftests(codex_bin, outbox, manifest, env):
                   'stdout_sha256': None, 'stderr_bytes': None, 'stderr_sha256': None, 'elapsed': None}
         records.append(record)
         argv = [codex_bin, 'sandbox', '-P', PROFILE, '-C', str(outbox / 'source')] + expand_selftest_argv(test, payload_dir)
+        test_env = dict(env, **endpoint.tool_env()) if endpoint is not None and test.get('needs_endpoint') else env
         stdin = None
         started = time.monotonic()
         try:
@@ -1278,7 +1284,7 @@ def run_selftests(codex_bin, outbox, manifest, env):
                 stdin = open_regular(payload_dir / test['stdin']) if test['stdin'] is not None else open(os.devnull, 'rb')
                 try:
                     limit = fsize_limit(test['max_output_bytes'])
-                    proc = subprocess.Popen(argv, stdin=stdin, stdout=out, stderr=err, cwd=str(outbox / 'tmp'), env=env, start_new_session=True,
+                    proc = subprocess.Popen(argv, stdin=stdin, stdout=out, stderr=err, cwd=str(outbox / 'tmp'), env=test_env, start_new_session=True,
                                             preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit)))
                 except OSError:
                     record['unrunnable'] = True
@@ -1399,6 +1405,89 @@ def qa_stage(args, build_env=None, copy_source=None, open_payload=None):
     return 0
 
 
+# --- daemon-endpoint run (SPE-145 PR-b4) ----------------------------------------------------------------------------------------------
+# Controls run by `codex sandbox -P` with the endpoint profile AFTER the daemon and relay are up: what a tool command can and cannot
+# reach. The negatives are EPERM-only (a refused or unreachable port proves nothing). {relay} {daemon_sock} {port} {decoy} come from cae.
+ENDPOINT_CODEX_CONTROLS = (
+    ('pos_uds_relay_http', "import socket\ntry:\n    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.settimeout(10)\n    s.connect({relay!r})\n    s.sendall(b'GET / HTTP/1.0\\r\\nHost: x\\r\\n\\r\\n')\n    print('ALLOWED' if s.recv(64).startswith(b'HTTP/1.') else 'DENIED:NOHTTP')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'ALLOWED'),
+    ('pos_uds_daemon', "import socket\ntry:\n    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.settimeout(10)\n    s.connect({daemon_sock!r})\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'ALLOWED'),
+    ('neg_tcp_daemon_port', "import socket\ntry:\n    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    s.settimeout(5)\n    s.connect(('127.0.0.1', {port}))\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED_EPERM'),
+    ('neg_uds_decoy', "import os, socket\ntry:\n    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.settimeout(5)\n    os.chdir(os.path.dirname({decoy!r}))\n    s.connect(os.path.basename({decoy!r}))\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED_EPERM'),
+    # The managed proxy is on (the unix_sockets table needs it) but allows no domain: a CONNECT through it must be refused.
+    ('neg_proxy_connect', "import os, socket\nraw = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY') or os.environ.get('https_proxy') or os.environ.get('http_proxy')\nif not raw:\n    print('NOPROXY')\nelse:\n    host, _, port = raw.split('://')[-1].rstrip('/').rpartition(':')\n    try:\n        s = socket.create_connection((host, int(port)), 5)\n        s.sendall(b'CONNECT 192.0.2.1:9 HTTP/1.1\\r\\nHost: 192.0.2.1:9\\r\\n\\r\\n')\n        line = s.recv(64).split(b'\\r\\n')[0]\n        print('DENIED_PROXY' if line[9:12] in (b'403', b'407') else 'ALLOWED:' + line.decode('latin-1')[:20])\n    except OSError as e:\n        print('DENIED:%s' % e.errno)", 'DENIED_PROXY'),
+)
+
+
+def endpoint_codex_probe(codex_bin, run_dir, env, endpoint, decoy):
+    """Run ENDPOINT_CODEX_CONTROLS under the real Codex profile with the endpoint's tool environment. Returns (results, problems)."""
+    values = {'relay': str(endpoint.relay_sock), 'daemon_sock': str(endpoint.daemon_sock), 'port': endpoint.port, 'decoy': str(decoy)}
+    tool_env = dict(env, **endpoint.tool_env())
+    results, problems = [], []
+    for name, snippet, expect in ENDPOINT_CODEX_CONTROLS:
+        argv = [codex_bin, 'sandbox', '-P', PROFILE, '-C', str(run_dir / 'source'), '/usr/bin/python3', '-c', '# CONTROL=%s\n%s' % (name, snippet.format(**values))]
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=tool_env)
+            got = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else ''
+            ok = done.returncode == 0 and control_ok(expect, got)
+            detail = got or 'exit %s' % done.returncode
+            unrunnable = done.returncode != 0 or not got
+        except (OSError, subprocess.SubprocessError) as error:
+            ok, detail, unrunnable = False, type(error).__name__, True
+        results.append({'control': name, 'expected': expect, 'observed': clean(detail, 40), 'ok': ok, 'unrunnable': unrunnable})
+        if not ok:
+            problems.append('%s expected %s, observed %s' % (name, expect, clean(detail, 40)))
+    return results, problems
+
+
+def build_endpoint(args, outbox, manifest):
+    """The Endpoint for this run, from values cae holds (QA home, exchange, attempt, port) and the manifest's daemon path; raises
+    EndpointError for anything the generators refuse."""
+    block = manifest['endpoint']
+    payload = str(Path(outbox) / 'payload')
+    return Endpoint(args.qa_home, args.exchange, args.attempt, args.port, block['contract'], payload, payload + '/' + block['daemon'])
+
+
+def run_endpoint_phase(args, outbox, manifest, endpoint, env, home, ops=None):
+    """Everything that needs the daemon, in order: the two generated profiles are proved, the daemon and relay start (the first producer
+    code outside Codex), the port is proved, the Codex-side controls run, and only then the self-tests that need the endpoint. The
+    endpoint is torn down on every path. Returns the `endpoint` record; its `established` is the only thing the producer may trust."""
+    outbox = Path(outbox)
+    life = EndpointLifecycle(endpoint, outbox / 'endpoint', ops=ops)
+    record = life.record
+    record.update(established=False, codex_controls=[], selftests=None)
+    token = os.urandom(8).hex()
+    canary_dir = CANARY_ROOT / token
+    try:
+        canary_dir.mkdir(parents=True, mode=0o700)
+        canary = canary_dir / 'canary.txt'
+        canary.write_text('synthetic-qa-canary-%s' % token)
+        life.create()
+        decoy_dir = outbox / 'tmp'          # a place the Codex profile can otherwise write, so a refusal is the socket allowlist's
+        life.prove_profiles(canary, real_codex_home() / 'auth.json', decoy_dir)
+        life.start()
+        results, problems = endpoint_codex_probe(args.codex_bin, outbox, selftest_env(outbox, home), endpoint, decoy_dir / 'qa-decoy.sock')
+        record['codex_controls'] = results
+        if problems:
+            record['problems'].extend(problems)
+        elif life.supervise():
+            record['selftests'] = run_selftests(args.codex_bin, outbox, manifest, selftest_env(outbox, home), endpoint)
+            record['established'] = life.supervise()
+    except (EndpointFailed, EndpointError, OSError) as error:
+        record['problems'].append(clean(str(error), 160))
+    finally:
+        try:
+            record['teardown'] = life.teardown()
+        finally:
+            for leftover in (canary_dir / 'canary.txt', canary_dir, outbox / 'tmp' / 'qa-decoy.sock'):
+                try:
+                    leftover.rmdir() if leftover.is_dir() and not leftover.is_symlink() else leftover.unlink()
+                except OSError:
+                    pass
+    if record['teardown'] and not record['teardown'].get('clean'):
+        record['established'] = False
+    return record
+
+
 def stage_outbox(args, build_env=None, copy_source=None, open_payload=None):
     inbox, outbox = Path(args.inbox), Path(args.outbox)
     outbox.mkdir(mode=0o700)      # fails if anything already exists under this attempt name
@@ -1414,24 +1503,36 @@ def stage_outbox(args, build_env=None, copy_source=None, open_payload=None):
     if not (real_codex_home() / 'auth.json').exists():
         return {'login_missing': True}     # otherwise the probe would skip the login control, which the producer requires
     manifest, payload_record = None, None
+    network = getattr(args, 'network', 'none')
     opened = (open_payload or (lambda: open_payload_path(inbox / 'payload')))()
+    if opened is None and network != 'none':
+        return {'payload': {'problems': ['a daemon endpoint run needs a payload']}}
     if opened is not None:
-        manifest, payload_record = stage_payload(opened, outbox)
+        manifest, payload_record = stage_payload(opened, outbox, network)
         if manifest is None:
             return {'payload': payload_record}                     # nothing is proved on top of a payload that failed its manifest
-    home = prepare_codex_home(outbox, [outbox / 'payload'] if manifest is not None else (), home=Path(args.codex_home))
+    endpoint = None
+    if network == 'daemon-endpoint':
+        try:
+            endpoint = build_endpoint(args, outbox, manifest)
+        except EndpointError as error:
+            payload_record['problems'] = [clean(str(error), 160)]
+            return {'payload': payload_record}
+    home = prepare_codex_home(outbox, [outbox / 'payload'] if manifest is not None else (), home=Path(args.codex_home), endpoint=endpoint)
     env = build_env() if build_env else isolated_env(outbox, home)
     record, problems = confinement_probe(args.codex_bin, outbox, env, manifest)
     result = {'confinement': record, 'profile_sha256': sha256_file(home / 'config.toml')}
     if manifest is not None:
         result['payload'] = payload_record
         # The gate runs only on a proved profile; the producer refuses to start Codex without both.
-        if not problems:
+        if not problems and endpoint is None:
             result['selftests'] = run_selftests(args.codex_bin, outbox, manifest, selftest_env(outbox, home))
+        elif not problems:
+            result['endpoint'] = run_endpoint_phase(args, outbox, manifest, endpoint, env, home)
     return result
 
 
-def stage_payload(opened, outbox):
+def stage_payload(opened, outbox, network='none'):
     """Verify the producer's payload (held open as `opened`), copy it into outbox/payload and verify the copy. Returns
     (manifest, record) or (None, record with the problems)."""
     fd, producer = opened
@@ -1440,7 +1541,7 @@ def stage_payload(opened, outbox):
         raw = read_manifest_at(fd, producer)
         record['manifest_sha256'] = manifest_sha256(raw)
         manifest = parse_manifest(raw)
-        refusal = endpoint_refusal(manifest)
+        refusal = endpoint_refusal(manifest, network)
         if refusal:
             record['problems'] = [refusal]
             return None, record
@@ -2000,6 +2101,12 @@ def build_parser():
         q.add_argument('--outbox', required=True)
         q.add_argument('--codex-home', required=True)
         q.add_argument('--codex-bin', default='codex')
+        if name == 'qa-stage':
+            q.add_argument('--network', choices=('none', 'daemon-endpoint'), default='none')
+            q.add_argument('--port', type=int, default=0)
+            q.add_argument('--qa-home', default=str(HOME))
+            q.add_argument('--exchange', default='')
+            q.add_argument('--attempt', default='')
         if name == 'qa-exec':
             q.add_argument('--timeout', type=int, default=1800)
             q.add_argument('--profile-sha256', required=True)
