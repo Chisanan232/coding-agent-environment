@@ -604,8 +604,8 @@ class EnvironmentTests(InstalledCase):
         t = self.tree(verb="probe")
         seen = self.run_action(t, "probe")
         path, argv, env = seen["execve"]
-        self.assertEqual(path, "/usr/bin/python3")
-        self.assertEqual(argv[:3], ["/usr/bin/python3", "-I", "-c"])
+        self.assertEqual(path, side.TRUSTED_PYTHON)
+        self.assertEqual(argv[:3], [side.TRUSTED_PYTHON, "-I", "-c"])
         self.assertEqual(argv[3], side.PROBE)
         self.assertEqual(argv[4:], [str(t.x / "inbox"), str(t.x / "outbox"), str(t.x), pwd.getpwuid(ME).pw_dir, "4242", SENTINEL])
         self.assertEqual(env, {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": QA.pw_dir})
@@ -891,6 +891,109 @@ class DescriptorRelativeTests(InstalledCase):
             rc, out, err = self.run_side(t, ["stage", ATTEMPT])
         self.assertEqual((out, err), ("", ""))
         self.assertNotEqual(rc, 0)
+
+
+class InterpreterPinTests(unittest.TestCase):
+    """The helper's interpreter is the real Command Line Tools binary, not the xcode-select shim, and its framework tree is checked."""
+
+    def make_tree(self):
+        base = Path(os.path.realpath(tempfile.mkdtemp(prefix="qa-interp-test-")))
+        self.addCleanup(lambda: (subprocess.run(["/bin/chmod", "-R", "u+w", str(base)]), shutil.rmtree(base, ignore_errors=True)))
+        tree = base / "Versions/3.9"
+        for d in (base, base / "Versions", tree, tree / "bin", tree / "lib"):
+            d.mkdir(exist_ok=True)
+            os.chmod(d, 0o755)
+        binary = tree / "bin/python3.9"
+        binary.write_bytes(b"\xcf\xfa\xed\xfe")
+        os.chmod(binary, 0o755)
+        (tree / "lib/os.py").write_text("x")
+        os.chmod(tree / "lib/os.py", 0o644)
+        return base, tree, binary
+
+    def problems(self, base, tree, binary, uid=None, **kw):
+        with mock.patch.object(side, "TRUSTED_PYTHON", str(binary)), mock.patch.object(side, "TRUSTED_PYTHON_TREE", str(tree)), \
+                mock.patch.object(side, "ROOT_UID", os.getuid() if uid is None else uid):
+            return side.interpreter_problems(str(base), **kw)
+
+    def test_the_pinned_names(self):
+        self.assertEqual(side.SHEBANG, "#!" + side.TRUSTED_PYTHON + " -I")
+        self.assertEqual(Path(side.__file__).read_text().split("\n", 1)[0], side.SHEBANG)
+        self.assertTrue(side.TRUSTED_PYTHON.startswith(side.TRUSTED_PYTHON_TREE + "/bin/"))
+        self.assertTrue(side.TRUSTED_PYTHON.startswith("/Library/Developer/CommandLineTools/"))
+        self.assertNotIn("xcode", side.TRUSTED_PYTHON.lower())
+
+    def test_no_shim_literal_is_left_where_the_helper_chooses_an_interpreter(self):
+        source = Path(side.__file__).read_text()
+        self.assertEqual([l for l in source.splitlines() if "'/usr/bin/python3'" in l and not l.startswith("SHIM_PYTHON")], [])
+        self.assertEqual([l for l in source.splitlines() if '"/usr/bin/python3"' in l], [])
+
+    def test_a_clean_tree_is_trusted(self):
+        base, tree, binary = self.make_tree()
+        self.assertEqual(self.problems(base, tree, binary), [])
+
+    def test_any_entry_writable_by_group_or_other_is_reported(self):
+        for mode in (0o664, 0o646, 0o666):
+            base, tree, binary = self.make_tree()
+            os.chmod(tree / "lib/os.py", mode)
+            found = self.problems(base, tree, binary)
+            self.assertTrue(any("os.py is writable by group or other" in f for f in found), (mode, found))
+
+    def test_a_writable_directory_or_binary_is_reported(self):
+        base, tree, binary = self.make_tree()
+        os.chmod(tree / "lib", 0o775)
+        self.assertTrue(any("lib is writable" in f for f in self.problems(base, tree, binary)))
+        base, tree, binary = self.make_tree()
+        os.chmod(binary, 0o775)
+        self.assertTrue(self.problems(base, tree, binary))
+
+    def test_entries_not_owned_by_root_are_reported(self):
+        base, tree, binary = self.make_tree()
+        self.assertTrue(self.problems(base, tree, binary, uid=os.getuid() + 1))
+
+    def test_a_link_is_refused_as_the_binary_or_a_parent(self):
+        base, tree, binary = self.make_tree()
+        real = tree / "bin/real"
+        binary.rename(real)
+        os.symlink(real, binary)
+        self.assertTrue(self.problems(base, tree, binary))
+        base, tree, binary = self.make_tree()
+        os.rename(tree / "bin", tree / "bin2")
+        os.symlink(tree / "bin2", tree / "bin")
+        self.assertTrue(self.problems(base, tree, binary))
+
+    def test_a_link_leaving_the_tree_is_reported_but_system_and_inside_targets_are_not(self):
+        base, tree, binary = self.make_tree()
+        os.symlink("/usr/lib", tree / "lib/to-usr-lib")
+        os.symlink("os.py", tree / "lib/inside")
+        self.assertEqual(self.problems(base, tree, binary), [])
+        os.symlink("/tmp", tree / "lib/outside")
+        os.symlink("../../../elsewhere", tree / "lib/escape")
+        found = self.problems(base, tree, binary)
+        self.assertTrue(any("outside" in f for f in found) and any("escape" in f for f in found), found)
+
+    def test_a_missing_binary_or_missing_chain_is_reported(self):
+        base, tree, binary = self.make_tree()
+        os.unlink(binary)
+        self.assertEqual(len(self.problems(base, tree, binary)), 1)
+
+    def test_a_huge_tree_is_reported_not_walked_forever(self):
+        base, tree, binary = self.make_tree()
+        for n in range(30):
+            (tree / "lib" / ("f%d" % n)).write_text("x")
+            os.chmod(tree / "lib" / ("f%d" % n), 0o644)
+        self.assertTrue(any("more than" in f for f in self.problems(base, tree, binary, limit=10)))
+
+    def test_the_real_host_interpreter_is_trusted_when_it_exists(self):
+        if not os.path.exists(side.TRUSTED_PYTHON) or os.stat(side.TRUSTED_PYTHON).st_uid != 0:
+            self.skipTest("no root-owned Command Line Tools interpreter on this host")
+        with mock.patch.object(side, "ROOT_UID", 0):
+            self.assertEqual(side.interpreter_problems(), [])
+
+    def test_the_probe_python_falls_back_only_when_the_trusted_one_is_missing(self):
+        with mock.patch.object(side, "TRUSTED_PYTHON", "/nonexistent/python3.9"):
+            self.assertEqual(side.tool_python(), side.SHIM_PYTHON)
+        with mock.patch.object(side, "TRUSTED_PYTHON", sys.executable):
+            self.assertEqual(side.tool_python(), sys.executable)
 
 
 class DetachTests(unittest.TestCase):

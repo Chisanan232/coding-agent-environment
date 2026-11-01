@@ -1,4 +1,4 @@
-#!/usr/bin/python3 -I
+#!/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I
 """The QA side of the Codex QA hand-off: everything that runs as the dedicated QA OS user (SPE-153).
 
   qa-side.py qa-stage --inbox DIR --outbox DIR --codex-home DIR [--codex-bin PATH]
@@ -36,6 +36,15 @@ PROFILE = 'qa_confined'
 SECRET_DIRS = ('.codex', '.ssh', '.aws', '.config', '.claude', '.gnupg', '.netrc', '.npmrc', '.docker', '.kube',
                'Library/Keychains', '.cargo/credentials.toml', '.cargo/credentials')
 SYSTEM_READ = ('/usr', '/bin', '/opt/homebrew', '/Library/Developer/CommandLineTools')
+# The interpreter the installed helper (and everything it starts outside the Codex sandbox) runs under. `/usr/bin/python3` is an Apple
+# shim that picks its real interpreter through xcode-select (DEVELOPER_DIR, /var/db/xcode_select_link), and that link can name a
+# directory under /Applications that the admin group may create, so the shim is not a trusted executable. This is the real, link-free
+# Command Line Tools binary: every component down from / and the whole framework version tree must be root-owned and not writable by
+# group or other (interpreter_problems). The delegated digest pins the helper's bytes, including this first line.
+TRUSTED_PYTHON_TREE = '/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9'
+TRUSTED_PYTHON = TRUSTED_PYTHON_TREE + '/bin/python3.9'
+SHEBANG = '#!' + TRUSTED_PYTHON + ' -I'
+SHIM_PYTHON = '/usr/bin/python3'        # only where no trusted interpreter exists: the attended hop on a host without Command Line Tools
 CANARY_ROOT = HOME / '.local/state/coding-agent-environment/qa-canary'
 ENV_ALLOW = ('PATH', 'LANG', 'LC_ALL', 'TERM', 'TZ', 'USER', 'LOGNAME', 'SHELL')
 
@@ -509,9 +518,9 @@ class EndpointLifecycle:
     relay, prove the port is the daemon's and loopback-only, and tear everything down. The order is the point: the candidate daemon is
     the first producer code and starts only after every control of both profiles has passed."""
 
-    def __init__(self, endpoint, record_dir, ops=None, sandbox_exec='/usr/bin/sandbox-exec', python='/usr/bin/python3'):
+    def __init__(self, endpoint, record_dir, ops=None, sandbox_exec='/usr/bin/sandbox-exec', python=None):
         self.endpoint, self.record_dir, self.ops = endpoint, Path(record_dir), ops or EndpointOps()
-        self.sandbox_exec, self.python = sandbox_exec, python
+        self.sandbox_exec, self.python = sandbox_exec, python or tool_python()
         self.daemon = self.relay = None
         self._owns_dir = False                 # set only after OUR exclusive mkdir; teardown never touches a directory it did not create
         self.record = {'port': endpoint.port, 'mode': 'daemon-endpoint', 'controls': [], 'problems': [], 'daemon_started': False,
@@ -942,7 +951,7 @@ def confinement_probe(codex_bin, run_dir, env, manifest=None):
                 continue
             code = '# CONTROL=%s\n%s' % (name, snippet.format(**values))
             cwd = hostile if name == 'neg_project_config_ignored' else run_dir / 'source'
-            argv = [codex_bin, 'sandbox', '-P', PROFILE, '-C', str(cwd), '/usr/bin/python3', '-c', code]
+            argv = [codex_bin, 'sandbox', '-P', PROFILE, '-C', str(cwd), tool_python(), '-c', code]
             try:
                 if name in PAYLOAD_EXEC_CONTROLS:
                     # allowlist environment, own session, whole group killed afterwards: the payload cannot leave a process behind
@@ -1527,7 +1536,7 @@ def endpoint_codex_probe(codex_bin, run_dir, env, endpoint, decoy):
     tool_env = dict(env, **endpoint.tool_env())
     results, problems = [], []
     for name, snippet, expect in ENDPOINT_CODEX_CONTROLS:
-        argv = [codex_bin, 'sandbox', '-P', PROFILE, '-C', str(run_dir / 'source'), '/usr/bin/python3', '-c', '# CONTROL=%s\n%s' % (name, snippet.format(**values))]
+        argv = [codex_bin, 'sandbox', '-P', PROFILE, '-C', str(run_dir / 'source'), tool_python(), '-c', '# CONTROL=%s\n%s' % (name, snippet.format(**values))]
         try:
             done = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=tool_env)
             got = done.stdout.strip().splitlines()[-1] if done.stdout.strip() else ''
@@ -1899,7 +1908,6 @@ PROTOCOL = 2                          # 2: stage and exec requests carry network
 ROOT_UID = 0                          # tests substitute the current uid to stand in for root; never read from argv or env
 CONFIG_PATH = '/Library/cae-qa/qa-side.json'
 CHILD_PATH = '/usr/bin:/bin:/usr/sbin:/sbin'
-PYTHON = '/usr/bin/python3'
 ATTEMPT_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,150}')
 SENTINEL_RE = re.compile(r'qa-sentinel-[0-9a-f]{32}')
 SHA256_RE = re.compile(r'[0-9a-f]{64}')
@@ -1982,6 +1990,54 @@ def trusted_chain(path, anchor, final_regular=True):
         _need(not stat.S_ISLNK(st.st_mode) and st.st_uid == ROOT_UID and not st.st_mode & 0o022)
         last = index == len(parts)
         _need(stat.S_ISREG(st.st_mode) if last and final_regular else stat.S_ISDIR(st.st_mode) if not last else True)
+
+
+def tool_python():
+    """The interpreter for the confinement probes that run inside the Codex sandbox: the trusted binary where it exists (always, on
+    an unattended install, which verifies it), the system shim only on a host that has no Command Line Tools."""
+    return TRUSTED_PYTHON if os.path.exists(TRUSTED_PYTHON) else SHIM_PYTHON
+
+
+def interpreter_problems(anchor='/', limit=50000):
+    """Messages for anything that makes TRUSTED_PYTHON not trustworthy; empty means trusted. The binary is reached through root-owned,
+    non-writable, non-link components, and every entry of its framework version tree (the dylib it loads, the standard library,
+    site-packages) is root-owned and not group/world writable; a link must stay inside the tree or under /System or /usr/lib. ACLs
+    are not visible to this check (the owner readback lists them). Messages carry paths, never contents."""
+    found = []
+    try:
+        trusted_chain(TRUSTED_PYTHON, anchor)
+    except (Refuse, OSError):
+        return ['the trusted interpreter %s is missing, a link, or not reached through root-owned non-writable components' % TRUSTED_PYTHON]
+    tree = TRUSTED_PYTHON_TREE
+    if not TRUSTED_PYTHON.startswith(tree + '/'):
+        return ['the trusted interpreter is not inside its framework tree']
+    inside = (tree + '/', '/System/', '/usr/lib/')
+    seen = 0
+    errors = []
+    for top, dirs, files in os.walk(tree, followlinks=False, onerror=errors.append):
+        for name in dirs + files:
+            path = os.path.join(top, name)
+            seen += 1
+            if seen > limit:
+                return found + ['the interpreter tree has more than %d entries' % limit]
+            try:
+                st = os.lstat(path)
+            except OSError:
+                found.append('%s cannot be examined' % path)
+                continue
+            if st.st_uid != ROOT_UID:
+                found.append('%s is not root-owned' % path)
+            if stat.S_ISLNK(st.st_mode):
+                target = os.path.realpath(path)
+                if not (target + '/').startswith(inside):
+                    found.append('%s points outside the interpreter tree' % path)
+            elif st.st_mode & 0o022:
+                found.append('%s is writable by group or other' % path)
+            if len(found) >= 8:
+                return found
+    if errors:
+        found.append('the interpreter tree could not be read completely')
+    return found
 
 
 def read_config(config_path, chain_anchor):
@@ -2210,7 +2266,7 @@ def describe(plan):
     paths = {key: plan[key] for key in ('exchange', 'inbox', 'outbox', 'codex_home', 'codex', 'qa_home')}
     if verb == 'probe':
         request = plan['request']
-        argv = [PYTHON, '-I', '-c', '<probe source>', plan['inbox_root'], plan['outbox_root'], plan['exchange'],
+        argv = [TRUSTED_PYTHON, '-I', '-c', '<probe source>', plan['inbox_root'], plan['outbox_root'], plan['exchange'],
                 plan['producer_home'], str(request['pid']), request['sentinel']]
         env = base_env(plan['qa_home'])
     else:
@@ -2328,7 +2384,7 @@ def _act(plan):
         detach(120)
         os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
         request = plan['request']
-        os.execve(PYTHON, [PYTHON, '-I', '-c', PROBE, plan['inbox_root'], plan['outbox_root'], plan['exchange'],
+        os.execve(TRUSTED_PYTHON, [TRUSTED_PYTHON, '-I', '-c', PROBE, plan['inbox_root'], plan['outbox_root'], plan['exchange'],
                            plan['producer_home'], str(request['pid']), request['sentinel']], base_env(plan['qa_home']))
     except Exception:
         return 2
