@@ -151,6 +151,7 @@ jobs:
           python3 tests/test-qa-endpoint-lifecycle-live.py
           python3 tests/test-qa-endpoint-stage.py
           python3 tests/test-qa-endpoint-stage-live.py
+          python3 tests/test-qa-endpoint-producer.py
           python3 tests/test-parity-dogfood.py
   native-resource-wire:
     runs-on: macos-15

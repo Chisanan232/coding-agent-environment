@@ -48,6 +48,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -380,7 +381,7 @@ def read_optional(path):
 NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 
 
-def read_payload_source(directory):
+def read_payload_source(directory, network='none'):
     """The producer's payload directory, opened and fully verified against its MANIFEST.json before anything is created: a dict with
     the open descriptor, the parsed manifest and its raw bytes. Any broken rule is a refusal that names it."""
     try:
@@ -390,7 +391,7 @@ def read_payload_source(directory):
     try:
         raw = _SIDE.read_manifest_at(fd, os.getuid())
         manifest = _SIDE.parse_manifest(raw)
-        refusal = _SIDE.endpoint_refusal(manifest)
+        refusal = _SIDE.endpoint_refusal(manifest, network)
         if refusal:
             raise _SIDE.PayloadError(refusal)
         problems = _SIDE.verify_tree(fd, manifest, raw, os.getuid())
@@ -411,7 +412,10 @@ def prepare(args):
         raise SystemExit('refusing: --sha must not start with -')
     # Read every input before anything is created, so a bad input leaves no half-made run directory behind.
     criteria, producer, notes = read_small(args.criteria), read_optional(args.producer_evidence), read_optional(args.qa_notes)
-    payload = read_payload_source(args.payload) if getattr(args, 'payload', None) else None
+    network = getattr(args, 'network', 'none')
+    if network != 'none' and not getattr(args, 'payload', None):
+        raise SystemExit('refusing: --network %s needs a --payload that names the daemon' % network)
+    payload = read_payload_source(args.payload, network) if getattr(args, 'payload', None) else None
     repo = Path(args.repo).resolve()
     sha = git(repo, 'rev-parse', '--verify', '--end-of-options', args.sha + '^{commit}').stdout.strip()
     if not re.fullmatch(r'[0-9a-f]{40,64}', sha):
@@ -451,6 +455,8 @@ def prepare(args):
                              'files': len(manifest['files']), 'bytes': sum(f['size'] for f in manifest['files']),
                              'selftests': [t['id'] for t in manifest['selftests']], 'scope': manifest['scope'],
                              'producer_run': list(manifest['producer_run'])}
+    if network != 'none':
+        packet['network'] = network          # bound by the digest: the run cannot be started with another network mode
     packet['digest'] = packet_digest(packet)
     write_private(run_dir / 'packet.json', packet)
     print(run_dir)
@@ -658,6 +664,10 @@ def run(args):
     packet = load_packet(run_dir)
     if packet.get('payload') is not None and ident is None:
         return refuse('this run directory carries a payload; payload runs need --qa-identity (the self-tests run as the QA user)')
+    if packet.get('network', 'none') not in ('none', 'daemon-endpoint'):
+        return refuse('the packet names an unknown network mode')
+    if packet.get('network') == 'daemon-endpoint' and not getattr(args, 'no_model', False):
+        return refuse('a daemon-endpoint run stops before the model for now (its exec-time endpoint is not built): add --no-model')
     if run_dir.is_dir():
         write_private(run_dir / 'MODE.json', mode)    # one mode per run directory; recorded in RESULT.json too
     source = run_dir / 'source'
@@ -1358,7 +1368,7 @@ def producer_payload(run_dir, packet):
         if not isinstance(info, dict) or _SIDE.manifest_sha256(raw) != info.get('manifest_sha256'):
             return None, ['MANIFEST.json is not the one the packet names']
         manifest = _SIDE.parse_manifest(raw)
-        refusal = _SIDE.endpoint_refusal(manifest)
+        refusal = _SIDE.endpoint_refusal(manifest, packet.get('network', 'none'))
         if refusal:
             return None, [refusal]
         problems = _SIDE.verify_tree(fd, manifest, raw, os.getuid())
@@ -1385,6 +1395,90 @@ def selftest_summary(verdicts):
     return {'ran': len(verdicts), 'passed': sum(1 for v in verdicts if v['ok']),
             'tests': [{'id': v['id'], 'ok': v['ok'], 'exit': v['exit'], 'stdout_sha256': v['stdout_sha256'],
                        'stderr_sha256': v['stderr_sha256'], 'reasons': [clean(r, 80) for r in v['reasons']]} for v in verdicts]}
+
+
+def pick_port():
+    """A port in the endpoint range that nothing is listening on right now (best effort: the QA side proves it again before it starts anything)."""
+    for _ in range(100):
+        port = _SIDE.PORT_RANGE[0] + int.from_bytes(os.urandom(2), 'big') % (_SIDE.PORT_RANGE[1] - _SIDE.PORT_RANGE[0] + 1)
+        with socket.socket() as probe:
+            probe.settimeout(1)
+            if probe.connect_ex(('127.0.0.1', port)) != 0:
+                return port
+    return None
+
+
+def endpoint_for(ident, attempt, outbox, port, manifest):
+    """The Endpoint this producer expects: built from values it holds itself (QA home, exchange, attempt, port) and the manifest, never
+    from anything the QA side reported."""
+    block = manifest['endpoint']
+    payload = str(outbox / 'payload')
+    return _SIDE.Endpoint(str(ident.home), str(ident.exchange), attempt, port, block['contract'], payload, payload + '/' + block['daemon'])
+
+
+def expected_endpoint_profile_sha(ident, outbox, endpoint):
+    """SHA-256 of the Codex profile an endpoint run must have used, computed here from the same generator the QA side uses and the
+    values this producer holds. The QA-reported digest is accepted only if it equals this."""
+    text = _SIDE.profile_toml(outbox, [outbox / 'payload'], home=Path(ident.home), codex_home=Path(ident.home) / '.codex', endpoint=endpoint)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def verify_endpoint_record(record, endpoint):
+    """(view, problems): the producer's own judgment of the QA side's `endpoint` record. Every expected control must be present exactly
+    once and its result is recomputed from what was observed; the port proof must name loopback and one listener; teardown must be clean
+    (the relay's socket unlinked by the helper is reportable, not fatal). `established` is required but never sufficient."""
+    problems = []
+    if not isinstance(record, dict):
+        return None, ['qa-stage did not report an endpoint record']
+
+    def judge(rows, expected, ok_of, label):
+        seen, out = set(), []
+        for row in rows if isinstance(rows, list) else []:
+            name, observed = (row.get('control'), row.get('observed')) if isinstance(row, dict) else (None, None)
+            if not isinstance(name, str) or name not in expected or name in seen or not isinstance(observed, str):
+                problems.append('%s: unknown, repeated or malformed control %s' % (label, clean(name, 40)))
+                continue
+            seen.add(name)
+            ok = ok_of(expected[name], observed)
+            out.append({'control': name, 'expected': expected[name], 'observed': clean(observed, 40), 'ok': ok})
+            if not ok:
+                problems.append('%s %s expected %s, observed %s' % (label, name, expected[name], clean(observed, 40)))
+        missing = sorted(set(expected) - seen)
+        if missing:
+            problems.append('%s controls missing: %s' % (label, ', '.join(missing[:6])))
+        return out
+
+    profile_controls = judge(record.get('controls'), _SIDE.endpoint_control_expectations(endpoint), _SIDE.endpoint_result_ok, 'profile')
+    codex_controls = judge(record.get('codex_controls'), {n: e for n, _, e in _SIDE.ENDPOINT_CODEX_CONTROLS}, _SIDE.control_ok, 'codex')
+    proof = record.get('port_proof')
+    want_listener = ['127.0.0.1:%d' % endpoint.port]
+    if not (isinstance(proof, dict) and proof.get('listeners') == want_listener and type(proof.get('daemon_pid')) is int and proof['daemon_pid'] > 1):
+        problems.append('the port proof does not show the daemon alone on 127.0.0.1:%d' % endpoint.port)
+        proof = None
+    teardown = record.get('teardown')
+    steps = ('relay_stopped', 'daemon_stopped', 'port_closed', 'sockets_gone', 'dir_removed')
+    if not (isinstance(teardown, dict) and teardown.get('clean') is True and teardown.get('descendants_left') == []
+            and teardown.get('not_ours') is False and all(teardown.get(step) is True for step in steps)):
+        problems.append('the endpoint was not torn down cleanly')
+    # Only known, bounded values reach the producer's own record: nothing the QA side sent is copied through as it came.
+    proof_view = {'listeners': want_listener, 'daemon_pid': proof['daemon_pid']} if proof else None
+    teardown_view = ({'clean': True, 'steps': {step: teardown.get(step) is True for step in steps}} if isinstance(teardown, dict) else None)
+    if isinstance(teardown, dict):
+        teardown_view['socket_removed_by_helper'] = [clean(n, 40) for n in (teardown.get('socket_removed_by_helper') or [])[:4]
+                                                     if isinstance(n, str)] if isinstance(teardown.get('socket_removed_by_helper'), list) else []
+        teardown_view['clean'] = teardown.get('clean') is True
+    for key, want in _SIDE.endpoint_digests(endpoint).items():          # the generated profiles and relay are the ones cae would generate
+        if record.get(key) != want:
+            problems.append('the endpoint record\'s %s is not the one this producer computes' % key)
+    reported = record.get('problems')
+    if reported is not None and not (isinstance(reported, list) and not reported):
+        text = '; '.join(clean(p, 80) for p in reported[:2] if isinstance(p, str)) if isinstance(reported, list) else 'malformed'
+        problems.append('the endpoint reported: ' + text)
+    if record.get('established') is not True:
+        problems.append('the endpoint was not established')
+    view = {'port': endpoint.port, 'controls': profile_controls, 'codex_controls': codex_controls, 'port_proof': proof_view, 'teardown': teardown_view,
+            **{key: want for key, want in _SIDE.endpoint_digests(endpoint).items() if record.get(key) == want}, 'derived_by': 'producer'}
+    return view, problems
 
 
 def run_identity(args, run_dir, packet, source, ident):
@@ -1609,13 +1703,27 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload
             os.close(run_fd)
         stage_seconds += _SIDE.payload_stage_seconds(payload.manifest) + 60 * len(_SIDE.PAYLOAD_CONTROLS)
     tail = ['--inbox', str(inbox), '--outbox', str(outbox), '--codex-home', str(codex_home), '--codex-bin', args.codex_bin]
+    network, port, endpoint = packet.get('network', 'none'), 0, None
+    stage_tail = list(tail)
+    if network != 'none':
+        port = pick_port()
+        try:
+            if port is None:
+                raise _SIDE.EndpointError('no free port in the endpoint range')
+            endpoint = endpoint_for(ident, attempt, outbox, port, payload.manifest)
+        except _SIDE.EndpointError as error:
+            shutil.rmtree(inbox / 'source', ignore_errors=True)
+            shutil.rmtree(inbox / 'payload', ignore_errors=True)
+            return write_result(run_dir, packet, 'QA_INCOMPLETE', ['the endpoint cannot be set up (%s); codex was not started' % clean(str(error), 100)])
+        stage_tail += ['--network', network, '--port', str(port), '--qa-home', str(ident.home), '--exchange', str(ident.exchange), '--attempt', attempt]
+        stage_seconds += _SIDE.ENDPOINT_STAGE_SECONDS
     # Hop 1: the QA side creates the outbox, its clone and its private Codex home, and proves read confinement there.
     try:
         if unattended:
-            write_request(inbox, {'verb': 'stage', 'attempt': attempt})
+            write_request(inbox, {'verb': 'stage', 'attempt': attempt, 'network': network, 'port': port})
             out, problem = helper_hop(ident, 'stage', attempt, stage_seconds)
         else:
-            out, problem = hop(ident, [qis.PY, '-I', str(script), 'qa-stage'] + tail, stage_seconds)
+            out, problem = hop(ident, [qis.PY, '-I', str(script), 'qa-stage'] + stage_tail, stage_seconds)
     finally:
         shutil.rmtree(inbox / 'source', ignore_errors=True)   # the QA side has its own copy now
         shutil.rmtree(inbox / 'payload', ignore_errors=True)
@@ -1654,9 +1762,22 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload
     if not (isinstance(profile_sha, str) and re.fullmatch(r'[0-9a-f]{64}', profile_sha)):
         established, could_not_check = False, False
         problems = problems + ['qa-stage did not report the digest of the profile it proved']
-    write_private(run_dir / 'CONFINEMENT.json', {'profile': PROFILE, 'established': established, 'could_not_check': could_not_check,
-                                                 'controls': controls, 'problems': problems, 'derived_by': 'producer',
-                                                 'qa_identity': ident.name, 'profile_sha256': profile_sha})
+    endpoint_view, endpoint_selftests = None, None
+    if endpoint is not None and established:
+        endpoint_record = stage.get('endpoint')
+        endpoint_view, endpoint_problems = verify_endpoint_record(endpoint_record, endpoint)
+        if profile_sha != expected_endpoint_profile_sha(ident, outbox, endpoint):
+            endpoint_problems.append('the Codex profile digest is not the one this producer computes for the endpoint run')
+        if endpoint_problems:
+            established, problems = False, problems + endpoint_problems
+        endpoint_selftests = endpoint_record.get('selftests') if isinstance(endpoint_record, dict) else None
+    confinement = {'profile': PROFILE, 'established': established, 'could_not_check': could_not_check,
+                   'controls': controls, 'problems': problems, 'derived_by': 'producer',
+                   'qa_identity': ident.name, 'profile_sha256': profile_sha}
+    if endpoint is not None:
+        confinement['network'] = network
+        confinement['endpoint'] = endpoint_view
+    write_private(run_dir / 'CONFINEMENT.json', confinement)
     if not established and could_not_check:
         return write_result(run_dir, packet, 'QA_INCOMPLETE', ['read confinement could not be checked: ' + '; '.join(problems[:3])])
     if not established:
@@ -1665,7 +1786,7 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload
     if payload is not None:
         # The model-free gate: re-derived here from the manifest, never from what the QA side calls ok. A failure leaves the evidence
         # (SELFTEST.json), writes no LAUNCHED record and never reaches the hop that starts Codex.
-        verdicts, first = _SIDE.derive_selftest_verdicts(payload.manifest, stage.get('selftests'))
+        verdicts, first = _SIDE.derive_selftest_verdicts(payload.manifest, endpoint_selftests if endpoint is not None else stage.get('selftests'))
         selftest = selftest_summary(verdicts)
         write_private(run_dir / 'SELFTEST.json', {'manifest_sha256': payload.sha, 'scope': packet['payload']['scope'], 'passed': first is None,
                                                   'staged': True, 'tests': verdicts, 'qa_identity': ident.name})
@@ -1688,7 +1809,7 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload
     no_model = bool(getattr(args, 'no_model', False))
     if not no_model:
         if unattended:
-            write_request(inbox, {'verb': 'exec', 'attempt': attempt, 'timeout': args.timeout, 'profile_sha256': profile_sha})
+            write_request(inbox, {'verb': 'exec', 'attempt': attempt, 'timeout': args.timeout, 'profile_sha256': profile_sha, 'network': 'none', 'port': 0})
             argv = helper_argv(ident, 'exec', attempt)
         else:
             argv = qis.qa_argv(ident.name, ident.home, [qis.PY, '-I', str(script), 'qa-exec'] + tail
@@ -2387,6 +2508,8 @@ def build_parser():
     p.add_argument('--producer-evidence')
     p.add_argument('--qa-notes')
     p.add_argument('--payload', metavar='DIR', help='a payload directory with a MANIFEST.json (cae-qa-payload/1; see docs/QA-PAYLOAD.md)')
+    p.add_argument('--network', choices=('none', 'daemon-endpoint'), default='none',
+                   help='daemon-endpoint: the payload names a candidate daemon that cae runs outside Codex and exposes through two Unix sockets')
     p.add_argument('--root')
     r = sub.add_parser('run')
     r.add_argument('--run-dir', required=True)
