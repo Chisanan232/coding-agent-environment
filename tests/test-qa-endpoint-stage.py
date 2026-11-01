@@ -20,7 +20,7 @@ class FakeLife:
     failing = None
     log = []
 
-    def __init__(self, endpoint, record_dir, ops=None):
+    def __init__(self, endpoint, record_dir, ops=None, manifest=None):
         self.record = {"port": endpoint.port, "controls": [], "problems": [], "teardown": None}
         FakeLife.log = []
 
@@ -38,8 +38,8 @@ class FakeLife:
     def start(self):
         self._step("start")
 
-    def supervise(self):
-        FakeLife.log.append("supervise")
+    def supervise(self, final=False):
+        FakeLife.log.append("supervise-final" if final else "supervise")
         return True
 
     def teardown(self):
@@ -76,7 +76,7 @@ class PhaseTests(unittest.TestCase):
 
     def test_the_order_is_prove_start_codex_controls_selftests_teardown(self):
         record = self.run_phase()
-        self.assertEqual(FakeLife.log, ["create", "prove_profiles", "start", "codex_controls", "supervise", "supervise", "teardown"])
+        self.assertEqual(FakeLife.log, ["create", "prove_profiles", "start", "codex_controls", "supervise", "supervise-final", "teardown"])
         self.assertTrue(record["established"])
         self.assertEqual(self.selftest_calls, 1)
 

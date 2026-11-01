@@ -21,6 +21,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -385,7 +386,34 @@ RELAY_START_SECONDS = 45
 RELAY_GRACE_SECONDS = 3
 DAEMON_GRACE_SECONDS = 10
 ECONNREFUSED = 61          # macOS errno: a connect to a port nobody listens on
+ENOENT = 2
 ENDPOINT_FSIZE = 256 << 20
+# A unix contract's ping (the Circinus wire protocol): the request, then the client half-closes; one JSON object line comes back and the
+# daemon closes. The reply is read to EOF with a byte cap and one deadline for the whole exchange.
+PING_REQUEST = b'{"event": "ping"}\n'
+PING_REPLY_MAX = 64 << 10
+PING_SECONDS = 5
+PING_MODES = ('shadow', 'enforce')
+# getsockopt on an AF_UNIX socket (macOS <sys/un.h>): SOL_LOCAL level, LOCAL_PEERCRED (struct xucred: version, uid, ...) and LOCAL_PEERPID.
+# Measured under daemon.sb (SPE-155, see ADR 0016): LOCAL_PEERPID is the pid that last did I/O on the listener or the accepted socket, which
+# is a child of the daemon when a child listens or accepts; that child's process group is still the daemon's, so the group is what is proved.
+SOL_LOCAL, LOCAL_PEERCRED, LOCAL_PEERPID = 0, 1, 2
+XUCRED_SIZE = 76
+ENDPOINT_TEARDOWN_STEPS = {'tcp-relay': ('relay_stopped', 'daemon_stopped', 'port_closed', 'sockets_gone', 'dir_removed'),
+                           'unix': ('daemon_stopped', 'socket_refuses', 'sockets_gone', 'dir_removed')}
+
+
+def ping_mode(reply):
+    """The daemon's mode when a ping reply is one JSON object with ok true and a known mode; None for anything else."""
+    if not isinstance(reply, bytes) or len(reply) > PING_REPLY_MAX:
+        return None
+    try:
+        doc = json.loads(reply.decode('utf-8'))
+    except (ValueError, RecursionError):
+        return None
+    if isinstance(doc, dict) and doc.get('ok') is True and doc.get('mode') in PING_MODES:
+        return doc['mode']
+    return None
 
 
 class EndpointFailed(Exception):
@@ -396,7 +424,8 @@ class EndpointOps:
     """Every way the lifecycle touches the system, injectable. The defaults are the real thing."""
 
     def __init__(self, popen=None, run=None, sleep=None, monotonic=None, connect=None, listeners=None, killpg=None, rmtree=None,
-                 canary_listener=None, decoy_socket=None, which=None, leader_exited=None, process_table=None, kill=None):
+                 canary_listener=None, decoy_socket=None, which=None, leader_exited=None, process_table=None, kill=None, uds_ping=None,
+                 uds_connect=None, inet_sockets=None, getpgid=None):
         self.popen = popen or subprocess.Popen
         self.run = run or self._run
         self.sleep = sleep or time.sleep
@@ -411,6 +440,57 @@ class EndpointOps:
         self.leader_exited = leader_exited or self._leader_exited
         self.process_table = process_table or self._process_table
         self.kill = kill or os.kill
+        self.uds_ping = uds_ping or self._uds_ping
+        self.uds_connect = uds_connect or self._uds_connect
+        self.inet_sockets = inet_sockets or self._inet_sockets
+        self.getpgid = getpgid or os.getpgid
+
+    @staticmethod
+    def _uds_ping(path):
+        """(peer pid, peer uid, reply bytes) of ONE connection to the socket at path: the peer is read right after connect, then the ping is
+        sent on that same connection and the reply read to EOF (at most PING_REPLY_MAX + 1 bytes, PING_SECONDS in all). Raises OSError."""
+        deadline = time.monotonic() + PING_SECONDS
+        with socket.socket(socket.AF_UNIX) as conn:
+            conn.settimeout(PING_SECONDS)
+            conn.connect(path)
+            peer_pid = struct.unpack('i', conn.getsockopt(SOL_LOCAL, LOCAL_PEERPID, 4))[0]
+            cred = conn.getsockopt(SOL_LOCAL, LOCAL_PEERCRED, XUCRED_SIZE)
+            if len(cred) < 8:
+                raise OSError('no peer credentials')
+            peer_uid = struct.unpack_from('I', cred, 4)[0]
+            conn.sendall(PING_REQUEST)
+            conn.shutdown(socket.SHUT_WR)
+            reply = b''
+            while len(reply) <= PING_REPLY_MAX:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise OSError('the ping reply did not end in time')
+                conn.settimeout(left)
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                reply += chunk
+            return peer_pid, peer_uid, reply[:PING_REPLY_MAX + 1]
+
+    @staticmethod
+    def _uds_connect(path):
+        """errno of an unsandboxed connect to the Unix socket at path (0 when it connects)."""
+        with socket.socket(socket.AF_UNIX) as probe:
+            probe.settimeout(2)
+            return probe.connect_ex(path)
+
+    @staticmethod
+    def _inet_sockets(pgid):
+        """['name'] of every IPv4/IPv6 socket held by any process in the group, or None when lsof could not list them. A unix daemon
+        must hold none, not even an unbound one (lsof lists that as *:*)."""
+        try:
+            done = subprocess.run(['/usr/sbin/lsof', '-nP', '-a', '-g%d' % pgid, '-i', '-Fn'], capture_output=True, text=True, timeout=20, cwd='/',
+                                  stdin=subprocess.DEVNULL, env={'PATH': '/usr/bin:/bin:/usr/sbin'})
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if done.returncode not in (0, 1):
+            return None
+        return [line[1:] for line in done.stdout.splitlines() if line.startswith('n')]
 
     @staticmethod
     def _run(argv, env, timeout):
@@ -575,23 +655,37 @@ def endpoint_result_ok(expect, observed):
 
 
 class EndpointLifecycle:
-    """One run's endpoint: create the directories, write and run the two generated profiles' negative controls, start the daemon and the
-    relay, prove the port is the daemon's and loopback-only, and tear everything down. The order is the point: the candidate daemon is
-    the first producer code and starts only after every control of both profiles has passed."""
+    """One run's endpoint: create the directories, write and run the generated profiles' negative controls, start the daemon (and, for a
+    tcp-relay contract, the relay), prove the daemon owns what it serves (the loopback port, or for a unix contract its socket), and tear
+    everything down. The order is the point: the candidate daemon is the first producer code and starts only after every control of every
+    generated profile has passed. `manifest` is the staged payload's, needed only to seed a unix contract's state."""
 
-    def __init__(self, endpoint, record_dir, ops=None, sandbox_exec='/usr/bin/sandbox-exec', python=None):
+    def __init__(self, endpoint, record_dir, ops=None, sandbox_exec='/usr/bin/sandbox-exec', python=None, manifest=None):
         self.endpoint, self.record_dir, self.ops = endpoint, Path(record_dir), ops or EndpointOps()
         self.sandbox_exec, self.python = sandbox_exec, python or tool_python()
+        self.manifest = manifest
         self.daemon = self.relay = None
         self._owns_dir = False                 # set only after OUR exclusive mkdir; teardown never touches a directory it did not create
-        self.record = {'port': endpoint.port, 'mode': 'daemon-endpoint', 'controls': [], 'problems': [], 'daemon_started': False,
-                       'relay_started': False, 'port_proof': None, 'teardown': None}
+        self._sock_node = None                 # (st_dev, st_ino) of the daemon's socket when it was first proved (unix contracts)
+        self.unix = endpoint.transport == 'unix'
+        if self.unix:
+            self.record = {'port': endpoint.port, 'mode': 'daemon-endpoint', 'transport': 'unix', 'controls': [], 'problems': [],
+                           'daemon_started': False, 'socket_proof': None, 'teardown': None}
+        else:
+            self.record = {'port': endpoint.port, 'mode': 'daemon-endpoint', 'controls': [], 'problems': [], 'daemon_started': False,
+                           'relay_started': False, 'port_proof': None, 'teardown': None}
         self._closers = []
+
+    @property
+    def proof_key(self):
+        """The record key of the ownership proof start() made: what an established endpoint must have."""
+        return 'socket_proof' if self.unix else 'port_proof'
 
     # -- directories ----------------------------------------------------------------------------------------------------------------------
     def create(self):
         """e/ under the QA home (created 0700 if absent, then checked), the endpoint directory with an exclusive mkdir (already present is a
-        failure), and s/, t/, rl/. Nothing is followed through a link."""
+        failure), and s/, t/ and (tcp-relay only) rl/, then the seed files of a contract that has a seed directory. Nothing is followed
+        through a link."""
         e = self.endpoint
         parent = e.dir.parent
         try:
@@ -606,19 +700,76 @@ class EndpointLifecycle:
         except FileExistsError:
             raise EndpointFailed('the endpoint directory already exists')
         self._owns_dir = True
-        for sub in (e.state, e.tmp, e.rl):
+        for sub in (e.state, e.tmp, e.rl) if e.rl is not None else (e.state, e.tmp):
             os.mkdir(sub, 0o700)
         self.record_dir.mkdir(mode=0o700, exist_ok=True)
-        for name, text in (('daemon.sb', daemon_sb(e)), ('relay.sb', relay_sb(e))):
+        profiles = (('daemon.sb', daemon_sb(e)),) if self.unix else (('daemon.sb', daemon_sb(e)), ('relay.sb', relay_sb(e)))
+        for name, text in profiles:
             write_private(self.record_dir / name, text, 0o400)
         self.record.update(endpoint_digests(e))
+        if e.spec.get('seed_dir'):
+            self.record['seeded'] = self.seed_state()
+
+    def seed_state(self):
+        """Copy the payload's seed files into the new, empty state directory as the QA user, BEFORE the profiles are proved and before any
+        candidate code runs (tool commands never write the state). Each source is opened below the payload descriptor without following a
+        link and re-hashed while it is copied; each target directory is made 0700 and opened without following a link, and each file is
+        created exclusively at 0600, so nothing is overwritten. The content is never interpreted. Returns [{path, sha256}]."""
+        e = self.endpoint
+        try:
+            plan = seed_plan(self.manifest)
+        except (PayloadError, TypeError, KeyError):
+            raise EndpointFailed('the seed files of the payload break a seed rule')
+        seeded, fds = [], []
+        try:
+            payload = os.open(e.payload_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            fds.append(payload)
+            state = os.open(str(e.state), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            fds.append(state)
+            for source, rel, sha, size in plan:
+                src_dir = payload
+                for part in source.split('/')[:-1]:
+                    src_dir = _open_dir(src_dir, part)
+                    fds.append(src_dir)
+                dst_dir = state
+                for part in rel.split('/')[:-1]:
+                    try:
+                        os.mkdir(part, 0o700, dir_fd=dst_dir)
+                    except FileExistsError:
+                        pass
+                    dst_dir = _open_dir(dst_dir, part)
+                    fds.append(dst_dir)
+                    held = os.fstat(dst_dir)
+                    if held.st_uid != os.getuid() or stat.S_IMODE(held.st_mode) != 0o700:
+                        raise EndpointFailed('a seed directory is not a private directory of this user')
+                with os.fdopen(os.open(source.split('/')[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=src_dir), 'rb') as handle:
+                    held = os.fstat(handle.fileno())
+                    if not stat.S_ISREG(held.st_mode) or held.st_nlink != 1 or held.st_size != size:
+                        raise EndpointFailed('a seed file is not the listed regular file')
+                    data = handle.read(SEED_FILE_MAX + 1)
+                if len(data) != size or hashlib.sha256(data).hexdigest() != sha:
+                    raise EndpointFailed('a seed file does not match its listed SHA-256')
+                try:
+                    out = os.open(rel.split('/')[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dst_dir)
+                except FileExistsError:
+                    raise EndpointFailed('a seed file would overwrite an existing file')
+                with os.fdopen(out, 'wb') as sink:
+                    os.fchmod(sink.fileno(), 0o600)
+                    sink.write(data)
+                seeded.append({'path': rel, 'sha256': sha})
+        except OSError as error:
+            raise EndpointFailed('the state could not be seeded (%s)' % type(error).__name__)
+        finally:
+            for fd in fds:
+                os.close(fd)
+        return seeded
 
     # -- proof before any candidate code --------------------------------------------------------------------------------------------------
     def prove_profiles(self, canary, auth, decoy_dir):
         """Run every control of endpoint_probe_table under the real profiles. A control that fails or cannot run fails the endpoint; no
         candidate code has run yet. The canary listener and the decoy socket are live objects the profiles must not let a process reach."""
         e = self.endpoint
-        if self.ops.connect(e.port) != ECONNREFUSED:
+        if not self.unix and self.ops.connect(e.port) != ECONNREFUSED:             # a unix contract has no port to be taken
             raise EndpointFailed('the endpoint port is already in use')
         canary_port, closer = self.ops.canary_listener()
         self._closers.append(closer)
@@ -657,10 +808,15 @@ class EndpointLifecycle:
     def start(self):
         e = self.endpoint
         with open(self.record_dir / 'daemon.log', 'ab') as dlog:
-            self.daemon = self._spawn([self.sandbox_exec, '-f', str(self.record_dir / 'daemon.sb'), e.daemon_binary], e.daemon_env(), dlog)
+            self.daemon = self._spawn([self.sandbox_exec, '-f', str(self.record_dir / 'daemon.sb')] + e.daemon_argv(), e.daemon_env(), dlog)
         self.record['daemon_started'] = True
+        if self.unix:
+            # Ready means the socket node passes its checks AND a ping is answered; there is no relay.
+            self._wait_for(lambda: not self.ops.leader_exited(self.daemon) and self._answers(), DAEMON_START_SECONDS, 'the daemon')
+            self.record['socket_proof'] = self.prove_ownership()
+            return
         self._wait_for(lambda: not self.ops.leader_exited(self.daemon) and os.path.exists(e.daemon_sock), DAEMON_START_SECONDS, 'the daemon')
-        self.record['port_proof'] = self.prove_port()
+        self.record['port_proof'] = self.prove_ownership()
         with open(self.record_dir / 'relay.log', 'ab') as rlog:
             self.relay = self._spawn([self.sandbox_exec, '-f', str(self.record_dir / 'relay.sb'), self.python, '-I', '-c', RELAY_SRC,
                                       str(e.relay_sock), str(e.port)], {'PATH': '/usr/bin:/bin', 'DEVELOPER_DIR': DEVELOPER_DIR}, rlog)
@@ -690,9 +846,82 @@ class EndpointLifecycle:
             raise EndpointFailed('the daemon\'s port does not accept connections')
         return {'listeners': [name for _, name in found], 'daemon_pid': self.daemon.pid}
 
-    def supervise(self):
-        """One poll step for the helper's wait loop. The moment the daemon exits, or the port proof stops holding (a second listener, a
-        wildcard bind, another owner), the relay is killed so nobody else's process receives QA traffic. Returns False then."""
+    def prove_ownership(self):
+        """What start() and supervise() prove: the port (tcp-relay) or the socket (unix) is the daemon's."""
+        return self.prove_socket() if self.unix else self.prove_port()
+
+    def _socket_node(self):
+        """(st_dev, st_ino) of the daemon's socket after checking, with lstat and no link followed, every component from the endpoint
+        directory down: each a directory of this user at mode 0700, the node a socket of this user, mode 0600, one link."""
+        e = self.endpoint
+        current = e.dir
+        for part in ('',) + e.daemon_sock.relative_to(e.dir).parts:
+            current = current / part if part else current
+            info = os.lstat(current)
+            if current == e.daemon_sock:
+                if not (stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1):
+                    raise EndpointFailed('the daemon socket is not a private socket of this user (mode 0600, one link)')
+                return info.st_dev, info.st_ino
+            if not (stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700):
+                raise EndpointFailed('a directory above the daemon socket is not a private directory of this user')
+        raise EndpointFailed('the daemon socket path is not below the endpoint directory')
+
+    def _answers(self):
+        """Readiness of a unix daemon: its socket passes _socket_node and one ping is answered with ok true."""
+        try:
+            self._socket_node()
+            return ping_mode(self.ops.uds_ping(str(self.endpoint.daemon_sock))[2]) is not None
+        except (OSError, EndpointFailed):
+            return False
+
+    def prove_socket(self):
+        """The socket is the daemon's (run by the helper as the QA user, outside every sandbox). In order: the path checks of _socket_node;
+        then on ONE connection the peer (LOCAL_PEERPID, read right after connect) is a process in the daemon's process group (the daemon
+        leads it, and stays unreaped, so the id cannot be another's) with our uid, and the ping on that same connection is answered with ok
+        true and a known mode; the node is still the same inode; the group holds no IPv4 or IPv6 socket. The peer's group is proved rather
+        than its pid because LOCAL_PEERPID names whichever process of the daemon last did I/O on the socket (measured, ADR 0016)."""
+        e = self.endpoint
+        node = self._socket_node()
+        try:
+            peer_pid, peer_uid, reply = self.ops.uds_ping(str(e.daemon_sock))
+        except OSError:
+            raise EndpointFailed('the daemon socket did not answer a ping')
+        try:
+            peer_pgid = self.ops.getpgid(peer_pid) if peer_pid > 1 else None
+        except OSError:
+            peer_pgid = None
+        if peer_pgid != self.daemon.pid:
+            raise EndpointFailed('the process serving the socket is not in the daemon\'s process group')
+        if peer_uid != os.getuid():
+            raise EndpointFailed('the process serving the socket is another user\'s')
+        mode = ping_mode(reply)
+        if mode is None:
+            raise EndpointFailed('the daemon did not answer the ping with ok true and a known mode')
+        if self._socket_node() != node or (self._sock_node is not None and node != self._sock_node):
+            raise EndpointFailed('the daemon socket was replaced')
+        self._check_no_inet()
+        self._sock_node = node
+        return {'socket': str(e.daemon_sock), 'peer_pid': peer_pid, 'peer_pgid': peer_pgid, 'peer_uid': peer_uid, 'daemon_pid': self.daemon.pid,
+                'mode': 0o600, 'ping_mode': mode, 'inet': [], 'inode_stable': True}
+
+    def _check_no_inet(self):
+        found = self.ops.inet_sockets(self.daemon.pid)
+        if found is None:
+            raise EndpointFailed('the daemon\'s sockets could not be listed')
+        if found:
+            raise EndpointFailed('the daemon holds %d IPv4 or IPv6 socket%s' % (len(found), '' if len(found) == 1 else 's'))
+
+    def _socket_still_held(self):
+        """The cheap check of every supervision poll: the same socket inode, and no IPv4 or IPv6 socket in the daemon's group."""
+        if self._socket_node() != self._sock_node:
+            raise EndpointFailed('the daemon socket was replaced')
+        self._check_no_inet()
+
+    def supervise(self, final=False):
+        """One poll step for the helper's wait loop. The moment the daemon exits, or the ownership proof stops holding (tcp-relay: a second
+        listener, a wildcard bind, another owner; unix: the socket replaced, an IPv4/IPv6 socket in the daemon's group), the relay is killed
+        so nobody else's process receives QA traffic, and the daemon is stopped. Returns False then. `final` (the last step before teardown)
+        repeats the full unix proof, peer and ping included, and records it as `socket_recheck`; a tcp-relay poll is always the full proof."""
         if self.daemon is None:
             return False
         if self.ops.leader_exited(self.daemon):                 # not poll(): reaping now would lose the process group
@@ -700,9 +929,14 @@ class EndpointLifecycle:
             self._stop(self.relay, 0)
             return False
         try:
-            self.prove_port()
-        except EndpointFailed as error:
-            self.record['port_proof_lost'] = str(error)
+            if not self.unix:
+                self.prove_port()
+            elif final:
+                self.record['socket_recheck'] = self.prove_socket()
+            else:
+                self._socket_still_held()
+        except (EndpointFailed, OSError) as error:
+            self.record['socket_proof_lost' if self.unix else 'port_proof_lost'] = str(error)
             self.record['problems'].append(str(error))
             self._stop(self.relay, 0)
             self._stop(self.daemon, 0)                          # a daemon on a wildcard bind must not keep serving while the caller reacts
@@ -837,13 +1071,20 @@ class EndpointLifecycle:
         are gone (unlinked here if the daemon left one, and said so), the endpoint directory is removed. Safe to call twice and after a failed
         start (with `snapshot`, the daemon's state directory is copied there once both processes are stopped and before it is removed: what
         the independent QA looked at must survive the endpoint); if create() did not make the directory (it already existed) nothing is removed and the result is not clean. `clean` covers
-        the two process groups and the descendants seen before the stop; a process that escaped earlier is the producer's whole-QA-user sweep."""
+        the two process groups and the descendants seen before the stop; a process that escaped earlier is the producer's whole-QA-user sweep.
+        A unix contract has no relay and no port: its steps are daemon_stopped, socket_refuses (a connect to the socket path is refused or
+        finds nothing), sockets_gone and dir_removed (ENDPOINT_TEARDOWN_STEPS)."""
         e = self.endpoint
-        steps = {'relay_stopped': False, 'daemon_stopped': False, 'descendants_left': [], 'port_closed': False, 'socket_removed_by_helper': [],
-                 'sockets_gone': False, 'dir_removed': False}
+        if self.unix:
+            steps = {'daemon_stopped': False, 'descendants_left': [], 'socket_refuses': False, 'socket_removed_by_helper': [], 'sockets_gone': False,
+                     'dir_removed': False}
+        else:
+            steps = {'relay_stopped': False, 'daemon_stopped': False, 'descendants_left': [], 'port_closed': False, 'socket_removed_by_helper': [],
+                     'sockets_gone': False, 'dir_removed': False}
         before = self._descendants([self.relay, self.daemon]) if (self.relay is not None or self.daemon is not None) else set()
         self._stop(self.relay, RELAY_GRACE_SECONDS)
-        steps['relay_stopped'] = self.relay is None or self.relay.poll() is not None
+        if not self.unix:
+            steps['relay_stopped'] = self.relay is None or self.relay.poll() is not None
         self._stop(self.daemon, DAEMON_GRACE_SECONDS)
         steps['daemon_stopped'] = self.daemon is None or self.daemon.poll() is not None
         left = self._reap_stragglers(before)
@@ -857,15 +1098,18 @@ class EndpointLifecycle:
             except OSError:
                 pass
         self._closers = []
-        steps['port_closed'] = self.ops.connect(e.port) == ECONNREFUSED
-        for sock in ((e.daemon_sock, e.relay_sock) if self._owns_dir else ()):
+        if self.unix:
+            steps['socket_refuses'] = self.ops.uds_connect(str(e.daemon_sock)) in (ECONNREFUSED, ENOENT)
+        else:
+            steps['port_closed'] = self.ops.connect(e.port) == ECONNREFUSED
+        for sock in (e.codex_sockets() if self._owns_dir else ()):
             if os.path.lexists(sock):
                 try:
                     os.unlink(sock)
                     steps['socket_removed_by_helper'].append(sock.name)
                 except OSError:
                     pass
-        steps['sockets_gone'] = not any(os.path.lexists(s) for s in (e.daemon_sock, e.relay_sock))
+        steps['sockets_gone'] = not any(os.path.lexists(s) for s in e.codex_sockets())
         if self._owns_dir and os.path.lexists(e.dir):
             try:
                 self.ops.rmtree(e.dir)
@@ -873,8 +1117,7 @@ class EndpointLifecycle:
                 pass
         steps['dir_removed'] = not os.path.lexists(e.dir)
         steps['not_ours'] = not self._owns_dir
-        steps['clean'] = (all(steps[k] for k in ('relay_stopped', 'daemon_stopped', 'port_closed', 'sockets_gone', 'dir_removed'))
-                          and steps['descendants_left'] == [])
+        steps['clean'] = all(steps[k] for k in ENDPOINT_TEARDOWN_STEPS[e.transport]) and steps['descendants_left'] == []
         self.record['teardown'] = steps
         return steps
 
@@ -1681,11 +1924,12 @@ def build_endpoint(args, outbox, manifest):
 
 
 def run_endpoint_phase(args, outbox, manifest, endpoint, env, home, ops=None):
-    """Everything that needs the daemon, in order: the two generated profiles are proved, the daemon and relay start (the first producer
-    code outside Codex), the port is proved, the Codex-side controls run, and only then the self-tests that need the endpoint. The
-    endpoint is torn down on every path. Returns the `endpoint` record; its `established` is the only thing the producer may trust."""
+    """Everything that needs the daemon, in order: the state is seeded (a contract with a seed directory) and the generated profiles are
+    proved, the daemon (and a tcp-relay contract's relay) starts (the first producer code outside Codex), its port or socket is proved, the
+    Codex-side controls run, and only then the self-tests that need the endpoint, followed by the full proof once more. The endpoint is
+    torn down on every path. Returns the `endpoint` record; its `established` is the only thing the producer may trust."""
     outbox = Path(outbox)
-    life = EndpointLifecycle(endpoint, outbox / 'endpoint', ops=ops)
+    life = EndpointLifecycle(endpoint, outbox / 'endpoint', ops=ops, manifest=manifest)
     record = life.record
     record.update(established=False, codex_controls=[], selftests=None)
     token = os.urandom(8).hex()
@@ -1704,7 +1948,7 @@ def run_endpoint_phase(args, outbox, manifest, endpoint, env, home, ops=None):
             record['problems'].extend(problems)
         elif life.supervise():
             record['selftests'] = run_selftests(args.codex_bin, outbox, manifest, selftest_env(outbox, home), endpoint)
-            record['established'] = life.supervise()
+            record['established'] = life.supervise(final=True)
     except (EndpointFailed, EndpointError, OSError) as error:
         record['problems'].append(clean(str(error), 160))
     finally:
@@ -1849,7 +2093,7 @@ def start_exec_endpoint(args, outbox):
     endpoint = build_endpoint(args, outbox, manifest)
     if endpoint_digests(endpoint)['daemon_profile_sha256'] != args.daemon_profile_sha256:
         raise EndpointFailed('the generated daemon profile is not the one the producer computed')
-    life = EndpointLifecycle(endpoint, record_dir)
+    life = EndpointLifecycle(endpoint, record_dir, manifest=manifest)
     token = os.urandom(8).hex()
     canary_dir = CANARY_ROOT / token
     try:
@@ -1884,7 +2128,7 @@ def finish_exec_endpoint(life, outbox, canary_dir):
                 leftover.rmdir() if leftover.is_dir() and not leftover.is_symlink() else leftover.unlink()
             except OSError:
                 pass
-    life.record['established'] = bool(life.record.get('port_proof')) and not life.record['problems'] and bool(life.record['teardown'].get('clean'))
+    life.record['established'] = bool(life.record.get(life.proof_key)) and not life.record['problems'] and bool(life.record['teardown'].get('clean'))
     try:
         (outbox / 'endpoint-exec').mkdir(mode=0o700, exist_ok=True)
         write_private(outbox / 'endpoint-exec' / 'record.json', life.record)
@@ -1938,7 +2182,7 @@ def qa_exec(args, build_env=None, open_prompt=None):
                 return 127
         try:
             code = wait_supervised(proc, args.timeout, life)
-            if life is not None and not life.supervise():        # the last couple of seconds, and the moment codex returned
+            if life is not None and not life.supervise(final=True):        # the last couple of seconds, and the moment codex returned
                 raise EndpointLost()
         except subprocess.TimeoutExpired:
             kill_group(proc)
