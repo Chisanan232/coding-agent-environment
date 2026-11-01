@@ -776,7 +776,7 @@ def control_ok(expect, observed):
     if expect == 'DENIED':
         return observed in ('DENIED:1', 'DENIED:13')
     if expect == 'DENIED_PROXY':
-        return observed in ('DENIED_PROXY', 'NOPROXY')          # the managed proxy refused the request, or there is no proxy to ask
+        return observed == 'DENIED_PROXY'          # the managed proxy itself answered 403 or 407; no proxy, a dead one or a 5xx proves nothing
     return False          # an unknown expectation (a typo in CONTROLS) never passes
 
 
@@ -1412,9 +1412,9 @@ ENDPOINT_CODEX_CONTROLS = (
     ('pos_uds_relay_http', "import socket\ntry:\n    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.settimeout(10)\n    s.connect({relay!r})\n    s.sendall(b'GET / HTTP/1.0\\r\\nHost: x\\r\\n\\r\\n')\n    print('ALLOWED' if s.recv(64).startswith(b'HTTP/1.') else 'DENIED:NOHTTP')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'ALLOWED'),
     ('pos_uds_daemon', "import socket\ntry:\n    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.settimeout(10)\n    s.connect({daemon_sock!r})\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'ALLOWED'),
     ('neg_tcp_daemon_port', "import socket\ntry:\n    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    s.settimeout(5)\n    s.connect(('127.0.0.1', {port}))\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED_EPERM'),
-    ('neg_uds_decoy', "import socket\ntry:\n    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.settimeout(5)\n    s.connect({decoy!r})\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED_EPERM'),
+    ('neg_uds_decoy', "import os, socket\ntry:\n    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.settimeout(5)\n    os.chdir(os.path.dirname({decoy!r}))\n    s.connect(os.path.basename({decoy!r}))\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED_EPERM'),
     # The managed proxy is on (the unix_sockets table needs it) but allows no domain: a CONNECT through it must be refused.
-    ('neg_proxy_connect', "import os, socket\nraw = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY') or os.environ.get('https_proxy') or os.environ.get('http_proxy')\nif not raw:\n    print('NOPROXY')\nelse:\n    host, _, port = raw.split('://')[-1].rstrip('/').rpartition(':')\n    try:\n        s = socket.create_connection((host, int(port)), 5)\n        s.sendall(b'CONNECT 192.0.2.1:9 HTTP/1.1\\r\\nHost: 192.0.2.1:9\\r\\n\\r\\n')\n        line = s.recv(64).split(b'\\r\\n')[0]\n        print('DENIED_PROXY' if line[9:10] in (b'4', b'5') else ('ALLOWED' if line else 'DENIED:EMPTY'))\n    except OSError as e:\n        print('DENIED_PROXY' if e.errno in (1, 13, 54, 61) else 'DENIED:%s' % e.errno)", 'DENIED_PROXY'),
+    ('neg_proxy_connect', "import os, socket\nraw = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY') or os.environ.get('https_proxy') or os.environ.get('http_proxy')\nif not raw:\n    print('NOPROXY')\nelse:\n    host, _, port = raw.split('://')[-1].rstrip('/').rpartition(':')\n    try:\n        s = socket.create_connection((host, int(port)), 5)\n        s.sendall(b'CONNECT 192.0.2.1:9 HTTP/1.1\\r\\nHost: 192.0.2.1:9\\r\\n\\r\\n')\n        line = s.recv(64).split(b'\\r\\n')[0]\n        print('DENIED_PROXY' if line[9:12] in (b'403', b'407') else 'ALLOWED:' + line.decode('latin-1')[:20])\n    except OSError as e:\n        print('DENIED:%s' % e.errno)", 'DENIED_PROXY'),
 )
 
 
@@ -1462,9 +1462,10 @@ def run_endpoint_phase(args, outbox, manifest, endpoint, env, home, ops=None):
         canary = canary_dir / 'canary.txt'
         canary.write_text('synthetic-qa-canary-%s' % token)
         life.create()
-        life.prove_profiles(canary, real_codex_home() / 'auth.json', endpoint.dir)
+        decoy_dir = outbox / 'tmp'          # a place the Codex profile can otherwise write, so a refusal is the socket allowlist's
+        life.prove_profiles(canary, real_codex_home() / 'auth.json', decoy_dir)
         life.start()
-        results, problems = endpoint_codex_probe(args.codex_bin, outbox, env, endpoint, endpoint.dir / 'qa-decoy.sock')
+        results, problems = endpoint_codex_probe(args.codex_bin, outbox, selftest_env(outbox, home), endpoint, decoy_dir / 'qa-decoy.sock')
         record['codex_controls'] = results
         if problems:
             record['problems'].extend(problems)
@@ -1477,9 +1478,9 @@ def run_endpoint_phase(args, outbox, manifest, endpoint, env, home, ops=None):
         try:
             record['teardown'] = life.teardown()
         finally:
-            for leftover in (canary_dir / 'canary.txt', canary_dir):
+            for leftover in (canary_dir / 'canary.txt', canary_dir, outbox / 'tmp' / 'qa-decoy.sock'):
                 try:
-                    leftover.unlink() if leftover.is_file() else leftover.rmdir()
+                    leftover.rmdir() if leftover.is_dir() and not leftover.is_symlink() else leftover.unlink()
                 except OSError:
                     pass
     if record['teardown'] and not record['teardown'].get('clean'):

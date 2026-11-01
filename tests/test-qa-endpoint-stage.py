@@ -103,6 +103,17 @@ class PhaseTests(unittest.TestCase):
             self.assertFalse(self.run_phase()["established"])
 
 
+class ControlWordingTests(unittest.TestCase):
+    def test_the_proxy_control_passes_only_on_the_proxys_own_refusal(self):
+        self.assertTrue(side.control_ok("DENIED_PROXY", "DENIED_PROXY"))
+        for observed in ("NOPROXY", "ALLOWED", "ALLOWED:HTTP/1.1 502", "DENIED:1", "DENIED:61", "", "DENIED_403"):
+            self.assertFalse(side.control_ok("DENIED_PROXY", observed), observed)
+
+    def test_the_decoy_is_where_the_codex_profile_can_otherwise_write(self):
+        decoy = [c for c in side.ENDPOINT_CODEX_CONTROLS if c[0] == "neg_uds_decoy"][0]
+        self.assertIn("chdir", decoy[1])          # a long attempt path never turns the refusal into ENAMETOOLONG
+
+
 class SelftestEnvTests(unittest.TestCase):
     def test_only_a_needs_endpoint_test_gets_the_endpoint_paths(self):
         tmp = tempfile.TemporaryDirectory()
