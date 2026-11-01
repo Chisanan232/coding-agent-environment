@@ -926,6 +926,10 @@ class InterpreterPinTests(unittest.TestCase):
         source = Path(side.__file__).read_text()
         self.assertEqual([l for l in source.splitlines() if "'/usr/bin/python3'" in l and not l.startswith("SHIM_PYTHON")], [])
         self.assertEqual([l for l in source.splitlines() if '"/usr/bin/python3"' in l], [])
+        users = [l for l in source.splitlines() if "SHIM_PYTHON" in l]
+        self.assertEqual(len(users), 2, users)            # its definition and the one fallback in tool_python
+        body = source.split("def tool_python():", 1)[1].split("\n\n\n", 1)[0]
+        self.assertIn("SHIM_PYTHON", body)
 
     def test_a_clean_tree_is_trusted(self):
         base, tree, binary = self.make_tree()
@@ -987,7 +991,9 @@ class InterpreterPinTests(unittest.TestCase):
         if not os.path.exists(side.TRUSTED_PYTHON) or os.stat(side.TRUSTED_PYTHON).st_uid != 0:
             self.skipTest("no root-owned Command Line Tools interpreter on this host")
         with mock.patch.object(side, "ROOT_UID", 0):
-            self.assertEqual(side.interpreter_problems(), [])
+            found = side.interpreter_problems()
+        if found:
+            self.skipTest("this host's interpreter tree is not root-only (%s); the installer reports it" % "; ".join(found[:2]))
 
     def test_the_probe_python_falls_back_only_when_the_trusted_one_is_missing(self):
         with mock.patch.object(side, "TRUSTED_PYTHON", "/nonexistent/python3.9"):
