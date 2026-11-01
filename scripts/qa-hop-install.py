@@ -60,6 +60,7 @@ class Layout:
             str(lib), str(sudoers), root_uid, wheel_gid, str(anchor), visudo)
         self.bundle_dir = str(bundle_dir or HERE)
         self.helper, self.config, self.codex = (os.path.join(self.lib, n) for n in ('qa-side', 'qa-side.json', 'codex'))
+        self.codex_host = os.path.join(self.lib, 'codex-code-mode-host')      # the tool host `codex exec` starts from next to its own binary
 
 
 class Ops:
@@ -154,9 +155,10 @@ class Bundle:
 
 # ------------------------------------------------------------------ inputs
 class Inputs:
-    def __init__(self, qa_name, qa_uid, producer_uid, exchange, codex_source, codex_sha256):
+    def __init__(self, qa_name, qa_uid, producer_uid, exchange, codex_source, codex_sha256, host_source=None, host_sha256=None):
         self.qa_name, self.qa_uid, self.producer_uid, self.exchange = qa_name, qa_uid, producer_uid, str(exchange)
         self.codex_source, self.codex_sha256 = codex_source, codex_sha256
+        self.host_source, self.host_sha256 = host_source, host_sha256
         self.qa_home = None
         self.producer_name = None
 
@@ -206,7 +208,7 @@ def resolve_inputs(args, ops, bundle, need_codex=True):
     producer_uid = args.producer_uid if args.producer_uid is not None else (
         ops.caller_uid() if ops.geteuid() == 0 else os.getuid())
     inputs = Inputs(args.qa_name, args.qa_uid, producer_uid, args.exchange or '/Users/Shared/%s-qa' % args.qa_name,
-                    args.codex_source, args.codex_sha256)
+                    args.codex_source, args.codex_sha256, getattr(args, 'codex_host_source', None), getattr(args, 'codex_host_sha256', None))
     inputs.qa_home, inputs.exchange, inputs.producer_name = validate_identity(
         bundle, args.qa_name, args.qa_uid, producer_uid, inputs.exchange)
     if need_codex:
@@ -219,6 +221,15 @@ def resolve_inputs(args, ops, bundle, need_codex=True):
         with open(args.codex_source, 'rb') as handle:
             if handle.read(4) not in MACHO_MAGIC:
                 raise Stop('--codex-source is not a Mach-O binary; a launcher script needs sibling files the pin does not copy')
+        if not (isinstance(args.codex_host_sha256, str) and HEX64.fullmatch(args.codex_host_sha256)):
+            raise Stop('--codex-host-sha256 must be 64 lower-case hex characters (`codex exec` cannot run tool commands without its host)')
+        if not args.codex_host_source or not os.path.isabs(args.codex_host_source) or os.path.normpath(args.codex_host_source) != args.codex_host_source:
+            raise Stop('--codex-host-source must be an absolute, normalized path to the codex-code-mode-host binary to pin')
+        if sha256_stream(args.codex_host_source, MAX_CODEX_BYTES) != args.codex_host_sha256:
+            raise Stop('--codex-host-source does not have the digest given by --codex-host-sha256; nothing is installed')
+        with open(args.codex_host_source, 'rb') as handle:
+            if handle.read(4) not in MACHO_MAGIC:
+                raise Stop('--codex-host-source is not a Mach-O binary')
     return inputs
 
 
@@ -265,7 +276,8 @@ def sudoers_findings(text, expected):
 # ------------------------------------------------------------------ plan
 def config_text(inputs, layout):
     return json.dumps({'qa_name': inputs.qa_name, 'qa_uid': inputs.qa_uid, 'producer_uid': inputs.producer_uid,
-                       'exchange': inputs.exchange, 'codex_path': layout.codex, 'codex_sha256': inputs.codex_sha256},
+                       'exchange': inputs.exchange, 'codex_path': layout.codex, 'codex_sha256': inputs.codex_sha256,
+                       'codex_host_sha256': inputs.host_sha256},
                       sort_keys=True, indent=2) + '\n'
 
 
@@ -280,6 +292,7 @@ def planned(inputs, layout, bundle):
         (layout.helper, 'root:wheel', '0555', helper_sha, 'qa-side.py (the bundle copy)'),
         (layout.config, 'root:wheel', '0444', hashlib.sha256(config).hexdigest(), 'generated'),
         (layout.codex, 'root:wheel', '0555', inputs.codex_sha256, inputs.codex_source),
+        (layout.codex_host, 'root:wheel', '0555', inputs.host_sha256, inputs.host_source),
         (layout.sudoers, 'root:wheel', '0440', hashlib.sha256(dropin.encode()).hexdigest(), 'rendered below'),
     ]
     return files, dropin, helper, config
@@ -344,7 +357,9 @@ def plan_text(inputs, layout, ops, args_line, bundle):
     for path, owner, mode, digest, source in files:
         lines.append('  %-28s %s %s  sha256 %s%s' % (path, owner, mode, digest, '' if not source else '  <- ' + source))
     lines += ['', 'Pinned Codex: copy of %s (Mach-O binary, digest %s, about 300 MB, decision D1; nothing is downloaded)' % (
-        inputs.codex_source, inputs.codex_sha256), '',
+        inputs.codex_source, inputs.codex_sha256),
+        'Pinned Codex tool host: copy of %s (Mach-O binary, digest %s, about 65 MB; `codex exec` starts it from next to the pinned binary)' % (
+        inputs.host_source, inputs.host_sha256), '',
         'Config %s:' % layout.config] + ['  ' + l for l in config.decode().splitlines()] + [
         '', 'Sudoers drop-in %s (visudo -c -f on this exact text, unprivileged: %s):' % (layout.sudoers, 'parsed OK' if ok else 'NOT VERIFIED')]
     lines += ['  ' + l for l in dropin.splitlines()]
@@ -488,7 +503,8 @@ def apply(inputs, layout, ops, say, bundle):
     install_file(layout, ops, layout.helper, 0o555, data=helper, expect_sha=bundle.helper_sha)
     install_file(layout, ops, layout.config, 0o444, data=config)
     install_file(layout, ops, layout.codex, 0o555, source=inputs.codex_source, expect_sha=inputs.codex_sha256)
-    say('installed %s, %s, %s' % (layout.helper, layout.config, layout.codex))
+    install_file(layout, ops, layout.codex_host, 0o555, source=inputs.host_source, expect_sha=inputs.host_sha256)
+    say('installed %s, %s, %s, %s' % (layout.helper, layout.config, layout.codex, layout.codex_host))
     # Last: the grant itself. Candidate beside the destination under a name sudo ignores, compared, validated, then renamed.
     candidate = os.path.join(os.path.dirname(dropin_path), '.cae-qa.new')
     install_file(layout, ops, candidate, 0o440, data=dropin.encode())
@@ -523,6 +539,8 @@ def verify_installed(inputs, layout, bundle, producer_uid=None):
     handoff._SIDE.ROOT_UID = layout.root_uid
     ident = handoff.Identity(inputs.qa_name, inputs.qa_uid, Path(inputs.qa_home), Path(inputs.exchange), layout.root_uid)
     record, problems = handoff.unattended_install(ident, layout.config, layout.helper, layout.anchor, producer_uid)
+    if record is not None and (record['codex_sha256'] != inputs.codex_sha256 or record['codex_host_sha256'] != inputs.host_sha256):
+        problems = list(problems) + ['the installed Codex or its tool host is not the one pinned on this command line']
     if os.path.lexists(layout.sudoers):
         st = os.lstat(layout.sudoers)
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_uid != layout.root_uid or st.st_mode & 0o7777 != 0o440:
@@ -574,8 +592,8 @@ def rollback(layout, ops, say):
     elif warning:
         say('WARNING: %s. The drop-in is being removed at its fixed paths anyway; inspect %s afterwards.' % (
             warning, os.path.dirname(layout.sudoers)))
-    for path in (*grant, layout.helper, layout.config, layout.codex,
-                 *(os.path.join(layout.lib, '.%s.new' % n) for n in ('qa-side', 'qa-side.json', 'codex'))):
+    for path in (*grant, layout.helper, layout.config, layout.codex, layout.codex_host,
+                 *(os.path.join(layout.lib, '.%s.new' % n) for n in ('qa-side', 'qa-side.json', 'codex', 'codex-code-mode-host'))):
         if not os.path.lexists(path):
             continue
         st = os.lstat(path)
@@ -622,6 +640,8 @@ def build_parser():
         if name != 'rollback':
             p.add_argument('--codex-source', required=True, help='absolute path of the Codex Mach-O binary to pin (no default, no download)')
             p.add_argument('--codex-sha256', required=True, help='its SHA-256: the explicit pin')
+            p.add_argument('--codex-host-source', required=True, help='absolute path of the codex-code-mode-host Mach-O binary from the same release (no default, no download)')
+            p.add_argument('--codex-host-sha256', required=True, help='its SHA-256: the explicit pin')
         if name == 'apply':
             p.add_argument('--bundle-sha256', required=True, help='combined digest of the four scripts, from `plan`')
             p.add_argument('--helper-sha256', required=True, help='digest of qa-side.py, from `plan`')
@@ -629,7 +649,8 @@ def build_parser():
 
 
 def args_line(args):
-    parts = ['--qa-name', args.qa_name, '--qa-uid', str(args.qa_uid), '--codex-source', args.codex_source, '--codex-sha256', args.codex_sha256]
+    parts = ['--qa-name', args.qa_name, '--qa-uid', str(args.qa_uid), '--codex-source', args.codex_source, '--codex-sha256', args.codex_sha256,
+             '--codex-host-source', args.codex_host_source, '--codex-host-sha256', args.codex_host_sha256]
     if args.exchange:
         parts += ['--exchange', args.exchange]
     return ' '.join(parts)

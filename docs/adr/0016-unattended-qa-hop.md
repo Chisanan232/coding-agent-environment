@@ -195,6 +195,7 @@ the producer also maps to `QA_INCOMPLETE`. As implemented, the order is argv sha
 | `/Library/cae-qa/qa-side` | root:wheel | 0555 | `scripts/qa-side.py`, first line `#!/usr/bin/python3 -I` |
 | `/Library/cae-qa/qa-side.json` | root:wheel | 0444 | digests and ids, no secret |
 | `/Library/cae-qa/codex` | root:wheel | 0555 | pinned copy of the Codex binary (about 300 MB) |
+| `/Library/cae-qa/codex-code-mode-host` | root:wheel | 0555 | pinned copy of the tool host Codex starts from next to its own binary (about 65 MB); its digest is in `qa-side.json` |
 | `X` exchange | root | 0711 | unchanged (qa-identity-setup.py) |
 | `X/inbox` | producer | 0700 + read ACE for the QA user | unchanged |
 | `X/outbox` | QA user | 0700 + ACE for the producer | unchanged |
@@ -357,6 +358,8 @@ change. The design that meets it:
   The exec one is bound by digest to the payload manifest and the generated daemon profile the producer computed.
 - **The producer decides.** Every control is demanded by name and recomputed; generated profile digests and the Codex profile digest are recomputed from
   values the producer holds; a QA side that omits or alters anything is `QA_INVALID`; a lost endpoint is `QA_INCOMPLETE` (exit 123).
+- **Teardown is time-bounded step by step.** While the endpoint is torn down SIGTERM, SIGHUP, SIGINT and SIGALRM are held so a second signal cannot abandon it half way; the helper's alarm therefore cannot cut a hung teardown, so every step has its own bound (process-group waits, `proc.wait`, `ps` and `lsof` timeouts, the state copy's entry cap and 120 s deadline).
+- **The tool host is part of the pin.** `codex exec` starts `codex-code-mode-host` from next to its own binary and has no tool commands without it ("Code Mode is unavailable", measured). It is pinned beside the binary, its digest is in `qa-side.json`, and the helper and the producer verify it on every run. A model-free check cannot prove that a tool command runs (only a model asks for one); `tests/test-qa-endpoint-exec-model-live.py` is the one-call proof, and the owner demo repeats it as the QA user: one trivial `codex exec` whose command prints a value.
 - **Accepted residuals, disclosed:** the port is reachable by any local process during the run; the read-deny list is a deny list; `trustd` and similar
   helpers may still act for a process; AppleEvents to a same-uid process cannot be blocked by any profile (measured), so the QA user must have no GUI
   session, which the owner demo must show (`osascript` against System Events and Finder, `do shell script`, a pid-targeted event). Nothing here is

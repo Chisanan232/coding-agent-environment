@@ -16,6 +16,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 spec = importlib.util.spec_from_file_location("qa_side_stage_live_test", SCRIPTS / "qa-side.py")
@@ -71,7 +72,12 @@ class EndpointStageLiveTests(unittest.TestCase):
         self.qa_home, self.ex = self.root / "qa", self.root / "x"
         att = self.ex / "inbox" / "att"
         (att / "source").mkdir(parents=True)
-        self.qa_home.mkdir()
+        (self.qa_home / ".codex").mkdir(parents=True)
+        os.symlink(side.real_codex_home() / "auth.json", self.qa_home / ".codex" / "auth.json")      # the login, as a link only: never read here
+        patches = [mock.patch.object(side, "HOME", self.qa_home), mock.patch.object(side, "real_codex_home", lambda: self.qa_home / ".codex")]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
         subprocess.run(["git", "init", "-q", str(att / "source")], check=True)
         subprocess.run(["git", "-C", str(att / "source"), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"], check=True)
         self.files = {"bin/daemon": (STAND_IN.encode(), "exec"), "bin/probe": (PROBE.encode(), "exec"), "harness/transcript.txt": (b"t\n", "data")}

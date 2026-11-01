@@ -55,6 +55,10 @@ class Env:
         self.source.write_bytes(b"\xcf\xfa\xed\xfe" + b"codex 0.163.0 pretend Mach-O payload\n" * 100)
         os.chmod(self.source, 0o755)
         self.digest = hashlib.sha256(self.source.read_bytes()).hexdigest()
+        self.host_source = self.base / "codex-host-src"
+        self.host_source.write_bytes(b"\xcf\xfa\xed\xfe" + b"codex-code-mode-host pretend Mach-O payload\n" * 50)
+        os.chmod(self.host_source, 0o755)
+        self.host_digest = hashlib.sha256(self.host_source.read_bytes()).hexdigest()
         self.events = []
         self.euid = ME
         self.caller = ME
@@ -88,13 +92,14 @@ class Env:
 
     def args(self, mode="plan", **over):
         values = dict(qa_name="fornaxqa", qa_uid=777, exchange=None, producer_uid=ME, codex_source=str(self.source),
-                      codex_sha256=self.digest)
+                      codex_sha256=self.digest, codex_host_source=str(self.host_source), codex_host_sha256=self.host_digest)
         values.update(over)
         argv = [mode, "--qa-name", values["qa_name"], "--qa-uid", str(values["qa_uid"])]
         if values["producer_uid"] is not None:
             argv += ["--producer-uid", str(values["producer_uid"])]
         if mode != "rollback":
-            argv += ["--codex-source", values["codex_source"], "--codex-sha256", values["codex_sha256"]]
+            argv += ["--codex-source", values["codex_source"], "--codex-sha256", values["codex_sha256"],
+                     "--codex-host-source", values["codex_host_source"], "--codex-host-sha256", values["codex_host_sha256"]]
         if mode == "apply":
             bundle = inst.Bundle(self.install)
             argv += ["--bundle-sha256", over.get("bundle_sha256", bundle.combined), "--helper-sha256", over.get("helper_sha256", bundle.helper_sha)]
@@ -211,6 +216,30 @@ class InputTests(Case):
         self.refused(codex_sha256="ABC")
         self.refused(codex_source="relative/codex")
         self.refused(codex_source=str(self.env.base / "x/../codex-src"))
+        self.refused(codex_host_sha256="0" * 64)
+        self.refused(codex_host_sha256="ABC")
+        self.refused(codex_host_source="relative/host")
+        self.refused(codex_host_source=str(self.env.base / "x/../codex-host-src"))
+
+    def test_the_tool_host_is_pinned_explicitly_and_must_be_mach_o(self):
+        for flag in ("--codex-host-source", "--codex-host-sha256"):
+            argv = self.env.args("plan")
+            del argv[argv.index(flag):argv.index(flag) + 2]
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                inst.build_parser().parse_args(argv)
+        self.env.host_source.write_bytes(b"#!/bin/sh\nexit 0\n")
+        digest = hashlib.sha256(self.env.host_source.read_bytes()).hexdigest()
+        code, out = self.env.main("plan", codex_host_sha256=digest)
+        self.assertEqual(code, 1)
+        self.assertIn("Mach-O", out)
+
+    def test_the_plan_names_the_tool_host_and_it_lands_beside_the_codex_binary(self):
+        code, out = self.env.main("plan")
+        self.assertEqual(code, 0, out)
+        self.assertIn(str(self.env.layout.codex_host), out)
+        self.assertIn(self.env.host_digest, out)
+        self.assertEqual(os.path.dirname(self.env.layout.codex_host), os.path.dirname(self.env.layout.codex))
+        self.assertEqual(os.path.basename(self.env.layout.codex_host), "codex-code-mode-host")
 
     def test_symlinked_or_missing_codex_source_is_refused(self):
         link = self.env.base / "codex-link"
@@ -255,7 +284,7 @@ class ApplyTests(Case):
     def test_apply_installs_everything_in_order_with_exact_modes(self):
         out = self.installed()
         lay = self.env.layout
-        for path, mode in ((lay.helper, 0o555), (lay.config, 0o444), (lay.codex, 0o555), (lay.sudoers, 0o440), (lay.lib, 0o755)):
+        for path, mode in ((lay.helper, 0o555), (lay.config, 0o444), (lay.codex, 0o555), (lay.codex_host, 0o555), (lay.sudoers, 0o440), (lay.lib, 0o755)):
             st = os.lstat(path)
             self.assertFalse(stat.S_ISLNK(st.st_mode))
             self.assertEqual(stat.S_IMODE(st.st_mode), mode, path)
@@ -263,11 +292,11 @@ class ApplyTests(Case):
         self.assertEqual(hashlib.sha256(Path(lay.codex).read_bytes()).hexdigest(), self.env.digest)
         config = json.loads(Path(lay.config).read_text())
         self.assertEqual(config, {"qa_name": "fornaxqa", "qa_uid": 777, "producer_uid": ME, "exchange": "/Users/Shared/fornaxqa-qa",
-                                  "codex_path": lay.codex, "codex_sha256": self.env.digest})
+                                  "codex_path": lay.codex, "codex_sha256": self.env.digest, "codex_host_sha256": self.env.host_digest})
         helper_sha = hashlib.sha256((SCRIPTS / "qa-side.py").read_bytes()).hexdigest()
         want = inst.render_sudoers(MY_NAME, "fornaxqa", 777, "/Users/fornaxqa", helper_sha, lay.helper)
         self.assertEqual(inst.sudoers_findings(Path(lay.sudoers).read_text(), want), [])
-        self.assertEqual(sorted(os.listdir(lay.lib)), ["codex", "qa-side", "qa-side.json"])
+        self.assertEqual(sorted(os.listdir(lay.lib)), ["codex", "codex-code-mode-host", "qa-side", "qa-side.json"])
         self.assertEqual(sorted(os.listdir(os.path.dirname(lay.sudoers))), ["cae-qa"])           # no temp files left
         runs = [e[1] for e in self.env.events if e[0] == "run"]
         self.assertEqual([r[:3] for r in runs], [("/usr/sbin/visudo", "-c", "-f"), ("/usr/sbin/visudo", "-c")])   # candidate, then live
@@ -281,7 +310,7 @@ class ApplyTests(Case):
         with mock.patch.object(inst, "install_file", side_effect=lambda lay, ops, dest, *a, **k: (order.append(os.path.basename(dest)), real_install(lay, ops, dest, *a, **k))[1]), \
                 mock.patch("os.rename", side_effect=lambda a, b: (order.append("rename:" + os.path.basename(b)), real_rename(a, b))[1]):
             self.installed()
-        self.assertEqual([o for o in order if not o.startswith("rename")], ["qa-side", "qa-side.json", "codex", ".cae-qa.new"])
+        self.assertEqual([o for o in order if not o.startswith("rename")], ["qa-side", "qa-side.json", "codex", "codex-code-mode-host", ".cae-qa.new"])
         self.assertLess(order.index("rename:codex"), order.index("rename:cae-qa"))
         self.assertEqual(order[-1], "rename:cae-qa")
         runs = [i for i, e in enumerate(self.env.events) if e[0] == "run"]
@@ -365,7 +394,7 @@ class ApplyTests(Case):
     def test_reapply_is_safe(self):
         self.installed()
         self.installed()
-        self.assertEqual(sorted(os.listdir(self.env.layout.lib)), ["codex", "qa-side", "qa-side.json"])
+        self.assertEqual(sorted(os.listdir(self.env.layout.lib)), ["codex", "codex-code-mode-host", "qa-side", "qa-side.json"])
 
 
 class VerifyTests(Case):
@@ -378,6 +407,7 @@ class VerifyTests(Case):
         for label, tamper in (
                 ("helper writable", lambda: os.chmod(lay.helper, 0o575)),
                 ("codex drift", lambda: (os.chmod(lay.codex, 0o755), Path(lay.codex).write_bytes(b"x"), os.chmod(lay.codex, 0o555))),
+                ("host drift", lambda: (os.chmod(lay.codex_host, 0o755), Path(lay.codex_host).write_bytes(b"x"), os.chmod(lay.codex_host, 0o555))),
                 ("drop-in mode", lambda: os.chmod(lay.sudoers, 0o444)),
                 ("drop-in gone", lambda: os.unlink(lay.sudoers)),
                 ("config gone", lambda: os.unlink(lay.config))):
@@ -388,6 +418,7 @@ class VerifyTests(Case):
                 fl = fresh.layout
                 {"helper writable": lambda: os.chmod(fl.helper, 0o575),
                  "codex drift": lambda: (os.chmod(fl.codex, 0o755), Path(fl.codex).write_bytes(b"x"), os.chmod(fl.codex, 0o555)),
+                 "host drift": lambda: (os.chmod(fl.codex_host, 0o755), Path(fl.codex_host).write_bytes(b"x"), os.chmod(fl.codex_host, 0o555)),
                  "drop-in mode": lambda: os.chmod(fl.sudoers, 0o444), "drop-in gone": lambda: os.unlink(fl.sudoers),
                  "config gone": lambda: os.unlink(fl.config)}[label]()
                 lines = []
@@ -412,7 +443,7 @@ class RollbackTests(Case):
             code, out = self.env.main("rollback")
         self.assertEqual(code, 0, out)
         self.assertEqual(order[0], "cae-qa")
-        self.assertEqual(set(order), {"cae-qa", "qa-side", "qa-side.json", "codex"})
+        self.assertEqual(set(order), {"cae-qa", "qa-side", "qa-side.json", "codex", "codex-code-mode-host"})
         self.assertFalse(os.path.lexists(self.env.layout.lib))
         self.assertFalse(os.path.lexists(self.env.layout.sudoers))
         self.assertIn("removed:", out)

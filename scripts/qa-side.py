@@ -1509,6 +1509,11 @@ ENDPOINT_CODEX_CONTROLS = (
     ('pos_uds_daemon', "import socket\ntry:\n    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.settimeout(10)\n    s.connect({daemon_sock!r})\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'ALLOWED'),
     ('neg_tcp_daemon_port', "import socket\ntry:\n    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    s.settimeout(5)\n    s.connect(('127.0.0.1', {port}))\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED_EPERM'),
     ('neg_uds_decoy', "import os, socket\ntry:\n    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.settimeout(5)\n    os.chdir(os.path.dirname({decoy!r}))\n    s.connect(os.path.basename({decoy!r}))\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED_EPERM'),
+    # What the seal trusts is written by the QA user outside Codex's write roots; a tool command must not reach it, nor the daemon's private dirs.
+    ('neg_mkdir_endpoint_exec', "import os\ntry:\n    os.mkdir({record_exec!r})\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
+    ('neg_write_endpoint_record', "try:\n    open({record_stage!r} + '/qa-write-probe', 'w').write('x')\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
+    ('neg_list_endpoint_rl', "import os\ntry:\n    os.listdir({rl!r})\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
+    ('neg_list_endpoint_tmp', "import os\ntry:\n    os.listdir({etmp!r})\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
     # The managed proxy is on (the unix_sockets table needs it) but allows no domain: a CONNECT through it must be refused.
     ('neg_proxy_connect', "import os, socket\nraw = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY') or os.environ.get('https_proxy') or os.environ.get('http_proxy')\nif not raw:\n    print('NOPROXY')\nelse:\n    host, _, port = raw.split('://')[-1].rstrip('/').rpartition(':')\n    try:\n        s = socket.create_connection((host, int(port)), 5)\n        s.sendall(b'CONNECT 192.0.2.1:9 HTTP/1.1\\r\\nHost: 192.0.2.1:9\\r\\n\\r\\n')\n        line = s.recv(64).split(b'\\r\\n')[0]\n        print('DENIED_PROXY' if line[9:12] in (b'403', b'407') else 'ALLOWED:' + line.decode('latin-1')[:20])\n    except OSError as e:\n        print('DENIED:%s' % e.errno)", 'DENIED_PROXY'),
 )
@@ -1516,7 +1521,9 @@ ENDPOINT_CODEX_CONTROLS = (
 
 def endpoint_codex_probe(codex_bin, run_dir, env, endpoint, decoy):
     """Run ENDPOINT_CODEX_CONTROLS under the real Codex profile with the endpoint's tool environment. Returns (results, problems)."""
-    values = {'relay': str(endpoint.relay_sock), 'daemon_sock': str(endpoint.daemon_sock), 'port': endpoint.port, 'decoy': str(decoy)}
+    values = {'relay': str(endpoint.relay_sock), 'daemon_sock': str(endpoint.daemon_sock), 'port': endpoint.port, 'decoy': str(decoy),
+              'record_exec': str(Path(run_dir) / 'endpoint-exec'), 'record_stage': str(Path(run_dir) / 'endpoint'), 'rl': str(endpoint.rl),
+              'etmp': str(endpoint.tmp)}
     tool_env = dict(env, **endpoint.tool_env())
     results, problems = [], []
     for name, snippet, expect in ENDPOINT_CODEX_CONTROLS:
@@ -1908,7 +1915,9 @@ ALLOWED_ARGV = {
     'stage': ('stage', ATTEMPT_SLOT),
     'exec': ('exec', ATTEMPT_SLOT),
 }
-CONFIG_KEYS = {'qa_name': str, 'qa_uid': int, 'producer_uid': int, 'exchange': str, 'codex_path': str, 'codex_sha256': str}
+CONFIG_KEYS = {'qa_name': str, 'qa_uid': int, 'producer_uid': int, 'exchange': str, 'codex_path': str, 'codex_sha256': str,
+               'codex_host_sha256': str}
+CODEX_HOST_NAME = 'codex-code-mode-host'     # Codex looks for it next to its own executable; without it `codex exec` has no tool commands
 REQUEST_KEYS = {
     'probe': {'verb': str, 'attempt': str, 'pid': int, 'sentinel': str},
     'stage': {'verb': str, 'attempt': str, 'network': str, 'port': int},
@@ -1984,7 +1993,8 @@ def read_config(config_path, chain_anchor):
     _need(isinstance(config, dict) and set(config) == set(CONFIG_KEYS))
     for key, kind in CONFIG_KEYS.items():
         _need(_typed(config[key], kind))
-    _need(NAME_RE.fullmatch(config['qa_name']) is not None and SHA256_RE.fullmatch(config['codex_sha256']) is not None)
+    _need(NAME_RE.fullmatch(config['qa_name']) is not None and SHA256_RE.fullmatch(config['codex_sha256']) is not None
+          and SHA256_RE.fullmatch(config['codex_host_sha256']) is not None)
     _need(config['qa_uid'] > 0 and config['producer_uid'] > 0 and config['qa_uid'] != config['producer_uid'])
     for key in ('exchange', 'codex_path'):
         _need(os.path.isabs(config[key]) and os.path.normpath(config[key]) == config[key])
@@ -2175,8 +2185,11 @@ def validate_installed(argv, config_path, chain_anchor, fds):
     _need(record.pw_name == config['qa_name'] and os.path.isabs(record.pw_dir))
     trusted_chain(config['codex_path'], chain_anchor)
     _need(sha256_file(config['codex_path']) == config['codex_sha256'])
+    host = os.path.join(os.path.dirname(config['codex_path']), CODEX_HOST_NAME)
+    trusted_chain(host, chain_anchor)
+    _need(sha256_file(host) == config['codex_host_sha256'])
     plan = {'verb': verb, 'dry_run': dry, 'qa_name': config['qa_name'], 'qa_home': record.pw_dir, 'producer_uid': config['producer_uid'], 'codex': config['codex_path'],
-            'codex_sha256': config['codex_sha256'], 'exchange': config['exchange']}
+            'codex_sha256': config['codex_sha256'], 'codex_host_sha256': config['codex_host_sha256'], 'exchange': config['exchange']}
     if verb == 'version':
         return plan
     request, afd = read_request(config, verb, attempt, fds)
@@ -2294,7 +2307,7 @@ def _act(plan):
             return 0
         if plan['verb'] == 'version':
             sys.stdout.write(json.dumps({'protocol': PROTOCOL, 'helper_sha256': sha256_file(os.path.realpath(__file__)),
-                                         'codex_sha256': plan['codex_sha256']}, sort_keys=True) + '\n')
+                                         'codex_sha256': plan['codex_sha256'], 'codex_host_sha256': plan['codex_host_sha256']}, sort_keys=True) + '\n')
             return 0
         pin_process(plan['qa_home'])
         outbox, codex_home = plan['outbox'], plan['codex_home']

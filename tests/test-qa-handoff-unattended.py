@@ -50,11 +50,15 @@ class Install:
         self.codex = self.lib / "codex"
         self.codex.write_bytes(b"#!/bin/sh\nexit 0\n")
         os.chmod(self.codex, 0o555)
+        self.host = self.lib / "codex-code-mode-host"
+        self.host.write_bytes(b"#!/bin/sh\nexit 0\n")
+        os.chmod(self.host, 0o555)
         self.x = self.base / "X"
         (self.x / "inbox").mkdir(parents=True)
         (self.x / "outbox").mkdir()
         self.config = {"qa_name": QA.pw_name, "qa_uid": QA.pw_uid, "producer_uid": ME, "exchange": str(self.x),
-                       "codex_path": str(self.codex), "codex_sha256": hashlib.sha256(self.codex.read_bytes()).hexdigest()}
+                       "codex_path": str(self.codex), "codex_sha256": hashlib.sha256(self.codex.read_bytes()).hexdigest(),
+                       "codex_host_sha256": hashlib.sha256(self.host.read_bytes()).hexdigest()}
         self.cfg = self.lib / "qa-side.json"
         self.write_config()
         self.ident = qa.Identity(QA.pw_name, QA.pw_uid, Path(QA.pw_dir), self.x, 0)
@@ -101,6 +105,7 @@ class InstallVerificationTests(Case):
         self.assertEqual(problems, [])
         self.assertEqual(record["helper_sha256"], hashlib.sha256(SIDE_SOURCE).hexdigest())
         self.assertEqual(record["codex_sha256"], i.config["codex_sha256"])
+        self.assertEqual(record["codex_host_sha256"], i.config["codex_host_sha256"])
         self.assertEqual(record["helper_path"], str(i.helper))
 
     def assertFails(self, i):
@@ -116,6 +121,22 @@ class InstallVerificationTests(Case):
             i.config[key] = value
             i.write_config()
             self.assertFails(i)
+
+    def test_the_tool_host_is_verified_like_the_codex_binary(self):
+        i = self.install()
+        os.chmod(i.host, 0o755)
+        i.host.write_bytes(b"tampered")
+        os.chmod(i.host, 0o555)
+        self.assertFails(i)
+        i = self.install()
+        os.chmod(i.host, 0o557)
+        self.assertFails(i)
+        i = self.install()
+        os.unlink(i.host)
+        self.assertFails(i)
+        i = self.install()
+        os.chmod(i.lib, 0o775)
+        self.assertFails(i)
 
     def test_codex_digest_drift(self):
         i = self.install()
@@ -278,7 +299,7 @@ class RunBase(Case):
                                                   "--timeout", "900"])
         self.calls = []
         self.install_record = {"helper_path": SIDE.HELPER_PATH, "helper_sha256": "1" * 64, "codex_path": "/Library/cae-qa/codex",
-                               "codex_sha256": "2" * 64}
+                               "codex_sha256": "2" * 64, "codex_host_sha256": "4" * 64}
         self.profile = "3" * 64
         self.stage_record = {"confinement": {"controls": [{"control": n, "observed": "ALLOWED" if e == "ALLOWED" else "DENIED:1"}
                                                            for n, _, e in qa.CONTROLS]}, "profile_sha256": self.profile}
@@ -288,7 +309,8 @@ class RunBase(Case):
         self.calls.append((verb, attempt))
         if verb == "version":
             return json.dumps({"protocol": SIDE.PROTOCOL, "helper_sha256": self.install_record["helper_sha256"],
-                               "codex_sha256": self.install_record["codex_sha256"]}), None
+                               "codex_sha256": self.install_record["codex_sha256"],
+                               "codex_host_sha256": self.install_record["codex_host_sha256"]}), None
         if verb == "stage":
             return json.dumps(self.stage_record) + "\n", None
         raise AssertionError(verb)
@@ -386,7 +408,7 @@ class RunTests(RunBase):
 
         def bad(ident, verb, attempt, seconds):
             if verb == "version":
-                return json.dumps({"protocol": SIDE.PROTOCOL, "helper_sha256": "9" * 64, "codex_sha256": "2" * 64}), None
+                return json.dumps({"protocol": SIDE.PROTOCOL, "helper_sha256": "9" * 64, "codex_sha256": "2" * 64, "codex_host_sha256": "4" * 64}), None
             return original(ident, verb, attempt, seconds)
         code, out, mocks = self.go(helper_hop=mock.patch.object(qa, "helper_hop", side_effect=bad))
         self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"])

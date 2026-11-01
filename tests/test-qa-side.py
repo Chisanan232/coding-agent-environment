@@ -61,6 +61,10 @@ class Tree:
         self.codex.write_bytes(b"#!/bin/sh\nexit 0\n")
         os.chmod(self.codex, 0o555)
         self.digest = hashlib.sha256(self.codex.read_bytes()).hexdigest()
+        self.host = self.codex_dir / "codex-code-mode-host"
+        self.host.write_bytes(b"#!/bin/sh\nexit 0\n")
+        os.chmod(self.host, 0o555)
+        self.host_digest = hashlib.sha256(self.host.read_bytes()).hexdigest()
         self.x.mkdir()
         os.chmod(self.x, 0o711)
         self.inbox = self.x / "inbox"
@@ -72,7 +76,7 @@ class Tree:
         self.attempt.mkdir()
         os.chmod(self.attempt, 0o700)
         self.config = {"qa_name": QA.pw_name, "qa_uid": QA.pw_uid, "producer_uid": ME, "exchange": str(self.x),
-                       "codex_path": str(self.codex), "codex_sha256": self.digest}
+                       "codex_path": str(self.codex), "codex_sha256": self.digest, "codex_host_sha256": self.host_digest}
         self.cfg = self.cfg_dir / "qa-side.json"
         self.write_config()
         self.source = self.attempt / "source"
@@ -266,6 +270,31 @@ class ConfigChainTests(InstalledCase):
         os.chmod(t.cfg, 0o644)
         t.cfg.write_text("{not json")
         self.assertRefused(t, ["version"])
+
+    def test_the_codex_tool_host_is_pinned_too(self):
+        """`codex exec` starts codex-code-mode-host from next to its own binary: a missing, drifted or loosely-owned host refuses the helper."""
+        t = self.tree()
+        os.chmod(t.host, 0o755)
+        t.host.write_bytes(b"#!/bin/sh\necho tampered\n")
+        os.chmod(t.host, 0o555)
+        self.assertRefused(t, ["version"], "drifted host")
+        t = self.tree()
+        os.chmod(t.host, 0o575)
+        self.assertRefused(t, ["version"], "world writable host")
+        t = self.tree()
+        os.unlink(t.host)
+        self.assertRefused(t, ["version"], "missing host")
+        for bad in ("", "zz", "A" * 64, 5):
+            t = self.tree()
+            t.config["codex_host_sha256"] = bad
+            os.chmod(t.cfg, 0o644)
+            t.write_config()
+            self.assertRefused(t, ["version"], repr(bad))
+        t = self.tree()
+        del t.config["codex_host_sha256"]
+        os.chmod(t.cfg, 0o644)
+        t.write_config()
+        self.assertRefused(t, ["version"], "key missing")
 
     def test_codex_digest_drift_and_codex_chain(self):
         t = self.tree()
@@ -497,9 +526,10 @@ class RequestTests(InstalledCase):
         rc, out, err = self.run_side(t, ["version"])
         self.assertEqual((rc, err), (0, ""))
         info = json.loads(out)
-        self.assertEqual(set(info), {"protocol", "helper_sha256", "codex_sha256"})
+        self.assertEqual(set(info), {"protocol", "helper_sha256", "codex_sha256", "codex_host_sha256"})
         self.assertEqual(info["protocol"], side.PROTOCOL)
         self.assertEqual(info["codex_sha256"], t.digest)
+        self.assertEqual(info["codex_host_sha256"], t.host_digest)
         self.assertEqual(info["helper_sha256"], hashlib.sha256(SIDE.read_bytes()).hexdigest())
 
 
