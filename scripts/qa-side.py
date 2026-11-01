@@ -481,6 +481,10 @@ def endpoint_probe_table(endpoint, canary, auth, canary_port, decoy, state_probe
     return [(name, profile, _probe(body), expect) for name, profile, body, expect in table]
 
 
+SNAPSHOT_MAX_BYTES = 512 << 20
+ENDPOINT_FAILED = 123                        # qa-exec: the endpoint could not be started or was lost; codex was stopped or not started
+
+
 # Time budget of an endpoint stage beyond the base probe: both generated profiles' controls, the Codex-side controls (60 s each at most),
 # the daemon and relay start-up waits and teardown.
 ENDPOINT_STAGE_SECONDS = 60 * 46 + 300
@@ -681,10 +685,35 @@ class EndpointLifecycle:
         again = self.ops.process_table()
         return [pid for pid, _ in sorted(before & {(pid, start) for pid, _, start in (again or [])})] if left else []
 
-    def teardown(self):
+    @staticmethod
+    def _tree_bytes(root):
+        total = 0
+        for base, dirs, files in os.walk(root):
+            for name in files:
+                try:
+                    total += os.lstat(os.path.join(base, name)).st_size
+                except OSError:
+                    pass
+        return total
+
+    def _snapshot_state(self, dst):
+        """Copy the stopped daemon's state directory (links kept as links, sockets skipped) to dst, up to SNAPSHOT_MAX_BYTES."""
+        src = self.endpoint.state
+        try:
+            size = self._tree_bytes(src)
+            if size > SNAPSHOT_MAX_BYTES:
+                return {'copied': False, 'bytes': size, 'error': 'larger than the %d byte limit' % SNAPSHOT_MAX_BYTES}
+            dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copytree(src, dst, symlinks=True, ignore=lambda d, names: [n for n in names if stat.S_ISSOCK(os.lstat(os.path.join(d, n)).st_mode)])
+            return {'copied': True, 'bytes': size, 'error': None}
+        except (OSError, shutil.Error) as error:
+            return {'copied': False, 'bytes': None, 'error': type(error).__name__}
+
+    def teardown(self, snapshot=None):
         """Relay first, then daemon, then verify: both stopped, nothing that descended from either is left, the port refuses, both sockets
         are gone (unlinked here if the daemon left one, and said so), the endpoint directory is removed. Safe to call twice and after a failed
-        start; if create() did not make the directory (it already existed) nothing is removed and the result is not clean. `clean` covers
+        start (with `snapshot`, the daemon's state directory is copied there once both processes are stopped and before it is removed: what
+        the independent QA looked at must survive the endpoint); if create() did not make the directory (it already existed) nothing is removed and the result is not clean. `clean` covers
         the two process groups and the descendants seen before the stop; a process that escaped earlier is the producer's whole-QA-user sweep."""
         e = self.endpoint
         steps = {'relay_stopped': False, 'daemon_stopped': False, 'descendants_left': [], 'port_closed': False, 'socket_removed_by_helper': [],
@@ -696,6 +725,8 @@ class EndpointLifecycle:
         steps['daemon_stopped'] = self.daemon is None or self.daemon.poll() is not None
         left = self._reap_stragglers(before)
         steps['descendants_left'] = left if left is not None else ['unknown']
+        if snapshot is not None and self._owns_dir:
+            steps['state_snapshot'] = self._snapshot_state(Path(snapshot))
         for close in self._closers:
             try:
                 close()
@@ -1585,15 +1616,95 @@ class QAStop(Exception):
         self.code = code
 
 
+class EndpointLost(Exception):
+    pass
+
+
+def wait_supervised(proc, timeout, life):
+    """proc.wait(timeout) that also asks the endpoint every couple of seconds whether it still holds; raises EndpointLost when it does not."""
+    if life is None:
+        return proc.wait(timeout=timeout)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return proc.wait(timeout=max(0.01, min(2.0, deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            if time.monotonic() >= deadline:
+                raise
+            if not life.supervise():
+                raise EndpointLost()
+
+
+def start_exec_endpoint(args, outbox):
+    """The exec-time endpoint: the payload is re-read from the outbox, held to the manifest digest and the generated daemon profile to the
+    digest the producer computed, and the lifecycle is proved and started exactly as at stage. Returns (lifecycle, endpoint, record_dir);
+    raises EndpointFailed / EndpointError for anything wrong, after tearing down whatever was made."""
+    record_dir = outbox / 'endpoint-exec'
+    manifest_path = outbox / 'payload' / MANIFEST_NAME
+    with open_regular(manifest_path) as handle:
+        raw = handle.read(MANIFEST_MAX + 1)
+    if manifest_sha256(raw) != args.manifest_sha256:
+        raise EndpointFailed('the payload manifest is not the one the producer named')
+    manifest = parse_manifest(raw)
+    if endpoint_refusal(manifest, 'daemon-endpoint'):
+        raise EndpointFailed('the payload names no daemon')
+    fd = os.open(str(outbox / 'payload'), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        problems = verify_tree(fd, manifest, raw, os.getuid(), check_modes=True)
+    finally:
+        os.close(fd)
+    if problems:
+        raise EndpointFailed('the staged payload no longer matches its manifest')
+    endpoint = build_endpoint(args, outbox, manifest)
+    if endpoint_digests(endpoint)['daemon_profile_sha256'] != args.daemon_profile_sha256:
+        raise EndpointFailed('the generated daemon profile is not the one the producer computed')
+    life = EndpointLifecycle(endpoint, record_dir)
+    token = os.urandom(8).hex()
+    canary_dir = CANARY_ROOT / token
+    try:
+        canary_dir.mkdir(parents=True, mode=0o700)
+        (canary_dir / 'canary.txt').write_text('synthetic-qa-canary-%s' % token)
+        life.create()
+        life.prove_profiles(canary_dir / 'canary.txt', real_codex_home() / 'auth.json', outbox / 'tmp')
+        life.start()
+    except BaseException as error:
+        life.record['problems'].append(clean(str(error), 160))
+        finish_exec_endpoint(life, outbox, canary_dir)
+        raise
+    return life, endpoint, canary_dir
+
+
+def finish_exec_endpoint(life, outbox, canary_dir):
+    """Stop the endpoint, keep a copy of the daemon's state in the outbox, remove the canary and the decoy, and write the record the producer
+    judges (outbox/endpoint-exec/record.json)."""
+    try:
+        life.record['teardown'] = life.teardown(snapshot=outbox / 'endpoint-exec' / 'state')
+    finally:
+        for leftover in (canary_dir / 'canary.txt', canary_dir, outbox / 'tmp' / 'qa-decoy.sock'):
+            try:
+                leftover.rmdir() if leftover.is_dir() and not leftover.is_symlink() else leftover.unlink()
+            except OSError:
+                pass
+    life.record['established'] = bool(life.record.get('port_proof')) and not life.record['problems'] and bool(life.record['teardown'].get('clean'))
+    try:
+        (outbox / 'endpoint-exec').mkdir(mode=0o700, exist_ok=True)
+        write_private(outbox / 'endpoint-exec' / 'record.json', life.record)
+    except OSError:
+        pass
+
+
 def qa_exec(args, build_env=None, open_prompt=None):
     """QA side, hop 2 (runs as the QA user). Only codex writes fd 1 (the producer's pipe); stderr goes to the outbox; the
-    prompt comes from the producer-owned inbox file. Exit: codex's code, 124 on timeout or alarm, 130 on a signal."""
+    prompt comes from the producer-owned inbox file. Exit: codex's code, 124 on timeout or alarm, 130 on a signal, ENDPOINT_FAILED when
+    the daemon endpoint could not start or was lost while codex ran."""
     inbox, outbox = Path(args.inbox), Path(args.outbox)
     err = os.open(outbox / 'stderr.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     os.dup2(err, 2)
     os.close(err)
     os.umask(0o077)
     proc = None
+    life = canary_dir = None
+    endpoint_lost = False
 
     def stop(signum, frame):
         raise QAStop(124 if signum == signal.SIGALRM else 130)
@@ -1607,17 +1718,32 @@ def qa_exec(args, build_env=None, open_prompt=None):
         if profile != args.profile_sha256:
             sys.stderr.write('qa-exec: the permission profile changed since it was proved; codex not started\n')
             return PROFILE_CHANGED
+        env = build_env() if build_env else isolated_env(outbox, Path(args.codex_home))
+        if getattr(args, 'network', 'none') == 'daemon-endpoint':
+            if HOME != Path(args.qa_home) or real_codex_home() != Path(args.qa_home) / '.codex':
+                sys.stderr.write('qa-exec: HOME or the Codex login directory is not the QA home\'s; codex not started\n')
+                return ENDPOINT_FAILED
+            try:
+                life, endpoint, canary_dir = start_exec_endpoint(args, outbox)
+            except (EndpointFailed, EndpointError, PayloadError, OSError) as error:
+                sys.stderr.write('qa-exec: the daemon endpoint did not start (%s); codex not started\n' % clean(str(error), 160))
+                return ENDPOINT_FAILED
+            env = dict(env, **endpoint.tool_env())
         with (open_prompt() if open_prompt else open_regular(inbox / 'prompt.txt')) as prompt:
             try:
                 proc = subprocess.Popen(codex_argv(args.codex_bin, outbox), cwd=str(outbox / 'source'),
-                                        env=build_env() if build_env else isolated_env(outbox, Path(args.codex_home)), stdin=prompt, start_new_session=True)
+                                        env=env, stdin=prompt, start_new_session=True)
             except OSError:
                 return 127
         try:
-            code = proc.wait(timeout=args.timeout)
+            code = wait_supervised(proc, args.timeout, life)
         except subprocess.TimeoutExpired:
             kill_group(proc)
             return 124
+        except EndpointLost:
+            endpoint_lost = True
+            kill_group(proc)
+            return ENDPOINT_FAILED
         try:
             os.killpg(proc.pid, signal.SIGKILL)   # stragglers in codex's own group
         except OSError:
@@ -1627,6 +1753,11 @@ def qa_exec(args, build_env=None, open_prompt=None):
         if proc is not None:
             kill_group(proc)
         return stopped.code
+    finally:
+        if life is not None:
+            if endpoint_lost:
+                life.record['problems'].append('the endpoint stopped holding while codex ran')
+            finish_exec_endpoint(life, outbox, canary_dir)
 
 
 # Copied from qa-identity-setup.py (the attended isolation probe); a test pins the two together. This file imports
@@ -1711,7 +1842,8 @@ CONFIG_KEYS = {'qa_name': str, 'qa_uid': int, 'producer_uid': int, 'exchange': s
 REQUEST_KEYS = {
     'probe': {'verb': str, 'attempt': str, 'pid': int, 'sentinel': str},
     'stage': {'verb': str, 'attempt': str, 'network': str, 'port': int},
-    'exec': {'verb': str, 'attempt': str, 'timeout': int, 'profile_sha256': str, 'network': str, 'port': int},
+    'exec': {'verb': str, 'attempt': str, 'timeout': int, 'profile_sha256': str, 'network': str, 'port': int, 'manifest_sha256': str,
+             'daemon_profile_sha256': str},
 }
 REQUEST_MAX = 4096
 CONFIG_MAX = 65536
@@ -1852,7 +1984,13 @@ def read_request(config, verb, attempt, fds):
         _need(request['network'] in ('none', 'daemon-endpoint'))
         _need(request['port'] == 0 if request['network'] == 'none' else PORT_RANGE[0] <= request['port'] <= PORT_RANGE[1])
     if verb == 'exec':
-        _need(request['network'] == 'none')       # the exec-time endpoint lifecycle is not built yet: no model starts without it
+        # An endpoint run binds the payload manifest and the generated daemon profile by digest (both computed by the producer from its
+        # own values); a none run carries neither.
+        bound = [request['manifest_sha256'], request['daemon_profile_sha256']]
+        if request['network'] == 'none':
+            _need(bound == ['', ''])
+        else:
+            _need(all(SHA256_RE.fullmatch(value) is not None for value in bound))
     return request, afd
 
 
@@ -2100,6 +2238,7 @@ def _act(plan):
                             lambda: open_payload_at(plan['afd'], plan['producer_uid']))
         if plan['verb'] == 'exec':
             ns.timeout, ns.profile_sha256 = plan['request']['timeout'], plan['request']['profile_sha256']
+            ns.manifest_sha256, ns.daemon_profile_sha256 = plan['request']['manifest_sha256'], plan['request']['daemon_profile_sha256']
             prompt = open_prompt_at(plan['afd'], plan['producer_uid'])
             detach(ns.timeout + ALARM_SLACK, keep=(prompt.fileno(),))
             return qa_exec(ns, lambda: env, lambda: prompt)
@@ -2122,13 +2261,14 @@ def build_parser():
         q.add_argument('--outbox', required=True)
         q.add_argument('--codex-home', required=True)
         q.add_argument('--codex-bin', default='codex')
-        if name == 'qa-stage':
-            q.add_argument('--network', choices=('none', 'daemon-endpoint'), default='none')
-            q.add_argument('--port', type=int, default=0)
-            q.add_argument('--qa-home', default=str(HOME))
-            q.add_argument('--exchange', default='')
-            q.add_argument('--attempt', default='')
+        q.add_argument('--network', choices=('none', 'daemon-endpoint'), default='none')
+        q.add_argument('--port', type=int, default=0)
+        q.add_argument('--qa-home', default=str(HOME))
+        q.add_argument('--exchange', default='')
+        q.add_argument('--attempt', default='')
         if name == 'qa-exec':
+            q.add_argument('--manifest-sha256', default='')
+            q.add_argument('--daemon-profile-sha256', default='')
             q.add_argument('--timeout', type=int, default=1800)
             q.add_argument('--profile-sha256', required=True)
     return parser

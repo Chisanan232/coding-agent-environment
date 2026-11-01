@@ -93,7 +93,8 @@ class Tree:
     def good_request(verb, attempt=ATTEMPT):
         return {"probe": {"verb": "probe", "attempt": attempt, "pid": 4242, "sentinel": SENTINEL},
                 "stage": {"verb": "stage", "attempt": attempt, "network": "none", "port": 0},
-                "exec": {"verb": "exec", "attempt": attempt, "timeout": 1800, "profile_sha256": SHA, "network": "none", "port": 0}}[verb]
+                "exec": {"verb": "exec", "attempt": attempt, "timeout": 1800, "profile_sha256": SHA, "network": "none", "port": 0,
+                         "manifest_sha256": "", "daemon_profile_sha256": ""}}[verb]
 
     def write_config(self):
         self.cfg.write_text(json.dumps(self.config))
@@ -447,7 +448,12 @@ class RequestTests(InstalledCase):
         bad = [dict(base, timeout=59), dict(base, timeout=14401), dict(base, timeout="1800"), dict(base, timeout=True),
                dict(base, timeout=1800.0), dict(base, timeout=None), dict(base, profile_sha256="C" * 64),
                dict(base, profile_sha256="c" * 63), dict(base, profile_sha256="c" * 64 + "\n"), dict(base, profile_sha256=5),
-               dict(base, network="daemon-endpoint", port=25000)]            # exec cannot start an endpoint yet
+               dict(base, manifest_sha256=SHA), dict(base, daemon_profile_sha256=SHA),            # a none run binds neither
+               dict(base, network="daemon-endpoint", port=25000),                                    # an endpoint run binds both
+               dict(base, network="daemon-endpoint", port=25000, manifest_sha256=SHA),
+               dict(base, network="daemon-endpoint", port=25000, manifest_sha256=SHA, daemon_profile_sha256="C" * 64),
+               dict(base, network="daemon-endpoint", port=19999, manifest_sha256=SHA, daemon_profile_sha256=SHA),
+               {k: v for k, v in base.items() if k != "manifest_sha256"}]
         for request in bad:
             t = self.tree(request=request)
             self.assertRefused(t, ["exec", ATTEMPT], json.dumps(request))
@@ -468,6 +474,10 @@ class RequestTests(InstalledCase):
         for edge in (20000, 32767):
             t = self.tree(request=dict(base, network="daemon-endpoint", port=edge), verb="stage")
             self.assertEqual(self.dry(t, "stage")["verb"], "stage")
+
+    def test_exec_endpoint_request_resolves_with_both_digests(self):
+        t = self.tree(request=dict(Tree.good_request("exec"), network="daemon-endpoint", port=25000, manifest_sha256=SHA, daemon_profile_sha256=SHA))
+        self.assertEqual(self.dry(t)["verb"], "exec")
 
     def test_typed_ranges_probe(self):
         base = Tree.good_request("probe")

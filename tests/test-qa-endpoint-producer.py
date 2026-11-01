@@ -162,5 +162,122 @@ class NetworkModeTests(Base):
             self.assertTrue(side.PORT_RANGE[0] <= port <= side.PORT_RANGE[1])
 
 
+class SealEndpointTests(Base):
+    """seal_endpoint: the exec-time record is read through the opened outbox descriptor and judged by the producer."""
+
+    def setUp(self):
+        super().setUp()
+        import json
+        import os
+        self.json, self.os = json, os
+        self.box = self.root / "outbox"
+        self.sub = self.box / "endpoint-exec"
+        (self.sub / "state").mkdir(parents=True)
+        self.sub.chmod(0o700)
+        record = dict(self.record)
+        record.pop("codex_controls")
+        record["teardown"] = dict(record["teardown"], state_snapshot={"copied": True, "bytes": 3, "error": None})
+        self.exec_record = record
+        self.write(record)
+
+    def write(self, record):
+        (self.sub / "record.json").write_text(self.json.dumps(record))
+
+    def seal(self):
+        fd = self.os.open(self.box, self.os.O_RDONLY | self.os.O_DIRECTORY)
+        try:
+            return qa.seal_endpoint(fd, self.endpoint, self.os.getuid())
+        finally:
+            self.os.close(fd)
+
+    def test_a_complete_exec_record_is_verified_without_the_codex_side_controls(self):
+        sealed = self.seal()
+        self.assertTrue(sealed["verified"], sealed)
+        self.assertEqual(sealed["view"]["derived_by"], "producer")
+
+    def test_each_defect_is_a_problem(self):
+        import copy
+        cases = {
+            "state not kept": lambda r: r["teardown"].update(state_snapshot={"copied": False, "bytes": None, "error": "OSError"}),
+            "no snapshot": lambda r: r["teardown"].pop("state_snapshot"),
+            "unclean": lambda r: r["teardown"].update(clean=False),
+            "lost": lambda r: r.update(problems=["the endpoint stopped holding while codex ran"]),
+            "not established": lambda r: r.update(established=False),
+            "digest": lambda r: r.update(daemon_profile_sha256="0" * 64),
+        }
+        for label, mutate in cases.items():
+            record = copy.deepcopy(self.exec_record)
+            mutate(record)
+            self.write(record)
+            self.assertFalse(self.seal()["verified"], label)
+
+    def test_a_missing_directory_record_or_state_copy_is_not_verified(self):
+        (self.sub / "state").rmdir()
+        self.assertFalse(self.seal()["verified"])
+        (self.sub / "state").mkdir()
+        (self.sub / "record.json").unlink()
+        self.assertFalse(self.seal()["verified"])
+        self.sub.joinpath("record.json").write_text("not json")
+        self.assertFalse(self.seal()["verified"])
+        import shutil
+        shutil.rmtree(self.sub)
+        self.assertFalse(self.seal()["verified"])
+
+    def test_a_loose_record_directory_is_refused(self):
+        self.sub.chmod(0o770)
+        self.assertFalse(self.seal()["verified"])
+
+    def test_the_endpoint_gate_needs_a_verified_seal_only_for_endpoint_packets(self):
+        self.assertEqual(qa.endpoint_gate({}, {}), [])
+        packet = {"network": "daemon-endpoint"}
+        self.assertTrue(qa.endpoint_gate(packet, {}))
+        self.assertTrue(qa.endpoint_gate(packet, {"endpoint": {"verified": False, "problems": ["x"]}}))
+        self.assertTrue(qa.endpoint_gate(packet, {"endpoint": {"verified": "yes"}}))
+        self.assertEqual(qa.endpoint_gate(packet, {"endpoint": {"verified": True}}), [])
+
+
+class EvaluateEndpointTests(Base):
+    """evaluate_files for a daemon-endpoint model run whose codex was stopped by the endpoint (exit ENDPOINT_FAILED)."""
+
+    def setUp(self):
+        super().setUp()
+        import json
+        self.json = json
+        self.run = self.root / "run"
+        self.run.mkdir()
+        (self.run / "events.jsonl").write_text("")
+        digest = hashlib.sha256(b"").hexdigest()
+        (self.run / "tree-manifest.json").write_text(json.dumps({"__head__": "a" * 40, "__control__": "", "files": {}}))
+        for name in ("ISOLATION.json", "CONFINEMENT.json"):
+            (self.run / name).write_text(json.dumps({"established": True}))
+        self.meta = {"events_sha256": digest, "verdict_sha256": None, "exit_code": side.ENDPOINT_FAILED, "qa_identity": {"name": "q"}, "stragglers": 0,
+                     "path_ok": True, "persistence": [], "tree_problems": [], "untracked": {"count": 0, "sample": []},
+                     "endpoint": {"verified": False, "problems": ["the endpoint stopped holding while codex ran"]}}
+        self.packet = {"product": "p", "ticket": "T", "sha": "a" * 40, "network": "daemon-endpoint", "digest": "x"}
+
+    def evaluate(self, **over):
+        (self.run / "RUNMETA.json").write_text(self.json.dumps(dict(self.meta, **over)))
+        written = {}
+        with mock.patch.object(qa, "write_result", side_effect=lambda run_dir, packet, state, reasons, extra=None: written.update(state=state, reasons=reasons) or 0):
+            with mock.patch.object(qa, "tree_problems", return_value=[]):
+                qa.evaluate_files(self.run, self.packet)
+        return written
+
+    def test_an_endpoint_that_failed_is_incomplete_never_a_pass_and_names_why(self):
+        got = self.evaluate()
+        self.assertEqual(got["state"], "QA_INCOMPLETE")
+        self.assertIn("daemon endpoint failed", got["reasons"][0])
+        self.assertIn("stopped holding", got["reasons"][0])
+
+    def test_a_failed_endpoint_with_another_problem_is_invalid(self):
+        self.assertEqual(self.evaluate(stragglers=3)["state"], "QA_INVALID")
+
+    def test_an_unverified_endpoint_blocks_a_run_that_looks_finished(self):
+        (self.run / "verdict.json").write_text("{}")
+        got = self.evaluate(exit_code=0, verdict_sha256=qa.safe_digest(self.run / "verdict.json"))
+        self.assertEqual(got["state"], "QA_INVALID")
+        self.assertTrue(any("daemon endpoint was not verified" in r for r in got["reasons"]), got["reasons"])
+
+
 if __name__ == "__main__":
     unittest.main()
