@@ -1358,6 +1358,9 @@ def producer_payload(run_dir, packet):
         if not isinstance(info, dict) or _SIDE.manifest_sha256(raw) != info.get('manifest_sha256'):
             return None, ['MANIFEST.json is not the one the packet names']
         manifest = _SIDE.parse_manifest(raw)
+        refusal = _SIDE.endpoint_refusal(manifest)
+        if refusal:
+            return None, [refusal]
         problems = _SIDE.verify_tree(fd, manifest, raw, os.getuid())
     except _SIDE.PayloadError as error:
         return None, [str(error)]

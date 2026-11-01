@@ -791,6 +791,21 @@ class EndpointSchemaTests(Scratch):
         self.assertIn("cannot start", side.endpoint_refusal(self.parse(self.v2())))
         self.assertIsNone(side.endpoint_refusal(side.parse_manifest(self.payload(selftests=[test_entry()])[2])))
 
+    def test_the_producer_reverification_refuses_a_payload_that_names_an_endpoint(self):
+        hspec = importlib.util.spec_from_file_location("qa_handoff_for_endpoint_test", SCRIPTS / "qa-handoff.py")
+        handoff = importlib.util.module_from_spec(hspec)
+        hspec.loader.exec_module(handoff)
+        directory, _, _ = self.payload(selftests=[test_entry()])
+        run_dir = self.root / "run"
+        run_dir.mkdir()
+        shutil.copytree(directory, run_dir / "payload")
+        raw = json.dumps(self.v2()).encode()
+        (run_dir / "payload" / "MANIFEST.json").write_bytes(raw)
+        found, problems = handoff.producer_payload(run_dir, {"payload": {"manifest_sha256": side.manifest_sha256(raw)}})
+        self.assertIsNone(found)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("cannot start", problems[0])
+
     def test_stage_refuses_before_copying_anything(self):
         directory, manifest, _ = self.payload(files=dict(FILES, **{"bin/daemon": (b"#!/bin/sh\n", "exec")}), selftests=[])
         manifest.update(schema="cae-qa-payload/2", endpoint={"daemon": "bin/daemon", "contract": "fornax-daemon/1"})
