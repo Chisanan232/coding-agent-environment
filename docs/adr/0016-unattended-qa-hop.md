@@ -114,13 +114,13 @@ literal `version` rule), and the first real producer run stopped at `launchd dom
 `tests/test-qa-hop-install.py` now checks every rendered rule for this syntax and matches sample argv against the expressions.
 Parsing alone proves nothing about matching: the post-install readback must run one allowed shape of each rule for real.
 
-Sudoers regular expressions here contain no comma: a comma inside `{m,n}` is read as a list separator even in double quotes
-(`visudo` rejects it), so lengths are not limited in sudoers. The helper enforces the attempt-name cap (150 characters, validation
+Sudoers regular expressions here contain no comma, `#`, backslash or second `$` (the lexer ends an unquoted regex at the first `$`; a
+static test checks this), so lengths are not limited in sudoers: the helper and producer enforce them. The helper enforces the attempt-name cap (150 characters, validation
 item 2), and the producer enforces the service-label cap (200). Sudoers still lets a name contain dots, which is harmless: the
 helper rejects `..` and paths are never built from argv.
 
-**Tool environment (rev 4).** Every environment the helper builds for QA-side commands (Codex, self-tests, the daemon, the relay and the
-confinement probes) carries `DEVELOPER_DIR=/Library/Developer/CommandLineTools`. The `/usr/bin` developer shims (`git`, `python3`, `make`)
+**Tool environment (rev 4).** Every environment the helper builds for QA-side commands (the attended `isolated_env`, the installed `base_env` and `installed_env`,
+self-tests, the daemon, the relay and the confinement probes) carries `DEVELOPER_DIR=/Library/Developer/CommandLineTools`. The `/usr/bin` developer shims (`git`, `python3`, `make`)
 choose their real tool through xcode-select, whose link names an Xcode path that does not exist and whose parent directory a
 producer in `admin` can create; without the variable that is a way to put producer-chosen binaries under the QA user. The variable makes the
 shims use the root-owned Command Line Tools. Payload exec files should still use absolute Command Line Tools paths.

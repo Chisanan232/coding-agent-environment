@@ -2222,7 +2222,7 @@ def copy_tree_at(src_fd, dst, producer, limits=None, depth=0):
 
 def base_env(qa_home):
     """What a bare probe needs and nothing else."""
-    return {'PATH': CHILD_PATH, 'HOME': qa_home}
+    return {'PATH': CHILD_PATH, 'DEVELOPER_DIR': DEVELOPER_DIR, 'HOME': qa_home}
 
 
 def installed_env(qa_name, qa_home, outbox, codex_home):
@@ -2230,7 +2230,7 @@ def installed_env(qa_name, qa_home, outbox, codex_home):
     caller variable, so PATH, HOME, CODEX_HOME, LANG, TERM and SHELL of whoever started the helper cannot reach Codex. The
     attended isolated_env copies several of those from os.environ and is deliberately left alone."""
     home = os.path.join(outbox, 'home')
-    return {'PATH': CHILD_PATH, 'HOME': qa_home, 'USER': qa_name, 'LOGNAME': qa_name,
+    return {'PATH': CHILD_PATH, 'DEVELOPER_DIR': DEVELOPER_DIR, 'HOME': qa_home, 'USER': qa_name, 'LOGNAME': qa_name,
             'TMPDIR': os.path.join(outbox, 'tmp'), 'XDG_CONFIG_HOME': home + '/.config',
             'XDG_DATA_HOME': home + '/.local/share', 'XDG_CACHE_HOME': home + '/.cache',
             'CARGO_TARGET_DIR': os.path.join(outbox, 'cargo-target'), 'CARGO_NET_OFFLINE': 'true', 'CODEX_HOME': codex_home}

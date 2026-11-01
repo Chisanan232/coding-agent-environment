@@ -240,6 +240,14 @@ class SudoersSemanticsTests(Case):
                 self.assertNotIn("^", args, (path, args))
                 self.assertFalse(set(args) & set("*?[]"), "wildcard in a literal rule: %r %r" % (path, args))
 
+    def test_regex_rules_have_exactly_one_dollar_at_the_end_and_no_lexer_special_characters(self):
+        """sudo's lexer ends an unquoted regex at the first '$' and treats '#' and backslashes specially; Python's re would not notice."""
+        for path, args in self.commands():
+            if args.startswith("^"):
+                self.assertEqual(args.count("$"), 1, args)
+                self.assertTrue(args.endswith("$"), args)
+                self.assertFalse(set(args) & set("#\\,\""), args)
+
     def test_the_helper_attempt_rule_accepts_only_the_three_verbs_and_a_plain_attempt_id(self):
         (args,) = [a for p, a in self.commands() if p == "/Library/cae-qa/qa-side" and a.startswith("^")]
         for ok in ("probe att-1", "stage 9d2f18783930-1", "exec A.b_c", "probe 0", "exec " + "a" * 150):
