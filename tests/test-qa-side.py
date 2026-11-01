@@ -554,7 +554,7 @@ class EnvironmentTests(InstalledCase):
         t = self.tree()
         with self.poisoned():
             built = [side.base_env(QA.pw_dir), side.installed_env(QA.pw_name, QA.pw_dir, str(t.x / "outbox" / ATTEMPT), QA.pw_dir + "/c"),
-                     side.selftest_env(str(t.x / "outbox" / ATTEMPT), QA.pw_dir + "/c")]
+                     side.selftest_env(str(t.x / "outbox" / ATTEMPT), QA.pw_dir + "/c"), side.isolated_env(t.x / "outbox" / ATTEMPT)]
         for env in built:
             self.assertEqual(env.get("DEVELOPER_DIR"), "/Library/Developer/CommandLineTools", env)
 

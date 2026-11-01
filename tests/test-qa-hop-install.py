@@ -241,8 +241,10 @@ class SudoersSemanticsTests(Case):
                 self.assertFalse(set(args) & set("*?[]"), "wildcard in a literal rule: %r %r" % (path, args))
 
     def test_regex_rules_have_exactly_one_dollar_at_the_end_and_no_lexer_special_characters(self):
-        """sudo's lexer ends an unquoted regex at the first '$' and treats '#' and backslashes specially; Python's re would not notice."""
-        for path, args in self.commands():
+        """A conservative house rule (the lexer reads an unquoted regex up to its '$'; '#' needs escaping): one trailing '$', none of '#', backslash, comma, quote."""
+        rules = [(p, a) for p, a in self.commands() if a.startswith("^")]
+        self.assertEqual(len(rules), 2, rules)             # the helper rule and the launchctl rule: a silent empty loop must not pass
+        for path, args in rules:
             if args.startswith("^"):
                 self.assertEqual(args.count("$"), 1, args)
                 self.assertTrue(args.endswith("$"), args)
