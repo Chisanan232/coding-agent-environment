@@ -170,7 +170,7 @@ def profile_toml(run_dir, read_roots=(), home=None, codex_home=None, endpoint=No
 # `transport` picks the shape: 'tcp-relay' (the daemon binds a loopback port and cae relays one Unix socket to it) or 'unix' (the daemon
 # serves its own Unix socket under its state directory and binds no port at all; there is no relay). `sock` is relative to the state
 # directory. For a unix contract `argv` follows the payload's daemon binary, and `env`/`tool_env` map variables to 'state' or 'tmp' paths
-# of the endpoint ('tmp/config' is <tmp>/config);
+# of the endpoint ('tmp/config' is <tmp>/config); `seed_dir` names the payload directory whose files are copied into the state first.
 # The Circinus bootstrap is a cae constant: the payload names only the interpreter (its daemon), never the code it is told to run.
 CIRCINUS_BOOTSTRAP = 'from circinus.cli import main; import sys; sys.exit(main())'
 ENDPOINT_CONTRACTS = {
@@ -178,7 +178,7 @@ ENDPOINT_CONTRACTS = {
     # No XDG_RUNTIME_DIR on purpose: Circinus then puts its socket at <XDG_STATE_HOME>/circinus/circinusd.sock, inside the state directory.
     'circinus-daemon/1': {'transport': 'unix', 'sock': 'circinus/circinusd.sock', 'argv': ('-I', '-B', '-c', CIRCINUS_BOOTSTRAP, 'daemon-run'),
                           'env': {'XDG_STATE_HOME': 'state', 'XDG_CONFIG_HOME': 'tmp/config', 'HOME': 'tmp'},
-                          'tool_env': {'XDG_STATE_HOME': 'state'}},
+                          'tool_env': {'XDG_STATE_HOME': 'state'}, 'seed_dir': 'state-seed'},
 }
 RELAY_SOCK_NAME = 'http.sock'
 SUN_PATH_LIMIT = 104                      # sockaddr_un.sun_path on macOS, including the terminating NUL
@@ -1199,11 +1199,53 @@ def parse_manifest(raw):
             _exact(endpoint, ('daemon', 'contract'), 'the endpoint block')
             _check(isinstance(endpoint['contract'], str) and endpoint['contract'] in ENDPOINT_CONTRACTS, 'the endpoint contract is not one cae knows')
             _check(isinstance(endpoint['daemon'], str) and kinds.get(endpoint['daemon']) == 'exec', 'the endpoint daemon is not a listed kind=exec file')
+            seed_plan(doc)                         # a bad seed is refused where the manifest is first read, not only when the endpoint starts
     else:
         doc['endpoint'] = None                     # a /1 manifest has no endpoint; callers can rely on the key
         for test in tests:
             test['needs_endpoint'] = False
     return doc
+
+
+# State seeding (SPE-155): for a contract with a `seed_dir`, the listed kind=data files under <seed_dir>/ are copied into the endpoint's
+# state directory by the helper before the daemon starts. A convention, not a schema field: the manifest lists them like any other file.
+SEED_MAX_FILES = 32
+SEED_FILE_MAX = 256 << 10
+SEED_TOTAL_MAX = 1 << 20
+SEED_MAX_DEPTH = 6
+SEED_RESERVED = ('qa-probe', 'qa-probe.db', 'qa-probe.sock')      # what the daemon profile's own controls write into the state
+
+
+def seed_plan(manifest):
+    """[(payload path, state-relative path, sha256, size)] of the files to seed, in manifest order; [] for a contract without a seed
+    directory. Raises PayloadError when a seed breaks a rule: kind=data only, at most SEED_MAX_DEPTH components below the state, not a
+    name the profile controls write, not the daemon's socket path, at most 32 files, 256 KiB each and 1 MiB in all. The paths are already
+    normalised relative payload paths (valid_payload_path), so no target can leave the state directory."""
+    spec = ENDPOINT_CONTRACTS.get((manifest.get('endpoint') or {}).get('contract'), {})
+    if not spec.get('seed_dir'):
+        return []
+    prefix = spec['seed_dir'] + '/'
+    plan, total = [], 0
+    for entry in manifest['files']:
+        if not entry['path'].startswith(prefix):
+            continue
+        rel = entry['path'][len(prefix):]
+        parts = rel.split('/')
+        _check(entry['kind'] == 'data', 'seed file %s is not kind=data' % entry['path'])
+        _check(len(parts) <= SEED_MAX_DEPTH and all(part not in ('', '.', '..') for part in parts) and os.path.normpath(rel) == rel,
+               'seed file %s is more than %d levels deep or not a plain relative path' % (entry['path'], SEED_MAX_DEPTH))
+        _check(parts[0] not in SEED_RESERVED and rel != spec['sock'], 'seed file %s would replace a path cae or the daemon uses' % entry['path'])
+        _check(entry['size'] <= SEED_FILE_MAX, 'seed file %s is larger than %d bytes' % (entry['path'], SEED_FILE_MAX))
+        total += entry['size']
+        plan.append((entry['path'], rel, entry['sha256'], entry['size']))
+    _check(len(plan) <= SEED_MAX_FILES, 'more than %d seed files' % SEED_MAX_FILES)
+    _check(total <= SEED_TOTAL_MAX, 'the seed files are larger than %d bytes in all' % SEED_TOTAL_MAX)
+    return plan
+
+
+def seed_record(manifest):
+    """What an endpoint record must report as seeded: [{path, sha256}], derived from the manifest alone (the producer computes it too)."""
+    return [{'path': rel, 'sha256': sha} for _, rel, sha, _ in seed_plan(manifest)]
 
 
 def endpoint_refusal(manifest, network='none'):
