@@ -390,6 +390,9 @@ def read_payload_source(directory):
     try:
         raw = _SIDE.read_manifest_at(fd, os.getuid())
         manifest = _SIDE.parse_manifest(raw)
+        refusal = _SIDE.endpoint_refusal(manifest)
+        if refusal:
+            raise _SIDE.PayloadError(refusal)
         problems = _SIDE.verify_tree(fd, manifest, raw, os.getuid())
     except _SIDE.PayloadError as error:
         os.close(fd)
@@ -444,7 +447,7 @@ def prepare(args):
         finally:
             os.close(payload['fd'])
         manifest = payload['manifest']
-        packet['payload'] = {'schema': _SIDE.PAYLOAD_SCHEMA, 'manifest_sha256': _SIDE.manifest_sha256(payload['raw']),
+        packet['payload'] = {'schema': manifest['schema'], 'manifest_sha256': _SIDE.manifest_sha256(payload['raw']),
                              'files': len(manifest['files']), 'bytes': sum(f['size'] for f in manifest['files']),
                              'selftests': [t['id'] for t in manifest['selftests']], 'scope': manifest['scope'],
                              'producer_run': list(manifest['producer_run'])}
@@ -1355,6 +1358,9 @@ def producer_payload(run_dir, packet):
         if not isinstance(info, dict) or _SIDE.manifest_sha256(raw) != info.get('manifest_sha256'):
             return None, ['MANIFEST.json is not the one the packet names']
         manifest = _SIDE.parse_manifest(raw)
+        refusal = _SIDE.endpoint_refusal(manifest)
+        if refusal:
+            return None, [refusal]
         problems = _SIDE.verify_tree(fd, manifest, raw, os.getuid())
     except _SIDE.PayloadError as error:
         return None, [str(error)]

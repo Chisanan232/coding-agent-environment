@@ -2,6 +2,7 @@
 """Producer-side helper for QA payloads (SPE-145 part 9): generate and check payload/MANIFEST.json (cae-qa-payload/1).
 
   qa-payload-manifest.py plan   --dir DIR --scope TEXT [--producer-run PATH ...] [--selftests FILE] [--write]
+                                [--endpoint-daemon PATH --endpoint-contract ID]
   qa-payload-manifest.py verify --dir DIR
 
 Unprivileged and offline. `plan` lists every regular file of DIR (except MANIFEST.json) with its SHA-256, size and kind (exec when
@@ -62,9 +63,14 @@ def scan(side, directory):
     return sorted(found)
 
 
-def build_manifest(side, directory, scope, producer_run, selftests):
+def build_manifest(side, directory, scope, producer_run, selftests, endpoint=None):
+    """cae-qa-payload/1 unless an endpoint block is given, then /2 (each self-test then carries needs_endpoint, false when left out)."""
     entries = [{'path': p, 'sha256': sha, 'size': size, 'kind': kind} for p, kind, size, sha in scan(side, directory)]
-    return {'schema': side.PAYLOAD_SCHEMA, 'files': entries, 'selftests': selftests, 'scope': scope, 'producer_run': producer_run}
+    if endpoint is None:
+        return {'schema': side.PAYLOAD_SCHEMA, 'files': entries, 'selftests': selftests, 'scope': scope, 'producer_run': producer_run}
+    tests = [dict(t, needs_endpoint=t.get('needs_endpoint', False)) if isinstance(t, dict) else t for t in selftests]
+    return {'schema': side.PAYLOAD_SCHEMA_2, 'files': entries, 'selftests': tests, 'scope': scope, 'producer_run': producer_run,
+            'endpoint': endpoint}
 
 
 def render(manifest):
@@ -76,7 +82,10 @@ def plan(args, side):
     if args.selftests:
         with open(args.selftests, 'rb') as handle:
             selftests = json.loads(handle.read(1 << 20).decode('utf-8'))
-    manifest = build_manifest(side, args.dir, args.scope, list(args.producer_run or []), selftests)
+    if bool(args.endpoint_daemon) != bool(args.endpoint_contract):
+        raise SystemExit('--endpoint-daemon and --endpoint-contract go together')
+    endpoint = {'daemon': args.endpoint_daemon, 'contract': args.endpoint_contract} if args.endpoint_daemon else None
+    manifest = build_manifest(side, args.dir, args.scope, list(args.producer_run or []), selftests, endpoint)
     raw = render(manifest)
     side.parse_manifest(raw)                                    # the QA run's own rules, before anything is written
     sys.stderr.write('files: %d  bytes: %d  self-tests: %d  producer_run: %d\n' % (
@@ -127,6 +136,8 @@ def main(argv=None):
     p.add_argument('--scope', required=True)
     p.add_argument('--producer-run', action='append')
     p.add_argument('--selftests')
+    p.add_argument('--endpoint-daemon', help='payload-relative path of the candidate daemon (a kind=exec file); makes a cae-qa-payload/2 manifest')
+    p.add_argument('--endpoint-contract', help='endpoint contract id, e.g. fornax-daemon/1')
     p.add_argument('--write', action='store_true')
     v = sub.add_parser('verify')
     v.add_argument('--dir', required=True)
