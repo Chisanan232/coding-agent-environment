@@ -9,7 +9,7 @@ runs; it needs `--qa-identity` (the self-tests run as the QA user). The format b
 ## What it is not
 
 The wrapper's probe and self-tests cover only **offline, library-level checks** under the confinement profile, and (in a daemon-endpoint
-run) requests to the candidate daemon through the two endpoint sockets. End-to-end results beyond that are **producer-run** and are not
+run) requests to the candidate daemon through the endpoint's Unix sockets. End-to-end results beyond that are **producer-run** and are not
 independently reproduced by this QA. Every RESULT and the QA prompt say so, and
 every file named in `producer_run` is labelled `PRODUCER-RUN`.
 
@@ -160,8 +160,11 @@ For a payload whose subject is a daemon, `prepare --network daemon-endpoint --pa
   "selftests": [ {"id": "...", "argv": [...], "...": "...", "needs_endpoint": true} ] }
 ```
 
-`endpoint` is `null` or exactly `{daemon, contract}`: `daemon` is a listed `kind=exec` file and `contract` is a contract cae knows
-(`fornax-daemon/1`: the daemon reads `FORNAX_HOME` and `FORNAX_HTTP_PORT`, binds that loopback port and creates `fornax.sock` in its home).
+`endpoint` is `null` or exactly `{daemon, contract}`: `daemon` is a listed `kind=exec` file and `contract` is a contract cae knows:
+
+- `fornax-daemon/1` (transport `tcp-relay`): the daemon reads `FORNAX_HOME` and `FORNAX_HTTP_PORT`, binds that loopback port and creates
+  `fornax.sock` in its home. Described below.
+- `circinus-daemon/1` (transport `unix`): no port and no relay. See "Unix-socket contracts" below.
 Every self-test then carries `needs_endpoint` (strict boolean; `true` only when `endpoint` is not `null`). Schema `/1` is unchanged and a
 payload that names an endpoint is refused unless the run asks for one, and the reverse.
 
@@ -185,4 +188,61 @@ The exec-time record (`endpoint-exec/record.json`, including the state-copy resu
 What this does not do: the daemon's port is reachable by any local process while the run lasts (the sandbox cannot pin a loopback bind; the
 listener proof is the control), the read-deny list is a deny list, system helpers such as `trustd` may still act on a process's behalf, and
 AppleEvents to a same-user process cannot be blocked by a sandbox profile, so the QA user must have no GUI session (see QA-HANDOFF.md).
-Unattended mode needs the helper reinstalled (protocol 2). The owner demo, as the QA user, is what proves it on the real account.
+Unattended mode needs the helper reinstalled (protocol 3; a helper that still answers protocol 2 is refused with "reinstall"). The owner demo,
+as the QA user, is what proves it on the real account.
+
+## Unix-socket contracts (`circinus-daemon/1`, SPE-155)
+
+The daemon serves its own Unix socket under its state directory and binds no port, so there is nothing to relay. The same order of proof
+applies, with these differences:
+
+- **Launch.** `daemon` names the payload's interpreter (for Circinus `bin/python3.13`). cae starts it as
+  `<daemon> -I -B -c "from circinus.cli import main; import sys; sys.exit(main())" daemon-run`. The bootstrap is a cae constant, never
+  payload text. The environment is exactly `HOME=<tmp>`, `XDG_CONFIG_HOME=<tmp>/config`, `XDG_STATE_HOME=<state>`, `TMPDIR=<tmp>` and cae's fixed
+  `PATH` and `DEVELOPER_DIR`. `XDG_RUNTIME_DIR` is not set, so the socket is `<state>/circinus/circinusd.sock`. The launch (argv plus
+  environment) is bound by `daemon_launch_sha256` beside `daemon_profile_sha256`.
+- **Profiles.** The Codex profile is the fornax one except that its `unix_sockets` table names only the daemon's socket. The daemon's
+  `sandbox-exec` profile is the fornax one without the two loopback-port lines: every TCP, UDP and DNS path stays denied, and a socket may be bound
+  only under the state directory. The controls drop the relay and port rows and add `neg_d_bind_loopback` and `neg_d_bind_tmp_socket` (both EPERM).
+- **Ready and proof.** The daemon is up when its socket node passes the path checks and a ping is answered. The ping is the product's exchange:
+  `{"event": "ping"}` plus a newline (18 bytes), then the client half-closes, then one JSON object line back, then the daemon closes. The proof, run by the helper
+  as the QA user outside every sandbox: every directory from the endpoint directory down is the QA user's at 0700, and the node is a socket of
+  the QA user at 0600 with one link. Then, on one connection and before a single byte is sent, the peer (`LOCAL_PEERPID`) is in the
+  daemon's process group with the QA uid (`LOCAL_PEERCRED`) and the node is still the inode seen before connect; only then is the ping sent,
+  and it must be answered with `ok: true` and a `mode` of `shadow` or `enforce`. The inode must be
+  unchanged afterwards, and neither the daemon's process group nor any process below it (found by parent pid) may hold an IPv4 or IPv6 socket (`lsof -g`, `lsof -p`). Each supervision poll repeats the
+  inode and inet checks. The full proof runs again as the last step before teardown (`socket_recheck`), and the producer requires both.
+- **Codex-side controls.** `pos_uds_daemon_ping` (the exact exchange with half-close, under the Codex seatbelt), `neg_write_endpoint_state`,
+  `neg_unlink_daemon_sock`, `neg_tcp_loopback`, plus the decoy, proxy, record-directory and daemon-tmp controls of the fornax set.
+  Tool commands and `needs_endpoint` self-tests get `QA_ENDPOINT_STATE`, `QA_ENDPOINT_SOCK` and `XDG_STATE_HOME=<state>`, so `circinus hook ...`
+  finds the socket the way it does in production. The state stays read-only to them: a hook client's own writes there fail, and that is expected
+  to be best-effort.
+- **Teardown.** The daemon's process group gets SIGTERM, a 10 s grace, then SIGKILL, and stragglers are reaped. Then the state is copied
+  (exec only; sockets are skipped). The steps are `daemon_stopped`, `socket_refuses` (a connect to the path is refused or finds nothing),
+  `sockets_gone` (a leftover socket node is unlinked and reported, not fatal) and `dir_removed`.
+
+**Seeding the state.** A contract with a seed directory (`circinus-daemon/1`: `state-seed`) has its listed `kind=data` files under
+`state-seed/<path>` copied by the helper, as the QA user, to `<state>/<path>`. This happens right after the state directory is created, before the
+profiles are proved and before the daemon starts. It is a convention, not a schema field: the files are listed in `files` like any other.
+
+Seed rules:
+- at most 6 components below the state, and at most 32 files of at most 256 KiB each and 1 MiB in all;
+- no target named `qa-probe`, `qa-probe.db` or `qa-probe.sock` (what the profile controls write), and none equal to the daemon's socket path;
+- every source is opened without following a link and re-hashed;
+- every target directory is created 0700 and every file exclusively at 0600, so nothing is overwritten;
+- the content is never interpreted.
+
+The rules are checked when the manifest is parsed (`prepare`, `qa-payload-manifest.py plan`) and again when the state is seeded. The record lists
+`seeded` (path and SHA-256 of each file), and the producer re-derives that list from the manifest it holds. Tool commands never seed:
+the state stays read-only to them (`neg_write_endpoint_state`).
+
+**Packaging a Circinus payload.**
+- **Interpreter.** The payload carries its own interpreter, because the trusted interpreter is Python 3.9 and nothing under `/Users` is
+  readable to the daemon except its state, tmp and the payload. For example: `bin/python3.13` (`kind=exec`, the `--endpoint-daemon`),
+  `lib/libpython3.13.dylib`, `lib/python313.zip`, and site-packages with the dependency zip and the extension-module directories.
+- **Modes.** The tree is read-only in the outbox (exec 0555, data 0444). That is enough: measured under the generated profile, a payload
+  extension module of mode 0444 or 0555 is loaded with `dlopen` and needs no extra rule.
+- **Limits.** The payload limits stay: 2000 files, 8 path components, 256 MiB, and a manifest of at most 64 KiB (roughly 550 entries).
+  Zip the library trees to fit.
+- **Building it.** `qa-payload-manifest.py plan --dir DIR --scope TEXT --endpoint-daemon bin/python3.13 --endpoint-contract circinus-daemon/1`
+  builds a `/2` manifest and checks the seed rules.

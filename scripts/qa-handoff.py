@@ -1433,10 +1433,14 @@ def expected_endpoint_profile_sha(ident, outbox, endpoint):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def verify_endpoint_record(record, endpoint, codex=True):
+def verify_endpoint_record(record, endpoint, codex=True, manifest=None, uid=None):
     """(view, problems): the producer's own judgment of the QA side's `endpoint` record. Every expected control must be present exactly
-    once and its result is recomputed from what was observed; the port proof must name loopback and one listener; teardown must be clean
-    (the relay's socket unlinked by the helper is reportable, not fatal). `established` is required but never sufficient."""
+    once and its result is recomputed from what was observed; the port proof must name loopback and one listener (tcp-relay), or both socket
+    proofs must show the producer's own socket path served by the daemon's process group as the QA uid `uid` (unix); teardown must be clean
+    (a socket unlinked by the helper is reportable, not fatal); a seeding contract's `seeded` must be what `manifest` lists. `established`
+    is required but never sufficient."""
+    if endpoint.transport == 'unix':
+        return verify_unix_endpoint_record(record, endpoint, codex, manifest, uid)
     problems = []
     if not isinstance(record, dict):
         return None, ['qa-stage did not report an endpoint record']
@@ -1459,7 +1463,7 @@ def verify_endpoint_record(record, endpoint, codex=True):
         return out
 
     profile_controls = judge(record.get('controls'), _SIDE.endpoint_control_expectations(endpoint), _SIDE.endpoint_result_ok, 'profile')
-    codex_controls = judge(record.get('codex_controls'), {n: e for n, _, e in _SIDE.ENDPOINT_CODEX_CONTROLS}, _SIDE.control_ok, 'codex') if codex else []
+    codex_controls = judge(record.get('codex_controls'), {n: e for n, _, e in _SIDE.endpoint_codex_controls(endpoint)}, _SIDE.control_ok, 'codex') if codex else []
     proof = record.get('port_proof')
     want_listener = ['127.0.0.1:%d' % endpoint.port]
     if not (isinstance(proof, dict) and proof.get('listeners') == want_listener and type(proof.get('daemon_pid')) is int and proof['daemon_pid'] > 1):
@@ -1492,6 +1496,96 @@ def verify_endpoint_record(record, endpoint, codex=True):
         problems.append('the endpoint was not established')
     view = {'port': endpoint.port, 'controls': profile_controls, 'codex_controls': codex_controls, 'port_proof': proof_view, 'teardown': teardown_view,
             **{key: want for key, want in _SIDE.endpoint_digests(endpoint).items() if record.get(key) == want}, 'derived_by': 'producer'}
+    return view, problems
+
+
+def judge_controls(rows, expected, ok_of, label, problems):
+    """[{control, expected, observed, ok}] recomputed from the observations: every expected control exactly once, nothing else."""
+    seen, out = set(), []
+    for row in rows if isinstance(rows, list) else []:
+        name, observed = (row.get('control'), row.get('observed')) if isinstance(row, dict) else (None, None)
+        if not isinstance(name, str) or name not in expected or name in seen or not isinstance(observed, str):
+            problems.append('%s: unknown, repeated or malformed control %s' % (label, clean(name, 40)))
+            continue
+        seen.add(name)
+        ok = ok_of(expected[name], observed)
+        out.append({'control': name, 'expected': expected[name], 'observed': clean(observed, 40), 'ok': ok})
+        if not ok:
+            problems.append('%s %s expected %s, observed %s' % (label, name, expected[name], clean(observed, 40)))
+    missing = sorted(set(expected) - seen)
+    if missing:
+        problems.append('%s controls missing: %s' % (label, ', '.join(missing[:6])))
+    return out
+
+
+def socket_proof_view(proof, endpoint, uid):
+    """The producer's bounded view of one unix socket proof, or None unless it shows exactly: this producer's socket path, a peer in the
+    daemon's process group (the daemon leads it: peer_pgid == daemon_pid > 1) running as the QA uid, mode 0600, a known ping mode, no inet
+    socket, a stable inode, and the same inode before and after connect (checked before the ping was sent)."""
+    def pid(value):
+        return type(value) is int and value > 1
+    if not (isinstance(proof, dict) and proof.get('socket') == str(endpoint.daemon_sock) and pid(proof.get('peer_pid')) and pid(proof.get('daemon_pid'))
+            and proof.get('peer_pgid') == proof['daemon_pid'] and type(proof.get('peer_pgid')) is int and type(proof.get('peer_uid')) is int
+            and proof['peer_uid'] == uid and proof.get('mode') == 0o600 and type(proof.get('mode')) is int and proof.get('ping_mode') in _SIDE.PING_MODES
+            and proof.get('inet') == [] and proof.get('inode_stable') is True and type(proof.get('inode_before_connect')) is int
+            and proof.get('inode_after_connect') == proof['inode_before_connect'] and type(proof.get('inode_after_connect')) is int):
+        return None
+    return {'socket': str(endpoint.daemon_sock), 'peer_pid': proof['peer_pid'], 'peer_pgid': proof['peer_pgid'], 'daemon_pid': proof['daemon_pid'],
+            'peer_uid': uid, 'mode': 0o600, 'ping_mode': proof['ping_mode'], 'inet': [], 'inode_stable': True,
+            'inode_before_connect': proof['inode_before_connect'], 'inode_after_connect': proof['inode_after_connect']}
+
+
+def verify_unix_endpoint_record(record, endpoint, codex, manifest, uid):
+    """verify_endpoint_record for a unix contract: no port, no relay. The socket was proved at start (`socket_proof`) and again as the last
+    step before teardown (`socket_recheck`), both against the same daemon; the launch digest is regenerated here like the profile's."""
+    problems = []
+    if not isinstance(record, dict):
+        return None, ['qa-stage did not report an endpoint record']
+    profile_controls = judge_controls(record.get('controls'), _SIDE.endpoint_control_expectations(endpoint), _SIDE.endpoint_result_ok, 'profile', problems)
+    codex_controls = (judge_controls(record.get('codex_controls'), {n: e for n, _, e in _SIDE.endpoint_codex_controls(endpoint)}, _SIDE.control_ok,
+                                     'codex', problems) if codex else [])
+    proof, recheck = socket_proof_view(record.get('socket_proof'), endpoint, uid), socket_proof_view(record.get('socket_recheck'), endpoint, uid)
+    if proof is None:
+        problems.append('the socket proof does not show the daemon\'s process group serving %s as the QA user' % endpoint.daemon_sock.name)
+    if recheck is None or (proof is not None and (recheck['daemon_pid'] != proof['daemon_pid'] or recheck['inode_before_connect'] != proof['inode_before_connect'])):
+        problems.append('the socket was not proved again, for the same daemon and the same socket inode, before the endpoint was torn down')
+        recheck = None
+    teardown = record.get('teardown')
+    steps = _SIDE.ENDPOINT_TEARDOWN_STEPS['unix']
+    if not (isinstance(teardown, dict) and teardown.get('clean') is True and teardown.get('descendants_left') == []
+            and teardown.get('not_ours') is False and all(teardown.get(step) is True for step in steps)):
+        problems.append('the endpoint was not torn down cleanly')
+    teardown_view = None
+    if isinstance(teardown, dict):
+        removed = teardown.get('socket_removed_by_helper')
+        teardown_view = {'clean': teardown.get('clean') is True, 'steps': {step: teardown.get(step) is True for step in steps},
+                         'socket_removed_by_helper': [clean(n, 40) for n in removed[:4] if isinstance(n, str)] if isinstance(removed, list) else []}
+    digests = _SIDE.endpoint_digests(endpoint)
+    for key, want in digests.items():          # the generated profile and the daemon's launch are the ones cae would generate
+        if record.get(key) != want:
+            problems.append('the endpoint record\'s %s is not the one this producer computes' % key)
+    seeded = None
+    if endpoint.spec.get('seed_dir'):
+        try:
+            seeded = _SIDE.seed_record(manifest)
+        except (_SIDE.PayloadError, TypeError, KeyError, AttributeError):
+            problems.append('the producer cannot derive the seed files from its manifest')
+        if seeded is not None and record.get('seeded') != seeded:
+            problems.append('the endpoint record does not show exactly the seed files the manifest lists')
+            seeded = None
+    reported = record.get('problems')
+    if reported is not None and not (isinstance(reported, list) and not reported):
+        text = '; '.join(clean(p, 80) for p in reported[:2] if isinstance(p, str)) if isinstance(reported, list) else 'malformed'
+        problems.append('the endpoint reported: ' + text)
+    if record.get('daemon_exited_early') or record.get('socket_proof_lost'):
+        problems.append('the endpoint stopped holding while it was in use')
+    if record.get('daemon_started') is not True:
+        problems.append('the record does not show the daemon started')
+    if record.get('established') is not True:
+        problems.append('the endpoint was not established')
+    view = {'transport': 'unix', 'socket': str(endpoint.daemon_sock), 'controls': profile_controls, 'codex_controls': codex_controls,
+            'socket_proof': proof, 'socket_recheck': recheck, 'teardown': teardown_view, 'seeded': seeded,
+            **{key: want for key, want in digests.items() if record.get(key) == want}, 'derived_by': 'producer'}
     return view, problems
 
 
@@ -1639,6 +1733,10 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload
             version = json.loads(text) if not problem else None
         except (ValueError, RecursionError):
             version = None
+        if isinstance(version, dict) and version.get('protocol') != _SIDE.PROTOCOL:
+            return write_result(run_dir, packet, 'QA_INCOMPLETE', ['the installed helper speaks protocol %s, this producer needs %d: reinstall it '
+                                                                   '(qa-hop-install.py plan, then apply); codex was not started'
+                                                                   % (clean(version.get('protocol'), 8), _SIDE.PROTOCOL)])
         if not (isinstance(version, dict) and version.get('protocol') == _SIDE.PROTOCOL
                 and version.get('helper_sha256') == helper['helper_sha256'] and version.get('codex_sha256') == helper['codex_sha256']
                 and version.get('codex_host_sha256') == helper['codex_host_sha256']):
@@ -1721,7 +1819,9 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload
     network, port, endpoint = packet.get('network', 'none'), 0, None
     stage_tail = list(tail)
     if network != 'none':
-        port = pick_port()
+        # A unix-socket contract binds no port; only a tcp-relay one needs a free port picked here.
+        spec = _SIDE.ENDPOINT_CONTRACTS.get(payload.manifest['endpoint']['contract'], {})
+        port = 0 if spec.get('transport') == 'unix' else pick_port()
         try:
             if port is None:
                 raise _SIDE.EndpointError('no free port in the endpoint range')
@@ -1780,7 +1880,7 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload
     endpoint_view, endpoint_selftests = None, None
     if endpoint is not None and established:
         endpoint_record = stage.get('endpoint')
-        endpoint_view, endpoint_problems = verify_endpoint_record(endpoint_record, endpoint)
+        endpoint_view, endpoint_problems = verify_endpoint_record(endpoint_record, endpoint, manifest=payload.manifest, uid=ident.uid)
         if profile_sha != expected_endpoint_profile_sha(ident, outbox, endpoint):
             endpoint_problems.append('the Codex profile digest is not the one this producer computes for the endpoint run')
         if endpoint_problems:
@@ -1920,7 +2020,7 @@ def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None, payload=N
         if payload is not None:
             extra['payload'] = seal_payload(fds[2], payload, ident.uid)
         if endpoint is not None:
-            extra['endpoint'] = seal_endpoint(fds[2], endpoint, ident.uid)
+            extra['endpoint'] = seal_endpoint(fds[2], endpoint, ident.uid, payload.manifest if payload is not None else None)
         extra['tree_problems'] = check_tree(outbox / 'source', manifest)
         names, truncated = untracked_created(outbox / 'source', manifest)
         extra['untracked'] = {'count': 'many' if truncated else len(names), 'sample': [clean(n, 80) for n in names[:10]]}
@@ -1934,7 +2034,7 @@ def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None, payload=N
             os.close(fd)
 
 
-def seal_endpoint(outbox_fd, endpoint, uid):
+def seal_endpoint(outbox_fd, endpoint, uid, manifest=None):
     """What the exec-time endpoint left in the outbox, judged by the producer through the opened outbox descriptor: endpoint-exec/record.json
     (QA-owned, single link) passes verify_endpoint_record's rules without the Codex-side controls (those ran at stage, against the same
     profile bytes), and the daemon's state must have been copied to endpoint-exec/state."""
@@ -1953,7 +2053,7 @@ def seal_endpoint(outbox_fd, endpoint, uid):
             record = None
         if record is None:
             return {'verified': False, 'problems': ['the endpoint record is missing or unreadable']}
-        view, problems = verify_endpoint_record(record, endpoint, codex=False)
+        view, problems = verify_endpoint_record(record, endpoint, codex=False, manifest=manifest, uid=uid)
         snapshot = (record.get('teardown') or {}).get('state_snapshot') if isinstance(record.get('teardown'), dict) else None
         if not (isinstance(snapshot, dict) and snapshot.get('copied') is True):
             problems.append('the daemon state was not kept in the outbox')
@@ -2593,7 +2693,9 @@ def build_parser():
     p.add_argument('--qa-notes')
     p.add_argument('--payload', metavar='DIR', help='a payload directory with a MANIFEST.json (cae-qa-payload/1; see docs/QA-PAYLOAD.md)')
     p.add_argument('--network', choices=('none', 'daemon-endpoint'), default='none',
-                   help='daemon-endpoint: the payload names a candidate daemon that cae runs outside Codex and exposes through two Unix sockets')
+                   help='daemon-endpoint: the payload names a candidate daemon that cae runs outside Codex; tool commands reach it only through '
+                        'Unix sockets (fornax-daemon/1: a relay to its loopback port plus its own socket; circinus-daemon/1: its own socket alone, '
+                        'no port)')
     p.add_argument('--root')
     r = sub.add_parser('run')
     r.add_argument('--run-dir', required=True)

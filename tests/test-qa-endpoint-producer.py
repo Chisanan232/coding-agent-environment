@@ -35,7 +35,7 @@ class Base(unittest.TestCase):
         self.record = {
             "established": True, "problems": [], "daemon_started": True, "relay_started": True,
             "controls": [{"control": n, "observed": good_observation(x)} for n, x in side.endpoint_control_expectations(e).items()],
-            "codex_controls": [{"control": n, "observed": good_observation(x)} for n, _, x in side.ENDPOINT_CODEX_CONTROLS],
+            "codex_controls": [{"control": n, "observed": good_observation(x)} for n, _, x in side.endpoint_codex_controls(e)],
             "port_proof": {"listeners": ["127.0.0.1:%d" % PORT], "daemon_pid": 42},
             "teardown": {"clean": True, "descendants_left": [], "not_ours": False, "socket_removed_by_helper": ["http.sock"], "relay_stopped": True,
                          "daemon_stopped": True, "port_closed": True, "sockets_gone": True, "dir_removed": True},
@@ -330,6 +330,145 @@ class EvaluateEndpointTests(Base):
         got = self.evaluate(exit_code=0, verdict_sha256=qa.safe_digest(self.run / "verdict.json"))
         self.assertEqual(got["state"], "QA_INVALID")
         self.assertTrue(any("daemon endpoint was not verified" in r for r in got["reasons"]), got["reasons"])
+
+
+UID = 530
+SEED_SHA = "e" * 64
+
+
+class UnixBase(unittest.TestCase):
+    """A complete circinus-daemon/1 record as the QA side writes it, and the manifest the producer holds (one seed file)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.ident = types.SimpleNamespace(home=Path("/Users/qa"), exchange=Path("/Users/Shared/qa-x"))
+        self.outbox = self.ident.exchange / "outbox" / "att"
+        self.manifest = {"files": [{"path": "bin/python3.13", "sha256": "a" * 64, "size": 1, "kind": "exec"},
+                                   {"path": "state-seed/circinus/mode.json", "sha256": SEED_SHA, "size": 5, "kind": "data"}],
+                         "endpoint": {"daemon": "bin/python3.13", "contract": "circinus-daemon/1"}}
+        self.endpoint = qa.endpoint_for(self.ident, "att", self.outbox, 0, self.manifest)
+        e = self.endpoint
+        proof = {"socket": str(e.daemon_sock), "peer_pid": 7001, "peer_pgid": 7000, "peer_uid": UID, "daemon_pid": 7000, "mode": 0o600,
+                 "ping_mode": "shadow", "inet": [], "inode_stable": True, "inode_before_connect": 812, "inode_after_connect": 812}
+        self.record = {
+            "established": True, "problems": [], "daemon_started": True, "transport": "unix", "port": 0,
+            "controls": [{"control": n, "observed": good_observation(x)} for n, x in side.endpoint_control_expectations(e).items()],
+            "codex_controls": [{"control": n, "observed": good_observation(x)} for n, _, x in side.endpoint_codex_controls(e)],
+            "socket_proof": proof, "socket_recheck": dict(proof), "seeded": [{"path": "circinus/mode.json", "sha256": SEED_SHA}],
+            "teardown": {"clean": True, "descendants_left": [], "not_ours": False, "socket_removed_by_helper": ["circinusd.sock"], "daemon_stopped": True,
+                         "socket_refuses": True, "sockets_gone": True, "dir_removed": True},
+            **side.endpoint_digests(e)}
+
+    def verify(self, record=None, **kw):
+        kw.setdefault("manifest", self.manifest)
+        kw.setdefault("uid", UID)
+        return qa.verify_endpoint_record(self.record if record is None else record, self.endpoint, **kw)
+
+
+class UnixVerifyTests(UnixBase):
+    def test_a_complete_unix_record_passes_and_the_view_is_the_producers(self):
+        view, problems = self.verify()
+        self.assertEqual(problems, [])
+        self.assertEqual(view["transport"], "unix")
+        self.assertEqual(view["socket_proof"]["peer_pgid"], 7000)
+        self.assertEqual(view["seeded"], [{"path": "circinus/mode.json", "sha256": SEED_SHA}])
+        self.assertEqual(set(side.endpoint_digests(self.endpoint)) - set(view), set())
+        self.assertNotIn("port_proof", view)
+
+    def test_the_unix_codex_controls_are_demanded(self):
+        record = copy.deepcopy(self.record)
+        record["codex_controls"] = [c for c in record["codex_controls"] if c["control"] != "neg_unlink_daemon_sock"]
+        self.assertTrue(any("neg_unlink_daemon_sock" in p for p in self.verify(record)[1]))
+        record = copy.deepcopy(self.record)
+        record["codex_controls"].append({"control": "pos_uds_relay_http", "observed": "ALLOWED"})      # a relay control means nothing here
+        self.assertTrue(self.verify(record)[1])
+
+    def test_every_socket_proof_defect_fails(self):
+        changes = [{"socket": "/elsewhere.sock"}, {"peer_pgid": 4242}, {"peer_pgid": True}, {"peer_uid": UID + 1}, {"mode": 0o644}, {"mode": 384.0},
+                   {"ping_mode": "open"}, {"inet": ["*:*"]}, {"inode_stable": False}, {"peer_pid": 1}, {"peer_pid": True}, {"daemon_pid": 1, "peer_pgid": 1},
+                   {"daemon_pid": "7000", "peer_pgid": "7000"}, {"inode_after_connect": 813}, {"inode_before_connect": None},
+                   {"inode_after_connect": True, "inode_before_connect": True}]
+        for key in ("socket_proof", "socket_recheck"):
+            for change in changes:
+                record = copy.deepcopy(self.record)
+                record[key].update(change)
+                self.assertTrue(self.verify(record)[1], (key, change))
+            for bad in (None, "x", []):
+                record = copy.deepcopy(self.record)
+                record[key] = bad
+                self.assertTrue(self.verify(record)[1], (key, bad))
+
+    def test_the_recheck_must_be_of_the_same_daemon(self):
+        record = copy.deepcopy(self.record)
+        record["socket_recheck"].update(daemon_pid=7100, peer_pgid=7100)
+        self.assertTrue(any("proved again" in p for p in self.verify(record)[1]))
+
+    def test_the_recheck_must_be_of_the_same_socket_inode(self):
+        record = copy.deepcopy(self.record)
+        record["socket_recheck"].update(inode_before_connect=record["socket_proof"]["inode_before_connect"] + 1,
+                                        inode_after_connect=record["socket_proof"]["inode_before_connect"] + 1)
+        self.assertTrue(any("proved again" in p for p in self.verify(record)[1]))
+
+    def test_the_uid_comes_from_the_producer_not_the_record(self):
+        self.assertTrue(self.verify(uid=None)[1])
+        self.assertTrue(self.verify(uid=UID + 1)[1])
+
+    def test_every_unix_teardown_step_must_hold_and_no_tcp_step_is_asked_for(self):
+        for step in side.ENDPOINT_TEARDOWN_STEPS["unix"]:
+            record = copy.deepcopy(self.record)
+            record["teardown"][step] = False
+            self.assertTrue(self.verify(record)[1], step)
+        self.assertNotIn("port_closed", self.record["teardown"])
+
+    def test_a_changed_launch_or_profile_digest_fails(self):
+        for key in ("daemon_profile_sha256", "daemon_launch_sha256"):
+            self.assertTrue(any(key in p for p in self.verify(dict(self.record, **{key: "0" * 64}))[1]), key)
+            self.assertTrue(any(key in p for p in self.verify({k: v for k, v in self.record.items() if k != key})[1]), key)
+
+    def test_the_seed_record_is_rederived_from_the_producers_manifest(self):
+        for seeded in ([], [{"path": "circinus/mode.json", "sha256": "0" * 64}], None, [{"path": "x", "sha256": SEED_SHA}]):
+            self.assertTrue(self.verify(dict(self.record, seeded=seeded))[1], seeded)
+        self.assertTrue(self.verify(manifest=None)[1])
+
+    def test_a_lost_socket_or_an_unstarted_daemon_fails(self):
+        for change in ({"socket_proof_lost": "the daemon socket was replaced"}, {"daemon_exited_early": True}, {"daemon_started": False},
+                       {"established": False}, {"problems": ["x"]}):
+            self.assertTrue(self.verify(dict(self.record, **change))[1], change)
+        self.assertTrue(qa.verify_endpoint_record(None, self.endpoint, manifest=self.manifest, uid=UID)[1])
+
+    def test_nothing_the_qa_side_sent_is_copied_into_the_view(self):
+        record = copy.deepcopy(self.record)
+        record["socket_proof"]["note"] = "x" * 5000
+        record["teardown"]["socket_removed_by_helper"] = ["y" * 5000, 7]
+        view, problems = self.verify(record)
+        self.assertEqual(problems, [])
+        self.assertNotIn("x" * 200, repr(view))
+        self.assertNotIn("y" * 200, repr(view))
+
+
+class UnixSealTests(UnixBase):
+    def test_the_exec_record_is_sealed_with_the_manifest_and_the_qa_uid(self):
+        import json
+        import os
+        box = self.root / "outbox"
+        sub = box / "endpoint-exec"
+        (sub / "state").mkdir(parents=True)
+        sub.chmod(0o700)
+        record = copy.deepcopy(self.record)
+        record.pop("codex_controls")
+        record["teardown"]["state_snapshot"] = {"copied": True, "bytes": 3, "error": None}
+        for proof in ("socket_proof", "socket_recheck"):
+            record[proof]["peer_uid"] = os.getuid()
+        (sub / "record.json").write_text(json.dumps(record))
+        fd = os.open(box, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            sealed = qa.seal_endpoint(fd, self.endpoint, os.getuid(), self.manifest)
+            self.assertTrue(sealed["verified"], sealed)
+            self.assertFalse(qa.seal_endpoint(fd, self.endpoint, os.getuid())["verified"])        # without the manifest the seed is unprovable
+        finally:
+            os.close(fd)
 
 
 if __name__ == "__main__":

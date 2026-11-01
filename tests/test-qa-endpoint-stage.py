@@ -20,7 +20,7 @@ class FakeLife:
     failing = None
     log = []
 
-    def __init__(self, endpoint, record_dir, ops=None):
+    def __init__(self, endpoint, record_dir, ops=None, manifest=None):
         self.record = {"port": endpoint.port, "controls": [], "problems": [], "teardown": None}
         FakeLife.log = []
 
@@ -38,8 +38,8 @@ class FakeLife:
     def start(self):
         self._step("start")
 
-    def supervise(self):
-        FakeLife.log.append("supervise")
+    def supervise(self, final=False):
+        FakeLife.log.append("supervise-final" if final else "supervise")
         return True
 
     def teardown(self):
@@ -76,7 +76,7 @@ class PhaseTests(unittest.TestCase):
 
     def test_the_order_is_prove_start_codex_controls_selftests_teardown(self):
         record = self.run_phase()
-        self.assertEqual(FakeLife.log, ["create", "prove_profiles", "start", "codex_controls", "supervise", "supervise", "teardown"])
+        self.assertEqual(FakeLife.log, ["create", "prove_profiles", "start", "codex_controls", "supervise", "supervise-final", "teardown"])
         self.assertTrue(record["established"])
         self.assertEqual(self.selftest_calls, 1)
 
@@ -110,7 +110,7 @@ class ControlWordingTests(unittest.TestCase):
             self.assertFalse(side.control_ok("DENIED_PROXY", observed), observed)
 
     def test_the_decoy_is_where_the_codex_profile_can_otherwise_write(self):
-        decoy = [c for c in side.ENDPOINT_CODEX_CONTROLS if c[0] == "neg_uds_decoy"][0]
+        decoy = [c for c in side.RELAY_CODEX_CONTROLS if c[0] == "neg_uds_decoy"][0]
         self.assertIn("chdir", decoy[1])          # a long attempt path never turns the refusal into ENAMETOOLONG
 
 
@@ -135,6 +135,95 @@ class SelftestEnvTests(unittest.TestCase):
         self.assertEqual(seen[1]["QA_ENDPOINT_HTTP_SOCK"], str(endpoint.relay_sock))
         self.assertEqual(seen[1]["QA_ENDPOINT_STATE"], str(endpoint.state))
         self.assertNotIn(str(endpoint.port), "".join(seen[1].values()))        # paths only, never the port
+
+
+class UnixPhaseTests(unittest.TestCase):
+    """circinus-daemon/1 (SPE-155) through the same phase: the lifecycle gets the manifest (it seeds the state from it), the final
+    supervision step is the full one, and a needs_endpoint test finds the socket through XDG_STATE_HOME."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix=".cae-st-", dir=str(Path.home()))
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.endpoint = side.Endpoint(self.root / "q", self.root / "x", "att", 0, "circinus-daemon/1", self.root / "x/o/payload",
+                                      self.root / "x/o/payload/bin/python3.13")
+
+    def test_the_lifecycle_is_given_the_manifest_and_ends_with_the_full_proof(self):
+        seen = {}
+
+        class Life(FakeLife):
+            def __init__(self, endpoint, record_dir, ops=None, manifest=None):
+                super().__init__(endpoint, record_dir, ops)
+                seen["manifest"] = manifest
+        manifest = {"selftests": [], "endpoint": {"daemon": "bin/python3.13", "contract": "circinus-daemon/1"}}
+        with mock.patch.object(side, "EndpointLifecycle", Life), mock.patch.object(side, "CANARY_ROOT", self.root / "canary"), \
+                mock.patch.object(side, "real_codex_home", lambda: self.root / ".codex"), mock.patch.object(side, "run_selftests", lambda *a, **k: []), \
+                mock.patch.object(side, "endpoint_codex_probe", lambda *a: ([], [])):
+            record = side.run_endpoint_phase(types.SimpleNamespace(codex_bin="codex"), self.root / "x/o", manifest, self.endpoint, {}, self.root / "h")
+        self.assertIs(seen["manifest"], manifest)
+        self.assertEqual(FakeLife.log[-2:], ["supervise-final", "teardown"])
+        self.assertTrue(record["established"])
+
+    def test_a_needs_endpoint_test_gets_the_socket_and_xdg_state_home_only(self):
+        (self.root / "x/o/payload").mkdir(parents=True)
+        (self.root / "x/o/tmp").mkdir()
+        tests = [{"id": "ep", "argv": ["bin/t"], "stdin": None, "timeout_s": 5, "max_output_bytes": 100, "needs_endpoint": True}]
+        seen = []
+
+        def popen(argv, **kw):
+            seen.append(kw["env"])
+            raise OSError("stop")
+        with mock.patch.object(side.subprocess, "Popen", popen):
+            side.run_selftests("codex", self.root / "x/o", {"selftests": tests}, {"PATH": "/usr/bin"}, self.endpoint)
+        self.assertEqual(seen[0], {"PATH": "/usr/bin", "QA_ENDPOINT_STATE": str(self.endpoint.state), "QA_ENDPOINT_SOCK": str(self.endpoint.daemon_sock),
+                                   "XDG_STATE_HOME": str(self.endpoint.state)})
+
+
+class UnixExecTests(unittest.TestCase):
+    """qa_exec around a unix endpoint, with the lifecycle and Codex as doubles: Codex gets the unix tool environment, and the step after
+    Codex returned is the FULL proof (socket_recheck), which the producer requires."""
+
+    def test_codex_gets_xdg_state_home_and_the_last_supervision_is_the_full_one(self):
+        import hashlib
+        import os
+        import signal
+        tmp = tempfile.TemporaryDirectory(prefix=".cae-ex-", dir=str(Path.home()))
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve()
+        outbox, home = root / "x/o", root / "q"
+        (outbox / "source").mkdir(parents=True)
+        (root / "ch").mkdir()
+        (root / "ch" / "config.toml").write_text("profile")
+        endpoint = side.Endpoint(home, root / "x", "att", 0, "circinus-daemon/1", outbox / "payload", outbox / "payload/bin/python3.13")
+        calls, envs = [], []
+        life = types.SimpleNamespace(supervise=lambda final=False: calls.append(final) or True, record={"problems": []})
+
+        class Proc:
+            pid = 99999
+
+            def wait(self, timeout=None):
+                return 0
+        args = types.SimpleNamespace(inbox=str(root / "x/i"), outbox=str(outbox), codex_home=str(root / "ch"), codex_bin="codex", timeout=60,
+                                     profile_sha256=hashlib.sha256(b"profile").hexdigest(), network="daemon-endpoint", qa_home=str(home))
+        saved = os.dup(2)
+        handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGALRM)}
+        try:
+            with mock.patch.object(side, "HOME", home), mock.patch.object(side, "real_codex_home", lambda: home / ".codex"), \
+                    mock.patch.object(side, "start_exec_endpoint", lambda a, o: (life, endpoint, root / "canary")), \
+                    mock.patch.object(side, "finish_exec_endpoint", lambda *a: calls.append("finish")), \
+                    mock.patch.object(side.subprocess, "Popen", lambda argv, **kw: envs.append(kw["env"]) or Proc()), \
+                    mock.patch.object(side.os, "killpg", lambda *a: None):
+                code = side.qa_exec(args, build_env=lambda: {"PATH": "/usr/bin"}, open_prompt=lambda: open(os.devnull, "rb"))
+        finally:
+            os.dup2(saved, 2)
+            os.close(saved)
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [True, "finish"])
+        self.assertEqual(envs[0]["XDG_STATE_HOME"], str(endpoint.state))
+        self.assertEqual(envs[0]["QA_ENDPOINT_SOCK"], str(endpoint.daemon_sock))
+        self.assertNotIn("QA_ENDPOINT_HTTP_SOCK", envs[0])
 
 
 if __name__ == "__main__":

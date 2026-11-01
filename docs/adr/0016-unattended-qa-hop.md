@@ -398,6 +398,82 @@ chooses the interpreter that runs every root-pinned Python script, including the
 - **Residual:** `qa-identity-setup.py` (the attended identity setup) and `qa-payload-manifest.py` still use `/usr/bin/python3`; they are outside the unattended helper's interpreter choice and are not run under the sudo delegation. ACLs are not visible to this Python check (the owner readback lists them with `ls -le`); a Command Line Tools update changes the path or
   tree and fails closed until the install is redone.
 
+## Addendum rev 4: a unix-socket endpoint contract (SPE-155)
+
+`circinus-daemon/1` is a daemon that serves its own Unix socket and binds no port. Contracts now carry a `transport`. `fornax-daemon/1` is
+`tcp-relay`, and its generated profiles, relay, digests, control tables, environments and records are byte-identical to `efd339d` (a test
+imports that revision and compares). `circinus-daemon/1` is `unix`:
+- no relay and no port;
+- one sandbox-exec profile, which is the fornax one without the loopback-port lines;
+- a Codex profile whose `unix_sockets` table names only the daemon's socket;
+- the state seeded from the payload's `state-seed/` files before the profile is proved.
+
+See docs/QA-PAYLOAD.md for the contract and the packaging rules.
+
+**The socket-ownership proof, and what was measured.** The design asked for `getsockopt(SOL_LOCAL=0, LOCAL_PEERPID=2)` to equal the daemon's pid.
+Measured on macOS 27 as uid 501, unsandboxed and under the generated `daemon.sb` via `sandbox-exec` (tests/test-qa-endpoint-unix-live.py). The
+stand-in is a `/usr/bin/python3` script speaking the Circinus ping protocol, and the daemon pid is the `sandbox-exec` pid, which execs the daemon.
+
+| Listener shape | LOCAL_PEERPID right after connect | after the daemon side did I/O | getpgid(peer) |
+|---|---|---|---|
+| leader binds, listens, accepts | daemon pid | daemon pid | daemon pid |
+| a child binds, listens, accepts | that child's pid | that child's pid | daemon pid |
+| leader binds and listens, a child accepts | daemon pid or the child's (varied between runs) | the child's pid | daemon pid |
+
+`LOCAL_PEERPID` names whichever process last did I/O on the listener or the accepted socket. It is not necessarily the process that created
+the socket, and not necessarily the group leader. Requiring it to equal the daemon's pid would fail a legitimate daemon that serves from a child.
+
+Decision:
+- **The proof is group membership.** `getpgid(peer) == daemon pid`, plus the peer's uid from `LOCAL_PEERCRED`. The daemon is started in its own
+  session, so it leads its process group, and it stays unreaped until teardown, so no other process can hold that group id. The record carries
+  `peer_pid`, `peer_pgid` and `daemon_pid`, and the producer demands `peer_pgid == daemon_pid > 1`.
+- **No lsof fallback.** The `lsof -U -Fpn` fallback in the design was not needed, because getsockopt answered in every shape.
+- **Inet check over the whole group.** `lsof -a -g<pgid> -i` replaces the design's per-pid form. It covers the whole group and also lists an
+  unbound IPv4/IPv6 socket (as `*:*`).
+- **Proved twice.** The full proof (path checks, peer, ping, inode, inet) runs at start and again as the last supervision step before teardown
+  (`socket_recheck`), and the producer requires both. A poll in between rechecks the inode and inet.
+- **Nothing is sent before the peer is known.** `connect()` on an AF_UNIX path follows links, and macOS has no descriptor-relative connect. A
+  daemon could swap `state/circinus` or the socket node for a link to another socket the QA user can reach, after the helper's lstat walk.
+  The helper would then talk to that socket as a confused deputy. So the helper first connects, then reads the peer's uid and process
+  group and walks the path with lstat again, which must give the same inode (recorded as `inode_before_connect` and
+  `inode_after_connect`). Only then does it send the ping. On any mismatch the connection is closed with no byte written. Readiness pings
+  use the same check. The two inode readings are not independent evidence: a daemon can point a link at another socket, let `connect()` resolve it, and put the
+  original node back before the second walk. The guarantee is the peer check (uid and process group), made on the connected socket; and because
+  `LOCAL_PEERPID` names the last process to do I/O on the socket and can name one that has exited, a daemon that forks until it gets that pid back
+  inside its own group could pass the guard for another listener of the QA user. The impact is one fixed 18-byte ping, of which only `ping_mode` is kept.
+- **What the peer and inet checks cannot see.** `LOCAL_PEERPID`, its process group and `lsof -g<pgid>` all miss a descendant that called
+  `setsid()` and holds the listener or an inet socket. The inet check therefore also asks `lsof -p` for every process below the daemon by
+  parent pid, which covers a `setpgid()` escape. A descendant that called `setsid()` and lost its parent is still missed. For such a process
+  the guarantees are elsewhere:
+  - the endpoint directory is exclusive and freshly created;
+  - `daemon.sb` has no IP rule at all in unix mode, and it is inherited by every descendant;
+  - the producer sweeps every process of the QA user before Codex starts and at the seal.
+- **lsof fails closed.** An answer counts as "no inet socket" only when lsof exits 1 with no output and no stderr. That was measured as its
+  answer when nothing matches, also for a pid that is gone. A warning, any other exit status, or a timeout fails the check. The timeout is
+  5 s, because the check runs on every 2 s supervision poll.
+- **Fornax supervision.** A fornax poll that raises `OSError` now also counts as a lost proof: it returns False and stops the relay and the
+  daemon, instead of raising. This is intentional, and a test pins it.
+
+dlopen: a payload extension module (a copy of a Command Line Tools 3.9 `lib-dynload` `.so`) at mode 0444 and at 0555 loads under the generated
+`daemon.sb` with no extra rule (`(allow default)` covers `file-map-executable`; reads are allowed in the payload subpath). No profile was widened.
+
+**Protocol 3 and the reinstall.**
+- **Protocol.** The unattended `read_request` now accepts port 0 for a daemon-endpoint request. Which contract applies is known only from the
+  manifest, so `Endpoint()` refuses the wrong pairing (0 for tcp-relay, a port for unix) at stage and at exec before anything starts.
+  `PROTOCOL` is 3, and the producer tells a helper that answers another protocol to reinstall. The installer pins no protocol: the producer's
+  `version` check is the only place it is compared.
+- **Reinstall.** Every change to `scripts/qa-side.py` changes the helper digest pinned in the sudoers drop-in, so the owner must reinstall
+  (`qa-hop-install.py plan`, then `apply`) after merging, before any `--unattended` run. Between the merge and the reinstall the producer
+  (repository copy) and the helper (installed copy) disagree. The protocol bump and the digest checks make that visible as `QA_INCOMPLETE`;
+  do not run unattended QA in that window. Changes to `qa-handoff.py`, `qa-payload-manifest.py`, docs or tests need no reinstall.
+
+**Still unmeasured.**
+- Whether the real Circinus interpreter (Python 3.13 with its own `libpython`, run as uid 530) starts under `daemon.sb`.
+- What its daemon and hook report with an empty or seeded state.
+- Whether a real `codex exec` tool command reaches the socket through `XDG_STATE_HOME`. The stand-in live test shows `codex sandbox -P` does.
+
+That is the owner's post-merge run as the QA user.
+
 ## Version history
 
 | Rev | Change |
@@ -405,3 +481,4 @@ chooses the interpreter that runs every root-pinned Python script, including the
 | 1 | Initial decision (SPE-153) |
 | 2 | Daemon endpoint addendum (SPE-145 PR-b) |
 | 3 | Helper interpreter pinned to the Command Line Tools binary (SPE-153) |
+| 4 | Unix-socket endpoint contract, measured LOCAL_PEERPID, protocol 3 (SPE-155) |

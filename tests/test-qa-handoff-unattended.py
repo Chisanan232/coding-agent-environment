@@ -672,7 +672,7 @@ class UnattendedEndpointTests(PayloadBase):
                 "controls": [{"control": n, "observed": {"ALLOWED": "ALLOWED", "REFUSED": "REFUSED"}.get(x, "DENIED:1")}
                              for n, x in SIDE.endpoint_control_expectations(endpoint).items()],
                 "codex_controls": [{"control": n, "observed": {"ALLOWED": "ALLOWED", "DENIED_PROXY": "DENIED_PROXY"}.get(x, "DENIED:1")}
-                                   for n, _, x in SIDE.ENDPOINT_CODEX_CONTROLS],
+                                   for n, _, x in SIDE.endpoint_codex_controls(endpoint)],
                 "port_proof": {"listeners": ["127.0.0.1:%d" % endpoint.port], "daemon_pid": 7},
                 "teardown": {"clean": True, "descendants_left": [], "not_ours": False, "relay_stopped": True, "daemon_stopped": True,
                              "port_closed": True, "sockets_gone": True, "dir_removed": True},
@@ -746,6 +746,74 @@ class UnattendedEndpointTests(PayloadBase):
             self.assertEqual(code, qa.EXIT["QA_INVALID"], label)
             self.assertEqual(finished, [], label)
             self.assertFalse((self.run_dir / "SELFTEST.json").exists(), label)
+
+class UnattendedUnixEndpointTests(UnattendedEndpointTests):
+    """The same run for a circinus-daemon/1 payload (SPE-155): no port is picked, the requests carry port 0, and the producer judges the
+    unix record (socket proofs, unix teardown, launch digest) for itself."""
+
+    def setUp(self):
+        super().setUp()
+        src = self.run_dir / "payload-src"
+        manifest = json.loads((src / "MANIFEST.json").read_text())
+        manifest["endpoint"]["contract"] = "circinus-daemon/1"
+        raw = json.dumps(manifest).encode()
+        (src / "MANIFEST.json").write_bytes(raw)
+        __import__("shutil").rmtree(self.run_dir / "payload")
+        fd = os.open(src, os.O_RDONLY | os.O_DIRECTORY)
+        SIDE.copy_payload(fd, str(self.run_dir / "payload"), SIDE.parse_manifest(raw), raw, SIDE.INBOX_MODES)
+        os.close(fd)
+        self.payload = qa.PayloadRun(SIDE.parse_manifest(raw), raw)
+        self.packet["payload"].update(manifest_sha256=self.payload.sha)
+        patch = unittest.mock.patch.object(qa, "pick_port", side_effect=AssertionError("a unix contract picks no port"))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def endpoint_record(self, endpoint):
+        proof = {"socket": str(endpoint.daemon_sock), "peer_pid": 7001, "peer_pgid": 7000, "peer_uid": QA.pw_uid, "daemon_pid": 7000, "mode": 0o600,
+                 "ping_mode": "shadow", "inet": [], "inode_stable": True, "inode_before_connect": 812, "inode_after_connect": 812}
+        record = super().endpoint_record(endpoint)
+        for key in ("relay_started", "port_proof"):
+            record.pop(key)
+        record.update(transport="unix", socket_proof=proof, socket_recheck=dict(proof), seeded=[],
+                      teardown={"clean": True, "descendants_left": [], "not_ours": False, "daemon_stopped": True, "socket_refuses": True,
+                                "sockets_gone": True, "dir_removed": True, "socket_removed_by_helper": ["circinusd.sock"]})
+        return record
+
+    def test_the_request_carries_network_and_a_port_in_range_and_the_budget_grows(self):
+        code, out, seen, finished = self.run_endpoint()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(finished, [1])
+        self.assertEqual((seen["request"]["network"], seen["request"]["port"]), ("daemon-endpoint", 0))
+        confinement = json.loads((self.run_dir / "CONFINEMENT.json").read_text())
+        self.assertTrue(confinement["established"], confinement)
+        self.assertEqual(confinement["endpoint"]["transport"], "unix")
+        self.assertEqual(confinement["endpoint"]["socket_proof"]["peer_pgid"], 7000)
+
+    def test_a_bad_endpoint_record_stops_before_the_self_test_gate_and_the_next_hop(self):
+        for label, change in (("teardown", lambda s, r: r["teardown"].update(socket_refuses=False)),
+                              ("peer", lambda s, r: r["socket_proof"].update(peer_pgid=4242)),
+                              ("recheck", lambda s, r: r.pop("socket_recheck")),
+                              ("control", lambda s, r: r["codex_controls"][0].update(observed="DENIED:NOPING"))):
+            self.setUp()
+            code, out, seen, finished = self.run_endpoint(change)
+            self.assertEqual(code, qa.EXIT["QA_INVALID"], label)
+            self.assertEqual(finished, [], label)
+
+
+class StaleProtocolTests(RunBase):
+    def test_a_helper_on_an_older_protocol_is_told_to_reinstall_and_nothing_else_runs(self):
+        def old(ident, verb, attempt, seconds):
+            self.calls.append((verb, attempt))
+            return json.dumps({"protocol": SIDE.PROTOCOL - 1, "helper_sha256": self.install_record["helper_sha256"],
+                               "codex_sha256": self.install_record["codex_sha256"], "codex_host_sha256": self.install_record["codex_host_sha256"]}), None
+        code, out, mocks = self.go(helper_hop=mock.patch.object(qa, "helper_hop", side_effect=old))
+        self.assertEqual(code, qa.EXIT["QA_INCOMPLETE"])
+        self.assertIn("speaks protocol %d" % (SIDE.PROTOCOL - 1), out)
+        self.assertIn("reinstall", out)
+        self.assertEqual(self.calls, [("version", None)])
+        mocks["sweep"].assert_not_called()
+        mocks["launch"].assert_not_called()
+
 
 class AttendedUnchangedTests(Case):
     def test_attended_mode_json_and_keepalive_are_untouched(self):

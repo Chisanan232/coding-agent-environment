@@ -2,7 +2,7 @@
 """Producer-side helper for QA payloads (SPE-145 part 9): generate and check payload/MANIFEST.json (cae-qa-payload/1).
 
   qa-payload-manifest.py plan   --dir DIR --scope TEXT [--producer-run PATH ...] [--selftests FILE] [--write]
-                                [--endpoint-daemon PATH --endpoint-contract ID]
+                                [--endpoint-daemon PATH --endpoint-contract fornax-daemon/1|circinus-daemon/1]
   qa-payload-manifest.py verify --dir DIR
 
 Unprivileged and offline. `plan` lists every regular file of DIR (except MANIFEST.json) with its SHA-256, size and kind (exec when
@@ -137,7 +137,8 @@ def main(argv=None):
     p.add_argument('--producer-run', action='append')
     p.add_argument('--selftests')
     p.add_argument('--endpoint-daemon', help='payload-relative path of the candidate daemon (a kind=exec file); makes a cae-qa-payload/2 manifest')
-    p.add_argument('--endpoint-contract', help='endpoint contract id, e.g. fornax-daemon/1')
+    p.add_argument('--endpoint-contract', help='endpoint contract id: fornax-daemon/1 (a loopback port behind a cae relay) or circinus-daemon/1 '
+                                               '(its own Unix socket, no port; files under state-seed/ seed its state)')
     p.add_argument('--write', action='store_true')
     v = sub.add_parser('verify')
     v.add_argument('--dir', required=True)
