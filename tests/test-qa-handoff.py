@@ -787,6 +787,27 @@ class VerdictTests(Base):
             self.assertIn(".git", out)
             self.assertFalse((self.fake_dir / "CANARY3").exists())
 
+    def test_the_qa_copy_of_an_executable_file_matches_the_producer_manifest(self):
+        """Regression: qa-side copies the clone under umask 077, so a 0755 tracked file arrives as 0700; the exec check must not
+        compare group/other bits, yet a lost or gained owner execute bit is still a change."""
+        import tempfile as tf
+        with tf.TemporaryDirectory() as d:
+            src = Path(d)
+            (src / ".git").mkdir()
+            (src / ".git/HEAD").write_text("ref: refs/heads/main\n")
+            for name, mode in (("tool.sh", 0o755), ("data.txt", 0o644)):
+                (src / name).write_text("x\n")
+                (src / name).chmod(mode)
+            manifest = {"__head__": "ref: refs/heads/main", "__control__": qa.git_control_digest(src),
+                        "files": {n: qa.hash_path(src / n) for n in ("tool.sh", "data.txt")}}
+            self.assertEqual(qa.check_tree(src, manifest), [])
+            (src / "tool.sh").chmod(0o700); (src / "data.txt").chmod(0o600)          # what the QA copy looks like
+            self.assertEqual(qa.check_tree(src, manifest), [])
+            (src / "tool.sh").chmod(0o600)                                          # exec bit lost
+            self.assertTrue(any("tool.sh" in p for p in qa.check_tree(src, manifest)))
+            (src / "tool.sh").chmod(0o700); (src / "data.txt").chmod(0o700)         # exec bit gained
+            self.assertTrue(any("data.txt" in p for p in qa.check_tree(src, manifest)))
+
     def test_control_digest_fails_closed(self):
         import tempfile as tf
         with tf.TemporaryDirectory() as d:
