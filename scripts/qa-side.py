@@ -2269,7 +2269,7 @@ print(json.dumps(out))
 # root-owned config or from a request file that is validated before a single path is derived. Any failure prints nothing
 # and exits non-zero; the producer maps that to QA_INCOMPLETE. This mode is not installed anywhere yet.
 # ---------------------------------------------------------------------------------------------------------------------
-PROTOCOL = 2                          # 2: stage and exec requests carry network and port
+PROTOCOL = 3                          # 2: stage and exec requests carry network and port; 3: a daemon-endpoint request may carry port 0
 ROOT_UID = 0                          # tests substitute the current uid to stand in for root; never read from argv or env
 CONFIG_PATH = '/Library/cae-qa/qa-side.json'
 CHILD_PATH = '/usr/bin:/bin:/usr/sbin:/sbin'
@@ -2483,7 +2483,9 @@ def read_request(config, verb, attempt, fds):
         _need(60 <= request['timeout'] <= 14400 and SHA256_RE.fullmatch(request['profile_sha256']) is not None)
     if verb in ('stage', 'exec'):
         _need(request['network'] in ('none', 'daemon-endpoint'))
-        _need(request['port'] == 0 if request['network'] == 'none' else PORT_RANGE[0] <= request['port'] <= PORT_RANGE[1])
+        # A daemon-endpoint run carries a port in the range (tcp-relay contract) or 0 (unix contract). Which contract it is shows only in the
+        # payload manifest, read later; Endpoint() then refuses the wrong pairing (0 for tcp-relay, any port for unix) before anything starts.
+        _need(request['port'] == 0 if request['network'] == 'none' else request['port'] == 0 or PORT_RANGE[0] <= request['port'] <= PORT_RANGE[1])
     if verb == 'exec':
         # An endpoint run binds the payload manifest and the generated daemon profile by digest (both computed by the producer from its
         # own values); a none run carries neither.

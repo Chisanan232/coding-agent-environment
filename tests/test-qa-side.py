@@ -493,20 +493,23 @@ class RequestTests(InstalledCase):
     def test_typed_ranges_stage_network_and_port(self):
         base = Tree.good_request("stage")
         bad = [dict(base, network="open"), dict(base, network=None), dict(base, network=1), dict(base, port=25000),
-               dict(base, network="daemon-endpoint"), dict(base, network="daemon-endpoint", port=19999),
+               dict(base, network="daemon-endpoint", port=19999), dict(base, network="daemon-endpoint", port=-1), dict(base, network="daemon-endpoint", port=1),
                dict(base, network="daemon-endpoint", port=32768), dict(base, network="daemon-endpoint", port="25000"),
                dict(base, network="daemon-endpoint", port=True), dict(base, network="daemon-endpoint", port=25000.0),
                {k: v for k, v in base.items() if k != "port"}, {k: v for k, v in base.items() if k != "network"}]
         for request in bad:
             t = self.tree(request=request, verb="stage")
             self.assertRefused(t, ["stage", ATTEMPT], json.dumps(request))
-        for edge in (20000, 32767):
+        for edge in (20000, 32767, 0):                  # 0: a unix-socket contract (protocol 3); Endpoint() enforces the pairing later
             t = self.tree(request=dict(base, network="daemon-endpoint", port=edge), verb="stage")
             self.assertEqual(self.dry(t, "stage")["verb"], "stage")
 
     def test_exec_endpoint_request_resolves_with_both_digests(self):
-        t = self.tree(request=dict(Tree.good_request("exec"), network="daemon-endpoint", port=25000, manifest_sha256=SHA, daemon_profile_sha256=SHA))
-        self.assertEqual(self.dry(t)["verb"], "exec")
+        for port in (25000, 0):
+            t = self.tree(request=dict(Tree.good_request("exec"), network="daemon-endpoint", port=port, manifest_sha256=SHA, daemon_profile_sha256=SHA))
+            self.assertEqual(self.dry(t)["verb"], "exec")
+        t = self.tree(request=dict(Tree.good_request("exec"), network="daemon-endpoint", port=0))           # port 0 still binds both digests
+        self.assertRefused(t, ["exec", ATTEMPT])
 
     def test_typed_ranges_probe(self):
         base = Tree.good_request("probe")
@@ -528,6 +531,7 @@ class RequestTests(InstalledCase):
         info = json.loads(out)
         self.assertEqual(set(info), {"protocol", "helper_sha256", "codex_sha256", "codex_host_sha256"})
         self.assertEqual(info["protocol"], side.PROTOCOL)
+        self.assertEqual(side.PROTOCOL, 3)                      # 3: a daemon-endpoint request may carry port 0 (SPE-155); a stale helper speaks 2
         self.assertEqual(info["codex_sha256"], t.digest)
         self.assertEqual(info["codex_host_sha256"], t.host_digest)
         self.assertEqual(info["helper_sha256"], hashlib.sha256(SIDE.read_bytes()).hexdigest())
@@ -1529,6 +1533,59 @@ class SeedPlanTests(unittest.TestCase):
                 side.parse_manifest(self.raw(m))
         ok = self.manifest([("state-seed/a/b/c/d/e/f", 5, "data")] + [("state-seed/g%d" % n, side.SEED_FILE_MAX, "data") for n in range(3)])
         self.assertEqual(len(side.seed_plan(ok)), 4)         # depth 6 and three full-size files (768 KiB) are inside the limits
+
+
+class PortPairingTests(unittest.TestCase):
+    """read_request lets a daemon-endpoint request carry port 0; the pairing with the contract is enforced where the manifest is known,
+    at stage (build_endpoint) and at exec (start_exec_endpoint), before anything starts."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix=".cae-pair-", dir=str(Path.home())))
+        self.addCleanup(self.remove, self.root)
+        self.outbox = self.root / "x" / "outbox" / "att"
+        (self.outbox / "tmp").mkdir(parents=True)
+
+    @staticmethod
+    def remove(path):
+        """The staged copy is 0555 like a real outbox payload: make it writable again, then remove it."""
+        for top, dirs, _ in os.walk(path):
+            for name in dirs:
+                os.chmod(os.path.join(top, name), 0o700)
+        if os.path.isdir(path):
+            os.chmod(path, 0o700)
+        shutil.rmtree(path, ignore_errors=True)
+
+    def staged(self, contract):
+        source = self.root / "src"
+        self.remove(source)
+        self.remove(self.outbox / "payload")
+        (source / "bin").mkdir(parents=True)
+        (source / "bin" / "d").write_bytes(b"#!/bin/sh\n")
+        manifest = {"schema": "cae-qa-payload/2", "files": [{"path": "bin/d", "sha256": hashlib.sha256(b"#!/bin/sh\n").hexdigest(), "size": 10,
+                                                             "kind": "exec"}], "selftests": [], "scope": "s", "producer_run": [],
+                    "endpoint": {"daemon": "bin/d", "contract": contract}}
+        raw = json.dumps(manifest).encode()
+        fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            side.copy_payload(fd, str(self.outbox / "payload"), side.parse_manifest(raw), raw, side.OUTBOX_MODES)
+        finally:
+            os.close(fd)
+        return side.parse_manifest(raw), raw
+
+    def args(self, port, raw):
+        import types
+        return types.SimpleNamespace(qa_home=str(self.root / "q"), exchange=str(self.root / "x"), attempt="att", port=port,
+                                     manifest_sha256=hashlib.sha256(raw).hexdigest(), daemon_profile_sha256="0" * 64)
+
+    def test_the_right_pairings_build_and_the_wrong_ones_are_refused_at_stage_and_at_exec(self):
+        for contract, good, bad in (("fornax-daemon/1", 25000, 0), ("circinus-daemon/1", 0, 25000)):
+            manifest, raw = self.staged(contract)
+            self.assertEqual(side.build_endpoint(self.args(good, raw), self.outbox, manifest).contract, contract)
+            with self.assertRaises(side.EndpointError, msg=contract):
+                side.build_endpoint(self.args(bad, raw), self.outbox, manifest)
+            with mock.patch.object(side, "EndpointLifecycle", side_effect=AssertionError("nothing may start")):
+                with self.assertRaises(side.EndpointError, msg=contract):
+                    side.start_exec_endpoint(self.args(bad, raw), self.outbox)
 
 
 class NetworkControlTests(unittest.TestCase):
