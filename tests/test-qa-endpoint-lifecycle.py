@@ -392,6 +392,14 @@ class StartTests(LifecycleBase):
         daemon = self.fakes.procs["daemon"]
         self.assertIn((daemon.pid, signal.SIGKILL), self.fakes.signals)                     # and a wildcard-bound daemon stops serving
 
+    def test_a_fornax_poll_that_raises_oserror_stops_the_endpoint(self):
+        """Intentional since SPE-155: an OSError in the ownership check is a lost proof (False, relay and daemon stopped), not a crash."""
+        self.life.start()
+        self.life.ops.listeners = lambda port: (_ for _ in ()).throw(OSError("lsof vanished"))
+        self.assertFalse(self.life.supervise())
+        self.assertIn("lsof vanished", self.life.record["port_proof_lost"])
+        self.assertIn((self.fakes.procs["daemon"].pid, signal.SIGKILL), self.fakes.signals)
+
     def test_a_port_that_does_not_accept_connections_fails(self):
         self.fakes.connect_after_start = 61
         with self.assertRaises(side.EndpointFailed):
