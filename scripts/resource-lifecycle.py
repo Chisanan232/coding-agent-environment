@@ -73,7 +73,7 @@ def default_consumers(tmp=None):
     tmp = Path(tmp or os.environ.get('TMPDIR') or '/tmp')
     dev = d / 'Bryant-Developments'
     spec = [
-        ('cargo_target', [str(d / '.cargo/shared-target'), str(d / '.cargo/nda-targets'), str(d / '.cargo/isolated-target*'),
+        ('cargo_target', [str(d / '.cargo/shared-target'), str(d / '.cargo/nda-targets/*'), str(d / '.cargo/isolated-target*'),
                           str(d / '.cargo/isolated-targets/*'), str(d / 'aaasm-campaign-*'), str(d / '*-target-*'),
                           str(dev / '.cargo-target*'), str(dev / '.cargo-targets/*'), str(dev / '.*-target')]),
         ('package_cache', [str(dev / '.pnpm-store'), str(d / 'Library/pnpm'), str(d / '.npm'), str(d / '.cache/uv'),

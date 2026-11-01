@@ -275,6 +275,18 @@ class ApplyTests(Fixture):
         self.assertEqual(code, 0)
         return next(out.glob("manifest-%s-*.json" % cls)), out
 
+    def test_nda_targets_are_discovered_per_ticket_child_not_as_one_root(self):
+        # One root hid every per-ticket cache behind a sibling's evidence-named directory (SPE-111): a child can only be reclaimed if it is a root.
+        home = self.root / "home"
+        (home / ".cargo/nda-targets/horo2082-redacted-export-core").mkdir(parents=True)
+        (home / ".cargo/nda-targets/horo2082-evidence-drilldown").mkdir(parents=True)
+        self.patch(rl, "HOME", home)
+        spec = dict(rl.default_consumers(self.root))["cargo_target"]
+        found = {hit for kind, hit, _ in rl.discover([("cargo_target", spec)])}
+        self.assertIn(str(home / ".cargo/nda-targets/horo2082-redacted-export-core"), found)
+        self.assertIn(str(home / ".cargo/nda-targets/horo2082-evidence-drilldown"), found)
+        self.assertNotIn(str(home / ".cargo/nda-targets"), found)
+
     def test_inventory_refuses_to_start_on_a_busy_host(self):
         self.patch(rl.os, "getloadavg", lambda: (10_000.0, 0, 0))
         out = self.root / "state"
