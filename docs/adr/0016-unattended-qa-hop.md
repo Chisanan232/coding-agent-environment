@@ -362,7 +362,7 @@ change. The design that meets it:
 - **The tool host is part of the pin.** `codex exec` starts `codex-code-mode-host` from next to its own binary and has no tool commands without it ("Code Mode is unavailable", measured). It is pinned beside the binary, its digest is in `qa-side.json`, and the helper and the producer verify it on every run. A model-free check cannot prove that a tool command runs (only a model asks for one); `tests/test-qa-endpoint-exec-model-live.py` is the one-call proof, and the owner demo repeats it as the QA user: one trivial `codex exec` whose command prints a value.
 - **Accepted residuals, disclosed:** the port is reachable by any local process during the run; the read-deny list is a deny list; `trustd` and similar
   helpers may still act for a process; AppleEvents to a same-uid process cannot be blocked by any profile (measured), so the QA user must have no GUI
-  session, which the owner demo must show (`osascript` against System Events and Finder, `do shell script`, a pid-targeted event). Nothing here is
+  session, which the owner demo must show (`osascript` against System Events and Finder, and a `tell application` that would start one; no application of that user may be running afterwards). Nothing here is
   proven for the real account until that demo.
 
 ## Version history
