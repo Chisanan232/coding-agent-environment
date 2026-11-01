@@ -954,7 +954,7 @@ def manifest_sha256(raw):
 
 
 def parse_manifest(raw):
-    """Validate the raw bytes of MANIFEST.json against the cae-qa-payload/1 rules (exact key sets, caps, listed files only) and
+    """Validate the raw bytes of MANIFEST.json against the cae-qa-payload/1 and /2 rules (exact key sets, caps, listed files only) and
     return the parsed document. Raises PayloadError naming the first rule broken."""
     _check(isinstance(raw, bytes) and 0 < len(raw) <= MANIFEST_MAX, 'MANIFEST.json is empty or larger than 64 KiB')
     try:
