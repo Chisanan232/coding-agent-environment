@@ -179,5 +179,52 @@ class UnixPhaseTests(unittest.TestCase):
                                    "XDG_STATE_HOME": str(self.endpoint.state)})
 
 
+class UnixExecTests(unittest.TestCase):
+    """qa_exec around a unix endpoint, with the lifecycle and Codex as doubles: Codex gets the unix tool environment, and the step after
+    Codex returned is the FULL proof (socket_recheck), which the producer requires."""
+
+    def test_codex_gets_xdg_state_home_and_the_last_supervision_is_the_full_one(self):
+        import hashlib
+        import os
+        import signal
+        tmp = tempfile.TemporaryDirectory(prefix=".cae-ex-", dir=str(Path.home()))
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve()
+        outbox, home = root / "x/o", root / "q"
+        (outbox / "source").mkdir(parents=True)
+        (root / "ch").mkdir()
+        (root / "ch" / "config.toml").write_text("profile")
+        endpoint = side.Endpoint(home, root / "x", "att", 0, "circinus-daemon/1", outbox / "payload", outbox / "payload/bin/python3.13")
+        calls, envs = [], []
+        life = types.SimpleNamespace(supervise=lambda final=False: calls.append(final) or True, record={"problems": []})
+
+        class Proc:
+            pid = 99999
+
+            def wait(self, timeout=None):
+                return 0
+        args = types.SimpleNamespace(inbox=str(root / "x/i"), outbox=str(outbox), codex_home=str(root / "ch"), codex_bin="codex", timeout=60,
+                                     profile_sha256=hashlib.sha256(b"profile").hexdigest(), network="daemon-endpoint", qa_home=str(home))
+        saved = os.dup(2)
+        handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGALRM)}
+        try:
+            with mock.patch.object(side, "HOME", home), mock.patch.object(side, "real_codex_home", lambda: home / ".codex"), \
+                    mock.patch.object(side, "start_exec_endpoint", lambda a, o: (life, endpoint, root / "canary")), \
+                    mock.patch.object(side, "finish_exec_endpoint", lambda *a: calls.append("finish")), \
+                    mock.patch.object(side.subprocess, "Popen", lambda argv, **kw: envs.append(kw["env"]) or Proc()), \
+                    mock.patch.object(side.os, "killpg", lambda *a: None):
+                code = side.qa_exec(args, build_env=lambda: {"PATH": "/usr/bin"}, open_prompt=lambda: open(os.devnull, "rb"))
+        finally:
+            os.dup2(saved, 2)
+            os.close(saved)
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [True, "finish"])
+        self.assertEqual(envs[0]["XDG_STATE_HOME"], str(endpoint.state))
+        self.assertEqual(envs[0]["QA_ENDPOINT_SOCK"], str(endpoint.daemon_sock))
+        self.assertNotIn("QA_ENDPOINT_HTTP_SOCK", envs[0])
+
+
 if __name__ == "__main__":
     unittest.main()
