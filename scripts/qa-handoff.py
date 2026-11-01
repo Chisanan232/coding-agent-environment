@@ -1039,6 +1039,8 @@ def unattended_install(ident, config_path=None, helper_path=None, anchor='/', pr
         config = side.read_config(config_path, anchor)
         side.trusted_chain(helper_path, anchor)
         side.trusted_chain(config['codex_path'], anchor)
+        host_path = os.path.join(os.path.dirname(config['codex_path']), side.CODEX_HOST_NAME)
+        side.trusted_chain(host_path, anchor)
         problems = []
         if config['qa_name'] != ident.name or config['qa_uid'] != ident.uid:
             problems.append('qa-side.json names another QA identity')
@@ -1049,12 +1051,15 @@ def unattended_install(ident, config_path=None, helper_path=None, anchor='/', pr
         helper_sha, codex_sha = sha256_file(helper_path), sha256_file(config['codex_path'])
         if codex_sha != config['codex_sha256']:
             problems.append('the pinned Codex does not match its recorded digest')
+        host_sha = sha256_file(host_path)
+        if host_sha != config['codex_host_sha256']:
+            problems.append('the pinned Codex tool host does not match its recorded digest')
     except Exception as error:      # Refuse carries no message by design; an OSError message could name a path, keep the type
         return None, ['the installed delegation failed verification (%s)' % type(error).__name__]
     if problems:
         return None, problems
     return {'helper_path': helper_path, 'helper_sha256': helper_sha, 'codex_path': config['codex_path'],
-            'codex_sha256': codex_sha}, []
+            'codex_sha256': codex_sha, 'codex_host_sha256': host_sha}, []
 
 
 def helper_argv(ident, verb, attempt=None, helper_path=None):
@@ -1626,7 +1631,8 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload
         except (ValueError, RecursionError):
             version = None
         if not (isinstance(version, dict) and version.get('protocol') == _SIDE.PROTOCOL
-                and version.get('helper_sha256') == helper['helper_sha256'] and version.get('codex_sha256') == helper['codex_sha256']):
+                and version.get('helper_sha256') == helper['helper_sha256'] and version.get('codex_sha256') == helper['codex_sha256']
+                and version.get('codex_host_sha256') == helper['codex_host_sha256']):
             return write_result(run_dir, packet, 'QA_INCOMPLETE', ['the delegated helper did not answer `version` with the verified '
                                                                    'digests (%s); codex was not started' % (problem or 'mismatch')])
     # Hop 0/1 output is trusted only because no model has run yet; a QA-user process left by an earlier run killed
@@ -1825,7 +1831,7 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload
             'require_env_isolation': bool(getattr(args, 'require_env_isolation', False)), 'profile_sha256': profile_sha}
     if unattended:
         info.update({'mode': 'unattended', 'helper_path': helper['helper_path'], 'helper_sha256': helper['helper_sha256'],
-                     'codex_path': helper['codex_path'], 'codex_sha256': helper['codex_sha256']})
+                     'codex_path': helper['codex_path'], 'codex_sha256': helper['codex_sha256'], 'codex_host_sha256': helper['codex_host_sha256']})
     if payload is not None:
         info['payload'] = {'manifest_sha256': payload.sha}
     seal_extra = {'payload': payload} if payload is not None else {}

@@ -195,6 +195,7 @@ the producer also maps to `QA_INCOMPLETE`. As implemented, the order is argv sha
 | `/Library/cae-qa/qa-side` | root:wheel | 0555 | `scripts/qa-side.py`, first line `#!/usr/bin/python3 -I` |
 | `/Library/cae-qa/qa-side.json` | root:wheel | 0444 | digests and ids, no secret |
 | `/Library/cae-qa/codex` | root:wheel | 0555 | pinned copy of the Codex binary (about 300 MB) |
+| `/Library/cae-qa/codex-code-mode-host` | root:wheel | 0555 | pinned copy of the tool host Codex starts from next to its own binary (about 65 MB); its digest is in `qa-side.json` |
 | `X` exchange | root | 0711 | unchanged (qa-identity-setup.py) |
 | `X/inbox` | producer | 0700 + read ACE for the QA user | unchanged |
 | `X/outbox` | QA user | 0700 + ACE for the producer | unchanged |

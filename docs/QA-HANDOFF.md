@@ -171,10 +171,10 @@ AppleEvents are a second gap. A sandboxed process can still send an AppleEvent t
 **Installing the delegation (a root-owned copy, then one root command).** `scripts/qa-hop-install.py` is the installer of ADR 0016.
 `plan` is read-only and unprivileged; it prints the exact text below with your values filled in, runs `visudo -c -f` on the
 rendered drop-in, and changes nothing. There is no flag, variable or prefix that moves its paths, and nothing is downloaded: the
-Codex binary to pin (a Mach-O file; a launcher script is refused) and its SHA-256 are explicit arguments (decision D1, about 300 MB).
+Codex binary to pin (a Mach-O file; a launcher script is refused) and its SHA-256 are explicit arguments (decision D1, about 300 MB), and so are the `codex-code-mode-host` binary from the same release (about 65 MB; `codex exec` starts it from next to its own binary and has no tool commands without it, measured with 0.163.0) and its SHA-256.
 
 ```
-python3 -I -B scripts/qa-hop-install.py plan --qa-name NAME --qa-uid UID --codex-source /path/to/codex --codex-sha256 HEX
+python3 -I -B scripts/qa-hop-install.py plan --qa-name NAME --qa-uid UID --codex-source /path/to/codex --codex-sha256 HEX --codex-host-source /path/to/codex-code-mode-host --codex-host-sha256 HEX
 ```
 
 Root must not run code that a less-privileged user can change, so the installer refuses unless it, `qa-identity-setup.py`,
@@ -222,7 +222,7 @@ the digests are the ones `plan` printed:
 
 ```
 sudo /usr/bin/python3 -I -B /Library/cae-qa-install/qa-hop-install.py apply --qa-name NAME --qa-uid UID \
-     --codex-source /path/to/codex --codex-sha256 HEX --bundle-sha256 HEX --helper-sha256 HEX
+     --codex-source /path/to/codex --codex-sha256 HEX --codex-host-source /path/to/codex-code-mode-host --codex-host-sha256 HEX --bundle-sha256 HEX --helper-sha256 HEX
 ```
 
 (`-B` and `sys.dont_write_bytecode` keep root from writing `__pycache__` anywhere.) Known and accepted: `qa-handoff.py` reads `qa-side.py` a second time on its own when the installer executes it (defence in depth, not the pin: the installer's trust check, root-owned and link-free, is what keeps the two reads equal). In order, `apply`: refuses unless it is root with
