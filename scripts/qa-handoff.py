@@ -213,7 +213,10 @@ def hash_path(full):
     try:
         if os.path.islink(full):
             return ['link', os.readlink(full)]
-        return ['file', sha256_file(full), os.lstat(full).st_mode & 0o111]
+        # Only the owner's execute bit: the QA user's copy is made under umask 077 (qa-side copy_tree_at), so an executable tracked
+        # file arrives as 0o700 and the group/other execute bits of the producer's clone can never match. Whether a file is
+        # executable still has to match.
+        return ['file', sha256_file(full), os.lstat(full).st_mode & 0o100]
     except OSError:
         return ['missing', '']
 
