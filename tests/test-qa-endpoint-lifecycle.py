@@ -9,6 +9,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
@@ -491,6 +492,99 @@ class TeardownTests(LifecycleBase):
         logged = [e[0] for e in self.fakes.log]
         self.assertIn("close_canary", logged)
         self.assertIn("close_decoy", logged)
+
+
+class StateSnapshotTests(LifecycleBase):
+    """The copy of the daemon's state runs as the QA user without the daemon's sandbox, so it follows nothing."""
+
+    def setUp(self):
+        super().setUp()
+        self.life.create()
+        self.dst = self.record_dir / "state-copy"
+
+    def snapshot(self):
+        return self.life._snapshot_state(self.dst)
+
+    def test_regular_files_and_directories_are_copied_and_the_socket_is_skipped(self):
+        import socket as sk
+        state = self.endpoint.state
+        (state / "a.db").write_bytes(b"rows")
+        (state / "sub").mkdir()
+        (state / "sub" / "b.log").write_bytes(b"log")
+        server = sk.socket(sk.AF_UNIX)
+        cwd = os.getcwd()
+        os.chdir(state)
+        try:
+            server.bind("fornax.sock")
+        finally:
+            os.chdir(cwd)
+            self.addCleanup(server.close)
+        got = self.snapshot()
+        self.assertTrue(got["copied"], got)
+        self.assertEqual(got["bytes"], 7)
+        self.assertEqual((self.dst / "a.db").read_bytes(), b"rows")
+        self.assertEqual((self.dst / "sub" / "b.log").read_bytes(), b"log")
+        self.assertFalse((self.dst / "fornax.sock").exists())
+
+    def test_a_hard_link_or_a_symlink_is_never_followed_and_fails_the_snapshot(self):
+        outside = self.home / "secret.txt"
+        outside.write_text("do not copy")
+        os.link(outside, self.endpoint.state / "linked")
+        os.symlink(outside, self.endpoint.state / "sym")
+        (self.endpoint.state / "ok").write_text("fine")
+        got = self.snapshot()
+        self.assertFalse(got["copied"], got)
+        self.assertEqual(sorted(got["refused"]), ["linked", "sym"])
+        self.assertFalse((self.dst / "linked").exists())
+        self.assertFalse((self.dst / "sym").exists())
+        self.assertEqual((self.dst / "ok").read_text(), "fine")
+
+    def test_a_fifo_is_refused_and_the_size_limit_is_enforced_while_copying(self):
+        os.mkfifo(self.endpoint.state / "fifo")
+        self.assertIn("fifo", self.snapshot()["refused"])
+        (self.endpoint.state / "fifo").unlink()
+        __import__("shutil").rmtree(self.dst)
+        (self.endpoint.state / "big").write_bytes(b"x" * 100)
+        with mock.patch.object(side, "SNAPSHOT_MAX_BYTES", 50):
+            got = self.snapshot()
+        self.assertFalse(got["copied"])
+        self.assertIn("limit", got["error"])
+
+    def test_a_flood_of_tiny_files_is_stopped_by_the_entry_cap(self):
+        for n in range(30):
+            (self.endpoint.state / ("f%d" % n)).write_text("")
+        with mock.patch.object(side, "SNAPSHOT_MAX_ENTRIES", 10):
+            got = self.snapshot()
+        self.assertFalse(got["copied"])
+        self.assertIn("limit", got["error"])
+
+    def test_a_socket_is_named_as_skipped_not_silently_dropped(self):
+        import socket as sk
+        server = sk.socket(sk.AF_UNIX)
+        cwd = os.getcwd()
+        os.chdir(self.endpoint.state)
+        try:
+            server.bind("other.sock")
+        finally:
+            os.chdir(cwd)
+            self.addCleanup(server.close)
+        got = self.snapshot()
+        self.assertEqual(got["skipped_sockets"], ["other.sock"])
+
+    def test_no_snapshot_is_taken_while_a_process_of_the_endpoint_is_still_running(self):
+        (self.endpoint.state / "kept").write_text("x")
+        with mock.patch.object(side.EndpointLifecycle, "_reap_stragglers", lambda self, before: [4242]):
+            steps = self.life.teardown(snapshot=self.dst)
+        self.assertFalse(steps["state_snapshot"]["copied"])
+        self.assertFalse(self.dst.exists())
+
+    def test_teardown_with_a_snapshot_reports_it_and_never_for_a_directory_it_does_not_own(self):
+        (self.endpoint.state / "kept").write_text("x")
+        steps = self.life.teardown(snapshot=self.dst)
+        self.assertTrue(steps["state_snapshot"]["copied"], steps)
+        self.assertEqual((self.dst / "kept").read_text(), "x")
+        other = side.EndpointLifecycle(self.endpoint, self.record_dir, self.fakes.ops())
+        self.assertNotIn("state_snapshot", other.teardown(snapshot=self.home / "x-copy"))
 
 
 class FailedStartCleanupTests(LifecycleBase):

@@ -666,8 +666,8 @@ def run(args):
         return refuse('this run directory carries a payload; payload runs need --qa-identity (the self-tests run as the QA user)')
     if packet.get('network', 'none') not in ('none', 'daemon-endpoint'):
         return refuse('the packet names an unknown network mode')
-    if packet.get('network') == 'daemon-endpoint' and not getattr(args, 'no_model', False):
-        return refuse('a daemon-endpoint run stops before the model for now (its exec-time endpoint is not built): add --no-model')
+    if packet.get('network', 'none') != 'none' and ident is None:
+        return refuse('a daemon-endpoint run needs --qa-identity')
     if run_dir.is_dir():
         write_private(run_dir / 'MODE.json', mode)    # one mode per run directory; recorded in RESULT.json too
     source = run_dir / 'source'
@@ -1423,7 +1423,7 @@ def expected_endpoint_profile_sha(ident, outbox, endpoint):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def verify_endpoint_record(record, endpoint):
+def verify_endpoint_record(record, endpoint, codex=True):
     """(view, problems): the producer's own judgment of the QA side's `endpoint` record. Every expected control must be present exactly
     once and its result is recomputed from what was observed; the port proof must name loopback and one listener; teardown must be clean
     (the relay's socket unlinked by the helper is reportable, not fatal). `established` is required but never sufficient."""
@@ -1449,7 +1449,7 @@ def verify_endpoint_record(record, endpoint):
         return out
 
     profile_controls = judge(record.get('controls'), _SIDE.endpoint_control_expectations(endpoint), _SIDE.endpoint_result_ok, 'profile')
-    codex_controls = judge(record.get('codex_controls'), {n: e for n, _, e in _SIDE.ENDPOINT_CODEX_CONTROLS}, _SIDE.control_ok, 'codex')
+    codex_controls = judge(record.get('codex_controls'), {n: e for n, _, e in _SIDE.ENDPOINT_CODEX_CONTROLS}, _SIDE.control_ok, 'codex') if codex else []
     proof = record.get('port_proof')
     want_listener = ['127.0.0.1:%d' % endpoint.port]
     if not (isinstance(proof, dict) and proof.get('listeners') == want_listener and type(proof.get('daemon_pid')) is int and proof['daemon_pid'] > 1):
@@ -1474,6 +1474,10 @@ def verify_endpoint_record(record, endpoint):
     if reported is not None and not (isinstance(reported, list) and not reported):
         text = '; '.join(clean(p, 80) for p in reported[:2] if isinstance(p, str)) if isinstance(reported, list) else 'malformed'
         problems.append('the endpoint reported: ' + text)
+    if record.get('daemon_exited_early') or record.get('port_proof_lost'):
+        problems.append('the endpoint stopped holding while it was in use')
+    if record.get('daemon_started') is not True or record.get('relay_started') is not True:
+        problems.append('the record does not show both the daemon and the relay started')
     if record.get('established') is not True:
         problems.append('the endpoint was not established')
     view = {'port': endpoint.port, 'controls': profile_controls, 'codex_controls': codex_controls, 'port_proof': proof_view, 'teardown': teardown_view,
@@ -1809,11 +1813,17 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload
     no_model = bool(getattr(args, 'no_model', False))
     if not no_model:
         if unattended:
-            write_request(inbox, {'verb': 'exec', 'attempt': attempt, 'timeout': args.timeout, 'profile_sha256': profile_sha, 'network': 'none', 'port': 0})
+            write_request(inbox, {'verb': 'exec', 'attempt': attempt, 'timeout': args.timeout, 'profile_sha256': profile_sha, 'network': network, 'port': port,
+                                  'manifest_sha256': payload.sha if endpoint is not None else '',
+                                  'daemon_profile_sha256': _SIDE.endpoint_digests(endpoint)['daemon_profile_sha256'] if endpoint is not None else ''})
             argv = helper_argv(ident, 'exec', attempt)
         else:
-            argv = qis.qa_argv(ident.name, ident.home, [qis.PY, '-I', str(script), 'qa-exec'] + tail
-                               + ['--timeout', str(args.timeout), '--profile-sha256', profile_sha], alarm=alarm)
+            exec_tail = ['--timeout', str(args.timeout), '--profile-sha256', profile_sha]
+            if endpoint is not None:
+                exec_tail += ['--network', network, '--port', str(port), '--qa-home', str(ident.home), '--exchange', str(ident.exchange),
+                              '--attempt', attempt, '--manifest-sha256', payload.sha,
+                              '--daemon-profile-sha256', _SIDE.endpoint_digests(endpoint)['daemon_profile_sha256']]
+            argv = qis.qa_argv(ident.name, ident.home, [qis.PY, '-I', str(script), 'qa-exec'] + tail + exec_tail, alarm=alarm)
     manifest = read_run_json(run_dir / 'tree-manifest.json')
     info = {'name': ident.name, 'uid': ident.uid, 'exchange': str(ident.exchange), 'attempt': attempt, 'script_sha256': script_sha,
             'require_env_isolation': bool(getattr(args, 'require_env_isolation', False)), 'profile_sha256': profile_sha}
@@ -1831,6 +1841,8 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload
     # terminal session it was typed in. The QA side detaches itself (DETACH: setsid as the QA user).
     # Unattended mode has no credential, but keeps this session and the child-signalling stop on purpose: process ownership
     # and kill semantics stay exactly the attended ones, and the helper detaches itself (setsid as the QA user).
+    if endpoint is not None:
+        seal_extra = dict(seal_extra, endpoint=endpoint)          # only a model run starts the exec-time endpoint
     return launch(args, run_dir, argv, dict(HOP_ENV), '/', None, timeout=alarm + 60, new_session=False,
                   seal=lambda proc: seal(run_dir, ident, outbox, manifest, info, proc, keepalive, **seal_extra))
 
@@ -1850,7 +1862,7 @@ def finish_no_model(run_dir, packet, ident, outbox, manifest, info, keepalive, s
     return evaluate(run_dir)
 
 
-def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None, payload=None):
+def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None, payload=None, endpoint=None):
     """Freeze what the QA user produced into producer-owned values, so `verdict` never reads the outbox again: sweep the
     QA user's processes first, open every outbox directory once without following links and check its owner, read the
     verdict relative to the opened outbox, compare the QA clone with the manifest once, then confirm that every path
@@ -1870,6 +1882,8 @@ def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None, payload=N
         extra['interrupted'] = True
     elif proc.returncode == PROFILE_CHANGED:
         extra['profile_changed'] = True
+    elif proc.returncode == _SIDE.ENDPOINT_FAILED:
+        extra['endpoint_failed'] = True
     if proc.returncode not in (0, None):
         try:              # sudo's own stderr, producer-owned; the QA side's stderr goes to the outbox, never here
             refused = sudo_refused(read_nofollow(run_dir / 'stderr.log', MAX_INPUT_BYTES).decode('utf-8', 'replace'))
@@ -1883,6 +1897,8 @@ def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None, payload=N
             extra['verdict_sha256'] = 'UNREADABLE'
             if payload is not None:
                 extra['payload'] = {'manifest_sha256': payload.sha, 'verified': False, 'problems': ['the outbox could not be opened']}
+            if endpoint is not None:
+                extra['endpoint'] = {'verified': False, 'problems': ['the outbox could not be opened']}
             return extra
         try:
             data = read_sealed(fds[2], 'verdict.json', ident.uid)
@@ -1892,6 +1908,8 @@ def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None, payload=N
             extra['verdict_sha256'] = 'UNREADABLE'
         if payload is not None:
             extra['payload'] = seal_payload(fds[2], payload, ident.uid)
+        if endpoint is not None:
+            extra['endpoint'] = seal_endpoint(fds[2], endpoint, ident.uid)
         extra['tree_problems'] = check_tree(outbox / 'source', manifest)
         names, truncated = untracked_created(outbox / 'source', manifest)
         extra['untracked'] = {'count': 'many' if truncated else len(names), 'sample': [clean(n, 80) for n in names[:10]]}
@@ -1903,6 +1921,38 @@ def seal(run_dir, ident, outbox, manifest, info, proc, keepalive=None, payload=N
     finally:
         for fd in fds:
             os.close(fd)
+
+
+def seal_endpoint(outbox_fd, endpoint, uid):
+    """What the exec-time endpoint left in the outbox, judged by the producer through the opened outbox descriptor: endpoint-exec/record.json
+    (QA-owned, single link) passes verify_endpoint_record's rules without the Codex-side controls (those ran at stage, against the same
+    profile bytes), and the daemon's state must have been copied to endpoint-exec/state."""
+    try:
+        sub = os.open('endpoint-exec', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=outbox_fd)
+    except OSError:
+        return {'verified': False, 'problems': ['the endpoint record directory is missing']}
+    try:
+        st = os.fstat(sub)
+        if st.st_uid != uid or st.st_mode & 0o022:
+            return {'verified': False, 'problems': ['the endpoint record directory is not a private QA-owned directory']}
+        try:
+            data = read_sealed(sub, 'record.json', uid)
+            record = json.loads(data.decode('utf-8')) if data is not None else None
+        except (OSError, ValueError, RecursionError):
+            record = None
+        if record is None:
+            return {'verified': False, 'problems': ['the endpoint record is missing or unreadable']}
+        view, problems = verify_endpoint_record(record, endpoint, codex=False)
+        snapshot = (record.get('teardown') or {}).get('state_snapshot') if isinstance(record.get('teardown'), dict) else None
+        if not (isinstance(snapshot, dict) and snapshot.get('copied') is True):
+            problems.append('the daemon state was not kept in the outbox')
+        try:
+            os.close(os.open('state', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=sub))
+        except OSError:
+            problems.append('endpoint-exec/state is missing')
+        return {'verified': not problems, 'problems': [clean(p, 120) for p in problems[:10]], 'view': view}
+    finally:
+        os.close(sub)
 
 
 def seal_payload(outbox_fd, payload, uid):
@@ -2351,6 +2401,18 @@ def no_model_result(run_dir, packet, meta):
                          % (': %d self-tests' % tests['ran'] if tests else '')], extra)
 
 
+def endpoint_gate(packet, meta):
+    """Problems with the exec-time endpoint of a daemon-endpoint model run: the producer's own judgment of the sealed record must be
+    present and clean. Only called for a run whose codex was not stopped by the endpoint itself (ENDPOINT_FAILED has its own outcome)."""
+    if packet.get('network', 'none') != 'daemon-endpoint':
+        return []
+    sealed = meta.get('endpoint')
+    if not isinstance(sealed, dict) or sealed.get('verified') is not True:
+        detail = clean((sealed.get('problems') or [''])[0], 100) if isinstance(sealed, dict) and sealed.get('problems') else ''
+        return ['the daemon endpoint was not verified clean at the seal' + (': ' + detail if detail else '')]
+    return []
+
+
 def identity_gate(run_dir, meta):
     """An identity run counts only if the environment canary and read confinement were both established before codex
     started, every QA-user process was gone after the sweep, and every outbox path was a plain QA-owned directory."""
@@ -2396,6 +2458,17 @@ def evaluate_files(run_dir, packet):
                                                                    'this terminal session); codex was not started'])
         bad += identity_gate(run_dir, meta)
         bad += payload_gate(run_dir, packet, meta)
+        if meta.get('exit_code') == _SIDE.ENDPOINT_FAILED and not (isinstance(meta.get('endpoint'), dict) and meta['endpoint'].get('verified') is True):
+            # The endpoint could not start or stopped holding: whatever codex wrote is not trusted, and nothing is a pass.
+            tampered = tree_problems(run_dir, meta, read_run_json(run_dir / 'tree-manifest.json'))
+            if tampered or bad:
+                return write_result(run_dir, packet, 'QA_INVALID', bad + tampered)
+            detail = ''
+            sealed = meta.get('endpoint')
+            if isinstance(sealed, dict) and sealed.get('problems'):
+                detail = ' (' + clean(sealed['problems'][0], 100) + ')'
+            return write_result(run_dir, packet, 'QA_INCOMPLETE', ['the daemon endpoint failed%s; no verdict is trusted; retry with a new attempt' % detail])
+        bad += endpoint_gate(packet, meta)
     elif packet.get('payload') is not None:
         bad.append('a payload run without a QA identity')
     try:

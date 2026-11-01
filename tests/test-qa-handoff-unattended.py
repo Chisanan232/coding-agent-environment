@@ -352,7 +352,8 @@ class RunTests(RunBase):
         self.assertEqual(self.launched["probe_request"], {"verb": "probe", "attempt": attempt, "pid": 4242,
                                                            "sentinel": "qa-sentinel-" + "ab" * 16})
         self.assertEqual(self.launched["argv"], qa.helper_argv(self.ident, "exec", attempt))
-        self.assertEqual(self.launched["request"], {"verb": "exec", "attempt": attempt, "timeout": 900, "profile_sha256": self.profile, "network": "none", "port": 0})
+        self.assertEqual(self.launched["request"], {"verb": "exec", "attempt": attempt, "timeout": 900, "profile_sha256": self.profile, "network": "none", "port": 0,
+                          "manifest_sha256": "", "daemon_profile_sha256": ""})
         mocks["hop"].assert_not_called()                     # the attended terminal-detaching hop is never used
         self.assertNotIn("qa-side.py", self.launched["inbox"])  # no helper copy is handed over: the pinned install runs
         self.assertIn("packet.json", self.launched["inbox"])
@@ -627,7 +628,7 @@ class UnattendedEndpointTests(PayloadBase):
         self.ident = qa.Identity(QA.pw_name, QA.pw_uid, Path("/tmp/qahome-t"), self.exchange, 0)      # short: a Unix socket path must fit 104 bytes
 
     def endpoint_record(self, endpoint):
-        return {"established": True, "problems": [],
+        return {"established": True, "problems": [], "daemon_started": True, "relay_started": True,
                 "controls": [{"control": n, "observed": {"ALLOWED": "ALLOWED", "REFUSED": "REFUSED"}.get(x, "DENIED:1")}
                              for n, x in SIDE.endpoint_control_expectations(endpoint).items()],
                 "codex_controls": [{"control": n, "observed": {"ALLOWED": "ALLOWED", "DENIED_PROXY": "DENIED_PROXY"}.get(x, "DENIED:1")}
@@ -676,6 +677,18 @@ class UnattendedEndpointTests(PayloadBase):
         self.assertTrue(confinement["established"])
         self.assertEqual(confinement["endpoint"]["derived_by"], "producer")
         self.assertTrue(json.loads((self.run_dir / "SELFTEST.json").read_text())["passed"])
+
+    def test_a_model_run_binds_the_manifest_and_the_daemon_profile_into_the_exec_request(self):
+        self.args = qa.build_parser().parse_args(["run", "--run-dir", str(self.run_dir), "--unattended", "--qa-identity", QA.pw_name, "--timeout", "900"])
+        code, out, seen, finished = self.run_endpoint()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(finished, [])
+        request = self.launched["request"]
+        outbox = self.exchange / "outbox" / request["attempt"]
+        endpoint = qa.endpoint_for(self.ident, request["attempt"], outbox, seen["request"]["port"], self.payload.manifest)
+        self.assertEqual(request, {"verb": "exec", "attempt": request["attempt"], "timeout": 900, "profile_sha256": qa.expected_endpoint_profile_sha(self.ident, outbox, endpoint),
+                                   "network": "daemon-endpoint", "port": seen["request"]["port"], "manifest_sha256": self.payload.sha,
+                                   "daemon_profile_sha256": SIDE.endpoint_digests(endpoint)["daemon_profile_sha256"]})
 
     def test_a_profile_digest_the_producer_does_not_compute_is_not_established(self):
         code, out, seen, finished = self.run_endpoint(lambda stage, record: stage.update(profile_sha256="3" * 64))

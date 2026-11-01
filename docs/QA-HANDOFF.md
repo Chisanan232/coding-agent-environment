@@ -156,8 +156,9 @@ the QA run: `scripts/qa-payload-manifest.py plan|verify` builds and checks the `
 the packet, and a run copies it into the QA outbox, mounts it read-only and executable, proves confinement (now including loopback and
 UNIX-socket bind, IPv4 and IPv6 TEST-NET connects, a UDP send and the system resolver's socket, each of which must be refused with EPERM), and runs the producer's self-tests under the real profile before Codex
 starts; a failed self-test is `QA_INCOMPLETE` and Codex is never launched. `--no-model` stops after that gate, the seal and the sweep
-and can never be a pass. The probe and self-tests cover only offline, library-level checks; daemon-level and end-to-end results are
-producer-run and are not independently reproduced, and RESULT says so. Note that the base confinement control set itself grew for every
+and can never be a pass. The probe and self-tests cover only offline, library-level checks; a daemon-level payload can be exercised through a
+[daemon endpoint](QA-PAYLOAD.md#daemon-endpoint-payloads-cae-qa-payload2) (`prepare --network daemon-endpoint`, a `cae-qa-payload/2` payload), and
+whatever else the producer ran is producer-run, not independently reproduced, and RESULT says so. Note that the base confinement control set itself grew for every
 run (loopback bind, UNIX-socket bind, IPv4 and IPv6 TEST-NET connects, UDP send, resolver socket): an older helper's record is rejected,
 `--unattended` needs the helper reinstalled, and a host that does not answer one of them with an immediate EPERM fails closed; real macOS
 behaviour of the three older controls is unverified until an owner run (the new three were measured as the owner's user with `codex sandbox`).
