@@ -445,11 +445,13 @@ class EndpointOps:
         self.inet_sockets = inet_sockets or self._inet_sockets
 
     @staticmethod
-    def _uds_ping(path):
+    def _uds_ping(path, guard):
         """(peer pid, peer process group or None, peer uid, reply bytes) of ONE connection to the socket at path. The peer and its group are
         read right after connect, while the peer is still blocked reading the request (a daemon that serves each connection from a child
-        that exits after replying would be gone later); then the ping is sent on that same connection and the reply read to EOF (at most
-        PING_REPLY_MAX + 1 bytes, PING_SECONDS in all). Raises OSError."""
+        that exits after replying would be gone later), and handed to guard(peer_pid, peer_pgid, peer_uid) BEFORE a single byte is sent:
+        connect() follows a link the daemon may have swapped in after the caller's lstat, so whatever answered is unknown until guard has
+        accepted it, and when guard raises the connection is closed with nothing written. Then the ping is sent on that same connection
+        and the reply read to EOF (at most PING_REPLY_MAX + 1 bytes, PING_SECONDS in all). Raises OSError, or what guard raises."""
         deadline = time.monotonic() + PING_SECONDS
         with socket.socket(socket.AF_UNIX) as conn:
             conn.settimeout(PING_SECONDS)
@@ -463,6 +465,7 @@ class EndpointOps:
                 peer_pgid = os.getpgid(peer_pid) if peer_pid > 1 else None
             except OSError:
                 peer_pgid = None
+            guard(peer_pid, peer_pgid, peer_uid)
             conn.sendall(PING_REQUEST)
             conn.shutdown(socket.SHUT_WR)
             reply = b''
@@ -871,30 +874,49 @@ class EndpointLifecycle:
                 raise EndpointFailed('a directory above the daemon socket is not a private directory of this user')
         raise EndpointFailed('the daemon socket path is not below the endpoint directory')
 
+    def _peer_guard(self, node):
+        """The check uds_ping runs after connect and before it sends anything: the peer runs as this user, it is in the daemon's process
+        group, and the socket node (lstat walk again) is still the inode `node` seen before connect. Returns (guard, seen); seen['after'] is
+        the node found after connect once guard has passed."""
+        seen = {}
+
+        def guard(peer_pid, peer_pgid, peer_uid):
+            if peer_uid != os.getuid():
+                raise EndpointFailed('the process serving the socket is another user\'s')
+            if peer_pid <= 1 or peer_pgid != self.daemon.pid:
+                raise EndpointFailed('the process serving the socket is not in the daemon\'s process group')
+            after = self._socket_node()
+            if after != node:
+                raise EndpointFailed('the daemon socket was replaced while it was being connected to')
+            seen['after'] = after
+        return guard, seen
+
     def _answers(self):
-        """Readiness of a unix daemon: its socket passes _socket_node and one ping is answered with ok true."""
+        """Readiness of a unix daemon: its socket passes _socket_node and one ping, sent only to a peer _peer_guard accepted, is answered
+        with ok true."""
         try:
-            self._socket_node()
-            return ping_mode(self.ops.uds_ping(str(self.endpoint.daemon_sock))[3]) is not None
+            guard, _ = self._peer_guard(self._socket_node())
+            return ping_mode(self.ops.uds_ping(str(self.endpoint.daemon_sock), guard)[3]) is not None
         except (OSError, EndpointFailed):
             return False
 
     def prove_socket(self):
         """The socket is the daemon's (run by the helper as the QA user, outside every sandbox). In order: the path checks of _socket_node;
-        then on ONE connection the peer (LOCAL_PEERPID, read right after connect) is a process in the daemon's process group (the daemon
-        leads it, and stays unreaped, so the id cannot be another's) with our uid, and the ping on that same connection is answered with ok
-        true and a known mode; the node is still the same inode; the group holds no IPv4 or IPv6 socket. The peer's group is proved rather
-        than its pid because LOCAL_PEERPID names whichever process of the daemon last did I/O on the socket (measured, ADR 0016)."""
+        then on ONE connection, BEFORE anything is sent (_peer_guard), the peer (LOCAL_PEERPID, read right after connect) is a process in the
+        daemon's process group (the daemon leads it, and stays unreaped, so the id cannot be another's) with our uid and the node is still
+        the inode seen before connect; only then is the ping sent on that connection, and it must be answered with ok true and a known mode;
+        the node is still the same inode after the reply; neither the group nor any descendant holds an IPv4 or IPv6 socket. The peer's group
+        is proved rather than its pid because LOCAL_PEERPID names whichever process of the daemon last did I/O on the socket (measured,
+        ADR 0016)."""
         e = self.endpoint
         node = self._socket_node()
+        guard, seen = self._peer_guard(node)
         try:
-            peer_pid, peer_pgid, peer_uid, reply = self.ops.uds_ping(str(e.daemon_sock))
+            peer_pid, peer_pgid, peer_uid, reply = self.ops.uds_ping(str(e.daemon_sock), guard)
         except OSError:
             raise EndpointFailed('the daemon socket did not answer a ping')
-        if peer_pid <= 1 or peer_pgid != self.daemon.pid:
-            raise EndpointFailed('the process serving the socket is not in the daemon\'s process group')
-        if peer_uid != os.getuid():
-            raise EndpointFailed('the process serving the socket is another user\'s')
+        if 'after' not in seen:                                   # a uds_ping that skipped the guard proves nothing
+            raise EndpointFailed('the peer of the daemon socket was not checked before the ping')
         mode = ping_mode(reply)
         if mode is None:
             raise EndpointFailed('the daemon did not answer the ping with ok true and a known mode')
@@ -903,7 +925,8 @@ class EndpointLifecycle:
         self._check_no_inet()
         self._sock_node = node
         return {'socket': str(e.daemon_sock), 'peer_pid': peer_pid, 'peer_pgid': peer_pgid, 'peer_uid': peer_uid, 'daemon_pid': self.daemon.pid,
-                'mode': 0o600, 'ping_mode': mode, 'inet': [], 'inode_stable': True}
+                'mode': 0o600, 'ping_mode': mode, 'inet': [], 'inode_stable': True, 'inode_before_connect': node[1],
+                'inode_after_connect': seen['after'][1]}
 
     def _check_no_inet(self):
         found = self.ops.inet_sockets(self.daemon.pid)

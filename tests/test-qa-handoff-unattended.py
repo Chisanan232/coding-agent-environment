@@ -770,7 +770,7 @@ class UnattendedUnixEndpointTests(UnattendedEndpointTests):
 
     def endpoint_record(self, endpoint):
         proof = {"socket": str(endpoint.daemon_sock), "peer_pid": 7001, "peer_pgid": 7000, "peer_uid": QA.pw_uid, "daemon_pid": 7000, "mode": 0o600,
-                 "ping_mode": "shadow", "inet": [], "inode_stable": True}
+                 "ping_mode": "shadow", "inet": [], "inode_stable": True, "inode_before_connect": 812, "inode_after_connect": 812}
         record = super().endpoint_record(endpoint)
         for key in ("relay_started", "port_proof"):
             record.pop(key)

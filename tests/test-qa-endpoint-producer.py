@@ -351,7 +351,7 @@ class UnixBase(unittest.TestCase):
         self.endpoint = qa.endpoint_for(self.ident, "att", self.outbox, 0, self.manifest)
         e = self.endpoint
         proof = {"socket": str(e.daemon_sock), "peer_pid": 7001, "peer_pgid": 7000, "peer_uid": UID, "daemon_pid": 7000, "mode": 0o600,
-                 "ping_mode": "shadow", "inet": [], "inode_stable": True}
+                 "ping_mode": "shadow", "inet": [], "inode_stable": True, "inode_before_connect": 812, "inode_after_connect": 812}
         self.record = {
             "established": True, "problems": [], "daemon_started": True, "transport": "unix", "port": 0,
             "controls": [{"control": n, "observed": good_observation(x)} for n, x in side.endpoint_control_expectations(e).items()],
@@ -388,7 +388,8 @@ class UnixVerifyTests(UnixBase):
     def test_every_socket_proof_defect_fails(self):
         changes = [{"socket": "/elsewhere.sock"}, {"peer_pgid": 4242}, {"peer_pgid": True}, {"peer_uid": UID + 1}, {"mode": 0o644}, {"mode": 384.0},
                    {"ping_mode": "open"}, {"inet": ["*:*"]}, {"inode_stable": False}, {"peer_pid": 1}, {"peer_pid": True}, {"daemon_pid": 1, "peer_pgid": 1},
-                   {"daemon_pid": "7000", "peer_pgid": "7000"}]
+                   {"daemon_pid": "7000", "peer_pgid": "7000"}, {"inode_after_connect": 813}, {"inode_before_connect": None},
+                   {"inode_after_connect": True, "inode_before_connect": True}]
         for key in ("socket_proof", "socket_recheck"):
             for change in changes:
                 record = copy.deepcopy(self.record)

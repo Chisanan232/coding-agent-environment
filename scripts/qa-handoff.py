@@ -1521,16 +1521,18 @@ def judge_controls(rows, expected, ok_of, label, problems):
 def socket_proof_view(proof, endpoint, uid):
     """The producer's bounded view of one unix socket proof, or None unless it shows exactly: this producer's socket path, a peer in the
     daemon's process group (the daemon leads it: peer_pgid == daemon_pid > 1) running as the QA uid, mode 0600, a known ping mode, no inet
-    socket and a stable inode."""
+    socket, a stable inode, and the same inode before and after connect (checked before the ping was sent)."""
     def pid(value):
         return type(value) is int and value > 1
     if not (isinstance(proof, dict) and proof.get('socket') == str(endpoint.daemon_sock) and pid(proof.get('peer_pid')) and pid(proof.get('daemon_pid'))
             and proof.get('peer_pgid') == proof['daemon_pid'] and type(proof.get('peer_pgid')) is int and type(proof.get('peer_uid')) is int
             and proof['peer_uid'] == uid and proof.get('mode') == 0o600 and type(proof.get('mode')) is int and proof.get('ping_mode') in _SIDE.PING_MODES
-            and proof.get('inet') == [] and proof.get('inode_stable') is True):
+            and proof.get('inet') == [] and proof.get('inode_stable') is True and type(proof.get('inode_before_connect')) is int
+            and proof.get('inode_after_connect') == proof['inode_before_connect'] and type(proof.get('inode_after_connect')) is int):
         return None
     return {'socket': str(endpoint.daemon_sock), 'peer_pid': proof['peer_pid'], 'peer_pgid': proof['peer_pgid'], 'daemon_pid': proof['daemon_pid'],
-            'peer_uid': uid, 'mode': 0o600, 'ping_mode': proof['ping_mode'], 'inet': [], 'inode_stable': True}
+            'peer_uid': uid, 'mode': 0o600, 'ping_mode': proof['ping_mode'], 'inet': [], 'inode_stable': True,
+            'inode_before_connect': proof['inode_before_connect'], 'inode_after_connect': proof['inode_after_connect']}
 
 
 def verify_unix_endpoint_record(record, endpoint, codex, manifest, uid):
