@@ -99,6 +99,37 @@ print(json.dumps({"ok": reply["ok"], "seed": reply.get("seed_sha256"), "dylib": 
 '''
 
 
+# Another process's listener (its own session, outside the daemon's group) that logs how many bytes each connection carried.
+OTHER_LISTENER = r"""
+import os, socket, sys
+path, log = sys.argv[1], sys.argv[2]
+os.chdir(os.path.dirname(path))
+s = socket.socket(socket.AF_UNIX)
+s.bind(os.path.basename(path))
+s.listen(8)
+s.settimeout(60)
+open(log + ".ready", "w").close()
+while True:
+    try:
+        c, _ = s.accept()
+    except OSError:
+        break
+    c.settimeout(5)
+    data = b""
+    try:
+        while True:
+            chunk = c.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        pass
+    with open(log, "a") as f:
+        f.write("%d\n" % len(data))
+    c.close()
+"""
+
+
 def usable():
     return sys.platform == "darwin" and CODEX and os.access(CODEX, os.X_OK) and (side.real_codex_home() / "auth.json").exists()
 
@@ -206,6 +237,36 @@ class PeerMeasurementLiveTests(Base):
         self.assertIn(accept_child[2], (accept_child[1], accept_child[3]))
         self.assertNotEqual(accept_child[3], accept_child[1])
         self.assertTrue(all(row[4] == row[1] for row in rows))       # the peer's process group is the daemon's in every shape
+
+
+    def test_a_socket_swapped_for_a_link_to_another_listener_gets_no_byte(self):
+        """The daemon's own socket replaced by a link to another process's listening socket (what a hostile daemon could do between the
+        helper's lstat walk and its connect): the full proof refuses, and that listener receives zero bytes."""
+        other, log = self.root / "o.sock", self.root / "o.log"
+        listener = subprocess.Popen([sys.executable, "-I", "-c", OTHER_LISTENER, str(other), str(log)], start_new_session=True)
+        self.addCleanup(lambda: (listener.kill(), listener.wait()))
+        while not os.path.exists(str(log) + ".ready"):
+            time.sleep(0.05)
+        life, e = self.lifecycle("leader")
+        life.create()
+        life.start()
+        node, real, walks = life._socket_node(), life._socket_node, []
+
+        def walk():                 # the walk before connect saw the daemon's node; the swap lands between it and connect
+            walks.append(1)
+            return node if len(walks) == 1 else real()
+        e.daemon_sock.unlink()
+        os.symlink(other, e.daemon_sock)
+        life._socket_node = walk
+        with self.assertRaises(side.EndpointFailed) as caught:
+            life.prove_socket()
+        sys.stderr.write("\nswapped socket refused: %s\n" % caught.exception)
+        e.daemon_sock.unlink()
+        for _ in range(100):                                        # the line, not just the file: open() creates it before the write
+            if log.exists() and log.read_text().endswith("\n"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(log.read_text().split(), ["0"])
 
 
 @unittest.skipUnless(usable(), "set CAE_QA_LIVE_CODEX to a Codex binary on macOS with a Codex login")
