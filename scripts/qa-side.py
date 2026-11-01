@@ -394,6 +394,7 @@ PING_REQUEST = b'{"event": "ping"}\n'
 PING_REPLY_MAX = 64 << 10
 PING_SECONDS = 5
 PING_MODES = ('shadow', 'enforce')
+INET_LIST_SECONDS = 5
 # getsockopt on an AF_UNIX socket (macOS <sys/un.h>): SOL_LOCAL level, LOCAL_PEERCRED (struct xucred: version, uid, ...) and LOCAL_PEERPID.
 # Measured under daemon.sb (SPE-155, see ADR 0016): LOCAL_PEERPID is the pid that last did I/O on the listener or the accepted socket, which
 # is a child of the daemon when a child listens or accepts; that child's process group is still the daemon's, so the group is what is proved.
@@ -488,17 +489,25 @@ class EndpointOps:
             return probe.connect_ex(path)
 
     @staticmethod
-    def _inet_sockets(pgid):
-        """['name'] of every IPv4/IPv6 socket held by any process in the group, or None when lsof could not list them. A unix daemon
-        must hold none, not even an unbound one (lsof lists that as *:*)."""
-        try:
-            done = subprocess.run(['/usr/sbin/lsof', '-nP', '-a', '-g%d' % pgid, '-i', '-Fn'], capture_output=True, text=True, timeout=20, cwd='/',
-                                  stdin=subprocess.DEVNULL, env={'PATH': '/usr/bin:/bin:/usr/sbin'})
-        except (OSError, subprocess.SubprocessError):
-            return None
-        if done.returncode not in (0, 1):
-            return None
-        return [line[1:] for line in done.stdout.splitlines() if line.startswith('n')]
+    def _inet_sockets(pgid, pids):
+        """['name'] of every IPv4/IPv6 socket held by any process in the group or with one of the pids (the daemon's descendants, which a
+        setpgid() would take out of the group), or None when lsof could not list them. A unix daemon must hold none, not even an unbound one
+        (lsof lists that as *:*). Fails closed: exit 1 counts as "none" only with empty output AND empty stderr (measured: that is lsof's
+        answer when nothing matches, also for a pid that is gone); a warning, any other status or a timeout (INET_LIST_SECONDS, as the
+        check runs on every supervision poll) is None."""
+        found = []
+        for selector in ('-g%d' % pgid, '-p' + ','.join(str(pid) for pid in sorted(pids))):
+            try:
+                done = subprocess.run(['/usr/sbin/lsof', '-nP', '-a', selector, '-i', '-Fn'], capture_output=True, text=True, timeout=INET_LIST_SECONDS,
+                                      cwd='/', stdin=subprocess.DEVNULL, env={'PATH': '/usr/bin:/bin:/usr/sbin'})
+            except (OSError, subprocess.SubprocessError):
+                return None
+            if done.returncode == 1 and not done.stdout and not done.stderr:
+                continue
+            if done.returncode != 0:
+                return None
+            found += [line[1:] for line in done.stdout.splitlines() if line.startswith('n')]
+        return found
 
     @staticmethod
     def _run(argv, env, timeout):
@@ -929,7 +938,12 @@ class EndpointLifecycle:
                 'inode_after_connect': seen['after'][1]}
 
     def _check_no_inet(self):
-        found = self.ops.inet_sockets(self.daemon.pid)
+        """No IPv4 or IPv6 socket in the daemon's process group or in any process below it (by parent pid, so a descendant that left the
+        group with setpgid is included). A descendant that left with setsid and lost its parent is seen by neither; see ADR 0016."""
+        below = self._descendants([self.daemon])
+        if below is None:
+            raise EndpointFailed('the daemon\'s descendants could not be listed')
+        found = self.ops.inet_sockets(self.daemon.pid, {self.daemon.pid} | {pid for pid, _ in below})
         if found is None:
             raise EndpointFailed('the daemon\'s sockets could not be listed')
         if found:

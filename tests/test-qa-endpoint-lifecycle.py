@@ -660,9 +660,9 @@ class UnixFakes(Fakes):
             self.on_reply()
         return pid, self.groups.get(pid), self.peer_uid, self.reply
 
-    def inet_sockets(self, pgid):
-        self.log.append(("inet", pgid))
-        return self.inet() if callable(self.inet) else self.inet
+    def inet_sockets(self, pgid, pids):
+        self.log.append(("inet", pgid, frozenset(pids)))
+        return self.inet(pids) if callable(self.inet) else self.inet
 
     def uds_connect(self, path):
         self.log.append(("uds_connect", path))
@@ -821,7 +821,7 @@ class UnixStartTests(UnixBase):
                                  "daemon_pid": pid, "mode": 0o600, "ping_mode": "shadow", "inet": [], "inode_stable": True,
                                  "inode_before_connect": ino, "inode_after_connect": ino})
         self.assertGreaterEqual(len(self.fakes.pings), 2)          # readiness, then the proof's own connection
-        self.assertIn(("inet", pid), self.fakes.log)
+        self.assertIn(("inet", pid, frozenset({pid})), self.fakes.log)
         self.assertEqual(proof["inode_before_connect"], proof["inode_after_connect"])
         self.assertEqual(proof["inode_before_connect"], os.lstat(self.endpoint.daemon_sock).st_ino)
 
@@ -897,6 +897,19 @@ class UnixStartTests(UnixBase):
             self.setUp()
             self.fakes.inet = inet
             self.fail_start(expect)
+
+    def test_an_inet_socket_held_by_a_descendant_outside_the_group_fails(self):
+        self.fakes.table = [(9001, 5001, "t1"), (9002, 9001, "t2")]     # 5001: the daemon (the first pid the fakes hand out)
+        self.fakes.inet = lambda pids: ["127.0.0.1:9"] if 9002 in pids else []
+        self.fail_start("IPv4 or IPv6")
+
+    def test_an_unreadable_process_table_fails_the_inet_check(self):
+        self.life.create()
+        self.prove()
+        self.life.ops.process_table = lambda: None
+        with self.assertRaises(side.EndpointFailed) as caught:
+            self.life.start()
+        self.assertIn("descendants could not be listed", str(caught.exception))
 
     def test_a_loose_socket_or_directory_or_a_linked_socket_never_becomes_ready(self):
         def loose_socket():
@@ -1062,6 +1075,38 @@ class SwappedSocketRealTests(UnixBase):
         with self.assertRaises(side.EndpointFailed):
             self.life.prove_socket()
         self.assertEqual(self.logged(3), ["18", "0", "0"])
+
+
+class InetListingTests(unittest.TestCase):
+    """_inet_sockets fails closed: only lsof's own "nothing matched" (exit 1, no output, no stderr) is an empty answer."""
+
+    def answer(self, *results):
+        calls = []
+
+        def run(argv, **kw):
+            calls.append((argv, kw["timeout"]))
+            result = results[len(calls) - 1]
+            if isinstance(result, Exception):
+                raise result
+            return subprocess.CompletedProcess(argv, result[0], result[1], result[2])
+        with mock.patch.object(side.subprocess, "run", run):
+            return side.EndpointOps._inet_sockets(100, {100, 200, 9}), calls
+
+    def test_nothing_matched_is_empty_and_both_the_group_and_the_pids_are_asked(self):
+        found, calls = self.answer((1, "", ""), (1, "", ""))
+        self.assertEqual(found, [])
+        self.assertEqual([c[0][3] for c in calls], ["-g100", "-p9,100,200"])
+        self.assertEqual({c[1] for c in calls}, {side.INET_LIST_SECONDS})
+        self.assertEqual(side.INET_LIST_SECONDS, 5)
+
+    def test_sockets_are_listed_from_either_selection(self):
+        self.assertEqual(self.answer((0, "p100\nf4\nn*:*\n", ""), (1, "", ""))[0], ["*:*"])
+        self.assertEqual(self.answer((1, "", ""), (0, "p200\nf5\nn127.0.0.1:9\n", ""))[0], ["127.0.0.1:9"])
+
+    def test_a_warning_another_status_or_a_timeout_fails_closed(self):
+        for results in (((1, "", "lsof: WARNING: can't stat()\n"), (1, "", "")), ((1, "", ""), (1, "", "warn")), ((2, "", ""), (1, "", "")),
+                        ((1, "x", ""), (1, "", "")), (subprocess.TimeoutExpired("lsof", 5), (1, "", "")), (OSError("gone"), (1, "", ""))):
+            self.assertIsNone(self.answer(*results)[0], results)
 
 
 if __name__ == "__main__":
