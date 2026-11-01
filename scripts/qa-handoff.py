@@ -1433,7 +1433,7 @@ def verify_endpoint_record(record, endpoint, codex=True):
         seen, out = set(), []
         for row in rows if isinstance(rows, list) else []:
             name, observed = (row.get('control'), row.get('observed')) if isinstance(row, dict) else (None, None)
-            if name not in expected or name in seen or not isinstance(observed, str):
+            if not isinstance(name, str) or name not in expected or name in seen or not isinstance(observed, str):
                 problems.append('%s: unknown, repeated or malformed control %s' % (label, clean(name, 40)))
                 continue
             seen.add(name)
@@ -1450,22 +1450,32 @@ def verify_endpoint_record(record, endpoint, codex=True):
     codex_controls = judge(record.get('codex_controls'), {n: e for n, _, e in _SIDE.ENDPOINT_CODEX_CONTROLS}, _SIDE.control_ok, 'codex') if codex else []
     proof = record.get('port_proof')
     want_listener = ['127.0.0.1:%d' % endpoint.port]
-    if not (isinstance(proof, dict) and proof.get('listeners') == want_listener and type(proof.get('daemon_pid')) is int):
+    if not (isinstance(proof, dict) and proof.get('listeners') == want_listener and type(proof.get('daemon_pid')) is int and proof['daemon_pid'] > 1):
         problems.append('the port proof does not show the daemon alone on 127.0.0.1:%d' % endpoint.port)
+        proof = None
     teardown = record.get('teardown')
+    steps = ('relay_stopped', 'daemon_stopped', 'port_closed', 'sockets_gone', 'dir_removed')
     if not (isinstance(teardown, dict) and teardown.get('clean') is True and teardown.get('descendants_left') == []
-            and teardown.get('not_ours') is False):
+            and teardown.get('not_ours') is False and all(teardown.get(step) is True for step in steps)):
         problems.append('the endpoint was not torn down cleanly')
+    # Only known, bounded values reach the producer's own record: nothing the QA side sent is copied through as it came.
+    proof_view = {'listeners': want_listener, 'daemon_pid': proof['daemon_pid']} if proof else None
+    teardown_view = ({'clean': True, 'steps': {step: teardown.get(step) is True for step in steps}} if isinstance(teardown, dict) else None)
+    if isinstance(teardown, dict):
+        teardown_view['socket_removed_by_helper'] = [clean(n, 40) for n in (teardown.get('socket_removed_by_helper') or [])[:4]
+                                                     if isinstance(n, str)] if isinstance(teardown.get('socket_removed_by_helper'), list) else []
+        teardown_view['clean'] = teardown.get('clean') is True
     for key, want in _SIDE.endpoint_digests(endpoint).items():          # the generated profiles and relay are the ones cae would generate
         if record.get(key) != want:
             problems.append('the endpoint record\'s %s is not the one this producer computes' % key)
-    if record.get('problems'):
-        problems.append('the endpoint reported: ' + '; '.join(clean(p, 80) for p in record['problems'][:2] if isinstance(p, str)))
+    reported = record.get('problems')
+    if reported is not None and not (isinstance(reported, list) and not reported):
+        text = '; '.join(clean(p, 80) for p in reported[:2] if isinstance(p, str)) if isinstance(reported, list) else 'malformed'
+        problems.append('the endpoint reported: ' + text)
     if record.get('established') is not True:
         problems.append('the endpoint was not established')
-    view = {'port': endpoint.port, 'controls': profile_controls, 'codex_controls': codex_controls, 'port_proof': proof, 'teardown': teardown,
-            'daemon_profile_sha256': record.get('daemon_profile_sha256'), 'relay_profile_sha256': record.get('relay_profile_sha256'),
-            'relay_source_sha256': record.get('relay_source_sha256'), 'derived_by': 'producer'}
+    view = {'port': endpoint.port, 'controls': profile_controls, 'codex_controls': codex_controls, 'port_proof': proof_view, 'teardown': teardown_view,
+            **{key: want for key, want in _SIDE.endpoint_digests(endpoint).items() if record.get(key) == want}, 'derived_by': 'producer'}
     return view, problems
 
 
@@ -1700,6 +1710,8 @@ def run_identity_locked(args, run_dir, packet, source, ident, keepalive, payload
                 raise _SIDE.EndpointError('no free port in the endpoint range')
             endpoint = endpoint_for(ident, attempt, outbox, port, payload.manifest)
         except _SIDE.EndpointError as error:
+            shutil.rmtree(inbox / 'source', ignore_errors=True)
+            shutil.rmtree(inbox / 'payload', ignore_errors=True)
             return write_result(run_dir, packet, 'QA_INCOMPLETE', ['the endpoint cannot be set up (%s); codex was not started' % clean(str(error), 100)])
         stage_tail += ['--network', network, '--port', str(port), '--qa-home', str(ident.home), '--exchange', str(ident.exchange), '--attempt', attempt]
         stage_seconds += _SIDE.ENDPOINT_STAGE_SECONDS

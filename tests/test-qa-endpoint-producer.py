@@ -37,7 +37,8 @@ class Base(unittest.TestCase):
             "controls": [{"control": n, "observed": good_observation(x)} for n, x in side.endpoint_control_expectations(e).items()],
             "codex_controls": [{"control": n, "observed": good_observation(x)} for n, _, x in side.ENDPOINT_CODEX_CONTROLS],
             "port_proof": {"listeners": ["127.0.0.1:%d" % PORT], "daemon_pid": 42},
-            "teardown": {"clean": True, "descendants_left": [], "not_ours": False, "socket_removed_by_helper": ["http.sock"]},
+            "teardown": {"clean": True, "descendants_left": [], "not_ours": False, "socket_removed_by_helper": ["http.sock"], "relay_stopped": True,
+                         "daemon_stopped": True, "port_closed": True, "sockets_gone": True, "dir_removed": True},
             **side.endpoint_digests(e)}
 
     def verify(self, record=None):
@@ -98,6 +99,44 @@ class VerifyTests(Base):
             self.assertTrue(any(key in p for p in self.verify(record)[1]), key)
             record = {k: v for k, v in self.record.items() if k != key}
             self.assertTrue(any(key in p for p in self.verify(record)[1]), key)
+
+    def test_hostile_shapes_fail_closed_instead_of_raising(self):
+        for mutate in (lambda r: r["controls"].append({"control": ["x"], "observed": "ALLOWED"}),
+                       lambda r: r["codex_controls"].append({"control": {"a": 1}, "observed": "ALLOWED"}),
+                       lambda r: r.update(problems=5), lambda r: r.update(problems={"a": 1}), lambda r: r.update(problems="boom"),
+                       lambda r: r["controls"].append(None), lambda r: r.update(controls="x")):
+            record = copy.deepcopy(self.record)
+            mutate(record)
+            self.assertTrue(self.verify(record)[1])
+
+    def test_the_port_proof_pid_must_be_a_real_pid(self):
+        for pid in (0, 1, -4, True, False, 2.0, "7", None):
+            record = copy.deepcopy(self.record)
+            record["port_proof"]["daemon_pid"] = pid
+            self.assertTrue(self.verify(record)[1], pid)
+
+    def test_every_teardown_step_must_be_true_on_its_own(self):
+        for step in ("relay_stopped", "daemon_stopped", "port_closed", "sockets_gone", "dir_removed"):
+            for bad in (False, None, "yes"):
+                record = copy.deepcopy(self.record)
+                record["teardown"][step] = bad
+                self.assertTrue(self.verify(record)[1], (step, bad))
+            record = copy.deepcopy(self.record)
+            del record["teardown"][step]
+            self.assertTrue(self.verify(record)[1], step)
+
+    def test_nothing_the_qa_side_sent_is_copied_into_the_producers_view(self):
+        record = copy.deepcopy(self.record)
+        record["port_proof"]["note"] = "x" * 5000
+        record["teardown"]["note"] = {"deep": ["x" * 5000]}
+        record["teardown"]["socket_removed_by_helper"] = ["y" * 5000, 7, None]
+        view, problems = self.verify(record)
+        self.assertEqual(problems, [])
+        text = repr(view)
+        self.assertLess(len(text), 20000)
+        self.assertNotIn("x" * 200, text)
+        self.assertNotIn("y" * 200, text)
+        self.assertEqual(sorted(view["port_proof"]), ["daemon_pid", "listeners"])
 
     def test_a_non_dict_record_fails(self):
         for bad in (None, [], "x", 5):
