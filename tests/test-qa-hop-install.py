@@ -171,7 +171,7 @@ class RenderTests(Case):
         text = self.render()
         self.assertEqual(inst.sudoers_findings(text, self.render()), [])
         self.assertEqual(text.count("/bin/kill -KILL -1"), 1)
-        self.assertEqual(text.count("/bin/launchctl print"), 3)
+        self.assertEqual(text.count("/bin/launchctl "), 3)
         self.assertEqual(len(re.findall(r"^\s*(?:Cmnd_Alias CAE_QA_\w+\s+= )?(?:/\S+|sha256:\S+ /\S+)", text, re.M)), 9)  # 7 + 2 helper shapes
         self.assertIn("NOPASSWD: NOSETENV:", text)
         self.assertIn("(qauser)", text)
@@ -200,6 +200,89 @@ class RenderTests(Case):
         done = subprocess.run(["/usr/sbin/visudo", "-c", "-f", str(path)], capture_output=True, text=True, timeout=30)
         self.assertIn("parsed OK", done.stdout + done.stderr)
         self.assertEqual(done.returncode, 0)
+
+
+class SudoersSemanticsTests(Case):
+    """Parsing (`visudo -c`) is not matching. These tests apply sudoers(5)'s argument rules to every rendered command: arguments are a
+    regular expression only when the whole argument string starts with '^' and ends with '$' (unquoted, matched against the arguments
+    joined by single spaces); otherwise they are literal words/wildcards, where a double quote only means the lone '""' (no arguments).
+    The first real uid-530 attempt showed the quoted form never matches, so this class exists to keep it from coming back. It is an emulation
+    of sudo's matcher: the post-install readback must still run one allowed shape of each rule against the real sudo."""
+    def commands(self):
+        text = inst.render_sudoers(MY_NAME, "qauser", 599, "/Users/qauser", "a" * 64)
+        cmds = []
+        for line in text.splitlines():
+            line = re.sub(r"^Cmnd_Alias CAE_QA_\w+\s*= ", "", line.strip()).rstrip("\\").strip().rstrip(",").strip()
+            if line.startswith(("/", "sha256:")):
+                rest = line.split(" ", 1)[1] if line.startswith("sha256:") else line
+                path, _, args = rest.partition(" ")
+                cmds.append((path, args))
+        return cmds
+
+    @staticmethod
+    def matches(args, argv):
+        """sudo 1.9.17: '^...$' is a POSIX ERE on the joined arguments; anything else is compared as literal words."""
+        joined = " ".join(argv)
+        if args.startswith("^"):
+            assert args.endswith("$"), args
+            return re.fullmatch(args[1:-1].replace("[[:blank:]]", "[ \t]"), joined) is not None and "\n" not in joined
+        if args == '""':
+            return argv == []
+        return args == joined
+
+    def test_every_rule_is_a_literal_or_an_unquoted_whole_string_regex(self):
+        for path, args in self.commands():
+            if args.startswith("^"):
+                self.assertTrue(args.endswith("$"), (path, args))
+                self.assertNotIn('"', args, (path, args))
+            else:
+                self.assertTrue(args == '""' or '"' not in args, "a quote that sudo reads literally: %r %r" % (path, args))
+                self.assertNotIn("^", args, (path, args))
+                self.assertFalse(set(args) & set("*?[]"), "wildcard in a literal rule: %r %r" % (path, args))
+
+    def test_the_helper_attempt_rule_accepts_only_the_three_verbs_and_a_plain_attempt_id(self):
+        (args,) = [a for p, a in self.commands() if p == "/Library/cae-qa/qa-side" and a.startswith("^")]
+        for ok in ("probe att-1", "stage 9d2f18783930-1", "exec A.b_c", "probe 0", "exec " + "a" * 150):
+            self.assertTrue(self.matches(args, ok.split(" ")), ok)
+        for bad in ("exec ../x", "exec", "bogus", "bogus att", "probe a b", "probe -x", "probe .hidden", "probe a;b", "probe a/b", "version x", "PROBE a",
+                    "probe  a", "probe a\nexec b", "stage $(id)", "exec a`id`"):
+            self.assertFalse(self.matches(args, bad.split(" ")) if "\n" not in bad else self.matches(args, [bad]), repr(bad))
+
+    def test_the_helper_version_rule_is_literal_and_exact(self):
+        (args,) = [a for p, a in self.commands() if p == "/Library/cae-qa/qa-side" and a == "version"]
+        self.assertTrue(self.matches(args, ["version"]))
+        self.assertFalse(self.matches(args, ["version", "x"]))
+        self.assertFalse(self.matches(args, []))
+
+    def test_the_launchctl_label_rule_covers_the_whole_argument_string_for_the_qa_uid_only(self):
+        (args,) = [a for p, a in self.commands() if p == "/bin/launchctl" and a.startswith("^")]
+        self.assertTrue(args.startswith("^print"), "the verb belongs to the expression")
+        for ok in ("com.apple.lsd", "com.apple.distnoted.xpc.agent", "a", "_x-1", "application.com.apple.Finder.123"):
+            self.assertTrue(self.matches(args, ["print", "user/599/" + ok]), ok)
+        for bad in ("", "../0", ".x", "-x", "a b", "a;b", "a/b", "a$(id)"):
+            self.assertFalse(self.matches(args, ["print", "user/599/" + bad]), repr(bad))
+        for bad_argv in (["print", "user/0/x"], ["print", "user/598/x"], ["print", "gui/599/x"], ["blame", "user/599/x"], ["print", "user/599/x", "extra"],
+                         ["print-disabled", "user/599/x"], ["print"], ["-v", "print", "user/599/x"]):
+            self.assertFalse(self.matches(args, bad_argv), bad_argv)
+
+    def test_the_literal_launchctl_atq_ls_crontab_kill_rules_are_exact(self):
+        table = {("/bin/launchctl", "print user/599"): (["print", "user/599"], [["print", "user/598"], ["print", "user/599", "x"]]),
+                 ("/bin/launchctl", "print gui/599"): (["print", "gui/599"], [["print", "gui/0"]]),
+                 ("/usr/bin/crontab", "-l"): (["-l"], [["-r"], ["-l", "-u", "root"]]),
+                 ("/usr/bin/atq", '""'): ([], [[""], ["-q", "a"]]),
+                 ("/bin/kill", "-KILL -1"): (["-KILL", "-1"], [["-KILL", "-9"], ["-KILL"]]),
+                 ("/bin/ls", "-A /Users/qauser/Library/LaunchAgents"): (["-A", "/Users/qauser/Library/LaunchAgents"], [["-A", "/Users"], ["-A", "/Users/qauser/Library/LaunchAgents", "x"]])}
+        commands = set(self.commands())
+        for key, (good, bad) in table.items():
+            self.assertIn(key, commands, key)
+            self.assertTrue(self.matches(key[1], good), key)
+            for argv in bad:
+                self.assertFalse(self.matches(key[1], argv), (key, argv))
+        self.assertEqual(len(commands), 9)
+
+    def test_a_quoted_regex_is_detected_as_never_matching(self):
+        self.assertFalse(self.matches('"^(probe|stage|exec) [A-Za-z0-9][A-Za-z0-9._-]*$"', ["probe", "att"]))
+        self.assertFalse(self.matches('^print[[:blank:]]user/599/x$', ["print", "user/599/y"]))
 
 
 class InputTests(Case):

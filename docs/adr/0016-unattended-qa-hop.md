@@ -77,9 +77,9 @@ Cmnd_Alias CAE_QA_SEE   = /usr/bin/crontab -l, \
                           /bin/ls -A /Users/QA/Library/LaunchAgents, \
                           /bin/launchctl print user/QAUID, \
                           /bin/launchctl print gui/QAUID, \
-                          /bin/launchctl print "^user/QAUID/[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+                          /bin/launchctl ^print[[:blank:]]user/QAUID/[A-Za-z0-9_][A-Za-z0-9_.-]*$
 Cmnd_Alias CAE_QA_SIDE  = sha256:HELPERHEX /Library/cae-qa/qa-side version, \
-                          sha256:HELPERHEX /Library/cae-qa/qa-side "^(probe|stage|exec) [A-Za-z0-9][A-Za-z0-9._-]*$"
+                          sha256:HELPERHEX /Library/cae-qa/qa-side ^(probe|stage|exec)[[:blank:]][A-Za-z0-9][A-Za-z0-9._-]*$
 
 PRODUCER ALL = (QA) NOPASSWD: NOSETENV: CAE_QA_SWEEP, CAE_QA_SEE, CAE_QA_SIDE
 ```
@@ -105,6 +105,14 @@ install. `HELPERHEX` is the digest of the installed helper, so **the drop-in is 
 The digest check is racy: macOS has no `fexecve(2)`, so sudo verifies the file and then executes the path. That is why the
 helper lives where neither the producer nor Homebrew can write (below) and the producer verifies the path before every run;
 the digest is defence in depth, not the barrier.
+
+**Regular-expression arguments (rev 4, 2026-11-01).** The two regex rules are written exactly as sudoers(5) defines them for sudo 1.9.10+:
+the argument string starts with `^`, ends with `$`, is NOT quoted, and is matched against all arguments joined by single spaces, so the
+verb belongs to the expression (`^print[[:blank:]]user/QAUID/...$`) and a blank is `[[:blank:]]`. The earlier revisions wrote them in
+double quotes, which sudo reads as a literal string that never matches: `visudo -c` accepted it, the owner readback passed (it only ran the
+literal `version` rule), and the first real producer run stopped at `launchd domain user/530 could not be read (sudo -n refused)`.
+`tests/test-qa-hop-install.py` now checks every rendered rule for this syntax and matches sample argv against the expressions.
+Parsing alone proves nothing about matching: the post-install readback must run one allowed shape of each rule for real.
 
 Sudoers regular expressions here contain no comma: a comma inside `{m,n}` is read as a list separator even in double quotes
 (`visudo` rejects it), so lengths are not limited in sudoers. The helper enforces the attempt-name cap (150 characters, validation
