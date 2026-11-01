@@ -550,6 +550,34 @@ class StateSnapshotTests(LifecycleBase):
         self.assertFalse(got["copied"])
         self.assertIn("limit", got["error"])
 
+    def test_a_flood_of_tiny_files_is_stopped_by_the_entry_cap(self):
+        for n in range(30):
+            (self.endpoint.state / ("f%d" % n)).write_text("")
+        with mock.patch.object(side, "SNAPSHOT_MAX_ENTRIES", 10):
+            got = self.snapshot()
+        self.assertFalse(got["copied"])
+        self.assertIn("limit", got["error"])
+
+    def test_a_socket_is_named_as_skipped_not_silently_dropped(self):
+        import socket as sk
+        server = sk.socket(sk.AF_UNIX)
+        cwd = os.getcwd()
+        os.chdir(self.endpoint.state)
+        try:
+            server.bind("other.sock")
+        finally:
+            os.chdir(cwd)
+            self.addCleanup(server.close)
+        got = self.snapshot()
+        self.assertEqual(got["skipped_sockets"], ["other.sock"])
+
+    def test_no_snapshot_is_taken_while_a_process_of_the_endpoint_is_still_running(self):
+        (self.endpoint.state / "kept").write_text("x")
+        with mock.patch.object(side.EndpointLifecycle, "_reap_stragglers", lambda self, before: [4242]):
+            steps = self.life.teardown(snapshot=self.dst)
+        self.assertFalse(steps["state_snapshot"]["copied"])
+        self.assertFalse(self.dst.exists())
+
     def test_teardown_with_a_snapshot_reports_it_and_never_for_a_directory_it_does_not_own(self):
         (self.endpoint.state / "kept").write_text("x")
         steps = self.life.teardown(snapshot=self.dst)

@@ -666,6 +666,8 @@ def run(args):
         return refuse('this run directory carries a payload; payload runs need --qa-identity (the self-tests run as the QA user)')
     if packet.get('network', 'none') not in ('none', 'daemon-endpoint'):
         return refuse('the packet names an unknown network mode')
+    if packet.get('network', 'none') != 'none' and ident is None:
+        return refuse('a daemon-endpoint run needs --qa-identity')
     if run_dir.is_dir():
         write_private(run_dir / 'MODE.json', mode)    # one mode per run directory; recorded in RESULT.json too
     source = run_dir / 'source'
@@ -1477,6 +1479,8 @@ def verify_endpoint_record(record, endpoint, codex=True):
     if reported is not None and not (isinstance(reported, list) and not reported):
         text = '; '.join(clean(p, 80) for p in reported[:2] if isinstance(p, str)) if isinstance(reported, list) else 'malformed'
         problems.append('the endpoint reported: ' + text)
+    if record.get('daemon_exited_early') or record.get('port_proof_lost'):
+        problems.append('the endpoint stopped holding while it was in use')
     if record.get('daemon_started') is not True or record.get('relay_started') is not True:
         problems.append('the record does not show both the daemon and the relay started')
     if record.get('established') is not True:
@@ -2460,7 +2464,7 @@ def evaluate_files(run_dir, packet):
                                                                    'this terminal session); codex was not started'])
         bad += identity_gate(run_dir, meta)
         bad += payload_gate(run_dir, packet, meta)
-        if meta.get('exit_code') == _SIDE.ENDPOINT_FAILED:
+        if meta.get('exit_code') == _SIDE.ENDPOINT_FAILED and not (isinstance(meta.get('endpoint'), dict) and meta['endpoint'].get('verified') is True):
             # The endpoint could not start or stopped holding: whatever codex wrote is not trusted, and nothing is a pass.
             tampered = tree_problems(run_dir, meta, read_run_json(run_dir / 'tree-manifest.json'))
             if tampered or bad:

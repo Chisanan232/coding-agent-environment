@@ -138,6 +138,10 @@ class VerifyTests(Base):
         self.assertNotIn("y" * 200, text)
         self.assertEqual(sorted(view["port_proof"]), ["daemon_pid", "listeners"])
 
+    def test_a_record_that_saw_the_endpoint_stop_holding_fails(self):
+        for key in ("daemon_exited_early", "port_proof_lost"):
+            self.assertTrue(self.verify(dict(self.record, **{key: True if key == "daemon_exited_early" else "the port is not held"}))[1], key)
+
     def test_both_processes_must_be_recorded_as_started(self):
         for key in ("daemon_started", "relay_started"):
             for bad in (False, None, "yes", 1):
@@ -315,6 +319,11 @@ class EvaluateEndpointTests(Base):
 
     def test_a_failed_endpoint_with_another_problem_is_invalid(self):
         self.assertEqual(self.evaluate(stragglers=3)["state"], "QA_INVALID")
+
+    def test_exit_123_with_a_verified_endpoint_is_an_ordinary_codex_failure_not_an_endpoint_failure(self):
+        got = self.evaluate(endpoint={"verified": True, "problems": []})
+        self.assertEqual(got["state"], "QA_INCOMPLETE")
+        self.assertIn("codex exited 123", got["reasons"][0])
 
     def test_an_unverified_endpoint_blocks_a_run_that_looks_finished(self):
         (self.run / "verdict.json").write_text("{}")

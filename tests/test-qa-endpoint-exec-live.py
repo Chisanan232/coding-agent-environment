@@ -28,6 +28,7 @@ spec.loader.exec_module(side)
 STAND_IN = '''#!/usr/bin/python3 -I
 import os, socket, sqlite3, threading
 st, port = os.environ["FORNAX_HOME"], int(os.environ["FORNAX_HTTP_PORT"])
+open(st + "/daemon.pid", "w").write(str(os.getpid()))
 db = sqlite3.connect(st + "/fornax.db"); db.execute("create table if not exists t(x)"); db.execute("insert into t values('row')"); db.commit()
 def http():
     s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", port)); s.listen(8)
@@ -51,6 +52,8 @@ while True:
         break
     data += chunk
 open(os.path.join(out, "fake-codex.txt"), "w").write(data.split(b"\\r\\n\\r\\n", 1)[1].decode() + "|" + os.environ["QA_ENDPOINT_STATE"])
+if os.environ.get("FAKE_CODEX_KILL_DAEMON"):
+    os.kill(int(open(os.path.join(os.environ["QA_ENDPOINT_STATE"], "daemon.pid")).read()), signal.SIGKILL)
 if os.environ.get("FAKE_CODEX_WAIT"):
     time.sleep(float(os.environ["FAKE_CODEX_WAIT"]))
 '''
@@ -74,7 +77,7 @@ def free_port():
 class EndpointExecLiveTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix=".cae-exec-live-", dir=str(Path.home())))
-        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.addCleanup(self.remove_scratch)
         self.qa_home, self.ex = self.root / "qa", self.root / "x"
         (self.qa_home / ".codex").mkdir(parents=True)
         (self.qa_home / ".codex" / "auth.json").write_text("synthetic-login")
@@ -111,6 +114,11 @@ class EndpointExecLiveTests(unittest.TestCase):
                                           timeout=60, profile_sha256=self.profile, network="daemon-endpoint", port=self.port, qa_home=str(self.qa_home),
                                           exchange=str(self.ex), attempt="att", manifest_sha256=side.manifest_sha256(self.raw),
                                           daemon_profile_sha256=side.endpoint_digests(self.endpoint)["daemon_profile_sha256"])
+
+    def remove_scratch(self):
+        """The staged payload is 0555 (as in a real outbox), which rmtree cannot empty: make it writable first."""
+        subprocess.run(["/bin/chmod", "-R", "u+w", str(self.root)], capture_output=True)
+        shutil.rmtree(self.root, ignore_errors=True)
 
     def run_exec(self, **env):
         """qa_exec in a forked child: it moves fd 2 to the outbox, installs signal handlers and umask, none of which belongs in this process."""
@@ -160,11 +168,16 @@ class EndpointExecLiveTests(unittest.TestCase):
         self.assertEqual(self.run_exec(), side.PROFILE_CHANGED)
         self.assertFalse((self.outbox / "out" / "fake-codex.txt").exists())
 
+    def test_a_daemon_lost_in_the_last_moments_is_still_caught(self):
+        """Codex kills the daemon and returns at once, before the two-second poll can notice: only the final check can catch it."""
+        code = self.run_exec(FAKE_CODEX_KILL_DAEMON="1")
+        self.assertEqual(code, side.ENDPOINT_FAILED)
+        record = self.record()
+        self.assertFalse(record["established"])
+        self.assertTrue(record.get("daemon_exited_early") or record.get("port_proof_lost"), record)
+
     def test_a_daemon_that_dies_while_codex_runs_stops_codex(self):
-        killer = subprocess.Popen([sys.executable, "-I", "-c",
-                                   "import os,signal,subprocess,time\nfor _ in range(300):\n    out = subprocess.run(['/usr/sbin/lsof','-nP','-iTCP:%d','-sTCP:LISTEN','-Fp'],capture_output=True,text=True).stdout\n    pids=[int(l[1:]) for l in out.split() if l.startswith('p')]\n    if pids:\n        time.sleep(1.0)\n        os.kill(pids[0], signal.SIGKILL)\n        break\n    time.sleep(0.1)\n" % self.port])
-        self.addCleanup(killer.wait)
-        code = self.run_exec(FAKE_CODEX_WAIT="30")
+        code = self.run_exec(FAKE_CODEX_KILL_DAEMON="1", FAKE_CODEX_WAIT="120")
         self.assertEqual(code, side.ENDPOINT_FAILED)
         record = self.record()
         self.assertFalse(record["established"])
