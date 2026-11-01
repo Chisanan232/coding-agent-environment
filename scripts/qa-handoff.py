@@ -1472,6 +1472,8 @@ def verify_endpoint_record(record, endpoint, codex=True):
     if reported is not None and not (isinstance(reported, list) and not reported):
         text = '; '.join(clean(p, 80) for p in reported[:2] if isinstance(p, str)) if isinstance(reported, list) else 'malformed'
         problems.append('the endpoint reported: ' + text)
+    if record.get('daemon_started') is not True or record.get('relay_started') is not True:
+        problems.append('the record does not show both the daemon and the relay started')
     if record.get('established') is not True:
         problems.append('the endpoint was not established')
     view = {'port': endpoint.port, 'controls': profile_controls, 'codex_controls': codex_controls, 'port_proof': proof_view, 'teardown': teardown_view,

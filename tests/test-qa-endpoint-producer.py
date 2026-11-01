@@ -33,7 +33,7 @@ class Base(unittest.TestCase):
         self.endpoint = qa.endpoint_for(self.ident, "att", self.outbox, PORT, {"endpoint": {"daemon": "bin/d", "contract": "fornax-daemon/1"}})
         e = self.endpoint
         self.record = {
-            "established": True, "problems": [],
+            "established": True, "problems": [], "daemon_started": True, "relay_started": True,
             "controls": [{"control": n, "observed": good_observation(x)} for n, x in side.endpoint_control_expectations(e).items()],
             "codex_controls": [{"control": n, "observed": good_observation(x)} for n, _, x in side.ENDPOINT_CODEX_CONTROLS],
             "port_proof": {"listeners": ["127.0.0.1:%d" % PORT], "daemon_pid": 42},
@@ -137,6 +137,11 @@ class VerifyTests(Base):
         self.assertNotIn("x" * 200, text)
         self.assertNotIn("y" * 200, text)
         self.assertEqual(sorted(view["port_proof"]), ["daemon_pid", "listeners"])
+
+    def test_both_processes_must_be_recorded_as_started(self):
+        for key in ("daemon_started", "relay_started"):
+            for bad in (False, None, "yes", 1):
+                self.assertTrue(self.verify(dict(self.record, **{key: bad}))[1], (key, bad))
 
     def test_a_non_dict_record_fails(self):
         for bad in (None, [], "x", 5):

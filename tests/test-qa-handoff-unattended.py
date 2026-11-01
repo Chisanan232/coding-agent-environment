@@ -628,7 +628,7 @@ class UnattendedEndpointTests(PayloadBase):
         self.ident = qa.Identity(QA.pw_name, QA.pw_uid, Path("/tmp/qahome-t"), self.exchange, 0)      # short: a Unix socket path must fit 104 bytes
 
     def endpoint_record(self, endpoint):
-        return {"established": True, "problems": [],
+        return {"established": True, "problems": [], "daemon_started": True, "relay_started": True,
                 "controls": [{"control": n, "observed": {"ALLOWED": "ALLOWED", "REFUSED": "REFUSED"}.get(x, "DENIED:1")}
                              for n, x in SIDE.endpoint_control_expectations(endpoint).items()],
                 "codex_controls": [{"control": n, "observed": {"ALLOWED": "ALLOWED", "DENIED_PROXY": "DENIED_PROXY"}.get(x, "DENIED:1")}
