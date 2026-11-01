@@ -685,29 +685,66 @@ class EndpointLifecycle:
         again = self.ops.process_table()
         return [pid for pid, _ in sorted(before & {(pid, start) for pid, _, start in (again or [])})] if left else []
 
-    @staticmethod
-    def _tree_bytes(root):
-        total = 0
-        for base, dirs, files in os.walk(root):
-            for name in files:
-                try:
-                    total += os.lstat(os.path.join(base, name)).st_size
-                except OSError:
-                    pass
-        return total
-
     def _snapshot_state(self, dst):
-        """Copy the stopped daemon's state directory (links kept as links, sockets skipped) to dst, up to SNAPSHOT_MAX_BYTES."""
-        src = self.endpoint.state
+        """Copy the stopped daemon's state directory to dst through descriptors: nothing is followed, only regular single-link files and
+        directories are copied, bytes are counted as they are copied (limit SNAPSHOT_MAX_BYTES). A link, a hard-linked file (the daemon could
+        have linked something it must not read into its state), a socket or any other node is not copied and makes the snapshot `copied: False`
+        with the names listed, because this copy runs as the QA user without the daemon's sandbox."""
+        refused, budget = [], [SNAPSHOT_MAX_BYTES]
+
+        def walk(dir_fd, target, depth):
+            if depth > 20:
+                refused.append('too deep')
+                return
+            os.mkdir(target, 0o700)
+            for name in sorted(os.listdir(dir_fd)):
+                info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                label = clean(name, 40)
+                if stat.S_ISSOCK(info.st_mode):
+                    continue                                    # the daemon's own listening socket
+                if stat.S_ISDIR(info.st_mode):
+                    sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+                    try:
+                        walk(sub, os.path.join(target, name), depth + 1)
+                    finally:
+                        os.close(sub)
+                    continue
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    refused.append(label)
+                    continue
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+                try:
+                    again = os.fstat(fd)
+                    if not stat.S_ISREG(again.st_mode) or again.st_nlink != 1 or (again.st_dev, again.st_ino) != (info.st_dev, info.st_ino):
+                        refused.append(label)
+                        continue
+                    out = os.open(os.path.join(target, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    try:
+                        while True:
+                            chunk = os.read(fd, 1 << 20)
+                            if not chunk:
+                                break
+                            budget[0] -= len(chunk)
+                            if budget[0] < 0:
+                                raise OverflowError
+                            os.write(out, chunk)
+                    finally:
+                        os.close(out)
+                finally:
+                    os.close(fd)
         try:
-            size = self._tree_bytes(src)
-            if size > SNAPSHOT_MAX_BYTES:
-                return {'copied': False, 'bytes': size, 'error': 'larger than the %d byte limit' % SNAPSHOT_MAX_BYTES}
             dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            shutil.copytree(src, dst, symlinks=True, ignore=lambda d, names: [n for n in names if stat.S_ISSOCK(os.lstat(os.path.join(d, n)).st_mode)])
-            return {'copied': True, 'bytes': size, 'error': None}
-        except (OSError, shutil.Error) as error:
-            return {'copied': False, 'bytes': None, 'error': type(error).__name__}
+            root = os.open(self.endpoint.state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                walk(root, str(dst), 0)
+            finally:
+                os.close(root)
+        except OverflowError:
+            return {'copied': False, 'bytes': SNAPSHOT_MAX_BYTES, 'error': 'larger than the %d byte limit' % SNAPSHOT_MAX_BYTES, 'refused': refused[:10]}
+        except OSError as error:
+            return {'copied': False, 'bytes': None, 'error': type(error).__name__, 'refused': refused[:10]}
+        return {'copied': not refused, 'bytes': SNAPSHOT_MAX_BYTES - budget[0], 'error': None if not refused else 'not copied: links, hard links or special files',
+                'refused': refused[:10]}
 
     def teardown(self, snapshot=None):
         """Relay first, then daemon, then verify: both stopped, nothing that descended from either is left, the port refuses, both sockets
