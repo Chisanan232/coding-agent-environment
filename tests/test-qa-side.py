@@ -1297,6 +1297,198 @@ class EndpointProfileTests(unittest.TestCase):
         self.assertNotIn(str(e.state), got)
 
 
+GOLDEN_REV = "efd339d"            # origin/main before SPE-155: the fornax-daemon/1 generators must still produce exactly its bytes
+
+
+def load_golden_side():
+    """scripts/qa-side.py as it was at GOLDEN_REV, imported from the bytes git holds (nothing of it is written to disk)."""
+    done = subprocess.run(["git", "-C", str(SCRIPTS), "show", "%s:scripts/qa-side.py" % GOLDEN_REV], capture_output=True)
+    if done.returncode != 0:
+        raise unittest.SkipTest("git cannot show %s (a shallow clone?): the fornax golden comparison needs it" % GOLDEN_REV)
+    module = type(sys)("qa_side_golden")
+    exec(compile(done.stdout, "qa-side.py@" + GOLDEN_REV, "exec"), module.__dict__)
+    return module
+
+
+class FornaxGoldenTests(unittest.TestCase):
+    """fornax-daemon/1 behaviour is byte-identical to GOLDEN_REV: the Codex profile, both sandbox profiles, the relay, every digest, both
+    control tables, both environments and the lifecycle's initial record, for two different endpoints."""
+
+    def endpoints(self, module):
+        home, ex = "/Users/qa", "/Users/Shared/qa-qa"
+        for attempt, port in (("att-1", 23456), ("fornax-FORNX-9-run-0123abcd", 31999)):
+            pay = ex + "/outbox/" + attempt + "/payload"
+            yield module.Endpoint(home, ex, attempt, port, "fornax-daemon/1", pay, pay + "/bin/daemon")
+
+    def test_every_fornax_generator_output_is_unchanged(self):
+        old = load_golden_side()
+        for e_old, e_new in zip(self.endpoints(old), self.endpoints(side)):
+            run_dir = Path(e_new.payload_dir).parent
+            for name in ("dir", "state", "tmp", "rl", "daemon_sock", "relay_sock", "port"):
+                self.assertEqual(getattr(e_old, name), getattr(e_new, name), name)
+            self.assertEqual(old.profile_toml(run_dir, [run_dir / "payload"], home="/Users/qa", codex_home="/Users/qa/.codex", endpoint=e_old),
+                             side.profile_toml(run_dir, [run_dir / "payload"], home="/Users/qa", codex_home="/Users/qa/.codex", endpoint=e_new))
+            self.assertEqual(old.daemon_sb(e_old), side.daemon_sb(e_new))
+            self.assertEqual(old.relay_sb(e_old), side.relay_sb(e_new))
+            self.assertEqual(old.RELAY_SRC, side.RELAY_SRC)
+            self.assertEqual(old.endpoint_digests(e_old), side.endpoint_digests(e_new))
+            self.assertEqual(old.endpoint_probe_table(e_old, "/c", "/a", 24999, "/d/qa-decoy.sock", None),
+                             side.endpoint_probe_table(e_new, "/c", "/a", 24999, "/d/qa-decoy.sock", None))
+            self.assertEqual(old.endpoint_control_expectations(e_old), side.endpoint_control_expectations(e_new))
+            self.assertEqual(old.ENDPOINT_CODEX_CONTROLS, side.endpoint_codex_controls(e_new))
+            self.assertEqual(old.ENDPOINT_CODEX_CONTROLS, side.RELAY_CODEX_CONTROLS)
+            self.assertEqual(old.EndpointLifecycle(e_old, "/r").record, side.EndpointLifecycle(e_new, "/r").record)
+            self.assertEqual(list(old.EndpointLifecycle(e_old, "/r").record), list(side.EndpointLifecycle(e_new, "/r").record))
+            self.assertEqual(e_old.daemon_env(), e_new.daemon_env())
+            self.assertEqual(e_old.tool_env(), e_new.tool_env())
+            self.assertEqual([e_new.daemon_binary], e_new.daemon_argv())       # started exactly as before: sandbox-exec -f daemon.sb <binary>
+
+
+class UnixEndpointProfileTests(unittest.TestCase):
+    """circinus-daemon/1 (SPE-155): a daemon that serves its own Unix socket and binds no port. Pure generators only."""
+    HOME = "/Users/qa"
+    EX = "/Users/Shared/qa-qa"
+    PAY = "/Users/Shared/qa-qa/outbox/att-1/payload"
+
+    def endpoint(self, **over):
+        args = dict(qa_home=self.HOME, exchange=self.EX, attempt="att-1", port=0, contract="circinus-daemon/1",
+                    payload_dir=self.PAY, daemon_binary=self.PAY + "/bin/python3.13")
+        args.update(over)
+        return side.Endpoint(**args)
+
+    def test_paths_have_no_relay_and_the_socket_is_under_the_state(self):
+        e = self.endpoint()
+        self.assertEqual(e.transport, "unix")
+        self.assertIsNone(e.rl)
+        self.assertIsNone(e.relay_sock)
+        self.assertEqual(e.daemon_sock, e.state / "circinus" / "circinusd.sock")
+        self.assertEqual(e.codex_sockets(), [e.daemon_sock])
+        self.assertLess(len(str(e.daemon_sock).encode()), side.SUN_PATH_LIMIT)
+
+    def test_a_port_or_a_wrong_pairing_is_refused(self):
+        for port in (25000, 1, -1, True, False, "0", None, 0.0):
+            with self.assertRaises(side.EndpointError, msg=repr(port)):
+                self.endpoint(port=port)
+        with self.assertRaises(side.EndpointError):          # and the tcp-relay contract still refuses port 0
+            self.endpoint(contract="fornax-daemon/1", daemon_binary=self.PAY + "/bin/daemon")
+
+    def test_a_socket_path_over_the_limit_is_refused(self):
+        with self.assertRaises(side.EndpointError) as caught:
+            self.endpoint(qa_home="/Users/" + "q" * 60)
+        self.assertIn("circinusd.sock", str(caught.exception))
+
+    def test_codex_profile_allows_only_the_daemon_socket_and_is_otherwise_the_fornax_profile(self):
+        e = self.endpoint()
+        run_dir = Path(self.EX + "/outbox/att-1")
+        text = side.profile_toml(run_dir, [run_dir / "payload"], home=self.HOME, codex_home=self.HOME + "/.codex", endpoint=e)
+        table = text.split("[permissions.qa_confined.network.unix_sockets]\n")[1].strip().splitlines()
+        self.assertEqual(table, ['"%s" = "allow"' % e.daemon_sock])
+        fornax = self.endpoint(port=23456, contract="fornax-daemon/1", daemon_binary=self.PAY + "/bin/python3.13")
+        other = side.profile_toml(run_dir, [run_dir / "payload"], home=self.HOME, codex_home=self.HOME + "/.codex", endpoint=fornax)
+        head = lambda t: t.split("[permissions.qa_confined.network.unix_sockets]\n")[0]
+        self.assertEqual(head(text).replace(str(e.state), "STATE"), head(other).replace(str(fornax.state), "STATE"))
+        self.assertIn('"%s" = "read"' % e.state, text)
+        self.assertNotIn('"%s" = "write"' % e.state, text)
+
+    def test_daemon_profile_has_no_port_and_binds_only_under_its_state(self):
+        e = self.endpoint()
+        lines = side.daemon_sb(e).splitlines()
+        self.assertEqual(lines[:3], ["(version 1)", "(allow default)", "(deny network*)"])
+        self.assertEqual([l for l in lines if l.startswith("(allow network")],
+                         ['(allow network-bind (local unix-socket (subpath "%s")))' % e.state,
+                          '(allow network-inbound (local unix-socket (subpath "%s")))' % e.state])
+        self.assertNotIn("localhost", "\n".join(lines))
+        writes = next(l for l in lines if l.startswith("(allow file-write*"))
+        self.assertEqual(writes, '(allow file-write* (subpath "%s") (subpath "%s") (literal "/dev/null") (literal "/dev/dtracehelper"))' % (e.state, e.tmp))
+        self.assertEqual(next(l for l in lines if l.startswith("(allow file-read* ")),
+                         '(allow file-read* (subpath "%s") (subpath "%s") (subpath "%s"))' % (e.state, e.tmp, self.PAY))
+        fornax_lines = side.daemon_sb(self.endpoint(port=23456, contract="fornax-daemon/1")).splitlines()
+        self.assertEqual([l for l in fornax_lines if "localhost" not in l], lines)       # the same profile minus the two port lines
+
+    def test_launch_environment_and_digests(self):
+        e = self.endpoint()
+        self.assertEqual(e.daemon_argv(), [self.PAY + "/bin/python3.13", "-I", "-B", "-c", side.CIRCINUS_BOOTSTRAP, "daemon-run"])
+        self.assertEqual(e.daemon_env(), {"PATH": "/usr/bin:/bin", "DEVELOPER_DIR": side.DEVELOPER_DIR, "HOME": str(e.tmp),
+                                          "XDG_CONFIG_HOME": str(e.tmp / "config"), "XDG_STATE_HOME": str(e.state), "TMPDIR": str(e.tmp)})
+        self.assertNotIn("XDG_RUNTIME_DIR", e.daemon_env())
+        self.assertEqual(e.tool_env(), {"QA_ENDPOINT_STATE": str(e.state), "QA_ENDPOINT_SOCK": str(e.daemon_sock), "XDG_STATE_HOME": str(e.state)})
+        d = side.endpoint_digests(e)
+        self.assertEqual(set(d), {"daemon_profile_sha256", "daemon_launch_sha256"})
+        self.assertEqual(d["daemon_profile_sha256"], hashlib.sha256(side.daemon_sb(e).encode()).hexdigest())
+        launch = json.dumps({"argv": e.daemon_argv(), "env": e.daemon_env()}, sort_keys=True)
+        self.assertEqual(d["daemon_launch_sha256"], hashlib.sha256(launch.encode()).hexdigest())
+        with mock.patch.dict(side.ENDPOINT_CONTRACTS["circinus-daemon/1"], argv=("-I", "-c", "import os")):
+            self.assertNotEqual(side.endpoint_digests(e)["daemon_launch_sha256"], d["daemon_launch_sha256"])
+
+    def test_probe_table_is_daemon_only_with_the_unix_bind_controls(self):
+        e = self.endpoint()
+        table = side.endpoint_probe_table(e, "/c", "/a", 24999, "/d/qa-decoy.sock", None)
+        names = [n for n, *_ in table]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual({p for _, p, _, _ in table}, {"daemon.sb"})
+        expect = {n: x for n, _, _, x in table}
+        self.assertEqual(expect["neg_d_bind_loopback"], "DENIED_EPERM")
+        self.assertEqual(expect["neg_d_bind_tmp_socket"], "DENIED_EPERM")
+        self.assertEqual(expect["pos_d_bind_state_socket"], "ALLOWED")
+        for gone in ("pos_d_bind_port", "neg_d_bind_other_port", "neg_d_write_rl", "neg_d_list_rl"):
+            self.assertNotIn(gone, names)
+        for kept in ("neg_d_testnet4", "neg_d_udp", "neg_d_resolver", "neg_d_canary_listener", "neg_d_decoy_socket", "neg_d_read_login",
+                     "pos_d_sqlite_state", "pos_d_read_payload"):
+            self.assertIn(kept, names)
+        for name, profile, code, x in table:
+            compile(code, name, "exec")
+        self.assertEqual(side.endpoint_control_expectations(e), expect)
+
+    def test_codex_controls_are_the_unix_set(self):
+        e = self.endpoint()
+        controls = side.endpoint_codex_controls(e)
+        self.assertEqual([c[0] for c in controls], ["pos_uds_daemon_ping", "neg_write_endpoint_state", "neg_unlink_daemon_sock", "neg_tcp_loopback",
+                                                     "neg_uds_decoy", "neg_mkdir_endpoint_exec", "neg_write_endpoint_record", "neg_list_endpoint_tmp",
+                                                     "neg_proxy_connect"])
+        values = {"relay": "", "daemon_sock": str(e.daemon_sock), "port": 0, "decoy": "/d/qa-decoy.sock", "record_exec": "/r/x", "record_stage": "/r/s",
+                  "rl": "", "etmp": str(e.tmp), "state": str(e.state)}
+        for name, snippet, _ in controls:
+            compile(snippet.format(**values), name, "exec")
+        ping = dict((c[0], c[1]) for c in controls)["pos_uds_daemon_ping"].format(**values)
+        self.assertIn("s.sendall(b'{\"event\": \"ping\"}\\n')\n    s.shutdown(socket.SHUT_WR)", ping)
+        self.assertEqual(len(b'{"event": "ping"}\n'), 18)
+
+    def test_a_ping_snippet_run_against_a_real_daemon_double_passes(self):
+        """The Codex-side ping, run unsandboxed against a listener that speaks the product's protocol, prints ALLOWED; one that does not
+        answer with ok:true prints the denial."""
+        import socket as sk
+        import threading
+        root = Path(tempfile.mkdtemp(prefix="qp"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        path = str(root / "d.sock")
+        for reply, want in ((b'{"ok": true, "mode": "shadow"}\n', "ALLOWED"), (b'{"ok": false}\n', "DENIED:NOPING"), (b"nope\n", "DENIED:NOPING")):
+            server = sk.socket(sk.AF_UNIX)
+            server.bind(path)
+            server.listen(1)
+            got = []
+
+            def serve():
+                conn, _ = server.accept()
+                data = b""
+                while True:
+                    chunk = conn.recv(100)
+                    if not chunk:
+                        break
+                    data += chunk
+                got.append(data)
+                conn.sendall(reply)
+                conn.close()
+            thread = threading.Thread(target=serve)
+            thread.start()
+            snippet = dict((c[0], c[1]) for c in side.UNIX_CODEX_CONTROLS)["pos_uds_daemon_ping"].format(daemon_sock=path)
+            done = subprocess.run([sys.executable, "-I", "-c", snippet], capture_output=True, text=True, timeout=30)
+            thread.join(10)
+            server.close()
+            os.unlink(path)
+            self.assertEqual(done.stdout.strip(), want, reply)
+            self.assertEqual(got, [b'{"event": "ping"}\n'])        # read to EOF: the client half-closed after exactly the 18 bytes
+
+
 class NetworkControlTests(unittest.TestCase):
     NET = ("neg_loopback_bind", "neg_uds_bind", "neg_testnet_connect", "neg_testnet6_connect", "neg_udp_testnet", "neg_resolver_socket")
 
