@@ -7,6 +7,7 @@ import os
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -626,6 +627,21 @@ class UnixFakes(Fakes):
         self.sent = []                      # pings that got past the guard: a refused peer must never be sent a byte
         self.uds_errno = side.ECONNREFUSED
         self.groups = {}
+        self.node_generation = 0            # the socket node's inode as the lifecycle sees it: bumped by replace_socket(), never by the fs
+
+    def lstat(self, path):
+        """Real lstat (types, modes, owners, links), but the daemon socket's inode is node_generation: a replaced node is a new inode on
+        every file system (Linux reuses a freed inode number at once, so the real number cannot show a swap)."""
+        info = os.lstat(path)
+        if Path(path) == self.e.daemon_sock and stat.S_ISSOCK(info.st_mode):
+            return os.stat_result((info.st_mode, 1000 + self.node_generation) + tuple(info)[2:10])
+        return info
+
+    def replace_socket(self):
+        """What a hostile daemon does: a new socket node at the same path."""
+        self.e.daemon_sock.unlink()
+        self.bind_socket()
+        self.node_generation += 1
 
     def bind_socket(self, path=None):
         import socket as sk
@@ -680,7 +696,7 @@ class UnixFakes(Fakes):
         return side.EndpointOps(popen=self.popen, run=self.run, sleep=self.clock.sleep, monotonic=self.clock.now, connect=self.connect,
                                 listeners=self.listeners, killpg=self.killpg, rmtree=self.rmtree, canary_listener=self.canary_listener,
                                 decoy_socket=self.decoy_socket, leader_exited=self.leader_exited, process_table=self.process_table, kill=self.kill,
-                                uds_ping=self.uds_ping, uds_connect=self.uds_connect, inet_sockets=self.inet_sockets)
+                                uds_ping=self.uds_ping, uds_connect=self.uds_connect, inet_sockets=self.inet_sockets, lstat=self.lstat)
 
 
 class UnixBase(LifecycleBase):
@@ -824,14 +840,14 @@ class UnixStartTests(UnixBase):
         self.assertEqual(daemon[3], self.endpoint.daemon_env())
         proof = self.life.record["socket_proof"]
         pid = self.fakes.procs["daemon"].pid
-        ino = os.lstat(self.endpoint.daemon_sock).st_ino
+        ino = self.fakes.lstat(self.endpoint.daemon_sock).st_ino
         self.assertEqual(proof, {"socket": str(self.endpoint.daemon_sock), "peer_pid": 7001, "peer_pgid": pid, "peer_uid": os.getuid(),
                                  "daemon_pid": pid, "mode": 0o600, "ping_mode": "shadow", "inet": [], "inode_stable": True,
                                  "inode_before_connect": ino, "inode_after_connect": ino})
         self.assertGreaterEqual(len(self.fakes.pings), 2)          # readiness, then the proof's own connection
         self.assertIn(("inet", pid, frozenset({pid})), self.fakes.log)
         self.assertEqual(proof["inode_before_connect"], proof["inode_after_connect"])
-        self.assertEqual(proof["inode_before_connect"], os.lstat(self.endpoint.daemon_sock).st_ino)
+        self.assertEqual(proof["inode_before_connect"], 1000)
 
     def test_a_leader_peer_and_the_enforce_mode_pass(self):
         self.fakes.peer = "leader"
@@ -871,7 +887,7 @@ class UnixStartTests(UnixBase):
         self.refused_everywhere("another user")
 
     def test_a_node_changed_between_lstat_and_connect_is_never_sent_a_byte(self):
-        self.fakes.on_ping = lambda: (self.endpoint.daemon_sock.unlink(), self.fakes.bind_socket())     # a new inode at the same path
+        self.fakes.on_ping = self.fakes.replace_socket                                                  # a new inode at the same path
         self.refused_everywhere("while it was being connected to")
 
     def test_a_bad_ping_reply_never_becomes_ready(self):
@@ -893,8 +909,7 @@ class UnixStartTests(UnixBase):
         def swap():
             if len(self.fakes.pings) >= 2 and not swaps:              # after readiness: during the proof's own connection
                 swaps.append(1)
-                self.endpoint.daemon_sock.unlink()
-                self.fakes.bind_socket()
+                self.fakes.replace_socket()
         self.fakes.on_reply = swap                               # after the guard passed: only the post-reply lstat sees it
         with self.assertRaises(side.EndpointFailed) as caught:
             self.life.start()
@@ -966,7 +981,7 @@ class UnixSupervisionAndTeardownTests(UnixBase):
         self.assertEqual(self.life.record["socket_recheck"], self.life.record["socket_proof"])
 
     def test_a_replaced_socket_or_a_new_inet_socket_stops_the_daemon(self):
-        for mutate, final in ((lambda: (self.endpoint.daemon_sock.unlink(), self.fakes.bind_socket()), False),
+        for mutate, final in ((lambda: self.fakes.replace_socket(), False),
                               (lambda: setattr(self.fakes, "inet", ["127.0.0.1:80"]), False),
                               (lambda: setattr(self.fakes, "peer", "stranger"), True)):
             self.setUp()
@@ -1031,13 +1046,13 @@ while True:
 """
 
 
+@unittest.skipUnless(sys.platform == "darwin", "the real uds_ping reads macOS LOCAL_PEERPID/LOCAL_PEERCRED")
 class SwappedSocketRealTests(UnixBase):
     """The REAL uds_ping (connect follows a link) against a node the daemon swapped for a link to someone else's listening socket between
     the lstat walk and connect: the guard refuses before the first byte, in readiness and in the proof. The other listener must log zero
     bytes for both connections (and logs the 18 of an unguarded ping, the positive control)."""
 
     def setUp(self):
-        import sys
         super().setUp()
         self.other, self.log = self.endpoint.dir.parent.parent / "o.sock", self.endpoint.dir.parent.parent / "o.log"
         proc = subprocess.Popen([sys.executable, "-I", "-c", OTHER_LISTENER, str(self.other), str(self.log)], start_new_session=True)
@@ -1077,8 +1092,7 @@ class SwappedSocketRealTests(UnixBase):
         self.assertEqual(self.logged(1), ["18"])
         self.swap_after_first_walk()
         self.assertFalse(self.life._answers())
-        self.endpoint.daemon_sock.unlink()
-        self.fakes.bind_socket()
+        self.fakes.replace_socket()
         self.swap_after_first_walk()
         with self.assertRaises(side.EndpointFailed):
             self.life.prove_socket()
