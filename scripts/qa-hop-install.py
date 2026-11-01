@@ -2,10 +2,13 @@
 """One-time owner install of the unattended QA hop (SPE-153, ADR 0016).
 
   qa-hop-install.py plan     --qa-name N --qa-uid U --codex-source PATH --codex-sha256 HEX [--exchange DIR] [--producer-uid U]
-  sudo /usr/bin/python3 -I -B /Library/cae-qa-install/qa-hop-install.py apply (same arguments) --bundle-sha256 H --helper-sha256 H
+  sudo <TRUSTED_PYTHON> -I -B /Library/cae-qa-install/qa-hop-install.py apply (same arguments) --bundle-sha256 H --helper-sha256 H
                                                                          installs; root only, run through YOUR own sudo
   qa-hop-install.py verify   (same arguments)                              unprivileged re-check of the installed state
-  sudo /usr/bin/python3 -I qa-hop-install.py rollback --qa-name N --qa-uid U   removes the drop-in first, then the files
+  sudo <TRUSTED_PYTHON> -I -B /Library/cae-qa-install/qa-hop-install.py rollback --qa-name N --qa-uid U   removes the drop-in first, then the files
+
+TRUSTED_PYTHON is the real Command Line Tools binary printed by `plan` (not the xcode-select shim /usr/bin/python3, which a same-user
+process can redirect); `apply` and `rollback` refuse to run under any other interpreter.
 
 Root must never run code a less-privileged user can change. `apply` and `rollback` therefore refuse unless this file, the three
 scripts it loads (qa-identity-setup.py, qa-handoff.py, qa-side.py) and every directory above them are root-owned, not group or
@@ -43,6 +46,8 @@ MACHO_MAGIC = (b'\xfe\xed\xfa\xce', b'\xfe\xed\xfa\xcf', b'\xce\xfa\xed\xfe', b'
                b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca', b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca')
 PRODUCER_RE = re.compile(r'[A-Za-z_][A-Za-z0-9._-]{0,31}')
 INSTALL_COPY = '/Library/cae-qa-install'
+# Same value as qa-side.TRUSTED_PYTHON (a test asserts it); kept here so `rollback` need not load any other script as root to know it.
+TRUSTED_PYTHON = '/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9'
 MAX_CODEX_BYTES = 2 << 30
 SAFE_ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
 
@@ -684,6 +689,9 @@ def main(argv=None, layout=None, ops=None, out=None):
         bundle = Bundle(layout.bundle_dir)
         if mode in ('apply', 'rollback'):
             need_root(layout, ops)
+            if ops.interpreter() != TRUSTED_PYTHON:
+                raise Stop('this mode must run under the trusted interpreter %s (the line printed by plan), not %s; refusing. To remove the grant by hand: '
+                           'sudo /bin/rm -f %s' % (TRUSTED_PYTHON, ops.interpreter(), layout.sudoers))
             require_trusted_bundle(bundle, layout, only=None if mode == 'apply' else ('qa-hop-install.py',))
         if mode == 'apply':
             if not (HEX64.fullmatch(args.bundle_sha256) and HEX64.fullmatch(args.helper_sha256)):

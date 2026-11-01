@@ -327,6 +327,20 @@ class TrustedInterpreterTests(Case):
         self.assertIn("swapped", out)
 
 
+class RollbackInterpreterTests(Case):
+    def test_rollback_also_refuses_a_shim_interpreter_and_names_the_manual_removal(self):
+        self.installed()
+        self.env.interpreter = "/usr/bin/python3"
+        code, out = self.env.main("rollback")
+        self.assertEqual(code, 1, out)
+        self.assertIn("trusted interpreter", out)
+        self.assertIn("rm -f", out)
+        self.assertTrue(os.path.lexists(self.env.layout.sudoers))
+
+    def test_the_installer_constant_equals_the_helper_constant(self):
+        self.assertEqual(inst.TRUSTED_PYTHON, inst.Bundle(self.env.install).module("qa-side").TRUSTED_PYTHON)
+
+
 class ApplyTests(Case):
     def test_apply_installs_everything_in_order_with_exact_modes(self):
         out = self.installed()
