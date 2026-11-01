@@ -559,7 +559,7 @@ class UnattendedPayloadTests(RunBase):
         self.run_payload()
         self.assertEqual({v for v, _ in self.calls}, {"version", "stage"})
         self.assertEqual(set(SIDE.ALLOWED_ARGV), {"version", "probe", "stage", "exec"})
-        self.assertEqual(SIDE.REQUEST_KEYS["stage"], {"verb": str, "attempt": str})
+        self.assertEqual(SIDE.REQUEST_KEYS["stage"], {"verb": str, "attempt": str, "network": str, "port": int})
 
     def test_a_failed_self_test_never_reaches_the_exec_hop(self):
         bad = [{"id": "t", "exit": 1, "timed_out": False, "unrunnable": False, "stdout_bytes": 3, "stdout_sha256": self.tool_out,

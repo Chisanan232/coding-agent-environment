@@ -92,8 +92,8 @@ class Tree:
     @staticmethod
     def good_request(verb, attempt=ATTEMPT):
         return {"probe": {"verb": "probe", "attempt": attempt, "pid": 4242, "sentinel": SENTINEL},
-                "stage": {"verb": "stage", "attempt": attempt},
-                "exec": {"verb": "exec", "attempt": attempt, "timeout": 1800, "profile_sha256": SHA}}[verb]
+                "stage": {"verb": "stage", "attempt": attempt, "network": "none", "port": 0},
+                "exec": {"verb": "exec", "attempt": attempt, "timeout": 1800, "profile_sha256": SHA, "network": "none", "port": 0}}[verb]
 
     def write_config(self):
         self.cfg.write_text(json.dumps(self.config))
@@ -446,13 +446,28 @@ class RequestTests(InstalledCase):
         base = Tree.good_request("exec")
         bad = [dict(base, timeout=59), dict(base, timeout=14401), dict(base, timeout="1800"), dict(base, timeout=True),
                dict(base, timeout=1800.0), dict(base, timeout=None), dict(base, profile_sha256="C" * 64),
-               dict(base, profile_sha256="c" * 63), dict(base, profile_sha256="c" * 64 + "\n"), dict(base, profile_sha256=5)]
+               dict(base, profile_sha256="c" * 63), dict(base, profile_sha256="c" * 64 + "\n"), dict(base, profile_sha256=5),
+               dict(base, network="daemon-endpoint", port=25000)]            # exec cannot start an endpoint yet
         for request in bad:
             t = self.tree(request=request)
             self.assertRefused(t, ["exec", ATTEMPT], json.dumps(request))
         for edge in (60, 14400):
             t = self.tree(request=dict(base, timeout=edge))
             self.assertEqual(self.dry(t)["verb"], "exec")
+
+    def test_typed_ranges_stage_network_and_port(self):
+        base = Tree.good_request("stage")
+        bad = [dict(base, network="open"), dict(base, network=None), dict(base, network=1), dict(base, port=25000),
+               dict(base, network="daemon-endpoint"), dict(base, network="daemon-endpoint", port=19999),
+               dict(base, network="daemon-endpoint", port=32768), dict(base, network="daemon-endpoint", port="25000"),
+               dict(base, network="daemon-endpoint", port=True), dict(base, network="daemon-endpoint", port=25000.0),
+               {k: v for k, v in base.items() if k != "port"}, {k: v for k, v in base.items() if k != "network"}]
+        for request in bad:
+            t = self.tree(request=request, verb="stage")
+            self.assertRefused(t, ["stage", ATTEMPT], json.dumps(request))
+        for edge in (20000, 32767):
+            t = self.tree(request=dict(base, network="daemon-endpoint", port=edge), verb="stage")
+            self.assertEqual(self.dry(t, "stage")["verb"], "stage")
 
     def test_typed_ranges_probe(self):
         base = Tree.good_request("probe")

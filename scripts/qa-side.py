@@ -1514,6 +1514,9 @@ def stage_outbox(args, build_env=None, copy_source=None, open_payload=None):
     if network == 'daemon-endpoint':
         try:
             endpoint = build_endpoint(args, outbox, manifest)
+            # The profile denies HOME's secret directories and the login directory by path; they must be the QA account's own.
+            if HOME != Path(args.qa_home) or real_codex_home() != Path(args.qa_home) / '.codex':
+                raise EndpointError('the process HOME or Codex login directory is not the QA home\'s')
         except EndpointError as error:
             payload_record['problems'] = [clean(str(error), 160)]
             return {'payload': payload_record}
@@ -1672,7 +1675,7 @@ print(json.dumps(out))
 # root-owned config or from a request file that is validated before a single path is derived. Any failure prints nothing
 # and exits non-zero; the producer maps that to QA_INCOMPLETE. This mode is not installed anywhere yet.
 # ---------------------------------------------------------------------------------------------------------------------
-PROTOCOL = 1
+PROTOCOL = 2                          # 2: stage and exec requests carry network and port
 ROOT_UID = 0                          # tests substitute the current uid to stand in for root; never read from argv or env
 CONFIG_PATH = '/Library/cae-qa/qa-side.json'
 CHILD_PATH = '/usr/bin:/bin:/usr/sbin:/sbin'
@@ -1695,8 +1698,8 @@ ALLOWED_ARGV = {
 CONFIG_KEYS = {'qa_name': str, 'qa_uid': int, 'producer_uid': int, 'exchange': str, 'codex_path': str, 'codex_sha256': str}
 REQUEST_KEYS = {
     'probe': {'verb': str, 'attempt': str, 'pid': int, 'sentinel': str},
-    'stage': {'verb': str, 'attempt': str},
-    'exec': {'verb': str, 'attempt': str, 'timeout': int, 'profile_sha256': str},
+    'stage': {'verb': str, 'attempt': str, 'network': str, 'port': int},
+    'exec': {'verb': str, 'attempt': str, 'timeout': int, 'profile_sha256': str, 'network': str, 'port': int},
 }
 REQUEST_MAX = 4096
 CONFIG_MAX = 65536
@@ -1833,6 +1836,11 @@ def read_request(config, verb, attempt, fds):
         _need(request['pid'] > 1 and SENTINEL_RE.fullmatch(request['sentinel']) is not None)
     if verb == 'exec':
         _need(60 <= request['timeout'] <= 14400 and SHA256_RE.fullmatch(request['profile_sha256']) is not None)
+    if verb in ('stage', 'exec'):
+        _need(request['network'] in ('none', 'daemon-endpoint'))
+        _need(request['port'] == 0 if request['network'] == 'none' else PORT_RANGE[0] <= request['port'] <= PORT_RANGE[1])
+    if verb == 'exec':
+        _need(request['network'] == 'none')       # the exec-time endpoint lifecycle is not built yet: no model starts without it
     return request, afd
 
 
@@ -2071,7 +2079,9 @@ def _act(plan):
         pin_process(plan['qa_home'])
         outbox, codex_home = plan['outbox'], plan['codex_home']
         env = installed_env(plan['qa_name'], plan['qa_home'], outbox, codex_home)
-        ns = argparse.Namespace(inbox=plan['inbox'], outbox=outbox, codex_home=codex_home, codex_bin=plan['codex'])
+        ns = argparse.Namespace(inbox=plan['inbox'], outbox=outbox, codex_home=codex_home, codex_bin=plan['codex'],
+                                network=plan['request'].get('network', 'none'), port=plan['request'].get('port', 0),
+                                qa_home=plan['qa_home'], exchange=plan['exchange'], attempt=plan['attempt'])
         if plan['verb'] == 'stage':
             source_fd = open_source_dir(plan['afd'], plan['producer_uid'])
             return qa_stage(ns, lambda: env, lambda dst: copy_tree_at(source_fd, dst, plan['producer_uid']),
