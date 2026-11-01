@@ -221,6 +221,18 @@ class CreateTests(LifecycleBase):
         self.assertEqual((self.record_dir / "relay.sb").read_text(), side.relay_sb(e))
         self.assertEqual(self.life.record["daemon_profile_sha256"], side.endpoint_digests(e)["daemon_profile_sha256"])
 
+    def test_teardown_after_a_failed_create_leaves_a_directory_it_did_not_make(self):
+        self.life.create()
+        marker = self.endpoint.state / "theirs"
+        marker.write_text("x")
+        other = side.EndpointLifecycle(self.endpoint, self.record_dir, self.fakes.ops())
+        with self.assertRaises(side.EndpointFailed):
+            other.create()
+        steps = other.teardown()
+        self.assertTrue(marker.exists())
+        self.assertFalse(steps["clean"])
+        self.assertTrue(steps["not_ours"])
+
     def test_an_existing_endpoint_directory_is_a_failure(self):
         self.life.create()
         with self.assertRaises(side.EndpointFailed):
@@ -376,6 +388,8 @@ class StartTests(LifecycleBase):
         self.assertIn("port_proof_lost", self.life.record)
         relay = self.fakes.procs["relay"]
         self.assertIn((relay.pid, signal.SIGTERM), self.fakes.signals)                      # the relay stops carrying traffic
+        daemon = self.fakes.procs["daemon"]
+        self.assertIn((daemon.pid, signal.SIGKILL), self.fakes.signals)                     # and a wildcard-bound daemon stops serving
 
     def test_a_port_that_does_not_accept_connections_fails(self):
         self.fakes.connect_after_start = 61

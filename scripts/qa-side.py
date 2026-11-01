@@ -366,7 +366,7 @@ class EndpointOps:
 
     @staticmethod
     def _listeners(port):
-        """[(pid, 'address:port')] for EVERY TCP listener on the port system-wide, or None when they cannot be listed. lsof, not a guess:
+        """[(pid, 'address:port')] for every TCP listener on the port that lsof can list for this user (other users' sockets are not visible to it), or None when they cannot be listed. lsof, not a guess:
         the bind scope of a sandbox-exec rule cannot be pinned to 127.0.0.1, so the sockets themselves are the proof, and a second
         listener on the same port from another process shows up here too."""
         try:
@@ -496,6 +496,7 @@ class EndpointLifecycle:
         self.endpoint, self.record_dir, self.ops = endpoint, Path(record_dir), ops or EndpointOps()
         self.sandbox_exec, self.python = sandbox_exec, python
         self.daemon = self.relay = None
+        self._owns_dir = False                 # set only after OUR exclusive mkdir; teardown never touches a directory it did not create
         self.record = {'port': endpoint.port, 'mode': 'daemon-endpoint', 'controls': [], 'problems': [], 'daemon_started': False,
                        'relay_started': False, 'port_proof': None, 'teardown': None}
         self._closers = []
@@ -517,6 +518,7 @@ class EndpointLifecycle:
             os.mkdir(e.dir, 0o700)
         except FileExistsError:
             raise EndpointFailed('the endpoint directory already exists')
+        self._owns_dir = True
         for sub in (e.state, e.tmp, e.rl):
             os.mkdir(sub, 0o700)
         self.record_dir.mkdir(mode=0o700, exist_ok=True)
@@ -579,7 +581,7 @@ class EndpointLifecycle:
         self._wait_for(lambda: not self.ops.leader_exited(self.relay) and os.path.exists(e.relay_sock), RELAY_START_SECONDS, 'the relay')
 
     def prove_port(self):
-        """The port is the daemon's alone and bound to loopback only: EVERY TCP listener on the port, system-wide, must be exactly one, owned
+        """The port is the daemon's alone and bound to loopback only: every TCP listener on the port that lsof lists for this user must be exactly one, owned
         by the daemon's pid, at 127.0.0.1. A wildcard or IPv6 listener, a second listener, or one held by another process fails the
         endpoint. The sandbox rule cannot forbid a wildcard bind, so this is the only control on it, and supervise() repeats it."""
         found = self.ops.listeners(self.endpoint.port)
@@ -607,6 +609,7 @@ class EndpointLifecycle:
             self.record['port_proof_lost'] = str(error)
             self.record['problems'].append(str(error))
             self._stop(self.relay, 0)
+            self._stop(self.daemon, 0)                          # a daemon on a wildcard bind must not keep serving while the caller reacts
             return False
         return True
 
@@ -670,7 +673,8 @@ class EndpointLifecycle:
     def teardown(self):
         """Relay first, then daemon, then verify: both stopped, nothing that descended from either is left, the port refuses, both sockets
         are gone (unlinked here if the daemon left one, and said so), the endpoint directory is removed. Safe to call twice and after a failed
-        start."""
+        start; if create() did not make the directory (it already existed) nothing is removed and the result is not clean. `clean` covers
+        the two process groups and the descendants seen before the stop; a process that escaped earlier is the producer's whole-QA-user sweep."""
         e = self.endpoint
         steps = {'relay_stopped': False, 'daemon_stopped': False, 'descendants_left': [], 'port_closed': False, 'socket_removed_by_helper': [],
                  'sockets_gone': False, 'dir_removed': False}
@@ -688,7 +692,7 @@ class EndpointLifecycle:
                 pass
         self._closers = []
         steps['port_closed'] = self.ops.connect(e.port) == ECONNREFUSED
-        for sock in (e.daemon_sock, e.relay_sock):
+        for sock in ((e.daemon_sock, e.relay_sock) if self._owns_dir else ()):
             if os.path.lexists(sock):
                 try:
                     os.unlink(sock)
@@ -696,12 +700,13 @@ class EndpointLifecycle:
                 except OSError:
                     pass
         steps['sockets_gone'] = not any(os.path.lexists(s) for s in (e.daemon_sock, e.relay_sock))
-        if os.path.lexists(e.dir):
+        if self._owns_dir and os.path.lexists(e.dir):
             try:
                 self.ops.rmtree(e.dir)
             except (OSError, EndpointFailed):
                 pass
         steps['dir_removed'] = not os.path.lexists(e.dir)
+        steps['not_ours'] = not self._owns_dir
         steps['clean'] = (all(steps[k] for k in ('relay_stopped', 'daemon_stopped', 'port_closed', 'sockets_gone', 'dir_removed'))
                           and steps['descendants_left'] == [])
         self.record['teardown'] = steps
