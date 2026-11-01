@@ -337,8 +337,34 @@ installed mode is not offered.
 The current Fornax candidate QA stays on the attended path: its bundle and run directory are not touched, and attended
 `MODE.json` bytes do not change (installed mode, when it exists, records itself as a different mode value).
 
+## Addendum: the daemon endpoint (SPE-145 PR-b, rev 2)
+
+The owner rejected broad local TCP access and required the smallest daemon-capable path: a dedicated per-run Unix socket, isolated test state, the
+independent QA submitting its own inputs to the actual candidate daemon, no access to unrelated host services or other runs' sockets, and no firewall
+change. The design that meets it:
+
+- **The daemon runs outside Codex.** A process started inside a sandboxed command does not outlive it, and the candidate daemon binds a TCP port that
+  the Codex profile refuses. cae therefore starts it under a `sandbox-exec` profile it generates (state, tmp and the read-only payload; one loopback
+  port; no launchd, keychain or system network helpers by name), and a cae relay joins one Unix socket to that one port.
+- **Codex gets Unix sockets only.** `[features] network_proxy = true` with `[permissions.qa_confined.network] enabled = true, mode = "limited",
+  allow_local_binding = false` and a `unix_sockets` table naming the daemon socket and the relay socket (with the network table disabled the
+  `unix_sockets` table is ignored; measured). Every TCP, UDP, DNS and other-socket path stays refused with EPERM; the managed proxy's loopback
+  listener allows no domain.
+- **The proof is the listening socket.** SBPL cannot pin a bind to `127.0.0.1` (`localhost:P` also admits wildcard), so cae proves with `lsof` that the
+  daemon is the only listener on its port, at `127.0.0.1`, before it starts the relay and at every poll, and stops the relay and daemon when it stops
+  holding. No `pf` rule is used.
+- **Two lifecycles per run** (stage and exec), because the sweep after the self-tests kills everything of the QA user, including the stage's endpoint.
+  The exec one is bound by digest to the payload manifest and the generated daemon profile the producer computed.
+- **The producer decides.** Every control is demanded by name and recomputed; generated profile digests and the Codex profile digest are recomputed from
+  values the producer holds; a QA side that omits or alters anything is `QA_INVALID`; a lost endpoint is `QA_INCOMPLETE` (exit 123).
+- **Accepted residuals, disclosed:** the port is reachable by any local process during the run; the read-deny list is a deny list; `trustd` and similar
+  helpers may still act for a process; AppleEvents to a same-uid process cannot be blocked by any profile (measured), so the QA user must have no GUI
+  session, which the owner demo must show (`osascript` against System Events and Finder, `do shell script`, a pid-targeted event). Nothing here is
+  proven for the real account until that demo.
+
 ## Version history
 
 | Rev | Change |
 |---|---|
 | 1 | Initial decision (SPE-153) |
+| 2 | Daemon endpoint addendum (SPE-145 PR-b) |
