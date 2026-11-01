@@ -287,6 +287,25 @@ class ApplyTests(Fixture):
         self.assertIn(str(home / ".cargo/nda-targets/horo2082-evidence-drilldown"), found)
         self.assertNotIn(str(home / ".cargo/nda-targets"), found)
 
+    def test_layout_dirs_of_a_target_that_is_itself_a_build_dir_are_never_roots_of_their_own(self):
+        # nda-targets is also used directly as a CARGO_TARGET_DIR: debug/, a target-triple dir and tmp/ belong to that one target.
+        parent = self.root / "nda-targets"
+        parent.mkdir()
+        (parent / ".rustc_info.json").write_text("{}")
+        for layout in ("debug", "aarch64-apple-darwin", "tmp"):
+            (parent / layout).mkdir()
+            (parent / layout / "blob").write_bytes(b"x" * 5000)
+        ticket = parent / "horo2082-redacted-export-core"
+        ticket.mkdir()
+        (ticket / ".rustc_info.json").write_text("{}")
+        (ticket / "blob").write_bytes(b"x" * 5000)
+        for layout in ("debug", "aarch64-apple-darwin", "tmp"):
+            (cls, why), _ = self.classify(parent / layout)
+            self.assertEqual(cls, "C", layout)
+            self.assertIn("not-a-target-root", why)
+        (cls, why), _ = self.classify(ticket)
+        self.assertEqual((cls, why), ("B", ["shared-or-foreign"]))
+
     def test_inventory_refuses_to_start_on_a_busy_host(self):
         self.patch(rl.os, "getloadavg", lambda: (10_000.0, 0, 0))
         out = self.root / "state"
