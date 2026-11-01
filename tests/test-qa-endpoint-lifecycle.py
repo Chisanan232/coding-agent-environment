@@ -651,13 +651,8 @@ class UnixFakes(Fakes):
             raise OSError("refused")
         if self.on_ping:
             self.on_ping()
-        pid = {"child": 7001, "leader": self.procs["daemon"].pid, "stranger": 4242}[self.peer]
-        return pid, self.peer_uid, self.reply
-
-    def getpgid(self, pid):
-        if pid not in self.groups:
-            raise ProcessLookupError(pid)
-        return self.groups[pid]
+        pid = {"child": 7001, "leader": self.procs["daemon"].pid, "stranger": 4242, "gone": 7002}[self.peer]
+        return pid, self.groups.get(pid), self.peer_uid, self.reply              # a vanished peer has no group: None
 
     def inet_sockets(self, pgid):
         self.log.append(("inet", pgid))
@@ -671,7 +666,7 @@ class UnixFakes(Fakes):
         return side.EndpointOps(popen=self.popen, run=self.run, sleep=self.clock.sleep, monotonic=self.clock.now, connect=self.connect,
                                 listeners=self.listeners, killpg=self.killpg, rmtree=self.rmtree, canary_listener=self.canary_listener,
                                 decoy_socket=self.decoy_socket, leader_exited=self.leader_exited, process_table=self.process_table, kill=self.kill,
-                                uds_ping=self.uds_ping, uds_connect=self.uds_connect, inet_sockets=self.inet_sockets, getpgid=self.getpgid)
+                                uds_ping=self.uds_ping, uds_connect=self.uds_connect, inet_sockets=self.inet_sockets)
 
 
 class UnixBase(LifecycleBase):
@@ -840,8 +835,7 @@ class UnixStartTests(UnixBase):
         self.fail_start("process group")
 
     def test_a_peer_that_vanished_fails(self):
-        self.fakes.getpgid = lambda pid: (_ for _ in ()).throw(ProcessLookupError(pid))
-        self.life = self.lifecycle()
+        self.fakes.peer = "gone"
         self.fail_start("process group")
 
     def test_another_users_peer_fails(self):

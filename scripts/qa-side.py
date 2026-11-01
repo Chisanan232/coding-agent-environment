@@ -425,7 +425,7 @@ class EndpointOps:
 
     def __init__(self, popen=None, run=None, sleep=None, monotonic=None, connect=None, listeners=None, killpg=None, rmtree=None,
                  canary_listener=None, decoy_socket=None, which=None, leader_exited=None, process_table=None, kill=None, uds_ping=None,
-                 uds_connect=None, inet_sockets=None, getpgid=None):
+                 uds_connect=None, inet_sockets=None):
         self.popen = popen or subprocess.Popen
         self.run = run or self._run
         self.sleep = sleep or time.sleep
@@ -443,12 +443,13 @@ class EndpointOps:
         self.uds_ping = uds_ping or self._uds_ping
         self.uds_connect = uds_connect or self._uds_connect
         self.inet_sockets = inet_sockets or self._inet_sockets
-        self.getpgid = getpgid or os.getpgid
 
     @staticmethod
     def _uds_ping(path):
-        """(peer pid, peer uid, reply bytes) of ONE connection to the socket at path: the peer is read right after connect, then the ping is
-        sent on that same connection and the reply read to EOF (at most PING_REPLY_MAX + 1 bytes, PING_SECONDS in all). Raises OSError."""
+        """(peer pid, peer process group or None, peer uid, reply bytes) of ONE connection to the socket at path. The peer and its group are
+        read right after connect, while the peer is still blocked reading the request (a daemon that serves each connection from a child
+        that exits after replying would be gone later); then the ping is sent on that same connection and the reply read to EOF (at most
+        PING_REPLY_MAX + 1 bytes, PING_SECONDS in all). Raises OSError."""
         deadline = time.monotonic() + PING_SECONDS
         with socket.socket(socket.AF_UNIX) as conn:
             conn.settimeout(PING_SECONDS)
@@ -458,6 +459,10 @@ class EndpointOps:
             if len(cred) < 8:
                 raise OSError('no peer credentials')
             peer_uid = struct.unpack_from('I', cred, 4)[0]
+            try:
+                peer_pgid = os.getpgid(peer_pid) if peer_pid > 1 else None
+            except OSError:
+                peer_pgid = None
             conn.sendall(PING_REQUEST)
             conn.shutdown(socket.SHUT_WR)
             reply = b''
@@ -470,7 +475,7 @@ class EndpointOps:
                 if not chunk:
                     break
                 reply += chunk
-            return peer_pid, peer_uid, reply[:PING_REPLY_MAX + 1]
+            return peer_pid, peer_pgid, peer_uid, reply[:PING_REPLY_MAX + 1]
 
     @staticmethod
     def _uds_connect(path):
@@ -870,7 +875,7 @@ class EndpointLifecycle:
         """Readiness of a unix daemon: its socket passes _socket_node and one ping is answered with ok true."""
         try:
             self._socket_node()
-            return ping_mode(self.ops.uds_ping(str(self.endpoint.daemon_sock))[2]) is not None
+            return ping_mode(self.ops.uds_ping(str(self.endpoint.daemon_sock))[3]) is not None
         except (OSError, EndpointFailed):
             return False
 
@@ -883,14 +888,10 @@ class EndpointLifecycle:
         e = self.endpoint
         node = self._socket_node()
         try:
-            peer_pid, peer_uid, reply = self.ops.uds_ping(str(e.daemon_sock))
+            peer_pid, peer_pgid, peer_uid, reply = self.ops.uds_ping(str(e.daemon_sock))
         except OSError:
             raise EndpointFailed('the daemon socket did not answer a ping')
-        try:
-            peer_pgid = self.ops.getpgid(peer_pid) if peer_pid > 1 else None
-        except OSError:
-            peer_pgid = None
-        if peer_pgid != self.daemon.pid:
+        if peer_pid <= 1 or peer_pgid != self.daemon.pid:
             raise EndpointFailed('the process serving the socket is not in the daemon\'s process group')
         if peer_uid != os.getuid():
             raise EndpointFailed('the process serving the socket is another user\'s')
