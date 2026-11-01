@@ -207,9 +207,10 @@ applies, with these differences:
 - **Ready and proof.** The daemon is up when its socket node passes the path checks and a ping is answered. The ping is the product's exchange:
   `{"event": "ping"}` plus a newline (18 bytes), then the client half-closes, then one JSON object line back, then the daemon closes. The proof, run by the helper
   as the QA user outside every sandbox: every directory from the endpoint directory down is the QA user's at 0700, and the node is a socket of
-  the QA user at 0600 with one link. Then, on one connection, the peer (`LOCAL_PEERPID`) is in the daemon's process group with the QA uid
-  (`LOCAL_PEERCRED`), and the ping on that connection is answered with `ok: true` and a `mode` of `shadow` or `enforce`. The inode must be
-  unchanged afterwards, and the daemon's process group must hold no IPv4 or IPv6 socket (`lsof -g`). Each supervision poll repeats the
+  the QA user at 0600 with one link. Then, on one connection and before a single byte is sent, the peer (`LOCAL_PEERPID`) is in the
+  daemon's process group with the QA uid (`LOCAL_PEERCRED`) and the node is still the inode seen before connect; only then is the ping sent,
+  and it must be answered with `ok: true` and a `mode` of `shadow` or `enforce`. The inode must be
+  unchanged afterwards, and neither the daemon's process group nor any process below it may hold an IPv4 or IPv6 socket (`lsof -g`, `lsof -p`). Each supervision poll repeats the
   inode and inet checks. The full proof runs again as the last step before teardown (`socket_recheck`), and the producer requires both.
 - **Codex-side controls.** `pos_uds_daemon_ping` (the exact exchange with half-close, under the Codex seatbelt), `neg_write_endpoint_state`,
   `neg_unlink_daemon_sock`, `neg_tcp_loopback`, plus the decoy, proxy, record-directory and daemon-tmp controls of the fornax set.

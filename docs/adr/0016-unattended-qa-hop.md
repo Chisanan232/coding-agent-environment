@@ -432,6 +432,24 @@ Decision:
   unbound IPv4/IPv6 socket (as `*:*`).
 - **Proved twice.** The full proof (path checks, peer, ping, inode, inet) runs at start and again as the last supervision step before teardown
   (`socket_recheck`), and the producer requires both. A poll in between rechecks the inode and inet.
+- **Nothing is sent before the peer is known.** `connect()` on an AF_UNIX path follows links, and macOS has no descriptor-relative connect. A
+  daemon could swap `state/circinus` or the socket node for a link to another socket the QA user can reach, after the helper's lstat walk.
+  The helper would then talk to that socket as a confused deputy. So the helper first connects, then reads the peer's uid and process
+  group and walks the path with lstat again, which must give the same inode (recorded as `inode_before_connect` and
+  `inode_after_connect`). Only then does it send the ping. On any mismatch the connection is closed with no byte written. Readiness pings
+  use the same check.
+- **What the peer and inet checks cannot see.** `LOCAL_PEERPID`, its process group and `lsof -g<pgid>` all miss a descendant that called
+  `setsid()` and holds the listener or an inet socket. The inet check therefore also asks `lsof -p` for every process below the daemon by
+  parent pid, which covers a `setpgid()` escape. A descendant that called `setsid()` and lost its parent is still missed. For such a process
+  the guarantees are elsewhere:
+  - the endpoint directory is exclusive and freshly created;
+  - `daemon.sb` has no IP rule at all in unix mode, and it is inherited by every descendant;
+  - the producer sweeps every process of the QA user before Codex starts and at the seal.
+- **lsof fails closed.** An answer counts as "no inet socket" only when lsof exits 1 with no output and no stderr. That was measured as its
+  answer when nothing matches, also for a pid that is gone. A warning, any other exit status, or a timeout fails the check. The timeout is
+  5 s, because the check runs on every 2 s supervision poll.
+- **Fornax supervision.** A fornax poll that raises `OSError` now also counts as a lost proof: it returns False and stops the relay and the
+  daemon, instead of raising. This is intentional, and a test pins it.
 
 dlopen: a payload extension module (a copy of a Command Line Tools 3.9 `lib-dynload` `.so`) at mode 0444 and at 0555 loads under the generated
 `daemon.sb` with no extra rule (`(allow default)` covers `file-map-executable`; reads are allowed in the payload subpath). No profile was widened.
