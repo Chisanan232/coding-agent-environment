@@ -320,8 +320,8 @@ def endpoint_digests(endpoint):
 # Runs as the QA user inside the digest-pinned helper. Nothing here is wired into stage or exec yet (that is the next slice), and every
 # system touch goes through EndpointOps so tests can prove ORDER: the candidate daemon starts only after both generated profiles passed
 # their negative controls, and teardown always runs.
-DAEMON_START_SECONDS = 30
-RELAY_START_SECONDS = 15
+DAEMON_START_SECONDS = 90          # a loaded host (or a CI runner) can take a long time to start a sandboxed interpreter
+RELAY_START_SECONDS = 45
 RELAY_GRACE_SECONDS = 3
 DAEMON_GRACE_SECONDS = 10
 ECONNREFUSED = 61          # macOS errno: a connect to a port nobody listens on
