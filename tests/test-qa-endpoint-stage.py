@@ -137,5 +137,47 @@ class SelftestEnvTests(unittest.TestCase):
         self.assertNotIn(str(endpoint.port), "".join(seen[1].values()))        # paths only, never the port
 
 
+class UnixPhaseTests(unittest.TestCase):
+    """circinus-daemon/1 (SPE-155) through the same phase: the lifecycle gets the manifest (it seeds the state from it), the final
+    supervision step is the full one, and a needs_endpoint test finds the socket through XDG_STATE_HOME."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix=".cae-st-", dir=str(Path.home()))
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.endpoint = side.Endpoint(self.root / "q", self.root / "x", "att", 0, "circinus-daemon/1", self.root / "x/o/payload",
+                                      self.root / "x/o/payload/bin/python3.13")
+
+    def test_the_lifecycle_is_given_the_manifest_and_ends_with_the_full_proof(self):
+        seen = {}
+
+        class Life(FakeLife):
+            def __init__(self, endpoint, record_dir, ops=None, manifest=None):
+                super().__init__(endpoint, record_dir, ops)
+                seen["manifest"] = manifest
+        manifest = {"selftests": [], "endpoint": {"daemon": "bin/python3.13", "contract": "circinus-daemon/1"}}
+        with mock.patch.object(side, "EndpointLifecycle", Life), mock.patch.object(side, "CANARY_ROOT", self.root / "canary"), \
+                mock.patch.object(side, "real_codex_home", lambda: self.root / ".codex"), mock.patch.object(side, "run_selftests", lambda *a, **k: []), \
+                mock.patch.object(side, "endpoint_codex_probe", lambda *a: ([], [])):
+            record = side.run_endpoint_phase(types.SimpleNamespace(codex_bin="codex"), self.root / "x/o", manifest, self.endpoint, {}, self.root / "h")
+        self.assertIs(seen["manifest"], manifest)
+        self.assertEqual(FakeLife.log[-2:], ["supervise-final", "teardown"])
+        self.assertTrue(record["established"])
+
+    def test_a_needs_endpoint_test_gets_the_socket_and_xdg_state_home_only(self):
+        (self.root / "x/o/payload").mkdir(parents=True)
+        (self.root / "x/o/tmp").mkdir()
+        tests = [{"id": "ep", "argv": ["bin/t"], "stdin": None, "timeout_s": 5, "max_output_bytes": 100, "needs_endpoint": True}]
+        seen = []
+
+        def popen(argv, **kw):
+            seen.append(kw["env"])
+            raise OSError("stop")
+        with mock.patch.object(side.subprocess, "Popen", popen):
+            side.run_selftests("codex", self.root / "x/o", {"selftests": tests}, {"PATH": "/usr/bin"}, self.endpoint)
+        self.assertEqual(seen[0], {"PATH": "/usr/bin", "QA_ENDPOINT_STATE": str(self.endpoint.state), "QA_ENDPOINT_SOCK": str(self.endpoint.daemon_sock),
+                                   "XDG_STATE_HOME": str(self.endpoint.state)})
+
+
 if __name__ == "__main__":
     unittest.main()

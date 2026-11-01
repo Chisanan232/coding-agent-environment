@@ -598,5 +598,365 @@ class FailedStartCleanupTests(LifecycleBase):
         self.assertEqual(self.spawned(), [])
 
 
+GOOD_REPLY = b'{"ok": true, "mode": "shadow"}\n'
+
+
+class UnixFakes(Fakes):
+    """The unix-contract daemon (SPE-155): the spawned daemon binds a REAL socket node at its path (0600, under a 0700 directory) so the
+    lstat checks see the real thing; who answers, what it answers and which inet sockets the group holds are knobs."""
+
+    def __init__(self, endpoint):
+        super().__init__(endpoint)
+        self.reply = GOOD_REPLY
+        self.peer = "child"                 # 'child' (a process in the daemon's group), 'leader', 'stranger'
+        self.peer_uid = os.getuid()
+        self.inet = []
+        self.ping_fails = False
+        self.on_ping = None                 # called during a ping (to swap the node between the two lstats)
+        self.pings = []
+        self.uds_errno = side.ECONNREFUSED
+        self.groups = {}
+
+    def bind_socket(self, path=None):
+        import socket as sk
+        path = path or self.e.daemon_sock
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        server = sk.socket(sk.AF_UNIX)
+        cwd = os.getcwd()
+        os.chdir(path.parent)
+        try:
+            server.bind(path.name)
+        finally:
+            os.chdir(cwd)
+        server.close()                      # the node stays; nothing here needs it to accept
+        os.chmod(path, 0o600)
+
+    def popen(self, argv, **kw):
+        self.next_pid += 1
+        proc = FakeProc(self.next_pid)
+        self.log.append(("spawn", "daemon" if argv[3] == self.e.daemon_binary else "other", tuple(argv), kw.get("env"), kw.get("cwd")))
+        self.procs["daemon"] = proc
+        self.groups = {proc.pid: proc.pid, 7001: proc.pid, 4242: 4242}
+        if self.daemon_dies_at_start:
+            proc.exit(1)
+        else:
+            self.bind_socket()
+        return proc
+
+    def uds_ping(self, path):
+        self.log.append(("ping", path))
+        self.pings.append(path)
+        if self.ping_fails:
+            raise OSError("refused")
+        if self.on_ping:
+            self.on_ping()
+        pid = {"child": 7001, "leader": self.procs["daemon"].pid, "stranger": 4242}[self.peer]
+        return pid, self.peer_uid, self.reply
+
+    def getpgid(self, pid):
+        if pid not in self.groups:
+            raise ProcessLookupError(pid)
+        return self.groups[pid]
+
+    def inet_sockets(self, pgid):
+        self.log.append(("inet", pgid))
+        return self.inet() if callable(self.inet) else self.inet
+
+    def uds_connect(self, path):
+        self.log.append(("uds_connect", path))
+        return self.uds_errno if os.path.lexists(path) else side.ENOENT
+
+    def ops(self):
+        return side.EndpointOps(popen=self.popen, run=self.run, sleep=self.clock.sleep, monotonic=self.clock.now, connect=self.connect,
+                                listeners=self.listeners, killpg=self.killpg, rmtree=self.rmtree, canary_listener=self.canary_listener,
+                                decoy_socket=self.decoy_socket, leader_exited=self.leader_exited, process_table=self.process_table, kill=self.kill,
+                                uds_ping=self.uds_ping, uds_connect=self.uds_connect, inet_sockets=self.inet_sockets, getpgid=self.getpgid)
+
+
+class UnixBase(LifecycleBase):
+    def setUp(self):
+        # Short and real: the socket node is bound for real, and a long TMPDIR would push its path past the 104-byte limit.
+        self.tmp = tempfile.TemporaryDirectory(prefix=".cae-lc-", dir=str(Path.home()))
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(os.path.realpath(self.tmp.name))
+        self.home, self.ex = root / "h", root / "x"
+        self.pay = self.ex / "outbox" / "a" / "payload"
+        (self.pay / "bin").mkdir(parents=True)
+        self.home.mkdir(mode=0o700)
+        (self.pay / "bin" / "python3.13").write_text("x")
+        self.endpoint = side.Endpoint(str(self.home), str(self.ex), "a", 0, "circinus-daemon/1", str(self.pay), str(self.pay / "bin" / "python3.13"))
+        self.record_dir = self.ex / "outbox" / "a" / "endpoint"
+        self.fakes = UnixFakes(self.endpoint)
+        self.table = side.endpoint_probe_table(self.endpoint, "/c", "/a", 24999, "/d/qa-decoy.sock", None)
+        self.manifest = self.seed_manifest({})
+        self.life = self.lifecycle()
+
+    def lifecycle(self, fakes=None):
+        return side.EndpointLifecycle(self.endpoint, self.record_dir, (fakes or self.fakes).ops(), manifest=self.manifest)
+
+    def seed_manifest(self, files, digests=None):
+        """A manifest whose payload holds bin/python3.13 and the given state-seed files (written to the payload directory)."""
+        import hashlib
+        entries = [{"path": "bin/python3.13", "sha256": hashlib.sha256(b"x").hexdigest(), "size": 1, "kind": "exec"}]
+        for rel, data in files.items():
+            target = self.pay / "state-seed" / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            entries.append({"path": "state-seed/" + rel, "sha256": (digests or {}).get(rel, hashlib.sha256(data).hexdigest()), "size": len(data),
+                            "kind": "data"})
+        return {"files": sorted(entries, key=lambda f: f["path"]), "endpoint": {"daemon": "bin/python3.13", "contract": "circinus-daemon/1"}}
+
+    def up(self):
+        self.life.create()
+        self.prove()
+        self.life.start()
+
+
+class UnixCreateAndProveTests(UnixBase):
+    def test_create_makes_no_relay_directory_and_writes_only_the_daemon_profile(self):
+        self.life.create()
+        self.assertFalse((self.endpoint.dir / "rl").exists())
+        self.assertEqual(sorted(p.name for p in self.record_dir.iterdir()), ["daemon.sb"])
+        self.assertEqual((self.record_dir / "daemon.sb").read_text(), side.daemon_sb(self.endpoint))
+        self.assertEqual(self.life.record["daemon_launch_sha256"], side.endpoint_digests(self.endpoint)["daemon_launch_sha256"])
+        self.assertNotIn("relay_started", self.life.record)
+        self.assertNotIn("relay_profile_sha256", self.life.record)
+        self.assertEqual(self.life.record["transport"], "unix")
+        self.assertEqual(self.life.record["seeded"], [])
+
+    def test_prove_profiles_has_no_port_check_and_runs_only_the_daemon_profile(self):
+        self.life.create()
+        self.prove()
+        self.assertNotIn(("connect",), self.fakes.log)
+        self.assertEqual({p[1] for p in self.fakes.log if p[0] == "probe"}, {"daemon.sb"})
+        self.assertEqual(len([p for p in self.fakes.log if p[0] == "probe"]), len(self.table))
+        self.assertEqual(self.spawned(), [])
+
+    def test_a_leaking_unix_control_fails_before_the_daemon_starts(self):
+        self.life.create()
+        for leaked in ("neg_d_bind_loopback", "neg_d_bind_tmp_socket", "pos_d_bind_state_socket"):
+            self.fakes.answer = self.answers(leak=(leaked,))
+            with self.assertRaises(side.EndpointFailed) as caught:
+                self.lifecycle().prove_profiles("/c", "/a", "/d")
+            self.assertIn(leaked, str(caught.exception))
+        self.assertEqual(self.spawned(), [])
+
+
+class UnixSeedTests(UnixBase):
+    def test_seed_files_are_copied_private_before_anything_runs_and_recorded(self):
+        import hashlib
+        self.manifest = self.seed_manifest({"install.json": b'{"a": 1}', "circinus/mode.json": b'{"mode": "shadow"}'})
+        life = self.lifecycle()
+        life.create()
+        state = self.endpoint.state
+        self.assertEqual((state / "install.json").read_bytes(), b'{"a": 1}')
+        self.assertEqual((state / "circinus" / "mode.json").read_bytes(), b'{"mode": "shadow"}')
+        self.assertEqual(stat.S_IMODE(os.lstat(state / "install.json").st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.lstat(state / "circinus").st_mode), 0o700)
+        self.assertEqual(life.record["seeded"], [{"path": "circinus/mode.json", "sha256": hashlib.sha256(b'{"mode": "shadow"}').hexdigest()},
+                                                 {"path": "install.json", "sha256": hashlib.sha256(b'{"a": 1}').hexdigest()}])
+        self.assertEqual(life.record["seeded"], side.seed_record(self.manifest))
+        self.assertEqual(self.fakes.log, [])                       # nothing ran: no probe, no spawn
+
+    def test_a_file_that_does_not_match_its_digest_is_refused(self):
+        self.manifest = self.seed_manifest({"install.json": b"x"}, digests={"install.json": "0" * 64})
+        with self.assertRaises(side.EndpointFailed) as caught:
+            self.lifecycle().create()
+        self.assertIn("SHA-256", str(caught.exception))
+
+    def test_a_linked_seed_source_is_refused(self):
+        self.manifest = self.seed_manifest({"install.json": b"x"})
+        target = self.pay / "state-seed" / "install.json"
+        target.unlink()
+        (self.home / "secret").write_text("x")
+        os.symlink(self.home / "secret", target)
+        with self.assertRaises(side.EndpointFailed):
+            self.lifecycle().create()
+
+    def test_an_existing_file_is_never_overwritten_and_a_linked_directory_is_never_followed(self):
+        self.manifest = self.seed_manifest({"install.json": b"x", "circinus/mode.json": b"m"})
+        life = self.lifecycle()
+        life.create()
+        with self.assertRaises(side.EndpointFailed) as caught:
+            life.seed_state()
+        self.assertIn("overwrite", str(caught.exception))
+        (self.endpoint.state / "install.json").unlink()
+        (self.endpoint.state / "circinus" / "mode.json").unlink()
+        (self.endpoint.state / "circinus").rmdir()
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir(mode=0o700)
+        os.symlink(elsewhere, self.endpoint.state / "circinus")
+        with self.assertRaises(side.EndpointFailed):
+            life.seed_state()
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_a_manifest_that_breaks_a_seed_rule_is_refused_by_the_lifecycle_too(self):
+        self.manifest = self.seed_manifest({"qa-probe": b"x"})
+        with self.assertRaises(side.EndpointFailed):
+            self.lifecycle().create()
+        self.manifest = None
+        with self.assertRaises(side.EndpointFailed):
+            side.EndpointLifecycle(self.endpoint, self.record_dir, self.fakes.ops()).create()      # a seed contract with no manifest
+
+    def test_a_fornax_endpoint_neither_seeds_nor_records_a_seed(self):
+        life = side.EndpointLifecycle(side.Endpoint(str(self.home), str(self.ex), "b", PORT, "fornax-daemon/1", str(self.pay),
+                                                    str(self.pay / "bin" / "python3.13")), self.record_dir, Fakes(self.endpoint).ops())
+        life.create()
+        self.assertNotIn("seeded", life.record)
+
+
+class UnixStartTests(UnixBase):
+    def test_start_spawns_the_contract_argv_and_proves_the_socket_without_a_relay(self):
+        self.up()
+        (daemon,) = self.spawned()
+        self.assertEqual(daemon[2], ("/usr/bin/sandbox-exec", "-f", str(self.record_dir / "daemon.sb")) + tuple(self.endpoint.daemon_argv()))
+        self.assertEqual(daemon[2][4:], ("-I", "-B", "-c", side.CIRCINUS_BOOTSTRAP, "daemon-run"))
+        self.assertEqual(daemon[3], self.endpoint.daemon_env())
+        proof = self.life.record["socket_proof"]
+        pid = self.fakes.procs["daemon"].pid
+        self.assertEqual(proof, {"socket": str(self.endpoint.daemon_sock), "peer_pid": 7001, "peer_pgid": pid, "peer_uid": os.getuid(),
+                                 "daemon_pid": pid, "mode": 0o600, "ping_mode": "shadow", "inet": [], "inode_stable": True})
+        self.assertGreaterEqual(len(self.fakes.pings), 2)          # readiness, then the proof's own connection
+        self.assertIn(("inet", pid), self.fakes.log)
+
+    def test_a_leader_peer_and_the_enforce_mode_pass(self):
+        self.fakes.peer = "leader"
+        self.fakes.reply = b'{"ok": true, "mode": "enforce", "extra": 1}\n'
+        self.up()
+        self.assertEqual(self.life.record["socket_proof"]["ping_mode"], "enforce")
+
+    def fail_start(self, expect=None):
+        self.life.create()
+        self.prove()
+        with self.assertRaises(side.EndpointFailed) as caught:
+            self.life.start()
+        if expect:
+            self.assertIn(expect, str(caught.exception))
+        self.assertIsNone(self.life.record["socket_proof"])
+
+    def test_a_peer_outside_the_daemon_group_fails(self):
+        self.fakes.peer = "stranger"
+        self.fail_start("process group")
+
+    def test_a_peer_that_vanished_fails(self):
+        self.fakes.getpgid = lambda pid: (_ for _ in ()).throw(ProcessLookupError(pid))
+        self.life = self.lifecycle()
+        self.fail_start("process group")
+
+    def test_another_users_peer_fails(self):
+        self.fakes.peer_uid = os.getuid() + 1
+        self.fail_start("another user")
+
+    def test_a_bad_ping_reply_never_becomes_ready(self):
+        for reply in (b'{"ok": false, "mode": "shadow"}\n', b'{"ok": true, "mode": "open"}\n', b"[]\n", b"not json", b"",
+                      b'{"ok": "true", "mode": "shadow"}', b'{"ok": true, "mode": "shadow"}' + b" " * side.PING_REPLY_MAX):
+            self.setUp()
+            self.fakes.reply = reply
+            self.fail_start("did not come up")
+
+    def test_a_socket_that_never_answers_fails_at_the_start_wait(self):
+        self.fakes.ping_fails = True
+        self.fail_start("did not come up")
+
+    def test_a_socket_replaced_between_the_two_lstats_fails(self):
+        self.life.create()
+        self.prove()
+        swaps = []
+
+        def swap():
+            if len(self.fakes.pings) >= 2 and not swaps:              # after readiness: during the proof's own connection
+                swaps.append(1)
+                self.endpoint.daemon_sock.unlink()
+                self.fakes.bind_socket()
+        self.fakes.on_ping = swap
+        with self.assertRaises(side.EndpointFailed) as caught:
+            self.life.start()
+        self.assertIn("replaced", str(caught.exception))
+
+    def test_an_inet_socket_in_the_daemon_group_or_an_unlistable_group_fails(self):
+        for inet, expect in ((["*:*"], "IPv4 or IPv6"), (None, "could not be listed")):
+            self.setUp()
+            self.fakes.inet = inet
+            self.fail_start(expect)
+
+    def test_a_loose_socket_or_directory_or_a_linked_socket_never_becomes_ready(self):
+        def loose_socket():
+            os.chmod(self.endpoint.daemon_sock, 0o644)
+
+        def loose_dir():
+            os.chmod(self.endpoint.daemon_sock.parent, 0o755)
+
+        def linked():
+            real = self.endpoint.state / "real.sock"
+            self.fakes.bind_socket(real)
+            self.endpoint.daemon_sock.unlink()
+            os.symlink(real, self.endpoint.daemon_sock)
+        for mutate in (loose_socket, loose_dir, linked):
+            self.setUp()
+            original = self.fakes.popen
+
+            def popen(argv, original=original, mutate=mutate, **kw):
+                proc = original(argv, **kw)
+                mutate()
+                return proc
+            self.fakes.popen = popen
+            self.life = self.lifecycle()
+            self.fail_start("did not come up")
+            self.assertEqual(self.fakes.pings, [], mutate.__name__)      # nothing is dialled through a node that failed its checks
+
+
+class UnixSupervisionAndTeardownTests(UnixBase):
+    def setUp(self):
+        super().setUp()
+        self.up()
+
+    def test_a_poll_checks_the_inode_and_inet_without_pinging(self):
+        pings = len(self.fakes.pings)
+        self.assertTrue(self.life.supervise())
+        self.assertEqual(len(self.fakes.pings), pings)
+        self.assertNotIn("socket_recheck", self.life.record)
+
+    def test_the_final_step_repeats_the_full_proof(self):
+        pings = len(self.fakes.pings)
+        self.assertTrue(self.life.supervise(final=True))
+        self.assertEqual(len(self.fakes.pings), pings + 1)
+        self.assertEqual(self.life.record["socket_recheck"], self.life.record["socket_proof"])
+
+    def test_a_replaced_socket_or_a_new_inet_socket_stops_the_daemon(self):
+        for mutate, final in ((lambda: (self.endpoint.daemon_sock.unlink(), self.fakes.bind_socket()), False),
+                              (lambda: setattr(self.fakes, "inet", ["127.0.0.1:80"]), False),
+                              (lambda: setattr(self.fakes, "peer", "stranger"), True)):
+            self.setUp()
+            mutate()
+            self.assertFalse(self.life.supervise(final=final))
+            self.assertIn("socket_proof_lost", self.life.record)
+            self.assertIn((self.fakes.procs["daemon"].pid, signal.SIGKILL), self.fakes.signals)
+
+    def test_teardown_has_the_unix_steps_and_is_clean(self):
+        steps = self.life.teardown()
+        self.assertEqual(set(side.ENDPOINT_TEARDOWN_STEPS["unix"]) - set(steps), set())
+        for gone in ("relay_stopped", "port_closed"):
+            self.assertNotIn(gone, steps)
+        self.assertTrue(steps["clean"], steps)
+        self.assertEqual(steps["socket_removed_by_helper"], ["circinusd.sock"])      # the stand-in left its node; unlinked and reported
+        self.assertFalse(self.endpoint.dir.exists())
+        self.assertNotIn(("connect",), self.fakes.log)
+
+    def test_a_socket_that_still_accepts_after_the_stop_is_not_clean(self):
+        self.fakes.uds_errno = 0
+        steps = self.life.teardown()
+        self.assertFalse(steps["socket_refuses"])
+        self.assertFalse(steps["clean"])
+
+    def test_the_exec_record_is_established_on_the_socket_proof(self):
+        import types
+        outbox = self.ex / "outbox" / "a"
+        for record, want in (({"socket_proof": {"x": 1}, "problems": []}, True), ({"port_proof": {"x": 1}, "problems": []}, False)):
+            life = types.SimpleNamespace(record=dict(record), proof_key="socket_proof", teardown=lambda snapshot: {"clean": True})
+            side.finish_exec_endpoint(life, outbox, self.home / "no-canary")
+            self.assertIs(life.record["established"], want, record)
+
+
 if __name__ == "__main__":
     unittest.main()
