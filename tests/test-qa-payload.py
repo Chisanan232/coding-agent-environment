@@ -33,7 +33,7 @@ d = "@FAKEDIR@"
 argv = sys.argv[1:]
 assert argv[0] == "sandbox" and argv[1:3] == ["-P", "qa_confined"], argv
 cmd = argv[argv.index("-C") + 2:]
-code = cmd[-1] if cmd and cmd[0] == "/usr/bin/python3" else ""
+code = cmd[-1] if cmd and cmd[0] in ("/usr/bin/python3", "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9") else ""
 if code.startswith("# CONTROL="):
     control = code.splitlines()[0].replace("# CONTROL=", "")
     mode = open(d + "/mode").read().strip() if os.path.exists(d + "/mode") else "confined"

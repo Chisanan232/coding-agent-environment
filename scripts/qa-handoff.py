@@ -1056,6 +1056,11 @@ def unattended_install(ident, config_path=None, helper_path=None, anchor='/', pr
         host_sha = sha256_file(host_path)
         if host_sha != config['codex_host_sha256']:
             problems.append('the pinned Codex tool host does not match its recorded digest')
+        problems += side.interpreter_problems()   # always from /: the interpreter is a real system path, never under a test anchor
+        with open(helper_path, 'rb') as handle:
+            first_line = handle.readline(4096).rstrip(b'\n')
+        if first_line != side.SHEBANG.encode():
+            problems.append('the installed helper does not start with the trusted-interpreter line')
     except Exception as error:      # Refuse carries no message by design; an OSError message could name a path, keep the type
         return None, ['the installed delegation failed verification (%s)' % type(error).__name__]
     if problems:

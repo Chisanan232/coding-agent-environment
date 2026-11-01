@@ -340,7 +340,7 @@ class StartTests(LifecycleBase):
         self.assertEqual(daemon[2], ("/usr/bin/sandbox-exec", "-f", str(self.record_dir / "daemon.sb"), self.endpoint.daemon_binary))
         self.assertEqual(daemon[3], self.endpoint.daemon_env())                   # nothing inherited
         self.assertEqual((daemon[4], relay[4]), ("/", "/"))
-        self.assertEqual(relay[2][:4], ("/usr/bin/sandbox-exec", "-f", str(self.record_dir / "relay.sb"), "/usr/bin/python3"))
+        self.assertEqual(relay[2][:4], ("/usr/bin/sandbox-exec", "-f", str(self.record_dir / "relay.sb"), side.tool_python()))
         self.assertEqual(relay[2][4:6], ("-I", "-c"))
         self.assertEqual(relay[2][6:], (side.RELAY_SRC, str(self.endpoint.relay_sock), str(PORT)))
         self.assertEqual(relay[3], {"PATH": "/usr/bin:/bin"})

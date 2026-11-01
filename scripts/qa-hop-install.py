@@ -2,10 +2,13 @@
 """One-time owner install of the unattended QA hop (SPE-153, ADR 0016).
 
   qa-hop-install.py plan     --qa-name N --qa-uid U --codex-source PATH --codex-sha256 HEX [--exchange DIR] [--producer-uid U]
-  sudo /usr/bin/python3 -I -B /Library/cae-qa-install/qa-hop-install.py apply (same arguments) --bundle-sha256 H --helper-sha256 H
+  sudo <TRUSTED_PYTHON> -I -B /Library/cae-qa-install/qa-hop-install.py apply (same arguments) --bundle-sha256 H --helper-sha256 H
                                                                          installs; root only, run through YOUR own sudo
   qa-hop-install.py verify   (same arguments)                              unprivileged re-check of the installed state
-  sudo /usr/bin/python3 -I qa-hop-install.py rollback --qa-name N --qa-uid U   removes the drop-in first, then the files
+  sudo <TRUSTED_PYTHON> -I -B /Library/cae-qa-install/qa-hop-install.py rollback --qa-name N --qa-uid U   removes the drop-in first, then the files
+
+TRUSTED_PYTHON is the real Command Line Tools binary printed by `plan` (not the xcode-select shim /usr/bin/python3, which a same-user
+process can redirect); `apply` and `rollback` refuse to run under any other interpreter.
 
 Root must never run code a less-privileged user can change. `apply` and `rollback` therefore refuse unless this file, the three
 scripts it loads (qa-identity-setup.py, qa-handoff.py, qa-side.py) and every directory above them are root-owned, not group or
@@ -43,6 +46,8 @@ MACHO_MAGIC = (b'\xfe\xed\xfa\xce', b'\xfe\xed\xfa\xcf', b'\xce\xfa\xed\xfe', b'
                b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca', b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca')
 PRODUCER_RE = re.compile(r'[A-Za-z_][A-Za-z0-9._-]{0,31}')
 INSTALL_COPY = '/Library/cae-qa-install'
+# Same value as qa-side.TRUSTED_PYTHON (a test asserts it); kept here so `rollback` need not load any other script as root to know it.
+TRUSTED_PYTHON = '/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9'
 MAX_CODEX_BYTES = 2 << 30
 SAFE_ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}
 
@@ -55,10 +60,11 @@ class Layout:
     """Where things go. Production uses the defaults; tests pass scratch paths. Nothing here is user-configurable."""
 
     def __init__(self, lib='/Library/cae-qa', sudoers='/etc/sudoers.d/cae-qa', root_uid=0, wheel_gid=0, anchor='/',
-                 visudo='/usr/sbin/visudo', bundle_dir=None):
+                 visudo='/usr/sbin/visudo', bundle_dir=None, interpreter_problems=None):
         self.lib, self.sudoers, self.root_uid, self.wheel_gid, self.anchor, self.visudo = (
             str(lib), str(sudoers), root_uid, wheel_gid, str(anchor), visudo)
         self.bundle_dir = str(bundle_dir or HERE)
+        self.interpreter_problems = interpreter_problems       # tests only: stands in for the real Command Line Tools tree check
         self.helper, self.config, self.codex = (os.path.join(self.lib, n) for n in ('qa-side', 'qa-side.json', 'codex'))
         self.codex_host = os.path.join(self.lib, 'codex-code-mode-host')      # the tool host `codex exec` starts from next to its own binary
 
@@ -66,8 +72,9 @@ class Layout:
 class Ops:
     """Everything that touches the system beyond plain file I/O, injectable so tests can prove what would happen."""
 
-    def __init__(self, run=None, fchown=None, chown=None, geteuid=None, caller_uid=None):
+    def __init__(self, run=None, fchown=None, chown=None, geteuid=None, caller_uid=None, interpreter=None):
         self.run = run or self._run
+        self.interpreter = interpreter or (lambda: os.path.realpath(sys.executable))
         self.fchown = fchown or os.fchown
         self.chown = chown or os.chown
         self.geteuid = geteuid or os.geteuid
@@ -345,6 +352,8 @@ def plan_text(inputs, layout, ops, args_line, bundle):
         os.chmod(probe, 0o440)
         ok, _ = visudo_check(layout, ops, probe)
     copy = INSTALL_COPY + '/qa-hop-install.py'
+    side_mod = bundle.module('qa-side')
+    interp = (layout.interpreter_problems or side_mod.interpreter_problems)()
     pins = '--bundle-sha256 %s --helper-sha256 %s' % (bundle.combined, bundle.helper_sha)
     lines = ['PLAN (nothing has been changed; this was computed without privilege)', '',
              'Identity: QA user %s (uid %d, home %s), invoking user %s (uid %d), exchange %s' % (
@@ -360,6 +369,9 @@ def plan_text(inputs, layout, ops, args_line, bundle):
         inputs.codex_source, inputs.codex_sha256),
         'Pinned Codex tool host: copy of %s (Mach-O binary, digest %s, about 65 MB; `codex exec` starts it from next to the pinned binary)' % (
         inputs.host_source, inputs.host_sha256), '',
+        'Trusted interpreter (the helper\'s first line and every helper-started process): %s' % side_mod.TRUSTED_PYTHON,
+        '  chain and framework tree on this host: %s' % ('root-owned, not group/world writable, link-free' if not interp else 'NOT TRUSTED: ' + '; '.join(interp[:3])),
+        '  the helper\'s first line must be: %s' % side_mod.SHEBANG, '',
         'Config %s:' % layout.config] + ['  ' + l for l in config.decode().splitlines()] + [
         '', 'Sudoers drop-in %s (visudo -c -f on this exact text, unprivileged: %s):' % (layout.sudoers, 'parsed OK' if ok else 'NOT VERIFIED')]
     lines += ['  ' + l for l in dropin.splitlines()]
@@ -370,7 +382,7 @@ def plan_text(inputs, layout, ops, args_line, bundle):
               '  (the ids from `git -C "${REPO}" rev-parse "${H}:scripts/<file>"` are git SHA-1 blob ids: informational only, never the pin)',
               'Only if every pair matches and the combined digest equals the one printed above, run the one command that then needs root',
               '(your own sudo; it never asks for or stores a password):',
-              '  sudo /usr/bin/python3 -I -B %s apply %s %s' % (copy, args_line, pins), '',
+              '  sudo %s -I -B %s apply %s %s' % (side_mod.TRUSTED_PYTHON, copy, args_line, pins), '',
               'What that command does, in order:',
               '  1. refuses unless it is root, the four scripts and every directory above them are root-owned, not group/world writable and',
               '     link-free, and the bundle and helper digests above equal what it reads from those very files',
@@ -381,13 +393,13 @@ def plan_text(inputs, layout, ops, args_line, bundle):
               '  5. runs `visudo -c` on the live configuration; if that fails the drop-in is removed at once',
               '  6. re-runs the same producer-side checks `qa-handoff.py --unattended` uses (as root, read-only); if they fail the drop-in is removed',
               '     again (no helper verb is run as root)', '',
-              'Afterwards, unprivileged: python3 -I -B %s verify %s' % (Path(__file__).resolve(), args_line),
+              'Afterwards, unprivileged: %s -I -B %s verify %s' % (side_mod.TRUSTED_PYTHON, Path(__file__).resolve(), args_line),
               '  and, as you, `sudo -n -u %s %s version` (must print the digests above).' % (inputs.qa_name, layout.helper),
               '  Codex smoke test (the delegation refuses the pinned codex on purpose, so use your own password-gated sudo):',
               '    cd / && sudo -u %s %s --version' % (inputs.qa_name, layout.codex),
               '  Unverified until the owner pilot: regex arguments and digest pinning under a real sudo, setsid and signal relay.', '',
               'Rollback (root; removes the drop-in FIRST, then the files; safe to repeat):',
-              '  sudo /usr/bin/python3 -I -B %s rollback --qa-name %s --qa-uid %d' % (copy, inputs.qa_name, inputs.qa_uid), '',
+              '  sudo %s -I -B %s rollback --qa-name %s --qa-uid %d' % (side_mod.TRUSTED_PYTHON, copy, inputs.qa_name, inputs.qa_uid), '',
               'Eliminated by this install: typing `sudo -v` before every run, launching from that Terminal, the sudo keepalive.',
               'Still yours: the copy and the one root command; reinstalling when qa-side.py or the pinned Codex changes; the QA user\'s Codex',
               '  device login (qa-identity-setup.py prints it, followed by chmod 700 ~/.codex and a --check re-run); rechecking after a macOS',
@@ -398,7 +410,7 @@ def plan_text(inputs, layout, ops, args_line, bundle):
 # ------------------------------------------------------------------ apply
 def need_root(layout, ops):
     if ops.geteuid() != layout.root_uid:
-        raise Stop('this mode must run as root through your own sudo, from the root-owned copy: sudo /usr/bin/python3 -I -B %s/qa-hop-install.py ...' % INSTALL_COPY)
+        raise Stop('this mode must run as root through your own sudo, from the root-owned copy: sudo <trusted interpreter> -I -B %s/qa-hop-install.py ... (the exact line is printed by plan)' % INSTALL_COPY)
 
 
 def require_trusted_bundle(bundle, layout, only=None):
@@ -497,6 +509,16 @@ def apply(inputs, layout, ops, say, bundle):
     need_root(layout, ops)
     if ops.caller_uid() != inputs.producer_uid:
         raise Stop('the invoking uid does not match the producer uid; run this through your own sudo')
+    side_mod = bundle.module('qa-side')
+    if ops.interpreter() != side_mod.TRUSTED_PYTHON:
+        raise Stop('this installer must run under the trusted interpreter %s (the line printed by plan), not %s; refusing' % (
+            side_mod.TRUSTED_PYTHON, ops.interpreter()))
+    side_mod.ROOT_UID = layout.root_uid
+    interp = (layout.interpreter_problems or side_mod.interpreter_problems)()
+    if interp:
+        raise Stop('the trusted interpreter is not trustworthy on this host (%s); refusing' % '; '.join(interp[:3]))
+    if bundle.helper.split(b'\n', 1)[0] != side_mod.SHEBANG.encode():
+        raise Stop('the helper does not start with the trusted-interpreter line; refusing')
     files, dropin, helper, config = planned(inputs, layout, bundle)
     dropin_path = sudoers_real(layout)
     lib_dir(layout, ops, bundle, create=True)
@@ -537,6 +559,8 @@ def verify_installed(inputs, layout, bundle, producer_uid=None):
     """The producer-side check qa-handoff --unattended runs before every run, from the same code."""
     handoff = bundle.module('qa-handoff')
     handoff._SIDE.ROOT_UID = layout.root_uid
+    if layout.interpreter_problems:
+        handoff._SIDE.interpreter_problems = layout.interpreter_problems
     ident = handoff.Identity(inputs.qa_name, inputs.qa_uid, Path(inputs.qa_home), Path(inputs.exchange), layout.root_uid)
     record, problems = handoff.unattended_install(ident, layout.config, layout.helper, layout.anchor, producer_uid)
     if record is not None and (record['codex_sha256'] != inputs.codex_sha256 or record['codex_host_sha256'] != inputs.host_sha256):
@@ -665,6 +689,9 @@ def main(argv=None, layout=None, ops=None, out=None):
         bundle = Bundle(layout.bundle_dir)
         if mode in ('apply', 'rollback'):
             need_root(layout, ops)
+            if ops.interpreter() != TRUSTED_PYTHON:
+                raise Stop('this mode must run under the trusted interpreter %s (the line printed by plan), not %s; refusing. To remove the grant by hand: '
+                           'sudo /bin/rm -f %s' % (TRUSTED_PYTHON, ops.interpreter(), layout.sudoers))
             require_trusted_bundle(bundle, layout, only=None if mode == 'apply' else ('qa-hop-install.py',))
         if mode == 'apply':
             if not (HEX64.fullmatch(args.bundle_sha256) and HEX64.fullmatch(args.helper_sha256)):

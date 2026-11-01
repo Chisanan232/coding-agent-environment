@@ -128,7 +128,7 @@ chain cannot protect against its own replacement, so integrity is enforced from 
 digest pin, and a producer-side check (below).
 
 `/Library/cae-qa/qa-side` is `scripts/qa-side.py` (PR 1 creates it as a standard-library-only module with the same
-code the attended hop copies today) installed root-owned. It is run as the QA user with `/usr/bin/python3 -I`. Verbs:
+code the attended hop copies today) installed root-owned. It is run as the QA user with the pinned Command Line Tools interpreter (`#!/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I`; see the interpreter addendum), not the `/usr/bin/python3` shim. Verbs:
 
 | Verb | Replaces | Does |
 |---|---|---|
@@ -192,7 +192,7 @@ the producer also maps to `QA_INCOMPLETE`. As implemented, the order is argv sha
 |---|---|---|---|
 | `/etc/sudoers.d/cae-qa` | root:wheel | 0440 | written last, after `visudo -c -f` |
 | `/Library`, `/Library/cae-qa/` | root:wheel | 0755 | directories; nothing under them writable by group or other |
-| `/Library/cae-qa/qa-side` | root:wheel | 0555 | `scripts/qa-side.py`, first line `#!/usr/bin/python3 -I` |
+| `/Library/cae-qa/qa-side` | root:wheel | 0555 | `scripts/qa-side.py`, first line `#!/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I` |
 | `/Library/cae-qa/qa-side.json` | root:wheel | 0444 | digests and ids, no secret |
 | `/Library/cae-qa/codex` | root:wheel | 0555 | pinned copy of the Codex binary (about 300 MB) |
 | `/Library/cae-qa/codex-code-mode-host` | root:wheel | 0555 | pinned copy of the tool host Codex starts from next to its own binary (about 65 MB); its digest is in `qa-side.json` |
@@ -365,9 +365,28 @@ change. The design that meets it:
   session, which the owner demo must show (`osascript` against System Events and Finder, and a `tell application` that would start one; no application of that user may be running afterwards). Nothing here is
   proven for the real account until that demo.
 
+## Addendum rev 3: the helper's interpreter is pinned (SPE-153)
+
+`/usr/bin/python3` is a shim that resolves its interpreter through `xcode-select` (`DEVELOPER_DIR`, `/var/db/xcode_select_link`). On the owner's host that link
+named an Xcode directory that did not exist, under `/Applications` (group-writable by `admin`, which includes the invoking user). Whoever creates that path
+chooses the interpreter that runs every root-pinned Python script, including the helper as the QA user. The sudo digest pins script bytes, not the interpreter.
+
+- **Decision:** the helper's first line and every interpreter it chooses outside the Codex sandbox (probe, relay, daemon profile checks) is the real,
+  link-free Command Line Tools binary `TRUSTED_PYTHON`. The Codex-side confinement probes use it too (so a redirected shim cannot forge the evidence); only a host with no
+  Command Line Tools falls back to the shim, and such a host cannot pass the unattended install check. `xcode-select` is not changed (it affects the
+  owner's Xcode work).
+- **Check (`interpreter_problems`):** every component from `/` to the binary is root-owned, not group/other writable and not a link; every entry of the
+  framework version tree is root-owned and not group/other writable; a link stays inside the tree or under `/System` or `/usr/lib`; at most 50000 entries.
+  Run by `plan`, by `apply` (as root, which also refuses to run under any other interpreter), by `verify` and before every `--unattended` run; the installed
+  helper's first line must equal `SHEBANG`. About 20 ms on the measured tree (2006 entries).
+- **Rollback is covered too:** `apply` and `rollback` both refuse to run as root under any other interpreter (the installer carries its own copy of the constant, asserted equal to the helper's); the refusal message names the manual `rm -f` of the drop-in.
+- **Residual:** `qa-identity-setup.py` (the attended identity setup) and `qa-payload-manifest.py` still use `/usr/bin/python3`; they are outside the unattended helper's interpreter choice and are not run under the sudo delegation. ACLs are not visible to this Python check (the owner readback lists them with `ls -le`); a Command Line Tools update changes the path or
+  tree and fails closed until the install is redone.
+
 ## Version history
 
 | Rev | Change |
 |---|---|
 | 1 | Initial decision (SPE-153) |
 | 2 | Daemon endpoint addendum (SPE-145 PR-b) |
+| 3 | Helper interpreter pinned to the Command Line Tools binary (SPE-153) |
