@@ -170,8 +170,8 @@ only the two endpoint sockets in its `unix_sockets` table); the base confinement
 (never from payload text) are proved with 41 controls each of what the daemon and the relay may and may not touch; only then the candidate daemon
 starts, outside Codex, bound by the sandbox to its own state, tmp and the read-only payload, with network access limited to its one loopback port;
 cae proves that the daemon is the **only** listener on that port, at `127.0.0.1`, and repeats the proof while the run lasts; a relay joins one Unix
-socket to that port. Five controls then run under the real Codex profile (the relay and the daemon socket reachable; TCP to the port, a decoy
-socket and a proxy `CONNECT` refused) and only after those do the `needs_endpoint` self-tests run, with `QA_ENDPOINT_STATE`,
+socket to that port. Nine controls then run under the real Codex profile (the relay and the daemon socket reachable; TCP to the port, a decoy
+socket and a proxy `CONNECT` refused; creating the exec record directory, writing into the stage record directory and listing the relay and daemon-tmp directories refused) and only after those do the `needs_endpoint` self-tests run, with `QA_ENDPOINT_STATE`,
 `QA_ENDPOINT_SOCK` and `QA_ENDPOINT_HTTP_SOCK` (paths only, never the port) in their environment. A model run does the same around `codex exec`: the
 payload and the generated daemon profile are held to digests the producer computed, the endpoint is supervised while Codex runs, Codex is stopped with
 exit 123 if the endpoint is lost, and the daemon's state is copied into `outbox/endpoint-exec/state` before everything is torn down.

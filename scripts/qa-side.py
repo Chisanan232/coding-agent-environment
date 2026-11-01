@@ -1492,6 +1492,11 @@ ENDPOINT_CODEX_CONTROLS = (
     ('pos_uds_daemon', "import socket\ntry:\n    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.settimeout(10)\n    s.connect({daemon_sock!r})\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'ALLOWED'),
     ('neg_tcp_daemon_port', "import socket\ntry:\n    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    s.settimeout(5)\n    s.connect(('127.0.0.1', {port}))\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED_EPERM'),
     ('neg_uds_decoy', "import os, socket\ntry:\n    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    s.settimeout(5)\n    os.chdir(os.path.dirname({decoy!r}))\n    s.connect(os.path.basename({decoy!r}))\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED_EPERM'),
+    # What the seal trusts is written by the QA user outside Codex's write roots; a tool command must not reach it, nor the daemon's private dirs.
+    ('neg_mkdir_endpoint_exec', "import os\ntry:\n    os.mkdir({record_exec!r})\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
+    ('neg_write_endpoint_record', "try:\n    open({record_stage!r} + '/qa-write-probe', 'w').write('x')\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
+    ('neg_list_endpoint_rl', "import os\ntry:\n    os.listdir({rl!r})\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
+    ('neg_list_endpoint_tmp', "import os\ntry:\n    os.listdir({etmp!r})\n    print('ALLOWED')\nexcept OSError as e:\n    print('DENIED:%s' % e.errno)", 'DENIED'),
     # The managed proxy is on (the unix_sockets table needs it) but allows no domain: a CONNECT through it must be refused.
     ('neg_proxy_connect', "import os, socket\nraw = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY') or os.environ.get('https_proxy') or os.environ.get('http_proxy')\nif not raw:\n    print('NOPROXY')\nelse:\n    host, _, port = raw.split('://')[-1].rstrip('/').rpartition(':')\n    try:\n        s = socket.create_connection((host, int(port)), 5)\n        s.sendall(b'CONNECT 192.0.2.1:9 HTTP/1.1\\r\\nHost: 192.0.2.1:9\\r\\n\\r\\n')\n        line = s.recv(64).split(b'\\r\\n')[0]\n        print('DENIED_PROXY' if line[9:12] in (b'403', b'407') else 'ALLOWED:' + line.decode('latin-1')[:20])\n    except OSError as e:\n        print('DENIED:%s' % e.errno)", 'DENIED_PROXY'),
 )
@@ -1499,7 +1504,9 @@ ENDPOINT_CODEX_CONTROLS = (
 
 def endpoint_codex_probe(codex_bin, run_dir, env, endpoint, decoy):
     """Run ENDPOINT_CODEX_CONTROLS under the real Codex profile with the endpoint's tool environment. Returns (results, problems)."""
-    values = {'relay': str(endpoint.relay_sock), 'daemon_sock': str(endpoint.daemon_sock), 'port': endpoint.port, 'decoy': str(decoy)}
+    values = {'relay': str(endpoint.relay_sock), 'daemon_sock': str(endpoint.daemon_sock), 'port': endpoint.port, 'decoy': str(decoy),
+              'record_exec': str(Path(run_dir) / 'endpoint-exec'), 'record_stage': str(Path(run_dir) / 'endpoint'), 'rl': str(endpoint.rl),
+              'etmp': str(endpoint.tmp)}
     tool_env = dict(env, **endpoint.tool_env())
     results, problems = [], []
     for name, snippet, expect in ENDPOINT_CODEX_CONTROLS:
