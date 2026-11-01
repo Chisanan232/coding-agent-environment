@@ -426,7 +426,7 @@ class EndpointOps:
 
     def __init__(self, popen=None, run=None, sleep=None, monotonic=None, connect=None, listeners=None, killpg=None, rmtree=None,
                  canary_listener=None, decoy_socket=None, which=None, leader_exited=None, process_table=None, kill=None, uds_ping=None,
-                 uds_connect=None, inet_sockets=None):
+                 uds_connect=None, inet_sockets=None, lstat=None):
         self.popen = popen or subprocess.Popen
         self.run = run or self._run
         self.sleep = sleep or time.sleep
@@ -444,6 +444,7 @@ class EndpointOps:
         self.uds_ping = uds_ping or self._uds_ping
         self.uds_connect = uds_connect or self._uds_connect
         self.inet_sockets = inet_sockets or self._inet_sockets
+        self.lstat = lstat or os.lstat          # the socket-node walk; tests pin node identities without relying on how a file system numbers inodes
 
     @staticmethod
     def _uds_ping(path, guard):
@@ -874,7 +875,7 @@ class EndpointLifecycle:
         current = e.dir
         for part in ('',) + e.daemon_sock.relative_to(e.dir).parts:
             current = current / part if part else current
-            info = os.lstat(current)
+            info = self.ops.lstat(current)
             if current == e.daemon_sock:
                 if not (stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1):
                     raise EndpointFailed('the daemon socket is not a private socket of this user (mode 0600, one link)')
