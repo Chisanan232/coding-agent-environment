@@ -50,7 +50,10 @@ class Env:
             shutil.copy(SCRIPTS / name, self.install / name)
             os.chmod(self.install / name, 0o644)
         self.layout = inst.Layout(lib=self.base / "Library/cae-qa", sudoers=self.base / "etc/sudoers.d/cae-qa", root_uid=ME,
-                                  wheel_gid=os.getgid(), anchor=self.base, bundle_dir=self.install)
+                                  wheel_gid=os.getgid(), anchor=self.base, bundle_dir=self.install,
+                                  interpreter_problems=lambda: self.interpreter_findings)
+        self.interpreter_findings = []
+        self.interpreter = None
         self.source = self.base / "codex-src"
         self.source.write_bytes(b"\xcf\xfa\xed\xfe" + b"codex 0.163.0 pretend Mach-O payload\n" * 100)
         os.chmod(self.source, 0o755)
@@ -63,7 +66,8 @@ class Env:
         self.euid = ME
         self.caller = ME
         self.visudo_result = None
-        self.ops = inst.Ops(run=self.run, fchown=self.fchown, chown=self.chown, geteuid=lambda: self.euid, caller_uid=lambda: self.caller)
+        self.ops = inst.Ops(run=self.run, fchown=self.fchown, chown=self.chown, geteuid=lambda: self.euid, caller_uid=lambda: self.caller,
+                            interpreter=lambda: self.interpreter or inst.Bundle(self.install).module('qa-side').TRUSTED_PYTHON)
 
     def fchown(self, fd, uid, gid):
         assert uid == self.layout.root_uid and gid == self.layout.wheel_gid, "chown to something other than the scratch root"
@@ -278,6 +282,49 @@ class PlanTests(Case):
         runs = [e[1] for e in self.env.events if e[0] == "run"]
         self.assertEqual(len(runs), 1)
         self.assertEqual(runs[0][:3], ("/usr/sbin/visudo", "-c", "-f"))
+
+
+class TrustedInterpreterTests(Case):
+    """The helper's interpreter is pinned: the shim /usr/bin/python3 can be redirected through xcode-select, so the installer refuses
+    to run under it, refuses an untrusted interpreter tree, a helper without the pinned first line, and verify fails closed."""
+
+    def test_apply_refuses_when_not_running_under_the_trusted_interpreter(self):
+        self.env.interpreter = "/usr/bin/python3"
+        code, out = self.env.main("apply")
+        self.assertEqual(code, 1, out)
+        self.assertIn("must run under the trusted interpreter", out)
+        self.assertFalse(os.path.lexists(self.env.layout.lib))
+        self.assertFalse(os.path.lexists(self.env.layout.sudoers))
+
+    def test_apply_refuses_an_untrusted_interpreter_tree(self):
+        self.env.interpreter_findings = ["/Library/x/lib/python3.9/os.py is writable by group or other"]
+        code, out = self.env.main("apply")
+        self.assertEqual(code, 1, out)
+        self.assertIn("not trustworthy", out)
+        self.assertFalse(os.path.lexists(self.env.layout.lib))
+
+    def test_apply_refuses_a_helper_without_the_pinned_first_line(self):
+        helper = self.env.install / "qa-side.py"
+        os.chmod(helper, 0o644)
+        helper.write_text(helper.read_text().replace(inst.Bundle(self.env.install).module("qa-side").SHEBANG, "#!/usr/bin/python3 -I", 1))
+        code, out = self.env.main("apply")
+        self.assertEqual(code, 1, out)
+        self.assertIn("trusted-interpreter line", out)
+
+    def test_plan_names_the_interpreter_and_flags_an_untrusted_tree(self):
+        code, out = self.env.main("plan")
+        self.assertIn("root-owned, not group/world writable, link-free", out)
+        self.env.interpreter_findings = ["tree finding"]
+        code, out = self.env.main("plan")
+        self.assertIn("NOT TRUSTED: tree finding", out)
+        self.assertNotIn("sudo /usr/bin/python3", out)
+
+    def test_verify_fails_closed_when_the_interpreter_stops_being_trusted(self):
+        self.installed()
+        self.env.interpreter_findings = ["swapped"]
+        code, out = self.env.main("verify")
+        self.assertEqual(code, 1, out)
+        self.assertIn("swapped", out)
 
 
 class ApplyTests(Case):
@@ -707,7 +754,7 @@ class RootRunsOnlyTrustedCodeTests(Case):
         for needle in ('git -C "${REPO}" archive "${H}"', 'sudo tar -x -o -C "${D}" --strip-components=1', "chown -R -h root:wheel",
                        "chmod -h 644", "AFTER the copy", 'git -C "${REPO}" show "${H}:scripts/${f}.py" | shasum -a 256', "SHA-1 blob ids",
                        "cd / && sudo -u fornaxqa", "REFUSED: the extract holds a link",
-                       "sudo /usr/bin/python3 -I -B /Library/cae-qa-install/qa-hop-install.py apply", "--bundle-sha256 " + bundle.combined,
+                       "sudo /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -B /Library/cae-qa-install/qa-hop-install.py apply", "--bundle-sha256 " + bundle.combined,
                        "--helper-sha256 " + bundle.helper_sha, "--version", "Unverified until the owner pilot", "Mach-O"):
             self.assertIn(needle, out)
 
