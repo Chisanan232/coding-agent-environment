@@ -190,6 +190,9 @@ PORT_RANGE = (20000, 32767)               # outside the ephemeral range, so a ra
 # (`appleevent-send`, `mach*`, `ipc*`, `lsopen` or a blanket `mach-lookup` deny all still let `osascript` reach System Events). The
 # boundary is the uid: the QA user (uid 530) has no GUI session, so nothing of its own is there to answer. The owner demo must show
 # `osascript` failing as uid 530 before installation; see docs/QA-HANDOFF.md.
+# Launching is a separate capability and the uid is NOT a boundary for it (owner demo 2026-11-02): a process without its own GUI session that
+# runs `osascript` or `open` makes LaunchServices/RunningBoard start the application in the console user's session. The generated daemon and
+# relay profiles therefore deny LaunchServices (MACH_DENY_PREFIX) and prove it with neg_d_launch_app / neg_r_launch_app before any candidate code.
 MACH_DENY = ('com.apple.trustd', 'com.apple.trustd.agent', 'com.apple.ocspd', 'com.apple.dnssd.service', 'com.apple.nsurlsessiond',
              'com.apple.nesessionmanager', 'com.apple.cfnetwork.cfnetworkagent',
              # Keychain access (securityd reads the QA user's keychain files on a denied process's behalf; measured: `security list-keychains`
@@ -296,9 +299,17 @@ class Endpoint:
         return {'QA_ENDPOINT_STATE': str(self.state), 'QA_ENDPOINT_SOCK': str(self.daemon_sock), 'QA_ENDPOINT_HTTP_SOCK': str(self.relay_sock)}
 
 
+# LaunchServices' database services. With these unreachable `open -a` and `tell application` cannot resolve or start an application, so a
+# daemon or relay (candidate code) cannot start one in another account's GUI session. A name PREFIX on purpose: denying a subset is not
+# monotone (measured on macOS 27: denying com.apple.lsd.mapdb alone refuses, adding com.apple.lsd.open/.openurl makes the client fall back to
+# a path that launches), and the bare com.apple.lsd name must be covered too. Every launch control (neg_*_launch_app) re-proves it per run.
+MACH_DENY_PREFIX = ('com.apple.lsd',)
+
+
 def _sb_header():
     return ['(version 1)', '(allow default)', '(deny network*)',
-            '(deny mach-lookup %s)' % ' '.join('(global-name "%s")' % name for name in MACH_DENY)]
+            '(deny mach-lookup %s)' % ' '.join('(global-name "%s")' % name for name in MACH_DENY),
+            '(deny mach-lookup %s)' % ' '.join('(global-name-prefix "%s")' % name for name in MACH_DENY_PREFIX)]
 
 
 def _read_deny(endpoint):
@@ -612,6 +623,10 @@ def endpoint_probe_table(endpoint, canary, auth, canary_port, decoy, state_probe
     uds = lambda path: ["s = socket.socket(socket.AF_UNIX)", 's.settimeout(3)', "os.chdir(%r)" % os.path.dirname(path), "s.connect(%r)" % os.path.basename(path)]
     write = lambda path: ["open(%r, 'w').write('x')" % str(path)]
     read = lambda path: ["open(%r, 'rb').read(1)" % str(path)]
+    # `open -g -a` must not start anything: LaunchServices is unreachable, so it exits non-zero. If the profile ever fails, the probe starts the
+    # faceless System Events (harmless) and reports ALLOWED, which fails the endpoint before any candidate code starts.
+    launch = ["import subprocess", "r = subprocess.run(['/usr/bin/open', '-g', '-a', 'System Events'], capture_output=True, timeout=20)",
+              "if r.returncode != 0:", "    raise OSError(1, 'launch refused')"]
     table = []
     unix = e.transport == 'unix'
     for who, profile in (('d', 'daemon.sb'),) if unix else (('d', 'daemon.sb'), ('r', 'relay.sb')):
@@ -621,6 +636,7 @@ def endpoint_probe_table(endpoint, canary, auth, canary_port, decoy, state_probe
         table += [(n, profile, b, 'DENIED_EPERM') for n, b in net]
         if not unix:            # a unix daemon has no port, so "another port" means nothing; neg_d_bind_loopback below refuses every one
             table += [('neg_%s_bind_other_port' % who, profile, ["s = socket.socket()", "s.bind(('127.0.0.1', %d))" % (e.port + 1)], 'DENIED_EPERM')]
+        table += [('neg_%s_launch_app' % who, profile, launch, 'DENIED')]
         table += [('neg_%s_read_canary' % who, profile, read(canary), 'DENIED'), ('neg_%s_read_login' % who, profile, read(auth), 'DENIED'),
                   ('neg_%s_list_home' % who, profile, ["os.listdir(%r)" % e.home], 'DENIED'),
                   ('neg_%s_list_exchange' % who, profile, ["os.listdir(%r)" % e.exchange], 'DENIED'),
