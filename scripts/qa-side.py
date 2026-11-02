@@ -300,9 +300,10 @@ class Endpoint:
 
 
 # LaunchServices' database services. With these unreachable `open -a` and `tell application` cannot resolve or start an application, so a
-# daemon or relay (candidate code) cannot start one in another account's GUI session. A name PREFIX on purpose: denying a subset is not
-# monotone (measured on macOS 27: denying com.apple.lsd.mapdb alone refuses, adding com.apple.lsd.open/.openurl makes the client fall back to
-# a path that launches), and the bare com.apple.lsd name must be covered too. Every launch control (neg_*_launch_app) re-proves it per run.
+# daemon or relay (candidate code) cannot start one in another account's GUI session. A name PREFIX on purpose: it is the broadest lsd deny
+# and covers the bare com.apple.lsd name and every com.apple.lsd.* service (measured on macOS 27 with one clause per name: mapdb alone, or
+# the bare name plus mapdb, or the full list refuse; denying only .open/.openurl, or only the AppleEvent or RunningBoard services, still
+# launches). Every launch control (neg_*_launch_app) re-proves it per run.
 MACH_DENY_PREFIX = ('com.apple.lsd',)
 
 
@@ -625,8 +626,11 @@ def endpoint_probe_table(endpoint, canary, auth, canary_port, decoy, state_probe
     read = lambda path: ["open(%r, 'rb').read(1)" % str(path)]
     # `open -g -a` must not start anything: LaunchServices is unreachable, so it exits non-zero. If the profile ever fails, the probe starts the
     # faceless System Events (harmless) and reports ALLOWED, which fails the endpoint before any candidate code starts.
+    # Only open's own refusal counts (exit 1 and its "Unable to find application" message); any other exit (missing binary, killed, a different
+    # error) is an unexplained failure and must not read as a pass, so it raises a non-OSError and the control reports no result.
     launch = ["import subprocess", "r = subprocess.run(['/usr/bin/open', '-g', '-a', 'System Events'], capture_output=True, timeout=20)",
-              "if r.returncode != 0:", "    raise OSError(1, 'launch refused')"]
+              "if r.returncode == 1 and b'Unable to find application' in r.stderr:", "    raise OSError(1, 'launch refused')",
+              "if r.returncode != 0:", "    raise RuntimeError('open failed for another reason')"]
     table = []
     unix = e.transport == 'unix'
     for who, profile in (('d', 'daemon.sb'),) if unix else (('d', 'daemon.sb'), ('r', 'relay.sb')):
