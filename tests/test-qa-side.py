@@ -1234,6 +1234,9 @@ class EndpointProfileTests(unittest.TestCase):
         self.assertEqual(lines[:3], ["(version 1)", "(allow default)", "(deny network*)"])
         for name in side.MACH_DENY:
             self.assertIn('(global-name "%s")' % name, sb)
+        # LaunchServices must be unreachable by prefix (a subset of lsd names is not monotone, see MACH_DENY_PREFIX); the relay profile shares the header
+        self.assertIn('(deny mach-lookup (global-name-prefix "com.apple.lsd"))', lines)
+        self.assertIn('(deny mach-lookup (global-name-prefix "com.apple.lsd"))', side.relay_sb(e).splitlines())
         self.assertIn('(allow network-bind (local ip "localhost:23456"))', lines)
         self.assertIn('(allow network-inbound (local ip "localhost:23456"))', lines)
         self.assertIn('(allow network-bind (local unix-socket (subpath "%s")))' % e.state, lines)
@@ -1332,13 +1335,22 @@ class FornaxGoldenTests(unittest.TestCase):
                 self.assertEqual(getattr(e_old, name), getattr(e_new, name), name)
             self.assertEqual(old.profile_toml(run_dir, [run_dir / "payload"], home="/Users/qa", codex_home="/Users/qa/.codex", endpoint=e_old),
                              side.profile_toml(run_dir, [run_dir / "payload"], home="/Users/qa", codex_home="/Users/qa/.codex", endpoint=e_new))
-            self.assertEqual(old.daemon_sb(e_old), side.daemon_sb(e_new))
-            self.assertEqual(old.relay_sb(e_old), side.relay_sb(e_new))
+            # SPE-157: the ONLY intended change to the generated profiles is the LaunchServices prefix deny (and its two launch controls, and the
+            # digests that cover the profile text); everything else is byte-identical to Fornax's generator.
+            lsd = '(deny mach-lookup (global-name-prefix "com.apple.lsd"))\n'
+            self.assertIn(lsd, side.daemon_sb(e_new))
+            self.assertIn(lsd, side.relay_sb(e_new))
+            self.assertEqual(old.daemon_sb(e_old), side.daemon_sb(e_new).replace(lsd, "", 1))
+            self.assertEqual(old.relay_sb(e_old), side.relay_sb(e_new).replace(lsd, "", 1))
             self.assertEqual(old.RELAY_SRC, side.RELAY_SRC)
-            self.assertEqual(old.endpoint_digests(e_old), side.endpoint_digests(e_new))
-            self.assertEqual(old.endpoint_probe_table(e_old, "/c", "/a", 24999, "/d/qa-decoy.sock", None),
-                             side.endpoint_probe_table(e_new, "/c", "/a", 24999, "/d/qa-decoy.sock", None))
-            self.assertEqual(old.endpoint_control_expectations(e_old), side.endpoint_control_expectations(e_new))
+            digests_old, digests_new = old.endpoint_digests(e_old), side.endpoint_digests(e_new)
+            self.assertEqual({k: v for k, v in digests_old.items() if "profile" not in k}, {k: v for k, v in digests_new.items() if "profile" not in k})
+            self.assertNotEqual(digests_old["daemon_profile_sha256"], digests_new["daemon_profile_sha256"])
+            launch = lambda row: row[0].endswith("_launch_app")
+            table_new = side.endpoint_probe_table(e_new, "/c", "/a", 24999, "/d/qa-decoy.sock", None)
+            self.assertEqual(sorted(r[0] for r in table_new if launch(r)), ["neg_d_launch_app"] + (["neg_r_launch_app"] if e_new.transport != "unix" else []))
+            self.assertEqual(old.endpoint_probe_table(e_old, "/c", "/a", 24999, "/d/qa-decoy.sock", None), [r for r in table_new if not launch(r)])
+            self.assertEqual(old.endpoint_control_expectations(e_old), {k: v for k, v in side.endpoint_control_expectations(e_new).items() if not k.endswith("_launch_app")})
             self.assertEqual(old.ENDPOINT_CODEX_CONTROLS, side.endpoint_codex_controls(e_new))
             self.assertEqual(old.ENDPOINT_CODEX_CONTROLS, side.RELAY_CODEX_CONTROLS)
             self.assertEqual(old.EndpointLifecycle(e_old, "/r").record, side.EndpointLifecycle(e_new, "/r").record)
@@ -1424,6 +1436,27 @@ class UnixEndpointProfileTests(unittest.TestCase):
         with mock.patch.dict(side.ENDPOINT_CONTRACTS["circinus-daemon/1"], argv=("-I", "-c", "import os")):
             self.assertNotEqual(side.endpoint_digests(e)["daemon_launch_sha256"], d["daemon_launch_sha256"])
 
+    def test_launch_control_only_reads_opens_own_refusal_as_denied(self):
+        """neg_d_launch_app: exit 1 with open's "Unable to find application" is DENIED; a successful launch is ALLOWED; any other failure is no result."""
+        import contextlib, io, sys, types
+        e = self.endpoint()
+        code = next(c for n, _, c, _ in side.endpoint_probe_table(e, "/c", "/a", 24999, "/d/qa-decoy.sock", None) if n == "neg_d_launch_app")
+
+        def run(rc, err):
+            fake = types.ModuleType("subprocess")
+            fake.run = lambda *a, **k: types.SimpleNamespace(returncode=rc, stderr=err)
+            out = io.StringIO()
+            with mock.patch.dict(sys.modules, {"subprocess": fake}), contextlib.redirect_stdout(out):
+                try:
+                    exec(code, {})
+                except RuntimeError:
+                    return "NO_RESULT"
+            return out.getvalue().strip()
+        self.assertEqual(run(1, b"Unable to find application named 'System Events'"), "DENIED:1")
+        self.assertEqual(run(0, b""), "ALLOWED")
+        self.assertEqual(run(1, b"something else"), "NO_RESULT")
+        self.assertEqual(run(127, b""), "NO_RESULT")
+
     def test_probe_table_is_daemon_only_with_the_unix_bind_controls(self):
         e = self.endpoint()
         table = side.endpoint_probe_table(e, "/c", "/a", 24999, "/d/qa-decoy.sock", None)
@@ -1432,6 +1465,7 @@ class UnixEndpointProfileTests(unittest.TestCase):
         self.assertEqual({p for _, p, _, _ in table}, {"daemon.sb"})
         expect = {n: x for n, _, _, x in table}
         self.assertEqual(expect["neg_d_bind_loopback"], "DENIED_EPERM")
+        self.assertEqual(expect["neg_d_launch_app"], "DENIED")
         self.assertEqual(expect["neg_d_bind_tmp_socket"], "DENIED_EPERM")
         self.assertEqual(expect["pos_d_bind_state_socket"], "ALLOWED")
         for gone in ("pos_d_bind_port", "neg_d_bind_other_port", "neg_d_write_rl", "neg_d_list_rl"):
