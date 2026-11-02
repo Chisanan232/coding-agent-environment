@@ -294,14 +294,13 @@ class ApplyTests(Fixture):
                  "Bryant-Developments/AI-agent-assembly/private-target-6430"]
         for name in names:
             (home / name).mkdir(parents=True)
-        tmp = self.root / "tmp"
-        (tmp / "nda-horo-2065-target").mkdir(parents=True)
         self.patch(rl, "HOME", home)
-        spec = dict(rl.default_consumers(tmp))["cargo_target"]
+        spec = dict(rl.default_consumers(self.root / "tmp"))["cargo_target"]
         found = {hit for kind, hit, _ in rl.discover([("cargo_target", spec)])}
         for name in names:
             self.assertIn(str(home / name), found, name)
-        self.assertIn(str(tmp / "nda-horo-2065-target"), found)
+        # the per-ticket temp targets live in /private/tmp whatever TMPDIR is (a session's TMPDIR is a private subdirectory)
+        self.assertIn("/private/tmp/*-target", spec)
 
     def test_layout_dirs_of_a_target_that_is_itself_a_build_dir_are_never_roots_of_their_own(self):
         # nda-targets is also used directly as a CARGO_TARGET_DIR: debug/, a target-triple dir and tmp/ belong to that one target.
