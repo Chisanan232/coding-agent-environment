@@ -287,6 +287,22 @@ class ApplyTests(Fixture):
         self.assertIn(str(home / ".cargo/nda-targets/horo2082-evidence-drilldown"), found)
         self.assertNotIn(str(home / ".cargo/nda-targets"), found)
 
+    def test_named_per_ticket_targets_outside_the_cargo_globs_are_discovered(self):
+        # SPE-111 audit 2026-11-02: these names were not roots, so ~50 GiB of finished qualification/QA targets never reached an inventory.
+        home = self.root / "home"
+        names = [".cargo/qual-aaasm-6262-30d5325d139a", ".cargo/private-target-qa-2c553741d", ".cargo/pkg-repro-target-c5707fa71b29",
+                 "Bryant-Developments/AI-agent-assembly/private-target-6430"]
+        for name in names:
+            (home / name).mkdir(parents=True)
+        tmp = self.root / "tmp"
+        (tmp / "nda-horo-2065-target").mkdir(parents=True)
+        self.patch(rl, "HOME", home)
+        spec = dict(rl.default_consumers(tmp))["cargo_target"]
+        found = {hit for kind, hit, _ in rl.discover([("cargo_target", spec)])}
+        for name in names:
+            self.assertIn(str(home / name), found, name)
+        self.assertIn(str(tmp / "nda-horo-2065-target"), found)
+
     def test_layout_dirs_of_a_target_that_is_itself_a_build_dir_are_never_roots_of_their_own(self):
         # nda-targets is also used directly as a CARGO_TARGET_DIR: debug/, a target-triple dir and tmp/ belong to that one target.
         parent = self.root / "nda-targets"
