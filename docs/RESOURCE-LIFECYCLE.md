@@ -22,6 +22,12 @@ owner session and product, rebuild cost, protective markers and the receipt. Log
 purgeable space are not in it at all. The only reclaim figure the tool prints is the measured change in filesystem free space
 after each batch (`df` ground truth).
 
+A target directory is only inventoried when a configured consumer glob matches it (`default_consumers`; `--consumers FILE` replaces the
+list). Name patterns that are not in the list are invisible, however large: the 2026-11-02 audit found ~50 GiB of
+`~/.cargo/qual-*`, `private-target-*` and `pkg-repro-target-*` outside every glob, and `~/.cargo/shared-target` (about 640 GiB) is one
+unit whose `du` exceeds the 90 s limit, so it is reported with no size and no sub-units. Run `inventory --only cargo_target` as its own
+pass; a full inventory also walks worktrees and caches and can exceed the load gate on a busy host.
+
 ## Classes
 
 | Class | Meaning | Action |
