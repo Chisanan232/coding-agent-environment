@@ -75,7 +75,11 @@ def default_consumers(tmp=None):
     spec = [
         ('cargo_target', [str(d / '.cargo/shared-target'), str(d / '.cargo/nda-targets/*'), str(d / '.cargo/isolated-target*'),
                           str(d / '.cargo/isolated-targets/*'), str(d / 'aaasm-campaign-*'), str(d / '*-target-*'),
-                          str(dev / '.cargo-target*'), str(dev / '.cargo-targets/*'), str(dev / '.*-target')]),
+                          str(dev / '.cargo-target*'), str(dev / '.cargo-targets/*'), str(dev / '.*-target'),
+                          # per-ticket targets that live inside ~/.cargo, the AASM worktree container and the temp root (SPE-111 audit
+                          # 2026-11-02: ~50 GiB of qualification/QA/package-repro targets were invisible to the inventory)
+                          str(d / '.cargo/qual-*'), str(d / '.cargo/private-target-*'), str(d / '.cargo/pkg-repro-target-*'),
+                          str(dev / 'AI-agent-assembly/private-target-*'), '/private/tmp/*-target']),
         ('package_cache', [str(dev / '.pnpm-store'), str(d / 'Library/pnpm'), str(d / '.npm'), str(d / '.cache/uv'),
                            str(d / 'Library/Caches/pypoetry'), str(d / '.cache/pre-commit'),
                            str(d / 'Library/Caches/ms-playwright'), str(d / 'Library/Caches/Homebrew'),
