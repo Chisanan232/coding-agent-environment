@@ -1436,6 +1436,27 @@ class UnixEndpointProfileTests(unittest.TestCase):
         with mock.patch.dict(side.ENDPOINT_CONTRACTS["circinus-daemon/1"], argv=("-I", "-c", "import os")):
             self.assertNotEqual(side.endpoint_digests(e)["daemon_launch_sha256"], d["daemon_launch_sha256"])
 
+    def test_launch_control_only_reads_opens_own_refusal_as_denied(self):
+        """neg_d_launch_app: exit 1 with open's "Unable to find application" is DENIED; a successful launch is ALLOWED; any other failure is no result."""
+        import contextlib, io, sys, types
+        e = self.endpoint()
+        code = next(c for n, _, c, _ in side.endpoint_probe_table(e, "/c", "/a", 24999, "/d/qa-decoy.sock", None) if n == "neg_d_launch_app")
+
+        def run(rc, err):
+            fake = types.ModuleType("subprocess")
+            fake.run = lambda *a, **k: types.SimpleNamespace(returncode=rc, stderr=err)
+            out = io.StringIO()
+            with mock.patch.dict(sys.modules, {"subprocess": fake}), contextlib.redirect_stdout(out):
+                try:
+                    exec(code, {})
+                except RuntimeError:
+                    return "NO_RESULT"
+            return out.getvalue().strip()
+        self.assertEqual(run(1, b"Unable to find application named 'System Events'"), "DENIED:1")
+        self.assertEqual(run(0, b""), "ALLOWED")
+        self.assertEqual(run(1, b"something else"), "NO_RESULT")
+        self.assertEqual(run(127, b""), "NO_RESULT")
+
     def test_probe_table_is_daemon_only_with_the_unix_bind_controls(self):
         e = self.endpoint()
         table = side.endpoint_probe_table(e, "/c", "/a", 24999, "/d/qa-decoy.sock", None)
