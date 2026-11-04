@@ -128,8 +128,11 @@ independent review. Skipping a hosted check that would have failed: only owner-l
 - The record is written under the same GitHub identity and OS user as the agent. A forged line cannot be detected cryptographically (an
   HMAC would be tamper evidence only); the independent review and the owner's merge review are the controls.
 - A failing run that was deleted or never posted cannot be seen by the gate. Only a posted failure denies. The failure scan reads every
-  line of every raw comment body (also quoted with `>` or indented, fenced, or in a minimized comment); a line at this head that cannot be
-  parsed counts as a failure. An edit replaces a comment's body, so text removed by an edit is not visible.
+  line of every raw comment body of the authenticated user's own comments (so a third party cannot cause a denial), also quoted with `>`
+  or indented, fenced, or in a minimized comment; a line that starts with the record prefix, names this head and cannot be parsed counts
+  as a failure. A failing record inside an inline code span, a list item or an HTML comment is not matched (the line must start with
+  the prefix). An edit replaces a comment's body, so text removed by an edit is not visible. The skip trailer is accepted after one
+  blank line; GitHub's documentation says two, and the Actions-runs check backstops the difference except for a short timing race.
 - The trust file lives in a directory no host rule protects, so the agent could write it. The owner may add a host deny rule for
   `~/.config/coding-agent-environment/local/` as an owner action; this repository does not edit `settings.json`.
 - The clean-tree test sees tracked and untracked files but not git-ignored ones (a venv, a cache, a build directory), which can still
