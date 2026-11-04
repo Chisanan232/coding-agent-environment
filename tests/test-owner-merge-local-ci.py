@@ -175,6 +175,45 @@ class Recorder(unittest.TestCase):
         os.symlink(real, self.logs)
         self.assertEqual(self.record(py("pass"))[0], 2)
 
+    def test_ambient_git_variables_cannot_redirect_the_recorders_git_calls(self):
+        from unittest import mock
+        other = os.path.join(os.path.realpath(self.tmp.name), "b")
+        os.mkdir(other)
+        git(other, "init", "-q", "-b", "main")
+        pathlib.Path(other, "dirty.txt").write_text("x")
+        env = {"GIT_DIR": os.path.join(self.wt, ".git"), "GIT_WORK_TREE": self.wt, "GIT_INDEX_FILE": os.path.join(self.wt, ".git", "index")}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = rec.record(REPO, 7, "main", other, self.entry(py(f"open({self.marker!r}, 'w')")), self.logs)
+        self.assertEqual((code, out.getvalue()), (2, ""))
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_the_worktree_must_be_the_top_of_its_repository(self):
+        sub = os.path.join(self.wt, "sub")
+        os.mkdir(sub)
+        pathlib.Path(sub, "f.txt").write_text("x")
+        git(self.wt, "add", "sub/f.txt")
+        git(self.wt, "commit", "-q", "-m", "sub")
+        code, out, err = self.record(py("pass"))
+        self.assertEqual(code, 0)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(rec.record(REPO, 7, "main", sub, self.entry(py("pass")), self.logs), 2)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_the_owners_env_is_written_into_the_record(self):
+        _, out, _ = self.record(py("pass"), env={"CI": "1"})
+        parsed = json.loads(out.split(" ", 1)[1])
+        self.assertEqual(parsed["env"], {"CI": "1"})
+        omg.parse_local_record(parsed)
+
+    def test_two_checks_sharing_a_log_name_are_refused(self):
+        entry = {"checks": [("a b", ("true",)), ("a_b", ("true",))], "max_age_hours": 24, "pinned_paths": (), "not_covered": [], "env": {}}
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(rec.record(REPO, 7, "main", self.wt, entry, self.logs), 2)
+        self.assertEqual(out.getvalue(), "")
+
     def test_a_config_outside_the_owner_config_root_is_refused(self):
         cfg = os.path.join(os.path.realpath(self.tmp.name), "local-first-ci.json")
         pathlib.Path(cfg).write_text(json.dumps({"schema": 1, "repos": {REPO: {"checks": [{"name": "c0", "argv": ["true"]}]}}}))

@@ -53,13 +53,16 @@ CI_RE = re.compile(r"^OWNER-MERGE-CI-UNAVAILABLE head=([0-9a-f]{40}) cause=(bill
 NOCI_RE = re.compile(r"^OWNER-MERGE-CI-EXCEPTION head=([0-9a-f]{40}) basis=no-hosted-ci local_equivalent=(\w+)\s*$", re.M)
 LOCAL_RE = re.compile(r"^OWNER-MERGE-LOCAL-CI (.*?)\s*$", re.M)
 # GitHub's documented spellings for "do not run workflows on this commit": one of five bracketed phrases anywhere in the message, or a
-# `skip-checks: true` trailer in the final paragraph. Matched case-sensitively and exactly; when unsure the gate treats it as no directive.
+# `skip-checks: true` / `skip-checks:true` as the final line after a blank line. Matched case-sensitively and exactly; when unsure the gate treats it as no directive.
 SKIP_RE = re.compile(r"\[(?:skip ci|ci skip|no ci|skip actions|actions skip)\]")
 
 
 def has_skip_directive(message):
-    paragraphs = [x for x in re.split(r"\n\s*\n", message.strip("\n")) if x.strip()]
-    return bool(SKIP_RE.search(message)) or (len(paragraphs) > 1 and "skip-checks: true" in paragraphs[-1].split("\n"))
+    lines = message.rstrip().split("\n")
+    trailer = len(lines) >= 3 and lines[-1] in ("skip-checks: true", "skip-checks:true") and lines[-2].strip() == "" and any(x.strip() for x in lines[:-2])
+    return bool(SKIP_RE.search(message)) or trailer
+
+
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 STAMP_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 OWNER_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
@@ -176,10 +179,17 @@ def read_version_policy(path, required, root=None):
 
 
 LOCAL_FIRST_DEFAULT = "~/.config/coding-agent-environment/local/local-first-ci.json"
+def log_slug(name):
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name)
+
+
 LOCAL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,63}")
 ENV_KEY_RE = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
-# Variables that redirect what an interpreter or the dynamic loader runs; an owner cannot fix these either.
-ENV_FORBIDDEN = re.compile(r"(PYTHON|NODE|LD_|DYLD_|PERL|RUBY|PIP_|NPM_|VIRTUAL_ENV|BASH_ENV$|ENV$)")
+# Known variables that redirect what git, an interpreter, a build tool or the dynamic loader runs, and the names the recorder passes
+# itself; an owner cannot fix these. A denylist of known redirect keys, not a proof that no other variable can matter.
+ENV_FORBIDDEN = re.compile(r"(GIT_|PYTHON|NODE|LD_|DYLD_|PERL|RUBY|PIP_|UV_|PYTEST_|NPM_|BUNDLE_|GEM_|CARGO_|RUSTC|RUSTFLAGS|LC_|"
+                           r"VIRTUAL_ENV|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS|CLASSPATH|"
+                           r"(?:BASH_ENV|ENV|PATH|HOME|USER|LOGNAME|LANG|TMPDIR|TERM|TZ)$)")
 
 
 def load_local_first(obj):
@@ -201,9 +211,9 @@ def load_local_first(obj):
         for c in entry["checks"]:
             ok = isinstance(c, dict) and set(c) == {"name", "argv"} and isinstance(c["name"], str) and LOCAL_NAME_RE.fullmatch(c["name"]) \
                 and isinstance(c["argv"], list) and c["argv"] and all(isinstance(a, str) and 0 < len(a) <= 500 for a in c["argv"])
-            if not ok or c["name"] in names:
+            if not ok or log_slug(c["name"]) in names:   # two names with one log file would overwrite each other's evidence
                 raise ValueError(f"local-first check for {repo} is malformed or repeated")
-            names.add(c["name"])
+            names.add(log_slug(c["name"]))
             checks.append((c["name"], tuple(c["argv"])))
         hours = entry.get("max_age_hours", 24)
         if type(hours) is not int or not 1 <= hours <= 168:
@@ -496,10 +506,11 @@ def _int(x):
 
 def parse_local_record(rec):
     """Strictly validate one OWNER-MERGE-LOCAL-CI record and return its commands' finish times; raises ValueError on any deviation."""
-    top = {"schema", "repo", "pr", "base", "base_sha", "head", "commands"}
+    top = {"schema", "repo", "pr", "base", "base_sha", "head", "env", "commands"}
     ok = isinstance(rec, dict) and set(rec) == top and rec["schema"] == 1 and _int(rec["schema"]) and isinstance(rec["repo"], str) \
         and _int(rec["pr"]) and isinstance(rec["base"], str) and isinstance(rec["base_sha"], str) and SHA_RE.fullmatch(rec["base_sha"]) \
-        and isinstance(rec["head"], str) and SHA_RE.fullmatch(rec["head"]) and isinstance(rec["commands"], list) and rec["commands"]
+        and isinstance(rec["head"], str) and SHA_RE.fullmatch(rec["head"]) and isinstance(rec["commands"], list) and rec["commands"] \
+        and isinstance(rec["env"], dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in rec["env"].items())
     if not ok:
         raise ValueError("record shape")
     finished = []
@@ -555,13 +566,23 @@ def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, raw_bo
                 items.append(("rec", rec, c))
             elif head in raw:
                 items.append(("bad", None, c))
-    # A failing run at this head stands whatever happened to its comment (edited, minimized, fenced) and however its exit code is
-    # spelled: anything other than the integer 0 is a failure, and a later pass never overrides it.
+    # A failing run at this head stands wherever it appears in a comment body (fenced, quoted, indented, in a minimized comment), and
+    # however its exit code is spelled: anything other than the integer 0 is a failure, and a later pass never overrides it. A line at
+    # this head that cannot be read (bad JSON, duplicate keys, oversized) is treated as a failure too. An edit replaces a comment's body,
+    # so text removed by an edit is not visible here; that is a residual risk, not something this scan can see.
     for body in raw_bodies:
-        for m in LOCAL_RE.finditer(body):
+        for line in body.splitlines():
+            line = line.lstrip(" \t>")
+            if not line.startswith("OWNER-MERGE-LOCAL-CI "):
+                continue
+            raw = line[len("OWNER-MERGE-LOCAL-CI "):].strip()
             try:
-                rec = json.loads(m.group(1), object_pairs_hook=_no_dup)
+                if len(raw) > POLICY_MAX_BYTES:
+                    raise ValueError("oversized")
+                rec = json.loads(raw, object_pairs_hook=_no_dup)
             except ValueError:
+                if head in raw:
+                    return reasons + ["LOCAL_CI_FAILED: a record line at this head cannot be read; treated as a failed run"], wait, facts
                 continue
             cmds = rec.get("commands") if isinstance(rec, dict) and rec.get("head") == head else None
             if isinstance(cmds, list) and any(isinstance(x, dict) and not (_int(x.get("exit_code")) and x["exit_code"] == 0) for x in cmds):
@@ -582,8 +603,8 @@ def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, raw_bo
         mismatch = rec["base_sha"] != run("api", f"repos/{repo}/compare/{base}...{head}", "--jq", ".merge_base_commit.sha").strip()
     if mismatch or max(finished) > now + 60 or max(finished) > created:
         return reasons + ["LOCAL_CI_MISMATCH: the record is for another repo, PR, base, base commit or head, or claims to finish after it was posted"], wait, facts
-    if [(c["name"], tuple(c["argv"])) for c in rec["commands"]] != cfg["checks"]:
-        return reasons + ["LOCAL_CI_COMMANDS_MISMATCH: the recorded commands are not exactly the owner's configured checks, in order"], wait, facts
+    if [(c["name"], tuple(c["argv"])) for c in rec["commands"]] != cfg["checks"] or rec["env"] != cfg["env"]:
+        return reasons + ["LOCAL_CI_COMMANDS_MISMATCH: the recorded commands or environment are not exactly the owner's configured checks, in order"], wait, facts
     if now - max(finished) > cfg["max_age_hours"] * 3600:
         return reasons + [f"LOCAL_CI_STALE: the record is older than {cfg['max_age_hours']} hours; rerun the local checks"], wait, facts
     if not reasons and not wait:

@@ -465,7 +465,7 @@ def iso(t):
 
 
 def lf_record(**over):
-    rec = {"schema": 1, "repo": "Chisanan232/r", "pr": 7, "base": "main", "base_sha": BASE_SHA, "head": HEAD,
+    rec = {"schema": 1, "repo": "Chisanan232/r", "pr": 7, "base": "main", "base_sha": BASE_SHA, "head": HEAD, "env": {},
            "commands": [{"name": "suite", "argv": ["python3", "-m", "pytest"], "exit_code": 0, "started_at": iso(NOW - 900),
                          "finished_at": iso(NOW - 600), "log_sha256": "1" * 64},
                         {"name": "lint", "argv": ["ruff", "check", "."], "exit_code": 0, "started_at": iso(NOW - 590),
@@ -575,11 +575,14 @@ class LocalFirst(unittest.TestCase):
 
     def test_malformed_and_duplicate_key_records_refuse(self):
         dup = '{"schema": 1, "schema": 1, "head": "%s"}' % HEAD
-        for body in ("OWNER-MERGE-LOCAL-CI {not json %s" % HEAD, "OWNER-MERGE-LOCAL-CI " + dup,
-                     "OWNER-MERGE-LOCAL-CI " + json.dumps(dict(lf_record(), extra=1)), "OWNER-MERGE-LOCAL-CI " + json.dumps(lf_record(schema=2)),
+        for body in ("OWNER-MERGE-LOCAL-CI " + json.dumps(dict(lf_record(), extra=1)), "OWNER-MERGE-LOCAL-CI " + json.dumps(lf_record(schema=2)),
                      "OWNER-MERGE-LOCAL-CI " + json.dumps(lf_record(pr="7"))):
             with self.subTest(body[:60]):
                 self.refused(self.fake(lf_comment(body=body)), "LOCAL_CI_MALFORMED")
+        for body in ("OWNER-MERGE-LOCAL-CI {not json %s" % HEAD, "OWNER-MERGE-LOCAL-CI " + dup,
+                     "OWNER-MERGE-LOCAL-CI " + json.dumps(dict(lf_record(), pad="x" * 70000))):   # unreadable at this head: fail closed
+            with self.subTest(body[:40]):
+                self.refused(self.fake(lf_comment(body=body)), "LOCAL_CI_FAILED")
         digest = lf_record()
         digest["commands"][0]["log_sha256"] = "zz"
         self.refused(self.fake(lf_comment(digest)), "LOCAL_CI_MALFORMED")
@@ -658,6 +661,49 @@ class LocalFirst(unittest.TestCase):
         missing = lf_record()
         del missing["commands"][1]["exit_code"]
         self.refused(self.fake(lf_comment(missing), lf_comment()), "LOCAL_CI_FAILED")
+
+    def test_a_failure_in_a_quoted_or_indented_line_still_counts(self):
+        bad = lf_record()
+        bad["commands"][0]["exit_code"] = 2
+        for prefix in ("> ", ">> ", "  ", "> > ", "\t> "):
+            with self.subTest(prefix=prefix):
+                self.refused(self.fake(lf_comment(body=prefix + "OWNER-MERGE-LOCAL-CI " + json.dumps(bad)), lf_comment()), "LOCAL_CI_FAILED")
+
+    def test_skip_trailer_must_be_the_final_line_after_a_blank_line(self):
+        for msg in ("x\n\nskip-checks: true", "x\n\nskip-checks:true\n", "x\n\nbody\n\nskip-checks: true\n\n"):
+            with self.subTest(msg):
+                self.assertEqual(self.evaluate(self.fake(message=msg))[0], "PASS")
+        for msg in ("x\n\nskip-checks: true\nSigned-off-by: a", "x\nskip-checks: true", "x\n\nskip-checks: true\n\ntail", "skip-checks: true",
+                    "x\n\nskip-checks:  true", "x\n\n skip-checks: true"):
+            with self.subTest(msg):
+                self.assertEqual(self.evaluate(self.fake(message=msg))[0], "WAIT")
+
+    def test_env_is_bound_into_the_record(self):
+        entry = LF_CONFIG["repos"]["Chisanan232/r"]
+        cfg = {"schema": 1, "repos": {"Chisanan232/r": dict(entry, env={"CI": "1"})}}
+        self.assertEqual(self.evaluate(self.fake(lf_comment(lf_record(env={"CI": "1"}))), config=cfg)[0], "PASS")
+        for env in ({}, {"CI": "2"}, {"CI": "1", "X": "1"}):
+            with self.subTest(env=env):
+                self.refused(self.fake(lf_comment(lf_record(env=env))), "LOCAL_CI_COMMANDS_MISMATCH", config=cfg)
+        self.refused(self.fake(lf_comment(lf_record(env={"CI": "1"}))), "LOCAL_CI_COMMANDS_MISMATCH")   # config has no env
+        bad = lf_record(env={"CI": 1})
+        self.refused(self.fake(lf_comment(bad)), "LOCAL_CI_MALFORMED")
+        missing = lf_record()
+        del missing["env"]
+        self.refused(self.fake(lf_comment(missing)), "LOCAL_CI_MALFORMED")
+
+    def test_more_redirecting_env_names_are_refused_in_the_trust_file(self):
+        entry = LF_CONFIG["repos"]["Chisanan232/r"]
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_GLOBAL", "PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "TERM", "TZ", "UV_PYTHON",
+                    "PYTEST_ADDOPTS", "JAVA_TOOL_OPTIONS", "CLASSPATH", "GEM_PATH", "RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER", "NPM_CONFIG_PREFIX",
+                    "BUNDLE_GEMFILE"):
+            with self.subTest(key), self.assertRaises(ValueError):
+                omg.load_local_first({"schema": 1, "repos": {"Chisanan232/r": dict(entry, env={key: "x"})}})
+
+    def test_check_names_must_have_distinct_log_names(self):
+        entry = LF_CONFIG["repos"]["Chisanan232/r"]
+        with self.assertRaises(ValueError):
+            omg.load_local_first({"schema": 1, "repos": {"Chisanan232/r": dict(entry, checks=[{"name": "a b", "argv": ["x"]}, {"name": "a_b", "argv": ["y"]}])}})
 
     def test_a_tilde_fenced_passing_record_does_not_count(self):
         self.refused(self.fake(lf_comment(body="~~~\nOWNER-MERGE-LOCAL-CI " + json.dumps(lf_record()) + "\n~~~")), "LOCAL_CI_MISSING")

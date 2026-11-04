@@ -9,8 +9,8 @@ which this script only reads) in the worktree, with no shell, and prints exactly
 The worktree must be clean before and after the run, so the record describes the committed head (tracked and untracked files; git-ignored files are not seen). A failing command
 is still recorded (exit_code non-zero) and the script exits 1; the gate denies on any recorded failure. Full logs stay on this machine
 (mode 0600, ~/.claude/owner-merge-evidence/); only their SHA-256 digests are recorded. It never posts, merges or writes the trust file.
-Checks run with a scrubbed environment (ENV_KEEP plus the owner's `env`); the kept names are printed to stderr and are not part of the
-record. The clean-tree test uses `--untracked-files=all`, which does not see git-ignored files: ignored content (a venv, a cache, a
+Checks run with a scrubbed environment (ENV_KEEP plus the owner's `env`); the owner's `env` map is part of the record (the gate compares it
+with the trust file) and all kept names are printed to stderr. The clean-tree test uses `--untracked-files=all`, which does not see git-ignored files: ignored content (a venv, a cache, a
 build directory) can still influence a check and is not covered by the record.
 """
 import argparse
@@ -42,7 +42,9 @@ def stamp(t=None):
 
 
 def git(worktree, *args):
-    r = subprocess.run(["git", "-C", worktree, *args], capture_output=True, text=True, timeout=120)
+    # Ambient GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, GIT_CONFIG* ... could point git at another repository than --worktree.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    r = subprocess.run(["git", "-C", worktree, *args], capture_output=True, text=True, timeout=120, env=env)
     if r.returncode:
         raise RuntimeError(f"git {args[0]} failed: {r.stderr.strip()[:200]}")
     return r.stdout.strip()
@@ -66,7 +68,7 @@ def check_env(extra):
 
 
 def log_path(logs, name, head, tag):
-    return os.path.join(logs, f"local-ci-{tag}-{head[:12]}-{re.sub(r'[^A-Za-z0-9._-]', '_', name)}.log")
+    return os.path.join(logs, f"local-ci-{tag}-{head[:12]}-{gate.log_slug(name)}.log")
 
 
 def open_log(path):
@@ -115,10 +117,14 @@ def record(repo, pr, base, worktree, entry, logs, expect_head=None):
         return 2
     if not gate.REPO_RE.fullmatch(repo) or not re.fullmatch(r"[1-9][0-9]{0,8}", str(pr)) or not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", base):
         return refuse("repo, pr or base is malformed")
+    if len({gate.log_slug(n) for n, _ in entry["checks"]}) != len(entry["checks"]):
+        return refuse("two checks would share one log file")
     for name, argv in entry["checks"]:
         if any(SECRET_RE.search(a) for a in argv):
             return refuse(f"check {name!r} has a credential-shaped argument")
     try:
+        if os.path.realpath(git(worktree, "rev-parse", "--show-toplevel")) != os.path.realpath(worktree):
+            return refuse("the worktree is not the top level of its git repository")
         head = git(worktree, "rev-parse", "HEAD")
         if expect_head and head != expect_head:
             return refuse(f"worktree HEAD {head[:12]} is not the expected {expect_head[:12]}")
@@ -152,7 +158,8 @@ def record(repo, pr, base, worktree, entry, logs, expect_head=None):
         return refuse("the checks changed the worktree or HEAD; no record is produced")
     if moved:   # a failing record is still printed (the gate denies on it); a pass is never produced from a changed tree
         print("owner-merge-local-ci: the checks also changed the worktree; printing the failing record only", file=sys.stderr)
-    out = {"schema": 1, "repo": repo, "pr": int(pr), "base": base, "base_sha": base_sha, "head": head, "commands": commands}
+    out = {"schema": 1, "repo": repo, "pr": int(pr), "base": base, "base_sha": base_sha, "head": head,
+           "env": dict(entry.get("env") or {}), "commands": commands}
     print("OWNER-MERGE-LOCAL-CI " + json.dumps(out, separators=(",", ":")))
     return 0 if all(c["exit_code"] == 0 for c in commands) else 1
 
