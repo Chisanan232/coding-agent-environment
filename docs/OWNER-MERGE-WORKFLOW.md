@@ -125,6 +125,7 @@ Threats considered. Replay to another head, base or PR: exact match plus an age 
 file, which the agent installs from owner-approved content (same OS user; see the residual risks). A script a command calls being edited by the PR: pinned paths, the workflow-change refusal and the
 independent review. Skipping a hosted check that would have failed: only owner-listed private repositories, hosted result reported
 `NOT_RUN`, never a pass. Backdating or editing a record: server-side `createdAt` and the unedited check. Residual risks, stated plainly:
+- An agent that installs the trust file can widen its commands, pinned paths or `not_covered`. Only the independent review and the founder's approval of the file content catch that. Record where the approval lives (a Jira or PR comment quoting the content digest) and install only content matching it; the agent never approves its own content. A host deny rule on the directory is optional hardening, not a requirement.
 - The record is written under the same GitHub identity and OS user as the agent. A forged line cannot be detected cryptographically (an
   HMAC would be tamper evidence only); the independent review and the owner's merge review are the controls.
 - A failing run that was deleted or never posted cannot be seen by the gate. Only a posted failure denies. The failure scan reads every
