@@ -77,7 +77,7 @@ Describe the observed coverage boundary; do not infer absence of all regressions
 from passing tests. Unverified blocking criteria prevent a ready verdict.
 
 ## Acceptance standard
-Acceptance rests on real end-to-end or realistic user-workflow evidence, run by Codex where possible and otherwise by Claude Code, with results attributed truthfully. See "Acceptance evidence" in [engineering-workflow](../engineering-workflow/SKILL.md); a check that could not run is `NOT_RUN`, never pass.
+Acceptance rests on real end-to-end or realistic user-workflow evidence, run by Codex where possible and otherwise by Claude Code, with results attributed truthfully. See "Acceptance evidence" in [engineering-workflow](../engineering-workflow/SKILL.md); a check that could not run is `NOT_RUN`, never pass, and stays an unresolved acceptance gap until another permitted method or the supported approval mechanism produces the evidence.
 
 ## Safe-Fix Guidance
 - If a criterion fails, report it. Do not modify tests or code to make it pass.
