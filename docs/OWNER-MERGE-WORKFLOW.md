@@ -93,6 +93,44 @@ verify the founder's per-PR approval; it bounds what the record can cover, it do
 ran and failed or are pending still refuse or wait. It records that local evidence stands in for CI; it is not a CI pass and is
 never reported as one. It does not replace `--ci-unavailable`, which is for a verified external outage of CI that exists.
 
+## Private repository whose head skips hosted CI (local-first basis, SPE-135)
+
+A private repository can have workflows and still show an empty check rollup: the head commit message carries a GitHub skip
+directive (`[skip ci]`, `[ci skip]`, `[no ci]`, `[skip actions]`, `[actions skip]` or a `skip-checks: true` trailer), so no Actions run
+exists for it. An empty rollup is never evidence by itself, and neither `--ci-unavailable` (a billing, quota or outage cause) nor the
+no-hosted-ci exception (no workflows directory) fits. The local-first basis is the third, separate one. It is not a CI pass.
+
+Owner-authored trust file, which the agent never writes: `~/.config/coding-agent-environment/local/local-first-ci.json`
+(loaded with the same checks as the version-branch policy: fixed directory, no symlink, caller-owned, not group/world-writable, 64 KB,
+duplicate keys rejected). Per repository: `checks` (`name` + `argv`, in order), `max_age_hours` (1 to 168, default 24), `pinned_paths`
+(globs whose change is never covered, for example scripts a check runs) and `not_covered` (what a local run cannot prove, for example
+hosted windows or ubuntu matrix legs).
+
+1. The owner commits with a skip directive. 2. `scripts/owner-merge-local-ci.py record --repo R --pr N --base B --worktree PATH` runs
+exactly the owner's argv in a clean worktree (no shell) and prints one `OWNER-MERGE-LOCAL-CI {json}` line; run the heavy suite through
+the heavy-lane wrapper. 3. Post that line unedited and unfenced as the authenticated user, plus the independent
+`OWNER-MERGE-REVIEW` record. 4. `owner-merge-gate.py check ... --ci-exception`.
+
+`--ci-exception` only states intent; the trust file is the authorization. The gate refuses unless all hold: the repo is in the trust file;
+it is private; the rollup is empty; GitHub reports no Actions run for the head; the head commit has a skip directive; the PR changes no
+`.github/workflows/**` file and no pinned path and lists fewer than 100 files; the latest visible record for this head is by the
+authenticated user, not edited and not minimized; its repo, PR, base, head and base commit (against the compare merge base) match;
+its commands equal the configured ones exactly, in order; every exit code is 0; it finished no more than 60 seconds in the future,
+within `max_age_hours`, and no later than the comment's server-side creation time; and a clean review record exists. A recorded
+non-zero exit at this head is `LOCAL_CI_FAILED` (DENY) and a later pass does not override it. An empty rollup with no skip directive, or
+any Actions run for the head, is `CI_PENDING`. On success the facts carry `ci_exception=local-first`, `hosted_checks=NOT_RUN`,
+`ci_verdict=NOT_A_CI_PASS: LOCAL_EQUIVALENT_PASS`, `local_ci_digest` and `not_covered`.
+
+Threats considered. Replay to another head, base or PR: exact match plus an age window. Weaker commands: argv must equal the owner's
+file, which the agent cannot write. A script a command calls being edited by the PR: pinned paths, the workflow-change refusal and the
+independent review. Skipping a hosted check that would have failed: only owner-listed private repositories, hosted result reported
+`NOT_RUN`, never a pass. Backdating or editing a record: server-side `createdAt` and the unedited check. Residual risk, stated plainly:
+the record is written under the same GitHub identity and OS user as the agent, so a forged line, or a failing run that was never posted,
+cannot be detected cryptographically (an HMAC would be tamper evidence only); the independent review and the owner's merge review are
+the controls for that. A macOS local run does not cover hosted windows or ubuntu legs (`not_covered` makes that visible). The
+`owner-merge-runner` is unchanged: a local-first repository is not on its allowlist, and a missing required check there is never
+exempted, so the merge is the direct pinned `gh pr merge`, which the host still asks about.
+
 ## Version integration branches (Development-Ahead / Sequential Release)
 
 `main` is the protected cumulative release baseline. A founder-approved version integration branch (for example
