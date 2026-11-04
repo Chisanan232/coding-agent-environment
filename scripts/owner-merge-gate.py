@@ -29,18 +29,33 @@ No-hosted-CI exception (a repository that defines no CI workflow at all, founder
 and only together with --ci-exception, only when the head has zero checks, only when the repository's .github/workflows
 directory does not exist (404; any other answer counts as 'has workflows'), and only with a clean review record. It records
 that the local validation evidence stands in for CI; the comment must state that evidence.
+Local-first basis (a private repository whose own head commit carries a GitHub skip directive, so no hosted CI exists for it; not a CI pass):
+  OWNER-MERGE-LOCAL-CI {json}   (written by scripts/owner-merge-local-ci.py, posted unedited by the authenticated user)
+only together with --ci-exception, only for a repository in the owner's trust file (VERSION-style, outside every product repo,
+default ~/.config/coding-agent-environment/local/local-first-ci.json, see docs/OWNER-MERGE-WORKFLOW.md), only when the rollup is
+empty and GitHub reports no Actions run for the head, and only when every owner-fixed command ran at this exact head and base and
+exited 0. Hosted checks are reported NOT_RUN, never as a pass.
 """
 import argparse
 import base64
+import calendar
+import fnmatch
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 
 REVIEW_RE = re.compile(r"^OWNER-MERGE-REVIEW head=([0-9a-f]{40}) verdict=(\w+) blocking=(\d+) reviewer=(\S+)\s*$", re.M)
 CI_RE = re.compile(r"^OWNER-MERGE-CI-UNAVAILABLE head=([0-9a-f]{40}) cause=(billing|quota|outage) local_equivalent=(\w+)\s*$", re.M)
 NOCI_RE = re.compile(r"^OWNER-MERGE-CI-EXCEPTION head=([0-9a-f]{40}) basis=no-hosted-ci local_equivalent=(\w+)\s*$", re.M)
+LOCAL_RE = re.compile(r"^OWNER-MERGE-LOCAL-CI (.*?)\s*$", re.M)
+# GitHub's own spellings for "do not run workflows on this commit"; anything else (a look-alike, a negation) is not a directive.
+SKIP_RE = re.compile(r"\[(?:skip ci|ci skip|no ci|skip actions|actions skip)\]|^skip-checks:\s*true\s*$", re.I | re.M)
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+STAMP_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 OWNER_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}")
 FAIL = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR", "STALE"}
@@ -154,6 +169,48 @@ def read_version_policy(path, required, root=None):
     return read_owner_file(path, required, load_version_policy, "version policy", root)
 
 
+LOCAL_FIRST_DEFAULT = "~/.config/coding-agent-environment/local/local-first-ci.json"
+LOCAL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,63}")
+
+
+def load_local_first(obj):
+    """Validate the owner-authored local-first CI trust file and return {repo.lower(): entry}.
+
+    The agent never writes this file: the commands listed here are what stands in for a hosted CI run, so whoever can edit them can
+    weaken the gate. Each repo lists the exact checks (name + argv) the recorder must run, how old a record may be, paths whose
+    change is never covered (they could rewrite what a command runs) and what the local run does not cover."""
+    if not isinstance(obj, dict) or type(obj.get("schema")) is not int or obj["schema"] != 1 or not isinstance(obj.get("repos"), dict):
+        raise ValueError("local-first config must be an object with schema 1 and a repos object")
+    out = {}
+    for repo, entry in obj["repos"].items():
+        if not isinstance(repo, str) or not REPO_RE.fullmatch(repo) or not isinstance(entry, dict) \
+                or set(entry) - {"checks", "max_age_hours", "pinned_paths", "not_covered"}:
+            raise ValueError(f"local-first config repo {repo!r} is malformed")
+        checks, names = [], set()
+        if not isinstance(entry.get("checks"), list) or not entry["checks"]:
+            raise ValueError(f"local-first checks for {repo} must be a non-empty list")
+        for c in entry["checks"]:
+            ok = isinstance(c, dict) and set(c) == {"name", "argv"} and isinstance(c["name"], str) and LOCAL_NAME_RE.fullmatch(c["name"]) \
+                and isinstance(c["argv"], list) and c["argv"] and all(isinstance(a, str) and 0 < len(a) <= 500 for a in c["argv"])
+            if not ok or c["name"] in names:
+                raise ValueError(f"local-first check for {repo} is malformed or repeated")
+            names.add(c["name"])
+            checks.append((c["name"], tuple(c["argv"])))
+        hours = entry.get("max_age_hours", 24)
+        if type(hours) is not int or not 1 <= hours <= 168:
+            raise ValueError(f"local-first max_age_hours for {repo} must be an integer from 1 to 168")
+        lists = {}
+        for key in ("pinned_paths", "not_covered"):
+            lists[key] = entry.get(key, [])
+            if not isinstance(lists[key], list) or not all(isinstance(x, str) and x for x in lists[key]):
+                raise ValueError(f"local-first {key} for {repo} must be a list of non-empty strings")
+        if repo.lower() in out:
+            raise ValueError(f"local-first config lists {repo} more than once (repository names are case-insensitive)")
+        out[repo.lower()] = {"checks": checks, "max_age_hours": hours, "pinned_paths": tuple(lists["pinned_paths"]),
+                             "not_covered": list(lists["not_covered"])}
+    return out
+
+
 # One entry per refusal reason so callers and tests can match on a stable code.
 PR_FIELDS = ("number,state,isDraft,baseRefName,headRefName,headRefOid,author,mergeable,mergeStateStatus,"
              "reviewDecision,reviews,comments,statusCheckRollup,isCrossRepository,mergeCommit,files,commits")
@@ -168,6 +225,8 @@ API_READS = [re.compile(x) for x in (
     _RO + r"/contents/(\.github/CODEOWNERS|CODEOWNERS|docs/CODEOWNERS)", _RO + r"/contents/\.github/workflows\?ref=(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._/-]{0,199}",
     # The billing waiver (--ci-unavailable) reads one check run, its job and its annotations by numeric id.
     _RO + r"/check-runs/\d{1,15}", _RO + r"/actions/jobs/\d{1,15}", _RO + r"/check-runs/\d{1,15}/annotations\?per_page=100",
+    # The local-first basis asks GitHub whether any Actions run exists for the head (a count only).
+    _RO + r"/actions/runs\?head_sha=[0-9a-f]{40}&per_page=1",
     r"orgs/[A-Za-z0-9][A-Za-z0-9-]{0,38}/memberships/[A-Za-z0-9][A-Za-z0-9-]{0,38}")]
 SAFE_FLAGS = {"--json", "--jq", "--repo"}
 GRAPHQL_VARS = {"query", "o", "r", "n"}
@@ -408,14 +467,112 @@ def billing_waiver(run, repo, head, checks):
     return [{"name": e["name"], "conclusion": e["conclusion"], "job_id": e["job_id"], "reason": e["reason"]} for e in info], []
 
 
-def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_policy=None, ci_exception=False):
+def _stamp(text):
+    if not isinstance(text, str) or not STAMP_RE.fullmatch(text):
+        raise ValueError("bad timestamp")
+    return calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ"))
+
+
+def _no_dup(pairs):
+    return _no_duplicate_keys(pairs)
+
+
+def _int(x):
+    return type(x) is int
+
+
+def parse_local_record(rec):
+    """Strictly validate one OWNER-MERGE-LOCAL-CI record and return its commands' finish times; raises ValueError on any deviation."""
+    top = {"schema", "repo", "pr", "base", "base_sha", "head", "commands"}
+    ok = isinstance(rec, dict) and set(rec) == top and rec["schema"] == 1 and _int(rec["schema"]) and isinstance(rec["repo"], str) \
+        and _int(rec["pr"]) and isinstance(rec["base"], str) and isinstance(rec["base_sha"], str) and SHA_RE.fullmatch(rec["base_sha"]) \
+        and isinstance(rec["head"], str) and SHA_RE.fullmatch(rec["head"]) and isinstance(rec["commands"], list) and rec["commands"]
+    if not ok:
+        raise ValueError("record shape")
+    finished = []
+    for c in rec["commands"]:
+        keys = {"name", "argv", "exit_code", "started_at", "finished_at", "log_sha256"}
+        if not isinstance(c, dict) or set(c) != keys or not isinstance(c["name"], str) or not isinstance(c["argv"], list) \
+                or not all(isinstance(a, str) for a in c["argv"]) or not _int(c["exit_code"]) \
+                or not isinstance(c["log_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", c["log_sha256"]):
+            raise ValueError("command shape")
+        start, end = _stamp(c["started_at"]), _stamp(c["finished_at"])
+        if end < start:
+            raise ValueError("command ends before it starts")
+        finished.append(end)
+    return finished
+
+
+def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, cfg, now):
+    """Third CI basis. Returns (reasons, wait, facts). Only called for an empty rollup, --ci-exception and a repo in the owner's
+    trust file. Every uncertainty refuses; a pass is never a CI pass (hosted checks stay NOT_RUN)."""
+    reasons, wait, facts = [], [], {}
+    if meta.get("isPrivate") is not True:
+        return ["NOT_PRIVATE: the local-first basis exists only for private repositories"], wait, facts
+    files = p.get("files") or []
+    pinned = [f["path"] for f in files if any(fnmatch.fnmatchcase(str(f.get("path", "")).casefold(), g.casefold()) for g in cfg["pinned_paths"])]
+    if p.get("isCrossRepository") or not files or len(files) >= 100 \
+            or any(".github/workflows" in str(f.get("path", "")).casefold() for f in files) or pinned:
+        reasons.append("LOCAL_FIRST_SCOPE: the file list is unknown or truncated, or the PR changes a workflow or an owner-pinned path")
+    if int(run("api", f"repos/{repo}/actions/runs?head_sha={head}&per_page=1", "--jq", ".total_count").strip()):
+        wait.append("CI_PENDING: GitHub Actions has a run for this head; the hosted result decides, not the local-first basis")
+    elif not SKIP_RE.search(run("api", f"repos/{repo}/commits/{head}", "--jq", ".commit.message")):
+        wait.append("CI_PENDING: the empty rollup is not explained by a skip directive in the head commit; hosted CI may not have started")
+    items = []   # in comment order: ("rec", record, comment) or ("bad", None, comment)
+    for c, text in texts_meta:
+        for m in LOCAL_RE.finditer(text):
+            raw = m.group(1)
+            try:
+                rec = json.loads(raw, object_pairs_hook=_no_dup)
+            except ValueError:
+                rec = None
+                if head in raw:
+                    items.append(("bad", None, c))
+                continue
+            if isinstance(rec, dict) and rec.get("head") == head:
+                items.append(("rec", rec, c))
+            elif head in raw:
+                items.append(("bad", None, c))
+    for kind, rec, _ in items:   # a failing run at this head stands whatever happened to its comment, and a later pass never overrides it
+        cmds = rec.get("commands") if kind == "rec" else None
+        if isinstance(cmds, list) and any(isinstance(x, dict) and _int(x.get("exit_code")) and x["exit_code"] != 0 for x in cmds):
+            return reasons + ["LOCAL_CI_FAILED: a recorded local run at this head exited non-zero; fix it and record a new run"], wait, facts
+    trusted = [i for i in items if i[2].get("includesCreatedEdit") is False and i[2].get("isMinimized") is False]
+    if not trusted:
+        return reasons + ["LOCAL_CI_MISSING: no unedited, visible OWNER-MERGE-LOCAL-CI record for this head by the authenticated user"], wait, facts
+    kind, rec, comment = trusted[-1]
+    try:
+        if kind == "bad":
+            raise ValueError("unparsable")
+        finished = parse_local_record(rec)
+        created = _stamp(comment.get("createdAt"))
+    except ValueError:
+        return reasons + ["LOCAL_CI_MALFORMED: the latest record for this head is not exactly the recorder's schema"], wait, facts
+    mismatch = rec["repo"].lower() != repo.lower() or rec["pr"] != pr or rec["base"] != base or rec["head"] != head
+    if not mismatch:
+        mismatch = rec["base_sha"] != run("api", f"repos/{repo}/compare/{base}...{head}", "--jq", ".merge_base_commit.sha").strip()
+    if mismatch or max(finished) > now + 60 or max(finished) > created:
+        return reasons + ["LOCAL_CI_MISMATCH: the record is for another repo, PR, base, base commit or head, or claims to finish after it was posted"], wait, facts
+    if [(c["name"], tuple(c["argv"])) for c in rec["commands"]] != cfg["checks"]:
+        return reasons + ["LOCAL_CI_COMMANDS_MISMATCH: the recorded commands are not exactly the owner's configured checks, in order"], wait, facts
+    if now - max(finished) > cfg["max_age_hours"] * 3600:
+        return reasons + [f"LOCAL_CI_STALE: the record is older than {cfg['max_age_hours']} hours; rerun the local checks"], wait, facts
+    if not reasons and not wait:
+        facts.update(ci_exception="local-first", hosted_checks="NOT_RUN",
+                     ci_verdict="NOT_A_CI_PASS: LOCAL_EQUIVALENT_PASS; hosted checks never ran for this head",
+                     local_ci_digest=hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                     not_covered=cfg["not_covered"])
+    return reasons, wait, facts
+
+
+def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_policy=None, ci_exception=False, local_first=None, now=None):
     """Return (verdict, reasons, facts). `run` executes gh and returns stdout (injected in tests)."""
     bots = {norm_bot(b) for b in (bots or BOT_LOGINS)}
     reasons, wait = [], []
     owner = repo.split("/")[0].lower()
     if not REPO_RE.fullmatch(repo) or owner not in {o.lower() for o in owners}:
         return "REFUSE", [f"UNAUTHORIZED_REPO: {repo} is not owned by a trusted owner"], {}
-    meta = _json(run, "repo", "view", repo, "--json", "nameWithOwner,defaultBranchRef,isFork,viewerPermission,owner")
+    meta = _json(run, "repo", "view", repo, "--json", "nameWithOwner,defaultBranchRef,isFork,isPrivate,viewerPermission,owner")
     if meta["nameWithOwner"].lower() != repo.lower() or meta["owner"]["login"].lower() not in {o.lower() for o in owners}:
         reasons.append("NOT_CANONICAL_REPO: repository identity does not match the target")
     if meta.get("isFork"):
@@ -548,8 +705,8 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
     unresolved = [t for t in rt["nodes"] if not t["isResolved"]]
     if unresolved:
         reasons.append(f"UNRESOLVED_REVIEW_THREADS: {len(unresolved)}")
-    texts = [re.sub(r"```.*?```", "", (c["body"] or ""), flags=re.S) for c in p["comments"]
-             if (c.get("author") or {}).get("login", "").lower() == me.lower()]
+    mine = [c for c in p["comments"] if (c.get("author") or {}).get("login", "").lower() == me.lower()]
+    texts = [re.sub(r"```.*?```", "", (c["body"] or ""), flags=re.S) for c in mine]
     found = [m for t in texts for m in REVIEW_RE.findall(t)]
     at_head = [m for m in found if m[0] == head]
     if not found:
@@ -602,6 +759,12 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
             facts["ci_exception"] = ci[-1][1]
         elif ci_exception and noci and not checks and no_hosted_ci(run, repo, base, head, p.get("files") or [], bool(p.get("isCrossRepository"))):
             facts["ci_exception"] = "no-hosted-ci"
+        elif ci_exception and not checks and (local_first or {}).get(repo.lower()):
+            lf_reasons, lf_wait, lf_facts = local_first_basis(run, repo, pr, base, head, p, meta, me, list(zip(mine, texts)),
+                                                              local_first[repo.lower()], time.time() if now is None else now)
+            reasons.extend(lf_reasons)
+            wait.extend(lf_wait)
+            facts.update(lf_facts)
         else:
             reasons.append("NO_CI_EVIDENCE: no completed checks on this head and no qualified CI_UNAVAILABLE_EXTERNAL record")
     facts["checks"] = len(checks)
@@ -718,6 +881,12 @@ REASON_TABLE = {
     "EVIDENCE_TRUNCATED": (ASK, "owner_review", "ENGINEERING_GATE"),
     "CI_PENDING": (ASK, "agent_revalidates", "ENGINEERING_GATE"),
     "NO_CI_EVIDENCE": (ASK, "founder_risk_decision", "ENGINEERING_GATE"),
+    "NOT_PRIVATE": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"),
+    "LOCAL_CI_FAILED": (DENY, "author_fixes_ci", "ENGINEERING_GATE"),  # a local run that executed and failed is never overridden by a later pass
+    "LOCAL_CI_MISSING": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"), "LOCAL_CI_STALE": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"),
+    "LOCAL_CI_MISMATCH": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"), "LOCAL_CI_MALFORMED": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"),
+    "LOCAL_CI_COMMANDS_MISMATCH": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"),
+    "LOCAL_FIRST_SCOPE": (ASK, "founder_risk_decision", "ENGINEERING_GATE"),
 }
 SEVERITY = {"ALLOW": 0, ASK: 1, DENY: 2}
 HOST_OUTCOME = {"allow": "ALLOW", "ask": ASK, "deny": DENY, "classifier": ASK, "not_evaluated": ASK}
@@ -830,12 +999,12 @@ def evidence_json(repo, pr, base, head, reviewer, kind="independent-agent", now=
             "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}
 
 
-def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None, version_policy=None, ci_exception=False):
+def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None, version_policy=None, ci_exception=False, local_first=None):
     """Text plan for the owner: gate verdict per PR, in the order given. Print-only."""
     lines, first = [], True
     for n in prs:
         try:
-            verdict, reasons, facts = evaluate(run, repo, n, owners, ci_unavailable, version_policy=version_policy, ci_exception=ci_exception)
+            verdict, reasons, facts = evaluate(run, repo, n, owners, ci_unavailable, version_policy=version_policy, ci_exception=ci_exception, local_first=local_first)
         except Exception as e:
             lines.append(f"#{n} ERROR  {type(e).__name__}: {str(e)[:200]}")
             continue
@@ -855,6 +1024,14 @@ def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None, ve
     return "\n".join(lines)
 
 
+def read_local_first(a):
+    """The trust file is read only when the owner passed --ci-exception; an explicit path or an unreadable file is an error, not a skip."""
+    if not a.ci_exception:
+        return None
+    return read_owner_file(a.local_first_config or LOCAL_FIRST_DEFAULT, bool(a.local_first_config), load_local_first,
+                           "local-first CI config", os.path.dirname(os.path.expanduser(LOCAL_FIRST_DEFAULT)))
+
+
 def main(argv=None, run=None):
     run = run or gh
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -872,6 +1049,8 @@ def main(argv=None, run=None):
     POLICY_HELP = ("approved version-branch policy (JSON, schema 1, owner-governed, outside every product repo); "
                    f"default {VERSION_POLICY_DEFAULT} when it exists")
     sub.choices["check"].add_argument("--version-policy", help=POLICY_HELP)
+    LOCAL_HELP = f"owner trust file for the local-first CI basis (JSON, schema 1; only read with --ci-exception); default {LOCAL_FIRST_DEFAULT} when it exists"
+    sub.choices["check"].add_argument("--local-first-config", help=LOCAL_HELP)
     sub.choices["verify"].add_argument("--head", required=True)
     q = sub.add_parser("queue")
     q.add_argument("--repo", required=True)
@@ -881,6 +1060,7 @@ def main(argv=None, run=None):
     q.add_argument("--ci-exception", action="store_true")
     q.add_argument("--settings", action="append", help=SETTINGS_HELP)
     q.add_argument("--version-policy", help=POLICY_HELP)
+    q.add_argument("--local-first-config", help=LOCAL_HELP)
     d = sub.add_parser("host-denied")
     d.add_argument("--repo", required=True)
     d.add_argument("--pr", type=int, required=True)
@@ -922,7 +1102,8 @@ def main(argv=None, run=None):
                 print(json.dumps({"verdict": "REFUSE", "reasons": ["BAD_OWNERS"]}))
                 return 1
             policy = read_version_policy(a.version_policy or VERSION_POLICY_DEFAULT, bool(a.version_policy))
-            text = queue_report(run, a.repo, [int(x) for x in a.prs.split(",")], owners, a.ci_unavailable, a.settings, policy, a.ci_exception)
+            text = queue_report(run, a.repo, [int(x) for x in a.prs.split(",")], owners, a.ci_unavailable, a.settings, policy, a.ci_exception,
+                                read_local_first(a))
             print(text)
             return 0 if all(re.match(r"#\d+ PASS ", l) for l in text.splitlines() if l.startswith("#")) else 1
         if a.cmd == "check":
@@ -931,7 +1112,8 @@ def main(argv=None, run=None):
                 print(json.dumps({"verdict": "REFUSE", "reasons": ["BAD_OWNERS"]}))
                 return 1
             policy = read_version_policy(a.version_policy or VERSION_POLICY_DEFAULT, bool(a.version_policy))
-            verdict, reasons, facts = evaluate(run, a.repo, a.pr, owners, a.ci_unavailable, version_policy=policy, ci_exception=a.ci_exception)
+            verdict, reasons, facts = evaluate(run, a.repo, a.pr, owners, a.ci_unavailable, version_policy=policy, ci_exception=a.ci_exception,
+                                               local_first=read_local_first(a))
             out = {"verdict": verdict, "reasons": reasons, **facts}
             sel = None
             if verdict == "PASS":
