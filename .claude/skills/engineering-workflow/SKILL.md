@@ -277,6 +277,18 @@ one prompt, is the unit of completion: `TASK_DONE` is not `CAMPAIGN_DONE`,
   unapproved funds on the basis of campaign state; each remains gated by its own
   explicit authorization, including when every engineering gate is satisfied.
 
+## Acceptance evidence
+
+Guidance, not a sequence: choose the proportionate scope and the execution method; any equivalent method that yields the same evidence is fine.
+
+- **Reconcile first.** Compare what the current version promised, plus its milestone requirements, with what is built. Record each gap as work or an explicit scope decision; never drop a promised capability silently.
+- **Evidence must be real.** Acceptance needs real end-to-end or realistic user-workflow evidence for each promised outcome. Unit tests, local CI and installation do not substitute for it; they support it. Preserve product-specific acceptance requirements as written.
+- **Who runs it.** Prefer Codex running the tests directly, with retained session records and results returned to Claude Code. If Codex cannot run them, Claude Code runs the actual tests itself and says so. Attribute every result to the agent and environment that produced it, and do not present one agent's run as another's. An explicit independent-QA requirement stays in force; "independent" means a separate agent or reviewer, never that the founder must run it.
+- **Close the loop.** Test, diagnose, fix, verify and regression-check autonomously, using existing authorization. Ask for a concrete approval only for an action that requires one (interactive authentication, an OS credential prompt, a host ASK, a material product or cost decision), after preparing the exact action, and resume afterwards.
+- **Reuse and stop honestly.** A valid existing run (same SHA and inputs, retained record) is reusable evidence; rerun only what changed. After a repeated expensive failure, change the approach or narrow to the cheapest reproduction instead of repeating it; there is no fixed retry count.
+- **Unavailable is not PASS.** Record what could not run and why: Codex unavailable (fall back as above), socket binding or another capability denied (run the unaffected cases, report the rest `NOT_RUN`, do not bypass the denial), hosted CI unavailable (local-equivalent evidence under `docs/ENGINEERING-POLICY.md` section 8, reported `NOT_A_CI_PASS`), an interactive login required (prepare everything else and request that single action).
+- **Readiness is not authorization.** Technical readiness (`READY_FOR_RELEASE`) rests on live evidence. Release approval, tagging, publication and deployment stay with the founder.
+
 ## Resource admission and concurrency
 
 Before heavy work (workspace or full builds, Cargo workspace builds, Docker suites, native QA, full E2E, large
