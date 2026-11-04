@@ -60,7 +60,7 @@ POLICY_MAX_BYTES = 65536
 def _no_duplicate_keys(pairs):
     keys = [k for k, _ in pairs]
     if len(keys) != len(set(keys)):
-        raise ValueError("version policy has a duplicate JSON key")
+        raise ValueError("owner config file has a duplicate JSON key")
     return dict(pairs)
 
 
@@ -112,20 +112,21 @@ def load_version_policy(obj):
     return out
 
 
-def read_version_policy(path, required, root=None):
-    """Load the policy file. A missing default file means no policy (old behaviour); an explicit path must load.
+def read_owner_file(path, required, validator, label, root=None):
+    """Load an owner-authored config file and return validator(parsed JSON). A missing default file means None (old behaviour);
+    an explicit path must load.
 
-    The policy is the trust anchor for which bases are mergeable, so it is accepted only from the fixed owner-config
-    directory: the real path must sit under `root`, the file and every directory from `root` down must be owned by the
+    The file is a trust anchor (which bases are mergeable, which commands stand in for CI), so it is accepted only from the fixed
+    owner-config directory: the real path must sit under `root`, the file and every directory from `root` down must be owned by the
     caller and not group/world-writable, and it is opened without following a symlink and judged on the open descriptor."""
     import stat
     root = os.path.realpath(os.path.expanduser(root or os.path.dirname(VERSION_POLICY_DEFAULT)))
     full = os.path.expanduser(path)
     if os.path.islink(full):
-        raise ValueError("version policy must be the file itself, not a symlink")
+        raise ValueError(f"{label} must be the file itself, not a symlink")
     real = os.path.realpath(full)
     if os.path.commonpath([root, real]) != root:
-        raise ValueError(f"version policy must live under {root}")
+        raise ValueError(f"{label} must live under {root}")
     try:
         fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -135,18 +136,22 @@ def read_version_policy(path, required, root=None):
     with os.fdopen(fd) as f:
         st = os.fstat(f.fileno())
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
-            raise ValueError("version policy file must be a regular file owned by the caller and not group/world-writable")
+            raise ValueError(f"{label} file must be a regular file owned by the caller and not group/world-writable")
         d = os.path.dirname(real)
         while True:
             ds = os.stat(d)
             if ds.st_uid != os.getuid() or ds.st_mode & 0o022:
-                raise ValueError(f"version policy directory {d} must be owned by the caller and not group/world-writable")
+                raise ValueError(f"{label} directory {d} must be owned by the caller and not group/world-writable")
             if d == root:
                 break
             d = os.path.dirname(d)
         if st.st_size > POLICY_MAX_BYTES:
-            raise ValueError(f"version policy file is larger than {POLICY_MAX_BYTES} bytes")
-        return load_version_policy(json.loads(f.read(POLICY_MAX_BYTES + 1), object_pairs_hook=_no_duplicate_keys))
+            raise ValueError(f"{label} file is larger than {POLICY_MAX_BYTES} bytes")
+        return validator(json.loads(f.read(POLICY_MAX_BYTES + 1), object_pairs_hook=_no_duplicate_keys))
+
+
+def read_version_policy(path, required, root=None):
+    return read_owner_file(path, required, load_version_policy, "version policy", root)
 
 
 # One entry per refusal reason so callers and tests can match on a stable code.
