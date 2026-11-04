@@ -100,7 +100,7 @@ directive (`[skip ci]`, `[ci skip]`, `[no ci]`, `[skip actions]`, `[actions skip
 exists for it. An empty rollup is never evidence by itself, and neither `--ci-unavailable` (a billing, quota or outage cause) nor the
 no-hosted-ci exception (no workflows directory) fits. The local-first basis is the third, separate one. It is not a CI pass.
 
-Owner-authored trust file, which the agent must not write (it runs as the same OS user, so nothing but this rule and the owner's review prevents it): `~/.config/coding-agent-environment/local/local-first-ci.json`
+Owner-approved trust file, installed by the responsible agent (the founder ratified this on 2026-11-04: human authoring is not an acceptance requirement). The agent installs only content the owner approved, with mode 0600 in a 0700 directory, preserves unrelated entries, and validates it with the gate's own loader before first use. It runs as the same OS user, so the file is a record of approved commands, not a barrier against the agent; the independent review and the pinned/not_covered lists carry the control: `~/.config/coding-agent-environment/local/local-first-ci.json`
 (loaded with the same checks as the version-branch policy: fixed directory, no symlink, caller-owned, not group/world-writable, 64 KB,
 duplicate keys rejected). Per repository: `checks` (`name` + `argv`, in order), `max_age_hours` (1 to 168, default 24), `pinned_paths`
 (globs whose change is never covered, for example scripts a check runs), `env` (optional fixed environment variables; known redirect keys such as `GIT_*`, `PYTHON*`, `PATH`, `LD_*`, `CARGO_*` and `NPM_*` are refused, a denylist and not proof that no other variable matters; check names must also map to distinct log file names) and `not_covered` (what a local run cannot prove, for example
@@ -122,7 +122,7 @@ any Actions run for the head, is `CI_PENDING`. Record schema 1 now carries a top
 `ci_verdict=NOT_A_CI_PASS: LOCAL_EQUIVALENT_PASS`, `local_ci_digest` and `not_covered`.
 
 Threats considered. Replay to another head, base or PR: exact match plus an age window. Weaker commands: argv must equal the owner's
-file, which the agent must not write (same OS user; see the residual risks). A script a command calls being edited by the PR: pinned paths, the workflow-change refusal and the
+file, which the agent installs from owner-approved content (same OS user; see the residual risks). A script a command calls being edited by the PR: pinned paths, the workflow-change refusal and the
 independent review. Skipping a hosted check that would have failed: only owner-listed private repositories, hosted result reported
 `NOT_RUN`, never a pass. Backdating or editing a record: server-side `createdAt` and the unedited check. Residual risks, stated plainly:
 - The record is written under the same GitHub identity and OS user as the agent. A forged line cannot be detected cryptographically (an
