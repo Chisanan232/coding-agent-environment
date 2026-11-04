@@ -177,6 +177,9 @@ def read_version_policy(path, required, root=None):
 
 LOCAL_FIRST_DEFAULT = "~/.config/coding-agent-environment/local/local-first-ci.json"
 LOCAL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,63}")
+ENV_KEY_RE = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
+# Variables that redirect what an interpreter or the dynamic loader runs; an owner cannot fix these either.
+ENV_FORBIDDEN = re.compile(r"(PYTHON|NODE|LD_|DYLD_|PERL|RUBY|PIP_|NPM_|VIRTUAL_ENV|BASH_ENV$|ENV$)")
 
 
 def load_local_first(obj):
@@ -190,7 +193,7 @@ def load_local_first(obj):
     out = {}
     for repo, entry in obj["repos"].items():
         if not isinstance(repo, str) or not REPO_RE.fullmatch(repo) or not isinstance(entry, dict) \
-                or set(entry) - {"checks", "max_age_hours", "pinned_paths", "not_covered"}:
+                or set(entry) - {"checks", "max_age_hours", "pinned_paths", "not_covered", "env"}:
             raise ValueError(f"local-first config repo {repo!r} is malformed")
         checks, names = [], set()
         if not isinstance(entry.get("checks"), list) or not entry["checks"]:
@@ -210,10 +213,14 @@ def load_local_first(obj):
             lists[key] = entry.get(key, [])
             if not isinstance(lists[key], list) or not all(isinstance(x, str) and x for x in lists[key]):
                 raise ValueError(f"local-first {key} for {repo} must be a list of non-empty strings")
+        env = entry.get("env", {})
+        if not isinstance(env, dict) or not all(isinstance(k, str) and ENV_KEY_RE.fullmatch(k) and not ENV_FORBIDDEN.match(k)
+                                                and isinstance(v, str) and len(v) <= 500 for k, v in env.items()):
+            raise ValueError(f"local-first env for {repo} must map plain variable names to strings and may not redirect an interpreter or loader")
         if repo.lower() in out:
             raise ValueError(f"local-first config lists {repo} more than once (repository names are case-insensitive)")
         out[repo.lower()] = {"checks": checks, "max_age_hours": hours, "pinned_paths": tuple(lists["pinned_paths"]),
-                             "not_covered": list(lists["not_covered"])}
+                             "not_covered": list(lists["not_covered"]), "env": dict(env)}
     return out
 
 

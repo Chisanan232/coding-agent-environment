@@ -65,13 +65,14 @@ class Recorder(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def entry(self, *commands):
-        return {"checks": [(f"c{i}", tuple(argv)) for i, argv in enumerate(commands)], "max_age_hours": 24, "pinned_paths": (), "not_covered": []}
+    def entry(self, *commands, env=None):
+        return {"checks": [(f"c{i}", tuple(argv)) for i, argv in enumerate(commands)], "max_age_hours": 24, "pinned_paths": (), "not_covered": [],
+                "env": env or {}}
 
-    def record(self, *commands, expect_head=None):
+    def record(self, *commands, expect_head=None, env=None):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = rec.record(REPO, 7, "main", self.wt, self.entry(*commands), self.logs, expect_head)
+            code = rec.record(REPO, 7, "main", self.wt, self.entry(*commands, env=env), self.logs, expect_head)
         return code, out.getvalue(), err.getvalue()
 
     def test_clean_tree_prints_one_unfenced_line_the_gate_accepts(self):
@@ -135,6 +136,44 @@ class Recorder(unittest.TestCase):
                 self.assertNotEqual(code, 0)
                 self.assertEqual(out, "")
                 self.assertFalse(os.path.exists(self.marker))
+
+    def test_checks_run_with_a_scrubbed_environment_plus_the_owners_env(self):
+        from unittest import mock
+        dump = py("import os, sys; sys.stdout.write(','.join(sorted(os.environ)))")
+        hostile = {"PYTHONPATH": "/x", "PYTHONHOME": "/x", "NODE_PATH": "/x", "VIRTUAL_ENV": "/x", "PYTHONSTARTUP": "/x", "PIP_INDEX_URL": "/x",
+                   "LD_PRELOAD": "/x", "DYLD_INSERT_LIBRARIES": "/x", "SOME_TOKEN": "t"}
+        with mock.patch.dict(os.environ, hostile):
+            self.record(dump, env={"OWNER_FIXED": "1"})
+        log = pathlib.Path(self.logs, os.listdir(self.logs)[0]).read_text().split(",")
+        for key in hostile:
+            self.assertNotIn(key, log)
+        for key in ("PATH", "HOME", "OWNER_FIXED"):
+            self.assertIn(key, log)
+
+    def test_a_failure_is_still_printed_when_the_checks_also_dirtied_the_tree(self):
+        made = os.path.join(self.wt, "made.txt")
+        code, out, _ = self.record(py(f"open({made!r}, 'w'); raise SystemExit(4)"))
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out.split(" ", 1)[1])["commands"][0]["exit_code"], 4)
+
+    def test_the_evidence_directory_is_made_private_and_log_files_are_checked(self):
+        os.mkdir(self.logs, 0o755)
+        self.assertEqual(self.record(py("pass"))[0], 0)
+        self.assertEqual(stat.S_IMODE(os.stat(self.logs).st_mode), 0o700)
+        name = os.listdir(self.logs)[0]
+        os.chmod(os.path.join(self.logs, name), 0o644)
+        code, out, _ = self.record(py(f"open({self.marker!r}, 'w')"))   # same head and check name: the existing log has another mode
+        self.assertEqual((code, out), (2, ""))
+        self.assertFalse(os.path.exists(self.marker))
+        os.remove(os.path.join(self.logs, name))
+        os.symlink(self.marker, os.path.join(self.logs, name))
+        self.assertEqual(self.record(py("pass"))[0], 2)
+
+    def test_the_directory_must_be_owned_by_the_caller_and_not_a_symlink(self):
+        real = os.path.join(self.tmp.name, "elsewhere")
+        os.mkdir(real, 0o700)
+        os.symlink(real, self.logs)
+        self.assertEqual(self.record(py("pass"))[0], 2)
 
     def test_a_config_outside_the_owner_config_root_is_refused(self):
         cfg = os.path.join(os.path.realpath(self.tmp.name), "local-first-ci.json")

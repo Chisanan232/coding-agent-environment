@@ -6,9 +6,12 @@
 Runs the owner-configured checks for the repository (the trust file ~/.config/coding-agent-environment/local/local-first-ci.json,
 which this script only reads) in the worktree, with no shell, and prints exactly one unfenced line for the PR comment:
   OWNER-MERGE-LOCAL-CI {json}
-The worktree must be clean before and after the run, so the record describes the committed head and nothing else. A failing command
+The worktree must be clean before and after the run, so the record describes the committed head (tracked and untracked files; git-ignored files are not seen). A failing command
 is still recorded (exit_code non-zero) and the script exits 1; the gate denies on any recorded failure. Full logs stay on this machine
 (mode 0600, ~/.claude/owner-merge-evidence/); only their SHA-256 digests are recorded. It never posts, merges or writes the trust file.
+Checks run with a scrubbed environment (ENV_KEEP plus the owner's `env`); the kept names are printed to stderr and are not part of the
+record. The clean-tree test uses `--untracked-files=all`, which does not see git-ignored files: ignored content (a venv, a cache, a
+build directory) can still influence a check and is not covered by the record.
 """
 import argparse
 import hashlib
@@ -27,6 +30,8 @@ _spec.loader.exec_module(gate)
 
 EVIDENCE_DIR = "~/.claude/owner-merge-evidence"
 COMMAND_TIMEOUT = 6 * 3600
+# Allowlist, not a blocklist: anything not named here (PYTHONPATH, NODE_PATH, VIRTUAL_ENV, PIP_*, LD_*, tokens ...) never reaches a check.
+ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "TZ")
 # Credential-looking argv would land in the PR comment, so it is refused before anything runs.
 SECRET_RE = re.compile(r"(?i)(token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|credential|authorization)\s*[=:]"
                        r"|gh[opusr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN ")
@@ -56,19 +61,48 @@ def load_entry(repo, path=None, root=None):
     return cfg[repo.lower()]
 
 
-def run_check(worktree, name, argv, logs, head, tag):
+def check_env(extra):
+    return {**{k: os.environ[k] for k in ENV_KEEP if k in os.environ}, **extra}
+
+
+def log_path(logs, name, head, tag):
+    return os.path.join(logs, f"local-ci-{tag}-{head[:12]}-{re.sub(r'[^A-Za-z0-9._-]', '_', name)}.log")
+
+
+def open_log(path):
+    """Open (never follow a link) a log file that is a regular file owned by the caller with mode exactly 0600, creating it when absent."""
+    import stat
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600:
+        os.close(fd)
+        raise RuntimeError(f"log file {path} is not a regular file of the caller with mode 0600")
+    os.ftruncate(fd, 0)
+    return os.fdopen(fd, "wb")
+
+
+def prepare_dir(logs):
+    """The evidence directory must be a real directory (not a link) owned by the caller; it is made 0700."""
+    if os.path.islink(logs):
+        raise RuntimeError(f"{logs} is a symlink")
+    os.makedirs(logs, mode=0o700, exist_ok=True)
+    if os.stat(logs).st_uid != os.getuid():
+        raise RuntimeError(f"{logs} is not owned by the caller")
+    os.chmod(logs, 0o700)
+
+
+def run_check(worktree, name, argv, logs, head, tag, env=None):
     """Run one argv without a shell; the combined output goes to a private log and only its digest is returned."""
     started = time.time()
+    path = log_path(logs, name, head, tag)
     try:
-        r = subprocess.run(list(argv), cwd=worktree, capture_output=True, timeout=COMMAND_TIMEOUT, stdin=subprocess.DEVNULL)
+        r = subprocess.run(list(argv), cwd=worktree, capture_output=True, timeout=COMMAND_TIMEOUT, stdin=subprocess.DEVNULL, env=check_env(env or {}))
         code, data = r.returncode, r.stdout + r.stderr
     except subprocess.TimeoutExpired as e:
         code, data = 124, (e.stdout or b"") + (e.stderr or b"")
     except OSError as e:   # the program cannot start: that is a failed check, not a crash
         code, data = 127, str(e).encode()
-    path = os.path.join(logs, f"local-ci-{tag}-{head[:12]}-{re.sub(r'[^A-Za-z0-9._-]', '_', name)}.log")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "wb") as f:
+    with open_log(path) as f:
         f.write(data)
     return {"name": name, "argv": list(argv), "exit_code": code, "started_at": stamp(started), "finished_at": stamp(),
             "log_sha256": hashlib.sha256(data).hexdigest()}, path
@@ -93,18 +127,31 @@ def record(repo, pr, base, worktree, entry, logs, expect_head=None):
         base_sha = git(worktree, "merge-base", f"origin/{base}", "HEAD")
     except RuntimeError as e:
         return refuse(str(e))
-    os.makedirs(os.path.expanduser(logs), mode=0o700, exist_ok=True)
+    logs = os.path.expanduser(logs)
     tag = f"{repo.replace('/', '__')}-{pr}"
+    try:
+        prepare_dir(logs)
+        for name, _ in entry["checks"]:   # check every log file before anything runs, so a bad one cannot be found after the work is done
+            path = log_path(logs, name, head, tag)
+            if os.path.lexists(path):
+                open_log(path).close()
+    except (OSError, RuntimeError) as e:
+        return refuse(str(e))
+    print("owner-merge-local-ci: check environment: " + ",".join(sorted(check_env(entry.get("env") or {}))), file=sys.stderr)
     commands = []
     for name, argv in entry["checks"]:
-        result, path = run_check(worktree, name, argv, os.path.expanduser(logs), head, tag)
+        result, path = run_check(worktree, name, argv, logs, head, tag, entry.get("env"))
         commands.append(result)
         print(f"owner-merge-local-ci: {name} exit {result['exit_code']} log {path}", file=sys.stderr)
+    failed = any(c["exit_code"] != 0 for c in commands)
     try:
-        if git(worktree, "rev-parse", "HEAD") != head or not clean(worktree):
-            return refuse("the checks changed the worktree or HEAD; no record is produced")
+        moved = git(worktree, "rev-parse", "HEAD") != head or not clean(worktree)
     except RuntimeError as e:
-        return refuse(str(e))
+        moved = str(e)
+    if moved and not failed:
+        return refuse("the checks changed the worktree or HEAD; no record is produced")
+    if moved:   # a failing record is still printed (the gate denies on it); a pass is never produced from a changed tree
+        print("owner-merge-local-ci: the checks also changed the worktree; printing the failing record only", file=sys.stderr)
     out = {"schema": 1, "repo": repo, "pr": int(pr), "base": base, "base_sha": base_sha, "head": head, "commands": commands}
     print("OWNER-MERGE-LOCAL-CI " + json.dumps(out, separators=(",", ":")))
     return 0 if all(c["exit_code"] == 0 for c in commands) else 1

@@ -704,6 +704,14 @@ class LocalFirst(unittest.TestCase):
             with self.assertRaises(ValueError):
                 omg.read_owner_file(link, True, omg.load_local_first, "x", root)
 
+    def test_the_trust_file_may_fix_environment_variables(self):
+        entry = LF_CONFIG["repos"]["Chisanan232/r"]
+        self.assertEqual(omg.load_local_first({"schema": 1, "repos": {"Chisanan232/r": dict(entry, env={"CI": "1"})}})["chisanan232/r"]["env"], {"CI": "1"})
+        self.assertEqual(omg.load_local_first(LF_CONFIG)["chisanan232/r"]["env"], {})
+        for bad in ({"ci": "1"}, {"CI": 1}, {"CI=": "1"}, {"PYTHONPATH": "/x"}, [], {"LD_PRELOAD": "/x"}):
+            with self.assertRaises(ValueError, msg=bad):
+                omg.load_local_first({"schema": 1, "repos": {"Chisanan232/r": dict(entry, env=bad)}})
+
     def test_a_malformed_trust_file_is_rejected(self):
         entry = LF_CONFIG["repos"]["Chisanan232/r"]
         for bad in ({}, {"schema": 2, "repos": {}}, {"schema": 1, "repos": {"Chisanan232/r": dict(entry, checks=[])}},
