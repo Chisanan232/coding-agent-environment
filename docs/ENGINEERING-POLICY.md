@@ -148,8 +148,11 @@ skill says: "Public repositories require green CI before merge, except a qualifi
 Private repositories require the full local suite to pass instead." The private-repository rule of engineering-workflow is the basis
 for the gate's local-first basis (`docs/OWNER-MERGE-WORKFLOW.md`): an owner-listed private repository whose head skips hosted CI may
 merge on owner-configured local commands that passed at the exact head, reported `NOT_A_CI_PASS`, never `CI_PASS`. This is a reading
-that widens the Gate paragraph, and an agent-written ticket is not founder consent. The owner's merge review of the pull request
-that introduces it is the explicit ratification; until that review the basis is a proposal.
+that widens the Gate paragraph, and an agent-written ticket is not founder consent. The founder ratified the basis on 2026-11-04
+(PR #199, with clarifications): agents perform development, testing and technical acceptance, including Codex for repositories it
+operates, and human execution is not an acceptance requirement unless technically unavoidable, for example interactive
+authentication, an OS credential prompt or a material product or cost decision. Local CI never replaces real end-to-end or
+realistic user-workflow acceptance, and final release approval remains the founder's.
 
 **Equivalence.** Inspect the workflow's real commands, run them locally with matching runtime, dependencies,
 features and configuration, record exit codes and test counts, preserve sanitized logs, pin to the exact
