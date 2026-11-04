@@ -52,8 +52,14 @@ REVIEW_RE = re.compile(r"^OWNER-MERGE-REVIEW head=([0-9a-f]{40}) verdict=(\w+) b
 CI_RE = re.compile(r"^OWNER-MERGE-CI-UNAVAILABLE head=([0-9a-f]{40}) cause=(billing|quota|outage) local_equivalent=(\w+)\s*$", re.M)
 NOCI_RE = re.compile(r"^OWNER-MERGE-CI-EXCEPTION head=([0-9a-f]{40}) basis=no-hosted-ci local_equivalent=(\w+)\s*$", re.M)
 LOCAL_RE = re.compile(r"^OWNER-MERGE-LOCAL-CI (.*?)\s*$", re.M)
-# GitHub's own spellings for "do not run workflows on this commit"; anything else (a look-alike, a negation) is not a directive.
-SKIP_RE = re.compile(r"\[(?:skip ci|ci skip|no ci|skip actions|actions skip)\]|^skip-checks:\s*true\s*$", re.I | re.M)
+# GitHub's documented spellings for "do not run workflows on this commit": one of five bracketed phrases anywhere in the message, or a
+# `skip-checks: true` trailer in the final paragraph. Matched case-sensitively and exactly; when unsure the gate treats it as no directive.
+SKIP_RE = re.compile(r"\[(?:skip ci|ci skip|no ci|skip actions|actions skip)\]")
+
+
+def has_skip_directive(message):
+    paragraphs = [x for x in re.split(r"\n\s*\n", message.strip("\n")) if x.strip()]
+    return bool(SKIP_RE.search(message)) or (len(paragraphs) > 1 and "skip-checks: true" in paragraphs[-1].split("\n"))
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 STAMP_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 OWNER_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
@@ -226,7 +232,7 @@ API_READS = [re.compile(x) for x in (
     # The billing waiver (--ci-unavailable) reads one check run, its job and its annotations by numeric id.
     _RO + r"/check-runs/\d{1,15}", _RO + r"/actions/jobs/\d{1,15}", _RO + r"/check-runs/\d{1,15}/annotations\?per_page=100",
     # The local-first basis asks GitHub whether any Actions run exists for the head (a count only).
-    _RO + r"/actions/runs\?head_sha=[0-9a-f]{40}&per_page=1",
+    _RO + r"/actions/runs\?head_sha=[0-9a-f]{40}&per_page=1", _RO + r"/pulls/\d{1,9}/files\?per_page=100",
     r"orgs/[A-Za-z0-9][A-Za-z0-9-]{0,38}/memberships/[A-Za-z0-9][A-Za-z0-9-]{0,38}")]
 SAFE_FLAGS = {"--json", "--jq", "--repo"}
 GRAPHQL_VARS = {"query", "o", "r", "n"}
@@ -503,24 +509,33 @@ def parse_local_record(rec):
     return finished
 
 
-def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, cfg, now):
+def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, raw_bodies, cfg, now):
     """Third CI basis. Returns (reasons, wait, facts). Only called for an empty rollup, --ci-exception and a repo in the owner's
     trust file. Every uncertainty refuses; a pass is never a CI pass (hosted checks stay NOT_RUN)."""
     reasons, wait, facts = [], [], {}
     if meta.get("isPrivate") is not True:
         return ["NOT_PRIVATE: the local-first basis exists only for private repositories"], wait, facts
     files = p.get("files") or []
-    pinned = [f["path"] for f in files if any(fnmatch.fnmatchcase(str(f.get("path", "")).casefold(), g.casefold()) for g in cfg["pinned_paths"])]
-    if p.get("isCrossRepository") or not files or len(files) >= 100 \
-            or any(".github/workflows" in str(f.get("path", "")).casefold() for f in files) or pinned:
-        reasons.append("LOCAL_FIRST_SCOPE: the file list is unknown or truncated, or the PR changes a workflow or an owner-pinned path")
+
+    def covered(path):   # a workflow, or a path the owner pinned; case-insensitive and over-broad on purpose
+        path = str(path or "").casefold()
+        return ".github/workflows" in path or any(fnmatch.fnmatchcase(path, g.casefold()) for g in cfg["pinned_paths"])
+    # `pr view --json files` lists only the new path of a rename, so a workflow moved out of its directory is read from the REST list too.
+    listed = _json(run, "api", f"repos/{repo}/pulls/{pr}/files?per_page=100", "--jq", "[.[] | {filename, previous_filename, status}]") \
+        if files and len(files) < 100 else []
+    consistent = isinstance(listed, list) and all(isinstance(f, dict) for f in listed) and len(listed) == len(files) \
+        and {str(f.get("filename")) for f in listed} == {str(f.get("path")) for f in files}
+    if p.get("isCrossRepository") or not files or len(files) >= 100 or not consistent \
+            or any(f.get("status") == "renamed" or f.get("previous_filename") or covered(f.get("previous_filename")) for f in listed) \
+            or any(covered(f.get("path")) for f in files):
+        reasons.append("LOCAL_FIRST_SCOPE: the file list is unknown, truncated or inconsistent, or the PR renames a file or changes a workflow or an owner-pinned path")
     if int(run("api", f"repos/{repo}/actions/runs?head_sha={head}&per_page=1", "--jq", ".total_count").strip()):
         wait.append("CI_PENDING: GitHub Actions has a run for this head; the hosted result decides, not the local-first basis")
-    elif not SKIP_RE.search(run("api", f"repos/{repo}/commits/{head}", "--jq", ".commit.message")):
+    elif not has_skip_directive(run("api", f"repos/{repo}/commits/{head}", "--jq", ".commit.message")):
         wait.append("CI_PENDING: the empty rollup is not explained by a skip directive in the head commit; hosted CI may not have started")
     items = []   # in comment order: ("rec", record, comment) or ("bad", None, comment)
     for c, text in texts_meta:
-        for m in LOCAL_RE.finditer(text):
+        for m in LOCAL_RE.finditer(re.sub(r"~~~.*?~~~", "", text, flags=re.S)):
             raw = m.group(1)
             try:
                 rec = json.loads(raw, object_pairs_hook=_no_dup)
@@ -533,10 +548,17 @@ def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, cfg, n
                 items.append(("rec", rec, c))
             elif head in raw:
                 items.append(("bad", None, c))
-    for kind, rec, _ in items:   # a failing run at this head stands whatever happened to its comment, and a later pass never overrides it
-        cmds = rec.get("commands") if kind == "rec" else None
-        if isinstance(cmds, list) and any(isinstance(x, dict) and _int(x.get("exit_code")) and x["exit_code"] != 0 for x in cmds):
-            return reasons + ["LOCAL_CI_FAILED: a recorded local run at this head exited non-zero; fix it and record a new run"], wait, facts
+    # A failing run at this head stands whatever happened to its comment (edited, minimized, fenced) and however its exit code is
+    # spelled: anything other than the integer 0 is a failure, and a later pass never overrides it.
+    for body in raw_bodies:
+        for m in LOCAL_RE.finditer(body):
+            try:
+                rec = json.loads(m.group(1), object_pairs_hook=_no_dup)
+            except ValueError:
+                continue
+            cmds = rec.get("commands") if isinstance(rec, dict) and rec.get("head") == head else None
+            if isinstance(cmds, list) and any(isinstance(x, dict) and not (_int(x.get("exit_code")) and x["exit_code"] == 0) for x in cmds):
+                return reasons + ["LOCAL_CI_FAILED: a recorded local run at this head did not exit 0; fix it and record a new run"], wait, facts
     trusted = [i for i in items if i[2].get("includesCreatedEdit") is False and i[2].get("isMinimized") is False]
     if not trusted:
         return reasons + ["LOCAL_CI_MISSING: no unedited, visible OWNER-MERGE-LOCAL-CI record for this head by the authenticated user"], wait, facts
@@ -760,7 +782,7 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
         elif ci_exception and noci and not checks and no_hosted_ci(run, repo, base, head, p.get("files") or [], bool(p.get("isCrossRepository"))):
             facts["ci_exception"] = "no-hosted-ci"
         elif ci_exception and not checks and (local_first or {}).get(repo.lower()):
-            lf_reasons, lf_wait, lf_facts = local_first_basis(run, repo, pr, base, head, p, meta, me, list(zip(mine, texts)),
+            lf_reasons, lf_wait, lf_facts = local_first_basis(run, repo, pr, base, head, p, meta, me, list(zip(mine, texts)), [c["body"] or "" for c in mine],
                                                               local_first[repo.lower()], time.time() if now is None else now)
             reasons.extend(lf_reasons)
             wait.extend(lf_wait)

@@ -55,6 +55,11 @@ class Fake:
             return self.me + "\n"
         if a[:2] == ("pr", "view"):
             return json.dumps(self.pr)
+        if a[0] == "api" and a[1].endswith("/files?per_page=100"):
+            listed = getattr(self, "api_files", None)
+            if listed is None:
+                listed = [{"filename": f["path"], "status": "modified"} for f in self.pr.get("files") or []]
+            return json.dumps(listed)
         if a[0] == "api" and "/actions/runs?head_sha=" in a[1]:
             self.runs_reads = getattr(self, "runs_reads", []) + [a[1]]
             return f"{self.runs}\n"
@@ -575,9 +580,6 @@ class LocalFirst(unittest.TestCase):
                      "OWNER-MERGE-LOCAL-CI " + json.dumps(lf_record(pr="7"))):
             with self.subTest(body[:60]):
                 self.refused(self.fake(lf_comment(body=body)), "LOCAL_CI_MALFORMED")
-        weird = lf_record()
-        weird["commands"][0]["exit_code"] = False
-        self.refused(self.fake(lf_comment(weird)), "LOCAL_CI_MALFORMED")
         digest = lf_record()
         digest["commands"][0]["log_sha256"] = "zz"
         self.refused(self.fake(lf_comment(digest)), "LOCAL_CI_MALFORMED")
@@ -601,10 +603,11 @@ class LocalFirst(unittest.TestCase):
         self.assertTrue(reasons[0].startswith("CI_PENDING"), reasons)
 
     def test_skip_directives_are_recognised_only_where_github_honours_them(self):
-        for msg in ("x [skip ci]", "x [CI SKIP]", "x [no ci]", "x [skip actions]", "x [actions skip]", "x\n\nskip-checks: true"):
+        for msg in ("x [skip ci]", "x [ci skip]", "x [no ci]", "x [skip actions]", "x [actions skip]", "x\n\nbody\n\nskip-checks: true\n"):
             with self.subTest(msg):
                 self.assertEqual(self.evaluate(self.fake(message=msg))[0], "PASS")
-        for msg in ("x skip ci", "x [skip ci please]", "x skip-checks: false", "x (skip actions)"):
+        for msg in ("x skip ci", "x [skip ci please]", "x skip-checks: false", "x (skip actions)", "x [CI SKIP]", "x [Skip Actions]",
+                    "skip-checks: true", "x\n\nskip-checks: TRUE", "x\n\nskip-checks: true\n\nmore text after", "x skip-checks: true"):
             with self.subTest(msg):
                 self.assertEqual(self.evaluate(self.fake(message=msg))[0], "WAIT")
 
@@ -618,6 +621,46 @@ class LocalFirst(unittest.TestCase):
                       [{"path": f"f{i}"} for i in range(100)]):
             with self.subTest(files=files[:1]):
                 self.refused(self.fake(files=files), "LOCAL_FIRST_SCOPE")
+
+    def test_a_rename_out_of_a_workflow_or_pinned_path_refuses(self):
+        old = {"filename": "docs/quality.yml", "status": "renamed", "previous_filename": ".github/workflows/quality.yml"}
+        for listed in ([old], [dict(old, previous_filename=".GitHub/Workflows/q.yml")], [dict(old, previous_filename="scripts/ci/run.sh")],
+                       [dict(old, previous_filename="docs/old.md")]):
+            with self.subTest(prev=listed[0]["previous_filename"]):
+                self.refused(self.fake(files=[{"path": "docs/quality.yml"}], api_files=listed), "LOCAL_FIRST_SCOPE")
+
+    def test_the_two_file_listings_must_agree_and_not_be_truncated(self):
+        self.refused(self.fake(api_files=[]), "LOCAL_FIRST_SCOPE")
+        self.refused(self.fake(api_files=[{"filename": "src/a.py", "status": "modified"}, {"filename": "src/b.py", "status": "modified"}]), "LOCAL_FIRST_SCOPE")
+        self.refused(self.fake(api_files=[{"filename": "src/other.py", "status": "modified"}]), "LOCAL_FIRST_SCOPE")
+        self.refused(self.fake(files=[{"path": f"f{i}"} for i in range(99)] + [{"path": "g"}]), "LOCAL_FIRST_SCOPE")
+
+    def test_the_pull_files_read_is_an_allowed_read_only_call(self):
+        omg.read_only(("api", "repos/Chisanan232/r/pulls/7/files?per_page=100", "--jq", "."))
+        for bad in ("repos/Chisanan232/r/pulls/7/files?per_page=100&page=2", "repos/Chisanan232/r/pulls/7/files?per_page=1",
+                    "repos/Chisanan232/r/pulls/7/files?per_page=100&x=1", "repos/Chisanan232/r/pulls/x/files?per_page=100"):
+            with self.subTest(bad), self.assertRaises(RuntimeError):
+                omg.read_only(("api", bad, "--jq", "."))
+
+    def test_a_failing_record_stands_wherever_it_was_posted_and_however_it_is_shaped(self):
+        bad = lf_record()
+        bad["commands"][0]["exit_code"] = 1
+        for body in ("```\nOWNER-MERGE-LOCAL-CI " + json.dumps(bad) + "\n```", "~~~\nOWNER-MERGE-LOCAL-CI " + json.dumps(bad) + "\n~~~"):
+            with self.subTest(body[:3]):
+                self.refused(self.fake(lf_comment(body=body), lf_comment()), "LOCAL_CI_FAILED")
+        self.refused(self.fake(lf_comment(bad, includesCreatedEdit=True), lf_comment()), "LOCAL_CI_FAILED")
+        self.refused(self.fake(lf_comment(bad, isMinimized=True), lf_comment()), "LOCAL_CI_FAILED")
+        for code in (1.0, "1", False, True, None, 0.0, "0"):
+            odd = lf_record()
+            odd["commands"][0]["exit_code"] = code
+            with self.subTest(code=code):
+                self.refused(self.fake(lf_comment(odd), lf_comment()), "LOCAL_CI_FAILED")
+        missing = lf_record()
+        del missing["commands"][1]["exit_code"]
+        self.refused(self.fake(lf_comment(missing), lf_comment()), "LOCAL_CI_FAILED")
+
+    def test_a_tilde_fenced_passing_record_does_not_count(self):
+        self.refused(self.fake(lf_comment(body="~~~\nOWNER-MERGE-LOCAL-CI " + json.dumps(lf_record()) + "\n~~~")), "LOCAL_CI_MISSING")
 
     def test_a_missing_review_still_refuses(self):
         fake = self.fake()
