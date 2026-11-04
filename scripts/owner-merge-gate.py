@@ -185,7 +185,7 @@ ENV_FORBIDDEN = re.compile(r"(PYTHON|NODE|LD_|DYLD_|PERL|RUBY|PIP_|NPM_|VIRTUAL_
 def load_local_first(obj):
     """Validate the owner-authored local-first CI trust file and return {repo.lower(): entry}.
 
-    The agent never writes this file: the commands listed here are what stands in for a hosted CI run, so whoever can edit them can
+    The agent must not write this file (same OS user, so the rule and the owner's review are the only barrier): the commands listed here are what stands in for a hosted CI run, so whoever can edit them can
     weaken the gate. Each repo lists the exact checks (name + argv) the recorder must run, how old a record may be, paths whose
     change is never covered (they could rewrite what a command runs) and what the local run does not cover."""
     if not isinstance(obj, dict) or type(obj.get("schema")) is not int or obj["schema"] != 1 or not isinstance(obj.get("repos"), dict):

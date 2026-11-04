@@ -100,10 +100,10 @@ directive (`[skip ci]`, `[ci skip]`, `[no ci]`, `[skip actions]`, `[actions skip
 exists for it. An empty rollup is never evidence by itself, and neither `--ci-unavailable` (a billing, quota or outage cause) nor the
 no-hosted-ci exception (no workflows directory) fits. The local-first basis is the third, separate one. It is not a CI pass.
 
-Owner-authored trust file, which the agent never writes: `~/.config/coding-agent-environment/local/local-first-ci.json`
+Owner-authored trust file, which the agent must not write (it runs as the same OS user, so nothing but this rule and the owner's review prevents it): `~/.config/coding-agent-environment/local/local-first-ci.json`
 (loaded with the same checks as the version-branch policy: fixed directory, no symlink, caller-owned, not group/world-writable, 64 KB,
 duplicate keys rejected). Per repository: `checks` (`name` + `argv`, in order), `max_age_hours` (1 to 168, default 24), `pinned_paths`
-(globs whose change is never covered, for example scripts a check runs) and `not_covered` (what a local run cannot prove, for example
+(globs whose change is never covered, for example scripts a check runs), `env` (optional fixed environment variables; interpreter and loader redirects such as `PYTHONPATH` are refused) and `not_covered` (what a local run cannot prove, for example
 hosted windows or ubuntu matrix legs).
 
 1. The owner commits with a skip directive. 2. `scripts/owner-merge-local-ci.py record --repo R --pr N --base B --worktree PATH` runs
@@ -122,14 +122,25 @@ any Actions run for the head, is `CI_PENDING`. On success the facts carry `ci_ex
 `ci_verdict=NOT_A_CI_PASS: LOCAL_EQUIVALENT_PASS`, `local_ci_digest` and `not_covered`.
 
 Threats considered. Replay to another head, base or PR: exact match plus an age window. Weaker commands: argv must equal the owner's
-file, which the agent cannot write. A script a command calls being edited by the PR: pinned paths, the workflow-change refusal and the
+file, which the agent must not write (same OS user; see the residual risks). A script a command calls being edited by the PR: pinned paths, the workflow-change refusal and the
 independent review. Skipping a hosted check that would have failed: only owner-listed private repositories, hosted result reported
-`NOT_RUN`, never a pass. Backdating or editing a record: server-side `createdAt` and the unedited check. Residual risk, stated plainly:
-the record is written under the same GitHub identity and OS user as the agent, so a forged line, or a failing run that was never posted,
-cannot be detected cryptographically (an HMAC would be tamper evidence only); the independent review and the owner's merge review are
-the controls for that. A macOS local run does not cover hosted windows or ubuntu legs (`not_covered` makes that visible). The
-`owner-merge-runner` is unchanged: a local-first repository is not on its allowlist, and a missing required check there is never
-exempted, so the merge is the direct pinned `gh pr merge`, which the host still asks about.
+`NOT_RUN`, never a pass. Backdating or editing a record: server-side `createdAt` and the unedited check. Residual risks, stated plainly:
+- The record is written under the same GitHub identity and OS user as the agent. A forged line cannot be detected cryptographically (an
+  HMAC would be tamper evidence only); the independent review and the owner's merge review are the controls.
+- A failing run that was deleted or never posted cannot be seen by the gate. Only a posted failure denies.
+- The trust file lives in a directory no host rule protects, so the agent could write it. The owner may add a host deny rule for
+  `~/.config/coding-agent-environment/local/` as an owner action; this repository does not edit `settings.json`.
+- The clean-tree test sees tracked and untracked files but not git-ignored ones (a venv, a cache, a build directory), which can still
+  influence a check. Checks run with a scrubbed environment (`PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR`,
+  `TERM`, `TZ` plus the owner's `env`); the kept names are printed by the recorder, not recorded.
+- A macOS local run does not cover hosted windows or ubuntu legs (`not_covered` makes that visible).
+- A malformed or untrusted default trust file makes every `--ci-exception` run exit 3 (ERROR/DENY), including for repositories that do not
+  use this basis. This is fail-closed by design; fix or remove the file.
+- A rename is read from the REST file list too: any rename, or a file list that disagrees with `gh pr view`, refuses (`LOCAL_FIRST_SCOPE`).
+  Skip directives are matched exactly and case-sensitively (the five bracketed phrases, or a `skip-checks: true` trailer in the last
+  paragraph); anything else waits.
+- The `owner-merge-runner` is unchanged: a local-first repository is not on its allowlist, and a missing required check there is never
+  exempted, so the merge is the direct pinned `gh pr merge`, which the host still asks about.
 
 ## Version integration branches (Development-Ahead / Sequential Release)
 

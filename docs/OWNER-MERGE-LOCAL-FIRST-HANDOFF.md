@@ -5,7 +5,7 @@ threat notes are in `docs/OWNER-MERGE-WORKFLOW.md`; this is only the order of st
 
 | # | Who | Step |
 |---|---|---|
-| 1 | Owner | Create `~/.config/coding-agent-environment/local/local-first-ci.json` (directory and file mode 0700/0600, schema 1) with an entry for the repository: `checks` (name + argv, in order), `max_age_hours`, `pinned_paths`, `not_covered`. The agent never writes this file. |
+| 1 | Owner | Create `~/.config/coding-agent-environment/local/local-first-ci.json` (directory and file mode 0700/0600, schema 1) with an entry for the repository: `checks` (name + argv, in order), `max_age_hours`, `pinned_paths`, `not_covered`. The agent must not write this file; consider a host deny rule for that directory (owner action). |
 | 2 | Agent | Commit the change with a skip directive (`[skip actions]`) and push the branch, then confirm GitHub shows no Actions run for the head. |
 | 3 | Agent | Run `scripts/owner-merge-local-ci.py record --repo OWNER/REPO --pr N --base BRANCH --worktree PATH --expect-head SHA` through the heavy-lane wrapper. It needs a clean worktree and prints one `OWNER-MERGE-LOCAL-CI` line. |
 | 4 | Agent | Post that line as a PR comment, unedited and unfenced. |
