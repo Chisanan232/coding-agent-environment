@@ -30,6 +30,8 @@ on:
       - 'tests/test-constitution-behavior-matrix.py'
       - 'scripts/owner-merge-runner.py'
       - 'scripts/owner-merge-evidence-sign.py'
+      - 'scripts/owner-merge-local-ci.py'
+      - 'tests/test-owner-merge-local-ci.py'
       - 'scripts/branch-protection-rollout.py'
       - 'docs/OWNER-MERGE-AUTONOMY.md'
       - 'tests/test-owner-merge-autonomy.py'
@@ -116,6 +118,7 @@ jobs:
           python3 tests/test-hook-rollout.py
           python3 tests/test-owner-merge-gate.py
           python3 tests/test-owner-merge-gate-local.py
+          python3 tests/test-owner-merge-local-ci.py
           python3 tests/test-engineering-constitution.py
           python3 tests/test-constitution-behavior-matrix.py
           python3 tests/test-owner-merge-autonomy.py
