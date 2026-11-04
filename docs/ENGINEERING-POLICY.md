@@ -141,6 +141,16 @@ engineering or release gate when the local run is sufficiently equivalent. Recor
 Jira; do not claim hosted CI succeeded; do not weaken branch protection; do not ask the founder again for the same
 known exception.
 
+**Private repositories and the owner's ratification (SPE-135).** Two texts bear on a private repository whose hosted CI did not
+run, and they differ. This section's Gate paragraph says: "For a verified billing or quota outage only, `LOCAL_EQUIVALENT_PASS`
+satisfies the corresponding engineering or release gate when the local run is sufficiently equivalent." The engineering-workflow
+skill says: "Public repositories require green CI before merge, except a qualified `CI_UNAVAILABLE_EXTERNAL` exception below.
+Private repositories require the full local suite to pass instead." The private-repository rule of engineering-workflow is the basis
+for the gate's local-first basis (`docs/OWNER-MERGE-WORKFLOW.md`): an owner-listed private repository whose head skips hosted CI may
+merge on owner-configured local commands that passed at the exact head, reported `NOT_A_CI_PASS`, never `CI_PASS`. This is a reading
+that widens the Gate paragraph, and an agent-written ticket is not founder consent. The owner's merge review of the pull request
+that introduces it is the explicit ratification; until that review the basis is a proposal.
+
 **Equivalence.** Inspect the workflow's real commands, run them locally with matching runtime, dependencies,
 features and configuration, record exit codes and test counts, preserve sanitized logs, pin to the exact
 commit or tree, and document platform or coverage differences. Reuse evidence while the tested inputs are

@@ -4,9 +4,11 @@
 Live behavior (the host classifier, a real merge) is covered by the acceptance runs recorded in
 the ticket, not here.
 """
+import calendar
 import importlib.util
 import json
 import pathlib
+import time
 import unittest
 
 SPEC = importlib.util.spec_from_file_location("omg", pathlib.Path(__file__).resolve().parents[1] / "scripts/owner-merge-gate.py")
@@ -16,6 +18,8 @@ SPEC.loader.exec_module(omg)
 HEAD = "a" * 40
 SRC = [{"path": "src/a.py"}]
 OWNERS = ["Chisanan232", "horonomy", "ai-agent-assembly"]
+BASE_SHA = "b" * 40
+NOW = 1_800_000_000
 REVIEW = f"OWNER-MERGE-REVIEW head={HEAD} verdict=PASS blocking=0 reviewer=independent-agent-1"
 
 
@@ -33,9 +37,10 @@ class Fake:
                    "comments": [{"author": {"login": "chisanan232"}, "body": REVIEW}],
                    "statusCheckRollup": green()}
         self.repo = {"nameWithOwner": "Chisanan232/r", "defaultBranchRef": {"name": "main"}, "isFork": False,
-                     "viewerPermission": "ADMIN", "owner": {"login": "Chisanan232"}}
+                     "viewerPermission": "ADMIN", "owner": {"login": "Chisanan232"}, "isPrivate": True}
         self.behind, self.threads, self.me, self.more_threads = 0, [], "chisanan232", False
         self.parents, self.cmp, self.org_role = [HEAD, "b" * 40], "ahead", "admin active"
+        self.merge_base, self.message, self.runs = BASE_SHA, "chore: change [skip actions]", 0
         for k, v in over.items():
             target = self.repo if k in self.repo else self.pr if k in self.pr else None
             if target is None:
@@ -50,6 +55,18 @@ class Fake:
             return self.me + "\n"
         if a[:2] == ("pr", "view"):
             return json.dumps(self.pr)
+        if a[0] == "api" and a[1].endswith("/files?per_page=100"):
+            listed = getattr(self, "api_files", None)
+            if listed is None:
+                listed = [{"filename": f["path"], "status": "modified"} for f in self.pr.get("files") or []]
+            return json.dumps(listed)
+        if a[0] == "api" and "/actions/runs?head_sha=" in a[1]:
+            self.runs_reads = getattr(self, "runs_reads", []) + [a[1]]
+            return f"{self.runs}\n"
+        if a[0] == "api" and "/compare/" in a[1] and "merge_base_commit" in a[3]:
+            return self.merge_base + "\n"
+        if a[0] == "api" and "/commits/" in a[1] and ".commit.message" in a[3]:
+            return self.message + "\n"
         if a[0] == "api" and "/compare/" in a[1]:
             return (str(self.behind) if "behind_by" in a[3] else self.cmp) + "\n"
         if a[:2] == ("api", "graphql"):
@@ -436,6 +453,336 @@ class VersionBranches(unittest.TestCase):
                     {"schema": 1, "repos": {"Chisanan232/r": {"branches": "integration/mvp-5.0"}}}):
             with self.assertRaises(ValueError):
                 omg.load_version_policy(bad)
+
+
+LF_CONFIG = {"schema": 1, "repos": {"Chisanan232/r": {
+    "checks": [{"name": "suite", "argv": ["python3", "-m", "pytest"]}, {"name": "lint", "argv": ["ruff", "check", "."]}],
+    "max_age_hours": 24, "pinned_paths": ["scripts/ci/*"], "not_covered": ["windows and ubuntu matrix legs"]}}}
+
+
+def iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def lf_record(**over):
+    rec = {"schema": 1, "repo": "Chisanan232/r", "pr": 7, "base": "main", "base_sha": BASE_SHA, "head": HEAD, "env": {},
+           "commands": [{"name": "suite", "argv": ["python3", "-m", "pytest"], "exit_code": 0, "started_at": iso(NOW - 900),
+                         "finished_at": iso(NOW - 600), "log_sha256": "1" * 64},
+                        {"name": "lint", "argv": ["ruff", "check", "."], "exit_code": 0, "started_at": iso(NOW - 590),
+                         "finished_at": iso(NOW - 580), "log_sha256": "2" * 64}]}
+    rec.update(over)
+    return rec
+
+
+def lf_comment(rec=None, body=None, **over):
+    comment = {"author": {"login": "chisanan232"}, "body": body if body is not None else "OWNER-MERGE-LOCAL-CI " + json.dumps(rec or lf_record()),
+               "createdAt": iso(NOW - 60), "includesCreatedEdit": False, "isMinimized": False}
+    comment.update(over)
+    return comment
+
+
+class LocalFirst(unittest.TestCase):
+    """Third CI basis: the head's own skip directive left no hosted CI, and owner-fixed local commands passed at this exact head."""
+
+    def fake(self, *records, files=None, **over):
+        comments = [{"author": {"login": "chisanan232"}, "body": REVIEW}] + (list(records) if records else [lf_comment()])
+        fake = Fake(statusCheckRollup=over.pop("statusCheckRollup", []), comments=comments, **over)
+        fake.pr["files"] = SRC if files is None else files
+        return fake
+
+    def evaluate(self, fake, config=LF_CONFIG, **kw):
+        kw.setdefault("ci_exception", True)
+        return omg.evaluate(fake, "Chisanan232/r", 7, OWNERS, local_first=omg.load_local_first(config) if config else None, now=NOW, **kw)
+
+    def refused(self, fake, code, **kw):
+        v, reasons, facts = self.evaluate(fake, **kw)
+        self.assertEqual(v, "REFUSE", reasons)
+        self.assertTrue(any(r.startswith(code) for r in reasons), reasons)
+        self.assertNotIn("ci_exception", facts)
+
+    def test_matching_record_passes_and_is_never_reported_as_a_ci_pass(self):
+        fake = self.fake()
+        v, reasons, facts = self.evaluate(fake)
+        self.assertEqual((v, reasons), ("PASS", []))
+        self.assertEqual((facts["ci_exception"], facts["hosted_checks"]), ("local-first", "NOT_RUN"))
+        self.assertTrue(facts["ci_verdict"].startswith("NOT_A_CI_PASS"))
+        self.assertEqual(facts["not_covered"], ["windows and ubuntu matrix legs"])
+        self.assertRegex(facts["local_ci_digest"], r"^[0-9a-f]{64}$")
+        self.assertEqual(len(fake.runs_reads), 1)
+
+    def test_the_flag_the_trust_file_and_the_repo_entry_are_all_required(self):
+        self.refused(self.fake(), "NO_CI_EVIDENCE", ci_exception=False)
+        self.refused(self.fake(), "NO_CI_EVIDENCE", config=None)
+        other = {"schema": 1, "repos": {"Chisanan232/other": LF_CONFIG["repos"]["Chisanan232/r"]}}
+        self.refused(self.fake(), "NO_CI_EVIDENCE", config=other)
+
+    def test_a_public_repository_is_denied(self):
+        self.refused(self.fake(isPrivate=False), "NOT_PRIVATE")
+        self.refused(self.fake(isPrivate=None), "NOT_PRIVATE")
+
+    def test_each_identity_field_mismatch_alone_refuses(self):
+        for over in ({"repo": "Chisanan232/x"}, {"pr": 8}, {"base": "dev"}, {"head": "c" * 40}, {"base_sha": "d" * 40}):
+            with self.subTest(over=over):
+                fake = self.fake(lf_comment(lf_record(**over)))
+                self.refused(fake, "LOCAL_CI_MISSING" if "head" in over else "LOCAL_CI_MISMATCH")
+
+    def test_the_base_sha_is_the_real_merge_base_not_the_claimed_one(self):
+        self.refused(self.fake(merge_base="e" * 40), "LOCAL_CI_MISMATCH")
+
+    def test_a_head_that_moved_after_the_record_has_no_record(self):
+        self.refused(self.fake(headRefOid="c" * 40), "LOCAL_CI_MISSING")
+
+    def test_a_failing_run_is_denied_even_when_a_later_run_passes(self):
+        bad = lf_record()
+        bad["commands"][0]["exit_code"] = 1
+        fake = self.fake(lf_comment(bad), lf_comment())
+        self.refused(fake, "LOCAL_CI_FAILED")
+        v, reasons, _ = self.evaluate(fake)
+        self.assertEqual(omg.decide(v, reasons, {"class": "A"})["outcome"], "DENY")
+
+    def test_stale_future_and_backdated_records_refuse(self):
+        late = lf_record()
+        late["commands"][1]["finished_at"] = iso(NOW - 25 * 3600)
+        late["commands"][0]["finished_at"] = iso(NOW - 25 * 3600)
+        late["commands"][0]["started_at"] = iso(NOW - 26 * 3600)
+        late["commands"][1]["started_at"] = iso(NOW - 25 * 3600)
+        self.refused(self.fake(lf_comment(late)), "LOCAL_CI_STALE")
+        future = lf_record()
+        future["commands"][1]["finished_at"] = iso(NOW + 3600)
+        self.refused(self.fake(lf_comment(future)), "LOCAL_CI_MISMATCH")
+        # finished_at after the comment's server-side creation time means the record was written before the work ran
+        self.refused(self.fake(lf_comment(createdAt=iso(NOW - 595))), "LOCAL_CI_MISMATCH")
+
+    def test_commands_must_equal_the_owner_configuration_exactly(self):
+        suite, lint = lf_record()["commands"]
+        weaker = dict(suite, argv=["python3", "-m", "pytest", "-k", "nothing"])
+        renamed = dict(suite, name="other")
+        for label, commands in (("argv", [weaker, lint]), ("name", [renamed, lint]), ("missing", [suite]),
+                                ("extra", [suite, lint, dict(lint, name="extra")]), ("order", [lint, suite])):
+            with self.subTest(label):
+                self.refused(self.fake(lf_comment(lf_record(commands=commands))), "LOCAL_CI_COMMANDS_MISMATCH")
+
+    def test_edited_minimized_or_foreign_records_do_not_count(self):
+        self.refused(self.fake(lf_comment(includesCreatedEdit=True)), "LOCAL_CI_MISSING")
+        self.refused(self.fake(lf_comment(isMinimized=True)), "LOCAL_CI_MISSING")
+        self.refused(self.fake(lf_comment(author={"login": "someone-else"})), "LOCAL_CI_MISSING")
+        bare = lf_comment()
+        del bare["includesCreatedEdit"]
+        self.refused(self.fake(bare), "LOCAL_CI_MISSING")
+
+    def test_a_fenced_record_does_not_count(self):
+        self.refused(self.fake(lf_comment(body="```\nOWNER-MERGE-LOCAL-CI " + json.dumps(lf_record()) + "\n```")), "LOCAL_CI_MISSING")
+
+    def test_malformed_and_duplicate_key_records_refuse(self):
+        dup = '{"schema": 1, "schema": 1, "head": "%s"}' % HEAD
+        for body in ("OWNER-MERGE-LOCAL-CI " + json.dumps(dict(lf_record(), extra=1)), "OWNER-MERGE-LOCAL-CI " + json.dumps(lf_record(schema=2)),
+                     "OWNER-MERGE-LOCAL-CI " + json.dumps(lf_record(pr="7"))):
+            with self.subTest(body[:60]):
+                self.refused(self.fake(lf_comment(body=body)), "LOCAL_CI_MALFORMED")
+        for body in ("OWNER-MERGE-LOCAL-CI {not json %s" % HEAD, "OWNER-MERGE-LOCAL-CI " + dup,
+                     "OWNER-MERGE-LOCAL-CI " + json.dumps(dict(lf_record(), pad="x" * 70000))):   # unreadable at this head: fail closed
+            with self.subTest(body[:40]):
+                self.refused(self.fake(lf_comment(body=body)), "LOCAL_CI_FAILED")
+        digest = lf_record()
+        digest["commands"][0]["log_sha256"] = "zz"
+        self.refused(self.fake(lf_comment(digest)), "LOCAL_CI_MALFORMED")
+
+    def test_no_record_at_all_is_missing(self):
+        fake = self.fake()
+        fake.pr["comments"] = [fake.pr["comments"][0]]
+        self.refused(fake, "LOCAL_CI_MISSING")
+
+    def test_a_check_in_the_rollup_means_the_basis_does_not_apply(self):
+        for conclusion in ("SUCCESS", "SKIPPED"):
+            v, _, facts = self.evaluate(self.fake(statusCheckRollup=[{"name": "t", "status": "COMPLETED", "conclusion": conclusion}]))
+            self.assertNotIn("ci_exception", facts)
+        self.refused(self.fake(statusCheckRollup=[{"name": "t", "status": "COMPLETED", "conclusion": "FAILURE"}]), "CI_FAILED")
+        v, _, _ = self.evaluate(self.fake(statusCheckRollup=[{"name": "t", "status": "IN_PROGRESS", "conclusion": ""}]))
+        self.assertEqual(v, "WAIT")
+
+    def test_an_empty_rollup_without_a_skip_directive_waits(self):
+        v, reasons, _ = self.evaluate(self.fake(message="chore: change"))
+        self.assertEqual(v, "WAIT")
+        self.assertTrue(reasons[0].startswith("CI_PENDING"), reasons)
+
+    def test_skip_directives_are_recognised_only_where_github_honours_them(self):
+        for msg in ("x [skip ci]", "x [ci skip]", "x [no ci]", "x [skip actions]", "x [actions skip]", "x\n\nbody\n\nskip-checks: true\n"):
+            with self.subTest(msg):
+                self.assertEqual(self.evaluate(self.fake(message=msg))[0], "PASS")
+        for msg in ("x skip ci", "x [skip ci please]", "x skip-checks: false", "x (skip actions)", "x [CI SKIP]", "x [Skip Actions]",
+                    "skip-checks: true", "x\n\nskip-checks: TRUE", "x\n\nskip-checks: true\n\nmore text after", "x skip-checks: true"):
+            with self.subTest(msg):
+                self.assertEqual(self.evaluate(self.fake(message=msg))[0], "WAIT")
+
+    def test_any_actions_run_for_the_head_waits(self):
+        v, reasons, _ = self.evaluate(self.fake(runs=1))
+        self.assertEqual(v, "WAIT")
+        self.assertTrue(reasons[0].startswith("CI_PENDING"), reasons)
+
+    def test_workflow_pinned_and_oversized_changes_refuse(self):
+        for files in ([{"path": ".github/workflows/q.yml"}], [{"path": ".GitHub/Workflows/q.yml"}], [{"path": "scripts/ci/run.sh"}], [],
+                      [{"path": f"f{i}"} for i in range(100)]):
+            with self.subTest(files=files[:1]):
+                self.refused(self.fake(files=files), "LOCAL_FIRST_SCOPE")
+
+    def test_a_rename_out_of_a_workflow_or_pinned_path_refuses(self):
+        old = {"filename": "docs/quality.yml", "status": "renamed", "previous_filename": ".github/workflows/quality.yml"}
+        for listed in ([old], [dict(old, previous_filename=".GitHub/Workflows/q.yml")], [dict(old, previous_filename="scripts/ci/run.sh")],
+                       [dict(old, previous_filename="docs/old.md")]):
+            with self.subTest(prev=listed[0]["previous_filename"]):
+                self.refused(self.fake(files=[{"path": "docs/quality.yml"}], api_files=listed), "LOCAL_FIRST_SCOPE")
+
+    def test_the_two_file_listings_must_agree_and_not_be_truncated(self):
+        self.refused(self.fake(api_files=[]), "LOCAL_FIRST_SCOPE")
+        self.refused(self.fake(api_files=[{"filename": "src/a.py", "status": "modified"}, {"filename": "src/b.py", "status": "modified"}]), "LOCAL_FIRST_SCOPE")
+        self.refused(self.fake(api_files=[{"filename": "src/other.py", "status": "modified"}]), "LOCAL_FIRST_SCOPE")
+        self.refused(self.fake(files=[{"path": f"f{i}"} for i in range(99)] + [{"path": "g"}]), "LOCAL_FIRST_SCOPE")
+
+    def test_the_pull_files_read_is_an_allowed_read_only_call(self):
+        omg.read_only(("api", "repos/Chisanan232/r/pulls/7/files?per_page=100", "--jq", "."))
+        for bad in ("repos/Chisanan232/r/pulls/7/files?per_page=100&page=2", "repos/Chisanan232/r/pulls/7/files?per_page=1",
+                    "repos/Chisanan232/r/pulls/7/files?per_page=100&x=1", "repos/Chisanan232/r/pulls/x/files?per_page=100"):
+            with self.subTest(bad), self.assertRaises(RuntimeError):
+                omg.read_only(("api", bad, "--jq", "."))
+
+    def test_a_failing_record_stands_wherever_it_was_posted_and_however_it_is_shaped(self):
+        bad = lf_record()
+        bad["commands"][0]["exit_code"] = 1
+        for body in ("```\nOWNER-MERGE-LOCAL-CI " + json.dumps(bad) + "\n```", "~~~\nOWNER-MERGE-LOCAL-CI " + json.dumps(bad) + "\n~~~"):
+            with self.subTest(body[:3]):
+                self.refused(self.fake(lf_comment(body=body), lf_comment()), "LOCAL_CI_FAILED")
+        self.refused(self.fake(lf_comment(bad, includesCreatedEdit=True), lf_comment()), "LOCAL_CI_FAILED")
+        self.refused(self.fake(lf_comment(bad, isMinimized=True), lf_comment()), "LOCAL_CI_FAILED")
+        for code in (1.0, "1", False, True, None, 0.0, "0"):
+            odd = lf_record()
+            odd["commands"][0]["exit_code"] = code
+            with self.subTest(code=code):
+                self.refused(self.fake(lf_comment(odd), lf_comment()), "LOCAL_CI_FAILED")
+        missing = lf_record()
+        del missing["commands"][1]["exit_code"]
+        self.refused(self.fake(lf_comment(missing), lf_comment()), "LOCAL_CI_FAILED")
+
+    def test_a_failure_in_a_quoted_or_indented_line_still_counts(self):
+        bad = lf_record()
+        bad["commands"][0]["exit_code"] = 2
+        for prefix in ("> ", ">> ", "  ", "> > ", "\t> "):
+            with self.subTest(prefix=prefix):
+                self.refused(self.fake(lf_comment(body=prefix + "OWNER-MERGE-LOCAL-CI " + json.dumps(bad)), lf_comment()), "LOCAL_CI_FAILED")
+
+    def test_skip_trailer_must_be_the_final_line_after_a_blank_line(self):
+        for msg in ("x\n\nskip-checks: true", "x\n\nskip-checks:true\n", "x\n\nbody\n\nskip-checks: true\n\n"):
+            with self.subTest(msg):
+                self.assertEqual(self.evaluate(self.fake(message=msg))[0], "PASS")
+        for msg in ("x\n\nskip-checks: true\nSigned-off-by: a", "x\nskip-checks: true", "x\n\nskip-checks: true\n\ntail", "skip-checks: true",
+                    "x\n\nskip-checks:  true", "x\n\n skip-checks: true"):
+            with self.subTest(msg):
+                self.assertEqual(self.evaluate(self.fake(message=msg))[0], "WAIT")
+
+    def test_env_is_bound_into_the_record(self):
+        entry = LF_CONFIG["repos"]["Chisanan232/r"]
+        cfg = {"schema": 1, "repos": {"Chisanan232/r": dict(entry, env={"CI": "1"})}}
+        self.assertEqual(self.evaluate(self.fake(lf_comment(lf_record(env={"CI": "1"}))), config=cfg)[0], "PASS")
+        for env in ({}, {"CI": "2"}, {"CI": "1", "X": "1"}):
+            with self.subTest(env=env):
+                self.refused(self.fake(lf_comment(lf_record(env=env))), "LOCAL_CI_COMMANDS_MISMATCH", config=cfg)
+        self.refused(self.fake(lf_comment(lf_record(env={"CI": "1"}))), "LOCAL_CI_COMMANDS_MISMATCH")   # config has no env
+        bad = lf_record(env={"CI": 1})
+        self.refused(self.fake(lf_comment(bad)), "LOCAL_CI_MALFORMED")
+        missing = lf_record()
+        del missing["env"]
+        self.refused(self.fake(lf_comment(missing)), "LOCAL_CI_MALFORMED")
+
+    def test_more_redirecting_env_names_are_refused_in_the_trust_file(self):
+        entry = LF_CONFIG["repos"]["Chisanan232/r"]
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_GLOBAL", "PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "TERM", "TZ", "UV_PYTHON",
+                    "PYTEST_ADDOPTS", "JAVA_TOOL_OPTIONS", "CLASSPATH", "GEM_PATH", "RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER", "NPM_CONFIG_PREFIX",
+                    "BUNDLE_GEMFILE"):
+            with self.subTest(key), self.assertRaises(ValueError):
+                omg.load_local_first({"schema": 1, "repos": {"Chisanan232/r": dict(entry, env={key: "x"})}})
+
+    def test_check_names_must_have_distinct_log_names(self):
+        entry = LF_CONFIG["repos"]["Chisanan232/r"]
+        with self.assertRaises(ValueError):
+            omg.load_local_first({"schema": 1, "repos": {"Chisanan232/r": dict(entry, checks=[{"name": "a b", "argv": ["x"]}, {"name": "a_b", "argv": ["y"]}])}})
+
+    def test_a_tilde_fenced_passing_record_does_not_count(self):
+        self.refused(self.fake(lf_comment(body="~~~\nOWNER-MERGE-LOCAL-CI " + json.dumps(lf_record()) + "\n~~~")), "LOCAL_CI_MISSING")
+
+    def test_a_missing_review_still_refuses(self):
+        fake = self.fake()
+        fake.pr["comments"] = fake.pr["comments"][1:]
+        v, reasons, _ = self.evaluate(fake)
+        self.assertEqual(v, "REFUSE")
+        self.assertTrue(any(r.startswith("NO_REVIEW_EVIDENCE") for r in reasons), reasons)
+
+    def test_the_three_ci_exception_records_do_not_stand_in_for_each_other(self):
+        billing = {"author": {"login": "chisanan232"}, "body": f"OWNER-MERGE-CI-UNAVAILABLE head={HEAD} cause=billing local_equivalent=PASS"}
+        noci = {"author": {"login": "chisanan232"}, "body": Gate.NOCI}
+        self.refused(self.fake(billing, noci, workflows=3), "LOCAL_CI_MISSING")
+        self.refused(self.fake(billing, noci, workflows=3), "NO_CI_EVIDENCE", config=None)
+        self.refused(Gate().noci_fake(comments=[{"author": {"login": "chisanan232"}, "body": REVIEW}, lf_comment()]), "NO_CI_EVIDENCE", config=None)
+
+    def test_the_actions_runs_read_is_an_allowed_read_only_call(self):
+        omg.read_only(("api", f"repos/Chisanan232/r/actions/runs?head_sha={HEAD}&per_page=1", "--jq", ".total_count"))
+        for bad in (f"repos/Chisanan232/r/actions/runs?head_sha={HEAD}", f"repos/Chisanan232/r/actions/runs?head_sha={HEAD}&per_page=100",
+                    "repos/Chisanan232/r/actions/runs?head_sha=main&per_page=1", f"repos/Chisanan232/r/actions/runs?head_sha={HEAD}&per_page=1&x=1",
+                    f"repos/Chisanan232/r/actions/runs/1?head_sha={HEAD}&per_page=1"):
+            with self.subTest(bad), self.assertRaises(RuntimeError):
+                omg.read_only(("api", bad, "--jq", ".total_count"))
+
+    def test_the_trust_file_is_loaded_with_the_owner_file_checks(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(os.path.realpath(d), "local")
+            os.mkdir(root, 0o700)
+            f = os.path.join(root, "local-first-ci.json")
+            pathlib.Path(f).write_text(json.dumps(LF_CONFIG))
+            os.chmod(f, 0o600)
+            cfg = omg.read_owner_file(f, True, omg.load_local_first, "local-first CI config", root)
+            self.assertEqual(cfg["chisanan232/r"]["max_age_hours"], 24)
+            self.assertIsNone(omg.read_owner_file(os.path.join(root, "none.json"), False, omg.load_local_first, "x", root))
+            os.chmod(f, 0o666)
+            with self.assertRaises(ValueError):
+                omg.read_owner_file(f, True, omg.load_local_first, "x", root)
+            os.chmod(f, 0o600)
+            link = os.path.join(root, "link.json")
+            os.symlink(f, link)
+            with self.assertRaises(ValueError):
+                omg.read_owner_file(link, True, omg.load_local_first, "x", root)
+
+    def test_the_trust_file_may_fix_environment_variables(self):
+        entry = LF_CONFIG["repos"]["Chisanan232/r"]
+        self.assertEqual(omg.load_local_first({"schema": 1, "repos": {"Chisanan232/r": dict(entry, env={"CI": "1"})}})["chisanan232/r"]["env"], {"CI": "1"})
+        self.assertEqual(omg.load_local_first(LF_CONFIG)["chisanan232/r"]["env"], {})
+        for bad in ({"ci": "1"}, {"CI": 1}, {"CI=": "1"}, {"PYTHONPATH": "/x"}, [], {"LD_PRELOAD": "/x"}):
+            with self.assertRaises(ValueError, msg=bad):
+                omg.load_local_first({"schema": 1, "repos": {"Chisanan232/r": dict(entry, env=bad)}})
+
+    def test_a_malformed_trust_file_is_rejected(self):
+        entry = LF_CONFIG["repos"]["Chisanan232/r"]
+        for bad in ({}, {"schema": 2, "repos": {}}, {"schema": 1, "repos": {"Chisanan232/r": dict(entry, checks=[])}},
+                    {"schema": 1, "repos": {"Chisanan232/r": dict(entry, checks=[{"name": "a", "argv": []}])}},
+                    {"schema": 1, "repos": {"Chisanan232/r": dict(entry, checks=[{"name": "a", "argv": ["x"]}, {"name": "a", "argv": ["y"]}])}},
+                    {"schema": 1, "repos": {"Chisanan232/r": dict(entry, max_age_hours=0)}},
+                    {"schema": 1, "repos": {"Chisanan232/r": dict(entry, max_age_hours=169)}},
+                    {"schema": 1, "repos": {"Chisanan232/r": dict(entry, max_age_hours=True)}},
+                    {"schema": 1, "repos": {"Chisanan232/r": dict(entry, surprise=1)}},
+                    {"schema": 1, "repos": {"Chisanan232/r": entry, "chisanan232/R": entry}}):
+            with self.assertRaises(ValueError, msg=bad):
+                omg.load_local_first(bad)
+        self.assertEqual(omg.load_local_first({"schema": 1, "repos": {"Chisanan232/r": {"checks": entry["checks"]}}})["chisanan232/r"]["max_age_hours"], 24)
+
+    def test_check_accepts_only_a_trust_file_under_the_owner_config_root(self):
+        import contextlib, io, os, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(os.path.realpath(d), "local-first-ci.json")  # outside the fixed owner-config directory
+            pathlib.Path(f).write_text(json.dumps(LF_CONFIG))
+            os.chmod(f, 0o600)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = omg.main(["check", "--repo", "Chisanan232/r", "--pr", "7", "--owners", "Chisanan232", "--ci-exception", "--local-first-config", f], run=self.fake())
+            self.assertEqual(code, 3)
+            self.assertEqual(json.loads(out.getvalue())["decision"]["outcome"], "DENY")
 
 
 class Verify(unittest.TestCase):
