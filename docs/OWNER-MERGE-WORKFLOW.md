@@ -103,17 +103,24 @@ no-hosted-ci exception (no workflows directory) fits. The local-first basis is t
 Owner-approved trust file, installed by the responsible agent (the founder ratified this on 2026-11-04: human authoring is not an acceptance requirement). The agent installs only content the owner approved, with mode 0600 in a 0700 directory, preserves unrelated entries, and validates it with the gate's own loader before first use. It runs as the same OS user, so the file is a record of approved commands, not a barrier against the agent; the independent review and the pinned/not_covered lists carry the control: `~/.config/coding-agent-environment/local/local-first-ci.json`
 (loaded with the same checks as the version-branch policy: fixed directory, no symlink, caller-owned, not group/world-writable, 64 KB,
 duplicate keys rejected). Per repository: `checks` (`name` + `argv`, in order), `max_age_hours` (1 to 168, default 24), `pinned_paths`
-(globs whose change is never covered, for example scripts a check runs), `env` (optional fixed environment variables; known redirect keys such as `GIT_*`, `PYTHON*`, `PATH`, `LD_*`, `CARGO_*` and `NPM_*` are refused, a denylist and not proof that no other variable matters; check names must also map to distinct log file names) and `not_covered` (what a local run cannot prove, for example
-hosted windows or ubuntu matrix legs).
+(globs whose change is not covered unless explicitly opted into controlled project-script updates), optional `controlled_script_paths`
+(globs only beneath `scripts/`; each changed pinned path must match one), `env` (optional fixed environment variables; known redirect keys
+such as `GIT_*`, `PYTHON*`, `PATH`, `LD_*`, `CARGO_*` and `NPM_*` are refused, a denylist and not proof that no other variable
+matters; check names must also map to distinct log file names) and `not_covered` (what a local run cannot prove, for example hosted
+windows or ubuntu matrix legs).
 
 1. The owner commits with a skip directive. 2. `scripts/owner-merge-local-ci.py record --repo R --pr N --base B --worktree PATH` runs
 exactly the owner's argv in a clean worktree (no shell) and prints one `OWNER-MERGE-LOCAL-CI {json}` line; run the heavy suite through
-the heavy-lane wrapper. 3. Post that line unedited and unfenced as the authenticated user, plus the independent
-`OWNER-MERGE-REVIEW` record. 4. `owner-merge-gate.py check ... --ci-exception`.
+the heavy-lane wrapper. 3. Post that line unedited and unfenced as the authenticated user, plus an independent `OWNER-MERGE-REVIEW`
+record. For a controlled script update, the reviewer records the current base commit and recipe digest as described below. 4.
+`owner-merge-gate.py check ... --ci-exception`.
 
-`--ci-exception` only states intent; the trust file is the authorization. The gate refuses unless all hold: the repo is in the trust file;
+`--ci-exception` only states intent; the owner-controlled trust file is the authorization. The standing project-work decision permits
+the reviewed source change without a new per-PR founder authorization; it does not grant new CI, production, credential or release authority.
+The gate refuses unless all hold: the repo is in the trust file;
 it is private; the rollup is empty; GitHub reports no Actions run for the head; the head commit has a skip directive; the PR changes no
-`.github/workflows/**` file and no pinned path and lists fewer than 100 files; the latest visible record for this head is by the
+`.github/workflows/**` file and changes no pinned path except a pinned path explicitly matched by `controlled_script_paths`; its file
+inventory is complete and lists fewer than 100 files; the latest visible record for this head is by the
 authenticated user, not edited and not minimized; its repo, PR, base, head and base commit (against the compare merge base) match;
 its commands and its `env` map equal the configured ones exactly, in order; every exit code is 0; it finished no more than 60 seconds in the future,
 within `max_age_hours`, and no later than the comment's server-side creation time; and a clean review record exists. A recorded
@@ -121,11 +128,27 @@ non-zero exit at this head is `LOCAL_CI_FAILED` (DENY) and a later pass does not
 any Actions run for the head, is `CI_PENDING`. Record schema 1 now carries a top-level `env` object (the owner's `env` only); a record without it is `LOCAL_CI_MALFORMED`. On success the facts carry `ci_exception=local-first`, `hosted_checks=NOT_RUN`,
 `ci_verdict=NOT_A_CI_PASS: LOCAL_EQUIVALENT_PASS`, `local_ci_digest` and `not_covered`.
 
+Controlled source updates are opt-in per repository through `controlled_script_paths`, whose patterns are restricted to `scripts/`.
+Every changed pinned path must match both `pinned_paths` and this opt-in. The gate checks the complete PR file list against the exact
+merge-base and head commit trees using the captured base commit, then rereads the PR base/head after record validation; incomplete, renamed, mismatched or concurrently changed
+inventory refuses. A controlled review line extends the usual review record with
+`base_sha=<current base commit> recipe_sha256=<digest> scope=project-scripts authorization=standing-project-work`. The digest is
+SHA-256 of the normalized ordered check names/argv and configured environment map. The review must bind the current head, base and
+recipe and report `PASS` with zero blockers; it remains independent self-attested review evidence, not a GitHub approval or CI pass.
+The gate returns an agent remediation reason when this review is missing, stale, malformed or ambiguous.
+The review's `base_sha` is the current base tip; the local-CI record's `base_sha` remains the merge base. A refreshed review can coexist
+with clean legacy or stale-tuple history; applicable failures and competing current-tuple records still refuse. Authorization is
+standing, without per-PR approval or authorization expiry; existing evidence freshness and head/base/recipe invalidation still apply.
+The independent review covers test validity and indirectly invoked scripts, including attempts to fabricate evidence, bypass checks
+or introduce separately reserved IAM, host-permission, credential, production, paid-spend or release authority.
+Surviving changed controlled scripts must be regular Git blobs (`100644` or `100755`): a symlink binds a pathname rather than the
+executed bytes. Deleting a script link or replacing it with a regular file is not rejected by this mode check.
+
 Threats considered. Replay to another head, base or PR: exact match plus an age window. Weaker commands: argv must equal the owner's
 file, which the agent installs from owner-approved content (same OS user; see the residual risks). A script a command calls being edited by the PR: pinned paths, the workflow-change refusal and the
 independent review. Skipping a hosted check that would have failed: only owner-listed private repositories, hosted result reported
 `NOT_RUN`, never a pass. Backdating or editing a record: server-side `createdAt` and the unedited check. Residual risks, stated plainly:
-- An agent that installs the trust file can widen its commands, pinned paths or `not_covered`. Only the independent review and the founder's approval of the file content catch that. Record where the approval lives (a Jira or PR comment quoting the content digest) and install only content matching it; the agent never approves its own content. A host deny rule on the directory is optional hardening, not a requirement.
+- An agent that installs the trust file can widen its commands, pinned paths or `not_covered`. The standing project-work authorization covers only the controlled source-update workflow; trust-file content remains owner-governed. Independent review is required for a controlled script update, and the agent never approves its own content. A host deny rule on the directory is optional hardening, not a requirement.
 - The record is written under the same GitHub identity and OS user as the agent. A forged line cannot be detected cryptographically (an
   HMAC would be tamper evidence only); the independent review and the owner's merge review are the controls.
 - A failing run that was deleted or never posted cannot be seen by the gate. Only a posted failure denies. The failure scan reads every
