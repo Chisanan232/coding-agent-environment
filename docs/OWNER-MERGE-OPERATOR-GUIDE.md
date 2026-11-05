@@ -183,5 +183,5 @@ and review (`OWNER-MERGE-AUTONOMY.md`, "Owner allow registry"). Exhaustive cover
 A private repository whose head commit skips hosted CI has an empty rollup; `check --ci-exception` can accept owner-fixed local
 commands instead. The responsible agent installs the owner-approved `~/.config/coding-agent-environment/local/local-first-ci.json` and validates it (see the residual risks in the workflow doc); the recorder is
 `scripts/owner-merge-local-ci.py`. Reason codes: `LOCAL_CI_FAILED` DENY; `LOCAL_CI_MISSING`, `_STALE`, `_MISMATCH`, `_MALFORMED`,
-`_COMMANDS_MISMATCH` ASK (agent reruns the local checks); `NOT_PRIVATE` DENY; `LOCAL_FIRST_SCOPE` ASK. Full rules and threat notes:
+`_COMMANDS_MISMATCH`, `_CONTEXT_MISMATCH` ASK (agent reruns the local checks); `NOT_PRIVATE` DENY; `LOCAL_FIRST_SCOPE` ASK. Full rules and threat notes:
 `docs/OWNER-MERGE-WORKFLOW.md`. Step list for the first use: `docs/OWNER-MERGE-LOCAL-FIRST-HANDOFF.md`.
