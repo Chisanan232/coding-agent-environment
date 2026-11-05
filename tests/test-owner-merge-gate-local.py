@@ -91,7 +91,7 @@ class LocalGh:
             merged = n in self.merged
             checks = [] if pr["checks"] is None else [{"name": "ci", "status": "COMPLETED" if pr["checks"] != "PENDING" else "IN_PROGRESS",
                                                      "conclusion": "" if pr["checks"] == "PENDING" else pr["checks"]}]
-            return json.dumps({"number": n, "state": "MERGED" if merged else "OPEN", "isDraft": False, "baseRefName": "main",
+            return json.dumps({"number": n, "state": "MERGED" if merged else "OPEN", "isDraft": False, "title": f"change {n}", "baseRefName": "main",
                                "headRefName": pr["branch"], "headRefOid": self.head(n), "author": {"login": "chisanan232"},
                                "mergeable": "CONFLICTING" if not merged and self.conflicts(n) else "MERGEABLE",
                                "mergeStateStatus": "DIRTY" if not merged and self.conflicts(n) else "CLEAN",

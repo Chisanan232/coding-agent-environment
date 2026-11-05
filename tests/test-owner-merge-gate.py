@@ -31,7 +31,7 @@ class Fake:
     """Answers the gh calls the gate makes from a mutable state dict."""
 
     def __init__(self, **over):
-        self.pr = {"number": 7, "state": "OPEN", "isDraft": False, "baseRefName": "main", "headRefName": "feat/x", "headRefOid": HEAD,
+        self.pr = {"number": 7, "state": "OPEN", "isDraft": False, "title": "feat: x", "baseRefName": "main", "headRefName": "feat/x", "headRefOid": HEAD,
                    "author": {"login": "chisanan232"}, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
                    "reviewDecision": "", "reviews": [], "isCrossRepository": False, "mergeCommit": None,
                    "comments": [{"author": {"login": "chisanan232"}, "body": REVIEW}],
@@ -466,6 +466,7 @@ def iso(t):
 
 def lf_record(**over):
     rec = {"schema": 1, "repo": "Chisanan232/r", "pr": 7, "base": "main", "base_sha": BASE_SHA, "head": HEAD, "env": {},
+           "context": {"PULL_BRANCH": "feat/x", "PR_TITLE": "feat: x", "GIT_BASE": BASE_SHA},
            "commands": [{"name": "suite", "argv": ["python3", "-m", "pytest"], "exit_code": 0, "started_at": iso(NOW - 900),
                          "finished_at": iso(NOW - 600), "log_sha256": "1" * 64},
                         {"name": "lint", "argv": ["ruff", "check", "."], "exit_code": 0, "started_at": iso(NOW - 590),
@@ -561,6 +562,23 @@ class LocalFirst(unittest.TestCase):
                                 ("extra", [suite, lint, dict(lint, name="extra")]), ("order", [lint, suite])):
             with self.subTest(label):
                 self.refused(self.fake(lf_comment(lf_record(commands=commands))), "LOCAL_CI_COMMANDS_MISMATCH")
+
+    def test_the_recorded_pr_context_must_match_the_pr_now(self):
+        self.refused(self.fake(title="feat: renamed"), "LOCAL_CI_CONTEXT_MISMATCH")
+        self.refused(self.fake(headRefName="feat/renamed"), "LOCAL_CI_CONTEXT_MISMATCH")
+        for key, value in (("PR_TITLE", "other"), ("PULL_BRANCH", "other"), ("GIT_BASE", "e" * 40)):
+            with self.subTest(key):
+                self.refused(self.fake(lf_comment(lf_record(context=dict(lf_record()["context"], **{key: value})))), "LOCAL_CI_CONTEXT_MISMATCH")
+
+    def test_a_record_without_a_well_formed_context_is_malformed(self):
+        missing = lf_record()
+        del missing["context"]
+        self.refused(self.fake(lf_comment(missing)), "LOCAL_CI_MALFORMED")
+        good = lf_record()["context"]
+        for label, bad in (("extra", dict(good, CARGO_TARGET_DIR="/x")), ("short", {"PULL_BRANCH": "feat/x"}), ("type", dict(good, PR_TITLE=1)),
+                           ("list", [])):
+            with self.subTest(label):
+                self.refused(self.fake(lf_comment(lf_record(context=bad))), "LOCAL_CI_MALFORMED")
 
     def test_edited_minimized_or_foreign_records_do_not_count(self):
         self.refused(self.fake(lf_comment(includesCreatedEdit=True)), "LOCAL_CI_MISSING")

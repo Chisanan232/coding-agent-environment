@@ -235,7 +235,7 @@ def load_local_first(obj):
 
 
 # One entry per refusal reason so callers and tests can match on a stable code.
-PR_FIELDS = ("number,state,isDraft,baseRefName,headRefName,headRefOid,author,mergeable,mergeStateStatus,"
+PR_FIELDS = ("number,state,isDraft,title,baseRefName,headRefName,headRefOid,author,mergeable,mergeStateStatus,"
              "reviewDecision,reviews,comments,statusCheckRollup,isCrossRepository,mergeCommit,files,commits")
 THREADS = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n)"
            "{reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved isOutdated}}}}}")
@@ -504,13 +504,18 @@ def _int(x):
     return type(x) is int
 
 
+# What the recorder derives from the PR so a detached local run sees what hosted CI would (head ref, title, merge-base).
+LOCAL_CONTEXT_KEYS = {"PULL_BRANCH", "PR_TITLE", "GIT_BASE"}
+
+
 def parse_local_record(rec):
     """Strictly validate one OWNER-MERGE-LOCAL-CI record and return its commands' finish times; raises ValueError on any deviation."""
-    top = {"schema", "repo", "pr", "base", "base_sha", "head", "env", "commands"}
+    top = {"schema", "repo", "pr", "base", "base_sha", "head", "env", "context", "commands"}
     ok = isinstance(rec, dict) and set(rec) == top and rec["schema"] == 1 and _int(rec["schema"]) and isinstance(rec["repo"], str) \
         and _int(rec["pr"]) and isinstance(rec["base"], str) and isinstance(rec["base_sha"], str) and SHA_RE.fullmatch(rec["base_sha"]) \
         and isinstance(rec["head"], str) and SHA_RE.fullmatch(rec["head"]) and isinstance(rec["commands"], list) and rec["commands"] \
-        and isinstance(rec["env"], dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in rec["env"].items())
+        and isinstance(rec["env"], dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in rec["env"].items()) \
+        and isinstance(rec["context"], dict) and set(rec["context"]) == LOCAL_CONTEXT_KEYS and all(isinstance(v, str) for v in rec["context"].values())
     if not ok:
         raise ValueError("record shape")
     finished = []
@@ -605,6 +610,8 @@ def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, raw_bo
         return reasons + ["LOCAL_CI_MISMATCH: the record is for another repo, PR, base, base commit or head, or claims to finish after it was posted"], wait, facts
     if [(c["name"], tuple(c["argv"])) for c in rec["commands"]] != cfg["checks"] or rec["env"] != cfg["env"]:
         return reasons + ["LOCAL_CI_COMMANDS_MISMATCH: the recorded commands or environment are not exactly the owner's configured checks, in order"], wait, facts
+    if rec["context"] != {"PULL_BRANCH": p.get("headRefName"), "PR_TITLE": p.get("title"), "GIT_BASE": rec["base_sha"]}:
+        return reasons + ["LOCAL_CI_CONTEXT_MISMATCH: the record's PR branch, title or base differ from the PR now; rerun the local checks"], wait, facts
     if now - max(finished) > cfg["max_age_hours"] * 3600:
         return reasons + [f"LOCAL_CI_STALE: the record is older than {cfg['max_age_hours']} hours; rerun the local checks"], wait, facts
     if not reasons and not wait:
@@ -936,6 +943,7 @@ REASON_TABLE = {
     "LOCAL_CI_MISSING": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"), "LOCAL_CI_STALE": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"),
     "LOCAL_CI_MISMATCH": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"), "LOCAL_CI_MALFORMED": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"),
     "LOCAL_CI_COMMANDS_MISMATCH": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"),
+    "LOCAL_CI_CONTEXT_MISMATCH": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"),
     "LOCAL_FIRST_SCOPE": (ASK, "founder_risk_decision", "ENGINEERING_GATE"),
 }
 SEVERITY = {"ALLOW": 0, ASK: 1, DENY: 2}

@@ -18,6 +18,11 @@ threat notes are in `docs/OWNER-MERGE-WORKFLOW.md`; this is only the order of st
 Not covered by a local run is listed in `not_covered` and in the check output; it is not hidden. A new push invalidates the record,
 the review and the skip-directive check, so repeat steps 2 to 6.
 
+The recorder also supplies the context hosted CI would have, because the worktree is detached and the host's cargo config sets a shared
+`build.target-dir`: `PULL_BRANCH` and `PR_TITLE` (read from the PR with `gh pr view`, which must report the worktree HEAD), `GIT_BASE` (the merge base)
+and `CARGO_TARGET_DIR=<worktree>/target` (add `target/` to the repository's `.gitignore`). The first three are written into the record as `context`;
+the gate compares them with the PR now, so a changed title or branch gives `LOCAL_CI_CONTEXT_MISMATCH` and the checks must be recorded again.
+
 For Codex, the recorder refuses a symlinked `~/.codex` root or evidence directory, a root not owned by the caller or writable by
 group/others, and an evidence directory not owned by the caller with mode `0700`. It validates this fixed location and all existing
 log files before running any configured check. An unsafe Codex path is a refusal; the recorder does not fall back to Claude storage.
