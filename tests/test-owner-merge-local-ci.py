@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -75,6 +76,15 @@ class Recorder(unittest.TestCase):
             code = rec.record(REPO, 7, "main", self.wt, self.entry(*commands, env=env), self.logs, expect_head)
         return code, out.getvalue(), err.getvalue()
 
+    def record_from_cli(self, host_args=()):
+        args = ["record", "--repo", REPO, "--pr", "7", "--base", "main", "--worktree", self.wt, *host_args]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": self.tmp.name}), \
+                mock.patch.object(rec, "load_entry", return_value=self.entry(py(f"open({self.marker!r}, 'w').write('ran')"))), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = rec.main(args)
+        return code, out.getvalue(), err.getvalue()
+
     def test_clean_tree_prints_one_unfenced_line_the_gate_accepts(self):
         code, out, _ = self.record(py("print('ok')"), py("import sys; sys.exit(0)"))
         self.assertEqual(code, 0)
@@ -87,6 +97,92 @@ class Recorder(unittest.TestCase):
                          (REPO, 7, "main", self.head, self.base_sha))
         self.assertEqual([c["exit_code"] for c in parsed["commands"]], [0, 0])
         self.assertEqual([c["name"] for c in parsed["commands"]], ["c0", "c1"])
+
+    def test_evidence_host_defaults_to_existing_claude_location(self):
+        code, out, _ = self.record_from_cli()
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(self.marker))
+        self.assertTrue(os.path.isdir(os.path.join(self.tmp.name, ".claude", "owner-merge-evidence")))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, ".codex", "owner-merge-evidence")))
+        self.assertTrue(out.startswith("OWNER-MERGE-LOCAL-CI {"))
+
+    def test_explicit_codex_host_uses_only_codex_evidence_location(self):
+        os.mkdir(os.path.join(self.tmp.name, ".codex"), 0o755)
+        code, out, _ = self.record_from_cli(("--evidence-host", "codex"))
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(self.marker))
+        evidence = os.path.join(self.tmp.name, ".codex", "owner-merge-evidence")
+        self.assertTrue(os.path.isdir(evidence))
+        self.assertEqual(stat.S_IMODE(os.stat(evidence).st_mode), 0o700)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, ".claude")))
+        self.assertTrue(out.startswith("OWNER-MERGE-LOCAL-CI {"))
+
+    def test_evidence_host_does_not_accept_an_arbitrary_path(self):
+        out, err = io.StringIO(), io.StringIO()
+        args = ["record", "--repo", REPO, "--pr", "7", "--base", "main", "--worktree", self.wt,
+                "--evidence-host", self.logs]
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as raised:
+                rec.main(args)
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(out.getvalue(), "")
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_codex_symlinked_host_root_refuses_without_fallback_or_execution(self):
+        outside = os.path.join(self.tmp.name, "outside")
+        os.mkdir(outside, 0o700)
+        os.symlink(outside, os.path.join(self.tmp.name, ".codex"))
+        os.makedirs(os.path.join(self.tmp.name, ".claude", "owner-merge-evidence"), mode=0o700)
+        code, out, _ = self.record_from_cli(("--evidence-host", "codex"))
+        self.assertEqual((code, out), (2, ""))
+        self.assertFalse(os.path.exists(self.marker))
+        self.assertEqual(os.listdir(os.path.join(self.tmp.name, ".claude", "owner-merge-evidence")), [])
+
+    def test_codex_wrong_host_root_mode_refuses_without_execution(self):
+        root = os.path.join(self.tmp.name, ".codex")
+        os.mkdir(root, 0o777)
+        os.chmod(root, 0o777)
+        code, out, _ = self.record_from_cli(("--evidence-host", "codex"))
+        self.assertEqual((code, out), (2, ""))
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_codex_wrong_host_root_owner_refuses_without_execution(self):
+        os.mkdir(os.path.join(self.tmp.name, ".codex"), 0o755)
+        with mock.patch.object(rec.os, "getuid", return_value=os.getuid() + 1):
+            code, out, _ = self.record_from_cli(("--evidence-host", "codex"))
+        self.assertEqual((code, out), (2, ""))
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_codex_symlinked_evidence_dir_refuses_without_execution(self):
+        root = os.path.join(self.tmp.name, ".codex")
+        os.mkdir(root, 0o755)
+        outside = os.path.join(self.tmp.name, "outside")
+        os.mkdir(outside, 0o700)
+        os.symlink(outside, os.path.join(root, "owner-merge-evidence"))
+        code, out, _ = self.record_from_cli(("--evidence-host", "codex"))
+        self.assertEqual((code, out), (2, ""))
+        self.assertFalse(os.path.exists(self.marker))
+        self.assertEqual(os.listdir(outside), [])
+
+    def test_codex_wrong_evidence_mode_refuses_without_execution(self):
+        root = os.path.join(self.tmp.name, ".codex")
+        os.mkdir(root, 0o755)
+        evidence = os.path.join(root, "owner-merge-evidence")
+        os.mkdir(evidence, 0o755)
+        code, out, _ = self.record_from_cli(("--evidence-host", "codex"))
+        self.assertEqual((code, out), (2, ""))
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_codex_existing_log_symlink_refuses_before_any_check(self):
+        root = os.path.join(self.tmp.name, ".codex")
+        os.mkdir(root, 0o755)
+        evidence = os.path.join(root, "owner-merge-evidence")
+        os.mkdir(evidence, 0o700)
+        log = rec.log_path(evidence, "c0", self.head, f"{REPO.replace('/', '__')}-7")
+        os.symlink(self.marker, log)
+        code, out, _ = self.record_from_cli(("--evidence-host", "codex"))
+        self.assertEqual((code, out), (2, ""))
+        self.assertFalse(os.path.exists(self.marker))
 
     def test_logs_are_private_and_their_digest_is_recorded(self):
         _, out, _ = self.record(py("print('hello')"))
