@@ -187,3 +187,8 @@ commands instead. The responsible agent installs the owner-governed `~/.config/c
 `_STALE`, `_INVALID`, `_AMBIGUOUS` ASK (agent obtains an independent review bound to the current base, head and check recipe).
 The standing project-work authorization is recorded in that review line and does not replace CI evidence or GitHub approval. Full rules and threat notes:
 `docs/OWNER-MERGE-WORKFLOW.md`. Step list for the first use: `docs/OWNER-MERGE-LOCAL-FIRST-HANDOFF.md`.
+
+`controlled_package_scripts` is an optional, exact-path opt-in for a `package.json` test script update. It accepts only the existing
+non-empty `scripts.test` value changing; the gate checks the immutable base/head blobs and does not execute the command. The reviewer
+must inspect the command, any indirectly invoked scripts and the resulting local validation. Changes to lifecycle hooks, dependencies,
+engines, or any other manifest structure remain outside this controlled scope.
