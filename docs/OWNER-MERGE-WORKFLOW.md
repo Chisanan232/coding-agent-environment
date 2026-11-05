@@ -128,8 +128,18 @@ non-zero exit at this head is `LOCAL_CI_FAILED` (DENY) and a later pass does not
 any Actions run for the head, is `CI_PENDING`. Record schema 1 now carries a top-level `env` object (the owner's `env` only); a record without it is `LOCAL_CI_MALFORMED`. On success the facts carry `ci_exception=local-first`, `hosted_checks=NOT_RUN`,
 `ci_verdict=NOT_A_CI_PASS: LOCAL_EQUIVALENT_PASS`, `local_ci_digest` and `not_covered`.
 
-Controlled source updates are opt-in per repository through `controlled_script_paths`, whose patterns are restricted to `scripts/`.
-Every changed pinned path must match both `pinned_paths` and this opt-in. The gate checks the complete PR file list against the exact
+Controlled source updates are opt-in per repository through `controlled_script_paths`, whose patterns are restricted to `scripts/`,
+and optionally `controlled_package_scripts`, an exact path map whose only accepted value is `["test"]` (for example
+`{"package.json":["test"],"desktop/package.json":["test"]}`). A package path must be a normalized exact `package.json` path; globs,
+traversal, lifecycle scripts and every other package script key are refused. Every changed pinned path must match one of the explicit
+controlled opt-ins and `pinned_paths`. For a mapped package manifest, the gate reads only its base/head Git blobs by immutable object
+identity, rejects a blob larger than 64 KiB, and requires strict UTF-8 JSON with no duplicate keys or non-standard numbers. Both
+manifests must have a non-empty string `scripts.test`; their only semantic difference may be that value, with all other JSON types
+preserved. The file must be a regular modified blob with unchanged mode. The gate never runs the package script. The independent
+reviewer must inspect and validate the test command and its effects; this scope does not authorize dependencies, hooks, engines,
+workflows or other privileged changes.
+
+The gate checks the complete PR file list against the exact
 merge-base and head commit trees using the captured base commit, then rereads the PR base/head after record validation; incomplete, renamed, mismatched or concurrently changed
 inventory refuses. A controlled review line extends the usual review record with
 `base_sha=<current base commit> recipe_sha256=<digest> scope=project-scripts authorization=standing-project-work`. The digest is

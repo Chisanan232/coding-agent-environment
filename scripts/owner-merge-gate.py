@@ -48,6 +48,7 @@ import re
 import subprocess
 import sys
 import time
+from decimal import Decimal
 
 REVIEW_RE = re.compile(r"^OWNER-MERGE-REVIEW head=([0-9a-f]{40}) verdict=(\w+) blocking=(\d+) reviewer=(\S+)\s*$", re.M)
 CONTROLLED_REVIEW_RE = re.compile(
@@ -85,6 +86,14 @@ POLICY_FORBIDDEN = re.compile(
     r"|(^|[-/._])(staged?|staging|stg|beta|alpha|canary|hotfix|uat|preprod|qa|live|prd|prod|production|release|releases|deploy|"
     r"sandbox)([-/._0-9]|$)", re.I)
 POLICY_MAX_BYTES = 65536
+
+
+class _JSONInteger(Decimal):
+    """Exact integer token; kept distinct from a JSON fractional/exponent token."""
+
+
+class _JSONFloat(Decimal):
+    """Exact fractional/exponent token, without binary-float precision loss."""
 
 
 def _no_duplicate_keys(pairs):
@@ -209,7 +218,8 @@ def load_local_first(obj):
     out = {}
     for repo, entry in obj["repos"].items():
         if not isinstance(repo, str) or not REPO_RE.fullmatch(repo) or not isinstance(entry, dict) \
-                or set(entry) - {"checks", "max_age_hours", "pinned_paths", "not_covered", "env", "controlled_script_paths"}:
+                or set(entry) - {"checks", "max_age_hours", "pinned_paths", "not_covered", "env", "controlled_script_paths",
+                                 "controlled_package_scripts"}:
             raise ValueError(f"local-first config repo {repo!r} is malformed")
         checks, names = [], set()
         if not isinstance(entry.get("checks"), list) or not entry["checks"]:
@@ -244,6 +254,21 @@ def load_local_first(obj):
                              "not_covered": list(lists["not_covered"]), "env": dict(env)}
         if "controlled_script_paths" in entry:
             out[repo.lower()]["controlled_script_paths"] = tuple(controlled)
+        package_scripts = entry.get("controlled_package_scripts", {})
+        if not isinstance(package_scripts, dict):
+            raise ValueError(f"local-first controlled_package_scripts for {repo} must map exact package.json paths to ['test']")
+        normalized_package_scripts = {}
+        for path, keys in package_scripts.items():
+            valid_path = (isinstance(path, str) and 0 < len(path) <= 1024 and path == path.strip()
+                          and not path.startswith("/") and "\\" not in path
+                          and not any(char in path for char in "*?[]!")
+                          and all(part not in ("", ".", "..") for part in path.split("/"))
+                          and (path == "package.json" or path.endswith("/package.json")))
+            if not valid_path or type(keys) is not list or keys != ["test"]:
+                raise ValueError(f"local-first controlled_package_scripts for {repo} must map exact package.json paths to ['test']")
+            normalized_package_scripts[path] = ("test",)
+        if "controlled_package_scripts" in entry:
+            out[repo.lower()]["controlled_package_scripts"] = normalized_package_scripts
     return out
 
 
@@ -264,26 +289,108 @@ def _tree_blobs(run, repo, commit):
     if not re.fullmatch(r"[0-9a-f]{40}", tree_sha):
         raise ValueError("commit tree identity is malformed")
     tree = _json(run, "api", f"repos/{repo}/git/trees/{tree_sha}?recursive=1", "--jq",
-                 "{truncated,tree:[.tree[]|{path,mode,type,sha}]}")
+                 "{truncated,tree:[.tree[]|{path,mode,type,sha,size}]}")
     if not isinstance(tree, dict) or tree.get("truncated") is not False or not isinstance(tree.get("tree"), list):
         raise ValueError("commit tree is incomplete")
     blobs = {}
     for item in tree["tree"]:
-        if not isinstance(item, dict) or set(item) != {"path", "mode", "type", "sha"}:
+        if not isinstance(item, dict) or set(item) != {"path", "mode", "type", "sha", "size"}:
             raise ValueError("commit tree entry is incomplete")
-        path, mode, kind, sha = (item.get(key) for key in ("path", "mode", "type", "sha"))
+        path, mode, kind, sha, size = (item.get(key) for key in ("path", "mode", "type", "sha", "size"))
         if (not isinstance(path, str) or not path or path.startswith("/") or "\\" in path or "\x00" in path
                 or any(part in ("", ".", "..") for part in path.split("/"))
                 or not isinstance(mode, str) or not re.fullmatch(r"[0-7]{6}", mode)
                 or kind not in ("blob", "tree", "commit") or not isinstance(sha, str)
-                or not re.fullmatch(r"[0-9a-f]{40}", sha) or path in blobs):
+                or not re.fullmatch(r"[0-9a-f]{40}", sha) or path in blobs
+                or (kind == "blob" and (type(size) is not int or size < 0))
+                or (kind != "blob" and size is not None)):
             raise ValueError("commit tree entry is malformed or ambiguous")
         if kind != "tree":
-            blobs[path] = (kind, mode, sha)
+            blobs[path] = (kind, mode, sha, size)
     return blobs
 
 
-def _verify_controlled_inventory(run, repo, head, files, listed, merge_base, *, controlled_pins):
+def _strict_manifest_json(raw):
+    def reject_constant(value):
+        raise ValueError(f"non-standard JSON number: {value}")
+    def parse_float(value):
+        parsed = _JSONFloat(value)
+        if not parsed.is_finite():
+            raise ValueError("non-finite JSON number")
+        return parsed
+    return json.loads(raw.decode("utf-8", errors="strict"), object_pairs_hook=_no_duplicate_keys,
+                      parse_constant=reject_constant, parse_int=_JSONInteger, parse_float=parse_float)
+
+
+def _typed_json_equal(left, right):
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, Decimal):
+        return left == right and (not left.is_zero() or left.as_tuple().sign == right.as_tuple().sign)
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(_typed_json_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(_typed_json_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def _read_bounded_blob(run, repo, sha, expected_size):
+    if (not re.fullmatch(r"[0-9a-f]{40}", sha) or type(expected_size) is not int
+            or not 0 <= expected_size <= POLICY_MAX_BYTES):
+        raise ValueError("blob identity is malformed")
+    endpoint = f"repos/{repo}/git/blobs/{sha}"
+    encoded = run("api", endpoint, "--jq", ".content")
+    max_compact = ((POLICY_MAX_BYTES + 2) // 3) * 4
+    if not isinstance(encoded, str) or len(encoded) > max_compact + (max_compact + 59) // 60 + 2:
+        raise ValueError("manifest blob content exceeds the bounded read size")
+    if encoded.endswith("\n\n"):
+        encoded = encoded[:-2]  # wrapped-content terminator plus jq formatter terminator
+    elif encoded.endswith("\n"):
+        encoded = encoded[:-1]  # jq formatter terminator when content is not line-wrapped at EOF
+    if "\r" in encoded:
+        raise ValueError("manifest blob base64 wrapping is malformed")
+    lines = encoded.split("\n")
+    if (not lines or any(not line or len(line) > 60 for line in lines)
+            or any(len(line) != 60 for line in lines[:-1])
+            or not all(re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", line) for line in lines)):
+        raise ValueError("manifest blob base64 wrapping is malformed")
+    raw = base64.b64decode("".join(lines), validate=True)
+    git_oid = hashlib.sha1(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()
+    if len(raw) != expected_size or git_oid != sha:
+        raise ValueError("manifest blob bytes do not match the immutable tree identity")
+    return raw
+
+
+def _verify_package_script_changes(run, repo, listed, before, after, package_pins):
+    statuses = {item["filename"]: item["status"] for item in listed}
+    for path in package_pins:
+        if path not in statuses:
+            continue
+        old, new = before.get(path), after.get(path)
+        if (statuses[path] != "modified" or old is None or new is None or old[0] != "blob" or new[0] != "blob"
+                or old[1] not in ("100644", "100755") or new[1] != old[1]):
+            raise ValueError("controlled package manifest is not a regular unchanged-mode modified blob")
+        if old[2] == new[2]:
+            raise ValueError("controlled package manifest blob did not change")
+        if (type(old[3]) is not int or type(new[3]) is not int
+                or not 0 <= old[3] <= POLICY_MAX_BYTES or not 0 <= new[3] <= POLICY_MAX_BYTES):
+            raise ValueError("controlled package manifest tree size is missing, invalid or oversized")
+        before_json = _strict_manifest_json(_read_bounded_blob(run, repo, old[2], old[3]))
+        after_json = _strict_manifest_json(_read_bounded_blob(run, repo, new[2], new[3]))
+        if not isinstance(before_json, dict) or not isinstance(after_json, dict):
+            raise ValueError("controlled package manifest must contain JSON objects")
+        scripts_before, scripts_after = before_json.get("scripts"), after_json.get("scripts")
+        if (not isinstance(scripts_before, dict) or not isinstance(scripts_after, dict)
+                or not isinstance(scripts_before.get("test"), str) or not scripts_before["test"].strip()
+                or not isinstance(scripts_after.get("test"), str) or not scripts_after["test"].strip()
+                or scripts_before["test"] == scripts_after["test"]):
+            raise ValueError("controlled package manifest must change an existing non-empty scripts.test string")
+        scripts_before["test"] = scripts_after["test"] = object()
+        if not _typed_json_equal(before_json, after_json):
+            raise ValueError("controlled package manifest changes content outside scripts.test")
+
+
+def _verify_controlled_inventory(run, repo, head, files, listed, merge_base, *, controlled_pins, package_pins=()):
     if not re.fullmatch(r"[0-9a-f]{40}", merge_base):
         raise ValueError("merge base is unavailable")
     if not isinstance(files, list) or not isinstance(listed, list) or not files or len(files) >= 100 or len(listed) != len(files):
@@ -318,16 +425,22 @@ def _verify_controlled_inventory(run, repo, head, files, listed, merge_base, *, 
             raise ValueError("pull request file status does not match its blob change")
         if path in controlled_pins and new is not None and new[1] not in ("100644", "100755"):
             raise ValueError("changed controlled script is not a regular source blob")
+        if path in package_pins and (status != "modified" or old is None or new is None or old[1] not in ("100644", "100755")
+                                     or new[1] != old[1]):
+            raise ValueError("controlled package manifest must be a regular unchanged-mode modified blob")
+    if package_pins:
+        _verify_package_script_changes(run, repo, listed, before, after, package_pins)
     return names
 
 
 def _controlled_pin_candidate(files, cfg):
     controlled = cfg.get("controlled_script_paths", ())
-    if not controlled or not isinstance(files, list):
+    package_paths = cfg.get("controlled_package_scripts", {})
+    if (not controlled and not package_paths) or not isinstance(files, list):
         return False
     return any(isinstance(item, dict) and isinstance(item.get("path"), str)
                and _matches_any(item["path"], cfg["pinned_paths"])
-               and _matches_any(item["path"], controlled) for item in files)
+               and (_matches_any(item["path"], controlled) or item["path"] in package_paths) for item in files)
 
 
 # One entry per refusal reason so callers and tests can match on a stable code.
@@ -347,6 +460,7 @@ API_READS = [re.compile(x) for x in (
     # The local-first basis asks GitHub whether any Actions run exists for the head (a count only).
     _RO + r"/actions/runs\?head_sha=[0-9a-f]{40}&per_page=1", _RO + r"/pulls/\d{1,9}/files\?per_page=100",
     _RO + r"/git/commits/[0-9a-f]{40}", _RO + r"/git/trees/[0-9a-f]{40}\?recursive=1",
+    _RO + r"/git/blobs/[0-9a-f]{40}",
     r"orgs/[A-Za-z0-9][A-Za-z0-9-]{0,38}/memberships/[A-Za-z0-9][A-Za-z0-9-]{0,38}")]
 SAFE_FLAGS = {"--json", "--jq", "--repo"}
 GRAPHQL_VARS = {"query", "o", "r", "n"}
@@ -649,10 +763,11 @@ def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, raw_bo
     workflow_changed = any(".github/workflows" in str(path).casefold() for path in view_paths)
     pinned_changed = [path for path in view_paths if _matches_any(path, cfg["pinned_paths"])] if consistent else []
     controls = cfg.get("controlled_script_paths", ())
-    pin_outside_control = any(not _matches_any(path, controls) for path in pinned_changed)
+    package_controls = cfg.get("controlled_package_scripts", {})
+    pin_outside_control = any(not _matches_any(path, controls) and path not in package_controls for path in pinned_changed)
     scope_invalid = (p.get("isCrossRepository") or not files or not isinstance(files, list) or len(files) >= 100
                      or not consistent or renamed or workflow_changed or pin_outside_control)
-    controlled_scope = bool(pinned_changed and controls) and not scope_invalid
+    controlled_scope = bool(pinned_changed and (controls or package_controls)) and not scope_invalid
     controlled_merge_base = None
     if controlled_scope:
         base_sha = p.get("baseRefOid")
@@ -663,7 +778,9 @@ def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, raw_bo
             if not isinstance(base_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", base_sha):
                 raise ValueError("base commit identity is unavailable")
             controlled_merge_base = run("api", f"repos/{repo}/compare/{base_sha}...{head}", "--jq", ".merge_base_commit.sha").strip()
-            _verify_controlled_inventory(run, repo, head, files, listed, controlled_merge_base, controlled_pins=pinned_changed)
+            _verify_controlled_inventory(run, repo, head, files, listed, controlled_merge_base,
+                                         controlled_pins=[path for path in pinned_changed if _matches_any(path, controls)],
+                                         package_pins=[path for path in pinned_changed if path in package_controls])
         except Exception:
             scope_invalid = True
     if scope_invalid:

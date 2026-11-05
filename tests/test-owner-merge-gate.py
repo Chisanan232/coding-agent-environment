@@ -8,6 +8,7 @@ import calendar
 import hashlib
 import importlib.util
 import json
+import base64
 import pathlib
 import time
 import unittest
@@ -90,6 +91,13 @@ class Fake:
             if tree not in self.tree_entries:
                 raise AssertionError(a)
             return json.dumps({"truncated": tree in self.truncated_trees, "tree": self.tree_entries[tree]})
+        if a[0] == "api" and "/git/blobs/" in a[1]:
+            sha = a[1].rsplit("/", 1)[1]
+            data = self.git_blobs[sha]
+            if a[-1] == ".content":
+                encoded = getattr(self, "blob_content_override", {}).get(sha, base64.b64encode(data).decode("ascii"))
+                return "\n".join(encoded[i:i + 60] for i in range(0, len(encoded), 60)) + "\n\n"
+            raise AssertionError(a)
         if a[0] == "api" and "/compare/" in a[1] and "merge_base_commit" in a[3]:
             return self.merge_base + "\n"
         if a[0] == "api" and "/commits/" in a[1] and ".commit.message" in a[3]:
@@ -156,10 +164,12 @@ class Gate(unittest.TestCase):
 
     def test_controlled_inventory_uses_only_allowlisted_read_endpoints(self):
         for path in (f"repos/Chisanan232/r/git/commits/{HEAD}",
-                     f"repos/Chisanan232/r/git/trees/{HEAD_TREE}?recursive=1"):
+                     f"repos/Chisanan232/r/git/trees/{HEAD_TREE}?recursive=1",
+                     f"repos/Chisanan232/r/git/blobs/{'e' * 40}"):
             omg.read_only(("api", path, "--jq", "."))
         for path in (f"repos/Chisanan232/r/git/trees/{HEAD_TREE}?recursive=0",
-                     "repos/Chisanan232/r/git/trees/not-a-sha?recursive=1"):
+                     "repos/Chisanan232/r/git/trees/not-a-sha?recursive=1",
+                     "repos/Chisanan232/r/git/blobs/not-a-sha"):
             with self.subTest(path=path), self.assertRaises(RuntimeError):
                 omg.read_only(("api", path, "--jq", "."))
 
@@ -578,8 +588,8 @@ class LocalFirst(unittest.TestCase):
             {"filename": item["path"], "status": "modified"} for item in changed_files]
         fake.tree_commits = {BASE_SHA: BASE_TREE, HEAD: HEAD_TREE}
         fake.tree_entries = {
-            BASE_TREE: [{"path": path, "mode": "100644", "type": "blob", "sha": "1" * 40}],
-            HEAD_TREE: [{"path": path, "mode": "100644", "type": "blob", "sha": "2" * 40}],
+            BASE_TREE: [{"path": path, "mode": "100644", "type": "blob", "sha": "1" * 40, "size": 20}],
+            HEAD_TREE: [{"path": path, "mode": "100644", "type": "blob", "sha": "2" * 40, "size": 20}],
         }
         fake.pr["comments"] = [lf_comment(), {
             "author": {"login": "chisanan232"}, "body": review or controlled_review(fake),
@@ -595,6 +605,124 @@ class LocalFirst(unittest.TestCase):
         verdict, reasons, facts = self.controlled_evaluate(fake, **kw)
         self.assertEqual(verdict, "REFUSE", reasons)
         self.assertTrue(any(reason.startswith(code) for reason in reasons), reasons)
+
+    def package_fake(self, old, new, *, path="package.json", modes=("100644", "100644"),
+                     status="modified", review=None):
+        fake = self.controlled_fake(files=[{"path": path}], api_files=[{"filename": path, "status": status}])
+        old_bytes = old.encode("utf-8") if isinstance(old, str) else old
+        new_bytes = new.encode("utf-8") if isinstance(new, str) else new
+        def oid(data):
+            return hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+        old_oid, new_oid = oid(old_bytes), oid(new_bytes)
+        fake.tree_entries[BASE_TREE] = [{"path": path, "mode": modes[0], "type": "blob", "sha": old_oid, "size": len(old_bytes)}]
+        fake.tree_entries[HEAD_TREE] = [{"path": path, "mode": modes[1], "type": "blob", "sha": new_oid, "size": len(new_bytes)}]
+        fake.git_blobs = {old_oid: old_bytes, new_oid: new_bytes}
+        fake.pr["comments"][-1]["body"] = review or controlled_review(fake)
+        return fake
+
+    def package_config(self, path="package.json"):
+        entry = dict(CONTROLLED_LF_CONFIG["repos"]["Chisanan232/r"], pinned_paths=[path],
+                     controlled_package_scripts={path: ["test"]})
+        return {"schema": 1, "repos": {"Chisanan232/r": entry}}
+
+    def test_controlled_package_test_script_change_passes_after_bounded_immutable_blob_reads(self):
+        old = '{"name":"fixture","scripts":{"test":"python3 -m unittest"},"version":"1.0"}\n'
+        new = '{"name":"fixture","scripts":{"test":"python3 -m unittest -v"},"version":"1.0"}\n'
+        fake = self.package_fake(old, new)
+        verdict, reasons, facts = self.controlled_evaluate(fake, config=self.package_config())
+        self.assertEqual((verdict, reasons), ("PASS", []))
+        self.assertEqual(facts["controlled_script_review"]["scope"], "project-scripts")
+        self.assertEqual(len([call for call in fake.calls if call[0] == "api" and "/git/blobs/" in call[1]]), 2)
+
+    def test_actual_gh_wrapped_content_terminators_and_short_final_line_are_accepted(self):
+        old = '{"scripts":{"test":"old"},"padding":"' + "x" * 40 + '"}'
+        new = '{"scripts":{"test":"new"},"padding":"' + "x" * 40 + '"}'
+        fake = self.package_fake(old, new)
+        verdict, reasons, _ = self.controlled_evaluate(fake, config=self.package_config())
+        self.assertEqual((verdict, reasons), ("PASS", []))
+        content_calls = [call for call in fake.calls if call[0] == "api" and "/git/blobs/" in call[1] and call[-1] == ".content"]
+        for call in content_calls:
+            raw = fake.git_blobs[call[1].rsplit("/", 1)[1]]
+            encoded = base64.b64encode(raw)
+            self.assertEqual(len(encoded) % 60, 48)
+            self.assertTrue(fake("api", call[1], "--jq", ".content").endswith("\n\n"))
+
+    def test_controlled_package_manifest_rejects_changes_outside_test_value(self):
+        base = {"name": "fixture", "scripts": {"test": "python3 -m unittest", "build": "make"}, "version": "1.0"}
+        cases = [
+            dict(base, version="2.0"),
+            {"name": "fixture", "scripts": {"test": "python3 -m unittest -v"}},
+            {"name": "fixture", "scripts": {"test": "python3 -m unittest -v", "pretest": "echo hook", "build": "make"}, "version": "1.0"},
+            {"name": "fixture", "scripts": {"test": "python3 -m unittest -v", "build": "make"}, "dependencies": {"x": "1"}, "version": "1.0"},
+            {"name": "fixture", "scripts": {"test": "python3 -m unittest -v", "build": "make"}, "engines": {"node": ">=22"}, "version": "1.0"},
+        ]
+        original = json.dumps(base, separators=(",", ":"))
+        for changed in cases:
+            with self.subTest(changed=changed):
+                fake = self.package_fake(original, json.dumps(changed, separators=(",", ":")))
+                self.controlled_refused(fake, "LOCAL_FIRST_SCOPE", config=self.package_config())
+
+    def test_controlled_package_manifest_rejects_duplicate_nonstandard_numeric_and_invalid_utf8(self):
+        bad_pairs = [
+            ('{"scripts":{"test":"old","test":"new"}}', '{"scripts":{"test":"new"}}'),
+            ('{"n":1,"scripts":{"test":"old"}}', '{"n":1.0,"scripts":{"test":"new"}}'),
+            ('{"n":0,"scripts":{"test":"old"}}', '{"n":-0,"scripts":{"test":"new"}}'),
+            ('{"n":0.0,"scripts":{"test":"old"}}', '{"n":-0.0,"scripts":{"test":"new"}}'),
+            ('{"n":1.00000000000000001,"scripts":{"test":"old"}}',
+             '{"n":1.00000000000000002,"scripts":{"test":"new"}}'),
+            ('{"n":1,"scripts":{"test":"old"}}', '{"n":1e400,"scripts":{"test":"new"}}'),
+            ('{"scripts":{"test":"old"}}', '{"scripts":{"test":"new"},"x":NaN}'),
+            ('{"scripts":{"test":"old"}}', b'{"scripts":{"test":"new"},"x":"ok"}\xff'),
+        ]
+        for old, new in bad_pairs:
+            with self.subTest(new=new):
+                fake = self.package_fake(old, new)
+                self.controlled_refused(fake, "LOCAL_FIRST_SCOPE", config=self.package_config())
+
+    def test_controlled_package_manifest_rejects_path_mode_status_and_blob_identity_bypass(self):
+        old = '{"scripts":{"test":"old"}}'
+        new = '{"scripts":{"test":"new"}}'
+        for path, modes, status in (("pkg/package.json", ("100644", "100755"), "modified"),
+                                    ("package.json", ("100644", "100644"), "renamed")):
+            fake = self.package_fake(old, new, path=path, modes=modes, status=status)
+            self.controlled_refused(fake, "LOCAL_FIRST_SCOPE", config=self.package_config(path))
+        fake = self.package_fake(old, new)
+        fake.git_blobs[next(iter(fake.git_blobs))] = b"different bytes"
+        self.controlled_refused(fake, "LOCAL_FIRST_SCOPE", config=self.package_config())
+
+    def test_controlled_package_path_schema_is_exact_and_optional(self):
+        self.assertNotIn("controlled_package_scripts", omg.load_local_first(LF_CONFIG)["chisanan232/r"])
+        self.assertEqual(omg.load_local_first(self.package_config())["chisanan232/r"]["controlled_package_scripts"],
+                         {"package.json": ("test",)})
+        for path, scripts in (("**/package.json", ["test"]), ("../package.json", ["test"]),
+                              ("pkg/../package.json", ["test"]), ("pkg/package-lock.json", ["test"]),
+                              ("pkg/package.json", ["pretest"]), ("pkg/package.json", ["test", "build"])):
+            entry = dict(CONTROLLED_LF_CONFIG["repos"]["Chisanan232/r"], controlled_package_scripts={path: scripts})
+            with self.subTest(path=path, scripts=scripts), self.assertRaises(ValueError):
+                omg.load_local_first({"schema": 1, "repos": {"Chisanan232/r": entry}})
+
+    def test_controlled_package_manifest_requires_a_current_extended_review(self):
+        fake = self.package_fake('{"scripts":{"test":"old"}}', '{"scripts":{"test":"new"}}', review=REVIEW)
+        self.controlled_refused(fake, "CONTROLLED_REVIEW_REQUIRED", config=self.package_config())
+
+    def test_invalid_tree_manifest_sizes_refuse_before_any_blob_request(self):
+        for tree_id in (BASE_TREE, HEAD_TREE):
+            for size in ("unknown", True, -1, omg.POLICY_MAX_BYTES + 1, None):
+                with self.subTest(tree_id=tree_id, size=size):
+                    fake = self.package_fake('{"scripts":{"test":"old"}}', '{"scripts":{"test":"new"}}')
+                    entry = fake.tree_entries[tree_id][0]
+                    if size is None:
+                        del entry["size"]
+                    else:
+                        entry["size"] = size
+                    self.controlled_refused(fake, "LOCAL_FIRST_SCOPE", config=self.package_config())
+                    self.assertFalse(any(call[0] == "api" and "/git/blobs/" in call[1] for call in fake.calls))
+
+    def test_malformed_wrapped_base64_refuses(self):
+        fake = self.package_fake('{"scripts":{"test":"old"}}', '{"scripts":{"test":"new"}}')
+        head_blob = fake.tree_entries[HEAD_TREE][0]["sha"]
+        fake.blob_content_override = {head_blob: "not*base64"}
+        self.controlled_refused(fake, "LOCAL_FIRST_SCOPE", config=self.package_config())
 
     def test_controlled_script_change_passes_only_with_extended_current_review(self):
         fake = self.controlled_fake()
