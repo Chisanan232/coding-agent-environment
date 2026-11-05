@@ -162,6 +162,11 @@ independent review. Skipping a hosted check that would have failed: only owner-l
 - The clean-tree test sees tracked and untracked files but not git-ignored ones (a venv, a cache, a build directory), which can still
   influence a check. Checks run with a scrubbed environment (`PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR`,
   `TERM`, `TZ` plus the owner's `env`); the kept names are printed by the recorder, and the owner's `env` map is written into the record.
+- The recorder adds the hosted-equivalent context itself, never from the caller's environment: `PULL_BRANCH` and `PR_TITLE` from `gh pr view`
+  (which must report the worktree HEAD), `GIT_BASE` (the merge base) and a repo-local `CARGO_TARGET_DIR` (`<worktree>/target`, which must be
+  git-ignored), because the detached worktree has no branch and the host's cargo `build.target-dir` is shared across worktrees. The record
+  carries the first three as `context`; a changed PR title or branch, or a record without `context`, is `LOCAL_CI_CONTEXT_MISMATCH` or
+  `LOCAL_CI_MALFORMED` and the checks must be rerun.
 - A macOS local run does not cover hosted windows or ubuntu legs (`not_covered` makes that visible).
 - A malformed or untrusted default trust file makes every `--ci-exception` run exit 3 (ERROR/DENY), including for repositories that do not
   use this basis. This is fail-closed by design; fix or remove the file.

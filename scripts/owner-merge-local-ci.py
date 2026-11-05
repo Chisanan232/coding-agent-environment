@@ -9,8 +9,11 @@ which this script only reads) in the worktree, with no shell, and prints exactly
 The worktree must be clean before and after the run, so the record describes the committed head (tracked and untracked files; git-ignored files are not seen). A failing command
 is still recorded (exit_code non-zero) and the script exits 1; the gate denies on any recorded failure. Full logs stay on this machine
 (mode 0600, ~/.claude/owner-merge-evidence/); only their SHA-256 digests are recorded. It never posts, merges or writes the trust file.
-Checks run with a scrubbed environment (ENV_KEEP plus the owner's `env`); the owner's `env` map is part of the record (the gate compares it
-with the trust file) and all kept names are printed to stderr. The clean-tree test uses `--untracked-files=all`, which does not see git-ignored files: ignored content (a venv, a cache, a
+Checks run with a scrubbed environment (ENV_KEEP plus the owner's `env`) and a fixed hosted-equivalent context the recorder derives itself, never from
+the caller's environment: PULL_BRANCH and PR_TITLE (read from the PR with `gh pr view`, which must report the worktree HEAD), GIT_BASE (the merge base) and
+CARGO_TARGET_DIR (<worktree>/target, so a host-wide cargo `build.target-dir` is not used). The detached worktree and the host's shared target dir would
+otherwise make a check differ from hosted CI. The owner's `env` map and the three PR-derived values ("context") are part of the record (the gate compares
+them with the trust file and the PR) and all kept names are printed to stderr. The clean-tree test uses `--untracked-files=all`, which does not see git-ignored files: ignored content (a venv, a cache, a
 build directory) can still influence a check and is not covered by the record.
 """
 import argparse
@@ -24,6 +27,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 
 _spec = importlib.util.spec_from_file_location("owner_merge_gate", pathlib.Path(__file__).resolve().with_name("owner-merge-gate.py"))
 gate = importlib.util.module_from_spec(_spec)
@@ -66,8 +70,23 @@ def load_entry(repo, path=None, root=None):
     return cfg[repo.lower()]
 
 
-def check_env(extra):
-    return {**{k: os.environ[k] for k in ENV_KEEP if k in os.environ}, **extra}
+def check_env(extra, context=None):
+    return {**{k: os.environ[k] for k in ENV_KEEP if k in os.environ}, **extra, **(context or {})}
+
+
+def pr_context(repo, pr, head):
+    """PULL_BRANCH and PR_TITLE from the PR itself; raises ValueError unless gh answers, the PR head is `head` and both fields are well formed."""
+    try:
+        info = json.loads(gate.gh("pr", "view", str(pr), "--repo", repo, "--json", "headRefName,headRefOid,title"))
+    except (RuntimeError, OSError, subprocess.SubprocessError, ValueError) as e:
+        raise ValueError(f"cannot read the PR from gh: {type(e).__name__}") from None
+    ref, title = (info.get("headRefName"), info.get("title")) if isinstance(info, dict) else (None, None)
+    if not isinstance(ref, str) or not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", ref) \
+            or not isinstance(title, str) or not 1 <= len(title) <= 500 or any(unicodedata.category(c) == "Cc" for c in title):
+        raise ValueError("the PR head ref or title reported by gh is malformed")
+    if info.get("headRefOid") != head:
+        raise ValueError("the PR head on GitHub is not the worktree HEAD; push or check out the PR head first")
+    return {"PULL_BRANCH": ref, "PR_TITLE": title}
 
 
 def log_path(logs, name, head, tag):
@@ -125,12 +144,12 @@ def prepare_codex_dir(logs):
         os.close(root_fd)
 
 
-def run_check(worktree, name, argv, logs, head, tag, env=None):
+def run_check(worktree, name, argv, logs, head, tag, env=None, context=None):
     """Run one argv without a shell; the combined output goes to a private log and only its digest is returned."""
     started = time.time()
     path = log_path(logs, name, head, tag)
     try:
-        r = subprocess.run(list(argv), cwd=worktree, capture_output=True, timeout=COMMAND_TIMEOUT, stdin=subprocess.DEVNULL, env=check_env(env or {}))
+        r = subprocess.run(list(argv), cwd=worktree, capture_output=True, timeout=COMMAND_TIMEOUT, stdin=subprocess.DEVNULL, env=check_env(env or {}, context))
         code, data = r.returncode, r.stdout + r.stderr
     except subprocess.TimeoutExpired as e:
         code, data = 124, (e.stdout or b"") + (e.stderr or b"")
@@ -173,6 +192,11 @@ def record(repo, pr, base, worktree, entry, logs, expect_head=None, evidence_hos
         base_sha = git(worktree, "merge-base", f"origin/{base}", "HEAD")
     except RuntimeError as e:
         return refuse(str(e))
+    try:
+        context = {**pr_context(repo, pr, head), "GIT_BASE": base_sha}
+    except ValueError as e:
+        return refuse(str(e))
+    check_context = {**context, "CARGO_TARGET_DIR": os.path.join(os.path.realpath(worktree), "target")}
     tag = f"{repo.replace('/', '__')}-{pr}"
     try:
         if evidence_host == "claude":
@@ -185,10 +209,10 @@ def record(repo, pr, base, worktree, entry, logs, expect_head=None, evidence_hos
                 open_log(path).close()
     except (OSError, RuntimeError) as e:
         return refuse(str(e))
-    print("owner-merge-local-ci: check environment: " + ",".join(sorted(check_env(entry.get("env") or {}))), file=sys.stderr)
+    print("owner-merge-local-ci: check environment: " + ",".join(sorted(check_env(entry.get("env") or {}, check_context))), file=sys.stderr)
     commands = []
     for name, argv in entry["checks"]:
-        result, path = run_check(worktree, name, argv, logs, head, tag, entry.get("env"))
+        result, path = run_check(worktree, name, argv, logs, head, tag, entry.get("env"), check_context)
         commands.append(result)
         print(f"owner-merge-local-ci: {name} exit {result['exit_code']} log {path}", file=sys.stderr)
     failed = any(c["exit_code"] != 0 for c in commands)
@@ -201,7 +225,7 @@ def record(repo, pr, base, worktree, entry, logs, expect_head=None, evidence_hos
     if moved:   # a failing record is still printed (the gate denies on it); a pass is never produced from a changed tree
         print("owner-merge-local-ci: the checks also changed the worktree; printing the failing record only", file=sys.stderr)
     out = {"schema": 1, "repo": repo, "pr": int(pr), "base": base, "base_sha": base_sha, "head": head,
-           "env": dict(entry.get("env") or {}), "commands": commands}
+           "env": dict(entry.get("env") or {}), "context": context, "commands": commands}
     print("OWNER-MERGE-LOCAL-CI " + json.dumps(out, separators=(",", ":")))
     return 0 if all(c["exit_code"] == 0 for c in commands) else 1
 

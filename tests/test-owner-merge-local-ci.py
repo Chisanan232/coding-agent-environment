@@ -62,6 +62,17 @@ class Recorder(unittest.TestCase):
         git(self.wt, "commit", "-q", "-m", "change")
         self.head = git(self.wt, "rev-parse", "HEAD")
         self.marker = os.path.join(base, "marker")
+        self.pr_info = {"headRefName": "feat/x", "headRefOid": self.head, "title": "feat: x"}
+        self.gh_calls = []
+        patcher = mock.patch.object(rec.gate, "gh", self.fake_gh)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fake_gh(self, *args):
+        self.gh_calls.append(args)
+        if isinstance(self.pr_info, Exception):
+            raise self.pr_info
+        return json.dumps(self.pr_info)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -290,6 +301,7 @@ class Recorder(unittest.TestCase):
         pathlib.Path(sub, "f.txt").write_text("x")
         git(self.wt, "add", "sub/f.txt")
         git(self.wt, "commit", "-q", "-m", "sub")
+        self.pr_info["headRefOid"] = git(self.wt, "rev-parse", "HEAD")
         code, out, err = self.record(py("pass"))
         self.assertEqual(code, 0)
         out, err = io.StringIO(), io.StringIO()
@@ -327,6 +339,58 @@ class Recorder(unittest.TestCase):
         os.chmod(path, 0o600)
         with self.assertRaises(ValueError):
             rec.load_entry(REPO, path, cfg)
+
+    def log_text(self):
+        return pathlib.Path(self.logs, os.listdir(self.logs)[0]).read_text()
+
+    def test_checks_get_the_hosted_context_and_the_record_carries_it(self):
+        dump = py("import os; print(*(os.environ.get(k, '<unset>') for k in ('PULL_BRANCH', 'PR_TITLE', 'GIT_BASE', 'CARGO_TARGET_DIR')), sep='\\n')")
+        code, out, err = self.record(dump)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.log_text().split("\n")[:4], ["feat/x", "feat: x", self.base_sha, os.path.join(self.wt, "target")])
+        parsed = json.loads(out.split(" ", 1)[1])
+        self.assertEqual(parsed["context"], {"PULL_BRANCH": "feat/x", "PR_TITLE": "feat: x", "GIT_BASE": self.base_sha})
+        omg.parse_local_record(parsed)
+        self.assertEqual(self.gh_calls, [("pr", "view", "7", "--repo", REPO, "--json", "headRefName,headRefOid,title")])
+        self.assertIn("CARGO_TARGET_DIR", err)
+        self.assertNotIn("feat: x", err)   # names only
+
+    def test_ambient_context_variables_are_not_forwarded(self):
+        dump = py("import os; print(*(os.environ.get(k, '<unset>') for k in ('PULL_BRANCH', 'PR_TITLE', 'GIT_BASE', 'CARGO_TARGET_DIR')), sep='\\n')")
+        ambient = {"PULL_BRANCH": "evil", "PR_TITLE": "evil", "GIT_BASE": "evil", "CARGO_TARGET_DIR": "/evil"}
+        with mock.patch.dict(os.environ, ambient):
+            self.assertEqual(self.record(dump)[0], 0)
+        text = self.log_text()
+        self.assertNotIn("evil", text)
+        self.assertIn("feat/x", text)
+
+    def test_a_pr_head_other_than_the_worktree_head_refuses(self):
+        self.pr_info = dict(self.pr_info, headRefOid="c" * 40)
+        code, out, err = self.record(py(f"open({self.marker!r}, 'w')"))
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("not the worktree HEAD", err)
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_a_gh_failure_refuses_before_any_check(self):
+        self.pr_info = RuntimeError("gh pr view failed: boom")
+        code, out, err = self.record(py(f"open({self.marker!r}, 'w')"))
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("cannot read the PR", err)
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_malformed_pr_fields_refuse(self):
+        good = dict(self.pr_info)
+        for label, bad in (("ref space", {"headRefName": "a b"}), ("ref empty", {"headRefName": ""}), ("ref long", {"headRefName": "a" * 201}),
+                           ("ref type", {"headRefName": 5}), ("title empty", {"title": ""}), ("title long", {"title": "t" * 501}),
+                           ("title newline", {"title": "a\nb"}), ("title control", {"title": "a\x1bb"}), ("title type", {"title": None}),
+                           ("missing ref", {"headRefName": None})):
+            with self.subTest(label):
+                self.pr_info = dict(good, **bad)
+                code, out, _ = self.record(py(f"open({self.marker!r}, 'w')"))
+                self.assertEqual((code, out), (2, ""))
+                self.assertFalse(os.path.exists(self.marker))
+        self.pr_info = ["not", "a", "dict"]
+        self.assertEqual(self.record(py("pass"))[0], 2)
 
 
 if __name__ == "__main__":
