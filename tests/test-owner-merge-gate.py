@@ -5,6 +5,7 @@ Live behavior (the host classifier, a real merge) is covered by the acceptance r
 the ticket, not here.
 """
 import calendar
+import hashlib
 import importlib.util
 import json
 import pathlib
@@ -19,6 +20,8 @@ HEAD = "a" * 40
 SRC = [{"path": "src/a.py"}]
 OWNERS = ["Chisanan232", "horonomy", "ai-agent-assembly"]
 BASE_SHA = "b" * 40
+BASE_TREE = "c" * 40
+HEAD_TREE = "d" * 40
 NOW = 1_800_000_000
 REVIEW = f"OWNER-MERGE-REVIEW head={HEAD} verdict=PASS blocking=0 reviewer=independent-agent-1"
 
@@ -32,6 +35,7 @@ class Fake:
 
     def __init__(self, **over):
         self.pr = {"number": 7, "state": "OPEN", "isDraft": False, "title": "feat: x", "baseRefName": "main", "headRefName": "feat/x", "headRefOid": HEAD,
+                   "baseRefOid": BASE_SHA,
                    "author": {"login": "chisanan232"}, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
                    "reviewDecision": "", "reviews": [], "isCrossRepository": False, "mergeCommit": None,
                    "comments": [{"author": {"login": "chisanan232"}, "body": REVIEW}],
@@ -41,6 +45,14 @@ class Fake:
         self.behind, self.threads, self.me, self.more_threads = 0, [], "chisanan232", False
         self.parents, self.cmp, self.org_role = [HEAD, "b" * 40], "ahead", "admin active"
         self.merge_base, self.message, self.runs = BASE_SHA, "chore: change [skip actions]", 0
+        self.pr_reads = 0
+        self.calls = []
+        self.tree_commits = {BASE_SHA: BASE_TREE, HEAD: HEAD_TREE}
+        self.tree_entries = {
+            BASE_TREE: [{"path": "src/a.py", "mode": "100644", "type": "blob", "sha": "1" * 40}],
+            HEAD_TREE: [{"path": "src/a.py", "mode": "100644", "type": "blob", "sha": "1" * 40}],
+        }
+        self.truncated_trees = set()
         for k, v in over.items():
             target = self.repo if k in self.repo else self.pr if k in self.pr else None
             if target is None:
@@ -49,12 +61,17 @@ class Fake:
                 target[k] = v
 
     def __call__(self, *a):
+        self.calls.append(a)
         if a[:2] == ("repo", "view"):
             return json.dumps(self.repo)
         if a[:2] == ("api", "user"):
             return self.me + "\n"
         if a[:2] == ("pr", "view"):
-            return json.dumps(self.pr)
+            self.pr_reads += 1
+            pr_view = dict(self.pr)
+            if self.pr_reads > 1 and getattr(self, "pr_after_first_view", None):
+                pr_view.update(self.pr_after_first_view)
+            return json.dumps(pr_view)
         if a[0] == "api" and a[1].endswith("/files?per_page=100"):
             listed = getattr(self, "api_files", None)
             if listed is None:
@@ -63,6 +80,16 @@ class Fake:
         if a[0] == "api" and "/actions/runs?head_sha=" in a[1]:
             self.runs_reads = getattr(self, "runs_reads", []) + [a[1]]
             return f"{self.runs}\n"
+        if a[0] == "api" and "/git/commits/" in a[1]:
+            sha = a[1].rsplit("/", 1)[1]
+            if sha not in self.tree_commits:
+                raise AssertionError(a)
+            return self.tree_commits[sha] + "\n"
+        if a[0] == "api" and "/git/trees/" in a[1]:
+            tree = a[1].split("/git/trees/", 1)[1].split("?", 1)[0]
+            if tree not in self.tree_entries:
+                raise AssertionError(a)
+            return json.dumps({"truncated": tree in self.truncated_trees, "tree": self.tree_entries[tree]})
         if a[0] == "api" and "/compare/" in a[1] and "merge_base_commit" in a[3]:
             return self.merge_base + "\n"
         if a[0] == "api" and "/commits/" in a[1] and ".commit.message" in a[3]:
@@ -113,6 +140,28 @@ class Gate(unittest.TestCase):
         self.assertIn(f"--match-head-commit {HEAD}", cmd)
         self.assertNotIn("--admin", cmd)
         self.assertNotIn("--squash", cmd)
+
+    def test_evidence_line_can_emit_only_the_closed_controlled_review_extension(self):
+        line = omg.evidence_line(HEAD, "independent-agent-1", base_sha=BASE_SHA,
+                                 recipe_sha256="c" * 64, scope="project-scripts",
+                                 authorization="standing-project-work")
+        self.assertEqual(line, f"OWNER-MERGE-REVIEW head={HEAD} verdict=PASS blocking=0 reviewer=independent-agent-1 "
+                         f"base_sha={BASE_SHA} recipe_sha256={'c' * 64} scope=project-scripts authorization=standing-project-work")
+        for args in ({"base_sha": BASE_SHA}, {"base_sha": "x" * 40, "recipe_sha256": "c" * 64,
+                     "scope": "project-scripts", "authorization": "standing-project-work"},
+                     {"base_sha": BASE_SHA, "recipe_sha256": "c" * 64, "scope": "any", "authorization": "standing-project-work"},
+                     {"base_sha": BASE_SHA, "recipe_sha256": "c" * 64, "scope": "project-scripts", "authorization": "per-pr"}):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                omg.evidence_line(HEAD, "independent-agent-1", **args)
+
+    def test_controlled_inventory_uses_only_allowlisted_read_endpoints(self):
+        for path in (f"repos/Chisanan232/r/git/commits/{HEAD}",
+                     f"repos/Chisanan232/r/git/trees/{HEAD_TREE}?recursive=1"):
+            omg.read_only(("api", path, "--jq", "."))
+        for path in (f"repos/Chisanan232/r/git/trees/{HEAD_TREE}?recursive=0",
+                     "repos/Chisanan232/r/git/trees/not-a-sha?recursive=1"):
+            with self.subTest(path=path), self.assertRaises(RuntimeError):
+                omg.read_only(("api", path, "--jq", "."))
 
     def test_failed_required_ci_refuses(self):
         self.refused(Fake(statusCheckRollup=[{"name": "t", "status": "COMPLETED", "conclusion": "FAILURE"}]), "CI_FAILED")
@@ -458,6 +507,26 @@ class VersionBranches(unittest.TestCase):
 LF_CONFIG = {"schema": 1, "repos": {"Chisanan232/r": {
     "checks": [{"name": "suite", "argv": ["python3", "-m", "pytest"]}, {"name": "lint", "argv": ["ruff", "check", "."]}],
     "max_age_hours": 24, "pinned_paths": ["scripts/ci/*"], "not_covered": ["windows and ubuntu matrix legs"]}}}
+CONTROLLED_LF_CONFIG = {"schema": 1, "repos": {"Chisanan232/r": {
+    "checks": LF_CONFIG["repos"]["Chisanan232/r"]["checks"], "max_age_hours": 24,
+    "pinned_paths": ["scripts/*"], "controlled_script_paths": ["scripts/*"],
+    "not_covered": ["windows and ubuntu matrix legs"]}}}
+
+
+def controlled_recipe_sha(config=CONTROLLED_LF_CONFIG):
+    entry = omg.load_local_first(config)["chisanan232/r"]
+    recipe = {"checks": [{"name": name, "argv": list(argv)} for name, argv in entry["checks"]],
+              "env": dict(entry.get("env") or {})}
+    raw = json.dumps(recipe, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def controlled_review(fake, *, base_sha=BASE_SHA, recipe_sha256=None, scope="project-scripts",
+                      authorization="standing-project-work", verdict="PASS", blocking=0,
+                      reviewer="independent-agent-1"):
+    return (f"OWNER-MERGE-REVIEW head={fake.pr['headRefOid']} verdict={verdict} blocking={blocking} "
+            f"reviewer={reviewer} base_sha={base_sha} recipe_sha256={recipe_sha256 or controlled_recipe_sha()} "
+            f"scope={scope} authorization={authorization}")
 
 
 def iso(t):
@@ -501,6 +570,195 @@ class LocalFirst(unittest.TestCase):
         self.assertTrue(any(r.startswith(code) for r in reasons), reasons)
         self.assertNotIn("ci_exception", facts)
 
+    def controlled_fake(self, review=None, files=None, api_files=None, **over):
+        path = "scripts/update.py"
+        changed_files = files if files is not None else [{"path": path}]
+        fake = self.fake(lf_comment(), files=changed_files, **over)
+        fake.api_files = api_files if api_files is not None else [
+            {"filename": item["path"], "status": "modified"} for item in changed_files]
+        fake.tree_commits = {BASE_SHA: BASE_TREE, HEAD: HEAD_TREE}
+        fake.tree_entries = {
+            BASE_TREE: [{"path": path, "mode": "100644", "type": "blob", "sha": "1" * 40}],
+            HEAD_TREE: [{"path": path, "mode": "100644", "type": "blob", "sha": "2" * 40}],
+        }
+        fake.pr["comments"] = [lf_comment(), {
+            "author": {"login": "chisanan232"}, "body": review or controlled_review(fake),
+            "createdAt": iso(NOW - 30), "includesCreatedEdit": False, "isMinimized": False}]
+        return fake
+
+    def controlled_evaluate(self, fake, config=CONTROLLED_LF_CONFIG, **kw):
+        kw.setdefault("ci_exception", True)
+        return omg.evaluate(fake, "Chisanan232/r", 7, OWNERS,
+                            local_first=omg.load_local_first(config), now=NOW, **kw)
+
+    def controlled_refused(self, fake, code, **kw):
+        verdict, reasons, facts = self.controlled_evaluate(fake, **kw)
+        self.assertEqual(verdict, "REFUSE", reasons)
+        self.assertTrue(any(reason.startswith(code) for reason in reasons), reasons)
+
+    def test_controlled_script_change_passes_only_with_extended_current_review(self):
+        fake = self.controlled_fake()
+        verdict, reasons, facts = self.controlled_evaluate(fake)
+        self.assertEqual((verdict, reasons), ("PASS", []))
+        self.assertEqual(facts["ci_exception"], "local-first")
+        self.assertEqual(facts["hosted_checks"], "NOT_RUN")
+        self.assertTrue(facts["ci_verdict"].startswith("NOT_A_CI_PASS"))
+        self.assertEqual(facts["controlled_script_review"], {
+            "base_sha": BASE_SHA, "recipe_sha256": controlled_recipe_sha(),
+            "scope": "project-scripts", "authorization": "standing-project-work"})
+        self.assertIn(f"repos/Chisanan232/r/git/trees/{HEAD_TREE}?recursive=1", [a[1] for a in fake.calls if a[0] == "api"])
+
+    def test_full_hosted_ci_does_not_need_controlled_review(self):
+        fake = self.controlled_fake(review=REVIEW, statusCheckRollup=green())
+        verdict, reasons, facts = self.controlled_evaluate(fake)
+        self.assertEqual((verdict, reasons), ("PASS", []))
+        self.assertNotIn("ci_exception", facts)
+        self.assertFalse(any("/git/trees/" in a[1] for a in fake.calls if a[0] == "api"))
+
+    def test_controlled_change_rejects_missing_legacy_stale_and_invalid_review(self):
+        fake = self.controlled_fake(review=REVIEW)
+        self.controlled_refused(fake, "CONTROLLED_REVIEW_REQUIRED")
+        fake = self.controlled_fake(review=controlled_review(fake, base_sha=BASE_SHA))
+        fake.pr["headRefOid"] = "e" * 40
+        self.controlled_refused(fake, "CONTROLLED_REVIEW_STALE")
+        fake = self.controlled_fake(review=controlled_review(fake, base_sha="c" * 40))
+        self.controlled_refused(fake, "CONTROLLED_REVIEW_STALE")
+        fake = self.controlled_fake(review=controlled_review(fake, recipe_sha256="c" * 64))
+        self.controlled_refused(fake, "CONTROLLED_REVIEW_STALE")
+        fake = self.controlled_fake(review=controlled_review(fake, authorization="per-pr"))
+        self.controlled_refused(fake, "CONTROLLED_REVIEW_INVALID")
+        fake = self.controlled_fake(review=controlled_review(fake, reviewer="author"))
+        self.controlled_refused(fake, "REVIEW_NOT_INDEPENDENT")
+        fake = self.controlled_fake(review=controlled_review(fake, verdict="FAIL", blocking=1))
+        self.controlled_refused(fake, "REVIEW_NOT_CLEAN")
+
+    def test_controlled_change_rejects_ambiguous_review(self):
+        fake = self.controlled_fake()
+        fake.pr["comments"].append(dict(fake.pr["comments"][-1]))
+        self.controlled_refused(fake, "CONTROLLED_REVIEW_AMBIGUOUS")
+
+    def test_controlled_review_refresh_preserves_clean_history(self):
+        for old in (REVIEW, controlled_review(Fake(), base_sha="c" * 40),
+                    controlled_review(Fake(), recipe_sha256="c" * 64)):
+            with self.subTest(old=old):
+                fake = self.controlled_fake()
+                fake.pr["comments"].insert(0, {"author": {"login": "chisanan232"}, "body": old})
+                verdict, reasons, _ = self.controlled_evaluate(fake)
+                self.assertEqual((verdict, reasons), ("PASS", []))
+
+    def test_controlled_review_refresh_keeps_applicable_failures_blocking(self):
+        fake = self.controlled_fake()
+        records = (REVIEW.replace("verdict=PASS blocking=0", "verdict=FAIL blocking=1"),
+                   controlled_review(fake, verdict="FAIL", blocking=1),
+                   controlled_review(fake, blocking=1))
+        for old in records:
+            with self.subTest(old=old):
+                fake = self.controlled_fake()
+                fake.pr["comments"].insert(0, {"author": {"login": "chisanan232"}, "body": old})
+                self.controlled_refused(fake, "REVIEW_NOT_CLEAN")
+
+    def test_controlled_inventory_malformed_paths_return_structured_refusal(self):
+        for bad in ({"path": None}, {"path": 42}, {"path": ""}, {}):
+            with self.subTest(view=bad):
+                fake = self.controlled_fake(files=[bad, {"path": "scripts/update.py"}], api_files=[
+                    {"filename": "scripts/unknown.py", "status": "modified"},
+                    {"filename": "scripts/update.py", "status": "modified"}])
+                self.controlled_refused(fake, "LOCAL_FIRST_SCOPE")
+        for bad in (None, 42, {}, {"filename": None}, {"filename": 42}, {"filename": ""}):
+            with self.subTest(rest=bad):
+                self.controlled_refused(self.controlled_fake(api_files=[bad]), "LOCAL_FIRST_SCOPE")
+
+    def test_controlled_snapshot_is_rechecked_after_late_api_work(self):
+        for phase in ("/actions/runs?", "/commits/"):
+            for change in ({"baseRefOid": "e" * 40}, {"headRefOid": "e" * 40},
+                           {"baseRefName": "other"}):
+                with self.subTest(phase=phase, change=change):
+                    fake = self.controlled_fake()
+                    def late_change(*args):
+                        result = fake(*args)
+                        if args[0] == "api" and phase in args[1]:
+                            fake.pr_after_first_view = change
+                        return result
+                    verdict, reasons, facts = omg.evaluate(late_change, "Chisanan232/r", 7, OWNERS,
+                        local_first=omg.load_local_first(CONTROLLED_LF_CONFIG), ci_exception=True, now=NOW)
+                    self.assertEqual(verdict, "REFUSE", reasons)
+                    self.assertTrue(any(r.startswith("CONTROLLED_SCOPE_CHANGED") for r in reasons), reasons)
+                    self.assertNotIn("ci_exception", facts)
+
+    def test_controlled_inventory_and_record_share_immutable_merge_base(self):
+        fake = self.controlled_fake()
+        verdict, reasons, _ = self.controlled_evaluate(fake)
+        self.assertEqual((verdict, reasons), ("PASS", []))
+        comparisons = [a for a in fake.calls if a[0] == "api" and "/compare/" in a[1]
+                       and "merge_base_commit" in a[3]]
+        self.assertEqual([a[1] for a in comparisons], [f"repos/Chisanan232/r/compare/{BASE_SHA}...{HEAD}"])
+
+    def test_controlled_script_links_cannot_select_unreviewed_execution_bytes(self):
+        for old_mode in (None, "100644", "120000"):
+            with self.subTest(old_mode=old_mode):
+                fake = self.controlled_fake()
+                if old_mode is None:
+                    fake.tree_entries[BASE_TREE] = []
+                    fake.api_files[0]["status"] = "added"
+                else:
+                    fake.tree_entries[BASE_TREE][0]["mode"] = old_mode
+                fake.tree_entries[HEAD_TREE][0]["mode"] = "120000"
+                verdict, reasons, facts = self.controlled_evaluate(fake)
+                self.assertEqual(verdict, "REFUSE", reasons)
+                self.assertTrue(any(r.startswith("LOCAL_FIRST_SCOPE") for r in reasons), reasons)
+                self.assertNotIn("ci_exception", facts)
+
+    def test_controlled_script_regular_modes_and_link_removal_remain_supported(self):
+        for mode in ("100644", "100755"):
+            with self.subTest(mode=mode):
+                fake = self.controlled_fake()
+                fake.tree_entries[BASE_TREE][0]["mode"] = "120000"
+                fake.tree_entries[HEAD_TREE][0]["mode"] = mode
+                verdict, reasons, _ = self.controlled_evaluate(fake)
+                self.assertEqual((verdict, reasons), ("PASS", []))
+        fake = self.controlled_fake()
+        fake.tree_entries[BASE_TREE][0]["mode"] = "120000"
+        fake.tree_entries[HEAD_TREE] = []
+        fake.api_files[0]["status"] = "removed"
+        verdict, reasons, _ = self.controlled_evaluate(fake)
+        self.assertEqual((verdict, reasons), ("PASS", []))
+
+    def test_controlled_change_rejects_base_or_head_changed_during_evaluation(self):
+        fake = self.controlled_fake()
+        fake.pr_after_first_view = {"baseRefOid": "c" * 40}
+        self.controlled_refused(fake, "CONTROLLED_SCOPE_CHANGED")
+        fake = self.controlled_fake()
+        fake.pr_after_first_view = {"headRefOid": "c" * 40}
+        self.controlled_refused(fake, "CONTROLLED_SCOPE_CHANGED")
+
+    def test_every_changed_pin_requires_controlled_opt_in_and_workflow_never_opts_in(self):
+        config = {"schema": 1, "repos": {"Chisanan232/r": dict(CONTROLLED_LF_CONFIG["repos"]["Chisanan232/r"],
+            controlled_script_paths=["scripts/allowed/*"])}}
+        fake = self.controlled_fake()
+        self.controlled_refused(fake, "LOCAL_FIRST_SCOPE", config=config)
+        fake = self.controlled_fake(files=[{"path": ".github/workflows/ci.yml"}])
+        self.controlled_refused(fake, "LOCAL_FIRST_SCOPE")
+        fake = self.controlled_fake(files=[{"path": "scripts/allowed/a.py"}, {"path": "scripts/update.py"}],
+                                    api_files=[{"filename": "scripts/allowed/a.py", "status": "modified"},
+                                               {"filename": "scripts/update.py", "status": "modified"}])
+        self.controlled_refused(fake, "LOCAL_FIRST_SCOPE", config=config)
+        self.controlled_refused(self.controlled_fake(isCrossRepository=True), "LOCAL_FIRST_SCOPE")
+
+    def test_controlled_change_requires_complete_matching_tree_and_file_inventory(self):
+        fake = self.controlled_fake()
+        fake.truncated_trees.add(HEAD_TREE)
+        self.controlled_refused(fake, "LOCAL_FIRST_SCOPE")
+        fake = self.controlled_fake()
+        fake.tree_entries[HEAD_TREE] = []
+        self.controlled_refused(fake, "LOCAL_FIRST_SCOPE")
+        fake = self.controlled_fake()
+        fake.api_files = [{"filename": "scripts/other.py", "status": "modified"}]
+        self.controlled_refused(fake, "LOCAL_FIRST_SCOPE")
+
+    def test_controlled_review_cannot_override_a_failed_ci_check(self):
+        self.controlled_refused(self.controlled_fake(statusCheckRollup=[{
+            "name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"}]), "CI_FAILED")
+
     def test_matching_record_passes_and_is_never_reported_as_a_ci_pass(self):
         fake = self.fake()
         v, reasons, facts = self.evaluate(fake)
@@ -510,6 +768,16 @@ class LocalFirst(unittest.TestCase):
         self.assertEqual(facts["not_covered"], ["windows and ubuntu matrix legs"])
         self.assertRegex(facts["local_ci_digest"], r"^[0-9a-f]{64}$")
         self.assertEqual(len(fake.runs_reads), 1)
+
+    def test_controlled_script_path_schema_is_optional_and_closed(self):
+        legacy = omg.load_local_first(LF_CONFIG)["chisanan232/r"]
+        self.assertNotIn("controlled_script_paths", legacy)
+        controlled = omg.load_local_first(CONTROLLED_LF_CONFIG)["chisanan232/r"]
+        self.assertEqual(controlled["controlled_script_paths"], ("scripts/*",))
+        for bad in ("../scripts/*", ".github/workflows/*", "/scripts/*", "scripts/../*", "src/*"):
+            entry = dict(CONTROLLED_LF_CONFIG["repos"]["Chisanan232/r"], controlled_script_paths=[bad])
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                omg.load_local_first({"schema": 1, "repos": {"Chisanan232/r": entry}})
 
     def test_the_flag_the_trust_file_and_the_repo_entry_are_all_required(self):
         self.refused(self.fake(), "NO_CI_EVIDENCE", ci_exception=False)
