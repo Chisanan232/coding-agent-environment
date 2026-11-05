@@ -289,6 +289,16 @@ Guidance, not a sequence: choose the proportionate scope and the execution metho
 - **Unavailable is not PASS, and `NOT_RUN` is an open gap, not an end state.** Record what could not run and why, then pursue another permitted execution method or the supported approval mechanism until the criterion is evidenced or a genuine human-only blocker is named: Codex unavailable (fall back as above), socket binding or another capability denied (run the unaffected cases, keep the rest `NOT_RUN` while seeking another permitted route or the supported approval, and do not bypass the denial), hosted CI unavailable (local-equivalent evidence under `docs/ENGINEERING-POLICY.md` section 8, reported `NOT_A_CI_PASS`), an interactive login required (prepare everything else and request that single action).
 - **Readiness is not authorization.** Technical readiness (`READY_FOR_RELEASE`) rests on live evidence. Release approval, tagging, publication and deployment stay with the founder.
 
+## Build, test and cleanup economy
+
+Guidance, not a gate: choose the scope and order yourself, and keep the final version's functionality and end-to-end acceptance intact.
+
+- **Scope to the change while iterating.** Build only the affected packages, binaries, required dependencies and relevant feature combinations; run affected tests and the real-user workflow first. Broaden when a shared dependency, public interface, feature unification or a release requirement justifies it. A full-workspace build or full suite after every small change is waste; before review and for release evidence it is not.
+- **Reuse only what is proven compatible.** Before reusing a build cache or earlier evidence, confirm candidate identity (commit or tree), toolchain, features, profile and configuration match. If an artifact looks stale or a rebuild keeps happening, diagnose why (changed fingerprint, env or flag drift, shared-target contention) instead of rebuilding everything again.
+- **Measure before optimizing.** Find where the time goes (compile, link, tests, executable first-start, resource admission, waiting for authentication, waiting on a queue) and fix that, not a guess.
+- **Clean up what the task owns.** After a task is integrated or abandoned, remove its clean, unused worktree and its disposable directories, build outputs, temporary services and redundant watchers, once ownership and active references are checked (per-resource removal, never a broad `git worktree prune`; see the post-merge cleanup paragraph). Keep uncommitted or unpushed work, retained evidence, active QA, shared caches still in use and artifacts a pending acceptance needs. Do not routinely `cargo clean` or delete useful shared caches to force a cold rebuild; remove only obsolete task-specific caches.
+- **Decide routine scope yourself.** Ask the founder only for unavoidable authentication, material cost, a product-scope change or acceptance of an unresolved defect.
+
 ## Resource admission and concurrency
 
 Before heavy work (workspace or full builds, Cargo workspace builds, Docker suites, native QA, full E2E, large
