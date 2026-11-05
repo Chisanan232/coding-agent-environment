@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Recorder for the local-first CI basis of owner-merge-gate.py (SPE-135).
 
-  owner-merge-local-ci.py record --repo OWNER/REPO --pr N --base BRANCH --worktree PATH [--expect-head SHA] [--config FILE]
+  owner-merge-local-ci.py record --repo OWNER/REPO --pr N --base BRANCH --worktree PATH [--evidence-host {claude,codex}] [--expect-head SHA] [--config FILE]
 
 Runs the owner-configured checks for the repository (the trust file ~/.config/coding-agent-environment/local/local-first-ci.json,
 which this script only reads) in the worktree, with no shell, and prints exactly one unfenced line for the PR comment:
@@ -20,6 +20,7 @@ import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -29,6 +30,8 @@ gate = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gate)
 
 EVIDENCE_DIR = "~/.claude/owner-merge-evidence"
+CODEX_EVIDENCE_DIR = "~/.codex/owner-merge-evidence"
+EVIDENCE_HOSTS = ("claude", "codex")
 COMMAND_TIMEOUT = 6 * 3600
 # Allowlist, not a blocklist: anything not named here (PYTHONPATH, NODE_PATH, VIRTUAL_ENV, PIP_*, LD_*, tokens ...) never reaches a check.
 ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "TZ")
@@ -93,6 +96,35 @@ def prepare_dir(logs):
     os.chmod(logs, 0o700)
 
 
+def prepare_codex_dir(logs):
+    """Require the fixed private Codex evidence location before any configured check runs."""
+    root = os.path.expanduser("~/.codex")
+    expected = os.path.join(root, "owner-merge-evidence")
+    if os.path.abspath(logs) != os.path.abspath(expected):
+        raise RuntimeError("Codex evidence path differs from the fixed host location")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_fd = os.open(root, flags)
+    try:
+        root_info = os.fstat(root_fd)
+        if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.getuid()
+                or stat.S_IMODE(root_info.st_mode) & 0o022):
+            raise RuntimeError("Codex host root must be caller-owned and not group/world writable")
+        try:
+            evidence_fd = os.open("owner-merge-evidence", flags, dir_fd=root_fd)
+        except FileNotFoundError:
+            os.mkdir("owner-merge-evidence", 0o700, dir_fd=root_fd)
+            evidence_fd = os.open("owner-merge-evidence", flags, dir_fd=root_fd)
+        try:
+            evidence_info = os.fstat(evidence_fd)
+            if (not stat.S_ISDIR(evidence_info.st_mode) or evidence_info.st_uid != os.getuid()
+                    or stat.S_IMODE(evidence_info.st_mode) != 0o700):
+                raise RuntimeError("Codex evidence directory must be caller-owned with mode 0700")
+        finally:
+            os.close(evidence_fd)
+    finally:
+        os.close(root_fd)
+
+
 def run_check(worktree, name, argv, logs, head, tag, env=None):
     """Run one argv without a shell; the combined output goes to a private log and only its digest is returned."""
     started = time.time()
@@ -110,18 +142,26 @@ def run_check(worktree, name, argv, logs, head, tag, env=None):
             "log_sha256": hashlib.sha256(data).hexdigest()}, path
 
 
-def record(repo, pr, base, worktree, entry, logs, expect_head=None):
+def record(repo, pr, base, worktree, entry, logs, expect_head=None, evidence_host="claude"):
     """Run the configured checks and print the record. Returns the process exit code: 0 all passed, 1 a check failed, 2 refused."""
     def refuse(why):
         print(f"owner-merge-local-ci: refused: {why}", file=sys.stderr)
         return 2
     if not gate.REPO_RE.fullmatch(repo) or not re.fullmatch(r"[1-9][0-9]{0,8}", str(pr)) or not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", base):
         return refuse("repo, pr or base is malformed")
+    if evidence_host not in EVIDENCE_HOSTS:
+        return refuse("evidence host is unsupported")
     if len({gate.log_slug(n) for n, _ in entry["checks"]}) != len(entry["checks"]):
         return refuse("two checks would share one log file")
     for name, argv in entry["checks"]:
         if any(SECRET_RE.search(a) for a in argv):
             return refuse(f"check {name!r} has a credential-shaped argument")
+    logs = os.path.expanduser(logs)
+    try:
+        if evidence_host == "codex":
+            prepare_codex_dir(logs)
+    except (OSError, RuntimeError) as e:
+        return refuse(str(e))
     try:
         if os.path.realpath(git(worktree, "rev-parse", "--show-toplevel")) != os.path.realpath(worktree):
             return refuse("the worktree is not the top level of its git repository")
@@ -133,10 +173,12 @@ def record(repo, pr, base, worktree, entry, logs, expect_head=None):
         base_sha = git(worktree, "merge-base", f"origin/{base}", "HEAD")
     except RuntimeError as e:
         return refuse(str(e))
-    logs = os.path.expanduser(logs)
     tag = f"{repo.replace('/', '__')}-{pr}"
     try:
-        prepare_dir(logs)
+        if evidence_host == "claude":
+            prepare_dir(logs)
+        else:
+            prepare_codex_dir(logs)
         for name, _ in entry["checks"]:   # check every log file before anything runs, so a bad one cannot be found after the work is done
             path = log_path(logs, name, head, tag)
             if os.path.lexists(path):
@@ -173,6 +215,8 @@ def main(argv=None):
     r.add_argument("--base", required=True)
     r.add_argument("--worktree", required=True)
     r.add_argument("--expect-head")
+    r.add_argument("--evidence-host", choices=EVIDENCE_HOSTS, default="claude",
+                   help="host-owned private evidence directory (default: claude)")
     r.add_argument("--config", help=f"owner trust file; must live under the owner-config directory (default {gate.LOCAL_FIRST_DEFAULT})")
     a = ap.parse_args(argv)
     if a.expect_head is not None and not re.fullmatch(r"[0-9a-f]{40}", a.expect_head):
@@ -183,7 +227,9 @@ def main(argv=None):
     except (OSError, ValueError) as e:
         print(f"owner-merge-local-ci: refused: {type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
         return 2
-    return record(a.repo, a.pr, a.base, os.path.realpath(a.worktree), entry, EVIDENCE_DIR, a.expect_head)
+    evidence_dir = EVIDENCE_DIR if a.evidence_host == "claude" else CODEX_EVIDENCE_DIR
+    return record(a.repo, a.pr, a.base, os.path.realpath(a.worktree), entry, evidence_dir,
+                  a.expect_head, evidence_host=a.evidence_host)
 
 
 if __name__ == "__main__":
