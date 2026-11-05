@@ -6,6 +6,7 @@
   owner-merge-gate.py verify --repo OWNER/REPO --pr N --head SHA
   owner-merge-gate.py queue  --repo OWNER/REPO --prs 5,6 --owners a,b      (print-only plan)
   owner-merge-gate.py evidence-line --head SHA --reviewer ID               (prints the record line)
+  (controlled script reviews also pass --base-sha, --recipe-sha256, --scope project-scripts and --authorization standing-project-work)
   owner-merge-gate.py evidence-json --repo R --pr N --head SHA --reviewer ID   (prints the JSON file the owner-merge-runner reads)
 
 `check` evaluates the exact PR head and prints one JSON verdict (PASS, REFUSE or WAIT) plus the
@@ -49,6 +50,11 @@ import sys
 import time
 
 REVIEW_RE = re.compile(r"^OWNER-MERGE-REVIEW head=([0-9a-f]{40}) verdict=(\w+) blocking=(\d+) reviewer=(\S+)\s*$", re.M)
+CONTROLLED_REVIEW_RE = re.compile(
+    r"^OWNER-MERGE-REVIEW head=([0-9a-f]{40}) verdict=(\w+) blocking=(\d+) reviewer=(\S+) "
+    r"base_sha=([0-9a-f]{40}) recipe_sha256=([0-9a-f]{64}) scope=project-scripts "
+    r"authorization=standing-project-work$")
+REVIEW_LINE_RE = re.compile(r"^OWNER-MERGE-REVIEW\b[^\r\n]*$", re.M)
 CI_RE = re.compile(r"^OWNER-MERGE-CI-UNAVAILABLE head=([0-9a-f]{40}) cause=(billing|quota|outage) local_equivalent=(\w+)\s*$", re.M)
 NOCI_RE = re.compile(r"^OWNER-MERGE-CI-EXCEPTION head=([0-9a-f]{40}) basis=no-hosted-ci local_equivalent=(\w+)\s*$", re.M)
 LOCAL_RE = re.compile(r"^OWNER-MERGE-LOCAL-CI (.*?)\s*$", re.M)
@@ -203,7 +209,7 @@ def load_local_first(obj):
     out = {}
     for repo, entry in obj["repos"].items():
         if not isinstance(repo, str) or not REPO_RE.fullmatch(repo) or not isinstance(entry, dict) \
-                or set(entry) - {"checks", "max_age_hours", "pinned_paths", "not_covered", "env"}:
+                or set(entry) - {"checks", "max_age_hours", "pinned_paths", "not_covered", "env", "controlled_script_paths"}:
             raise ValueError(f"local-first config repo {repo!r} is malformed")
         checks, names = [], set()
         if not isinstance(entry.get("checks"), list) or not entry["checks"]:
@@ -223,6 +229,11 @@ def load_local_first(obj):
             lists[key] = entry.get(key, [])
             if not isinstance(lists[key], list) or not all(isinstance(x, str) and x for x in lists[key]):
                 raise ValueError(f"local-first {key} for {repo} must be a list of non-empty strings")
+        controlled = entry.get("controlled_script_paths", [])
+        if (not isinstance(controlled, list) or not all(isinstance(x, str) and x for x in controlled)
+                or any(not x.startswith("scripts/") or x.startswith("/") or "\\" in x
+                       or any(part == ".." for part in x.split("/")) for x in controlled)):
+            raise ValueError(f"local-first controlled_script_paths for {repo} must contain only safe scripts/ globs")
         env = entry.get("env", {})
         if not isinstance(env, dict) or not all(isinstance(k, str) and ENV_KEY_RE.fullmatch(k) and not ENV_FORBIDDEN.match(k)
                                                 and isinstance(v, str) and len(v) <= 500 for k, v in env.items()):
@@ -231,11 +242,96 @@ def load_local_first(obj):
             raise ValueError(f"local-first config lists {repo} more than once (repository names are case-insensitive)")
         out[repo.lower()] = {"checks": checks, "max_age_hours": hours, "pinned_paths": tuple(lists["pinned_paths"]),
                              "not_covered": list(lists["not_covered"]), "env": dict(env)}
+        if "controlled_script_paths" in entry:
+            out[repo.lower()]["controlled_script_paths"] = tuple(controlled)
     return out
 
 
+def local_first_recipe_sha256(entry):
+    recipe = {"checks": [{"name": name, "argv": list(argv)} for name, argv in entry["checks"]],
+              "env": dict(entry.get("env") or {})}
+    raw = json.dumps(recipe, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _matches_any(path, patterns):
+    path = path.casefold()
+    return any(fnmatch.fnmatchcase(path, pattern.casefold()) for pattern in patterns)
+
+
+def _tree_blobs(run, repo, commit):
+    tree_sha = run("api", f"repos/{repo}/git/commits/{commit}", "--jq", ".tree.sha").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", tree_sha):
+        raise ValueError("commit tree identity is malformed")
+    tree = _json(run, "api", f"repos/{repo}/git/trees/{tree_sha}?recursive=1", "--jq",
+                 "{truncated,tree:[.tree[]|{path,mode,type,sha}]}")
+    if not isinstance(tree, dict) or tree.get("truncated") is not False or not isinstance(tree.get("tree"), list):
+        raise ValueError("commit tree is incomplete")
+    blobs = {}
+    for item in tree["tree"]:
+        if not isinstance(item, dict) or set(item) != {"path", "mode", "type", "sha"}:
+            raise ValueError("commit tree entry is incomplete")
+        path, mode, kind, sha = (item.get(key) for key in ("path", "mode", "type", "sha"))
+        if (not isinstance(path, str) or not path or path.startswith("/") or "\\" in path or "\x00" in path
+                or any(part in ("", ".", "..") for part in path.split("/"))
+                or not isinstance(mode, str) or not re.fullmatch(r"[0-7]{6}", mode)
+                or kind not in ("blob", "tree", "commit") or not isinstance(sha, str)
+                or not re.fullmatch(r"[0-9a-f]{40}", sha) or path in blobs):
+            raise ValueError("commit tree entry is malformed or ambiguous")
+        if kind != "tree":
+            blobs[path] = (kind, mode, sha)
+    return blobs
+
+
+def _verify_controlled_inventory(run, repo, head, files, listed, merge_base, *, controlled_pins):
+    if not re.fullmatch(r"[0-9a-f]{40}", merge_base):
+        raise ValueError("merge base is unavailable")
+    if not isinstance(files, list) or not isinstance(listed, list) or not files or len(files) >= 100 or len(listed) != len(files):
+        raise ValueError("pull request file inventory is incomplete")
+    names, statuses = {}, {}
+    for remote in listed:
+        if (not isinstance(remote, dict) or not isinstance(remote.get("filename"), str)
+                or remote["filename"] in statuses or remote.get("status") not in ("added", "modified", "removed")
+                or remote.get("previous_filename") is not None):
+            raise ValueError("pull request file inventory is malformed, renamed or ambiguous")
+        statuses[remote["filename"]] = remote["status"]
+    for file in files:
+        if not isinstance(file, dict) or not isinstance(file.get("path"), str) or file["path"] in names:
+            raise ValueError("pull request file inventory is malformed, renamed or ambiguous")
+        names[file["path"]] = True
+    if set(names) != set(statuses):
+        raise ValueError("pull request file inventory listings disagree")
+    before = _tree_blobs(run, repo, merge_base)
+    after = _tree_blobs(run, repo, head)
+    changed = {path for path in before.keys() | after.keys() if before.get(path) != after.get(path)}
+    if changed != set(names):
+        raise ValueError("pull request file inventory does not match the commit trees")
+    for path, status in statuses.items():
+        old, new = before.get(path), after.get(path)
+        if status == "added":
+            valid = old is None and new is not None
+        elif status == "removed":
+            valid = old is not None and new is None
+        else:
+            valid = old is not None and new is not None and old != new
+        if not valid or any(item is not None and item[0] != "blob" for item in (old, new)):
+            raise ValueError("pull request file status does not match its blob change")
+        if path in controlled_pins and new is not None and new[1] not in ("100644", "100755"):
+            raise ValueError("changed controlled script is not a regular source blob")
+    return names
+
+
+def _controlled_pin_candidate(files, cfg):
+    controlled = cfg.get("controlled_script_paths", ())
+    if not controlled or not isinstance(files, list):
+        return False
+    return any(isinstance(item, dict) and isinstance(item.get("path"), str)
+               and _matches_any(item["path"], cfg["pinned_paths"])
+               and _matches_any(item["path"], controlled) for item in files)
+
+
 # One entry per refusal reason so callers and tests can match on a stable code.
-PR_FIELDS = ("number,state,isDraft,baseRefName,headRefName,headRefOid,author,mergeable,mergeStateStatus,"
+PR_FIELDS = ("number,state,isDraft,baseRefName,headRefName,headRefOid,baseRefOid,author,mergeable,mergeStateStatus,"
              "reviewDecision,reviews,comments,statusCheckRollup,isCrossRepository,mergeCommit,files,commits")
 THREADS = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n)"
            "{reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved isOutdated}}}}}")
@@ -250,6 +346,7 @@ API_READS = [re.compile(x) for x in (
     _RO + r"/check-runs/\d{1,15}", _RO + r"/actions/jobs/\d{1,15}", _RO + r"/check-runs/\d{1,15}/annotations\?per_page=100",
     # The local-first basis asks GitHub whether any Actions run exists for the head (a count only).
     _RO + r"/actions/runs\?head_sha=[0-9a-f]{40}&per_page=1", _RO + r"/pulls/\d{1,9}/files\?per_page=100",
+    _RO + r"/git/commits/[0-9a-f]{40}", _RO + r"/git/trees/[0-9a-f]{40}\?recursive=1",
     r"orgs/[A-Za-z0-9][A-Za-z0-9-]{0,38}/memberships/[A-Za-z0-9][A-Za-z0-9-]{0,38}")]
 SAFE_FLAGS = {"--json", "--jq", "--repo"}
 GRAPHQL_VARS = {"query", "o", "r", "n"}
@@ -533,19 +630,38 @@ def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, raw_bo
     reasons, wait, facts = [], [], {}
     if meta.get("isPrivate") is not True:
         return ["NOT_PRIVATE: the local-first basis exists only for private repositories"], wait, facts
-    files = p.get("files") or []
-
-    def covered(path):   # a workflow, or a path the owner pinned; case-insensitive and over-broad on purpose
-        path = str(path or "").casefold()
-        return ".github/workflows" in path or any(fnmatch.fnmatchcase(path, g.casefold()) for g in cfg["pinned_paths"])
+    files = p.get("files")
     # `pr view --json files` lists only the new path of a rename, so a workflow moved out of its directory is read from the REST list too.
     listed = _json(run, "api", f"repos/{repo}/pulls/{pr}/files?per_page=100", "--jq", "[.[] | {filename, previous_filename, status}]") \
-        if files and len(files) < 100 else []
-    consistent = isinstance(listed, list) and all(isinstance(f, dict) for f in listed) and len(listed) == len(files) \
-        and {str(f.get("filename")) for f in listed} == {str(f.get("path")) for f in files}
-    if p.get("isCrossRepository") or not files or len(files) >= 100 or not consistent \
-            or any(f.get("status") == "renamed" or f.get("previous_filename") or covered(f.get("previous_filename")) for f in listed) \
-            or any(covered(f.get("path")) for f in files):
+        if isinstance(files, list) and files and len(files) < 100 else []
+    view_paths = [f.get("path") for f in files] if isinstance(files, list) and all(isinstance(f, dict) for f in files) else []
+    remote_paths = [f.get("filename") for f in listed] if isinstance(listed, list) and all(isinstance(f, dict) for f in listed) else []
+    consistent = (isinstance(listed, list) and isinstance(files, list) and len(listed) == len(files)
+                  and all(isinstance(path, str) and path for path in view_paths + remote_paths)
+                  and len(set(view_paths)) == len(view_paths) and len(set(remote_paths)) == len(remote_paths)
+                  and set(view_paths) == set(remote_paths))
+    renamed = not consistent or any(f.get("status") == "renamed" or f.get("previous_filename") for f in listed)
+    workflow_changed = any(".github/workflows" in str(path).casefold() for path in view_paths)
+    pinned_changed = [path for path in view_paths if _matches_any(path, cfg["pinned_paths"])] if consistent else []
+    controls = cfg.get("controlled_script_paths", ())
+    pin_outside_control = any(not _matches_any(path, controls) for path in pinned_changed)
+    scope_invalid = (p.get("isCrossRepository") or not files or not isinstance(files, list) or len(files) >= 100
+                     or not consistent or renamed or workflow_changed or pin_outside_control)
+    controlled_scope = bool(pinned_changed and controls) and not scope_invalid
+    controlled_merge_base = None
+    if controlled_scope:
+        base_sha = p.get("baseRefOid")
+        facts["controlled_script_review"] = {"base_sha": base_sha,
+            "recipe_sha256": local_first_recipe_sha256(cfg), "scope": "project-scripts",
+            "authorization": "standing-project-work"}
+        try:
+            if not isinstance(base_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", base_sha):
+                raise ValueError("base commit identity is unavailable")
+            controlled_merge_base = run("api", f"repos/{repo}/compare/{base_sha}...{head}", "--jq", ".merge_base_commit.sha").strip()
+            _verify_controlled_inventory(run, repo, head, files, listed, controlled_merge_base, controlled_pins=pinned_changed)
+        except Exception:
+            scope_invalid = True
+    if scope_invalid:
         reasons.append("LOCAL_FIRST_SCOPE: the file list is unknown, truncated or inconsistent, or the PR renames a file or changes a workflow or an owner-pinned path")
     if int(run("api", f"repos/{repo}/actions/runs?head_sha={head}&per_page=1", "--jq", ".total_count").strip()):
         wait.append("CI_PENDING: GitHub Actions has a run for this head; the hosted result decides, not the local-first basis")
@@ -600,13 +716,25 @@ def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, raw_bo
         return reasons + ["LOCAL_CI_MALFORMED: the latest record for this head is not exactly the recorder's schema"], wait, facts
     mismatch = rec["repo"].lower() != repo.lower() or rec["pr"] != pr or rec["base"] != base or rec["head"] != head
     if not mismatch:
-        mismatch = rec["base_sha"] != run("api", f"repos/{repo}/compare/{base}...{head}", "--jq", ".merge_base_commit.sha").strip()
+        expected_merge_base = controlled_merge_base if controlled_scope else run(
+            "api", f"repos/{repo}/compare/{base}...{head}", "--jq", ".merge_base_commit.sha").strip()
+        mismatch = rec["base_sha"] != expected_merge_base
     if mismatch or max(finished) > now + 60 or max(finished) > created:
         return reasons + ["LOCAL_CI_MISMATCH: the record is for another repo, PR, base, base commit or head, or claims to finish after it was posted"], wait, facts
     if [(c["name"], tuple(c["argv"])) for c in rec["commands"]] != cfg["checks"] or rec["env"] != cfg["env"]:
         return reasons + ["LOCAL_CI_COMMANDS_MISMATCH: the recorded commands or environment are not exactly the owner's configured checks, in order"], wait, facts
     if now - max(finished) > cfg["max_age_hours"] * 3600:
         return reasons + [f"LOCAL_CI_STALE: the record is older than {cfg['max_age_hours']} hours; rerun the local checks"], wait, facts
+    if controlled_scope and not scope_invalid:
+        try:
+            current = _json(run, "pr", "view", str(pr), "--repo", repo,
+                            "--json", "baseRefName,baseRefOid,headRefOid")
+            stable = (current.get("baseRefName") == base and current.get("baseRefOid") == base_sha
+                      and current.get("headRefOid") == head)
+        except Exception:
+            stable = False
+        if not stable:
+            reasons.append("CONTROLLED_SCOPE_CHANGED: the PR base or head changed or became unverifiable during gate evaluation; re-read and review the current commits")
     if not reasons and not wait:
         facts.update(ci_exception="local-first", hosted_checks="NOT_RUN",
                      ci_verdict="NOT_A_CI_PASS: LOCAL_EQUIVALENT_PASS; hosted checks never ran for this head",
@@ -757,20 +885,57 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
         reasons.append(f"UNRESOLVED_REVIEW_THREADS: {len(unresolved)}")
     mine = [c for c in p["comments"] if (c.get("author") or {}).get("login", "").lower() == me.lower()]
     texts = [re.sub(r"```.*?```", "", (c["body"] or ""), flags=re.S) for c in mine]
-    found = [m for t in texts for m in REVIEW_RE.findall(t)]
-    at_head = [m for m in found if m[0] == head]
-    if not found:
-        reasons.append("NO_REVIEW_EVIDENCE: no OWNER-MERGE-REVIEW record by the authenticated user")
-    elif not at_head:
-        reasons.append("REVIEW_STALE: the recorded review is for a different head; the PR changed after review")
-    else:
-        bad = [m for m in at_head if m[1] != "PASS" or m[2] != "0"]
-        if bad:
+    configured_local = (local_first or {}).get(repo.lower())
+    controlled_review_required = (ci_exception and not (p.get("statusCheckRollup") or []) and configured_local
+                                  and _controlled_pin_candidate(p.get("files"), configured_local))
+    if controlled_review_required:
+        recipe_sha = local_first_recipe_sha256(configured_local)
+        facts["controlled_script_review"] = {"base_sha": p.get("baseRefOid"), "recipe_sha256": recipe_sha,
+            "scope": "project-scripts", "authorization": "standing-project-work"}
+        lines = [line for text in texts for line in REVIEW_LINE_RE.findall(text)]
+        current_lines = [line for line in lines if re.match(r"^OWNER-MERGE-REVIEW\s+head=" + re.escape(head) + r"(?:\s|$)", line)]
+        legacy = [match for line in current_lines if (match := REVIEW_RE.fullmatch(line))]
+        parsed = [match for line in current_lines if (match := CONTROLLED_REVIEW_RE.fullmatch(line))]
+        applicable = [match for match in parsed if match.group(5) == p.get("baseRefOid") and match.group(6) == recipe_sha]
+        malformed = [line for line in current_lines if not REVIEW_RE.fullmatch(line) and not CONTROLLED_REVIEW_RE.fullmatch(line)]
+        if (any(match.group(2) != "PASS" or match.group(3) != "0" for match in legacy + applicable)):
             reasons.append("REVIEW_NOT_CLEAN: recorded review has blocking findings or a non-PASS verdict")
-        facts["reviewer"] = at_head[-1][3]
-        facts["review_kind"] = "recorded technical review, self-attested by the authenticated identity (not a GitHub approval)"
-        if at_head[-1][3].lower() in (me.lower(), "self", "author", "coordinator"):
-            reasons.append("REVIEW_NOT_INDEPENDENT: reviewer id is the author or coordinator")
+        elif malformed:
+            reasons.append("CONTROLLED_REVIEW_INVALID: the controlled review record is malformed or has unsupported authority")
+        elif len(applicable) > 1:
+            reasons.append("CONTROLLED_REVIEW_AMBIGUOUS: multiple review records bind this head, base and recipe")
+        elif not current_lines:
+            if lines:
+                reasons.append("CONTROLLED_REVIEW_STALE: no review record binds the current head")
+            else:
+                reasons.append("CONTROLLED_REVIEW_REQUIRED: an independent controlled-scope review is missing")
+        elif not applicable:
+            if parsed:
+                reasons.append("CONTROLLED_REVIEW_STALE: the review binds a different base commit or check recipe")
+            else:
+                reasons.append("CONTROLLED_REVIEW_REQUIRED: the legacy head-only review does not bind the current base and recipe")
+        else:
+            match = applicable[0]
+            if match.group(4).lower() in (me.lower(), "self", "author", "coordinator"):
+                reasons.append("REVIEW_NOT_INDEPENDENT: reviewer id is the author or coordinator")
+            else:
+                facts["reviewer"] = match.group(4)
+                facts["review_kind"] = "controlled project-script review, self-attested by the authenticated identity (not a GitHub approval)"
+    else:
+        found = [m for t in texts for m in REVIEW_RE.findall(t)]
+        at_head = [m for m in found if m[0] == head]
+        if not found:
+            reasons.append("NO_REVIEW_EVIDENCE: no OWNER-MERGE-REVIEW record by the authenticated user")
+        elif not at_head:
+            reasons.append("REVIEW_STALE: the recorded review is for a different head; the PR changed after review")
+        else:
+            bad = [m for m in at_head if m[1] != "PASS" or m[2] != "0"]
+            if bad:
+                reasons.append("REVIEW_NOT_CLEAN: recorded review has blocking findings or a non-PASS verdict")
+            facts["reviewer"] = at_head[-1][3]
+            facts["review_kind"] = "recorded technical review, self-attested by the authenticated identity (not a GitHub approval)"
+            if at_head[-1][3].lower() in (me.lower(), "self", "author", "coordinator"):
+                reasons.append("REVIEW_NOT_INDEPENDENT: reviewer id is the author or coordinator")
     checks = p["statusCheckRollup"] or []
     failed = [c.get("name") or c.get("context") for c in checks
               if (c.get("conclusion") or c.get("state") or "").upper() in FAIL]
@@ -925,6 +1090,11 @@ REASON_TABLE = {
     "NO_REVIEW_EVIDENCE": (ASK, "agent_runs_independent_review", "ENGINEERING_GATE"),
     "REVIEW_STALE": (ASK, "agent_runs_independent_review", "ENGINEERING_GATE"),
     "REVIEW_NOT_INDEPENDENT": (ASK, "agent_runs_independent_review", "ENGINEERING_GATE"),
+    "CONTROLLED_REVIEW_REQUIRED": (ASK, "agent_runs_independent_review", "ENGINEERING_GATE"),
+    "CONTROLLED_REVIEW_STALE": (ASK, "agent_runs_independent_review", "ENGINEERING_GATE"),
+    "CONTROLLED_REVIEW_INVALID": (ASK, "agent_runs_independent_review", "ENGINEERING_GATE"),
+    "CONTROLLED_REVIEW_AMBIGUOUS": (ASK, "agent_runs_independent_review", "ENGINEERING_GATE"),
+    "CONTROLLED_SCOPE_CHANGED": (ASK, "agent_revalidates", "ENGINEERING_GATE"),
     "REVIEW_NOT_CLEAN": (ASK, "author_fixes_findings", "ENGINEERING_GATE"),
     "UNRESOLVED_REVIEW_THREADS": (ASK, "author_resolves_threads", "ENGINEERING_GATE"),
     "REVIEW_THREADS_TRUNCATED": (ASK, "owner_review", "ENGINEERING_GATE"),
@@ -1026,12 +1196,22 @@ def host_denied(repo, pr, head, message):
             "owner_action": "Run the blocked_operation yourself (prefix ! in the session), or approve it from /permissions > Recently denied. Then run verify."}
 
 
-def evidence_line(head, reviewer, verdict="PASS", blocking=0):
+def evidence_line(head, reviewer, verdict="PASS", blocking=0, *, base_sha=None, recipe_sha256=None,
+                  scope=None, authorization=None):
     if not re.fullmatch(r"[0-9a-f]{40}", head) or not re.fullmatch(r"[A-Za-z0-9._:-]{3,64}", reviewer):
         raise ValueError("head must be a full 40-hex sha and reviewer a plain identifier")
     if verdict not in ("PASS", "FAIL") or blocking < 0:
         raise ValueError("verdict must be PASS or FAIL and blocking >= 0")
-    return f"OWNER-MERGE-REVIEW head={head} verdict={verdict} blocking={blocking} reviewer={reviewer}"
+    line = f"OWNER-MERGE-REVIEW head={head} verdict={verdict} blocking={blocking} reviewer={reviewer}"
+    extension = (base_sha, recipe_sha256, scope, authorization)
+    if all(value is None for value in extension):
+        return line
+    if (not re.fullmatch(r"[0-9a-f]{40}", str(base_sha or ""))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(recipe_sha256 or ""))
+            or scope != "project-scripts" or authorization != "standing-project-work"):
+        raise ValueError("controlled review requires a full base sha, recipe digest, project-scripts scope and standing-project-work authorization")
+    return (f"{line} base_sha={base_sha} recipe_sha256={recipe_sha256} "
+            f"scope=project-scripts authorization=standing-project-work")
 
 
 def evidence_json(repo, pr, base, head, reviewer, kind="independent-agent", now=None):
@@ -1121,6 +1301,10 @@ def main(argv=None, run=None):
     e.add_argument("--reviewer", required=True)
     e.add_argument("--verdict", default="PASS")
     e.add_argument("--blocking", type=int, default=0)
+    e.add_argument("--base-sha")
+    e.add_argument("--recipe-sha256")
+    e.add_argument("--scope", choices=("project-scripts",))
+    e.add_argument("--authorization", choices=("standing-project-work",))
     ce = sub.add_parser("ci-exception-line")
     ce.add_argument("--head", required=True)
     ej = sub.add_parser("evidence-json")
@@ -1136,7 +1320,8 @@ def main(argv=None, run=None):
             print(json.dumps(evidence_json(a.repo, a.pr, a.base, a.head, a.reviewer, a.kind), indent=1))
             return 0
         if a.cmd == "evidence-line":
-            print(evidence_line(a.head, a.reviewer, a.verdict, a.blocking))
+            print(evidence_line(a.head, a.reviewer, a.verdict, a.blocking, base_sha=a.base_sha,
+                                recipe_sha256=a.recipe_sha256, scope=a.scope, authorization=a.authorization))
             return 0
         if a.cmd == "ci-exception-line":
             if not re.fullmatch(r"[0-9a-f]{40}", a.head):
