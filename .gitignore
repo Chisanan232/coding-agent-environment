@@ -8,6 +8,7 @@
 !.claude/config.env
 
 # Runtime / session state (do not version)
+/.codex/
 **/sessions/
 **/projects/
 **/tasks/
