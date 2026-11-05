@@ -22,5 +22,6 @@ For Codex, the recorder refuses a symlinked `~/.codex` root or evidence director
 group/others, and an evidence directory not owned by the caller with mode `0700`. It validates this fixed location and all existing
 log files before running any configured check. An unsafe Codex path is a refusal; the recorder does not fall back to Claude storage.
 These path checks do not attest protection against concurrent directory replacement by the same local user.
+The local-CI record contains log digests, not host paths; selecting a storage host does not change gate validation of that record.
 
 Local CI never replaces real end-to-end or realistic user-workflow acceptance: the product's own acceptance criteria stay open until agents execute them and record truthful evidence. Final release approval remains the founder's.
