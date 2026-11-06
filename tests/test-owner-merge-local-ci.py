@@ -248,7 +248,8 @@ class Recorder(unittest.TestCase):
         from unittest import mock
         dump = py("import os, sys; sys.stdout.write(','.join(sorted(os.environ)))")
         hostile = {"PYTHONPATH": "/x", "PYTHONHOME": "/x", "NODE_PATH": "/x", "VIRTUAL_ENV": "/x", "PYTHONSTARTUP": "/x", "PIP_INDEX_URL": "/x",
-                   "LD_PRELOAD": "/x", "DYLD_INSERT_LIBRARIES": "/x", "SOME_TOKEN": "t"}
+                   "LD_PRELOAD": "/x", "DYLD_INSERT_LIBRARIES": "/x", "SOME_TOKEN": "t", "CARGO_HOME": "/x", "RUSTFLAGS": "-C link-arg=x",
+                   "RUST_LOG": "trace"}
         with mock.patch.dict(os.environ, hostile):
             self.record(dump, env={"OWNER_FIXED": "1"})
         log = pathlib.Path(self.logs, os.listdir(self.logs)[0]).read_text().split(",")
@@ -256,6 +257,84 @@ class Recorder(unittest.TestCase):
             self.assertNotIn(key, log)
         for key in ("PATH", "HOME", "OWNER_FIXED"):
             self.assertIn(key, log)
+
+    def test_absent_resource_caps_keep_standalone_behavior(self):
+        inherited = {key: value for key, value in os.environ.items()
+                     if key not in ("CARGO_BUILD_JOBS", "RUST_TEST_THREADS", "NEXTEST_TEST_THREADS")}
+        code = "import os; print(*(os.environ.get(k, '<unset>') for k in ('CARGO_BUILD_JOBS','RUST_TEST_THREADS','NEXTEST_TEST_THREADS')), sep='\\n')"
+        with mock.patch.dict(os.environ, inherited, clear=True):
+            result, _, err = self.record(py(code))
+        self.assertEqual(result, 0)
+        self.assertEqual(self.log_text().splitlines(), ["<unset>", "<unset>", "<unset>"])
+        self.assertIn("none (standalone behavior)", err)
+
+    def test_inherited_resource_caps_are_forwarded_without_broad_cargo_or_rust_environment(self):
+        code = "import os; print(*(os.environ.get(k, '<unset>') for k in ('CARGO_BUILD_JOBS','RUST_TEST_THREADS','NEXTEST_TEST_THREADS','CARGO_HOME','RUSTFLAGS','RUST_LOG')), sep='\\n')"
+        caps = {"CARGO_BUILD_JOBS": "3", "RUST_TEST_THREADS": "3", "NEXTEST_TEST_THREADS": "3"}
+        with mock.patch.dict(os.environ, {**caps, "CARGO_HOME": "/private", "RUSTFLAGS": "-C link-arg=x", "RUST_LOG": "trace"}):
+            result, out, err = self.record(py(code))
+        self.assertEqual(result, 0)
+        self.assertEqual(self.log_text().splitlines(), ["3", "3", "3", "<unset>", "<unset>", "<unset>"])
+        self.assertIn("CARGO_BUILD_JOBS=3", err)
+        self.assertIn("RUST_TEST_THREADS=3", err)
+        self.assertIn("NEXTEST_TEST_THREADS=3", err)
+
+    def test_configured_resource_limits_are_minimized_with_inherited_caps(self):
+        code = "import os; print(*(os.environ.get(k, '<unset>') for k in ('CARGO_BUILD_JOBS','RUST_TEST_THREADS','NEXTEST_TEST_THREADS')), sep='\\n')"
+        caps = {"CARGO_BUILD_JOBS": "8", "RUST_TEST_THREADS": "6", "NEXTEST_TEST_THREADS": "4"}
+        configured = {"CARGO_BUILD_JOBS": "3", "RUST_TEST_THREADS": "9", "NEXTEST_TEST_THREADS": "2"}
+        with mock.patch.dict(os.environ, caps):
+            result, out, err = self.record(py(code), env=configured)
+        self.assertEqual(result, 0)
+        self.assertEqual(self.log_text().splitlines(), ["3", "6", "2"])
+        self.assertEqual(json.loads(out.split(" ", 1)[1])["env"], configured)
+        self.assertIn("CARGO_BUILD_JOBS=3", err)
+        self.assertIn("RUST_TEST_THREADS=6", err)
+        self.assertIn("NEXTEST_TEST_THREADS=2", err)
+
+    def test_inherited_resource_caps_are_snapshotted_once_across_checks(self):
+        code = "import os; print(os.environ.get('CARGO_BUILD_JOBS','<unset>'))"
+        original = rec.run_check
+        calls = []
+        def change_after_first(*args, **kwargs):
+            result = original(*args, **kwargs)
+            calls.append(True)
+            if len(calls) == 1:
+                os.environ["CARGO_BUILD_JOBS"] = "1"
+            return result
+        with mock.patch.dict(os.environ, {"CARGO_BUILD_JOBS": "3"}), mock.patch.object(rec, "run_check", change_after_first):
+            result, _, _ = self.record(py(code), py(code))
+        self.assertEqual(result, 0)
+        logs = [pathlib.Path(self.logs, name).read_text().strip() for name in sorted(os.listdir(self.logs))]
+        self.assertEqual(logs, ["3", "3"])
+
+    def test_invalid_inherited_caps_refuse_before_execution_and_log_truncation(self):
+        bad_values = ("", "0", "-1", "+2", "1.5", "2x", " 2", "２", "1025", "9" * 100)
+        for key in ("CARGO_BUILD_JOBS", "RUST_TEST_THREADS", "NEXTEST_TEST_THREADS"):
+            for value in bad_values:
+                with self.subTest(key=key, value=value):
+                    os.makedirs(self.logs, mode=0o700, exist_ok=True)
+                    path = rec.log_path(self.logs, "c0", self.head, f"{REPO.replace('/', '__')}-7")
+                    pathlib.Path(path).write_bytes(b"preserve existing log")
+                    os.chmod(path, 0o600)
+                    with mock.patch.dict(os.environ, {key: value}):
+                        code, out, _ = self.record(py(f"open({self.marker!r}, 'w')"))
+                    self.assertEqual((code, out), (2, ""))
+                    self.assertFalse(os.path.exists(self.marker))
+                    self.assertEqual(pathlib.Path(path).read_bytes(), b"preserve existing log")
+
+    def test_invalid_configured_resource_limits_refuse_before_execution_and_log_truncation(self):
+        for key in ("CARGO_BUILD_JOBS", "RUST_TEST_THREADS", "NEXTEST_TEST_THREADS"):
+            for value in ("", "0", "-2", "+3", " 3", "3x", "３", "1025", "9" * 100):
+                with self.subTest(key=key, value=value):
+                    os.makedirs(self.logs, mode=0o700, exist_ok=True)
+                    path = rec.log_path(self.logs, "c0", self.head, f"{REPO.replace('/', '__')}-7")
+                    pathlib.Path(path).write_bytes(b"preserve existing log")
+                    os.chmod(path, 0o600)
+                    code, out, _ = self.record(py(f"open({self.marker!r}, 'w')"), env={key: value})
+                    self.assertEqual((code, out), (2, ""))
+                    self.assertFalse(os.path.exists(self.marker))
+                    self.assertEqual(pathlib.Path(path).read_bytes(), b"preserve existing log")
 
     def test_a_failure_is_still_printed_when_the_checks_also_dirtied_the_tree(self):
         made = os.path.join(self.wt, "made.txt")

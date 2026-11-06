@@ -39,6 +39,8 @@ EVIDENCE_HOSTS = ("claude", "codex")
 COMMAND_TIMEOUT = 6 * 3600
 # Allowlist, not a blocklist: anything not named here (PYTHONPATH, NODE_PATH, VIRTUAL_ENV, PIP_*, LD_*, tokens ...) never reaches a check.
 ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "TZ")
+RESOURCE_LIMIT_KEYS = ("CARGO_BUILD_JOBS", "RUST_TEST_THREADS", "NEXTEST_TEST_THREADS")
+RESOURCE_LIMIT_RE = re.compile(r"[0-9]{1,1024}")
 # Credential-looking argv would land in the PR comment, so it is refused before anything runs.
 SECRET_RE = re.compile(r"(?i)(token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|credential|authorization)\s*[=:]"
                        r"|gh[opusr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN ")
@@ -70,8 +72,32 @@ def load_entry(repo, path=None, root=None):
     return cfg[repo.lower()]
 
 
-def check_env(extra, context=None):
-    return {**{k: os.environ[k] for k in ENV_KEEP if k in os.environ}, **extra, **(context or {})}
+def resource_caps(inherited, configured):
+    """Validate the three admitted resource limits and return their non-increasing effective values."""
+    if not isinstance(configured, dict):
+        raise ValueError("configured environment must be an object")
+    effective = {}
+    for key in RESOURCE_LIMIT_KEYS:
+        values = []
+        for source, env in (("inherited", inherited), ("configured", configured)):
+            if key not in env:
+                continue
+            value = env[key]
+            if not isinstance(value, str) or not RESOURCE_LIMIT_RE.fullmatch(value):
+                raise ValueError(f"{source} {key} must be positive ASCII decimal from 1 to 1024")
+            number = int(value)
+            if not 1 <= number <= 1024:
+                raise ValueError(f"{source} {key} must be positive ASCII decimal from 1 to 1024")
+            values.append(number)
+        if values:
+            effective[key] = str(min(values))
+    return effective
+
+
+def check_env(extra, context=None, caps=None):
+    configured = {key: value for key, value in extra.items() if key not in RESOURCE_LIMIT_KEYS}
+    return {**{k: os.environ[k] for k in ENV_KEEP if k in os.environ}, **configured,
+            **(context or {}), **(caps or {})}
 
 
 def pr_context(repo, pr, head):
@@ -144,12 +170,13 @@ def prepare_codex_dir(logs):
         os.close(root_fd)
 
 
-def run_check(worktree, name, argv, logs, head, tag, env=None, context=None):
+def run_check(worktree, name, argv, logs, head, tag, env=None, context=None, caps=None):
     """Run one argv without a shell; the combined output goes to a private log and only its digest is returned."""
     started = time.time()
     path = log_path(logs, name, head, tag)
     try:
-        r = subprocess.run(list(argv), cwd=worktree, capture_output=True, timeout=COMMAND_TIMEOUT, stdin=subprocess.DEVNULL, env=check_env(env or {}, context))
+        r = subprocess.run(list(argv), cwd=worktree, capture_output=True, timeout=COMMAND_TIMEOUT, stdin=subprocess.DEVNULL,
+                           env=check_env(env or {}, context, caps))
         code, data = r.returncode, r.stdout + r.stderr
     except subprocess.TimeoutExpired as e:
         code, data = 124, (e.stdout or b"") + (e.stderr or b"")
@@ -166,6 +193,11 @@ def record(repo, pr, base, worktree, entry, logs, expect_head=None, evidence_hos
     def refuse(why):
         print(f"owner-merge-local-ci: refused: {why}", file=sys.stderr)
         return 2
+    inherited_limits = {key: os.environ[key] for key in RESOURCE_LIMIT_KEYS if key in os.environ}
+    try:
+        effective_caps = resource_caps(inherited_limits, entry.get("env") or {})
+    except ValueError as e:
+        return refuse(str(e))
     if not gate.REPO_RE.fullmatch(repo) or not re.fullmatch(r"[1-9][0-9]{0,8}", str(pr)) or not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", base):
         return refuse("repo, pr or base is malformed")
     if evidence_host not in EVIDENCE_HOSTS:
@@ -209,10 +241,13 @@ def record(repo, pr, base, worktree, entry, logs, expect_head=None, evidence_hos
                 open_log(path).close()
     except (OSError, RuntimeError) as e:
         return refuse(str(e))
-    print("owner-merge-local-ci: check environment: " + ",".join(sorted(check_env(entry.get("env") or {}, check_context))), file=sys.stderr)
+    child_env = check_env(entry.get("env") or {}, check_context, effective_caps)
+    print("owner-merge-local-ci: check environment: " + ",".join(sorted(child_env)), file=sys.stderr)
+    caps_note = ",".join(f"{key}={value}" for key, value in sorted(effective_caps.items())) or "none (standalone behavior)"
+    print("owner-merge-local-ci: effective resource caps: " + caps_note, file=sys.stderr)
     commands = []
     for name, argv in entry["checks"]:
-        result, path = run_check(worktree, name, argv, logs, head, tag, entry.get("env"), check_context)
+        result, path = run_check(worktree, name, argv, logs, head, tag, entry.get("env"), check_context, effective_caps)
         commands.append(result)
         print(f"owner-merge-local-ci: {name} exit {result['exit_code']} log {path}", file=sys.stderr)
     failed = any(c["exit_code"] != 0 for c in commands)

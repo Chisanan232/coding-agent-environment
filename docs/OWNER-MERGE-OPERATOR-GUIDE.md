@@ -188,6 +188,13 @@ commands instead. The responsible agent installs the owner-governed `~/.config/c
 The standing project-work authorization is recorded in that review line and does not replace CI evidence or GitHub approval. Full rules and threat notes:
 `docs/OWNER-MERGE-WORKFLOW.md`. Step list for the first use: `docs/OWNER-MERGE-LOCAL-FIRST-HANDOFF.md`.
 
+The recorder snapshots only inherited `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS`, validates any supplied
+values as ASCII decimal limits from 1 to 1024, and forwards only those three caps into checks. For limits permitted by the existing
+environment policy, the recorder uses the lower inherited/configured value. Configured `CARGO_*` keys remain refused; this change
+does not widen the environment policy. Invalid limits refuse before a check runs or an existing log is truncated.
+Effective caps are printed in a separate stderr diagnostic; they do not change the configured `env` field in the evidence record.
+With no inherited or configured cap, the recorder keeps standalone behavior; this is not evidence of an admitted resource budget.
+
 `controlled_package_scripts` is an optional, exact-path opt-in for a `package.json` test script update. It accepts only the existing
 non-empty `scripts.test` value changing; the gate checks the immutable base/head blobs and does not execute the command. The reviewer
 must inspect the command, any indirectly invoked scripts and the resulting local validation. Changes to lifecycle hooks, dependencies,
