@@ -1864,6 +1864,213 @@ def queue_status(state_path, now=None):
     return {'entries': shown, 'problems': problems}
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Concurrency trial report (SPE-160). Read-only evidence for the decision to enable a third heavy lane: it reads the queue
+# entries, the receipts log and the measurement log, never takes the lock and writes nothing. Every missing input yields
+# "insufficient", never PASS. Times are upper bounds where noted: a release is recorded when a queue-aware command next runs.
+TRIAL_CRITERIA = {'overlapped_jobs': 10, 'classes': 2, 'q2c_improvement': 0.20, 'slowdown': 1.6, 'swap_growth_bytes': 2 * GIB,
+                  'free_margin_bytes': 60 * GIB, 'fits_share': 0.5}
+
+
+def _median(values):
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _trial_time(text):
+    try:
+        return _parse_time(text) if isinstance(text, str) else None
+    except ValueError:
+        return None
+
+
+def _read_jsonl_lines(path):
+    """Parsed dict lines of a private JSONL log, unreadable lines skipped, no symlinks followed."""
+    out = []
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return out
+    with os.fdopen(descriptor, 'rb') as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            return out
+        for raw in handle.read(4 * RECEIPT_ROTATE_BYTES).splitlines():
+            try:
+                line = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(line, dict):
+                out.append(line)
+    return out
+
+
+def _trial_jobs(entries, lines_by_queue_id, since, until):
+    """One record per claimed queue entry whose claim falls in [since, until]."""
+    jobs = []
+    for entry in entries:
+        holder = entry.get('holder') or {}
+        claimed, created = _trial_time(holder.get('claimed_at')), _trial_time(entry.get('created'))
+        if entry['state'] not in ('CLAIMED', 'RELEASED') or claimed is None or not since <= claimed <= until:
+            continue
+        released = _trial_time((entry.get('release') or {}).get('at')) if entry['state'] == 'RELEASED' else None
+        stamps = [t for t in (_trial_time(ln.get('ts')) for ln in lines_by_queue_id.get(entry['id'], [])) if t is not None]
+        lower = max(stamps) if stamps else None
+        job = {'id': entry['id'], 'label': entry['label'], 'class': entry.get('class') or 'unclassified', 'claimed': claimed,
+               'created': created, 'released': released, 'finished': released is not None and released >= claimed}
+        job['wait_s'] = (claimed - created).total_seconds() if created and created <= claimed else None
+        job['run_s'] = (released - claimed).total_seconds() if job['finished'] else None
+        job['run_lower_s'] = max(0.0, (lower - claimed).total_seconds()) if lower else None
+        job['q2c_s'] = (released - created).total_seconds() if job['finished'] and created and created <= released else None
+        job['lines'] = lines_by_queue_id.get(entry['id'], [])
+        job['end'] = lower if lower and (released is None or lower <= released) else released
+        jobs.append(job)
+    for job in jobs:
+        if job['lines']:
+            job['overlapped'] = any(type(ln.get('concurrent')) is int and ln['concurrent'] > 1 for ln in job['lines'])
+        else:
+            start, end = job['claimed'], job['end'] or until
+            job['overlapped'] = any(o is not job and o['claimed'] < end and start < (o['end'] or until) for o in jobs)
+    return jobs
+
+
+def _peak_concurrent(jobs, until):
+    events = sorted([(j['claimed'], 1) for j in jobs] + [(j['end'] or until, -1) for j in jobs], key=lambda e: (e[0], e[1]))
+    peak = current = 0
+    for _, step in events:
+        current += step
+        peak = max(peak, current)
+    sampled = [ln['concurrent'] for j in jobs for ln in j['lines'] if type(ln.get('concurrent')) is int]
+    return max([peak] + sampled)
+
+
+def _busy_hours(jobs, until):
+    spans = sorted((j['claimed'], j['end'] or until) for j in jobs)
+    total, cursor = 0.0, None
+    for start, end in spans:
+        start = max(start, cursor) if cursor else start
+        if end > start:
+            total += (end - start).total_seconds()
+            cursor = end
+    return total / 3600
+
+
+def _criterion(name, value, verdict, needed):
+    return {'name': name, 'value': value, 'needed': needed, 'verdict': verdict}
+
+
+def trial_report(state_path, since, until=None, baseline=None, now=None):
+    """Read-only trial evidence for a third heavy lane. `since`/`until` bound the trial window (aware datetimes); `baseline` is
+    an optional (since, until) pair whose solo jobs form the comparison, else the solo jobs of the trial window. Returns a
+    JSON-safe dict with per-job rows, per-class figures, the criteria and an overall verdict that is PASS only when every criterion
+    passes (FAIL when any fails, else INSUFFICIENT)."""
+    now = now or datetime.now(timezone.utc)
+    until = until or now
+    out = {'ok': True, 'since': iso_utc(since), 'until': iso_utc(until), 'writes': 'nothing'}
+    try:
+        entries, problems = _queue_entries(state_path)
+    except (StateError, OSError) as exc:
+        return {'ok': False, 'reason': 'queue-unreadable: %s' % exc}
+    out['problems'] = problems
+    measurement_lines = _read_measurement_lines(state_path)[0]
+    by_qid = {}
+    for line in measurement_lines:
+        if line.get('event') != 'end' and isinstance(line.get('queue_id'), str):
+            by_qid.setdefault(line['queue_id'], []).append(line)
+    jobs = _trial_jobs(entries, by_qid, since, until)
+    base_jobs = _trial_jobs(entries, by_qid, baseline[0], baseline[1]) if baseline else jobs
+    solo = [j for j in base_jobs if j['finished'] and not j['overlapped']]
+    overlapped = [j for j in jobs if j['finished'] and j['overlapped']]
+    in_window = [ln for ln in measurement_lines if (t := _trial_time(ln.get('ts'))) is not None and since <= t <= until]
+    receipts = []
+    base = queue_dir(state_path) / 'receipts.jsonl'
+    for path in (base.with_name(base.name + '.1'), base):
+        receipts += _read_jsonl_lines(path)
+    verdicts = [r['budget'] for r in receipts if r.get('event') == 'shadow-budget' and isinstance(r.get('budget'), dict)
+                and (t := _trial_time(r.get('ts'))) is not None and since <= t <= until]
+
+    busy = _busy_hours([j for j in jobs if j['finished']], until)
+    classes = {}
+    for name in sorted({j['class'] for j in jobs + solo}):
+        s_runs = [j['run_s'] for j in solo if j['class'] == name]
+        o_runs = [j['run_s'] for j in overlapped if j['class'] == name]
+        s_med, o_med = _median(s_runs), _median(o_runs)
+        mine = [j for j in jobs if j['class'] == name and j['finished']]
+        classes[name] = {'solo_runs': len(s_runs), 'overlapped_runs': len(o_runs), 'solo_median_run_s': s_med,
+                         'overlapped_median_run_s': o_med,
+                         'slowdown': (o_med / s_med) if s_med and o_med is not None else None,
+                         'jobs_per_busy_hour': len(mine) / busy if mine and busy > 0 else None}
+    q2c_base = {n: _median([j['q2c_s'] for j in solo if j['class'] == n and j['q2c_s'] is not None]) for n in classes}
+    ratios = [j['q2c_s'] / q2c_base[j['class']] for j in overlapped
+              if j['q2c_s'] is not None and q2c_base.get(j['class'])]
+    slowdowns = [c['slowdown'] for c in classes.values() if c['slowdown'] is not None]
+    median_ratio = _median(ratios)
+    overlap_lines = [ln for j in overlapped for ln in j['lines'] if type(ln.get('concurrent')) is int and ln['concurrent'] > 1]
+    pressure_known = [ln['pressure'] for ln in overlap_lines if type(ln.get('pressure')) is int]
+    swaps = [(t, ln['swap_used_bytes']) for ln in in_window if type(ln.get('swap_used_bytes')) is int
+             and (t := _trial_time(ln.get('ts'))) is not None]
+    swaps.sort(key=lambda e: e[0])
+    frees = [ln['free_bytes'] for ln in in_window if type(ln.get('free_bytes')) is int]
+    seen3 = [v['fits_if_cap_were_3'] for v in verdicts if type(v.get('fits_if_cap_were_3')) is bool]
+    c = TRIAL_CRITERIA
+
+    def verdict(ok, have=True):
+        return 'insufficient' if not have else ('PASS' if ok else 'FAIL')
+
+    n_classes = len({j['class'] for j in overlapped})
+    growth = (max(v for _, v in swaps) - swaps[0][1]) if len(swaps) >= 2 else None
+    floor_need = HEAVY_FLOOR + c['free_margin_bytes']
+    pressured = sum(1 for p in pressure_known if p > 1)
+    pressure_verdict = ('FAIL' if pressured else 'PASS' if pressure_known and len(pressure_known) == len(overlap_lines)
+                        else 'insufficient')   # an overlap sample with no pressure reading is missing data, not a pass
+    criteria = [
+        # Too little evidence is a shortage of data, not a failing result.
+        _criterion('overlapped_jobs', len(overlapped), 'PASS' if len(overlapped) >= c['overlapped_jobs'] else 'insufficient',
+                   '>= %d' % c['overlapped_jobs']),
+        _criterion('overlapped_classes', n_classes, 'PASS' if n_classes >= c['classes'] else 'insufficient', '>= %d' % c['classes']),
+        _criterion('median_queue_to_completion_ratio', None if median_ratio is None else round(median_ratio, 3),
+                   verdict(median_ratio is not None and median_ratio <= 1 - c['q2c_improvement'], median_ratio is not None),
+                   '<= %.2f of the solo baseline' % (1 - c['q2c_improvement'])),
+        _criterion('worst_class_slowdown', None if not slowdowns else round(max(slowdowns), 3),
+                   verdict(bool(slowdowns) and max(slowdowns) <= c['slowdown'], bool(slowdowns)), '<= %g' % c['slowdown']),
+        _criterion('pressure_samples_above_1_during_overlap', pressured if pressure_known else None, pressure_verdict, '== 0'),
+        _criterion('swap_growth_bytes', growth, verdict(growth is not None and growth <= c['swap_growth_bytes'], growth is not None),
+                   '<= %d' % c['swap_growth_bytes']),
+        _criterion('min_free_bytes', min(frees) if frees else None, verdict(bool(frees) and min(frees) >= floor_need, bool(frees)),
+                   '>= %d (floor + 60 GiB)' % floor_need),
+        _criterion('fits_if_cap_were_3_share', None if not seen3 else round(sum(seen3) / len(seen3), 3),
+                   verdict(bool(seen3) and sum(seen3) / len(seen3) >= c['fits_share'], bool(seen3)), '>= %g' % c['fits_share']),
+    ]
+    verdicts_all = [x['verdict'] for x in criteria]
+    out.update(
+        jobs=[{'id': j['id'], 'label': j['label'], 'class': j['class'], 'overlapped': j['overlapped'], 'finished': j['finished'],
+               'wait_s': j['wait_s'], 'run_s_upper_bound': j['run_s'], 'run_s_lower_bound': j['run_lower_s'],
+               'queue_to_completion_s_upper_bound': j['q2c_s']} for j in jobs],
+        classes=classes, peak_concurrent=_peak_concurrent(jobs, until) if jobs else None,
+        peak_pressure=max([ln['pressure'] for ln in in_window if type(ln.get('pressure')) is int], default=None),
+        solo_baseline_jobs=len(solo), overlapped_jobs=len(overlapped), criteria=criteria,
+        verdict='FAIL' if 'FAIL' in verdicts_all else ('PASS' if all(v == 'PASS' for v in verdicts_all) else 'INSUFFICIENT'),
+        note='run and queue-to-completion use the release time, an upper bound (a release is recorded when a queue-aware command next '
+             'runs); run_s_lower_bound is the last sample of the job. Missing data is insufficient, never a pass.')
+    return out
+
+
+def format_trial_report(report):
+    if not report.get('ok'):
+        return 'trial report unavailable: %s' % report.get('reason')
+    rows = ['trial window %s .. %s: %d job(s), %d overlapped finished, %d solo baseline, peak concurrent %s, peak pressure %s' % (
+        report['since'], report['until'], len(report['jobs']), report['overlapped_jobs'], report['solo_baseline_jobs'],
+        report['peak_concurrent'], report['peak_pressure'])]
+    for name, c in report['classes'].items():
+        rows.append('  %-22s solo=%d overlapped=%d slowdown=%s jobs/busy-hour=%s' % (
+            name, c['solo_runs'], c['overlapped_runs'], None if c['slowdown'] is None else '%.2f' % c['slowdown'],
+            None if c['jobs_per_busy_hour'] is None else '%.2f' % c['jobs_per_busy_hour']))
+    rows += ['  %-44s %-13s value=%s needed %s' % (x['name'], x['verdict'], x['value'], x['needed']) for x in report['criteria']]
+    return '\n'.join(rows + ['verdict: %s' % report['verdict'], 'note: ' + report['note']])
+
+
 def queue_release(state_path, qid, now=None, session_id=None, token_fn=process_token, table_fn=None, confirm_ended=False):
     """Owner's explicit release of a CLAIMED entry whose holder is unresolved (or already exited). Never signals a process.
 
@@ -2608,6 +2815,12 @@ def build_parser():
     clm.add_argument('--max-hold', action='store_true', dest='allow_long')
     _add_workload_args(clm)
     clm.add_argument('job', nargs=argparse.REMAINDER, help='-- COMMAND [ARG...] (the exact job the grant was queued for)')
+    trial = qcmds.add_parser('trial-report', allow_abbrev=False, help='read-only evidence for a third heavy lane; writes nothing')
+    trial.add_argument('--since', required=True, help='ISO time with timezone; jobs claimed from then on')
+    trial.add_argument('--until', help='ISO time with timezone (default now)')
+    trial.add_argument('--baseline-since', dest='baseline_since', help='ISO time: take the solo baseline from an earlier window')
+    trial.add_argument('--baseline-until', dest='baseline_until')
+    trial.add_argument('--json', action='store_true')
     qcx = qcmds.add_parser('cancel', allow_abbrev=False, help='cancel a waiting or unclaimed entry')
     qcx.add_argument('--id', required=True, dest='qid')
     qcx.add_argument('--session-id', dest='session_id', help='refuse unless the entry belongs to this session')
@@ -2673,6 +2886,17 @@ def _queue_cli(args, state_path, free_fn, host_fn=None):
                           ttl=args.ttl, allow_long=args.allow_long, memory_fn=lambda: _memory_precondition(),
                           exec_fn=lambda program, argv: None, declared=declared, host_fn=host_fn)
         out.pop('exit', None)
+    elif command == 'trial-report':
+        since, until = _trial_time(args.since), _trial_time(args.until) if args.until else None
+        base_since, base_until = _trial_time(args.baseline_since), _trial_time(args.baseline_until)
+        if since is None or (args.until and until is None) or bool(args.baseline_since) != bool(args.baseline_until) or (
+                args.baseline_since and (base_since is None or base_until is None)):
+            print(json.dumps({'ok': False, 'reason': 'invalid-request: times must be ISO 8601 with a timezone; '
+                                                     'give both baseline bounds or neither'}))
+            return REFUSED_EXIT
+        report = trial_report(state_path, since, until, (base_since, base_until) if args.baseline_since else None)
+        print(json.dumps(report, sort_keys=True) if args.json else format_trial_report(report))
+        return 0 if report.get('ok') else REFUSED_EXIT
     elif command == 'cancel':
         out = queue_cancel(state_path, args.qid, session_id=args.session_id)
     elif command == 'release':
