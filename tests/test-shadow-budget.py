@@ -37,8 +37,11 @@ def host(used=20 * GIB, cores=16, load1=0.0, band='GREEN', rows=None, rows_prev=
                  'rows': rows or {}, 'rows_prev': rows_prev or {}, 'workloads': workloads or [], 'band': band}, **extra)
 
 
-def holder(label='a', record=CRATE, kind='reservation', created=None, pid=None, excl=('cargo-target:/a',), **extra):
-    return da.budget_holder(kind, dict({'label': label, 'excl_keys': list(excl)}, **dict(record, **extra)), created, pid)
+def holder(label='a', record=CRATE, kind='reservation', created=None, pid=None, excl=('cargo-target:/a',), granted_jobs='declared',
+           **extra):
+    """A running holder started under a job limit equal to its declared slots, unless granted_jobs says otherwise (None: no limit)."""
+    full = dict({'label': label, 'excl_keys': list(excl)}, **dict(record, **extra))
+    return da.budget_holder(kind, full, created, pid, granted_jobs=full.get('cpu_slots') if granted_jobs == 'declared' else granted_jobs)
 
 
 def request(record=CRATE, excl=('cargo-target:/b',), nbytes=20 * GIB, label='new'):
@@ -153,6 +156,22 @@ class Arithmetic(unittest.TestCase):
         over = decide(holders=three, req=request(dict(CRATE, cpu_slots=5)))
         self.assertEqual(over['resource_reasons'], ['cpu: 12 slots in use + 5 requested > 16 cores'])
 
+    def test_a_running_cargo_holder_without_a_recorded_job_limit_may_use_every_core(self):
+        out = decide(holders=[holder(granted_jobs=None)])
+        self.assertEqual((out['holders'][0]['cpu_slots'], out['cpu_slots_used']), (16, 16))
+        self.assertTrue(out['holders'][0]['granted_jobs'] is None)
+        self.assertTrue(any(r.startswith('cpu:') for r in out['resource_reasons']))
+        self.assertFalse(out['fits_if_cap_were_2'])
+
+    def test_a_recorded_job_limit_is_what_a_holder_is_charged_never_more_than_declared(self):
+        self.assertEqual(decide(holders=[holder(granted_jobs=2)])['cpu_slots_used'], 2)
+        self.assertEqual(decide(holders=[holder(granted_jobs=9)])['cpu_slots_used'], 4)
+
+    def test_classes_without_cargo_variables_and_unclaimed_grants_keep_their_declared_charge(self):
+        suite = {'class': 'container-suite', 'mem_bytes': 12 * GIB, 'cpu_slots': 4, 'test_threads': 4}
+        self.assertEqual(decide(holders=[holder(record=suite, granted_jobs=None, excl=('docker',))])['cpu_slots_used'], 4)
+        self.assertEqual(decide(holders=[holder(kind='granted', granted_jobs=None)])['cpu_slots_used'], 4)
+
     def test_memory_headroom_boundaries_are_exact(self):
         limit = RAM * 70 // 100
         need = 6 * GIB
@@ -222,7 +241,8 @@ class Sites(QueueBase):
         return fn
 
     def reserve(self, label, proc, host_fn=None, declared=None, nbytes=20 * GIB):
-        return da.reserve(label, nbytes, proc.pid, self.path, lambda: 400 * GIB, now=self.now, host_fn=host_fn, declared=declared)
+        return da.reserve(label, nbytes, proc.pid, self.path, lambda: 400 * GIB, now=self.now, host_fn=host_fn, declared=declared,
+                          grant_environ={})
 
     def spawn(self):
         proc = subprocess.Popen(['/bin/sleep', '300'], stdin=subprocess.DEVNULL)
@@ -249,6 +269,88 @@ class Sites(QueueBase):
         self.assertFalse(two['budget']['would_admit'])
         self.assertTrue(two['budget']['fits_if_cap_were_2'])
         self.assertEqual(two['budget']['count'], 1)
+
+    def reservation_file(self, label):
+        return json.loads((self.path.parent / 'reservations' / (label + '.json')).read_text())
+
+    def test_a_reservation_records_the_job_limit_it_will_run_with(self):
+        proc = self.spawn()
+        self.assertTrue(self.reserve('job', proc, self.host_fn(), declared=CRATE)['admit'])
+        self.assertEqual(self.reservation_file('job')['granted_jobs'], 4)
+        da.release('job', self.path)
+        self.assertTrue(self.reserve('job', proc, self.host_fn(band='AMBER'), declared=CRATE)['admit'])
+        self.assertEqual(self.reservation_file('job')['granted_jobs'], 2)
+        # a refresh from the CLI (no environment to export into) must not forget it
+        self.assertTrue(da.reserve('job', 20 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now)['admit'])
+        self.assertEqual(self.reservation_file('job')['granted_jobs'], 2)
+
+    def test_the_job_own_lower_setting_is_what_is_recorded_and_an_unusable_one_records_nothing(self):
+        proc = self.spawn()
+        da.reserve('job', 20 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now, host_fn=self.host_fn(), declared=CRATE,
+                   grant_environ={'CARGO_BUILD_JOBS': '1'})
+        self.assertEqual(self.reservation_file('job')['granted_jobs'], 1)
+        da.release('job', self.path)
+        da.reserve('job', 20 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now, host_fn=self.host_fn(), declared=CRATE,
+                   grant_environ={'CARGO_BUILD_JOBS': 'num-cpus-2'})
+        self.assertNotIn('granted_jobs', self.reservation_file('job'))
+
+    def test_no_environment_no_budget_or_a_legacy_job_records_no_limit(self):
+        proc = self.spawn()
+        self.assertTrue(self.reserve('job', proc, self.host_fn(), declared=CRATE, )['admit'])
+        da.release('job', self.path)
+        da.reserve('job', 20 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now, host_fn=self.host_fn(), declared=CRATE)
+        self.assertNotIn('granted_jobs', self.reservation_file('job'))
+        da.release('job', self.path)
+        self.reserve('job', proc, declared=CRATE)
+        self.assertNotIn('granted_jobs', self.reservation_file('job'))
+        da.release('job', self.path)
+        self.reserve('job', proc, self.host_fn())
+        self.assertNotIn('granted_jobs', self.reservation_file('job'))
+
+    def test_a_claim_records_the_limit_on_the_reservation_and_the_claimed_holder(self):
+        self.assertTrue(self.enqueue(declared=dict(CRATE))['ok'])
+        qid = da.queue_advance(self.path, lambda: 400 * GIB, now=self.now)['granted'][0]
+        entry = self.entries()[qid]
+        out = da.queue_claim(self.path, qid, entry['label'], entry['bytes'], ARGV, str(self.worktree), lambda: 400 * GIB,
+                             pid=os.getpid(), now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda p, a: None,
+                             declared=dict(CRATE), host_fn=self.host_fn(band='AMBER'), grant_environ={})
+        self.assertTrue(out['ok'], out)
+        self.assertEqual(self.entries()[qid]['holder']['granted_jobs'], 2)
+        self.assertEqual(self.reservation_file(entry['label'])['granted_jobs'], 2)
+
+    def test_a_claim_without_an_environment_to_export_into_records_none(self):
+        self.assertTrue(self.enqueue(declared=dict(CRATE))['ok'])
+        qid = da.queue_advance(self.path, lambda: 400 * GIB, now=self.now)['granted'][0]
+        entry = self.entries()[qid]
+        out = da.queue_claim(self.path, qid, entry['label'], entry['bytes'], ARGV, str(self.worktree), lambda: 400 * GIB,
+                             pid=os.getpid(), now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda p, a: None,
+                             declared=dict(CRATE), host_fn=self.host_fn())
+        self.assertTrue(out['ok'], out)
+        self.assertNotIn('granted_jobs', self.entries()[qid]['holder'])
+
+    def test_a_claimed_orphan_without_a_limit_is_charged_every_core_and_one_with_a_limit_its_limit(self):
+        entry = {'label': 'o', 'class': 'build-crate', 'mem_bytes': 6 * GIB, 'cpu_slots': 4, 'excl_keys': [],
+                 'holder': {'pid': 5, 'claimed_at': '2026-10-31T11:00:00Z'}}
+        free = da.budget_holders([], [entry], [], SAMPLED)[0]
+        self.assertTrue(free['uncapped'])
+        capped = da.budget_holders([], [dict(entry, holder=dict(entry['holder'], granted_jobs=2))], [], SAMPLED)[0]
+        self.assertEqual((capped['uncapped'], capped['granted_jobs']), (False, 2))
+
+    def test_the_new_field_is_additive_for_reservations_and_claimed_entries(self):
+        proc = self.spawn()
+        self.assertTrue(self.reserve('job', proc, self.host_fn(), declared=CRATE)['admit'])
+        path = self.path.parent / 'reservations/job.json'
+        record = json.loads(path.read_text())
+        self.assertIn('granted_jobs', record)
+        self.assertEqual(da._read_reservation(path)['granted_jobs'], 4)
+        del record['granted_jobs']
+        path.write_text(json.dumps(record))
+        self.assertNotIn('granted_jobs', da._read_reservation(path))   # an older record without it still reads
+        for bad in (True, 0, -1, '4', 4.0, 2 ** 40):
+            path.write_text(json.dumps(dict(record, granted_jobs=bad)))
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                da._read_reservation(path)
+        self.assertNotIn('granted_jobs', da.DECLARED_FIELDS + da.WORKLOAD_FIELDS)   # neither compared at claim nor fingerprinted
 
     def test_without_a_host_sample_the_result_has_no_budget_key(self):
         proc = self.spawn()
@@ -334,7 +436,7 @@ class Sites(QueueBase):
         plain = da.snapshot(self.path, lambda: (400 * GIB, 'test'), now=self.now)
         self.assertNotIn('budget', plain)
         proc = self.spawn()
-        self.assertTrue(self.reserve('job', proc, declared=CRATE)['admit'])
+        self.assertTrue(self.reserve('job', proc, self.host_fn(), declared=CRATE)['admit'])
         shot = da.snapshot(self.path, lambda: (400 * GIB, 'test'), now=self.now, host_fn=self.host_fn())
         budget = shot['budget']
         self.assertEqual((budget['shadow'], budget['count'], budget['band']), ('shadow: not enforced', 1, 'GREEN'))

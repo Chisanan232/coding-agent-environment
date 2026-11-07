@@ -624,9 +624,13 @@ def _valid_declared(record):
     def number(key, upper):
         return key not in record or (type(record[key]) is int and 0 < record[key] <= upper)
 
+    # granted_jobs (SPE-160) is additive: what the claim exported as CARGO_BUILD_JOBS. It is not a declared field, so it is
+    # neither compared at claim nor part of the fingerprint.
+
     owner = record.get('owner')
     return (('class' not in record or (isinstance(record['class'], str) and CLASS_RE.fullmatch(record['class']) is not None))
             and number('mem_bytes', MAX_MEM_BYTES) and number('cpu_slots', MAX_CPU_SLOTS) and number('test_threads', MAX_CPU_SLOTS)
+            and number('granted_jobs', MAX_CPU_SLOTS)
             and ('excl_keys' not in record or (isinstance(record['excl_keys'], list) and len(record['excl_keys']) <= MAX_EXCL_KEYS
                                                and all(isinstance(k, str) and 0 < len(k) <= MAX_EXCL_KEY_LEN
                                                        and not any(ord(c) < 32 or ord(c) == 127 for c in k) for k in record['excl_keys'])))
@@ -657,7 +661,8 @@ def reservations_dir(state_path):
     return state_path.parent / RESERVATIONS_DIR
 
 
-def write_reservation(state_path, label, nbytes, pid, token, expires, queue_id=None, workload=None, declared=None):
+def write_reservation(state_path, label, nbytes, pid, token, expires, queue_id=None, workload=None, declared=None,
+                      granted_jobs=None):
     """Create or replace this job's reservation file; call while holding state_lock."""
     directory = reservations_dir(state_path)
     _refuse_symlinks(directory / label)
@@ -671,6 +676,8 @@ def write_reservation(state_path, label, nbytes, pid, token, expires, queue_id=N
         record['queue_id'] = queue_id
     if workload is not None:
         record['workload'] = workload
+    if granted_jobs:
+        record['granted_jobs'] = granted_jobs
     write_json_atomic(directory / (label + '.json'), record)
     return record
 
@@ -847,20 +854,22 @@ def _refusal(reason, **extra):
 
 def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None,
             token_fn=process_token, ttl=DEFAULT_TTL, owner_fn=process_owner, allow_long=False, table_fn=None, declared=None,
-            host_fn=None):
+            host_fn=None, grant_environ=None):
     """Admit or refuse via _reserve, then record a measurement sample outside the lock for an admitted reservation.
 
-    host_fn (optional) supplies the host sample for the SHADOW budget, taken here before the lock; it never changes the result."""
+    host_fn (optional) supplies the host sample for the SHADOW budget, taken here before the lock; it never changes the result.
+    grant_environ (the environment the job will run with, when this process is about to exec it) lets the reservation record the
+    Cargo job limit the job will actually get."""
     now = now or datetime.now(timezone.utc)
     result = _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long, table_fn, declared,
-                      _host_or_error(host_fn))
+                      _host_or_error(host_fn), grant_environ)
     if result.get('admit') and str(result.get('reason', '')).startswith('reserved '):
         _measure(state_path, 'reserve', result.get('free_bytes'), now)
     return result
 
 
 def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_fn, allow_long, table_fn=None, declared=None,
-             host=None):
+             host=None, grant_environ=None):
     """Admit one heavy job and record its byte reservation, or refuse.
 
     Admission needs: heavy admitted by tier and latch, a free heavy lane, and
@@ -938,7 +947,9 @@ def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_
                 return _with_budget(dict(result, admit=False, reserved_bytes=reserved,
                                          reason='over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
                                              result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB)), budget)
-            write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), workload=workload, declared=declared)
+            granted = _granted_jobs(budget, declared, grant_environ) or (same[0].get('granted_jobs') if same else None)   # a refresh keeps it
+            write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), workload=workload, declared=declared,
+                              granted_jobs=granted)
             return _with_budget(dict(result, reserved_bytes=reserved + nbytes,
                                      reason='reserved %.1f GiB for %s (lane %d of %d)' % (nbytes / GIB, label, len(others) + 1, lanes)),
                                 budget)
@@ -1303,7 +1314,8 @@ def _read_queue_entry(path):
              and (entry.get('grant') is None or (isinstance(entry['grant'], dict) and isinstance(entry['grant'].get('expires'), str)))
              and (entry['state'] != 'CLAIMED' or (isinstance(entry.get('holder'), dict) and type(entry['holder'].get('pid')) is int
                                                   and isinstance(entry['holder'].get('start_token'), str)
-                                                  and ('workload' not in entry['holder'] or _valid_workload(entry['holder']['workload'], entry['holder']['pid'])))))
+                                                  and ('workload' not in entry['holder'] or _valid_workload(entry['holder']['workload'], entry['holder']['pid']))
+                                                  and _valid_declared({k: v for k, v in entry['holder'].items() if k == 'granted_jobs'}))))
     if not valid or not _valid_declared(entry):
         raise ValueError('wrong schema')
     return entry
@@ -1638,7 +1650,7 @@ def _memory_precondition():
 
 def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_bytes, pid=None, now=None, token_fn=process_token,
                 owner_fn=process_owner, ttl=DEFAULT_TTL, memory_fn=_memory_precondition, exec_fn=None, allow_long=False,
-                table_fn=None, declared=None, host_fn=None):
+                table_fn=None, declared=None, host_fn=None, grant_environ=None):
     """Claim a granted lane for this very process, then exec the job; every precondition is revalidated first.
     host_fn feeds the SHADOW budget (sampled after the memory gate, before the lock); it never changes the outcome.
 
@@ -1753,11 +1765,15 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
             if wrapper_is_zombie(pid, token, table_fn):
                 return refuse('process-not-running: pid %d has exited' % pid)
             workload = capture_workload(pid, token, table_fn)
+            granted = _granted_jobs(budget, _declared_fields(entry), grant_environ)
             write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), queue_id=qid, workload=workload,
-                              declared=dict(_declared_fields(entry), created=iso_utc(now)) if any(_declared(entry)) else None)
+                              declared=dict(_declared_fields(entry), created=iso_utc(now)) if any(_declared(entry)) else None,
+                              granted_jobs=granted)
             try:
                 entry['state'] = 'CLAIMED'
                 entry['holder'] = {'pid': pid, 'start_token': token, 'claimed_at': iso_utc(now), 'workload': workload}
+                if granted:
+                    entry['holder']['granted_jobs'] = granted
                 _write_queue_entry(state_path, entry)
             except OSError:
                 try:
@@ -1970,10 +1986,12 @@ def _created_time(text):
         return None
 
 
-def budget_holder(kind, record, created=None, pid=None, workload=None):
+def budget_holder(kind, record, created=None, pid=None, workload=None, granted_jobs=None):
     """Normalised cost record of one thing that occupies the budget. `created` is when its reservation began (None: charge in
-    full); pid is None for a grant nobody has claimed yet (nothing runs, nothing is measured)."""
+    full); pid is None for a grant nobody has claimed yet (nothing runs, nothing is measured). A running Cargo-class holder with no
+    recorded `granted_jobs` was started without a job limit, so it may use every core: `uncapped`."""
     return {'kind': kind, 'label': record['label'], 'class': record.get('class'), 'legacy': _legacy(record),
+            'granted_jobs': granted_jobs, 'uncapped': kind != 'granted' and record.get('class') in GRANT_ENV and not granted_jobs,
             'mem_bytes': record.get('mem_bytes') or 0, 'cpu_slots': record.get('cpu_slots') or 0,
             'excl_keys': list(record.get('excl_keys') or []), 'created': _created_time(created), 'pid': pid,
             'members': [m['pid'] for m in (workload or {}).get('members', [])],
@@ -1989,9 +2007,9 @@ def budget_request(record, nbytes, label):
 def budget_holders(live, orphans, entries, now, skip_id=None):
     """Holders for the budget from lane-site data: live reservations, claimed orphans (judged from their claim time) and the
     unlapsed GRANTED entries other than skip_id (the grant being claimed does not count against itself)."""
-    holders = [budget_holder('reservation', r, r.get('created'), r['pid'], r.get('workload')) for r in live]
-    holders += [budget_holder('orphan', e, e['holder'].get('claimed_at'), e['holder']['pid'], e['holder'].get('workload'))
-                for e in orphans]
+    holders = [budget_holder('reservation', r, r.get('created'), r['pid'], r.get('workload'), r.get('granted_jobs')) for r in live]
+    holders += [budget_holder('orphan', e, e['holder'].get('claimed_at'), e['holder']['pid'], e['holder'].get('workload'),
+                              e['holder'].get('granted_jobs')) for e in orphans]
     holders += [budget_holder('granted', e, None) for e in entries
                 if e['state'] == 'GRANTED' and e['id'] != skip_id and not _entry_lapsed(e, now)]
     return holders
@@ -2036,7 +2054,7 @@ def budget_decision(host, reservations, request, caps):
         fresh = sampled is not None and h['created'] is not None and sampled > h['created']
         rss = sum(rows[p][1] for p in pids) * 1024 if fresh else 0
         rate = sum(max(0.0, rows[p][2] - prev[p][2]) for p in pids if p in prev) / window if fresh and window > 0 else 0.0
-        slots = cores if h['legacy'] else h['cpu_slots']
+        slots = cores if h['legacy'] or h['uncapped'] else min(h['cpu_slots'], h['granted_jobs'] or h['cpu_slots'])
         load_credit += min(slots, rate)
         measured_cpu += rate
         legacy += h['legacy']
@@ -2044,7 +2062,7 @@ def budget_decision(host, reservations, request, caps):
         residual += charge or 0
         holders.append({'label': h['label'], 'kind': h['kind'], 'class': h['class'], 'legacy': h['legacy'], 'est_mem_bytes': h['mem_bytes'],
                         'measured_rss_bytes': rss, 'charge_bytes': charge, 'cpu_slots': slots, 'measured_cpu': round(rate, 2),
-                        'counted_measurement': bool(fresh), 'flags': h['flags']})
+                        'counted_measurement': bool(fresh), 'flags': h['flags'], 'granted_jobs': h['granted_jobs']})
     unmanaged = [w for w in host.get('workloads') or []
                  if w.get('root_pid') is None or (w['root_pid'] not in managed and not managed & set(w.get('members') or []))]
     lpc = None
@@ -2169,6 +2187,18 @@ def grant_env(budget, declared, environ):
         if value is not None:
             out[name] = str(value)
     return out
+
+
+def _granted_jobs(budget, declared, environ):
+    """The CARGO_BUILD_JOBS value this job will actually run with, or None when it gets no limit (no environment to export into,
+    no budget, a class without Cargo variables, or a setting of its own that is not a positive integer)."""
+    if environ is None:
+        return None
+    try:
+        value = grant_env(budget, declared, environ).get('CARGO_BUILD_JOBS')
+        return int(value) if value else None
+    except Exception:
+        return None
 
 
 def apply_grant_env(budget, declared):
@@ -2470,7 +2500,8 @@ def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, tt
     if not argv or not all(isinstance(part, str) and '\0' not in part for part in argv) or not argv[0]:
         print('refused: invalid-request: a command is required after --', file=sys.stderr)
         return REFUSED_EXIT
-    result = reserve(label, nbytes, os.getpid(), state_path, free_fn, ttl=ttl, allow_long=allow_long, declared=declared, host_fn=host_fn)
+    result = reserve(label, nbytes, os.getpid(), state_path, free_fn, ttl=ttl, allow_long=allow_long, declared=declared, host_fn=host_fn,
+                     grant_environ=os.environ)
     if not result['admit']:
         print(result['reason'], file=sys.stderr)
         if result.get('budget'):
@@ -2660,7 +2691,7 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None, host_fn=None):
             return REFUSED_EXIT
         if args.queue_id:
             out = queue_claim(state_path, args.queue_id, args.label, args.nbytes, job, os.getcwd(), free_fn, ttl=args.ttl,
-                              allow_long=args.allow_long, declared=declared, host_fn=host_fn)
+                              allow_long=args.allow_long, declared=declared, host_fn=host_fn, grant_environ=os.environ)
             if not out['ok']:
                 print(out['reason'], file=sys.stderr)
             return out['exit'] if not out['ok'] else 0
