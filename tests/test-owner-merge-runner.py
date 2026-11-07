@@ -75,6 +75,7 @@ class FakeGh:
         self.protection = protection  # (rc, stdout-or-stderr) for the branch-protection read
         self.plan_limited = plan_limited
         self.runs = None  # optional callable(name) -> check-runs body
+        self.actions = {}  # "<run id>" or "<run id>/jobs?per_page=100" -> (rc, body); SPE-159 path-filter proof
         self.jobs = jobs if jobs is not None else {}  # job id -> (rc, job dict); a callable is invoked per read
         self.fetches = 0
         self.readback_base = None
@@ -108,6 +109,9 @@ class FakeGh:
             body = self.runs(name) if self.runs else {"total_count": 1, "check_runs": [
                 {"name": name, "head_sha": HEAD, "app": {"slug": "github-actions"}}]}
             return 0, json.dumps(body), ""
+        if argv[0] == "api" and "/actions/runs/" in argv[1]:
+            rc, body = self.actions.get(argv[1].split("/actions/runs/")[1], (1, None))
+            return (0, json.dumps(body), "") if rc == 0 else (1, "", "HTTP 500")
         if argv[0] == "api" and "/actions/jobs/" in argv[1]:
             job = self.jobs[argv[1].rsplit("/", 1)[1]]
             rc, body = job() if callable(job) else job
@@ -1473,6 +1477,202 @@ def unavailable(verdict="FAILURE", url=None, name="ci"):
     return [{"__typename": "CheckRun", "name": name, "status": "COMPLETED", "conclusion": verdict,
              "detailsUrl": f"https://github.com/{REPO}/actions/runs/5/job/{JOB_ID}" if url is None else url},
             {"__typename": "StatusContext", "context": "SonarCloud Code Analysis", "state": "SUCCESS"}]
+
+
+SKIP_JOB, PASS_JOB, SKIP_RUN, PASS_RUN, WF = "50", "60", "5", "6", 77
+
+
+def _run(run_id, event, **over):
+    r = {"id": int(run_id), "head_sha": HEAD, "status": "completed", "conclusion": "success", "event": event,
+         "workflow_id": WF, "path": ".github/workflows/ci.yml", "repository": {"full_name": REPO},
+         "head_repository": {"full_name": REPO}}
+    r.update(over)
+    return r
+
+
+def _job(job_id, run_id, name="ci", conclusion="success", steps=True, **over):
+    j = {"id": int(job_id), "run_id": int(run_id), "name": name, "head_sha": HEAD, "status": "completed",
+         "conclusion": conclusion, "runner_id": 3 if steps else 0, "runner_name": "GitHub Actions 3" if steps else "",
+         "steps": [{"name": "run", "conclusion": "success"}] if steps else []}
+    j.update(over)
+    return j
+
+
+class PathFilteredSkip(Base):
+    """SPE-159: a SKIPPED required check is ignored only with proof of a path-filtered skip AND a trusted passing run
+    of the same job at the exact head. Everything else (and every API problem) keeps refusing."""
+
+    def build(self, rollup=True, skipped_run=None, pass_check=True, mutate=None, **kw):
+        url = lambda run, job: f"https://github.com/{REPO}/actions/runs/{run}/job/{job}"
+        skip_entry = {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SKIPPED",
+                      "detailsUrl": url(SKIP_RUN, SKIP_JOB)}
+        pass_entry = {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS",
+                      "detailsUrl": url(PASS_RUN, PASS_JOB)}
+        sonar = green()[1]
+        entries = [skip_entry] + ([pass_entry] if pass_check else []) + [sonar]
+        gh = FakeGh(base_pr(statusCheckRollup=entries if rollup is True else rollup), **kw)
+        app = {"slug": "github-actions"}
+        cr = [{"id": int(SKIP_JOB), "name": "ci", "head_sha": HEAD, "app": app, "status": "completed", "conclusion": "skipped"}]
+        if pass_check:
+            cr.append({"id": int(PASS_JOB), "name": "ci", "head_sha": HEAD, "app": app, "status": "completed",
+                       "conclusion": "success"})
+        gh.runs = lambda name: {"total_count": len(cr), "check_runs": cr if name == "ci" else []}
+        gh.jobs = {SKIP_JOB: (0, _job(SKIP_JOB, SKIP_RUN, conclusion="skipped", steps=False)),
+                   PASS_JOB: (0, _job(PASS_JOB, PASS_RUN))}
+        gate = _job("40", SKIP_RUN, name="changes")
+        gh.actions = {SKIP_RUN: (0, _run(SKIP_RUN, "pull_request")),
+                      PASS_RUN: (0, _run(PASS_RUN, "workflow_dispatch")),
+                      f"{SKIP_RUN}/jobs?per_page=100": (0, {"total_count": 2, "jobs": [
+                          gate, _job(SKIP_JOB, SKIP_RUN, conclusion="skipped", steps=False)]})}
+        if mutate:
+            mutate(gh, cr)
+        return gh
+
+    def refused(self, gh):
+        self.assertRefused(gh, "check ci is SKIPPED")
+
+    def test_accepted_with_skip_plus_trusted_pass_on_exact_head(self):
+        gh = self.build()
+        code, rec = self.go(gh, dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+        self.assertEqual(rec["checks"]["path_filtered_skips"], ["ci"])
+        self.assertEqual(rec["checks"]["path_filtered_skips_ignored"], 1)
+
+    def test_real_merge_still_runs_once_and_other_gates_still_checked(self):
+        gh = self.build()
+        code, rec = self.go(gh)
+        self.assertEqual((code, rec["outcome"], len(gh.merges())), (omr.EXIT_OK, "MERGED", 1), rec)
+        self.assertRefused(self.build(rollup=True, rules=server_rules(["SonarCloud Code Analysis"])), "not required server-side")
+        pr = base_pr(statusCheckRollup=self.build().pr["statusCheckRollup"], mergeable="CONFLICTING")
+        gh2 = self.build()
+        gh2.pr = pr
+        self.assertRefused(gh2, "mergeable is CONFLICTING")
+
+    def test_skip_only_without_any_passing_run_is_refused(self):
+        self.refused(self.build(pass_check=False))
+
+    def test_pass_on_a_different_head_only_is_refused(self):
+        def m(gh, cr):
+            cr[1]["head_sha"] = OTHER
+        self.refused(self.build(mutate=m))
+        self.refused(self.build(mutate=lambda gh, cr: gh.jobs.__setitem__(PASS_JOB, (0, _job(PASS_JOB, PASS_RUN, head_sha=OTHER)))))
+        self.refused(self.build(mutate=lambda gh, cr: gh.actions.__setitem__(PASS_RUN, (0, _run(PASS_RUN, "workflow_dispatch", head_sha=OTHER)))))
+
+    def test_a_failure_is_never_ignored(self):
+        fail = {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"}
+        base = self.build().pr["statusCheckRollup"]
+        self.assertRefused(self.build(rollup=base + [fail]), "check ci is FAILURE")
+        self.assertRefused(self.build(rollup=[base[0], fail, base[2]]), "check ci is FAILURE")
+        # a failing check run listed next to the passing one (rollup shows only the pass and the skip)
+        def m(gh, cr):
+            cr.append({"id": 61, "name": "ci", "head_sha": HEAD, "app": {"slug": "github-actions"},
+                       "status": "completed", "conclusion": "failure"})
+        self.refused(self.build(mutate=m))
+        for verdict in ("CANCELLED", "TIMED_OUT", "NEUTRAL", "ACTION_REQUIRED", "IN_PROGRESS"):
+            with self.subTest(verdict=verdict):
+                bad = dict(fail, conclusion=verdict) if verdict != "IN_PROGRESS" else {"__typename": "CheckRun", "name": "ci", "status": "IN_PROGRESS"}
+                gh = self.build(rollup=base + [bad])
+                code, rec = self.go(gh, dry=True)
+                self.assertEqual(code, omr.EXIT_REFUSED, rec)
+
+    def test_untrusted_passes_are_refused(self):
+        def app(gh, cr):
+            cr[1]["app"] = {"slug": "evil-checks"}
+        self.refused(self.build(mutate=app))
+        def noapp(gh, cr):
+            del cr[1]["app"]
+        self.refused(self.build(mutate=noapp))
+        cases = {"fork repository": _run(PASS_RUN, "workflow_dispatch", repository={"full_name": "evil/demo-repo"}),
+                 "fork head repository": _run(PASS_RUN, "workflow_dispatch", head_repository={"full_name": "evil/demo-repo"}),
+                 "null head repository": _run(PASS_RUN, "workflow_dispatch", head_repository=None),
+                 "bad event": _run(PASS_RUN, "pull_request_target"),
+                 "dynamic workflow": _run(PASS_RUN, "workflow_dispatch", path="dynamic/copilot"),
+                 "other path dir": _run(PASS_RUN, "workflow_dispatch", path="scripts/ci.yml"),
+                 "different workflow": _run(PASS_RUN, "workflow_dispatch", workflow_id=78),
+                 "different workflow file": _run(PASS_RUN, "workflow_dispatch", path=".github/workflows/other.yml"),
+                 "not completed": _run(PASS_RUN, "workflow_dispatch", status="in_progress"),
+                 "wrong id": _run(PASS_RUN, "workflow_dispatch", id=999)}
+        for label, run in cases.items():
+            with self.subTest(label):
+                self.refused(self.build(mutate=lambda gh, cr, run=run: gh.actions.__setitem__(PASS_RUN, (0, run))))
+
+    def test_pass_with_zero_or_failed_steps_or_wrong_job_is_refused(self):
+        bad = {"zero steps": _job(PASS_JOB, PASS_RUN, steps=False),
+               "failed step": _job(PASS_JOB, PASS_RUN, steps=[{"conclusion": "failure"}]),
+               "only skipped steps": _job(PASS_JOB, PASS_RUN, steps=[{"conclusion": "skipped"}]),
+               "wrong name": _job(PASS_JOB, PASS_RUN, name="other"),
+               "not success": _job(PASS_JOB, PASS_RUN, conclusion="failure"),
+               "wrong id": _job(PASS_JOB, PASS_RUN, id=61)}
+        bad["failed step"]["steps"] = [{"conclusion": "failure"}]
+        bad["only skipped steps"]["steps"] = [{"conclusion": "skipped"}]
+        for label, job in bad.items():
+            with self.subTest(label):
+                self.refused(self.build(mutate=lambda gh, cr, job=job: gh.jobs.__setitem__(PASS_JOB, (0, job))))
+
+    def test_api_errors_and_malformed_data_are_refused(self):
+        for key in (SKIP_RUN, PASS_RUN, f"{SKIP_RUN}/jobs?per_page=100"):
+            with self.subTest(key=key):
+                self.refused(self.build(mutate=lambda gh, cr, key=key: gh.actions.__setitem__(key, (1, None))))
+                self.refused(self.build(mutate=lambda gh, cr, key=key: gh.actions.__setitem__(key, (0, ["x"]))))
+        for job in (SKIP_JOB, PASS_JOB):
+            with self.subTest(job=job):
+                self.refused(self.build(mutate=lambda gh, cr, job=job: gh.jobs.__setitem__(job, (1, None))))
+                self.refused(self.build(mutate=lambda gh, cr, job=job: gh.jobs.__setitem__(job, (0, ["x"]))))
+        self.refused(self.build(mutate=lambda gh, cr: setattr(gh, "runs", lambda n: {"total_count": 5, "check_runs": cr})))
+
+    def test_skip_must_be_a_gated_pull_request_job(self):
+        gate = _job("40", SKIP_RUN, name="changes")
+        skipped = _job(SKIP_JOB, SKIP_RUN, conclusion="skipped", steps=False)
+        listing = lambda *jobs: (0, {"total_count": len(jobs), "jobs": list(jobs)})
+        key = f"{SKIP_RUN}/jobs?per_page=100"
+        cases = [("skip job executed steps", "jobs", SKIP_JOB, (0, _job(SKIP_JOB, SKIP_RUN, conclusion="skipped"))),
+                 ("skip job ran on a runner", "jobs", SKIP_JOB, (0, _job(SKIP_JOB, SKIP_RUN, conclusion="skipped", steps=False, runner_id=9))),
+                 ("skip job is not skipped", "jobs", SKIP_JOB, (0, _job(SKIP_JOB, SKIP_RUN, conclusion="cancelled", steps=False))),
+                 ("skip job of another head", "jobs", SKIP_JOB, (0, _job(SKIP_JOB, SKIP_RUN, conclusion="skipped", steps=False, head_sha=OTHER))),
+                 ("skip run is push", "actions", SKIP_RUN, (0, _run(SKIP_RUN, "push"))),
+                 ("skip run failed", "actions", SKIP_RUN, (0, _run(SKIP_RUN, "pull_request", conclusion="failure"))),
+                 ("skip run from a fork", "actions", SKIP_RUN, (0, _run(SKIP_RUN, "pull_request", head_repository={"full_name": "evil/demo-repo"}))),
+                 ("no gating sibling", "actions", key, listing(skipped)),
+                 ("sibling failed", "actions", key, listing(_job("40", SKIP_RUN, name="changes", conclusion="failure"), skipped)),
+                 ("sibling has zero steps", "actions", key, listing(_job("40", SKIP_RUN, name="changes", steps=False), skipped)),
+                 ("sibling listing incomplete", "actions", key, (0, {"total_count": 3, "jobs": [gate, skipped]})),
+                 ("skipped job absent from run", "actions", key, listing(gate, _job("41", SKIP_RUN, name="lint", conclusion="skipped", steps=False)))]
+        for label, kind, k, val in cases:
+            with self.subTest(label):
+                def m(gh, cr, kind=kind, k=k, val=val):
+                    (gh.jobs if kind == "jobs" else gh.actions)[k] = val
+                self.refused(self.build(mutate=m))
+
+    def test_detail_url_must_point_at_this_repository(self):
+        for url in (f"https://github.com/evil/demo-repo/actions/runs/{SKIP_RUN}/job/{SKIP_JOB}", None, "https://example.com/x"):
+            with self.subTest(url=url):
+                gh = self.build()
+                gh.pr["statusCheckRollup"][0]["detailsUrl"] = url
+                self.refused(gh)
+        gh = self.build()
+        gh.pr["statusCheckRollup"][0] = {"__typename": "StatusContext", "context": "ci", "state": "SKIPPED"}
+        code, rec = self.go(gh, dry=True)
+        self.assertEqual(code, omr.EXIT_REFUSED, rec)
+
+    def test_a_non_required_skip_is_unchanged_and_makes_no_proof_calls(self):
+        gh = FakeGh(base_pr(statusCheckRollup=green() + [{"__typename": "CheckRun", "name": "publish", "status": "COMPLETED",
+                                                           "conclusion": "SKIPPED"}]))
+        code, rec = self.go(gh, dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+        self.assertEqual(rec["checks"]["path_filtered_skips"], [])
+        self.assertFalse([c for c in gh.calls if "/actions/" in c[-1]])
+
+    def test_proof_reads_only_fixed_run_shapes(self):
+        gh = self.build()
+        self.go(gh, dry=True)
+        paths = [c[1] for c in gh.calls if c[0] == "api" and "/actions/" in c[1]]
+        self.assertTrue(paths)
+        for path in ("repos/a/b/actions/runs/1/jobs?per_page=99", "repos/a/b/actions/runs/1/../x", "repos/a/b/actions/runs/x",
+                     "repos/a/b/actions/runs/1/artifacts"):
+            with self.assertRaises(RuntimeError):
+                omr.check_argv(["api", path])
+        self.assertEqual(omr.check_argv(["api", "repos/a/b/actions/runs/1"]), "run")
+        self.assertEqual(omr.check_argv(["api", "repos/a/b/actions/runs/1/jobs?per_page=100"]), "run-jobs")
 
 
 class LocalEquivalentCi(Base):
