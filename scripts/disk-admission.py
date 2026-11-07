@@ -1045,6 +1045,21 @@ def _read_pressure():
     return level if level in (1, 2, 4) else None
 
 
+SWAPUSAGE_USED_RE = re.compile(r'used\s*=\s*([\d.]+)\s*([KMG])')
+
+
+def _read_swap_used():
+    """Swap currently in use in bytes (vm.swapusage); None when unreadable. Telemetry only: macOS keeps swap files allocated long
+    after the pages stop mattering, so this is a trend across a trial, never an admission input."""
+    try:
+        done = subprocess.run(['/usr/sbin/sysctl', '-n', 'vm.swapusage'], capture_output=True, text=True, timeout=5,
+                              stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/usr/sbin:/usr/bin'})
+        match = SWAPUSAGE_USED_RE.search(done.stdout)
+        return int(float(match.group(1)) * {'K': 1024, 'M': MIB, 'G': GIB}[match.group(2)]) if match else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 def _subtree(rows, root):
     """(rss_bytes, cpu_s, process count) of root and every descendant; None when root is not running."""
     if root not in rows:
@@ -1103,7 +1118,7 @@ def _measure(state_path, source, free_bytes=None, now=None):
         if rows is None:
             MEASUREMENT_FAILURES += 1
             return
-        pressure = _read_pressure()
+        pressure, swap_used = _read_pressure(), _read_swap_used()
         for record in holders:
             try:
                 if process_token(record['pid']) != record['start_token']:
@@ -1115,7 +1130,7 @@ def _measure(state_path, source, free_bytes=None, now=None):
                 continue  # the holder is gone: the lazy reaper owns that, and a dead process has nothing to measure
             line = dict(_run_key(record), v=MEASUREMENT_VERSION, ts=iso_utc(now), event=source, rss_bytes=tree[0],
                         cpu_s=round(tree[1], 2), procs=tree[2], pressure=pressure, concurrent=len(holders),
-                        free_bytes=free_bytes)
+                        free_bytes=free_bytes, swap_used_bytes=swap_used)
             if record.get('queue_id'):
                 line['queue_id'] = record['queue_id']
             if isinstance(record.get('class'), str):
