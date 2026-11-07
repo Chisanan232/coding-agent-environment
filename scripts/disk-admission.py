@@ -2133,9 +2133,14 @@ def _lowered(existing, grant):
     if existing is None or not existing.strip():
         return grant
     text = existing.strip()
-    if not (text.isascii() and text.isdigit() and int(text) > 0):
+    if not (text.isascii() and text.isdigit()):
         return None
-    return min(int(text), grant)
+    digits = text.lstrip('0')
+    if not digits:
+        return None
+    if len(digits) > 6:
+        return grant   # int() raises past 4300 digits; any value this long is above every grant anyway
+    return min(int(digits), grant)
 
 
 def grant_env(budget, declared, environ):

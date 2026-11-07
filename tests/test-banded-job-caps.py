@@ -74,6 +74,12 @@ class GrantEnv(unittest.TestCase):
             env = {'CARGO_BUILD_JOBS': bad, 'RUST_TEST_THREADS': bad, 'NEXTEST_TEST_THREADS': bad}
             self.assertEqual(da.grant_env(budget('build-workspace'), fields('build-workspace'), env), {}, bad)
 
+    def test_an_oversized_integer_is_lowered_and_never_raises(self):
+        for big in ('9' * 7, '1' + '0' * 5000, '9' * 4301):
+            self.assertEqual(da.grant_env(budget(), fields(), {'CARGO_BUILD_JOBS': big})['CARGO_BUILD_JOBS'], '4', big[:8])
+        self.assertEqual(da.grant_env(budget(), fields(), {'CARGO_BUILD_JOBS': '0000002'})['CARGO_BUILD_JOBS'], '2')
+        self.assertNotIn('CARGO_BUILD_JOBS', da.grant_env(budget(), fields(), {'CARGO_BUILD_JOBS': '0' * 5000}))
+
     def test_only_the_unusable_variable_is_left_alone(self):
         out = da.grant_env(budget(), fields(), {'CARGO_BUILD_JOBS': '-1'})
         self.assertEqual(out, {'RUST_TEST_THREADS': '4'})
