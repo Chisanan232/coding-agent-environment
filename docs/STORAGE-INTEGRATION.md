@@ -113,8 +113,9 @@ State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
   read-only `snapshot --check-fresh [--max-age N]` (exit 0 fresh; 77 stale,
   missing or unreadable). N may only tighten the rule: values above 120 or
   below 1 are refused with exit 77. The gate does not use the snapshot: it always asks the
-  adapter for a fresh `check`. `heavy_lanes_allowed` is 0 below 100 GiB or while
-  latched and 1 in stable and wide until a second-lane analysis is approved.
+  adapter for a fresh `check`. `heavy_lanes_allowed` is `heavy_lane_cap()`: 0 below 100 GiB or while
+  latched, else the tier's cap (1 until ADR 0017 revision 2's flip merges, then 2 in stable and wide; a second lane is admitted only
+  when the resource budget passes, so `active_heavy_jobs < heavy_lanes_allowed` is not permission to start).
   `protection` stays `advisory-not-wired` until the gate is proven wired.
 - `reservations/<label>.json`: `reserve --bytes N --pid P --label L` admits a
   heavy job only if the tier and latch admit it, a lane is free, P is a live
@@ -149,7 +150,7 @@ callers that use them: the gate hook still decides on tier and latch alone, so a
 beside a reserved one. This state is advisory (same-user), not a security boundary.
 ### Heavy-lane queue (`queue`, SPE-111)
 
-A first-in-first-out, non-preemptive queue for the heavy lane (one lane today). It never signals, releases or reaps a holder; it only
+A first-in-first-out, non-preemptive queue for the heavy lanes (one lane until ADR 0017 revision 2's flip, then two). It never signals, releases or reaps a holder; it only
 decides who is granted the lane after the current holder is gone.
 
 - `queue enqueue --label L --ticket T [--ticket T2] --repo R --worktree W --harness claude|codex --session-id ID --bytes N
@@ -158,7 +159,8 @@ decides who is granted the lane after the current holder is gone.
   never the argv. The same live job returns the existing entry; a RELEASED, EXPIRED or CANCELLED job needs `--again`.
 - `queue advance` runs one step under the lock: it expires lapsed grants and waits, then grants the FIRST entry in line only
   if live reservations (including past-TTL and unverifiable ones) plus unclaimed grants are fewer than the tier's heavy
-  lanes and the latch is off. A tier or latch without a heavy lane marks the first entry ELIGIBLE and grants nothing.
+  lanes and the latch is off; with two lanes it then tries the next entry too, and a lane beside a running job also needs the
+  resource budget (see RESOURCE-ADMISSION.md), stopping at the first entry that does not fit. A tier or latch without a heavy lane marks the first entry ELIGIBLE and grants nothing.
   The first entry is granted only if its bytes also fit (`free - reserved - bytes >= 100 GiB`); otherwise nothing is granted and
   the reason says so. `ELIGIBLE` means "first in line but the tier or latch offers no heavy lane right now", not "ready".
   A grant lasts 60 min (at most 4 h) and writes `queue/granted/<id>` plus a receipt line in `queue/receipts.jsonl`
@@ -177,7 +179,8 @@ decides who is granted the lane after the current holder is gone.
   job. Before anything runs it revalidates, outside the lock: entry GRANTED and unlapsed, owned by this uid, label, bytes,
   current worktree and job fingerprint all match; then a fresh `memory-admission.py check --weight heavy --memory-only`
   (memory pressure, swap I/O, CPU load, other heavy processes). Under the lock it checks the entry again, then tier, latch,
-  heavy lanes (the grant itself does not count), the 100 GiB disk floor and that the claiming process is alive and owned, and
+  heavy lanes (the grant itself does not count), the 100 GiB disk floor, the resource budget when a job is already running, and that
+  the claiming process is alive and owned, and
   writes the holder reservation (with `queue_id`) and the CLAIMED entry in one critical section. A refusal exits 77 and keeps
   the grant; retrying is one explicit call, never a loop. A second claim of the same grant is refused; a failed `exec`
   releases the reservation and marks the entry RELEASED (`exec-failed`, exit 127).
