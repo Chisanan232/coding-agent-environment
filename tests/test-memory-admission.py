@@ -547,7 +547,7 @@ class IdleOrphan(unittest.TestCase):
         m = ma.derive(sample(0, idle=idle, heavy={"cargo": 1}), sample(10, idle=idle, heavy={"cargo": 1}))
         verdict, _ = ma.decide("heavy", m, None, 1000.0)
         self.assertFalse(verdict["admit"])
-        self.assertIn("one heavy lane at a time", " ".join(verdict["reasons"]))
+        self.assertIn("heavy lanes full (unattributed; cap 1)", " ".join(verdict["reasons"]))
         loaded = ma.derive(sample(0, idle=idle, load=100.0), sample(10, idle=idle, load=100.0))
         self.assertFalse(ma.decide("heavy", loaded, None, 1000.0)[0]["admit"])
 
@@ -677,7 +677,7 @@ class WorkloadTree(unittest.TestCase):
         m = ma.derive(sample(0), dict(sample(10), heavy_workloads=s["heavy_workloads"]))
         reasons, _ = ma.refusal_reasons("heavy", m)
         self.assertEqual(len([r for r in reasons if "heavy build workload" in r]), 1)
-        self.assertIn("1 heavy build workload(s) running (cargo: 5 procs, 5.0 GiB): one heavy lane at a time", " ".join(reasons))
+        self.assertIn("1 heavy build workload(s) running (cargo: 5 procs, 5.0 GiB): heavy lanes full (1 of 1)", " ".join(reasons))
 
     def test_two_separate_trees_are_two_workloads(self):
         other = [self.line(200, 500, "/x/cargo", state="R"), self.line(201, 200, "/x/rustc", state="R")]
@@ -704,7 +704,7 @@ class WorkloadTree(unittest.TestCase):
         m = ma.derive(first, self.take(ps_out(*busier)))
         self.assertFalse(m["heavy_workloads"][0]["idle"])
         reasons, _ = ma.refusal_reasons("heavy", m)
-        self.assertIn("one heavy lane at a time", " ".join(reasons))
+        self.assertIn("heavy lanes full", " ".join(reasons))
 
     def test_heavy_processes_that_form_no_workload_still_refuse(self):
         # A ppid cycle or a duplicate pid leaves no workload root; heavy-named processes without a workload must not be admitted.
@@ -714,7 +714,7 @@ class WorkloadTree(unittest.TestCase):
             m = ma.derive(self.take(ps_out(*lines)), self.take(ps_out(*lines)))
             self.assertEqual(m["heavy_workloads"], [])
             reasons, _ = ma.refusal_reasons("heavy", m)
-            self.assertIn("one heavy lane at a time", " ".join(reasons))
+            self.assertIn("heavy lanes full", " ".join(reasons))
 
     def test_a_non_heavy_member_spending_cpu_makes_the_tree_active(self):
         first = self.take(ps_out(*self.tree(root_ppid=1)))

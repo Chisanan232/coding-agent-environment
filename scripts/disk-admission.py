@@ -307,8 +307,24 @@ LABEL_RE = re.compile(r'[A-Za-z0-9_][A-Za-z0-9._-]{0,63}')
 DEFAULT_TTL = 4 * 3600
 MAX_TTL = 24 * 3600
 HEAVY_FLOOR = LOW_BELOW
-# One heavy lane in stable and wide until a second-lane analysis is approved.
+# Concurrent heavy lanes per tier. Lane 1 is admitted by the disk rules alone; lanes 2 and up also need the resource budget to
+# pass (see _budget_allows), so a tier's number is a ceiling, not a promise.
 HEAVY_LANES = {'emergency': 0, 'low': 0, 'stable': 1, 'wide': 1}
+# A third lane is a separate reviewed change (SPE-160): flip THIRD_LANE_ENABLED in its own PR with the `queue trial-report` PASS
+# output and owner sign-off. LANE_CEILING is the most that flag, or any edit of HEAVY_LANES, can ever yield.
+LANE_CEILING = 3
+THIRD_LANE_ENABLED = False
+
+
+def heavy_lane_cap(tier, latch=False):
+    """Heavy lanes allowed at `tier`: 0 while latched or below stable, else HEAVY_LANES[tier], plus one for the wide tier once the
+    third lane is enabled, never above LANE_CEILING. The one place a lane count is decided."""
+    if latch:
+        return 0
+    lanes = HEAVY_LANES.get(tier, 0)
+    if lanes and tier == 'wide' and THIRD_LANE_ENABLED:
+        lanes += 1
+    return min(lanes, LANE_CEILING)
 
 
 class ReservationError(Exception):
@@ -927,7 +943,7 @@ def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_
                 declared = _declared_fields(same[0])   # a refresh without a declaration keeps what the job declared before
             if same and same[0].get('workload') is not None:
                 workload = merge_workload(same[0]['workload'], workload)   # a refresh must not forget reparented members
-            lanes = HEAVY_LANES[result['tier']]
+            lanes = heavy_lane_cap(result['tier'], result['latch'])
             reserved = sum(r['bytes'] for r in others) + sum(e['bytes'] for e in orphans)
             lane_full = len(others) + len(orphans) >= lanes
             budget = None
@@ -1607,7 +1623,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
             granted = [e for e in entries if e['state'] == 'GRANTED']
             if not waiting:
                 return out
-            lanes = 0 if result['latch'] else HEAVY_LANES[result['tier']]
+            lanes = heavy_lane_cap(result['tier'], result['latch'])
             first = waiting[0]
             if lanes == 0:
                 if first['state'] != 'ELIGIBLE':
@@ -1761,7 +1777,7 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
             if any(r['label'] == label for r in live):
                 return refuse('label-in-use: %s already holds a reservation' % label)
             orphans = _claimed_orphans(entries, live, token_fn, table_fn, state_path)
-            lanes = HEAVY_LANES[result['tier']]
+            lanes = heavy_lane_cap(result['tier'], result['latch'])
             reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
             lane_full = len(live) + len(orphans) >= lanes
             if host is not None:
@@ -2189,8 +2205,6 @@ SHADOW_NOTE = 'shadow: not enforced'
 UNMANAGED_ALLOWANCE = 8 * GIB
 HEADROOM_PERCENT = {'GREEN': 30, 'AMBER': 40}        # memory kept free: 0.30 / 0.40 of RAM
 CPU_BUDGET_PERCENT = 100                              # cpu_slots may sum to cores x 1.0
-MAX_CONCURRENT = {'emergency': 0, 'low': 0, 'stable': 1, 'wide': 1}   # constant 1 everywhere a heavy lane exists
-PROBE_CAP = 2                                         # `fits_if_cap_were_2` asks what a second concurrent job would have met
 SHADOW_DEADLINE_S = 3.0                              # overall wall-time cap on one host sample, ps rounds included
 SHADOW_WINDOW_S = 2.0                                 # host sample window; memory-admission's own check uses 10 s
 BAND_RANK = {'GREEN': 0, 'AMBER': 1, 'RED': 2}
@@ -2261,7 +2275,7 @@ def budget_decision(host, reservations, request, caps):
     host: {'ram','used','cores','load1','time' (aware datetime),'window_s','rows','rows_prev','workloads','band' or
     'band_fn'(corrected load per core -> (band, reasons))} or None/{'error':..}. request: budget_request() or None for state
     only. caps: {'max_concurrent','free_bytes','reserved_bytes','floor'}. Returns a JSON-safe dict; `would_admit` honours the
-    concurrency cap, `fits_if_cap_were_2` is the same verdict with the cap raised to 2, `resource_reasons` explains every
+    concurrency cap, `fits_if_cap_were_2` / `fits_if_cap_were_3` are the same verdict with the cap raised to 2 / 3, `resource_reasons` explains every
     non-cap refusal and `cap_reason` the cap.
     """
     out = {'shadow': SHADOW_NOTE, 'status': 'ok'}
@@ -2342,7 +2356,8 @@ def budget_decision(host, reservations, request, caps):
     def fits(limit_count):
         return not reasons and count + 1 <= limit_count
 
-    out.update(resource_reasons=reasons, would_admit=fits(cap), fits_if_cap_were_2=fits(PROBE_CAP if cap > 0 else 0),
+    out.update(resource_reasons=reasons, would_admit=fits(cap), fits_if_cap_were_2=fits(2 if cap > 0 else 0),
+               fits_if_cap_were_3=fits(LANE_CEILING if cap > 0 else 0),
                cap_reason=None if count + 1 <= cap else 'cap: %d running + 1 > max concurrent %d' % (count, cap))
     jobs, threads = request['cpu_slots'], request['test_threads']
     floor_jobs = WORKLOAD_CLASSES.get(request['class'], {}).get('min_jobs') or 1
@@ -2440,9 +2455,9 @@ def budget_line(budget):
             SHADOW_NOTE, budget['band'], _gib(budget['projected_bytes']), _gib(budget['limit_bytes']), budget['cpu_slots_used'],
             budget['cpu_limit'])
     why = budget['resource_reasons'] + ([budget['cap_reason']] if budget['cap_reason'] else [])
-    return 'budget (%s): would %s%s; fits_if_cap_were_2=%s; band %s; projected %s of %s; %d/%d cpu slots; lane check decided %s' % (
+    return 'budget (%s): would %s%s; fits_if_cap_were_2=%s; fits_if_cap_were_3=%s; band %s; projected %s of %s; %d/%d cpu slots; lane check decided %s' % (
         SHADOW_NOTE, 'admit' if budget['would_admit'] else 'refuse', ' (%s)' % '; '.join(why) if why else '',
-        str(budget['fits_if_cap_were_2']).lower(), budget['band'], _gib(budget['projected_bytes']), _gib(budget['limit_bytes']),
+        str(budget['fits_if_cap_were_2']).lower(), str(budget['fits_if_cap_were_3']).lower(), budget['band'], _gib(budget['projected_bytes']), _gib(budget['limit_bytes']),
         budget['cpu_slots_used'] + budget.get('request_cpu_slots', 0), budget['cpu_limit'], budget.get('enforced', 'n/a'))
 
 
@@ -2505,7 +2520,7 @@ def _shadow_site(host, site, label, build, tier, free_bytes, reserved, enforced_
     may be malformed, and a failure must only mark the budget unavailable, never change or abort the lane decision."""
     try:
         holders, request = build()
-        caps = {'max_concurrent': MAX_CONCURRENT.get(tier, 0), 'free_bytes': free_bytes, 'reserved_bytes': reserved, 'floor': HEAVY_FLOOR}
+        caps = {'max_concurrent': heavy_lane_cap(tier), 'free_bytes': free_bytes, 'reserved_bytes': reserved, 'floor': HEAVY_FLOOR}
         budget = budget_decision(host, holders, request, caps)
         budget.update(site=site, label=label, enforced='admit' if enforced_admit else 'refuse')
         if request is not None:
@@ -2517,8 +2532,8 @@ def _shadow_site(host, site, label, build, tier, free_bytes, reserved, enforced_
 
 
 def _compact_budget(budget):
-    keys = ('shadow', 'status', 'reason', 'site', 'enforced', 'band', 'would_admit', 'fits_if_cap_were_2', 'resource_reasons',
-            'cap_reason', 'projected_bytes', 'limit_bytes', 'cpu_slots_used', 'cpu_limit', 'count', 'max_concurrent',
+    keys = ('shadow', 'status', 'reason', 'site', 'enforced', 'band', 'would_admit', 'fits_if_cap_were_2', 'fits_if_cap_were_3',
+            'resource_reasons', 'cap_reason', 'projected_bytes', 'limit_bytes', 'cpu_slots_used', 'cpu_limit', 'count', 'max_concurrent',
             'unmanaged_trees', 'granted_jobs', 'granted_test_threads')
     return {k: budget[k] for k in keys if k in budget}
 
@@ -2556,7 +2571,8 @@ def _state_budget(host, state_path, now, tier, free_bytes, live, entries, orphan
         verdict = _shadow_site(host, 'state', None, lambda: (holders, probe), tier, free_bytes, reserved, True)
         if verdict['status'] == 'ok':
             state['reference'] = dict({'class': REFERENCE_CLASS}, **{k: verdict[k] for k in (
-                'would_admit', 'fits_if_cap_were_2', 'resource_reasons', 'cap_reason', 'granted_jobs', 'granted_test_threads')})
+                'would_admit', 'fits_if_cap_were_2', 'fits_if_cap_were_3', 'resource_reasons', 'cap_reason', 'granted_jobs',
+                'granted_test_threads')})
     state.pop('enforced', None)
     return state
 
@@ -2640,9 +2656,9 @@ def _snapshot(state_path, source_fn, now, token_fn, table_fn=None, host=None):
                 blockers.insert(0, result['reason'])
             elif result['latch']:
                 blockers.insert(0, 'latched until free space reaches 50 GiB')
-            elif HEAVY_LANES[result['tier']] == 0:
+            elif heavy_lane_cap(result['tier']) == 0:
                 blockers.insert(0, 'tier %s is below stable' % result['tier'])
-            lanes = 0 if result['tier'] is None or result['latch'] else HEAVY_LANES[result['tier']]
+            lanes = heavy_lane_cap(result['tier'], result['latch'])
             record = {'schema': SNAPSHOT_SCHEMA, 'ts': iso_utc(now),
                       'free_bytes': result['free_bytes'], 'tier': result['tier'], 'latch': result['latch'],
                       'heavy_lanes_allowed': lanes, 'active_heavy_jobs': len(live),

@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,6 +75,9 @@ class Arithmetic(unittest.TestCase):
     def test_a_third_workload_does_not_fit_even_if_the_cap_were_2(self):
         out = decide(holders=[holder('a'), holder('b', excl=('cargo-target:/c',))])
         self.assertFalse(out['fits_if_cap_were_2'])
+        self.assertTrue(out['fits_if_cap_were_3'])          # resources alone would still have fitted a third
+        four = decide(holders=[holder(str(i), excl=('k%d' % i,)) for i in range(3)])
+        self.assertFalse(four['fits_if_cap_were_3'])        # a fourth is above LANE_CEILING whatever the resources
 
     def test_a_legacy_reservation_costs_the_whole_budget_and_all_cores(self):
         out = decide(holders=[holder('old', record={})])
@@ -191,7 +195,7 @@ class Arithmetic(unittest.TestCase):
 
     def test_no_heavy_lane_means_a_cap_of_zero_even_for_the_probe(self):
         out = decide(caps=dict(CAPS, max_concurrent=0))
-        self.assertFalse(out['would_admit'] or out['fits_if_cap_were_2'])
+        self.assertFalse(out['would_admit'] or out['fits_if_cap_were_2'] or out['fits_if_cap_were_3'])
 
     def test_the_load_is_corrected_for_admitted_work_before_banding(self):
         seen = []
@@ -595,10 +599,38 @@ class Deadline(unittest.TestCase):
         self.assertGreater(da.SHADOW_DEADLINE_S, da.SHADOW_WINDOW_S)
 
 
+class HeavyLaneCap(unittest.TestCase):
+    def test_shipped_values_follow_the_lane_table(self):
+        self.assertEqual({t: da.heavy_lane_cap(t) for t in da.HEAVY_LANES}, da.HEAVY_LANES)
+        self.assertEqual((da.heavy_lane_cap('emergency'), da.heavy_lane_cap('low'), da.heavy_lane_cap(None)), (0, 0, 0))
+        self.assertFalse(da.THIRD_LANE_ENABLED)
+        self.assertEqual(da.LANE_CEILING, 3)
+
+    def test_a_latch_means_no_lane_at_any_tier(self):
+        for tier in da.HEAVY_LANES:
+            self.assertEqual(da.heavy_lane_cap(tier, True), 0, tier)
+
+    def test_the_third_lane_flag_adds_one_to_wide_only(self):
+        with unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 2, 'wide': 2}), unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', True):
+            self.assertEqual((da.heavy_lane_cap('stable'), da.heavy_lane_cap('wide')), (2, 3))
+            self.assertEqual((da.heavy_lane_cap('low'), da.heavy_lane_cap('wide', True)), (0, 0))
+        with unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 2, 'wide': 2}):
+            self.assertEqual(da.heavy_lane_cap('wide'), 2)       # flag off: the table alone decides
+
+    def test_nothing_ever_yields_more_than_the_ceiling(self):
+        with unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 9, 'wide': 3}), unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', True):
+            self.assertEqual((da.heavy_lane_cap('stable'), da.heavy_lane_cap('wide')), (3, 3))
+
+    def test_the_lane_sites_and_the_shadow_budget_read_the_same_function(self):
+        with unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 2, 'wide': 2}):
+            budget = da._shadow_site(host(), 'state', None, lambda: ([], None), 'wide', 400 * GIB, 0, True)
+            self.assertEqual(budget['max_concurrent'], 2)
+            self.assertFalse(hasattr(da, 'MAX_CONCURRENT'))
+
+
 class Unchanged(unittest.TestCase):
     def test_the_lane_caps_and_concurrency_constants(self):
         self.assertEqual(da.HEAVY_LANES, {'emergency': 0, 'low': 0, 'stable': 1, 'wide': 1})
-        self.assertEqual(da.MAX_CONCURRENT, da.HEAVY_LANES)
         self.assertEqual(da.UNMANAGED_ALLOWANCE, 8 * GIB)
         self.assertEqual(da.HEADROOM_PERCENT, {'GREEN': 30, 'AMBER': 40})
 
