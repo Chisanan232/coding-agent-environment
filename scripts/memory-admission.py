@@ -409,6 +409,23 @@ def lane_budget_text(occ):
     return f"lane budget: {occ['in_use']} of {occ['cap']} heavy lane(s) in use, {resident:.1f} GiB resident: " + "; ".join(parts)
 
 
+def concurrent_lane_reasons(m):
+    """A heavy lane beside an already running one needs the stricter EXIT bounds, not just the ENTER thresholds (SPE-160): the
+    first lane keeps today's rule, a second must be admitted into a quiet host. Unreadable inputs are reported by the caller.
+    Computed directly, never through exit_ok(), which calls refusal_reasons()."""
+    r = []
+    io, cr, lpc = m.get("swap_io_mib_s"), m.get("compressor_ratio"), m.get("load_per_core")
+    if io is not None and io > EXIT["swap_io_mib_s"]:
+        r.append(f"a second heavy lane needs swap I/O <= {EXIT['swap_io_mib_s']:g} MiB/s (now {io:.1f})")
+    if cr is not None and cr > EXIT["compressor_ratio"]:
+        r.append(f"a second heavy lane needs the compressor at <= {EXIT['compressor_ratio']:.0%} of RAM (now {cr:.0%})")
+    if lpc is not None and lpc > EXIT["load_per_core"]:
+        r.append(f"a second heavy lane needs load per core <= {EXIT['load_per_core']:g} (now {lpc:.1f})")
+    if m.get("pressure_level") not in (None, PRESSURE_NORMAL):
+        r.append(f"a second heavy lane needs memory pressure level {PRESSURE_NORMAL}")
+    return r
+
+
 def refusal_reasons(weight, m):
     """Reasons memory alone would refuse `weight` work right now (ENTER thresholds)."""
     r, unknown = [], []
@@ -447,6 +464,8 @@ def refusal_reasons(weight, m):
                 detail = "; ".join(f"{w['root_comm']}: {w['procs']} procs, {w['rss_bytes'] / GIB:.1f} GiB" for w in running)
                 r.append(f"{len(running)} heavy build workload(s) running ({detail}): heavy lanes full "
                          f"({occ['in_use']} of {occ['cap']}) [{lane_budget_text(occ)}]")
+            elif running:
+                r += concurrent_lane_reasons(m)
         elif procs:
             names = ", ".join(f"{k} x{v}" for k, v in sorted(procs.items()))
             r.append(f"another heavy build/test process is running ({names}): heavy lanes full (unattributed; cap {m.get('lane_cap') or HEAVY_LANE_CAP})")

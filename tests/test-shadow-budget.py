@@ -57,7 +57,7 @@ class Arithmetic(unittest.TestCase):
     def test_a_lone_classed_request_would_be_admitted(self):
         out = decide()
         self.assertTrue(out['would_admit'] and out['fits_if_cap_were_2'])
-        self.assertEqual((out['shadow'], out['status'], out['band'], out['count']), ('shadow: not enforced', 'ok', 'GREEN', 0))
+        self.assertEqual((out['shadow'], out['status'], out['band'], out['count']), (da.SHADOW_NOTE, 'ok', 'GREEN', 0))
         self.assertEqual(out['projected_bytes'], 26 * GIB)
         self.assertEqual(out['limit_bytes'], RAM * 70 // 100)
         json.dumps(out)
@@ -218,13 +218,13 @@ class Arithmetic(unittest.TestCase):
         for bad in (None, {}, {'error': 'host-sample-unavailable: OSError'}, host(used=None)):
             out = da.budget_decision(bad, [holder()], request(), CAPS)
             self.assertEqual(out['status'], 'unavailable')
-            self.assertEqual(out['shadow'], 'shadow: not enforced')
+            self.assertEqual(out['shadow'], da.SHADOW_NOTE)
             self.assertNotIn('would_admit', out)
 
     def test_line_always_says_shadow_not_enforced(self):
         for out in (decide(), decide(holders=[holder()]), da.budget_decision(None, [], request(), CAPS),
                     da.budget_decision(host(), [], None, CAPS)):
-            self.assertIn('shadow: not enforced', da.budget_line(out))
+            self.assertIn(da.SHADOW_NOTE, da.budget_line(out))
 
     def test_budget_holders_skips_the_claiming_grant_and_lapsed_grants(self):
         base = {'label': 'x', 'bytes': GIB, 'state': 'GRANTED', 'grant': {'expires': (SAMPLED + timedelta(hours=1)).isoformat()}}
@@ -235,6 +235,7 @@ class Arithmetic(unittest.TestCase):
         self.assertEqual([h['label'] for h in picked], ['y'])
 
 
+@unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 1, 'wide': 1})   # these tests are about the one-lane (rollback) state
 class Sites(QueueBase):
     def host_fn(self, **kw):
         self.calls = getattr(self, 'calls', 0)
@@ -263,7 +264,7 @@ class Sites(QueueBase):
         one = self.reserve('one', first, hf, declared=CRATE)
         self.assertTrue(one['admit'], one)
         self.assertEqual((one['budget']['shadow'], one['budget']['enforced'], one['budget']['site']),
-                         ('shadow: not enforced', 'admit', 'reserve'))
+                         (da.SHADOW_NOTE, 'admit', 'reserve'))
         two = self.reserve('two', second, hf, declared=CRATE)
         plain = da.reserve('two', 20 * GIB, second.pid, self.path, lambda: 400 * GIB, now=self.now)
         self.assertFalse(two['admit'])
@@ -393,7 +394,7 @@ class Sites(QueueBase):
         self.assertEqual((out['budget']['site'], out['budget']['enforced'], out['budget']['fits_if_cap_were_2']), ('advance', 'refuse', False))
         lines = [r for r in self.receipts() if r['event'] == 'shadow-budget']
         self.assertEqual(len(lines), 1)
-        self.assertEqual(lines[0]['budget']['shadow'], 'shadow: not enforced')
+        self.assertEqual(lines[0]['budget']['shadow'], da.SHADOW_NOTE)
         self.assertNotIn('holders', lines[0]['budget'])
 
     def test_advance_records_a_would_admit_beside_a_free_lane_and_still_grants_as_before(self):
@@ -443,7 +444,7 @@ class Sites(QueueBase):
         self.assertTrue(self.reserve('job', proc, self.host_fn(), declared=CRATE)['admit'])
         shot = da.snapshot(self.path, lambda: (400 * GIB, 'test'), now=self.now, host_fn=self.host_fn())
         budget = shot['budget']
-        self.assertEqual((budget['shadow'], budget['count'], budget['band']), ('shadow: not enforced', 1, 'GREEN'))
+        self.assertEqual((budget['shadow'], budget['count'], budget['band']), (da.SHADOW_NOTE, 1, 'GREEN'))
         self.assertEqual(budget['reference']['class'], 'build-crate')
         self.assertFalse(budget['reference']['would_admit'])
         self.assertTrue(budget['reference']['fits_if_cap_were_2'])
@@ -461,7 +462,7 @@ class Sites(QueueBase):
         with contextlib.redirect_stdout(out):
             da.main(['status', '--json'], free_fn=lambda: 400 * GIB, state_path=self.path, host_fn=self.host_fn())
         shown = json.loads(out.getvalue())
-        self.assertEqual((shown['budget']['shadow'], shown['budget']['count']), ('shadow: not enforced', 1))
+        self.assertEqual((shown['budget']['shadow'], shown['budget']['count']), (da.SHADOW_NOTE, 1))
         self.assertEqual(shown['tier'], 'wide')
 
     def test_reserve_cli_prints_the_shadow_line_to_a_terminal_only(self):
@@ -474,7 +475,7 @@ class Sites(QueueBase):
                          state_path=self.path, host_fn=self.host_fn())
         self.assertEqual(rc, 0)
         self.assertTrue(out.getvalue().startswith('reserved '))
-        self.assertIn('shadow: not enforced', err.getvalue())
+        self.assertIn(da.SHADOW_NOTE, err.getvalue())
 
     def test_no_new_state_files_are_written_by_the_shadow_budget(self):
         proc = self.spawn()
@@ -513,6 +514,7 @@ class HostSample(unittest.TestCase):
         self.assertEqual(out, {'error': 'process table unreadable'})
 
 
+@unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 1, 'wide': 1})   # these tests are about the one-lane (rollback) state
 class Guarded(QueueBase):
     """A malformed record or sample inside the budget code must leave every admission outcome exactly as without it."""
 
@@ -526,7 +528,7 @@ class Guarded(QueueBase):
         return lambda: host(rows=rows, ram='not-a-number', time=self.now + timedelta(seconds=1))
 
     def assert_unavailable(self, budget):
-        self.assertEqual((budget['status'], budget['shadow']), ('unavailable', 'shadow: not enforced'))
+        self.assertEqual((budget['status'], budget['shadow']), ('unavailable', da.SHADOW_NOTE))
         self.assertIn('budget-computation-failed', budget['reason'])
 
     def test_reserve_admit_and_refuse_are_identical_with_a_malformed_sample(self):

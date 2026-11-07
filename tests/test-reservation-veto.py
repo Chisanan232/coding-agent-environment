@@ -188,6 +188,38 @@ class DerivedCap(unittest.TestCase):
             self.assertEqual(seen, [expected])
 
 
+class SecondLaneNeedsExitBounds(unittest.TestCase):
+    """A lane beside a running tree must meet the EXIT bounds; the first lane keeps the ENTER thresholds (SPE-160)."""
+
+    def two_lane_metrics(self, running, **over):
+        m = metrics(running, [owned()])
+        m["lane_cap"] = 2
+        m.update(over)
+        return m
+
+    def test_a_quiet_host_admits_a_second_lane(self):
+        self.assertEqual(ma.refusal_reasons("heavy", self.two_lane_metrics([tree()]))[0], [])
+
+    def test_each_exit_bound_refuses_a_second_lane_that_the_enter_threshold_would_admit(self):
+        for key, value, text in (("swap_io_mib_s", 6.0, "swap I/O <= 4"), ("compressor_ratio", 0.30, "compressor at <= 25%"),
+                                 ("load_per_core", 2.5, "load per core <= 2")):
+            m = self.two_lane_metrics([tree()], **{key: value})
+            self.assertEqual(ma.refusal_reasons("heavy", dict(metrics([]), **{key: value}))[0], [], key)   # first lane: ENTER only
+            (reason,) = ma.refusal_reasons("heavy", m)[0]
+            self.assertIn("a second heavy lane needs", reason)
+            self.assertIn(text, reason)
+
+    def test_the_first_lane_and_a_full_cap_are_unchanged(self):
+        busy = self.two_lane_metrics([tree()], swap_io_mib_s=6.0, lane_cap=1)
+        (reason,) = ma.refusal_reasons("heavy", busy)[0]
+        self.assertIn("heavy lanes full (1 of 1)", reason)
+        self.assertEqual(ma.refusal_reasons("heavy", dict(metrics([]), lane_cap=2, swap_io_mib_s=6.0))[0], [])
+
+    def test_the_budget_band_view_is_not_affected(self):
+        view = ma.budget_view(sample(0, [tree()]), sample(10, [tree()]))
+        self.assertEqual(ma.budget_band(dict(view["m"], swap_io_mib_s=6.0), None)[0], "AMBER")
+
+
 class ReadOwned(unittest.TestCase):
     def test_reads_the_sibling_reservation_dir_read_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -217,7 +249,7 @@ class EndToEnd(unittest.TestCase):
             calls = iter([sample(0, [tree(ancestors=[50])]), sample(10, [tree(ancestors=[50])])])
             out = io.StringIO()
             deps = {"sample": lambda: next(calls), "sleep": lambda s: None, "now": lambda: 1000.0,
-                    "owned": lambda path: [owned()], "disk": lambda w: (True, "ok")}
+                    "owned": lambda path: [owned()], "disk": lambda w: (True, "ok"), "lane_cap": lambda: 1}
             with contextlib.redirect_stdout(out):
                 rc = ma.main(["check", "--weight", "heavy", "--json", "--memory-only", "--state", str(pathlib.Path(tmp) / "s.json")], deps)
             verdict = json.loads(out.getvalue())

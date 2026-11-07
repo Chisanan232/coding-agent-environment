@@ -527,14 +527,14 @@ def process_owner(pid):
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Declared workload classes and estimates (SPE-150 PR3). These fields are validated, stored and shown, and no admission
-# decision (lane cap, byte floor, grant order) reads them. Only the shadow budget (reported, not enforced) and the banded job
+# decision (lane cap, byte floor, grant order) reads them. Only the resource budget (lanes 2 and up) and the banded job
 # caps exported to a Cargo job's environment (GRANT_ENV) read them. A job declares what it expects to need; an estimate can be
 # raised by the caller but never lowered below the class default.
 #
 # THE NUMBERS BELOW ARE GUESSES, deliberately conservative. They may be lowered only by a reviewed constants change
 # backed by evidence from `disk-admission.py measurements`, never by a caller and never in passing.
 # mem = mem_base_mib + mem_per_job_mib * jobs; jobs/min_jobs are the default and the lowest degraded parallelism
-# (min_jobs is read by the shadow budget's AMBER grant only); disk_gib is the default for
+# (min_jobs is read by the budget's AMBER and RED grants only); disk_gib is the default for
 # --bytes; excl names what two jobs of the class must not share ('target' = the Cargo target directory, 'docker' = the
 # Docker daemon). A class with no entry values (light, remote) has no defaults. No class means the legacy meaning: the
 # whole budget and all cores, recorded as nothing.
@@ -873,7 +873,8 @@ def reserve(label, nbytes, pid, state_path, free_fn=measure_free_bytes, now=None
             host_fn=None, grant_environ=None):
     """Admit or refuse via _reserve, then record a measurement sample outside the lock for an admitted reservation.
 
-    host_fn (optional) supplies the host sample for the SHADOW budget, taken here before the lock; it never changes the result.
+    host_fn (optional) supplies the host sample for the resource budget, taken here before the lock; only a lane beside a running
+    job depends on it (no sample means no second lane).
     grant_environ (the environment the job will run with, when this process is about to exec it) lets the reservation record the
     Cargo job limit the job will actually get."""
     now = now or datetime.now(timezone.utc)
@@ -945,24 +946,30 @@ def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_
                 workload = merge_workload(same[0]['workload'], workload)   # a refresh must not forget reparented members
             lanes = heavy_lane_cap(result['tier'], result['latch'])
             reserved = sum(r['bytes'] for r in others) + sum(e['bytes'] for e in orphans)
-            lane_full = len(others) + len(orphans) >= lanes
+            in_use = len(others) + len(orphans)
+            lane_full = in_use >= lanes
+            floor_ok = result['free_bytes'] - reserved - nbytes >= HEAVY_FLOOR
             budget = None
             if host is not None:
                 budget = _shadow_site(host, 'reserve', label, lambda: (budget_holders(others, orphans, queued, now), budget_request(
-                    declared or {}, nbytes, label)), result['tier'], result['free_bytes'], reserved,
-                    not lane_full and result['free_bytes'] - reserved - nbytes >= HEAVY_FLOOR)
-                if queue_dir(state_path).exists():
-                    _budget_receipt(state_path, {'id': '-', 'label': label, 'tickets': []}, now, budget)
+                    declared or {}, nbytes, label)), result['tier'], result['free_bytes'], reserved, True)
+            # A job refreshing its own reservation already holds its lane and is running: only a new lane needs the budget.
+            budget_why = None if same else _budget_refusal(budget, in_use)
+            _mark_enforced(budget, not lane_full and floor_ok and not budget_why)
+            if budget is not None and queue_dir(state_path).exists():
+                _budget_receipt(state_path, {'id': '-', 'label': label, 'tickets': []}, now, budget)
             if lane_full:
                 return _with_budget(dict(result, admit=False, reserved_bytes=reserved,
                                          reason='lane-cap: %d of %d heavy lanes in use (%s)' % (len(others), lanes, ', '.join(
                                              '%s pid %d%s%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '',
                                                                 ' UNRESOLVED: ' + r['unresolved'] if r.get('unresolved') else '')
                                              for r in others))), budget)
-            if result['free_bytes'] - reserved - nbytes < HEAVY_FLOOR:
+            if not floor_ok:
                 return _with_budget(dict(result, admit=False, reserved_bytes=reserved,
                                          reason='over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
                                              result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB)), budget)
+            if budget_why:
+                return _with_budget(dict(result, admit=False, reserved_bytes=reserved, reason=budget_why), budget)
             granted = _granted_jobs(budget, declared, grant_environ) or (same[0].get('granted_jobs') if same else None)   # a refresh keeps it
             write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), workload=workload, declared=declared,
                               granted_jobs=granted)
@@ -1549,7 +1556,7 @@ def _has_waiting(state_path):
 
 def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=process_token, grant_s=QUEUE_GRANT_S, table_fn=None,
                   host_fn=None):
-    """_queue_advance, then a measurement sample per reservation holder outside the lock. host_fn feeds the SHADOW budget."""
+    """_queue_advance, then a measurement sample per reservation holder outside the lock. host_fn feeds the resource budget."""
     now = now or datetime.now(timezone.utc)
     host = _host_or_error(host_fn) if host_fn is not None and _has_waiting(state_path) else None
     seen = {}
@@ -1634,30 +1641,41 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                 out['reason'] = 'no heavy lane at tier %s' % result['tier']
                 return out
             orphans = _claimed_orphans(entries, live, token_fn, table_fn, state_path)
-            occupied = len(live) + len(granted) + len(orphans) >= lanes
-            reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
-            if host is not None:
-                out['budget'] = _shadow_site(host, 'advance', first['label'], lambda: (
-                    budget_holders(live, orphans, granted, now), budget_request(first, first['bytes'], first['label'])), result['tier'],
-                                             result['free_bytes'], reserved,
-                                             not occupied and result['free_bytes'] - reserved - first['bytes'] >= HEAVY_FLOOR)
-                _budget_receipt(state_path, first, now, out['budget'])
-            if occupied:
-                out['reason'] = 'lane occupied'
-                return out
-            if result['free_bytes'] - reserved - first['bytes'] < HEAVY_FLOOR:
-                out['reason'] = 'over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested for %s, floor 100 GiB' % (
-                    result['free_bytes'] / GIB, reserved / GIB, first['bytes'] / GIB, first['id'])
-                return out
+            in_use = len(live) + len(granted) + len(orphans)
+            reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans) + sum(e['bytes'] for e in granted)
             window = min(grant_s, QUEUE_MAX_GRANT_S)
-            first['state'] = 'GRANTED'
-            first['grant'] = {'at': iso_utc(now), 'expires': iso_utc(now + timedelta(seconds=window))}
-            _write_queue_entry(state_path, first)
-            marker = queue_dir(state_path) / 'granted' / first['id']
-            write_json_atomic(marker, {'id': first['id'], 'label': first['label'], 'tickets': first['tickets'],
-                                       'expires': first['grant']['expires']})
-            _queue_receipt(state_path, 'granted', first, now, expires=first['grant']['expires'], tier=result['tier'])
-            out['granted'].append(first['id'])
+            # Strict first-in-first-out: grant the head, then try the next with the budget recomputed beside the new grant, and
+            # stop at the first entry that does not fit. A later, smaller entry never overtakes a larger head.
+            for nxt in waiting:
+                floor_ok = result['free_bytes'] - reserved - nxt['bytes'] >= HEAVY_FLOOR
+                budget = None
+                if host is not None:
+                    budget = _shadow_site(host, 'advance', nxt['label'], lambda: (
+                        budget_holders(live, orphans, granted, now), budget_request(nxt, nxt['bytes'], nxt['label'])), result['tier'],
+                                          result['free_bytes'], reserved, True)
+                budget_why = _budget_refusal(budget, in_use) if in_use < lanes else None
+                _mark_enforced(budget, in_use < lanes and floor_ok and not budget_why)
+                if budget is not None:
+                    out['budget'] = budget
+                    _budget_receipt(state_path, nxt, now, budget)
+                if in_use >= lanes or not floor_ok or budget_why:
+                    if not out['granted']:
+                        out['reason'] = ('lane occupied' if in_use >= lanes else
+                                         'over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested for %s, floor 100 GiB' % (
+                                             result['free_bytes'] / GIB, reserved / GIB, nxt['bytes'] / GIB, nxt['id'])
+                                         if not floor_ok else budget_why)
+                    return out
+                nxt['state'] = 'GRANTED'
+                nxt['grant'] = {'at': iso_utc(now), 'expires': iso_utc(now + timedelta(seconds=window))}
+                _write_queue_entry(state_path, nxt)
+                marker = queue_dir(state_path) / 'granted' / nxt['id']
+                write_json_atomic(marker, {'id': nxt['id'], 'label': nxt['label'], 'tickets': nxt['tickets'],
+                                           'expires': nxt['grant']['expires']})
+                _queue_receipt(state_path, 'granted', nxt, now, expires=nxt['grant']['expires'], tier=result['tier'])
+                out['granted'].append(nxt['id'])
+                granted.append(nxt)
+                in_use += 1
+                reserved += nxt['bytes']
             return out
     except StateError as exc:
         out['reason'] = '%s: %s' % (exc.kind, exc)
@@ -1683,7 +1701,8 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
                 owner_fn=process_owner, ttl=DEFAULT_TTL, memory_fn=_memory_precondition, exec_fn=None, allow_long=False,
                 table_fn=None, declared=None, host_fn=None, grant_environ=None):
     """Claim a granted lane for this very process, then exec the job; every precondition is revalidated first.
-    host_fn feeds the SHADOW budget (sampled after the memory gate, before the lock); it never changes the outcome.
+    host_fn feeds the resource budget (sampled after the memory gate, before the lock); only a lane beside a running job depends
+    on it.
 
     Outside the lock: the entry must be GRANTED and unlapsed, owned by this uid, and match label, bytes, worktree and job
     fingerprint; then fresh memory/CPU/heavy-process admission. Under the lock: the entry again, then tier, latch, lane
@@ -1779,20 +1798,26 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
             orphans = _claimed_orphans(entries, live, token_fn, table_fn, state_path)
             lanes = heavy_lane_cap(result['tier'], result['latch'])
             reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans)
-            lane_full = len(live) + len(orphans) >= lanes
+            in_use = len(live) + len(orphans)
+            lane_full = in_use >= lanes
+            floor_ok = result['free_bytes'] - reserved - nbytes >= HEAVY_FLOOR
             if host is not None:
                 budget = _shadow_site(host, 'claim', label, lambda: (budget_holders(live, orphans, entries, now, skip_id=qid),
-                                                          budget_request(entry, nbytes, label)), result['tier'], result['free_bytes'], reserved,
-                                      not lane_full and result['free_bytes'] - reserved - nbytes >= HEAVY_FLOOR)
+                                                          budget_request(entry, nbytes, label)), result['tier'], result['free_bytes'], reserved, True)
+            budget_why = _budget_refusal(budget, in_use)   # re-checked now: what fitted at grant time may not fit any more
+            _mark_enforced(budget, not lane_full and floor_ok and not budget_why)
+            if budget is not None:
                 _budget_receipt(state_path, entry, now, budget)
             if lane_full:
                 return _with_budget(refuse('lane-cap: %d of %d heavy lanes in use (%s)' % (len(live) + len(orphans), lanes, ', '.join(
                     ['%s pid %d%s%s' % (r['label'], r['pid'], ' past its time limit' if r.get('past_ttl') else '',
                                     ' UNRESOLVED: ' + r['unresolved'] if r.get('unresolved') else '') for r in live] +
                     ['%s pid %d (reservation removed, job still running)' % (e['label'], e['holder']['pid']) for e in orphans]))), budget)
-            if result['free_bytes'] - reserved - nbytes < HEAVY_FLOOR:
+            if not floor_ok:
                 return _with_budget(refuse('over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested, floor 100 GiB' % (
                     result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB)), budget)
+            if budget_why:
+                return _with_budget(refuse(budget_why), budget)   # the grant is kept: a later claim may fit
             if wrapper_is_zombie(pid, token, table_fn):
                 return refuse('process-not-running: pid %d has exited' % pid)
             workload = capture_workload(pid, token, table_fn)
@@ -2184,11 +2209,12 @@ def queue_cancel(state_path, qid, now=None, session_id=None):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Shadow resource budget (SPE-150 PR4). SHADOW: NOT ENFORCED. At the three lane sites (reserve, queue advance, queue claim)
-# the budget below is computed and recorded beside the decision (a `budget` key in the result, a receipts line, the snapshot
-# and status `budget` sections) while the HEAVY_LANES check still decides alone. Nothing here changes an admit, a refusal,
-# a grant order or a reason string. It persists nothing but receipts lines, and any failure to sample the host only marks the
-# budget `unavailable`.
+# Resource budget (SPE-150 PR4, enforced for lanes 2 and up by SPE-160). At the three lane sites (reserve, queue advance, queue
+# claim) the budget below is computed and recorded beside the decision (a `budget` key in the result, a receipts line, the
+# snapshot and status `budget` sections). The first heavy lane is still decided by the disk rules alone: it never reads the
+# budget, so a failed host sample cannot stop a lone job. A lane beside a running job also needs the budget to pass (_budget_
+# refusal): a sample, status ok, would_admit under the tier's cap and band GREEN; a missing sample means an effective cap of one.
+# It persists nothing but receipts lines, and any failure to sample the host only marks the budget `unavailable`.
 #
 # Arithmetic, under the existing flock and over reservation records (host memory is never sampled inside the lock; a
 # windowed host sample is taken BEFORE it):
@@ -2201,7 +2227,7 @@ def queue_cancel(state_path, qid, now=None, session_id=None):
 # unlapsed GRANTED queue entries, each at its recorded class cost.
 # All numbers are guesses to be calibrated from `disk-admission.py measurements`; headroom is whole percent so a boundary
 # comparison is exact.
-SHADOW_NOTE = 'shadow: not enforced'
+SHADOW_NOTE = 'enforced for lanes 2+ only'
 UNMANAGED_ALLOWANCE = 8 * GIB
 HEADROOM_PERCENT = {'GREEN': 30, 'AMBER': 40}        # memory kept free: 0.30 / 0.40 of RAM
 CPU_BUDGET_PERCENT = 100                              # cpu_slots may sum to cores x 1.0
@@ -2551,6 +2577,34 @@ def _with_budget(result, budget):
     return result if budget is None else dict(result, budget=budget)
 
 
+def _mark_enforced(budget, admitted):
+    """Record on the budget the verdict the lane site actually reached (it was computed before the verdict was known)."""
+    if budget is not None and 'enforced' in budget:
+        budget['enforced'] = 'admit' if admitted else 'refuse'
+
+
+def _budget_refusal(budget, in_use):
+    """Why the resource budget refuses one more heavy job beside `in_use` running ones, or None. Lane 1 (in_use 0) is admitted by
+    the disk rules alone; every later lane needs a host sample, a budget that is ok, would_admit under the tier's cap and band
+    GREEN. A missing or failed sample is a refusal: the effective cap is then one lane."""
+    if in_use == 0:
+        return None
+    if not budget:
+        return 'budget: no host sample, so a heavy lane beside a running job is not admitted'
+    if budget.get('status') != 'ok':
+        return 'budget: unavailable (%s), so a heavy lane beside a running job is not admitted' % budget.get('reason')
+    why = list(budget.get('resource_reasons') or [])
+    if budget.get('band') != 'GREEN' and not any(r.startswith('band RED') for r in why):
+        why.append('band %s: a heavy lane beside a running job needs GREEN' % budget.get('band'))
+    if not why and not budget.get('would_admit'):
+        why.append(budget.get('cap_reason') or 'budget would not admit')
+    return 'budget: ' + '; '.join(why) if why else None
+
+
+def _budget_allows(budget, in_use):
+    return _budget_refusal(budget, in_use) is None
+
+
 def _state_budget(host, state_path, now, tier, free_bytes, live, entries, orphans):
     """Budget section for snapshot and status: the occupied budget plus a probe with the reference class."""
     try:
@@ -2885,7 +2939,7 @@ def _queue_cli(args, state_path, free_fn, host_fn=None):
     elif command == 'advance':
         out = queue_advance(state_path, free_fn, grant_s=args.grant_s, host_fn=host_fn)
         out['ok'] = out['reason'] in ('ok',) or bool(out['granted'] or out['expired'] or out['eligible']) or out['reason'] in (
-            'lane occupied',) or out['reason'].startswith('no heavy lane')
+            'lane occupied',) or out['reason'].startswith(('no heavy lane', 'budget:'))
     elif command == 'claim':
         if args.pid <= 0 or not _is_strict_ancestor(args.pid):
             print(json.dumps({'ok': False, 'reason': 'invalid-request: --pid must be a live ancestor of this command '
