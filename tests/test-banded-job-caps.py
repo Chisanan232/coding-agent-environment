@@ -46,12 +46,21 @@ class GrantEnv(unittest.TestCase):
         self.assertEqual(da.grant_env(budget(band='AMBER'), fields(), {}), {'CARGO_BUILD_JOBS': '2', 'RUST_TEST_THREADS': '2'})
         self.assertEqual(da.grant_env(budget('build-workspace', 'AMBER'), fields('build-workspace'), {})['CARGO_BUILD_JOBS'], '4')
 
-    def test_red_grants_none(self):
-        self.assertEqual(da.grant_env(budget(band='RED'), fields(), {}), {})
+    def test_red_grants_the_class_minimum(self):
+        self.assertEqual(da.grant_env(budget(band='RED'), fields(), {}), {'CARGO_BUILD_JOBS': '2', 'RUST_TEST_THREADS': '2'})
+        self.assertEqual(da.grant_env(budget('build-workspace', 'RED'), fields('build-workspace'), {})['CARGO_BUILD_JOBS'], '4')
 
-    def test_an_unavailable_budget_changes_nothing(self):
-        for bad in (None, {}, da.budget_decision(None, [], None, shadow.CAPS), {'status': 'unavailable', 'granted_jobs': 4}):
-            self.assertEqual(da.grant_env(bad, fields(), {}), {})
+    def test_an_unavailable_budget_exports_the_declared_figures(self):
+        down = da.budget_decision(None, [], None, shadow.CAPS)
+        self.assertEqual(da.grant_env(down, fields(), {}), {'CARGO_BUILD_JOBS': '4', 'RUST_TEST_THREADS': '4'})
+        self.assertEqual(da.grant_env({'status': 'unavailable'}, fields('build-workspace'), {'CARGO_BUILD_JOBS': '3'}),
+                         {'CARGO_BUILD_JOBS': '3', 'RUST_TEST_THREADS': '8', 'NEXTEST_TEST_THREADS': '8'})
+        self.assertEqual(da.grant_env(down, {}, {}), {})
+
+    def test_no_budget_and_a_state_only_budget_change_nothing(self):
+        state_only = da.budget_decision(shadow.host(), [], None, shadow.CAPS)
+        for none in (None, {}, state_only):
+            self.assertEqual(da.grant_env(none, fields(), {}), {})
 
     def test_no_class_or_a_class_without_an_entry_exports_nothing(self):
         self.assertEqual(da.grant_env(budget(), {}, {}), {})
@@ -115,13 +124,15 @@ class RunEnv(queue_tests.QueueBase):
         self.assertEqual(self.run_job(fields(), self.host_fn(band='AMBER')), 0)
         self.assertEqual(self.seen[-1]['CARGO_BUILD_JOBS'], '2')
 
-    def test_red_unavailable_and_unrequested_budgets_leave_the_environment_alone(self):
+    def test_red_and_unavailable_budgets_still_cap_the_job_and_no_budget_leaves_it_alone(self):
         def boom():
             raise OSError('no sample')
-        for label, hf in (('red', self.host_fn(band='RED')), ('down', boom), ('none', None)):
+        for label, hf, jobs in (('red', self.host_fn(band='RED'), '2'), ('down', boom, '4'), ('none', None, None)):
             self.assertEqual(self.run_job(fields(), hf, label), 0)
-            self.assertEqual(self.seen[-1], dict.fromkeys(VARS), label)
+            self.assertEqual(self.seen[-1]['CARGO_BUILD_JOBS'], jobs, label)
             da.release(label, self.path)
+            os.environ.pop('CARGO_BUILD_JOBS', None)
+            os.environ.pop('RUST_TEST_THREADS', None)
 
     def test_legacy_runs_are_untouched(self):
         self.assertEqual(self.run_job({}, self.host_fn()), 0)

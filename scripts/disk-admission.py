@@ -2115,8 +2115,8 @@ def budget_decision(host, reservations, request, caps):
     return out
 
 
-# Banded per-job caps (SPE-150 PR6). The one place the budget touches a job: a declared Cargo class gets its granted jobs and test
-# threads exported to the child, only from a budget with status ok. Admission itself (lane cap, floor, grant order) is untouched.
+# Banded per-job caps (SPE-150 PR6, SPE-160). The one place the budget touches a job: a declared Cargo class gets its granted jobs and
+# test threads exported to the child (class minimum when RED, declared figures when the budget is unavailable).
 # Which variables a class exports is "what the class says": build classes cap Cargo and libtest; the workspace classes also cap
 # nextest. Classes without an entry (light, remote, container-suite) export nothing, and so do legacy runs (no class).
 GRANT_ENV = {
@@ -2144,13 +2144,24 @@ def _lowered(existing, grant):
 
 
 def grant_env(budget, declared, environ):
-    """{variable: value} to export to a job. Empty unless a Cargo class was declared and the budget is status ok with a positive
-    grant (RED grants none; an unavailable budget changes nothing). Never raises a variable the job already set above the grant."""
+    """{variable: value} to export to a job. Empty unless a Cargo class was declared. A budget that is status ok grants its band's
+    jobs and threads (RED grants the class minimum, not nothing: a lane-1 job must not claim the whole machine); a budget that is
+    present but unavailable falls back to what the job declared. No budget at all (sampling not requested) changes nothing. Never
+    raises a variable the job already set above the grant."""
     spec = GRANT_ENV.get((declared or {}).get('class'))
-    if not spec or not budget or budget.get('status') != 'ok':
+    if not spec or not budget:
+        return {}
+    if budget.get('status') == 'ok':
+        if 'granted_jobs' not in budget:
+            return {}
+        jobs, threads = budget.get('granted_jobs'), budget.get('granted_test_threads')
+        if budget.get('band') == 'RED':
+            jobs = threads = WORKLOAD_CLASSES[declared['class']].get('min_jobs')
+    elif 'status' in budget:
+        jobs, threads = declared.get('cpu_slots'), declared.get('test_threads')
+    else:
         return {}
     out = {}
-    jobs, threads = budget.get('granted_jobs'), budget.get('granted_test_threads')
     wanted = ([(spec[0], jobs)] if type(jobs) is int and jobs > 0 else []) + (
         [(name, threads) for name in spec[1]] if type(threads) is int and threads > 0 else [])
     for name, grant in wanted:
