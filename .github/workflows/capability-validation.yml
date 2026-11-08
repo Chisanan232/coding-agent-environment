@@ -23,6 +23,8 @@ on:
       - 'scripts/resource-policy-install.py'
       - 'scripts/launcher-install.py'
       - 'scripts/cargo-deps-reclaim.py'
+      - 'scripts/disk-admission.py'
+      - 'scripts/resource-lifecycle.py'
       - 'scripts/hook-rollout.py'
       - 'scripts/owner-merge-gate.py'
       - 'docs/ENGINEERING-CONSTITUTION.md'
