@@ -351,13 +351,58 @@ class ApplyTests(unittest.TestCase):
         self.assertTrue(seen and all(p == str(fx.deps) for p in seen))
 
     def test_the_cap_is_not_overshot_by_a_large_inode_group(self):
+        def fixture():
+            fx = Fixture(self)
+            fx.crate('gone', H, gone_root(fx), files=('d', 'rlib'))
+            for i in range(3):
+                os.link(fx.deps / ('gone-%s.rlib' % H), fx.deps / ('gone-%s.x.cgu.%d.rcgu.o' % (H, i)))
+            fx.classify()
+            return fx
+        small = fixture()
+        small.apply(execute=True, batch_gib=100.0, max_gib=1 / cdr.GIB)        # cap far below the one inode group
+        self.assertTrue((small.deps / ('gone-%s.rlib' % H)).exists())
+        large = fixture()
+        large.apply(execute=True, batch_gib=100.0, max_gib=100.0)
+        self.assertFalse((large.deps / ('gone-%s.rlib' % H)).exists())
+
+    def test_a_group_too_big_for_the_cap_does_not_block_smaller_ones(self):
         fx = Fixture(self)
-        fx.crate('gone', H, gone_root(fx), files=('d', 'rlib'))
-        for i in range(4):
-            os.link(fx.deps / ('gone-%s.rlib' % H), fx.deps / ('gone-%s.link%d.rlib' % (H, i)))
+        fx.crate('big', H, gone_root(fx), files=('d', 'rlib'))
+        os.link(fx.deps / ('big-%s.rlib' % H), fx.deps / ('big-%s.x.cgu.0.rcgu.o' % H))     # one inode, two links: 8192 B share
+        fx.crate('small', H2, gone_root(fx), files=('d',))
+        (fx.deps / ('small-%s.rmeta' % H2)).write_bytes(b'x' * 512)
+        os.utime(fx.deps / ('small-%s.rmeta' % H2), (OLD, OLD))
         fx.classify()
-        fx.apply(execute=True, batch_gib=100.0, max_gib=1 / cdr.GIB)           # cap far below the one inode group
-        self.assertTrue((fx.deps / ('gone-%s.rlib' % H)).exists())
+        fx.apply(execute=True, batch_gib=100.0, max_gib=4096 / cdr.GIB)
+        self.assertTrue((fx.deps / ('big-%s.rlib' % H)).exists())
+        self.assertFalse((fx.deps / ('small-%s.rmeta' % H2)).exists())
+
+    def test_every_group_is_rechecked_right_before_its_links_are_unlinked(self):
+        fx = self.prepared()
+        calls = {'n': 0}
+        real = os.unlink
+        victim = fx.deps / ('gone-%s.rlib' % H)
+
+        def racing(path, *a, **kw):
+            if calls['n'] == 0:                      # first unlink of the batch: a worktree comes back meanwhile
+                Path(gone_root(fx)).mkdir(parents=True)
+            calls['n'] += 1
+            return real(path, *a, **kw)
+        import unittest.mock
+        with unittest.mock.patch.object(cdr.os, 'unlink', racing):
+            fx.apply(execute=True, batch_gib=1.0)
+        # the root reappeared after the first group was unlinked: the remaining groups must have been skipped by the recheck
+        self.assertEqual(calls['n'], 1)
+        self.assertGreaterEqual(len([n for n in fx.names() if n.startswith('gone-')]), 3)
+
+    def test_a_stale_progress_tmp_file_cannot_lend_its_mode(self):
+        fx = self.prepared()
+        path = cdr.plan_paths(cdr.private_state(fx.state))[0]
+        stale = Path('%s.tmp%d' % (path, os.getpid()))
+        stale.write_text('junk')
+        os.chmod(stale, 0o666)
+        cdr.write_private(path, '{"deps": "x"}')
+        self.assertEqual(oct(path.stat().st_mode & 0o777), '0o600')
 
     def test_overly_broad_prefix_is_refused(self):
         fx = Fixture(self)
