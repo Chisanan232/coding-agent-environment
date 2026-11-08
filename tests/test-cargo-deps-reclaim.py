@@ -303,6 +303,62 @@ class ApplyTests(unittest.TestCase):
         for prefix in cdr.DEFAULT_PREFIXES:
             self.assertTrue(cdr.valid_prefix(prefix), prefix)
 
+    def test_a_truncated_d_file_is_no_evidence(self):
+        fx = Fixture(self)
+        fx.crate('big', H, gone_root(fx), files=('rlib',))
+        big = fx.deps / ('big-%s.d' % H)
+        big.write_text('# env-dep:CARGO_MANIFEST_DIR=%s\n' % gone_root(fx) + '#' * (cdr.D_READ_LIMIT + 10))
+        os.utime(big, (OLD, OLD))
+        fx.classify()
+        self.assertEqual(cdr.read_plan(cdr.private_state(fx.state)), [])
+
+    def test_home_directory_and_its_parents_are_not_valid_prefixes(self):
+        home = str(cdr.HOME)
+        self.assertFalse(cdr.valid_prefix(home))
+        self.assertFalse(cdr.valid_prefix(os.path.dirname(home)))
+        self.assertTrue(cdr.valid_prefix(home + '/Bryant-Developments'))
+
+    def test_malformed_plan_lines_are_skipped_not_fatal(self):
+        fx = self.prepared()
+        path = cdr.plan_paths(cdr.private_state(fx.state))[1]
+        with open(path, 'a') as handle:
+            handle.write('not json\n[]\n{"name": 5}\n{"name": "x-%s.rlib", "ino": "1", "nlink": 1, "mtime": 0, "blocks": 1, "root": "/a", "kind": "rlib"}\n' % H)
+        self.assertEqual(len(cdr.read_plan(cdr.private_state(fx.state))), 3)
+        fx.apply(execute=True)
+
+    def test_classify_with_another_prefix_set_needs_reset(self):
+        fx = self.prepared()
+        other = fx.base / 'other-prefix'
+        other.mkdir()
+        fx.prefixes = [str(other)]
+        with self.assertRaises(SystemExit):
+            fx.classify()
+
+    def test_progress_file_is_written_atomically_and_privately(self):
+        fx = self.prepared()
+        path = cdr.plan_paths(cdr.private_state(fx.state))[0]
+        self.assertEqual(oct(path.stat().st_mode & 0o777), '0o600')
+        self.assertEqual([p.name for p in fx.state.iterdir() if '.tmp' in p.name], [])
+
+    def test_the_default_free_space_probe_reads_the_deps_filesystem(self):
+        fx = self.prepared()
+        seen = []
+        import unittest.mock
+        real = cdr.free_bytes
+        with unittest.mock.patch.object(cdr, 'free_bytes', lambda path: seen.append(path) or real(path)):
+            with contextlib.redirect_stdout(io.StringIO()):
+                cdr.apply(fx.args(execute=True, batch_gib=1.0))
+        self.assertTrue(seen and all(p == str(fx.deps) for p in seen))
+
+    def test_the_cap_is_not_overshot_by_a_large_inode_group(self):
+        fx = Fixture(self)
+        fx.crate('gone', H, gone_root(fx), files=('d', 'rlib'))
+        for i in range(4):
+            os.link(fx.deps / ('gone-%s.rlib' % H), fx.deps / ('gone-%s.link%d.rlib' % (H, i)))
+        fx.classify()
+        fx.apply(execute=True, batch_gib=100.0, max_gib=1 / cdr.GIB)           # cap far below the one inode group
+        self.assertTrue((fx.deps / ('gone-%s.rlib' % H)).exists())
+
     def test_overly_broad_prefix_is_refused(self):
         fx = Fixture(self)
         fx.crate('gone', H, gone_root(fx))
