@@ -45,8 +45,8 @@ RECLAIMABLE = {'rcgu.o', 'o', 'rlib', 'rmeta'}
 EXECUTABLE = {'exe', 'dylib', 'so'}
 PLAN_MAX_AGE_S = 7 * 86400
 STOP_RATIO = 0.3
-DEFAULT_PREFIXES = tuple(str(p) for p in (HOME / 'Bryant-Developments', Path('/private/tmp'), Path('/tmp'),
-                                          Path('/private/var/folders')))
+# Recorded roots are real paths, so /tmp appears as /private/tmp.
+DEFAULT_PREFIXES = tuple(str(p) for p in (HOME / 'Bryant-Developments', Path('/private/tmp'), Path('/private/var/folders')))
 
 
 def state_dir(arg=None):
