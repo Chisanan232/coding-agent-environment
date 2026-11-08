@@ -69,7 +69,7 @@ detection matches executable names only; it targets macOS. Wiring it into `disk-
 
 ## 4. Concurrency
 
-One admitted heavy lane today, as the resource governor allows; a shadow budget is measured beside it and the cap is raised only after measurement ([ADR 0017](adr/0017-resource-aware-workload-scheduling.md)). Do not start competing Cargo workspace builds, Docker
+Up to two admitted heavy lanes, as the resource governor allows (the second only when the resource budget passes; a third stays off behind `THIRD_LANE_ENABLED`; [ADR 0017](adr/0017-resource-aware-workload-scheduling.md) revision 2). Do not start competing Cargo workspace builds, Docker
 suites, native QA or full E2E; lower subagent fan-out while pressure is not normal (the seven-subagent cap is a ceiling, not a
 target). Prefer reusable build artifacts and isolated targets inside the budget. Never kill another active session, and never delete
 its worktree, runtime, cache, container or reservation.
