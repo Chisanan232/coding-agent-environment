@@ -93,8 +93,8 @@ class GrantEnv(unittest.TestCase):
         out = da.grant_env(budget(), fields(), {'CARGO_BUILD_JOBS': '-1'})
         self.assertEqual(out, {'RUST_TEST_THREADS': '4'})
 
-    def test_the_cap_is_still_one_lane(self):
-        self.assertEqual(da.HEAVY_LANES, {'emergency': 0, 'low': 0, 'stable': 1, 'wide': 1})
+    def test_the_cap_is_two_lanes(self):
+        self.assertEqual(da.HEAVY_LANES, {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 2})
 
 
 class RunEnv(queue_tests.QueueBase):

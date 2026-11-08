@@ -1055,7 +1055,7 @@ class Snapshots(unittest.TestCase):
         self.assertEqual((record['schema'], record['ts']), (1, '2026-10-16T12:00:00Z'))
         self.assertNotIn('age_s', json.loads((self.path.parent / 'snapshot.json').read_text()))
         self.assertEqual((record['free_bytes'], record['tier'], record['latch']), (250 * GIB, 'wide', False))
-        self.assertEqual((record['heavy_lanes_allowed'], record['blockers'], record['source']), (1, [], 'glomeris'))
+        self.assertEqual((record['heavy_lanes_allowed'], record['blockers'], record['source']), (2, [], 'glomeris'))
         self.assertEqual(record['protection'], 'advisory-not-wired')
         file = self.path.parent / 'snapshot.json'
         self.assertEqual(json.loads(file.read_text()), record)
@@ -1063,11 +1063,11 @@ class Snapshots(unittest.TestCase):
         self.assertEqual(self.shot(80 * GIB, 'statvfs')['source'], 'statvfs')
 
     def test_snapshot_heavy_lanes_by_tier_and_latch(self):
-        self.assertEqual(self.shot(150 * GIB)['heavy_lanes_allowed'], 1)
+        self.assertEqual(self.shot(150 * GIB)['heavy_lanes_allowed'], 2)
         self.assertEqual(self.shot(99 * GIB)['heavy_lanes_allowed'], 0)
-        self.assertEqual(self.shot(100 * GIB)['heavy_lanes_allowed'], 1)
+        self.assertEqual(self.shot(100 * GIB)['heavy_lanes_allowed'], 2)
         wide = self.shot(500 * GIB)
-        self.assertEqual((wide['tier'], wide['heavy_lanes_allowed']), ('wide', 1))
+        self.assertEqual((wide['tier'], wide['heavy_lanes_allowed']), ('wide', 2))
         # Latched: no lane, with the reason listed, even once free space reads as stable again.
         self.shot(10 * GIB)
         held = self.shot(40 * GIB)

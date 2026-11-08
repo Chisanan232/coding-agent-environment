@@ -311,7 +311,7 @@ existing SPE-109 disk gate with its reservations and lane caps, and keeps heavy 
 checks (hysteresis). A single swap-used figure is history, not proof of current exhaustion. Thresholds are proposed in
 `docs/RESOURCE-ADMISSION.md` in the coding-agent-environment repository; do not change the disk gate's thresholds.
 
-Run one admitted heavy lane today (a second is admitted only by the resource budget once the cap is raised, ADR 0017 revision 2). Do not start competing Cargo workspace builds, Docker suites, native QA or full
+Run up to two admitted heavy lanes (the second only when the resource budget passes, ADR 0017 revision 2). Do not start competing Cargo workspace builds, Docker suites, native QA or full
 E2E, and lower subagent fan-out while pressure is not normal; prefer reusable build artifacts and isolated targets
 within the resource budget. Never kill another active session or delete its worktree, runtime, cache, container,
 reservation or scratch. Clean only regenerable caches and scratch proven idle and owned (owner, process lifetime, open
