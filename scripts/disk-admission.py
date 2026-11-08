@@ -2475,17 +2475,18 @@ CLASS_ENV = {
 
 def class_env(declared, environ):
     """{variable: value} the declared class implies, for variables the job left unset. Empty for other classes and legacy runs."""
-    defaults = CLASS_ENV.get((declared or {}).get('class')) or {}
-    return {name: value for name, value in defaults.items() if name not in environ}
+    name = declared.get('class') if isinstance(declared, dict) else None
+    defaults = CLASS_ENV.get(name) if isinstance(name, str) else None
+    return {var: value for var, value in (defaults or {}).items() if var not in environ}
 
 
 def apply_grant_env(budget, declared):
     """Export the grant and the class defaults into this process's environment, which the exec'd job inherits. Never raises."""
-    try:
-        os.environ.update(class_env(declared, os.environ))
-        os.environ.update(grant_env(budget, declared, os.environ))
-    except Exception:
-        pass
+    for exports in (class_env, lambda d, e: grant_env(budget, d, e)):   # independent: one failing never skips the other
+        try:
+            os.environ.update(exports(declared, os.environ))
+        except Exception:
+            pass
 
 
 def budget_line(budget):

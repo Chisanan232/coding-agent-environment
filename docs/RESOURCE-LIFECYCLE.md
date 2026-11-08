@@ -82,12 +82,18 @@ take the machine-wide shared target to hit a number, and never touch unique QA e
 One policy for every Rust project on the host. It reuses admission classes, the 100 GiB floor and `apply`; it adds no hook, no
 gate before commit or push, and no mandatory `cargo clean`.
 
+**Status.** Implemented: the `CARGO_INCREMENTAL=0` default for `build-cold-isolated` (`disk-admission.py run`), whole-private-target removal
+through `apply`, and the existing disk tiers. **Proposed, not implemented (follow-up):** writing a `.ca-owner.json` receipt when a job creates
+its target (receipts are still supplied by the owner of the target), a stale-incremental-session scope in `apply`, and automated
+manifest-based reclaim of shared `debug/deps` entries. Until then those reclaim steps are done by a bounded, reviewed one-off
+script with a manifest and a free-space check per batch, never by `apply`.
+
 **Ownership.**
 
 | Target | Owner and rule |
 |---|---|
 | Machine-wide shared target (`build.target-dir` in `~/.cargo/config.toml`) | Serial, interactive builds of compatible projects only (same toolchain, same profile and feature set, else fingerprints churn and the cache thrashes). Never cleaned wholesale, never deleted to hit a number, no per-artifact deletion by age (see below). |
-| Isolated target (`CARGO_TARGET_DIR` under a private root, `build-cold-isolated`) | Owned by the task that made it. Private, receipted (`.ca-owner.json`), removed by that task through `apply` when it finishes. Sized in `--bytes`. |
+| Isolated target (`CARGO_TARGET_DIR` under a private root, `build-cold-isolated`) | Owned by the task that made it. Class A only with a receipt (`.ca-owner.json` with `"private": true` and the applying session's id, see above); otherwise `apply` returns ASK. Removed by that task through `apply` when it finishes.  |
 | QA evidence or release-candidate target | Unique output: keep it, mark it (`.ca-keep`), never reclaim it without the exact-path ASK. |
 | Another project's target (`nda-targets`, `private-target-*`) | Foreign. Inventory only; class B ASK. |
 
@@ -100,7 +106,7 @@ isolated target (admission refuses two jobs on one `cargo-target:` key, and `doc
 | Workload | Policy |
 |---|---|
 | `build-cold-isolated` (one-shot QA, release, per-ticket cold build) | `CARGO_INCREMENTAL=0`, exported by `disk-admission.py run` when the job leaves it unset (`CLASS_ENV`). A job that sets it keeps its value. |
-| Interactive iteration in the shared target | Keep Cargo's default; warm rebuild speed is the point. Sweep sessions older than the session in use through the receipted path below, not `cargo clean`. |
+| Interactive iteration in the shared target | Keep Cargo's default; warm rebuild speed is the point. Old incremental sessions are swept by a bounded, reviewed one-off (see Status), never by `cargo clean`. |
 | Real debugging that needs full symbols | Opt in per run (`CARGO_PROFILE_DEV_DEBUG=2`), not as the default. |
 
 Reduced default debug information (`CARGO_PROFILE_DEV_DEBUG=line-tables-only`) and `split-debuginfo` are **not** changed
@@ -109,7 +115,7 @@ edit `~/.cargo/config.toml`, a workspace `[profile]` or the toolchain for this p
 
 **Reclaim scope.** Prefer, in order: (1) whole private targets the task owns; (2) Cargo's own scopes on a target the caller
 owns (`cargo clean -p NAME`, `--profile NAME`, `--target TRIPLE`, `--dry-run` first; `--workspace` or no scope empties the
-target); (3) stale incremental session directories older than the current build, with a manifest and an audit line. Not allowed:
+target); (3) stale incremental session directories older than the current build (proposed scope, not in `apply` yet; see Status), with a manifest and an audit line. Not allowed:
 deleting files from the shared `debug/deps` by age, by crate-name prefix or by guessed `.o` ownership; touching `.fingerprint`
 or `*.d` metadata; any shared-target deletion without proof of orphaning and a bounded plan. `.fingerprint` presence is not proof (measured: only 0.0025 GiB of
 `deps/` lacked an entry). Accepted proof is the artifact's own recorded `CARGO_MANIFEST_DIR` (from its `.d` file) no longer existing on disk,
@@ -121,8 +127,8 @@ unlink frees nothing). Never during a running build of the same workspace. Uncer
 reclaim are computed per unique inode; `du` or a shell glob over `deps/` does not finish in a reasonable time, so use one streaming
 `scandir` pass with a five-minute cap and a TSV, never one subprocess per artifact.
 
-**Thresholds.** The existing disk tiers apply unchanged: below 100 GiB heavy work is refused (`HEAVY_FLOOR`), below 50 GiB the latch
-holds, below 20 GiB emergency. Warning is the `low` tier. A target larger than its class estimate (`disk_gib`) is a signal to
+**Thresholds.** The existing disk tiers apply unchanged: below 100 GiB heavy work is refused (`HEAVY_FLOOR`), the emergency latch sets below 20 GiB and releases
+at 50 GiB. Warning is the `low` tier. A target larger than its class estimate (`disk_gib`) is a signal to
 sweep or isolate, never an automatic deletion. Measure free space on the Data volume before and after every cleanup batch and stop on
 any inconsistency.
 

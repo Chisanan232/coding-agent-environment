@@ -62,6 +62,27 @@ class ClassEnvTests(unittest.TestCase):
             da.apply_grant_env(None, None)
             self.assertNotIn('CARGO_INCREMENTAL', os.environ)
 
+    def test_odd_declared_values_never_raise(self):
+        for odd in ('build-cold-isolated', 7, ['build-cold-isolated'], {'class': ['x']}, {'class': 3}):
+            with self.subTest(odd=odd):
+                self.assertEqual(da.class_env(odd, {}), {})
+
+    def test_the_class_default_does_not_skip_the_budget_grant(self):
+        budget = {'status': 'ok', 'granted_jobs': 3, 'granted_test_threads': 2, 'band': 'GREEN'}
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            for var in ('CARGO_INCREMENTAL', 'CARGO_BUILD_JOBS', 'RUST_TEST_THREADS', 'NEXTEST_TEST_THREADS'):
+                os.environ.pop(var, None)
+            da.apply_grant_env(budget, declared('build-cold-isolated'))
+            self.assertEqual(os.environ.get('CARGO_INCREMENTAL'), '0')
+            self.assertEqual(os.environ.get('CARGO_BUILD_JOBS'), '3')
+
+    def test_a_failing_class_default_does_not_skip_the_grant(self):
+        budget = {'status': 'ok', 'granted_jobs': 3, 'granted_test_threads': 2, 'band': 'GREEN'}
+        with unittest.mock.patch.dict(os.environ, {}, clear=False), unittest.mock.patch.object(da, 'class_env', side_effect=RuntimeError):
+            os.environ.pop('CARGO_BUILD_JOBS', None)
+            da.apply_grant_env(budget, declared('build-cold-isolated'))
+            self.assertEqual(os.environ.get('CARGO_BUILD_JOBS'), '3')
+
     def test_no_profile_or_toolchain_variable_is_ever_set(self):
         allowed = {'CARGO_INCREMENTAL'}
         for defaults in da.CLASS_ENV.values():
