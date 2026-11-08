@@ -21,7 +21,7 @@ def load(name, file):
 
 da = load('disk_admission', 'scripts/disk-admission.py')
 rl = load('resource_lifecycle', 'scripts/resource-lifecycle.py')
-SESSION = 'f4323153-becb-4647-9f6c-40250cc182c8'
+SESSION = '00000000-0000-4000-8000-000000000001'
 CLASS = 'build-cold-isolated'
 
 

@@ -22,6 +22,9 @@ on:
       - 'scripts/qa-payload-manifest.py'
       - 'scripts/resource-policy-install.py'
       - 'scripts/launcher-install.py'
+      - 'scripts/cargo-deps-reclaim.py'
+      - 'scripts/disk-admission.py'
+      - 'scripts/resource-lifecycle.py'
       - 'scripts/hook-rollout.py'
       - 'scripts/owner-merge-gate.py'
       - 'docs/ENGINEERING-CONSTITUTION.md'
@@ -143,6 +146,9 @@ jobs:
           python3 tests/test-adoption-coverage.py
           python3 tests/test-build-baseline.py
           python3 tests/test-resource-lifecycle.py
+          python3 tests/test-cargo-deps-reclaim.py
+          python3 tests/test-target-receipt.py
+          python3 tests/test-class-env.py
           python3 tests/test-qa-handoff.py
           python3 tests/test-qa-identity-setup.py
           python3 tests/test-qa-side.py
