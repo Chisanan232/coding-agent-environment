@@ -167,8 +167,13 @@ def take_build_locks(profile):
             continue
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            release_build_locks(held)
+            return [], 'active:build-lock-held'
+        try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
+            os.close(fd)
             release_build_locks(held)
             return [], 'active:build-lock-held'
         held.append(fd)
