@@ -21,6 +21,14 @@ spec = spec_from_file_location('disk_admission', ROOT / 'scripts/disk-admission.
 da = module_from_spec(spec)
 spec.loader.exec_module(da)
 GIB = 1024 ** 3
+# Several lanes are only admitted beside a running job with a GREEN host sample and an estimate; a `light` job costs the budget
+# nothing, so these tests keep exercising the byte floor, serialization and TTL rules rather than the budget (tested elsewhere).
+LIGHT = {'class': 'light', 'excl_keys': [], 'created': '2026-10-16T12:00:00Z'}
+
+
+def green_host():
+    return {'ram': 128 * GIB, 'used': 20 * GIB, 'cores': 16, 'load1': 0.0, 'time': datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc),
+            'window_s': 2.0, 'rows': {}, 'rows_prev': {}, 'workloads': [], 'band': 'GREEN'}
 
 
 class Tiers(unittest.TestCase):
@@ -748,6 +756,7 @@ class Workloads(unittest.TestCase):
         live, _ = self.live()
         self.assertIn('workload-not-witnessed', live[0]['unresolved'])
 
+    @mock.patch.dict(da.HEAVY_LANES, {'stable': 1, 'wide': 1})   # this test is about the one-lane (rollback) state
     def test_unresolved_holder_blocks_admission_and_is_reported_in_the_snapshot(self):
         proc = self.wrapper('setsid')
         self.hold('job-blocking', proc)
@@ -928,6 +937,7 @@ class Reservations(unittest.TestCase):
         live, _ = self.live()
         self.assertFalse(live[0].get('past_ttl', False))
 
+    @mock.patch.dict(da.HEAVY_LANES, {'stable': 1, 'wide': 1})   # this test is about the one-lane (rollback) state
     def test_second_lane_refused_while_expired_holder_still_runs(self):
         self.reserve_file('job-long', hours=-1)
         refused = da.reserve('job-next', 10 * GIB, os.getppid(), self.path, lambda: 400 * GIB, now=self.now)
@@ -954,6 +964,7 @@ class Reservations(unittest.TestCase):
         self.assertTrue(admitted['admit'], admitted)
         self.assertEqual(admitted['reserved_bytes'], 50 * GIB)
 
+    @mock.patch.dict(da.HEAVY_LANES, {'stable': 1, 'wide': 1})   # this test is about the one-lane (rollback) state
     def test_second_heavy_lane_refused_until_release(self):
         self.assertTrue(self.take('job-one', 10 * GIB, 300 * GIB)['admit'])
         second = self.take('job-two', 10 * GIB, 300 * GIB)
@@ -966,9 +977,9 @@ class Reservations(unittest.TestCase):
 
     def test_live_reservations_reduce_remaining_headroom(self):
         with mock.patch.dict(da.HEAVY_LANES, {'wide': 3}):
-            self.assertTrue(self.take('job-a', 40 * GIB, 200 * GIB)['admit'])
-            self.assertTrue(self.take('job-b', 40 * GIB, 200 * GIB)['admit'])
-            third = self.take('job-c', 40 * GIB, 200 * GIB)
+            self.assertTrue(self.take('job-a', 40 * GIB, 200 * GIB, declared=LIGHT, host_fn=green_host)['admit'])
+            self.assertTrue(self.take('job-b', 40 * GIB, 200 * GIB, declared=LIGHT, host_fn=green_host)['admit'])
+            third = self.take('job-c', 40 * GIB, 200 * GIB, declared=LIGHT, host_fn=green_host)
         self.assertFalse(third['admit'])
         self.assertIn('over-capacity', third['reason'])
         self.assertEqual(third['reserved_bytes'], 80 * GIB)
@@ -976,7 +987,8 @@ class Reservations(unittest.TestCase):
     def test_concurrent_reserve_serialization(self):
         results = []
         with mock.patch.dict(da.HEAVY_LANES, {'wide': 8}):
-            workers = [threading.Thread(target=lambda n=n: results.append(self.take('job-%d' % n, 30 * GIB, 200 * GIB)))
+            workers = [threading.Thread(target=lambda n=n: results.append(self.take('job-%d' % n, 30 * GIB, 200 * GIB, declared=LIGHT,
+                                                                                host_fn=green_host)))
                        for n in range(8)]
             for worker in workers:
                 worker.start()
@@ -1197,9 +1209,9 @@ class ReservationHardening(unittest.TestCase):
     def test_hold_longer_than_4_hours_needs_max_hold_and_is_capped_at_24(self):
         four, day = 4 * 3600, 24 * 3600
         with mock.patch.dict(da.HEAVY_LANES, {'wide': 4}):
-            self.assertTrue(self.take('job-4h', ttl=four)['admit'])
+            self.assertTrue(self.take('job-4h', ttl=four, declared=LIGHT, host_fn=green_host)['admit'])
             self.assertIn('invalid-request', self.take('job-5h', ttl=four + 1)['reason'])
-            self.assertTrue(self.take('job-24h', ttl=day, allow_long=True)['admit'])
+            self.assertTrue(self.take('job-24h', ttl=day, allow_long=True, declared=LIGHT, host_fn=green_host)['admit'])
         self.assertIn('invalid-request', self.take('job-25h', ttl=day + 1, allow_long=True)['reason'])
         record = json.loads((self.path.parent / 'reservations/job-4h.json').read_text())
         self.assertEqual(record['expires'], '2026-10-16T16:00:00Z')
@@ -1282,6 +1294,7 @@ class RunReserved(unittest.TestCase):
                 self.assertIn(reason, err)
         self.assertFalse(self.sentinel.exists())
 
+    @mock.patch.dict(da.HEAVY_LANES, {'stable': 1, 'wide': 1})   # this test is about the one-lane (rollback) state
     def test_second_job_hits_the_lane_cap(self):
         holder = subprocess.Popen(['sleep', '30'])
         self.addCleanup(holder.wait)

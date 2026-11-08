@@ -373,8 +373,9 @@ def swap_cannot_grow(m):
     return sw["used"] / sw["total"] >= SWAP_FULL_FRACTION and sw["free"] < SWAP_LOW_FREE and m["disk_free"] < SWAP_GROWTH_DISK_FLOOR
 
 
-# Mirrors HEAVY_LANES for the stable and wide disk tiers in disk-admission.py (a test pins the equality). Lane occupancy below is
-# judged against this cap from the workloads actually running, owned or not, instead of from "any heavy process exists".
+# The cap when disk-admission.py cannot be loaded (one lane, today's rule). The live cap is read from disk-admission.py's
+# heavy_lane_cap() by read_lane_cap() and travels in m["lane_cap"]; it is never configured here. Lane occupancy below is judged
+# against it from the workloads actually running, owned or not, instead of from "any heavy process exists".
 HEAVY_LANE_CAP = 1
 
 
@@ -392,7 +393,7 @@ def lane_occupancy(m, owned=None):
         trees.append({"comm": w["root_comm"], "procs": w["procs"], "rss_bytes": w["rss_bytes"],
                       "label": hit["label"] if hit else None, "class": hit.get("class") if hit else None,
                       "est_mem_bytes": hit.get("mem_bytes") if hit else None})
-    return {"cap": HEAVY_LANE_CAP, "in_use": len(trees), "workloads": trees}
+    return {"cap": m.get("lane_cap") or HEAVY_LANE_CAP, "in_use": len(trees), "workloads": trees}
 
 
 def lane_budget_text(occ):
@@ -406,6 +407,23 @@ def lane_budget_text(occ):
             parts.append(f"unmanaged {t['comm']} ({t['rss_bytes'] / GIB:.1f} GiB resident, no reservation accounts for it)")
     resident = sum(t["rss_bytes"] for t in occ["workloads"]) / GIB
     return f"lane budget: {occ['in_use']} of {occ['cap']} heavy lane(s) in use, {resident:.1f} GiB resident: " + "; ".join(parts)
+
+
+def concurrent_lane_reasons(m):
+    """A heavy lane beside an already running one needs the stricter EXIT bounds, not just the ENTER thresholds (SPE-160): the
+    first lane keeps today's rule, a second must be admitted into a quiet host. Unreadable inputs are reported by the caller.
+    Computed directly, never through exit_ok(), which calls refusal_reasons()."""
+    r = []
+    io, cr, lpc = m.get("swap_io_mib_s"), m.get("compressor_ratio"), m.get("load_per_core")
+    if io is not None and io > EXIT["swap_io_mib_s"]:
+        r.append(f"a second heavy lane needs swap I/O <= {EXIT['swap_io_mib_s']:g} MiB/s (now {io:.1f})")
+    if cr is not None and cr > EXIT["compressor_ratio"]:
+        r.append(f"a second heavy lane needs the compressor at <= {EXIT['compressor_ratio']:.0%} of RAM (now {cr:.0%})")
+    if lpc is not None and lpc > EXIT["load_per_core"]:
+        r.append(f"a second heavy lane needs load per core <= {EXIT['load_per_core']:g} (now {lpc:.1f})")
+    if m.get("pressure_level") not in (None, PRESSURE_NORMAL):
+        r.append(f"a second heavy lane needs memory pressure level {PRESSURE_NORMAL}")
+    return r
 
 
 def refusal_reasons(weight, m):
@@ -444,11 +462,13 @@ def refusal_reasons(weight, m):
             occ = lane_occupancy(m, m.get("owned"))
             if running and occ["in_use"] >= occ["cap"]:
                 detail = "; ".join(f"{w['root_comm']}: {w['procs']} procs, {w['rss_bytes'] / GIB:.1f} GiB" for w in running)
-                r.append(f"{len(running)} heavy build workload(s) running ({detail}): one heavy lane at a time "
-                         f"[{lane_budget_text(occ)}]")
+                r.append(f"{len(running)} heavy build workload(s) running ({detail}): heavy lanes full "
+                         f"({occ['in_use']} of {occ['cap']}) [{lane_budget_text(occ)}]")
+            elif running:
+                r += concurrent_lane_reasons(m)
         elif procs:
             names = ", ".join(f"{k} x{v}" for k, v in sorted(procs.items()))
-            r.append(f"another heavy build/test process is running ({names}): one heavy lane at a time")
+            r.append(f"another heavy build/test process is running ({names}): heavy lanes full (unattributed; cap {m.get('lane_cap') or HEAVY_LANE_CAP})")
         if m.get("swap") is None:
             unknown.append("swap usage unreadable")
         if m.get("disk_free") is None:
@@ -616,6 +636,21 @@ def read_owned(state_path):
         return []
 
 
+def read_lane_cap():
+    """The most heavy lanes any disk tier allows, from disk-admission.py's heavy_lane_cap(); HEAVY_LANE_CAP on any failure. This gate
+    cannot see the tier, so it applies the widest cap and leaves the tier's own (lower) cap to the disk gate, which is authoritative.
+    A failed load can only make this stricter than the disk gate, never looser."""
+    try:
+        from importlib.util import module_from_spec, spec_from_file_location
+        spec = spec_from_file_location("disk_admission_readonly", HERE / "disk-admission.py")
+        disk = module_from_spec(spec)
+        spec.loader.exec_module(disk)
+        cap = max(disk.heavy_lane_cap(tier) for tier in disk.HEAVY_LANES)
+        return cap if type(cap) is int and cap >= 1 else HEAVY_LANE_CAP
+    except Exception:
+        return HEAVY_LANE_CAP
+
+
 # ---- CLI -------------------------------------------------------------------------------------------------------------
 def assess(weight, window, state_path, memory_only, deps):
     s1 = deps["sample"]()
@@ -624,6 +659,7 @@ def assess(weight, window, state_path, memory_only, deps):
     m = derive(s1, s2)
     if weight == "heavy":
         m["owned"] = deps["owned"](state_path) if deps.get("owned") else read_owned(state_path)
+        m["lane_cap"] = deps["lane_cap"]() if deps.get("lane_cap") else read_lane_cap()
         try:
             with deps["lock"](state_path):
                 state, problem = load_state(state_path)

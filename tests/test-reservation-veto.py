@@ -22,7 +22,7 @@ def load(name, file):
 ma = load("ma_veto", "scripts/memory-admission.py")
 da = load("da_veto", "scripts/disk-admission.py")
 GIB, PAGE, RAM = 1024 ** 3, 16384, 128 * 1024 ** 3
-OLD_TEXT = "1 heavy build workload(s) running (cargo: 5 procs, 5.0 GiB): one heavy lane at a time"
+OLD_TEXT = "1 heavy build workload(s) running (cargo: 5 procs, 5.0 GiB): heavy lanes full (1 of 1)"
 
 
 def tree(root=100, comm="cargo", procs=5, rss=5 * GIB, idle=False, members=None, ancestors=None):
@@ -61,10 +61,10 @@ class Occupancy(unittest.TestCase):
     def test_idle_trees_hold_no_lane(self):
         self.assertEqual(ma.lane_occupancy(metrics([tree(idle=True)]))["in_use"], 0)
 
-    def test_cap_is_the_disk_gates_single_lane(self):
+    def test_the_fallback_cap_is_one_and_the_derived_cap_follows_the_disk_gate(self):
         self.assertEqual(ma.HEAVY_LANE_CAP, 1)
-        self.assertEqual(ma.HEAVY_LANE_CAP, da.HEAVY_LANES["stable"])
-        self.assertEqual(ma.HEAVY_LANE_CAP, da.HEAVY_LANES["wide"])
+        self.assertEqual(ma.read_lane_cap(), max(da.heavy_lane_cap(tier) for tier in da.HEAVY_LANES))
+        self.assertEqual(metrics([tree()], [owned()]).get("lane_cap"), None)   # the cap is attached by assess(), not by derive()
 
     def test_workloads_carry_their_ancestors_from_the_process_list(self):
         ps = ("   50      1 S    1-00:00:00    0:10.00   0.0   100 /bin/zsh\n"
@@ -141,6 +141,85 @@ class OccupancyIsArithmeticNotAName(unittest.TestCase):
         self.assertIn("2 of 2 heavy lane(s) in use", text)
 
 
+class DerivedCap(unittest.TestCase):
+    """The memory gate takes its lane cap from disk-admission.py and falls back to one lane when it cannot."""
+
+    def fake_disk(self, tmp, body):
+        (pathlib.Path(tmp) / "disk-admission.py").write_text(body)
+        original = ma.HERE
+        ma.HERE = pathlib.Path(tmp)
+        self.addCleanup(setattr, ma, "HERE", original)
+
+    def test_a_cap_of_two_allows_one_tree_and_refuses_at_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.fake_disk(tmp, "HEAVY_LANES = {'stable': 2, 'wide': 2}\ndef heavy_lane_cap(tier):\n    return HEAVY_LANES[tier]\n")
+            self.assertEqual(ma.read_lane_cap(), 2)
+            one = metrics([tree()], [owned()])
+            one["lane_cap"] = ma.read_lane_cap()
+            self.assertEqual(ma.refusal_reasons("heavy", one)[0], [])
+            two = metrics([tree(100), tree(200)], [owned()])
+            two["lane_cap"] = ma.read_lane_cap()
+            (text,) = ma.refusal_reasons("heavy", two)[0]
+            self.assertIn("heavy lanes full (2 of 2)", text)
+            self.assertIn("2 of 2 heavy lane(s) in use", text)
+
+    def test_any_failure_to_load_or_a_nonsense_cap_falls_back_to_one_lane(self):
+        for body in ("raise RuntimeError('broken')", "HEAVY_LANES = {'wide': 0}\ndef heavy_lane_cap(tier):\n    return 0\n",
+                     "HEAVY_LANES = {'wide': 1}\ndef heavy_lane_cap(tier):\n    return 'two'\n", "syntax error here"):
+            with tempfile.TemporaryDirectory() as tmp:
+                self.fake_disk(tmp, body)
+                self.assertEqual(ma.read_lane_cap(), 1, body)
+        ma.HERE = pathlib.Path("/nonexistent-dir-for-spe-160")
+        self.assertEqual(ma.read_lane_cap(), 1)
+
+    def test_assess_attaches_the_derived_cap_and_an_injected_one_wins(self):
+        for injected, expected in ((None, ma.read_lane_cap()), (lambda: 2, 2)):
+            seen = []
+            real = ma.decide
+            ma.decide = lambda weight, m, state, now, _real=real: (seen.append(m.get("lane_cap")), _real(weight, m, state, now))[1]
+            self.addCleanup(setattr, ma, "decide", real)
+            calls = iter([sample(0, [tree(ancestors=[50])]), sample(10, [tree(ancestors=[50])])])
+            deps = {"sample": lambda: next(calls), "sleep": lambda s: None, "now": lambda: 1000.0, "owned": lambda path: [owned()]}
+            if injected:
+                deps["lane_cap"] = injected
+            with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+                ma.main(["check", "--weight", "heavy", "--json", "--memory-only", "--state", str(pathlib.Path(tmp) / "s.json")], deps)
+            ma.decide = real
+            self.assertEqual(seen, [expected])
+
+
+class SecondLaneNeedsExitBounds(unittest.TestCase):
+    """A lane beside a running tree must meet the EXIT bounds; the first lane keeps the ENTER thresholds (SPE-160)."""
+
+    def two_lane_metrics(self, running, **over):
+        m = metrics(running, [owned()])
+        m["lane_cap"] = 2
+        m.update(over)
+        return m
+
+    def test_a_quiet_host_admits_a_second_lane(self):
+        self.assertEqual(ma.refusal_reasons("heavy", self.two_lane_metrics([tree()]))[0], [])
+
+    def test_each_exit_bound_refuses_a_second_lane_that_the_enter_threshold_would_admit(self):
+        for key, value, text in (("swap_io_mib_s", 6.0, "swap I/O <= 4"), ("compressor_ratio", 0.30, "compressor at <= 25%"),
+                                 ("load_per_core", 2.5, "load per core <= 2")):
+            m = self.two_lane_metrics([tree()], **{key: value})
+            self.assertEqual(ma.refusal_reasons("heavy", dict(metrics([]), **{key: value}))[0], [], key)   # first lane: ENTER only
+            (reason,) = ma.refusal_reasons("heavy", m)[0]
+            self.assertIn("a second heavy lane needs", reason)
+            self.assertIn(text, reason)
+
+    def test_the_first_lane_and_a_full_cap_are_unchanged(self):
+        busy = self.two_lane_metrics([tree()], swap_io_mib_s=6.0, lane_cap=1)
+        (reason,) = ma.refusal_reasons("heavy", busy)[0]
+        self.assertIn("heavy lanes full (1 of 1)", reason)
+        self.assertEqual(ma.refusal_reasons("heavy", dict(metrics([]), lane_cap=2, swap_io_mib_s=6.0))[0], [])
+
+    def test_the_budget_band_view_is_not_affected(self):
+        view = ma.budget_view(sample(0, [tree()]), sample(10, [tree()]))
+        self.assertEqual(ma.budget_band(dict(view["m"], swap_io_mib_s=6.0), None)[0], "AMBER")
+
+
 class ReadOwned(unittest.TestCase):
     def test_reads_the_sibling_reservation_dir_read_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -170,7 +249,7 @@ class EndToEnd(unittest.TestCase):
             calls = iter([sample(0, [tree(ancestors=[50])]), sample(10, [tree(ancestors=[50])])])
             out = io.StringIO()
             deps = {"sample": lambda: next(calls), "sleep": lambda s: None, "now": lambda: 1000.0,
-                    "owned": lambda path: [owned()], "disk": lambda w: (True, "ok")}
+                    "owned": lambda path: [owned()], "disk": lambda w: (True, "ok"), "lane_cap": lambda: 1}
             with contextlib.redirect_stdout(out):
                 rc = ma.main(["check", "--weight", "heavy", "--json", "--memory-only", "--state", str(pathlib.Path(tmp) / "s.json")], deps)
             verdict = json.loads(out.getvalue())

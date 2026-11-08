@@ -247,6 +247,7 @@ class Records(QueueBase):
 
 
 class Decisions(QueueBase):
+    @unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 1, 'wide': 1})   # this test is about the one-lane (rollback) state
     def test_a_declared_estimate_changes_no_admission_decision(self):
         """Lane cap 1 and the byte floor read only `bytes`: a huge declared memory estimate neither blocks nor adds a lane."""
         fields, _ = da.resolve_workload('container-suite', 4000, 1000, None, env={}, home='/x', cwd='/x')

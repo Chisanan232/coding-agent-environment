@@ -18,6 +18,7 @@ spec = spec_from_file_location('disk_admission', ROOT / 'scripts/disk-admission.
 da = module_from_spec(spec)
 spec.loader.exec_module(da)
 ORIGINAL_PROCESS_ROWS = da._process_rows
+ORIGINAL_SWAP_USED = da._read_swap_used
 GIB = 1024 ** 3
 SECRET_ARG = 'sk-test-ARGV-SECRET-0123456789'
 NOW = datetime(2026, 10, 31, 3, 0, tzinfo=timezone.utc)
@@ -38,6 +39,7 @@ class Base(unittest.TestCase):
         self.addCleanup(self.stop_holders)
         self.patch('_process_rows', lambda: rows_for(self.pid))
         self.patch('_read_pressure', lambda: 1)
+        self.patch('_read_swap_used', lambda: 3 * GIB)
         self.pid = 4242
 
     def patch(self, name, value):
@@ -73,6 +75,25 @@ class Append(Base):
                          ('reserve', 'build-a', 3, 3 * 1024 * 1024, 4.0))
         self.assertEqual((line['pressure'], line['concurrent'], line['free_bytes']), (1, 1, 400 * GIB))
         self.assertEqual(stat.S_IMODE(self.log.stat().st_mode), 0o600)
+
+    def test_lines_carry_swap_in_use_additively(self):
+        self.reserve()
+        self.assertEqual(self.lines()[0]['swap_used_bytes'], 3 * GIB)
+        self.assertEqual(self.lines()[0]['v'], da.MEASUREMENT_VERSION)   # same schema version: older readers ignore the new key
+        self.patch('_read_swap_used', lambda: None)
+        da._measure(self.path, 'snapshot', None, NOW)
+        self.assertIsNone(self.lines()[-1]['swap_used_bytes'])
+        self.assertIsNotNone(da.measurements_summary(self.path)['classes'])
+
+    def test_swap_usage_is_parsed_from_sysctl_text_and_unreadable_is_none(self):
+        text = 'total = 69632.00M  used = 2048.50M  free = 630.75M  (encrypted)'
+        done = subprocess.CompletedProcess([], 0, stdout=text, stderr='')
+        with unittest.mock.patch.object(da.subprocess, 'run', return_value=done):
+            self.assertEqual(ORIGINAL_SWAP_USED(), int(2048.5 * 1024 ** 2))
+        with unittest.mock.patch.object(da.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='garbage', stderr='')):
+            self.assertIsNone(ORIGINAL_SWAP_USED())
+        with unittest.mock.patch.object(da.subprocess, 'run', side_effect=OSError('no sysctl')):
+            self.assertIsNone(ORIGINAL_SWAP_USED())
 
     def test_existing_file_with_wider_mode_is_tightened(self):
         self.path.parent.mkdir(parents=True)

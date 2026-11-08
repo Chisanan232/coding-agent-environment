@@ -327,6 +327,7 @@ class Claim(QueueBase):
         self.assertEqual(self.entries()[qid]['state'], 'GRANTED')
         self.assertTrue(self.claim(qid)['ok'])
 
+    @unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 1, 'wide': 1})   # this test is about the one-lane (rollback) state
     def test_a_holder_that_appeared_after_the_grant_blocks_the_claim(self):
         qid = self.grant()
         intruder = subprocess.Popen(['/bin/sleep', '300'])
