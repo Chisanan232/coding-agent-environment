@@ -819,6 +819,35 @@ class IncrementalScopeTests(Fixture):
         (t / "debug/.cargo-lock").symlink_to(real_lock)
         self.assertEqual(self.classify(inc, "cargo_incremental")[0][0], "C")     # fails closed, the link is never opened
 
+    def test_apply_itself_takes_the_lock_even_if_revalidation_missed_the_build(self):
+        t, inc = self.target()
+        manifest, out = self.manifest(inc)
+        entry = json.loads(manifest.read_text())["entries"][0]
+        self.patch(rl, "incremental_blockers", lambda root: [])      # a build that starts after revalidation
+        self.hold(t / "debug/.cargo-lock")
+        self.run_cli("apply", "--manifest", str(manifest), "--self-session", SELF, "--out", str(out), "--ids", entry["id"])
+        self.assertTrue((inc / "crate-abc/s-1/work-product.o").exists())
+
+    def test_keep_marker_on_the_profile_directory_is_class_c(self):
+        t, inc = self.target()
+        (t / "debug/.ca-keep").write_text("")
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("marker:keep-marker", why)
+
+    def test_a_target_owned_by_someone_else_is_class_c(self):
+        t, inc = self.target()
+        self.patch(rl.os, "getuid", lambda: os.stat(t).st_uid + 1)
+        self.assertIn("target-not-owned", rl.incremental_blockers(str(inc)))
+
+    def test_lock_misses_do_not_leak_descriptors(self):
+        t, inc = self.target()
+        self.hold(t / "debug/.cargo-lock")
+        before = len(os.listdir("/dev/fd"))
+        for _ in range(20):
+            rl.take_build_locks(str(t / "debug"))
+        self.assertLessEqual(len(os.listdir("/dev/fd")), before + 1)
+
     def test_a_large_incremental_tree_is_not_failed_closed_by_the_marker_scan(self):
         _, inc = self.target()
         for i in range(30):
