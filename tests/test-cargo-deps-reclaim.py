@@ -299,6 +299,10 @@ class ApplyTests(unittest.TestCase):
         fx.apply(execute=True)
         self.assertEqual(fx.names(), before)
 
+    def test_the_default_prefixes_are_all_acceptable(self):
+        for prefix in cdr.DEFAULT_PREFIXES:
+            self.assertTrue(cdr.valid_prefix(prefix), prefix)
+
     def test_overly_broad_prefix_is_refused(self):
         fx = Fixture(self)
         fx.crate('gone', H, gone_root(fx))
