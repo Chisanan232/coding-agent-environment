@@ -1848,6 +1848,7 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
         return refuse('state-unwritable: %s' % exc)
     _measure(state_path, 'claim', _free_or_none(free_fn), now)
     apply_grant_env(budget, _declared_fields(entry))   # the entry's recorded class: one source for the table and the numbers
+    write_target_receipt(_declared_fields(entry).get('class'), entry.get('session_id'), os.environ)
     try:
         exec_fn(argv[0], argv)
     except OSError as exc:
@@ -2489,6 +2490,52 @@ def apply_grant_env(budget, declared):
             pass
 
 
+OWNER_RECEIPT = '.ca-owner.json'   # read by resource-lifecycle.py, which promotes a receipted idle private target to class A
+
+
+def write_target_receipt(class_name, session_id, environ, home=None):
+    """Record that this session created the isolated Cargo target the job will build into (SPE-163). Returns 'written' or
+    'skipped:<why>'; never raises, never blocks the job.
+
+    Ownership is claimed by creation only: the receipt is written when CARGO_TARGET_DIR is set explicitly and names a directory that
+    does not exist yet or is empty, so a job pointed at another session's target (or at a non-empty one) cannot claim it. The machine-wide
+    shared target, anything inside it and anything containing it are refused, a symlink is never followed, and an existing receipt is
+    never overwritten."""
+    try:
+        if class_name != 'build-cold-isolated':
+            return 'skipped:class'
+        if not (isinstance(session_id, str) and SESSION_RE.fullmatch(session_id)):
+            return 'skipped:no-session'
+        raw = environ.get('CARGO_TARGET_DIR')
+        if not isinstance(raw, str) or not raw or '\0' in raw or not os.path.isabs(raw):
+            return 'skipped:no-explicit-target'
+        target = os.path.normpath(raw)
+        if os.path.islink(target):
+            return 'skipped:symlink'
+        shared = os.path.realpath(os.path.join(str(home if home is not None else account_home()), '.cargo/shared-target'))
+        real = os.path.realpath(target)
+        if real == shared or real.startswith(shared + os.sep) or shared.startswith(real.rstrip(os.sep) + os.sep):
+            return 'skipped:shared-target'
+        os.makedirs(target, mode=0o700, exist_ok=True)
+        fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            if info.st_uid != os.getuid() or info.st_mode & 0o022:
+                return 'skipped:not-private'
+            if os.listdir(fd):
+                return 'skipped:not-fresh'
+            receipt = os.open(OWNER_RECEIPT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+            with os.fdopen(receipt, 'w') as handle:
+                json.dump({'schema': 1, 'session_id': session_id, 'reproducible': True, 'private': True,
+                           'class': class_name, 'created': iso_utc(datetime.now(timezone.utc)),
+                           'written_by': 'disk-admission'}, handle, sort_keys=True)
+            return 'written'
+        finally:
+            os.close(fd)
+    except Exception:
+        return 'skipped:error'
+
+
 def budget_line(budget):
     """One human line; always carries the shadow note."""
     if budget.get('status') != 'ok':
@@ -2821,6 +2868,7 @@ def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, tt
         if result.get('budget'):
             print(budget_line(result['budget']), file=sys.stderr)
     apply_grant_env(result.get('budget'), declared)
+    write_target_receipt((declared or {}).get('class'), ((declared or {}).get('owner') or {}).get('session_id'), os.environ)
     try:
         exec_fn(argv[0], argv)
     except OSError as exc:
