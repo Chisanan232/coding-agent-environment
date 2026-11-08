@@ -65,6 +65,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 
 GIB = 1024 ** 3
 EMERGENCY_BELOW = 20 * GIB
@@ -1848,7 +1849,10 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
         return refuse('state-unwritable: %s' % exc)
     _measure(state_path, 'claim', _free_or_none(free_fn), now)
     apply_grant_env(budget, _declared_fields(entry))   # the entry's recorded class: one source for the table and the numbers
-    write_target_receipt(_declared_fields(entry).get('class'), entry.get('session_id'), os.environ)
+    try:
+        write_target_receipt(_declared_fields(entry).get('class'), entry.get('session_id'), os.environ)
+    except Exception:
+        pass
     try:
         exec_fn(argv[0], argv)
     except OSError as exc:
@@ -2497,10 +2501,10 @@ def write_target_receipt(class_name, session_id, environ, home=None):
     """Record that this session created the isolated Cargo target the job will build into (SPE-163). Returns 'written' or
     'skipped:<why>'; never raises, never blocks the job.
 
-    Ownership is claimed by creation only: the receipt is written when CARGO_TARGET_DIR is set explicitly and names a directory that
-    does not exist yet or is empty, so a job pointed at another session's target (or at a non-empty one) cannot claim it. The machine-wide
-    shared target, anything inside it and anything containing it are refused, a symlink is never followed, and an existing receipt is
-    never overwritten."""
+    Ownership is claimed by creation only: the receipt is written when CARGO_TARGET_DIR is set explicitly and names a directory this
+    call creates, so a job pointed at another session's target (even an empty one) cannot claim it. The machine-wide shared target
+    (compared case-folded), anything inside it and anything containing it are refused, a symlink anywhere on the path is refused, and
+    an existing receipt is never overwritten."""
     try:
         if class_name != 'build-cold-isolated':
             return 'skipped:class'
@@ -2510,20 +2514,25 @@ def write_target_receipt(class_name, session_id, environ, home=None):
         if not isinstance(raw, str) or not raw or '\0' in raw or not os.path.isabs(raw):
             return 'skipped:no-explicit-target'
         target = os.path.normpath(raw)
-        if os.path.islink(target):
-            return 'skipped:symlink'
-        shared = os.path.realpath(os.path.join(str(home if home is not None else account_home()), '.cargo/shared-target'))
         real = os.path.realpath(target)
-        if real == shared or real.startswith(shared + os.sep) or shared.startswith(real.rstrip(os.sep) + os.sep):
+        if real != target:
+            return 'skipped:symlink'      # any symlinked ancestor or leaf: the lexical and the real location must agree
+        shared = os.path.realpath(os.path.join(str(home if home is not None else account_home()), '.cargo/shared-target'))
+        # APFS is case-insensitive and realpath does not fold case: compare folded.
+        fold = lambda text: unicodedata.normalize('NFC', text).casefold()
+        a, b = fold(real).rstrip(os.sep), fold(shared).rstrip(os.sep)
+        if a == b or a.startswith(b + os.sep) or b.startswith(a + os.sep):
             return 'skipped:shared-target'
-        os.makedirs(target, mode=0o700, exist_ok=True)
+        os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+        try:
+            os.mkdir(target, 0o700)       # ownership by creation: a directory that already exists is never claimed
+        except FileExistsError:
+            return 'skipped:not-created-here'
         fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             info = os.fstat(fd)
             if info.st_uid != os.getuid() or info.st_mode & 0o022:
                 return 'skipped:not-private'
-            if os.listdir(fd):
-                return 'skipped:not-fresh'
             receipt = os.open(OWNER_RECEIPT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
             with os.fdopen(receipt, 'w') as handle:
                 json.dump({'schema': 1, 'session_id': session_id, 'reproducible': True, 'private': True,
@@ -2868,7 +2877,10 @@ def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, tt
         if result.get('budget'):
             print(budget_line(result['budget']), file=sys.stderr)
     apply_grant_env(result.get('budget'), declared)
-    write_target_receipt((declared or {}).get('class'), ((declared or {}).get('owner') or {}).get('session_id'), os.environ)
+    try:
+        write_target_receipt((declared or {}).get('class'), ((declared or {}).get('owner') or {}).get('session_id'), os.environ)
+    except Exception:
+        pass   # a receipt problem never fails or delays the job
     try:
         exec_fn(argv[0], argv)
     except OSError as exc:
