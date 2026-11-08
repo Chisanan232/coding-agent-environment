@@ -30,6 +30,7 @@ symlink-safe remover. Any new handle, marker or fingerprint change skips the ent
 """
 import argparse
 import datetime
+import fcntl
 import glob
 import hashlib
 import json
@@ -56,6 +57,7 @@ PRODUCTS = (('AASM', r'aaasm|aasm|agent-assembly'), ('Fornax', r'fornax|fornx'),
 # kind -> (reproducible, rebuild cost, shallow marker scan). Shallow kinds hold millions of generated files.
 KINDS = {
     'cargo_target': (True, 'high: full cold rebuild', True),
+    'cargo_incremental': (True, 'low: the next build of the workspace crates compiles non-incrementally, dependencies are untouched', True),
     'package_cache': (True, 'medium: network redownload', True),
     'ide_cache': (True, 'low: indexes rebuild', True),
     'session_scratch': (False, 'not reproducible: may hold unique QA evidence', False),
@@ -80,6 +82,14 @@ def default_consumers(tmp=None):
                           # 2026-11-02: ~50 GiB of qualification/QA/package-repro targets were invisible to the inventory)
                           str(d / '.cargo/qual-*'), str(d / '.cargo/private-target-*'), str(d / '.cargo/pkg-repro-target-*'),
                           str(dev / 'AI-agent-assembly/private-target-*'), '/private/tmp/*-target']),
+        # Whole `<profile>/incremental` directories (SPE-162). Class B only: the shared target and other sessions' targets are
+        # never pre-authorized, and `apply` takes Cargo's build locks before it deletes one.
+        ('cargo_incremental', [str(d / '.cargo/shared-target/*/incremental'), str(d / '.cargo/nda-targets/*/*/incremental'),
+                               str(d / '.cargo/isolated-target*/*/incremental'), str(d / '.cargo/isolated-targets/*/*/incremental'),
+                               str(d / '.cargo/qual-*/*/incremental'), str(d / '.cargo/private-target-*/*/incremental'),
+                               str(d / '.cargo/pkg-repro-target-*/*/incremental'), str(dev / '.cargo-target*/*/incremental'),
+                               str(dev / '.cargo-targets/*/*/incremental'), str(dev / 'AI-agent-assembly/private-target-*/*/incremental'),
+                               '/private/tmp/*-target/*/incremental']),
         ('package_cache', [str(dev / '.pnpm-store'), str(d / 'Library/pnpm'), str(d / '.npm'), str(d / '.cache/uv'),
                            str(d / 'Library/Caches/pypoetry'), str(d / '.cache/pre-commit'),
                            str(d / 'Library/Caches/ms-playwright'), str(d / 'Library/Caches/Homebrew'),
@@ -142,6 +152,63 @@ def has_handle(root, paths):
         if any(q == r or q.startswith(r + '/') for r in roots):
             return True
     return False
+
+
+BUILD_LOCKS = ('.cargo-lock', '.cargo-build-lock', '.cargo-artifact-lock')
+
+
+def take_build_locks(profile):
+    """Non-blocking exclusive flock on every Cargo build lock in a profile directory: (fds, None) when all were taken, ([], reason)
+    otherwise. A lock someone else holds means a build is running; no lock file at all means that cannot be ruled out."""
+    held = []
+    for name in BUILD_LOCKS:
+        path = os.path.join(profile, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            release_build_locks(held)
+            return [], 'active:build-lock-held'
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            release_build_locks(held)
+            return [], 'active:build-lock-held'
+        held.append(fd)
+    return (held, None) if held else ([], 'build-lock-unverifiable')
+
+
+def release_build_locks(held):
+    for fd in held:
+        os.close(fd)
+
+
+def incremental_blockers(root):
+    """Reasons a `<target>/<profile>/incremental` directory is not safe to remove now (empty when it is)."""
+    profile = os.path.dirname(root)
+    target = os.path.dirname(profile)
+    why = []
+    # Lexical and real location must agree: a symlinked ancestor could make the target/profile/lock checks describe one
+    # directory while the removal acts on another.
+    if os.path.realpath(root) != os.path.normpath(root):
+        why.append('symlinked-ancestor')
+    try:
+        if os.lstat(target).st_uid != os.getuid():
+            why.append('target-not-owned')
+    except OSError:
+        why.append('target-unreadable')
+    if os.path.basename(root) != 'incremental' or not (os.path.isfile(os.path.join(target, 'CACHEDIR.TAG'))
+                                                       or os.path.isfile(os.path.join(target, '.rustc_info.json'))):
+        why.append('not-a-cargo-incremental-dir')
+    if any(os.path.exists(os.path.join(place, KEEP_MARKER)) for place in (target, profile)):
+        why.append('marker:keep-marker')
+    held, reason = take_build_locks(profile)
+    release_build_locks(held)
+    if reason:
+        why.append(reason)
+    return why
 
 
 def etime_seconds(pid):
@@ -362,6 +429,8 @@ def classify(rec, ctx):
     if kind == 'cargo_target' and os.path.isfile(os.path.join(os.path.dirname(root), '.rustc_info.json')) \
             and not os.path.isfile(os.path.join(root, '.rustc_info.json')):
         why.append('not-a-target-root')
+    if kind == 'cargo_incremental':
+        why += incremental_blockers(root)
     if why:
         return 'C', why
     # SPE-109/ADR-0001: shared or redirected Cargo targets are never preauthorizable. A target is class A only when its
@@ -382,7 +451,11 @@ def classify(rec, ctx):
 
 def measure(path, kind, ctx):
     shallow = KINDS.get(kind, KINDS['unknown'])[2]
-    if kind == 'worktree':
+    if kind == 'cargo_incremental':
+        # rustc writes only generated session files here; a marker scan of millions of them would never finish and would
+        # fail the resource closed. The top level is still checked, and `safe_remove` never follows a link.
+        markers, complete = scan_markers(path, False, max_depth=0)
+    elif kind == 'worktree':
         # Ignored local files (.env.local, a sqlite database) are invisible to `git status`: scan deep, skipping the
         # reproducible dependency and build trees.
         markers, complete = scan_markers(path, False, max_depth=WORKTREE_DEPTH, skip=WORKTREE_SKIP)
@@ -617,14 +690,23 @@ def apply(args):
                 record['action'] = 'skipped'
                 record['why'] = why = ['active:handle-appeared-before-delete']
             else:
-                before = free_bytes()
-                try:
-                    safe_remove(entry['path'], entry['fingerprint'])
-                    record['action'] = 'removed'
-                    removed += 1
-                except (OSError, SystemExit) as error:
-                    record['action'] = 'failed:%s' % type(error).__name__
-                record['free_delta_bytes'] = free_bytes() - before
+                held, blocked = [], None
+                if entry['kind'] == 'cargo_incremental':
+                    held, blocked = take_build_locks(os.path.dirname(entry['path']))
+                if blocked:
+                    record['action'] = 'skipped'
+                    record['why'] = why = [blocked]
+                else:
+                    before = free_bytes()
+                    try:
+                        safe_remove(entry['path'], entry['fingerprint'])
+                        record['action'] = 'removed'
+                        removed += 1
+                    except (OSError, SystemExit) as error:
+                        record['action'] = 'failed:%s' % type(error).__name__
+                    finally:
+                        release_build_locks(held)
+                    record['free_delta_bytes'] = free_bytes() - before
         with os.fdopen(os.open(audit, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), 'a') as handle:
             handle.write(json.dumps(record, sort_keys=True) + '\n')
         print('%-12s %s %s' % (record['action'], entry['id'], ','.join(why)))

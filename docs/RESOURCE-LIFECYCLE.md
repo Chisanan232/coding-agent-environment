@@ -83,10 +83,11 @@ One policy for every Rust project on the host. It reuses admission classes, the 
 gate before commit or push, and no mandatory `cargo clean`.
 
 **Status.** Implemented: the `CARGO_INCREMENTAL=0` default for `build-cold-isolated` (`disk-admission.py run`), whole-private-target removal
-through `apply`, the existing disk tiers, and `scripts/cargo-deps-reclaim.py` for shared `debug/deps` (below). **Proposed, not implemented
-(tracked follow-ups):** writing a `.ca-owner.json` receipt when a job creates its target (receipts are still supplied by the owner of the
-target), and a stale-incremental-session scope in `resource-lifecycle.py apply`. Until then incremental sessions are swept by a bounded,
-reviewed one-off with a manifest and a free-space check per batch.
+through `apply`, whole `<profile>/incremental` directories as a class B `cargo_incremental` kind (explicit `--ids`; `apply` takes Cargo's
+build locks first and skips a target whose lock is held; a missing lock file fails closed; never `deps/`, never the target root), an
+owner receipt written by `disk-admission.py run` and the queue claim into an isolated target that call itself creates (a `build-cold-isolated`
+job with an explicit `CARGO_TARGET_DIR`; never the shared target, a symlinked path or an existing directory), `scripts/cargo-deps-reclaim.py`
+for shared `debug/deps` (below), and the existing disk tiers. Nothing here runs automatically: every reclaim is an explicit command.
 
 **Shared `debug/deps` reclaim (`cargo-deps-reclaim.py`).** `classify` is read-only, resumable by hash-prefix partition and time-bounded
 (default 300 s per run; the full measured `deps/` of about 2.9 million files takes two runs). `apply` is a dry run unless `--execute`.
@@ -125,7 +126,7 @@ edit `~/.cargo/config.toml`, a workspace `[profile]` or the toolchain for this p
 
 **Reclaim scope.** Prefer, in order: (1) whole private targets the task owns; (2) Cargo's own scopes on a target the caller
 owns (`cargo clean -p NAME`, `--profile NAME`, `--target TRIPLE`, `--dry-run` first; `--workspace` or no scope empties the
-target); (3) stale incremental session directories older than the current build (proposed scope, not in `apply` yet; see Status), with a manifest and an audit line; (4) `cargo-deps-reclaim.py` for the shared `debug/deps` with its recorded-root proof. Not allowed:
+target); (3) whole `incremental` directories through the `cargo_incremental` kind of `resource-lifecycle.py` (manifest, explicit `--ids`, audit line); (4) `cargo-deps-reclaim.py` for the shared `debug/deps` with its recorded-root proof. Not allowed:
 deleting files from the shared `debug/deps` by age, by crate-name prefix or by guessed `.o` ownership; touching `.fingerprint`
 or `*.d` metadata; any shared-target deletion without proof of orphaning and a bounded plan. `.fingerprint` presence is not proof (measured: only 0.0025 GiB of
 `deps/` lacked an entry). Accepted proof is the artifact's own recorded `CARGO_MANIFEST_DIR` (from its `.d` file) no longer existing on disk,
