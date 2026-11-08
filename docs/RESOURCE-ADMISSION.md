@@ -361,6 +361,9 @@ workload. Serial builds keep the shared target. The admission record's
 job). Every live job here shares one `cargo-target:/Users/bryant/.cargo/shared-target`, so a second lane admits nothing for ordinary
 builds until the trial jobs run as `build-cold-isolated` with their own `CARGO_TARGET_DIR`. The key resolution limits are listed under "Declared workload classes".
 
+A `build-cold-isolated` run also gets `CARGO_INCREMENTAL=0` from `disk-admission.py run` when the job left it unset (`CLASS_ENV`): its target is
+one-shot, so incremental sessions are pure growth. Lifecycle, ownership and reclaim scope: [RESOURCE-LIFECYCLE.md](RESOURCE-LIFECYCLE.md), "Cargo build-artifact lifecycle".
+
 ## Banded per-job caps (SPE-150)
 
 The budget's band now reaches the job, and only through its environment. The grant is `granted_jobs` and `granted_test_threads` in
