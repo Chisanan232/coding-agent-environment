@@ -54,6 +54,12 @@ READ_PATHS = (re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rules/branches/
 JOB_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/actions/runs/[0-9]{1,15}/job/([0-9]{1,15})")
 CHECK_RUNS_RE = re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/commits/([0-9a-f]{40})/check-runs\?check_name=([A-Za-z0-9%._~-]{1,300})&per_page=100")
 JOB_PATH_RE = re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/actions/jobs/([0-9]{1,15})")
+# SPE-159: read paths for the path-filtered-skip proof (see path_filtered_skips). Anchored; one run and its jobs only.
+RUN_PATH_RE = re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/actions/runs/([0-9]{1,15})")
+RUN_JOBS_RE = re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/actions/runs/([0-9]{1,15})/jobs\?per_page=100")
+JOB_RUN_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/actions/runs/([0-9]{1,15})/job/([0-9]{1,15})")
+WORKFLOW_PATH_RE = re.compile(r"(\.github/workflows/[A-Za-z0-9._-]+\.ya?ml)(@[A-Za-z0-9._/-]{1,200})?")
+TRUSTED_RUN_EVENTS = {"pull_request", "workflow_dispatch", "push"}
 # A required check may be exempted only if it never executed (see unavailable_checks); these are the verdicts a
 # never-started hosted job shows. SKIPPED, TIMED_OUT, NEUTRAL, ACTION_REQUIRED and every other verdict stay blockers.
 NOT_EXECUTED_VERDICTS = {"FAILURE", "STARTUP_FAILURE", "CANCELLED"}
@@ -151,6 +157,11 @@ def check_argv(argv):
         m = CHECK_RUNS_RE.fullmatch(a[1])
         if m and REPO_RE.fullmatch(m.group(1)):
             return "check-runs"
+    if len(a) == 2 and a[0] == "api":
+        for rx, kind in ((RUN_PATH_RE, "run"), (RUN_JOBS_RE, "run-jobs")):
+            m = rx.fullmatch(a[1])
+            if m and REPO_RE.fullmatch(m.group(1)):
+                return kind
     if len(a) == 8 and a == merge_argv(a[4], a[2], a[7]) and PR_RE.fullmatch(a[2]) \
             and REPO_RE.fullmatch(a[4]) and SHA_RE.fullmatch(a[7]):
         return "merge"
@@ -487,18 +498,20 @@ def check_entry(c):
     return name, verdict
 
 
-def entry_blocks(name, verdict, required, exempt):
-    """The one rule for whether a rollup entry blocks: only SUCCESS, an exempted name, or a SKIPPED entry of a
-    non-required check does not."""
-    return verdict != "SUCCESS" and name not in exempt and not (verdict == "SKIPPED" and name not in required)
+def entry_blocks(name, verdict, required, exempt, skip_ok=frozenset()):
+    """The one rule for whether a rollup entry blocks: only SUCCESS, an exempted name, a SKIPPED entry of a
+    non-required check, or a SKIPPED entry of a required check in `skip_ok` (path_filtered_skips) does not."""
+    return verdict != "SUCCESS" and name not in exempt \
+        and not (verdict == "SKIPPED" and (name not in required or name in skip_ok))
 
 
-def summarize_checks(rollup, required, exempt=frozenset()):
+def summarize_checks(rollup, required, exempt=frozenset(), skip_ok=frozenset()):
     """Every named required check must be present and SUCCESS; every other entry must also be SUCCESS, except that a
     non-required entry that SKIPPED (a job whose `if:` did not select this event, such as a release job that only runs on
     tag pushes) is not a blocker: it never ran, and it is not one of the allowlisted checks. A required check that
     skipped, and every other non-SUCCESS verdict of any check, still blocks.
-    A name in `exempt` (verified never executed, covered by local evidence) may have non-SUCCESS entries."""
+    A name in `exempt` (verified never executed, covered by local evidence) may have non-SUCCESS entries.
+    A required name in `skip_ok` (a verified path-filtered skip, see path_filtered_skips) may have SKIPPED entries only."""
     seen, bad = {}, []
     for c in rollup:
         name, verdict = check_entry(c)
@@ -508,9 +521,10 @@ def summarize_checks(rollup, required, exempt=frozenset()):
             bad.append(f"required check {name} is missing")
     for name, verdicts in seen.items():
         for v in verdicts:
-            if entry_blocks(name, v, required, exempt):
+            if entry_blocks(name, v, required, exempt, skip_ok):
                 bad.append(f"check {name} is {v}")
     return {"total": len(rollup), "required": len(required),
+            "path_filtered_skips_ignored": sum(v == "SKIPPED" for n, vs in seen.items() if n in skip_ok and n in required for v in vs),
             "success": sum(v == "SUCCESS" for vs in seen.values() for v in vs), "not_success": len(bad),
             "skipped_ignored": sum(v == "SKIPPED" for n, vs in seen.items() if n not in required and n not in exempt for v in vs)}, bad
 
@@ -667,9 +681,10 @@ def job_never_ran(runner, repo, job_id, name, head):
             and job.get("steps") == [] and job.get("runner_id") in (None, 0) and not job.get("runner_name"))
 
 
-def only_actions_runs(runner, repo, head, name):
-    """Every check run of this name at this head belongs to the GitHub Actions app. A checks-writing integration
-    could otherwise publish an executed failure under the same name and details URL as a never-started job."""
+def actions_runs_of(runner, repo, head, name):
+    """The complete check-run listing of this name at this head if every entry belongs to the GitHub Actions app,
+    else None. A checks-writing integration could otherwise publish an executed failure under the same name and
+    details URL as a never-started job."""
     path = f"repos/{repo}/commits/{head}/check-runs?check_name={urllib.parse.quote(name, safe='')}&per_page=100"
     rc, out, err = runner.call(["api", path])
     if rc != 0:
@@ -680,9 +695,142 @@ def only_actions_runs(runner, repo, head, name):
         raise RuntimeError("gh returned unparseable JSON")
     runs = data.get("check_runs") if isinstance(data, dict) else None
     if not isinstance(runs, list) or data.get("total_count") != len(runs) or not runs or len(runs) > 100:
-        return False
-    return all(isinstance(r, dict) and r.get("name") == name and r.get("head_sha") == head
-               and isinstance(r.get("app"), dict) and r["app"].get("slug") == "github-actions" for r in runs)
+        return None
+    if not all(isinstance(r, dict) and r.get("name") == name and r.get("head_sha") == head
+               and isinstance(r.get("app"), dict) and r["app"].get("slug") == "github-actions" for r in runs):
+        return None
+    return runs
+
+
+def only_actions_runs(runner, repo, head, name):
+    """True when actions_runs_of lists only GitHub Actions check runs of this name at this head."""
+    return actions_runs_of(runner, repo, head, name) is not None
+
+
+class Unproven(Exception):
+    """A path-filtered-skip proof step failed. Never an error: the skipped required check simply keeps blocking."""
+
+
+def need(condition):
+    if not condition:
+        raise Unproven()
+
+
+def real_id(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def api_object(runner, path, stage):
+    rc, out, err = runner.call(["api", path])
+    if rc != 0:
+        raise RuntimeError(gh_error(err, stage))
+    try:
+        data = json.loads(out)
+    except ValueError:
+        raise RuntimeError("gh returned unparseable JSON")
+    need(isinstance(data, dict))
+    return data
+
+
+def trusted_run(runner, repo, run_id, head, events):
+    """A completed workflow run that is trusted evidence for `head`: a workflow file of this very repository (not a
+    fork, not a dynamic run), an allowed event, and exactly the PR head SHA. Returns the run."""
+    run = api_object(runner, f"repos/{repo}/actions/runs/{run_id}", "run-read")
+    need(run.get("id") == int(run_id) and run.get("head_sha") == head and run.get("status") == "completed")
+    need(run.get("event") in events and real_id(run.get("workflow_id")))
+    need(isinstance(run.get("path"), str) and WORKFLOW_PATH_RE.fullmatch(run["path"]))
+    for key in ("repository", "head_repository"):
+        full = (run.get(key) or {}).get("full_name") if isinstance(run.get(key), dict) else None
+        need(isinstance(full, str) and full.lower() == repo.lower())
+    return run
+
+
+def steps_executed(job):
+    """A job that really ran: steps present, none failed or cancelled, and at least one succeeded."""
+    steps = job.get("steps")
+    return isinstance(steps, list) and bool(steps) and all(isinstance(s, dict) and s.get("conclusion") in ("success", "skipped")
+                                                           for s in steps) \
+        and any(s["conclusion"] == "success" for s in steps)
+
+
+def skip_is_path_filtered(runner, repo, entry, name, head):
+    """Prove one SKIPPED required rollup entry is the never-started job of a pull_request run that was gated by a
+    sibling job. Returns the skipped job's workflow run."""
+    need(entry.get("__typename") == "CheckRun")
+    m = JOB_RUN_URL_RE.fullmatch(entry.get("detailsUrl") or "")
+    need(m is not None and m.group(1).lower() == repo.lower())
+    run_id, job_id = m.group(2), m.group(3)
+    job = api_object(runner, f"repos/{repo}/actions/jobs/{job_id}", "job-read")
+    need(job.get("id") == int(job_id) and job.get("run_id") == int(run_id) and job.get("name") == name
+         and job.get("head_sha") == head and job.get("status") == "completed" and job.get("conclusion") == "skipped"
+         and job.get("steps") == [] and job.get("runner_id") in (None, 0) and not job.get("runner_name"))
+    run = trusted_run(runner, repo, run_id, head, {"pull_request"})
+    need(run.get("conclusion") == "success")
+    siblings = api_object(runner, f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100", "run-jobs-read")
+    jobs = siblings.get("jobs")
+    need(isinstance(jobs, list) and siblings.get("total_count") == len(jobs) and 0 < len(jobs) <= 100)
+    need(all(isinstance(j, dict) and j.get("status") == "completed" and j.get("conclusion") in ("success", "skipped")
+             and j.get("run_id") == int(run_id) for j in jobs))
+    need(any(j.get("id") == job["id"] for j in jobs))
+    need(any(j.get("id") != job["id"] and j.get("conclusion") == "success" and steps_executed(j) for j in jobs))
+    return run
+
+
+def passed_in_trusted_run(runner, repo, head, name, skipped_run):
+    """True only when this required job really passed on `head` in a trusted run of the SAME workflow as the skip,
+    and no other check run of that name at `head` is anything but that success or a skip."""
+    runs = actions_runs_of(runner, repo, head, name)
+    need(runs is not None)
+    passes = 0
+    for r in runs:
+        need(r.get("status") == "completed" and r.get("conclusion") in ("success", "skipped"))
+        if r["conclusion"] == "skipped":
+            continue
+        need(real_id(r.get("id")))
+        job = api_object(runner, f"repos/{repo}/actions/jobs/{r['id']}", "job-read")
+        need(job.get("id") == r["id"] and job.get("name") == name and job.get("head_sha") == head
+             and job.get("status") == "completed" and job.get("conclusion") == "success" and steps_executed(job)
+             and real_id(job.get("run_id")))
+        run = trusted_run(runner, repo, job["run_id"], head, TRUSTED_RUN_EVENTS)
+        need(run["workflow_id"] == skipped_run["workflow_id"]
+             and WORKFLOW_PATH_RE.fullmatch(run["path"]).group(1) == WORKFLOW_PATH_RE.fullmatch(skipped_run["path"]).group(1))
+        passes += 1
+    need(passes > 0)
+    return True
+
+
+def path_filtered_skips(runner, repo, facts, head, cfg):
+    """Required checks whose SKIPPED rollup entries may be ignored (SPE-159, founder decision). A path-filtered
+    workflow skips its required job on a docs-only PR; GitHub treats that as green but the rollup keeps the SKIPPED
+    entry. A required name qualifies only when ALL hold, and any API error, malformed datum or ambiguity means it
+    does not (the skip then blocks exactly as before):
+      1. every rollup entry of the name is SKIPPED or SUCCESS (a failure or pending entry is never ignored);
+      2. each SKIPPED entry is a CheckRun of this repo whose job is completed/skipped with zero steps and no runner,
+         at this head, in a trusted pull_request run that concluded success in which every job is success or skipped
+         and at least one other job really executed (the gating `changes`-style job);
+      3. the same name has a completed success check run at this head, authored only by the github-actions app
+         (every check run of that name at this head is), whose job executed steps and whose workflow run is
+         trusted: a workflow file of this repository on the repository itself (no fork), event pull_request,
+         workflow_dispatch or push, exact head SHA, and the SAME workflow (workflow_id and file) as the skip.
+    It does not prove the skip came from a `paths:` filter rather than another `if:`; it proves the skipped job ran
+    green on this exact head in the same workflow, which is the evidence the skip was standing in for."""
+    rollup = facts.get("statusCheckRollup")
+    if not isinstance(rollup, list):
+        return frozenset()
+    ok = set()
+    for name in cfg["required_checks"]:
+        entries = [(c, check_entry(c)[1]) for c in rollup if check_entry(c)[0] == name]
+        skipped = [c for c, v in entries if v == "SKIPPED"]
+        if not skipped or any(v not in ("SKIPPED", "SUCCESS") for _, v in entries):
+            continue
+        try:
+            runs = [skip_is_path_filtered(runner, repo, c, name, head) for c in skipped]
+            need(all(r["workflow_id"] == runs[0]["workflow_id"] for r in runs))
+            passed_in_trusted_run(runner, repo, head, name, runs[0])
+        except (Unproven, RuntimeError):
+            continue
+        ok.add(name)
+    return frozenset(ok)
 
 
 def unavailable_checks(runner, repo, facts, head, cfg, local):
@@ -728,7 +876,7 @@ def unstable_is_covered(rollup, required, exempt):
     return not any(entry_blocks(n, v, required, exempt) for n, v in map(check_entry, rollup))
 
 
-def decide(p, repo, pr, head, me, cfg, exempt=frozenset()):
+def decide(p, repo, pr, head, me, cfg, exempt=frozenset(), skip_ok=frozenset()):
     """All guards against one PR fact set. Returns (pr_class, checks_summary); raises Refused."""
     bad = []
     state = require(p, "state", str)
@@ -771,7 +919,7 @@ def decide(p, repo, pr, head, me, cfg, exempt=frozenset()):
             latest[who.lower()] = (st, (r.get("commit") or {}).get("oid"), r.get("authorAssociation"))
     if decision == "CHANGES_REQUESTED" or any(v[0] == "CHANGES_REQUESTED" for v in latest.values()):
         bad.append("unresolved CHANGES_REQUESTED")
-    checks, check_bad = summarize_checks(rollup, cfg["required_checks"], exempt)
+    checks, check_bad = summarize_checks(rollup, cfg["required_checks"], exempt, skip_ok)
     bad += check_bad
     a, me_l = author.lower(), me.lower()
     if a == me_l:
@@ -814,10 +962,12 @@ def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin=None):
     # other fact is validated first; a required check is never skipped by this pre-pass in the real decision below.
     pre = frozenset(cfg["required_checks"]) | {check_entry(c)[0] for c in facts.get("statusCheckRollup") or ()} \
         if cfg["local_equivalent_ci"] else frozenset()
-    decide(facts, repo, pr, head, me, cfg, pre)
+    # Same pre-pass idea for path-filtered skips: assume every required skip is provable until the real proof runs.
+    decide(facts, repo, pr, head, me, cfg, pre, frozenset(cfg["required_checks"]))
     digest, local = load_evidence(evidence, head, repo, pr, base, cfg, key, clock())
     exempt = unavailable_checks(runner, repo, facts, head, cfg, local)
-    pr_class, checks = decide(facts, repo, pr, head, me, cfg, exempt)
+    skip_ok = path_filtered_skips(runner, repo, facts, head, cfg)
+    pr_class, checks = decide(facts, repo, pr, head, me, cfg, exempt, skip_ok)
     if pin is not None and digest != pin["evidence"]:
         raise Refused(["evidence file changed since the first read"])
     info = {"waived": True}
@@ -831,7 +981,9 @@ def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin=None):
     exempt_after = unavailable_checks(runner, repo, after, head, cfg, local)
     if exempt_after != exempt:
         raise Refused(["required-check availability changed while server-side state was being read"])
-    final_class, _ = decide(after, repo, pr, head, me, cfg, exempt_after)  # every blocking fact in the last read refuses
+    if path_filtered_skips(runner, repo, after, head, cfg) != skip_ok:
+        raise Refused(["path-filtered skip proof changed while server-side state was being read"])
+    final_class, _ = decide(after, repo, pr, head, me, cfg, exempt_after, skip_ok)  # every blocking fact in the last read refuses
     if final_class != pr_class:
         raise Refused(["PR class changed while server-side state was being read"])
     req = set(cfg["required_checks"])
@@ -840,7 +992,7 @@ def evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin=None):
                   local_equivalent=sorted(exempt),  # union, kept for compatibility
                   local_equivalent_required=sorted(exempt & req), local_equivalent_optional=sorted(exempt - req),
                   exempted_entries=sum(v != "SUCCESS" and n in exempt for n, v in entries),
-                  merge_state=after.get("mergeStateStatus"))  # an exempted check is never reported as CI_PASS
+                  path_filtered_skips=sorted(skip_ok), merge_state=after.get("mergeStateStatus"))  # an exempted check is never reported as CI_PASS
     return observed, pr_class, checks, info, {"base": base, "evidence": digest}
 
 
