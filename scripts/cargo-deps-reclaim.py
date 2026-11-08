@@ -146,9 +146,15 @@ def check_target(deps):
 def write_private(path, text):
     """Atomic: write a private temporary file next to the target, then rename it over."""
     tmp = '%s.tmp%d' % (path, os.getpid())
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.unlink(tmp)                    # a stale file from a crashed run must not lend its mode or content
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'w') as handle:
         handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp, path)
 
 
@@ -444,9 +450,10 @@ def apply(args, free_fn=None):
                 if args.execute and batch and expect >= limit and not flush():
                     print('STOP: a batch freed under %d%% of its estimate; investigate before continuing' % (STOP_RATIO * 100))
                     break
-                if (time.monotonic() - started > args.max_seconds or total_expected + expect >= cap
-                        or total_expected + expect + shares[entry['ino']] > cap):
-                    break                      # the cap is never overshot by the next inode group either
+                if time.monotonic() - started > args.max_seconds or total_expected + expect >= cap:
+                    break
+                if total_expected + expect + shares[entry['ino']] > cap:
+                    continue                   # the cap is never overshot by this inode group; smaller ones may still fit
                 previous = entry['ino']
             if args.execute:
                 batch.append(entry)
