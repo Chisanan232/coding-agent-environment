@@ -2464,9 +2464,25 @@ def _granted_jobs(budget, declared, environ):
         return None
 
 
+# Class-level Cargo settings that do not depend on the budget (SPE-161). A build-cold-isolated job is a one-shot build in its own
+# target directory: incremental compilation cannot be reused by a later run and was the largest measured source of target growth
+# (357 GiB of session directories in the shared target, ADR 0017 / SPE-109). Warm classes keep Cargo's default. Only an unset
+# variable is filled; a job that chose its own value keeps it, and no profile or toolchain setting is touched.
+CLASS_ENV = {
+    'build-cold-isolated': {'CARGO_INCREMENTAL': '0'},
+}
+
+
+def class_env(declared, environ):
+    """{variable: value} the declared class implies, for variables the job left unset. Empty for other classes and legacy runs."""
+    defaults = CLASS_ENV.get((declared or {}).get('class')) or {}
+    return {name: value for name, value in defaults.items() if name not in environ}
+
+
 def apply_grant_env(budget, declared):
-    """Export the grant into this process's environment, which the exec'd job inherits. Never raises."""
+    """Export the grant and the class defaults into this process's environment, which the exec'd job inherits. Never raises."""
     try:
+        os.environ.update(class_env(declared, os.environ))
         os.environ.update(grant_env(budget, declared, os.environ))
     except Exception:
         pass
