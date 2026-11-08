@@ -804,6 +804,21 @@ class IncrementalScopeTests(Fixture):
         self.addCleanup(os.close, fd)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
+    def test_symlinked_ancestor_is_class_c(self):
+        t, inc = self.target("real-target")
+        link = self.root / "linked-target"
+        link.symlink_to(t)
+        cls, why = self.classify(link / "debug/incremental", "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("symlinked-ancestor", why)
+
+    def test_lock_file_that_is_a_symlink_is_not_followed(self):
+        t, inc = self.target(locks=())
+        real_lock = self.root / "elsewhere-lock"
+        real_lock.write_text("")
+        (t / "debug/.cargo-lock").symlink_to(real_lock)
+        self.assertEqual(self.classify(inc, "cargo_incremental")[0][0], "C")     # fails closed, the link is never opened
+
     def test_a_large_incremental_tree_is_not_failed_closed_by_the_marker_scan(self):
         _, inc = self.target()
         for i in range(30):
