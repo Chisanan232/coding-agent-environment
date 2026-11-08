@@ -673,5 +673,188 @@ class ReviewRegressionTests(Fixture):
         self.assertIsNone(rl.read_receipt(d))
 
 
+class IncrementalScopeTests(Fixture):
+    """SPE-162: whole `<target>/<profile>/incremental` directories, class B, never the target, deps or a busy build."""
+
+    def target(self, name="tgt", locks=(".cargo-lock", ".cargo-build-lock")):
+        t = self.root / name
+        inc = t / "debug/incremental"
+        (inc / "crate-abc/s-1").mkdir(parents=True)
+        (inc / "crate-abc/s-1/work-product.o").write_bytes(b"x" * 5000)
+        (t / "debug/deps").mkdir()
+        (t / "debug/deps/libkeep.rlib").write_bytes(b"y" * 100)
+        (t / "CACHEDIR.TAG").write_text("c")
+        for lock in locks:
+            (t / "debug" / lock).write_text("")
+        return t, inc
+
+    def manifest(self, inc):
+        spec = [["cargo_incremental", [str(inc)]]]
+        consumers = self.root / "consumers.json"
+        consumers.write_text(json.dumps(spec))
+        self.patch(rl, "default_consumers", lambda tmp=None: spec)
+        out = self.root / "state"
+        code, _ = self.run_cli("inventory", "--self-session", SELF, "--consumers", str(consumers), "--out", str(out),
+                               "--sessions-dir", str(self.sessions))
+        self.assertEqual(code, 0)
+        return next(out.glob("manifest-B-*.json")), out
+
+    def hold(self, path):
+        import fcntl
+        fd = os.open(path, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+    def test_an_idle_incremental_directory_is_class_b(self):
+        _, inc = self.target()
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual(cls, "B")
+        self.assertIn("shared-or-foreign", why)
+
+    def test_never_class_a_even_with_a_private_receipt(self):
+        _, inc = self.target()
+        receipt(inc, private=True)
+        self.assertEqual(self.classify(inc, "cargo_incremental")[0][0], "B")
+
+    def test_held_build_lock_is_class_c(self):
+        t, inc = self.target()
+        self.hold(t / "debug/.cargo-lock")
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("active:build-lock-held", why)
+
+    def test_missing_build_lock_fails_closed(self):
+        _, inc = self.target(locks=())
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("build-lock-unverifiable", why)
+
+    def test_open_handle_inside_is_class_c(self):
+        _, inc = self.target()
+        self.handles = ({str(inc / "crate-abc/s-1/work-product.o")}, True)
+        self.assertEqual(self.classify(inc, "cargo_incremental")[0][0], "C")
+
+    def test_keep_marker_on_the_target_is_class_c(self):
+        t, inc = self.target()
+        (t / ".ca-keep").write_text("")
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("marker:keep-marker", why)
+
+    def test_directory_that_is_not_below_a_cargo_target_is_class_c(self):
+        d = self.root / "elsewhere/debug/incremental"
+        d.mkdir(parents=True)
+        (d.parent / ".cargo-lock").write_text("")
+        cls, why = self.classify(d, "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("not-a-cargo-incremental-dir", why)
+
+    def test_a_directory_not_named_incremental_is_class_c(self):
+        t, _ = self.target()
+        cls, why = self.classify(t / "debug/deps", "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("not-a-cargo-incremental-dir", why)
+
+    def test_default_consumers_find_the_shared_and_isolated_incremental_dirs(self):
+        home = self.root / "home"
+        wanted = [".cargo/shared-target/debug/incremental", ".cargo/shared-target/release/incremental",
+                  ".cargo/nda-targets/t1/debug/incremental", ".cargo/isolated-targets/x/debug/incremental"]
+        for name in wanted:
+            (home / name).mkdir(parents=True)
+        (home / ".cargo/shared-target/debug/deps").mkdir()
+        self.patch(rl, "HOME", home)
+        spec = dict(rl.default_consumers(self.root / "tmp"))["cargo_incremental"]
+        found = {hit for kind, hit, _ in rl.discover([("cargo_incremental", spec)]) if hit.startswith(str(home))}
+        self.assertEqual(found, {str(home / n) for n in wanted})
+
+    def test_apply_needs_explicit_ids_and_removes_only_the_named_directory(self):
+        t, inc = self.target()
+        manifest, out = self.manifest(inc)
+        code, _ = self.run_cli("apply", "--manifest", str(manifest), "--self-session", SELF, "--out", str(out))
+        self.assertNotEqual(code, 0)
+        self.assertTrue(inc.exists())
+        entry = json.loads(manifest.read_text())["entries"][0]
+        self.run_cli("apply", "--manifest", str(manifest), "--self-session", SELF, "--out", str(out), "--ids", entry["id"])
+        self.assertFalse(inc.exists())
+        self.assertTrue((t / "debug/deps/libkeep.rlib").exists())
+        self.assertTrue((t / "debug/.cargo-lock").exists())
+
+    def test_apply_skips_when_a_build_starts_after_the_manifest(self):
+        t, inc = self.target()
+        manifest, out = self.manifest(inc)
+        entry = json.loads(manifest.read_text())["entries"][0]
+        self.hold(t / "debug/.cargo-build-lock")
+        self.run_cli("apply", "--manifest", str(manifest), "--self-session", SELF, "--out", str(out), "--ids", entry["id"])
+        self.assertTrue((inc / "crate-abc/s-1/work-product.o").exists())
+
+    def test_apply_dry_run_removes_nothing(self):
+        _, inc = self.target()
+        manifest, out = self.manifest(inc)
+        entry = json.loads(manifest.read_text())["entries"][0]
+        self.run_cli("apply", "--manifest", str(manifest), "--self-session", SELF, "--out", str(out), "--ids", entry["id"], "--dry-run")
+        self.assertTrue(inc.exists())
+
+    def test_locks_are_released_after_apply(self):
+        import fcntl
+        t, inc = self.target()
+        manifest, out = self.manifest(inc)
+        entry = json.loads(manifest.read_text())["entries"][0]
+        self.run_cli("apply", "--manifest", str(manifest), "--self-session", SELF, "--out", str(out), "--ids", entry["id"])
+        fd = os.open(t / "debug/.cargo-lock", os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_symlinked_ancestor_is_class_c(self):
+        t, inc = self.target("real-target")
+        link = self.root / "linked-target"
+        link.symlink_to(t)
+        cls, why = self.classify(link / "debug/incremental", "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("symlinked-ancestor", why)
+
+    def test_lock_file_that_is_a_symlink_is_not_followed(self):
+        t, inc = self.target(locks=())
+        real_lock = self.root / "elsewhere-lock"
+        real_lock.write_text("")
+        (t / "debug/.cargo-lock").symlink_to(real_lock)
+        self.assertEqual(self.classify(inc, "cargo_incremental")[0][0], "C")     # fails closed, the link is never opened
+
+    def test_apply_itself_takes_the_lock_even_if_revalidation_missed_the_build(self):
+        t, inc = self.target()
+        manifest, out = self.manifest(inc)
+        entry = json.loads(manifest.read_text())["entries"][0]
+        self.patch(rl, "incremental_blockers", lambda root: [])      # a build that starts after revalidation
+        self.hold(t / "debug/.cargo-lock")
+        self.run_cli("apply", "--manifest", str(manifest), "--self-session", SELF, "--out", str(out), "--ids", entry["id"])
+        self.assertTrue((inc / "crate-abc/s-1/work-product.o").exists())
+
+    def test_keep_marker_on_the_profile_directory_is_class_c(self):
+        t, inc = self.target()
+        (t / "debug/.ca-keep").write_text("")
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("marker:keep-marker", why)
+
+    def test_a_target_owned_by_someone_else_is_class_c(self):
+        t, inc = self.target()
+        self.patch(rl.os, "getuid", lambda: os.stat(t).st_uid + 1)
+        self.assertIn("target-not-owned", rl.incremental_blockers(str(inc)))
+
+    def test_lock_misses_do_not_leak_descriptors(self):
+        t, inc = self.target()
+        self.hold(t / "debug/.cargo-lock")
+        before = len(os.listdir("/dev/fd"))
+        for _ in range(20):
+            rl.take_build_locks(str(t / "debug"))
+        self.assertLessEqual(len(os.listdir("/dev/fd")), before + 1)
+
+    def test_a_large_incremental_tree_is_not_failed_closed_by_the_marker_scan(self):
+        _, inc = self.target()
+        for i in range(30):
+            (inc / ("crate-%d/s-1" % i)).mkdir(parents=True)
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual(cls, "B", why)
+
+
 if __name__ == "__main__":
     unittest.main()
