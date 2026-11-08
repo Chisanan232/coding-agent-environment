@@ -111,8 +111,15 @@ edit `~/.cargo/config.toml`, a workspace `[profile]` or the toolchain for this p
 owns (`cargo clean -p NAME`, `--profile NAME`, `--target TRIPLE`, `--dry-run` first; `--workspace` or no scope empties the
 target); (3) stale incremental session directories older than the current build, with a manifest and an audit line. Not allowed:
 deleting files from the shared `debug/deps` by age, by crate-name prefix or by guessed `.o` ownership; touching `.fingerprint`
-or `*.d` metadata; any shared-target deletion that has no proof the artifacts are orphaned (no `.fingerprint` unit, no source root
-on disk) and no running build. Uncertain artifacts are preserved and listed.
+or `*.d` metadata; any shared-target deletion without proof of orphaning and a bounded plan. `.fingerprint` presence is not proof (measured: only 0.0025 GiB of
+`deps/` lacked an entry). Accepted proof is the artifact's own recorded `CARGO_MANIFEST_DIR` (from its `.d` file) no longer existing on disk,
+re-checked at deletion time, the file unchanged since the scan and older than a day, and every hard link of the inode removed (a partial
+unlink frees nothing). Never during a running build of the same workspace. Uncertain artifacts are preserved and listed.
+
+**Measuring.** `deps/` holds about a million tiny `*.rcgu.o` objects that Cargo hard-links (up to dozens of links per inode), so a per-entry
+`st_blocks` sum over-counts (measured 82.5 GiB per entry versus 51.8 GiB of unique inodes in the same sample). Size and expected
+reclaim are computed per unique inode; `du` or a shell glob over `deps/` does not finish in a reasonable time, so use one streaming
+`scandir` pass with a five-minute cap and a TSV, never one subprocess per artifact.
 
 **Thresholds.** The existing disk tiers apply unchanged: below 100 GiB heavy work is refused (`HEAVY_FLOOR`), below 50 GiB the latch
 holds, below 20 GiB emergency. Warning is the `low` tier. A target larger than its class estimate (`disk_gib`) is a signal to
