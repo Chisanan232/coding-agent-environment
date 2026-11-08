@@ -55,7 +55,7 @@ class Fixture:
 
     def args(self, **kw):
         base = dict(deps=str(self.deps), state=str(self.state), max_seconds=60, prefix=self.prefixes, execute=False,
-                    batch_gib=0.000001, max_gib=20.0, min_age_hours=24.0)
+                    batch_gib=0.000001, max_gib=20.0, min_age_hours=24.0, reset=False)
         base.update(kw)
         return argparse.Namespace(**base)
 
@@ -254,13 +254,118 @@ class ApplyTests(unittest.TestCase):
         fx.classify()
         out = fx.apply(execute=True, free_fn=lambda: 1_000_000_000)    # frees nothing, as if a snapshot held the blocks
         self.assertIn('STOP', out)
-        self.assertGreater(len(fx.names()), 0)
+        gone = [n for n in range(6) if not (fx.deps / ('gone%d-%s.rlib' % (n, H))).exists()]
+        self.assertEqual(len(gone), 1)                  # the first batch only; the other five files were never touched
+
+    def test_pre_existing_outside_link_keeps_the_file_at_classify_time(self):
+        fx = Fixture(self)
+        fx.crate('gone', H, gone_root(fx), files=('d', 'rlib'))
+        os.link(fx.deps / ('gone-%s.rlib' % H), fx.base / 'outside-link')    # already there when classify runs
+        fx.classify()
+        self.assertEqual([e for e in cdr.read_plan(cdr.private_state(fx.state)) if e['kind'] == 'rlib'], [e for e in cdr.read_plan(cdr.private_state(fx.state))])
+        self.assertEqual(cdr.eligible(cdr.read_plan(cdr.private_state(fx.state)), time.time(), 0), [])
+        fx.apply(execute=True)
+        self.assertTrue((fx.deps / ('gone-%s.rlib' % H)).exists())
+
+    def test_symlinked_ancestor_is_not_proof_of_absence(self):
+        fx = Fixture(self)
+        (fx.live / 'moved').symlink_to(fx.base / 'unmounted-drive')            # dangling, as an unmounted volume would be
+        fx.crate('gone', H, str(fx.live / 'moved/wt/crate'))
+        fx.classify()
+        self.assertEqual(cdr.read_plan(cdr.private_state(fx.state)), [])
+
+    def test_dotdot_and_unnormalised_roots_are_kept(self):
+        fx = Fixture(self)
+        fx.crate('dd', H, str(fx.live) + '/a/../b/crate')
+        fx.crate('dbl', H, str(fx.live) + '//b/crate')
+        fx.classify()
+        self.assertEqual(cdr.read_plan(cdr.private_state(fx.state)), [])
+
+    def test_permission_error_on_a_component_counts_as_present(self):
+        fx = Fixture(self)
+        locked = fx.live / 'locked'
+        locked.mkdir()
+        fx.crate('gone', H, str(locked / 'wt/crate'))
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o700)
+        fx.classify()
+        self.assertEqual(cdr.read_plan(cdr.private_state(fx.state)), [])
+
+    def test_prefix_unmounted_between_classify_and_apply_deletes_nothing(self):
+        fx = self.prepared()
+        before = fx.names()
+        import shutil
+        shutil.rmtree(fx.live)                                                  # the whole prefix vanishes
+        fx.apply(execute=True)
+        self.assertEqual(fx.names(), before)
+
+    def test_overly_broad_prefix_is_refused(self):
+        fx = Fixture(self)
+        fx.crate('gone', H, gone_root(fx))
+        for prefix in ('/', '/Users', 'relative/path'):
+            fx.prefixes = [prefix]
+            with self.assertRaises(SystemExit):
+                fx.classify()
+
+    def test_max_gib_caps_even_when_the_batch_is_larger(self):
+        fx = Fixture(self)
+        for i in range(10):
+            fx.crate('gone%d' % i, H, gone_root(fx), files=('rlib', 'd'))
+        fx.classify()
+        out = fx.apply(execute=True, batch_gib=100.0, max_gib=3 * 8192 / cdr.GIB)
+        self.assertLessEqual(sum(1 for i in range(10) if not (fx.deps / ('gone%d-%s.rlib' % (i, H))).exists()), 3)
+        self.assertIn('removed', out)
+
+    def test_tampered_plan_names_are_ignored(self):
+        fx = self.prepared()
+        path = cdr.plan_paths(cdr.private_state(fx.state))[1]
+        outside = fx.base / 'victim'
+        outside.write_bytes(b'keep me')
+        with open(path, 'a') as handle:
+            handle.write(json.dumps({'name': '../victim', 'ino': outside.stat().st_ino, 'nlink': 1, 'mtime': 0, 'blocks': 8,
+                                     'root': gone_root(fx), 'kind': 'rlib'}) + '\n')
+        fx.apply(execute=True)
+        self.assertTrue(outside.exists())
+
+    def test_duplicate_plan_entries_are_collapsed(self):
+        fx = self.prepared()
+        path = cdr.plan_paths(cdr.private_state(fx.state))[1]
+        lines = path.read_text()
+        path.write_text(lines + lines)
+        self.assertEqual(len(cdr.read_plan(cdr.private_state(fx.state))), 3)
+
+    def test_a_vanished_file_does_not_abort_the_batch(self):
+        fx = self.prepared()
+        real = os.unlink
+        victim = 'gone-%s.rmeta' % H
+
+        def flaky(path, *a, **kw):
+            if path == victim:
+                raise FileNotFoundError(path)
+            return real(path, *a, **kw)
+        import unittest.mock
+        with unittest.mock.patch.object(cdr.os, 'unlink', flaky):
+            fx.apply(execute=True, batch_gib=1.0)
+        self.assertEqual(sorted(n for n in fx.names()), sorted([victim, 'gone-%s.d' % H]))
+
+    def test_stale_plan_is_refused_and_reset_redoes_it(self):
+        fx = self.prepared()
+        path = cdr.plan_paths(cdr.private_state(fx.state))[0]
+        progress = json.loads(path.read_text())
+        progress['done_at'] = {k: time.time() - 8 * 86400 for k in progress['done']}
+        path.write_text(json.dumps(progress))
+        with self.assertRaises(SystemExit):
+            fx.apply(execute=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            cdr.classify(fx.args(reset=True))
+        fx.apply(execute=True)
+        self.assertEqual(fx.names(), {'gone-%s.d' % H})
 
     def test_stale_classification_is_refused(self):
         fx = self.prepared()
         path = cdr.plan_paths(cdr.private_state(fx.state))[0]
         progress = json.loads(path.read_text())
-        progress['updated'] = time.time() - 8 * 86400
+        progress['done_at'] = {k: time.time() - 8 * 86400 for k in progress['done']}
         path.write_text(json.dumps(progress))
         with self.assertRaises(SystemExit):
             fx.apply(execute=True)

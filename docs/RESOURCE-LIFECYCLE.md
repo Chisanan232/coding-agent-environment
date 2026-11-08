@@ -93,8 +93,8 @@ reviewed one-off with a manifest and a free-space check per batch.
 Attribution is the artifact's own recorded `CARGO_MANIFEST_DIR`; it removes only `rcgu.o`, `.o`, `.rlib` and `.rmeta` files whose root is
 gone under a prefix that still exists, never `.d` metadata, executables or libraries (a QA ledger may reference a test binary). It holds
 Cargo's build locks for the run (a lock it cannot take means a build is active and nothing is deleted), refuses a `.ca-keep` marker,
-unlinks an inode only when every hard link is in the deletion set, re-checks inode, link count, mtime, age and root immediately before each
-unlink, and stops when a batch frees under 30% of its estimate. Estimates are hard-link-deduplicated and printed apart from the measured
+unlinks an inode only when every hard link is in the deletion set, re-checks inode, link count, mtime, age and the root (absent, no symlink on the way, prefix still mounted) right before each batch is
+unlinked, and stops when a batch frees under 30% of its estimate. Estimates are hard-link-deduplicated and printed apart from the measured
 free-space change, which is the only reclaim figure. Measured limit of the evidence: in the 2026-11-08 run only about 4% of the bytes
 (about 9 GiB of 305 GiB) carried a recorded root that was gone; about 280 GiB had no recorded root and stays.
 
