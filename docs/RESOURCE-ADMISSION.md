@@ -15,7 +15,7 @@ subagent fan-out. Run `scripts/memory-admission.py check --weight heavy` first; 
 | Physical RAM and compressed memory | `hw.memsize`, `vm_stat` "occupied by compressor" | A large compressor share means the machine is already holding memory it cannot drop cheaply |
 | Swap used **and** sustained swap I/O | `vm.swapusage`, swapins+swapouts over a measured window | Used swap alone is history; the I/O rate is current behaviour |
 | Disk and swap-growth headroom | free bytes of the Data volume | Swap files grow on that volume; a full disk means swap cannot grow |
-| Active build/test processes | `ps` pid, ppid, state, elapsed and CPU time, %cpu, rss and the executable name (`cargo`, `rustc`, `clang`, `ld`, `xcodebuild`, ...); never the command line | One heavy lane until ADR 0017 revision 2's flip merges, then two (the second only when the resource budget passes), counted as a process tree (workload), not per process; see "Idle orphans" below |
+| Active build/test processes | `ps` pid, ppid, state, elapsed and CPU time, %cpu, rss and the executable name (`cargo`, `rustc`, `clang`, `ld`, `xcodebuild`, ...); never the command line | Up to two heavy lanes (the second only when the resource budget passes; ADR 0017 revision 2), counted as a process tree (workload), not per process; see "Idle orphans" below |
 | Load per core | `getloadavg` / CPU count | Scheduler saturation that RAM numbers do not show |
 | Reservations and ownership | the existing `disk-admission.py` gate (reserve, lane cap, process identity) | Task ownership already lives there; it is not duplicated |
 
@@ -268,8 +268,8 @@ reservation `class`, which `measurements` already groups by.
 
 **Lane 1 is not gated by the budget; every later lane is.** At the three lane sites (`reserve`, `queue advance`, `queue claim`) the
 resource budget is computed and recorded beside the decision. The first heavy lane is decided by the disk rules and the lane cap
-alone, as before. A lane beside a running job also needs the budget to pass (see "Concurrent heavy lanes"). While the shipped cap
-is 1 no second lane exists, so nothing changes. Nothing is persisted except a `shadow-budget` line in the existing
+alone, as before. A lane beside a running job also needs the budget to pass (see "Concurrent heavy lanes"). With
+the cap at 1 (the rollback state) no second lane exists, so nothing changes. Nothing is persisted except a `shadow-budget` line in the existing
 `queue/receipts.jsonl` (only when the queue directory exists and a host sample was readable); its name is historical.
 
 Where it appears. A `budget` object on the result of `reserve`/`run`, `queue advance` and `queue claim` (absent when no host
@@ -391,8 +391,8 @@ which does not exec, applies the grant only to its own process.
 
 `heavy_lane_cap(tier, latch)` in `scripts/disk-admission.py` is the one place a lane count is decided: 0 while latched or below
 stable, else `HEAVY_LANES[tier]`, plus one in the wide tier only when `THIRD_LANE_ENABLED` (off), never above `LANE_CEILING` (3).
-The shipped `HEAVY_LANES` value is changed only by the final, separately reviewed flip commit of ADR 0017 revision 2; until then it
-is 1 and everything below is dormant.
+The shipped `HEAVY_LANES` value is 2 in stable and wide since the final, separately reviewed flip commit of ADR 0017 revision 2;
+reverting that commit restores 1 (rollback procedure in the ADR) and the rules below go dormant.
 
 - Lane 1: the disk tier and latch, the 100 GiB floor, process ownership and queue order. It never reads the budget.
 - A lane beside a running job (the count of live reservations, claimed orphans and, in `advance`, unclaimed grants): also a host

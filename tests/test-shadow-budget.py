@@ -632,7 +632,7 @@ class HeavyLaneCap(unittest.TestCase):
 
 class Unchanged(unittest.TestCase):
     def test_the_lane_caps_and_concurrency_constants(self):
-        self.assertEqual(da.HEAVY_LANES, {'emergency': 0, 'low': 0, 'stable': 1, 'wide': 1})
+        self.assertEqual(da.HEAVY_LANES, {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 2})
         self.assertEqual(da.UNMANAGED_ALLOWANCE, 8 * GIB)
         self.assertEqual(da.HEADROOM_PERCENT, {'GREEN': 30, 'AMBER': 40})
 

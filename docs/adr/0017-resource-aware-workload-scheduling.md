@@ -1,8 +1,8 @@
 # ADR 0017: Resource-aware workload scheduling (SPE-150)
 
 Status: accepted for the repository. Revision 2 (SPE-160) adds the machinery for a **second heavy lane** and the evidence tooling for
-a conditional third. **The shipped value of the cap is a single constant, `HEAVY_LANES`, changed only by the final "flip" commit
-described below; until that commit is merged the cap is 1 and revision 2 is dormant.** A third lane stays off behind
+a conditional third. **The cap is 2 in the stable and wide tiers, set by the single constant `HEAVY_LANES` in the final "flip"
+commit described below; reverting that commit restores 1 and is the rollback.** A third lane stays off behind
 `THIRD_LANE_ENABLED = False`. Supersedes the clause "One heavy lane" in decision 3 of [ADR 0015](0015-memory-aware-admission-and-gh-first.md);
 the rest of ADR 0015 stands.
 
@@ -46,9 +46,9 @@ numbers) and no preemption (nothing is signalled, released or reaped on behalf o
 
 | Piece | State |
 |---|---|
-| Lane cap (`HEAVY_LANES`, read through `heavy_lane_cap()`) | **1** until the flip commit of revision 2 merges, then 2 in stable and wide; never above `LANE_CEILING` = 3 |
+| Lane cap (`HEAVY_LANES`, read through `heavy_lane_cap()`) | **2** in stable and wide (the flip commit of revision 2; 1 before it and again after its revert); never above `LANE_CEILING` = 3 |
 | Declared classes and estimates | shipped (PR #171); a declared estimate is what lane 2 is charged |
-| Resource budget and `fits_if_cap_were_2` / `fits_if_cap_were_3` | reported everywhere (#174); **enforced for lanes 2 and up** (revision 2; dormant while the cap is 1) |
+| Resource budget and `fits_if_cap_were_2` / `fits_if_cap_were_3` | reported everywhere (#174); **enforced for lanes 2 and up** (revision 2) |
 | Reservation-aware memory veto | shipped (#175); its cap now follows `heavy_lane_cap()`; a second tree also needs the EXIT bounds |
 | Banded per-job caps in the child environment | shipped (#176); revision 2: RED exports `min_jobs`, an unavailable budget exports the declared figures, oversized integers are safe, the exported jobs are recorded as `granted_jobs` |
 | Third lane | **not enabled** (`THIRD_LANE_ENABLED = False`); needs its own reviewed change |
@@ -159,8 +159,8 @@ change. Effects, in order:
 
 ## Consequences
 
-- Text that says "one heavy lane at a time" as a permanent rule is replaced with "one heavy lane today (a second lane is admitted only
-  by the resource budget, once the cap is raised; ADR 0017 revision 2)" in this repository. The memory gate's reason now reads
+- Text that says "one heavy lane at a time" as a permanent rule is replaced with "up to two heavy lanes (the second only when the resource
+  budget passes; ADR 0017 revision 2)" in this repository. The memory gate's reason now reads
   `heavy lanes full (N of cap)`.
 - User-level copies (`~/.claude/CLAUDE.md`, installed skills) still carry the old wording until an owner-run deploy.
 - Cap 2 is one constant (`HEAVY_LANES`) behind the enforcing code path of revision 2, with the invariants above unchanged; the flip is

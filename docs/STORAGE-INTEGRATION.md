@@ -114,7 +114,7 @@ State lives in `~/.cache/coding-agent-environment/admission/` (0700, files
   missing or unreadable). N may only tighten the rule: values above 120 or
   below 1 are refused with exit 77. The gate does not use the snapshot: it always asks the
   adapter for a fresh `check`. `heavy_lanes_allowed` is `heavy_lane_cap()`: 0 below 100 GiB or while
-  latched, else the tier's cap (1 until ADR 0017 revision 2's flip merges, then 2 in stable and wide; a second lane is admitted only
+  latched, else the tier's cap (2 in stable and wide since ADR 0017 revision 2's flip; a second lane is admitted only
   when the resource budget passes, so `active_heavy_jobs < heavy_lanes_allowed` is not permission to start).
   `protection` stays `advisory-not-wired` until the gate is proven wired.
 - `reservations/<label>.json`: `reserve --bytes N --pid P --label L` admits a
@@ -150,7 +150,7 @@ callers that use them: the gate hook still decides on tier and latch alone, so a
 beside a reserved one. This state is advisory (same-user), not a security boundary.
 ### Heavy-lane queue (`queue`, SPE-111)
 
-A first-in-first-out, non-preemptive queue for the heavy lanes (one lane until ADR 0017 revision 2's flip, then two). It never signals, releases or reaps a holder; it only
+A first-in-first-out, non-preemptive queue for the heavy lanes (two since ADR 0017 revision 2's flip). It never signals, releases or reaps a holder; it only
 decides who is granted the lane after the current holder is gone.
 
 - `queue enqueue --label L --ticket T [--ticket T2] --repo R --worktree W --harness claude|codex --session-id ID --bytes N

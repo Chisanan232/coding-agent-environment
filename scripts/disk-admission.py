@@ -309,7 +309,7 @@ MAX_TTL = 24 * 3600
 HEAVY_FLOOR = LOW_BELOW
 # Concurrent heavy lanes per tier. Lane 1 is admitted by the disk rules alone; lanes 2 and up also need the resource budget to
 # pass (see _budget_allows), so a tier's number is a ceiling, not a promise.
-HEAVY_LANES = {'emergency': 0, 'low': 0, 'stable': 1, 'wide': 1}
+HEAVY_LANES = {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 2}
 # A third lane is a separate reviewed change (SPE-160): flip THIRD_LANE_ENABLED in its own PR with the `queue trial-report` PASS
 # output and owner sign-off. LANE_CEILING is the most that flag, or any edit of HEAVY_LANES, can ever yield.
 LANE_CEILING = 3
