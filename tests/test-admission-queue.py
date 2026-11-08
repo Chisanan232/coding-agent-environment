@@ -560,6 +560,13 @@ class ReviewRegressions(QueueBase):
         self.assertEqual(out['entries'], [])
         self.assertTrue(out['problems'])
 
+    def test_handoff_of_an_entry_that_declares_only_a_class_is_built_without_an_estimate(self):
+        entry = {'harness': 'claude', 'worktree': '/w', 'session_id': 's', 'id': 'q1', 'label': 'l', 'bytes': GIB, 'class': 'remote'}
+        claim = da._handoff(entry)['claim']
+        self.assertIn('--class remote', claim)
+        self.assertNotIn('--mem-gib', claim)
+        self.assertNotIn('--cpus', claim)
+
     def test_status_hides_the_handoff_of_a_lapsed_grant(self):
         self.enqueue()
         self.advance()
