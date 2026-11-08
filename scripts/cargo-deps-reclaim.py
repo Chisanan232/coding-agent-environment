@@ -15,7 +15,7 @@ a configured prefix whose directory still exists and the root itself is gone. Ev
 reason: root present, no recorded root, conflicting roots, root outside the prefixes, executables and shared libraries
 (a QA ledger may reference a test binary), unrecognised names. `.d` files are never deleted.
 
-`apply` re-checks every file immediately before unlinking it (same inode, link count, mtime, older than --min-age-hours,
+`apply` re-checks every file right before its batch is unlinked (same inode, link count, mtime, older than --min-age-hours,
 root still missing) and unlinks only when EVERY hard link of the inode is in the deletion set, because removing one link
 of a shared inode frees nothing. It holds Cargo's own build locks for the whole run (so no build starts and none is
 running: a lock it cannot take means a build is active and nothing is deleted), refuses a target with a keep marker, and
@@ -74,26 +74,52 @@ def recorded_roots(path):
     return {line[len(ROOT_LINE):].strip() for line in text.splitlines() if line.startswith(ROOT_LINE)}
 
 
-def under_live_prefix(root, prefixes):
-    """The root sits under a prefix that exists now. A path below an unmounted or renamed prefix proves nothing."""
+def valid_prefix(prefix):
+    """An absolute, normalised prefix at least two components deep (never `/` or `/Users`)."""
+    return (isinstance(prefix, str) and os.path.isabs(prefix) and os.path.normpath(prefix) == prefix.rstrip('/')
+            and len([c for c in prefix.split('/') if c]) >= 2)
+
+
+def prefix_of(root, prefixes):
+    """The live prefix a recorded root sits under, or None. A path below an unmounted or renamed prefix proves nothing."""
+    if not os.path.isabs(root) or '\0' in root or os.path.normpath(root) != root:
+        return None
     for prefix in prefixes:
         base = prefix.rstrip('/')
-        if root.startswith(base + '/') and os.path.isdir(prefix):
-            return True
-    return False
+        if valid_prefix(base) and root.startswith(base + '/') and os.path.isdir(base):
+            return base
+    return None
 
 
-def verdict_for(roots, prefixes, exists=os.path.lexists):
+def probe_root(root, prefix):
+    """'absent' only when the walk from the prefix down finds a component that is definitely not there (ENOENT/ENOTDIR) and no
+    component before it is a symlink. 'present' when the root exists or the answer is unclear (permission error, other I/O
+    error), 'unsafe' when a symlink sits on the way (it may point at an unmounted volume)."""
+    current = prefix
+    for part in [c for c in root[len(prefix):].split('/') if c]:
+        current = os.path.join(current, part)
+        try:
+            info = os.lstat(current)
+        except (FileNotFoundError, NotADirectoryError):
+            return 'absent'
+        except OSError:
+            return 'present'
+        if stat.S_ISLNK(info.st_mode):
+            return 'unsafe'
+    return 'present'
+
+
+def verdict_for(roots, prefixes, probe=probe_root):
     if not roots:
         return 'keep:no-recorded-root'
     if len(roots) > 1:
         return 'keep:conflicting-roots'
     root = next(iter(roots))
-    if not os.path.isabs(root) or '\0' in root:
-        return 'keep:no-recorded-root'
-    if not under_live_prefix(root, prefixes):
+    prefix = prefix_of(root, prefixes)
+    if prefix is None:
         return 'keep:root-outside-prefixes'
-    return 'keep:root-present' if exists(root) else 'obsolete'
+    state = probe(root, prefix)
+    return {'absent': 'obsolete', 'present': 'keep:root-present'}.get(state, 'keep:symlinked-ancestor')
 
 
 def check_target(deps):
@@ -147,14 +173,15 @@ def plan_paths(state):
 def load_progress(state, deps):
     text = load_private(plan_paths(state)[0])
     if text is None:
-        return {'deps': str(deps), 'done': [], 'started': time.time(), 'seen': 0, 'keep': {}, 'obsolete': 0}
+        return {'deps': str(deps), 'done': [], 'done_at': {}, 'started': time.time(), 'seen': 0, 'keep': {}, 'obsolete': 0,
+                'prefixes': []}
     progress = json.loads(text)
     if progress.get('deps') != str(deps):
         raise SystemExit('refusing: the state directory holds a classification of a different deps directory')
     return progress
 
 
-def classify_partition(deps, digit, prefixes, deadline, out_lines, exists=os.path.lexists):
+def classify_partition(deps, digit, prefixes, deadline, out_lines):
     """Classify every file whose hash starts with `digit`. Returns (seen, keep-by-reason bytes, completed)."""
     groups = collections.defaultdict(list)
     with os.scandir(deps) as entries:
@@ -172,7 +199,7 @@ def classify_partition(deps, digit, prefixes, deadline, out_lines, exists=os.pat
                 roots |= recorded_roots(os.path.join(deps, name))
         key = tuple(sorted(roots))
         if key not in root_cache:
-            root_cache[key] = verdict_for(roots, prefixes, exists)
+            root_cache[key] = verdict_for(roots, prefixes)
         group_verdict = root_cache[key]
         for name, rest in files:
             kind = kind_of(rest)
@@ -198,11 +225,20 @@ def classify_partition(deps, digit, prefixes, deadline, out_lines, exists=os.pat
     return seen, keep, True
 
 
-def classify(args, exists=os.path.lexists):
+def classify(args):
     deps = str(check_target(args.deps)[0] / 'deps')
     state = private_state(state_dir(args.state), create=True)
-    progress = load_progress(state, deps)
     prefixes = tuple(args.prefix) if args.prefix else DEFAULT_PREFIXES
+    bad = [p for p in prefixes if not valid_prefix(p.rstrip('/') if isinstance(p, str) else p)]
+    if bad:
+        raise SystemExit('refusing: prefix must be an absolute normalised path at least two levels deep: %s' % bad[0])
+    if args.reset:
+        for path in plan_paths(state):
+            if path.exists():
+                load_private(path)           # only removes files this tool wrote (private, regular, ours)
+                path.unlink()
+    progress = load_progress(state, deps)
+    progress['prefixes'] = sorted(prefixes)
     deadline = time.monotonic() + args.max_seconds
     obsolete_file = plan_paths(state)[1]
     for digit in '0123456789abcdef':
@@ -211,7 +247,7 @@ def classify(args, exists=os.path.lexists):
         if time.monotonic() > deadline:
             break
         lines = []
-        seen, keep, complete = classify_partition(deps, digit, prefixes, deadline, lines, exists)
+        seen, keep, complete = classify_partition(deps, digit, prefixes, deadline, lines)
         if not complete:
             print('time budget reached inside partition %s; it is redone on the next run' % digit)
             break
@@ -219,11 +255,11 @@ def classify(args, exists=os.path.lexists):
         with os.fdopen(fd, 'a') as handle:
             handle.write(''.join(line + '\n' for line in lines))
         progress['done'].append(digit)
+        progress.setdefault('done_at', {})[digit] = time.time()
         progress['seen'] += seen
         progress['obsolete'] += len(lines)
         for reason, nbytes in keep.items():
             progress['keep'][reason] = progress['keep'].get(reason, 0) + nbytes
-        progress['updated'] = time.time()
         write_private(plan_paths(state)[0], json.dumps(progress, sort_keys=True))
         print('partition %s: %d files, %d obsolete' % (digit, seen, len(lines)))
     return report_progress(progress, state)
@@ -231,8 +267,18 @@ def classify(args, exists=os.path.lexists):
 
 def read_plan(state):
     text = load_private(plan_paths(state)[1]) or ''
-    entries = (json.loads(line) for line in text.splitlines() if line)
-    return [e for e in entries if e['kind'] in RECLAIMABLE]
+    seen, out = set(), []
+    for line in text.splitlines():
+        if not line:
+            continue
+        e = json.loads(line)
+        match = GROUP.match(e['name']) if isinstance(e.get('name'), str) and '/' not in e['name'] else None
+        if (not match or kind_of(match.group('rest')) != e.get('kind') or e['kind'] not in RECLAIMABLE
+                or (e['name'], e['ino']) in seen):
+            continue                        # tampered, mismatched or duplicated (crash resume) entries are ignored
+        seen.add((e['name'], e['ino']))
+        out.append(e)
+    return out
 
 
 def eligible(entries, now, min_age_s):
@@ -288,20 +334,23 @@ def release_locks(held):
         os.close(fd)
 
 
-def free_bytes(path='/System/Volumes/Data'):
-    st = os.statvfs(path if os.path.exists(path) else '/')
+def free_bytes(path):
+    st = os.statvfs(path)
     return st.f_bavail * st.f_frsize
 
 
-def apply(args, free_fn=free_bytes, exists=os.path.lexists):
+def apply(args, free_fn=None):
     profile, _ = check_target(args.deps)
     deps = str(profile / 'deps')
+    free_fn = free_fn or (lambda: free_bytes(deps))     # the filesystem that holds deps, not a fixed volume
     state = private_state(state_dir(args.state))
     progress = load_progress(state, deps)
+    prefixes = progress.get('prefixes') or []
     if len(progress['done']) < 16:
         print('note: classification covers %d/16 partitions; only classified files can be removed' % len(progress['done']))
-    if time.time() - progress.get('updated', progress['started']) > PLAN_MAX_AGE_S:
-        raise SystemExit('refusing: the classification is older than 7 days; run classify again')
+    oldest = min(progress.get('done_at', {}).values(), default=progress['started'])
+    if time.time() - oldest > PLAN_MAX_AGE_S:
+        raise SystemExit('refusing: part of the classification is older than 7 days; run classify --reset to redo it')
     entries = read_plan(state)
     now = time.time()
     ready = eligible(entries, now, args.min_age_hours * 3600)
@@ -309,58 +358,81 @@ def apply(args, free_fn=free_bytes, exists=os.path.lexists):
     print('dry run: %s' % (not args.execute))
     print('ESTIMATE, hard-link-deduplicated, before re-checks: %.2f GiB in %d files' % (dedup_bytes(ready) / GIB, len(ready)))
     held = take_locks(profile)
+    if not args.execute:
+        release_locks(held)                      # a dry run only proves no build is active right now
+        held = []
     audit = state / 'audit.jsonl'
     pfd = os.open(deps, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     removed = skipped = 0
     started, total_expected, total_measured = time.monotonic(), 0, 0
+    cap = args.max_gib * GIB
+
+    def fresh(entry):
+        """Everything classify relied on, checked again: same regular file and inode, link count, mtime, age, and a recorded
+        root that is still definitely absent under a prefix that still exists with no symlink on the way."""
+        try:
+            st = os.lstat(entry['name'], dir_fd=pfd)
+        except OSError:
+            return False
+        if (not stat.S_ISREG(st.st_mode) or st.st_ino != entry['ino'] or st.st_nlink != entry['nlink']
+                or planned[entry['ino']] != st.st_nlink or int(st.st_mtime) != entry['mtime']
+                or time.time() - st.st_mtime < args.min_age_hours * 3600):
+            return False
+        prefix = prefix_of(entry['root'], prefixes)
+        return prefix is not None and probe_root(entry['root'], prefix) == 'absent'
+
     batch, expect = [], 0
+
+    def flush():
+        """Unlink the batch (each inode's links together, only when every link is still fresh) and compare the estimate with the
+        measured free-space change. False when the batch freed under STOP_RATIO of its estimate."""
+        nonlocal batch, expect, total_expected, total_measured, removed, skipped
+        groups = collections.defaultdict(list)
+        for item in batch:
+            groups[item['ino']].append(item)
+        batch, expect = [], 0
+        todo = [g for g in groups.values() if all(fresh(i) for i in g)]
+        skipped += sum(len(g) for g in groups.values()) - sum(len(g) for g in todo)
+        if not todo:
+            return True
+        estimate = sum(i['blocks'] * 512 // i['nlink'] for g in todo for i in g)
+        before = free_fn()
+        for group in todo:
+            for item in group:
+                try:
+                    os.unlink(item['name'], dir_fd=pfd)
+                    removed += 1
+                except OSError:
+                    skipped += 1
+        time.sleep(1)
+        delta = free_fn() - before
+        total_expected += estimate
+        total_measured += delta
+        print('batch: %d files, estimate %.2f GiB, measured free-space change %+.2f GiB' % (
+            sum(len(g) for g in todo), estimate / GIB, delta / GIB))
+        return delta >= STOP_RATIO * estimate
+
     try:
-        def flush():
-            nonlocal batch, expect, total_expected, total_measured
-            if not batch:
-                return True
-            before = free_fn()
-            for item in batch:
-                os.unlink(item['name'], dir_fd=pfd)
-            time.sleep(1)
-            delta = free_fn() - before
-            total_expected += expect
-            total_measured += delta
-            print('batch: %d files, estimate %.2f GiB, measured free-space change %+.2f GiB' % (
-                len(batch), expect / GIB, delta / GIB))
-            ok = delta >= STOP_RATIO * expect
-            batch, expect = [], 0
-            return ok
         previous = None
         # Links of one inode stay adjacent and in one batch: removing only some of them frees nothing yet.
         for entry in sorted(ready, key=lambda e: (e['ino'], e['name'])):
             if entry['ino'] != previous:
-                if args.execute and expect >= args.batch_gib * GIB and not flush():
+                limit = min(args.batch_gib * GIB, cap - total_expected)
+                if args.execute and batch and expect >= limit and not flush():
                     print('STOP: a batch freed under %d%% of its estimate; investigate before continuing' % (STOP_RATIO * 100))
                     break
-                if time.monotonic() - started > args.max_seconds or total_expected / GIB >= args.max_gib:
+                if time.monotonic() - started > args.max_seconds or total_expected + expect >= cap:
                     break
                 previous = entry['ino']
-            try:
-                st = os.lstat(entry['name'], dir_fd=pfd)
-            except OSError:
-                skipped += 1
-                continue
-            stale = (not stat.S_ISREG(st.st_mode) or st.st_ino != entry['ino'] or st.st_nlink != entry['nlink']
-                     or planned[entry['ino']] != st.st_nlink or int(st.st_mtime) != entry['mtime']
-                     or now - st.st_mtime < args.min_age_hours * 3600 or exists(entry['root']))
-            if stale:
-                skipped += 1
-                continue
-            share = entry['blocks'] * 512 // entry['nlink']
             if args.execute:
                 batch.append(entry)
-                expect += share
+                expect += entry['blocks'] * 512 // entry['nlink']
+            elif fresh(entry):
                 removed += 1
+                total_expected += entry['blocks'] * 512 // entry['nlink']
             else:
-                removed += 1
-                total_expected += share
-        if args.execute:
+                skipped += 1
+        if args.execute and batch:
             flush()
     finally:
         os.close(pfd)
@@ -385,6 +457,7 @@ def main(argv=None):
         if name == 'classify':
             p.add_argument('--max-seconds', type=int, default=300)
             p.add_argument('--prefix', action='append')
+            p.add_argument('--reset', action='store_true', help='discard the stored classification and redo it')
         if name == 'apply':
             p.add_argument('--execute', action='store_true')
             p.add_argument('--batch-gib', type=float, default=2.0)
