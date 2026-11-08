@@ -49,23 +49,40 @@ class WriteTests(Base):
         self.assertEqual((data['session_id'], data['reproducible'], data['private']), (SESSION, True, True))
         self.assertEqual(stat.S_IMODE((target / '.ca-owner.json').stat().st_mode), 0o600)
 
-    def test_an_existing_empty_target_gets_one(self):
+    def test_an_existing_empty_target_is_never_claimed(self):
+        # Another session may have created it a moment ago and not built yet: only a directory this call creates is claimed.
         target = self.base / 'iso'
         target.mkdir(mode=0o700)
-        self.assertEqual(self.write(target), 'written')
+        self.assertEqual(self.write(target), 'skipped:not-created-here')
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_a_symlinked_ancestor_is_refused_and_writes_nothing(self):
+        real = self.base / 'other-sessions-target'
+        real.mkdir(mode=0o700)
+        link = self.base / 'link'
+        link.symlink_to(real)
+        self.assertEqual(self.write(link / 'sub'), 'skipped:symlink')
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_a_case_variant_of_the_shared_target_is_refused(self):
+        probe = self.home / '.cargo/shared-target'
+        if not (self.home / '.CARGO/SHARED-TARGET').exists():
+            self.skipTest('case-sensitive filesystem')
+        self.assertEqual(self.write(self.home / '.CARGO/SHARED-TARGET/newprof'), 'skipped:shared-target')
+        self.assertFalse((probe / 'newprof').exists())
 
     def test_a_non_empty_target_is_not_claimed(self):
         target = self.base / 'iso'
         target.mkdir(mode=0o700)
         (target / 'debug').mkdir()
-        self.assertEqual(self.write(target), 'skipped:not-fresh')
+        self.assertEqual(self.write(target), 'skipped:not-created-here')
         self.assertFalse((target / '.ca-owner.json').exists())
 
     def test_an_existing_receipt_is_never_overwritten(self):
         target = self.base / 'iso'
         target.mkdir(mode=0o700)
         (target / '.ca-owner.json').write_text('{"session_id": "someone-else-1234"}')
-        self.assertEqual(self.write(target), 'skipped:not-fresh')
+        self.assertEqual(self.write(target), 'skipped:not-created-here')
         self.assertIn('someone-else', (target / '.ca-owner.json').read_text())
 
     def test_the_shared_target_inside_it_and_above_it_are_refused(self):
@@ -103,11 +120,12 @@ class WriteTests(Base):
             self.assertEqual(self.write(target, session=session), 'skipped:no-session')
         self.assertFalse(target.exists())
 
-    def test_a_group_writable_target_is_not_claimed(self):
-        target = self.base / 'iso'
-        target.mkdir()
-        os.chmod(target, 0o770)
-        self.assertEqual(self.write(target), 'skipped:not-private')
+    def test_a_new_target_is_created_private_whatever_the_umask(self):
+        old = os.umask(0)
+        self.addCleanup(os.umask, old)
+        target = self.base / 'iso-umask'
+        self.assertEqual(self.write(target), 'written')
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
 
     def test_odd_input_never_raises(self):
         for environ in (None, {'CARGO_TARGET_DIR': None}, {'CARGO_TARGET_DIR': 5}):
