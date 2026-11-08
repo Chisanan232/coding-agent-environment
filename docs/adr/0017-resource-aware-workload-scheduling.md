@@ -147,9 +147,13 @@ change. Effects, in order:
    occupied`. Snapshot shows `heavy_lanes_allowed` 1 with `active_heavy_jobs` 2 until one ends.
 4. A GRANTED but unclaimed entry keeps its grant, but the grant window (1 h) may lapse before a lane frees; a lapsed grant becomes
    `EXPIRED` (terminal), so the owner re-enqueues it with `--again`, which puts it at the back (a fairness loss, not data loss).
-5. Never run `queue release` or `queue cancel` on a running entry to "make room": release is for a holder proved gone, and neither
+5. While two holders are live after a rollback, a same-process `reserve` refresh by either is refused with `lane-cap` (as before
+   this change); the running job is not killed, and its pid-bound reservation is simply not renewed.
+6. Only `run` / `run --queue-id` record `granted_jobs`. A standalone `reserve` or non-exec `queue claim` holder records no job limit,
+   so it is charged all cores and no second lane opens beside it.
+7. Never run `queue release` or `queue cancel` on a running entry to "make room": release is for a holder proved gone, and neither
    touches a process.
-6. Mixed checkouts are safe: a checkout still at cap 1 only refuses more, and it reads the new fields (`granted_jobs`,
+8. Mixed checkouts are safe: a checkout still at cap 1 only refuses more, and it reads the new fields (`granted_jobs`,
    `swap_used_bytes`) as unknown keys. Verified by loading the pre-change script against a reservation, a CLAIMED entry and a
    measurement line that carry them.
 
