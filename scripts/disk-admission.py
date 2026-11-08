@@ -1887,10 +1887,15 @@ def _handoff(entry):
         shlex.quote(entry['worktree']), entry['id'], entry['label'], entry['bytes']))
     if any(_declared(entry)):
         # Always the recorded values: the claim re-resolves them and must match the entry exactly, raised estimates included.
-        claim = claim.replace(' -- <the exact job>', ''.join(
-            [' --class ' + entry['class']] * ('class' in entry) +
-            [' --mem-gib %s' % (entry['mem_bytes'] / GIB)] * ('mem_bytes' in entry) +
-            [' --cpus %d' % entry['cpu_slots']] * ('cpu_slots' in entry)) + ' -- <the exact job>')
+        # Built only from the fields present: an entry may declare just some (a legacy one has a class and no estimate).
+        flags = []
+        if 'class' in entry:
+            flags.append(' --class ' + entry['class'])
+        if 'mem_bytes' in entry:
+            flags.append(' --mem-gib %s' % (entry['mem_bytes'] / GIB))
+        if 'cpu_slots' in entry:
+            flags.append(' --cpus %d' % entry['cpu_slots'])
+        claim = claim.replace(' -- <the exact job>', ''.join(flags) + ' -- <the exact job>')
     return {'resume': resume, 'claim': claim}
 
 
