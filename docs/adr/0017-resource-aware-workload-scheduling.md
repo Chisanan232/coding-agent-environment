@@ -137,7 +137,7 @@ owner's sign-off, and is not auto-merged. `LANE_CEILING` is not raised by that c
 
 ### Rollback procedure
 
-Revert the single flip commit (the one that sets `HEAVY_LANES` stable and wide to 2 and updates the pins); nothing else needs to
+Revert the flip pull request's merge commit (it sets `HEAVY_LANES` stable and wide to 2, updates the pins and the status wording); nothing else needs to
 change. Effects, in order:
 
 1. The memory gate follows automatically (its cap is derived from `heavy_lane_cap()`); no second constant exists to forget.
