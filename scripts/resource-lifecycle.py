@@ -166,7 +166,7 @@ def take_build_locks(profile):
         if not os.path.isfile(path):
             continue
         try:
-            fd = os.open(path, os.O_RDONLY)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             release_build_locks(held)
@@ -185,6 +185,15 @@ def incremental_blockers(root):
     profile = os.path.dirname(root)
     target = os.path.dirname(profile)
     why = []
+    # Lexical and real location must agree: a symlinked ancestor could make the target/profile/lock checks describe one
+    # directory while the removal acts on another.
+    if os.path.realpath(root) != os.path.normpath(root):
+        why.append('symlinked-ancestor')
+    try:
+        if os.lstat(target).st_uid != os.getuid():
+            why.append('target-not-owned')
+    except OSError:
+        why.append('target-unreadable')
     if os.path.basename(root) != 'incremental' or not (os.path.isfile(os.path.join(target, 'CACHEDIR.TAG'))
                                                        or os.path.isfile(os.path.join(target, '.rustc_info.json'))):
         why.append('not-a-cargo-incremental-dir')
