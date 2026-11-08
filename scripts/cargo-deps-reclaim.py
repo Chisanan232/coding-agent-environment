@@ -68,16 +68,22 @@ def recorded_roots(path):
     """Distinct CARGO_MANIFEST_DIR values in one .d file (bounded read; unreadable means no evidence)."""
     try:
         with open(path, 'rb') as handle:
-            text = handle.read(D_READ_LIMIT).decode('utf-8', 'replace')
+            raw = handle.read(D_READ_LIMIT + 1)
     except OSError:
         return set()
+    if len(raw) > D_READ_LIMIT:
+        return set()                      # a line cut at the limit could be a partial path that looks absent: no evidence
+    text = raw.decode('utf-8', 'replace')
     return {line[len(ROOT_LINE):].strip() for line in text.splitlines() if line.startswith(ROOT_LINE)}
 
 
 def valid_prefix(prefix):
-    """An absolute, normalised prefix at least two components deep (never `/` or `/Users`)."""
-    return (isinstance(prefix, str) and os.path.isabs(prefix) and os.path.normpath(prefix) == prefix.rstrip('/')
-            and len([c for c in prefix.split('/') if c]) >= 2)
+    """An absolute, normalised prefix at least two components deep that is neither the home directory nor above it."""
+    if not (isinstance(prefix, str) and os.path.isabs(prefix) and os.path.normpath(prefix) == prefix.rstrip('/')
+            and len([c for c in prefix.split('/') if c]) >= 2):
+        return False
+    home = str(HOME)
+    return not (prefix.rstrip('/') == home or home.startswith(prefix.rstrip('/') + '/'))
 
 
 def prefix_of(root, prefixes):
@@ -138,9 +144,12 @@ def check_target(deps):
 
 
 def write_private(path, text):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    """Atomic: write a private temporary file next to the target, then rename it over."""
+    tmp = '%s.tmp%d' % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, 'w') as handle:
         handle.write(text)
+    os.replace(tmp, path)
 
 
 def private_state(directory, create=False):
@@ -238,6 +247,8 @@ def classify(args):
                 load_private(path)           # only removes files this tool wrote (private, regular, ours)
                 path.unlink()
     progress = load_progress(state, deps)
+    if progress['done'] and progress.get('prefixes') != sorted(prefixes):
+        raise SystemExit('refusing: this classification used a different --prefix set; run classify --reset to redo it')
     progress['prefixes'] = sorted(prefixes)
     deadline = time.monotonic() + args.max_seconds
     obsolete_file = plan_paths(state)[1]
@@ -271,11 +282,17 @@ def read_plan(state):
     for line in text.splitlines():
         if not line:
             continue
-        e = json.loads(line)
-        match = GROUP.match(e['name']) if isinstance(e.get('name'), str) and '/' not in e['name'] else None
+        try:
+            e = json.loads(line)
+            ok = (isinstance(e, dict) and isinstance(e.get('name'), str) and '\0' not in e['name'] and '/' not in e['name']
+                  and isinstance(e.get('ino'), int) and isinstance(e.get('nlink'), int) and isinstance(e.get('mtime'), int)
+                  and isinstance(e.get('blocks'), int) and isinstance(e.get('root'), str) and '\0' not in e['root'])
+        except ValueError:
+            ok = False
+        match = GROUP.match(e['name']) if ok else None
         if (not match or kind_of(match.group('rest')) != e.get('kind') or e['kind'] not in RECLAIMABLE
                 or (e['name'], e['ino']) in seen):
-            continue                        # tampered, mismatched or duplicated (crash resume) entries are ignored
+            continue                        # malformed, tampered, mismatched or duplicated (crash resume) entries are ignored
         seen.add((e['name'], e['ino']))
         out.append(e)
     return out
@@ -398,6 +415,9 @@ def apply(args, free_fn=None):
         estimate = sum(i['blocks'] * 512 // i['nlink'] for g in todo for i in g)
         before = free_fn()
         for group in todo:
+            if not all(fresh(i) for i in group):      # once more, right before this inode's links go
+                skipped += len(group)
+                continue
             for item in group:
                 try:
                     os.unlink(item['name'], dir_fd=pfd)
@@ -412,6 +432,9 @@ def apply(args, free_fn=None):
             sum(len(g) for g in todo), estimate / GIB, delta / GIB))
         return delta >= STOP_RATIO * estimate
 
+    shares = collections.Counter()
+    for e in ready:
+        shares[e['ino']] += e['blocks'] * 512 // e['nlink']
     try:
         previous = None
         # Links of one inode stay adjacent and in one batch: removing only some of them frees nothing yet.
@@ -421,8 +444,9 @@ def apply(args, free_fn=None):
                 if args.execute and batch and expect >= limit and not flush():
                     print('STOP: a batch freed under %d%% of its estimate; investigate before continuing' % (STOP_RATIO * 100))
                     break
-                if time.monotonic() - started > args.max_seconds or total_expected + expect >= cap:
-                    break
+                if (time.monotonic() - started > args.max_seconds or total_expected + expect >= cap
+                        or total_expected + expect + shares[entry['ino']] > cap):
+                    break                      # the cap is never overshot by the next inode group either
                 previous = entry['ino']
             if args.execute:
                 batch.append(entry)
