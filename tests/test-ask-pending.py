@@ -452,6 +452,49 @@ class SecondReview(Env):
         self.assertEqual(item['settings'], ['/u/s.json', '/p/s.json'])
 
 
+class FinalHeadReview(Env):
+    def test_reopen_refuses_different_gate_options(self):
+        ap.record(self.dir, MERGE.format(pr=7, head=HEAD1), 'o/r#7', HEAD1, [], 'owner_approval', 's', '', 900, 'none', T0,
+                  'o', ['--ci-exception'], ['/u/s.json'])
+        with self.assertRaises(ap.AskError):
+            self.resume(item_key_for(7), HEAD2, T0)
+        with self.assertRaisesRegex(ap.AskError, 'different gate options'):
+            ap.record(self.dir, MERGE.format(pr=7, head=HEAD1), 'o/r#7', HEAD1, [], 'owner_approval', 's', '', 900, 'none', T0,
+                      'o', [], ['/u/s.json'])
+        again, created = ap.record(self.dir, MERGE.format(pr=7, head=HEAD1), 'o/r#7', HEAD1, [], 'owner_approval', 's', '', 900, 'none', T0,
+                                   'o', ['--ci-exception'], ['/u/s.json'])
+        self.assertTrue(created)
+
+    def test_reopen_keeps_the_hand_back_count(self):
+        a, _ = self.rec(7)
+        self.set_gate({7: HEAD1})
+        self.resume(a['id'], HEAD1, T0)
+        later = T0 + timedelta(seconds=ap.LEASE_S + 1)
+        with self.assertRaises(ap.AskError):
+            ap.begin_resume(self.dir, a['id'], HEAD2, self.validator(), later, lambda _i: ['x'])
+        self.assertEqual(self.rec(7)[0]['resumes'], 1)
+
+    def test_even_the_first_resume_closes_a_merge_that_already_happened(self):
+        a, _ = self.rec(7)
+        self.set_gate({7: HEAD1})
+        with self.assertRaisesRegex(ap.AskError, 'already verified'):
+            ap.begin_resume(self.dir, a['id'], HEAD1, self.validator(), T0, lambda _i: [])
+        self.assertEqual(self.state(a['id']), 'CONSUMED')
+
+    def test_lease_recovery_is_receipted_with_the_open_prompt_warning(self):
+        a, _ = self.rec(7)
+        self.set_gate({7: HEAD1})
+        self.resume(a['id'], HEAD1, T0)
+        ap.begin_resume(self.dir, a['id'], HEAD1, self.validator(), T0 + timedelta(seconds=ap.LEASE_S + 1), lambda _i: ['not merged'])
+        lines = [json.loads(l) for l in Path(self.dir, 'receipts.jsonl').read_text().splitlines()]
+        lapse = [l for l in lines if l['event'] == 'lease_expired'][0]
+        self.assertTrue(lapse['earlier_handback_may_still_be_open'])
+
+
+def item_key_for(pr, head=HEAD1):
+    return ap.item_key(MERGE.format(pr=pr, head=head), f'o/r#{pr}', head)
+
+
 class Scenario(Env):
     """The disposable-environment demonstration from the task: two unanswered ASKs, independent work, late approval."""
 
