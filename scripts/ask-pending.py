@@ -106,6 +106,13 @@ def save(directory, item):
     os.replace(tmp, _path(directory, item["id"]))
 
 
+def stored_ref(ref, keep=False):
+    """What may reach disk for a caller-supplied reference: a validated gh-comment reference when `keep`, otherwise only its hash."""
+    if not ref:
+        return None
+    return ref if keep else "sha256:" + hashlib.sha256(ref.encode()).hexdigest()[:16]
+
+
 def receipt(directory, event, item, **detail):
     line = {"at": iso(now_utc()), "event": event, "id": item["id"], "state": item["state"], **detail}
     path = os.path.join(directory, "receipts.jsonl")
@@ -350,9 +357,9 @@ def finish(directory, item_id, outcome, ref, at, verify=None, session_id=None, v
             item["state"], item["closed"] = OUTCOMES[outcome], iso(at)
             item["verified"] = outcome == "answered" and not problems
             # Only a validated gh-comment reference is kept; a free-form note could hold anything, so only its hash is stored.
-            item["outcome_ref"] = ref if item["verified"] else ("sha256:" + hashlib.sha256(ref.encode()).hexdigest()[:16] if ref else None)
+            item["outcome_ref"] = stored_ref(ref, keep=item["verified"])
             save(directory, item)
-            receipt(directory, "finished", item, outcome=outcome, ref=ref or None, verified=item["verified"], problems=problems or None)
+            receipt(directory, "finished", item, outcome=outcome, ref=item["outcome_ref"], verified=item["verified"], problems=problems or None)
             return item
         if item["state"] != RESUMING:
             raise AskError("only a RESUMING item can finish; run resume first")
@@ -364,13 +371,13 @@ def finish(directory, item_id, outcome, ref, at, verify=None, session_id=None, v
                 receipt(directory, "executed_unverified", item, problems=problems)
                 raise AskError("executed not accepted: " + "; ".join(problems))
         item["state"] = OUTCOMES[outcome]
-        item["closed"], item["outcome_ref"] = iso(at), ref or None
+        item["closed"], item["outcome_ref"] = iso(at), stored_ref(ref)
         if outcome == "failed":
             item.pop("lease_at", None)
             item.pop("closed")
             item["prompt"] = "unknown"
         save(directory, item)
-        receipt(directory, "finished", item, outcome=outcome, ref=ref or None)
+        receipt(directory, "finished", item, outcome=outcome, ref=item["outcome_ref"])
         return item
 
 
