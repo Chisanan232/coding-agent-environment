@@ -28,7 +28,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 GRACE_MAX_S = 900  # 15 minutes: the longest a runnable task waits on a pending ASK before the agent moves on
-MAX_PENDING = 20
+MAX_PENDING = 20  # open items per coordinating session
+MAX_PENDING_TOTAL = 200  # across all sessions
 LEASE_S = 1800  # a RESUMING item with no outcome for this long returns to PENDING (restart/crash), never to approved
 
 PENDING, RESUMING, CONSUMED, DENIED, STALE, EXPIRED, CANCELLED = (
@@ -169,11 +170,11 @@ def record(directory, action, target, head, deps, trigger, session_id, request_i
             receipt(directory, "duplicate_record", existing, from_session=session_id or None)
             return existing, False
         live_open = [i for i in all_items(directory) if i["state"] in (PENDING, RESUMING)]
-        if len(live_open) >= MAX_PENDING:
-            raise AskError(f"{MAX_PENDING} items already pending")
-        # An older pending item for the same target at a different head can no longer be the action asked about.
+        _check_caps(live_open, session_id)
+        # An older pending item of THIS session for the same target at a different head can no longer be the action asked about.
+        # Another session's item is left alone: it stays pending and fails its own head revalidation at resume.
         for old in live_open:
-            if old["target"] == target and old["head"] != head and old["state"] == PENDING:
+            if old["target"] == target and old["head"] != head and old["state"] == PENDING and old.get("coordinator") == (session_id or None):
                 old["state"], old["closed"], old["reason"] = STALE, iso(at), f"superseded by head {head}"
                 save(directory, old)
                 receipt(directory, "superseded", old, new_head=head)
@@ -184,6 +185,13 @@ def record(directory, action, target, head, deps, trigger, session_id, request_i
         save(directory, item)
         receipt(directory, "recorded", item, prompt=prompt, request_id=request_id or None)
         return item, True
+
+
+def _check_caps(live_open, session_id):
+    if len(live_open) >= MAX_PENDING_TOTAL:
+        raise AskError(f"{MAX_PENDING_TOTAL} items already open in the ledger")
+    if len([i for i in live_open if i.get("coordinator") == (session_id or None)]) >= MAX_PENDING:
+        raise AskError(f"this session already coordinates {MAX_PENDING} open items")
 
 
 def record_decision(directory, subject, target, session_id, deps, trigger, request_id, grace_s, prompt, at):
@@ -202,11 +210,20 @@ def record_decision(directory, subject, target, session_id, deps, trigger, reque
             existing = load(directory, key)
         except AskError:
             existing = None
+        if existing is not None and existing["state"] in TERMINAL and not existing.get("verified"):
+            # A closure nobody verified (the closing session's own word) must not suppress the owner request for everyone else.
+            _check_caps([i for i in all_items(directory) if i["state"] in (PENDING, RESUMING)], session_id)
+            existing.update(state=PENDING, created=iso(at), prompt=prompt, session_id=session_id, coordinator=session_id,
+                            generation=existing.get("generation", 0) + 1)
+            for k in ("closed", "outcome_ref", "reason"):
+                existing.pop(k, None)
+            save(directory, existing)
+            receipt(directory, "reopened_unverified_closure", existing, from_session=session_id)
+            return existing, True
         if existing is not None:
             receipt(directory, "duplicate_decision", existing, from_session=session_id)
             return existing, False
-        if len([i for i in all_items(directory) if i["state"] in (PENDING, RESUMING)]) >= MAX_PENDING:
-            raise AskError(f"{MAX_PENDING} items already pending")
+        _check_caps([i for i in all_items(directory) if i["state"] in (PENDING, RESUMING)], session_id)
         item = {"id": key, "kind": "decision", "action": "DECISION: " + subject, "target": target, "head": "decision",
                 "dependencies": sorted(deps), "resume_trigger": trigger, "session_id": session_id, "coordinator": session_id,
                 "request_id": request_id or None, "prompt": prompt, "grace_s": max(0, min(int(grace_s), GRACE_MAX_S)),
@@ -247,6 +264,7 @@ def _recover(directory, item, at):
     """A RESUMING item whose lease ran out (the session died mid-resume) goes back to PENDING. Never to done. Call under the lock."""
     if _lease_expired(item, at):
         item["state"], item["prompt"] = PENDING, "unknown"
+        item["possible_duplicate_handback"] = True  # the earlier hand-back's prompt may still be open and answerable
         item.pop("lease_at", None)
         save(directory, item)
         # The earlier hand-back's host prompt may still be open and answerable; it is not cancelled by this, and the next
@@ -304,7 +322,7 @@ def begin_resume(directory, item_id, current_head, validate, at, verify=None):
         return item
 
 
-def finish(directory, item_id, outcome, ref, at, verify=None):
+def finish(directory, item_id, outcome, ref, at, verify=None, session_id=None, verify_answer=None):
     if outcome not in OUTCOMES:
         raise AskError("outcome must be one of " + ", ".join(sorted(OUTCOMES)))
     with locked(directory):
@@ -316,11 +334,17 @@ def finish(directory, item_id, outcome, ref, at, verify=None):
         if outcome == "answered" and not decision or outcome in ("executed", "failed") and decision:
             raise AskError(f"outcome {outcome} does not apply to a {'decision' if decision else 'merge'} item")
         if decision:
+            if not session_id or session_id != item.get("coordinator"):
+                raise AskError("only the coordinating session closes a decision; another session uses takeover first")
             if outcome == "answered" and not ref:
-                raise AskError("answered needs --ref: the durable record of the owner's answer (ticket comment, ADR, review)")
+                raise AskError("answered needs --ref: the durable record of the owner's answer")
+            # `verified` is true only when an owner-authored GitHub comment at that ref was read back. Anything else is the closing
+            # session's own word: it closes this session's wait but a later record-decision for the subject reopens the request.
+            problems = (verify_answer or (lambda _i, _r: ["unverifiable reference"]))(item, ref) if outcome == "answered" else ["not an answer"]
             item["state"], item["closed"], item["outcome_ref"] = OUTCOMES[outcome], iso(at), ref or None
+            item["verified"] = outcome == "answered" and not problems
             save(directory, item)
-            receipt(directory, "finished", item, outcome=outcome, ref=ref or None)
+            receipt(directory, "finished", item, outcome=outcome, ref=ref or None, verified=item["verified"], problems=problems or None)
             return item
         if item["state"] != RESUMING:
             raise AskError("only a RESUMING item can finish; run resume first")
@@ -342,11 +366,13 @@ def finish(directory, item_id, outcome, ref, at, verify=None):
         return item
 
 
-def cancel(directory, item_id, reason, at):
+def cancel(directory, item_id, reason, at, session_id=None):
     with locked(directory):
         item = load(directory, item_id)
         if item["state"] in TERMINAL:
             raise AskError(f"item already {item['state']}")
+        if item.get("coordinator") and session_id != item["coordinator"]:
+            raise AskError("only the coordinating session cancels an item; another session uses takeover first")
         item["state"], item["closed"], item["reason"] = CANCELLED, iso(at), reason
         save(directory, item)
         receipt(directory, "cancelled", item, reason=reason)
@@ -399,6 +425,26 @@ def gate_validator(settings, gate_cmd=None):
             problems.append("gate merge_command differs from the recorded action")
         return problems
     return validate
+
+
+def owner_answer_verifier(runner=None):
+    """Proof for a decision `answered`: ref `gh-comment:<owner/repo>:<comment id>` must be a comment by an owner made after the item was recorded."""
+    def verify(item, ref):
+        m = re.fullmatch(r"gh-comment:((?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?:)[A-Za-z0-9_.-]+):([0-9]+)", ref or "")
+        if not m:
+            return ["ref is not a gh-comment:<owner/repo>:<id> reference"]
+        argv = ["gh", "api", f"repos/{m.group(1)}/issues/comments/{m.group(2)}", "--jq", "{login: .user.login, created_at: .created_at}"]
+        rc, out = (runner or _run_gate)(argv)
+        if rc is None or rc != 0:
+            return ["the comment could not be read"]
+        owners = [o.strip().lower() for o in (item.get("owners") or item["target"].split("/")[0]).split(",") if o.strip()]
+        problems = []
+        if str(out.get("login", "")).lower() not in owners:
+            problems.append("the comment is not by a recorded owner")
+        if str(out.get("created_at", "")) < item["created"]:
+            problems.append("the comment predates the request")
+        return problems
+    return verify
 
 
 def merge_verifier(gate_cmd=None):
@@ -464,9 +510,11 @@ def main(argv=None):
     f.add_argument("--id", required=True)
     f.add_argument("--outcome", required=True, choices=sorted(OUTCOMES))
     f.add_argument("--ref", default="")
+    f.add_argument("--session-id", default="", help="required for a decision: the coordinating session")
     c = sub.add_parser("cancel")
     c.add_argument("--id", required=True)
     c.add_argument("--reason", required=True)
+    c.add_argument("--session-id", default="", help="the coordinating session")
     args = ap.parse_args(argv)
     directory, at = state_dir(), now_utc()
     try:
@@ -501,9 +549,9 @@ def main(argv=None):
             item = begin_resume(directory, args.id, args.current_head, gate_validator(layers), at, merge_verifier())
             print(json.dumps({"run_exactly": item["action"], "id": item["id"], "note": "the host will ask again; its answer is the only approval"}))
         elif args.cmd == "finish":
-            print(json.dumps(view(finish(directory, args.id, args.outcome, args.ref, at, merge_verifier()), at), sort_keys=True))
+            print(json.dumps(view(finish(directory, args.id, args.outcome, args.ref, at, merge_verifier(), args.session_id or None, owner_answer_verifier()), at), sort_keys=True))
         elif args.cmd == "cancel":
-            print(json.dumps(view(cancel(directory, args.id, args.reason, at), at), sort_keys=True))
+            print(json.dumps(view(cancel(directory, args.id, args.reason, at, args.session_id or None), at), sort_keys=True))
     except AskError as err:
         print(f"refused: {err}", file=sys.stderr)
         return 2
