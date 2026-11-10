@@ -771,6 +771,30 @@ class RefNeverReachesDiskRaw(Env):
         self.assertEqual(done['outcome_ref'], 'gh-comment:o/r:42')
 
 
+class FinalHardening(Env):
+    def test_cancel_is_refused_while_a_hand_back_is_in_flight(self):
+        a, _ = self.rec(7)
+        self.set_gate({7: HEAD1})
+        self.resume(a['id'], HEAD1, T0)
+        with self.assertRaisesRegex(ap.AskError, 'hand-back is in flight'):
+            ap.cancel(self.dir, a['id'], 'x', T0, 'sess-1')
+        self.assertEqual(self.state(a['id']), 'RESUMING')
+        self.finish(a['id'], 'expired', 'prompt expired')
+
+    def test_caller_strings_are_length_bounded(self):
+        a, _ = self.rec(7, request_id='r' * 500)
+        self.assertEqual(len(a['request_id']), 80)
+        ap.cancel(self.dir, a['id'], 'x' * 900, T0, 'sess-1')
+        self.assertEqual(len(ap.load(self.dir, a['id'])['reason']), 200)
+
+    def test_resume_output_names_the_gate_options_used(self):
+        item, _ = ap.record(self.dir, MERGE.format(pr=7, head=HEAD1), 'o/r#7', HEAD1, [], 'owner_approval', 'sess-1', '', 900, 'none', T0,
+                            'o', ['--ci-exception'], [])
+        self.set_gate({7: HEAD1})
+        got = self.resume(item['id'], HEAD1, T0)
+        self.assertEqual(got['gate_args'], ['--ci-exception'])
+
+
 class Scenario(Env):
     """The disposable-environment demonstration from the task: two unanswered ASKs, independent work, late approval."""
 
