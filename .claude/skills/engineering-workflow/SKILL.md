@@ -167,12 +167,13 @@ Omit file chronology and unsupported completion claims.
   revalidation), never an unrecoverable failure; DENY is for non-waivable constraints such as a failed check or a
   cross-repository head. An approved ASK covers exactly the one pinned operation; the agent never simulates the answer.
   Details: `docs/OWNER-MERGE-OPERATOR-GUIDE.md`.
-- **A pending ASK does not stall independent work** (`docs/NONBLOCKING-ASK.md`, `scripts/ask-pending.py`). Record the exact action, target, head,
-  dependencies, any host-supplied request id and the resume trigger, then continue the next runnable task; after 15 minutes without an answer
-  move on, keep the item pending and keep it visible. Several items may be pending. Resume only at a safe checkpoint, after `ask-pending.py resume`
-  revalidated the exact head and the merge gate (independent review, required checks, owner class, host permission); the host asks again and its
-  answer is the only approval. A closed item (consumed, denied, expired, changed head) is never resumed; a pending item is not a live prompt, and time,
-  a handoff or a watcher never approve. The 12-hour heavy-admission escalation rule is separate.
+- **A pending ASK does not stall independent work** (`docs/NONBLOCKING-ASK.md`, `scripts/ask-pending.py`). Issue the gate's exact `merge_command` from one background
+  subagent lane so the host's native prompt (an actionable Approve/Deny, including on Remote Control) stays open, record it in the ledger (exact action, target,
+  head, dependencies, host request id if any, resume trigger) and continue the next runnable authorized task. After 15 minutes only the scheduling changes:
+  never cancel, dismiss, reword or convert the live prompt into a text question, and a notification, pending-list entry or chat reply request is not an
+  approval flow. If the platform expires the prompt, record it and reissue the exact command only after `ask-pending.py resume` revalidated the exact head and
+  gate. A watcher or the root may observe the outcome but never grants it. Closed items (consumed, denied, expired, changed head) are never resumed. The 12-hour
+  heavy-admission escalation rule is separate. The live Remote Control behavior is not yet verified: until it is, report that criterion, not completion.
 
 Do not merge until required checks, CODEOWNERS-required approvals, the class approvals above,
 conflict resolution, branch currency, and blocking review threads satisfy the

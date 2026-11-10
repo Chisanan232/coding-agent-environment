@@ -1,7 +1,41 @@
 # Non-blocking ASK handling (SPE-170)
 
 A host ASK on an exact action (typically the `merge_command` that `owner-merge-gate.py check` prints) must not stall independent work, and must never be
-treated as approved because time passed. This page is the canonical contract. Implementation: `scripts/ask-pending.py`; tests: `tests/test-ask-pending.py`.
+treated as approved because time passed. Implementation: `scripts/ask-pending.py` (safety layer); tests: `tests/test-ask-pending.py`.
+
+## Acceptance criteria (corrected 2026-11-10)
+
+A text notification, a pending-list entry or a request to reply in chat does **not** satisfy this feature. The feature is complete only when every
+criterion below is verified on the real host path (Claude Code Remote Control on the owner's iPhone).
+
+| # | Criterion | Status |
+|---|---|---|
+| A1 | A real tool permission request stays a **live, actionable native Approve/Deny** on the iPhone (Remote Control) | NOT_RUN |
+| A2 | A product decision is an **interactive Select** control where the host supports it | NOT_RUN |
+| A3 | The waiting operation is assigned to **one background subagent** where the host supports it | NOT_RUN |
+| A4 | The root agent (or another subagent) continues **independent authorized work** within existing concurrency limits while the prompt is open | NOT_RUN |
+| A5 | The 15-minute rule changes **scheduling only**: the original prompt is not cancelled, dismissed or converted to a text reply when the timer fires | NOT_RUN |
+| A6 | If the platform itself expires a prompt, that is **recorded explicitly** and a supported reissue path is determined | NOT_RUN |
+| A7 | A watcher may observe the decision and resume work; it **cannot** grant permission or bypass the host gate | Design met (ledger has no approve path); live part NOT_RUN |
+| A8 | Approve on the **original** prompt resumes **only** the intended exact-head action; Deny and Select are tested separately | NOT_RUN |
+| A9 | An expired prompt, a changed head or a duplicate event **cannot execute the wrong action** | Ledger part tested in a disposable dir; live part NOT_RUN |
+| A10 | A host mode that cannot support a criterion is reported by criterion; a notification-only flow is never marked complete | Applies to this page: **the feature is NOT complete** |
+
+What exists today (PR #217) is only the **safety layer** behind A7 and A9: a ledger that records the exact action, target, head, dependencies, host request id and
+resume trigger, revalidates the exact head and the owner-merge gate before a resume, hands the action back once, and handles denial, expiry, changed head,
+duplicate and restart. It is **not** an approval channel, and a pending-list entry is not an approval prompt. The live prompt itself is the host's.
+
+## Intended flow on the supported path
+
+1. The root agent issues the gate's exact `merge_command` from **one background subagent lane**. The host raises its native prompt (shown in the session and,
+   under Remote Control, on the phone); that prompt is the only approval request and it is **never replaced by text**.
+2. The root records a ledger item (`prompt: live`, host request id if any) and **keeps scheduling other authorized work**. After 15 minutes it only moves on
+   to the next runnable task; it does not cancel, dismiss, re-ask or reword the prompt, and does not turn it into a chat question.
+3. When the owner taps Approve or Deny on the original prompt, the lane's tool call proceeds or is refused. The root observes the lane's result; a watcher may do
+   the same, and neither can grant anything. The command is pinned to the exact head (`--match-head-commit`), so a stale approval after the head moved fails
+   at GitHub instead of merging something else. The result is verified with `owner-merge-gate.py verify`, then `finish`.
+4. If the platform expires or loses the prompt, record it (`finish --outcome expired`) and reissue only by a supported path: re-run the gate and issue the exact
+   command again from a lane, after `ask-pending.py resume` revalidated head, review, checks and gate.
 
 ## What the host does (Claude Code 2.1.306, from the official docs, 2026-11-10)
 
@@ -27,8 +61,8 @@ Host policy is not changed: no settings edit, no new allow, no hook that answers
 | The ledger keeps an unanswered ASK pending past 15 minutes, holds several at once, resumes only the intended one, and handles changed head, denial, duplicate and restart | Tested (`tests/test-ask-pending.py`, class `Scenario` and `Resume`) in a disposable directory with a stand-in gate |
 | The normal merge gate is still the authority | Tested against a stand-in gate, plus one contract test that runs the real `owner-merge-gate.py check` `main` (evaluation stubbed) and feeds its printed JSON to the validator. The gate's own evaluation (checks, reviews, ownership) is covered by `tests/test-owner-merge-gate.py` and is not re-tested here. No live merge was performed |
 
-Because the live-prompt claim is unverified, the design does not depend on it: with no live prompt the item simply stays pending with `prompt: none`, other work
-continues, and the action is issued when the owner is present.
+The live-prompt claim is the whole point of A1-A6 and is unverified, so the feature is **not complete**. Leaving an item pending with `prompt: none` and issuing the action
+later is only a degraded fallback for an absent owner; it is not an approval flow and does not satisfy the criteria above.
 
 ## The ledger
 
@@ -60,9 +94,9 @@ There is deliberately no `approve` command: the ledger cannot authorize anything
 
 ## Flow
 
-1. **Record.** Before issuing an action the host will ask about, `record` it (exact action, target, head, dependencies, request id if any, trigger). Issue it from a
-   background lane, or leave it pending if the owner is away, and **continue the next runnable task immediately**.
-2. **Grace.** `list` shows `move_on` after 15 minutes (`grace_s` is capped at 900). That only means "do other work"; it never changes state, approves or expires the item.
+1. **Record.** When issuing an action the host will ask about, `record` it (exact action, target, head, dependencies, request id if any, trigger, `--prompt live`).
+   The action itself is issued from a background lane so the host's native prompt is the approval request, and the root **continues the next runnable task immediately**.
+2. **Grace.** `list` shows `move_on` after 15 minutes (`grace_s` is capped at 900). That only means "schedule other work"; it never changes state, approves, expires, cancels or rewords the live prompt, and never converts it to a chat question.
    Several items can be pending; none blocks another.
 3. **Resume at a safe checkpoint** (between tasks, never mid-edit). `resume --id <id> --current-head <head just read from GitHub>`:
    - moves `PENDING` to `RESUMING` once; a second resume, a closed item or a lost race is refused;
