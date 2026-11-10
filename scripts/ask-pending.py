@@ -154,7 +154,10 @@ def record(directory, action, target, head, deps, trigger, session_id, request_i
             existing = None
         if existing is not None and existing["state"] == STALE:
             # The head moved away and came back (or the head was mistyped): the same pinned action is requested again.
-            existing.update(state=PENDING, created=iso(at), prompt=prompt, resumes=0, session_id=session_id)
+            # Gate options and layers are part of what was reviewed; a reopen with different ones is a new decision, not a reopen.
+            if (existing.get("owners"), existing.get("gate_args"), existing.get("settings")) != (owners, list(gate_args), list(settings)):
+                raise AskError("the stale item was recorded with different gate options or settings layers; cancel it and record a new request")
+            existing.update(state=PENDING, created=iso(at), prompt=prompt, session_id=session_id)  # resumes stays: a hand-back did happen
             existing.pop("closed", None), existing.pop("reason", None)
             save(directory, existing)
             receipt(directory, "reopened_after_stale", existing)
@@ -199,7 +202,9 @@ def _recover(directory, item, at):
         item["state"], item["prompt"] = PENDING, "unknown"
         item.pop("lease_at", None)
         save(directory, item)
-        receipt(directory, "lease_expired", item)
+        # The earlier hand-back's host prompt may still be open and answerable; it is not cancelled by this, and the next
+        # resume checks the merged state first so a late answer to it cannot be followed by a second execution.
+        receipt(directory, "lease_expired", item, earlier_handback_may_still_be_open=True)
     return item
 
 
@@ -233,7 +238,7 @@ def begin_resume(directory, item_id, current_head, validate, at, verify=None):
             save(directory, item)
             receipt(directory, "stale_head", item, current_head=current_head)
             raise AskError(f"head changed ({item['head'][:12]} -> {current_head[:12]}): record a new request after review of the new head")
-        if item["resumes"] and verify is not None and not verify(item):
+        if verify is not None and not verify(item):
             # An earlier hand-back may have been answered after its lease lapsed: if the merge is already verified, close it instead.
             item["state"], item["closed"], item["outcome_ref"] = CONSUMED, iso(at), "merge verified at re-resume"
             save(directory, item)
