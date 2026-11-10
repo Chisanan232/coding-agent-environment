@@ -287,7 +287,7 @@ change: ONE packet. Level 3: cite the durable record of an already-authorized
 decision; never infer founder consent from any agent-produced record or the author
 field alone. Level 4: a host ASK/DENY/managed/classifier refusal is reported (exact
 operation, secrets redacted) and never bypassed or relabeled a product decision;
-approving a host prompt is not founder consent. Main coordinator continues the
+approving a host prompt is not founder consent; a pending ASK is recorded (`scripts/ask-pending.py`) and resumed only after revalidation, never inferred approved from time, a handoff or a watcher. Main coordinator continues the
 release DAG after each slice; a merge that deploys or publishes needs its own
 authorization; no fake human approval; preserve active or ambiguously owned
 worktrees and sessions (ownership needs a checkpoint record, not a name match).

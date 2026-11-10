@@ -167,6 +167,16 @@ Omit file chronology and unsupported completion claims.
   revalidation), never an unrecoverable failure; DENY is for non-waivable constraints such as a failed check or a
   cross-repository head. An approved ASK covers exactly the one pinned operation; the agent never simulates the answer.
   Details: `docs/OWNER-MERGE-OPERATOR-GUIDE.md`.
+- **Before opening an ASK, triage it** (`docs/NONBLOCKING-ASK.md`, "Before opening an ASK"): resolve routine and reversible choices yourself, preserve worktrees and sessions of
+  unknown ownership, investigate and prepare the fix on a separate branch, ask only the one remaining owner decision with the evidence and impact of each option, and
+  deduplicate shared blockers through `ask-pending.py` so one coordinator session owns the owner action.
+- **A pending ASK does not stall independent work** (`docs/NONBLOCKING-ASK.md`, `scripts/ask-pending.py`). Issue the gate's exact `merge_command` from one background
+  subagent lane so the host's native prompt (an actionable Approve/Deny, including on Remote Control) stays open, record it in the ledger (exact action, target,
+  head, dependencies, host request id if any, resume trigger) and continue the next runnable authorized task. After 15 minutes only the scheduling changes:
+  never cancel, dismiss, reword or convert the live prompt into a text question, and a notification, pending-list entry or chat reply request is not an
+  approval flow. If the platform expires the prompt, record it and reissue the exact command only after `ask-pending.py resume` revalidated the exact head and
+  gate. A watcher or the root may observe the outcome but never grants it. Closed items (consumed, denied, expired, changed head) are never resumed. The 12-hour
+  heavy-admission escalation rule is separate. The live Remote Control behavior is not yet verified: until it is, report that criterion, not completion.
 
 Do not merge until required checks, CODEOWNERS-required approvals, the class approvals above,
 conflict resolution, branch currency, and blocking review threads satisfy the
@@ -235,6 +245,7 @@ one prompt, is the unit of completion: `TASK_DONE` is not `CAMPAIGN_DONE`,
   `VERIFICATION_PENDING`, `DONE` or `OUT_OF_SCOPE`. One blocked task never freezes
   the campaign: run the next safe eligible task, and stop a worker only when it has
   no authorized executable work left. A worker checkpoint is not campaign completion.
+  A task whose next step is a host ASK is `WAITING_OPERATOR` with an `ask-pending.py` item; it never blocks a `READY` task.
 - **Fresh evidence.** A cached checkpoint or historical ticket status is not proof.
   Before declaring `WAITING_RESOURCE`, measure the current physical volume and read
   the canonical admission state; an admission snapshot older than its freshness
