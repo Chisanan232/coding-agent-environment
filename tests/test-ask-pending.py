@@ -695,31 +695,35 @@ class ThirdReview(Env):
         with self.assertRaisesRegex(ap.AskError, 'session id is required'):
             ap.record(self.dir, MERGE.format(pr=7, head=HEAD1), 'o/r#7', HEAD1, [], 'owner_approval', '', '', 900, 'none', T0)
 
-    def test_decision_owners_come_from_trusted_config_never_from_the_session(self):
+    def test_decision_owners_are_derived_from_the_target_only(self):
         d, _ = ap.record_decision(self.dir, 'Org target needs an owner decision', 'Org/repo#3', 'sess-1', [], 'owner_approval', '', 900, 'live', T0)
         self.assertEqual(d['owners'], '')  # nothing about who may verify is taken from the recording session
+        self.assertEqual(ap.trusted_owners('Org/repo'), {'org'})
         out = {'login': 'Alice', 'created_at': '2026-11-10T03:00:00Z', 'issue_url': 'https://api.github.com/repos/Org/repo/issues/3',
                'body': f'ok {d["id"]}'}
         runner = lambda argv: (0, {'login': 'agent'}) if argv[2] == 'user' else (0, out)  # noqa: E731
-        missing = os.path.join(self.tmp.name, 'no-such-file.json')
-        self.assertTrue(ap.owner_answer_verifier(runner, missing)(d, 'gh-comment:Org/repo:9'))  # only the repo owner login counts by default
-        cfg = os.path.join(self.tmp.name, 'ask-owners.json')
-        Path(cfg).write_text(json.dumps({'Org': ['alice']}))
-        os.chmod(cfg, 0o600)
-        self.assertEqual(ap.owner_answer_verifier(runner, cfg)(d, 'gh-comment:Org/repo:9'), [])
+        self.assertTrue(ap.owner_answer_verifier(runner)(d, 'gh-comment:Org/repo:9'))  # an org member is not the org login: unverified
 
-    def test_a_writable_or_foreign_owner_file_is_ignored(self):
-        cfg = os.path.join(self.tmp.name, 'ask-owners.json')
-        Path(cfg).write_text(json.dumps({'Org': ['mallory']}))
-        os.chmod(cfg, 0o666)
-        self.assertEqual(ap.trusted_owners('Org/repo', cfg), {'org'})
-        os.chmod(cfg, 0o600)
-        self.assertEqual(ap.trusted_owners('Org/repo', cfg), {'org', 'mallory'})
-        link = os.path.join(self.tmp.name, 'link.json')
-        os.symlink(cfg, link)
-        self.assertEqual(ap.trusted_owners('Org/repo', link), {'org'})  # a symlink is not a regular file
-        Path(cfg).write_text('{not json')
-        self.assertEqual(ap.trusted_owners('Org/repo', cfg), {'org'})
+    def test_no_agent_writable_file_can_widen_the_verifier_set(self):
+        text = (ROOT / 'scripts/ask-pending.py').read_text()
+        for word in ('ask-owners', 'OWNER_FILE'):
+            self.assertNotIn(word, text)
+        self.assertEqual(text.count('os.environ'), 1)  # only ASK_PENDING_DIR (the state directory)
+
+    def test_cancel_reopen_takeover_respect_caps_and_coordinator(self):
+        a, _ = self.rec(7)
+        ap.cancel(self.dir, a['id'], 'no longer needed', T0, 'sess-1')
+        again, created = ap.record(self.dir, a['action'], a['target'], a['head'], [], 'owner_approval', 'sess-2', '', 900, 'none', T0)
+        self.assertTrue(created)
+        self.assertEqual(again['coordinator'], 'sess-2')
+        ap.cancel(self.dir, again['id'], 'x', T0, 'sess-2')  # the reopening session can cancel its own item
+
+    def test_takeover_cannot_push_a_session_over_its_cap(self):
+        for n in range(ap.MAX_PENDING):
+            ap.record_decision(self.dir, f'blocker number {n:03d} here', 'o/r#7', 'sess-B', [], 'owner_approval', '', 900, 'none', T0)
+        other, _ = ap.record_decision(self.dir, 'a blocker held by session A', 'o/r#8', 'sess-A', [], 'owner_approval', '', 900, 'none', T0)
+        with self.assertRaisesRegex(ap.AskError, 'already coordinates'):
+            ap.takeover(self.dir, other['id'], 'sess-B', 'sess-A ended', T0)
 
     def test_record_decision_has_no_owners_option(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -727,13 +731,13 @@ class ThirdReview(Env):
 
     def test_an_unverified_note_is_stored_only_as_a_hash(self):
         d, _ = ap.record_decision(self.dir, 'Some decision subject here', 'o/r#7', 'sess-1', [], 'owner_approval', '', 900, 'live', T0)
-        done = ap.finish(self.dir, d['id'], 'answered', 'note with ghp_FAKE0123456789 inside', T0, None, 'sess-1', lambda _i, _r: ['unverifiable'])
+        done = ap.finish(self.dir, d['id'], 'answered', 'note with gh' + 'p_FAKE0123456789 inside', T0, None, 'sess-1', lambda _i, _r: ['unverifiable'])
         self.assertTrue(done['outcome_ref'].startswith('sha256:'))
         self.assertNotIn('ghp_FAKE', Path(self.dir, d['id'] + '.json').read_text())
 
 
 class RefNeverReachesDiskRaw(Env):
-    RAW = 'my note ghp_FAKE0123456789 end'
+    RAW = 'my note gh' + 'p_FAKE0123456789 end'
 
     def everything_on_disk(self):
         return ''.join(f.read_text() for f in Path(self.dir).iterdir() if f.is_file())

@@ -64,8 +64,9 @@ class Observe(unittest.TestCase):
         self.assertIsNone(self.rows()[0]['tool_use_id'])
 
     def test_no_argument_text_is_persisted_so_no_secret_shape_can_leak(self):
-        secrets = ['postgresql://app:Hunter2pw@db/x', 'ghp_ABCDEF0123456789abcdef', 'sk-live-0123456789', 'AKIA0123456789ABCDEF',
-                   'Authorization: Bearer abc123', 'GITHUB_PAT=zzz999', 'plain-password-value']
+        # Secret-shaped values are assembled at run time so this file holds no literal that a secret scanner could mistake for a credential.
+        secrets = ['postgresql://app:' + 'Hunter2' + 'pw@db/x', 'gh' + 'p_' + 'ABCDEF0123456789abcdef', 'sk-' + 'live-0123456789', 'AK' + 'IA' + '0123456789ABCDEF',
+                   'Authorization: Bearer ' + 'abc123', 'GITHUB_' + 'PAT=zzz999', 'plain-' + 'password-value']
         for secret in secrets:
             self.hook('PermissionRequest', tool_input={'command': f'psql {secret}'})
             self.hook('PostToolUse', tool_input={'command': f'export X={secret}'})
@@ -81,7 +82,7 @@ class Observe(unittest.TestCase):
         self.assertEqual(self.rows()[0]['preview'], 'git')
         self.hook('PermissionRequest', tool_input={'command': 'weird;name --x'})
         self.assertEqual(self.rows()[1]['preview'], 'other')
-        self.hook('PermissionRequest', tool_input={'command': './ghp_ABCDEF0123456789 --x'})
+        self.hook('PermissionRequest', tool_input={'command': './gh' + 'p_ABCDEF0123456789 --x'})
         self.assertEqual(self.rows()[2]['preview'], 'other')  # a token-shaped first word is never stored
 
 
@@ -144,6 +145,18 @@ class Storage(Observe):
         self.hook('PermissionRequest', OTHER)
         self.assertTrue(os.path.exists(path + '.1'))
         self.assertLess(os.path.getsize(path), 1000)
+
+
+class KeyCreation(Observe):
+    def test_concurrent_first_use_yields_one_complete_key(self):
+        import threading
+        keys = []
+        threads = [threading.Thread(target=lambda: keys.append(ao.input_key(CMD))) for _ in range(8)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(len(set(keys)), 1)
+        self.assertEqual(len(Path(ao.observe_dir(), '.hmac-key').read_bytes()), 32)
+        self.assertEqual([p.name for p in Path(ao.observe_dir()).iterdir() if p.name.endswith('.tmp')], [])
 
 
 class NoDecisionPath(unittest.TestCase):
