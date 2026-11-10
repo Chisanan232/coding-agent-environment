@@ -103,7 +103,7 @@ minute"**. Neither left a prompt open for 15 minutes. Criteria A1, A3, A5, A6 an
 
 ## Verification protocol (needs the owner's phone)
 
-1. The owner merges `docs/examples/ask-observe-hooks.example.json` into the settings and starts or reconnects Remote Control (`/remote-control`) on the session that will
+1. The owner installs the observer with `scripts/ask-observe-install.py` (`plan` prints the exact settings diff and the two pins; `apply` needs both pins and adds four hook groups only; `rollback --receipt` removes exactly those four and keeps later edits; run `apply` and `rollback` from a checkout merged to origin/main). The example JSON is only a reference for what it adds. Then start or reconnect Remote Control (`/remote-control`) on the session that will
    run the test. A session in `default` permission mode raises prompts more reliably than `auto`; if `auto` does not raise one for an ask-ruled command, that is itself
    recorded as the failed criterion.
 2. The root launches one background lane per scenario (A: approve, B: deny, C: a second request for a different pinned head) with a harmless ask-ruled command whose
