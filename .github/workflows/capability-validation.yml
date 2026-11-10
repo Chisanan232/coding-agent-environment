@@ -38,6 +38,9 @@ on:
       - 'scripts/branch-protection-rollout.py'
       - 'docs/OWNER-MERGE-AUTONOMY.md'
       - 'tests/test-owner-merge-autonomy.py'
+      - 'scripts/ask-pending.py'
+      - 'tests/test-ask-pending.py'
+      - 'docs/NONBLOCKING-ASK.md'
       - 'tests/test-owner-merge-runner.py'
       - 'tests/test-branch-protection-rollout.py'
       - 'docs/permission-corpus/owner-merge-corpus.json'
@@ -125,6 +128,7 @@ jobs:
           python3 tests/test-engineering-constitution.py
           python3 tests/test-constitution-behavior-matrix.py
           python3 tests/test-owner-merge-autonomy.py
+          python3 tests/test-ask-pending.py
           python3 tests/test-owner-merge-runner.py
           python3 tests/test-branch-protection-rollout.py
           python3 tests/test-routing-eval.py
