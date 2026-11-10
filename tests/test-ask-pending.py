@@ -692,7 +692,7 @@ class ThirdReview(Env):
         self.assertEqual(self.state(a['id']), 'DENIED')
 
     def test_a_session_id_is_required_for_a_merge_record(self):
-        with self.assertRaisesRegex(ap.AskError, 'session id is required'):
+        with self.assertRaisesRegex(ap.AskError, 'session id of 1-80'):
             ap.record(self.dir, MERGE.format(pr=7, head=HEAD1), 'o/r#7', HEAD1, [], 'owner_approval', '', '', 900, 'none', T0)
 
     def test_decision_owners_are_derived_from_the_target_only(self):
@@ -793,6 +793,43 @@ class FinalHardening(Env):
         self.set_gate({7: HEAD1})
         got = self.resume(item['id'], HEAD1, T0)
         self.assertEqual(got['gate_args'], ['--ci-exception'])
+
+
+class LastHardening(Env):
+    def test_inputs_are_bounded_and_session_ids_validated(self):
+        base = dict(target='o/r#7', head=HEAD1, deps=[], trigger='owner_approval', session_id='s', request_id='', grace_s=900, prompt='none', at=T0)
+        def go(**over):
+            kw = {**base, **over}
+            return ap.record(self.dir, kw.pop('action', MERGE.format(pr=7, head=HEAD1)), kw.pop('target'), kw.pop('head'), kw.pop('deps'),
+                             kw.pop('trigger'), kw.pop('session_id'), kw.pop('request_id'), kw.pop('grace_s'), kw.pop('prompt'), kw.pop('at'),
+                             **{k: kw.pop(k) for k in ('owners',) if k in kw})
+        for bad in ({'action': MERGE.format(pr=7, head=HEAD1) + ' ' * 600}, {'action': MERGE.format(pr=7, head=HEAD1) + '\x07'},
+                    {'owners': 'x' * 201}, {'deps': ['d'] * 21}, {'deps': ['d' * 201]}, {'session_id': 's' * 81}, {'session_id': 'has space'}):
+            with self.assertRaises(ap.AskError):
+                go(**bad)
+        with self.assertRaises(ap.AskError):
+            ap.record_decision(self.dir, 'A long enough subject', 'o/r#7', 'bad id!', [], 'owner_approval', '', 900, 'none', T0)
+
+    def test_the_handed_back_item_reads_prompt_unknown(self):
+        a, _ = self.rec(7)
+        self.set_gate({7: HEAD1})
+        self.resume(a['id'], HEAD1, T0)
+        self.assertEqual(ap.load(self.dir, a['id'])['prompt'], 'unknown')
+
+    def test_cancel_after_a_lapsed_lease_recovers_first_and_then_cancels(self):
+        a, _ = self.rec(7)
+        self.set_gate({7: HEAD1})
+        self.resume(a['id'], HEAD1, T0)
+        later = T0 + timedelta(seconds=ap.LEASE_S + 1)
+        self.assertEqual(ap.cancel(self.dir, a['id'], 'gone', later, 'sess-1')['state'], 'CANCELLED')
+
+    def test_denied_on_a_lapsed_decision_or_merge_goes_through_recovery(self):
+        a, _ = self.rec(7)
+        self.set_gate({7: HEAD1})
+        self.resume(a['id'], HEAD1, T0)
+        later = T0 + timedelta(seconds=ap.LEASE_S + 1)
+        with self.assertRaisesRegex(ap.AskError, 'only a RESUMING item'):
+            ap.finish(self.dir, a['id'], 'denied', 'x', later, lambda _i: [])  # lease lapsed: it is PENDING again, not RESUMING
 
 
 class Scenario(Env):
