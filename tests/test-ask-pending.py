@@ -384,6 +384,74 @@ class RealGateContract(Env):
         self.assertEqual(self.validator()(item), [])
 
 
+class SecondReview(Env):
+    def test_list_writes_nothing_even_with_an_unreadable_item(self):
+        self.rec(7)
+        Path(self.dir, 'deadbeefdeadbeef.json').write_text('{bad')
+        before = Path(self.dir, 'receipts.jsonl').read_bytes()
+        ap.all_items(self.dir, quiet=True)
+        self.assertEqual(Path(self.dir, 'receipts.jsonl').read_bytes(), before)
+
+    def test_a_stale_item_can_be_requested_again_but_a_consumed_one_cannot(self):
+        a, _ = self.rec(7)
+        with self.assertRaises(ap.AskError):
+            self.resume(a['id'], HEAD2, T0)
+        self.assertEqual(self.state(a['id']), 'STALE_HEAD')
+        again, created = self.rec(7)
+        self.assertTrue(created)
+        self.assertEqual(again['state'], 'PENDING')
+        self.set_gate({7: HEAD1})
+        self.resume(a['id'], HEAD1, T0)
+        self.finish(a['id'], 'executed', 'ref')
+        self.assertFalse(self.rec(7)[1])
+
+    def test_a_re_resume_after_a_lapsed_lease_closes_an_already_merged_item(self):
+        a, _ = self.rec(7)
+        self.set_gate({7: HEAD1})
+        self.resume(a['id'], HEAD1, T0)
+        later = T0 + timedelta(seconds=ap.LEASE_S + 1)
+        with self.assertRaisesRegex(ap.AskError, 'already verified'):
+            ap.begin_resume(self.dir, a['id'], HEAD1, self.validator(), later, lambda _item: [])
+        self.assertEqual(self.state(a['id']), 'CONSUMED')
+
+    def test_a_re_resume_when_not_merged_proceeds_normally(self):
+        a, _ = self.rec(7)
+        self.set_gate({7: HEAD1})
+        self.resume(a['id'], HEAD1, T0)
+        later = T0 + timedelta(seconds=ap.LEASE_S + 1)
+        got = ap.begin_resume(self.dir, a['id'], HEAD1, self.validator(), later, lambda _item: ['verify verdict MISMATCH'])
+        self.assertEqual(got['resumes'], 2)
+
+    def test_non_object_gate_output_is_a_refusal(self):
+        a, _ = self.rec(7)
+        Path(self.gate).write_text('print("[1,2]")')
+        with self.assertRaisesRegex(ap.AskError, 'could not run'):
+            self.resume(a['id'], HEAD1, T0)
+
+    def test_concurrent_resumes_hand_the_action_back_exactly_once(self):
+        import threading
+        a, _ = self.rec(7)
+        self.set_gate({7: HEAD1})
+        results = []
+
+        def attempt():
+            try:
+                ap.begin_resume(self.dir, a['id'], HEAD1, self.validator(), T0)
+                results.append('ok')
+            except ap.AskError:
+                results.append('refused')
+        threads = [threading.Thread(target=attempt) for _ in range(6)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(sorted(results), ['ok'] + ['refused'] * 5)
+        self.assertEqual(ap.load(self.dir, a['id'])['resumes'], 1)
+
+    def test_settings_layers_are_recorded_with_the_item(self):
+        item, _ = ap.record(self.dir, MERGE.format(pr=7, head=HEAD1), 'o/r#7', HEAD1, [], 'owner_approval', 's', '', 900, 'none', T0,
+                            settings=['/u/s.json', '/p/s.json'])
+        self.assertEqual(item['settings'], ['/u/s.json', '/p/s.json'])
+
+
 class Scenario(Env):
     """The disposable-environment demonstration from the task: two unanswered ASKs, independent work, late approval."""
 
