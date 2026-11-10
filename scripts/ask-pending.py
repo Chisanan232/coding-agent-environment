@@ -20,7 +20,6 @@ import hashlib
 import json
 import os
 import re
-import stat
 import subprocess
 import sys
 import tempfile
@@ -165,13 +164,14 @@ def record(directory, action, target, head, deps, trigger, session_id, request_i
             existing = load(directory, key)
         except AskError:
             existing = None
-        if existing is not None and existing["state"] in (STALE, EXPIRED):
+        if existing is not None and existing["state"] in (STALE, EXPIRED, CANCELLED):
             # The head moved away and came back, or the platform expired the prompt: the same pinned action is requested again
             # (a supported reissue). Denied and consumed items stay closed.
             # Gate options and layers are part of what was reviewed; a reopen with different ones is a new decision, not a reopen.
             if (existing.get("owners"), existing.get("gate_args"), existing.get("settings")) != (owners, list(gate_args), list(settings)):
                 raise AskError("the stale item was recorded with different gate options or settings layers; cancel it and record a new request")
-            existing.update(state=PENDING, created=iso(at), prompt=prompt, session_id=session_id)  # resumes stays: a hand-back did happen
+            _check_caps([i for i in all_items(directory) if i["state"] in (PENDING, RESUMING)], session_id)
+            existing.update(state=PENDING, created=iso(at), prompt=prompt, session_id=session_id, coordinator=session_id)  # resumes stays: a hand-back did happen
             existing.pop("closed", None), existing.pop("reason", None)
             save(directory, existing)
             receipt(directory, "reopened_after_stale_or_expired", existing)
@@ -254,6 +254,7 @@ def takeover(directory, item_id, session_id, reason, at):
         item = load(directory, item_id)
         if item["state"] in TERMINAL:
             raise AskError(f"item already {item['state']}")
+        _check_caps([i for i in all_items(directory) if i["state"] in (PENDING, RESUMING) and i["id"] != item["id"]], session_id)
         previous, item["coordinator"] = item.get("coordinator"), session_id
         save(directory, item)
         receipt(directory, "coordinator_changed", item, previous=previous, new=session_id, reason=reason[:200])
@@ -442,30 +443,17 @@ def gate_validator(settings, gate_cmd=None):
     return validate
 
 
-OWNER_FILE = os.path.join(os.path.expanduser("~"), ".claude", "ask-owners.json")
+def trusted_owners(target_repo):
+    """Who may verify a decision answer: only the target repo's owner login, derived from the target itself.
 
-
-def trusted_owners(target_repo, path=None):
-    """Who may verify a decision answer: the target repo's owner login, plus extras from an owner-controlled file.
-
-    Never taken from the session that records or closes the item. The optional file `~/.claude/ask-owners.json` maps an org or user
-    login to a list of owner logins (`{"Org": ["alice"]}`); it is read only when it is a regular file owned by the current user and not
-    writable by group or others. Anything else is ignored and only the repo owner login counts.
+    Not taken from the recording or closing session, and not from any file the agent could write: `~/.claude` files outside the
+    protected ask rules are agent-writable, so a list there would be a trust anchor the gated party controls. For an org-owned
+    target the owner login is the org, which never authors a comment, so an answer there stays unverified and the request reopens.
     """
-    owner = target_repo.split("/")[0].lower()
-    allowed = {owner}
-    try:
-        st = os.lstat(path or OWNER_FILE)
-        if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022:
-            with open(path or OWNER_FILE) as fh:
-                extra = json.load(fh).get(target_repo.split("/")[0], [])
-            allowed |= {str(x).lower() for x in extra if isinstance(x, str)}
-    except (OSError, ValueError, AttributeError):
-        pass
-    return allowed
+    return {target_repo.split("/")[0].lower()}
 
 
-def owner_answer_verifier(runner=None, owners_path=None):
+def owner_answer_verifier(runner=None):
     """Proof for a decision `answered`: ref `gh-comment:<owner/repo>:<comment id>`, read back and bound to this decision.
 
     All must hold: the comment is in the item's own repo and on the item's own issue/PR; its body contains the item id; its author is a
@@ -487,7 +475,7 @@ def owner_answer_verifier(runner=None, owners_path=None):
         rc, me = run(["gh", "api", "user", "--jq", "{login: .login}"])
         if rc is None or rc != 0 or not me.get("login"):
             return ["the authenticated identity could not be read"]
-        owners = trusted_owners(target_repo, owners_path)
+        owners = trusted_owners(target_repo)
         author = str(out.get("login", "")).lower()
         problems = []
         if author not in owners:
