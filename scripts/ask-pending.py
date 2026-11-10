@@ -111,7 +111,7 @@ def receipt(directory, event, item, **detail):
         fh.write(json.dumps(line, sort_keys=True) + "\n")
 
 
-def all_items(directory):
+def all_items(directory, quiet=False):
     out = []
     for name in sorted(os.listdir(directory)):
         if name.endswith(".json") and not name.startswith("."):
@@ -120,7 +120,8 @@ def all_items(directory):
                     out.append(json.load(fh))
             except (OSError, ValueError):
                 # One unreadable file must not take the whole ledger down; it is left in place for the owner to inspect.
-                receipt(directory, "unreadable_item", {"id": name[:-5], "state": "UNREADABLE"})
+                if not quiet:  # the read path (list) writes nothing
+                    receipt(directory, "unreadable_item", {"id": name[:-5], "state": "UNREADABLE"})
     return out
 
 
@@ -137,7 +138,7 @@ def view(item, at):
 
 # --- transitions -------------------------------------------------------------------------------------------------------
 
-def record(directory, action, target, head, deps, trigger, session_id, request_id, grace_s, prompt, at, owners="", gate_args=()):
+def record(directory, action, target, head, deps, trigger, session_id, request_id, grace_s, prompt, at, owners="", gate_args=(), settings=()):
     if not action.strip() or not TARGET_RE.fullmatch(target) or not HEAD_RE.fullmatch(head):
         raise AskError("action, a target of the form owner/repo#N and a full 40-hex head sha are required")
     if target.split("#")[0] not in action or head not in action:
@@ -151,6 +152,13 @@ def record(directory, action, target, head, deps, trigger, session_id, request_i
             existing = load(directory, key)
         except AskError:
             existing = None
+        if existing is not None and existing["state"] == STALE:
+            # The head moved away and came back (or the head was mistyped): the same pinned action is requested again.
+            existing.update(state=PENDING, created=iso(at), prompt=prompt, resumes=0, session_id=session_id)
+            existing.pop("closed", None), existing.pop("reason", None)
+            save(directory, existing)
+            receipt(directory, "reopened_after_stale", existing)
+            return existing, True
         if existing is not None:
             # Same action, target and head is the same request: a duplicate is a no-op, a consumed one stays consumed.
             receipt(directory, "duplicate_record", existing)
@@ -166,7 +174,7 @@ def record(directory, action, target, head, deps, trigger, session_id, request_i
                 receipt(directory, "superseded", old, new_head=head)
         item = {"id": key, "action": action, "target": target, "head": head, "dependencies": sorted(deps), "resume_trigger": trigger,
                 "session_id": session_id, "request_id": request_id or None, "prompt": prompt, "grace_s": grace_s,
-                "created": iso(at), "state": PENDING, "resumes": 0, "owners": owners, "gate_args": list(gate_args)}
+                "created": iso(at), "state": PENDING, "resumes": 0, "owners": owners, "gate_args": list(gate_args), "settings": list(settings)}
         save(directory, item)
         receipt(directory, "recorded", item, prompt=prompt, request_id=request_id or None)
         return item, True
@@ -208,7 +216,7 @@ def restart(directory, session_id, at):
     return changed
 
 
-def begin_resume(directory, item_id, current_head, validate, at):
+def begin_resume(directory, item_id, current_head, validate, at, verify=None):
     """PENDING -> RESUMING exactly once, after revalidation. Returns the exact recorded action to run (the host then asks again)."""
     if not HEAD_RE.fullmatch(current_head):
         raise AskError("--current-head must be the full 40-hex head read from GitHub; nothing was changed")
@@ -225,6 +233,12 @@ def begin_resume(directory, item_id, current_head, validate, at):
             save(directory, item)
             receipt(directory, "stale_head", item, current_head=current_head)
             raise AskError(f"head changed ({item['head'][:12]} -> {current_head[:12]}): record a new request after review of the new head")
+        if item["resumes"] and verify is not None and not verify(item):
+            # An earlier hand-back may have been answered after its lease lapsed: if the merge is already verified, close it instead.
+            item["state"], item["closed"], item["outcome_ref"] = CONSUMED, iso(at), "merge verified at re-resume"
+            save(directory, item)
+            receipt(directory, "consumed_by_verification", item)
+            raise AskError("the merge is already verified: item closed as CONSUMED, nothing to run")
         problems = validate(item)
         if problems:
             receipt(directory, "revalidation_failed", item, problems=problems)
@@ -281,7 +295,10 @@ def _run_gate(argv):
     """Run the gate; any launch problem is a refusal, never a traceback and never a pass."""
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
-        return proc.returncode, json.loads(proc.stdout)
+        out = json.loads(proc.stdout)
+        if not isinstance(out, dict):
+            raise ValueError("gate output is not an object")
+        return proc.returncode, out
     except (OSError, ValueError, subprocess.TimeoutExpired) as err:
         return None, {"error": type(err).__name__}
 
@@ -365,7 +382,7 @@ def main(argv=None):
     b = sub.add_parser("resume", help="revalidate and hand back the exact action once")
     b.add_argument("--id", required=True)
     b.add_argument("--current-head", required=True, help="the head you just read from GitHub")
-    b.add_argument("--settings", action="append", default=[], help="settings layer(s) passed to the gate; default: user, plus project and local in the cwd when present")
+    b.add_argument("--settings", action="append", default=[], help="must equal the layers recorded with the item (user, plus project and local in the recording cwd, when present)")
     f = sub.add_parser("finish", help="close a RESUMING item with an observed outcome")
     f.add_argument("--id", required=True)
     f.add_argument("--outcome", required=True, choices=sorted(OUTCOMES))
@@ -381,10 +398,10 @@ def main(argv=None):
                          + (["--version-policy", args.gate_version_policy] if args.gate_version_policy else [])
                          + (["--local-first-config", args.gate_local_first_config] if args.gate_local_first_config else []))
             item, created = record(directory, args.action, args.target, args.head, args.dep, args.trigger, args.session_id,
-                                   args.request_id, args.grace_s, args.prompt, at, args.owners, gate_args)
+                                   args.request_id, args.grace_s, args.prompt, at, args.owners, gate_args, default_settings())
             print(json.dumps({"created": created, **view(item, at)}, sort_keys=True))
         elif args.cmd == "list":
-            items = [view(recovered_view(i, at), at) for i in all_items(directory)]
+            items = [view(recovered_view(i, at), at) for i in all_items(directory, quiet=True)]
             open_items = [i for i in items if i["state"] in (PENDING, RESUMING)]
             if args.json:
                 print(json.dumps({"pending": open_items, "closed": [i for i in items if i["state"] in TERMINAL]}, sort_keys=True))
@@ -394,7 +411,11 @@ def main(argv=None):
         elif args.cmd == "restart":
             print(json.dumps({"prompt_unknown": restart(directory, args.session_id, at)}))
         elif args.cmd == "resume":
-            item = begin_resume(directory, args.id, args.current_head, gate_validator(args.settings or default_settings()), at)
+            item = load(directory, args.id)
+            layers = item.get("settings") or default_settings()
+            if args.settings and sorted(args.settings) != sorted(layers):
+                raise AskError("--settings differs from the layers recorded with the item; record a new request instead")
+            item = begin_resume(directory, args.id, args.current_head, gate_validator(layers), at, merge_verifier())
             print(json.dumps({"run_exactly": item["action"], "id": item["id"], "note": "the host will ask again; its answer is the only approval"}))
         elif args.cmd == "finish":
             print(json.dumps(view(finish(directory, args.id, args.outcome, args.ref, at, merge_verifier()), at), sort_keys=True))
