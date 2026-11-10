@@ -381,6 +381,9 @@ class Flow(Env):
 
     def test_rollback_refuses_a_symlinked_backup_dir_and_does_not_chmod_its_target(self):
         receipt = self.apply()
+        data = json.loads(Path(receipt).read_text())
+        data['settings_backup'] = data['hook_backup'] = None  # so only the symlinked directory itself can refuse
+        Path(receipt).write_text(json.dumps(data))
         real = Path(self.tmp.name) / 'real-backups'
         real.mkdir(mode=0o755)
         os.chmod(real, 0o755)
