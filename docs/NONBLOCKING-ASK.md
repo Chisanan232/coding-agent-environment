@@ -25,7 +25,7 @@ Host policy is not changed: no settings edit, no new allow, no hook that answers
 |---|---|
 | A background subagent's prompt waits in the main session while the main agent continues | **Documented, not observed here.** A 2026-11-10 probe lane ran `rtk proxy echo` (a `permissions.ask` rule) and returned at once with no visible prompt, so it exercised no live prompt. Treat the live-prompt behavior as `HOST_PROMPT_BACKGROUND_UNVERIFIED` until an owner-observed run shows a pending prompt while the main agent keeps working |
 | The ledger keeps an unanswered ASK pending past 15 minutes, holds several at once, resumes only the intended one, and handles changed head, denial, duplicate and restart | Tested (`tests/test-ask-pending.py`, class `Scenario` and `Resume`) in a disposable directory with a stand-in gate |
-| The normal merge gate is still the authority | Tested: resume is refused unless `owner-merge-gate.py check` returns PASS for the same repo, PR and head and prints exactly the recorded action |
+| The normal merge gate is still the authority | Tested against a stand-in gate, plus one contract test that runs the real `owner-merge-gate.py check` `main` (evaluation stubbed) and feeds its printed JSON to the validator. The gate's own evaluation (checks, reviews, ownership) is covered by `tests/test-owner-merge-gate.py` and is not re-tested here. No live merge was performed |
 
 Because the live-prompt claim is unverified, the design does not depend on it: with no live prompt the item simply stays pending with `prompt: none`, other work
 continues, and the action is issued when the owner is present.
@@ -46,6 +46,14 @@ action, target and head, so a repeated request is the same item.
 Commands: `record`, `list [--json]`, `restart --session-id`, `resume --id --current-head`, `finish --id --outcome executed|denied|expired|failed [--ref]`, `cancel`.
 There is deliberately no `approve` command: the ledger cannot authorize anything.
 
+## Scope and limits
+
+- Resume revalidation is the owner-merge gate, so the ledger covers **merge ASKs** (the direct `gh pr merge` or the runner command the gate prints). Another kind of ASK can be recorded as a note but has no revalidation and is out of scope here.
+- `dependencies` and `resume_trigger` are recorded for the main agent's task graph; the ledger does not evaluate them. Resume is always an explicit call.
+- If the gate's preferred executor changes (for example the runner is installed after a direct item was recorded), the old item is refused as "differs from the recorded action"; cancel it and record the new action.
+- At most 20 items can be open; the 21st `record` is refused with an explicit error. `list` is read-only; only `resume` recovers a lapsed lease.
+- `prompt` is `none` while an item is `RESUMING`; the host prompt for the handed-back command is a separate, immediate event.
+
 ## Flow
 
 1. **Record.** Before issuing an action the host will ask about, `record` it (exact action, target, head, dependencies, request id if any, trigger). Issue it from a
@@ -55,10 +63,10 @@ There is deliberately no `approve` command: the ledger cannot authorize anything
 3. **Resume at a safe checkpoint** (between tasks, never mid-edit). `resume --id <id> --current-head <head just read from GitHub>`:
    - moves `PENDING` to `RESUMING` once; a second resume, a closed item or a lost race is refused;
    - a different head closes the item as `STALE_HEAD` (a new head needs a new independent review and a new record); recording a new head for the same target also supersedes the old item;
-   - runs `owner-merge-gate.py check` and requires PASS for the same repo, PR and head and the same printed `merge_command` (the gate covers exact head, independent review evidence, required checks, owner class and host permission);
+   - runs `owner-merge-gate.py check` with every settings layer that exists (user, plus project and local in the cwd; override with repeated `--settings`) and the gate options recorded with the item (`--gate-ci-unavailable`, `--gate-ci-exception`, `--gate-version-policy`, `--gate-local-first-config`), and requires PASS with the same head and the same printed `merge_command` (the gate covers exact head, independent review evidence, required checks, owner class and host permission). A gate that cannot run is a refusal;
    - prints `run_exactly` and nothing else. The agent runs that command alone, as the gate requires; **the host asks again and its answer is the only approval.**
 4. **Finish.** `finish --outcome executed --ref <proof>` (for a merge, the `owner-merge-gate.py verify` result, run separately), `denied`, `expired`, or `failed`
-   (back to `PENDING` with `prompt: unknown`). A duplicate finish is refused and receipted. A `RESUMING` item with no outcome for 30 minutes returns to `PENDING`
+   (back to `PENDING` with `prompt: unknown`). `executed` is accepted only when `owner-merge-gate.py verify` reports VERIFIED for the recorded repo, PR and head; `--ref` is just a pointer to the evidence. A duplicate finish is refused and receipted. A `RESUMING` item with no outcome for 30 minutes returns to `PENDING`
    (never to done).
 5. **Restart.** State is on disk. `restart --session-id <new>` marks every live prompt `unknown`; nothing is assumed approved and every item re-validates on resume.
 
