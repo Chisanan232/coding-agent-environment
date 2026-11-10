@@ -1,0 +1,3 @@
+# Synthetic test value, never a credential: an AWS-access-key-shaped placeholder that tests/test-ask-observe.py once held as a literal
+# (the observer test now assembles it at run time). Fingerprint = <commit>:<file>:<rule>:<line> for that one historic commit.
+c03144346bc5106970f48daa6ab8eabc07fe789d:tests/test-ask-observe.py:aws-access-token:67
