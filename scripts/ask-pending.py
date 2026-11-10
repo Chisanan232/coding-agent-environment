@@ -191,7 +191,7 @@ def record(directory, action, target, head, deps, trigger, session_id, request_i
                 save(directory, old)
                 receipt(directory, "superseded", old, new_head=head)
         item = {"id": key, "action": action, "target": target, "head": head, "dependencies": sorted(deps), "resume_trigger": trigger,
-                "session_id": session_id, "request_id": request_id or None, "prompt": prompt, "grace_s": grace_s,
+                "session_id": session_id, "request_id": (request_id or "")[:80] or None, "prompt": prompt, "grace_s": grace_s,
                 "kind": "merge", "coordinator": session_id or None,
                 "created": iso(at), "state": PENDING, "resumes": 0, "owners": owners, "gate_args": list(gate_args), "settings": list(settings)}
         save(directory, item)
@@ -239,7 +239,7 @@ def record_decision(directory, subject, target, session_id, deps, trigger, reque
         _check_caps([i for i in all_items(directory) if i["state"] in (PENDING, RESUMING)], session_id)
         item = {"id": key, "kind": "decision", "action": "DECISION: " + subject, "target": target, "head": "decision",
                 "dependencies": sorted(deps), "resume_trigger": trigger, "session_id": session_id, "coordinator": session_id,
-                "request_id": request_id or None, "prompt": prompt, "grace_s": max(0, min(int(grace_s), GRACE_MAX_S)),
+                "request_id": (request_id or "")[:80] or None, "prompt": prompt, "grace_s": max(0, min(int(grace_s), GRACE_MAX_S)),
                 "created": iso(at), "state": PENDING, "resumes": 0, "owners": "", "gate_args": [], "settings": []}
         save(directory, item)
         receipt(directory, "recorded_decision", item, prompt=prompt, request_id=request_id or None)
@@ -255,6 +255,7 @@ def takeover(directory, item_id, session_id, reason, at):
         if item["state"] in TERMINAL:
             raise AskError(f"item already {item['state']}")
         _check_caps([i for i in all_items(directory) if i["state"] in (PENDING, RESUMING) and i["id"] != item["id"]], session_id)
+        reason = reason[:200]
         previous, item["coordinator"] = item.get("coordinator"), session_id
         save(directory, item)
         receipt(directory, "coordinator_changed", item, previous=previous, new=session_id, reason=reason[:200])
@@ -389,6 +390,9 @@ def cancel(directory, item_id, reason, at, session_id=None):
             raise AskError(f"item already {item['state']}")
         if item.get("coordinator") and session_id != item["coordinator"]:
             raise AskError("only the coordinating session cancels an item; another session uses takeover first")
+        if item["state"] == RESUMING:
+            raise AskError("a hand-back is in flight and its host prompt may still be open: finish it (executed, denied or expired) instead of cancelling")
+        reason = reason[:200]
         item["state"], item["closed"], item["reason"] = CANCELLED, iso(at), reason
         save(directory, item)
         receipt(directory, "cancelled", item, reason=reason)
@@ -592,7 +596,8 @@ def main(argv=None):
             if args.settings and sorted(args.settings) != sorted(layers):
                 raise AskError("--settings differs from the layers recorded with the item; record a new request instead")
             item = begin_resume(directory, args.id, args.current_head, gate_validator(layers), at, merge_verifier())
-            print(json.dumps({"run_exactly": item["action"], "id": item["id"], "note": "the host will ask again; its answer is the only approval"}))
+            print(json.dumps({"run_exactly": item["action"], "id": item["id"], "gate_options_used": item.get("gate_args") or [],
+                              "note": "state any gate_options_used when asking: the host prompt shows only the command"}))
         elif args.cmd == "finish":
             print(json.dumps(view(finish(directory, args.id, args.outcome, args.ref, at, merge_verifier(), args.session_id or None, owner_answer_verifier()), at), sort_keys=True))
         elif args.cmd == "cancel":
