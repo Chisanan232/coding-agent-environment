@@ -495,6 +495,84 @@ def item_key_for(pr, head=HEAD1):
     return ap.item_key(MERGE.format(pr=pr, head=head), f'o/r#{pr}', head)
 
 
+class SharedBlockers(Env):
+    SUBJECT = 'AASM J84 needs a sudo action by the owner'
+
+    def decide(self, session, **kw):
+        return ap.record_decision(self.dir, kw.pop('subject', self.SUBJECT), kw.pop('target', 'o/r#84'), session, [], 'owner_approval',
+                                  kw.pop('request_id', ''), 900, kw.pop('prompt', 'live'), T0)
+
+    def test_the_first_session_coordinates_and_a_second_gets_the_same_item(self):
+        first, created = self.decide('sess-A')
+        second, created_again = self.decide('sess-B')
+        self.assertTrue(created)
+        self.assertFalse(created_again)
+        self.assertEqual((second['id'], second['coordinator']), (first['id'], 'sess-A'))
+        self.assertEqual(len(ap.all_items(self.dir)), 1)
+
+    def test_different_subjects_or_targets_are_different_blockers(self):
+        a, _ = self.decide('sess-A')
+        b, _ = self.decide('sess-A', subject='Libra v0.0.5 spend decision')
+        c, _ = self.decide('sess-A', target='o/r#85')
+        self.assertEqual(len({a['id'], b['id'], c['id']}), 3)
+
+    def test_a_decision_cannot_be_resumed_or_executed(self):
+        item, _ = self.decide('sess-A')
+        with self.assertRaisesRegex(ap.AskError, 'answered by the owner'):
+            self.resume(item['id'], HEAD1, T0)
+        with self.assertRaisesRegex(ap.AskError, 'does not apply'):
+            self.finish(item['id'], 'executed', 'ref')
+
+    def test_answered_needs_a_durable_reference_and_closes_it_once(self):
+        item, _ = self.decide('sess-A')
+        with self.assertRaisesRegex(ap.AskError, 'needs --ref'):
+            self.finish(item['id'], 'answered', '')
+        self.assertEqual(self.finish(item['id'], 'answered', 'SPE-170 comment 1')['state'], 'CONSUMED')
+        with self.assertRaises(ap.AskError):
+            self.finish(item['id'], 'answered', 'SPE-170 comment 1')
+
+    def test_denied_is_terminal_for_a_decision_too(self):
+        item, _ = self.decide('sess-A')
+        self.assertEqual(self.finish(item['id'], 'denied', 'owner declined')['state'], 'DENIED')
+
+    def test_a_merge_item_cannot_be_answered(self):
+        a, _ = self.rec(7)
+        with self.assertRaisesRegex(ap.AskError, 'does not apply'):
+            self.finish(a['id'], 'answered', 'x')
+
+    def test_takeover_is_explicit_receipted_and_not_for_closed_items(self):
+        item, _ = self.decide('sess-A')
+        moved = ap.takeover(self.dir, item['id'], 'sess-B', 'sess-A ended', T0)
+        self.assertEqual(moved['coordinator'], 'sess-B')
+        events = [json.loads(l) for l in Path(self.dir, 'receipts.jsonl').read_text().splitlines()]
+        self.assertEqual(events[-1]['event'], 'coordinator_changed')
+        with self.assertRaises(ap.AskError):
+            ap.takeover(self.dir, item['id'], 'sess-B', '', T0)
+        self.finish(item['id'], 'denied', 'x')
+        with self.assertRaises(ap.AskError):
+            ap.takeover(self.dir, item['id'], 'sess-C', 'late', T0)
+
+    def test_decision_needs_subject_target_and_session(self):
+        for kw in ({'subject': 'short'}, {'target': 'not-a-target'}):
+            with self.assertRaises(ap.AskError):
+                self.decide('sess-A', **kw)
+        with self.assertRaises(ap.AskError):
+            self.decide('')
+
+    def test_merge_items_record_their_coordinator_and_duplicates_do_not_change_it(self):
+        a, _ = self.rec(7)
+        again, created = ap.record(self.dir, a['action'], a['target'], a['head'], [], 'owner_approval', 'sess-other', '', 900, 'none', T0)
+        self.assertFalse(created)
+        self.assertEqual(again['coordinator'], 'sess-1')
+
+    def test_a_pending_decision_is_not_expired_or_approved_by_time(self):
+        item, _ = self.decide('sess-A')
+        late = T0 + timedelta(days=3)
+        shown = ap.view(ap.load(self.dir, item['id']), late)
+        self.assertTrue(shown['move_on'])
+        self.assertEqual(self.state(item['id']), 'PENDING')
+
+
 class Scenario(Env):
     """The disposable-environment demonstration from the task: two unanswered ASKs, independent work, late approval."""
 
@@ -553,14 +631,14 @@ class NoSelfAuthorization(unittest.TestCase):
                 ap.main(['--help'])
         finally:
             argparse.ArgumentParser.add_subparsers = real
-        self.assertEqual(parser_names, {'record', 'list', 'restart', 'resume', 'finish', 'cancel'})
+        self.assertEqual(parser_names, {'record', 'record-decision', 'takeover', 'list', 'restart', 'resume', 'finish', 'cancel'})
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             ap.main(['approve', '--id', 'x'])
 
     def test_the_only_subprocess_is_the_gate(self):
         text = (ROOT / 'scripts/ask-pending.py').read_text()
         self.assertEqual(text.count('subprocess.run('), 1)  # _run_gate: check and verify only
-        self.assertNotIn('"merge"', text)
+        self.assertNotIn('"gh"', text)  # the ledger never builds or runs a gh command itself
 
 
 if __name__ == '__main__':
