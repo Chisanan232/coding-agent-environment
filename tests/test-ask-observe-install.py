@@ -379,6 +379,17 @@ class Flow(Env):
         self.apply()
         self.assertEqual(stat.S_IMODE(os.stat(self.backups).st_mode), 0o700)
 
+    def test_rollback_refuses_a_symlinked_backup_dir_and_does_not_chmod_its_target(self):
+        receipt = self.apply()
+        real = Path(self.tmp.name) / 'real-backups'
+        real.mkdir(mode=0o755)
+        os.chmod(real, 0o755)
+        link = Path(self.tmp.name) / 'link-backups'
+        link.symlink_to(real)
+        code, _ = self.run_mode('rollback', '--receipt', receipt, '--backup-dir', str(link))
+        self.assertEqual(code, 4)
+        self.assertEqual(stat.S_IMODE(os.stat(real).st_mode), 0o755)
+
 
 if __name__ == '__main__':
     unittest.main()
