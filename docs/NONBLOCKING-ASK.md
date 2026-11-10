@@ -51,8 +51,12 @@ There is deliberately no `approve` command: the ledger cannot authorize anything
 - Resume revalidation is the owner-merge gate, so the ledger covers **merge ASKs** (the direct `gh pr merge` or the runner command the gate prints). Another kind of ASK can be recorded as a note but has no revalidation and is out of scope here.
 - `dependencies` and `resume_trigger` are recorded for the main agent's task graph; the ledger does not evaluate them. Resume is always an explicit call.
 - If the gate's preferred executor changes (for example the runner is installed after a direct item was recorded), the old item is refused as "differs from the recorded action"; cancel it and record the new action.
-- At most 20 items can be open; the 21st `record` is refused with an explicit error. `list` is read-only; only `resume` recovers a lapsed lease.
+- At most 20 items can be open; the 21st `record` is refused with an explicit error. `list` is read-only (it writes neither items nor receipts); only `resume` recovers a lapsed lease.
 - `prompt` is `none` while an item is `RESUMING`; the host prompt for the handed-back command is a separate, immediate event.
+
+- **Trust boundary.** The ledger is not tamper-evident: an agent with a shell can edit the JSON under the state directory, and `finish --outcome denied|expired|failed` and `cancel` take the caller's word. That can at worst keep an ASK from being resumed (a closed item, a reopened-after-stale item, or a re-recorded one); it can never approve or execute anything, because resume still needs the real gate PASS and the host's own answer. `executed` is the only outcome that needs outside proof (gate `verify`).
+- A `RESUMING` lease that lapses (30 minutes) returns to `PENDING`. The next resume first runs `verify`; if the merge is already VERIFIED the item is closed as `CONSUMED` instead of handing the action back again.
+- The gate runs while the ledger lock is held (up to 120 s), so other ledger writes wait during a resume; a recorded `STALE_HEAD` item is reopened by recording the same pinned action again.
 
 ## Flow
 
@@ -63,7 +67,7 @@ There is deliberately no `approve` command: the ledger cannot authorize anything
 3. **Resume at a safe checkpoint** (between tasks, never mid-edit). `resume --id <id> --current-head <head just read from GitHub>`:
    - moves `PENDING` to `RESUMING` once; a second resume, a closed item or a lost race is refused;
    - a different head closes the item as `STALE_HEAD` (a new head needs a new independent review and a new record); recording a new head for the same target also supersedes the old item;
-   - runs `owner-merge-gate.py check` with every settings layer that exists (user, plus project and local in the cwd; override with repeated `--settings`) and the gate options recorded with the item (`--gate-ci-unavailable`, `--gate-ci-exception`, `--gate-version-policy`, `--gate-local-first-config`), and requires PASS with the same head and the same printed `merge_command` (the gate covers exact head, independent review evidence, required checks, owner class and host permission). A gate that cannot run is a refusal;
+   - runs `owner-merge-gate.py check` with the settings layers recorded with the item (user, plus project and local in the recording directory, when they exist; managed settings are not included; a different `--settings` at resume is refused) and the gate options recorded with the item (`--gate-ci-unavailable`, `--gate-ci-exception`, `--gate-version-policy`, `--gate-local-first-config`), and requires PASS with the same head and the same printed `merge_command` (the gate covers exact head, independent review evidence, required checks, owner class and host permission). A gate that cannot run is a refusal;
    - prints `run_exactly` and nothing else. The agent runs that command alone, as the gate requires; **the host asks again and its answer is the only approval.**
 4. **Finish.** `finish --outcome executed --ref <proof>` (for a merge, the `owner-merge-gate.py verify` result, run separately), `denied`, `expired`, or `failed`
    (back to `PENDING` with `prompt: unknown`). `executed` is accepted only when `owner-merge-gate.py verify` reports VERIFIED for the recorded repo, PR and head; `--ref` is just a pointer to the evidence. A duplicate finish is refused and receipted. A `RESUMING` item with no outcome for 30 minutes returns to `PENDING`
