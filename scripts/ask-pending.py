@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -198,7 +199,7 @@ def _check_caps(live_open, session_id):
         raise AskError(f"this session already coordinates {MAX_PENDING} open items")
 
 
-def record_decision(directory, subject, target, session_id, deps, trigger, request_id, grace_s, prompt, at, owners=""):
+def record_decision(directory, subject, target, session_id, deps, trigger, request_id, grace_s, prompt, at):
     """A shared blocker that needs an owner decision (a Select or a credential/admin action), not a command.
 
     One item per subject and target across every session that shares this ledger: the first session to record it coordinates the
@@ -232,7 +233,7 @@ def record_decision(directory, subject, target, session_id, deps, trigger, reque
         item = {"id": key, "kind": "decision", "action": "DECISION: " + subject, "target": target, "head": "decision",
                 "dependencies": sorted(deps), "resume_trigger": trigger, "session_id": session_id, "coordinator": session_id,
                 "request_id": request_id or None, "prompt": prompt, "grace_s": max(0, min(int(grace_s), GRACE_MAX_S)),
-                "created": iso(at), "state": PENDING, "resumes": 0, "owners": owners, "gate_args": [], "settings": []}
+                "created": iso(at), "state": PENDING, "resumes": 0, "owners": "", "gate_args": [], "settings": []}
         save(directory, item)
         receipt(directory, "recorded_decision", item, prompt=prompt, request_id=request_id or None)
         return item, True
@@ -434,7 +435,30 @@ def gate_validator(settings, gate_cmd=None):
     return validate
 
 
-def owner_answer_verifier(runner=None):
+OWNER_FILE = os.path.join(os.path.expanduser("~"), ".claude", "ask-owners.json")
+
+
+def trusted_owners(target_repo, path=None):
+    """Who may verify a decision answer: the target repo's owner login, plus extras from an owner-controlled file.
+
+    Never taken from the session that records or closes the item. The optional file `~/.claude/ask-owners.json` maps an org or user
+    login to a list of owner logins (`{"Org": ["alice"]}`); it is read only when it is a regular file owned by the current user and not
+    writable by group or others. Anything else is ignored and only the repo owner login counts.
+    """
+    owner = target_repo.split("/")[0].lower()
+    allowed = {owner}
+    try:
+        st = os.lstat(path or OWNER_FILE)
+        if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022:
+            with open(path or OWNER_FILE) as fh:
+                extra = json.load(fh).get(target_repo.split("/")[0], [])
+            allowed |= {str(x).lower() for x in extra if isinstance(x, str)}
+    except (OSError, ValueError, AttributeError):
+        pass
+    return allowed
+
+
+def owner_answer_verifier(runner=None, owners_path=None):
     """Proof for a decision `answered`: ref `gh-comment:<owner/repo>:<comment id>`, read back and bound to this decision.
 
     All must hold: the comment is in the item's own repo and on the item's own issue/PR; its body contains the item id; its author is a
@@ -456,7 +480,7 @@ def owner_answer_verifier(runner=None):
         rc, me = run(["gh", "api", "user", "--jq", "{login: .login}"])
         if rc is None or rc != 0 or not me.get("login"):
             return ["the authenticated identity could not be read"]
-        owners = [o.strip().lower() for o in (item.get("owners") or target_repo.split("/")[0]).split(",") if o.strip()]
+        owners = trusted_owners(target_repo, owners_path)
         author = str(out.get("login", "")).lower()
         problems = []
         if author not in owners:
@@ -520,7 +544,6 @@ def main(argv=None):
     d.add_argument("--request-id", default="")
     d.add_argument("--prompt", default="none", choices=sorted(PROMPTS))
     d.add_argument("--grace-s", type=int, default=GRACE_MAX_S)
-    d.add_argument("--owners", default="", help="comma-separated owner logins whose comment can verify an answer (default: the target repo's owner login)")
     t = sub.add_parser("takeover", help="become the coordinator of an open item")
     t.add_argument("--id", required=True)
     t.add_argument("--session-id", required=True)
@@ -554,7 +577,7 @@ def main(argv=None):
             print(json.dumps({"created": created, **view(item, at)}, sort_keys=True))
         elif args.cmd == "record-decision":
             item, created = record_decision(directory, args.subject, args.target, args.session_id, args.dep, args.trigger,
-                                            args.request_id, args.grace_s, args.prompt, at, args.owners)
+                                            args.request_id, args.grace_s, args.prompt, at)
             print(json.dumps({"created": created, "you_coordinate": item["coordinator"] == args.session_id, **view(item, at)}, sort_keys=True))
         elif args.cmd == "takeover":
             print(json.dumps(view(takeover(directory, args.id, args.session_id, args.reason, at), at), sort_keys=True))
