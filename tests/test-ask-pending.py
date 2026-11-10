@@ -561,23 +561,44 @@ class SharedBlockers(Env):
             self.assertFalse(self.close(item['id'], outcome=outcome, ref='')['verified'])
             self.assertTrue(self.decide('sess-B', subject=f'subject for {outcome} case')[1])
 
-    def test_owner_answer_verifier_accepts_only_an_owner_comment_after_the_request(self):
-        item, _ = self.decide('sess-A')
-        ok = lambda out: (lambda argv: (0, out))  # noqa: E731
-        good = {'login': 'O', 'created_at': '2026-11-10T03:00:00Z'}
-        self.assertEqual(ap.owner_answer_verifier(ok(good))(item, 'gh-comment:o/r:42'), [])
-        self.assertTrue(ap.owner_answer_verifier(ok({'login': 'someone-else', 'created_at': good['created_at']}))(item, 'gh-comment:o/r:42'))
-        self.assertTrue(ap.owner_answer_verifier(ok({'login': 'o', 'created_at': '2026-11-09T00:00:00Z'}))(item, 'gh-comment:o/r:42'))
-        self.assertTrue(ap.owner_answer_verifier(lambda argv: (None, {'error': 'X'}))(item, 'gh-comment:o/r:42'))
-        for bad in ('', 'SPE-170 comment 1', 'gh-comment:o/r:abc', 'gh-comment:../x:1'):
-            self.assertTrue(ap.owner_answer_verifier(ok(good))(item, bad))
+    def gh(self, item, **over):
+        comment = {'login': 'O', 'created_at': '2026-11-10T03:00:00Z', 'issue_url': 'https://api.github.com/repos/o/r/issues/84',
+                   'body': f'Approved. decision {item["id"]}', **over}
 
-    def test_the_verifier_reads_one_comment_and_nothing_else(self):
+        def runner(argv):
+            return (0, {'login': 'me-the-agent'}) if argv[2] == 'user' else (0, comment)
+        return runner
+
+    def test_owner_answer_verifier_accepts_only_a_bound_independent_owner_comment(self):
+        item, _ = self.decide('sess-A')
+        self.assertEqual(ap.owner_answer_verifier(self.gh(item))(item, 'gh-comment:o/r:42'), [])
+        for over, why in (({'login': 'someone-else'}, 'not by a recorded owner'),
+                          ({'login': 'me-the-agent'}, 'not independent proof'),
+                          ({'issue_url': 'https://api.github.com/repos/o/r/issues/85'}, 'not on the item'),
+                          ({'body': 'looks fine to me'}, 'does not name this decision'),
+                          ({'created_at': '2026-11-09T00:00:00Z'}, 'predates')):
+            problems = ap.owner_answer_verifier(self.gh(item, **over))(item, 'gh-comment:o/r:42')
+            self.assertTrue(any(why in p for p in problems), (over, problems))
+
+    def test_the_verifier_refuses_other_repos_and_bad_refs_and_unreadable_reads(self):
+        item, _ = self.decide('sess-A')
+        v = ap.owner_answer_verifier(self.gh(item))
+        for bad in ('', 'SPE-170 comment 1', 'gh-comment:o/r:abc', 'gh-comment:../x:1', 'gh-comment:other/repo:42'):
+            self.assertTrue(v(item, bad), bad)
+        self.assertTrue(ap.owner_answer_verifier(lambda argv: (None, {'error': 'X'}))(item, 'gh-comment:o/r:42'))
+        no_identity = lambda argv: (0, {}) if argv[2] == 'user' else (0, {'login': 'o'})  # noqa: E731
+        self.assertTrue(ap.owner_answer_verifier(no_identity)(item, 'gh-comment:o/r:42'))
+
+    def test_the_verifier_only_reads(self):
         item, _ = self.decide('sess-A')
         seen = []
-        ap.owner_answer_verifier(lambda argv: (seen.append(argv), (0, {'login': 'o', 'created_at': '2026-11-10T03:00:00Z'}))[1])(item, 'gh-comment:o/r:42')
-        self.assertEqual(seen[0][:3], ['gh', 'api', 'repos/o/r/issues/comments/42'])
-        self.assertNotIn('--method', seen[0])
+
+        def runner(argv):
+            seen.append(argv)
+            return (0, {'login': 'me'}) if argv[2] == 'user' else (0, {'login': 'o', 'created_at': '2026-11-10T03:00:00Z', 'issue_url': '', 'body': ''})
+        ap.owner_answer_verifier(runner)(item, 'gh-comment:o/r:42')
+        self.assertTrue(all(a[:2] == ['gh', 'api'] and '--method' not in a and '-X' not in a for a in seen))
+        self.assertEqual([a[2] for a in seen], ['repos/o/r/issues/comments/42', 'user'])
 
     def test_cancel_is_coordinator_only(self):
         a, _ = self.rec(7)
