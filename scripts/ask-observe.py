@@ -11,12 +11,12 @@ without being a second approver.
 | Observed | Meaning |
 |---|---|
 | `PROMPTED`, nothing later | A prompt was raised and no result has been seen: still pending, denied or expired. The documented events do not say which |
-| `PROMPTED` then `PostToolUse` | The call ran after the prompt: approved (by anyone the host accepts, phone or terminal) |
-| `PROMPTED` then `PostToolUseFailure` | The call ran after the prompt and failed |
+| `PROMPTED` then `PostToolUse` | The same call ran while or after a prompt was open. That is consistent with an approval, but a denied prompt followed by the same call under an allow rule looks identical, so it is never reported as consent |
+| `PROMPTED` then `PostToolUseFailure` | The same call failed after a prompt was open |
 | `PostToolUse` with no earlier `PROMPTED` | The call ran without a prompt (an allow rule, a mode, or no ask rule matched) |
 
-Nothing here is evidence of consent by itself: a record says what the host did, never what the owner meant. Command text is stored only as a 200-character
-prefix and a hash; a value that looks like a secret assignment is cut before the prefix is taken.
+Nothing here is evidence of consent by itself: a record says what the host did, never what the owner meant. No command arguments, file paths or URLs are stored: only the
+program name (for a command), the tool name and a hash of the input.
 """
 import argparse
 import hashlib
@@ -28,7 +28,6 @@ from datetime import datetime, timezone
 
 PROMPT_EVENTS = {"PermissionRequest"}
 RESULT_EVENTS = {"PostToolUse", "PostToolUseFailure"}
-SECRET_RE = re.compile(r"(?i)(token|secret|password|passwd|api[_-]?key|authorization|bearer)\W{0,3}(?:\s*[=:]\s*|\s+)(?:bearer\s+|basic\s+)?[^\s\"']+")
 
 
 def now():
@@ -47,10 +46,12 @@ def input_key(tool_input):
 
 
 def preview(tool_input):
-    text = ""
-    if isinstance(tool_input, dict):
-        text = str(tool_input.get("command") or tool_input.get("file_path") or tool_input.get("url") or "")
-    return SECRET_RE.sub(lambda m: m.group(1) + "=<redacted>", text)[:200]
+    """Only the program name for a command, never its arguments: arguments can carry credentials and no redaction list is complete."""
+    if isinstance(tool_input, dict) and tool_input.get("command"):
+        words = str(tool_input["command"]).split()
+        if words and re.fullmatch(r"[A-Za-z0-9_./+-]{1,60}", os.path.basename(words[0])):
+            return os.path.basename(words[0])
+    return ""
 
 
 def sanitize(payload, at):
@@ -97,7 +98,7 @@ def report(rows, at):
             waiting = next((e for e in pending if e["result_at"] is None), None)
             if waiting is not None:
                 waiting["result_at"] = row["at"]
-                waiting["outcome"] = "EXECUTED_AFTER_PROMPT" if row["event"] == "PostToolUse" else "FAILED_AFTER_PROMPT"
+                waiting["outcome"] = "RAN_AFTER_OPEN_PROMPT" if row["event"] == "PostToolUse" else "FAILED_AFTER_OPEN_PROMPT"
             else:
                 out.append({"prompted_at": None, "session": row["session"], "tool": row["tool"], "key": row["key"], "preview": row["preview"],
                             "outcome": "RAN_WITHOUT_PROMPT", "result_at": row["at"]})
@@ -113,7 +114,7 @@ def main(argv=None, stdin=None):
     sub.add_parser("hook", help="record one hook event from stdin (default)")
     r = sub.add_parser("report")
     r.add_argument("--json", action="store_true")
-    r.add_argument("--only", choices=("PROMPTED_NO_RESULT", "EXECUTED_AFTER_PROMPT", "FAILED_AFTER_PROMPT", "RAN_WITHOUT_PROMPT"))
+    r.add_argument("--only", choices=("PROMPTED_NO_RESULT", "RAN_AFTER_OPEN_PROMPT", "FAILED_AFTER_OPEN_PROMPT", "RAN_WITHOUT_PROMPT"))
     args = ap.parse_args(argv)
     if args.cmd == "report":
         entries = report(read(observe_dir()), now())
