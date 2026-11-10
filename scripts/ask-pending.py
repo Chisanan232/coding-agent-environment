@@ -428,19 +428,38 @@ def gate_validator(settings, gate_cmd=None):
 
 
 def owner_answer_verifier(runner=None):
-    """Proof for a decision `answered`: ref `gh-comment:<owner/repo>:<comment id>` must be a comment by an owner made after the item was recorded."""
+    """Proof for a decision `answered`: ref `gh-comment:<owner/repo>:<comment id>`, read back and bound to this decision.
+
+    All must hold: the comment is in the item's own repo and on the item's own issue/PR; its body contains the item id; its author is a
+    recorded owner; it was made after the request; and its author is NOT the identity `gh` is authenticated as here (the agent can post
+    as that identity, so such a comment proves nothing). Any miss leaves the closure unverified.
+    """
     def verify(item, ref):
         m = re.fullmatch(r"gh-comment:((?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?:)[A-Za-z0-9_.-]+):([0-9]+)", ref or "")
         if not m:
             return ["ref is not a gh-comment:<owner/repo>:<id> reference"]
-        argv = ["gh", "api", f"repos/{m.group(1)}/issues/comments/{m.group(2)}", "--jq", "{login: .user.login, created_at: .created_at}"]
-        rc, out = (runner or _run_gate)(argv)
+        target_repo, _, target_number = item["target"].partition("#")
+        if m.group(1).lower() != target_repo.lower():
+            return ["the comment is not in the item's repo"]
+        run = runner or _run_gate
+        rc, out = run(["gh", "api", f"repos/{m.group(1)}/issues/comments/{m.group(2)}", "--jq",
+                       "{login: .user.login, created_at: .created_at, issue_url: .issue_url, body: .body}"])
         if rc is None or rc != 0:
             return ["the comment could not be read"]
-        owners = [o.strip().lower() for o in (item.get("owners") or item["target"].split("/")[0]).split(",") if o.strip()]
+        rc, me = run(["gh", "api", "user", "--jq", "{login: .login}"])
+        if rc is None or rc != 0 or not me.get("login"):
+            return ["the authenticated identity could not be read"]
+        owners = [o.strip().lower() for o in (item.get("owners") or target_repo.split("/")[0]).split(",") if o.strip()]
+        author = str(out.get("login", "")).lower()
         problems = []
-        if str(out.get("login", "")).lower() not in owners:
+        if author not in owners:
             problems.append("the comment is not by a recorded owner")
+        if author == str(me["login"]).lower():
+            problems.append("the comment is by the identity this session posts as, so it is not independent proof")
+        if not str(out.get("issue_url", "")).endswith(f"/repos/{target_repo}/issues/{target_number}"):
+            problems.append("the comment is not on the item's issue or PR")
+        if item["id"] not in str(out.get("body", "")):
+            problems.append("the comment does not name this decision's id")
         if str(out.get("created_at", "")) < item["created"]:
             problems.append("the comment predates the request")
         return problems
