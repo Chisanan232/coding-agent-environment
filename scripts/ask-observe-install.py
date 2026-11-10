@@ -189,6 +189,9 @@ def plan(args):
     raw_bytes, raw, live = load_settings(args.live)
     src, dest = Path(args.hook_src), Path(args.hook_dest)
     command = command_for(dest)
+    if not src.is_file():
+        print('REFUSING: cannot read the hook file %s' % src)
+        return 2
     hook_sha = rollout.sha(src)
     state = overall(live, command)
     print('live settings sha256 %s' % hr.sha_bytes(raw_bytes))
@@ -255,6 +258,7 @@ def apply(args):
         print(message)
         return 4
     backups.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(backups, 0o700)
     lock = hr.take_lock(backups)
     if lock is None:
         print('REFUSING: another apply holds the lock in %s' % backups)
@@ -281,26 +285,32 @@ def _apply_locked(live_p, dest, backups, raw_bytes, live_sha, hook_bytes, hook_s
     if live_p.read_bytes() != raw_bytes:
         print('REFUSING: the live file changed while the install was prepared; nothing was written')
         return 5
-    if dest_sha != hook_sha:
-        hr.install_bytes(dest, hook_bytes, 0o755)
     receipt_path = backups / ('ask-observe.receipt.%d.json' % stamp)
     if new_text is not None:
         receipt['settings_sha_after'] = hr.sha_bytes(new_text.encode())
-    # The receipt exists before settings change, so a failure after the replace is still reversible with `rollback`.
-    rollout.write_new(receipt_path, (json.dumps(receipt, indent=2) + '\n').encode(), 0o600)
-    if new_text is not None:
-        try:
-            hr.replace_if_unchanged(live_p, new_text.encode(), raw_bytes)
-        except BaseException as exc:
-            if receipt['hook_created'] and dest.exists():
-                dest.unlink()
-            elif receipt['hook_backup']:
-                hr.install_bytes(dest, Path(receipt['hook_backup']).read_bytes(), 0o755)
+
+    def undo():
+        if receipt['hook_created'] and dest.exists():
+            dest.unlink()
+        elif receipt['hook_backup']:
+            hr.install_bytes(dest, Path(receipt['hook_backup']).read_bytes(), 0o755)
+        if receipt_path.exists():
             receipt_path.unlink()
-            if isinstance(exc, hr.SettingsChanged):
-                print('REFUSING: the live file changed immediately before the write; the hook install was undone')
-                return 5
-            raise
+
+    try:
+        if dest_sha != hook_sha:
+            hr.install_bytes(dest, hook_bytes, 0o755)
+        # The receipt exists before settings change, so a failure after the replace is still reversible with `rollback`.
+        rollout.write_new(receipt_path, (json.dumps(receipt, indent=2) + '\n').encode(), 0o600)
+        if new_text is not None:
+            hr.replace_if_unchanged(live_p, new_text.encode(), raw_bytes)
+    except hr.SettingsChanged:
+        undo()
+        print('REFUSING: the live file changed immediately before the write; the hook install was undone')
+        return 5
+    except BaseException:
+        undo()
+        raise
     print('applied | receipt %s | rollback: python3 %s rollback --receipt %s' % (receipt_path, sys.argv[0], receipt_path))
     return 0
 
@@ -310,6 +320,9 @@ def verify(args):
     live = load_settings(live_p)[2]
     command = command_for(dest)
     problems = [f'{event}: {value}' for event, value in states(live, command).items() if value != 'installed']
+    if not args.expect_hook_sha and not Path(args.hook_src).is_file():
+        print('REFUSING: cannot read the hook file %s' % args.hook_src)
+        return 2
     expected = args.expect_hook_sha or rollout.sha(args.hook_src)
     if hr.redirected(dest):
         problems.append('hook destination is redirected by a symlink')
@@ -321,7 +334,7 @@ def verify(args):
         if not os.access(dest, os.X_OK):
             problems.append('hook file is not executable')
     if args.receipt:
-        receipt, bad = load_receipt(args.receipt)
+        receipt, bad = load_receipt(args.receipt, args.backup_dir)
         if bad:
             problems.append(bad)
         elif receipt.get('settings_backup'):
@@ -335,7 +348,7 @@ def verify(args):
 REQUIRED_RECEIPT_KEYS = ('live', 'command', 'hook_dest', 'hook_created', 'hook_sha_installed')
 
 
-def load_receipt(path):
+def load_receipt(path, backups=None):
     """Receipt dict, or a refusal string when it is missing, malformed or points at a path this tool would never have written."""
     try:
         receipt = json.loads(Path(path).read_text())
@@ -346,6 +359,9 @@ def load_receipt(path):
     problem = dest_problem(receipt['hook_dest'])
     if problem or not str(receipt['live']).startswith('/') or os.path.normpath(receipt['live']) != receipt['live']:
         return None, 'the receipt holds an unexpected path (%s)' % (problem or receipt['live'])
+    for key in ('hook_backup', 'settings_backup'):
+        if receipt.get(key) and backups is not None and Path(receipt[key]).parent != Path(backups):
+            return None, 'the receipt names a %s outside the backup directory' % key
     return receipt, None
 
 
@@ -353,7 +369,7 @@ def rollback(args):
     if not args.receipt:
         print('rollback needs --receipt')
         return 2
-    receipt, bad = load_receipt(args.receipt)
+    receipt, bad = load_receipt(args.receipt, args.backup_dir)
     if bad:
         print('REFUSING: %s' % bad)
         return 2
@@ -364,6 +380,7 @@ def rollback(args):
         return 4
     backups = Path(args.backup_dir)
     backups.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(backups, 0o700)
     lock = hr.take_lock(backups)
     if lock is None:
         print('REFUSING: another apply or rollback holds the lock in %s' % backups)
