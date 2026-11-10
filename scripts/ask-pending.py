@@ -34,7 +34,8 @@ LEASE_S = 1800  # a RESUMING item with no outcome for this long returns to PENDI
 PENDING, RESUMING, CONSUMED, DENIED, STALE, EXPIRED, CANCELLED = (
     "PENDING", "RESUMING", "CONSUMED", "DENIED", "STALE_HEAD", "EXPIRED", "CANCELLED")
 TERMINAL = {CONSUMED, DENIED, STALE, EXPIRED, CANCELLED}
-OUTCOMES = {"executed": CONSUMED, "denied": DENIED, "expired": EXPIRED, "failed": PENDING}
+OUTCOMES = {"executed": CONSUMED, "answered": CONSUMED, "denied": DENIED, "expired": EXPIRED, "failed": PENDING}
+SUBJECT_RE = re.compile(r"[^\x00-\x1f]{8,200}")
 HEAD_RE = re.compile(r"[0-9a-f]{40}")
 TARGET_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+")
 ID_RE = re.compile(r"[0-9a-f]{16}")
@@ -133,6 +134,7 @@ def view(item, at):
     out["past_grace"] = item["state"] == PENDING and age >= item["grace_s"]
     out["move_on"] = item["state"] == PENDING and age >= item["grace_s"]
     out["live_prompt"] = item["prompt"] == "live"
+    out["coordinator"] = item.get("coordinator")
     return out
 
 
@@ -164,7 +166,7 @@ def record(directory, action, target, head, deps, trigger, session_id, request_i
             return existing, True
         if existing is not None:
             # Same action, target and head is the same request: a duplicate is a no-op, a consumed one stays consumed.
-            receipt(directory, "duplicate_record", existing)
+            receipt(directory, "duplicate_record", existing, from_session=session_id or None)
             return existing, False
         live_open = [i for i in all_items(directory) if i["state"] in (PENDING, RESUMING)]
         if len(live_open) >= MAX_PENDING:
@@ -177,10 +179,55 @@ def record(directory, action, target, head, deps, trigger, session_id, request_i
                 receipt(directory, "superseded", old, new_head=head)
         item = {"id": key, "action": action, "target": target, "head": head, "dependencies": sorted(deps), "resume_trigger": trigger,
                 "session_id": session_id, "request_id": request_id or None, "prompt": prompt, "grace_s": grace_s,
+                "kind": "merge", "coordinator": session_id or None,
                 "created": iso(at), "state": PENDING, "resumes": 0, "owners": owners, "gate_args": list(gate_args), "settings": list(settings)}
         save(directory, item)
         receipt(directory, "recorded", item, prompt=prompt, request_id=request_id or None)
         return item, True
+
+
+def record_decision(directory, subject, target, session_id, deps, trigger, request_id, grace_s, prompt, at):
+    """A shared blocker that needs an owner decision (a Select or a credential/admin action), not a command.
+
+    One item per subject and target across every session that shares this ledger: the first session to record it coordinates the
+    owner action; a later session gets the same item back and must not open a second request for it. Nothing here approves anything.
+    """
+    if not SUBJECT_RE.fullmatch(subject) or not TARGET_RE.fullmatch(target) or not session_id:
+        raise AskError("a decision needs a stable subject (8-200 chars), a target owner/repo#N and the recording session id")
+    if trigger not in TRIGGERS or prompt not in PROMPTS:
+        raise AskError("unknown trigger or prompt value")
+    key = item_key("DECISION: " + subject, target, "decision")
+    with locked(directory):
+        try:
+            existing = load(directory, key)
+        except AskError:
+            existing = None
+        if existing is not None:
+            receipt(directory, "duplicate_decision", existing, from_session=session_id)
+            return existing, False
+        if len([i for i in all_items(directory) if i["state"] in (PENDING, RESUMING)]) >= MAX_PENDING:
+            raise AskError(f"{MAX_PENDING} items already pending")
+        item = {"id": key, "kind": "decision", "action": "DECISION: " + subject, "target": target, "head": "decision",
+                "dependencies": sorted(deps), "resume_trigger": trigger, "session_id": session_id, "coordinator": session_id,
+                "request_id": request_id or None, "prompt": prompt, "grace_s": max(0, min(int(grace_s), GRACE_MAX_S)),
+                "created": iso(at), "state": PENDING, "resumes": 0, "owners": "", "gate_args": [], "settings": []}
+        save(directory, item)
+        receipt(directory, "recorded_decision", item, prompt=prompt, request_id=request_id or None)
+        return item, True
+
+
+def takeover(directory, item_id, session_id, reason, at):
+    """Another session becomes the coordinator of an open item (the old one is gone or handed it over). Explicit and receipted."""
+    if not session_id or not reason.strip():
+        raise AskError("takeover needs the new session id and a reason")
+    with locked(directory):
+        item = load(directory, item_id)
+        if item["state"] in TERMINAL:
+            raise AskError(f"item already {item['state']}")
+        previous, item["coordinator"] = item.get("coordinator"), session_id
+        save(directory, item)
+        receipt(directory, "coordinator_changed", item, previous=previous, new=session_id, reason=reason[:200])
+        return item
 
 
 def _lease_expired(item, at):
@@ -227,6 +274,8 @@ def begin_resume(directory, item_id, current_head, validate, at, verify=None):
         raise AskError("--current-head must be the full 40-hex head read from GitHub; nothing was changed")
     with locked(directory):
         item = _recover(directory, load(directory, item_id), at)
+        if item.get("kind") == "decision":
+            raise AskError("a decision is answered by the owner on the original request; record the answer with finish --outcome answered")
         if item["state"] in TERMINAL:
             receipt(directory, "refused_terminal", item)
             raise AskError(f"item is {item['state']}: an approval is consumed once and a closed item is never resumed")
@@ -263,6 +312,16 @@ def finish(directory, item_id, outcome, ref, at, verify=None):
         if item["state"] in TERMINAL:
             receipt(directory, "duplicate_finish", item, outcome=outcome)
             raise AskError(f"item already {item['state']}: duplicate event ignored")
+        decision = item.get("kind") == "decision"
+        if outcome == "answered" and not decision or outcome in ("executed", "failed") and decision:
+            raise AskError(f"outcome {outcome} does not apply to a {'decision' if decision else 'merge'} item")
+        if decision:
+            if outcome == "answered" and not ref:
+                raise AskError("answered needs --ref: the durable record of the owner's answer (ticket comment, ADR, review)")
+            item["state"], item["closed"], item["outcome_ref"] = OUTCOMES[outcome], iso(at), ref or None
+            save(directory, item)
+            receipt(directory, "finished", item, outcome=outcome, ref=ref or None)
+            return item
         if item["state"] != RESUMING:
             raise AskError("only a RESUMING item can finish; run resume first")
         if outcome == "executed":
@@ -380,6 +439,19 @@ def main(argv=None):
     r.add_argument("--gate-version-policy", default="")
     r.add_argument("--gate-local-first-config", default="")
     r.add_argument("--grace-s", type=int, default=GRACE_MAX_S)
+    d = sub.add_parser("record-decision", help="record a shared owner-decision blocker (deduplicated across sessions)")
+    d.add_argument("--subject", required=True)
+    d.add_argument("--target", required=True)
+    d.add_argument("--session-id", required=True)
+    d.add_argument("--dep", action="append", default=[])
+    d.add_argument("--trigger", default="owner_approval", choices=sorted(TRIGGERS))
+    d.add_argument("--request-id", default="")
+    d.add_argument("--prompt", default="none", choices=sorted(PROMPTS))
+    d.add_argument("--grace-s", type=int, default=GRACE_MAX_S)
+    t = sub.add_parser("takeover", help="become the coordinator of an open item")
+    t.add_argument("--id", required=True)
+    t.add_argument("--session-id", required=True)
+    t.add_argument("--reason", required=True)
     l = sub.add_parser("list")
     l.add_argument("--json", action="store_true")
     rs = sub.add_parser("restart", help="mark live prompts unknown after a session restart")
@@ -405,6 +477,12 @@ def main(argv=None):
             item, created = record(directory, args.action, args.target, args.head, args.dep, args.trigger, args.session_id,
                                    args.request_id, args.grace_s, args.prompt, at, args.owners, gate_args, default_settings())
             print(json.dumps({"created": created, **view(item, at)}, sort_keys=True))
+        elif args.cmd == "record-decision":
+            item, created = record_decision(directory, args.subject, args.target, args.session_id, args.dep, args.trigger,
+                                            args.request_id, args.grace_s, args.prompt, at)
+            print(json.dumps({"created": created, "you_coordinate": item["coordinator"] == args.session_id, **view(item, at)}, sort_keys=True))
+        elif args.cmd == "takeover":
+            print(json.dumps(view(takeover(directory, args.id, args.session_id, args.reason, at), at), sort_keys=True))
         elif args.cmd == "list":
             items = [view(recovered_view(i, at), at) for i in all_items(directory, quiet=True)]
             open_items = [i for i in items if i["state"] in (PENDING, RESUMING)]
