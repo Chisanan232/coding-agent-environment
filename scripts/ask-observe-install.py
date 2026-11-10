@@ -7,6 +7,10 @@ Modes (nothing is written except by `apply` and `rollback`):
   verify    check the live install: each group present once, file hash, no permission rule changed
   rollback  remove exactly the four groups apply added (later unrelated edits to settings are kept)
 
+Exit codes: 0 ok, 1 verify problem, 2 refused (conflict, bad receipt, unreadable input), 3 pin mismatch, 4 symlink, 5 live file changed,
+7 hook file not merged, 8 reformat needed (--allow-reformat), 10 bad settings, 11 lock held, 12 bad --hook-dest.
+Use the newest receipt in the backup directory; apply on an already installed copy prints no new receipt.
+
 The hook only observes: it prints nothing and exits 0, so it can never allow, deny or ask. This installer adds
 no permission rule, changes no existing hook and key, and refuses when any of the four events already holds a different
 ask-observe entry. The change set is pinned by `--expect-change-sha` (the hash of the groups to add) and the hook
@@ -104,8 +108,11 @@ def with_hooks(live, command):
     return new
 
 
-def without_hooks(live, command):
-    """Copy of live with exactly our canonical groups removed; a list or a hooks object emptied by that removal is dropped."""
+def without_hooks(live, command, events_created=None, hooks_created=None):
+    """Copy of live with exactly our canonical groups removed.
+
+    An event list or the hooks object that apply created is dropped when removal empties it; one that existed before apply is
+    left as it was (possibly empty). With no receipt facts (None) every list emptied by the removal is dropped."""
     new = json.loads(json.dumps(live))
     hooks = new.get('hooks') or {}
     removed = False
@@ -114,9 +121,9 @@ def without_hooks(live, command):
         if groups and group_for(event, command) in groups:
             removed = True
             hooks[event] = [group for group in groups if group != group_for(event, command)]
-            if not hooks[event]:
+            if not hooks[event] and (events_created is None or event in events_created):
                 del hooks[event]
-    if removed and not hooks:
+    if removed and not hooks and (hooks_created is None or hooks_created):
         del new['hooks']
     return new
 
@@ -218,7 +225,11 @@ def apply(args):
     if state == 'conflict':
         print('REFUSING: some event already holds an ask-observe entry that is not exactly ours (or only some events do)')
         return 2
-    hook_bytes = src.read_bytes()
+    try:
+        hook_bytes = src.read_bytes()
+    except OSError as exc:
+        print('REFUSING: cannot read the hook file: %s' % exc)
+        return 2
     hook_sha, live_sha = hr.sha_bytes(hook_bytes), hr.sha_bytes(raw_bytes)
     dest_sha = rollout.sha(dest) if dest.exists() else None
     if state == 'installed' and dest_sha == hook_sha:
@@ -243,7 +254,7 @@ def apply(args):
     if message:
         print(message)
         return 4
-    backups.mkdir(parents=True, exist_ok=True)
+    backups.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = hr.take_lock(backups)
     if lock is None:
         print('REFUSING: another apply holds the lock in %s' % backups)
@@ -256,32 +267,40 @@ def apply(args):
 
 def _apply_locked(live_p, dest, backups, raw_bytes, live_sha, hook_bytes, hook_sha, dest_sha, new_text, command):
     stamp = time.time_ns()
+    before = json.loads(raw_bytes)
     receipt = {'schema': 1, 'live': str(live_p), 'command': command, 'settings_backup': None, 'settings_sha_before': live_sha,
-               'hook_dest': str(dest), 'hook_backup': None, 'hook_created': dest_sha is None, 'hook_sha_installed': hook_sha}
+               'hook_dest': str(dest), 'hook_backup': None, 'hook_created': dest_sha is None, 'hook_sha_installed': hook_sha,
+               'hooks_created': 'hooks' not in before,
+               'events_created': [event for event in EVENTS if event not in (before.get('hooks') or {})]}
     if new_text is not None:
         receipt['settings_backup'] = str(backups / ('settings.json.pre-SPE-170.%d' % stamp))
-        rollout.write_new(Path(receipt['settings_backup']), raw_bytes, live_p.stat().st_mode & 0o777)
+        rollout.write_new(Path(receipt['settings_backup']), raw_bytes, 0o600)
     if dest_sha is not None and dest_sha != hook_sha:
         receipt['hook_backup'] = str(backups / ('ask-observe.py.pre-SPE-170.%d' % stamp))
-        rollout.write_new(Path(receipt['hook_backup']), dest.read_bytes(), dest.stat().st_mode & 0o777)
+        rollout.write_new(Path(receipt['hook_backup']), dest.read_bytes(), 0o600)
     if live_p.read_bytes() != raw_bytes:
         print('REFUSING: the live file changed while the install was prepared; nothing was written')
         return 5
     if dest_sha != hook_sha:
         hr.install_bytes(dest, hook_bytes, 0o755)
+    receipt_path = backups / ('ask-observe.receipt.%d.json' % stamp)
+    if new_text is not None:
+        receipt['settings_sha_after'] = hr.sha_bytes(new_text.encode())
+    # The receipt exists before settings change, so a failure after the replace is still reversible with `rollback`.
+    rollout.write_new(receipt_path, (json.dumps(receipt, indent=2) + '\n').encode(), 0o600)
     if new_text is not None:
         try:
             hr.replace_if_unchanged(live_p, new_text.encode(), raw_bytes)
-        except hr.SettingsChanged:
+        except BaseException as exc:
             if receipt['hook_created'] and dest.exists():
                 dest.unlink()
             elif receipt['hook_backup']:
                 hr.install_bytes(dest, Path(receipt['hook_backup']).read_bytes(), 0o755)
-            print('REFUSING: the live file changed immediately before the write; the hook install was undone')
-            return 5
-        receipt['settings_sha_after'] = hr.sha_bytes(new_text.encode())
-    receipt_path = backups / ('ask-observe.receipt.%d.json' % stamp)
-    rollout.write_new(receipt_path, (json.dumps(receipt, indent=2) + '\n').encode(), 0o600)
+            receipt_path.unlink()
+            if isinstance(exc, hr.SettingsChanged):
+                print('REFUSING: the live file changed immediately before the write; the hook install was undone')
+                return 5
+            raise
     print('applied | receipt %s | rollback: python3 %s rollback --receipt %s' % (receipt_path, sys.argv[0], receipt_path))
     return 0
 
@@ -302,8 +321,10 @@ def verify(args):
         if not os.access(dest, os.X_OK):
             problems.append('hook file is not executable')
     if args.receipt:
-        receipt = json.loads(Path(args.receipt).read_text())
-        if receipt.get('settings_backup'):
+        receipt, bad = load_receipt(args.receipt)
+        if bad:
+            problems.append(bad)
+        elif receipt.get('settings_backup'):
             before = json.loads(Path(receipt['settings_backup']).read_text())
             if (live.get('permissions') or {}) != (before.get('permissions') or {}):
                 problems.append('permissions differ from the pre-apply backup')
@@ -311,16 +332,49 @@ def verify(args):
     return 1 if problems else 0
 
 
+REQUIRED_RECEIPT_KEYS = ('live', 'command', 'hook_dest', 'hook_created', 'hook_sha_installed')
+
+
+def load_receipt(path):
+    """Receipt dict, or a refusal string when it is missing, malformed or points at a path this tool would never have written."""
+    try:
+        receipt = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as exc:
+        return None, 'cannot read the receipt: %s' % exc
+    if not isinstance(receipt, dict) or any(key not in receipt for key in REQUIRED_RECEIPT_KEYS):
+        return None, 'the receipt is malformed'
+    problem = dest_problem(receipt['hook_dest'])
+    if problem or not str(receipt['live']).startswith('/') or os.path.normpath(receipt['live']) != receipt['live']:
+        return None, 'the receipt holds an unexpected path (%s)' % (problem or receipt['live'])
+    return receipt, None
+
+
 def rollback(args):
     if not args.receipt:
         print('rollback needs --receipt')
         return 2
-    receipt = json.loads(Path(args.receipt).read_text())
+    receipt, bad = load_receipt(args.receipt)
+    if bad:
+        print('REFUSING: %s' % bad)
+        return 2
     live_p, dest = Path(receipt['live']), Path(receipt['hook_dest'])
     message = hr.redirected(live_p, dest)
     if message:
         print(message)
         return 4
+    backups = Path(args.backup_dir)
+    backups.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock = hr.take_lock(backups)
+    if lock is None:
+        print('REFUSING: another apply or rollback holds the lock in %s' % backups)
+        return 11
+    try:
+        return _rollback_locked(args, receipt, live_p, dest)
+    finally:
+        os.close(lock)
+
+
+def _rollback_locked(args, receipt, live_p, dest):
     command = receipt['command']
     raw_bytes, raw, live = load_settings(live_p)
     present = [event for event, value in states(live, command).items() if value == 'installed']
@@ -328,9 +382,12 @@ def rollback(args):
         print('REFUSING: an ask-observe entry that apply did not write is present; remove it by hand')
         return 2
     if present:
-        new_text = hr.serialise(without_hooks(live, command), raw)
+        if hr.serialise(live, raw) != raw and not args.allow_reformat:
+            print('REFUSING: re-serialising the settings would change unrelated formatting; pass --allow-reformat')
+            return 8
+        new_text = hr.serialise(without_hooks(live, command, receipt.get('events_created'), receipt.get('hooks_created')), raw)
         saved = live_p.with_name('%s.pre-rollback.%d' % (live_p.name, time.time_ns()))
-        rollout.write_new(saved, raw_bytes, live_p.stat().st_mode & 0o777)
+        rollout.write_new(saved, raw_bytes, 0o600)
         print('current settings saved to %s' % saved)
         try:
             hr.replace_if_unchanged(live_p, new_text.encode(), raw_bytes)
