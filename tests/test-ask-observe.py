@@ -63,13 +63,24 @@ class Observe(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
         self.assertIsNone(self.rows()[0]['tool_use_id'])
 
-    def test_secret_assignments_are_cut_from_the_preview(self):
-        self.hook('PermissionRequest', tool_input={'command': 'curl -H "Authorization: Bearer abc123" https://x'})
-        self.assertNotIn('abc123', self.rows()[0]['preview'])
+    def test_no_argument_text_is_persisted_so_no_secret_shape_can_leak(self):
+        secrets = ['postgresql://app:Hunter2pw@db/x', 'ghp_ABCDEF0123456789abcdef', 'sk-live-0123456789', 'AKIA0123456789ABCDEF',
+                   'Authorization: Bearer abc123', 'GITHUB_PAT=zzz999', 'plain-password-value']
+        for secret in secrets:
+            self.hook('PermissionRequest', tool_input={'command': f'psql {secret}'})
+            self.hook('PostToolUse', tool_input={'command': f'export X={secret}'})
+            self.hook('PermissionRequest', tool_input={'file_path': f'/tmp/{secret}', 'url': f'https://u:{secret}@h/'})
+        raw = Path(ao.observe_dir(), 'events.jsonl').read_text()
+        for secret in secrets:
+            self.assertNotIn(secret, raw)
+        for row in self.rows():
+            self.assertIn(row['preview'], ('psql', 'export', ''))
 
-    def test_preview_is_bounded(self):
-        self.hook('PermissionRequest', tool_input={'command': 'x' * 5000})
-        self.assertEqual(len(self.rows()[0]['preview']), 200)
+    def test_the_preview_is_only_the_program_name(self):
+        self.hook('PermissionRequest', tool_input={'command': '/usr/bin/git ' + 'x' * 5000})
+        self.assertEqual(self.rows()[0]['preview'], 'git')
+        self.hook('PermissionRequest', tool_input={'command': 'weird;name --x'})
+        self.assertEqual(self.rows()[1]['preview'], '')
 
 
 class Report(unittest.TestCase):
@@ -83,7 +94,7 @@ class Report(unittest.TestCase):
 
     def test_prompt_then_result_is_executed_after_prompt(self):
         rows = [self.row('PermissionRequest', '2026-11-10T02:00:00Z'), self.row('PostToolUse', '2026-11-10T02:30:00Z')]
-        self.assertEqual(ao.report(rows, '2026-11-10T03:00:00Z')[0]['outcome'], 'EXECUTED_AFTER_PROMPT')
+        self.assertEqual(ao.report(rows, '2026-11-10T03:00:00Z')[0]['outcome'], 'RAN_AFTER_OPEN_PROMPT')
 
     def test_result_for_a_different_command_never_closes_the_prompt(self):
         rows = [self.row('PermissionRequest', '2026-11-10T02:00:00Z'), self.row('PostToolUse', '2026-11-10T02:01:00Z', OTHER)]
@@ -98,14 +109,14 @@ class Report(unittest.TestCase):
         rows = [self.row('PermissionRequest', '2026-11-10T02:00:00Z'), self.row('PermissionRequest', '2026-11-10T02:00:05Z'),
                 self.row('PostToolUse', '2026-11-10T02:01:00Z'), self.row('PostToolUse', '2026-11-10T02:01:00Z')]
         outcomes = [e['outcome'] for e in ao.report(rows, '2026-11-10T02:02:00Z')]
-        self.assertEqual(outcomes, ['EXECUTED_AFTER_PROMPT', 'EXECUTED_AFTER_PROMPT'])
+        self.assertEqual(outcomes, ['RAN_AFTER_OPEN_PROMPT', 'RAN_AFTER_OPEN_PROMPT'])
         self.assertEqual(len(outcomes), 2)
 
     def test_failure_after_prompt_and_unprompted_run_are_distinguished(self):
         rows = [self.row('PermissionRequest', '2026-11-10T02:00:00Z'), self.row('PostToolUseFailure', '2026-11-10T02:01:00Z'),
                 self.row('PostToolUse', '2026-11-10T02:03:00Z', OTHER)]
         outcomes = [e['outcome'] for e in ao.report(rows, '2026-11-10T02:04:00Z')]
-        self.assertEqual(outcomes, ['FAILED_AFTER_PROMPT', 'RAN_WITHOUT_PROMPT'])
+        self.assertEqual(outcomes, ['FAILED_AFTER_OPEN_PROMPT', 'RAN_WITHOUT_PROMPT'])
 
 
 class NoDecisionPath(unittest.TestCase):

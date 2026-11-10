@@ -254,7 +254,7 @@ class Resume(Env):
 
     def test_cancel_is_terminal(self):
         a, _ = self.rec(7)
-        ap.cancel(self.dir, a['id'], 'superseded by owner', T0)
+        ap.cancel(self.dir, a['id'], 'superseded by owner', T0, 'sess-1')
         with self.assertRaises(ap.AskError):
             self.resume(a['id'], HEAD1, T0)
 
@@ -356,7 +356,7 @@ class ReviewHardening(Env):
         Path(self.scn).write_text(json.dumps({'7': {'out': {'verdict': 'PASS', 'head': HEAD1, 'merge_command': runner}}}))
         with self.assertRaisesRegex(ap.AskError, 'differs from the recorded action'):
             self.resume(a['id'], HEAD1, T0)
-        ap.cancel(self.dir, a['id'], 'executor changed', T0)
+        ap.cancel(self.dir, a['id'], 'executor changed', T0, 'sess-1')
         again, created = ap.record(self.dir, runner, 'o/r#7', HEAD1, [], 'owner_approval', 's', '', 900, 'none', T0)
         self.assertTrue(created)
 
@@ -521,24 +521,91 @@ class SharedBlockers(Env):
         with self.assertRaisesRegex(ap.AskError, 'answered by the owner'):
             self.resume(item['id'], HEAD1, T0)
         with self.assertRaisesRegex(ap.AskError, 'does not apply'):
-            self.finish(item['id'], 'executed', 'ref')
+            ap.finish(self.dir, item['id'], 'executed', 'ref', T0, lambda _i: [], 'sess-A')
 
-    def test_answered_needs_a_durable_reference_and_closes_it_once(self):
+    def close(self, item_id, outcome='answered', ref='gh-comment:o/r:42', session='sess-A', problems=()):
+        return ap.finish(self.dir, item_id, outcome, ref, T0, None, session, lambda _i, _r: list(problems))
+
+    def test_only_the_coordinator_closes_a_decision(self):
+        item, _ = self.decide('sess-A')
+        with self.assertRaisesRegex(ap.AskError, 'only the coordinating session'):
+            self.close(item['id'], session='sess-B')
+        with self.assertRaisesRegex(ap.AskError, 'only the coordinating session'):
+            self.close(item['id'], session='')
+        self.assertEqual(self.state(item['id']), 'PENDING')
+
+    def test_answered_needs_a_reference_and_a_verified_one_suppresses_re_asks(self):
         item, _ = self.decide('sess-A')
         with self.assertRaisesRegex(ap.AskError, 'needs --ref'):
-            self.finish(item['id'], 'answered', '')
-        self.assertEqual(self.finish(item['id'], 'answered', 'SPE-170 comment 1')['state'], 'CONSUMED')
+            self.close(item['id'], ref='')
+        done = self.close(item['id'])
+        self.assertEqual((done['state'], done['verified']), ('CONSUMED', True))
+        again, created = self.decide('sess-C')
+        self.assertFalse(created)  # a verified owner answer is not asked for again
         with self.assertRaises(ap.AskError):
-            self.finish(item['id'], 'answered', 'SPE-170 comment 1')
+            self.close(item['id'])
 
-    def test_denied_is_terminal_for_a_decision_too(self):
+    def test_an_unverified_closure_does_not_suppress_the_owner_request_for_other_sessions(self):
         item, _ = self.decide('sess-A')
-        self.assertEqual(self.finish(item['id'], 'denied', 'owner declined')['state'], 'DENIED')
+        done = self.close(item['id'], ref='my own say-so', problems=['unverifiable reference'])
+        self.assertEqual((done['state'], done['verified']), ('CONSUMED', False))
+        again, created = self.decide('sess-C')
+        self.assertTrue(created)
+        self.assertEqual((again['state'], again['coordinator'], again['generation']), ('PENDING', 'sess-C', 1))
+        events = [json.loads(l)['event'] for l in Path(self.dir, 'receipts.jsonl').read_text().splitlines()]
+        self.assertIn('reopened_unverified_closure', events)
 
-    def test_a_merge_item_cannot_be_answered(self):
+    def test_denied_and_expired_decisions_are_unverified_and_reopen(self):
+        for outcome in ('denied', 'expired'):
+            item, _ = self.decide('sess-A', subject=f'subject for {outcome} case')
+            self.assertFalse(self.close(item['id'], outcome=outcome, ref='')['verified'])
+            self.assertTrue(self.decide('sess-B', subject=f'subject for {outcome} case')[1])
+
+    def test_owner_answer_verifier_accepts_only_an_owner_comment_after_the_request(self):
+        item, _ = self.decide('sess-A')
+        ok = lambda out: (lambda argv: (0, out))  # noqa: E731
+        good = {'login': 'O', 'created_at': '2026-11-10T03:00:00Z'}
+        self.assertEqual(ap.owner_answer_verifier(ok(good))(item, 'gh-comment:o/r:42'), [])
+        self.assertTrue(ap.owner_answer_verifier(ok({'login': 'someone-else', 'created_at': good['created_at']}))(item, 'gh-comment:o/r:42'))
+        self.assertTrue(ap.owner_answer_verifier(ok({'login': 'o', 'created_at': '2026-11-09T00:00:00Z'}))(item, 'gh-comment:o/r:42'))
+        self.assertTrue(ap.owner_answer_verifier(lambda argv: (None, {'error': 'X'}))(item, 'gh-comment:o/r:42'))
+        for bad in ('', 'SPE-170 comment 1', 'gh-comment:o/r:abc', 'gh-comment:../x:1'):
+            self.assertTrue(ap.owner_answer_verifier(ok(good))(item, bad))
+
+    def test_the_verifier_reads_one_comment_and_nothing_else(self):
+        item, _ = self.decide('sess-A')
+        seen = []
+        ap.owner_answer_verifier(lambda argv: (seen.append(argv), (0, {'login': 'o', 'created_at': '2026-11-10T03:00:00Z'}))[1])(item, 'gh-comment:o/r:42')
+        self.assertEqual(seen[0][:3], ['gh', 'api', 'repos/o/r/issues/comments/42'])
+        self.assertNotIn('--method', seen[0])
+
+    def test_cancel_is_coordinator_only(self):
         a, _ = self.rec(7)
-        with self.assertRaisesRegex(ap.AskError, 'does not apply'):
-            self.finish(a['id'], 'answered', 'x')
+        with self.assertRaisesRegex(ap.AskError, 'only the coordinating session'):
+            ap.cancel(self.dir, a['id'], 'x', T0, 'sess-other')
+        with self.assertRaises(ap.AskError):
+            ap.cancel(self.dir, a['id'], 'x', T0, None)
+        self.assertEqual(self.state(a['id']), 'PENDING')
+
+    def test_a_new_head_from_another_session_does_not_flip_this_sessions_item(self):
+        old, _ = self.rec(7, head=HEAD1)
+        ap.record(self.dir, MERGE.format(pr=7, head=HEAD2), 'o/r#7', HEAD2, [], 'owner_approval', 'sess-other', '', 900, 'none', T0)
+        self.assertEqual(self.state(old['id']), 'PENDING')
+
+    def test_one_session_cannot_fill_the_ledger_for_the_others(self):
+        for n in range(ap.MAX_PENDING):
+            self.decide('sess-A', subject=f'blocker number {n:03d} here')
+        with self.assertRaisesRegex(ap.AskError, 'already coordinates'):
+            self.decide('sess-A', subject='one blocker too many here')
+        self.assertTrue(self.decide('sess-B', subject='another session still works')[1])
+
+    def test_a_lapsed_lease_flags_a_possible_duplicate_handback(self):
+        a, _ = self.rec(7)
+        self.set_gate({7: HEAD1})
+        self.resume(a['id'], HEAD1, T0)
+        later = T0 + timedelta(seconds=ap.LEASE_S + 1)
+        item = ap.begin_resume(self.dir, a['id'], HEAD1, self.validator(), later, lambda _i: ['not merged'])
+        self.assertTrue(item['possible_duplicate_handback'])
 
     def test_takeover_is_explicit_receipted_and_not_for_closed_items(self):
         item, _ = self.decide('sess-A')
@@ -548,9 +615,14 @@ class SharedBlockers(Env):
         self.assertEqual(events[-1]['event'], 'coordinator_changed')
         with self.assertRaises(ap.AskError):
             ap.takeover(self.dir, item['id'], 'sess-B', '', T0)
-        self.finish(item['id'], 'denied', 'x')
+        self.close(item['id'], outcome='denied', ref='', session='sess-B')
         with self.assertRaises(ap.AskError):
             ap.takeover(self.dir, item['id'], 'sess-C', 'late', T0)
+
+    def test_a_merge_item_cannot_be_answered(self):
+        a, _ = self.rec(7)
+        with self.assertRaisesRegex(ap.AskError, 'does not apply'):
+            ap.finish(self.dir, a['id'], 'answered', 'x', T0, None, 'sess-1')
 
     def test_decision_needs_subject_target_and_session(self):
         for kw in ({'subject': 'short'}, {'target': 'not-a-target'}):
@@ -638,7 +710,7 @@ class NoSelfAuthorization(unittest.TestCase):
     def test_the_only_subprocess_is_the_gate(self):
         text = (ROOT / 'scripts/ask-pending.py').read_text()
         self.assertEqual(text.count('subprocess.run('), 1)  # _run_gate: check and verify only
-        self.assertNotIn('"gh"', text)  # the ledger never builds or runs a gh command itself
+        self.assertNotIn('"pr", "merge"', text)  # the ledger never builds or runs a merge; its only gh use is a read-only comment lookup
 
 
 if __name__ == '__main__':
