@@ -36,6 +36,7 @@ PENDING, RESUMING, CONSUMED, DENIED, STALE, EXPIRED, CANCELLED = (
     "PENDING", "RESUMING", "CONSUMED", "DENIED", "STALE_HEAD", "EXPIRED", "CANCELLED")
 TERMINAL = {CONSUMED, DENIED, STALE, EXPIRED, CANCELLED}
 OUTCOMES = {"executed": CONSUMED, "answered": CONSUMED, "denied": DENIED, "expired": EXPIRED, "failed": PENDING}
+SESSION_RE = re.compile(r"[A-Za-z0-9_.:-]{1,80}")
 SUBJECT_RE = re.compile(r"[^\x00-\x1f]{8,200}")
 HEAD_RE = re.compile(r"[0-9a-f]{40}")
 TARGET_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+")
@@ -149,8 +150,10 @@ def view(item, at):
 # --- transitions -------------------------------------------------------------------------------------------------------
 
 def record(directory, action, target, head, deps, trigger, session_id, request_id, grace_s, prompt, at, owners="", gate_args=(), settings=()):
-    if not session_id:
-        raise AskError("a session id is required: the recording session coordinates the item")
+    if not SESSION_RE.fullmatch(session_id or ""):
+        raise AskError("a session id of 1-80 characters [A-Za-z0-9_.:-] is required: the recording session coordinates the item")
+    if len(action) > 500 or any(ord(c) < 32 for c in action) or len(owners) > 200 or len(deps) > 20 or any(len(d) > 200 for d in deps):
+        raise AskError("action (500), owners (200) and dependencies (20 x 200) are bounded and may not hold control characters")
     if not action.strip() or not TARGET_RE.fullmatch(target) or not HEAD_RE.fullmatch(head):
         raise AskError("action, a target of the form owner/repo#N and a full 40-hex head sha are required")
     if target.split("#")[0] not in action or head not in action:
@@ -213,7 +216,7 @@ def record_decision(directory, subject, target, session_id, deps, trigger, reque
     owner action; a later session gets the same item back and must not open a second request for it. Nothing here approves anything.
     """
     subject = subject.strip()
-    if not SUBJECT_RE.fullmatch(subject) or not TARGET_RE.fullmatch(target) or not session_id:
+    if not SUBJECT_RE.fullmatch(subject) or not TARGET_RE.fullmatch(target) or not SESSION_RE.fullmatch(session_id or ""):
         raise AskError("a decision needs a stable subject (8-200 chars), a target owner/repo#N and the recording session id")
     if trigger not in TRIGGERS or prompt not in PROMPTS:
         raise AskError("unknown trigger or prompt value")
@@ -331,7 +334,7 @@ def begin_resume(directory, item_id, current_head, validate, at, verify=None):
             receipt(directory, "revalidation_failed", item, problems=problems)
             raise AskError("revalidation failed: " + "; ".join(problems))
         item["state"], item["lease_at"], item["resumes"] = RESUMING, iso(at), item["resumes"] + 1
-        item["prompt"] = "none"
+        item["prompt"] = "unknown"  # the host prompt for the handed-back command opens next; its state is not observable here
         save(directory, item)
         receipt(directory, "resuming", item)
         return item
@@ -341,7 +344,7 @@ def finish(directory, item_id, outcome, ref, at, verify=None, session_id=None, v
     if outcome not in OUTCOMES:
         raise AskError("outcome must be one of " + ", ".join(sorted(OUTCOMES)))
     with locked(directory):
-        item = load(directory, item_id)
+        item = _recover(directory, load(directory, item_id), at) if outcome != "executed" else load(directory, item_id)
         if item["state"] in TERMINAL:
             receipt(directory, "duplicate_finish", item, outcome=outcome)
             raise AskError(f"item already {item['state']}: duplicate event ignored")
@@ -385,7 +388,7 @@ def finish(directory, item_id, outcome, ref, at, verify=None, session_id=None, v
 
 def cancel(directory, item_id, reason, at, session_id=None):
     with locked(directory):
-        item = load(directory, item_id)
+        item = _recover(directory, load(directory, item_id), at)
         if item["state"] in TERMINAL:
             raise AskError(f"item already {item['state']}")
         if item.get("coordinator") and session_id != item["coordinator"]:
@@ -595,6 +598,9 @@ def main(argv=None):
             layers = item.get("settings") or default_settings()
             if args.settings and sorted(args.settings) != sorted(layers):
                 raise AskError("--settings differs from the layers recorded with the item; record a new request instead")
+            if item.get("settings") and sorted(default_settings()) != sorted(layers):
+                raise AskError("the settings layers present here differ from those recorded (a layer appeared, vanished, or this is another directory); "
+                               "resume from the recording directory or record a new request")
             item = begin_resume(directory, args.id, args.current_head, gate_validator(layers), at, merge_verifier())
             print(json.dumps({"run_exactly": item["action"], "id": item["id"], "gate_options_used": item.get("gate_args") or [],
                               "note": "state any gate_options_used when asking: the host prompt shows only the command"}))
