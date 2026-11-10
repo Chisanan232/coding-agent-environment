@@ -48,17 +48,30 @@ MAX_BYTES = 1_000_000
 
 
 def _key_secret(directory):
-    """Per-install random key so an input hash cannot be brute-forced from the file alone."""
+    """Per-install random key so an input hash cannot be brute-forced from the file alone (the key sits beside the log, so this
+    only protects a reader of the log file by itself). Created by linking a complete temp file into place: a concurrent hook
+    can never read a half-written key."""
     path = os.path.join(directory, ".hmac-key")
-    try:
-        with open(path, "rb") as fh:
-            return fh.read()
-    except OSError:
-        key = os.urandom(32)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    for _ in range(2):
+        try:
+            with open(path, "rb") as fh:
+                key = fh.read()
+            if len(key) == 32:
+                return key
+        except OSError:
+            pass
+        tmp = os.path.join(directory, f".hmac-key.{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as fh:
-            fh.write(key)
-        return key
+            fh.write(os.urandom(32))
+        try:
+            os.link(tmp, path)  # fails if another hook won the race; then the loop re-reads theirs
+        except FileExistsError:
+            pass
+        finally:
+            os.unlink(tmp)
+    with open(path, "rb") as fh:
+        return fh.read()
 
 
 def input_key(tool_input, directory=None):
