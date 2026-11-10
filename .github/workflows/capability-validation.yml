@@ -42,6 +42,8 @@ on:
       - 'tests/test-ask-pending.py'
       - 'scripts/ask-observe.py'
       - 'tests/test-ask-observe.py'
+      - 'scripts/ask-observe-install.py'
+      - 'tests/test-ask-observe-install.py'
       - 'docs/NONBLOCKING-ASK.md'
       - 'tests/test-owner-merge-runner.py'
       - 'tests/test-branch-protection-rollout.py'
@@ -132,6 +134,7 @@ jobs:
           python3 tests/test-owner-merge-autonomy.py
           python3 tests/test-ask-pending.py
           python3 tests/test-ask-observe.py
+          python3 tests/test-ask-observe-install.py
           python3 tests/test-owner-merge-runner.py
           python3 tests/test-branch-protection-rollout.py
           python3 tests/test-routing-eval.py
