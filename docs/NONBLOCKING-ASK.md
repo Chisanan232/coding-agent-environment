@@ -22,7 +22,7 @@ criterion below is verified on the real host path (Claude Code Remote Control on
 | A10 | A host mode that cannot support a criterion is reported by criterion; a notification-only flow is never marked complete | Applies to this page: **the feature is NOT complete** |
 
 What exists today (PR #217) is only the **safety layer** behind A7 and A9: a ledger that records the exact action, target, head, dependencies, host request id and
-resume trigger, revalidates the exact head and the owner-merge gate before a resume, hands the action back once, and handles denial, expiry, changed head,
+resume trigger, revalidates the exact head and the owner-merge gate before a resume, hands the action back at most once per lease (a lapsed lease after a crash can produce a second hand-back, which is flagged `possible_duplicate_handback`), and handles denial, expiry, changed head,
 duplicate and restart. It is **not** an approval channel, and a pending-list entry is not an approval prompt. The live prompt itself is the host's.
 
 ## Before opening an ASK (triage)
@@ -37,7 +37,7 @@ sudo action, release authorization) or a **material product, security, cost or r
 4. **Ask only for the decision that remains**, with the evidence and the impact of each option (what happens on Approve, on Deny, on each Select choice), as one
    request. Never bundle several questions or ask what the code or an existing ADR already settles.
 5. **Deduplicate across sessions.** Before asking, `ask-pending.py list`; a blocker already recorded (same merge action, or same decision subject and target) belongs to its
-   **coordinator** session. Do not open a second request; record your dependency and keep working. Use `record-decision` for non-command blockers: the first session to
+   **coordinator** session. Do not open a second request (this is a convention the ledger makes visible, not a lock: nothing technical stops another session from raising its own host prompt, and the ledger cannot see one); record your dependency and keep working. Use `record-decision` for non-command blockers: the first session to
    record it coordinates the one owner action, a later session gets the same item (`created: false`). `takeover` moves coordination only explicitly and is receipted.
 
 For a genuine owner decision the original clickable Approve, Deny or Select request stays available (never withdrawn, reworded or converted to a text question), and
@@ -77,9 +77,9 @@ no settings edit, no new allow, and no hook that answers a prompt.
 ## Observation instrument (owner installs; never decides)
 
 `scripts/ask-observe.py` is a non-deciding hook (example: `docs/examples/ask-observe-hooks.example.json`) for `PermissionRequest`, `PostToolUse`, `PostToolUseFailure`
-and `Notification permission_prompt`. It prints nothing and exits 0, so the host prompt is untouched, and it records a sanitized line per event.
-`ask-observe.py report` shows each prompt as `PROMPTED_NO_RESULT` (pending, denied or expired: the documented events do not say which), `EXECUTED_AFTER_PROMPT`,
-`FAILED_AFTER_PROMPT` or `RAN_WITHOUT_PROMPT`. Without it nothing in this repository can tell whether a prompt was raised at all. Editing `~/.claude/settings.json`
+and `Notification permission_prompt`. It prints nothing and exits 0, so the host prompt is untouched, and it records a line per event holding only the tool name, the program name for a command and a hash of the input (never arguments, paths or URLs, so no credential can reach the file).
+`ask-observe.py report` shows each prompt as `PROMPTED_NO_RESULT` (pending, denied or expired: the documented events do not say which), `RAN_AFTER_OPEN_PROMPT`,
+`FAILED_AFTER_OPEN_PROMPT` or `RAN_WITHOUT_PROMPT` (the same call ran while or after a prompt was open: consistent with an approval, but a denied prompt followed by the same call under an allow rule looks identical, so it is never reported as consent). Without it nothing in this repository can tell whether a prompt was raised at all. Editing `~/.claude/settings.json`
 is an owner action; this branch does not do it.
 
 ## Live results so far (2026-11-10, this Mac, session in `auto` mode)
@@ -109,7 +109,7 @@ minute"**. Neither left a prompt open for 15 minutes. Criteria A1, A3, A5, A6 an
 2. The root launches one background lane per scenario (A: approve, B: deny, C: a second request for a different pinned head) with a harmless ask-ruled command whose
    text carries a distinct marker, records each in the ledger with `--prompt live`, and keeps doing independent authorized work, logging timestamps.
 3. Past 15 minutes nothing is done to the prompts. The owner taps Approve on A's original prompt and Deny on B's. `ask-observe.py report` must show A
-   `EXECUTED_AFTER_PROMPT` and B without an execution, and C must not have run.
+   `RAN_AFTER_OPEN_PROMPT` and B without an execution, and C must not have run.
 4. Select is a root-only `AskUserQuestion`; background lanes keep working while the root waits on it.
 5. Expiry, a changed head and a duplicate event are covered by `tests/test-ask-pending.py`; live, the pinned `--match-head-commit` makes a stale approval fail at GitHub.
 
@@ -127,7 +127,7 @@ action, target and head, so a repeated request is the same item.
 | `request_id` | Host-supplied identifier or `null` |
 | `prompt` | `live` (a host prompt is open now), `none`, or `unknown` (after a restart or a crashed resume). A pending item is a record; a live prompt is a different fact |
 | `state` | `PENDING`, `RESUMING`, then `CONSUMED`, `DENIED`, `EXPIRED`, `STALE_HEAD`, `CANCELLED` |
-| `kind`, `coordinator` | `merge` (an exact command, revalidated by the gate) or `decision` (a shared owner-decision blocker, answered on the original request and closed with `finish --outcome answered --ref <durable record>`); the first recording session coordinates and a duplicate record from another session returns the same item |
+| `kind`, `coordinator` | `merge` (an exact command, revalidated by the gate) or `decision` (a shared owner-decision blocker, answered on the original request). Only the coordinating session closes it. `finish --outcome answered --ref gh-comment:<owner/repo>:<id>` is **verified** by reading that GitHub comment (must be by a recorded owner and newer than the request); any other closure (denied, expired, an unverifiable ref) is the coordinator's own word, closes only that session's wait, and a later `record-decision` for the subject reopens the request (generation +1) instead of suppressing it. `cancel` is coordinator-only as well; `takeover` is the explicit, receipted way another session coordinates; the first recording session coordinates and a duplicate record from another session returns the same item |
 
 Commands: `record`, `record-decision`, `takeover`, `list [--json]`, `restart --session-id`, `resume --id --current-head`, `finish --id --outcome executed|denied|expired|failed [--ref]`, `cancel`.
 There is deliberately no `approve` command: the ledger cannot authorize anything.
@@ -137,7 +137,7 @@ There is deliberately no `approve` command: the ledger cannot authorize anything
 - Resume revalidation is the owner-merge gate, so the ledger covers **merge ASKs** (the direct `gh pr merge` or the runner command the gate prints). Another kind of ASK can be recorded as a note but has no revalidation and is out of scope here.
 - `dependencies` and `resume_trigger` are recorded for the main agent's task graph; the ledger does not evaluate them. Resume is always an explicit call.
 - If the gate's preferred executor changes (for example the runner is installed after a direct item was recorded), the old item is refused as "differs from the recorded action"; cancel it and record the new action.
-- At most 20 items can be open; the 21st `record` is refused with an explicit error. `list` is read-only (it writes neither items nor receipts); only `resume` recovers a lapsed lease.
+- At most 20 items can be open per coordinating session (200 in the ledger); the next `record` is refused with an explicit error, and one session cannot fill the ledger for the others. `list` is read-only (it writes neither items nor receipts); only `resume` recovers a lapsed lease.
 - `prompt` is `none` while an item is `RESUMING`; the host prompt for the handed-back command is a separate, immediate event.
 
 - **Trust boundary.** The ledger is not tamper-evident: an agent with a shell can edit the JSON under the state directory, and `finish --outcome denied|expired|failed` and `cancel` take the caller's word. That can at worst keep an ASK from being resumed (a closed item, a reopened-after-stale item, or a re-recorded one); it can never approve or execute anything, because resume still needs the real gate PASS and the host's own answer. `executed` is the only outcome that needs outside proof (gate `verify`).
