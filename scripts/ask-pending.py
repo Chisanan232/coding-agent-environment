@@ -142,6 +142,8 @@ def view(item, at):
 # --- transitions -------------------------------------------------------------------------------------------------------
 
 def record(directory, action, target, head, deps, trigger, session_id, request_id, grace_s, prompt, at, owners="", gate_args=(), settings=()):
+    if not session_id:
+        raise AskError("a session id is required: the recording session coordinates the item")
     if not action.strip() or not TARGET_RE.fullmatch(target) or not HEAD_RE.fullmatch(head):
         raise AskError("action, a target of the form owner/repo#N and a full 40-hex head sha are required")
     if target.split("#")[0] not in action or head not in action:
@@ -155,15 +157,16 @@ def record(directory, action, target, head, deps, trigger, session_id, request_i
             existing = load(directory, key)
         except AskError:
             existing = None
-        if existing is not None and existing["state"] == STALE:
-            # The head moved away and came back (or the head was mistyped): the same pinned action is requested again.
+        if existing is not None and existing["state"] in (STALE, EXPIRED):
+            # The head moved away and came back, or the platform expired the prompt: the same pinned action is requested again
+            # (a supported reissue). Denied and consumed items stay closed.
             # Gate options and layers are part of what was reviewed; a reopen with different ones is a new decision, not a reopen.
             if (existing.get("owners"), existing.get("gate_args"), existing.get("settings")) != (owners, list(gate_args), list(settings)):
                 raise AskError("the stale item was recorded with different gate options or settings layers; cancel it and record a new request")
             existing.update(state=PENDING, created=iso(at), prompt=prompt, session_id=session_id)  # resumes stays: a hand-back did happen
             existing.pop("closed", None), existing.pop("reason", None)
             save(directory, existing)
-            receipt(directory, "reopened_after_stale", existing)
+            receipt(directory, "reopened_after_stale_or_expired", existing)
             return existing, True
         if existing is not None:
             # Same action, target and head is the same request: a duplicate is a no-op, a consumed one stays consumed.
@@ -174,7 +177,8 @@ def record(directory, action, target, head, deps, trigger, session_id, request_i
         # An older pending item of THIS session for the same target at a different head can no longer be the action asked about.
         # Another session's item is left alone: it stays pending and fails its own head revalidation at resume.
         for old in live_open:
-            if old["target"] == target and old["head"] != head and old["state"] == PENDING and old.get("coordinator") == (session_id or None):
+            if (old.get("kind") == "merge" and old["target"] == target and old["head"] != head and old["state"] == PENDING
+                    and old.get("coordinator") == (session_id or None)):
                 old["state"], old["closed"], old["reason"] = STALE, iso(at), f"superseded by head {head}"
                 save(directory, old)
                 receipt(directory, "superseded", old, new_head=head)
@@ -194,12 +198,13 @@ def _check_caps(live_open, session_id):
         raise AskError(f"this session already coordinates {MAX_PENDING} open items")
 
 
-def record_decision(directory, subject, target, session_id, deps, trigger, request_id, grace_s, prompt, at):
+def record_decision(directory, subject, target, session_id, deps, trigger, request_id, grace_s, prompt, at, owners=""):
     """A shared blocker that needs an owner decision (a Select or a credential/admin action), not a command.
 
     One item per subject and target across every session that shares this ledger: the first session to record it coordinates the
     owner action; a later session gets the same item back and must not open a second request for it. Nothing here approves anything.
     """
+    subject = subject.strip()
     if not SUBJECT_RE.fullmatch(subject) or not TARGET_RE.fullmatch(target) or not session_id:
         raise AskError("a decision needs a stable subject (8-200 chars), a target owner/repo#N and the recording session id")
     if trigger not in TRIGGERS or prompt not in PROMPTS:
@@ -227,7 +232,7 @@ def record_decision(directory, subject, target, session_id, deps, trigger, reque
         item = {"id": key, "kind": "decision", "action": "DECISION: " + subject, "target": target, "head": "decision",
                 "dependencies": sorted(deps), "resume_trigger": trigger, "session_id": session_id, "coordinator": session_id,
                 "request_id": request_id or None, "prompt": prompt, "grace_s": max(0, min(int(grace_s), GRACE_MAX_S)),
-                "created": iso(at), "state": PENDING, "resumes": 0, "owners": "", "gate_args": [], "settings": []}
+                "created": iso(at), "state": PENDING, "resumes": 0, "owners": owners, "gate_args": [], "settings": []}
         save(directory, item)
         receipt(directory, "recorded_decision", item, prompt=prompt, request_id=request_id or None)
         return item, True
@@ -341,8 +346,10 @@ def finish(directory, item_id, outcome, ref, at, verify=None, session_id=None, v
             # `verified` is true only when an owner-authored GitHub comment at that ref was read back. Anything else is the closing
             # session's own word: it closes this session's wait but a later record-decision for the subject reopens the request.
             problems = (verify_answer or (lambda _i, _r: ["unverifiable reference"]))(item, ref) if outcome == "answered" else ["not an answer"]
-            item["state"], item["closed"], item["outcome_ref"] = OUTCOMES[outcome], iso(at), ref or None
+            item["state"], item["closed"] = OUTCOMES[outcome], iso(at)
             item["verified"] = outcome == "answered" and not problems
+            # Only a validated gh-comment reference is kept; a free-form note could hold anything, so only its hash is stored.
+            item["outcome_ref"] = ref if item["verified"] else ("sha256:" + hashlib.sha256(ref.encode()).hexdigest()[:16] if ref else None)
             save(directory, item)
             receipt(directory, "finished", item, outcome=outcome, ref=ref or None, verified=item["verified"], problems=problems or None)
             return item
@@ -513,6 +520,7 @@ def main(argv=None):
     d.add_argument("--request-id", default="")
     d.add_argument("--prompt", default="none", choices=sorted(PROMPTS))
     d.add_argument("--grace-s", type=int, default=GRACE_MAX_S)
+    d.add_argument("--owners", default="", help="comma-separated owner logins whose comment can verify an answer (default: the target repo's owner login)")
     t = sub.add_parser("takeover", help="become the coordinator of an open item")
     t.add_argument("--id", required=True)
     t.add_argument("--session-id", required=True)
@@ -546,7 +554,7 @@ def main(argv=None):
             print(json.dumps({"created": created, **view(item, at)}, sort_keys=True))
         elif args.cmd == "record-decision":
             item, created = record_decision(directory, args.subject, args.target, args.session_id, args.dep, args.trigger,
-                                            args.request_id, args.grace_s, args.prompt, at)
+                                            args.request_id, args.grace_s, args.prompt, at, args.owners)
             print(json.dumps({"created": created, "you_coordinate": item["coordinator"] == args.session_id, **view(item, at)}, sort_keys=True))
         elif args.cmd == "takeover":
             print(json.dumps(view(takeover(directory, args.id, args.session_id, args.reason, at), at), sort_keys=True))
