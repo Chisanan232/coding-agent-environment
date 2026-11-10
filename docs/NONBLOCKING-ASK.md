@@ -141,7 +141,7 @@ There is deliberately no `approve` command: the ledger cannot authorize anything
 - `prompt` is `none` while an item is `RESUMING`; the host prompt for the handed-back command is a separate, immediate event.
 
 - **Trust boundary.** The ledger is not tamper-evident: an agent with a shell can edit the JSON under the state directory, and `finish --outcome denied|expired|failed` and `cancel` take the caller's word. That can at worst keep an ASK from being resumed (a closed item, a reopened-after-stale item, or a re-recorded one); it can never approve or execute anything, because resume still needs the real gate PASS and the host's own answer. `executed` is the only outcome that needs outside proof (gate `verify`).
-- A `RESUMING` lease that lapses (30 minutes) returns to `PENDING`. The next resume first runs `verify`; if the merge is already VERIFIED the item is closed as `CONSUMED` instead of handing the action back again.
+- A `RESUMING` item cannot be cancelled (its host prompt may still be open): finish it as executed, denied or expired. A `RESUMING` lease that lapses (30 minutes) returns to `PENDING`. The next resume first runs `verify`; if the merge is already VERIFIED the item is closed as `CONSUMED` instead of handing the action back again.
 - The gate runs while the ledger lock is held (up to 120 s), so other ledger writes wait during a resume; a recorded `STALE_HEAD` item is reopened by recording the same pinned action again.
 
 ## Flow
@@ -154,7 +154,7 @@ There is deliberately no `approve` command: the ledger cannot authorize anything
    - moves `PENDING` to `RESUMING` once; a second resume, a closed item or a lost race is refused;
    - a different head closes the item as `STALE_HEAD` (a new head needs a new independent review and a new record); recording a new head for the same target also supersedes the old item;
    - runs `owner-merge-gate.py check` with the settings layers recorded with the item (user, plus project and local in the recording directory, when they exist; managed settings are not included; a different `--settings` at resume is refused) and the gate options recorded with the item (`--gate-ci-unavailable`, `--gate-ci-exception`, `--gate-version-policy`, `--gate-local-first-config`), and requires PASS with the same head and the same printed `merge_command` (the gate covers exact head, independent review evidence, required checks, owner class and host permission). A gate that cannot run is a refusal;
-   - prints `run_exactly` and nothing else. The agent runs that command alone, as the gate requires; **the host asks again and its answer is the only approval.**
+   - prints `run_exactly` and the `gate_options_used` (a recorded CI exception, version policy or local-first config), which the request to the owner must state because the host prompt shows only the command. The agent runs that command alone, as the gate requires; **the host asks again and its answer is the only approval** for the settings layers the host actually enforces: the gate checks the user, project and local layers, so a managed allow rule it cannot see could let the command run without an ASK.
 4. **Finish.** `finish --outcome executed --ref <proof>` (for a merge, the `owner-merge-gate.py verify` result, run separately), `denied`, `expired`, or `failed`
    (back to `PENDING` with `prompt: unknown`). `executed` is accepted only when `owner-merge-gate.py verify` reports VERIFIED for the recorded repo, PR and head; `--ref` is just a pointer to the evidence. A duplicate finish is refused and receipted. A `RESUMING` item with no outcome for 30 minutes returns to `PENDING`
    (never to done).
@@ -169,3 +169,11 @@ answer to the exact command is, and the merged state must then be verified.
 
 - The 12-hour heavy-admission escalation rule (`docs/RESOURCE-ADMISSION.md`) concerns queue admission and is unrelated to the 15-minute ASK grace.
 - Merge execution, evidence and verification rules in `OWNER-MERGE-WORKFLOW.md` are unchanged.
+
+## Known limits (reviewers' open Medium items, accepted)
+
+- A `RESUMING` item cannot be cancelled (its host prompt may still be open): finish it as executed, denied or expired first.
+- A verified `answered` closure proves who wrote a comment naming the item id, on which issue, and when; the answer text is **not parsed**. Treat the cited comment as the record.
+- `action`, `subject`, `request_id` and the `takeover`/`cancel` reasons are stored as given (length-capped) in mode-0600 files; do not put secrets in them.
+- Gate options (`--gate-ci-exception` and friends) are chosen by the recording session, as they are for a direct `owner-merge-gate.py check`; they are shown at resume time and must be stated in the owner request.
+- The `.gitleaksignore` entry names one historic commit holding a synthetic AWS-key-shaped literal (sequential digits, written by the test author, never issued by any provider).
