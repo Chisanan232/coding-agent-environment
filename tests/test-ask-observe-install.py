@@ -344,6 +344,41 @@ class Flow(Env):
         self.apply()
         self.assertEqual(stat.S_IMODE(os.stat(self.backups).st_mode), 0o700)
 
+    def test_a_receipt_pointing_at_a_backup_outside_the_backup_dir_is_refused(self):
+        receipt = self.apply()
+        data = json.loads(Path(receipt).read_text())
+        data['hook_backup'] = str(Path(self.tmp.name) / 'planted.py')
+        Path(receipt).write_text(json.dumps(data))
+        self.assertEqual(self.run_mode('rollback', '--receipt', receipt)[0], 2)
+
+    def test_a_failure_before_the_receipt_is_written_undoes_the_hook_file(self):
+        original = ai.rollout.write_new
+        calls = []
+
+        def failing(path, data, mode):
+            calls.append(path)
+            if 'receipt' in Path(path).name:
+                raise OSError('disk full')
+            return original(path, data, mode)
+        ai.rollout.write_new = failing
+        try:
+            with self.assertRaises(OSError):
+                self.run_mode('apply', *self.pins())
+        finally:
+            ai.rollout.write_new = original
+        self.assertFalse(self.dest.exists())
+
+    def test_plan_and_verify_refuse_a_missing_hook_file(self):
+        self.src.unlink()
+        self.assertEqual(self.run_mode('plan')[0], 2)
+        self.assertEqual(self.run_mode('verify')[0], 2)
+
+    def test_an_existing_backup_dir_is_tightened_to_private(self):
+        self.backups.mkdir(mode=0o755)
+        os.chmod(self.backups, 0o755)
+        self.apply()
+        self.assertEqual(stat.S_IMODE(os.stat(self.backups).st_mode), 0o700)
+
 
 if __name__ == '__main__':
     unittest.main()
