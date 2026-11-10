@@ -90,7 +90,7 @@ documented canonical form of the same operation is permitted; changing the
 operation, tool, target or wrapper to obtain a different permission outcome is
 evasion. Report the exact operation, with any secret-bearing argument redacted, and
 the supported approval mechanism. Approving a host permission prompt is not founder
-product consent. A host ASK is recorded as a pending item and waited on without stalling independent work (`docs/NONBLOCKING-ASK.md`). A permission denial is never a
+product consent. A host ASK is recorded as a pending item and waited on without stalling independent work (`docs/NONBLOCKING-ASK.md`). Triage first: an ASK is for owner authority or a material decision, never for a Level 0-1 choice, and a shared blocker has one coordinating session. A permission denial is never a
 missing founder product decision, and a founder decision does not lift a denial.
 No human approval is ever claimed that a human did not give; agent review is not a
 human PR approval.

@@ -167,6 +167,9 @@ Omit file chronology and unsupported completion claims.
   revalidation), never an unrecoverable failure; DENY is for non-waivable constraints such as a failed check or a
   cross-repository head. An approved ASK covers exactly the one pinned operation; the agent never simulates the answer.
   Details: `docs/OWNER-MERGE-OPERATOR-GUIDE.md`.
+- **Before opening an ASK, triage it** (`docs/NONBLOCKING-ASK.md`, "Before opening an ASK"): resolve routine and reversible choices yourself, preserve worktrees and sessions of
+  unknown ownership, investigate and prepare the fix on a separate branch, ask only the one remaining owner decision with the evidence and impact of each option, and
+  deduplicate shared blockers through `ask-pending.py` so one coordinator session owns the owner action.
 - **A pending ASK does not stall independent work** (`docs/NONBLOCKING-ASK.md`, `scripts/ask-pending.py`). Issue the gate's exact `merge_command` from one background
   subagent lane so the host's native prompt (an actionable Approve/Deny, including on Remote Control) stays open, record it in the ledger (exact action, target,
   head, dependencies, host request id if any, resume trigger) and continue the next runnable authorized task. After 15 minutes only the scheduling changes:

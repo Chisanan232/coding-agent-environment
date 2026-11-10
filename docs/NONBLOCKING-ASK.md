@@ -25,6 +25,26 @@ What exists today (PR #217) is only the **safety layer** behind A7 and A9: a led
 resume trigger, revalidates the exact head and the owner-merge gate before a resume, hands the action back once, and handles denial, expiry, changed head,
 duplicate and restart. It is **not** an approval channel, and a pending-list entry is not an approval prompt. The live prompt itself is the host's.
 
+## Before opening an ASK (triage)
+
+Most blockers are not ASKs. Open one only when the next action genuinely requires **owner authority** (a host ASK for a gated operation, a credential, an admin or
+sudo action, release authorization) or a **material product, security, cost or release decision**. Otherwise decide it yourself, per `decision-delegation` Levels 0-1.
+
+1. **Resolve routine and reversible choices yourself** (implementation, ordering, retries, safe cleanup of what this task owns).
+2. **Preserve what you do not own.** Worktrees, branches, processes and queue entries of unknown ownership stay untouched; a session's own work is its own (ownership
+   needs a checkpoint record, not a name match). Never delete or overwrite to "unblock".
+3. **Investigate and prepare first.** Diagnose, reproduce and prepare the fix on a separate branch (its own worktree) and gather the evidence, so the owner only decides.
+4. **Ask only for the decision that remains**, with the evidence and the impact of each option (what happens on Approve, on Deny, on each Select choice), as one
+   request. Never bundle several questions or ask what the code or an existing ADR already settles.
+5. **Deduplicate across sessions.** Before asking, `ask-pending.py list`; a blocker already recorded (same merge action, or same decision subject and target) belongs to its
+   **coordinator** session. Do not open a second request; record your dependency and keep working. Use `record-decision` for non-command blockers: the first session to
+   record it coordinates the one owner action, a later session gets the same item (`created: false`). `takeover` moves coordination only explicitly and is receipted.
+
+For a genuine owner decision the original clickable Approve, Deny or Select request stays available (never withdrawn, reworded or converted to a text question), and
+independent authorized work continues immediately in the root or a separate subagent. The 15-minute threshold is for switching focus only: it never expires a
+request or grants permission. The 12-hour heavy-queue escalation rule is separate and unchanged: a queue wait escalates only after 12 continuous hours, with queue id,
+elapsed wait, concrete blocker and exact action needed.
+
 ## Intended flow on the supported path
 
 1. The root agent issues the gate's exact `merge_command` from **one background subagent lane**. The host raises its native prompt (shown in the session and,
@@ -107,8 +127,9 @@ action, target and head, so a repeated request is the same item.
 | `request_id` | Host-supplied identifier or `null` |
 | `prompt` | `live` (a host prompt is open now), `none`, or `unknown` (after a restart or a crashed resume). A pending item is a record; a live prompt is a different fact |
 | `state` | `PENDING`, `RESUMING`, then `CONSUMED`, `DENIED`, `EXPIRED`, `STALE_HEAD`, `CANCELLED` |
+| `kind`, `coordinator` | `merge` (an exact command, revalidated by the gate) or `decision` (a shared owner-decision blocker, answered on the original request and closed with `finish --outcome answered --ref <durable record>`); the first recording session coordinates and a duplicate record from another session returns the same item |
 
-Commands: `record`, `list [--json]`, `restart --session-id`, `resume --id --current-head`, `finish --id --outcome executed|denied|expired|failed [--ref]`, `cancel`.
+Commands: `record`, `record-decision`, `takeover`, `list [--json]`, `restart --session-id`, `resume --id --current-head`, `finish --id --outcome executed|denied|expired|failed [--ref]`, `cancel`.
 There is deliberately no `approve` command: the ledger cannot authorize anything.
 
 ## Scope and limits
