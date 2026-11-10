@@ -167,6 +167,12 @@ Omit file chronology and unsupported completion claims.
   revalidation), never an unrecoverable failure; DENY is for non-waivable constraints such as a failed check or a
   cross-repository head. An approved ASK covers exactly the one pinned operation; the agent never simulates the answer.
   Details: `docs/OWNER-MERGE-OPERATOR-GUIDE.md`.
+- **A pending ASK does not stall independent work** (`docs/NONBLOCKING-ASK.md`, `scripts/ask-pending.py`). Record the exact action, target, head,
+  dependencies, any host-supplied request id and the resume trigger, then continue the next runnable task; after 15 minutes without an answer
+  move on, keep the item pending and keep it visible. Several items may be pending. Resume only at a safe checkpoint, after `ask-pending.py resume`
+  revalidated the exact head and the merge gate (independent review, required checks, owner class, host permission); the host asks again and its
+  answer is the only approval. A closed item (consumed, denied, expired, changed head) is never resumed; a pending item is not a live prompt, and time,
+  a handoff or a watcher never approve. The 12-hour heavy-admission escalation rule is separate.
 
 Do not merge until required checks, CODEOWNERS-required approvals, the class approvals above,
 conflict resolution, branch currency, and blocking review threads satisfy the
@@ -235,6 +241,7 @@ one prompt, is the unit of completion: `TASK_DONE` is not `CAMPAIGN_DONE`,
   `VERIFICATION_PENDING`, `DONE` or `OUT_OF_SCOPE`. One blocked task never freezes
   the campaign: run the next safe eligible task, and stop a worker only when it has
   no authorized executable work left. A worker checkpoint is not campaign completion.
+  A task whose next step is a host ASK is `WAITING_OPERATOR` with an `ask-pending.py` item; it never blocks a `READY` task.
 - **Fresh evidence.** A cached checkpoint or historical ticket status is not proof.
   Before declaring `WAITING_RESOURCE`, measure the current physical volume and read
   the canonical admission state; an admission snapshot older than its freshness
