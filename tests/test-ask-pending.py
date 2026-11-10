@@ -732,6 +732,41 @@ class ThirdReview(Env):
         self.assertNotIn('ghp_FAKE', Path(self.dir, d['id'] + '.json').read_text())
 
 
+class RefNeverReachesDiskRaw(Env):
+    RAW = 'my note ghp_FAKE0123456789 end'
+
+    def everything_on_disk(self):
+        return ''.join(f.read_text() for f in Path(self.dir).iterdir() if f.is_file())
+
+    def test_a_merge_executed_ref_is_hashed_in_the_item_and_the_receipt(self):
+        a, _ = self.rec(7)
+        self.set_gate({7: HEAD1})
+        self.resume(a['id'], HEAD1, T0)
+        done = self.finish(a['id'], 'executed', self.RAW)
+        self.assertTrue(done['outcome_ref'].startswith('sha256:'))
+        self.assertNotIn('ghp_FAKE', self.everything_on_disk())
+
+    def test_denied_and_expired_refs_are_hashed(self):
+        for pr, outcome in ((7, 'denied'), (8, 'expired')):
+            a, _ = self.rec(pr)
+            self.set_gate({pr: HEAD1})
+            self.resume(a['id'], HEAD1, T0)
+            self.finish(a['id'], outcome, self.RAW)
+        self.assertNotIn('ghp_FAKE', self.everything_on_disk())
+
+    def test_a_decision_ref_is_hashed_unless_verified_and_the_receipt_matches_the_item(self):
+        d, _ = ap.record_decision(self.dir, 'Some decision subject here', 'o/r#7', 'sess-1', [], 'owner_approval', '', 900, 'live', T0)
+        ap.finish(self.dir, d['id'], 'answered', self.RAW, T0, None, 'sess-1', lambda _i, _r: ['unverifiable'])
+        self.assertNotIn('ghp_FAKE', self.everything_on_disk())
+        lines = [json.loads(l) for l in Path(self.dir, 'receipts.jsonl').read_text().splitlines()]
+        self.assertEqual(lines[-1]['ref'], ap.load(self.dir, d['id'])['outcome_ref'])
+
+    def test_a_verified_ref_is_kept_as_the_validated_reference(self):
+        d, _ = ap.record_decision(self.dir, 'Another decision subject', 'o/r#7', 'sess-1', [], 'owner_approval', '', 900, 'live', T0)
+        done = ap.finish(self.dir, d['id'], 'answered', 'gh-comment:o/r:42', T0, None, 'sess-1', lambda _i, _r: [])
+        self.assertEqual(done['outcome_ref'], 'gh-comment:o/r:42')
+
+
 class Scenario(Env):
     """The disposable-environment demonstration from the task: two unanswered ASKs, independent work, late approval."""
 
