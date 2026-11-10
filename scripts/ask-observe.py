@@ -20,6 +20,7 @@ program name (for a command), the tool name and a hash of the input.
 """
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -41,16 +42,37 @@ def observe_dir():
     return path
 
 
-def input_key(tool_input):
-    return hashlib.sha256(json.dumps(tool_input, sort_keys=True, default=str).encode()).hexdigest()[:16]
+PROGRAMS = {"git", "gh", "rtk", "cargo", "python3", "python", "bash", "sh", "zsh", "npm", "pnpm", "node", "uv", "make", "docker", "kubectl",
+            "gcloud", "terraform", "curl", "rm", "mv", "cp", "ls", "cat", "echo", "claude", "timeout", "env", "sudo", "ssh", "scp", "rsync"}
+MAX_BYTES = 1_000_000
+
+
+def _key_secret(directory):
+    """Per-install random key so an input hash cannot be brute-forced from the file alone."""
+    path = os.path.join(directory, ".hmac-key")
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        key = os.urandom(32)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(key)
+        return key
+
+
+def input_key(tool_input, directory=None):
+    blob = json.dumps(tool_input, sort_keys=True, default=str).encode()
+    key = _key_secret(directory or observe_dir())
+    return hmac.new(key, blob, hashlib.sha256).hexdigest()[:16]
 
 
 def preview(tool_input):
-    """Only the program name for a command, never its arguments: arguments can carry credentials and no redaction list is complete."""
+    """Only an allowlisted program name for a command, never its arguments, and nothing else from the command line."""
     if isinstance(tool_input, dict) and tool_input.get("command"):
         words = str(tool_input["command"]).split()
-        if words and re.fullmatch(r"[A-Za-z0-9_./+-]{1,60}", os.path.basename(words[0])):
-            return os.path.basename(words[0])
+        name = os.path.basename(words[0]) if words else ""
+        return name if name in PROGRAMS else "other"
     return ""
 
 
@@ -64,6 +86,12 @@ def sanitize(payload, at):
 
 
 def append(directory, record):
+    path = os.path.join(directory, "events.jsonl")
+    try:
+        if os.path.getsize(path) > MAX_BYTES:  # keep one previous generation; the report only needs recent prompts
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
     fd = os.open(os.path.join(directory, "events.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     with os.fdopen(fd, "a") as fh:
         fh.write(json.dumps(record, sort_keys=True) + "\n")
