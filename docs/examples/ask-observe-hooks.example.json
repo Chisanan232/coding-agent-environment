@@ -1,0 +1,9 @@
+{
+  "_comment": "SPE-170 observe-only hooks. Merge into ~/.claude/settings.json by the owner (an Edit of settings is host-gated). The script prints nothing and exits 0, so it can never allow, deny or ask. Use the absolute path of your checkout or the installed copy.",
+  "hooks": {
+    "PermissionRequest": [{"hooks": [{"type": "command", "command": "python3 /ABS/PATH/scripts/ask-observe.py hook"}]}],
+    "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 /ABS/PATH/scripts/ask-observe.py hook"}]}],
+    "PostToolUseFailure": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 /ABS/PATH/scripts/ask-observe.py hook"}]}],
+    "Notification": [{"matcher": "permission_prompt", "hooks": [{"type": "command", "command": "python3 /ABS/PATH/scripts/ask-observe.py hook"}]}]
+  }
+}

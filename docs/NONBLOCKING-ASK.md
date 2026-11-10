@@ -37,32 +37,63 @@ duplicate and restart. It is **not** an approval channel, and a pending-list ent
 4. If the platform expires or loses the prompt, record it (`finish --outcome expired`) and reissue only by a supported path: re-run the gate and issue the exact
    command again from a lane, after `ask-pending.py resume` revalidated head, review, checks and gate.
 
-## What the host does (Claude Code 2.1.306, from the official docs, 2026-11-10)
+## What the host does (Claude Code 2.1.306; official docs read 2026-11-10; "not documented" means exactly that)
 
-| Mechanism | Blocks other work? | Late answer then resume? | Use here |
-|---|---|---|---|
-| Native prompt for a **foreground** call | Not documented; a foreground subagent blocks its caller | Interactive answer only | Avoid when other work is runnable |
-| Native prompt raised by a **background subagent** | No: the subagent runs concurrently and its prompt is shown in the main session, naming the subagent (`sub-agents`) | Yes, answered in the main session | **Preferred live path**: the exact gate command is run by one background lane |
-| Background Bash hitting an ASK | Not documented | Not documented | Do not rely on it |
-| PreToolUse `defer` | Ends the turn (print mode only, ignored in interactive sessions) | `claude -p --resume <id>` re-runs the hook | Not used: it needs a headless host; this setup is interactive |
-| `PermissionRequest` hook / `--permission-prompt-tool` / SDK `canUseTool` | Per call; the hook cannot return ask or defer | Callback only | Not used: would make a hook the approver |
-| `permissions.denyInsteadOfPrompting`, `--permission-prompts none` | Deny the call, no wait | No | Not used |
+| Question | Answer | Source |
+|---|---|---|
+| Are permission prompts shown on a Remote Control device? | By implication yes; the docs do not describe native Approve/Deny buttons or whether the phone answer resolves the same request | remote-control, changelog 2.1.317 |
+| Prompts and `AskUserQuestion` forwarded to Remote Control: do they expire? | They stay open until answered. Other forwarded dialogs expire after 5 min by default (`dialogExpiry`) | remote-control "Forwarded dialogs expire" |
+| Platform timeout, idle or app-backgrounding behavior of a pending permission prompt; survival across disconnect/resume | Not documented | none |
+| Does `AskUserQuestion` render a Select control on mobile? | Forwarded; the control type is not documented. **Not available to subagents**, so a Select is always a root-agent call | remote-control, sub-agents |
+| Background subagent prompts | Surface in the main session and name the subagent; approve lets that subagent continue, Esc denies one call. Whether the root keeps running meanwhile is not stated; whether the phone can answer it is inferred, not documented | sub-agents |
+| Supported reissue after an expired or denied prompt | Not documented (`/permissions` "Recently blocked" is not documented either). `PermissionDenied` `retry` exists only in auto mode. The only supported path is to re-run the exact tool call | hooks, permissions |
+| Hooks that observe the outcome | `PermissionRequest` fires before the prompt (no `tool_use_id`); `PostToolUse` / `PostToolUseFailure` after the call; `Notification` `permission_prompt` after about 6 s (no outcome). **No documented event reports approve vs deny vs expire**; `PermissionDenied` does not fire for a manual denial | hooks |
+| Push notification Approve/Deny buttons | Not documented | remote-control, mobile |
+| `defer`, `permissions.denyInsteadOfPrompting`, `--permission-prompts none` | Print-mode or denying; **not** a live prompt and not used | hooks, permissions |
 
-`PermissionRequest` input has no `tool_use_id`; `PreToolUse` and `PermissionDenied` have one. There is no documented permission-request id, so the ledger
-records a request id only when the host supplies one (for example a `tool_use_id` seen in a hook) and otherwise stores `null`. Nothing is invented.
+`PermissionRequest` input has no `tool_use_id`, so the ledger records a request id only when the host supplies one and otherwise `null`. Host policy is not changed:
+no settings edit, no new allow, and no hook that answers a prompt.
 
-Host policy is not changed: no settings edit, no new allow, no hook that answers a prompt.
+## Observation instrument (owner installs; never decides)
+
+`scripts/ask-observe.py` is a non-deciding hook (example: `docs/examples/ask-observe-hooks.example.json`) for `PermissionRequest`, `PostToolUse`, `PostToolUseFailure`
+and `Notification permission_prompt`. It prints nothing and exits 0, so the host prompt is untouched, and it records a sanitized line per event.
+`ask-observe.py report` shows each prompt as `PROMPTED_NO_RESULT` (pending, denied or expired: the documented events do not say which), `EXECUTED_AFTER_PROMPT`,
+`FAILED_AFTER_PROMPT` or `RAN_WITHOUT_PROMPT`. Without it nothing in this repository can tell whether a prompt was raised at all. Editing `~/.claude/settings.json`
+is an owner action; this branch does not do it.
+
+## Live results so far (2026-11-10, this Mac, session in `auto` mode)
+
+| Probe | Result |
+|---|---|
+| Background lane ran `rtk proxy echo` (matches the `Bash(rtk proxy *)` ask) | Returned at once; no prompt was visible to the lane |
+| Background lane ran `git -C <scratch repo> worktree prune --dry-run ...` (matches the `Bash(git * worktree prune*)` ask) | Returned at once (`ok`); no prompt or wait visible to the lane |
+
+A lane cannot see host prompts and no observer hook is installed, so these probes **cannot distinguish "no prompt was raised" from "a prompt was answered within a
+minute"**. Neither left a prompt open for 15 minutes. Criteria A1, A3, A5, A6 and A8 are therefore **not verified**.
 
 ## Proof status
 
 | Claim | Status |
 |---|---|
-| A background subagent's prompt waits in the main session while the main agent continues | **Documented, not observed here.** A 2026-11-10 probe lane ran `rtk proxy echo` (a `permissions.ask` rule) and returned at once with no visible prompt, so it exercised no live prompt. Treat the live-prompt behavior as `HOST_PROMPT_BACKGROUND_UNVERIFIED` until an owner-observed run shows a pending prompt while the main agent keeps working |
-| The ledger keeps an unanswered ASK pending past 15 minutes, holds several at once, resumes only the intended one, and handles changed head, denial, duplicate and restart | Tested (`tests/test-ask-pending.py`, class `Scenario` and `Resume`) in a disposable directory with a stand-in gate |
-| The normal merge gate is still the authority | Tested against a stand-in gate, plus one contract test that runs the real `owner-merge-gate.py check` `main` (evaluation stubbed) and feeds its printed JSON to the validator. The gate's own evaluation (checks, reviews, ownership) is covered by `tests/test-owner-merge-gate.py` and is not re-tested here. No live merge was performed |
+| A background subagent's prompt waits, actionable on the phone, while the root continues | **NOT verified** (see Live results) |
+| The ledger keeps an unanswered ASK past 15 minutes, holds several, resumes only the intended one, and handles changed head, denial, duplicate and restart | Tested in a disposable directory with a stand-in gate (`tests/test-ask-pending.py`); no live prompt was involved |
+| The normal merge gate is still the authority | Tested against a stand-in gate plus a contract test of the real gate's printed JSON; the gate's own evaluation is covered by `tests/test-owner-merge-gate.py`. No live merge was performed |
+| The observer cannot decide | Tested (`tests/test-ask-observe.py`): no output, exit 0, no decision fields in the source |
 
-The live-prompt claim is the whole point of A1-A6 and is unverified, so the feature is **not complete**. Leaving an item pending with `prompt: none` and issuing the action
-later is only a degraded fallback for an absent owner; it is not an approval flow and does not satisfy the criteria above.
+## Verification protocol (needs the owner's phone)
+
+1. The owner merges `docs/examples/ask-observe-hooks.example.json` into the settings and starts or reconnects Remote Control (`/remote-control`) on the session that will
+   run the test. A session in `default` permission mode raises prompts more reliably than `auto`; if `auto` does not raise one for an ask-ruled command, that is itself
+   recorded as the failed criterion.
+2. The root launches one background lane per scenario (A: approve, B: deny, C: a second request for a different pinned head) with a harmless ask-ruled command whose
+   text carries a distinct marker, records each in the ledger with `--prompt live`, and keeps doing independent authorized work, logging timestamps.
+3. Past 15 minutes nothing is done to the prompts. The owner taps Approve on A's original prompt and Deny on B's. `ask-observe.py report` must show A
+   `EXECUTED_AFTER_PROMPT` and B without an execution, and C must not have run.
+4. Select is a root-only `AskUserQuestion`; background lanes keep working while the root waits on it.
+5. Expiry, a changed head and a duplicate event are covered by `tests/test-ask-pending.py`; live, the pinned `--match-head-commit` makes a stale approval fail at GitHub.
+
+Until step 3 passes, the feature is not complete.
 
 ## The ledger
 
