@@ -695,14 +695,35 @@ class ThirdReview(Env):
         with self.assertRaisesRegex(ap.AskError, 'session id is required'):
             ap.record(self.dir, MERGE.format(pr=7, head=HEAD1), 'o/r#7', HEAD1, [], 'owner_approval', '', '', 900, 'none', T0)
 
-    def test_decision_owners_are_recorded_for_org_targets(self):
-        d, _ = ap.record_decision(self.dir, 'Org target needs an owner decision', 'Org/repo#3', 'sess-1', [], 'owner_approval', '', 900, 'live', T0,
-                                  'alice, bob')
-        self.assertEqual(d['owners'], 'alice, bob')
+    def test_decision_owners_come_from_trusted_config_never_from_the_session(self):
+        d, _ = ap.record_decision(self.dir, 'Org target needs an owner decision', 'Org/repo#3', 'sess-1', [], 'owner_approval', '', 900, 'live', T0)
+        self.assertEqual(d['owners'], '')  # nothing about who may verify is taken from the recording session
         out = {'login': 'Alice', 'created_at': '2026-11-10T03:00:00Z', 'issue_url': 'https://api.github.com/repos/Org/repo/issues/3',
                'body': f'ok {d["id"]}'}
         runner = lambda argv: (0, {'login': 'agent'}) if argv[2] == 'user' else (0, out)  # noqa: E731
-        self.assertEqual(ap.owner_answer_verifier(runner)(d, 'gh-comment:Org/repo:9'), [])
+        missing = os.path.join(self.tmp.name, 'no-such-file.json')
+        self.assertTrue(ap.owner_answer_verifier(runner, missing)(d, 'gh-comment:Org/repo:9'))  # only the repo owner login counts by default
+        cfg = os.path.join(self.tmp.name, 'ask-owners.json')
+        Path(cfg).write_text(json.dumps({'Org': ['alice']}))
+        os.chmod(cfg, 0o600)
+        self.assertEqual(ap.owner_answer_verifier(runner, cfg)(d, 'gh-comment:Org/repo:9'), [])
+
+    def test_a_writable_or_foreign_owner_file_is_ignored(self):
+        cfg = os.path.join(self.tmp.name, 'ask-owners.json')
+        Path(cfg).write_text(json.dumps({'Org': ['mallory']}))
+        os.chmod(cfg, 0o666)
+        self.assertEqual(ap.trusted_owners('Org/repo', cfg), {'org'})
+        os.chmod(cfg, 0o600)
+        self.assertEqual(ap.trusted_owners('Org/repo', cfg), {'org', 'mallory'})
+        link = os.path.join(self.tmp.name, 'link.json')
+        os.symlink(cfg, link)
+        self.assertEqual(ap.trusted_owners('Org/repo', link), {'org'})  # a symlink is not a regular file
+        Path(cfg).write_text('{not json')
+        self.assertEqual(ap.trusted_owners('Org/repo', cfg), {'org'})
+
+    def test_record_decision_has_no_owners_option(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            ap.main(['record-decision', '--subject', 'a long enough subject', '--target', 'o/r#1', '--session-id', 's', '--owners', 'mallory'])
 
     def test_an_unverified_note_is_stored_only_as_a_hash(self):
         d, _ = ap.record_decision(self.dir, 'Some decision subject here', 'o/r#7', 'sess-1', [], 'owner_approval', '', 900, 'live', T0)
