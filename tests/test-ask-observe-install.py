@@ -258,6 +258,92 @@ class Flow(Env):
         data = json.loads(Path(receipt).read_text())
         self.assertEqual(Path(data['settings_backup']).read_bytes(), before)
 
+    def test_rollback_refuses_to_reformat_later_edits_without_the_flag(self):
+        receipt = self.apply()
+        data = self.settings()
+        data['permissions']['allow'].append('Bash(\u00e9)')
+        self.live.write_text(json.dumps(data, indent=2, ensure_ascii=True) + '\n')
+        before = self.live.read_bytes()
+        self.assertEqual(self.run_mode('rollback', '--receipt', receipt)[0], 8)
+        self.assertEqual(self.live.read_bytes(), before)
+        self.assertEqual(self.run_mode('rollback', '--receipt', receipt, '--allow-reformat')[0], 0)
+
+    def test_rollback_removes_keys_apply_created_and_keeps_ones_that_existed(self):
+        bare = {'permissions': {'allow': []}}
+        self.live.write_text(json.dumps(bare, indent=2) + '\n')
+        receipt = self.apply()
+        self.run_mode('rollback', '--receipt', receipt)
+        self.assertEqual(self.settings(), bare)
+        empty_list = {'hooks': {'PermissionRequest': []}}
+        self.live.write_text(json.dumps(empty_list, indent=2) + '\n')
+        receipt = self.apply()
+        self.run_mode('rollback', '--receipt', receipt)
+        self.assertEqual(self.settings(), empty_list)
+
+    def test_malformed_or_missing_receipt_is_a_refusal_not_a_traceback(self):
+        self.assertEqual(self.run_mode('rollback', '--receipt', str(self.backups / 'nope.json'))[0], 2)
+        bad = Path(self.tmp.name) / 'bad.json'
+        bad.write_text('{"live": "/x"}')
+        self.assertEqual(self.run_mode('rollback', '--receipt', str(bad))[0], 2)
+
+    def test_a_tampered_receipt_path_is_refused(self):
+        receipt = self.apply()
+        data = json.loads(Path(receipt).read_text())
+        data['hook_dest'] = '/etc/cron.d/evil'
+        Path(receipt).write_text(json.dumps(data))
+        self.assertEqual(self.run_mode('rollback', '--receipt', receipt)[0], 2)
+
+    def test_missing_hook_source_is_a_refusal(self):
+        self.src.unlink()
+        self.assertEqual(self.run_mode('apply', '--expect-hook-sha', 'x', '--expect-change-sha', 'x')[0], 2)
+
+    def test_lock_contention_refuses_apply_and_rollback(self):
+        receipt = self.apply()
+        self.backups.mkdir(exist_ok=True)
+        lock = ai.hr.take_lock(self.backups)
+        try:
+            self.assertEqual(self.run_mode('rollback', '--receipt', receipt)[0], 11)
+        finally:
+            os.close(lock)
+
+    def test_a_settings_change_during_apply_undoes_the_hook_and_leaves_no_receipt(self):
+        original = ai.hr.replace_if_unchanged
+
+        def racing(path, data, expected):
+            path.write_text(path.read_text() + ' ')
+            return original(path, data, expected)
+        ai.hr.replace_if_unchanged = racing
+        try:
+            code, _ = self.run_mode('apply', *self.pins())
+        finally:
+            ai.hr.replace_if_unchanged = original
+        self.assertEqual(code, 5)
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(list(self.backups.glob('ask-observe.receipt.*')), [])
+
+    def test_an_io_failure_during_the_replace_leaves_no_half_state(self):
+        original = ai.hr.replace_if_unchanged
+
+        def failing(path, data, expected):
+            raise OSError('disk full')
+        ai.hr.replace_if_unchanged = failing
+        try:
+            with self.assertRaises(OSError):
+                self.run_mode('apply', *self.pins())
+        finally:
+            ai.hr.replace_if_unchanged = original
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(ai.overall(self.settings(), self.command), 'absent')
+        self.assertEqual(list(self.backups.glob('ask-observe.receipt.*')), [])
+
+    def test_receipt_exists_before_settings_change_and_records_created_keys(self):
+        receipt = json.loads(Path(self.apply()).read_text())
+        self.assertEqual((receipt['hooks_created'], receipt['events_created']), (False, ['PermissionRequest', 'PostToolUseFailure']))
+
+    def test_backups_dir_is_private(self):
+        self.apply()
+        self.assertEqual(stat.S_IMODE(os.stat(self.backups).st_mode), 0o700)
+
 
 if __name__ == '__main__':
     unittest.main()
