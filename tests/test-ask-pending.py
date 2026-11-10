@@ -666,6 +666,51 @@ class SharedBlockers(Env):
         self.assertEqual(self.state(item['id']), 'PENDING')
 
 
+class ThirdReview(Env):
+    def test_a_merge_recorded_on_the_same_target_never_supersedes_a_decision(self):
+        d, _ = ap.record_decision(self.dir, 'AASM J84 needs a sudo action', 'o/r#7', 'sess-1', [], 'owner_approval', '', 900, 'live', T0)
+        self.rec(7, head=HEAD1)
+        self.rec(7, head=HEAD2)
+        self.assertEqual(self.state(d['id']), 'PENDING')
+
+    def test_an_expired_merge_item_can_be_reissued_for_the_same_head(self):
+        a, _ = self.rec(7)
+        self.set_gate({7: HEAD1})
+        self.resume(a['id'], HEAD1, T0)
+        self.finish(a['id'], 'expired', 'platform expired the prompt')
+        again, created = self.rec(7)
+        self.assertTrue(created)
+        self.assertEqual(again['state'], 'PENDING')
+        self.assertEqual(self.resume(again['id'], HEAD1, T0)['action'], a['action'])
+
+    def test_denied_and_consumed_merge_items_stay_closed_on_record(self):
+        a, _ = self.rec(7)
+        self.set_gate({7: HEAD1})
+        self.resume(a['id'], HEAD1, T0)
+        self.finish(a['id'], 'denied', 'owner denied')
+        self.assertFalse(self.rec(7)[1])
+        self.assertEqual(self.state(a['id']), 'DENIED')
+
+    def test_a_session_id_is_required_for_a_merge_record(self):
+        with self.assertRaisesRegex(ap.AskError, 'session id is required'):
+            ap.record(self.dir, MERGE.format(pr=7, head=HEAD1), 'o/r#7', HEAD1, [], 'owner_approval', '', '', 900, 'none', T0)
+
+    def test_decision_owners_are_recorded_for_org_targets(self):
+        d, _ = ap.record_decision(self.dir, 'Org target needs an owner decision', 'Org/repo#3', 'sess-1', [], 'owner_approval', '', 900, 'live', T0,
+                                  'alice, bob')
+        self.assertEqual(d['owners'], 'alice, bob')
+        out = {'login': 'Alice', 'created_at': '2026-11-10T03:00:00Z', 'issue_url': 'https://api.github.com/repos/Org/repo/issues/3',
+               'body': f'ok {d["id"]}'}
+        runner = lambda argv: (0, {'login': 'agent'}) if argv[2] == 'user' else (0, out)  # noqa: E731
+        self.assertEqual(ap.owner_answer_verifier(runner)(d, 'gh-comment:Org/repo:9'), [])
+
+    def test_an_unverified_note_is_stored_only_as_a_hash(self):
+        d, _ = ap.record_decision(self.dir, 'Some decision subject here', 'o/r#7', 'sess-1', [], 'owner_approval', '', 900, 'live', T0)
+        done = ap.finish(self.dir, d['id'], 'answered', 'note with ghp_FAKE0123456789 inside', T0, None, 'sess-1', lambda _i, _r: ['unverifiable'])
+        self.assertTrue(done['outcome_ref'].startswith('sha256:'))
+        self.assertNotIn('ghp_FAKE', Path(self.dir, d['id'] + '.json').read_text())
+
+
 class Scenario(Env):
     """The disposable-environment demonstration from the task: two unanswered ASKs, independent work, late approval."""
 

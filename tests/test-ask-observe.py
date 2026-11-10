@@ -74,16 +74,25 @@ class Observe(unittest.TestCase):
         for secret in secrets:
             self.assertNotIn(secret, raw)
         for row in self.rows():
-            self.assertIn(row['preview'], ('psql', 'export', ''))
+            self.assertIn(row['preview'], ('other', ''))
 
     def test_the_preview_is_only_the_program_name(self):
         self.hook('PermissionRequest', tool_input={'command': '/usr/bin/git ' + 'x' * 5000})
         self.assertEqual(self.rows()[0]['preview'], 'git')
         self.hook('PermissionRequest', tool_input={'command': 'weird;name --x'})
-        self.assertEqual(self.rows()[1]['preview'], '')
+        self.assertEqual(self.rows()[1]['preview'], 'other')
+        self.hook('PermissionRequest', tool_input={'command': './ghp_ABCDEF0123456789 --x'})
+        self.assertEqual(self.rows()[2]['preview'], 'other')  # a token-shaped first word is never stored
 
 
 class Report(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ['ASK_OBSERVE_DIR'] = os.path.join(self.tmp.name, 'o')
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
     def row(self, event, at, tool_input=CMD, session='s1'):
         return {'at': at, 'event': event, 'session': session, 'tool': 'Bash', 'key': ao.input_key(tool_input), 'preview': tool_input['command']}
 
@@ -117,6 +126,24 @@ class Report(unittest.TestCase):
                 self.row('PostToolUse', '2026-11-10T02:03:00Z', OTHER)]
         outcomes = [e['outcome'] for e in ao.report(rows, '2026-11-10T02:04:00Z')]
         self.assertEqual(outcomes, ['FAILED_AFTER_OPEN_PROMPT', 'RAN_WITHOUT_PROMPT'])
+
+
+class Storage(Observe):
+    def test_the_input_hash_is_keyed_per_install_and_the_key_is_private(self):
+        a = ao.input_key(CMD)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(ao.observe_dir(), '.hmac-key')).st_mode), 0o600)
+        self.assertEqual(a, ao.input_key(CMD))
+        os.remove(os.path.join(ao.observe_dir(), '.hmac-key'))
+        self.assertNotEqual(a, ao.input_key(CMD))  # a different install key gives a different hash: it cannot be precomputed
+
+    def test_the_log_rotates_to_one_previous_generation(self):
+        self.hook('PermissionRequest')
+        path = os.path.join(ao.observe_dir(), 'events.jsonl')
+        with open(path, 'a') as fh:
+            fh.write('x' * (ao.MAX_BYTES + 1) + '\n')
+        self.hook('PermissionRequest', OTHER)
+        self.assertTrue(os.path.exists(path + '.1'))
+        self.assertLess(os.path.getsize(path), 1000)
 
 
 class NoDecisionPath(unittest.TestCase):
