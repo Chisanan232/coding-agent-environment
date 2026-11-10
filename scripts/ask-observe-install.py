@@ -379,6 +379,10 @@ def rollback(args):
         print(message)
         return 4
     backups = Path(args.backup_dir)
+    message = hr.redirected(backups / 'receipt')
+    if message:
+        print(message)
+        return 4
     backups.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(backups, 0o700)
     lock = hr.take_lock(backups)
