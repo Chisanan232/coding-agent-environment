@@ -60,7 +60,7 @@ def _key_secret(directory):
                 return key
         except OSError:
             pass
-        tmp = os.path.join(directory, f".hmac-key.{os.getpid()}.tmp")
+        tmp = os.path.join(directory, f".hmac-key.{os.getpid()}.{os.urandom(4).hex()}.tmp")  # unique per call: threads share a pid
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as fh:
             fh.write(os.urandom(32))
