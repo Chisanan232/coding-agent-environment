@@ -1919,8 +1919,10 @@ def queue_status(state_path, now=None):
 # Concurrency trial report (SPE-160). Read-only evidence for the decision to enable a third heavy lane: it reads the queue
 # entries, the receipts log and the measurement log, never takes the lock and writes nothing. Every missing input yields
 # "insufficient", never PASS. Times are upper bounds where noted: a release is recorded when a queue-aware command next runs.
-TRIAL_CRITERIA = {'overlapped_jobs': 10, 'classes': 2, 'q2c_improvement': 0.20, 'slowdown': 1.6, 'swap_growth_bytes': 2 * GIB,
-                  'free_margin_bytes': 60 * GIB, 'fits_share': 0.5}
+# Revision 3 (SPE-172): the stage gates count jobs that ran with exactly TRIAL_STAGE_N jobs at once (2 evidences the step to a third lane).
+TRIAL_STAGE_N = 2
+TRIAL_CRITERIA = {'overlapped_jobs': 20, 'classes': 2, 'jobs_per_class': 5, 'overlap_hours': 5.0, 'q2c_improvement': 0.20,
+                  'slowdown': 1.6, 'swap_growth_bytes': 2 * GIB, 'free_margin_bytes': 60 * GIB, 'fits_share': 0.5}
 
 
 def _median(values):
@@ -1969,7 +1971,7 @@ def _trial_jobs(entries, lines_by_queue_id, since, until):
         released = _trial_time((entry.get('release') or {}).get('at')) if entry['state'] == 'RELEASED' else None
         stamps = [t for t in (_trial_time(ln.get('ts')) for ln in lines_by_queue_id.get(entry['id'], [])) if t is not None]
         lower = max(stamps) if stamps else None
-        job = {'id': entry['id'], 'label': entry['label'], 'class': entry.get('class') or 'unclassified', 'claimed': claimed,
+        job = {'id': entry['id'], 'label': entry['label'], 'bytes': entry.get('bytes'), 'class': entry.get('class') or 'unclassified', 'claimed': claimed,
                'created': created, 'released': released, 'finished': released is not None and released >= claimed}
         job['wait_s'] = (claimed - created).total_seconds() if created and created <= claimed else None
         job['run_s'] = (released - claimed).total_seconds() if job['finished'] else None
@@ -1985,6 +1987,37 @@ def _trial_jobs(entries, lines_by_queue_id, since, until):
             start, end = job['claimed'], job['end'] or until
             job['overlapped'] = any(o is not job and o['claimed'] < end and start < (o['end'] or until) for o in jobs)
     return jobs
+
+
+def _concurrency_segments(jobs, until):
+    """(start, end, jobs running) for each stretch of time between two claim/end events."""
+    events = sorted([(j['claimed'], 1) for j in jobs] + [(j['end'] or until, -1) for j in jobs], key=lambda e: (e[0], e[1]))
+    segments, current = [], 0
+    for index, (moment, step) in enumerate(events):
+        current += step
+        if index + 1 < len(events) and events[index + 1][0] > moment and current > 0:
+            segments.append((moment, events[index + 1][0], current))
+    return segments
+
+
+def _ran_with(jobs, until):
+    """Most jobs running at once during each job's life, from claim times and from the sampled `concurrent` figure (the larger)."""
+    segments = _concurrency_segments(jobs, until)
+    for job in jobs:
+        end = job['end'] or until
+        timed = max([n for s, e, n in segments if s < end and job['claimed'] < e], default=1)
+        sampled = [ln['concurrent'] for ln in job['lines'] if type(ln.get('concurrent')) is int]
+        job['ran_with'] = max([timed] + sampled)
+
+
+def _overlap_hours(jobs, until, n):
+    return sum((e - s).total_seconds() for s, e, count in _concurrency_segments(jobs, until) if count == n) / 3600
+
+
+def _reserved_at(jobs, moment, until):
+    """Bytes reserved by the jobs live at `moment`, or None when any of them has no declared byte figure."""
+    live = [j for j in jobs if j['claimed'] <= moment <= (j['end'] or until)]
+    return sum(j['bytes'] for j in live) if live and all(type(j['bytes']) is int for j in live) else None
 
 
 def _peak_concurrent(jobs, until):
@@ -2033,14 +2066,28 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
     jobs = _trial_jobs(entries, by_qid, since, until)
     base_jobs = _trial_jobs(entries, by_qid, baseline[0], baseline[1]) if baseline else jobs
     solo = [j for j in base_jobs if j['finished'] and not j['overlapped']]
+    _ran_with(jobs, until)
+    stage_n = TRIAL_STAGE_N
+    at_stage = [j for j in jobs if j['finished'] and j['ran_with'] == stage_n]
     overlapped = [j for j in jobs if j['finished'] and j['overlapped']]
     in_window = [ln for ln in measurement_lines if (t := _trial_time(ln.get('ts'))) is not None and since <= t <= until]
     receipts = []
     base = queue_dir(state_path) / 'receipts.jsonl'
     for path in (base.with_name(base.name + '.1'), base):
         receipts += _read_jsonl_lines(path)
-    verdicts = [r['budget'] for r in receipts if r.get('event') == 'shadow-budget' and isinstance(r.get('budget'), dict)
-                and (t := _trial_time(r.get('ts'))) is not None and since <= t <= until]
+    # Only a verdict made while a job was running says anything about a third lane (a verdict on an empty host is trivially "fits"),
+    # and a polled entry repeats the same verdict, so each (entry, situation) counts once.
+    verdicts, counted = [], set()
+    for r in receipts:
+        b = r.get('budget')
+        if r.get('event') != 'shadow-budget' or not isinstance(b, dict) or not ((t := _trial_time(r.get('ts'))) and since <= t <= until):
+            continue
+        if type(b.get('count')) is not int or b['count'] < 1 or type(b.get('fits_if_cap_were_3')) is not bool:
+            continue
+        key = (r.get('id'), b['count'], b.get('band'), tuple(b.get('resource_reasons') or ()))
+        if key not in counted:
+            counted.add(key)
+            verdicts.append(b)
 
     busy = _busy_hours([j for j in jobs if j['finished']], until)
     classes = {}
@@ -2064,13 +2111,27 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
              and (t := _trial_time(ln.get('ts'))) is not None]
     swaps.sort(key=lambda e: e[0])
     frees = [ln['free_bytes'] for ln in in_window if type(ln.get('free_bytes')) is int]
-    seen3 = [v['fits_if_cap_were_3'] for v in verdicts if type(v.get('fits_if_cap_were_3')) is bool]
+    # Disk is judged where concurrency could cause the shortfall: overlap samples, free minus what running jobs reserved. The
+    # window-wide minimum is reported, not gated (shared-target growth lowers it with one job running).
+    margins = []
+    for ln in in_window:
+        t = _trial_time(ln.get('ts'))
+        if type(ln.get('free_bytes')) is int and type(ln.get('concurrent')) is int and ln['concurrent'] >= 2:
+            reserved = _reserved_at(jobs, t, until)
+            if reserved is not None:
+                margins.append(ln['free_bytes'] - reserved)
+    low_line = min((ln for ln in in_window if type(ln.get('free_bytes')) is int), key=lambda ln: ln['free_bytes'], default=None)
+    seen3 = [v['fits_if_cap_were_3'] for v in verdicts]
     c = TRIAL_CRITERIA
 
     def verdict(ok, have=True):
         return 'insufficient' if not have else ('PASS' if ok else 'FAIL')
 
-    n_classes = len({j['class'] for j in overlapped})
+    per_class = {}
+    for j in at_stage:
+        per_class[j['class']] = per_class.get(j['class'], 0) + 1
+    n_classes = sum(1 for name, n in per_class.items() if name != 'unclassified' and n >= c['jobs_per_class'])
+    hours = _overlap_hours([j for j in jobs if j['finished']], until, stage_n)
     growth = (max(v for _, v in swaps) - swaps[0][1]) if len(swaps) >= 2 else None
     floor_need = HEAVY_FLOOR + c['free_margin_bytes']
     pressured = sum(1 for p in pressure_known if p > 1)
@@ -2078,9 +2139,12 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
                         else 'insufficient')   # an overlap sample with no pressure reading is missing data, not a pass
     criteria = [
         # Too little evidence is a shortage of data, not a failing result.
-        _criterion('overlapped_jobs', len(overlapped), 'PASS' if len(overlapped) >= c['overlapped_jobs'] else 'insufficient',
-                   '>= %d' % c['overlapped_jobs']),
-        _criterion('overlapped_classes', n_classes, 'PASS' if n_classes >= c['classes'] else 'insufficient', '>= %d' % c['classes']),
+        _criterion('overlapped_jobs', len(at_stage), 'PASS' if len(at_stage) >= c['overlapped_jobs'] else 'insufficient',
+                   '>= %d finished jobs that ran with exactly %d at once' % (c['overlapped_jobs'], stage_n)),
+        _criterion('overlapped_classes', n_classes, 'PASS' if n_classes >= c['classes'] else 'insufficient',
+                   '>= %d declared classes with >= %d such jobs each' % (c['classes'], c['jobs_per_class'])),
+        _criterion('overlap_hours', round(hours, 2), 'PASS' if hours >= c['overlap_hours'] else 'insufficient',
+                   '>= %g h with exactly %d jobs running' % (c['overlap_hours'], stage_n)),
         _criterion('median_queue_to_completion_ratio', None if median_ratio is None else round(median_ratio, 3),
                    verdict(median_ratio is not None and median_ratio <= 1 - c['q2c_improvement'], median_ratio is not None),
                    '<= %.2f of the solo baseline' % (1 - c['q2c_improvement'])),
@@ -2089,10 +2153,11 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
         _criterion('pressure_samples_above_1_during_overlap', pressured if pressure_known else None, pressure_verdict, '== 0'),
         _criterion('swap_growth_bytes', growth, verdict(growth is not None and growth <= c['swap_growth_bytes'], growth is not None),
                    '<= %d' % c['swap_growth_bytes']),
-        _criterion('min_free_bytes', min(frees) if frees else None, verdict(bool(frees) and min(frees) >= floor_need, bool(frees)),
-                   '>= %d (floor + 60 GiB)' % floor_need),
+        _criterion('min_free_bytes', min(margins) if margins else None, verdict(bool(margins) and min(margins) >= floor_need, bool(margins)),
+                   '>= %d (floor + 60 GiB) for free - reserved, over overlap samples' % floor_need),
         _criterion('fits_if_cap_were_3_share', None if not seen3 else round(sum(seen3) / len(seen3), 3),
-                   verdict(bool(seen3) and sum(seen3) / len(seen3) >= c['fits_share'], bool(seen3)), '>= %g' % c['fits_share']),
+                   verdict(bool(seen3) and sum(seen3) / len(seen3) >= c['fits_share'], bool(seen3)),
+                   '>= %g of verdicts made with a job running' % c['fits_share']),
     ]
     verdicts_all = [x['verdict'] for x in criteria]
     out.update(
@@ -2101,7 +2166,9 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
                'queue_to_completion_s_upper_bound': j['q2c_s']} for j in jobs],
         classes=classes, peak_concurrent=_peak_concurrent(jobs, until) if jobs else None,
         peak_pressure=max([ln['pressure'] for ln in in_window if type(ln.get('pressure')) is int], default=None),
-        solo_baseline_jobs=len(solo), overlapped_jobs=len(overlapped), criteria=criteria,
+        solo_baseline_jobs=len(solo), overlapped_jobs=len(overlapped), stage_n=stage_n,
+        window_min_free_bytes=None if low_line is None else low_line['free_bytes'],
+        window_min_free_at=None if low_line is None else low_line.get('ts'), criteria=criteria,
         verdict='FAIL' if 'FAIL' in verdicts_all else ('PASS' if all(v == 'PASS' for v in verdicts_all) else 'INSUFFICIENT'),
         note='run and queue-to-completion use the release time, an upper bound (a release is recorded when a queue-aware command next '
              'runs); run_s_lower_bound is the last sample of the job. Missing data is insufficient, never a pass.')
@@ -2114,6 +2181,8 @@ def format_trial_report(report):
     rows = ['trial window %s .. %s: %d job(s), %d overlapped finished, %d solo baseline, peak concurrent %s, peak pressure %s' % (
         report['since'], report['until'], len(report['jobs']), report['overlapped_jobs'], report['solo_baseline_jobs'],
         report['peak_concurrent'], report['peak_pressure'])]
+    if report.get('window_min_free_bytes') is not None:
+        rows.append('  window minimum free disk %.1f GiB at %s (reported, not gated)' % (report['window_min_free_bytes'] / GIB, report['window_min_free_at']))
     for name, c in report['classes'].items():
         rows.append('  %-22s solo=%d overlapped=%d slowdown=%s jobs/busy-hour=%s' % (
             name, c['solo_runs'], c['overlapped_runs'], None if c['slowdown'] is None else '%.2f' % c['slowdown'],

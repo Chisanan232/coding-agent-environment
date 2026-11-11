@@ -17,6 +17,8 @@ spec.loader.exec_module(da)
 GIB = 1024 ** 3
 T0 = datetime(2026, 11, 9, 8, 0, tzinfo=timezone.utc)
 CLASSES = ('build-crate', 'build-workspace')
+RUN = 2000                                                             # solo run seconds; 20 paired jobs then overlap 6.1 h
+SOLO_WAIT = 1100                                                       # so a 1.5x slowdown is exactly no queue-to-completion gain
 
 
 def iso(moment):
@@ -52,24 +54,25 @@ class Trial(unittest.TestCase):
                                                'swap_used_bytes': swap})
         return qid
 
-    def receipt(self, fits, when=None):
-        entry = {'id': 'q000001', 'label': 'x', 'tickets': []}
+    def receipt(self, fits, when=None, qid=None, count=1, band='GREEN'):
+        self.seq += 1
         path = self.path.parent / 'queue/receipts.jsonl'
-        line = {'ts': iso(when or T0 + timedelta(hours=1)), 'event': 'shadow-budget', 'id': entry['id'], 'label': 'x', 'tickets': [],
-                'budget': {'status': 'ok', 'fits_if_cap_were_3': fits}}
+        line = {'ts': iso(when or T0 + timedelta(hours=1)), 'event': 'shadow-budget', 'id': qid or 'r%06d' % self.seq, 'label': 'x',
+                'tickets': [], 'budget': {'status': 'ok', 'fits_if_cap_were_3': fits, 'count': count, 'band': band}}
         with open(path, 'a') as handle:
             handle.write(json.dumps(line) + '\n')
 
-    def scenario(self, slow=1.1, overlapped_per_class=6, pressure=1, fits=(True, True, True, False), swap_growth=GIB, free=300 * GIB):
-        """3 solo jobs per class (run 1000 s, wait 600 s) then overlapped jobs (run 1000 * slow, wait 100 s)."""
+    def scenario(self, slow=1.1, overlapped_per_class=10, pressure=1, fits=(True, True, True, False), swap_growth=GIB, free=300 * GIB):
+        """3 solo jobs per class (run RUN s, wait SOLO_WAIT s) then overlapped pairs (run RUN * slow, wait 100 s) that really run together."""
         at = T0
         for cls in CLASSES:
             for _ in range(3):
-                self.job(cls, at, 600, 1000, False, swap=10 * GIB, free=free)
+                self.job(cls, at, SOLO_WAIT, RUN, False, swap=10 * GIB, free=free)
                 at += timedelta(hours=1)
         for cls in CLASSES:
-            for n in range(overlapped_per_class):
-                self.job(cls, at, 100, 1000 * slow, True, pressure=pressure, swap=10 * GIB + swap_growth, free=free)
+            for n in range(overlapped_per_class // 2):
+                for _ in range(2):
+                    self.job(cls, at, 100, RUN * slow, True, pressure=pressure, swap=10 * GIB + swap_growth, free=free)
                 at += timedelta(hours=1)
         for value in fits:
             self.receipt(value)
@@ -85,19 +88,19 @@ class Trial(unittest.TestCase):
         report = self.report()
         self.assertEqual(report['verdict'], 'PASS', report['criteria'])
         self.assertEqual((report['overlapped_jobs'], report['solo_baseline_jobs'], report['peak_concurrent'], report['peak_pressure']),
-                         (12, 6, 2, 1))
+                         (20, 6, 2, 1))
         crate = report['classes']['build-crate']
-        self.assertEqual((crate['solo_runs'], crate['overlapped_runs'], round(crate['slowdown'], 2)), (3, 6, 1.1))
+        self.assertEqual((crate['solo_runs'], crate['overlapped_runs'], round(crate['slowdown'], 2)), (3, 10, 1.1))
         crit = self.criteria(report)
-        self.assertEqual(crit['median_queue_to_completion_ratio']['value'], round((100 + 1100) / (600 + 1000), 3))
+        self.assertEqual(crit['median_queue_to_completion_ratio']['value'], round((100 + RUN * 1.1) / (SOLO_WAIT + RUN), 3))
         self.assertEqual(crit['swap_growth_bytes']['value'], GIB)
-        self.assertEqual(crit['min_free_bytes']['value'], 300 * GIB)
+        self.assertEqual(crit['min_free_bytes']['value'], 260 * GIB)      # 300 free minus two 20 GiB reservations
         self.assertEqual(crit['fits_if_cap_were_3_share']['value'], 0.75)
         self.assertEqual(crit['pressure_samples_above_1_during_overlap']['value'], 0)
         self.assertGreater(crate['jobs_per_busy_hour'], 0)
         row = next(j for j in report['jobs'] if j['overlapped'])
-        self.assertEqual((row['wait_s'], row['run_s_upper_bound'], row['queue_to_completion_s_upper_bound']), (100, 1100, 1200))
-        self.assertEqual(row['run_s_lower_bound'], 1070)                     # last sample is 30 s before the recorded release
+        self.assertEqual((row['wait_s'], row['run_s_upper_bound'], row['queue_to_completion_s_upper_bound']), (100, RUN * 1.1, 100 + RUN * 1.1))
+        self.assertEqual(row['run_s_lower_bound'], RUN * 1.1 - 30)                    # last sample is 30 s before the recorded release
         json.dumps(report)
 
     def test_each_threshold_can_fail_the_trial_alone(self):
@@ -113,12 +116,12 @@ class Trial(unittest.TestCase):
             self.assertEqual(report['verdict'], 'FAIL', label)
 
     def test_no_queue_to_completion_gain_fails(self):
-        self.scenario(slow=1.5)                                              # q2c 100 + 1500 = 1600 == baseline: no gain
+        self.scenario(slow=1.5)                                              # q2c 100 + 3000 == 1100 + 2000: no gain
         crit = self.criteria(self.report())
         self.assertEqual(crit['median_queue_to_completion_ratio']['verdict'], 'FAIL')
 
     def test_too_few_overlapped_jobs_or_classes_is_not_a_pass(self):
-        self.scenario(overlapped_per_class=4)                                # 8 overlapped < 10
+        self.scenario(overlapped_per_class=4)                                # 8 paired jobs < 20
         report = self.report()
         self.assertEqual(self.criteria(report)['overlapped_jobs']['verdict'], 'insufficient')
         self.assertEqual(report['verdict'], 'INSUFFICIENT')
@@ -131,6 +134,65 @@ class Trial(unittest.TestCase):
             self.job('build-crate', at, 100, 1100, True, swap=GIB)
             at += timedelta(hours=1)
         self.assertEqual(self.criteria(self.report())['overlapped_classes']['verdict'], 'insufficient')
+
+    def test_per_class_minimum_and_unclassified_jobs(self):
+        self.scenario(overlapped_per_class=8)                                # 16 jobs, 8 per class: still < 20 in total
+        self.assertEqual(self.criteria(self.report())['overlapped_jobs']['verdict'], 'insufficient')
+        self.setUp()
+        at = T0
+        for cls, pairs in (('build-crate', 8), ('build-workspace', 2)):      # 16 + 4 jobs: 20 in total, one class below 5
+            for _ in range(pairs):
+                for _ in range(2):
+                    self.job(cls, at, 100, RUN, True)
+                at += timedelta(hours=1)
+        crit = self.criteria(self.report())
+        self.assertEqual((crit['overlapped_jobs']['verdict'], crit['overlapped_classes']['verdict']), ('PASS', 'insufficient'))
+        self.setUp()
+        for n in range(10):
+            for _ in range(2):
+                self.job('unclassified', T0 + timedelta(hours=n), 100, RUN, True)
+        self.assertEqual(self.criteria(self.report())['overlapped_classes']['verdict'], 'insufficient')
+
+    def test_five_hours_of_overlap_are_required(self):
+        at = T0
+        for cls in CLASSES:
+            for _ in range(5):
+                for _ in range(2):
+                    self.job(cls, at, 100, 600, True)                       # 10 pairs of 10 min = 1.7 h
+                at += timedelta(hours=1)
+        crit = self.criteria(self.report())
+        self.assertEqual((crit['overlapped_jobs']['verdict'], crit['overlapped_classes']['verdict']), ('PASS', 'PASS'))
+        self.assertEqual(crit['overlap_hours']['verdict'], 'insufficient')
+        self.assertLess(crit['overlap_hours']['value'], 5)
+
+    def test_disk_is_judged_on_overlap_samples_net_of_reservations_and_the_window_minimum_is_only_reported(self):
+        self.scenario()
+        self.job('build-crate', T0 - timedelta(minutes=30), 10, 1200, False, free=149 * GIB)   # one job, no overlap, low disk
+        report = self.report()
+        self.assertEqual(self.criteria(report)['min_free_bytes']['verdict'], 'PASS')
+        self.assertEqual((report['window_min_free_bytes'], report['verdict']), (149 * GIB, 'PASS'))
+        self.assertIn('window minimum free disk 149.0 GiB', da.format_trial_report(report))
+        self.setUp()
+        self.scenario(free=190 * GIB)                                        # 190 - 2 x 20 reserved = 150 < 160 although 190 >= 160
+        crit = self.criteria(self.report())['min_free_bytes']
+        self.assertEqual((crit['verdict'], crit['value']), ('FAIL', 150 * GIB))
+
+    def test_disk_without_a_reserved_figure_or_overlap_sample_is_insufficient(self):
+        self.job('build-crate', T0, 100, RUN, False)                         # a solo sample only
+        self.assertEqual(self.criteria(self.report())['min_free_bytes']['verdict'], 'insufficient')
+
+    def test_fits_share_counts_only_verdicts_made_with_a_job_running_once_per_entry_and_situation(self):
+        self.receipt(True, count=0)                                          # an empty host trivially fits: not evidence
+        for _ in range(125):                                                 # a polled entry repeats one verdict
+            self.receipt(True, qid='q000900')
+        self.receipt(False, qid='q000901')
+        self.receipt(False, qid='q000901', count=2)                          # same entry, a different situation
+        self.receipt(True, qid='q000900', band='AMBER')
+        crit = self.criteria(self.report())['fits_if_cap_were_3_share']
+        self.assertEqual((crit['value'], crit['verdict']), (0.5, 'PASS'))    # 2 of 4 distinct (entry, situation) verdicts
+        self.setUp()
+        self.receipt(True, count=0)
+        self.assertEqual(self.criteria(self.report())['fits_if_cap_were_3_share']['verdict'], 'insufficient')
 
     def test_missing_data_is_insufficient_never_pass(self):
         empty = self.report()
