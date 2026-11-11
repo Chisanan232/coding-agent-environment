@@ -312,12 +312,19 @@ class Sites(QueueBase):
                    grant_environ={'CARGO_BUILD_JOBS': 'num-cpus-2'})
         self.assertNotIn('granted_jobs', self.reservation_file('job'))
 
+    def test_a_non_exec_reserve_of_a_declared_class_records_what_a_run_would_have_exported(self):
+        proc = self.spawn()
+        da.reserve('job', 20 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now, host_fn=self.host_fn(), declared=CRATE)
+        self.assertEqual(self.reservation_file('job')['granted_jobs'], 4)      # SPE-171: not "every core"
+        da.release('job', self.path)
+        da.reserve('job', 20 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now, host_fn=self.host_fn(band='RED'),
+                   declared=CRATE)
+        self.assertEqual(self.reservation_file('job')['granted_jobs'], da.WORKLOAD_CLASSES['build-crate']['min_jobs'])
+
     def test_no_environment_no_budget_or_a_legacy_job_records_no_limit(self):
         proc = self.spawn()
         self.assertTrue(self.reserve('job', proc, self.host_fn(), declared=CRATE, )['admit'])
         da.release('job', self.path)
-        da.reserve('job', 20 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now, host_fn=self.host_fn(), declared=CRATE)
-        self.assertNotIn('granted_jobs', self.reservation_file('job'))
         da.release('job', self.path)
         self.reserve('job', proc, declared=CRATE)
         self.assertNotIn('granted_jobs', self.reservation_file('job'))
@@ -336,7 +343,7 @@ class Sites(QueueBase):
         self.assertEqual(self.entries()[qid]['holder']['granted_jobs'], 2)
         self.assertEqual(self.reservation_file(entry['label'])['granted_jobs'], 2)
 
-    def test_a_claim_without_an_environment_to_export_into_records_none(self):
+    def test_a_claim_without_an_environment_to_export_into_records_the_band_grant(self):
         self.assertTrue(self.enqueue(declared=dict(CRATE))['ok'])
         qid = da.queue_advance(self.path, lambda: 400 * GIB, now=self.now)['granted'][0]
         entry = self.entries()[qid]
@@ -344,7 +351,7 @@ class Sites(QueueBase):
                              pid=os.getpid(), now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda p, a: None,
                              declared=dict(CRATE), host_fn=self.host_fn())
         self.assertTrue(out['ok'], out)
-        self.assertNotIn('granted_jobs', self.entries()[qid]['holder'])
+        self.assertEqual(self.entries()[qid]['holder']['granted_jobs'], 4)
 
     def test_a_claimed_orphan_without_a_limit_is_charged_every_core_and_one_with_a_limit_its_limit(self):
         entry = {'label': 'o', 'class': 'build-crate', 'mem_bytes': 6 * GIB, 'cpu_slots': 4, 'excl_keys': [],

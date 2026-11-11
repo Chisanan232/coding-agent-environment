@@ -971,7 +971,10 @@ def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_
                                              result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB)), budget)
             if budget_why:
                 return _with_budget(dict(result, admit=False, reserved_bytes=reserved, reason=budget_why), budget)
-            granted = _granted_jobs(budget, declared, grant_environ) or (same[0].get('granted_jobs') if same else None)   # a refresh keeps it
+            kept = same[0].get('granted_jobs') if same else None
+            # A refresh keeps exactly what the running job was given. A non-exec refresh (no environment) of an existing holder records
+            # nothing new: it must neither raise a lower limit nor turn an unlimited holder into a capped one (SPE-171).
+            granted = kept if same and grant_environ is None else (_granted_jobs(budget, declared, grant_environ) or kept)
             write_reservation(state_path, label, nbytes, pid, token, now + timedelta(seconds=ttl), workload=workload, declared=declared,
                               granted_jobs=granted)
             return _with_budget(dict(result, reserved_bytes=reserved + nbytes,
@@ -1862,6 +1865,23 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
     return _with_budget({'ok': True, 'reason': 'claimed %s for %s' % (qid, label), 'exit': 0}, budget)
 
 
+def _reserved_jobs(state_path, label):
+    """The granted_jobs recorded on label's reservation, or None."""
+    try:
+        return _read_reservation(reservations_dir(state_path) / (label + '.json')).get('granted_jobs')
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _entry_granted_jobs(state_path, qid):
+    """The granted_jobs recorded on a CLAIMED entry's holder, or None."""
+    try:
+        entries, _ = _queue_entries(state_path)
+    except (StateError, OSError):
+        return None
+    return next((e['holder'].get('granted_jobs') for e in entries if e['id'] == qid and e.get('holder')), None)
+
+
 def _queue_mark_released(state_path, qid, now, evidence, alive):
     try:
         with state_lock(state_path):
@@ -2532,12 +2552,21 @@ def grant_env(budget, declared, environ):
 
 
 def _granted_jobs(budget, declared, environ):
-    """The CARGO_BUILD_JOBS value this job will actually run with, or None when it gets no limit (no environment to export into,
-    no budget, a class without Cargo variables, or a setting of its own that is not a positive integer)."""
-    if environ is None:
-        return None
+    """The CARGO_BUILD_JOBS value this job will actually run with, or None when it gets no limit (no budget, a class without Cargo
+    variables, or a setting of its own that is not a positive integer).
+
+    environ None means nothing is exec'd by this process: the `reserve` CLI and the non-exec `queue claim` CLI (SPE-171). The job
+    is started later by a supervisor, so the limit recorded is the one the claim WOULD have exported (the band grant, or the declared
+    slots when the budget is absent or unavailable) and the supervisor must export it as CARGO_BUILD_JOBS. Without a record the holder
+    would be charged every core, which closed the second lane for a job that never asked for them. A holder with no declared Cargo
+    class still records nothing and keeps the whole-budget legacy charge."""
+    non_exec = environ is None
+    # Deliberately {}: a lower CARGO_BUILD_JOBS in the claiming shell is not the supervisor's environment, so it is ignored and the
+    # charge stays at the full band grant (conservative).
     try:
-        value = grant_env(budget, declared, environ).get('CARGO_BUILD_JOBS')
+        value = grant_env(budget, declared, {} if non_exec else environ).get('CARGO_BUILD_JOBS')
+        if not value and non_exec and (declared or {}).get('class') in GRANT_ENV:
+            value = (declared or {}).get('cpu_slots')
         return int(value) if value else None
     except Exception:
         return None
@@ -3107,6 +3136,11 @@ def _queue_cli(args, state_path, free_fn, host_fn=None):
                           ttl=args.ttl, allow_long=args.allow_long, memory_fn=lambda: _memory_precondition(),
                           exec_fn=lambda program, argv: None, declared=declared, host_fn=host_fn)
         out.pop('exit', None)
+        jobs = _entry_granted_jobs(state_path, args.qid) if out.get('ok') else None
+        if jobs:
+            out['cargo_build_jobs'] = jobs
+            out['warning'] = ('the holder is charged %d cpu slots: the supervising process must run the job with CARGO_BUILD_JOBS=%d '
+                              'or lower' % (jobs, jobs))
     elif command == 'trial-report':
         since, until = _trial_time(args.since), _trial_time(args.until) if args.until else None
         base_since, base_until = _trial_time(args.baseline_since), _trial_time(args.baseline_until)
@@ -3172,6 +3206,11 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None, host_fn=None):
                           declared=declared, host_fn=host_fn)
                   if args.command == 'reserve' else release(args.label, state_path))
         print(result['reason'])
+        if args.command == 'reserve' and result['admit']:
+            jobs = _reserved_jobs(state_path, args.label)
+            if jobs:
+                print('cargo_build_jobs=%d: the holder is charged %d cpu slots; the supervising process must run the job with '
+                      'CARGO_BUILD_JOBS=%d or lower' % (jobs, jobs, jobs))
         if result.get('budget') and sys.stderr.isatty():
             print(budget_line(result['budget']), file=sys.stderr)
         return 0 if result['admit'] else REFUSED_EXIT
