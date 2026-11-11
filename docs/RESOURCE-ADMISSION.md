@@ -413,4 +413,5 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
 - Pressure: AMBER or RED admits no new concurrent job and nothing running is signalled.
 - Trial evidence: `disk-admission.py queue trial-report --since ISO [--until ISO] [--baseline-since ISO --baseline-until ISO]
   [--json]` (read-only, writes nothing, takes no lock). Measurement lines also carry `swap_used_bytes`. A third lane needs its PASS
-  output, listed in ADR 0017 revision 2 with the rollback procedure.
+  output, with the criteria of ADR 0017 revision 3 (exact-N stage gates, overlap-window disk margin, running-only deduplicated
+  `fits_if_cap_were_3`; the window-wide minimum free disk is reported, not gated) and the rollback procedure of revision 2.

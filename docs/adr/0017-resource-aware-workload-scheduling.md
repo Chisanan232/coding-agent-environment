@@ -1,6 +1,7 @@
 # ADR 0017: Resource-aware workload scheduling (SPE-150)
 
-Status: accepted for the repository. Revision 2 (SPE-160) adds the machinery for a **second heavy lane** and the evidence tooling for
+Status: accepted for the repository. **Revision 3 (SPE-172, draft, awaiting owner sign-off) records the first trial evidence and revises the
+third-lane protocol; it does not enable a third lane.** Revision 2 (SPE-160) adds the machinery for a **second heavy lane** and the evidence tooling for
 a conditional third. **The cap is 2 in the stable and wide tiers, set by the single constant `HEAVY_LANES` in the final "flip"
 commit described below; reverting that commit restores 1 and is the rollback.** A third lane stays off behind
 `THIRD_LANE_ENABLED = False`. Supersedes the clause "One heavy lane" in decision 3 of [ADR 0015](0015-memory-aware-admission-and-gh-first.md);
@@ -164,6 +165,87 @@ change. Effects, in order:
    `swap_used_bytes`) as unknown keys. Verified by loading the pre-change script against a reservation, a CLAIMED entry and a
    measurement line that carry them.
 
+## Revision 3: trial evidence and the third-lane protocol (SPE-172, draft)
+
+Status of this revision: **proposed**. Until the owner signs it off, the text above ("Trial plan", step 3) is the protocol in force. The
+code in this change implements the revised criteria below; `THIRD_LANE_ENABLED` stays `False` in every commit except the last, which is
+the flip and must not merge until the owner has signed off and a `trial-report` PASS is attached.
+
+### Trial evidence 2026-11-11
+
+Measured by a read-only analysis of the queue state, receipts and measurement logs (no state was written). Logs rotate at 1 MiB, so
+the verdicts cover about 12 h; the job and overlap figures cover the 63 h since cap 2 was enabled.
+
+| Measure | Result | Reading |
+|---|---|---|
+| Budget verdicts | 2,887 | 88% came from stale cap-1 copies of the script: 116 of 133 checkouts still have `HEAVY_LANES` = 1 |
+| `fits_if_cap_were_3` true | 3.4%, i.e. 12 of 358 revision-2 verdicts | Weighted by polling (one queue entry alone produced 125 of the 358), so it measures re-polling, not distinct situations |
+| Reason: request had no class | 58.2% | Artifact: the request is charged as legacy (whole budget) |
+| Reason: running holder charged 16 CPU slots, no `granted_jobs` | 25.4% | Artifact, fixed by PR #226 (not part of this change) |
+| Reason: holder with no class charged the whole memory budget | 12.6% | Artifact |
+| Reason: memory projected over the limit | 14.8% | Real in the model but uncalibrated. Container-suite memory lives in the Docker VM, so it measures about 0 while its 12 GiB estimate is charged on top of `host_used`: likely double counting |
+| Reason: Docker exclusion key | 13.1% | Real |
+| Reason: shared Cargo target exclusion key | 9.3% | Real |
+| Reason: disk floor | 0% | Not binding |
+| Minimum free disk | 149.0 GiB (159,936,757,760 B) at 2026-11-11T14:03:03Z | One job running, no overlap. Builds ran serially and grew the shared target by about 383 GiB; free fell from 203.7 to 149.0 GiB. The old criterion takes the minimum over all samples, so it measured the host, not concurrency |
+| Overlap | 3 overlapped jobs, about 93 to 160 s of two-way overlap in 63 h | Peak concurrency 2, never 3; peak pressure 1; swap growth 0 |
+| Throughput, nominal cap 1 vs cap 2 | 1.05 vs 1.45 jobs/h wall clock | Nominal, not a demonstrated gain |
+| Wait median / p90 | 11 / 182 min at cap 1 vs 158 / 381 min at cap 2 | Dominated by about 41 h of Circinus container-suite jobs that share the Docker key |
+
+Reasons overlap (one verdict can list several), so the percentages do not sum to 100.
+
+**What the evidence shows.** The trial has not produced a third-lane signal in either direction: almost every refusal is an artifact of
+stale copies, missing classes or an unrecorded `granted_jobs`; the real exclusions (Docker, shared target) are the declared limits of the
+design; and there has been essentially no concurrency (a few minutes) to judge safety by. It does show that two criteria of revision 2
+measured the wrong thing: the disk criterion (host-wide minimum, driven by serial shared-target growth) and the `fits_if_cap_were_3`
+share (polling-weighted, and counting verdicts made on an empty host, which trivially fit).
+
+### Revised stage-3 trial protocol
+
+Criteria names are unchanged. Changes, all in `trial_report`:
+
+1. **Stage gates** (`overlapped_jobs`, `overlapped_classes`, new `overlap_hours`) count finished jobs that ran with **exactly N jobs at
+   once** (N = 2, `TRIAL_STAGE_N`, the stage that evidences a third lane), a job's figure being the larger of its sampled `concurrent`
+   and the claim intervals. Required: at least 20 such jobs; at least 2 declared classes with at least 5 each (`unclassified` does not
+   count); at least 5 h during which exactly N jobs were running. Previously: 10 overlapped jobs across 2 classes. A stage with less is
+   `insufficient`, never PASS.
+2. **`min_free_bytes`** is evaluated over overlap samples only (`concurrent` of at least 2) as `free - reserved >= floor + 60 GiB`, where
+   `reserved` is the declared bytes of the jobs live at that sample; a sample whose live jobs have no byte figure is not evaluated. The
+   window-wide minimum free disk and its time are reported (`window_min_free_bytes`, `window_min_free_at`) and are **not gated**. No
+   evaluable overlap sample is `insufficient`.
+3. **`fits_if_cap_were_3_share`** counts only verdicts made with exactly `TRIAL_STAGE_N` jobs running (`count == 2`: `fits()` is `count + 1 <= limit`, so a verdict with fewer
+   running says nothing about a third lane), once per queue entry and situation (entry, running count, band and resource reasons); the required share (at least half) is unchanged.
+   Known limits of the report, to be read with a PASS: reserved bytes are rebuilt from jobs claimed inside the window only (a job already
+   running at the window start, GRANTED-not-yet-claimed entries and orphans are not counted, so the margin can be optimistic), and
+   `overlap_hours` counts finished jobs only (an unfinished third job hides a three-way period as two-way).
+4. Unchanged: median queue-to-completion at least 20% better than the solo baseline, worst class slowdown at most 1.6, no pressure sample
+   above 1 during an overlap, swap growth at most 2 GiB.
+
+### Prerequisites before a trial can say anything
+
+1. Every checkout runs revision 2 code: bring the 116 stale checkouts to it, or route every job through one canonical copy of the script.
+2. Every Cargo job goes through `run --queue-id`, so `granted_jobs` is recorded.
+3. Every job declares a class; an unclassified job is charged as a legacy request and holds the second lane closed.
+4. Recalibrate `host_used` and the container-suite memory so the Docker VM is not charged twice (open item 3 of revision 1).
+5. Reject a misdeclaration such as q000389: a job declared `build-cold-isolated` whose exclusion key is nevertheless the shared target
+   (it holds the key every other build needs while claiming isolation). Declare the key the job really uses.
+6. Keep the logs for the whole trial: copy or raise the 1 MiB rotation so the verdicts of the full window survive (today about 12 h).
+7. Reclaim disk to at least 200 GiB free before the trial starts; the shared target grew about 383 GiB in the observed window.
+
+### The remaining gap
+
+The only direct evidence for the third lane is a PASS from the revised `queue trial-report` over a window that meets the prerequisites.
+Today there are 3 overlapped jobs and minutes of overlap against 20 jobs and 5 h required, and the two real exclusions (Docker key,
+shared target) still serialise most work. Whether a third lane would help at all is therefore open; the trial of the second lane has to
+run first, with the prerequisites in place.
+
+### Consolidated sign-off statement
+
+The owner is asked to sign off on this: (a) the evidence table is accepted as the record of the first trial; (b) the revised criteria
+and prerequisites replace step 3 of the trial plan; (c) `THIRD_LANE_ENABLED` is flipped only by a separate pull request carrying a
+PASS from the revised report; and (d) the flip, which lives alone in its own draft pull request, is the rollback
+unit, must not merge before (c) is satisfied, and is reverted to restore today's state. Sign-off of (a) and (b) does not authorise (d).
+
 ## Consequences
 
 - Text that says "one heavy lane at a time" as a permanent rule is replaced with "up to two heavy lanes (the second only when the resource
@@ -179,3 +261,4 @@ change. Effects, in order:
 |---|---|
 | 1 | Initial decision (SPE-150 PR7) |
 | 2 | Two heavy lanes behind the budget, `heavy_lane_cap()`, `LANE_CEILING` 3 with `THIRD_LANE_ENABLED` off, `granted_jobs`, `queue trial-report`, rollback procedure (SPE-160) |
+| 3 | Draft (SPE-172): trial evidence 2026-11-11, revised stage-3 criteria (exact-N stage gates, overlap-window disk margin, running-only deduplicated `fits_if_cap_were_3`), prerequisites, sign-off statement |
