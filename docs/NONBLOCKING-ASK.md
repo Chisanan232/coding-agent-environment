@@ -110,7 +110,7 @@ Limits: the decision source (`user_temporary`, `user_reject`) is read from the s
 
 ## Expiry and reissue: what the docs say (2026-11-11, read-only research)
 
-Documented: Remote Control "keeps permission prompts and AskUserQuestion questions open until you answer them" (code.claude.com/docs/en/remote-control, "Forwarded dialogs expire"); other forwarded dialogs get a 5-minute default, controlled by `dialogExpiry` (2.1.224+, default and values not read). `permissions.denyInsteadOfPrompting` (2.1.319+, user settings or `--settings` only) is an opt-in auto-deny and is not enabled here.
+Documented: Remote Control "keeps permission prompts and AskUserQuestion questions open until you answer them" (code.claude.com/docs/en/remote-control, "Forwarded dialogs expire"); other forwarded dialogs get a 5-minute default, controlled by `dialogExpiry` (2.1.224+, user or managed scope, default `5m`, values `60s`/`5m`/`10m`/`never`); `dialogExpiry` does not govern permission prompts or AskUserQuestion, and the "open until answered" statement covers Remote Control forwarding only. `permissions.denyInsteadOfPrompting` (2.1.319+, user, managed or `--settings`; not project or local) is an opt-in auto-deny and is not enabled here.
 Not documented: a timeout for a background-subagent prompt, a way to re-surface or reissue a missed prompt (only `/remote-control` after a connection failure), or a maximum pending time.
 This agrees with the 7h21m observation but proves nothing about expiry, so A6 and the expired-prompt case of A9 stay unverified. The changelog for 2.1.306 itself could not be confirmed (the fetched page began at 2.1.311).
 
