@@ -107,6 +107,10 @@ admission logic tested and the rollback documented before rollout.
   slots, not every core (SPE-171); the claim output carries `cargo_build_jobs` and a warning that the supervising process must run
   the job with `CARGO_BUILD_JOBS` at or below it. A legacy holder with no estimate, a classed record that carries no limit, and
   any job claimed before SPE-171 are still charged all cores or the whole budget and keep the second lane closed until they finish.
+  The recorded non-exec limit is NOT enforced: nothing can make a supervisor honour it. The charge is a declaration; the safety net
+  is the measured-load gate (`load_credit` is `min(slots, measured cpu rate)`, so a holder that really burns more than it declared
+  still raises the load the next lane sees), not the charge. A non-exec refresh of an existing holder never changes its record. Both
+  `queue claim` and `reserve` print `cargo_build_jobs` and the warning.
 - **Pressure.** Lanes 2 and up need band GREEN: memory pressure level 1, swap I/O at most 4 MiB/s, compressor at most 25% of RAM and
   load per core (corrected for admitted work) at most 2.0, i.e. the memory gate's EXIT bounds. The memory gate also asks for these
   before it admits a tree beside a running one. AMBER or RED means no new concurrent job; lane 1 keeps today's ENTER thresholds.
