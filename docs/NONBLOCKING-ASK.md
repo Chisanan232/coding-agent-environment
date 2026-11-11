@@ -15,7 +15,7 @@ criterion below is verified on the real host path (Claude Code Remote Control on
 | A3 | The waiting operation is assigned to **one background subagent** where the host supports it | PASS: one background subagent held the prompt (lane A3) |
 | A4 | The root agent (or another subagent) continues **independent authorized work** within existing concurrency limits while the prompt is open | PASS: a new subagent launched about 40 s after the prompt and finished independent read-only work while it was still pending |
 | A5 | The 15-minute rule changes **scheduling only**: the original prompt is not cancelled, dismissed or converted to a text reply when the timer fires | PASS for one run, for what was observed: the original prompt survived past T0+15m untouched and was accepted after 24m28s; nothing cancelled, reworded or converted it. No scheduling timer was involved, only elapsed time |
-| A6 | If the platform itself expires a prompt, that is **recorded explicitly** and a supported reissue path is determined | Not expired within 24m28s; expiry after that and a reissue path are NOT_RUN |
+| A6 | If the platform itself expires a prompt, that is **recorded explicitly** and a supported reissue path is determined | Not expired within 61m46s on an unanswered prompt; no expiry event observed, so expiry and a reissue path stay unverified |
 | A7 | A watcher may observe the decision and resume work; it **cannot** grant permission or bypass the host gate | Design met; live part observed: the observer printed no decision and the accept recorded `user_temporary`, not the observer or a watcher |
 | A8 | Approve on the **original** prompt resumes **only** the intended exact-head action; Deny and Select are tested separately | Allow once resumed only the intended command and Deny did not run its command (separate lanes); the exact-head merge action itself is NOT_RUN |
 | A9 | An expired prompt, a changed head or a duplicate event **cannot execute the wrong action** | Ledger part tested in a disposable dir; live part NOT_RUN |
@@ -93,8 +93,11 @@ With the observer installed, the same `Bash(rtk proxy *)` ask rule raised a real
 | 2 (2026-11-10) | 23:47:52 | 23:51:40 | accept, `user_temporary` | No: same |
 | 3 hold (2026-11-11) | 00:04:02 | 00:28:30 | accept, `user_temporary` | Yes: pending 24m28s, owner told the hold-until time in advance |
 | Deny lane (2026-11-11) | 00:29:07 | 00:30:33 | reject, `user_reject` | Yes: "Denied by user", command did not run |
+| A6 hold (2026-11-11) | 03:17:24 | unanswered; still open at 04:19:10 (61m46s) | none | Yes: owner told to leave it unanswered; no expiry event, command did not run |
 
 Run 3: command `rtk proxy echo spe170-allow3-hold-0825TPE`. A second subagent launched about 40 s after the prompt and finished a read-only ticket verification by 00:06:26, while the prompt was still pending. The prompt survived T0+15m (00:19:02) and the announced hold-until (08:25 Asia/Taipei = 00:25:00Z). After the owner's Allow once the observer showed `RAN_AFTER_OPEN_PROMPT` and the lane returned the echo output.
+
+A6 hold: command `rtk proxy echo spe170-a6-1794367034`, one lane, never answered. Polled every 10-15 minutes against a 60-minute window (to 04:17Z). The observer row stayed `PROMPTED_NO_RESULT` and the lane transcript never gained a `permissionDecision` or a result for the marker, so the platform did not expire the prompt and the command did not run within the window. This does not show the platform never expires a prompt; it bounds expiry above 61m46s for this host mode.
 
 Each transcript also shows a second `accept` 4-5 s after the owner's decision with source `config` and reason `classifier`; it belongs to the lane's final report call and did not change the owner's decision.
 
