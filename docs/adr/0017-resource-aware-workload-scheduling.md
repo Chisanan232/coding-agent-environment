@@ -6,6 +6,9 @@ commit described below; reverting that commit restores 1 and is the rollback.** 
 `THIRD_LANE_ENABLED = False`. Supersedes the clause "One heavy lane" in decision 3 of [ADR 0015](0015-memory-aware-admission-and-gh-first.md);
 the rest of ADR 0015 stands.
 
+**Revision 3 (SPE-173) is a DRAFT and is not accepted.** It proposes raising `LANE_CEILING` from 3 to 4. Nothing in it changes code or
+the cap: the ceiling stays 3 until the stage-3 trial below passes and the owner decides. See "Revision 3 (draft)".
+
 ## Context
 
 ADR 0015 fixed "one heavy lane" because it was the only safe rule available: admission knew bytes of disk and process names, not
@@ -157,6 +160,131 @@ change. Effects, in order:
    `swap_used_bytes`) as unknown keys. Verified by loading the pre-change script against a reservation, a CLAIMED entry and a
    measurement line that carry them.
 
+## Revision 3 (draft): a fourth heavy lane (SPE-173)
+
+Status: **DRAFT, not accepted.** Documentation only. The measurements below are from "analysis 2026-11-11" (read-only).
+
+### Decision statement
+
+Target: four concurrent heavy jobs in normal operation. **The ceiling stays 3, and `THIRD_LANE_ENABLED` stays `False`, until stage 3 of
+the trial below passes.** Lane 3 itself has not passed its trial (the trial protocol is SPE-172, draft). Raising the ceiling is a further
+owner decision taken on that evidence; this draft only fixes what the text and the code would have to say if the owner takes it.
+
+### Related work, not repeated here
+
+- PR #226: CPU accounting fix. The budget's CPU sum (see "How the budgets are enforced") is only as good as that accounting.
+- SPE-172 (draft PR): the lane-3 trial protocol. Stage 3 of this draft's staged trial is that protocol.
+
+### What fits today (analysis 2026-11-11)
+
+| Resource | Finding |
+|---|---|
+| CPU | 16 cores: four 4-slot jobs, or 8+4+4, fit exactly |
+| Memory | about 21 GiB free for new work (idle `host_used` about 68 of 128 GiB) |
+| Disk | two isolated builds need 2x60+100 = 220 GiB (two 60 GiB targets plus the 100 GiB floor) against about 169-173 GiB free. Four lanes need disk reclaimed: at least 200 GiB free to start a stage |
+| Exclusive keys | one shared-target job and one Docker job at a time |
+
+Memory is the tightest budget today and the figure is dominated by two known double counts (see Prerequisites), so it may be pessimistic.
+
+### Job classes that may overlap
+
+- Lanes 1-2: as today (any declared class the budget admits).
+- Lanes 3-4: only `build-cold-isolated` jobs with their own `CARGO_TARGET_DIR` exclusion key, or `remote` / `light` jobs.
+- `container-suite` (the Docker key) and shared-target builds never overlap with their own kind (decision 5, unchanged).
+- Lanes 3-4 also require all of: no holder without a class, no holder missing `granted_jobs` (such a holder is charged every core or the
+  whole budget today), band GREEN, tier wide, and `free - reserved - request >= HEAVY_FLOOR + 60 GiB`.
+- The fourth lane additionally requires the sum of CPU slots including the request to be at most the core count (no oversubscription).
+
+### How the budgets are enforced per lane
+
+All in `scripts/disk-admission.py`, under the existing lock; the host is sampled before it.
+
+- **Lane count.** `heavy_lane_cap(tier, latch)` (about line 320). Lane 1 never reads the budget. Lanes 2 and up go through
+  `_budget_refusal` (about line 2664): a host sample, status ok, `would_admit`, band GREEN.
+- **CPU.** `budget_decision` (about lines 2308-2406): `cpu_used + cpu_need > cpu_limit` refuses, where `cpu_limit = cores *
+  CPU_BUDGET_PERCENT // 100` (100%, so cores) and `cpu_used` sums each holder's slots (all cores for a legacy or uncapped holder;
+  otherwise `min(cpu_slots, granted_jobs)`). This already applies to every lane, so the fourth lane's no-oversubscription rule is
+  today's behaviour made an explicit invariant, not new code.
+- **Memory.** `projected = host_used + sum(max(0, est_mem - measured_rss)) + 8 GiB x unmanaged trees + request mem`; refused when
+  `projected > RAM x (1 - headroom)`, headroom 30% in GREEN and 40% otherwise (`HEADROOM_PERCENT`); a legacy holder is charged the whole
+  limit.
+- **Disk.** `free_bytes - reserved_bytes - request bytes < floor` refuses, with `floor = HEAVY_FLOOR` (100 GiB) today. The extra
+  60 GiB for lanes 3-4 is new and is not in the code now (`trial_report` applies floor + 60 GiB only as a trial criterion).
+- **Exclusion keys.** Any shared key refuses.
+
+### Evidence so far (analysis 2026-11-11)
+
+| | Nominal 1 lane (11-01 to 11-08) | Nominal 2 lanes (to 11-11 15:00Z) | 3 lanes |
+|---|---|---|---|
+| Completed jobs | 186 | 114 | no data: not run |
+| Jobs/hour, wall clock | 1.05 | 1.45 | - |
+| Jobs per busy hour | 2.60 | 1.65 | - |
+| Queue wait median / p90 | 11 / 182 min | 158 / 381 min | - |
+| Crate job median | 2.8 min (n=83) | 2.4 min (n=36) | - |
+| Container-suite median | 34 min (n=2) | 57.0 min (n=50) | - |
+| Legacy median | 2.2 min (n=71) | 28.5 min (n=18) | - |
+| Workspace median | not reported | 10.8 min (n=4) | - |
+| Minimum free disk | not reported | 149.0 GiB | - |
+| Pressure / swap growth | not reported | always 1 / 0 | - |
+
+Read these plainly:
+
+- There was effectively **no real cap-2 window**: about 93-160 s of two-way overlap in 63 h, and 3 overlapped jobs.
+- The job mix is **not comparable**: about 41 h of Circinus container-suite jobs share the Docker key and cannot overlap, and the 1-lane
+  window had a different mix.
+- Confidence is **low**. These numbers justify the prerequisites below. **They do not justify raising the ceiling.**
+
+### Code consequences (specified, not implemented)
+
+1. `FOURTH_LANE_ENABLED = False` is honoured only when `THIRD_LANE_ENABLED` is on; with the third lane off it has no effect.
+2. `LANE_CEILING = 4`. Only the flip PR for each stage changes the flags; the ceiling change itself ships with, or after, stage 3's pass.
+3. `heavy_lane_cap` adds a lane for the wide tier per enabled flag and still returns `min(lanes, LANE_CEILING)`.
+4. `fits_if_cap_were_3` is computed from `LANE_CEILING` (line 2396), so raising the ceiling would silently change its meaning and
+   `trial_report`'s `fits_if_cap_were_3_share` (line 2067). It must be pinned to the literal 3, and a separate `fits_if_cap_were_4`
+   added, with the stage-N criterion reading `fits_if_cap_were_N`.
+5. The lane-3/4 class and `+60 GiB` rules above are added to the budget as a lane-index-dependent refusal reason.
+6. `trial_report` takes the stage N and applies the per-stage gates below.
+
+**Unchanged ADR 0017 invariants:** atomic admission, headroom, ownership, strict FIFO that stops at the first entry that does not fit
+(so an ineligible head, for example a `container-suite` head while Docker is held, blocks lane 4 until it can run: a deliberate
+fairness cost), backpressure, no preemption, and nothing is ever signalled.
+
+### Proposed four-lane trial: stages 2, 3, 4
+
+Each stage needs at least 20 finished jobs that ran with exactly N jobs at once, across at least 2 classes with at least 5 each, and at
+least 5 h of N-way overlap. Gates, per stage:
+
+- Median queue-to-completion at least 20% better than the previous stage.
+- Worst class slowdown at most 1.6.
+- Pressure at most 1 and swap growth at most 2 GiB during overlap.
+- `free - reserved >= HEAVY_FLOOR + 60 GiB` during overlap samples (the window-wide minimum free is reported, not gated).
+- Share of `fits_if_cap_were_N` at least 0.5, counted only with at least one job running and once per entry and situation.
+- No budget sample misses its deadline.
+
+Stage 2 re-runs the current cap with the trial's own gates (it has no real window yet), stage 3 is SPE-172, and stage 4 needs both.
+Missing data is insufficient, never PASS.
+
+### Rollback criteria
+
+Revert the flip PR (running jobs finish untouched; nothing is signalled, released or requeued; the procedure in "Rollback procedure"
+applies) on any of: pressure above 1 or swap growth above 2 GiB during overlap; `free - reserved` below floor + 60 GiB; slowdown above
+1.6; no improvement over the previous stage; any duplicate grant or broken ownership invariant.
+
+### Prerequisites, in order
+
+1. Stale checkouts (116 of 133 still at `HEAVY_LANES = 1`) brought to revision 2, or one canonical copy.
+2. Cargo claims go through `run --queue-id` so `granted_jobs` is recorded.
+3. Every job declares a class.
+4. Recalibrate `host_used` and the container-memory double counting.
+5. Fix misdeclared `build-cold-isolated` entries whose key is the shared target.
+6. Keep logs for the whole trial (they rotate at 1 MiB).
+7. Reclaim disk to at least 200 GiB free.
+
+### Open questions for the owner
+
+- Whether four lanes are worth the Docker-head blocking cost under strict FIFO.
+- Whether the lane-3 and lane-4 flips share one reviewed PR each, as the lane-3 flip does today.
+
 ## Consequences
 
 - Text that says "one heavy lane at a time" as a permanent rule is replaced with "up to two heavy lanes (the second only when the resource
@@ -172,3 +300,4 @@ change. Effects, in order:
 |---|---|
 | 1 | Initial decision (SPE-150 PR7) |
 | 2 | Two heavy lanes behind the budget, `heavy_lane_cap()`, `LANE_CEILING` 3 with `THIRD_LANE_ENABLED` off, `granted_jobs`, `queue trial-report`, rollback procedure (SPE-160) |
+| 3 (draft) | Proposes `LANE_CEILING` 4 and a staged trial 2 -> 3 -> 4; not accepted, no code change (SPE-173) |
