@@ -54,7 +54,7 @@ class Trial(unittest.TestCase):
                                                'swap_used_bytes': swap})
         return qid
 
-    def receipt(self, fits, when=None, qid=None, count=1, band='GREEN'):
+    def receipt(self, fits, when=None, qid=None, count=2, band='GREEN'):
         self.seq += 1
         path = self.path.parent / 'queue/receipts.jsonl'
         line = {'ts': iso(when or T0 + timedelta(hours=1)), 'event': 'shadow-budget', 'id': qid or 'r%06d' % self.seq, 'label': 'x',
@@ -177,6 +177,21 @@ class Trial(unittest.TestCase):
         crit = self.criteria(self.report())['min_free_bytes']
         self.assertEqual((crit['verdict'], crit['value']), ('FAIL', 150 * GIB))
 
+    def test_disk_margin_needs_every_overlap_sample_evaluable(self):
+        self.scenario()
+        orphan = self.job('build-crate', T0 + timedelta(days=1, hours=2), 100, RUN, True)   # an overlap sample whose job has no bytes figure
+        path = self.path.parent / 'queue' / (orphan + '.json')
+        entry = json.loads(path.read_text())
+        entry['bytes'] = None
+        path.write_text(json.dumps(entry))
+        self.assertEqual(self.criteria(self.report())['min_free_bytes']['verdict'], 'insufficient')
+
+    def test_a_class_outside_the_workload_classes_is_not_a_declared_class(self):
+        for n in range(10):
+            for _ in range(2):
+                self.job('made-up-class', T0 + timedelta(hours=n), 100, RUN, True)
+        self.assertEqual(self.criteria(self.report())['overlapped_classes']['verdict'], 'insufficient')
+
     def test_disk_without_a_reserved_figure_or_overlap_sample_is_insufficient(self):
         self.job('build-crate', T0, 100, RUN, False)                         # a solo sample only
         self.assertEqual(self.criteria(self.report())['min_free_bytes']['verdict'], 'insufficient')
@@ -186,10 +201,11 @@ class Trial(unittest.TestCase):
         for _ in range(125):                                                 # a polled entry repeats one verdict
             self.receipt(True, qid='q000900')
         self.receipt(False, qid='q000901')
-        self.receipt(False, qid='q000901', count=2)                          # same entry, a different situation
+        self.receipt(False, qid='q000901', count=3)                          # same entry, a different situation (3 running: not a third-lane question)
+        self.receipt(True, qid='q000902', count=1)                           # one running: fits() is count + 1 <= limit, trivially true for a cap of 2
         self.receipt(True, qid='q000900', band='AMBER')
         crit = self.criteria(self.report())['fits_if_cap_were_3_share']
-        self.assertEqual((crit['value'], crit['verdict']), (0.5, 'PASS'))    # 2 of 4 distinct (entry, situation) verdicts
+        self.assertEqual((crit['value'], crit['verdict']), (0.667, 'PASS'))  # 2 of 3 distinct count==2 (entry, situation) verdicts
         self.setUp()
         self.receipt(True, count=0)
         self.assertEqual(self.criteria(self.report())['fits_if_cap_were_3_share']['verdict'], 'insufficient')

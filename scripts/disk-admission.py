@@ -2102,7 +2102,9 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
         b = r.get('budget')
         if r.get('event') != 'shadow-budget' or not isinstance(b, dict) or not ((t := _trial_time(r.get('ts'))) and since <= t <= until):
             continue
-        if type(b.get('count')) is not int or b['count'] < 1 or type(b.get('fits_if_cap_were_3')) is not bool:
+        # fits() is count + 1 <= limit, so only a verdict made with exactly stage_n jobs running asks whether one more (a third lane) fits;
+        # with fewer running it says nothing beyond the current cap.
+        if b.get('count') != stage_n or type(b['count']) is not int or type(b.get('fits_if_cap_were_3')) is not bool:
             continue
         key = (r.get('id'), b['count'], b.get('band'), tuple(b.get('resource_reasons') or ()))
         if key not in counted:
@@ -2133,13 +2135,16 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
     frees = [ln['free_bytes'] for ln in in_window if type(ln.get('free_bytes')) is int]
     # Disk is judged where concurrency could cause the shortfall: overlap samples, free minus what running jobs reserved. The
     # window-wide minimum is reported, not gated (shared-target growth lowers it with one job running).
-    margins = []
+    margins, margin_samples = [], 0
     for ln in in_window:
         t = _trial_time(ln.get('ts'))
         if type(ln.get('free_bytes')) is int and type(ln.get('concurrent')) is int and ln['concurrent'] >= 2:
+            margin_samples += 1
             reserved = _reserved_at(jobs, t, until)
             if reserved is not None:
                 margins.append(ln['free_bytes'] - reserved)
+    # A sample without byte figures is missing data; the margin only passes when every overlap sample could be evaluated.
+    margins_complete = bool(margins) and len(margins) == margin_samples
     low_line = min((ln for ln in in_window if type(ln.get('free_bytes')) is int), key=lambda ln: ln['free_bytes'], default=None)
     seen3 = [v['fits_if_cap_were_3'] for v in verdicts]
     c = TRIAL_CRITERIA
@@ -2150,7 +2155,7 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
     per_class = {}
     for j in at_stage:
         per_class[j['class']] = per_class.get(j['class'], 0) + 1
-    n_classes = sum(1 for name, n in per_class.items() if name != 'unclassified' and n >= c['jobs_per_class'])
+    n_classes = sum(1 for name, n in per_class.items() if name in WORKLOAD_CLASSES and n >= c['jobs_per_class'])
     hours = _overlap_hours([j for j in jobs if j['finished']], until, stage_n)
     growth = (max(v for _, v in swaps) - swaps[0][1]) if len(swaps) >= 2 else None
     floor_need = HEAVY_FLOOR + c['free_margin_bytes']
@@ -2173,8 +2178,9 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
         _criterion('pressure_samples_above_1_during_overlap', pressured if pressure_known else None, pressure_verdict, '== 0'),
         _criterion('swap_growth_bytes', growth, verdict(growth is not None and growth <= c['swap_growth_bytes'], growth is not None),
                    '<= %d' % c['swap_growth_bytes']),
-        _criterion('min_free_bytes', min(margins) if margins else None, verdict(bool(margins) and min(margins) >= floor_need, bool(margins)),
-                   '>= %d (floor + 60 GiB) for free - reserved, over overlap samples' % floor_need),
+        _criterion('min_free_bytes', min(margins) if margins else None, verdict(bool(margins) and min(margins) >= floor_need, margins_complete),
+                   '>= %d (floor + 60 GiB) for free - reserved, over every overlap sample (%d of %d evaluable)' % (
+                       floor_need, len(margins), margin_samples)),
         _criterion('fits_if_cap_were_3_share', None if not seen3 else round(sum(seen3) / len(seen3), 3),
                    verdict(bool(seen3) and sum(seen3) / len(seen3) >= c['fits_share'], bool(seen3)),
                    '>= %g of verdicts made with a job running' % c['fits_share']),
