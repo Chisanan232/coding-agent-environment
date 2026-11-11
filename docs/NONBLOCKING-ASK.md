@@ -10,16 +10,16 @@ criterion below is verified on the real host path (Claude Code Remote Control on
 
 | # | Criterion | Status |
 |---|---|---|
-| A1 | A real tool permission request stays a **live, actionable native Approve/Deny** on the iPhone (Remote Control) | NOT_RUN |
-| A2 | A product decision is an **interactive Select** control where the host supports it | NOT_RUN |
-| A3 | The waiting operation is assigned to **one background subagent** where the host supports it | NOT_RUN |
-| A4 | The root agent (or another subagent) continues **independent authorized work** within existing concurrency limits while the prompt is open | NOT_RUN |
-| A5 | The 15-minute rule changes **scheduling only**: the original prompt is not cancelled, dismissed or converted to a text reply when the timer fires | NOT_RUN |
-| A6 | If the platform itself expires a prompt, that is **recorded explicitly** and a supported reissue path is determined | NOT_RUN |
-| A7 | A watcher may observe the decision and resume work; it **cannot** grant permission or bypass the host gate | Design met (ledger has no approve path); live part NOT_RUN |
-| A8 | Approve on the **original** prompt resumes **only** the intended exact-head action; Deny and Select are tested separately | NOT_RUN |
+| A1 | A real tool permission request stays a **live, actionable native Approve/Deny** on the iPhone (Remote Control) | PASS for Allow once and Deny on a harmless ask-ruled command (2026-11-11 run 3, deny lane); owner attests both taps were on the iPhone, telemetry records the decision source only |
+| A2 | A product decision is an **interactive Select** control where the host supports it | Select value verified (chosen "Blue" returned as Blue); the device for this one was not separately confirmed, and the observer cannot corroborate it (an `AskUserQuestion` stays `PROMPTED_NO_RESULT`) |
+| A3 | The waiting operation is assigned to **one background subagent** where the host supports it | PASS: one background subagent held the prompt (lane A3) |
+| A4 | The root agent (or another subagent) continues **independent authorized work** within existing concurrency limits while the prompt is open | PASS: a new subagent launched about 40 s after the prompt and finished independent read-only work while it was still pending |
+| A5 | The 15-minute rule changes **scheduling only**: the original prompt is not cancelled, dismissed or converted to a text reply when the timer fires | PASS for one run, for what was observed: the original prompt survived past T0+15m untouched and was accepted after 24m28s; nothing cancelled, reworded or converted it. No scheduling timer was involved, only elapsed time |
+| A6 | If the platform itself expires a prompt, that is **recorded explicitly** and a supported reissue path is determined | Not expired within 24m28s; expiry after that and a reissue path are NOT_RUN |
+| A7 | A watcher may observe the decision and resume work; it **cannot** grant permission or bypass the host gate | Design met; live part observed: the observer printed no decision and the accept recorded `user_temporary`, not the observer or a watcher |
+| A8 | Approve on the **original** prompt resumes **only** the intended exact-head action; Deny and Select are tested separately | Allow once resumed only the intended command and Deny did not run its command (separate lanes); the exact-head merge action itself is NOT_RUN |
 | A9 | An expired prompt, a changed head or a duplicate event **cannot execute the wrong action** | Ledger part tested in a disposable dir; live part NOT_RUN |
-| A10 | A host mode that cannot support a criterion is reported by criterion; a notification-only flow is never marked complete | Applies to this page: **the feature is NOT complete** |
+| A10 | A host mode that cannot support a criterion is reported by criterion; a notification-only flow is never marked complete | iPhone Allow once, Deny and Select verified (see Live results); the feature is **not yet complete** against A6, the live part of A9 and an exact-head merge under A8 |
 
 What exists today (PR #217) is only the **safety layer** behind A7 and A9: a ledger that records the exact action, target, head, dependencies, host request id and
 resume trigger, revalidates the exact head and the owner-merge gate before a resume, hands the action back at most once per lease (a lapsed lease after a crash can produce a second hand-back, which is flagged `possible_duplicate_handback`), and handles denial, expiry, changed head,
@@ -82,21 +82,29 @@ and `Notification permission_prompt`. It prints nothing and exits 0, so the host
 `FAILED_AFTER_OPEN_PROMPT` or `RAN_WITHOUT_PROMPT` (the same call ran while or after a prompt was open: consistent with an approval, but a denied prompt followed by the same call under an allow rule looks identical, so it is never reported as consent). Without it nothing in this repository can tell whether a prompt was raised at all. Editing `~/.claude/settings.json`
 is an owner action; this branch does not do it.
 
-## Live results so far (2026-11-10, this Mac, session in `auto` mode)
+## Live results (2026-11-10 to 2026-11-11, this Mac, Claude Code 2.1.306, session in `auto` mode, observer installed)
 
-| Probe | Result |
-|---|---|
-| Background lane ran `rtk proxy echo` (matches the `Bash(rtk proxy *)` ask) | Returned at once; no prompt was visible to the lane |
-| Background lane ran `git -C <scratch repo> worktree prune --dry-run ...` (matches the `Bash(git * worktree prune*)` ask) | Returned at once (`ok`); no prompt or wait visible to the lane |
+Earlier probes (2026-11-10, before the observer was installed) returned at once and could not distinguish "no prompt raised" from "answered within a minute".
+With the observer installed, the same `Bash(rtk proxy *)` ask rule raised a real prompt in `auto` mode: an explicit ask rule is not auto-resolved.
 
-A lane cannot see host prompts and no observer hook is installed, so these probes **cannot distinguish "no prompt was raised" from "a prompt was answered within a
-minute"**. Neither left a prompt open for 15 minutes. Criteria A1, A3, A5, A6 and A8 are therefore **not verified**.
+| Run | Prompt raised (UTC) | Resolved (UTC) | Decision | Counted |
+|---|---|---|---|---|
+| 1 (2026-11-10) | 23:40:43 | 23:41:28 | accept, `user_temporary` | No: the owner did not know it was a test |
+| 2 (2026-11-10) | 23:47:52 | 23:51:40 | accept, `user_temporary` | No: same |
+| 3 hold (2026-11-11) | 00:04:02 | 00:28:30 | accept, `user_temporary` | Yes: pending 24m28s, owner told the hold-until time in advance |
+| Deny lane (2026-11-11) | 00:29:07 | 00:30:33 | reject, `user_reject` | Yes: "Denied by user", command did not run |
+
+Run 3: command `rtk proxy echo spe170-allow3-hold-0825TPE`. A second subagent launched about 40 s after the prompt and finished a read-only ticket verification by 00:06:26, while the prompt was still pending. The prompt survived T0+15m (00:19:02) and the announced hold-until (08:25 Asia/Taipei = 00:25:00Z). After the owner's Allow once the observer showed `RAN_AFTER_OPEN_PROMPT` and the lane returned the echo output.
+
+Each transcript also shows a second `accept` 4-5 s after the owner's decision with source `config` and reason `classifier`; it belongs to the lane's final report call and did not change the owner's decision.
+
+Limits: the decision source (`user_temporary`, `user_reject`) is read from the subagent transcript's `permissionDecision`; no telemetry records the device, so the iPhone claim rests on the owner's confirmation. The observer reports a denied prompt as `PROMPTED_NO_RESULT` (not `FAILED_AFTER_OPEN_PROMPT`), so by itself it cannot tell denied from open. The test must tell the owner it is a test, name the exact command and give the hold-until time, otherwise the owner may answer early (runs 1 and 2).
 
 ## Proof status
 
 | Claim | Status |
 |---|---|
-| A background subagent's prompt waits, actionable on the phone, while the root continues | **NOT verified** (see Live results) |
+| A background subagent's prompt waits, actionable on the phone, while the root continues | Verified once on a harmless command (Allow once after 24m28s, Deny separately); not verified for an exact-head merge or for expiry beyond 24m28s |
 | The ledger keeps an unanswered ASK past 15 minutes, holds several, resumes only the intended one, and handles changed head, denial, duplicate and restart | Tested in a disposable directory with a stand-in gate (`tests/test-ask-pending.py`); no live prompt was involved |
 | The normal merge gate is still the authority | Tested against a stand-in gate plus a contract test of the real gate's printed JSON; the gate's own evaluation is covered by `tests/test-owner-merge-gate.py`. No live merge was performed |
 | The observer cannot decide | Tested (`tests/test-ask-observe.py`): no output, exit 0, no decision fields in the source |
@@ -104,8 +112,8 @@ minute"**. Neither left a prompt open for 15 minutes. Criteria A1, A3, A5, A6 an
 ## Verification protocol (needs the owner's phone)
 
 1. The owner installs the observer with `scripts/ask-observe-install.py` (`plan` prints the exact settings diff and the two pins; `apply` needs both pins and adds four hook groups only; `rollback --receipt` removes exactly those four and keeps later edits; run `apply` and `rollback` from a checkout merged to origin/main). The example JSON is only a reference for what it adds. Then start or reconnect Remote Control (`/remote-control`) on the session that will
-   run the test. A session in `default` permission mode raises prompts more reliably than `auto`; if `auto` does not raise one for an ask-ruled command, that is itself
-   recorded as the failed criterion.
+   run the test. An explicit ask rule raised a prompt in `auto` mode in the 2026-11-11 runs; if a mode does not raise one for an ask-ruled command, that is itself
+   recorded as the failed criterion. Tell the owner beforehand that it is a test, the exact command and the hold-until time.
 2. The root launches one background lane per scenario (A: approve, B: deny, C: a second request for a different pinned head) with a harmless ask-ruled command whose
    text carries a distinct marker, records each in the ledger with `--prompt live`, and keeps doing independent authorized work, logging timestamps.
 3. Past 15 minutes nothing is done to the prompts. The owner taps Approve on A's original prompt and Deny on B's. `ask-observe.py report` must show A
