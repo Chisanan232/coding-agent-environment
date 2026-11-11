@@ -108,6 +108,12 @@ Each transcript also shows a second `accept` 4-5 s after the owner's decision wi
 
 Limits: the decision source (`user_temporary`, `user_reject`) is read from the subagent transcript's `permissionDecision`; no telemetry records the device, so the iPhone claim rests on the owner's confirmation. The observer reports a denied prompt as `PROMPTED_NO_RESULT` (not `FAILED_AFTER_OPEN_PROMPT`), so by itself it cannot tell denied from open. The test must tell the owner it is a test, name the exact command and give the hold-until time, otherwise the owner may answer early (runs 1 and 2).
 
+## Expiry and reissue: what the docs say (2026-11-11, read-only research)
+
+Documented: Remote Control "keeps permission prompts and AskUserQuestion questions open until you answer them" (code.claude.com/docs/en/remote-control, "Forwarded dialogs expire"); other forwarded dialogs get a 5-minute default, controlled by `dialogExpiry` (2.1.224+, default and values not read). `permissions.denyInsteadOfPrompting` (2.1.319+, user settings or `--settings` only) is an opt-in auto-deny and is not enabled here.
+Not documented: a timeout for a background-subagent prompt, a way to re-surface or reissue a missed prompt (only `/remote-control` after a connection failure), or a maximum pending time.
+This agrees with the 7h21m observation but proves nothing about expiry, so A6 and the expired-prompt case of A9 stay unverified. The changelog for 2.1.306 itself could not be confirmed (the fetched page began at 2.1.311).
+
 ## Proof status
 
 | Claim | Status |
