@@ -23,19 +23,6 @@ def load(name, file):
 
 
 da = load('disk_admission', 'scripts/disk-admission.py')
-
-
-SHIPPED_THIRD_LANE_ENABLED = da.THIRD_LANE_ENABLED
-_two_lane_patch = unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', False)
-
-
-def setUpModule():
-    # These tests pin the two-lane mechanics (cap 2 at the wide tier). The shipped third-lane value is asserted by its own tests.
-    _two_lane_patch.start()
-
-
-def tearDownModule():
-    _two_lane_patch.stop()
 shadow = load('shadow_budget_tests', 'tests/test-shadow-budget.py')
 queue_tests = load('admission_queue_tests', 'tests/test-admission-queue.py')
 GIB = 1024 ** 3

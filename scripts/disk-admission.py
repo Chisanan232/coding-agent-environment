@@ -314,7 +314,7 @@ HEAVY_LANES = {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 2}
 # A third lane is a separate reviewed change (SPE-160): flip THIRD_LANE_ENABLED in its own PR with the `queue trial-report` PASS
 # output and owner sign-off. LANE_CEILING is the most that flag, or any edit of HEAVY_LANES, can ever yield.
 LANE_CEILING = 3
-THIRD_LANE_ENABLED = True
+THIRD_LANE_ENABLED = False
 
 
 def heavy_lane_cap(tier, latch=False):

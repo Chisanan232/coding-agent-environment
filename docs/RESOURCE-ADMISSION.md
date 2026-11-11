@@ -69,7 +69,7 @@ detection matches executable names only; it targets macOS. Wiring it into `disk-
 
 ## 4. Concurrency
 
-Up to two admitted heavy lanes, as the resource governor allows (the second only when the resource budget passes; a third behind `THIRD_LANE_ENABLED`, set by the SPE-172 flip commit that must not merge before owner sign-off and a trial-report PASS; [ADR 0017](adr/0017-resource-aware-workload-scheduling.md) revision 2). Do not start competing Cargo workspace builds, Docker
+Up to two admitted heavy lanes, as the resource governor allows (the second only when the resource budget passes; a third stays off behind `THIRD_LANE_ENABLED`; [ADR 0017](adr/0017-resource-aware-workload-scheduling.md) revision 2). Do not start competing Cargo workspace builds, Docker
 suites, native QA or full E2E; lower subagent fan-out while pressure is not normal (the seven-subagent cap is a ceiling, not a
 target). Prefer reusable build artifacts and isolated targets inside the budget. Never kill another active session, and never delete
 its worktree, runtime, cache, container or reservation.
@@ -323,7 +323,7 @@ Arithmetic (`budget_decision(host, reservations, request, caps)`, pure):
 Known gaps. All constants are guesses until `measurements` backs them. A heavy-named process the process list could not parse
 into a tree is not counted as unmanaged. `status` reads records without verification (it takes no lock), so it can briefly show a
 holder that has just exited. A 2 s window is shorter than the 10 s `memory-admission check` uses, so its swap-I/O reading is
-noisier, so a noisy sample can only close a second lane, never open one. A third lane is a separate, owner-approved change (the SPE-172 flip commit).
+noisier, so a noisy sample can only close a second lane, never open one. A third lane is a separate, owner-approved change.
 
 Known and accepted. The `shadow-budget` lines share `queue/receipts.jsonl` (and its single 1 MiB rotation) with the queue's own
 receipts, so a busy shadow stream rotates queue history sooner. The `budget` result key is additive: a caller that compares
@@ -393,7 +393,7 @@ which does not exec, applies the grant only to its own process.
 ## Concurrent heavy lanes (SPE-160)
 
 `heavy_lane_cap(tier, latch)` in `scripts/disk-admission.py` is the one place a lane count is decided: 0 while latched or below
-stable, else `HEAVY_LANES[tier]`, plus one in the wide tier only when `THIRD_LANE_ENABLED` (on only in the SPE-172 flip commit, which must not merge before owner sign-off and a trial-report PASS), never above `LANE_CEILING` (3).
+stable, else `HEAVY_LANES[tier]`, plus one in the wide tier only when `THIRD_LANE_ENABLED` (off), never above `LANE_CEILING` (3).
 The shipped `HEAVY_LANES` value is 2 in stable and wide since the final, separately reviewed flip commit of ADR 0017 revision 2;
 reverting that commit restores 1 (rollback procedure in the ADR) and the rules below go dormant.
 
