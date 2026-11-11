@@ -151,6 +151,28 @@ class Reserve(Base):
         holders = {h['label']: h for h in two['budget']['holders']}
         self.assertEqual(holders['cli']['cpu_slots'], 4)
 
+    def test_a_non_exec_refresh_never_changes_the_recorded_limit(self):
+        proc = self.spawn()
+        self.write_unlimited_for('old', proc, '/work/wt-a')
+        refresh = lambda **kw: da.reserve('old', 20 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now,
+                                          declared=fields('/work/wt-a'), host_fn=self.host_fn(**kw), grant_environ=None)
+        self.assertTrue(refresh()['admit'])
+        self.assertIsNone(self.recorded('old'))                       # still unlimited, still charged every core
+        refused = self.take('two', cwd='/work/wt-b')
+        self.assertIn('cpu: 16 slots in use', refused['reason'])
+        da.release('old', self.path)
+        self.assertTrue(da.reserve('amber', 20 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now, declared=fields('/work/wt-a'),
+                                   host_fn=self.host_fn(band='AMBER'), grant_environ=None)['admit'])
+        self.assertEqual(self.recorded('amber'), 2)
+        self.assertTrue(da.reserve('amber', 20 * GIB, proc.pid, self.path, lambda: 400 * GIB, now=self.now, declared=fields('/work/wt-a'),
+                                   host_fn=self.host_fn(), grant_environ=None)['admit'])
+        self.assertEqual(self.recorded('amber'), 2)
+
+    def write_unlimited_for(self, label, proc, cwd):
+        with da.state_lock(self.path):
+            da.write_reservation(self.path, label, 20 * GIB, proc.pid, da.process_token(proc.pid), self.now + timedelta(hours=1),
+                                 declared=dict(fields(cwd), created=da.iso_utc(self.now)))
+
     def test_a_non_exec_reserve_without_a_budget_records_the_declared_slots(self):
         self.assertTrue(self.take('cli', grant=None, host=None)['admit'])      # lane 1 needs no host sample
         self.assertEqual(self.recorded('cli'), 4)
