@@ -4,6 +4,7 @@
 The shipped cap may be one or two; every test here pins the cap it exercises."""
 from datetime import timedelta
 from importlib.util import module_from_spec, spec_from_file_location
+import json
 import os
 import subprocess
 import threading
@@ -110,10 +111,71 @@ class Reserve(Base):
         self.assertFalse(refused['admit'])
         self.assertIn('memory:', refused['reason'])
         da.release('legacy', self.path)
-        self.assertTrue(self.take('unlimited', grant=False)['admit'])    # classed, but started without a CARGO_BUILD_JOBS limit
+        self.write_unlimited('unlimited', '/work/wt-a')      # classed, but a record that carries no job limit (before SPE-171)
         refused = self.take('two', cwd='/work/wt-b')
         self.assertFalse(refused['admit'])
         self.assertIn('cpu: 16 slots in use + 4 requested > 16 cores', refused['reason'])
+
+    def write_unlimited(self, label, cwd):
+        proc = self.spawn()
+        with da.state_lock(self.path):
+            da.write_reservation(self.path, label, 20 * GIB, proc.pid, da.process_token(proc.pid), self.now + timedelta(hours=1),
+                                 declared=dict(fields(cwd), created=da.iso_utc(self.now)))
+        return proc
+
+    def test_run_records_the_granted_jobs_it_exports(self):
+        """`run` (run_reserved) execs the job itself, so it records the CARGO_BUILD_JOBS it exports (SPE-160)."""
+        self.assertTrue(self.take('one')['admit'])
+        env = {k: v for k, v in os.environ.items() if k not in ('CARGO_BUILD_JOBS', 'RUST_TEST_THREADS', 'NEXTEST_TEST_THREADS')}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            code = da.run_reserved('two', 20 * GIB, ['true'], self.path, lambda: 400 * GIB, exec_fn=lambda p, a: None,
+                                   declared=fields('/work/wt-b'), host_fn=lambda: shadow.host(time=da.datetime.now(da.timezone.utc)
+                                                                                           + timedelta(seconds=1)))
+            exported = os.environ.get('CARGO_BUILD_JOBS')
+        try:
+            self.assertEqual(code, 0)
+            self.assertEqual(exported, '4')
+            self.assertEqual(self.recorded('two'), 4)
+        finally:
+            da.release('two', self.path)
+
+    def recorded(self, label):
+        return json.loads((self.path.parent / 'reservations' / (label + '.json')).read_text()).get('granted_jobs')
+
+    def test_a_non_exec_reserve_of_a_declared_class_is_charged_its_slots_not_every_core(self):
+        first = self.take('cli', grant=None)                  # the `reserve` CLI: nothing is exec'd, no environment
+        self.assertTrue(first['admit'])
+        self.assertEqual(self.recorded('cli'), 4)
+        two = self.take('two', cwd='/work/wt-b')
+        self.assertTrue(two['admit'], two)
+        holders = {h['label']: h for h in two['budget']['holders']}
+        self.assertEqual(holders['cli']['cpu_slots'], 4)
+
+    def test_a_non_exec_reserve_without_a_budget_records_the_declared_slots(self):
+        self.assertTrue(self.take('cli', grant=None, host=None)['admit'])      # lane 1 needs no host sample
+        self.assertEqual(self.recorded('cli'), 4)
+
+    def test_a_non_exec_reserve_without_a_class_records_nothing(self):
+        self.assertTrue(self.take('legacy', declared=None, grant=None)['admit'])
+        self.assertIsNone(self.recorded('legacy'))
+
+    def test_non_exec_holders_sharing_a_target_or_the_docker_daemon_are_still_refused(self):
+        self.assertTrue(self.take('cli', grant=None)['admit'])
+        refused = self.take('two', grant=None)                # same working directory: same Cargo target key
+        self.assertFalse(refused['admit'])
+        self.assertIn('excl_key overlap with cli', refused['reason'])
+        da.release('cli', self.path)
+        docker = lambda: fields('/work/wt-a', name='container-suite')
+        self.assertTrue(self.take('d1', cwd='/work/wt-a', declared=docker(), grant=None)['admit'])
+        refused = self.take('d2', cwd='/work/wt-b', declared=docker(), grant=None)
+        self.assertFalse(refused['admit'])
+        self.assertIn('excl_key overlap with d1', refused['reason'])
+
+    def test_two_isolated_cold_builds_with_separate_targets_are_admitted_together(self):
+        cold = lambda n: fields('/work/wt-%d' % n, name='build-cold-isolated')
+        self.assertTrue(self.take('c1', declared=cold(1), grant=None)['admit'])
+        two = self.take('c2', declared=cold(2), grant=None)
+        self.assertTrue(two['admit'], two)
 
     def test_a_shared_cargo_target_refuses(self):
         self.assertTrue(self.take('one')['admit'])
@@ -225,19 +287,47 @@ class Advance(Base):
         self.queue(2, nbytes=25 * GIB)
         self.assertEqual(len(self.advance(free=160 * GIB)['granted']), 2)
 
-    def test_a_claimed_job_from_before_the_cap_change_occupies_a_lane_for_the_budget(self):
-        old = self.queue(1)
-        self.assertEqual(da.queue_advance(self.path, lambda: 400 * GIB, now=self.now)['granted'], [old])   # no host sample: one lane
-        entry = self.entries()[old]
-        claimed = da.queue_claim(self.path, old, entry['label'], entry['bytes'], shadow.ARGV, str(self.worktree),
-                                 lambda: 400 * GIB, pid=os.getpid(), now=self.now, memory_fn=lambda: (True, 'ok'),
-                                 exec_fn=lambda p, a: None, declared=self.entry_fields(1))
-        self.assertTrue(claimed['ok'], claimed)
-        self.assertNotIn('granted_jobs', self.entries()[old]['holder'])    # claimed without a recorded job limit
+    def claim_non_exec(self, n, **kw):
+        qid = self.queue(n)
+        self.assertEqual(da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, **kw)['granted'][-1:], [qid])
+        entry = self.entries()[qid]
+        out = da.queue_claim(self.path, qid, entry['label'], entry['bytes'], shadow.ARGV, str(self.worktree), lambda: 400 * GIB,
+                             pid=os.getpid() if n == 1 else self.spawn().pid, now=self.now, memory_fn=lambda: (True, 'ok'),
+                             exec_fn=lambda p, a: None, declared=self.entry_fields(n), **kw)
+        self.assertTrue(out['ok'], out)
+        return qid
+
+    def test_a_claimed_job_without_a_recorded_limit_occupies_a_lane_for_the_budget(self):
+        old = self.claim_non_exec(1)
+        with da.state_lock(self.path):                                     # a claim made before SPE-171 carried no limit
+            entries, _ = da._queue_entries(self.path)
+            entry = next(e for e in entries if e['id'] == old)
+            del entry['holder']['granted_jobs']
+            da._write_queue_entry(self.path, entry)
+            held = self.path.parent / 'reservations' / (entry['label'] + '.json')
+            record = json.loads(held.read_text())
+            del record['granted_jobs']
+            held.write_text(json.dumps(record))
+        self.assertNotIn('granted_jobs', self.entries()[old]['holder'])
         self.queue(2)
         out = self.advance()
         self.assertEqual(out['granted'], [])
         self.assertIn('cpu: 16 slots in use + 4 requested > 16 cores', out['reason'])
+
+    def test_a_non_exec_claim_records_its_slots_and_leaves_the_second_lane_open(self):
+        old = self.claim_non_exec(1)
+        self.assertEqual(self.entries()[old]['holder']['granted_jobs'], 4)
+        self.assertEqual(da._entry_granted_jobs(self.path, old), 4)     # what the claim CLI tells the supervisor to honour
+        second = self.queue(2)                                             # separate CARGO_TARGET_DIR (working directory)
+        out = self.advance()
+        self.assertEqual(out['granted'], [second], out)
+
+    def test_a_non_exec_claim_still_refuses_a_job_sharing_its_target_dir(self):
+        self.claim_non_exec(1)
+        self.queue(1, ticket='SPE-299')                                    # same working directory: same Cargo target key
+        out = self.advance()
+        self.assertEqual(out['granted'], [])
+        self.assertIn('excl_key overlap', out['reason'])
 
     def test_no_host_sample_grants_only_one(self):
         first = self.queue(1)
