@@ -101,9 +101,16 @@ admission logic tested and the rollback documented before rollout.
   itself. The value actually exported is recorded as `granted_jobs` on the reservation and on the CLAIMED holder (additive; not a
   declared field, not in the fingerprint). In the budget a running Cargo-class holder **without** a recorded `granted_jobs` is
   charged every core (and a lower recorded figure is charged as itself).
-- **Production consequence.** Only Cargo jobs started through `run` / `run --queue-id`, and non-Cargo classes, can ever share the host.
-  A holder created by the `reserve` CLI or by the non-exec `queue claim` CLI, a legacy holder with no estimate, and any job claimed
-  before this change are charged all cores or the whole budget and keep the second lane closed until they finish.
+- **Production consequence.** Only Cargo jobs started through `run` / `run --queue-id`, and non-Cargo classes, export a job limit
+  themselves. A holder created by the `reserve` CLI or by the non-exec `queue claim` CLI for a declared Cargo class records the
+  `granted_jobs` it would have exported (the band grant, or the declared slots when there is no usable budget) and is charged those
+  slots, not every core (SPE-171); the claim output carries `cargo_build_jobs` and a warning that the supervising process must run
+  the job with `CARGO_BUILD_JOBS` at or below it. A legacy holder with no estimate, a classed record that carries no limit, and
+  any job claimed before SPE-171 are still charged all cores or the whole budget and keep the second lane closed until they finish.
+  The recorded non-exec limit is NOT enforced: nothing can make a supervisor honour it. The charge is a declaration; the safety net
+  is the measured-load gate (`load_credit` is `min(slots, measured cpu rate)`, so a holder that really burns more than it declared
+  still raises the load the next lane sees), not the charge. A non-exec refresh of an existing holder never changes its record. Both
+  `queue claim` and `reserve` print `cargo_build_jobs` and the warning.
 - **Pressure.** Lanes 2 and up need band GREEN: memory pressure level 1, swap I/O at most 4 MiB/s, compressor at most 25% of RAM and
   load per core (corrected for admitted work) at most 2.0, i.e. the memory gate's EXIT bounds. The memory gate also asks for these
   before it admits a tree beside a running one. AMBER or RED means no new concurrent job; lane 1 keeps today's ENTER thresholds.
