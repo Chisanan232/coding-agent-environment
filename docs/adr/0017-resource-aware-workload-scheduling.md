@@ -213,8 +213,11 @@ Criteria names are unchanged. Changes, all in `trial_report`:
    `reserved` is the declared bytes of the jobs live at that sample; a sample whose live jobs have no byte figure is not evaluated. The
    window-wide minimum free disk and its time are reported (`window_min_free_bytes`, `window_min_free_at`) and are **not gated**. No
    evaluable overlap sample is `insufficient`.
-3. **`fits_if_cap_were_3_share`** counts only verdicts made with at least one job running (`count` of at least 1), once per queue entry and
-   situation (entry, running count, band and resource reasons); the required share (at least half) is unchanged.
+3. **`fits_if_cap_were_3_share`** counts only verdicts made with exactly `TRIAL_STAGE_N` jobs running (`count == 2`: `fits()` is `count + 1 <= limit`, so a verdict with fewer
+   running says nothing about a third lane), once per queue entry and situation (entry, running count, band and resource reasons); the required share (at least half) is unchanged.
+   Known limits of the report, to be read with a PASS: reserved bytes are rebuilt from jobs claimed inside the window only (a job already
+   running at the window start, GRANTED-not-yet-claimed entries and orphans are not counted, so the margin can be optimistic), and
+   `overlap_hours` counts finished jobs only (an unfinished third job hides a three-way period as two-way).
 4. Unchanged: median queue-to-completion at least 20% better than the solo baseline, worst class slowdown at most 1.6, no pressure sample
    above 1 during an overlap, swap growth at most 2 GiB.
 
@@ -240,7 +243,7 @@ run first, with the prerequisites in place.
 
 The owner is asked to sign off on this: (a) the evidence table is accepted as the record of the first trial; (b) the revised criteria
 and prerequisites replace step 3 of the trial plan; (c) `THIRD_LANE_ENABLED` is flipped only by a separate pull request carrying a
-PASS from the revised report; and (d) the last commit of the draft pull request that carries this revision (the flip) is the rollback
+PASS from the revised report; and (d) the flip, which lives alone in its own draft pull request, is the rollback
 unit, must not merge before (c) is satisfied, and is reverted to restore today's state. Sign-off of (a) and (b) does not authorise (d).
 
 ## Consequences
