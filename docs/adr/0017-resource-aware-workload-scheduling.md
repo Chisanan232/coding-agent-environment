@@ -173,14 +173,15 @@ Status: **DRAFT, not accepted.** Documentation only. The measurements below are 
 
 ### Decision statement
 
-Target: four concurrent heavy jobs in normal operation. **The ceiling stays 3, and `THIRD_LANE_ENABLED` stays `False`, until stage 3 of
-the trial below passes.** Lane 3 itself has not passed its trial (the trial protocol is SPE-172, draft). Raising the ceiling is a further
+Target: four concurrent heavy jobs in normal operation. **The ceiling stays 3, and `FOURTH_LANE_ENABLED` stays `False`, until the stage 3 trial below (three jobs at
+once, with lane 3 already enabled) passes.** `THIRD_LANE_ENABLED` is gated separately, by the SPE-172 trial (see "Stage numbering"). Lane 3 itself has not passed its trial (the trial protocol is SPE-172, draft). Raising the ceiling is a further
 owner decision taken on that evidence; this draft only fixes what the text and the code would have to say if the owner takes it.
 
 ### Related work, not repeated here
 
 - PR #226: CPU accounting fix. The budget's CPU sum (see "How the budgets are enforced") is only as good as that accounting.
-- SPE-172 (draft PR): the lane-3 trial protocol. Stage 3 of this draft's staged trial is that protocol.
+- SPE-172 (draft PR #228): the lane-3 trial protocol. It is the stage 2 trial below: its `TRIAL_STAGE_N` is 2, because the evidence for a third
+  lane is jobs that ran with two at once while a third was judged. Its PASS gates the lane-3 flip (draft PR #229), not the raise to four.
 
 ### What fits today (analysis 2026-11-11)
 
@@ -207,10 +208,10 @@ Memory is the tightest budget today and the figure is dominated by two known dou
 All in `scripts/disk-admission.py`, under the existing lock; the host is sampled before it.
 
 - **Lane count.** `heavy_lane_cap(tier, latch)` (about line 320). Lane 1 never reads the budget. Lanes 2 and up go through
-  `_budget_refusal` (about line 2664): a host sample, status ok, `would_admit`, band GREEN.
-- **CPU.** `budget_decision` (about lines 2308-2406): `cpu_used + cpu_need > cpu_limit` refuses, where `cpu_limit = cores *
+  `_budget_refusal` (about line 2693): a host sample, status ok, `would_admit`, band GREEN.
+- **CPU.** `budget_decision` (about lines 2328-2420): `cpu_used + cpu_need > cpu_limit` refuses, where `cpu_limit = cores *
   CPU_BUDGET_PERCENT // 100` (100%, so cores) and `cpu_used` sums each holder's slots (all cores for a legacy or uncapped holder;
-  otherwise `min(cpu_slots, granted_jobs)`). This already applies to every lane, so the fourth lane's no-oversubscription rule is
+  otherwise `min(cpu_slots, granted_jobs)`). The budget, CPU included, gates lanes 2 and up (`_budget_refusal` returns nothing for lane 1), so the fourth lane's no-oversubscription rule is
   today's behaviour made an explicit invariant, not new code.
 - **Memory.** `projected = host_used + sum(max(0, est_mem - measured_rss)) + 8 GiB x unmanaged trees + request mem`; refused when
   `projected > RAM x (1 - headroom)`, headroom 30% in GREEN and 40% otherwise (`HEADROOM_PERCENT`); a legacy holder is charged the whole
@@ -244,10 +245,10 @@ Read these plainly:
 ### Code consequences (specified, not implemented)
 
 1. `FOURTH_LANE_ENABLED = False` is honoured only when `THIRD_LANE_ENABLED` is on; with the third lane off it has no effect.
-2. `LANE_CEILING = 4`. Only the flip PR for each stage changes the flags; the ceiling change itself ships with, or after, stage 3's pass.
+2. `LANE_CEILING = 4`. Only the flip PR for each stage changes the flags; the ceiling change itself ships with, or after, the stage 3 pass.
 3. `heavy_lane_cap` adds a lane for the wide tier per enabled flag and still returns `min(lanes, LANE_CEILING)`.
-4. `fits_if_cap_were_3` is computed from `LANE_CEILING` (line 2396), so raising the ceiling would silently change its meaning and
-   `trial_report`'s `fits_if_cap_were_3_share` (line 2067). It must be pinned to the literal 3, and a separate `fits_if_cap_were_4`
+4. `fits_if_cap_were_3` is computed from `LANE_CEILING` (line 2416), so raising the ceiling would silently change its meaning and
+   `trial_report`'s `fits_if_cap_were_3_share` (line 2114). It must be pinned to the literal 3, and a separate `fits_if_cap_were_4`
    added, with the stage-N criterion reading `fits_if_cap_were_N`.
 5. The lane-3/4 class and `+60 GiB` rules above are added to the budget as a lane-index-dependent refusal reason.
 6. `trial_report` takes the stage N and applies the per-stage gates below.
@@ -258,17 +259,22 @@ fairness cost), backpressure, no preemption, and nothing is ever signalled.
 
 ### Proposed four-lane trial: stages 2, 3, 4
 
+**Stage numbering.** Stage N is the N-way operating point: its evidence is jobs that ran with exactly N at once, and its verdict question is
+`fits_if_cap_were_(N+1)`, counted only from verdicts made with exactly N jobs running (`fits()` is `count + 1 <= limit`, so a verdict with fewer
+running says nothing about lane N+1). Stage 2 (SPE-172, `TRIAL_STAGE_N = 2`, `fits_if_cap_were_3`) gates the lane-3 flip. Stage 3
+(`fits_if_cap_were_4`, three at once, lane 3 enabled) gates the lane-4 flip. Stage 4 re-runs at four to confirm normal operation.
+
 Each stage needs at least 20 finished jobs that ran with exactly N jobs at once, across at least 2 classes with at least 5 each, and at
 least 5 h of N-way overlap. Gates, per stage:
 
-- Median queue-to-completion at least 20% better than the previous stage.
+- Median queue-to-completion at least 20% better than the solo baseline (the `trial_report` rule; a per-stage baseline is not implemented).
 - Worst class slowdown at most 1.6.
 - Pressure at most 1 and swap growth at most 2 GiB during overlap.
 - `free - reserved >= HEAVY_FLOOR + 60 GiB` during overlap samples (the window-wide minimum free is reported, not gated).
-- Share of `fits_if_cap_were_N` at least 0.5, counted only with at least one job running and once per entry and situation.
-- No budget sample misses its deadline.
+- Share of `fits_if_cap_were_(N+1)` at least 0.5, counted only from verdicts made with exactly N jobs running, once per entry and situation.
+- Budget deadline misses (a host sample that misses its deadline means no extra lane): reported per stage, not gated; no `trial_report` criterion exists for them yet.
 
-Stage 2 re-runs the current cap with the trial's own gates (it has no real window yet), stage 3 is SPE-172, and stage 4 needs both.
+Stage 4 needs the stage 2 and stage 3 passes.
 Missing data is insufficient, never PASS.
 
 ### Rollback criteria
