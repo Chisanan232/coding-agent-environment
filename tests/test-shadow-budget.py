@@ -22,6 +22,19 @@ def load(name, file):
 
 
 da = load('disk_admission', 'scripts/disk-admission.py')
+
+
+SHIPPED_THIRD_LANE_ENABLED = da.THIRD_LANE_ENABLED
+_two_lane_patch = unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', False)
+
+
+def setUpModule():
+    # These tests pin the two-lane mechanics (cap 2 at the wide tier). The shipped third-lane value is asserted by its own tests.
+    _two_lane_patch.start()
+
+
+def tearDownModule():
+    _two_lane_patch.stop()
 queue_tests = load('admission_queue_tests', 'tests/test-admission-queue.py')
 QueueBase = queue_tests.QueueBase
 GIB = 1024 ** 3
@@ -605,8 +618,13 @@ class HeavyLaneCap(unittest.TestCase):
     def test_shipped_values_follow_the_lane_table(self):
         self.assertEqual({t: da.heavy_lane_cap(t) for t in da.HEAVY_LANES}, da.HEAVY_LANES)
         self.assertEqual((da.heavy_lane_cap('emergency'), da.heavy_lane_cap('low'), da.heavy_lane_cap(None)), (0, 0, 0))
-        self.assertFalse(da.THIRD_LANE_ENABLED)
         self.assertEqual(da.LANE_CEILING, 3)
+
+    def test_the_shipped_third_lane_value_gives_the_wide_tier_three_and_stable_two(self):
+        self.assertTrue(SHIPPED_THIRD_LANE_ENABLED)          # the flip commit; reverting it is the rollback
+        with unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', SHIPPED_THIRD_LANE_ENABLED):
+            self.assertEqual({t: da.heavy_lane_cap(t) for t in da.HEAVY_LANES}, {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 3})
+            self.assertEqual(da.heavy_lane_cap('wide', True), 0)
 
     def test_a_latch_means_no_lane_at_any_tier(self):
         for tier in da.HEAVY_LANES:
