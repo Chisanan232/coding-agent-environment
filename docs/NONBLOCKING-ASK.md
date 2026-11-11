@@ -11,10 +11,10 @@ criterion below is verified on the real host path (Claude Code Remote Control on
 | # | Criterion | Status |
 |---|---|---|
 | A1 | A real tool permission request stays a **live, actionable native Approve/Deny** on the iPhone (Remote Control) | PASS for Allow once and Deny on a harmless ask-ruled command (2026-11-11 run 3, deny lane); owner attests both taps were on the iPhone, telemetry records the decision source only |
-| A2 | A product decision is an **interactive Select** control where the host supports it | Select value verified (chosen "Blue" returned as Blue); the device for this one was not separately confirmed |
+| A2 | A product decision is an **interactive Select** control where the host supports it | Select value verified (chosen "Blue" returned as Blue); the device for this one was not separately confirmed, and the observer cannot corroborate it (an `AskUserQuestion` stays `PROMPTED_NO_RESULT`) |
 | A3 | The waiting operation is assigned to **one background subagent** where the host supports it | PASS: one background subagent held the prompt (lane A3) |
 | A4 | The root agent (or another subagent) continues **independent authorized work** within existing concurrency limits while the prompt is open | PASS: a new subagent launched about 40 s after the prompt and finished independent read-only work while it was still pending |
-| A5 | The 15-minute rule changes **scheduling only**: the original prompt is not cancelled, dismissed or converted to a text reply when the timer fires | PASS for one run: the original prompt was untouched past T0+15m and was accepted after 24m28s; nothing cancelled, reworded or converted it |
+| A5 | The 15-minute rule changes **scheduling only**: the original prompt is not cancelled, dismissed or converted to a text reply when the timer fires | PASS for one run, for what was observed: the original prompt survived past T0+15m untouched and was accepted after 24m28s; nothing cancelled, reworded or converted it. No scheduling timer was involved, only elapsed time |
 | A6 | If the platform itself expires a prompt, that is **recorded explicitly** and a supported reissue path is determined | Not expired within 24m28s; expiry after that and a reissue path are NOT_RUN |
 | A7 | A watcher may observe the decision and resume work; it **cannot** grant permission or bypass the host gate | Design met; live part observed: the observer printed no decision and the accept recorded `user_temporary`, not the observer or a watcher |
 | A8 | Approve on the **original** prompt resumes **only** the intended exact-head action; Deny and Select are tested separately | Allow once resumed only the intended command and Deny did not run its command (separate lanes); the exact-head merge action itself is NOT_RUN |
@@ -89,12 +89,14 @@ With the observer installed, the same `Bash(rtk proxy *)` ask rule raised a real
 
 | Run | Prompt raised (UTC) | Resolved (UTC) | Decision | Counted |
 |---|---|---|---|---|
-| 1 | 23:40:43 | 23:41:28 | accept, `user_temporary` | No: the owner did not know it was a test |
-| 2 | 23:47:52 | 23:51:40 | accept, `user_temporary` | No: same |
-| 3 (hold) | 00:04:02 | 00:28:30 | accept, `user_temporary` | Yes: pending 24m28s, owner told the hold-until time in advance |
-| Deny lane | 00:29:07 | 00:30:33 | reject, `user_reject` | Yes: "Denied by user", command did not run |
+| 1 (2026-11-10) | 23:40:43 | 23:41:28 | accept, `user_temporary` | No: the owner did not know it was a test |
+| 2 (2026-11-10) | 23:47:52 | 23:51:40 | accept, `user_temporary` | No: same |
+| 3 hold (2026-11-11) | 00:04:02 | 00:28:30 | accept, `user_temporary` | Yes: pending 24m28s, owner told the hold-until time in advance |
+| Deny lane (2026-11-11) | 00:29:07 | 00:30:33 | reject, `user_reject` | Yes: "Denied by user", command did not run |
 
 Run 3: command `rtk proxy echo spe170-allow3-hold-0825TPE`. A second subagent launched about 40 s after the prompt and finished a read-only ticket verification by 00:06:26, while the prompt was still pending. The prompt survived T0+15m (00:19:02) and the announced hold-until (08:25 Asia/Taipei = 00:25:00Z). After the owner's Allow once the observer showed `RAN_AFTER_OPEN_PROMPT` and the lane returned the echo output.
+
+Each transcript also shows a second `accept` 4-5 s after the owner's decision with source `config` and reason `classifier`; it belongs to the lane's final report call and did not change the owner's decision.
 
 Limits: the decision source (`user_temporary`, `user_reject`) is read from the subagent transcript's `permissionDecision`; no telemetry records the device, so the iPhone claim rests on the owner's confirmation. The observer reports a denied prompt as `PROMPTED_NO_RESULT` (not `FAILED_AFTER_OPEN_PROMPT`), so by itself it cannot tell denied from open. The test must tell the owner it is a test, name the exact command and give the hold-until time, otherwise the owner may answer early (runs 1 and 2).
 
