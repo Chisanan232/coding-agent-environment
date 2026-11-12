@@ -294,10 +294,13 @@ the two changed rows. Rollback is reverting this change.
 
 The first two overlapped jobs produced `FAIL` with a "102x slowdown". It was a measurement artifact, not contention: q000419 was a 58-minute
 `container-suite` job (about 315 samples, one at `concurrent` 2) compared against a baseline of short solo runs, and one concurrent sample
-made the whole job count as overlapped. Two rules fix the report, and neither can create a new PASS path:
+made the whole job count as overlapped. Two rules fix the report. Independent review found the first version of the change could turn a
+FAIL into a PASS (a pressure sample inside a briefly overlapped job went unseen, and partly overlapped jobs joined the solo baseline), so the
+final rules keep every concurrent sample of every job in the pressure check and keep any job that ever overlapped out of the solo baseline:
 
 - A job counts as overlapped only when at least half of its sampled life (or, without samples, of its time) ran with another job
   (`overlap_share` 0.5).
+- The share is counted in samples, not time, so uneven sampling intervals skew it; the 0.5 threshold is deliberately coarse.
 - A comparison or share judged on a handful of samples is `insufficient`, not `FAIL`: slowdown and queue-to-completion need
   `jobs_per_class` (5) solo and overlapped runs in the class, and the fits share needs `min_verdicts` (10) distinct verdicts.
 
