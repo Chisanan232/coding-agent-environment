@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""Admission wrapper for Local Agent cargo work on this workstation.
+
+Usage: la-cargo [--light] <cargo args...>     (run inside a local-agent worktree)
+       la-cargo --status
+
+Enforces the founder-approved budget: dedicated target dir, one heavy build at a
+time, ~8 build jobs, and free-space gates (warn <100, refuse <75, hard stop <50 GiB).
+`--light` skips the heavy lock/refuse-at-75 gate for read-only cargo (metadata, tree).
+
+Heavy builds are also admitted by the shared heavy-job queue (scripts/disk-admission.py,
+ADR 0017, SPE-174): class build-workspace, one lane reservation per build, released when
+cargo exits. A build already running under a lane (CAE_ADMISSION_HOLDER names this process
+or an ancestor) is not charged again; `--light` is never charged. Exit codes: 75 free-space
+refusal, 76 over artifact budget, 77 refused by the queue (distinct from cargo's own).
+"""
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+TARGET = os.path.expanduser("~/.cargo/targets/local-agent")
+LOCK = os.path.expanduser("~/.cargo/targets/local-agent.lock")
+LOG = os.path.expanduser("~/.cargo/targets/local-agent.log")
+VOLUME = "/System/Volumes/Data"
+WARN_GIB, PAUSE_GIB, STOP_GIB = 100, 75, 50
+ARTIFACT_BUDGET_GIB = 60
+JOBS = os.environ.get("LA_CARGO_JOBS", "8")
+SIZE_PROBE_TIMEOUT_S = 120
+
+# Heavy-job admission (SPE-174). The class and bytes are the runner's build-workspace defaults (40 GiB, 8 jobs): Local Agent is a
+# workspace build and the runner refuses a request below its class default. The runner's own disk floor (free - reserved - bytes
+# >= 100 GiB) is stricter than REFUSE_GIB above, by design.
+RUNNER = os.environ.get("LA_CARGO_RUNNER") or os.path.expanduser(
+    "~/Bryant-Developments/coding-agent-environment-main-view/scripts/disk-admission.py")
+ADMISSION_CLASS = "build-workspace"
+ADMISSION_BYTES = 40 * 2**30
+HOLDER_ENV = "CAE_ADMISSION_HOLDER"          # "<label>:<pid>", exported by the runner's run / queue claim
+REFUSED_EXIT = 77                            # the runner's refusal code
+
+
+def _wait_s() -> int:
+    """A bad or out-of-range LA_CARGO_QUEUE_WAIT_S falls back to the default instead of failing every invocation."""
+    try:
+        value = int(os.environ.get("LA_CARGO_QUEUE_WAIT_S", "3600"))
+    except ValueError:
+        return 3600
+    return value if 60 <= value <= 86400 else 3600
+
+
+QUEUE_WAIT_S = _wait_s()
+POLL_S = 15
+NOTICE_EVERY_S = 300
+
+
+def free_gib() -> float:
+    return shutil.disk_usage(VOLUME).free / 2**30
+
+
+def target_gib() -> "float | None":
+    """Bounded size probe of the Local Agent target dir only; None if it exceeds the time bound."""
+    if not os.path.isdir(TARGET):
+        return 0.0
+    try:
+        out = subprocess.run(["du", "-sk", TARGET], capture_output=True, text=True,
+                             timeout=SIZE_PROBE_TIMEOUT_S, check=True).stdout
+        return int(out.split()[0]) / 2**20
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError):
+        return None
+
+
+def log(msg: str) -> None:
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(f"{time.strftime('%FT%T')} {msg}\n")
+
+
+def process_ancestors() -> "set[int]":
+    """Pids of this process's ancestors (empty set if the process table cannot be read)."""
+    found, current = set(), os.getppid()
+    for _ in range(64):
+        if current is None or current <= 1 or current in found:
+            break
+        found.add(current)
+        try:
+            out = subprocess.run(["/bin/ps", "-o", "ppid=", "-p", str(current)], capture_output=True, text=True,
+                                 timeout=5, stdin=subprocess.DEVNULL).stdout.strip()
+            current = int(out) if out.isdigit() else None
+        except (OSError, subprocess.SubprocessError):
+            break
+    return found
+
+
+def inherited_holder(environ=None) -> "str | None":
+    """The runner's marker when this process already runs under a lane reservation, else None. Accepted only when the marked pid
+    is this process (the runner exec'd us) or one of its ancestors: a marker inherited by a process that outlived the job proves
+    nothing, and a forged one for an unrelated pid is ignored."""
+    value = (os.environ if environ is None else environ).get(HOLDER_ENV, "")
+    match = re.fullmatch(r"([A-Za-z0-9_][A-Za-z0-9._-]{0,63}):([0-9]+)", value)
+    if not match:
+        return None
+    pid = int(match.group(2))
+    return value if pid == os.getpid() or pid in process_ancestors() else None
+
+
+def runner_cmd(*args: str) -> "list[str]":
+    return [sys.executable, RUNNER, *args]
+
+
+def runner_present() -> bool:
+    """Pre-spawn check only: the exit code of a runner that ran cannot tell absence from refusal (it maps internal errors to 77)."""
+    return os.path.isfile(RUNNER) and os.path.isfile(sys.executable)
+
+
+def _capture(cmd: "list[str]", env) -> "tuple[int, str]":
+    try:
+        done = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        return done.returncode, done.stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+
+
+def _json(text: str) -> dict:
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, dict) else {}
+    except ValueError:
+        return {}
+
+
+def admitted_build(args, env, sleep=time.sleep, clock=time.monotonic) -> int:
+    """Run cargo as the lane holder: reserve directly when a lane is free, else queue and wait for the grant. Called with the
+    heavy lock held, so at most one Local Agent build is queued or running at a time. The lane is released when cargo exits."""
+    label = f"la-cargo-{os.getpid()}"
+    session = f"la-cargo-{os.getpid()}-{int(time.time())}"
+    scratch = tempfile.mkdtemp(prefix="la-cargo-")
+    proof = os.path.join(scratch, "started")
+    # The job writes the proof then execs cargo (same pid), so the runner's reservation is held by cargo itself and "cargo ran"
+    # is distinguishable from "the runner refused" even when cargo's own exit code happens to be 77.
+    job = ["/bin/sh", "-c", 'touch "$1" && shift && exec "$@"', "la-cargo", proof, "cargo", *args]
+    declare = ["--label", label, "--bytes", str(ADMISSION_BYTES), "--class", ADMISSION_CLASS]
+    try:
+        rc = subprocess.call(runner_cmd("run", *declare, "--", *job), env=env)
+        if os.path.exists(proof):
+            _release(["release", "--label", label], env)
+            return rc
+        if rc != REFUSED_EXIT:
+            print(f"la-cargo: the admission runner failed (exit {rc}) before starting cargo; refusing (fail closed).", file=sys.stderr)
+            return rc
+        print("la-cargo: no heavy lane free right now; queueing for one.", file=sys.stderr)
+        return _queued_build(declare, job, proof, session, env, sleep, clock)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _release(cmd: "list[str]", env) -> None:
+    rc, out = _capture(runner_cmd(*cmd), env)
+    if rc != 0:
+        print(f"la-cargo: WARNING could not release the lane ({out.strip()[:200]}); run `disk-admission.py {' '.join(cmd)}` "
+              "once cargo has ended.", file=sys.stderr)
+
+
+def _queued_build(declare, job, proof, session, env, sleep, clock) -> int:
+    ticket = re.sub(r"[^A-Za-z0-9._-]", "", os.environ.get("CLAUDE_CURRENT_TICKET", "")).lstrip("._-")[:32] or "local-agent"
+    harness = os.environ.get("LA_CARGO_HARNESS", "claude")
+    rc, out = _capture(runner_cmd("queue", "enqueue", *declare, "--ticket", ticket, "--repo", "local-agent", "--worktree",
+                                  os.getcwd(), "--harness", harness, "--session-id", session, "--again",
+                                  "--wait-s", str(QUEUE_WAIT_S), "--", *job), env)
+    queued = _json(out)
+    if rc != 0 or not queued.get("ok") or not queued.get("id"):
+        print(f"la-cargo: could not queue the build: {queued.get('reason', out.strip()[:200])}", file=sys.stderr)
+        return REFUSED_EXIT
+    qid = queued["id"]
+    claimed, deadline, next_notice = False, clock() + QUEUE_WAIT_S, 0.0
+    try:
+        while clock() < deadline:
+            _capture(runner_cmd("queue", "advance"), env)
+            _, listing = _capture(runner_cmd("queue", "status", "--json"), env)
+            entry = next((e for e in _json(listing).get("entries", []) if e.get("id") == qid), None)
+            state = entry.get("state") if entry else None
+            if state == "GRANTED":
+                rc = subprocess.call(runner_cmd("run", *declare, "--queue-id", qid, "--", *job), env=env)
+                if os.path.exists(proof):
+                    claimed = True
+                    _release(["queue", "release", "--id", qid, "--session-id", session], env)
+                    return rc
+                print(f"la-cargo: claim of {qid} refused (exit {rc}); the grant is kept, retrying.", file=sys.stderr)
+            elif state not in ("QUEUED", "ELIGIBLE"):
+                print(f"la-cargo: queue entry {qid} is {state or 'missing'}; refusing.", file=sys.stderr)
+                return REFUSED_EXIT
+            elif clock() >= next_notice:
+                print(f"la-cargo: waiting for a heavy lane ({qid} {state}).", file=sys.stderr)
+                next_notice = clock() + NOTICE_EVERY_S
+            sleep(POLL_S)
+        print(f"la-cargo: no heavy lane within {QUEUE_WAIT_S} s; refusing.", file=sys.stderr)
+        return REFUSED_EXIT
+    finally:
+        if not claimed:
+            _capture(runner_cmd("queue", "cancel", "--id", qid, "--session-id", session), env)
+
+
+def _terminate(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+def run_heavy(args, env) -> int:
+    # SIGTERM/SIGHUP must unwind through the queue wait's `finally` (cancel the entry, free the lane) like SIGINT does.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _terminate)
+    holder = inherited_holder()
+    if holder:
+        log(f"ADMITTED-BY-OUTER holder={holder}")
+        return subprocess.call(["cargo", *args], env=env)
+    if not runner_present():
+        # Fail closed: a missing runner (moved checkout, bad LA_CARGO_RUNNER) would otherwise run unaccounted builds exactly when
+        # disk or memory is tight. LA_CARGO_ALLOW_UNADMITTED=1 is the explicit opt-out; the lock, gates and budget still apply.
+        if os.environ.get("LA_CARGO_ALLOW_UNADMITTED") != "1":
+            log(f"REFUSED runner-missing path={RUNNER}")
+            print(f"la-cargo: admission runner not found at {RUNNER}; refusing the build. Fix LA_CARGO_RUNNER or set "
+                  "LA_CARGO_ALLOW_UNADMITTED=1 to build outside the heavy-job queue.", file=sys.stderr)
+            return REFUSED_EXIT
+        log(f"UNADMITTED runner-missing path={RUNNER} (opt-out)")
+        print(f"la-cargo: WARNING admission runner not found at {RUNNER}; LA_CARGO_ALLOW_UNADMITTED=1, building under "
+              "la-cargo's own gates only (NOT accounted in the heavy-job queue).", file=sys.stderr)
+        return subprocess.call(["cargo", *args], env=env)
+    return admitted_build(args, env)
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args == ["--status"]:
+        t = target_gib()
+        print(f"free={free_gib():.1f}GiB target={'unknown(>probe bound)' if t is None else f'{t:.1f}GiB'}/{ARTIFACT_BUDGET_GIB}GiB jobs={JOBS}")
+        return 0
+    light = False
+    if args and args[0] == "--light":
+        light, args = True, args[1:]
+    if not args:
+        print(__doc__)
+        return 2
+
+    free = free_gib()
+    if free < STOP_GIB or (not light and free < PAUSE_GIB):
+        log(f"REFUSED free={free:.1f}GiB args={args[0]}")
+        print(f"la-cargo: refused, only {free:.1f} GiB free (pause<{PAUSE_GIB}, stop<{STOP_GIB}).", file=sys.stderr)
+        return 75
+    if free < WARN_GIB:
+        print(f"la-cargo: WARNING {free:.1f} GiB free (<{WARN_GIB}).", file=sys.stderr)
+
+    os.makedirs(TARGET, exist_ok=True)
+    env = dict(os.environ, CARGO_TARGET_DIR=TARGET, CARGO_BUILD_JOBS=JOBS)
+
+    if light:
+        return subprocess.call(["cargo", *args], env=env)
+
+    t = target_gib()
+    if t is not None and t > ARTIFACT_BUDGET_GIB:
+        # The incremental cache is the only regenerable, single-owner part of this
+        # dir that grows without bound; clear it before refusing the build.
+        inc = os.path.join(TARGET, "debug", "incremental")
+        if os.path.isdir(inc):
+            shutil.rmtree(inc, ignore_errors=True)
+            os.makedirs(inc, exist_ok=True)
+            log(f"PRUNED incremental cache; target was {t:.1f}GiB")
+            t = target_gib()
+    if t is not None and t > ARTIFACT_BUDGET_GIB:
+        log(f"REFUSED target={t:.1f}GiB over budget")
+        print(f"la-cargo: target dir {t:.1f} GiB exceeds {ARTIFACT_BUDGET_GIB} GiB budget; reclaim first.", file=sys.stderr)
+        return 76
+
+    with open(LOCK, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("la-cargo: another heavy Local Agent build holds the lock; waiting...", file=sys.stderr)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        log(f"START free={free:.1f}GiB cwd={os.getcwd()} args={' '.join(args)}")
+        rc = run_heavy(args, env)
+        log(f"END rc={rc} free={free_gib():.1f}GiB")
+        return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
