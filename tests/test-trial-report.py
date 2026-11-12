@@ -279,6 +279,30 @@ class Trial(unittest.TestCase):
         self.receipt(False, qid='q003999')                                   # the tenth distinct verdict is enough to judge
         self.assertEqual(self.criteria(self.report())['fits_if_cap_were_3_share']['verdict'], 'FAIL')
 
+    def test_pressure_in_a_briefly_overlapped_job_still_fails_the_trial(self):
+        # A job with 40% of its samples at concurrent 2 is not "overlapped", but a pressure-2 sample inside it is still an overlap sample.
+        qid = self.job('build-crate', T0, 100, 4000, False)
+        entry = json.loads((self.path.parent / 'queue' / (qid + '.json')).read_text())
+        for index, offset in enumerate(range(60, 600, 60)):
+            da._append_measurement(self.path, {'label': entry['label'], 'pid': 7, 'start_token': 't', 'v': 1, 'event': 'advance',
+                                               'ts': iso(T0 + timedelta(seconds=100 + offset)), 'queue_id': qid, 'rss_bytes': GIB,
+                                               'concurrent': 2 if index < 4 else 1, 'pressure': 2 if index == 0 else 1,
+                                               'free_bytes': 300 * GIB})
+        report = self.report()
+        self.assertFalse(next(j for j in report['jobs'] if j['id'] == qid)['overlapped'])
+        self.assertEqual(self.criteria(report)['pressure_samples_above_1_during_overlap']['verdict'], 'FAIL')
+
+    def test_a_partly_overlapped_job_does_not_join_the_solo_baseline(self):
+        for _ in range(5):
+            self.job('build-crate', T0, 100, 1000, False)
+        qid = self.job('build-crate', T0 + timedelta(hours=1), 100, 5000, False)
+        entry = json.loads((self.path.parent / 'queue' / (qid + '.json')).read_text())
+        for index, offset in enumerate(range(60, 600, 60)):
+            da._append_measurement(self.path, {'label': entry['label'], 'pid': 7, 'start_token': 't', 'v': 1, 'event': 'advance',
+                                               'ts': iso(T0 + timedelta(hours=1, seconds=100 + offset)), 'queue_id': qid, 'rss_bytes': GIB,
+                                               'concurrent': 2 if index == 0 else 1, 'pressure': 1, 'free_bytes': 300 * GIB})
+        self.assertEqual(self.report()['solo_baseline_jobs'], 5)
+
     def test_it_writes_nothing(self):
         self.scenario()
 
