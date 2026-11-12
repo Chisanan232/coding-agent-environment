@@ -2126,7 +2126,9 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
         # with fewer running it says nothing beyond the current cap.
         if b.get('count') != stage_n or type(b['count']) is not int or type(b.get('fits_if_cap_were_3')) is not bool:
             continue
-        key = (r.get('id'), b['count'], b.get('band'), tuple(b.get('resource_reasons') or ()))
+        # The reason text carries live figures ("projected 95.8 GiB"), so keying on it counts every re-poll of one waiting entry as a new
+        # situation; only the kind of each reason (memory, cpu, byte floor, ...) separates situations.
+        key = (r.get('id'), b['count'], b.get('band'), tuple(sorted({str(x).split(':', 1)[0] for x in b.get('resource_reasons') or ()})))
         if key not in counted:
             counted.add(key)
             verdicts.append(b)

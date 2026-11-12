@@ -214,7 +214,7 @@ Criteria names are unchanged. Changes, all in `trial_report`:
    window-wide minimum free disk and its time are reported (`window_min_free_bytes`, `window_min_free_at`) and are **not gated**. No
    evaluable overlap sample is `insufficient`.
 3. **`fits_if_cap_were_3_share`** counts only verdicts made with exactly `TRIAL_STAGE_N` jobs running (`count == 2`: `fits()` is `count + 1 <= limit`, so a verdict with fewer
-   running says nothing about a third lane), once per queue entry and situation (entry, running count, band and resource reasons); the required share (at least half) is unchanged.
+   running says nothing about a third lane), once per queue entry and situation (entry, running count, band and the *kinds* of resource reason: the text before the first colon, such as memory, cpu, byte floor or band RED; `excl_key overlap with ...` has no colon and keeps its clashing labels; the live figures in a reason's text do not separate situations); the required share (at least half) is unchanged.
    Known limits of the report, to be read with a PASS: reserved bytes are rebuilt from jobs claimed inside the window only (a job already
    running at the window start, GRANTED-not-yet-claimed entries and orphans are not counted, so the margin can be optimistic), and
    `overlap_hours` counts finished jobs only (an unfinished third job hides a three-way period as two-way).
@@ -303,6 +303,13 @@ final rules keep every concurrent sample of every job in the pressure check and 
 - The share is counted in samples, not time, so uneven sampling intervals skew it; the 0.5 threshold is deliberately coarse.
 - A comparison or share judged on a handful of samples is `insufficient`, not `FAIL`: slowdown and queue-to-completion need
   `jobs_per_class` (5) solo and overlapped runs in the class, and the fits share needs `min_verdicts` (10) distinct verdicts.
+
+A later audit of the lane-3 verdicts (window to 2026-11-12 12:16 UTC, class estimates 8 / 6 / 4 / 16 GiB deployed and used by every entry enqueued
+after 08:51 UTC) found the same polling weight again: the situation key included the reason text, whose "projected N GiB" changes on every poll,
+so one entry waiting behind two running jobs produced a new "situation" per poll. Of 27 counted verdicts, 12 came from `la-cargo-25106` and 10 from
+`la-cargo-51643`; the distinct entries were 6. Memory refused 21 of 27 (projected 93.1 to 99.8 GiB against the 89.6 GiB limit, an overage of 3.5 to
+10.2 GiB, median 7.0), cpu refused 11 of 27 (12 of 16 slots in use, the third `build-workspace` asks for 8), and 10 were both. The key now uses the
+reason kinds, which leaves 9 distinct verdicts on that window (4 of them fits, 0.444), one short of `min_verdicts` (10), so the share reads `insufficient`, not FAIL. A refusal that worsens between polls is still one verdict. This changes how verdicts are counted, not the share, the minimum, the 30% headroom or any admission check.
 
 On the same window the corrected report reads `INSUFFICIENT`. The pass thresholds are unchanged, and the run-time comparison is still
 within a class, so a mixed-length class remains a known limit that a larger trial averages out.
