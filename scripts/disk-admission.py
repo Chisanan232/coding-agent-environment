@@ -1852,6 +1852,7 @@ def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_
         return refuse('state-unwritable: %s' % exc)
     _measure(state_path, 'claim', _free_or_none(free_fn), now)
     apply_grant_env(budget, _declared_fields(entry))   # the entry's recorded class: one source for the table and the numbers
+    export_holder_marker(label, pid)
     try:
         write_target_receipt(_declared_fields(entry).get('class'), entry.get('session_id'), os.environ)
     except Exception:
@@ -2603,6 +2604,19 @@ def apply_grant_env(budget, declared):
             pass
 
 
+HOLDER_ENV = 'CAE_ADMISSION_HOLDER'   # "<label>:<pid>" of the reservation the exec'd job runs under (SPE-174)
+
+
+def export_holder_marker(label, pid):
+    """Tell the exec'd job it already runs under a lane reservation, so a nested heavy wrapper (la-cargo) does not charge a second
+    one. exec keeps the pid, so a nested wrapper accepts the marker only when pid is itself or one of its ancestors: a marker
+    inherited by a process that outlived the job proves nothing. Never raises."""
+    try:
+        os.environ[HOLDER_ENV] = '%s:%d' % (label, pid)
+    except Exception:
+        pass
+
+
 OWNER_RECEIPT = '.ca-owner.json'   # read by resource-lifecycle.py, which promotes a receipted idle private target to class A
 
 
@@ -2990,6 +3004,7 @@ def run_reserved(label, nbytes, argv, state_path, free_fn=measure_free_bytes, tt
         write_target_receipt((declared or {}).get('class'), ((declared or {}).get('owner') or {}).get('session_id'), os.environ)
     except Exception:
         pass   # a receipt problem never fails or delays the job
+    export_holder_marker(label, os.getpid())
     try:
         exec_fn(argv[0], argv)
     except OSError as exc:
@@ -3143,6 +3158,8 @@ def _queue_cli(args, state_path, free_fn, host_fn=None):
                           exec_fn=lambda program, argv: None, declared=declared, host_fn=host_fn)
         out.pop('exit', None)
         jobs = _entry_granted_jobs(state_path, args.qid) if out.get('ok') else None
+        if out.get('ok'):
+            out['holder_marker'] = '%s:%d' % (args.label, args.pid)   # the supervisor exports it as HOLDER_ENV for the job it runs
         if jobs:
             out['cargo_build_jobs'] = jobs
             out['warning'] = ('the holder is charged %d cpu slots: the supervising process must run the job with CARGO_BUILD_JOBS=%d '
