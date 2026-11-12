@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Admission wrapper for Local Agent cargo work on this workstation.
+
+Usage: la-cargo [--light] <cargo args...>     (run inside a local-agent worktree)
+       la-cargo --status
+
+Enforces the founder-approved budget: dedicated target dir, one heavy build at a
+time, ~8 build jobs, and free-space gates (warn <100, refuse <75, hard stop <50 GiB).
+`--light` skips the heavy lock/refuse-at-75 gate for read-only cargo (metadata, tree).
+"""
+import fcntl
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+TARGET = os.path.expanduser("~/.cargo/targets/local-agent")
+LOCK = os.path.expanduser("~/.cargo/targets/local-agent.lock")
+LOG = os.path.expanduser("~/.cargo/targets/local-agent.log")
+VOLUME = "/System/Volumes/Data"
+WARN_GIB, PAUSE_GIB, STOP_GIB = 100, 75, 50
+ARTIFACT_BUDGET_GIB = 60
+JOBS = os.environ.get("LA_CARGO_JOBS", "8")
+SIZE_PROBE_TIMEOUT_S = 120
+
+
+def free_gib() -> float:
+    return shutil.disk_usage(VOLUME).free / 2**30
+
+
+def target_gib() -> "float | None":
+    """Bounded size probe of the Local Agent target dir only; None if it exceeds the time bound."""
+    if not os.path.isdir(TARGET):
+        return 0.0
+    try:
+        out = subprocess.run(["du", "-sk", TARGET], capture_output=True, text=True,
+                             timeout=SIZE_PROBE_TIMEOUT_S, check=True).stdout
+        return int(out.split()[0]) / 2**20
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError):
+        return None
+
+
+def log(msg: str) -> None:
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(f"{time.strftime('%FT%T')} {msg}\n")
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args == ["--status"]:
+        t = target_gib()
+        print(f"free={free_gib():.1f}GiB target={'unknown(>probe bound)' if t is None else f'{t:.1f}GiB'}/{ARTIFACT_BUDGET_GIB}GiB jobs={JOBS}")
+        return 0
+    light = False
+    if args and args[0] == "--light":
+        light, args = True, args[1:]
+    if not args:
+        print(__doc__)
+        return 2
+
+    free = free_gib()
+    if free < STOP_GIB or (not light and free < PAUSE_GIB):
+        log(f"REFUSED free={free:.1f}GiB args={args[0]}")
+        print(f"la-cargo: refused, only {free:.1f} GiB free (pause<{PAUSE_GIB}, stop<{STOP_GIB}).", file=sys.stderr)
+        return 75
+    if free < WARN_GIB:
+        print(f"la-cargo: WARNING {free:.1f} GiB free (<{WARN_GIB}).", file=sys.stderr)
+
+    os.makedirs(TARGET, exist_ok=True)
+    env = dict(os.environ, CARGO_TARGET_DIR=TARGET, CARGO_BUILD_JOBS=JOBS)
+
+    if light:
+        return subprocess.call(["cargo", *args], env=env)
+
+    t = target_gib()
+    if t is not None and t > ARTIFACT_BUDGET_GIB:
+        # The incremental cache is the only regenerable, single-owner part of this
+        # dir that grows without bound; clear it before refusing the build.
+        inc = os.path.join(TARGET, "debug", "incremental")
+        if os.path.isdir(inc):
+            shutil.rmtree(inc, ignore_errors=True)
+            os.makedirs(inc, exist_ok=True)
+            log(f"PRUNED incremental cache; target was {t:.1f}GiB")
+            t = target_gib()
+    if t is not None and t > ARTIFACT_BUDGET_GIB:
+        log(f"REFUSED target={t:.1f}GiB over budget")
+        print(f"la-cargo: target dir {t:.1f} GiB exceeds {ARTIFACT_BUDGET_GIB} GiB budget; reclaim first.", file=sys.stderr)
+        return 76
+
+    with open(LOCK, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("la-cargo: another heavy Local Agent build holds the lock; waiting...", file=sys.stderr)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        log(f"START free={free:.1f}GiB cwd={os.getcwd()} args={' '.join(args)}")
+        rc = subprocess.call(["cargo", *args], env=env)
+        log(f"END rc={rc} free={free_gib():.1f}GiB")
+        return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
