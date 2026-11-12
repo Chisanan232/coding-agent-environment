@@ -54,11 +54,12 @@ class Trial(unittest.TestCase):
                                                'swap_used_bytes': swap})
         return qid
 
-    def receipt(self, fits, when=None, qid=None, count=2, band='GREEN'):
+    def receipt(self, fits, when=None, qid=None, count=2, band='GREEN', reasons=()):
         self.seq += 1
         path = self.path.parent / 'queue/receipts.jsonl'
         line = {'ts': iso(when or T0 + timedelta(hours=1)), 'event': 'shadow-budget', 'id': qid or 'r%06d' % self.seq, 'label': 'x',
-                'tickets': [], 'budget': {'status': 'ok', 'fits_if_cap_were_3': fits, 'count': count, 'band': band}}
+                'tickets': [], 'budget': {'status': 'ok', 'fits_if_cap_were_3': fits, 'count': count, 'band': band,
+                           'resource_reasons': list(reasons)}}
         with open(path, 'a') as handle:
             handle.write(json.dumps(line) + '\n')
 
@@ -223,6 +224,23 @@ class Trial(unittest.TestCase):
         self.assertEqual(crit['pressure_samples_above_1_during_overlap']['verdict'], 'insufficient')
         self.assertEqual(crit['fits_if_cap_were_3_share']['verdict'], 'insufficient')
         self.assertEqual(report['verdict'], 'INSUFFICIENT')
+
+    def test_repolling_one_waiting_entry_counts_once_whatever_the_live_figures(self):
+        for gib in (93.1, 95.8, 99.0, 96.4):                                 # same entry, same refusal kind, a different live figure each poll
+            self.receipt(False, qid='q002000', reasons=['memory: projected %.1f GiB > 89.6 GiB (RAM x (1 - 30%%))' % gib])
+        self.receipt(False, qid='q002000', reasons=['memory: projected 97.0 GiB > 89.6 GiB', 'cpu: 12 slots in use + 8 requested > 16 cores'])
+        for n in range(9):
+            self.receipt(True, qid='q002%03d' % (n + 1))
+        crit = self.criteria(self.report())['fits_if_cap_were_3_share']
+        self.assertEqual((crit['value'], crit['verdict']), (0.818, 'PASS'))  # 9 fits of 11: one memory verdict and one memory+cpu verdict
+
+    def test_a_repolled_failure_cannot_drown_distinct_entries(self):
+        for gib in range(90, 110):
+            self.receipt(False, qid='q003000', reasons=['memory: projected %d.0 GiB > 89.6 GiB' % gib])
+        for n in range(6):
+            self.receipt(True, qid='q003%03d' % (n + 1))
+        crit = self.criteria(self.report())['fits_if_cap_were_3_share']
+        self.assertEqual(crit['verdict'], 'insufficient')                    # 7 distinct verdicts, below min_verdicts
 
     def test_an_unfinished_job_is_listed_but_not_counted(self):
         self.job('build-crate', T0, 100, 3600, True, release=False)
