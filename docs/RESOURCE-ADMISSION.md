@@ -415,3 +415,42 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
   [--json]` (read-only, writes nothing, takes no lock). Measurement lines also carry `swap_used_bytes`. A third lane needs its PASS
   output, with the criteria of ADR 0017 revision 3 (exact-N stage gates, overlap-window disk margin, running-only deduplicated
   `fits_if_cap_were_3`; the window-wide minimum free disk is reported, not gated) and the rollback procedure of revision 2.
+
+## Local Agent builds through the queue: `la-cargo` (SPE-174)
+
+`scripts/la-cargo` is the tracked source of the wrapper installed at `~/.local/bin/la-cargo` (before SPE-174 it existed only as the
+installed file). It stays the entry point for every Local Agent cargo build and keeps its own limits unchanged: the dedicated target
+`~/.cargo/targets/local-agent`, the 60 GiB artifact budget with the incremental-cache prune, the exclusive lock
+`~/.cargo/targets/local-agent.lock`, the free-space gates (warn < 100, refuse < 75 with exit 75, stop < 50 GiB) and `--light` /
+`--status`. What it adds is one lane reservation per heavy build:
+
+| Situation | Behaviour |
+|---|---|
+| Heavy build, no marker | Inside the heavy lock: `disk-admission.py run --class build-workspace --bytes 40 GiB` with cargo as the job. A free lane runs it at once; otherwise `queue enqueue`, `queue advance` and `queue status` are polled (15 s) until the entry is granted, then `run --queue-id`. The lane is released (`release --label` or `queue release --id --session-id`) when cargo exits. |
+| Already under a lane | `CAE_ADMISSION_HOLDER=<label>:<pid>` is exported by `run`, `run --queue-id` and printed as `holder_marker` by `queue claim`. la-cargo honours it only when the pid is itself or an ancestor, and then charges nothing (lock and gates still apply). A supervisor using `queue claim --pid` must export the printed value for the job it runs. |
+| `--light`, `--status` | Never contact the runner. |
+| Runner file missing (checked before spawning) | Warning on stderr and a `UNADMITTED` log line, then the pre-SPE-174 behaviour. The lock, the gates and the artifact budget still hold, so this is not an unguarded build, only an unaccounted one. |
+| Runner present but refuses for the whole wait (`LA_CARGO_QUEUE_WAIT_S`, default 3600), cannot queue, or fails before cargo | Exit 77 (a runner failure keeps its own code) and cargo never starts: fail closed. The wait is cancelled with `queue cancel`. |
+
+Effects an owner should know. (1) The runner's disk floor (`free - reserved - bytes >= 100 GiB`, bytes 40 GiB for `build-workspace`)
+is stricter than la-cargo's own: heavy builds are refused below about 140 GiB free instead of 75. (2) The runner only lowers
+`CARGO_BUILD_JOBS` (8 from la-cargo): AMBER gives 4, RED the class minimum; a non-integer `LA_CARGO_JOBS` is left alone and the holder is
+charged every core. (3) The exclusion key is `cargo-target:` plus the resolved `CARGO_TARGET_DIR`, which la-cargo sets. (4) Plain `run`
+is refused while anything is queued, so a build that finds a lane busy queues in order. (5) `LA_CARGO_RUNNER` overrides the runner
+path (tests); the default is the merged checkout's `scripts/disk-admission.py`. (6) A runner without the SPE-174 marker (an older
+checkout) still works but cannot tell a nested la-cargo that it is already charged, so a build wrapped in an outer `run` is charged twice
+until the checkout contains this change.
+
+Owner install (the agent never writes `~/.local/bin/la-cargo`). Baseline sha256 of the installed file at SPE-174:
+`663b67bfffd612ee9d176c02d0b485dd1549378395dc114ab38bbe4c96f767bc`; the new sha256 is in the PR description. From the merged checkout:
+
+```bash
+cp -p ~/.local/bin/la-cargo ~/.local/bin/la-cargo.pre-SPE-174
+install -m 0755 scripts/la-cargo ~/.local/bin/la-cargo
+shasum -a 256 scripts/la-cargo ~/.local/bin/la-cargo      # the two lines must match
+la-cargo --status
+```
+
+Rollback: `install -m 0755 ~/.local/bin/la-cargo.pre-SPE-174 ~/.local/bin/la-cargo` (its sha256 is the baseline above). Run
+`disk-admission.py status --json` and `queue status --json` afterwards: a killed build that never released leaves an UNRESOLVED
+holder that `release --label la-cargo-<pid>` (or `queue release --id qNNNNNN --confirm-ended`) clears once cargo has ended.
