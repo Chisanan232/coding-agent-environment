@@ -290,6 +290,20 @@ Unchanged: the 30% headroom, strict FIFO, the exclusion keys, the disk floor and
 (`WORKLOAD_CLASSES`). **Revert trigger:** any overlap sample with pressure above 1, or swap growth beyond the trial threshold, reverts
 the two changed rows. Rollback is reverting this change.
 
+### Trial report: overlap share and minimum samples (found by the first overlap, 2026-11-12)
+
+The first two overlapped jobs produced `FAIL` with a "102x slowdown". It was a measurement artifact, not contention: q000419 was a 58-minute
+`container-suite` job (about 315 samples, one at `concurrent` 2) compared against a baseline of short solo runs, and one concurrent sample
+made the whole job count as overlapped. Two rules fix the report, and neither can create a new PASS path:
+
+- A job counts as overlapped only when at least half of its sampled life (or, without samples, of its time) ran with another job
+  (`overlap_share` 0.5).
+- A comparison or share judged on a handful of samples is `insufficient`, not `FAIL`: slowdown and queue-to-completion need
+  `jobs_per_class` (5) solo and overlapped runs in the class, and the fits share needs `min_verdicts` (10) distinct verdicts.
+
+On the same window the corrected report reads `INSUFFICIENT`. The pass thresholds are unchanged, and the run-time comparison is still
+within a class, so a mixed-length class remains a known limit that a larger trial averages out.
+
 ### What this does not do
 
 It does not enable a third lane and does not change a trial criterion. #229 stays unmerged until a trial report passes on real data.
@@ -311,3 +325,4 @@ It does not enable a third lane and does not change a trial criterion. #229 stay
 | 2 | Two heavy lanes behind the budget, `heavy_lane_cap()`, `LANE_CEILING` 3 with `THIRD_LANE_ENABLED` off, `granted_jobs`, `queue trial-report`, rollback procedure (SPE-160) |
 | 3 | Draft (SPE-172): trial evidence 2026-11-11, revised stage-3 criteria (exact-N stage gates, overlap-window disk margin, running-only deduplicated `fits_if_cap_were_3`), prerequisites, sign-off statement |
 | 4 | Class memory estimates recalibrated against measured solo peaks: `build-workspace` 16 to 8 GiB, `container-suite` 12 to 4 GiB; `build-crate` and `build-cold-isolated` unchanged; 30% headroom kept (SPE-160) |
+| 4a | Trial report: a job overlaps only when at least half its life did; slowdown, queue-to-completion and the fits share need minimum samples before they can FAIL (SPE-172) |
