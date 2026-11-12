@@ -277,6 +277,24 @@ least 5 h of N-way overlap. Gates, per stage:
 Stage 4 needs the stage 2 and stage 3 passes.
 Missing data is insufficient, never PASS.
 
+### Lane-3 evidence and the lane-4 capacity gap (2026-11-12)
+
+Measured on the lane-3 trial window (to 2026-11-12 12:16 UTC, class estimates 8 / 6 / 4 / 16 GiB in force): the lane-3 verdicts are refused by
+memory in 21 of 27 counted verdicts (6 distinct entries; projected 93.1 to 99.8 GiB against the 89.6 GiB limit, an overage of 3.5 to 10.2 GiB, median
+7.0) and by cpu in 11 of 27 (12 of 16 slots in use, a third `build-workspace` asks for 8). See "Trial plan" for the counting rule.
+
+What that implies for lane 4 (derived from the constants and the audit above, not separately measured): the host has 128 GiB, the limit is 89.6 GiB,
+and `host_used` on an idle host reads about 73 to 77 GiB, so about 12.6 to 16.6 GiB is left for every managed job together, and the 8 GiB unmanaged
+allowance per unmanaged tree comes out of that. Two typical running jobs (`build-workspace` 8 plus `build-crate` 6) already charge 14 GiB. A fourth lane
+adds two more jobs: 8 GiB for two `container-suite` entries or 12 GiB for two `build-crate` entries, so memory is short by roughly 4 to 13 GiB before
+any third lane has passed. CPU is the second limit: 16 cores and 16 slots, with `build-workspace` at 8 and `build-crate` / `container-suite` at 4, so four
+concurrent heavy jobs fit only when none is a `build-workspace`.
+
+Consequence for the stage plan: stage 3 cannot reach its `fits_if_cap_were_4` share of 0.5 on this host for build-class work. A fourth lane is only
+reachable for light or degraded-parallelism jobs (a class-aware lane rule), or with more memory headroom than the 30% rule leaves. The 30% headroom is
+not proposed for change. The owner decision is whether to accept a class-aware ceiling (lanes above two only for `light` and degraded `build-crate`) or to
+keep two lanes; the stage 3 trial is not worth running for build classes until that is decided.
+
 ### Rollback criteria
 
 Revert the flip PR (running jobs finish untouched; nothing is signalled, released or requeued; the procedure in "Rollback procedure"
