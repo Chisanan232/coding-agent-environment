@@ -532,8 +532,10 @@ def process_owner(pid):
 # caps exported to a Cargo job's environment (GRANT_ENV) read them. A job declares what it expects to need; an estimate can be
 # raised by the caller but never lowered below the class default.
 #
-# THE NUMBERS BELOW ARE GUESSES, deliberately conservative. They may be lowered only by a reviewed constants change
-# backed by evidence from `disk-admission.py measurements`, never by a caller and never in passing.
+# THE NUMBERS BELOW ARE CONSERVATIVE ESTIMATES. They may be lowered only by a reviewed constants change
+# backed by evidence from `disk-admission.py measurements`, never by a caller and never in passing. Revision 4 of ADR 0017
+# recalibrated build-workspace and container-suite to measured solo peaks x ~1.6-2.0; build-crate (already 1.37x its
+# measured peak) and build-cold-isolated (fewer than MIN_SOLO_RUNS qualifying runs) were left unchanged.
 # mem = mem_base_mib + mem_per_job_mib * jobs; jobs/min_jobs are the default and the lowest degraded parallelism
 # (min_jobs is read by the budget's AMBER and RED grants only); disk_gib is the default for
 # --bytes; excl names what two jobs of the class must not share ('target' = the Cargo target directory, 'docker' = the
@@ -543,10 +545,10 @@ WORKLOAD_CLASSES = {
     'light': {},
     'remote': {},
     'build-crate': {'mem_base_mib': 2048, 'mem_per_job_mib': 1024, 'jobs': 4, 'min_jobs': 2, 'disk_gib': 10, 'excl': 'target'},
-    'build-workspace': {'mem_base_mib': 4096, 'mem_per_job_mib': 1536, 'jobs': 8, 'min_jobs': 4, 'disk_gib': 40, 'excl': 'target'},
+    'build-workspace': {'mem_base_mib': 2048, 'mem_per_job_mib': 768, 'jobs': 8, 'min_jobs': 4, 'disk_gib': 40, 'excl': 'target'},
     'build-cold-isolated': {'mem_base_mib': 4096, 'mem_per_job_mib': 1536, 'jobs': 8, 'min_jobs': 4, 'disk_gib': 60,
                             'excl': 'target'},
-    'container-suite': {'mem_base_mib': 12288, 'mem_per_job_mib': 0, 'jobs': 4, 'min_jobs': 2, 'disk_gib': 20, 'excl': 'docker'},
+    'container-suite': {'mem_base_mib': 4096, 'mem_per_job_mib': 0, 'jobs': 4, 'min_jobs': 2, 'disk_gib': 20, 'excl': 'docker'},
 }
 CLASS_RE = re.compile(r'[a-z][a-z0-9-]{0,31}')
 MAX_MEM_BYTES = 2 ** 44      # 16 TiB: far above any real host, small enough to reject absurd or hostile values

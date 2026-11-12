@@ -306,5 +306,28 @@ class Summary(Base):
         self.assertIn('no measurements recorded', out.getvalue())
 
 
+# Solo peaks recorded in ADR 0017 revision 4 (process-tree RSS, `disk-admission.py measurements`, 2026-11-12). An estimate below
+# 1.3x its measured peak, or one that grew past the previous guess, needs a new ADR revision, not a passing edit.
+MEASURED_SOLO_PEAK_GIB = {'build-crate': 4.39, 'build-workspace': 4.90, 'container-suite': 1.98}
+RECALIBRATED_ESTIMATE_GIB = {'build-crate': 6, 'build-workspace': 8, 'container-suite': 4}
+
+
+class ClassEstimateCalibrationTests(unittest.TestCase):
+    def default_gib(self, name):
+        spec = da.WORKLOAD_CLASSES[name]
+        return (spec['mem_base_mib'] + spec['mem_per_job_mib'] * spec['jobs']) / 1024
+
+    def test_estimates_match_the_adr_revision_4_table(self):
+        for name, expected in RECALIBRATED_ESTIMATE_GIB.items():
+            self.assertEqual(self.default_gib(name), expected, name)
+
+    def test_every_estimate_keeps_a_margin_over_the_measured_peak(self):
+        for name, peak in MEASURED_SOLO_PEAK_GIB.items():
+            self.assertGreaterEqual(self.default_gib(name), 1.3 * peak, name)
+
+    def test_the_class_without_enough_runs_is_not_recalibrated(self):
+        self.assertEqual(self.default_gib('build-cold-isolated'), 16)
+
+
 if __name__ == '__main__':
     unittest.main()
