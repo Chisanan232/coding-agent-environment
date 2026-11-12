@@ -373,16 +373,31 @@ class LightBypass(LaCargoBase):
 
 
 class RunnerMissing(LaCargoBase):
-    def test_missing_runner_degrades_loudly_to_the_previous_behaviour(self):
+    def test_missing_runner_refuses_the_build_by_default(self):
         la.RUNNER = str(self.dir / 'absent.py')
+        rc, err = self.run_la('build')
+        self.assertEqual(rc, 77)
+        self.assertIn('refusing the build', err)
+        self.assertEqual(self.lines('cargo.jsonl'), [])
+        self.assertIn('REFUSED runner-missing', (self.dir / 'targets/local-agent.log').read_text())
+
+    def test_missing_runner_with_the_explicit_opt_out_builds_loudly_unaccounted(self):
+        la.RUNNER = str(self.dir / 'absent.py')
+        os.environ['LA_CARGO_ALLOW_UNADMITTED'] = '1'
+        self.addCleanup(os.environ.pop, 'LA_CARGO_ALLOW_UNADMITTED', None)
         os.environ['FAKE_CARGO_RC'] = '3'
         rc, err = self.run_la('build')
         self.assertEqual(rc, 3)
-        self.assertIn('WARNING admission runner not found', err)
         self.assertIn('NOT accounted', err)
         (call,) = self.lines('cargo.jsonl')
         self.assertFalse(call['lock_free'])
         self.assertIn('UNADMITTED runner-missing', (self.dir / 'targets/local-agent.log').read_text())
+
+    def test_a_bad_queue_wait_value_falls_back_instead_of_failing(self):
+        for bad in ('abc', '5', '999999'):
+            os.environ['LA_CARGO_QUEUE_WAIT_S'] = bad
+            self.assertEqual(la._wait_s(), 3600, bad)
+        os.environ.pop('LA_CARGO_QUEUE_WAIT_S')
 
     def test_missing_runner_still_enforces_the_gates(self):
         la.RUNNER = str(self.dir / 'absent.py')
@@ -392,6 +407,14 @@ class RunnerMissing(LaCargoBase):
         self.free = 200.0
         self.assertEqual(self.run_la('build')[0], 76)
         self.assertEqual(self.lines('cargo.jsonl'), [])
+
+
+class Signals(unittest.TestCase):
+    def test_sigterm_and_sighup_unwind_like_an_exit(self):
+        import signal
+        with self.assertRaises(SystemExit) as raised:
+            la._terminate(signal.SIGTERM, None)
+        self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
 
 
 if __name__ == '__main__':

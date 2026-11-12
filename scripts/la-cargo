@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -42,7 +43,18 @@ ADMISSION_CLASS = "build-workspace"
 ADMISSION_BYTES = 40 * 2**30
 HOLDER_ENV = "CAE_ADMISSION_HOLDER"          # "<label>:<pid>", exported by the runner's run / queue claim
 REFUSED_EXIT = 77                            # the runner's refusal code
-QUEUE_WAIT_S = int(os.environ.get("LA_CARGO_QUEUE_WAIT_S", "3600"))
+
+
+def _wait_s() -> int:
+    """A bad or out-of-range LA_CARGO_QUEUE_WAIT_S falls back to the default instead of failing every invocation."""
+    try:
+        value = int(os.environ.get("LA_CARGO_QUEUE_WAIT_S", "3600"))
+    except ValueError:
+        return 3600
+    return value if 60 <= value <= 86400 else 3600
+
+
+QUEUE_WAIT_S = _wait_s()
 POLL_S = 15
 NOTICE_EVERY_S = 300
 
@@ -155,7 +167,7 @@ def _release(cmd: "list[str]", env) -> None:
 
 
 def _queued_build(declare, job, proof, session, env, sleep, clock) -> int:
-    ticket = re.sub(r"[^A-Za-z0-9._-]", "", os.environ.get("CLAUDE_CURRENT_TICKET", ""))[:32] or "local-agent"
+    ticket = re.sub(r"[^A-Za-z0-9._-]", "", os.environ.get("CLAUDE_CURRENT_TICKET", "")).lstrip("._-")[:32] or "local-agent"
     harness = os.environ.get("LA_CARGO_HARNESS", "claude")
     rc, out = _capture(runner_cmd("queue", "enqueue", *declare, "--ticket", ticket, "--repo", "local-agent", "--worktree",
                                   os.getcwd(), "--harness", harness, "--session-id", session, "--again",
@@ -193,17 +205,29 @@ def _queued_build(declare, job, proof, session, env, sleep, clock) -> int:
             _capture(runner_cmd("queue", "cancel", "--id", qid, "--session-id", session), env)
 
 
+def _terminate(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
 def run_heavy(args, env) -> int:
+    # SIGTERM/SIGHUP must unwind through the queue wait's `finally` (cancel the entry, free the lane) like SIGINT does.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _terminate)
     holder = inherited_holder()
     if holder:
         log(f"ADMITTED-BY-OUTER holder={holder}")
         return subprocess.call(["cargo", *args], env=env)
     if not runner_present():
-        # Degrade, loudly: the heavy lock, free-space gates and artifact budget above still hold, so this is the pre-queue
-        # behaviour, not an unguarded build. It is unaccounted against other workloads until the runner is installed.
-        log(f"UNADMITTED runner-missing path={RUNNER}")
-        print(f"la-cargo: WARNING admission runner not found at {RUNNER}; building under la-cargo's own gates only "
-              "(NOT accounted in the heavy-job queue).", file=sys.stderr)
+        # Fail closed: a missing runner (moved checkout, bad LA_CARGO_RUNNER) would otherwise run unaccounted builds exactly when
+        # disk or memory is tight. LA_CARGO_ALLOW_UNADMITTED=1 is the explicit opt-out; the lock, gates and budget still apply.
+        if os.environ.get("LA_CARGO_ALLOW_UNADMITTED") != "1":
+            log(f"REFUSED runner-missing path={RUNNER}")
+            print(f"la-cargo: admission runner not found at {RUNNER}; refusing the build. Fix LA_CARGO_RUNNER or set "
+                  "LA_CARGO_ALLOW_UNADMITTED=1 to build outside the heavy-job queue.", file=sys.stderr)
+            return REFUSED_EXIT
+        log(f"UNADMITTED runner-missing path={RUNNER} (opt-out)")
+        print(f"la-cargo: WARNING admission runner not found at {RUNNER}; LA_CARGO_ALLOW_UNADMITTED=1, building under "
+              "la-cargo's own gates only (NOT accounted in the heavy-job queue).", file=sys.stderr)
         return subprocess.call(["cargo", *args], env=env)
     return admitted_build(args, env)
 
