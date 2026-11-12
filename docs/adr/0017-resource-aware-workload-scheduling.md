@@ -246,6 +246,50 @@ and prerequisites replace step 3 of the trial plan; (c) `THIRD_LANE_ENABLED` is 
 PASS from the revised report; and (d) the flip, which lives alone in its own draft pull request, is the rollback
 unit, must not merge before (c) is satisfied, and is reverted to restore today's state. Sign-off of (a) and (b) does not authorise (d).
 
+## Revision 4: class memory estimates recalibrated against measured peaks (SPE-160)
+
+Owner approval to recalibrate was given on 2026-11-12 with two conditions that this revision keeps: the 30% host headroom and every
+existing admission safeguard are unchanged, and the overlap trial is rerun on real queued work after rollout.
+
+### Why
+
+The trial of revision 3 ran 23 real jobs and none overlapped (peak concurrent 1). The receipts show why: while q000391 (`container-suite`)
+ran, q000396 (`build-crate`) was refused with `memory: projected 90.7 GiB > 89.6 GiB (RAM x (1 - 30%))`. The host sat at about 77 GiB
+`host_used` with no job running, so only about 13 GiB of budget was left, and the 12 GiB `container-suite` charge alone consumed it.
+`host_used` was audited and is not the defect: it counts active + wired + compressed pages (about 73 GiB), which is lower than an
+Activity-Monitor-style figure (about 88 GiB). The class estimates were the part not backed by measurement.
+
+### Measured peaks (`disk-admission.py measurements`, process-tree RSS, solo runs, pressure 1 throughout)
+
+| Class | Runs | Measured max (= p95) | Previous estimate | New estimate | Margin over measured |
+|---|---|---|---|---|---|
+| `build-crate` | 15 | 4.39 GiB | 6 GiB (2 + 1 x 4) | unchanged, 6 GiB | 1.37x |
+| `build-workspace` | 18 | 4.90 GiB | 16 GiB (4 + 1.5 x 8) | 8 GiB (2 + 0.75 x 8) | 1.63x |
+| `container-suite` | 17 | 1.98 GiB | 12 GiB | 4 GiB | 2.02x |
+| `build-cold-isolated` | 2 | 4.51 GiB | 16 GiB | unchanged (fewer than `MIN_SOLO_RUNS` = 3 qualifying runs) | n/a |
+
+Peaks are lower bounds (sampled about every 60 s), which is why every new value keeps a margin of at least 1.6x. `container-suite` gets
+the widest margin because its RSS excludes the Docker VM; the VM is resident memory already inside `host_used`, so it is not charged a
+second time, but its growth during a build is not in the RSS peak. No concurrent run has been measured for any class
+(`concurrent=0`), so these values are solo evidence and the trial must confirm them under overlap.
+
+### Effect, same inputs as the refused decision
+
+With about 77 GiB `host_used` and a limit of 89.6 GiB: `build-crate` (6 GiB) next to a running `container-suite` projects to about
+77 + 2 (residual of its 4 GiB charge over about 2 GiB RSS) + 6 = 85 GiB, inside the limit; two `build-workspace` jobs project to about
+88 GiB, inside the limit by about 1.6 GiB. The second is deliberately tight: it admits only while the host is as quiet as it was, and
+refuses otherwise.
+
+### Safeguards and rollback
+
+Unchanged: the 30% headroom, strict FIFO, the exclusion keys, the disk floor and the band logic. The constants stay in one table
+(`WORKLOAD_CLASSES`). **Revert trigger:** any overlap sample with pressure above 1, or swap growth beyond the trial threshold, reverts
+the two changed rows. Rollback is reverting this change.
+
+### What this does not do
+
+It does not enable a third lane and does not change a trial criterion. #229 stays unmerged until a trial report passes on real data.
+
 ## Consequences
 
 - Text that says "one heavy lane at a time" as a permanent rule is replaced with "up to two heavy lanes (the second only when the resource
@@ -262,3 +306,4 @@ unit, must not merge before (c) is satisfied, and is reverted to restore today's
 | 1 | Initial decision (SPE-150 PR7) |
 | 2 | Two heavy lanes behind the budget, `heavy_lane_cap()`, `LANE_CEILING` 3 with `THIRD_LANE_ENABLED` off, `granted_jobs`, `queue trial-report`, rollback procedure (SPE-160) |
 | 3 | Draft (SPE-172): trial evidence 2026-11-11, revised stage-3 criteria (exact-N stage gates, overlap-window disk margin, running-only deduplicated `fits_if_cap_were_3`), prerequisites, sign-off statement |
+| 4 | Class memory estimates recalibrated against measured solo peaks: `build-workspace` 16 to 8 GiB, `container-suite` 12 to 4 GiB; `build-crate` and `build-cold-isolated` unchanged; 30% headroom kept (SPE-160) |

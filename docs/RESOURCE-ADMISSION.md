@@ -226,16 +226,16 @@ Record-only. `run`, `reserve`, `queue enqueue` and `queue claim` accept optional
 queue order and the first lane are exactly as before, and a record without them means what it always meant (the whole budget, all
 cores). The resource budget below reads them to admit a lane beside a running job.
 
-Classes live in one table, `WORKLOAD_CLASSES` in `scripts/disk-admission.py`. The numbers are guesses, conservative on purpose,
+Classes live in one table, `WORKLOAD_CLASSES` in `scripts/disk-admission.py`. The numbers are conservative estimates (recalibrated by ADR 0017 revision 4 against measured solo peaks),
 to be lowered only by a reviewed constants change backed by `disk-admission.py measurements` evidence.
 
 | Class | Memory | Jobs (default / min) | Default disk | Exclusion key |
 |---|---|---|---|---|
 | `light`, `remote` | none | none | none | none |
 | `build-crate` | 2 GiB + 1 GiB per job | 4 / 2 | 10 GiB | Cargo target dir |
-| `build-workspace` | 4 GiB + 1.5 GiB per job | 8 / 4 | 40 GiB | Cargo target dir |
+| `build-workspace` | 2 GiB + 0.75 GiB per job | 8 / 4 | 40 GiB | Cargo target dir |
 | `build-cold-isolated` | 4 GiB + 1.5 GiB per job | 8 / 4 | 60 GiB | Cargo target dir (its own) |
-| `container-suite` | 12 GiB | 4 / 2 | 20 GiB | `docker` |
+| `container-suite` | 4 GiB | 4 / 2 | 20 GiB | `docker` |
 | none (legacy) | whole budget | all cores | as given | none |
 
 Rules. An unknown class is refused (fail closed). `--mem-gib`, `--cpus` and `--bytes` may raise an estimate and are refused when
