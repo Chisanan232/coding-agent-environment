@@ -41,11 +41,11 @@ class Resolve(unittest.TestCase):
         fields, error = self.resolve('build-workspace', nbytes=40 * GIB)
         self.assertIsNone(error)
         self.assertEqual((fields['class'], fields['mem_bytes'], fields['cpu_slots'], fields['test_threads']),
-                         ('build-workspace', 16 * GIB, 8, 8))
+                         ('build-workspace', 8 * GIB, 8, 8))
         crate, _ = self.resolve('build-crate')
         self.assertEqual((crate['mem_bytes'], crate['cpu_slots']), (6 * GIB, 4))
         suite, _ = self.resolve('container-suite')
-        self.assertEqual((suite['mem_bytes'], suite['excl_keys']), (12 * GIB, ['docker']))
+        self.assertEqual((suite['mem_bytes'], suite['excl_keys']), (4 * GIB, ['docker']))
         light, _ = self.resolve('light')
         self.assertNotIn('mem_bytes', light)
         self.assertEqual(light['excl_keys'], [])
