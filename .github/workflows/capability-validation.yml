@@ -24,6 +24,8 @@ on:
       - 'scripts/launcher-install.py'
       - 'scripts/cargo-deps-reclaim.py'
       - 'scripts/disk-admission.py'
+      - 'scripts/la-cargo'
+      - 'tests/test-la-cargo.py'
       - 'scripts/resource-lifecycle.py'
       - 'scripts/hook-rollout.py'
       - 'scripts/owner-merge-gate.py'
@@ -121,6 +123,9 @@ jobs:
           python3 tests/test-admission-queue.py
           python3 tests/test-disk-admission.py
           python3 tests/test-admission-measurements.py
+          python3 tests/test-trial-report.py
+          python3 tests/test-heavy-lane-cap.py
+          python3 tests/test-la-cargo.py
           python3 tests/test-workload-classes.py
           python3 tests/test-shadow-budget.py
           python3 tests/test-reservation-veto.py
