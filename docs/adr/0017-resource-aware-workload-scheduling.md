@@ -255,9 +255,10 @@ existing admission safeguard are unchanged, and the overlap trial is rerun on re
 
 The trial of revision 3 ran 23 real jobs and none overlapped (peak concurrent 1). The receipts show why: while q000391 (`container-suite`)
 ran, q000396 (`build-crate`) was refused with `memory: projected 90.7 GiB > 89.6 GiB (RAM x (1 - 30%))`. The host sat at about 77 GiB
-`host_used` with no job running, so only about 13 GiB of budget was left, and the 12 GiB `container-suite` charge alone consumed it.
-`host_used` was audited and is not the defect: it counts active + wired + compressed pages (about 73 GiB), which is lower than an
-Activity-Monitor-style figure (about 88 GiB). The class estimates were the part not backed by measurement.
+`host_used` when idle (about 73 GiB at the moment of the refused decision: 90.7 - 12 - 6 = 72.7 GiB), so the budget left was only 13 to 17 GiB, and the
+12 GiB `container-suite` charge plus the 6 GiB request consumed it.
+`host_used` was audited and is not the defect: it counts active + wired + compressed pages, which is lower than an Activity-Monitor-style
+figure (about 73 GiB against about 88 GiB when audited). The host figure moves by a few GiB with other applications (73 to 77 GiB seen). The class estimates were the part not backed by measurement.
 
 ### Measured peaks (`disk-admission.py measurements`, process-tree RSS, solo runs, pressure 1 throughout)
 
@@ -268,16 +269,19 @@ Activity-Monitor-style figure (about 88 GiB). The class estimates were the part 
 | `container-suite` | 17 | 1.98 GiB | 12 GiB | 4 GiB | 2.02x |
 | `build-cold-isolated` | 2 | 4.51 GiB | 16 GiB | unchanged (fewer than `MIN_SOLO_RUNS` = 3 qualifying runs) | n/a |
 
-Peaks are lower bounds (sampled about every 60 s), which is why every new value keeps a margin of at least 1.6x. `container-suite` gets
+Peaks are lower bounds (sampled about every 60 s), which is why every changed value keeps a margin of at least 1.6x (`build-crate` was not
+changed and keeps its existing 1.37x). `container-suite` gets
 the widest margin because its RSS excludes the Docker VM; the VM is resident memory already inside `host_used`, so it is not charged a
-second time, but its growth during a build is not in the RSS peak. No concurrent run has been measured for any class
+second time, but its growth during a build is not in the RSS peak. **That growth is an accepted risk of the 4 GiB value**: the 2x margin
+and the revert trigger below are the only cover, so the overlap trial must also compare `host_used` before and during every
+`container-suite` job, and a rise above 3 GiB reverts this row. No concurrent run has been measured for any class
 (`concurrent=0`), so these values are solo evidence and the trial must confirm them under overlap.
 
 ### Effect, same inputs as the refused decision
 
 With about 77 GiB `host_used` and a limit of 89.6 GiB: `build-crate` (6 GiB) next to a running `container-suite` projects to about
 77 + 2 (residual of its 4 GiB charge over about 2 GiB RSS) + 6 = 85 GiB, inside the limit; two `build-workspace` jobs project to about
-88 GiB, inside the limit by about 1.6 GiB. The second is deliberately tight: it admits only while the host is as quiet as it was, and
+88.1 GiB, inside the limit by about 1.5 GiB. The second is deliberately tight: it admits only while the host is as quiet as it was, and
 refuses otherwise.
 
 ### Safeguards and rollback
