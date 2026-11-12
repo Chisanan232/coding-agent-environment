@@ -2011,6 +2011,7 @@ def _trial_jobs(entries, lines_by_queue_id, since, until):
         share = TRIAL_CRITERIA['overlap_share']
         sampled = [ln['concurrent'] for ln in job['lines'] if type(ln.get('concurrent')) is int]
         if sampled:
+            job['touched'] = any(n > 1 for n in sampled)
             job['overlapped'] = sum(1 for n in sampled if n > 1) / len(sampled) >= share
         else:
             start, end = job['claimed'], job['end'] or until
@@ -2023,6 +2024,7 @@ def _trial_jobs(entries, lines_by_queue_id, since, until):
                 if hi > lo:
                     covered += (hi - lo).total_seconds()
                     edge = hi
+            job['touched'] = bool(others)
             job['overlapped'] = life > 0 and covered / life >= share
     return jobs
 
@@ -2103,7 +2105,7 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
             by_qid.setdefault(line['queue_id'], []).append(line)
     jobs = _trial_jobs(entries, by_qid, since, until)
     base_jobs = _trial_jobs(entries, by_qid, baseline[0], baseline[1]) if baseline else jobs
-    solo = [j for j in base_jobs if j['finished'] and not j['overlapped']]
+    solo = [j for j in base_jobs if j['finished'] and not j['touched']]   # any overlap at all keeps a job out of the baseline
     _ran_with(jobs, until)
     stage_n = TRIAL_STAGE_N
     at_stage = [j for j in jobs if j['finished'] and j['ran_with'] == stage_n]
@@ -2146,7 +2148,9 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
               if j['q2c_s'] is not None and q2c_base.get(j['class']) and classes[j['class']]['slowdown'] is not None]
     slowdowns = [c['slowdown'] for c in classes.values() if c['slowdown'] is not None]
     median_ratio = _median(ratios)
-    overlap_lines = [ln for j in overlapped for ln in j['lines'] if type(ln.get('concurrent')) is int and ln['concurrent'] > 1]
+    # Every concurrent sample of every job counts here, whatever share of its life it was: a pressure reading must not escape by sitting in a
+    # job that overlapped only briefly.
+    overlap_lines = [ln for j in jobs for ln in j['lines'] if type(ln.get('concurrent')) is int and ln['concurrent'] > 1]
     pressure_known = [ln['pressure'] for ln in overlap_lines if type(ln.get('pressure')) is int]
     swaps = [(t, ln['swap_used_bytes']) for ln in in_window if type(ln.get('swap_used_bytes')) is int
              and (t := _trial_time(ln.get('ts'))) is not None]
