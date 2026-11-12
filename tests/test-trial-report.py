@@ -62,11 +62,11 @@ class Trial(unittest.TestCase):
         with open(path, 'a') as handle:
             handle.write(json.dumps(line) + '\n')
 
-    def scenario(self, slow=1.1, overlapped_per_class=10, pressure=1, fits=(True, True, True, False), swap_growth=GIB, free=300 * GIB):
-        """3 solo jobs per class (run RUN s, wait SOLO_WAIT s) then overlapped pairs (run RUN * slow, wait 100 s) that really run together."""
+    def scenario(self, slow=1.1, overlapped_per_class=10, pressure=1, fits=(True,) * 9 + (False,) * 3, swap_growth=GIB, free=300 * GIB):
+        """5 solo jobs per class (run RUN s, wait SOLO_WAIT s) then overlapped pairs (run RUN * slow, wait 100 s) that really run together."""
         at = T0
         for cls in CLASSES:
-            for _ in range(3):
+            for _ in range(5):
                 self.job(cls, at, SOLO_WAIT, RUN, False, swap=10 * GIB, free=free)
                 at += timedelta(hours=1)
         for cls in CLASSES:
@@ -88,9 +88,9 @@ class Trial(unittest.TestCase):
         report = self.report()
         self.assertEqual(report['verdict'], 'PASS', report['criteria'])
         self.assertEqual((report['overlapped_jobs'], report['solo_baseline_jobs'], report['peak_concurrent'], report['peak_pressure']),
-                         (20, 6, 2, 1))
+                         (20, 10, 2, 1))
         crate = report['classes']['build-crate']
-        self.assertEqual((crate['solo_runs'], crate['overlapped_runs'], round(crate['slowdown'], 2)), (3, 10, 1.1))
+        self.assertEqual((crate['solo_runs'], crate['overlapped_runs'], round(crate['slowdown'], 2)), (5, 10, 1.1))
         crit = self.criteria(report)
         self.assertEqual(crit['median_queue_to_completion_ratio']['value'], round((100 + RUN * 1.1) / (SOLO_WAIT + RUN), 3))
         self.assertEqual(crit['swap_growth_bytes']['value'], GIB)
@@ -108,7 +108,7 @@ class Trial(unittest.TestCase):
                                     ('pressure', dict(pressure=2), 'pressure_samples_above_1_during_overlap'),
                                     ('swap', dict(swap_growth=3 * GIB), 'swap_growth_bytes'),
                                     ('disk', dict(free=150 * GIB), 'min_free_bytes'),
-                                    ('fits', dict(fits=(True, False, False, False)), 'fits_if_cap_were_3_share')):
+                                    ('fits', dict(fits=(True,) + (False,) * 11), 'fits_if_cap_were_3_share')):
             self.setUp()
             self.scenario(**kwargs)
             report = self.report()
@@ -204,8 +204,10 @@ class Trial(unittest.TestCase):
         self.receipt(False, qid='q000901', count=3)                          # same entry, a different situation (3 running: not a third-lane question)
         self.receipt(True, qid='q000902', count=1)                           # one running: fits() is count + 1 <= limit, trivially true for a cap of 2
         self.receipt(True, qid='q000900', band='AMBER')
+        for n in range(9):                                                   # enough distinct verdicts to judge a share at all
+            self.receipt(n < 6, qid='q001%03d' % n)
         crit = self.criteria(self.report())['fits_if_cap_were_3_share']
-        self.assertEqual((crit['value'], crit['verdict']), (0.667, 'PASS'))  # 2 of 3 distinct count==2 (entry, situation) verdicts
+        self.assertEqual((crit['value'], crit['verdict']), (0.667, 'PASS'))  # 8 of 12 distinct count==2 (entry, situation) verdicts
         self.setUp()
         self.receipt(True, count=0)
         self.assertEqual(self.criteria(self.report())['fits_if_cap_were_3_share']['verdict'], 'insufficient')
@@ -235,7 +237,7 @@ class Trial(unittest.TestCase):
     def test_a_separate_baseline_window_supplies_the_solo_runs(self):
         at = T0
         for cls in CLASSES:
-            for _ in range(3):
+            for _ in range(5):
                 self.job(cls, at, 600, 1000, False, swap=GIB)
                 at += timedelta(hours=1)
         trial_from = at
@@ -244,8 +246,38 @@ class Trial(unittest.TestCase):
                 self.job(cls, at, 100, 1100, True, swap=GIB)
                 at += timedelta(hours=1)
         report = da.trial_report(self.path, trial_from, at, baseline=(T0, trial_from - timedelta(seconds=1)), now=at)
-        self.assertEqual((report['overlapped_jobs'], report['solo_baseline_jobs']), (12, 6))
+        self.assertEqual((report['overlapped_jobs'], report['solo_baseline_jobs']), (12, 10))
         self.assertEqual(round(report['classes']['build-workspace']['slowdown'], 2), 1.1)
+
+    def test_one_concurrent_sample_in_a_long_job_is_not_an_overlap(self):
+        # q000419 in the 2026-11-12 trial: a 58-minute job with 1 of ~315 samples at concurrent 2 was counted as overlapped.
+        long_id = self.job('build-crate', T0, 100, 4000, False)
+        entry = json.loads((self.path.parent / 'queue' / (long_id + '.json')).read_text())
+        for offset in range(60, 3900, 60):
+            da._append_measurement(self.path, {'label': entry['label'], 'pid': 7, 'start_token': 't', 'v': 1, 'event': 'advance',
+                                               'ts': iso(T0 + timedelta(seconds=100 + offset)), 'queue_id': long_id, 'rss_bytes': GIB,
+                                               'concurrent': 2 if offset == 600 else 1, 'pressure': 1, 'free_bytes': 300 * GIB})
+        short = self.job('build-crate', T0 + timedelta(seconds=700), 0, 200, True)
+        rows = {j['id']: j['overlapped'] for j in self.report()['jobs']}
+        self.assertEqual((rows[long_id], rows[short]), (False, True))
+
+    def test_a_comparison_on_a_handful_of_runs_is_insufficient_not_a_fail(self):
+        # 2 overlapped jobs, 1 per class, a 100x slowdown against a class baseline of short runs: not a verdict about a lane.
+        for _ in range(5):
+            self.job('container-suite', T0, 100, 30, False)
+        self.job('container-suite', T0 + timedelta(hours=1), 100, 3000, True)
+        report = self.report()
+        crit = self.criteria(report)
+        self.assertEqual(crit['worst_class_slowdown']['verdict'], 'insufficient')
+        self.assertEqual(crit['median_queue_to_completion_ratio']['verdict'], 'insufficient')
+        self.assertNotEqual(report['verdict'], 'FAIL')
+
+    def test_a_share_on_fewer_than_ten_verdicts_is_insufficient(self):
+        for n in range(9):
+            self.receipt(False, qid='q003%03d' % n)
+        self.assertEqual(self.criteria(self.report())['fits_if_cap_were_3_share']['verdict'], 'insufficient')
+        self.receipt(False, qid='q003999')                                   # the tenth distinct verdict is enough to judge
+        self.assertEqual(self.criteria(self.report())['fits_if_cap_were_3_share']['verdict'], 'FAIL')
 
     def test_it_writes_nothing(self):
         self.scenario()
