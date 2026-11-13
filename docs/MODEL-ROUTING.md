@@ -17,6 +17,20 @@ A person or a script reads this table; no model call is made to choose a model. 
 
 A task that needs no subagent uses none. A coherent task is not split to create workers.
 
+## Tier audit (2026-11-14): configured, verified, proposed
+
+Read from the repository's `.claude/settings.json` and `.claude/agents` and from the user-level `~/.claude/settings.json` and `~/.claude/agents` on the owner's host. "Verified" here means the value is present in those files; the effective model id seen by a running session is not re-measured by this table.
+
+| Tier | Model | Effort | Routing trigger | Fallback | Status |
+|---|---|---|---|---|---|
+| Main | `sonnet` | `medium` (`effortLevel`) | Default for implementation, tests, CI, orchestration | None needed; it is the floor | Configured, in both settings files |
+| Advisor | `opus` (`advisorModel`) | Not set; the advisor default applies, UNKNOWN | Important decisions, repeated failure, security or architecture doubt, final review | Continue on Sonnet main | Configured |
+| Architect | `opus` via `opus-architect` | `high` (agent frontmatter) | Meaningful architecture, migration, security-sensitive design, genuine ambiguity | Sonnet main | Configured |
+| Worker | Haiku, pinned by explicit id | Not set | Admission table row 3 only, opt-in | Sonnet | Proposed; no Haiku agent exists |
+| Fable 5.2 | `claude-fable-5-2` | Not set | One read-only consult after a genuine reasoning bottleneck | Sonnet main plus `opus-architect` | Proposed; no agent file, paid calls disabled, see [fable/enablement-runbook.md](fable/enablement-runbook.md) |
+
+The Fable decision (retention, spend cap, billing route) is owner-held in SPE-171; nothing in this table enables it.
+
 ## Worker rules and stops
 
 A Haiku worker is pinned by explicit model id (the `haiku` alias resolved to Haiku 4.5 on Claude Code 2.1.287 to 2.1.292 and to Haiku 5.5 on 2.1.306), has the narrowest tools its task needs, never spawns agents, and never merges, publishes, closes tickets, touches credentials or certifies its own work. Sonnet main reviews the result and owns integration, the PR and Jira. The worker stops and returns the observed result, evidence and open decision when requirements are ambiguous, a public contract or schema must change, security or privacy appears, root cause stays unknown, scope grows, a test contradicts the intended behavior, or two targeted repairs fail. There is no retry loop.
