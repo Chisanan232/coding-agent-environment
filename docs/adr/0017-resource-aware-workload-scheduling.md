@@ -336,8 +336,8 @@ the class default is not cut, because an estimate may be raised and never lowere
 
 `budget_decision` records `class_aware_eligible`, `class_aware_jobs` and `fits_if_class_aware_3` beside `fits_if_cap_were_3`, and the receipts carry
 them. `queue trial-report --policy class-aware` replaces the flat fits criterion with `fits_if_class_aware_3_share`: at least 0.5 of the distinct
-verdicts of an eligible request made with exactly two jobs running, at least 10 of them. Only receipts that carry the new field count, so history
-made at four jobs is not reused, and verdicts of other classes are set aside and reported. Every other criterion, threshold and the default policy are unchanged.
+verdicts of an eligible request made with exactly two jobs running, at least 10 of them. Only receipts that carry the new field count, so
+receipts made before it existed are not reused, and verdicts of other classes are set aside and reported. Every other criterion, threshold and the default policy are unchanged.
 
 ### What this does not do
 

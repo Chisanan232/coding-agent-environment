@@ -691,6 +691,11 @@ class ClassAwareThirdLane(unittest.TestCase):
         out = decide(holders=self.TWO, req=request(self.LIGHT, excl=()))
         self.assertFalse(out['would_admit'])
 
+    def test_a_tier_with_no_lanes_admits_nothing_class_aware_either(self):
+        out = decide(req=request(self.LIGHT, excl=()), caps=dict(CAPS, max_concurrent=0))
+        self.assertTrue(out['class_aware_eligible'])
+        self.assertFalse(out['fits_if_class_aware_3'] or out['would_admit'])
+
     def test_the_verdict_reaches_the_receipt(self):
         out = decide(holders=self.TWO)
         compact = da._compact_budget(out)

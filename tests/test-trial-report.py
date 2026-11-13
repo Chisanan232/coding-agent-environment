@@ -216,7 +216,7 @@ class Trial(unittest.TestCase):
         self.assertEqual(self.criteria(self.report())['fits_if_cap_were_3_share']['verdict'], 'insufficient')
 
     def test_class_aware_policy_judges_only_eligible_verdicts_that_carry_the_field(self):
-        self.receipt(True, qid='q003000')                                    # an old receipt with no class-aware field: ignored
+        self.receipt(True, qid='q002999')                                    # an old receipt with no class-aware field: ignored
         for n in range(6):                                                   # eligible, fits
             self.receipt(False, qid='q003%03d' % n, aware=(True, True))
         for n in range(4):                                                   # eligible, refused
@@ -253,6 +253,22 @@ class Trial(unittest.TestCase):
         self.assertEqual(report['policy'], 'class-aware')
         self.assertIn('fits_if_class_aware_3_share', {c['name'] for c in report['criteria']})
 
+
+    def test_the_default_policy_counts_a_repolled_entry_once_whatever_the_class_aware_verdict(self):
+        self.receipt(False, qid='q009000')                                   # a poll from before the class-aware field existed
+        self.receipt(False, qid='q009000', aware=(True, False))
+        self.receipt(False, qid='q009000', aware=(True, True))
+        for n in range(9):
+            self.receipt(n < 5, qid='q009%03d' % (n + 1))
+        crit = self.criteria(self.report())['fits_if_cap_were_3_share']
+        self.assertEqual(crit['value'], 0.5)                                 # 10 distinct entries, 5 fit
+
+    def test_class_aware_set_aside_counts_distinct_verdicts_not_polls(self):
+        for n in range(10):
+            self.receipt(True, qid='q010%03d' % n, aware=(True, True))
+        for _ in range(7):
+            self.receipt(True, qid='q011000', aware=(False, False))
+        self.assertIn('1 verdicts of other classes set aside', self.criteria(self.report(policy='class-aware'))['fits_if_class_aware_3_share']['needed'])
 
     def test_missing_data_is_insufficient_never_pass(self):
         empty = self.report()
