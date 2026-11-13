@@ -637,6 +637,72 @@ class HeavyLaneCap(unittest.TestCase):
             self.assertFalse(hasattr(da, 'MAX_CONCURRENT'))
 
 
+class ClassAwareThirdLane(unittest.TestCase):
+    """SPE-160 shadow verdict: would a third lane admit this class at the least it needs. Never enforced."""
+    LIGHT = {'class': 'light'}
+    TWO = [holder('a'), holder('b', excl=('cargo-target:/c',))]
+
+    def test_light_fits_a_third_lane_when_the_host_has_room(self):
+        out = decide(holders=self.TWO, req=request(self.LIGHT, excl=()))
+        self.assertTrue(out['class_aware_eligible'] and out['fits_if_class_aware_3'])
+        self.assertEqual(out['class_aware_jobs'], 0)
+
+    def test_a_build_crate_is_judged_at_its_min_jobs(self):
+        tight = host(used=73 * GIB)   # 89.6 GiB limit: two crates hold 12 GiB, a third at 6 GiB projects 91, at 4 GiB 89
+        out = decide(h=tight, holders=self.TWO)
+        self.assertTrue(any(r.startswith('memory:') for r in out['resource_reasons']))
+        self.assertFalse(out['fits_if_cap_were_3'])
+        self.assertTrue(out['class_aware_eligible'] and out['fits_if_class_aware_3'])
+        self.assertEqual(out['class_aware_jobs'], 2)
+
+    def test_memory_still_refuses_a_reduced_crate_when_the_host_is_over(self):
+        out = decide(h=host(used=80 * GIB), holders=self.TWO)
+        self.assertTrue(out['class_aware_eligible'])
+        self.assertFalse(out['fits_if_class_aware_3'])
+
+    def test_cpu_still_refuses_a_reduced_crate(self):
+        busy = [holder(str(i), record=dict(CRATE, cpu_slots=8), excl=('k%d' % i,)) for i in range(2)]
+        self.assertFalse(decide(holders=busy)['fits_if_class_aware_3'])
+
+    def test_other_classes_are_not_eligible(self):
+        workspace = {'class': 'build-workspace', 'mem_bytes': 8 * GIB, 'cpu_slots': 8, 'test_threads': 8}
+        out = decide(holders=self.TWO, req=request(workspace))
+        self.assertFalse(out['class_aware_eligible'] or out['fits_if_class_aware_3'])
+
+    def test_a_request_raised_above_the_class_default_is_not_cut(self):
+        raised = dict(CRATE, mem_bytes=10 * GIB, cpu_slots=6)
+        self.assertFalse(decide(holders=self.TWO, req=request(raised))['class_aware_eligible'])
+
+    def test_non_resource_refusals_are_kept(self):
+        clash = [holder('a'), holder('b', excl=('cargo-target:/b',))]
+        out = decide(holders=clash)
+        self.assertTrue(out['class_aware_eligible'])
+        self.assertFalse(out['fits_if_class_aware_3'])
+        self.assertTrue(decide(holders=self.TWO, req=request(self.LIGHT, excl=()), caps=dict(CAPS, free_bytes=0))['class_aware_eligible'])
+        self.assertFalse(decide(holders=self.TWO, req=request(self.LIGHT, excl=()), caps=dict(CAPS, free_bytes=0))['fits_if_class_aware_3'])
+
+    def test_a_fourth_job_is_never_class_aware(self):
+        three = [holder(str(i), excl=('k%d' % i,)) for i in range(3)]
+        self.assertFalse(decide(holders=three, req=request(self.LIGHT, excl=()))['fits_if_class_aware_3'])
+
+    def test_the_lane_cap_is_untouched(self):
+        self.assertEqual(da.heavy_lane_cap('wide'), 2)
+        self.assertFalse(da.THIRD_LANE_ENABLED)
+        out = decide(holders=self.TWO, req=request(self.LIGHT, excl=()))
+        self.assertFalse(out['would_admit'])
+
+    def test_a_tier_with_no_lanes_admits_nothing_class_aware_either(self):
+        out = decide(req=request(self.LIGHT, excl=()), caps=dict(CAPS, max_concurrent=0))
+        self.assertTrue(out['class_aware_eligible'])
+        self.assertFalse(out['fits_if_class_aware_3'] or out['would_admit'])
+
+    def test_the_verdict_reaches_the_receipt(self):
+        out = decide(holders=self.TWO)
+        compact = da._compact_budget(out)
+        for key in ('class_aware_eligible', 'class_aware_jobs', 'fits_if_class_aware_3'):
+            self.assertIn(key, compact)
+
+
 class Unchanged(unittest.TestCase):
     def test_the_lane_caps_and_concurrency_constants(self):
         self.assertEqual(da.HEAVY_LANES, {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 2})

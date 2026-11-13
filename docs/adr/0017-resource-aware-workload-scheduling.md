@@ -318,6 +318,57 @@ within a class, so a mixed-length class remains a known limit that a larger tria
 
 It does not enable a third lane and does not change a trial criterion. #229 stays unmerged until a trial report passes on real data.
 
+## Revision 5: a class-aware third lane, trialled in shadow (SPE-160)
+
+### Why
+
+The lane-3 trial window 2026-11-11T23:27:03Z to 2026-11-13T00:48:36Z (25.4 h, 142 jobs) asked a flat question: would any third job fit. The
+refusals were almost all `build-workspace` (8 GiB, 8 slots): memory over the 89.6 GiB limit by 3.5 to 10.2 GiB, or 12 of 16 cpu slots already
+held. A light job holds no memory or slots, and a `build-crate` cut to its class `min_jobs` (2) needs 4 GiB and 2 slots instead of 6 GiB and 4.
+The owner asked for that narrower policy to be evaluated on real queued work before anything is enabled.
+
+### Policy under trial (shadow only)
+
+A third lane could admit only a request of class `light`, or of class `build-crate` that has not been raised above its class default, charged
+and granted at `min_jobs`. Every other class stays on two lanes. Memory, cpu slots, the byte floor, exclusive keys, the band and the 30% headroom are
+checked exactly as before; the policy removes no check, it changes only what the third job is charged. A request whose estimate was raised above
+the class default is not cut, because an estimate may be raised and never lowered.
+
+`budget_decision` records `class_aware_eligible`, `class_aware_jobs` and `fits_if_class_aware_3` beside `fits_if_cap_were_3`, and the receipts carry
+them. `queue trial-report --policy class-aware` replaces the flat fits criterion with `fits_if_class_aware_3_share`: at least 0.5 of the distinct
+verdicts of an eligible request made with exactly two jobs running, at least 10 of them. Only receipts that carry the new field count, so
+receipts made before it existed are not reused, and verdicts of other classes are set aside and reported. Every other criterion, threshold and the default policy are unchanged.
+
+### What this does not do
+
+It does not touch `heavy_lane_cap`, `HEAVY_LANES`, `THIRD_LANE_ENABLED`, the memory gate's lane reading, a trial threshold or the headroom.
+Enabling is a later, separately reviewed change that must also (a) grant `min_jobs` through `granted_jobs` and charge the reservation at the reduced
+estimate, otherwise the next verdict overcharges the lane, and (b) pass `trial-report --policy class-aware` and the gate. #229 and #227 stay open.
+
+### Overlap hours, reconciled
+
+The same window and the same finished jobs give three figures for time with exactly two jobs running:
+
+| Measure | Value |
+|---|---|
+| Gate: each job ends at its last measurement sample (lower bound) | 28 s (0.008 h; the report rounds it to 0.01) |
+| Samples with `concurrent` = 2: 41 samples at the 10 s median gap | 6.8 min (3.4 min counting each moment once) |
+| Release time as the end (upper bound; a release is recorded when a queue-aware command next runs) | 9.1 min (0.152 h) |
+
+The 10 to 20 minute estimate sits above even the upper bound. At the upper-bound rate, 5 h of overlap takes about 35 days of the same traffic, and
+far longer at the gate's own measure. The criterion is unchanged here; whether to keep it is an owner decision.
+
+### Evidence on the historic window (not counted by the new policy)
+
+Replaying the light and `build-crate` entries of that window at `min_jobs`: five of eight entries fit throughout. `aasm6463-clippy` (q000544) stayed 0.2 to
+2.7 GiB over the limit, `aasm6463-push` (q000545) up to 0.6 GiB and `orgF4run` (q000483) up to 1.0 GiB, so memory still refuses a reduced crate when the host is
+that full, and the eligible share is not guaranteed to reach 0.5.
+
+### Known limit of `min_free_bytes`
+
+16 of the 60 overlap samples are `reserve` lines of 16 jobs started without a queue entry; the line carries no byte figure, so the margin cannot be
+computed and the criterion reads `insufficient`, not FAIL. The 44 evaluable samples have a minimum margin of 177,979,600,896 bytes against 171,798,691,840 needed.
+
 ## Consequences
 
 - Text that says "one heavy lane at a time" as a permanent rule is replaced with "up to two heavy lanes (the second only when the resource
@@ -336,3 +387,4 @@ It does not enable a third lane and does not change a trial criterion. #229 stay
 | 3 | Draft (SPE-172): trial evidence 2026-11-11, revised stage-3 criteria (exact-N stage gates, overlap-window disk margin, running-only deduplicated `fits_if_cap_were_3`), prerequisites, sign-off statement |
 | 4 | Class memory estimates recalibrated against measured solo peaks: `build-workspace` 16 to 8 GiB, `container-suite` 12 to 4 GiB; `build-crate` and `build-cold-isolated` unchanged; 30% headroom kept (SPE-160) |
 | 4a | Trial report: a job overlaps only when at least half its life did; slowdown, queue-to-completion and the fits share need minimum samples before they can FAIL (SPE-172) |
+| 5 | Class-aware third lane trialled in shadow: `fits_if_class_aware_3`, `trial-report --policy class-aware`; overlap-hours reconciliation; no lane, threshold or headroom change (SPE-160) |
