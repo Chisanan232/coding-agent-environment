@@ -54,12 +54,14 @@ class Trial(unittest.TestCase):
                                                'swap_used_bytes': swap})
         return qid
 
-    def receipt(self, fits, when=None, qid=None, count=2, band='GREEN', reasons=()):
+    def receipt(self, fits, when=None, qid=None, count=2, band='GREEN', reasons=(), aware=None):
         self.seq += 1
         path = self.path.parent / 'queue/receipts.jsonl'
         line = {'ts': iso(when or T0 + timedelta(hours=1)), 'event': 'shadow-budget', 'id': qid or 'r%06d' % self.seq, 'label': 'x',
                 'tickets': [], 'budget': {'status': 'ok', 'fits_if_cap_were_3': fits, 'count': count, 'band': band,
                            'resource_reasons': list(reasons)}}
+        if aware is not None:   # (class-aware eligible, fits as class-aware)
+            line['budget'].update(class_aware_eligible=aware[0], fits_if_class_aware_3=aware[1])
         with open(path, 'a') as handle:
             handle.write(json.dumps(line) + '\n')
 
@@ -212,6 +214,45 @@ class Trial(unittest.TestCase):
         self.setUp()
         self.receipt(True, count=0)
         self.assertEqual(self.criteria(self.report())['fits_if_cap_were_3_share']['verdict'], 'insufficient')
+
+    def test_class_aware_policy_judges_only_eligible_verdicts_that_carry_the_field(self):
+        self.receipt(True, qid='q003000')                                    # an old receipt with no class-aware field: ignored
+        for n in range(6):                                                   # eligible, fits
+            self.receipt(False, qid='q003%03d' % n, aware=(True, True))
+        for n in range(4):                                                   # eligible, refused
+            self.receipt(False, qid='q004%03d' % n, aware=(True, False), reasons=['memory: projected 91.0 GiB > 89.6 GiB'])
+        for n in range(5):                                                   # another class: set aside, not counted
+            self.receipt(True, qid='q005%03d' % n, aware=(False, False))
+        crit = self.criteria(self.report(policy='class-aware'))
+        self.assertNotIn('fits_if_cap_were_3_share', crit)
+        share = crit['fits_if_class_aware_3_share']
+        self.assertEqual((share['value'], share['verdict']), (0.6, 'PASS'))
+        self.assertIn('5 verdicts of other classes set aside, 10 counted', share['needed'])
+        self.assertEqual(self.criteria(self.report())['fits_if_cap_were_3_share']['value'], 0.375)   # the default policy still counts every verdict: 6 of 16
+
+    def test_class_aware_policy_needs_enough_eligible_verdicts(self):
+        for n in range(9):
+            self.receipt(True, qid='q006%03d' % n, aware=(True, True))
+        self.assertEqual(self.criteria(self.report(policy='class-aware'))['fits_if_class_aware_3_share']['verdict'], 'insufficient')
+
+    def test_class_aware_policy_can_fail(self):
+        for n in range(10):
+            self.receipt(True, qid='q007%03d' % n, aware=(True, n < 3))
+        crit = self.criteria(self.report(policy='class-aware'))['fits_if_class_aware_3_share']
+        self.assertEqual((crit['value'], crit['verdict']), (0.3, 'FAIL'))
+
+    def test_the_cli_takes_the_policy(self):
+        self.scenario()
+        for n in range(10):
+            self.receipt(True, qid='q008%03d' % n, aware=(True, True))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            da.run(['queue', 'trial-report', '--since', iso(T0 - timedelta(hours=1)), '--until', iso(T0 + timedelta(days=2)), '--json',
+                    '--policy', 'class-aware'], state_path=self.path, free_fn=lambda: 400 * GIB)
+        report = json.loads(out.getvalue())
+        self.assertEqual(report['policy'], 'class-aware')
+        self.assertIn('fits_if_class_aware_3_share', {c['name'] for c in report['criteria']})
+
 
     def test_missing_data_is_insufficient_never_pass(self):
         empty = self.report()
