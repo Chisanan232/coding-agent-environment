@@ -2088,11 +2088,12 @@ def _criterion(name, value, verdict, needed):
     return {'name': name, 'value': value, 'needed': needed, 'verdict': verdict}
 
 
-def trial_report(state_path, since, until=None, baseline=None, now=None):
+def trial_report(state_path, since, until=None, baseline=None, now=None, policy='cap-3'):
     """Read-only trial evidence for a third heavy lane. `since`/`until` bound the trial window (aware datetimes); `baseline` is
     an optional (since, until) pair whose solo jobs form the comparison, else the solo jobs of the trial window. Returns a
     JSON-safe dict with per-job rows, per-class figures, the criteria and an overall verdict that is PASS only when every criterion
-    passes (FAIL when any fails, else INSUFFICIENT)."""
+    passes (FAIL when any fails, else INSUFFICIENT). `policy` 'class-aware' swaps the fits criterion for the class-aware third lane
+    (light and build-crate at min_jobs): only receipts that carry the verdict count, and only verdicts of an eligible class."""
     now = now or datetime.now(timezone.utc)
     until = until or now
     out = {'ok': True, 'since': iso_utc(since), 'until': iso_utc(until), 'writes': 'nothing'}
@@ -2120,7 +2121,7 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
         receipts += _read_jsonl_lines(path)
     # Only a verdict made while a job was running says anything about a third lane (a verdict on an empty host is trivially "fits"),
     # and a polled entry repeats the same verdict, so each (entry, situation) counts once.
-    verdicts, counted = [], set()
+    verdicts, counted, ineligible = [], set(), 0
     for r in receipts:
         b = r.get('budget')
         if r.get('event') != 'shadow-budget' or not isinstance(b, dict) or not ((t := _trial_time(r.get('ts'))) and since <= t <= until):
@@ -2129,9 +2130,15 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
         # with fewer running it says nothing beyond the current cap.
         if b.get('count') != stage_n or type(b['count']) is not int or type(b.get('fits_if_cap_were_3')) is not bool:
             continue
+        if policy == 'class-aware':
+            if type(b.get('fits_if_class_aware_3')) is not bool or type(b.get('class_aware_eligible')) is not bool:
+                continue   # a receipt from before the verdict existed says nothing about it
+            ineligible += not b['class_aware_eligible']
+            if not b['class_aware_eligible']:
+                continue
         # The reason text carries live figures ("projected 95.8 GiB"), so keying on it counts every re-poll of one waiting entry as a new
         # situation; only the kind of each reason (memory, cpu, byte floor, ...) separates situations.
-        key = (r.get('id'), b['count'], b.get('band'), tuple(sorted({str(x).split(':', 1)[0] for x in b.get('resource_reasons') or ()})))
+        key = (r.get('id'), b['count'], b.get('band'), b.get('fits_if_class_aware_3'), tuple(sorted({str(x).split(':', 1)[0] for x in b.get('resource_reasons') or ()})))
         if key not in counted:
             counted.add(key)
             verdicts.append(b)
@@ -2174,7 +2181,7 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
     # A sample without byte figures is missing data; the margin only passes when every overlap sample could be evaluated.
     margins_complete = bool(margins) and len(margins) == margin_samples
     low_line = min((ln for ln in in_window if type(ln.get('free_bytes')) is int), key=lambda ln: ln['free_bytes'], default=None)
-    seen3 = [v['fits_if_cap_were_3'] for v in verdicts]
+    seen3 = [v['fits_if_class_aware_3' if policy == 'class-aware' else 'fits_if_cap_were_3'] for v in verdicts]
     c = TRIAL_CRITERIA
 
     def verdict(ok, have=True):
@@ -2209,9 +2216,12 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
         _criterion('min_free_bytes', min(margins) if margins else None, verdict(bool(margins) and min(margins) >= floor_need, margins_complete),
                    '>= %d (floor + 60 GiB) for free - reserved, over every overlap sample (%d of %d evaluable)' % (
                        floor_need, len(margins), margin_samples)),
-        _criterion('fits_if_cap_were_3_share', None if len(seen3) < c['min_verdicts'] else round(sum(seen3) / len(seen3), 3),
+        _criterion('fits_if_class_aware_3_share' if policy == 'class-aware' else 'fits_if_cap_were_3_share',
+                   None if len(seen3) < c['min_verdicts'] else round(sum(seen3) / len(seen3), 3),
                    verdict(bool(seen3) and sum(seen3) / len(seen3) >= c['fits_share'], len(seen3) >= c['min_verdicts']),
-                   '>= %g of verdicts made with a job running' % c['fits_share']),
+                   '>= %g of %s' % (c['fits_share'], ('verdicts of a light or build-crate request made with %d jobs running (%d verdicts of other '
+                                                      'classes set aside, %d counted)' % (stage_n, ineligible, len(seen3)))
+                                    if policy == 'class-aware' else 'verdicts made with a job running')),
     ]
     verdicts_all = [x['verdict'] for x in criteria]
     out.update(
@@ -2222,7 +2232,7 @@ def trial_report(state_path, since, until=None, baseline=None, now=None):
         peak_pressure=max([ln['pressure'] for ln in in_window if type(ln.get('pressure')) is int], default=None),
         solo_baseline_jobs=len(solo), overlapped_jobs=len(overlapped), stage_n=stage_n,
         window_min_free_bytes=None if low_line is None else low_line['free_bytes'],
-        window_min_free_at=None if low_line is None else low_line.get('ts'), criteria=criteria,
+        window_min_free_at=None if low_line is None else low_line.get('ts'), criteria=criteria, policy=policy,
         verdict='FAIL' if 'FAIL' in verdicts_all else ('PASS' if all(v == 'PASS' for v in verdicts_all) else 'INSUFFICIENT'),
         note='run and queue-to-completion use the release time, an upper bound (a release is recorded when a queue-aware command next '
              'runs); run_s_lower_bound is the last sample of the job. Missing data is insufficient, never a pass.')
@@ -3150,6 +3160,8 @@ def build_parser():
     trial.add_argument('--until', help='ISO time with timezone (default now)')
     trial.add_argument('--baseline-since', dest='baseline_since', help='ISO time: take the solo baseline from an earlier window')
     trial.add_argument('--baseline-until', dest='baseline_until')
+    trial.add_argument('--policy', choices=('cap-3', 'class-aware'), default='cap-3',
+                       help='which third-lane policy the fits criterion judges (default: a flat cap of 3)')
     trial.add_argument('--json', action='store_true')
     qcx = qcmds.add_parser('cancel', allow_abbrev=False, help='cancel a waiting or unclaimed entry')
     qcx.add_argument('--id', required=True, dest='qid')
@@ -3231,7 +3243,7 @@ def _queue_cli(args, state_path, free_fn, host_fn=None):
             print(json.dumps({'ok': False, 'reason': 'invalid-request: times must be ISO 8601 with a timezone; '
                                                      'give both baseline bounds or neither'}))
             return REFUSED_EXIT
-        report = trial_report(state_path, since, until, (base_since, base_until) if args.baseline_since else None)
+        report = trial_report(state_path, since, until, (base_since, base_until) if args.baseline_since else None, policy=args.policy)
         print(json.dumps(report, sort_keys=True) if args.json else format_trial_report(report))
         return 0 if report.get('ok') else REFUSED_EXIT
     elif command == 'cancel':
