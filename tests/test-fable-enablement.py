@@ -13,7 +13,7 @@ FABLE_MODEL = re.compile(r"(?im)^\s*model:\s*\S*fable")
 
 
 def loadable_agent_files():
-    """Files in any directory the harness loads agents from (repo-level, plugin, or nested)."""
+    """Files under any directory named `agents` in this repo. Not ~/.claude/agents or installed plugins: those are outside the repo."""
     return [p for d in ROOT.rglob("agents") if d.is_dir() and ".git" not in d.parts
             for p in d.rglob("*") if p.is_file()]
 
@@ -37,6 +37,13 @@ class FableEnablement(unittest.TestCase):
                       "unrecognized_model", "--max-budget-usd", "cleanupperioddays"):
             self.assertIn(topic, text, topic)
         self.assertIn("not applied", text)
+
+    def test_unverifiable_claims_carry_a_label(self):
+        text = RUNBOOK.read_text()
+        for claim in ("Claude Code 2.1.306 logs", "Covered Model", "`cleanupPeriodDays` is unset", "claude -p --max-budget-usd <cap>",
+                      "`maxTurns: 12` in the agent file"):
+            at = text.index(claim)
+            self.assertIn("[UNVERIFIED", text[max(0, at - 220):at + 260], claim)
 
 
 if __name__ == "__main__":
