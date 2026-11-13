@@ -2133,15 +2133,17 @@ def trial_report(state_path, since, until=None, baseline=None, now=None, policy=
         if policy == 'class-aware':
             if type(b.get('fits_if_class_aware_3')) is not bool or type(b.get('class_aware_eligible')) is not bool:
                 continue   # a receipt from before the verdict existed says nothing about it
-            ineligible += not b['class_aware_eligible']
-            if not b['class_aware_eligible']:
-                continue
+
         # The reason text carries live figures ("projected 95.8 GiB"), so keying on it counts every re-poll of one waiting entry as a new
         # situation; only the kind of each reason (memory, cpu, byte floor, ...) separates situations.
-        key = (r.get('id'), b['count'], b.get('band'), b.get('fits_if_class_aware_3'), tuple(sorted({str(x).split(':', 1)[0] for x in b.get('resource_reasons') or ()})))
+        key = (r.get('id'), b['count'], b.get('band'), b.get('fits_if_class_aware_3') if policy == 'class-aware' else None,
+               tuple(sorted({str(x).split(':', 1)[0] for x in b.get('resource_reasons') or ()})))
         if key not in counted:
             counted.add(key)
-            verdicts.append(b)
+            if policy == 'class-aware' and not b['class_aware_eligible']:
+                ineligible += 1   # set aside after the dedupe, so it counts distinct verdicts like the eligible ones
+            else:
+                verdicts.append(b)
 
     busy = _busy_hours([j for j in jobs if j['finished']], until)
     classes = {}
