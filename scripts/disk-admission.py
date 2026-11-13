@@ -315,6 +315,9 @@ HEAVY_LANES = {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 2}
 # output and owner sign-off. LANE_CEILING is the most that flag, or any edit of HEAVY_LANES, can ever yield.
 LANE_CEILING = 3
 THIRD_LANE_ENABLED = False
+# Class-aware third lane (SPE-160, shadow only): the classes a third lane could admit, each at the least it needs. light holds no
+# memory or cpu slots; build-crate is granted its class min_jobs. Every other class stays on two lanes. Nothing reads this to admit.
+THIRD_LANE_CLASSES = ('light', 'build-crate')
 
 
 def heavy_lane_cap(tier, latch=False):
@@ -2425,6 +2428,30 @@ def _gib(value):
     return '%.1f GiB' % (value / GIB)
 
 
+def _resource_reasons(projected, limit, headroom, cpu_used, cpu_need, cpu_limit):
+    reasons = []
+    if projected > limit:
+        reasons.append('memory: projected %s > %s (RAM x (1 - %d%%))' % (_gib(projected), _gib(limit), headroom))
+    if cpu_used + cpu_need > cpu_limit:
+        reasons.append('cpu: %d slots in use + %d requested > %d cores' % (cpu_used, cpu_need, cpu_limit))
+    return reasons
+
+
+def class_aware_grant(request):
+    """(mem_bytes, cpu_slots) a third lane would charge `request`, or None when its class is not one a third lane could admit.
+    A build-crate is cut to its class min_jobs; a request already raised above the class default is not cut and not eligible,
+    because an estimate may be raised and never lowered."""
+    if request.get('legacy') or request.get('class') not in THIRD_LANE_CLASSES:
+        return None
+    spec = WORKLOAD_CLASSES[request['class']]
+    if not spec.get('jobs'):
+        return (request['mem_bytes'], request['cpu_slots']) if not request['mem_bytes'] and not request['cpu_slots'] else None
+    default_mem = (spec['mem_base_mib'] + spec['mem_per_job_mib'] * spec['jobs']) * MIB
+    if request['mem_bytes'] > default_mem or request['cpu_slots'] > spec['jobs']:
+        return None
+    return (spec['mem_base_mib'] + spec['mem_per_job_mib'] * spec['min_jobs']) * MIB, spec['min_jobs']
+
+
 def budget_decision(host, reservations, request, caps):
     """Pure. What the resource budget WOULD decide for `request` beside `reservations` (shadow: not enforced).
 
@@ -2497,10 +2524,7 @@ def budget_decision(host, reservations, request, caps):
     else:
         out['projected_bytes'] = base + request['mem_bytes']
         cpu_need = request['cpu_slots']
-        if out['projected_bytes'] > limit:
-            reasons.append('memory: projected %s > %s (RAM x (1 - %d%%))' % (_gib(out['projected_bytes']), _gib(limit), headroom))
-        if cpu_used + cpu_need > cpu_limit:
-            reasons.append('cpu: %d slots in use + %d requested > %d cores' % (cpu_used, cpu_need, cpu_limit))
+        reasons += _resource_reasons(base + request['mem_bytes'], limit, headroom, cpu_used, cpu_need, cpu_limit)
     taken = set(request['excl_keys'])
     clash = sorted({h['label'] for h in reservations if taken & set(h['excl_keys'])})
     if clash:
@@ -2512,8 +2536,18 @@ def budget_decision(host, reservations, request, caps):
     def fits(limit_count):
         return not reasons and count + 1 <= limit_count
 
+    grant = class_aware_grant(request)
+    if grant is None:
+        aware = False
+    else:   # the same refusals, with the request cut to the class-aware grant: only memory and cpu depend on it
+        mem_need, slots_need = grant
+        aware = not [r for r in reasons if r.split(':', 1)[0] not in ('memory', 'cpu')] and not _resource_reasons(
+            base + mem_need, limit, headroom, cpu_used, slots_need, cpu_limit) and count + 1 <= LANE_CEILING
+
     out.update(resource_reasons=reasons, would_admit=fits(cap), fits_if_cap_were_2=fits(2 if cap > 0 else 0),
                fits_if_cap_were_3=fits(LANE_CEILING if cap > 0 else 0),
+               class_aware_eligible=grant is not None, class_aware_jobs=None if grant is None else grant[1],
+               fits_if_class_aware_3=aware and cap > 0,
                cap_reason=None if count + 1 <= cap else 'cap: %d running + 1 > max concurrent %d' % (count, cap))
     jobs, threads = request['cpu_slots'], request['test_threads']
     floor_jobs = WORKLOAD_CLASSES.get(request['class'], {}).get('min_jobs') or 1
@@ -2779,7 +2813,8 @@ def _shadow_site(host, site, label, build, tier, free_bytes, reserved, enforced_
 
 def _compact_budget(budget):
     keys = ('shadow', 'status', 'reason', 'site', 'enforced', 'band', 'would_admit', 'fits_if_cap_were_2', 'fits_if_cap_were_3',
-            'resource_reasons', 'cap_reason', 'projected_bytes', 'limit_bytes', 'cpu_slots_used', 'cpu_limit', 'count', 'max_concurrent',
+            'resource_reasons', 'cap_reason', 'class_aware_eligible', 'class_aware_jobs', 'fits_if_class_aware_3', 'projected_bytes',
+            'limit_bytes', 'cpu_slots_used', 'cpu_limit', 'count', 'max_concurrent',
             'unmanaged_trees', 'granted_jobs', 'granted_test_threads')
     return {k: budget[k] for k in keys if k in budget}
 
