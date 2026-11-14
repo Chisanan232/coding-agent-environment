@@ -1,6 +1,6 @@
 # Claude Code model routing: Sonnet default, Haiku opt-in (SPE-122, SPE-126)
 
-Status: evidence-gated. Nothing here is deployed to live configuration, and the only Haiku agent this repository ships is the opt-in project worker `.claude/agents/haiku-worker.md` (an enabled plugin ships its own, see the tier audit). The baseline is unchanged: Sonnet medium as main, selective Opus high through `opus-architect` ([ADR 0003](adr/0003-model-routing-strategy.md)). Codex routing belongs to SPE-93 ([CODEX-ROUTING.md](CODEX-ROUTING.md)); the engineering contract belongs to SPE-108 and SPE-121. This file adds only the Haiku admission table, the measured context rule, the tier audit and the four-layer canary evidence.
+Status: evidence-gated. No setting, environment variable or user-level agent is changed by this file. The only Haiku agent this repository ships is the project worker `.claude/agents/haiku-worker.md`: sessions in this repository can see it, but it is used only when a task is explicitly delegated to it under the admission table (an enabled plugin ships its own Haiku agents, see the tier audit). The baseline is unchanged: Sonnet medium as main, selective Opus high through `opus-architect` ([ADR 0003](adr/0003-model-routing-strategy.md)). Codex routing belongs to SPE-93 ([CODEX-ROUTING.md](CODEX-ROUTING.md)); the engineering contract belongs to SPE-108 and SPE-121. This file adds only the Haiku admission table, the measured context rule, the tier audit and the four-layer canary evidence.
 
 ## Admission table
 
