@@ -1,6 +1,6 @@
 # Claude Code model routing: Sonnet default, Haiku opt-in (SPE-122, SPE-126)
 
-Status: evidence-gated. Nothing here is deployed to live configuration, and no Haiku agent is configured in this repository or in the user-level agents directory (an enabled plugin ships its own, see the tier audit). The baseline is unchanged: Sonnet medium as main, selective Opus high through `opus-architect` ([ADR 0003](adr/0003-model-routing-strategy.md)). Codex routing belongs to SPE-93 ([CODEX-ROUTING.md](CODEX-ROUTING.md)); the engineering contract belongs to SPE-108 and SPE-121. This file adds only the Haiku admission table, the measured context rule and the tier audit.
+Status: evidence-gated. Nothing here is deployed to live configuration, and no Haiku agent is configured in this repository or in the user-level agents directory (an enabled plugin ships its own, see the tier audit). The baseline is unchanged: Sonnet medium as main, selective Opus high through `opus-architect` ([ADR 0003](adr/0003-model-routing-strategy.md)). Codex routing belongs to SPE-93 ([CODEX-ROUTING.md](CODEX-ROUTING.md)); the engineering contract belongs to SPE-108 and SPE-121. This file adds only the Haiku admission table, the measured context rule, the tier audit and the four-layer canary evidence.
 
 ## Admission table
 
@@ -33,17 +33,17 @@ The Fable decision (retention, spend cap, billing route) is owner-held in SPE-17
 
 ## Four-layer design and canary evidence (2026-11-14)
 
-Haiku for bounded worker tasks, Sonnet for routine implementation, Opus for complex design and important decisions, Fable for exceptional read-only reasoning. Advisor and Architect are two distinct roles on the one Opus layer: the Advisor is the `advisorModel` tool that reviews a running session's transcript, the Architect is the `opus-architect` subagent that designs and returns a plan.
+Haiku for bounded worker tasks, Sonnet for routine implementation, Opus for complex design and important decisions, Fable for exceptional read-only reasoning (proposed, not enabled; SPE-171). Advisor and Architect are two distinct roles on the one Opus layer: the Advisor is the `advisorModel` tool that reviews a running session's transcript, the Architect is the `opus-architect` subagent that designs and returns a plan.
 
 | Layer | Effective model, measured | Evidence | Fallback |
 |---|---|---|---|
-| Haiku worker | `claude-haiku-5-5` | A `cavecrew-investigator` subagent canary and a `claude -p --agents` run of a project-style agent definition with `model: haiku` and no plugin both recorded only `claude-haiku-5-5` in the session record (modelUsage; list-price estimate $0.0097) | Sonnet |
+| Haiku worker | `claude-haiku-5-5` | A `cavecrew-investigator` subagent canary and a `claude -p --agents` run of a project-style agent definition with `model: haiku` and no plugin both recorded only `claude-haiku-5-5` in the session record on Claude Code 2.1.306, 2026-11-14 (subagent transcript model fields and `claude -p` modelUsage; list-price estimate $0.0097 for the `claude -p` run alone; no Jira record, the transcripts are not committed) | Sonnet |
 | Sonnet main | `sonnet` (configured, medium); effective id not measured here | Settings files | None |
-| Opus Architect | `claude-opus-5-5` | An `opus-architect` canary recorded `claude-opus-5-5` in the subagent transcript | Sonnet main |
+| Opus Architect | `claude-opus-5-5` | An `opus-architect` canary on 2.1.306, 2026-11-14, recorded `claude-opus-5-5` in the subagent transcript (not committed) | Sonnet main |
 | Opus Advisor | `opus` (configured); effective id not measured here | Settings file | Continue on Sonnet |
-| Fable | not measured | Preparation only: the offline tests pass and `claude --help` now names a `fable` alias, which is not evidence that a Fable call works or which model answers | Sonnet main plus `opus-architect` |
+| Fable | not measured | Preparation only: `tests/test-fable-enablement.py` passes and `claude --help` now names a `fable` alias, which is not evidence that a Fable call works or which model answers | Sonnet main plus `opus-architect` |
 
-Haiku through project-owned configuration is supported: an agent definition with `model: haiku` resolves to `claude-haiku-5-5` without the `caveman` plugin. The check used the inline `--agents` definition; a file under `.claude/agents` was not exercised, and this repository still ships none (the table test above keeps it that way until an owner approves it). Today the Haiku subagents that actually run on the owner's host come only from the `caveman` plugin, so the Haiku layer depends on that plugin until a project-owned worker is approved.
+Haiku through project-owned configuration: on Claude Code 2.1.306 an inline `--agents` definition with the bare alias `model: haiku` resolved to `claude-haiku-5-5` without the `caveman` plugin. That shows the alias resolves, not that a project worker is admitted: the worker rule above still requires an explicit model id, and the alias resolved to a different Haiku on 2.1.287 to 2.1.292. A file under `.claude/agents` was not exercised, and this repository still ships none (`tests/test-model-routing-doc.py::test_the_documented_state_matches_the_repository` keeps it that way until an owner approves one). Today the Haiku subagents that actually run on the owner's host come only from the `caveman` plugin, so the Haiku layer depends on that plugin until a project-owned worker is approved.
 
 ## Worker rules and stops
 
