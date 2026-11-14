@@ -1057,6 +1057,9 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
             if bad:
                 reasons.append("REVIEW_NOT_CLEAN: recorded review has blocking findings or a non-PASS verdict")
             facts["reviewer"] = at_head[-1][3]
+            stamps = [c.get("createdAt") for c, t in zip(mine, texts) if any(m[0] == head for m in REVIEW_RE.findall(t))]
+            if stamps and stamps[-1]:
+                facts["review_comment_at"] = stamps[-1]   # the review was complete no later than this comment
             facts["review_kind"] = "recorded technical review, self-attested by the authenticated identity (not a GitHub approval)"
             if at_head[-1][3].lower() in (me.lower(), "self", "author", "coordinator"):
                 reasons.append("REVIEW_NOT_INDEPENDENT: reviewer id is the author or coordinator")
@@ -1339,19 +1342,27 @@ def evidence_line(head, reviewer, verdict="PASS", blocking=0, *, base_sha=None, 
             f"scope=project-scripts authorization=standing-project-work")
 
 
-def evidence_json(repo, pr, base, head, reviewer, kind="independent-agent", now=None):
+def evidence_json(repo, pr, base, head, reviewer, kind="independent-agent", now=None, reviewed_at=None):
     """The review-evidence record the validating runner reads (see owner-merge-runner.py load_evidence). Print-only; unsigned.
 
     It records that an independent review of this exact head passed. It is never a GitHub approval, and the runner (not this
-    record) enforces the head pin, the checks and the class rules.
+    record) enforces the head pin, the checks and the class rules. `reviewed_at` is when the review completed (the `check` output's
+    `evidence_reviewed_at`, the review comment's time); it defaults to now and must not lie in the future.
     """
     import time
     if not REPO_RE.fullmatch(repo) or not re.fullmatch(r"[1-9][0-9]{0,8}", str(pr)) or not re.fullmatch(r"[0-9a-f]{40}", head) \
             or not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", base) or not re.fullmatch(r"[A-Za-z0-9._:-]{3,64}", reviewer) \
             or kind not in ("human", "independent-agent"):
         raise ValueError("repo, pr, base, head (40-hex), reviewer and kind (human|independent-agent) must be well formed")
+    current = time.time() if now is None else now
+    if reviewed_at is not None:
+        if not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", str(reviewed_at)):
+            raise ValueError("reviewed_at must be UTC, like 2026-11-14T02:47:00Z")
+        import calendar
+        if calendar.timegm(time.strptime(reviewed_at, "%Y-%m-%dT%H:%M:%SZ")) > current + 60:
+            raise ValueError("reviewed_at is in the future")
     return {"repo": repo, "pr": int(pr), "base": base, "head": head, "verdict": "PASS", "reviewer": reviewer, "reviewer_kind": kind,
-            "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}
+            "reviewed_at": reviewed_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(current))}
 
 
 def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None, version_policy=None, ci_exception=False, local_first=None):
@@ -1439,10 +1450,11 @@ def main(argv=None, run=None):
     ej.add_argument("--head", required=True)
     ej.add_argument("--reviewer", required=True)
     ej.add_argument("--kind", default="independent-agent")
+    ej.add_argument("--reviewed-at", help="review completion time, UTC; default now (use the check output's evidence_reviewed_at)")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "evidence-json":
-            print(json.dumps(evidence_json(a.repo, a.pr, a.base, a.head, a.reviewer, a.kind), indent=1))
+            print(json.dumps(evidence_json(a.repo, a.pr, a.base, a.head, a.reviewer, a.kind, reviewed_at=a.reviewed_at), indent=1))
             return 0
         if a.cmd == "evidence-line":
             print(evidence_line(a.head, a.reviewer, a.verdict, a.blocking, base_sha=a.base_sha,
@@ -1485,7 +1497,9 @@ def main(argv=None, run=None):
                 if sel.get("evidence_path"):
                     out["evidence_path"] = sel["evidence_path"]
                     out["evidence_note"] = ("write this file only after an independent review PASS at this exact head "
-                                            "(owner-merge-gate.py evidence-json); the runner refuses without it")
+                                            "(owner-merge-gate.py evidence-json --reviewed-at <evidence_reviewed_at>); the runner refuses without it")
+                    if facts.get("review_comment_at"):
+                        out["evidence_reviewed_at"] = facts["review_comment_at"]
             print(json.dumps(out, indent=1))
             if out["decision"]["outcome"] == DENY and verdict == "PASS":
                 return 1
