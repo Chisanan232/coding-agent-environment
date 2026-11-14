@@ -149,6 +149,21 @@ class Gate(unittest.TestCase):
         self.assertNotIn("--admin", cmd)
         self.assertNotIn("--squash", cmd)
 
+    def test_review_completion_time_is_taken_from_the_review_comment(self):
+        stamp = "2026-11-14T02:47:00Z"
+        v, _, facts = run(Fake(comments=[{"author": {"login": "chisanan232"}, "body": REVIEW, "createdAt": stamp}]))
+        self.assertEqual((v, facts["review_comment_at"]), ("PASS", stamp))
+        self.assertNotIn("review_comment_at", run(Fake())[2])         # a comment without a time claims none
+
+    def test_evidence_json_takes_an_explicit_completion_time_and_never_a_future_one(self):
+        args = ("o/r", 7, "main", HEAD, "agent-rv1")
+        self.assertEqual(omg.evidence_json(*args, reviewed_at="2026-11-14T02:47:00Z", now=1794624480)["reviewed_at"], "2026-11-14T02:47:00Z")
+        for bad in ("2026-11-14 02:47:00", "yesterday", "2026-11-14T02:47:00+00:00"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                omg.evidence_json(*args, reviewed_at=bad, now=1794624480)
+        with self.assertRaises(ValueError):
+            omg.evidence_json(*args, reviewed_at="2026-11-14T03:47:00Z", now=1794624480)   # an hour ahead of "now"
+
     def test_evidence_line_can_emit_only_the_closed_controlled_review_extension(self):
         line = omg.evidence_line(HEAD, "independent-agent-1", base_sha=BASE_SHA,
                                  recipe_sha256="c" * 64, scope="project-scripts",
