@@ -7,7 +7,7 @@
   owner-merge-gate.py queue  --repo OWNER/REPO --prs 5,6 --owners a,b      (print-only plan)
   owner-merge-gate.py evidence-line --head SHA --reviewer ID               (prints the record line)
   (controlled script reviews also pass --base-sha, --recipe-sha256, --scope project-scripts and --authorization standing-project-work)
-  owner-merge-gate.py evidence-json --repo R --pr N --head SHA --reviewer ID   (prints the JSON file the owner-merge-runner reads)
+  owner-merge-gate.py evidence-json --repo R --pr N --head SHA --reviewer ID [--from-review-comment]   (prints the JSON file the owner-merge-runner reads)
 
 `check` evaluates the exact PR head and prints one JSON verdict (PASS, REFUSE or WAIT) plus the
 merge command to run, and a `decision` (ALLOW, ASK or DENY across five separate dimensions; see
@@ -1365,6 +1365,26 @@ def evidence_json(repo, pr, base, head, reviewer, kind="independent-agent", now=
             "reviewed_at": reviewed_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(current))}
 
 
+def review_completed_at(run, repo, pr, head):
+    """When the review of this exact head was recorded: the createdAt of the authenticated user's newest OWNER-MERGE-REVIEW comment for it.
+
+    The evidence file takes this instead of a caller-written time. The PR must still be at `head`, so a review of an older head is never
+    stamped onto a newer one. It reads the comment's creation time, not its last edit, which can only make the time earlier (stricter).
+    """
+    if not REPO_RE.fullmatch(repo) or not re.fullmatch(r"[1-9][0-9]{0,8}", str(pr)) or not re.fullmatch(r"[0-9a-f]{40}", head):
+        raise ValueError("repo, pr and head (40-hex) must be well formed")
+    me = run("api", "user", "--jq", ".login").strip().lower()
+    p = _json(run, "pr", "view", str(pr), "--repo", repo, "--json", "headRefOid,comments")
+    if p["headRefOid"] != head:
+        raise ValueError("the PR is no longer at this head; the recorded review does not apply")
+    stamps = [c.get("createdAt") for c in p.get("comments") or []
+              if (c.get("author") or {}).get("login", "").lower() == me
+              and any(m[0] == head for m in REVIEW_RE.findall(re.sub(r"```.*?```", "", c.get("body") or "", flags=re.S)))]
+    if not stamps or not stamps[-1]:
+        raise ValueError("no OWNER-MERGE-REVIEW comment by the authenticated user for this head")
+    return stamps[-1]
+
+
 def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None, version_policy=None, ci_exception=False, local_first=None):
     """Text plan for the owner: gate verdict per PR, in the order given. Print-only."""
     lines, first = [], True
@@ -1450,11 +1470,18 @@ def main(argv=None, run=None):
     ej.add_argument("--head", required=True)
     ej.add_argument("--reviewer", required=True)
     ej.add_argument("--kind", default="independent-agent")
-    ej.add_argument("--reviewed-at", help="review completion time, UTC; default now (use the check output's evidence_reviewed_at)")
+    ej.add_argument("--reviewed-at", help="review completion time, UTC; default now")
+    ej.add_argument("--from-review-comment", action="store_true",
+                    help="take reviewed_at from the authenticated user's OWNER-MERGE-REVIEW comment for this head (refuses without one)")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "evidence-json":
-            print(json.dumps(evidence_json(a.repo, a.pr, a.base, a.head, a.reviewer, a.kind, reviewed_at=a.reviewed_at), indent=1))
+            at = a.reviewed_at
+            if a.from_review_comment:
+                if at:
+                    raise ValueError("--from-review-comment and --reviewed-at are alternatives")
+                at = review_completed_at(run, a.repo, a.pr, a.head)
+            print(json.dumps(evidence_json(a.repo, a.pr, a.base, a.head, a.reviewer, a.kind, reviewed_at=at), indent=1))
             return 0
         if a.cmd == "evidence-line":
             print(evidence_line(a.head, a.reviewer, a.verdict, a.blocking, base_sha=a.base_sha,
@@ -1497,7 +1524,7 @@ def main(argv=None, run=None):
                 if sel.get("evidence_path"):
                     out["evidence_path"] = sel["evidence_path"]
                     out["evidence_note"] = ("write this file only after an independent review PASS at this exact head "
-                                            "(owner-merge-gate.py evidence-json --reviewed-at <evidence_reviewed_at>); the runner refuses without it")
+                                            "(owner-merge-gate.py evidence-json --from-review-comment); the runner refuses without it")
                     if facts.get("review_comment_at"):
                         out["evidence_reviewed_at"] = facts["review_comment_at"]
             print(json.dumps(out, indent=1))
