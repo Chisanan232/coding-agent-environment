@@ -32,7 +32,12 @@ class ModelRoutingDoc(unittest.TestCase):
 
     def test_the_documented_state_matches_the_repository(self):
         for agent in (ROOT / ".claude/agents").glob("*.md"):
+            if agent.name == "haiku-worker.md":
+                continue
             self.assertNotRegex(agent.read_text(), r"(?im)^model:\s*.*haiku", agent.name)
+        worker = (ROOT / ".claude/agents/haiku-worker.md").read_text()
+        self.assertRegex(worker, r"(?m)^model: claude-haiku-5-5$")        # explicit id, never the bare alias (worker rule)
+        self.assertNotRegex(worker, r"(?m)^tools:.*\b(Agent|Task)\b")     # a worker never spawns agents
         settings = json.loads((ROOT / ".claude/settings.json").read_text())
         self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", settings.get("env", {}))
         self.assertEqual(settings.get("model"), "sonnet")
@@ -68,8 +73,8 @@ class ModelRoutingDoc(unittest.TestCase):
             self.assertIn(phrase, DOC)
 
     def test_four_layer_design_separates_measured_from_preparation(self):
-        for phrase in ("## Four-layer design and canary evidence", "claude-haiku-5-5", "claude-opus-5-5",
-                       "not evidence that a Fable call works", "depends on that plugin"):
+        for phrase in ("## Four-layer design and canary evidence", "claude-haiku-5-5", "claude-opus-5-5", "claude-sonnet-5-5",
+                       "not evidence that a Fable call works", "no longer depends on the `caveman` plugin"):
             self.assertIn(phrase, DOC)
 
     def test_worker_boundaries_are_stated(self):
