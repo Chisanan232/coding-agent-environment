@@ -67,6 +67,11 @@ class ModelRoutingDoc(unittest.TestCase):
         for phrase in ("cavecrew-investigator", "cavecrew-reviewer", "cavecrew-builder", "enabled user-wide"):
             self.assertIn(phrase, DOC)
 
+    def test_four_layer_design_separates_measured_from_preparation(self):
+        for phrase in ("## Four-layer design and canary evidence", "claude-haiku-5-5", "claude-opus-5-5",
+                       "not evidence that a Fable call works", "depends on that plugin"):
+            self.assertIn(phrase, DOC)
+
     def test_worker_boundaries_are_stated(self):
         for phrase in ("never spawns agents", "never merges, publishes, closes tickets", "There is no retry loop"):
             self.assertIn(phrase, DOC)
