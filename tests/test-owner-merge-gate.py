@@ -155,6 +155,21 @@ class Gate(unittest.TestCase):
         self.assertEqual((v, facts["review_comment_at"]), ("PASS", stamp))
         self.assertNotIn("review_comment_at", run(Fake())[2])         # a comment without a time claims none
 
+    def test_evidence_time_comes_from_the_newest_review_comment_for_the_head_only(self):
+        mine = {"login": "chisanan232"}
+        other = f"OWNER-MERGE-REVIEW head={'c' * 40} verdict=PASS blocking=0 reviewer=independent-agent-1"
+        fake = Fake(comments=[{"author": mine, "body": REVIEW, "createdAt": "2026-11-14T01:00:00Z"},
+                              {"author": mine, "body": other, "createdAt": "2026-11-14T02:00:00Z"},      # another head: ignored
+                              {"author": {"login": "someone-else"}, "body": REVIEW, "createdAt": "2026-11-14T03:00:00Z"},   # not me: ignored
+                              {"author": mine, "body": REVIEW, "createdAt": "2026-11-14T02:30:00Z"}])
+        self.assertEqual(omg.review_completed_at(fake, "Chisanan232/r", 7, HEAD), "2026-11-14T02:30:00Z")
+
+    def test_evidence_time_refuses_without_a_review_or_after_the_head_moved(self):
+        for fake in (Fake(comments=[]), Fake(comments=[{"author": {"login": "chisanan232"}, "body": REVIEW}]),
+                     Fake(headRefOid="c" * 40, comments=[{"author": {"login": "chisanan232"}, "body": REVIEW, "createdAt": "2026-11-14T02:30:00Z"}])):
+            with self.subTest(), self.assertRaises(ValueError):
+                omg.review_completed_at(fake, "Chisanan232/r", 7, HEAD)
+
     def test_evidence_json_takes_an_explicit_completion_time_and_never_a_future_one(self):
         args = ("o/r", 7, "main", HEAD, "agent-rv1")
         self.assertEqual(omg.evidence_json(*args, reviewed_at="2026-11-14T02:47:00Z", now=1794624480)["reviewed_at"], "2026-11-14T02:47:00Z")
