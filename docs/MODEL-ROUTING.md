@@ -1,6 +1,6 @@
 # Claude Code model routing: Sonnet default, Haiku opt-in (SPE-122, SPE-126)
 
-Status: evidence-gated. Nothing here is deployed to live configuration, and no Haiku agent is configured anywhere. The baseline is unchanged: Sonnet medium as main, selective Opus high through `opus-architect` ([ADR 0003](adr/0003-model-routing-strategy.md)). Codex routing belongs to SPE-93 ([CODEX-ROUTING.md](CODEX-ROUTING.md)); the engineering contract belongs to SPE-108 and SPE-121. This file adds only the Haiku admission table and the measured context rule.
+Status: evidence-gated. Nothing here is deployed to live configuration, and no Haiku agent is configured in this repository or in the user-level agents directory (an enabled plugin ships its own, see the tier audit). The baseline is unchanged: Sonnet medium as main, selective Opus high through `opus-architect` ([ADR 0003](adr/0003-model-routing-strategy.md)). Codex routing belongs to SPE-93 ([CODEX-ROUTING.md](CODEX-ROUTING.md)); the engineering contract belongs to SPE-108 and SPE-121. This file adds only the Haiku admission table, the measured context rule and the tier audit.
 
 ## Admission table
 
@@ -16,6 +16,20 @@ A person or a script reads this table; no model call is made to choose a model. 
 | Classification unknown, or the effective model id is not verified | Sonnet |
 
 A task that needs no subagent uses none. A coherent task is not split to create workers.
+
+## Tier audit (2026-11-14): configured and proposed
+
+Read from the repository's `.claude/settings.json` and `.claude/agents` and from the user-level `~/.claude/settings.json` and `~/.claude/agents` on the owner's host. "Configured" means the value is present in those files; the effective model id seen by a running session is not measured by this table.
+
+| Tier | Model | Effort | Routing trigger | Fallback | Status |
+|---|---|---|---|---|---|
+| Main | `sonnet` | `medium` (`effortLevel`) | Default for implementation, tests, CI, orchestration | None needed; it is the floor | Configured, in both settings files |
+| Advisor | `opus` (`advisorModel`) | Not set; the advisor default applies, UNKNOWN | Important decisions, repeated failure, security or architecture doubt, final review | Continue on Sonnet main | Configured |
+| Architect | `opus` via `opus-architect` | `high` (agent frontmatter) | Meaningful architecture, migration, security-sensitive design, genuine ambiguity | Sonnet main | Configured |
+| Worker | Haiku, pinned by explicit id | Not set | Admission table row 3 only, opt-in | Sonnet | Proposed for this repo; no repo or user-level Haiku agent exists. The enabled `caveman` plugin ships `cavecrew-investigator` and `cavecrew-reviewer` agents that declare the bare alias `model: haiku`, which the worker rule above does not allow for admission. Its `cavecrew-builder` declares no model and inherits the session model |
+| Fable 5.2 | `claude-fable-5-2` | Not set | One read-only consult after a genuine reasoning bottleneck | Sonnet main plus `opus-architect` | Proposed; no agent file, not enabled, owner approval pending (SPE-171); blocked by an unverified `unrecognized_model` observation on Claude Code 2.1.306, see [fable/enablement-runbook.md](fable/enablement-runbook.md) |
+
+The Fable decision (retention, spend cap, billing route) is owner-held in SPE-171; nothing in this table enables it.
 
 ## Worker rules and stops
 
@@ -35,4 +49,4 @@ Measured on Claude Code 2.1.306: a one-word reply cost 190,961 prompt tokens wit
 
 ## Rollout and rollback
 
-The pilot verdict (inconclusive, keep opt-in) is accepted. Expansion to 30 or more paired trials is deferred until a narrower pilot shows that delegation actually happens and that a benefit is plausible; Haiku delegation is not activated globally. There is nothing to roll back: no Haiku agent, no `CLAUDE_CODE_SUBAGENT_MODEL`, no change to the main model, Auto Mode or permissions. If a canary is ever approved it starts with one worker on one low-risk task class, widens to two workers only after measured accepted throughput, quarantines any class that fails back to Sonnet, and is disabled by removing the opt-in. Concurrency limits stay those of the engineering contract.
+The pilot verdict (inconclusive, keep opt-in) is accepted. Expansion to 30 or more paired trials is deferred until a narrower pilot shows that delegation actually happens and that a benefit is plausible; Haiku delegation is not activated globally by this repository or by a user-level agent. Separately, the `caveman` plugin is enabled user-wide and its `cavecrew-investigator` and `cavecrew-reviewer` agents declare Haiku, so Haiku-pinned subagents are available on this host outside this opt-in rule (disable path: set `caveman@caveman` to false in `enabledPlugins`, an owner action). There is nothing to roll back in this repository: no repo or user-level Haiku agent, no `CLAUDE_CODE_SUBAGENT_MODEL`, no change to the main model, Auto Mode or permissions. If a canary is ever approved it starts with one worker on one low-risk task class, widens to two workers only after measured accepted throughput, quarantines any class that fails back to Sonnet, and is disabled by removing the opt-in. Concurrency limits stay those of the engineering contract.
