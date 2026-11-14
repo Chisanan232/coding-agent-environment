@@ -7,7 +7,7 @@
   owner-merge-gate.py queue  --repo OWNER/REPO --prs 5,6 --owners a,b      (print-only plan)
   owner-merge-gate.py evidence-line --head SHA --reviewer ID               (prints the record line)
   (controlled script reviews also pass --base-sha, --recipe-sha256, --scope project-scripts and --authorization standing-project-work)
-  owner-merge-gate.py evidence-json --repo R --pr N --head SHA --reviewer ID   (prints the JSON file the owner-merge-runner reads)
+  owner-merge-gate.py evidence-json --repo R --pr N --head SHA --reviewer ID [--from-review-comment]   (prints the JSON file the owner-merge-runner reads)
 
 `check` evaluates the exact PR head and prints one JSON verdict (PASS, REFUSE or WAIT) plus the
 merge command to run, and a `decision` (ALLOW, ASK or DENY across five separate dimensions; see
@@ -1057,6 +1057,9 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
             if bad:
                 reasons.append("REVIEW_NOT_CLEAN: recorded review has blocking findings or a non-PASS verdict")
             facts["reviewer"] = at_head[-1][3]
+            stamps = [c.get("createdAt") for c, t in zip(mine, texts) if any(m[0] == head for m in REVIEW_RE.findall(t))]
+            if stamps and stamps[-1]:
+                facts["review_comment_at"] = stamps[-1]   # the review was complete no later than this comment
             facts["review_kind"] = "recorded technical review, self-attested by the authenticated identity (not a GitHub approval)"
             if at_head[-1][3].lower() in (me.lower(), "self", "author", "coordinator"):
                 reasons.append("REVIEW_NOT_INDEPENDENT: reviewer id is the author or coordinator")
@@ -1339,19 +1342,47 @@ def evidence_line(head, reviewer, verdict="PASS", blocking=0, *, base_sha=None, 
             f"scope=project-scripts authorization=standing-project-work")
 
 
-def evidence_json(repo, pr, base, head, reviewer, kind="independent-agent", now=None):
+def evidence_json(repo, pr, base, head, reviewer, kind="independent-agent", now=None, reviewed_at=None):
     """The review-evidence record the validating runner reads (see owner-merge-runner.py load_evidence). Print-only; unsigned.
 
     It records that an independent review of this exact head passed. It is never a GitHub approval, and the runner (not this
-    record) enforces the head pin, the checks and the class rules.
+    record) enforces the head pin, the checks and the class rules. `reviewed_at` is when the review completed (the `check` output's
+    `evidence_reviewed_at`, the review comment's time); it defaults to now and must not lie in the future.
     """
     import time
     if not REPO_RE.fullmatch(repo) or not re.fullmatch(r"[1-9][0-9]{0,8}", str(pr)) or not re.fullmatch(r"[0-9a-f]{40}", head) \
             or not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", base) or not re.fullmatch(r"[A-Za-z0-9._:-]{3,64}", reviewer) \
             or kind not in ("human", "independent-agent"):
         raise ValueError("repo, pr, base, head (40-hex), reviewer and kind (human|independent-agent) must be well formed")
+    current = time.time() if now is None else now
+    if reviewed_at is not None:
+        if not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", str(reviewed_at)):
+            raise ValueError("reviewed_at must be UTC, like 2026-11-14T02:47:00Z")
+        import calendar
+        if calendar.timegm(time.strptime(reviewed_at, "%Y-%m-%dT%H:%M:%SZ")) > current + 60:
+            raise ValueError("reviewed_at is in the future")
     return {"repo": repo, "pr": int(pr), "base": base, "head": head, "verdict": "PASS", "reviewer": reviewer, "reviewer_kind": kind,
-            "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}
+            "reviewed_at": reviewed_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(current))}
+
+
+def review_completed_at(run, repo, pr, head):
+    """When the review of this exact head was recorded: the createdAt of the authenticated user's newest OWNER-MERGE-REVIEW comment for it.
+
+    The evidence file takes this instead of a caller-written time. The PR must still be at `head`, so a review of an older head is never
+    stamped onto a newer one. It reads the comment's creation time, not its last edit, which can only make the time earlier (stricter).
+    """
+    if not REPO_RE.fullmatch(repo) or not re.fullmatch(r"[1-9][0-9]{0,8}", str(pr)) or not re.fullmatch(r"[0-9a-f]{40}", head):
+        raise ValueError("repo, pr and head (40-hex) must be well formed")
+    me = run("api", "user", "--jq", ".login").strip().lower()
+    p = _json(run, "pr", "view", str(pr), "--repo", repo, "--json", "headRefOid,comments")
+    if p["headRefOid"] != head:
+        raise ValueError("the PR is no longer at this head; the recorded review does not apply")
+    stamps = [c.get("createdAt") for c in p.get("comments") or []
+              if (c.get("author") or {}).get("login", "").lower() == me
+              and any(m[0] == head for m in REVIEW_RE.findall(re.sub(r"```.*?```", "", c.get("body") or "", flags=re.S)))]
+    if not stamps or not stamps[-1]:
+        raise ValueError("no OWNER-MERGE-REVIEW comment by the authenticated user for this head")
+    return stamps[-1]
 
 
 def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None, version_policy=None, ci_exception=False, local_first=None):
@@ -1439,10 +1470,18 @@ def main(argv=None, run=None):
     ej.add_argument("--head", required=True)
     ej.add_argument("--reviewer", required=True)
     ej.add_argument("--kind", default="independent-agent")
+    ej.add_argument("--reviewed-at", help="review completion time, UTC; default now")
+    ej.add_argument("--from-review-comment", action="store_true",
+                    help="take reviewed_at from the authenticated user's OWNER-MERGE-REVIEW comment for this head (refuses without one)")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "evidence-json":
-            print(json.dumps(evidence_json(a.repo, a.pr, a.base, a.head, a.reviewer, a.kind), indent=1))
+            at = a.reviewed_at
+            if a.from_review_comment:
+                if at:
+                    raise ValueError("--from-review-comment and --reviewed-at are alternatives")
+                at = review_completed_at(run, a.repo, a.pr, a.head)
+            print(json.dumps(evidence_json(a.repo, a.pr, a.base, a.head, a.reviewer, a.kind, reviewed_at=at), indent=1))
             return 0
         if a.cmd == "evidence-line":
             print(evidence_line(a.head, a.reviewer, a.verdict, a.blocking, base_sha=a.base_sha,
@@ -1485,7 +1524,9 @@ def main(argv=None, run=None):
                 if sel.get("evidence_path"):
                     out["evidence_path"] = sel["evidence_path"]
                     out["evidence_note"] = ("write this file only after an independent review PASS at this exact head "
-                                            "(owner-merge-gate.py evidence-json); the runner refuses without it")
+                                            "(owner-merge-gate.py evidence-json --from-review-comment); the runner refuses without it")
+                    if facts.get("review_comment_at"):
+                        out["evidence_reviewed_at"] = facts["review_comment_at"]
             print(json.dumps(out, indent=1))
             if out["decision"]["outcome"] == DENY and verdict == "PASS":
                 return 1
