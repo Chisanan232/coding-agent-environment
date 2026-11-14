@@ -1950,7 +1950,10 @@ TRIAL_STAGE_N = 2
 # Revision 4 (SPE-172): a job counts as overlapped only if at least `overlap_share` of its life ran with another job (one concurrent sample
 # in a long job is not an overlap), and a comparison or share judged on a handful of samples is insufficient, not FAIL:
 # slowdown and queue-to-completion need `jobs_per_class` solo and overlapped runs, the fits share needs `min_verdicts` verdicts.
-TRIAL_CRITERIA = {'overlapped_jobs': 20, 'classes': 2, 'jobs_per_class': 5, 'overlap_hours': 5.0, 'q2c_improvement': 0.20,
+# Revision 6 (SPE-160, owner-approved 2026-11-14): overlap time is at least 15 minutes (was 5 h, about 35 days of the measured traffic) and at
+# least `overlap_samples` overlap samples must be evaluable (free and reserved bytes known); every other threshold is unchanged.
+TRIAL_CRITERIA = {'overlapped_jobs': 20, 'classes': 2, 'jobs_per_class': 5, 'overlap_hours': 0.25, 'overlap_samples': 20,
+                  'q2c_improvement': 0.20,
                   'slowdown': 1.6, 'swap_growth_bytes': 2 * GIB, 'free_margin_bytes': 60 * GIB, 'fits_share': 0.5,
                   'overlap_share': 0.5, 'min_verdicts': 10}
 
@@ -2207,6 +2210,9 @@ def trial_report(state_path, since, until=None, baseline=None, now=None, policy=
                    '>= %d declared classes with >= %d such jobs each' % (c['classes'], c['jobs_per_class'])),
         _criterion('overlap_hours', round(hours, 2), 'PASS' if hours >= c['overlap_hours'] else 'insufficient',
                    '>= %g h with exactly %d jobs running' % (c['overlap_hours'], stage_n)),
+        _criterion('overlap_samples', len(margins), 'PASS' if len(margins) >= c['overlap_samples'] else 'insufficient',
+                   '>= %d evaluable overlap samples (free and reserved bytes known; %d overlap samples in all)' % (
+                       c['overlap_samples'], margin_samples)),
         _criterion('median_queue_to_completion_ratio', None if median_ratio is None else round(median_ratio, 3),
                    verdict(median_ratio is not None and median_ratio <= 1 - c['q2c_improvement'], median_ratio is not None),
                    '<= %.2f of the solo baseline' % (1 - c['q2c_improvement'])),
