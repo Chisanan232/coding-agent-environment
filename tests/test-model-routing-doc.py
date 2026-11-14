@@ -63,6 +63,10 @@ class ModelRoutingDoc(unittest.TestCase):
         self.assertIn("does not block network access", ev)
         self.assertIn("no expansion to 30 or more paired trials", ev)
 
+    def test_plugin_haiku_agents_are_disclosed(self):
+        for phrase in ("cavecrew-investigator", "cavecrew-reviewer", "cavecrew-builder", "enabled user-wide"):
+            self.assertIn(phrase, DOC)
+
     def test_worker_boundaries_are_stated(self):
         for phrase in ("never spawns agents", "never merges, publishes, closes tickets", "There is no retry loop"):
             self.assertIn(phrase, DOC)
