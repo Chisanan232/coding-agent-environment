@@ -37,7 +37,7 @@ class ModelRoutingDoc(unittest.TestCase):
             self.assertNotRegex(agent.read_text(), r"(?im)^model:\s*.*haiku", agent.name)
         worker = (ROOT / ".claude/agents/haiku-worker.md").read_text()
         self.assertRegex(worker, r"(?m)^model: claude-haiku-5-5$")        # explicit id, never the bare alias (worker rule)
-        self.assertNotRegex(worker, r"(?m)^tools:.*\b(Agent|Task)\b")     # a worker never spawns agents
+        self.assertIn("\ntools: [Read, Grep, Glob, Edit, Write, Bash]\n", worker)   # any widening (Agent, Task, MCP) must change this test
         settings = json.loads((ROOT / ".claude/settings.json").read_text())
         self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", settings.get("env", {}))
         self.assertEqual(settings.get("model"), "sonnet")
