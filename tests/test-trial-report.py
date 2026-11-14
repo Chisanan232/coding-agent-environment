@@ -156,17 +156,29 @@ class Trial(unittest.TestCase):
                 self.job('unclassified', T0 + timedelta(hours=n), 100, RUN, True)
         self.assertEqual(self.criteria(self.report())['overlapped_classes']['verdict'], 'insufficient')
 
-    def test_five_hours_of_overlap_are_required(self):
+    def test_fifteen_minutes_of_overlap_are_required(self):
         at = T0
         for cls in CLASSES:
             for _ in range(5):
                 for _ in range(2):
-                    self.job(cls, at, 100, 600, True)                       # 10 pairs of 10 min = 1.7 h
+                    self.job(cls, at, 100, 60, True)                        # 10 pairs of 1 min = 10 min < 15 min
                 at += timedelta(hours=1)
         crit = self.criteria(self.report())
         self.assertEqual((crit['overlapped_jobs']['verdict'], crit['overlapped_classes']['verdict']), ('PASS', 'PASS'))
         self.assertEqual(crit['overlap_hours']['verdict'], 'insufficient')
-        self.assertLess(crit['overlap_hours']['value'], 5)
+        self.assertLess(crit['overlap_hours']['value'], 0.25)
+        self.setUp()
+        self.scenario()                                                     # 10 pairs of 33 min: well over 15 min
+        self.assertEqual(self.criteria(self.report())['overlap_hours']['verdict'], 'PASS')
+
+    def test_twenty_evaluable_overlap_samples_are_required(self):
+        self.scenario(overlapped_per_class=4)                               # 8 overlapped jobs x 2 samples = 16 samples
+        crit = self.criteria(self.report())['overlap_samples']
+        self.assertEqual((crit['verdict'], crit['value']), ('insufficient', 16))
+        self.setUp()
+        self.scenario()                                                     # 20 jobs x 2 samples = 40
+        crit = self.criteria(self.report())['overlap_samples']
+        self.assertEqual((crit['verdict'], crit['value']), ('PASS', 40))
 
     def test_disk_is_judged_on_overlap_samples_net_of_reservations_and_the_window_minimum_is_only_reported(self):
         self.scenario()
