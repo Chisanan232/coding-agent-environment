@@ -369,6 +369,21 @@ that full, and the eligible share is not guaranteed to reach 0.5.
 16 of the 60 overlap samples are `reserve` lines of 16 jobs started without a queue entry; the line carries no byte figure, so the margin cannot be
 computed and the criterion reads `insufficient`, not FAIL. The 44 evaluable samples have a minimum margin of 177,979,600,896 bytes against 171,798,691,840 needed.
 
+## Revision 6: overlap-time criterion replaced (SPE-160, owner-approved 2026-11-14)
+
+### Why
+Revision 3 required at least 5 h during which exactly two jobs ran. Measured on the real queue, exactly-two time accrues at 28 s to 9.1 min over the
+observed windows (table above), so 5 h is about 35 days of the same traffic at the upper-bound rate and far longer at the gate's own measure; the fresh
+window since 2026-11-14T02:45:00Z reached 8 jobs and no overlap in 7.8 h. The owner approved replacing it (instruction of 2026-11-14).
+
+### Change
+`TRIAL_CRITERIA['overlap_hours']` 5.0 becomes 0.25 (at least 15 minutes with exactly two jobs running), and a new criterion `overlap_samples` requires at
+least 20 evaluable overlap samples (a sample with `concurrent` of at least 2 whose free bytes and live jobs' reserved bytes are all known). Unchanged and still
+required: at least 20 overlapped jobs across at least 2 classes with 5 each (`overlapped_jobs`, `overlapped_classes`), median queue-to-completion at most 0.80 of
+solo, worst slowdown at most 1.6, no pressure sample above 1 during an overlap, swap growth at most 2 GiB, `min_free_bytes` of at least floor plus 60 GiB for
+free minus reserved over every overlap sample, and the fits share of at least 0.5 over at least 10 counted verdicts. Memory (30% headroom), CPU and disk
+admission are untouched. Lane 3 stays off until a trial under these criteria reads PASS and the separately reviewed enabling change (#229) merges.
+
 ## Consequences
 
 - Text that says "one heavy lane at a time" as a permanent rule is replaced with "up to two heavy lanes (the second only when the resource
@@ -388,3 +403,4 @@ computed and the criterion reads `insufficient`, not FAIL. The 44 evaluable samp
 | 4 | Class memory estimates recalibrated against measured solo peaks: `build-workspace` 16 to 8 GiB, `container-suite` 12 to 4 GiB; `build-crate` and `build-cold-isolated` unchanged; 30% headroom kept (SPE-160) |
 | 4a | Trial report: a job overlaps only when at least half its life did; slowdown, queue-to-completion and the fits share need minimum samples before they can FAIL (SPE-172) |
 | 5 | Class-aware third lane trialled in shadow: `fits_if_class_aware_3`, `trial-report --policy class-aware`; overlap-hours reconciliation; no lane, threshold or headroom change (SPE-160) |
+| 6 | Overlap-time criterion 5 h replaced by 15 min plus 20 evaluable overlap samples; all other trial criteria and admission safeguards unchanged (SPE-160, owner-approved 2026-11-14) |
