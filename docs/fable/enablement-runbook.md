@@ -6,6 +6,8 @@ Status: nothing here is enabled. No Fable agent, setting or env var exists, and 
 
 [UNVERIFIED: session observation 2026-11-12, not reproducible from the repo] Claude Code 2.1.306 logs `unrecognized_model` for `claude-fable-5-2`, and Advisor is disabled for that id ("no advisor rank in the model catalog"). So only option A (one read-only subagent) is a candidate; Fable-as-advisor is unavailable. Effective-model identity of a Fable subagent, per-agent `model` precedence, refusal behaviour and accepted effort levels are UNVERIFIED; each needs a paid call.
 
+[MEASURED 2026-11-15, no model call] The installed 2.1.306 binary contains 13 strings for `claude-fable-5-1` and none for `claude-fable-5-2`, so its model catalog predates Fable 5.2; the `unrecognized_model` text is also present in it. Anthropic's support article 15424964 states Fable 5.2 needs Claude Code 2.1.321 or later. The CLI is the Homebrew cask `claude-code@latest` (2.1.306 installed, 2.1.325 available), upgraded by `brew upgrade --cask claude-code@latest`. That upgrade replaces the CLI every session uses, so it is a host-wide change that needs owner approval; it was not run.
+
 Re-check without spending (no model call):
 
 1. `claude --version`; if it is newer than 2.1.306, read its release notes/changelog for Fable 5.2 catalog support.
