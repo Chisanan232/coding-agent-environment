@@ -74,7 +74,7 @@ class ModelRoutingDoc(unittest.TestCase):
 
     def test_four_layer_design_separates_measured_from_preparation(self):
         for phrase in ("## Four-layer design and canary evidence", "claude-haiku-5-5", "claude-opus-5-5", "claude-sonnet-5-5",
-                       "not evidence that a Fable call works", "no longer depends on the `caveman` plugin"):
+                       "This is one canary call, not a routing decision", "no longer depends on the `caveman` plugin"):
             self.assertIn(phrase, DOC)
 
     def test_worker_boundaries_are_stated(self):
