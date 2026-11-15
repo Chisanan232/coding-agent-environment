@@ -32,7 +32,7 @@ Effective model in the session record is `claude-fable-5-2` (not an alias or fal
 
 ## Fallback routing when Fable is unavailable
 
-Unrecognised model, refusal, fallback, or any unverified identity routes to the existing baseline: Sonnet medium main, `opus-architect` (Opus, high) for hard design, `advisorModel: opus` unchanged. Escalation rules stay in `docs/MODEL-ROUTING.md` (genuine reasoning bottleneck after evidence is sufficient; not file count, one test failure, uncertainty, enthusiasm, or a safety refusal). A refusal or fallback is a gate, not a retry.
+Unrecognised model, refusal, fallback, or any unverified identity falls back to the existing baseline: Sonnet medium main, `opus-architect` (Opus, high) for hard design, `advisorModel: opus` unchanged. Escalation rules stay in `docs/MODEL-ROUTING.md` (genuine reasoning bottleneck after evidence is sufficient; not file count, one test failure, uncertainty, enthusiasm, or a safety refusal). A refusal or fallback is a gate, not a retry. The fallback is not automatic: measured on Claude Code 2.1.325, an unrecognised main model id with no `--fallback-model` fails with `is_error` true and nothing answers; only a configured `--fallback-model sonnet` completes on Sonnet (see `docs/MODEL-ROUTING.md`). No setting or agent file configures that flag by default.
 
 ## Retention
 
