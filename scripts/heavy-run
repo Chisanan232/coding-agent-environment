@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Class-declaring, queue-aware wrapper for one heavy command (ADR 0017).
+
+Usage: heavy-run --label L --class C --bytes N [--ttl-s S] [--max-wait-s W] [--ticket T] [--repo R] -- COMMAND [ARG...]
+
+Runs COMMAND as the lane holder of the shared heavy-job queue (scripts/disk-admission.py next to this file, so the runner is always
+the checkout's own version). A free lane runs it at once; when the runner refuses (no lane, or entries already wait: "queue-ahead")
+the job is enqueued with the same declared class and argv, advanced and polled until granted, then claimed with `run --queue-id`.
+The lane is released when COMMAND exits. The command is never started outside a lane.
+
+--class declares the workload (build-workspace for a Cargo workspace gate). Without it the runner records no class and charges the
+reservation as an unknown workload (the host's whole resource budget), which is the conservative accounting and blocks every other
+lane, so a missing class is warned about, not guessed.
+
+Exit codes: COMMAND's own (a signal death is 128+N); 64 usage; 75 not admitted within --max-wait-s; 77 refused by the queue. A
+command's own 64, 75 or 77 is indistinguishable from the wrapper's, as with la-cargo. A command already inside a lane
+(CAE_ADMISSION_HOLDER names this process or an ancestor) is not charged again; that marker is trusted as the environment's word, so
+it guards against double charging by accident, not against a caller who sets it on purpose.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+RUNNER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk-admission.py")
+HOLDER_ENV = "CAE_ADMISSION_HOLDER"          # "<label>:<pid>", exported by the runner's run / queue claim
+REFUSED_EXIT = 77
+TIMEOUT_EXIT = 75
+POLL_S = 15
+NOTICE_EVERY_S = 300
+
+
+def exit_code(rc):
+    """A command killed by a signal comes back from subprocess as -N; report it as a shell would (128+N), not as 256-N."""
+    return 128 - rc if rc < 0 else rc
+
+
+def runner_cmd(*args):
+    return [sys.executable, RUNNER, *args]
+
+
+def _capture(cmd, env):
+    try:
+        done = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        return done.returncode, done.stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+
+
+def _json(text):
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, dict) else {}
+    except ValueError:
+        return {}
+
+
+def _ancestors():
+    pids, pid = set(), os.getpid()
+    for _ in range(64):
+        out = subprocess.run(["/bin/ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL).stdout.strip()
+        if not out.isdigit() or int(out) <= 1:
+            break
+        pid = int(out)
+        pids.add(pid)
+    return pids
+
+
+def inherited_holder(environ=None):
+    """The runner's marker when this process already runs under a lane, else None. Accepted only when the marked pid is this
+    process or an ancestor: a marker inherited by a process that outlived the job, or a forged one, proves nothing."""
+    match = re.fullmatch(r"([A-Za-z0-9_][A-Za-z0-9._-]{0,63}):([0-9]+)", (os.environ if environ is None else environ).get(HOLDER_ENV, ""))
+    if not match:
+        return None
+    pid = int(match.group(2))
+    return match.group(0) if pid == os.getpid() or pid in _ancestors() else None
+
+
+def _release(cmd, env):
+    rc, out = _capture(runner_cmd(*cmd), env)
+    if rc != 0:
+        print(f"heavy-run: WARNING could not release the lane ({out.strip()[:200]}); run `disk-admission.py {' '.join(cmd)}` "
+              "once the command has ended.", file=sys.stderr)
+
+
+def admitted(args, env, sleep=time.sleep, clock=time.monotonic):
+    label = args.label
+    session = f"heavy-run-{os.getpid()}-{int(time.time())}"
+    scratch = tempfile.mkdtemp(prefix="heavy-run-")
+    proof = os.path.join(scratch, "started")
+    # The job writes the proof then execs the command (same pid): the lane is held by the command itself, and "it ran" is
+    # distinguishable from "the runner refused" even when the command's own exit code happens to be 77.
+    job = ["/bin/sh", "-c", 'touch "$1" && shift && exec "$@"', "heavy-run", proof, *args.command]
+    declare = ["--label", label, "--bytes", str(args.bytes)]
+    if args.workload_class:
+        declare += ["--class", args.workload_class]
+    run_extra = ["--ttl-s", str(args.ttl_s)]
+    try:
+        rc = subprocess.call(runner_cmd("run", *declare, *run_extra, "--", *job), env=env)
+        if os.path.exists(proof):
+            _release(["release", "--label", label], env)
+            return exit_code(rc)
+        if rc != REFUSED_EXIT:
+            print(f"heavy-run: the admission runner failed (exit {rc}) before starting the command; refusing (fail closed).", file=sys.stderr)
+            return rc
+        print("heavy-run: no heavy lane for this job right now; queueing for one.", file=sys.stderr)
+        return _queued(args, declare, run_extra, job, proof, session, env, sleep, clock)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _queued(args, declare, run_extra, job, proof, session, env, sleep, clock):
+    ticket = re.sub(r"[^A-Za-z0-9._-]", "", args.ticket).lstrip("._-")[:32] or "heavy-run"
+    rc, out = _capture(runner_cmd("queue", "enqueue", *declare, "--ticket", ticket, "--repo", args.repo, "--worktree", os.getcwd(),
+                                  "--harness", args.harness, "--session-id", session, "--again", "--wait-s",
+                                  str(max(args.max_wait_s, 60)), "--", *job), env)
+    queued = _json(out)
+    if rc != 0 or not queued.get("ok") or not queued.get("id"):
+        print(f"heavy-run: could not queue the job: {queued.get('reason', out.strip()[:200])}", file=sys.stderr)
+        return REFUSED_EXIT
+    qid = queued["id"]
+    claimed, deadline, next_notice = False, clock() + args.max_wait_s, 0.0
+    try:
+        while clock() < deadline:
+            _capture(runner_cmd("queue", "advance"), env)
+            _, listing = _capture(runner_cmd("queue", "status", "--json"), env)
+            entry = next((e for e in _json(listing).get("entries", []) if e.get("id") == qid), None)
+            state = entry.get("state") if entry else None
+            if state == "GRANTED":
+                rc = subprocess.call(runner_cmd("run", *declare, *run_extra, "--queue-id", qid, "--", *job), env=env)
+                if os.path.exists(proof):
+                    claimed = True
+                    _release(["queue", "release", "--id", qid, "--session-id", session], env)
+                    return exit_code(rc)
+                print(f"heavy-run: claim of {qid} refused (exit {rc}); the grant is kept, retrying.", file=sys.stderr)
+            elif state not in ("QUEUED", "ELIGIBLE"):
+                print(f"heavy-run: queue entry {qid} is {state or 'missing'}; refusing.", file=sys.stderr)
+                return REFUSED_EXIT
+            elif clock() >= next_notice:
+                print(f"heavy-run: waiting for a heavy lane ({qid} {state}).", file=sys.stderr)
+                next_notice = clock() + NOTICE_EVERY_S
+            sleep(POLL_S)
+        print(f"heavy-run: not admitted within {args.max_wait_s} s; the command was NOT started.", file=sys.stderr)
+        return TIMEOUT_EXIT
+    finally:
+        if not claimed and os.path.exists(proof):
+            # interrupted after the claim started the job: the entry is CLAIMED, so it is released, not cancelled
+            _release(["queue", "release", "--id", qid, "--session-id", session], env)
+        elif not claimed:
+            _capture(runner_cmd("queue", "cancel", "--id", qid, "--session-id", session), env)
+
+
+def _terminate(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+def parse(argv):
+    parser = argparse.ArgumentParser(prog="heavy-run", add_help=True, allow_abbrev=False)
+    parser.add_argument("--label", required=True, help="reservation label, [A-Za-z0-9_][A-Za-z0-9._-]{0,63}")
+    parser.add_argument("--class", dest="workload_class", help="declared workload class (see disk-admission.py run --help)")
+    parser.add_argument("--bytes", type=int, required=True, help="disk bytes to reserve (at least the class default)")
+    parser.add_argument("--ttl-s", type=int, default=4 * 3600)
+    parser.add_argument("--max-wait-s", type=int, default=3600)
+    parser.add_argument("--ticket", default="")
+    parser.add_argument("--repo", default="heavy-run")
+    parser.add_argument("--harness", choices=("claude", "codex"), default=os.environ.get("HEAVY_RUN_HARNESS", "claude"))
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    if args.command[:1] == ["--"]:
+        args.command = args.command[1:]
+    if not args.command:
+        parser.error("empty command: pass it after --")
+    if not 1 <= args.ttl_s <= 14400:
+        parser.error("--ttl-s must be 1..14400 (the runner refuses a longer hold without --max-hold)")
+    return args
+
+
+def main(argv=None, env=None):
+    try:
+        args = parse(sys.argv[1:] if argv is None else argv)
+    except SystemExit as exc:
+        return 64 if exc.code else 0
+    env = dict(os.environ if env is None else env)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _terminate)
+    holder = inherited_holder(env)
+    if holder:
+        print(f"heavy-run: already running under lane {holder}; not charged again.", file=sys.stderr)
+        try:
+            return exit_code(subprocess.call(args.command, env=env))
+        except OSError as exc:
+            print(f"heavy-run: cannot run {args.command[0]}: {exc}", file=sys.stderr)
+            return 127
+    if not args.workload_class:
+        print("heavy-run: WARNING no --class: the runner records an unknown workload and charges the host's whole resource budget.",
+              file=sys.stderr)
+    return admitted(args, env)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
