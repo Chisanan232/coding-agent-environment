@@ -85,7 +85,7 @@ def inherited_holder(environ=None):
 
 def _release(cmd, env):
     rc, out = _capture(runner_cmd(*cmd), env)
-    if rc != 0:
+    if rc != 0 and " is RELEASED" not in out:       # the runner already released the entry when the job ended: nothing to do
         print(f"heavy-run: WARNING could not release the lane ({out.strip()[:200]}); run `disk-admission.py {' '.join(cmd)}` "
               "once the command has ended.", file=sys.stderr)
 
