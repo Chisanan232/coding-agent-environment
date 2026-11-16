@@ -416,6 +416,18 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
   output, with the criteria of ADR 0017 revision 3 (exact-N stage gates, overlap-window disk margin, running-only deduplicated
   `fits_if_cap_were_3`; the window-wide minimum free disk is reported, not gated) and the rollback procedure of revision 2.
 
+## Any other heavy command: `scripts/heavy-run`
+
+`scripts/heavy-run --label L --class C --bytes N [--max-wait-s W] -- COMMAND` is the supported entry point for a campaign's heavy
+command (a Cargo workspace gate, a container suite). It runs `scripts/disk-admission.py` from its own checkout, declares the class,
+runs the command at once when a lane is free, and otherwise enqueues the same class and argv, polls, claims with `run --queue-id` and
+releases the entry when the command exits. It never starts the command outside a lane; exit 75 means not admitted in time (command
+not started), 77 refused. A wrapper that calls an old runner directly is the defect it replaces: a runner from before ADR 0017
+revision 2 writes a reservation with no class, which the budget must charge as an unknown workload (the whole resource budget and
+every core), and it cannot see queued entries, so it starts ahead of jobs that are waiting. Unknown workloads stay charged
+conservatively; declare `build-workspace` for a Cargo workspace test or clippy run. The runner version a session uses is the checkout
+its wrapper points at: check `grep '^HEAVY_LANES' <checkout>/scripts/disk-admission.py` (the cap is 1 before revision 2).
+
 ## Local Agent builds through the queue: `la-cargo` (SPE-174)
 
 `scripts/la-cargo` is the tracked source of the wrapper installed at `~/.local/bin/la-cargo` (before SPE-174 it existed only as the
