@@ -1,7 +1,7 @@
 # Owner-merge onboarding matrix and the repeated-prompt root cause (SPE-118)
 
 The repository matrix was measured 2026-10-23 with read-only `gh api` calls against main `c97fc85`. **No repository is opted in by this document.** The runner allowlist
-(`~/.claude/owner-merge-runner-allowlist.json`) is owner-controlled; today it holds `Chisanan232/coding-agent-environment` and a disposable canary only.
+(`~/.claude/owner-merge-runner-allowlist.json`) is owner-controlled; as read on 2026-11-16 it holds seven entries: `Chisanan232/coding-agent-environment`, a disposable canary, `horonomy/fornax-core`, `horonomy/libra-governor`, `horonomy/circinus`, `horonomy/local-agent` and `AI-agent-assembly/agent-assembly`. This document opts nothing in; each entry was added by the owner. Repositories with evidence files but no entry (`horonomy/fornax-cloud`, `ai-agent-assembly/official-website`) merge through the pinned `gh pr merge` (ASK), not the runner.
 
 ## Why a Libra Governor owner PR (#205) still showed "Allow once"
 

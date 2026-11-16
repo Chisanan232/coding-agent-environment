@@ -15,7 +15,7 @@ subagent fan-out. Run `scripts/memory-admission.py check --weight heavy` first; 
 | Physical RAM and compressed memory | `hw.memsize`, `vm_stat` "occupied by compressor" | A large compressor share means the machine is already holding memory it cannot drop cheaply |
 | Swap used **and** sustained swap I/O | `vm.swapusage`, swapins+swapouts over a measured window | Used swap alone is history; the I/O rate is current behaviour |
 | Disk and swap-growth headroom | free bytes of the Data volume | Swap files grow on that volume; a full disk means swap cannot grow |
-| Active build/test processes | `ps` pid, ppid, state, elapsed and CPU time, %cpu, rss and the executable name (`cargo`, `rustc`, `clang`, `ld`, `xcodebuild`, ...); never the command line | Up to two heavy lanes (the second only when the resource budget passes; ADR 0017 revision 2), counted as a process tree (workload), not per process; see "Idle orphans" below |
+| Active build/test processes | `ps` pid, ppid, state, elapsed and CPU time, %cpu, rss and the executable name (`cargo`, `rustc`, `clang`, `ld`, `xcodebuild`, ...); never the command line | Up to two heavy lanes, a third as a pilot (each beyond the first only when the resource budget passes; ADR 0017 revisions 2 and 7), counted as a process tree (workload), not per process; see "Idle orphans" below |
 | Load per core | `getloadavg` / CPU count | Scheduler saturation that RAM numbers do not show |
 | Reservations and ownership | the existing `disk-admission.py` gate (reserve, lane cap, process identity) | Task ownership already lives there; it is not duplicated |
 

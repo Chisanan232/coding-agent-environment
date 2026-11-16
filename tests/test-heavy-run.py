@@ -55,19 +55,22 @@ if cmd == 'run':
     queued = '--queue-id' in argv
     if mode == 'claimrefused' and queued and counter('claims') == 0:
         sys.exit(77)                       # the first claim is refused (gate), the grant is kept
-    if mode == 'free' or (mode in ('queue', 'claimrefused') and queued):
+    if mode == 'free' or (mode in ('queue', 'claimrefused', 'preleased') and queued):
         log(event='job-start', claim=queued)
         os.execvp(job[0], job)             # like the real runner: the job replaces the runner, so its exit status is the wrapper's input
-    if mode in ('queue', 'claimrefused', 'cancelled'):
+    if mode in ('queue', 'claimrefused', 'cancelled', 'preleased'):
         sys.exit(77)                       # queue-ahead: entries already wait, a direct start is refused
     if mode == 'broken':
         sys.exit(2)
     sys.exit(77)
+if cmd == 'queue' and argv[1] == 'release' and mode == 'preleased':
+    print(json.dumps({'ok': False, 'reason': 'q000900 is RELEASED; only a claimed entry is released here'}))
+    sys.exit(1)
 if cmd == 'queue' and argv[1] == 'enqueue':
     print(json.dumps({'ok': True, 'id': 'q000900'}))
 elif cmd == 'queue' and argv[1] == 'status':
     n = counter('polls')
-    state = 'GRANTED' if mode in ('queue', 'claimrefused') and n >= 2 else ('CANCELLED' if mode == 'cancelled' else 'QUEUED')
+    state = 'GRANTED' if mode in ('queue', 'claimrefused', 'preleased') and n >= 2 else ('CANCELLED' if mode == 'cancelled' else 'QUEUED')
     print(json.dumps({'entries': [{'id': 'q000900', 'state': state}]}))
 '''
 
@@ -225,6 +228,12 @@ class Wrapper(unittest.TestCase):
         self.assertEqual(code, hr.REFUSED_EXIT)
         self.assertEqual(self.ran(), 0)
         self.assertIn('CANCELLED', err)
+
+    def test_an_entry_the_runner_already_released_is_not_a_release_failure(self):
+        self.mode('preleased')
+        code, err = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertNotIn('WARNING', err)
 
     def test_a_command_killed_by_a_signal_exits_as_a_shell_would(self):
         self.mode('free')
