@@ -3,8 +3,10 @@
 Status: accepted for the repository. **Revision 3 (SPE-172, draft, awaiting owner sign-off) records the first trial evidence and revises the
 third-lane protocol; it does not enable a third lane.** Revision 2 (SPE-160) adds the machinery for a **second heavy lane** and the evidence tooling for
 a conditional third. **The cap is 2 in the stable and wide tiers, set by the single constant `HEAVY_LANES` in the final "flip"
-commit described below; reverting that commit restores 1 and is the rollback.** A third lane stays off behind
-`THIRD_LANE_ENABLED = False`. Supersedes the clause "One heavy lane" in decision 3 of [ADR 0015](0015-memory-aware-admission-and-gh-first.md);
+commit described below; reverting that commit restores 1 and is the rollback.** **Revision 7 (SPE-160) enables the third lane as a monitored,
+reversible pilot (`THIRD_LANE_ENABLED = True`, wide-tier cap 3) on the owner's instruction of 2026-11-16, ahead of a trial PASS; the lane-3 trial
+evidence (revision 6 criteria) is still collected to decide whether to keep it as the default, and reverting the revision 7 pull request is the
+rollback.** Supersedes the clause "One heavy lane" in decision 3 of [ADR 0015](0015-memory-aware-admission-and-gh-first.md);
 the rest of ADR 0015 stands.
 
 ## Context
@@ -52,7 +54,7 @@ numbers) and no preemption (nothing is signalled, released or reaped on behalf o
 | Resource budget and `fits_if_cap_were_2` / `fits_if_cap_were_3` | reported everywhere (#174); **enforced for lanes 2 and up** (revision 2) |
 | Reservation-aware memory veto | shipped (#175); its cap now follows `heavy_lane_cap()`; a second tree also needs the EXIT bounds |
 | Banded per-job caps in the child environment | shipped (#176); revision 2: RED exports `min_jobs`, an unavailable budget exports the declared figures, oversized integers are safe, the exported jobs are recorded as `granted_jobs` |
-| Third lane | **not enabled** (`THIRD_LANE_ENABLED = False`); needs its own reviewed change |
+| Third lane | **enabled as a pilot** (`THIRD_LANE_ENABLED = True`, wide tier cap 3, revision 7); reverting that change restores two lanes |
 
 The constants (class estimates, 8 GiB allowance, headroom, `host_used` = active + wired + compressed pages) are guesses until measured.
 
@@ -404,3 +406,4 @@ admission are untouched. Lane 3 stays off until a trial under these criteria rea
 | 4a | Trial report: a job overlaps only when at least half its life did; slowdown, queue-to-completion and the fits share need minimum samples before they can FAIL (SPE-172) |
 | 5 | Class-aware third lane trialled in shadow: `fits_if_class_aware_3`, `trial-report --policy class-aware`; overlap-hours reconciliation; no lane, threshold or headroom change (SPE-160) |
 | 6 | Overlap-time criterion 5 h replaced by 15 min plus 20 evaluable overlap samples; all other trial criteria and admission safeguards unchanged (SPE-160, owner-approved 2026-11-14) |
+| 7 | Third lane enabled as a monitored, reversible pilot on the owner's instruction (2026-11-16): `THIRD_LANE_ENABLED = True`. Disk, memory-pressure, CPU, headroom and class limits unchanged, so a third job still needs the budget to pass (a `light` or class-eligible `build-crate` request). If the pilot hits a limit, new third-lane admission stops by revert; trial evidence under the revision 6 criteria still decides whether to retain it as the default (SPE-160) |

@@ -23,6 +23,7 @@ def load(name, file):
 
 
 da = load('disk_admission', 'scripts/disk-admission.py')
+da.THIRD_LANE_ENABLED = False      # these tests pin the two-lane mechanics; the shipped value is asserted in test-shadow-budget
 shadow = load('shadow_budget_tests', 'tests/test-shadow-budget.py')
 queue_tests = load('admission_queue_tests', 'tests/test-admission-queue.py')
 GIB = 1024 ** 3
