@@ -311,10 +311,11 @@ HEAVY_FLOOR = LOW_BELOW
 # Concurrent heavy lanes per tier. Lane 1 is admitted by the disk rules alone; lanes 2 and up also need the resource budget to
 # pass (see _budget_allows), so a tier's number is a ceiling, not a promise.
 HEAVY_LANES = {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 2}
-# A third lane is a separate reviewed change (SPE-160): flip THIRD_LANE_ENABLED in its own PR with the `queue trial-report` PASS
-# output and owner sign-off. LANE_CEILING is the most that flag, or any edit of HEAVY_LANES, can ever yield.
+# A third lane is a separate reviewed change (SPE-160): THIRD_LANE_ENABLED is flipped in its own PR. It is on as a monitored,
+# reversible pilot on the owner's instruction of 2026-11-16 (ADR 0017 revision 7), not on a trial PASS; reverting that PR is the
+# rollback. LANE_CEILING is the most that flag, or any edit of HEAVY_LANES, can ever yield.
 LANE_CEILING = 3
-THIRD_LANE_ENABLED = False
+THIRD_LANE_ENABLED = True
 # Class-aware third lane (SPE-160, shadow only): the classes a third lane could admit, each at the least it needs. light holds no
 # memory or cpu slots; build-crate is granted its class min_jobs. Every other class stays on two lanes. Nothing reads this to admit.
 THIRD_LANE_CLASSES = ('light', 'build-crate')

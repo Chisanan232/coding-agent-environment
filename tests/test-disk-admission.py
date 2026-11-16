@@ -20,6 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = spec_from_file_location('disk_admission', ROOT / 'scripts/disk-admission.py')
 da = module_from_spec(spec)
 spec.loader.exec_module(da)
+# These tests pin the two-lane mechanics (cap 2 at the wide tier); the shipped third-lane value is asserted in test-shadow-budget.
+da.THIRD_LANE_ENABLED = False
 GIB = 1024 ** 3
 # Several lanes are only admitted beside a running job with a GREEN host sample and an estimate; a `light` job costs the budget
 # nothing, so these tests keep exercising the byte floor, serialization and TTL rules rather than the budget (tested elsewhere).
