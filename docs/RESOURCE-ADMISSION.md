@@ -69,7 +69,7 @@ detection matches executable names only; it targets macOS. Wiring it into `disk-
 
 ## 4. Concurrency
 
-Up to two admitted heavy lanes, as the resource governor allows (the second only when the resource budget passes; a third stays off behind `THIRD_LANE_ENABLED`; [ADR 0017](adr/0017-resource-aware-workload-scheduling.md) revision 2). Do not start competing Cargo workspace builds, Docker
+Up to two admitted heavy lanes, as the resource governor allows (the second only when the resource budget passes; a third runs as a pilot behind `THIRD_LANE_ENABLED`, still only when the budget passes; [ADR 0017](adr/0017-resource-aware-workload-scheduling.md) revision 2). Do not start competing Cargo workspace builds, Docker
 suites, native QA or full E2E; lower subagent fan-out while pressure is not normal (the seven-subagent cap is a ceiling, not a
 target). Prefer reusable build artifacts and isolated targets inside the budget. Never kill another active session, and never delete
 its worktree, runtime, cache, container or reservation.
@@ -393,7 +393,7 @@ which does not exec, applies the grant only to its own process.
 ## Concurrent heavy lanes (SPE-160)
 
 `heavy_lane_cap(tier, latch)` in `scripts/disk-admission.py` is the one place a lane count is decided: 0 while latched or below
-stable, else `HEAVY_LANES[tier]`, plus one in the wide tier only when `THIRD_LANE_ENABLED` (off), never above `LANE_CEILING` (3).
+stable, else `HEAVY_LANES[tier]`, plus one in the wide tier only when `THIRD_LANE_ENABLED` (on, as a pilot; ADR 0017 revision 7), never above `LANE_CEILING` (3).
 The shipped `HEAVY_LANES` value is 2 in stable and wide since the final, separately reviewed flip commit of ADR 0017 revision 2;
 reverting that commit restores 1 (rollback procedure in the ADR) and the rules below go dormant.
 
