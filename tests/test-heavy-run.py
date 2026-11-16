@@ -53,10 +53,12 @@ log(argv=argv)
 if cmd == 'run':
     job = argv[argv.index('--') + 1:]
     queued = '--queue-id' in argv
-    if mode == 'free' or (mode == 'queue' and queued):
+    if mode == 'claimrefused' and queued and counter('claims') == 0:
+        sys.exit(77)                       # the first claim is refused (gate), the grant is kept
+    if mode == 'free' or (mode in ('queue', 'claimrefused') and queued):
         log(event='job-start', claim=queued)
-        sys.exit(subprocess.call(job))
-    if mode == 'queue':
+        os.execvp(job[0], job)             # like the real runner: the job replaces the runner, so its exit status is the wrapper's input
+    if mode in ('queue', 'claimrefused', 'cancelled'):
         sys.exit(77)                       # queue-ahead: entries already wait, a direct start is refused
     if mode == 'broken':
         sys.exit(2)
@@ -65,7 +67,7 @@ if cmd == 'queue' and argv[1] == 'enqueue':
     print(json.dumps({'ok': True, 'id': 'q000900'}))
 elif cmd == 'queue' and argv[1] == 'status':
     n = counter('polls')
-    state = 'GRANTED' if mode == 'queue' and n >= 2 else 'QUEUED'
+    state = 'GRANTED' if mode in ('queue', 'claimrefused') and n >= 2 else ('CANCELLED' if mode == 'cancelled' else 'QUEUED')
     print(json.dumps({'entries': [{'id': 'q000900', 'state': state}]}))
 '''
 
@@ -73,6 +75,8 @@ COMMAND = '''\
 #!/usr/bin/env python3
 import os, sys
 open(os.path.join(os.environ['FAKE_DIR'], 'command.ran'), 'a').write('x')
+if os.environ.get('FAKE_COMMAND_KILL'):
+    os.kill(os.getpid(), int(os.environ['FAKE_COMMAND_KILL']))
 sys.exit(int(os.environ.get('FAKE_COMMAND_RC', '0')))
 '''
 
@@ -91,6 +95,8 @@ class Wrapper(unittest.TestCase):
         self.addCleanup(setattr, hr, 'RUNNER', old)
         self.env = {'PATH': os.environ['PATH'], 'FAKE_DIR': str(self.dir)}
         self.now = 0.0
+        for sig in (hr.signal.SIGTERM, hr.signal.SIGHUP):
+            self.addCleanup(hr.signal.signal, sig, hr.signal.getsignal(sig))   # main() installs handlers into this process
 
     def mode(self, value):
         (self.dir / 'mode').write_text(value)
@@ -203,6 +209,61 @@ class Wrapper(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.calls(), [])
         self.assertEqual(self.ran(), 1)
+
+    def test_a_refused_claim_keeps_the_grant_and_retries_without_starting_the_job_outside_a_lane(self):
+        self.mode('claimrefused')
+        code, err = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.argvs('run')), 3)                # direct (refused), claim (refused), claim (started)
+        self.assertEqual([c['claim'] for c in self.calls() if c.get('event') == 'job-start'], [True])
+        self.assertIn('retrying', err)
+        self.assertEqual(self.argvs('queue', 'cancel'), [])
+
+    def test_a_queue_entry_that_is_no_longer_waiting_refuses_and_starts_nothing(self):
+        self.mode('cancelled')
+        code, err = self.invoke()
+        self.assertEqual(code, hr.REFUSED_EXIT)
+        self.assertEqual(self.ran(), 0)
+        self.assertIn('CANCELLED', err)
+
+    def test_a_command_killed_by_a_signal_exits_as_a_shell_would(self):
+        self.mode('free')
+        self.env['FAKE_COMMAND_KILL'] = '9'
+        code, _ = self.invoke()
+        self.assertEqual(code, 137)
+
+    def test_an_interrupt_after_the_claim_started_the_job_releases_the_entry_instead_of_cancelling_it(self):
+        self.mode('queue')
+        real_call = hr.subprocess.call
+
+        def call(cmd, **kw):
+            if '--queue-id' in cmd:
+                proof = cmd[cmd.index('--') + 5]                    # /bin/sh -c SCRIPT heavy-run PROOF ...
+                Path(proof).touch()
+                raise KeyboardInterrupt
+            return real_call(cmd, **kw)
+
+        hr.subprocess.call = call
+        self.addCleanup(setattr, hr.subprocess, 'call', real_call)
+        with self.assertRaises(KeyboardInterrupt):
+            self.invoke()
+        self.assertEqual(len(self.argvs('queue', 'release')), 1)
+        self.assertEqual(self.argvs('queue', 'cancel'), [])
+
+    def test_a_ttl_the_runner_would_refuse_is_a_usage_error_not_a_retry_loop(self):
+        for ttl in ('0', '-5', '14401'):
+            with contextlib.redirect_stderr(io.StringIO()):
+                code = hr.main(['--label', 'x', '--bytes', '1', '--ttl-s', ttl, '--', str(self.dir / 'command')], self.env)
+            self.assertEqual(code, 64, ttl)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_missing_command_inside_a_lane_exits_127_without_a_traceback(self):
+        env = dict(self.env, **{hr.HOLDER_ENV: 'outer:%d' % os.getpid()})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = hr.main(['--label', 'x', '--bytes', '1', '--', str(self.dir / 'no-such-command')], env)
+        self.assertEqual(code, 127)
+        self.assertIn('cannot run', err.getvalue())
 
     def test_a_forged_holder_marker_for_an_unrelated_pid_is_ignored(self):
         self.assertIsNone(hr.inherited_holder({hr.HOLDER_ENV: 'outer:1999999'}))

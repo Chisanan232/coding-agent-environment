@@ -12,7 +12,10 @@ The lane is released when COMMAND exits. The command is never started outside a 
 reservation as an unknown workload (the host's whole resource budget), which is the conservative accounting and blocks every other
 lane, so a missing class is warned about, not guessed.
 
-Exit codes: COMMAND's own; 64 usage; 75 not admitted within --max-wait-s; 77 refused by the queue (distinct from COMMAND's own).
+Exit codes: COMMAND's own (a signal death is 128+N); 64 usage; 75 not admitted within --max-wait-s; 77 refused by the queue. A
+command's own 64, 75 or 77 is indistinguishable from the wrapper's, as with la-cargo. A command already inside a lane
+(CAE_ADMISSION_HOLDER names this process or an ancestor) is not charged again; that marker is trusted as the environment's word, so
+it guards against double charging by accident, not against a caller who sets it on purpose.
 """
 import argparse
 import json
@@ -31,6 +34,11 @@ REFUSED_EXIT = 77
 TIMEOUT_EXIT = 75
 POLL_S = 15
 NOTICE_EVERY_S = 300
+
+
+def exit_code(rc):
+    """A command killed by a signal comes back from subprocess as -N; report it as a shell would (128+N), not as 256-N."""
+    return 128 - rc if rc < 0 else rc
 
 
 def runner_cmd(*args):
@@ -98,7 +106,7 @@ def admitted(args, env, sleep=time.sleep, clock=time.monotonic):
         rc = subprocess.call(runner_cmd("run", *declare, *run_extra, "--", *job), env=env)
         if os.path.exists(proof):
             _release(["release", "--label", label], env)
-            return rc
+            return exit_code(rc)
         if rc != REFUSED_EXIT:
             print(f"heavy-run: the admission runner failed (exit {rc}) before starting the command; refusing (fail closed).", file=sys.stderr)
             return rc
@@ -130,7 +138,7 @@ def _queued(args, declare, run_extra, job, proof, session, env, sleep, clock):
                 if os.path.exists(proof):
                     claimed = True
                     _release(["queue", "release", "--id", qid, "--session-id", session], env)
-                    return rc
+                    return exit_code(rc)
                 print(f"heavy-run: claim of {qid} refused (exit {rc}); the grant is kept, retrying.", file=sys.stderr)
             elif state not in ("QUEUED", "ELIGIBLE"):
                 print(f"heavy-run: queue entry {qid} is {state or 'missing'}; refusing.", file=sys.stderr)
@@ -142,7 +150,10 @@ def _queued(args, declare, run_extra, job, proof, session, env, sleep, clock):
         print(f"heavy-run: not admitted within {args.max_wait_s} s; the command was NOT started.", file=sys.stderr)
         return TIMEOUT_EXIT
     finally:
-        if not claimed:
+        if not claimed and os.path.exists(proof):
+            # interrupted after the claim started the job: the entry is CLAIMED, so it is released, not cancelled
+            _release(["queue", "release", "--id", qid, "--session-id", session], env)
+        elif not claimed:
             _capture(runner_cmd("queue", "cancel", "--id", qid, "--session-id", session), env)
 
 
@@ -166,6 +177,8 @@ def parse(argv):
         args.command = args.command[1:]
     if not args.command:
         parser.error("empty command: pass it after --")
+    if not 1 <= args.ttl_s <= 14400:
+        parser.error("--ttl-s must be 1..14400 (the runner refuses a longer hold without --max-hold)")
     return args
 
 
@@ -180,7 +193,11 @@ def main(argv=None, env=None):
     holder = inherited_holder(env)
     if holder:
         print(f"heavy-run: already running under lane {holder}; not charged again.", file=sys.stderr)
-        return subprocess.call(args.command, env=env)
+        try:
+            return exit_code(subprocess.call(args.command, env=env))
+        except OSError as exc:
+            print(f"heavy-run: cannot run {args.command[0]}: {exc}", file=sys.stderr)
+            return 127
     if not args.workload_class:
         print("heavy-run: WARNING no --class: the runner records an unknown workload and charges the host's whole resource budget.",
               file=sys.stderr)
