@@ -317,7 +317,8 @@ HEAVY_LANES = {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 2}
 LANE_CEILING = 3
 THIRD_LANE_ENABLED = True
 # Class-aware third lane (SPE-160, shadow only): the classes a third lane could admit, each at the least it needs. light holds no
-# memory or cpu slots; build-crate is granted its class min_jobs. Every other class stays on two lanes. Nothing reads this to admit.
+# memory or cpu slots; build-crate is granted its class min_jobs. This only feeds the trial report; it does not decide admission.
+# With THIRD_LANE_ENABLED the resource budget alone gates a third lane, whatever its class.
 THIRD_LANE_CLASSES = ('light', 'build-crate')
 
 
