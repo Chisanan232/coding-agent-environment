@@ -37,8 +37,9 @@ MIN_ATTEMPTS = 2
 CAUSES = {"none", "queue_delay", "ci_unavailable", "missing_permission", "external_outage"}
 # A failure text that names one of these is infrastructure or permission, never a reasoning blocker, whatever `cause` says.
 EXCLUDED_TEXT = re.compile(r"CI_UNAVAILABLE_EXTERNAL|HARNESS_PERMISSION_BLOCK|spending limit|billing limit|quota|permission .{0,30}denied|"
-                           r"denied.{0,20}permission|not permitted|forbidden|unauthori[sz]ed|EACCES|\b40[13]\b|\b50[23]\b|overloaded|"
-                           r"queue(d)? (delay|wait)|outage|ECONNRESET|rate.?limit|runner unavailable|timed? ?out", re.I)
+                           r"denied.{0,20}permission|not permitted|forbidden|unauthori[sz]ed|EACCES|\bHTTP/?[0-9. ]*(40[13]|50[23])\b|overloaded|"
+                           r"queue(d)? (delay|wait)|outage|ECONNRESET|rate.?limit|runner unavailable|"
+                           r"(gateway|connect(ion)?|network|request) time[sd]? ?-?out", re.I)
 # Any of these set means the call may not use the included subscription. Presence only; the values are never read or printed.
 API_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_FOUNDRY_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
            "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
