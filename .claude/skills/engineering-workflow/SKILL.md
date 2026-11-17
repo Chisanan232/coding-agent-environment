@@ -114,7 +114,7 @@ expected speedup, mutable-state overlap, and integration overhead.
 After every failed attempt at an acceptance check, record it (pass `--cause queue_delay|ci_unavailable|missing_permission|external_outage`
 for CI, queue, permission or outage trouble: such an attempt is not counted). The script is not installed into `~/.claude`: run it by
 absolute path from the maintained coding-agent-environment checkout, from any repository
-(`$HOME/Bryant-Developments/coding-agent-environment-main-view`; `CODING_AGENT_ENV_CHECKOUT` overrides it):
+(`$HOME/Bryant-Developments/coding-agent-environment-main-view`; it must be at or after the commit that added `attempt`):
 
 ```bash
 python3 "$HOME/Bryant-Developments/coding-agent-environment-main-view/scripts/fable-escalation.py" attempt \
