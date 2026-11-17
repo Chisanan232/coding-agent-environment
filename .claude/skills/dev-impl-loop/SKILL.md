@@ -113,6 +113,8 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
         bash "${ENGINEERING_RUNTIME}/circuit-breaker-gate.sh" record-failure "$TICKET" 5
         ```
         If the circuit opens, stop and escalate to the engineer.
+      - Record the attempt for Fable escalation and follow the returned `action` (see "Blocker escalation to Fable" in
+        `engineering-workflow`); it asks the owner at most once per blocker and never blocks this loop.
    e. If relative tests pass after a fix:
       ```bash
       bash "${ENGINEERING_RUNTIME}/circuit-breaker-gate.sh" record-success "$TICKET"
@@ -144,6 +146,7 @@ If empty, stop and ask the engineer to run `ticket-pickup-check` first.
        ```bash
        bash "${ENGINEERING_RUNTIME}/circuit-breaker-gate.sh" record-failure "$TICKET" 3
        ```
+       Also record the attempt for Fable escalation (`engineering-workflow`, "Blocker escalation to Fable") and follow its `action`.
        On success: `bash "${ENGINEERING_RUNTIME}/circuit-breaker-gate.sh" record-success "$TICKET"`
 12. All tests must pass before proceeding to Phase 3.
     Record decision:

@@ -3,8 +3,11 @@
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from importlib.util import module_from_spec, spec_from_file_location
@@ -49,6 +52,9 @@ class Env(unittest.TestCase):
         self.bin = os.path.join(self.tmp.name, "claude")
         Path(self.bin).write_text(FAKE_CLAUDE)
         os.chmod(self.bin, 0o755)
+        # The first launch of a freshly written executable can stall for tens of seconds on macOS under load; absorb it here so it
+        # cannot land inside the 30 s version probe and look like a route failure.
+        subprocess.run([self.bin, "--version"], capture_output=True, timeout=300, env=dict(os.environ, FAKE_VERSION="warm"))
         self.log = os.path.join(self.tmp.name, "calls.log")
         self.env = {"FABLE_CLAUDE_BIN": self.bin, "FAKE_LOG": self.log, "FAKE_OUT": json.dumps(FABLE_OK)}
         self.saved = {k: os.environ.get(k) for k in [*self.env, *fe.API_ENV, "FAKE_RC", "FAKE_VERSION"]}
@@ -394,7 +400,194 @@ class ReviewFixes(Env):
         self.assertFalse(fe.evaluate(case(), self.dir)["eligible"])
 
 
+class WorkflowBase(Env):
+    """Helpers to drive the real CLI the way the development loop calls it."""
+    SCRIPT = str(ROOT / "scripts/fable-escalation.py")
+
+    def cli(self, *argv, rc=0):
+        env = dict(os.environ, FABLE_ESCALATION_DIR=self.dir, ASK_PENDING_DIR=self.ask)
+        proc = subprocess.run([sys.executable, self.SCRIPT, *argv], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(proc.returncode, rc, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+    def attempt(self, approach, failure="AC3 deadlock at step 4", model="claude-opus-5-5", target="o/r#7", check="AC3 lock ordering",
+                question="Which lock order removes the cycle between the cache and the index?", **extra):
+        argv = ["attempt", "--target", target, "--check", check, "--session", "dev-1", "--model", model, "--approach", approach,
+                "--failure", failure, "--question", question, "--non-sensitive"]
+        for k, v in extra.items():
+            argv += [f"--{k.replace('_', '-')}", v] if v is not True else [f"--{k.replace('_', '-')}"]
+        return self.cli(*argv)
+
+    def asked(self):
+        self.attempt("reorder acquisition")
+        return self.attempt("single global lock")["id"]
+
+
+class WorkflowCases(WorkflowBase):
+    """Controlled cases through the real CLI."""
+    def test_two_distinct_failed_attempts_ask_exactly_once_across_any_number_of_later_calls(self):
+        self.assertEqual(self.attempt("reorder acquisition")["action"], "CONTINUE")
+        second = self.attempt("single global lock")
+        self.assertEqual(second["action"], "ASK_OWNER")
+        self.assertEqual(second["packet"]["question_for_fable"].count("?"), 1)
+        for approach in ("lock-free index", "lock-free index", "retry with backoff"):
+            self.assertEqual(self.attempt(approach)["action"], "CONTINUE")
+        self.assertEqual(len([r for r in Path(self.dir, "receipts.log").read_text().splitlines() if '"offered"' in r]), 1)
+        self.assertEqual(self.calls(), 0)
+
+    def test_same_approach_repeated_or_a_different_failure_does_not_ask(self):
+        self.attempt("reorder acquisition")
+        self.assertEqual(self.attempt("reorder acquisition")["action"], "CONTINUE")
+        self.assertEqual(self.attempt("single global lock", failure="AC3 times out in setup")["action"], "CONTINUE")
+
+    def test_ordinary_ci_and_queue_delays_never_ask(self):
+        for failure, cause in (("CI_UNAVAILABLE_EXTERNAL billing limit", None), ("job waiting in queue delay", "queue_delay"),
+                               ("runner unavailable", None), ("permission denied on merge", "missing_permission"),
+                               ("ECONNRESET from provider", "external_outage")):
+            for approach in ("a", "b", "c"):
+                extra = {"cause": cause} if cause else {}
+                self.assertEqual(self.attempt(approach + failure, failure=failure, check="AC " + failure, **extra)["action"], "CONTINUE", failure)
+        self.assertFalse(Path(self.dir, "receipts.log").exists())
+
+    def test_trigger_without_a_question_or_attestation_waits_instead_of_asking(self):
+        self.attempt("a", question="")
+        out = self.cli("attempt", "--target", "o/r#7", "--check", "AC3 lock ordering", "--session", "dev-1", "--model", "claude-opus-5-5",
+                       "--approach", "b", "--failure", "AC3 deadlock at step 4")
+        self.assertEqual(out["action"], "CONTINUE")
+        self.assertIn("--question", out["next"])
+        self.assertEqual(self.attempt("c")["action"], "ASK_OWNER")
+
+    def test_review_disagreement_asks_once(self):
+        out = self.cli("attempt", "--target", "o/r#8", "--check", "design review RV1", "--session", "dev-1",
+                       "--question", "Which of the two queue designs keeps tenant isolation?", "--non-sensitive", "--review-unresolved",
+                       "--review-position", "queue per tenant", "--review-position", "shared queue with quotas")
+        self.assertEqual(out["action"], "ASK_OWNER")
+        self.assertEqual(out["packet"]["trigger"], "unresolved_review_disagreement")
+        again = self.cli("attempt", "--target", "o/r#8", "--check", "design review RV1", "--session", "dev-1", "--review-unresolved")
+        self.assertEqual(again["action"], "CONTINUE")
+
+    def test_approval_allows_one_consult_and_the_next_attempt_says_consult_approved_until_it_runs(self):
+        bid = self.asked()
+        self.cli("answer", "--id", bid, "--decision", "approve", "--ref", "owner said: approve this one", "--session", "dev-1")
+        self.assertEqual(self.attempt("third try")["action"], "CONSULT_APPROVED")
+        out = self.cli("consult", "--id", bid, "--execute", "--cwd", self.tmp.name)
+        self.assertTrue(Path(out["advice_path"]).is_file())
+        self.assertEqual(self.calls(), 1)
+        self.assertEqual(self.attempt("fourth try")["action"], "CONTINUE")
+        self.cli("consult", "--id", bid, "--execute", "--cwd", self.tmp.name, rc=2)
+        self.assertEqual(self.calls(), 1)
+        argv = json.loads(Path(self.log).read_text().splitlines()[0])
+        self.assertEqual(argv[argv.index("--tools") + 1], "Read,Grep,Glob")
+        self.assertEqual(argv[argv.index("--model") + 1], "claude-fable-5-2")
+
+    def test_decline_and_no_reply_never_prompt_again_and_never_call(self):
+        bid = self.asked()
+        for approach in ("x", "y"):
+            self.assertEqual(self.attempt(approach)["action"], "CONTINUE")  # no reply: still pending, no re-ask
+        self.cli("answer", "--id", bid, "--decision", "decline", "--ref", "owner said: not now, skip", "--session", "dev-1")
+        for approach in ("p", "q"):
+            self.assertEqual(self.attempt(approach)["action"], "CONTINUE")
+        self.cli("consult", "--id", bid, "--execute", "--cwd", self.tmp.name, rc=2)
+        self.assertEqual(self.calls(), 0)
+
+    def test_failed_consult_stops_all_escalation_without_repeat_prompts_or_calls(self):
+        bid = self.asked()
+        self.cli("answer", "--id", bid, "--decision", "approve", "--ref", "owner said: approve this one", "--session", "dev-1")
+        os.environ["FAKE_RC"] = "1"
+        self.cli("consult", "--id", bid, "--execute", "--cwd", self.tmp.name, rc=2)
+        os.environ.pop("FAKE_RC")
+        self.assertEqual(self.attempt("again")["action"], "CONTINUE")
+        # a different blocker that would otherwise qualify is also held back while the breaker is open
+        self.attempt("one", target="o/r#9", check="AC9 other", failure="AC9 broken")
+        self.assertEqual(self.attempt("two", target="o/r#9", check="AC9 other", failure="AC9 broken")["action"], "CONTINUE")
+        self.assertEqual(self.calls(), 1)
+
+    def test_unrelated_blockers_and_work_continue_while_one_ask_is_open(self):
+        self.asked()
+        start = time.monotonic()
+        other = self.attempt("only one try", target="o/r#10", check="AC10 other", failure="AC10 flake")
+        self.assertEqual(other["action"], "CONTINUE")
+        self.assertLess(time.monotonic() - start, 30)  # the call returns at once: it never waits for the owner
+        self.attempt("first", target="o/r#11", check="AC11 other", failure="AC11 broken")
+        self.assertEqual(self.attempt("second", target="o/r#11", check="AC11 other", failure="AC11 broken")["action"], "ASK_OWNER")
+        pending = [i for i in fe._ask_pending().all_items(self.ask) if i["state"] == "PENDING"]
+        self.assertEqual(len(pending), 2)  # one open request per blocker, both non-blocking
+
+
+class ReviewRound2(WorkflowBase):
+    def test_an_attempt_tagged_with_a_cause_is_never_counted_toward_the_trigger(self):
+        self.attempt("one", cause="queue_delay")
+        self.assertEqual(self.attempt("two")["action"], "CONTINUE")  # only one reasoning attempt so far
+        self.assertEqual(self.attempt("three")["action"], "ASK_OWNER")
+
+    def test_infrastructure_failure_text_is_not_kept_and_does_not_suppress_the_blocker(self):
+        self.attempt("one", failure="quota exceeded on the provider")
+        self.assertEqual(self.attempt("two")["action"], "CONTINUE")
+        self.assertEqual(self.attempt("three")["action"], "ASK_OWNER")
+
+    def test_concurrent_attempts_ask_exactly_once_and_none_errors(self):
+        self.attempt("seed")
+        results = []
+        def run(i):
+            results.append(self.attempt(f"concurrent approach {i}"))
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(5)]
+        [th.start() for th in threads]
+        [th.join() for th in threads]
+        self.assertEqual(sorted(r["action"] for r in results), ["ASK_OWNER"] + ["CONTINUE"] * 4)
+        self.assertEqual(len([r for r in Path(self.dir, "receipts.log").read_text().splitlines() if '"offered"' in r]), 1)
+
+    def test_a_settled_review_disagreement_cannot_trigger_later(self):
+        base = ("--target", "o/r#8", "--check", "design review RV1", "--session", "dev-1")
+        self.cli("attempt", *base, "--review-unresolved", "--review-position", "queue per tenant", "--review-position", "shared queue")
+        self.cli("attempt", *base, "--review-resolved")
+        out = self.cli("attempt", *base, "--model", "claude-opus-5-5", "--approach", "x", "--failure", "RV1 flake",
+                       "--question", "Which of the two queue designs keeps tenant isolation?", "--non-sensitive")
+        self.assertEqual(out["action"], "CONTINUE")
+
+    def test_a_lost_first_display_is_recoverable_without_asking_again(self):
+        asked = self.asked()
+        again = self.attempt("another")
+        self.assertEqual(again["action"], "CONTINUE")
+        shown = self.cli("show", "--id", asked)
+        self.assertEqual(shown["id"], asked)
+        self.assertEqual(shown["question_for_fable"].count("?"), 1)
+        self.cli("answer", "--id", asked, "--decision", "decline", "--ref", "owner said: not now, skip", "--session", "dev-1")
+        self.cli("show", "--id", asked, rc=2)
+
+    def test_a_failing_pending_ledger_still_returns_the_packet(self):
+        packet = fe.offer(self.dir, case(), "sess-1", "/dev/null/not-a-dir", T0)
+        self.assertTrue(packet["pending_ledger_item"].startswith("not-recorded"))
+        self.assertEqual(fe.load(self.dir, packet["id"])["state"], fe.OFFERED)
+
+    def test_non_ascii_acceptance_checks_are_distinct_blockers(self):
+        self.assertNotEqual(fe.fingerprint("o/r#1", "验收一"), fe.fingerprint("o/r#1", "验收二"))
+
+    def test_an_expired_or_breaker_blocked_approval_says_continue_not_consult(self):
+        bid = self.asked()
+        self.cli("answer", "--id", bid, "--decision", "approve", "--ref", "owner said: approve this one", "--session", "dev-1")
+        self.assertEqual(self.attempt("next")["action"], "CONSULT_APPROVED")
+        fe.trip(self.dir, "route_failure", None, T0)
+        self.assertEqual(self.attempt("next2")["action"], "CONTINUE")
+        fe.reset_breaker(self.dir, "route re-verified by canary today", T0)
+        path = fe._record_path(self.dir, bid)
+        record = json.loads(Path(path).read_text())
+        record["answered"] = "2026-01-01T00:00:00Z"
+        Path(path).write_text(json.dumps(record))
+        out = self.attempt("next3")
+        self.assertEqual(out["action"], "CONTINUE")
+        self.assertIn("24h", out["reason"])
+
+
 class RepoInvariants(unittest.TestCase):
+    def test_the_loop_skills_call_the_attempt_command(self):
+        flow = (ROOT / ".claude/skills/engineering-workflow/SKILL.md").read_text()
+        loop = (ROOT / ".claude/skills/dev-impl-loop/SKILL.md").read_text()
+        self.assertIn("scripts/fable-escalation.py attempt", flow)
+        for action in ("CONTINUE", "ASK_OWNER", "CONSULT_APPROVED"):
+            self.assertIn(action, flow)
+        self.assertEqual(loop.count("Blocker escalation to Fable"), 2)
+
+
     def test_no_scheduler_hook_or_workflow_calls_consult(self):
         for path in list((ROOT / ".github").rglob("*")) + list((ROOT / ".claude").rglob("*")):
             if path.is_file():

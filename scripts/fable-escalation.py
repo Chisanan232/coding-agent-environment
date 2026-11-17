@@ -101,7 +101,7 @@ def fingerprint(target, acceptance_check):
     """One blocker = one target and one acceptance check; case, spacing and punctuation do not make a new blocker.
 
     A genuinely reworded acceptance check does: key the check by its stable id (AC3), not by prose."""
-    check = re.sub(r"[^a-z0-9 ]+", " ", _norm(acceptance_check))
+    check = re.sub(r"[^\w ]+", " ", _norm(acceptance_check))
     return hashlib.sha256((target.lower() + "\0" + " ".join(check.split())).encode()).hexdigest()[:16]
 
 
@@ -223,6 +223,41 @@ def _ask_pending():
     return mod
 
 
+def _create_offer(directory, case, session_id, at, verdict):
+    """Write the OFFERED record. The caller holds the lock and has just evaluated `case` as eligible."""
+    attempts = [{"model": str(a.get("model"))[:40], "approach": str(a.get("approach"))[:200], "failure": str(a.get("failure"))[:200]}
+                for a in case["attempts"]][:8]
+    record = {"id": verdict["id"], "state": OFFERED, "created": iso(at), "session_id": session_id, "trigger": verdict["trigger"],
+              "target": case["target"], "acceptance_check": str(case["acceptance_check"])[:300],
+              "blocker": str(case.get("blocker") or case["acceptance_check"])[:300], "attempts": attempts,
+              "question": case["question"].strip(), "review": case.get("review") or {},
+              "spent": {k: case.get("spent", {}).get(k) for k in ("rework_rounds", "elapsed_s", "usd")}}
+    save(directory, record)
+    receipt(directory, "offered", record, trigger=verdict["trigger"])
+    return record
+
+
+def packet_for(record, ledger=None):
+    return {"id": record["id"], "trigger": record["trigger"], "blocker": record["blocker"], "attempts_made": record["attempts"],
+            "question_for_fable": record["question"], "pending_ledger_item": ledger,
+            "route": "included Claude subscription only; usage credits stay off; one read-only consult; advice returns to this session",
+            "ask": "Approve one read-only Fable consult for this blocker? (Approve / Decline). No reply: independent work continues."}
+
+
+def _ledger_packet(record, session_id, ask_dir, at):
+    """Record the offer in the pending-ASK ledger (visibility only) and return the packet. Runs outside the lock."""
+    ledger = None
+    if ask_dir:
+        try:
+            ap = _ask_pending()
+            item, _new = ap.record_decision(ask_dir, "Fable consult: " + record["blocker"][:150], record["target"], session_id, [],
+                                            "owner_approval", record["id"], ap.GRACE_MAX_S, "unknown", at)
+            ledger = item["id"]
+        except Exception as exc:  # noqa: BLE001 - the ledger is visibility only; the offer already stands and must still reach the owner
+            ledger = "not-recorded: " + str(exc)[:120]
+    return packet_for(record, ledger)
+
+
 def offer(directory, case, session_id, ask_dir, at):
     if not SESSION_RE.fullmatch(session_id or ""):
         raise EscalationError("--session is required")
@@ -230,29 +265,17 @@ def offer(directory, case, session_id, ask_dir, at):
         verdict = evaluate(case, directory)
         if not verdict["eligible"]:
             raise EscalationError("not eligible: " + "; ".join(verdict["reasons"]))
-        attempts = [{"model": str(a.get("model"))[:40], "approach": str(a.get("approach"))[:200], "failure": str(a.get("failure"))[:200]}
-                    for a in case["attempts"]][:8]
-        record = {"id": verdict["id"], "state": OFFERED, "created": iso(at), "session_id": session_id, "trigger": verdict["trigger"],
-                  "target": case["target"], "acceptance_check": str(case["acceptance_check"])[:300],
-                  "blocker": str(case.get("blocker") or case["acceptance_check"])[:300], "attempts": attempts,
-                  "question": case["question"].strip(), "review": case.get("review") or {},
-                  "spent": {k: case.get("spent", {}).get(k) for k in ("rework_rounds", "elapsed_s", "usd")}}
-        save(directory, record)
-        receipt(directory, "offered", record, trigger=verdict["trigger"])
-    ledger = None
-    if ask_dir:
-        ap = _ask_pending()
-        try:
-            item, _new = ap.record_decision(ask_dir, "Fable consult: " + record["blocker"][:150], record["target"], session_id, [],
-                                            "owner_approval", record["id"], ap.GRACE_MAX_S, "unknown", at)
-            ledger = item["id"]
-        except ap.AskError as exc:
-            ledger = "not-recorded: " + str(exc)[:120]
-    packet = {"id": record["id"], "trigger": record["trigger"], "blocker": record["blocker"], "attempts_made": attempts,
-              "question_for_fable": record["question"], "pending_ledger_item": ledger,
-              "route": "included Claude subscription only; usage credits stay off; one read-only consult; advice returns to this session",
-              "ask": "Approve one read-only Fable consult for this blocker? (Approve / Decline). No reply: independent work continues."}
-    return packet
+        record = _create_offer(directory, case, session_id, at, verdict)
+    return _ledger_packet(record, session_id, ask_dir, at)
+
+
+def show(directory, blocker_id):
+    """Re-display the packet of an OFFERED blocker whose first display was lost (a crash after the record was written).
+    It never asks anything itself and never changes state."""
+    record = load(directory, blocker_id)
+    if record["state"] != OFFERED:
+        raise EscalationError(f"blocker is {record['state']}: only an OFFERED blocker has an open packet")
+    return packet_for(record)
 
 
 def answer(directory, blocker_id, decision, ref, session_id, ask_dir, at):
@@ -278,6 +301,79 @@ def answer(directory, blocker_id, decision, ref, session_id, ask_dir, at):
         except ap.AskError:
             pass  # the ledger is visibility only; this record is the authority for the consult
     return record
+
+
+# --- workflow entry: record an attempt, get exactly one action -----------------------------------------------------------
+
+def _attempt_path(directory, blocker_id):
+    os.makedirs(os.path.join(directory, "attempts"), mode=0o700, exist_ok=True)
+    return os.path.join(directory, "attempts", blocker_id + ".json")
+
+
+def attempt(directory, args, session_id, ask_dir, at):
+    """What the development loop calls after every failed attempt. Never blocks and never raises for a normal outcome.
+
+    Returns {"action": ...}: CONTINUE (do nothing, keep working), ASK_OWNER (ask once now, with `packet`), CONSULT_APPROVED (the owner
+    approved earlier: run `consult`). ASK_OWNER comes back once per blocker; every later call for it says CONTINUE. Evaluate and offer
+    happen under one lock, so concurrent calls cannot both ask and none of them errors."""
+    target, check = args["target"], args["acceptance_check"]
+    if not TARGET_RE.fullmatch(target or "") or not _norm(check):
+        return {"action": "CONTINUE", "reason": "target owner/repo#N and acceptance_check are required to track a blocker"}
+    if not SESSION_RE.fullmatch(session_id or ""):
+        return {"action": "CONTINUE", "reason": "--session is required (letters, digits, . _ : -)"}
+    bid = fingerprint(target, check)
+    excluded = bool(args.get("cause") and args["cause"] != "none") or bool(EXCLUDED_TEXT.search(args.get("failure") or ""))
+    with locked(directory):
+        path = _attempt_path(directory, bid)
+        try:
+            with open(path) as fh:
+                held = json.load(fh)
+        except (OSError, ValueError):
+            held = {"attempts": [], "positions": [], "unresolved": False}
+        # Trouble that is not a reasoning failure (queue, CI availability, permissions, outage) is never kept, so it can neither
+        # count toward the trigger nor linger and suppress it.
+        if (args.get("approach") or args.get("failure")) and not excluded:
+            held["attempts"].append({"model": args.get("model") or "", "approach": args.get("approach") or "",
+                                     "failure": args.get("failure") or ""})
+            held["attempts"] = held["attempts"][-8:]
+        if args.get("review_resolved"):
+            held["positions"], held["unresolved"] = [], False
+        for pos in args.get("review_position") or []:
+            if pos not in held["positions"]:
+                held["positions"].append(pos)
+        held["unresolved"] = held["unresolved"] or bool(args.get("review_unresolved"))
+        for key in ("question", "blocker"):
+            if args.get(key):
+                held[key] = args[key]
+        _write(path, held)
+        try:
+            existing = load(directory, bid)
+        except EscalationError:
+            existing = {"state": "UNREADABLE"} if os.path.exists(_record_path(directory, bid)) else None
+        if existing is not None:
+            state = existing["state"]
+            if state == APPROVED and breaker(directory).get("open"):
+                return {"action": "CONTINUE", "id": bid, "reason": "approved, but the circuit breaker is open: no consult, no prompt"}
+            if state == APPROVED and (at - parse(existing["answered"])).total_seconds() > APPROVAL_TTL_S:
+                return {"action": "CONTINUE", "id": bid,
+                        "reason": "approval is older than 24h: no consult and no new prompt for this blocker; continue without Fable"}
+            if state == APPROVED:
+                return {"action": "CONSULT_APPROVED", "id": bid, "next": "run `consult --id` once, then implement and verify"}
+            return {"action": "CONTINUE", "id": bid, "reason": f"blocker already {state}: no new prompt, keep working on independent tasks"}
+        case = {"target": target, "acceptance_check": check, "blocker": held.get("blocker") or check, "attempts": held["attempts"],
+                "review": {"unresolved_architecture_disagreement": held["unresolved"], "positions": held["positions"]},
+                "cause": "none", "question": held.get("question") or "",
+                "inputs_non_sensitive": bool(args.get("non_sensitive")), "spent": args.get("spent") or {}}
+        verdict = evaluate(case, directory)
+        if verdict["trigger"] and not verdict["eligible"] and all("question" in r or "non-sensitive" in r for r in verdict["reasons"]):
+            return {"action": "CONTINUE", "id": bid, "reason": "trigger met but not offerable yet: " + "; ".join(verdict["reasons"]),
+                    "next": "re-run attempt with --question (one concrete question ending in ?) and --non-sensitive"}
+        if not verdict["eligible"]:
+            return {"action": "CONTINUE", "id": bid, "reason": "; ".join(verdict["reasons"])[:300]}
+        record = _create_offer(directory, case, session_id, at, verdict)
+    return {"action": "ASK_OWNER", "id": bid, "packet": _ledger_packet(record, session_id, ask_dir, at),
+            "how": "ask the owner once with AskUserQuestion (Approve / Decline); record with `answer`; on no reply keep working, never "
+                   "re-ask; if this display is lost, `show --id` prints the packet again without asking"}
 
 
 # --- consult -----------------------------------------------------------------------------------------------------------
@@ -438,6 +534,23 @@ def main(argv=None):
     s.add_argument("--rework-rounds", type=int)
     s.add_argument("--elapsed-s", type=int)
     s.add_argument("--usd", type=float)
+    s = sub.add_parser("attempt", help="record one failed attempt; prints the one action to take")
+    s.add_argument("--target", required=True)
+    s.add_argument("--check", required=True, dest="acceptance_check")
+    s.add_argument("--session", required=True)
+    s.add_argument("--model", default="")
+    s.add_argument("--approach", default="")
+    s.add_argument("--failure", default="")
+    s.add_argument("--cause", choices=sorted(CAUSES), default=None)
+    s.add_argument("--question", default="")
+    s.add_argument("--blocker", default="")
+    s.add_argument("--non-sensitive", action="store_true", help="attest the inputs hold no secret, customer or private data")
+    s.add_argument("--review-position", action="append")
+    s.add_argument("--review-unresolved", action="store_true")
+    s.add_argument("--review-resolved", action="store_true", help="clear a review disagreement that has been settled")
+    s.add_argument("--ask-dir", default=os.environ.get("ASK_PENDING_DIR") or None)
+    s = sub.add_parser("show", help="print the packet of an OFFERED blocker again (never asks, never changes state)")
+    s.add_argument("--id", required=True)
     sub.add_parser("report")
     s = sub.add_parser("reset-breaker")
     s.add_argument("--note", required=True)
@@ -458,6 +571,10 @@ def main(argv=None):
         elif args.cmd == "verdict":
             out = verdict(directory, args.id, args.result,
                           {"rework_rounds": args.rework_rounds, "elapsed_s": args.elapsed_s, "usd": args.usd}, at)
+        elif args.cmd == "attempt":
+            out = attempt(directory, vars(args), args.session, args.ask_dir, at)
+        elif args.cmd == "show":
+            out = show(directory, args.id)
         elif args.cmd == "report":
             out = report(directory)
         else:
