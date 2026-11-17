@@ -336,7 +336,8 @@ class ReviewFixes(Env):
             self.assertFalse(v["eligible"], over)
 
     def test_more_infrastructure_wordings_are_excluded(self):
-        for text in ("HTTP 403 forbidden", "Permission to merge was denied", "503 overloaded", "runner unavailable", "EACCES on write"):
+        for text in ("HTTP 403 forbidden", "Permission to merge was denied", "503 overloaded", "runner unavailable", "EACCES on write",
+                     "connection timed out", "HTTP/1.1 503"):
             a = [dict(x, failure=text) for x in case()["attempts"]]
             self.assertFalse(fe.evaluate(case(attempts=a), self.dir)["eligible"], text)
 
@@ -355,6 +356,32 @@ class ReviewFixes(Env):
         argv = fe.consult_argv(fe.load(self.dir, self.approved()))
         self.assertFalse(any("deadlock at step 4" in a for a in argv))
         self.assertIn("deadlock at step 4", fe.consult_prompt(fe.load(self.dir, self.approved(acceptance_check="AC other"))))
+
+    def test_ordinary_reasoning_failures_are_not_excluded(self):
+        for text in ("test_deadlock timed out at step 4", "assert failed at line 403", "exit 503 from the lock test"):
+            a = [dict(x, failure=text) for x in case()["attempts"]]
+            self.assertTrue(fe.evaluate(case(attempts=a), self.dir)["eligible"], text)
+
+    def test_prompt_reaches_the_child_on_stdin(self):
+        fake = Path(self.bin)
+        fake.write_text(FAKE_CLAUDE.replace('open(os.environ["FAKE_LOG"], "a").write(json.dumps(sys.argv[1:]) + "\\n")',
+                                            'open(os.environ["FAKE_LOG"], "a").write(sys.stdin.read().replace("\\n", " ") + "\\n")'))
+        fe.consult(self.dir, self.approved(), True, self.tmp.name, T0)
+        logged = Path(self.log).read_text()
+        self.assertIn("deadlock at step 4", logged)
+        self.assertIn("Which lock order removes the cycle", logged)
+
+    def test_version_probe_timeout_trips_the_breaker(self):
+        bid = self.approved()
+        real = fe.claude_version
+        fe.claude_version = lambda: (_ for _ in ()).throw(fe.subprocess.TimeoutExpired("claude", 30))
+        try:
+            with self.assertRaises(fe.EscalationError):
+                fe.consult(self.dir, bid, True, self.tmp.name, T0)
+        finally:
+            fe.claude_version = real
+        self.assertEqual(fe.breaker(self.dir)["reason"], "route_failure")
+        self.assertEqual(self.calls(), 0)
 
     def test_first_breaker_reason_is_kept(self):
         fe.trip(self.dir, "route_failure", None, T0)
