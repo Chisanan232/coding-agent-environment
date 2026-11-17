@@ -280,6 +280,65 @@ def answer(directory, blocker_id, decision, ref, session_id, ask_dir, at):
     return record
 
 
+# --- workflow entry: record an attempt, get exactly one action -----------------------------------------------------------
+
+def _attempt_path(directory, blocker_id):
+    os.makedirs(os.path.join(directory, "attempts"), mode=0o700, exist_ok=True)
+    return os.path.join(directory, "attempts", blocker_id + ".json")
+
+
+def attempt(directory, args, session_id, ask_dir, at):
+    """What the development loop calls after every failed attempt. Never blocks, never raises for a normal outcome.
+
+    Returns {"action": ...}: CONTINUE (do nothing, keep working), ASK_OWNER (ask once now, with `packet`), CONSULT_APPROVED (the owner
+    approved earlier: run `consult`). ASK_OWNER comes back once per blocker; every later call for it says CONTINUE."""
+    target, check = args["target"], args["acceptance_check"]
+    if not TARGET_RE.fullmatch(target or "") or not _norm(check):
+        return {"action": "CONTINUE", "reason": "target owner/repo#N and acceptance_check are required to track a blocker"}
+    bid = fingerprint(target, check)
+    with locked(directory):
+        path = _attempt_path(directory, bid)
+        try:
+            with open(path) as fh:
+                held = json.load(fh)
+        except (OSError, ValueError):
+            held = {"attempts": [], "positions": [], "unresolved": False}
+        if args.get("approach") or args.get("failure"):
+            held["attempts"].append({"model": args.get("model") or "", "approach": args.get("approach") or "",
+                                     "failure": args.get("failure") or ""})
+            held["attempts"] = held["attempts"][-8:]
+        for pos in args.get("review_position") or []:
+            if pos not in held["positions"]:
+                held["positions"].append(pos)
+        held["unresolved"] = held["unresolved"] or bool(args.get("review_unresolved"))
+        for key in ("question", "blocker"):
+            if args.get(key):
+                held[key] = args[key]
+        _write(path, held)
+        try:
+            existing = load(directory, bid)
+        except EscalationError:
+            existing = None
+        if existing is not None:
+            state = existing["state"]
+            if state == APPROVED:
+                return {"action": "CONSULT_APPROVED", "id": bid, "next": "run `consult --id` once, then implement and verify"}
+            return {"action": "CONTINUE", "id": bid, "reason": f"blocker already {state}: no new prompt, keep working on independent tasks"}
+    case = {"target": target, "acceptance_check": check, "blocker": held.get("blocker") or check, "attempts": held["attempts"],
+            "review": {"unresolved_architecture_disagreement": held["unresolved"], "positions": held["positions"]},
+            "cause": args.get("cause") or "none", "question": held.get("question") or "",
+            "inputs_non_sensitive": bool(args.get("non_sensitive")), "spent": args.get("spent") or {}}
+    verdict = evaluate(case, directory)
+    if verdict["trigger"] and not verdict["eligible"] and all("question" in r or "non-sensitive" in r for r in verdict["reasons"]):
+        return {"action": "CONTINUE", "id": bid, "reason": "trigger met but not offerable yet: " + "; ".join(verdict["reasons"]),
+                "next": "re-run attempt with --question (one concrete question ending in ?) and --non-sensitive"}
+    if not verdict["eligible"]:
+        return {"action": "CONTINUE", "id": bid, "reason": "; ".join(verdict["reasons"])[:300]}
+    packet = offer(directory, case, session_id, ask_dir, at)
+    return {"action": "ASK_OWNER", "id": bid, "packet": packet,
+            "how": "ask the owner once with AskUserQuestion (Approve / Decline); record with `answer`; on no reply keep working, never re-ask"}
+
+
 # --- consult -----------------------------------------------------------------------------------------------------------
 
 def claude_bin():
@@ -438,6 +497,20 @@ def main(argv=None):
     s.add_argument("--rework-rounds", type=int)
     s.add_argument("--elapsed-s", type=int)
     s.add_argument("--usd", type=float)
+    s = sub.add_parser("attempt", help="record one failed attempt; prints the one action to take")
+    s.add_argument("--target", required=True)
+    s.add_argument("--check", required=True, dest="acceptance_check")
+    s.add_argument("--session", required=True)
+    s.add_argument("--model", default="")
+    s.add_argument("--approach", default="")
+    s.add_argument("--failure", default="")
+    s.add_argument("--cause", choices=sorted(CAUSES), default=None)
+    s.add_argument("--question", default="")
+    s.add_argument("--blocker", default="")
+    s.add_argument("--non-sensitive", action="store_true", help="attest the inputs hold no secret, customer or private data")
+    s.add_argument("--review-position", action="append")
+    s.add_argument("--review-unresolved", action="store_true")
+    s.add_argument("--ask-dir", default=os.environ.get("ASK_PENDING_DIR") or None)
     sub.add_parser("report")
     s = sub.add_parser("reset-breaker")
     s.add_argument("--note", required=True)
@@ -458,6 +531,8 @@ def main(argv=None):
         elif args.cmd == "verdict":
             out = verdict(directory, args.id, args.result,
                           {"rework_rounds": args.rework_rounds, "elapsed_s": args.elapsed_s, "usd": args.usd}, at)
+        elif args.cmd == "attempt":
+            out = attempt(directory, vars(args), args.session, args.ask_dir, at)
         elif args.cmd == "report":
             out = report(directory)
         else:
