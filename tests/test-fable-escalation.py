@@ -317,6 +317,56 @@ class BreakerAndFallback(Env):
         self.assertIn("no control arm", out["note"])
 
 
+class ReviewFixes(Env):
+    def test_non_object_json_result_trips_the_breaker_instead_of_crashing(self):
+        for out in ("[]", "null", "7", json.dumps({"is_error": False, "modelUsage": {"claude-fable-5-2": {}}, "result": 5})):
+            self.tearDown()
+            self.setUp()
+            os.environ["FAKE_OUT"] = out
+            bid = self.approved()
+            with self.assertRaisesRegex(fe.EscalationError, "breaker opened"):
+                fe.consult(self.dir, bid, True, self.tmp.name, T0)
+            self.assertTrue(fe.breaker(self.dir)["open"], out)
+            self.assertEqual(fe.load(self.dir, bid)["state"], fe.FAILED)
+
+    def test_target_case_and_check_punctuation_do_not_make_a_new_blocker(self):
+        self.offered()
+        for over in ({"target": "O/R#7"}, {"acceptance_check": "AC3  Lock ordering test passes."}):
+            v = fe.evaluate(case(**over), self.dir)
+            self.assertFalse(v["eligible"], over)
+
+    def test_more_infrastructure_wordings_are_excluded(self):
+        for text in ("HTTP 403 forbidden", "Permission to merge was denied", "503 overloaded", "runner unavailable", "EACCES on write"):
+            a = [dict(x, failure=text) for x in case()["attempts"]]
+            self.assertFalse(fe.evaluate(case(attempts=a), self.dir)["eligible"], text)
+
+    def test_alternate_provider_variables_refuse_the_call(self):
+        for name in ("ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"):
+            bid = self.approved(acceptance_check="AC " + name)
+            os.environ[name] = "1"
+            try:
+                with self.assertRaisesRegex(fe.EscalationError, "subscription only"):
+                    fe.consult(self.dir, bid, True, self.tmp.name, T0)
+            finally:
+                del os.environ[name]
+        self.assertEqual(self.calls(), 0)
+
+    def test_attempt_text_goes_on_stdin_not_argv(self):
+        argv = fe.consult_argv(fe.load(self.dir, self.approved()))
+        self.assertFalse(any("deadlock at step 4" in a for a in argv))
+        self.assertIn("deadlock at step 4", fe.consult_prompt(fe.load(self.dir, self.approved(acceptance_check="AC other"))))
+
+    def test_first_breaker_reason_is_kept(self):
+        fe.trip(self.dir, "route_failure", None, T0)
+        fe.trip(self.dir, "no_advance", None, T0)
+        self.assertEqual(fe.breaker(self.dir)["reason"], "route_failure")
+
+    def test_unreadable_record_is_refused_not_overwritten(self):
+        bid = fe.fingerprint("o/r#7", case()["acceptance_check"])
+        Path(fe._record_path(self.dir, bid)).write_text("{corrupt")
+        self.assertFalse(fe.evaluate(case(), self.dir)["eligible"])
+
+
 class RepoInvariants(unittest.TestCase):
     def test_no_scheduler_hook_or_workflow_calls_consult(self):
         for path in list((ROOT / ".github").rglob("*")) + list((ROOT / ".claude").rglob("*")):
