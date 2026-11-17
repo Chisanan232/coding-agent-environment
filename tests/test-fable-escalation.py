@@ -2,6 +2,7 @@
 """Fable escalation: trigger, approval, one-per-blocker, circuit breaker and fallback. Never calls a real model."""
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -582,10 +583,20 @@ class RepoInvariants(unittest.TestCase):
     def test_the_loop_skills_call_the_attempt_command(self):
         flow = (ROOT / ".claude/skills/engineering-workflow/SKILL.md").read_text()
         loop = (ROOT / ".claude/skills/dev-impl-loop/SKILL.md").read_text()
-        self.assertIn("scripts/fable-escalation.py attempt", flow)
+        self.assertIn("coding-agent-environment-main-view/scripts/fable-escalation.py\" attempt", flow)  # absolute path: works from any repository
+        self.assertNotIn("python3 scripts/fable-escalation.py", flow)
         for action in ("CONTINUE", "ASK_OWNER", "CONSULT_APPROVED"):
             self.assertIn(action, flow)
         self.assertEqual(loop.count("Blocker escalation to Fable"), 2)
+
+    def test_the_claude_only_approval_text_is_dropped_from_the_codex_copy(self):
+        strip = lambda s: re.sub(r"<!-- claude-only:start -->.*?<!-- claude-only:end -->\n?", "", s, flags=re.S)  # the installer's Codex transform
+        for skill in ("engineering-workflow", "dev-impl-loop"):
+            text = (ROOT / f".claude/skills/{skill}/SKILL.md").read_text()
+            self.assertEqual(text.count("<!-- claude-only:start -->"), text.count("<!-- claude-only:end -->"))
+            for word in ("AskUserQuestion", "fable-escalation", "Fable"):
+                self.assertIn(word, text) if skill == "engineering-workflow" and word != "Fable" or word == "Fable" else None
+                self.assertNotIn(word, strip(text), f"{skill}: {word} reaches the Codex copy")
 
 
     def test_no_scheduler_hook_or_workflow_calls_consult(self):
