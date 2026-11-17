@@ -4,6 +4,14 @@ Replaces "manual opt-in" with a proactive offer. Default routes are unchanged (S
 
 Tool: `scripts/fable-escalation.py`. Tests: `tests/test-fable-escalation.py` (a fake `claude` binary; no real model call).
 
+## How the workflow reaches it
+
+The development loop calls one command after every failed attempt, and the command decides:
+
+`python3 scripts/fable-escalation.py attempt --target OWNER/REPO#N --check <id> --session <id> --model <m> --approach <text> --failure <signature> --question "<one question?>" --non-sensitive`
+
+It returns at once with one `action`: `CONTINUE` (keep working; also the answer while an offer is pending, after a decline, after a consult, or while the breaker is open), `ASK_OWNER` (once per blocker, with the packet for AskUserQuestion) or `CONSULT_APPROVED` (the owner approved; run `consult`). The call sites are the failure steps of `dev-impl-loop` and the "Blocker escalation to Fable" section of `engineering-workflow`; both are `.claude/skills` sources that reach a live `~/.claude` only through the owner-run `scripts/profile-install.sh --claude-skills` (see `docs/ROLLOUT-USER-CLAUDE-MD.md`). Until that rollout a live session does not carry the instruction, so nothing asks. Detection is in the tool, not in a hook: a hook cannot tell a materially different approach from a retry. The loop supplies the approach and failure text; the tool counts, dedupes and decides.
+
 ## When the agent offers
 
 One trigger must hold, and no exclusion:
