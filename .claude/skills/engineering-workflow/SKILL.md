@@ -108,13 +108,17 @@ Use at most seven concurrent subagents (dynamic 0-7), with one owner per scope.
 Seven is a ceiling, never a target; choose the count from dependencies, cost,
 expected speedup, mutable-state overlap, and integration overhead.
 
+<!-- claude-only:start -->
 ### Blocker escalation to Fable
 
-After every failed attempt at an acceptance check, record it (pass `--cause queue_delay|ci_unavailable|missing_permission|external_outage` for CI, queue, permission or outage trouble: such an attempt is not counted) from the
-coding-agent-environment checkout:
+After every failed attempt at an acceptance check, record it (pass `--cause queue_delay|ci_unavailable|missing_permission|external_outage`
+for CI, queue, permission or outage trouble: such an attempt is not counted). The script is not installed into `~/.claude`: run it by
+absolute path from the maintained coding-agent-environment checkout, from any repository
+(`$HOME/Bryant-Developments/coding-agent-environment-main-view`; it must be at or after the commit that added `attempt`):
 
 ```bash
-python3 scripts/fable-escalation.py attempt --target OWNER/REPO#N --check "<stable acceptance check id>" --session "$SESSION" \
+python3 "$HOME/Bryant-Developments/coding-agent-environment-main-view/scripts/fable-escalation.py" attempt \
+  --target OWNER/REPO#N --check "<stable acceptance check id>" --session "$SESSION" \
   --model "<model that tried>" --approach "<what was tried>" --failure "<failure signature>" \
   --question "<one concrete question for Fable?>" --non-sensitive
 ```
@@ -125,7 +129,8 @@ two materially different Opus attempts end in the same failure or review leaves 
 `packet`, then record the answer with `answer`. No reply is not approval: keep doing independent work and never re-ask (`show --id` re-prints a lost packet without asking). An approval older than 24 hours is not re-asked: continue without Fable. `CONSULT_APPROVED`:
 run `consult --id <id> --execute` once, implement and verify the advice here, then record `verdict`. A failed consult opens the
 circuit breaker and stops escalation until the owner resets it. Pass `--non-sensitive` only for inputs that hold no secret, customer or
-private data on an owned repo. Usage credits stay off and the default routes are unchanged. See `docs/fable/escalation.md`.
+private data on an owned repo. Usage credits stay off and the default routes are unchanged. See `docs/fable/escalation.md` in that checkout.
+<!-- claude-only:end -->
 
 ## Review and open the pull request
 
@@ -342,7 +347,7 @@ existing SPE-109 disk gate with its reservations and lane caps, and keeps heavy 
 checks (hysteresis). A single swap-used figure is history, not proof of current exhaustion. Thresholds are proposed in
 `docs/RESOURCE-ADMISSION.md` in the coding-agent-environment repository; do not change the disk gate's thresholds.
 
-Run up to two admitted heavy lanes (the second only when the resource budget passes, ADR 0017 revision 2). Do not start competing Cargo workspace builds, Docker suites, native QA or full
+Run only the heavy lanes the disk-admission scheduler grants: up to two in the stable and wide disk tiers (lane 2 only when the resource budget passes, ADR 0017 revision 2), plus a third in the wide tier only as the monitored SPE-160 pilot (ADR 0017 revision 7); never a fourth. Do not start competing Cargo workspace builds, Docker suites, native QA or full
 E2E, and lower subagent fan-out while pressure is not normal; prefer reusable build artifacts and isolated targets
 within the resource budget. Never kill another active session or delete its worktree, runtime, cache, container,
 reservation or scratch. Clean only regenerable caches and scratch proven idle and owned (owner, process lifetime, open

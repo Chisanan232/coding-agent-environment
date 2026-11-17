@@ -112,7 +112,10 @@ class BriefingInstallation(unittest.TestCase):
             self.assertEqual(run('--check').returncode, 1)
             self.assertEqual(run().returncode, 0)
             self.assertEqual(target.read_bytes(), source.read_bytes())
-            self.assertEqual(workflow_target.read_bytes(), workflow_source.read_bytes())
+            # The Codex copy drops Claude-only spans (the installer's transform); everything else is byte-identical.
+            codex_workflow = re.sub(rb'<!-- claude-only:start -->.*?<!-- claude-only:end -->\n?', b'', workflow_source.read_bytes(), flags=re.S)
+            self.assertNotIn(b'AskUserQuestion', codex_workflow)
+            self.assertEqual(workflow_target.read_bytes(), codex_workflow)
             before = {p: p.read_bytes() for p in live.rglob('*') if p.is_file()}
             self.assertEqual(run().returncode, 0)
             self.assertEqual(before, {p: p.read_bytes() for p in live.rglob('*') if p.is_file()})
@@ -123,7 +126,7 @@ class BriefingInstallation(unittest.TestCase):
             workflow_target.write_text('workflow drift')
             self.assertEqual(run('--check').returncode, 1)
             self.assertEqual(run().returncode, 0)
-            self.assertEqual(workflow_target.read_bytes(), workflow_source.read_bytes())
+            self.assertEqual(workflow_target.read_bytes(), codex_workflow)
             self.assertEqual(config.read_text(), 'local_setting = "preserve"\n')
             backups = [path.read_text() for path in (live / '.codex/backups').rglob('SKILL.md')]
             self.assertIn('manual drift', backups)
