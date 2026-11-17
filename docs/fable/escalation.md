@@ -20,21 +20,21 @@ Excluded, whatever else is true: queue delay, CI availability (`CI_UNAVAILABLE_E
 ## Approval: one per blocker
 
 1. `offer --case case.json --session <id>` records the blocker and writes one pending item in the pending-ASK ledger (`scripts/ask-pending.py`), so sessions sharing the ledger see one open request. It returns the packet: blocker, attempts made, the one question for Fable, the route.
-2. The agent asks the owner once through the native prompt (AskUserQuestion: Approve / Decline) with that packet. This tool never approves.
+2. The agent asks the owner once through the native prompt (AskUserQuestion: Approve / Decline) with that packet. This tool cannot obtain or verify the answer: the recorded approval is the agent's attestation of the owner's native answer, stored as a hash. A local script cannot stop a session from recording an approval nobody gave; `receipts.log` and the pending-ASK ledger are the audit trail, and the owner can check them.
 3. `answer --id <id> --decision approve|decline --ref "<the owner's answer>"` records it (only a hash of the text is stored). Decline, or no reply, spends nothing and the blocker is never offered again; independent work continues.
 4. An approval expires after 24 hours; a stale one needs a new offer after the blocker is revalidated.
 
-A blocker is the target plus the acceptance check. More attempts or a reworded summary do not make a new blocker, so the owner is asked at most once for it.
+A blocker is the target plus the acceptance check, compared ignoring case, spacing and punctuation. More attempts or a reworded `blocker` summary do not make a new blocker; a reworded acceptance check does, so key it by its stable id (AC3). The state directory is overridable by environment, so dedup and the breaker bind sessions that share it.
 
 ## The consult
 
-`consult --id <id>` prints the command shape (dry run). `--execute` runs one `claude -p --model claude-fable-5-2` with only `Read,Grep,Glob`, no MCP, no slash commands, no session persistence and `--max-budget-usd 4`. Included subscription only: it refuses when `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` is present (presence check, never read), and it requires Claude Code 2.1.321 or later. Usage credits stay off, an owner setting this tool cannot see or change. The result is accepted only if `is_error` is false, `modelUsage` is exactly `claude-fable-5-2` (a fallback model beside it is a mismatch) and the advice is non-empty. The advice goes to a 0600 file; the original session implements and verifies it. The consult state is saved before the call, so a crash or kill still leaves the one consult spent.
+`consult --id <id>` prints the command shape (dry run). `--execute` runs one `claude -p --model claude-fable-5-2` with only `Read,Grep,Glob`, no MCP, no slash commands, no session persistence and `--max-budget-usd 4`. Included subscription only, as far as the environment shows: it refuses when `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, a Foundry key or a Bedrock/Vertex/Foundry switch is set (presence check, never printed). It cannot see an `apiKeyHelper` in settings or a stored console key, so the owner's usage-credits-off setting stays the real guard. The prompt goes on stdin, not argv. It requires Claude Code 2.1.321 or later. Usage credits stay off, an owner setting this tool cannot see or change. The result is accepted only if `is_error` is false, `modelUsage` is exactly `claude-fable-5-2` (a fallback model beside it is a mismatch) and the advice is non-empty. The advice goes to a 0600 file; the original session implements and verifies it. The consult state is saved before the call, so a crash or kill still leaves the one consult spent.
 
 ## Circuit breaker
 
 At most one consult per blocker, never retried. The breaker opens, and blocks every new offer and consult, on:
 
-- `route_failure`: non-zero exit, `is_error`, unparseable output, timeout, old client
+- `route_failure`: non-zero exit, `is_error`, unparseable or non-object output, any exception during the call, timeout, old client
 - `model_mismatch`: the effective model is not exactly Fable 5.2
 - `no_advance`: the original session records `verdict --result not_advanced`
 
