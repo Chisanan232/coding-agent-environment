@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -399,8 +400,8 @@ class ReviewFixes(Env):
         self.assertFalse(fe.evaluate(case(), self.dir)["eligible"])
 
 
-class WorkflowCases(Env):
-    """Controlled cases through the real CLI, the way the development loop calls it."""
+class WorkflowBase(Env):
+    """Helpers to drive the real CLI the way the development loop calls it."""
     SCRIPT = str(ROOT / "scripts/fable-escalation.py")
 
     def cli(self, *argv, rc=0):
@@ -417,6 +418,13 @@ class WorkflowCases(Env):
             argv += [f"--{k.replace('_', '-')}", v] if v is not True else [f"--{k.replace('_', '-')}"]
         return self.cli(*argv)
 
+    def asked(self):
+        self.attempt("reorder acquisition")
+        return self.attempt("single global lock")["id"]
+
+
+class WorkflowCases(WorkflowBase):
+    """Controlled cases through the real CLI."""
     def test_two_distinct_failed_attempts_ask_exactly_once_across_any_number_of_later_calls(self):
         self.assertEqual(self.attempt("reorder acquisition")["action"], "CONTINUE")
         second = self.attempt("single global lock")
@@ -457,10 +465,6 @@ class WorkflowCases(Env):
         self.assertEqual(out["packet"]["trigger"], "unresolved_review_disagreement")
         again = self.cli("attempt", "--target", "o/r#8", "--check", "design review RV1", "--session", "dev-1", "--review-unresolved")
         self.assertEqual(again["action"], "CONTINUE")
-
-    def asked(self):
-        self.attempt("reorder acquisition")
-        return self.attempt("single global lock")["id"]
 
     def test_approval_allows_one_consult_and_the_next_attempt_says_consult_approved_until_it_runs(self):
         bid = self.asked()
@@ -508,6 +512,70 @@ class WorkflowCases(Env):
         self.assertEqual(self.attempt("second", target="o/r#11", check="AC11 other", failure="AC11 broken")["action"], "ASK_OWNER")
         pending = [i for i in fe._ask_pending().all_items(self.ask) if i["state"] == "PENDING"]
         self.assertEqual(len(pending), 2)  # one open request per blocker, both non-blocking
+
+
+class ReviewRound2(WorkflowBase):
+    def test_an_attempt_tagged_with_a_cause_is_never_counted_toward_the_trigger(self):
+        self.attempt("one", cause="queue_delay")
+        self.assertEqual(self.attempt("two")["action"], "CONTINUE")  # only one reasoning attempt so far
+        self.assertEqual(self.attempt("three")["action"], "ASK_OWNER")
+
+    def test_infrastructure_failure_text_is_not_kept_and_does_not_suppress_the_blocker(self):
+        self.attempt("one", failure="quota exceeded on the provider")
+        self.assertEqual(self.attempt("two")["action"], "CONTINUE")
+        self.assertEqual(self.attempt("three")["action"], "ASK_OWNER")
+
+    def test_concurrent_attempts_ask_exactly_once_and_none_errors(self):
+        self.attempt("seed")
+        results = []
+        def run(i):
+            results.append(self.attempt(f"concurrent approach {i}"))
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(5)]
+        [th.start() for th in threads]
+        [th.join() for th in threads]
+        self.assertEqual(sorted(r["action"] for r in results), ["ASK_OWNER"] + ["CONTINUE"] * 4)
+        self.assertEqual(len([r for r in Path(self.dir, "receipts.log").read_text().splitlines() if '"offered"' in r]), 1)
+
+    def test_a_settled_review_disagreement_cannot_trigger_later(self):
+        base = ("--target", "o/r#8", "--check", "design review RV1", "--session", "dev-1")
+        self.cli("attempt", *base, "--review-unresolved", "--review-position", "queue per tenant", "--review-position", "shared queue")
+        self.cli("attempt", *base, "--review-resolved")
+        out = self.cli("attempt", *base, "--model", "claude-opus-5-5", "--approach", "x", "--failure", "RV1 flake",
+                       "--question", "Which of the two queue designs keeps tenant isolation?", "--non-sensitive")
+        self.assertEqual(out["action"], "CONTINUE")
+
+    def test_a_lost_first_display_is_recoverable_without_asking_again(self):
+        asked = self.asked()
+        again = self.attempt("another")
+        self.assertEqual(again["action"], "CONTINUE")
+        shown = self.cli("show", "--id", asked)
+        self.assertEqual(shown["id"], asked)
+        self.assertEqual(shown["question_for_fable"].count("?"), 1)
+        self.cli("answer", "--id", asked, "--decision", "decline", "--ref", "owner said: not now, skip", "--session", "dev-1")
+        self.cli("show", "--id", asked, rc=2)
+
+    def test_a_failing_pending_ledger_still_returns_the_packet(self):
+        packet = fe.offer(self.dir, case(), "sess-1", "/dev/null/not-a-dir", T0)
+        self.assertTrue(packet["pending_ledger_item"].startswith("not-recorded"))
+        self.assertEqual(fe.load(self.dir, packet["id"])["state"], fe.OFFERED)
+
+    def test_non_ascii_acceptance_checks_are_distinct_blockers(self):
+        self.assertNotEqual(fe.fingerprint("o/r#1", "验收一"), fe.fingerprint("o/r#1", "验收二"))
+
+    def test_an_expired_or_breaker_blocked_approval_says_continue_not_consult(self):
+        bid = self.asked()
+        self.cli("answer", "--id", bid, "--decision", "approve", "--ref", "owner said: approve this one", "--session", "dev-1")
+        self.assertEqual(self.attempt("next")["action"], "CONSULT_APPROVED")
+        fe.trip(self.dir, "route_failure", None, T0)
+        self.assertEqual(self.attempt("next2")["action"], "CONTINUE")
+        fe.reset_breaker(self.dir, "route re-verified by canary today", T0)
+        path = fe._record_path(self.dir, bid)
+        record = json.loads(Path(path).read_text())
+        record["answered"] = "2026-01-01T00:00:00Z"
+        Path(path).write_text(json.dumps(record))
+        out = self.attempt("next3")
+        self.assertEqual(out["action"], "CONTINUE")
+        self.assertIn("24h", out["reason"])
 
 
 class RepoInvariants(unittest.TestCase):
