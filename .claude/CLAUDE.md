@@ -256,8 +256,8 @@ read existing merge-specific wording through the canonical contract above.
 ## Resource Admission and GitHub Operations
 
 Before heavy work run `scripts/memory-admission.py check --weight heavy` from the coding-agent-environment checkout (it also asks the
-SPE-109 disk gate; it is not installed into `~/.claude`); one heavy
-lane today (a shadow budget is measured beside it; cap raised only after measurement, ADR 0017), never kill or delete another session's work, and treat a swap-used number as history, not current
+SPE-109 disk gate; it is not installed into `~/.claude`); run only the
+heavy lanes the scheduler grants (up to two in the stable and wide disk tiers, a third in the wide tier only as the monitored SPE-160 pilot, never a fourth; ADR 0017), never kill or delete another session's work, and treat a swap-used number as history, not current
 exhaustion. After a reboot treat earlier processes, locks, reservations and jobs as stale and reconcile before resuming.
 Use `gh` for GitHub; it never bypasses host authorization, PR classes, CI, reviews or the merge gate.
 
