@@ -2,11 +2,13 @@
 """Fable escalation (SPE-171): offer one read-only Fable consult per blocker, only after the owner approves it.
 
 The tool decides *eligibility*, keeps *one offer and one consult per blocker*, and trips a *circuit breaker* when the route
-fails or the advice does not advance the task. It never authorizes anything: the owner's answer to the offer is recorded
-here after the agent asked it (AskUserQuestion), and a consult runs only from a recorded approval. No scheduler, hook or
-background lane calls `consult`; unattended Fable calls are not enabled.
+fails or the advice does not advance the task. It cannot obtain or verify the owner's approval itself: the agent asks the owner
+(AskUserQuestion) and records the answer here, so the recorded approval is the agent's own attestation of the owner's native
+answer, and the ref is stored as a hash only. A consult runs only from a recorded approval. No scheduler, hook or background lane
+calls `consult`; unattended Fable calls are not enabled. A local script cannot stop a session from recording an approval nobody
+gave; the receipts log and the pending-ASK ledger are the audit trail.
 
-Route: the included Claude subscription only. The consult refuses to run when an API credential is present in the
+Route: the included Claude subscription only. The consult refuses to run when an API credential or alternate-provider variable is set in the
 environment and refuses a result whose `modelUsage` is not exactly `claude-fable-5-2`. Usage credits stay off (owner setting).
 
 Stdlib only. State: `$FABLE_ESCALATION_DIR` (default `~/.cache/coding-agent-environment/fable`), mode 0700/0600, one flock
@@ -34,9 +36,12 @@ CONSULT_BUDGET_USD = "4"  # client-side list-price cap per consult (runbook), no
 MIN_ATTEMPTS = 2
 CAUSES = {"none", "queue_delay", "ci_unavailable", "missing_permission", "external_outage"}
 # A failure text that names one of these is infrastructure or permission, never a reasoning blocker, whatever `cause` says.
-EXCLUDED_TEXT = re.compile(r"CI_UNAVAILABLE_EXTERNAL|HARNESS_PERMISSION_BLOCK|spending limit|billing|quota|permission denied|"
-                           r"queue(d)? (delay|wait)|outage|ECONNRESET|rate.?limit", re.I)
-API_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")  # presence only, never read
+EXCLUDED_TEXT = re.compile(r"CI_UNAVAILABLE_EXTERNAL|HARNESS_PERMISSION_BLOCK|spending limit|billing limit|quota|permission .{0,30}denied|"
+                           r"denied.{0,20}permission|not permitted|forbidden|unauthori[sz]ed|EACCES|\b40[13]\b|\b50[23]\b|overloaded|"
+                           r"queue(d)? (delay|wait)|outage|ECONNRESET|rate.?limit|runner unavailable|timed? ?out", re.I)
+# Any of these set means the call may not use the included subscription. Presence only; the values are never read or printed.
+API_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_FOUNDRY_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
+           "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
 TARGET_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+")
 SESSION_RE = re.compile(r"[A-Za-z0-9_.:-]{1,80}")
 ID_RE = re.compile(r"[0-9a-f]{16}")
@@ -92,8 +97,11 @@ def _norm(text):
 
 
 def fingerprint(target, acceptance_check):
-    """One blocker = one target and one acceptance check; more attempts or a reworded summary do not make a new blocker."""
-    return hashlib.sha256((target + "\0" + _norm(acceptance_check)).encode()).hexdigest()[:16]
+    """One blocker = one target and one acceptance check; case, spacing and punctuation do not make a new blocker.
+
+    A genuinely reworded acceptance check does: key the check by its stable id (AC3), not by prose."""
+    check = re.sub(r"[^a-z0-9 ]+", " ", _norm(acceptance_check))
+    return hashlib.sha256((target.lower() + "\0" + " ".join(check.split())).encode()).hexdigest()[:16]
 
 
 def _record_path(directory, blocker_id):
@@ -132,6 +140,8 @@ def breaker(directory):
 
 
 def trip(directory, reason, blocker_id, at):
+    if breaker(directory).get("open"):
+        return breaker(directory)  # keep the first reason
     state = {"open": True, "reason": reason, "blocker": blocker_id, "since": iso(at)}
     _write(os.path.join(directory, "breaker.json"), state)
     receipt(directory, "breaker_open", {"id": blocker_id, "state": None}, reason=reason)
@@ -190,7 +200,8 @@ def evaluate(case, directory=None):
             try:
                 existing = load(directory, bid)
             except EscalationError:
-                existing = None
+                # An unreadable record may be a spent blocker: refuse rather than overwrite it.
+                existing = {"state": "UNREADABLE"} if os.path.exists(_record_path(directory, bid)) else None
     else:
         bid = None
     if directory and breaker(directory).get("open"):
@@ -291,7 +302,7 @@ def consult_prompt(record):
 
 
 def consult_argv(record):
-    return [claude_bin(), "-p", consult_prompt(record), "--model", FABLE_MODEL, "--tools", "Read,Grep,Glob", "--strict-mcp-config",
+    return [claude_bin(), "-p", "--model", FABLE_MODEL, "--tools", "Read,Grep,Glob", "--strict-mcp-config",
             "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands", "--no-session-persistence",
             "--max-budget-usd", CONSULT_BUDGET_USD, "--output-format", "json"]
 
@@ -304,7 +315,7 @@ def check_route(result):
     models = set((result.get("modelUsage") or {}).keys())
     if models != {FABLE_MODEL}:
         problems.append(f"effective model is not exactly {FABLE_MODEL}: {','.join(sorted(models)) or 'none'}")
-    if not str(result.get("result") or "").strip():
+    if not isinstance(result.get("result"), str) or not result["result"].strip():
         problems.append("empty advice")
     return problems
 
@@ -322,8 +333,11 @@ def consult(directory, blocker_id, execute, cwd, at):
             raise EscalationError("an API credential is present in the environment: refusing, the route is the subscription only")
         argv = consult_argv(record)
         if not execute:
-            return {"dry_run": True, "id": record["id"], "model": FABLE_MODEL, "argv_without_prompt": [a for a in argv if a != argv[2]]}
-        version = claude_version()
+            return {"dry_run": True, "id": record["id"], "model": FABLE_MODEL, "argv": argv, "prompt_via": "stdin"}
+        try:
+            version = claude_version()
+        except (subprocess.TimeoutExpired, OSError):
+            version = None
         if version is None or version < MIN_CLAUDE:
             record["state"] = FAILED
             record["failure"] = "claude version unknown or below 2.1.321"
@@ -335,10 +349,13 @@ def consult(directory, blocker_id, execute, cwd, at):
         save(directory, record)
         receipt(directory, "consult_started", record)
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, cwd=cwd, timeout=CONSULT_TIMEOUT_S)
+        # The prompt goes on stdin so attempt text never appears in a process listing.
+        proc = subprocess.run(argv, input=consult_prompt(record), capture_output=True, text=True, cwd=cwd, timeout=CONSULT_TIMEOUT_S)
         result = json.loads(proc.stdout)
+        if not isinstance(result, dict):
+            raise ValueError("result is not a JSON object")
         problems = ([] if proc.returncode == 0 else [f"exit {proc.returncode}"]) + check_route(result)
-    except (subprocess.TimeoutExpired, ValueError, OSError) as exc:
+    except Exception as exc:  # noqa: BLE001 - every non-success exit must trip the breaker, whatever raised
         result, problems = {}, [type(exc).__name__]
     with locked(directory):
         record = load(directory, blocker_id)
