@@ -594,9 +594,9 @@ class RepoInvariants(unittest.TestCase):
         for skill in ("engineering-workflow", "dev-impl-loop"):
             text = (ROOT / f".claude/skills/{skill}/SKILL.md").read_text()
             self.assertEqual(text.count("<!-- claude-only:start -->"), text.count("<!-- claude-only:end -->"))
+            self.assertIn("Fable", text)  # the Claude copy carries it ...
             for word in ("AskUserQuestion", "fable-escalation", "Fable"):
-                self.assertIn(word, text) if skill == "engineering-workflow" and word != "Fable" or word == "Fable" else None
-                self.assertNotIn(word, strip(text), f"{skill}: {word} reaches the Codex copy")
+                self.assertNotIn(word, strip(text), f"{skill}: {word} reaches the Codex copy")  # ... the Codex copy does not
 
 
     def test_no_scheduler_hook_or_workflow_calls_consult(self):
