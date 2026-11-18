@@ -1610,8 +1610,9 @@ class RestCommentSource(unittest.TestCase):
 
     def test_the_review_completion_time_refuses_when_comments_may_be_truncated(self):
         filler = [dict(self.MINE, body=f"note {i}", createdAt=f"2026-11-17T20:{i // 60:02d}:{i % 60:02d}Z") for i in range(100)]
-        with self.assertRaises(ValueError):
-            omg.review_completed_at(Fake(comments=[], rest_comments=filler), "Chisanan232/r", 7, HEAD)
+        # The real record is present, so without the guard a stamp would be returned instead of an error.
+        with self.assertRaisesRegex(ValueError, "100 or more"):
+            omg.review_completed_at(Fake(comments=[], rest_comments=filler[:99] + [self.MINE]), "Chisanan232/r", 7, HEAD)
 
     def test_a_twin_mismatch_between_the_sources_never_trusts_an_edited_or_minimized_copy(self):
         # GraphQL says minimized; the REST copy differs in createdAt, so the twin does not match and both are kept.
