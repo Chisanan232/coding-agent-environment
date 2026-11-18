@@ -299,13 +299,13 @@ def answer(directory, blocker_id, decision, ref, session_id, ask_dir, at):
         save(directory, record)
         receipt(directory, "answered", record, decision=decision)
     if ask_dir:
-        os.makedirs(ask_dir, mode=0o700, exist_ok=True)
-        ap = _ask_pending()
         try:
+            os.makedirs(ask_dir, mode=0o700, exist_ok=True)
+            ap = _ask_pending()
             ap.finish(ask_dir, ap.item_key("DECISION: Fable consult: " + record["blocker"][:150], record["target"], "decision"),
                       "answered" if decision == "approve" else "denied", ref if decision == "approve" else None, at,
                       session_id=session_id)
-        except ap.AskError:
+        except Exception:  # noqa: BLE001 - the answer is already saved; a ledger that cannot be written must not make it look failed
             pass  # the ledger is visibility only; this record is the authority for the consult
     return record
 
@@ -447,7 +447,11 @@ def consult(directory, blocker_id, execute, cwd, at):
             raise EscalationError("circuit breaker open: " + str(breaker(directory).get("reason")))
         if record["state"] != APPROVED:
             raise EscalationError(f"blocker is {record['state']}: a consult runs only from a recorded approval, once")
-        if (at - parse(record["answered"])).total_seconds() > APPROVAL_TTL_S:
+        try:
+            approval_age = (at - parse(record["answered"])).total_seconds()
+        except (KeyError, TypeError, ValueError):
+            raise EscalationError("approval record is unreadable: no consult")
+        if approval_age > APPROVAL_TTL_S:
             raise EscalationError("approval is older than 24h: offer again after revalidating the blocker")
         if any(os.environ.get(name) for name in API_ENV):
             raise EscalationError("an API credential is present in the environment: refusing, the route is the subscription only")

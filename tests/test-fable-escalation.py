@@ -459,6 +459,27 @@ class WorkflowCases(WorkflowBase):
                           "dev-1", missing, T0)
         self.assertTrue(os.path.isdir(missing))
 
+    def test_an_unwritable_ledger_never_makes_a_saved_answer_look_failed(self):
+        bid = self.asked()
+        blocker = os.path.join(self.tmp.name, "afile")
+        Path(blocker).write_text("x")
+        env = dict(os.environ, FABLE_ESCALATION_DIR=self.dir, ASK_PENDING_DIR=os.path.join(blocker, "under"))
+        proc = subprocess.run([sys.executable, self.SCRIPT, "answer", "--id", bid, "--decision", "approve", "--session", "dev-1",
+                               "--ref", "owner said approve in chat"], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(fe.load(self.dir, bid)["state"], fe.APPROVED)
+
+    def test_consult_refuses_cleanly_on_an_approval_without_a_timestamp(self):
+        bid = self.asked()
+        self.cli("answer", "--id", bid, "--decision", "approve", "--session", "dev-1", "--ref", "owner said approve in chat")
+        record = Path(fe._record_path(self.dir, bid))
+        data = json.loads(record.read_text())
+        del data["answered"]
+        record.write_text(json.dumps(data))
+        out = self.cli("consult", "--id", bid, "--execute", rc=2)
+        self.assertIn("unreadable", out["error"])
+        self.assertEqual(self.calls(), 0)
+
     def test_an_uncounted_attempt_says_so(self):
         out = self.attempt("wait for the runner", failure="CI_UNAVAILABLE_EXTERNAL billing limit")
         self.assertEqual(out["action"], "CONTINUE")
