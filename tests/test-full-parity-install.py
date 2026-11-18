@@ -36,6 +36,29 @@ class FullParity(unittest.TestCase):
                                '--global' if host == 'codex' else '--claude-skills', *flags],
                               env=self.env, text=True, capture_output=True)
 
+    def test_claude_policy_flag_writes_only_the_managed_block(self):
+        policy = self.home / '.claude/CLAUDE.md'
+        policy.parent.mkdir(parents=True)
+        before, after = b'Private head\r\n', b'\nPrivate tail\n'
+        stale = (self.repo / '.claude/CLAUDE.md').read_bytes()
+        start = b'<!-- coding-agent-environment:engineering-workflow:start -->'
+        end = b'<!-- coding-agent-environment:engineering-workflow:end -->'
+        span = stale[stale.index(start):stale.index(end) + len(end)]
+        policy.write_bytes(before + span.replace(b'run only the\nheavy lanes', b'one heavy\nlane') + after)
+        other = self.home / '.claude/skills/evidence-first-briefing/SKILL.md'
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b'local skill edit')
+        run = lambda *flags: subprocess.run(['bash', str(self.repo / 'scripts/profile-install.sh'), '--claude-policy', *flags],
+                                            env=self.env, text=True, capture_output=True)
+        self.assertEqual(run('--check').returncode, 1)
+        self.assertEqual(run('--shared-skills=dev-impl-loop').returncode, 2)
+        result = run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(policy.read_bytes(), before + span + after)
+        self.assertEqual(other.read_bytes(), b'local skill edit')
+        self.assertEqual(sorted(p.name for p in (self.home / '.claude/skills').iterdir()), ['evidence-first-briefing'])
+        self.assertEqual(run('--check').returncode, 0)
+
     def test_complete_both_hosts_omissions_and_resource_preflight(self):
         protected = {}
         for host in ['claude', 'codex']:
