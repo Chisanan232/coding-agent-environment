@@ -215,6 +215,11 @@ def evaluate(case, directory=None):
 
 # --- offer / answer ----------------------------------------------------------------------------------------------------
 
+def default_ask_dir():
+    # The pending-ASK ledger the rest of the workflow reads; an unset override must not silently skip the record.
+    return os.environ.get("ASK_PENDING_DIR") or os.path.join(os.path.expanduser("~"), ".cache", "coding-agent-environment", "asks")
+
+
 def _ask_pending():
     here = os.path.dirname(os.path.abspath(__file__))
     spec = spec_from_file_location("ask_pending", os.path.join(here, "ask-pending.py"))
@@ -249,6 +254,7 @@ def _ledger_packet(record, session_id, ask_dir, at):
     ledger = None
     if ask_dir:
         try:
+            os.makedirs(ask_dir, mode=0o700, exist_ok=True)
             ap = _ask_pending()
             item, _new = ap.record_decision(ask_dir, "Fable consult: " + record["blocker"][:150], record["target"], session_id, [],
                                             "owner_approval", record["id"], ap.GRACE_MAX_S, "unknown", at)
@@ -293,6 +299,7 @@ def answer(directory, blocker_id, decision, ref, session_id, ask_dir, at):
         save(directory, record)
         receipt(directory, "answered", record, decision=decision)
     if ask_dir:
+        os.makedirs(ask_dir, mode=0o700, exist_ok=True)
         ap = _ask_pending()
         try:
             ap.finish(ask_dir, ap.item_key("DECISION: Fable consult: " + record["blocker"][:150], record["target"], "decision"),
@@ -310,7 +317,18 @@ def _attempt_path(directory, blocker_id):
     return os.path.join(directory, "attempts", blocker_id + ".json")
 
 
+def _uncounted(args):
+    return bool(args.get("cause") and args["cause"] != "none") or bool(EXCLUDED_TEXT.search(args.get("failure") or ""))
+
+
 def attempt(directory, args, session_id, ask_dir, at):
+    out = _attempt(directory, args, session_id, ask_dir, at)
+    if (args.get("approach") or args.get("failure")) and _uncounted(args):
+        out["note"] = "this attempt was not counted: queue, CI-availability, permission or outage trouble cannot trigger an offer"
+    return out
+
+
+def _attempt(directory, args, session_id, ask_dir, at):
     """What the development loop calls after every failed attempt. Never blocks and never raises for a normal outcome.
 
     Returns {"action": ...}: CONTINUE (do nothing, keep working), ASK_OWNER (ask once now, with `packet`), CONSULT_APPROVED (the owner
@@ -322,7 +340,7 @@ def attempt(directory, args, session_id, ask_dir, at):
     if not SESSION_RE.fullmatch(session_id or ""):
         return {"action": "CONTINUE", "reason": "--session is required (letters, digits, . _ : -)"}
     bid = fingerprint(target, check)
-    excluded = bool(args.get("cause") and args["cause"] != "none") or bool(EXCLUDED_TEXT.search(args.get("failure") or ""))
+    excluded = _uncounted(args)
     with locked(directory):
         path = _attempt_path(directory, bid)
         try:
@@ -354,9 +372,14 @@ def attempt(directory, args, session_id, ask_dir, at):
             state = existing["state"]
             if state == APPROVED and breaker(directory).get("open"):
                 return {"action": "CONTINUE", "id": bid, "reason": "approved, but the circuit breaker is open: no consult, no prompt"}
-            if state == APPROVED and (at - parse(existing["answered"])).total_seconds() > APPROVAL_TTL_S:
-                return {"action": "CONTINUE", "id": bid,
-                        "reason": "approval is older than 24h: no consult and no new prompt for this blocker; continue without Fable"}
+            if state == APPROVED:
+                try:
+                    age = (at - parse(existing["answered"])).total_seconds()
+                except (KeyError, TypeError, ValueError):
+                    return {"action": "CONTINUE", "id": bid, "reason": "approval record is unreadable: no consult and no new prompt"}
+                if age > APPROVAL_TTL_S:
+                    return {"action": "CONTINUE", "id": bid,
+                            "reason": "approval is older than 24h: no consult and no new prompt for this blocker; continue without Fable"}
             if state == APPROVED:
                 return {"action": "CONSULT_APPROVED", "id": bid, "next": "run `consult --id` once, then implement and verify"}
             return {"action": "CONTINUE", "id": bid, "reason": f"blocker already {state}: no new prompt, keep working on independent tasks"}
@@ -517,13 +540,13 @@ def main(argv=None):
         s.add_argument("--case", required=True, help="JSON file describing the blocker")
         if name == "offer":
             s.add_argument("--session", required=True)
-            s.add_argument("--ask-dir", default=os.environ.get("ASK_PENDING_DIR") or None)
+            s.add_argument("--ask-dir", default=default_ask_dir())
     s = sub.add_parser("answer")
     s.add_argument("--id", required=True)
     s.add_argument("--decision", required=True, choices=("approve", "decline"))
     s.add_argument("--ref", required=True)
     s.add_argument("--session", required=True)
-    s.add_argument("--ask-dir", default=os.environ.get("ASK_PENDING_DIR") or None)
+    s.add_argument("--ask-dir", default=default_ask_dir())
     s = sub.add_parser("consult")
     s.add_argument("--id", required=True)
     s.add_argument("--execute", action="store_true", help="without it: print the command shape only")
@@ -548,7 +571,7 @@ def main(argv=None):
     s.add_argument("--review-position", action="append")
     s.add_argument("--review-unresolved", action="store_true")
     s.add_argument("--review-resolved", action="store_true", help="clear a review disagreement that has been settled")
-    s.add_argument("--ask-dir", default=os.environ.get("ASK_PENDING_DIR") or None)
+    s.add_argument("--ask-dir", default=default_ask_dir())
     s = sub.add_parser("show", help="print the packet of an OFFERED blocker again (never asks, never changes state)")
     s.add_argument("--id", required=True)
     sub.add_parser("report")
