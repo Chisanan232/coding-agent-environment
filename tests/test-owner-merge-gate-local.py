@@ -108,6 +108,10 @@ class LocalGh:
         if a[:2] == ("api", "graphql"):
             pr = next(p for k, p in self.prs.items() if f"n={k}" in " ".join(a))
             return json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": pr["threads"]}}}}})
+        if a[0] == "api" and "/issues/" in a[1] and a[1].endswith("/comments?per_page=100"):
+            pr = self.prs[int(a[1].split("/issues/")[1].split("/")[0])]  # what gh prints after the gate's --jq (FORNX-503)
+            return json.dumps([{"author": {"login": (c.get("author") or {}).get("login") or ""}, "body": c.get("body") or "",
+                                "createdAt": c.get("createdAt")} for c in pr["comments"]])
         if a[0] == "api" and "/commits/" in a[1]:
             sha = a[1].split("/commits/")[1]
             return json.dumps(git(self.repo, "rev-list", "--parents", "-n1", sha).split()[1:])

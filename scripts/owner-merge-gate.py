@@ -461,6 +461,8 @@ API_READS = [re.compile(x) for x in (
     _RO + r"/actions/runs\?head_sha=[0-9a-f]{40}&per_page=1", _RO + r"/pulls/\d{1,9}/files\?per_page=100",
     _RO + r"/git/commits/[0-9a-f]{40}", _RO + r"/git/trees/[0-9a-f]{40}\?recursive=1",
     _RO + r"/git/blobs/[0-9a-f]{40}",
+    # FORNX-503: the PR's issue comments, a second source for the viewer's own OWNER-MERGE-* records (first page only).
+    _RO + r"/issues/\d{1,9}/comments\?per_page=100",
     r"orgs/[A-Za-z0-9][A-Za-z0-9-]{0,38}/memberships/[A-Za-z0-9][A-Za-z0-9-]{0,38}")]
 SAFE_FLAGS = {"--json", "--jq", "--repo"}
 GRAPHQL_VARS = {"query", "o", "r", "n"}
@@ -600,6 +602,48 @@ def bot_provenance(p, bots):
 
 def _json(run, *args):
     return json.loads(run(*args))
+
+
+# FORNX-503: `gh pr view --json comments` (GraphQL pullRequest.comments) was measured returning no comments at all for
+# every PR of horonomy/fornax-core while the REST issue-comments list held them, so the viewer's review record was
+# invisible and the gate refused with NO_REVIEW_EVIDENCE. The gate now reads the REST list as well and uses the union.
+REST_COMMENTS_JQ = '[.[]|{author:{login:(.user.login // "")},body:(.body // ""),createdAt:.created_at}]'
+
+
+def merged_comments(run, repo, pr, graphql_comments):
+    """(comments, rest_count, error): GraphQL comments unioned with the REST issue comments, REST order first.
+
+    Comments are the same kind of record from the same author on both paths, so the union adds no new trust: callers still
+    keep only the authenticated viewer's comments, outside code fences, bound to the exact head. Each GraphQL entry replaces
+    its REST twin (same login, body, createdAt) one-to-one; unmatched entries from either side are kept. If the REST list
+    cannot be read or has an unexpected shape, `error` is set and the caller must refuse (fail closed) instead of silently
+    trusting GraphQL alone.
+    """
+    graphql_comments = list(graphql_comments or [])
+    try:
+        rest = json.loads(run("api", f"repos/{repo}/issues/{pr}/comments?per_page=100", "--jq", REST_COMMENTS_JQ))
+        if not isinstance(rest, list) or not all(isinstance(c, dict) for c in rest):
+            raise ValueError("unexpected shape")
+    except Exception as e:
+        return graphql_comments, None, f"{type(e).__name__}: {str(e)[:120]}"
+    # A GraphQL entry replaces its REST twin in place: only GraphQL carries includesCreatedEdit/isMinimized, which the
+    # local-first basis requires, so a REST-only record can never satisfy that basis (those flags stay absent).
+    # Matching is one-to-one, so two genuinely identical comments in one source stay two (the controlled-review ambiguity
+    # check counts them).
+    def key(c):
+        return (((c.get("author") or {}).get("login") or "").lower(), c.get("body") or "", c.get("createdAt"))
+
+    out = list(rest)
+    free = {}
+    for i, c in enumerate(out):
+        free.setdefault(key(c), []).append(i)
+    for c in graphql_comments:
+        slots = free.get(key(c))
+        if slots:
+            out[slots.pop(0)] = c
+        else:
+            out.append(c)
+    return out, len(rest), None
 
 
 def has_workflows(run, repo, ref):
@@ -932,7 +976,13 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
             role = run("api", f"orgs/{owner}/memberships/{me}", "--jq", ".role + \" \" + .state").strip()
             if role != "admin active":
                 reasons.append(f"OWNER_IDENTITY_NOT_VERIFIED: {me!r} is neither the repository owner account nor an administrator of org {owner!r}")
-    if len(p["comments"]) >= 100 or len(p["reviews"]) >= 100:
+    graphql_n = len(p["comments"])
+    comments, rest_n, comments_error = merged_comments(run, repo, pr, p["comments"])
+    if comments_error:
+        reasons.append(f"COMMENTS_UNREADABLE: the REST issue comments could not be read ({comments_error}); review and CI records cannot be proven")
+    elif rest_n != graphql_n:
+        facts["comment_source_discrepancy"] = {"graphql": graphql_n, "rest": rest_n}
+    if graphql_n >= 100 or (rest_n or 0) >= 100 or len(p["reviews"]) >= 100:
         reasons.append("EVIDENCE_TRUNCATED: 100 or more comments or reviews; later records may be hidden")
     if p["state"] != "OPEN":
         reasons.append(f"NOT_OPEN: state {p['state']}")
@@ -1007,7 +1057,7 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
     unresolved = [t for t in rt["nodes"] if not t["isResolved"]]
     if unresolved:
         reasons.append(f"UNRESOLVED_REVIEW_THREADS: {len(unresolved)}")
-    mine = [c for c in p["comments"] if (c.get("author") or {}).get("login", "").lower() == me.lower()]
+    mine = [c for c in comments if (c.get("author") or {}).get("login", "").lower() == me.lower()]
     texts = [re.sub(r"```.*?```", "", (c["body"] or ""), flags=re.S) for c in mine]
     configured_local = (local_first or {}).get(repo.lower())
     controlled_review_required = (ci_exception and not (p.get("statusCheckRollup") or []) and configured_local
@@ -1226,6 +1276,7 @@ REASON_TABLE = {
     "UNRESOLVED_REVIEW_THREADS": (ASK, "author_resolves_threads", "ENGINEERING_GATE"),
     "REVIEW_THREADS_TRUNCATED": (ASK, "owner_review", "ENGINEERING_GATE"),
     "EVIDENCE_TRUNCATED": (ASK, "owner_review", "ENGINEERING_GATE"),
+    "COMMENTS_UNREADABLE": (ASK, "agent_revalidates", "ENGINEERING_GATE"),
     "CI_PENDING": (ASK, "agent_revalidates", "ENGINEERING_GATE"),
     "NO_CI_EVIDENCE": (ASK, "founder_risk_decision", "ENGINEERING_GATE"),
     "NOT_PRIVATE": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"),
@@ -1377,7 +1428,10 @@ def review_completed_at(run, repo, pr, head):
     p = _json(run, "pr", "view", str(pr), "--repo", repo, "--json", "headRefOid,comments")
     if p["headRefOid"] != head:
         raise ValueError("the PR is no longer at this head; the recorded review does not apply")
-    stamps = [c.get("createdAt") for c in p.get("comments") or []
+    comments, _, comments_error = merged_comments(run, repo, pr, p.get("comments"))
+    if comments_error:
+        raise ValueError(f"the PR comments could not be read from REST: {comments_error}")
+    stamps = [c.get("createdAt") for c in comments
               if (c.get("author") or {}).get("login", "").lower() == me
               and any(m[0] == head for m in REVIEW_RE.findall(re.sub(r"```.*?```", "", c.get("body") or "", flags=re.S)))]
     if not stamps or not stamps[-1]:

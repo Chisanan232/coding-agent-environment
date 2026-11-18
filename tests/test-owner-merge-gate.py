@@ -78,6 +78,18 @@ class Fake:
             if listed is None:
                 listed = [{"filename": f["path"], "status": "modified"} for f in self.pr.get("files") or []]
             return json.dumps(listed)
+        if a[0] == "api" and "/issues/" in a[1] and a[1].endswith("/comments?per_page=100"):
+            # What gh prints after the gate's own --jq: already normalised. Default mirrors the GraphQL comments.
+            self.rest_reads = getattr(self, "rest_reads", 0) + 1
+            rest = getattr(self, "rest_comments", None)
+            if rest == "error":
+                raise RuntimeError("gh api repos/Chisanan232/r/issues/7/comments failed: HTTP 502")
+            if rest == "garbage":
+                return "not json\n"
+            if rest is None:
+                rest = [{"author": {"login": (c.get("author") or {}).get("login") or ""}, "body": c.get("body") or "", "createdAt": c.get("createdAt")}
+                        for c in self.pr["comments"]]
+            return json.dumps(rest)
         if a[0] == "api" and "/actions/runs?head_sha=" in a[1]:
             self.runs_reads = getattr(self, "runs_reads", []) + [a[1]]
             return f"{self.runs}\n"
@@ -1509,6 +1521,109 @@ class BillingCI(unittest.TestCase):
                      {"detailsUrl": "https://github.com/other/r/actions/runs/900/job/1"}, {"detailsUrl": ""}):
             with self.subTest(over=over):
                 self.assertEqual(self.verdict([self.job("1", "t", **over)], {"1": [self.TEXT]})[0], "REFUSE")
+
+
+class RestCommentSource(unittest.TestCase):
+    """FORNX-503: the viewer's records are also read from the REST issue comments, because the GraphQL comments
+    connection was measured empty for every PR of one repository. The union adds no trust: viewer only, outside code
+    fences, exact head, PASS and blocking=0 all still apply."""
+
+    MINE = {"author": {"login": "chisanan232"}, "body": REVIEW, "createdAt": "2026-11-17T20:05:11Z"}
+
+    def refused(self, fake, code, **kw):
+        v, reasons, facts = run(fake, **kw)
+        self.assertEqual(v, "REFUSE", reasons)
+        self.assertTrue(any(r.startswith(code) for r in reasons), reasons)
+        return facts
+
+    def test_a_viewer_review_visible_only_through_rest_counts(self):
+        fake = Fake(comments=[], rest_comments=[self.MINE])
+        v, reasons, facts = run(fake)
+        self.assertEqual((v, reasons), ("PASS", []))
+        self.assertEqual(facts["comment_source_discrepancy"], {"graphql": 0, "rest": 1})
+        self.assertEqual(facts["reviewer"], "independent-agent-1")
+
+    def test_a_graphql_only_review_still_works_and_reports_the_discrepancy(self):
+        fake = Fake(comments=[self.MINE], rest_comments=[])
+        v, reasons, facts = run(fake)
+        self.assertEqual((v, reasons), ("PASS", []))
+        self.assertEqual(facts["comment_source_discrepancy"], {"graphql": 1, "rest": 0})
+
+    def test_agreeing_sources_report_no_discrepancy(self):
+        v, _, facts = run(Fake())
+        self.assertEqual(v, "PASS")
+        self.assertNotIn("comment_source_discrepancy", facts)
+
+    def test_an_unreadable_rest_list_fails_closed_even_if_graphql_has_the_review(self):
+        for broken in ("error", "garbage"):
+            with self.subTest(broken=broken):
+                self.refused(Fake(rest_comments=broken), "COMMENTS_UNREADABLE")
+
+    def test_a_non_viewer_rest_comment_does_not_count(self):
+        other = dict(self.MINE, author={"login": "someone-else"})
+        self.refused(Fake(comments=[], rest_comments=[other]), "NO_REVIEW_EVIDENCE")
+
+    def test_a_missing_rest_author_does_not_count(self):
+        self.refused(Fake(comments=[], rest_comments=[dict(self.MINE, author={"login": ""})]), "NO_REVIEW_EVIDENCE")
+
+    def test_a_code_fenced_rest_record_does_not_count(self):
+        fenced = dict(self.MINE, body="```\n" + REVIEW + "\n```")
+        self.refused(Fake(comments=[], rest_comments=[fenced]), "NO_REVIEW_EVIDENCE")
+
+    def test_a_rest_review_for_another_head_is_stale(self):
+        old = dict(self.MINE, body=REVIEW.replace(HEAD, "e" * 40))
+        self.refused(Fake(comments=[], rest_comments=[old]), "REVIEW_STALE")
+
+    def test_a_rest_review_that_is_not_clean_refuses(self):
+        for body in (REVIEW.replace("verdict=PASS", "verdict=FAIL"), REVIEW.replace("blocking=0", "blocking=1")):
+            with self.subTest(body=body):
+                self.refused(Fake(comments=[], rest_comments=[dict(self.MINE, body=body)]), "REVIEW_NOT_CLEAN")
+
+    def test_a_rest_review_by_the_coordinator_is_not_independent(self):
+        body = REVIEW.replace("independent-agent-1", "coordinator")
+        self.refused(Fake(comments=[], rest_comments=[dict(self.MINE, body=body)]), "REVIEW_NOT_INDEPENDENT")
+
+    def test_one_hundred_rest_comments_alone_trigger_the_truncation_guard(self):
+        filler = [dict(self.MINE, body=f"note {i}", createdAt=f"2026-11-17T20:{i // 60:02d}:{i % 60:02d}Z") for i in range(100)]
+        self.refused(Fake(comments=[], rest_comments=filler + [self.MINE]), "EVIDENCE_TRUNCATED")
+
+    def test_identical_comments_inside_one_source_are_not_collapsed(self):
+        merged, n, err = omg.merged_comments(Fake(rest_comments=[self.MINE, dict(self.MINE)]), "Chisanan232/r", 7, [])
+        self.assertIsNone(err)
+        self.assertEqual((len(merged), n), (2, 2))
+
+    def test_a_graphql_entry_replaces_its_rest_twin_and_keeps_its_flags(self):
+        graphql = dict(self.MINE, includesCreatedEdit=False, isMinimized=False)
+        merged, _, _ = omg.merged_comments(Fake(rest_comments=[self.MINE]), "Chisanan232/r", 7, [graphql])
+        self.assertEqual(merged, [graphql])
+
+    def test_a_rest_only_record_never_satisfies_the_local_first_flags(self):
+        merged, _, _ = omg.merged_comments(Fake(rest_comments=[self.MINE]), "Chisanan232/r", 7, [])
+        self.assertIsNot(merged[0].get("includesCreatedEdit"), False)
+        self.assertIsNot(merged[0].get("isMinimized"), False)
+
+    def test_the_review_completion_time_reads_the_rest_comment(self):
+        fake = Fake(comments=[], rest_comments=[self.MINE])
+        self.assertEqual(omg.review_completed_at(fake, "Chisanan232/r", 7, HEAD), "2026-11-17T20:05:11Z")
+        with self.assertRaises(ValueError):
+            omg.review_completed_at(Fake(comments=[], rest_comments="error"), "Chisanan232/r", 7, HEAD)
+
+    def test_the_rest_read_is_one_exact_allowlisted_call(self):
+        omg.read_only(("api", "repos/Chisanan232/r/issues/7/comments?per_page=100", "--jq", omg.REST_COMMENTS_JQ))
+        for path in ("repos/Chisanan232/r/issues/7/comments",
+                     "repos/Chisanan232/r/issues/7/comments?per_page=100&page=2",
+                     "repos/Chisanan232/r/issues/7/comments?per_page=1000",
+                     "repos/Chisanan232/r/issues/7/comments/123",
+                     "repos/Chisanan232/r/issues/comments/123",
+                     "repos/Chisanan232/r/issues/7/labels?per_page=100",
+                     "repos/Chisanan232/r/issues/x/comments?per_page=100",
+                     "repos/Chisanan232/r/issues/7/comments?per_page=100/../x",
+                     "repos/Chisanan232/../r/issues/7/comments?per_page=100"):
+            with self.subTest(path=path), self.assertRaises(RuntimeError):
+                omg.read_only(("api", path, "--jq", "."))
+        for extra in (("-X", "POST"), ("-XPOST",), ("--method", "POST"), ("-f", "body=x"), ("--input", "x"), ("--paginate",)):
+            with self.subTest(extra=extra), self.assertRaises(RuntimeError):
+                omg.read_only(("api", "repos/Chisanan232/r/issues/7/comments?per_page=100", *extra))
 
 
 if __name__ == "__main__":
