@@ -99,6 +99,8 @@ every shared skill file under `~/.claude/skills` with the repository copy, and i
 saves a backup of replaced files under `~/.claude/backups/coding-agent-environment/`.
 Run `scripts/profile-install.sh --claude-skills --dry-run` or `--check` first to
 see the drift before anything is written.
+`--claude-policy` does only the `CLAUDE.md` half (no skill file is read or written);
+`--claude-skills --shared-skills=a,b` does only the named skills.
 
 Copy the remaining files into your home config (review first):
 

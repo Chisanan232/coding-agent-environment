@@ -18,6 +18,7 @@
 #   ./scripts/profile-install.sh [--dry-run]
 #   ./scripts/profile-install.sh --visuals [--dry-run | --check]
 #   ./scripts/profile-install.sh --global [--dry-run | --check]
+#   ./scripts/profile-install.sh --claude-policy [--dry-run | --check]   (managed Claude policy block only)
 #   ./scripts/profile-install.sh --capabilities [--dry-run | --check | --remove]
 #   ./scripts/profile-install.sh --resource-policy [--dry-run | --check | --apply | --rollback]
 set -euo pipefail
@@ -50,12 +51,14 @@ CAPABILITIES=0
 REMOVE=0
 SHARED_SELECTION=""
 SHARED_SELECTION_SET=0
+POLICY_ONLY=0
 
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
         --global) GLOBAL=1 ;;
         --claude-skills) GLOBAL=1; HOST_MODE=claude ;;
+        --claude-policy) GLOBAL=1; HOST_MODE=claude; POLICY_ONLY=1 ;;
         --check) CHECK=1 ;;
         --capabilities) CAPABILITIES=1 ;;
         --remove) REMOVE=1 ;;
@@ -76,6 +79,10 @@ if [[ -n "$SHARED_SELECTION" ]] && (( ! GLOBAL )); then
     exit 2
 fi
 
+if (( POLICY_ONLY )) && [[ -n "$SHARED_SELECTION" ]]; then
+    echo '--claude-policy installs only the managed policy block; it takes no --shared-skills.' >&2
+    exit 2
+fi
 if (( GLOBAL && CAPABILITIES )); then
     echo 'Choose --global or --capabilities, not both.' >&2
     exit 2
@@ -173,7 +180,7 @@ if (( GLOBAL )); then
         echo 'Global mode requires the standard user Codex home; custom CODEX_HOME is not managed.' >&2
         exit 2
     fi
-    python3 - "$REPO_ROOT" "${CODING_AGENT_SYNC_HOME:-$HOME}" "$DRY_RUN" "$CHECK" "$HOST_MODE" "$SHARED_SELECTION" <<'PYGLOBAL'
+    python3 - "$REPO_ROOT" "${CODING_AGENT_SYNC_HOME:-$HOME}" "$DRY_RUN" "$CHECK" "$HOST_MODE" "$SHARED_SELECTION" "$POLICY_ONLY" <<'PYGLOBAL'
 import datetime
 import hashlib
 import json
@@ -190,6 +197,7 @@ root, live = map(Path, sys.argv[1:3])
 dry, check = map(int, sys.argv[3:5])
 host_mode = sys.argv[5]
 selection = sys.argv[6].split(',') if sys.argv[6] else []
+policy_only = sys.argv[7] == '1'
 host_dir = '.' + host_mode
 drift_label = 'Managed Codex drift' if host_mode == 'codex' else 'Managed Claude practice drift'
 if dry and check:
@@ -296,6 +304,9 @@ def codex_excluded(skill, relative):
 
 if selection:
     shared_skills = selection
+if policy_only:
+    # Managed policy block only: no skill file is read, compared or written.
+    shared_skills = []
 for skill in shared_skills:
     folder = root / '.claude/skills' / skill
     body = (folder / 'SKILL.md').read_text()
