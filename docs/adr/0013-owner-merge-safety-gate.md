@@ -63,6 +63,19 @@ to act on. Conversely, host authorization never excuses a REFUSE.
   independence rests on the reviewer id and the engineering-workflow rules. A marker inside a
   code fence is ignored. With 100 or more comments or reviews the gate refuses
   (`EVIDENCE_TRUNCATED`) because later records could be hidden.
+- **Two comment sources (FORNX-503).** The gate reads the PR's comments from GraphQL
+  (`gh pr view --json comments`) and from the REST issue-comments list
+  (`repos/o/r/issues/N/comments?per_page=100`, one more exact allowlisted read) and uses the
+  union. GraphQL `pullRequest.comments` was measured empty for every PR of one repository while
+  REST and the GraphQL timeline held the comments, so a single source could hide the
+  reviewer's record. Each GraphQL entry replaces its REST twin (same login, body and creation
+  time) one-to-one; identical comments inside one source stay separate. The union adds no
+  trust: only the authenticated viewer's comments count, outside code fences, bound to the
+  exact head, with PASS and `blocking=0`. If the REST list cannot be read the gate refuses
+  (`COMMENTS_UNREADABLE`) instead of trusting GraphQL alone. A count difference between the
+  sources is reported as the fact `comment_source_discrepancy`. REST carries no
+  edited/minimized flags, so a REST-only comment can never satisfy the local-first basis,
+  which needs them.
 - **Deployment.** The gate cannot detect a repository whose default branch deploys on merge
   (for example a hosting integration on `main`); it guards base-branch names only. A merge that
   triggers a deployment needs its own authorization.
