@@ -84,8 +84,9 @@ permissions:
   contents: read
 jobs:
   isolated-validation:
-    # ubuntu-latest moved to 26.04 on 2026-11-18, where visudo rejects the regex sudoers rules
-    # that tests/test-qa-hop-install.py checks (a real-sudo behaviour, not a repo change).
+    # ubuntu-latest resolves to 26.04, where tests/test-qa-hop-install.py fails with
+    # `visudo: invalid sudoers file` (cause not verified). Pinned to the last passing image;
+    # retire the pin under SPE-171 follow-up once the sudoers check is decided for 26.04.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
