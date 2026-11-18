@@ -84,7 +84,9 @@ permissions:
   contents: read
 jobs:
   isolated-validation:
-    runs-on: ubuntu-latest
+    # ubuntu-latest moved to 26.04 on 2026-11-18, where visudo rejects the regex sudoers rules
+    # that tests/test-qa-hop-install.py checks (a real-sudo behaviour, not a repo change).
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
