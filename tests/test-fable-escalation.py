@@ -436,6 +436,68 @@ class WorkflowCases(WorkflowBase):
         self.assertEqual(len([r for r in Path(self.dir, "receipts.log").read_text().splitlines() if '"offered"' in r]), 1)
         self.assertEqual(self.calls(), 0)
 
+    def test_unset_ledger_dir_defaults_to_the_home_ledger_and_a_missing_override_is_created(self):
+        # The production case: no ASK_PENDING_DIR. The offer must still reach the pending-ASK ledger (under HOME), not be skipped.
+        home = os.path.join(self.tmp.name, "home")
+        os.makedirs(home)
+        env = {k: v for k, v in os.environ.items() if k != "ASK_PENDING_DIR"}
+        env.update(HOME=home, FABLE_ESCALATION_DIR=self.dir)
+        def run(approach):
+            argv = ["attempt", "--target", "o/r#7", "--check", "AC3 lock ordering", "--session", "dev-1", "--model", "claude-opus-5-5",
+                    "--approach", approach, "--failure", "AC3 deadlock at step 4", "--question", "Which lock order removes the cycle?",
+                    "--non-sensitive"]
+            proc = subprocess.run([sys.executable, self.SCRIPT, *argv], capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return json.loads(proc.stdout)
+        run("reorder acquisition")
+        ledger = run("single global lock")["packet"]["pending_ledger_item"]
+        self.assertTrue(ledger and not str(ledger).startswith("not-recorded"), ledger)
+        self.assertTrue(os.path.isdir(os.path.join(home, ".cache", "coding-agent-environment", "asks")))
+        # An override that names a directory that does not exist yet is created, not a "No such file" failure.
+        missing = os.path.join(self.tmp.name, "fresh", "asks")
+        fe._ledger_packet({"id": "x1", "blocker": "b", "target": "o/r#7", "trigger": "t", "attempts": [], "question": "q?"},
+                          "dev-1", missing, T0)
+        self.assertTrue(os.path.isdir(missing))
+
+    def test_an_unwritable_ledger_never_makes_a_saved_answer_look_failed(self):
+        bid = self.asked()
+        blocker = os.path.join(self.tmp.name, "afile")
+        Path(blocker).write_text("x")
+        env = dict(os.environ, FABLE_ESCALATION_DIR=self.dir, ASK_PENDING_DIR=os.path.join(blocker, "under"))
+        proc = subprocess.run([sys.executable, self.SCRIPT, "answer", "--id", bid, "--decision", "approve", "--session", "dev-1",
+                               "--ref", "owner said approve in chat"], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(fe.load(self.dir, bid)["state"], fe.APPROVED)
+
+    def test_consult_refuses_cleanly_on_an_approval_without_a_timestamp(self):
+        bid = self.asked()
+        self.cli("answer", "--id", bid, "--decision", "approve", "--session", "dev-1", "--ref", "owner said approve in chat")
+        record = Path(fe._record_path(self.dir, bid))
+        data = json.loads(record.read_text())
+        del data["answered"]
+        record.write_text(json.dumps(data))
+        out = self.cli("consult", "--id", bid, "--execute", rc=2)
+        self.assertIn("unreadable", out["error"])
+        self.assertEqual(self.calls(), 0)
+
+    def test_an_uncounted_attempt_says_so(self):
+        out = self.attempt("wait for the runner", failure="CI_UNAVAILABLE_EXTERNAL billing limit")
+        self.assertEqual(out["action"], "CONTINUE")
+        self.assertIn("not counted", out["note"])
+        self.assertNotIn("note", self.attempt("reorder acquisition"))
+
+    def test_an_approval_with_a_corrupt_timestamp_continues_without_raising(self):
+        bid = self.asked()
+        self.cli("answer", "--id", bid, "--decision", "approve", "--session", "dev-1", "--ref", "owner said approve in chat")
+        record = Path(fe._record_path(self.dir, bid))
+        data = json.loads(record.read_text())
+        data["answered"] = "not-a-time"
+        record.write_text(json.dumps(data))
+        out = self.attempt("retry with backoff")
+        self.assertEqual(out["action"], "CONTINUE")
+        self.assertIn("unreadable", out["reason"])
+        self.assertEqual(self.calls(), 0)
+
     def test_same_approach_repeated_or_a_different_failure_does_not_ask(self):
         self.attempt("reorder acquisition")
         self.assertEqual(self.attempt("reorder acquisition")["action"], "CONTINUE")
