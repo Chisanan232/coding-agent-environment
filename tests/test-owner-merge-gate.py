@@ -1608,6 +1608,20 @@ class RestCommentSource(unittest.TestCase):
         with self.assertRaises(ValueError):
             omg.review_completed_at(Fake(comments=[], rest_comments="error"), "Chisanan232/r", 7, HEAD)
 
+    def test_the_review_completion_time_refuses_when_comments_may_be_truncated(self):
+        filler = [dict(self.MINE, body=f"note {i}", createdAt=f"2026-11-17T20:{i // 60:02d}:{i % 60:02d}Z") for i in range(100)]
+        with self.assertRaises(ValueError):
+            omg.review_completed_at(Fake(comments=[], rest_comments=filler), "Chisanan232/r", 7, HEAD)
+
+    def test_a_twin_mismatch_between_the_sources_never_trusts_an_edited_or_minimized_copy(self):
+        # GraphQL says minimized; the REST copy differs in createdAt, so the twin does not match and both are kept.
+        graphql = dict(self.MINE, includesCreatedEdit=False, isMinimized=True)
+        rest = dict(self.MINE, createdAt="2026-11-17T20:05:12Z")
+        merged, _, _ = omg.merged_comments(Fake(rest_comments=[rest]), "Chisanan232/r", 7, [graphql])
+        self.assertEqual(len(merged), 2)
+        trusted = [c for c in merged if c.get("includesCreatedEdit") is False and c.get("isMinimized") is False]
+        self.assertEqual(trusted, [])
+
     def test_the_rest_read_is_one_exact_allowlisted_call(self):
         omg.read_only(("api", "repos/Chisanan232/r/issues/7/comments?per_page=100", "--jq", omg.REST_COMMENTS_JQ))
         for path in ("repos/Chisanan232/r/issues/7/comments",

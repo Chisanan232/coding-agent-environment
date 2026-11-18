@@ -75,7 +75,8 @@ to act on. Conversely, host authorization never excuses a REFUSE.
   (`COMMENTS_UNREADABLE`) instead of trusting GraphQL alone. A count difference between the
   sources is reported as the fact `comment_source_discrepancy`. REST carries no
   edited/minimized flags, so a REST-only comment can never satisfy the local-first basis,
-  which needs them.
+  which needs them. The REST source therefore rescues the standard review record only; in a repository whose GraphQL
+  comments are empty, the local-first basis still reports `LOCAL_CI_MISSING`.
 - **Deployment.** The gate cannot detect a repository whose default branch deploys on merge
   (for example a hosting integration on `main`); it guards base-branch names only. A merge that
   triggers a deployment needs its own authorization.

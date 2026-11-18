@@ -1428,9 +1428,11 @@ def review_completed_at(run, repo, pr, head):
     p = _json(run, "pr", "view", str(pr), "--repo", repo, "--json", "headRefOid,comments")
     if p["headRefOid"] != head:
         raise ValueError("the PR is no longer at this head; the recorded review does not apply")
-    comments, _, comments_error = merged_comments(run, repo, pr, p.get("comments"))
+    comments, rest_n, comments_error = merged_comments(run, repo, pr, p.get("comments"))
     if comments_error:
         raise ValueError(f"the PR comments could not be read from REST: {comments_error}")
+    if (rest_n or 0) >= 100 or len(p.get("comments") or []) >= 100:
+        raise ValueError("100 or more comments; the newest record may be hidden, so no completion time is stamped")
     stamps = [c.get("createdAt") for c in comments
               if (c.get("author") or {}).get("login", "").lower() == me
               and any(m[0] == head for m in REVIEW_RE.findall(re.sub(r"```.*?```", "", c.get("body") or "", flags=re.S)))]
