@@ -1745,15 +1745,14 @@ class EmitResource(Base):
         self.assertEqual(self.rec("admission-monitor")["task"]["resume_trigger"], "owner_decision")
 
     def test_repo_label_is_never_rendered(self):
-        c = cfg(known_repos=[])
-        self.emit(self.engine(c))
-        self.assertNotIn("coding-agent-environment", self.fake.sent[0][1]["body"])
+        self.emit(self.engine(cfg(known_repos=[])))
+        self.assertEqual(self.fake.sent[0][1], {"title": "Claude Code: admission stalled", "body": "disk below floor | recovery: none tried | action: reclaim disk"})
 
-    def test_backends_off_means_no_delivery_and_still_exit_ok(self):
+    def test_backends_off_returns_no_backend(self):
         c = cfg()
         for b in c["backends"].values():
             b["enabled"] = False
-        self.assertIn(self.emit(self.engine(c)), ("queued", "deduped"))
+        self.assertEqual(self.emit(self.engine(c)), "no-backend")
         self.assertEqual(self.fake.sent, [])
 
     def test_clear_returns_to_idle_without_notifying(self):
@@ -1768,11 +1767,75 @@ class EmitResource(Base):
             self.assertEqual(self.emit(**bad), "invalid")
         self.assertFalse(self.sdir.exists())
 
-    def test_untrusted_state_is_not_acted_on(self):
+    def test_corrupt_synthetic_record_is_quarantined_and_rebuilt(self):
         self.sdir.mkdir(parents=True)
         (self.sdir / "admission-monitor.json").write_text("{")
-        self.assertEqual(self.emit(), "untrusted:corrupt")
-        self.assertEqual(self.fake.sent, [])
+        self.assertEqual(self.emit(), "queued")
+        self.assertEqual((self.sdir / "admission-monitor.json.corrupt").read_text(), "{")
+        self.assertEqual(self.rec("admission-monitor")["state"], "BLOCKED_RESOURCE")
+        (self.sdir / "admission-monitor.json").write_text("[]")
+        self.assertEqual(self.emit(cause="frozen-queue"), "queued")
+        self.assertEqual((self.sdir / "admission-monitor.json.corrupt").read_text(), "[]")
+
+    def test_real_session_records_keep_untrusted_behaviour(self):
+        self.sdir.mkdir(parents=True)
+        (self.sdir / "s1.json").write_text("{")
+        self.assertEqual(self.ev(self.engine(), "Stop"), "untrusted:corrupt")
+        self.assertEqual((self.sdir / "s1.json").read_text(), "{")
+
+    def test_recurrence_after_clear_notifies_again(self):
+        self.emit()
+        self.engine().emit_resource({}, clear=True)
+        self.fake.sent.clear()
+        self.assertEqual(self.emit(), "queued")
+        self.assertEqual(len(self.fake.sent), 3)
+
+    def test_hook_events_cannot_touch_the_reserved_session(self):
+        e = self.engine()
+        for name in ("SessionStart", "Stop", "StopFailure"):
+            self.assertEqual(self.ev(e, name, sid="admission-monitor"), "ignored")
+        self.assertFalse(self.sdir.exists())
+        self.emit()
+        before = (self.sdir / "admission-monitor.json").read_text()
+        self.assertEqual(self.ev(e, "SessionStart", sid="admission-monitor"), "ignored")
+        self.assertEqual((self.sdir / "admission-monitor.json").read_text(), before)
+
+    def test_sweep_never_stales_the_reserved_session_but_retries_delivery(self):
+        rec = sn.new_record("admission-monitor", self.t)
+        rec["state"] = "RUNNING"
+        self.sdir.mkdir(parents=True)
+        sn.save_record(self.sdir, rec)
+        self.advance(10**6)
+        self.engine().sweep()
+        self.assertEqual(self.rec("admission-monitor")["state"], "RUNNING")
+        fake = Fake(fail={"macos": "network"})
+        self.emit(self.engine(fake=fake))
+        self.assertTrue(self.rec("admission-monitor")["pending"])
+        self.advance(1000)
+        self.fake.sent.clear()
+        out = self.engine().sweep()
+        self.assertEqual(out["stale"], 0)
+        self.assertIn("macos", self.names())
+
+    def test_corporate_profile_and_session_refuse_remote_backends(self):
+        fake = Fake(fail={"macos": "network"})
+        self.emit(self.engine(fake=fake))                       # personal: queued, macos failing so the entry stays pending
+        self.assertEqual(self.rec("admission-monitor")["pending"][0]["backends"]["ntfy"]["status"], "sent")
+        for mutate in ("profile", "session"):
+            self.setUp()
+            fake = Fake(fail={"macos": "network", "ntfy": "network", "pushover": "network"})
+            self.emit(self.engine(fake=fake))
+            rec = self.rec("admission-monitor")
+            if mutate == "session":
+                rec["corporate"] = True
+                sn.save_record(self.sdir, rec)
+            self.advance(1000)
+            c = cfg(profile="corporate") if mutate == "profile" else cfg()
+            remote = Fake()
+            sn.Engine(self.sdir, c, remote.table(), clock=lambda: self.t, sleep=lambda s: None).sweep()
+            self.assertEqual({n for n, _ in remote.sent} & {"ntfy", "pushover"}, set(), mutate)
+            st = {k: v["status"] for k, v in self.rec("admission-monitor")["pending"][0]["backends"].items()} if self.rec("admission-monitor")["pending"] else {}
+            self.assertNotIn("sent", [st.get("ntfy"), st.get("pushover")], mutate)
 
     def test_cli_exit_codes_and_usage_error_writes_nothing(self):
         env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(self.sdir), SESSION_NOTIFY_CONFIG=str(self.tmp / "none.json"))
