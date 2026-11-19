@@ -187,8 +187,6 @@ def usable_entries(entries):
         if e.get('state') == 'GRANTED':
             grant = e.get('grant')
             ok = ok and isinstance(grant, dict) and safe_time(grant.get('at')) is not None and safe_time(grant.get('expires')) is not None
-        if e.get('state') == 'GRANTED' and ok and e['grant'].get('runner') is not None and not isinstance(e['grant']['runner'], dict):
-            ok = False
         if e.get('state') == 'EXPIRED' and isinstance(e.get('grant'), dict):
             ok = ok and safe_time(e['grant'].get('expires')) is not None
         if ok:
@@ -284,8 +282,8 @@ def classify(snap, limits):
         if age >= GRANTED_ALERT_S:
             found['failed-continuation'] = '%s GRANTED %d min without a claim' % (entry['id'], age // 60)
     for entry in granted:
-        runner = entry['grant'].get('runner')
-        if not runner or runner.get('protocol', 0) < snap['protocol']:
+        runner = (snap.get('stamps') or {}).get(entry['id'])      # from the granted receipt: the grant object itself carries no stamp
+        if not isinstance(runner, dict) or runner.get('protocol', 0) < snap['protocol']:
             found['outdated-caller'] = '%s was granted by a runner without protocol %d' % (entry['id'], snap['protocol'])
     # Nothing blocks the head, nothing is claimed, nothing granted is waiting to be claimed: nobody is advancing the queue.
     held_elsewhere = waiting and waiting[0]['state'] == 'ELIGIBLE' and snap.get('reservations', 0) > 0    # a lane held by a non-queue reservation
@@ -359,7 +357,7 @@ class Env:
     """Everything a tick touches outside its own state, so tests substitute it."""
 
     def __init__(self, da, state_path, memory_state_path, limits, clock=None, mono=None, boot=None, table=None, memory=None,
-                 free=None, advance=None, notify=None, clear=None, reservations=None):
+                 free=None, advance=None, notify=None, clear=None, reservations=None, stamps=None):
         self.da, self.state_path, self.memory_state_path, self.limits = da, Path(state_path), Path(memory_state_path), limits
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.mono = mono or time.monotonic
@@ -369,6 +367,7 @@ class Env:
         self.free = free or (lambda: shutil.disk_usage('/System/Volumes/Data').free)
         self.advance = advance or self._advance
         self.reservations = reservations or self._reservations
+        self.stamps = stamps or self._stamps
         self.notify = notify or session_notify
         self.clear = clear or session_clear
 
@@ -378,6 +377,26 @@ class Env:
             return sum(1 for _ in (self.state_path.parent / 'reservations').glob('*.json'))
         except OSError:
             return 0
+
+    def _stamps(self, granted):
+        """{entry id: runner stamp} for the given GRANTED entries, from the newest matching 'granted' receipt; absent means unstamped."""
+        want = {e['id']: e['grant']['at'] for e in granted}
+        found = {}
+        for name in ('receipts.jsonl.1', 'receipts.jsonl'):
+            try:
+                text = (self.state_path.parent / 'queue' / name).read_text(errors='replace')
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if '"granted"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get('event') == 'granted' and rec.get('id') in want and rec.get('ts') == want[rec['id']]:
+                    found[rec['id']] = rec.get('runner')
+        return found
 
     def _advance(self):
         """Run one `queue advance`. A slow one is left to finish on its own (never signalled); the next tick's spacing covers it."""
@@ -522,7 +541,8 @@ def _tick_locked(env, directory, act, if_due):
     if ratio is not None:
         window = (window + [[wall, ratio]])[-WINDOW_MAX:]
     snap = {'now': now, 'wall': wall, 'entries': entries, 'problems': problems, 'free_bytes': env.free(), 'mem': mem,
-            'window': window, 'claims': claims, 'protocol': env.da.RUNNER_PROTOCOL, 'reservations': env.reservations()}
+            'window': window, 'claims': claims, 'protocol': env.da.RUNNER_PROTOCOL, 'reservations': env.reservations(),
+            'stamps': env.stamps([e for e in entries if e['state'] == 'GRANTED'])}
     verdict = classify(snap, env.limits)
     waiting = verdict['waiting']
     old_grant = verdict['oldest_grant_s'] >= GRANTED_ALERT_S
