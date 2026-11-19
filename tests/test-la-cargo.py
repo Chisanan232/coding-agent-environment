@@ -100,7 +100,8 @@ class LaCargoBase(unittest.TestCase):
         self.lock = str(self.dir / 'targets/local-agent.lock')
         patches = [
             unittest.mock.patch.multiple(la, TARGET=self.target, LOCK=self.lock, LOG=str(self.dir / 'targets/local-agent.log'),
-                                         RUNNER=str(self.dir / 'runner.py'), POLL_S=0, JOBS='8'),
+                                         RUNNER=str(self.dir / 'runner.py'), POLL_S=0, JOBS='8',
+                                         RECOVERY_LIB=str(self.dir / 'absent-recovery.py')),      # the wrapper registry stays off unless a test enables it
             unittest.mock.patch.dict(os.environ, {'PATH': '%s/bin:%s' % (self.dir, os.environ['PATH']), 'FAKE_DIR': str(self.dir),
                                                   'FAKE_LOCK': self.lock, 'FAKE_CARGO_RC': '0'}),
             unittest.mock.patch.object(la, 'free_gib', lambda: self.free),
@@ -409,6 +410,119 @@ class RunnerMissing(LaCargoBase):
         self.free = 200.0
         self.assertEqual(self.run_la('build')[0], 76)
         self.assertEqual(self.lines('cargo.jsonl'), [])
+
+
+class Registry(LaCargoBase):
+    """ADR 0019: a queued la-cargo records itself for the monitor's guarded recovery; a failure to do so never fails the build."""
+
+    def setUp(self):
+        super().setUp()
+        self.registry = self.dir / 'wrappers'
+        patch_env = unittest.mock.patch.dict(os.environ, {'ADMISSION_WRAPPERS_DIR': str(self.registry)})
+        patch_env.start()
+        self.addCleanup(patch_env.stop)
+        self.seen = []
+        real_capture = la._capture
+
+        def spy(cmd, env):
+            self.seen.append({p.name: json.loads(p.read_text()) for p in self.registry.glob('q*.json')} if self.registry.exists() else {})
+            return real_capture(cmd, env)
+        patcher = unittest.mock.patch.object(la, '_capture', spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.use_lib(str(ROOT / 'scripts/admission-recovery.py'))
+
+    def use_lib(self, path, identity='python3 la-cargo'):
+        """Point la-cargo at a recovery library; this test process is not a la-cargo script, so its identity is fixed to one."""
+        real = spec_from_file_location
+
+        def fake(name, location):
+            spec = real(name, location)
+            inner = spec.loader
+
+            class Loader:
+                def create_module(self, spec):
+                    return None
+
+                def exec_module(self, module):
+                    inner.exec_module(module)
+                    module.exe_identity = lambda pid, run=None: identity
+            spec.loader = Loader()
+            return spec
+        for patcher in (unittest.mock.patch.object(la, 'RECOVERY_LIB', path), unittest.mock.patch.object(la, 'spec_from_file_location', fake)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def left(self):
+        return sorted(p.name for p in self.registry.iterdir()) if self.registry.exists() else []
+
+    def test_a_queued_build_is_recorded_while_it_waits_and_removed_after_cargo_exits(self):
+        (self.dir / 'mode').write_text('queue')
+        os.environ['FAKE_WAITS'] = '2'
+        self.assertEqual(self.run_la('build')[0], 0)
+        waiting = [snap for snap in self.seen if snap]
+        self.assertTrue(waiting, 'the record was never present during the wait')
+        record = waiting[0]['q000001.json']
+        self.assertEqual((record['qid'], record['kind'], record['pid'], record['exe_id']), ('q000001', 'la-cargo', os.getpid(), 'python3 la-cargo'))
+        self.assertEqual(set(record), set(('qid', 'pid', 'start_token', 'pgid', 'ppid', 'exe_id', 'kind', 'created')))
+        self.assertEqual(self.left(), [])
+
+    def test_the_record_is_private_and_holds_no_command_line(self):
+        (self.dir / 'mode').write_text('queue')
+        os.environ['FAKE_WAITS'] = '2'
+        seen = []
+        real = la._capture
+
+        def spy(cmd, env):
+            for p in self.registry.glob('q*.json'):
+                seen.append((oct(p.stat().st_mode & 0o777), oct(self.registry.stat().st_mode & 0o777), p.read_text()))
+            return real(cmd, env)
+        with unittest.mock.patch.object(la, '_capture', spy):
+            self.run_la('build', '--release')
+        self.assertTrue(seen)
+        for file_mode, dir_mode, text in seen:
+            self.assertEqual((file_mode, dir_mode), ('0o600', '0o700'))
+            self.assertNotIn('--release', text)
+            self.assertNotIn('build', text)
+
+    def test_a_build_admitted_at_once_registers_nothing(self):
+        self.assertEqual(self.run_la('build')[0], 0)
+        self.assertEqual((self.left(), any(self.seen)), ([], False))
+
+    def test_a_timed_out_or_refused_queue_wait_removes_the_record(self):
+        (self.dir / 'mode').write_text('refuse')
+        ticks = iter(range(0, 10 ** 6, 1000))
+        err = io.StringIO()
+        orig = la.admitted_build
+
+        def with_clock(a, env, sleep=None, clock=None):
+            return orig(a, env, sleep=lambda s: None, clock=lambda: next(ticks))
+        with unittest.mock.patch.object(la, 'QUEUE_WAIT_S', 3000), unittest.mock.patch.object(la, 'admitted_build', with_clock), \
+                unittest.mock.patch.object(sys, 'argv', ['la-cargo', 'build']), contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(la.main(), 77)
+        self.assertTrue(any(self.seen))
+        self.assertEqual(self.left(), [])
+
+    def test_a_registry_that_cannot_be_written_never_fails_the_build(self):
+        (self.dir / 'mode').write_text('queue')
+        os.environ['FAKE_WAITS'] = '1'
+        blocker = self.dir / 'blocker'
+        blocker.write_text('x')
+        with unittest.mock.patch.dict(os.environ, {'ADMISSION_WRAPPERS_DIR': str(blocker / 'wrappers')}):
+            self.assertEqual(self.run_la('build')[0], 0)
+        self.assertEqual(len(self.lines('cargo.jsonl')), 1)
+
+    def test_a_missing_or_broken_recovery_library_never_fails_the_build(self):
+        (self.dir / 'mode').write_text('queue')
+        os.environ['FAKE_WAITS'] = '1'
+        self.use_lib(str(self.dir / 'does-not-exist.py'))
+        self.assertEqual(self.run_la('build')[0], 0)
+        bad = self.dir / 'bad-recovery.py'
+        bad.write_text('raise RuntimeError("boom")\n')
+        self.use_lib(str(bad))
+        self.assertEqual(self.run_la('build')[0], 0)
+        self.assertEqual(len(self.lines('cargo.jsonl')), 2)
+        self.assertEqual(self.left(), [])
 
 
 class Signals(unittest.TestCase):

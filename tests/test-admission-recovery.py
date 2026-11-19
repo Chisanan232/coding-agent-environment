@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -690,6 +691,154 @@ class Allowlist(unittest.TestCase):
         self.path.write_text(' ' * (rec.ALLOWLIST_LIMIT + 1))
         with self.assertRaises(rec.AllowlistError):
             rec.load_terminate_allowlist(self.path)
+
+
+class Registry(unittest.TestCase):
+    """The wrapper registry (ADR 0019 section 3): closed schema, private files, nothing trusted without the live process matching."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name).resolve() / 'wrappers'
+        patcher = unittest.mock.patch.object(rec, 'exe_identity', lambda pid, run=None: 'python3 heavy-run')   # this process is not a wrapper script
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write(self, qid='q000101', **change):
+        self.assertTrue(rec.register_wrapper(self.dir, qid, 'heavy-run'))
+        path = self.dir / (qid + '.json')
+        if change:
+            doc = json.loads(path.read_text())
+            doc.update(change)
+            path.write_text(json.dumps(doc))
+        return path
+
+    def test_record_is_closed_schema_private_and_names_this_process_only(self):
+        path = self.write()
+        doc = json.loads(path.read_text())
+        self.assertEqual(set(doc), set(rec.WRAPPER_KEYS))
+        self.assertEqual((doc['pid'], doc['ppid'], doc['pgid'], doc['kind'], doc['exe_id']), (os.getpid(), os.getppid(), os.getpgid(0), 'heavy-run', 'python3 heavy-run'))
+        self.assertEqual(doc['start_token'], da.waiter_token(os.getpid()))
+        self.assertEqual((os.stat(path).st_mode & 0o777, os.stat(self.dir).st_mode & 0o777), (0o600, 0o700))
+        self.assertEqual([p.name for p in self.dir.iterdir()], ['q000101.json'])      # no temporary file left behind
+        got = rec.read_registry('q000101', self.dir, token_fn=da.waiter_token)
+        self.assertEqual((got['pid'], got['exe'], got['kind']), (os.getpid(), 'python3 heavy-run', 'heavy-run'))
+
+    def test_a_reused_pid_or_failing_token_reader_is_not_trusted(self):
+        self.write()
+        self.assertIsNone(rec.read_registry('q000101', self.dir, token_fn=lambda pid: 'another start time'))
+        self.assertIsNone(rec.read_registry('q000101', self.dir, token_fn=lambda pid: None))
+        def boom(pid):
+            raise OSError('ps failed')
+        self.assertIsNone(rec.read_registry('q000101', self.dir, token_fn=boom))
+
+    def test_off_schema_records_are_refused(self):
+        for change in ({'extra': 1}, {'pid': '12'}, {'pid': 1}, {'pid': True}, {'pgid': 0}, {'kind': 'cargo'}, {'kind': 'la-cargo'}, {'exe_id': 'python3'},
+                       {'exe_id': 'python3 heavy-run extra'}, {'exe_id': 'a b/c'}, {'start_token': ''}, {'start_token': 'x' * 65}, {'created': 'yesterday'},
+                       {'qid': 'q000102'}):
+            path = self.write(**change)
+            self.assertIsNone(rec.read_registry('q000101', self.dir), change)
+            path.unlink()
+        path = self.write()
+        doc = json.loads(path.read_text())
+        del doc['ppid']
+        path.write_text(json.dumps(doc))
+        self.assertIsNone(rec.read_registry('q000101', self.dir))
+        path.write_text('x' * (rec.WRAPPER_FILE_LIMIT + 1))
+        self.assertIsNone(rec.read_registry('q000101', self.dir))
+        path.write_text('not json')
+        self.assertIsNone(rec.read_registry('q000101', self.dir))
+        self.assertIsNone(rec.read_registry('../q000101', self.dir))
+
+    def test_symlinks_foreign_owner_and_loose_modes_are_refused(self):
+        path = self.write()
+        self.assertIsNotNone(rec.read_registry('q000101', self.dir))
+        self.assertIsNone(rec.read_registry('q000101', self.dir, uid=os.getuid() + 1))
+        os.chmod(path, 0o644)
+        self.assertIsNone(rec.read_registry('q000101', self.dir))
+        os.chmod(path, 0o600)
+        os.chmod(self.dir, 0o755)
+        self.assertIsNone(rec.read_registry('q000101', self.dir))
+        self.assertEqual(rec.list_registered(self.dir), [])
+        os.chmod(self.dir, 0o700)
+        real = path.with_name('real.json')
+        path.rename(real)
+        path.symlink_to(real)
+        self.assertIsNone(rec.read_registry('q000101', self.dir))
+        link = self.dir.parent / 'linked'
+        link.symlink_to(self.dir)
+        self.assertIsNone(rec.read_registry('q000101', link))
+        self.assertEqual(rec.list_registered(link), [])
+
+    def test_unregister_removes_only_this_process_record(self):
+        self.write()
+        other = self.write('q000102', pid=os.getpid() + 1)
+        self.assertTrue(rec.unregister_wrapper(self.dir, 'q000101'))
+        self.assertFalse((self.dir / 'q000101.json').exists())
+        self.assertFalse(rec.unregister_wrapper(self.dir, 'q000102'))
+        self.assertTrue(other.exists())
+        self.assertFalse(rec.unregister_wrapper(self.dir, 'q000103'))      # nothing there: no error
+
+    def test_a_failed_write_returns_false_and_never_raises(self):
+        blocker = Path(self.temp.name) / 'file'
+        blocker.write_text('x')
+        self.assertFalse(rec.register_wrapper(blocker / 'wrappers', 'q000101', 'heavy-run'))      # parent is a file
+        self.assertFalse(rec.register_wrapper(self.dir, 'q000101', 'sh'))
+        self.assertFalse(rec.register_wrapper(self.dir, 'bad id', 'heavy-run'))
+        self.dir.mkdir(mode=0o755)
+        self.assertFalse(rec.register_wrapper(self.dir, 'q000101', 'heavy-run'))      # a loose directory is not adopted or chmodded
+        self.assertEqual(os.stat(self.dir).st_mode & 0o777, 0o755)
+        with unittest.mock.patch.object(rec, 'exe_identity', lambda pid, run=None: None):
+            os.chmod(self.dir, 0o700)
+            self.assertFalse(rec.register_wrapper(self.dir, 'q000101', 'heavy-run'))      # unknown identity: nothing recorded
+
+    def test_list_registered_ignores_temporaries_and_foreign_names(self):
+        self.write('q000101')
+        self.write('q000102')
+        for name in ('.q000103.1.tmp', 'q000104.json.bak', 'notes.json', 'q1.json'):
+            (self.dir / name).write_text('{}')
+        self.assertEqual(rec.list_registered(self.dir), ['q000101', 'q000102'])
+        self.assertEqual(rec.list_registered(self.dir / 'absent'), [])
+
+    def test_wrappers_dir_follows_the_state_file_unless_overridden(self):
+        with unittest.mock.patch.dict(os.environ):
+            os.environ.pop('ADMISSION_WRAPPERS_DIR', None)
+            self.assertEqual(rec.wrappers_dir(Path('/x/admission/state.json')), Path('/x/admission/wrappers'))
+            os.environ['ADMISSION_WRAPPERS_DIR'] = '/elsewhere'
+            self.assertEqual(rec.wrappers_dir(Path('/x/admission/state.json')), Path('/elsewhere'))
+
+
+class ExeIdentity(unittest.TestCase):
+    def reduce(self, stdout, code=0):
+        return rec.exe_identity(1234, run=lambda *a, **k: subprocess.CompletedProcess(a, code, stdout=stdout))
+
+    def test_only_two_basenames_survive_and_the_rest_of_the_command_line_is_dropped(self):
+        got = self.reduce('/opt/homebrew/bin/python3 -u /Users/x/scripts/heavy-run --label l --token sk-SECRET-123 -- cargo test\n')
+        self.assertEqual(got, 'python3 heavy-run')
+        self.assertNotIn('SECRET', got)
+
+    def test_unknown_or_odd_shapes_are_none(self):
+        self.assertIsNone(self.reduce('', 1))
+        self.assertIsNone(self.reduce('python3\n'))
+        self.assertIsNone(self.reduce('python3 -c\n'))
+        self.assertIsNone(self.reduce('py thon3 /x/s p a c e\n'.replace('py thon3', 'p/y$y')))
+        self.assertIsNone(rec.exe_identity(1, run=lambda *a, **k: (_ for _ in ()).throw(OSError('no ps'))))
+
+    def test_it_reads_a_real_process_and_names_the_interpreter_and_script(self):
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / 'heavy-run'
+            script.write_text('import time\ntime.sleep(30)\n')
+            proc = subprocess.Popen([sys.executable, str(script), '--token', 'sk-SECRET'], stdin=subprocess.DEVNULL)
+            self.addCleanup(lambda: (proc.kill(), proc.wait()))
+            got = None
+            for _ in range(50):
+                got = rec.exe_identity(proc.pid)
+                if got and got.endswith('heavy-run'):
+                    break
+            self.assertEqual(got, '%s heavy-run' % os.path.basename(sys.executable))
+        inline = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], stdin=subprocess.DEVNULL)
+        self.addCleanup(lambda: (inline.kill(), inline.wait()))
+        self.assertIsNone(rec.exe_identity(inline.pid))      # `-c CODE` names no script: unknown, never guessed
 
 
 class Shape(unittest.TestCase):
