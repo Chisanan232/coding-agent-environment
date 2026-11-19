@@ -411,7 +411,7 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
   gate and a grant it would refuse only holds a lane for its whole window and then lapses unclaimed. The gate takes 10 s or more, so it
   runs outside the lock and only when the head otherwise fits (a lane is free, the floor holds, the budget allows); otherwise it is not
   asked. A refusal grants nothing, leaves every entry `QUEUED` in FIFO order, still expires lapsed grants and waits, and reports reason
-  `memory-gate: <first line of the gate verdict>` (counted as `ok`). The library function stays memory-free unless given `memory_fn`.
+  `memory-gate: <first line of the gate verdict> ; <its first reason line>` (capped at 400 characters) (counted as `ok`). The library function stays memory-free unless given `memory_fn`.
 - A grant is not a start. An entry is running only in state `CLAIMED` with `holder.workload.observed` true and a live workload; report
   `GRANTED` as "granted, not started" together with the claim refusal text.
 - `queue claim`: re-checks the budget under the lock; a refusal keeps the grant.
