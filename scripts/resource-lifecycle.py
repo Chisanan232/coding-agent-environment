@@ -185,31 +185,55 @@ def release_build_locks(held):
         os.close(fd)
 
 
-# rustc's incremental layout: <crate_ident>-<13 base36 chars>/ holds `s-<a>-<b>-<c>` session dirs and `s-<a>-<b>.lock` files.
+# rustc's incremental layout: <crate_ident>-<13 base36>/ holds `s-<a>-<b>-<c>` session dirs and `s-<a>-<b>.lock` files; a session
+# dir holds only the closed set of regular files below (measured over every session dir of the real shared target, SPE-176).
 INCR_CRATE_DIR = re.compile(r'[a-z0-9_]+-[0-9a-z]{13}')
 INCR_SESSION_DIR = re.compile(r's-[0-9a-z]+-[0-9a-z]+-[0-9a-z]+(-working)?')
 INCR_SESSION_LOCK = re.compile(r's-[0-9a-z]+-[0-9a-z]+\.lock')
+INCR_SESSION_FILES = frozenset(('dep-graph.bin', 'dep-graph.part.bin', 'query-cache.bin', 'work-products.bin', 'metadata.rmeta'))
+INCR_OBJECT_FILE = re.compile(r'[0-9a-z]{25}\.o')
+INCR_LOCK_MAX_BYTES = 4096
+INCR_TREE_LIMIT = 1_000_000
 
 
-def is_generated_incremental_tree(root, limit=None, seconds=None):
-    """True only when every top-level child is a rustc crate directory holding nothing but rustc session dirs and session
-    lock files. Any deviation, an unreadable directory or an exhausted budget is False, so the name markers then apply."""
-    limit = SCAN_LIMIT * 20 if limit is None else limit
-    deadline = time.monotonic() + (SCAN_SECONDS if seconds is None else seconds)
+def is_generated_incremental_tree(root, limit=INCR_TREE_LIMIT, seconds=None, clock=time.monotonic):
+    """True only when the tree is positively rustc's: every top-level child is a non-empty crate directory holding only
+    session dirs (regular files of the closed set, nothing deeper) and small regular lock files, with no link anywhere.
+    Any deviation, unreadable entry or exhausted entry or time budget is False, so the name markers then apply."""
+    deadline = clock() + (SCAN_SECONDS if seconds is None else seconds)
     count = 0
+
+    def tick():
+        nonlocal count
+        count += 1
+        return count > limit or (count % 64 == 0 and clock() > deadline)
+
+    def regular(e):
+        return e.is_file(follow_symlinks=False) and not e.is_symlink()
+
     try:
-        for crate in os.scandir(root):
-            count += 1
-            if not (INCR_CRATE_DIR.fullmatch(crate.name) and crate.is_dir(follow_symlinks=False)):
-                return False
-            for e in os.scandir(crate.path):
-                count += 1
-                if count > limit or (count % 256 == 0 and time.monotonic() > deadline):
+        with os.scandir(root) as crates:
+            for crate in crates:
+                if tick() or not (INCR_CRATE_DIR.fullmatch(crate.name) and crate.is_dir(follow_symlinks=False)):
                     return False
-                if e.is_symlink():
-                    return False
-                if not ((e.is_dir(follow_symlinks=False) and INCR_SESSION_DIR.fullmatch(e.name))
-                        or (e.is_file(follow_symlinks=False) and INCR_SESSION_LOCK.fullmatch(e.name))):
+                seen = 0
+                with os.scandir(crate.path) as entries:
+                    for e in entries:
+                        seen += 1
+                        if tick():
+                            return False
+                        if regular(e) and INCR_SESSION_LOCK.fullmatch(e.name):
+                            if e.stat(follow_symlinks=False).st_size > INCR_LOCK_MAX_BYTES:
+                                return False
+                        elif e.is_dir(follow_symlinks=False) and not e.is_symlink() and INCR_SESSION_DIR.fullmatch(e.name):
+                            with os.scandir(e.path) as files:
+                                for f in files:
+                                    if tick() or not regular(f) or not (f.name in INCR_SESSION_FILES
+                                                                        or INCR_OBJECT_FILE.fullmatch(f.name)):
+                                        return False
+                        else:
+                            return False
+                if not seen:
                     return False
     except OSError:
         return False
