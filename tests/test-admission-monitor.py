@@ -80,6 +80,13 @@ class MonitorBase(unittest.TestCase):
         self.assertTrue(out['ok'], out)
         return out['id']
 
+    def declare_waiter(self):
+        """Entries with a declared live waiter keep the full grant window; a hand-off entry's is 20 min (ADR 0019), shorter than these 45 min cases."""
+        for entry in da._queue_entries(self.state_path)[0]:
+            if entry['state'] == 'QUEUED':
+                entry['waiter'] = {'pid': os.getpid(), 'start_token': da.waiter_token(os.getpid())}
+                da._write_queue_entry(self.state_path, entry)
+
     def grant(self, memory=None, runner=True):
         out = da.queue_advance(self.state_path, lambda: 400 * GIB, now=self.clock.now, memory_fn=(lambda: (True, 'ADMIT')) if memory else None)
         if not runner:   # an outdated caller grants without the stamp: its granted receipt carries no runner
@@ -345,6 +352,7 @@ class Persistence(MonitorBase):
 
     def test_an_unclaimed_grant_is_failed_continuation_after_45_minutes(self):
         self.mem['latched'] = False
+        self.declare_waiter()
         self.grant(memory=True)
         self.clock.advance(46 * 60)
         entries = da._queue_entries(self.state_path)[0]
@@ -516,6 +524,7 @@ class ReviewFindings(MonitorBase):
                 entry['state'] = 'CANCELLED'
                 da._write_queue_entry(self.state_path, entry)
         self.enqueue('HORO-3004')
+        self.declare_waiter()
         self.grant(memory=True)
         for entry in da._queue_entries(self.state_path)[0]:
             if entry['state'] == 'QUEUED':
