@@ -76,7 +76,13 @@ Reliability: state is persisted as `sending` before a transport runs; failures r
 - `--owner-action`: `reclaim-disk reduce-load approve-memory-policy wait-or-approve-memory-policy confirm-claim-ended restart-waiting-session restart-outdated-caller inspect-admission-state inspect-running-workload run-queue-advance inspect-memory-admission`
 - `--signature`: optional 16 lowercase hex characters, used only for dedup, never rendered.
 
-The text is built only from the fixed phrase of each enum (`disk below floor | recovery: none tried | action: reclaim disk`); no id, number, path or free text can reach a backend. Dedup key is cause + signature inside the usual 24 h window: a replay produces no second banner and no second queue entry, a different cause or signature notifies again. `emit-resource --clear` returns the record to `IDLE` without notifying. Exit codes: 0 queued, deduped or cleared (also when every backend is off); 2 invalid enum or signature (nothing written); 1 busy lock or untrusted state record.
+The text is built only from the fixed phrase of each enum (`disk below floor | recovery: none tried | action: reclaim disk`); no id, number, path or free text can reach a backend. Dedup key is cause + signature inside the usual 24 h window: a replay produces no second banner and no second queue entry, a different cause or signature notifies again. `emit-resource --clear` returns the record to `IDLE` without notifying. `--clear` also forgets the session's dedup tombstones and its finished queue entries, so dedup suppresses only a continuous stall: a recurrence after a clear notifies again.
+
+Exit codes: 0 for `queued`, `deduped`, `cleared` or `no-backend`; 2 invalid enum or signature (nothing written); 1 busy lock. Exit 0 does **not** mean a banner was shown: `no-backend` (every backend disabled) records state only, and the monitor's own status.json is then the record. Tombstones are also written after a delivery whose backends all ended `dropped` (retries exhausted) or `skipped`, so such a notice is not re-sent either. The queue holds 20 entries (`PENDING_CAP`); beyond that the oldest entry gets a terminal `dropped` outcome and is counted, as for any session.
+
+The `--signature` must stay stable for the life of one incident and must never be derived from measured data (free bytes, counts, timestamps), or every sample would notify again.
+
+The id `admission-monitor` is reserved: hook events carrying it are ignored (no write), and `sweep` never marks it stale or removes it, though it still retries its deliveries. If its state record is corrupt or untrusted it is renamed to `admission-monitor.json.corrupt` (one kept) and rebuilt, so alerting cannot fail forever; real session records keep the untrusted behaviour. Remote backends are refused for it under the corporate profile or a corporate session, checked at delivery like any other record.
 
 ## Crash and silence handling
 
