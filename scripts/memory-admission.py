@@ -47,7 +47,7 @@ EXIT_SAMPLES = 3          # consecutive good checks needed to leave a heavy refu
 # P2: a latch whose only failing EXIT predicate is a compressor below ENTER (compressed pages are a stock nothing evicts at pressure
 # level 1) is released after P2_SAMPLES good checks P2_SPACING s apart with normal pressure, swap I/O <= P2_SWAP_IO and a compressor that
 # did not rise over the run. Neither changes a threshold value; the second lane's bounds (exit_ok, concurrent_lane_reasons) are unchanged.
-LATCH_ONLY_ON_MEMORY_REASONS = True
+LATCH_ONLY_ON_MEMORY_REASONS = False   # P1 ships off: it reverses a pinned cap-one behaviour (hysteresis after a tree ends); enable on its own decision
 CONSERVATIVE_RECOVERY = True
 P2_SAMPLES, P2_SPACING, P2_SWAP_IO, P2_RISE, P2_STALE = 10, 60, 1.0, 0.005, 5
 MIN_SPACING = 30          # seconds between checks that count toward EXIT_SAMPLES
@@ -530,9 +530,12 @@ def _p2_clean(st, now):
     last = st.get("p2_last", 0.0)
     if not isinstance(last, (int, float)) or isinstance(last, bool) or not math.isfinite(last) or last > now:
         st["p2_hist"], last = [], 0.0
+    first = st.get("p2_first", last)
+    if not isinstance(first, (int, float)) or isinstance(first, bool) or not math.isfinite(first) or first > last:
+        st["p2_hist"], first = [], last      # a run without a believable start cannot count as dwell
     elif st["p2_hist"] and now - last > P2_STALE * P2_SPACING:
         st["p2_hist"] = []      # ten snapshots days apart are not ten minutes of calm
-    st["p2_last"] = float(last)
+    st["p2_last"], st["p2_first"] = float(last), float(first)
 
 
 def decide(weight, m, state, now):
@@ -568,7 +571,7 @@ def decide(weight, m, state, now):
         reasons = reasons + [f"{u}: heavy work fails closed" for u in unknown]
     lane = [r for r in reasons if LATCH_ONLY_ON_MEMORY_REASONS and is_lane_reason(r)]
     if [r for r in reasons if r not in lane]:
-        st.update(latched=True, ok_streak=0, p2_hist=[], p2_last=0.0)
+        st.update(latched=True, ok_streak=0, p2_hist=[], p2_last=0.0, p2_first=0.0)
     elif st["latched"]:
         _p2_clean(st, now)
         if exit_ok(m):
@@ -582,10 +585,13 @@ def decide(weight, m, state, now):
             st["ok_streak"] = 0
             if CONSERVATIVE_RECOVERY and conservative_ok(m):      # false whenever a lane reason exists (refusal_reasons is then non-empty)
                 if not st["p2_hist"] or now - st["p2_last"] >= P2_SPACING:
+                    if not st["p2_hist"]:
+                        st["p2_first"] = now
                     st["p2_hist"] = (st["p2_hist"] + [float(m["compressor_ratio"])])[-P2_SAMPLES:]
                     st["p2_last"] = now
-                if len(st["p2_hist"]) >= P2_SAMPLES and max(st["p2_hist"]) - min(st["p2_hist"]) <= P2_RISE:
-                    st.update(latched=False, ok_streak=0, p2_hist=[], p2_last=0.0)
+                dwell = st["p2_last"] - st["p2_first"]    # real elapsed calm, from recorded times, not from the stored list
+                if len(st["p2_hist"]) >= P2_SAMPLES and dwell >= (P2_SAMPLES - 1) * P2_SPACING and max(st["p2_hist"]) - min(st["p2_hist"]) <= P2_RISE:
+                    st.update(latched=False, ok_streak=0, p2_hist=[], p2_last=0.0, p2_first=0.0)
             else:
                 st["p2_hist"] = []
         if st["latched"]:
@@ -659,7 +665,7 @@ def save_state(path, state):
     fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".state-")
     try:
         with os.fdopen(fd, "w") as fh:
-            json.dump({k: state[k] for k in ("latched", "ok_streak", "last_ok", "levels", "p2_hist", "p2_last") if k in state}, fh)
+            json.dump({k: state[k] for k in ("latched", "ok_streak", "last_ok", "levels", "p2_hist", "p2_last", "p2_first") if k in state}, fh)
         os.chmod(tmp, 0o600)
         os.replace(tmp, p)
     except OSError:
