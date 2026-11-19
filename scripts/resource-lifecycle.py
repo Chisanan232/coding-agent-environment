@@ -185,6 +185,37 @@ def release_build_locks(held):
         os.close(fd)
 
 
+# rustc's incremental layout: <crate_ident>-<13 base36 chars>/ holds `s-<a>-<b>-<c>` session dirs and `s-<a>-<b>.lock` files.
+INCR_CRATE_DIR = re.compile(r'[a-z0-9_]+-[0-9a-z]{13}')
+INCR_SESSION_DIR = re.compile(r's-[0-9a-z]+-[0-9a-z]+-[0-9a-z]+(-working)?')
+INCR_SESSION_LOCK = re.compile(r's-[0-9a-z]+-[0-9a-z]+\.lock')
+
+
+def is_generated_incremental_tree(root, limit=None, seconds=None):
+    """True only when every top-level child is a rustc crate directory holding nothing but rustc session dirs and session
+    lock files. Any deviation, an unreadable directory or an exhausted budget is False, so the name markers then apply."""
+    limit = SCAN_LIMIT * 20 if limit is None else limit
+    deadline = time.monotonic() + (SCAN_SECONDS if seconds is None else seconds)
+    count = 0
+    try:
+        for crate in os.scandir(root):
+            count += 1
+            if not (INCR_CRATE_DIR.fullmatch(crate.name) and crate.is_dir(follow_symlinks=False)):
+                return False
+            for e in os.scandir(crate.path):
+                count += 1
+                if count > limit or (count % 256 == 0 and time.monotonic() > deadline):
+                    return False
+                if e.is_symlink():
+                    return False
+                if not ((e.is_dir(follow_symlinks=False) and INCR_SESSION_DIR.fullmatch(e.name))
+                        or (e.is_file(follow_symlinks=False) and INCR_SESSION_LOCK.fullmatch(e.name))):
+                    return False
+    except OSError:
+        return False
+    return True
+
+
 def incremental_blockers(root):
     """Reasons a `<target>/<profile>/incremental` directory is not safe to remove now (empty when it is)."""
     profile = os.path.dirname(root)
@@ -455,6 +486,10 @@ def measure(path, kind, ctx):
         # rustc writes only generated session files here; a marker scan of millions of them would never finish and would
         # fail the resource closed. The top level is still checked, and `safe_remove` never follows a link.
         markers, complete = scan_markers(path, False, max_depth=0)
+        # Crate names such as `agent_id_bound_to_token_test-<hash>` are compiler-generated, not secrets (SPE-176). Only a
+        # positively verified rustc layout drops the two name markers; every other marker still stands.
+        if complete and is_generated_incremental_tree(path):
+            markers -= {'credential-name', 'evidence-name'}
     elif kind == 'worktree':
         # Ignored local files (.env.local, a sqlite database) are invisible to `git status`: scan deep, skipping the
         # reproducible dependency and build trees.
