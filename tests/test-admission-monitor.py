@@ -633,7 +633,27 @@ class SafetyShape(unittest.TestCase):
         text = mon.plist(Path('/x/scripts/admission-monitor.py'))
         self.assertIn('com.coding-agent-environment.admission-monitor', text)
         self.assertIn('<integer>60</integer>', text)
-        self.assertNotIn('KeepAlive', text)
+        self.assertIn('<string>--act</string>', text)
+        self.assertNotIn('<string>--act</string>', mon.plist(Path('/x/scripts/admission-monitor.py'), act=False))
+        for needle in ('KeepAlive', 'sudo', 'LaunchDaemons', 'UserName', 'launchctl'):
+            self.assertNotIn(needle, text)
+        import plistlib
+        data = plistlib.loads(text.encode())
+        self.assertEqual(data['ProgramArguments'][:2], ['/usr/bin/python3', '/x/scripts/admission-monitor.py'])
+        self.assertEqual((data['StartInterval'], data['StandardOutPath']), (60, '/dev/null'))
+
+    def test_the_plist_command_demands_an_existing_checkout_and_prints_without_installing(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / 'scripts').mkdir()
+            (Path(root) / 'scripts/admission-monitor.py').write_text('x')
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(mon.main(['plist', '--checkout', root, '--observe-only']), 0)
+            self.assertIn(str(Path(root).resolve() / 'scripts/admission-monitor.py'), buf.getvalue())
+            self.assertNotIn('--act', buf.getvalue())
+            self.assertEqual(mon.main(['plist', '--checkout', root + '/missing']), 2)
 
 
 class IncidentReplay(MonitorBase):
