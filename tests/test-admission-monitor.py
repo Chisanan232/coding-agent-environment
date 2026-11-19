@@ -60,6 +60,7 @@ class MonitorBase(unittest.TestCase):
         self.table = {}
         self.advances = []
         self.alerts = []
+        self.cleared = []
         self.old_env = os.environ.pop('ADMISSION_MONITOR_DIR', None)
         self.addCleanup(lambda: os.environ.__setitem__('ADMISSION_MONITOR_DIR', self.old_env) if self.old_env else None)
         self.statuses = {}
@@ -70,7 +71,8 @@ class MonitorBase(unittest.TestCase):
         limits = mon.default_limits(da, ma)
         return mon.Env(self.shim, self.state_path, self.memory_state, limits, clock=self.clock, mono=lambda: self.clock.mono,
                        boot=lambda: self.boot, table=lambda: self.table, memory=lambda: dict(self.mem), free=lambda: self.free,
-                       advance=lambda: self.advances.append(self.clock.now) or {'exit': 0}, notify=lambda a: self.alerts.append(a) or True)
+                       advance=lambda: self.advances.append(self.clock.now) or {'exit': 0}, notify=lambda a: self.alerts.append(a) or True,
+                       clear=lambda: self.cleared.append(self.clock.now) or True)
 
     def enqueue(self, ticket, nbytes=16 * GIB, session='0b1d2e3f-aaaa-bbbb-cccc-1234567890ab'):
         out = da.queue_enqueue(self.state_path, label='job-' + ticket.lower(), tickets=[ticket], repo='horonom/x', worktree=str(self.worktree),
@@ -573,6 +575,15 @@ class Notifier(unittest.TestCase):
             raise OSError('no python')
         self.assertFalse(mon.session_notify(self.alert(), runner=boom))
 
+    def test_the_clear_request_is_the_plain_clear_flag(self):
+        seen = []
+
+        def runner(argv, **kw):
+            seen.append(argv)
+            return types.SimpleNamespace(returncode=0)
+        self.assertTrue(mon.session_clear(runner=runner))
+        self.assertEqual(seen[0][2:], ['emit-resource', '--clear'])
+
     def test_every_monitor_cause_and_action_is_a_known_session_notify_phrase(self):
         sn = load('session-notify')
         for cause in mon.CAUSES:
@@ -580,6 +591,84 @@ class Notifier(unittest.TestCase):
                 self.assertIn(cause, sn.CAUSE_TEXT, cause)
         for action in set(mon.OWNER_ACTION.values()):
             self.assertIn(action, sn.OWNER_ACTION_TEXT, action)
+
+
+class FinalReviewFindings(MonitorBase):
+    def setUp(self):
+        super().setUp()
+        self.mem['latched'] = False
+
+    def test_thousands_of_terminal_entries_do_not_grow_or_blind_the_state(self):
+        for i in range(60):
+            self.enqueue('HORO-%d' % (4000 + i))
+        for entry in da._queue_entries(self.state_path)[0]:
+            entry['state'] = 'CANCELLED'
+            da._write_queue_entry(self.state_path, entry)
+        self.enqueue('HORO-4999')
+        self.enqueue('HORO-4998')
+        out = None
+        for _ in range(8):
+            out = self.tick()
+        state_file = mon.monitor_dir(self.state_path) / 'state.json'
+        state = json.loads(state_file.read_text())
+        self.assertEqual(sorted(state['states']), ['q000061', 'q000062'])
+        self.assertFalse(out['observation_gap'])
+        self.assertLess(state_file.stat().st_size, 4096)
+
+    def test_a_state_file_over_the_read_cap_is_not_produced_by_normal_use(self):
+        self.enqueue('HORO-4001')
+        self.run_ticks(5)
+        self.assertLess((mon.monitor_dir(self.state_path) / 'state.json').stat().st_size, mon.STATE_LIMIT // 4)
+
+    def test_recurrence_is_announced_again_after_the_blockage_clears(self):
+        self.enqueue('HORO-4001')
+        self.enqueue('HORO-4002')
+        self.mem['metrics'] = dict(CALM, pressure_level=2)
+        self.run_ticks(40)
+        self.assertEqual(len(self.alerts), 1)
+        self.mem['metrics'] = dict(CALM)
+        for entry in da._queue_entries(self.state_path)[0]:
+            entry['state'] = 'CANCELLED'
+            da._write_queue_entry(self.state_path, entry)
+        out = self.tick()
+        self.assertTrue(out.get('cleared'))
+        self.assertEqual(len(self.cleared), 1)
+        self.tick()
+        self.assertEqual(len(self.cleared), 1)       # cleared once per incident
+        self.enqueue('HORO-4003')
+        self.enqueue('HORO-4004')
+        self.mem['metrics'] = dict(CALM, pressure_level=2)
+        self.run_ticks(40)
+        self.assertEqual(len(self.alerts), 2)        # same cause, new incident, announced again
+
+    def test_an_eligible_head_is_busy_not_frozen(self):
+        self.enqueue('HORO-4001')
+        for entry in da._queue_entries(self.state_path)[0]:
+            entry['state'] = 'ELIGIBLE'
+            da._write_queue_entry(self.state_path, entry)
+        out = self.run_ticks(5)
+        self.assertEqual(out['primary'], 'healthy-busy')
+
+    def test_a_non_dict_runner_stamp_is_reported_not_a_traceback(self):
+        self.enqueue('HORO-4001')
+        self.enqueue('HORO-4002')
+        self.grant(memory=True)
+        for entry in da._queue_entries(self.state_path)[0]:
+            if entry['state'] == 'GRANTED':
+                entry['grant']['runner'] = 'old'
+                da._write_queue_entry(self.state_path, entry)
+        out = self.tick()
+        self.assertIn('state-unreadable', out['causes'])
+        self.assertIn('unusable', out['causes']['state-unreadable'])
+
+    def test_receipts_rotate_instead_of_stopping(self):
+        self.enqueue('HORO-4001')
+        directory = mon.monitor_dir(self.state_path)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / 'receipts.jsonl').write_text('x' * (1 << 20))
+        self.tick()
+        self.assertTrue((directory / 'receipts.jsonl.1').exists())
+        self.assertLess((directory / 'receipts.jsonl').stat().st_size, 4096)
 
 
 class Inventory(unittest.TestCase):
