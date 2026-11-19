@@ -170,7 +170,7 @@ def _queued_build(declare, job, proof, session, env, sleep, clock) -> int:
     ticket = re.sub(r"[^A-Za-z0-9._-]", "", os.environ.get("CLAUDE_CURRENT_TICKET", "")).lstrip("._-")[:32] or "local-agent"
     harness = os.environ.get("LA_CARGO_HARNESS", "claude")
     rc, out = _capture(runner_cmd("queue", "enqueue", *declare, "--ticket", ticket, "--repo", "local-agent", "--worktree",
-                                  os.getcwd(), "--harness", harness, "--session-id", session, "--again",
+                                  os.getcwd(), "--harness", harness, "--session-id", session, "--again", "--waiter-pid", str(os.getpid()),
                                   "--wait-s", str(QUEUE_WAIT_S), "--", *job), env)
     queued = _json(out)
     if rc != 0 or not queued.get("ok") or not queued.get("id"):
