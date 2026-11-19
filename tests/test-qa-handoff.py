@@ -1025,7 +1025,10 @@ class ReviewFollowUpTests(Base):
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             run_dir = self.prepare()
             proc = subprocess.Popen([sys.executable, str(SCRIPT), "run", "--run-dir", str(run_dir), "--codex-bin", str(self.fake),
-                                     "--admission-cmd", shlex.join(self.ADMIT), "--settle", "8"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                     "--admission-cmd", shlex.join(self.ADMIT), "--settle", "8"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    # a test run launched under nohup or from a background job inherits SIGHUP as ignored, which the wrapper
+                                    # rightly respects; this test exercises its handler, so it starts the child with the default disposition
+                                    preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_DFL))
             self.addCleanup(lambda p=proc: p.poll() is None and p.kill())
             deadline = time.time() + 40
             while time.time() < deadline and not (run_dir / "verdict.json").exists():
