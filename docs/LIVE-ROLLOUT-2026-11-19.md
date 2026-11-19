@@ -26,7 +26,7 @@ The caveman fix is a narrowing: the only Haiku route left is the admitted, id-pi
 | Sonnet main | every run's `modelUsage` shows `claude-sonnet-5-5` |
 | `haiku-worker` | forced diagnostic arm: `modelUsage` `claude-sonnet-5-5` plus `claude-haiku-5-5` ($0.0084), six tests passed |
 | `opus-architect` | forced arm: `claude-opus-5-5` ($0.97) plus Sonnet |
-| Natural delegation | not observed: with the admission policy in the prompt Sonnet implemented the one-function task itself (policy allows that), and designed a queue change itself instead of calling `opus-architect`. This is not a failure of either route and not manufactured; it adds one more not-delegated sample to the pilot's 0 of 6 |
+| Natural delegation | not observed: with the admission policy in the prompt Sonnet implemented the one-function task itself (policy allows that), and designed a queue change itself instead of calling `opus-architect`. This is not a failure of either route and not manufactured; it adds two not-delegated runs (one per task) to the pilot's 0 of 6; they are not independent trials and are not pooled into that count |
 | Opus advisor | `advisorModel: opus` is set in settings; it was not exercised in these headless runs, so its routing is NOT_VERIFIED here |
 
 ## Real-route Fable consult (functional verification, not effectiveness)
