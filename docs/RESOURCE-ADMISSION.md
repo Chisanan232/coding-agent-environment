@@ -522,3 +522,30 @@ stalled and why. It is observe-only unless started with `--act`, which allows on
 resets the latch, changes a threshold or deletes. `status` shows the last result, `callers` lists admission runners found on disk by
 protocol, and `plist` prints the launchd agent without installing it; installing it (`launchctl bootstrap gui/$(id -u) <plist>`) is an
 owner-run step. A grant is not a start: only a claim, a release or CPU growth of a claimed workload counts as progress.
+
+## Guarded recovery library (not wired)
+
+`scripts/admission-recovery.py` (SPE-176 slice 1b, ADR 0019 sections 3, 5 and 6) is a self-contained library that nothing imports or calls: no
+CLI, no monitor tick, no hook. It exists so the monitor slice can act only through audited, conclusive-evidence guards.
+
+- `abandoned_unstarted` / `do_cancel`: a GRANTED entry with no holder, release or workload, whose waiter is provably gone (the scheduler's own
+  `_waiter_gone`; uninspectable or malformed is not gone) or absent, whose owner mechanism is `gone` or `refused-permanently`, older than the 5 min
+  notice threshold, and that a fresh re-read still agrees with, is cancelled through `queue cancel --id` only (no session id, no end
+  confirmation, no state-file edit). `refused-permanently` also needs the newest scheduler receipt for the entry to be a `claim-refused` of a permanent
+  kind made after the grant; a later receipt of any kind, or a transient kind (`memory-gate`, `floor`, `lane`, `budget`, `other`), voids it. An
+  `unknown` owner never cancels. `verify_recovery` then reports `pending`, `verified` or `failed` from scheduler status; it never assumes success.
+- `obsolete_wrapper` / `terminate_wrapper`: a wrapper or waiter (real int pid above 1, not this process or its parent) whose entry is terminal
+  or gone, with matching pid, start token, uid, process group and parent, a matching executable identity, no workload by evidence and no child or
+  detached workload, gets exactly one SIGTERM, a bounded wait, and a `failed-to-terminate` report on survival. Never SIGKILL, never a workload.
+  A terminal entry only proves the queue no longer needs the pid, so identity is checked too: a wrapper that exec'd the workload keeps its pid and token.
+- Registry contract: `registered_fn(qid)` returns `{pid, start_token, pgid, ppid, exe}` recorded by the wrapper at enqueue, where `exe` is the
+  interpreter plus script identity of heavy-run or la-cargo. `exe_fn(pid)` returns the live identity and `holds_workload_fn(pid)` whether the
+  process holds a cargo/target lock; both default to unknown, and unknown refuses. `heavy-run` and `la-cargo` do not yet record any of this, so the
+  library stays inert until a wiring slice supplies the registry, `owner_exec_fn`, `exe_fn` and `holds_workload_fn`.
+- One exclusive flock (`recovery.lock` in the monitor dir, which must be a private 0700 real directory owned by us) serialises recoveries and the
+  verify receipt write; the second recovery gets `busy`. Every decision and action is a closed-schema 0600 line in `recovery-receipts.jsonl`,
+  rotated at 1 MiB.
+- `load_terminate_allowlist` / `terminate_allowed_for_workload` prepare a broader, closed-schema termination policy. The file is absent by
+  default, the policy is disabled, and neither function is used by the code above. Enabling it needs separate owner approval.
+
+Default wiring (`default_env`) leaves the owner-execution and wrapper-registry readers uninspectable, so by default nothing is abandoned or obsolete.
