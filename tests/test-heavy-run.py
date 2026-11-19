@@ -154,6 +154,9 @@ class Wrapper(unittest.TestCase):
             self.assertEqual(argv[argv.index('--class') + 1], 'build-workspace')
             self.assertEqual(argv[argv.index('--bytes') + 1], str(40 * GIB))
         self.assertEqual(enqueue[enqueue.index('--') + 1:], claim[claim.index('--') + 1:])
+        waiter = enqueue[enqueue.index('--waiter-pid') + 1]       # SPE-176: the supervising wrapper, so a dead one frees its place
+        self.assertTrue(waiter.isdigit() and int(waiter) > 0, waiter)
+        self.assertNotIn('--waiter-pid', claim)
         self.assertGreaterEqual(len(self.argvs('queue', 'advance')), 3)   # it waited through QUEUED polls
         starts = [c for c in self.calls() if c.get('event') == 'job-start']
         self.assertEqual([s['claim'] for s in starts], [True])     # started once, and only as the claim: never as the direct attempt

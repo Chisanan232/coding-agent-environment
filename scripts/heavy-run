@@ -119,7 +119,7 @@ def admitted(args, env, sleep=time.sleep, clock=time.monotonic):
 def _queued(args, declare, run_extra, job, proof, session, env, sleep, clock):
     ticket = re.sub(r"[^A-Za-z0-9._-]", "", args.ticket).lstrip("._-")[:32] or "heavy-run"
     rc, out = _capture(runner_cmd("queue", "enqueue", *declare, "--ticket", ticket, "--repo", args.repo, "--worktree", os.getcwd(),
-                                  "--harness", args.harness, "--session-id", session, "--again", "--wait-s",
+                                  "--harness", args.harness, "--session-id", session, "--again", "--waiter-pid", str(os.getpid()), "--wait-s",
                                   str(max(args.max_wait_s, 60)), "--", *job), env)
     queued = _json(out)
     if rc != 0 or not queued.get("ok") or not queued.get("id"):
