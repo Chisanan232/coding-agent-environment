@@ -12,13 +12,14 @@ explicit authorization: a LaunchAgent created from an agent session was classifi
 | Label | `com.coding-agent-environment.admission-monitor` |
 | Program | `/usr/bin/python3 <CHECKOUT>/scripts/admission-monitor.py tick --act --if-due` (Python 3.9 verified), where `<CHECKOUT>` is the canonical checkout `~/Bryant-Developments/coding-agent-environment-main-view`, fast-forward only |
 | Schedule | every 60 s (`StartInterval`) and once at load; `ThrottleInterval` 30; no `KeepAlive`, so it never restarts in a loop |
-| Priority | `ProcessType Background`, `Nice 10`, `LowPriorityIO`; one tick takes about 12 s (the memory window) and holds a non-blocking lock, so a slow tick makes the next one exit at once |
+| Priority | `ProcessType Background`, `Nice 10`, `LowPriorityIO`; one tick takes about the 10 s memory sampling window plus a short `ps`/queue read (not measured end to end) and holds a non-blocking lock, so a slow tick makes the next one exit at once |
 | Environment | `PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin`; no secrets, no credentials |
-| Writes | only `~/.cache/coding-agent-environment/admission-monitor/` (0700: `state.json`, `status.json`, `receipts.jsonl` rotated at 1 MiB, `monitor.lock`) and, through its one recovery verb, what `disk-admission.py queue advance` already writes |
+| Writes | only `~/.cache/coding-agent-environment/admission-monitor/` (0700: `state.json`, `status.json`, `receipts.jsonl` rotated to `.1` at 1 MiB, `monitor.lock`) and, through its one recovery verb, what `disk-admission.py queue advance` already writes |
 | Logs | launchd stdout and stderr go to `/dev/null`; the durable record is `status.json` and `receipts.jsonl` (`admission-monitor.py status`) |
+| Alerts | through `session-notify.py emit-resource` (enum phrases only). With every session-notify backend off it is recorded and no banner shows, and the monitor still labels it delivered; `status.json` holds the same facts. When the blockage ends the monitor sends `emit-resource --clear` once so a recurrence is announced again |
 | Reads | the queue entry files, the memory latch file, `ps -axo pid=,ppid=,time=` (never command lines), free space on the data volume |
 | Recovery verb | `disk-admission.py queue advance` from the canonical checkout, only with `--act`, after the same cause held for two checks at least 30 s apart, never for disk floor, memory pressure or unreadable state, at most one per 120 s and five per rolling 30 minutes |
-| Never | signal or kill a process, run `launchctl`, reset the latch, change a threshold, delete anything, cancel or release another owner's entry |
+| Never | signal or kill a process, run `launchctl`, reset the latch, change a threshold, delete anything, or cancel or release an entry itself. `queue advance`, which any caller runs, may release a claim whose holder provably exited and cancel an unclaimed entry whose declared waiter provably exited; never on doubt |
 
 Prerequisite: the canonical checkout contains the merged monitor (and the merged `session-notify emit-resource` if you want the alert
 recorded through session-notify). Verify before installing:
