@@ -541,6 +541,47 @@ class ReviewFindings(MonitorBase):
         self.assertEqual([k for k in state['alerts'] if k.startswith('memory-pressure')], [])
 
 
+class Notifier(unittest.TestCase):
+    def alert(self, **kw):
+        return dict({'cause': 'memory-hysteresis-static-compressor', 'signature': 'abcdef0123456789', 'owner_action': 'approve-memory-policy',
+                     'recovery': [{'advance': 'ran', 'exit': 0}]}, **kw)
+
+    def run_with(self, alert, code=0):
+        seen = []
+
+        def runner(argv, **kw):
+            seen.append(argv)
+            return types.SimpleNamespace(returncode=code)
+        return mon.session_notify(alert, runner=runner), seen[0] if seen else None
+
+    def test_the_request_is_enum_flags_only(self):
+        ok, argv = self.run_with(self.alert())
+        self.assertTrue(ok)
+        self.assertEqual(argv[2:], ['emit-resource', '--cause', 'memory-hysteresis-static-compressor', '--recovery', 'advance-tried',
+                                    '--owner-action', 'approve-memory-policy', '--signature', 'abcdef0123456789'])
+
+    def test_recovery_phrases(self):
+        self.assertEqual(mon.recovery_phrase([], False), 'none')
+        self.assertEqual(mon.recovery_phrase([{'advance': 'would-run'}], False), 'observe-only')
+        self.assertEqual(mon.recovery_phrase([{'advance': 'recovery-exhausted'}], True), 'recovery-exhausted')
+
+    def test_a_refused_request_is_not_delivered(self):
+        self.assertFalse(self.run_with(self.alert(), code=2)[0])
+
+    def test_a_missing_runner_is_not_delivered(self):
+        def boom(argv, **kw):
+            raise OSError('no python')
+        self.assertFalse(mon.session_notify(self.alert(), runner=boom))
+
+    def test_every_monitor_cause_and_action_is_a_known_session_notify_phrase(self):
+        sn = load('session-notify')
+        for cause in mon.CAUSES:
+            if cause not in ('healthy-busy', 'unknown'):
+                self.assertIn(cause, sn.CAUSE_TEXT, cause)
+        for action in set(mon.OWNER_ACTION.values()):
+            self.assertIn(action, sn.OWNER_ACTION_TEXT, action)
+
+
 class Inventory(unittest.TestCase):
     def test_callers_are_classified_from_text_without_running_them(self):
         with tempfile.TemporaryDirectory() as root:
