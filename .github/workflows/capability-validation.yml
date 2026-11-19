@@ -131,6 +131,7 @@ jobs:
           python3 tests/test-admission-queue.py
           python3 tests/test-admission-monitor.py
           python3 tests/test-admission-recovery.py
+          python3 tests/test-admission-recovery-acceptance.py
           python3 tests/test-disk-admission.py
           python3 tests/test-admission-measurements.py
           python3 tests/test-trial-report.py
