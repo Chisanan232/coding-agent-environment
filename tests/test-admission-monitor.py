@@ -4,7 +4,9 @@ from datetime import datetime, timedelta, timezone
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import ast
+import contextlib
 import fcntl
+import io
 import json
 import os
 import sys
@@ -62,7 +64,25 @@ class MonitorBase(unittest.TestCase):
         self.alerts = []
         self.cleared = []
         self.old_env = os.environ.pop('ADMISSION_MONITOR_DIR', None)
-        self.addCleanup(lambda: os.environ.__setitem__('ADMISSION_MONITOR_DIR', self.old_env) if self.old_env else None)
+        self.sn_dir = root / 'session-status'      # no test may reach the owner's real notification state or config
+        self.sn_env = {'SESSION_NOTIFY_STATE_DIR': str(self.sn_dir), 'SESSION_NOTIFY_CONFIG': str(root / 'session-notify.json')}
+        saved = {k: os.environ.get(k) for k in self.sn_env}
+        os.environ.update(self.sn_env)
+        self.addCleanup(lambda: [os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v) for k, v in saved.items()])
+        self.emit_result = {'result': 'queued', 'delivery': 'sent'}
+        self.addCleanup(lambda: os.environ.pop('ADMISSION_MONITOR_DIR', None) if self.old_env is None else os.environ.__setitem__('ADMISSION_MONITOR_DIR', self.old_env))
+        self.spawned = []
+        real_subprocess = mon.subprocess
+
+        class NoSpawn:      # a test that reaches a real child process (notifier, advance, ps) fails loudly instead of touching the machine
+            def __getattr__(inner, name):
+                if name in ('run', 'Popen'):
+                    self.spawned.append(name)
+                    raise AssertionError('test spawned a real process via subprocess.%s' % name)
+                return getattr(real_subprocess, name)
+        mon.subprocess = NoSpawn()
+        self.addCleanup(lambda: setattr(mon, 'subprocess', real_subprocess))
+        self.addCleanup(lambda: self.assertEqual(self.spawned, []))
         self.statuses = {}
         self.shim = types.SimpleNamespace(**{k: getattr(da, k) for k in dir(da) if not k.startswith('__')})
         self.shim.holder_status = lambda pid, token, workload, *a: da.HolderStatus(self.statuses.get(pid, 'alive'))
@@ -72,7 +92,8 @@ class MonitorBase(unittest.TestCase):
         return mon.Env(self.shim, self.state_path, self.memory_state, limits, clock=self.clock, mono=lambda: self.clock.mono,
                        boot=lambda: self.boot, table=lambda: self.table, memory=lambda: dict(self.mem), free=lambda: self.free,
                        advance=lambda: self.advances.append(self.clock.now) or {'exit': 0}, notify=lambda a: self.alerts.append(a) or True,
-                       clear=lambda: self.cleared.append(self.clock.now) or True)
+                       clear=lambda: self.cleared.append(self.clock.now) or True,
+                       emit_incident=lambda alert: self.alerts.append(alert) or dict(self.emit_result))
 
     def enqueue(self, ticket, nbytes=16 * GIB, session='0b1d2e3f-aaaa-bbbb-cccc-1234567890ab'):
         out = da.queue_enqueue(self.state_path, label='job-' + ticket.lower(), tickets=[ticket], repo='horonom/x', worktree=str(self.worktree),
@@ -846,7 +867,8 @@ class SafetyShape(unittest.TestCase):
             os.environ['ADMISSION_MONITOR_DIR'] = str(Path(root) / 'mon')
             try:
                 mon.tick(mon.Env(da, state, memory, mon.default_limits(da, ma), memory=lambda: {'latched': True, 'ok_streak': 0, 'metrics': dict(CALM)},
-                                 table=lambda: {}, free=lambda: 300 * GIB, boot=lambda: 1, notify=lambda a: True, clear=lambda: True))
+                                 table=lambda: {}, free=lambda: 300 * GIB, boot=lambda: 1, notify=lambda a: True, clear=lambda: True,
+                                 emit_incident=lambda a: {'result': 'queued', 'delivery': 'sent'}))
             finally:
                 os.environ.pop('ADMISSION_MONITOR_DIR')
             self.assertEqual(memory.read_bytes(), before)
