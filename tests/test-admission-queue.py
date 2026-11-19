@@ -270,6 +270,74 @@ class GrantStamp(QueueBase):
         self.assertEqual(self.granted_receipt()['memory_gate'], 'not-asked')
 
 
+class HandoffWindow(QueueBase):
+    """SPE-176 / ADR 0019: an entry without a declared waiter is a manual hand-off with a bounded 20 minute grant window."""
+
+    def waiter_entry(self, ticket):
+        proc = subprocess.Popen(['/bin/sleep', '300'], stdin=subprocess.DEVNULL)
+        self.holders.append(proc)
+        qid = self.enqueue(ticket=ticket, waiter_pid=proc.pid, ancestor_fn=lambda pid: True)['id']
+        return qid
+
+    def grant(self, qid):
+        return next(e for e in da._queue_entries(self.path)[0] if e['id'] == qid)['grant']
+
+    def seconds(self, qid):
+        grant = self.grant(qid)
+        return (da._parse_time(grant['expires']) - da._parse_time(grant['at'])).total_seconds()
+
+    def test_handoff_entry_gets_the_bounded_window_and_expires_then(self):
+        a = self.enqueue('HORO-2070')
+        self.advance()
+        self.assertEqual(da.HANDOFF_GRANT_S, 1200)
+        self.assertEqual(self.seconds(a['id']), 1200)
+        receipt = [json.loads(l) for l in (self.path.parent / 'queue/receipts.jsonl').read_text().splitlines()]
+        granted = [r for r in receipt if r.get('event') == 'granted'][0]
+        self.assertEqual(granted['expires'], self.grant(a['id'])['expires'])
+        marker = json.loads((self.path.parent / 'queue/granted' / a['id']).read_text())
+        self.assertEqual(marker['expires'], self.grant(a['id'])['expires'])
+        self.assertEqual(self.advance(now=self.now + timedelta(seconds=1199))['expired'], [])
+        self.assertEqual(self.advance(now=self.now + timedelta(seconds=1200))['expired'], [a['id']])
+
+    def test_waiter_entry_keeps_the_full_window(self):
+        qid = self.waiter_entry('HORO-2070')
+        self.advance()
+        self.assertEqual(self.seconds(qid), da.QUEUE_GRANT_S)
+
+    def test_fifo_order_holds_when_a_handoff_lapses(self):
+        a, b = self.enqueue('HORO-2070'), self.enqueue('HORO-2071')
+        self.assertEqual(self.advance()['granted'], [a['id']])
+        out = self.advance(now=self.now + timedelta(seconds=1200))
+        self.assertEqual(out['expired'], [a['id']])
+        self.assertEqual(out['granted'], [b['id']])
+        self.assertEqual(self.states(), ['EXPIRED', 'GRANTED'])
+
+    def test_claim_inside_the_window_still_works(self):
+        a = self.enqueue('HORO-2070')
+        self.advance()
+        proc = subprocess.Popen(['/bin/sleep', '300'], stdin=subprocess.DEVNULL)
+        self.holders.append(proc)
+        out = da.queue_claim(self.path, a['id'], 'nda-horo-2070', 20 * GIB, ['cargo', 'nextest', 'run', '--token', SECRET_ARG], str(self.worktree), lambda: 400 * GIB,
+                             pid=proc.pid, now=self.now + timedelta(seconds=1100), memory_fn=lambda: (True, 'ok'),
+                             exec_fn=lambda program, args: None)
+        self.assertTrue(out['ok'], out)
+        self.assertEqual(self.entries()[a['id']]['state'], 'CLAIMED')
+
+    def test_grant_key_set_is_at_and_expires(self):
+        a = self.enqueue('HORO-2070')
+        self.advance()
+        self.assertEqual(set(self.grant(a['id'])), {'at', 'expires'})
+
+    def test_explicit_smaller_grant_window_wins(self):
+        a = self.enqueue('HORO-2070')
+        da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, grant_s=300)
+        self.assertEqual(self.seconds(a['id']), 300)
+        w = self.waiter_entry('HORO-2071')
+        da.queue_cancel(self.path, a['id'], now=self.now)
+        da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, grant_s=300)
+        self.assertEqual(self.seconds(w), 300)
+
+
 class MemoryPreconditionText(unittest.TestCase):
     """The refusal text a claim or advance reports must carry the gate's reason, not only its metrics line (SPE-175)."""
 
