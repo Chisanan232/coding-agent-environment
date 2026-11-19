@@ -1479,6 +1479,7 @@ class BoundaryFuzz(Base):
         base["backends"]["macos"]["enabled"] = True
         base["backends"]["ntfy"].update(enabled=True, approved_destination="ntfy.sh", topic_file="/x/t")
         base["backends"]["pushover"].update(enabled=True, user_file="/x/u")
+        base["backends"]["telegram"].update(enabled=True, approved_destination="api.telegram.org", chat_id_file="/x/c")
         failures, n = [], 0
         path = self.tmp / "fuzz-config.json"
         for mpath, w, m in mutants(base):
@@ -2143,6 +2144,119 @@ class ConfigAndCheckpoint(Base):
                     self.assertEqual(h["type"], "command")
                     self.assertIn("session-notify.py hook", h["command"])
                     self.assertLessEqual(h["timeout"], 15)
+
+
+class TelegramBackend(Base):
+    """SPE-176 slice 3. Dummy token only; http_post is replaced, so nothing here ever reaches a network."""
+    TOKEN, CHAT = "123456:TEST-ONLY", "-100123"
+    PAYLOAD = {"title": "Claude Code: FAILED", "body": "work SPE-1"}
+
+    def setUp(self):
+        super().setUp()
+        self.posts = []
+        self.real_post = sn.http_post
+        sn.http_post = lambda url, data, headers, timeout=4: self.posts.append((url, data, headers)) or None
+        self.addCleanup(setattr, sn, "http_post", self.real_post)
+        for k in ("SN_TG_TOKEN", "SN_TG_CHAT"):
+            self.addCleanup(os.environ.pop, k, None)
+
+    def tg(self, **over):
+        return dict({"approved_destination": "api.telegram.org", "token_env": "SN_TG_TOKEN", "chat_id_env": "SN_TG_CHAT"}, **over)
+
+    def env(self):
+        os.environ["SN_TG_TOKEN"], os.environ["SN_TG_CHAT"] = self.TOKEN, self.CHAT
+
+    def secret(self, name, value, mode=0o600):
+        f = self.tmp / name
+        f.write_text(value + "\n")
+        os.chmod(f, mode)
+        return str(f)
+
+    def test_success_posts_form_to_the_bot_api_host(self):
+        self.env()
+        self.assertIsNone(sn.send_telegram(self.PAYLOAD, self.tg()))
+        url, data, _ = self.posts[0]
+        self.assertTrue(url.startswith("https://api.telegram.org/bot") and url.endswith("/sendMessage"))
+        form = sn.urllib.parse.parse_qs(data.decode())
+        self.assertEqual(sorted(form), ["chat_id", "text"])
+        self.assertEqual(form["text"], ["Claude Code: FAILED\nwork SPE-1"])
+
+    def test_refused_when_destination_mismatches_or_credentials_missing_or_malformed(self):
+        self.env()
+        for bad in (self.tg(approved_destination=""), self.tg(approved_destination="api.pushover.net"), self.tg(token_env="SN_TG_UNSET"),
+                    self.tg(chat_id_env="SN_TG_UNSET")):
+            self.assertEqual(sn.send_telegram(self.PAYLOAD, bad), "not-configured")
+        os.environ["SN_TG_TOKEN"] = "123456:a/../b?x"   # would alter the URL path
+        self.assertEqual(sn.send_telegram(self.PAYLOAD, self.tg()), "not-configured")
+        self.assertEqual(self.posts, [])
+
+    def test_credential_files_need_private_regular_owned_files(self):
+        os.symlink(self.secret("real", self.TOKEN), self.tmp / "link")
+        for label, path in {"world readable": self.secret("open", self.TOKEN, 0o644), "group readable": self.secret("grp", self.TOKEN, 0o640),
+                            "relative": "tok", "missing": str(self.tmp / "nope"), "symlink": str(self.tmp / "link")}.items():
+            self.assertEqual(sn.send_telegram(self.PAYLOAD, self.tg(token_env="SN_TG_UNSET", token_file=path, chat_id_file=self.secret("c", self.CHAT))),
+                             "not-configured", label)
+        ok = self.tg(token_env="SN_TG_UNSET", chat_id_env="SN_TG_UNSET", token_file=self.secret("tok", self.TOKEN), chat_id_file=self.secret("chat", self.CHAT))
+        self.assertIsNone(sn.send_telegram(self.PAYLOAD, ok))
+        self.assertEqual(self.posts[0][0], f"https://api.telegram.org/bot{self.TOKEN}/sendMessage")
+
+    def test_env_wins_over_file_when_set_and_non_empty(self):
+        self.env()
+        both = self.tg(token_file=self.secret("tok", "999999:FILE-ONLY"), chat_id_file=self.secret("chat", "555"))
+        sn.send_telegram(self.PAYLOAD, both)
+        os.environ["SN_TG_TOKEN"] = "   "
+        sn.send_telegram(self.PAYLOAD, both)
+        self.assertIn("bot123456:TEST-ONLY/", self.posts[0][0])
+        self.assertIn("bot999999:FILE-ONLY/", self.posts[1][0])
+
+    def test_token_is_scrubbed_from_exceptions_state_and_logs(self):
+        self.env()
+        def boom(url, data, headers, timeout=4):
+            raise RuntimeError("connect failed for " + url)
+        sn.http_post = boom
+        self.assertEqual(sn.send_telegram(self.PAYLOAD, self.tg()), "error-RuntimeError")
+        c = cfg()
+        c["backends"]["telegram"].update(self.tg(enabled=True))
+        e = sn.Engine(self.sdir, c, sn.REAL_TRANSPORTS | {"macos": lambda p, x: None, "ntfy": lambda p, x: None, "pushover": lambda p, x: None},
+                      clock=lambda: self.t, sleep=lambda s: None)
+        self.ev(e, "UserPromptSubmit")
+        self.ev(e, "Notification", notification_type="permission_prompt")
+        pend = self.rec()["pending"][0]["backends"]["telegram"]
+        self.assertEqual((pend["status"], pend["attempts"]), ("failed", 1))   # a failed attempt, never a crash
+        for f in self.sdir.glob("*"):
+            if f.is_file():
+                self.assertNotIn(self.TOKEN, f.read_text())
+                self.assertNotIn("TEST-ONLY", f.read_text())
+
+    def test_refused_for_corporate_profile_marker_and_session(self):
+        self.env()
+        c = cfg()
+        c["backends"]["telegram"].update(self.tg(enabled=True))
+        self.assertEqual(sn.backend_allowed("telegram", c, False), (True, None))
+        self.assertEqual(sn.backend_allowed("telegram", c, True), (False, "refused-corporate"))
+        self.assertEqual(sn.backend_allowed("telegram", dict(c, profile="corporate"), False), (False, "refused-corporate"))
+        c["backends"]["telegram"]["approved_destination"] = ""
+        self.assertEqual(sn.backend_allowed("telegram", c, False), (False, "no-approved-destination"))
+        c["backends"]["telegram"].update(enabled=False)
+        self.assertEqual(sn.backend_allowed("telegram", c, False), (False, "disabled"))
+        # corporate marker in the working directory: skipped at delivery, never sent
+        c = cfg(corporate_markers=[self.work.name])
+        c["backends"]["telegram"].update(self.tg(enabled=True))
+        self.ev(self.engine(c), "UserPromptSubmit")
+        self.ev(self.engine(c), "Notification", notification_type="permission_prompt")
+        self.assertEqual(self.posts, [])
+
+    def test_redirects_are_never_followed(self):
+        h = sn._NoRedirect()
+        self.assertIsNone(h.redirect_request(sn.urllib.request.Request("https://api.telegram.org/x"), None, 302, "Found", {}, "https://evil.example/"))
+
+    def test_off_by_default_and_listed_in_default_config_and_schema(self):
+        t = sn.DEFAULT_CONFIG["backends"]["telegram"]
+        self.assertIs(t["enabled"], False)
+        self.assertEqual(t["approved_destination"], "")
+        self.assertEqual(set(t), set(sn.CONFIG_SCHEMA["backends"]["telegram"]))
+        self.assertIn("telegram", sn.BACKEND_NAMES)
+        self.assertIn("telegram", sn.REAL_TRANSPORTS)
 
 
 if __name__ == "__main__":
