@@ -10,6 +10,7 @@ import stat
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import unittest.mock
 from contextlib import redirect_stdout
@@ -276,21 +277,31 @@ class LatchPolicy(unittest.TestCase):
     def calm(self, compressor=0.26):
         return metrics(level=1, io=0.0, compressor=compressor, load=2.0)
 
-    def test_a_lane_reason_refuses_but_does_not_latch(self):
-        v, st = ma.decide("heavy", self.lane_busy(), None, 100.0)
-        self.assertFalse(v["admit"])
-        self.assertIn("heavy lanes full", v["reasons"][0])
-        self.assertFalse(st["latched"])
-        v, st = ma.decide("heavy", self.calm(), st, 160.0)    # the tree ended: lane 1 is judged by ENTER thresholds again
-        self.assertTrue(v["admit"], v)
+    def test_shipped_defaults_are_p2_on_and_p1_off(self):
+        self.assertEqual((ma.CONSERVATIVE_RECOVERY, ma.LATCH_ONLY_ON_MEMORY_REASONS), (True, False))
 
-    def test_the_2026_11_19_shape_a_fresh_gate_admits_what_a_lane_latched_gate_refused(self):
-        self.assertTrue(ma.decide("heavy", self.calm(), None, 1.0)[0]["admit"])
-        with unittest.mock.patch.object(ma, "LATCH_ONLY_ON_MEMORY_REASONS", False):
-            _, st = ma.decide("heavy", self.lane_busy(), None, 100.0)
-            self.assertTrue(st["latched"])      # the old behaviour, kept switchable as the rollback
-            v, _ = ma.decide("heavy", self.calm(), st, 160.0)
+    def test_by_default_a_lane_reason_still_latches_as_the_cap_one_tests_pin(self):
+        _, st = ma.decide("heavy", self.lane_busy(), None, 100.0)
+        self.assertTrue(st["latched"])
+        v, _ = ma.decide("heavy", self.calm(), st, 160.0)
+        self.assertFalse(v["admit"])      # hysteresis after a tree ends, unchanged until P1 is decided
+
+    def test_p1_a_lane_reason_refuses_but_does_not_latch(self):
+        with unittest.mock.patch.object(ma, "LATCH_ONLY_ON_MEMORY_REASONS", True):
+            v, st = ma.decide("heavy", self.lane_busy(), None, 100.0)
             self.assertFalse(v["admit"])
+            self.assertIn("heavy lanes full", v["reasons"][0])
+            self.assertFalse(st["latched"])
+            v, st = ma.decide("heavy", self.calm(), st, 160.0)    # the tree ended: lane 1 is judged by ENTER thresholds again
+            self.assertTrue(v["admit"], v)
+
+    def test_p1_a_fresh_gate_admits_what_a_lane_latched_gate_refused(self):
+        self.assertTrue(ma.decide("heavy", self.calm(), None, 1.0)[0]["admit"])
+        _, st = ma.decide("heavy", self.lane_busy(), None, 100.0)     # shipped default: latched by a lane reason
+        self.assertFalse(ma.decide("heavy", self.calm(), st, 160.0)[0]["admit"])
+        with unittest.mock.patch.object(ma, "LATCH_ONLY_ON_MEMORY_REASONS", True):
+            _, st = ma.decide("heavy", self.lane_busy(), None, 100.0)
+            self.assertTrue(ma.decide("heavy", self.calm(), st, 160.0)[0]["admit"])
 
     def test_a_memory_reason_still_latches_and_a_pressure_spike_rearms_it(self):
         v, st = ma.decide("heavy", metrics(level=2), None, 100.0)
@@ -405,6 +416,27 @@ class LatchPolicy(unittest.TestCase):
                 now += 61
             self.assertTrue(st["latched"])
 
+    def test_a_forged_nine_sample_run_cannot_release_in_one_check(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        st.update(p2_hist=[0.26] * 9, p2_last=1000.0 - 60, p2_first=1000.0 - 60)     # nine samples claimed, no elapsed dwell
+        v, st = ma.decide("heavy", self.calm(), st, 1000.0)
+        self.assertTrue(st["latched"])
+        st.update(p2_hist=[0.26] * 9, p2_last=1000.0 - 60, p2_first=2000.0)          # a start after the last sample is not believable
+        _, st = ma.decide("heavy", self.calm(), st, 1000.0)
+        self.assertTrue(st["latched"])
+
+    def test_release_needs_the_recorded_dwell_not_just_ten_samples(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        now = 100.0
+        for i in range(ma.P2_SAMPLES):
+            v, st = ma.decide("heavy", self.calm(), st, now)
+            now += 60
+        self.assertTrue(v["admit"])               # 9 spacings of 60 s elapsed between first and last
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        st.update(p2_hist=[0.26] * 9, p2_last=100.0, p2_first=100.0)
+        v, st = ma.decide("heavy", self.calm(), st, 160.0)    # tenth sample but only 60 s since the claimed first
+        self.assertTrue(st["latched"])
+
     def test_state_file_round_trips_the_p2_fields_and_old_files_still_load(self):
         with tempfile.TemporaryDirectory() as root:
             path = pathlib.Path(root) / "state.json"
@@ -461,6 +493,35 @@ class ConcurrentPolling(unittest.TestCase):
             self.clock[0] = now
             self.burst(4)
             self.assertEqual(self.current()["ok_streak"], expected, now)
+
+    def test_critical_sections_never_overlap_under_a_burst(self):
+        self.latch()
+        holders, peak, guard = [0], [0], threading.Lock()
+        real_lock = ma.state_lock
+
+        @__import__("contextlib").contextmanager
+        def watched(path, *a, **k):
+            with real_lock(path, *a, **k):
+                with guard:
+                    holders[0] += 1
+                    peak[0] = max(peak[0], holders[0])
+                time.sleep(0.02)
+                with guard:
+                    holders[0] -= 1
+                yield
+
+        def check():
+            calls = iter([sample(0.0), sample(10.0)])
+            deps = {"sample": lambda: next(calls), "sleep": lambda s: None, "now": lambda: time.time(), "disk": lambda w: (True, "ok"),
+                    "lock": watched, "owned": lambda p: None, "lane_cap": lambda: 2}
+            ma.assess("heavy", 10.0, self.state, True, deps)
+        threads = [threading.Thread(target=check) for _ in range(8)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        self.assertEqual(peak[0], 1)
+        self.assertIsNone(ma.load_state(self.state)[1])
 
     def test_a_burst_never_releases_a_latch_on_one_instant(self):
         self.latch()
