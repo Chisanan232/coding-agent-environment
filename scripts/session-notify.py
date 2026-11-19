@@ -68,6 +68,7 @@ OWNER_ACTION_TEXT = {"reclaim-disk": "reclaim disk", "reduce-load": "reduce load
                      "inspect-admission-state": "inspect admission state", "inspect-running-workload": "inspect running workload",
                      "run-queue-advance": "run queue advance", "inspect-memory-admission": "inspect memory admission"}
 RESOURCE_SESSION = "admission-monitor"
+QUARANTINE_PROBLEMS = {"corrupt", "not-regular", "too-large", "foreign-owner"}
 RESOURCE_TICKET = "SPE-176"
 RESOURCE_REPO = "coding-agent-environment"
 SIGNATURE = re.compile(r"[0-9a-f]{16}")
@@ -845,7 +846,7 @@ class Engine:
             return "ignored"  # not an object, or a consumed field has the wrong type/size: nothing is read from it, nothing changes
         ev = raw
         name, sid = ev["hook_event_name"], ev["session_id"]
-        if sid == RESOURCE_SESSION:
+        if sid.lower() == RESOURCE_SESSION:  # case-folded: APFS would map Admission-Monitor onto the same file
             return "ignored"  # reserved for emit-resource: a hook event can neither write nor spoof this record
         path = record_path(self.sdir, sid)
         try:
@@ -956,7 +957,7 @@ class Engine:
     def emit_resource(self, req, clear=False):
         """One deduplicated BLOCKED_RESOURCE notice on the synthetic `admission-monitor` session, or (clear) its return to IDLE.
 
-        `req` is an EMIT_SCHEMA-shaped dict. Returns queued, deduped, no-backend, cleared, invalid, busy or untrusted:<problem>. Dedup key is cause + signature.
+        `req` is an EMIT_SCHEMA-shaped dict. Returns queued, deduped, no-backend, cleared, invalid, busy, error or untrusted:<problem>. Dedup key is cause + signature.
         """
         if not clear and not conforms(EMIT_SCHEMA, req):
             return "invalid"
@@ -964,6 +965,8 @@ class Engine:
         try:
             with session_lock(record_path(self.sdir, sid), sleep=self.sleep):
                 rec, problem = load_record(self.sdir, sid)
+                if problem and not (problem in QUARANTINE_PROBLEMS):
+                    return f"untrusted:{problem}"  # transient (e.g. unreadable:<errno>): never destroy state over it
                 if problem:  # the synthetic record only: quarantine it (one kept) and rebuild, so alerting cannot fail forever
                     log_line(self.sdir, f"state-quarantined {problem} event=emit-resource")
                     try:
@@ -977,6 +980,7 @@ class Engine:
                 rec = rec or new_record(sid, now)
                 if clear:
                     self.set_state(rec, "IDLE", "resource-cleared", now, notify=False)
+                    rec["cycle"] += 1  # an in-flight pre-clear notice may still finish and write a tombstone; it is of the old cycle and cannot dedup a recurrence
                     rec["notified"] = {}  # dedup only suppresses a continuous stall: a recurrence after a clear notifies again
                     rec["pending"] = [e for e in rec["pending"] if not all(b["status"] in TERMINAL for b in e["backends"].values())]
                     result = "cleared"
@@ -994,6 +998,9 @@ class Engine:
         except TimeoutError:
             log_line(self.sdir, "lock-timeout event=emit-resource")
             return "busy"
+        except OSError as exc:
+            log_line(self.sdir, f"emit-resource os-error errno={exc.errno}")  # errno only: no path reaches stderr
+            return "error"
 
     # -- sweep
     def sweep(self, now=None):
@@ -1015,7 +1022,7 @@ class Engine:
                         continue
                     out["sessions"] += 1
                     changed = False
-                    if rec["state"] == "RUNNING" and sid != RESOURCE_SESSION and now - rec["last_seen"] > self.cfg["stale_after_seconds"]:
+                    if rec["state"] == "RUNNING" and sid.lower() != RESOURCE_SESSION and now - rec["last_seen"] > self.cfg["stale_after_seconds"]:
                         self.set_state(rec, "FAILED", "stale-no-heartbeat", now, None, kind="STALE", notify=True)
                         out["stale"] += 1
                         changed = True
@@ -1023,7 +1030,7 @@ class Engine:
                     if self.deliver(rec, now):
                         changed = True
                         out["retried"] += pending_before
-                    if sid != RESOURCE_SESSION and rec["state"] in ("SESSION_ENDED", "COMPLETED", "FAILED") and not rec["pending"] and now - rec["last_seen"] > GC_AFTER:
+                    if sid.lower() != RESOURCE_SESSION and rec["state"] in ("SESSION_ENDED", "COMPLETED", "FAILED") and not rec["pending"] and now - rec["last_seen"] > GC_AFTER:
                         # removed while HOLDING the lock; session_lock re-checks the inode, so a waiter that opened the old file retries on the new one
                         for q in (p, p.with_name(p.name + ".lock")):
                             with contextlib.suppress(OSError):
