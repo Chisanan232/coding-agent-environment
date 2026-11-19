@@ -65,6 +65,19 @@ Two independent backends, both **off** until `~/.config/coding-agent-environment
 
 Payload: **only** the state, a repository name, a ticket, a PR number, an enum blocker owner, an enum resume trigger rendered as a fixed phrase, a failure kind and a fixed phrase for stale/ended/agent events. The same body goes to every backend. Each field is rebuilt from a strict validator or fixed enum, never copied: the ticket must match `ABC-123`, the PR must be an integer, enums must be members, and the **repository name must appear in `known_repos` in your config and also pass the secret and corporate-marker checks**, otherwise the notice says `unlisted`; the ticket label passes the same two checks (a ticket like `ACME-123` is dropped when `ACME` is a marker). The checkpoint's `task` and `workflow_state` are short plain text kept for local identity and dedup and are never sent. Never sent: commands, environment values, keys, source, logs, transcripts, model text, paths, corporate content. The check runs when a notification is queued **and again at every delivery attempt** on whatever is on disk, and corporate status (the `corporate` profile, or a `corporate_markers` match on the session's last working directory, stored whole and never truncated, sticky once seen; a path too long to store, over 4096 characters, counts as corporate) is also re-evaluated at delivery, so a queued remote notice is revoked if the session turns out to be corporate or a marker is added later. Remote requests are plain `https` POSTs to the approved host with **no redirect following and no environment proxies**, so the credential is never forwarded elsewhere.
 
+### Telegram backend (SPE-176, ADR 0019 section 7)
+
+`telegram` follows the same rules as `ntfy` and `pushover`: **off by default**, needs `enabled: true` **and** `approved_destination` equal to `api.telegram.org`, refused for the `corporate` profile and markers (re-checked at delivery), same sanitised fixed-phrase body, same retry, backoff and dedup. **Nothing is enabled by this change**; it was tested only with a replaced transport and never contacted Telegram.
+
+To set it up yourself:
+
+1. In Telegram, message `@BotFather`, send `/newbot`, and keep the bot token it returns (shape `123456:ABC-...`).
+2. Send any message to your new bot, then get your numeric chat id (for example from the bot's `getUpdates` result in your own browser session). A channel handle `@name` also works.
+3. Provide both values **without putting them in the config**: either export environment variables and name them (`token_env`, `chat_id_env`; defaults `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`), or save each in a file and name its absolute path (`token_file`, `chat_id_file`). A file must be a regular file you own, not a symlink, `chmod 600`; otherwise it counts as not configured. The environment variable wins when set and non-empty.
+4. In `session-notify.json` set `backends.telegram.enabled` to `true` and `approved_destination` to `api.telegram.org`.
+
+The send is a plain `https` POST to `https://api.telegram.org/bot<token>/sendMessage` with form fields `chat_id` and `text`, no redirects and no environment proxies. The token is part of that URL path, so it is never logged, stored in state, or returned in an error: failures are recorded only as a short code such as `http-401` or `network`. A token or chat id that does not have the Telegram shape counts as not configured.
+
 Reliability: state is persisted as `sending` before a transport runs; failures retry with backoff 30 s, 60 s, 120 s, 240 s (cap 900 s, 5 attempts) and are then dropped; retries run from the next hook of that session or from `sweep`. A send interrupted by a crash is recovered after 5 minutes and **counts toward the same attempt cap** (checked before sending), so it can repeat at most within that cap. A queue limited to 20 entries never discards silently: the oldest entry gets a terminal `dropped` (`queue-overflow`) outcome, is remembered for dedup, adds a history line and increments `dropped` (shown by `status`). A raising transport is a failed attempt, never a crash.
 
 ## Admission-stall notices (`emit-resource`, SPE-176)
@@ -146,7 +159,7 @@ The unit tests replay each scenario against scratch state with fake transports (
 
 ## Owner decisions still open
 
-Whether and which mobile service to approve (ntfy or Pushover; no choice and no contact has been made); whether to wire `sweep` to launchd; the `stale_after_seconds` value for 10-30 hour runs; which paths count as `corporate_markers` on a corporate machine; the repository names to list in `known_repos` (an empty list means every notice says `unlisted`).
+Whether and which mobile service to approve (ntfy, Pushover or Telegram; no choice and no contact has been made); whether to wire `sweep` to launchd; the `stale_after_seconds` value for 10-30 hour runs; which paths count as `corporate_markers` on a corporate machine; the repository names to list in `known_repos` (an empty list means every notice says `unlisted`).
 
 ## Evidence tokens and approved contract
 
