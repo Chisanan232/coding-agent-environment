@@ -67,6 +67,17 @@ Payload: **only** the state, a repository name, a ticket, a PR number, an enum b
 
 Reliability: state is persisted as `sending` before a transport runs; failures retry with backoff 30 s, 60 s, 120 s, 240 s (cap 900 s, 5 attempts) and are then dropped; retries run from the next hook of that session or from `sweep`. A send interrupted by a crash is recovered after 5 minutes and **counts toward the same attempt cap** (checked before sending), so it can repeat at most within that cap. A queue limited to 20 entries never discards silently: the oldest entry gets a terminal `dropped` (`queue-overflow`) outcome, is remembered for dedup, adds a history line and increments `dropped` (shown by `status`). A raising transport is a failed attempt, never a crash.
 
+## Admission-stall notices (`emit-resource`, SPE-176)
+
+`session-notify.py emit-resource --cause C --recovery R --owner-action A [--signature HEX16]` lets the deterministic admission monitor (`scripts/admission-monitor.py`) raise one actionable notice through the pipeline above. It records a synthetic session `admission-monitor` in `BLOCKED_RESOURCE` (blocker owner `resource`; resume trigger `owner_decision` when the action is an approval, else `resource_available`) and reuses the schema validator, per-session lock, atomic state, `sending` persistence, retry, dedup and backends unchanged; all backends stay off unless the config enables them.
+
+- `--cause`: `disk-floor memory-pressure memory-hysteresis-static-compressor memory-hysteresis stale-claim frozen-queue failed-continuation outdated-caller stalled-running unobservable state-unreadable`
+- `--recovery`: `none advance-tried recovery-exhausted observe-only`
+- `--owner-action`: `reclaim-disk reduce-load approve-memory-policy wait-or-approve-memory-policy confirm-claim-ended restart-waiting-session restart-outdated-caller inspect-admission-state inspect-running-workload run-queue-advance inspect-memory-admission`
+- `--signature`: optional 16 lowercase hex characters, used only for dedup, never rendered.
+
+The text is built only from the fixed phrase of each enum (`disk below floor | recovery: none tried | action: reclaim disk`); no id, number, path or free text can reach a backend. Dedup key is cause + signature inside the usual 24 h window: a replay produces no second banner and no second queue entry, a different cause or signature notifies again. `emit-resource --clear` returns the record to `IDLE` without notifying. Exit codes: 0 queued, deduped or cleared (also when every backend is off); 2 invalid enum or signature (nothing written); 1 busy lock or untrusted state record.
+
 ## Crash and silence handling
 
 Hooks cannot run after `kill -9`, power loss or a reboot. `session-notify.py sweep` (cheap, run on a timer; not installed here) marks a `RUNNING` session whose last heartbeat is older than `stale_after_seconds` (default 2700) as `FAILED` once with the notice "no heartbeat". `PostToolUse` is the heartbeat, throttled to one write per 30 s, so a long build inside one tool call is covered by the threshold. Blocked, idle and ended sessions are never stale. Records finished for 14 days are removed. Example timer (a template, not installed):
