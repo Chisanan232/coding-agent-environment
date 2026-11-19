@@ -230,7 +230,13 @@ def exe_identity(pid, run=None):
     if returncode != 0 or len(parts) < 2:
         return None
     interpreter = os.path.basename(parts[0])
-    script = next((os.path.basename(x) for x in parts[1:] if not x.startswith('-')), None)
+    script = None
+    for part in parts[1:]:
+        if part.startswith('-') and not part.startswith('--') and 'c' in part[1:]:
+            return None      # `-c CODE` runs inline code: there is no script to name, and the code must not be mistaken for one
+        if not part.startswith('-'):
+            script = os.path.basename(part)
+            break
     found = '%s %s' % (interpreter, script)
     return found if script and EXE_RE.fullmatch(found) else None
 
