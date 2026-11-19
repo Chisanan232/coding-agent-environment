@@ -192,6 +192,31 @@ class Decisions(unittest.TestCase):
             self.assertTrue(any("fails closed" in r for r in v["reasons"]), field)
 
 
+class ExitBlockers(unittest.TestCase):
+    """A latch that is not recovering must say which exit condition fails (SPE-175); no limit changes."""
+
+    def test_cold_compressor_between_enter_and_exit_is_named(self):
+        m = metrics(level=1, io=0.0, compressor=0.28, load=2.0)
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        for t in (100.0, 140.0, 180.0, 220.0):            # four spaced checks: never recovers while the reading stays there
+            v, st = ma.decide("heavy", m, st, t)
+        self.assertFalse(v["admit"])
+        self.assertEqual(st["ok_streak"], 0)
+        self.assertIn("recovering (0/3", v["reasons"][0])
+        self.assertIn("compressor 28% > exit 25%", v["reasons"][0])
+        self.assertTrue(st["latched"])
+
+    def test_limits_are_unchanged(self):
+        self.assertEqual((ma.EXIT["compressor_ratio"], ma.ENTER["compressor_ratio_heavy"]), (0.25, 0.35))
+
+    def test_a_reading_inside_every_exit_limit_names_nothing_and_each_bad_one_is_named(self):
+        good = metrics(level=1, io=0.0, compressor=0.05, load=2.0)
+        self.assertEqual(ma.exit_blockers(good), [])
+        for bad, text in ((metrics(level=2), "pressure level 2"), (metrics(level=1, io=6.0), "swap I/O"),
+                          (metrics(level=1, load=40.0), "load/core")):
+            self.assertTrue(any(text in x for x in ma.exit_blockers(bad)), (text, ma.exit_blockers(bad)))
+
+
 class Hysteresis(unittest.TestCase):
     def good(self):
         return metrics(level=1, io=0.0, compressor=0.05, load=2.0)
