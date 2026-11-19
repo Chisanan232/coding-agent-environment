@@ -49,7 +49,7 @@ EXIT_SAMPLES = 3          # consecutive good checks needed to leave a heavy refu
 # did not rise over the run. Neither changes a threshold value; the second lane's bounds (exit_ok, concurrent_lane_reasons) are unchanged.
 LATCH_ONLY_ON_MEMORY_REASONS = True
 CONSERVATIVE_RECOVERY = True
-P2_SAMPLES, P2_SPACING, P2_SWAP_IO, P2_RISE = 10, 60, 1.0, 0.005
+P2_SAMPLES, P2_SPACING, P2_SWAP_IO, P2_RISE, P2_STALE = 10, 60, 1.0, 0.005, 5
 MIN_SPACING = 30          # seconds between checks that count toward EXIT_SAMPLES
 SWAP_FULL_FRACTION = 0.90
 SWAP_LOW_FREE = 4 * GIB
@@ -530,6 +530,8 @@ def _p2_clean(st, now):
     last = st.get("p2_last", 0.0)
     if not isinstance(last, (int, float)) or isinstance(last, bool) or not math.isfinite(last) or last > now:
         st["p2_hist"], last = [], 0.0
+    elif st["p2_hist"] and now - last > P2_STALE * P2_SPACING:
+        st["p2_hist"] = []      # ten snapshots days apart are not ten minutes of calm
     st["p2_last"] = float(last)
 
 
@@ -578,11 +580,11 @@ def decide(weight, m, state, now):
                 st.update(latched=False, ok_streak=0)
         else:
             st["ok_streak"] = 0
-            if CONSERVATIVE_RECOVERY and conservative_ok(m) and not lane:
+            if CONSERVATIVE_RECOVERY and conservative_ok(m):      # false whenever a lane reason exists (refusal_reasons is then non-empty)
                 if not st["p2_hist"] or now - st["p2_last"] >= P2_SPACING:
                     st["p2_hist"] = (st["p2_hist"] + [float(m["compressor_ratio"])])[-P2_SAMPLES:]
                     st["p2_last"] = now
-                if len(st["p2_hist"]) >= P2_SAMPLES and st["p2_hist"][-1] - st["p2_hist"][0] <= P2_RISE:
+                if len(st["p2_hist"]) >= P2_SAMPLES and max(st["p2_hist"]) - min(st["p2_hist"]) <= P2_RISE:
                     st.update(latched=False, ok_streak=0, p2_hist=[], p2_last=0.0)
             else:
                 st["p2_hist"] = []
