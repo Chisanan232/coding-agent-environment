@@ -592,18 +592,25 @@ def inventory(root):
     return found
 
 
-def plist(script):
+def plist(script, act=True):
+    """The launchd agent as text. `script` must be the canonical checkout's copy: a path inside a feature worktree would vanish with it."""
+    flags = '<string>tick</string>' + ('<string>--act</string>' if act else '') + '<string>--if-due</string>'
     return '''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>com.coding-agent-environment.admission-monitor</string>
-<key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>%s</string><string>tick</string><string>--act</string><string>--if-due</string></array>
+<key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>%s</string>%s</array>
 <key>StartInterval</key><integer>%d</integer>
 <key>RunAtLoad</key><true/>
+<key>ProcessType</key><string>Background</string>
+<key>Nice</key><integer>10</integer>
+<key>LowPriorityIO</key><true/>
+<key>ThrottleInterval</key><integer>30</integer>
+<key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string></dict>
 <key>StandardOutPath</key><string>/dev/null</string>
 <key>StandardErrorPath</key><string>/dev/null</string>
 </dict></plist>
-''' % (script, INTERVAL_S)
+''' % (script, flags, INTERVAL_S)
 
 
 def main(argv=None):
@@ -616,12 +623,18 @@ def main(argv=None):
     s = sub.add_parser('status')
     s.add_argument('--json', action='store_true')
     sub.add_parser('callers')
-    sub.add_parser('plist')
+    pl = sub.add_parser('plist')
+    pl.add_argument('--checkout', required=True, help='the canonical checkout directory (its scripts/admission-monitor.py is the program)')
+    pl.add_argument('--observe-only', action='store_true', help='omit --act: the agent only observes and reports')
     args = parser.parse_args(argv)
     da, ma = load('disk-admission'), load('memory-admission')
     state_path = da.default_state_path()
     if args.cmd == 'plist':
-        print(plist(Path(__file__).resolve()), end='')
+        script = Path(args.checkout).expanduser().resolve() / 'scripts/admission-monitor.py'
+        if not script.is_file():
+            print('no scripts/admission-monitor.py under %s' % args.checkout, file=sys.stderr)
+            return 2
+        print(plist(script, act=not args.observe_only), end='')
         return 0
     if args.cmd == 'callers':
         rows = inventory(Path.home() / 'Bryant-Developments')
