@@ -33,7 +33,19 @@ HERE = Path(__file__).resolve().parent
 GIB = 1024 ** 3
 INTERVAL_S = 60
 STALL_S = 600                 # waiting work with no claim, release or CPU growth for this long is a global stall
-GRANTED_ALERT_S = 2700        # above the observed p99 grant->claim (29 min), below the 60 min grant window
+# A grant nobody has claimed is noticed 5 min after it was made (the observed p90 grant->claim is 139 s) and escalated at 75% of that entry's own grant
+# window, so the owner hears BEFORE it lapses: 45 min of a waiter entry's 60 min window (above the observed p99 grant->claim of 29 min), 15 min of a
+# hand-off entry's 20 min window (ADR 0019). A hand-off grant lapses to EXPIRED and is then only history, so an alert on a fixed 45 min could never fire.
+GRANT_NOTICE_S = 300
+GRANT_ESCALATE_FRACTION = 0.75
+HANDOFF_GRANT_S = 1200        # mirror of disk-admission.HANDOFF_GRANT_S (a test pins the equality): the window of an entry with no `waiter`
+LAPSE_WINDOW_S = 6 * 3600     # an unclaimed grant that lapsed this recently and was never raised is still raised once
+INCIDENT_LIMIT = 24           # unclaimed-grant incidents kept in the state file; the state read cap is 64 KiB
+UNVERIFIED_AFTER_DEDUPS = 5   # `deduped` for a notice this record never handed off: after this many answers, stop asking and record it unverified
+INCIDENT_HARD_LIMIT = 64      # an incident still inside its lapse window is never evicted for the soft limit; this bound protects the read cap
+GRANTED_STALL_S = 2700        # a granted-only queue with a waiter entry is a stall from this age, as before the hand-off window existed
+INCIDENT_KEEP_S = 7 * 3600    # past the lapse window plus an hour, an incident can no longer be re-raised, so it is dropped
+INCIDENT_ACK_KEEP_S = 3600
 CPU_STALL_S = 900             # a claimed, alive workload with no CPU growth this long is reported, never touched
 CONFIRM_SPACING_S = 30        # confirmations are counted at least this far apart
 CLEAR_AFTER_TICKS = 3         # clean ticks in a row before the alert channel is told the blockage ended
@@ -49,12 +61,12 @@ STATIC_SPAN = 0.01            # ...within one percentage point of RAM
 WINDOW_MAX = 16
 STATE_LIMIT = 65536
 CAUSES = ('state-unreadable', 'disk-floor', 'memory-pressure', 'memory-hysteresis-static-compressor', 'memory-hysteresis',
-          'stale-claim', 'frozen-queue', 'failed-continuation', 'outdated-caller', 'stalled-running', 'unobservable', 'healthy-busy', 'unknown')
+          'stale-claim', 'frozen-queue', 'unclaimed-handoff', 'failed-continuation', 'outdated-caller', 'stalled-running', 'unobservable', 'healthy-busy', 'unknown')
 OWNER_ACTION = {'disk-floor': 'reclaim-disk', 'memory-pressure': 'reduce-load', 'memory-hysteresis-static-compressor': 'approve-memory-policy',
                 'memory-hysteresis': 'wait-or-approve-memory-policy', 'stale-claim': 'confirm-claim-ended',
                 'failed-continuation': 'restart-waiting-session', 'outdated-caller': 'restart-outdated-caller',
                 'state-unreadable': 'inspect-admission-state', 'unknown': 'inspect-admission-state',
-                'frozen-queue': 'run-queue-advance', 'stalled-running': 'inspect-running-workload', 'unobservable': 'inspect-memory-admission'}
+                'frozen-queue': 'run-queue-advance', 'unclaimed-handoff': 'claim-or-reenqueue-handoff', 'stalled-running': 'inspect-running-workload', 'unobservable': 'inspect-memory-admission'}
 
 
 def load(name):
@@ -179,6 +191,46 @@ def safe_time(text):
     return moment if moment.tzinfo is not None else None
 
 
+def is_handoff(entry):
+    """An entry with no declared waiter is a manual hand-off: its owner must claim the grant by hand."""
+    return 'waiter' not in entry
+
+
+def grant_window_s(entry):
+    """This entry's own grant window: the granted span, capped at the hand-off window when it has no waiter."""
+    grant = entry['grant']
+    span = int((safe_time(grant['expires']) - safe_time(grant['at'])).total_seconds())
+    return min(span, HANDOFF_GRANT_S) if is_handoff(entry) else span
+
+
+def escalate_s(entry):
+    return int(grant_window_s(entry) * GRANT_ESCALATE_FRACTION)
+
+
+def incident_key(entry):
+    return '%s@%s' % (entry['id'], entry['grant']['at'])
+
+
+def incident_signature(key, phase):
+    """16 hex chars, stable per incident and phase: session-notify dedups on cause plus this, so restarts and two monitors send once per phase."""
+    return hashlib.sha256(('%s:%s' % (key, phase)).encode()).hexdigest()[:16]
+
+
+def lapsed_handoffs(entries, events, now, recorded_only=False):
+    """Hand-off entries whose grant lapsed with no claim or holder, within LAPSE_WINDOW_S. Includes a GRANTED entry whose window ended but
+    which no queue-aware command has yet recorded as EXPIRED (unless `recorded_only`: after a clock step only the scheduler's own EXPIRED counts).
+    `events`: {id: set of receipt events}."""
+    out = []
+    for e in entries:
+        grant = e.get('grant')
+        if not (isinstance(grant, dict) and is_handoff(e)) or e.get('holder') or e['state'] not in (('EXPIRED',) if recorded_only else ('GRANTED', 'EXPIRED')):
+            continue
+        gone = (now - safe_time(grant['expires'])).total_seconds()
+        if 0 <= gone < LAPSE_WINDOW_S and not ({'claimed', 'released'} & set(events.get(e['id'], ()))):
+            out.append(e)
+    return out
+
+
 def usable_entries(entries):
     """(entries whose times parse, problems). A damaged entry is reported and left alone, never allowed to crash a tick."""
     good, problems = [], []
@@ -242,7 +294,8 @@ def classify(snap, limits):
     if snap['problems']:
         found['state-unreadable'] = snap['problems'][0]
     if not waiting and not granted:
-        return {'causes': found, 'primary': next(iter(found), 'idle'), 'waiting': 0, 'oldest_grant_s': 0, 'notes': []}
+        return {'causes': found, 'primary': next(iter(found), 'idle'), 'waiting': 0, 'oldest_grant_s': 0, 'notes': [], 'notices': [],
+                'unclaimed': [], 'grant_escalated': False, 'grant_stall_s': None}
     head = waiting[0] if waiting else None
     mem = snap['mem']
     metrics = mem.get('metrics') or {}
@@ -275,12 +328,20 @@ def classify(snap, limits):
             found['stale-claim'] = '%s holder exited, claim not released' % entry['id']
         elif claim.get('status') == 'alive' and claim.get('idle_s', 0) >= CPU_STALL_S:
             found['stalled-running'] = '%s alive but its CPU time has not changed for %d min (report only)' % (entry['id'], claim['idle_s'] // 60)
-    oldest = 0
+    oldest, notices, unclaimed, escalated, stall_s = 0, [], [], False, None
     for entry in granted:
         age = int((now - safe_time(entry['grant']['at'])).total_seconds())
         oldest = max(oldest, age)
-        if age >= GRANTED_ALERT_S:
-            found['failed-continuation'] = '%s GRANTED %d min without a claim' % (entry['id'], age // 60)
+        if age >= escalate_s(entry):
+            escalated = True
+            stall_s = min(stall_s if stall_s is not None else GRANTED_STALL_S, 0 if is_handoff(entry) else GRANTED_STALL_S)
+            if is_handoff(entry):
+                found['unclaimed-handoff'] = '%s hand-off GRANTED %d min without a claim' % (entry['id'], age // 60)
+                unclaimed.append(entry['id'])
+            else:
+                found['failed-continuation'] = '%s GRANTED %d min without a claim' % (entry['id'], age // 60)
+        elif is_handoff(entry) and age >= GRANT_NOTICE_S:
+            notices.append('%s hand-off GRANTED %d min, not yet claimed' % (entry['id'], age // 60))
     for entry in granted:
         runner = (snap.get('stamps') or {}).get(entry['id'])      # from the granted receipt: the grant object itself carries no stamp
         if not isinstance(runner, dict) or runner.get('protocol', 0) < snap['protocol']:
@@ -296,7 +357,8 @@ def classify(snap, limits):
     # History for the owner, never a trigger: a grant that lapsed unclaimed shortly ago (a lost callback).
     notes = ['%s grant lapsed unclaimed' % e['id'] for e in entries if e['state'] == 'EXPIRED' and isinstance(e.get('grant'), dict)
              and not e.get('holder') and 0 <= (now - safe_time(e['grant']['expires'])).total_seconds() < 3 * 3600]
-    return {'causes': found, 'primary': primary, 'waiting': len(waiting), 'oldest_grant_s': oldest, 'notes': notes}
+    return {'causes': found, 'primary': primary, 'waiting': len(waiting), 'oldest_grant_s': oldest, 'notes': notes, 'notices': notices,
+            'unclaimed': unclaimed, 'grant_escalated': escalated, 'grant_stall_s': stall_s}
 
 
 def signature(verdict, entries):
@@ -326,6 +388,28 @@ def advance_allowed(state, now_wall):
     return True, 'ok'
 
 
+def clean_incident(rec):
+    """A well-typed copy of a stored unclaimed-grant incident, or None when its identity fields are damaged."""
+    def num(key):
+        value = rec.get(key)
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    if not (isinstance(rec, dict) and isinstance(rec.get('id'), str) and len(rec['id']) <= 16 and num('grant_wall') is not None
+            and num('expires_wall') is not None and rec.get('phase') in ('escalated', 'lapsed')):
+        return None
+    verify = rec.get('verify')
+    verify = {k: verify[k] for k in ('at', 'lanes_in_use', 'next', 'next_started') if k in verify and isinstance(verify[k], (str, int, bool, type(None)))
+              } if isinstance(verify, dict) else None
+    return {'id': rec['id'], 'phase': rec['phase'], 'grant_wall': num('grant_wall'), 'expires_wall': num('expires_wall'), 'raised_at': num('raised_at'),
+            'ack_deadline': num('ack_deadline'), 'delivered_at': num('delivered_at'), 'acknowledged_at': num('acknowledged_at'),
+            'notified_phase': rec['notified_phase'] if rec.get('notified_phase') in ('escalated', 'lapsed') else None,
+            'owner_notice_state': rec['owner_notice_state'] if rec.get('owner_notice_state') in ('acknowledged', 'delivered', 'unknown', 'undelivered', 'pending') else 'pending',
+            'handed_off_at': num('handed_off_at'), 'claim_seen': rec.get('claim_seen') is True, 'handed_off_unverified': rec.get('handed_off_unverified') is True,
+            'dedups': rec['dedups'] if type(rec.get('dedups')) is int and 0 <= rec['dedups'] < 1000 else 0,
+            'delivery': rec['delivery'] if rec.get('delivery') in ('sent', 'pending', 'dropped', 'unknown', 'unconfirmed') else None,
+            'attempts': rec['attempts'] if type(rec.get('attempts')) is int and 0 <= rec['attempts'] < 1000 else 0, 'next_try': num('next_try') or 0,
+            'waiter': False, 'action': 'none', 'verify': verify}
+
+
 def sanitize_state(state):
     """Field-by-field type check of a loaded state; a wrong type resets that field only (the counters that bound recovery are kept)."""
     def nums(value, limit):
@@ -345,7 +429,10 @@ def sanitize_state(state):
     window = [[float(w), float(r)] for w, r in (x for x in (state.get('window') or []) if isinstance(x, list) and len(x) == 2
                                                  and all(isinstance(y, (int, float)) for y in x))][-WINDOW_MAX:] if isinstance(state.get('window'), list) else []
     progress = state.get('progress_at')
-    return dict(schema=1, last_tick=last, blocker=blocker, alerts=alerts, cpu=cpu, states=states, window=window,
+    incidents = state.get('incidents')
+    incidents = {k: c for k, c in ((k, clean_incident(v)) for k, v in incidents.items() if isinstance(k, str) and len(k) <= 64)
+                 if c} if isinstance(incidents, dict) else {}
+    return dict(schema=1, incidents=dict(sorted(incidents.items(), key=lambda kv: kv[1]['grant_wall'])[-INCIDENT_HARD_LIMIT:]), last_tick=last, blocker=blocker, alerts=alerts, cpu=cpu, states=states, window=window,
                 advances=nums(state.get('advances'), 64), progress_at=progress if isinstance(progress, (int, float)) else None,
                 last_alert=state.get('last_alert') if isinstance(state.get('last_alert'), dict) else None,
                 clean_ticks=state.get('clean_ticks') if type(state.get('clean_ticks')) is int and 0 <= state['clean_ticks'] < 10 ** 6 else 0)
@@ -357,7 +444,7 @@ class Env:
     """Everything a tick touches outside its own state, so tests substitute it."""
 
     def __init__(self, da, state_path, memory_state_path, limits, clock=None, mono=None, boot=None, table=None, memory=None,
-                 free=None, advance=None, notify=None, clear=None, reservations=None, stamps=None):
+                 free=None, advance=None, notify=None, clear=None, reservations=None, stamps=None, events=None, emit_incident=None):
         self.da, self.state_path, self.memory_state_path, self.limits = da, Path(state_path), Path(memory_state_path), limits
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.mono = mono or time.monotonic
@@ -368,6 +455,8 @@ class Env:
         self.advance = advance or self._advance
         self.reservations = reservations or self._reservations
         self.stamps = stamps or self._stamps
+        self.events = events or self._events
+        self.emit_incident = emit_incident or session_notify_incident
         self.notify = notify or session_notify
         self.clear = clear or session_clear
 
@@ -398,6 +487,23 @@ class Env:
                     found[rec['id']] = rec.get('runner')
         return found
 
+    def _events(self, ids):
+        """{entry id: set of receipt events} for the given ids, read-only; an unreadable receipt file leaves them empty."""
+        want, found = set(ids), {}
+        for name in ('receipts.jsonl.1', 'receipts.jsonl'):
+            try:
+                text = (self.state_path.parent / 'queue' / name).read_text(errors='replace')
+            except OSError:
+                continue
+            for line in text.splitlines():
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get('id') in want and isinstance(rec.get('event'), str):
+                    found.setdefault(rec['id'], set()).add(rec['event'])
+        return found
+
     def _advance(self):
         """Run one `queue advance`. A slow one is left to finish on its own (never signalled); the next tick's spacing covers it."""
         proc = subprocess.Popen([sys.executable, str(HERE / 'disk-admission.py'), 'queue', 'advance', '--json'], stdout=subprocess.PIPE,
@@ -412,6 +518,8 @@ class Env:
 def recovery_phrase(actions, exhausted):
     if exhausted:
         return 'recovery-exhausted'
+    if any(a.get('handoff') == 'lapsed' for a in actions):
+        return 'lapsed'
     if any(a.get('advance') == 'ran' for a in actions):
         return 'advance-tried'
     if any(a.get('advance') == 'would-run' for a in actions):
@@ -434,6 +542,22 @@ def session_notify(alert, runner=None):
     except (OSError, subprocess.SubprocessError):
         return False
     return done.returncode == 0
+
+
+def session_notify_incident(alert, runner=None):
+    """Raise an unclaimed-grant notice with `--strict` and report what session-notify says: {'result': queued|deduped|no-backend|failed,
+    'delivery': sent|pending|dropped|unknown|None}. `queued` is a hand-off to the pipeline, not delivery; `sent` means a backend accepted it."""
+    actions = alert.get('recovery') or []
+    argv = [sys.executable, str(HERE / 'session-notify.py'), 'emit-resource', '--cause', alert['cause'], '--recovery', recovery_phrase(actions, False),
+            '--owner-action', alert.get('owner_action') or 'inspect-admission-state', '--signature', alert['signature'], '--strict']
+    try:
+        done = (runner or subprocess.run)(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return {'result': 'failed', 'delivery': None}
+    seen = re.search(r'emit-resource: (queued|deduped|no-backend)(?: delivery=(sent|pending|dropped|unknown))?', getattr(done, 'stdout', '') or '')
+    if done.returncode != 0 or not seen:
+        return {'result': 'failed', 'delivery': None}
+    return {'result': seen.group(1), 'delivery': seen.group(2)}
 
 
 def session_clear(runner=None):
@@ -545,7 +669,7 @@ def _tick_locked(env, directory, act, if_due):
             'stamps': env.stamps([e for e in entries if e['state'] == 'GRANTED'])}
     verdict = classify(snap, env.limits)
     waiting = verdict['waiting']
-    old_grant = verdict['oldest_grant_s'] >= GRANTED_ALERT_S
+    old_grant = verdict['grant_escalated']
     progress_at = state['progress_at'] if state['progress_at'] is not None else wall
     if progress or not (waiting or old_grant):
         progress_at = wall
@@ -564,11 +688,11 @@ def _tick_locked(env, directory, act, if_due):
         blocker = None
     confirmed = bool(blocker) and blocker['confirmations'] >= CONFIRM_TICKS
     quiet = verdict['primary'] in ('idle', 'healthy-busy')
-    stalled = (waiting > 0 or old_grant) and stalled_for >= (STALL_S if waiting else GRANTED_ALERT_S) and not quiet
+    stalled = (waiting > 0 or old_grant) and stalled_for >= (STALL_S if waiting else verdict['grant_stall_s'] or 0) and not quiet
     result = {'ran': True, 'at': iso(now), 'observation_gap': gap, 'primary': verdict['primary'], 'causes': verdict['causes'],
               'waiting': waiting, 'stalled': stalled, 'stalled_for_s': stalled_for, 'signature': sig, 'confirmed': confirmed,
               'owner_action': OWNER_ACTION.get(verdict['primary']), 'granted_is_execution': False, 'actions': [],
-              'notes': verdict['notes']}
+              'notes': verdict['notes'], 'notices': verdict['notices']}
     state['advances'] = [t for t in state['advances'] if wall - t < ADVANCE_WINDOW_S]
     wants_advance = waiting > 0 and not gap and confirmed and any(c in ADVANCE_CAUSES for c in verdict['causes']) and not (
         {'disk-floor', 'memory-pressure', 'state-unreadable'} & set(verdict['causes']))
@@ -590,7 +714,7 @@ def _tick_locked(env, directory, act, if_due):
                 result['recovery_exhausted'] = True
     alert_key = '%s:%s' % (verdict['primary'], sig)
     state['alerts'] = {k: v for k, v in state['alerts'].items() if wall - v['sent_at'] < 2 * ALERT_COOLDOWN_S}
-    escalate = stalled and confirmed and (verdict['primary'] not in RECOVERABLE or result.get('recovery_exhausted')
+    escalate = stalled and confirmed and verdict['primary'] != 'unclaimed-handoff' and (verdict['primary'] not in RECOVERABLE or result.get('recovery_exhausted')
                                           or stalled_for >= 2 * STALL_S)
     if escalate and alert_due(state, alert_key, wall):
         alert = {'cause': verdict['primary'], 'causes': sorted(verdict['causes']), 'signature': sig, 'detail': verdict['causes'],
@@ -605,9 +729,12 @@ def _tick_locked(env, directory, act, if_due):
                                       'next_try': wall + min(300 * 2 ** (attempts - 1), ALERT_COOLDOWN_S)}
         state['last_alert'] = {'at': iso(now), 'cause': verdict['primary'], 'signature': sig, 'delivered': delivered, 'attempts': attempts}
         result['alert'] = dict(alert, delivered=delivered)
+    handoff_incidents(env, state, verdict, entries, now, wall, result, gap and not fresh_start)
     state['clean_ticks'] = 0 if verdict['causes'] or gap else state.get('clean_ticks', 0) + 1
     last_alert = state.get('last_alert')
-    if state['clean_ticks'] >= CLEAR_AFTER_TICKS and last_alert and not last_alert.get('cleared') and wall >= last_alert.get('clear_next', 0):
+    # A clear bumps session-notify's cycle and forgets its dedup records: never while an incident's notice is still being handed off or polled.
+    open_notice = any(not incident_settled(r) for r in state['incidents'].values())
+    if state['clean_ticks'] >= CLEAR_AFTER_TICKS and last_alert and not last_alert.get('cleared') and wall >= last_alert.get('clear_next', 0) and not open_notice:
         try:
             cleared = bool(env.clear())
         except Exception:
@@ -630,6 +757,120 @@ def _tick_locked(env, directory, act, if_due):
         handle.write(json.dumps({k: result[k] for k in ('at', 'primary', 'waiting', 'stalled', 'confirmed', 'actions', 'observation_gap')},
                                 sort_keys=True) + '\n')
     return result
+
+
+def incident_settled(rec):
+    """Nothing more to ask session-notify about this incident: acknowledged, delivered, finished elsewhere, or unverifiable."""
+    handed = rec['notified_phase'] == rec['phase']
+    return rec['acknowledged_at'] is not None or rec['handed_off_unverified'] or (handed and (
+        rec['delivered_at'] is not None or rec['delivery'] in ('unknown', 'dropped', 'unconfirmed')))
+
+
+def owner_notice_state(rec):
+    """What is known about the owner notice: acknowledged, delivered, unknown (finished by an earlier call), undelivered (retries ended, or the hand-off keeps
+    failing: no backend), else pending. `undelivered` does not stop a clear, so it is surfaced in status instead; status.json is NOT delivery."""
+    if rec['acknowledged_at'] is not None:
+        return 'acknowledged'
+    if rec['delivered_at'] is not None:
+        return 'delivered'
+    if rec['delivery'] == 'unknown':
+        return 'unknown'
+    if rec['handed_off_unverified'] or rec['delivery'] in ('dropped', 'unconfirmed') or (rec['notified_phase'] != rec['phase'] and rec['attempts'] >= 1):
+        return 'undelivered'
+    return 'pending'
+
+
+def prune_incidents(incidents, wall):
+    """Drop incidents that can no longer be re-raised; over the soft limit drop acknowledged ones first, then ones past the lapse window. An
+    incident still inside its lapse window is never evicted for the soft limit (it could be raised twice)."""
+    kept = {k: r for k, r in incidents.items() if not (wall - r['expires_wall'] > INCIDENT_KEEP_S or (
+        r['acknowledged_at'] is not None and wall - r['acknowledged_at'] > INCIDENT_ACK_KEEP_S))}
+    for old_first in (lambda r: r['acknowledged_at'] is not None, lambda r: wall - r['expires_wall'] > LAPSE_WINDOW_S):
+        for key, rec in sorted(kept.items(), key=lambda kv: kv[1]['grant_wall']):
+            if len(kept) <= INCIDENT_LIMIT:
+                break
+            if old_first(rec):
+                del kept[key]
+    return dict(sorted(kept.items(), key=lambda kv: kv[1]['grant_wall'])[-INCIDENT_HARD_LIMIT:])
+
+
+def handoff_incidents(env, state, verdict, entries, now, wall, result, gap=False):
+    """Unclaimed-grant incidents (ADR 0019): raised at the escalate point before the grant lapses, or once on lapse if it never was.
+
+    Key = entry id plus grant time, so repeated ticks, restarts and a second monitor are one incident; a lapse after a raise upgrades it (at most two
+    notices per incident: escalate and lapse). `handed_off_at` is set only when session-notify queued the notice; `delivered_at` only when its own
+    result shows a backend accepted it; acknowledgement (a claim or release by a holder; never inferred from silence) and the ack deadline are separate
+    fields. On a tick after an observation gap (sleep, reboot, clock step) wall-clock age is not trusted: only the scheduler's own EXPIRED state may
+    raise. The monitor takes no action on the entry: the scheduler's own expiry frees the lane, which is only verified here."""
+    incidents, by_id = state['incidents'], {e['id']: e for e in entries}
+    for rec in incidents.values():
+        entry = by_id.get(rec['id'])
+        if entry and entry['state'] in ('CLAIMED', 'RELEASED'):
+            rec['claim_seen'] = True
+            if rec['acknowledged_at'] is None:
+                rec['acknowledged_at'] = wall
+    unseen = [e['id'] for e in entries if e['state'] in ('GRANTED', 'EXPIRED') and isinstance(e.get('grant'), dict) and is_handoff(e)
+              and not e.get('holder') and incident_key(e) not in incidents and safe_time(e['grant']['expires']) <= now]
+    try:
+        events = env.events(unseen) if unseen else {}      # receipts are read only for a lapse that has no incident yet
+    except Exception:
+        events = {}
+    wanted = [] if gap else [(e, 'escalated') for e in entries if e['id'] in verdict['unclaimed']]
+    wanted += [(e, 'lapsed') for e in lapsed_handoffs(entries, events, now, recorded_only=gap)]
+    for entry, phase in wanted:
+        key, rec = incident_key(entry), incidents.get(incident_key(entry))
+        if rec is None:
+            granted_at, expires = safe_time(entry['grant']['at']).timestamp(), safe_time(entry['grant']['expires']).timestamp()
+            incidents[key] = {'id': entry['id'], 'phase': phase, 'grant_wall': granted_at, 'expires_wall': expires, 'raised_at': wall,
+                              'ack_deadline': granted_at + escalate_s(entry), 'handed_off_at': None, 'delivered_at': None, 'delivery': None,
+                              'acknowledged_at': None, 'owner_notice_state': 'pending', 'claim_seen': False, 'handed_off_unverified': False, 'dedups': 0, 'notified_phase': None, 'attempts': 0, 'next_try': 0, 'waiter': False,
+                              'action': 'none', 'verify': None}
+        elif phase == 'lapsed' and rec['phase'] == 'escalated' and not rec['claim_seen']:
+            rec.update(phase='lapsed', attempts=0, next_try=0, handed_off_at=None, delivered_at=None, delivery=None, handed_off_unverified=False, dedups=0)
+    in_use = sum(1 for e in entries if e['state'] == 'CLAIMED' or (e['state'] == 'GRANTED' and safe_time(e['grant']['expires']) > now))
+    waiting = [e['id'] for e in entries if e['state'] in ('QUEUED', 'ELIGIBLE') and safe_time(e['wait_expires']) > now]
+    for key, rec in sorted(incidents.items(), key=lambda kv: kv[1]['grant_wall']):
+        if rec['phase'] == 'lapsed':     # the lane must be free again, and an eligible entry should start (existing continuation checks decide blame)
+            before = rec['verify'] or {}
+            nxt = before.get('next') or (waiting[0] if waiting else None)
+            started = bool(before.get('next_started')) or (nxt is not None and by_id.get(nxt, {}).get('state') in ('GRANTED', 'CLAIMED', 'RELEASED'))
+            rec['verify'] = {'at': iso(now), 'lanes_in_use': in_use, 'next': nxt, 'next_started': started}
+        handed = rec['notified_phase'] == rec['phase']
+        if wall < rec['next_try'] or incident_settled(rec):
+            continue
+        alert = {'cause': 'unclaimed-handoff', 'causes': ['unclaimed-handoff'], 'signature': incident_signature(key, rec['phase']),
+                 'detail': {'phase': rec['phase']}, 'recovery': [{'handoff': 'lapsed'}] if rec['phase'] == 'lapsed' else [],
+                 'owner_action': OWNER_ACTION['unclaimed-handoff'], 'blocked_for_s': int(wall - rec['grant_wall'])}
+        try:
+            outcome = env.emit_incident(alert)
+        except Exception:
+            outcome = {}
+        rec['attempts'] += 1
+        # `deduped` counts only for a notice this record already handed off (a poll); a first-time `deduped` or `no-backend` is not a hand-off.
+        if not handed and outcome.get('result') == 'deduped':
+            rec['dedups'] += 1     # an earlier call (a crash before the state was saved, another monitor) queued it; stop asking after a few
+            rec['handed_off_unverified'] = rec['dedups'] >= UNVERIFIED_AFTER_DEDUPS
+        if not handed and outcome.get('result') == 'queued':
+            rec.update(handed_off_at=wall, notified_phase=rec['phase'], attempts=0, next_try=0)
+            handed = True
+        if handed and outcome.get('result') in ('queued', 'deduped'):
+            rec['delivery'] = outcome.get('delivery')
+            if outcome.get('delivery') == 'sent':
+                rec.update(delivered_at=wall, next_try=0)
+            elif outcome.get('delivery') == 'pending' and rec['attempts'] >= 20:
+                rec['delivery'] = 'unconfirmed'
+        if not incident_settled(rec):
+            rec['next_try'] = wall + min(60 * 2 ** (min(rec['attempts'], 10) - 1), 900)     # not handed off, or not yet delivered: retried or polled
+        state['last_alert'] = {'at': iso(now), 'cause': 'unclaimed-handoff', 'signature': alert['signature'], 'delivered': rec['delivered_at'] is not None,
+                               'attempts': rec['attempts']}
+    for rec in incidents.values():
+        rec['owner_notice_state'] = owner_notice_state(rec)
+    state['incidents'] = prune_incidents(incidents, wall)
+    result['owner_notice_undelivered'] = [{'incident': k, 'id': r['id'], 'phase': r['phase'], 'since': iso(datetime.fromtimestamp(r['raised_at'] or wall, timezone.utc))}
+                                          for k, r in state['incidents'].items() if r['owner_notice_state'] == 'undelivered']
+    result['handoff_incidents'] = [{'id': r['id'], 'phase': r['phase'], 'owner_notice_state': r['owner_notice_state'], 'handed_off_at': r['handed_off_at'], 'delivered_at': r['delivered_at'],
+                                    'delivery': r['delivery'], 'acknowledged_at': r['acknowledged_at'], 'ack_deadline': r['ack_deadline'], 'waiter': False,
+                                    'action': 'none', 'verify': r['verify']} for r in state['incidents'].values()]
 
 
 def persist(directory, state, cpu_now, states_now, window, blocker, progress_at, wall, mono, boot):
@@ -707,8 +948,8 @@ def main(argv=None):
         return 0
     if args.cmd == 'status':
         data = read_json(monitor_dir(state_path) / 'status.json', {'ran': False, 'why': 'no tick yet'})
-        print(json.dumps(data, indent=1, sort_keys=True) if args.json else '%s primary=%s waiting=%s stalled=%s' % (
-            data.get('at'), data.get('primary'), data.get('waiting'), data.get('stalled')))
+        print(json.dumps(data, indent=1, sort_keys=True) if args.json else '%s primary=%s waiting=%s stalled=%s owner-notice-undelivered=%d' % (
+            data.get('at'), data.get('primary'), data.get('waiting'), data.get('stalled'), len(data.get('owner_notice_undelivered') or [])))
         return 0
     env = Env(da, state_path, ma.DEFAULT_STATE, default_limits(da, ma))
     result = tick(env, act=args.act, if_due=args.if_due)

@@ -59,14 +59,17 @@ ALLOWED_KINDS = set(KIND_TEXT.values()) | STOP_FAILURE_KINDS
 # Admission-monitor notices (SPE-176): every word of the notification comes from these fixed phrases; no ids, numbers, paths or free text.
 CAUSE_TEXT = {"disk-floor": "disk below floor", "memory-pressure": "memory pressure", "memory-hysteresis-static-compressor": "memory hysteresis, static compressor",
               "memory-hysteresis": "memory hysteresis", "stale-claim": "stale claim", "frozen-queue": "queue frozen", "failed-continuation": "continuation failed",
+              "unclaimed-handoff": "hand-off grant unclaimed",
               "outdated-caller": "outdated caller", "stalled-running": "running work stalled", "unobservable": "admission unobservable",
               "state-unreadable": "admission state unreadable"}
-RECOVERY_TEXT = {"none": "none tried", "advance-tried": "queue advance tried", "recovery-exhausted": "recovery exhausted", "observe-only": "observe only"}
+RECOVERY_TEXT = {"none": "none tried", "advance-tried": "queue advance tried", "recovery-exhausted": "recovery exhausted", "observe-only": "observe only",
+                 "lapsed": "grant lapsed"}
 OWNER_ACTION_TEXT = {"reclaim-disk": "reclaim disk", "reduce-load": "reduce load", "approve-memory-policy": "approve memory policy",
                      "wait-or-approve-memory-policy": "wait or approve memory policy", "confirm-claim-ended": "confirm claim ended",
                      "restart-waiting-session": "restart waiting session", "restart-outdated-caller": "restart outdated caller",
                      "inspect-admission-state": "inspect admission state", "inspect-running-workload": "inspect running workload",
-                     "run-queue-advance": "run queue advance", "inspect-memory-admission": "inspect memory admission"}
+                     "run-queue-advance": "run queue advance", "inspect-memory-admission": "inspect memory admission",
+                     "claim-or-reenqueue-handoff": "claim or re-enqueue hand-off"}
 RESOURCE_SESSION = "admission-monitor"
 QUARANTINE_PROBLEMS = {"corrupt", "not-regular", "too-large", "foreign-owner"}
 RESOURCE_TICKET = "SPE-176"
@@ -712,6 +715,7 @@ def render(fields):
 class Engine:
     def __init__(self, sdir, cfg, transports=None, clock=time.time, sleep=time.sleep):
         self.sdir, self.cfg, self.transports, self.clock, self.sleep = pathlib.Path(sdir), cfg, transports or REAL_TRANSPORTS, clock, sleep
+        self.last_key, self.last_delivery = None, None   # of the latest emit_resource request: its dedup key and what became of its delivery
 
     # -- state machine
     def set_state(self, rec, new, reason, now, cp=None, kind=None, notify=True, force=False, bump=True, extra=None):
@@ -729,10 +733,11 @@ class Engine:
             self.enqueue(rec, new, reason, now, kind, extra=extra)
 
     @staticmethod
-    def seen(rec, base, cycle, now):
-        """Best-effort dedup: a transition is a repeat only while its tombstone is inside DEDUP_WINDOW (and was not evicted by the cap)."""
+    def seen(rec, base, cycle, now, any_cycle=False):
+        """Best-effort dedup: a transition is a repeat only while its tombstone is inside DEDUP_WINDOW (and was not evicted by the cap). For the admission-monitor
+        session (`any_cycle`) a still-pending entry of the same key is a repeat whatever the cycle: a clear bumps the cycle and must not let it be queued twice."""
         got = rec["notified"].get(base)
-        return (got is not None and got[0] >= cycle and got[1] >= now - DEDUP_WINDOW) or any(p["key"] == base and p["cycle"] == cycle for p in rec["pending"])
+        return (got is not None and got[0] >= cycle and got[1] >= now - DEDUP_WINDOW) or any(p["key"] == base and (any_cycle or p["cycle"] == cycle) for p in rec["pending"])
 
     @staticmethod
     def mark_notified(rec, base, cycle, now):
@@ -755,10 +760,11 @@ class Engine:
             rec["dropped"] += 1
             rec["history"] = (rec["history"] + [{"t": int(now), "from": rec["state"], "to": rec["state"], "why": "queue-overflow-dropped"}])[-HISTORY_CAP:]
 
-    def enqueue(self, rec, state, reason, now, kind=None, extra_key="", extra=None):
+    def enqueue(self, rec, state, reason, now, kind=None, extra_key="", extra=None, strict=False):
         t, label, cycle = rec["task"], kind or state, rec["cycle"]
         base = hashlib.sha256("|".join([rec["session_id"], str(t.get("task") or t.get("ticket") or "-"), label, str(t.get("head") or ""), extra_key]).encode()).hexdigest()[:24]
-        if self.seen(rec, base, cycle, now):
+        self.last_key = base
+        if self.seen(rec, base, cycle, now, any_cycle=rec["session_id"] == RESOURCE_SESSION):
             return None
         raw = {"state": "FAILED" if kind == "STALE" else ("SESSION_ENDED" if kind == "ENDED" else ("RUNNING" if kind == "AGENT" else state)),
                "repo": t.get("repo") or rec.get("repo_label"), "ticket": t.get("ticket"), "pr": t.get("pr")}
@@ -777,7 +783,8 @@ class Engine:
             enabled = (self.cfg["backends"][name] or {}).get("enabled") is True
             backends[name] = {"status": "pending" if enabled else "skipped", "attempts": 0, "next_at": 0, "code": None if enabled else "disabled"}
         if not any(b["status"] == "pending" for b in backends.values()):
-            self.mark_notified(rec, base, cycle, now)
+            if not strict:       # strict: nothing was handed to any backend, so a later retry (a backend enabled meanwhile) must not hit a dedup tombstone
+                self.mark_notified(rec, base, cycle, now)
             return None
         self.make_room(rec, now)
         rec["pending"].append({"key": base, "cycle": cycle, "created": int(now), "fields": fields, "backends": backends})
@@ -975,13 +982,14 @@ class Engine:
             rec["last_seen"] = now
 
     # -- admission-monitor notices
-    def emit_resource(self, req, clear=False):
+    def emit_resource(self, req, clear=False, strict=False):
         """One deduplicated BLOCKED_RESOURCE notice on the synthetic `admission-monitor` session, or (clear) its return to IDLE.
 
         `req` is an EMIT_SCHEMA-shaped dict. Returns queued, deduped, no-backend, cleared, invalid, busy, error or untrusted:<problem>. Dedup key is cause + signature.
         """
         if not clear and not conforms(EMIT_SCHEMA, req):
             return "invalid"
+        self.last_delivery, self.last_key = None, None
         sid = RESOURCE_SESSION
         try:
             with session_lock(record_path(self.sdir, sid), sleep=self.sleep):
@@ -1010,10 +1018,17 @@ class Engine:
                     cp = {"task": RESOURCE_SESSION, "repo": RESOURCE_REPO, "ticket": RESOURCE_TICKET, "blocker_owner": "resource", "resume_trigger": resume}
                     self.set_state(rec, "BLOCKED_RESOURCE", "resource-stall", now, cp, notify=False)
                     extra = {"cause": req["cause"], "recovery": req["recovery"], "owner_action": req["owner_action"]}
-                    queued = self.enqueue(rec, "BLOCKED_RESOURCE", "resource-stall", now, extra_key=req["cause"] + ":" + (req.get("signature") or ""), extra=extra)
+                    queued = self.enqueue(rec, "BLOCKED_RESOURCE", "resource-stall", now, extra_key=req["cause"] + ":" + (req.get("signature") or ""), extra=extra,
+                                          strict=strict)
+                    tracked = next((p for p in rec["pending"] if p["key"] == self.last_key), None)
                     any_backend = any((b or {}).get("enabled") is True for b in self.cfg["backends"].values())
                     result = "no-backend" if not any_backend else ("queued" if queued else "deduped")
                 self.deliver(rec, now, budget_end=now + 6)
+                if not clear and result != "no-backend":
+                    # What this request's own pending entry looks like after the attempt; an entry that finished in an earlier call is unknown.
+                    states = {b["status"] for b in tracked["backends"].values()} if tracked else set()
+                    self.last_delivery = ("unknown" if tracked is None else "sent" if "sent" in states else
+                                          "pending" if states - TERMINAL else "dropped")
                 save_record(self.sdir, rec)
                 return result
         except TimeoutError:
@@ -1191,8 +1206,9 @@ def cmd_checkpoint(args):
 def cmd_emit_resource(args):
     cfg, _ = load_config()
     req = {"cause": args.cause, "recovery": args.recovery, "owner_action": args.owner_action, "signature": args.signature}
-    result = Engine(state_dir(), cfg).emit_resource(req, clear=args.clear)
-    print(f"emit-resource: {result}")
+    engine = Engine(state_dir(), cfg)
+    result = engine.emit_resource(req, clear=args.clear, strict=args.strict)
+    print(f"emit-resource: {result}" + (f" delivery={engine.last_delivery}" if engine.last_delivery else ""))
     return 0 if result in ("queued", "deduped", "no-backend", "cleared") else 1
 
 
@@ -1245,6 +1261,7 @@ def main(argv=None):
     for opt, table in (("cause", CAUSE_TEXT), ("recovery", RECOVERY_TEXT), ("owner-action", OWNER_ACTION_TEXT)):
         e.add_argument(f"--{opt}", choices=sorted(table))
     e.add_argument("--signature", type=signature_arg)
+    e.add_argument("--strict", action="store_true", help="a no-backend outcome leaves no dedup record, so a retry after a backend is enabled still notifies")
     r = sub.add_parser("render-config")
     r.add_argument("--profile", choices=("personal", "corporate"), default="personal")
     r.add_argument("--out")
