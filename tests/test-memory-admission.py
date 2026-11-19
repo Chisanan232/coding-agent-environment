@@ -9,6 +9,7 @@ import pathlib
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from contextlib import redirect_stdout
@@ -415,6 +416,75 @@ class LatchPolicy(unittest.TestCase):
             self.assertEqual(loaded["p2_hist"], st["p2_hist"])
             path.write_text(json.dumps({"latched": True, "ok_streak": 0, "last_ok": 0.0, "levels": [1]}))
             self.assertIsNone(ma.load_state(path)[1])
+
+
+class ConcurrentPolling(unittest.TestCase):
+    """The recovery streak and the P2 run advance by wall-clock spacing under the state lock, so many callers cannot speed them up."""
+
+    def setUp(self):
+        self.d = pathlib.Path(tempfile.mkdtemp(prefix="ma-conc-"))
+        self.addCleanup(__import__("shutil").rmtree, self.d, True)
+        self.state = str(self.d / "state.json")
+        self.clock = [100.0]
+
+    def one_check(self, compressor=0.05, level=1):
+        calls = iter([sample(0.0, level=level, compressor=compressor), sample(10.0, level=level, compressor=compressor)])
+        deps = {"sample": lambda: next(calls), "sleep": lambda s: None, "now": lambda: self.clock[0], "disk": lambda w: (True, "ok"),
+                "lock": ma.state_lock, "owned": lambda p: None, "lane_cap": lambda: 2}
+        ma.assess("heavy", 10.0, self.state, True, deps)
+
+    def burst(self, n=8, **kw):
+        threads = [threading.Thread(target=self.one_check, kwargs=kw) for _ in range(n)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+
+    def current(self):
+        state, problem = ma.load_state(self.state)
+        self.assertIsNone(problem)       # concurrent writers never leave a torn or partial file
+        return state
+
+    def latch(self):
+        self.one_check(level=4)
+        self.assertTrue(self.current()["latched"])
+
+    def test_eight_callers_at_the_same_instant_count_as_one_good_check(self):
+        self.latch()
+        self.clock[0] = 200.0
+        self.burst()
+        self.assertEqual(self.current()["ok_streak"], 1)
+
+    def test_callers_inside_the_spacing_do_not_advance_the_streak(self):
+        self.latch()
+        for now, expected in ((200.0, 1), (210.0, 1), (229.0, 1), (240.0, 2)):
+            self.clock[0] = now
+            self.burst(4)
+            self.assertEqual(self.current()["ok_streak"], expected, now)
+
+    def test_a_burst_never_releases_a_latch_on_one_instant(self):
+        self.latch()
+        self.clock[0] = 200.0
+        self.burst(20)
+        self.assertTrue(self.current()["latched"])
+
+    def test_the_p2_run_grows_one_sample_per_spacing_not_per_caller(self):
+        self.latch()
+        for i in range(4):
+            self.clock[0] = 200.0 + 61 * i
+            self.burst(6, compressor=0.262)
+            self.assertEqual(len(self.current()["p2_hist"]), i + 1)
+
+    def test_worsening_pressure_in_a_burst_relatches_and_clears_the_run(self):
+        self.latch()
+        for i in range(3):
+            self.clock[0] = 200.0 + 61 * i
+            self.burst(4, compressor=0.262)
+        self.clock[0] = 500.0
+        self.burst(3, level=2)
+        state = self.current()
+        self.assertTrue(state["latched"])
+        self.assertEqual((state["ok_streak"], state["p2_hist"]), (0, []))
 
 
 class StateFile(unittest.TestCase):
