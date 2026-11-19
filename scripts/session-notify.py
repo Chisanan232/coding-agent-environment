@@ -61,16 +61,20 @@ CAUSE_TEXT = {"disk-floor": "disk below floor", "memory-pressure": "memory press
               "memory-hysteresis": "memory hysteresis", "stale-claim": "stale claim", "frozen-queue": "queue frozen", "failed-continuation": "continuation failed",
               "unclaimed-handoff": "hand-off grant unclaimed", "queue-wait-excessive": "queue wait excessive", "workload-over-deadline": "workload over deadline",
               "outdated-caller": "outdated caller", "stalled-running": "running work stalled", "unobservable": "admission unobservable",
-              "state-unreadable": "admission state unreadable"}
+              "state-unreadable": "admission state unreadable",
+              "obsolete-wrapper-terminated": "obsolete wrapper terminated", "abandoned-unstarted-cancelled": "abandoned grant cancelled",
+              "failed-to-terminate": "wrapper failed to terminate"}
 RECOVERY_TEXT = {"none": "none tried", "advance-tried": "queue advance tried", "recovery-exhausted": "recovery exhausted", "observe-only": "observe only",
-                 "lapsed": "grant lapsed", "wait-expiry-near": "wait expiry near"}
+                 "lapsed": "grant lapsed", "wait-expiry-near": "wait expiry near", "wrapper-terminated": "wrapper terminated",
+                 "grant-cancelled": "grant cancelled", "termination-failed": "termination failed"}
 OWNER_ACTION_TEXT = {"reclaim-disk": "reclaim disk", "reduce-load": "reduce load", "approve-memory-policy": "approve memory policy",
                      "wait-or-approve-memory-policy": "wait or approve memory policy", "confirm-claim-ended": "confirm claim ended",
                      "restart-waiting-session": "restart waiting session", "restart-outdated-caller": "restart outdated caller",
                      "inspect-admission-state": "inspect admission state", "inspect-running-workload": "inspect running workload",
                      "run-queue-advance": "run queue advance", "inspect-memory-admission": "inspect memory admission",
                      "claim-or-reenqueue-handoff": "claim or re-enqueue hand-off", "check-queued-wait": "check queued wait",
-                     "check-over-deadline-workload": "check over-deadline workload"}
+                     "check-over-deadline-workload": "check over-deadline workload", "check-recovery-result": "check recovery result",
+                     "inspect-stuck-wrapper": "inspect stuck wrapper"}
 RESOURCE_SESSION = "admission-monitor"
 QUARANTINE_PROBLEMS = {"corrupt", "not-regular", "too-large", "foreign-owner"}
 RESOURCE_TICKET = "SPE-176"
