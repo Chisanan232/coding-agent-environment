@@ -364,6 +364,23 @@ def process_token(pid):
     raise ReservationError('cannot inspect process %d: ps exit %d' % (pid, done.returncode))
 
 
+def waiter_token(pid, tz='UTC'):
+    """Start-time token of a queue waiter: the same ps call as process_token but rendered in UTC (second precision), so a timezone or
+    DST change while the waiter lives cannot make a live process look replaced. Used only for the queue `waiter` field; holder
+    reservations keep process_token's local-time format. None when the process is gone."""
+    try:
+        done = subprocess.run(['/bin/ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True, timeout=5,
+                              stdin=subprocess.DEVNULL, env=dict(PS_ENV, TZ=tz))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReservationError('cannot inspect process %d: %s' % (pid, exc))
+    token = done.stdout.strip()
+    if done.returncode == 0 and token:
+        return token
+    if done.returncode == 1 and not token:
+        return None
+    raise ReservationError('cannot inspect process %d: ps exit %d' % (pid, done.returncode))
+
+
 def process_table():
     """{pid: (ppid, pgid, stat, start token)} for every process; raises ReservationError when it cannot be read.
 
@@ -1468,7 +1485,7 @@ def _claimed_orphans(entries, live, token_fn, table_fn=None, state_path=None):
 
 
 def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_id, nbytes, argv, again=False, now=None,
-                  wait_s=QUEUE_WAIT_S, declared=None, waiter_pid=None, token_fn=process_token, owner_fn=process_owner,
+                  wait_s=QUEUE_WAIT_S, declared=None, waiter_pid=None, token_fn=None, owner_fn=process_owner,
                   ancestor_fn=None):
     """Add one durable entry, or return the live one with the same fingerprint. Never stores argv.
 
@@ -1504,7 +1521,7 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
         return {'ok': False, 'reason': 'invalid-request: %s is missing or out of range' % bad}
     waiter = None
     if waiter_pid is not None:
-        waiter, why = _waiter_identity(waiter_pid, token_fn, owner_fn, ancestor_fn)
+        waiter, why = _waiter_identity(waiter_pid, token_fn or waiter_token, owner_fn, ancestor_fn)
         if why:
             return {'ok': False, 'reason': 'invalid-request: waiter-pid %s' % why}
     real_worktree = os.path.realpath(worktree)
@@ -1569,6 +1586,8 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
 
 def _waiter_identity(pid, token_fn, owner_fn, ancestor_fn):
     """({'pid', 'start_token'}, None) for a live same-user process that is us, our parent or an ancestor; else (None, reason)."""
+    if pid <= 1:
+        return None, 'is not a supervising process'
     try:
         token = token_fn(pid)
         owner = owner_fn(pid) if token is not None else None
@@ -1613,7 +1632,7 @@ def _has_waiting(state_path):
 
 
 def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=process_token, grant_s=QUEUE_GRANT_S, table_fn=None,
-                  host_fn=None, memory_fn=None):
+                  host_fn=None, memory_fn=None, waiter_token_fn=None):
     """_queue_advance, then a measurement sample per reservation holder outside the lock. host_fn feeds the resource budget.
 
     memory_fn (the CLI passes the SPE-117 gate) makes a grant conditional on the memory gate admitting: a grant that queue_claim
@@ -1628,19 +1647,20 @@ def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=pro
         seen['free'] = free_fn()
         return seen['free']
 
-    out = _queue_advance(state_path, free, now, token_fn, grant_s, table_fn, host, memory='probe' if memory_fn else None)
+    out = _queue_advance(state_path, free, now, token_fn, grant_s, table_fn, host, memory='probe' if memory_fn else None,
+                         waiter_token_fn=waiter_token_fn)
     if memory_fn and out.pop('grant_pending', False):
         admitted, why = memory_fn()
         first = out
         out = _queue_advance(state_path, free, datetime.now(timezone.utc) if caller_now is None else now, token_fn, grant_s, table_fn, host,
-                             memory=(bool(admitted), why))
+                             memory=(bool(admitted), why), waiter_token_fn=waiter_token_fn)
         for key in ('expired', 'released', 'cancelled'):
             out[key] = first[key] + out[key]
     _measure(state_path, 'advance', seen.get('free'), now)
     return out
 
 
-def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, host=None, memory=None):
+def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, host=None, memory=None, waiter_token_fn=None):
     """One advance step under the lock: expire lapsed grants and waits, then grant the first in line if a lane is free.
 
     A lane is occupied by a live reservation (including one past its time limit or unverifiable) and by an unclaimed,
@@ -1699,7 +1719,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
             for entry in entries:
                 # SPE-176: a waiter that is provably gone will never claim; free its place (and a granted lane) now. A CLAIMED entry
                 # is not in WAITING_STATES and is left to the holder rules above.
-                if entry['state'] in WAITING_STATES and _waiter_gone(entry, token_fn):
+                if entry['state'] in WAITING_STATES and _waiter_gone(entry, waiter_token_fn or waiter_token):
                     was = entry['state']
                     entry['state'] = 'CANCELLED'
                     _write_queue_entry(state_path, entry)
