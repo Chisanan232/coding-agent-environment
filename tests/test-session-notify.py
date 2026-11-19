@@ -1749,6 +1749,44 @@ class EmitResource(Base):
         self.emit(self.engine(cfg(known_repos=[])))
         self.assertEqual(self.fake.sent[0][1], {"title": "Claude Code: admission stalled", "body": "disk below floor | recovery: none tried | action: reclaim disk"})
 
+    def test_unclaimed_handoff_phrases_are_fixed_enums(self):
+        self.assertEqual(self.emit(cause="unclaimed-handoff", recovery="none", owner_action="claim-or-reenqueue-handoff"), "queued")
+        self.assertEqual(self.fake.sent[0][1]["body"], "hand-off grant unclaimed | recovery: none tried | action: claim or re-enqueue hand-off")
+        self.fake.sent.clear()
+        self.assertEqual(self.emit(cause="unclaimed-handoff", recovery="lapsed", owner_action="claim-or-reenqueue-handoff", signature="fedcba9876543210"), "queued")
+        self.assertEqual(self.fake.sent[0][1]["body"], "hand-off grant unclaimed | recovery: grant lapsed | action: claim or re-enqueue hand-off")
+
+    def test_strict_no_backend_leaves_no_dedup_record_so_a_later_retry_is_queued(self):
+        off = cfg()
+        for b in off["backends"].values():
+            b["enabled"] = False
+        self.assertEqual(self.engine(off).emit_resource(dict(self.REQ), strict=True), "no-backend")
+        self.assertEqual(self.rec("admission-monitor")["notified"], {})
+        self.assertEqual(self.engine().emit_resource(dict(self.REQ), strict=True), "queued")
+        self.assertEqual(len(self.fake.sent), 3)
+
+    def test_a_clear_while_a_notice_is_pending_never_lets_it_be_queued_twice(self):
+        failing = Fake(fail={"macos": "boom", "ntfy": "boom", "pushover": "boom"})
+        self.assertEqual(self.engine(fake=failing).emit_resource(dict(self.REQ)), "queued")
+        self.engine().emit_resource({}, clear=True)
+        self.assertEqual(self.engine(fake=failing).emit_resource(dict(self.REQ)), "deduped")
+        self.assertEqual(len(self.rec("admission-monitor")["pending"]), 1)
+
+    def test_non_strict_no_backend_keeps_the_dedup_record(self):
+        off = cfg()
+        for b in off["backends"].values():
+            b["enabled"] = False
+        self.assertEqual(self.engine(off).emit_resource(dict(self.REQ)), "no-backend")
+        self.assertEqual(self.engine().emit_resource(dict(self.REQ)), "deduped")
+
+    def test_the_delivery_of_the_request_itself_is_reported(self):
+        eng = self.engine()
+        self.assertEqual((eng.emit_resource(dict(self.REQ)), eng.last_delivery), ("queued", "sent"))
+        eng = self.engine(fake=Fake(fail={"macos": "boom", "ntfy": "boom", "pushover": "boom"}))
+        self.assertEqual((eng.emit_resource(dict(self.REQ, signature="fedcba9876543210")), eng.last_delivery), ("queued", "pending"))
+        eng = self.engine()
+        self.assertEqual((eng.emit_resource(dict(self.REQ)), eng.last_delivery), ("deduped", "unknown"))
+
     def test_backends_off_returns_no_backend(self):
         c = cfg()
         for b in c["backends"].values():
