@@ -630,7 +630,11 @@ class FinalReviewFindings(MonitorBase):
         for entry in da._queue_entries(self.state_path)[0]:
             entry['state'] = 'CANCELLED'
             da._write_queue_entry(self.state_path, entry)
-        out = self.tick()
+        out = None
+        for _ in range(mon.CLEAR_AFTER_TICKS + 1):
+            out = self.tick()
+            if out.get('cleared'):
+                break
         self.assertTrue(out.get('cleared'))
         self.assertEqual(len(self.cleared), 1)
         self.tick()
@@ -641,13 +645,63 @@ class FinalReviewFindings(MonitorBase):
         self.run_ticks(40)
         self.assertEqual(len(self.alerts), 2)        # same cause, new incident, announced again
 
-    def test_an_eligible_head_is_busy_not_frozen(self):
+    def test_an_eligible_head_with_nothing_holding_a_lane_is_still_frozen(self):
         self.enqueue('HORO-4001')
         for entry in da._queue_entries(self.state_path)[0]:
             entry['state'] = 'ELIGIBLE'
             da._write_queue_entry(self.state_path, entry)
         out = self.run_ticks(5)
-        self.assertEqual(out['primary'], 'healthy-busy')
+        self.assertEqual(out['primary'], 'frozen-queue')
+
+    def test_one_clean_tick_does_not_clear_or_reset_the_cooldown(self):
+        self.enqueue('HORO-4001')
+        self.enqueue('HORO-4002')
+        self.mem['metrics'] = dict(CALM, pressure_level=2)
+        self.run_ticks(40)
+        self.assertEqual(len(self.alerts), 1)
+        self.mem['metrics'] = dict(CALM)            # a flicker: one calm reading, then the same stall again
+        self.tick()
+        self.assertEqual(self.cleared, [])
+        self.mem['metrics'] = dict(CALM, pressure_level=2)
+        self.run_ticks(40)
+        self.assertEqual(len(self.alerts), 1)
+        self.assertEqual(self.cleared, [])
+
+    def test_a_failing_clear_backs_off_instead_of_retrying_every_tick(self):
+        self.enqueue('HORO-4001')
+        self.enqueue('HORO-4002')
+        self.mem['metrics'] = dict(CALM, pressure_level=2)
+        self.run_ticks(40)
+        for entry in da._queue_entries(self.state_path)[0]:
+            entry['state'] = 'CANCELLED'
+            da._write_queue_entry(self.state_path, entry)
+        self.mem['metrics'] = dict(CALM)
+        attempts = []
+        env_factory = self.env
+
+        def env():
+            e = env_factory()
+            e.clear = lambda: attempts.append(self.clock.now) or False
+            return e
+        self.env = env
+        self.run_ticks(30)
+        self.assertGreaterEqual(len(attempts), 2)
+        self.assertLess(len(attempts), 6)
+
+    def test_a_claim_released_and_garbage_collected_between_ticks_is_progress(self):
+        self.enqueue('HORO-4001')
+        self.enqueue('HORO-4002')
+        entries = da._queue_entries(self.state_path)[0]
+        entries[0].update(state='CLAIMED', holder={'pid': 4242, 'start_token': 't'})
+        da._write_queue_entry(self.state_path, entries[0])
+        self.table = {4242: (1, 5.0)}
+        self.run_ticks(3)
+        (da.queue_dir(self.state_path) / (entries[0]['id'] + '.json')).unlink()
+        self.table = {}
+        before = self.tick()
+        self.assertGreater(before['stalled_for_s'] + 1, 0)
+        state = json.loads((mon.monitor_dir(self.state_path) / 'state.json').read_text())
+        self.assertEqual(state['progress_at'], self.clock.now.timestamp())    # the vanished claim reset the stall clock
 
     def test_a_non_dict_runner_stamp_is_reported_not_a_traceback(self):
         self.enqueue('HORO-4001')
@@ -712,7 +766,7 @@ class SafetyShape(unittest.TestCase):
             os.environ['ADMISSION_MONITOR_DIR'] = str(Path(root) / 'mon')
             try:
                 mon.tick(mon.Env(da, state, memory, mon.default_limits(da, ma), memory=lambda: {'latched': True, 'ok_streak': 0, 'metrics': dict(CALM)},
-                                 table=lambda: {}, free=lambda: 300 * GIB, boot=lambda: 1))
+                                 table=lambda: {}, free=lambda: 300 * GIB, boot=lambda: 1, notify=lambda a: True, clear=lambda: True))
             finally:
                 os.environ.pop('ADMISSION_MONITOR_DIR')
             self.assertEqual(memory.read_bytes(), before)
