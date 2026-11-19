@@ -260,6 +260,8 @@ class SingleAccounting(LaCargoBase):
         self.assertIn('--again', enqueue)
         self.assertEqual(enqueue[enqueue.index('--harness') + 1], 'claude')
         self.assertEqual(enqueue[enqueue.index('--worktree') + 1], os.getcwd())
+        waiter = enqueue[enqueue.index('--waiter-pid') + 1]   # SPE-176: the supervising wrapper, so a dead one frees its place
+        self.assertTrue(waiter.isdigit() and int(waiter) > 0, waiter)
 
     def test_queue_timeout_cancels_and_never_builds(self):
         (self.dir / 'mode').write_text('refuse')
