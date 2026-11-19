@@ -782,6 +782,77 @@ class IncrementalScopeTests(Fixture):
         self.handles = ({str(inc / "credential_store_test-a000000000001")}, True)
         self.assertEqual(self.classify(inc, "cargo_incremental")[0][0], "C")
 
+    tree_ids = iter(range(1000))
+
+    def tree(self, **kw):
+        _, inc = self.target(name="tgt-%d" % next(self.tree_ids))
+        self.generated(inc)
+        self.assertTrue(rl.is_generated_incremental_tree(inc))
+        self.assertTrue(rl.is_generated_incremental_tree(inc, **kw))
+        return inc, next(p for p in sorted(inc.iterdir()) if "token" in p.name)
+
+    def test_tree_check_rejects_each_structural_deviation(self):
+        sess = "s-hn0w0a1hoy-0kzvtw0-58velkjf4a000dk65birnb0gs"
+        outside = self.root / "outside"
+        outside.mkdir()
+
+        def symlinked_session(c):
+            shutil.rmtree(c / sess)
+            os.symlink(outside, c / sess)
+
+        def fifo(c):
+            os.mkfifo(c / sess / "dep-graph.bin")
+
+        def deeper(c):
+            (c / sess / "sub").mkdir()
+
+        def unknown(c):
+            (c / sess / "credentials.json").write_text("")
+
+        def symlinked_file(c):
+            os.symlink(outside, c / sess / "dep-graph.bin")
+
+        def oversize_lock(c):
+            (c / "s-hn0w0a1hoy-0kzvtw0.lock").write_bytes(b"x" * 4097)
+
+        def lock_is_symlink(c):
+            (c / "s-hn0w0a1hoy-0kzvtw0.lock").unlink()
+            os.symlink(outside, c / "s-hn0w0a1hoy-0kzvtw0.lock")
+
+        def empty_crate(c):
+            (c.parent / "empty_crate-0000000000000").mkdir()
+
+        def unreadable(c):
+            c.chmod(0)
+            self.addCleanup(c.chmod, 0o700)
+
+        for fn in (symlinked_session, fifo, deeper, unknown, symlinked_file, oversize_lock, lock_is_symlink, empty_crate,
+                   unreadable):
+            with self.subTest(case=fn.__name__):
+                inc, crate = self.tree()
+                fn(crate)
+                self.assertFalse(rl.is_generated_incremental_tree(inc))
+
+    def test_tree_check_accepts_known_session_files_and_lock_only_crates(self):
+        inc, crate = self.tree()
+        for name in ("dep-graph.bin", "query-cache.bin", "work-products.bin", "metadata.rmeta", "a" * 25 + ".o"):
+            (crate / "s-hn0w0a1hoy-0kzvtw0-58velkjf4a000dk65birnb0gs" / name).write_text("")
+        lock_only = inc / "lock_only-0000000000001"
+        lock_only.mkdir()
+        (lock_only / "s-hn0w0a1hoy-0kzvtw1.lock").write_text("")
+        self.assertTrue(rl.is_generated_incremental_tree(inc))
+
+    def test_tree_check_fails_closed_on_entry_budget(self):
+        inc, _ = self.tree()
+        self.assertFalse(rl.is_generated_incremental_tree(inc, limit=3))
+
+    def test_tree_check_fails_closed_on_deadline_even_for_empty_crate_dirs(self):
+        _, inc = self.target(name="tgt-deadline")
+        for i in range(130):
+            (inc / ("c%d-%013d" % (i, i))).mkdir()
+        ticks = iter(range(10**6))
+        self.assertFalse(rl.is_generated_incremental_tree(inc, seconds=5, clock=lambda: next(ticks)))
+
     def test_never_class_a_even_with_a_private_receipt(self):
         _, inc = self.target()
         receipt(inc, private=True)
