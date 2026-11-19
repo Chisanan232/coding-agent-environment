@@ -84,6 +84,7 @@ class MonitorBase(unittest.TestCase):
         self.addCleanup(lambda: setattr(mon, 'subprocess', real_subprocess))
         self.addCleanup(lambda: self.assertEqual(self.spawned, []))
         self.statuses = {}
+        self.process_answers = {}
         self.shim = types.SimpleNamespace(**{k: getattr(da, k) for k in dir(da) if not k.startswith('__')})
         self.shim.holder_status = lambda pid, token, workload, *a: da.HolderStatus(self.statuses.get(pid, 'alive'))
 
@@ -93,7 +94,8 @@ class MonitorBase(unittest.TestCase):
                        boot=lambda: self.boot, table=lambda: self.table, memory=lambda: dict(self.mem), free=lambda: self.free,
                        advance=lambda: self.advances.append(self.clock.now) or {'exit': 0}, notify=lambda a: self.alerts.append(a) or True,
                        clear=lambda: self.cleared.append(self.clock.now) or True,
-                       emit_incident=lambda alert: self.alerts.append(alert) or dict(self.emit_result))
+                       emit_incident=lambda alert: self.alerts.append(alert) or dict(self.emit_result),
+                       owner_process=lambda pid, token: self.process_answers.get(pid))      # never the real process table: unknown unless a test says otherwise
 
     def enqueue(self, ticket, nbytes=16 * GIB, session='0b1d2e3f-aaaa-bbbb-cccc-1234567890ab'):
         out = da.queue_enqueue(self.state_path, label='job-' + ticket.lower(), tickets=[ticket], repo='horonom/x', worktree=str(self.worktree),
@@ -671,6 +673,42 @@ class HandoffIncidents(MonitorBase):
         self.assertNotIn('waiter', self.entry(qid))
         return qid
 
+    def handoff_outbox(self):
+        path = mon.monitor_dir(self.state_path) / mon.OUTBOX_NAME
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def test_hand_off_escalate_and_lapse_each_write_one_closed_schema_outbox_line_deduped_by_key(self):
+        qid = self.granted_handoff()
+        self.walk(840)
+        self.assertEqual(self.handoff_outbox(), [])                            # before the escalate point
+        self.walk(120)
+        (first,) = self.handoff_outbox()
+        self.assertEqual(sorted(first), ['at', 'blocker', 'cause', 'clock', 'evidence', 'job', 'key', 'owner', 'owner_action', 'phase', 'recovery', 'v'])
+        self.assertEqual((first['job'], first['cause'], first['clock'], first['phase'], first['recovery'], first['owner_action']),
+                         (qid, 'unclaimed-handoff', 'grant', 'escalated', 'none', 'claim-or-reenqueue-handoff'))
+        self.assertEqual(first['evidence'], ['session-unknown', 'grant-unclaimed-escalate', 'no-waiter'])
+        self.assertEqual((first['owner']['kind'], first['owner']['reachable'], first['key']), ('codex', None, next(iter(self.incidents()))))
+        self.walk(120)
+        self.assertEqual(len(self.handoff_outbox()), 1)                        # repeated ticks: no duplicate
+        self.clock.advance(300)
+        self.expire()
+        self.tick(0)
+        lines = self.handoff_outbox()
+        self.assertEqual([l['phase'] for l in lines], ['escalated', 'lapsed'])
+        self.assertEqual((lines[1]['recovery'], lines[1]['evidence'][-2]), ('lapsed', 'grant-lapsed-unclaimed'))
+        self.assertEqual(lines[0]['key'], lines[1]['key'])
+        self.run_ticks(5)
+        self.assertEqual(len(self.handoff_outbox()), 2)
+        text = (mon.monitor_dir(self.state_path) / mon.OUTBOX_NAME).read_text()
+        self.assertNotIn('0b1d2e3f', text)
+
+    def test_a_claimed_hand_off_writes_no_outbox_line(self):
+        qid = self.granted_handoff()
+        self.tick(180)
+        self.claim(qid)
+        self.run_ticks(20)
+        self.assertEqual(self.handoff_outbox(), [])
+
     def test_the_hand_off_window_mirrors_the_scheduler_constant(self):
         self.assertEqual(mon.HANDOFF_GRANT_S, da.HANDOFF_GRANT_S)
         self.assertEqual(mon.escalate_s(self.entry(self.granted_handoff())), 900)
@@ -878,7 +916,7 @@ class HandoffIncidents(MonitorBase):
     def test_an_incident_inside_its_lapse_window_is_never_evicted_for_the_soft_limit(self):
         wall = self.clock.now.timestamp()
         rec = lambda i, **kw: dict({'id': 'q%06d' % i, 'phase': 'escalated', 'grant_wall': wall - 100 * i, 'expires_wall': wall - 100 * i + 1200,
-                                    'acknowledged_at': None}, **kw)
+                                    'acknowledged_at': None, 'resolved_at': None, 'owner_notice_state': 'pending'}, **kw)
         crowded = {'k%d' % i: rec(i) for i in range(mon.INCIDENT_LIMIT + 6)}
         crowded['acked'] = rec(999, acknowledged_at=wall - 10)
         kept = mon.prune_incidents(crowded, wall)
@@ -1276,6 +1314,463 @@ class FinalReviewFindings(MonitorBase):
         self.assertLess((directory / 'receipts.jsonl').stat().st_size, 4096)
 
 
+class WaitAndRunClocks(MonitorBase):
+    """ADR 0019 clocks 1 and 3: QUEUED wait (4 h notice, 12.5 h incident, 20 h near-expiry) and execution (2x deadline). Notice only, never an action."""
+    CAUSES = ('queue-wait-excessive', 'workload-over-deadline')
+
+    def setUp(self):
+        super().setUp()
+        self.mem['latched'] = False
+
+    def entry(self, qid):
+        return [e for e in da._queue_entries(self.state_path)[0] if e['id'] == qid][0]
+
+    def age(self, qid, hours):
+        """Make the entry look `hours` old now (created and wait window moved together)."""
+        entry = self.entry(qid)
+        created = self.clock.now - timedelta(hours=hours)
+        entry.update(created=mon.iso(created), wait_expires=mon.iso(created + timedelta(hours=24)))
+        da._write_queue_entry(self.state_path, entry)
+
+    def claim(self, qid, hours, pid=4242, **extra):
+        entry = self.entry(qid)
+        entry.update(state='CLAIMED', holder={'pid': pid, 'start_token': 'Thu Nov 19 04:00:00 2026', 'claimed_at': mon.iso(self.clock.now - timedelta(hours=hours))}, **extra)
+        da._write_queue_entry(self.state_path, entry)
+        self.table = {pid: (1, 10.0)}
+
+    def pages(self):
+        return [a for a in self.alerts if a['cause'] in self.CAUSES]
+
+    def incidents(self):
+        return json.loads((mon.monitor_dir(self.state_path) / 'state.json').read_text()).get('incidents', {})
+
+    def outbox(self):
+        path = mon.monitor_dir(self.state_path) / mon.OUTBOX_NAME
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def walk(self, seconds, step=120, busy=False):
+        """Tick every `step` s; `busy` gives the running holder fresh CPU each tick (a live, working job)."""
+        out = None
+        for i in range(seconds // step):
+            if busy and 4242 in self.table:
+                self.table = {4242: (1, self.table[4242][1] + 30.0)}
+            out = self.tick(step)
+        return out
+
+    # ---- queued wait ----
+    def test_complete_queued_lifecycle_notice_escalate_dedup_near_expiry_and_two_notice_cap(self):
+        qid = self.enqueue('HORO-3101')
+        self.age(qid, 3.9)
+        out = self.walk(3600 // 2)                                         # +30 min: crosses 4 h
+        self.assertTrue(any(qid in n and 'queued 4 h' in n for n in out['notices']), out['notices'])
+        self.assertEqual((self.pages(), self.incidents()), ([], {}))        # a notice is status only: no page, no incident
+        self.walk(8 * 3600 + 1200 - 10 * 120)                                # up to just under 12.5 h
+        self.assertEqual((self.pages(), self.incidents()), ([], {}))
+        self.walk(20 * 120)
+        (page,) = self.pages()
+        self.assertEqual((page['cause'], page['owner_action'], mon.recovery_phrase(page['recovery'], False)), ('queue-wait-excessive', 'check-queued-wait', 'none'))
+        self.assertEqual(list(self.incidents()), [qid + ':wait'])
+        self.walk(7 * 3600)                                                   # hours of further ticks: still one notice (dedup by key)
+        self.assertEqual(len(self.pages()), 2)                               # the 20 h second phase arrived in that span
+        second = self.pages()[1]
+        self.assertEqual(mon.recovery_phrase(second['recovery'], False), 'wait-expiry-near')
+        self.assertNotEqual(page['signature'], second['signature'])
+        self.walk(3 * 3600)
+        self.assertEqual(len(self.pages()), 2)                               # never a third
+        (rec,) = self.incidents().values()
+        self.assertEqual((rec['phase'], rec['clock'], rec['acknowledged_at']), ('near', 'wait', None))
+        self.assertEqual([o['phase'] for o in self.outbox()], ['escalated', 'near'])
+
+    def test_a_queue_entry_under_12_5_hours_never_pages(self):
+        qid = self.enqueue('HORO-3102')
+        self.age(qid, 12.0)
+        self.walk(10 * 120)
+        self.assertEqual((self.pages(), self.incidents(), self.outbox()), ([], {}, []))
+
+    def test_an_entry_waiting_only_behind_a_running_higher_entry_does_not_page_inside_the_wait_budget(self):
+        first, second = self.enqueue('HORO-3103'), self.enqueue('HORO-3104')
+        self.claim(first, 5)
+        self.age(second, 9)
+        self.walk(20 * 120)
+        self.assertEqual((self.pages(), self.incidents()), ([], {}))
+
+    def test_a_first_tick_after_a_restart_raises_a_wait_already_past_the_near_point_once_as_near(self):
+        qid = self.enqueue('HORO-3105')
+        self.age(qid, 21)
+        self.tick(60)
+        (page,) = self.pages()
+        self.assertEqual(mon.recovery_phrase(page['recovery'], False), 'wait-expiry-near')
+        self.tick(60)
+        self.assertEqual(len(self.pages()), 1)
+
+    def test_restart_keeps_one_incident_and_a_second_monitor_cannot_tick(self):
+        qid = self.enqueue('HORO-3106')
+        self.age(qid, 13)
+        self.tick(60)
+        directory = mon.monitor_dir(self.state_path)
+        fd = os.open(directory / 'monitor.lock', os.O_WRONLY)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            self.assertFalse(self.tick()['ran'])
+        finally:
+            os.close(fd)
+        for _ in range(3):                                                    # fresh Env each time, state reloaded from disk
+            self.tick()
+        self.assertEqual((len(self.pages()), len(self.incidents()), len(self.outbox())), (1, 1, 1))
+        # the state file is lost (restart with nothing persisted): the same notice is asked again and session-notify's own dedup answers it
+        self.emit_result = {'result': 'deduped', 'delivery': 'unknown'}
+        (mon.monitor_dir(self.state_path) / 'state.json').unlink()
+        self.tick(60)
+        self.assertEqual(len(self.incidents()), 1)
+
+    def test_sleep_time_is_discounted_from_a_wait_for_every_later_tick_not_just_the_gap_tick(self):
+        qid = self.enqueue('HORO-3107')
+        self.age(qid, 12.4)
+        self.tick(60)
+        out = self.tick(3600, asleep=True)                                    # +1 h of wall clock that the monotonic clock did not see
+        self.assertTrue(out['observation_gap'])
+        for _ in range(3):                                                    # two (three) consecutive ordinary ticks after the gap: still no page
+            self.assertFalse(self.tick(60)['observation_gap'])
+        self.assertEqual((self.pages(), self.incidents()), ([], {}))
+        self.walk(5 * 60)                                                     # real elapsed uptime still counts: 12.4 h plus 6 min waited
+        self.assertEqual(len(self.pages()), 1)
+
+    def test_a_clock_step_backwards_gives_no_age_and_no_incident(self):
+        qid = self.enqueue('HORO-3108')
+        entry = self.entry(qid)
+        entry['created'] = mon.iso(self.clock.now + timedelta(hours=30))      # a created time in the future is never an age
+        da._write_queue_entry(self.state_path, entry)
+        self.walk(5 * 120)
+        self.assertEqual((self.pages(), self.incidents()), ([], {}))
+
+    def test_a_granted_entry_resolves_its_wait_incident_without_another_notice(self):
+        qid = self.enqueue('HORO-3109')
+        self.age(qid, 13)
+        self.tick(60)
+        entry = self.entry(qid)
+        entry.update(state='RELEASED')
+        da._write_queue_entry(self.state_path, entry)
+        self.walk(5 * 120)
+        (rec,) = self.incidents().values()
+        self.assertEqual((rec['acknowledged_at'], rec['owner_notice_state']), (None, 'delivered'))
+        self.assertIsNotNone(rec['resolved_at'])
+        self.assertEqual(len(self.pages()), 1)
+
+    def test_a_global_blocker_is_attributed_but_the_entry_still_gets_its_one_incident(self):
+        qid = self.enqueue('HORO-3110')
+        self.age(qid, 13)
+        self.free = 1 * GIB                                                   # disk-floor holds the whole queue
+        out = self.walk(5 * 120)
+        self.assertEqual(out['primary'], 'disk-floor')
+        (rec,) = self.incidents().values()
+        self.assertEqual(rec['blocker'], 'disk-floor')
+        self.assertEqual(len(self.pages()), 1)
+        (line,) = self.outbox()
+        self.assertIn('blocked-by-global-cause', line['evidence'])
+        self.assertEqual(line['blocker'], 'disk-floor')
+
+    def test_a_memory_blocker_is_attributed_the_same_way(self):
+        qid = self.enqueue('HORO-3111')
+        self.age(qid, 13)
+        self.mem.update(latched=True, ok_streak=0)
+        self.walk(5 * 120)
+        (rec,) = self.incidents().values()
+        self.assertTrue(rec['blocker'].startswith('memory-hysteresis'), rec['blocker'])
+
+    def test_waiting_behind_a_running_entry_over_its_deadline_pages_and_records_that_blocker(self):
+        first, second = self.enqueue('HORO-3112'), self.enqueue('HORO-3113')
+        self.claim(first, 7)                                                   # past its 6 h deadline (not yet 2x: no run incident)
+        self.age(second, 13)
+        self.walk(3 * 120)
+        (rec,) = self.incidents().values()
+        self.assertEqual((rec['id'], rec['blocker'], rec['status']), (second, 'higher-entry-running', None))
+        self.assertIn('behind-running-entry', self.outbox()[0]['evidence'])
+        self.assertEqual(len(self.pages()), 1)
+
+    def suppressed_wait(self, running_hours=1):
+        first, second = self.enqueue('HORO-3150'), self.enqueue('HORO-3151')
+        self.claim(first, running_hours)
+        self.age(second, 13)
+        out = self.walk(3 * 120, busy=True)
+        return first, second, out
+
+    def test_a_wait_behind_healthy_running_work_is_a_status_note_and_a_suppressed_record_not_a_page(self):
+        first, second, out = self.suppressed_wait()
+        (rec,) = self.incidents().values()
+        self.assertEqual((rec['id'], rec['status'], rec['blocker'], rec['phase']), (second, 'suppressed-higher-entry', 'higher-entry-running', 'escalated'))
+        self.assertEqual((self.pages(), self.outbox()), ([], []))
+        self.assertTrue(any(second in n and 'within its deadline' in n for n in out['notices']), out['notices'])
+        self.assertEqual(out['owner_notice_undelivered'], [])
+        self.walk(10 * 120, busy=True)
+        self.assertEqual((self.pages(), self.outbox()), ([], []))
+
+    def test_a_suppressed_wait_pages_when_the_running_entry_passes_its_deadline(self):
+        first, second, _ = self.suppressed_wait(5.9)
+        self.walk(10 * 60, busy=True)                                          # the higher entry crosses 6 h
+        (rec,) = self.incidents().values()
+        self.assertEqual((rec['status'], rec['phase']), (None, 'escalated'))
+        (page,) = self.pages()
+        self.assertEqual(mon.recovery_phrase(page['recovery'], False), 'none')
+        self.assertEqual(len(self.outbox()), 1)
+
+    def test_a_suppressed_wait_pages_when_a_global_cause_holds_the_queue(self):
+        self.suppressed_wait()
+        self.free = 1 * GIB
+        self.walk(3 * 120)
+        (rec,) = self.incidents().values()
+        self.assertEqual((rec['status'], rec['blocker']), (None, 'disk-floor'))
+        self.assertEqual(len(self.pages()), 1)
+
+    def test_a_suppressed_wait_pages_when_the_running_work_ends_and_it_is_still_queued(self):
+        first, second, _ = self.suppressed_wait()
+        entry = self.entry(first)
+        entry.update(state='RELEASED')
+        da._write_queue_entry(self.state_path, entry)
+        self.walk(3 * 120)
+        (rec,) = self.incidents().values()
+        self.assertEqual((rec['status'], rec['blocker']), (None, 'none'))
+        self.assertEqual(len(self.pages()), 1)
+
+    def test_wait_expiry_near_always_pages_even_behind_healthy_running_work(self):
+        first, second, _ = self.suppressed_wait()
+        self.age(second, 19.99)
+        self.claim(first, 1)
+        self.walk(60 * 60 // 2, busy=True)                                     # crosses 20 h
+        (rec,) = self.incidents().values()
+        self.assertEqual((rec['status'], rec['phase']), (None, 'near'))
+        (page,) = self.pages()
+        self.assertEqual(mon.recovery_phrase(page['recovery'], False), 'wait-expiry-near')
+
+    def test_a_granted_but_unclaimed_higher_entry_is_not_running_work_and_does_not_suppress(self):
+        first, second = self.enqueue('HORO-3152'), self.enqueue('HORO-3153')
+        self.grant()
+        self.age(second, 13)
+        self.walk(3 * 120)
+        self.assertEqual(self.entry(first)['state'], 'GRANTED')
+        self.assertEqual([r['status'] for r in self.incidents().values() if r['id'] == second], [None])
+
+    def test_a_running_entry_with_an_unreadable_claim_time_does_not_suppress(self):
+        first, second = self.enqueue('HORO-3154'), self.enqueue('HORO-3155')
+        entry = self.entry(first)
+        entry.update(state='CLAIMED', holder={'pid': 4242, 'start_token': 't'})
+        da._write_queue_entry(self.state_path, entry)
+        self.table = {4242: (1, 1.0)}
+        self.age(second, 13)
+        self.walk(3 * 120)
+        self.assertEqual(len(self.pages()), 1)
+
+    def test_200_queued_entries_keep_state_bounded_and_page_at_most_the_cap_at_once(self):
+        ids = []
+        for i in range(200):
+            out = da.queue_enqueue(self.state_path, label='job-%d' % i, tickets=['HORO-%d' % (4000 + i)], repo='horonom/x', worktree=str(self.worktree),
+                                   harness='codex', session_id='0b1d2e3f-aaaa-bbbb-cccc-1234567890ab', nbytes=GIB, argv=['x'], now=self.clock.now)
+            self.assertTrue(out['ok'], out)
+            ids.append(out['id'])
+        for n, qid in enumerate(ids):
+            self.age(qid, 13 + n / 1000.0)                                     # distinct ages, oldest first by index descending
+        out = self.walk(3 * 120)
+        self.assertEqual(len(self.incidents()), mon.WAIT_INCIDENT_MAX)
+        self.assertEqual(len(self.pages()), mon.WAIT_INCIDENT_MAX)
+        self.assertEqual(out['wait_overflow'], 200 - mon.WAIT_INCIDENT_MAX)
+        self.assertLess((mon.monitor_dir(self.state_path) / 'state.json').stat().st_size, mon.STATE_LIMIT // 2)
+        self.assertLess((mon.monitor_dir(self.state_path) / 'status.json').stat().st_size, 64 * 1024)
+        self.assertEqual(len(self.outbox()), mon.WAIT_INCIDENT_MAX)
+        self.walk(5 * 120)
+        self.assertEqual(len(self.pages()), mon.WAIT_INCIDENT_MAX)            # a stable set: no flood and no re-raise
+        for qid in list(self.incidents())[:3]:                                 # three of them leave the queue: three more are taken up
+            entry = self.entry(qid.split(':')[0])
+            entry.update(state='RELEASED')
+            da._write_queue_entry(self.state_path, entry)
+        self.walk(5 * 120)
+        self.assertEqual(len(self.pages()), mon.WAIT_INCIDENT_MAX + 3)
+
+    def test_status_notices_stay_bounded_for_many_entries_past_the_notice_age(self):
+        for i in range(30):
+            qid = self.enqueue('HORO-%d' % (4300 + i))
+            self.age(qid, 5)
+        out = self.tick(60)
+        self.assertLessEqual(len(out['notices']), mon.NOTICE_LIST_MAX + 1)
+        self.assertTrue(any('more entries queued' in n for n in out['notices']))
+
+    # ---- execution ----
+    def test_a_long_job_under_twice_its_deadline_with_fresh_children_never_alerts(self):
+        qid = self.enqueue('HORO-3120')
+        self.claim(qid, 11.0)
+        cpu = 10.0
+        for _ in range(20):
+            cpu += 60.0
+            self.table = {4242: (1, cpu)}                                       # fresh child activity every tick
+            self.tick(120)
+        self.assertEqual((self.pages(), self.incidents()), ([], {}))
+
+    def test_quiet_logs_and_idle_cpu_are_not_an_escalation_on_their_own(self):
+        qid = self.enqueue('HORO-3121')
+        self.enqueue('HORO-3140')                                               # waiting work, so the tick has a verdict to name
+        self.claim(qid, 1)
+        out = self.walk(40 * 60)                                                # CPU time flat well past the stalled-running threshold
+        self.assertEqual(out['primary'], 'stalled-running')
+        self.assertEqual(self.pages_of('workload-over-deadline'), [])
+        self.assertEqual(self.incidents(), {})
+
+    def pages_of(self, cause):
+        return [a for a in self.alerts if a['cause'] == cause]
+
+    def test_over_twice_the_default_deadline_escalates_once_and_records_the_holder_without_any_signal(self):
+        signals = []
+        real_kill, real_killpg = os.kill, os.killpg
+        os.kill = lambda *a: signals.append(('kill',) + a)
+        os.killpg = lambda *a: signals.append(('killpg',) + a)
+        self.addCleanup(lambda: (setattr(os, 'kill', real_kill), setattr(os, 'killpg', real_killpg)))
+        qid = self.enqueue('HORO-3122')
+        self.claim(qid, 11.8)
+        self.walk(3 * 120)
+        self.assertEqual(self.pages(), [])
+        self.walk(10 * 60)                                                      # crosses 12 h
+        (page,) = self.pages()
+        self.assertEqual((page['cause'], page['owner_action']), ('workload-over-deadline', 'check-over-deadline-workload'))
+        (rec,) = self.incidents().values()
+        self.assertEqual((rec['clock'], rec['holder_pid'], rec['holder_token'], rec['deadline_s'], rec['deadline_source']),
+                         ('run', 4242, 'Thu Nov 19 04:00:00 2026', 6 * 3600, 'default'))
+        self.assertGreaterEqual(rec['elapsed_s'], 12 * 3600)
+        self.walk(3600)
+        self.assertEqual(len(self.pages()), 1)                                   # one notice per run incident
+        self.assertEqual((signals, self.spawned, self.advances), ([], [], []))
+        self.assertEqual(self.entry(qid)['state'], 'CLAIMED')                    # nothing was cancelled, released or touched
+        (line,) = self.outbox()
+        self.assertEqual((line['cause'], line['clock'], line['evidence']), ('workload-over-deadline', 'run', ['session-unknown', 'process-uninspectable', 'holder-alive', 'over-deadline', 'deadline-default']))
+
+    def test_a_declared_deadline_is_used_and_named_as_the_source(self):
+        qid = self.enqueue('HORO-3123')
+        self.claim(qid, 2.1, deadline_s=3600)
+        self.walk(3 * 120)
+        (rec,) = self.incidents().values()
+        self.assertEqual((rec['deadline_s'], rec['deadline_source']), (3600, 'declared'))
+        self.assertIn('deadline-declared', self.outbox()[0]['evidence'])
+
+    def test_a_malformed_declared_deadline_falls_back_to_the_default(self):
+        for bad in (True, 0, -5, 10 ** 9, '3600', 1.5):
+            self.assertEqual(mon.run_deadline({'deadline_s': bad}), (6 * 3600, 'default'), bad)
+
+    def test_an_exited_holder_or_one_without_a_claim_time_is_not_an_execution_incident(self):
+        gone, odd = self.enqueue('HORO-3124'), self.enqueue('HORO-3125')
+        self.claim(gone, 30, pid=111)
+        self.statuses[111] = 'exited'
+        entry = self.entry(odd)
+        entry.update(state='CLAIMED', holder={'pid': 222, 'start_token': 't'})
+        da._write_queue_entry(self.state_path, entry)
+        self.table = {111: (1, 1.0), 222: (1, 1.0)}
+        self.walk(5 * 120)
+        self.assertEqual((self.pages(), self.incidents()), ([], {}))
+
+    def test_a_run_incident_is_resolved_when_the_claim_ends(self):
+        qid = self.enqueue('HORO-3126')
+        self.claim(qid, 13)
+        self.tick(60)
+        entry = self.entry(qid)
+        entry.update(state='RELEASED')
+        da._write_queue_entry(self.state_path, entry)
+        self.walk(3 * 120)
+        (rec,) = self.incidents().values()
+        self.assertEqual((rec['acknowledged_at'], rec['owner_notice_state']), (None, 'delivered'))
+        self.assertIsNotNone(rec['resolved_at'])
+        self.assertEqual(len(self.pages()), 1)
+
+    # ---- suppression needs live, working holders ----
+    # ---- bounds ----
+    # ---- owner resolution and outbox ----
+    def test_owner_resolution_with_an_uninspectable_owner_is_none_never_gone(self):
+        entry = {'state': 'QUEUED', 'harness': 'codex', 'owner': {'uid': 1, 'session_id': 'sess-1', 'ticket': 'HORO-1'}, 'waiter': {'pid': 5, 'start_token': 't'}}
+        out = mon.resolve_owner(entry, {}, process=lambda pid, token: None, launcher=lambda sid: None)
+        self.assertEqual(out, {'kind': 'codex', 'session_id': 'sess-1', 'reachable': None, 'evidence': ['session-unknown', 'process-uninspectable']})
+        raising = mon.resolve_owner(entry, {}, process=lambda *a: 1 / 0, launcher=lambda sid: 1 / 0)
+        self.assertIsNone(raising['reachable'])
+        self.assertIsNone(mon.resolve_owner({}, {})['reachable'])
+
+    def test_owner_reachability_needs_every_signal_to_say_gone(self):
+        entry = {'state': 'QUEUED', 'harness': 'claude', 'owner': {'uid': 1, 'session_id': 'sess-2'}, 'waiter': {'pid': 5, 'start_token': 't'}}
+        sessions = {'sess-2': {'kind': 'claude', 'live': False}}
+        self.assertFalse(mon.resolve_owner(entry, sessions, process=lambda p, t: False)['reachable'])
+        self.assertIsNone(mon.resolve_owner(entry, sessions, process=lambda p, t: None)['reachable'])
+        self.assertTrue(mon.resolve_owner(entry, sessions, process=lambda p, t: True)['reachable'])
+        self.assertTrue(mon.resolve_owner(entry, {'sess-2': {'kind': 'claude', 'live': True}}, process=lambda p, t: False)['reachable'])
+
+    def test_owner_kinds_and_closed_schema(self):
+        cases = [({'harness': 'claude'}, 'claude'), ({'harness': 'codex'}, 'codex'), ({'label': 'la-cargo-build'}, 'la-cargo'),
+                 ({'holder': {'pid': 1, 'start_token': 't'}, 'state': 'CLAIMED'}, 'heavy-run'), ({}, 'unknown')]
+        for entry, kind in cases:
+            out = mon.resolve_owner(entry, {})
+            self.assertEqual(out['kind'], kind)
+            self.assertEqual(sorted(out), ['evidence', 'kind', 'reachable', 'session_id'])
+            self.assertIn(out['kind'], mon.OWNER_KINDS)
+            self.assertTrue(set(out['evidence']) <= set(mon.OWNER_EVIDENCE))
+        self.assertEqual(mon.resolve_owner({'owner': {'session_id': 7}}, {})['session_id'], None)
+        self.assertEqual(mon.resolve_owner({'owner': {'session_id': 'x' * 65}}, {})['session_id'], None)
+
+    def test_the_outbox_line_has_a_closed_schema_and_never_carries_a_session_id_or_path(self):
+        qid = self.enqueue('HORO-3130', session='0b1d2e3f-aaaa-bbbb-cccc-1234567890ab')
+        self.age(qid, 13)
+        self.process_answers = {}
+        self.walk(3 * 120)
+        (line,) = self.outbox()
+        self.assertEqual(sorted(line), ['at', 'blocker', 'cause', 'clock', 'evidence', 'job', 'key', 'owner', 'owner_action', 'phase', 'recovery', 'v'])
+        self.assertEqual((line['job'], line['key'], line['owner']['kind']), (qid, qid + ':wait', 'codex'))
+        self.assertIsNone(line['owner']['reachable'])
+        self.assertTrue(set(line['evidence']) <= set(mon.EVIDENCE))
+        self.assertIn(line['blocker'], mon.BLOCKERS)
+        text = (mon.monitor_dir(self.state_path) / mon.OUTBOX_NAME).read_text()
+        for needle in ('0b1d2e3f', str(self.worktree), 'cargo', 'HORO-3130'):
+            self.assertNotIn(needle, text)
+        status = (mon.monitor_dir(self.state_path) / 'status.json').read_text() + (mon.monitor_dir(self.state_path) / 'state.json').read_text()
+        self.assertNotIn('0b1d2e3f', status)
+
+    def test_the_outbox_rotates_at_one_mib_and_stays_bounded(self):
+        directory = mon.monitor_dir(self.state_path)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = directory / mon.OUTBOX_NAME
+        path.write_text('x' * mon.OUTBOX_LIMIT)
+        qid = self.enqueue('HORO-3131')
+        self.age(qid, 13)
+        self.walk(3 * 120)
+        self.assertEqual(len(self.outbox()), 1)
+        self.assertEqual((directory / (mon.OUTBOX_NAME + '.1')).stat().st_size, mon.OUTBOX_LIMIT)
+        self.assertLess(path.stat().st_size, 2048)
+        self.assertEqual(oct(path.stat().st_mode & 0o777), '0o600')
+
+    def test_an_unwritable_outbox_never_breaks_the_tick_and_is_retried(self):
+        qid = self.enqueue('HORO-3132')
+        self.age(qid, 13)
+        directory = mon.monitor_dir(self.state_path)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        (directory / mon.OUTBOX_NAME).mkdir()                                   # a directory where the file should be: open() fails
+        out = self.tick(60)
+        self.assertEqual((out['primary'] != 'state-unreadable', out['owner_outbox_pending']), (True, 1))
+        self.assertEqual(len(self.pages()), 1)                                  # the notice itself does not wait on the outbox
+        (directory / mon.OUTBOX_NAME).rmdir()
+        out = self.tick(60)
+        self.assertEqual((out['owner_outbox_pending'], len(self.outbox())), (0, 1))
+
+    def test_new_causes_and_phrases_are_known_session_notify_enums(self):
+        sn = load('session-notify')
+        for cause in mon.INCIDENT_CAUSES:
+            self.assertIn(cause, sn.CAUSE_TEXT)
+            self.assertIn(mon.OWNER_ACTION[cause], sn.OWNER_ACTION_TEXT)
+        self.assertIn('wait-expiry-near', sn.RECOVERY_TEXT)
+        self.assertEqual(mon.recovery_phrase([{'wait': 'expiry-near'}], False), 'wait-expiry-near')
+
+    def test_old_state_files_without_the_new_fields_still_load(self):
+        qid = self.enqueue('HORO-3133')
+        self.age(qid, 13)
+        self.tick(60)
+        path = mon.monitor_dir(self.state_path) / 'state.json'
+        state = json.loads(path.read_text())
+        for rec in state['incidents'].values():
+            for key in ('clock', 'blocker', 'holder_pid', 'holder_token', 'elapsed_s', 'deadline_s', 'deadline_source', 'outbox_phase'):
+                rec.pop(key)
+        path.write_text(json.dumps(state))
+        self.tick(60)
+        self.assertEqual(len(self.pages()), 1)       # read back as a grant incident: it is not mistaken for a new wait incident
+
+
 class Inventory(unittest.TestCase):
     def test_callers_are_classified_from_text_without_running_them(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1296,8 +1791,11 @@ class SafetyShape(unittest.TestCase):
         names = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)} | {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
         for forbidden in ('kill', 'killpg', 'signal', 'pkill', 'rmtree', 'unlink', 'remove', 'rmdir'):
             self.assertNotIn(forbidden, names, forbidden)
+        # `resolve_owner` is the one place an entry's session id is read (to find its owner); no notice, outbox line or state record carries it.
+        resolver = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'resolve_owner')
+        outside = '\n'.join(l for i, l in enumerate(source.splitlines(), 1) if not resolver.lineno <= i <= resolver.end_lineno)
         for text in ('launchctl', '--confirm-ended', 'confirm_ended', "'release'", "'cancel'", 'session_id', 'kill -'):
-            self.assertNotIn(text, source.replace('without the stamp', ''), text)
+            self.assertNotIn(text, outside.replace('without the stamp', ''), text)
 
     def test_the_only_subprocess_targets_are_read_tools_and_advance(self):
         source = (ROOT / 'scripts/admission-monitor.py').read_text()
