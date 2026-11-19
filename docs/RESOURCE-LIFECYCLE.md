@@ -183,3 +183,25 @@ removes files unused for days. The deletion is consistent with that but unproven
    `disk-admission.py run --bytes N --label L -- COMMAND`, and uses a bounded, named target directory. Each is a ticket and
    PR in that repository.
 4. **Class B manifests** are deleted only after the founder's exact-path ASK.
+
+## Classifier correction (2026-11-19, SPE-176)
+
+`~/.cargo/shared-target/debug/incremental` (about 67 GiB) was classified C by `credential-name` and `evidence-name`, so the
+documented `cargo_incremental` reclaim scope could never be used. Cause: `measure` scans the top level of a `cargo_incremental`
+directory and applies the filename regexes; rustc names each directory `<crate_ident>-<hash>`, and test crates are named
+after what they test (`agent_id_bound_to_token_test-<hash>`). A filename is not evidence of a secret.
+
+| Measured (names only, 2026-11-19) | Count |
+|---|---|
+| Top-level entries | 10,357 |
+| Matching `credential-name` (credential 98, secret 33, token 12) | 143 |
+| Matching `evidence-name` (evidence, ledger, attestation, receipt, manifest) | 426 |
+| Entries not shaped `<crate_ident>-<13 base36>` or not a directory | 0 |
+| Session dirs `s-<a>-<b>-<c>` / lock files `s-<a>-<b>.lock` inside crate dirs | 7,046 / 15,576 |
+| Any other entry, link or file inside a crate dir | 0 |
+
+Fix: `is_generated_incremental_tree` verifies positively that every top-level child is a directory named
+`<crate_ident>-<13 base36>` containing only `s-*-*-*` directories and `s-*-*.lock` files, with no symlinks. Only then are the two name
+markers dropped for `cargo_incremental`. Any deviation, unreadable entry or exhausted budget keeps the old behaviour for the whole
+directory. `keep-marker`, escaping symlinks, `.ca-keep`, open handles, live sessions, build locks and protected roots are unchanged,
+as are `cargo_target` and every other kind, the `evidence_free` receipt rule, `apply` and revalidation.
