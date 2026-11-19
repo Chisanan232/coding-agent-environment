@@ -1680,7 +1680,8 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                 _mark_enforced(budget, in_use < lanes and floor_ok and not budget_why)
                 if budget is not None:
                     out['budget'] = budget
-                    _budget_receipt(state_path, nxt, now, budget)
+                    if memory != 'probe':   # the probe pass repeats in the final pass: one receipt per decision, not two
+                        _budget_receipt(state_path, nxt, now, budget)
                 if in_use >= lanes or not floor_ok or budget_why:
                     if not out['granted']:
                         out['reason'] = ('lane occupied' if in_use >= lanes else
