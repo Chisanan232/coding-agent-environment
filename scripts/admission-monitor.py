@@ -361,7 +361,7 @@ class Env:
         self.memory = memory or (lambda: memory_view(self.memory_state_path))
         self.free = free or (lambda: shutil.disk_usage('/System/Volumes/Data').free)
         self.advance = advance or self._advance
-        self.notify = notify or (lambda alert: False)
+        self.notify = notify or session_notify
 
     def _advance(self):
         """Run one `queue advance`. A slow one is left to finish on its own (never signalled); the next tick's spacing covers it."""
@@ -372,6 +372,33 @@ class Env:
         except subprocess.TimeoutExpired:
             return {'exit': None, 'out': 'still running after 180 s; left to finish'}
         return {'exit': proc.returncode, 'out': (out or '')[-400:]}
+
+
+def recovery_phrase(actions, exhausted):
+    if exhausted:
+        return 'recovery-exhausted'
+    if any(a.get('advance') == 'ran' for a in actions):
+        return 'advance-tried'
+    if any(a.get('advance') == 'would-run' for a in actions):
+        return 'observe-only'
+    return 'none'
+
+
+def session_notify(alert, runner=None):
+    """Raise the alert through the existing session-notify pipeline (enum phrases only; its own dedup, retry and backends apply).
+
+    True when that pipeline accepted the request (exit 0). With every backend off that records the alert and shows no banner;
+    `status.json` keeps the same facts either way."""
+    actions = alert.get('recovery') or []
+    exhausted = any(a.get('advance') == 'recovery-exhausted' for a in actions)
+    argv = [sys.executable, str(HERE / 'session-notify.py'), 'emit-resource', '--cause', alert['cause'], '--recovery',
+            recovery_phrase(actions, exhausted), '--owner-action', alert.get('owner_action') or 'inspect-admission-state',
+            '--signature', alert['signature']]
+    try:
+        done = (runner or subprocess.run)(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
 
 
 def default_limits(da, ma):
