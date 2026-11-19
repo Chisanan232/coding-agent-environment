@@ -21,7 +21,7 @@ One trigger must hold, and no exclusion:
 | `two_distinct_attempts_same_failure` | Two Opus attempts with materially different approaches (distinct `approach` text) end in the same acceptance failure |
 | `unresolved_review_disagreement` | Independent review leaves a substantive architecture disagreement with at least two stated positions |
 
-Excluded, whatever else is true: queue delay, CI availability (`CI_UNAVAILABLE_EXTERNAL`, billing, quota), missing permissions or a host denial, external outages. The caller states `cause`, and a failure text that names one of these also excludes. The inputs must be attested non-sensitive and the repo owned; the question must be one concrete one-line question.
+Excluded, whatever else is true: queue delay, CI availability (`CI_UNAVAILABLE_EXTERNAL`, billing, quota), missing permissions or a host denial, external outages, and blockers that only an owner can clear (an owner decision, credential or provisioning step: `owner_decision`). Those are authority problems, not reasoning bottlenecks. Two approaches that use the same words in a different order count as one. The caller states `cause`, and a failure text that names one of these also excludes. The inputs must be attested non-sensitive and the repo owned; the question must be one concrete one-line question.
 
 `evaluate` is a pure check (exit 1 when ineligible, with reasons). Ineligible means: continue independent work.
 
