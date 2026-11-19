@@ -37,6 +37,7 @@ GRANTED_ALERT_S = 2700        # above the observed p99 grant->claim (29 min), be
 CPU_STALL_S = 900             # a claimed, alive workload with no CPU growth this long is reported, never touched
 CONFIRM_SPACING_S = 30        # confirmations are counted at least this far apart
 CONFIRM_TICKS = 2             # consecutive ticks a cause must hold before it is acted on or alerted
+LIVE = ('QUEUED', 'ELIGIBLE', 'GRANTED', 'CLAIMED')
 GAP_FACTOR = 3                # a gap over this many intervals, or sleep, is an observation gap
 ADVANCE_MIN_GAP_S = 120
 ADVANCE_MAX_PER_WINDOW = 5
@@ -185,6 +186,8 @@ def usable_entries(entries):
         if e.get('state') == 'GRANTED':
             grant = e.get('grant')
             ok = ok and isinstance(grant, dict) and safe_time(grant.get('at')) is not None and safe_time(grant.get('expires')) is not None
+        if e.get('state') == 'GRANTED' and ok and e['grant'].get('runner') is not None and not isinstance(e['grant']['runner'], dict):
+            ok = False
         if e.get('state') == 'EXPIRED' and isinstance(e.get('grant'), dict):
             ok = ok and safe_time(e['grant'].get('expires')) is not None
         if ok:
@@ -284,11 +287,12 @@ def classify(snap, limits):
         if not runner or runner.get('protocol', 0) < snap['protocol']:
             found['outdated-caller'] = '%s was granted by a runner without protocol %d' % (entry['id'], snap['protocol'])
     # Nothing blocks the head, nothing is claimed, nothing granted is waiting to be claimed: nobody is advancing the queue.
-    if waiting and not found and not granted and not any(e['state'] == 'CLAIMED' for e in entries):
+    if waiting and waiting[0]['state'] != 'ELIGIBLE' and not found and not granted and not any(e['state'] == 'CLAIMED' for e in entries):
         found['frozen-queue'] = 'waiting work, free lanes and no blocker, but nothing is being granted'
     primary = next((c for c in CAUSES if c in found), 'unknown')
     if not found:
-        primary = 'healthy-busy' if any(e['state'] == 'CLAIMED' for e in entries) else 'unknown'
+        busy = any(e['state'] == 'CLAIMED' for e in entries) or any(e['state'] == 'ELIGIBLE' for e in waiting)   # ELIGIBLE: no lane free yet
+        primary = 'healthy-busy' if busy else 'unknown'
     # History for the owner, never a trigger: a grant that lapsed unclaimed shortly ago (a lost callback).
     notes = ['%s grant lapsed unclaimed' % e['id'] for e in entries if e['state'] == 'EXPIRED' and isinstance(e.get('grant'), dict)
              and not e.get('holder') and 0 <= (now - safe_time(e['grant']['expires'])).total_seconds() < 3 * 3600]
@@ -352,7 +356,7 @@ class Env:
     """Everything a tick touches outside its own state, so tests substitute it."""
 
     def __init__(self, da, state_path, memory_state_path, limits, clock=None, mono=None, boot=None, table=None, memory=None,
-                 free=None, advance=None, notify=None):
+                 free=None, advance=None, notify=None, clear=None):
         self.da, self.state_path, self.memory_state_path, self.limits = da, Path(state_path), Path(memory_state_path), limits
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.mono = mono or time.monotonic
@@ -362,6 +366,7 @@ class Env:
         self.free = free or (lambda: shutil.disk_usage('/System/Volumes/Data').free)
         self.advance = advance or self._advance
         self.notify = notify or session_notify
+        self.clear = clear or session_clear
 
     def _advance(self):
         """Run one `queue advance`. A slow one is left to finish on its own (never signalled); the next tick's spacing covers it."""
@@ -394,6 +399,16 @@ def session_notify(alert, runner=None):
     argv = [sys.executable, str(HERE / 'session-notify.py'), 'emit-resource', '--cause', alert['cause'], '--recovery',
             recovery_phrase(actions, exhausted), '--owner-action', alert.get('owner_action') or 'inspect-admission-state',
             '--signature', alert['signature']]
+    try:
+        done = (runner or subprocess.run)(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
+
+
+def session_clear(runner=None):
+    """Tell session-notify the blockage ended, so a later recurrence of the same cause is announced again."""
+    argv = [sys.executable, str(HERE / 'session-notify.py'), 'emit-resource', '--clear']
     try:
         done = (runner or subprocess.run)(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
@@ -480,10 +495,12 @@ def _tick_locked(env, directory, act, if_due):
         else:
             cpu_now[entry['id']] = before
         claims[entry['id']] = {'status': status.state, 'idle_s': int(wall - cpu_now[entry['id']]['at'])}
-    states_now = {e['id']: e['state'] for e in entries}
+    states_now = {e['id']: e['state'] for e in entries if e['state'] in LIVE}      # terminal entries never accumulate in the state file
     if not gap:
-        for qid, st in states_now.items():
-            if st in ('CLAIMED', 'RELEASED') and qid in state['states'] and state['states'][qid] != st:
+        now_by_id = {e['id']: e['state'] for e in entries}
+        for qid, before in state['states'].items():
+            after = now_by_id.get(qid)
+            if after in ('CLAIMED', 'RELEASED') and after != before:
                 progress = True
     try:
         mem = env.memory()
@@ -557,14 +574,25 @@ def _tick_locked(env, directory, act, if_due):
                                       'next_try': wall + min(300 * 2 ** (attempts - 1), ALERT_COOLDOWN_S)}
         state['last_alert'] = {'at': iso(now), 'cause': verdict['primary'], 'signature': sig, 'delivered': delivered, 'attempts': attempts}
         result['alert'] = dict(alert, delivered=delivered)
+    if not verdict['causes'] and state.get('last_alert') and not state['last_alert'].get('cleared'):
+        try:
+            cleared = bool(env.clear())
+        except Exception:
+            cleared = False
+        if cleared:
+            state['last_alert']['cleared'] = True
+            state['alerts'] = {}      # the next incident may announce again even with the same cause and signature
+            result['cleared'] = True
     result['last_alert'] = state.get('last_alert')
     persist(directory, state, cpu_now, states_now, window, blocker, progress_at, wall, mono, boot)
     write_json(directory / 'status.json', result)
     receipts = directory / 'receipts.jsonl'
-    if not receipts.exists() or receipts.stat().st_size < 1 << 20:
-        with open(receipts, 'a') as handle:
-            handle.write(json.dumps({k: result[k] for k in ('at', 'primary', 'waiting', 'stalled', 'confirmed', 'actions', 'observation_gap')},
-                                    sort_keys=True) + '\n')
+    with contextlib.suppress(OSError):
+        if receipts.exists() and receipts.stat().st_size >= 1 << 20:
+            os.replace(receipts, directory / 'receipts.jsonl.1')      # one backup, so history never silently stops
+    with open(receipts, 'a') as handle:
+        handle.write(json.dumps({k: result[k] for k in ('at', 'primary', 'waiting', 'stalled', 'confirmed', 'actions', 'observation_gap')},
+                                sort_keys=True) + '\n')
     return result
 
 
