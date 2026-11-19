@@ -496,3 +496,11 @@ Notes: the stored `waiter.start_token` is a UTC `ps lstart` string (not `process
 change cannot make a live waiter look replaced; waiter pids at or below 1 are refused. Cancellation is skipped while the disk tier
 cannot be measured (advance returns early before it). Enqueue that dedupes to an existing live entry returns that entry and does not
 refresh its waiter.
+
+## Stall detection (SPE-176, ADR 0018)
+
+`scripts/admission-monitor.py tick` reads the queue, the latch file and the process table and reports whether queued work is globally
+stalled and why. It is observe-only unless started with `--act`, which allows one bounded recovery verb (`queue advance`). It never signals,
+resets the latch, changes a threshold or deletes. `status` shows the last result, `callers` lists admission runners found on disk by
+protocol, and `plist` prints the launchd agent without installing it; installing it (`launchctl bootstrap gui/$(id -u) <plist>`) is an
+owner-run step. A grant is not a start: only a claim, a release or CPU growth of a claimed workload counts as progress.
