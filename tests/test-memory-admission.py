@@ -10,6 +10,7 @@ import stat
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from contextlib import redirect_stdout
 
 sys.dont_write_bytecode = True
@@ -261,6 +262,124 @@ class Hysteresis(unittest.TestCase):
         _, st = ma.decide("light", metrics(level=1), None, 0.0)
         v, _ = ma.decide("light", metrics(level=2), st, 10.0)
         self.assertTrue(any("rising" in w for w in v["warnings"]))
+
+
+class LatchPolicy(unittest.TestCase):
+    """SPE-177: P1 (lane reasons do not latch) and P2 (conservative release of a static-compressor latch). Thresholds are unchanged."""
+
+    def lane_busy(self, compressor=0.26):
+        m = metrics(level=1, io=0.0, compressor=compressor, load=2.0)
+        m["heavy_procs"], m["heavy_workloads"] = {"cargo": 1}, None
+        return m
+
+    def calm(self, compressor=0.26):
+        return metrics(level=1, io=0.0, compressor=compressor, load=2.0)
+
+    def test_a_lane_reason_refuses_but_does_not_latch(self):
+        v, st = ma.decide("heavy", self.lane_busy(), None, 100.0)
+        self.assertFalse(v["admit"])
+        self.assertIn("heavy lanes full", v["reasons"][0])
+        self.assertFalse(st["latched"])
+        v, st = ma.decide("heavy", self.calm(), st, 160.0)    # the tree ended: lane 1 is judged by ENTER thresholds again
+        self.assertTrue(v["admit"], v)
+
+    def test_the_2026_11_19_shape_a_fresh_gate_admits_what_a_lane_latched_gate_refused(self):
+        self.assertTrue(ma.decide("heavy", self.calm(), None, 1.0)[0]["admit"])
+        with unittest.mock.patch.object(ma, "LATCH_ONLY_ON_MEMORY_REASONS", False):
+            _, st = ma.decide("heavy", self.lane_busy(), None, 100.0)
+            self.assertTrue(st["latched"])      # the old behaviour, kept switchable as the rollback
+            v, _ = ma.decide("heavy", self.calm(), st, 160.0)
+            self.assertFalse(v["admit"])
+
+    def test_a_memory_reason_still_latches_and_a_pressure_spike_rearms_it(self):
+        v, st = ma.decide("heavy", metrics(level=2), None, 100.0)
+        self.assertTrue(st["latched"])
+        self.assertFalse(v["admit"])
+
+    def test_a_latch_with_only_the_compressor_blocking_releases_after_ten_calm_spaced_checks(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        now = 100.0
+        for i in range(ma.P2_SAMPLES):
+            v, st = ma.decide("heavy", self.calm(0.262), st, now)
+            now += 61
+            if i < ma.P2_SAMPLES - 1:
+                self.assertFalse(v["admit"], i)
+                self.assertIn("conservative recovery", v["reasons"][0])
+        self.assertTrue(v["admit"], v)
+        self.assertFalse(st["latched"])
+
+    def test_p2_needs_the_spacing(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        for i in range(30):
+            v, st = ma.decide("heavy", self.calm(), st, 100.0 + i)     # 30 s of checks do not make ten samples
+        self.assertTrue(st["latched"])
+
+    def test_a_rising_compressor_does_not_release(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        now = 100.0
+        for i in range(ma.P2_SAMPLES + 2):
+            v, st = ma.decide("heavy", self.calm(0.26 + 0.004 * i), st, now)
+            now += 61
+        self.assertTrue(st["latched"])
+
+    def test_any_blocker_other_than_the_compressor_resets_p2(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        now = 100.0
+        for i in range(6):
+            _, st = ma.decide("heavy", self.calm(), st, now)
+            now += 61
+        self.assertEqual(len(st["p2_hist"]), 6)
+        _, st = ma.decide("heavy", metrics(level=1, io=2.0, compressor=0.26, load=2.0), st, now)     # swap I/O above the 1 MiB/s bound
+        self.assertEqual(st["p2_hist"], [])
+
+    def test_p2_never_releases_at_or_above_the_enter_threshold(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        now = 100.0
+        for _ in range(ma.P2_SAMPLES + 3):
+            v, st = ma.decide("heavy", self.calm(0.36), st, now)
+            now += 61
+        self.assertTrue(st["latched"])
+        self.assertFalse(v["admit"])
+
+    def test_p2_does_not_run_while_a_lane_is_busy(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        now = 100.0
+        for _ in range(ma.P2_SAMPLES + 3):
+            v, st = ma.decide("heavy", self.lane_busy(), st, now)
+            now += 61
+        self.assertTrue(st["latched"])
+
+    def test_a_released_gate_admits_only_what_a_fresh_gate_admits(self):
+        # The safety property: whatever P1/P2 release, the first check afterwards is the ordinary ENTER decision.
+        for compressor in (0.26, 0.30, 0.34):
+            _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+            now = 100.0
+            for _ in range(ma.P2_SAMPLES):
+                _, st = ma.decide("heavy", self.calm(compressor), st, now)
+                now += 61
+            released, _ = ma.decide("heavy", self.calm(compressor), st, now)
+            fresh, _ = ma.decide("heavy", self.calm(compressor), None, now)
+            self.assertEqual(released["admit"], fresh["admit"], compressor)
+
+    def test_tampered_p2_state_cannot_skip_the_run(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        st["p2_hist"] = [0.26] * 50
+        st["p2_last"] = 1e12
+        v, st = ma.decide("heavy", self.calm(), st, 100.0)
+        self.assertTrue(st["latched"])
+        self.assertLessEqual(len(st["p2_hist"]), 1)
+
+    def test_state_file_round_trips_the_p2_fields_and_old_files_still_load(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = pathlib.Path(root) / "state.json"
+            _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+            _, st = ma.decide("heavy", self.calm(), st, 100.0)
+            ma.save_state(path, st)
+            loaded, problem = ma.load_state(path)
+            self.assertIsNone(problem)
+            self.assertEqual(loaded["p2_hist"], st["p2_hist"])
+            path.write_text(json.dumps({"latched": True, "ok_streak": 0, "last_ok": 0.0, "levels": [1]}))
+            self.assertIsNone(ma.load_state(path)[1])
 
 
 class StateFile(unittest.TestCase):
