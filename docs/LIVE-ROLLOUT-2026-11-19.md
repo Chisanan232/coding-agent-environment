@@ -66,13 +66,13 @@ Not the same as forced invocation, which already works. Fresh headless sessions,
 
 | Task | Class under the Model Routing rule | Delegated to `opus-architect` |
 |---|---|---|
-| queue lease and migration design | design, migration | no |
-| multi-tenant Postgres migration plan | migration, multi-module | no (1 of 1 base) |
-| production-safe session and password design | security-sensitive design | no (2 of 2 base runs) |
+| queue lease and migration design | design, migration | no (1 of 1, from the earlier `rt/` run) |
+| multi-tenant Postgres migration plan | migration, multi-module | no (0 of 3 baseline runs) |
+| production-safe session and password design | security-sensitive design | no (0 of 3 baseline runs) |
 | same two tasks with strict routing wording appended to the system prompt | design, security-sensitive | no (0 of 6) |
 | rename in one file | trivial, policy allows direct | correctly no |
 
-A session asked directly lists `opus-architect` among its subagent types and states that the rule requires it for security-sensitive design and that it would have no valid reason to skip it, so the agent is visible and the rule is known; the miss is in following it. Strict wording did not change that, so wording is not the lever, and I changed no policy text. Evidence is headless only (interactive sessions were not measured) and small (baseline n=4 including repeats, strict n=6). Tasks the policy lets the main agent handle (the one-function Haiku task, the rename) are not counted as misses. No fix is deployed; the open question for the owner is whether to accept the rule as advisory or to ask for an enforcement design (a hook cannot force delegation, so any enforcement would be a different mechanism).
+A session asked directly lists `opus-architect` among its subagent types and states that the rule requires it for security-sensitive design and that it would have no valid reason to skip it, so the agent is visible and the rule is known; the miss is in following it. Strict wording did not change that, so wording is not the lever, and I changed no policy text. Evidence is headless only (interactive sessions were not measured) and small (7 unforced qualifying runs across three tasks, 0 delegated; 6 strict-wording runs across two tasks, 0 delegated; runs of one task are repeats, not independent tasks). Tasks the policy lets the main agent handle (the one-function Haiku task, the rename) are not counted as misses. No fix is deployed; the open question for the owner is whether to accept the rule as advisory or to ask for an enforcement design (a hook cannot force delegation, so any enforcement would be a different mechanism).
 
 ### Codex concurrency, measured on the installed version
 `codex-cli 0.169.0`, legacy `[agents]` key, `-c agents.max_concurrent_threads_per_session=1`, one `codex exec` from an unrelated directory asked to spawn two subagents at once: exactly one spawned and the second was refused with "agent thread limit reached". So the cap counts subagents and excludes the primary thread. Eight therefore allowed eight subagents, one above the engineering contract's seven; seven matches it. The `multi_agent_v2` key, which counts the root thread per a separate source, is not enabled on this install (`codex features list`: `multi_agent_v2 stable false`, `multi_agent` deprecated true). The change is correct and still not applied: the exact one-line apply is given to the owner in the report, with the check and rollback.
