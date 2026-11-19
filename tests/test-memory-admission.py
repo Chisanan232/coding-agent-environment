@@ -425,6 +425,16 @@ class LatchPolicy(unittest.TestCase):
         _, st = ma.decide("heavy", self.calm(), st, 1000.0)
         self.assertTrue(st["latched"])
 
+    def test_absurd_or_negative_p2_times_are_cleared_without_raising(self):
+        for bad in (10 ** 400, -1e9, float("nan"), float("inf"), True, "x", None, [1]):
+            for key in ("p2_first", "p2_last"):
+                _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+                st.update(p2_hist=[0.26] * 10, p2_last=500.0, p2_first=0.0)
+                st[key] = bad
+                v, st = ma.decide("heavy", self.calm(), st, 1000.0)
+                self.assertTrue(st["latched"], (key, bad))
+                self.assertLessEqual(len(st["p2_hist"]), 1)
+
     def test_release_needs_the_recorded_dwell_not_just_ten_samples(self):
         _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
         now = 100.0
