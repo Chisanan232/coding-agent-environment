@@ -198,10 +198,19 @@ after what they test (`agent_id_bound_to_token_test-<hash>`). A filename is not 
 | Matching `evidence-name` (evidence, ledger, attestation, receipt, manifest) | 426 |
 | Entries not shaped `<crate_ident>-<13 base36>` or not a directory | 0 |
 | Session dirs `s-<a>-<b>-<c>` / lock files `s-<a>-<b>.lock` inside crate dirs | 7,046 / 15,576 |
-| Any other entry, link or file inside a crate dir | 0 |
+| Any other entry, link or non-regular file inside a crate dir | 0 |
+| Crate dirs with no entry at all | 0 |
+| Crate dirs holding only lock files (rustc leaves them after a session dir is collected) | 6,139 |
+| Regular files inside session dirs (all 7,046 listed) | 258,128 |
+| Non-regular or unknown-named entries inside session dirs | 0 |
+| Largest lock file | 0 bytes |
 
-Fix: `is_generated_incremental_tree` verifies positively that every top-level child is a directory named
-`<crate_ident>-<13 base36>` containing only `s-*-*-*` directories and `s-*-*.lock` files, with no symlinks. Only then are the two name
-markers dropped for `cargo_incremental`. Any deviation, unreadable entry or exhausted budget keeps the old behaviour for the whole
+Closed set inside a session dir, all regular files: `dep-graph.bin`, `dep-graph.part.bin`, `query-cache.bin`, `work-products.bin`,
+`metadata.rmeta`, and `<25 base36>.o`.
+
+Fix: `is_generated_incremental_tree` verifies positively, to session-file depth, that every top-level child is a non-empty
+`<crate_ident>-<13 base36>` directory holding only `s-*-*-*` session dirs (containing only the closed set above, as regular files) and
+`s-*-*.lock` regular files of at most 4096 bytes, with no symlink anywhere. Only then are the two name markers dropped for
+`cargo_incremental`. A crate dir with only lock files is accepted because 6,139 real ones are exactly that. Any deviation, unreadable entry or exhausted entry (1,000,000) or time (20 s) budget keeps the old behaviour for the whole
 directory. `keep-marker`, escaping symlinks, `.ca-keep`, open handles, live sessions, build locks and protected roots are unchanged,
 as are `cargo_target` and every other kind, the `evidence_free` receipt rule, `apply` and revalidation.
