@@ -214,8 +214,9 @@ class Progress(MonitorBase):
         da._write_queue_entry(self.state_path, entries[0])
         self.table = {4242: (1, 10.0)}
         out = self.run_ticks(20)
-        self.assertEqual(out['primary'], 'stale-claim')
-        self.assertIn('report only', out['causes']['stale-claim'])
+        self.assertEqual(out['primary'], 'stalled-running')
+        self.assertIn('report only', out['causes']['stalled-running'])
+        self.assertEqual(self.advances, [])
 
 
 class Recovery(MonitorBase):
@@ -326,6 +327,17 @@ class Persistence(MonitorBase):
         verdict = mon.classify({'now': self.clock.now, 'wall': self.clock.now.timestamp(), 'entries': da._queue_entries(self.state_path)[0],
                                 'problems': [], 'free_bytes': self.free, 'mem': self.mem, 'window': [], 'claims': {},
                                 'protocol': da.RUNNER_PROTOCOL}, mon.default_limits(da, ma))
+        self.assertIn('1 grant lapsed unclaimed'.replace('1 ', ''), ' '.join(verdict['notes']).replace('q000', '') and 'grant lapsed unclaimed')
+        self.assertTrue(verdict['notes'])
+        self.assertNotIn('failed-continuation', verdict['causes'])    # history is a note, not a trigger for advances
+
+    def test_an_unclaimed_grant_is_failed_continuation_after_45_minutes(self):
+        self.mem['latched'] = False
+        self.grant(memory=True)
+        self.clock.advance(46 * 60)
+        verdict = mon.classify({'now': self.clock.now, 'wall': self.clock.now.timestamp(), 'entries': da._queue_entries(self.state_path)[0],
+                                'problems': [], 'free_bytes': self.free, 'mem': self.mem, 'window': [], 'claims': {},
+                                'protocol': da.RUNNER_PROTOCOL}, mon.default_limits(da, ma))
         self.assertIn('failed-continuation', verdict['causes'])
 
 
@@ -366,6 +378,167 @@ class Escalation(MonitorBase):
             self.table = {77: (1, float(i * 10))}
             self.tick()
         self.assertEqual(self.alerts, [])
+
+
+class ReviewFindings(MonitorBase):
+    """Cases an independent review showed the first version missed."""
+
+    def setUp(self):
+        super().setUp()
+        self.mem['latched'] = False
+        self.enqueue('HORO-3001')
+        self.enqueue('HORO-3002')
+
+    def test_a_frozen_queue_nobody_advances_is_detected_and_recovered(self):
+        out = self.tick()
+        self.assertEqual(out['primary'], 'frozen-queue')
+        for _ in range(4):
+            out = self.tick(act=True, seconds=61)
+        self.assertGreaterEqual(len(self.advances), 1)
+
+    def test_an_undelivered_alert_is_retried_with_backoff_and_recorded(self):
+        self.mem['metrics'] = dict(CALM, pressure_level=2)
+        results = []
+
+        def failing(alert):
+            results.append(self.clock.now)
+            return False
+        env_factory = self.env
+
+        def env():
+            e = env_factory()
+            e.notify = failing
+            return e
+        self.env = env
+        for _ in range(60):
+            out = self.tick()
+        self.assertGreaterEqual(len(results), 2)
+        self.assertLess(len(results), 8)       # exponential backoff, not every tick
+        status = json.loads((mon.monitor_dir(self.state_path) / 'status.json').read_text())
+        self.assertFalse(status['last_alert']['delivered'])
+        self.assertEqual(status['last_alert']['attempts'], len(results))
+
+    def test_an_alert_that_is_delivered_is_silenced_for_the_cooldown(self):
+        self.mem['metrics'] = dict(CALM, pressure_level=2)
+        self.run_ticks(60)
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_an_advance_that_raises_still_counts_against_the_bound(self):
+        calls = []
+        env_factory = self.env
+
+        def env():
+            e = env_factory()
+            e.advance = lambda: calls.append(self.clock.now) or (_ for _ in ()).throw(OSError('boom'))
+            return e
+        self.env = env
+        for _ in range(80):
+            self.tick(act=True)
+        self.assertGreaterEqual(len(calls), 1)
+        for at in calls:     # no rolling window ever holds more than the bound, even though every advance raised
+            self.assertLessEqual(len([c for c in calls if at - timedelta(seconds=mon.ADVANCE_WINDOW_S) < c <= at]), mon.ADVANCE_MAX_PER_WINDOW)
+
+    def test_a_damaged_entry_is_reported_and_never_crashes_the_tick(self):
+        entries = da._queue_entries(self.state_path)[0]
+        entries[0]['wait_expires'] = 'not-a-time'
+        da._write_queue_entry(self.state_path, entries[0])
+        out = self.tick()
+        self.assertTrue(out['ran'])
+        self.assertIn('state-unreadable', out['causes'])
+
+    def test_a_granted_entry_without_a_grant_object_is_reported_not_fatal(self):
+        self.grant(memory=True)
+        for entry in da._queue_entries(self.state_path)[0]:
+            if entry['state'] == 'GRANTED':
+                entry['grant'] = None
+                da._write_queue_entry(self.state_path, entry)
+        out = self.tick()
+        self.assertIn('state-unreadable', out['causes'])
+
+    def test_wrong_types_in_the_state_file_reset_that_field_only(self):
+        self.run_ticks(3)
+        path = mon.monitor_dir(self.state_path) / 'state.json'
+        data = json.loads(path.read_text())
+        data.update(blocker='x', alerts=[], advances='no', last_tick={'wall': 'x'}, cpu=5, window=[1, 'a'])
+        path.write_text(json.dumps(data))
+        out = self.tick(act=True)
+        self.assertTrue(out['ran'])
+        self.assertEqual(self.advances, [])
+
+    def test_a_tick_exception_leaves_a_status_instead_of_a_traceback(self):
+        env_factory = self.env
+
+        def env():
+            e = env_factory()
+            e.free = lambda: (_ for _ in ()).throw(RuntimeError('statvfs failed'))
+            return e
+        self.env = env
+        out = self.tick()
+        self.assertEqual(out['primary'], 'state-unreadable')
+        self.assertTrue((mon.monitor_dir(self.state_path) / 'status.json').exists())
+
+    def test_a_new_enqueue_behind_the_head_does_not_change_the_signature(self):
+        first = self.tick()['signature']
+        self.enqueue('HORO-3003')
+        self.assertEqual(self.tick()['signature'], first)
+
+    def test_sleep_does_not_inflate_the_stall_clock(self):
+        self.run_ticks(3)
+        out = self.tick(seconds=6 * 3600, asleep=True)
+        self.assertTrue(out['observation_gap'])
+        self.assertLess(out['stalled_for_s'], 120)
+
+    def test_a_reboot_forgets_the_compressor_window(self):
+        self.mem['latched'] = True
+        self.run_ticks(15)
+        self.boot = 999
+        self.tick()
+        state = json.loads((mon.monitor_dir(self.state_path) / 'state.json').read_text())
+        self.assertLessEqual(len(state['window']), 1)
+
+    def test_a_granted_entry_with_nothing_waiting_alerts_after_45_minutes(self):
+        for entry in da._queue_entries(self.state_path)[0]:
+            if entry['state'] == 'QUEUED':
+                entry['state'] = 'CANCELLED'
+                da._write_queue_entry(self.state_path, entry)
+        self.enqueue('HORO-3004')
+        self.grant(memory=True)
+        for entry in da._queue_entries(self.state_path)[0]:
+            if entry['state'] == 'QUEUED':
+                entry['state'] = 'CANCELLED'
+                da._write_queue_entry(self.state_path, entry)
+        self.run_ticks(60, )
+        self.assertTrue(self.alerts)
+
+    def test_a_falling_cpu_total_still_counts_as_activity(self):
+        entries = da._queue_entries(self.state_path)[0]
+        entries[0].update(state='CLAIMED', holder={'pid': 4242, 'start_token': 't'})
+        da._write_queue_entry(self.state_path, entries[0])
+        self.table = {4242: (1, 500.0)}
+        self.tick()
+        for i in range(30):
+            self.table = {4242: (1, 500.0 - 3 * (i + 1))}     # reaped children: the total falls while work goes on
+            out = self.tick()
+        self.assertNotIn('stalled-running', out['causes'])
+
+    def test_two_quick_manual_ticks_are_one_confirmation(self):
+        self.mem['metrics'] = dict(CALM, pressure_level=2)
+        self.tick()
+        for _ in range(5):
+            out = self.tick(seconds=1)
+        self.assertFalse(out['confirmed'])
+
+    def test_missing_memory_metrics_are_reported(self):
+        self.mem['metrics'] = {}
+        self.assertIn('unobservable', self.tick()['causes'])
+
+    def test_old_alert_records_are_pruned(self):
+        self.mem['metrics'] = dict(CALM, pressure_level=2)
+        self.run_ticks(40)
+        self.clock.advance(3 * mon.ALERT_COOLDOWN_S, asleep=True)
+        self.tick()
+        state = json.loads((mon.monitor_dir(self.state_path) / 'state.json').read_text())
+        self.assertEqual([k for k in state['alerts'] if k.startswith('memory-pressure')], [])
 
 
 class Inventory(unittest.TestCase):
