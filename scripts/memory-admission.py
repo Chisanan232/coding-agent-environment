@@ -523,15 +523,25 @@ def conservative_ok(m):
             and cr is not None and lpc is not None and lpc <= EXIT["load_per_core"])
 
 
+def _clock_value(x):
+    """A believable epoch seconds value: a real number (not bool), finite, non-negative and below year 33658. Never raises."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return False
+    try:
+        return math.isfinite(x) and 0 <= x < 1e12
+    except OverflowError:
+        return False
+
+
 def _p2_clean(st, now):
     hist = st.get("p2_hist")
     ok = isinstance(hist, list) and len(hist) <= P2_SAMPLES and all(isinstance(x, float) and 0 <= x <= 1 for x in hist)
     st["p2_hist"] = hist if ok else []
     last = st.get("p2_last", 0.0)
-    if not isinstance(last, (int, float)) or isinstance(last, bool) or not math.isfinite(last) or last > now:
+    if not _clock_value(last) or last > now:
         st["p2_hist"], last = [], 0.0
     first = st.get("p2_first", last)
-    if not isinstance(first, (int, float)) or isinstance(first, bool) or not math.isfinite(first) or first > last:
+    if not _clock_value(first) or first > last:
         st["p2_hist"], first = [], last      # a run without a believable start cannot count as dwell
     elif st["p2_hist"] and now - last > P2_STALE * P2_SPACING:
         st["p2_hist"] = []      # ten snapshots days apart are not ten minutes of calm
