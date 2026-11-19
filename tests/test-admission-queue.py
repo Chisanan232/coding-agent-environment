@@ -171,6 +171,70 @@ class Grant(QueueBase):
         self.assertFalse(da.queue_cancel(self.path, 'q999999', now=self.now)['ok'])
 
 
+class GrantNeedsMemory(QueueBase):
+    """A grant is only worth making when the claim that follows can pass the memory gate (SPE-175)."""
+
+    def advance_with(self, memory_fn, free=400 * GIB, now=None):
+        return da.queue_advance(self.path, lambda: free, now=now or self.now, memory_fn=memory_fn)
+
+    def test_refusal_grants_nothing_and_keeps_fifo(self):
+        a, b = self.enqueue('HORO-2070'), self.enqueue('HORO-2071')
+        out = self.advance_with(lambda: (False, 'REFUSE heavy | hysteresis: recovering (0/3)'))
+        self.assertEqual(out['granted'], [])
+        self.assertTrue(out['reason'].startswith('memory-gate: '), out)
+        self.assertEqual(self.states(), ['QUEUED', 'QUEUED'])
+        self.assertFalse((self.path.parent / 'queue/granted' / a['id']).exists())
+        out = self.advance_with(lambda: (True, 'ADMIT'))
+        self.assertEqual(out['granted'], [a['id']])     # the head, never the later entry
+        self.assertEqual(self.states(), ['GRANTED', 'QUEUED'])
+        self.assertNotIn(b['id'], out['granted'])
+
+    def test_admission_grants_like_before_and_asks_the_gate_once(self):
+        a = self.enqueue('HORO-2070')
+        calls = []
+        out = self.advance_with(lambda: calls.append(1) or (True, 'ADMIT'))
+        self.assertEqual((out['granted'], len(calls)), ([a['id']], 1))
+
+    def test_gate_is_not_asked_when_no_grant_is_possible(self):
+        self.enqueue('HORO-2070')
+        calls = []
+        out = self.advance_with(lambda: calls.append(1) or (True, 'ADMIT'), free=110 * GIB)   # 20 GiB request would break the 100 GiB floor
+        self.assertEqual((out['granted'], calls), ([], []))
+        self.assertEqual(self.states(), ['QUEUED'])
+        self.assertEqual(self.advance_with(lambda: calls.append(1) or (True, 'ADMIT'), free=5 * GIB)['granted'], [])
+        self.assertEqual(calls, [])                      # emergency tier: still no gate call
+
+    def test_refusal_still_expires_a_lapsed_grant_and_does_not_hand_its_lane_on(self):
+        a, b = self.enqueue('HORO-2070'), self.enqueue('HORO-2071')
+        self.advance()
+        out = self.advance_with(lambda: (False, 'REFUSE'), now=self.now + timedelta(hours=2))
+        self.assertEqual((out['expired'], out['granted']), ([a['id']], []))
+        self.assertEqual(self.states(), ['EXPIRED', 'QUEUED'])
+
+    def test_the_two_passes_write_one_shadow_budget_receipt_per_decision(self):
+        host = {'ram': 128 * GIB, 'used': 20 * GIB, 'cores': 16, 'load1': 0.0, 'time': self.now, 'window_s': 2.0, 'rows': {},
+                'rows_prev': {}, 'workloads': [], 'band': 'GREEN'}
+
+        def budget_receipts():
+            lines = (self.path.parent / 'queue/receipts.jsonl').read_text().splitlines()
+            return len([line for line in lines if '"shadow-budget"' in line])
+
+        def advance_once(memory_fn):
+            self.path = Path(self.temp.name).resolve() / ('state-%s/admission/state.json' % ('memory' if memory_fn else 'library'))
+            self.enqueue('HORO-2070')
+            da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, host_fn=lambda: host, memory_fn=memory_fn)
+            return budget_receipts()
+
+        library = advance_once(None)
+        self.assertGreaterEqual(library, 1)
+        self.assertEqual(advance_once(lambda: (True, 'ADMIT')), library)        # one receipt per decision, same as without the gate
+        self.assertEqual(advance_once(lambda: (False, 'REFUSE')), library)
+
+    def test_no_memory_fn_keeps_the_library_behaviour(self):
+        a = self.enqueue('HORO-2070')
+        self.assertEqual(self.advance()['granted'], [a['id']])
+
+
 class NoDoubleBooking(QueueBase):
     def test_plain_reserve_is_refused_behind_the_queue(self):
         self.enqueue()
@@ -712,9 +776,11 @@ class ClaimCli(QueueBase):
 
 
 class Cli(QueueBase):
+    memory = (True, 'ok')
+
     def run_cli(self, *argv):
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with contextlib.redirect_stdout(out), unittest.mock.patch.object(da, '_memory_precondition', lambda: self.memory):
             rc = da.run(list(argv), state_path=self.path, free_fn=lambda: 400 * GIB)
         return rc, out.getvalue()
 
@@ -734,6 +800,21 @@ class Cli(QueueBase):
         self.assertNotIn(SECRET_ARG, out)
         self.assertEqual(self.run_cli('queue', 'cancel', '--id', qid)[0], 0)
         self.assertNotEqual(self.run_cli('queue', 'cancel', '--id', 'q999999')[0], 0)
+
+    def test_advance_cli_grants_nothing_while_the_memory_gate_refuses(self):
+        rc, out = self.run_cli('queue', 'enqueue', '--label', 'nda-horo-2070', '--ticket', 'HORO-2070', '--repo', 'horonom/nda',
+                               '--worktree', str(self.worktree), '--harness', 'codex',
+                               '--session-id', '0b1d2e3f-aaaa-bbbb-cccc-1234567890ab', '--bytes', str(20 * GIB), '--', 'cargo', 'test')
+        qid = json.loads(out)['id']
+        self.memory = (False, 'REFUSE heavy | hysteresis: recovering (0/3)')
+        rc, out = self.run_cli('queue', 'advance')
+        result = json.loads(out)
+        self.assertEqual((rc, result['ok'], result['granted']), (0, True, []))
+        self.assertTrue(result['reason'].startswith('memory-gate: '), result)
+        entry = [e for e in json.loads(self.run_cli('queue', 'status', '--json')[1])['entries'] if e['id'] == qid][0]
+        self.assertEqual(entry['state'], 'QUEUED')
+        self.memory = (True, 'ok')
+        self.assertEqual(json.loads(self.run_cli('queue', 'advance')[1])['granted'], [qid])
 
 
 DETACHER = """

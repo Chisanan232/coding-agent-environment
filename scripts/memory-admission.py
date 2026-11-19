@@ -487,6 +487,21 @@ def exit_ok(m):
     return m.get("pressure_level") == PRESSURE_NORMAL and io <= EXIT["swap_io_mib_s"] and cr <= EXIT["compressor_ratio"] and lpc <= EXIT["load_per_core"]
 
 
+def exit_blockers(m):
+    """Which stricter EXIT conditions this reading fails, as short texts. Explains a latch that is not recovering; changes no limit."""
+    out = []
+    lvl = m.get("pressure_level")
+    if lvl != PRESSURE_NORMAL:
+        out.append(f"pressure level {lvl}, exit needs {PRESSURE_NORMAL}")
+    for key, limit, label, fmt in (("swap_io_mib_s", EXIT["swap_io_mib_s"], "swap I/O", "{:.1f} MiB/s"),
+                                   ("compressor_ratio", EXIT["compressor_ratio"], "compressor", "{:.0%}"),
+                                   ("load_per_core", EXIT["load_per_core"], "load/core", "{:.1f}")):
+        value = m.get(key)
+        if value is not None and value > limit:
+            out.append(f"{label} {fmt.format(value)} > exit {fmt.format(limit)}")
+    return out
+
+
 def decide(weight, m, state, now):
     """Pure. Returns (verdict, new_state). state = {'latched': bool, 'ok_streak': int, 'last_ok': float, 'levels': [..]}."""
     st = {"latched": False, "ok_streak": 0, "last_ok": 0.0, "levels": []}
@@ -530,7 +545,9 @@ def decide(weight, m, state, now):
         else:
             st["ok_streak"] = 0
         if st["latched"]:
-            reasons = [f"hysteresis: recovering ({st['ok_streak']}/{EXIT_SAMPLES} good checks >= {MIN_SPACING}s apart)"]
+            why = exit_blockers(m)
+            reasons = [f"hysteresis: recovering ({st['ok_streak']}/{EXIT_SAMPLES} good checks >= {MIN_SPACING}s apart)"
+                       + (f"; exit blocked by {', '.join(why)}" if why else "")]
     return {"admit": not reasons, "reasons": reasons, "warnings": warnings, "weight": weight}, st
 
 

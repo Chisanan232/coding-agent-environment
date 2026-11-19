@@ -1566,9 +1566,14 @@ def _has_waiting(state_path):
 
 
 def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=process_token, grant_s=QUEUE_GRANT_S, table_fn=None,
-                  host_fn=None):
-    """_queue_advance, then a measurement sample per reservation holder outside the lock. host_fn feeds the resource budget."""
-    now = now or datetime.now(timezone.utc)
+                  host_fn=None, memory_fn=None):
+    """_queue_advance, then a measurement sample per reservation holder outside the lock. host_fn feeds the resource budget.
+
+    memory_fn (the CLI passes the SPE-117 gate) makes a grant conditional on the memory gate admitting: a grant that queue_claim
+    would then refuse only holds a lane for its whole window and lapses unclaimed, consuming the queue without starting anything.
+    The gate takes 10 s or more, so it runs outside the lock and only when a grant is otherwise possible (first pass finds the head
+    grantable and returns grant_pending; second pass applies the verdict). A refusal leaves every entry QUEUED in FIFO order."""
+    caller_now, now = now, now or datetime.now(timezone.utc)
     host = _host_or_error(host_fn) if host_fn is not None and _has_waiting(state_path) else None
     seen = {}
 
@@ -1576,12 +1581,19 @@ def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=pro
         seen['free'] = free_fn()
         return seen['free']
 
-    out = _queue_advance(state_path, free, now, token_fn, grant_s, table_fn, host)
+    out = _queue_advance(state_path, free, now, token_fn, grant_s, table_fn, host, memory='probe' if memory_fn else None)
+    if memory_fn and out.pop('grant_pending', False):
+        admitted, why = memory_fn()
+        first = out
+        out = _queue_advance(state_path, free, datetime.now(timezone.utc) if caller_now is None else now, token_fn, grant_s, table_fn, host,
+                             memory=(bool(admitted), why))
+        for key in ('expired', 'released'):
+            out[key] = first[key] + out[key]
     _measure(state_path, 'advance', seen.get('free'), now)
     return out
 
 
-def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, host=None):
+def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, host=None, memory=None):
     """One advance step under the lock: expire lapsed grants and waits, then grant the first in line if a lane is free.
 
     A lane is occupied by a live reservation (including one past its time limit or unverifiable) and by an unclaimed,
@@ -1668,13 +1680,20 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                 _mark_enforced(budget, in_use < lanes and floor_ok and not budget_why)
                 if budget is not None:
                     out['budget'] = budget
-                    _budget_receipt(state_path, nxt, now, budget)
+                    if memory != 'probe':   # the probe pass repeats in the final pass: one receipt per decision, not two
+                        _budget_receipt(state_path, nxt, now, budget)
                 if in_use >= lanes or not floor_ok or budget_why:
                     if not out['granted']:
                         out['reason'] = ('lane occupied' if in_use >= lanes else
                                          'over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested for %s, floor 100 GiB' % (
                                              result['free_bytes'] / GIB, reserved / GIB, nxt['bytes'] / GIB, nxt['id'])
                                          if not floor_ok else budget_why)
+                    return out
+                if memory == 'probe':
+                    out['grant_pending'] = True   # the head fits: the caller asks the memory gate outside the lock, then calls again
+                    return out
+                if type(memory) is tuple and not memory[0] and not out['granted']:
+                    out['reason'] = 'memory-gate: %s' % memory[1]
                     return out
                 nxt['state'] = 'GRANTED'
                 nxt['grant'] = {'at': iso_utc(now), 'expires': iso_utc(now + timedelta(seconds=window))}
@@ -3219,9 +3238,9 @@ def _queue_cli(args, state_path, free_fn, host_fn=None):
         out = queue_enqueue(state_path, args.label, args.tickets, args.repo, args.worktree, args.harness, args.session_id,
                             args.nbytes, args.job[1:], again=args.again, wait_s=args.wait_s, declared=declared)
     elif command == 'advance':
-        out = queue_advance(state_path, free_fn, grant_s=args.grant_s, host_fn=host_fn)
+        out = queue_advance(state_path, free_fn, grant_s=args.grant_s, host_fn=host_fn, memory_fn=_memory_precondition)
         out['ok'] = out['reason'] in ('ok',) or bool(out['granted'] or out['expired'] or out['eligible']) or out['reason'] in (
-            'lane occupied',) or out['reason'].startswith(('no heavy lane', 'budget:'))
+            'lane occupied',) or out['reason'].startswith(('no heavy lane', 'budget:', 'memory-gate:'))
     elif command == 'claim':
         if args.pid <= 0 or not _is_strict_ancestor(args.pid):
             print(json.dumps({'ok': False, 'reason': 'invalid-request: --pid must be a live ancestor of this command '
