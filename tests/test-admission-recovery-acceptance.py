@@ -482,6 +482,61 @@ class Acceptance(unittest.TestCase):
             self.assertNotIn(secret, blob)
         self.assertEqual(len([a for a in self.alerts if a['cause'] == 'obsolete-wrapper-terminated']), 1)      # delivered once, not again
 
+    # ==== a forged or mismatched record is never trusted ===========================================================
+    def test_a_record_for_a_terminal_entry_that_does_not_name_it_as_waiter_is_refused(self):
+        healthy = self.stand_in()
+        qid = self.enqueue('HORO-3901')                     # no waiter at all: nothing proves this process belongs to the entry
+        self.register(healthy, qid)
+        other = self.spawn(['/bin/sleep', '300'])
+        stranger = self.stand_in()
+        qid2 = self.enqueue('HORO-3902', waiter=other)      # a different, live waiter
+        self.register(stranger, qid2)
+        self.cancel(qid)
+        self.cancel(qid2)
+        self.to_action()
+        result = self.tick(65)
+        self.tick(65)
+        self.assertTrue(self.alive(healthy['proc']) and self.alive(stranger['proc']) and self.alive(other))
+        self.assertEqual(self.kills, [])
+        self.assertEqual(sorted(r['id'] for r in result['recovery']['reported']), sorted([qid, qid2]))
+        self.assertTrue(all(r['refused'] == ['not-the-entry-waiter'] for r in result['recovery']['reported']))
+
+    # ==== registry pruning (unlink only, every tick mode) ==========================================================
+    def forge(self, qid, pid, token='Mon Jan  1 00:00:00 2001', days=0):
+        self.registry.mkdir(mode=0o700, parents=True, exist_ok=True)
+        doc = {'qid': qid, 'pid': pid, 'start_token': token, 'pgid': 5, 'ppid': 4, 'exe_id': 'python3 heavy-run', 'kind': 'heavy-run',
+               'created': lib.iso(datetime.now(timezone.utc) + timedelta(seconds=self.clock.offset) - timedelta(days=days))}
+        path = self.registry / (qid + '.json')
+        path.write_text(json.dumps(doc))
+        os.chmod(path, 0o600)
+        return path
+
+    def test_pruning_removes_only_dead_replaced_or_old_records_even_when_observing(self):
+        keep = self.wrapped_entry('HORO-4001')
+        dead = self.wrapped_entry('HORO-4002')
+        dead['proc'].kill()
+        dead['proc'].wait()
+        replaced = self.forge('q000901', keep['proc'].pid)                       # live pid, different start token
+        old = self.forge('q000902', keep['proc'].pid, token=json.loads((self.registry / (keep['qid'] + '.json')).read_text())['start_token'], days=8)
+        link = self.registry / 'q000903.json'
+        link.symlink_to(self.root / 'elsewhere')
+        result = self.tick(0, act=False)
+        self.assertEqual(result['registry_pruned'], 3)
+        self.assertEqual([p.name for p in sorted(self.registry.iterdir())], sorted([keep['qid'] + '.json', 'q000903.json']))
+        self.assertFalse(any(p.exists() for p in (replaced, old, self.registry / (dead['qid'] + '.json'))))
+        self.assertTrue(self.alive(keep['proc']))
+        self.assertEqual(self.kills, [])
+        lines = [json.loads(x) for x in (self.monitor_dir / 'recovery-receipts.jsonl').read_text().splitlines()]
+        self.assertEqual([(x['kind'], x['detail']) for x in lines], [('prune', 'count=3')])
+        self.assertEqual(self.tick(65, act=True)['registry_pruned'], 0)
+
+    def test_pruning_is_bounded_to_fifty_per_tick(self):
+        for n in range(60):
+            self.forge('q0020%02d' % n, 2 ** 30 + n)
+        self.assertEqual(self.tick(0)['registry_pruned'], 50)
+        self.assertEqual(self.tick(65)['registry_pruned'], 10)
+        self.assertEqual(list(self.registry.iterdir()), [])
+
 
 class HoldsWorkload(unittest.TestCase):
     """The workload-evidence binding: anything uncertain, a child, a group mate or an open cargo lock counts as holding."""

@@ -562,14 +562,14 @@ owner-run step. A grant is not a start: only a claim, a release or CPU growth of
   kind made after the grant; a later receipt of any kind, or a transient kind (`memory-gate`, `floor`, `lane`, `budget`, `other`), voids it. An
   `unknown` owner never cancels. `verify_recovery` then reports `pending`, `verified` or `failed` from scheduler status; it never assumes success.
 - `obsolete_wrapper` / `terminate_wrapper`: a wrapper or waiter (real int pid above 1, not this process or its parent) whose entry is terminal
-  or gone, with matching pid, start token, uid, process group and parent, a matching executable identity, no workload by evidence and no child or
+  and names this very pid and start token as its `waiter` (a terminal entry with no waiter, or another one, is refused: a forged record cannot aim a signal) or is gone, with matching pid, start token, uid, process group and parent, a matching executable identity, no workload by evidence and no child or
   detached workload, gets exactly one SIGTERM, a bounded wait, and a `failed-to-terminate` report on survival. Never SIGKILL, never a workload.
   A terminal entry only proves the queue no longer needs the pid, so identity is checked too: a wrapper that exec'd the workload keeps its pid and token.
 - Wrapper registry: when `heavy-run` or `la-cargo` enqueue they record `wrappers/<qid>.json` (0600, in a 0700 directory beside the admission state,
   or `$ADMISSION_WRAPPERS_DIR`) holding exactly `{qid, pid, start_token (the queue waiter token), pgid, ppid, exe_id, kind, created}`, where `exe_id` is
   the interpreter and script basenames only (never argv), and remove it when they exit. Writing is best effort: any failure is ignored and never
   fails the job. `read_registry` refuses a symlink, a foreign owner, loose modes, an off-schema or oversized record and a pid whose live start token
-  differs. `kill -9` leaves a stale file that is never trusted (the process is gone) and is not deleted by the monitor.
+  differs. A stale file (`kill -9`) is never trusted, and every monitor tick, observe-only or act, unlinks (never signals) records whose pid is gone, whose start token changed or that are older than 7 days: regular files of ours only, at most 50 per tick, one count-only `prune` receipt per batch. Registration uses `ps` lookups bounded to 1 s each; a slow `ps` means no record, which is never terminated, and a signal during registration still cancels or releases the queue entry (the registry step sits inside the wrapper's cleanup `try`, and its own removal is the last cleanup step).
 - Monitor bindings (the library's own defaults still refuse): `registered_fn` is that registry; `exe_fn` reduces `ps` args to the same two basenames in
   memory; `holds_workload_fn` is true when anything else lives in the wrapper's group or below it, when an open `.cargo-lock` is seen, or when the
   process table or `lsof` cannot be read (uncertain is holding); `owner_exec_fn` is `gone` only when the entry's declared waiter is provably gone,

@@ -1105,6 +1105,7 @@ def _tick_locked(env, directory, act, if_due):
     if act:
         recovery_pass(env, state, entries, now, wall, gap, directory, result,
                       lambda: persist(directory, state, cpu_now, states_now, window, blocker, progress_at, wall, mono, boot))
+    result['registry_pruned'] = prune_wrappers(env, directory)
     state['clean_ticks'] = 0 if verdict['causes'] or gap else state.get('clean_ticks', 0) + 1
     last_alert = state.get('last_alert')
     # A clear bumps session-notify's cycle and forgets its dedup records: never while an incident's notice is still being handed off or polled.
@@ -1132,6 +1133,16 @@ def _tick_locked(env, directory, act, if_due):
         handle.write(json.dumps({k: result[k] for k in ('at', 'primary', 'waiting', 'stalled', 'confirmed', 'actions', 'observation_gap')},
                                 sort_keys=True) + '\n')
     return result
+
+
+def prune_wrappers(env, directory):
+    """Drop wrapper-registry files that can no longer matter (dead pid, replaced start token, older than 7 days): unlink only, at most 50 per tick, in every
+    tick mode and independent of the recovery kill switch (it removes records, it never acts on a process). Returns the count; never raises."""
+    try:
+        lib = recovery_lib()
+        return lib.prune_registry(lib.wrappers_dir(env.state_path), lib.Env(directory, clock=env.clock))
+    except Exception:
+        return 0
 
 
 def kill_switch_on(directory):

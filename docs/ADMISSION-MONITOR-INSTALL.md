@@ -65,7 +65,7 @@ Expected: `last exit code = 0`, `status.json` less than 2 minutes old, `granted_
 Beyond `queue advance`, each `--act` tick first verifies earlier recoveries, then takes at most one new action:
 
 1. **Obsolete wrapper.** A `heavy-run` or `la-cargo` that registered itself when it enqueued (`wrappers/<qid>.json`) whose queue entry is CANCELLED, EXPIRED
-   or RELEASED, with the same live wrapper seen that way on two ticks at least 120 s apart, and whose pid, start token, process group, parent, uid and
+   or RELEASED, with the same live wrapper seen that way on two ticks at least 120 s apart, and whose entry names that very pid and start token as its waiter, and whose pid, start token, process group, parent, uid and
    interpreter+script identity still match, with no child, group mate, detached process or open cargo lock, gets one SIGTERM. If it survives 10 s it is reported
    as `failed-to-terminate` (owner action: inspect the stuck wrapper) and never signalled again.
 2. **Abandoned unstarted grant.** A GRANTED entry older than 5 min with no holder, release or workload, whose declared waiter is provably gone (or that has none and
@@ -89,7 +89,7 @@ ls -l ~/.cache/coding-agent-environment/admission/wrappers/                     
 ```
 
 Expected while healthy: `recovery.state` is `ok`, `acted` and `reported` are empty, and the registry holds only wrappers of live entries. A stale file left by `kill -9`
-is harmless (never trusted once its process is gone).
+is never trusted and is removed by the next tick (unlink only; dead pid, changed start token or older than 7 days; at most 50 per tick; a count-only `prune` receipt).
 
 **Roll back.** Fastest: create `recovery.disabled`. Complete: reprint the agent with `--observe-only` as below, which removes every action including `queue advance`.
 The registry files and receipts can stay; removing `wrappers/` is safe because `heavy-run` and `la-cargo` write it best effort and never depend on it.
