@@ -497,6 +497,24 @@ change cannot make a live waiter look replaced; waiter pids at or below 1 are re
 cannot be measured (advance returns early before it). Enqueue that dedupes to an existing live entry returns that entry and does not
 refresh its waiter.
 
+## Bounded hand-off grants (SPE-176, ADR 0019)
+
+A queue entry enqueued without `--waiter-pid` is a manual hand-off. `queue advance` still grants it strictly in order and in its place, but
+the grant window is `HANDOFF_GRANT_S` (1200 s, 20 min) instead of the 3600 s default, because observed grant-to-claim p99 is 29 min and an
+absent owner must not hold the only usable lane for a full hour. The granted receipt, the `granted/<id>` marker and `grant.expires` all carry
+the same shorter expiry; the grant object stays exactly `{at, expires}`. When the window lapses the entry expires through the existing
+EXPIRED path and the owner re-enqueues (joining the end of the line). Entries with a declared waiter keep `min(grant_s, 4 h)`, and an
+explicit smaller `--grant-s` still wins for either kind. Lane and byte accounting for an unclaimed grant is unchanged.
+
+## Bounded hand-off grants (SPE-176, ADR 0019)
+
+A queue entry enqueued without `--waiter-pid` is a manual hand-off. `queue advance` still grants it strictly in order and in its place, but
+the grant window is `HANDOFF_GRANT_S` (1200 s, 20 min) instead of the 3600 s default, because observed grant-to-claim p99 is 29 min and an
+absent owner must not hold the only usable lane for a full hour. The granted receipt, the `granted/<id>` marker and `grant.expires` all carry
+the same shorter expiry; the grant object stays exactly `{at, expires}`. When the window lapses the entry expires through the existing
+EXPIRED path and the owner re-enqueues (joining the end of the line). Entries with a declared waiter keep `min(grant_s, 4 h)`, and an
+explicit smaller `--grant-s` still wins for either kind. Lane and byte accounting for an unclaimed grant is unchanged.
+
 ## Stall detection (SPE-176, ADR 0018)
 
 `scripts/admission-monitor.py tick` reads the queue, the latch file and the process table and reports whether queued work is globally

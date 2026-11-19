@@ -1310,6 +1310,10 @@ QUEUE_VERSION = 1
 RUNNER_PROTOCOL = 2
 QUEUE_WAIT_S = 24 * 3600
 QUEUE_GRANT_S = 3600
+# Grant window for an entry with no declared waiter (a manual hand-off), SPE-176 / ADR 0019. Observed grant-to-claim p99 is 29 min, so 20 min is
+# the claim window: an absent hand-off owner holds the only usable lane at most 20 min per grant. On lapse the existing EXPIRED path applies and
+# the owner re-enqueues. Entries with a declared waiter keep min(grant_s, QUEUE_MAX_GRANT_S); an explicit smaller grant_s still wins.
+HANDOFF_GRANT_S = 1200
 QUEUE_MAX_GRANT_S = 4 * 3600
 WAITING_STATES = ('QUEUED', 'ELIGIBLE', 'GRANTED')
 LIVE_STATES = WAITING_STATES + ('CLAIMED',)
@@ -1746,7 +1750,6 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
             orphans = _claimed_orphans(entries, live, token_fn, table_fn, state_path)
             in_use = len(live) + len(granted) + len(orphans)
             reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans) + sum(e['bytes'] for e in granted)
-            window = min(grant_s, QUEUE_MAX_GRANT_S)
             # Strict first-in-first-out: grant the head, then try the next with the budget recomputed beside the new grant, and
             # stop at the first entry that does not fit. A later, smaller entry never overtakes a larger head.
             for nxt in waiting:
@@ -1775,6 +1778,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                 if type(memory) is tuple and not memory[0] and not out['granted']:
                     out['reason'] = 'memory-gate: %s' % memory[1]
                     return out
+                window = min(grant_s, QUEUE_MAX_GRANT_S if 'waiter' in nxt else HANDOFF_GRANT_S)   # once per entry: grant, marker, receipt
                 nxt['state'] = 'GRANTED'
                 # The grant object is exactly {at, expires}: a hand-off consumer validates it as a closed key set (the HORO-2139 executor
                 # refused a grant with two extra keys on 2026-11-19 and its waiter died). The runner stamp goes in the receipt only.
