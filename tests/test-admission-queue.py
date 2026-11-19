@@ -1028,7 +1028,7 @@ class WaiterAndClaimReceipts(QueueBase):
     def test_waiter_is_stored_with_its_start_token(self):
         proc = self.waiter()
         qid = self.enqueue_waited(proc)
-        self.assertEqual(self.entries()[qid]['waiter'], {'pid': proc.pid, 'start_token': da.process_token(proc.pid)})
+        self.assertEqual(self.entries()[qid]['waiter'], {'pid': proc.pid, 'start_token': da.waiter_token(proc.pid)})
 
     def test_no_waiter_field_without_the_flag(self):
         qid = self.enqueue()['id']
@@ -1069,7 +1069,7 @@ class WaiterAndClaimReceipts(QueueBase):
 
     def test_entry_without_waiter_is_never_cancelled(self):
         self.enqueue()
-        out = self.advance_out(token_fn=lambda pid: None)   # every process looks gone
+        out = self.advance_out(waiter_token_fn=lambda pid: None)   # every process looks gone
         self.assertEqual(out['cancelled'], [])
         self.assertEqual(self.states(), ['GRANTED'])
 
@@ -1079,14 +1079,14 @@ class WaiterAndClaimReceipts(QueueBase):
 
         def broken(pid):
             raise da.ReservationError('ps failed')
-        out = self.advance_out(token_fn=broken)
+        out = self.advance_out(waiter_token_fn=broken)
         self.assertEqual(out['cancelled'], [])
         self.assertNotEqual(self.states(), ['CANCELLED'])
 
     def test_reused_pid_with_a_new_start_token_cancels(self):
         proc = self.waiter()
         qid = self.enqueue_waited(proc)
-        out = self.advance_out(token_fn=lambda pid: 'Thu Jan  1 00:00:00 2099')
+        out = self.advance_out(waiter_token_fn=lambda pid: 'Thu Jan  1 00:00:00 2099')
         self.assertEqual(out['cancelled'], [qid])
 
     def test_claimed_entry_is_never_touched_by_the_waiter_rule(self):
@@ -1118,6 +1118,43 @@ class WaiterAndClaimReceipts(QueueBase):
     def test_self_and_parent_are_accepted_as_waiter(self):
         self.assertTrue(self.enqueue(ticket='HORO-2070', waiter_pid=os.getpid())['ok'])
         self.assertTrue(self.enqueue(ticket='HORO-2071', waiter_pid=os.getppid())['ok'])
+
+    def test_timezone_change_does_not_cancel_a_live_waiter_but_a_reused_pid_does(self):
+        proc = self.waiter()
+        qid = self.enqueue_waited(proc)
+        stored = self.entries()[qid]['waiter']['start_token']
+        tokyo = da.waiter_token(proc.pid, tz='Asia/Tokyo')
+        self.assertNotEqual(tokyo, stored)                      # the same process renders differently in another zone
+        with unittest.mock.patch.dict(os.environ, {'TZ': 'Asia/Tokyo'}):
+            self.assertEqual(da.waiter_token(proc.pid), stored)  # the waiter token is pinned to UTC
+            self.assertEqual(self.advance_out()['cancelled'], [])
+        self.assertEqual(self.states(), ['GRANTED'])
+        reused = lambda pid: 'Thu Jan  1 00:00:01 2099'          # another process (later start) now answers for the stored pid
+        self.assertEqual(self.advance_out(waiter_token_fn=reused)['cancelled'], [qid])
+
+    def test_real_ancestor_chain_is_accepted_and_an_unrelated_pid_is_refused(self):
+        # Run waiter_identity inside a grandchild of this test process: parent (us) -> child -> grandchild.
+        script = ('import sys,os,json;from importlib.util import module_from_spec,spec_from_file_location as s;'
+                  'sp=s("da",sys.argv[1]);m=module_from_spec(sp);sp.loader.exec_module(m);'
+                  'print(json.dumps([m._waiter_identity(int(a),m.waiter_token,m.process_owner,None)[1] for a in sys.argv[2:]]))')
+        wrapper = ('import subprocess,sys;sys.exit(subprocess.call([sys.executable,"-c",sys.argv[1]]+sys.argv[2:]))')
+        sleeper = self.waiter()
+        dead = self.waiter()
+        dead.kill()
+        dead.wait()
+        out = subprocess.run([sys.executable, '-c', wrapper, script, str(ROOT / 'scripts/disk-admission.py'), str(os.getpid()),
+                              str(sleeper.pid), str(dead.pid)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        accepted, unrelated, gone = json.loads(out.stdout)
+        self.assertIsNone(accepted)                                           # the test process is the grandchild's grandparent
+        self.assertIn('supervising wrapper', unrelated)
+        self.assertIn('not a running process', gone)
+
+    def test_pid_one_and_below_are_rejected(self):
+        for pid in (1, 0, -5):
+            _, why = da._waiter_identity(pid, da.waiter_token, da.process_owner, lambda p: True)
+            self.assertIsNotNone(why, pid)
+        self.assertFalse(self.enqueue(waiter_pid=1, ancestor_fn=lambda p: True)['ok'])
 
     def test_waiter_pid_flag_is_accepted_by_the_cli(self):
         job = ['--', 'cargo', 'build']
