@@ -36,8 +36,11 @@ Add `scripts/admission-monitor.py`: a stdlib-only, deterministic, single-shot `t
   (a grant without the runner stamp of the current protocol), `stalled-running` (a claimed workload whose CPU time has not changed for
   15 minutes: reported, never touched) and `unobservable` (memory metrics unreadable). A grant that lapsed unclaimed is a note in the
   status, not a trigger. Only `stale-claim`, `frozen-queue`, `failed-continuation` and the two hysteresis causes can start an advance.
-- **Runner stamp.** Each grant records `runner: {protocol, checkout}` and `memory_gate`. `RUNNER_PROTOCOL` is bumped when a runner gains
-  behaviour another runner's grants cannot be trusted without.
+- **Runner stamp.** The granted receipt (never the grant object) records `runner: {protocol, checkout}` and `memory_gate`; the monitor reads
+  it from the receipt that matches the grant time. The grant object stays exactly `{at, expires}`: a hand-off consumer validates it as a
+  closed key set, and an earlier version of this change that put the stamp inside the grant made the HORO-2139 executor refuse the grant
+  and exit (2026-11-19). A test pins the key set. `RUNNER_PROTOCOL` is bumped when a runner gains behaviour another runner's grants
+  cannot be trusted without.
 - **Recovery** has one verb: `disk-admission.py queue advance` from this checkout, only with `--act`, only after the same cause held for two
   ticks, never on `disk-floor`, `memory-pressure` or `state-unreadable`, at most one per 120 s and five per rolling 30 minutes, then
   `recovery-exhausted`. Advance already releases claims whose holder provably exited, expires lapsed grants and probes the memory gate, so
