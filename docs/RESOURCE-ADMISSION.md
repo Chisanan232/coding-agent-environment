@@ -407,6 +407,13 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
 - `queue advance`: grants the head, then tries the next entry with the budget recomputed from the single host sample taken before the
   lock, and stops at the first entry that does not fit (no overtaking, no backfill). Grants made in the same call count toward the
   floor. `ok` also covers a `budget:` reason.
+- `queue advance` and memory (SPE-175): the CLI grants the head only when the SPE-117 memory gate admits, because `queue claim` runs that
+  gate and a grant it would refuse only holds a lane for its whole window and then lapses unclaimed. The gate takes 10 s or more, so it
+  runs outside the lock and only when the head otherwise fits (a lane is free, the floor holds, the budget allows); otherwise it is not
+  asked. A refusal grants nothing, leaves every entry `QUEUED` in FIFO order, still expires lapsed grants and waits, and reports reason
+  `memory-gate: <first line of the gate verdict>` (counted as `ok`). The library function stays memory-free unless given `memory_fn`.
+- A grant is not a start. An entry is running only in state `CLAIMED` with `holder.workload.observed` true and a live workload; report
+  `GRANTED` as "granted, not started" together with the claim refusal text.
 - `queue claim`: re-checks the budget under the lock; a refusal keeps the grant.
 - A job that was claimed before this change has no `granted_jobs`; as a Cargo-class holder it is charged every core, so it holds the
   second lane closed until it finishes.
