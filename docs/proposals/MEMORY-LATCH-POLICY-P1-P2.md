@@ -27,7 +27,7 @@ least 30 s apart satisfying every EXIT threshold.
 exactly 1; swap I/O at most 1.0 MiB/s; load per core at most 2.0; compressor reading present (below 35% because ENTER passed).
 
 **P2 run and release:**
-- A counted sample is an eligible reading at least 60 s after the previous counted sample (a second per 60 s whatever the number of callers).
+- A counted sample is an eligible reading at least 60 s after the previous counted sample (at most once per 60 s whatever the number of callers).
 - Release needs all of: 10 counted samples; (last sample time minus first sample time) at least 540 s, taken from recorded times, so a
   forged or truncated list cannot shortcut it; and (maximum minus minimum compressor ratio) at most 0.005 across the run.
 - A run is discarded when the next eligible reading arrives more than 300 s after the last counted one (exactly 300 s still counts).
