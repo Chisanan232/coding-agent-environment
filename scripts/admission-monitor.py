@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -34,6 +35,7 @@ INTERVAL_S = 60
 STALL_S = 600                 # waiting work with no claim, release or CPU growth for this long is a global stall
 GRANTED_ALERT_S = 2700        # above the observed p99 grant->claim (29 min), below the 60 min grant window
 CPU_STALL_S = 900             # a claimed, alive workload with no CPU growth this long is reported, never touched
+CONFIRM_SPACING_S = 30        # confirmations are counted at least this far apart
 CONFIRM_TICKS = 2             # consecutive ticks a cause must hold before it is acted on or alerted
 GAP_FACTOR = 3                # a gap over this many intervals, or sleep, is an observation gap
 ADVANCE_MIN_GAP_S = 120
@@ -45,11 +47,12 @@ STATIC_SPAN = 0.01            # ...within one percentage point of RAM
 WINDOW_MAX = 16
 STATE_LIMIT = 65536
 CAUSES = ('state-unreadable', 'disk-floor', 'memory-pressure', 'memory-hysteresis-static-compressor', 'memory-hysteresis',
-          'stale-claim', 'failed-continuation', 'outdated-caller', 'healthy-busy', 'unknown')
+          'stale-claim', 'frozen-queue', 'failed-continuation', 'outdated-caller', 'stalled-running', 'unobservable', 'healthy-busy', 'unknown')
 OWNER_ACTION = {'disk-floor': 'reclaim-disk', 'memory-pressure': 'reduce-load', 'memory-hysteresis-static-compressor': 'approve-memory-policy',
                 'memory-hysteresis': 'wait-or-approve-memory-policy', 'stale-claim': 'confirm-claim-ended',
                 'failed-continuation': 'restart-waiting-session', 'outdated-caller': 'restart-outdated-caller',
-                'state-unreadable': 'inspect-admission-state', 'unknown': 'inspect-admission-state'}
+                'state-unreadable': 'inspect-admission-state', 'unknown': 'inspect-admission-state',
+                'frozen-queue': 'run-queue-advance', 'stalled-running': 'inspect-running-workload', 'unobservable': 'inspect-memory-admission'}
 
 
 def load(name):
@@ -149,8 +152,8 @@ def memory_view(memory_state_path):
     state = read_json(memory_state_path, {})
     latch = {'latched': bool(state.get('latched')), 'ok_streak': state.get('ok_streak', 0)}
     try:
-        done = subprocess.run([sys.executable, str(HERE / 'memory-admission.py'), 'status', '--json'], capture_output=True, text=True,
-                              timeout=90, stdin=subprocess.DEVNULL)
+        done = subprocess.run([sys.executable, str(HERE / 'memory-admission.py'), 'status', '--json', '--state', str(memory_state_path)],
+                              capture_output=True, text=True, timeout=90, stdin=subprocess.DEVNULL)
         metrics = json.loads(done.stdout)['memory']
     except (OSError, subprocess.SubprocessError, ValueError, KeyError):
         metrics = {}
@@ -158,6 +161,38 @@ def memory_view(memory_state_path):
 
 
 # ---- pure core -------------------------------------------------------------------------------------------------------
+
+# Causes that a `queue advance` from this checkout can clear (it releases proven-exited claims, expires lapsed grants and probes the
+# memory gate, which is also what counts the recovery streak). Everything else is reported, never advanced.
+ADVANCE_CAUSES = {'stale-claim', 'failed-continuation', 'memory-hysteresis', 'memory-hysteresis-static-compressor', 'frozen-queue'}
+# Causes the owner can usually leave alone for a while because the monitor's own recovery may clear them first.
+RECOVERABLE = {'stale-claim', 'failed-continuation', 'memory-hysteresis', 'frozen-queue'}
+
+
+def safe_time(text):
+    try:
+        moment = parse_iso(text)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return moment if moment.tzinfo is not None else None
+
+
+def usable_entries(entries):
+    """(entries whose times parse, problems). A damaged entry is reported and left alone, never allowed to crash a tick."""
+    good, problems = [], []
+    for e in entries:
+        ok = safe_time(e.get('wait_expires')) is not None
+        if e.get('state') == 'GRANTED':
+            grant = e.get('grant')
+            ok = ok and isinstance(grant, dict) and safe_time(grant.get('at')) is not None and safe_time(grant.get('expires')) is not None
+        if e.get('state') == 'EXPIRED' and isinstance(e.get('grant'), dict):
+            ok = ok and safe_time(e['grant'].get('expires')) is not None
+        if ok:
+            good.append(e)
+        else:
+            problems.append('queue-entry-unusable: %s has an unreadable time field' % e.get('id'))
+    return good, problems
+
 
 def enter_violations(m, enter):
     out = []
@@ -196,17 +231,19 @@ def compressor_static(window, now_wall):
 def classify(snap, limits):
     """Every cause that holds, in precedence order. snap: now, wall, entries, problems, free_bytes, mem, window, claims, protocol.
 
-    claims: {qid: {'status': alive|exited|unresolved, 'idle_s': seconds without CPU growth}}."""
+    claims: {qid: {'status': alive|exited|unresolved, 'idle_s': seconds without CPU change}}. Entries must already be usable."""
     now = snap['now']
     entries = snap['entries']
-    waiting = [e for e in entries if e['state'] in ('QUEUED', 'ELIGIBLE') and parse_iso(e['wait_expires']) > now]
-    granted = [e for e in entries if e['state'] == 'GRANTED' and parse_iso(e['grant']['expires']) > now]
+    waiting = [e for e in entries if e['state'] in ('QUEUED', 'ELIGIBLE') and safe_time(e['wait_expires']) > now]
+    granted = [e for e in entries if e['state'] == 'GRANTED' and safe_time(e['grant']['expires']) > now]
     found = {}
     if snap['problems']:
         found['state-unreadable'] = snap['problems'][0]
     if not waiting and not granted:
-        return {'causes': {}, 'primary': 'idle', 'waiting': 0}
+        return {'causes': found, 'primary': next(iter(found), 'idle'), 'waiting': 0, 'oldest_grant_s': 0, 'notes': []}
     head = waiting[0] if waiting else None
+    mem = snap['mem']
+    metrics = mem.get('metrics') or {}
     if head is not None:
         claimed = sum(e['bytes'] for e in entries if e['state'] == 'CLAIMED')
         parked = sum(e['bytes'] for e in granted)   # reserved by a grant nobody has claimed: capacity held, nothing running
@@ -216,8 +253,8 @@ def classify(snap, limits):
         elif snap['free_bytes'] - claimed - parked - head['bytes'] < limits['floor']:
             found['failed-continuation'] = 'unclaimed grants hold %.0f GiB; %.0f GiB free, %.0f GiB requested by %s' % (
                 parked / GIB, snap['free_bytes'] / GIB, head['bytes'] / GIB, head['id'])
-    mem = snap['mem']
-    metrics = mem.get('metrics') or {}
+    if not metrics and not mem.get('latched'):
+        found['unobservable'] = 'memory metrics could not be read'
     enter = enter_violations(metrics, limits['enter'])
     if enter:
         found['memory-pressure'] = ', '.join(enter)
@@ -235,33 +272,44 @@ def classify(snap, limits):
         if claim.get('status') == 'exited':
             found['stale-claim'] = '%s holder exited, claim not released' % entry['id']
         elif claim.get('status') == 'alive' and claim.get('idle_s', 0) >= CPU_STALL_S:
-            found.setdefault('stale-claim', '%s alive but no CPU growth for %d min (report only)' % (entry['id'], claim['idle_s'] // 60))
+            found['stalled-running'] = '%s alive but its CPU time has not changed for %d min (report only)' % (entry['id'], claim['idle_s'] // 60)
+    oldest = 0
     for entry in granted:
-        age = (now - parse_iso(entry['grant']['at'])).total_seconds()
+        age = int((now - safe_time(entry['grant']['at'])).total_seconds())
+        oldest = max(oldest, age)
         if age >= GRANTED_ALERT_S:
             found['failed-continuation'] = '%s GRANTED %d min without a claim' % (entry['id'], age // 60)
-    if any(e['state'] == 'EXPIRED' and e.get('grant') and not e.get('holder')
-           and (now - parse_iso(e['grant']['expires'])).total_seconds() < 3 * 3600 for e in entries):
-        found.setdefault('failed-continuation', 'a grant lapsed unclaimed within the last 3 h')
     for entry in granted:
-        runner = (entry['grant'] or {}).get('runner')
+        runner = entry['grant'].get('runner')
         if not runner or runner.get('protocol', 0) < snap['protocol']:
             found['outdated-caller'] = '%s was granted by a runner without protocol %d' % (entry['id'], snap['protocol'])
+    # Nothing blocks the head, nothing is claimed, nothing granted is waiting to be claimed: nobody is advancing the queue.
+    if waiting and not found and not granted and not any(e['state'] == 'CLAIMED' for e in entries):
+        found['frozen-queue'] = 'waiting work, free lanes and no blocker, but nothing is being granted'
     primary = next((c for c in CAUSES if c in found), 'unknown')
-    if primary == 'unknown' and not found:
+    if not found:
         primary = 'healthy-busy' if any(e['state'] == 'CLAIMED' for e in entries) else 'unknown'
-    return {'causes': found, 'primary': primary, 'waiting': len(waiting)}
+    # History for the owner, never a trigger: a grant that lapsed unclaimed shortly ago (a lost callback).
+    notes = ['%s grant lapsed unclaimed' % e['id'] for e in entries if e['state'] == 'EXPIRED' and isinstance(e.get('grant'), dict)
+             and not e.get('holder') and 0 <= (now - safe_time(e['grant']['expires'])).total_seconds() < 3 * 3600]
+    return {'causes': found, 'primary': primary, 'waiting': len(waiting), 'oldest_grant_s': oldest, 'notes': notes}
 
 
 def signature(verdict, entries):
-    blockers = sorted(e['id'] for e in entries if e['state'] in ('GRANTED', 'CLAIMED', 'QUEUED', 'ELIGIBLE'))[:12]
-    raw = json.dumps([verdict['primary'], sorted(verdict['causes']), blockers], sort_keys=True)
+    """Stable while the same blockage lasts: the cause set plus the head, claimed and granted ids; a new enqueue behind them changes nothing."""
+    live = [e for e in entries if e['state'] in ('GRANTED', 'CLAIMED')]
+    waiting = [e['id'] for e in entries if e['state'] in ('QUEUED', 'ELIGIBLE')][:1]
+    raw = json.dumps([verdict['primary'], sorted(verdict['causes']), sorted(e['id'] for e in live)[:8], waiting], sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 def alert_due(state, key, now_wall):
     sent = (state.get('alerts') or {}).get(key)
-    return sent is None or now_wall - sent['sent_at'] >= ALERT_COOLDOWN_S
+    if sent is None:
+        return True
+    if not sent.get('delivered'):
+        return now_wall >= sent.get('next_try', 0)
+    return now_wall - sent['sent_at'] >= ALERT_COOLDOWN_S
 
 
 def advance_allowed(state, now_wall):
@@ -272,6 +320,30 @@ def advance_allowed(state, now_wall):
     if len(log) >= ADVANCE_MAX_PER_WINDOW:
         return False, 'recovery-exhausted'
     return True, 'ok'
+
+
+def sanitize_state(state):
+    """Field-by-field type check of a loaded state; a wrong type resets that field only (the counters that bound recovery are kept)."""
+    def nums(value, limit):
+        return [float(x) for x in value if isinstance(x, (int, float)) and not isinstance(x, bool)][-limit:] if isinstance(value, list) else []
+    last = state.get('last_tick')
+    if not (isinstance(last, dict) and all(isinstance(last.get(k), (int, float)) for k in ('wall', 'mono'))):
+        last = {}
+    blocker = state.get('blocker')
+    if not (isinstance(blocker, dict) and isinstance(blocker.get('signature'), str) and type(blocker.get('confirmations')) is int):
+        blocker = None
+    alerts = state.get('alerts')
+    alerts = {k: v for k, v in alerts.items() if isinstance(v, dict) and isinstance(v.get('sent_at'), (int, float))} if isinstance(alerts, dict) else {}
+    cpu = state.get('cpu')
+    cpu = {k: v for k, v in cpu.items() if isinstance(v, dict) and isinstance(v.get('cpu'), (int, float)) and isinstance(v.get('at'), (int, float))} if isinstance(cpu, dict) else {}
+    states = state.get('states')
+    states = {k: v for k, v in states.items() if isinstance(v, str)} if isinstance(states, dict) else {}
+    window = [[float(w), float(r)] for w, r in (x for x in (state.get('window') or []) if isinstance(x, list) and len(x) == 2
+                                                 and all(isinstance(y, (int, float)) for y in x))][-WINDOW_MAX:] if isinstance(state.get('window'), list) else []
+    progress = state.get('progress_at')
+    return dict(schema=1, last_tick=last, blocker=blocker, alerts=alerts, cpu=cpu, states=states, window=window,
+                advances=nums(state.get('advances'), 64), progress_at=progress if isinstance(progress, (int, float)) else None,
+                last_alert=state.get('last_alert') if isinstance(state.get('last_alert'), dict) else None)
 
 
 # ---- tick --------------------------------------------------------------------------------------------------------------
@@ -292,9 +364,14 @@ class Env:
         self.notify = notify or (lambda alert: False)
 
     def _advance(self):
-        done = subprocess.run([sys.executable, str(HERE / 'disk-admission.py'), 'queue', 'advance', '--json'], capture_output=True,
-                              text=True, timeout=180, stdin=subprocess.DEVNULL)
-        return {'exit': done.returncode, 'out': done.stdout[-400:]}
+        """Run one `queue advance`. A slow one is left to finish on its own (never signalled); the next tick's spacing covers it."""
+        proc = subprocess.Popen([sys.executable, str(HERE / 'disk-admission.py'), 'queue', 'advance', '--json'], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, text=True, start_new_session=True)
+        try:
+            out, _ = proc.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            return {'exit': None, 'out': 'still running after 180 s; left to finish'}
+        return {'exit': proc.returncode, 'out': (out or '')[-400:]}
 
 
 def default_limits(da, ma):
@@ -302,8 +379,11 @@ def default_limits(da, ma):
 
 
 def tick(env, act=False, if_due=False):
-    """One idempotent pass. Returns the result dict (also persisted as status.json)."""
+    """One idempotent pass. Returns the result dict (also persisted as status.json). Never raises on bad input: a failed observation
+    is itself reported as `state-unreadable`."""
     directory = monitor_dir(env.state_path)
+    if directory.is_symlink():
+        return {'ran': False, 'why': 'monitor directory is a symlink'}
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock_fd = os.open(directory / 'monitor.lock', os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
@@ -312,7 +392,15 @@ def tick(env, act=False, if_due=False):
         os.close(lock_fd)
         return {'ran': False, 'why': 'another monitor holds the lock'}
     try:
-        return _tick_locked(env, directory, act, if_due)
+        try:
+            return _tick_locked(env, directory, act, if_due)
+        except Exception as exc:   # a tick must leave a status behind, not a traceback launchd sends to /dev/null
+            result = {'ran': True, 'at': iso(env.clock()), 'primary': 'state-unreadable', 'causes': {'state-unreadable': '%s: %s' % (
+                type(exc).__name__, str(exc)[:160])}, 'waiting': None, 'stalled': False, 'confirmed': False, 'actions': [],
+                'granted_is_execution': False, 'owner_action': OWNER_ACTION['state-unreadable']}
+            with contextlib.suppress(OSError):
+                write_json(directory / 'status.json', result)
+            return result
     finally:
         os.close(lock_fd)
 
@@ -323,99 +411,140 @@ def _tick_locked(env, directory, act, if_due):
     path = directory / 'state.json'
     prev = read_json(path, None)
     fresh_start = not isinstance(prev, dict) or prev.get('schema') != 1
-    state = {'schema': 1} if fresh_start else prev
-    last = state.get('last_tick') or {}
-    if if_due and last and wall - last.get('wall', 0) < INTERVAL_S:
+    state = sanitize_state({} if fresh_start else prev)
+    last = state['last_tick']
+    if if_due and last and wall - last['wall'] < INTERVAL_S:
         return {'ran': False, 'why': 'not due'}
-    gap = False
+    gap, rebooted = fresh_start, False    # nothing is known yet on a first tick: observe once before acting
     if last:
-        if boot and last.get('boot') and boot != last['boot']:
-            gap = True
-            state.update({'claims_seen': {}, 'blocker': None})
+        if boot and prev.get('last_tick', {}).get('boot') and boot != prev['last_tick']['boot']:
+            gap = rebooted = True
         elif wall - last['wall'] > INTERVAL_S * GAP_FACTOR or (wall - last['wall']) - (mono - last['mono']) > 60 or wall < last['wall']:
             gap = True
-    if fresh_start:
-        gap = True   # nothing is known yet: observe once before acting
-    entries, problems = env.da._queue_entries(env.state_path)
-    table = env.table()
-    seen_cpu = state.get('cpu') or {}
+    if gap:    # a gap's duration is not stall time: every clock restarts, and a flat-compressor window never spans one
+        state['progress_at'] = wall
+        state['window'] = []
+        state['cpu'] = {k: {'cpu': v['cpu'], 'at': wall} for k, v in state['cpu'].items()}
+        state['blocker'] = None
+        if rebooted:
+            state['cpu'], state['states'] = {}, {}
+    try:
+        entries, problems = env.da._queue_entries(env.state_path)
+    except Exception as exc:    # StateError from a symlinked queue directory, or an unreadable store
+        entries, problems = [], ['queue-unreadable: %s' % str(exc)[:160]]
+    entries, bad = usable_entries(entries)
+    problems = problems + bad
+    try:
+        table = env.table()
+    except (OSError, subprocess.SubprocessError):
+        table = {}
+    cpu_prev = state['cpu']
     claims, cpu_now, progress = {}, {}, False
-    prior_states = state.get('states') or {}
     for entry in entries:
         if entry['state'] != 'CLAIMED':
             continue
         holder = entry['holder']
         status = env.da.holder_status(holder['pid'], holder['start_token'], holder.get('workload'), None, None)
         cpu = tree_cpu(table, holder['pid']) if table else 0.0
-        before = seen_cpu.get(entry['id'])
-        if before is None or cpu > before['cpu']:
+        before = cpu_prev.get(entry['id'])
+        if before is None or cpu != before['cpu']:      # any change counts: reaped children make a tree's total fall as well as rise
             cpu_now[entry['id']] = {'cpu': cpu, 'at': wall}
             progress = progress or (before is not None)
         else:
             cpu_now[entry['id']] = before
         claims[entry['id']] = {'status': status.state, 'idle_s': int(wall - cpu_now[entry['id']]['at'])}
     states_now = {e['id']: e['state'] for e in entries}
-    for qid, st in states_now.items():
-        if st in ('CLAIMED', 'RELEASED') and prior_states.get(qid) != st and qid in prior_states:
-            progress = True
-    mem = env.memory()
-    window = [list(x) for x in state.get('window') or []]
+    if not gap:
+        for qid, st in states_now.items():
+            if st in ('CLAIMED', 'RELEASED') and qid in state['states'] and state['states'][qid] != st:
+                progress = True
+    try:
+        mem = env.memory()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        mem = {'latched': False, 'metrics': {}}
     ratio = (mem.get('metrics') or {}).get('compressor_ratio')
+    window = state['window']
     if ratio is not None:
         window = (window + [[wall, ratio]])[-WINDOW_MAX:]
     snap = {'now': now, 'wall': wall, 'entries': entries, 'problems': problems, 'free_bytes': env.free(), 'mem': mem,
             'window': window, 'claims': claims, 'protocol': env.da.RUNNER_PROTOCOL}
     verdict = classify(snap, env.limits)
     waiting = verdict['waiting']
-    progress_at = state.get('progress_at', wall)
-    if progress or not waiting:
+    old_grant = verdict['oldest_grant_s'] >= GRANTED_ALERT_S
+    progress_at = state['progress_at'] if state['progress_at'] is not None else wall
+    if progress or not (waiting or old_grant):
         progress_at = wall
-    stalled_for = int(wall - progress_at) if waiting else 0
+    stalled_for = int(wall - progress_at) if (waiting or old_grant) else 0
+    if old_grant:
+        stalled_for = max(stalled_for, verdict['oldest_grant_s'])    # a grant nobody claimed has been idle since it was made
     sig = signature(verdict, entries)
-    blocker = state.get('blocker')
-    if verdict['causes'] and blocker and blocker.get('signature') == sig and not gap:
-        blocker['confirmations'] += 1
+    blocker = state['blocker']
+    if verdict['causes'] and blocker and blocker['signature'] == sig and not gap:
+        if wall - blocker.get('last', 0) >= CONFIRM_SPACING_S:      # two quick manual ticks are one observation
+            blocker['confirmations'] += 1
+            blocker['last'] = wall
     elif verdict['causes']:
-        blocker = {'signature': sig, 'since': iso(now), 'confirmations': 0 if gap else 1}
+        blocker = {'signature': sig, 'since': iso(now), 'confirmations': 0 if gap else 1, 'last': wall}
     else:
         blocker = None
     confirmed = bool(blocker) and blocker['confirmations'] >= CONFIRM_TICKS
-    stalled = waiting > 0 and stalled_for >= STALL_S and verdict['primary'] not in ('idle', 'healthy-busy')
+    quiet = verdict['primary'] in ('idle', 'healthy-busy')
+    stalled = (waiting > 0 or old_grant) and stalled_for >= (STALL_S if waiting else GRANTED_ALERT_S) and not quiet
     result = {'ran': True, 'at': iso(now), 'observation_gap': gap, 'primary': verdict['primary'], 'causes': verdict['causes'],
               'waiting': waiting, 'stalled': stalled, 'stalled_for_s': stalled_for, 'signature': sig, 'confirmed': confirmed,
-              'owner_action': OWNER_ACTION.get(verdict['primary']), 'granted_is_execution': False, 'actions': []}
-    state['advances'] = [t for t in state.get('advances') or [] if wall - t < ADVANCE_WINDOW_S]
-    wants_advance = waiting > 0 and not gap and confirmed and verdict['primary'] not in ('disk-floor', 'state-unreadable', 'memory-pressure')
+              'owner_action': OWNER_ACTION.get(verdict['primary']), 'granted_is_execution': False, 'actions': [],
+              'notes': verdict['notes']}
+    state['advances'] = [t for t in state['advances'] if wall - t < ADVANCE_WINDOW_S]
+    wants_advance = waiting > 0 and not gap and confirmed and any(c in ADVANCE_CAUSES for c in verdict['causes']) and not (
+        {'disk-floor', 'memory-pressure', 'state-unreadable'} & set(verdict['causes']))
     if wants_advance:
         ok, why = advance_allowed(state, wall)
         if not act:
             result['actions'].append({'advance': 'would-run' if ok else why})
         elif ok:
-            outcome = env.advance()
-            state['advances'].append(wall)
+            state['advances'].append(wall)      # recorded first: a crash or timeout after this point still counts against the bound
+            persist(directory, state, cpu_now, states_now, window, blocker, progress_at, wall, mono, boot)
+            try:
+                outcome = env.advance()
+            except Exception as exc:
+                outcome = {'exit': None, 'out': '%s' % type(exc).__name__}
             result['actions'].append({'advance': 'ran', 'exit': outcome.get('exit')})
         else:
             result['actions'].append({'advance': why})
             if why == 'recovery-exhausted':
                 result['recovery_exhausted'] = True
     alert_key = '%s:%s' % (verdict['primary'], sig)
-    escalate = stalled and confirmed and (verdict['primary'] not in ('stale-claim', 'failed-continuation', 'memory-hysteresis')
-                                          or result.get('recovery_exhausted') or stalled_for >= 2 * STALL_S)
+    state['alerts'] = {k: v for k, v in state['alerts'].items() if wall - v['sent_at'] < 2 * ALERT_COOLDOWN_S}
+    escalate = stalled and confirmed and (verdict['primary'] not in RECOVERABLE or result.get('recovery_exhausted')
+                                          or stalled_for >= 2 * STALL_S)
     if escalate and alert_due(state, alert_key, wall):
         alert = {'cause': verdict['primary'], 'causes': sorted(verdict['causes']), 'signature': sig, 'detail': verdict['causes'],
                  'recovery': result['actions'], 'owner_action': result['owner_action'], 'blocked_for_s': stalled_for}
-        delivered = env.notify(alert)
-        state.setdefault('alerts', {})[alert_key] = {'sent_at': wall, 'delivered': bool(delivered)}
-        result['alert'] = dict(alert, delivered=bool(delivered))
-    state.update({'last_tick': {'wall': wall, 'mono': mono, 'boot': boot}, 'cpu': cpu_now, 'states': states_now, 'window': window,
-                  'blocker': blocker, 'progress_at': progress_at})
-    write_json(directory / 'state.json', state)
+        try:
+            delivered = bool(env.notify(alert))
+        except Exception:
+            delivered = False
+        previous = state['alerts'].get(alert_key, {})
+        attempts = previous.get('attempts', 0) + 1
+        state['alerts'][alert_key] = {'sent_at': wall, 'delivered': delivered, 'attempts': attempts,
+                                      'next_try': wall + min(300 * 2 ** (attempts - 1), ALERT_COOLDOWN_S)}
+        state['last_alert'] = {'at': iso(now), 'cause': verdict['primary'], 'signature': sig, 'delivered': delivered, 'attempts': attempts}
+        result['alert'] = dict(alert, delivered=delivered)
+    result['last_alert'] = state.get('last_alert')
+    persist(directory, state, cpu_now, states_now, window, blocker, progress_at, wall, mono, boot)
     write_json(directory / 'status.json', result)
-    with open(directory / 'receipts.jsonl', 'a') as handle:
-        if os.path.getsize(directory / 'receipts.jsonl') < 1 << 20:
+    receipts = directory / 'receipts.jsonl'
+    if not receipts.exists() or receipts.stat().st_size < 1 << 20:
+        with open(receipts, 'a') as handle:
             handle.write(json.dumps({k: result[k] for k in ('at', 'primary', 'waiting', 'stalled', 'confirmed', 'actions', 'observation_gap')},
                                     sort_keys=True) + '\n')
     return result
+
+
+def persist(directory, state, cpu_now, states_now, window, blocker, progress_at, wall, mono, boot):
+    state.update({'last_tick': {'wall': wall, 'mono': mono, 'boot': boot}, 'cpu': cpu_now, 'states': states_now, 'window': window,
+                  'blocker': blocker, 'progress_at': progress_at})
+    write_json(directory / 'state.json', state)
 
 
 # ---- callers / plist -----------------------------------------------------------------------------------------------------
