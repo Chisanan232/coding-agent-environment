@@ -8,6 +8,7 @@ import contextlib
 import fcntl
 import io
 import json
+import math
 import os
 import sys
 import tempfile
@@ -1435,6 +1436,37 @@ class WaitAndRunClocks(MonitorBase):
         self.walk(5 * 60)                                                     # real elapsed uptime still counts: 12.4 h plus 6 min waited
         self.assertEqual(len(self.pages()), 1)
 
+    def test_a_forward_clock_step_and_a_reboot_are_discounted_too(self):
+        stepped, rebooted = self.enqueue('HORO-3160'), self.enqueue('HORO-3161')
+        self.age(stepped, 5)
+        self.age(rebooted, 5)
+        self.tick(60)
+        self.clock.advance(10 * 3600, asleep=True)                            # the wall clock jumps 10 h, the monotonic clock does not
+        self.boot = 222                                                       # ... and the host rebooted meanwhile
+        out = self.tick(60)
+        self.assertTrue(out['observation_gap'])
+        out = self.walk(3 * 120)
+        self.assertEqual((self.pages(), self.incidents()), ([], {}))
+        self.assertTrue(any('queued 5 h' in n for n in out['notices']), out['notices'])
+        gaps = json.loads((mon.monitor_dir(self.state_path) / 'state.json').read_text())['gaps']
+        self.assertEqual(len(gaps), 1)
+        self.assertGreater(gaps[0][2], 9.9 * 3600)
+
+    def test_a_job_claimed_before_a_long_sleep_does_not_page_at_twelve_wall_hours_but_does_after_twelve_real_ones(self):
+        qid = self.enqueue('HORO-3162')
+        self.claim(qid, 5)
+        self.tick(60)
+        self.tick(8 * 3600, asleep=True)                                      # 8 h asleep: 13 h of wall clock since the claim, 5 h of it awake
+        self.walk(5 * 120)
+        self.assertEqual((self.pages(), self.incidents()), ([], {}))
+        self.walk(7 * 3600 - 20 * 60)                                         # about 12 h awake in total
+        self.assertEqual(self.pages(), [])
+        self.walk(30 * 60)
+        (rec,) = self.incidents().values()
+        self.assertEqual(rec['clock'], 'run')
+        self.assertGreater(rec['discounted_s'], 7.9 * 3600)
+        self.assertEqual(len(self.pages()), 1)
+
     def test_a_clock_step_backwards_gives_no_age_and_no_incident(self):
         qid = self.enqueue('HORO-3108')
         entry = self.entry(qid)
@@ -1675,8 +1707,146 @@ class WaitAndRunClocks(MonitorBase):
         self.assertIsNotNone(rec['resolved_at'])
         self.assertEqual(len(self.pages()), 1)
 
+    def test_a_resolved_wait_whose_notice_never_arrived_stays_listed_undelivered_and_is_not_retried(self):
+        qid = self.enqueue('HORO-3170')
+        self.age(qid, 13)
+        self.emit_result = {'result': 'failed', 'delivery': None}
+        self.tick(60)
+        self.assertEqual(len(self.pages()), 1)
+        entry = self.entry(qid)
+        entry.update(state='RELEASED')
+        da._write_queue_entry(self.state_path, entry)
+        out = self.walk(5 * 120)
+        (rec,) = self.incidents().values()
+        self.assertEqual((rec['acknowledged_at'], rec['owner_notice_state']), (None, 'undelivered'))
+        self.assertIsNotNone(rec['resolved_at'])
+        self.assertEqual([u['id'] for u in out['owner_notice_undelivered']], [qid])
+        self.assertEqual(len(self.pages()), 1)                                   # no retries once resolved
+        self.walk(3 * 3600)
+        self.assertEqual(len(self.incidents()), 1)                               # still visible hours later, unlike a settled one
+
+    def test_a_resolved_incident_with_no_notice_ever_attempted_is_resolved_not_acknowledged_nor_listed(self):
+        first, second, _ = self.suppressed_wait()
+        entry = self.entry(second)
+        entry.update(state='RELEASED')
+        da._write_queue_entry(self.state_path, entry)
+        out = self.walk(3 * 120, busy=True)
+        (rec,) = self.incidents().values()
+        self.assertEqual((rec['owner_notice_state'], rec['acknowledged_at'] is None, rec['resolved_at'] is not None), ('resolved', True, True))
+        self.assertEqual((out['owner_notice_undelivered'], self.pages()), ([], []))
+
+    def test_a_resolved_delivered_incident_is_dropped_after_the_keep_window(self):
+        qid = self.enqueue('HORO-3171')
+        self.age(qid, 13)
+        self.tick(60)
+        entry = self.entry(qid)
+        entry.update(state='RELEASED')
+        da._write_queue_entry(self.state_path, entry)
+        self.tick(60)
+        self.assertEqual(len(self.incidents()), 1)
+        self.walk(mon.INCIDENT_ACK_KEEP_S + 600)
+        self.assertEqual(self.incidents(), {})
+
     # ---- suppression needs live, working holders ----
+    def test_a_dead_unresolved_or_cpu_stalled_holder_never_suppresses_a_wait(self):
+        for status in ('exited', 'unresolved'):
+            with self.subTest(status=status):
+                self.setUp()
+                first, second = self.enqueue('HORO-3180'), self.enqueue('HORO-3181')
+                self.claim(first, 1)
+                self.statuses[4242] = status
+                self.age(second, 13)
+                self.walk(3 * 120, busy=True)
+                (rec,) = [r for r in self.incidents().values() if r['clock'] == 'wait']
+                self.assertEqual(rec['status'], None)
+                self.assertEqual(len(self.pages_of('queue-wait-excessive')), 1)
+        self.setUp()
+        first, second = self.enqueue('HORO-3182'), self.enqueue('HORO-3183')
+        self.claim(first, 1)
+        self.age(second, 13)
+        self.walk(3 * 120, busy=True)
+        self.assertEqual(self.pages(), [])                                       # healthy so far: suppressed
+        self.walk(20 * 120)                                                       # the CPU stands still for over 15 min
+        (rec,) = self.incidents().values()
+        self.assertEqual(rec['status'], None)
+        self.assertEqual(len(self.pages()), 1)
+
     # ---- bounds ----
+    def test_hard_limit_eviction_never_removes_an_open_incident(self):
+        wall = self.clock.now.timestamp()
+        crowd = {}
+        for i in range(mon.INCIDENT_HARD_LIMIT + 6):
+            crowd['k%03d' % i] = mon.new_incident('q%06d' % i, 'escalated', wall - 10000 + i, wall + 3600, wall, None, 'wait', 'none')
+        for i in range(10):                                                       # the oldest ten are closed
+            crowd['k%03d' % i]['resolved_at'] = wall
+        kept = mon.bound_incidents(dict(crowd))
+        self.assertEqual(len(kept), mon.INCIDENT_HARD_LIMIT)
+        self.assertTrue(all(k in kept for k in crowd if int(k[1:]) >= 10))        # every open one survived
+        self.assertTrue(all(k not in kept for k in ('k000', 'k005')) and 'k006' in kept)      # the six oldest closed ones went, oldest first
+        everything_open = {k: dict(v, resolved_at=None) for k, v in crowd.items()}
+        self.assertEqual(len(mon.bound_incidents(dict(everything_open))), len(everything_open))      # the bound yields to an open incident
+
+    def test_a_crash_between_the_outbox_append_and_the_state_write_does_not_duplicate_the_line(self):
+        qid = self.enqueue('HORO-3190')
+        self.age(qid, 13)
+        self.tick(60)
+        self.assertEqual(len(self.outbox()), 1)
+        path = mon.monitor_dir(self.state_path) / 'state.json'
+        state = json.loads(path.read_text())
+        for rec in state['incidents'].values():
+            rec['outbox_phase'] = None                                             # the state write that never happened
+        path.write_text(json.dumps(state))
+        self.tick(60)
+        self.assertEqual(len(self.outbox()), 1)
+        directory = mon.monitor_dir(self.state_path)
+        os.replace(directory / mon.OUTBOX_NAME, directory / (mon.OUTBOX_NAME + '.1'))      # ... also when the line was rotated meanwhile
+        state = json.loads(path.read_text())
+        for rec in state['incidents'].values():
+            rec['outbox_phase'] = None
+        path.write_text(json.dumps(state))
+        self.tick(60)
+        self.assertFalse((directory / mon.OUTBOX_NAME).exists() and (directory / mon.OUTBOX_NAME).read_text())
+
+    # ---- state read hardening ----
+    BAD_NUMBERS = (float('nan'), float('inf'), float('-inf'), 10 ** 400, True)
+
+    def write_state(self, mutate):
+        self.tick(60)
+        path = mon.monitor_dir(self.state_path) / 'state.json'
+        state = json.loads(path.read_text())
+        mutate(state)
+        path.write_text(json.dumps(state))        # json.dumps writes NaN and Infinity, and json.loads reads them back
+
+    def test_non_finite_or_out_of_range_gaps_are_dropped_and_never_silence_the_clocks(self):
+        for bad in self.BAD_NUMBERS:
+            with self.subTest(bad=repr(bad)[:12]):
+                self.setUp()
+                qid = self.enqueue('HORO-3200')
+                self.age(qid, 13)
+                self.write_state(lambda st: st.update(gaps=[[0.0, 1.0, bad], [bad, 5.0, 1.0], [0.0, bad, 1.0], [10.0, 20.0, 5.0]]))
+                self.tick(60)
+                self.assertEqual(len(self.pages()), 1)                                    # not silenced
+                gaps = json.loads((mon.monitor_dir(self.state_path) / 'state.json').read_text())['gaps']
+                self.assertEqual(gaps, [[10.0, 20.0, 5.0]])                                # only the sound one is kept
+        self.assertEqual(mon.sanitize_state({'gaps': [[0, 1, 2], 'x', [1, 2], [1, 2, 3, 4], [5, 4, 1], [0, 1, -1.0], [0, 1, 49 * 3600], [0, 1, 48 * 3600]]})['gaps'],
+                         [[0.0, 1.0, 2.0], [0.0, 1.0, 48.0 * 3600]])      # a duration outside 0..48 h, a reversed span and a wrong shape are dropped
+
+    def test_other_numeric_state_fields_reject_nan_infinity_and_huge_ints(self):
+        for bad in (float('nan'), float('inf'), float('-inf'), 10 ** 400, True):
+            with self.subTest(bad=repr(bad)[:12]):
+                state = mon.sanitize_state({'schema': 1, 'last_tick': {'wall': bad, 'mono': 1.0}, 'progress_at': bad, 'advances': [bad, 1.0],
+                                            'cpu': {'a': {'cpu': bad, 'at': 1.0}, 'b': {'cpu': 1.0, 'at': 1.0}}, 'window': [[bad, 1.0], [1.0, 2.0]],
+                                            'alerts': {'a': {'sent_at': 1.0, 'next_try': bad}, 'b': {'sent_at': 1.0, 'next_try': 2.0}},
+                                            'blocker': {'signature': 'x', 'confirmations': 1, 'last': bad}, 'last_alert': {'clear_next': bad}})
+                self.assertEqual((state['last_tick'], state['progress_at'], state['advances'], list(state['cpu']), state['window'], list(state['alerts']),
+                                  state['blocker'], state['last_alert']), ({}, None, [1.0], ['b'], [[1.0, 2.0]], ['b'], None, None))
+        rec = mon.new_incident('q000001', 'escalated', 1.0, 2.0, 1.0, None, 'wait', 'none')
+        for key in ('grant_wall', 'expires_wall', 'raised_at', 'ack_deadline', 'handed_off_at', 'resolved_at'):
+            for bad in (float('nan'), float('inf'), 10 ** 400):
+                damaged = dict(rec, **{key: bad})
+                cleaned = mon.clean_incident(damaged)
+                self.assertTrue(cleaned is None or cleaned[key] is None or math.isfinite(cleaned[key]), (key, bad))
+
     # ---- owner resolution and outbox ----
     def test_owner_resolution_with_an_uninspectable_owner_is_none_never_gone(self):
         entry = {'state': 'QUEUED', 'harness': 'codex', 'owner': {'uid': 1, 'session_id': 'sess-1', 'ticket': 'HORO-1'}, 'waiter': {'pid': 5, 'start_token': 't'}}
