@@ -1837,6 +1837,68 @@ class EmitResource(Base):
             st = {k: v["status"] for k, v in self.rec("admission-monitor")["pending"][0]["backends"].items()} if self.rec("admission-monitor")["pending"] else {}
             self.assertNotIn("sent", [st.get("ntfy"), st.get("pushover")], mutate)
 
+    def test_clear_with_a_notice_in_flight_does_not_silence_the_recurrence(self):
+        self.emit(self.engine(fake=Fake(fail={"macos": "network"})))
+        self.assertTrue(self.rec("admission-monitor")["pending"])
+        self.engine().emit_resource({}, clear=True)
+        self.advance(1000)
+        self.fake.sent.clear()
+        self.engine().sweep()
+        self.assertIn("macos", self.names())                 # the in-flight notice is still delivered
+        self.assertEqual(self.emit(), "queued")              # and its late tombstone does not dedup the recurrence
+
+    def test_reserved_session_id_is_case_insensitive(self):
+        e = self.engine()
+        for sid in ("ADMISSION-MONITOR", "Admission-Monitor"):
+            self.assertEqual(self.ev(e, "SessionStart", sid=sid), "ignored")
+        self.assertFalse(self.sdir.exists())
+        rec = sn.new_record("admission-monitor", self.t)
+        rec["state"] = "RUNNING"
+        self.sdir.mkdir(parents=True)
+        sn.save_record(self.sdir, rec)
+        self.advance(10**6)
+        self.engine().sweep()
+        self.assertEqual(self.rec("admission-monitor")["state"], "RUNNING")
+
+    def test_transient_unreadable_record_is_not_quarantined(self):
+        self.sdir.mkdir(parents=True)
+        path = self.sdir / "admission-monitor.json"
+        path.write_text("{")
+        orig = sn.read_regular
+        sn.read_regular = lambda p, limit: (None, "unreadable:5")
+        try:
+            self.assertEqual(self.emit(), "untrusted:unreadable:5")
+        finally:
+            sn.read_regular = orig
+        self.assertEqual(path.read_text(), "{")
+        self.assertFalse((self.sdir / "admission-monitor.json.corrupt").exists())
+
+    def test_corrupt_marker_as_symlink_is_replaced_and_as_directory_fails_cleanly(self):
+        self.sdir.mkdir(parents=True)
+        path, marker = self.sdir / "admission-monitor.json", self.sdir / "admission-monitor.json.corrupt"
+        target = self.tmp / "elsewhere"
+        target.write_text("keep")
+        marker.symlink_to(target)
+        path.write_text("{")
+        self.assertEqual(self.emit(), "queued")
+        self.assertEqual((target.read_text(), marker.is_symlink(), marker.read_text()), ("keep", False, "{"))
+        marker.unlink()
+        marker.mkdir()
+        path.write_text("{")
+        self.assertEqual(self.emit(cause="frozen-queue"), "untrusted:corrupt")
+        self.assertEqual(path.read_text(), "{")
+
+    def test_os_error_returns_error_without_traceback_or_path(self):
+        blocker = self.tmp / "afile"
+        blocker.write_text("x")
+        self.assertEqual(sn.Engine(blocker / "state", cfg(), self.fake.table()).emit_resource(dict(self.REQ)), "error")
+        env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(blocker / "state"), SESSION_NOTIFY_CONFIG=str(self.tmp / "none.json"))
+        r = subprocess.run([sys.executable, str(SCRIPT), "emit-resource", "--cause", "disk-floor", "--recovery", "none", "--owner-action", "reclaim-disk"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertNotIn(str(blocker), r.stdout + r.stderr)
+
     def test_cli_exit_codes_and_usage_error_writes_nothing(self):
         env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(self.sdir), SESSION_NOTIFY_CONFIG=str(self.tmp / "none.json"))
         run = lambda *a: subprocess.run([sys.executable, str(SCRIPT), "emit-resource", *a], capture_output=True, text=True, env=env)
