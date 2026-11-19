@@ -235,6 +235,37 @@ class GrantNeedsMemory(QueueBase):
         self.assertEqual(self.advance()['granted'], [a['id']])
 
 
+class GrantStamp(QueueBase):
+    """Every grant names the runner that made it and whether the memory gate vouched for it (SPE-176: outdated-caller detection)."""
+
+    def advance_with(self, memory_fn):
+        return da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, memory_fn=memory_fn)
+
+    def grant_of(self, entry):
+        return next(e for e in da._queue_entries(self.path)[0] if e['id'] == entry['id'])['grant']
+
+    def test_a_gated_grant_is_stamped_with_protocol_checkout_and_gate(self):
+        a = self.enqueue('HORO-2070')
+        self.advance_with(lambda: (True, 'ADMIT'))
+        grant = self.grant_of(a)
+        self.assertEqual(grant['runner']['protocol'], da.RUNNER_PROTOCOL)
+        self.assertEqual(grant['runner']['checkout'], Path(da.__file__).resolve().parent.parent.name)
+        self.assertEqual(grant['memory_gate'], 'admitted')
+
+    def test_a_library_grant_without_a_gate_says_so(self):
+        a = self.enqueue('HORO-2070')
+        self.advance()
+        self.assertEqual(self.grant_of(a)['memory_gate'], 'not-asked')
+
+    def test_the_granted_receipt_carries_the_stamp(self):
+        self.enqueue('HORO-2070')
+        self.advance_with(lambda: (True, 'ADMIT'))
+        lines = [json.loads(l) for l in (self.path.parent / 'queue/receipts.jsonl').read_text().splitlines()]
+        granted = [l for l in lines if l.get('event') == 'granted'][0]
+        self.assertEqual((granted['runner']['protocol'], granted['memory_gate']), (da.RUNNER_PROTOCOL, 'admitted'))
+
+
+
 class MemoryPreconditionText(unittest.TestCase):
     """The refusal text a claim or advance reports must carry the gate's reason, not only its metrics line (SPE-175)."""
 
