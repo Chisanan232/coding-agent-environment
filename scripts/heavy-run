@@ -18,6 +18,7 @@ command's own 64, 75 or 77 is indistinguishable from the wrapper's, as with la-c
 it guards against double charging by accident, not against a caller who sets it on purpose.
 """
 import argparse
+from importlib.util import module_from_spec, spec_from_file_location
 import json
 import os
 import re
@@ -29,6 +30,7 @@ import tempfile
 import time
 
 RUNNER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk-admission.py")
+RECOVERY_LIB = os.path.join(os.path.dirname(RUNNER), "admission-recovery.py")
 HOLDER_ENV = "CAE_ADMISSION_HOLDER"          # "<label>:<pid>", exported by the runner's run / queue claim
 REFUSED_EXIT = 77
 TIMEOUT_EXIT = 75
@@ -51,6 +53,26 @@ def _capture(cmd, env):
         return done.returncode, done.stdout
     except (OSError, subprocess.SubprocessError) as exc:
         return 1, str(exc)
+
+
+def _register(qid, kind):
+    """Record this wrapper for the monitor's guarded recovery (ADR 0019). Best effort: any problem returns None and the job goes on."""
+    try:
+        spec = spec_from_file_location("admission_recovery", RECOVERY_LIB)
+        lib = module_from_spec(spec)
+        spec.loader.exec_module(lib)
+        directory = lib.wrappers_dir()
+        return (lib, directory) if lib.register_wrapper(directory, qid, kind) else None
+    except Exception:
+        return None
+
+
+def _unregister(handle, qid):
+    if handle:
+        try:
+            handle[0].unregister_wrapper(handle[1], qid)
+        except Exception:
+            pass
 
 
 def _json(text):
@@ -126,6 +148,7 @@ def _queued(args, declare, run_extra, job, proof, session, env, sleep, clock):
         print(f"heavy-run: could not queue the job: {queued.get('reason', out.strip()[:200])}", file=sys.stderr)
         return REFUSED_EXIT
     qid = queued["id"]
+    registered = _register(qid, "heavy-run")
     claimed, deadline, next_notice = False, clock() + args.max_wait_s, 0.0
     try:
         while clock() < deadline:
@@ -150,6 +173,7 @@ def _queued(args, declare, run_extra, job, proof, session, env, sleep, clock):
         print(f"heavy-run: not admitted within {args.max_wait_s} s; the command was NOT started.", file=sys.stderr)
         return TIMEOUT_EXIT
     finally:
+        _unregister(registered, qid)
         if not claimed and os.path.exists(proof):
             # interrupted after the claim started the job: the entry is CLAIMED, so it is released, not cancelled
             _release(["queue", "release", "--id", qid, "--session-id", session], env)

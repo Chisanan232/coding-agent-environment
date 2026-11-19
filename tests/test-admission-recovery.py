@@ -700,14 +700,17 @@ class Shape(unittest.TestCase):
             called = {c.func.id for c in ast.walk(funcs[name]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
             self.assertFalse(called & {'load_terminate_allowlist', 'terminate_allowed_for_workload'}, name)
 
-    def test_only_sigterm_is_ever_named_and_module_is_unwired(self):
+    def test_only_sigterm_is_ever_named_and_only_known_consumers_import_it(self):
         text = (ROOT / 'scripts' / 'admission-recovery.py').read_text()
         self.assertNotIn('signal.SIGKILL', text)
         self.assertNotIn('os.kill', text)
         self.assertNotIn('killpg', text)
+        consumers = {'admission-monitor.py', 'heavy-run', 'la-cargo'}   # the monitor's act mode, and the two wrappers that register themselves
         for path in (ROOT / 'scripts').iterdir():
-            if path.is_file() and path.name != 'admission-recovery.py':
+            if path.is_file() and path.name != 'admission-recovery.py' and path.name not in consumers:
                 self.assertNotIn('admission-recovery', path.read_text(errors='ignore'), path.name)
+        for name in consumers:
+            self.assertNotIn('SIGKILL', (ROOT / 'scripts' / name).read_text(errors='ignore'), name)
 
     def test_cancel_never_uses_session_or_confirm_or_state_edits(self):
         text = (ROOT / 'scripts' / 'admission-recovery.py').read_text()

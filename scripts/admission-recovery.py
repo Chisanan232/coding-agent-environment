@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Guarded recovery library (SPE-176 slice 1b, ADR 0019 sections 3, 5 and 6). NOT WIRED and disabled by default: nothing imports this
-module, no CLI or monitor tick calls it, and importing it has no side effect.
+"""Guarded recovery library (SPE-176, ADR 0019 sections 3, 5 and 6). Wired only into `admission-monitor.py tick --act` (the monitor
+supplies the real Env bindings; every default here still refuses), and importing it has no side effect.
 
 Two narrow actions, each behind conclusive-evidence guards and an exclusive lock:
 
@@ -22,6 +22,7 @@ import os
 import re
 import signal
 import stat
+import subprocess
 import sys
 
 HERE = Path(__file__).resolve().parent
@@ -136,8 +137,8 @@ def _no_kill(pid, sig):
 
 
 def default_env(state_path, monitor_dir):
-    """Real scheduler bindings. Still unwired: nothing calls this. The owner-execution and wrapper-registry readers stay at their
-    uninspectable defaults until a consumer slice supplies them, so by default no entry is conclusively abandoned and no wrapper obsolete."""
+    """Real scheduler bindings. The owner-execution, wrapper-registry, executable and workload readers stay at their uninspectable defaults
+    here: the consumer (the monitor's act mode) supplies them, so without it no entry is conclusively abandoned and no wrapper obsolete."""
     da = _disk_admission()
     state_path = Path(state_path)
 
@@ -193,6 +194,167 @@ def safe_monitor_dir(env):
         raise UnsafeDir('monitor dir unavailable')
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != env.uid or info.st_mode & 0o077:
         raise UnsafeDir('monitor dir is a symlink, not ours or not private')
+
+
+# ---- wrapper registry (ADR 0019 section 3) -----------------------------------------------------------------------------
+# heavy-run and la-cargo record one closed-schema file per queued entry at enqueue and remove it on normal exit. The monitor trusts a record only
+# after the live process still matches it (start token, process group, parent, interpreter+script basenames). No argv is ever stored.
+
+WRAPPER_DIR_NAME = 'wrappers'
+WRAPPER_KINDS = ('heavy-run', 'la-cargo')
+WRAPPER_KEYS = ('qid', 'pid', 'start_token', 'pgid', 'ppid', 'exe_id', 'kind', 'created')
+WRAPPER_FILE_LIMIT = 4096
+EXE_RE = re.compile(r'[A-Za-z0-9._-]{1,64} [A-Za-z0-9._-]{1,64}')
+BASENAME_RE = re.compile(r'[A-Za-z0-9._-]{1,64}')
+
+
+def wrappers_dir(state_path=None):
+    """The registry directory: ADMISSION_WRAPPERS_DIR (experiments and tests) else `wrappers/` beside the admission state file."""
+    override = os.environ.get('ADMISSION_WRAPPERS_DIR')
+    if override:
+        return Path(override)
+    base = Path(state_path) if state_path is not None else _disk_admission().default_state_path()
+    return base.parent / WRAPPER_DIR_NAME
+
+
+def exe_identity(pid, run=None):
+    """'interpreter script' basenames of a live process, or None when unknown. The command line is reduced in memory to those two
+    basenames and discarded: nothing else of it is kept, stored or printed."""
+    try:
+        done = (run or subprocess.run)(['/bin/ps', '-ww', '-o', 'args=', '-p', str(pid)], capture_output=True, text=True, timeout=5,
+                                       stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/bin:/usr/bin'})
+        parts = (done.stdout or '').split()
+        returncode = done.returncode
+    except (OSError, subprocess.SubprocessError, AttributeError):
+        return None
+    if returncode != 0 or len(parts) < 2:
+        return None
+    interpreter = os.path.basename(parts[0])
+    script = next((os.path.basename(x) for x in parts[1:] if not x.startswith('-')), None)
+    found = '%s %s' % (interpreter, script)
+    return found if script and EXE_RE.fullmatch(found) else None
+
+
+def _dir_private(directory, uid):
+    try:
+        info = os.lstat(str(directory))
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and info.st_uid == uid and not info.st_mode & 0o077
+
+
+def list_registered(directory, uid=None):
+    """Queue ids that have a registry file, only from a real private directory of ours; [] otherwise."""
+    uid = os.getuid() if uid is None else uid
+    if not _dir_private(directory, uid):
+        return []
+    try:
+        names = os.listdir(str(directory))
+    except OSError:
+        return []
+    return sorted(n[:-5] for n in names if n.endswith('.json') and QID_RE.fullmatch(n[:-5]))
+
+
+def read_registry(qid, directory, uid=None, token_fn=None):
+    """The validated record of the wrapper registered for `qid` as {'pid', 'start_token', 'pgid', 'ppid', 'exe', 'kind', 'created'}, else None.
+
+    Refuses (None) on: a directory or file that is a symlink, not ours, or readable by group/other; an oversized, non-JSON or off-schema record
+    (exact key set, every type checked); a qid that differs from the file name; and, when `token_fn` is given, a pid whose live start token no
+    longer equals the recorded one (a reused pid). Never raises."""
+    uid = os.getuid() if uid is None else uid
+    if not (isinstance(qid, str) and QID_RE.fullmatch(qid)) or not _dir_private(directory, uid):
+        return None
+    try:
+        fd = os.open(str(Path(directory) / (qid + '.json')), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, 'rb') as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_mode & 0o077 or info.st_size > WRAPPER_FILE_LIMIT:
+                return None
+            doc = json.loads(handle.read(WRAPPER_FILE_LIMIT + 1).decode('utf-8'))
+    except (OSError, ValueError):
+        return None
+    rec = _valid_wrapper_record(doc, qid)
+    if rec is None:
+        return None
+    if token_fn is not None:
+        try:
+            if token_fn(rec['pid']) != rec['start_token']:
+                return None
+        except Exception:
+            return None
+    return rec
+
+
+def _valid_wrapper_record(doc, qid):
+    if not isinstance(doc, dict) or set(doc) != set(WRAPPER_KEYS) or doc['qid'] != qid:
+        return None
+    for key, low in (('pid', 2), ('pgid', 1), ('ppid', 0)):
+        if type(doc[key]) is not int or not low <= doc[key] < 2 ** 31:
+            return None
+    token, exe = doc['start_token'], doc['exe_id']
+    if not (isinstance(token, str) and 0 < len(token) <= 64 and token.isprintable() and isinstance(exe, str) and EXE_RE.fullmatch(exe)):
+        return None
+    if doc['kind'] not in WRAPPER_KINDS or exe.split(' ')[1] != doc['kind'] or not isinstance(doc['created'], str):
+        return None
+    try:
+        parse_iso(doc['created'])
+    except ValueError:
+        return None
+    return {'pid': doc['pid'], 'start_token': token, 'pgid': doc['pgid'], 'ppid': doc['ppid'], 'exe': exe, 'kind': doc['kind'], 'created': doc['created']}
+
+
+def register_wrapper(directory, qid, kind, uid=None):
+    """Record the calling process (a heavy-run or la-cargo wrapper that just enqueued `qid`). Atomic, 0600, in a 0700 directory. Best effort:
+    returns False on any failure and never raises, so a registry problem can never fail the job."""
+    try:
+        uid = os.getuid() if uid is None else uid
+        pid = os.getpid()
+        token = _disk_admission().waiter_token(pid)
+        exe = exe_identity(pid)
+        if token is None or exe is None or kind not in WRAPPER_KINDS or not QID_RE.fullmatch(qid):
+            return False
+        record = {'qid': qid, 'pid': pid, 'start_token': token, 'pgid': os.getpgid(0), 'ppid': os.getppid(), 'exe_id': exe, 'kind': kind,
+                  'created': iso(datetime.now(timezone.utc))}
+        if _valid_wrapper_record(record, qid) is None:
+            return False
+        directory = Path(directory)
+        directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        if not _dir_private(directory, uid):
+            return False
+        tmp = directory / ('.%s.%d.tmp' % (qid, pid))
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, 'w') as handle:
+                handle.write(json.dumps(record, sort_keys=True))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(tmp), str(directory / (qid + '.json')))
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
+        return True
+    except Exception:
+        return False
+
+
+def unregister_wrapper(directory, qid, uid=None):
+    """Remove this process's own record for `qid` (normal exit). A record that names another pid is left alone. Never raises."""
+    try:
+        rec = read_registry(qid, directory, uid)
+        if rec is not None and rec['pid'] == os.getpid():
+            (Path(directory) / (qid + '.json')).unlink()
+            return True
+    except Exception:
+        pass
+    return False
 
 
 # ---- receipts ---------------------------------------------------------------------------------------------------------

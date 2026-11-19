@@ -15,6 +15,7 @@ or an ancestor) is not charged again; `--light` is never charged. Exit codes: 75
 refusal, 76 over artifact budget, 77 refused by the queue (distinct from cargo's own).
 """
 import fcntl
+from importlib.util import module_from_spec, spec_from_file_location
 import json
 import os
 import re
@@ -41,6 +42,7 @@ RUNNER = os.environ.get("LA_CARGO_RUNNER") or os.path.expanduser(
     "~/Bryant-Developments/coding-agent-environment-main-view/scripts/disk-admission.py")
 ADMISSION_CLASS = "build-workspace"
 ADMISSION_BYTES = 40 * 2**30
+RECOVERY_LIB = os.path.join(os.path.dirname(RUNNER), "admission-recovery.py")
 HOLDER_ENV = "CAE_ADMISSION_HOLDER"          # "<label>:<pid>", exported by the runner's run / queue claim
 REFUSED_EXIT = 77                            # the runner's refusal code
 
@@ -126,6 +128,26 @@ def _capture(cmd: "list[str]", env) -> "tuple[int, str]":
         return 1, str(exc)
 
 
+def _register(qid: str, kind: str):
+    """Record this wrapper for the monitor's guarded recovery (ADR 0019). Best effort: any problem returns None and the job goes on."""
+    try:
+        spec = spec_from_file_location("admission_recovery", RECOVERY_LIB)
+        lib = module_from_spec(spec)
+        spec.loader.exec_module(lib)
+        directory = lib.wrappers_dir()
+        return (lib, directory) if lib.register_wrapper(directory, qid, kind) else None
+    except Exception:
+        return None
+
+
+def _unregister(handle, qid: str) -> None:
+    if handle:
+        try:
+            handle[0].unregister_wrapper(handle[1], qid)
+        except Exception:
+            pass
+
+
 def _json(text: str) -> dict:
     try:
         value = json.loads(text)
@@ -177,6 +199,7 @@ def _queued_build(declare, job, proof, session, env, sleep, clock) -> int:
         print(f"la-cargo: could not queue the build: {queued.get('reason', out.strip()[:200])}", file=sys.stderr)
         return REFUSED_EXIT
     qid = queued["id"]
+    registered = _register(qid, "la-cargo")
     claimed, deadline, next_notice = False, clock() + QUEUE_WAIT_S, 0.0
     try:
         while clock() < deadline:
@@ -201,6 +224,7 @@ def _queued_build(declare, job, proof, session, env, sleep, clock) -> int:
         print(f"la-cargo: no heavy lane within {QUEUE_WAIT_S} s; refusing.", file=sys.stderr)
         return REFUSED_EXIT
     finally:
+        _unregister(registered, qid)
         if not claimed:
             _capture(runner_cmd("queue", "cancel", "--id", qid, "--session-id", session), env)
 
