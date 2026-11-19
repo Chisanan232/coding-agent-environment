@@ -9,6 +9,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import shutil
 import os
 import subprocess
 import tempfile
@@ -710,6 +711,76 @@ class IncrementalScopeTests(Fixture):
         cls, why = self.classify(inc, "cargo_incremental")[0]
         self.assertEqual(cls, "B")
         self.assertIn("shared-or-foreign", why)
+
+    def generated(self, inc, names=("agent_id_bound_to_token_test", "credential_store_test", "evidence_ledger_tests",
+                                    "secret_scan")):
+        """rustc layout: <crate>-<13 base36>/ with s-<a>-<b>-<c> session dirs and s-<a>-<b>.lock files (SPE-176)."""
+        shutil.rmtree(inc / "crate-abc", ignore_errors=True)    # the plain fixture's non-generated crate dir
+        for i, n in enumerate(names):
+            c = inc / ("%s-%013d" % (n, i)).replace("-0", "-a", 1)
+            (c / "s-hn0w0a1hoy-0kzvtw0-58velkjf4a000dk65birnb0gs").mkdir(parents=True)
+            (c / "s-hn0w0a1hoy-0kzvtw0.lock").write_text("")
+
+    def test_rustc_generated_crate_names_are_not_credential_or_evidence_markers(self):
+        _, inc = self.target()
+        self.generated(inc)
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual((cls, why), ("B", ["shared-or-foreign"]))
+
+    def test_a_stray_credential_file_in_a_generated_tree_is_still_class_c(self):
+        for stray in ("credentials.json", ".env", "server.pem", "id_rsa", "evidence-ledger.json"):
+            with self.subTest(stray=stray):
+                _, inc = self.target(name="tgt-" + stray.replace(".", "_"))
+                self.generated(inc)
+                (inc / stray).write_text("")
+                self.assertEqual(self.classify(inc, "cargo_incremental")[0][0], "C")
+
+    def test_a_stray_file_inside_a_crate_dir_is_still_class_c(self):
+        _, inc = self.target()
+        self.generated(inc)
+        crate = next(p for p in inc.iterdir() if "token" in p.name)
+        (crate / "credentials.json").write_text("")
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("marker:credential-name", why)
+
+    def test_a_non_generated_directory_keeps_the_name_markers(self):
+        _, inc = self.target()
+        self.generated(inc)
+        (inc / "my_secret_notes").mkdir()
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("marker:credential-name", why)
+
+    def test_a_symlink_in_a_generated_tree_is_still_class_c(self):
+        _, inc = self.target()
+        self.generated(inc)
+        outside = self.root / "outside"
+        outside.mkdir()
+        os.symlink(outside, inc / "token_link-0000000000000")
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("marker:escaping-symlink", why)
+
+    def test_keep_marker_inside_a_generated_tree_is_still_class_c(self):
+        _, inc = self.target()
+        self.generated(inc)
+        (inc / ".ca-keep").write_text("")
+        self.assertIn("marker:keep-marker", self.classify(inc, "cargo_incremental")[0][1])
+
+    def test_generated_names_do_not_relax_the_shared_cargo_target_kind(self):
+        t = self.root / "plain-target"
+        (t / "debug").mkdir(parents=True)
+        (t / "debug/credentials.json").write_text("")
+        cls, why = self.classify(t, "cargo_target")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("marker:credential-name", why)
+
+    def test_generated_incremental_tree_still_blocked_by_open_handle(self):
+        _, inc = self.target()
+        self.generated(inc)
+        self.handles = ({str(inc / "credential_store_test-a000000000001")}, True)
+        self.assertEqual(self.classify(inc, "cargo_incremental")[0][0], "C")
 
     def test_never_class_a_even_with_a_private_receipt(self):
         _, inc = self.target()
