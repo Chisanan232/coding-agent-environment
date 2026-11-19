@@ -366,7 +366,7 @@ class ReviewFixes(Env):
 
     def test_owner_clearable_blockers_are_authority_problems_not_reasoning_blockers(self):
         for text in ("not satisfiable with current authorization: owner-held steps", "requires owner decision on the credential",
-                     "only the owner can read the cause", "credentials are missing for the producer"):
+                     "only the owner can read the cause", "credentials are missing until the owner provisions them"):
             a = [dict(x, failure=text) for x in case()["attempts"]]
             self.assertFalse(fe.evaluate(case(attempts=a), self.dir)["eligible"], text)
         self.assertFalse(fe.evaluate(case(cause="owner_decision"), self.dir)["eligible"])
@@ -379,7 +379,9 @@ class ReviewFixes(Env):
         self.assertTrue(fe.evaluate(case(attempts=different), self.dir)["eligible"])
 
     def test_ordinary_reasoning_failures_are_not_excluded(self):
-        for text in ("test_deadlock timed out at step 4", "assert failed at line 403", "exit 503 from the lock test"):
+        for text in ("test_deadlock timed out at step 4", "assert failed at line 403", "exit 503 from the lock test",
+                     "needs the owner field populated", "needs an owner check", "requires the owner id",
+                     "credentials are missing from the fixture"):
             a = [dict(x, failure=text) for x in case()["attempts"]]
             self.assertTrue(fe.evaluate(case(attempts=a), self.dir)["eligible"], text)
 

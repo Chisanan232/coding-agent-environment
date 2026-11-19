@@ -39,8 +39,9 @@ CAUSES = {"none", "queue_delay", "ci_unavailable", "missing_permission", "extern
 EXCLUDED_TEXT = re.compile(r"CI_UNAVAILABLE_EXTERNAL|HARNESS_PERMISSION_BLOCK|spending limit|billing limit|quota|permission .{0,30}denied|"
                            r"denied.{0,20}permission|not permitted|forbidden|unauthori[sz]ed|EACCES|\bHTTP/?[0-9. ]*(40[13]|50[23])\b|overloaded|"
                            r"queue(d)? (delay|wait)|outage|ECONNRESET|rate.?limit|runner unavailable|"
-                           r"owner[- ](held|decision|action|approval|only)|(requires?|needs?) (an? |the )?owner|only the owner|"
-                           r"credentials? (is|are) (missing|unavailable|inaccessible)|not satisfiable (with|under) (the )?current authori[sz]ation|"
+                           r"owner[- ](held|decision|action|approval|only)\b|(requires?|needs?) (an? |the )?owner (decision|action|approval|to)\b|only the owner\b|"
+                           r"credentials? (is|are) (missing|unavailable|inaccessible) .{0,30}(provision|owner|account)|"
+                           r"not satisfiable (with|under) (the )?current authori[sz]ation|"
                            r"(gateway|connect(ion)?|network|request) time[sd]? ?-?out", re.I)
 # Any of these set means the call may not use the included subscription. Presence only; the values are never read or printed.
 API_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_FOUNDRY_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
