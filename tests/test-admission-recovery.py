@@ -923,6 +923,63 @@ class Prune(unittest.TestCase):
         self.assertEqual(self.prune(), 0)
         self.assertTrue((self.dir / 'q000200.json').exists())
 
+    def test_examination_is_capped_and_rotates_so_every_record_is_reached(self):
+        for n in range(150):
+            self.put('q%06d' % (300 + n), 1000 + n)
+        seen, calls = set(), []
+
+        def alive(pid):
+            calls.append(pid)
+            seen.add(pid)
+            return 'T1'
+        stats = {}
+        self.assertEqual(rec.prune_registry(self.dir, self.env, token_fn=alive, now=NOW, stats=stats), 0)
+        self.assertEqual((len(calls), stats['examined']), (rec.PRUNE_EXAMINE_MAX, rec.PRUNE_EXAMINE_MAX))
+        for minute in range(1, 4):
+            rec.prune_registry(self.dir, self.env, token_fn=alive, now=NOW + timedelta(minutes=minute))
+        self.assertEqual(len(seen), 150)
+
+    def test_directory_listing_is_capped_and_the_excess_counted(self):
+        for n in range(30):
+            self.put('q%06d' % (400 + n), 2000 + n)
+        stats = {}
+        removed = rec.prune_registry(self.dir, self.env, token_fn=lambda pid: None, now=NOW, list_max=20, stats=stats)
+        self.assertEqual((removed, stats['ignored']), (20, 10))
+        self.assertEqual(len(list(self.dir.glob('q*.json'))), 10)
+        self.assertEqual(json.loads((self.mon / rec.RECEIPT_NAME).read_text().splitlines()[-1])['detail'], 'count=20 ignored=10')
+        self.assertEqual((rec.PRUNE_LIST_MAX, rec.PRUNE_EXAMINE_MAX, rec.PRUNE_BUDGET_S), (1000, 100, 5.0))
+
+    def test_a_total_time_budget_stops_a_slow_pass(self):
+        for n in range(10):
+            self.put('q%06d' % (500 + n), 3000 + n)
+        clock = {'t': 0.0}
+
+        def slow(pid):
+            clock['t'] += 2.0      # each lookup "takes" 2 s
+            return 'T1'
+        stats = {}
+        rec.prune_registry(self.dir, self.env, token_fn=slow, now=NOW, monotonic=lambda: clock['t'], stats=stats)
+        self.assertEqual(stats['examined'], 3)      # 0, 2 and 4 s are inside the 5 s budget; 6 s is not
+
+    def test_a_slow_or_failing_ps_keeps_the_record(self):
+        path = self.put('q000600', 4000)
+        seen = []
+
+        def hang(argv, **kw):
+            seen.append(kw.get('timeout'))
+            raise subprocess.TimeoutExpired(argv, kw.get('timeout'))
+        with unittest.mock.patch.object(rec.subprocess, 'run', hang):
+            self.assertEqual(rec.prune_registry(self.dir, self.env, now=NOW), 0)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                rec._bounded_token(4000)
+        self.assertTrue(path.exists() and seen and all(t <= 1 for t in seen), seen)
+        gone = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout='')
+        broken = lambda argv, **kw: subprocess.CompletedProcess(argv, 2, stdout='')
+        with unittest.mock.patch.object(rec.subprocess, 'run', gone):
+            self.assertIsNone(rec._bounded_token(4000))
+        with unittest.mock.patch.object(rec.subprocess, 'run', broken), self.assertRaises(OSError):
+            rec._bounded_token(4000)
+
     def test_it_never_signals(self):
         text = (ROOT / 'scripts/admission-recovery.py').read_text()
         body = text[text.index('def prune_registry'):text.index('# ---- receipts')]

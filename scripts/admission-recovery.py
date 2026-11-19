@@ -24,6 +24,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 
 HERE = Path(__file__).resolve().parent
 
@@ -377,25 +378,67 @@ def unregister_wrapper(directory, qid, uid=None):
     return False
 
 
-PRUNE_MAX = 50
+PRUNE_MAX = 50                 # unlinks per pass
+PRUNE_EXAMINE_MAX = 100        # records examined (one `ps` each) per pass; the start offset rotates so every record is reached in time
+PRUNE_LIST_MAX = 1000          # registry names read per pass; the excess is ignored and counted
+PRUNE_BUDGET_S = 5.0           # total wall time of one pass: a slow `ps` stops the pass, never the tick
 PRUNE_MAX_AGE_S = 7 * 86400
 
 
-def prune_registry(directory, env, token_fn=None, now=None, limit=PRUNE_MAX):
+def _bounded_token(pid):
+    """Start token with a 1 s bound. None only when ps says there is no such process; a timeout or any other failure RAISES (uncertain is kept)."""
+    done = subprocess.run(['/bin/ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True, timeout=REGISTER_LOOKUP_TIMEOUT_S,
+                          stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/bin:/usr/bin', 'TZ': 'UTC'})
+    token = (done.stdout or '').strip()
+    if done.returncode == 0 and token:
+        return token
+    if done.returncode == 1 and not token:
+        return None
+    raise OSError('cannot inspect process')
+
+
+def _listed(directory, uid, limit):
+    """(queue ids, ignored): at most `limit` registry names from a private real directory, and how many more were seen (scanning stops at 2 x limit)."""
+    if not _dir_private(directory, uid):
+        return [], 0
+    names, ignored = [], 0
+    try:
+        with os.scandir(str(directory)) as it:
+            for item in it:
+                if item.name.endswith('.json') and QID_RE.fullmatch(item.name[:-5]):
+                    if len(names) < limit:
+                        names.append(item.name[:-5])
+                    else:
+                        ignored += 1
+                        if ignored >= limit:
+                            break
+    except OSError:
+        return [], 0
+    return sorted(names), ignored
+
+
+def prune_registry(directory, env, token_fn=None, now=None, limit=PRUNE_MAX, examine_max=PRUNE_EXAMINE_MAX, list_max=PRUNE_LIST_MAX,
+                   budget_s=PRUNE_BUDGET_S, monotonic=time.monotonic, stats=None):
     """Unlink-only cleanup of registry files that can no longer matter: a valid record whose pid is gone, whose start token no longer matches, or that is
     older than 7 days. Only regular files of ours with a valid queue-id name in a private real directory; anything else, and anything uninspectable, is left.
-    At most `limit` per call; one count-only receipt line when something was removed. Returns the count. Never raises."""
-    count = 0
+    Bounded per call: `limit` unlinks, `examine_max` records examined (rotating start, so all are reached over successive ticks), `list_max` names read
+    (the rest ignored and counted), `budget_s` seconds in total. One count-only receipt line when something was removed or ignored. Returns the number
+    removed; `stats` (a dict) receives examined and ignored. Never raises."""
+    count, examined, ignored = 0, 0, 0
     try:
-        token_fn = token_fn or _disk_admission().waiter_token
+        token_fn = token_fn or _bounded_token
         now = now or env.clock()
-        for qid in list_registered(directory, env.uid):
-            if count >= limit:
+        deadline = monotonic() + budget_s
+        names, ignored = _listed(directory, env.uid, list_max)
+        start = ((int(now.timestamp()) // 60) * max(1, examine_max)) % len(names) if names else 0      # each minute starts one window further on
+        for qid in names[start:] + names[:start]:
+            if count >= limit or examined >= examine_max or monotonic() >= deadline:
                 break
             rec = read_registry(qid, directory, env.uid)
             path = Path(directory) / (qid + '.json')
             if rec is None:
                 continue
+            examined += 1
             try:
                 token = token_fn(rec['pid'])
                 old = (now - parse_iso(rec['created'])).total_seconds() > PRUNE_MAX_AGE_S
@@ -410,10 +453,12 @@ def prune_registry(directory, env, token_fn=None, now=None, limit=PRUNE_MAX):
                     count += 1
             except OSError:
                 continue
-        if count:
-            write_receipt(env, 'prune', 'registry', 'prune', 'pruned', detail='count=%d' % count)
+        if count or ignored:
+            write_receipt(env, 'prune', 'registry', 'prune', 'pruned', detail='count=%d' % count + (' ignored=%d' % ignored if ignored else ''))
     except Exception:
         pass
+    if stats is not None:
+        stats.update(examined=examined, ignored=ignored)
     return count
 
 
