@@ -32,10 +32,30 @@ Add `scripts/admission-monitor.py`: a stdlib-only, deterministic, single-shot `t
 - **Causes**, first match is primary: `state-unreadable`, `disk-floor` (running work holds the space), `memory-pressure` (an ENTER predicate),
   `memory-hysteresis-static-compressor` (latched, ENTER passes, the compressor alone fails EXIT and was flat for 10 minutes),
   `memory-hysteresis`, `stale-claim` (holder exited, claim unreleased), `frozen-queue` (waiting work, nothing blocks it, nothing is being granted),
-  `failed-continuation` (a grant unclaimed for 45 minutes, or unclaimed grants whose reservation breaks the floor), `outdated-caller`
+  `unclaimed-handoff` (a grant with no `waiter` unclaimed for 15 minutes, 75% of its 20 minute window; see below),
+  `failed-continuation` (a grant with a waiter unclaimed for 45 minutes, 75% of its 60 minute window, or unclaimed grants whose reservation breaks the floor), `outdated-caller`
   (a grant without the runner stamp of the current protocol), `stalled-running` (a claimed workload whose CPU time has not changed for
   15 minutes: reported, never touched) and `unobservable` (memory metrics unreadable). A grant that lapsed unclaimed is a note in the
   status, not a trigger. Only `stale-claim`, `frozen-queue`, `failed-continuation` and the two hysteresis causes can start an advance.
+- **Unclaimed hand-off incidents (ADR 0019 monitor slice, SPE-176).** A hand-off grant (no `waiter`) lapses to EXPIRED after 20 minutes, which
+  made the 45 minute rule unreachable for it. Each grant's own window now sets the clock: a status notice at 5 minutes (no page), an incident at 75%
+  of the window (15 minutes for a hand-off), and, if the monitor first sees the grant after it lapsed (EXPIRED, or GRANTED past its window, with no claim,
+  holder or claim/release receipt, within 6 hours), one incident on lapse with the recovery phrase `grant lapsed`. An incident is keyed by entry id plus
+  `grant.at`, so ticks, restarts and a second monitor are one incident. **At most two notices per incident: escalate and lapse.** A lapse after a raise
+  upgrades the incident with one more notice whose text says `grant lapsed`. A lapsed waiter entry raises nothing here. On a tick after an observation gap
+  (sleep, reboot, clock step) wall-clock age is not trusted: only an EXPIRED state the scheduler itself recorded can raise.
+  The state records, per incident, `handed_off_at` (session-notify answered `queued`), `delivered_at` (set only when session-notify reports a backend
+  accepted that notice; `queued` alone, or `deduped` for a notice not already handed off by this record, is never delivery), `delivery`
+  (`sent`, `pending` while polled, `dropped`, `unknown` when an earlier call finished it, `unconfirmed` after 20 polls), `acknowledged_at` (set only when the
+  entry is later CLAIMED or RELEASED; silence is never read as abandonment), `claim_seen`, `ack_deadline` (the escalate time), that the entry had no
+  waiter, and `action: none`: the monitor does not cancel, because the scheduler's own expiry frees the lane. The request uses `emit-resource --strict`, so a
+  no-backend outcome leaves no dedup record and a retry after a backend is enabled still notifies. The monitor sends no `--clear` while any incident's notice is unsettled (a clear bumps session-notify's cycle), and session-notify never queues a second entry for a key that is still pending. A `deduped` answer for a notice this record never handed off (a crash before the state was saved) is asked for at most 5 times, then recorded as `handed_off_unverified`. **`status.json` is not delivery.** Each incident carries `owner_notice_state` (`pending`, `delivered`, `acknowledged`, `unknown`, `undelivered`); an incident
+  whose notice ended undelivered (dropped, unconfirmed after 20 polls, unverified, or the hand-off keeps failing) is listed in `owner_notice_undelivered`
+  (incident key, entry id, phase, time raised) in `status.json`, and `status` prints its count. That list does not hold back `--clear`. With no backend enabled
+  the only path to the owner is the coordinating Claude session reading that list and forwarding it. After a lapse the monitor records whether the lane is in
+  use and whether the next waiting entry started. Incidents are dropped 7 hours after the grant (1 hour after an acknowledgement). Beyond 24 kept, acknowledged
+  ones go first, then ones past the 6 hour lapse window; one still inside the window is never evicted (hard bound 64), so the state file stays far below its
+  64 KiB read cap.
 - **Runner stamp.** The granted receipt (never the grant object) records `runner: {protocol, checkout}` and `memory_gate`; the monitor reads
   it from the receipt that matches the grant time. The grant object stays exactly `{at, expires}`: a hand-off consumer validates it as a
   closed key set, and an earlier version of this change that put the stamp inside the grant made the HORO-2139 executor refuse the grant
