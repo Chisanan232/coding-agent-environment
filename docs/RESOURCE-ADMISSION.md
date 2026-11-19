@@ -491,3 +491,8 @@ nothing, an uninspectable one is treated as alive, and a CLAIMED entry is never 
 `lane`, `budget` or `other` (derived from the reason prefix; no free text, no argv). At most one receipt is written per entry and kind
 per 10 minutes, judged from the newest matching line in `receipts.jsonl` (which still rotates at 1 MiB), and the entry itself is not
 changed, so the grant is kept as before.
+
+Notes: the stored `waiter.start_token` is a UTC `ps lstart` string (not `process_token`'s local-time format), so a timezone or DST
+change cannot make a live waiter look replaced; waiter pids at or below 1 are refused. Cancellation is skipped while the disk tier
+cannot be measured (advance returns early before it). Enqueue that dedupes to an existing live entry returns that entry and does not
+refresh its waiter.
