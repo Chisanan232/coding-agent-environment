@@ -473,3 +473,21 @@ la-cargo --status
 Rollback: `install -m 0755 ~/.local/bin/la-cargo.pre-SPE-174 ~/.local/bin/la-cargo` (its sha256 is the baseline above). Run
 `disk-admission.py status --json` and `queue status --json` afterwards: a killed build that never released leaves an UNRESOLVED
 holder that `release --label la-cargo-<pid>` (or `queue release --id qNNNNNN --confirm-ended`) clears once cargo has ended.
+
+## Dead waiters and refused claims (SPE-176)
+
+**Waiter.** `queue enqueue --waiter-pid PID` is optional and names the supervising wrapper that will claim the entry (`heavy-run` and
+`la-cargo` pass their own pid). The pid must be a live process of this user that is the enqueue process, its parent or an ancestor, so
+a session cannot declare an unrelated process. The entry stores `waiter: {pid, start_token}` (the same pid-reuse-safe identity as a
+holder). Without the flag there is no `waiter` field, and such a handoff entry, which someone claims later by hand, is never
+auto-cancelled.
+
+**Cancellation.** `queue advance`, under the queue lock and before it grants, cancels a QUEUED, ELIGIBLE or GRANTED entry whose waiter is
+provably gone: no such pid, or the pid now has a different start token. The receipt is `cancelled` with `evidence: waiter-exited`, the
+granted marker is dropped, and a granted lane and its bytes are free for the next entry in the same advance. A live waiter changes
+nothing, an uninspectable one is treated as alive, and a CLAIMED entry is never touched by this rule (the holder rules apply).
+
+**Claim refusals.** A `queue claim` refused with exit 77 appends a `claim-refused` receipt with `kind` one of `memory-gate`, `floor`,
+`lane`, `budget` or `other` (derived from the reason prefix; no free text, no argv). At most one receipt is written per entry and kind
+per 10 minutes, judged from the newest matching line in `receipts.jsonl` (which still rotates at 1 MiB), and the entry itself is not
+changed, so the grant is kept as before.
