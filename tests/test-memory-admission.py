@@ -369,6 +369,41 @@ class LatchPolicy(unittest.TestCase):
         self.assertTrue(st["latched"])
         self.assertLessEqual(len(st["p2_hist"]), 1)
 
+    def test_sparse_checks_days_apart_never_release(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        now = 100.0
+        for _ in range(ma.P2_SAMPLES + 2):
+            _, st = ma.decide("heavy", self.calm(0.30), st, now)
+            now += 3 * 86400
+        self.assertTrue(st["latched"])
+
+    def test_an_oscillating_compressor_never_releases(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        now = 100.0
+        for i in range(ma.P2_SAMPLES + 2):
+            _, st = ma.decide("heavy", self.calm(0.26 if i % 2 == 0 else 0.34), st, now)
+            now += 61
+        for _ in range(2):
+            _, st = ma.decide("heavy", self.calm(0.26), st, now)
+            now += 61
+        self.assertTrue(st["latched"])
+
+    def test_a_second_lane_after_a_release_is_still_judged_by_the_exit_bounds(self):
+        m = self.lane_busy(0.30)
+        m["heavy_procs"], m["heavy_workloads"] = {"cargo": 1}, None
+        reasons, _ = ma.refusal_reasons("heavy", m)
+        self.assertTrue(reasons)    # lanes are full or the second lane needs a quiet host: a release never relaxes that
+        self.assertFalse(ma.exit_ok(m))
+
+    def test_both_rollback_switches_restore_the_old_behaviour(self):
+        with unittest.mock.patch.object(ma, "CONSERVATIVE_RECOVERY", False):
+            _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+            now = 100.0
+            for _ in range(ma.P2_SAMPLES + 2):
+                _, st = ma.decide("heavy", self.calm(), st, now)
+                now += 61
+            self.assertTrue(st["latched"])
+
     def test_state_file_round_trips_the_p2_fields_and_old_files_still_load(self):
         with tempfile.TemporaryDirectory() as root:
             path = pathlib.Path(root) / "state.json"
