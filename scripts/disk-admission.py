@@ -1776,15 +1776,17 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                     out['reason'] = 'memory-gate: %s' % memory[1]
                     return out
                 nxt['state'] = 'GRANTED'
-                nxt['grant'] = {'at': iso_utc(now), 'expires': iso_utc(now + timedelta(seconds=window)),
-                                'runner': {'protocol': RUNNER_PROTOCOL, 'checkout': Path(__file__).resolve().parent.parent.name},
-                                'memory_gate': 'admitted' if type(memory) is tuple else 'not-asked'}
+                # The grant object is exactly {at, expires}: a hand-off consumer validates it as a closed key set (the HORO-2139 executor
+                # refused a grant with two extra keys on 2026-11-19 and its waiter died). The runner stamp goes in the receipt only.
+                nxt['grant'] = {'at': iso_utc(now), 'expires': iso_utc(now + timedelta(seconds=window))}
+                stamp = {'runner': {'protocol': RUNNER_PROTOCOL, 'checkout': Path(__file__).resolve().parent.parent.name},
+                         'memory_gate': 'admitted' if type(memory) is tuple else 'not-asked'}
                 _write_queue_entry(state_path, nxt)
                 marker = queue_dir(state_path) / 'granted' / nxt['id']
                 write_json_atomic(marker, {'id': nxt['id'], 'label': nxt['label'], 'tickets': nxt['tickets'],
                                            'expires': nxt['grant']['expires']})
                 _queue_receipt(state_path, 'granted', nxt, now, expires=nxt['grant']['expires'], tier=result['tier'],
-                               runner=nxt['grant']['runner'], memory_gate=nxt['grant']['memory_gate'])
+                               runner=stamp['runner'], memory_gate=stamp['memory_gate'])
                 out['granted'].append(nxt['id'])
                 granted.append(nxt)
                 in_use += 1

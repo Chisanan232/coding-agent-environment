@@ -82,12 +82,19 @@ class MonitorBase(unittest.TestCase):
 
     def grant(self, memory=None, runner=True):
         out = da.queue_advance(self.state_path, lambda: 400 * GIB, now=self.clock.now, memory_fn=(lambda: (True, 'ADMIT')) if memory else None)
-        if not runner:   # an outdated caller grants without the stamp
-            for entry in da._queue_entries(self.state_path)[0]:
-                if entry['state'] == 'GRANTED':
-                    entry['grant'] = {'at': entry['grant']['at'], 'expires': entry['grant']['expires']}
-                    da._write_queue_entry(self.state_path, entry)
+        if not runner:   # an outdated caller grants without the stamp: its granted receipt carries no runner
+            self.edit_granted_receipts(lambda rec: rec.pop('runner', None))
         return out
+
+    def edit_granted_receipts(self, change):
+        path = da.queue_dir(self.state_path) / 'receipts.jsonl'
+        out = []
+        for line in path.read_text().splitlines():
+            rec = json.loads(line)
+            if rec.get('event') == 'granted':
+                change(rec)
+            out.append(json.dumps(rec, sort_keys=True))
+        path.write_text('\n'.join(out) + '\n')
 
     def tick(self, seconds=60, act=False, asleep=False, **kw):
         self.clock.advance(seconds, asleep=asleep)
@@ -106,6 +113,7 @@ class Classify(MonitorBase):
     def snap(self, entries, **extra):
         base = {'now': self.clock.now, 'wall': self.clock.now.timestamp(), 'entries': entries, 'problems': [], 'free_bytes': self.free,
                 'mem': self.mem, 'window': [], 'claims': {}, 'protocol': da.RUNNER_PROTOCOL}
+        base['stamps'] = self.env().stamps([e for e in entries if e['state'] == 'GRANTED'])
         base.update(extra)
         return base
 
@@ -326,9 +334,11 @@ class Persistence(MonitorBase):
         self.grant(memory=True)
         self.clock.advance(3700)
         da.queue_advance(self.state_path, lambda: 400 * GIB, now=self.clock.now)
-        verdict = mon.classify({'now': self.clock.now, 'wall': self.clock.now.timestamp(), 'entries': da._queue_entries(self.state_path)[0],
+        entries = da._queue_entries(self.state_path)[0]
+        verdict = mon.classify({'now': self.clock.now, 'wall': self.clock.now.timestamp(), 'entries': entries,
                                 'problems': [], 'free_bytes': self.free, 'mem': self.mem, 'window': [], 'claims': {},
-                                'protocol': da.RUNNER_PROTOCOL}, mon.default_limits(da, ma))
+                                'protocol': da.RUNNER_PROTOCOL, 'stamps': self.env().stamps([e for e in entries if e['state'] == 'GRANTED'])},
+                               mon.default_limits(da, ma))
         self.assertIn('1 grant lapsed unclaimed'.replace('1 ', ''), ' '.join(verdict['notes']).replace('q000', '') and 'grant lapsed unclaimed')
         self.assertTrue(verdict['notes'])
         self.assertNotIn('failed-continuation', verdict['causes'])    # history is a note, not a trigger for advances
@@ -337,9 +347,11 @@ class Persistence(MonitorBase):
         self.mem['latched'] = False
         self.grant(memory=True)
         self.clock.advance(46 * 60)
-        verdict = mon.classify({'now': self.clock.now, 'wall': self.clock.now.timestamp(), 'entries': da._queue_entries(self.state_path)[0],
+        entries = da._queue_entries(self.state_path)[0]
+        verdict = mon.classify({'now': self.clock.now, 'wall': self.clock.now.timestamp(), 'entries': entries,
                                 'problems': [], 'free_bytes': self.free, 'mem': self.mem, 'window': [], 'claims': {},
-                                'protocol': da.RUNNER_PROTOCOL}, mon.default_limits(da, ma))
+                                'protocol': da.RUNNER_PROTOCOL, 'stamps': self.env().stamps([e for e in entries if e['state'] == 'GRANTED'])},
+                               mon.default_limits(da, ma))
         self.assertIn('failed-continuation', verdict['causes'])
 
 
@@ -760,17 +772,19 @@ class FinalReviewFindings(MonitorBase):
         state = json.loads((mon.monitor_dir(self.state_path) / 'state.json').read_text())
         self.assertEqual(state['progress_at'], self.clock.now.timestamp())    # the vanished claim reset the stall clock
 
-    def test_a_non_dict_runner_stamp_is_reported_not_a_traceback(self):
+    def test_a_malformed_runner_stamp_reads_as_an_outdated_caller_not_a_traceback(self):
         self.enqueue('HORO-4001')
         self.enqueue('HORO-4002')
         self.grant(memory=True)
-        for entry in da._queue_entries(self.state_path)[0]:
-            if entry['state'] == 'GRANTED':
-                entry['grant']['runner'] = 'old'
-                da._write_queue_entry(self.state_path, entry)
+        self.edit_granted_receipts(lambda rec: rec.update(runner='old'))
         out = self.tick()
-        self.assertIn('state-unreadable', out['causes'])
-        self.assertIn('unusable', out['causes']['state-unreadable'])
+        self.assertIn('outdated-caller', out['causes'])
+
+    def test_the_grant_object_is_never_extended_by_the_monitored_scheduler(self):
+        self.enqueue('HORO-4001')
+        self.grant(memory=True)
+        grants = [e['grant'] for e in da._queue_entries(self.state_path)[0] if e['state'] == 'GRANTED']
+        self.assertEqual([set(g) for g in grants], [{'at', 'expires'}])
 
     def test_receipts_rotate_instead_of_stopping(self):
         self.enqueue('HORO-4001')

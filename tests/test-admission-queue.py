@@ -244,26 +244,30 @@ class GrantStamp(QueueBase):
     def grant_of(self, entry):
         return next(e for e in da._queue_entries(self.path)[0] if e['id'] == entry['id'])['grant']
 
-    def test_a_gated_grant_is_stamped_with_protocol_checkout_and_gate(self):
+    def granted_receipt(self):
+        lines = [json.loads(l) for l in (self.path.parent / 'queue/receipts.jsonl').read_text().splitlines()]
+        return [l for l in lines if l.get('event') == 'granted'][0]
+
+    def test_the_grant_object_stays_exactly_at_and_expires(self):
+        # A hand-off consumer validates the grant as a closed key set; two extra keys made the HORO-2139 executor refuse it (2026-11-19).
         a = self.enqueue('HORO-2070')
         self.advance_with(lambda: (True, 'ADMIT'))
-        grant = self.grant_of(a)
-        self.assertEqual(grant['runner']['protocol'], da.RUNNER_PROTOCOL)
-        self.assertEqual(grant['runner']['checkout'], Path(da.__file__).resolve().parent.parent.name)
-        self.assertEqual(grant['memory_gate'], 'admitted')
+        self.assertEqual(set(self.grant_of(a)), {'at', 'expires'})
+        self.advance()      # also without the memory gate
+        self.assertEqual(set(self.grant_of(a)), {'at', 'expires'})
 
-    def test_a_library_grant_without_a_gate_says_so(self):
-        a = self.enqueue('HORO-2070')
-        self.advance()
-        self.assertEqual(self.grant_of(a)['memory_gate'], 'not-asked')
-
-    def test_the_granted_receipt_carries_the_stamp(self):
+    def test_the_runner_and_memory_gate_stamp_goes_in_the_granted_receipt(self):
         self.enqueue('HORO-2070')
         self.advance_with(lambda: (True, 'ADMIT'))
-        lines = [json.loads(l) for l in (self.path.parent / 'queue/receipts.jsonl').read_text().splitlines()]
-        granted = [l for l in lines if l.get('event') == 'granted'][0]
-        self.assertEqual((granted['runner']['protocol'], granted['memory_gate']), (da.RUNNER_PROTOCOL, 'admitted'))
+        receipt = self.granted_receipt()
+        self.assertEqual(receipt['runner']['protocol'], da.RUNNER_PROTOCOL)
+        self.assertEqual(receipt['runner']['checkout'], Path(da.__file__).resolve().parent.parent.name)
+        self.assertEqual(receipt['memory_gate'], 'admitted')
 
+    def test_a_library_grant_without_a_gate_says_so_in_the_receipt(self):
+        self.enqueue('HORO-2070')
+        self.advance()
+        self.assertEqual(self.granted_receipt()['memory_gate'], 'not-asked')
 
 
 class MemoryPreconditionText(unittest.TestCase):
