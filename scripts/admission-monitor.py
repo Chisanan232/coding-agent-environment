@@ -36,6 +36,7 @@ STALL_S = 600                 # waiting work with no claim, release or CPU growt
 GRANTED_ALERT_S = 2700        # above the observed p99 grant->claim (29 min), below the 60 min grant window
 CPU_STALL_S = 900             # a claimed, alive workload with no CPU growth this long is reported, never touched
 CONFIRM_SPACING_S = 30        # confirmations are counted at least this far apart
+CLEAR_AFTER_TICKS = 3         # clean ticks in a row before the alert channel is told the blockage ended
 CONFIRM_TICKS = 2             # consecutive ticks a cause must hold before it is acted on or alerted
 LIVE = ('QUEUED', 'ELIGIBLE', 'GRANTED', 'CLAIMED')
 GAP_FACTOR = 3                # a gap over this many intervals, or sleep, is an observation gap
@@ -287,11 +288,11 @@ def classify(snap, limits):
         if not runner or runner.get('protocol', 0) < snap['protocol']:
             found['outdated-caller'] = '%s was granted by a runner without protocol %d' % (entry['id'], snap['protocol'])
     # Nothing blocks the head, nothing is claimed, nothing granted is waiting to be claimed: nobody is advancing the queue.
-    if waiting and waiting[0]['state'] != 'ELIGIBLE' and not found and not granted and not any(e['state'] == 'CLAIMED' for e in entries):
+    if waiting and not found and not granted and not any(e['state'] == 'CLAIMED' for e in entries):
         found['frozen-queue'] = 'waiting work, free lanes and no blocker, but nothing is being granted'
     primary = next((c for c in CAUSES if c in found), 'unknown')
     if not found:
-        busy = any(e['state'] == 'CLAIMED' for e in entries) or any(e['state'] == 'ELIGIBLE' for e in waiting)   # ELIGIBLE: no lane free yet
+        busy = any(e['state'] == 'CLAIMED' for e in entries) or (any(e['state'] == 'ELIGIBLE' for e in waiting) and bool(granted))   # an ELIGIBLE head waits on a lane someone holds
         primary = 'healthy-busy' if busy else 'unknown'
     # History for the owner, never a trigger: a grant that lapsed unclaimed shortly ago (a lost callback).
     notes = ['%s grant lapsed unclaimed' % e['id'] for e in entries if e['state'] == 'EXPIRED' and isinstance(e.get('grant'), dict)
@@ -347,7 +348,8 @@ def sanitize_state(state):
     progress = state.get('progress_at')
     return dict(schema=1, last_tick=last, blocker=blocker, alerts=alerts, cpu=cpu, states=states, window=window,
                 advances=nums(state.get('advances'), 64), progress_at=progress if isinstance(progress, (int, float)) else None,
-                last_alert=state.get('last_alert') if isinstance(state.get('last_alert'), dict) else None)
+                last_alert=state.get('last_alert') if isinstance(state.get('last_alert'), dict) else None,
+                clean_ticks=state.get('clean_ticks') if type(state.get('clean_ticks')) is int and 0 <= state['clean_ticks'] < 10 ** 6 else 0)
 
 
 # ---- tick --------------------------------------------------------------------------------------------------------------
@@ -500,8 +502,8 @@ def _tick_locked(env, directory, act, if_due):
         now_by_id = {e['id']: e['state'] for e in entries}
         for qid, before in state['states'].items():
             after = now_by_id.get(qid)
-            if after in ('CLAIMED', 'RELEASED') and after != before:
-                progress = True
+            if (after in ('CLAIMED', 'RELEASED') and after != before) or (after is None and before == 'CLAIMED'):
+                progress = True      # a claim started, finished, or finished and was garbage-collected between two ticks
     try:
         mem = env.memory()
     except (OSError, subprocess.SubprocessError, ValueError):
@@ -574,15 +576,20 @@ def _tick_locked(env, directory, act, if_due):
                                       'next_try': wall + min(300 * 2 ** (attempts - 1), ALERT_COOLDOWN_S)}
         state['last_alert'] = {'at': iso(now), 'cause': verdict['primary'], 'signature': sig, 'delivered': delivered, 'attempts': attempts}
         result['alert'] = dict(alert, delivered=delivered)
-    if not verdict['causes'] and state.get('last_alert') and not state['last_alert'].get('cleared'):
+    state['clean_ticks'] = 0 if verdict['causes'] or gap else state.get('clean_ticks', 0) + 1
+    last_alert = state.get('last_alert')
+    if state['clean_ticks'] >= CLEAR_AFTER_TICKS and last_alert and not last_alert.get('cleared') and wall >= last_alert.get('clear_next', 0):
         try:
             cleared = bool(env.clear())
         except Exception:
             cleared = False
         if cleared:
-            state['last_alert']['cleared'] = True
+            last_alert['cleared'] = True
             state['alerts'] = {}      # the next incident may announce again even with the same cause and signature
             result['cleared'] = True
+        else:
+            tries = last_alert.get('clear_tries', 0) + 1
+            last_alert.update(clear_tries=tries, clear_next=wall + min(300 * 2 ** (tries - 1), 3600))
     result['last_alert'] = state.get('last_alert')
     persist(directory, state, cpu_now, states_now, window, blocker, progress_at, wall, mono, boot)
     write_json(directory / 'status.json', result)
