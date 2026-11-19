@@ -545,15 +545,15 @@ explicit smaller `--grant-s` still wins for either kind. Lane and byte accountin
 ## Stall detection (SPE-176, ADR 0018)
 
 `scripts/admission-monitor.py tick` reads the queue, the latch file and the process table and reports whether queued work is globally
-stalled and why. It is observe-only unless started with `--act`, which allows one bounded recovery verb (`queue advance`). It never signals,
-resets the latch, changes a threshold or deletes. `status` shows the last result, `callers` lists admission runners found on disk by
+stalled and why. It is observe-only unless started with `--act`, which allows one bounded recovery verb (`queue advance`) and the two guarded
+recoveries below. It never resets the latch, changes a threshold or deletes, and it signals nothing but one SIGTERM to an obsolete wrapper. `status` shows the last result, `callers` lists admission runners found on disk by
 protocol, and `plist` prints the launchd agent without installing it; installing it (`launchctl bootstrap gui/$(id -u) <plist>`) is an
 owner-run step. A grant is not a start: only a claim, a release or CPU growth of a claimed workload counts as progress.
 
-## Guarded recovery library (not wired)
+## Guarded recovery (wired under `tick --act`)
 
-`scripts/admission-recovery.py` (SPE-176 slice 1b, ADR 0019 sections 3, 5 and 6) is a self-contained library that nothing imports or calls: no
-CLI, no monitor tick, no hook. It exists so the monitor slice can act only through audited, conclusive-evidence guards.
+`scripts/admission-recovery.py` (SPE-176, ADR 0019 sections 3, 5 and 6) is the library the monitor's `tick --act` calls; nothing else does, and
+`--observe-only` and a plain `tick` never reach it. It acts only through audited, conclusive-evidence guards.
 
 - `abandoned_unstarted` / `do_cancel`: a GRANTED entry with no holder, release or workload, whose waiter is provably gone (the scheduler's own
   `_waiter_gone`; uninspectable or malformed is not gone) or absent, whose owner mechanism is `gone` or `refused-permanently`, older than the 5 min
@@ -565,14 +565,30 @@ CLI, no monitor tick, no hook. It exists so the monitor slice can act only throu
   or gone, with matching pid, start token, uid, process group and parent, a matching executable identity, no workload by evidence and no child or
   detached workload, gets exactly one SIGTERM, a bounded wait, and a `failed-to-terminate` report on survival. Never SIGKILL, never a workload.
   A terminal entry only proves the queue no longer needs the pid, so identity is checked too: a wrapper that exec'd the workload keeps its pid and token.
-- Registry contract: `registered_fn(qid)` returns `{pid, start_token, pgid, ppid, exe}` recorded by the wrapper at enqueue, where `exe` is the
-  interpreter plus script identity of heavy-run or la-cargo. `exe_fn(pid)` returns the live identity and `holds_workload_fn(pid)` whether the
-  process holds a cargo/target lock; both default to unknown, and unknown refuses. `heavy-run` and `la-cargo` do not yet record any of this, so the
-  library stays inert until a wiring slice supplies the registry, `owner_exec_fn`, `exe_fn` and `holds_workload_fn`.
+- Wrapper registry: when `heavy-run` or `la-cargo` enqueue they record `wrappers/<qid>.json` (0600, in a 0700 directory beside the admission state,
+  or `$ADMISSION_WRAPPERS_DIR`) holding exactly `{qid, pid, start_token (the queue waiter token), pgid, ppid, exe_id, kind, created}`, where `exe_id` is
+  the interpreter and script basenames only (never argv), and remove it when they exit. Writing is best effort: any failure is ignored and never
+  fails the job. `read_registry` refuses a symlink, a foreign owner, loose modes, an off-schema or oversized record and a pid whose live start token
+  differs. `kill -9` leaves a stale file that is never trusted (the process is gone) and is not deleted by the monitor.
+- Monitor bindings (the library's own defaults still refuse): `registered_fn` is that registry; `exe_fn` reduces `ps` args to the same two basenames in
+  memory; `holds_workload_fn` is true when anything else lives in the wrapper's group or below it, when an open `.cargo-lock` is seen, or when the
+  process table or `lsof` cannot be read (uncertain is holding); `owner_exec_fn` is `gone` only when the entry's declared waiter is provably gone,
+  or, for a hand-off entry, when a session record says the owning session ended (none is read yet, so such an entry stays `unknown` and is never
+  cancelled), `live` when the waiter or session is alive, else `unknown`.
+- Bounds and switches: at most one recovery action per tick and three per rolling 30 minutes (the action is recorded and persisted before it is
+  taken, so a crash still counts); a wrapper is only a candidate after its entry has been terminal with that same live wrapper for two ticks
+  (120 s), so a job that is just exiting is never signalled; one SIGTERM and a 10 s wait, then `failed-to-terminate` is reported and nothing more is
+  sent; the file `recovery.disabled` in the monitor directory (any file) turns the whole act-mode recovery, verification included, into a no-op; a
+  monitor directory that is a symlink, not ours or not 0700 does the same (`recovery.state` in `status.json`: `disabled`, `unsafe-monitor-dir`,
+  `recovery-bound`, else `ok`).
+- Effect and follow-up: each action writes receipts, one enum-only owner-outbox line and one strict session-notify notice (`obsolete-wrapper-terminated`,
+  `abandoned-unstarted-cancelled` or `failed-to-terminate`), deduplicated by entry id, pid and start token. A later tick runs `verify_recovery` exactly
+  once to a final state (`verified` or `failed`; `pending` while the next eligible entry has not started) and keeps the incident in `state.json`
+  and `status.json` (`recovery_incidents`) across restarts. A wrapper with a live child or detached workload is listed in `recovery.reported`, never signalled.
 - One exclusive flock (`recovery.lock` in the monitor dir, which must be a private 0700 real directory owned by us) serialises recoveries and the
   verify receipt write; the second recovery gets `busy`. Every decision and action is a closed-schema 0600 line in `recovery-receipts.jsonl`,
   rotated at 1 MiB.
 - `load_terminate_allowlist` / `terminate_allowed_for_workload` prepare a broader, closed-schema termination policy. The file is absent by
   default, the policy is disabled, and neither function is used by the code above. Enabling it needs separate owner approval.
 
-Default wiring (`default_env`) leaves the owner-execution and wrapper-registry readers uninspectable, so by default nothing is abandoned or obsolete.
+`default_env` alone still leaves the owner-execution, registry, executable and workload readers uninspectable, so without the monitor's bindings nothing is abandoned or obsolete.

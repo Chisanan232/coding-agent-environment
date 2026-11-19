@@ -4,6 +4,13 @@ Status: accepted for the repository for the monitor (observe-first). **The memor
 that needs its own review and an owner decision; nothing here changes a threshold or the latch.** Installing the persistent trigger is an
 owner-run step.
 
+**Update (SPE-176 wiring): the guarded recovery of ADR 0019 sections 3, 5 and 6 is wired, enabled only under `tick --act`.** `--observe-only` and a plain
+`tick` still never act. With `--act` the monitor may also (1) cancel a conclusively abandoned, unstarted GRANTED entry through the scheduler's own
+`queue cancel` and (2) send one SIGTERM, no escalation, to a conclusively obsolete heavy-run / la-cargo wrapper whose entry is terminal. Both go through
+`scripts/admission-recovery.py`, are limited to one action per tick and three per rolling 30 minutes (recorded before acting), are verified on a later tick,
+and are switched off by the file `recovery.disabled` in the monitor directory. Every sentence below that says the monitor "never signals" or never cancels
+is superseded by exactly those two actions; a healthy workload, an arbitrary process and an unidentified process are still never touched.
+
 ## Context
 
 On 2026-11-19 queued heavy work stalled for about 9.5 hours. Measured causes, in the order they were found (SPE-175, SPE-176):
