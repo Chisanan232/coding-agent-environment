@@ -1305,6 +1305,9 @@ def format_measurements(summary):
 # advances when a queue-aware command runs. Entries record only a digest of the job argv, never the argv itself.
 QUEUE_DIR = 'queue'
 QUEUE_VERSION = 1
+# Bumped when a runner gains behaviour another runner's grants cannot be trusted without (2: memory-gated advance, SPE-175). A grant
+# stamped with a lower protocol, or with none, came from an outdated caller; stall detection reports it (SPE-176).
+RUNNER_PROTOCOL = 2
 QUEUE_WAIT_S = 24 * 3600
 QUEUE_GRANT_S = 3600
 QUEUE_MAX_GRANT_S = 4 * 3600
@@ -1773,12 +1776,15 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                     out['reason'] = 'memory-gate: %s' % memory[1]
                     return out
                 nxt['state'] = 'GRANTED'
-                nxt['grant'] = {'at': iso_utc(now), 'expires': iso_utc(now + timedelta(seconds=window))}
+                nxt['grant'] = {'at': iso_utc(now), 'expires': iso_utc(now + timedelta(seconds=window)),
+                                'runner': {'protocol': RUNNER_PROTOCOL, 'checkout': Path(__file__).resolve().parent.parent.name},
+                                'memory_gate': 'admitted' if type(memory) is tuple else 'not-asked'}
                 _write_queue_entry(state_path, nxt)
                 marker = queue_dir(state_path) / 'granted' / nxt['id']
                 write_json_atomic(marker, {'id': nxt['id'], 'label': nxt['label'], 'tickets': nxt['tickets'],
                                            'expires': nxt['grant']['expires']})
-                _queue_receipt(state_path, 'granted', nxt, now, expires=nxt['grant']['expires'], tier=result['tier'])
+                _queue_receipt(state_path, 'granted', nxt, now, expires=nxt['grant']['expires'], tier=result['tier'],
+                               runner=nxt['grant']['runner'], memory_gate=nxt['grant']['memory_gate'])
                 out['granted'].append(nxt['id'])
                 granted.append(nxt)
                 in_use += 1
