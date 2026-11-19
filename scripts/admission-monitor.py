@@ -867,7 +867,10 @@ def holds_workload(table_fn, pid, lsof=None):
         if lsof is not None:
             out = lsof(pid)
         else:
-            done = subprocess.run(['/usr/sbin/lsof', '-nP', '-Fn', '-p', str(pid)], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+            tool = next((path for path in ('/usr/sbin/lsof', '/usr/bin/lsof') if os.path.exists(path)), None)
+            if tool is None:
+                return True      # no way to look at open files: uncertain is holding
+            done = subprocess.run([tool, '-nP', '-Fn', '-p', str(pid)], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
             out = done.stdout if done.returncode == 0 else ''
     except Exception:
         return True
