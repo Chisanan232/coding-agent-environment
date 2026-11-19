@@ -56,6 +56,38 @@ Add `scripts/admission-monitor.py`: a stdlib-only, deterministic, single-shot `t
   use and whether the next waiting entry started. Incidents are dropped 7 hours after the grant (1 hour after an acknowledgement). Beyond 24 kept, acknowledged
   ones go first, then ones past the 6 hour lapse window; one still inside the window is never evicted (hard bound 64), so the state file stays far below its
   64 KiB read cap.
+- **Queued-wait and execution incidents (ADR 0019 clocks 1 and 3, SPE-176).** Two more incident kinds share the hand-off incident record, dedup,
+  owner-notice states (`handed_off_at`, `delivered_at`, `acknowledged_at`, `ack_deadline`), retention, strict delivery and the `owner_notice_undelivered` list.
+  Neither can make the queue "stalled", start an advance, cancel, release or signal anything; both are keyed per entry and skipped on an observation-gap tick.
+
+  | Cause (`CAUSE_TEXT`) | Clock | Threshold | Notices | Key | Owner action |
+  |---|---|---|---|---|---|
+  | `queue-wait-excessive` | age since `created`, entry still QUEUED/ELIGIBLE inside its window | status notice at 4 h (no page); incident at 12.5 h; second phase `wait-expiry-near` at 20 h of the 24 h window | at most two per incident | entry id + `wait` | `check-queued-wait` |
+  | `workload-over-deadline` | CLAIMED, holder alive, elapsed since `claimed_at` | 2x the entry's declared `deadline_s` (none is written today), else 2 x 6 h | one | entry id + `run` | `check-over-deadline-workload` |
+
+  A global cause already holding the queue (`disk-floor`, `memory-pressure`, `memory-hysteresis*`) is attributed in the incident's `blocker` field (also
+  `higher-entry-running` or `none`); the entry still gets its one incident past 12.5 h. At most 12 wait and 6 run incidents are open at once, oldest wait first; the
+  rest are counted in `wait_overflow` so 200 old entries never page 200 times or grow the state past its cap. An incident is resolved (`resolved_at`, owner-notice state `resolved`) when the
+  wait or the claim ends. That is never an acknowledgement: `acknowledged_at` stays empty. Resolution stops retries, but a notice that was tried and never arrived
+  stays `undelivered` and listed in `owner_notice_undelivered` (and is kept until the usual 7 h); only a delivered, acknowledged or never-attempted one is dropped after an hour. Low CPU or a quiet log is never an input to either clock; `stalled-running` keeps its own rule. The run incident
+  records the holder pid, its start token as stored, the elapsed time and the deadline source (`declared` or `default`). **Known gap:** no producer writes `deadline_s` into a queue entry or claim, so
+  today every run clock uses the 6 h default (escalation at 12 h); a job that legitimately runs longer must have its owner raise that through a future declared field.
+  **Sleep and clock steps are discounted.** Ages are wall age minus the observed gaps since the entry was created or claimed. A tick that sees a gap (sleep, a forward clock
+  step, a reboot, or a monitor that did not run for over three intervals) records `[last tick, now, gap seconds]` (32 kept) and every later tick subtracts it, so a job claimed
+  5 h before an 8 h sleep does not page at 12 wall hours, while real uptime still counts. The cost, stated plainly: an entry that legitimately waits on a sleeping host is not
+  "excessive", and an interval in which the monitor itself was not running is not counted either. `discounted_s` is recorded in the incident. The ledger keeps the newest 32 gaps (older ones stop discounting, which only pages sooner) and a gap is capped at 48 h; a stored gap that is not a finite number in
+  0..48 h is dropped on load, as is any non-finite number in any other numeric state field (NaN and Infinity are valid JSON to Python and would otherwise silence the clocks).
+  **Suppression:** a wait past 12.5 h whose only blocker is running work that is healthy (every CLAIMED entry has a live holder, CPU changed within 15 minutes, claim time readable, inside its own deadline) is a status note
+  plus an incident in state `suppressed-higher-entry`: no page, no outbox line. It pages (same incident, same two-notice cap) as soon as a global resource cause holds
+  the queue, a running entry passes its deadline, the running work ends with the entry still queued, or at 20 h (`wait-expiry-near` always pages). A granted but
+  unclaimed higher entry, a dead, stale-claim, unresolved or CPU-stalled holder never suppresses.
+  Bounds: the state file is read through a 64 KiB cap (a larger file restarts observation), so open incidents are capped (12 wait, 6 run) and past 64 incidents only closed ones are evicted (oldest first); an open incident is never dropped. An outbox line is skipped when its key and phase are already in
+  the outbox or its backup, so a crash between the append and the state write cannot duplicate it.
+  `resolve_owner(entry, sessions, process, launcher)` is a pure function returning `{kind, session_id, reachable, evidence}` (`kind`: claude, codex,
+  heavy-run, la-cargo, unknown); the inspectors are injected and an uninspectable owner is `reachable: null`, never gone. Nothing calls a model or messages a peer:
+  each incident phase appends one closed-schema line to `owner-outbox.jsonl` in the monitor directory (job id, incident key, observed blocker, evidence enums,
+  requested check, owner kind and reachability, no session id; rotated to one backup at 1 MiB) for the coordinating session or a future adapter to forward. Hand-off (unclaimed grant) incidents write the same line at escalate and at lapse (cause `unclaimed-handoff`, clock `grant`, evidence `grant-unclaimed-escalate` or
+  `grant-lapsed-unclaimed` plus `no-waiter`), once per incident key and phase.
 - **Runner stamp.** The granted receipt (never the grant object) records `runner: {protocol, checkout}` and `memory_gate`; the monitor reads
   it from the receipt that matches the grant time. The grant object stays exactly `{at, expires}`: a hand-off consumer validates it as a
   closed key set, and an earlier version of this change that put the stamp inside the grant made the HORO-2139 executor refuse the grant
