@@ -1724,7 +1724,11 @@ def _memory_precondition():
     except (OSError, subprocess.SubprocessError) as exc:
         return False, 'memory-gate-unavailable: %s' % exc
     lines = [line.strip() for line in done.stdout.splitlines() if line.strip()]
-    return done.returncode == 0, (lines[0] if lines else 'memory gate exit %d' % done.returncode)
+    if not lines:
+        return done.returncode == 0, 'memory gate exit %d' % done.returncode
+    # The first line is the verdict and metrics; the first `reason:` line says why (for example which exit limit a recovering latch fails).
+    reasons = [line[len('reason:'):].strip() for line in lines[1:] if line.startswith('reason:')]
+    return done.returncode == 0, (lines[0] + (' ; ' + reasons[0] if reasons else ''))[:400]
 
 
 def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_bytes, pid=None, now=None, token_fn=process_token,
