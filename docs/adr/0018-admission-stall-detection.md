@@ -31,22 +31,28 @@ Add `scripts/admission-monitor.py`: a stdlib-only, deterministic, single-shot `t
   **GRANTED never counts as execution.** A global stall is waiting work with no claim, release or CPU growth for 10 minutes.
 - **Causes**, first match is primary: `state-unreadable`, `disk-floor` (running work holds the space), `memory-pressure` (an ENTER predicate),
   `memory-hysteresis-static-compressor` (latched, ENTER passes, the compressor alone fails EXIT and was flat for 10 minutes),
-  `memory-hysteresis`, `stale-claim`, `failed-continuation` (a grant unclaimed for 45 minutes, a lapsed grant, or unclaimed grants whose
-  reservation breaks the floor), `outdated-caller` (a grant without the runner stamp of the current protocol).
+  `memory-hysteresis`, `stale-claim` (holder exited, claim unreleased), `frozen-queue` (waiting work, nothing blocks it, nothing is being granted),
+  `failed-continuation` (a grant unclaimed for 45 minutes, or unclaimed grants whose reservation breaks the floor), `outdated-caller`
+  (a grant without the runner stamp of the current protocol), `stalled-running` (a claimed workload whose CPU time has not changed for
+  15 minutes: reported, never touched) and `unobservable` (memory metrics unreadable). A grant that lapsed unclaimed is a note in the
+  status, not a trigger. Only `stale-claim`, `frozen-queue`, `failed-continuation` and the two hysteresis causes can start an advance.
 - **Runner stamp.** Each grant records `runner: {protocol, checkout}` and `memory_gate`. `RUNNER_PROTOCOL` is bumped when a runner gains
   behaviour another runner's grants cannot be trusted without.
 - **Recovery** has one verb: `disk-admission.py queue advance` from this checkout, only with `--act`, only after the same cause held for two
   ticks, never on `disk-floor`, `memory-pressure` or `state-unreadable`, at most one per 120 s and five per rolling 30 minutes, then
   `recovery-exhausted`. Advance already releases claims whose holder provably exited, expires lapsed grants and probes the memory gate, so
   the monitor also becomes a legitimate sampler of the recovery streak through the gate's own path.
-- **Never**: signal or kill a process, run `launchctl`, reset the latch, change a threshold, write disk or memory admission state, delete
+- **Never**: signal or kill a process (a slow advance is left to finish), run `launchctl`, reset the latch, change a threshold, write disk or
+  memory admission state from the monitor process itself (the advance it starts writes queue and disk state, and counts the memory
+  streak through the gate, under their own locks), delete
   anything, pass `--confirm-ended`, or present an entry's session id (an ownership attestation). A test enforces that shape. Redirected Cargo
   targets stay ask-only; on `disk-floor` the monitor reports and does not delete.
 - **Observation gaps.** It persists wall clock, monotonic clock and boot time. A reboot, a backward clock step, a gap over three intervals or
   wall minus monotonic over 60 s (sleep) marks a gap: confirmations reset and nothing is done until two later ticks agree. Corrupt state
   restarts observation. A non-blocking `flock` makes a second monitor exit. The queue files are the truth; the monitor's state is a cache.
 - **Escalation.** One alert per cause plus blocker signature, again only on change or after 6 hours, through an injected notifier (the
-  `session-notify` wiring is the next slice). The cause, the attempted recovery and one owner-action name are in the alert; ids and numbers
+  `session-notify` wiring is the next slice). An alert counts as sent only when the notifier reports delivery; an undelivered one is
+  retried with exponential backoff and shows in `status.json` as `last_alert`. The cause, the attempted recovery and one owner-action name are in the alert; ids and numbers
   stay in `status.json`.
 - **Caller inventory.** `callers` reads each checkout's `disk-admission.py` as text (protocol, stable lane cap, whether advance is memory
   gated) and never executes it or reads a process environment. Canonical path: `coding-agent-environment-main-view`, fast-forward only.
