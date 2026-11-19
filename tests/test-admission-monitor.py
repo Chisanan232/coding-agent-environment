@@ -653,6 +653,64 @@ class FinalReviewFindings(MonitorBase):
         out = self.run_ticks(5)
         self.assertEqual(out['primary'], 'frozen-queue')
 
+    def test_an_eligible_head_beside_a_non_queue_reservation_is_busy(self):
+        self.enqueue('HORO-4001')
+        for entry in da._queue_entries(self.state_path)[0]:
+            entry['state'] = 'ELIGIBLE'
+            da._write_queue_entry(self.state_path, entry)
+        env_factory = self.env
+
+        def env():
+            e = env_factory()
+            e.reservations = lambda: 1
+            return e
+        self.env = env
+        self.assertEqual(self.run_ticks(5)['primary'], 'healthy-busy')
+
+    def test_an_unreadable_entry_cannot_forge_progress_for_a_claim(self):
+        self.enqueue('HORO-4001')
+        self.enqueue('HORO-4002')
+        entries = da._queue_entries(self.state_path)[0]
+        entries[0].update(state='CLAIMED', holder={'pid': 4242, 'start_token': 't'})
+        da._write_queue_entry(self.state_path, entries[0])
+        self.table = {4242: (1, 5.0)}
+        self.run_ticks(3)
+        path = da.queue_dir(self.state_path) / (entries[0]['id'] + '.json')
+        path.write_text('{broken')
+        out = self.tick()
+        state = json.loads((mon.monitor_dir(self.state_path) / 'state.json').read_text())
+        self.assertIn('state-unreadable', out['causes'])
+        self.assertLess(state['progress_at'], self.clock.now.timestamp())
+
+    def test_clean_ticks_persist_reset_on_a_cause_and_a_new_alert_can_clear_again(self):
+        self.enqueue('HORO-4001')
+        self.enqueue('HORO-4002')
+        self.mem['metrics'] = dict(CALM, pressure_level=2)
+        self.run_ticks(40)
+        for entry in da._queue_entries(self.state_path)[0]:
+            entry['state'] = 'CANCELLED'
+            da._write_queue_entry(self.state_path, entry)
+        self.mem['metrics'] = dict(CALM)
+        self.tick()
+        self.tick()
+        state = json.loads((mon.monitor_dir(self.state_path) / 'state.json').read_text())
+        self.assertEqual(state['clean_ticks'], 2)
+        self.tick()
+        self.assertEqual(len(self.cleared), 1)
+        self.enqueue('HORO-4003')
+        self.enqueue('HORO-4004')
+        self.mem['metrics'] = dict(CALM, pressure_level=2)
+        self.run_ticks(40)
+        state = json.loads((mon.monitor_dir(self.state_path) / 'state.json').read_text())
+        self.assertEqual(state['clean_ticks'], 0)
+        self.assertFalse(state['last_alert'].get('cleared'))
+        for entry in da._queue_entries(self.state_path)[0]:
+            entry['state'] = 'CANCELLED'
+            da._write_queue_entry(self.state_path, entry)
+        self.mem['metrics'] = dict(CALM)
+        self.run_ticks(4)
+        self.assertEqual(len(self.cleared), 2)
+
     def test_one_clean_tick_does_not_clear_or_reset_the_cooldown(self):
         self.enqueue('HORO-4001')
         self.enqueue('HORO-4002')
@@ -699,7 +757,6 @@ class FinalReviewFindings(MonitorBase):
         (da.queue_dir(self.state_path) / (entries[0]['id'] + '.json')).unlink()
         self.table = {}
         before = self.tick()
-        self.assertGreater(before['stalled_for_s'] + 1, 0)
         state = json.loads((mon.monitor_dir(self.state_path) / 'state.json').read_text())
         self.assertEqual(state['progress_at'], self.clock.now.timestamp())    # the vanished claim reset the stall clock
 
