@@ -28,8 +28,8 @@ exactly 1; swap I/O at most 1.0 MiB/s; load per core at most 2.0; compressor rea
 
 **P2 run and release:**
 - A counted sample is an eligible reading at least 60 s after the previous counted sample (at most once per 60 s whatever the number of callers).
-- Release needs all of: 10 counted samples; (last sample time minus first sample time) at least 540 s, taken from recorded times, so a
-  forged or truncated list cannot shortcut it; and (maximum minus minimum compressor ratio) at most 0.005 across the run.
+- Release needs all of: 10 counted samples; (last sample time minus first sample time) at least 540 s, taken from recorded times (appends are already
+  spaced, so this mainly guards against hand-edited state; a writer of the state file can always write `latched: false` directly); and (maximum minus minimum compressor ratio) at most 0.005 across the run.
 - A run is discarded when the next eligible reading arrives more than 300 s after the last counted one (exactly 300 s still counts).
   Consequence: the poller cadence must be between 60 s and 300 s; a poller slower than 300 s can never release.
 - Release clears the latch only. The next check is the ordinary ENTER decision, so lane 1 admits as a fresh gate would, and a second lane
@@ -69,6 +69,9 @@ accepted ENTER 35% for a fresh gate; a release returns exactly there. If the fir
 again immediately.
 
 ## Options for recovering the current latch (available options, estimated outcomes)
+
+Figures below were measured by the author on 2026-11-19 on this host and are not backed by repository evidence; the 10 to 12 minute estimate
+follows from the code (540 s of recorded dwell plus polling and sampling lag).
 
 1. **Deploy P2** (this change). Estimated: released about 10 to 12 minutes after the first polling caller runs on the new code, if the host
    stays calm (it has been: pressure 1, swap 0, load below 1). Needs a merged change in the canonical checkout.
