@@ -5,7 +5,10 @@ One `tick` reads the queue, the disk and memory gates' state and the process tab
 stalled, names the cause, and (only with --act) runs the one recovery verb it owns: `disk-admission.py queue advance` from this
 checkout. It needs no conversation and makes no model call.
 
-It never signals a process, resets the memory latch, changes a threshold, writes disk/memory admission state itself, deletes
+With --act it also owns two guarded recoveries (ADR 0019, scripts/admission-recovery.py): cancel a conclusively abandoned, unstarted GRANTED entry
+through the scheduler's own `queue cancel`, and SIGTERM (once, never a harder signal) a conclusively obsolete heavy-run / la-cargo wrapper whose queue entry is
+terminal. Both are bounded (1 per tick, 3 per 30 min), off while `recovery.disabled` exists in the monitor directory, and never in observe-only mode.
+It never signals anything else, resets the memory latch, changes a threshold, writes disk/memory admission state itself, deletes
 anything, or presents an entry's session id (only `resolve_owner` reads it; no notice or outbox line carries it). GRANTED is never execution: only a claim, a release or CPU growth of a claimed
 workload counts as progress. Memory-policy changes are a separate, owner-decided proposal (docs/adr/0018, option P1/P2).
 
@@ -26,6 +29,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -75,6 +79,20 @@ STATIC_WINDOW_S = 600         # compressor must have been flat this long to be c
 STATIC_SPAN = 0.01            # ...within one percentage point of RAM
 WINDOW_MAX = 16
 STATE_LIMIT = 65536
+RECOVERY_KILL_SWITCH = 'recovery.disabled'   # a file of any kind in the monitor directory turns act-mode recovery into a no-op
+RECOVERY_MAX_PER_WINDOW = 3
+RECOVERY_WINDOW_S = 1800
+RECOVERY_CONFIRM_S = 120      # a terminal entry must have had a live registered wrapper this long (two ticks): a wrapper that is just exiting is never signalled
+RECOVERY_GRACE_S = 10.0       # bounded wait after the one SIGTERM
+RECOVERY_POLL_S = 1.0
+RECOVERY_LIMIT = 16           # recovery incidents kept in the state file
+RECOVERY_KEEP_S = 24 * 3600
+RECOVERY_REGISTRY_MAX = 64
+RECOVERY_OUTCOMES = ('terminated', 'failed-to-terminate', 'cancelled', 'failed')
+RECOVERY_NOTICE = {'terminated': ('obsolete-wrapper-terminated', 'wrapper-terminated'), 'cancelled': ('abandoned-unstarted-cancelled', 'grant-cancelled'),
+                   'failed-to-terminate': ('failed-to-terminate', 'termination-failed')}
+RECOVERY_EVIDENCE = {'terminated': ['wrapper-registered', 'entry-terminal'], 'failed-to-terminate': ['wrapper-registered', 'entry-terminal'],
+                     'cancelled': ['grant-unclaimed-escalate', 'owner-gone']}
 CAUSES = ('state-unreadable', 'disk-floor', 'memory-pressure', 'memory-hysteresis-static-compressor', 'memory-hysteresis',
           'stale-claim', 'frozen-queue', 'unclaimed-handoff', 'failed-continuation', 'outdated-caller', 'stalled-running', 'unobservable', 'healthy-busy', 'unknown')
 # Causes of the per-entry wait and execution incidents. They are never part of a verdict (they cannot make the queue "stalled" or start an advance).
@@ -87,13 +105,15 @@ OWNER_KINDS = ('claude', 'codex', 'heavy-run', 'la-cargo', 'unknown')
 OWNER_EVIDENCE = ('no-session-id', 'session-live', 'session-ended', 'session-unknown', 'process-alive', 'process-gone', 'process-uninspectable')
 SUPPRESSED = 'suppressed-higher-entry'
 EVIDENCE = OWNER_EVIDENCE + ('grant-unclaimed-escalate', 'grant-lapsed-unclaimed', 'no-waiter', 'queued-over-escalate', 'queued-expiry-near', 'blocked-by-global-cause', 'behind-running-entry', 'holder-alive',
-                             'over-deadline', 'deadline-declared', 'deadline-default')
+                             'over-deadline', 'deadline-declared', 'deadline-default', 'wrapper-registered', 'entry-terminal', 'owner-gone')
 OWNER_ACTION = {'disk-floor': 'reclaim-disk', 'memory-pressure': 'reduce-load', 'memory-hysteresis-static-compressor': 'approve-memory-policy',
                 'memory-hysteresis': 'wait-or-approve-memory-policy', 'stale-claim': 'confirm-claim-ended',
                 'failed-continuation': 'restart-waiting-session', 'outdated-caller': 'restart-outdated-caller',
                 'state-unreadable': 'inspect-admission-state', 'unknown': 'inspect-admission-state',
                 'frozen-queue': 'run-queue-advance', 'unclaimed-handoff': 'claim-or-reenqueue-handoff', 'stalled-running': 'inspect-running-workload', 'unobservable': 'inspect-memory-admission',
-                'queue-wait-excessive': 'check-queued-wait', 'workload-over-deadline': 'check-over-deadline-workload'}
+                'queue-wait-excessive': 'check-queued-wait', 'workload-over-deadline': 'check-over-deadline-workload',
+                'obsolete-wrapper-terminated': 'check-recovery-result', 'abandoned-unstarted-cancelled': 'check-recovery-result',
+                'failed-to-terminate': 'inspect-stuck-wrapper'}
 
 
 def load(name):
@@ -614,6 +634,29 @@ def clean_incident(rec):
             'waiter': False, 'action': 'none', 'verify': verify}
 
 
+def clean_recovery(rec):
+    """A well-typed copy of a stored recovery incident (a terminated wrapper or a cancelled grant), or None when its identity fields are damaged."""
+    if not (isinstance(rec, dict) and rec.get('kind') in ('wrapper', 'grant') and isinstance(rec.get('id'), str) and len(rec['id']) <= 16
+            and finite(rec.get('at')) and rec.get('outcome') in RECOVERY_OUTCOMES):
+        return None
+
+    def count(key, high=10 ** 9):
+        value = rec.get(key)
+        return value if type(value) is int and 0 <= value < high else None
+
+    def number(key):
+        return float(rec[key]) if finite(rec.get(key)) else None
+    token, cancelled = rec.get('token'), rec.get('cancelled_at')
+    return {'kind': rec['kind'], 'id': rec['id'], 'at': float(rec['at']), 'outcome': rec['outcome'], 'pid': count('pid', 2 ** 31),
+            'token': token if isinstance(token, str) and len(token) <= 64 else None,
+            'cancelled_at': cancelled if isinstance(cancelled, str) and len(cancelled) <= 32 and safe_time(cancelled) is not None else None,
+            'verify': rec['verify'] if rec.get('verify') in ('pending', 'verified', 'failed') else None, 'verified_at': number('verified_at'),
+            'next': rec['next'] if isinstance(rec.get('next'), str) and len(rec['next']) <= 16 else None,
+            'attempts': count('attempts', 1000) or 0, 'next_try': number('next_try') or 0.0, 'handed': rec.get('handed') is True,
+            'delivered_at': number('delivered_at'), 'delivery': rec['delivery'] if rec.get('delivery') in ('sent', 'pending', 'dropped', 'unknown', 'unconfirmed') else None,
+            'dedups': count('dedups', 1000) or 0, 'outbox': rec.get('outbox') is True}
+
+
 def bound_incidents(incidents):
     """At most INCIDENT_HARD_LIMIT kept: closed (acknowledged or resolved) incidents go first, oldest first; an open incident is never evicted."""
     excess = len(incidents) - INCIDENT_HARD_LIMIT
@@ -651,7 +694,13 @@ def sanitize_state(state):
                  if c} if isinstance(incidents, dict) else {}
     gaps = [[float(g[0]), float(g[1]), float(g[2])] for g in (state.get('gaps') if isinstance(state.get('gaps'), list) else [])
             if isinstance(g, list) and len(g) == 3 and all(finite(x) for x in g) and 0 <= g[2] <= GAP_MAX_S and g[0] <= g[1]][-GAP_LEDGER_MAX:]
-    return dict(schema=1, gaps=gaps, incidents=bound_incidents(incidents), last_tick=last, blocker=blocker, alerts=alerts, cpu=cpu, states=states, window=window,
+    log = nums(state.get('recovery_log'), 64)
+    candidates = state.get('candidates')
+    candidates = dict(sorted(((k, float(v)) for k, v in candidates.items() if isinstance(k, str) and len(k) <= 64 and finite(v)), key=lambda kv: kv[1])[:RECOVERY_LIMIT]
+                      ) if isinstance(candidates, dict) else {}
+    recoveries = state.get('recoveries')
+    recoveries = {k: c for k, c in ((k, clean_recovery(v)) for k, v in recoveries.items() if isinstance(k, str) and len(k) <= 64) if c} if isinstance(recoveries, dict) else {}
+    return dict(schema=1, gaps=gaps, incidents=bound_incidents(incidents), recovery_log=log, candidates=candidates, recoveries=recoveries, last_tick=last, blocker=blocker, alerts=alerts, cpu=cpu, states=states, window=window,
                 advances=nums(state.get('advances'), 64), progress_at=progress if finite(progress) else None,
                 last_alert=state.get('last_alert') if isinstance(state.get('last_alert'), dict) and finite(state['last_alert'].get('clear_next', 0))
                 and type(state['last_alert'].get('clear_tries', 0)) is int else None,
@@ -665,7 +714,7 @@ class Env:
 
     def __init__(self, da, state_path, memory_state_path, limits, clock=None, mono=None, boot=None, table=None, memory=None,
                  free=None, advance=None, notify=None, clear=None, reservations=None, stamps=None, events=None, emit_incident=None,
-                 owner_sessions=None, owner_process=None, owner_launcher=None):
+                 owner_sessions=None, owner_process=None, owner_launcher=None, recovery_env=None):
         self.da, self.state_path, self.memory_state_path, self.limits = da, Path(state_path), Path(memory_state_path), limits
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.mono = mono or time.monotonic
@@ -681,6 +730,7 @@ class Env:
         self.owner_sessions = owner_sessions or (lambda: {})      # local session records: none are read yet, so the harness field decides the kind
         self.owner_process = owner_process or self._owner_process
         self.owner_launcher = owner_launcher or (lambda session: None)      # launcher metadata is not readable here: uninspectable, never gone
+        self.recovery_env = recovery_env or self._recovery_env
         self.notify = notify or session_notify
         self.clear = clear or session_clear
 
@@ -697,6 +747,32 @@ class Env:
             return resolve_owner(entry, self.owner_sessions(), self.owner_process, self.owner_launcher)
         except Exception:
             return resolve_owner({}, {})
+
+    def _recovery_env(self, directory):
+        """The real bindings of the recovery library, built only when a candidate exists. Every answer that cannot be inspected is unknown or
+        `holds`, which the library turns into a refusal."""
+        lib = recovery_lib()
+        renv = lib.default_env(self.state_path, directory)
+        registry, uid = lib.wrappers_dir(self.state_path), renv.uid
+        renv.registered_fn = lambda qid: lib.read_registry(qid, registry, uid, token_fn=renv.token_fn)
+        renv.exe_fn = lib.exe_identity
+        renv.holds_workload_fn = lambda pid: holds_workload(renv.table_fn, pid)
+        renv.owner_exec_fn = self.owner_exec
+        renv.kill_fn = sigterm_only
+        renv.sleep_fn = time.sleep
+        return renv
+
+    def owner_exec(self, entry):
+        """'gone' | 'live' | 'unknown' for the entry's owner. A declared waiter is the executor: its own process answers. A hand-off entry has no waiter, so
+        only a session record that says the owning session ended can prove it gone (none is read yet: such an entry stays unknown)."""
+        waiter = entry.get('waiter')
+        if isinstance(waiter, dict) and type(waiter.get('pid')) is int and isinstance(waiter.get('start_token'), str):
+            try:
+                token = self.da.waiter_token(waiter['pid'])
+            except Exception:
+                return 'unknown'
+            return 'gone' if token is None or token != waiter['start_token'] else 'live'
+        return {True: 'live', False: 'gone'}.get(self.owner(entry)['reachable'], 'unknown')
 
     def _reservations(self):
         """Number of reservation files (lane holders outside the queue too); read-only, 0 when unreadable."""
@@ -753,9 +829,60 @@ class Env:
         return {'exit': proc.returncode, 'out': (out or '')[-400:]}
 
 
+_RECOVERY = None
+
+
+def recovery_lib():
+    global _RECOVERY
+    if _RECOVERY is None:
+        _RECOVERY = load('admission-recovery')
+    return _RECOVERY
+
+
+def sigterm_only(pid, sig):
+    """The only signal path of the monitor: one SIGTERM to one positive pid. Any other signal, process groups and pid 0/1 are refused here as well as in the library."""
+    if sig != signal.SIGTERM or type(pid) is not int or pid <= 1:
+        raise OSError('only SIGTERM to one process is allowed')
+    os.kill(pid, sig)
+
+
+def holds_workload(table_fn, pid, lsof=None):
+    """True when the wrapper may be holding a workload: any other live process in its group or below it, an open cargo lock, or anything
+    that could not be inspected (uncertain is True). False only when the table and the open-file list were both read and show neither."""
+    try:
+        table = table_fn()
+        row = table[pid]
+    except Exception:
+        return True
+    below, frontier = set(), [pid]
+    while frontier:
+        parent = frontier.pop()
+        for other, r in table.items():
+            if r[0] == parent and other not in below and other != pid:
+                below.add(other)
+                frontier.append(other)
+    if any(other != pid and 'Z' not in r[2] and (r[1] == row[1] or other in below) for other, r in table.items()):
+        return True
+    try:
+        if lsof is not None:
+            out = lsof(pid)
+        else:
+            done = subprocess.run(['/usr/sbin/lsof', '-nP', '-Fn', '-p', str(pid)], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+            out = done.stdout if done.returncode == 0 else ''
+    except Exception:
+        return True
+    names = [line[1:] for line in (out or '').splitlines() if line.startswith('n')]
+    if not names:
+        return True
+    return any(os.path.basename(n) in ('.cargo-lock', '.package-cache') for n in names)
+
+
 def recovery_phrase(actions, exhausted):
     if exhausted:
         return 'recovery-exhausted'
+    for action in actions:
+        if action.get('recovery') in ('wrapper-terminated', 'grant-cancelled', 'termination-failed'):
+            return action['recovery']
     if any(a.get('handoff') == 'lapsed' for a in actions):
         return 'lapsed'
     if any(a.get('wait') == 'expiry-near' for a in actions):
@@ -972,6 +1099,9 @@ def _tick_locked(env, directory, act, if_due):
         state['last_alert'] = {'at': iso(now), 'cause': verdict['primary'], 'signature': sig, 'delivered': delivered, 'attempts': attempts}
         result['alert'] = dict(alert, delivered=delivered)
     handoff_incidents(env, state, verdict, entries, now, wall, result, gap and not fresh_start, claims=claims, directory=directory)
+    if act:
+        recovery_pass(env, state, entries, now, wall, gap, directory, result,
+                      lambda: persist(directory, state, cpu_now, states_now, window, blocker, progress_at, wall, mono, boot))
     state['clean_ticks'] = 0 if verdict['causes'] or gap else state.get('clean_ticks', 0) + 1
     last_alert = state.get('last_alert')
     # A clear bumps session-notify's cycle and forgets its dedup records: never while an incident's notice is still being handed off or polled.
@@ -999,6 +1129,189 @@ def _tick_locked(env, directory, act, if_due):
         handle.write(json.dumps({k: result[k] for k in ('at', 'primary', 'waiting', 'stalled', 'confirmed', 'actions', 'observation_gap')},
                                 sort_keys=True) + '\n')
     return result
+
+
+def kill_switch_on(directory):
+    """True when `recovery.disabled` exists (any file type) or cannot be examined: an unreadable switch is treated as pulled."""
+    try:
+        os.lstat(str(directory / RECOVERY_KILL_SWITCH))
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def recovery_key(kind, qid, *identity):
+    return '%s-%s' % (kind, hashlib.sha256(':'.join((kind, qid) + tuple(str(x) for x in identity)).encode()).hexdigest()[:12])
+
+
+def recovery_allowed(state, wall):
+    """At most RECOVERY_MAX_PER_WINDOW actions in a rolling window; the one-per-tick limit is the caller's. A clock step back never frees a slot."""
+    log = [t for t in state['recovery_log'] if wall - t < RECOVERY_WINDOW_S]
+    return len(log) < RECOVERY_MAX_PER_WINDOW
+
+
+def new_recovery(kind, qid, wall, outcome, pid=None, token=None, cancelled_at=None):
+    return {'kind': kind, 'id': qid, 'at': wall, 'outcome': outcome, 'pid': pid, 'token': token, 'cancelled_at': cancelled_at, 'verify': None,
+            'verified_at': None, 'next': None, 'attempts': 0, 'next_try': 0.0, 'handed': False, 'delivered_at': None, 'delivery': None, 'dedups': 0,
+            'outbox': False}
+
+
+def recovery_pass(env, state, entries, now, wall, gap, directory, result, save):
+    """Act-mode recovery (ADR 0019). Never called by observe-only or plain ticks. Order: verify earlier recoveries, then at most ONE new action
+    (terminate a conclusively obsolete wrapper, else cancel a conclusively abandoned unstarted grant), then notices. The bound is recorded and persisted
+    BEFORE the action, so a crash or timeout still counts. Everything uncertain is a refusal that the library reports; a survivor is reported, never escalated."""
+    info = result['recovery'] = {'state': 'ok', 'acted': [], 'reported': [], 'verified': []}
+    if kill_switch_on(directory):
+        info['state'] = 'disabled'
+        return
+    lib = recovery_lib()
+    try:
+        lib.safe_monitor_dir(lib.Env(directory))
+    except lib.UnsafeDir:
+        info['state'] = 'unsafe-monitor-dir'
+        return
+    by_id, recs = {e['id']: e for e in entries}, state['recoveries']
+    holder = []
+
+    def get_env():
+        if not holder:
+            holder.append(env.recovery_env(directory))
+        return holder[0]
+
+    for key, rec in sorted(recs.items(), key=lambda kv: kv[1]['at']):
+        if rec['outcome'] not in ('terminated', 'cancelled') or rec['verify'] in ('verified', 'failed') or wall <= rec['at']:
+            continue      # verified on a LATER tick, exactly once to a final state
+        checked = lib.verify_recovery(rec['id'], get_env(), cancelled_at=rec['cancelled_at'])
+        rec['verify'] = checked['state']
+        rec['next'] = str(checked['checks'].get('next_entry'))[:16] if checked['checks'].get('next_entry') else rec['next']
+        if checked['state'] != 'pending':
+            rec['verified_at'] = wall
+        info['verified'].append({'id': rec['id'], 'kind': rec['kind'], 'state': checked['state']})
+    acted = False
+
+    def spend():
+        state['recovery_log'] = [t for t in state['recovery_log'] if wall - t < RECOVERY_WINDOW_S] + [wall]
+        save()
+
+    wdir = lib.wrappers_dir(env.state_path)
+    seen = {}
+    registered = []
+    for qid in lib.list_registered(wdir)[:RECOVERY_REGISTRY_MAX]:
+        entry = by_id.get(qid)
+        if entry is None or entry['state'] not in lib.TERMINAL:
+            continue
+        reg = get_env().registered_fn(qid)
+        if not reg:
+            continue
+        ckey = recovery_key('wrapper', qid, reg['pid'], reg['start_token'])
+        seen[ckey] = state['candidates'].get(ckey, wall)
+        registered.append((qid, reg, ckey))
+    state['candidates'] = dict(sorted(seen.items(), key=lambda kv: kv[1])[:RECOVERY_LIMIT])
+    for qid, reg, ckey in registered:
+        if gap or acted or ckey in recs or wall - state['candidates'].get(ckey, wall) < RECOVERY_CONFIRM_S:
+            continue
+        verdict = lib.obsolete_wrapper(qid, reg['pid'], get_env())
+        if not verdict['obsolete']:
+            info['reported'].append({'id': qid, 'kind': 'wrapper', 'refused': verdict['reasons'], 'children': len(verdict['children']), 'detached': len(verdict['detached'])})
+            continue
+        if not recovery_allowed(state, wall):
+            info['state'] = 'recovery-bound'
+            continue
+        spend()
+        acted = True
+        out = lib.terminate_wrapper(qid, reg['pid'], get_env(), grace_s=RECOVERY_GRACE_S, poll_s=RECOVERY_POLL_S)
+        if out['result'] in ('terminated', 'failed-to-terminate'):
+            recs[ckey] = new_recovery('wrapper', qid, wall, out['result'], reg['pid'], reg['start_token'], iso(now))
+            info['acted'].append({'id': qid, 'action': 'wrapper', 'result': out['result']})
+        else:
+            info['reported'].append({'id': qid, 'kind': 'wrapper', 'refused': [out['result']]})
+        save()
+    for entry in entries:
+        if gap or acted or entry['state'] != 'GRANTED' or entry.get('holder'):
+            continue
+        age = (now - safe_time(entry['grant']['at'])).total_seconds()
+        ckey = recovery_key('grant', entry['id'], entry['grant']['at'])
+        if age <= lib.NOTICE_S or ckey in recs:
+            continue
+        if lib.abandoned_unstarted(entry, get_env())['action'] == 'none':   # the library's only other decision is a conclusive cancel
+            continue
+        if not recovery_allowed(state, wall):
+            info['state'] = 'recovery-bound'
+            continue
+        spend()
+        acted = True
+        out = lib.do_cancel(entry, get_env())
+        if out['result'] in ('cancelled', 'failed'):
+            recs[ckey] = new_recovery('grant', entry['id'], wall, out['result'], cancelled_at=(out['receipt'] or {}).get('cancelled_at') or iso(now))
+            info['acted'].append({'id': entry['id'], 'action': 'grant', 'result': out['result']})
+        else:
+            info['reported'].append({'id': entry['id'], 'kind': 'grant', 'refused': [out['result']]})
+        save()
+    for item in info['acted']:
+        result['actions'].append({'recovery_action': '%s-%s' % (item['action'], item['result'])})
+    recovery_notices(env, recs, by_id, now, wall, directory)
+    state['recoveries'] = prune_recoveries(recs, wall)
+    info['pending_verification'] = sum(1 for r in state['recoveries'].values() if r['outcome'] in ('terminated', 'cancelled') and r['verify'] in (None, 'pending'))
+    result['recovery_incidents'] = [{'id': r['id'], 'kind': r['kind'], 'outcome': r['outcome'], 'verify': r['verify'], 'delivery': r['delivery'],
+                                     'delivered': r['delivered_at'] is not None} for r in state['recoveries'].values()]
+
+
+def recovery_settled(rec):
+    return rec['outcome'] not in RECOVERY_NOTICE or rec['delivered_at'] is not None or rec['delivery'] in ('unknown', 'dropped', 'unconfirmed') or rec['dedups'] >= UNVERIFIED_AFTER_DEDUPS
+
+
+def prune_recoveries(recs, wall):
+    """Finished (verified or failed, notice settled) incidents older than a day go first; never an open one for the soft limit."""
+    def done(r):
+        return r['verify'] in ('verified', 'failed') or r['outcome'] in ('failed-to-terminate', 'failed')
+    kept = {k: r for k, r in recs.items() if not (done(r) and recovery_settled(r) and wall - r['at'] > RECOVERY_KEEP_S)}
+    for key, rec in sorted(kept.items(), key=lambda kv: kv[1]['at']):
+        if len(kept) <= RECOVERY_LIMIT:
+            break
+        if done(rec) and recovery_settled(rec):
+            del kept[key]
+    return kept
+
+
+def recovery_notices(env, recs, by_id, now, wall, directory):
+    """One owner-outbox line and one strict session-notify request per recovery (enum phrases only), deduped by entry id, pid and start token (the key)."""
+    for key, rec in sorted(recs.items(), key=lambda kv: kv[1]['at']):
+        if rec['outcome'] not in RECOVERY_NOTICE or recovery_settled(rec) or wall < rec['next_try']:
+            continue
+        cause, phrase = RECOVERY_NOTICE[rec['outcome']]
+        if not rec['outbox']:
+            entry = by_id.get(rec['id'])
+            owner = env.owner(entry) if entry else {'kind': 'unknown', 'reachable': None, 'evidence': []}
+            line = {'v': 1, 'at': iso(now), 'key': key, 'job': rec['id'], 'clock': 'recovery', 'phase': rec['outcome'], 'cause': cause, 'blocker': 'none',
+                    'evidence': [x for x in EVIDENCE if x in RECOVERY_EVIDENCE[rec['outcome']]], 'owner_action': OWNER_ACTION[cause], 'recovery': phrase,
+                    'owner': {'kind': owner['kind'], 'reachable': owner['reachable']}}
+            try:
+                if not outbox_has(directory, key, rec['outcome']):
+                    outbox_append(directory, line)
+                rec['outbox'] = True
+            except OSError:
+                pass
+        alert = {'cause': cause, 'causes': [cause], 'signature': incident_signature(key, rec['outcome']), 'detail': {'phase': rec['outcome']},
+                 'recovery': [{'recovery': phrase}], 'owner_action': OWNER_ACTION[cause], 'blocked_for_s': int(max(0, wall - rec['at']))}
+        try:
+            outcome = env.emit_incident(alert)
+        except Exception:
+            outcome = {}
+        rec['attempts'] += 1
+        if outcome.get('result') == 'queued':
+            rec['handed'] = True
+        elif outcome.get('result') == 'deduped' and not rec['handed']:
+            rec['dedups'] += 1      # an earlier call (a crash before the state was saved, another monitor) queued it; stop asking after a few
+        if outcome.get('result') in ('queued', 'deduped'):
+            rec['delivery'] = outcome.get('delivery')
+            if outcome.get('delivery') == 'sent':
+                rec['delivered_at'] = wall
+            elif outcome.get('delivery') == 'pending' and rec['attempts'] >= 20:
+                rec['delivery'] = 'unconfirmed'
+        if not recovery_settled(rec):
+            rec['next_try'] = wall + min(60 * 2 ** (min(rec['attempts'], 10) - 1), 900)
 
 
 def incident_settled(rec):
@@ -1272,7 +1585,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     sub = parser.add_subparsers(dest='cmd', required=True)
     t = sub.add_parser('tick')
-    t.add_argument('--act', action='store_true', help='run the bounded advance recovery (default: observe only)')
+    t.add_argument('--act', action='store_true', help='run the bounded recoveries: queue advance, abandoned-grant cancel, obsolete-wrapper SIGTERM (default: observe only)')
     t.add_argument('--if-due', action='store_true')
     t.add_argument('--json', action='store_true')
     s = sub.add_parser('status')
