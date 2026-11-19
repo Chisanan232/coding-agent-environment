@@ -558,6 +558,82 @@ class ConcurrentPolling(unittest.TestCase):
         self.assertEqual((state["ok_streak"], state["p2_hist"]), (0, []))
 
 
+class P2Sidecar(unittest.TestCase):
+    """The P2 run lives in a sidecar so a checkout without P2 (which rewrites the latch file with four keys) cannot erase it."""
+
+    def setUp(self):
+        self.d = pathlib.Path(tempfile.mkdtemp(prefix="ma-side-"))
+        self.addCleanup(__import__("shutil").rmtree, self.d, True)
+        self.state = str(self.d / "state.json")
+
+    def calm(self, c=0.26):
+        return metrics(level=1, io=0.0, compressor=c, load=2.0)
+
+    def step(self, st, now):
+        v, st = ma.decide("heavy", self.calm(), st, now)
+        ma.save_state(self.state, st)
+        loaded, problem = ma.load_state(self.state)
+        self.assertIsNone(problem)
+        return v, loaded
+
+    def old_writer(self):
+        """What a checkout without P2 does on every check: rewrite the latch file with exactly its four keys."""
+        cur, _ = ma.load_state(self.state)
+        pathlib.Path(self.state).write_text(json.dumps({k: cur[k] for k in ("latched", "ok_streak", "last_ok", "levels")}))
+
+    def test_the_latch_file_keeps_its_four_keys_and_the_run_goes_to_the_sidecar(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        _, st = self.step(st, 100.0)
+        self.assertEqual(sorted(json.loads(pathlib.Path(self.state).read_text())), ["last_ok", "latched", "levels", "ok_streak"])
+        self.assertEqual(sorted(json.loads(ma.p2_path(self.state).read_text())), ["p2_first", "p2_hist", "p2_last"])
+
+    def test_an_old_checkout_rewriting_the_latch_file_does_not_erase_the_run(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        now = 100.0
+        for i in range(ma.P2_SAMPLES):
+            if i % 2:
+                self.old_writer()                  # an outdated caller checks in between every new-code check
+            v, st = self.step(st, now)
+            now += 60
+        self.assertTrue(v["admit"], v)
+        self.assertFalse(st["latched"])
+
+    def test_without_the_sidecar_nothing_can_release(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        ma.save_state(self.state, st)
+        now = 100.0
+        for _ in range(ma.P2_SAMPLES + 2):
+            ma.p2_path(self.state).unlink(missing_ok=True)     # the run is lost every time: P2 only ever sees one sample
+            v, st = self.step(ma.load_state(self.state)[0], now)
+            now += 60
+        self.assertTrue(st["latched"])
+
+    def test_a_corrupt_oversized_or_symlinked_sidecar_is_ignored_and_never_releases(self):
+        _, st = ma.decide("heavy", metrics(level=4), None, 0.0)
+        ma.save_state(self.state, st)
+        for payload in ("{broken", "x" * 5000, json.dumps({"p2_hist": [0.26] * 10, "p2_last": 1e400 if False else 10 ** 400, "p2_first": 0})):
+            ma.p2_path(self.state).write_text(payload)
+            loaded, problem = ma.load_state(self.state)
+            self.assertIsNone(problem)
+            v, loaded = ma.decide("heavy", self.calm(), loaded, 1000.0)
+            self.assertTrue(loaded["latched"])
+        ma.p2_path(self.state).unlink()
+        target = self.d / "target.json"
+        target.write_text(json.dumps({"p2_hist": [0.26] * 10, "p2_last": 940.0, "p2_first": 400.0}))
+        ma.p2_path(self.state).symlink_to(target)
+        loaded, problem = ma.load_state(self.state)
+        self.assertNotIn("p2_hist", loaded)         # O_NOFOLLOW: a symlinked sidecar is not read
+
+    def test_a_file_written_by_the_previous_layout_still_loads_and_migrates(self):
+        pathlib.Path(self.state).write_text(json.dumps({"latched": True, "ok_streak": 0, "last_ok": 0.0, "levels": [1],
+                                                        "p2_hist": [0.26], "p2_last": 100.0, "p2_first": 100.0}))
+        loaded, problem = ma.load_state(self.state)
+        self.assertIsNone(problem)
+        self.assertEqual(loaded["p2_hist"], [0.26])
+        ma.save_state(self.state, loaded)
+        self.assertNotIn("p2_hist", json.loads(pathlib.Path(self.state).read_text()))
+
+
 class StateFile(unittest.TestCase):
     def setUp(self):
         self.d = pathlib.Path(tempfile.mkdtemp(prefix="ma-test-"))

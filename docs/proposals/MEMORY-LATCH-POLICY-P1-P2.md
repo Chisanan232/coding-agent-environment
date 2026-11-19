@@ -41,6 +41,16 @@ a 120 s poll. Measurement can lag the recorded time by up to the 10 s sampling w
 **P1 (off by default):** only a non-lane reason arms the latch (a lane reason is a refusal whose text contains "heavy lanes full" or starts
 "a second heavy lane needs"). A lane reason still refuses that check and does nothing to the latch. A mixed check latches.
 
+## Where the run is stored (sidecar)
+
+The P2 run (`p2_hist`, `p2_last`, `p2_first`) lives in `<latch file>.p2`, beside the latch file and written under the same state lock.
+Reason, measured on 2026-11-19 right after P2 was deployed: a checkout without P2 (an old feature worktree used by another session's
+poller) rewrites the latch file with its four keys on every check, which erased a run stored inside it, so the counter restarted at one
+sample each time. With the sidecar an old caller's check cannot touch the run. A missing, corrupt, oversized, symlinked or hostile sidecar
+is ignored (no run, so no release); a latch file written by the first P2 layout (keys inside) still loads and migrates on its next save.
+The predicates, spacing, dwell and thresholds are unchanged. Residual: a check by an old caller does not clear the run when it sees a busy
+lane, so a busy period is caught by the maintained pollers' own checks (they run every 15 s while a waiter exists), not by the old one.
+
 ## Worse conditions
 
 - Any ENTER violation (pressure 2 or more, swap I/O 16 MiB/s or more, compressor 35% or more, load 4.0 or more, unreadable input) latches at
