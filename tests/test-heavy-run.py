@@ -10,10 +10,12 @@ import contextlib
 import io
 import json
 import os
+import signal
 import stat
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -321,7 +323,7 @@ class Registry(Wrapper):
 
                 def exec_module(self, module):
                     inner.exec_module(module)
-                    module.exe_identity = lambda pid, run=None: identity
+                    module.exe_identity = lambda pid, run=None, timeout=5: identity
             spec.loader = Loader()
             return spec
         patchers = [unittest.mock.patch.object(hr, 'RECOVERY_LIB', path), unittest.mock.patch.object(hr, 'spec_from_file_location', fake)]
@@ -391,6 +393,65 @@ class Registry(Wrapper):
         with self.assertRaises(SystemExit):
             self.invoke()
         self.assertEqual(self.left(), [])
+
+    def signal_during_registration(self, signum):
+        """A signal that arrives while the registry is being written (an injected slow register): the wrapper's handlers raise as in production."""
+        self.mode('queue')
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+            signal.signal(sig, hr._terminate)
+
+        def slow_register(qid, kind):
+            os.kill(os.getpid(), signum)
+            time.sleep(5)
+            return None
+        with unittest.mock.patch.object(hr, '_register', slow_register), self.assertRaises((SystemExit, KeyboardInterrupt)) as raised:
+            self.invoke()
+        return raised.exception
+
+    def test_a_signal_during_registration_still_cancels_the_entry_with_the_same_exit_code(self):
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            (self.dir / 'runner.jsonl').unlink(missing_ok=True)
+            stopped = self.signal_during_registration(signum)
+            self.assertEqual((type(stopped), stopped.code), (SystemExit, 128 + signum))      # the exit status a signal always had
+            cancel = self.argvs('queue', 'cancel')
+            self.assertEqual([c[c.index('--id') + 1] for c in cancel], ['q000900'], signum)
+            self.assertEqual((self.ran(), self.argvs('queue', 'release')), (0, []))
+
+    def test_an_interrupt_during_registration_still_cancels_the_entry(self):
+        (self.dir / 'runner.jsonl').unlink(missing_ok=True)
+        stopped = self.signal_during_registration(signal.SIGINT)
+        self.assertIsInstance(stopped, KeyboardInterrupt)
+        self.assertEqual(len(self.argvs('queue', 'cancel')), 1)
+
+    def test_unregister_is_the_last_cleanup_step_and_its_failure_changes_nothing(self):
+        self.mode('cancelled')
+        order = []
+
+        class Lib:
+            @staticmethod
+            def unregister_wrapper(directory, qid):
+                order.append('unregister')
+                raise RuntimeError('registry')
+        real_capture = hr._capture
+
+        def spy(cmd, env):
+            if 'cancel' in cmd:
+                order.append('cancel')
+            return real_capture(cmd, env)
+        with unittest.mock.patch.object(hr, '_register', lambda qid, kind: (Lib, '/x')), unittest.mock.patch.object(hr, '_capture', spy):
+            self.assertEqual(self.invoke()[0], hr.REFUSED_EXIT)
+        self.assertEqual(order, ['cancel', 'unregister'])
+
+    def test_a_registration_error_of_any_kind_is_ignored(self):
+        self.mode('queue')
+        class Odd(BaseException):
+            pass
+        bad = self.dir / 'odd-recovery.py'
+        bad.write_text('class Odd(BaseException):\n    pass\nraise Odd()\n')
+        self.use_lib(str(bad))
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(self.ran(), 1)
 
     def test_a_registry_that_cannot_be_written_never_fails_the_job(self):
         self.mode('queue')

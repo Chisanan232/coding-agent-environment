@@ -136,7 +136,9 @@ def _register(qid: str, kind: str):
         spec.loader.exec_module(lib)
         directory = lib.wrappers_dir()
         return (lib, directory) if lib.register_wrapper(directory, qid, kind) else None
-    except Exception:
+    except (SystemExit, KeyboardInterrupt):
+        raise      # a signal in this window keeps its meaning: the caller's `finally` still cancels or releases the entry
+    except BaseException:
         return None
 
 
@@ -144,7 +146,9 @@ def _unregister(handle, qid: str) -> None:
     if handle:
         try:
             handle[0].unregister_wrapper(handle[1], qid)
-        except Exception:
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException:
             pass
 
 
@@ -199,9 +203,9 @@ def _queued_build(declare, job, proof, session, env, sleep, clock) -> int:
         print(f"la-cargo: could not queue the build: {queued.get('reason', out.strip()[:200])}", file=sys.stderr)
         return REFUSED_EXIT
     qid = queued["id"]
-    registered = _register(qid, "la-cargo")
-    claimed, deadline, next_notice = False, clock() + QUEUE_WAIT_S, 0.0
+    claimed, deadline, next_notice, registered = False, clock() + QUEUE_WAIT_S, 0.0, None
     try:
+        registered = _register(qid, "la-cargo")
         while clock() < deadline:
             _capture(runner_cmd("queue", "advance"), env)
             _, listing = _capture(runner_cmd("queue", "status", "--json"), env)
@@ -224,9 +228,9 @@ def _queued_build(declare, job, proof, session, env, sleep, clock) -> int:
         print(f"la-cargo: no heavy lane within {QUEUE_WAIT_S} s; refusing.", file=sys.stderr)
         return REFUSED_EXIT
     finally:
-        _unregister(registered, qid)
         if not claimed:
             _capture(runner_cmd("queue", "cancel", "--id", qid, "--session-id", session), env)
+        _unregister(registered, qid)      # last: a registry problem can never skip the cancel above
 
 
 def _terminate(signum, _frame):

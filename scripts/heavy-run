@@ -63,7 +63,9 @@ def _register(qid, kind):
         spec.loader.exec_module(lib)
         directory = lib.wrappers_dir()
         return (lib, directory) if lib.register_wrapper(directory, qid, kind) else None
-    except Exception:
+    except (SystemExit, KeyboardInterrupt):
+        raise      # a signal in this window keeps its meaning: the caller's `finally` still cancels or releases the entry
+    except BaseException:
         return None
 
 
@@ -71,7 +73,9 @@ def _unregister(handle, qid):
     if handle:
         try:
             handle[0].unregister_wrapper(handle[1], qid)
-        except Exception:
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException:
             pass
 
 
@@ -148,9 +152,9 @@ def _queued(args, declare, run_extra, job, proof, session, env, sleep, clock):
         print(f"heavy-run: could not queue the job: {queued.get('reason', out.strip()[:200])}", file=sys.stderr)
         return REFUSED_EXIT
     qid = queued["id"]
-    registered = _register(qid, "heavy-run")
-    claimed, deadline, next_notice = False, clock() + args.max_wait_s, 0.0
+    claimed, deadline, next_notice, registered = False, clock() + args.max_wait_s, 0.0, None
     try:
+        registered = _register(qid, "heavy-run")
         while clock() < deadline:
             _capture(runner_cmd("queue", "advance"), env)
             _, listing = _capture(runner_cmd("queue", "status", "--json"), env)
@@ -173,12 +177,12 @@ def _queued(args, declare, run_extra, job, proof, session, env, sleep, clock):
         print(f"heavy-run: not admitted within {args.max_wait_s} s; the command was NOT started.", file=sys.stderr)
         return TIMEOUT_EXIT
     finally:
-        _unregister(registered, qid)
         if not claimed and os.path.exists(proof):
             # interrupted after the claim started the job: the entry is CLAIMED, so it is released, not cancelled
             _release(["queue", "release", "--id", qid, "--session-id", session], env)
         elif not claimed:
             _capture(runner_cmd("queue", "cancel", "--id", qid, "--session-id", session), env)
+        _unregister(registered, qid)      # last: a registry problem can never skip the cancel or release above
 
 
 def _terminate(signum, _frame):

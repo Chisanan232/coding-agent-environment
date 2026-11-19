@@ -51,7 +51,7 @@ OBSOLETE_REASONS = (
 )
 TERMINAL = ('CANCELLED', 'EXPIRED', 'RELEASED')
 RECEIPT_KEYS = ('ts', 'kind', 'id', 'action', 'result', 'reasons', 'pid', 'detail')
-RECEIPT_KINDS = ('decision', 'cancel', 'terminate', 'verify')
+RECEIPT_KINDS = ('decision', 'cancel', 'terminate', 'verify', 'prune')
 # Receipt `kind` values of a claim-refused line that mean the owner's executor cannot ever succeed with this grant. Every kind the scheduler emits
 # today (memory-gate, floor, lane, budget, other) is transient, so no refusal counts yet; a kind is added here only by a reviewed change.
 PERMANENT_REFUSAL_KINDS = ('malformed-grant', 'fingerprint-mismatch')
@@ -217,11 +217,11 @@ def wrappers_dir(state_path=None):
     return base.parent / WRAPPER_DIR_NAME
 
 
-def exe_identity(pid, run=None):
+def exe_identity(pid, run=None, timeout=5):
     """'interpreter script' basenames of a live process, or None when unknown. The command line is reduced in memory to those two
     basenames and discarded: nothing else of it is kept, stored or printed."""
     try:
-        done = (run or subprocess.run)(['/bin/ps', '-ww', '-o', 'args=', '-p', str(pid)], capture_output=True, text=True, timeout=5,
+        done = (run or subprocess.run)(['/bin/ps', '-ww', '-o', 'args=', '-p', str(pid)], capture_output=True, text=True, timeout=timeout,
                                        stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/bin:/usr/bin'})
         parts = (done.stdout or '').split()
         returncode = done.returncode
@@ -239,6 +239,20 @@ def exe_identity(pid, run=None):
             break
     found = '%s %s' % (interpreter, script)
     return found if script and EXE_RE.fullmatch(found) else None
+
+
+REGISTER_LOOKUP_TIMEOUT_S = 1      # registration must never delay a job: a slow `ps` means no record, and no record is never terminated
+
+
+def _quick_token(pid, run=None):
+    """The queue waiter start token (UTC, same format as disk-admission.waiter_token) with a 1 s bound; None when gone, slow or unreadable."""
+    try:
+        done = (run or subprocess.run)(['/bin/ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True, timeout=REGISTER_LOOKUP_TIMEOUT_S,
+                                       stdin=subprocess.DEVNULL, env={'LC_ALL': 'C', 'PATH': '/bin:/usr/bin', 'TZ': 'UTC'})
+        token = (done.stdout or '').strip()
+        return token if done.returncode == 0 and token else None
+    except (OSError, subprocess.SubprocessError, AttributeError):
+        return None
 
 
 def _dir_private(directory, uid):
@@ -312,14 +326,14 @@ def _valid_wrapper_record(doc, qid):
     return {'pid': doc['pid'], 'start_token': token, 'pgid': doc['pgid'], 'ppid': doc['ppid'], 'exe': exe, 'kind': doc['kind'], 'created': doc['created']}
 
 
-def register_wrapper(directory, qid, kind, uid=None):
+def register_wrapper(directory, qid, kind, uid=None, run=None):
     """Record the calling process (a heavy-run or la-cargo wrapper that just enqueued `qid`). Atomic, 0600, in a 0700 directory. Best effort:
     returns False on any failure and never raises, so a registry problem can never fail the job."""
     try:
         uid = os.getuid() if uid is None else uid
         pid = os.getpid()
-        token = _disk_admission().waiter_token(pid)
-        exe = exe_identity(pid)
+        token = _quick_token(pid, run)
+        exe = exe_identity(pid, run, timeout=REGISTER_LOOKUP_TIMEOUT_S) if run is not None else exe_identity(pid, timeout=REGISTER_LOOKUP_TIMEOUT_S)
         if token is None or exe is None or kind not in WRAPPER_KINDS or not QID_RE.fullmatch(qid):
             return False
         record = {'qid': qid, 'pid': pid, 'start_token': token, 'pgid': os.getpgid(0), 'ppid': os.getppid(), 'exe_id': exe, 'kind': kind,
@@ -361,6 +375,46 @@ def unregister_wrapper(directory, qid, uid=None):
     except Exception:
         pass
     return False
+
+
+PRUNE_MAX = 50
+PRUNE_MAX_AGE_S = 7 * 86400
+
+
+def prune_registry(directory, env, token_fn=None, now=None, limit=PRUNE_MAX):
+    """Unlink-only cleanup of registry files that can no longer matter: a valid record whose pid is gone, whose start token no longer matches, or that is
+    older than 7 days. Only regular files of ours with a valid queue-id name in a private real directory; anything else, and anything uninspectable, is left.
+    At most `limit` per call; one count-only receipt line when something was removed. Returns the count. Never raises."""
+    count = 0
+    try:
+        token_fn = token_fn or _disk_admission().waiter_token
+        now = now or env.clock()
+        for qid in list_registered(directory, env.uid):
+            if count >= limit:
+                break
+            rec = read_registry(qid, directory, env.uid)
+            path = Path(directory) / (qid + '.json')
+            if rec is None:
+                continue
+            try:
+                token = token_fn(rec['pid'])
+                old = (now - parse_iso(rec['created'])).total_seconds() > PRUNE_MAX_AGE_S
+            except Exception:
+                continue
+            if token is not None and token == rec['start_token'] and not old:
+                continue
+            try:
+                info = os.lstat(str(path))
+                if stat.S_ISREG(info.st_mode) and info.st_uid == env.uid:
+                    path.unlink()
+                    count += 1
+            except OSError:
+                continue
+        if count:
+            write_receipt(env, 'prune', 'registry', 'prune', 'pruned', detail='count=%d' % count)
+    except Exception:
+        pass
+    return count
 
 
 # ---- receipts ---------------------------------------------------------------------------------------------------------
@@ -655,8 +709,8 @@ def obsolete_wrapper(qid, pid, env):
     if entry is None:
         out['reasons'].append('obsolete-entry-missing')
     elif entry.get('state') in TERMINAL:
-        waiter = entry.get('waiter')
-        if isinstance(waiter, dict) and waiter.get('pid') != pid:
+        waiter = entry.get('waiter')      # positive proof only: the entry must name THIS pid and start token as its waiter
+        if not (isinstance(waiter, dict) and waiter.get('pid') == pid and waiter.get('start_token') == token):
             return refuse('not-the-entry-waiter')
         out['reasons'].append('obsolete-entry-terminal')
     else:

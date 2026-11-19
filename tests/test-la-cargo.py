@@ -11,10 +11,12 @@ import fcntl
 import io
 import json
 import os
+import signal
 import stat
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -446,7 +448,7 @@ class Registry(LaCargoBase):
 
                 def exec_module(self, module):
                     inner.exec_module(module)
-                    module.exe_identity = lambda pid, run=None: identity
+                    module.exe_identity = lambda pid, run=None, timeout=5: identity
             spec.loader = Loader()
             return spec
         for patcher in (unittest.mock.patch.object(la, 'RECOVERY_LIB', path), unittest.mock.patch.object(la, 'spec_from_file_location', fake)):
@@ -502,6 +504,67 @@ class Registry(LaCargoBase):
             self.assertEqual(la.main(), 77)
         self.assertTrue(any(self.seen))
         self.assertEqual(self.left(), [])
+
+    def signal_during_registration(self, signum):
+        """A signal arriving while the registry is written (an injected slow register); la-cargo's own handlers raise as in production."""
+        (self.dir / 'mode').write_text('queue')
+        os.environ['FAKE_WAITS'] = '5'
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+
+        def slow_register(qid, kind):
+            os.kill(os.getpid(), signum)
+            time.sleep(5)
+            return None
+        with unittest.mock.patch.object(la, '_register', slow_register), self.assertRaises((SystemExit, KeyboardInterrupt)) as raised:
+            self.run_la('build')
+        return raised.exception
+
+    def test_a_signal_during_registration_still_cancels_the_entry_with_the_same_exit_code(self):
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            (self.dir / 'runner.jsonl').unlink(missing_ok=True)
+            stopped = self.signal_during_registration(signum)
+            self.assertEqual((type(stopped), stopped.code), (SystemExit, 128 + signum))
+            self.assertIn(('queue', 'cancel'), self.runner_commands(), signum)
+            self.assertEqual(self.lines('cargo.jsonl'), [])
+
+    def test_an_interrupt_during_registration_still_cancels_the_entry(self):
+        (self.dir / 'runner.jsonl').unlink(missing_ok=True)
+        self.assertIsInstance(self.signal_during_registration(signal.SIGINT), KeyboardInterrupt)
+        self.assertIn(('queue', 'cancel'), self.runner_commands())
+
+    def test_unregister_is_the_last_cleanup_step_and_its_failure_changes_nothing(self):
+        (self.dir / 'mode').write_text('refuse')
+        order = []
+
+        class Lib:
+            @staticmethod
+            def unregister_wrapper(directory, qid):
+                order.append('unregister')
+                raise RuntimeError('registry')
+        real = la._capture
+
+        def spy(cmd, env):
+            if 'cancel' in cmd:
+                order.append('cancel')
+            return real(cmd, env)
+        ticks = iter(range(0, 10 ** 6, 1000))
+        orig = la.admitted_build
+        with unittest.mock.patch.object(la, '_register', lambda qid, kind: (Lib, '/x')), unittest.mock.patch.object(la, '_capture', spy), \
+                unittest.mock.patch.object(la, 'QUEUE_WAIT_S', 3000), \
+                unittest.mock.patch.object(la, 'admitted_build', lambda a, e, sleep=None, clock=None: orig(a, e, sleep=lambda s: None, clock=lambda: next(ticks))), \
+                unittest.mock.patch.object(sys, 'argv', ['la-cargo', 'build']), contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(la.main(), 77)
+        self.assertEqual(order, ['cancel', 'unregister'])
+
+    def test_a_registration_error_of_any_kind_is_ignored(self):
+        (self.dir / 'mode').write_text('queue')
+        os.environ['FAKE_WAITS'] = '1'
+        bad = self.dir / 'odd-recovery.py'
+        bad.write_text('class Odd(BaseException):\n    pass\nraise Odd()\n')
+        self.use_lib(str(bad))
+        self.assertEqual(self.run_la('build')[0], 0)
+        self.assertEqual(len(self.lines('cargo.jsonl')), 1)
 
     def test_a_registry_that_cannot_be_written_never_fails_the_build(self):
         (self.dir / 'mode').write_text('queue')
