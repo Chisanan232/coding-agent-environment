@@ -235,6 +235,27 @@ class GrantNeedsMemory(QueueBase):
         self.assertEqual(self.advance()['granted'], [a['id']])
 
 
+class MemoryPreconditionText(unittest.TestCase):
+    """The refusal text a claim or advance reports must carry the gate's reason, not only its metrics line (SPE-175)."""
+
+    def run_gate(self, stdout, rc):
+        done = subprocess.CompletedProcess([], rc, stdout=stdout, stderr='')
+        with unittest.mock.patch.object(da.subprocess, 'run', lambda *a, **k: done):
+            return da._memory_precondition()
+
+    def test_refusal_carries_the_reason_line(self):
+        admitted, text = self.run_gate('REFUSE heavy | pressure=1 swapIO=0.0MiB/s compressor=28% load/core=0.5\n'
+                                       '  reason: hysteresis: recovering (0/3 good checks >= 30s apart); exit blocked by compressor 28% > exit 25%\n', 77)
+        self.assertFalse(admitted)
+        self.assertIn('compressor=28%', text)
+        self.assertIn('exit blocked by compressor 28% > exit 25%', text)
+
+    def test_admission_and_empty_output_keep_their_meaning(self):
+        self.assertEqual(self.run_gate('ADMIT heavy | pressure=1 swapIO=0.0MiB/s compressor=5% load/core=0.5\n', 0),
+                         (True, 'ADMIT heavy | pressure=1 swapIO=0.0MiB/s compressor=5% load/core=0.5'))
+        self.assertEqual(self.run_gate('', 77), (False, 'memory gate exit 77'))
+
+
 class NoDoubleBooking(QueueBase):
     def test_plain_reserve_is_refused_behind_the_queue(self):
         self.enqueue()
