@@ -364,6 +364,20 @@ class ReviewFixes(Env):
         self.assertFalse(any("deadlock at step 4" in a for a in argv))
         self.assertIn("deadlock at step 4", fe.consult_prompt(fe.load(self.dir, self.approved(acceptance_check="AC other"))))
 
+    def test_owner_clearable_blockers_are_authority_problems_not_reasoning_blockers(self):
+        for text in ("not satisfiable with current authorization: owner-held steps", "requires owner decision on the credential",
+                     "only the owner can read the cause", "credentials are missing for the producer"):
+            a = [dict(x, failure=text) for x in case()["attempts"]]
+            self.assertFalse(fe.evaluate(case(attempts=a), self.dir)["eligible"], text)
+        self.assertFalse(fe.evaluate(case(cause="owner_decision"), self.dir)["eligible"])
+
+    def test_reordered_words_do_not_make_a_second_distinct_approach(self):
+        same = [dict(x, approach=a) for x, a in zip(case()["attempts"], ("fix lock ordering", "Lock ordering, fix"))]
+        v = fe.evaluate(case(attempts=same), self.dir)
+        self.assertFalse(v["eligible"], v)
+        different = [dict(x, approach=a) for x, a in zip(case()["attempts"], ("fix lock ordering", "add a timeout and retry"))]
+        self.assertTrue(fe.evaluate(case(attempts=different), self.dir)["eligible"])
+
     def test_ordinary_reasoning_failures_are_not_excluded(self):
         for text in ("test_deadlock timed out at step 4", "assert failed at line 403", "exit 503 from the lock test"):
             a = [dict(x, failure=text) for x in case()["attempts"]]
