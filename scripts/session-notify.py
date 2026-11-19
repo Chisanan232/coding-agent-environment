@@ -48,7 +48,7 @@ OWNER_BLOCK_TYPES = {"permission_prompt", "elicitation_dialog", "elicitation_url
 STOP_FAILURE_KINDS = {"rate_limit", "overloaded", "authentication_failed", "oauth_org_not_allowed", "account_on_hold", "billing_error",
                       "invalid_request", "model_not_found", "server_error", "max_output_tokens", "cloud_credential_error", "unknown"}
 END_NOTIFY_REASONS = {"other", "logout"}
-REMOTE_BACKENDS = ("ntfy", "pushover")
+REMOTE_BACKENDS = ("ntfy", "pushover", "telegram")
 BLOCKER_OWNERS = {"owner", "dependency", "resource", "ci", "reviewer", "other"}
 # Everything a notification can say about a resume condition is one of these fixed phrases; there is no free-text field.
 RESUME_TRIGGERS = {"owner_approval": "owner approval", "owner_decision": "owner decision", "dependency_merged": "dependency merged",
@@ -72,7 +72,7 @@ QUARANTINE_PROBLEMS = {"corrupt", "not-regular", "too-large", "foreign-owner"}
 RESOURCE_TICKET = "SPE-176"
 RESOURCE_REPO = "coding-agent-environment"
 SIGNATURE = re.compile(r"[0-9a-f]{16}")
-BACKEND_NAMES = {"macos", "ntfy", "pushover"}
+BACKEND_NAMES = {"macos", "ntfy", "pushover", "telegram"}
 DELIVERY_STATUSES = {"pending", "sending", "failed", "sent", "dropped", "skipped"}
 TERMINAL = {"sent", "dropped", "skipped"}
 
@@ -101,6 +101,7 @@ DEFAULT_CONFIG = {
         "macos": {"enabled": False},
         "ntfy": {"enabled": False, "approved_destination": "", "server": "https://ntfy.sh", "topic_env": "NTFY_TOPIC", "topic_file": "", "token_env": "", "token_file": ""},
         "pushover": {"enabled": False, "approved_destination": "", "token_env": "PUSHOVER_APP_TOKEN", "token_file": "", "user_env": "PUSHOVER_USER_KEY", "user_file": ""},
+        "telegram": {"enabled": False, "approved_destination": "", "token_env": "TELEGRAM_BOT_TOKEN", "token_file": "", "chat_id_env": "TELEGRAM_CHAT_ID", "chat_id_file": ""},
     },
 }
 
@@ -255,7 +256,8 @@ CONFIG_SCHEMA = {
     "retry": {"max_attempts": v_int(1, 100), "base_seconds": v_int(1, 86400), "max_seconds": v_int(1, 86400)},
     "backends": {"macos": {"enabled": v_bool()},
                  "ntfy": {"enabled": v_bool(), "approved_destination": _S200, "server": _S200, "topic_env": _S200, "topic_file": _S200, "token_env": _S200, "token_file": _S200},
-                 "pushover": {"enabled": v_bool(), "approved_destination": _S200, "token_env": _S200, "token_file": _S200, "user_env": _S200, "user_file": _S200}},
+                 "pushover": {"enabled": v_bool(), "approved_destination": _S200, "token_env": _S200, "token_file": _S200, "user_env": _S200, "user_file": _S200},
+                 "telegram": {"enabled": v_bool(), "approved_destination": _S200, "token_env": _S200, "token_file": _S200, "chat_id_env": _S200, "chat_id_file": _S200}},
 }
 
 
@@ -651,7 +653,26 @@ def send_pushover(payload, cfg):
     return http_post("https://api.pushover.net/1/messages.json", data, {"Content-Type": "application/x-www-form-urlencoded"})
 
 
-REAL_TRANSPORTS = {"macos": send_macos, "ntfy": send_ntfy, "pushover": send_pushover}
+TELEGRAM_TOKEN = re.compile(r"[0-9]{3,20}:[A-Za-z0-9_-]{5,100}")
+TELEGRAM_CHAT = re.compile(r"-?[0-9]{1,20}|@[A-Za-z0-9_]{5,64}")
+
+
+def send_telegram(payload, cfg):
+    """Bot API sendMessage over plain https. The token is part of the URL path, so it must never leave this function: http_post returns only
+    fixed codes and any exception is reduced to its type name."""
+    token = read_secret(cfg.get("token_env") or None, cfg.get("token_file") or None)
+    chat = read_secret(cfg.get("chat_id_env") or None, cfg.get("chat_id_file") or None)
+    if (not token or not chat or not TELEGRAM_TOKEN.fullmatch(token) or not TELEGRAM_CHAT.fullmatch(chat)
+            or str(cfg.get("approved_destination", "")).lower() != "api.telegram.org"):
+        return "not-configured"
+    data = urllib.parse.urlencode({"chat_id": chat, "text": payload["title"] + "\n" + payload["body"]}).encode()
+    try:
+        return http_post(f"https://api.telegram.org/bot{token}/sendMessage", data, {"Content-Type": "application/x-www-form-urlencoded"})
+    except Exception as exc:  # noqa: BLE001 - never let exception text (which may embed the URL) escape
+        return f"error-{type(exc).__name__}"[:40]
+
+
+REAL_TRANSPORTS = {"macos": send_macos, "ntfy": send_ntfy, "pushover": send_pushover, "telegram": send_telegram}
 
 
 def backend_allowed(name, cfg, corporate_session):
