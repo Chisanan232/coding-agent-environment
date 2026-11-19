@@ -42,6 +42,14 @@ ENTER = {"swap_io_mib_s_heavy": 16.0, "swap_io_mib_s_light": 128.0,   # swapins 
          "load_per_core_heavy": 4.0}
 EXIT = {"swap_io_mib_s": 4.0, "compressor_ratio": 0.25, "load_per_core": 2.0}
 EXIT_SAMPLES = 3          # consecutive good checks needed to leave a heavy refusal
+# SPE-177. P1: only memory reasons latch the gate; a lane reason (lanes full, a second lane needing a quiet host) still refuses each
+# check but no longer arms the stricter EXIT thresholds for the first lane (ADR 0017: lane 1 keeps the ENTER thresholds).
+# P2: a latch whose only failing EXIT predicate is a compressor below ENTER (compressed pages are a stock nothing evicts at pressure
+# level 1) is released after P2_SAMPLES good checks P2_SPACING s apart with normal pressure, swap I/O <= P2_SWAP_IO and a compressor that
+# did not rise over the run. Neither changes a threshold value; the second lane's bounds (exit_ok, concurrent_lane_reasons) are unchanged.
+LATCH_ONLY_ON_MEMORY_REASONS = True
+CONSERVATIVE_RECOVERY = True
+P2_SAMPLES, P2_SPACING, P2_SWAP_IO, P2_RISE = 10, 60, 1.0, 0.005
 MIN_SPACING = 30          # seconds between checks that count toward EXIT_SAMPLES
 SWAP_FULL_FRACTION = 0.90
 SWAP_LOW_FREE = 4 * GIB
@@ -502,6 +510,29 @@ def exit_blockers(m):
     return out
 
 
+def is_lane_reason(text):
+    """A refusal about lane occupancy (SPE-160) rather than about memory itself."""
+    return "heavy lanes full" in text or text.startswith("a second heavy lane needs")
+
+
+def conservative_ok(m):
+    """P2 reading: calm by every ENTER measure, pressure normal, swap I/O near zero, load within EXIT; the compressor may sit above EXIT."""
+    reasons, unknown = refusal_reasons("heavy", m)
+    cr, io, lpc = m.get("compressor_ratio"), m.get("swap_io_mib_s"), m.get("load_per_core")
+    return (not reasons and not unknown and m.get("pressure_level") == PRESSURE_NORMAL and io is not None and io <= P2_SWAP_IO
+            and cr is not None and lpc is not None and lpc <= EXIT["load_per_core"])
+
+
+def _p2_clean(st, now):
+    hist = st.get("p2_hist")
+    ok = isinstance(hist, list) and len(hist) <= P2_SAMPLES and all(isinstance(x, float) and 0 <= x <= 1 for x in hist)
+    st["p2_hist"] = hist if ok else []
+    last = st.get("p2_last", 0.0)
+    if not isinstance(last, (int, float)) or isinstance(last, bool) or not math.isfinite(last) or last > now:
+        st["p2_hist"], last = [], 0.0
+    st["p2_last"] = float(last)
+
+
 def decide(weight, m, state, now):
     """Pure. Returns (verdict, new_state). state = {'latched': bool, 'ok_streak': int, 'last_ok': float, 'levels': [..]}."""
     st = {"latched": False, "ok_streak": 0, "last_ok": 0.0, "levels": []}
@@ -533,10 +564,13 @@ def decide(weight, m, state, now):
         return dict(verdict, weight=weight), st
     if unknown:
         reasons = reasons + [f"{u}: heavy work fails closed" for u in unknown]
-    if reasons:
-        st.update(latched=True, ok_streak=0)
+    lane = [r for r in reasons if LATCH_ONLY_ON_MEMORY_REASONS and is_lane_reason(r)]
+    if [r for r in reasons if r not in lane]:
+        st.update(latched=True, ok_streak=0, p2_hist=[], p2_last=0.0)
     elif st["latched"]:
+        _p2_clean(st, now)
         if exit_ok(m):
+            st["p2_hist"] = []
             if now - st["last_ok"] >= MIN_SPACING or st["ok_streak"] == 0:
                 st["ok_streak"] += 1
                 st["last_ok"] = now
@@ -544,10 +578,23 @@ def decide(weight, m, state, now):
                 st.update(latched=False, ok_streak=0)
         else:
             st["ok_streak"] = 0
+            if CONSERVATIVE_RECOVERY and conservative_ok(m) and not lane:
+                if not st["p2_hist"] or now - st["p2_last"] >= P2_SPACING:
+                    st["p2_hist"] = (st["p2_hist"] + [float(m["compressor_ratio"])])[-P2_SAMPLES:]
+                    st["p2_last"] = now
+                if len(st["p2_hist"]) >= P2_SAMPLES and st["p2_hist"][-1] - st["p2_hist"][0] <= P2_RISE:
+                    st.update(latched=False, ok_streak=0, p2_hist=[], p2_last=0.0)
+            else:
+                st["p2_hist"] = []
         if st["latched"]:
             why = exit_blockers(m)
             reasons = [f"hysteresis: recovering ({st['ok_streak']}/{EXIT_SAMPLES} good checks >= {MIN_SPACING}s apart)"
-                       + (f"; exit blocked by {', '.join(why)}" if why else "")]
+                       + (f"; exit blocked by {', '.join(why)}" if why else "")
+                       + (f"; conservative recovery {len(st['p2_hist'])}/{P2_SAMPLES}" if CONSERVATIVE_RECOVERY and st["p2_hist"] else "")] + lane
+        else:
+            reasons = lane
+    else:
+        reasons = lane
     return {"admit": not reasons, "reasons": reasons, "warnings": warnings, "weight": weight}, st
 
 
@@ -610,7 +657,7 @@ def save_state(path, state):
     fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".state-")
     try:
         with os.fdopen(fd, "w") as fh:
-            json.dump({k: state[k] for k in ("latched", "ok_streak", "last_ok", "levels")}, fh)
+            json.dump({k: state[k] for k in ("latched", "ok_streak", "last_ok", "levels", "p2_hist", "p2_last") if k in state}, fh)
         os.chmod(tmp, 0o600)
         os.replace(tmp, p)
     except OSError:
