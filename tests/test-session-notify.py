@@ -1573,7 +1573,8 @@ class BoundaryFuzz(Base):
 
     def test_pending_deliveries_every_field_every_wrong_type(self):
         base = {"key": "k", "cycle": 1, "created": 0,
-                "fields": {"state": "FAILED", "repo": "work", "ticket": "SPE-1", "pr": 4, "blocker_owner": "owner", "resume_trigger": "ci_green", "kind": "rate_limit"},
+                "fields": {"state": "FAILED", "repo": "work", "ticket": "SPE-1", "pr": 4, "blocker_owner": "owner", "resume_trigger": "ci_green", "kind": "rate_limit",
+                           "cause": "disk-floor", "recovery": "none", "owner_action": "reclaim-disk"},
                 "backends": {"macos": {"status": "failed", "attempts": 1, "next_at": 0, "code": "network"}, "ntfy": {"status": "pending", "attempts": 0, "next_at": 0, "code": None}}}
         failures, n = [], 0
         for mpath, w, m in mutants(base):
@@ -1614,6 +1615,23 @@ class BoundaryFuzz(Base):
                     failures.append((base["hook_event_name"], mpath, repr(w)[:20], "processed" if not valid else "ignored a valid event"))
         self.collect(failures, n, 500)
 
+    def test_emit_resource_request_every_field_every_wrong_type(self):
+        base = {"cause": "disk-floor", "recovery": "advance-tried", "owner_action": "reclaim-disk", "signature": "0123456789abcdef"}
+        failures, n = [], 0
+        for mpath, w, m in mutants(base):
+            n += 1
+            fake = Fake()
+            e = sn.Engine(self.sdir / f"e{n}", cfg(), fake.table(), clock=lambda: self.t, sleep=lambda s: None)
+            try:
+                got = e.emit_resource(m)
+            except BaseException as exc:  # noqa: BLE001
+                failures.append((mpath, repr(w)[:20], type(exc).__name__))
+                continue
+            valid = ref_ok(sn.EMIT_SCHEMA, m)
+            if (got != "invalid") != valid or (not valid and (fake.sent or (self.sdir / f"e{n}").exists())):
+                failures.append((mpath, repr(w)[:20], "processed" if not valid else "rejected a valid request"))
+        self.collect(failures, n, 8)
+
     def test_cmd_hook_survives_every_json_root_and_deep_nesting(self):
         saved, stdin = dict(os.environ), sys.stdin
         os.environ["SESSION_NOTIFY_STATE_DIR"] = str(self.sdir)
@@ -1639,7 +1657,7 @@ class BoundaryLint(unittest.TestCase):
     catches the common regressions."""
     VALIDATOR = {"conforms", "_conforms", "overlay"}
     TRUSTED_CONTRACT = {"render", "apply", "deliver_entry"}   # receive sanitised or already validated values
-    BOUNDARY_PARAMS = {"ev", "raw", "d", "user", "fields", "entry", "event"}
+    BOUNDARY_PARAMS = {"ev", "raw", "d", "user", "fields", "entry", "event", "req"}
 
     @classmethod
     def violations(cls, source):
@@ -1690,6 +1708,83 @@ class BoundaryLint(unittest.TestCase):
         self.assertEqual(len(self.violations("def f(event):\n    return event.get('x')\n")), 1)                      # unvalidated `event`
         self.assertEqual(len(self.violations("def f(raw):\n    alias = raw\n    return alias['x']\n")), 1)           # alias of a boundary value
         self.assertEqual(self.violations("def f(raw):\n    if not conforms(S, raw):\n        return None\n    alias = raw\n    return alias['x']\n"), [])
+
+
+class EmitResource(Base):
+    """SPE-176: admission-monitor notices through the existing pipeline."""
+    REQ = {"cause": "disk-floor", "recovery": "none", "owner_action": "reclaim-disk", "signature": "0123456789abcdef"}
+
+    def emit(self, eng=None, **over):
+        return (eng or self.engine()).emit_resource({**self.REQ, **over})
+
+    def test_one_notification_with_fixed_phrases_only(self):
+        self.assertEqual(self.emit(), "queued")
+        self.assertEqual(self.names(), ["macos", "ntfy", "pushover"])
+        payload = self.fake.sent[0][1]
+        self.assertEqual(payload["body"], "disk below floor | recovery: none tried | action: reclaim disk")
+        self.assertNotIn("0123456789abcdef", json.dumps(payload))
+        rec = self.rec("admission-monitor")
+        self.assertEqual((rec["state"], rec["task"]["blocker_owner"], rec["task"]["resume_trigger"]), ("BLOCKED_RESOURCE", "resource", "resource_available"))
+
+    def test_replay_neither_notifies_nor_queues_again(self):
+        self.emit()
+        self.fake.sent.clear()
+        self.advance(5)
+        self.assertEqual(self.emit(), "deduped")
+        self.assertEqual((self.fake.sent, self.rec("admission-monitor")["pending"]), ([], []))
+
+    def test_different_cause_or_signature_notifies_again(self):
+        self.emit()
+        self.fake.sent.clear()
+        self.assertEqual(self.emit(signature="fedcba9876543210"), "queued")
+        self.assertEqual(self.emit(cause="frozen-queue", owner_action="run-queue-advance"), "queued")
+        self.assertEqual(len(self.fake.sent), 6)
+
+    def test_approve_actions_resume_on_owner_decision(self):
+        self.emit(cause="memory-pressure", owner_action="approve-memory-policy")
+        self.assertEqual(self.rec("admission-monitor")["task"]["resume_trigger"], "owner_decision")
+
+    def test_repo_label_is_never_rendered(self):
+        c = cfg(known_repos=[])
+        self.emit(self.engine(c))
+        self.assertNotIn("coding-agent-environment", self.fake.sent[0][1]["body"])
+
+    def test_backends_off_means_no_delivery_and_still_exit_ok(self):
+        c = cfg()
+        for b in c["backends"].values():
+            b["enabled"] = False
+        self.assertIn(self.emit(self.engine(c)), ("queued", "deduped"))
+        self.assertEqual(self.fake.sent, [])
+
+    def test_clear_returns_to_idle_without_notifying(self):
+        self.emit()
+        self.fake.sent.clear()
+        self.assertEqual(self.engine().emit_resource({}, clear=True), "cleared")
+        self.assertEqual((self.rec("admission-monitor")["state"], self.fake.sent), ("IDLE", []))
+        self.assertEqual(sn.Engine(self.sdir / "none", cfg(), self.fake.table()).emit_resource({}, clear=True), "cleared")
+
+    def test_invalid_request_writes_nothing(self):
+        for bad in ({"cause": "nope"}, {"signature": "XYZ"}, {"recovery": None}, {"owner_action": "rm -rf /"}):
+            self.assertEqual(self.emit(**bad), "invalid")
+        self.assertFalse(self.sdir.exists())
+
+    def test_untrusted_state_is_not_acted_on(self):
+        self.sdir.mkdir(parents=True)
+        (self.sdir / "admission-monitor.json").write_text("{")
+        self.assertEqual(self.emit(), "untrusted:corrupt")
+        self.assertEqual(self.fake.sent, [])
+
+    def test_cli_exit_codes_and_usage_error_writes_nothing(self):
+        env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(self.sdir), SESSION_NOTIFY_CONFIG=str(self.tmp / "none.json"))
+        run = lambda *a: subprocess.run([sys.executable, str(SCRIPT), "emit-resource", *a], capture_output=True, text=True, env=env)
+        ok = ("--cause", "disk-floor", "--recovery", "none", "--owner-action", "reclaim-disk")
+        for args in (ok, ok + ("--signature", "0123456789abcdef"), ("--clear",)):
+            self.assertEqual(run(*args).returncode, 0, args)
+        shutil_rmtree = __import__("shutil").rmtree
+        shutil_rmtree(self.sdir)
+        for args in (("--cause", "bogus", "--recovery", "none", "--owner-action", "reclaim-disk"), ok + ("--signature", "short"), ("--cause", "disk-floor")):
+            self.assertEqual(run(*args).returncode, 2, args)
+        self.assertFalse(self.sdir.exists())
 
 
 class Cycle4Regressions(Base):
