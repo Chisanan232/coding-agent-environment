@@ -644,7 +644,12 @@ def load_state(path):
               and all(type(x) is int and x in VALID_LEVELS for x in d.get("levels", [])))
     except (ValueError, UnicodeDecodeError):
         ok = False
-    return (d, None) if ok else (latched, "state corrupt: treated as latched")
+    if not ok:
+        return latched, "state corrupt: treated as latched"
+    side = _load_p2(path)
+    if side:
+        d = dict(d, **side)      # the sidecar wins; a file written by the previous P2 layout (keys inside) still loads
+    return d, None
 
 
 @contextlib.contextmanager
@@ -669,19 +674,51 @@ def state_lock(path, wait=LOCK_WAIT, sleep=time.sleep):
         os.close(fd)
 
 
-def save_state(path, state):
+P2_KEYS = ("p2_hist", "p2_last", "p2_first")
+
+
+def p2_path(path):
+    """Where the P2 run lives: beside the latch file, never inside it. A checkout without P2 rewrites the latch file with its four keys on
+    every check; if the run were stored there, every old caller's check would erase the recovery progress (observed 2026-11-19)."""
     p = pathlib.Path(path)
+    return p.with_name(p.name + ".p2")
+
+
+def _load_p2(path):
+    try:
+        fd = os.open(str(p2_path(path)), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return {}
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return {}
+        raw = os.read(fd, 4096 + 1)
+        d = json.loads(raw.decode("utf-8")) if len(raw) <= 4096 else {}
+    except (OSError, ValueError, UnicodeDecodeError, OverflowError):
+        return {}
+    finally:
+        os.close(fd)
+    return {k: d[k] for k in P2_KEYS if k in d} if isinstance(d, dict) else {}
+
+
+def _write_private(p, payload):
     p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".state-")
     try:
         with os.fdopen(fd, "w") as fh:
-            json.dump({k: state[k] for k in ("latched", "ok_streak", "last_ok", "levels", "p2_hist", "p2_last", "p2_first") if k in state}, fh)
+            json.dump(payload, fh)
         os.chmod(tmp, 0o600)
         os.replace(tmp, p)
     except OSError:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+def save_state(path, state):
+    _write_private(pathlib.Path(path), {k: state[k] for k in ("latched", "ok_streak", "last_ok", "levels") if k in state})
+    if any(k in state for k in P2_KEYS):
+        _write_private(p2_path(path), {k: state[k] for k in P2_KEYS if k in state})
 
 
 # ---- disk gate composition -------------------------------------------------------------------------------------------
