@@ -288,11 +288,12 @@ def classify(snap, limits):
         if not runner or runner.get('protocol', 0) < snap['protocol']:
             found['outdated-caller'] = '%s was granted by a runner without protocol %d' % (entry['id'], snap['protocol'])
     # Nothing blocks the head, nothing is claimed, nothing granted is waiting to be claimed: nobody is advancing the queue.
-    if waiting and not found and not granted and not any(e['state'] == 'CLAIMED' for e in entries):
+    held_elsewhere = waiting and waiting[0]['state'] == 'ELIGIBLE' and snap.get('reservations', 0) > 0    # a lane held by a non-queue reservation
+    if waiting and not found and not granted and not held_elsewhere and not any(e['state'] == 'CLAIMED' for e in entries):
         found['frozen-queue'] = 'waiting work, free lanes and no blocker, but nothing is being granted'
     primary = next((c for c in CAUSES if c in found), 'unknown')
     if not found:
-        busy = any(e['state'] == 'CLAIMED' for e in entries) or (any(e['state'] == 'ELIGIBLE' for e in waiting) and bool(granted))   # an ELIGIBLE head waits on a lane someone holds
+        busy = any(e['state'] == 'CLAIMED' for e in entries) or (any(e['state'] == 'ELIGIBLE' for e in waiting) and (bool(granted) or snap.get('reservations', 0) > 0))   # an ELIGIBLE head waits on a lane someone holds
         primary = 'healthy-busy' if busy else 'unknown'
     # History for the owner, never a trigger: a grant that lapsed unclaimed shortly ago (a lost callback).
     notes = ['%s grant lapsed unclaimed' % e['id'] for e in entries if e['state'] == 'EXPIRED' and isinstance(e.get('grant'), dict)
@@ -358,7 +359,7 @@ class Env:
     """Everything a tick touches outside its own state, so tests substitute it."""
 
     def __init__(self, da, state_path, memory_state_path, limits, clock=None, mono=None, boot=None, table=None, memory=None,
-                 free=None, advance=None, notify=None, clear=None):
+                 free=None, advance=None, notify=None, clear=None, reservations=None):
         self.da, self.state_path, self.memory_state_path, self.limits = da, Path(state_path), Path(memory_state_path), limits
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.mono = mono or time.monotonic
@@ -367,8 +368,16 @@ class Env:
         self.memory = memory or (lambda: memory_view(self.memory_state_path))
         self.free = free or (lambda: shutil.disk_usage('/System/Volumes/Data').free)
         self.advance = advance or self._advance
+        self.reservations = reservations or self._reservations
         self.notify = notify or session_notify
         self.clear = clear or session_clear
+
+    def _reservations(self):
+        """Number of reservation files (lane holders outside the queue too); read-only, 0 when unreadable."""
+        try:
+            return sum(1 for _ in (self.state_path.parent / 'reservations').glob('*.json'))
+        except OSError:
+            return 0
 
     def _advance(self):
         """Run one `queue advance`. A slow one is left to finish on its own (never signalled); the next tick's spacing covers it."""
@@ -502,7 +511,7 @@ def _tick_locked(env, directory, act, if_due):
         now_by_id = {e['id']: e['state'] for e in entries}
         for qid, before in state['states'].items():
             after = now_by_id.get(qid)
-            if (after in ('CLAIMED', 'RELEASED') and after != before) or (after is None and before == 'CLAIMED'):
+            if (after in ('CLAIMED', 'RELEASED') and after != before) or (after is None and before == 'CLAIMED' and not problems):
                 progress = True      # a claim started, finished, or finished and was garbage-collected between two ticks
     try:
         mem = env.memory()
@@ -513,7 +522,7 @@ def _tick_locked(env, directory, act, if_due):
     if ratio is not None:
         window = (window + [[wall, ratio]])[-WINDOW_MAX:]
     snap = {'now': now, 'wall': wall, 'entries': entries, 'problems': problems, 'free_bytes': env.free(), 'mem': mem,
-            'window': window, 'claims': claims, 'protocol': env.da.RUNNER_PROTOCOL}
+            'window': window, 'claims': claims, 'protocol': env.da.RUNNER_PROTOCOL, 'reservations': env.reservations()}
     verdict = classify(snap, env.limits)
     waiting = verdict['waiting']
     old_grant = verdict['oldest_grant_s'] >= GRANTED_ALERT_S
