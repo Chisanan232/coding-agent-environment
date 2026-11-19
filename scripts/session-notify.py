@@ -845,6 +845,8 @@ class Engine:
             return "ignored"  # not an object, or a consumed field has the wrong type/size: nothing is read from it, nothing changes
         ev = raw
         name, sid = ev["hook_event_name"], ev["session_id"]
+        if sid == RESOURCE_SESSION:
+            return "ignored"  # reserved for emit-resource: a hook event can neither write nor spoof this record
         path = record_path(self.sdir, sid)
         try:
             with session_lock(path, sleep=self.sleep):
@@ -954,7 +956,7 @@ class Engine:
     def emit_resource(self, req, clear=False):
         """One deduplicated BLOCKED_RESOURCE notice on the synthetic `admission-monitor` session, or (clear) its return to IDLE.
 
-        `req` is an EMIT_SCHEMA-shaped dict. Returns queued, deduped, cleared, invalid, busy or untrusted:<problem>. Dedup key is cause + signature.
+        `req` is an EMIT_SCHEMA-shaped dict. Returns queued, deduped, no-backend, cleared, invalid, busy or untrusted:<problem>. Dedup key is cause + signature.
         """
         if not clear and not conforms(EMIT_SCHEMA, req):
             return "invalid"
@@ -962,15 +964,21 @@ class Engine:
         try:
             with session_lock(record_path(self.sdir, sid), sleep=self.sleep):
                 rec, problem = load_record(self.sdir, sid)
-                if problem:
-                    log_line(self.sdir, f"state-untrusted {problem} event=emit-resource")
-                    return f"untrusted:{problem}"
+                if problem:  # the synthetic record only: quarantine it (one kept) and rebuild, so alerting cannot fail forever
+                    log_line(self.sdir, f"state-quarantined {problem} event=emit-resource")
+                    try:
+                        os.replace(record_path(self.sdir, sid), str(record_path(self.sdir, sid)) + ".corrupt")
+                    except OSError:
+                        return f"untrusted:{problem}"
+                    rec = None
                 now = self.clock()
                 if rec is None and clear:
                     return "cleared"
                 rec = rec or new_record(sid, now)
                 if clear:
                     self.set_state(rec, "IDLE", "resource-cleared", now, notify=False)
+                    rec["notified"] = {}  # dedup only suppresses a continuous stall: a recurrence after a clear notifies again
+                    rec["pending"] = [e for e in rec["pending"] if not all(b["status"] in TERMINAL for b in e["backends"].values())]
                     result = "cleared"
                 else:
                     resume = "owner_decision" if "approve" in req["owner_action"] else "resource_available"
@@ -978,7 +986,8 @@ class Engine:
                     self.set_state(rec, "BLOCKED_RESOURCE", "resource-stall", now, cp, notify=False)
                     extra = {"cause": req["cause"], "recovery": req["recovery"], "owner_action": req["owner_action"]}
                     queued = self.enqueue(rec, "BLOCKED_RESOURCE", "resource-stall", now, extra_key=req["cause"] + ":" + (req.get("signature") or ""), extra=extra)
-                    result = "queued" if queued else "deduped"
+                    any_backend = any((b or {}).get("enabled") is True for b in self.cfg["backends"].values())
+                    result = "no-backend" if not any_backend else ("queued" if queued else "deduped")
                 self.deliver(rec, now, budget_end=now + 6)
                 save_record(self.sdir, rec)
                 return result
@@ -1006,7 +1015,7 @@ class Engine:
                         continue
                     out["sessions"] += 1
                     changed = False
-                    if rec["state"] == "RUNNING" and now - rec["last_seen"] > self.cfg["stale_after_seconds"]:
+                    if rec["state"] == "RUNNING" and sid != RESOURCE_SESSION and now - rec["last_seen"] > self.cfg["stale_after_seconds"]:
                         self.set_state(rec, "FAILED", "stale-no-heartbeat", now, None, kind="STALE", notify=True)
                         out["stale"] += 1
                         changed = True
@@ -1014,7 +1023,7 @@ class Engine:
                     if self.deliver(rec, now):
                         changed = True
                         out["retried"] += pending_before
-                    if rec["state"] in ("SESSION_ENDED", "COMPLETED", "FAILED") and not rec["pending"] and now - rec["last_seen"] > GC_AFTER:
+                    if sid != RESOURCE_SESSION and rec["state"] in ("SESSION_ENDED", "COMPLETED", "FAILED") and not rec["pending"] and now - rec["last_seen"] > GC_AFTER:
                         # removed while HOLDING the lock; session_lock re-checks the inode, so a waiter that opened the old file retries on the new one
                         for q in (p, p.with_name(p.name + ".lock")):
                             with contextlib.suppress(OSError):
@@ -1156,7 +1165,7 @@ def cmd_emit_resource(args):
     req = {"cause": args.cause, "recovery": args.recovery, "owner_action": args.owner_action, "signature": args.signature}
     result = Engine(state_dir(), cfg).emit_resource(req, clear=args.clear)
     print(f"emit-resource: {result}")
-    return 0 if result in ("queued", "deduped", "cleared") else 1
+    return 0 if result in ("queued", "deduped", "no-backend", "cleared") else 1
 
 
 def signature_arg(text):
