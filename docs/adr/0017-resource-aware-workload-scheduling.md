@@ -551,6 +551,29 @@ stays `False` and the four-lane code is untouched.
     lapsed unclaimed; re-queued as qNNNNNN` for a lapse. It moves its recovery registration
     and its final cancel to the new id, and keeps waiting. After `REQUEUE_MAX` = 3 re-queues it exits 77 with a message naming the
     limit.
+- **Only an entry whose waiter can re-queue is backfilled.** The re-queue logic lives in the wrapper process, which loads it once at
+  start. On 2026-11-20, waiters started before it were still queued: q000839, q000840 and q000841, behind a 5 h job. If a backfilled
+  grant of such an entry were revoked, its wrapper would exit 77 and the job would lose its place. Asking product sessions to cancel
+  and re-enqueue is not acceptable, so the scheduler gates on a declared capability instead.
+  - **The declaration.** New `heavy-run` and `la-cargo` pass `queue enqueue --requeue-capable`. The entry stores the additive field
+    `requeue_capable: true`. The entry reader accepts only a literal `true`. The field is absent on older entries, is not part of the
+    fingerprint, and does not touch the grant object.
+  - **The gate.** `_backfill_candidate` evaluates a candidate as before. If the candidate would qualify but lacks the field, it is
+    never backfilled, whether backfill is ON or OFF.
+    - It is skipped like any refused candidate. Its exclusion keys join the skipped set, so later same-key entries still never
+      overtake it.
+    - A `backfill-shadow` receipt with `skipped: no-requeue-capability` records the skip. That receipt is written at most once per
+      (pivot, candidate) per 10 minutes.
+    - In OFF mode the skipped entry is not counted as a shadow grant.
+  - **Inheritance.** A replacement made by `--requeue-of` inherits `requeue_capable` from the entry it replaces.
+  - **First enqueue only.** A `--requeue-of` call omits the flag, because the replacement inherits the field. A re-queue therefore
+    still works if the checkout moved back to an older runner during a long wait.
+  - **Which runner gets the flag.** A wrapper passes the flag only when its runner file contains the `'--requeue-capable'` option
+    string. The check reads the file as text and never runs it. `heavy-run` uses its own checkout's runner, which always contains it.
+    `la-cargo` calls whatever `LA_CARGO_RUNNER` or the main-view checkout provides, so an older runner never receives an unknown flag.
+    The job then runs unbackfilled, exactly as before.
+  - **Existing waiters.** Live waiters from before this change keep their entries, unchanged and in order. They are simply never
+    backfilled.
 - **Timing facts the wrappers rely on.**
   - Both wrappers poll every `POLL_S` = 15 s. One iteration is the sleep, plus advance and status (each capped at 120 s), plus at
     most one claim. A refused claim is bounded by the runner's memory gate (120 s) and its two 5 s lock waits. That is about 390 s
@@ -572,17 +595,21 @@ q000836 (`p2556f`, a docker job) at 11:05:56Z, 11:16:03Z, 11:26:08Z and 11:36:11
 Preconditions still open before the enabling pull request:
 
 1. More shadow evidence. The window above is one shape over about 30 minutes. Before the flip, review the live `backfill-shadow`
-   receipts again over a representative window.
+   receipts again over a representative window that covers more than one queue shape.
+   - Filter out every receipt that has `skipped` set. A `skipped: no-requeue-capability` receipt is written in ON and OFF mode
+     alike, and records a candidate that was not backfilled.
+   - Only receipts without `skipped` show what backfill would have granted.
 2. The same revision on every poller copy. `admission-monitor.py callers` must show `backfill=off-hardened` for every checkout
    whose runner polls or claims from the queue before the flip. Each copy reads its own constant, so a stale copy never backfills
    on its own. But a pre-hardening or pre-backfill copy that claims a backfilled grant skips the claim-time re-check. A
    pre-backfill copy (`absent`) still counts a backfilled grant as an occupied lane.
-   - This now includes the re-queue. `la-cargo` claims through `coding-agent-environment-main-view` by default, and `heavy-run`
-     uses its own checkout's runner. Each must contain `BACKFILL_REQUEUE_MAX`.
-   - A runner without it refuses `--requeue-of`, so its wrappers exit 77 as before.
-   - It also orders entries by seq. Such a runner can read a replacement that was granted in order as a backfilled grant and re-check
-     it at claim.
-3. Done in this revision: consumers re-queue on revoke or unclaimed lapse (above).
+   - This applies to scheduler copies only, meaning every runner that advances or claims: it must be the canonical checkout at this
+     revision. A runner without `BACKFILL_REQUEUE_MAX` orders entries by seq. It can then read a replacement that was granted in order
+     as a backfilled grant and re-check it at claim.
+   - Wrapper processes no longer have to match. The per-entry capability below replaces that requirement.
+3. Done in this revision:
+   - consumers re-queue on revoke or unclaimed lapse (above);
+   - only entries whose waiter declared the capability are backfilled (below).
 4. The enabling pull request itself, one line, reviewed on its own. Reverting it is the rollback.
 
 ## Version history
@@ -599,4 +626,4 @@ Preconditions still open before the enabling pull request:
 | 7 | Third lane enabled as a monitored, reversible pilot on the owner's instruction (2026-11-16): `THIRD_LANE_ENABLED = True`. Disk, memory-pressure, CPU, headroom and class limits unchanged, so a third job still needs the budget to pass (a `light` or class-eligible `build-crate` request). If the pilot hits a limit, new third-lane admission stops by revert; trial evidence under the revision 6 criteria still decides whether to retain it as the default (SPE-160) |
 | 8 | Four-lane code shipped OFF (`FOURTH_LANE_ENABLED = False`, `FOUR_LANE_CEILING` 4): lane-4 capacity gates, `lane_protocol` queue stamp, `fits_if_cap_were_4`; enabling is a separate reviewed PR, rollback is its revert (SPE-176) |
 | 9 | Strict FIFO amended: bounded backfill past a head blocked only by an exclusion key held by a claimed running job, shipped OFF (`BACKFILL_ENABLED = False`, `BACKFILL_MAX = 1`); head protection from declared reservations, same-key order kept, `backfill` / `backfill-shadow` receipts (SPE-176) |
-| 9a | Backfill hardening, still OFF: exclusion keys compared by directory identity, with new keys in cargo's own target-dir order; head protection projects tier loss and the latch; claim-time re-check revokes a backfilled grant whose protection broke; `BACKFILL_GRANT_S` 600 s; all blockers in receipts; open preconditions listed. Later amended: wrappers re-queue a revoked or unclaimed-lapsed backfilled grant at its original FIFO position (`--requeue-of`, inherited `order`, chain cap 3); live shadow evidence recorded (SPE-176) |
+| 9a | Backfill hardening, still OFF: exclusion keys compared by directory identity, with new keys in cargo's own target-dir order; head protection projects tier loss and the latch; claim-time re-check revokes a backfilled grant whose protection broke; `BACKFILL_GRANT_S` 600 s; all blockers in receipts; open preconditions listed. Later amended: wrappers re-queue a revoked or unclaimed-lapsed backfilled grant at its original FIFO position (`--requeue-of`, inherited `order`, chain cap 3); live shadow evidence recorded; only entries whose waiter declared `--requeue-capable` are backfilled (SPE-176) |

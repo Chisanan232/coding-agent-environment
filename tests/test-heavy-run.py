@@ -304,6 +304,32 @@ class Wrapper(unittest.TestCase):
         cancel = self.argvs('queue', 'cancel')
         self.assertEqual([c[c.index('--id') + 1] for c in cancel], ['q000900'])
 
+    def test_the_requeue_capability_is_declared_only_to_a_runner_that_accepts_it(self):
+        self.mode('revoked')
+        self.invoke()
+        self.assertFalse([a for a in self.argvs('queue', 'enqueue') if '--requeue-capable' in a])   # the fake has no such flag
+        for name in ('runner.jsonl', 'current', 'revoked', 'polls', 'command.ran'):
+            (self.dir / name).unlink(missing_ok=True)
+        with open(self.dir / 'runner', 'a') as handle:
+            handle.write("# accepts '--requeue-capable'\n")
+        code, _ = self.invoke()
+        self.assertEqual(code, 0)
+        enqueues = self.argvs('queue', 'enqueue')
+        self.assertEqual(len(enqueues), 2)
+        first, requeue = enqueues
+        self.assertIn('--requeue-capable', first[:first.index('--')])
+        # The re-queue omits it (the replacement inherits the field), so a runner that lost the flag mid-wait cannot refuse it.
+        self.assertIn('--requeue-of', requeue)
+        self.assertNotIn('--requeue-capable', requeue)
+
+    def test_the_checkouts_own_runner_accepts_the_capability(self):
+        with unittest.mock.patch.object(hr, 'RUNNER', str(ROOT / 'scripts/disk-admission.py')):
+            self.assertTrue(hr.runner_requeue_capable())
+        args = da.build_parser().parse_args(['queue', 'enqueue', '--label', 'x1', '--ticket', 'T-1', '--repo', 'r', '--worktree', '/tmp',
+                                             '--harness', 'claude', '--session-id', 'heavy-run-1-2', '--bytes', '1', '--again',
+                                             '--requeue-capable', '--', 'x'])
+        self.assertTrue(args.requeue_capable)
+
     def test_a_lapsed_unclaimed_backfill_grant_says_so(self):
         self.mode('lapsed')
         code, err = self.invoke()

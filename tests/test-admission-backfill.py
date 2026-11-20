@@ -86,12 +86,13 @@ class Base(unittest.TestCase):
             sample['band_fn'] = self.band_fn
         return sample
 
-    def enqueue(self, label, cls, keys, gib=None, waiter=True, cpus=None, mem_gib=None):
+    def enqueue(self, label, cls, keys, gib=None, waiter=True, cpus=None, mem_gib=None, capable=True):
+        """capable: the waiter declared --requeue-capable, as heavy-run and la-cargo do since SPE-176; only such entries are backfilled."""
         proc = self.spawn() if waiter else None
         out = da.queue_enqueue(self.path, label=label, tickets=['HORO-1'], repo='horonom/x', worktree=str(self.worktree), harness='claude',
                                session_id=SESSION, nbytes=(gib or da.WORKLOAD_CLASSES[cls]['disk_gib']) * GIB, argv=['cargo', 'test', label],
                                now=self.now, declared=decl(cls, keys, cpus, mem_gib), waiter_pid=proc.pid if proc else None,
-                               ancestor_fn=(lambda pid: True) if proc else None)
+                               ancestor_fn=(lambda pid: True) if proc else None, requeue_capable=capable)
         self.assertTrue(out['ok'], out)
         return out['id']
 
@@ -1138,6 +1139,108 @@ class Requeue(Base):
         self.assertFalse(out['ok'])
         self.assertIn('is CANCELLED, not EXPIRED', out['reason'])
         self.assertEqual(len(self.entries()), count)
+
+
+class RequeueCapability(Base):
+    """Only an entry whose waiter declared --requeue-capable is ever backfilled (SPE-176): a waiter started before the re-queue logic
+    would exit 77 on a revoke and lose the job's place."""
+
+    def shape(self, docker_a_capable):
+        self.blocker, self.blocker_proc = self.running('p6-verify-2', 'build-workspace', [SHARED], 40)
+        self.head = self.enqueue('ent-verify-3', 'build-workspace', [SHARED], 40)
+        self.docker_a = self.enqueue('p2556d', 'container-suite', ['docker'], 32, capable=docker_a_capable)
+        self.docker_b = self.enqueue('p2556e', 'container-suite', ['docker'], 32)
+
+    def skipped(self):
+        return [r for r in self.receipts('backfill-shadow') if r.get('skipped') == 'no-requeue-capability']
+
+    def test_a_capable_candidate_is_backfilled(self):
+        self.shape(True)
+        with backfill():
+            self.assertEqual(self.advance()['backfilled'], [self.docker_a])
+        self.assertTrue(self.entries()[self.docker_a]['requeue_capable'])
+        self.assertFalse(self.skipped())
+
+    def test_a_candidate_without_the_capability_is_skipped_and_its_keys_still_hold_later_same_key_entries(self):
+        self.shape(False)
+        with backfill(cap=2):
+            out = self.advance()
+        self.assertEqual(out['backfilled'], [])                   # docker_b is capable but shares docker_a's key: never ahead of it
+        self.assertEqual(out['granted'], [])
+        self.assertEqual([self.state(q) for q in (self.head, self.docker_a, self.docker_b)], ['QUEUED', 'QUEUED', 'QUEUED'])
+        record = self.skipped()
+        self.assertEqual([(r['id'], r['blocked_id'], r['reason']) for r in record], [(self.docker_a, self.head, 'head-excl-only')])
+        self.assertFalse(self.receipts('backfill'))
+
+    def test_the_scan_continues_past_a_skipped_candidate_to_a_capable_one_on_another_key(self):
+        self.blocker, self.blocker_proc = self.running('p6-verify-2', 'build-workspace', [SHARED], 40)
+        self.head = self.enqueue('ent-verify-3', 'build-workspace', [SHARED], 40)
+        old = self.enqueue('p2556d', 'container-suite', ['docker'], 32, capable=False)
+        other = self.enqueue('p2556p', 'container-suite', ['podman'], 32)
+        with backfill():
+            out = self.advance()
+        self.assertEqual(out['backfilled'], [other])
+        self.assertEqual(self.state(old), 'QUEUED')
+        self.assertEqual([r['id'] for r in self.skipped()], [old])
+
+    def test_off_mode_skips_it_too_and_does_not_count_it_as_a_shadow_grant(self):
+        self.shape(False)
+        with backfill(enabled=False):
+            out = self.advance()
+        self.assertEqual(out['backfill_shadow'], [])
+        self.assertEqual([r['id'] for r in self.skipped()], [self.docker_a])
+        self.assertFalse([r for r in self.receipts('backfill-shadow') if not r.get('skipped')])
+
+    def test_the_skip_receipt_is_rate_limited_per_pivot_and_candidate(self):
+        self.shape(False)
+        with backfill():
+            self.advance()
+            self.advance(now=self.now + timedelta(seconds=da.BACKFILL_SHADOW_WINDOW_S - 1))
+            self.assertEqual(len(self.skipped()), 1)
+            self.advance(now=self.now + timedelta(seconds=da.BACKFILL_SHADOW_WINDOW_S + 1))
+        self.assertEqual(len(self.skipped()), 2)
+
+    def test_an_old_format_entry_loads_and_orders_unchanged(self):
+        old = self.enqueue('old-wrapper', 'build-crate', [LOCAL], capable=False)
+        new = self.enqueue('new-wrapper', 'build-crate', [SHARED])
+        entries = da._queue_entries(self.path)
+        self.assertEqual(entries[1], [])
+        self.assertEqual([e['id'] for e in entries[0]], [old, new])
+        self.assertNotIn('requeue_capable', entries[0][0])
+        self.assertIs(entries[0][1]['requeue_capable'], True)
+        for bad in (False, 'yes', 1):                             # only a literal true is accepted
+            path = da.queue_dir(self.path) / (old + '.json')
+            record = json.loads(path.read_text())
+            record['requeue_capable'] = bad
+            path.write_text(json.dumps(record))
+            self.assertTrue(da._queue_entries(self.path)[1], bad)
+
+    def test_the_flag_is_not_part_of_the_fingerprint(self):
+        qid = self.enqueue('dedupe', 'build-crate', [SHARED], capable=False)
+        entry = self.entries()[qid]
+        out = da.queue_enqueue(self.path, label='dedupe', tickets=['HORO-1'], repo='horonom/x', worktree=str(self.worktree), harness='claude',
+                               session_id=SESSION, nbytes=entry['bytes'], argv=['cargo', 'test', 'dedupe'], now=self.now,
+                               declared=decl('build-crate', [SHARED]), waiter_pid=entry['waiter']['pid'], ancestor_fn=lambda p: True,
+                               requeue_capable=True)
+        self.assertEqual((out['id'], out.get('existing')), (qid, True))
+
+    def test_a_replacement_inherits_the_capability(self):
+        self.shape(True)
+        with backfill():
+            self.advance()
+        entry = self.entries()[self.docker_a]
+        wrapper = next(p for p in self.procs if p.pid == entry['waiter']['pid'])
+        declared = {k: entry[k] for k in ('class', 'mem_bytes', 'cpu_slots', 'test_threads', 'excl_keys')}
+        out = da.queue_claim(self.path, self.docker_a, entry['label'], entry['bytes'], ['cargo', 'test', entry['label']], str(self.worktree),
+                             lambda: 210 * GIB, pid=wrapper.pid, now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda p, a: None,
+                             declared=declared, host_fn=self.host, grant_environ={})
+        self.assertTrue(out['reason'].startswith('backfill-revoked'), out['reason'])
+        out = da.queue_enqueue(self.path, label=entry['label'], tickets=['HORO-1'], repo='horonom/x', worktree=str(self.worktree),
+                               harness='claude', session_id=SESSION, nbytes=entry['bytes'], argv=['cargo', 'test', entry['label']],
+                               now=self.now + timedelta(seconds=1), again=True, requeue_of=self.docker_a, declared=declared,
+                               waiter_pid=wrapper.pid, ancestor_fn=lambda p: True)
+        self.assertTrue(out['ok'], out)
+        self.assertIs(self.entries()[out['id']]['requeue_capable'], True)
 
 
 if __name__ == '__main__':
