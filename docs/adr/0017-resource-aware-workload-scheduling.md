@@ -430,7 +430,7 @@ exclusion key, which no amount of waiting by later work could change. The code i
 one-line pull request; **rollback is reverting it**. While off, `queue advance` writes rate-limited `backfill-shadow` receipts saying what
 it would have granted and grants nothing extra.
 
-Decision (only `_queue_advance` changes; claim, the grant object `{at, expires}`, fingerprints, `RUNNER_PROTOCOL` 2 and `LANE_PROTOCOL`
+Decision (only `_queue_advance` changes; claim (amended by revision 9a), the grant object `{at, expires}`, fingerprints, `RUNNER_PROTOCOL` 2 and `LANE_PROTOCOL`
 are unchanged):
 
 - **Pivot.** The oldest waiting entry, in a pass that granted nothing in order. It qualifies only when a lane is free, the floor holds,
@@ -455,8 +455,71 @@ are unchanged):
   `shadow-budget` receipt. The stall monitor needs no change: a backfilled grant is an ordinary stamped grant, and one left unclaimed
   falls under the existing failed-continuation timer.
 
-Prerequisite before the enabling pull request: shadow receipts over a representative window showing the decisions are the intended
-ones (the 2026-11-20 shape grants only the first docker job: the second shares its key, the local-agent build fails the CPU sum).
+### Revision 9a: hardening before enablement (still OFF)
+
+An independent review of the first cut set preconditions for ever enabling it. All of them are now in the code; `BACKFILL_ENABLED`
+stays `False` and the four-lane code is untouched.
+
+- **Exclusion keys are compared by identity.** New `cargo-target:` keys are resolved in cargo's own order (`--target-dir` in the job's
+  argv before any `--`, then `CARGO_TARGET_DIR`, then `CARGO_BUILD_TARGET_DIR`, then `build.target-dir` from the nearest
+  `.cargo/config` or `.cargo/config.toml` walking up from the working directory, then `$CARGO_HOME`'s, default `~/.cargo`, else
+  `./target`). A relative config value resolves against the directory holding that `.cargo`. The result is passed through `realpath`.
+  At decision time every key, stored or new, is compared through `excl_identity`: `(st_dev, st_ino)` when the directory exists, else its
+  realpath, NFC-normalised and case-folded on macOS. A folding error can only make two keys equal, the fail-safe direction. Stored keys
+  are never rewritten, the fingerprint never contained them, and claim never compares them, so queued entries keep working and are
+  protected by the alias rule too. This applies to every admission, not only backfill, and it changes clashes in both directions.
+  The identity comparison only adds clashes: two spellings of one target directory now clash where they did not before. The
+  corrected resolution order can remove clashes as well as add them:
+  - Removed: a job using `--target-dir`, a repository `.cargo/config.toml`, `CARGO_BUILD_TARGET_DIR` or `CARGO_HOME` used to be
+    keyed on the home config's target. It now gets its real, different directory and no longer clashes with jobs that really use
+    the home target.
+  - Added: a symlinked `~/.cargo/config.toml` is now followed, as cargo follows it; it used to be ignored, so `./target` was used.
+
+  Entries queued before this revision keep their old-rule keys until they drain.
+- **Head protection models tier loss and the latch.** The lane check uses the cap of the tier that the free space falls to after every
+  reservation and the candidate are counted: `heavy_lane_cap(tier(free - reserved - candidate), next_latch(...))`. That cap is also
+  bounded by the current tier's cap with the disk latch. A candidate that would leave the head without a lane is refused.
+  No existing helper projects the SPE-117 memory latch (pressure level, swap I/O, compressor) from declared bytes, so no threshold was
+  invented. The memory projection is the head's budget with the blockers removed (their load credit included) and the candidate charged
+  its full declared memory: it must be band GREEN and stay under the GREEN memory limit. The receipt's `math` carries `tier_after`,
+  `lanes_after`, `cap` and `band_after`.
+- **Claim re-checks head protection for backfilled grants.** A GRANTED entry is a backfilled grant when an earlier waiting entry is still
+  unlapsed. This is the same durable rule as the in-flight count, so a rotated receipt log cannot hide it. Claim then repeats the check
+  against the oldest waiting entry. That entry must be admitted outright, or refused only by the exclusion keys of claimed running
+  jobs, and `_protects_head` must hold with this grant charged.
+  - If the check fails, the grant is withdrawn: the entry becomes `EXPIRED`, its marker is dropped, and a `backfill-revoked` receipt
+    records the kind and the blocked id. The claim is refused with `backfill-revoked: ...`, so the owner re-enqueues.
+  - Without a host sample nothing can be shown either way. The claim is refused with `backfill-unverifiable: ...` and the grant is
+    kept, bounded by its window.
+  - Ordinary grants never reach this branch.
+- **Shorter window.** A backfilled grant expires after `BACKFILL_GRANT_S` = 600 s, against 1200 s for a hand-off and up to 4 h for a
+  grant with a waiter. Only `expires` changes. The grant object stays `{at, expires}` and the runner stamp stays in the receipt. On a
+  lapse the existing EXPIRED path applies and the in-flight count frees immediately. Monitor and recovery need no change:
+  `grant_window_s` reads the entry's own `at`/`expires`, a backfilled entry always has a waiter, and the recovery notice of 300 s is
+  shorter than the window.
+- **Smaller fixes.**
+  - `backfill` and `backfill-shadow` receipts list every blocker in `blockers`. `blocker_id`, `blocker_label` and `excl_key` keep the
+    first blocker for older readers.
+  - With `BACKFILL_MAX > 1` in OFF mode, each shadow candidate is judged beside the earlier ones, as the enabled pass would judge it.
+  - Waiter `ps` answers are cached for one pass.
+  - `admission-monitor.py callers` prints `backfill=absent|off|off-hardened|on|on-hardened` per checkout.
+  - Deliberately unchanged: the OFF-mode shadow does not run the SPE-117 memory-admission check, because that check writes the shared
+    latch state and a disabled feature must not change live admission. Its receipt records `memory_gate: not-asked`, and the band and
+    memory projection above still apply.
+
+Preconditions still open before the enabling pull request:
+
+1. Shadow evidence from the live queue. `backfill-shadow` receipts over a representative window must show that the decisions are the
+   intended ones. The 2026-11-20 shape grants only the first docker job: the second shares its key, and the local-agent build fails
+   the CPU sum.
+2. The same revision on every poller copy. `admission-monitor.py callers` must show `backfill=off-hardened` for every checkout
+   whose runner polls or claims from the queue before the flip. Each copy reads its own constant, so a stale copy never backfills
+   on its own. But a pre-hardening or pre-backfill copy that claims a backfilled grant skips the claim-time re-check. A
+   pre-backfill copy (`absent`) still counts a backfilled grant as an occupied lane.
+3. Consumers re-enqueue on revoke. `heavy-run` and `la-cargo` exit 77 when their entry turns `EXPIRED`, as they do today for a
+   lapsed grant. A revoked or lapsed backfilled grant would end the wrapper instead of queueing the job again. Either teach them to
+   re-enqueue with `--again`, or accept exit 77 as the documented outcome.
+4. The enabling pull request itself, one line, reviewed on its own. Reverting it is the rollback.
 
 ## Version history
 
@@ -472,3 +535,4 @@ ones (the 2026-11-20 shape grants only the first docker job: the second shares i
 | 7 | Third lane enabled as a monitored, reversible pilot on the owner's instruction (2026-11-16): `THIRD_LANE_ENABLED = True`. Disk, memory-pressure, CPU, headroom and class limits unchanged, so a third job still needs the budget to pass (a `light` or class-eligible `build-crate` request). If the pilot hits a limit, new third-lane admission stops by revert; trial evidence under the revision 6 criteria still decides whether to retain it as the default (SPE-160) |
 | 8 | Four-lane code shipped OFF (`FOURTH_LANE_ENABLED = False`, `FOUR_LANE_CEILING` 4): lane-4 capacity gates, `lane_protocol` queue stamp, `fits_if_cap_were_4`; enabling is a separate reviewed PR, rollback is its revert (SPE-176) |
 | 9 | Strict FIFO amended: bounded backfill past a head blocked only by an exclusion key held by a claimed running job, shipped OFF (`BACKFILL_ENABLED = False`, `BACKFILL_MAX = 1`); head protection from declared reservations, same-key order kept, `backfill` / `backfill-shadow` receipts (SPE-176) |
+| 9a | Backfill hardening, still OFF: exclusion keys compared by directory identity, with new keys in cargo's own target-dir order; head protection projects tier loss and the latch; claim-time re-check revokes a backfilled grant whose protection broke; `BACKFILL_GRANT_S` 600 s; all blockers in receipts; open preconditions listed (SPE-176) |
