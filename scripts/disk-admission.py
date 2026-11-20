@@ -1338,6 +1338,13 @@ QUEUE_GRANT_S = 3600
 # the owner re-enqueues. Entries with a declared waiter keep min(grant_s, QUEUE_MAX_GRANT_S); an explicit smaller grant_s still wins.
 HANDOFF_GRANT_S = 1200
 QUEUE_MAX_GRANT_S = 4 * 3600
+# Bounded backfill (SPE-176, ADR 0017 revision 9) ships OFF: while off, queue advance only writes rate-limited `backfill-shadow` receipts
+# saying what it would have granted. Turning it on is a separate reviewed one-line PR flipping BACKFILL_ENABLED, and reverting that PR
+# is the rollback; as with FOURTH_LANE_ENABLED there is deliberately no flag file or environment switch (a writable switch is a forgeable
+# cap). BACKFILL_MAX is how many entries may hold a lane ahead of the oldest waiting entry at once.
+BACKFILL_ENABLED = False
+BACKFILL_MAX = 1
+BACKFILL_SHADOW_WINDOW_S = 600
 WAITING_STATES = ('QUEUED', 'ELIGIBLE', 'GRANTED')
 LIVE_STATES = WAITING_STATES + ('CLAIMED',)
 TERMINAL_STATES = ('RELEASED', 'EXPIRED', 'CANCELLED')
@@ -1774,34 +1781,10 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
             orphans = _claimed_orphans(entries, live, token_fn, table_fn, state_path)
             in_use = len(live) + len(granted) + len(orphans)
             reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans) + sum(e['bytes'] for e in granted)
-            # Strict first-in-first-out: grant the head, then try the next with the budget recomputed beside the new grant, and
-            # stop at the first entry that does not fit. A later, smaller entry never overtakes a larger head.
-            for nxt in waiting:
-                floor_ok = result['free_bytes'] - reserved - nxt['bytes'] >= HEAVY_FLOOR
-                budget = None
-                if host is not None:
-                    budget = _shadow_site(host, 'advance', nxt['label'], lambda: (
-                        budget_holders(live, orphans, granted, now), budget_request(nxt, nxt['bytes'], nxt['label'])), result['tier'],
-                                          result['free_bytes'], reserved, True)
-                budget_why = _lane_refusal(budget, in_use, result['free_bytes'], reserved, nxt['bytes'], nxt) if in_use < lanes else None
-                _mark_enforced(budget, in_use < lanes and floor_ok and not budget_why)
-                if budget is not None:
-                    out['budget'] = budget
-                    if memory != 'probe':   # the probe pass repeats in the final pass: one receipt per decision, not two
-                        _budget_receipt(state_path, nxt, now, budget)
-                if in_use >= lanes or not floor_ok or budget_why:
-                    if not out['granted']:
-                        out['reason'] = ('lane occupied' if in_use >= lanes else
-                                         'over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested for %s, floor 100 GiB' % (
-                                             result['free_bytes'] / GIB, reserved / GIB, nxt['bytes'] / GIB, nxt['id'])
-                                         if not floor_ok else budget_why)
-                    return out
-                if memory == 'probe':
-                    out['grant_pending'] = True   # the head fits: the caller asks the memory gate outside the lock, then calls again
-                    return out
-                if type(memory) is tuple and not memory[0] and not out['granted']:
-                    out['reason'] = 'memory-gate: %s' % memory[1]
-                    return out
+            backfill = None   # set at the pivot when bounded backfill applies (ADR 0017 revision 9)
+
+            def grant(nxt):
+                nonlocal in_use, reserved
                 window = min(grant_s, QUEUE_MAX_GRANT_S if 'waiter' in nxt else HANDOFF_GRANT_S)   # once per entry: grant, marker, receipt
                 nxt['state'] = 'GRANTED'
                 # The grant object is exactly {at, expires}: a hand-off consumer validates it as a closed key set (the HORO-2139 executor
@@ -1819,6 +1802,76 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                 granted.append(nxt)
                 in_use += 1
                 reserved += nxt['bytes']
+
+            # First in, first out: grant the head, then try the next with the budget recomputed beside the new grant, and stop at the
+            # first entry that does not fit (the pivot). A later entry overtakes it only through bounded backfill: the pivot is blocked
+            # solely by an exclusion key a claimed running job holds, the candidate shares no key with the pivot or any skipped entry,
+            # passes every lane check and leaves room for the pivot once its blocker releases (_backfill_candidate).
+            for nxt in waiting:
+                if backfill is not None:
+                    verdict = _backfill_candidate(state_path, nxt, backfill, host, result, live, orphans, granted, entries, now, in_use,
+                                                  reserved, lanes, waiter_token_fn or waiter_token)
+                    if verdict == 'stop':
+                        return out
+                    if verdict is None:
+                        continue
+                    if not BACKFILL_ENABLED:
+                        if not _recent_backfill_shadow(queue_dir(state_path) / 'receipts.jsonl', backfill['pivot'], nxt['id'], now):
+                            _queue_receipt(state_path, 'backfill-shadow', nxt, now, **verdict)
+                        out['backfill_shadow'].append(nxt['id'])
+                    else:
+                        if memory == 'probe':
+                            out['grant_pending'] = True   # the final pass re-derives the whole decision from scratch
+                            return out
+                        if type(memory) is tuple and not memory[0]:
+                            out['reason'] = 'memory-gate: %s' % memory[1]
+                            return out
+                        _queue_receipt(state_path, 'backfill', nxt, now, **verdict)
+                        grant(nxt)
+                        out['backfilled'].append(nxt['id'])
+                    backfill['keys'] |= set(nxt.get('excl_keys') or [])
+                    backfill['taken'] += 1
+                    if backfill['in_flight'] + backfill['taken'] >= BACKFILL_MAX:
+                        return out
+                    continue
+                floor_ok = result['free_bytes'] - reserved - nxt['bytes'] >= HEAVY_FLOOR
+                budget = None
+                if host is not None:
+                    budget = _shadow_site(host, 'advance', nxt['label'], lambda: (
+                        budget_holders(live, orphans, granted, now), budget_request(nxt, nxt['bytes'], nxt['label'])), result['tier'],
+                                          result['free_bytes'], reserved, True)
+                budget_why = _lane_refusal(budget, in_use, result['free_bytes'], reserved, nxt['bytes'], nxt) if in_use < lanes else None
+                _mark_enforced(budget, in_use < lanes and floor_ok and not budget_why)
+                if budget is not None:
+                    out['budget'] = budget
+                    if memory != 'probe':   # the probe pass repeats in the final pass: one receipt per decision, not two
+                        _budget_receipt(state_path, nxt, now, budget)
+                if in_use >= lanes or not floor_ok or budget_why:
+                    if out['granted']:
+                        return out   # a pass that granted in order never also backfills: the pivot is always the oldest waiting entry
+                    out['reason'] = ('lane occupied' if in_use >= lanes else
+                                     'over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested for %s, floor 100 GiB' % (
+                                         result['free_bytes'] / GIB, reserved / GIB, nxt['bytes'] / GIB, nxt['id'])
+                                     if not floor_ok else budget_why)
+                    blockers = _excl_only_blockers(budget, in_use, lanes, floor_ok, result['free_bytes'], reserved, nxt, live, entries)
+                    if blockers is None:
+                        return out
+                    # Overtakers already in flight, from durable states alone: a GRANTED or CLAIMED entry queued after the oldest waiting
+                    # one got its lane by backfill. Read under the lock, so concurrent pollers can never exceed BACKFILL_MAX together.
+                    in_flight = sum(1 for e in entries if e['state'] in ('GRANTED', 'CLAIMED') and e['seq'] > nxt['seq'])
+                    out.update(head_reason=out['reason'], backfilled=[], backfill_shadow=[])
+                    if in_flight >= BACKFILL_MAX:
+                        return out
+                    backfill = {'pivot': nxt['id'], 'head': nxt, 'blockers': blockers, 'keys': set(nxt.get('excl_keys') or []),
+                                'in_flight': in_flight, 'taken': 0}
+                    continue
+                if memory == 'probe':
+                    out['grant_pending'] = True   # the head fits: the caller asks the memory gate outside the lock, then calls again
+                    return out
+                if type(memory) is tuple and not memory[0] and not out['granted']:
+                    out['reason'] = 'memory-gate: %s' % memory[1]
+                    return out
+                grant(nxt)
             return out
     except StateError as exc:
         out['reason'] = '%s: %s' % (exc.kind, exc)
@@ -2742,6 +2795,10 @@ def budget_decision(host, reservations, request, caps):
     clash = sorted({h['label'] for h in reservations if taken & set(h['excl_keys'])})
     if clash:
         reasons.append('excl_key overlap with %s' % ', '.join(clash))
+    # One row per clashing holder with its kind (no dedupe by label), so bounded backfill can tell a running claimed job from an unclaimed
+    # grant or an orphan and fail closed on anything but the first.
+    out['excl_clash'] = [{'label': h['label'], 'kind': h['kind'], 'keys': sorted(taken & set(h['excl_keys']))}
+                         for h in reservations if taken & set(h['excl_keys'])]
     if caps.get('free_bytes') is not None and caps['free_bytes'] - caps.get('reserved_bytes', 0) - request['bytes'] < caps.get('floor', 0):
         reasons.append('byte floor: %s free - %s reserved - %s requested < %s' % (
             _gib(caps['free_bytes']), _gib(caps.get('reserved_bytes', 0)), _gib(request['bytes']), _gib(caps['floor'])))
@@ -3098,6 +3155,121 @@ def _lane_refusal(budget, in_use, free, reserved, nbytes, entry=None):
     if _four_lane_mode() and entry is not None and in_use >= 2 and not _stamped(entry):
         return 'budget: lane %d needs a stamped runner (head %s)' % (in_use + 1, entry.get('id', '?'))
     return _fourth_lane_refusal(budget, in_use, free, reserved, nbytes) or _budget_refusal(budget, in_use)
+
+
+def _excl_only_blockers(budget, in_use, lanes, floor_ok, free, reserved, entry, live, entries):
+    """The jobs whose exclusion keys alone refuse `entry`, or None. Pure. The pivot must have a free lane, the disk floor, an ok budget
+    in band GREEN within the cap, and no refusal but the excl_key overlap (the same budget without it must pass _lane_refusal). Every
+    clashing holder must be a live reservation, not past its time limit nor unresolved, of a CLAIMED queue entry: an orphan, an
+    unclaimed grant or a reservation made outside the queue has no known release path, so it disqualifies backfill (fail closed)."""
+    if in_use >= lanes or not floor_ok or not budget or budget.get('status') != 'ok' or budget.get('band') != 'GREEN':
+        return None
+    clash, reasons = budget.get('excl_clash') or [], list(budget.get('resource_reasons') or [])
+    if budget.get('cap_reason') or not clash or len(reasons) != 1 or not reasons[0].startswith('excl_key overlap with '):
+        return None
+    if _lane_refusal(dict(budget, resource_reasons=[], would_admit=True), in_use, free, reserved, entry['bytes'], entry):
+        return None
+    claimed = {e['id']: e for e in entries if e['state'] == 'CLAIMED'}
+    by_label = {r['label']: r for r in live}
+    blockers = []
+    for row in clash:
+        record = by_label.get(row.get('label'))
+        if row.get('kind') != 'reservation' or record is None or record.get('past_ttl') or record.get('unresolved'):
+            return None
+        holder = claimed.get(record.get('queue_id'))
+        if holder is None or holder['label'] != record['label'] or holder['holder']['pid'] != record['pid'] or not row.get('keys'):
+            return None
+        blockers.append({'id': holder['id'], 'label': record['label'], 'pid': record['pid'], 'keys': list(row['keys'])})
+    return blockers
+
+
+def _protects_head(host, head, cand, blockers, live, orphans, granted, now, tier, free, reserved, in_use, lanes):
+    """(ok, math): would `head` still be admitted once its blockers release, with `cand` granted beside everything else? Pure.
+
+    Declared reservations only: the disk check counts every current reservation, the blockers included (a release is not credited
+    before it happens), plus the candidate and the head. The lane check frees only the blockers' lanes. Memory and CPU run the budget
+    for the head with the blockers removed and the candidate as an unclaimed grant charged its full declared size, on the same host
+    sample; it must give no refusal, band GREEN and fit the cap. The blockers' measured memory stays in the sample: conservative."""
+    math = {'free': free, 'reserved': reserved, 'cand_bytes': cand['bytes'], 'head_bytes': head['bytes'], 'floor': HEAVY_FLOOR,
+            'disk_left': free - reserved - cand['bytes'] - head['bytes'], 'in_use': in_use, 'lanes': lanes,
+            'head_projected': None, 'head_limit': None, 'head_cpu': None, 'cpu_limit': None}
+    ok = math['disk_left'] >= HEAVY_FLOOR and in_use + 1 - len(blockers) < lanes
+    try:
+        gone = {b['label'] for b in blockers}
+        holders = [h for h in budget_holders(live, orphans, granted, now) if not (h['kind'] == 'reservation' and h['label'] in gone)]
+        holders.append(budget_holder('granted', cand))
+        caps = {'max_concurrent': heavy_lane_cap(tier), 'free_bytes': free, 'reserved_bytes': reserved + cand['bytes'], 'floor': HEAVY_FLOOR}
+        verdict = budget_decision(host, holders, budget_request(head, head['bytes'], head['label']), caps)
+    except Exception:   # malformed records under the lock: no backfill, never an aborted advance
+        return False, math
+    if verdict.get('status') != 'ok':
+        return False, math
+    math.update(head_projected=verdict['projected_bytes'], head_limit=verdict['limit_bytes'],
+                head_cpu=verdict['cpu_slots_used'] + (head.get('cpu_slots') or 0),
+                cpu_limit=verdict['cpu_limit'])
+    ok = ok and not verdict['resource_reasons'] and verdict['band'] == 'GREEN' and not verdict['cap_reason']
+    return ok, math
+
+
+def _waiter_proven_alive(entry, token_fn):
+    """True only when the entry's declared waiter is positively alive (same start token). No waiter, a gone or reused pid and an
+    uninspectable one are all False: a waiter-less hand-off is never backfilled, because nobody may be there to claim the lane."""
+    waiter = entry.get('waiter')
+    if not waiter:
+        return False
+    try:
+        current = token_fn(waiter['pid'])
+    except Exception:
+        return False
+    return current is not None and current == waiter['start_token']
+
+
+def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans, granted, entries, now, in_use, reserved, lanes, waiter_fn):
+    """One later entry in candidate mode: 'stop' (no lane left), None (refused; its keys join the skipped set, so a later entry can never
+    overtake it on a shared key) or the receipt fields of a qualifying candidate. Every lane check of the head applies to it."""
+    keys = set(cand.get('excl_keys') or [])
+    free = result['free_bytes']
+    if in_use >= lanes:
+        return 'stop'
+    refused = bool(keys & backfill['keys']) or not _waiter_proven_alive(cand, waiter_fn) or free - reserved - cand['bytes'] < HEAVY_FLOOR
+    if not refused:
+        budget = None
+        if host is not None:
+            budget = _shadow_site(host, 'backfill', cand['label'], lambda: (
+                budget_holders(live, orphans, granted, now), budget_request(cand, cand['bytes'], cand['label'])), result['tier'], free, reserved, True)
+        refused = bool(_lane_refusal(budget, in_use, free, reserved, cand['bytes'], cand))
+    if not refused:
+        ok, math = _protects_head(host, backfill['head'], cand, backfill['blockers'], live, orphans, granted, now, result['tier'], free,
+                                  reserved, in_use, lanes)
+        refused = not ok
+    if refused:
+        backfill['keys'] |= keys
+        return None
+    blocker = backfill['blockers'][0]
+    return {'blocked_id': backfill['pivot'], 'blocker_id': blocker['id'], 'blocker_label': blocker['label'], 'excl_key': blocker['keys'][0],
+            'reason': 'head-excl-only', 'math': math, 'in_flight': backfill['in_flight'] + backfill['taken'], 'cap': BACKFILL_MAX}
+
+
+def _recent_backfill_shadow(path, pivot, cand, now):
+    """True when the newest backfill-shadow line for this (pivot, candidate) pair is inside the window (tail of the log only)."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return False
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - RECEIPT_ROTATE_BYTES))
+            raw = handle.read(RECEIPT_ROTATE_BYTES + 1).decode('utf-8', 'replace')
+    except OSError:
+        return False
+    for text in reversed(raw.splitlines()):
+        try:
+            line = json.loads(text)
+            if line.get('event') == 'backfill-shadow' and line.get('id') == cand and line.get('blocked_id') == pivot:
+                return (now - _parse_time(line['ts'])).total_seconds() < BACKFILL_SHADOW_WINDOW_S
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return False
 
 
 def _budget_allows(budget, in_use):

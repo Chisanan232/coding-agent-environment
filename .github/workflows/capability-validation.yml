@@ -31,6 +31,7 @@ on:
       - 'tests/test-la-cargo.py'
       - 'scripts/heavy-run'
       - 'tests/test-heavy-run.py'
+      - 'tests/test-admission-backfill.py'
       - 'scripts/resource-lifecycle.py'
       - 'scripts/hook-rollout.py'
       - 'scripts/owner-merge-gate.py'
@@ -141,6 +142,7 @@ jobs:
           python3 tests/test-admission-measurements.py
           python3 tests/test-trial-report.py
           python3 tests/test-heavy-lane-cap.py
+          python3 tests/test-admission-backfill.py
           python3 tests/test-four-lane-acceptance.py
           python3 tests/test-la-cargo.py
           python3 tests/test-heavy-run.py

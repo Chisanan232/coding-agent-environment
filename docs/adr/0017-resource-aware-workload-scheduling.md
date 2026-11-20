@@ -97,7 +97,8 @@ admission logic tested and the rollback documented before rollout.
   a running job is never refused its renewal because the host turned AMBER.
 - **Strict first-in-first-out grants.** `queue advance` grants the head, recomputes the budget beside that grant from the same host
   sample, and tries the next entry; it stops at the first entry that does not fit, so a smaller later entry never overtakes a larger
-  head. Bytes of grants made earlier in the same call count toward the 100 GiB floor. A claim re-checks the budget under the lock; a
+  head (amended by revision 9: bounded backfill past a head blocked only by an exclusion key, shipped off). Bytes of grants made
+  earlier in the same call count toward the 100 GiB floor. A claim re-checks the budget under the lock; a
   refusal keeps the grant (backpressure), and the grant window still lapses after an hour.
 - **Per-job limits.** A job started by `run` or `run --queue-id` gets `CARGO_BUILD_JOBS` (and test threads) from the band: GREEN the
   class values, AMBER about half, RED the class minimum, an unavailable budget the declared figures, and never above what the job set
@@ -420,6 +421,43 @@ Prerequisites before the enabling pull request: every active checkout is at or a
 older runner is in use; the stamp makes a straggler wait rather than overrun), measured headroom for four concurrent jobs (a trial
 report at three lanes with free space comfortably above 200 GiB after reservations), and no unmanaged trees in the report window.
 
+## Revision 9: bounded backfill past an exclusion-key-blocked head, code shipped off (SPE-176)
+
+Revision 2's strict first-in-first-out rule is amended for one case. On 2026-11-20 the head (q000830, shared Cargo target) waited behind
+q000828 on the same target while free lanes, disk, memory and CPU would have run an unrelated docker job: the head was blocked only by an
+exclusion key, which no amount of waiting by later work could change. The code is merged **disabled**: `BACKFILL_ENABLED = False`,
+`BACKFILL_MAX = 1` in `scripts/disk-admission.py`, with no flag file or environment switch (revision 8's reasoning). Enabling is a separate
+one-line pull request; **rollback is reverting it**. While off, `queue advance` writes rate-limited `backfill-shadow` receipts saying what
+it would have granted and grants nothing extra.
+
+Decision (only `_queue_advance` changes; claim, the grant object `{at, expires}`, fingerprints, `RUNNER_PROTOCOL` 2 and `LANE_PROTOCOL`
+are unchanged):
+
+- **Pivot.** The oldest waiting entry, in a pass that granted nothing in order. It qualifies only when a lane is free, the floor holds,
+  the budget is ok in band GREEN within the cap and its single refusal is the exclusion-key overlap (`budget_decision` now also returns a
+  structured `excl_clash`; reason strings unchanged). Every clashing holder must be the live reservation of a CLAIMED queue entry, not
+  past its time limit and not unresolved. An orphan, an unclaimed grant or a reservation made outside the queue has no known release
+  path and disqualifies (fail closed).
+- **Candidate.** The earliest later entry that shares no exclusion key with the pivot or with any entry skipped before it (so same-key
+  order is never violated), whose declared waiter is proven alive (waiter-less hand-offs are never backfilled), and that passes every
+  existing check: cap, floor, budget (its exclusion keys against all live and granted holders) and the lane-site refusal.
+- **Head protection.** From declared reservations only: free minus every current reservation (the blocker included, its release not
+  credited early) minus candidate and head at or above 100 GiB; one lane left for the head once the blockers leave; the head's budget,
+  with the blockers removed and the candidate charged its full declared size on the same host sample, gives no refusal, band GREEN and
+  fits the cap. The blocker's measured memory stays in the sample, so the check errs towards refusing.
+- **Bound.** At most `BACKFILL_MAX` GRANTED or CLAIMED entries with a higher seq than the oldest waiting entry, counted from entry
+  states under the lock, so concurrent pollers cannot exceed it; the probe pass returns `grant_pending` and the final pass re-derives
+  everything after the memory gate. Every pass starts at the oldest entry, so once the blocker releases the head is considered first.
+- **Global refusals first.** Tier without lanes, latch, unreadable state, the head's floor and the memory gate refuse before candidate
+  mode. A claim still re-checks memory, disk, lanes and the budget at claim time.
+- **Evidence.** A backfill writes a `backfill` receipt (blocked id, blocker id and label, exclusion key, reason `head-excl-only`, disk,
+  lane, memory and CPU figures, in-flight count and cap) before the unchanged `granted` receipt. Scanned candidates write no
+  `shadow-budget` receipt. The stall monitor needs no change: a backfilled grant is an ordinary stamped grant, and one left unclaimed
+  falls under the existing failed-continuation timer.
+
+Prerequisite before the enabling pull request: shadow receipts over a representative window showing the decisions are the intended
+ones (the 2026-11-20 shape grants only the first docker job: the second shares its key, the local-agent build fails the CPU sum).
+
 ## Version history
 
 | Rev | Change |
@@ -433,3 +471,4 @@ report at three lanes with free space comfortably above 200 GiB after reservatio
 | 6 | Overlap-time criterion 5 h replaced by 15 min plus 20 evaluable overlap samples; all other trial criteria and admission safeguards unchanged (SPE-160, owner-approved 2026-11-14) |
 | 7 | Third lane enabled as a monitored, reversible pilot on the owner's instruction (2026-11-16): `THIRD_LANE_ENABLED = True`. Disk, memory-pressure, CPU, headroom and class limits unchanged, so a third job still needs the budget to pass (a `light` or class-eligible `build-crate` request). If the pilot hits a limit, new third-lane admission stops by revert; trial evidence under the revision 6 criteria still decides whether to retain it as the default (SPE-160) |
 | 8 | Four-lane code shipped OFF (`FOURTH_LANE_ENABLED = False`, `FOUR_LANE_CEILING` 4): lane-4 capacity gates, `lane_protocol` queue stamp, `fits_if_cap_were_4`; enabling is a separate reviewed PR, rollback is its revert (SPE-176) |
+| 9 | Strict FIFO amended: bounded backfill past a head blocked only by an exclusion key held by a claimed running job, shipped OFF (`BACKFILL_ENABLED = False`, `BACKFILL_MAX = 1`); head protection from declared reservations, same-key order kept, `backfill` / `backfill-shadow` receipts (SPE-176) |

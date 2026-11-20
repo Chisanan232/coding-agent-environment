@@ -405,8 +405,20 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
   Order of refusal: cap, then the byte floor (`over-capacity`), then the budget.
 - `reserve`: a same-process refresh of its own reservation is exempt from the budget. The queue-ahead rule is unchanged.
 - `queue advance`: grants the head, then tries the next entry with the budget recomputed from the single host sample taken before the
-  lock, and stops at the first entry that does not fit (no overtaking, no backfill). Grants made in the same call count toward the
-  floor. `ok` also covers a `budget:` reason.
+  lock, and stops at the first entry that does not fit (the pivot). Grants made in the same call count toward the floor. `ok` also
+  covers a `budget:` reason. Bounded backfill (ADR 0017 revision 9, shipped OFF: `BACKFILL_ENABLED = False`, `BACKFILL_MAX = 1`) is
+  the only overtaking: when the pivot is the oldest waiting entry and its sole refusal is `excl_key overlap with <label>` held by the
+  live reservation of a CLAIMED queue entry (not past its time limit, not unresolved; an orphan, unclaimed grant or non-queue
+  reservation disqualifies), advance scans later entries in order for the first one that shares no exclusion key with the pivot or any
+  skipped entry, has a waiter proven alive (a waiter-less hand-off is never backfilled), passes every lane check (cap, floor, budget
+  including exclusion keys) and leaves the pivot admissible once its blocker releases (disk: free minus every current reservation, the
+  blocker included, minus candidate and pivot at or above 100 GiB; the pivot's budget with the blockers removed and the candidate
+  charged its full declared size: no refusal, band GREEN, within the cap). At most `BACKFILL_MAX` GRANTED or CLAIMED entries may sit
+  ahead of the oldest waiting entry (counted from entry states under the lock). The tier, latch, floor and memory gate refuse first,
+  exactly as before. A backfilled grant writes a `backfill` receipt (blocked id, blocker id and label, exclusion key, reason
+  `head-excl-only`, the disk/lane/memory/CPU figures, in-flight count and cap) before its usual `granted` receipt. While OFF, advance
+  grants nothing extra and writes one `backfill-shadow` receipt per (pivot, candidate) per 10 minutes. `out` gains `head_reason`,
+  `backfilled` and `backfill_shadow`.
 - `queue advance` and memory (SPE-175): the CLI grants the head only when the SPE-117 memory gate admits, because `queue claim` runs that
   gate and a grant it would refuse only holds a lane for its whole window and then lapses unclaimed. The gate takes 10 s or more, so it
   runs outside the lock and only when the head otherwise fits (a lane is free, the floor holds, the budget allows); otherwise it is not
