@@ -566,6 +566,8 @@ stays `False` and the four-lane code is untouched.
       (pivot, candidate) per 10 minutes.
     - In OFF mode the skipped entry is not counted as a shadow grant.
   - **Inheritance.** A replacement made by `--requeue-of` inherits `requeue_capable` from the entry it replaces.
+  - **First enqueue only.** A `--requeue-of` call omits the flag, because the replacement inherits the field. A re-queue therefore
+    still works if the checkout moved back to an older runner during a long wait.
   - **Which runner gets the flag.** A wrapper passes the flag only when its runner file contains the `'--requeue-capable'` option
     string. The check reads the file as text and never runs it. `heavy-run` uses its own checkout's runner, which always contains it.
     `la-cargo` calls whatever `LA_CARGO_RUNNER` or the main-view checkout provides, so an older runner never receives an unknown flag.
@@ -593,7 +595,10 @@ q000836 (`p2556f`, a docker job) at 11:05:56Z, 11:16:03Z, 11:26:08Z and 11:36:11
 Preconditions still open before the enabling pull request:
 
 1. More shadow evidence. The window above is one shape over about 30 minutes. Before the flip, review the live `backfill-shadow`
-   receipts again over a representative window.
+   receipts again over a representative window that covers more than one queue shape.
+   - Filter out every receipt that has `skipped` set. A `skipped: no-requeue-capability` receipt is written in ON and OFF mode
+     alike, and records a candidate that was not backfilled.
+   - Only receipts without `skipped` show what backfill would have granted.
 2. The same revision on every poller copy. `admission-monitor.py callers` must show `backfill=off-hardened` for every checkout
    whose runner polls or claims from the queue before the flip. Each copy reads its own constant, so a stale copy never backfills
    on its own. But a pre-hardening or pre-backfill copy that claims a backfilled grant skips the claim-time re-check. A

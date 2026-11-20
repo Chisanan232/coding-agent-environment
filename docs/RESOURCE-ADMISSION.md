@@ -456,9 +456,14 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
   - **Backfill gate.** Backfill (ON, or OFF in shadow) never grants a candidate without the field. Such a candidate is skipped like a
     refused one: its keys still hold later same-key entries behind it.
   - **Skip receipt.** The skip is recorded once per (pivot, candidate) per 10 minutes as a `backfill-shadow` receipt with
-    `skipped: no-requeue-capability`.
+    `skipped: no-requeue-capability`. It is written in ON and OFF mode alike. When you review shadow evidence before the ON flip:
+    - filter out receipts with `skipped` set: only the rest show what backfill would have granted;
+    - look at decisions over more than one queue shape.
   - **Who passes the flag.** `heavy-run` and `la-cargo` pass it only when their runner file contains the `'--requeue-capable'` option
     string. They read the file as text and never run it, so an older runner is never handed an unknown flag.
+  - **First enqueue only.** The wrappers pass it on the first enqueue. A `--requeue-of` call omits it, because the replacement
+    inherits the field. A re-queue therefore cannot be refused just because the checkout moved back to an older runner during a long
+    wait.
 - `heavy-run` and `la-cargo` use `--requeue-of` when their polled entry turns `EXPIRED`.
   - They accept the reply only when it names the old id in `requeue_of`. On success they print
     `backfill grant revoked; re-queued as qNNNNNN` (or `backfill grant lapsed unclaimed; ...` for a lapse), move their registration
