@@ -1623,6 +1623,32 @@ class RestCommentSource(unittest.TestCase):
         trusted = [c for c in merged if c.get("includesCreatedEdit") is False and c.get("isMinimized") is False]
         self.assertEqual(trusted, [])
 
+    def test_a_graphql_only_entry_cannot_outrank_a_newer_rest_entry(self):
+        old = dict(self.MINE, body=REVIEW.replace("independent-agent-1", "independent-agent-0"), createdAt="2026-11-17T20:00:00Z")
+        new = dict(self.MINE, createdAt="2026-11-17T20:10:00Z")
+        # An edit race left the old record only in GraphQL: it is appended last, but it is older.
+        merged, _, _ = omg.merged_comments(Fake(rest_comments=[new]), "Chisanan232/r", 7, [old])
+        self.assertEqual([c["createdAt"] for c in merged], ["2026-11-17T20:00:00Z", "2026-11-17T20:10:00Z"])
+        # Latest wins at evaluation: the newer (REST) reviewer id is the one the gate checks.
+        _, _, facts = run(Fake(comments=[old], rest_comments=[new]))
+        self.assertEqual(facts["reviewer"], "independent-agent-1")
+
+    def test_equal_times_keep_the_rest_first_order(self):
+        a = dict(self.MINE, body="a")
+        b = dict(self.MINE, body="b")
+        merged, _, _ = omg.merged_comments(Fake(rest_comments=[a]), "Chisanan232/r", 7, [b])
+        self.assertEqual([c["body"] for c in merged], ["a", "b"])
+
+    def test_a_rest_reply_of_the_wrong_shape_is_unreadable(self):
+        for shape in ({}, [1], ["x"], {"message": "Not Found"}):
+            with self.subTest(shape=shape):
+                self.refused(Fake(rest_comments=shape), "COMMENTS_UNREADABLE")
+
+    def test_the_review_completion_time_refuses_when_graphql_alone_has_100_comments(self):
+        filler = [dict(self.MINE, body=f"note {i}") for i in range(99)]
+        with self.assertRaisesRegex(ValueError, "100 or more"):
+            omg.review_completed_at(Fake(comments=filler + [self.MINE], rest_comments=[self.MINE]), "Chisanan232/r", 7, HEAD)
+
     def test_the_rest_read_is_one_exact_allowlisted_call(self):
         omg.read_only(("api", "repos/Chisanan232/r/issues/7/comments?per_page=100", "--jq", omg.REST_COMMENTS_JQ))
         for path in ("repos/Chisanan232/r/issues/7/comments",
