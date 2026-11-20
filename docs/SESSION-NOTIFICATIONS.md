@@ -117,6 +117,18 @@ The `--signature` must stay stable for the life of one incident and must never b
 
 The id `admission-monitor` is reserved: hook events carrying it (compared case-insensitively) are ignored (no write), and `sweep` never marks it stale or removes it, though it still retries its deliveries. If its state record is corrupt or untrusted it is renamed to `admission-monitor.json.corrupt` (one kept; only for `corrupt`, `not-regular`, `too-large`, `foreign-owner`; a directory at that marker path makes the emit fail with `untrusted`) and rebuilt, so alerting cannot fail forever; real session records keep the untrusted behaviour. Remote backends are refused for it under the corporate profile or a corporate session, checked at delivery like any other record.
 
+## Claude sign-in notices (`emit-resource`, SPE-176, ADR 0020)
+
+`scripts/claude-auth-watch.py` is the only detector and sender of sign-in alerts and uses `emit-resource` as its transport; nothing else should send them.
+Three more causes, with their own phrases and a synthetic session `claude-auth-watch` (reserved like `admission-monitor`; `--clear --scope auth` returns only that session to IDLE):
+
+- `--cause auth-required` with `--recovery no-auto-recovery --owner-action sign-in-claude`: title `Claude Code: sign-in required`.
+- `--cause remote-control-disconnect` with `--recovery remote-control-only --owner-action reconnect-remote-control`: title `Claude Code: Remote Control disconnected`, never worded as sign-in.
+- `--cause signin-recovered` with `--recovery sessions-resumed --owner-action verify-resumed-work`: title `Claude Code: sign-in recovered`.
+- `--detail D` (these causes only; anything else is `invalid`): 1 to 160 characters of `[A-Za-z0-9 ._(),+=-]` such as `host=mac names=alpha,beta +2 more`. A newline, URL, slash, colon, quote, bracket, backtick, asterisk or pipe is rejected at the CLI (exit 2) and in the engine, and a stored detail is re-checked at delivery. It is the only free-looking field in any notification.
+
+Mixing a sign-in cause with an admission phrase (or the reverse) is `invalid`. The id `claude-auth-watch` is ignored in hook events, case-insensitively.
+
 ## Crash and silence handling
 
 Hooks cannot run after `kill -9`, power loss or a reboot. `session-notify.py sweep` (cheap, run on a timer; not installed here) marks a `RUNNING` session whose last heartbeat is older than `stale_after_seconds` (default 2700) as `FAILED` once with the notice "no heartbeat". `PostToolUse` is the heartbeat, throttled to one write per 30 s, so a long build inside one tool call is covered by the threshold. Blocked, idle and ended sessions are never stale. Records finished for 14 days are removed. Example timer (a template, not installed):

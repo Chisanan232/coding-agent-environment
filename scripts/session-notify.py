@@ -5,7 +5,7 @@
   session-notify.py status [--json]              table of tracked sessions (read-only)
   session-notify.py sweep [--now EPOCH]          stale-session detection, delivery retry, old-record cleanup
   session-notify.py checkpoint --state S ...     write the structured checkpoint a session uses to declare its state
-  session-notify.py emit-resource --cause C --recovery R --owner-action A [--signature HEX16 | --clear]   admission-stall notice (enums only)
+  session-notify.py emit-resource --cause C --recovery R --owner-action A [--signature HEX16] [--detail D] | --clear [--scope admission|auth]   stall and sign-in notices
   session-notify.py render-config [--profile personal|corporate] [--out FILE]
 
 One short-lived process per hook, no daemon. Per-session state lives under
@@ -63,10 +63,14 @@ CAUSE_TEXT = {"disk-floor": "disk below floor", "memory-pressure": "memory press
               "outdated-caller": "outdated caller", "stalled-running": "running work stalled", "unobservable": "admission unobservable",
               "state-unreadable": "admission state unreadable",
               "obsolete-wrapper-terminated": "obsolete wrapper terminated", "abandoned-unstarted-cancelled": "abandoned grant cancelled",
-              "failed-to-terminate": "wrapper failed to terminate"}
+              "failed-to-terminate": "wrapper failed to terminate",
+              # Claude Code sign-in watch (SPE-176, ADR 0020): own session record, own titles; `detail` is a closed bounded field (AUTH_DETAIL) for these causes only.
+              "auth-required": "Claude Code sign-in required", "remote-control-disconnect": "Remote Control disconnected",
+              "signin-recovered": "Claude Code sign-in recovered"}
 RECOVERY_TEXT = {"none": "none tried", "advance-tried": "queue advance tried", "recovery-exhausted": "recovery exhausted", "observe-only": "observe only",
                  "lapsed": "grant lapsed", "wait-expiry-near": "wait expiry near", "wrapper-terminated": "wrapper terminated",
-                 "grant-cancelled": "grant cancelled", "termination-failed": "termination failed"}
+                 "grant-cancelled": "grant cancelled", "termination-failed": "termination failed",
+                 "no-auto-recovery": "no automatic recovery", "remote-control-only": "remote control only", "sessions-resumed": "sessions resumed"}
 OWNER_ACTION_TEXT = {"reclaim-disk": "reclaim disk", "reduce-load": "reduce load", "approve-memory-policy": "approve memory policy",
                      "wait-or-approve-memory-policy": "wait or approve memory policy", "confirm-claim-ended": "confirm claim ended",
                      "restart-waiting-session": "restart waiting session", "restart-outdated-caller": "restart outdated caller",
@@ -74,12 +78,22 @@ OWNER_ACTION_TEXT = {"reclaim-disk": "reclaim disk", "reduce-load": "reduce load
                      "run-queue-advance": "run queue advance", "inspect-memory-admission": "inspect memory admission",
                      "claim-or-reenqueue-handoff": "claim or re-enqueue hand-off", "check-queued-wait": "check queued wait",
                      "check-over-deadline-workload": "check over-deadline workload", "check-recovery-result": "check recovery result",
-                     "inspect-stuck-wrapper": "inspect stuck wrapper"}
+                     "inspect-stuck-wrapper": "inspect stuck wrapper",
+                     "sign-in-claude": "sign in to Claude Code", "reconnect-remote-control": "reconnect Remote Control",
+                     "verify-resumed-work": "verify resumed work"}
+AUTH_SESSION = "claude-auth-watch"   # synthetic session of the sign-in watch notices: its dedup, pending queue and clear are independent of the admission monitor's
+AUTH_CAUSES = {"auth-required", "remote-control-disconnect", "signin-recovered"}
+AUTH_RECOVERY = {"no-auto-recovery", "remote-control-only", "sessions-resumed"}
+AUTH_ACTIONS = {"sign-in-claude", "reconnect-remote-control", "verify-resumed-work"}
 RESOURCE_SESSION = "admission-monitor"
+RESERVED_SESSIONS = (RESOURCE_SESSION, AUTH_SESSION)
+AUTH_TITLE = {"auth-required": "sign-in required", "remote-control-disconnect": "Remote Control disconnected", "signin-recovered": "sign-in recovered"}
 QUARANTINE_PROBLEMS = {"corrupt", "not-regular", "too-large", "foreign-owner"}
 RESOURCE_TICKET = "SPE-176"
 RESOURCE_REPO = "coding-agent-environment"
 SIGNATURE = re.compile(r"[0-9a-f]{16}")
+# Closed `detail` charset of a sign-in notice: letters, digits, space and . _ ( ) , + = - only (no quotes, brackets, slash, colon, newline, markdown or URL syntax).
+AUTH_DETAIL = re.compile(r"(?=.*[A-Za-z0-9])[A-Za-z0-9 ._(),+=-]{1,160}")
 BACKEND_NAMES = {"macos", "ntfy", "pushover", "telegram"}
 DELIVERY_STATUSES = {"pending", "sending", "failed", "sent", "dropped", "skipped"}
 TERMINAL = {"sent", "dropped", "skipped"}
@@ -239,9 +253,10 @@ CHECKPOINT_SCHEMA = v_tag("state", {
 _OPT_STR = v_opt(v_str(200))
 FIELDS_SCHEMA = v_obj({"state": v_str(200), "repo": _OPT_STR, "ticket": _OPT_STR, "pr": v_opt(v_int(0, 10**9)), "blocker_owner": _OPT_STR,
                        "resume_trigger": _OPT_STR, "kind": _OPT_STR, "cause": v_opt(v_enum(CAUSE_TEXT)),
-                       "recovery": v_opt(v_enum(RECOVERY_TEXT)), "owner_action": v_opt(v_enum(OWNER_ACTION_TEXT))}, required=("state",))
+                       "recovery": v_opt(v_enum(RECOVERY_TEXT)), "owner_action": v_opt(v_enum(OWNER_ACTION_TEXT)),
+                       "detail": v_opt(v_str(160, AUTH_DETAIL))}, required=("state",))
 EMIT_SCHEMA = v_obj({"cause": v_enum(CAUSE_TEXT), "recovery": v_enum(RECOVERY_TEXT), "owner_action": v_enum(OWNER_ACTION_TEXT),
-                     "signature": v_opt(v_str(16, SIGNATURE))}, required=("cause", "recovery", "owner_action"))
+                     "signature": v_opt(v_str(16, SIGNATURE)), "detail": v_opt(v_str(160, AUTH_DETAIL))}, required=("cause", "recovery", "owner_action"))
 BACKEND_SCHEMA = v_obj({"status": v_enum(DELIVERY_STATUSES), "attempts": v_int(0, 100), "next_at": v_num(), "code": v_opt(v_str(40))},
                        required=("status", "attempts", "next_at"))
 PENDING_SCHEMA = v_obj({"key": v_str(64, re.compile(r".+")), "cycle": v_int(0, 10**9), "created": v_int(-10**12, 10**12), "fields": FIELDS_SCHEMA,
@@ -342,6 +357,8 @@ def sanitize_fields(fields, cfg):
     for key, table in (("cause", CAUSE_TEXT), ("recovery", RECOVERY_TEXT), ("owner_action", OWNER_ACTION_TEXT)):
         if fields.get(key) in table:
             out[key] = fields[key]
+    if fields.get("cause") in AUTH_CAUSES and isinstance(fields.get("detail"), str) and AUTH_DETAIL.fullmatch(fields["detail"]):
+        out["detail"] = fields["detail"]   # the only free-looking field, and only for the sign-in causes: closed charset, length-capped
     return out
 
 
@@ -754,6 +771,10 @@ def render(fields):
     """Title and body from sanitised fields and fixed phrases only. Identical for every backend: there is no free-text field."""
     if fields.get("cause") in CAUSE_TEXT and fields.get("recovery") in RECOVERY_TEXT and fields.get("owner_action") in OWNER_ACTION_TEXT:
         body = f"{CAUSE_TEXT[fields['cause']]} | recovery: {RECOVERY_TEXT[fields['recovery']]} | action: {OWNER_ACTION_TEXT[fields['owner_action']]}"
+        if fields["cause"] in AUTH_CAUSES:
+            if fields.get("detail"):
+                body += f" | {fields['detail']}"
+            return {"title": "Claude Code: " + AUTH_TITLE[fields["cause"]], "body": body[:300]}
         return {"title": "Claude Code: admission stalled", "body": body}
     bits = [fields.get("repo", "unlisted")]
     if fields.get("ticket"):
@@ -823,7 +844,7 @@ class Engine:
         t, label, cycle = rec["task"], kind or state, rec["cycle"]
         base = hashlib.sha256("|".join([rec["session_id"], str(t.get("task") or t.get("ticket") or "-"), label, str(t.get("head") or ""), extra_key]).encode()).hexdigest()[:24]
         self.last_key = base
-        if self.seen(rec, base, cycle, now, any_cycle=rec["session_id"] == RESOURCE_SESSION):
+        if self.seen(rec, base, cycle, now, any_cycle=rec["session_id"] in RESERVED_SESSIONS):
             return None
         raw = {"state": "FAILED" if kind == "STALE" else ("SESSION_ENDED" if kind == "ENDED" else ("RUNNING" if kind == "AGENT" else state)),
                "repo": t.get("repo") or rec.get("repo_label"), "ticket": t.get("ticket"), "pr": t.get("pr")}
@@ -933,7 +954,7 @@ class Engine:
             return "ignored"  # not an object, or a consumed field has the wrong type/size: nothing is read from it, nothing changes
         ev = raw
         name, sid = ev["hook_event_name"], ev["session_id"]
-        if sid.lower() == RESOURCE_SESSION:  # case-folded: APFS would map Admission-Monitor onto the same file
+        if sid.lower() in RESERVED_SESSIONS:  # case-folded: APFS would map Admission-Monitor onto the same file
             return "ignored"  # reserved for emit-resource: a hook event can neither write nor spoof this record
         path = record_path(self.sdir, sid)
         try:
@@ -1041,15 +1062,18 @@ class Engine:
             rec["last_seen"] = now
 
     # -- admission-monitor notices
-    def emit_resource(self, req, clear=False, strict=False):
+    def emit_resource(self, req, clear=False, strict=False, scope=None):
         """One deduplicated BLOCKED_RESOURCE notice on the synthetic `admission-monitor` session, or (clear) its return to IDLE.
 
         `req` is an EMIT_SCHEMA-shaped dict. Returns queued, deduped, no-backend, cleared, invalid, busy, error or untrusted:<problem>. Dedup key is cause + signature.
         """
         if not clear and not conforms(EMIT_SCHEMA, req):
             return "invalid"
+        if not clear and (((req["cause"] in AUTH_CAUSES) != (req["recovery"] in AUTH_RECOVERY)) or ((req["cause"] in AUTH_CAUSES) != (req["owner_action"] in AUTH_ACTIONS))
+                          or (req.get("detail") and req["cause"] not in AUTH_CAUSES)):
+            return "invalid"   # sign-in phrases only go with sign-in causes, and `detail` exists for those causes alone
         self.last_delivery, self.last_key = None, None
-        sid = RESOURCE_SESSION
+        sid = AUTH_SESSION if (req["cause"] in AUTH_CAUSES if not clear else scope == "auth") else RESOURCE_SESSION
         try:
             with session_lock(record_path(self.sdir, sid), sleep=self.sleep):
                 rec, problem = load_record(self.sdir, sid)
@@ -1073,11 +1097,13 @@ class Engine:
                     rec["pending"] = [e for e in rec["pending"] if not all(b["status"] in TERMINAL for b in e["backends"].values())]
                     result = "cleared"
                 else:
-                    resume = "owner_decision" if "approve" in req["owner_action"] else "resource_available"
-                    cp = {"task": RESOURCE_SESSION, "repo": RESOURCE_REPO, "ticket": RESOURCE_TICKET, "blocker_owner": "resource", "resume_trigger": resume}
-                    self.set_state(rec, "BLOCKED_RESOURCE", "resource-stall", now, cp, notify=False)
-                    extra = {"cause": req["cause"], "recovery": req["recovery"], "owner_action": req["owner_action"]}
-                    queued = self.enqueue(rec, "BLOCKED_RESOURCE", "resource-stall", now, extra_key=req["cause"] + ":" + (req.get("signature") or ""), extra=extra,
+                    resume = ("credentials_provided" if req["cause"] == "auth-required" else "manual_restart" if sid == AUTH_SESSION else
+                              "owner_decision" if "approve" in req["owner_action"] else "resource_available")
+                    cp = {"task": sid, "repo": RESOURCE_REPO, "ticket": RESOURCE_TICKET, "blocker_owner": "resource", "resume_trigger": resume}
+                    state = "IDLE" if req["cause"] == "signin-recovered" else "BLOCKED_RESOURCE"
+                    self.set_state(rec, state, "resource-stall", now, cp, notify=False)
+                    extra = {"cause": req["cause"], "recovery": req["recovery"], "owner_action": req["owner_action"], "detail": req.get("detail")}
+                    queued = self.enqueue(rec, state, "resource-stall", now, extra_key=req["cause"] + ":" + (req.get("signature") or ""), extra=extra,
                                           strict=strict)
                     tracked = next((p for p in rec["pending"] if p["key"] == self.last_key), None)
                     any_backend = any((b or {}).get("enabled") is True for b in self.cfg["backends"].values())
@@ -1117,7 +1143,7 @@ class Engine:
                         continue
                     out["sessions"] += 1
                     changed = False
-                    if rec["state"] == "RUNNING" and sid.lower() != RESOURCE_SESSION and now - rec["last_seen"] > self.cfg["stale_after_seconds"]:
+                    if rec["state"] == "RUNNING" and sid.lower() not in RESERVED_SESSIONS and now - rec["last_seen"] > self.cfg["stale_after_seconds"]:
                         self.set_state(rec, "FAILED", "stale-no-heartbeat", now, None, kind="STALE", notify=True)
                         out["stale"] += 1
                         changed = True
@@ -1125,7 +1151,7 @@ class Engine:
                     if self.deliver(rec, now):
                         changed = True
                         out["retried"] += pending_before
-                    if sid.lower() != RESOURCE_SESSION and rec["state"] in ("SESSION_ENDED", "COMPLETED", "FAILED") and not rec["pending"] and now - rec["last_seen"] > GC_AFTER:
+                    if sid.lower() not in RESERVED_SESSIONS and rec["state"] in ("SESSION_ENDED", "COMPLETED", "FAILED") and not rec["pending"] and now - rec["last_seen"] > GC_AFTER:
                         # removed while HOLDING the lock; session_lock re-checks the inode, so a waiter that opened the old file retries on the new one
                         for q in (p, p.with_name(p.name + ".lock")):
                             with contextlib.suppress(OSError):
@@ -1264,9 +1290,9 @@ def cmd_checkpoint(args):
 
 def cmd_emit_resource(args):
     cfg, _ = load_config()
-    req = {"cause": args.cause, "recovery": args.recovery, "owner_action": args.owner_action, "signature": args.signature}
+    req = {"cause": args.cause, "recovery": args.recovery, "owner_action": args.owner_action, "signature": args.signature, "detail": args.detail}
     engine = Engine(state_dir(), cfg)
-    result = engine.emit_resource(req, clear=args.clear, strict=args.strict)
+    result = engine.emit_resource(req, clear=args.clear, strict=args.strict, scope=args.scope)
     print(f"emit-resource: {result}" + (f" delivery={engine.last_delivery}" if engine.last_delivery else ""))
     return 0 if result in ("queued", "deduped", "no-backend", "cleared") else 1
 
@@ -1274,6 +1300,12 @@ def cmd_emit_resource(args):
 def signature_arg(text):
     if not SIGNATURE.fullmatch(text):
         raise argparse.ArgumentTypeError("--signature must be 16 lowercase hex characters")
+    return text
+
+
+def detail_arg(text):
+    if not AUTH_DETAIL.fullmatch(text):
+        raise argparse.ArgumentTypeError("--detail must be 1..160 characters of letters, digits, space and . _ ( ) , + = -")
     return text
 
 
@@ -1320,6 +1352,8 @@ def main(argv=None):
     for opt, table in (("cause", CAUSE_TEXT), ("recovery", RECOVERY_TEXT), ("owner-action", OWNER_ACTION_TEXT)):
         e.add_argument(f"--{opt}", choices=sorted(table))
     e.add_argument("--signature", type=signature_arg)
+    e.add_argument("--detail", type=detail_arg, help="sign-in causes only: closed charset, at most 160 characters")
+    e.add_argument("--scope", choices=("admission", "auth"), default="admission", help="with --clear: which synthetic session returns to IDLE")
     e.add_argument("--strict", action="store_true", help="a no-backend outcome leaves no dedup record, so a retry after a backend is enabled still notifies")
     r = sub.add_parser("render-config")
     r.add_argument("--profile", choices=("personal", "corporate"), default="personal")

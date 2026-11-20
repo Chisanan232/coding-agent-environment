@@ -23,6 +23,8 @@ on:
       - 'scripts/resource-policy-install.py'
       - 'scripts/launcher-install.py'
       - 'scripts/admission-monitor.py'
+      - 'scripts/claude-auth-watch.py'
+      - 'tests/test-claude-auth-watch.py'
       - 'scripts/cargo-deps-reclaim.py'
       - 'scripts/disk-admission.py'
       - 'scripts/la-cargo'
@@ -130,6 +132,7 @@ jobs:
           python3 tests/test-disk-admission-gate.py
           python3 tests/test-admission-queue.py
           python3 tests/test-admission-monitor.py
+          python3 tests/test-claude-auth-watch.py
           python3 tests/test-admission-recovery.py
           python3 tests/test-admission-recovery-acceptance.py
           python3 tests/test-disk-admission.py
