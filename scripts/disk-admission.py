@@ -605,33 +605,122 @@ DECLARED_FIELDS = ('class', 'mem_bytes', 'cpu_slots', 'test_threads')   # compar
 MIB = 1024 ** 2
 
 
-def _cargo_target_dir(env, home, cwd):
-    """The Cargo target directory this job would use, resolved from CARGO_TARGET_DIR, else the user's Cargo config
-    (`build.target-dir`), else ./target. Reads one small file; executes nothing."""
-    def absolute(value, base):
-        return os.path.normpath(value if os.path.isabs(value) else os.path.join(base, value))
+CARGO_KEY = 'cargo-target:'
+MAX_CONFIG_DEPTH = 64
 
-    value = env.get('CARGO_TARGET_DIR')
-    if isinstance(value, str) and value:
-        return absolute(value, cwd)
+
+def _argv_target_dir(argv):
+    """The last `--target-dir X` / `--target-dir=X` cargo itself would parse: only after the first token named cargo and before a `--`
+    (what follows `--` belongs to the test binary). None when the job is not a cargo command or names no target dir."""
+    tokens = list(argv or [])
+    start = next((i for i, token in enumerate(tokens) if isinstance(token, str) and os.path.basename(token) == 'cargo'), None)
+    if start is None:
+        return None
+    found = None
+    rest = tokens[start + 1:]
+    for i, token in enumerate(rest):
+        if token == '--':
+            break
+        if token == '--target-dir' and i + 1 < len(rest):
+            found = rest[i + 1]
+        elif isinstance(token, str) and token.startswith('--target-dir='):
+            found = token[len('--target-dir='):]
+    return found if isinstance(found, str) and found and '\0' not in found else None
+
+
+def _config_target_dir(path):
+    """`build.target-dir` from one Cargo config file, or None. Follows a symlink as cargo does (dotfile managers link it); a FIFO,
+    device or unparseable file counts as absent."""
     try:
         import tomllib
-        descriptor = os.open(Path(home) / '.cargo/config.toml', os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         with os.fdopen(descriptor, 'rb') as handle:
-            if stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                configured = tomllib.loads(handle.read(65536).decode()).get('build', {}).get('target-dir')
-                if isinstance(configured, str) and configured and '\0' not in configured:
-                    return absolute(configured, str(home))
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None
+            build = tomllib.loads(handle.read(65536).decode()).get('build', {})
+            configured = build.get('target-dir') if isinstance(build, dict) else None
     except Exception:
-        pass
+        return None
+    return configured if isinstance(configured, str) and configured and '\0' not in configured else None
+
+
+def _cargo_config_files(cwd, cargo_home):
+    """Config files in cargo's merge order, highest precedence first: `.cargo/config` (legacy, which cargo prefers when both exist) or
+    `.cargo/config.toml` in cwd and each ancestor up to /, then $CARGO_HOME's."""
+    dirs, directory = [], cwd
+    for _ in range(MAX_CONFIG_DEPTH):
+        dirs.append(os.path.join(directory, '.cargo'))
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+    if cargo_home not in dirs:
+        dirs.append(cargo_home)
+    out = []
+    for dot_cargo in dirs:
+        path = next((p for p in (os.path.join(dot_cargo, n) for n in ('config', 'config.toml')) if os.path.isfile(p)), None)
+        if path:
+            out.append(path)
+    return out
+
+
+def _cargo_target_dir(env, home, cwd, argv=None):
+    """The Cargo target directory this job would use, resolved exactly in cargo's own order: `--target-dir` in the job's argv, then
+    CARGO_TARGET_DIR, then CARGO_BUILD_TARGET_DIR (the environment form of build.target-dir, which overrides every config file), then
+    build.target-dir from the nearest config file (cwd upward, then $CARGO_HOME, default <home>/.cargo), else <cwd>/target. A relative
+    CLI or environment value is relative to cwd; a relative config value to the directory holding that config's `.cargo` directory.
+    The result is realpath-canonical (symlinks, /tmp vs /private/tmp, `..`, trailing slashes). Reads small files; executes nothing."""
+    def absolute(value, base):
+        return os.path.realpath(value if os.path.isabs(value) else os.path.join(base, value))
+
+    cwd = os.path.abspath(cwd)
+    value = _argv_target_dir(argv)
+    if value:
+        return absolute(value, cwd)
+    for name in ('CARGO_TARGET_DIR', 'CARGO_BUILD_TARGET_DIR'):
+        value = env.get(name)
+        if isinstance(value, str) and value and '\0' not in value:
+            return absolute(value, cwd)
+    cargo_home = env.get('CARGO_HOME')
+    cargo_home = absolute(cargo_home, cwd) if isinstance(cargo_home, str) and cargo_home and '\0' not in cargo_home else \
+        os.path.join(str(home), '.cargo')
+    for path in _cargo_config_files(cwd, cargo_home):
+        configured = _config_target_dir(path)
+        if configured:
+            return absolute(configured, os.path.dirname(os.path.dirname(path)))
     return absolute('target', cwd)
 
 
-def resolve_workload(name, mem_gib, cpus, nbytes, env=None, home=None, cwd=None, session_id=None, ticket=None, now=None):
+def _fold_path(path):
+    """Comparison form of a path that does not exist: NFC, and case-folded on macOS, whose default volumes are case-insensitive. Folding
+    can only make two keys compare equal, never unequal, which is the fail-safe direction for an exclusion key."""
+    path = unicodedata.normalize('NFC', path)
+    return path.casefold() if sys.platform == 'darwin' else path
+
+
+def excl_identity(key):
+    """Comparison identity of one exclusion key, computed at decision time so already-stored keys (normpath, pre-realpath) and newly
+    computed ones that name the same directory compare equal. A cargo-target key whose directory exists is identified by its
+    (st_dev, st_ino) after following symlinks; otherwise by its folded realpath. Any other key is compared as written."""
+    if not (isinstance(key, str) and key.startswith(CARGO_KEY)):
+        return key
+    path = key[len(CARGO_KEY):]
+    try:
+        info = os.stat(path)
+        return 'cargo-target-inode:%d:%d' % (info.st_dev, info.st_ino)
+    except (OSError, ValueError):
+        pass
+    try:
+        return CARGO_KEY + _fold_path(os.path.realpath(path))
+    except (OSError, ValueError):
+        return key
+
+
+def resolve_workload(name, mem_gib, cpus, nbytes, env=None, home=None, cwd=None, session_id=None, ticket=None, now=None, argv=None):
     """(fields, error). fields is {} when nothing was declared (the legacy meaning), else the optional record fields.
 
     Unknown class names fail closed. --mem-gib, --cpus and --bytes may raise an estimate and never lower it below the class
-    default. Nothing is executed and nothing outside the Cargo config is read.
+    default. Nothing is executed and nothing outside the Cargo config files is read; `argv` (the job) is read only for `--target-dir`.
     """
     if name is None and mem_gib is None and cpus is None:
         return {}, None
@@ -671,7 +760,7 @@ def resolve_workload(name, mem_gib, cpus, nbytes, env=None, home=None, cwd=None,
     if spec:
         env = os.environ if env is None else env
         if spec['excl'] == 'target':
-            key = 'cargo-target:' + _cargo_target_dir(env, home if home is not None else account_home(), cwd or os.getcwd())
+            key = CARGO_KEY + _cargo_target_dir(env, home if home is not None else account_home(), cwd or os.getcwd(), argv)
         else:
             key = spec['excl']
         fields['excl_keys'] = [key]
@@ -2654,7 +2743,8 @@ def budget_holder(kind, record, created=None, pid=None, workload=None, granted_j
     return {'kind': kind, 'label': record['label'], 'class': record.get('class'), 'legacy': _legacy(record),
             'granted_jobs': granted_jobs, 'uncapped': kind != 'granted' and record.get('class') in GRANT_ENV and not granted_jobs,
             'mem_bytes': record.get('mem_bytes') or 0, 'cpu_slots': record.get('cpu_slots') or 0,
-            'excl_keys': list(record.get('excl_keys') or []), 'created': _created_time(created), 'pid': pid,
+            'excl_keys': list(record.get('excl_keys') or []), 'excl_ids': [excl_identity(k) for k in record.get('excl_keys') or []],
+            'created': _created_time(created), 'pid': pid,
             'members': [m['pid'] for m in (workload or {}).get('members', [])],
             'flags': [flag for flag in ('past_ttl', 'unresolved') if record.get(flag)]}
 
@@ -2662,7 +2752,13 @@ def budget_holder(kind, record, created=None, pid=None, workload=None, granted_j
 def budget_request(record, nbytes, label):
     return {'label': label, 'bytes': nbytes, 'class': record.get('class'), 'legacy': _legacy(record),
             'mem_bytes': record.get('mem_bytes') or 0, 'cpu_slots': record.get('cpu_slots') or 0,
-            'test_threads': record.get('test_threads') or 0, 'excl_keys': list(record.get('excl_keys') or [])}
+            'test_threads': record.get('test_threads') or 0, 'excl_keys': list(record.get('excl_keys') or []),
+            'excl_ids': [excl_identity(k) for k in record.get('excl_keys') or []]}
+
+
+def _excl_ids(record):
+    ids = record.get('excl_ids')
+    return ids if isinstance(ids, list) and len(ids) == len(record['excl_keys']) else list(record['excl_keys'])
 
 
 def budget_holders(live, orphans, entries, now, skip_id=None):
@@ -2791,14 +2887,19 @@ def budget_decision(host, reservations, request, caps):
         out['projected_bytes'] = base + request['mem_bytes']
         cpu_need = request['cpu_slots']
         reasons += _resource_reasons(base + request['mem_bytes'], limit, headroom, cpu_used, cpu_need, cpu_limit)
-    taken = set(request['excl_keys'])
-    clash = sorted({h['label'] for h in reservations if taken & set(h['excl_keys'])})
+    # Keys are compared by identity (excl_identity, computed by budget_holder / budget_request at decision time), so two spellings of
+    # one directory clash; the request's own spelling is what a reason or receipt shows. A record built without ids compares as written.
+    taken = {}
+    for ident, key in zip(_excl_ids(request), request['excl_keys']):
+        taken.setdefault(ident, key)
+    shared = [(h, sorted({taken[i] for i in set(taken) & set(_excl_ids(h))})) for h in reservations]
+    shared = [(h, keys) for h, keys in shared if keys]
+    clash = sorted({h['label'] for h, _ in shared})
     if clash:
         reasons.append('excl_key overlap with %s' % ', '.join(clash))
     # One row per clashing holder with its kind (no dedupe by label), so bounded backfill can tell a running claimed job from an unclaimed
     # grant or an orphan and fail closed on anything but the first.
-    out['excl_clash'] = [{'label': h['label'], 'kind': h['kind'], 'keys': sorted(taken & set(h['excl_keys']))}
-                         for h in reservations if taken & set(h['excl_keys'])]
+    out['excl_clash'] = [{'label': h['label'], 'kind': h['kind'], 'keys': keys} for h, keys in shared]
     if caps.get('free_bytes') is not None and caps['free_bytes'] - caps.get('reserved_bytes', 0) - request['bytes'] < caps.get('floor', 0):
         reasons.append('byte floor: %s free - %s reserved - %s requested < %s' % (
             _gib(caps['free_bytes']), _gib(caps.get('reserved_bytes', 0)), _gib(request['bytes']), _gib(caps['floor'])))
@@ -3496,9 +3597,9 @@ def _add_workload_args(parser):
     parser.add_argument('--cpus', type=int, dest='cpus', help='declared CPU slots; may raise the class default, never lower it')
 
 
-def _declared_from_args(args, nbytes, session_id=None, ticket=None):
+def _declared_from_args(args, nbytes, session_id=None, ticket=None, argv=None):
     """(fields, error) for the CLI: resolves the declared class and estimates without executing anything."""
-    return resolve_workload(args.workload_class, args.mem_gib, args.cpus, nbytes, session_id=session_id, ticket=ticket)
+    return resolve_workload(args.workload_class, args.mem_gib, args.cpus, nbytes, session_id=session_id, ticket=ticket, argv=argv)
 
 
 def build_parser():
@@ -3610,7 +3711,7 @@ def _queue_cli(args, state_path, free_fn, host_fn=None):
         if args.job[:1] != ['--']:
             print('refused: invalid-request: put -- between the options and the command', file=sys.stderr)
             return REFUSED_EXIT
-        declared, error = _declared_from_args(args, args.nbytes, args.session_id, args.tickets[0] if args.tickets else None)
+        declared, error = _declared_from_args(args, args.nbytes, args.session_id, args.tickets[0] if args.tickets else None, args.job[1:])
         if error:
             print(json.dumps({'ok': False, 'reason': error}))
             return REFUSED_EXIT
@@ -3682,7 +3783,7 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None, host_fn=None):
             print('refused: invalid-request: put -- between the options and the command', file=sys.stderr)
             return REFUSED_EXIT
         job = args.job[1:]
-        declared, error = _declared_from_args(args, args.nbytes)
+        declared, error = _declared_from_args(args, args.nbytes, argv=job)
         if error:
             print('refused: ' + error, file=sys.stderr)
             return REFUSED_EXIT
