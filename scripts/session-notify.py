@@ -6,6 +6,7 @@
   session-notify.py sweep [--now EPOCH]          stale-session detection, delivery retry, old-record cleanup
   session-notify.py checkpoint --state S ...     write the structured checkpoint a session uses to declare its state
   session-notify.py emit-resource --cause C --recovery R --owner-action A [--signature HEX16] [--detail D] | --clear [--scope admission|auth]   stall and sign-in notices
+  session-notify.py test-notice [--strict]       one fixed, clearly labelled delivery-test notice (no arguments carry text)
   session-notify.py render-config [--profile personal|corporate] [--out FILE]
 
 One short-lived process per hook, no daemon. Per-session state lives under
@@ -86,7 +87,9 @@ AUTH_CAUSES = {"auth-required", "remote-control-disconnect", "signin-recovered"}
 AUTH_RECOVERY = {"no-auto-recovery", "remote-control-only", "sessions-resumed"}
 AUTH_ACTIONS = {"sign-in-claude", "reconnect-remote-control", "verify-resumed-work"}
 RESOURCE_SESSION = "admission-monitor"
-RESERVED_SESSIONS = (RESOURCE_SESSION, AUTH_SESSION)
+TEST_SESSION = "notify-test"   # own synthetic record for `test-notice`: shares no state with any other synthetic record
+RESERVED_SESSIONS = (RESOURCE_SESSION, AUTH_SESSION, TEST_SESSION)   # hook events cannot touch them; sweep never stales or removes them
+TEST_NOTICE_WINDOW = 600
 AUTH_TITLE = {"auth-required": "sign-in required", "remote-control-disconnect": "Remote Control disconnected", "signin-recovered": "sign-in recovered"}
 QUARANTINE_PROBLEMS = {"corrupt", "not-regular", "too-large", "foreign-owner"}
 RESOURCE_TICKET = "SPE-176"
@@ -254,7 +257,8 @@ _OPT_STR = v_opt(v_str(200))
 FIELDS_SCHEMA = v_obj({"state": v_str(200), "repo": _OPT_STR, "ticket": _OPT_STR, "pr": v_opt(v_int(0, 10**9)), "blocker_owner": _OPT_STR,
                        "resume_trigger": _OPT_STR, "kind": _OPT_STR, "cause": v_opt(v_enum(CAUSE_TEXT)),
                        "recovery": v_opt(v_enum(RECOVERY_TEXT)), "owner_action": v_opt(v_enum(OWNER_ACTION_TEXT)),
-                       "detail": v_opt(v_str(160, AUTH_DETAIL))}, required=("state",))
+                       "detail": v_opt(v_str(160, AUTH_DETAIL)),
+                       "notice": v_opt(v_enum(("test",)))}, required=("state",))
 EMIT_SCHEMA = v_obj({"cause": v_enum(CAUSE_TEXT), "recovery": v_enum(RECOVERY_TEXT), "owner_action": v_enum(OWNER_ACTION_TEXT),
                      "signature": v_opt(v_str(16, SIGNATURE)), "detail": v_opt(v_str(160, AUTH_DETAIL))}, required=("cause", "recovery", "owner_action"))
 BACKEND_SCHEMA = v_obj({"status": v_enum(DELIVERY_STATUSES), "attempts": v_int(0, 100), "next_at": v_num(), "code": v_opt(v_str(40))},
@@ -359,6 +363,8 @@ def sanitize_fields(fields, cfg):
             out[key] = fields[key]
     if fields.get("cause") in AUTH_CAUSES and isinstance(fields.get("detail"), str) and AUTH_DETAIL.fullmatch(fields["detail"]):
         out["detail"] = fields["detail"]   # the only free-looking field, and only for the sign-in causes: closed charset, length-capped
+    if fields.get("notice") == "test":
+        out["notice"] = "test"
     return out
 
 
@@ -769,6 +775,8 @@ def backend_allowed(name, cfg, corporate_session):
 
 def render(fields):
     """Title and body from sanitised fields and fixed phrases only. Identical for every backend: there is no free-text field."""
+    if fields.get("notice") == "test":
+        return {"title": "Claude Code: test notice, ignore", "body": "notification delivery test | no action needed"}
     if fields.get("cause") in CAUSE_TEXT and fields.get("recovery") in RECOVERY_TEXT and fields.get("owner_action") in OWNER_ACTION_TEXT:
         body = f"{CAUSE_TEXT[fields['cause']]} | recovery: {RECOVERY_TEXT[fields['recovery']]} | action: {OWNER_ACTION_TEXT[fields['owner_action']]}"
         if fields["cause"] in AUTH_CAUSES:
@@ -813,11 +821,11 @@ class Engine:
             self.enqueue(rec, new, reason, now, kind, extra=extra)
 
     @staticmethod
-    def seen(rec, base, cycle, now, any_cycle=False):
+    def seen(rec, base, cycle, now, any_cycle=False, window=DEDUP_WINDOW):
         """Best-effort dedup: a transition is a repeat only while its tombstone is inside DEDUP_WINDOW (and was not evicted by the cap). For the admission-monitor
         session (`any_cycle`) a still-pending entry of the same key is a repeat whatever the cycle: a clear bumps the cycle and must not let it be queued twice."""
         got = rec["notified"].get(base)
-        return (got is not None and got[0] >= cycle and got[1] >= now - DEDUP_WINDOW) or any(p["key"] == base and (any_cycle or p["cycle"] == cycle) for p in rec["pending"])
+        return (got is not None and got[0] >= cycle and got[1] >= now - window) or any(p["key"] == base and (any_cycle or p["cycle"] == cycle) for p in rec["pending"])
 
     @staticmethod
     def mark_notified(rec, base, cycle, now):
@@ -840,11 +848,11 @@ class Engine:
             rec["dropped"] += 1
             rec["history"] = (rec["history"] + [{"t": int(now), "from": rec["state"], "to": rec["state"], "why": "queue-overflow-dropped"}])[-HISTORY_CAP:]
 
-    def enqueue(self, rec, state, reason, now, kind=None, extra_key="", extra=None, strict=False):
+    def enqueue(self, rec, state, reason, now, kind=None, extra_key="", extra=None, strict=False, window=DEDUP_WINDOW):
         t, label, cycle = rec["task"], kind or state, rec["cycle"]
         base = hashlib.sha256("|".join([rec["session_id"], str(t.get("task") or t.get("ticket") or "-"), label, str(t.get("head") or ""), extra_key]).encode()).hexdigest()[:24]
         self.last_key = base
-        if self.seen(rec, base, cycle, now, any_cycle=rec["session_id"] in RESERVED_SESSIONS):
+        if self.seen(rec, base, cycle, now, any_cycle=rec["session_id"] in RESERVED_SESSIONS, window=window):
             return None
         raw = {"state": "FAILED" if kind == "STALE" else ("SESSION_ENDED" if kind == "ENDED" else ("RUNNING" if kind == "AGENT" else state)),
                "repo": t.get("repo") or rec.get("repo_label"), "ticket": t.get("ticket"), "pr": t.get("pr")}
@@ -1123,6 +1131,52 @@ class Engine:
             log_line(self.sdir, f"emit-resource os-error errno={exc.errno}")  # errno only: no path reaches stderr
             return "error"
 
+    # -- delivery-test notice
+    def test_notice(self, strict=False):
+        """One fixed-text delivery-test notice on its own synthetic `notify-test` record, deduplicated for TEST_NOTICE_WINDOW seconds.
+
+        Takes no content. Returns queued, deduped, no-backend, busy, error or untrusted:<problem>; `last_delivery` is set as for emit_resource.
+        """
+        self.last_delivery, self.last_key = None, None
+        sid = TEST_SESSION
+        try:
+            with session_lock(record_path(self.sdir, sid), sleep=self.sleep):
+                rec, problem = load_record(self.sdir, sid)
+                if problem and problem not in QUARANTINE_PROBLEMS:
+                    return f"untrusted:{problem}"
+                if problem:
+                    log_line(self.sdir, f"state-quarantined {problem} event=test-notice")
+                    try:
+                        os.replace(record_path(self.sdir, sid), str(record_path(self.sdir, sid)) + ".corrupt")
+                    except OSError:
+                        return f"untrusted:{problem}"
+                    rec = None
+                now = self.clock()
+                rec = rec or new_record(sid, now)
+                # The window also bounds a still-pending entry (a failing backend must not read as `deduped` forever): an older one is dropped, counted, and replaced.
+                old = [e for e in rec["pending"] if e["created"] < now - TEST_NOTICE_WINDOW]
+                if old:
+                    rec["pending"] = [e for e in rec["pending"] if e not in old]
+                    rec["dropped"] += len(old)
+                queued = self.enqueue(rec, "IDLE", "test-notice", now, extra_key="test-notice", extra={"notice": "test"}, strict=strict, window=TEST_NOTICE_WINDOW)
+                tracked = next((p for p in rec["pending"] if p["key"] == self.last_key), None)
+                any_backend = any((b or {}).get("enabled") is True for b in self.cfg["backends"].values())
+                result = "no-backend" if not any_backend else ("queued" if queued else "deduped")
+                self.deliver(rec, now, budget_end=now + 6)
+                if result != "no-backend":
+                    states = {b["status"] for b in tracked["backends"].values()} if tracked else set()
+                    self.last_delivery = ("unknown" if tracked is None else "sent" if "sent" in states else
+                                          "pending" if states - TERMINAL else "dropped")
+                if not (strict and result == "no-backend" and rec["pending"] == [] and not rec["notified"]):
+                    save_record(self.sdir, rec)
+                return result
+        except TimeoutError:
+            log_line(self.sdir, "lock-timeout event=test-notice")
+            return "busy"
+        except OSError as exc:
+            log_line(self.sdir, f"test-notice os-error errno={exc.errno}")
+            return "error"
+
     # -- sweep
     def sweep(self, now=None):
         now = self.clock() if now is None else now
@@ -1297,6 +1351,14 @@ def cmd_emit_resource(args):
     return 0 if result in ("queued", "deduped", "no-backend", "cleared") else 1
 
 
+def cmd_test_notice(args):
+    cfg, _ = load_config()
+    engine = Engine(state_dir(), cfg)
+    result = engine.test_notice(strict=args.strict)
+    print(f"test-notice: {result}" + (f" delivery={engine.last_delivery}" if engine.last_delivery else ""))
+    return 0 if result in ("queued", "deduped", "no-backend") else 1
+
+
 def signature_arg(text):
     if not SIGNATURE.fullmatch(text):
         raise argparse.ArgumentTypeError("--signature must be 16 lowercase hex characters")
@@ -1355,13 +1417,15 @@ def main(argv=None):
     e.add_argument("--detail", type=detail_arg, help="sign-in causes only: closed charset, at most 160 characters")
     e.add_argument("--scope", choices=("admission", "auth"), default="admission", help="with --clear: which synthetic session returns to IDLE")
     e.add_argument("--strict", action="store_true", help="a no-backend outcome leaves no dedup record, so a retry after a backend is enabled still notifies")
+    t = sub.add_parser("test-notice")
+    t.add_argument("--strict", action="store_true", help="a no-backend outcome leaves no dedup record")
     r = sub.add_parser("render-config")
     r.add_argument("--profile", choices=("personal", "corporate"), default="personal")
     r.add_argument("--out")
     a = ap.parse_args(argv)
     if a.cmd == "emit-resource" and not a.clear and not (a.cause and a.recovery and a.owner_action):
         ap.error("emit-resource needs --cause, --recovery and --owner-action (or --clear)")
-    return {"hook": cmd_hook, "status": cmd_status, "sweep": cmd_sweep, "checkpoint": cmd_checkpoint, "emit-resource": cmd_emit_resource, "render-config": cmd_render_config}[a.cmd](a)
+    return {"hook": cmd_hook, "status": cmd_status, "sweep": cmd_sweep, "checkpoint": cmd_checkpoint, "emit-resource": cmd_emit_resource, "test-notice": cmd_test_notice, "render-config": cmd_render_config}[a.cmd](a)
 
 
 if __name__ == "__main__":

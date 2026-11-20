@@ -2500,5 +2500,164 @@ class TelegramBackend(Base):
         self.assertIn("telegram", sn.REAL_TRANSPORTS)
 
 
+class TestNotice(Base):
+    """SPE-176: the fixed-text delivery-test notice on its own reserved record."""
+    TITLE, BODY = "Claude Code: test notice, ignore", "notification delivery test | no action needed"
+
+    def digest(self, sid):
+        return __import__("hashlib").sha256(sn.record_path(self.sdir, sid).read_bytes()).hexdigest()
+
+    def test_fixed_text_through_every_enabled_backend(self):
+        e = self.engine()
+        self.assertEqual((e.test_notice(), e.last_delivery), ("queued", "sent"))
+        self.assertEqual(self.names(), ["macos", "ntfy", "pushover"])
+        for _, payload in self.fake.sent:
+            self.assertEqual(payload, {"title": self.TITLE, "body": self.BODY})
+
+    def test_touches_no_other_record_or_state_file(self):
+        self.engine().emit_resource({"cause": "disk-floor", "recovery": "none", "owner_action": "reclaim-disk"})
+        sn.save_record(self.sdir, sn.new_record("claude-auth-watch", self.t))
+        before = {sid: self.digest(sid) for sid in ("admission-monitor", "claude-auth-watch")}
+        listing = sorted(p.name for p in self.sdir.iterdir())
+        self.assertEqual(self.engine().test_notice(), "queued")
+        self.assertEqual({sid: self.digest(sid) for sid in before}, before)
+        self.assertEqual(sorted(set(p.name for p in self.sdir.iterdir()) - set(listing)), ["notify-test.json", "notify-test.json.lock"])
+
+    def test_dedup_for_ten_minutes_then_resend(self):
+        e = self.engine()
+        self.assertEqual(e.test_notice(), "queued")
+        self.advance(599)
+        self.assertEqual(e.test_notice(), "deduped")
+        self.assertEqual(len(self.fake.sent), 3)
+        self.advance(2)
+        self.assertEqual(self.engine().test_notice(), "queued")
+        self.assertEqual(len(self.fake.sent), 6)
+
+    def test_resource_emit_and_clear_do_not_affect_test_dedup(self):
+        self.assertEqual(self.engine().test_notice(), "queued")
+        self.engine().emit_resource({}, clear=True)
+        self.assertEqual(self.engine().test_notice(), "deduped")
+
+    def test_reserved_id_hook_events_are_ignored_case_insensitively(self):
+        e = self.engine()
+        for sid in ("notify-test", "Notify-Test", "NOTIFY-TEST"):
+            self.assertEqual(self.ev(e, "SessionStart", sid=sid, source="startup"), "ignored")
+        self.assertFalse(self.sdir.exists() and any(self.sdir.glob("*otify-*est*")))
+
+    def test_sweep_retries_its_delivery_but_never_marks_it_stale(self):
+        failing = Fake(fail={"macos": "boom", "ntfy": "boom", "pushover": "boom"})
+        self.assertEqual(self.engine(fake=failing).test_notice(), "queued")
+        rec = self.rec("notify-test")
+        rec["state"], rec["last_seen"] = "RUNNING", self.t
+        sn.save_record(self.sdir, rec)
+        self.advance(10 * 86400)
+        out = self.engine().sweep()
+        self.assertEqual((out["stale"], out["retried"]), (0, 3))
+        self.assertEqual(self.rec("notify-test")["state"], "RUNNING")
+        self.assertEqual(len(self.fake.sent), 3)
+        self.assertEqual(self.rec("notify-test")["pending"], [])
+        self.advance(20 * 86400)
+        self.engine().sweep()
+        self.assertIsNotNone(self.rec("notify-test"))
+
+    def test_pending_entry_does_not_report_deduped_past_the_window(self):
+        failing = Fake(fail={"macos": "boom", "ntfy": "boom", "pushover": "boom"})
+        e = self.engine(fake=failing)
+        self.assertEqual((e.test_notice(), e.last_delivery), ("queued", "pending"))
+        self.advance(300)
+        self.assertEqual((e.test_notice(), e.last_delivery), ("deduped", "pending"))
+        self.advance(301)
+        e = self.engine()
+        self.assertEqual((e.test_notice(), e.last_delivery), ("queued", "sent"))
+        self.assertEqual(len(self.fake.sent), 3)
+        self.assertEqual(len(self.rec("notify-test")["pending"]), 0)
+
+    def test_all_three_synthetic_sessions_are_reserved_in_every_path(self):
+        ids = ("admission-monitor", "claude-auth-watch", "notify-test")
+        self.assertEqual(set(sn.RESERVED_SESSIONS), set(ids))
+        e = self.engine()
+        for sid in ids:
+            for variant in (sid, sid.upper(), sid.title()):
+                self.assertEqual(self.ev(e, "SessionStart", sid=variant, source="startup"), "ignored", variant)
+        self.assertFalse(self.sdir.exists())
+        # one of each, with an old RUNNING state and an old SESSION_ENDED state: sweep must neither stale nor remove any of them
+        failing = Fake(fail={"macos": "boom", "ntfy": "boom", "pushover": "boom"})
+        for sid in ids:
+            rec = sn.new_record(sid, self.t)
+            rec["state"] = "RUNNING"
+            sn.save_record(self.sdir, rec)
+        self.advance(40 * 86400)
+        out = self.engine(fake=failing).sweep()
+        self.assertEqual((out["sessions"], out["stale"], out["removed"]), (3, 0, 0))
+        for sid in ids:
+            rec = self.rec(sid)
+            rec["state"] = "SESSION_ENDED"
+            sn.save_record(self.sdir, rec)
+        self.assertEqual(self.engine().sweep()["removed"], 0)
+        self.assertEqual(sorted(p.name for p in self.sdir.glob("*.json")), sorted(i + ".json" for i in ids))
+
+    def test_each_synthetic_record_stays_byte_identical_when_another_runs(self):
+        auth = {"cause": "auth-required", "recovery": "no-auto-recovery", "owner_action": "sign-in-claude"}
+        res = {"cause": "disk-floor", "recovery": "none", "owner_action": "reclaim-disk"}
+        runs = {"claude-auth-watch": lambda e: e.emit_resource(dict(auth)), "admission-monitor": lambda e: e.emit_resource(dict(res)),
+                "notify-test": lambda e: e.test_notice()}
+        for sid, fn in runs.items():
+            self.assertIn(fn(self.engine()), ("queued",))
+        before = {sid: self.digest(sid) for sid in runs}
+        self.advance(5)
+        for sid, fn in runs.items():
+            others = {o: self.digest(o) for o in runs if o != sid}
+            fn(self.engine())   # a deduped repeat of its own notice must not write the other two records
+            self.assertEqual({o: self.digest(o) for o in others}, others, sid)
+        after = {sid: self.digest(sid) for sid in runs}   # each record may rewrite itself on a repeat; only the others must stay put
+        self.assertEqual(before["notify-test"], after["notify-test"])
+        self.engine().emit_resource({}, clear=True, scope="admission")
+        self.assertEqual({o: self.digest(o) for o in ("claude-auth-watch", "notify-test")}, {o: after[o] for o in ("claude-auth-watch", "notify-test")})
+        self.advance(700)
+        self.engine().test_notice()
+        self.assertEqual(self.digest("claude-auth-watch"), after["claude-auth-watch"])
+
+    def test_no_backend_strict_leaves_no_dedup_record(self):
+        off = cfg()
+        for b in off["backends"].values():
+            b["enabled"] = False
+        e = self.engine(off)
+        self.assertEqual((e.test_notice(strict=True), e.last_delivery), ("no-backend", None))
+        self.assertEqual(self.engine().test_notice(), "queued")
+
+    def test_no_backend_non_strict_records_dedup(self):
+        off = cfg()
+        for b in off["backends"].values():
+            b["enabled"] = False
+        self.assertEqual(self.engine(off).test_notice(), "no-backend")
+        self.assertEqual(self.engine().test_notice(), "deduped")
+
+    def test_corporate_profile_refuses_remote_backends(self):
+        c = cfg(profile="corporate")
+        c["backends"]["macos"]["enabled"] = False
+        e = self.engine(c)
+        self.assertEqual((e.test_notice(), e.last_delivery), ("queued", "dropped"))
+        self.assertEqual(self.fake.sent, [])
+
+    def test_no_free_text_path_and_no_new_cause_enum(self):
+        for table in (sn.CAUSE_TEXT, sn.RECOVERY_TEXT, sn.OWNER_ACTION_TEXT):
+            self.assertFalse([k for k in table if "test" in k or "notice" in k], table)
+        env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(self.sdir), SESSION_NOTIFY_CONFIG=str(self.tmp / "none.json"))
+        run = lambda *a: subprocess.run([sys.executable, str(SCRIPT), "test-notice", *a], capture_output=True, text=True, env=env)
+        for args in (("--text", "hello"), ("--title", "x"), ("hello",), ("--body=x",), ("--cause", "disk-floor")):
+            self.assertEqual(run(*args).returncode, 2, args)
+        self.assertFalse(self.sdir.exists())
+        r = run("--strict")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "test-notice: no-backend"))
+
+    def test_cli_busy_or_error_exits_one_without_path(self):
+        blocker = self.tmp / "afile"
+        blocker.write_text("x")
+        env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(blocker / "state"), SESSION_NOTIFY_CONFIG=str(self.tmp / "none.json"))
+        r = subprocess.run([sys.executable, str(SCRIPT), "test-notice"], capture_output=True, text=True, env=env)
+        self.assertEqual((r.returncode, r.stdout.strip()), (1, "test-notice: error"))
+        self.assertNotIn(str(blocker), r.stdout + r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

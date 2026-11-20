@@ -129,6 +129,16 @@ Three more causes, with their own phrases and a synthetic session `claude-auth-w
 
 Mixing a sign-in cause with an admission phrase (or the reverse) is `invalid`. The id `claude-auth-watch` is ignored in hook events, case-insensitively.
 
+## Delivery test notice (`test-notice`, SPE-176)
+
+`session-notify.py test-notice [--strict]` checks that notifications reach the owner without faking an incident. Do not use `emit-resource --cause ...` for this: it looks like a real admission stall and its `--clear` clears the shared `admission-monitor` record, which can drop a real incident's dedup.
+
+- Fixed text only: title `Claude Code: test notice, ignore`, body `notification delivery test | no action needed`. No argument carries text, and no cause, recovery or owner-action value was added.
+- Same pipeline as every other notice: each enabled backend, the same retry, transport, corporate-profile refusal and `approved_destination` rules.
+- Own reserved record `notify-test` (case-insensitive, like `admission-monitor`). It shares no state with any other synthetic record. Hook events carrying that id are ignored; `sweep` retries its deliveries but never marks it stale or removes it.
+- Dedup: a repeat within 10 minutes prints `test-notice: deduped` and sends nothing; after that it sends again.
+- Output: `test-notice: <queued|deduped|no-backend|busy|error>` plus ` delivery=sent|pending|dropped|unknown` for the request's own queue entry. Exit 0 for queued, deduped and no-backend; 1 for busy or error. `--strict` leaves no dedup record on a no-backend outcome.
+
 ## Crash and silence handling
 
 Hooks cannot run after `kill -9`, power loss or a reboot. `session-notify.py sweep` (cheap, run on a timer; not installed here) marks a `RUNNING` session whose last heartbeat is older than `stale_after_seconds` (default 2700) as `FAILED` once with the notice "no heartbeat". `PostToolUse` is the heartbeat, throttled to one write per 30 s, so a long build inside one tool call is covered by the threshold. Blocked, idle and ended sessions are never stale. Records finished for 14 days are removed. Example timer (a template, not installed):
