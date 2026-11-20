@@ -69,6 +69,8 @@ on:
       - 'scripts/memory-admission.py'
       - 'scripts/session-notify.py'
       - 'tests/test-session-notify.py'
+      - 'tests/test-zeroclaw-spool.py'
+      - 'docs/schemas/zeroclaw-incident-spool-*.json'
       - 'docs/SESSION-NOTIFICATIONS.md'
       - 'docs/examples/session-notify*.json'
       - 'scripts/mcp-scope-inspect.py'
@@ -173,6 +175,7 @@ jobs:
           python3 tests/test-workstation-policy-hook.py
           python3 tests/test-memory-admission.py
           python3 tests/test-session-notify.py
+          python3 tests/test-zeroclaw-spool.py
           python3 tests/test-mcp-scope-inspect.py
           python3 tests/test-spe108-live.py
           python3 tests/test-adoption-coverage.py
