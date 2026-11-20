@@ -19,6 +19,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -236,25 +237,116 @@ def _ask_pending():
     return mod
 
 
-def _create_offer(directory, case, session_id, at, verdict):
-    """Write the OFFERED record. The caller holds the lock and has just evaluated `case` as eligible."""
+def _consult_fields(case):
+    """The fields of `case` that the consult prompt is built from, truncated exactly as the saved record keeps them."""
     attempts = [{"model": str(a.get("model"))[:40], "approach": str(a.get("approach"))[:200], "failure": str(a.get("failure"))[:200]}
                 for a in case["attempts"]][:8]
+    return {"acceptance_check": str(case["acceptance_check"])[:300], "blocker": str(case.get("blocker") or case["acceptance_check"])[:300],
+            "attempts": attempts, "question": case["question"].strip(), "review": case.get("review") or {}}
+
+
+def _create_offer(directory, case, session_id, at, verdict):
+    """Write the OFFERED record. The caller holds the lock and has just evaluated `case` as eligible."""
     record = {"id": verdict["id"], "state": OFFERED, "created": iso(at), "session_id": session_id, "trigger": verdict["trigger"],
-              "target": case["target"], "acceptance_check": str(case["acceptance_check"])[:300],
-              "blocker": str(case.get("blocker") or case["acceptance_check"])[:300], "attempts": attempts,
-              "question": case["question"].strip(), "review": case.get("review") or {},
+              "target": case["target"], **_consult_fields(case),
               "spent": {k: case.get("spent", {}).get(k) for k in ("rework_rounds", "elapsed_s", "usd")}}
     save(directory, record)
     receipt(directory, "offered", record, trigger=verdict["trigger"])
     return record
 
 
+def why_opus_insufficient(record):
+    """Restate the trigger that made the blocker eligible; it adds no criterion of its own."""
+    trigger = record.get("trigger")
+    if trigger == "two_distinct_attempts_same_failure":
+        by_failure = {}
+        for a in record.get("attempts") or []:
+            if "opus" in _norm(a.get("model")) and _norm(a.get("failure")):
+                by_failure.setdefault(_norm(a.get("failure")), (a.get("failure"), set()))[1].add(_approach_key(a.get("approach")))
+        shared = [(text, len(keys - {""})) for text, keys in by_failure.values() if len(keys - {""}) >= MIN_ATTEMPTS]
+        if shared:
+            text, count = shared[0]
+            return (f"{count} materially different Opus attempts ended in the same acceptance failure ({str(text)[:120]!r}); "
+                    "another Opus attempt is not expected to change the outcome (trigger two_distinct_attempts_same_failure).")
+    if trigger == "unresolved_review_disagreement":
+        positions = [p for p in (record.get("review") or {}).get("positions") or [] if _norm(p)]
+        return (f"independent review left an architecture disagreement with {len(positions)} stated positions that Opus has not "
+                "settled (trigger unresolved_review_disagreement).")
+    return f"the eligibility trigger {trigger} held."
+
+
+# Conservative bytes-per-token ratio for the consult packet: English and code usually run near 4 bytes per token, so 3 overcounts tokens
+# and therefore cost. Deterministic; nothing is tokenized by a model.
+BYTES_PER_TOKEN = 3
+COST_REFERENCE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "fable", "consult-cost-reference.json")
+COST_KEYS = ("estimated_usd_low", "estimated_usd_high", "cap_usd", "basis", "model", "invoked")
+
+
+def _cents_up(usd):
+    return math.ceil(round(usd * 100, 6)) / 100
+
+
+def estimate(record, reference_path=None):
+    """List-price estimate of one consult, before any invocation. Pure: no model, no network, no state directory.
+
+    low  = a cold call writing the measured prefix plus the packet, priced at the highest measured cache-write rate;
+    high = the configured per-consult cap. The documented consults are listed in `basis` as reference points."""
+    cap = float(CONSULT_BUDGET_USD)
+    basis = [f"model {FABLE_MODEL}; nothing was invoked to produce this estimate; list price, not an invoice"]
+    low = cap
+    try:
+        size = len(consult_prompt(record).encode())
+        tokens = -(-size // BYTES_PER_TOKEN)
+        basis.append(f"consult packet {size} bytes, counted as {tokens} tokens at a conservative {BYTES_PER_TOKEN} bytes per token")
+    except Exception:  # noqa: BLE001 - an offer must still reach the owner; fall back to the cap
+        tokens = None
+        basis.append("consult packet size unreadable: low set to the cap")
+    try:
+        with open(reference_path or COST_REFERENCE) as fh:
+            ref = json.load(fh)
+        runs = [r for r in ref.get("cold_prefix_runs") or []
+                if isinstance(r.get("usd"), (int, float)) and isinstance(r.get("cache_creation_tokens"), int) and r["cache_creation_tokens"] > 0]
+        consults = [c for c in ref.get("consults") or [] if isinstance(c.get("usd"), (int, float))]
+    except (OSError, ValueError, AttributeError):
+        runs, consults = None, []
+        basis.append("reference file unreadable: low set to the cap")
+    if runs and tokens is not None:
+        rate = max(r["usd"] / r["cache_creation_tokens"] for r in runs)
+        prefix = max(runs, key=lambda r: r["usd"])
+        low = _cents_up(prefix["usd"] + tokens * rate)
+        basis.append(f"low: a cold call writes the measured {prefix['cache_creation_tokens']}-token prefix (${prefix['usd']}, "
+                     f"{prefix.get('source')} {prefix.get('date')}) plus the packet at the highest measured cache-write rate "
+                     f"(${rate * 1e6:.2f} per million tokens); a warm prefix cache can cost less")
+    elif runs == []:
+        basis.append("no measured cold-prefix run in the reference file: low set to the cap")
+    basis.append(f"high: the configured cap --max-budget-usd {CONSULT_BUDGET_USD}; the client checks it between turns, so a turn "
+                 "already running can end above it")
+    for c in consults:
+        basis.append(f"reference: ${c['usd']} on {c.get('date')}: {c.get('what')} ({c.get('source')})")
+    if low > cap:
+        low = cap
+        basis.append("low clamped to the cap")
+    return {"estimated_usd_low": low, "estimated_usd_high": cap, "cap_usd": cap, "basis": basis, "model": FABLE_MODEL, "invoked": False}
+
+
+def estimate_case(case):
+    """`estimate --case`: the same estimate the offer packet would carry for this case, with no eligibility check and no state."""
+    try:
+        return estimate(_consult_fields(case))
+    except (KeyError, TypeError, AttributeError):
+        raise EscalationError("case needs acceptance_check, attempts and question")
+
+
 def packet_for(record, ledger=None):
+    cost, why = estimate(record), why_opus_insufficient(record)
     return {"id": record["id"], "trigger": record["trigger"], "blocker": record["blocker"], "attempts_made": record["attempts"],
             "question_for_fable": record["question"], "pending_ledger_item": ledger,
             "route": "included Claude subscription only; usage credits stay off; one read-only consult; advice returns to this session",
-            "ask": "Approve one read-only Fable consult for this blocker? (Approve / Decline). No reply: independent work continues."}
+            "cost": cost, "why_opus_insufficient": why,
+            "ask": (f"Recommendation: one read-only Fable consult for this blocker. Why Opus is not enough: {why} "
+                    f"Estimated cost: ${cost['estimated_usd_low']:.2f} to ${cost['estimated_usd_high']:.2f} list price, "
+                    f"capped at ${cost['cap_usd']:.2f} per consult. Nothing is invoked until you approve. "
+                    "Approve one read-only Fable consult for this blocker? (Approve / Decline). No reply: independent work continues.")}
 
 
 def _ledger_packet(record, session_id, ask_dir, at):
@@ -547,6 +639,8 @@ def report(directory):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("estimate", help="list-price estimate of one consult for a case; never invokes, never reads or writes state")
+    s.add_argument("--case", required=True, help="JSON file describing the blocker")
     for name in ("evaluate", "offer"):
         s = sub.add_parser(name)
         s.add_argument("--case", required=True, help="JSON file describing the blocker")
@@ -590,6 +684,15 @@ def main(argv=None):
     s = sub.add_parser("reset-breaker")
     s.add_argument("--note", required=True)
     args = p.parse_args(argv)
+    if args.cmd == "estimate":  # before state_dir(): an estimate never creates or reads the state directory
+        try:
+            with open(args.case) as fh:
+                out = estimate_case(json.load(fh))
+        except (EscalationError, OSError, ValueError) as exc:
+            print(json.dumps({"error": str(exc)}))
+            return 2
+        print(json.dumps(out, indent=1, sort_keys=True))
+        return 0
     directory, at = state_dir(), now_utc()
     try:
         if args.cmd in ("evaluate", "offer"):
