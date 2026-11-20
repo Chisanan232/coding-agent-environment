@@ -44,6 +44,10 @@ Add `scripts/admission-monitor.py`: a stdlib-only, deterministic, single-shot `t
   (a grant without the runner stamp of the current protocol), `stalled-running` (a claimed workload whose CPU time has not changed for
   15 minutes: reported, never touched) and `unobservable` (memory metrics unreadable). A grant that lapsed unclaimed is a note in the
   status, not a trigger. Only `stale-claim`, `frozen-queue`, `failed-continuation` and the two hysteresis causes can start an advance.
+- **Backfilled grants (ADR 0017 revision 9).** With bounded backfill on, a GRANTED or CLAIMED entry can have a higher seq than the QUEUED
+  head it overtook. That is not a stall or an ordering fault: the monitor still takes the oldest waiting entry as the head, a backfilled
+  grant carries the normal runner stamp (no `outdated-caller`), its bytes are within the floor the scheduler checked for the head (no
+  false `failed-continuation`), and one left unclaimed falls under the same per-grant window as any other grant.
 - **Unclaimed hand-off incidents (ADR 0019 monitor slice, SPE-176).** A hand-off grant (no `waiter`) lapses to EXPIRED after 20 minutes, which
   made the 45 minute rule unreachable for it. Each grant's own window now sets the clock: a status notice at 5 minutes (no page), an incident at 75%
   of the window (15 minutes for a hand-off), and, if the monitor first sees the grant after it lapsed (EXPIRED, or GRANTED past its window, with no claim,
