@@ -1993,7 +1993,8 @@ def _memory_precondition():
 
 
 CLAIM_REFUSED_WINDOW_S = 600
-CLAIM_REFUSED_KINDS = (('memory-gate', 'memory-gate'), ('over-capacity', 'floor'), ('lane-cap', 'lane'), ('budget', 'budget'))
+CLAIM_REFUSED_KINDS = (('memory-gate', 'memory-gate'), ('over-capacity', 'floor'), ('lane-cap', 'lane'), ('budget', 'budget'),
+                       ('backfill-revoked', 'backfill-revoked'), ('backfill-unverifiable', 'backfill-unverifiable'))
 
 
 def _claim_refusal_kind(reason):
@@ -2170,6 +2171,20 @@ def _queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn, pid, now, t
                     result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB)), budget)
             if budget_why:
                 return _with_budget(refuse(budget_why), budget)   # the grant is kept: a later claim may fit
+            lost = _backfill_protection_lost(host, entry, entries, live, orphans, now, result, reserved, in_use, lanes)
+            if lost and lost[0] == 'no-host-sample':
+                # Unknown, not disproved: refuse and keep the grant (its BACKFILL_GRANT_S window bounds the hold).
+                return _with_budget(refuse('backfill-unverifiable: no host sample, so %s cannot show it still protects the oldest waiting '
+                                           'entry %s; the grant is kept, retry' % (qid, lost[1])), budget)
+            if lost:
+                # A backfilled grant whose head protection no longer holds is withdrawn, not kept: keeping it would hold a lane ahead of
+                # the oldest waiting entry on a premise that is gone. Ordinary grants never reach this branch.
+                entry['state'] = 'EXPIRED'
+                _write_queue_entry(state_path, entry)
+                _drop_marker(state_path, qid)
+                _queue_receipt(state_path, 'backfill-revoked', entry, now, kind=lost[0], blocked_id=lost[1])
+                return _with_budget(refuse('backfill-revoked: %s no longer protects the oldest waiting entry %s (%s); the grant is '
+                                           'withdrawn, re-enqueue' % (qid, lost[1], lost[0])), budget)
             if wrapper_is_zombie(pid, token, table_fn):
                 return refuse('process-not-running: pid %d has exited' % pid)
             workload = capture_workload(pid, token, table_fn)
@@ -3290,22 +3305,47 @@ def _excl_only_blockers(budget, in_use, lanes, floor_ok, free, reserved, entry, 
     return blockers
 
 
-def _protects_head(host, head, cand, blockers, live, orphans, granted, now, tier, free, reserved, in_use, lanes):
+def _per_pass_memo(fn):
+    """`fn` answering once per argument tuple for the length of one queue pass: bounds the `ps` forks a pass makes without changing what
+    any check sees. An exception is not cached, so every caller still fails closed on its own."""
+    cache = {}
+
+    def memo(*args):
+        if args not in cache:
+            cache[args] = fn(*args)
+        return cache[args]
+    return memo
+
+
+def _excl_id_set(entry):
+    return {excl_identity(k) for k in entry.get('excl_keys') or []}
+
+
+def _protects_head(host, head, cand, blockers, live, orphans, granted, now, lane_tier, free, reserved, in_use, lanes, latch=False):
     """(ok, math): would `head` still be admitted once its blockers release, with `cand` granted beside everything else? Pure.
 
     Declared reservations only: the disk check counts every current reservation, the blockers included (a release is not credited
-    before it happens), plus the candidate and the head. The lane check frees only the blockers' lanes. Memory and CPU run the budget
-    for the head with the blockers removed and the candidate as an unclaimed grant charged its full declared size, on the same host
-    sample; it must give no refusal, band GREEN and fit the cap. The blockers' measured memory stays in the sample: conservative."""
+    before it happens), plus the candidate and the head. The lane check frees only the blockers' lanes, against the lane cap of the tier
+    the measured free space falls to once every reservation and the candidate are written (free - reserved - candidate, with the disk
+    latch carried), so a candidate that would shrink the tier below the lanes the head needs is refused. Memory and CPU run the budget
+    for the head with the blockers removed (their load credit too) and the candidate as an unclaimed grant charged its full declared
+    size, on the same host sample; it must give no refusal, band GREEN and fit the cap. No helper projects the SPE-117 memory latch
+    (pressure, swap, compressor) from declared bytes, so the projection used is that budget: band GREEN and the projected memory, the
+    candidate and the head included, under the GREEN limit. The blockers' measured memory stays in the sample: conservative."""
+    projected_free = free - reserved - cand['bytes']
+    tier_after = tier(projected_free)
+    lanes_after = heavy_lane_cap(tier_after, next_latch(projected_free, {'latch': latch}))
     math = {'free': free, 'reserved': reserved, 'cand_bytes': cand['bytes'], 'head_bytes': head['bytes'], 'floor': HEAVY_FLOOR,
             'disk_left': free - reserved - cand['bytes'] - head['bytes'], 'in_use': in_use, 'lanes': lanes,
+            'tier_after': tier_after, 'lanes_after': lanes_after, 'cap': None, 'band_after': None,
             'head_projected': None, 'head_limit': None, 'head_cpu': None, 'cpu_limit': None}
-    ok = math['disk_left'] >= HEAVY_FLOOR and in_use + 1 - len(blockers) < lanes
+    cap = math['cap'] = min(lanes, lanes_after, heavy_lane_cap(lane_tier, latch))
+    ok = math['disk_left'] >= HEAVY_FLOOR and in_use + 1 - len(blockers) < cap
     try:
         gone = {b['label'] for b in blockers}
         holders = [h for h in budget_holders(live, orphans, granted, now) if not (h['kind'] == 'reservation' and h['label'] in gone)]
         holders.append(budget_holder('granted', cand))
-        caps = {'max_concurrent': heavy_lane_cap(tier), 'free_bytes': free, 'reserved_bytes': reserved + cand['bytes'], 'floor': HEAVY_FLOOR}
+        caps = {'max_concurrent': cap, 'free_bytes': free, 'reserved_bytes': reserved + cand['bytes'], 'floor': HEAVY_FLOOR}
         verdict = budget_decision(host, holders, budget_request(head, head['bytes'], head['label']), caps)
     except Exception:   # malformed records under the lock: no backfill, never an aborted advance
         return False, math
@@ -3313,9 +3353,45 @@ def _protects_head(host, head, cand, blockers, live, orphans, granted, now, tier
         return False, math
     math.update(head_projected=verdict['projected_bytes'], head_limit=verdict['limit_bytes'],
                 head_cpu=verdict['cpu_slots_used'] + (head.get('cpu_slots') or 0),
-                cpu_limit=verdict['cpu_limit'])
+                cpu_limit=verdict['cpu_limit'], band_after=verdict['band'])
     ok = ok and not verdict['resource_reasons'] and verdict['band'] == 'GREEN' and not verdict['cap_reason']
     return ok, math
+
+
+def _overtaken_head(entries, entry, now):
+    """The oldest unlapsed waiting entry queued before `entry`, or None. A GRANTED entry with one is a backfilled grant: an in-order
+    pass grants the head first and stops at the first entry that does not fit (the same durable rule the in-flight count uses, so a
+    rotated receipt log cannot hide it)."""
+    earlier = [e for e in entries if e['state'] in ('QUEUED', 'ELIGIBLE') and e['seq'] < entry['seq'] and not _entry_lapsed(e, now)]
+    return min(earlier, key=lambda e: e['seq']) if earlier else None
+
+
+def _backfill_protection_lost(host, entry, entries, live, orphans, now, result, reserved, in_use, lanes):
+    """None, or (kind, head id) when `entry` is a backfilled grant whose head protection no longer holds at claim time. The head must be
+    admitted outright or refused solely by the exclusion key of claimed running jobs (_excl_only_blockers), and _protects_head must hold
+    with this grant charged beside everything else. Without a host sample nothing can be shown: ('no-host-sample', head id)."""
+    head = _overtaken_head(entries, entry, now)
+    if head is None:
+        return None
+    if host is None or host.get('error'):
+        return ('no-host-sample', head['id'])
+    others = [e for e in entries if e['id'] != entry['id']]
+    granted = [e for e in others if e['state'] == 'GRANTED' and not _entry_lapsed(e, now)]
+    held = in_use + len(granted)
+    reserved_all = reserved + sum(e['bytes'] for e in granted)
+    free = result['free_bytes']
+    floor_ok = free - reserved_all - head['bytes'] >= HEAVY_FLOOR
+    budget = _shadow_site(host, 'claim-backfill', head['label'], lambda: (budget_holders(live, orphans, others, now),
+                          budget_request(head, head['bytes'], head['label'])), result['tier'], free, reserved_all, True)
+    if held < lanes and floor_ok and not _lane_refusal(budget, held, free, reserved_all, head['bytes'], head):
+        blockers = []
+    else:
+        blockers = _excl_only_blockers(budget, held, lanes, floor_ok, free, reserved_all, head, live, entries)
+        if blockers is None:
+            return ('head-not-excl-only', head['id'])
+    ok, _ = _protects_head(host, head, entry, blockers, live, orphans, granted, now, result['tier'], free, reserved_all, held, lanes,
+                           result['latch'])
+    return None if ok else ('head-unprotected', head['id'])
 
 
 def _waiter_proven_alive(entry, token_fn):
@@ -3347,7 +3423,7 @@ def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans,
         refused = bool(_lane_refusal(budget, in_use, free, reserved, cand['bytes'], cand))
     if not refused:
         ok, math = _protects_head(host, backfill['head'], cand, backfill['blockers'], live, orphans, granted, now, result['tier'], free,
-                                  reserved, in_use, lanes)
+                                  reserved, in_use, lanes, result['latch'])
         refused = not ok
     if refused:
         backfill['keys'] |= keys
