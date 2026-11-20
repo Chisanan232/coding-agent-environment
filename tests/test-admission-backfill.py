@@ -635,7 +635,7 @@ class KeyResolution(unittest.TestCase):
     @unittest.skipUnless(sys.platform == 'darwin' and os.path.realpath('/tmp') == '/private/tmp', 'macOS /tmp alias')
     def test_tmp_and_private_tmp_are_one_key(self):
         self.assertEqual(self.key({'CARGO_TARGET_DIR': '/tmp/cae-target-x'}), da.CARGO_KEY + '/private/tmp/cae-target-x')
-        self.assertEqual(da.excl_identity(da.CARGO_KEY + '/tmp/cae-target-x'), da.excl_identity(da.CARGO_KEY + '/private/tmp/cae-target-x'))
+        self.assertTrue(da.excl_keys_clash(da.CARGO_KEY + '/tmp/cae-target-x', da.CARGO_KEY + '/private/tmp/cae-target-x'))
 
 
 class KeyIdentity(Base):
@@ -650,14 +650,46 @@ class KeyIdentity(Base):
 
     def test_excl_identity(self):
         canonical, stored = self.aliases()
-        self.assertEqual(da.excl_identity(canonical), da.excl_identity(stored))
-        self.assertNotEqual(da.excl_identity(canonical), da.excl_identity(LOCAL))
-        self.assertEqual(da.excl_identity('docker'), 'docker')
-        self.assertEqual(da.excl_identity(da.CARGO_KEY + '/nonexistent/a/../b'), da.CARGO_KEY + da._fold_path('/nonexistent/b'))
+        self.assertTrue(da.excl_keys_clash(canonical, stored))
+        self.assertFalse(da.excl_keys_clash(canonical, LOCAL))
+        self.assertEqual(da.excl_identity('docker'), ['docker'])
+        self.assertTrue(da.excl_keys_clash(da.CARGO_KEY + '/nonexistent/a/../b', da.CARGO_KEY + '/nonexistent/b'))
+        for key in (canonical, stored, LOCAL, 'docker'):
+            self.assertIn(key, da.excl_identity(key), 'the raw string always stays a token: string equality is never lost')
+
+    def test_a_directory_created_or_removed_between_two_stats_still_clashes(self):
+        """The race the single-form identity had: one side stats before cargo creates the target (or after cargo clean removes it)."""
+        target = Path(self.temp.name).resolve() / 'raced-target'
+        key = da.CARGO_KEY + str(target)
+        link = Path(self.temp.name).resolve() / 'raced-link'
+        link.symlink_to(target)          # dangling until the directory exists
+        alias = da.CARGO_KEY + str(link)
+        before, before_alias = da.excl_identity(key), da.excl_identity(alias)
+        target.mkdir()
+        after, after_alias = da.excl_identity(key), da.excl_identity(alias)
+        self.assertTrue(any(t.startswith('cargo-target-inode:') for t in after))
+        self.assertFalse(any(t.startswith('cargo-target-inode:') for t in before))
+        for a, b in ((before, after), (before_alias, after), (before, after_alias), (before_alias, after_alias)):
+            self.assertTrue(set(a) & set(b), (a, b))
+        target.rmdir()
+        removed = da.excl_identity(key)
+        self.assertTrue(set(after) & set(removed))
+        self.assertTrue(set(after_alias) & set(removed))
+
+    def test_two_different_existing_directories_stay_distinct(self):
+        root = Path(self.temp.name).resolve()
+        (root / 'one').mkdir()
+        (root / 'two').mkdir()
+        self.assertFalse(da.excl_keys_clash(da.CARGO_KEY + str(root / 'one'), da.CARGO_KEY + str(root / 'two')))
+        holders = [da.budget_holder('reservation', dict(decl('build-crate', [da.CARGO_KEY + str(root / 'one')]), label='a'), None, 11,
+                                    granted_jobs=4)]
+        out = da.budget_decision(self.host(), holders, da.budget_request(decl('build-crate', [da.CARGO_KEY + str(root / 'two')]), 10 * GIB,
+                                                                          'b'), {'max_concurrent': 3})
+        self.assertEqual(out['excl_clash'], [])
 
     @unittest.skipUnless(sys.platform == 'darwin', 'case-insensitive default volume')
     def test_a_missing_directory_compares_case_insensitively_on_macos(self):
-        self.assertEqual(da.excl_identity(da.CARGO_KEY + '/Nonexistent/Target'), da.excl_identity(da.CARGO_KEY + '/nonexistent/target'))
+        self.assertTrue(da.excl_keys_clash(da.CARGO_KEY + '/Nonexistent/Target', da.CARGO_KEY + '/nonexistent/target'))
 
     def test_budget_clash_sees_an_alias_and_reports_the_request_spelling(self):
         canonical, stored = self.aliases()
