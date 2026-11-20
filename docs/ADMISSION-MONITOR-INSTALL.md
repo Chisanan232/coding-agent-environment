@@ -22,6 +22,8 @@ explicit authorization: a LaunchAgent created from an agent session was classifi
 | Guarded recovery (`--act` only) | at most one action per tick and three per rolling 30 minutes: cancel a conclusively abandoned, unstarted GRANTED entry through `queue cancel`, or send one SIGTERM to a conclusively obsolete heavy-run / la-cargo wrapper whose entry is terminal for two ticks. See "What `--act` does now" below |
 | Never | send any signal other than that one SIGTERM (never SIGKILL, never a process group), touch a healthy workload, an arbitrary application, a system service or an unidentified process, run `launchctl`, reset the latch, change a threshold, delete anything, or release an entry itself. `queue advance`, which any caller runs, may release a claim whose holder provably exited and cancel an unclaimed entry whose declared waiter provably exited; never on doubt |
 
+Optional ZeroClaw hand-off (credential-free, no Claude Code sign-in needed): enabling `backends.zeroclaw-spool` in the session-notify config also writes each unclaimed-handoff, queue-wait and over-deadline incident to the supervisor spool; see `SESSION-NOTIFICATIONS.md` (ZeroClaw incident spool). It cannot be enabled together with `telegram` for the same notice kind.
+
 Prerequisite: the canonical checkout contains the merged monitor (and the merged `session-notify emit-resource` if you want the alert
 recorded through session-notify). Verify before installing:
 

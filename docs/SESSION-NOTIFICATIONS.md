@@ -129,6 +129,36 @@ Three more causes, with their own phrases and a synthetic session `claude-auth-w
 
 Mixing a sign-in cause with an admission phrase (or the reverse) is `invalid`. The id `claude-auth-watch` is ignored in hook events, case-insensitively.
 
+## ZeroClaw incident spool (`zeroclaw-spool` backend, SPE-176)
+
+A local, **credential-free** hand-off of incident transitions to the engineering-supervisor (ZeroClaw), which alerts the owner. It needs no bot token, no Claude Code
+sign-in and no network, so the reserved sessions (`admission-monitor`, `claude-auth-watch`, `notify-test`) keep working while Claude Code is signed out. Off by default.
+`admission-monitor.py` and `claude-auth-watch.py` already call `emit-resource`, which now also feeds this backend; the only caller change is that admission-monitor passes `--incident-ref` (stable across the phases of one incident) and claude-auth-watch's incident key already serves as the ref.
+
+- **One file per incident transition**, named `<key>.json`, in the supervisor spool directory: default `<HOME>/.local/share/engineering-supervisor/state/incident-spool/`,
+  override with `backends.zeroclaw-spool.spool_dir` (absolute path only; a relative one disables the backend and is reported by `status`). The directory is never created
+  here: it must already exist, be owned by the user, have mode exactly 0700 and have no symlink component, otherwise nothing is written. The file is written to a
+  `.tmp-*` name in the same directory (0600, `O_EXCL`, `fsync`) and then `rename`d, so a reader sees all of it or none of it.
+- **Closed schema 1**, as specified in SPE-176 (not yet cross-checked with the supervisor consumer, which is built separately; machine-readable: [`schemas/zeroclaw-incident-spool-v1.schema.json`](schemas/zeroclaw-incident-spool-v1.schema.json)):
+  `schema`, `key` (first 32 hex of `sha256(incident_ref + "|" + transition)`), `project`, `incident_ref` (`inc:<16 hex>`, the sign-in notice's `inc=` is its first 6; `test:<bucket>` for a test; `emit-resource --incident-ref` sets it, default `inc:<signature>`), `kind`
+  (`unclaimed-handoff`, `queue-wait-excessive`, `workload-over-deadline`, `auth-interrupted`, `recovered`, `notify-test`), `transition` (`opened`, `escalated`, `recovered`,
+  `test`; one incident keeps its ref across transitions, so `key` differs per transition), `severity` (`info`, `action`), `progress`, `action`, `ts`. `progress` and `action` are fixed phrases from the existing cause, recovery and owner-action tables; no
+  path, id, command line, URL or free text can reach the file (charset `[A-Za-z0-9 .,;:()+-]`, at most 120 characters). `project` is `backends.zeroclaw-spool.project` (default `coding-agent-environment`).
+- **Mapping:** the three admission incident causes and `test-notice` map to their own kinds; `auth-required` and `remote-control-disconnect` to `auth-interrupted`; `signin-recovered`
+  to `recovered` (`info`). A recovery phrase of `lapsed`, `wait-expiry-near` or `recovery-exhausted` makes the transition `escalated`, otherwise `opened`. Other causes (disk,
+  memory, wrapper recovery) and hook-driven session states have no spool kind and are never spooled.
+- **Dedup:** the key is the dedup identity. A key already in the directory, or written within 24 h per the local ledger `zeroclaw-spool.ledger` in the state directory (so a
+  file the supervisor already consumed is not written again), produces no second file.
+- **Undelivered events are kept.** A missing, wrong-mode or unwritable spool directory leaves the notice pending in the session record (`status` shows `pending_deliveries`;
+  admission-monitor reports it as an undelivered owner notice and keeps its owner-outbox line). It is retried every `retry.base_seconds` by the emitter's next tick and by
+  `sweep`, without the attempt cap and never dropped for this reason, and is written exactly once when the directory becomes usable. Guarantee, exactly: an incident notice waiting for the spool is never dropped by the normal 20-entry queue cap (other notices still are); up to `SPOOL_PENDING_CAP` = 200 distinct incident transitions are kept. Beyond 200 the oldest is dropped, counted in `dropped` (shown by `status`), recorded as the history entry `spool-overflow-dropped` and logged in `hook.log` as `spool-queue-overflow`. Stale `.tmp-*` files of ours older than 1 h in the spool directory are removed on the next write (regular files only), and an interrupted write (a crash while `sending`) is not counted as an attempt. Limit: admission-monitor stops polling an incident after 20 pending attempts (about 4 h) and nothing here schedules `sweep` (see "Crash and silence handling"); after that the entry waits for the next emit on the same reserved record or a `sweep` run. claude-auth-watch keeps re-driving an open alert.
+- **One destination per notice kind.** `telegram` and `zeroclaw-spool` each have a `kinds` list (telegram default: all kinds and `session`, so enabling `zeroclaw-spool` next to an unchanged `telegram` is rejected; an empty list carries nothing; spool default: the six spool kinds). A
+  config that enables both with an overlapping kind is **rejected at load** (`status` shows `CONFIG_PROBLEM conflict:...`; `emit-resource`, `test-notice` exit 2 with the reason on
+  stderr and send nothing; the two backends are treated as off). The hook path stays silent, so the rejection is also visible later: `status` shows `CONFIG_CONFLICT` with the exact keys to fix, and the hook leaves `config-conflict.marker` in the state directory (shown as `CONFIG_CONFLICT_SEEN_BY_HOOK` once the config is fixed but before the next hook removes it).
+  **Warning: a working direct `telegram` stops sending, silently on the hook path, the moment `zeroclaw-spool` is enabled next to it unchanged.** Worked example (spool for incidents, telegram only for hook-driven session states):
+  `"telegram": {"enabled": true, ..., "kinds": ["session"]}, "zeroclaw-spool": {"enabled": true}`; or set `"telegram": {"enabled": false}` to leave everything to ZeroClaw. `render-config` and `docs/examples/session-notify.config.example.json` carry the same warning. To use both, narrow `backends.telegram.kinds` (for example to `["session"]`).
+- Not yet validated against the real supervisor consumer or a real spool directory: tests use scratch directories only.
+
 ## Delivery test notice (`test-notice`, SPE-176)
 
 `session-notify.py test-notice [--strict]` checks that notifications reach the owner without faking an incident. Do not use `emit-resource --cause ...` for this: it looks like a real admission stall and its `--clear` clears the shared `admission-monitor` record, which can drop a real incident's dedup.
