@@ -67,5 +67,5 @@
       ]
     }
   },
-  "_note": "Everything is off until a backend sets enabled to true. Credentials are environment-variable NAMES or file paths, never values. Remote backends also need approved_destination equal to the server host, and are refused on the corporate profile. Notifications show a repository name only if it is listed in known_repos; otherwise they say 'unlisted'."
+  "_note": "Everything is off until a backend sets enabled to true. Credentials are environment-variable NAMES or file paths, never values. Remote backends also need approved_destination equal to the server host, and are refused on the corporate profile. Notifications show a repository name only if it is listed in known_repos; otherwise they say 'unlisted'. If you enable zeroclaw-spool, set backends.telegram.kinds to [\"session\"] (or disable telegram): both enabled for one notice kind is rejected and turns both off."
 }

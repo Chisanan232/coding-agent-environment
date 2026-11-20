@@ -129,6 +129,8 @@ NOTIFIED_CAP = 500
 DEDUP_WINDOW = 86400   # best-effort dedup memory: older or beyond the cap, a repeat of the same transition may notify again
 MAX_CWD = 4096
 PENDING_CAP = 20
+SPOOL_PENDING_CAP = 200   # hard bound on notices still waiting for an unavailable spool directory (one per incident transition); see make_room
+SPOOL_TMP_MAX_AGE = 3600
 HOOK_DEADLINE = 10
 SENDING_STALE = 300
 GC_AFTER = 14 * 86400
@@ -293,7 +295,7 @@ HISTORY_SCHEMA = v_obj({"t": v_int(-10**12, 10**12), "from": v_enum(STATES), "to
 RECORD_SCHEMA = v_obj({"v": v_int(3, 3), "session_id": v_str(80, SAFE_ID), "state": v_enum(STATES), "state_since": v_num(), "last_seen": v_num(),
                        "run_started": v_num(), "cp_floor": v_num(), "cycle": v_int(0, 10**9), "agent_done": v_int(0, 10**9), "dropped": v_int(0, 10**9),
                        "task": TASK_SCHEMA, "history": v_list(HISTORY_SCHEMA, HISTORY_CAP),
-                       "notified": v_map(v_str(64), v_list(v_int(-10**12, 10**12), 2, 2), NOTIFIED_CAP), "pending": v_list(PENDING_SCHEMA, PENDING_CAP),
+                       "notified": v_map(v_str(64), v_list(v_int(-10**12, 10**12), 2, 2), NOTIFIED_CAP), "pending": v_list(PENDING_SCHEMA, SPOOL_PENDING_CAP),
                        "ended_reason": v_opt(v_str(30)), "cwd": v_str(MAX_CWD), "corporate": v_bool(), "repo_label": v_opt(v_str(64))},
                       required=("v", "session_id", "state", "state_since", "last_seen", "run_started", "cp_floor", "cycle", "agent_done", "dropped", "task",
                                 "history", "notified", "pending", "ended_reason", "cwd", "corporate"))
@@ -530,7 +532,7 @@ def load_config(path=None):
     if clash:
         for name in ("telegram", SPOOL_BACKEND):   # fail closed for the clashing pair only: no notice may go to two destinations
             cfg["backends"][name]["enabled"] = False
-        return cfg, f"{CONFLICT_PREFIX}telegram+{SPOOL_BACKEND} both enabled for kinds {','.join(clash)}; narrow backends.telegram.kinds or backends.{SPOOL_BACKEND}.kinds"
+        return cfg, f"{CONFLICT_PREFIX}telegram+{SPOOL_BACKEND} both enabled for kinds {','.join(clash)}; both are now OFF until fixed: set backends.telegram.kinds to a list without those kinds (for example [\"session\"]), or set backends.telegram.enabled or backends.{SPOOL_BACKEND}.enabled to false"
     return cfg, (f"invalid:{','.join(bad[:5])}"[:100] if bad else None)
 
 
@@ -879,6 +881,17 @@ def open_spool_dir(path):
     return fd
 
 
+def sweep_stale_tmp(dfd, now):
+    """Unlink our own regular `.tmp-*` files older than SPOOL_TMP_MAX_AGE (left by a crashed writer). Nothing else in the directory is touched."""
+    with contextlib.suppress(OSError):
+        for name in os.listdir(dfd):
+            if not name.startswith(".tmp-"):
+                continue
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and now - st.st_mtime > SPOOL_TMP_MAX_AGE:
+                os.unlink(name, dir_fd=dfd)
+
+
 def _ledger_keys(sdir, now):
     raw, _ = read_regular(pathlib.Path(sdir) / SPOOL_LEDGER, MAX_STATE_BYTES)
     try:
@@ -910,6 +923,7 @@ def send_zeroclaw_spool(payload, cfg):
             dfd = open_spool_dir(path)
             if dfd is None:
                 return SPOOL_UNAVAILABLE
+            sweep_stale_tmp(dfd, now)
             tmp = f".tmp-{os.urandom(8).hex()}"
             try:
                 try:
@@ -1018,16 +1032,29 @@ class Engine:
         while len(rec["notified"]) > NOTIFIED_CAP:
             del rec["notified"][min(rec["notified"], key=lambda k: rec["notified"][k][1])]
 
+    @staticmethod
+    def spool_waiting(pend):
+        b = pend.get("backends", {}).get(SPOOL_BACKEND)
+        return bool(b) and b.get("status") in ("pending", "failed", "sending")
+
     def make_room(self, rec, now):
         """A full queue gives its oldest entry a durable terminal outcome instead of silently discarding it."""
         while len(rec["pending"]) >= PENDING_CAP:
-            old = rec["pending"].pop(0)
+            # An incident notice still waiting for the spool is kept past PENDING_CAP (they already dedup per incident transition); the oldest other entry goes first.
+            victim = next((i for i, e in enumerate(rec["pending"]) if not self.spool_waiting(e)), None)
+            if victim is None:
+                if len(rec["pending"]) < SPOOL_PENDING_CAP:
+                    return
+                victim = 0
+                log_line(self.sdir, "spool-queue-overflow: oldest undelivered incident notice dropped")   # owner-visible: hook.log, `dropped` in status, history
+            code = "queue-overflow" if not self.spool_waiting(rec["pending"][victim]) else "spool-queue-overflow"
+            old = rec["pending"].pop(victim)
             for b in old["backends"].values():
                 if b["status"] not in TERMINAL:
-                    b.update(status="dropped", code="queue-overflow")
+                    b.update(status="dropped", code=code)
             self.mark_notified(rec, old["key"], old["cycle"], now)
             rec["dropped"] += 1
-            rec["history"] = (rec["history"] + [{"t": int(now), "from": rec["state"], "to": rec["state"], "why": "queue-overflow-dropped"}])[-HISTORY_CAP:]
+            rec["history"] = (rec["history"] + [{"t": int(now), "from": rec["state"], "to": rec["state"], "why": "spool-overflow-dropped" if code == "spool-queue-overflow" else "queue-overflow-dropped"}])[-HISTORY_CAP:]
 
     def enqueue(self, rec, state, reason, now, kind=None, extra_key="", extra=None, strict=False, window=DEDUP_WINDOW):
         t, label, cycle = rec["task"], kind or state, rec["cycle"]
@@ -1107,6 +1134,8 @@ class Engine:
             for name, b in entry["backends"].items():
                 if b["status"] == "sending" and now - b["next_at"] > SENDING_STALE:
                     b["status"], changed = "failed", True
+                    if name == SPOOL_BACKEND:   # an interrupted spool write is idempotent (an existing key is success): the interrupted attempt does not count
+                        b["attempts"] = max(0, b["attempts"] - 1)
                 if b["status"] not in ("pending", "failed") or b["next_at"] > now:
                     continue
                 ok, why = backend_allowed(name, self.cfg, corporate)
@@ -1410,6 +1439,19 @@ class Engine:
 
 
 # ---- CLI -----------------------------------------------------------------------------------------------------------------------
+CONFLICT_MARKER = "config-conflict.marker"   # not *.json: never read as a session record
+
+
+def mark_conflict(sdir, problem):
+    """Hook path, no stderr: leave (or remove) a marker that `status` shows, because a rejected config silently turns telegram and the spool off."""
+    path = pathlib.Path(sdir) / CONFLICT_MARKER
+    with contextlib.suppress(OSError):
+        if isinstance(problem, str) and problem.startswith(CONFLICT_PREFIX):
+            atomic_write(path, problem[len(CONFLICT_PREFIX):][:400] + "\n")
+        elif path.is_file() and not path.is_symlink():
+            path.unlink()
+
+
 def cmd_hook(args):
     sdir = state_dir()
 
@@ -1430,6 +1472,7 @@ def cmd_hook(args):
         cfg, problem = load_config()
         if problem and problem not in (None,) and str(problem) != "unreadable:2":
             log_line(sdir, f"config {problem}")
+        mark_conflict(sdir, problem)
         result = Engine(sdir, cfg).handle(ev)
         if result not in ("ok", "ignored"):
             log_line(sdir, f"result {result}")
@@ -1449,8 +1492,13 @@ def age(now, t):
 def cmd_status(args):
     sdir, rows, now = state_dir(), [], time.time()
     config_problem = load_config()[1]
-    if config_problem and str(config_problem) != "unreadable:2":
+    if isinstance(config_problem, str) and config_problem.startswith(CONFLICT_PREFIX):
+        rows.append({"session": "(config)", "state": "CONFIG_CONFLICT", "problem": config_problem[len(CONFLICT_PREFIX):]})   # telegram AND zeroclaw-spool are off
+    elif config_problem and str(config_problem) != "unreadable:2":
         rows.append({"session": "(config)", "state": "CONFIG_PROBLEM", "problem": config_problem})  # surfaced here, not only in hook.log
+    marker, _ = read_regular(sdir / CONFLICT_MARKER, 4096)
+    if marker and not (isinstance(config_problem, str) and config_problem.startswith(CONFLICT_PREFIX)):
+        rows.append({"session": "(config)", "state": "CONFIG_CONFLICT_SEEN_BY_HOOK", "problem": marker.decode("utf-8", "replace").strip()})
     for p in sorted(sdir.glob("*.json")) if sdir.is_dir() else []:
         sid = p.stem
         rec, problem = load_record(sdir, sid) if SAFE_ID.fullmatch(sid) else (None, "bad-name")
@@ -1586,7 +1634,8 @@ def cmd_render_config(args):
     cfg["profile"] = args.profile
     cfg["_note"] = ("Everything is off until a backend sets enabled to true. Credentials are environment-variable NAMES or file paths, never values. "
                     "Remote backends also need approved_destination equal to the server host, and are refused on the corporate profile. "
-                    "Notifications show a repository name only if it is listed in known_repos; otherwise they say 'unlisted'.")
+                    "Notifications show a repository name only if it is listed in known_repos; otherwise they say 'unlisted'. "
+                    "If you enable zeroclaw-spool, set backends.telegram.kinds to [\"session\"] (or disable telegram): both enabled for one notice kind is rejected and turns both off.")
     text = json.dumps(cfg, indent=2) + "\n"
     if args.out:
         with open(args.out, "x") as fh:
