@@ -59,17 +59,18 @@ ALLOWED_KINDS = set(KIND_TEXT.values()) | STOP_FAILURE_KINDS
 # Admission-monitor notices (SPE-176): every word of the notification comes from these fixed phrases; no ids, numbers, paths or free text.
 CAUSE_TEXT = {"disk-floor": "disk below floor", "memory-pressure": "memory pressure", "memory-hysteresis-static-compressor": "memory hysteresis, static compressor",
               "memory-hysteresis": "memory hysteresis", "stale-claim": "stale claim", "frozen-queue": "queue frozen", "failed-continuation": "continuation failed",
-              "unclaimed-handoff": "hand-off grant unclaimed",
+              "unclaimed-handoff": "hand-off grant unclaimed", "queue-wait-excessive": "queue wait excessive", "workload-over-deadline": "workload over deadline",
               "outdated-caller": "outdated caller", "stalled-running": "running work stalled", "unobservable": "admission unobservable",
               "state-unreadable": "admission state unreadable"}
 RECOVERY_TEXT = {"none": "none tried", "advance-tried": "queue advance tried", "recovery-exhausted": "recovery exhausted", "observe-only": "observe only",
-                 "lapsed": "grant lapsed"}
+                 "lapsed": "grant lapsed", "wait-expiry-near": "wait expiry near"}
 OWNER_ACTION_TEXT = {"reclaim-disk": "reclaim disk", "reduce-load": "reduce load", "approve-memory-policy": "approve memory policy",
                      "wait-or-approve-memory-policy": "wait or approve memory policy", "confirm-claim-ended": "confirm claim ended",
                      "restart-waiting-session": "restart waiting session", "restart-outdated-caller": "restart outdated caller",
                      "inspect-admission-state": "inspect admission state", "inspect-running-workload": "inspect running workload",
                      "run-queue-advance": "run queue advance", "inspect-memory-admission": "inspect memory admission",
-                     "claim-or-reenqueue-handoff": "claim or re-enqueue hand-off"}
+                     "claim-or-reenqueue-handoff": "claim or re-enqueue hand-off", "check-queued-wait": "check queued wait",
+                     "check-over-deadline-workload": "check over-deadline workload"}
 RESOURCE_SESSION = "admission-monitor"
 QUARANTINE_PROBLEMS = {"corrupt", "not-regular", "too-large", "foreign-owner"}
 RESOURCE_TICKET = "SPE-176"
