@@ -2560,6 +2560,63 @@ class TestNotice(Base):
         self.engine().sweep()
         self.assertIsNotNone(self.rec("notify-test"))
 
+    def test_pending_entry_does_not_report_deduped_past_the_window(self):
+        failing = Fake(fail={"macos": "boom", "ntfy": "boom", "pushover": "boom"})
+        e = self.engine(fake=failing)
+        self.assertEqual((e.test_notice(), e.last_delivery), ("queued", "pending"))
+        self.advance(300)
+        self.assertEqual((e.test_notice(), e.last_delivery), ("deduped", "pending"))
+        self.advance(301)
+        e = self.engine()
+        self.assertEqual((e.test_notice(), e.last_delivery), ("queued", "sent"))
+        self.assertEqual(len(self.fake.sent), 3)
+        self.assertEqual(len(self.rec("notify-test")["pending"]), 0)
+
+    def test_all_three_synthetic_sessions_are_reserved_in_every_path(self):
+        ids = ("admission-monitor", "claude-auth-watch", "notify-test")
+        self.assertEqual(set(sn.RESERVED_SESSIONS), set(ids))
+        e = self.engine()
+        for sid in ids:
+            for variant in (sid, sid.upper(), sid.title()):
+                self.assertEqual(self.ev(e, "SessionStart", sid=variant, source="startup"), "ignored", variant)
+        self.assertFalse(self.sdir.exists())
+        # one of each, with an old RUNNING state and an old SESSION_ENDED state: sweep must neither stale nor remove any of them
+        failing = Fake(fail={"macos": "boom", "ntfy": "boom", "pushover": "boom"})
+        for sid in ids:
+            rec = sn.new_record(sid, self.t)
+            rec["state"] = "RUNNING"
+            sn.save_record(self.sdir, rec)
+        self.advance(40 * 86400)
+        out = self.engine(fake=failing).sweep()
+        self.assertEqual((out["sessions"], out["stale"], out["removed"]), (3, 0, 0))
+        for sid in ids:
+            rec = self.rec(sid)
+            rec["state"] = "SESSION_ENDED"
+            sn.save_record(self.sdir, rec)
+        self.assertEqual(self.engine().sweep()["removed"], 0)
+        self.assertEqual(sorted(p.name for p in self.sdir.glob("*.json")), sorted(i + ".json" for i in ids))
+
+    def test_each_synthetic_record_stays_byte_identical_when_another_runs(self):
+        auth = {"cause": "auth-required", "recovery": "no-auto-recovery", "owner_action": "sign-in-claude"}
+        res = {"cause": "disk-floor", "recovery": "none", "owner_action": "reclaim-disk"}
+        runs = {"claude-auth-watch": lambda e: e.emit_resource(dict(auth)), "admission-monitor": lambda e: e.emit_resource(dict(res)),
+                "notify-test": lambda e: e.test_notice()}
+        for sid, fn in runs.items():
+            self.assertIn(fn(self.engine()), ("queued",))
+        before = {sid: self.digest(sid) for sid in runs}
+        self.advance(5)
+        for sid, fn in runs.items():
+            others = {o: self.digest(o) for o in runs if o != sid}
+            fn(self.engine())   # a deduped repeat of its own notice must not write the other two records
+            self.assertEqual({o: self.digest(o) for o in others}, others, sid)
+        after = {sid: self.digest(sid) for sid in runs}   # each record may rewrite itself on a repeat; only the others must stay put
+        self.assertEqual(before["notify-test"], after["notify-test"])
+        self.engine().emit_resource({}, clear=True, scope="admission")
+        self.assertEqual({o: self.digest(o) for o in ("claude-auth-watch", "notify-test")}, {o: after[o] for o in ("claude-auth-watch", "notify-test")})
+        self.advance(700)
+        self.engine().test_notice()
+        self.assertEqual(self.digest("claude-auth-watch"), after["claude-auth-watch"])
+
     def test_no_backend_strict_leaves_no_dedup_record(self):
         off = cfg()
         for b in off["backends"].values():
