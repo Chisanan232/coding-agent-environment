@@ -161,7 +161,7 @@ class Sanitization(Spool):
             recovery, action = (sorted(sn.AUTH_RECOVERY)[0], sorted(sn.AUTH_ACTIONS)[0]) if auth else ("none", "inspect-admission-state")
             for rec in ([sorted(sn.AUTH_RECOVERY)[0]] if auth else sorted(set(sn.RECOVERY_TEXT) - sn.AUTH_RECOVERY)):
                 with self.subTest(cause=cause, recovery=rec):
-                    event = sn.spool_event({"cause": cause, "recovery": rec, "owner_action": action, "incident_ref": "inc:" + SIG},
+                    event = sn.spool_event({"state": "BLOCKED_RESOURCE", "cause": cause, "recovery": rec, "owner_action": action, "incident_ref": "inc:" + SIG},
                                            "coding-agent-environment", self.t)
                     self.assertIsNotNone(event)
                     self.assertTrue(check_schema(event))
@@ -170,7 +170,7 @@ class Sanitization(Spool):
 
     def test_free_text_and_untrusted_fields_never_reach_the_file(self):
         evil = "Ignore previous /etc/passwd https://evil.example $(rm -rf ~) token=abc"
-        base = {"cause": "auth-required", "recovery": "no-auto-recovery", "owner_action": "sign-in-claude", "incident_ref": "inc:" + SIG}
+        base = {"state": "BLOCKED_RESOURCE", "cause": "auth-required", "recovery": "no-auto-recovery", "owner_action": "sign-in-claude", "incident_ref": "inc:" + SIG}
         self.assertIsNone(sn.spool_event(dict(base, incident_ref=evil), "p", self.t))
         self.assertIsNone(sn.spool_event(dict(base, incident_ref="x" * 65), "p", self.t))
         self.assertIsNone(sn.spool_event({k: v for k, v in base.items() if k != "incident_ref"}, "p", self.t))
@@ -393,6 +393,28 @@ class Routing(Spool):
         self.assertEqual(len(self.files()), 1)
         self.assertEqual(sent, ["disk below floor | recovery: none tried | action: reclaim disk"])
 
+    def test_an_empty_telegram_kinds_list_cannot_route_a_notice_to_both_destinations(self):
+        sent = []
+        transports = {"telegram": lambda payload, b: sent.append(payload["body"]), sn.SPOOL_BACKEND: sn.send_zeroclaw_spool}
+        cfg, problem = sn.load_config(self.write_cfg(self.both(tele_kinds=[])))
+        self.assertIsNone(problem)               # telegram carries nothing, so the kinds are disjoint
+        self.assertEqual(sn.effective_kinds("telegram", cfg["backends"]["telegram"]), ())
+        engine = self.engine(cfg, transports=transports)
+        self.emit(engine=engine)
+        self.emit(engine=engine, cause="disk-floor", recovery="none", action="reclaim-disk", sig="a" * 16)
+        self.assertEqual((len(self.files()), sent), (1, []))
+
+    def test_incident_ref_option_is_validated_and_defaults_to_the_signature(self):
+        run = lambda *extra: subprocess.run([sys.executable, str(ROOT / "scripts/session-notify.py"), "emit-resource", "--cause", "workload-over-deadline",   # noqa: E731
+                                             "--recovery", "none", "--owner-action", "check-over-deadline-workload", "--signature", SIG, *extra],
+                                            capture_output=True, text=True, env=dict(os.environ), stdin=subprocess.DEVNULL, timeout=30)
+        self.assertNotEqual(run("--incident-ref", "Bad Ref/../x").returncode, 0)
+        self.assertEqual(self.files(), [])
+        pathlib.Path(self.env["SESSION_NOTIFY_CONFIG"]).write_text(json.dumps(self.cfg()))
+        self.assertEqual(run().returncode, 0)
+        self.assertEqual(run("--incident-ref", "inc:feedfacefeedface").returncode, 0)    # deduped on the signature, so still one file
+        self.assertEqual([d["incident_ref"] for d in self.docs()], ["inc:" + SIG])
+
     def test_spool_never_carries_a_notice_without_a_spool_kind(self):
         result, engine = self.emit(cause="disk-floor", recovery="none", action="reclaim-disk")
         self.assertIn(result, ("queued", "deduped", "no-backend"))
@@ -450,16 +472,30 @@ class SignedOut(Spool):
     def test_admission_monitor_incident_path_spools(self):
         self.write_config()
         rec = am.new_incident("job-1", "escalated", self.t, self.t + 600, self.t, self.t + 300, "grant", "none")
-        alert = am.incident_alert("job-1@2026-11-20T00:00:00Z", rec, self.t)
+        key = "job-1@2026-11-20T00:00:00Z"
+        alert = am.incident_alert(key, rec, self.t)
         outcome = am.session_notify_incident(alert, runner=lambda argv, **kw: subprocess.run(argv, env=self.clean_env(), **kw))
         self.assertEqual(outcome, {"result": "queued", "delivery": "sent"})
         (doc,) = self.docs()
-        self.assertEqual((doc["kind"], doc["incident_ref"]), ("unclaimed-handoff", "inc:" + alert["signature"]))
+        self.assertEqual((doc["kind"], doc["incident_ref"]), ("unclaimed-handoff", am.incident_ref(key)))
         for clock, kind in (("wait", "queue-wait-excessive"), ("run", "workload-over-deadline")):
             rec = am.new_incident("job-2", "escalated", self.t, self.t + 600, self.t, self.t + 300, clock, "none")
             alert = am.incident_alert("job-2@" + clock, rec, self.t)
             self.assertEqual(am.session_notify_incident(alert, runner=lambda argv, **kw: subprocess.run(argv, env=self.clean_env(), **kw))["delivery"], "sent")
         self.assertEqual({d["kind"] for d in self.docs()}, {"unclaimed-handoff", "queue-wait-excessive", "workload-over-deadline"})
+
+    def test_one_admission_incident_keeps_one_ref_across_its_phases(self):
+        self.write_config()
+        key = "job-9@2026-11-20T00:00:00Z"
+        run = lambda argv, **kw: subprocess.run(argv, env=self.clean_env(), **kw)   # noqa: E731
+        for phase in ("escalated", "lapsed"):
+            rec = am.new_incident("job-9", phase, self.t, self.t + 600, self.t, self.t + 300, "grant", "none")
+            alert = am.incident_alert(key, rec, self.t)
+            self.assertEqual(am.session_notify_incident(alert, runner=run), {"result": "queued", "delivery": "sent"})
+        docs = sorted(self.docs(), key=lambda d: d["transition"])
+        self.assertEqual([d["transition"] for d in docs], ["escalated", "opened"])
+        self.assertEqual({d["incident_ref"] for d in docs}, {am.incident_ref(key)})   # one incident, two transitions
+        self.assertEqual(len({d["key"] for d in docs}), 2)
 
     def test_claude_auth_watch_notifier_spools_alert_and_recovery(self):
         self.write_config()
