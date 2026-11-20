@@ -438,5 +438,325 @@ class Rollback(Base):
         self.assertEqual(self.entries()[qid]['state'], 'CLAIMED')
 
 
+FOUR_FREE = 280 * GIB          # four 20 GiB reservations leave exactly the 200 GiB lane 4 needs (and still the wide tier)
+STRAY = [{'root_pid': 424242, 'members': [424242]}]     # a process tree no reservation owns
+
+
+class FourLanes(Base):
+    """SPE-176: lane 4 behind FOURTH_LANE_ENABLED. Every test patches the flags it needs; the shipped value is pinned elsewhere."""
+    third, fourth = True, True
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (('THIRD_LANE_ENABLED', self.third), ('FOURTH_LANE_ENABLED', self.fourth)):
+            patcher = unittest.mock.patch.object(da, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def take(self, label, cwd=None, **kw):
+        kw.setdefault('cores', 64)                              # four 4-slot jobs must fit the cpu budget
+        kw.setdefault('free', FOUR_FREE)
+        return super().take(label, cwd=cwd or '/work/wt-%s' % label, **kw)
+
+    def fill(self, count):
+        for n in range(1, count + 1):
+            out = self.take('job%d' % n)
+            self.assertTrue(out['admit'], out)
+
+    def aged(self, label, n, expires):
+        """A reservation of a running process whose time limit has passed (marked past_ttl, lane kept)."""
+        proc = self.spawn()
+        with da.state_lock(self.path):
+            da.write_reservation(self.path, label, 20 * GIB, proc.pid, da.process_token(proc.pid), expires,
+                                 declared=dict(fields('/work/wt-%s' % label), created=da.iso_utc(self.now - timedelta(hours=3))),
+                                 granted_jobs=4)
+
+
+class FourLaneReserve(FourLanes):
+    def test_the_cap_is_four_and_lane_four_is_admitted_when_the_margin_is_met(self):
+        self.fill(3)
+        four = self.take('job4')
+        self.assertTrue(four['admit'], four)
+        self.assertIn('lane 4 of 4', four['reason'])
+        self.assertEqual(len(self.lanes()), 4)
+
+    def test_a_fifth_job_meets_the_lane_cap(self):
+        self.fill(4)
+        fifth = self.take('job5')
+        self.assertFalse(fifth['admit'])
+        self.assertTrue(fifth['reason'].startswith('lane-cap: 4 of 4 heavy lanes in use'), fifth['reason'])
+
+    def test_lane_four_is_refused_below_the_margin_and_admitted_at_it(self):
+        self.fill(3)
+        refused = self.take('job4', free=FOUR_FREE - GIB // 10)               # 199.9 GiB left
+        self.assertFalse(refused['admit'])
+        self.assertTrue(refused['reason'].startswith('budget: lane 4 needs '), refused['reason'])
+        self.assertIn('199.9 GiB free after all reservations', refused['reason'])
+        self.assertEqual(refused['budget']['enforced'], 'refuse')
+        self.assertEqual(len(self.lanes()), 3)
+        self.assertTrue(self.take('job4')['admit'])                           # exactly 200 GiB left
+
+    def test_lane_three_does_not_need_the_margin(self):
+        self.fill(2)
+        self.assertTrue(self.take('job3', free=230 * GIB)['admit'])           # 230 - 40 - 20 = 170: above the 100 GiB floor, below lane 4's 200
+
+    def test_lane_four_is_refused_beside_an_unmanaged_tree(self):
+        self.fill(3)
+        refused = self.take('job4', workloads=STRAY)
+        self.assertFalse(refused['admit'])
+        self.assertTrue(refused['reason'].startswith('budget: lane 4 needs '), refused['reason'])
+        self.assertIn('1 unmanaged process tree', refused['reason'])
+
+    def test_lane_four_is_refused_while_amber(self):
+        self.fill(3)
+        refused = self.take('job4', band='AMBER', band_reasons=['load per core 3.0'])
+        self.assertFalse(refused['admit'])
+        self.assertTrue(refused['reason'].startswith('budget: lane 4 needs '), refused['reason'])
+        self.assertIn('AMBER', refused['reason'])
+
+    def test_lane_four_is_refused_beside_a_holder_past_its_time_limit(self):
+        self.fill(2)
+        self.aged('old', 3, self.now - timedelta(hours=1))
+        refused = self.take('job4')
+        self.assertFalse(refused['admit'])
+        self.assertTrue(refused['reason'].startswith('budget: lane 4 needs '), refused['reason'])
+        self.assertIn('past their time limit or unresolved: old', refused['reason'])
+
+    def test_a_running_fourth_job_can_refresh_when_the_margin_is_gone(self):
+        self.fill(3)
+        proc = self.spawn()
+        self.assertTrue(self.take('job4', proc=proc)['admit'])
+        refresh = self.take('job4', proc=proc, free=FOUR_FREE - 40 * GIB, workloads=STRAY)
+        self.assertTrue(refresh['admit'], refresh)
+
+    def test_the_refusal_never_reaches_the_memory_gate_or_the_latch(self):
+        self.fill(3)
+        self.take('job4', free=FOUR_FREE - GIB)
+        self.assertFalse((self.path.parent / 'memory').exists())             # the disk site never writes the memory latch
+
+    def test_exactly_four_of_eight_concurrent_requests_are_admitted(self):
+        procs = [self.spawn() for _ in range(8)]
+        results = []
+        workers = [threading.Thread(target=lambda n=n: results.append(self.take('job-%d' % n, cwd='/work/wt-%d' % n, proc=procs[n])))
+                   for n in range(8)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        self.assertEqual(len(results), 8)
+        self.assertEqual(sum(1 for r in results if r['admit']), 4, [r['reason'] for r in results])
+        self.assertEqual(len(self.lanes()), 4)
+
+    def test_release_frees_a_lane_and_leaks_nothing(self):
+        self.fill(4)
+        self.assertTrue(da.release('job2', self.path)['admit'])
+        again = self.take('job5')
+        self.assertTrue(again['admit'], again)
+        self.assertEqual(len(self.lanes()), 4)
+
+
+class FourLanePureRules(unittest.TestCase):
+    BUDGET = {'status': 'ok', 'band': 'GREEN', 'resource_reasons': [], 'would_admit': True, 'unmanaged_trees': 0, 'holders': []}
+
+    def refuse(self, budget=None, in_use=3, free=300 * GIB, reserved=60 * GIB, nbytes=20 * GIB):
+        return da._fourth_lane_refusal(self.BUDGET if budget is None else budget, in_use, free, reserved, nbytes)
+
+    def setUp(self):
+        for name in ('THIRD_LANE_ENABLED', 'FOURTH_LANE_ENABLED'):
+            patcher = unittest.mock.patch.object(da, name, True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_clean_budget_with_the_margin_passes(self):
+        self.assertIsNone(self.refuse())
+
+    def test_only_the_fourth_lane_is_judged(self):
+        for in_use in (0, 1, 2, 4):
+            self.assertIsNone(self.refuse(in_use=in_use, free=0), in_use)
+
+    def test_unresolved_and_past_ttl_holders_each_refuse(self):
+        for flag in ('unresolved', 'past_ttl'):
+            budget = dict(self.BUDGET, holders=[{'label': 'x', 'flags': [flag]}])
+            self.assertIn('x', self.refuse(budget))
+
+    def test_every_unmet_condition_is_named(self):
+        text = self.refuse(dict(self.BUDGET, band='AMBER', resource_reasons=['band AMBER: needs GREEN'], unmanaged_trees=2), free=100 * GIB)
+        self.assertTrue(text.startswith('budget: lane 4 needs '))
+        for part in ('AMBER', 'GiB free after all reservations', '2 unmanaged process tree'):
+            self.assertIn(part, text)
+
+    def test_a_missing_budget_refuses_by_name(self):
+        self.assertTrue(self.refuse(budget={}, nbytes=20 * GIB).startswith('budget: lane 4 needs no host sample'))
+
+    def test_the_mode_off_means_no_fourth_lane_rule(self):
+        with unittest.mock.patch.object(da, 'FOURTH_LANE_ENABLED', False):
+            self.assertIsNone(self.refuse(free=0))
+
+    def test_stamp_reading(self):
+        self.assertTrue(da._stamped({'lane_protocol': 4}))
+        for bad in ({}, {'lane_protocol': None}, {'lane_protocol': '4'}, {'lane_protocol': True}, {'lane_protocol': 3.0},
+                    {'lane_protocol': 3}, {'lane_protocol': [4]}, None, 'x'):
+            self.assertFalse(da._stamped(bad), bad)
+
+
+class FourLaneQueue(FourLanes):
+    def queue(self, n, nbytes=20 * GIB):
+        return self.enqueue('SPE-%d' % (300 + n), declared=fields('/work/wt-%d' % n), nbytes=nbytes)['id']
+
+    def advance(self, free=FOUR_FREE, **kw):
+        kw.setdefault('cores', 64)
+        return da.queue_advance(self.path, lambda: free, now=self.now, host_fn=self.host_fn(**kw))
+
+    def unstamp(self, qid, value=None, drop=True):
+        with da.state_lock(self.path):
+            entries, _ = da._queue_entries(self.path)
+            entry = next(e for e in entries if e['id'] == qid)
+            if drop:
+                entry.pop('lane_protocol', None)
+            else:
+                entry['lane_protocol'] = value
+            da._write_queue_entry(self.path, entry)
+
+    def test_enqueue_stamps_the_entry_outside_the_grant_and_the_fingerprint(self):
+        qid = self.queue(1)
+        entry = self.entries()[qid]
+        self.assertEqual(entry['lane_protocol'], 4)
+        self.assertEqual(da.RUNNER_PROTOCOL, 2)
+        self.advance()
+        self.assertEqual(set(self.entries()[qid]['grant']), {'at', 'expires'})
+        stamped = entry['fingerprint']
+        self.unstamp(qid)
+        self.assertEqual(self.entries()[qid]['fingerprint'], stamped)       # an old caller computes the same fingerprint
+
+    def test_four_stamped_entries_are_granted_and_a_fifth_waits(self):
+        ids = [self.queue(n) for n in range(1, 6)]
+        out = self.advance()
+        self.assertEqual(out['granted'], ids[:4])
+        self.assertEqual(self.advance()['reason'], 'lane occupied')
+
+    def test_an_unstamped_head_blocks_the_queue_and_a_stamped_entry_never_overtakes(self):
+        ids = [self.queue(n) for n in range(1, 5)]
+        self.unstamp(ids[2])
+        out = self.advance()
+        self.assertEqual(out['granted'], ids[:2])
+        again = self.advance()
+        self.assertEqual((again['granted'], again['reason']), ([], 'budget: lane 3 needs a stamped runner (head %s)' % ids[2]))
+        self.assertEqual(self.states(), ['GRANTED', 'GRANTED', 'QUEUED', 'QUEUED'])
+
+    def test_a_malformed_stamp_is_unstamped_and_never_a_schema_failure(self):
+        ids = [self.queue(n) for n in range(1, 4)]
+        self.unstamp(ids[2], 'x', drop=False)
+        self.assertEqual(self.advance()['granted'], ids[:2], 'the first two lanes never need a stamp')
+        for bad in ('4', True, None, 3, [4]):
+            self.unstamp(ids[2], bad, drop=False)
+            out = self.advance()
+            self.assertTrue(out['reason'].startswith('budget: lane 3 needs a stamped runner'), (bad, out['reason']))
+            self.assertEqual(da._queue_entries(self.path)[1], [])            # still readable
+        self.assertEqual(self.states(), ['GRANTED', 'GRANTED', 'QUEUED'])
+
+    def test_unstamped_entries_still_get_lanes_one_and_two(self):
+        ids = [self.queue(n) for n in range(1, 3)]
+        for qid in ids:
+            self.unstamp(qid)
+        self.assertEqual(self.advance()['granted'], ids)
+
+    def test_an_advance_refusal_of_lane_four_never_asks_the_memory_gate(self):
+        ids = [self.queue(n) for n in range(1, 4)]
+        self.assertEqual(self.advance()['granted'], ids)
+        self.queue(4)
+        asked = []
+        out = da.queue_advance(self.path, lambda: FOUR_FREE - 40 * GIB, now=self.now, host_fn=self.host_fn(cores=64),
+                               memory_fn=lambda: asked.append(1) or (True, 'ok'))
+        self.assertEqual(out['granted'], [])
+        self.assertTrue(out['reason'].startswith('budget: lane 4 needs '), out['reason'])
+        self.assertEqual(asked, [])          # refused before the probe: the memory gate, and so its latch, was never consulted
+        self.assertEqual(self.states()[3], 'QUEUED')
+
+    def test_a_claim_of_a_third_lane_needs_the_stamp(self):
+        ids = [self.queue(n) for n in range(1, 4)]
+        self.assertEqual(self.advance()['granted'], ids)
+        self.unstamp(ids[2])
+        entry = self.entries()[ids[2]]
+        self.spawn(), self.spawn()
+        for qid, n in ((ids[0], 1), (ids[1], 2)):
+            self.assertTrue(self.claim(qid, n)['ok'])
+        refused = self.claim(ids[2], 3)
+        self.assertFalse(refused['ok'])
+        self.assertTrue(refused['reason'].startswith('budget: lane 3 needs a stamped runner'), refused['reason'])
+        self.assertEqual(self.entries()[ids[2]]['state'], 'GRANTED')
+        self.unstamp(ids[2], 4, drop=False)
+        self.assertTrue(self.claim(ids[2], 3)['ok'])
+
+    def claim(self, qid, n, free=FOUR_FREE):
+        entry = self.entries()[qid]
+        return da.queue_claim(self.path, qid, entry['label'], entry['bytes'], shadow.ARGV, str(self.worktree), lambda: free,
+                              pid=self.spawn().pid, now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda p, a: None,
+                              declared=fields('/work/wt-%d' % n), grant_environ={}, host_fn=self.host_fn(cores=64))
+
+    def test_a_claim_of_lane_four_rechecks_the_capacity_and_keeps_the_grant(self):
+        ids = [self.queue(n) for n in range(1, 5)]
+        self.assertEqual(self.advance()['granted'], ids)
+        for n in (1, 2, 3):
+            self.assertTrue(self.claim(ids[n - 1], n)['ok'])
+        refused = self.claim(ids[3], 4, free=FOUR_FREE - GIB)
+        self.assertFalse(refused['ok'])
+        self.assertTrue(refused['reason'].startswith('budget: lane 4 needs '), refused['reason'])
+        self.assertEqual(self.entries()[ids[3]]['state'], 'GRANTED')
+        self.assertTrue(self.claim(ids[3], 4)['ok'])
+
+    def test_no_reservation_leaks_across_grant_claim_and_release(self):
+        ids = [self.queue(n) for n in range(1, 5)]
+        self.advance()
+        for n, qid in enumerate(ids, 1):
+            self.assertTrue(self.claim(qid, n)['ok'])
+        for _ in range(da.WITNESSES_REQUIRED):                  # the supervisor's polling: each pass witnesses every running holder
+            self.assertEqual(self.advance()['released'], [])
+        for proc in self.holders:
+            proc.kill()
+            proc.wait()
+        late = da.queue_advance(self.path, lambda: FOUR_FREE, now=self.now + timedelta(minutes=5), host_fn=None)
+        self.assertEqual(sorted(late['released']), sorted(ids), late)
+        self.assertEqual(self.lanes(), [])
+        self.assertEqual(self.states(), ['RELEASED'] * 4)
+
+
+class FourLaneRollback(FourLanes):
+    def test_turning_the_mode_off_never_touches_four_running_jobs_and_refuses_new_ones(self):
+        self.fill(4)
+        procs = list(self.holders)
+        with unittest.mock.patch.object(da, 'FOURTH_LANE_ENABLED', False), \
+                unittest.mock.patch.object(os, 'kill', side_effect=AssertionError('os.kill must never be called')) as kill, \
+                unittest.mock.patch.object(os, 'killpg', side_effect=AssertionError('os.killpg must never be called')) as killpg:
+            refused = self.take('job5')
+            self.assertFalse(refused['admit'])
+            self.assertTrue(refused['reason'].startswith('lane-cap: 4 of 3 heavy lanes in use'), refused['reason'])
+            snap = da.snapshot(self.path, lambda: (FOUR_FREE, 'test'), now=self.now)
+            self.assertEqual((snap['heavy_lanes_allowed'], snap['active_heavy_jobs']), (3, 4))
+            self.assertEqual(kill.call_count + killpg.call_count, 0)
+        self.assertEqual(len(self.lanes()), 4)
+        self.assertTrue(all(p.poll() is None for p in procs))
+
+
+class FourLaneModeOff(FourLanes):
+    """Shipped default (third lane on, fourth off): three lanes, no lane 4 rule, no stamp rule."""
+    fourth = False
+
+    def test_a_fourth_job_meets_a_cap_of_three(self):
+        self.fill(3)
+        refused = self.take('job4')
+        self.assertFalse(refused['admit'])
+        self.assertTrue(refused['reason'].startswith('lane-cap: 3 of 3 heavy lanes in use'), refused['reason'])
+
+    def test_lane_three_needs_neither_the_margin_nor_the_stamp(self):
+        ids = [self.enqueue('SPE-%d' % (400 + n), declared=fields('/work/wt-%d' % n))['id'] for n in range(1, 4)]
+        with da.state_lock(self.path):
+            entries, _ = da._queue_entries(self.path)
+            for entry in entries:
+                entry.pop('lane_protocol', None)
+                da._write_queue_entry(self.path, entry)
+        out = da.queue_advance(self.path, lambda: 230 * GIB, now=self.now, host_fn=self.host_fn(cores=64))
+        self.assertEqual(out['granted'], ids[:3], out)
+
+
 if __name__ == '__main__':
     unittest.main()

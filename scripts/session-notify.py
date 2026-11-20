@@ -105,7 +105,8 @@ DEFAULT_CONFIG = {
         "macos": {"enabled": False},
         "ntfy": {"enabled": False, "approved_destination": "", "server": "https://ntfy.sh", "topic_env": "NTFY_TOPIC", "topic_file": "", "token_env": "", "token_file": ""},
         "pushover": {"enabled": False, "approved_destination": "", "token_env": "PUSHOVER_APP_TOKEN", "token_file": "", "user_env": "PUSHOVER_USER_KEY", "user_file": ""},
-        "telegram": {"enabled": False, "approved_destination": "", "token_env": "TELEGRAM_BOT_TOKEN", "token_file": "", "chat_id_env": "TELEGRAM_CHAT_ID", "chat_id_file": ""},
+        "telegram": {"enabled": False, "approved_destination": "", "token_env": "TELEGRAM_BOT_TOKEN", "token_file": "", "chat_id_env": "TELEGRAM_CHAT_ID", "chat_id_file": "",
+                     "credentials_json": "", "chat_target": "owner"},
     },
 }
 
@@ -261,7 +262,8 @@ CONFIG_SCHEMA = {
     "backends": {"macos": {"enabled": v_bool()},
                  "ntfy": {"enabled": v_bool(), "approved_destination": _S200, "server": _S200, "topic_env": _S200, "topic_file": _S200, "token_env": _S200, "token_file": _S200},
                  "pushover": {"enabled": v_bool(), "approved_destination": _S200, "token_env": _S200, "token_file": _S200, "user_env": _S200, "user_file": _S200},
-                 "telegram": {"enabled": v_bool(), "approved_destination": _S200, "token_env": _S200, "token_file": _S200, "chat_id_env": _S200, "chat_id_file": _S200}},
+                 "telegram": {"enabled": v_bool(), "approved_destination": _S200, "token_env": _S200, "token_file": _S200, "chat_id_env": _S200, "chat_id_file": _S200,
+                              "credentials_json": _S200, "chat_target": v_enum(("owner",))}},
 }
 
 
@@ -661,11 +663,63 @@ TELEGRAM_TOKEN = re.compile(r"[0-9]{3,20}:[A-Za-z0-9_-]{5,100}")
 TELEGRAM_CHAT = re.compile(r"-?[0-9]{1,20}|@[A-Za-z0-9_]{5,64}")
 
 
+MAX_CREDENTIALS_JSON = 65536
+# Open object: the supervisor file carries other keys (the supergroup id) that are neither read nor validated here.
+SUPERVISOR_CREDENTIALS_SCHEMA = v_obj({"TELEGRAM_BOT_TOKEN": v_str(200, re.compile(r".+")), "TELEGRAM_OWNER_ID": v_int(1, 10**18)},
+                                      required=("TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID"), closed=False)
+
+
+def _private_path(path):
+    """True when no component of an absolute path is a symlink."""
+    cur = pathlib.Path(path)
+    while True:
+        if cur.is_symlink():
+            return False
+        if cur == cur.parent:
+            return True
+        cur = cur.parent
+
+
+def read_supervisor_credentials(path):
+    """(token, owner chat id) from the engineering-supervisor credential file, or (None, None) on ANY problem (one fixed outcome, no detail).
+
+    Same checks as the supervisor loader: absolute path without symlinks, owner-only 0700 parent, fd-based open with O_NOFOLLOW, a regular
+    file we own with mode exactly 0600 and at most 64 KiB, a JSON object with a string TELEGRAM_BOT_TOKEN and a positive integer
+    TELEGRAM_OWNER_ID. Only those two keys are read; the supergroup id is deliberately ignored (direct message to the owner only)."""
+    try:
+        if not isinstance(path, str) or not path or not os.path.isabs(path) or not _private_path(path):
+            return None, None
+        parent = os.lstat(os.path.dirname(path))
+        if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) != 0o700:
+            return None, None
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        try:
+            st = os.fstat(fd)
+            if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600
+                    or st.st_size > MAX_CREDENTIALS_JSON):
+                return None, None
+            raw = os.read(fd, MAX_CREDENTIALS_JSON + 1)
+        finally:
+            os.close(fd)
+        if not 0 < len(raw) <= MAX_CREDENTIALS_JSON:
+            return None, None
+        doc = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+        if not conforms(SUPERVISOR_CREDENTIALS_SCHEMA, doc):
+            return None, None
+        return doc["TELEGRAM_BOT_TOKEN"], str(doc["TELEGRAM_OWNER_ID"])
+    except (OSError, ValueError, RecursionError):
+        return None, None
+
+
 def send_telegram(payload, cfg):
     """Bot API sendMessage over plain https. The token is part of the URL path, so it must never leave this function: http_post returns only
     fixed codes and any exception is reduced to its type name."""
     token = read_secret(cfg.get("token_env") or None, cfg.get("token_file") or None)
     chat = read_secret(cfg.get("chat_id_env") or None, cfg.get("chat_id_file") or None)
+    if not token and not chat and cfg.get("credentials_json"):  # lowest precedence, and only when neither explicit source produced anything
+        if cfg.get("chat_target", "owner") != "owner":
+            return "not-configured"
+        token, chat = read_supervisor_credentials(cfg["credentials_json"])
     if (not token or not chat or not TELEGRAM_TOKEN.fullmatch(token) or not TELEGRAM_CHAT.fullmatch(chat)
             or str(cfg.get("approved_destination", "")).lower() != "api.telegram.org"):
         return "not-configured"

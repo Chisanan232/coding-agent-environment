@@ -185,6 +185,64 @@ def release_build_locks(held):
         os.close(fd)
 
 
+# rustc's incremental layout: <crate_ident>-<13 base36>/ holds `s-<a>-<b>-<c>` session dirs and `s-<a>-<b>.lock` files; a session
+# dir holds only the closed set of regular files below (measured over every session dir of the real shared target, SPE-176).
+INCR_CRATE_DIR = re.compile(r'[a-z0-9_]+-[0-9a-z]{13}')
+INCR_SESSION_DIR = re.compile(r's-[0-9a-z]+-[0-9a-z]+-[0-9a-z]+(-working)?')
+INCR_SESSION_LOCK = re.compile(r's-[0-9a-z]+-[0-9a-z]+\.lock')
+INCR_SESSION_FILES = frozenset(('dep-graph.bin', 'dep-graph.part.bin', 'query-cache.bin', 'work-products.bin', 'metadata.rmeta'))
+INCR_OBJECT_FILE = re.compile(r'[0-9a-z]{25}\.o')
+INCR_LOCK_MAX_BYTES = 0   # every real lock file is empty; any content under a lock name is not rustc's
+INCR_TREE_LIMIT = 1_000_000
+
+
+def is_generated_incremental_tree(root, limit=INCR_TREE_LIMIT, seconds=None, clock=time.monotonic):
+    """True only when the tree is positively rustc's: every top-level child is a non-empty crate directory holding only
+    session dirs (regular files of the closed set, nothing deeper) and small regular lock files, with no link anywhere.
+    Any deviation, unreadable entry or exhausted entry or time budget is False, so the name markers then apply."""
+    deadline = clock() + (SCAN_SECONDS if seconds is None else seconds)
+    count = 0
+
+    def tick():
+        nonlocal count
+        count += 1
+        return count > limit or (count % 64 == 0 and clock() > deadline)
+
+    def regular(e):
+        return e.is_file(follow_symlinks=False) and not e.is_symlink()
+
+    try:
+        with os.scandir(root) as crates:
+            for crate in crates:
+                if tick() or not (INCR_CRATE_DIR.fullmatch(crate.name) and crate.is_dir(follow_symlinks=False)):
+                    return False
+                seen = 0
+                with os.scandir(crate.path) as entries:
+                    for e in entries:
+                        seen += 1
+                        if tick():
+                            return False
+                        if regular(e) and INCR_SESSION_LOCK.fullmatch(e.name):
+                            if e.stat(follow_symlinks=False).st_size > INCR_LOCK_MAX_BYTES:
+                                return False
+                        elif e.is_dir(follow_symlinks=False) and not e.is_symlink() and INCR_SESSION_DIR.fullmatch(e.name):
+                            with os.scandir(e.path) as files:
+                                for f in files:
+                                    if tick() or not regular(f) or not (f.name in INCR_SESSION_FILES
+                                                                        or INCR_OBJECT_FILE.fullmatch(f.name)):
+                                        return False
+                                    # Real object files are never empty (smallest observed 584 bytes).
+                                    if f.name.endswith('.o') and f.stat(follow_symlinks=False).st_size == 0:
+                                        return False
+                        else:
+                            return False
+                if not seen:
+                    return False
+    except OSError:
+        return False
+    return True
+
+
 def incremental_blockers(root):
     """Reasons a `<target>/<profile>/incremental` directory is not safe to remove now (empty when it is)."""
     profile = os.path.dirname(root)
@@ -455,6 +513,10 @@ def measure(path, kind, ctx):
         # rustc writes only generated session files here; a marker scan of millions of them would never finish and would
         # fail the resource closed. The top level is still checked, and `safe_remove` never follows a link.
         markers, complete = scan_markers(path, False, max_depth=0)
+        # Crate names such as `agent_id_bound_to_token_test-<hash>` are compiler-generated, not secrets (SPE-176). Only a
+        # positively verified rustc layout drops the two name markers; every other marker still stands.
+        if complete and is_generated_incremental_tree(path):
+            markers -= {'credential-name', 'evidence-name'}
     elif kind == 'worktree':
         # Ignored local files (.env.local, a sqlite database) are invisible to `git status`: scan deep, skipping the
         # reproducible dependency and build trees.

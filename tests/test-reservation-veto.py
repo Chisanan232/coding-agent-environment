@@ -141,6 +141,24 @@ class OccupancyIsArithmeticNotAName(unittest.TestCase):
         self.assertIn("2 of 2 heavy lane(s) in use", text)
 
 
+class OccupancyAtCapFour(unittest.TestCase):
+    """SPE-176: with four lanes allowed the same arithmetic holds; CapOneUnchanged above is untouched."""
+
+    def setUp(self):
+        self.cap = ma.HEAVY_LANE_CAP
+        self.addCleanup(setattr, ma, "HEAVY_LANE_CAP", self.cap)
+        ma.HEAVY_LANE_CAP = 4
+
+    def test_three_calm_trees_under_a_cap_of_four_neither_refuse_nor_latch(self):
+        verdict, state = ma.decide("heavy", metrics([tree(100), tree(200), tree(300)], [owned()]), None, 1000.0)
+        self.assertTrue(verdict["admit"])
+        self.assertFalse(state["latched"])
+
+    def test_four_trees_fill_a_cap_of_four(self):
+        (text,) = ma.refusal_reasons("heavy", metrics([tree(100), tree(200), tree(300), tree(400)]))[0]
+        self.assertIn("4 of 4 heavy lane(s) in use", text)
+
+
 class DerivedCap(unittest.TestCase):
     """The memory gate takes its lane cap from disk-admission.py and falls back to one lane when it cannot."""
 

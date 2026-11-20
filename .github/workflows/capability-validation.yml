@@ -135,6 +135,7 @@ jobs:
           python3 tests/test-admission-measurements.py
           python3 tests/test-trial-report.py
           python3 tests/test-heavy-lane-cap.py
+          python3 tests/test-four-lane-acceptance.py
           python3 tests/test-la-cargo.py
           python3 tests/test-heavy-run.py
           python3 tests/test-workload-classes.py

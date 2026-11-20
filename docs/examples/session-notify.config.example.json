@@ -40,7 +40,9 @@
       "token_env": "TELEGRAM_BOT_TOKEN",
       "token_file": "",
       "chat_id_env": "TELEGRAM_CHAT_ID",
-      "chat_id_file": ""
+      "chat_id_file": "",
+      "credentials_json": "",
+      "chat_target": "owner"
     }
   },
   "_note": "Everything is off until a backend sets enabled to true. Credentials are environment-variable NAMES or file paths, never values. Remote backends also need approved_destination equal to the server host, and are refused on the corporate profile. Notifications show a repository name only if it is listed in known_repos; otherwise they say 'unlisted'."
