@@ -2,7 +2,7 @@
 
 Replaces "manual opt-in" with a proactive offer. Default routes are unchanged (Sonnet main, `opus-architect`, Opus advisor). Fable is never a default and no unattended Fable call is enabled: nothing in `.github`, `.claude`, a hook or a scheduler invokes `consult`, and `tests/test-fable-escalation.py` fails if one does.
 
-Tool: `scripts/fable-escalation.py`. Tests: `tests/test-fable-escalation.py` (a fake `claude` binary; no real model call).
+Tool: `scripts/fable-escalation.py`. Tests: `tests/test-fable-escalation.py` and `tests/test-fable-cost-estimate.py` (a fake `claude` binary; no real model call).
 
 ## How the workflow reaches it
 
@@ -27,12 +27,22 @@ Excluded, whatever else is true: queue delay, CI availability (`CI_UNAVAILABLE_E
 
 ## Approval: one per blocker
 
-1. `offer --case case.json --session <id>` records the blocker and writes one pending item in the pending-ASK ledger (`scripts/ask-pending.py`), so sessions sharing the ledger see one open request. It returns the packet: blocker, attempts made, the one question for Fable, the route.
+1. `offer --case case.json --session <id>` records the blocker and writes one pending item in the pending-ASK ledger (`scripts/ask-pending.py`), so sessions sharing the ledger see one open request. It returns the packet: blocker, attempts made, the one question for Fable, the route, `cost` (the estimate below), `why_opus_insufficient` and the `ask` text, which states the recommendation, why Opus is not enough, the estimated cost and the cap, and that nothing is invoked until the owner approves. The recommendation and the consult are separate outcomes: the offer never invokes anything.
 2. The agent asks the owner once through the native prompt (AskUserQuestion: Approve / Decline) with that packet. This tool cannot obtain or verify the answer: the recorded approval is the agent's attestation of the owner's native answer, stored as a hash. A local script cannot stop a session from recording an approval nobody gave; `receipts.log` and the pending-ASK ledger are the audit trail, and the owner can check them.
 3. `answer --id <id> --decision approve|decline --ref "<the owner's answer>"` records it (only a hash of the text is stored). Decline, or no reply, spends nothing and the blocker is never offered again; independent work continues.
 4. An approval expires after 24 hours; a stale one needs a new offer after the blocker is revalidated.
 
 A blocker is the target plus the acceptance check, compared ignoring case, spacing and punctuation. More attempts or a reworded `blocker` summary do not make a new blocker; a reworded acceptance check does, so key it by its stable id (AC3). The state directory is overridable by environment, so dedup and the breaker bind sessions that share it.
+
+## Cost estimate before invocation (SPE-176)
+
+`estimate --case case.json` prints the same `cost` object the offer packet carries (`offer`, `attempt` → `ASK_OWNER` and `show` all include it). It calls no model and no network, and it neither creates nor reads the state directory; it does not check eligibility. Closed schema: `estimated_usd_low`, `estimated_usd_high`, `cap_usd`, `basis` (list of strings), `model` (`claude-fable-5-2`), `invoked` (always `false`). All figures are list-price estimates of token use, not invoices.
+
+- Low: a cold call writes the measured cold prefix (about 46k cache-creation tokens, $0.739) plus the consult packet, priced at the highest measured cache-write rate. The packet's tokens are counted from its UTF-8 bytes at 3 bytes per token, which overcounts ordinary text and code (about 4 bytes per token), so the figure leans high. Rounded up to the cent. A warm prefix cache can cost less; it is not used as a floor because the cache state before a call is unknown.
+- High: the configured per-consult cap, `--max-budget-usd 4`. The client checks it between turns, so a turn already running can end above it (the 2026-11-15 canary reached $0.739 against a $0.10 cap).
+- Reference points, listed in `basis`: the one completed real-route consult ($1.29, 2026-11-19) and the cold canary ($0.74, 2026-11-15). They are read from [consult-cost-reference.json](consult-cost-reference.json), and `tests/test-fable-cost-estimate.py` fails if a figure there no longer appears in its cited record. If that file cannot be read, low falls back to the cap and `basis` says so; the offer still reaches the owner.
+
+`why_opus_insufficient` restates the trigger that made the blocker eligible (`two_distinct_attempts_same_failure` with the shared failure text, or `unresolved_review_disagreement` with the number of positions). It adds no criterion. The estimate changes nothing else: approval, one offer and one consult per blocker, duplicate refusal, the cap and the consult path are as before, and `consult` still refuses without a recorded approval.
 
 ## The consult
 
