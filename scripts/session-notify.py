@@ -1153,6 +1153,11 @@ class Engine:
                     rec = None
                 now = self.clock()
                 rec = rec or new_record(sid, now)
+                # The window also bounds a still-pending entry (a failing backend must not read as `deduped` forever): an older one is dropped, counted, and replaced.
+                old = [e for e in rec["pending"] if e["created"] < now - TEST_NOTICE_WINDOW]
+                if old:
+                    rec["pending"] = [e for e in rec["pending"] if e not in old]
+                    rec["dropped"] += len(old)
                 queued = self.enqueue(rec, "IDLE", "test-notice", now, extra_key="test-notice", extra={"notice": "test"}, strict=strict, window=TEST_NOTICE_WINDOW)
                 tracked = next((p for p in rec["pending"] if p["key"] == self.last_key), None)
                 any_backend = any((b or {}).get("enabled") is True for b in self.cfg["backends"].values())
