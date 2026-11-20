@@ -12,6 +12,9 @@ The lane is released when COMMAND exits. The command is never started outside a 
 reservation as an unknown workload (the host's whole resource budget), which is the conservative accounting and blocks every other
 lane, so a missing class is warned about, not guessed.
 
+When the entry's backfilled grant is revoked at claim or lapses unclaimed (SPE-176), the same job is re-queued at its original FIFO
+position (`queue enqueue --requeue-of`) and the wait goes on, at most REQUEUE_MAX times; any other EXPIRED entry is refused as before.
+
 Exit codes: COMMAND's own (a signal death is 128+N); 64 usage; 75 not admitted within --max-wait-s; 77 refused by the queue. A
 command's own 64, 75 or 77 is indistinguishable from the wrapper's, as with la-cargo. A command already inside a lane
 (CAE_ADMISSION_HOLDER names this process or an ancestor) is not charged again; that marker is trusted as the environment's word, so
@@ -36,6 +39,10 @@ REFUSED_EXIT = 77
 TIMEOUT_EXIT = 75
 POLL_S = 15
 NOTICE_EVERY_S = 300
+# A backfilled grant revoked at claim, or lapsed unclaimed, is re-queued at its own FIFO position at most this many times (the runner's
+# BACKFILL_REQUEUE_MAX caps the chain too). One poll iteration stays well under the runner's 600 s backfill claim window: the 15 s sleep,
+# advance and status capped at 120 s each, and a refused claim bounded by the runner's own memory-gate (120 s) and lock (5 s) timeouts.
+REQUEUE_MAX = 3
 
 
 def exit_code(rc):
@@ -144,15 +151,22 @@ def admitted(args, env, sleep=time.sleep, clock=time.monotonic):
 
 def _queued(args, declare, run_extra, job, proof, session, env, sleep, clock):
     ticket = re.sub(r"[^A-Za-z0-9._-]", "", args.ticket).lstrip("._-")[:32] or "heavy-run"
-    rc, out = _capture(runner_cmd("queue", "enqueue", *declare, "--ticket", ticket, "--repo", args.repo, "--worktree", os.getcwd(),
-                                  "--harness", args.harness, "--session-id", session, "--again", "--waiter-pid", str(os.getpid()), "--wait-s",
-                                  str(max(args.max_wait_s, 60)), "--", *job), env)
-    queued = _json(out)
-    if rc != 0 or not queued.get("ok") or not queued.get("id"):
-        print(f"heavy-run: could not queue the job: {queued.get('reason', out.strip()[:200])}", file=sys.stderr)
+    worktree = os.getcwd()
+
+    def enqueue(wait_s, requeue_of=None):
+        """(entry id or None, reason). The same declaration, job and waiter every time, so a re-queue matches the lost entry."""
+        extra = ["--requeue-of", requeue_of] if requeue_of else []
+        rc, out = _capture(runner_cmd("queue", "enqueue", *declare, "--ticket", ticket, "--repo", args.repo, "--worktree", worktree,
+                                      "--harness", args.harness, "--session-id", session, "--again", *extra, "--waiter-pid",
+                                      str(os.getpid()), "--wait-s", str(max(wait_s, 60)), "--", *job), env)
+        queued = _json(out)
+        return (queued["id"] if rc == 0 and queued.get("ok") and queued.get("id") else None), queued.get("reason", out.strip()[:200])
+
+    qid, why = enqueue(args.max_wait_s)
+    if not qid:
+        print(f"heavy-run: could not queue the job: {why}", file=sys.stderr)
         return REFUSED_EXIT
-    qid = queued["id"]
-    claimed, deadline, next_notice, registered = False, clock() + args.max_wait_s, 0.0, None
+    claimed, deadline, next_notice, registered, requeues = False, clock() + args.max_wait_s, 0.0, None, 0
     try:
         registered = _register(qid, "heavy-run")
         while clock() < deadline:
@@ -167,6 +181,19 @@ def _queued(args, declare, run_extra, job, proof, session, env, sleep, clock):
                     _release(["queue", "release", "--id", qid, "--session-id", session], env)
                     return exit_code(rc)
                 print(f"heavy-run: claim of {qid} refused (exit {rc}); the grant is kept, retrying.", file=sys.stderr)
+            elif state == "EXPIRED" and requeues >= REQUEUE_MAX:
+                print(f"heavy-run: queue entry {qid} is EXPIRED after {requeues} backfill re-queues (limit {REQUEUE_MAX}); refusing.",
+                      file=sys.stderr)
+                return REFUSED_EXIT
+            elif state == "EXPIRED" and (replacement := enqueue(int(deadline - clock()), requeue_of=qid)[0]):
+                # The runner alone decides: it re-queues only an entry whose backfilled grant it revoked or saw lapse unclaimed. An
+                # ordinary expiry is refused there and falls to the unchanged refusal below in this same pass.
+                print(f"heavy-run: backfill grant revoked; re-queued as {replacement} (was {qid}, original FIFO position kept).",
+                      file=sys.stderr)
+                _unregister(registered, qid)
+                qid, requeues = replacement, requeues + 1
+                registered = _register(qid, "heavy-run")
+                continue
             elif state not in ("QUEUED", "ELIGIBLE"):
                 print(f"heavy-run: queue entry {qid} is {state or 'missing'}; refusing.", file=sys.stderr)
                 return REFUSED_EXIT
