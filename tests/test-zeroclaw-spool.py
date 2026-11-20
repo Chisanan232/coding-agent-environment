@@ -511,5 +511,89 @@ class SignedOut(Spool):
         self.assertEqual({d["incident_ref"] for d in self.docs()}, {"inc:" + sig})
 
 
+class Hardening(Spool):
+    def test_long_outage_keeps_every_incident_beyond_the_normal_queue_cap(self):
+        os.chmod(self.spool, 0o755)
+        engine = self.engine()
+        n = sn.PENDING_CAP + 15
+        for i in range(n):
+            self.emit(engine=engine, sig=f"{i:016x}")
+        rec = self.record()
+        self.assertEqual((len(rec["pending"]), rec["dropped"]), (n, 0))
+        os.chmod(self.spool, 0o700)
+        self.t += 31
+        self.engine().sweep(now=self.t)
+        self.assertEqual(len(self.files()), n)
+        self.assertEqual(self.record()["pending"], [])
+
+    def test_hard_bound_drop_is_explicit_and_owner_visible(self):
+        os.chmod(self.spool, 0o755)
+        with mock.patch.object(sn, "SPOOL_PENDING_CAP", 25):
+            engine = self.engine()
+            for i in range(28):
+                self.emit(engine=engine, sig=f"{i:016x}")
+        rec = self.record()
+        self.assertEqual((len(rec["pending"]), rec["dropped"]), (25, 3))
+        self.assertTrue(any(h["why"] == "spool-overflow-dropped" for h in rec["history"]))
+        self.assertIn("spool-queue-overflow", (self.sdir / "hook.log").read_text())
+
+    def test_other_overflow_still_drops_the_oldest_non_spool_entry(self):
+        cfg = json.loads(json.dumps(sn.DEFAULT_CONFIG))
+        cfg["backends"]["macos"]["enabled"] = True
+        engine = self.engine(cfg, transports={"macos": lambda payload, b: "network"})
+        for i in range(sn.PENDING_CAP + 2):
+            self.emit(engine=engine, cause="disk-floor", recovery="none", action="reclaim-disk", sig=f"{i:016x}")
+        rec = self.record()
+        self.assertEqual((len(rec["pending"]), rec["dropped"]), (sn.PENDING_CAP, 2))
+
+    def test_stale_tmp_files_of_ours_are_removed_and_nothing_else(self):
+        old, new, other = self.spool / ".tmp-old", self.spool / ".tmp-new", self.spool / "keep.txt"
+        for f in (old, new, other):
+            f.write_text("x")
+        (self.spool / ".tmp-link").symlink_to(old)
+        stale = self.t - 2 * 3600
+        os.utime(old, (stale, stale))
+        os.utime(other, (stale, stale))
+        os.utime(self.spool / ".tmp-link", (stale, stale), follow_symlinks=False)
+        with mock.patch.object(sn.time, "time", lambda: self.t):
+            self.emit()
+        self.assertFalse(old.exists())
+        self.assertTrue(new.exists() and other.exists() and (self.spool / ".tmp-link").is_symlink())
+
+    def test_crash_during_sending_does_not_count_when_nothing_was_written(self):
+        os.chmod(self.spool, 0o755)
+        self.emit()
+        rec = self.record()
+        b = rec["pending"][0]["backends"][sn.SPOOL_BACKEND]
+        b.update(status="sending", attempts=5, next_at=self.t - 1000)    # at the attempt cap, interrupted before any file existed
+        sn.save_record(self.sdir, rec)
+        self.t += 31
+        self.engine().sweep(now=self.t)
+        self.assertEqual(self.pending_codes(), [("failed", "spool-unavailable", 4)])
+        self.assertEqual(self.record()["dropped"], 0)
+
+    def test_conflict_is_visible_in_status_and_hook_marker_and_names_the_keys(self):
+        cfg = Routing.both(self)
+        pathlib.Path(self.env["SESSION_NOTIFY_CONFIG"]).write_text(json.dumps(cfg))
+        script = str(ROOT / "scripts/session-notify.py")
+        hook = subprocess.run([sys.executable, script, "hook"], input=json.dumps({"hook_event_name": "SessionStart", "session_id": "s1"}),
+                              capture_output=True, text=True, env=dict(os.environ), timeout=30)
+        self.assertEqual((hook.returncode, hook.stdout, hook.stderr), (0, "", ""))     # the hook path stays silent
+        self.assertIn("backends.telegram.kinds", (self.sdir / sn.CONFLICT_MARKER).read_text())
+        status = subprocess.run([sys.executable, script, "status", "--json"], capture_output=True, text=True, env=dict(os.environ), timeout=30).stdout
+        row = next(r for r in json.loads(status) if r["session"] == "(config)")
+        self.assertEqual(row["state"], "CONFIG_CONFLICT")
+        for key in ("backends.telegram.kinds", "backends.telegram.enabled", "backends.zeroclaw-spool.enabled", "both are now OFF"):
+            self.assertIn(key, row["problem"])
+        emit = subprocess.run([sys.executable, script, "test-notice"], capture_output=True, text=True, env=dict(os.environ), timeout=30)
+        self.assertEqual(emit.returncode, 2)
+        self.assertIn("backends.telegram.kinds", emit.stderr)
+        # fixing the config removes the marker on the next hook
+        pathlib.Path(self.env["SESSION_NOTIFY_CONFIG"]).write_text(json.dumps(Routing.both(self, tele_kinds=["session"])))
+        subprocess.run([sys.executable, script, "hook"], input=json.dumps({"hook_event_name": "SessionStart", "session_id": "s1"}), capture_output=True,
+                       text=True, env=dict(os.environ), timeout=30)
+        self.assertFalse((self.sdir / sn.CONFLICT_MARKER).exists())
+
+
 if __name__ == "__main__":
     unittest.main()
