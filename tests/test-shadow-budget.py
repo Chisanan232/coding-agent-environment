@@ -23,6 +23,7 @@ def load(name, file):
 
 da = load('disk_admission', 'scripts/disk-admission.py')
 SHIPPED_THIRD_LANE_ENABLED = da.THIRD_LANE_ENABLED
+SHIPPED_FOURTH_LANE_ENABLED = da.FOURTH_LANE_ENABLED
 da.THIRD_LANE_ENABLED = False      # the tests below pin the two-lane mechanics; the shipped value has its own test
 queue_tests = load('admission_queue_tests', 'tests/test-admission-queue.py')
 QueueBase = queue_tests.QueueBase
@@ -80,6 +81,8 @@ class Arithmetic(unittest.TestCase):
         self.assertTrue(out['fits_if_cap_were_3'])          # resources alone would still have fitted a third
         four = decide(holders=[holder(str(i), excl=('k%d' % i,)) for i in range(3)])
         self.assertFalse(four['fits_if_cap_were_3'])        # a fourth is above LANE_CEILING whatever the resources
+        self.assertTrue(four['fits_if_cap_were_4'])         # ... but resources alone would have fitted it (SPE-176)
+        self.assertFalse(decide(holders=[holder(str(i), excl=('k%d' % i,)) for i in range(4)])['fits_if_cap_were_4'])
 
     def test_a_legacy_reservation_costs_the_whole_budget_and_all_cores(self):
         out = decide(holders=[holder('old', record={})])
@@ -621,6 +624,23 @@ class HeavyLaneCap(unittest.TestCase):
         with unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', SHIPPED_THIRD_LANE_ENABLED):
             self.assertEqual({t: da.heavy_lane_cap(t) for t in da.HEAVY_LANES}, {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 3})
             self.assertEqual(da.heavy_lane_cap('wide', True), 0)
+
+    def test_the_fourth_lane_ships_off_and_the_shipped_cap_is_unchanged(self):
+        self.assertIs(SHIPPED_FOURTH_LANE_ENABLED, False)    # enabling is a separate reviewed one-line PR; reverting it is the rollback
+        self.assertEqual((da.LANE_CEILING, da.FOUR_LANE_CEILING), (3, 4))
+        with unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', SHIPPED_THIRD_LANE_ENABLED), \
+                unittest.mock.patch.object(da, 'FOURTH_LANE_ENABLED', SHIPPED_FOURTH_LANE_ENABLED):
+            self.assertEqual({t: da.heavy_lane_cap(t) for t in da.HEAVY_LANES}, {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 3})
+
+    def test_the_cap_is_four_only_with_both_flags_and_only_on_the_wide_tier(self):
+        table = {'stable': 2, 'wide': 2}
+        for third, fourth, wide in ((False, False, 2), (True, False, 3), (False, True, 2), (True, True, 4)):
+            with unittest.mock.patch.dict(da.HEAVY_LANES, table), unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', third), \
+                    unittest.mock.patch.object(da, 'FOURTH_LANE_ENABLED', fourth):
+                self.assertEqual((da.heavy_lane_cap('stable'), da.heavy_lane_cap('wide')), (2, wide), (third, fourth))
+        with unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 9, 'wide': 9}), unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', True), \
+                unittest.mock.patch.object(da, 'FOURTH_LANE_ENABLED', True):
+            self.assertEqual((da.heavy_lane_cap('stable'), da.heavy_lane_cap('wide'), da.heavy_lane_cap('wide', True)), (4, 4, 0))
 
     def test_a_latch_means_no_lane_at_any_tier(self):
         for tier in da.HEAVY_LANES:
