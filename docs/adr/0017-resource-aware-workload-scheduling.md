@@ -7,7 +7,7 @@ commit described below; reverting that commit restores 1 and is the rollback.** 
 reversible pilot (`THIRD_LANE_ENABLED = True`, wide-tier cap 3) on the owner's instruction of 2026-11-16, ahead of a trial PASS; the lane-3 trial
 evidence (revision 6 criteria) is still collected to decide whether to keep it as the default, and reverting the revision 7 pull request is the
 rollback.** Supersedes the clause "One heavy lane" in decision 3 of [ADR 0015](0015-memory-aware-admission-and-gh-first.md);
-the rest of ADR 0015 stands.
+the rest of ADR 0015 stands. **Revision 8 (SPE-176) merges a fourth-lane mode that ships off (`FOURTH_LANE_ENABLED = False`); enabling it is a separate reviewed pull request.**
 
 ## Context
 
@@ -395,6 +395,31 @@ admission are untouched. Lane 3 stays off until a trial under these criteria rea
 - Cap 2 is one constant (`HEAVY_LANES`) behind the enforcing code path of revision 2, with the invariants above unchanged; the flip is
   the last, separately reviewable commit and the rollback is its revert.
 
+## Revision 8: four heavy lanes, code shipped off (SPE-176)
+
+The code for a fourth heavy lane is merged **disabled**: `FOURTH_LANE_ENABLED = False` in `scripts/disk-admission.py`. With it off every
+decision is today's three-lane behaviour. There is no runtime flag file, environment switch or kill file (revision 2: a file an agent can
+write is a forgeable cap). Enabling is a separate one-line pull request that flips the constant; **rollback is reverting that pull request**.
+Nothing running is ever signalled by either change.
+
+What the mode does when it is on (it also needs `THIRD_LANE_ENABLED`, and only the wide tier gains the lane):
+
+- `heavy_lane_cap` adds one wide-tier lane, never above `FOUR_LANE_CEILING` (4). `LANE_CEILING` stays 3 for the three-lane mode.
+- Lane 4 needs measured capacity on top of every lane-2+ rule (2 s host sample, band GREEN, memory exit limits, exclusion keys, 100 GiB
+  floor): free space minus all reservations minus this request at or above 200 GiB (`FOURTH_LANE_MARGIN`, still the wide tier after four
+  reservations), no unmanaged process tree, no holder past its time limit or unresolved. Refusals read `budget: lane 4 needs ...` and name
+  each unmet condition. They are evaluated in `reserve` (a same-process refresh is exempt), `advance` before the memory probe, and `claim`.
+  The advance and reserve refusals never reach the memory gate, so they cannot arm its latch. The margin applies to lane 4 only.
+- Old-caller isolation: `queue enqueue` writes an extra entry field `lane_protocol: 4`. It is not in the grant object (still exactly
+  `{at, expires}`), not in the fingerprint, and `RUNNER_PROTOCOL` is unchanged. A missing or malformed value means unstamped and is never
+  a schema failure. Lanes 3 and 4 go only to stamped entries; an unstamped head blocks the queue (`budget: lane N needs a stamped runner
+  (head qX)`), because first in, first out beats utilisation.
+- The shadow budget reports `fits_if_cap_were_4` beside `fits_if_cap_were_3`, which stays a three-lane figure.
+
+Prerequisites before the enabling pull request: every active checkout is at or after this change (the revision 3 prerequisite that no
+older runner is in use; the stamp makes a straggler wait rather than overrun), measured headroom for four concurrent jobs (a trial
+report at three lanes with free space comfortably above 200 GiB after reservations), and no unmanaged trees in the report window.
+
 ## Version history
 
 | Rev | Change |
@@ -407,3 +432,4 @@ admission are untouched. Lane 3 stays off until a trial under these criteria rea
 | 5 | Class-aware third lane trialled in shadow: `fits_if_class_aware_3`, `trial-report --policy class-aware`; overlap-hours reconciliation; no lane, threshold or headroom change (SPE-160) |
 | 6 | Overlap-time criterion 5 h replaced by 15 min plus 20 evaluable overlap samples; all other trial criteria and admission safeguards unchanged (SPE-160, owner-approved 2026-11-14) |
 | 7 | Third lane enabled as a monitored, reversible pilot on the owner's instruction (2026-11-16): `THIRD_LANE_ENABLED = True`. Disk, memory-pressure, CPU, headroom and class limits unchanged, so a third job still needs the budget to pass (a `light` or class-eligible `build-crate` request). If the pilot hits a limit, new third-lane admission stops by revert; trial evidence under the revision 6 criteria still decides whether to retain it as the default (SPE-160) |
+| 8 | Four-lane code shipped OFF (`FOURTH_LANE_ENABLED = False`, `FOUR_LANE_CEILING` 4): lane-4 capacity gates, `lane_protocol` queue stamp, `fits_if_cap_were_4`; enabling is a separate reviewed PR, rollback is its revert (SPE-176) |

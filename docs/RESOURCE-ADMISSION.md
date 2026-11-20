@@ -423,6 +423,33 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
   output, with the criteria of ADR 0017 revision 3 (exact-N stage gates, overlap-window disk margin, running-only deduplicated
   `fits_if_cap_were_3`; the window-wide minimum free disk is reported, not gated) and the rollback procedure of revision 2.
 
+## Four heavy lanes (shipped off)
+
+The fourth lane (SPE-176, ADR 0017 revision 8) is code behind `FOURTH_LANE_ENABLED = False` in `scripts/disk-admission.py`. While it is
+off, `heavy_lane_cap` and every refusal text are unchanged (three lanes in the wide tier). There is no runtime switch: enabling is a
+separate reviewed pull request that flips the constant, and rollback is reverting it. Running jobs are never signalled either way.
+
+With it on (and `THIRD_LANE_ENABLED`), the wide tier allows four lanes (`FOUR_LANE_CEILING`). Lane 4 additionally needs, at `reserve`,
+`queue advance` (before the memory probe, so it cannot arm the latch) and `queue claim`: free space minus all reservations minus the
+request at or above 200 GiB, no unmanaged process tree, and no holder past its time limit or unresolved. The refusal reads
+`budget: lane 4 needs <each unmet condition>`. Lanes 3 and 4 go only to queue entries carrying `lane_protocol: 4` (written by `queue
+enqueue`); an entry without it, or with a malformed value, waits with `budget: lane N needs a stamped runner (head qX)` and, being the head,
+blocks the queue. `fits_if_cap_were_4` appears beside `fits_if_cap_were_3` in the shadow budget.
+
+### Live verification procedure (never enqueues, never loops the real memory gate)
+
+All read-only; none of it creates a queue entry, takes a reservation or runs the memory gate's latch-writing check.
+
+1. Read `snapshot.json` next to the admission state file (published by the existing snapshot refresher; `python3 scripts/disk-admission.py
+   snapshot --check-fresh` is its read-only freshness check): `heavy_lanes_allowed` is 3 while off, 4 when on and the tier is wide, 2 in
+   stable, and `budget.reference.fits_if_cap_were_4` is the shadow figure. Do not run `snapshot --json` or `status --json` for this: the
+   first writes the file, the second does not report lanes.
+2. In a Python shell: `import importlib.util as u; s=u.spec_from_file_location('m','scripts/memory-admission.py'); m=u.module_from_spec(s);
+   s.loader.exec_module(m); print(m.read_lane_cap())` (it only loads `disk-admission.py` and reads the constants; it takes no sample).
+3. Confirm from real work: after real jobs have run, look in the queue receipts for `granted` and `shadow-budget` lines (their `budget`
+   carries `fits_if_cap_were_4`), and for a `budget: lane 4 needs ...` reason in `queue status` of a waiting entry. Do not enqueue a
+   job, and do not run `memory-admission.py check`, to produce evidence: wait for real work.
+
 ## Any other heavy command: `scripts/heavy-run`
 
 `scripts/heavy-run --label L --class C --bytes N [--max-wait-s W] -- COMMAND` is the supported entry point for a campaign's heavy

@@ -320,17 +320,40 @@ THIRD_LANE_ENABLED = True
 # memory or cpu slots; build-crate is granted its class min_jobs. This only feeds the trial report; it does not decide admission.
 # With THIRD_LANE_ENABLED the resource budget alone gates a third lane, whatever its class.
 THIRD_LANE_CLASSES = ('light', 'build-crate')
+# A fourth lane (SPE-176, ADR 0017 revision 8) is code that ships OFF. Enabling it is a separate reviewed one-line PR flipping this
+# constant and reverting that PR is the rollback: there is deliberately no flag file, environment switch or kill file, because a
+# file or variable an agent can write is a forgeable cap. It needs THIRD_LANE_ENABLED too and adds one wide-tier lane, never above
+# FOUR_LANE_CEILING. LANE_CEILING stays 3 for the three-lane mode.
+FOURTH_LANE_ENABLED = False
+FOUR_LANE_CEILING = 4
+# Lane 4 also needs this much free space left once every reservation and the request are counted (still the wide tier).
+FOURTH_LANE_MARGIN = 200 * 1024 ** 3
+# Queue entries carry this extra field when the enqueuing code knows the four-lane rules. It is not part of the grant object, the
+# fingerprint or RUNNER_PROTOCOL: an older caller simply lacks it and is never given lane 3 or 4 while the mode is on.
+LANE_PROTOCOL = 4
 
 
 def heavy_lane_cap(tier, latch=False):
     """Heavy lanes allowed at `tier`: 0 while latched or below stable, else HEAVY_LANES[tier], plus one for the wide tier once the
-    third lane is enabled, never above LANE_CEILING. The one place a lane count is decided."""
+    third lane is enabled (and one more with the fourth), never above LANE_CEILING (FOUR_LANE_CEILING in four-lane mode). The one place a lane count is decided."""
     if latch:
         return 0
     lanes = HEAVY_LANES.get(tier, 0)
     if lanes and tier == 'wide' and THIRD_LANE_ENABLED:
         lanes += 1
-    return min(lanes, LANE_CEILING)
+        if FOURTH_LANE_ENABLED:
+            lanes += 1
+    return min(lanes, FOUR_LANE_CEILING if _four_lane_mode() else LANE_CEILING)
+
+
+def _four_lane_mode():
+    return bool(THIRD_LANE_ENABLED and FOURTH_LANE_ENABLED)
+
+
+def _stamped(entry):
+    """True when the queue entry was written by code that knows the four-lane rules. Missing or malformed counts as unstamped."""
+    value = entry.get('lane_protocol') if isinstance(entry, dict) else None
+    return type(value) is int and value >= LANE_PROTOCOL
 
 
 class ReservationError(Exception):
@@ -979,7 +1002,7 @@ def _reserve(label, nbytes, pid, state_path, free_fn, now, token_fn, ttl, owner_
                 budget = _shadow_site(host, 'reserve', label, lambda: (budget_holders(others, orphans, queued, now), budget_request(
                     declared or {}, nbytes, label)), result['tier'], result['free_bytes'], reserved, True)
             # A job refreshing its own reservation already holds its lane and is running: only a new lane needs the budget.
-            budget_why = None if same else _budget_refusal(budget, in_use)
+            budget_why = None if same else _lane_refusal(budget, in_use, result['free_bytes'], reserved, nbytes)
             _mark_enforced(budget, not lane_full and floor_ok and not budget_why)
             if budget is not None and queue_dir(state_path).exists():
                 _budget_receipt(state_path, {'id': '-', 'label': label, 'tickets': []}, now, budget)
@@ -1574,7 +1597,8 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
             entry = {'version': QUEUE_VERSION, 'id': 'q%06d' % seq, 'seq': seq, 'label': label, 'state': 'QUEUED',
                      'tickets': list(tickets), 'repo': repo, 'worktree': real_worktree, 'harness': harness,
                      'session_id': session_id, 'owner_uid': os.getuid(), 'bytes': nbytes, 'fingerprint': fingerprint,
-                     'created': iso_utc(now), 'wait_expires': iso_utc(now + timedelta(seconds=wait_s)), 'grant': None}
+                     'created': iso_utc(now), 'wait_expires': iso_utc(now + timedelta(seconds=wait_s)), 'grant': None,
+                     'lane_protocol': LANE_PROTOCOL}
             entry.update({k: v for k, v in (declared or {}).items() if k != 'created'})  # the entry already has `created`
             if waiter:
                 entry['waiter'] = waiter
@@ -1759,7 +1783,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                     budget = _shadow_site(host, 'advance', nxt['label'], lambda: (
                         budget_holders(live, orphans, granted, now), budget_request(nxt, nxt['bytes'], nxt['label'])), result['tier'],
                                           result['free_bytes'], reserved, True)
-                budget_why = _budget_refusal(budget, in_use) if in_use < lanes else None
+                budget_why = _lane_refusal(budget, in_use, result['free_bytes'], reserved, nxt['bytes'], nxt) if in_use < lanes else None
                 _mark_enforced(budget, in_use < lanes and floor_ok and not budget_why)
                 if budget is not None:
                     out['budget'] = budget
@@ -1984,7 +2008,7 @@ def _queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn, pid, now, t
             if host is not None:
                 budget = _shadow_site(host, 'claim', label, lambda: (budget_holders(live, orphans, entries, now, skip_id=qid),
                                                           budget_request(entry, nbytes, label)), result['tier'], result['free_bytes'], reserved, True)
-            budget_why = _budget_refusal(budget, in_use)   # re-checked now: what fitted at grant time may not fit any more
+            budget_why = _lane_refusal(budget, in_use, result['free_bytes'], reserved, nbytes, entry)   # re-checked now: what fitted at grant time may not fit any more
             _mark_enforced(budget, not lane_full and floor_ok and not budget_why)
             if budget is not None:
                 _budget_receipt(state_path, entry, now, budget)
@@ -2731,10 +2755,10 @@ def budget_decision(host, reservations, request, caps):
     else:   # the same refusals, with the request cut to the class-aware grant: only memory and cpu depend on it
         mem_need, slots_need = grant
         aware = not [r for r in reasons if r.split(':', 1)[0] not in ('memory', 'cpu')] and not _resource_reasons(
-            base + mem_need, limit, headroom, cpu_used, slots_need, cpu_limit) and count + 1 <= LANE_CEILING
+            base + mem_need, limit, headroom, cpu_used, slots_need, cpu_limit) and count + 1 <= 3
 
     out.update(resource_reasons=reasons, would_admit=fits(cap), fits_if_cap_were_2=fits(2 if cap > 0 else 0),
-               fits_if_cap_were_3=fits(LANE_CEILING if cap > 0 else 0),
+               fits_if_cap_were_3=fits(3 if cap > 0 else 0), fits_if_cap_were_4=fits(FOUR_LANE_CEILING if cap > 0 else 0),
                class_aware_eligible=grant is not None, class_aware_jobs=None if grant is None else grant[1],
                fits_if_class_aware_3=aware and cap > 0,
                cap_reason=None if count + 1 <= cap else 'cap: %d running + 1 > max concurrent %d' % (count, cap))
@@ -2924,9 +2948,9 @@ def budget_line(budget):
             SHADOW_NOTE, budget['band'], _gib(budget['projected_bytes']), _gib(budget['limit_bytes']), budget['cpu_slots_used'],
             budget['cpu_limit'])
     why = budget['resource_reasons'] + ([budget['cap_reason']] if budget['cap_reason'] else [])
-    return 'budget (%s): would %s%s; fits_if_cap_were_2=%s; fits_if_cap_were_3=%s; band %s; projected %s of %s; %d/%d cpu slots; lane check decided %s' % (
+    return 'budget (%s): would %s%s; fits_if_cap_were_2=%s; fits_if_cap_were_3=%s; fits_if_cap_were_4=%s; band %s; projected %s of %s; %d/%d cpu slots; lane check decided %s' % (
         SHADOW_NOTE, 'admit' if budget['would_admit'] else 'refuse', ' (%s)' % '; '.join(why) if why else '',
-        str(budget['fits_if_cap_were_2']).lower(), str(budget['fits_if_cap_were_3']).lower(), budget['band'], _gib(budget['projected_bytes']), _gib(budget['limit_bytes']),
+        str(budget['fits_if_cap_were_2']).lower(), str(budget['fits_if_cap_were_3']).lower(), str(budget.get('fits_if_cap_were_4')).lower(), budget['band'], _gib(budget['projected_bytes']), _gib(budget['limit_bytes']),
         budget['cpu_slots_used'] + budget.get('request_cpu_slots', 0), budget['cpu_limit'], budget.get('enforced', 'n/a'))
 
 
@@ -3001,7 +3025,7 @@ def _shadow_site(host, site, label, build, tier, free_bytes, reserved, enforced_
 
 
 def _compact_budget(budget):
-    keys = ('shadow', 'status', 'reason', 'site', 'enforced', 'band', 'would_admit', 'fits_if_cap_were_2', 'fits_if_cap_were_3',
+    keys = ('shadow', 'status', 'reason', 'site', 'enforced', 'band', 'would_admit', 'fits_if_cap_were_2', 'fits_if_cap_were_3', 'fits_if_cap_were_4',
             'resource_reasons', 'cap_reason', 'class_aware_eligible', 'class_aware_jobs', 'fits_if_class_aware_3', 'projected_bytes',
             'limit_bytes', 'cpu_slots_used', 'cpu_limit', 'count', 'max_concurrent',
             'unmanaged_trees', 'granted_jobs', 'granted_test_threads')
@@ -3045,6 +3069,37 @@ def _budget_refusal(budget, in_use):
     return 'budget: ' + '; '.join(why) if why else None
 
 
+def _fourth_lane_refusal(budget, in_use, free, reserved, nbytes):
+    """Why a fourth lane (in_use == 3, four-lane mode on) is refused, or None. Every condition of the lane-2+ budget still applies;
+    on top of them lane 4 needs measured capacity: the free space left after all reservations and this request stays at or above
+    FOURTH_LANE_MARGIN, no unmanaged process tree, and no holder past its time limit or unresolved. Pure: no I/O, no latch."""
+    if not _four_lane_mode() or in_use != 3:
+        return None
+    unmet = []
+    base = _budget_refusal(budget, in_use)
+    if base:
+        unmet.append(base[len('budget: '):])
+    left = free - reserved - nbytes
+    if left < FOURTH_LANE_MARGIN:
+        unmet.append('%.1f GiB free after all reservations and this request, %.0f GiB required' % (left / GIB, FOURTH_LANE_MARGIN / GIB))
+    if budget and budget.get('status') == 'ok':
+        if budget.get('unmanaged_trees'):
+            unmet.append('%d unmanaged process tree(s) running' % budget['unmanaged_trees'])
+        flagged = sorted(h.get('label', '?') for h in budget.get('holders') or [] if h.get('flags'))
+        if flagged:
+            unmet.append('holder(s) past their time limit or unresolved: %s' % ', '.join(flagged))
+    return 'budget: lane 4 needs ' + '; '.join(unmet) if unmet else None
+
+
+def _lane_refusal(budget, in_use, free, reserved, nbytes, entry=None):
+    """The one budget-side refusal at a lane site. With four-lane mode on, lanes 3 and 4 are given only to a stamped queue entry
+    (an unstamped head blocks the queue: first in, first out beats utilisation); lane 4 also needs _fourth_lane_refusal's capacity.
+    Otherwise exactly _budget_refusal."""
+    if _four_lane_mode() and entry is not None and in_use >= 2 and not _stamped(entry):
+        return 'budget: lane %d needs a stamped runner (head %s)' % (in_use + 1, entry.get('id', '?'))
+    return _fourth_lane_refusal(budget, in_use, free, reserved, nbytes) or _budget_refusal(budget, in_use)
+
+
 def _budget_allows(budget, in_use):
     return _budget_refusal(budget, in_use) is None
 
@@ -3069,8 +3124,8 @@ def _state_budget(host, state_path, now, tier, free_bytes, live, entries, orphan
         verdict = _shadow_site(host, 'state', None, lambda: (holders, probe), tier, free_bytes, reserved, True)
         if verdict['status'] == 'ok':
             state['reference'] = dict({'class': REFERENCE_CLASS}, **{k: verdict[k] for k in (
-                'would_admit', 'fits_if_cap_were_2', 'fits_if_cap_were_3', 'resource_reasons', 'cap_reason', 'granted_jobs',
-                'granted_test_threads')})
+                'would_admit', 'fits_if_cap_were_2', 'fits_if_cap_were_3', 'fits_if_cap_were_4', 'resource_reasons', 'cap_reason',
+                'granted_jobs', 'granted_test_threads')})
     state.pop('enforced', None)
     return state
 
