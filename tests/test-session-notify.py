@@ -1479,7 +1479,8 @@ class BoundaryFuzz(Base):
         base["backends"]["macos"]["enabled"] = True
         base["backends"]["ntfy"].update(enabled=True, approved_destination="ntfy.sh", topic_file="/x/t")
         base["backends"]["pushover"].update(enabled=True, user_file="/x/u")
-        base["backends"]["telegram"].update(enabled=True, approved_destination="api.telegram.org", chat_id_file="/x/c")
+        base["backends"]["telegram"].update(enabled=True, approved_destination="api.telegram.org", chat_id_file="/x/c",
+                                           credentials_json="/x/creds.json")
         failures, n = [], 0
         path = self.tmp / "fuzz-config.json"
         for mpath, w, m in mutants(base):
@@ -2287,6 +2288,138 @@ class TelegramBackend(Base):
     def test_redirects_are_never_followed(self):
         h = sn._NoRedirect()
         self.assertIsNone(h.redirect_request(sn.urllib.request.Request("https://api.telegram.org/x"), None, 302, "Found", {}, "https://evil.example/"))
+
+    # ---- credentials_json: the established supervisor credential file (owner decision, never enabled by default) ----
+    OWNER = 424242
+
+    def sup(self, doc=None, mode=0o600, dirmode=0o700, raw=None, name="credentials.json"):
+        d = pathlib.Path(os.path.realpath(self.tmp)) / f"sup{dirmode:o}"
+        d.mkdir(exist_ok=True)
+        os.chmod(d, dirmode)
+        f = d / name
+        f.write_text(raw if raw is not None else json.dumps(doc if doc is not None else
+                     {"TELEGRAM_BOT_TOKEN": self.TOKEN, "TELEGRAM_OWNER_ID": self.OWNER, "TELEGRAM_SUPERGROUP_ID": -100999}))
+        os.chmod(f, mode)
+        return str(f)
+
+    def cj(self, path, **over):
+        return {"approved_destination": "api.telegram.org", "token_env": "SN_TG_UNSET", "chat_id_env": "SN_TG_UNSET", "credentials_json": path, **over}
+
+    def test_json_success_dms_the_owner_never_the_supergroup(self):
+        self.assertIsNone(sn.send_telegram(self.PAYLOAD, self.cj(self.sup())))
+        url, data, _ = self.posts[0]
+        host, _, rest = url[len("https://"):].partition("/")
+        self.assertEqual((host, rest.startswith("bot"), rest.endswith("/sendMessage")), ("api.telegram.org", True, True))
+        form = sn.urllib.parse.parse_qs(data.decode())
+        self.assertEqual(sorted(form), ["chat_id", "text"])
+        self.assertEqual(form["chat_id"], [str(self.OWNER)])
+        self.assertNotIn("100999", data.decode())
+
+    def test_json_refused_shapes(self):
+        os.symlink(self.sup(), self.tmp / "lnk")
+        big = json.dumps({"TELEGRAM_BOT_TOKEN": self.TOKEN, "TELEGRAM_OWNER_ID": 1, "pad": "x" * 70000})
+        ok = {"TELEGRAM_BOT_TOKEN": self.TOKEN, "TELEGRAM_OWNER_ID": self.OWNER}
+        cases = {"mode 0640": self.sup(mode=0o640), "mode 0644": self.sup(mode=0o644, name="w.json"), "mode 0400": self.sup(mode=0o400, name="r.json"),
+                 "symlink file": str(self.tmp / "lnk"), "parent 0755": self.sup(dirmode=0o755), "parent 0750": self.sup(dirmode=0o750),
+                 "oversize": self.sup(raw=big, name="big.json"), "list": self.sup(raw="[]", name="l.json"), "not json": self.sup(raw="{", name="n.json"),
+                 "no token": self.sup({"TELEGRAM_OWNER_ID": 1}, name="a.json"), "no owner": self.sup({"TELEGRAM_BOT_TOKEN": self.TOKEN}, name="b.json"),
+                 "bool owner": self.sup(dict(ok, TELEGRAM_OWNER_ID=True), name="c.json"), "negative owner": self.sup(dict(ok, TELEGRAM_OWNER_ID=-5), name="d.json"),
+                 "zero owner": self.sup(dict(ok, TELEGRAM_OWNER_ID=0), name="e.json"), "string owner": self.sup(dict(ok, TELEGRAM_OWNER_ID="5"), name="f.json"),
+                 "int token": self.sup(dict(ok, TELEGRAM_BOT_TOKEN=5), name="g.json"), "bad token shape": self.sup(dict(ok, TELEGRAM_BOT_TOKEN="a/../b"), name="h.json"),
+                 "missing": str(self.tmp / "nope" / "x.json"), "relative": "credentials.json"}
+        for label, path in cases.items():
+            self.assertEqual(sn.send_telegram(self.PAYLOAD, self.cj(path)), "not-configured", label)
+        self.assertEqual(self.posts, [])
+        self.assertIsNone(sn.send_telegram(self.PAYLOAD, self.cj(self.sup(ok, name="fine.json"))))   # same shape, valid: proves the refusals are about the shape
+
+    def test_json_wrong_owner_uid_refused(self):
+        path = self.sup()
+        real = os.getuid
+        sn.os.getuid = lambda: real() + 1
+        try:
+            self.assertEqual(sn.send_telegram(self.PAYLOAD, self.cj(path)), "not-configured")
+        finally:
+            sn.os.getuid = real
+        self.assertEqual(self.posts, [])
+
+    def test_json_symlinked_parent_directory_refused(self):
+        real = pathlib.Path(self.sup()).parent
+        os.symlink(real, self.tmp / "dirlink")
+        self.assertEqual(sn.send_telegram(self.PAYLOAD, self.cj(str(self.tmp / "dirlink" / "credentials.json"))), "not-configured")
+
+    def test_json_chat_target_group_or_anything_else_refused(self):
+        for target in ("group", "supergroup", "", None, 1, ["owner"]):
+            self.assertEqual(sn.send_telegram(self.PAYLOAD, self.cj(self.sup(), chat_target=target)), "not-configured", repr(target))
+        self.assertEqual(self.posts, [])
+        c, _ = sn.load_config(self._write_cfg({"backends": {"telegram": {"chat_target": "group", "credentials_json": "/x"}}}))
+        self.assertEqual(c["backends"]["telegram"]["chat_target"], "owner")   # an invalid leaf can only fall back to the narrowest value
+
+    def _write_cfg(self, obj):
+        p = self.tmp / "cfg.json"
+        p.write_text(json.dumps(obj))
+        return p
+
+    def test_json_precedence_env_then_files_then_json(self):
+        path = self.sup()
+        os.environ["SN_TG_TOKEN"], os.environ["SN_TG_CHAT"] = "111111:ENV-ONLY", "777"
+        sn.send_telegram(self.PAYLOAD, self.cj(path, token_env="SN_TG_TOKEN", chat_id_env="SN_TG_CHAT"))
+        files = self.cj(path, token_file=self.secret("tok", "222222:FILE-ONLY"), chat_id_file=self.secret("chat", "888"))
+        sn.send_telegram(self.PAYLOAD, files)
+        sn.send_telegram(self.PAYLOAD, self.cj(path))
+        self.assertIn("bot111111:ENV-ONLY/", self.posts[0][0])
+        self.assertIn("chat_id=777", self.posts[0][1].decode())
+        self.assertIn("bot222222:FILE-ONLY/", self.posts[1][0])
+        self.assertIn("chat_id=888", self.posts[1][1].decode())
+        self.assertIn(f"bot{self.TOKEN}/", self.posts[2][0])
+        self.assertIn(f"chat_id={self.OWNER}", self.posts[2][1].decode())
+
+    def test_json_never_mixed_with_a_partial_explicit_source(self):
+        os.environ["SN_TG_TOKEN"] = "111111:ENV-ONLY"   # token from env, no chat from any explicit source
+        self.assertEqual(sn.send_telegram(self.PAYLOAD, self.cj(self.sup(), token_env="SN_TG_TOKEN")), "not-configured")
+        self.assertEqual(self.posts, [])
+
+    def test_json_destination_mismatch_sends_nothing(self):
+        for dest in ("", "api.pushover.net", "evil.example"):
+            self.assertEqual(sn.send_telegram(self.PAYLOAD, self.cj(self.sup(), approved_destination=dest)), "not-configured")
+        self.assertEqual(self.posts, [])
+
+    def test_json_token_not_in_state_logs_or_errors_after_forced_failure(self):
+        path = self.sup()
+        def boom(url, data, headers, timeout=4):
+            raise RuntimeError("connect failed for " + url)
+        sn.http_post = boom
+        self.assertEqual(sn.send_telegram(self.PAYLOAD, self.cj(path)), "error-RuntimeError")
+        c = cfg()
+        c["backends"]["telegram"].update(self.cj(path, enabled=True))
+        e = sn.Engine(self.sdir, c, sn.REAL_TRANSPORTS | {"macos": lambda p, x: None, "ntfy": lambda p, x: None, "pushover": lambda p, x: None},
+                      clock=lambda: self.t, sleep=lambda s: None)
+        self.ev(e, "UserPromptSubmit")
+        self.ev(e, "Notification", notification_type="permission_prompt")
+        self.assertEqual(self.rec()["pending"][0]["backends"]["telegram"]["status"], "failed")
+        files = [f for f in self.sdir.rglob("*") if f.is_file()]
+        self.assertTrue(files)
+        for f in files:
+            text = f.read_text()
+            self.assertNotIn("TEST-ONLY", text)
+            self.assertNotIn(str(self.OWNER), text)
+
+    def test_json_refused_for_corporate_like_other_remote_backends(self):
+        c = cfg()
+        c["backends"]["telegram"].update(self.cj(self.sup(), enabled=True))
+        self.assertEqual(sn.backend_allowed("telegram", c, True), (False, "refused-corporate"))
+        self.assertEqual(sn.backend_allowed("telegram", dict(c, profile="corporate"), False), (False, "refused-corporate"))
+
+    def test_json_keys_default_off_and_old_configs_still_load(self):
+        t = sn.DEFAULT_CONFIG["backends"]["telegram"]
+        self.assertEqual((t["credentials_json"], t["chat_target"]), ("", "owner"))
+        old = {"backends": {"telegram": {"enabled": True, "approved_destination": "api.telegram.org", "token_file": "/x/t"}}}
+        c, problem = sn.load_config(self._write_cfg(old))
+        self.assertIsNone(problem)
+        self.assertEqual((c["backends"]["telegram"]["credentials_json"], c["backends"]["telegram"]["chat_target"]), ("", "owner"))
+        rendered = json.loads(subprocess.run([sys.executable, str(SCRIPT), "render-config"], capture_output=True, text=True).stdout)
+        self.assertEqual((rendered["backends"]["telegram"]["credentials_json"], rendered["backends"]["telegram"]["chat_target"]), ("", "owner"))
+        self.assertEqual(sn.send_telegram(self.PAYLOAD, self.tg(token_env="SN_TG_UNSET", chat_id_env="SN_TG_UNSET")), "not-configured")
+
 
     def test_off_by_default_and_listed_in_default_config_and_schema(self):
         t = sn.DEFAULT_CONFIG["backends"]["telegram"]

@@ -78,6 +78,23 @@ To set it up yourself:
 
 The send is a plain `https` POST to `https://api.telegram.org/bot<token>/sendMessage` with form fields `chat_id` and `text`, no redirects and no environment proxies. The token is part of that URL path, so it is never logged, stored in state, or returned in an error: failures are recorded only as a short code such as `http-401` or `network`. A token or chat id that does not have the Telegram shape counts as not configured.
 
+#### Reusing the supervisor Telegram credential file (owner decision)
+
+`backends.telegram.credentials_json` (absolute path, default empty) lets session-notify use the credential file the engineering supervisor already has, so no token is copied into the config, an environment variable or another file. **Nothing is enabled by this change**; the key is empty by default.
+
+- **What is read:** only `TELEGRAM_BOT_TOKEN` (string) and `TELEGRAM_OWNER_ID` (positive integer) from a JSON object. `TELEGRAM_SUPERGROUP_ID` is never read. The file is checked as the supervisor loader checks it: absolute path with no symlink component, parent directory owner-only (`0700`), opened with `O_NOFOLLOW`, a regular file you own with mode exactly `0600`, at most 64 KiB. Any problem, including invalid JSON or a missing key, gives the single code `not-configured`; the path and contents are never logged.
+- **Precedence:** a named environment variable wins, then `token_file` / `chat_id_file`, then `credentials_json`. It is used only when neither the token nor the chat id came from those sources; a partly explicit setup is `not-configured`, never mixed.
+- **Direct message to the owner only:** `chat_target` is a closed key whose only value is `owner`. The message goes to `TELEGRAM_OWNER_ID`, never the supergroup. Posting to the group would be a separate, explicit change that adds a new `chat_target` value; any other value is refused (in a config file an invalid value falls back to `owner`).
+- **Credential-authority decision:** this makes the same bot identity a second consumer of the supervisor's credential. That is a credential-authority decision for the owner, to be recorded as an owner approval before enabling. The same destination, corporate-profile and fixed-phrase rules apply as for the other remote backends.
+- **To enable** (after that approval), in `session-notify.json`:
+
+```json
+{"backends": {"telegram": {"enabled": true, "approved_destination": "api.telegram.org",
+                           "credentials_json": "/absolute/path/to/credentials.json"}}}
+```
+
+  **Enabling sends real Telegram messages** to the owner's chat for every notifiable transition.
+
 Reliability: state is persisted as `sending` before a transport runs; failures retry with backoff 30 s, 60 s, 120 s, 240 s (cap 900 s, 5 attempts) and are then dropped; retries run from the next hook of that session or from `sweep`. A send interrupted by a crash is recovered after 5 minutes and **counts toward the same attempt cap** (checked before sending), so it can repeat at most within that cap. A queue limited to 20 entries never discards silently: the oldest entry gets a terminal `dropped` (`queue-overflow`) outcome, is remembered for dedup, adds a history line and increments `dropped` (shown by `status`). A raising transport is a failed attempt, never a crash.
 
 ## Admission-stall notices (`emit-resource`, SPE-176)
