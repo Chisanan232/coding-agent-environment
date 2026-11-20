@@ -1434,6 +1434,10 @@ QUEUE_MAX_GRANT_S = 4 * 3600
 BACKFILL_ENABLED = False
 BACKFILL_MAX = 1
 BACKFILL_SHADOW_WINDOW_S = 600
+# Claim window of a backfilled grant (SPE-176 hardening): it holds a lane ahead of the oldest waiting entry, so it gets half the hand-off
+# window. Its waiter is proven alive when granted and polls for the grant; a lapse takes the existing EXPIRED path and frees the in-flight
+# count at once. Only `expires` changes: the grant object stays {at, expires}.
+BACKFILL_GRANT_S = 600
 WAITING_STATES = ('QUEUED', 'ELIGIBLE', 'GRANTED')
 LIVE_STATES = WAITING_STATES + ('CLAIMED',)
 TERMINAL_STATES = ('RELEASED', 'EXPIRED', 'CANCELLED')
@@ -1872,9 +1876,11 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
             reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans) + sum(e['bytes'] for e in granted)
             backfill = None   # set at the pivot when bounded backfill applies (ADR 0017 revision 9)
 
-            def grant(nxt):
+            def grant(nxt, backfilled=False):
                 nonlocal in_use, reserved
                 window = min(grant_s, QUEUE_MAX_GRANT_S if 'waiter' in nxt else HANDOFF_GRANT_S)   # once per entry: grant, marker, receipt
+                if backfilled:
+                    window = min(window, BACKFILL_GRANT_S)
                 nxt['state'] = 'GRANTED'
                 # The grant object is exactly {at, expires}: a hand-off consumer validates it as a closed key set (the HORO-2139 executor
                 # refused a grant with two extra keys on 2026-11-19 and its waiter died). The runner stamp goes in the receipt only.
@@ -1916,7 +1922,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                             out['reason'] = 'memory-gate: %s' % memory[1]
                             return out
                         _queue_receipt(state_path, 'backfill', nxt, now, **verdict)
-                        grant(nxt)
+                        grant(nxt, backfilled=True)
                         out['backfilled'].append(nxt['id'])
                     backfill['keys'] |= set(nxt.get('excl_keys') or [])
                     backfill['taken'] += 1
