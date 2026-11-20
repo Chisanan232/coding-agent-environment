@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,7 @@ def load(name, file):
 
 da = load('disk_admission_backfill', 'scripts/disk-admission.py')
 mon = load('admission_monitor_backfill', 'scripts/admission-monitor.py')
+rec = load('admission_recovery_backfill', 'scripts/admission-recovery.py')
 ma = load('memory_admission_backfill', 'scripts/memory-admission.py')
 SHIPPED_BACKFILL_ENABLED, SHIPPED_BACKFILL_MAX = da.BACKFILL_ENABLED, da.BACKFILL_MAX
 da.THIRD_LANE_ENABLED = True      # the shipped lane rules: three lanes at the wide tier
@@ -39,11 +41,11 @@ LOCAL = 'cargo-target:/Users/dev/.cargo/targets/local-agent'
 SESSION = '0b1d2e3f-aaaa-bbbb-cccc-1234567890ab'
 
 
-def decl(cls, keys, cpus=None):
+def decl(cls, keys, cpus=None, mem_gib=None):
     spec = da.WORKLOAD_CLASSES[cls]
     jobs = cpus or spec['jobs']
-    return {'class': cls, 'mem_bytes': (spec['mem_base_mib'] + spec['mem_per_job_mib'] * spec['jobs']) * da.MIB, 'cpu_slots': jobs,
-            'test_threads': jobs, 'excl_keys': list(keys)}
+    mem = int(mem_gib * GIB) if mem_gib else (spec['mem_base_mib'] + spec['mem_per_job_mib'] * spec['jobs']) * da.MIB
+    return {'class': cls, 'mem_bytes': mem, 'cpu_slots': jobs, 'test_threads': jobs, 'excl_keys': list(keys)}
 
 
 @contextmanager
@@ -64,6 +66,7 @@ class Base(unittest.TestCase):
         self.procs = []
         self.addCleanup(self.reap)
         self.load1, self.band, self.workloads, self.band_fn = 0.0, 'GREEN', [], None
+        self.rows, self.rows_prev = {}, {}
 
     def reap(self):
         for proc in self.procs:
@@ -77,16 +80,17 @@ class Base(unittest.TestCase):
 
     def host(self):
         sample = {'ram': 128 * GIB, 'used': 20 * GIB, 'cores': 16, 'load1': self.load1, 'time': self.now + timedelta(seconds=1),
-                  'window_s': 2.0, 'rows': {}, 'rows_prev': {}, 'workloads': list(self.workloads), 'band': self.band}
+                  'window_s': 2.0, 'rows': dict(self.rows), 'rows_prev': dict(self.rows_prev), 'workloads': list(self.workloads),
+                  'band': self.band}
         if self.band_fn:
             sample['band_fn'] = self.band_fn
         return sample
 
-    def enqueue(self, label, cls, keys, gib=None, waiter=True, cpus=None):
+    def enqueue(self, label, cls, keys, gib=None, waiter=True, cpus=None, mem_gib=None):
         proc = self.spawn() if waiter else None
         out = da.queue_enqueue(self.path, label=label, tickets=['HORO-1'], repo='horonom/x', worktree=str(self.worktree), harness='claude',
                                session_id=SESSION, nbytes=(gib or da.WORKLOAD_CLASSES[cls]['disk_gib']) * GIB, argv=['cargo', 'test', label],
-                               now=self.now, declared=decl(cls, keys, cpus), waiter_pid=proc.pid if proc else None,
+                               now=self.now, declared=decl(cls, keys, cpus, mem_gib), waiter_pid=proc.pid if proc else None,
                                ancestor_fn=(lambda pid: True) if proc else None)
         self.assertTrue(out['ok'], out)
         return out['id']
@@ -107,8 +111,8 @@ class Base(unittest.TestCase):
             da._write_queue_entry(self.path, entry)
         return holder
 
-    def running(self, label, cls, keys, gib=None):
-        qid = self.enqueue(label, cls, keys, gib)
+    def running(self, label, cls, keys, gib=None, cpus=None, mem_gib=None):
+        qid = self.enqueue(label, cls, keys, gib, cpus=cpus, mem_gib=mem_gib)
         return qid, self.claim(qid)
 
     def advance(self, free=400 * GIB, now=None, memory_fn=None, waiter_token_fn=None, host=True):
@@ -567,6 +571,357 @@ class EndToEnd(Base):
             claimed = self.claim_real(self.head, next(p for p in self.procs if p.pid == head_wrapper))
             self.assertTrue(claimed['ok'], claimed)
         self.assertEqual([self.state(q) for q in (self.blocker, self.head, self.docker_a)], ['RELEASED', 'CLAIMED', 'CLAIMED'])
+
+
+class KeyResolution(unittest.TestCase):
+    """New keys follow cargo's own target-dir order and are realpath-canonical (resolve_workload with an injected env, home and cwd)."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
+        self.home = self.root / 'home'
+        self.work = self.root / 'repo/crates/wt'
+        self.work.mkdir(parents=True)
+        (self.home / '.cargo').mkdir(parents=True)
+
+    def key(self, env=None, argv=None, cwd=None):
+        fields, error = da.resolve_workload('build-crate', None, None, None, env=env or {}, home=str(self.home), cwd=str(cwd or self.work),
+                                            argv=argv)
+        self.assertIsNone(error)
+        return fields['excl_keys'][0]
+
+    def config(self, directory, text, name='config.toml'):
+        (directory / '.cargo').mkdir(parents=True, exist_ok=True)
+        (directory / '.cargo' / name).write_text(text)
+
+    def test_cargo_precedence_cli_then_env_then_nearest_config_then_cargo_home(self):
+        self.config(self.home, '[build]\ntarget-dir = "home-target"\n')
+        self.assertEqual(self.key(), da.CARGO_KEY + str(self.home / 'home-target'), 'relative to the parent of the .cargo directory')
+        self.config(self.root / 'repo', '[build]\ntarget-dir = "repo-target"\n')
+        self.assertEqual(self.key(), da.CARGO_KEY + str(self.root / 'repo/repo-target'))
+        self.config(self.work, '[build]\ntarget-dir = "/abs/nearest"\n')
+        self.assertEqual(self.key(), da.CARGO_KEY + '/abs/nearest', 'the config nearest to cwd wins')
+        self.assertEqual(self.key({'CARGO_BUILD_TARGET_DIR': 'bt'}), da.CARGO_KEY + str(self.work / 'bt'), 'the env form beats every file')
+        self.assertEqual(self.key({'CARGO_BUILD_TARGET_DIR': 'bt', 'CARGO_TARGET_DIR': '/ct'}), da.CARGO_KEY + '/ct')
+        argv = ['cargo', 'test', '--target-dir', 'cli', '--', '--target-dir', 'ignored']
+        self.assertEqual(self.key({'CARGO_TARGET_DIR': '/ct'}, argv), da.CARGO_KEY + str(self.work / 'cli'))
+        self.assertEqual(self.key({}, ['cargo', 'build', '--target-dir=/eq']), da.CARGO_KEY + '/eq')
+
+    def test_cargo_home_and_legacy_config_and_the_default(self):
+        self.assertEqual(self.key(), da.CARGO_KEY + str(self.work / 'target'))
+        cargo_home = self.root / 'ch'
+        cargo_home.mkdir()
+        (cargo_home / 'config.toml').write_text('[build]\ntarget-dir = "/from-cargo-home"\n')
+        self.assertEqual(self.key({'CARGO_HOME': str(cargo_home)}), da.CARGO_KEY + '/from-cargo-home')
+        self.config(self.root / 'repo', '[build]\ntarget-dir = "/legacy"\n', name='config')
+        self.config(self.root / 'repo', '[build]\ntarget-dir = "/toml"\n')
+        self.assertEqual(self.key(), da.CARGO_KEY + '/legacy', 'cargo reads the extensionless file when both exist')
+
+    def test_heavy_run_shaped_argv_and_non_cargo_jobs(self):
+        heavy = ['/bin/sh', '-c', 'touch "$1" && shift && exec "$@"', 'heavy-run', '/tmp/proof', 'cargo', 'nextest', 'run',
+                 '--target-dir', '/hr']
+        self.assertEqual(self.key({}, heavy), da.CARGO_KEY + '/hr')
+        self.assertEqual(self.key({}, ['make', '--target-dir', '/nope']), da.CARGO_KEY + str(self.work / 'target'))
+
+    def test_symlinks_trailing_slashes_and_dot_dot_are_canonical(self):
+        real = self.root / 'real-target'
+        real.mkdir()
+        link = self.root / 'link-target'
+        link.symlink_to(real)
+        for spelling in (str(link), str(link) + '/', str(self.root / 'x/../link-target')):
+            self.assertEqual(self.key({'CARGO_TARGET_DIR': spelling}), da.CARGO_KEY + str(real), spelling)
+
+    @unittest.skipUnless(sys.platform == 'darwin' and os.path.realpath('/tmp') == '/private/tmp', 'macOS /tmp alias')
+    def test_tmp_and_private_tmp_are_one_key(self):
+        self.assertEqual(self.key({'CARGO_TARGET_DIR': '/tmp/cae-target-x'}), da.CARGO_KEY + '/private/tmp/cae-target-x')
+        self.assertEqual(da.excl_identity(da.CARGO_KEY + '/tmp/cae-target-x'), da.excl_identity(da.CARGO_KEY + '/private/tmp/cae-target-x'))
+
+
+class KeyIdentity(Base):
+    """Stored keys (pre-realpath spellings) and new keys compare by identity at decision time, so queued entries are protected too."""
+
+    def aliases(self):
+        real = Path(self.temp.name).resolve() / 'shared-target'
+        real.mkdir()
+        link = Path(self.temp.name).resolve() / 'shared-link'
+        link.symlink_to(real)
+        return da.CARGO_KEY + str(real), da.CARGO_KEY + str(link) + '/'
+
+    def test_excl_identity(self):
+        canonical, stored = self.aliases()
+        self.assertEqual(da.excl_identity(canonical), da.excl_identity(stored))
+        self.assertNotEqual(da.excl_identity(canonical), da.excl_identity(LOCAL))
+        self.assertEqual(da.excl_identity('docker'), 'docker')
+        self.assertEqual(da.excl_identity(da.CARGO_KEY + '/nonexistent/a/../b'), da.CARGO_KEY + da._fold_path('/nonexistent/b'))
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'case-insensitive default volume')
+    def test_a_missing_directory_compares_case_insensitively_on_macos(self):
+        self.assertEqual(da.excl_identity(da.CARGO_KEY + '/Nonexistent/Target'), da.excl_identity(da.CARGO_KEY + '/nonexistent/target'))
+
+    def test_budget_clash_sees_an_alias_and_reports_the_request_spelling(self):
+        canonical, stored = self.aliases()
+        crate = dict(decl('build-crate', [stored]), label='old')
+        holders = [da.budget_holder('reservation', crate, None, 11, granted_jobs=4)]
+        out = da.budget_decision(self.host(), holders, da.budget_request(decl('build-crate', [canonical]), 10 * GIB, 'new'), {'max_concurrent': 3})
+        self.assertIn('excl_key overlap with old', out['resource_reasons'])
+        self.assertEqual(out['excl_clash'], [{'label': 'old', 'kind': 'reservation', 'keys': [canonical]}])
+
+    def test_a_running_job_on_an_aliased_key_blocks_an_ordinary_grant(self):
+        canonical, stored = self.aliases()
+        self.running('old', 'build-crate', [stored])
+        new = self.enqueue('new', 'build-crate', [canonical])
+        out = self.advance()
+        self.assertEqual(out['granted'], [])
+        self.assertEqual(out['reason'], 'budget: excl_key overlap with old')
+        self.assertEqual(self.state(new), 'QUEUED')
+
+    def test_a_candidate_aliasing_the_heads_key_is_never_backfilled(self):
+        canonical, stored = self.aliases()
+        self.running('blocker', 'build-workspace', [SHARED], 40)
+        self.enqueue('head', 'build-workspace', [SHARED, stored], 40)
+        alias = self.enqueue('alias', 'build-crate', [canonical])
+        other = self.enqueue('other', 'container-suite', ['docker'])
+        with backfill():
+            out = self.advance()
+        self.assertEqual(out['backfilled'], [other])
+        self.assertEqual(self.state(alias), 'QUEUED')
+
+    def test_an_entry_holding_a_legacy_key_still_claims_with_an_unchanged_fingerprint(self):
+        canonical, stored = self.aliases()
+        qid = self.enqueue('legacy', 'build-crate', [stored])
+        entry = self.entries()[qid]
+        self.assertEqual(entry['excl_keys'], [stored], 'stored keys are never rewritten')
+        salt = da._queue_salt(self.path)
+        self.assertEqual(da._fingerprint(salt, entry['repo'], entry['worktree'], entry['tickets'], ['cargo', 'test', 'legacy'], entry['bytes'],
+                                         da._declared(entry)), entry['fingerprint'])
+        self.assertEqual(self.advance()['granted'], [qid])
+        wrapper = next(p for p in self.procs if p.pid == entry['waiter']['pid'])
+        claimed = da.queue_claim(self.path, qid, 'legacy', entry['bytes'], ['cargo', 'test', 'legacy'], str(self.worktree), lambda: 400 * GIB,
+                                 pid=wrapper.pid, now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda p, a: None,
+                                 declared=decl('build-crate', [canonical]), host_fn=self.host, grant_environ={})
+        self.assertTrue(claimed['ok'], claimed)
+
+
+class HeadProtection(Base):
+    def test_a_candidate_that_would_shrink_the_tier_below_the_heads_lanes_is_refused(self):
+        """Wide (3 lanes) now; free - reservations - candidate falls to stable (2 lanes): blocker gone, other + candidate + head = 3."""
+        self.running('blocker', 'build-workspace', [SHARED], 40)
+        self.running('other', 'build-crate', [LOCAL], 10)
+        head = self.enqueue('head', 'build-crate', [SHARED], 10)
+        docker = self.enqueue('docker', 'container-suite', ['docker'], 20)
+        with backfill():
+            out = self.advance(free=260 * GIB)            # 260 - 50 - 20 = 190 GiB: stable; disk_left 180 GiB passes the floor
+        self.assertEqual(out['head_reason'], 'budget: excl_key overlap with blocker')
+        self.assertEqual(out['backfilled'], [])
+        self.assertEqual(self.state(docker), 'QUEUED')
+        entries = self.entries()
+        live, _ = da.live_reservations(self.path, self.now)
+        ok, math = da._protects_head(self.host(), entries[head], entries[docker], [{'label': 'blocker'}], live, [], [], self.now, 'wide',
+                                     260 * GIB, 50 * GIB, 2, 3)
+        self.assertFalse(ok)
+        self.assertEqual((math['tier_after'], math['lanes_after'], math['disk_left']), ('stable', 2, 180 * GIB))
+        with backfill():
+            self.assertEqual(self.advance(free=300 * GIB)['backfilled'], [docker], '300 - 70 = 230 GiB stays wide')
+
+    def test_the_disk_latch_is_carried_into_the_projection(self):
+        self.historical()
+        entries = self.entries()
+        live, _ = da.live_reservations(self.path, self.now)
+        args = (self.host(), entries[self.head], entries[self.docker_a], [{'label': 'p6-verify-2'}], live, [], [], self.now, 'wide',
+                400 * GIB, 40 * GIB, 1, 3)
+        self.assertTrue(da._protects_head(*args)[0])
+        ok, math = da._protects_head(*args, latch=True)
+        self.assertFalse(ok)
+        self.assertEqual(math['cap'], 0, 'heavy_lane_cap now sees the latch')
+        low = (self.host(), entries[self.head], entries[self.docker_a], [{'label': 'p6-verify-2'}], live, [], [], self.now, 'stable',
+               110 * GIB, 40 * GIB, 1, 2)
+        self.assertEqual(da._protects_head(*low, latch=True)[1]['lanes_after'], 0, '110 - 40 - 32 = 38 GiB keeps a set latch (release at 50)')
+        self.assertEqual(da._protects_head(*low)[1]['lanes_after'], 0, '38 GiB is the low tier: no heavy lane')
+
+    def test_a_candidate_whose_declared_memory_breaks_the_heads_memory_projection_is_refused(self):
+        """No helper projects the SPE-117 latch from declared bytes; the fallback is the head's band and memory with the candidate charged."""
+        self.running('blocker', 'build-crate', [SHARED], mem_gib=4)
+        self.enqueue('head', 'build-workspace', [SHARED], 40, mem_gib=40)    # beside the blocker: 20 + 4 + 40 = 64 <= 89.6 GiB
+        big = self.enqueue('big', 'container-suite', ['docker'], mem_gib=40)  # alone it fits; with the head 20 + 40 + 40 > 89.6 GiB
+        small = self.enqueue('small', 'build-crate', [LOCAL], mem_gib=8)
+        with backfill(cap=2):
+            out = self.advance()
+        self.assertEqual(out['backfilled'], [small])
+        self.assertEqual(self.state(big), 'QUEUED')
+        self.assertEqual(self.receipts('backfill')[0]['math']['band_after'], 'GREEN')
+
+    def blocker_load(self, load1):
+        """The blocker's measured CPU (8 slots' worth over the 2 s window) is credited only while it is counted as a holder."""
+        self.historical()
+        pid = self.blocker_proc.pid
+        self.rows, self.rows_prev = {pid: (1, 1024, 116.0)}, {pid: (1, 1024, 100.0)}
+        self.load1 = load1
+        self.band_fn = lambda lpc: ('GREEN', []) if lpc is None or lpc <= ma.EXIT['load_per_core'] else ('AMBER', [])
+
+    def test_the_head_turning_amber_once_the_blockers_load_credit_is_removed_refuses(self):
+        self.blocker_load(36.0)       # (36 - 8) / 16 = 1.75 with the credit: GREEN; 36 / 16 = 2.25 without it: AMBER
+        with backfill():
+            out = self.advance()
+        self.assertEqual(out['head_reason'], 'budget: excl_key overlap with p6-verify-2')
+        self.assertEqual(out['backfilled'], [])
+        self.assertEqual(self.state(self.docker_a), 'QUEUED')
+
+    def test_the_same_shape_below_the_line_still_backfills(self):
+        self.blocker_load(30.0)       # 30 / 16 = 1.875 even without the credit
+        with backfill():
+            self.assertEqual(self.advance()['backfilled'], [self.docker_a])
+
+    def test_every_blocker_is_recorded_and_the_first_stays_in_the_old_fields(self):
+        first, _ = self.running('blocker-a', 'build-crate', [SHARED])
+        second, _ = self.running('blocker-b', 'build-crate', [LOCAL])
+        self.enqueue('head', 'build-crate', [SHARED, LOCAL])
+        docker = self.enqueue('docker', 'container-suite', ['docker'])
+        with backfill():
+            self.assertEqual(self.advance()['backfilled'], [docker])
+        record = self.receipts('backfill')[0]
+        self.assertEqual([b['id'] for b in record['blockers']], [first, second])
+        self.assertEqual((record['blocker_id'], record['blocker_label'], record['excl_key']), (first, 'blocker-a', SHARED))
+        self.assertEqual(record['blockers'][1]['keys'], [LOCAL])
+
+
+class ClaimRecheck(Base):
+    def claim_real(self, qid, host_fn=None, free=400 * GIB):
+        entry = self.entries()[qid]
+        wrapper = next(p for p in self.procs if p.pid == entry['waiter']['pid'])
+        declared = {k: entry[k] for k in ('class', 'mem_bytes', 'cpu_slots', 'test_threads', 'excl_keys')}
+        return da.queue_claim(self.path, qid, entry['label'], entry['bytes'], ['cargo', 'test', entry['label']], str(self.worktree),
+                              lambda: free, pid=wrapper.pid, now=self.now, memory_fn=lambda: (True, 'ok'), exec_fn=lambda p, a: None,
+                              declared=declared, host_fn=host_fn, grant_environ={})
+
+    def test_a_backfilled_grant_whose_head_protection_broke_is_revoked_at_claim(self):
+        self.historical()
+        with backfill():
+            self.assertEqual(self.advance()['backfilled'], [self.docker_a])
+        proc = self.spawn()      # a job reserved outside the queue now takes the CPU the head needs: no longer refused by the key alone
+        with da.state_lock(self.path):
+            da.write_reservation(self.path, 'manual', 10 * GIB, proc.pid, da.process_token(proc.pid), self.now + timedelta(hours=1),
+                                 declared=dict(decl('build-crate', [LOCAL]), created=da.iso_utc(self.now - timedelta(minutes=1))), granted_jobs=4)
+        out = self.claim_real(self.docker_a, self.host)
+        self.assertFalse(out['ok'])
+        self.assertTrue(out['reason'].startswith('backfill-revoked: %s no longer protects the oldest waiting entry %s (head-not-excl-only)'
+                                                 % (self.docker_a, self.head)), out['reason'])
+        self.assertEqual(self.state(self.docker_a), 'EXPIRED')
+        self.assertFalse((da.queue_dir(self.path) / 'granted' / self.docker_a).exists())
+        revoked = self.receipts('backfill-revoked')
+        self.assertEqual([(r['id'], r['kind'], r['blocked_id']) for r in revoked], [(self.docker_a, 'head-not-excl-only', self.head)])
+        self.assertEqual(self.receipts('claim-refused')[-1]['kind'], 'backfill-revoked')
+        self.assertFalse((da.reservations_dir(self.path) / 'p2556d.json').exists(), 'nothing was reserved')
+
+    def test_a_backfilled_grant_whose_disk_headroom_shrank_is_revoked_at_claim(self):
+        self.historical()
+        with backfill():
+            self.advance()
+        out = self.claim_real(self.docker_a, self.host, free=210 * GIB)
+        self.assertFalse(out['ok'])
+        self.assertIn('(head-unprotected)', out['reason'])     # its own floor passes (210 - 40 - 32); the head's would not (210 - 112 < 100)
+        self.assertEqual(self.state(self.docker_a), 'EXPIRED')
+
+    def test_no_host_sample_refuses_a_backfilled_claim_but_keeps_the_grant(self):
+        self.historical()
+        with backfill():
+            self.advance()
+        self.blocker_proc.kill()       # lane 1 needs no host sample, so only the re-check can refuse
+        self.blocker_proc.wait()
+        da.queue_advance(self.path, lambda: 400 * GIB, now=self.now)     # records the release; with no host sample nothing is granted
+        out = self.claim_real(self.docker_a, None)
+        self.assertFalse(out['ok'])
+        self.assertTrue(out['reason'].startswith('backfill-unverifiable: no host sample'), out['reason'])
+        self.assertEqual(self.state(self.docker_a), 'GRANTED')
+        self.assertTrue(self.claim_real(self.docker_a, self.host)['ok'])
+
+    def test_an_ordinary_grant_is_never_rechecked(self):
+        head = self.enqueue('head', 'build-crate', [SHARED])
+        self.enqueue('later', 'build-crate', [SHARED])
+        self.assertEqual(self.advance()['granted'], [head])
+        out = self.claim_real(head, None)      # no host sample: lane 1 needs none, and no earlier entry waits
+        self.assertTrue(out['ok'], out)
+        self.assertFalse(self.receipts('backfill-revoked'))
+
+
+class BackfillWindow(Base):
+    def test_a_backfill_grant_gets_the_shorter_window_and_an_in_order_grant_does_not(self):
+        self.historical()
+        with backfill():
+            self.advance()
+        grant = self.entries()[self.docker_a]['grant']
+        self.assertEqual(set(grant), {'at', 'expires'})
+        self.assertEqual(da._parse_time(grant['expires']) - da._parse_time(grant['at']), timedelta(seconds=da.BACKFILL_GRANT_S))
+        self.assertEqual(self.receipts('granted')[0]['expires'], grant['expires'])
+        self.assertEqual(da.BACKFILL_GRANT_S, 600)
+        self.blocker_proc.kill()
+        self.blocker_proc.wait()
+        with backfill():
+            self.advance()
+        head = self.entries()[self.head]['grant']
+        self.assertEqual(da._parse_time(head['expires']) - da._parse_time(head['at']), timedelta(seconds=da.QUEUE_GRANT_S))
+
+    def test_the_shorter_window_lapses_and_frees_the_in_flight_counter(self):
+        self.historical()
+        with backfill():
+            self.advance()
+            early = self.advance(now=self.now + timedelta(seconds=da.BACKFILL_GRANT_S - 1))
+            self.assertEqual((early['expired'], self.state(self.docker_a)), ([], 'GRANTED'))
+            late = self.advance(now=self.now + timedelta(seconds=da.BACKFILL_GRANT_S + 1))
+        self.assertEqual(late['expired'], [self.docker_a])
+        self.assertEqual(late['backfilled'], [self.docker_b])
+
+    def test_monitor_and_recovery_read_the_actual_window(self):
+        self.historical()
+        with backfill():
+            self.advance()
+        entry = self.entries()[self.docker_a]
+        self.assertEqual(mon.grant_window_s(entry), da.BACKFILL_GRANT_S)
+        self.assertEqual(mon.escalate_s(entry), int(da.BACKFILL_GRANT_S * mon.GRANT_ESCALATE_FRACTION))
+        verdict = Monitor.classify(self, self.now + timedelta(seconds=mon.escalate_s(entry) - 1))
+        self.assertNotIn('failed-continuation', verdict['causes'])
+        self.assertNotIn('unclaimed-handoff', verdict['causes'])
+        verdict = Monitor.classify(self, self.now + timedelta(seconds=mon.escalate_s(entry) + 1))
+        self.assertIn('failed-continuation', verdict['causes'])
+        env = unittest.mock.Mock(token_fn=da.waiter_token)
+        self.assertEqual(rec._evaluate(entry, env, self.now + timedelta(seconds=rec.NOTICE_S + 1)), (False, ['waiter-alive']))
+
+
+class Lows(Base):
+    def test_off_mode_shadow_judges_a_later_candidate_beside_the_earlier_one(self):
+        self.running('blocker', 'build-crate', [SHARED])                  # 4 slots
+        self.enqueue('head', 'build-crate', [SHARED])                     # 4
+        first = self.enqueue('first', 'build-crate', [LOCAL])             # 4: 4 + 4 + 4 for the head
+        wide = self.enqueue('wide', 'build-workspace', [LOCAL + '-2'], 40, cpus=9)   # alone 4 + 9; beside `first` 4 + 4 + 9 > 16
+        with backfill(enabled=False, cap=2):
+            off = self.advance()
+        self.assertEqual(off['backfill_shadow'], [first])
+        self.assertEqual(self.receipts('backfill-shadow')[0]['memory_gate'], 'not-asked')
+        self.assertEqual(self.state(wide), 'QUEUED')
+        with backfill(cap=2):
+            self.assertEqual(self.advance()['backfilled'], [first], 'the enabled pass agrees with the shadow')
+
+    def test_one_waiter_ps_per_process_per_pass(self):
+        self.historical()
+        asked = {}
+
+        def counting(pid):
+            asked[pid] = asked.get(pid, 0) + 1
+            return da.waiter_token(pid)
+        with backfill(enabled=False, cap=3):
+            self.advance(waiter_token_fn=counting)
+        self.assertTrue(asked)
+        self.assertEqual(max(asked.values()), 1, asked)
+
+    def test_callers_report_the_backfill_revision_from_text(self):
+        with tempfile.TemporaryDirectory() as root:
+            for name, body in (('old', 'RUNNER_PROTOCOL = 2\n'), ('rev9', 'RUNNER_PROTOCOL = 2\nBACKFILL_ENABLED = False\n'),
+                               ('hard', 'RUNNER_PROTOCOL = 2\nBACKFILL_ENABLED = False\nBACKFILL_GRANT_S = 600\n'),
+                               ('on', 'RUNNER_PROTOCOL = 2\nBACKFILL_ENABLED = True\nBACKFILL_GRANT_S = 600\n')):
+                (Path(root) / name / 'scripts').mkdir(parents=True)
+                (Path(root) / name / 'scripts/disk-admission.py').write_text(body + 'raise SystemExit("must not run")\n')
+            rows = {r['checkout']: r['backfill'] for r in mon.inventory(root)}
+        self.assertEqual(rows, {'old': 'absent', 'rev9': 'off', 'hard': 'off-hardened', 'on': 'on-hardened'})
 
 
 if __name__ == '__main__':
