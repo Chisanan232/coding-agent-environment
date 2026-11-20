@@ -203,10 +203,12 @@ def _queued_build(declare, job, proof, session, env, sleep, clock) -> int:
     harness = os.environ.get("LA_CARGO_HARNESS", "claude")
     worktree = os.getcwd()
 
+    capable = runner_requeue_capable()
+
     def enqueue(wait_s, requeue_of=None):
         """(entry id or None, reason, runner reply). The same declaration, job and waiter every time, so a re-queue matches the lost
         entry."""
-        extra = ["--requeue-of", requeue_of] if requeue_of else []
+        extra = (["--requeue-of", requeue_of] if requeue_of else []) + (["--requeue-capable"] if capable else [])
         rc, out = _capture(runner_cmd("queue", "enqueue", *declare, "--ticket", ticket, "--repo", "local-agent", "--worktree",
                                       worktree, "--harness", harness, "--session-id", session, "--again", *extra, "--waiter-pid",
                                       str(os.getpid()), "--wait-s", str(max(wait_s, 60)), "--", *job), env)
@@ -261,6 +263,17 @@ def _queued_build(declare, job, proof, session, env, sleep, clock) -> int:
         if not claimed:
             _capture(runner_cmd("queue", "cancel", "--id", qid, "--session-id", session), env)
         _unregister(registered, qid)      # last: a registry problem can never skip the cancel above
+
+
+def runner_requeue_capable():
+    """True when RUNNER accepts --requeue-capable (and so --requeue-of): this wrapper re-queues a lost backfilled grant, and the runner
+    then lets the entry be backfilled (SPE-176). Read as text, never executed. A runner from an older revision lacks the flag, so it is
+    not passed (no argparse refusal) and the entry is simply never backfilled."""
+    try:
+        with open(RUNNER, "rb") as handle:
+            return b"'--requeue-capable'" in handle.read(4 * 2**20)
+    except OSError:
+        return False
 
 
 def _replaces(requeued, qid):
