@@ -846,6 +846,65 @@ class IncrementalScopeTests(Fixture):
         inc, _ = self.tree()
         self.assertFalse(rl.is_generated_incremental_tree(inc, limit=3))
 
+    SESS = "s-hn0w0a1hoy-0kzvtw0-58velkjf4a000dk65birnb0gs"
+
+    def test_tree_check_lock_and_object_boundaries(self):
+        cases = (("lock 0 bytes", "s-hn0w0a1hoy-0kzvtw0.lock", b"", True),
+                 ("lock 1 byte", "s-hn0w0a1hoy-0kzvtw0.lock", b"x", False))
+        for label, name, data, ok in cases:
+            with self.subTest(case=label):
+                inc, crate = self.tree()
+                (crate / name).write_bytes(data)
+                self.assertEqual(rl.is_generated_incremental_tree(inc), ok)
+        for label, name, ok in (("o 25", "a" * 25 + ".o", True), ("o 24", "a" * 24 + ".o", False),
+                                ("o 26", "a" * 26 + ".o", False), ("o upper", "A" * 25 + ".o", False),
+                                ("empty o", "", False)):
+            with self.subTest(case=label):
+                inc, crate = self.tree()
+                (crate / self.SESS / (name or "a" * 25 + ".o")).write_bytes(b"" if not name else b"x")
+                self.assertEqual(rl.is_generated_incremental_tree(inc), ok)
+
+    def test_tree_check_rejects_uppercase_and_unexpected_suffix_names(self):
+        for label, rename in (("upper crate", lambda c: c.rename(c.parent / c.name.upper())),
+                              ("other suffix", lambda c: (c / self.SESS).rename(c / (self.SESS + "-old"))),
+                              ("upper session", lambda c: (c / self.SESS).rename(c / self.SESS.upper()))):
+            with self.subTest(case=label):
+                inc, crate = self.tree()
+                rename(crate)
+                self.assertFalse(rl.is_generated_incremental_tree(inc))
+
+    def test_tree_check_accepts_rustcs_working_session_suffix(self):
+        inc, crate = self.tree()
+        (crate / self.SESS).rename(crate / (self.SESS + "-working"))   # 22 such dirs exist in the real tree
+        self.assertTrue(rl.is_generated_incremental_tree(inc))
+
+    def test_tree_check_deadline_is_the_only_reason_a_valid_tree_fails(self):
+        def valid(shape):
+            _, inc = self.target(name="tgt-dl-%d" % next(self.tree_ids))
+            shutil.rmtree(inc / "crate-abc")
+            if shape == "outer":
+                for i in range(100):
+                    c = inc / ("c%03d-%013d" % (i, i))
+                    c.mkdir()
+                    (c / "s-hn0w0a1hoy-0kzvtw0.lock").write_text("")
+            else:
+                c = inc / "one-0000000000000"
+                c.mkdir()
+                if shape == "inner":
+                    for i in range(100):
+                        (c / ("s-hn0w0a1hoy-%07d.lock" % i)).write_text("")
+                else:
+                    (c / self.SESS).mkdir()
+                    for i in range(100):
+                        (c / self.SESS / ("%025d.o" % i)).write_text("x")
+            return inc
+
+        for shape in ("outer", "inner", "session"):
+            with self.subTest(shape=shape):
+                inc = valid(shape)
+                self.assertTrue(rl.is_generated_incremental_tree(inc, seconds=100, clock=lambda: 0))
+                self.assertFalse(rl.is_generated_incremental_tree(inc, seconds=-1, clock=lambda: 0))
+
     def test_never_class_a_even_with_a_private_receipt(self):
         _, inc = self.target()
         receipt(inc, private=True)
