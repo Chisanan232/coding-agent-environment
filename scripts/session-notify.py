@@ -281,7 +281,8 @@ FIELDS_SCHEMA = v_obj({"state": v_str(200), "repo": _OPT_STR, "ticket": _OPT_STR
                        "detail": v_opt(v_str(160, AUTH_DETAIL)),
                        "notice": v_opt(v_enum(("test",))), "incident_ref": v_opt(v_str(64, SPOOL_REF))}, required=("state",))
 EMIT_SCHEMA = v_obj({"cause": v_enum(CAUSE_TEXT), "recovery": v_enum(RECOVERY_TEXT), "owner_action": v_enum(OWNER_ACTION_TEXT),
-                     "signature": v_opt(v_str(16, SIGNATURE)), "detail": v_opt(v_str(160, AUTH_DETAIL))}, required=("cause", "recovery", "owner_action"))
+                     "signature": v_opt(v_str(16, SIGNATURE)), "detail": v_opt(v_str(160, AUTH_DETAIL)),
+                     "incident_ref": v_opt(v_str(64, SPOOL_REF))}, required=("cause", "recovery", "owner_action"))
 BACKEND_SCHEMA = v_obj({"status": v_enum(DELIVERY_STATUSES), "attempts": v_int(0, 100), "next_at": v_num(), "code": v_opt(v_str(40))},
                        required=("status", "attempts", "next_at"))
 PENDING_SCHEMA = v_obj({"key": v_str(64, re.compile(r".+")), "cycle": v_int(0, 10**9), "created": v_int(-10**12, 10**12), "fields": FIELDS_SCHEMA,
@@ -536,13 +537,20 @@ def load_config(path=None):
 CONFLICT_PREFIX = "conflict:"
 
 
+def effective_kinds(name, backend):
+    """The notice kinds a `kinds`-routed backend carries: its configured list as it is (an empty list carries nothing), else the default. The guard and the
+    routing both read it here, so they can never disagree."""
+    kinds = (backend or {}).get("kinds")
+    return tuple(kinds) if isinstance(kinds, list) else (SPOOL_KINDS if name == SPOOL_BACKEND else NOTICE_KINDS)
+
+
 def routing_conflict(cfg):
     """Notice kinds that BOTH `telegram` and `zeroclaw-spool` would carry while both are enabled (sorted, empty when the routing is disjoint).
     Each transition goes to one destination only, so the config is rejected rather than guessed at."""
     b = cfg.get("backends") or {}
     if (b.get("telegram") or {}).get("enabled") is not True or (b.get(SPOOL_BACKEND) or {}).get("enabled") is not True:
         return []
-    return sorted(set(b["telegram"].get("kinds") or ()) & set(b[SPOOL_BACKEND].get("kinds") or ()))
+    return sorted(set(effective_kinds("telegram", b["telegram"])) & set(effective_kinds(SPOOL_BACKEND, b[SPOOL_BACKEND])))
 
 
 def notice_kind(fields):
@@ -554,9 +562,9 @@ def backend_routed(name, cfg, fields):
     """False when `kinds` of this backend leaves the notice to another destination (telegram and zeroclaw-spool only)."""
     b = (cfg.get("backends") or {}).get(name) or {}
     if name == SPOOL_BACKEND:
-        return spool_kind(fields) in (b.get("kinds") or ())
+        return spool_kind(fields) in effective_kinds(name, b)
     if name == "telegram":
-        return notice_kind(fields) in (b.get("kinds") or NOTICE_KINDS)
+        return notice_kind(fields) in effective_kinds(name, b)
     return True
 
 
@@ -824,23 +832,27 @@ SPOOL_SCHEMA = v_obj({"schema": v_int(1, 1), "key": v_str(32, SPOOL_KEY), "proje
 LEDGER_SCHEMA = v_obj({"v": v_int(1, 1), "keys": v_map(v_str(32, SPOOL_KEY), v_num(), NOTIFIED_CAP)}, required=("v", "keys"))
 
 
-def spool_kind(notice):
-    """The spool kind of a sanitised notice, or None when this notice has no incident kind (it is then never spooled)."""
-    if notice.get("notice") == "test":
-        return "notify-test"
-    return SPOOL_KIND_OF_CAUSE.get(notice.get("cause"))
-
-
-def spool_event(notice, project, now):
-    """The closed-schema spool document for a sanitised notice, or None. Every word comes from the fixed phrase tables: nothing free-form."""
-    kind = spool_kind(notice)
-    ref = notice.get("incident_ref")
-    if kind is None or not isinstance(ref, str):
+def spool_kind(fields):
+    """The spool kind of sanitised notice fields, or None when this notice has no incident kind (it is then never spooled)."""
+    if not conforms(FIELDS_SCHEMA, fields):
         return None
+    if fields.get("notice") == "test":
+        return "notify-test"
+    return SPOOL_KIND_OF_CAUSE.get(fields.get("cause"))
+
+
+def spool_event(fields, project, now):
+    """The closed-schema spool document for sanitised notice fields, or None. Every word comes from the fixed phrase tables: nothing free-form."""
+    if not conforms(FIELDS_SCHEMA, fields):
+        return None
+    kind = spool_kind(fields)
+    if kind is None or not isinstance(fields.get("incident_ref"), str):
+        return None
+    ref = fields["incident_ref"]
     if kind == "notify-test":
         transition, severity, progress, action = "test", "info", "delivery test notice", "no action needed"
     else:
-        cause, recovery, owner_action = notice.get("cause"), notice.get("recovery"), notice.get("owner_action")
+        cause, recovery, owner_action = fields.get("cause"), fields.get("recovery"), fields.get("owner_action")
         if cause not in CAUSE_TEXT or recovery not in RECOVERY_TEXT or owner_action not in OWNER_ACTION_TEXT:
             return None
         transition = "recovered" if kind == "recovered" else "escalated" if recovery in SPOOL_ESCALATING_RECOVERY else "opened"
@@ -1287,7 +1299,7 @@ class Engine:
                     state = "IDLE" if req["cause"] == "signin-recovered" else "BLOCKED_RESOURCE"
                     self.set_state(rec, state, "resource-stall", now, cp, notify=False)
                     extra = {"cause": req["cause"], "recovery": req["recovery"], "owner_action": req["owner_action"], "detail": req.get("detail"),
-                             "incident_ref": "inc:" + (req.get("signature") or hashlib.sha256(req["cause"].encode()).hexdigest()[:16])}
+                             "incident_ref": req.get("incident_ref") or "inc:" + (req.get("signature") or hashlib.sha256(req["cause"].encode()).hexdigest()[:16])}
                     queued = self.enqueue(rec, state, "resource-stall", now, extra_key=req["cause"] + ":" + (req.get("signature") or ""), extra=extra,
                                           strict=strict)
                     tracked = next((p for p in rec["pending"] if p["key"] == self.last_key), None)
@@ -1533,7 +1545,8 @@ def cmd_emit_resource(args):
     cfg, problem = load_config()
     if config_rejected(problem):
         return 2
-    req = {"cause": args.cause, "recovery": args.recovery, "owner_action": args.owner_action, "signature": args.signature, "detail": args.detail}
+    req = {"cause": args.cause, "recovery": args.recovery, "owner_action": args.owner_action, "signature": args.signature, "detail": args.detail,
+           "incident_ref": args.incident_ref}
     engine = Engine(state_dir(), cfg)
     result = engine.emit_resource(req, clear=args.clear, strict=args.strict, scope=args.scope)
     print(f"emit-resource: {result}" + (f" delivery={engine.last_delivery}" if engine.last_delivery else ""))
@@ -1553,6 +1566,12 @@ def cmd_test_notice(args):
 def signature_arg(text):
     if not SIGNATURE.fullmatch(text):
         raise argparse.ArgumentTypeError("--signature must be 16 lowercase hex characters")
+    return text
+
+
+def incident_ref_arg(text):
+    if not SPOOL_REF.fullmatch(text):
+        raise argparse.ArgumentTypeError("--incident-ref must be 1..64 characters of a-z 0-9 . _ : -")
     return text
 
 
@@ -1605,6 +1624,7 @@ def main(argv=None):
     for opt, table in (("cause", CAUSE_TEXT), ("recovery", RECOVERY_TEXT), ("owner-action", OWNER_ACTION_TEXT)):
         e.add_argument(f"--{opt}", choices=sorted(table))
     e.add_argument("--signature", type=signature_arg)
+    e.add_argument("--incident-ref", type=incident_ref_arg, help="stable id of the incident across its transitions (spool backend); default inc:<signature>")
     e.add_argument("--detail", type=detail_arg, help="sign-in causes only: closed charset, at most 160 characters")
     e.add_argument("--scope", choices=("admission", "auth"), default="admission", help="with --clear: which synthetic session returns to IDLE")
     e.add_argument("--strict", action="store_true", help="a no-backend outcome leaves no dedup record, so a retry after a backend is enabled still notifies")

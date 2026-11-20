@@ -273,6 +273,11 @@ def incident_signature(key, phase):
     return hashlib.sha256(('%s:%s' % (key, phase)).encode()).hexdigest()[:16]
 
 
+def incident_ref(key):
+    """Stable across every phase of one incident (unlike the signature): the id the ZeroClaw spool files of its transitions share."""
+    return 'inc:' + hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
 def lapsed_handoffs(entries, events, now, recorded_only=False):
     """Hand-off entries whose grant lapsed with no claim or holder, within LAPSE_WINDOW_S. Includes a GRANTED entry whose window ended but
     which no queue-aware command has yet recorded as EXPIRED (unless `recorded_only`: after a clock step only the scheduler's own EXPIRED counts).
@@ -920,6 +925,8 @@ def session_notify_incident(alert, runner=None):
     actions = alert.get('recovery') or []
     argv = [sys.executable, str(HERE / 'session-notify.py'), 'emit-resource', '--cause', alert['cause'], '--recovery', recovery_phrase(actions, False),
             '--owner-action', alert.get('owner_action') or 'inspect-admission-state', '--signature', alert['signature'], '--strict']
+    if alert.get('incident_ref'):
+        argv += ['--incident-ref', alert['incident_ref']]
     try:
         done = (runner or subprocess.run)(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
@@ -1452,8 +1459,8 @@ def incident_alert(key, rec, wall):
         cause, recovery = 'workload-over-deadline', []
     else:
         cause, recovery = 'unclaimed-handoff', [{'handoff': 'lapsed'}] if rec['phase'] == 'lapsed' else []
-    return {'cause': cause, 'causes': [cause], 'signature': incident_signature(key, rec['phase']), 'detail': {'phase': rec['phase']}, 'recovery': recovery,
-            'owner_action': OWNER_ACTION[cause], 'blocked_for_s': int(wall - rec['grant_wall'])}
+    return {'cause': cause, 'causes': [cause], 'signature': incident_signature(key, rec['phase']), 'incident_ref': incident_ref(key), 'detail': {'phase': rec['phase']},
+            'recovery': recovery, 'owner_action': OWNER_ACTION[cause], 'blocked_for_s': int(wall - rec['grant_wall'])}
 
 
 def new_incident(entry_id, phase, started, expires, wall, deadline, clock, blocker):
