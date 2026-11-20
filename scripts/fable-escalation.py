@@ -34,11 +34,14 @@ APPROVAL_TTL_S = 24 * 3600  # an approval older than this is stale and must be a
 CONSULT_TIMEOUT_S = 900
 CONSULT_BUDGET_USD = "4"  # client-side list-price cap per consult (runbook), not billed money
 MIN_ATTEMPTS = 2
-CAUSES = {"none", "queue_delay", "ci_unavailable", "missing_permission", "external_outage"}
+CAUSES = {"none", "queue_delay", "ci_unavailable", "missing_permission", "external_outage", "owner_decision"}
 # A failure text that names one of these is infrastructure or permission, never a reasoning blocker, whatever `cause` says.
 EXCLUDED_TEXT = re.compile(r"CI_UNAVAILABLE_EXTERNAL|HARNESS_PERMISSION_BLOCK|spending limit|billing limit|quota|permission .{0,30}denied|"
                            r"denied.{0,20}permission|not permitted|forbidden|unauthori[sz]ed|EACCES|\bHTTP/?[0-9. ]*(40[13]|50[23])\b|overloaded|"
                            r"queue(d)? (delay|wait)|outage|ECONNRESET|rate.?limit|runner unavailable|"
+                           r"owner[- ](held|decision|action|approval|only)\b|(requires?|needs?) (an? |the )?owner (decision|action|approval|to)\b|only the owner\b|"
+                           r"credentials? (is|are) (missing|unavailable|inaccessible) .{0,30}(provision|owner|account)|"
+                           r"not satisfiable (with|under) (the )?current authori[sz]ation|"
                            r"(gateway|connect(ion)?|network|request) time[sd]? ?-?out", re.I)
 # Any of these set means the call may not use the included subscription. Presence only; the values are never read or printed.
 API_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_FOUNDRY_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
@@ -95,6 +98,11 @@ def _write(path, data, text=False):
 
 def _norm(text):
     return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def _approach_key(text):
+    """Two approaches that use the same words in another order are one approach, not two."""
+    return " ".join(sorted(set(re.findall(r"\w+", _norm(text)))))
 
 
 def fingerprint(target, acceptance_check):
@@ -185,7 +193,7 @@ def evaluate(case, directory=None):
     opus = [a for a in attempts if "opus" in _norm(a.get("model"))]
     by_failure = {}
     for a in opus:
-        by_failure.setdefault(_norm(a.get("failure")), set()).add(_norm(a.get("approach")))
+        by_failure.setdefault(_norm(a.get("failure")), set()).add(_approach_key(a.get("approach")))
     if any(f and len(approaches - {""}) >= MIN_ATTEMPTS for f, approaches in by_failure.items()):
         trigger = "two_distinct_attempts_same_failure"
     review = case.get("review") or {}
@@ -214,6 +222,11 @@ def evaluate(case, directory=None):
 
 
 # --- offer / answer ----------------------------------------------------------------------------------------------------
+
+def default_ask_dir():
+    # The pending-ASK ledger the rest of the workflow reads; an unset override must not silently skip the record.
+    return os.environ.get("ASK_PENDING_DIR") or os.path.join(os.path.expanduser("~"), ".cache", "coding-agent-environment", "asks")
+
 
 def _ask_pending():
     here = os.path.dirname(os.path.abspath(__file__))
@@ -249,6 +262,7 @@ def _ledger_packet(record, session_id, ask_dir, at):
     ledger = None
     if ask_dir:
         try:
+            os.makedirs(ask_dir, mode=0o700, exist_ok=True)
             ap = _ask_pending()
             item, _new = ap.record_decision(ask_dir, "Fable consult: " + record["blocker"][:150], record["target"], session_id, [],
                                             "owner_approval", record["id"], ap.GRACE_MAX_S, "unknown", at)
@@ -293,12 +307,13 @@ def answer(directory, blocker_id, decision, ref, session_id, ask_dir, at):
         save(directory, record)
         receipt(directory, "answered", record, decision=decision)
     if ask_dir:
-        ap = _ask_pending()
         try:
+            os.makedirs(ask_dir, mode=0o700, exist_ok=True)
+            ap = _ask_pending()
             ap.finish(ask_dir, ap.item_key("DECISION: Fable consult: " + record["blocker"][:150], record["target"], "decision"),
                       "answered" if decision == "approve" else "denied", ref if decision == "approve" else None, at,
                       session_id=session_id)
-        except ap.AskError:
+        except Exception:  # noqa: BLE001 - the answer is already saved; a ledger that cannot be written must not make it look failed
             pass  # the ledger is visibility only; this record is the authority for the consult
     return record
 
@@ -310,7 +325,18 @@ def _attempt_path(directory, blocker_id):
     return os.path.join(directory, "attempts", blocker_id + ".json")
 
 
+def _uncounted(args):
+    return bool(args.get("cause") and args["cause"] != "none") or bool(EXCLUDED_TEXT.search(args.get("failure") or ""))
+
+
 def attempt(directory, args, session_id, ask_dir, at):
+    out = _attempt(directory, args, session_id, ask_dir, at)
+    if (args.get("approach") or args.get("failure")) and _uncounted(args):
+        out["note"] = "this attempt was not counted: queue, CI-availability, permission or outage trouble cannot trigger an offer"
+    return out
+
+
+def _attempt(directory, args, session_id, ask_dir, at):
     """What the development loop calls after every failed attempt. Never blocks and never raises for a normal outcome.
 
     Returns {"action": ...}: CONTINUE (do nothing, keep working), ASK_OWNER (ask once now, with `packet`), CONSULT_APPROVED (the owner
@@ -322,7 +348,7 @@ def attempt(directory, args, session_id, ask_dir, at):
     if not SESSION_RE.fullmatch(session_id or ""):
         return {"action": "CONTINUE", "reason": "--session is required (letters, digits, . _ : -)"}
     bid = fingerprint(target, check)
-    excluded = bool(args.get("cause") and args["cause"] != "none") or bool(EXCLUDED_TEXT.search(args.get("failure") or ""))
+    excluded = _uncounted(args)
     with locked(directory):
         path = _attempt_path(directory, bid)
         try:
@@ -354,9 +380,14 @@ def attempt(directory, args, session_id, ask_dir, at):
             state = existing["state"]
             if state == APPROVED and breaker(directory).get("open"):
                 return {"action": "CONTINUE", "id": bid, "reason": "approved, but the circuit breaker is open: no consult, no prompt"}
-            if state == APPROVED and (at - parse(existing["answered"])).total_seconds() > APPROVAL_TTL_S:
-                return {"action": "CONTINUE", "id": bid,
-                        "reason": "approval is older than 24h: no consult and no new prompt for this blocker; continue without Fable"}
+            if state == APPROVED:
+                try:
+                    age = (at - parse(existing["answered"])).total_seconds()
+                except (KeyError, TypeError, ValueError):
+                    return {"action": "CONTINUE", "id": bid, "reason": "approval record is unreadable: no consult and no new prompt"}
+                if age > APPROVAL_TTL_S:
+                    return {"action": "CONTINUE", "id": bid,
+                            "reason": "approval is older than 24h: no consult and no new prompt for this blocker; continue without Fable"}
             if state == APPROVED:
                 return {"action": "CONSULT_APPROVED", "id": bid, "next": "run `consult --id` once, then implement and verify"}
             return {"action": "CONTINUE", "id": bid, "reason": f"blocker already {state}: no new prompt, keep working on independent tasks"}
@@ -424,7 +455,11 @@ def consult(directory, blocker_id, execute, cwd, at):
             raise EscalationError("circuit breaker open: " + str(breaker(directory).get("reason")))
         if record["state"] != APPROVED:
             raise EscalationError(f"blocker is {record['state']}: a consult runs only from a recorded approval, once")
-        if (at - parse(record["answered"])).total_seconds() > APPROVAL_TTL_S:
+        try:
+            approval_age = (at - parse(record["answered"])).total_seconds()
+        except (KeyError, TypeError, ValueError):
+            raise EscalationError("approval record is unreadable: no consult")
+        if approval_age > APPROVAL_TTL_S:
             raise EscalationError("approval is older than 24h: offer again after revalidating the blocker")
         if any(os.environ.get(name) for name in API_ENV):
             raise EscalationError("an API credential is present in the environment: refusing, the route is the subscription only")
@@ -517,13 +552,13 @@ def main(argv=None):
         s.add_argument("--case", required=True, help="JSON file describing the blocker")
         if name == "offer":
             s.add_argument("--session", required=True)
-            s.add_argument("--ask-dir", default=os.environ.get("ASK_PENDING_DIR") or None)
+            s.add_argument("--ask-dir", default=default_ask_dir())
     s = sub.add_parser("answer")
     s.add_argument("--id", required=True)
     s.add_argument("--decision", required=True, choices=("approve", "decline"))
     s.add_argument("--ref", required=True)
     s.add_argument("--session", required=True)
-    s.add_argument("--ask-dir", default=os.environ.get("ASK_PENDING_DIR") or None)
+    s.add_argument("--ask-dir", default=default_ask_dir())
     s = sub.add_parser("consult")
     s.add_argument("--id", required=True)
     s.add_argument("--execute", action="store_true", help="without it: print the command shape only")
@@ -548,7 +583,7 @@ def main(argv=None):
     s.add_argument("--review-position", action="append")
     s.add_argument("--review-unresolved", action="store_true")
     s.add_argument("--review-resolved", action="store_true", help="clear a review disagreement that has been settled")
-    s.add_argument("--ask-dir", default=os.environ.get("ASK_PENDING_DIR") or None)
+    s.add_argument("--ask-dir", default=default_ask_dir())
     s = sub.add_parser("show", help="print the packet of an OFFERED blocker again (never asks, never changes state)")
     s.add_argument("--id", required=True)
     sub.add_parser("report")

@@ -171,6 +171,194 @@ class Grant(QueueBase):
         self.assertFalse(da.queue_cancel(self.path, 'q999999', now=self.now)['ok'])
 
 
+class GrantNeedsMemory(QueueBase):
+    """A grant is only worth making when the claim that follows can pass the memory gate (SPE-175)."""
+
+    def advance_with(self, memory_fn, free=400 * GIB, now=None):
+        return da.queue_advance(self.path, lambda: free, now=now or self.now, memory_fn=memory_fn)
+
+    def test_refusal_grants_nothing_and_keeps_fifo(self):
+        a, b = self.enqueue('HORO-2070'), self.enqueue('HORO-2071')
+        out = self.advance_with(lambda: (False, 'REFUSE heavy | hysteresis: recovering (0/3)'))
+        self.assertEqual(out['granted'], [])
+        self.assertTrue(out['reason'].startswith('memory-gate: '), out)
+        self.assertEqual(self.states(), ['QUEUED', 'QUEUED'])
+        self.assertFalse((self.path.parent / 'queue/granted' / a['id']).exists())
+        out = self.advance_with(lambda: (True, 'ADMIT'))
+        self.assertEqual(out['granted'], [a['id']])     # the head, never the later entry
+        self.assertEqual(self.states(), ['GRANTED', 'QUEUED'])
+        self.assertNotIn(b['id'], out['granted'])
+
+    def test_admission_grants_like_before_and_asks_the_gate_once(self):
+        a = self.enqueue('HORO-2070')
+        calls = []
+        out = self.advance_with(lambda: calls.append(1) or (True, 'ADMIT'))
+        self.assertEqual((out['granted'], len(calls)), ([a['id']], 1))
+
+    def test_gate_is_not_asked_when_no_grant_is_possible(self):
+        self.enqueue('HORO-2070')
+        calls = []
+        out = self.advance_with(lambda: calls.append(1) or (True, 'ADMIT'), free=110 * GIB)   # 20 GiB request would break the 100 GiB floor
+        self.assertEqual((out['granted'], calls), ([], []))
+        self.assertEqual(self.states(), ['QUEUED'])
+        self.assertEqual(self.advance_with(lambda: calls.append(1) or (True, 'ADMIT'), free=5 * GIB)['granted'], [])
+        self.assertEqual(calls, [])                      # emergency tier: still no gate call
+
+    def test_refusal_still_expires_a_lapsed_grant_and_does_not_hand_its_lane_on(self):
+        a, b = self.enqueue('HORO-2070'), self.enqueue('HORO-2071')
+        self.advance()
+        out = self.advance_with(lambda: (False, 'REFUSE'), now=self.now + timedelta(hours=2))
+        self.assertEqual((out['expired'], out['granted']), ([a['id']], []))
+        self.assertEqual(self.states(), ['EXPIRED', 'QUEUED'])
+
+    def test_the_two_passes_write_one_shadow_budget_receipt_per_decision(self):
+        host = {'ram': 128 * GIB, 'used': 20 * GIB, 'cores': 16, 'load1': 0.0, 'time': self.now, 'window_s': 2.0, 'rows': {},
+                'rows_prev': {}, 'workloads': [], 'band': 'GREEN'}
+
+        def budget_receipts():
+            lines = (self.path.parent / 'queue/receipts.jsonl').read_text().splitlines()
+            return len([line for line in lines if '"shadow-budget"' in line])
+
+        def advance_once(memory_fn):
+            self.path = Path(self.temp.name).resolve() / ('state-%s/admission/state.json' % ('memory' if memory_fn else 'library'))
+            self.enqueue('HORO-2070')
+            da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, host_fn=lambda: host, memory_fn=memory_fn)
+            return budget_receipts()
+
+        library = advance_once(None)
+        self.assertGreaterEqual(library, 1)
+        self.assertEqual(advance_once(lambda: (True, 'ADMIT')), library)        # one receipt per decision, same as without the gate
+        self.assertEqual(advance_once(lambda: (False, 'REFUSE')), library)
+
+    def test_no_memory_fn_keeps_the_library_behaviour(self):
+        a = self.enqueue('HORO-2070')
+        self.assertEqual(self.advance()['granted'], [a['id']])
+
+
+class GrantStamp(QueueBase):
+    """Every grant names the runner that made it and whether the memory gate vouched for it (SPE-176: outdated-caller detection)."""
+
+    def advance_with(self, memory_fn):
+        return da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, memory_fn=memory_fn)
+
+    def grant_of(self, entry):
+        return next(e for e in da._queue_entries(self.path)[0] if e['id'] == entry['id'])['grant']
+
+    def granted_receipt(self):
+        lines = [json.loads(l) for l in (self.path.parent / 'queue/receipts.jsonl').read_text().splitlines()]
+        return [l for l in lines if l.get('event') == 'granted'][0]
+
+    def test_the_grant_object_stays_exactly_at_and_expires(self):
+        # A hand-off consumer validates the grant as a closed key set; two extra keys made the HORO-2139 executor refuse it (2026-11-19).
+        a = self.enqueue('HORO-2070')
+        self.advance_with(lambda: (True, 'ADMIT'))
+        self.assertEqual(set(self.grant_of(a)), {'at', 'expires'})
+        self.advance()      # also without the memory gate
+        self.assertEqual(set(self.grant_of(a)), {'at', 'expires'})
+
+    def test_the_runner_and_memory_gate_stamp_goes_in_the_granted_receipt(self):
+        self.enqueue('HORO-2070')
+        self.advance_with(lambda: (True, 'ADMIT'))
+        receipt = self.granted_receipt()
+        self.assertEqual(receipt['runner']['protocol'], da.RUNNER_PROTOCOL)
+        self.assertEqual(receipt['runner']['checkout'], Path(da.__file__).resolve().parent.parent.name)
+        self.assertEqual(receipt['memory_gate'], 'admitted')
+
+    def test_a_library_grant_without_a_gate_says_so_in_the_receipt(self):
+        self.enqueue('HORO-2070')
+        self.advance()
+        self.assertEqual(self.granted_receipt()['memory_gate'], 'not-asked')
+
+
+class HandoffWindow(QueueBase):
+    """SPE-176 / ADR 0019: an entry without a declared waiter is a manual hand-off with a bounded 20 minute grant window."""
+
+    def waiter_entry(self, ticket):
+        proc = subprocess.Popen(['/bin/sleep', '300'], stdin=subprocess.DEVNULL)
+        self.holders.append(proc)
+        qid = self.enqueue(ticket=ticket, waiter_pid=proc.pid, ancestor_fn=lambda pid: True)['id']
+        return qid
+
+    def grant(self, qid):
+        return next(e for e in da._queue_entries(self.path)[0] if e['id'] == qid)['grant']
+
+    def seconds(self, qid):
+        grant = self.grant(qid)
+        return (da._parse_time(grant['expires']) - da._parse_time(grant['at'])).total_seconds()
+
+    def test_handoff_entry_gets_the_bounded_window_and_expires_then(self):
+        a = self.enqueue('HORO-2070')
+        self.advance()
+        self.assertEqual(da.HANDOFF_GRANT_S, 1200)
+        self.assertEqual(self.seconds(a['id']), 1200)
+        receipt = [json.loads(l) for l in (self.path.parent / 'queue/receipts.jsonl').read_text().splitlines()]
+        granted = [r for r in receipt if r.get('event') == 'granted'][0]
+        self.assertEqual(granted['expires'], self.grant(a['id'])['expires'])
+        marker = json.loads((self.path.parent / 'queue/granted' / a['id']).read_text())
+        self.assertEqual(marker['expires'], self.grant(a['id'])['expires'])
+        self.assertEqual(self.advance(now=self.now + timedelta(seconds=1199))['expired'], [])
+        self.assertEqual(self.advance(now=self.now + timedelta(seconds=1200))['expired'], [a['id']])
+
+    def test_waiter_entry_keeps_the_full_window(self):
+        qid = self.waiter_entry('HORO-2070')
+        self.advance()
+        self.assertEqual(self.seconds(qid), da.QUEUE_GRANT_S)
+
+    def test_fifo_order_holds_when_a_handoff_lapses(self):
+        a, b = self.enqueue('HORO-2070'), self.enqueue('HORO-2071')
+        self.assertEqual(self.advance()['granted'], [a['id']])
+        out = self.advance(now=self.now + timedelta(seconds=1200))
+        self.assertEqual(out['expired'], [a['id']])
+        self.assertEqual(out['granted'], [b['id']])
+        self.assertEqual(self.states(), ['EXPIRED', 'GRANTED'])
+
+    def test_claim_inside_the_window_still_works(self):
+        a = self.enqueue('HORO-2070')
+        self.advance()
+        proc = subprocess.Popen(['/bin/sleep', '300'], stdin=subprocess.DEVNULL)
+        self.holders.append(proc)
+        out = da.queue_claim(self.path, a['id'], 'nda-horo-2070', 20 * GIB, ['cargo', 'nextest', 'run', '--token', SECRET_ARG], str(self.worktree), lambda: 400 * GIB,
+                             pid=proc.pid, now=self.now + timedelta(seconds=1100), memory_fn=lambda: (True, 'ok'),
+                             exec_fn=lambda program, args: None)
+        self.assertTrue(out['ok'], out)
+        self.assertEqual(self.entries()[a['id']]['state'], 'CLAIMED')
+
+    def test_grant_key_set_is_at_and_expires(self):
+        a = self.enqueue('HORO-2070')
+        self.advance()
+        self.assertEqual(set(self.grant(a['id'])), {'at', 'expires'})
+
+    def test_explicit_smaller_grant_window_wins(self):
+        a = self.enqueue('HORO-2070')
+        da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, grant_s=300)
+        self.assertEqual(self.seconds(a['id']), 300)
+        w = self.waiter_entry('HORO-2071')
+        da.queue_cancel(self.path, a['id'], now=self.now)
+        da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, grant_s=300)
+        self.assertEqual(self.seconds(w), 300)
+
+
+class MemoryPreconditionText(unittest.TestCase):
+    """The refusal text a claim or advance reports must carry the gate's reason, not only its metrics line (SPE-175)."""
+
+    def run_gate(self, stdout, rc):
+        done = subprocess.CompletedProcess([], rc, stdout=stdout, stderr='')
+        with unittest.mock.patch.object(da.subprocess, 'run', lambda *a, **k: done):
+            return da._memory_precondition()
+
+    def test_refusal_carries_the_reason_line(self):
+        admitted, text = self.run_gate('REFUSE heavy | pressure=1 swapIO=0.0MiB/s compressor=28% load/core=0.5\n'
+                                       '  reason: hysteresis: recovering (0/3 good checks >= 30s apart); exit blocked by compressor 28% > exit 25%\n', 77)
+        self.assertFalse(admitted)
+        self.assertIn('compressor=28%', text)
+        self.assertIn('exit blocked by compressor 28% > exit 25%', text)
+
+    def test_admission_and_empty_output_keep_their_meaning(self):
+        self.assertEqual(self.run_gate('ADMIT heavy | pressure=1 swapIO=0.0MiB/s compressor=5% load/core=0.5\n', 0),
+                         (True, 'ADMIT heavy | pressure=1 swapIO=0.0MiB/s compressor=5% load/core=0.5'))
+        self.assertEqual(self.run_gate('', 77), (False, 'memory gate exit 77'))
+
+
 class NoDoubleBooking(QueueBase):
     def test_plain_reserve_is_refused_behind_the_queue(self):
         self.enqueue()
@@ -712,9 +900,11 @@ class ClaimCli(QueueBase):
 
 
 class Cli(QueueBase):
+    memory = (True, 'ok')
+
     def run_cli(self, *argv):
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        with contextlib.redirect_stdout(out), unittest.mock.patch.object(da, '_memory_precondition', lambda: self.memory):
             rc = da.run(list(argv), state_path=self.path, free_fn=lambda: 400 * GIB)
         return rc, out.getvalue()
 
@@ -734,6 +924,21 @@ class Cli(QueueBase):
         self.assertNotIn(SECRET_ARG, out)
         self.assertEqual(self.run_cli('queue', 'cancel', '--id', qid)[0], 0)
         self.assertNotEqual(self.run_cli('queue', 'cancel', '--id', 'q999999')[0], 0)
+
+    def test_advance_cli_grants_nothing_while_the_memory_gate_refuses(self):
+        rc, out = self.run_cli('queue', 'enqueue', '--label', 'nda-horo-2070', '--ticket', 'HORO-2070', '--repo', 'horonom/nda',
+                               '--worktree', str(self.worktree), '--harness', 'codex',
+                               '--session-id', '0b1d2e3f-aaaa-bbbb-cccc-1234567890ab', '--bytes', str(20 * GIB), '--', 'cargo', 'test')
+        qid = json.loads(out)['id']
+        self.memory = (False, 'REFUSE heavy | hysteresis: recovering (0/3)')
+        rc, out = self.run_cli('queue', 'advance')
+        result = json.loads(out)
+        self.assertEqual((rc, result['ok'], result['granted']), (0, True, []))
+        self.assertTrue(result['reason'].startswith('memory-gate: '), result)
+        entry = [e for e in json.loads(self.run_cli('queue', 'status', '--json')[1])['entries'] if e['id'] == qid][0]
+        self.assertEqual(entry['state'], 'QUEUED')
+        self.memory = (True, 'ok')
+        self.assertEqual(json.loads(self.run_cli('queue', 'advance')[1])['granted'], [qid])
 
 
 DETACHER = """
@@ -901,6 +1106,211 @@ class DetachedWorkload(QueueBase):
         holder = json.loads((self.path.parent / 'queue' / (a + '.json')).read_text())['holder']
         self.assertGreaterEqual(holder['workload']['refreshes'], 1)
         self.assertIn(child, [m['pid'] for m in holder['workload']['members']])
+
+
+class WaiterAndClaimReceipts(QueueBase):
+    """SPE-176: a waiter that is gone frees its place; a refused claim leaves a rate-limited receipt."""
+    ARGV = ['cargo', 'nextest', 'run', '--token', SECRET_ARG]
+
+    def waiter(self):
+        proc = subprocess.Popen(['/bin/sleep', '300'], stdin=subprocess.DEVNULL)
+        self.holders.append(proc)
+        return proc
+
+    def enqueue_waited(self, proc, ticket='HORO-2070', **extra):
+        out = self.enqueue(ticket=ticket, waiter_pid=proc.pid, ancestor_fn=lambda pid: True, **extra)
+        self.assertTrue(out['ok'], out)
+        return out['id']
+
+    def advance_out(self, **kwargs):
+        return da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, **kwargs)
+
+    def receipts(self):
+        return [json.loads(line) for line in (self.path.parent / 'queue/receipts.jsonl').read_text().splitlines()]
+
+    def test_waiter_is_stored_with_its_start_token(self):
+        proc = self.waiter()
+        qid = self.enqueue_waited(proc)
+        self.assertEqual(self.entries()[qid]['waiter'], {'pid': proc.pid, 'start_token': da.waiter_token(proc.pid)})
+
+    def test_no_waiter_field_without_the_flag(self):
+        qid = self.enqueue()['id']
+        self.assertNotIn('waiter', self.entries()[qid])
+
+    def test_dead_waiter_cancels_a_granted_entry_once_and_frees_the_lane(self):
+        proc = self.waiter()
+        a = self.enqueue_waited(proc, 'HORO-2070')
+        b = self.enqueue('HORO-2071')['id']
+        self.assertEqual(self.advance_out()['granted'], [a])
+        self.assertEqual(self.states(), ['GRANTED', 'QUEUED'])
+        proc.kill()
+        proc.wait()
+        out = self.advance_out()
+        self.assertEqual((out['cancelled'], out['granted']), ([a], [b]))
+        self.assertEqual(self.states(), ['CANCELLED', 'GRANTED'])
+        self.assertFalse((self.path.parent / 'queue/granted' / a).exists())
+        self.assertEqual(self.advance_out()['cancelled'], [])
+        cancelled = [r for r in self.receipts() if r['event'] == 'cancelled']
+        self.assertEqual([(r['id'], r['was'], r['evidence']) for r in cancelled], [(a, 'GRANTED', 'waiter-exited')])
+
+    def test_dead_waiter_cancels_a_queued_entry(self):
+        proc = self.waiter()
+        self.holder('job-1')   # the lane is taken, so the entry stays QUEUED
+        qid = self.enqueue_waited(proc)
+        self.assertEqual(self.states(), ['QUEUED'])
+        proc.kill()
+        proc.wait()
+        self.assertEqual(self.advance_out()['cancelled'], [qid])
+        self.assertEqual(self.states(), ['CANCELLED'])
+
+    def test_live_waiter_changes_nothing(self):
+        proc = self.waiter()
+        qid = self.enqueue_waited(proc)
+        out = self.advance_out()
+        self.assertEqual((out['cancelled'], out['granted']), ([], [qid]))
+        self.assertEqual(self.states(), ['GRANTED'])
+
+    def test_entry_without_waiter_is_never_cancelled(self):
+        self.enqueue()
+        out = self.advance_out(waiter_token_fn=lambda pid: None)   # every process looks gone
+        self.assertEqual(out['cancelled'], [])
+        self.assertEqual(self.states(), ['GRANTED'])
+
+    def test_uninspectable_waiter_is_never_cancelled(self):
+        proc = self.waiter()
+        self.enqueue_waited(proc)
+
+        def broken(pid):
+            raise da.ReservationError('ps failed')
+        out = self.advance_out(waiter_token_fn=broken)
+        self.assertEqual(out['cancelled'], [])
+        self.assertNotEqual(self.states(), ['CANCELLED'])
+
+    def test_reused_pid_with_a_new_start_token_cancels(self):
+        proc = self.waiter()
+        qid = self.enqueue_waited(proc)
+        out = self.advance_out(waiter_token_fn=lambda pid: 'Thu Jan  1 00:00:00 2099')
+        self.assertEqual(out['cancelled'], [qid])
+
+    def test_claimed_entry_is_never_touched_by_the_waiter_rule(self):
+        proc = self.waiter()
+        qid = self.enqueue_waited(proc)
+        self.advance_out()
+        self.assertTrue(self.claim(qid)['ok'])
+        proc.kill()
+        proc.wait()
+        out = self.advance_out()
+        self.assertEqual(out['cancelled'], [])
+        self.assertEqual(self.entries()[qid]['state'], 'CLAIMED')
+
+    def test_non_ancestor_pid_is_refused_at_enqueue(self):
+        proc = self.waiter()
+        out = self.enqueue(waiter_pid=proc.pid)
+        self.assertFalse(out['ok'])
+        self.assertIn('waiter-pid', out['reason'])
+        self.assertEqual(self.entries(), {})
+
+    def test_dead_or_invalid_pid_is_refused_at_enqueue(self):
+        proc = self.waiter()
+        proc.kill()
+        proc.wait()
+        self.assertFalse(self.enqueue(waiter_pid=proc.pid, ancestor_fn=lambda pid: True)['ok'])
+        self.assertFalse(self.enqueue(waiter_pid=0)['ok'])
+        self.assertFalse(self.enqueue(waiter_pid=True)['ok'])
+
+    def test_self_and_parent_are_accepted_as_waiter(self):
+        self.assertTrue(self.enqueue(ticket='HORO-2070', waiter_pid=os.getpid())['ok'])
+        self.assertTrue(self.enqueue(ticket='HORO-2071', waiter_pid=os.getppid())['ok'])
+
+    def test_timezone_change_does_not_cancel_a_live_waiter_but_a_reused_pid_does(self):
+        proc = self.waiter()
+        qid = self.enqueue_waited(proc)
+        stored = self.entries()[qid]['waiter']['start_token']
+        tokyo = da.waiter_token(proc.pid, tz='Asia/Tokyo')
+        self.assertNotEqual(tokyo, stored)                      # the same process renders differently in another zone
+        with unittest.mock.patch.dict(os.environ, {'TZ': 'Asia/Tokyo'}):
+            self.assertEqual(da.waiter_token(proc.pid), stored)  # the waiter token is pinned to UTC
+            self.assertEqual(self.advance_out()['cancelled'], [])
+        self.assertEqual(self.states(), ['GRANTED'])
+        reused = lambda pid: 'Thu Jan  1 00:00:01 2099'          # another process (later start) now answers for the stored pid
+        self.assertEqual(self.advance_out(waiter_token_fn=reused)['cancelled'], [qid])
+
+    def test_real_ancestor_chain_is_accepted_and_an_unrelated_pid_is_refused(self):
+        # Run waiter_identity inside a grandchild of this test process: parent (us) -> child -> grandchild.
+        script = ('import sys,os,json;from importlib.util import module_from_spec,spec_from_file_location as s;'
+                  'sp=s("da",sys.argv[1]);m=module_from_spec(sp);sp.loader.exec_module(m);'
+                  'print(json.dumps([m._waiter_identity(int(a),m.waiter_token,m.process_owner,None)[1] for a in sys.argv[2:]]))')
+        wrapper = ('import subprocess,sys;sys.exit(subprocess.call([sys.executable,"-c",sys.argv[1]]+sys.argv[2:]))')
+        sleeper = self.waiter()
+        dead = self.waiter()
+        dead.kill()
+        dead.wait()
+        out = subprocess.run([sys.executable, '-c', wrapper, script, str(ROOT / 'scripts/disk-admission.py'), str(os.getpid()),
+                              str(sleeper.pid), str(dead.pid)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        accepted, unrelated, gone = json.loads(out.stdout)
+        self.assertIsNone(accepted)                                           # the test process is the grandchild's grandparent
+        self.assertIn('supervising wrapper', unrelated)
+        self.assertIn('not a running process', gone)
+
+    def test_pid_one_and_below_are_rejected(self):
+        for pid in (1, 0, -5):
+            _, why = da._waiter_identity(pid, da.waiter_token, da.process_owner, lambda p: True)
+            self.assertIsNotNone(why, pid)
+        self.assertFalse(self.enqueue(waiter_pid=1, ancestor_fn=lambda p: True)['ok'])
+
+    def test_waiter_pid_flag_is_accepted_by_the_cli(self):
+        job = ['--', 'cargo', 'build']
+        args = da.build_parser().parse_args(['queue', 'enqueue', '--label', 'nda-x', '--ticket', 'HORO-2070', '--repo', 'r',
+                                             '--worktree', str(self.worktree), '--harness', 'codex', '--session-id',
+                                             '0b1d2e3f-aaaa-bbbb-cccc-1234567890ab', '--bytes', str(GIB), '--waiter-pid',
+                                             str(os.getpid())] + job)
+        self.assertEqual(args.waiter_pid, os.getpid())
+
+    def refused(self, qid, minutes, memory_ok=False):
+        return self.claim(qid, now=self.now + timedelta(minutes=minutes), memory_ok=memory_ok)
+
+    def test_claim_refusal_is_receipted_once_per_window_and_kind(self):
+        qid = self.grant()
+        for minutes in (0, 1, 9):
+            out = self.refused(qid, minutes)
+            self.assertEqual((out['ok'], out['exit']), (False, 77))
+        refusals = [r for r in self.receipts() if r['event'] == 'claim-refused']
+        self.assertEqual([(r['id'], r['kind']) for r in refusals], [(qid, 'memory-gate')])
+        self.refused(qid, 11)
+        self.assertEqual([r['kind'] for r in self.receipts() if r['event'] == 'claim-refused'], ['memory-gate'] * 2)
+        self.assertEqual(self.entries()[qid]['state'], 'GRANTED')   # state untouched
+
+    def test_changed_kind_is_receipted_inside_the_window(self):
+        qid = self.grant()
+        self.refused(qid, 0)
+        out = self.claim(qid, now=self.now + timedelta(minutes=1), free=110 * GIB)   # 110 GiB free cannot hold 20 GiB above the floor
+        self.assertEqual(out['exit'], 77)
+        self.assertEqual([r['kind'] for r in self.receipts() if r['event'] == 'claim-refused'], ['memory-gate', 'floor'])
+
+    def test_kind_is_a_fixed_enum_and_receipts_carry_no_argv(self):
+        self.assertEqual({da._claim_refusal_kind(t) for t in (
+            'memory-gate: x', 'over-capacity: y', 'lane-cap: z', 'budget: w', 'grant for q000001 lapsed', 'anything')},
+            {'memory-gate', 'floor', 'lane', 'budget', 'other'})
+        qid = self.grant()
+        self.refused(qid, 0)
+        text = (self.path.parent / 'queue/receipts.jsonl').read_text()
+        self.assertNotIn(SECRET_ARG, text)
+        line = [r for r in self.receipts() if r['event'] == 'claim-refused'][0]
+        self.assertEqual(set(line), {'ts', 'event', 'id', 'label', 'tickets', 'kind'})
+
+    def grant(self):
+        qid = self.enqueue()['id']
+        self.advance()
+        return qid
+
+    ARGV = ['cargo', 'nextest', 'run', '--token', SECRET_ARG]
+
+    def claim(self, qid, now=None, memory_ok=True, free=400 * GIB):
+        return da.queue_claim(self.path, qid, 'nda-horo-2070', 20 * GIB, self.ARGV, str(self.worktree), lambda: free,
+                              pid=os.getpid(), now=now or self.now,
+                              memory_fn=lambda: (True, 'ok') if memory_ok else (False, 'memory pressure'),
+                              exec_fn=lambda program, args: None)
 
 
 if __name__ == '__main__':

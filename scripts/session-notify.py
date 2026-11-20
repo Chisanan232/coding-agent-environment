@@ -5,6 +5,7 @@
   session-notify.py status [--json]              table of tracked sessions (read-only)
   session-notify.py sweep [--now EPOCH]          stale-session detection, delivery retry, old-record cleanup
   session-notify.py checkpoint --state S ...     write the structured checkpoint a session uses to declare its state
+  session-notify.py emit-resource --cause C --recovery R --owner-action A [--signature HEX16 | --clear]   admission-stall notice (enums only)
   session-notify.py render-config [--profile personal|corporate] [--out FILE]
 
 One short-lived process per hook, no daemon. Per-session state lives under
@@ -47,7 +48,7 @@ OWNER_BLOCK_TYPES = {"permission_prompt", "elicitation_dialog", "elicitation_url
 STOP_FAILURE_KINDS = {"rate_limit", "overloaded", "authentication_failed", "oauth_org_not_allowed", "account_on_hold", "billing_error",
                       "invalid_request", "model_not_found", "server_error", "max_output_tokens", "cloud_credential_error", "unknown"}
 END_NOTIFY_REASONS = {"other", "logout"}
-REMOTE_BACKENDS = ("ntfy", "pushover")
+REMOTE_BACKENDS = ("ntfy", "pushover", "telegram")
 BLOCKER_OWNERS = {"owner", "dependency", "resource", "ci", "reviewer", "other"}
 # Everything a notification can say about a resume condition is one of these fixed phrases; there is no free-text field.
 RESUME_TRIGGERS = {"owner_approval": "owner approval", "owner_decision": "owner decision", "dependency_merged": "dependency merged",
@@ -55,7 +56,27 @@ RESUME_TRIGGERS = {"owner_approval": "owner approval", "owner_decision": "owner 
                    "credentials_provided": "credentials provided", "manual_restart": "manual restart", "other": "other"}
 KIND_TEXT = {"STALE": "no heartbeat", "ENDED": "ended while running", "AGENT": "background agent finished"}
 ALLOWED_KINDS = set(KIND_TEXT.values()) | STOP_FAILURE_KINDS
-BACKEND_NAMES = {"macos", "ntfy", "pushover"}
+# Admission-monitor notices (SPE-176): every word of the notification comes from these fixed phrases; no ids, numbers, paths or free text.
+CAUSE_TEXT = {"disk-floor": "disk below floor", "memory-pressure": "memory pressure", "memory-hysteresis-static-compressor": "memory hysteresis, static compressor",
+              "memory-hysteresis": "memory hysteresis", "stale-claim": "stale claim", "frozen-queue": "queue frozen", "failed-continuation": "continuation failed",
+              "unclaimed-handoff": "hand-off grant unclaimed", "queue-wait-excessive": "queue wait excessive", "workload-over-deadline": "workload over deadline",
+              "outdated-caller": "outdated caller", "stalled-running": "running work stalled", "unobservable": "admission unobservable",
+              "state-unreadable": "admission state unreadable"}
+RECOVERY_TEXT = {"none": "none tried", "advance-tried": "queue advance tried", "recovery-exhausted": "recovery exhausted", "observe-only": "observe only",
+                 "lapsed": "grant lapsed", "wait-expiry-near": "wait expiry near"}
+OWNER_ACTION_TEXT = {"reclaim-disk": "reclaim disk", "reduce-load": "reduce load", "approve-memory-policy": "approve memory policy",
+                     "wait-or-approve-memory-policy": "wait or approve memory policy", "confirm-claim-ended": "confirm claim ended",
+                     "restart-waiting-session": "restart waiting session", "restart-outdated-caller": "restart outdated caller",
+                     "inspect-admission-state": "inspect admission state", "inspect-running-workload": "inspect running workload",
+                     "run-queue-advance": "run queue advance", "inspect-memory-admission": "inspect memory admission",
+                     "claim-or-reenqueue-handoff": "claim or re-enqueue hand-off", "check-queued-wait": "check queued wait",
+                     "check-over-deadline-workload": "check over-deadline workload"}
+RESOURCE_SESSION = "admission-monitor"
+QUARANTINE_PROBLEMS = {"corrupt", "not-regular", "too-large", "foreign-owner"}
+RESOURCE_TICKET = "SPE-176"
+RESOURCE_REPO = "coding-agent-environment"
+SIGNATURE = re.compile(r"[0-9a-f]{16}")
+BACKEND_NAMES = {"macos", "ntfy", "pushover", "telegram"}
 DELIVERY_STATUSES = {"pending", "sending", "failed", "sent", "dropped", "skipped"}
 TERMINAL = {"sent", "dropped", "skipped"}
 
@@ -84,6 +105,7 @@ DEFAULT_CONFIG = {
         "macos": {"enabled": False},
         "ntfy": {"enabled": False, "approved_destination": "", "server": "https://ntfy.sh", "topic_env": "NTFY_TOPIC", "topic_file": "", "token_env": "", "token_file": ""},
         "pushover": {"enabled": False, "approved_destination": "", "token_env": "PUSHOVER_APP_TOKEN", "token_file": "", "user_env": "PUSHOVER_USER_KEY", "user_file": ""},
+        "telegram": {"enabled": False, "approved_destination": "", "token_env": "TELEGRAM_BOT_TOKEN", "token_file": "", "chat_id_env": "TELEGRAM_CHAT_ID", "chat_id_file": ""},
     },
 }
 
@@ -211,7 +233,10 @@ CHECKPOINT_SCHEMA = v_tag("state", {
                  required=("schema", "state", "blocker")) for st in BLOCKED}})
 _OPT_STR = v_opt(v_str(200))
 FIELDS_SCHEMA = v_obj({"state": v_str(200), "repo": _OPT_STR, "ticket": _OPT_STR, "pr": v_opt(v_int(0, 10**9)), "blocker_owner": _OPT_STR,
-                       "resume_trigger": _OPT_STR, "kind": _OPT_STR}, required=("state",))
+                       "resume_trigger": _OPT_STR, "kind": _OPT_STR, "cause": v_opt(v_enum(CAUSE_TEXT)),
+                       "recovery": v_opt(v_enum(RECOVERY_TEXT)), "owner_action": v_opt(v_enum(OWNER_ACTION_TEXT))}, required=("state",))
+EMIT_SCHEMA = v_obj({"cause": v_enum(CAUSE_TEXT), "recovery": v_enum(RECOVERY_TEXT), "owner_action": v_enum(OWNER_ACTION_TEXT),
+                     "signature": v_opt(v_str(16, SIGNATURE))}, required=("cause", "recovery", "owner_action"))
 BACKEND_SCHEMA = v_obj({"status": v_enum(DELIVERY_STATUSES), "attempts": v_int(0, 100), "next_at": v_num(), "code": v_opt(v_str(40))},
                        required=("status", "attempts", "next_at"))
 PENDING_SCHEMA = v_obj({"key": v_str(64, re.compile(r".+")), "cycle": v_int(0, 10**9), "created": v_int(-10**12, 10**12), "fields": FIELDS_SCHEMA,
@@ -235,7 +260,8 @@ CONFIG_SCHEMA = {
     "retry": {"max_attempts": v_int(1, 100), "base_seconds": v_int(1, 86400), "max_seconds": v_int(1, 86400)},
     "backends": {"macos": {"enabled": v_bool()},
                  "ntfy": {"enabled": v_bool(), "approved_destination": _S200, "server": _S200, "topic_env": _S200, "topic_file": _S200, "token_env": _S200, "token_file": _S200},
-                 "pushover": {"enabled": v_bool(), "approved_destination": _S200, "token_env": _S200, "token_file": _S200, "user_env": _S200, "user_file": _S200}},
+                 "pushover": {"enabled": v_bool(), "approved_destination": _S200, "token_env": _S200, "token_file": _S200, "user_env": _S200, "user_file": _S200},
+                 "telegram": {"enabled": v_bool(), "approved_destination": _S200, "token_env": _S200, "token_file": _S200, "chat_id_env": _S200, "chat_id_file": _S200}},
 }
 
 
@@ -307,6 +333,9 @@ def sanitize_fields(fields, cfg):
         out["resume_trigger"] = fields["resume_trigger"]
     if fields.get("kind") in ALLOWED_KINDS:
         out["kind"] = fields["kind"]
+    for key, table in (("cause", CAUSE_TEXT), ("recovery", RECOVERY_TEXT), ("owner_action", OWNER_ACTION_TEXT)):
+        if fields.get(key) in table:
+            out[key] = fields[key]
     return out
 
 
@@ -628,7 +657,26 @@ def send_pushover(payload, cfg):
     return http_post("https://api.pushover.net/1/messages.json", data, {"Content-Type": "application/x-www-form-urlencoded"})
 
 
-REAL_TRANSPORTS = {"macos": send_macos, "ntfy": send_ntfy, "pushover": send_pushover}
+TELEGRAM_TOKEN = re.compile(r"[0-9]{3,20}:[A-Za-z0-9_-]{5,100}")
+TELEGRAM_CHAT = re.compile(r"-?[0-9]{1,20}|@[A-Za-z0-9_]{5,64}")
+
+
+def send_telegram(payload, cfg):
+    """Bot API sendMessage over plain https. The token is part of the URL path, so it must never leave this function: http_post returns only
+    fixed codes and any exception is reduced to its type name."""
+    token = read_secret(cfg.get("token_env") or None, cfg.get("token_file") or None)
+    chat = read_secret(cfg.get("chat_id_env") or None, cfg.get("chat_id_file") or None)
+    if (not token or not chat or not TELEGRAM_TOKEN.fullmatch(token) or not TELEGRAM_CHAT.fullmatch(chat)
+            or str(cfg.get("approved_destination", "")).lower() != "api.telegram.org"):
+        return "not-configured"
+    data = urllib.parse.urlencode({"chat_id": chat, "text": payload["title"] + "\n" + payload["body"]}).encode()
+    try:
+        return http_post(f"https://api.telegram.org/bot{token}/sendMessage", data, {"Content-Type": "application/x-www-form-urlencoded"})
+    except Exception as exc:  # noqa: BLE001 - never let exception text (which may embed the URL) escape
+        return f"error-{type(exc).__name__}"[:40]
+
+
+REAL_TRANSPORTS = {"macos": send_macos, "ntfy": send_ntfy, "pushover": send_pushover, "telegram": send_telegram}
 
 
 def backend_allowed(name, cfg, corporate_session):
@@ -646,6 +694,9 @@ def backend_allowed(name, cfg, corporate_session):
 
 def render(fields):
     """Title and body from sanitised fields and fixed phrases only. Identical for every backend: there is no free-text field."""
+    if fields.get("cause") in CAUSE_TEXT and fields.get("recovery") in RECOVERY_TEXT and fields.get("owner_action") in OWNER_ACTION_TEXT:
+        body = f"{CAUSE_TEXT[fields['cause']]} | recovery: {RECOVERY_TEXT[fields['recovery']]} | action: {OWNER_ACTION_TEXT[fields['owner_action']]}"
+        return {"title": "Claude Code: admission stalled", "body": body}
     bits = [fields.get("repo", "unlisted")]
     if fields.get("ticket"):
         bits.append(fields["ticket"])
@@ -665,6 +716,7 @@ def render(fields):
 class Engine:
     def __init__(self, sdir, cfg, transports=None, clock=time.time, sleep=time.sleep):
         self.sdir, self.cfg, self.transports, self.clock, self.sleep = pathlib.Path(sdir), cfg, transports or REAL_TRANSPORTS, clock, sleep
+        self.last_key, self.last_delivery = None, None   # of the latest emit_resource request: its dedup key and what became of its delivery
 
     # -- state machine
     def set_state(self, rec, new, reason, now, cp=None, kind=None, notify=True, force=False, bump=True, extra=None):
@@ -682,10 +734,11 @@ class Engine:
             self.enqueue(rec, new, reason, now, kind, extra=extra)
 
     @staticmethod
-    def seen(rec, base, cycle, now):
-        """Best-effort dedup: a transition is a repeat only while its tombstone is inside DEDUP_WINDOW (and was not evicted by the cap)."""
+    def seen(rec, base, cycle, now, any_cycle=False):
+        """Best-effort dedup: a transition is a repeat only while its tombstone is inside DEDUP_WINDOW (and was not evicted by the cap). For the admission-monitor
+        session (`any_cycle`) a still-pending entry of the same key is a repeat whatever the cycle: a clear bumps the cycle and must not let it be queued twice."""
         got = rec["notified"].get(base)
-        return (got is not None and got[0] >= cycle and got[1] >= now - DEDUP_WINDOW) or any(p["key"] == base and p["cycle"] == cycle for p in rec["pending"])
+        return (got is not None and got[0] >= cycle and got[1] >= now - DEDUP_WINDOW) or any(p["key"] == base and (any_cycle or p["cycle"] == cycle) for p in rec["pending"])
 
     @staticmethod
     def mark_notified(rec, base, cycle, now):
@@ -708,10 +761,11 @@ class Engine:
             rec["dropped"] += 1
             rec["history"] = (rec["history"] + [{"t": int(now), "from": rec["state"], "to": rec["state"], "why": "queue-overflow-dropped"}])[-HISTORY_CAP:]
 
-    def enqueue(self, rec, state, reason, now, kind=None, extra_key="", extra=None):
+    def enqueue(self, rec, state, reason, now, kind=None, extra_key="", extra=None, strict=False):
         t, label, cycle = rec["task"], kind or state, rec["cycle"]
         base = hashlib.sha256("|".join([rec["session_id"], str(t.get("task") or t.get("ticket") or "-"), label, str(t.get("head") or ""), extra_key]).encode()).hexdigest()[:24]
-        if self.seen(rec, base, cycle, now):
+        self.last_key = base
+        if self.seen(rec, base, cycle, now, any_cycle=rec["session_id"] == RESOURCE_SESSION):
             return None
         raw = {"state": "FAILED" if kind == "STALE" else ("SESSION_ENDED" if kind == "ENDED" else ("RUNNING" if kind == "AGENT" else state)),
                "repo": t.get("repo") or rec.get("repo_label"), "ticket": t.get("ticket"), "pr": t.get("pr")}
@@ -730,7 +784,8 @@ class Engine:
             enabled = (self.cfg["backends"][name] or {}).get("enabled") is True
             backends[name] = {"status": "pending" if enabled else "skipped", "attempts": 0, "next_at": 0, "code": None if enabled else "disabled"}
         if not any(b["status"] == "pending" for b in backends.values()):
-            self.mark_notified(rec, base, cycle, now)
+            if not strict:       # strict: nothing was handed to any backend, so a later retry (a backend enabled meanwhile) must not hit a dedup tombstone
+                self.mark_notified(rec, base, cycle, now)
             return None
         self.make_room(rec, now)
         rec["pending"].append({"key": base, "cycle": cycle, "created": int(now), "fields": fields, "backends": backends})
@@ -820,6 +875,8 @@ class Engine:
             return "ignored"  # not an object, or a consumed field has the wrong type/size: nothing is read from it, nothing changes
         ev = raw
         name, sid = ev["hook_event_name"], ev["session_id"]
+        if sid.lower() == RESOURCE_SESSION:  # case-folded: APFS would map Admission-Monitor onto the same file
+            return "ignored"  # reserved for emit-resource: a hook event can neither write nor spoof this record
         path = record_path(self.sdir, sid)
         try:
             with session_lock(path, sleep=self.sleep):
@@ -925,6 +982,63 @@ class Engine:
         if now - rec["last_seen"] >= HEARTBEAT_EVERY or now < rec["last_seen"]:
             rec["last_seen"] = now
 
+    # -- admission-monitor notices
+    def emit_resource(self, req, clear=False, strict=False):
+        """One deduplicated BLOCKED_RESOURCE notice on the synthetic `admission-monitor` session, or (clear) its return to IDLE.
+
+        `req` is an EMIT_SCHEMA-shaped dict. Returns queued, deduped, no-backend, cleared, invalid, busy, error or untrusted:<problem>. Dedup key is cause + signature.
+        """
+        if not clear and not conforms(EMIT_SCHEMA, req):
+            return "invalid"
+        self.last_delivery, self.last_key = None, None
+        sid = RESOURCE_SESSION
+        try:
+            with session_lock(record_path(self.sdir, sid), sleep=self.sleep):
+                rec, problem = load_record(self.sdir, sid)
+                if problem and not (problem in QUARANTINE_PROBLEMS):
+                    return f"untrusted:{problem}"  # transient (e.g. unreadable:<errno>): never destroy state over it
+                if problem:  # the synthetic record only: quarantine it (one kept) and rebuild, so alerting cannot fail forever
+                    log_line(self.sdir, f"state-quarantined {problem} event=emit-resource")
+                    try:
+                        os.replace(record_path(self.sdir, sid), str(record_path(self.sdir, sid)) + ".corrupt")
+                    except OSError:
+                        return f"untrusted:{problem}"
+                    rec = None
+                now = self.clock()
+                if rec is None and clear:
+                    return "cleared"
+                rec = rec or new_record(sid, now)
+                if clear:
+                    self.set_state(rec, "IDLE", "resource-cleared", now, notify=False)
+                    rec["cycle"] += 1  # an in-flight pre-clear notice may still finish and write a tombstone; it is of the old cycle and cannot dedup a recurrence
+                    rec["notified"] = {}  # dedup only suppresses a continuous stall: a recurrence after a clear notifies again
+                    rec["pending"] = [e for e in rec["pending"] if not all(b["status"] in TERMINAL for b in e["backends"].values())]
+                    result = "cleared"
+                else:
+                    resume = "owner_decision" if "approve" in req["owner_action"] else "resource_available"
+                    cp = {"task": RESOURCE_SESSION, "repo": RESOURCE_REPO, "ticket": RESOURCE_TICKET, "blocker_owner": "resource", "resume_trigger": resume}
+                    self.set_state(rec, "BLOCKED_RESOURCE", "resource-stall", now, cp, notify=False)
+                    extra = {"cause": req["cause"], "recovery": req["recovery"], "owner_action": req["owner_action"]}
+                    queued = self.enqueue(rec, "BLOCKED_RESOURCE", "resource-stall", now, extra_key=req["cause"] + ":" + (req.get("signature") or ""), extra=extra,
+                                          strict=strict)
+                    tracked = next((p for p in rec["pending"] if p["key"] == self.last_key), None)
+                    any_backend = any((b or {}).get("enabled") is True for b in self.cfg["backends"].values())
+                    result = "no-backend" if not any_backend else ("queued" if queued else "deduped")
+                self.deliver(rec, now, budget_end=now + 6)
+                if not clear and result != "no-backend":
+                    # What this request's own pending entry looks like after the attempt; an entry that finished in an earlier call is unknown.
+                    states = {b["status"] for b in tracked["backends"].values()} if tracked else set()
+                    self.last_delivery = ("unknown" if tracked is None else "sent" if "sent" in states else
+                                          "pending" if states - TERMINAL else "dropped")
+                save_record(self.sdir, rec)
+                return result
+        except TimeoutError:
+            log_line(self.sdir, "lock-timeout event=emit-resource")
+            return "busy"
+        except OSError as exc:
+            log_line(self.sdir, f"emit-resource os-error errno={exc.errno}")  # errno only: no path reaches stderr
+            return "error"
+
     # -- sweep
     def sweep(self, now=None):
         now = self.clock() if now is None else now
@@ -945,7 +1059,7 @@ class Engine:
                         continue
                     out["sessions"] += 1
                     changed = False
-                    if rec["state"] == "RUNNING" and now - rec["last_seen"] > self.cfg["stale_after_seconds"]:
+                    if rec["state"] == "RUNNING" and sid.lower() != RESOURCE_SESSION and now - rec["last_seen"] > self.cfg["stale_after_seconds"]:
                         self.set_state(rec, "FAILED", "stale-no-heartbeat", now, None, kind="STALE", notify=True)
                         out["stale"] += 1
                         changed = True
@@ -953,7 +1067,7 @@ class Engine:
                     if self.deliver(rec, now):
                         changed = True
                         out["retried"] += pending_before
-                    if rec["state"] in ("SESSION_ENDED", "COMPLETED", "FAILED") and not rec["pending"] and now - rec["last_seen"] > GC_AFTER:
+                    if sid.lower() != RESOURCE_SESSION and rec["state"] in ("SESSION_ENDED", "COMPLETED", "FAILED") and not rec["pending"] and now - rec["last_seen"] > GC_AFTER:
                         # removed while HOLDING the lock; session_lock re-checks the inode, so a waiter that opened the old file retries on the new one
                         for q in (p, p.with_name(p.name + ".lock")):
                             with contextlib.suppress(OSError):
@@ -1090,6 +1204,21 @@ def cmd_checkpoint(args):
     return 0
 
 
+def cmd_emit_resource(args):
+    cfg, _ = load_config()
+    req = {"cause": args.cause, "recovery": args.recovery, "owner_action": args.owner_action, "signature": args.signature}
+    engine = Engine(state_dir(), cfg)
+    result = engine.emit_resource(req, clear=args.clear, strict=args.strict)
+    print(f"emit-resource: {result}" + (f" delivery={engine.last_delivery}" if engine.last_delivery else ""))
+    return 0 if result in ("queued", "deduped", "no-backend", "cleared") else 1
+
+
+def signature_arg(text):
+    if not SIGNATURE.fullmatch(text):
+        raise argparse.ArgumentTypeError("--signature must be 16 lowercase hex characters")
+    return text
+
+
 def cmd_render_config(args):
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     cfg["profile"] = args.profile
@@ -1128,11 +1257,19 @@ def main(argv=None):
     for opt in ("task", "repo", "ticket", "head", "workflow-state", "verified-by", "evidence", "blocker-owner", "resume-trigger", "file"):
         c.add_argument(f"--{opt}")
     c.add_argument("--pr", type=int)
+    e = sub.add_parser("emit-resource")
+    e.add_argument("--clear", action="store_true")
+    for opt, table in (("cause", CAUSE_TEXT), ("recovery", RECOVERY_TEXT), ("owner-action", OWNER_ACTION_TEXT)):
+        e.add_argument(f"--{opt}", choices=sorted(table))
+    e.add_argument("--signature", type=signature_arg)
+    e.add_argument("--strict", action="store_true", help="a no-backend outcome leaves no dedup record, so a retry after a backend is enabled still notifies")
     r = sub.add_parser("render-config")
     r.add_argument("--profile", choices=("personal", "corporate"), default="personal")
     r.add_argument("--out")
     a = ap.parse_args(argv)
-    return {"hook": cmd_hook, "status": cmd_status, "sweep": cmd_sweep, "checkpoint": cmd_checkpoint, "render-config": cmd_render_config}[a.cmd](a)
+    if a.cmd == "emit-resource" and not a.clear and not (a.cause and a.recovery and a.owner_action):
+        ap.error("emit-resource needs --cause, --recovery and --owner-action (or --clear)")
+    return {"hook": cmd_hook, "status": cmd_status, "sweep": cmd_sweep, "checkpoint": cmd_checkpoint, "emit-resource": cmd_emit_resource, "render-config": cmd_render_config}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,14 @@ ENTER = {"swap_io_mib_s_heavy": 16.0, "swap_io_mib_s_light": 128.0,   # swapins 
          "load_per_core_heavy": 4.0}
 EXIT = {"swap_io_mib_s": 4.0, "compressor_ratio": 0.25, "load_per_core": 2.0}
 EXIT_SAMPLES = 3          # consecutive good checks needed to leave a heavy refusal
+# SPE-177. P1: only memory reasons latch the gate; a lane reason (lanes full, a second lane needing a quiet host) still refuses each
+# check but no longer arms the stricter EXIT thresholds for the first lane (ADR 0017: lane 1 keeps the ENTER thresholds).
+# P2: a latch whose only failing EXIT predicate is a compressor below ENTER (compressed pages are a stock nothing evicts at pressure
+# level 1) is released after P2_SAMPLES good checks P2_SPACING s apart with normal pressure, swap I/O <= P2_SWAP_IO and a compressor that
+# did not rise over the run. Neither changes a threshold value; the second lane's bounds (exit_ok, concurrent_lane_reasons) are unchanged.
+LATCH_ONLY_ON_MEMORY_REASONS = False   # P1 ships off: it reverses a pinned cap-one behaviour (hysteresis after a tree ends); enable on its own decision
+CONSERVATIVE_RECOVERY = True
+P2_SAMPLES, P2_SPACING, P2_SWAP_IO, P2_RISE, P2_STALE = 10, 60, 1.0, 0.005, 5
 MIN_SPACING = 30          # seconds between checks that count toward EXIT_SAMPLES
 SWAP_FULL_FRACTION = 0.90
 SWAP_LOW_FREE = 4 * GIB
@@ -487,6 +495,59 @@ def exit_ok(m):
     return m.get("pressure_level") == PRESSURE_NORMAL and io <= EXIT["swap_io_mib_s"] and cr <= EXIT["compressor_ratio"] and lpc <= EXIT["load_per_core"]
 
 
+def exit_blockers(m):
+    """Which stricter EXIT conditions this reading fails, as short texts. Explains a latch that is not recovering; changes no limit."""
+    out = []
+    lvl = m.get("pressure_level")
+    if lvl != PRESSURE_NORMAL:
+        out.append(f"pressure level {lvl}, exit needs {PRESSURE_NORMAL}")
+    for key, limit, label, fmt in (("swap_io_mib_s", EXIT["swap_io_mib_s"], "swap I/O", "{:.1f} MiB/s"),
+                                   ("compressor_ratio", EXIT["compressor_ratio"], "compressor", "{:.0%}"),
+                                   ("load_per_core", EXIT["load_per_core"], "load/core", "{:.1f}")):
+        value = m.get(key)
+        if value is not None and value > limit:
+            out.append(f"{label} {fmt.format(value)} > exit {fmt.format(limit)}")
+    return out
+
+
+def is_lane_reason(text):
+    """A refusal about lane occupancy (SPE-160) rather than about memory itself."""
+    return "heavy lanes full" in text or text.startswith("a second heavy lane needs")
+
+
+def conservative_ok(m):
+    """P2 reading: calm by every ENTER measure, pressure normal, swap I/O near zero, load within EXIT; the compressor may sit above EXIT."""
+    reasons, unknown = refusal_reasons("heavy", m)
+    cr, io, lpc = m.get("compressor_ratio"), m.get("swap_io_mib_s"), m.get("load_per_core")
+    return (not reasons and not unknown and m.get("pressure_level") == PRESSURE_NORMAL and io is not None and io <= P2_SWAP_IO
+            and cr is not None and lpc is not None and lpc <= EXIT["load_per_core"])
+
+
+def _clock_value(x):
+    """A believable epoch seconds value: a real number (not bool), finite, non-negative and below year 33658. Never raises."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return False
+    try:
+        return math.isfinite(x) and 0 <= x < 1e12
+    except OverflowError:
+        return False
+
+
+def _p2_clean(st, now):
+    hist = st.get("p2_hist")
+    ok = isinstance(hist, list) and len(hist) <= P2_SAMPLES and all(isinstance(x, float) and 0 <= x <= 1 for x in hist)
+    st["p2_hist"] = hist if ok else []
+    last = st.get("p2_last", 0.0)
+    if not _clock_value(last) or last > now:
+        st["p2_hist"], last = [], 0.0
+    first = st.get("p2_first", last)
+    if not _clock_value(first) or first > last:
+        st["p2_hist"], first = [], last      # a run without a believable start cannot count as dwell
+    elif st["p2_hist"] and now - last > P2_STALE * P2_SPACING:
+        st["p2_hist"] = []      # ten snapshots days apart are not ten minutes of calm
+    st["p2_last"], st["p2_first"] = float(last), float(first)
+
+
 def decide(weight, m, state, now):
     """Pure. Returns (verdict, new_state). state = {'latched': bool, 'ok_streak': int, 'last_ok': float, 'levels': [..]}."""
     st = {"latched": False, "ok_streak": 0, "last_ok": 0.0, "levels": []}
@@ -518,10 +579,13 @@ def decide(weight, m, state, now):
         return dict(verdict, weight=weight), st
     if unknown:
         reasons = reasons + [f"{u}: heavy work fails closed" for u in unknown]
-    if reasons:
-        st.update(latched=True, ok_streak=0)
+    lane = [r for r in reasons if LATCH_ONLY_ON_MEMORY_REASONS and is_lane_reason(r)]
+    if [r for r in reasons if r not in lane]:
+        st.update(latched=True, ok_streak=0, p2_hist=[], p2_last=0.0, p2_first=0.0)
     elif st["latched"]:
+        _p2_clean(st, now)
         if exit_ok(m):
+            st["p2_hist"] = []
             if now - st["last_ok"] >= MIN_SPACING or st["ok_streak"] == 0:
                 st["ok_streak"] += 1
                 st["last_ok"] = now
@@ -529,8 +593,26 @@ def decide(weight, m, state, now):
                 st.update(latched=False, ok_streak=0)
         else:
             st["ok_streak"] = 0
+            if CONSERVATIVE_RECOVERY and conservative_ok(m):      # false whenever a lane reason exists (refusal_reasons is then non-empty)
+                if not st["p2_hist"] or now - st["p2_last"] >= P2_SPACING:
+                    if not st["p2_hist"]:
+                        st["p2_first"] = now
+                    st["p2_hist"] = (st["p2_hist"] + [float(m["compressor_ratio"])])[-P2_SAMPLES:]
+                    st["p2_last"] = now
+                dwell = st["p2_last"] - st["p2_first"]    # real elapsed calm, from recorded times, not from the stored list
+                if len(st["p2_hist"]) >= P2_SAMPLES and dwell >= (P2_SAMPLES - 1) * P2_SPACING and max(st["p2_hist"]) - min(st["p2_hist"]) <= P2_RISE:
+                    st.update(latched=False, ok_streak=0, p2_hist=[], p2_last=0.0, p2_first=0.0)
+            else:
+                st["p2_hist"] = []
         if st["latched"]:
-            reasons = [f"hysteresis: recovering ({st['ok_streak']}/{EXIT_SAMPLES} good checks >= {MIN_SPACING}s apart)"]
+            why = exit_blockers(m)
+            reasons = [f"hysteresis: recovering ({st['ok_streak']}/{EXIT_SAMPLES} good checks >= {MIN_SPACING}s apart)"
+                       + (f"; exit blocked by {', '.join(why)}" if why else "")
+                       + (f"; conservative recovery {len(st['p2_hist'])}/{P2_SAMPLES}" if CONSERVATIVE_RECOVERY and st["p2_hist"] else "")] + lane
+        else:
+            reasons = lane
+    else:
+        reasons = lane
     return {"admit": not reasons, "reasons": reasons, "warnings": warnings, "weight": weight}, st
 
 
@@ -562,7 +644,12 @@ def load_state(path):
               and all(type(x) is int and x in VALID_LEVELS for x in d.get("levels", [])))
     except (ValueError, UnicodeDecodeError):
         ok = False
-    return (d, None) if ok else (latched, "state corrupt: treated as latched")
+    if not ok:
+        return latched, "state corrupt: treated as latched"
+    side = _load_p2(path)
+    if side:
+        d = dict(d, **side)      # the sidecar wins; a file written by the previous P2 layout (keys inside) still loads
+    return d, None
 
 
 @contextlib.contextmanager
@@ -587,19 +674,51 @@ def state_lock(path, wait=LOCK_WAIT, sleep=time.sleep):
         os.close(fd)
 
 
-def save_state(path, state):
+P2_KEYS = ("p2_hist", "p2_last", "p2_first")
+
+
+def p2_path(path):
+    """Where the P2 run lives: beside the latch file, never inside it. A checkout without P2 rewrites the latch file with its four keys on
+    every check; if the run were stored there, every old caller's check would erase the recovery progress (observed 2026-11-19)."""
     p = pathlib.Path(path)
+    return p.with_name(p.name + ".p2")
+
+
+def _load_p2(path):
+    try:
+        fd = os.open(str(p2_path(path)), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return {}
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return {}
+        raw = os.read(fd, 4096 + 1)
+        d = json.loads(raw.decode("utf-8")) if len(raw) <= 4096 else {}
+    except (OSError, ValueError, UnicodeDecodeError, OverflowError):
+        return {}
+    finally:
+        os.close(fd)
+    return {k: d[k] for k in P2_KEYS if k in d} if isinstance(d, dict) else {}
+
+
+def _write_private(p, payload):
     p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".state-")
     try:
         with os.fdopen(fd, "w") as fh:
-            json.dump({k: state[k] for k in ("latched", "ok_streak", "last_ok", "levels")}, fh)
+            json.dump(payload, fh)
         os.chmod(tmp, 0o600)
         os.replace(tmp, p)
     except OSError:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+def save_state(path, state):
+    _write_private(pathlib.Path(path), {k: state[k] for k in ("latched", "ok_streak", "last_ok", "levels") if k in state})
+    if any(k in state for k in P2_KEYS):
+        _write_private(p2_path(path), {k: state[k] for k in P2_KEYS if k in state})
 
 
 # ---- disk gate composition -------------------------------------------------------------------------------------------

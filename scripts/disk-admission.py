@@ -364,6 +364,23 @@ def process_token(pid):
     raise ReservationError('cannot inspect process %d: ps exit %d' % (pid, done.returncode))
 
 
+def waiter_token(pid, tz='UTC'):
+    """Start-time token of a queue waiter: the same ps call as process_token but rendered in UTC (second precision), so a timezone or
+    DST change while the waiter lives cannot make a live process look replaced. Used only for the queue `waiter` field; holder
+    reservations keep process_token's local-time format. None when the process is gone."""
+    try:
+        done = subprocess.run(['/bin/ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True, timeout=5,
+                              stdin=subprocess.DEVNULL, env=dict(PS_ENV, TZ=tz))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReservationError('cannot inspect process %d: %s' % (pid, exc))
+    token = done.stdout.strip()
+    if done.returncode == 0 and token:
+        return token
+    if done.returncode == 1 and not token:
+        return None
+    raise ReservationError('cannot inspect process %d: ps exit %d' % (pid, done.returncode))
+
+
 def process_table():
     """{pid: (ppid, pgid, stat, start token)} for every process; raises ReservationError when it cannot be read.
 
@@ -1288,8 +1305,15 @@ def format_measurements(summary):
 # advances when a queue-aware command runs. Entries record only a digest of the job argv, never the argv itself.
 QUEUE_DIR = 'queue'
 QUEUE_VERSION = 1
+# Bumped when a runner gains behaviour another runner's grants cannot be trusted without (2: memory-gated advance, SPE-175). A grant
+# stamped with a lower protocol, or with none, came from an outdated caller; stall detection reports it (SPE-176).
+RUNNER_PROTOCOL = 2
 QUEUE_WAIT_S = 24 * 3600
 QUEUE_GRANT_S = 3600
+# Grant window for an entry with no declared waiter (a manual hand-off), SPE-176 / ADR 0019. Observed grant-to-claim p99 is 29 min, so 20 min is
+# the claim window: an absent hand-off owner holds the only usable lane at most 20 min per grant. On lapse the existing EXPIRED path applies and
+# the owner re-enqueues. Entries with a declared waiter keep min(grant_s, QUEUE_MAX_GRANT_S); an explicit smaller grant_s still wins.
+HANDOFF_GRANT_S = 1200
 QUEUE_MAX_GRANT_S = 4 * 3600
 WAITING_STATES = ('QUEUED', 'ELIGIBLE', 'GRANTED')
 LIVE_STATES = WAITING_STATES + ('CLAIMED',)
@@ -1360,6 +1384,9 @@ def _read_queue_entry(path):
              and isinstance(entry.get('tickets'), list) and entry.get('harness') in HARNESSES
              and isinstance(entry.get('fingerprint'), str) and len(entry['fingerprint']) == 64
              and isinstance(entry.get('wait_expires'), str)
+             and ('waiter' not in entry or (isinstance(entry['waiter'], dict) and type(entry['waiter'].get('pid')) is int
+                                            and entry['waiter']['pid'] > 0 and isinstance(entry['waiter'].get('start_token'), str)
+                                            and 0 < len(entry['waiter']['start_token']) <= 64))
              and (entry.get('grant') is None or (isinstance(entry['grant'], dict) and isinstance(entry['grant'].get('expires'), str)))
              and (entry['state'] != 'CLAIMED' or (isinstance(entry.get('holder'), dict) and type(entry['holder'].get('pid')) is int
                                                   and isinstance(entry['holder'].get('start_token'), str)
@@ -1465,8 +1492,13 @@ def _claimed_orphans(entries, live, token_fn, table_fn=None, state_path=None):
 
 
 def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_id, nbytes, argv, again=False, now=None,
-                  wait_s=QUEUE_WAIT_S, declared=None):
-    """Add one durable entry, or return the live one with the same fingerprint. Never stores argv."""
+                  wait_s=QUEUE_WAIT_S, declared=None, waiter_pid=None, token_fn=None, owner_fn=process_owner,
+                  ancestor_fn=None):
+    """Add one durable entry, or return the live one with the same fingerprint. Never stores argv.
+
+    waiter_pid (SPE-176) names the supervising wrapper that will claim the entry. It must be a live process of this user that is this
+    process, its parent or one of its ancestors, so a session cannot declare an unrelated process as its waiter. Its pid and start
+    token are stored; once that process is provably gone, queue advance cancels the entry. Without it nothing is ever auto-cancelled."""
     now = now or datetime.now(timezone.utc)
     bad = None
     if not (isinstance(label, str) and LABEL_RE.fullmatch(label)):
@@ -1490,8 +1522,15 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
         bad = 'worktree'
     elif declared and not (isinstance(declared, dict) and set(declared) <= set(WORKLOAD_FIELDS) and _valid_declared(declared)):
         bad = 'workload'
+    elif waiter_pid is not None and not (type(waiter_pid) is int and 0 < waiter_pid < MAX_PID):
+        bad = 'waiter-pid'
     if bad:
         return {'ok': False, 'reason': 'invalid-request: %s is missing or out of range' % bad}
+    waiter = None
+    if waiter_pid is not None:
+        waiter, why = _waiter_identity(waiter_pid, token_fn or waiter_token, owner_fn, ancestor_fn)
+        if why:
+            return {'ok': False, 'reason': 'invalid-request: waiter-pid %s' % why}
     real_worktree = os.path.realpath(worktree)
     try:
         with state_lock(state_path):
@@ -1537,6 +1576,8 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
                      'session_id': session_id, 'owner_uid': os.getuid(), 'bytes': nbytes, 'fingerprint': fingerprint,
                      'created': iso_utc(now), 'wait_expires': iso_utc(now + timedelta(seconds=wait_s)), 'grant': None}
             entry.update({k: v for k, v in (declared or {}).items() if k != 'created'})  # the entry already has `created`
+            if waiter:
+                entry['waiter'] = waiter
             if (queue_dir(state_path) / (entry['id'] + '.json')).exists():
                 return {'ok': False, 'reason': 'queue-entry-unreadable: %s already exists' % entry['id']}
             write_json_atomic(seq_path, {'next': seq + 1})  # counter first: a crash leaves a gap, never a reused id
@@ -1548,6 +1589,38 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
         return {'ok': False, 'reason': '%s: %s' % (exc.kind, exc)}
     except OSError as exc:
         return {'ok': False, 'reason': 'state-unwritable: %s' % exc}
+
+
+def _waiter_identity(pid, token_fn, owner_fn, ancestor_fn):
+    """({'pid', 'start_token'}, None) for a live same-user process that is us, our parent or an ancestor; else (None, reason)."""
+    if pid <= 1:
+        return None, 'is not a supervising process'
+    try:
+        token = token_fn(pid)
+        owner = owner_fn(pid) if token is not None else None
+    except ReservationError as exc:
+        return None, 'cannot be verified: %s' % exc
+    if token is None:
+        return None, 'is not a running process'
+    if owner != os.getuid():
+        return None, 'is not run by this user'
+    related = ancestor_fn(pid) if ancestor_fn else (pid == os.getpid() or _is_strict_ancestor(pid))
+    if not related:
+        return None, 'must be this command, its parent or an ancestor (the supervising wrapper)'
+    return {'pid': pid, 'start_token': token}, None
+
+
+def _waiter_gone(entry, token_fn):
+    """True only when the entry's waiter process is provably gone (no such pid, or a reused pid with a new start token).
+    No waiter, a live waiter and an uninspectable one are all False: never cancel on doubt."""
+    waiter = entry.get('waiter')
+    if not waiter:
+        return False
+    try:
+        current = token_fn(waiter['pid'])
+    except (ReservationError, OSError, subprocess.SubprocessError):
+        return False
+    return current is None or current != waiter['start_token']
 
 
 def _drop_marker(state_path, qid):
@@ -1566,9 +1639,14 @@ def _has_waiting(state_path):
 
 
 def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=process_token, grant_s=QUEUE_GRANT_S, table_fn=None,
-                  host_fn=None):
-    """_queue_advance, then a measurement sample per reservation holder outside the lock. host_fn feeds the resource budget."""
-    now = now or datetime.now(timezone.utc)
+                  host_fn=None, memory_fn=None, waiter_token_fn=None):
+    """_queue_advance, then a measurement sample per reservation holder outside the lock. host_fn feeds the resource budget.
+
+    memory_fn (the CLI passes the SPE-117 gate) makes a grant conditional on the memory gate admitting: a grant that queue_claim
+    would then refuse only holds a lane for its whole window and lapses unclaimed, consuming the queue without starting anything.
+    The gate takes 10 s or more, so it runs outside the lock and only when a grant is otherwise possible (first pass finds the head
+    grantable and returns grant_pending; second pass applies the verdict). A refusal leaves every entry QUEUED in FIFO order."""
+    caller_now, now = now, now or datetime.now(timezone.utc)
     host = _host_or_error(host_fn) if host_fn is not None and _has_waiting(state_path) else None
     seen = {}
 
@@ -1576,19 +1654,27 @@ def queue_advance(state_path, free_fn=measure_free_bytes, now=None, token_fn=pro
         seen['free'] = free_fn()
         return seen['free']
 
-    out = _queue_advance(state_path, free, now, token_fn, grant_s, table_fn, host)
+    out = _queue_advance(state_path, free, now, token_fn, grant_s, table_fn, host, memory='probe' if memory_fn else None,
+                         waiter_token_fn=waiter_token_fn)
+    if memory_fn and out.pop('grant_pending', False):
+        admitted, why = memory_fn()
+        first = out
+        out = _queue_advance(state_path, free, datetime.now(timezone.utc) if caller_now is None else now, token_fn, grant_s, table_fn, host,
+                             memory=(bool(admitted), why), waiter_token_fn=waiter_token_fn)
+        for key in ('expired', 'released', 'cancelled'):
+            out[key] = first[key] + out[key]
     _measure(state_path, 'advance', seen.get('free'), now)
     return out
 
 
-def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, host=None):
+def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, host=None, memory=None, waiter_token_fn=None):
     """One advance step under the lock: expire lapsed grants and waits, then grant the first in line if a lane is free.
 
     A lane is occupied by a live reservation (including one past its time limit or unverifiable) and by an unclaimed,
     unlapsed grant. Nothing here ever signals or releases a holder.
     """
     now = now or datetime.now(timezone.utc)
-    out = {'granted': [], 'expired': [], 'eligible': [], 'released': [], 'reason': 'ok'}
+    out = {'granted': [], 'expired': [], 'eligible': [], 'released': [], 'cancelled': [], 'reason': 'ok'}
     if not (type(grant_s) is int and 0 < grant_s <= QUEUE_MAX_GRANT_S):
         out['reason'] = 'invalid-request: grant window out of range'
         return out
@@ -1637,6 +1723,16 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                     _drop_marker(state_path, entry['id'])
                     _queue_receipt(state_path, 'expired', entry, now, was=was)
                     out['expired'].append(entry['id'])
+            for entry in entries:
+                # SPE-176: a waiter that is provably gone will never claim; free its place (and a granted lane) now. A CLAIMED entry
+                # is not in WAITING_STATES and is left to the holder rules above.
+                if entry['state'] in WAITING_STATES and _waiter_gone(entry, waiter_token_fn or waiter_token):
+                    was = entry['state']
+                    entry['state'] = 'CANCELLED'
+                    _write_queue_entry(state_path, entry)
+                    _drop_marker(state_path, entry['id'])
+                    _queue_receipt(state_path, 'cancelled', entry, now, was=was, evidence='waiter-exited')
+                    out['cancelled'].append(entry['id'])
             waiting = [e for e in entries if e['state'] in ('QUEUED', 'ELIGIBLE')]
             granted = [e for e in entries if e['state'] == 'GRANTED']
             if not waiting:
@@ -1654,7 +1750,6 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
             orphans = _claimed_orphans(entries, live, token_fn, table_fn, state_path)
             in_use = len(live) + len(granted) + len(orphans)
             reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans) + sum(e['bytes'] for e in granted)
-            window = min(grant_s, QUEUE_MAX_GRANT_S)
             # Strict first-in-first-out: grant the head, then try the next with the budget recomputed beside the new grant, and
             # stop at the first entry that does not fit. A later, smaller entry never overtakes a larger head.
             for nxt in waiting:
@@ -1668,7 +1763,8 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                 _mark_enforced(budget, in_use < lanes and floor_ok and not budget_why)
                 if budget is not None:
                     out['budget'] = budget
-                    _budget_receipt(state_path, nxt, now, budget)
+                    if memory != 'probe':   # the probe pass repeats in the final pass: one receipt per decision, not two
+                        _budget_receipt(state_path, nxt, now, budget)
                 if in_use >= lanes or not floor_ok or budget_why:
                     if not out['granted']:
                         out['reason'] = ('lane occupied' if in_use >= lanes else
@@ -1676,13 +1772,25 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                                              result['free_bytes'] / GIB, reserved / GIB, nxt['bytes'] / GIB, nxt['id'])
                                          if not floor_ok else budget_why)
                     return out
+                if memory == 'probe':
+                    out['grant_pending'] = True   # the head fits: the caller asks the memory gate outside the lock, then calls again
+                    return out
+                if type(memory) is tuple and not memory[0] and not out['granted']:
+                    out['reason'] = 'memory-gate: %s' % memory[1]
+                    return out
+                window = min(grant_s, QUEUE_MAX_GRANT_S if 'waiter' in nxt else HANDOFF_GRANT_S)   # once per entry: grant, marker, receipt
                 nxt['state'] = 'GRANTED'
+                # The grant object is exactly {at, expires}: a hand-off consumer validates it as a closed key set (the HORO-2139 executor
+                # refused a grant with two extra keys on 2026-11-19 and its waiter died). The runner stamp goes in the receipt only.
                 nxt['grant'] = {'at': iso_utc(now), 'expires': iso_utc(now + timedelta(seconds=window))}
+                stamp = {'runner': {'protocol': RUNNER_PROTOCOL, 'checkout': Path(__file__).resolve().parent.parent.name},
+                         'memory_gate': 'admitted' if type(memory) is tuple else 'not-asked'}
                 _write_queue_entry(state_path, nxt)
                 marker = queue_dir(state_path) / 'granted' / nxt['id']
                 write_json_atomic(marker, {'id': nxt['id'], 'label': nxt['label'], 'tickets': nxt['tickets'],
                                            'expires': nxt['grant']['expires']})
-                _queue_receipt(state_path, 'granted', nxt, now, expires=nxt['grant']['expires'], tier=result['tier'])
+                _queue_receipt(state_path, 'granted', nxt, now, expires=nxt['grant']['expires'], tier=result['tier'],
+                               runner=stamp['runner'], memory_gate=stamp['memory_gate'])
                 out['granted'].append(nxt['id'])
                 granted.append(nxt)
                 in_use += 1
@@ -1705,12 +1813,73 @@ def _memory_precondition():
     except (OSError, subprocess.SubprocessError) as exc:
         return False, 'memory-gate-unavailable: %s' % exc
     lines = [line.strip() for line in done.stdout.splitlines() if line.strip()]
-    return done.returncode == 0, (lines[0] if lines else 'memory gate exit %d' % done.returncode)
+    if not lines:
+        return done.returncode == 0, 'memory gate exit %d' % done.returncode
+    # The first line is the verdict and metrics; the first `reason:` line says why (for example which exit limit a recovering latch fails).
+    reasons = [line[len('reason:'):].strip() for line in lines[1:] if line.startswith('reason:')]
+    return done.returncode == 0, (lines[0] + (' ; ' + reasons[0] if reasons else ''))[:400]
+
+
+CLAIM_REFUSED_WINDOW_S = 600
+CLAIM_REFUSED_KINDS = (('memory-gate', 'memory-gate'), ('over-capacity', 'floor'), ('lane-cap', 'lane'), ('budget', 'budget'))
+
+
+def _claim_refusal_kind(reason):
+    """A fixed enum from the reason's prefix; the free text of a reason never reaches a receipt."""
+    return next((kind for prefix, kind in CLAIM_REFUSED_KINDS if str(reason).startswith(prefix)), 'other')
+
+
+def _recent_claim_refusal(path, qid, kind, now):
+    """True when the newest claim-refused line for this entry and kind is inside the window (tail of the log only)."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return False
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - RECEIPT_ROTATE_BYTES))
+            raw = handle.read(RECEIPT_ROTATE_BYTES + 1).decode('utf-8', 'replace')
+    except OSError:
+        return False
+    for text in reversed(raw.splitlines()):
+        try:
+            line = json.loads(text)
+            if line.get('event') == 'claim-refused' and line.get('id') == qid and line.get('kind') == kind:
+                return (now - _parse_time(line['ts'])).total_seconds() < CLAIM_REFUSED_WINDOW_S
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return False
+
+
+def _record_claim_refusal(state_path, qid, reason, now):
+    """Append a rate-limited `claim-refused` receipt (one per entry and kind per 10 minutes); entry state is never changed."""
+    kind = _claim_refusal_kind(reason)
+    try:
+        with state_lock(state_path):
+            entries, _ = _queue_entries(state_path)
+            entry = next((e for e in entries if e['id'] == qid), None)
+            if entry is None:
+                return
+            if not _recent_claim_refusal(queue_dir(state_path) / 'receipts.jsonl', qid, kind, now):
+                _queue_receipt(state_path, 'claim-refused', entry, now, kind=kind)
+    except (StateError, OSError, ValueError):
+        pass  # a missing receipt must never change the refusal the caller gets
 
 
 def queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn=measure_free_bytes, pid=None, now=None, token_fn=process_token,
                 owner_fn=process_owner, ttl=DEFAULT_TTL, memory_fn=_memory_precondition, exec_fn=None, allow_long=False,
                 table_fn=None, declared=None, host_fn=None, grant_environ=None):
+    """_queue_claim; a refusal (exit 77) on a valid queue id also leaves a rate-limited `claim-refused` receipt (SPE-176), so a
+    stall shows in history. The receipt is written after the claim's own critical sections, never inside them."""
+    out = _queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn, pid, now, token_fn, owner_fn, ttl, memory_fn, exec_fn,
+                       allow_long, table_fn, declared, host_fn, grant_environ)
+    if not out.get('ok') and out.get('exit') == REFUSED_EXIT and isinstance(qid, str) and QUEUE_ID_RE.fullmatch(qid):
+        _record_claim_refusal(state_path, qid, out.get('reason', ''), now or datetime.now(timezone.utc))
+    return out
+
+
+def _queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn, pid, now, token_fn, owner_fn, ttl, memory_fn, exec_fn,
+                 allow_long, table_fn, declared, host_fn, grant_environ):
     """Claim a granted lane for this very process, then exec the job; every precondition is revalidated first.
     host_fn feeds the resource budget (sampled after the memory gate, before the lock); only a lane beside a running job depends
     on it.
@@ -3150,6 +3319,8 @@ def build_parser():
     enq.add_argument('--bytes', type=int, required=True, dest='nbytes')
     enq.add_argument('--wait-s', type=int, default=QUEUE_WAIT_S, dest='wait_s')
     enq.add_argument('--again', action='store_true')
+    enq.add_argument('--waiter-pid', type=int, dest='waiter_pid',
+                     help='the supervising wrapper (this command, its parent or an ancestor); if it exits, advance cancels the entry')
     _add_workload_args(enq)
     enq.add_argument('job', nargs=argparse.REMAINDER, help='-- COMMAND [ARG...]')
     adv = qcmds.add_parser('advance', allow_abbrev=False, help='expire lapsed entries and grant the first in line if a lane is free')
@@ -3217,11 +3388,12 @@ def _queue_cli(args, state_path, free_fn, host_fn=None):
             print(json.dumps({'ok': False, 'reason': error}))
             return REFUSED_EXIT
         out = queue_enqueue(state_path, args.label, args.tickets, args.repo, args.worktree, args.harness, args.session_id,
-                            args.nbytes, args.job[1:], again=args.again, wait_s=args.wait_s, declared=declared)
+                            args.nbytes, args.job[1:], again=args.again, wait_s=args.wait_s, declared=declared,
+                            waiter_pid=args.waiter_pid)
     elif command == 'advance':
-        out = queue_advance(state_path, free_fn, grant_s=args.grant_s, host_fn=host_fn)
+        out = queue_advance(state_path, free_fn, grant_s=args.grant_s, host_fn=host_fn, memory_fn=_memory_precondition)
         out['ok'] = out['reason'] in ('ok',) or bool(out['granted'] or out['expired'] or out['eligible']) or out['reason'] in (
-            'lane occupied',) or out['reason'].startswith(('no heavy lane', 'budget:'))
+            'lane occupied',) or out['reason'].startswith(('no heavy lane', 'budget:', 'memory-gate:'))
     elif command == 'claim':
         if args.pid <= 0 or not _is_strict_ancestor(args.pid):
             print(json.dumps({'ok': False, 'reason': 'invalid-request: --pid must be a live ancestor of this command '

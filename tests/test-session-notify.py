@@ -1479,6 +1479,7 @@ class BoundaryFuzz(Base):
         base["backends"]["macos"]["enabled"] = True
         base["backends"]["ntfy"].update(enabled=True, approved_destination="ntfy.sh", topic_file="/x/t")
         base["backends"]["pushover"].update(enabled=True, user_file="/x/u")
+        base["backends"]["telegram"].update(enabled=True, approved_destination="api.telegram.org", chat_id_file="/x/c")
         failures, n = [], 0
         path = self.tmp / "fuzz-config.json"
         for mpath, w, m in mutants(base):
@@ -1573,7 +1574,8 @@ class BoundaryFuzz(Base):
 
     def test_pending_deliveries_every_field_every_wrong_type(self):
         base = {"key": "k", "cycle": 1, "created": 0,
-                "fields": {"state": "FAILED", "repo": "work", "ticket": "SPE-1", "pr": 4, "blocker_owner": "owner", "resume_trigger": "ci_green", "kind": "rate_limit"},
+                "fields": {"state": "FAILED", "repo": "work", "ticket": "SPE-1", "pr": 4, "blocker_owner": "owner", "resume_trigger": "ci_green", "kind": "rate_limit",
+                           "cause": "disk-floor", "recovery": "none", "owner_action": "reclaim-disk"},
                 "backends": {"macos": {"status": "failed", "attempts": 1, "next_at": 0, "code": "network"}, "ntfy": {"status": "pending", "attempts": 0, "next_at": 0, "code": None}}}
         failures, n = [], 0
         for mpath, w, m in mutants(base):
@@ -1614,6 +1616,23 @@ class BoundaryFuzz(Base):
                     failures.append((base["hook_event_name"], mpath, repr(w)[:20], "processed" if not valid else "ignored a valid event"))
         self.collect(failures, n, 500)
 
+    def test_emit_resource_request_every_field_every_wrong_type(self):
+        base = {"cause": "disk-floor", "recovery": "advance-tried", "owner_action": "reclaim-disk", "signature": "0123456789abcdef"}
+        failures, n = [], 0
+        for mpath, w, m in mutants(base):
+            n += 1
+            fake = Fake()
+            e = sn.Engine(self.sdir / f"e{n}", cfg(), fake.table(), clock=lambda: self.t, sleep=lambda s: None)
+            try:
+                got = e.emit_resource(m)
+            except BaseException as exc:  # noqa: BLE001
+                failures.append((mpath, repr(w)[:20], type(exc).__name__))
+                continue
+            valid = ref_ok(sn.EMIT_SCHEMA, m)
+            if (got != "invalid") != valid or (not valid and (fake.sent or (self.sdir / f"e{n}").exists())):
+                failures.append((mpath, repr(w)[:20], "processed" if not valid else "rejected a valid request"))
+        self.collect(failures, n, 8)
+
     def test_cmd_hook_survives_every_json_root_and_deep_nesting(self):
         saved, stdin = dict(os.environ), sys.stdin
         os.environ["SESSION_NOTIFY_STATE_DIR"] = str(self.sdir)
@@ -1639,7 +1658,7 @@ class BoundaryLint(unittest.TestCase):
     catches the common regressions."""
     VALIDATOR = {"conforms", "_conforms", "overlay"}
     TRUSTED_CONTRACT = {"render", "apply", "deliver_entry"}   # receive sanitised or already validated values
-    BOUNDARY_PARAMS = {"ev", "raw", "d", "user", "fields", "entry", "event"}
+    BOUNDARY_PARAMS = {"ev", "raw", "d", "user", "fields", "entry", "event", "req"}
 
     @classmethod
     def violations(cls, source):
@@ -1690,6 +1709,246 @@ class BoundaryLint(unittest.TestCase):
         self.assertEqual(len(self.violations("def f(event):\n    return event.get('x')\n")), 1)                      # unvalidated `event`
         self.assertEqual(len(self.violations("def f(raw):\n    alias = raw\n    return alias['x']\n")), 1)           # alias of a boundary value
         self.assertEqual(self.violations("def f(raw):\n    if not conforms(S, raw):\n        return None\n    alias = raw\n    return alias['x']\n"), [])
+
+
+class EmitResource(Base):
+    """SPE-176: admission-monitor notices through the existing pipeline."""
+    REQ = {"cause": "disk-floor", "recovery": "none", "owner_action": "reclaim-disk", "signature": "0123456789abcdef"}
+
+    def emit(self, eng=None, **over):
+        return (eng or self.engine()).emit_resource({**self.REQ, **over})
+
+    def test_one_notification_with_fixed_phrases_only(self):
+        self.assertEqual(self.emit(), "queued")
+        self.assertEqual(self.names(), ["macos", "ntfy", "pushover"])
+        payload = self.fake.sent[0][1]
+        self.assertEqual(payload["body"], "disk below floor | recovery: none tried | action: reclaim disk")
+        self.assertNotIn("0123456789abcdef", json.dumps(payload))
+        rec = self.rec("admission-monitor")
+        self.assertEqual((rec["state"], rec["task"]["blocker_owner"], rec["task"]["resume_trigger"]), ("BLOCKED_RESOURCE", "resource", "resource_available"))
+
+    def test_replay_neither_notifies_nor_queues_again(self):
+        self.emit()
+        self.fake.sent.clear()
+        self.advance(5)
+        self.assertEqual(self.emit(), "deduped")
+        self.assertEqual((self.fake.sent, self.rec("admission-monitor")["pending"]), ([], []))
+
+    def test_different_cause_or_signature_notifies_again(self):
+        self.emit()
+        self.fake.sent.clear()
+        self.assertEqual(self.emit(signature="fedcba9876543210"), "queued")
+        self.assertEqual(self.emit(cause="frozen-queue", owner_action="run-queue-advance"), "queued")
+        self.assertEqual(len(self.fake.sent), 6)
+
+    def test_approve_actions_resume_on_owner_decision(self):
+        self.emit(cause="memory-pressure", owner_action="approve-memory-policy")
+        self.assertEqual(self.rec("admission-monitor")["task"]["resume_trigger"], "owner_decision")
+
+    def test_repo_label_is_never_rendered(self):
+        self.emit(self.engine(cfg(known_repos=[])))
+        self.assertEqual(self.fake.sent[0][1], {"title": "Claude Code: admission stalled", "body": "disk below floor | recovery: none tried | action: reclaim disk"})
+
+    def test_unclaimed_handoff_phrases_are_fixed_enums(self):
+        self.assertEqual(self.emit(cause="unclaimed-handoff", recovery="none", owner_action="claim-or-reenqueue-handoff"), "queued")
+        self.assertEqual(self.fake.sent[0][1]["body"], "hand-off grant unclaimed | recovery: none tried | action: claim or re-enqueue hand-off")
+        self.fake.sent.clear()
+        self.assertEqual(self.emit(cause="unclaimed-handoff", recovery="lapsed", owner_action="claim-or-reenqueue-handoff", signature="fedcba9876543210"), "queued")
+        self.assertEqual(self.fake.sent[0][1]["body"], "hand-off grant unclaimed | recovery: grant lapsed | action: claim or re-enqueue hand-off")
+
+    def test_strict_no_backend_leaves_no_dedup_record_so_a_later_retry_is_queued(self):
+        off = cfg()
+        for b in off["backends"].values():
+            b["enabled"] = False
+        self.assertEqual(self.engine(off).emit_resource(dict(self.REQ), strict=True), "no-backend")
+        self.assertEqual(self.rec("admission-monitor")["notified"], {})
+        self.assertEqual(self.engine().emit_resource(dict(self.REQ), strict=True), "queued")
+        self.assertEqual(len(self.fake.sent), 3)
+
+    def test_a_clear_while_a_notice_is_pending_never_lets_it_be_queued_twice(self):
+        failing = Fake(fail={"macos": "boom", "ntfy": "boom", "pushover": "boom"})
+        self.assertEqual(self.engine(fake=failing).emit_resource(dict(self.REQ)), "queued")
+        self.engine().emit_resource({}, clear=True)
+        self.assertEqual(self.engine(fake=failing).emit_resource(dict(self.REQ)), "deduped")
+        self.assertEqual(len(self.rec("admission-monitor")["pending"]), 1)
+
+    def test_non_strict_no_backend_keeps_the_dedup_record(self):
+        off = cfg()
+        for b in off["backends"].values():
+            b["enabled"] = False
+        self.assertEqual(self.engine(off).emit_resource(dict(self.REQ)), "no-backend")
+        self.assertEqual(self.engine().emit_resource(dict(self.REQ)), "deduped")
+
+    def test_the_delivery_of_the_request_itself_is_reported(self):
+        eng = self.engine()
+        self.assertEqual((eng.emit_resource(dict(self.REQ)), eng.last_delivery), ("queued", "sent"))
+        eng = self.engine(fake=Fake(fail={"macos": "boom", "ntfy": "boom", "pushover": "boom"}))
+        self.assertEqual((eng.emit_resource(dict(self.REQ, signature="fedcba9876543210")), eng.last_delivery), ("queued", "pending"))
+        eng = self.engine()
+        self.assertEqual((eng.emit_resource(dict(self.REQ)), eng.last_delivery), ("deduped", "unknown"))
+
+    def test_backends_off_returns_no_backend(self):
+        c = cfg()
+        for b in c["backends"].values():
+            b["enabled"] = False
+        self.assertEqual(self.emit(self.engine(c)), "no-backend")
+        self.assertEqual(self.fake.sent, [])
+
+    def test_clear_returns_to_idle_without_notifying(self):
+        self.emit()
+        self.fake.sent.clear()
+        self.assertEqual(self.engine().emit_resource({}, clear=True), "cleared")
+        self.assertEqual((self.rec("admission-monitor")["state"], self.fake.sent), ("IDLE", []))
+        self.assertEqual(sn.Engine(self.sdir / "none", cfg(), self.fake.table()).emit_resource({}, clear=True), "cleared")
+
+    def test_invalid_request_writes_nothing(self):
+        for bad in ({"cause": "nope"}, {"signature": "XYZ"}, {"recovery": None}, {"owner_action": "rm -rf /"}):
+            self.assertEqual(self.emit(**bad), "invalid")
+        self.assertFalse(self.sdir.exists())
+
+    def test_corrupt_synthetic_record_is_quarantined_and_rebuilt(self):
+        self.sdir.mkdir(parents=True)
+        (self.sdir / "admission-monitor.json").write_text("{")
+        self.assertEqual(self.emit(), "queued")
+        self.assertEqual((self.sdir / "admission-monitor.json.corrupt").read_text(), "{")
+        self.assertEqual(self.rec("admission-monitor")["state"], "BLOCKED_RESOURCE")
+        (self.sdir / "admission-monitor.json").write_text("[]")
+        self.assertEqual(self.emit(cause="frozen-queue"), "queued")
+        self.assertEqual((self.sdir / "admission-monitor.json.corrupt").read_text(), "[]")
+
+    def test_real_session_records_keep_untrusted_behaviour(self):
+        self.sdir.mkdir(parents=True)
+        (self.sdir / "s1.json").write_text("{")
+        self.assertEqual(self.ev(self.engine(), "Stop"), "untrusted:corrupt")
+        self.assertEqual((self.sdir / "s1.json").read_text(), "{")
+
+    def test_recurrence_after_clear_notifies_again(self):
+        self.emit()
+        self.engine().emit_resource({}, clear=True)
+        self.fake.sent.clear()
+        self.assertEqual(self.emit(), "queued")
+        self.assertEqual(len(self.fake.sent), 3)
+
+    def test_hook_events_cannot_touch_the_reserved_session(self):
+        e = self.engine()
+        for name in ("SessionStart", "Stop", "StopFailure"):
+            self.assertEqual(self.ev(e, name, sid="admission-monitor"), "ignored")
+        self.assertFalse(self.sdir.exists())
+        self.emit()
+        before = (self.sdir / "admission-monitor.json").read_text()
+        self.assertEqual(self.ev(e, "SessionStart", sid="admission-monitor"), "ignored")
+        self.assertEqual((self.sdir / "admission-monitor.json").read_text(), before)
+
+    def test_sweep_never_stales_the_reserved_session_but_retries_delivery(self):
+        rec = sn.new_record("admission-monitor", self.t)
+        rec["state"] = "RUNNING"
+        self.sdir.mkdir(parents=True)
+        sn.save_record(self.sdir, rec)
+        self.advance(10**6)
+        self.engine().sweep()
+        self.assertEqual(self.rec("admission-monitor")["state"], "RUNNING")
+        fake = Fake(fail={"macos": "network"})
+        self.emit(self.engine(fake=fake))
+        self.assertTrue(self.rec("admission-monitor")["pending"])
+        self.advance(1000)
+        self.fake.sent.clear()
+        out = self.engine().sweep()
+        self.assertEqual(out["stale"], 0)
+        self.assertIn("macos", self.names())
+
+    def test_corporate_profile_and_session_refuse_remote_backends(self):
+        fake = Fake(fail={"macos": "network"})
+        self.emit(self.engine(fake=fake))                       # personal: queued, macos failing so the entry stays pending
+        self.assertEqual(self.rec("admission-monitor")["pending"][0]["backends"]["ntfy"]["status"], "sent")
+        for mutate in ("profile", "session"):
+            self.setUp()
+            fake = Fake(fail={"macos": "network", "ntfy": "network", "pushover": "network"})
+            self.emit(self.engine(fake=fake))
+            rec = self.rec("admission-monitor")
+            if mutate == "session":
+                rec["corporate"] = True
+                sn.save_record(self.sdir, rec)
+            self.advance(1000)
+            c = cfg(profile="corporate") if mutate == "profile" else cfg()
+            remote = Fake()
+            sn.Engine(self.sdir, c, remote.table(), clock=lambda: self.t, sleep=lambda s: None).sweep()
+            self.assertEqual({n for n, _ in remote.sent} & {"ntfy", "pushover"}, set(), mutate)
+            st = {k: v["status"] for k, v in self.rec("admission-monitor")["pending"][0]["backends"].items()} if self.rec("admission-monitor")["pending"] else {}
+            self.assertNotIn("sent", [st.get("ntfy"), st.get("pushover")], mutate)
+
+    def test_clear_with_a_notice_in_flight_does_not_silence_the_recurrence(self):
+        self.emit(self.engine(fake=Fake(fail={"macos": "network"})))
+        self.assertTrue(self.rec("admission-monitor")["pending"])
+        self.engine().emit_resource({}, clear=True)
+        self.advance(1000)
+        self.fake.sent.clear()
+        self.engine().sweep()
+        self.assertIn("macos", self.names())                 # the in-flight notice is still delivered
+        self.assertEqual(self.emit(), "queued")              # and its late tombstone does not dedup the recurrence
+
+    def test_reserved_session_id_is_case_insensitive(self):
+        e = self.engine()
+        for sid in ("ADMISSION-MONITOR", "Admission-Monitor"):
+            self.assertEqual(self.ev(e, "SessionStart", sid=sid), "ignored")
+        self.assertFalse(self.sdir.exists())
+        rec = sn.new_record("admission-monitor", self.t)
+        rec["state"] = "RUNNING"
+        self.sdir.mkdir(parents=True)
+        sn.save_record(self.sdir, rec)
+        self.advance(10**6)
+        self.engine().sweep()
+        self.assertEqual(self.rec("admission-monitor")["state"], "RUNNING")
+
+    def test_transient_unreadable_record_is_not_quarantined(self):
+        self.sdir.mkdir(parents=True)
+        path = self.sdir / "admission-monitor.json"
+        path.write_text("{")
+        orig = sn.read_regular
+        sn.read_regular = lambda p, limit: (None, "unreadable:5")
+        try:
+            self.assertEqual(self.emit(), "untrusted:unreadable:5")
+        finally:
+            sn.read_regular = orig
+        self.assertEqual(path.read_text(), "{")
+        self.assertFalse((self.sdir / "admission-monitor.json.corrupt").exists())
+
+    def test_corrupt_marker_as_symlink_is_replaced_and_as_directory_fails_cleanly(self):
+        self.sdir.mkdir(parents=True)
+        path, marker = self.sdir / "admission-monitor.json", self.sdir / "admission-monitor.json.corrupt"
+        target = self.tmp / "elsewhere"
+        target.write_text("keep")
+        marker.symlink_to(target)
+        path.write_text("{")
+        self.assertEqual(self.emit(), "queued")
+        self.assertEqual((target.read_text(), marker.is_symlink(), marker.read_text()), ("keep", False, "{"))
+        marker.unlink()
+        marker.mkdir()
+        path.write_text("{")
+        self.assertEqual(self.emit(cause="frozen-queue"), "untrusted:corrupt")
+        self.assertEqual(path.read_text(), "{")
+
+    def test_os_error_returns_error_without_traceback_or_path(self):
+        blocker = self.tmp / "afile"
+        blocker.write_text("x")
+        self.assertEqual(sn.Engine(blocker / "state", cfg(), self.fake.table()).emit_resource(dict(self.REQ)), "error")
+        env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(blocker / "state"), SESSION_NOTIFY_CONFIG=str(self.tmp / "none.json"))
+        r = subprocess.run([sys.executable, str(SCRIPT), "emit-resource", "--cause", "disk-floor", "--recovery", "none", "--owner-action", "reclaim-disk"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertNotIn(str(blocker), r.stdout + r.stderr)
+
+    def test_cli_exit_codes_and_usage_error_writes_nothing(self):
+        env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(self.sdir), SESSION_NOTIFY_CONFIG=str(self.tmp / "none.json"))
+        run = lambda *a: subprocess.run([sys.executable, str(SCRIPT), "emit-resource", *a], capture_output=True, text=True, env=env)
+        ok = ("--cause", "disk-floor", "--recovery", "none", "--owner-action", "reclaim-disk")
+        for args in (ok, ok + ("--signature", "0123456789abcdef"), ("--clear",)):
+            self.assertEqual(run(*args).returncode, 0, args)
+        shutil_rmtree = __import__("shutil").rmtree
+        shutil_rmtree(self.sdir)
+        for args in (("--cause", "bogus", "--recovery", "none", "--owner-action", "reclaim-disk"), ok + ("--signature", "short"), ("--cause", "disk-floor")):
+            self.assertEqual(run(*args).returncode, 2, args)
+        self.assertFalse(self.sdir.exists())
 
 
 class Cycle4Regressions(Base):
@@ -1923,6 +2182,119 @@ class ConfigAndCheckpoint(Base):
                     self.assertEqual(h["type"], "command")
                     self.assertIn("session-notify.py hook", h["command"])
                     self.assertLessEqual(h["timeout"], 15)
+
+
+class TelegramBackend(Base):
+    """SPE-176 slice 3. Dummy token only; http_post is replaced, so nothing here ever reaches a network."""
+    TOKEN, CHAT = "123456:TEST-ONLY", "-100123"
+    PAYLOAD = {"title": "Claude Code: FAILED", "body": "work SPE-1"}
+
+    def setUp(self):
+        super().setUp()
+        self.posts = []
+        self.real_post = sn.http_post
+        sn.http_post = lambda url, data, headers, timeout=4: self.posts.append((url, data, headers)) or None
+        self.addCleanup(setattr, sn, "http_post", self.real_post)
+        for k in ("SN_TG_TOKEN", "SN_TG_CHAT"):
+            self.addCleanup(os.environ.pop, k, None)
+
+    def tg(self, **over):
+        return dict({"approved_destination": "api.telegram.org", "token_env": "SN_TG_TOKEN", "chat_id_env": "SN_TG_CHAT"}, **over)
+
+    def env(self):
+        os.environ["SN_TG_TOKEN"], os.environ["SN_TG_CHAT"] = self.TOKEN, self.CHAT
+
+    def secret(self, name, value, mode=0o600):
+        f = self.tmp / name
+        f.write_text(value + "\n")
+        os.chmod(f, mode)
+        return str(f)
+
+    def test_success_posts_form_to_the_bot_api_host(self):
+        self.env()
+        self.assertIsNone(sn.send_telegram(self.PAYLOAD, self.tg()))
+        url, data, _ = self.posts[0]
+        self.assertTrue(url.startswith("https://api.telegram.org/bot") and url.endswith("/sendMessage"))
+        form = sn.urllib.parse.parse_qs(data.decode())
+        self.assertEqual(sorted(form), ["chat_id", "text"])
+        self.assertEqual(form["text"], ["Claude Code: FAILED\nwork SPE-1"])
+
+    def test_refused_when_destination_mismatches_or_credentials_missing_or_malformed(self):
+        self.env()
+        for bad in (self.tg(approved_destination=""), self.tg(approved_destination="api.pushover.net"), self.tg(token_env="SN_TG_UNSET"),
+                    self.tg(chat_id_env="SN_TG_UNSET")):
+            self.assertEqual(sn.send_telegram(self.PAYLOAD, bad), "not-configured")
+        os.environ["SN_TG_TOKEN"] = "123456:a/../b?x"   # would alter the URL path
+        self.assertEqual(sn.send_telegram(self.PAYLOAD, self.tg()), "not-configured")
+        self.assertEqual(self.posts, [])
+
+    def test_credential_files_need_private_regular_owned_files(self):
+        os.symlink(self.secret("real", self.TOKEN), self.tmp / "link")
+        for label, path in {"world readable": self.secret("open", self.TOKEN, 0o644), "group readable": self.secret("grp", self.TOKEN, 0o640),
+                            "relative": "tok", "missing": str(self.tmp / "nope"), "symlink": str(self.tmp / "link")}.items():
+            self.assertEqual(sn.send_telegram(self.PAYLOAD, self.tg(token_env="SN_TG_UNSET", token_file=path, chat_id_file=self.secret("c", self.CHAT))),
+                             "not-configured", label)
+        ok = self.tg(token_env="SN_TG_UNSET", chat_id_env="SN_TG_UNSET", token_file=self.secret("tok", self.TOKEN), chat_id_file=self.secret("chat", self.CHAT))
+        self.assertIsNone(sn.send_telegram(self.PAYLOAD, ok))
+        self.assertEqual(self.posts[0][0], f"https://api.telegram.org/bot{self.TOKEN}/sendMessage")
+
+    def test_env_wins_over_file_when_set_and_non_empty(self):
+        self.env()
+        both = self.tg(token_file=self.secret("tok", "999999:FILE-ONLY"), chat_id_file=self.secret("chat", "555"))
+        sn.send_telegram(self.PAYLOAD, both)
+        os.environ["SN_TG_TOKEN"] = "   "
+        sn.send_telegram(self.PAYLOAD, both)
+        self.assertIn("bot123456:TEST-ONLY/", self.posts[0][0])
+        self.assertIn("bot999999:FILE-ONLY/", self.posts[1][0])
+
+    def test_token_is_scrubbed_from_exceptions_state_and_logs(self):
+        self.env()
+        def boom(url, data, headers, timeout=4):
+            raise RuntimeError("connect failed for " + url)
+        sn.http_post = boom
+        self.assertEqual(sn.send_telegram(self.PAYLOAD, self.tg()), "error-RuntimeError")
+        c = cfg()
+        c["backends"]["telegram"].update(self.tg(enabled=True))
+        e = sn.Engine(self.sdir, c, sn.REAL_TRANSPORTS | {"macos": lambda p, x: None, "ntfy": lambda p, x: None, "pushover": lambda p, x: None},
+                      clock=lambda: self.t, sleep=lambda s: None)
+        self.ev(e, "UserPromptSubmit")
+        self.ev(e, "Notification", notification_type="permission_prompt")
+        pend = self.rec()["pending"][0]["backends"]["telegram"]
+        self.assertEqual((pend["status"], pend["attempts"]), ("failed", 1))   # a failed attempt, never a crash
+        for f in self.sdir.glob("*"):
+            if f.is_file():
+                self.assertNotIn(self.TOKEN, f.read_text())
+                self.assertNotIn("TEST-ONLY", f.read_text())
+
+    def test_refused_for_corporate_profile_marker_and_session(self):
+        self.env()
+        c = cfg()
+        c["backends"]["telegram"].update(self.tg(enabled=True))
+        self.assertEqual(sn.backend_allowed("telegram", c, False), (True, None))
+        self.assertEqual(sn.backend_allowed("telegram", c, True), (False, "refused-corporate"))
+        self.assertEqual(sn.backend_allowed("telegram", dict(c, profile="corporate"), False), (False, "refused-corporate"))
+        c["backends"]["telegram"]["approved_destination"] = ""
+        self.assertEqual(sn.backend_allowed("telegram", c, False), (False, "no-approved-destination"))
+        c["backends"]["telegram"].update(enabled=False)
+        self.assertEqual(sn.backend_allowed("telegram", c, False), (False, "disabled"))
+        # corporate marker in the working directory: skipped at delivery, never sent
+        c = cfg(corporate_markers=[self.work.name])
+        c["backends"]["telegram"].update(self.tg(enabled=True))
+        self.ev(self.engine(c), "UserPromptSubmit")
+        self.ev(self.engine(c), "Notification", notification_type="permission_prompt")
+        self.assertEqual(self.posts, [])
+
+    def test_redirects_are_never_followed(self):
+        h = sn._NoRedirect()
+        self.assertIsNone(h.redirect_request(sn.urllib.request.Request("https://api.telegram.org/x"), None, 302, "Found", {}, "https://evil.example/"))
+
+    def test_off_by_default_and_listed_in_default_config_and_schema(self):
+        t = sn.DEFAULT_CONFIG["backends"]["telegram"]
+        self.assertIs(t["enabled"], False)
+        self.assertEqual(t["approved_destination"], "")
+        self.assertEqual(set(t), set(sn.CONFIG_SCHEMA["backends"]["telegram"]))
+        self.assertIn("telegram", sn.BACKEND_NAMES)
+        self.assertIn("telegram", sn.REAL_TRANSPORTS)
 
 
 if __name__ == "__main__":

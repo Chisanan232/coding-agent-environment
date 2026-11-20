@@ -407,6 +407,13 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
 - `queue advance`: grants the head, then tries the next entry with the budget recomputed from the single host sample taken before the
   lock, and stops at the first entry that does not fit (no overtaking, no backfill). Grants made in the same call count toward the
   floor. `ok` also covers a `budget:` reason.
+- `queue advance` and memory (SPE-175): the CLI grants the head only when the SPE-117 memory gate admits, because `queue claim` runs that
+  gate and a grant it would refuse only holds a lane for its whole window and then lapses unclaimed. The gate takes 10 s or more, so it
+  runs outside the lock and only when the head otherwise fits (a lane is free, the floor holds, the budget allows); otherwise it is not
+  asked. A refusal grants nothing, leaves every entry `QUEUED` in FIFO order, still expires lapsed grants and waits, and reports reason
+  `memory-gate: <first line of the gate verdict> ; <its first reason line>` (capped at 400 characters) (counted as `ok`). The library function stays memory-free unless given `memory_fn`.
+- A grant is not a start. An entry is running only in state `CLAIMED` with `holder.workload.observed` true and a live workload; report
+  `GRANTED` as "granted, not started" together with the claim refusal text.
 - `queue claim`: re-checks the budget under the lock; a refusal keeps the grant.
 - A job that was claimed before this change has no `granted_jobs`; as a Cargo-class holder it is charged every core, so it holds the
   second lane closed until it finishes.
@@ -466,3 +473,79 @@ la-cargo --status
 Rollback: `install -m 0755 ~/.local/bin/la-cargo.pre-SPE-174 ~/.local/bin/la-cargo` (its sha256 is the baseline above). Run
 `disk-admission.py status --json` and `queue status --json` afterwards: a killed build that never released leaves an UNRESOLVED
 holder that `release --label la-cargo-<pid>` (or `queue release --id qNNNNNN --confirm-ended`) clears once cargo has ended.
+
+## Dead waiters and refused claims (SPE-176)
+
+**Waiter.** `queue enqueue --waiter-pid PID` is optional and names the supervising wrapper that will claim the entry (`heavy-run` and
+`la-cargo` pass their own pid). The pid must be a live process of this user that is the enqueue process, its parent or an ancestor, so
+a session cannot declare an unrelated process. The entry stores `waiter: {pid, start_token}` (the same pid-reuse-safe identity as a
+holder). Without the flag there is no `waiter` field, and such a handoff entry, which someone claims later by hand, is never
+auto-cancelled.
+
+**Cancellation.** `queue advance`, under the queue lock and before it grants, cancels a QUEUED, ELIGIBLE or GRANTED entry whose waiter is
+provably gone: no such pid, or the pid now has a different start token. The receipt is `cancelled` with `evidence: waiter-exited`, the
+granted marker is dropped, and a granted lane and its bytes are free for the next entry in the same advance. A live waiter changes
+nothing, an uninspectable one is treated as alive, and a CLAIMED entry is never touched by this rule (the holder rules apply).
+
+**Claim refusals.** A `queue claim` refused with exit 77 appends a `claim-refused` receipt with `kind` one of `memory-gate`, `floor`,
+`lane`, `budget` or `other` (derived from the reason prefix; no free text, no argv). At most one receipt is written per entry and kind
+per 10 minutes, judged from the newest matching line in `receipts.jsonl` (which still rotates at 1 MiB), and the entry itself is not
+changed, so the grant is kept as before.
+
+Notes: the stored `waiter.start_token` is a UTC `ps lstart` string (not `process_token`'s local-time format), so a timezone or DST
+change cannot make a live waiter look replaced; waiter pids at or below 1 are refused. Cancellation is skipped while the disk tier
+cannot be measured (advance returns early before it). Enqueue that dedupes to an existing live entry returns that entry and does not
+refresh its waiter.
+
+## Bounded hand-off grants (SPE-176, ADR 0019)
+
+A queue entry enqueued without `--waiter-pid` is a manual hand-off. `queue advance` still grants it strictly in order and in its place, but
+the grant window is `HANDOFF_GRANT_S` (1200 s, 20 min) instead of the 3600 s default, because observed grant-to-claim p99 is 29 min and an
+absent owner must not hold the only usable lane for a full hour. The granted receipt, the `granted/<id>` marker and `grant.expires` all carry
+the same shorter expiry; the grant object stays exactly `{at, expires}`. When the window lapses the entry expires through the existing
+EXPIRED path and the owner re-enqueues (joining the end of the line). Entries with a declared waiter keep `min(grant_s, 4 h)`, and an
+explicit smaller `--grant-s` still wins for either kind. Lane and byte accounting for an unclaimed grant is unchanged.
+
+## Bounded hand-off grants (SPE-176, ADR 0019)
+
+A queue entry enqueued without `--waiter-pid` is a manual hand-off. `queue advance` still grants it strictly in order and in its place, but
+the grant window is `HANDOFF_GRANT_S` (1200 s, 20 min) instead of the 3600 s default, because observed grant-to-claim p99 is 29 min and an
+absent owner must not hold the only usable lane for a full hour. The granted receipt, the `granted/<id>` marker and `grant.expires` all carry
+the same shorter expiry; the grant object stays exactly `{at, expires}`. When the window lapses the entry expires through the existing
+EXPIRED path and the owner re-enqueues (joining the end of the line). Entries with a declared waiter keep `min(grant_s, 4 h)`, and an
+explicit smaller `--grant-s` still wins for either kind. Lane and byte accounting for an unclaimed grant is unchanged.
+
+## Stall detection (SPE-176, ADR 0018)
+
+`scripts/admission-monitor.py tick` reads the queue, the latch file and the process table and reports whether queued work is globally
+stalled and why. It is observe-only unless started with `--act`, which allows one bounded recovery verb (`queue advance`). It never signals,
+resets the latch, changes a threshold or deletes. `status` shows the last result, `callers` lists admission runners found on disk by
+protocol, and `plist` prints the launchd agent without installing it; installing it (`launchctl bootstrap gui/$(id -u) <plist>`) is an
+owner-run step. A grant is not a start: only a claim, a release or CPU growth of a claimed workload counts as progress.
+
+## Guarded recovery library (not wired)
+
+`scripts/admission-recovery.py` (SPE-176 slice 1b, ADR 0019 sections 3, 5 and 6) is a self-contained library that nothing imports or calls: no
+CLI, no monitor tick, no hook. It exists so the monitor slice can act only through audited, conclusive-evidence guards.
+
+- `abandoned_unstarted` / `do_cancel`: a GRANTED entry with no holder, release or workload, whose waiter is provably gone (the scheduler's own
+  `_waiter_gone`; uninspectable or malformed is not gone) or absent, whose owner mechanism is `gone` or `refused-permanently`, older than the 5 min
+  notice threshold, and that a fresh re-read still agrees with, is cancelled through `queue cancel --id` only (no session id, no end
+  confirmation, no state-file edit). `refused-permanently` also needs the newest scheduler receipt for the entry to be a `claim-refused` of a permanent
+  kind made after the grant; a later receipt of any kind, or a transient kind (`memory-gate`, `floor`, `lane`, `budget`, `other`), voids it. An
+  `unknown` owner never cancels. `verify_recovery` then reports `pending`, `verified` or `failed` from scheduler status; it never assumes success.
+- `obsolete_wrapper` / `terminate_wrapper`: a wrapper or waiter (real int pid above 1, not this process or its parent) whose entry is terminal
+  or gone, with matching pid, start token, uid, process group and parent, a matching executable identity, no workload by evidence and no child or
+  detached workload, gets exactly one SIGTERM, a bounded wait, and a `failed-to-terminate` report on survival. Never SIGKILL, never a workload.
+  A terminal entry only proves the queue no longer needs the pid, so identity is checked too: a wrapper that exec'd the workload keeps its pid and token.
+- Registry contract: `registered_fn(qid)` returns `{pid, start_token, pgid, ppid, exe}` recorded by the wrapper at enqueue, where `exe` is the
+  interpreter plus script identity of heavy-run or la-cargo. `exe_fn(pid)` returns the live identity and `holds_workload_fn(pid)` whether the
+  process holds a cargo/target lock; both default to unknown, and unknown refuses. `heavy-run` and `la-cargo` do not yet record any of this, so the
+  library stays inert until a wiring slice supplies the registry, `owner_exec_fn`, `exe_fn` and `holds_workload_fn`.
+- One exclusive flock (`recovery.lock` in the monitor dir, which must be a private 0700 real directory owned by us) serialises recoveries and the
+  verify receipt write; the second recovery gets `busy`. Every decision and action is a closed-schema 0600 line in `recovery-receipts.jsonl`,
+  rotated at 1 MiB.
+- `load_terminate_allowlist` / `terminate_allowed_for_workload` prepare a broader, closed-schema termination policy. The file is absent by
+  default, the policy is disabled, and neither function is used by the code above. Enabling it needs separate owner approval.
+
+Default wiring (`default_env`) leaves the owner-execution and wrapper-registry readers uninspectable, so by default nothing is abandoned or obsolete.
