@@ -699,21 +699,33 @@ def _fold_path(path):
 
 
 def excl_identity(key):
-    """Comparison identity of one exclusion key, computed at decision time so already-stored keys (normpath, pre-realpath) and newly
-    computed ones that name the same directory compare equal. A cargo-target key whose directory exists is identified by its
-    (st_dev, st_ino) after following symlinks; otherwise by its folded realpath. Any other key is compared as written."""
-    if not (isinstance(key, str) and key.startswith(CARGO_KEY)):
-        return key
-    path = key[len(CARGO_KEY):]
-    try:
-        info = os.stat(path)
-        return 'cargo-target-inode:%d:%d' % (info.st_dev, info.st_ino)
-    except (OSError, ValueError):
-        pass
-    try:
-        return CARGO_KEY + _fold_path(os.path.realpath(path))
-    except (OSError, ValueError):
-        return key
+    """Comparison tokens of one exclusion key, computed at decision time: a sorted list; two keys clash when their lists share any token
+    (excl_keys_clash). Every key keeps its raw string as a token, so a clash the old string comparison saw is never lost. A cargo-target
+    key adds its folded realpath (NFC, case-folded on macOS) and, when the directory exists, its (st_dev, st_ino) after following
+    symlinks. Several tokens instead of one form keep the comparison stable when the directory is created or removed between two stats
+    (a cargo build making its target, a cargo clean): the folded realpath matches either way. So the comparison can only add clashes
+    relative to string equality, never remove one.
+
+    Known limit: os.stat and realpath run under the admission lock; a hung network mount under a target path would stall the pass. Cargo
+    target directories are local in this environment."""
+    tokens = {key}
+    if isinstance(key, str) and key.startswith(CARGO_KEY):
+        path = key[len(CARGO_KEY):]
+        try:
+            tokens.add(CARGO_KEY + _fold_path(os.path.realpath(path)))
+        except (OSError, ValueError):
+            pass
+        try:
+            info = os.stat(path)
+            tokens.add('cargo-target-inode:%d:%d' % (info.st_dev, info.st_ino))
+        except (OSError, ValueError):
+            pass
+    return sorted(tokens)
+
+
+def excl_keys_clash(a, b):
+    """True when exclusion keys `a` and `b` name the same thing (they share an excl_identity token)."""
+    return bool(set(excl_identity(a)) & set(excl_identity(b)))
 
 
 def resolve_workload(name, mem_gib, cpus, nbytes, env=None, home=None, cwd=None, session_id=None, ticket=None, now=None, argv=None):
@@ -2788,8 +2800,9 @@ def budget_request(record, nbytes, label):
 
 
 def _excl_ids(record):
+    """One token list per key (excl_identity); a record built without them compares its keys as written."""
     ids = record.get('excl_ids')
-    return ids if isinstance(ids, list) and len(ids) == len(record['excl_keys']) else list(record['excl_keys'])
+    return ids if isinstance(ids, list) and len(ids) == len(record['excl_keys']) else [[k] for k in record['excl_keys']]
 
 
 def budget_holders(live, orphans, entries, now, skip_id=None):
@@ -2918,12 +2931,17 @@ def budget_decision(host, reservations, request, caps):
         out['projected_bytes'] = base + request['mem_bytes']
         cpu_need = request['cpu_slots']
         reasons += _resource_reasons(base + request['mem_bytes'], limit, headroom, cpu_used, cpu_need, cpu_limit)
-    # Keys are compared by identity (excl_identity, computed by budget_holder / budget_request at decision time), so two spellings of
-    # one directory clash; the request's own spelling is what a reason or receipt shows. A record built without ids compares as written.
+    # Keys are compared by identity tokens (excl_identity, computed by budget_holder / budget_request at decision time): two keys clash
+    # when they share any token, so two spellings of one directory clash and no clash of the raw strings is ever lost. The request's own
+    # spelling is what a reason or receipt shows.
     taken = {}
-    for ident, key in zip(_excl_ids(request), request['excl_keys']):
-        taken.setdefault(ident, key)
-    shared = [(h, sorted({taken[i] for i in set(taken) & set(_excl_ids(h))})) for h in reservations]
+    for tokens, key in zip(_excl_ids(request), request['excl_keys']):
+        for token in tokens:
+            taken.setdefault(token, set()).add(key)
+
+    def held(h):
+        return {token for tokens in _excl_ids(h) for token in tokens}
+    shared = [(h, sorted({k for token in set(taken) & held(h) for k in taken[token]})) for h in reservations]
     shared = [(h, keys) for h, keys in shared if keys]
     clash = sorted({h['label'] for h, _ in shared})
     if clash:
@@ -3328,7 +3346,8 @@ def _per_pass_memo(fn):
 
 
 def _excl_id_set(entry):
-    return {excl_identity(k) for k in entry.get('excl_keys') or []}
+    """Every identity token of the entry's keys: two such sets intersect exactly when some pair of keys clashes."""
+    return {token for k in entry.get('excl_keys') or [] for token in excl_identity(k)}
 
 
 def _protects_head(host, head, cand, blockers, live, orphans, granted, now, lane_tier, free, reserved, in_use, lanes, latch=False):
