@@ -1,6 +1,6 @@
 # Owner approval packet: stall monitor, sign-in watch, Telegram delivery, four lanes, routing (SPE-176)
 
-Status: **prepared for the owner; nothing in this packet is installed, enabled or authorized.** Written 2026-11-20 against main `62ec5a2` plus PR #282.
+Status: **prepared for the owner; nothing in this packet is installed, enabled or authorized.** Written 2026-11-20 against main `42a258a` (sign-in watch merged as #282; the `test-notice` command below is PR-pending until noted merged).
 Each item below is **separately selectable**. Approving one does not approve another. Nothing here asks the owner to paste a secret into chat: no token or
 chat id is typed, printed or logged by any step. LaunchAgents created from an agent session were classifier-denied as "Unauthorized Persistence" (2026-11-08),
 so every install below is **owner-run** from the owner's own terminal (`! <command>` in the Claude prompt runs it in the session).
@@ -11,12 +11,12 @@ so every install below is **owner-run** from the owner's own terminal (`! <comma
 |---|---|---|---|---|---|---|
 | Stall monitor (queue wait, unclaimed grant, overdue workload) | yes (#268, #275, #277) | yes (canonical `62ec5a2`) | **no** | **no** | no (`tick --act` not running) | no |
 | Guarded recovery (SIGTERM of obsolete wrappers, cancel of abandoned unstarted grants) | yes (#276, #281) | yes | no | no | no | isolated acceptance only (25 tests, real throwaway processes) |
-| 20-minute hand-off grant window | yes (#274) | yes | n/a | n/a | yes (scheduler, live since the checkout update) | partly: q000814 was granted 15:07:07Z and claimed 15:10:27Z inside the window; no lapse has been observed yet |
-| Sign-in watch | PR #282 open | after merge | **no** | **no** | n/a (read-only) | no |
+| 20-minute hand-off grant window | yes (#274) | yes | n/a | n/a | yes (scheduler, live since the checkout update) | partly: from live receipts q000814 was granted 15:07:07Z and claimed 15:10:27Z inside the window (not otherwise sourced in docs); no lapse observed |
+| Sign-in watch | yes (#282) | yes (canonical `42a258a`) | **no** | **no** | n/a (read-only) | no |
 | Telegram backend (+ supervisor credential-file reuse) | yes (#273, #279) | yes | n/a | **no** (no config exists) | n/a | no |
-| Four heavy lanes | yes (#278), **shipped OFF** | yes | n/a | n/a | off | no lane-4 run exists |
+| Four heavy lanes | yes (#278), **shipped OFF** | yes | n/a | n/a | off | no lane-4 run is known to exist (not independently checked; the flag has never been on) |
 | Incremental-cache classifier correction | yes (#280) | yes | n/a | n/a | n/a | real-tree check True in 1.2-8.2 s |
-| Four-tier routing (Haiku/Sonnet/Opus/Fable) | policy + agents installed 2026-11-19 | live | n/a | n/a | n/a | forced Haiku/Opus delegation verified; natural delegation 0 of 6 / 0 of 7 |
+| Four-tier routing (Haiku/Sonnet/Opus/Fable) | policy + agents installed 2026-11-19 | live | n/a | n/a | n/a | forced Haiku/Opus delegation verified; natural delegation 0 of 6 (documented pilot); my own live count 0 of 7 (unsourced) |
 
 Live queue evidence: the queue ran continuously from 2026-11-19 11:33Z (q000812 through q000824 across AASM, Libra, LocalAgent and Circinus). The only
 standing refusals were resource or exclusion-key waits (`disk-floor`, `excl_key overlap with p2576d`), never a latch.
@@ -41,12 +41,11 @@ chmod 600 ~/.config/coding-agent-environment/session-notify.json
 # edit backends.telegram to: {"enabled": true, "approved_destination": "api.telegram.org", "credentials_json": "/Users/bryant/.config/engineering-supervisor/credentials.json"}
 ```
 
-Verify delivery (sends ONE real message, then clears the dedup record):
+Verify delivery (sends ONE real message with fixed text "Claude Code: test notice, ignore"; its own record, shares no state with any real alert; repeat runs within 10 minutes are deduplicated). Requires the `test-notice` PR to be merged (this packet is held until then):
 
 ```bash
-python3 scripts/session-notify.py emit-resource --cause unobservable --recovery observe-only --owner-action inspect-memory-admission --signature 00000000000000d1 --strict
-# expect: emit-resource: queued delivery=sent  and a Telegram message in your owner chat
-python3 scripts/session-notify.py emit-resource --clear
+python3 scripts/session-notify.py test-notice --strict
+# expect: test-notice: queued delivery=sent  and a Telegram message in your owner chat
 ```
 
 Rollback: set `backends.telegram.enabled` to `false` (or delete the file). No other state changes. Unverified until you run it: that the bot may message you
@@ -79,8 +78,7 @@ first exists to check them; after you sign in `claude-auth-watch.py reconcile --
 ## D. Four heavy lanes: enable (separate reviewed one-line PR, NOT part of this packet's approvals unless you say so)
 
 Shipped OFF (`FOURTH_LANE_ENABLED = False`). Enabling changes the live default for every product session sharing the scheduler. ADR 0017 rev 8 prerequisites, all
-required: every active checkout current (a stale checkout's memory check arms the shared latch with four trees running: 116 unstamped and 55 outdated checkouts were
-reported by `admission-monitor.py callers` on 2026-11-19), a fresh three-lane trial report PASS, measured headroom (lane 4 needs free space minus all reservations
+required: every active checkout current (a stale checkout's memory check arms the shared latch with four trees running: `admission-monitor.py callers` reported many unstamped and outdated checkouts on 2026-11-19 (116 and 55 by my count from that run; unverified, re-run it before deciding)), a fresh three-lane trial report PASS, measured headroom (lane 4 needs free space minus all reservations
 minus the request >= 200 GiB, no unmanaged build trees, no past-TTL/unresolved holder), and the monitor from B running so a stall is detected. Safe refusal is
 tested (`budget: lane 4 needs ...`, never latches); live lane-4 behaviour is NOT_VERIFIED. **Recommendation:** approve B and C first, then ask for D after a day of
 observation.
@@ -90,7 +88,7 @@ observation.
 1. **Codex thread cap 8 to 7:** live `~/.codex/config.toml` has 8, policy is 7. Review then apply: `cd ~/Bryant-Developments/coding-agent-environment-main-view && ./scripts/profile-install.sh --routing --dry-run`, then `./scripts/profile-install.sh --routing --apply` (reconciles only positively owned Codex routing; it does not serialize your user config).
 2. **`autoMode.allow` lacks `$defaults`:** `scripts/permission-rollout.py verify` exits 1; the text lives in `~/.claude/settings.json`, which the host gates against agent edits (SPE-106/118).
 3. **Haiku-alias plugin agents** (`caveman:cavecrew-investigator`, `-reviewer` declare bare `model: haiku`): either amend SPE-106 to allow one deny, add an ask rule, or admit them in the routing table (SPE-106 keeps `permissions.deny` empty).
-4. **Natural delegation** to `haiku-worker` / `opus-architect` is 0 of 6 / 0 of 7 unforced; wording is not the lever (measured). Forced delegation works. Decide whether to keep opt-in (default) or fund a routing experiment.
+4. **Natural delegation** to `haiku-worker` / `opus-architect` is 0 of 6 in the documented pilot and 0 of 6 with strict wording (docs/LIVE-ROLLOUT-2026-11-19.md); 0 of 7 qualifying live runs by my own count (not sourced in docs); wording is not the lever (measured). Forced delegation works. Decide whether to keep opt-in (default) or fund a routing experiment.
 5. **Fable:** routed nowhere by design; the one validation consult is recorded (blocker ca7955486c2b5007, about $1.29 list estimate, closed, duplicates refused). No action unless you want another approved consult.
 
 ## F. What the agent will do next without approval
