@@ -192,7 +192,7 @@ INCR_SESSION_DIR = re.compile(r's-[0-9a-z]+-[0-9a-z]+-[0-9a-z]+(-working)?')
 INCR_SESSION_LOCK = re.compile(r's-[0-9a-z]+-[0-9a-z]+\.lock')
 INCR_SESSION_FILES = frozenset(('dep-graph.bin', 'dep-graph.part.bin', 'query-cache.bin', 'work-products.bin', 'metadata.rmeta'))
 INCR_OBJECT_FILE = re.compile(r'[0-9a-z]{25}\.o')
-INCR_LOCK_MAX_BYTES = 4096
+INCR_LOCK_MAX_BYTES = 0   # every real lock file is empty; any content under a lock name is not rustc's
 INCR_TREE_LIMIT = 1_000_000
 
 
@@ -230,6 +230,9 @@ def is_generated_incremental_tree(root, limit=INCR_TREE_LIMIT, seconds=None, clo
                                 for f in files:
                                     if tick() or not regular(f) or not (f.name in INCR_SESSION_FILES
                                                                         or INCR_OBJECT_FILE.fullmatch(f.name)):
+                                        return False
+                                    # Real object files are never empty (smallest observed 584 bytes).
+                                    if f.name.endswith('.o') and f.stat(follow_symlinks=False).st_size == 0:
                                         return False
                         else:
                             return False

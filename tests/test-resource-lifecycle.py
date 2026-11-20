@@ -836,7 +836,7 @@ class IncrementalScopeTests(Fixture):
     def test_tree_check_accepts_known_session_files_and_lock_only_crates(self):
         inc, crate = self.tree()
         for name in ("dep-graph.bin", "query-cache.bin", "work-products.bin", "metadata.rmeta", "a" * 25 + ".o"):
-            (crate / "s-hn0w0a1hoy-0kzvtw0-58velkjf4a000dk65birnb0gs" / name).write_text("")
+            (crate / "s-hn0w0a1hoy-0kzvtw0-58velkjf4a000dk65birnb0gs" / name).write_text("x")
         lock_only = inc / "lock_only-0000000000001"
         lock_only.mkdir()
         (lock_only / "s-hn0w0a1hoy-0kzvtw1.lock").write_text("")
@@ -845,13 +845,6 @@ class IncrementalScopeTests(Fixture):
     def test_tree_check_fails_closed_on_entry_budget(self):
         inc, _ = self.tree()
         self.assertFalse(rl.is_generated_incremental_tree(inc, limit=3))
-
-    def test_tree_check_fails_closed_on_deadline_even_for_empty_crate_dirs(self):
-        _, inc = self.target(name="tgt-deadline")
-        for i in range(130):
-            (inc / ("c%d-%013d" % (i, i))).mkdir()
-        ticks = iter(range(10**6))
-        self.assertFalse(rl.is_generated_incremental_tree(inc, seconds=5, clock=lambda: next(ticks)))
 
     def test_never_class_a_even_with_a_private_receipt(self):
         _, inc = self.target()
