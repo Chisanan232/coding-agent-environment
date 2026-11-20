@@ -97,7 +97,26 @@ RESOURCE_REPO = "coding-agent-environment"
 SIGNATURE = re.compile(r"[0-9a-f]{16}")
 # Closed `detail` charset of a sign-in notice: letters, digits, space and . _ ( ) , + = - only (no quotes, brackets, slash, colon, newline, markdown or URL syntax).
 AUTH_DETAIL = re.compile(r"(?=.*[A-Za-z0-9])[A-Za-z0-9 ._(),+=-]{1,160}")
-BACKEND_NAMES = {"macos", "ntfy", "pushover", "telegram"}
+BACKEND_NAMES = {"macos", "ntfy", "pushover", "telegram", "zeroclaw-spool"}
+# ZeroClaw incident spool (SPE-176): a local, credential-free hand-off to the engineering-supervisor. The file schema below is the contract the
+# supervisor consumer validates; docs/schemas/zeroclaw-incident-spool-v1.schema.json is its machine-readable twin. Keep the three in step.
+SPOOL_BACKEND = "zeroclaw-spool"
+SPOOL_KINDS = ("unclaimed-handoff", "queue-wait-excessive", "workload-over-deadline", "auth-interrupted", "recovered", "notify-test")
+NOTICE_KINDS = SPOOL_KINDS + ("session",)   # `session`: every notice that has no spool kind (hook-driven session states, disk and memory stalls)
+SPOOL_TRANSITIONS = ("opened", "escalated", "recovered", "test")
+SPOOL_SEVERITIES = ("info", "action")
+SPOOL_KEY = re.compile(r"[0-9a-f]{32}")
+SPOOL_PROJECT = re.compile(r"[a-z0-9._-]{1,40}")
+SPOOL_REF = re.compile(r"[a-z0-9._:-]{1,64}")
+SPOOL_TEXT = re.compile(r"[A-Za-z0-9 .,;:()+-]{1,120}")   # no slash, backslash, quote, equals, at-sign or hash: no path, id, command line or URL can pass
+SPOOL_TS = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+SPOOL_LEDGER = "zeroclaw-spool.ledger"   # not *.json: sweep and status treat every *.json in the state directory as a session record
+SPOOL_UNAVAILABLE = "spool-unavailable"
+SPOOL_ESCALATING_RECOVERY = {"lapsed", "wait-expiry-near", "recovery-exhausted"}
+SPOOL_KIND_OF_CAUSE = {"unclaimed-handoff": "unclaimed-handoff", "queue-wait-excessive": "queue-wait-excessive",
+                       "workload-over-deadline": "workload-over-deadline", "auth-required": "auth-interrupted",
+                       "remote-control-disconnect": "auth-interrupted", "signin-recovered": "recovered"}
+DEFAULT_SPOOL_SUBDIR = ".local/share/engineering-supervisor/state/incident-spool"
 DELIVERY_STATUSES = {"pending", "sending", "failed", "sent", "dropped", "skipped"}
 TERMINAL = {"sent", "dropped", "skipped"}
 
@@ -127,7 +146,9 @@ DEFAULT_CONFIG = {
         "ntfy": {"enabled": False, "approved_destination": "", "server": "https://ntfy.sh", "topic_env": "NTFY_TOPIC", "topic_file": "", "token_env": "", "token_file": ""},
         "pushover": {"enabled": False, "approved_destination": "", "token_env": "PUSHOVER_APP_TOKEN", "token_file": "", "user_env": "PUSHOVER_USER_KEY", "user_file": ""},
         "telegram": {"enabled": False, "approved_destination": "", "token_env": "TELEGRAM_BOT_TOKEN", "token_file": "", "chat_id_env": "TELEGRAM_CHAT_ID", "chat_id_file": "",
-                     "credentials_json": "", "chat_target": "owner"},
+                     "credentials_json": "", "chat_target": "owner", "kinds": list(NOTICE_KINDS)},
+        # Needs no credential and no Claude Code sign-in. `spool_dir` "" means <HOME>/.local/share/engineering-supervisor/state/incident-spool.
+        "zeroclaw-spool": {"enabled": False, "spool_dir": "", "project": "coding-agent-environment", "kinds": list(SPOOL_KINDS)},
     },
 }
 
@@ -258,7 +279,7 @@ FIELDS_SCHEMA = v_obj({"state": v_str(200), "repo": _OPT_STR, "ticket": _OPT_STR
                        "resume_trigger": _OPT_STR, "kind": _OPT_STR, "cause": v_opt(v_enum(CAUSE_TEXT)),
                        "recovery": v_opt(v_enum(RECOVERY_TEXT)), "owner_action": v_opt(v_enum(OWNER_ACTION_TEXT)),
                        "detail": v_opt(v_str(160, AUTH_DETAIL)),
-                       "notice": v_opt(v_enum(("test",)))}, required=("state",))
+                       "notice": v_opt(v_enum(("test",))), "incident_ref": v_opt(v_str(64, SPOOL_REF))}, required=("state",))
 EMIT_SCHEMA = v_obj({"cause": v_enum(CAUSE_TEXT), "recovery": v_enum(RECOVERY_TEXT), "owner_action": v_enum(OWNER_ACTION_TEXT),
                      "signature": v_opt(v_str(16, SIGNATURE)), "detail": v_opt(v_str(160, AUTH_DETAIL))}, required=("cause", "recovery", "owner_action"))
 BACKEND_SCHEMA = v_obj({"status": v_enum(DELIVERY_STATUSES), "attempts": v_int(0, 100), "next_at": v_num(), "code": v_opt(v_str(40))},
@@ -286,7 +307,9 @@ CONFIG_SCHEMA = {
                  "ntfy": {"enabled": v_bool(), "approved_destination": _S200, "server": _S200, "topic_env": _S200, "topic_file": _S200, "token_env": _S200, "token_file": _S200},
                  "pushover": {"enabled": v_bool(), "approved_destination": _S200, "token_env": _S200, "token_file": _S200, "user_env": _S200, "user_file": _S200},
                  "telegram": {"enabled": v_bool(), "approved_destination": _S200, "token_env": _S200, "token_file": _S200, "chat_id_env": _S200, "chat_id_file": _S200,
-                              "credentials_json": _S200, "chat_target": v_enum(("owner",))}},
+                              "credentials_json": _S200, "chat_target": v_enum(("owner",)), "kinds": v_list(v_enum(NOTICE_KINDS), len(NOTICE_KINDS))},
+                 "zeroclaw-spool": {"enabled": v_bool(), "spool_dir": v_str(1024, re.compile(r"(/[^\x00]*)?")), "project": v_str(40, SPOOL_PROJECT),
+                                    "kinds": v_list(v_enum(SPOOL_KINDS), len(SPOOL_KINDS))}},
 }
 
 
@@ -365,6 +388,8 @@ def sanitize_fields(fields, cfg):
         out["detail"] = fields["detail"]   # the only free-looking field, and only for the sign-in causes: closed charset, length-capped
     if fields.get("notice") == "test":
         out["notice"] = "test"
+    if isinstance(fields.get("incident_ref"), str) and SPOOL_REF.fullmatch(fields["incident_ref"]):
+        out["incident_ref"] = fields["incident_ref"]
     return out
 
 
@@ -498,7 +523,41 @@ def load_config(path=None):
         return cfg, "invalid-json"
     if "profile" in bad or "corporate_markers" in bad:
         cfg["profile"] = "corporate"
+    if "backends.zeroclaw-spool.spool_dir" in bad:
+        cfg["backends"][SPOOL_BACKEND]["enabled"] = False   # an unusable (relative) spool directory is never replaced by the default one
+    clash = routing_conflict(cfg)
+    if clash:
+        for name in ("telegram", SPOOL_BACKEND):   # fail closed for the clashing pair only: no notice may go to two destinations
+            cfg["backends"][name]["enabled"] = False
+        return cfg, f"{CONFLICT_PREFIX}telegram+{SPOOL_BACKEND} both enabled for kinds {','.join(clash)}; narrow backends.telegram.kinds or backends.{SPOOL_BACKEND}.kinds"
     return cfg, (f"invalid:{','.join(bad[:5])}"[:100] if bad else None)
+
+
+CONFLICT_PREFIX = "conflict:"
+
+
+def routing_conflict(cfg):
+    """Notice kinds that BOTH `telegram` and `zeroclaw-spool` would carry while both are enabled (sorted, empty when the routing is disjoint).
+    Each transition goes to one destination only, so the config is rejected rather than guessed at."""
+    b = cfg.get("backends") or {}
+    if (b.get("telegram") or {}).get("enabled") is not True or (b.get(SPOOL_BACKEND) or {}).get("enabled") is not True:
+        return []
+    return sorted(set(b["telegram"].get("kinds") or ()) & set(b[SPOOL_BACKEND].get("kinds") or ()))
+
+
+def notice_kind(fields):
+    """The notice kind of sanitised fields: a spool kind, or `session`."""
+    return spool_kind(fields) or "session"
+
+
+def backend_routed(name, cfg, fields):
+    """False when `kinds` of this backend leaves the notice to another destination (telegram and zeroclaw-spool only)."""
+    b = (cfg.get("backends") or {}).get(name) or {}
+    if name == SPOOL_BACKEND:
+        return spool_kind(fields) in (b.get("kinds") or ())
+    if name == "telegram":
+        return notice_kind(fields) in (b.get("kinds") or NOTICE_KINDS)
+    return True
 
 
 # ---- checkpoint: the only source of task identity, blocker and completion ----------------------------------------------------
@@ -757,7 +816,117 @@ def send_telegram(payload, cfg):
         return f"error-{type(exc).__name__}"[:40]
 
 
-REAL_TRANSPORTS = {"macos": send_macos, "ntfy": send_ntfy, "pushover": send_pushover, "telegram": send_telegram}
+# ---- ZeroClaw incident spool (SPE-176) -----------------------------------------------------------------------------------------------
+SPOOL_SCHEMA = v_obj({"schema": v_int(1, 1), "key": v_str(32, SPOOL_KEY), "project": v_str(40, SPOOL_PROJECT), "incident_ref": v_str(64, SPOOL_REF),
+                      "kind": v_enum(SPOOL_KINDS), "transition": v_enum(SPOOL_TRANSITIONS), "severity": v_enum(SPOOL_SEVERITIES),
+                      "progress": v_str(120, SPOOL_TEXT), "action": v_str(120, SPOOL_TEXT), "ts": v_str(20, SPOOL_TS)},
+                     required=("schema", "key", "project", "incident_ref", "kind", "transition", "severity", "progress", "action", "ts"))
+LEDGER_SCHEMA = v_obj({"v": v_int(1, 1), "keys": v_map(v_str(32, SPOOL_KEY), v_num(), NOTIFIED_CAP)}, required=("v", "keys"))
+
+
+def spool_kind(notice):
+    """The spool kind of a sanitised notice, or None when this notice has no incident kind (it is then never spooled)."""
+    if notice.get("notice") == "test":
+        return "notify-test"
+    return SPOOL_KIND_OF_CAUSE.get(notice.get("cause"))
+
+
+def spool_event(notice, project, now):
+    """The closed-schema spool document for a sanitised notice, or None. Every word comes from the fixed phrase tables: nothing free-form."""
+    kind = spool_kind(notice)
+    ref = notice.get("incident_ref")
+    if kind is None or not isinstance(ref, str):
+        return None
+    if kind == "notify-test":
+        transition, severity, progress, action = "test", "info", "delivery test notice", "no action needed"
+    else:
+        cause, recovery, owner_action = notice.get("cause"), notice.get("recovery"), notice.get("owner_action")
+        if cause not in CAUSE_TEXT or recovery not in RECOVERY_TEXT or owner_action not in OWNER_ACTION_TEXT:
+            return None
+        transition = "recovered" if kind == "recovered" else "escalated" if recovery in SPOOL_ESCALATING_RECOVERY else "opened"
+        severity = "info" if transition == "recovered" else "action"
+        progress, action = f"{CAUSE_TEXT[cause]}; recovery: {RECOVERY_TEXT[recovery]}", OWNER_ACTION_TEXT[owner_action]
+    event = {"schema": 1, "key": hashlib.sha256(f"{ref}|{transition}".encode()).hexdigest()[:32], "project": project, "incident_ref": ref, "kind": kind,
+             "transition": transition, "severity": severity, "progress": progress, "action": action, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))}
+    return event if conforms(SPOOL_SCHEMA, event) else None
+
+
+def open_spool_dir(path):
+    """Directory fd of an EXISTING spool directory, or None. Absolute normalised path with no symlink component, a directory we own, mode exactly 0700.
+    Never created here: the supervisor owns it, and a wrong one must be refused rather than made."""
+    try:
+        if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path or not _private_path(path):
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o700:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _ledger_keys(sdir, now):
+    raw, _ = read_regular(pathlib.Path(sdir) / SPOOL_LEDGER, MAX_STATE_BYTES)
+    try:
+        doc = json.loads(raw.decode("utf-8"), parse_constant=reject_constant) if raw else None
+    except (ValueError, RecursionError):
+        doc = None
+    keys = doc["keys"] if doc is not None and conforms(LEDGER_SCHEMA, doc) else {}
+    return {k: t for k, t in keys.items() if t >= now - DEDUP_WINDOW}
+
+
+def send_zeroclaw_spool(payload, cfg):
+    """Write ONE spool file per incident transition. None = the transition is in the spool (written now, or already there, or written within the
+    dedup window); SPOOL_UNAVAILABLE = the directory is missing, wrong or unwritable (the caller keeps the notice and retries without a cap);
+    any other code is final. Needs no credential and no Claude Code sign-in."""
+    ctx = payload.get("context") or {}
+    fields, sdir, now = ctx.get("fields"), ctx.get("state_dir"), time.time()
+    event = spool_event(fields, cfg.get("project"), now) if isinstance(fields, dict) else None
+    if event is None or not sdir:
+        return "invalid-fields"
+    path = cfg.get("spool_dir") or os.path.join(os.path.expanduser("~"), DEFAULT_SPOOL_SUBDIR)
+    if not os.path.isabs(path):
+        return "not-configured"
+    key, name = event["key"], event["key"] + ".json"
+    try:
+        with session_lock(pathlib.Path(sdir) / SPOOL_LEDGER):   # one writer at a time: the dedup check and the write below are one step
+            keys = _ledger_keys(sdir, now)
+            if key in keys:
+                return None
+            dfd = open_spool_dir(path)
+            if dfd is None:
+                return SPOOL_UNAVAILABLE
+            tmp = f".tmp-{os.urandom(8).hex()}"
+            try:
+                try:
+                    os.stat(name, dir_fd=dfd, follow_symlinks=False)   # present (consumer has not taken it yet): never a second file
+                except FileNotFoundError:
+                    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+                    try:
+                        os.fchmod(fd, 0o600)
+                        os.write(fd, (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode())
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                    os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp, dir_fd=dfd)
+                return SPOOL_UNAVAILABLE
+            finally:
+                os.close(dfd)
+            keys[key] = now
+            with contextlib.suppress(OSError):   # the file is the authority; a lost ledger line only widens the dedup window to the file's lifetime
+                keep = dict(sorted(keys.items(), key=lambda kv: kv[1])[-NOTIFIED_CAP:])
+                atomic_write(pathlib.Path(sdir) / SPOOL_LEDGER, json.dumps({"v": 1, "keys": keep}, separators=(",", ":")))
+            return None
+    except TimeoutError:
+        return SPOOL_UNAVAILABLE
+
+
+REAL_TRANSPORTS = {"macos": send_macos, "ntfy": send_ntfy, "pushover": send_pushover, "telegram": send_telegram, SPOOL_BACKEND: send_zeroclaw_spool}
 
 
 def backend_allowed(name, cfg, corporate_session):
@@ -869,7 +1038,8 @@ class Engine:
         backends = {}
         for name in self.cfg["backends"]:
             enabled = (self.cfg["backends"][name] or {}).get("enabled") is True
-            backends[name] = {"status": "pending" if enabled else "skipped", "attempts": 0, "next_at": 0, "code": None if enabled else "disabled"}
+            routed = enabled and backend_routed(name, self.cfg, fields)
+            backends[name] = {"status": "pending" if routed else "skipped", "attempts": 0, "next_at": 0, "code": None if routed else ("disabled" if not enabled else "kind-not-routed")}
         if not any(b["status"] == "pending" for b in backends.values()):
             if not strict:       # strict: nothing was handed to any backend, so a later retry (a backend enabled meanwhile) must not hit a dedup tombstone
                 self.mark_notified(rec, base, cycle, now)
@@ -928,6 +1098,8 @@ class Engine:
                 if b["status"] not in ("pending", "failed") or b["next_at"] > now:
                     continue
                 ok, why = backend_allowed(name, self.cfg, corporate)
+                if ok and not backend_routed(name, self.cfg, fields):
+                    ok, why = False, "kind-not-routed"
                 if not ok:
                     b.update(status="skipped", code=why)
                     changed = True
@@ -939,6 +1111,8 @@ class Engine:
                 if budget_end is not None and self.clock() > budget_end:
                     return None
                 payload = render(fields)
+                if name == SPOOL_BACKEND:   # the local spool writer alone gets the sanitised fields and the ledger location; every other transport sees title and body only
+                    payload = dict(payload, context={"fields": fields, "state_dir": str(self.sdir)})
                 b.update(status="sending", attempts=b["attempts"] + 1, next_at=now)
                 save_record(self.sdir, rec)  # persisted BEFORE sending: a crash here retries once instead of looping or losing
                 transport = self.transports.get(name)
@@ -949,6 +1123,8 @@ class Engine:
                 changed = True
                 if code is None:
                     b.update(status="sent", code=None)
+                elif code == SPOOL_UNAVAILABLE:   # a missing or unwritable spool directory is a local condition that ends: keep the notice, retry, never drop it
+                    b.update(status="failed", code=code, attempts=b["attempts"] - 1, next_at=now + int(retry["base_seconds"]))
                 elif b["attempts"] >= int(retry["max_attempts"]):
                     b.update(status="dropped", code=str(code)[:40])
                 else:
@@ -1110,7 +1286,8 @@ class Engine:
                     cp = {"task": sid, "repo": RESOURCE_REPO, "ticket": RESOURCE_TICKET, "blocker_owner": "resource", "resume_trigger": resume}
                     state = "IDLE" if req["cause"] == "signin-recovered" else "BLOCKED_RESOURCE"
                     self.set_state(rec, state, "resource-stall", now, cp, notify=False)
-                    extra = {"cause": req["cause"], "recovery": req["recovery"], "owner_action": req["owner_action"], "detail": req.get("detail")}
+                    extra = {"cause": req["cause"], "recovery": req["recovery"], "owner_action": req["owner_action"], "detail": req.get("detail"),
+                             "incident_ref": "inc:" + (req.get("signature") or hashlib.sha256(req["cause"].encode()).hexdigest()[:16])}
                     queued = self.enqueue(rec, state, "resource-stall", now, extra_key=req["cause"] + ":" + (req.get("signature") or ""), extra=extra,
                                           strict=strict)
                     tracked = next((p for p in rec["pending"] if p["key"] == self.last_key), None)
@@ -1158,7 +1335,8 @@ class Engine:
                 if old:
                     rec["pending"] = [e for e in rec["pending"] if e not in old]
                     rec["dropped"] += len(old)
-                queued = self.enqueue(rec, "IDLE", "test-notice", now, extra_key="test-notice", extra={"notice": "test"}, strict=strict, window=TEST_NOTICE_WINDOW)
+                queued = self.enqueue(rec, "IDLE", "test-notice", now, extra_key="test-notice", extra={"notice": "test", "incident_ref": f"test:{int(now // TEST_NOTICE_WINDOW)}"},
+                                  strict=strict, window=TEST_NOTICE_WINDOW)
                 tracked = next((p for p in rec["pending"] if p["key"] == self.last_key), None)
                 any_backend = any((b or {}).get("enabled") is True for b in self.cfg["backends"].values())
                 result = "no-backend" if not any_backend else ("queued" if queued else "deduped")
@@ -1283,7 +1461,8 @@ def cmd_status(args):
 
 
 def cmd_sweep(args):
-    cfg, _ = load_config()
+    cfg, problem = load_config()
+    config_rejected(problem)   # said once on stderr; the sweep still retries what the remaining backends hold
     out = Engine(state_dir(), cfg).sweep(now=args.now)
     print(json.dumps(out))
     return 0
@@ -1342,8 +1521,18 @@ def cmd_checkpoint(args):
     return 0
 
 
+def config_rejected(problem):
+    """True (after saying why on stderr) when the config was rejected by the routing guard: nothing is emitted then."""
+    if isinstance(problem, str) and problem.startswith(CONFLICT_PREFIX):
+        print(f"session-notify: config rejected: {problem[len(CONFLICT_PREFIX):]}", file=sys.stderr)
+        return True
+    return False
+
+
 def cmd_emit_resource(args):
-    cfg, _ = load_config()
+    cfg, problem = load_config()
+    if config_rejected(problem):
+        return 2
     req = {"cause": args.cause, "recovery": args.recovery, "owner_action": args.owner_action, "signature": args.signature, "detail": args.detail}
     engine = Engine(state_dir(), cfg)
     result = engine.emit_resource(req, clear=args.clear, strict=args.strict, scope=args.scope)
@@ -1352,7 +1541,9 @@ def cmd_emit_resource(args):
 
 
 def cmd_test_notice(args):
-    cfg, _ = load_config()
+    cfg, problem = load_config()
+    if config_rejected(problem):
+        return 2
     engine = Engine(state_dir(), cfg)
     result = engine.test_notice(strict=args.strict)
     print(f"test-notice: {result}" + (f" delivery={engine.last_delivery}" if engine.last_delivery else ""))

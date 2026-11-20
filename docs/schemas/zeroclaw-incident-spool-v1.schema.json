@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ZeroClaw incident spool event, schema 1",
+  "description": "One file per incident transition, named <key>.json, written by scripts/session-notify.py (backend zeroclaw-spool) into the supervisor spool directory and consumed by the engineering-supervisor. Closed: no other key is ever written. Mirrors SPOOL_SCHEMA in scripts/session-notify.py.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "key", "project", "incident_ref", "kind", "transition", "severity", "progress", "action", "ts"],
+  "properties": {
+    "schema": {"const": 1},
+    "key": {"type": "string", "pattern": "^[0-9a-f]{32}$", "description": "lowercase hex of sha256(incident_ref + '|' + transition), first 32 characters; equals the file name without .json"},
+    "project": {"type": "string", "pattern": "^[a-z0-9._-]{1,40}$"},
+    "incident_ref": {"type": "string", "pattern": "^[a-z0-9._:-]{1,64}$", "description": "inc:<16 hex> for admission-monitor and claude-auth-watch incidents (the sign-in notice shows its first 6 hex as inc=); test:<bucket> for a delivery test"},
+    "kind": {"enum": ["unclaimed-handoff", "queue-wait-excessive", "workload-over-deadline", "auth-interrupted", "recovered", "notify-test"]},
+    "transition": {"enum": ["opened", "escalated", "recovered", "test"]},
+    "severity": {"enum": ["info", "action"]},
+    "progress": {"type": "string", "pattern": "^[A-Za-z0-9 .,;:()+-]{1,120}$", "description": "fixed phrase from the cause and recovery tables; never a path, id, command line or URL"},
+    "action": {"type": "string", "pattern": "^[A-Za-z0-9 .,;:()+-]{1,120}$", "description": "fixed phrase from the owner-action table"},
+    "ts": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", "description": "UTC, second resolution"}
+  }
+}

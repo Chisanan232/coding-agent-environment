@@ -1410,7 +1410,7 @@ def ref_ok(schema, v):
 def ref_config(m):
     """What load_config must return for a parsed user config m, derived leaf by leaf from CONFIG_SCHEMA with the reference check."""
     import copy
-    bad = []
+    bad, full = [], []
 
     def walk(default, schema, user, path):
         if isinstance(schema, dict):
@@ -1420,12 +1420,18 @@ def ref_config(m):
             return copy.deepcopy(user)
         if user != "<missing>":
             bad.append(path[0])
+            full.append(".".join(path))
         return copy.deepcopy(default)
     if not isinstance(m, dict) or json.dumps(m, allow_nan=True).count("NaN") + json.dumps(m).count("Infinity") or len(json.dumps(m)) > 64 * 1024:
         return copy.deepcopy(sn.DEFAULT_CONFIG)
     cfg_ = walk(sn.DEFAULT_CONFIG, sn.CONFIG_SCHEMA, m, ())
     if "profile" in bad or "corporate_markers" in bad:
         cfg_["profile"] = "corporate"
+    spool, tele = cfg_["backends"]["zeroclaw-spool"], cfg_["backends"]["telegram"]
+    if "backends.zeroclaw-spool.spool_dir" in full:
+        spool["enabled"] = False
+    if spool["enabled"] and tele["enabled"] and set(spool["kinds"]) & set(tele["kinds"]):   # SPE-176: no notice kind goes to two destinations
+        spool["enabled"] = tele["enabled"] = False
     return cfg_
 
 
