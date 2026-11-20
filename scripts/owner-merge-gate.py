@@ -643,6 +643,10 @@ def merged_comments(run, repo, pr, graphql_comments):
             out[slots.pop(0)] = c
         else:
             out.append(c)
+    # Latest-wins consumers (the reviewer-independence check, the newest local-first record) read the end of the list, so a
+    # GraphQL-only entry appended after an edit race must not outrank a newer REST entry: order by creation time, with the
+    # REST-first order as the stable tiebreak (and for entries that carry no time).
+    out.sort(key=lambda c: c.get("createdAt") or "")
     return out, len(rest), None
 
 
