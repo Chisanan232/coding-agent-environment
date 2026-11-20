@@ -441,8 +441,9 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
      (default `~/.cargo`);
   5. otherwise `./target`.
 
-  Every comparison, stored keys included, goes through directory identity: `(st_dev, st_ino)` when the directory exists, otherwise the
-  realpath, case-folded on macOS. So `/tmp` and `/private/tmp`, symlinks and trailing slashes all clash as one key. Stored keys and
+  Every comparison, stored keys included, goes through identity tokens. The tokens are the raw string, the folded realpath and, when
+  the directory exists, `(st_dev, st_ino)`. Two keys clash when they share any token, so no string-equal clash is lost and a directory
+  created or removed mid-decision still clashes. So `/tmp` and `/private/tmp`, symlinks and trailing slashes all clash as one key. Stored keys and
   fingerprints are unchanged. The corrected order can also remove a clash: a job with its own `--target-dir` or repository config no
   longer shares the home config's key. Entries queued earlier keep their old keys until they drain. `heavy-run` and `la-cargo` exit
   77 when a revoked grant turns `EXPIRED`; they do not re-enqueue.

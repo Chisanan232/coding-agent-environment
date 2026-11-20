@@ -464,8 +464,15 @@ stays `False` and the four-lane code is untouched.
   argv before any `--`, then `CARGO_TARGET_DIR`, then `CARGO_BUILD_TARGET_DIR`, then `build.target-dir` from the nearest
   `.cargo/config` or `.cargo/config.toml` walking up from the working directory, then `$CARGO_HOME`'s, default `~/.cargo`, else
   `./target`). A relative config value resolves against the directory holding that `.cargo`. The result is passed through `realpath`.
-  At decision time every key, stored or new, is compared through `excl_identity`: `(st_dev, st_ino)` when the directory exists, else its
-  realpath, NFC-normalised and case-folded on macOS. A folding error can only make two keys equal, the fail-safe direction. Stored keys
+  At decision time every key, stored or new, is turned into identity tokens by `excl_identity`. The tokens are:
+  - the raw key string;
+  - its realpath, NFC-normalised and case-folded on macOS;
+  - `(st_dev, st_ino)`, when the directory exists.
+
+  Two keys clash when they share any token. The comparison therefore only adds clashes to plain string equality, never removes one.
+  It also stays stable when cargo creates the target directory, or `cargo clean` removes it, between the two stats of one decision:
+  the realpath token matches either way. An earlier single-form identity could miss exactly that case (review M1). A folding error
+  can only make two keys equal, which is the fail-safe direction. Stored keys
   are never rewritten, the fingerprint never contained them, and claim never compares them, so queued entries keep working and are
   protected by the alias rule too. This applies to every admission, not only backfill, and it changes clashes in both directions.
   The identity comparison only adds clashes: two spellings of one target directory now clash where they did not before. The
@@ -506,6 +513,13 @@ stays `False` and the four-lane code is untouched.
   - Deliberately unchanged: the OFF-mode shadow does not run the SPE-117 memory-admission check, because that check writes the shared
     latch state and a disabled feature must not change live admission. Its receipt records `memory_gate: not-asked`, and the band and
     memory projection above still apply.
+- **Known limitations, accepted and not fixed here.**
+  - L1, the argv parse. `--target-dir` is read only after the first token named `cargo` and before the first `--`. A cargo alias
+    (`[alias]` in a config file) that expands to `--target-dir`, or one that ends in `--`, is not followed. Such a job is keyed by the
+    environment or config target instead. Cargo's `--config` and `-C` flags are not modelled either.
+  - L3, stats under the lock. `excl_identity` calls `realpath` and `os.stat` on each key path, inside the admission lock and once
+    per holder per decision. A hung network mount under a target path would stall a queue pass. Cargo target directories are local
+    in this environment, so no per-call timeout was added.
 
 Preconditions still open before the enabling pull request:
 
