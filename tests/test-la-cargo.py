@@ -511,6 +511,9 @@ class Registry(LaCargoBase):
         os.environ['FAKE_WAITS'] = '5'
         for sig in (signal.SIGTERM, signal.SIGHUP):
             self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+            signal.signal(sig, la._terminate)      # never an inherited ignore: the wrapper's own handler is what is under test
+        self.addCleanup(signal.signal, signal.SIGINT, signal.getsignal(signal.SIGINT))
+        signal.signal(signal.SIGINT, signal.default_int_handler)      # a background launch inherits SIGINT as ignored, which would make the test a no-op
 
         def slow_register(qid, kind):
             os.kill(os.getpid(), signum)
