@@ -48,6 +48,8 @@ python3 scripts/session-notify.py test-notice --strict
 # expect: test-notice: queued delivery=sent  and a Telegram message in your owner chat
 ```
 
+Alternative (owner decision 2026-11-20, SPE-176): ZeroClaw alerts via the credential-free `zeroclaw-spool` backend instead of direct Telegram for the incident kinds. Enable `backends.zeroclaw-spool` and either leave `telegram` off or narrow `backends.telegram.kinds` to `["session"]`; both enabled for the same kind is rejected at config load. Details: `SESSION-NOTIFICATIONS.md`.
+
 Rollback: set `backends.telegram.enabled` to `false` (or delete the file). No other state changes. Unverified until you run it: that the bot may message you
 (you must have started a chat with the bot once) and that `delivery=sent` is returned.
 

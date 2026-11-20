@@ -16,6 +16,8 @@ This is part of the single owner approval packet with the admission monitor (`do
 | Reads | `~/.claude/projects/*/*.jsonl` tail windows, `~/.claude/sessions/*.json` (name, sessionId, pid), `claude auth status` (only when a session shows auth evidence or an incident is open) |
 | Sends | through `session-notify.py emit-resource` only (Telegram backend must already be configured there); enum phrases plus the closed `detail` |
 
+The watch can also hand sign-in alerts and the recovery to ZeroClaw through the credential-free `zeroclaw-spool` backend (works while signed out; see `SESSION-NOTIFICATIONS.md`); enable it instead of, not together with, `telegram` for those kinds.
+
 Only failures at most 30 minutes old (record and transcript file) can open an incident; see ADR 0020 section 3 for the status rules. It does not log in or out, call a model, signal a process, delete anything or touch the queue.
 
 ## Install (observe-only first)
