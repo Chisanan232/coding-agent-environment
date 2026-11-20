@@ -1802,6 +1802,9 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
     if not (type(grant_s) is int and 0 < grant_s <= QUEUE_MAX_GRANT_S):
         out['reason'] = 'invalid-request: grant window out of range'
         return out
+    # One waiter `ps` per process for this pass: the waiter-gone sweep and every backfill candidate would otherwise each fork their own
+    # (holder checks keep their own calls: each one must fail closed on its own reading).
+    waiter_fn = _per_pass_memo(waiter_token_fn or waiter_token)
     try:
         with state_lock(state_path):
             if not queue_dir(state_path).exists():
@@ -1850,7 +1853,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
             for entry in entries:
                 # SPE-176: a waiter that is provably gone will never claim; free its place (and a granted lane) now. A CLAIMED entry
                 # is not in WAITING_STATES and is left to the holder rules above.
-                if entry['state'] in WAITING_STATES and _waiter_gone(entry, waiter_token_fn or waiter_token):
+                if entry['state'] in WAITING_STATES and _waiter_gone(entry, waiter_fn):
                     was = entry['state']
                     entry['state'] = 'CANCELLED'
                     _write_queue_entry(state_path, entry)
@@ -1905,15 +1908,22 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
             for nxt in waiting:
                 if backfill is not None:
                     verdict = _backfill_candidate(state_path, nxt, backfill, host, result, live, orphans, granted, entries, now, in_use,
-                                                  reserved, lanes, waiter_token_fn or waiter_token)
+                                                  reserved, lanes, waiter_fn)
                     if verdict == 'stop':
                         return out
                     if verdict is None:
                         continue
                     if not BACKFILL_ENABLED:
+                        # The shadow never runs the SPE-117 memory-admission check: that check writes the shared latch state, so asking it
+                        # would let a disabled feature change live admission. The band and memory projection of _protects_head apply.
                         if not _recent_backfill_shadow(queue_dir(state_path) / 'receipts.jsonl', backfill['pivot'], nxt['id'], now):
-                            _queue_receipt(state_path, 'backfill-shadow', nxt, now, **verdict)
+                            _queue_receipt(state_path, 'backfill-shadow', nxt, now, memory_gate='not-asked', **verdict)
                         out['backfill_shadow'].append(nxt['id'])
+                        # Judge a later shadow candidate beside this one, exactly as the enabled pass would after granting it.
+                        shadow = dict(nxt, state='GRANTED', grant={'at': iso_utc(now), 'expires': iso_utc(now + timedelta(seconds=BACKFILL_GRANT_S))})
+                        granted.append(shadow)
+                        in_use += 1
+                        reserved += nxt['bytes']
                     else:
                         if memory == 'probe':
                             out['grant_pending'] = True   # the final pass re-derives the whole decision from scratch
@@ -1924,7 +1934,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                         _queue_receipt(state_path, 'backfill', nxt, now, **verdict)
                         grant(nxt, backfilled=True)
                         out['backfilled'].append(nxt['id'])
-                    backfill['keys'] |= set(nxt.get('excl_keys') or [])
+                    backfill['keys'] |= _excl_id_set(nxt)
                     backfill['taken'] += 1
                     if backfill['in_flight'] + backfill['taken'] >= BACKFILL_MAX:
                         return out
@@ -1957,7 +1967,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                     out.update(head_reason=out['reason'], backfilled=[], backfill_shadow=[])
                     if in_flight >= BACKFILL_MAX:
                         return out
-                    backfill = {'pivot': nxt['id'], 'head': nxt, 'blockers': blockers, 'keys': set(nxt.get('excl_keys') or []),
+                    backfill = {'pivot': nxt['id'], 'head': nxt, 'blockers': blockers, 'keys': _excl_id_set(nxt),
                                 'in_flight': in_flight, 'taken': 0}
                     continue
                 if memory == 'probe':
@@ -3410,7 +3420,7 @@ def _waiter_proven_alive(entry, token_fn):
 def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans, granted, entries, now, in_use, reserved, lanes, waiter_fn):
     """One later entry in candidate mode: 'stop' (no lane left), None (refused; its keys join the skipped set, so a later entry can never
     overtake it on a shared key) or the receipt fields of a qualifying candidate. Every lane check of the head applies to it."""
-    keys = set(cand.get('excl_keys') or [])
+    keys = _excl_id_set(cand)
     free = result['free_bytes']
     if in_use >= lanes:
         return 'stop'
@@ -3428,8 +3438,9 @@ def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans,
     if refused:
         backfill['keys'] |= keys
         return None
-    blocker = backfill['blockers'][0]
+    blocker = backfill['blockers'][0]   # the first stays in blocker_id / blocker_label / excl_key for older readers
     return {'blocked_id': backfill['pivot'], 'blocker_id': blocker['id'], 'blocker_label': blocker['label'], 'excl_key': blocker['keys'][0],
+            'blockers': [{'id': b['id'], 'label': b['label'], 'keys': list(b['keys'])} for b in backfill['blockers']],
             'reason': 'head-excl-only', 'math': math, 'in_flight': backfill['in_flight'] + backfill['taken'], 'cap': BACKFILL_MAX}
 
 
