@@ -440,7 +440,9 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
   - **Accepted only when, under the lock:** the job, session and waiter (pid and start token) are the same; the entry has not already
     been replaced; the chain is below `BACKFILL_REQUEUE_MAX` = 3; and the receipts (live log and its rotated backup) show a `backfill`
     followed by `backfill-revoked`, or by `expired` with `was: GRANTED`, with no `claimed`.
-  - **Otherwise refused** with `not-requeueable: ...`, and nothing is written.
+  - **Otherwise refused** with `not-requeueable: ...`: no entry, counter or receipt is written. A repeated request returns only the
+    old entry's own live replacement (`existing`, with `requeue_of`). Any other live entry of the same job is refused rather than
+    returned, so a wrapper never adopts an entry another wrapper waits on.
   - **The new entry** gets a fresh id and seq (ids are never reused) plus `order` (the inherited position), `requeue_of` and
     `requeues`. Its `enqueued` receipt carries the same fields and the `evidence`.
   - **Order key.** Every ordering decision (listing, advance, in-flight count, the backfilled-grant test at claim, the recovery
@@ -448,13 +450,15 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
   - **Grants made before the replacement existed.** An in-order grant made while the replacement did not exist yet is not counted as
     having overtaken it.
 - `heavy-run` and `la-cargo` use `--requeue-of` when their polled entry turns `EXPIRED`.
-  - On success they print `backfill grant revoked; re-queued as qNNNNNN`, move their registration and final cancel to the new id,
-    and keep waiting within the original deadline.
+  - They accept the reply only when it names the old id in `requeue_of`. On success they print
+    `backfill grant revoked; re-queued as qNNNNNN` (or `backfill grant lapsed unclaimed; ...` for a lapse), move their registration
+    and final cancel to the new id, and keep waiting within the original deadline.
   - After `REQUEUE_MAX` = 3 re-queues they exit 77, naming the limit.
   - When the runner refuses (an ordinary expiry, or an older runner without the flag), they print the unchanged
-    `queue entry <id> is EXPIRED; refusing.` and exit 77.
-  - Their 15 s poll, plus advance and status (each capped at 120 s) and a refused claim (memory gate 120 s, lock 2 x 5 s), stays
-    under the 600 s backfill window.
+    `queue entry <id> is EXPIRED; refusing.` and exit 77. Any reply without the matching `requeue_of` is handled the same way.
+  - Timing: one poll iteration is about 390 s worst case (15 s sleep, advance and status capped at 120 s each, and a refused claim
+    bounded by the 120 s memory gate and two 5 s lock waits), within the 600 s backfill window. A grant that still lapses unclaimed,
+    for example because its claims keep being refused, is re-queued at its position anyway.
 - Exclusion keys (`excl_keys`). A new `cargo-target:` key follows cargo's own target-dir order and is realpath-canonical:
   1. `--target-dir` in the job argv, before any `--`;
   2. `CARGO_TARGET_DIR`;

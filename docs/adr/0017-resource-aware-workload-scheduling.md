@@ -536,7 +536,10 @@ stays `False` and the four-lane code is untouched.
 
     Anything else, including an ordinary expiry, missing receipts and a waiter-less hand-off, is refused. The wrapper then prints the
     unchanged `queue entry <id> is EXPIRED; refusing.` and exits 77. An older runner without `--requeue-of` rejects the flag and gives
-    the same result: the job loses its position rather than inventing one.
+    the same result: the job loses its position rather than inventing one. A refusal writes nothing (no entry, counter or receipt).
+    A repeated request returns only the old entry's own live replacement. Any other live entry of the same job is refused, not
+    returned, so a wrapper never adopts an entry another wrapper waits on. The wrappers also accept a reply only when its
+    `requeue_of` names the old id.
   - **FIFO invariant.** The replacement gets a fresh id and seq; ids are never reused. It inherits the old entry's position as
     `order`. Every ordering decision uses `(order or seq, seq)`: the queue listing, the advance scan, the in-flight count,
     `_overtaken_head` and the recovery verifier's head. So the replacement waits behind every entry queued before the original and
@@ -544,13 +547,15 @@ stays `False` and the four-lane code is untouched.
   - **Grants made while the replacement did not exist.** An in-order grant made between the revoke and the re-queue did not overtake
     the replacement. Such a grant is neither counted as in flight nor re-checked as a backfill. Only replacements get this exemption;
     for every other entry an earlier position already means an earlier creation.
-  - **Wrapper output and bound.** The wrapper prints `backfill grant revoked; re-queued as qNNNNNN`. It moves its recovery registration
+  - **Wrapper output and bound.** The wrapper prints `backfill grant revoked; re-queued as qNNNNNN` for a revoke, or `backfill grant
+    lapsed unclaimed; re-queued as qNNNNNN` for a lapse. It moves its recovery registration
     and its final cancel to the new id, and keeps waiting. After `REQUEUE_MAX` = 3 re-queues it exits 77 with a message naming the
     limit.
 - **Timing facts the wrappers rely on.**
   - Both wrappers poll every `POLL_S` = 15 s. One iteration is the sleep, plus advance and status (each capped at 120 s), plus at
     most one claim. A refused claim is bounded by the runner's memory gate (120 s) and its two 5 s lock waits. That is about 390 s
-    worst case, under the 600 s `BACKFILL_GRANT_S`, so a live wrapper sees its backfilled grant before it lapses.
+    worst case per poll iteration, within the 600 s `BACKFILL_GRANT_S`. A grant that still lapses unclaimed, for example because
+    its claims keep being refused, is re-queued at its position anyway.
   - The claim call has no wrapper timeout and cannot have one: a successful claim execs the job itself.
   - A revoke happens only in claim, before `write_reservation` and before the job is exec'd. Advance expires only `GRANTED`, `QUEUED`
     or `ELIGIBLE` entries. A `CLAIMED` backfilled job is therefore never revoked or expired by the short window, so a running job
