@@ -1989,6 +1989,76 @@ class Cycle4Regressions(Base):
         self.assertIn("best-effort delivery with bounded retries", doc)
 
 
+class AuthNotices(Base):
+    """SPE-176 / ADR 0020: the claude-auth-watch causes, their own synthetic session, and the closed `detail` field."""
+    REQ = {"cause": "auth-required", "recovery": "no-auto-recovery", "owner_action": "sign-in-claude", "signature": "0123456789abcdef",
+           "detail": "host=mac names=alpha,beta +2 more"}
+
+    def test_notice_text_is_enum_phrases_plus_closed_detail_on_its_own_session(self):
+        self.assertEqual(self.engine().emit_resource(dict(self.REQ)), "queued")
+        payload = self.fake.sent[0][1]
+        self.assertEqual(payload["title"], "Claude Code: sign-in required")
+        self.assertEqual(payload["body"], "Claude Code sign-in required | recovery: no automatic recovery | action: sign in to Claude Code | host=mac names=alpha,beta +2 more")
+        rec = self.rec("claude-auth-watch")
+        self.assertEqual((rec["state"], rec["task"]["resume_trigger"]), ("BLOCKED_RESOURCE", "credentials_provided"))
+        self.assertIsNone(self.rec("admission-monitor"))
+
+    def test_dedup_and_clear_are_independent_of_the_admission_monitor(self):
+        self.engine().emit_resource({"cause": "disk-floor", "recovery": "none", "owner_action": "reclaim-disk", "signature": "0123456789abcdef"})
+        self.assertEqual(self.engine().emit_resource(dict(self.REQ)), "queued")
+        self.assertEqual(self.engine().emit_resource(dict(self.REQ)), "deduped")
+        self.assertEqual(self.engine().emit_resource({}, clear=True, scope="auth"), "cleared")
+        self.assertEqual(self.rec("claude-auth-watch")["state"], "IDLE")
+        self.assertEqual(self.rec("admission-monitor")["state"], "BLOCKED_RESOURCE")     # untouched by the auth clear
+        self.assertEqual(self.engine().emit_resource(dict(self.REQ)), "queued")          # a recurrence after the clear notifies again
+
+    def test_recovery_notice_returns_the_session_to_idle_with_its_own_title(self):
+        req = {"cause": "signin-recovered", "recovery": "sessions-resumed", "owner_action": "verify-resumed-work", "signature": "fedcba9876543210", "detail": "host=mac"}
+        self.assertEqual(self.engine().emit_resource(req), "queued")
+        self.assertEqual(self.fake.sent[0][1]["title"], "Claude Code: sign-in recovered")
+        self.assertEqual(self.rec("claude-auth-watch")["state"], "IDLE")
+
+    def test_remote_control_notice_is_not_worded_as_sign_in(self):
+        req = {"cause": "remote-control-disconnect", "recovery": "remote-control-only", "owner_action": "reconnect-remote-control", "signature": "0123456789abcdef"}
+        self.assertEqual(self.engine().emit_resource(req), "queued")
+        text = self.fake.sent[0][1]["title"] + self.fake.sent[0][1]["body"]
+        self.assertIn("Remote Control disconnected", text)
+        self.assertNotIn("sign", text.lower())
+
+    def test_detail_rejects_injection_and_wrong_causes(self):
+        bad = ["line\nbreak", "see http://evil.example/x", "[click](http://a)", "*bold*", "`code`", "a/b", "a:b", "<b>", "x" * 161, "", "   ", "a|b", "a\x00b", INJECT + "!"]
+        for detail in bad:
+            self.assertEqual(self.engine().emit_resource({**self.REQ, "detail": detail}), "invalid", repr(detail))
+        for detail in (7, ["a"], {"a": 1}, True):
+            self.assertEqual(self.engine().emit_resource({**self.REQ, "detail": detail}), "invalid")
+        self.assertEqual(self.engine().emit_resource({"cause": "disk-floor", "recovery": "none", "owner_action": "reclaim-disk", "detail": "host=mac"}), "invalid")
+        self.assertEqual(self.engine().emit_resource({**self.REQ, "recovery": "none"}), "invalid")
+        self.assertEqual(self.engine().emit_resource({**self.REQ, "owner_action": "reclaim-disk"}), "invalid")
+        self.assertEqual(self.engine().emit_resource({"cause": "disk-floor", "recovery": "no-auto-recovery", "owner_action": "reclaim-disk"}), "invalid")
+        self.assertEqual(self.fake.sent, [])
+
+    def test_stored_detail_is_re_sanitised_at_delivery(self):
+        fields = {"state": "BLOCKED_RESOURCE", "cause": "auth-required", "recovery": "no-auto-recovery", "owner_action": "sign-in-claude", "detail": "http://evil"}
+        self.assertIsNone(sn.sanitize_fields(fields, cfg()))      # a stored entry with an out-of-charset detail is dropped whole, never delivered
+        fields["detail"] = "host=mac"
+        self.assertEqual(sn.sanitize_fields(fields, cfg())["detail"], "host=mac")
+        fields.update(cause="disk-floor", recovery="none", owner_action="reclaim-disk")
+        self.assertNotIn("detail", sn.sanitize_fields(fields, cfg()))
+
+    def test_cli_detail_is_validated_and_a_hook_cannot_write_the_reserved_session(self):
+        env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(self.sdir), SESSION_NOTIFY_CONFIG=str(self.tmp / "none.json"))
+        run = lambda *a: subprocess.run([sys.executable, str(SCRIPT), "emit-resource", *a], capture_output=True, text=True, env=env)
+        base = ("--cause", "auth-required", "--recovery", "no-auto-recovery", "--owner-action", "sign-in-claude")
+        self.assertEqual(run(*base, "--detail", "host=mac").returncode, 0)
+        for detail in ("a\nb", "http://x", "x" * 200):
+            self.assertEqual(run(*base, "--detail", detail).returncode, 2)
+        self.assertEqual(run("--clear", "--scope", "auth").returncode, 0)
+        self.assertEqual(run("--clear", "--scope", "nope").returncode, 2)
+        eng = self.engine()
+        for sid in ("claude-auth-watch", "Claude-Auth-Watch"):
+            self.assertEqual(self.ev(eng, "SessionStart", sid=sid), "ignored")
+
+
 class Cycle5Regressions(Base):
     def cli(self, *argv):
         env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(self.sdir), SESSION_NOTIFY_CONFIG=str(self.tmp / "none.json"))
