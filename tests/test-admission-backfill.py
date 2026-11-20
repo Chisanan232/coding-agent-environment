@@ -86,12 +86,13 @@ class Base(unittest.TestCase):
             sample['band_fn'] = self.band_fn
         return sample
 
-    def enqueue(self, label, cls, keys, gib=None, waiter=True, cpus=None, mem_gib=None):
+    def enqueue(self, label, cls, keys, gib=None, waiter=True, cpus=None, mem_gib=None, capable=True):
+        """capable: the waiter declared --requeue-capable, as heavy-run and la-cargo do since SPE-176; only such entries are backfilled."""
         proc = self.spawn() if waiter else None
         out = da.queue_enqueue(self.path, label=label, tickets=['HORO-1'], repo='horonom/x', worktree=str(self.worktree), harness='claude',
                                session_id=SESSION, nbytes=(gib or da.WORKLOAD_CLASSES[cls]['disk_gib']) * GIB, argv=['cargo', 'test', label],
                                now=self.now, declared=decl(cls, keys, cpus, mem_gib), waiter_pid=proc.pid if proc else None,
-                               ancestor_fn=(lambda pid: True) if proc else None)
+                               ancestor_fn=(lambda pid: True) if proc else None, requeue_capable=capable)
         self.assertTrue(out['ok'], out)
         return out['id']
 
