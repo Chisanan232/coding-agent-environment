@@ -449,6 +449,16 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
     verifier) uses `(order or seq, seq)`.
   - **Grants made before the replacement existed.** An in-order grant made while the replacement did not exist yet is not counted as
     having overtaken it.
+- `queue enqueue --requeue-capable` (ADR 0017 revision 9a, SPE-176) declares that the waiter re-queues a lost backfilled grant itself.
+  - **Stored field.** The entry gets the additive field `requeue_capable: true`. The entry reader accepts only a literal `true`. The
+    field is absent on older entries, is not in the fingerprint, and is not in the grant object. A `--requeue-of` replacement inherits
+    it.
+  - **Backfill gate.** Backfill (ON, or OFF in shadow) never grants a candidate without the field. Such a candidate is skipped like a
+    refused one: its keys still hold later same-key entries behind it.
+  - **Skip receipt.** The skip is recorded once per (pivot, candidate) per 10 minutes as a `backfill-shadow` receipt with
+    `skipped: no-requeue-capability`.
+  - **Who passes the flag.** `heavy-run` and `la-cargo` pass it only when their runner file contains the `'--requeue-capable'` option
+    string. They read the file as text and never run it, so an older runner is never handed an unknown flag.
 - `heavy-run` and `la-cargo` use `--requeue-of` when their polled entry turns `EXPIRED`.
   - They accept the reply only when it names the old id in `requeue_of`. On success they print
     `backfill grant revoked; re-queued as qNNNNNN` (or `backfill grant lapsed unclaimed; ...` for a lapse), move their registration
