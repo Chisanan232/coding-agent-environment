@@ -1,6 +1,6 @@
 # Owner approval packet: stall monitor, sign-in watch, Telegram delivery, four lanes, routing (SPE-176)
 
-Status: **prepared for the owner; nothing in this packet is installed, enabled or authorized.** Written 2026-11-20 against main `42a258a` (sign-in watch merged as #282; the `test-notice` command below is PR-pending until noted merged).
+Status: **prepared for the owner; nothing in this packet is installed, enabled or authorized.** Written 2026-11-20 against main `f1c7294` (sign-in watch #282 and `test-notice` #283 merged).
 Each item below is **separately selectable**. Approving one does not approve another. Nothing here asks the owner to paste a secret into chat: no token or
 chat id is typed, printed or logged by any step. LaunchAgents created from an agent session were classifier-denied as "Unauthorized Persistence" (2026-11-08),
 so every install below is **owner-run** from the owner's own terminal (`! <command>` in the Claude prompt runs it in the session).
@@ -41,7 +41,7 @@ chmod 600 ~/.config/coding-agent-environment/session-notify.json
 # edit backends.telegram to: {"enabled": true, "approved_destination": "api.telegram.org", "credentials_json": "/Users/bryant/.config/engineering-supervisor/credentials.json"}
 ```
 
-Verify delivery (sends ONE real message with fixed text "Claude Code: test notice, ignore"; its own record, shares no state with any real alert; repeat runs within 10 minutes are deduplicated). Requires the `test-notice` PR to be merged (this packet is held until then):
+Verify delivery (sends ONE real message with fixed text "Claude Code: test notice, ignore"; its own record, shares no state with any real alert; repeat runs within 10 minutes are deduplicated).:
 
 ```bash
 python3 scripts/session-notify.py test-notice --strict
