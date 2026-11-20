@@ -203,14 +203,18 @@ after what they test (`agent_id_bound_to_token_test-<hash>`). A filename is not 
 | Crate dirs holding only lock files (rustc leaves them after a session dir is collected) | 6,139 |
 | Regular files inside session dirs (all 7,046 listed) | 258,128 |
 | Non-regular or unknown-named entries inside session dirs | 0 |
-| Largest lock file | 0 bytes |
+| Largest lock file (limit 0 bytes: any content under a lock name is rejected) | 0 bytes |
+| Smallest / largest `.o` (zero-size `.o` rejected) | 584 B / 12.7 MiB |
+| Largest `metadata.rmeta` (no size bound: 47.4 MiB observed, a x4 bound would not stop a hidden secret) | 47.4 MiB |
+| Session dirs named `...-working` (accepted, rustc's own in-progress suffix) | 22 |
+| Session-dir files with link count above 1 (hard-link check not used: rustc hard-links work products) | 235,081 of 259,566 |
 
 Closed set inside a session dir, all regular files: `dep-graph.bin`, `dep-graph.part.bin`, `query-cache.bin`, `work-products.bin`,
 `metadata.rmeta`, and `<25 base36>.o`.
 
 Fix: `is_generated_incremental_tree` verifies positively, to session-file depth, that every top-level child is a non-empty
 `<crate_ident>-<13 base36>` directory holding only `s-*-*-*` session dirs (containing only the closed set above, as regular files) and
-`s-*-*.lock` regular files of at most 4096 bytes, with no symlink anywhere. Only then are the two name markers dropped for
+empty `s-*-*.lock` regular files, with no symlink anywhere. Only then are the two name markers dropped for
 `cargo_incremental`. A crate dir with only lock files is accepted because 6,139 real ones are exactly that. Any deviation, unreadable entry or exhausted entry (1,000,000) or time (20 s) budget keeps the old behaviour for the whole
 directory. `keep-marker`, escaping symlinks, `.ca-keep`, open handles, live sessions, build locks and protected roots are unchanged,
 as are `cargo_target` and every other kind, the `evidence_free` receipt rule, `apply` and revalidation.
