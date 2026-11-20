@@ -1958,9 +1958,15 @@ class SafetyShape(unittest.TestCase):
     def test_no_signal_launchctl_or_ownership_attestation(self):
         source = (ROOT / 'scripts/admission-monitor.py').read_text()
         tree = ast.parse(source)
-        names = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)} | {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-        for forbidden in ('kill', 'killpg', 'signal', 'pkill', 'rmtree', 'unlink', 'remove', 'rmdir'):
+        # The single signal path is `sigterm_only` (one SIGTERM to one positive pid, used only through the recovery library's guards); nothing else may signal.
+        sender = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'sigterm_only')
+        inside = {id(x) for x in ast.walk(sender)}
+        names = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and id(n) not in inside} | {
+            n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and id(n) not in inside}
+        for forbidden in ('kill', 'killpg', 'signal', 'pkill', 'rmtree', 'unlink', 'remove', 'rmdir', 'SIGKILL'):
             self.assertNotIn(forbidden, names, forbidden)
+        self.assertEqual({n.attr for n in ast.walk(sender) if isinstance(n, ast.Attribute) and n.attr.startswith('SIG')}, {'SIGTERM'})
+        self.assertNotIn('SIGKILL', source)
         # `resolve_owner` is the one place an entry's session id is read (to find its owner); no notice, outbox line or state record carries it.
         resolver = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'resolve_owner')
         outside = '\n'.join(l for i, l in enumerate(source.splitlines(), 1) if not resolver.lineno <= i <= resolver.end_lineno)

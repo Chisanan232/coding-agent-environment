@@ -11,7 +11,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -329,7 +331,7 @@ class Wrapper(Base):
         self.registered = {'pid': self.PID, 'start_token': 'Thu Nov 19 09:00:00 2026', 'pgid': 5000, 'ppid': 4000, 'exe': 'python3:heavy-run'}
         self.exe = 'python3:heavy-run'
         self.holds = False
-        self.entries['q000811'] = {'id': 'q000811', 'state': 'EXPIRED', 'waiter': {'pid': self.PID, 'start_token': 'x'}}
+        self.entries['q000811'] = {'id': 'q000811', 'state': 'EXPIRED', 'waiter': {'pid': self.PID, 'start_token': 'Thu Nov 19 09:00:00 2026'}}
 
     def wenv(self, **over):
         over.setdefault('exe_fn', lambda pid: self.exe)
@@ -345,6 +347,18 @@ class Wrapper(Base):
         for state in rec.TERMINAL:
             self.entries['q000811']['state'] = state
             self.assertTrue(self.verdict()['obsolete'], state)
+
+    def test_a_terminal_entry_must_name_this_pid_and_token_as_its_waiter(self):
+        for waiter in (None, {'pid': self.PID + 1, 'start_token': 'Thu Nov 19 09:00:00 2026'}, {'pid': self.PID, 'start_token': 'other'},
+                       {'pid': self.PID}, 'junk'):
+            entry = self.entries['q000811']
+            entry.pop('waiter', None)
+            if waiter is not None:
+                entry['waiter'] = waiter
+            v = self.verdict()
+            self.assertEqual((v['obsolete'], v['reasons']), (False, ['not-the-entry-waiter']), waiter)
+            self.assertEqual(rec.terminate_wrapper('q000811', self.PID, self.wenv())['result'], 'refused')
+        self.assertEqual(self.kills, [])
 
     def test_obsolete_when_entry_gone(self):
         del self.entries['q000811']
@@ -453,7 +467,6 @@ class Wrapper(Base):
         self.assertEqual(self.kills, [])
 
     def test_exec_workload_identity_guards(self):
-        del self.entries['q000811']['waiter']       # terminal entry without a waiter: only identity can tell wrapper from workload
         self.exe = 'cargo:build'
         self.assertEqual(self.verdict()['reasons'], ['exe-mismatch'])
         self.assertEqual(self.verdict(exe_fn=lambda pid: None)['reasons'], ['exe-unverified'])
@@ -496,7 +509,7 @@ class RealThrowawayProcess(Base):
         table = da.process_table()
         self.assertIn(child.pid, table)
         token = da.waiter_token(child.pid)
-        self.entries = {'q000811': {'id': 'q000811', 'state': 'EXPIRED'}}
+        self.entries = {'q000811': {'id': 'q000811', 'state': 'EXPIRED', 'waiter': {'pid': child.pid, 'start_token': token}}}
         reg = {'pid': child.pid, 'start_token': token, 'pgid': table[child.pid][1], 'ppid': os.getpid(), 'exe': 'sleep'}
         env = self.env(table_fn=da.process_table, token_fn=da.waiter_token, uid_fn=da.process_owner, registered_fn=lambda q: dict(reg, start_token='Mon Jan  1 00:00:00 2001'))
         self.assertEqual(rec.obsolete_wrapper('q000811', child.pid, env)['reasons'], ['pid-reused'])
@@ -510,7 +523,7 @@ class RealThrowawayProcess(Base):
         child = subprocess.Popen(['/bin/sleep', '60'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: (child.terminate(), child.wait()))
         table = da.process_table()
-        self.entries = {'q000811': {'id': 'q000811', 'state': 'EXPIRED'}}
+        self.entries = {'q000811': {'id': 'q000811', 'state': 'EXPIRED', 'waiter': {'pid': child.pid, 'start_token': da.waiter_token(child.pid)}}}
         reg = {'pid': child.pid, 'start_token': da.waiter_token(child.pid), 'pgid': table[child.pid][1], 'ppid': os.getpid(), 'exe': 'sleep'}
         env = self.env(table_fn=da.process_table, token_fn=da.waiter_token, uid_fn=da.process_owner, registered_fn=lambda q: reg, exe_fn=lambda p: 'sleep', holds_workload_fn=lambda p: False)
         verdict = rec.obsolete_wrapper('q000811', child.pid, env)
@@ -601,7 +614,7 @@ class Receipts(Base):
                 self.table = {5000: (4000, 5000, 'S', 'l'), 4000: (1, 4000, 'S', 'x')}
                 self.tokens[5000] = 'T'
                 self.registered = {'pid': 5000, 'start_token': 'T', 'pgid': 5000, 'ppid': 4000, 'exe': 'e'}
-                self.entries['q000811'] = {'id': 'q000811', 'state': 'EXPIRED'}
+                self.entries['q000811'] = {'id': 'q000811', 'state': 'EXPIRED', 'waiter': {'pid': 5000, 'start_token': 'T'}}
                 out = rec.terminate_wrapper('q000811', 5000, self.env(exe_fn=lambda p: 'e', holds_workload_fn=lambda p: False))
                 self.assertEqual(out['result'], 'receipt-unwritable')
                 self.assertEqual(self.kills, [])
@@ -692,6 +705,321 @@ class Allowlist(unittest.TestCase):
             rec.load_terminate_allowlist(self.path)
 
 
+class Registry(unittest.TestCase):
+    """The wrapper registry (ADR 0019 section 3): closed schema, private files, nothing trusted without the live process matching."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name).resolve() / 'wrappers'
+        patcher = unittest.mock.patch.object(rec, 'exe_identity', lambda pid, run=None, timeout=5: 'python3 heavy-run')   # this process is not a wrapper script
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write(self, qid='q000101', **change):
+        self.assertTrue(rec.register_wrapper(self.dir, qid, 'heavy-run'))
+        path = self.dir / (qid + '.json')
+        if change:
+            doc = json.loads(path.read_text())
+            doc.update(change)
+            path.write_text(json.dumps(doc))
+        return path
+
+    def test_record_is_closed_schema_private_and_names_this_process_only(self):
+        path = self.write()
+        doc = json.loads(path.read_text())
+        self.assertEqual(set(doc), set(rec.WRAPPER_KEYS))
+        self.assertEqual((doc['pid'], doc['ppid'], doc['pgid'], doc['kind'], doc['exe_id']), (os.getpid(), os.getppid(), os.getpgid(0), 'heavy-run', 'python3 heavy-run'))
+        self.assertEqual(doc['start_token'], da.waiter_token(os.getpid()))
+        self.assertEqual((os.stat(path).st_mode & 0o777, os.stat(self.dir).st_mode & 0o777), (0o600, 0o700))
+        self.assertEqual([p.name for p in self.dir.iterdir()], ['q000101.json'])      # no temporary file left behind
+        got = rec.read_registry('q000101', self.dir, token_fn=da.waiter_token)
+        self.assertEqual((got['pid'], got['exe'], got['kind']), (os.getpid(), 'python3 heavy-run', 'heavy-run'))
+
+    def test_a_reused_pid_or_failing_token_reader_is_not_trusted(self):
+        self.write()
+        self.assertIsNone(rec.read_registry('q000101', self.dir, token_fn=lambda pid: 'another start time'))
+        self.assertIsNone(rec.read_registry('q000101', self.dir, token_fn=lambda pid: None))
+        def boom(pid):
+            raise OSError('ps failed')
+        self.assertIsNone(rec.read_registry('q000101', self.dir, token_fn=boom))
+
+    def test_off_schema_records_are_refused(self):
+        for change in ({'extra': 1}, {'pid': '12'}, {'pid': 1}, {'pid': True}, {'pgid': 0}, {'kind': 'cargo'}, {'kind': 'la-cargo'}, {'exe_id': 'python3'},
+                       {'exe_id': 'python3 heavy-run extra'}, {'exe_id': 'a b/c'}, {'start_token': ''}, {'start_token': 'x' * 65}, {'created': 'yesterday'},
+                       {'qid': 'q000102'}):
+            path = self.write(**change)
+            self.assertIsNone(rec.read_registry('q000101', self.dir), change)
+            path.unlink()
+        path = self.write()
+        doc = json.loads(path.read_text())
+        del doc['ppid']
+        path.write_text(json.dumps(doc))
+        self.assertIsNone(rec.read_registry('q000101', self.dir))
+        path.write_text('x' * (rec.WRAPPER_FILE_LIMIT + 1))
+        self.assertIsNone(rec.read_registry('q000101', self.dir))
+        path.write_text('not json')
+        self.assertIsNone(rec.read_registry('q000101', self.dir))
+        self.assertIsNone(rec.read_registry('../q000101', self.dir))
+
+    def test_symlinks_foreign_owner_and_loose_modes_are_refused(self):
+        path = self.write()
+        self.assertIsNotNone(rec.read_registry('q000101', self.dir))
+        self.assertIsNone(rec.read_registry('q000101', self.dir, uid=os.getuid() + 1))
+        os.chmod(path, 0o644)
+        self.assertIsNone(rec.read_registry('q000101', self.dir))
+        os.chmod(path, 0o600)
+        os.chmod(self.dir, 0o755)
+        self.assertIsNone(rec.read_registry('q000101', self.dir))
+        self.assertEqual(rec.list_registered(self.dir), [])
+        os.chmod(self.dir, 0o700)
+        real = path.with_name('real.json')
+        path.rename(real)
+        path.symlink_to(real)
+        self.assertIsNone(rec.read_registry('q000101', self.dir))
+        link = self.dir.parent / 'linked'
+        link.symlink_to(self.dir)
+        self.assertIsNone(rec.read_registry('q000101', link))
+        self.assertEqual(rec.list_registered(link), [])
+
+    def test_unregister_removes_only_this_process_record(self):
+        self.write()
+        other = self.write('q000102', pid=os.getpid() + 1)
+        self.assertTrue(rec.unregister_wrapper(self.dir, 'q000101'))
+        self.assertFalse((self.dir / 'q000101.json').exists())
+        self.assertFalse(rec.unregister_wrapper(self.dir, 'q000102'))
+        self.assertTrue(other.exists())
+        self.assertFalse(rec.unregister_wrapper(self.dir, 'q000103'))      # nothing there: no error
+
+    def test_a_failed_write_returns_false_and_never_raises(self):
+        blocker = Path(self.temp.name) / 'file'
+        blocker.write_text('x')
+        self.assertFalse(rec.register_wrapper(blocker / 'wrappers', 'q000101', 'heavy-run'))      # parent is a file
+        self.assertFalse(rec.register_wrapper(self.dir, 'q000101', 'sh'))
+        self.assertFalse(rec.register_wrapper(self.dir, 'bad id', 'heavy-run'))
+        self.dir.mkdir(mode=0o755)
+        self.assertFalse(rec.register_wrapper(self.dir, 'q000101', 'heavy-run'))      # a loose directory is not adopted or chmodded
+        self.assertEqual(os.stat(self.dir).st_mode & 0o777, 0o755)
+        with unittest.mock.patch.object(rec, 'exe_identity', lambda pid, run=None, timeout=5: None):
+            os.chmod(self.dir, 0o700)
+            self.assertFalse(rec.register_wrapper(self.dir, 'q000101', 'heavy-run'))      # unknown identity: nothing recorded
+
+    def test_list_registered_ignores_temporaries_and_foreign_names(self):
+        self.write('q000101')
+        self.write('q000102')
+        for name in ('.q000103.1.tmp', 'q000104.json.bak', 'notes.json', 'q1.json'):
+            (self.dir / name).write_text('{}')
+        self.assertEqual(rec.list_registered(self.dir), ['q000101', 'q000102'])
+        self.assertEqual(rec.list_registered(self.dir / 'absent'), [])
+
+    def test_wrappers_dir_follows_the_state_file_unless_overridden(self):
+        with unittest.mock.patch.dict(os.environ):
+            os.environ.pop('ADMISSION_WRAPPERS_DIR', None)
+            self.assertEqual(rec.wrappers_dir(Path('/x/admission/state.json')), Path('/x/admission/wrappers'))
+            os.environ['ADMISSION_WRAPPERS_DIR'] = '/elsewhere'
+            self.assertEqual(rec.wrappers_dir(Path('/x/admission/state.json')), Path('/elsewhere'))
+
+
+class Slow(unittest.TestCase):
+    """Registration must never delay a job: every `ps` lookup is bounded to 1 s and a timeout means no record."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name).resolve() / 'wrappers'
+
+    def test_a_hanging_ps_skips_registration_quickly(self):
+        seen = []
+
+        def hang(argv, **kw):
+            seen.append(kw.get('timeout'))
+            raise subprocess.TimeoutExpired(argv, kw.get('timeout'))
+        started = time.monotonic()
+        self.assertFalse(rec.register_wrapper(self.dir, 'q000101', 'heavy-run', run=hang))
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertTrue(seen and all(t is not None and t <= 1 for t in seen), seen)
+        self.assertFalse(self.dir.exists() and list(self.dir.iterdir()))
+
+    def test_both_lookups_are_bounded_and_a_normal_answer_registers(self):
+        seen = []
+
+        def run(argv, **kw):
+            seen.append(kw.get('timeout'))
+            return subprocess.CompletedProcess(argv, 0, stdout='Thu Nov 19 09:00:00 2026\n' if 'lstart=' in argv else 'python3 /x/heavy-run\n')
+        self.assertTrue(rec.register_wrapper(self.dir, 'q000101', 'heavy-run', run=run))
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(all(t <= 1 for t in seen), seen)
+
+    def test_the_real_lookups_use_the_same_bound(self):
+        seen = []
+        real = subprocess.run
+        with unittest.mock.patch.object(rec.subprocess, 'run', lambda argv, **kw: seen.append(kw.get('timeout')) or real(argv, **kw)):
+            rec.register_wrapper(self.dir, 'q000101', 'heavy-run')
+        self.assertTrue(seen and all(t <= 1 for t in seen), seen)
+
+
+class Prune(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.dir = self.root / 'wrappers'
+        self.dir.mkdir(mode=0o700)
+        self.mon = self.root / 'mon'
+        self.env = rec.Env(self.mon, clock=lambda: NOW)
+        self.tokens = {}
+
+    def put(self, qid, pid, token='T1', created=None, mode=0o600):
+        doc = {'qid': qid, 'pid': pid, 'start_token': token, 'pgid': 5, 'ppid': 4, 'exe_id': 'python3 heavy-run', 'kind': 'heavy-run',
+               'created': created or rec.iso(NOW - timedelta(hours=1))}
+        path = self.dir / (qid + '.json')
+        path.write_text(json.dumps(doc))
+        os.chmod(path, mode)
+        return path
+
+    def prune(self, **kw):
+        return rec.prune_registry(self.dir, self.env, token_fn=lambda pid: self.tokens.get(pid), now=NOW, **kw)
+
+    def test_only_dead_replaced_or_old_records_go(self):
+        self.tokens = {10: 'T1', 11: 'OTHER', 13: 'T1'}
+        keep = self.put('q000001', 10)
+        dead = self.put('q000002', 12)
+        replaced = self.put('q000003', 11)
+        old = self.put('q000004', 13, created=rec.iso(NOW - timedelta(days=8)))
+        self.assertEqual(self.prune(), 3)
+        self.assertEqual((keep.exists(), dead.exists(), replaced.exists(), old.exists()), (True, False, False, False))
+        lines = [json.loads(x) for x in (self.mon / rec.RECEIPT_NAME).read_text().splitlines()]
+        self.assertEqual([(x['kind'], x['detail']) for x in lines], [('prune', 'count=3')])      # a count only
+        self.assertEqual(self.prune(), 0)
+        self.assertEqual(len((self.mon / rec.RECEIPT_NAME).read_text().splitlines()), 1)
+
+    def test_irregular_foreign_invalid_or_uninspectable_files_are_left(self):
+        self.tokens = {}
+        link = self.dir / 'q000010.json'
+        real = self.root / 'outside.json'
+        real.write_text('{}')
+        link.symlink_to(real)
+        (self.dir / 'q000011.json').mkdir()
+        bad = self.dir / 'q000012.json'
+        bad.write_text('not json')
+        loose = self.put('q000013', 99, mode=0o644)
+        def boom(pid):
+            raise OSError('ps')
+        keep = self.put('q000014', 98)
+        self.assertEqual(rec.prune_registry(self.dir, self.env, token_fn=boom, now=NOW), 0)
+        self.assertEqual(self.prune(), 1)       # only the valid, dead one
+        self.assertFalse(keep.exists())
+        for path in (link, bad, loose, real):
+            self.assertTrue(path.exists(), path)
+        self.assertTrue((self.dir / 'q000011.json').is_dir())
+
+    def test_bounded_per_call_and_loose_directory_untouched(self):
+        for n in range(7):
+            self.put('q0001%02d' % n, 90 + n)
+        self.assertEqual(self.prune(limit=5), 5)
+        self.assertEqual(self.prune(limit=5), 2)
+        self.put('q000200', 77)
+        os.chmod(self.dir, 0o755)
+        self.assertEqual(self.prune(), 0)
+        self.assertTrue((self.dir / 'q000200.json').exists())
+
+    def test_examination_is_capped_and_rotates_so_every_record_is_reached(self):
+        for n in range(150):
+            self.put('q%06d' % (300 + n), 1000 + n)
+        seen, calls = set(), []
+
+        def alive(pid):
+            calls.append(pid)
+            seen.add(pid)
+            return 'T1'
+        stats = {}
+        self.assertEqual(rec.prune_registry(self.dir, self.env, token_fn=alive, now=NOW, stats=stats), 0)
+        self.assertEqual((len(calls), stats['examined']), (rec.PRUNE_EXAMINE_MAX, rec.PRUNE_EXAMINE_MAX))
+        for minute in range(1, 4):
+            rec.prune_registry(self.dir, self.env, token_fn=alive, now=NOW + timedelta(minutes=minute))
+        self.assertEqual(len(seen), 150)
+
+    def test_directory_listing_is_capped_and_the_excess_counted(self):
+        for n in range(30):
+            self.put('q%06d' % (400 + n), 2000 + n)
+        stats = {}
+        removed = rec.prune_registry(self.dir, self.env, token_fn=lambda pid: None, now=NOW, list_max=20, stats=stats)
+        self.assertEqual((removed, stats['ignored']), (20, 10))
+        self.assertEqual(len(list(self.dir.glob('q*.json'))), 10)
+        self.assertEqual(json.loads((self.mon / rec.RECEIPT_NAME).read_text().splitlines()[-1])['detail'], 'count=20 ignored=10')
+        self.assertEqual((rec.PRUNE_LIST_MAX, rec.PRUNE_EXAMINE_MAX, rec.PRUNE_BUDGET_S), (1000, 100, 5.0))
+
+    def test_a_total_time_budget_stops_a_slow_pass(self):
+        for n in range(10):
+            self.put('q%06d' % (500 + n), 3000 + n)
+        clock = {'t': 0.0}
+
+        def slow(pid):
+            clock['t'] += 2.0      # each lookup "takes" 2 s
+            return 'T1'
+        stats = {}
+        rec.prune_registry(self.dir, self.env, token_fn=slow, now=NOW, monotonic=lambda: clock['t'], stats=stats)
+        self.assertEqual(stats['examined'], 3)      # 0, 2 and 4 s are inside the 5 s budget; 6 s is not
+
+    def test_a_slow_or_failing_ps_keeps_the_record(self):
+        path = self.put('q000600', 4000)
+        seen = []
+
+        def hang(argv, **kw):
+            seen.append(kw.get('timeout'))
+            raise subprocess.TimeoutExpired(argv, kw.get('timeout'))
+        with unittest.mock.patch.object(rec.subprocess, 'run', hang):
+            self.assertEqual(rec.prune_registry(self.dir, self.env, now=NOW), 0)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                rec._bounded_token(4000)
+        self.assertTrue(path.exists() and seen and all(t <= 1 for t in seen), seen)
+        gone = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout='')
+        broken = lambda argv, **kw: subprocess.CompletedProcess(argv, 2, stdout='')
+        with unittest.mock.patch.object(rec.subprocess, 'run', gone):
+            self.assertIsNone(rec._bounded_token(4000))
+        with unittest.mock.patch.object(rec.subprocess, 'run', broken), self.assertRaises(OSError):
+            rec._bounded_token(4000)
+
+    def test_it_never_signals(self):
+        text = (ROOT / 'scripts/admission-recovery.py').read_text()
+        body = text[text.index('def prune_registry'):text.index('# ---- receipts')]
+        for needle in ('kill', 'signal', 'rmtree'):
+            self.assertNotIn(needle, body)
+
+
+class ExeIdentity(unittest.TestCase):
+    def reduce(self, stdout, code=0):
+        return rec.exe_identity(1234, run=lambda *a, **k: subprocess.CompletedProcess(a, code, stdout=stdout))
+
+    def test_only_two_basenames_survive_and_the_rest_of_the_command_line_is_dropped(self):
+        got = self.reduce('/opt/homebrew/bin/python3 -u /Users/x/scripts/heavy-run --label l --token sk-SECRET-123 -- cargo test\n')
+        self.assertEqual(got, 'python3 heavy-run')
+        self.assertNotIn('SECRET', got)
+
+    def test_unknown_or_odd_shapes_are_none(self):
+        self.assertIsNone(self.reduce('', 1))
+        self.assertIsNone(self.reduce('python3\n'))
+        self.assertIsNone(self.reduce('python3 -c\n'))
+        self.assertIsNone(self.reduce('py thon3 /x/s p a c e\n'.replace('py thon3', 'p/y$y')))
+        self.assertIsNone(rec.exe_identity(1, run=lambda *a, **k: (_ for _ in ()).throw(OSError('no ps'))))
+
+    def test_it_reads_a_real_process_and_names_the_interpreter_and_script(self):
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / 'heavy-run'
+            script.write_text('import time\ntime.sleep(30)\n')
+            proc = subprocess.Popen([sys.executable, str(script), '--token', 'sk-SECRET'], stdin=subprocess.DEVNULL)
+            self.addCleanup(lambda: (proc.kill(), proc.wait()))
+            got = None
+            for _ in range(50):
+                got = rec.exe_identity(proc.pid)
+                if got and got.endswith('heavy-run'):
+                    break
+            self.assertEqual(got, '%s heavy-run' % os.path.basename(sys.executable))
+        inline = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], stdin=subprocess.DEVNULL)
+        self.addCleanup(lambda: (inline.kill(), inline.wait()))
+        self.assertIsNone(rec.exe_identity(inline.pid))      # `-c CODE` names no script: unknown, never guessed
+
+
 class Shape(unittest.TestCase):
     def test_allowlist_is_not_used_by_recovery_paths(self):
         tree = ast.parse((ROOT / 'scripts' / 'admission-recovery.py').read_text())
@@ -700,14 +1028,17 @@ class Shape(unittest.TestCase):
             called = {c.func.id for c in ast.walk(funcs[name]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
             self.assertFalse(called & {'load_terminate_allowlist', 'terminate_allowed_for_workload'}, name)
 
-    def test_only_sigterm_is_ever_named_and_module_is_unwired(self):
+    def test_only_sigterm_is_ever_named_and_only_known_consumers_import_it(self):
         text = (ROOT / 'scripts' / 'admission-recovery.py').read_text()
         self.assertNotIn('signal.SIGKILL', text)
         self.assertNotIn('os.kill', text)
         self.assertNotIn('killpg', text)
+        consumers = {'admission-monitor.py', 'heavy-run', 'la-cargo'}   # the monitor's act mode, and the two wrappers that register themselves
         for path in (ROOT / 'scripts').iterdir():
-            if path.is_file() and path.name != 'admission-recovery.py':
+            if path.is_file() and path.name != 'admission-recovery.py' and path.name not in consumers:
                 self.assertNotIn('admission-recovery', path.read_text(errors='ignore'), path.name)
+        for name in consumers:
+            self.assertNotIn('SIGKILL', (ROOT / 'scripts' / name).read_text(errors='ignore'), name)
 
     def test_cancel_never_uses_session_or_confirm_or_state_edits(self):
         text = (ROOT / 'scripts' / 'admission-recovery.py').read_text()

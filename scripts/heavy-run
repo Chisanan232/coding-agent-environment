@@ -18,6 +18,7 @@ command's own 64, 75 or 77 is indistinguishable from the wrapper's, as with la-c
 it guards against double charging by accident, not against a caller who sets it on purpose.
 """
 import argparse
+from importlib.util import module_from_spec, spec_from_file_location
 import json
 import os
 import re
@@ -29,6 +30,7 @@ import tempfile
 import time
 
 RUNNER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk-admission.py")
+RECOVERY_LIB = os.path.join(os.path.dirname(RUNNER), "admission-recovery.py")
 HOLDER_ENV = "CAE_ADMISSION_HOLDER"          # "<label>:<pid>", exported by the runner's run / queue claim
 REFUSED_EXIT = 77
 TIMEOUT_EXIT = 75
@@ -51,6 +53,30 @@ def _capture(cmd, env):
         return done.returncode, done.stdout
     except (OSError, subprocess.SubprocessError) as exc:
         return 1, str(exc)
+
+
+def _register(qid, kind):
+    """Record this wrapper for the monitor's guarded recovery (ADR 0019). Best effort: any problem returns None and the job goes on."""
+    try:
+        spec = spec_from_file_location("admission_recovery", RECOVERY_LIB)
+        lib = module_from_spec(spec)
+        spec.loader.exec_module(lib)
+        directory = lib.wrappers_dir()
+        return (lib, directory) if lib.register_wrapper(directory, qid, kind) else None
+    except (SystemExit, KeyboardInterrupt):
+        raise      # a signal in this window keeps its meaning: the caller's `finally` still cancels or releases the entry
+    except BaseException:
+        return None
+
+
+def _unregister(handle, qid):
+    if handle:
+        try:
+            handle[0].unregister_wrapper(handle[1], qid)
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException:
+            pass
 
 
 def _json(text):
@@ -126,8 +152,9 @@ def _queued(args, declare, run_extra, job, proof, session, env, sleep, clock):
         print(f"heavy-run: could not queue the job: {queued.get('reason', out.strip()[:200])}", file=sys.stderr)
         return REFUSED_EXIT
     qid = queued["id"]
-    claimed, deadline, next_notice = False, clock() + args.max_wait_s, 0.0
+    claimed, deadline, next_notice, registered = False, clock() + args.max_wait_s, 0.0, None
     try:
+        registered = _register(qid, "heavy-run")
         while clock() < deadline:
             _capture(runner_cmd("queue", "advance"), env)
             _, listing = _capture(runner_cmd("queue", "status", "--json"), env)
@@ -155,6 +182,7 @@ def _queued(args, declare, run_extra, job, proof, session, env, sleep, clock):
             _release(["queue", "release", "--id", qid, "--session-id", session], env)
         elif not claimed:
             _capture(runner_cmd("queue", "cancel", "--id", qid, "--session-id", session), env)
+        _unregister(registered, qid)      # last: a registry problem can never skip the cancel or release above
 
 
 def _terminate(signum, _frame):

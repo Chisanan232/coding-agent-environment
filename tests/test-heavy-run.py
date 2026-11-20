@@ -10,11 +10,14 @@ import contextlib
 import io
 import json
 import os
+import signal
 import stat
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,6 +99,10 @@ class Wrapper(unittest.TestCase):
         old = hr.RUNNER
         hr.RUNNER = str(self.dir / 'runner')
         self.addCleanup(setattr, hr, 'RUNNER', old)
+        # No test registers this process for real: the wrapper registry is off unless a test points it at a temp directory.
+        patcher = unittest.mock.patch.object(hr, 'RECOVERY_LIB', str(self.dir / 'absent-recovery.py'))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.env = {'PATH': os.environ['PATH'], 'FAKE_DIR': str(self.dir)}
         self.now = 0.0
         for sig in (hr.signal.SIGTERM, hr.signal.SIGHUP):
@@ -288,6 +295,193 @@ class Wrapper(unittest.TestCase):
         fresh = module_from_spec(spec_from_loader('heavy_run_fresh', fresh_loader))
         fresh_loader.exec_module(fresh)
         self.assertEqual(fresh.RUNNER, str(ROOT / 'scripts/disk-admission.py'))
+
+
+class Registry(Wrapper):
+    """ADR 0019: a queued wrapper records itself for the monitor's guarded recovery; a failure to do so never fails the job."""
+
+    def setUp(self):
+        super().setUp()
+        self.registry = self.dir / 'wrappers'
+        patch_env = unittest.mock.patch.dict(os.environ, {'ADMISSION_WRAPPERS_DIR': str(self.registry)})
+        patch_env.start()
+        self.addCleanup(patch_env.stop)
+        self.use_lib(str(ROOT / 'scripts/admission-recovery.py'))
+        self.seen = []
+
+    def use_lib(self, path, identity='python3 heavy-run'):
+        """Point the wrapper at a recovery library; this test process is not a heavy-run script, so its identity is fixed to one."""
+        real = spec_from_file_location
+
+        def fake(name, location):
+            spec = real(name, location)
+            inner = spec.loader
+
+            class Loader:
+                def create_module(self, spec):
+                    return None
+
+                def exec_module(self, module):
+                    inner.exec_module(module)
+                    module.exe_identity = lambda pid, run=None, timeout=5: identity
+            spec.loader = Loader()
+            return spec
+        patchers = [unittest.mock.patch.object(hr, 'RECOVERY_LIB', path), unittest.mock.patch.object(hr, 'spec_from_file_location', fake)]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def sleep(self, seconds):
+        self.seen.append({p.name: json.loads(p.read_text()) for p in self.registry.glob('q*.json')} if self.registry.exists() else {})
+        super().sleep(seconds)
+
+    def left(self):
+        return sorted(p.name for p in self.registry.iterdir()) if self.registry.exists() else []
+
+    def test_a_queued_job_is_recorded_while_it_waits_and_removed_after_it_exits(self):
+        self.mode('queue')
+        code, _ = self.invoke()
+        self.assertEqual(code, 0)
+        waiting = [snap for snap in self.seen if snap]
+        self.assertTrue(waiting, 'the record was never present during the wait')
+        record = waiting[0]['q000900.json']
+        self.assertEqual((record['qid'], record['kind'], record['pid'], record['exe_id']), ('q000900', 'heavy-run', os.getpid(), 'python3 heavy-run'))
+        self.assertEqual(set(record), set(('qid', 'pid', 'start_token', 'pgid', 'ppid', 'exe_id', 'kind', 'created')))
+        self.assertEqual(self.left(), [])
+
+    def test_the_record_holds_no_command_line_and_is_private(self):
+        self.mode('queue')
+        modes = []
+        original = self.sleep
+
+        def spy(seconds):
+            for p in self.registry.glob('q*.json'):
+                modes.append((oct(p.stat().st_mode & 0o777), oct(self.registry.stat().st_mode & 0o777), p.read_text()))
+            original(seconds)
+        self.sleep = spy
+        self.invoke()
+        self.assertTrue(modes)
+        for file_mode, dir_mode, text in modes:
+            self.assertEqual((file_mode, dir_mode), ('0o600', '0o700'))
+            self.assertNotIn(str(self.dir / 'command'), text)
+            self.assertNotIn('pricing-fix-full4', text)
+
+    def test_a_job_that_starts_in_a_free_lane_registers_nothing(self):
+        self.mode('free')
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(self.left(), [])
+        self.assertFalse(any(self.seen))
+
+    def test_a_refused_entry_and_a_timeout_remove_the_record(self):
+        self.mode('cancelled')
+        self.assertEqual(self.invoke()[0], hr.REFUSED_EXIT)
+        self.assertEqual(self.left(), [])
+        self.mode('queue')
+        self.assertEqual(self.invoke(max_wait=0)[0], hr.TIMEOUT_EXIT)
+        self.assertEqual(self.left(), [])
+
+    def test_an_interrupt_still_removes_the_record(self):
+        self.mode('queue')
+        calls = []
+
+        def boom(seconds):
+            calls.append(1)
+            if any(self.registry.glob('q*.json')) and len(calls) >= 2:
+                raise SystemExit(143)
+            self.now += seconds
+        self.sleep = boom
+        with self.assertRaises(SystemExit):
+            self.invoke()
+        self.assertEqual(self.left(), [])
+
+    def signal_during_registration(self, signum):
+        """A signal that arrives while the registry is being written (an injected slow register): the wrapper's handlers raise as in production."""
+        self.mode('queue')
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+            signal.signal(sig, hr._terminate)
+        self.addCleanup(signal.signal, signal.SIGINT, signal.getsignal(signal.SIGINT))
+        signal.signal(signal.SIGINT, signal.default_int_handler)      # a background launch inherits SIGINT as ignored, which would make the test a no-op
+
+        def slow_register(qid, kind):
+            os.kill(os.getpid(), signum)
+            time.sleep(5)
+            return None
+        with unittest.mock.patch.object(hr, '_register', slow_register), self.assertRaises((SystemExit, KeyboardInterrupt)) as raised:
+            self.invoke()
+        return raised.exception
+
+    def test_a_signal_during_registration_still_cancels_the_entry_with_the_same_exit_code(self):
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            (self.dir / 'runner.jsonl').unlink(missing_ok=True)
+            stopped = self.signal_during_registration(signum)
+            self.assertEqual((type(stopped), stopped.code), (SystemExit, 128 + signum))      # the exit status a signal always had
+            cancel = self.argvs('queue', 'cancel')
+            self.assertEqual([c[c.index('--id') + 1] for c in cancel], ['q000900'], signum)
+            self.assertEqual((self.ran(), self.argvs('queue', 'release')), (0, []))
+
+    def test_an_interrupt_during_registration_still_cancels_the_entry(self):
+        (self.dir / 'runner.jsonl').unlink(missing_ok=True)
+        stopped = self.signal_during_registration(signal.SIGINT)
+        self.assertIsInstance(stopped, KeyboardInterrupt)
+        self.assertEqual(len(self.argvs('queue', 'cancel')), 1)
+
+    def test_unregister_is_the_last_cleanup_step_and_its_failure_changes_nothing(self):
+        self.mode('cancelled')
+        order = []
+
+        class Lib:
+            @staticmethod
+            def unregister_wrapper(directory, qid):
+                order.append('unregister')
+                raise RuntimeError('registry')
+        real_capture = hr._capture
+
+        def spy(cmd, env):
+            if 'cancel' in cmd:
+                order.append('cancel')
+            return real_capture(cmd, env)
+        with unittest.mock.patch.object(hr, '_register', lambda qid, kind: (Lib, '/x')), unittest.mock.patch.object(hr, '_capture', spy):
+            self.assertEqual(self.invoke()[0], hr.REFUSED_EXIT)
+        self.assertEqual(order, ['cancel', 'unregister'])
+
+    def test_a_registration_error_of_any_kind_is_ignored(self):
+        self.mode('queue')
+        class Odd(BaseException):
+            pass
+        bad = self.dir / 'odd-recovery.py'
+        bad.write_text('class Odd(BaseException):\n    pass\nraise Odd()\n')
+        self.use_lib(str(bad))
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(self.ran(), 1)
+
+    def test_a_registry_that_cannot_be_written_never_fails_the_job(self):
+        self.mode('queue')
+        blocker = self.dir / 'blocker'
+        blocker.write_text('x')
+        for broken in ({'ADMISSION_WRAPPERS_DIR': str(blocker / 'wrappers')}, {'ADMISSION_WRAPPERS_DIR': '/proc/nope/wrappers'}):
+            with unittest.mock.patch.dict(os.environ, broken):
+                (self.dir / 'command.ran').unlink(missing_ok=True)
+                self.assertEqual(self.invoke()[0], 0, broken)
+                self.assertEqual(self.ran(), 1)
+
+    def test_a_missing_or_broken_recovery_library_never_fails_the_job(self):
+        self.mode('queue')
+        self.use_lib(str(self.dir / 'does-not-exist.py'))
+        self.assertEqual(self.invoke()[0], 0)
+        bad = self.dir / 'bad-recovery.py'
+        bad.write_text('raise RuntimeError("boom")\n')
+        self.use_lib(str(bad))
+        (self.dir / 'command.ran').unlink(missing_ok=True)
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(self.ran(), 1)
+        self.assertEqual(self.left(), [])
+
+    def test_an_unregister_failure_never_changes_the_exit_code(self):
+        self.mode('queue')
+        with unittest.mock.patch.object(hr, '_unregister', side_effect=lambda handle, qid: None):
+            self.assertEqual(self.invoke(rc=5)[0], 5)
+        self.assertEqual(self.left(), ['q000900.json'])      # a leftover record is harmless: the monitor never trusts it once the process is gone
 
 
 class Accounting(unittest.TestCase):
