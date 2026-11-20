@@ -1527,6 +1527,7 @@ def _read_queue_entry(path):
              and ('order' not in entry or (type(entry['order']) is int and 1 <= entry['order'] <= entry['seq']))
              and ('requeue_of' not in entry or (isinstance(entry['requeue_of'], str) and QUEUE_ID_RE.fullmatch(entry['requeue_of'])))
              and ('requeues' not in entry or (type(entry['requeues']) is int and 1 <= entry['requeues'] <= BACKFILL_REQUEUE_MAX))
+             and entry.get('requeue_evidence', 'backfill-revoked') in ('backfill-revoked', 'backfill-lapsed')
              and ('waiter' not in entry or (isinstance(entry['waiter'], dict) and type(entry['waiter'].get('pid')) is int
                                             and entry['waiter']['pid'] > 0 and isinstance(entry['waiter'].get('start_token'), str)
                                             and 0 < len(entry['waiter']['start_token']) <= 64))
@@ -1774,7 +1775,15 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
                     if entry.get('session_id') != session_id:
                         return {'ok': False, 'reason': 'this job is already queued as %s by another session (%s)' % (
                             entry['id'], entry['label'])}
-                    return {'ok': True, 'id': entry['id'], 'reason': 'already queued as %s' % entry['id'], 'existing': True}
+                    if requeue_of is not None and entry.get('requeue_of') != requeue_of:
+                        # A re-queue may only return its own replacement. Any other live entry of this job (an ordinary duplicate queued
+                        # next to an expired one) is refused, so a wrapper never adopts an entry another wrapper waits on.
+                        return {'ok': False, 'reason': 'not-requeueable: %s; this job is already live as %s, which is not its replacement'
+                                                       % (requeue_of, entry['id'])}
+                    out = {'ok': True, 'id': entry['id'], 'reason': 'already queued as %s' % entry['id'], 'existing': True}
+                    if requeue_of is not None:
+                        out.update(requeue_of=requeue_of, order=entry.get('order'), evidence=entry.get('requeue_evidence'))
+                    return out
                 if entry['state'] in LIVE_STATES:
                     continue  # lapsed: advance will record the expiry; a fresh entry may be queued
                 if entry['state'] == 'RELEASED' and not again:
@@ -1787,7 +1796,8 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
                 why, evidence = _requeue_refusal(old, entries, fingerprint, session_id, waiter, state_path)
                 if why:
                     return {'ok': False, 'reason': 'not-requeueable: %s %s' % (requeue_of, why)}
-                inherited = {'order': _queue_order(old)[0], 'requeue_of': old['id'], 'requeues': old.get('requeues', 0) + 1}
+                inherited = {'order': _queue_order(old)[0], 'requeue_of': old['id'], 'requeues': old.get('requeues', 0) + 1,
+                             'requeue_evidence': evidence}
             seq_path = queue_dir(state_path) / 'seq.json'
             floor = 1 + max([e['seq'] for e in entries] or [0])
             try:

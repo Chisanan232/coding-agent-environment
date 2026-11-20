@@ -1101,8 +1101,42 @@ class Requeue(Base):
         self.assertNotIn(self.docker_a, out['expired'])
         self.assertEqual(self.state(self.docker_a), 'CLAIMED')   # revoke happens only before the claim: a running job is never stranded
         count = len(self.entries())
-        out = self.requeue(self.docker_a)                         # the live entry of the same job is returned, nothing new is queued
-        self.assertEqual((out['id'], out.get('existing')), (self.docker_a, True))
+        out = self.requeue(self.docker_a)                         # a live entry that is not its own replacement: refused, nothing queued
+        self.assertFalse(out['ok'])
+        self.assertIn('already live as %s, which is not its replacement' % self.docker_a, out['reason'])
+        self.assertEqual(len(self.entries()), count)
+
+    def test_an_ordinary_expiry_beside_a_live_duplicate_is_refused_and_the_duplicate_untouched(self):
+        """Review M1: qA expires ordinarily, the same session queues the same job again as qB, then wrapper A asks to re-queue qA."""
+        qa = self.enqueue('dup', 'build-crate', [SHARED])
+        self.advance(now=self.now + timedelta(hours=25))
+        self.assertEqual(self.state(qa), 'EXPIRED')
+        later = self.now + timedelta(hours=26)
+        entry = self.entries()[qa]
+        qb = da.queue_enqueue(self.path, label='dup', tickets=['HORO-1'], repo='horonom/x', worktree=str(self.worktree), harness='claude',
+                              session_id=SESSION, nbytes=entry['bytes'], argv=['cargo', 'test', 'dup'], now=later, again=True,
+                              declared=decl('build-crate', [SHARED]), waiter_pid=entry['waiter']['pid'], ancestor_fn=lambda p: True)
+        self.assertTrue(qb['ok'], qb)
+        before = {q: dict(e) for q, e in self.entries().items()}
+        receipts = len(self.receipts())
+        out = self.requeue(qa, now=later + timedelta(seconds=1))
+        self.assertFalse(out['ok'])
+        self.assertNotIn('existing', out)
+        self.assertIn('not-requeueable: %s' % qa, out['reason'])
+        self.assertEqual(self.entries(), before)                  # nothing written: qB and qA unchanged, no new entry
+        self.assertEqual(len(self.receipts()), receipts)
+
+    def test_a_lost_grant_entry_that_is_no_longer_expired_is_never_replaced(self):
+        """Only the EXPIRED check refuses here: evidence, job, session, waiter, chain and replacement checks all pass."""
+        self.revoke_docker_a()
+        with da.state_lock(self.path):
+            entry = self.entries()[self.docker_a]
+            entry['state'] = 'CANCELLED'
+            da._write_queue_entry(self.path, entry)
+        count = len(self.entries())
+        out = self.requeue(self.docker_a)
+        self.assertFalse(out['ok'])
+        self.assertIn('is CANCELLED, not EXPIRED', out['reason'])
         self.assertEqual(len(self.entries()), count)
 
 
