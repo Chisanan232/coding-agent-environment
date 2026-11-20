@@ -158,7 +158,9 @@ def _queued(args, declare, run_extra, job, proof, session, env, sleep, clock):
     def enqueue(wait_s, requeue_of=None):
         """(entry id or None, reason, runner reply). The same declaration, job and waiter every time, so a re-queue matches the lost
         entry."""
-        extra = (["--requeue-of", requeue_of] if requeue_of else []) + (["--requeue-capable"] if capable else [])
+        # The capability goes on the first enqueue only: a replacement inherits it, and a re-queue must not depend on a flag the
+        # runner (probed once, at start) might no longer accept after a checkout change during a long wait.
+        extra = ["--requeue-of", requeue_of] if requeue_of else (["--requeue-capable"] if capable else [])
         rc, out = _capture(runner_cmd("queue", "enqueue", *declare, "--ticket", ticket, "--repo", args.repo, "--worktree", worktree,
                                       "--harness", args.harness, "--session-id", session, "--again", *extra, "--waiter-pid",
                                       str(os.getpid()), "--wait-s", str(max(wait_s, 60)), "--", *job), env)

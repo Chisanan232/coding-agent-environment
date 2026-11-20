@@ -365,8 +365,10 @@ class SingleAccounting(LaCargoBase):
         self.assertEqual(rc, 0)
         enqueues = self.queue_argvs('enqueue')
         self.assertEqual(len(enqueues), 2)
-        for argv in enqueues:
-            self.assertIn('--requeue-capable', argv[:argv.index('--')])
+        first, requeue = enqueues
+        self.assertIn('--requeue-capable', first[:first.index('--')])
+        self.assertIn('--requeue-of', requeue)
+        self.assertNotIn('--requeue-capable', requeue)              # the replacement inherits the field
         parsed = da.build_parser().parse_args(enqueues[0][:enqueues[0].index('--') + 1] + ['x'])
         self.assertTrue(parsed.requeue_capable)
 

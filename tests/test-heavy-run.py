@@ -315,9 +315,12 @@ class Wrapper(unittest.TestCase):
         code, _ = self.invoke()
         self.assertEqual(code, 0)
         enqueues = self.argvs('queue', 'enqueue')
-        self.assertEqual(len(enqueues), 2)                       # the first enqueue and the re-queue both declare it
-        for argv in enqueues:
-            self.assertIn('--requeue-capable', argv[:argv.index('--')])
+        self.assertEqual(len(enqueues), 2)
+        first, requeue = enqueues
+        self.assertIn('--requeue-capable', first[:first.index('--')])
+        # The re-queue omits it (the replacement inherits the field), so a runner that lost the flag mid-wait cannot refuse it.
+        self.assertIn('--requeue-of', requeue)
+        self.assertNotIn('--requeue-capable', requeue)
 
     def test_the_checkouts_own_runner_accepts_the_capability(self):
         with unittest.mock.patch.object(hr, 'RUNNER', str(ROOT / 'scripts/disk-admission.py')):
