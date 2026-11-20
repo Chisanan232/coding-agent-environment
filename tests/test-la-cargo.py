@@ -59,6 +59,43 @@ def counter(name):
     n = int(open(path).read()) if os.path.exists(path) else 0
     open(path, 'w').write(str(n + 1))
     return n
+if mode in ('revoked', 'lapsed', 'expired', 'revokedforever', 'adopt'):
+    # SPE-176: 'revoked' revokes the claim of q000001 (EXPIRED), accepts --requeue-of and grants the replacement; 'expired' is an
+    # ordinary expiry the runner refuses to re-queue; 'revokedforever' accepts every re-queue and expires each replacement.
+    cur_path, revoked = os.path.join(d, 'current'), os.path.join(d, 'revoked')
+    cur = open(cur_path).read() if os.path.exists(cur_path) else 'q000001'
+    if cmd == 'run':
+        if '--queue-id' in argv and argv[argv.index('--queue-id') + 1] != 'q000001' and mode in ('revoked', 'lapsed'):
+            job = argv[argv.index('--') + 1:]
+            os.execvp(job[0], job)
+        if '--queue-id' in argv:
+            open(revoked, 'w').write('1')
+        print('refused: lane-cap: 2 of 2 heavy lanes in use', file=sys.stderr)
+        sys.exit(77)
+    if cmd == 'queue' and argv[1] == 'enqueue':
+        if '--requeue-of' in argv:
+            old = argv[argv.index('--requeue-of') + 1]
+            if mode == 'adopt':                  # a runner reply that is not old's replacement: another live entry of the job
+                print(json.dumps({'ok': True, 'id': 'q000777', 'existing': True}))
+                sys.exit(0)
+            if mode == 'expired' or old != cur:
+                print(json.dumps({'ok': False, 'reason': 'not-requeueable: did not lose a backfilled grant'}))
+                sys.exit(77)
+            cur = 'q%06d' % (int(cur[1:]) + 1)
+            open(cur_path, 'w').write(cur)
+            print(json.dumps({'ok': True, 'id': cur, 'requeue_of': old,
+                              'evidence': 'backfill-lapsed' if mode == 'lapsed' else 'backfill-revoked'}))
+        else:
+            print(json.dumps({'ok': True, 'id': cur}))
+    elif cmd == 'queue' and argv[1] == 'status':
+        if mode in ('revoked', 'lapsed'):
+            state = 'GRANTED' if cur != 'q000001' or not os.path.exists(revoked) else 'EXPIRED'
+        else:
+            state = 'EXPIRED'
+        print(json.dumps({'entries': [{'id': cur, 'state': state}]}))
+    else:
+        print(json.dumps({'ok': True}))
+    sys.exit(0)
 if cmd == 'run':
     job = argv[argv.index('--') + 1:]
     queued = '--queue-id' in argv
@@ -287,6 +324,67 @@ class SingleAccounting(LaCargoBase):
                 contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             rc = la.main()
         return rc, err.getvalue()
+
+    def queue_argvs(self, sub):
+        return [c['argv'] for c in self.lines('runner.jsonl') if c['argv'][:2] == ['queue', sub]]
+
+    def test_a_revoked_backfill_grant_is_requeued_and_the_build_runs_once_on_the_replacement(self):
+        (self.dir / 'mode').write_text('revoked')
+        rc, err = self.run_la('build')
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.lines('cargo.jsonl')), 1)
+        self.assertIn('backfill grant revoked; re-queued as q000002', err)
+        first, requeue = self.queue_argvs('enqueue')
+        self.assertEqual(requeue[requeue.index('--requeue-of') + 1], 'q000001')
+        for flag in ('--session-id', '--waiter-pid', '--label', '--bytes', '--class', '--worktree'):
+            self.assertEqual(requeue[requeue.index(flag) + 1], first[first.index(flag) + 1], flag)
+        self.assertEqual(requeue[requeue.index('--') + 1:], first[first.index('--') + 1:])
+        parsed = da.build_parser().parse_args(requeue[:requeue.index('--') + 1] + ['x'])    # the real runner accepts the re-queue call
+        self.assertEqual((parsed.requeue_of, parsed.again), ('q000001', True))
+        self.assertEqual([r[r.index('--id') + 1] for r in self.queue_argvs('release')], ['q000002'])
+        self.assertEqual(self.queue_argvs('cancel'), [])
+
+    def test_an_ordinary_expiry_still_refuses_with_77(self):
+        (self.dir / 'mode').write_text('expired')
+        rc, err = self.run_la('build')
+        self.assertEqual(rc, 77)
+        self.assertEqual(self.lines('cargo.jsonl'), [])
+        self.assertIn('la-cargo: queue entry q000001 is EXPIRED; refusing.', err)
+        self.assertNotIn('re-queued', err)
+        self.assertEqual([c[c.index('--id') + 1] for c in self.queue_argvs('cancel')], ['q000001'])
+
+    def test_a_lapsed_unclaimed_backfill_grant_says_so(self):
+        (self.dir / 'mode').write_text('lapsed')
+        rc, err = self.run_la('build')
+        self.assertEqual(rc, 0)
+        self.assertIn('backfill grant lapsed unclaimed; re-queued as q000002', err)
+
+    def test_a_reply_that_is_not_the_replacement_is_a_refusal_and_never_adopted(self):
+        (self.dir / 'mode').write_text('adopt')
+        rc, err = self.run_la('build')
+        self.assertEqual(rc, 77)
+        self.assertEqual(self.lines('cargo.jsonl'), [])
+        self.assertIn('la-cargo: queue entry q000001 is EXPIRED; refusing.', err)
+        self.assertEqual([c[c.index('--id') + 1] for c in self.queue_argvs('cancel')], ['q000001'])
+        self.assertFalse([c for c in self.lines('runner.jsonl') if 'q000777' in c['argv']])
+
+    def test_requeues_are_bounded(self):
+        (self.dir / 'mode').write_text('revokedforever')
+
+        def expired(_signum, _frame):
+            raise AssertionError('la-cargo did not stop within 60 s')
+        old = signal.signal(signal.SIGALRM, expired)
+        signal.alarm(60)          # a regression that loops (POLL_S is 0 here) must fail, not hang the suite
+        try:
+            rc, err = self.run_la('build')
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+        self.assertEqual(rc, 77)
+        self.assertEqual(self.lines('cargo.jsonl'), [])
+        self.assertEqual(len([a for a in self.queue_argvs('enqueue') if '--requeue-of' in a]), la.REQUEUE_MAX)
+        self.assertIn('EXPIRED after 3 backfill re-queues (limit 3)', err)
+        self.assertEqual([c[c.index('--id') + 1] for c in self.queue_argvs('cancel')], ['q000004'])
 
     def test_an_unqueueable_build_is_refused_not_started(self):
         (self.dir / 'mode').write_text('enqueue-fails')

@@ -13,6 +13,8 @@ ADR 0017, SPE-174): class build-workspace, one lane reservation per build, relea
 cargo exits. A build already running under a lane (CAE_ADMISSION_HOLDER names this process
 or an ancestor) is not charged again; `--light` is never charged. Exit codes: 75 free-space
 refusal, 76 over artifact budget, 77 refused by the queue (distinct from cargo's own).
+A build whose backfilled grant is revoked at claim or lapses unclaimed (SPE-176) is re-queued
+at its original FIFO position and keeps waiting, at most REQUEUE_MAX times.
 """
 import fcntl
 from importlib.util import module_from_spec, spec_from_file_location
@@ -59,6 +61,10 @@ def _wait_s() -> int:
 QUEUE_WAIT_S = _wait_s()
 POLL_S = 15
 NOTICE_EVERY_S = 300
+# A backfilled grant revoked at claim, or lapsed unclaimed, is re-queued at its own FIFO position at most this many times (the runner's
+# BACKFILL_REQUEUE_MAX caps the chain too). One poll iteration stays well under the runner's 600 s backfill claim window: the 15 s sleep,
+# advance and status capped at 120 s each, and a refused claim bounded by the runner's own memory-gate (120 s) and lock (5 s) timeouts.
+REQUEUE_MAX = 3
 
 
 def free_gib() -> float:
@@ -195,15 +201,24 @@ def _release(cmd: "list[str]", env) -> None:
 def _queued_build(declare, job, proof, session, env, sleep, clock) -> int:
     ticket = re.sub(r"[^A-Za-z0-9._-]", "", os.environ.get("CLAUDE_CURRENT_TICKET", "")).lstrip("._-")[:32] or "local-agent"
     harness = os.environ.get("LA_CARGO_HARNESS", "claude")
-    rc, out = _capture(runner_cmd("queue", "enqueue", *declare, "--ticket", ticket, "--repo", "local-agent", "--worktree",
-                                  os.getcwd(), "--harness", harness, "--session-id", session, "--again", "--waiter-pid", str(os.getpid()),
-                                  "--wait-s", str(QUEUE_WAIT_S), "--", *job), env)
-    queued = _json(out)
-    if rc != 0 or not queued.get("ok") or not queued.get("id"):
-        print(f"la-cargo: could not queue the build: {queued.get('reason', out.strip()[:200])}", file=sys.stderr)
+    worktree = os.getcwd()
+
+    def enqueue(wait_s, requeue_of=None):
+        """(entry id or None, reason, runner reply). The same declaration, job and waiter every time, so a re-queue matches the lost
+        entry."""
+        extra = ["--requeue-of", requeue_of] if requeue_of else []
+        rc, out = _capture(runner_cmd("queue", "enqueue", *declare, "--ticket", ticket, "--repo", "local-agent", "--worktree",
+                                      worktree, "--harness", harness, "--session-id", session, "--again", *extra, "--waiter-pid",
+                                      str(os.getpid()), "--wait-s", str(max(wait_s, 60)), "--", *job), env)
+        queued = _json(out)
+        ok = rc == 0 and queued.get("ok") and queued.get("id")
+        return (queued["id"] if ok else None), queued.get("reason", out.strip()[:200]), queued
+
+    qid, why, _ = enqueue(QUEUE_WAIT_S)
+    if not qid:
+        print(f"la-cargo: could not queue the build: {why}", file=sys.stderr)
         return REFUSED_EXIT
-    qid = queued["id"]
-    claimed, deadline, next_notice, registered = False, clock() + QUEUE_WAIT_S, 0.0, None
+    claimed, deadline, next_notice, registered, requeues = False, clock() + QUEUE_WAIT_S, 0.0, None, 0
     try:
         registered = _register(qid, "la-cargo")
         while clock() < deadline:
@@ -218,6 +233,21 @@ def _queued_build(declare, job, proof, session, env, sleep, clock) -> int:
                     _release(["queue", "release", "--id", qid, "--session-id", session], env)
                     return rc
                 print(f"la-cargo: claim of {qid} refused (exit {rc}); the grant is kept, retrying.", file=sys.stderr)
+            elif state == "EXPIRED" and requeues >= REQUEUE_MAX:
+                print(f"la-cargo: queue entry {qid} is EXPIRED after {requeues} backfill re-queues (limit {REQUEUE_MAX}); refusing.",
+                      file=sys.stderr)
+                return REFUSED_EXIT
+            elif state == "EXPIRED" and _replaces(requeued := enqueue(int(deadline - clock()), requeue_of=qid), qid):
+                # The runner alone decides: it re-queues only an entry whose backfilled grant it revoked or saw lapse unclaimed. An
+                # ordinary expiry (or an older runner without --requeue-of) is refused there and falls to the unchanged refusal below.
+                replacement = requeued[0]
+                cause = "lapsed unclaimed" if requeued[2].get("evidence") == "backfill-lapsed" else "revoked"
+                print(f"la-cargo: backfill grant {cause}; re-queued as {replacement} (was {qid}, original FIFO position kept).",
+                      file=sys.stderr)
+                _unregister(registered, qid)
+                qid, requeues = replacement, requeues + 1
+                registered = _register(qid, "la-cargo")
+                continue
             elif state not in ("QUEUED", "ELIGIBLE"):
                 print(f"la-cargo: queue entry {qid} is {state or 'missing'}; refusing.", file=sys.stderr)
                 return REFUSED_EXIT
@@ -231,6 +261,12 @@ def _queued_build(declare, job, proof, session, env, sleep, clock) -> int:
         if not claimed:
             _capture(runner_cmd("queue", "cancel", "--id", qid, "--session-id", session), env)
         _unregister(registered, qid)      # last: a registry problem can never skip the cancel above
+
+
+def _replaces(requeued, qid):
+    """True only for the runner's replacement of qid: an id plus requeue_of naming qid. Any other reply, an `existing` entry that is not
+    qid's replacement included, is a refusal, so the wrapper never adopts an entry another wrapper waits on."""
+    return bool(requeued[0]) and requeued[2].get("requeue_of") == qid
 
 
 def _terminate(signum, _frame):

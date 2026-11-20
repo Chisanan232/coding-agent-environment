@@ -681,7 +681,7 @@ def verify_recovery(qid, env, cancelled_at=None):
     waiting = [e for e in entries.values() if e['id'] != qid and e.get('state') in ('ELIGIBLE', 'GRANTED')]
     checks['next_started'] = not waiting
     if waiting:
-        head = min(waiting, key=lambda e: e.get('seq', 0))
+        head = min(waiting, key=lambda e: (e.get('order', e.get('seq', 0)), e.get('seq', 0)))   # the scheduler's FIFO key (SPE-176 re-queue)
         within = cancelled_at is None or (now - parse_iso(cancelled_at)).total_seconds() < VERIFY_WINDOW_S
         checks['next_entry'] = head['id']
         return _verified(env, qid, 'pending' if within else 'failed', checks)

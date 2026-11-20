@@ -956,5 +956,189 @@ class Lows(Base):
         self.assertEqual(rows, {'old': 'absent', 'rev9': 'off', 'hard': 'off-hardened', 'on': 'on-hardened'})
 
 
+class Requeue(Base):
+    """A wrapper whose backfilled grant was revoked at claim, or lapsed unclaimed, re-queues the same job at its original FIFO position
+    (queue enqueue --requeue-of, SPE-176): a fresh id, never a reused one, ordered behind everything queued before the original."""
+    claim_real = ClaimRecheck.claim_real
+
+    def revoke_docker_a(self):
+        self.historical()
+        with backfill():
+            self.assertEqual(self.advance()['backfilled'], [self.docker_a])
+        out = self.claim_real(self.docker_a, self.host, free=210 * GIB)     # the head's floor would no longer hold: revoked
+        self.assertTrue(out['reason'].startswith('backfill-revoked'), out['reason'])
+
+    def requeue(self, qid, session=SESSION, waiter='entry', again=True, now=None):
+        entry = self.entries()[qid]
+        pid = entry['waiter']['pid'] if waiter == 'entry' else waiter
+        return da.queue_enqueue(self.path, label=entry['label'], tickets=['HORO-1'], repo='horonom/x', worktree=str(self.worktree),
+                                harness='claude', session_id=session, nbytes=entry['bytes'], argv=['cargo', 'test', entry['label']],
+                                now=now or self.now + timedelta(seconds=1), again=again, requeue_of=qid,
+                                declared={k: entry[k] for k in ('class', 'mem_bytes', 'cpu_slots', 'test_threads', 'excl_keys') if k in entry},
+                                waiter_pid=pid, ancestor_fn=(lambda p: True) if pid else None)
+
+    def waiting_order(self):
+        return [e['id'] for e in da._queue_entries(self.path)[0] if e['state'] in ('QUEUED', 'ELIGIBLE')]
+
+    def test_a_revoked_grant_is_replaced_at_its_original_position_with_a_fresh_id(self):
+        self.revoke_docker_a()
+        before = set(self.entries())
+        out = self.requeue(self.docker_a)
+        self.assertTrue(out['ok'], out)
+        new = out['id']
+        self.assertNotIn(new, before)
+        self.assertGreater(new, max(before))                     # ids are never reused
+        self.assertEqual((out['requeue_of'], out['evidence'], out['order']), (self.docker_a, 'backfill-revoked', self.entries()[self.docker_a]['seq']))
+        self.assertIn('position 2', out['reason'])
+        self.assertEqual(self.state(self.docker_a), 'EXPIRED')    # the lost entry stays as it was
+        self.assertEqual(self.waiting_order(), [self.head, new, self.docker_b, self.local])   # behind the head, ahead of later entries
+        record = [r for r in self.receipts('enqueued') if r['id'] == new]
+        self.assertEqual([(r['requeue_of'], r['evidence'], r['requeues']) for r in record], [(self.docker_a, 'backfill-revoked', 1)])
+        self.assertEqual(sum(1 for e in self.entries().values() if e.get('requeue_of') == self.docker_a), 1)
+
+    def test_the_replacement_is_granted_in_order_and_never_misread_as_a_backfilled_grant(self):
+        self.revoke_docker_a()
+        new = self.requeue(self.docker_a)['id']
+        self.blocker_proc.kill()
+        self.blocker_proc.wait()
+        with backfill():
+            out = self.advance()
+        self.assertEqual(out['granted'][:2], [self.head, new])    # ahead of docker_b, which was queued after the original
+        self.assertEqual(self.state(self.docker_b), 'QUEUED')
+        # docker_b waits with a lower seq than the replacement: by seq the replacement would look like a backfilled grant and its claim
+        # would need a host sample. By FIFO position nothing waits ahead of it, so it is an ordinary grant.
+        out = self.claim_real(new, None)
+        self.assertTrue(out['ok'], out)
+
+    def test_an_in_order_grant_made_before_the_replacement_existed_is_not_treated_as_a_backfill(self):
+        self.revoke_docker_a()
+        self.blocker_proc.kill()
+        self.blocker_proc.wait()
+        with backfill():
+            granted = self.advance()['granted']
+        self.assertIn(self.docker_b, granted)
+        self.assertTrue(self.requeue(self.docker_a)['ok'])
+        out = self.claim_real(self.docker_b, None)               # the replacement waits ahead of it but was created after its grant
+        self.assertTrue(out['ok'], out)
+
+    def test_a_backfilled_grant_that_lapsed_unclaimed_is_replaced(self):
+        self.historical()
+        later = self.now + timedelta(seconds=da.BACKFILL_GRANT_S + 1)
+        with backfill():
+            self.advance()
+            self.assertIn(self.docker_a, self.advance(now=later)['expired'])
+        out = self.requeue(self.docker_a, now=later + timedelta(seconds=1))
+        self.assertTrue(out['ok'], out)
+        self.assertEqual(out['evidence'], 'backfill-lapsed')
+
+    def test_an_ordinary_expiry_is_never_replaced(self):
+        head = self.enqueue('head', 'build-crate', [SHARED])
+        waited = self.enqueue('waited', 'build-crate', [LOCAL])
+        self.assertEqual(self.advance()['granted'][:1], [head])
+        self.advance(now=self.now + timedelta(hours=25))          # an in-order grant lapses; a wait limit passes
+        self.assertEqual((self.state(head), self.state(waited)), ('EXPIRED', 'EXPIRED'))
+        count = len(self.entries())
+        for qid in (head, waited):
+            out = self.requeue(qid, now=self.now + timedelta(hours=26))
+            self.assertFalse(out['ok'])
+            self.assertIn('did not lose a backfilled grant', out['reason'])
+        self.assertEqual(len(self.entries()), count)
+
+    def test_a_repeated_requeue_returns_the_live_replacement_and_never_duplicates(self):
+        self.revoke_docker_a()
+        first = self.requeue(self.docker_a)
+        again = self.requeue(self.docker_a)
+        self.assertEqual((again['id'], again.get('existing')), (first['id'], True))
+        self.advance(now=self.now + timedelta(hours=25))          # the replacement's own wait lapses: an ordinary expiry
+        self.assertEqual(self.state(first['id']), 'EXPIRED')
+        out = self.requeue(self.docker_a, now=self.now + timedelta(hours=26))
+        self.assertFalse(out['ok'])
+        self.assertIn('already re-queued as %s' % first['id'], out['reason'])
+        self.assertEqual(sum(1 for e in self.entries().values() if e.get('requeue_of') == self.docker_a), 1)
+
+    def test_only_the_same_session_and_waiter_may_take_the_position(self):
+        self.revoke_docker_a()
+        other = self.requeue(self.docker_a, session='1c2d3e4f-aaaa-bbbb-cccc-1234567890ab')
+        self.assertFalse(other['ok'])
+        self.assertIn('different job or session', other['reason'])
+        stranger = self.requeue(self.docker_a, waiter=self.spawn().pid)
+        self.assertFalse(stranger['ok'])
+        self.assertIn('different waiter', stranger['reason'])
+        self.assertFalse(self.requeue(self.docker_a, again=False)['ok'])
+        self.assertTrue(self.requeue(self.docker_a)['ok'])
+
+    def test_a_waiterless_handoff_entry_is_never_requeued(self):
+        qid = self.enqueue('handoff', 'build-crate', [SHARED], waiter=False)
+        self.advance(now=self.now + timedelta(hours=25))
+        out = self.requeue(qid, waiter=None, now=self.now + timedelta(hours=26))
+        self.assertFalse(out['ok'])
+        self.assertIn('different waiter', out['reason'])
+
+    def test_the_chain_is_capped(self):
+        self.revoke_docker_a()
+        with da.state_lock(self.path):
+            entry = self.entries()[self.docker_a]
+            entry['requeues'] = da.BACKFILL_REQUEUE_MAX
+            da._write_queue_entry(self.path, entry)
+        out = self.requeue(self.docker_a)
+        self.assertFalse(out['ok'])
+        self.assertIn('re-queue limit of 3', out['reason'])
+
+    def test_the_evidence_survives_one_receipt_rotation(self):
+        self.revoke_docker_a()
+        receipts = da.queue_dir(self.path) / 'receipts.jsonl'
+        os.replace(receipts, receipts.with_name('receipts.jsonl.1'))
+        out = self.requeue(self.docker_a)
+        self.assertTrue(out['ok'], out)
+        self.assertEqual(out['evidence'], 'backfill-revoked')
+
+    def test_a_claimed_backfill_job_is_never_expired_by_the_short_window_nor_requeued(self):
+        self.historical()
+        with backfill():
+            self.advance()
+        self.assertTrue(self.claim_real(self.docker_a, self.host)['ok'])
+        out = self.advance(now=self.now + timedelta(seconds=da.BACKFILL_GRANT_S + 60))
+        self.assertNotIn(self.docker_a, out['expired'])
+        self.assertEqual(self.state(self.docker_a), 'CLAIMED')   # revoke happens only before the claim: a running job is never stranded
+        count = len(self.entries())
+        out = self.requeue(self.docker_a)                         # a live entry that is not its own replacement: refused, nothing queued
+        self.assertFalse(out['ok'])
+        self.assertIn('already live as %s, which is not its replacement' % self.docker_a, out['reason'])
+        self.assertEqual(len(self.entries()), count)
+
+    def test_an_ordinary_expiry_beside_a_live_duplicate_is_refused_and_the_duplicate_untouched(self):
+        """Review M1: qA expires ordinarily, the same session queues the same job again as qB, then wrapper A asks to re-queue qA."""
+        qa = self.enqueue('dup', 'build-crate', [SHARED])
+        self.advance(now=self.now + timedelta(hours=25))
+        self.assertEqual(self.state(qa), 'EXPIRED')
+        later = self.now + timedelta(hours=26)
+        entry = self.entries()[qa]
+        qb = da.queue_enqueue(self.path, label='dup', tickets=['HORO-1'], repo='horonom/x', worktree=str(self.worktree), harness='claude',
+                              session_id=SESSION, nbytes=entry['bytes'], argv=['cargo', 'test', 'dup'], now=later, again=True,
+                              declared=decl('build-crate', [SHARED]), waiter_pid=entry['waiter']['pid'], ancestor_fn=lambda p: True)
+        self.assertTrue(qb['ok'], qb)
+        before = {q: dict(e) for q, e in self.entries().items()}
+        receipts = len(self.receipts())
+        out = self.requeue(qa, now=later + timedelta(seconds=1))
+        self.assertFalse(out['ok'])
+        self.assertNotIn('existing', out)
+        self.assertIn('not-requeueable: %s' % qa, out['reason'])
+        self.assertEqual(self.entries(), before)                  # nothing written: qB and qA unchanged, no new entry
+        self.assertEqual(len(self.receipts()), receipts)
+
+    def test_a_lost_grant_entry_that_is_no_longer_expired_is_never_replaced(self):
+        """Only the EXPIRED check refuses here: evidence, job, session, waiter, chain and replacement checks all pass."""
+        self.revoke_docker_a()
+        with da.state_lock(self.path):
+            entry = self.entries()[self.docker_a]
+            entry['state'] = 'CANCELLED'
+            da._write_queue_entry(self.path, entry)
+        count = len(self.entries())
+        out = self.requeue(self.docker_a)
+        self.assertFalse(out['ok'])
+        self.assertIn('is CANCELLED, not EXPIRED', out['reason'])
+        self.assertEqual(len(self.entries()), count)
+
+
 if __name__ == '__main__':
     unittest.main()

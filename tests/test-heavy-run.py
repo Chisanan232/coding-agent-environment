@@ -53,6 +53,41 @@ def counter(name):
     return n
 cmd = argv[0]
 log(argv=argv)
+if mode in ('revoked', 'lapsed', 'expired', 'revokedforever', 'adopt'):
+    # SPE-176: 'revoked' grants q000900, revokes its claim (the entry turns EXPIRED), accepts --requeue-of and grants the replacement;
+    # 'expired' is an ordinary expiry the runner refuses to re-queue; 'revokedforever' accepts every re-queue and expires each one.
+    cur_path, revoked = os.path.join(d, 'current'), os.path.join(d, 'revoked')
+    cur = open(cur_path).read() if os.path.exists(cur_path) else 'q000900'
+    if cmd == 'run':
+        if '--queue-id' in argv and argv[argv.index('--queue-id') + 1] != 'q000900' and mode in ('revoked', 'lapsed'):
+            job = argv[argv.index('--') + 1:]
+            log(event='job-start', claim=True, id=argv[argv.index('--queue-id') + 1])
+            os.execvp(job[0], job)
+        if '--queue-id' in argv:
+            open(revoked, 'w').write('1')    # backfill-revoked at claim: refused, the entry is EXPIRED from now on
+        sys.exit(77)
+    if cmd == 'queue' and argv[1] == 'enqueue':
+        if '--requeue-of' in argv:
+            old = argv[argv.index('--requeue-of') + 1]
+            if mode == 'adopt':                  # a runner reply that is not old's replacement: another live entry of the job
+                print(json.dumps({'ok': True, 'id': 'q000777', 'existing': True}))
+                sys.exit(0)
+            if mode == 'expired' or old != cur:
+                print(json.dumps({'ok': False, 'reason': 'not-requeueable: did not lose a backfilled grant'}))
+                sys.exit(77)
+            cur = 'q%06d' % (int(cur[1:]) + 1)
+            open(cur_path, 'w').write(cur)
+            print(json.dumps({'ok': True, 'id': cur, 'requeue_of': old,
+                              'evidence': 'backfill-lapsed' if mode == 'lapsed' else 'backfill-revoked'}))
+        else:
+            print(json.dumps({'ok': True, 'id': cur}))
+    elif cmd == 'queue' and argv[1] == 'status':
+        if mode in ('revoked', 'lapsed'):
+            state = 'GRANTED' if cur != 'q000900' or not os.path.exists(revoked) else 'EXPIRED'
+        else:
+            state = 'EXPIRED'
+        print(json.dumps({'entries': [{'id': cur, 'state': state}]}))
+    sys.exit(0)
 if cmd == 'run':
     job = argv[argv.index('--') + 1:]
     queued = '--queue-id' in argv
@@ -238,6 +273,76 @@ class Wrapper(unittest.TestCase):
         self.assertEqual(code, hr.REFUSED_EXIT)
         self.assertEqual(self.ran(), 0)
         self.assertIn('CANCELLED', err)
+
+    def test_a_revoked_backfill_grant_is_requeued_once_and_the_job_runs_when_the_replacement_is_granted(self):
+        self.mode('revoked')
+        code, err = self.invoke(max_wait=3600)
+        self.assertEqual(code, 0)
+        self.assertIn('backfill grant revoked; re-queued as q000901', err)
+        first, requeue = self.argvs('queue', 'enqueue')
+        self.assertNotIn('--requeue-of', first)
+        self.assertEqual(requeue[requeue.index('--requeue-of') + 1], 'q000900')
+        # The same job, session and waiter as the lost entry, so the runner can match it; --again because the old entry is EXPIRED.
+        for flag in ('--session-id', '--waiter-pid', '--label', '--bytes', '--class', '--ticket', '--worktree'):
+            self.assertEqual(requeue[requeue.index(flag) + 1], first[first.index(flag) + 1], flag)
+        self.assertEqual(requeue[requeue.index('--') + 1:], first[first.index('--') + 1:])
+        self.assertIn('--again', requeue)
+        self.assertLessEqual(int(requeue[requeue.index('--wait-s') + 1]), 3600)   # the original deadline, not a fresh one
+        self.assertEqual([(c['claim'], c['id']) for c in self.calls() if c.get('event') == 'job-start'], [(True, 'q000901')])
+        self.assertEqual(self.ran(), 1)
+        release = self.argvs('queue', 'release')
+        self.assertEqual([r[r.index('--id') + 1] for r in release], ['q000901'])
+        self.assertEqual(self.argvs('queue', 'cancel'), [])
+
+    def test_an_ordinary_expiry_still_refuses_with_77_and_queues_nothing_new(self):
+        self.mode('expired')
+        code, err = self.invoke()
+        self.assertEqual(code, hr.REFUSED_EXIT)
+        self.assertEqual(self.ran(), 0)
+        self.assertIn('heavy-run: queue entry q000900 is EXPIRED; refusing.', err)
+        self.assertNotIn('re-queued', err)
+        cancel = self.argvs('queue', 'cancel')
+        self.assertEqual([c[c.index('--id') + 1] for c in cancel], ['q000900'])
+
+    def test_a_lapsed_unclaimed_backfill_grant_says_so(self):
+        self.mode('lapsed')
+        code, err = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertIn('backfill grant lapsed unclaimed; re-queued as q000901', err)
+        self.assertNotIn('revoked', err)
+
+    def test_a_reply_that_is_not_the_replacement_is_a_refusal_and_never_adopted(self):
+        self.mode('adopt')
+        code, err = self.invoke()
+        self.assertEqual(code, hr.REFUSED_EXIT)
+        self.assertEqual(self.ran(), 0)
+        self.assertNotIn('re-queued', err)
+        self.assertIn('heavy-run: queue entry q000900 is EXPIRED; refusing.', err)
+        self.assertEqual([c[c.index('--id') + 1] for c in self.argvs('queue', 'cancel')], ['q000900'])   # q000777 is never touched
+        self.assertFalse([a for a in self.calls() if 'argv' in a and 'q000777' in a['argv']])
+
+    def bounded(self):
+        """A regression that loops without advancing the fake clock must fail, not hang the suite."""
+        def expired(_signum, _frame):
+            raise AssertionError('the wrapper did not stop within 60 s')
+        old = signal.signal(signal.SIGALRM, expired)
+        signal.alarm(60)
+        try:
+            return self.invoke()
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+    def test_requeues_are_bounded_then_the_wrapper_refuses_and_cancels_the_last_entry(self):
+        self.mode('revokedforever')
+        code, err = self.bounded()
+        self.assertEqual(code, hr.REFUSED_EXIT)
+        self.assertEqual(self.ran(), 0)
+        requeues = [a for a in self.argvs('queue', 'enqueue') if '--requeue-of' in a]
+        self.assertEqual([a[a.index('--requeue-of') + 1] for a in requeues], ['q000900', 'q000901', 'q000902'])
+        self.assertEqual(len(requeues), hr.REQUEUE_MAX)
+        self.assertIn('q000903 is EXPIRED after 3 backfill re-queues (limit 3); refusing', err)
+        self.assertEqual([c[c.index('--id') + 1] for c in self.argvs('queue', 'cancel')], ['q000903'])
 
     def test_an_entry_the_runner_already_released_is_not_a_release_failure(self):
         self.mode('preleased')
