@@ -1,0 +1,15 @@
+{
+ "about": "Measured Fable 5.2 list-price reference points read by scripts/fable-escalation.py estimate. Every figure is copied from the cited record and tests/test-fable-cost-estimate.py checks that the record still states it. List-price estimates from the client, not invoices.",
+ "cold_prefix_runs": [
+  {"date": "2026-11-15", "cache_creation_tokens": 46190, "usd": 0.739, "source": "docs/fable/enablement-runbook.md",
+   "what": "one-word canary, cold cache, no tools"},
+  {"date": "2026-11-17", "cache_creation_tokens": 46060, "usd": 0.737, "source": "docs/fable/enablement-runbook.md",
+   "what": "one-word canary, cold cache, no tools"}
+ ],
+ "consults": [
+  {"date": "2026-11-19", "usd": 1.29, "source": "docs/LIVE-ROLLOUT-2026-11-19.md",
+   "what": "the one completed real-route consult (Read,Grep,Glob, 105 s)"},
+  {"date": "2026-11-15", "usd": 0.74, "source": "docs/MODEL-ROUTING.md",
+   "what": "cold canary stopped by its cap before any answer"}
+ ]
+}
