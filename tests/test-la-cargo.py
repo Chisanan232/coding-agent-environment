@@ -353,6 +353,27 @@ class SingleAccounting(LaCargoBase):
         self.assertNotIn('re-queued', err)
         self.assertEqual([c[c.index('--id') + 1] for c in self.queue_argvs('cancel')], ['q000001'])
 
+    def test_the_requeue_capability_is_declared_only_to_a_runner_that_accepts_it(self):
+        (self.dir / 'mode').write_text('revoked')
+        self.run_la('build')
+        self.assertFalse([a for a in self.queue_argvs('enqueue') if '--requeue-capable' in a])   # an older runner: no argparse break
+        for name in ('runner.jsonl', 'current', 'revoked', 'cargo.jsonl'):
+            (self.dir / name).unlink(missing_ok=True)
+        with open(self.dir / 'runner.py', 'a') as handle:
+            handle.write("# accepts '--requeue-capable'\n")
+        rc, _ = self.run_la('build')
+        self.assertEqual(rc, 0)
+        enqueues = self.queue_argvs('enqueue')
+        self.assertEqual(len(enqueues), 2)
+        for argv in enqueues:
+            self.assertIn('--requeue-capable', argv[:argv.index('--')])
+        parsed = da.build_parser().parse_args(enqueues[0][:enqueues[0].index('--') + 1] + ['x'])
+        self.assertTrue(parsed.requeue_capable)
+
+    def test_a_missing_runner_file_declares_nothing(self):
+        with unittest.mock.patch.object(la, 'RUNNER', str(self.dir / 'absent.py')):
+            self.assertFalse(la.runner_requeue_capable())
+
     def test_a_lapsed_unclaimed_backfill_grant_says_so(self):
         (self.dir / 'mode').write_text('lapsed')
         rc, err = self.run_la('build')
