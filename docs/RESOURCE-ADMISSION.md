@@ -419,6 +419,34 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
   `head-excl-only`, the disk/lane/memory/CPU figures, in-flight count and cap) before its usual `granted` receipt. While OFF, advance
   grants nothing extra and writes one `backfill-shadow` receipt per (pivot, candidate) per 10 minutes. `out` gains `head_reason`,
   `backfilled` and `backfill_shadow`.
+  - Hardening (ADR 0017 revision 9a). The head check also uses the lane cap of the tier that free space falls to after every
+    reservation and the candidate (latch included), so a candidate that would shrink the tier below the head's lanes is refused.
+  - A backfilled grant expires after `BACKFILL_GRANT_S` (600 s) instead of the usual window.
+  - Receipts list every blocker in `blockers`; `blocker_id`, `blocker_label` and `excl_key` keep the first blocker.
+  - In OFF mode with a cap above 1, each shadow candidate is judged beside the earlier ones. The shadow never runs the memory-admission
+    check (`memory_gate: not-asked`) because that check writes the shared latch.
+  - Waiter `ps` answers are cached for one pass.
+- `queue claim` of a backfilled grant (a GRANTED entry with an earlier unlapsed waiting entry) re-checks head protection against the
+  oldest waiting entry.
+  - If protection no longer holds, the grant is withdrawn: the entry becomes `EXPIRED`, a `backfill-revoked` receipt records the kind
+    (`head-not-excl-only` or `head-unprotected`) and the blocked id, and the claim is refused with `backfill-revoked: ...`. Re-enqueue
+    the job.
+  - With no host sample the claim is refused with `backfill-unverifiable: ...` and the grant is kept.
+  - Ordinary grants are not re-checked.
+- Exclusion keys (`excl_keys`). A new `cargo-target:` key follows cargo's own target-dir order and is realpath-canonical:
+  1. `--target-dir` in the job argv, before any `--`;
+  2. `CARGO_TARGET_DIR`;
+  3. `CARGO_BUILD_TARGET_DIR`;
+  4. `build.target-dir` from the nearest `.cargo/config[.toml]` walking up from the working directory, then `$CARGO_HOME`'s
+     (default `~/.cargo`);
+  5. otherwise `./target`.
+
+  Every comparison, stored keys included, goes through identity tokens. The tokens are the raw string, the folded realpath and, when
+  the directory exists, `(st_dev, st_ino)`. Two keys clash when they share any token, so no string-equal clash is lost and a directory
+  created or removed mid-decision still clashes. So `/tmp` and `/private/tmp`, symlinks and trailing slashes all clash as one key. Stored keys and
+  fingerprints are unchanged. The corrected order can also remove a clash: a job with its own `--target-dir` or repository config no
+  longer shares the home config's key. Entries queued earlier keep their old keys until they drain. `heavy-run` and `la-cargo` exit
+  77 when a revoked grant turns `EXPIRED`; they do not re-enqueue.
 - `queue advance` and memory (SPE-175): the CLI grants the head only when the SPE-117 memory gate admits, because `queue claim` runs that
   gate and a grant it would refuse only holds a lane for its whole window and then lapses unclaimed. The gate takes 10 s or more, so it
   runs outside the lock and only when the head otherwise fits (a lane is free, the floor holds, the budget allows); otherwise it is not

@@ -605,33 +605,134 @@ DECLARED_FIELDS = ('class', 'mem_bytes', 'cpu_slots', 'test_threads')   # compar
 MIB = 1024 ** 2
 
 
-def _cargo_target_dir(env, home, cwd):
-    """The Cargo target directory this job would use, resolved from CARGO_TARGET_DIR, else the user's Cargo config
-    (`build.target-dir`), else ./target. Reads one small file; executes nothing."""
-    def absolute(value, base):
-        return os.path.normpath(value if os.path.isabs(value) else os.path.join(base, value))
+CARGO_KEY = 'cargo-target:'
+MAX_CONFIG_DEPTH = 64
 
-    value = env.get('CARGO_TARGET_DIR')
-    if isinstance(value, str) and value:
-        return absolute(value, cwd)
+
+def _argv_target_dir(argv):
+    """The last `--target-dir X` / `--target-dir=X` cargo itself would parse: only after the first token named cargo and before a `--`
+    (what follows `--` belongs to the test binary). None when the job is not a cargo command or names no target dir."""
+    tokens = list(argv or [])
+    start = next((i for i, token in enumerate(tokens) if isinstance(token, str) and os.path.basename(token) == 'cargo'), None)
+    if start is None:
+        return None
+    found = None
+    rest = tokens[start + 1:]
+    for i, token in enumerate(rest):
+        if token == '--':
+            break
+        if token == '--target-dir' and i + 1 < len(rest):
+            found = rest[i + 1]
+        elif isinstance(token, str) and token.startswith('--target-dir='):
+            found = token[len('--target-dir='):]
+    return found if isinstance(found, str) and found and '\0' not in found else None
+
+
+def _config_target_dir(path):
+    """`build.target-dir` from one Cargo config file, or None. Follows a symlink as cargo does (dotfile managers link it); a FIFO,
+    device or unparseable file counts as absent."""
     try:
         import tomllib
-        descriptor = os.open(Path(home) / '.cargo/config.toml', os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         with os.fdopen(descriptor, 'rb') as handle:
-            if stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                configured = tomllib.loads(handle.read(65536).decode()).get('build', {}).get('target-dir')
-                if isinstance(configured, str) and configured and '\0' not in configured:
-                    return absolute(configured, str(home))
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None
+            build = tomllib.loads(handle.read(65536).decode()).get('build', {})
+            configured = build.get('target-dir') if isinstance(build, dict) else None
     except Exception:
-        pass
+        return None
+    return configured if isinstance(configured, str) and configured and '\0' not in configured else None
+
+
+def _cargo_config_files(cwd, cargo_home):
+    """Config files in cargo's merge order, highest precedence first: `.cargo/config` (legacy, which cargo prefers when both exist) or
+    `.cargo/config.toml` in cwd and each ancestor up to /, then $CARGO_HOME's."""
+    dirs, directory = [], cwd
+    for _ in range(MAX_CONFIG_DEPTH):
+        dirs.append(os.path.join(directory, '.cargo'))
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+    if cargo_home not in dirs:
+        dirs.append(cargo_home)
+    out = []
+    for dot_cargo in dirs:
+        path = next((p for p in (os.path.join(dot_cargo, n) for n in ('config', 'config.toml')) if os.path.isfile(p)), None)
+        if path:
+            out.append(path)
+    return out
+
+
+def _cargo_target_dir(env, home, cwd, argv=None):
+    """The Cargo target directory this job would use, resolved exactly in cargo's own order: `--target-dir` in the job's argv, then
+    CARGO_TARGET_DIR, then CARGO_BUILD_TARGET_DIR (the environment form of build.target-dir, which overrides every config file), then
+    build.target-dir from the nearest config file (cwd upward, then $CARGO_HOME, default <home>/.cargo), else <cwd>/target. A relative
+    CLI or environment value is relative to cwd; a relative config value to the directory holding that config's `.cargo` directory.
+    The result is realpath-canonical (symlinks, /tmp vs /private/tmp, `..`, trailing slashes). Reads small files; executes nothing."""
+    def absolute(value, base):
+        return os.path.realpath(value if os.path.isabs(value) else os.path.join(base, value))
+
+    cwd = os.path.abspath(cwd)
+    value = _argv_target_dir(argv)
+    if value:
+        return absolute(value, cwd)
+    for name in ('CARGO_TARGET_DIR', 'CARGO_BUILD_TARGET_DIR'):
+        value = env.get(name)
+        if isinstance(value, str) and value and '\0' not in value:
+            return absolute(value, cwd)
+    cargo_home = env.get('CARGO_HOME')
+    cargo_home = absolute(cargo_home, cwd) if isinstance(cargo_home, str) and cargo_home and '\0' not in cargo_home else \
+        os.path.join(str(home), '.cargo')
+    for path in _cargo_config_files(cwd, cargo_home):
+        configured = _config_target_dir(path)
+        if configured:
+            return absolute(configured, os.path.dirname(os.path.dirname(path)))
     return absolute('target', cwd)
 
 
-def resolve_workload(name, mem_gib, cpus, nbytes, env=None, home=None, cwd=None, session_id=None, ticket=None, now=None):
+def _fold_path(path):
+    """Comparison form of a path that does not exist: NFC, and case-folded on macOS, whose default volumes are case-insensitive. Folding
+    can only make two keys compare equal, never unequal, which is the fail-safe direction for an exclusion key."""
+    path = unicodedata.normalize('NFC', path)
+    return path.casefold() if sys.platform == 'darwin' else path
+
+
+def excl_identity(key):
+    """Comparison tokens of one exclusion key, computed at decision time: a sorted list; two keys clash when their lists share any token
+    (excl_keys_clash). Every key keeps its raw string as a token, so a clash the old string comparison saw is never lost. A cargo-target
+    key adds its folded realpath (NFC, case-folded on macOS) and, when the directory exists, its (st_dev, st_ino) after following
+    symlinks. Several tokens instead of one form keep the comparison stable when the directory is created or removed between two stats
+    (a cargo build making its target, a cargo clean): the folded realpath matches either way. So the comparison can only add clashes
+    relative to string equality, never remove one.
+
+    Known limit: os.stat and realpath run under the admission lock; a hung network mount under a target path would stall the pass. Cargo
+    target directories are local in this environment."""
+    tokens = {key}
+    if isinstance(key, str) and key.startswith(CARGO_KEY):
+        path = key[len(CARGO_KEY):]
+        try:
+            tokens.add(CARGO_KEY + _fold_path(os.path.realpath(path)))
+        except (OSError, ValueError):
+            pass
+        try:
+            info = os.stat(path)
+            tokens.add('cargo-target-inode:%d:%d' % (info.st_dev, info.st_ino))
+        except (OSError, ValueError):
+            pass
+    return sorted(tokens)
+
+
+def excl_keys_clash(a, b):
+    """True when exclusion keys `a` and `b` name the same thing (they share an excl_identity token)."""
+    return bool(set(excl_identity(a)) & set(excl_identity(b)))
+
+
+def resolve_workload(name, mem_gib, cpus, nbytes, env=None, home=None, cwd=None, session_id=None, ticket=None, now=None, argv=None):
     """(fields, error). fields is {} when nothing was declared (the legacy meaning), else the optional record fields.
 
     Unknown class names fail closed. --mem-gib, --cpus and --bytes may raise an estimate and never lower it below the class
-    default. Nothing is executed and nothing outside the Cargo config is read.
+    default. Nothing is executed and nothing outside the Cargo config files is read; `argv` (the job) is read only for `--target-dir`.
     """
     if name is None and mem_gib is None and cpus is None:
         return {}, None
@@ -671,7 +772,7 @@ def resolve_workload(name, mem_gib, cpus, nbytes, env=None, home=None, cwd=None,
     if spec:
         env = os.environ if env is None else env
         if spec['excl'] == 'target':
-            key = 'cargo-target:' + _cargo_target_dir(env, home if home is not None else account_home(), cwd or os.getcwd())
+            key = CARGO_KEY + _cargo_target_dir(env, home if home is not None else account_home(), cwd or os.getcwd(), argv)
         else:
             key = spec['excl']
         fields['excl_keys'] = [key]
@@ -1345,6 +1446,10 @@ QUEUE_MAX_GRANT_S = 4 * 3600
 BACKFILL_ENABLED = False
 BACKFILL_MAX = 1
 BACKFILL_SHADOW_WINDOW_S = 600
+# Claim window of a backfilled grant (SPE-176 hardening): it holds a lane ahead of the oldest waiting entry, so it gets half the hand-off
+# window. Its waiter is proven alive when granted and polls for the grant; a lapse takes the existing EXPIRED path and frees the in-flight
+# count at once. Only `expires` changes: the grant object stays {at, expires}.
+BACKFILL_GRANT_S = 600
 WAITING_STATES = ('QUEUED', 'ELIGIBLE', 'GRANTED')
 LIVE_STATES = WAITING_STATES + ('CLAIMED',)
 TERMINAL_STATES = ('RELEASED', 'EXPIRED', 'CANCELLED')
@@ -1709,6 +1814,9 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
     if not (type(grant_s) is int and 0 < grant_s <= QUEUE_MAX_GRANT_S):
         out['reason'] = 'invalid-request: grant window out of range'
         return out
+    # One waiter `ps` per process for this pass: the waiter-gone sweep and every backfill candidate would otherwise each fork their own
+    # (holder checks keep their own calls: each one must fail closed on its own reading).
+    waiter_fn = _per_pass_memo(waiter_token_fn or waiter_token)
     try:
         with state_lock(state_path):
             if not queue_dir(state_path).exists():
@@ -1757,7 +1865,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
             for entry in entries:
                 # SPE-176: a waiter that is provably gone will never claim; free its place (and a granted lane) now. A CLAIMED entry
                 # is not in WAITING_STATES and is left to the holder rules above.
-                if entry['state'] in WAITING_STATES and _waiter_gone(entry, waiter_token_fn or waiter_token):
+                if entry['state'] in WAITING_STATES and _waiter_gone(entry, waiter_fn):
                     was = entry['state']
                     entry['state'] = 'CANCELLED'
                     _write_queue_entry(state_path, entry)
@@ -1783,9 +1891,11 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
             reserved = sum(r['bytes'] for r in live) + sum(e['bytes'] for e in orphans) + sum(e['bytes'] for e in granted)
             backfill = None   # set at the pivot when bounded backfill applies (ADR 0017 revision 9)
 
-            def grant(nxt):
+            def grant(nxt, backfilled=False):
                 nonlocal in_use, reserved
                 window = min(grant_s, QUEUE_MAX_GRANT_S if 'waiter' in nxt else HANDOFF_GRANT_S)   # once per entry: grant, marker, receipt
+                if backfilled:
+                    window = min(window, BACKFILL_GRANT_S)
                 nxt['state'] = 'GRANTED'
                 # The grant object is exactly {at, expires}: a hand-off consumer validates it as a closed key set (the HORO-2139 executor
                 # refused a grant with two extra keys on 2026-11-19 and its waiter died). The runner stamp goes in the receipt only.
@@ -1810,15 +1920,22 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
             for nxt in waiting:
                 if backfill is not None:
                     verdict = _backfill_candidate(state_path, nxt, backfill, host, result, live, orphans, granted, entries, now, in_use,
-                                                  reserved, lanes, waiter_token_fn or waiter_token)
+                                                  reserved, lanes, waiter_fn)
                     if verdict == 'stop':
                         return out
                     if verdict is None:
                         continue
                     if not BACKFILL_ENABLED:
+                        # The shadow never runs the SPE-117 memory-admission check: that check writes the shared latch state, so asking it
+                        # would let a disabled feature change live admission. The band and memory projection of _protects_head apply.
                         if not _recent_backfill_shadow(queue_dir(state_path) / 'receipts.jsonl', backfill['pivot'], nxt['id'], now):
-                            _queue_receipt(state_path, 'backfill-shadow', nxt, now, **verdict)
+                            _queue_receipt(state_path, 'backfill-shadow', nxt, now, memory_gate='not-asked', **verdict)
                         out['backfill_shadow'].append(nxt['id'])
+                        # Judge a later shadow candidate beside this one, exactly as the enabled pass would after granting it.
+                        shadow = dict(nxt, state='GRANTED', grant={'at': iso_utc(now), 'expires': iso_utc(now + timedelta(seconds=BACKFILL_GRANT_S))})
+                        granted.append(shadow)
+                        in_use += 1
+                        reserved += nxt['bytes']
                     else:
                         if memory == 'probe':
                             out['grant_pending'] = True   # the final pass re-derives the whole decision from scratch
@@ -1827,9 +1944,9 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                             out['reason'] = 'memory-gate: %s' % memory[1]
                             return out
                         _queue_receipt(state_path, 'backfill', nxt, now, **verdict)
-                        grant(nxt)
+                        grant(nxt, backfilled=True)
                         out['backfilled'].append(nxt['id'])
-                    backfill['keys'] |= set(nxt.get('excl_keys') or [])
+                    backfill['keys'] |= _excl_id_set(nxt)
                     backfill['taken'] += 1
                     if backfill['in_flight'] + backfill['taken'] >= BACKFILL_MAX:
                         return out
@@ -1862,7 +1979,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                     out.update(head_reason=out['reason'], backfilled=[], backfill_shadow=[])
                     if in_flight >= BACKFILL_MAX:
                         return out
-                    backfill = {'pivot': nxt['id'], 'head': nxt, 'blockers': blockers, 'keys': set(nxt.get('excl_keys') or []),
+                    backfill = {'pivot': nxt['id'], 'head': nxt, 'blockers': blockers, 'keys': _excl_id_set(nxt),
                                 'in_flight': in_flight, 'taken': 0}
                     continue
                 if memory == 'probe':
@@ -1898,7 +2015,8 @@ def _memory_precondition():
 
 
 CLAIM_REFUSED_WINDOW_S = 600
-CLAIM_REFUSED_KINDS = (('memory-gate', 'memory-gate'), ('over-capacity', 'floor'), ('lane-cap', 'lane'), ('budget', 'budget'))
+CLAIM_REFUSED_KINDS = (('memory-gate', 'memory-gate'), ('over-capacity', 'floor'), ('lane-cap', 'lane'), ('budget', 'budget'),
+                       ('backfill-revoked', 'backfill-revoked'), ('backfill-unverifiable', 'backfill-unverifiable'))
 
 
 def _claim_refusal_kind(reason):
@@ -2075,6 +2193,20 @@ def _queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn, pid, now, t
                     result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB)), budget)
             if budget_why:
                 return _with_budget(refuse(budget_why), budget)   # the grant is kept: a later claim may fit
+            lost = _backfill_protection_lost(host, entry, entries, live, orphans, now, result, reserved, in_use, lanes)
+            if lost and lost[0] == 'no-host-sample':
+                # Unknown, not disproved: refuse and keep the grant (its BACKFILL_GRANT_S window bounds the hold).
+                return _with_budget(refuse('backfill-unverifiable: no host sample, so %s cannot show it still protects the oldest waiting '
+                                           'entry %s; the grant is kept, retry' % (qid, lost[1])), budget)
+            if lost:
+                # A backfilled grant whose head protection no longer holds is withdrawn, not kept: keeping it would hold a lane ahead of
+                # the oldest waiting entry on a premise that is gone. Ordinary grants never reach this branch.
+                entry['state'] = 'EXPIRED'
+                _write_queue_entry(state_path, entry)
+                _drop_marker(state_path, qid)
+                _queue_receipt(state_path, 'backfill-revoked', entry, now, kind=lost[0], blocked_id=lost[1])
+                return _with_budget(refuse('backfill-revoked: %s no longer protects the oldest waiting entry %s (%s); the grant is '
+                                           'withdrawn, re-enqueue' % (qid, lost[1], lost[0])), budget)
             if wrapper_is_zombie(pid, token, table_fn):
                 return refuse('process-not-running: pid %d has exited' % pid)
             workload = capture_workload(pid, token, table_fn)
@@ -2654,7 +2786,8 @@ def budget_holder(kind, record, created=None, pid=None, workload=None, granted_j
     return {'kind': kind, 'label': record['label'], 'class': record.get('class'), 'legacy': _legacy(record),
             'granted_jobs': granted_jobs, 'uncapped': kind != 'granted' and record.get('class') in GRANT_ENV and not granted_jobs,
             'mem_bytes': record.get('mem_bytes') or 0, 'cpu_slots': record.get('cpu_slots') or 0,
-            'excl_keys': list(record.get('excl_keys') or []), 'created': _created_time(created), 'pid': pid,
+            'excl_keys': list(record.get('excl_keys') or []), 'excl_ids': [excl_identity(k) for k in record.get('excl_keys') or []],
+            'created': _created_time(created), 'pid': pid,
             'members': [m['pid'] for m in (workload or {}).get('members', [])],
             'flags': [flag for flag in ('past_ttl', 'unresolved') if record.get(flag)]}
 
@@ -2662,7 +2795,14 @@ def budget_holder(kind, record, created=None, pid=None, workload=None, granted_j
 def budget_request(record, nbytes, label):
     return {'label': label, 'bytes': nbytes, 'class': record.get('class'), 'legacy': _legacy(record),
             'mem_bytes': record.get('mem_bytes') or 0, 'cpu_slots': record.get('cpu_slots') or 0,
-            'test_threads': record.get('test_threads') or 0, 'excl_keys': list(record.get('excl_keys') or [])}
+            'test_threads': record.get('test_threads') or 0, 'excl_keys': list(record.get('excl_keys') or []),
+            'excl_ids': [excl_identity(k) for k in record.get('excl_keys') or []]}
+
+
+def _excl_ids(record):
+    """One token list per key (excl_identity); a record built without them compares its keys as written."""
+    ids = record.get('excl_ids')
+    return ids if isinstance(ids, list) and len(ids) == len(record['excl_keys']) else [[k] for k in record['excl_keys']]
 
 
 def budget_holders(live, orphans, entries, now, skip_id=None):
@@ -2791,14 +2931,24 @@ def budget_decision(host, reservations, request, caps):
         out['projected_bytes'] = base + request['mem_bytes']
         cpu_need = request['cpu_slots']
         reasons += _resource_reasons(base + request['mem_bytes'], limit, headroom, cpu_used, cpu_need, cpu_limit)
-    taken = set(request['excl_keys'])
-    clash = sorted({h['label'] for h in reservations if taken & set(h['excl_keys'])})
+    # Keys are compared by identity tokens (excl_identity, computed by budget_holder / budget_request at decision time): two keys clash
+    # when they share any token, so two spellings of one directory clash and no clash of the raw strings is ever lost. The request's own
+    # spelling is what a reason or receipt shows.
+    taken = {}
+    for tokens, key in zip(_excl_ids(request), request['excl_keys']):
+        for token in tokens:
+            taken.setdefault(token, set()).add(key)
+
+    def held(h):
+        return {token for tokens in _excl_ids(h) for token in tokens}
+    shared = [(h, sorted({k for token in set(taken) & held(h) for k in taken[token]})) for h in reservations]
+    shared = [(h, keys) for h, keys in shared if keys]
+    clash = sorted({h['label'] for h, _ in shared})
     if clash:
         reasons.append('excl_key overlap with %s' % ', '.join(clash))
     # One row per clashing holder with its kind (no dedupe by label), so bounded backfill can tell a running claimed job from an unclaimed
     # grant or an orphan and fail closed on anything but the first.
-    out['excl_clash'] = [{'label': h['label'], 'kind': h['kind'], 'keys': sorted(taken & set(h['excl_keys']))}
-                         for h in reservations if taken & set(h['excl_keys'])]
+    out['excl_clash'] = [{'label': h['label'], 'kind': h['kind'], 'keys': keys} for h, keys in shared]
     if caps.get('free_bytes') is not None and caps['free_bytes'] - caps.get('reserved_bytes', 0) - request['bytes'] < caps.get('floor', 0):
         reasons.append('byte floor: %s free - %s reserved - %s requested < %s' % (
             _gib(caps['free_bytes']), _gib(caps.get('reserved_bytes', 0)), _gib(request['bytes']), _gib(caps['floor'])))
@@ -3183,22 +3333,48 @@ def _excl_only_blockers(budget, in_use, lanes, floor_ok, free, reserved, entry, 
     return blockers
 
 
-def _protects_head(host, head, cand, blockers, live, orphans, granted, now, tier, free, reserved, in_use, lanes):
+def _per_pass_memo(fn):
+    """`fn` answering once per argument tuple for the length of one queue pass: bounds the `ps` forks a pass makes without changing what
+    any check sees. An exception is not cached, so every caller still fails closed on its own."""
+    cache = {}
+
+    def memo(*args):
+        if args not in cache:
+            cache[args] = fn(*args)
+        return cache[args]
+    return memo
+
+
+def _excl_id_set(entry):
+    """Every identity token of the entry's keys: two such sets intersect exactly when some pair of keys clashes."""
+    return {token for k in entry.get('excl_keys') or [] for token in excl_identity(k)}
+
+
+def _protects_head(host, head, cand, blockers, live, orphans, granted, now, lane_tier, free, reserved, in_use, lanes, latch=False):
     """(ok, math): would `head` still be admitted once its blockers release, with `cand` granted beside everything else? Pure.
 
     Declared reservations only: the disk check counts every current reservation, the blockers included (a release is not credited
-    before it happens), plus the candidate and the head. The lane check frees only the blockers' lanes. Memory and CPU run the budget
-    for the head with the blockers removed and the candidate as an unclaimed grant charged its full declared size, on the same host
-    sample; it must give no refusal, band GREEN and fit the cap. The blockers' measured memory stays in the sample: conservative."""
+    before it happens), plus the candidate and the head. The lane check frees only the blockers' lanes, against the lane cap of the tier
+    the measured free space falls to once every reservation and the candidate are written (free - reserved - candidate, with the disk
+    latch carried), so a candidate that would shrink the tier below the lanes the head needs is refused. Memory and CPU run the budget
+    for the head with the blockers removed (their load credit too) and the candidate as an unclaimed grant charged its full declared
+    size, on the same host sample; it must give no refusal, band GREEN and fit the cap. No helper projects the SPE-117 memory latch
+    (pressure, swap, compressor) from declared bytes, so the projection used is that budget: band GREEN and the projected memory, the
+    candidate and the head included, under the GREEN limit. The blockers' measured memory stays in the sample: conservative."""
+    projected_free = free - reserved - cand['bytes']
+    tier_after = tier(projected_free)
+    lanes_after = heavy_lane_cap(tier_after, next_latch(projected_free, {'latch': latch}))
     math = {'free': free, 'reserved': reserved, 'cand_bytes': cand['bytes'], 'head_bytes': head['bytes'], 'floor': HEAVY_FLOOR,
             'disk_left': free - reserved - cand['bytes'] - head['bytes'], 'in_use': in_use, 'lanes': lanes,
+            'tier_after': tier_after, 'lanes_after': lanes_after, 'cap': None, 'band_after': None,
             'head_projected': None, 'head_limit': None, 'head_cpu': None, 'cpu_limit': None}
-    ok = math['disk_left'] >= HEAVY_FLOOR and in_use + 1 - len(blockers) < lanes
+    cap = math['cap'] = min(lanes, lanes_after, heavy_lane_cap(lane_tier, latch))
+    ok = math['disk_left'] >= HEAVY_FLOOR and in_use + 1 - len(blockers) < cap
     try:
         gone = {b['label'] for b in blockers}
         holders = [h for h in budget_holders(live, orphans, granted, now) if not (h['kind'] == 'reservation' and h['label'] in gone)]
         holders.append(budget_holder('granted', cand))
-        caps = {'max_concurrent': heavy_lane_cap(tier), 'free_bytes': free, 'reserved_bytes': reserved + cand['bytes'], 'floor': HEAVY_FLOOR}
+        caps = {'max_concurrent': cap, 'free_bytes': free, 'reserved_bytes': reserved + cand['bytes'], 'floor': HEAVY_FLOOR}
         verdict = budget_decision(host, holders, budget_request(head, head['bytes'], head['label']), caps)
     except Exception:   # malformed records under the lock: no backfill, never an aborted advance
         return False, math
@@ -3206,9 +3382,45 @@ def _protects_head(host, head, cand, blockers, live, orphans, granted, now, tier
         return False, math
     math.update(head_projected=verdict['projected_bytes'], head_limit=verdict['limit_bytes'],
                 head_cpu=verdict['cpu_slots_used'] + (head.get('cpu_slots') or 0),
-                cpu_limit=verdict['cpu_limit'])
+                cpu_limit=verdict['cpu_limit'], band_after=verdict['band'])
     ok = ok and not verdict['resource_reasons'] and verdict['band'] == 'GREEN' and not verdict['cap_reason']
     return ok, math
+
+
+def _overtaken_head(entries, entry, now):
+    """The oldest unlapsed waiting entry queued before `entry`, or None. A GRANTED entry with one is a backfilled grant: an in-order
+    pass grants the head first and stops at the first entry that does not fit (the same durable rule the in-flight count uses, so a
+    rotated receipt log cannot hide it)."""
+    earlier = [e for e in entries if e['state'] in ('QUEUED', 'ELIGIBLE') and e['seq'] < entry['seq'] and not _entry_lapsed(e, now)]
+    return min(earlier, key=lambda e: e['seq']) if earlier else None
+
+
+def _backfill_protection_lost(host, entry, entries, live, orphans, now, result, reserved, in_use, lanes):
+    """None, or (kind, head id) when `entry` is a backfilled grant whose head protection no longer holds at claim time. The head must be
+    admitted outright or refused solely by the exclusion key of claimed running jobs (_excl_only_blockers), and _protects_head must hold
+    with this grant charged beside everything else. Without a host sample nothing can be shown: ('no-host-sample', head id)."""
+    head = _overtaken_head(entries, entry, now)
+    if head is None:
+        return None
+    if host is None or host.get('error'):
+        return ('no-host-sample', head['id'])
+    others = [e for e in entries if e['id'] != entry['id']]
+    granted = [e for e in others if e['state'] == 'GRANTED' and not _entry_lapsed(e, now)]
+    held = in_use + len(granted)
+    reserved_all = reserved + sum(e['bytes'] for e in granted)
+    free = result['free_bytes']
+    floor_ok = free - reserved_all - head['bytes'] >= HEAVY_FLOOR
+    budget = _shadow_site(host, 'claim-backfill', head['label'], lambda: (budget_holders(live, orphans, others, now),
+                          budget_request(head, head['bytes'], head['label'])), result['tier'], free, reserved_all, True)
+    if held < lanes and floor_ok and not _lane_refusal(budget, held, free, reserved_all, head['bytes'], head):
+        blockers = []
+    else:
+        blockers = _excl_only_blockers(budget, held, lanes, floor_ok, free, reserved_all, head, live, entries)
+        if blockers is None:
+            return ('head-not-excl-only', head['id'])
+    ok, _ = _protects_head(host, head, entry, blockers, live, orphans, granted, now, result['tier'], free, reserved_all, held, lanes,
+                           result['latch'])
+    return None if ok else ('head-unprotected', head['id'])
 
 
 def _waiter_proven_alive(entry, token_fn):
@@ -3227,7 +3439,7 @@ def _waiter_proven_alive(entry, token_fn):
 def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans, granted, entries, now, in_use, reserved, lanes, waiter_fn):
     """One later entry in candidate mode: 'stop' (no lane left), None (refused; its keys join the skipped set, so a later entry can never
     overtake it on a shared key) or the receipt fields of a qualifying candidate. Every lane check of the head applies to it."""
-    keys = set(cand.get('excl_keys') or [])
+    keys = _excl_id_set(cand)
     free = result['free_bytes']
     if in_use >= lanes:
         return 'stop'
@@ -3240,13 +3452,14 @@ def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans,
         refused = bool(_lane_refusal(budget, in_use, free, reserved, cand['bytes'], cand))
     if not refused:
         ok, math = _protects_head(host, backfill['head'], cand, backfill['blockers'], live, orphans, granted, now, result['tier'], free,
-                                  reserved, in_use, lanes)
+                                  reserved, in_use, lanes, result['latch'])
         refused = not ok
     if refused:
         backfill['keys'] |= keys
         return None
-    blocker = backfill['blockers'][0]
+    blocker = backfill['blockers'][0]   # the first stays in blocker_id / blocker_label / excl_key for older readers
     return {'blocked_id': backfill['pivot'], 'blocker_id': blocker['id'], 'blocker_label': blocker['label'], 'excl_key': blocker['keys'][0],
+            'blockers': [{'id': b['id'], 'label': b['label'], 'keys': list(b['keys'])} for b in backfill['blockers']],
             'reason': 'head-excl-only', 'math': math, 'in_flight': backfill['in_flight'] + backfill['taken'], 'cap': BACKFILL_MAX}
 
 
@@ -3496,9 +3709,9 @@ def _add_workload_args(parser):
     parser.add_argument('--cpus', type=int, dest='cpus', help='declared CPU slots; may raise the class default, never lower it')
 
 
-def _declared_from_args(args, nbytes, session_id=None, ticket=None):
+def _declared_from_args(args, nbytes, session_id=None, ticket=None, argv=None):
     """(fields, error) for the CLI: resolves the declared class and estimates without executing anything."""
-    return resolve_workload(args.workload_class, args.mem_gib, args.cpus, nbytes, session_id=session_id, ticket=ticket)
+    return resolve_workload(args.workload_class, args.mem_gib, args.cpus, nbytes, session_id=session_id, ticket=ticket, argv=argv)
 
 
 def build_parser():
@@ -3610,7 +3823,7 @@ def _queue_cli(args, state_path, free_fn, host_fn=None):
         if args.job[:1] != ['--']:
             print('refused: invalid-request: put -- between the options and the command', file=sys.stderr)
             return REFUSED_EXIT
-        declared, error = _declared_from_args(args, args.nbytes, args.session_id, args.tickets[0] if args.tickets else None)
+        declared, error = _declared_from_args(args, args.nbytes, args.session_id, args.tickets[0] if args.tickets else None, args.job[1:])
         if error:
             print(json.dumps({'ok': False, 'reason': error}))
             return REFUSED_EXIT
@@ -3682,7 +3895,7 @@ def main(argv=None, free_fn=measure_free_bytes, state_path=None, host_fn=None):
             print('refused: invalid-request: put -- between the options and the command', file=sys.stderr)
             return REFUSED_EXIT
         job = args.job[1:]
-        declared, error = _declared_from_args(args, args.nbytes)
+        declared, error = _declared_from_args(args, args.nbytes, argv=job)
         if error:
             print('refused: ' + error, file=sys.stderr)
             return REFUSED_EXIT

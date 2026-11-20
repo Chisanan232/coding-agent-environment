@@ -1576,8 +1576,13 @@ def inventory(root):
         proto = re.search(r'^RUNNER_PROTOCOL = (\d+)', text, re.M)
         lanes = re.search(r"^HEAVY_LANES = \{[^}]*'stable': (\d+)", text, re.M)
         kind = ('current' if proto else 'memory-gated-advance-unstamped' if 'memory_fn' in text else 'outdated')
+        # Bounded backfill (ADR 0017 rev 9): every poller copy must carry the same revision before it is enabled. `hardened` is the
+        # SPE-176 follow-up (claim-time head re-check, BACKFILL_GRANT_S window); `absent` predates backfill entirely.
+        enabled = re.search(r'^BACKFILL_ENABLED = (True|False)\b', text, re.M)
+        backfill = ('absent' if not enabled else ('on' if enabled.group(1) == 'True' else 'off')
+                    + ('-hardened' if re.search(r'^BACKFILL_GRANT_S = \d+', text, re.M) else ''))
         found.append({'checkout': path.parent.parent.name, 'protocol': int(proto.group(1)) if proto else 0,
-                      'stable_lanes': int(lanes.group(1)) if lanes else None, 'kind': kind})
+                      'stable_lanes': int(lanes.group(1)) if lanes else None, 'kind': kind, 'backfill': backfill})
     return found
 
 
@@ -1628,7 +1633,8 @@ def main(argv=None):
     if args.cmd == 'callers':
         rows = inventory(Path.home() / 'Bryant-Developments')
         for row in rows:
-            print('%-48s protocol=%d stable_lanes=%s %s' % (row['checkout'], row['protocol'], row['stable_lanes'], row['kind']))
+            print('%-48s protocol=%d stable_lanes=%s %s backfill=%s' % (row['checkout'], row['protocol'], row['stable_lanes'], row['kind'],
+                                                                      row['backfill']))
         return 0
     if args.cmd == 'status':
         data = read_json(monitor_dir(state_path) / 'status.json', {'ran': False, 'why': 'no tick yet'})
