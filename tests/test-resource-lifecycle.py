@@ -9,6 +9,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import shutil
 import os
 import subprocess
 import tempfile
@@ -710,6 +711,199 @@ class IncrementalScopeTests(Fixture):
         cls, why = self.classify(inc, "cargo_incremental")[0]
         self.assertEqual(cls, "B")
         self.assertIn("shared-or-foreign", why)
+
+    def generated(self, inc, names=("agent_id_bound_to_token_test", "credential_store_test", "evidence_ledger_tests",
+                                    "secret_scan")):
+        """rustc layout: <crate>-<13 base36>/ with s-<a>-<b>-<c> session dirs and s-<a>-<b>.lock files (SPE-176)."""
+        shutil.rmtree(inc / "crate-abc", ignore_errors=True)    # the plain fixture's non-generated crate dir
+        for i, n in enumerate(names):
+            c = inc / ("%s-%013d" % (n, i)).replace("-0", "-a", 1)
+            (c / "s-hn0w0a1hoy-0kzvtw0-58velkjf4a000dk65birnb0gs").mkdir(parents=True)
+            (c / "s-hn0w0a1hoy-0kzvtw0.lock").write_text("")
+
+    def test_rustc_generated_crate_names_are_not_credential_or_evidence_markers(self):
+        _, inc = self.target()
+        self.generated(inc)
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual((cls, why), ("B", ["shared-or-foreign"]))
+
+    def test_a_stray_credential_file_in_a_generated_tree_is_still_class_c(self):
+        for stray in ("credentials.json", ".env", "server.pem", "id_rsa", "evidence-ledger.json"):
+            with self.subTest(stray=stray):
+                _, inc = self.target(name="tgt-" + stray.replace(".", "_"))
+                self.generated(inc)
+                (inc / stray).write_text("")
+                self.assertEqual(self.classify(inc, "cargo_incremental")[0][0], "C")
+
+    def test_a_stray_file_inside_a_crate_dir_is_still_class_c(self):
+        _, inc = self.target()
+        self.generated(inc)
+        crate = next(p for p in inc.iterdir() if "token" in p.name)
+        (crate / "credentials.json").write_text("")
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("marker:credential-name", why)
+
+    def test_a_non_generated_directory_keeps_the_name_markers(self):
+        _, inc = self.target()
+        self.generated(inc)
+        (inc / "my_secret_notes").mkdir()
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("marker:credential-name", why)
+
+    def test_a_symlink_in_a_generated_tree_is_still_class_c(self):
+        _, inc = self.target()
+        self.generated(inc)
+        outside = self.root / "outside"
+        outside.mkdir()
+        os.symlink(outside, inc / "token_link-0000000000000")
+        cls, why = self.classify(inc, "cargo_incremental")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("marker:escaping-symlink", why)
+
+    def test_keep_marker_inside_a_generated_tree_is_still_class_c(self):
+        _, inc = self.target()
+        self.generated(inc)
+        (inc / ".ca-keep").write_text("")
+        self.assertIn("marker:keep-marker", self.classify(inc, "cargo_incremental")[0][1])
+
+    def test_generated_names_do_not_relax_the_shared_cargo_target_kind(self):
+        t = self.root / "plain-target"
+        (t / "debug").mkdir(parents=True)
+        (t / "debug/credentials.json").write_text("")
+        cls, why = self.classify(t, "cargo_target")[0]
+        self.assertEqual(cls, "C")
+        self.assertIn("marker:credential-name", why)
+
+    def test_generated_incremental_tree_still_blocked_by_open_handle(self):
+        _, inc = self.target()
+        self.generated(inc)
+        self.handles = ({str(inc / "credential_store_test-a000000000001")}, True)
+        self.assertEqual(self.classify(inc, "cargo_incremental")[0][0], "C")
+
+    tree_ids = iter(range(1000))
+
+    def tree(self, **kw):
+        _, inc = self.target(name="tgt-%d" % next(self.tree_ids))
+        self.generated(inc)
+        self.assertTrue(rl.is_generated_incremental_tree(inc))
+        self.assertTrue(rl.is_generated_incremental_tree(inc, **kw))
+        return inc, next(p for p in sorted(inc.iterdir()) if "token" in p.name)
+
+    def test_tree_check_rejects_each_structural_deviation(self):
+        sess = "s-hn0w0a1hoy-0kzvtw0-58velkjf4a000dk65birnb0gs"
+        outside = self.root / "outside"
+        outside.mkdir()
+
+        def symlinked_session(c):
+            shutil.rmtree(c / sess)
+            os.symlink(outside, c / sess)
+
+        def fifo(c):
+            os.mkfifo(c / sess / "dep-graph.bin")
+
+        def deeper(c):
+            (c / sess / "sub").mkdir()
+
+        def unknown(c):
+            (c / sess / "credentials.json").write_text("")
+
+        def symlinked_file(c):
+            os.symlink(outside, c / sess / "dep-graph.bin")
+
+        def oversize_lock(c):
+            (c / "s-hn0w0a1hoy-0kzvtw0.lock").write_bytes(b"x" * 4097)
+
+        def lock_is_symlink(c):
+            (c / "s-hn0w0a1hoy-0kzvtw0.lock").unlink()
+            os.symlink(outside, c / "s-hn0w0a1hoy-0kzvtw0.lock")
+
+        def empty_crate(c):
+            (c.parent / "empty_crate-0000000000000").mkdir()
+
+        def unreadable(c):
+            c.chmod(0)
+            self.addCleanup(c.chmod, 0o700)
+
+        for fn in (symlinked_session, fifo, deeper, unknown, symlinked_file, oversize_lock, lock_is_symlink, empty_crate,
+                   unreadable):
+            with self.subTest(case=fn.__name__):
+                inc, crate = self.tree()
+                fn(crate)
+                self.assertFalse(rl.is_generated_incremental_tree(inc))
+
+    def test_tree_check_accepts_known_session_files_and_lock_only_crates(self):
+        inc, crate = self.tree()
+        for name in ("dep-graph.bin", "query-cache.bin", "work-products.bin", "metadata.rmeta", "a" * 25 + ".o"):
+            (crate / "s-hn0w0a1hoy-0kzvtw0-58velkjf4a000dk65birnb0gs" / name).write_text("x")
+        lock_only = inc / "lock_only-0000000000001"
+        lock_only.mkdir()
+        (lock_only / "s-hn0w0a1hoy-0kzvtw1.lock").write_text("")
+        self.assertTrue(rl.is_generated_incremental_tree(inc))
+
+    def test_tree_check_fails_closed_on_entry_budget(self):
+        inc, _ = self.tree()
+        self.assertFalse(rl.is_generated_incremental_tree(inc, limit=3))
+
+    SESS = "s-hn0w0a1hoy-0kzvtw0-58velkjf4a000dk65birnb0gs"
+
+    def test_tree_check_lock_and_object_boundaries(self):
+        cases = (("lock 0 bytes", "s-hn0w0a1hoy-0kzvtw0.lock", b"", True),
+                 ("lock 1 byte", "s-hn0w0a1hoy-0kzvtw0.lock", b"x", False))
+        for label, name, data, ok in cases:
+            with self.subTest(case=label):
+                inc, crate = self.tree()
+                (crate / name).write_bytes(data)
+                self.assertEqual(rl.is_generated_incremental_tree(inc), ok)
+        for label, name, ok in (("o 25", "a" * 25 + ".o", True), ("o 24", "a" * 24 + ".o", False),
+                                ("o 26", "a" * 26 + ".o", False), ("o upper", "A" * 25 + ".o", False),
+                                ("empty o", "", False)):
+            with self.subTest(case=label):
+                inc, crate = self.tree()
+                (crate / self.SESS / (name or "a" * 25 + ".o")).write_bytes(b"" if not name else b"x")
+                self.assertEqual(rl.is_generated_incremental_tree(inc), ok)
+
+    def test_tree_check_rejects_uppercase_and_unexpected_suffix_names(self):
+        for label, rename in (("upper crate", lambda c: c.rename(c.parent / c.name.upper())),
+                              ("other suffix", lambda c: (c / self.SESS).rename(c / (self.SESS + "-old"))),
+                              ("upper session", lambda c: (c / self.SESS).rename(c / self.SESS.upper()))):
+            with self.subTest(case=label):
+                inc, crate = self.tree()
+                rename(crate)
+                self.assertFalse(rl.is_generated_incremental_tree(inc))
+
+    def test_tree_check_accepts_rustcs_working_session_suffix(self):
+        inc, crate = self.tree()
+        (crate / self.SESS).rename(crate / (self.SESS + "-working"))   # 22 such dirs exist in the real tree
+        self.assertTrue(rl.is_generated_incremental_tree(inc))
+
+    def test_tree_check_deadline_is_the_only_reason_a_valid_tree_fails(self):
+        def valid(shape):
+            _, inc = self.target(name="tgt-dl-%d" % next(self.tree_ids))
+            shutil.rmtree(inc / "crate-abc")
+            if shape == "outer":
+                for i in range(100):
+                    c = inc / ("c%03d-%013d" % (i, i))
+                    c.mkdir()
+                    (c / "s-hn0w0a1hoy-0kzvtw0.lock").write_text("")
+            else:
+                c = inc / "one-0000000000000"
+                c.mkdir()
+                if shape == "inner":
+                    for i in range(100):
+                        (c / ("s-hn0w0a1hoy-%07d.lock" % i)).write_text("")
+                else:
+                    (c / self.SESS).mkdir()
+                    for i in range(100):
+                        (c / self.SESS / ("%025d.o" % i)).write_text("x")
+            return inc
+
+        for shape in ("outer", "inner", "session"):
+            with self.subTest(shape=shape):
+                inc = valid(shape)
+                self.assertTrue(rl.is_generated_incremental_tree(inc, seconds=100, clock=lambda: 0))
+                self.assertFalse(rl.is_generated_incremental_tree(inc, seconds=-1, clock=lambda: 0))
 
     def test_never_class_a_even_with_a_private_receipt(self):
         _, inc = self.target()

@@ -183,3 +183,38 @@ removes files unused for days. The deletion is consistent with that but unproven
    `disk-admission.py run --bytes N --label L -- COMMAND`, and uses a bounded, named target directory. Each is a ticket and
    PR in that repository.
 4. **Class B manifests** are deleted only after the founder's exact-path ASK.
+
+## Classifier correction (2026-11-19, SPE-176)
+
+`~/.cargo/shared-target/debug/incremental` (about 67 GiB) was classified C by `credential-name` and `evidence-name`, so the
+documented `cargo_incremental` reclaim scope could never be used. Cause: `measure` scans the top level of a `cargo_incremental`
+directory and applies the filename regexes; rustc names each directory `<crate_ident>-<hash>`, and test crates are named
+after what they test (`agent_id_bound_to_token_test-<hash>`). A filename is not evidence of a secret.
+
+| Measured (names only, 2026-11-19) | Count |
+|---|---|
+| Top-level entries | 10,357 |
+| Matching `credential-name` (credential 98, secret 33, token 12) | 143 |
+| Matching `evidence-name` (evidence, ledger, attestation, receipt, manifest) | 426 |
+| Entries not shaped `<crate_ident>-<13 base36>` or not a directory | 0 |
+| Session dirs `s-<a>-<b>-<c>` / lock files `s-<a>-<b>.lock` inside crate dirs | 7,046 / 15,576 |
+| Any other entry, link or non-regular file inside a crate dir | 0 |
+| Crate dirs with no entry at all | 0 |
+| Crate dirs holding only lock files (rustc leaves them after a session dir is collected) | 6,139 |
+| Regular files inside session dirs (all 7,046 listed) | 258,128 |
+| Non-regular or unknown-named entries inside session dirs | 0 |
+| Largest lock file (limit 0 bytes: any content under a lock name is rejected) | 0 bytes |
+| Smallest / largest `.o` (zero-size `.o` rejected) | 584 B / 12.7 MiB |
+| Largest `metadata.rmeta` (no size bound: 47.4 MiB observed, a x4 bound would not stop a hidden secret) | 47.4 MiB |
+| Session dirs named `...-working` (accepted, rustc's own in-progress suffix) | 22 |
+| Session-dir files with link count above 1 (hard-link check not used: rustc hard-links work products) | 235,081 of 259,566 |
+
+Closed set inside a session dir, all regular files: `dep-graph.bin`, `dep-graph.part.bin`, `query-cache.bin`, `work-products.bin`,
+`metadata.rmeta`, and `<25 base36>.o`.
+
+Fix: `is_generated_incremental_tree` verifies positively, to session-file depth, that every top-level child is a non-empty
+`<crate_ident>-<13 base36>` directory holding only `s-*-*-*` session dirs (containing only the closed set above, as regular files) and
+empty `s-*-*.lock` regular files, with no symlink anywhere. Only then are the two name markers dropped for
+`cargo_incremental`. A crate dir with only lock files is accepted because 6,139 real ones are exactly that. Any deviation, unreadable entry or exhausted entry (1,000,000) or time (20 s) budget keeps the old behaviour for the whole
+directory. `keep-marker`, escaping symlinks, `.ca-keep`, open handles, live sessions, build locks and protected roots are unchanged,
+as are `cargo_target` and every other kind, the `evidence_free` receipt rule, `apply` and revalidation.
