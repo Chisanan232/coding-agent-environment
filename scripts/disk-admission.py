@@ -1450,6 +1450,11 @@ BACKFILL_SHADOW_WINDOW_S = 600
 # window. Its waiter is proven alive when granted and polls for the grant; a lapse takes the existing EXPIRED path and frees the in-flight
 # count at once. Only `expires` changes: the grant object stays {at, expires}.
 BACKFILL_GRANT_S = 600
+# A wrapper whose backfilled grant was revoked at claim, or lapsed unclaimed, re-queues the same job with `queue enqueue --requeue-of`
+# (SPE-176). The replacement gets a new id and seq (ids are never reused) and inherits the lost entry's FIFO position as `order`, so it
+# waits behind every entry queued before the original and ahead of every entry queued after it. A chain is capped at this many
+# replacements, so a job cannot hold a borrowed position forever; past the cap the wrapper exits 77 as for any expired entry.
+BACKFILL_REQUEUE_MAX = 3
 WAITING_STATES = ('QUEUED', 'ELIGIBLE', 'GRANTED')
 LIVE_STATES = WAITING_STATES + ('CLAIMED',)
 TERMINAL_STATES = ('RELEASED', 'EXPIRED', 'CANCELLED')
@@ -1519,6 +1524,9 @@ def _read_queue_entry(path):
              and isinstance(entry.get('tickets'), list) and entry.get('harness') in HARNESSES
              and isinstance(entry.get('fingerprint'), str) and len(entry['fingerprint']) == 64
              and isinstance(entry.get('wait_expires'), str)
+             and ('order' not in entry or (type(entry['order']) is int and 1 <= entry['order'] <= entry['seq']))
+             and ('requeue_of' not in entry or (isinstance(entry['requeue_of'], str) and QUEUE_ID_RE.fullmatch(entry['requeue_of'])))
+             and ('requeues' not in entry or (type(entry['requeues']) is int and 1 <= entry['requeues'] <= BACKFILL_REQUEUE_MAX))
              and ('waiter' not in entry or (isinstance(entry['waiter'], dict) and type(entry['waiter'].get('pid')) is int
                                             and entry['waiter']['pid'] > 0 and isinstance(entry['waiter'].get('start_token'), str)
                                             and 0 < len(entry['waiter']['start_token']) <= 64))
@@ -1532,8 +1540,26 @@ def _read_queue_entry(path):
     return entry
 
 
+def _queue_order(entry):
+    """FIFO position: the inherited `order` of a backfill re-queue (SPE-176), else seq; seq breaks ties. Every ordering decision uses
+    this key, so a replacement keeps its original place without ever reusing an id."""
+    return (entry.get('order', entry['seq']), entry['seq'])
+
+
+def _queued_after_grant(waiting, granted):
+    """True when `waiting` is a backfill re-queue created after `granted` got its grant: an in-order grant made while the replacement
+    did not exist yet did not overtake it. Only replacements qualify (for any other entry an earlier position means an earlier
+    creation), and unparseable times count as overtaken (fail closed: the grant stays subject to the backfill rules)."""
+    if 'requeue_of' not in waiting:
+        return False
+    try:
+        return _parse_time(waiting['created']) > _parse_time(granted['grant']['at'])
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return False
+
+
 def _queue_entries(state_path):
-    """Return (entries sorted by seq, problems). Unreadable files are reported and never deleted."""
+    """Return (entries in FIFO order, problems). Unreadable files are reported and never deleted."""
     directory = queue_dir(state_path)
     entries, problems = [], []
     if not directory.exists():
@@ -1544,7 +1570,7 @@ def _queue_entries(state_path):
             entries.append(_read_queue_entry(path))
         except (OSError, ValueError) as exc:
             problems.append('queue-entry-unreadable: %s: %s' % (path.name, exc))
-    return sorted(entries, key=lambda e: e['seq']), problems
+    return sorted(entries, key=_queue_order), problems
 
 
 def _write_queue_entry(state_path, entry):
@@ -1626,14 +1652,74 @@ def _claimed_orphans(entries, live, token_fn, table_fn=None, state_path=None):
     return orphans
 
 
+def _requeue_evidence(state_path, qid):
+    """'backfill-revoked' or 'backfill-lapsed' when the receipts show that qid's backfilled grant ended without a claim, else None.
+
+    Durable evidence the scheduler already writes: a `backfill` receipt, then `backfill-revoked` (claim-time revoke), or `expired` with
+    was=GRANTED (the shortened window lapsed), and never `claimed`. Both the live log and its one rotated backup are read; anything
+    missing or unreadable yields None, so the job loses its position rather than invents one."""
+    events = []
+    directory = queue_dir(state_path)
+    for path in (directory / 'receipts.jsonl.1', directory / 'receipts.jsonl'):
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            with os.fdopen(descriptor, 'rb') as handle:
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    continue
+                raw = handle.read(4 * RECEIPT_ROTATE_BYTES).decode('utf-8', 'replace')
+        except OSError:
+            continue
+        for text in raw.splitlines():
+            try:
+                line = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(line, dict) and line.get('id') == qid:
+                events.append(line)
+    names = [line.get('event') for line in events]
+    if 'claimed' in names or 'backfill' not in names:
+        return None
+    after = events[len(names) - 1 - names[::-1].index('backfill'):]
+    if any(line.get('event') == 'backfill-revoked' for line in after):
+        return 'backfill-revoked'
+    if any(line.get('event') == 'expired' and line.get('was') == 'GRANTED' for line in after):
+        return 'backfill-lapsed'
+    return None
+
+
+def _requeue_refusal(old, entries, fingerprint, session_id, waiter, state_path):
+    """(None, evidence) when `old` may be replaced at its own FIFO position, else (reason, None). Judged under the lock: the caller must
+    be the same job, session and live waiter, and the entry must have lost a backfilled grant and not have been replaced already."""
+    if old is None:
+        return 'no such queue entry', None
+    if old['state'] != 'EXPIRED':
+        return 'is %s, not EXPIRED' % old['state'], None
+    if old['fingerprint'] != fingerprint or old.get('session_id') != session_id:
+        return 'belongs to a different job or session', None
+    if waiter is None or old.get('waiter') != waiter:
+        return 'was queued by a different waiter (pass the same --waiter-pid)', None
+    replaced = next((e['id'] for e in entries if e.get('requeue_of') == old['id']), None)
+    if replaced:
+        return 'was already re-queued as %s' % replaced, None
+    if old.get('requeues', 0) >= BACKFILL_REQUEUE_MAX:
+        return 'reached the re-queue limit of %d' % BACKFILL_REQUEUE_MAX, None
+    evidence = _requeue_evidence(state_path, old['id'])
+    if evidence is None:
+        return 'did not lose a backfilled grant (no backfill-revoked or unclaimed backfill lapse on record)', None
+    return None, evidence
+
+
 def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_id, nbytes, argv, again=False, now=None,
                   wait_s=QUEUE_WAIT_S, declared=None, waiter_pid=None, token_fn=None, owner_fn=process_owner,
-                  ancestor_fn=None):
+                  ancestor_fn=None, requeue_of=None):
     """Add one durable entry, or return the live one with the same fingerprint. Never stores argv.
 
     waiter_pid (SPE-176) names the supervising wrapper that will claim the entry. It must be a live process of this user that is this
     process, its parent or one of its ancestors, so a session cannot declare an unrelated process as its waiter. Its pid and start
-    token are stored; once that process is provably gone, queue advance cancels the entry. Without it nothing is ever auto-cancelled."""
+    token are stored; once that process is provably gone, queue advance cancels the entry. Without it nothing is ever auto-cancelled.
+
+    requeue_of (SPE-176) names an EXPIRED entry of this same job, session and waiter whose backfilled grant was revoked or lapsed
+    unclaimed (_requeue_refusal). The new entry gets a fresh id and seq but inherits that entry's FIFO position (`order`)."""
     now = now or datetime.now(timezone.utc)
     bad = None
     if not (isinstance(label, str) and LABEL_RE.fullmatch(label)):
@@ -1659,6 +1745,8 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
         bad = 'workload'
     elif waiter_pid is not None and not (type(waiter_pid) is int and 0 < waiter_pid < MAX_PID):
         bad = 'waiter-pid'
+    elif requeue_of is not None and not (isinstance(requeue_of, str) and QUEUE_ID_RE.fullmatch(requeue_of) and again):
+        bad = 'requeue-of (a queue id, with --again)'
     if bad:
         return {'ok': False, 'reason': 'invalid-request: %s is missing or out of range' % bad}
     waiter = None
@@ -1693,6 +1781,13 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
                     return {'ok': False, 'reason': '%s already ran this job (RELEASED); pass --again to queue it again' % entry['id']}
                 if entry['state'] in ('CANCELLED', 'EXPIRED') and not again:
                     return {'ok': False, 'reason': '%s was %s; pass --again to queue it again' % (entry['id'], entry['state'])}
+            inherited = {}
+            if requeue_of is not None:
+                old = next((e for e in entries if e['id'] == requeue_of), None)
+                why, evidence = _requeue_refusal(old, entries, fingerprint, session_id, waiter, state_path)
+                if why:
+                    return {'ok': False, 'reason': 'not-requeueable: %s %s' % (requeue_of, why)}
+                inherited = {'order': _queue_order(old)[0], 'requeue_of': old['id'], 'requeues': old.get('requeues', 0) + 1}
             seq_path = queue_dir(state_path) / 'seq.json'
             floor = 1 + max([e['seq'] for e in entries] or [0])
             try:
@@ -1714,13 +1809,18 @@ def queue_enqueue(state_path, label, tickets, repo, worktree, harness, session_i
             entry.update({k: v for k, v in (declared or {}).items() if k != 'created'})  # the entry already has `created`
             if waiter:
                 entry['waiter'] = waiter
+            entry.update(inherited)
             if (queue_dir(state_path) / (entry['id'] + '.json')).exists():
                 return {'ok': False, 'reason': 'queue-entry-unreadable: %s already exists' % entry['id']}
             write_json_atomic(seq_path, {'next': seq + 1})  # counter first: a crash leaves a gap, never a reused id
             _write_queue_entry(state_path, entry)
-            receipt_ok = _queue_receipt(state_path, 'enqueued', entry, now)
-            return {'ok': True, 'id': entry['id'], 'receipt_ok': receipt_ok, 'reason': 'queued as %s (position %d)' % (
-                entry['id'], 1 + sum(1 for e in entries if e['state'] in WAITING_STATES and not _entry_lapsed(e, now)))}
+            extra = dict(inherited, evidence=evidence) if inherited else {}
+            receipt_ok = _queue_receipt(state_path, 'enqueued', entry, now, **extra)
+            ahead = sum(1 for e in entries if e['state'] in WAITING_STATES and not _entry_lapsed(e, now) and _queue_order(e) < _queue_order(entry))
+            out = {'ok': True, 'id': entry['id'], 'receipt_ok': receipt_ok, 'reason': 'queued as %s (position %d)' % (entry['id'], 1 + ahead)}
+            if inherited:
+                out.update(requeue_of=old['id'], order=inherited['order'], evidence=evidence)
+            return out
     except StateError as exc:
         return {'ok': False, 'reason': '%s: %s' % (exc.kind, exc)}
     except OSError as exc:
@@ -1975,7 +2075,8 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                         return out
                     # Overtakers already in flight, from durable states alone: a GRANTED or CLAIMED entry queued after the oldest waiting
                     # one got its lane by backfill. Read under the lock, so concurrent pollers can never exceed BACKFILL_MAX together.
-                    in_flight = sum(1 for e in entries if e['state'] in ('GRANTED', 'CLAIMED') and e['seq'] > nxt['seq'])
+                    in_flight = sum(1 for e in entries if e['state'] in ('GRANTED', 'CLAIMED') and _queue_order(e) > _queue_order(nxt)
+                                    and not _queued_after_grant(nxt, e))
                     out.update(head_reason=out['reason'], backfilled=[], backfill_shadow=[])
                     if in_flight >= BACKFILL_MAX:
                         return out
@@ -3391,8 +3492,9 @@ def _overtaken_head(entries, entry, now):
     """The oldest unlapsed waiting entry queued before `entry`, or None. A GRANTED entry with one is a backfilled grant: an in-order
     pass grants the head first and stops at the first entry that does not fit (the same durable rule the in-flight count uses, so a
     rotated receipt log cannot hide it)."""
-    earlier = [e for e in entries if e['state'] in ('QUEUED', 'ELIGIBLE') and e['seq'] < entry['seq'] and not _entry_lapsed(e, now)]
-    return min(earlier, key=lambda e: e['seq']) if earlier else None
+    earlier = [e for e in entries if e['state'] in ('QUEUED', 'ELIGIBLE') and _queue_order(e) < _queue_order(entry)
+               and not _entry_lapsed(e, now) and not _queued_after_grant(e, entry)]
+    return min(earlier, key=_queue_order) if earlier else None
 
 
 def _backfill_protection_lost(host, entry, entries, live, orphans, now, result, reserved, in_use, lanes):
@@ -3759,6 +3861,9 @@ def build_parser():
     enq.add_argument('--bytes', type=int, required=True, dest='nbytes')
     enq.add_argument('--wait-s', type=int, default=QUEUE_WAIT_S, dest='wait_s')
     enq.add_argument('--again', action='store_true')
+    enq.add_argument('--requeue-of', dest='requeue_of', metavar='QID',
+                     help='with --again: replace this EXPIRED entry of the same job, session and waiter whose backfilled grant was revoked '
+                          'or lapsed unclaimed, keeping its FIFO position (SPE-176)')
     enq.add_argument('--waiter-pid', type=int, dest='waiter_pid',
                      help='the supervising wrapper (this command, its parent or an ancestor); if it exits, advance cancels the entry')
     _add_workload_args(enq)
@@ -3829,7 +3934,7 @@ def _queue_cli(args, state_path, free_fn, host_fn=None):
             return REFUSED_EXIT
         out = queue_enqueue(state_path, args.label, args.tickets, args.repo, args.worktree, args.harness, args.session_id,
                             args.nbytes, args.job[1:], again=args.again, wait_s=args.wait_s, declared=declared,
-                            waiter_pid=args.waiter_pid)
+                            waiter_pid=args.waiter_pid, requeue_of=args.requeue_of)
     elif command == 'advance':
         out = queue_advance(state_path, free_fn, grant_s=args.grant_s, host_fn=host_fn, memory_fn=_memory_precondition)
         out['ok'] = out['reason'] in ('ok',) or bool(out['granted'] or out['expired'] or out['eligible']) or out['reason'] in (
