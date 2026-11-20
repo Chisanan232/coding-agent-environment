@@ -2500,5 +2500,107 @@ class TelegramBackend(Base):
         self.assertIn("telegram", sn.REAL_TRANSPORTS)
 
 
+class TestNotice(Base):
+    """SPE-176: the fixed-text delivery-test notice on its own reserved record."""
+    TITLE, BODY = "Claude Code: test notice, ignore", "notification delivery test | no action needed"
+
+    def digest(self, sid):
+        return __import__("hashlib").sha256(sn.record_path(self.sdir, sid).read_bytes()).hexdigest()
+
+    def test_fixed_text_through_every_enabled_backend(self):
+        e = self.engine()
+        self.assertEqual((e.test_notice(), e.last_delivery), ("queued", "sent"))
+        self.assertEqual(self.names(), ["macos", "ntfy", "pushover"])
+        for _, payload in self.fake.sent:
+            self.assertEqual(payload, {"title": self.TITLE, "body": self.BODY})
+
+    def test_touches_no_other_record_or_state_file(self):
+        self.engine().emit_resource({"cause": "disk-floor", "recovery": "none", "owner_action": "reclaim-disk"})
+        sn.save_record(self.sdir, sn.new_record("claude-auth-watch", self.t))
+        before = {sid: self.digest(sid) for sid in ("admission-monitor", "claude-auth-watch")}
+        listing = sorted(p.name for p in self.sdir.iterdir())
+        self.assertEqual(self.engine().test_notice(), "queued")
+        self.assertEqual({sid: self.digest(sid) for sid in before}, before)
+        self.assertEqual(sorted(set(p.name for p in self.sdir.iterdir()) - set(listing)), ["notify-test.json", "notify-test.json.lock"])
+
+    def test_dedup_for_ten_minutes_then_resend(self):
+        e = self.engine()
+        self.assertEqual(e.test_notice(), "queued")
+        self.advance(599)
+        self.assertEqual(e.test_notice(), "deduped")
+        self.assertEqual(len(self.fake.sent), 3)
+        self.advance(2)
+        self.assertEqual(self.engine().test_notice(), "queued")
+        self.assertEqual(len(self.fake.sent), 6)
+
+    def test_resource_emit_and_clear_do_not_affect_test_dedup(self):
+        self.assertEqual(self.engine().test_notice(), "queued")
+        self.engine().emit_resource({}, clear=True)
+        self.assertEqual(self.engine().test_notice(), "deduped")
+
+    def test_reserved_id_hook_events_are_ignored_case_insensitively(self):
+        e = self.engine()
+        for sid in ("notify-test", "Notify-Test", "NOTIFY-TEST"):
+            self.assertEqual(self.ev(e, "SessionStart", sid=sid, source="startup"), "ignored")
+        self.assertFalse(self.sdir.exists() and any(self.sdir.glob("*otify-*est*")))
+
+    def test_sweep_retries_its_delivery_but_never_marks_it_stale(self):
+        failing = Fake(fail={"macos": "boom", "ntfy": "boom", "pushover": "boom"})
+        self.assertEqual(self.engine(fake=failing).test_notice(), "queued")
+        rec = self.rec("notify-test")
+        rec["state"], rec["last_seen"] = "RUNNING", self.t
+        sn.save_record(self.sdir, rec)
+        self.advance(10 * 86400)
+        out = self.engine().sweep()
+        self.assertEqual((out["stale"], out["retried"]), (0, 3))
+        self.assertEqual(self.rec("notify-test")["state"], "RUNNING")
+        self.assertEqual(len(self.fake.sent), 3)
+        self.assertEqual(self.rec("notify-test")["pending"], [])
+        self.advance(20 * 86400)
+        self.engine().sweep()
+        self.assertIsNotNone(self.rec("notify-test"))
+
+    def test_no_backend_strict_leaves_no_dedup_record(self):
+        off = cfg()
+        for b in off["backends"].values():
+            b["enabled"] = False
+        e = self.engine(off)
+        self.assertEqual((e.test_notice(strict=True), e.last_delivery), ("no-backend", None))
+        self.assertEqual(self.engine().test_notice(), "queued")
+
+    def test_no_backend_non_strict_records_dedup(self):
+        off = cfg()
+        for b in off["backends"].values():
+            b["enabled"] = False
+        self.assertEqual(self.engine(off).test_notice(), "no-backend")
+        self.assertEqual(self.engine().test_notice(), "deduped")
+
+    def test_corporate_profile_refuses_remote_backends(self):
+        c = cfg(profile="corporate")
+        c["backends"]["macos"]["enabled"] = False
+        e = self.engine(c)
+        self.assertEqual((e.test_notice(), e.last_delivery), ("queued", "dropped"))
+        self.assertEqual(self.fake.sent, [])
+
+    def test_no_free_text_path_and_no_new_cause_enum(self):
+        for table in (sn.CAUSE_TEXT, sn.RECOVERY_TEXT, sn.OWNER_ACTION_TEXT):
+            self.assertFalse([k for k in table if "test" in k or "notice" in k], table)
+        env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(self.sdir), SESSION_NOTIFY_CONFIG=str(self.tmp / "none.json"))
+        run = lambda *a: subprocess.run([sys.executable, str(SCRIPT), "test-notice", *a], capture_output=True, text=True, env=env)
+        for args in (("--text", "hello"), ("--title", "x"), ("hello",), ("--body=x",), ("--cause", "disk-floor")):
+            self.assertEqual(run(*args).returncode, 2, args)
+        self.assertFalse(self.sdir.exists())
+        r = run("--strict")
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "test-notice: no-backend"))
+
+    def test_cli_busy_or_error_exits_one_without_path(self):
+        blocker = self.tmp / "afile"
+        blocker.write_text("x")
+        env = dict(os.environ, SESSION_NOTIFY_STATE_DIR=str(blocker / "state"), SESSION_NOTIFY_CONFIG=str(self.tmp / "none.json"))
+        r = subprocess.run([sys.executable, str(SCRIPT), "test-notice"], capture_output=True, text=True, env=env)
+        self.assertEqual((r.returncode, r.stdout.strip()), (1, "test-notice: error"))
+        self.assertNotIn(str(blocker), r.stdout + r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
