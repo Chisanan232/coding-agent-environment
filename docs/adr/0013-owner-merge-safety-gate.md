@@ -69,9 +69,13 @@ to act on. Conversely, host authorization never excuses a REFUSE.
   union. GraphQL `pullRequest.comments` was measured empty for every PR of one repository while
   REST and the GraphQL timeline held the comments, so a single source could hide the
   reviewer's record. Each GraphQL entry replaces its REST twin (same login, body and creation
-  time) one-to-one; identical comments inside one source stay separate. The union adds no
-  trust: only the authenticated viewer's comments count, outside code fences, bound to the
-  exact head, with PASS and `blocking=0`. If the REST list cannot be read the gate refuses
+  time) one-to-one; identical comments inside one source stay separate. The union adds one
+  acceptance path, for viewer-authored records visible only through REST on the standard review
+  path, and no trust beyond what the GraphQL path already granted (that path never checked
+  edited or minimized state either): only the authenticated viewer's comments count, outside
+  code fences, bound to the exact head, with PASS and `blocking=0`. The merged list is ordered
+  by creation time (REST order as the tiebreak) so latest-wins checks read the newest record.
+  If the REST list cannot be read the gate refuses
   (`COMMENTS_UNREADABLE`) instead of trusting GraphQL alone. A count difference between the
   sources is reported as the fact `comment_source_discrepancy`. REST carries no
   edited/minimized flags, so a REST-only comment can never satisfy the local-first basis,
