@@ -33,6 +33,9 @@ approval, and an approved prompt covers exactly the one printed command at its p
 `CI_FAILED` is DENY because a genuinely failed check is not waivable; remediate it. `NO_CI_EVIDENCE` (no completed checks and no qualified
 `CI_UNAVAILABLE_EXTERNAL` record) is a founder risk decision; a qualified record clears it. A gate `ERROR` prints a DENY decision (exit 3).
 `UNAUTHORIZED_REPO` and `NOT_CANONICAL_REPO` are DENY: a trust-boundary failure is never an ASK.
+`COMMENTS_UNREADABLE` (ASK, `agent_revalidates`): the gate reads the PR comments from GraphQL and from the REST issue-comments list and
+uses both; when the REST list cannot be read it refuses rather than trusting GraphQL alone (FORNX-503). A `comment_source_discrepancy` fact
+means the two sources disagree on the comment count; the union is used.
 
 Print the decision for a PR (reads GitHub and the permission rules of the settings file; prints no rule text or env values):
 
