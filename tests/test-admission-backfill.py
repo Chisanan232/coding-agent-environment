@@ -1172,6 +1172,17 @@ class RequeueCapability(Base):
         self.assertEqual([(r['id'], r['blocked_id'], r['reason']) for r in record], [(self.docker_a, self.head, 'head-excl-only')])
         self.assertFalse(self.receipts('backfill'))
 
+    def test_the_scan_continues_past_a_skipped_candidate_to_a_capable_one_on_another_key(self):
+        self.blocker, self.blocker_proc = self.running('p6-verify-2', 'build-workspace', [SHARED], 40)
+        self.head = self.enqueue('ent-verify-3', 'build-workspace', [SHARED], 40)
+        old = self.enqueue('p2556d', 'container-suite', ['docker'], 32, capable=False)
+        other = self.enqueue('p2556p', 'container-suite', ['podman'], 32)
+        with backfill():
+            out = self.advance()
+        self.assertEqual(out['backfilled'], [other])
+        self.assertEqual(self.state(old), 'QUEUED')
+        self.assertEqual([r['id'] for r in self.skipped()], [old])
+
     def test_off_mode_skips_it_too_and_does_not_count_it_as_a_shadow_grant(self):
         self.shape(False)
         with backfill(enabled=False):
