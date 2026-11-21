@@ -472,7 +472,7 @@ def load_evidence(path, head, repo, pr, base, cfg, key, now):
         if key is None or not isinstance(mac, str) or not MAC_RE.fullmatch(mac) \
                 or not hmac.compare_digest(mac, evidence_mac(key, ev)):
             bad.append("evidence signature missing or invalid")
-    required = cfg["required_local_checks"]
+    required = cfg.get("required_local_checks") or ()
     if required and "local_ci" not in ev:
         bad.append("required_local_checks is set but the evidence has no local_ci block")
     local = check_local_ci(ev["local_ci"], head, cfg, now) \
