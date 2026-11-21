@@ -1439,11 +1439,12 @@ QUEUE_GRANT_S = 3600
 # the owner re-enqueues. Entries with a declared waiter keep min(grant_s, QUEUE_MAX_GRANT_S); an explicit smaller grant_s still wins.
 HANDOFF_GRANT_S = 1200
 QUEUE_MAX_GRANT_S = 4 * 3600
-# Bounded backfill (SPE-176, ADR 0017 revision 9) ships OFF: while off, queue advance only writes rate-limited `backfill-shadow` receipts
-# saying what it would have granted. Turning it on is a separate reviewed one-line PR flipping BACKFILL_ENABLED, and reverting that PR
-# is the rollback; as with FOURTH_LANE_ENABLED there is deliberately no flag file or environment switch (a writable switch is a forgeable
+# Bounded backfill (SPE-176, ADR 0017 revision 10) is ON: queue advance may grant one later, compatible entry a lane while the oldest
+# waiting entry is blocked only by an exclusion key held by a claimed running job. Before revision 10 it shipped OFF and wrote only
+# rate-limited `backfill-shadow` receipts (still the behaviour when this is False). It was turned on by a separate reviewed one-line PR
+# flipping BACKFILL_ENABLED, and reverting that PR is the rollback; as with FOURTH_LANE_ENABLED there is deliberately no flag file or environment switch (a writable switch is a forgeable
 # cap). BACKFILL_MAX is how many entries may hold a lane ahead of the oldest waiting entry at once.
-BACKFILL_ENABLED = False
+BACKFILL_ENABLED = True
 BACKFILL_MAX = 1
 BACKFILL_SHADOW_WINDOW_S = 600
 # Claim window of a backfilled grant (SPE-176 hardening): it holds a lane ahead of the oldest waiting entry, so it gets half the hand-off
