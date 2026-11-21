@@ -1720,6 +1720,26 @@ class RequiredLocalChecks(Base):
         self.write_evidence(local_ci=self.local(), repo="x/y")
         self.assertRefused(FakeGh(), "evidence repo")
 
+    def test_empty_list_means_no_requirement(self):
+        self.allow.write_text(json.dumps(allow_doc(required_local_checks=[])))
+        self.write_evidence()
+        code, rec = self.go(FakeGh(), dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+
+    def test_non_integer_exit_codes_refuse(self):
+        for bad in ("0", True, None):
+            with self.subTest(exit_code=bad):
+                checks = [{"name": n, "exit_code": bad, "tests": 0} for n in self.NAMES]
+                self.write_evidence(local_ci=self.local(checks=checks))
+                self.assertRefused(FakeGh(), "local_ci check entry is malformed")
+
+    def test_near_miss_names_refuse(self):
+        for alt in ("Ruff-Security", "ruff-security ", " ruff-security"):
+            with self.subTest(name=alt):
+                checks = [{"name": alt, "exit_code": 0, "tests": 0}, {"name": "pip-audit-runtime", "exit_code": 0, "tests": 0}]
+                self.write_evidence(local_ci=self.local(checks=checks))
+                self.assertRefused(FakeGh(), "ruff-security")
+
     def test_invalid_config_values_refuse(self):
         for bad in ("ruff", [""], [" a"], [1], ["a", "a"]):
             with self.subTest(bad=bad):
