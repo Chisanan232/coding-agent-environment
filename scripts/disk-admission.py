@@ -319,7 +319,7 @@ THIRD_LANE_ENABLED = True
 # The tiers whose cap gains the third lane while THIRD_LANE_ENABLED (ADR 0017 revision 12: the stable tier joined the wide tier).
 # HEAVY_LANES stays the two-lane base so that flag remains the one-line kill switch for lane 3 in every tier. In the stable tier
 # (free below 200 GiB) THIRD_LANE_MARGIN still needs free - reserved - request >= HEAVY_FLOOR + 60 GiB, so lane 3 opens there only
-# while reservations plus the request stay within 40 GiB.
+# while reservations plus the request total at most free - 160 GiB (30 GiB at 190 GiB free).
 THIRD_LANE_TIERS = ('stable', 'wide')
 # Class-aware third lane (SPE-160, shadow only): the classes a third lane could admit, each at the least it needs. light holds no
 # memory or cpu slots; build-crate is granted its class min_jobs. This only feeds the trial report; it does not decide admission.

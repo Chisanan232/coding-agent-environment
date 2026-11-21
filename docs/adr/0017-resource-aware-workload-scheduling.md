@@ -680,7 +680,8 @@ effective stable cap instead of the table value.
 
 Effect, stated plainly: there is no extra concurrency at today's measured 160 to 184 GiB free and queue shape. The stable tier is below
 200 GiB free, and lane 3 still needs `free - reserved - request >= 160 GiB`, so it opens there only while every reservation plus the request
-stays within 40 GiB (for example three small jobs of about 5 to 15 GiB at 190 GiB free). With 32 to 55 GiB held and 25 to 40 GiB requested the
+totals at most `free - 160 GiB`: 30 GiB at 190 GiB free, and just under 40 GiB only at the very top of the tier (199.99 GiB free). For example
+three jobs of about 5 to 10 GiB each (30 GiB in total) at 190 GiB free. With 32 to 55 GiB held and 25 to 40 GiB requested the
 margin leaves at most 127 GiB and refuses. More free space (wide tier) or smaller reservations (isolated Cargo targets, smaller declared sizes) is what
 opens a third lane; the cap alone never does.
 
