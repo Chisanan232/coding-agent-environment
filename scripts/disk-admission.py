@@ -1454,6 +1454,11 @@ QUEUE_MAX_GRANT_S = 4 * 3600
 # cap). BACKFILL_MAX is how many entries may hold a lane ahead of the oldest waiting entry at once.
 BACKFILL_ENABLED = True
 BACKFILL_MAX = 1
+# SPE-176 (ADR 0017 revision 13): extra disk headroom a NEW backfill grant needs above HEAVY_FLOOR for the head's protection. Free space
+# jitters by a few hundred MB within seconds (live 2026-11-21: a grant with ~152 MB of margin was revoked 15 s later at claim time), so a
+# grant on a sliver of margin is wasted. 4 GiB is roughly ten times that jitter and small against the 25-40 GiB declared jobs. Grant time
+# only: the claim-time recheck keeps the plain floor. It only tightens; nothing is ever granted that was refused before.
+BACKFILL_HYSTERESIS = 4 * 1024 ** 3
 BACKFILL_SHADOW_WINDOW_S = 600
 # Claim window of a backfilled grant (SPE-176 hardening): it holds a lane ahead of the oldest waiting entry, so it gets half the hand-off
 # window. Its waiter is proven alive when granted and polls for the grant; a lapse takes the existing EXPIRED path and frees the in-flight
@@ -3494,7 +3499,8 @@ def _excl_id_set(entry):
     return {token for k in entry.get('excl_keys') or [] for token in excl_identity(k)}
 
 
-def _protects_head(host, head, cand, blockers, live, orphans, granted, now, lane_tier, free, reserved, in_use, lanes, latch=False):
+def _protects_head(host, head, cand, blockers, live, orphans, granted, now, lane_tier, free, reserved, in_use, lanes, latch=False,
+                   hysteresis=0):
     """(ok, math): would `head` still be admitted once its blockers release, with `cand` granted beside everything else? Pure.
 
     Declared reservations only: the disk check counts every current reservation, the blockers included (a release is not credited
@@ -3504,13 +3510,17 @@ def _protects_head(host, head, cand, blockers, live, orphans, granted, now, lane
     for the head with the blockers removed (their load credit too) and the candidate as an unclaimed grant charged its full declared
     size, on the same host sample; it must give no refusal, band GREEN and fit the cap. No helper projects the SPE-117 memory latch
     (pressure, swap, compressor) from declared bytes, so the projection used is that budget: band GREEN and the projected memory, the
-    candidate and the head included, under the GREEN limit. The blockers' measured memory stays in the sample: conservative."""
+    candidate and the head included, under the GREEN limit. The blockers' measured memory stays in the sample: conservative.
+
+    `hysteresis` (bytes) is extra disk headroom required above HEAVY_FLOOR. A new grant passes BACKFILL_HYSTERESIS so free-space jitter
+    between grant and claim cannot revoke it; the claim-time recheck keeps the default 0 (the plain floor). It only ever refuses more.
+    math['hysteresis_refused'] is True when that margin was the sole reason for the refusal."""
     projected_free = free - reserved - cand['bytes']
     tier_after = tier(projected_free)
     lanes_after = heavy_lane_cap(tier_after, next_latch(projected_free, {'latch': latch}))
     math = {'free': free, 'reserved': reserved, 'cand_bytes': cand['bytes'], 'head_bytes': head['bytes'], 'floor': HEAVY_FLOOR,
             'disk_left': free - reserved - cand['bytes'] - head['bytes'], 'in_use': in_use, 'lanes': lanes,
-            'tier_after': tier_after, 'lanes_after': lanes_after, 'cap': None, 'band_after': None,
+            'tier_after': tier_after, 'lanes_after': lanes_after, 'hysteresis': hysteresis, 'hysteresis_refused': False, 'cap': None, 'band_after': None,
             'head_projected': None, 'head_limit': None, 'head_cpu': None, 'cpu_limit': None}
     cap = math['cap'] = min(lanes, lanes_after, heavy_lane_cap(lane_tier, latch))
     ok = math['disk_left'] >= HEAVY_FLOOR and in_use + 1 - len(blockers) < cap
@@ -3531,6 +3541,9 @@ def _protects_head(host, head, cand, blockers, live, orphans, granted, now, lane
                 head_cpu=verdict['cpu_slots_used'] + (head.get('cpu_slots') or 0),
                 cpu_limit=verdict['cpu_limit'], band_after=verdict['band'])
     ok = ok and not verdict['resource_reasons'] and verdict['band'] == 'GREEN' and not verdict['cap_reason']
+    if ok and math['disk_left'] < HEAVY_FLOOR + hysteresis:
+        math['hysteresis_refused'] = True
+        ok = False
     return ok, math
 
 
@@ -3607,7 +3620,7 @@ def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans,
             reason = 'lane-refusal'
         else:
             ok, math = _protects_head(host, backfill['head'], cand, backfill['blockers'], live, orphans, granted, now, result['tier'], free,
-                                      reserved, in_use, lanes, result['latch'])
+                                      reserved, in_use, lanes, result['latch'], BACKFILL_HYSTERESIS)
             if not ok:
                 reason = _head_unprotected_part(math, backfill['blockers'])
     if reason:
@@ -3634,17 +3647,19 @@ def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans,
 # is the grant; `memory-gate` and `in-flight-cap` are the refusals made by advance itself rather than by _backfill_candidate.
 BACKFILL_DECISION_REASONS = ('qualified', 'key-overlap-pivot', 'key-overlap-skipped', 'no-requeue-capability', 'waiter-not-alive', 'disk-floor',
                              'lane-refusal', 'head-unprotected-disk', 'head-unprotected-lanes', 'head-unprotected-lane3-margin', 'head-unprotected-budget',
-                             'memory-gate', 'in-flight-cap', 'other')
+                             'head-unprotected-hysteresis', 'memory-gate', 'in-flight-cap', 'other')
 
 
 def _head_unprotected_part(math, blockers):
-    """Which part of _protects_head refused, from the figures it returns: disk first, then lanes, then the lane-3 margin, else the budget (memory, CPU, band)."""
+    """Which part of _protects_head refused, from the figures it returns: disk first, then lanes, then the lane-3 margin, then the grant-time hysteresis (only when every other part passed), else the budget (memory, CPU, band)."""
     if math['disk_left'] < HEAVY_FLOOR:
         return 'head-unprotected-disk'
     if math['in_use'] + 1 - len(blockers) >= math['cap']:
         return 'head-unprotected-lanes'
     if _third_lane_refusal(math['in_use'] + 2 - len(blockers), math['free'], math['reserved'] + math['cand_bytes'], math['head_bytes']):
         return 'head-unprotected-lane3-margin'
+    if math.get('hysteresis_refused'):
+        return 'head-unprotected-hysteresis'
     return 'head-unprotected-budget'
 
 
