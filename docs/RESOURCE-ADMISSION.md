@@ -426,6 +426,13 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
   - In OFF mode with a cap above 1, each shadow candidate is judged beside the earlier ones. The shadow never runs the memory-admission
     check (`memory_gate: not-asked`) because that check writes the shared latch.
   - Waiter `ps` answers are cached for one pass.
+  - Decision log (ADR 0017 revision 10a). While ON, each candidate evaluated behind an exclusion-key-blocked head writes one
+    `backfill-decision` receipt: `id`/`label` (candidate), `blocked_id` (head), `blocker_id`/`blocker_ids`, `outcome` (`granted` or
+    `refused`), `reason`, `in_flight`, `cap`. `reason` is one of `qualified`, `key-overlap-pivot`, `key-overlap-skipped`,
+    `no-requeue-capability`, `waiter-not-alive`, `disk-floor`, `lane-refusal`, `head-unprotected-disk`, `head-unprotected-lanes`,
+    `head-unprotected-lane3-margin`, `head-unprotected-budget`, `memory-gate`, `in-flight-cap`, `other`. `head-unprotected-lane3-margin` is a head whose own lane 3 would stay under the 160 GiB margin while the disk floor, the lane count and the tier all pass (see "Third lane disk margin"). An unchanged (head, candidate, outcome, reason, blocker set) is
+    not written again for 10 minutes. Logging only: it changes no decision, and a failure of the logger itself is swallowed. `other` is
+    never emitted by the shipped code paths; it is how an unknown reason would be recorded, so the vocabulary stays closed.
 - `queue claim` of a backfilled grant (a GRANTED entry with an earlier unlapsed waiting entry) re-checks head protection against the
   oldest waiting entry.
   - If protection no longer holds, the grant is withdrawn: the entry becomes `EXPIRED`, a `backfill-revoked` receipt records the kind

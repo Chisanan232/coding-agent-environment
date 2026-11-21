@@ -2063,8 +2063,10 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                             return out
                         if type(memory) is tuple and not memory[0]:
                             out['reason'] = 'memory-gate: %s' % memory[1]
+                            _log_backfill_decision(state_path, backfill, nxt, now, 'refused', 'memory-gate')
                             return out
                         _queue_receipt(state_path, 'backfill', nxt, now, **verdict)
+                        _log_backfill_decision(state_path, backfill, nxt, now, 'granted', 'qualified')
                         grant(nxt, backfilled=True)
                         out['backfilled'].append(nxt['id'])
                     backfill['keys'] |= _excl_id_set(nxt)
@@ -2099,10 +2101,13 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                     in_flight = sum(1 for e in entries if e['state'] in ('GRANTED', 'CLAIMED') and _queue_order(e) > _queue_order(nxt)
                                     and not _queued_after_grant(nxt, e))
                     out.update(head_reason=out['reason'], backfilled=[], backfill_shadow=[])
-                    if in_flight >= BACKFILL_MAX:
-                        return out
                     backfill = {'pivot': nxt['id'], 'head': nxt, 'blockers': blockers, 'keys': _excl_id_set(nxt),
                                 'in_flight': in_flight, 'taken': 0}
+                    if in_flight >= BACKFILL_MAX:
+                        behind = waiting[waiting.index(nxt) + 1:]
+                        if behind:   # the entry backfill would have tried first
+                            _log_backfill_decision(state_path, backfill, behind[0], now, 'refused', 'in-flight-cap')
+                        return out
                     continue
                 if memory == 'probe':
                     out['grant_pending'] = True   # the head fits: the caller asks the memory gate outside the lock, then calls again
@@ -3581,19 +3586,28 @@ def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans,
     free = result['free_bytes']
     if in_use >= lanes:
         return 'stop'
-    refused = bool(keys & backfill['keys']) or not _waiter_proven_alive(cand, waiter_fn) or free - reserved - cand['bytes'] < HEAVY_FLOOR
-    if not refused:
+    reason = None   # the first refusal in the order the checks run: a closed BACKFILL_DECISION_REASONS value
+    if keys & backfill['keys']:
+        reason = 'key-overlap-pivot' if keys & _excl_id_set(backfill['head']) else 'key-overlap-skipped'
+    elif not _waiter_proven_alive(cand, waiter_fn):
+        reason = 'waiter-not-alive'
+    elif free - reserved - cand['bytes'] < HEAVY_FLOOR:
+        reason = 'disk-floor'
+    else:
         budget = None
         if host is not None:
             budget = _shadow_site(host, 'backfill', cand['label'], lambda: (
                 budget_holders(live, orphans, granted, now), budget_request(cand, cand['bytes'], cand['label'])), result['tier'], free, reserved, True)
-        refused = bool(_lane_refusal(budget, in_use, free, reserved, cand['bytes'], cand))
-    if not refused:
-        ok, math = _protects_head(host, backfill['head'], cand, backfill['blockers'], live, orphans, granted, now, result['tier'], free,
-                                  reserved, in_use, lanes, result['latch'])
-        refused = not ok
-    if refused:
+        if _lane_refusal(budget, in_use, free, reserved, cand['bytes'], cand):
+            reason = 'lane-refusal'
+        else:
+            ok, math = _protects_head(host, backfill['head'], cand, backfill['blockers'], live, orphans, granted, now, result['tier'], free,
+                                      reserved, in_use, lanes, result['latch'])
+            if not ok:
+                reason = _head_unprotected_part(math, backfill['blockers'])
+    if reason:
         backfill['keys'] |= keys
+        _log_backfill_decision(state_path, backfill, cand, now, 'refused', reason)
         return None
     blocker = backfill['blockers'][0]   # the first stays in blocker_id / blocker_label / excl_key for older readers
     verdict = {'blocked_id': backfill['pivot'], 'blocker_id': blocker['id'], 'blocker_label': blocker['label'], 'excl_key': blocker['keys'][0],
@@ -3606,8 +3620,77 @@ def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans,
         backfill['keys'] |= keys
         if not _recent_backfill_shadow(queue_dir(state_path) / 'receipts.jsonl', backfill['pivot'], cand['id'], now):
             _queue_receipt(state_path, 'backfill-shadow', cand, now, memory_gate='not-asked', skipped='no-requeue-capability', **verdict)
+        _log_backfill_decision(state_path, backfill, cand, now, 'refused', 'no-requeue-capability')
         return None
     return verdict
+
+
+# The closed vocabulary of `backfill-decision` reasons, one per refusal site of a backfill candidate (SPE-176 decision log). `qualified`
+# is the grant; `memory-gate` and `in-flight-cap` are the refusals made by advance itself rather than by _backfill_candidate.
+BACKFILL_DECISION_REASONS = ('qualified', 'key-overlap-pivot', 'key-overlap-skipped', 'no-requeue-capability', 'waiter-not-alive', 'disk-floor',
+                             'lane-refusal', 'head-unprotected-disk', 'head-unprotected-lanes', 'head-unprotected-lane3-margin', 'head-unprotected-budget',
+                             'memory-gate', 'in-flight-cap', 'other')
+
+
+def _head_unprotected_part(math, blockers):
+    """Which part of _protects_head refused, from the figures it returns: disk first, then lanes, then the lane-3 margin, else the budget (memory, CPU, band)."""
+    if math['disk_left'] < HEAVY_FLOOR:
+        return 'head-unprotected-disk'
+    if math['in_use'] + 1 - len(blockers) >= math['cap']:
+        return 'head-unprotected-lanes'
+    if _third_lane_refusal(math['in_use'] + 2 - len(blockers), math['free'], math['reserved'] + math['cand_bytes'], math['head_bytes']):
+        return 'head-unprotected-lane3-margin'
+    return 'head-unprotected-budget'
+
+
+def _backfill_decisions(path, head, now):
+    """{candidate id: newest `backfill-decision` line inside the window} for one head (tail of the log only, same read as the shadow limiter)."""
+    found = {}
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, 'rb') as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return found
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - RECEIPT_ROTATE_BYTES))
+            raw = handle.read(RECEIPT_ROTATE_BYTES + 1).decode('utf-8', 'replace')
+    except OSError:
+        return found
+    for text in reversed(raw.splitlines()):
+        try:
+            line = json.loads(text)
+            if (line.get('event') == 'backfill-decision' and line.get('blocked_id') == head and line['id'] not in found
+                    and (now - _parse_time(line['ts'])).total_seconds() < BACKFILL_SHADOW_WINDOW_S):
+                found[line['id']] = line
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return found
+
+
+def _log_backfill_decision(state_path, backfill, cand, now, outcome, reason):
+    """One `backfill-decision` receipt: the head (blocked_id), its blockers, the candidate (id, label) and why it was granted or refused.
+
+    Only while BACKFILL_ENABLED (the OFF path keeps its shadow receipts). Written only when (head, candidate, outcome, reason, blocker set)
+    differs from the newest line inside BACKFILL_SHADOW_WINDOW_S, so an unchanged refusal is logged once per window rather than once per
+    poll. Pure logging: it reads the receipt tail and appends one line, no admission decision depends on either, and any failure of
+    either is swallowed so the decision it describes is never affected."""
+    try:
+        if not BACKFILL_ENABLED:
+            return
+        reason = reason if reason in BACKFILL_DECISION_REASONS else 'other'
+        blockers = sorted(b['id'] for b in backfill['blockers'])
+        seen = backfill.setdefault('decisions', {})
+        if 'loaded' not in seen:   # one tail read per pass, and the lines this pass writes are added below
+            seen['loaded'] = _backfill_decisions(queue_dir(state_path) / 'receipts.jsonl', backfill['pivot'], now)
+        last = seen['loaded'].get(cand['id'])
+        if last and (last.get('outcome'), last.get('reason'), last.get('blocker_ids')) == (outcome, reason, blockers):
+            return
+        fields = {'blocked_id': backfill['pivot'], 'blocker_id': backfill['blockers'][0]['id'], 'blocker_ids': blockers, 'outcome': outcome,
+                  'reason': reason, 'in_flight': backfill['in_flight'] + backfill['taken'], 'cap': BACKFILL_MAX}
+        if _queue_receipt(state_path, 'backfill-decision', cand, now, **fields):
+            seen['loaded'][cand['id']] = dict(fields, id=cand['id'], ts=iso_utc(now))
+    except Exception:   # logging only: a failure here must never abort or change an advance (queue_advance catches only StateError, OSError)
+        return
 
 
 def _recent_backfill_shadow(path, pivot, cand, now):

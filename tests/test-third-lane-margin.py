@@ -153,6 +153,16 @@ class HeadProtection(Base):
         self.assertGreaterEqual(math['disk_left'], da.HEAVY_FLOOR)
         self.assertTrue(da._protects_head(*args, 292 * GIB, 40 * GIB, 2, 3)[0])
 
+    def test_a_margin_only_head_refusal_is_logged_with_its_own_reason(self):
+        self.shape()
+        with unittest.mock.patch.object(da, 'BACKFILL_ENABLED', True):
+            out = self.advance(free=290 * GIB)             # disk, lanes and tier all pass for the head: only its lane-3 margin refuses
+        self.assertEqual(out['backfilled'], [])
+        logged = [d for d in self.receipts('backfill-decision') if d['id'] == self.cand]
+        self.assertEqual([(d['outcome'], d['reason'], d['blocked_id']) for d in logged],
+                         [('refused', 'head-unprotected-lane3-margin', self.head)])
+        self.assertIn('head-unprotected-lane3-margin', da.BACKFILL_DECISION_REASONS)
+
     def test_the_same_candidate_is_backfilled_once_the_head_has_room(self):
         self.shape()
         self.assertEqual(self.advance(free=292 * GIB)['backfilled'], [self.cand])
