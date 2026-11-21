@@ -406,7 +406,7 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
 - `reserve`: a same-process refresh of its own reservation is exempt from the budget. The queue-ahead rule is unchanged.
 - `queue advance`: grants the head, then tries the next entry with the budget recomputed from the single host sample taken before the
   lock, and stops at the first entry that does not fit (the pivot). Grants made in the same call count toward the floor. `ok` also
-  covers a `budget:` reason. Bounded backfill (ADR 0017 revision 9, shipped OFF: `BACKFILL_ENABLED = False`, `BACKFILL_MAX = 1`) is
+  covers a `budget:` reason. Bounded backfill (ADR 0017 revisions 9 and 10, enabled: `BACKFILL_ENABLED = True`, `BACKFILL_MAX = 1`, `BACKFILL_GRANT_S = 600`, `BACKFILL_REQUEUE_MAX = 3`; the kill switch is reverting the one-line enabling PR, there is no flag or environment switch; only entries whose waiter declared `requeue_capable: true` are backfilled, so wrappers enqueued before #289 never are) is
   the only overtaking: when the pivot is the oldest waiting entry and its sole refusal is `excl_key overlap with <label>` held by the
   live reservation of a CLAIMED queue entry (not past its time limit, not unresolved; an orphan, unclaimed grant or non-queue
   reservation disqualifies), advance scans later entries in order for the first one that shares no exclusion key with the pivot or any

@@ -612,6 +612,19 @@ Preconditions still open before the enabling pull request:
    - only entries whose waiter declared the capability are backfilled (below).
 4. The enabling pull request itself, one line, reviewed on its own. Reverting it is the rollback.
 
+## Revision 10: bounded backfill enabled (SPE-176)
+
+`BACKFILL_ENABLED` is now `True` in `scripts/disk-admission.py`, by the one-line pull request revisions 9 and 9a reserved for it. Bounds are
+unchanged: `BACKFILL_MAX = 1`, `BACKFILL_GRANT_S = 600`, `BACKFILL_REQUEUE_MAX = 3`, runner protocol 2. Only entries whose waiter declared
+`requeue_capable: true` are backfilled; wrappers enqueued before the capability gate never are. `FOURTH_LANE_ENABLED` stays `False` and
+`LANE_CEILING` is unchanged. Rollback is reverting the enabling PR; there is still no flag file or environment switch.
+
+Evidence at enablement (2026-11-21): the first non-skipped capable shadow receipt (00:01:33Z) named candidate q000865 (docker,
+requeue-capable) behind head q000863, blocked only on the shared Cargo target held by claimed q000862, with band after GREEN, 118.7 GB free
+over a 107.4 GB floor, head projection under its limit and 2 of 2 lanes after; the 22 earlier receipts were all
+`skipped=no-requeue-capability`. Shadow receipts are not live backfill evidence. Two live transitions remain to be verified after merge,
+separately from the controlled tests: a compatible later job runs while the head waits, and the head starts once eligible.
+
 ## Version history
 
 | Rev | Change |
@@ -627,3 +640,4 @@ Preconditions still open before the enabling pull request:
 | 8 | Four-lane code shipped OFF (`FOURTH_LANE_ENABLED = False`, `FOUR_LANE_CEILING` 4): lane-4 capacity gates, `lane_protocol` queue stamp, `fits_if_cap_were_4`; enabling is a separate reviewed PR, rollback is its revert (SPE-176) |
 | 9 | Strict FIFO amended: bounded backfill past a head blocked only by an exclusion key held by a claimed running job, shipped OFF (`BACKFILL_ENABLED = False`, `BACKFILL_MAX = 1`); head protection from declared reservations, same-key order kept, `backfill` / `backfill-shadow` receipts (SPE-176) |
 | 9a | Backfill hardening, still OFF: exclusion keys compared by directory identity, with new keys in cargo's own target-dir order; head protection projects tier loss and the latch; claim-time re-check revokes a backfilled grant whose protection broke; `BACKFILL_GRANT_S` 600 s; all blockers in receipts; open preconditions listed. Later amended: wrappers re-queue a revoked or unclaimed-lapsed backfilled grant at its original FIFO position (`--requeue-of`, inherited `order`, chain cap 3); live shadow evidence recorded; only entries whose waiter declared `--requeue-capable` are backfilled (SPE-176) |
+| 10 | Bounded backfill enabled (`BACKFILL_ENABLED = True`; `BACKFILL_MAX = 1`, `BACKFILL_GRANT_S = 600`, `BACKFILL_REQUEUE_MAX = 3`, runner protocol 2); four-lane code unchanged (`FOURTH_LANE_ENABLED = False`); rollback is reverting the one-line PR (SPE-176) |

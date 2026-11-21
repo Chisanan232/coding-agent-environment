@@ -473,9 +473,9 @@ class Concurrency(Base):
         self.assertEqual(self.receipts('granted')[0]['memory_gate'], 'admitted')
 
 
-class ShippedOff(Base):
-    def test_shipped_off_with_a_cap_of_one(self):
-        self.assertIs(SHIPPED_BACKFILL_ENABLED, False)
+class ShippedOn(Base):
+    def test_shipped_on_with_a_cap_of_one(self):
+        self.assertIs(SHIPPED_BACKFILL_ENABLED, True)
         self.assertEqual(SHIPPED_BACKFILL_MAX, 1)
         self.assertEqual(da.RUNNER_PROTOCOL, 2)
 
