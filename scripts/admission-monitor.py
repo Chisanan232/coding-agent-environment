@@ -1575,6 +1575,13 @@ def inventory(root):
             continue
         proto = re.search(r'^RUNNER_PROTOCOL = (\d+)', text, re.M)
         lanes = re.search(r"^HEAVY_LANES = \{[^}]*'stable': (\d+)", text, re.M)
+        # The effective stable cap, as heavy_lane_cap() computes it: the table is only the two-lane base, and a copy gains the third
+        # lane there when it enables it and lists 'stable' in THIRD_LANE_TIERS (ADR 0017 rev 12). A copy without that constant never
+        # gave the stable tier a third lane.
+        third = re.search(r'^THIRD_LANE_ENABLED = True\b', text, re.M)
+        tiers = re.search(r'^THIRD_LANE_TIERS = \(([^)]*)\)', text, re.M)
+        stable_cap = (int(lanes.group(1)) + (1 if lanes and third and tiers and re.search(r"'stable'", tiers.group(1)) else 0)
+                      if lanes else None)
         kind = ('current' if proto else 'memory-gated-advance-unstamped' if 'memory_fn' in text else 'outdated')
         # Bounded backfill (ADR 0017 rev 9): every poller copy must carry the same revision before it is enabled. `hardened` is the
         # SPE-176 follow-up (claim-time head re-check, BACKFILL_GRANT_S window); `absent` predates backfill entirely.
@@ -1582,7 +1589,7 @@ def inventory(root):
         backfill = ('absent' if not enabled else ('on' if enabled.group(1) == 'True' else 'off')
                     + ('-hardened' if re.search(r'^BACKFILL_GRANT_S = \d+', text, re.M) else ''))
         found.append({'checkout': path.parent.parent.name, 'protocol': int(proto.group(1)) if proto else 0,
-                      'stable_lanes': int(lanes.group(1)) if lanes else None, 'kind': kind, 'backfill': backfill})
+                      'stable_lanes': stable_cap, 'kind': kind, 'backfill': backfill})
     return found
 
 
