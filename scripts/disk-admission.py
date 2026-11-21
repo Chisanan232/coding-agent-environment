@@ -3652,21 +3652,25 @@ def _log_backfill_decision(state_path, backfill, cand, now, outcome, reason):
 
     Only while BACKFILL_ENABLED (the OFF path keeps its shadow receipts). Written only when (head, candidate, outcome, reason, blocker set)
     differs from the newest line inside BACKFILL_SHADOW_WINDOW_S, so an unchanged refusal is logged once per window rather than once per
-    poll. Pure logging: it reads the receipt tail and appends one line, and no admission decision depends on either."""
-    if not BACKFILL_ENABLED:
+    poll. Pure logging: it reads the receipt tail and appends one line, no admission decision depends on either, and any failure of
+    either is swallowed so the decision it describes is never affected."""
+    try:
+        if not BACKFILL_ENABLED:
+            return
+        reason = reason if reason in BACKFILL_DECISION_REASONS else 'other'
+        blockers = sorted(b['id'] for b in backfill['blockers'])
+        seen = backfill.setdefault('decisions', {})
+        if 'loaded' not in seen:   # one tail read per pass, and the lines this pass writes are added below
+            seen['loaded'] = _backfill_decisions(queue_dir(state_path) / 'receipts.jsonl', backfill['pivot'], now)
+        last = seen['loaded'].get(cand['id'])
+        if last and (last.get('outcome'), last.get('reason'), last.get('blocker_ids')) == (outcome, reason, blockers):
+            return
+        fields = {'blocked_id': backfill['pivot'], 'blocker_id': backfill['blockers'][0]['id'], 'blocker_ids': blockers, 'outcome': outcome,
+                  'reason': reason, 'in_flight': backfill['in_flight'] + backfill['taken'], 'cap': BACKFILL_MAX}
+        if _queue_receipt(state_path, 'backfill-decision', cand, now, **fields):
+            seen['loaded'][cand['id']] = dict(fields, id=cand['id'], ts=iso_utc(now))
+    except Exception:   # logging only: a failure here must never abort or change an advance (queue_advance catches only StateError, OSError)
         return
-    reason = reason if reason in BACKFILL_DECISION_REASONS else 'other'
-    blockers = sorted(b['id'] for b in backfill['blockers'])
-    seen = backfill.setdefault('decisions', {})
-    if 'loaded' not in seen:   # one tail read per pass, and the lines this pass writes are added below
-        seen['loaded'] = _backfill_decisions(queue_dir(state_path) / 'receipts.jsonl', backfill['pivot'], now)
-    last = seen['loaded'].get(cand['id'])
-    if last and (last.get('outcome'), last.get('reason'), last.get('blocker_ids')) == (outcome, reason, blockers):
-        return
-    fields = {'blocked_id': backfill['pivot'], 'blocker_id': backfill['blockers'][0]['id'], 'blocker_ids': blockers, 'outcome': outcome,
-              'reason': reason, 'in_flight': backfill['in_flight'] + backfill['taken'], 'cap': BACKFILL_MAX}
-    if _queue_receipt(state_path, 'backfill-decision', cand, now, **fields):
-        seen['loaded'][cand['id']] = dict(fields, id=cand['id'], ts=iso_utc(now))
 
 
 def _recent_backfill_shadow(path, pivot, cand, now):
