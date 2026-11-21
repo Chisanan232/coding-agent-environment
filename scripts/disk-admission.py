@@ -316,6 +316,11 @@ HEAVY_LANES = {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 2}
 # rollback. LANE_CEILING is the most that flag, or any edit of HEAVY_LANES, can ever yield.
 LANE_CEILING = 3
 THIRD_LANE_ENABLED = True
+# The tiers whose cap gains the third lane while THIRD_LANE_ENABLED (ADR 0017 revision 12: the stable tier joined the wide tier).
+# HEAVY_LANES stays the two-lane base so that flag remains the one-line kill switch for lane 3 in every tier. In the stable tier
+# (free below 200 GiB) THIRD_LANE_MARGIN still needs free - reserved - request >= HEAVY_FLOOR + 60 GiB, so lane 3 opens there only
+# while reservations plus the request stay within 40 GiB.
+THIRD_LANE_TIERS = ('stable', 'wide')
 # Class-aware third lane (SPE-160, shadow only): the classes a third lane could admit, each at the least it needs. light holds no
 # memory or cpu slots; build-crate is granted its class min_jobs. This only feeds the trial report; it does not decide admission.
 # With THIRD_LANE_ENABLED the resource budget alone gates a third lane, whatever its class.
@@ -338,13 +343,13 @@ LANE_PROTOCOL = 4
 
 def heavy_lane_cap(tier, latch=False):
     """Heavy lanes allowed at `tier`: 0 while latched or below stable, else HEAVY_LANES[tier], plus one for the wide tier once the
-    third lane is enabled (and one more with the fourth), never above LANE_CEILING (FOUR_LANE_CEILING in four-lane mode). The one place a lane count is decided."""
+    third lane is enabled (a tier in THIRD_LANE_TIERS), and one more in the wide tier with the fourth, never above LANE_CEILING (FOUR_LANE_CEILING in four-lane mode). The one place a lane count is decided."""
     if latch:
         return 0
     lanes = HEAVY_LANES.get(tier, 0)
-    if lanes and tier == 'wide' and THIRD_LANE_ENABLED:
+    if lanes and THIRD_LANE_ENABLED and tier in THIRD_LANE_TIERS:
         lanes += 1
-        if FOURTH_LANE_ENABLED:
+        if FOURTH_LANE_ENABLED and tier == 'wide':
             lanes += 1
     return min(lanes, FOUR_LANE_CEILING if _four_lane_mode() else LANE_CEILING)
 
