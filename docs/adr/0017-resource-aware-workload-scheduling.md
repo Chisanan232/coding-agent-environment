@@ -638,6 +638,34 @@ outcome, reason or blocker set changed or `BACKFILL_SHADOW_WINDOW_S` (10 minutes
 lock or ordering depends on it, and any failure inside the logger is swallowed. A candidate refused for `no-requeue-capability` still gets its `backfill-shadow` receipt as well, and a
 grant still gets its `backfill` receipt. `in-flight-cap` names the first entry behind the head, the one backfill would have tried first.
 
+## Revision 11: lane-3 disk margin (SPE-176)
+
+Founder instruction (2026-11-21): allow up to three concurrent heavy workloads when the actual job mix fits, preserving the 100 GiB disk
+floor, an explicit disk margin, the CPU and memory limits, the exclusion keys and head-job protection, counting each reservation exactly
+once, with lane four off.
+
+Current state: a third lane (the wide tier only, `heavy_lane_cap` unchanged) is admitted only when `free - reserved - request >= HEAVY_FLOOR +
+THIRD_LANE_MARGIN`, that is 100 GiB + 60 GiB = 160 GiB left once every reservation and the request are counted. `THIRD_LANE_MARGIN` is the
+free-disk margin the revision 3 and 6 trial criteria already require of an overlap (`TRIAL_CRITERIA['free_margin_bytes']`). The rule is one pure
+helper, `_third_lane_refusal`, called from `_lane_refusal` (so `reserve`, `queue advance`, `queue claim`, the backfill candidate, pivot
+qualification and the claim-time protection re-check all apply it; a same-process refresh of a held lane stays exempt) and from
+`_protects_head` for the lane the head takes once its blockers release, so a candidate cannot be judged head-protective and the head then be
+refused at lane 3. A margin-only head refusal is logged in the revision 10a decision log as `head-unprotected-lane3-margin` (decisions unchanged). The refusal text is `budget: lane 3 needs N GiB free after all reservations and this request, 160 GiB required`. Lanes 1 and
+2, the CPU and memory budget, band gates, exclusion keys, `BACKFILL_MAX`, `THIRD_LANE_ENABLED`, `FOURTH_LANE_ENABLED = False` and `LANE_CEILING` are
+unchanged.
+
+Effect: this tightens the wide-tier pilot of revision 7, which until now needed only the floor. Below 200 GiB free (the stable tier, 100 to under 200 GiB; the
+recent measured 160 to 184 GiB is an observation within it) there is no third lane before or after. A third lane needs a wide-tier host (200 GiB or more free) with room for the whole job mix, at least about 260 GiB
+free for a 40 + 35 + 25 GiB mix (100 GiB reserved plus the 160 GiB left; the 200 GiB tier threshold also applies), or isolated Cargo targets that shrink the reservations. 60 GiB is a proposed value the founder can change.
+
+Reservation accounting, verified by reading: `queue advance` counts live, granted and orphaned reservations once each; `queue claim` counts live and
+orphans and excludes every other unclaimed grant (the claimant's own grant is not double counted; other grants were counted when they were
+granted, so the claim-time margin is the more lenient view); the protection re-check adds the other grants and excludes the claimant, which
+`_protects_head` then charges once as the candidate. No double count was found. Lane 4 has the same head-protection gap and is left unchanged
+while it is off; it needs the same hook before it is ever enabled.
+
+Rollback is reverting the pull request. `scripts/admission-monitor.py` reads `HEAVY_LANES` by regular expression and does not know the margin.
+
 ## Version history
 
 | Rev | Change |
@@ -655,3 +683,4 @@ grant still gets its `backfill` receipt. `in-flight-cap` names the first entry b
 | 9a | Backfill hardening, still OFF: exclusion keys compared by directory identity, with new keys in cargo's own target-dir order; head protection projects tier loss and the latch; claim-time re-check revokes a backfilled grant whose protection broke; `BACKFILL_GRANT_S` 600 s; all blockers in receipts; open preconditions listed. Later amended: wrappers re-queue a revoked or unclaimed-lapsed backfilled grant at its original FIFO position (`--requeue-of`, inherited `order`, chain cap 3); live shadow evidence recorded; only entries whose waiter declared `--requeue-capable` are backfilled (SPE-176) |
 | 10 | Bounded backfill enabled (`BACKFILL_ENABLED = True`; `BACKFILL_MAX = 1`, `BACKFILL_GRANT_S = 600`, `BACKFILL_REQUEUE_MAX = 3`, runner protocol 2); four-lane code unchanged (`FOURTH_LANE_ENABLED = False`); rollback is reverting the one-line PR (SPE-176) |
 | 10a | `backfill-decision` receipt: candidate, head, outcome and one closed-vocabulary reason, deduplicated per 10 minutes; logging only (SPE-176) |
+| 11 | Lane-3 disk margin: a third lane needs `THIRD_LANE_MARGIN` (60 GiB) beyond the heavy floor after all reservations and the request, at every lane site and in head protection; lanes 1, 2 and 4, budget, exclusion keys and caps unchanged (SPE-176) |

@@ -997,10 +997,10 @@ class Reservations(unittest.TestCase):
             for worker in workers:
                 worker.join()
         self.assertEqual(len(results), 8)
-        # 200 - 3 * 30 = 110 >= 100 but a fourth would leave 80: exactly three fit.
-        self.assertEqual(sum(1 for result in results if result['admit']), 3)
+        # 200 - 2 * 30 = 140 and a third would leave 110: above the 100 GiB floor but under the 160 GiB lane-3 margin, so exactly two fit.
+        self.assertEqual(sum(1 for result in results if result['admit']), 2)
         live, problems = self.live()
-        self.assertEqual((len(live), problems), (3, []))
+        self.assertEqual((len(live), problems), (2, []))
         self.assertEqual(sorted(entry.name for entry in (self.path.parent / 'reservations').iterdir()),
                          sorted(record['label'] + '.json' for record in live))
 

@@ -1036,8 +1036,9 @@ class DecisionLog(Base):
             self.running('blocker', 'build-workspace', [SHARED], 40, cpus=2)
             self.running('other', 'build-workspace', [LOCAL], 40, cpus=2)
             self.enqueue('head', 'build-workspace', [SHARED], 20, cpus=2)
-            # free 250 falls to the stable tier (2 lanes) once 80 reserved and the 40 candidate are counted: 2 in use + 1 - 1 blocker >= 2
-            return self.enqueue('cand', 'container-suite', ['docker'], 40, cpus=2), {'free': 250 * GIB}
+            # free 300 falls to the stable tier (2 lanes) once 80 reserved and the 40 candidate are counted: 2 in use + 1 - 1 blocker >= 2.
+            # 300 also meets the lane-3 margin for the head (300 - 80 - 40 - 20 = 160) and the candidate, so only the lane count refuses.
+            return self.enqueue('cand', 'container-suite', ['docker'], 40, cpus=2), {'free': 300 * GIB}
         if which == 'head-unprotected-budget':
             self.running('blocker', 'build-workspace', [SHARED], 25, cpus=2)
             self.running('other', 'build-workspace', [LOCAL], 25, cpus=4)

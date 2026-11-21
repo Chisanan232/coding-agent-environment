@@ -328,6 +328,9 @@ FOURTH_LANE_ENABLED = False
 FOUR_LANE_CEILING = 4
 # Lane 4 also needs this much free space left once every reservation and the request are counted (still the wide tier).
 FOURTH_LANE_MARGIN = 200 * 1024 ** 3
+# Lane 3 (SPE-176, ADR 0017 revision 11) also needs this much beyond the heavy floor left once every reservation and the request are
+# counted: the same floor-plus-60-GiB the trial criteria already demand of an overlap (TRIAL_CRITERIA['free_margin_bytes']).
+THIRD_LANE_MARGIN = 60 * 1024 ** 3
 # Queue entries carry this extra field when the enqueuing code knows the four-lane rules. It is not part of the grant object, the
 # fingerprint or RUNNER_PROTOCOL: an older caller simply lacks it and is never given lane 3 or 4 while the mode is on.
 LANE_PROTOCOL = 4
@@ -3422,13 +3425,25 @@ def _fourth_lane_refusal(budget, in_use, free, reserved, nbytes):
     return 'budget: lane 4 needs ' + '; '.join(unmet) if unmet else None
 
 
+def _third_lane_refusal(lane, free, reserved, nbytes):
+    """Why lane 3 is refused for want of disk margin, or None: the free space left after every reservation and this request must stay
+    at or above HEAVY_FLOOR + THIRD_LANE_MARGIN. Any other lane is None. Pure: no I/O, no latch, independent of the host sample."""
+    if lane != 3:
+        return None
+    left, need = free - reserved - nbytes, HEAVY_FLOOR + THIRD_LANE_MARGIN
+    if left >= need:
+        return None
+    return 'budget: lane 3 needs %.1f GiB free after all reservations and this request, %.0f GiB required' % (left / GIB, need / GIB)
+
+
 def _lane_refusal(budget, in_use, free, reserved, nbytes, entry=None):
     """The one budget-side refusal at a lane site. With four-lane mode on, lanes 3 and 4 are given only to a stamped queue entry
     (an unstamped head blocks the queue: first in, first out beats utilisation); lane 4 also needs _fourth_lane_refusal's capacity.
-    Otherwise exactly _budget_refusal."""
+    Lane 3 needs _third_lane_refusal's disk margin in every mode. Otherwise exactly _budget_refusal."""
     if _four_lane_mode() and entry is not None and in_use >= 2 and not _stamped(entry):
         return 'budget: lane %d needs a stamped runner (head %s)' % (in_use + 1, entry.get('id', '?'))
-    return _fourth_lane_refusal(budget, in_use, free, reserved, nbytes) or _budget_refusal(budget, in_use)
+    return (_fourth_lane_refusal(budget, in_use, free, reserved, nbytes) or _third_lane_refusal(in_use + 1, free, reserved, nbytes)
+            or _budget_refusal(budget, in_use))
 
 
 def _excl_only_blockers(budget, in_use, lanes, floor_ok, free, reserved, entry, live, entries):
@@ -3494,6 +3509,9 @@ def _protects_head(host, head, cand, blockers, live, orphans, granted, now, lane
             'head_projected': None, 'head_limit': None, 'head_cpu': None, 'cpu_limit': None}
     cap = math['cap'] = min(lanes, lanes_after, heavy_lane_cap(lane_tier, latch))
     ok = math['disk_left'] >= HEAVY_FLOOR and in_use + 1 - len(blockers) < cap
+    # The head takes the lane after the candidate's, once the blockers have released: the same lane-3 disk margin must hold for it,
+    # or a candidate could be judged protective and the head then refused at lane 3 (starvation).
+    ok = ok and not _third_lane_refusal(in_use + 2 - len(blockers), free, reserved + cand['bytes'], head['bytes'])
     try:
         gone = {b['label'] for b in blockers}
         holders = [h for h in budget_holders(live, orphans, granted, now) if not (h['kind'] == 'reservation' and h['label'] in gone)]
@@ -3610,16 +3628,18 @@ def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans,
 # The closed vocabulary of `backfill-decision` reasons, one per refusal site of a backfill candidate (SPE-176 decision log). `qualified`
 # is the grant; `memory-gate` and `in-flight-cap` are the refusals made by advance itself rather than by _backfill_candidate.
 BACKFILL_DECISION_REASONS = ('qualified', 'key-overlap-pivot', 'key-overlap-skipped', 'no-requeue-capability', 'waiter-not-alive', 'disk-floor',
-                             'lane-refusal', 'head-unprotected-disk', 'head-unprotected-lanes', 'head-unprotected-budget', 'memory-gate',
-                             'in-flight-cap', 'other')
+                             'lane-refusal', 'head-unprotected-disk', 'head-unprotected-lanes', 'head-unprotected-lane3-margin', 'head-unprotected-budget',
+                             'memory-gate', 'in-flight-cap', 'other')
 
 
 def _head_unprotected_part(math, blockers):
-    """Which part of _protects_head refused, from the figures it returns: disk first, then lanes, else the budget (memory, CPU, band)."""
+    """Which part of _protects_head refused, from the figures it returns: disk first, then lanes, then the lane-3 margin, else the budget (memory, CPU, band)."""
     if math['disk_left'] < HEAVY_FLOOR:
         return 'head-unprotected-disk'
     if math['in_use'] + 1 - len(blockers) >= math['cap']:
         return 'head-unprotected-lanes'
+    if _third_lane_refusal(math['in_use'] + 2 - len(blockers), math['free'], math['reserved'] + math['cand_bytes'], math['head_bytes']):
+        return 'head-unprotected-lane3-margin'
     return 'head-unprotected-budget'
 
 

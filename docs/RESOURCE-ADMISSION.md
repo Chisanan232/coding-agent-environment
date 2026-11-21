@@ -15,7 +15,7 @@ subagent fan-out. Run `scripts/memory-admission.py check --weight heavy` first; 
 | Physical RAM and compressed memory | `hw.memsize`, `vm_stat` "occupied by compressor" | A large compressor share means the machine is already holding memory it cannot drop cheaply |
 | Swap used **and** sustained swap I/O | `vm.swapusage`, swapins+swapouts over a measured window | Used swap alone is history; the I/O rate is current behaviour |
 | Disk and swap-growth headroom | free bytes of the Data volume | Swap files grow on that volume; a full disk means swap cannot grow |
-| Active build/test processes | `ps` pid, ppid, state, elapsed and CPU time, %cpu, rss and the executable name (`cargo`, `rustc`, `clang`, `ld`, `xcodebuild`, ...); never the command line | Up to two heavy lanes, a third as a pilot (each beyond the first only when the resource budget passes; ADR 0017 revisions 2 and 7), counted as a process tree (workload), not per process; see "Idle orphans" below |
+| Active build/test processes | `ps` pid, ppid, state, elapsed and CPU time, %cpu, rss and the executable name (`cargo`, `rustc`, `clang`, `ld`, `xcodebuild`, ...); never the command line | Up to two heavy lanes, a third as a pilot (each beyond the first only when the resource budget passes, the third also needing the disk margin; ADR 0017 revisions 2, 7 and 11), counted as a process tree (workload), not per process; see "Idle orphans" below |
 | Load per core | `getloadavg` / CPU count | Scheduler saturation that RAM numbers do not show |
 | Reservations and ownership | the existing `disk-admission.py` gate (reserve, lane cap, process identity) | Task ownership already lives there; it is not duplicated |
 
@@ -69,7 +69,7 @@ detection matches executable names only; it targets macOS. Wiring it into `disk-
 
 ## 4. Concurrency
 
-Up to two admitted heavy lanes, as the resource governor allows (the second only when the resource budget passes; a third runs as a pilot behind `THIRD_LANE_ENABLED`, still only when the budget passes; [ADR 0017](adr/0017-resource-aware-workload-scheduling.md) revision 2). Do not start competing Cargo workspace builds, Docker
+Up to two admitted heavy lanes, as the resource governor allows (the second only when the resource budget passes; a third runs as a pilot behind `THIRD_LANE_ENABLED`, still only when the budget passes and 160 GiB (floor plus a 60 GiB margin) stays free after all reservations and the request; [ADR 0017](adr/0017-resource-aware-workload-scheduling.md) revision 2). Do not start competing Cargo workspace builds, Docker
 suites, native QA or full E2E; lower subagent fan-out while pressure is not normal (the seven-subagent cap is a ceiling, not a
 target). Prefer reusable build artifacts and isolated targets inside the budget. Never kill another active session, and never delete
 its worktree, runtime, cache, container or reservation.
@@ -430,7 +430,7 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
     `backfill-decision` receipt: `id`/`label` (candidate), `blocked_id` (head), `blocker_id`/`blocker_ids`, `outcome` (`granted` or
     `refused`), `reason`, `in_flight`, `cap`. `reason` is one of `qualified`, `key-overlap-pivot`, `key-overlap-skipped`,
     `no-requeue-capability`, `waiter-not-alive`, `disk-floor`, `lane-refusal`, `head-unprotected-disk`, `head-unprotected-lanes`,
-    `head-unprotected-budget`, `memory-gate`, `in-flight-cap`, `other`. An unchanged (head, candidate, outcome, reason, blocker set) is
+    `head-unprotected-lane3-margin`, `head-unprotected-budget`, `memory-gate`, `in-flight-cap`, `other`. `head-unprotected-lane3-margin` is a head whose own lane 3 would stay under the 160 GiB margin while the disk floor, the lane count and the tier all pass (see "Third lane disk margin"). An unchanged (head, candidate, outcome, reason, blocker set) is
     not written again for 10 minutes. Logging only: it changes no decision, and a failure of the logger itself is swallowed. `other` is
     never emitted by the shipped code paths; it is how an unknown reason would be recorded, so the vocabulary stays closed.
 - `queue claim` of a backfilled grant (a GRANTED entry with an earlier unlapsed waiting entry) re-checks head protection against the
@@ -510,6 +510,15 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
   [--json]` (read-only, writes nothing, takes no lock). Measurement lines also carry `swap_used_bytes`. A third lane needs its PASS
   output, with the criteria of ADR 0017 revision 3 (exact-N stage gates, overlap-window disk margin, running-only deduplicated
   `fits_if_cap_were_3`; the window-wide minimum free disk is reported, not gated) and the rollback procedure of revision 2.
+
+## Third lane disk margin
+
+A third heavy lane (wide tier, ADR 0017 revision 11) needs, besides the budget, `free - reserved - request >= 160 GiB` (`HEAVY_FLOOR` plus
+`THIRD_LANE_MARGIN`, 60 GiB), with every live, granted and orphaned reservation counted once. It applies at `reserve` (a same-process refresh
+is exempt), `queue advance`, `queue claim`, backfill candidates and head protection (the head's own lane 3 once its blockers release). The
+refusal reads `budget: lane 3 needs N GiB free after all reservations and this request, 160 GiB required`. Lanes 1 and 2 and lane 4 are
+unaffected. Below 200 GiB free (the stable tier; the recent measured 160 to 184 GiB is within it) no third lane exists with or without the margin. `scripts/admission-monitor.py` does not
+model the margin.
 
 ## Four heavy lanes (shipped off)
 
