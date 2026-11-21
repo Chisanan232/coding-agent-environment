@@ -3694,7 +3694,23 @@ def _log_backfill_decision(state_path, backfill, cand, now, outcome, reason):
                   'reason': reason, 'in_flight': backfill['in_flight'] + backfill['taken'], 'cap': BACKFILL_MAX}
         if _queue_receipt(state_path, 'backfill-decision', cand, now, **fields):
             seen['loaded'][cand['id']] = dict(fields, id=cand['id'], ts=iso_utc(now))
-    except Exception:   # logging only: a failure here must never abort or change an advance (queue_advance catches only StateError, OSError)
+    except Exception as failure:   # logging only: a failure here must never abort or change an advance (queue_advance catches only StateError, OSError)
+        _report_backfill_log_failure(failure)
+
+
+_BACKFILL_LOG_FAILURES_REPORTED = set()
+
+
+def _report_backfill_log_failure(failure):
+    """Debug aid for the swallowed failure above: with ADMISSION_DEBUG set, one stderr line per exception type per process; silent by default.
+    It touches no admission state and never raises, so it cannot change a decision."""
+    try:
+        kind = type(failure).__name__
+        if not os.environ.get('ADMISSION_DEBUG') or kind in _BACKFILL_LOG_FAILURES_REPORTED:
+            return
+        _BACKFILL_LOG_FAILURES_REPORTED.add(kind)
+        sys.stderr.write('disk-admission: backfill-decision log failed (%s): %s\n' % (kind, str(failure)[:200]))
+    except Exception:
         return
 
 
