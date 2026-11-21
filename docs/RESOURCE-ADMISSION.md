@@ -431,7 +431,8 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
     `refused`), `reason`, `in_flight`, `cap`. `reason` is one of `qualified`, `key-overlap-pivot`, `key-overlap-skipped`,
     `no-requeue-capability`, `waiter-not-alive`, `disk-floor`, `lane-refusal`, `head-unprotected-disk`, `head-unprotected-lanes`,
     `head-unprotected-budget`, `memory-gate`, `in-flight-cap`, `other`. An unchanged (head, candidate, outcome, reason, blocker set) is
-    not written again for 10 minutes. Logging only: it changes no decision.
+    not written again for 10 minutes. Logging only: it changes no decision, and a failure of the logger itself is swallowed. `other` is
+    never emitted by the shipped code paths; it is how an unknown reason would be recorded, so the vocabulary stays closed.
 - `queue claim` of a backfilled grant (a GRANTED entry with an earlier unlapsed waiting entry) re-checks head protection against the
   oldest waiting entry.
   - If protection no longer holds, the grant is withdrawn: the entry becomes `EXPIRED`, a `backfill-revoked` receipt records the kind

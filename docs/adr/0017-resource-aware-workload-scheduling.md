@@ -635,7 +635,7 @@ protection disk check: 180.0 GiB free minus 32 GiB reserved by the running docke
 One `backfill-decision` receipt now records, per (head, candidate), the outcome (`granted` or `refused`) and one reason from the closed
 set `BACKFILL_DECISION_REASONS`, one value per refusal site. It is written only while `BACKFILL_ENABLED`, and again only when the
 outcome, reason or blocker set changed or `BACKFILL_SHADOW_WINDOW_S` (10 minutes) passed. It is logging only: no admission decision,
-lock or ordering depends on it. A candidate refused for `no-requeue-capability` still gets its `backfill-shadow` receipt as well, and a
+lock or ordering depends on it, and any failure inside the logger is swallowed. A candidate refused for `no-requeue-capability` still gets its `backfill-shadow` receipt as well, and a
 grant still gets its `backfill` receipt. `in-flight-cap` names the first entry behind the head, the one backfill would have tried first.
 
 ## Version history
