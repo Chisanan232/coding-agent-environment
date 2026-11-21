@@ -738,24 +738,49 @@ class KeyIdentity(Base):
 
 class HeadProtection(Base):
     def test_a_candidate_that_would_shrink_the_tier_below_the_heads_lanes_is_refused(self):
-        """Wide (3 lanes) now; free - reservations - candidate falls to stable (2 lanes): blocker gone, other + candidate + head = 3."""
+        """Tier-drop logic, with the stable tier held at two lanes (THIRD_LANE_TIERS = wide only, the pre-revision-12 table).
+
+        Wide (3 lanes) now; free - reservations - candidate falls to stable (2 lanes): blocker gone, other + candidate + head = 3.
+        The shipped rules put three lanes in the stable tier too, so the same shape is protected by the lane-3 margin instead (next test)."""
         self.running('blocker', 'build-workspace', [SHARED], 40)
         self.running('other', 'build-crate', [LOCAL], 10)
         head = self.enqueue('head', 'build-crate', [SHARED], 10)
         docker = self.enqueue('docker', 'container-suite', ['docker'], 20)
-        with backfill():
+        with backfill(), unittest.mock.patch.object(da, 'THIRD_LANE_TIERS', ('wide',)):
             out = self.advance(free=260 * GIB)            # 260 - 50 - 20 = 190 GiB: stable; disk_left 180 GiB passes the floor
-        self.assertEqual(out['head_reason'], 'budget: excl_key overlap with blocker')
-        self.assertEqual(out['backfilled'], [])
-        self.assertEqual(self.state(docker), 'QUEUED')
-        entries = self.entries()
-        live, _ = da.live_reservations(self.path, self.now)
-        ok, math = da._protects_head(self.host(), entries[head], entries[docker], [{'label': 'blocker'}], live, [], [], self.now, 'wide',
-                                     260 * GIB, 50 * GIB, 2, 3)
-        self.assertFalse(ok)
-        self.assertEqual((math['tier_after'], math['lanes_after'], math['disk_left']), ('stable', 2, 180 * GIB))
+            self.assertEqual(out['head_reason'], 'budget: excl_key overlap with blocker')
+            self.assertEqual(out['backfilled'], [])
+            self.assertEqual(self.state(docker), 'QUEUED')
+            entries = self.entries()
+            live, _ = da.live_reservations(self.path, self.now)
+            ok, math = da._protects_head(self.host(), entries[head], entries[docker], [{'label': 'blocker'}], live, [], [], self.now,
+                                         'wide', 260 * GIB, 50 * GIB, 2, 3)
+            self.assertFalse(ok)
+            self.assertEqual((math['tier_after'], math['lanes_after'], math['disk_left']), ('stable', 2, 180 * GIB))
         with backfill():
             self.assertEqual(self.advance(free=300 * GIB)['backfilled'], [docker], '300 - 70 = 230 GiB stays wide')
+
+    def test_in_the_stable_tier_a_tier_drop_keeps_three_lanes_and_the_lane3_margin_protects_the_head(self):
+        """Revision 12: stable allows three lanes, so falling from wide to stable no longer removes the head's lane; what still refuses a
+        candidate is the head's own lane-3 disk margin, and a candidate that leaves the margin intact is backfilled (no starvation)."""
+        for head_gib, expect_ok in ((10, True), (35, False)):
+            with self.subTest(head_gib=head_gib):
+                self.reap()
+                self.setUp()
+                self.running('blocker', 'build-workspace', [SHARED], 40)
+                self.running('other', 'build-crate', [LOCAL], 10)
+                head = self.enqueue('head', 'build-crate', [SHARED], head_gib)
+                docker = self.enqueue('docker', 'container-suite', ['docker'], 20)
+                with backfill():
+                    out = self.advance(free=260 * GIB)        # 260 - 50 - 20 = 190 GiB: the stable tier, three lanes
+                    entries = self.entries()
+                    live, _ = da.live_reservations(self.path, self.now)
+                    ok, math = da._protects_head(self.host(), entries[head], entries[docker], [{'label': 'blocker'}], live, [], [], self.now,
+                                                 'wide', 260 * GIB, 50 * GIB, 2, 3)
+                self.assertEqual((math['tier_after'], math['lanes_after']), ('stable', 3))
+                self.assertEqual(ok, expect_ok, math)
+                # margin for the head: 260 - (50 + 20) - head >= 160  <=>  head <= 30 GiB
+                self.assertEqual(out['backfilled'], [docker] if expect_ok else [])
 
     def test_the_disk_latch_is_carried_into_the_projection(self):
         self.historical()
@@ -1052,7 +1077,9 @@ class DecisionLog(Base):
                 self.reap()
                 self.setUp()
                 cand, kwargs = self.reason_for(which)
-                with backfill():
+                # The stable tier is held at two lanes for the lane-count reason: with three (revision 12) a tier drop alone never refuses.
+                tiers = ('wide',) if which == 'head-unprotected-lanes' else da.THIRD_LANE_TIERS
+                with backfill(), unittest.mock.patch.object(da, 'THIRD_LANE_TIERS', tiers):
                     out = self.advance(**kwargs)
                 self.assertEqual(out['backfilled'], [], out)
                 got = [d['reason'] for d in self.decisions() if d['id'] == cand]

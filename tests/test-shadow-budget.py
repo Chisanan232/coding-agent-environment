@@ -619,39 +619,42 @@ class HeavyLaneCap(unittest.TestCase):
         self.assertEqual((da.heavy_lane_cap('emergency'), da.heavy_lane_cap('low'), da.heavy_lane_cap(None)), (0, 0, 0))
         self.assertEqual(da.LANE_CEILING, 3)
 
-    def test_the_shipped_third_lane_value_gives_the_wide_tier_three_and_stable_two(self):
+    def test_the_shipped_third_lane_value_gives_the_stable_and_wide_tiers_three(self):
         self.assertTrue(SHIPPED_THIRD_LANE_ENABLED)          # the pilot flip; reverting it is the rollback
         with unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', SHIPPED_THIRD_LANE_ENABLED):
-            self.assertEqual({t: da.heavy_lane_cap(t) for t in da.HEAVY_LANES}, {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 3})
+            self.assertEqual({t: da.heavy_lane_cap(t) for t in da.HEAVY_LANES}, {'emergency': 0, 'low': 0, 'stable': 3, 'wide': 3})
             self.assertEqual(da.heavy_lane_cap('wide', True), 0)
+            self.assertEqual(da.heavy_lane_cap('stable', True), 0)
 
     def test_the_fourth_lane_ships_off_and_the_shipped_cap_is_unchanged(self):
         self.assertIs(SHIPPED_FOURTH_LANE_ENABLED, False)    # enabling is a separate reviewed one-line PR; reverting it is the rollback
         self.assertEqual((da.LANE_CEILING, da.FOUR_LANE_CEILING), (3, 4))
         with unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', SHIPPED_THIRD_LANE_ENABLED), \
                 unittest.mock.patch.object(da, 'FOURTH_LANE_ENABLED', SHIPPED_FOURTH_LANE_ENABLED):
-            self.assertEqual({t: da.heavy_lane_cap(t) for t in da.HEAVY_LANES}, {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 3})
+            self.assertEqual({t: da.heavy_lane_cap(t) for t in da.HEAVY_LANES}, {'emergency': 0, 'low': 0, 'stable': 3, 'wide': 3})
 
     def test_the_cap_is_four_only_with_both_flags_and_only_on_the_wide_tier(self):
         table = {'stable': 2, 'wide': 2}
-        for third, fourth, wide in ((False, False, 2), (True, False, 3), (False, True, 2), (True, True, 4)):
+        # stable: 2 without the third lane, 3 with it, and never 4 (the fourth lane is wide-only)
+        for third, fourth, stable, wide in ((False, False, 2, 2), (True, False, 3, 3), (False, True, 2, 2), (True, True, 3, 4)):
             with unittest.mock.patch.dict(da.HEAVY_LANES, table), unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', third), \
                     unittest.mock.patch.object(da, 'FOURTH_LANE_ENABLED', fourth):
-                self.assertEqual((da.heavy_lane_cap('stable'), da.heavy_lane_cap('wide')), (2, wide), (third, fourth))
+                self.assertEqual((da.heavy_lane_cap('stable'), da.heavy_lane_cap('wide')), (stable, wide), (third, fourth))
         with unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 9, 'wide': 9}), unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', True), \
                 unittest.mock.patch.object(da, 'FOURTH_LANE_ENABLED', True):
-            self.assertEqual((da.heavy_lane_cap('stable'), da.heavy_lane_cap('wide'), da.heavy_lane_cap('wide', True)), (4, 4, 0))
+            self.assertEqual((da.heavy_lane_cap('stable'), da.heavy_lane_cap('wide'), da.heavy_lane_cap('wide', True)), (4, 4, 0))   # the ceiling caps an edited table
 
     def test_a_latch_means_no_lane_at_any_tier(self):
         for tier in da.HEAVY_LANES:
             self.assertEqual(da.heavy_lane_cap(tier, True), 0, tier)
 
-    def test_the_third_lane_flag_adds_one_to_wide_only(self):
+    def test_the_third_lane_flag_adds_one_in_the_third_lane_tiers_only(self):
+        self.assertEqual(da.THIRD_LANE_TIERS, ('stable', 'wide'))
         with unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 2, 'wide': 2}), unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', True):
-            self.assertEqual((da.heavy_lane_cap('stable'), da.heavy_lane_cap('wide')), (2, 3))
+            self.assertEqual((da.heavy_lane_cap('stable'), da.heavy_lane_cap('wide')), (3, 3))
             self.assertEqual((da.heavy_lane_cap('low'), da.heavy_lane_cap('wide', True)), (0, 0))
         with unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 2, 'wide': 2}):
-            self.assertEqual(da.heavy_lane_cap('wide'), 2)       # flag off: the table alone decides
+            self.assertEqual((da.heavy_lane_cap('stable'), da.heavy_lane_cap('wide')), (2, 2))   # flag off: the table alone decides
 
     def test_nothing_ever_yields_more_than_the_ceiling(self):
         with unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 9, 'wide': 3}), unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', True):
