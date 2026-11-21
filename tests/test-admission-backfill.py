@@ -1017,6 +1017,103 @@ class DecisionLog(Base):
         self.assertEqual(shape(self.path), shape(other))
 
 
+    def reason_for(self, which):
+        """Build one shape per reachable reason and return (candidate id, advance kwargs)."""
+        if which == 'key-overlap-skipped':
+            self.running('blocker', 'build-workspace', [SHARED], 40)
+            self.enqueue('head', 'build-workspace', [SHARED], 40)
+            self.enqueue('old', 'container-suite', ['docker'], 32, capable=False)   # refused first, so its key joins the skipped set
+            return self.enqueue('later', 'container-suite', ['docker'], 32), {}
+        if which == 'disk-floor':
+            self.running('blocker', 'build-workspace', [SHARED], 40)
+            self.enqueue('head', 'build-workspace', [SHARED], 20)
+            return self.enqueue('big', 'container-suite', ['docker'], 40), {'free': 165 * GIB}   # 165 - 40 - 40 = 85 < 100; the head fits
+        if which == 'lane-refusal':
+            self.running('blocker', 'build-workspace', [SHARED], 40, cpus=8)
+            self.enqueue('head', 'build-workspace', [SHARED], 40, cpus=8)
+            return self.enqueue('wide', 'container-suite', ['docker'], 32, cpus=12), {}      # 8 + 12 > 16 cores
+        if which == 'head-unprotected-lanes':
+            self.running('blocker', 'build-workspace', [SHARED], 40, cpus=2)
+            self.running('other', 'build-workspace', [LOCAL], 40, cpus=2)
+            self.enqueue('head', 'build-workspace', [SHARED], 20, cpus=2)
+            # free 250 falls to the stable tier (2 lanes) once 80 reserved and the 40 candidate are counted: 2 in use + 1 - 1 blocker >= 2
+            return self.enqueue('cand', 'container-suite', ['docker'], 40, cpus=2), {'free': 250 * GIB}
+        if which == 'head-unprotected-budget':
+            self.running('blocker', 'build-workspace', [SHARED], 25, cpus=2)
+            self.running('other', 'build-workspace', [LOCAL], 25, cpus=4)
+            self.enqueue('head', 'build-workspace', [SHARED], 25, cpus=8)
+            return self.enqueue('cand', 'container-suite', ['docker'], 25, cpus=8), {}       # 4 + 8 + 8 = 20 > 16 cores once the blocker is gone
+        raise AssertionError(which)
+
+    def test_every_reachable_reason_is_logged_exactly(self):
+        for which in ('key-overlap-skipped', 'disk-floor', 'lane-refusal', 'head-unprotected-lanes', 'head-unprotected-budget'):
+            with self.subTest(reason=which):
+                self.reap()
+                self.setUp()
+                cand, kwargs = self.reason_for(which)
+                with backfill():
+                    out = self.advance(**kwargs)
+                self.assertEqual(out['backfilled'], [], out)
+                got = [d['reason'] for d in self.decisions() if d['id'] == cand]
+                self.assertEqual(got, [which])
+
+    def test_a_reason_outside_the_closed_set_is_recorded_as_other(self):
+        self.historical()
+        with backfill():
+            entries = self.entries()
+            backfill_state = {'pivot': self.head, 'blockers': [{'id': self.blocker}], 'in_flight': 0, 'taken': 0}
+            with da.state_lock(self.path):
+                da._log_backfill_decision(self.path, backfill_state, entries[self.docker_a], self.now, 'refused', 'made-up')
+        self.assertEqual([d['reason'] for d in self.decisions()], ['other'])
+
+    def _shape(self, path):
+        entries = {e['id']: (e['state'], e.get('grant')) for e in da._queue_entries(path)[0]}
+        lines = [json.loads(x) for x in (da.queue_dir(path) / 'receipts.jsonl').read_text().splitlines()]
+        return entries, [(x['event'], x['id']) for x in lines if x['event'] != 'backfill-decision']
+
+    def _same_with_logging_off_or_broken(self, patch_target, replacement, free=400 * GIB):
+        import shutil
+        other = Path(self.temp.name).resolve() / ('copy%d/admission/state.json' % len(os.listdir(self.temp.name)))
+        shutil.copytree(self.path.parent, other.parent)
+        with backfill():
+            with unittest.mock.patch.object(da, patch_target, replacement):
+                broken = da.queue_advance(self.path, lambda: free, now=self.now, host_fn=self.host, waiter_token_fn=None)
+            with unittest.mock.patch.object(da, '_log_backfill_decision', lambda *a, **k: None):
+                silent = da.queue_advance(other, lambda: free, now=self.now, host_fn=self.host, waiter_token_fn=None)
+        self.assertEqual(broken, silent)
+        self.assertEqual(self._shape(self.path), self._shape(other))
+
+    def test_a_logger_failure_of_any_type_changes_nothing(self):
+        self.historical()
+
+        def boom(*a, **k):
+            raise RuntimeError('logger bug')
+        self._same_with_logging_off_or_broken('_backfill_decisions', boom)
+        self.assertEqual(self.decisions(), [])
+        self.assertEqual(self.state(self.docker_a), 'GRANTED')
+
+    def test_a_refusal_heavy_advance_is_identical_with_logging_on_or_off(self):
+        self.blocker, _ = self.running('blocker', 'build-workspace', [SHARED], 40)
+        self.head = self.enqueue('head', 'build-workspace', [SHARED], 40)
+        old = self.enqueue('old', 'container-suite', ['docker'], 32, capable=False)
+        self.enqueue('later', 'container-suite', ['docker'], 32)
+        self.enqueue('handoff', 'container-suite', ['solo'], 32, waiter=False)
+        self.enqueue('same', 'build-crate', [SHARED])
+        self.enqueue('wide', 'container-suite', ['wide'], 32, cpus=12)
+        import shutil
+        other = Path(self.temp.name).resolve() / 'copy/admission/state.json'
+        shutil.copytree(self.path.parent, other.parent)
+        with backfill():
+            logged = da.queue_advance(self.path, lambda: 400 * GIB, now=self.now, host_fn=self.host)
+            with unittest.mock.patch.object(da, '_log_backfill_decision', lambda *a, **k: None):
+                silent = da.queue_advance(other, lambda: 400 * GIB, now=self.now, host_fn=self.host)
+        self.assertEqual(logged, silent)
+        self.assertEqual(self._shape(self.path), self._shape(other))
+        reasons = {d['reason'] for d in self.decisions()}
+        self.assertGreaterEqual(len(reasons), 3, reasons)
+        self.assertIn(old, [d['id'] for d in self.decisions()])
+
+
 class Lows(Base):
     def test_off_mode_shadow_judges_a_later_candidate_beside_the_earlier_one(self):
         self.running('blocker', 'build-crate', [SHARED])                  # 4 slots
