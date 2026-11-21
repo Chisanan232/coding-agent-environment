@@ -699,6 +699,41 @@ Lane 4: still OFF. Its head-protection gap noted in revision 11 is unchanged; a 
 
 Rollback: set `THIRD_LANE_ENABLED = False` (or revert the pull request); no runtime switch exists, deliberately.
 
+## Revision 13: backfill grant hysteresis (SPE-176)
+
+Evidence (live, 2026-11-21): the first live backfill grant (q000879, behind head q000875 blocked on the shared cargo-target key held by
+q000873) was granted at 02:37:10Z with head-protection headroom `disk_left` 107,526,347,776 B against the 107,374,182,400 B floor, a margin of
+about 152 MB (free 191,886,086,144 B). The claim-time recheck revoked it 15 s later (`backfill-revoked kind=head-unprotected`, then
+`claim-refused`) because free space had drifted down by a few hundred MB. The protection logic was correct and stays conservative (the
+blocker's reservation is not credited, since its artifacts persist); only the grant-time margin had no hysteresis. A grant on a sliver of margin
+is wasted: the waiter must re-queue (`BACKFILL_REQUEUE_MAX` = 3), the receipts fill with noise, and the same jitter flips the logged reason
+between `head-unprotected-disk` and `head-unprotected-budget`.
+
+Change: `BACKFILL_HYSTERESIS = 4 GiB`. `_protects_head` takes a `hysteresis` argument (default 0). `_backfill_candidate`, the only grant-time
+caller, passes `BACKFILL_HYSTERESIS`, so a new backfill grant needs `disk_left >= HEAVY_FLOOR + BACKFILL_HYSTERESIS`. `_backfill_protection_lost` (the
+claim-time recheck) keeps the default 0, the plain floor, so ordinary jitter between grant and claim cannot revoke a grant that was made with
+the margin, while a drift larger than the margin still revokes it (protection is not weakened). One function serves both paths; the flag is the
+only difference, so there is no duplicated logic.
+
+Value: the observed jitter is a few hundred MB within seconds. 4 GiB is roughly ten times that, and small against the 25 to 40 GiB declared
+jobs. A margin that is a multiple of the jitter makes the grant/revoke flip unlikely; it was chosen by that reasoning, not fitted to one sample.
+
+Decision log: a grant-time refusal caused only by the margin (every other part of `_protects_head` passes) is logged `head-unprotected-hysteresis`,
+a new value of the closed `BACKFILL_DECISION_REASONS`. `_head_unprotected_part` reports it after the disk, lane, lane-3 and budget causes, so it
+never masks a different refusal. The `math` in receipts gains `hysteresis` and `hysteresis_refused`.
+
+Only tightens: no grant is made that revision 12 refused, no check is loosened, the lane-3 margin (`_third_lane_refusal`) is as merged, and
+non-backfill admissions never pass through this path.
+
+Effect, stated plainly: backfill still needs about three jobs' worth of headroom beyond the floor (blocker, head and candidate declared
+reservations plus the floor), so it will not fire more often at today's roughly 180 to 192 GiB free; it fires slightly less often. The lever
+for more concurrency is more free disk or smaller declared reservations, not this constant.
+
+Debug aid: `ADMISSION_DEBUG` (merged #295) only reports, once per exception type, a swallowed failure of the decision-log write. The new reason goes
+through the same `_log_backfill_decision`; no admission decision reads it, and nothing about it changes with the variable set or unset.
+
+Rollback: set `BACKFILL_HYSTERESIS = 0` (or revert the pull request).
+
 ## Version history
 
 | Rev | Change |
@@ -718,3 +753,4 @@ Rollback: set `THIRD_LANE_ENABLED = False` (or revert the pull request); no runt
 | 10a | `backfill-decision` receipt: candidate, head, outcome and one closed-vocabulary reason, deduplicated per 10 minutes; logging only (SPE-176) |
 | 11 | Lane-3 disk margin: a third lane needs `THIRD_LANE_MARGIN` (60 GiB) beyond the heavy floor after all reservations and the request, at every lane site and in head protection; lanes 1, 2 and 4, budget, exclusion keys and caps unchanged (SPE-176) |
 | 12 | Third lane in the stable tier: `THIRD_LANE_TIERS = ('stable', 'wide')`; lane 3 still needs the revision 11 margin, so no extra concurrency at 160 to 184 GiB free; lane 4 still OFF and wide-only; `THIRD_LANE_ENABLED` stays the kill switch; monitor reports the effective stable cap (SPE-176) |
+| 13 | Backfill grant hysteresis: a new backfill grant needs `BACKFILL_HYSTERESIS` (4 GiB) of head-protecting disk above the floor; the claim-time recheck keeps the plain floor; new decision reason `head-unprotected-hysteresis`; only tightens (SPE-176) |
