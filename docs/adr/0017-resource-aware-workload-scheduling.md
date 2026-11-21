@@ -625,6 +625,19 @@ over a 107.4 GB floor, head projection under its limit and 2 of 2 lanes after; t
 `skipped=no-requeue-capability`. Shadow receipts are not live backfill evidence. Two live transitions remain to be verified after merge,
 separately from the controlled tests: a compatible later job runs while the head waits, and the head starts once eligible.
 
+### Revision 10a: backfill decision log (SPE-176)
+
+While ON, advance wrote no receipt for a candidate it refused, so a head blocked by an exclusion key with a capable job queued behind it
+could not be explained from history. A controlled replay on a copy of the live state (2026-11-21 01:16Z) showed the refusal was the head
+protection disk check: 180.0 GiB free minus 32 GiB reserved by the running docker job, the 23.3 GiB candidate and the 32 GiB head left
+92.7 GiB, under the 100 GiB floor. Every other check passed. That is a correct refusal, only invisible.
+
+One `backfill-decision` receipt now records, per (head, candidate), the outcome (`granted` or `refused`) and one reason from the closed
+set `BACKFILL_DECISION_REASONS`, one value per refusal site. It is written only while `BACKFILL_ENABLED`, and again only when the
+outcome, reason or blocker set changed or `BACKFILL_SHADOW_WINDOW_S` (10 minutes) passed. It is logging only: no admission decision,
+lock or ordering depends on it, and any failure inside the logger is swallowed. A candidate refused for `no-requeue-capability` still gets its `backfill-shadow` receipt as well, and a
+grant still gets its `backfill` receipt. `in-flight-cap` names the first entry behind the head, the one backfill would have tried first.
+
 ## Version history
 
 | Rev | Change |
@@ -641,3 +654,4 @@ separately from the controlled tests: a compatible later job runs while the head
 | 9 | Strict FIFO amended: bounded backfill past a head blocked only by an exclusion key held by a claimed running job, shipped OFF (`BACKFILL_ENABLED = False`, `BACKFILL_MAX = 1`); head protection from declared reservations, same-key order kept, `backfill` / `backfill-shadow` receipts (SPE-176) |
 | 9a | Backfill hardening, still OFF: exclusion keys compared by directory identity, with new keys in cargo's own target-dir order; head protection projects tier loss and the latch; claim-time re-check revokes a backfilled grant whose protection broke; `BACKFILL_GRANT_S` 600 s; all blockers in receipts; open preconditions listed. Later amended: wrappers re-queue a revoked or unclaimed-lapsed backfilled grant at its original FIFO position (`--requeue-of`, inherited `order`, chain cap 3); live shadow evidence recorded; only entries whose waiter declared `--requeue-capable` are backfilled (SPE-176) |
 | 10 | Bounded backfill enabled (`BACKFILL_ENABLED = True`; `BACKFILL_MAX = 1`, `BACKFILL_GRANT_S = 600`, `BACKFILL_REQUEUE_MAX = 3`, runner protocol 2); four-lane code unchanged (`FOURTH_LANE_ENABLED = False`); rollback is reverting the one-line PR (SPE-176) |
+| 10a | `backfill-decision` receipt: candidate, head, outcome and one closed-vocabulary reason, deduplicated per 10 minutes; logging only (SPE-176) |
