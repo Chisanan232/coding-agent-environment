@@ -945,6 +945,92 @@ class BackfillWindow(Base):
         self.assertEqual(rec._evaluate(entry, env, self.now + timedelta(seconds=rec.NOTICE_S + 1)), (False, ['waiter-alive']))
 
 
+class Hysteresis(Base):
+    """SPE-176 revision 13: a NEW backfill grant needs HEAVY_FLOOR + BACKFILL_HYSTERESIS of head-protecting disk; the claim keeps the floor.
+
+    historical(): blocker 40 + head 40 + candidate 32 GiB, so disk_left = free - 112 GiB and the floor is 100 GiB."""
+    H = da.BACKFILL_HYSTERESIS
+    EDGE = 100 * GIB + 112 * GIB      # free at which disk_left == floor
+
+    def decisions(self):
+        return self.receipts('backfill-decision')
+
+    def test_the_shipped_margin_is_four_gib(self):
+        self.assertEqual(da.BACKFILL_HYSTERESIS, 4 * GIB)
+        self.assertIn('head-unprotected-hysteresis', da.BACKFILL_DECISION_REASONS)
+
+    def test_a_grant_inside_the_hysteresis_band_is_refused_and_logged(self):
+        for extra in (0, 1, self.H - 1):
+            with self.subTest(extra=extra):
+                self.reap()
+                self.setUp()
+                self.historical()
+                with backfill():
+                    out = self.advance(free=self.EDGE + extra)
+                self.assertEqual(out['backfilled'], [])
+                self.assertEqual(self.state(self.docker_a), 'QUEUED')
+                mine = [d for d in self.decisions() if d['id'] == self.docker_a]
+                self.assertEqual([(d['outcome'], d['reason']) for d in mine], [('refused', 'head-unprotected-hysteresis')])
+                self.assertIn(mine[0]['reason'], da.BACKFILL_DECISION_REASONS)
+
+    def test_a_grant_is_admitted_at_floor_plus_hysteresis(self):
+        self.historical()
+        with backfill():
+            out = self.advance(free=self.EDGE + self.H)
+        self.assertEqual(out['backfilled'], [self.docker_a])
+        self.assertEqual(self.receipts('backfill')[0]['math']['disk_left'], 100 * GIB + self.H)
+
+    def test_below_the_floor_is_still_the_disk_reason(self):
+        self.historical()
+        with backfill():
+            self.advance(free=self.EDGE - 1)
+        self.assertEqual([d['reason'] for d in self.decisions() if d['id'] == self.docker_a], ['head-unprotected-disk'])
+
+    def test_a_granted_backfill_survives_drift_up_to_the_hysteresis_but_not_beyond(self):
+        for drift, revoked in ((0, False), (self.H // 2, False), (self.H, False), (self.H + 1, True)):
+            with self.subTest(drift=drift):
+                self.reap()
+                self.setUp()
+                self.historical()
+                with backfill():
+                    self.assertEqual(self.advance(free=self.EDGE + self.H)['backfilled'], [self.docker_a])
+                out = ClaimRecheck.claim_real(self, self.docker_a, self.host, free=self.EDGE + self.H - drift)
+                if revoked:
+                    self.assertFalse(out['ok'])
+                    self.assertIn('(head-unprotected)', out['reason'])
+                    self.assertEqual(self.state(self.docker_a), 'EXPIRED')
+                else:
+                    self.assertTrue(out['ok'], out)
+                    self.assertFalse(self.receipts('backfill-revoked'))
+
+    def test_the_live_numbers_of_2026_11_21_are_now_refused_at_grant_and_were_floor_only_before(self):
+        self.running('blocker', 'build-workspace', [SHARED], 25)
+        self.enqueue('head', 'build-workspace', [SHARED], 25)
+        cand = self.enqueue('cand', 'container-suite', ['docker'], 32)
+        entries = self.entries()
+        head, cand_entry = dict(entries[self.head_id()]), dict(entries[cand])
+        head['bytes'], cand_entry['bytes'] = 25 * 10 ** 9, 34_359_738_368
+        live, _ = da.live_reservations(self.path, self.now)
+        free = 191_886_086_144
+        args = (self.host(), head, cand_entry, [{'label': 'blocker'}], live, [], [], self.now, 'wide', free, 25 * 10 ** 9, 1, 3)
+        plain_ok, plain = da._protects_head(*args)
+        self.assertEqual(plain['disk_left'], 107_526_347_776)
+        self.assertTrue(plain_ok, 'the pre-revision rule granted it on a 152 MB margin')
+        ok, math = da._protects_head(*args, hysteresis=da.BACKFILL_HYSTERESIS)
+        self.assertFalse(ok)
+        self.assertTrue(math['hysteresis_refused'])
+        self.assertEqual(da._head_unprotected_part(math, [{'label': 'blocker'}]), 'head-unprotected-hysteresis')
+
+    def head_id(self):
+        return next(i for i, e in self.entries().items() if e['label'] == 'head')
+
+    def test_a_non_backfill_admission_is_unaffected(self):
+        head = self.enqueue('solo', 'build-workspace', [SHARED], 40)
+        out = self.advance(free=141 * GIB)     # 141 - 40 = 101 GiB: above the floor by far less than the hysteresis
+        self.assertEqual(out['granted'], [head])
+        self.assertNotIn('backfilled', out)
+
+
 class DecisionLog(Base):
     """`backfill-decision` receipts (SPE-176): the candidate, the head, and the one closed-vocabulary reason, logged once per change."""
 
