@@ -319,7 +319,7 @@ THIRD_LANE_ENABLED = True
 # The tiers whose cap gains the third lane while THIRD_LANE_ENABLED (ADR 0017 revision 12: the stable tier joined the wide tier).
 # HEAVY_LANES stays the two-lane base so that flag remains the one-line kill switch for lane 3 in every tier. In the stable tier
 # (free below 200 GiB) THIRD_LANE_MARGIN still needs free - reserved - request >= HEAVY_FLOOR + 60 GiB, so lane 3 opens there only
-# while reservations plus the request stay within 40 GiB.
+# while reservations plus the request total at most free - 160 GiB (30 GiB at 190 GiB free).
 THIRD_LANE_TIERS = ('stable', 'wide')
 # Class-aware third lane (SPE-160, shadow only): the classes a third lane could admit, each at the least it needs. light holds no
 # memory or cpu slots; build-crate is granted its class min_jobs. This only feeds the trial report; it does not decide admission.
@@ -3694,7 +3694,23 @@ def _log_backfill_decision(state_path, backfill, cand, now, outcome, reason):
                   'reason': reason, 'in_flight': backfill['in_flight'] + backfill['taken'], 'cap': BACKFILL_MAX}
         if _queue_receipt(state_path, 'backfill-decision', cand, now, **fields):
             seen['loaded'][cand['id']] = dict(fields, id=cand['id'], ts=iso_utc(now))
-    except Exception:   # logging only: a failure here must never abort or change an advance (queue_advance catches only StateError, OSError)
+    except Exception as failure:   # logging only: a failure here must never abort or change an advance (queue_advance catches only StateError, OSError)
+        _report_backfill_log_failure(failure)
+
+
+_BACKFILL_LOG_FAILURES_REPORTED = set()
+
+
+def _report_backfill_log_failure(failure):
+    """Debug aid for the swallowed failure above: with ADMISSION_DEBUG set, one stderr line per exception type per process; silent by default.
+    It touches no admission state and never raises, so it cannot change a decision."""
+    try:
+        kind = type(failure).__name__
+        if not os.environ.get('ADMISSION_DEBUG') or kind in _BACKFILL_LOG_FAILURES_REPORTED:
+            return
+        _BACKFILL_LOG_FAILURES_REPORTED.add(kind)
+        sys.stderr.write('disk-admission: backfill-decision log failed (%s): %s\n' % (kind, str(failure)[:200]))
+    except Exception:
         return
 
 

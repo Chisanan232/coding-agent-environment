@@ -323,7 +323,7 @@ Arithmetic (`budget_decision(host, reservations, request, caps)`, pure):
 Known gaps. All constants are guesses until `measurements` backs them. A heavy-named process the process list could not parse
 into a tree is not counted as unmanaged. `status` reads records without verification (it takes no lock), so it can briefly show a
 holder that has just exited. A 2 s window is shorter than the 10 s `memory-admission check` uses, so its swap-I/O reading is
-noisier, so a noisy sample can only close a second lane, never open one. A third lane is a separate, owner-approved change.
+noisier, so a noisy sample can only close a second lane, never open one. The third lane is approved and shipped (margin PR #293, stable tier PR #294); `THIRD_LANE_ENABLED = False` is the kill switch. Lane 4 is still off and needs a head-protection follow-up before it is enabled.
 
 Known and accepted. The `shadow-budget` lines share `queue/receipts.jsonl` (and its single 1 MiB rotation) with the queue's own
 receipts, so a busy shadow stream rotates queue history sooner. The `budget` result key is additive: a caller that compares

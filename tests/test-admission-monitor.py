@@ -1977,6 +1977,12 @@ class InventoryStableLanes(unittest.TestCase):
         self.assertEqual(self.lanes_of(base + "THIRD_LANE_ENABLED = True\nTHIRD_LANE_TIERS = ('wide',)\n"), 2)
         self.assertIsNone(self.lanes_of('RUNNER_PROTOCOL = 2\n'))
 
+    def test_the_reported_cap_is_clamped_to_the_lane_ceiling_when_the_copy_has_one(self):
+        over = "HEAVY_LANES = {'emergency': 0, 'low': 0, 'stable': 3, 'wide': 3}\nTHIRD_LANE_ENABLED = True\nTHIRD_LANE_TIERS = ('stable', 'wide')\n"
+        self.assertEqual(self.lanes_of(over), 4)                              # no ceiling in the copy: shown as computed
+        self.assertEqual(self.lanes_of('LANE_CEILING = 3\n' + over), 3)      # the ceiling clamps it
+        self.assertEqual(self.lanes_of('LANE_CEILING = 3\n' + over.replace('3,', '2,', 1)), 3)   # at the ceiling: unchanged
+
 
 class SafetyShape(unittest.TestCase):
     """The monitor must stay unable to do what it is forbidden to do."""

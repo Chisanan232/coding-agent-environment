@@ -1120,6 +1120,51 @@ class DecisionLog(Base):
         self.assertEqual(self.decisions(), [])
         self.assertEqual(self.state(self.docker_a), 'GRANTED')
 
+    def _multi_cause(self, shares_head_key, waiter):
+        """Disk floor always fails (165 - 40 reserved - 40 candidate = 85 < 100 GiB; the head alone fits); the other causes are the arguments."""
+        self.running('blocker', 'build-workspace', [SHARED], 40)
+        self.enqueue('head', 'build-workspace', [SHARED], 20)
+        return self.enqueue('cand', 'container-suite', [SHARED] if shares_head_key else ['docker'], 40, waiter=waiter)
+
+    def test_refusal_reason_order_is_key_overlap_then_waiter_then_disk_floor(self):
+        """Pins the first-refusal order documented in _backfill_candidate: a mutation that reorders the checks changes the logged reason."""
+        for name, shares_key, waiter, expected in (
+                ('key overlap beats waiter and disk floor', True, False, 'key-overlap-pivot'),
+                ('key overlap beats disk floor', True, True, 'key-overlap-pivot'),
+                ('waiter beats disk floor', False, False, 'waiter-not-alive'),
+                ('disk floor alone', False, True, 'disk-floor')):
+            with self.subTest(name):
+                self.reap()
+                self.setUp()
+                cand = self._multi_cause(shares_key, waiter)
+                with backfill():
+                    out = self.advance(free=165 * GIB)
+                self.assertEqual(out['backfilled'], [], out)
+                self.assertEqual([d['reason'] for d in self.decisions() if d['id'] == cand], [expected])
+
+    def test_a_swallowed_logger_failure_reports_once_per_type_only_under_admission_debug(self):
+        import io
+        self.historical()
+
+        def boom(*a, **k):
+            raise RuntimeError('logger bug')
+        for env, expect_lines in (({}, 0), ({'ADMISSION_DEBUG': '1'}, 1)):
+            with self.subTest(env=env):
+                self.reap()
+                self.setUp()
+                self.historical()
+                err = io.StringIO()
+                clean = {k: v for k, v in os.environ.items() if k != 'ADMISSION_DEBUG'}
+                with backfill(), unittest.mock.patch.dict(os.environ, dict(clean, **env), clear=True), \
+                        unittest.mock.patch.object(da, '_BACKFILL_LOG_FAILURES_REPORTED', set()), \
+                        unittest.mock.patch.object(da, '_backfill_decisions', boom), unittest.mock.patch('sys.stderr', err):
+                    out = self.advance()
+                self.assertEqual(out['backfilled'], [self.docker_a])          # the decision is the same as with the logger working
+                lines = err.getvalue().splitlines()
+                self.assertEqual(len(lines), expect_lines, lines)
+                if expect_lines:
+                    self.assertIn('RuntimeError', lines[0])
+
     def test_a_refusal_heavy_advance_is_identical_with_logging_on_or_off(self):
         self.blocker, _ = self.running('blocker', 'build-workspace', [SHARED], 40)
         self.head = self.enqueue('head', 'build-workspace', [SHARED], 40)
