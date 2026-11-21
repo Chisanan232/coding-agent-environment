@@ -1675,6 +1675,59 @@ class PathFilteredSkip(Base):
         self.assertEqual(omr.check_argv(["api", "repos/a/b/actions/runs/1/jobs?per_page=100"]), "run-jobs")
 
 
+class RequiredLocalChecks(Base):
+    """Per-repo required_local_checks: the runner refuses unless evidence local_ci passed every named check at this head."""
+
+    NAMES = ["ruff-security", "pip-audit-runtime"]
+
+    def local(self, **over):
+        lc = {"classification": "LOCAL_EQUIVALENT_PASS", "head": HEAD, "run_at": "2026-10-20T11:00:00Z",
+              "checks": [{"name": n, "exit_code": 0, "tests": 0} for n in self.NAMES]}
+        lc.update(over)
+        return lc
+
+    def setUp(self):
+        super().setUp()
+        self.allow.write_text(json.dumps(allow_doc(required_local_checks=self.NAMES)))
+
+    def test_passes_when_every_required_check_passed_at_this_head(self):
+        self.write_evidence(local_ci=self.local())
+        code, rec = self.go(FakeGh(), dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+
+    def test_absent_local_ci_refuses(self):
+        self.write_evidence()
+        self.assertRefused(FakeGh(), "no local_ci block")
+
+    def test_missing_required_name_refuses(self):
+        self.write_evidence(local_ci=self.local(checks=[{"name": "ruff-security", "exit_code": 0, "tests": 0}]))
+        self.assertRefused(FakeGh(), "pip-audit-runtime")
+
+    def test_nonzero_exit_refuses(self):
+        checks = [{"name": "ruff-security", "exit_code": 0, "tests": 0}, {"name": "pip-audit-runtime", "exit_code": 1, "tests": 0}]
+        self.write_evidence(local_ci=self.local(checks=checks))
+        self.assertRefused(FakeGh(), "did not pass")
+
+    def test_local_ci_head_mismatch_refuses(self):
+        self.write_evidence(local_ci=self.local(head=OTHER))
+        self.assertRefused(FakeGh(), "local_ci head")
+
+    def test_evidence_for_another_pr_or_head_refuses(self):
+        self.write_evidence(local_ci=self.local(), pr=8)
+        self.assertRefused(FakeGh(), "evidence pr")
+        self.write_evidence(local_ci=self.local(), head=OTHER)
+        self.assertRefused(FakeGh(), "evidence head")
+        self.write_evidence(local_ci=self.local(), repo="x/y")
+        self.assertRefused(FakeGh(), "evidence repo")
+
+    def test_invalid_config_values_refuse(self):
+        for bad in ("ruff", [""], [" a"], [1], ["a", "a"]):
+            with self.subTest(bad=bad):
+                self.allow.write_text(json.dumps(allow_doc(required_local_checks=bad)))
+                self.write_evidence(local_ci=self.local())
+                self.assertRefused(FakeGh(), "allowlist config")
+
+
 class LocalEquivalentCi(Base):
     """Founder LOCAL_EQUIVALENT_CI exception: only for required checks GitHub reports as never started, covered
     by pinned local evidence. An executed failure (CI_FAILED) is never bypassed."""
