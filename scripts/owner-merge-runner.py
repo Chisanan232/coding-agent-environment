@@ -334,12 +334,15 @@ def repo_config(allow, repo):
     key_file = allow["evidence_key_file"]
     ok = isinstance(cfg, dict) and set(cfg) <= REPO_KEYS
     # required_checks may be [] only when required_local_checks is non-empty: the local gate then replaces the hosted one.
+    # Keep this ahead of, and consistent with, the required_local_checks entry validation below; do not reorder.
     local_gate = ok and isinstance(cfg.get("required_local_checks"), list) and bool(cfg["required_local_checks"])
     for key in ("required_checks", "reviewers"):
         v = cfg.get(key) if ok else None
         ok = ok and isinstance(v, list) and (bool(v) or (key == "required_checks" and local_gate)) \
             and all(isinstance(x, str) and x.strip() and x == x.strip() for x in v)
     prot = cfg.get("require_server_side_protection", True) if ok else True
+    # With no hosted checks and no server-side protection the only gate left would be agent-written local evidence.
+    ok = ok and not (not cfg["required_checks"] and not prot)
     bypass = cfg.get("accept_bypass_actors", False) if ok else False
     signed = cfg.get("require_signed_evidence", key_file is not None) if ok else True
     age = cfg.get("max_evidence_age_hours", 24) if ok else 24
@@ -356,7 +359,7 @@ def repo_config(allow, repo):
     ok = ok and not (signed and key_file is None)
     if not ok:
         raise Refused(["allowlist config for repo is invalid (needs a non-empty reviewers list and a non-empty required_checks list (which may be empty only when "
-                       "required_local_checks is non-empty); "
+                       "required_local_checks is non-empty and require_server_side_protection is not false); "
                        "booleans must be booleans; max_evidence_age_hours 1-%d; require_signed_evidence needs an "
                        "evidence_key_file)" % MAX_EVIDENCE_AGE_HOURS])
     return {"required_checks": list(cfg["required_checks"]), "reviewers": list(cfg["reviewers"]),
