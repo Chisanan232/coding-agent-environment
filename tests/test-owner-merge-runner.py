@@ -1748,6 +1748,90 @@ class RequiredLocalChecks(Base):
                 self.assertRefused(FakeGh(), "allowlist config")
 
 
+class EmptyRequiredChecks(Base):
+    """required_checks may be [] only when required_local_checks is non-empty (the local gate replaces the hosted one).
+    Everything else the hosted gate still does must keep working for the checks that are present."""
+
+    NAMES = ["ruff", "pytest"]
+
+    def local(self, **over):
+        lc = {"classification": "LOCAL_EQUIVALENT_PASS", "head": HEAD, "run_at": "2026-10-20T11:00:00Z",
+              "checks": [{"name": n, "exit_code": 0, "tests": 0} for n in self.NAMES]}
+        lc.update(over)
+        return lc
+
+    def setUp(self):
+        super().setUp()
+        self.allow.write_text(json.dumps(allow_doc(required_checks=[], required_local_checks=self.NAMES)))
+        self.write_evidence(local_ci=self.local())
+
+    def cfg(self, **kw):
+        self.allow.write_text(json.dumps(allow_doc(**kw)))
+
+    def test_accepted_and_merges_once_with_passing_local_ci(self):
+        gh = FakeGh(base_pr(statusCheckRollup=[]))
+        code, rec = self.go(gh)
+        self.assertEqual((code, rec["outcome"]), (omr.EXIT_OK, "MERGED"), rec)
+        self.assertEqual(len(gh.merges()), 1)
+
+    def test_empty_required_checks_needs_a_non_empty_local_list(self):
+        for kw in (dict(required_checks=[]), dict(required_checks=[], required_local_checks=[]),
+                   dict(required_checks=[], required_local_checks="ruff"), dict(required_local_checks=self.NAMES, required_checks="x"),
+                   dict(required_checks=[], required_local_checks=[""])):
+            with self.subTest(kw=kw):
+                self.cfg(**kw)
+                self.assertRefused(FakeGh(base_pr(statusCheckRollup=[])), "allowlist config")
+
+    def test_required_checks_key_missing_is_refused(self):
+        doc = allow_doc(required_local_checks=self.NAMES)
+        del doc["repos"][REPO]["required_checks"]
+        self.allow.write_text(json.dumps(doc))
+        self.assertRefused(FakeGh(base_pr(statusCheckRollup=[])), "allowlist config")
+
+    def test_reviewers_stay_required(self):
+        doc = allow_doc(required_checks=[], required_local_checks=self.NAMES, reviewers=[])
+        self.allow.write_text(json.dumps(doc))
+        self.assertRefused(FakeGh(base_pr(statusCheckRollup=[])), "allowlist config")
+
+    def test_local_gate_is_enforced_instead_of_the_hosted_one(self):
+        gh = lambda: FakeGh(base_pr(statusCheckRollup=[]))
+        self.write_evidence()
+        self.assertRefused(gh(), "no local_ci block")
+        self.write_evidence(local_ci=self.local(checks=[{"name": "ruff", "exit_code": 0, "tests": 0}]))
+        self.assertRefused(gh(), "pytest")
+        self.write_evidence(local_ci=self.local(checks=[{"name": "ruff", "exit_code": 0, "tests": 0},
+                                                        {"name": "pytest", "exit_code": 2, "tests": 0}]))
+        self.assertRefused(gh(), "did not pass")
+        self.write_evidence(local_ci=self.local(head=OTHER))
+        self.assertRefused(gh(), "local_ci head")
+
+    def test_non_required_hosted_checks_still_block_when_not_green(self):
+        for verdict in ("FAILURE", "PENDING", "IN_PROGRESS", "CANCELLED"):
+            with self.subTest(verdict=verdict):
+                roll = [{"__typename": "CheckRun", "name": "extra", "status": "COMPLETED", "conclusion": verdict}]
+                self.assertRefused(FakeGh(base_pr(statusCheckRollup=roll)), "check extra is")
+
+    def test_non_required_skipped_hosted_check_is_tolerated_as_before(self):
+        roll = [{"__typename": "CheckRun", "name": "release", "status": "COMPLETED", "conclusion": "SKIPPED"}]
+        code, rec = self.go(FakeGh(base_pr(statusCheckRollup=roll)), dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+
+    def test_merge_state_status_is_unchanged(self):
+        for mss in ("BLOCKED", "BEHIND", "UNSTABLE", "DIRTY"):
+            with self.subTest(mss=mss):
+                self.assertRefused(FakeGh(base_pr(statusCheckRollup=[], mergeStateStatus=mss)), "mergeStateStatus")
+
+    def test_server_side_protection_is_still_required(self):
+        self.assertRefused(FakeGh(base_pr(statusCheckRollup=[]), rules=[]), "server-side")
+
+    def test_name_collision_does_not_let_local_evidence_override_an_executed_hosted_failure(self):
+        self.cfg(required_checks=[], required_local_checks=["ci"])
+        self.write_evidence(local_ci=self.local(checks=[{"name": "ci", "exit_code": 0, "tests": 1}]))
+        roll = [{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "FAILURE",
+                 "detailsUrl": f"https://github.com/{REPO}/actions/runs/5/job/{JOB_ID}"}]
+        self.assertRefused(FakeGh(base_pr(statusCheckRollup=roll), jobs={JOB_ID: never_ran(steps=[{"name": "t"}])}), "check ci is FAILURE")
+
+
 class LocalEquivalentCi(Base):
     """Founder LOCAL_EQUIVALENT_CI exception: only for required checks GitHub reports as never started, covered
     by pinned local evidence. An executed failure (CI_FAILED) is never bypassed."""
