@@ -1788,6 +1788,13 @@ class EmptyRequiredChecks(Base):
         self.allow.write_text(json.dumps(doc))
         self.assertRefused(FakeGh(base_pr(statusCheckRollup=[])), "allowlist config")
 
+    def test_empty_required_checks_needs_server_side_protection(self):
+        self.cfg(required_checks=[], required_local_checks=self.NAMES, require_server_side_protection=False)
+        self.assertRefused(FakeGh(base_pr(statusCheckRollup=[])), "allowlist config")
+        self.cfg(required_checks=[], required_local_checks=self.NAMES, require_server_side_protection=True)
+        code, rec = self.go(FakeGh(base_pr(statusCheckRollup=[])), dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+
     def test_reviewers_stay_required(self):
         doc = allow_doc(required_checks=[], required_local_checks=self.NAMES, reviewers=[])
         self.allow.write_text(json.dumps(doc))
