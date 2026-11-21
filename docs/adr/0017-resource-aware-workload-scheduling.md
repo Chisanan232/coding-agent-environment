@@ -641,9 +641,9 @@ refused at lane 3. The refusal text is `budget: lane 3 needs N GiB free after al
 2, the CPU and memory budget, band gates, exclusion keys, `BACKFILL_MAX`, `THIRD_LANE_ENABLED`, `FOURTH_LANE_ENABLED = False` and `LANE_CEILING` are
 unchanged.
 
-Effect: this tightens the wide-tier pilot of revision 7, which until now needed only the floor. At 160 to 184 GiB free (the stable tier) there is
-no third lane before or after. A third lane needs a wide-tier host (200 GiB or more free) with room for the whole job mix, roughly 235 to 280 GiB
-free for 40 + 35 + 25 GiB jobs, or isolated Cargo targets that shrink the reservations. 60 GiB is a proposed value the founder can change.
+Effect: this tightens the wide-tier pilot of revision 7, which until now needed only the floor. Below 200 GiB free (the stable tier, 100 to under 200 GiB; the
+recent measured 160 to 184 GiB is an observation within it) there is no third lane before or after. A third lane needs a wide-tier host (200 GiB or more free) with room for the whole job mix, at least about 260 GiB
+free for a 40 + 35 + 25 GiB mix (100 GiB reserved plus the 160 GiB left; the 200 GiB tier threshold also applies), or isolated Cargo targets that shrink the reservations. 60 GiB is a proposed value the founder can change.
 
 Reservation accounting, verified by reading: `queue advance` counts live, granted and orphaned reservations once each; `queue claim` counts live and
 orphans and excludes every other unclaimed grant (the claimant's own grant is not double counted; other grants were counted when they were

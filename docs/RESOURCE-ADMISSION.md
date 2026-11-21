@@ -510,7 +510,7 @@ A third heavy lane (wide tier, ADR 0017 revision 11) needs, besides the budget, 
 `THIRD_LANE_MARGIN`, 60 GiB), with every live, granted and orphaned reservation counted once. It applies at `reserve` (a same-process refresh
 is exempt), `queue advance`, `queue claim`, backfill candidates and head protection (the head's own lane 3 once its blockers release). The
 refusal reads `budget: lane 3 needs N GiB free after all reservations and this request, 160 GiB required`. Lanes 1 and 2 and lane 4 are
-unaffected. At 160 to 184 GiB free (stable tier) no third lane exists with or without the margin. `scripts/admission-monitor.py` does not
+unaffected. Below 200 GiB free (the stable tier; the recent measured 160 to 184 GiB is within it) no third lane exists with or without the margin. `scripts/admission-monitor.py` does not
 model the margin.
 
 ## Four heavy lanes (shipped off)
