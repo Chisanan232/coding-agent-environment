@@ -322,7 +322,7 @@ def load_allowlist(path):
 
 REPO_KEYS = {"required_checks", "reviewers", "require_server_side_protection", "accept_bypass_actors",
              "max_evidence_age_hours", "require_signed_evidence", "local_equivalent_ci",
-             "independent_github_reviewers", "protection_capability"}
+             "independent_github_reviewers", "protection_capability", "required_local_checks"}
 
 
 def repo_config(allow, repo):
@@ -345,6 +345,9 @@ def repo_config(allow, repo):
     cap = cfg.get("protection_capability", "server-enforced") if ok else "server-enforced"
     ok = ok and cap in CAPABILITIES and not (cap == "private-free-app-level" and not prot)
     ok = ok and all(isinstance(x, bool) for x in (prot, bypass, signed, lci))
+    rlc = cfg.get("required_local_checks", []) if ok else []
+    ok = ok and isinstance(rlc, list) and all(isinstance(x, str) and x.strip() and x == x.strip() for x in rlc) \
+        and len(set(rlc)) == len(rlc)
     ok = ok and isinstance(ind, list) and all(isinstance(x, str) and LOGIN_RE.fullmatch(x) for x in ind)
     ok = ok and isinstance(age, int) and not isinstance(age, bool) and 1 <= age <= MAX_EVIDENCE_AGE_HOURS
     ok = ok and not (signed and key_file is None)
@@ -355,7 +358,8 @@ def repo_config(allow, repo):
     return {"required_checks": list(cfg["required_checks"]), "reviewers": list(cfg["reviewers"]),
             "require_server_side_protection": prot, "accept_bypass_actors": bypass,
             "max_evidence_age_hours": age, "require_signed_evidence": signed, "local_equivalent_ci": lci,
-            "independent_github_reviewers": [x.lower() for x in ind], "protection_capability": cap}
+            "independent_github_reviewers": [x.lower() for x in ind], "protection_capability": cap,
+            "required_local_checks": list(rlc)}
 
 
 def canonical_evidence(ev):
@@ -468,7 +472,15 @@ def load_evidence(path, head, repo, pr, base, cfg, key, now):
         if key is None or not isinstance(mac, str) or not MAC_RE.fullmatch(mac) \
                 or not hmac.compare_digest(mac, evidence_mac(key, ev)):
             bad.append("evidence signature missing or invalid")
-    local = check_local_ci(ev["local_ci"], head, cfg, now) if cfg["local_equivalent_ci"] and "local_ci" in ev else None
+    required = cfg["required_local_checks"]
+    if required and "local_ci" not in ev:
+        bad.append("required_local_checks is set but the evidence has no local_ci block")
+    local = check_local_ci(ev["local_ci"], head, cfg, now) \
+        if (cfg["local_equivalent_ci"] or required) and "local_ci" in ev else None
+    if required and local is not None:
+        absent = [n for n in required if n not in local]
+        if absent:
+            bad.append("local_ci is missing required local checks: " + ", ".join(absent))
     if bad:
         raise Refused(bad)
     return hashlib.sha256(raw).hexdigest(), local
