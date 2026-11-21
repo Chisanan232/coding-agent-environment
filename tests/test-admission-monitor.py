@@ -14,6 +14,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -1950,6 +1951,31 @@ class Inventory(unittest.TestCase):
                 (Path(root) / name / 'scripts/disk-admission.py').write_text(body + 'raise SystemExit("must not run")\n')
             kinds = {r['checkout']: r['kind'] for r in mon.inventory(root)}
         self.assertEqual(kinds, {'a': 'current', 'b': 'memory-gated-advance-unstamped', 'c': 'outdated'})
+
+
+class InventoryStableLanes(unittest.TestCase):
+    """`callers` reports the effective stable lane cap (ADR 0017 revision 12), not the two-lane base table."""
+    def lanes_of(self, body):
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / 'x/scripts').mkdir(parents=True)
+            (Path(root) / 'x/scripts/disk-admission.py').write_text(body)
+            return mon.inventory(root)[0]['stable_lanes']
+
+    def test_the_shipped_runner_reports_the_cap_heavy_lane_cap_computes(self):
+        shipped = (ROOT / 'scripts/disk-admission.py').read_text()
+        with unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', True), unittest.mock.patch.object(da, 'FOURTH_LANE_ENABLED', False):
+            self.assertEqual(self.lanes_of(shipped), da.heavy_lane_cap('stable'))
+        self.assertEqual(self.lanes_of(shipped), 3)
+
+    def test_the_base_table_and_the_two_flags_decide_the_reported_cap(self):
+        base = "HEAVY_LANES = {'emergency': 0, 'low': 0, 'stable': 2, 'wide': 2}\n"
+        self.assertEqual(self.lanes_of(base), 2)                                                # an older copy: no third lane in stable
+        self.assertEqual(self.lanes_of(base + 'THIRD_LANE_ENABLED = True\n'), 2)               # revision 11: wide-only third lane
+        both = base + "THIRD_LANE_ENABLED = True\nTHIRD_LANE_TIERS = ('stable', 'wide')\n"
+        self.assertEqual(self.lanes_of(both), 3)
+        self.assertEqual(self.lanes_of(both.replace('= True', '= False')), 2)                  # the kill switch
+        self.assertEqual(self.lanes_of(base + "THIRD_LANE_ENABLED = True\nTHIRD_LANE_TIERS = ('wide',)\n"), 2)
+        self.assertIsNone(self.lanes_of('RUNNER_PROTOCOL = 2\n'))
 
 
 class SafetyShape(unittest.TestCase):

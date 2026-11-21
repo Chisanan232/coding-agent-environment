@@ -666,6 +666,38 @@ while it is off; it needs the same hook before it is ever enabled.
 
 Rollback is reverting the pull request. `scripts/admission-monitor.py` reads `HEAVY_LANES` by regular expression and does not know the margin.
 
+## Revision 12: third lane in the stable tier (SPE-176)
+
+Decision (founder, 2026-11-21): allow up to three concurrent heavy workloads when the actual job mix fits, keeping the 100 GiB disk floor,
+an explicit disk margin, the CPU and memory limits, exclusion keys and head-job protection; lane four stays OFF and four lanes remain the
+original goal.
+
+Change: `THIRD_LANE_TIERS = ('stable', 'wide')` and `heavy_lane_cap` adds the third lane in each of those tiers while `THIRD_LANE_ENABLED`;
+the fourth lane is still wide-only and still needs `FOURTH_LANE_ENABLED` (False). `HEAVY_LANES` is untouched, so `THIRD_LANE_ENABLED`
+remains the one-line kill switch: `False` restores two lanes in every tier. `LANE_CEILING` (3), `FOUR_LANE_CEILING`, `BACKFILL_MAX`, the CPU, memory
+and band gates, exclusion keys and `THIRD_LANE_MARGIN` (revision 11) are unchanged. `scripts/admission-monitor.py` `callers` now reports the
+effective stable cap instead of the table value.
+
+Effect, stated plainly: there is no extra concurrency at today's measured 160 to 184 GiB free and queue shape. The stable tier is below
+200 GiB free, and lane 3 still needs `free - reserved - request >= 160 GiB`, so it opens there only while every reservation plus the request
+stays within 40 GiB (for example three small jobs of about 5 to 15 GiB at 190 GiB free). With 32 to 55 GiB held and 25 to 40 GiB requested the
+margin leaves at most 127 GiB and refuses. More free space (wide tier) or smaller reservations (isolated Cargo targets, smaller declared sizes) is what
+opens a third lane; the cap alone never does.
+
+Reservation accounting and head protection, verified by reading: the stable-tier cap of 3 changes the `heavy_lane_cap(tier(free - reserved -
+candidate), latch)` projection in `_protects_head` so a wide-to-stable tier drop no longer removes the head's lane; what protects the head
+there is its own lane-3 margin (`_third_lane_refusal` for lane `in_use + 2 - blockers`, charging every current reservation, the candidate and
+the head once), and the lane number at the pivot, the backfill candidate (`_lane_refusal`, `in_use + 1`), `_excl_only_blockers` and the claim-time
+re-check are the same expressions at three lanes. No off-by-one, head starvation or double count was found. The two existing backfill tests
+whose tier drop relied on a two-lane stable tier keep their shape under `THIRD_LANE_TIERS = ('wide',)`, and a stable-tier twin pins the margin
+as the protection. `scripts/memory-admission.py` takes the maximum over tiers (3 before and after) and needs no change.
+
+Lane 4: still OFF. Its head-protection gap noted in revision 11 is unchanged; a follow-up must add the lane-4 hook to `_protects_head` before
+`FOURTH_LANE_ENABLED` is ever flipped. A stable-tier fourth lane is unreachable by construction (the tier rule is wide-only; the ceiling and
+`lane-cap` refuse it).
+
+Rollback: set `THIRD_LANE_ENABLED = False` (or revert the pull request); no runtime switch exists, deliberately.
+
 ## Version history
 
 | Rev | Change |
@@ -684,3 +716,4 @@ Rollback is reverting the pull request. `scripts/admission-monitor.py` reads `HE
 | 10 | Bounded backfill enabled (`BACKFILL_ENABLED = True`; `BACKFILL_MAX = 1`, `BACKFILL_GRANT_S = 600`, `BACKFILL_REQUEUE_MAX = 3`, runner protocol 2); four-lane code unchanged (`FOURTH_LANE_ENABLED = False`); rollback is reverting the one-line PR (SPE-176) |
 | 10a | `backfill-decision` receipt: candidate, head, outcome and one closed-vocabulary reason, deduplicated per 10 minutes; logging only (SPE-176) |
 | 11 | Lane-3 disk margin: a third lane needs `THIRD_LANE_MARGIN` (60 GiB) beyond the heavy floor after all reservations and the request, at every lane site and in head protection; lanes 1, 2 and 4, budget, exclusion keys and caps unchanged (SPE-176) |
+| 12 | Third lane in the stable tier: `THIRD_LANE_TIERS = ('stable', 'wide')`; lane 3 still needs the revision 11 margin, so no extra concurrency at 160 to 184 GiB free; lane 4 still OFF and wide-only; `THIRD_LANE_ENABLED` stays the kill switch; monitor reports the effective stable cap (SPE-176) |

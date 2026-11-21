@@ -15,7 +15,7 @@ subagent fan-out. Run `scripts/memory-admission.py check --weight heavy` first; 
 | Physical RAM and compressed memory | `hw.memsize`, `vm_stat` "occupied by compressor" | A large compressor share means the machine is already holding memory it cannot drop cheaply |
 | Swap used **and** sustained swap I/O | `vm.swapusage`, swapins+swapouts over a measured window | Used swap alone is history; the I/O rate is current behaviour |
 | Disk and swap-growth headroom | free bytes of the Data volume | Swap files grow on that volume; a full disk means swap cannot grow |
-| Active build/test processes | `ps` pid, ppid, state, elapsed and CPU time, %cpu, rss and the executable name (`cargo`, `rustc`, `clang`, `ld`, `xcodebuild`, ...); never the command line | Up to two heavy lanes, a third as a pilot (each beyond the first only when the resource budget passes, the third also needing the disk margin; ADR 0017 revisions 2, 7 and 11), counted as a process tree (workload), not per process; see "Idle orphans" below |
+| Active build/test processes | `ps` pid, ppid, state, elapsed and CPU time, %cpu, rss and the executable name (`cargo`, `rustc`, `clang`, `ld`, `xcodebuild`, ...); never the command line | Up to two heavy lanes, a third as a pilot in the stable and wide tiers (each beyond the first only when the resource budget passes, the third also needing the disk margin; ADR 0017 revisions 2, 7, 11 and 12), counted as a process tree (workload), not per process; see "Idle orphans" below |
 | Load per core | `getloadavg` / CPU count | Scheduler saturation that RAM numbers do not show |
 | Reservations and ownership | the existing `disk-admission.py` gate (reserve, lane cap, process identity) | Task ownership already lives there; it is not duplicated |
 
@@ -393,7 +393,7 @@ which does not exec, applies the grant only to its own process.
 ## Concurrent heavy lanes (SPE-160)
 
 `heavy_lane_cap(tier, latch)` in `scripts/disk-admission.py` is the one place a lane count is decided: 0 while latched or below
-stable, else `HEAVY_LANES[tier]`, plus one in the wide tier only when `THIRD_LANE_ENABLED` (on, as a pilot; ADR 0017 revision 7), never above `LANE_CEILING` (3).
+stable, else `HEAVY_LANES[tier]`, plus one in each tier of `THIRD_LANE_TIERS` (stable and wide) only when `THIRD_LANE_ENABLED` (on, as a pilot; ADR 0017 revisions 7 and 12), never above `LANE_CEILING` (3). The table stays the two-lane base, so `THIRD_LANE_ENABLED = False` is the one-line kill switch that restores two lanes in every tier.
 The shipped `HEAVY_LANES` value is 2 in stable and wide since the final, separately reviewed flip commit of ADR 0017 revision 2;
 reverting that commit restores 1 (rollback procedure in the ADR) and the rules below go dormant.
 
@@ -513,17 +513,17 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
 
 ## Third lane disk margin
 
-A third heavy lane (wide tier, ADR 0017 revision 11) needs, besides the budget, `free - reserved - request >= 160 GiB` (`HEAVY_FLOOR` plus
+A third heavy lane (stable or wide tier, ADR 0017 revisions 11 and 12) needs, besides the budget, `free - reserved - request >= 160 GiB` (`HEAVY_FLOOR` plus
 `THIRD_LANE_MARGIN`, 60 GiB), with every live, granted and orphaned reservation counted once. It applies at `reserve` (a same-process refresh
 is exempt), `queue advance`, `queue claim`, backfill candidates and head protection (the head's own lane 3 once its blockers release). The
 refusal reads `budget: lane 3 needs N GiB free after all reservations and this request, 160 GiB required`. Lanes 1 and 2 and lane 4 are
-unaffected. Below 200 GiB free (the stable tier; the recent measured 160 to 184 GiB is within it) no third lane exists with or without the margin. `scripts/admission-monitor.py` does not
-model the margin.
+unaffected. In the stable tier (100 to under 200 GiB free) the margin leaves room for a third lane only while all reservations plus the request stay within 40 GiB; the recently measured 160 to 184 GiB free with 32 to 55 GiB held and 25 to 40 GiB requested admits none. `scripts/admission-monitor.py` does not
+model the margin; its `callers` listing reports the effective stable cap (the table plus the third lane where `THIRD_LANE_TIERS` lists stable).
 
 ## Four heavy lanes (shipped off)
 
 The fourth lane (SPE-176, ADR 0017 revision 8) is code behind `FOURTH_LANE_ENABLED = False` in `scripts/disk-admission.py`. While it is
-off, `heavy_lane_cap` and every refusal text are unchanged (three lanes in the wide tier). There is no runtime switch: enabling is a
+off, `heavy_lane_cap` and every refusal text are unchanged (three lanes in the stable and wide tiers; the fourth lane is wide-only and its head-protection gap, ADR 0017 revision 12, must be closed before it is ever enabled). There is no runtime switch: enabling is a
 separate reviewed pull request that flips the constant, and rollback is reverting it. Running jobs are never signalled either way.
 
 With it on (and `THIRD_LANE_ENABLED`), the wide tier allows four lanes (`FOUR_LANE_CEILING`). Lane 4 additionally needs, at `reserve`,
