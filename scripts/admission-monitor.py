@@ -1582,6 +1582,10 @@ def inventory(root):
         tiers = re.search(r'^THIRD_LANE_TIERS = \(([^)]*)\)', text, re.M)
         stable_cap = (int(lanes.group(1)) + (1 if lanes and third and tiers and re.search(r"'stable'", tiers.group(1)) else 0)
                       if lanes else None)
+        # heavy_lane_cap never exceeds LANE_CEILING, so the displayed cap is clamped to it; a copy without the constant is shown unclamped.
+        ceiling = re.search(r'^LANE_CEILING = (\d+)', text, re.M)
+        if stable_cap is not None and ceiling:
+            stable_cap = min(stable_cap, int(ceiling.group(1)))
         kind = ('current' if proto else 'memory-gated-advance-unstamped' if 'memory_fn' in text else 'outdated')
         # Bounded backfill (ADR 0017 rev 9): every poller copy must carry the same revision before it is enabled. `hardened` is the
         # SPE-176 follow-up (claim-time head re-check, BACKFILL_GRANT_S window); `absent` predates backfill entirely.
