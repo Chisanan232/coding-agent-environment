@@ -920,6 +920,103 @@ class BackfillWindow(Base):
         self.assertEqual(rec._evaluate(entry, env, self.now + timedelta(seconds=rec.NOTICE_S + 1)), (False, ['waiter-alive']))
 
 
+class DecisionLog(Base):
+    """`backfill-decision` receipts (SPE-176): the candidate, the head, and the one closed-vocabulary reason, logged once per change."""
+
+    def decisions(self):
+        return self.receipts('backfill-decision')
+
+    def test_a_refusal_is_logged_once_with_head_blocker_candidate_and_reason(self):
+        self.blocker, _ = self.running('blocker', 'build-workspace', [SHARED], 40)
+        self.head = self.enqueue('head', 'build-workspace', [SHARED], 40)
+        same = self.enqueue('same', 'build-crate', [SHARED])
+        with backfill():
+            out = self.advance()
+            self.advance(now=self.now + timedelta(minutes=1))
+            self.advance(now=self.now + timedelta(minutes=2), memory_fn=lambda: (True, 'ok'))
+        self.assertEqual(out['backfilled'], [])
+        (line,) = self.decisions()
+        self.assertEqual((line['id'], line['label'], line['blocked_id'], line['blocker_id'], line['blocker_ids'], line['outcome'], line['reason']),
+                         (same, 'same', self.head, self.blocker, [self.blocker], 'refused', 'key-overlap-pivot'))
+        self.assertIn(line['reason'], da.BACKFILL_DECISION_REASONS)
+
+    def test_an_unchanged_refusal_is_logged_again_only_after_the_window(self):
+        self.historical()
+        with backfill():
+            self.advance(waiter_token_fn=lambda pid: (_ for _ in ()).throw(OSError('ps unavailable')))
+            self.advance(now=self.now + timedelta(seconds=da.BACKFILL_SHADOW_WINDOW_S - 1),
+                         waiter_token_fn=lambda pid: (_ for _ in ()).throw(OSError('ps unavailable')))
+            self.assertEqual(len([d for d in self.decisions() if d['id'] == self.docker_a]), 1)
+            self.advance(now=self.now + timedelta(seconds=da.BACKFILL_SHADOW_WINDOW_S + 1),
+                         waiter_token_fn=lambda pid: (_ for _ in ()).throw(OSError('ps unavailable')))
+        self.assertEqual([d['reason'] for d in self.decisions() if d['id'] == self.docker_a], ['waiter-not-alive'] * 2)
+
+    def test_a_changed_reason_is_logged_at_once_and_head_protection_names_its_part(self):
+        self.historical()
+        with backfill():
+            self.advance(free=200 * GIB)                      # 200 - 40 reserved - 32 candidate - 40 head = 88 GiB < the 100 GiB floor
+            self.advance(free=200 * GIB, now=self.now + timedelta(seconds=30))
+            self.advance(waiter_token_fn=lambda pid: (_ for _ in ()).throw(OSError('ps unavailable')), now=self.now + timedelta(seconds=60))
+        first = [d for d in self.decisions() if d['id'] == self.docker_a]
+        self.assertEqual([d['reason'] for d in first], ['head-unprotected-disk', 'waiter-not-alive'])
+
+    def test_a_grant_is_logged_as_granted_and_qualified(self):
+        self.historical()
+        with backfill():
+            out = self.advance()
+            self.advance(now=self.now + timedelta(minutes=1))
+        self.assertEqual(out['backfilled'], [self.docker_a])
+        granted = [d for d in self.decisions() if d['outcome'] == 'granted']
+        self.assertEqual([(d['id'], d['reason'], d['blocked_id']) for d in granted], [(self.docker_a, 'qualified', self.head)])
+
+    def test_the_memory_gate_refusal_and_the_in_flight_cap_are_logged(self):
+        self.running('blocker', 'build-crate', [SHARED])
+        head = self.enqueue('head', 'build-crate', [SHARED])
+        first = self.enqueue('first', 'container-suite', ['docker'], 8, cpus=1)
+        second = self.enqueue('second', 'container-suite', ['other'], 8, cpus=1)
+        with backfill():
+            self.advance(memory_fn=lambda: (False, 'pressure'))
+            self.advance(memory_fn=lambda: (False, 'pressure'), now=self.now + timedelta(seconds=30))
+            self.advance(memory_fn=lambda: (True, 'ok'), now=self.now + timedelta(seconds=60))
+            self.advance(memory_fn=lambda: (True, 'ok'), now=self.now + timedelta(seconds=90))
+        self.assertEqual([(d['id'], d['blocked_id'], d['outcome'], d['reason']) for d in self.decisions()],
+                         [(first, head, 'refused', 'memory-gate'), (first, head, 'granted', 'qualified'),
+                          (second, head, 'refused', 'in-flight-cap')])
+
+    def test_no_requeue_capability_is_logged_beside_its_shadow_receipt(self):
+        self.blocker, _ = self.running('blocker', 'build-workspace', [SHARED], 40)
+        self.head = self.enqueue('head', 'build-workspace', [SHARED], 40)
+        old = self.enqueue('old', 'container-suite', ['docker'], 32, capable=False)
+        with backfill():
+            self.advance()
+        self.assertEqual([(d['id'], d['reason']) for d in self.decisions()], [(old, 'no-requeue-capability')])
+        self.assertEqual(len(self.receipts('backfill-shadow')), 1)
+
+    def test_off_mode_writes_no_decision_receipt(self):
+        self.historical()
+        with backfill(enabled=False):
+            self.advance()
+        self.assertEqual(self.decisions(), [])
+
+    def test_logging_never_changes_a_decision(self):
+        import shutil
+        self.historical()
+        other = Path(self.temp.name).resolve() / 'copy/admission/state.json'
+        shutil.copytree(self.path.parent, other.parent)
+        with backfill():
+            logged = da.queue_advance(self.path, lambda: 200 * GIB, now=self.now, host_fn=self.host, waiter_token_fn=None)
+            with unittest.mock.patch.object(da, '_log_backfill_decision', lambda *a, **k: None):
+                silent = da.queue_advance(other, lambda: 200 * GIB, now=self.now, host_fn=self.host, waiter_token_fn=None)
+        self.assertEqual(logged, silent)
+        self.assertTrue(self.decisions())
+
+        def shape(path):
+            entries = {e['id']: (e['state'], e.get('grant')) for e in da._queue_entries(path)[0]}
+            lines = (da.queue_dir(path) / 'receipts.jsonl').read_text().splitlines()
+            return entries, [(json.loads(x)['event'], json.loads(x)['id']) for x in lines if json.loads(x)['event'] != 'backfill-decision']
+        self.assertEqual(shape(self.path), shape(other))
+
+
 class Lows(Base):
     def test_off_mode_shadow_judges_a_later_candidate_beside_the_earlier_one(self):
         self.running('blocker', 'build-crate', [SHARED])                  # 4 slots
