@@ -330,16 +330,23 @@ def local_ci_comment_line(run, repo, pr, head):
     comments, rest_n, err = gate.merged_comments(run, repo, pr, p.get("comments"))
     if err or (rest_n or 0) >= 100 or len(p.get("comments") or []) >= 100:
         raise EvidenceRefused("the PR comments could not be read completely")
-    lines = [m for c in comments if (c.get("author") or {}).get("login", "").lower() == me
-             for m in gate.LOCAL_RE.findall(re.sub(r"```.*?```", "", c.get("body") or "", flags=re.S))]
-    for raw in reversed(lines):
-        try:
-            rec = json.loads(raw, object_pairs_hook=gate._no_dup)
-        except ValueError:
+    items = []   # (record or None, comment) in comment order, as the gate's local-first basis reads them
+    for c in comments:
+        if (c.get("author") or {}).get("login", "").lower() != me:
             continue
-        if isinstance(rec, dict) and rec.get("head") == head:
-            return rec
-    raise EvidenceRefused("no OWNER-MERGE-LOCAL-CI comment by the authenticated user for this head")
+        for m in gate.LOCAL_RE.finditer(re.sub(r"~~~.*?~~~", "", re.sub(r"```.*?```", "", c.get("body") or "", flags=re.S), flags=re.S)):
+            try:
+                rec = json.loads(m.group(1), object_pairs_hook=gate._no_dup)
+            except ValueError:
+                rec = None
+            if rec is None and head in m.group(1) or isinstance(rec, dict) and rec.get("head") == head:
+                items.append((rec, c))
+    if not items:
+        raise EvidenceRefused("no OWNER-MERGE-LOCAL-CI comment by the authenticated user for this head")
+    rec, c = items[-1]   # the newest record decides, and it must be unedited and visible (GraphQL flags; a REST-only copy never qualifies)
+    if rec is None or c.get("includesCreatedEdit") is not False or c.get("isMinimized") is not False:
+        raise EvidenceRefused("the newest OWNER-MERGE-LOCAL-CI comment for this head is unreadable, edited, minimized or lacks GraphQL integrity flags")
+    return rec, c.get("createdAt")
 
 
 def build_evidence(run, a, now=None):
@@ -351,8 +358,9 @@ def build_evidence(run, a, now=None):
     if os.path.islink(logs) or not os.path.isdir(logs) or os.stat(logs).st_uid != os.getuid() or os.stat(logs).st_mode & 0o077:
         raise EvidenceRefused("the evidence directory must be a real directory of the caller with mode 0700")
     tag = f"{a.repo.replace('/', '__')}-{a.pr}"
+    posted_at = None
     if a.from_pr_comment:
-        rec = local_ci_comment_line(run, a.repo, a.pr, a.head)
+        rec, posted_at = local_ci_comment_line(run, a.repo, a.pr, a.head)
     else:
         path = a.record or record_path(logs, a.head, tag)
         try:
@@ -367,7 +375,7 @@ def build_evidence(run, a, now=None):
     if rec["repo"].lower() != a.repo.lower() or rec["pr"] != int(a.pr) or rec["head"] != a.head:
         raise EvidenceRefused("the record is for another repo, PR or head")
     try:
-        pr = json.loads(run("pr", "view", str(a.pr), "--repo", a.repo, "--json", "headRefOid,baseRefName,headRefName"))
+        pr = json.loads(run("pr", "view", str(a.pr), "--repo", a.repo, "--json", "headRefOid,baseRefName,headRefName,title"))
     except (RuntimeError, OSError, subprocess.SubprocessError, ValueError):
         raise EvidenceRefused("the live PR cannot be read from gh") from None
     if pr.get("headRefOid") != a.head:
@@ -376,6 +384,14 @@ def build_evidence(run, a, now=None):
         raise EvidenceRefused("the record base does not match the live PR base")
     if pr.get("headRefName") != rec["context"]["PULL_BRANCH"]:
         raise EvidenceRefused("the record was made for a different PR head ref")
+    if rec["context"] != {"PULL_BRANCH": pr.get("headRefName"), "PR_TITLE": pr.get("title"), "GIT_BASE": rec["base_sha"]}:
+        raise EvidenceRefused("the record's PR branch, title or base commit differ from the PR now; re-record")
+    try:   # the gate's own expected merge base; a moved base means the recorded run no longer describes what would merge
+        live_base = run("api", f"repos/{a.repo}/compare/{rec['base']}...{a.head}", "--jq", ".merge_base_commit.sha").strip()
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        raise EvidenceRefused("the live merge base cannot be read from gh") from None
+    if rec["base_sha"] != live_base:
+        raise EvidenceRefused("the base moved since recording (recorded base commit is not the live merge base); re-record")
     try:
         entry = load_entry(a.repo, a.config)
     except (OSError, ValueError) as e:
@@ -398,6 +414,12 @@ def build_evidence(run, a, now=None):
         raise EvidenceRefused("record lacks required local checks: " + ", ".join(n for n in required if n not in names))
     age = min(max_age, entry["max_age_hours"]) * 3600
     run_at = min(started)
+    if posted_at is not None:
+        try:
+            if max(finished) > gate._stamp(posted_at):
+                raise EvidenceRefused("the posted record claims to finish after it was posted")
+        except ValueError:
+            raise EvidenceRefused("the record comment has no valid creation time") from None
     if now - run_at > age or max(finished) > now + 60 or run_at > now + 60:
         raise EvidenceRefused("the record is stale or in the future")
     for c in rec["commands"]:
