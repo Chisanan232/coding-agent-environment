@@ -674,6 +674,17 @@ class Evidence(unittest.TestCase):
                           "body": f"OWNER-MERGE-REVIEW head={self.head} verdict=PASS blocking=0 reviewer={REVIEWER}"}]
         self.refused("no OWNER-MERGE-REVIEW comment")
 
+    def test_a_failing_blocked_or_self_review_comment_never_becomes_pass_evidence(self):
+        line = self.comments[0]["body"]
+        for label, bodies in (("newest FAIL", [line, line.replace("verdict=PASS", "verdict=FAIL")]),
+                              ("older FAIL", [line.replace("verdict=PASS", "verdict=FAIL"), line]),
+                              ("blocking", [line.replace("blocking=0", "blocking=1")]),
+                              ("self", [line.replace(REVIEWER, "self")]), ("login", [line.replace(REVIEWER, "me")])):
+            with self.subTest(label):
+                self.comments = [dict(self.comments[0], body=b, createdAt=rec.stamp(time.time() - 60 + i)) for i, b in enumerate(bodies)]
+                self.refused("review comment")
+                self.assertFalse(os.path.exists(self.evidence_file))
+
     def test_reviewer_comes_from_the_comment_and_is_never_invented(self):
         self.refused("--reviewer differs", "--reviewer", "someone-else")
         self.comments[0]["body"] = self.comments[0]["body"].replace(REVIEWER, "unlisted-reviewer")
