@@ -76,6 +76,19 @@ Add `scripts/admission-monitor.py`: a stdlib-only, deterministic, single-shot `t
   | `queue-wait-excessive` | age since `created`, entry still QUEUED/ELIGIBLE inside its window | status notice at 4 h (no page); incident at 12.5 h; second phase `wait-expiry-near` at 20 h of the 24 h window | at most two per incident | entry id + `wait` | `check-queued-wait` |
   | `workload-over-deadline` | CLAIMED, holder alive, elapsed since `claimed_at` | 2x the entry's declared `deadline_s` (none is written today), else 2 x 6 h | one | entry id + `run` | `check-over-deadline-workload` |
 
+  **Abandoned claim (clock `claim`, cause `stale-claim`, SPE-176).** A CLAIMED entry whose supervising wrapper is gone (pid absent, a zombie, or reused by another process, compared by
+  start token) and was never inspected running (`holder_status` reason `workload-not-witnessed`: the scheduler keeps the lane on purpose) used to read as `unresolved`, which `classify` neither
+  flagged nor excluded from the `disk-floor` sum, so the queue behind it showed a false `disk-floor` indefinitely. The monitor now counts observations of the same holder identity
+  (state `dead_claims`): **5 observations at least 30 s apart (about 5 min) on a claim at least 15 min old** confirm it. The count survives an observation gap and restarts if the
+  holder is alive, uninspectable, still has a recorded workload process running (`workload-outlives-wrapper`), or is a different process. Confirmed, the verdict is `stale-claim`
+  (ahead of `disk-floor`, which no longer counts the dead claim as running work), `status.json` lists `abandoned_claims` (id, label, repo, claim age, bytes held, owner kind and
+  reachability, the entries blocked behind it), and one `stale-claim` incident (key entry id + `claim`, same dedup, strict delivery, retention and outbox line with evidence
+  `holder-gone`, `claim-unwitnessed`) is raised on any tick, gap or not. It is never released, cancelled, advanced or signalled (decision B): the owner confirms the claim ended and
+  releases it explicitly. A claim whose exit the scheduler can prove (`exited`) keeps the verdict-level alert and advance path. **Limit:** `stale-claim` is not a ZeroClaw spool kind,
+  so it reaches the supervisor only after a spool kind and schema revision are added; it reaches every backend that accepts the `session` kind.
+  **Clock.** Gap detection compares wall time with `host_uptime()` (`CLOCK_UPTIME_RAW`, else `CLOCK_MONOTONIC`). `time.monotonic()` under Apple's `/usr/bin/python3` 3.9.6 restarts near 0 in each process, so with a
+  new launchd process per tick every tick over 60 s apart was an observation gap (all 2171 recorded ticks), which reset blocker confirmations and the progress clock and skipped wait incidents and escalated
+  hand-offs. `status.json` carries `observation_gap_streak`; a streak that never returns to 0 means a broken clock, not a sleeping host.
   A global cause already holding the queue (`disk-floor`, `memory-pressure`, `memory-hysteresis*`) is attributed in the incident's `blocker` field (also
   `higher-entry-running` or `none`); the entry still gets its one incident past 12.5 h. At most 12 wait and 6 run incidents are open at once, oldest wait first; the
   rest are counted in `wait_overflow` so 200 old entries never page 200 times or grow the state past its cap. An incident is resolved (`resolved_at`, owner-notice state `resolved`) when the
