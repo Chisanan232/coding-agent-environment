@@ -212,7 +212,7 @@ or a link, is never overwritten; an unchanged record reproduces the same bytes (
 `evidence-json` is unchanged and still produces evidence without a `local_ci` block.
 
 Recordings made before the record file existed left only the `.log` files (digests are not stored anywhere on disk). If the authenticated user posted the
-recorder's printed line as a PR comment (the local-first flow above), `evidence --from-pr-comment` uses that line under the gate's local-first comment rules (the authenticated user's newest unfenced record for the head, unedited and not minimized per the GraphQL flags, posted no earlier than the run finished) and still re-verifies every log digest; otherwise
+recorder's printed line as a PR comment (the local-first flow above), `evidence --from-pr-comment` uses that line under the gate's local-first comment rules (the authenticated user's newest unfenced record for the head, unedited and not minimized per the GraphQL flags, posted no earlier than the run finished) and still re-verifies every log digest; the fallback does not repeat the gate's scan for failing lines in fenced, quoted or minimized text; `owner-merge-gate.py check` remains the control for that. Otherwise
 run `record` once more at the same head. Limit: the record and logs are written by the same OS user that runs the tool, so this removes hand-typed results but cannot prove a forged record
 (a user who can edit the record and the logs together); the signature and the host's own classifier are the remaining controls.
 
