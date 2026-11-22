@@ -2196,6 +2196,97 @@ class AbandonedClaims(MonitorBase):
         self.assertNotEqual(self.state()['incidents'][self.head_ids[0] + ':wait']['status'], mon.SUPPRESSED)      # a dead holder is never healthy running work
 
 
+    # ---- a coexisting genuine cause is still alerted (the abandoned claim has its own incident and must not hide or replace it) ----
+    def grant_entry(self, qid, minutes_ago):
+        """GRANTED by hand (the scheduler's own advance would release the fixture's claim): a declared waiter, so it is a continuation, and no granted receipt, so no runner stamp."""
+        entry = self.entry(qid)
+        at = self.clock.now - timedelta(minutes=minutes_ago)
+        entry.update(state='GRANTED', grant={'at': mon.iso(at), 'expires': mon.iso(at + timedelta(hours=100))},      # a long window: the cause outlasts the test's ticks
+                     
+                     waiter={'pid': os.getpid(), 'start_token': da.waiter_token(os.getpid())})
+        da._write_queue_entry(self.state_path, entry)
+
+    def coexist(self, name):
+        if name == 'disk-floor':
+            self.free = 100 * GIB      # without the dead claim's 40 GiB the 40 GiB head still does not fit above the 100 GiB floor
+        elif name == 'memory-pressure':
+            self.mem['metrics'] = dict(CALM, pressure_level=2)
+        elif name == 'memory-hysteresis-static-compressor':
+            self.mem['latched'] = True
+        elif name == 'outdated-caller':
+            self.free = 400 * GIB
+            self.grant_entry(self.head_ids[0], 1)
+        elif name == 'failed-continuation':
+            self.free = 400 * GIB
+            self.grant_entry(self.head_ids[0], 80 * 60)      # past 75% of its window, still unclaimed
+
+    def test_every_coexisting_cause_still_alerts_beside_the_stale_claim_incident(self):
+        for name in ('disk-floor', 'memory-pressure', 'memory-hysteresis-static-compressor', 'outdated-caller', 'failed-continuation'):
+            with self.subTest(cause=name):
+                self.setUp()
+                self.claim(0.5)
+                self.die()
+                self.coexist(name)
+                out = self.run_ticks(80)
+                self.assertIn(name, out['causes'])
+                self.assertIn('stale-claim', out['causes'])
+                self.assertEqual(out['primary'], 'stale-claim')      # status leads with the root cause
+                self.assertEqual(len(self.stale_pages()), 1, name)
+                others = [a for a in self.alerts if a['cause'] == name]
+                self.assertEqual(len(others), 1, (name, [a['cause'] for a in self.alerts]))
+                self.assertNotIn('stale-claim', others[0]['causes'])      # the verdict-level alert does not repeat the abandoned claim
+
+    def test_an_abandoned_claim_alone_pages_only_through_its_incident(self):
+        self.claim(0.5)
+        self.die()
+        out = self.run_ticks(80)
+        self.assertEqual(sorted({a['cause'] for a in self.alerts}), ['stale-claim'])
+        self.assertNotIn('alert', out)
+        self.assertEqual(len(self.stale_pages()), 1)
+
+    def test_a_different_holder_on_the_same_entry_restarts_the_count_by_token_alone(self):
+        self.claim(0.5)
+        self.die()
+        self.run_ticks(mon.ABANDON_TICKS - 1)
+        entry = self.entry(self.first)
+        entry['holder'].update(start_token='Sun Nov 22 03:00:00 2026')      # same entry id and pid, a different process
+        da._write_queue_entry(self.state_path, entry)
+        out = self.tick(60)
+        self.assertEqual((out['abandoned_claims'], self.state()['dead_claims'][self.first]['ticks']), ([], 1))
+
+    def test_two_ticks_less_than_the_spacing_apart_are_one_observation(self):
+        self.claim(0.5)
+        self.die()
+        self.run_ticks(2)
+        for _ in range(10):
+            self.tick(mon.CONFIRM_SPACING_S - 10)
+            self.tick(5)
+        ticks = self.state()['dead_claims'][self.first]['ticks']
+        self.assertLessEqual(ticks, 2 + 10 * 1 + 1)
+        self.assertLess(ticks, 2 + 20)      # twenty ticks inside ten windows counted at most once per window
+
+    def test_a_burst_of_first_notices_is_paced_per_tick_and_nothing_is_dropped(self):
+        for i in range(8):
+            self.enqueue('HORO-396%d' % i)
+        self.claim(14)
+        self.die()
+        for qid in [e['id'] for e in da._queue_entries(self.state_path)[0] if e['state'] == 'QUEUED']:
+            entry = self.entry(qid)
+            created = self.clock.now - timedelta(hours=13)
+            entry.update(created=mon.iso(created), wait_expires=mon.iso(created + timedelta(hours=24)))
+            da._write_queue_entry(self.state_path, entry)
+        per_tick = []
+        for _ in range(12):
+            n = len(self.alerts)
+            self.tick(60)
+            per_tick.append(len(self.alerts) - n)
+        self.assertLessEqual(max(per_tick), 3)      # the documented pace; the constant itself may not drift unnoticed
+        self.assertEqual(mon.FIRST_NOTICES_PER_TICK, 3)
+        self.run_ticks(10)
+        self.assertGreaterEqual(len([a for a in self.alerts if a['cause'] == 'queue-wait-excessive']), 8)      # deferred, never dropped
+        self.assertEqual(len(self.stale_pages()), 1)
+
+
 class Inventory(unittest.TestCase):
     def test_callers_are_classified_from_text_without_running_them(self):
         with tempfile.TemporaryDirectory() as root:
