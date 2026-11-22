@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -31,6 +32,7 @@ def load(name, rel):
 
 omg = load("omg", "scripts/owner-merge-gate.py")
 rec = load("omlc", "scripts/owner-merge-local-ci.py")
+runner_mod = rec.runner
 ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid", GIT_COMMITTER_NAME="t",
            GIT_COMMITTER_EMAIL="t@example.invalid", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
 REPO = "Chisanan232/r"
@@ -473,6 +475,247 @@ class Recorder(unittest.TestCase):
                 self.assertFalse(os.path.exists(self.marker))
         self.pr_info = ["not", "a", "dict"]
         self.assertEqual(self.record(py("pass"))[0], 2)
+
+
+REVIEWER = "claude-independent-agent"
+
+
+class Evidence(unittest.TestCase):
+    """`evidence` builds the runner's review-evidence file from a persisted record, in a temp HOME (no live state is touched)."""
+    entry, fake_gh, tearDown = Recorder.entry, Recorder.fake_gh, Recorder.tearDown
+
+    def setUp(self):
+        Recorder.setUp(self)
+        self.home = os.path.join(self.tmp.name, "home")
+        self.logs = os.path.join(self.home, ".claude", "owner-merge-evidence")
+        self.allow = os.path.join(self.home, ".claude", "owner-merge-runner-allowlist.json")
+        os.makedirs(os.path.dirname(self.allow), mode=0o700)
+        self.write_allow(["c0", "c1"])
+        self.review_at = rec.stamp(time.time() - 60)
+        self.comments = [{"author": {"login": "me"}, "createdAt": self.review_at,
+                          "body": f"OWNER-MERGE-REVIEW head={self.head} verdict=PASS blocking=0 reviewer={REVIEWER}"}]
+        self.live = {"headRefOid": self.head, "baseRefName": "main", "headRefName": "feat/x"}
+        patcher = mock.patch.object(runner_mod, "dir_chain_problems", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.checks = (py("print('one')"), py("print('two')"))
+        self.record_it()
+
+    def write_allow(self, required, **extra):
+        cfg = {"required_checks": [], "reviewers": [REVIEWER], "required_local_checks": required, **extra}
+        if os.path.lexists(self.allow):
+            os.unlink(self.allow)
+        with open(self.allow, "w") as f:
+            json.dump({"repos": {REPO: cfg}}, f)
+        os.chmod(self.allow, 0o600)
+
+    def record_it(self, *checks):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": self.home}), contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.code = rec.record(REPO, 7, "main", self.wt, self.entry(*(checks or self.checks)), "~/.claude/owner-merge-evidence")
+        self.printed = out.getvalue()
+        self.tag = f"{REPO.replace('/', '__')}-7"
+        self.record_file = rec.record_path(self.logs, self.head, self.tag)
+        self.evidence_file = os.path.join(self.logs, f"{self.tag}-{self.head[:12]}.json")
+
+    def run_gh(self, *args):
+        if args[:2] == ("api", "user"):
+            return "me\n"
+        if args[:2] == ("pr", "view"):
+            if args[-1] == "headRefOid,comments":
+                return json.dumps({"headRefOid": self.live["headRefOid"], "comments": []})
+            return json.dumps(self.live)
+        if args[0] == "api" and "comments" in args[1]:
+            return json.dumps(self.comments)
+        raise AssertionError(args)
+
+    def evidence(self, *extra, now=None, entry=None, run=None):
+        argv = ["evidence", "--repo", REPO, "--pr", "7", "--head", self.head, "--allowlist", self.allow, *extra]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": self.home}), mock.patch.object(rec, "load_entry", return_value=entry or self.entry(*self.checks)), \
+                mock.patch.object(rec.time, "time", return_value=now) if now else contextlib.nullcontext(), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = rec.main(argv, run=run or self.run_gh)
+        return code, out.getvalue(), err.getvalue()
+
+    def refused(self, why, *extra, **kw):
+        code, out, err = self.evidence(*extra, **kw)
+        self.assertEqual((code, out), (2, ""), err)
+        self.assertIn(why, err)
+        return err
+
+    def test_record_file_is_private_and_equals_the_printed_line(self):
+        self.assertEqual(self.code, 0)
+        self.assertEqual(stat.S_IMODE(os.stat(self.record_file).st_mode), 0o600)
+        self.assertEqual("OWNER-MERGE-LOCAL-CI " + pathlib.Path(self.record_file).read_text().strip(), self.printed.strip())
+        self.assertEqual([n for n in os.listdir(self.logs) if n.endswith(".tmp")], [])
+
+    def test_a_symlinked_record_target_is_refused_before_any_check_runs(self):
+        os.unlink(self.record_file)
+        os.symlink(self.marker, self.record_file)
+        self.record_it(py(f"open({self.marker!r}, 'w')"))
+        self.assertEqual(self.code, 2)
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_positive_path_passes_the_runners_own_validation(self):
+        code, out, err = self.evidence()
+        self.assertEqual(code, 0, err)
+        path, digest = re.match(r"owner-merge-local-ci: evidence written (\S+) sha256 ([0-9a-f]{64})$", out.strip()).groups()
+        self.assertEqual(path, self.evidence_file)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        cfg = runner_mod.repo_config(runner_mod.load_allowlist(self.allow), REPO)
+        got, local = runner_mod.load_evidence(path, self.head, REPO, "7", "main", cfg, None, time.time())
+        self.assertEqual((got, local), (digest, {"c0": 0, "c1": 0}))
+        self.assertEqual(json.loads(pathlib.Path(path).read_text())["reviewer"], REVIEWER)
+
+    def test_without_the_record_the_runner_refuses_what_the_old_flow_produced(self):
+        ev = omg.evidence_json(REPO, 7, "main", self.head, REVIEWER, reviewed_at=self.review_at)
+        pathlib.Path(self.evidence_file).write_text(json.dumps(ev))
+        cfg = runner_mod.repo_config(runner_mod.load_allowlist(self.allow), REPO)
+        with self.assertRaises(runner_mod.Refused):
+            runner_mod.load_evidence(self.evidence_file, self.head, REPO, "7", "main", cfg, None, time.time())
+
+    def test_idempotent_for_an_unchanged_record_and_upgrades_an_evidence_file_without_local_ci(self):
+        pathlib.Path(self.evidence_file).write_text(json.dumps(omg.evidence_json(REPO, 7, "main", self.head, REVIEWER, reviewed_at=self.review_at)))
+        os.chmod(self.evidence_file, 0o600)
+        self.assertIn("replaced", self.evidence()[1])
+        first = pathlib.Path(self.evidence_file).read_bytes()
+        code, out, _ = self.evidence()
+        self.assertEqual(code, 0)
+        self.assertIn("unchanged", out)
+        self.assertEqual(pathlib.Path(self.evidence_file).read_bytes(), first)
+
+    def test_log_digest_mismatch_refuses(self):
+        log = rec.log_path(self.logs, "c0", self.head, self.tag)
+        pathlib.Path(log).write_text("tampered")
+        self.refused("does not match the recorded SHA-256")
+        self.assertFalse(os.path.exists(self.evidence_file))
+
+    def test_missing_log_and_symlinked_log_refuse(self):
+        log = rec.log_path(self.logs, "c1", self.head, self.tag)
+        os.rename(log, log + ".moved")
+        self.refused("cannot be opened")
+        os.symlink(log + ".moved", log)
+        self.refused("cannot be opened")
+
+    def test_head_mismatch_with_the_live_pr_refuses(self):
+        self.live["headRefOid"] = "1" * 40
+        self.refused("live PR head")
+
+    def test_head_argument_must_equal_the_recorded_head(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": self.home}), contextlib.redirect_stderr(err):
+            code = rec.main(["evidence", "--repo", REPO, "--pr", "7", "--head", "2" * 40, "--allowlist", self.allow], run=self.run_gh)
+        self.assertEqual(code, 2)
+
+    def test_base_and_head_ref_mismatches_refuse(self):
+        self.live["baseRefName"] = "develop"
+        self.refused("base")
+        self.live["baseRefName"] = "main"
+        self.live["headRefName"] = "other"
+        self.refused("different PR head ref")
+        self.live["headRefName"] = "feat/x"
+        self.refused("base", "--base", "develop")
+
+    def test_wrong_repo_or_pr_in_the_record_refuses(self):
+        data = json.loads(pathlib.Path(self.record_file).read_text())
+        for field, value in (("repo", "Chisanan232/other"), ("pr", 8)):
+            with self.subTest(field):
+                pathlib.Path(self.record_file).write_text(json.dumps(dict(data, **{field: value})))
+                self.refused("another repo, PR or head")
+
+    def test_missing_required_name_refuses(self):
+        self.write_allow(["c0", "c1", "c2"])
+        self.refused("lacks required local checks: c2")
+        self.write_allow(["c0"])
+        self.refused("lacks required", "--require", "ghost")
+
+    def test_nonzero_exit_refuses(self):
+        self.record_it(py("print('one')"), py("import sys; sys.exit(3)"))
+        self.assertEqual(self.code, 1)
+        self.checks = (py("print('one')"), py("import sys; sys.exit(3)"))
+        self.refused("did not pass: c1")
+
+    def test_record_that_differs_from_the_trust_file_refuses(self):
+        self.refused("differ from the owner's trust file", entry=self.entry(*self.checks, py("print('extra')")))
+        self.refused("differ from the owner's trust file", entry=self.entry(*self.checks, env={"X": "1"}))
+
+    def test_a_forged_extra_command_is_refused(self):
+        data = json.loads(pathlib.Path(self.record_file).read_text())
+        data["commands"].append(dict(data["commands"][0], name="c9"))
+        pathlib.Path(self.record_file).write_text(json.dumps(data))
+        self.refused("differ from the owner's trust file")
+
+    def test_stale_record_refuses(self):
+        self.refused("stale", now=time.time() + 25 * 3600)
+        self.write_allow(["c0", "c1"], max_evidence_age_hours=1)
+        self.refused("stale", now=time.time() + 2 * 3600)
+
+    def test_record_file_must_be_private_and_not_a_link(self):
+        os.chmod(self.record_file, 0o644)
+        self.refused("mode 0600")
+        os.chmod(self.record_file, 0o600)
+        moved = self.record_file + ".moved"
+        os.rename(self.record_file, moved)
+        os.symlink(moved, self.record_file)
+        self.refused("cannot be opened")
+
+    def test_hand_edited_or_duplicate_key_record_refuses(self):
+        text = pathlib.Path(self.record_file).read_text()
+        pathlib.Path(self.record_file).write_text(text.replace('"schema":1', '"schema":1,"schema":1', 1))
+        self.refused("not valid JSON")
+        pathlib.Path(self.record_file).write_text("{}")
+        self.refused("malformed")
+
+    def test_missing_or_other_head_review_comment_refuses(self):
+        self.comments = []
+        self.refused("no OWNER-MERGE-REVIEW comment")
+        self.comments = [{"author": {"login": "someone"}, "createdAt": self.review_at,
+                          "body": f"OWNER-MERGE-REVIEW head={self.head} verdict=PASS blocking=0 reviewer={REVIEWER}"}]
+        self.refused("no OWNER-MERGE-REVIEW comment")
+
+    def test_reviewer_comes_from_the_comment_and_is_never_invented(self):
+        self.refused("--reviewer differs", "--reviewer", "someone-else")
+        self.comments[0]["body"] = self.comments[0]["body"].replace(REVIEWER, "unlisted-reviewer")
+        self.refused("not in the allowlisted reviewers")
+
+    def test_existing_evidence_for_another_head_or_a_link_is_not_overwritten(self):
+        other = omg.evidence_json(REPO, 7, "main", "3" * 40, REVIEWER)
+        pathlib.Path(self.evidence_file).write_text(json.dumps(other))
+        os.chmod(self.evidence_file, 0o600)
+        self.refused("another repo, PR or head")
+        self.assertEqual(json.loads(pathlib.Path(self.evidence_file).read_text())["head"], "3" * 40)
+        os.unlink(self.evidence_file)
+        os.symlink(self.marker, self.evidence_file)
+        self.refused("cannot be opened")
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_signed_allowlist_needs_a_key_and_signs_with_it(self):
+        self.write_allow(["c0", "c1"], require_signed_evidence=True)
+        with open(self.allow) as f:
+            data = json.load(f)
+        data["evidence_key_file"] = os.path.join(self.home, "key")
+        pathlib.Path(self.allow).write_text(json.dumps(data))
+        key = pathlib.Path(self.home, "key")
+        key.write_bytes(b"k" * 40)
+        os.chmod(key, 0o600)
+        self.refused("requires signed evidence")
+        code, out, err = self.evidence("--key-file", str(key))
+        self.assertEqual(code, 0, err)
+        cfg = runner_mod.repo_config(runner_mod.load_allowlist(self.allow), REPO)
+        runner_mod.load_evidence(self.evidence_file, self.head, REPO, "7", "main", cfg, runner_mod.load_key(str(key)), time.time())
+
+    def test_fallback_uses_only_the_line_the_authenticated_user_posted(self):
+        os.unlink(self.record_file)
+        line = self.printed.strip()
+        self.refused("cannot be opened")
+        self.comments.append({"author": {"login": "me"}, "createdAt": self.review_at, "body": line})
+        code, out, err = self.evidence("--from-pr-comment")
+        self.assertEqual(code, 0, err)
+        self.comments[-1]["author"]["login"] = "intruder"
+        self.refused("no OWNER-MERGE-LOCAL-CI comment", "--from-pr-comment")
+        self.comments[-1] = {"author": {"login": "me"}, "createdAt": self.review_at, "body": "```\n" + line + "\n```"}
+        self.refused("no OWNER-MERGE-LOCAL-CI comment", "--from-pr-comment")
 
 
 if __name__ == "__main__":
