@@ -204,8 +204,9 @@ Sequence, each step its own call, all at the same exact head:
 the live PR (`gh pr view`) is at that head with the recorded base and head ref; the recorded checks (names, argv, order, `env`) equal the
 owner's trust file; every recorded check exited 0 and every `required_local_checks` name (plus any `--require NAME`) is present; every
 log file re-read from disk hashes to its recorded SHA-256; the oldest start is within the smaller of the allowlist's `max_evidence_age_hours` and the trust file's `max_age_hours`;
-and the authenticated user's `OWNER-MERGE-REVIEW` comment for this head exists (reviewer and `reviewed_at` come from it; `--reviewer`, if given, must match, and
-the reviewer must be allowlisted). `--key-file` signs the file, which is needed when the allowlist requires signed evidence. An existing file for another repo, PR or head,
+and the authenticated user's `OWNER-MERGE-REVIEW` comment for this head exists and is accepted by the same rules as `check` (every at-head record PASS with blocking=0, so a later clean
+record never hides an earlier failing one; reviewer id not the authenticated login, `self`, `author` or `coordinator`; the controlled format where `check` requires it). Reviewer and `reviewed_at` come from it; `--reviewer`, if given, must match, and
+the reviewer must be allowlisted. `evidence-json --from-review-comment` applies the same review rules. `--key-file` signs the file, which is needed when the allowlist requires signed evidence. An existing file for another repo, PR or head,
 or a link, is never overwritten; an unchanged record reproduces the same bytes (idempotent), and an older file for the same head (for example from `evidence-json`) is replaced.
 `tests` in each `local_ci` check is always 0: the recorder does not count tests, and the runner only requires a non-negative integer.
 `evidence-json` is unchanged and still produces evidence without a `local_ci` block.
