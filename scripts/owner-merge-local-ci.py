@@ -405,7 +405,7 @@ def build_evidence(run, a, now=None):
         if digest != c["log_sha256"]:
             raise EvidenceRefused(f"log of {c['name']} does not match the recorded SHA-256")
     try:
-        at, reviewer = gate.review_comment(run, a.repo, a.pr, a.head)
+        at, reviewer = gate.review_comment(run, a.repo, a.pr, a.head, {a.repo.lower(): entry})
     except (ValueError, KeyError) as e:
         raise EvidenceRefused(f"review comment: {str(e)[:200]}") from None
     if a.reviewer and a.reviewer != reviewer:
