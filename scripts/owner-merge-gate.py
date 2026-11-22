@@ -1420,11 +1420,12 @@ def evidence_json(repo, pr, base, head, reviewer, kind="independent-agent", now=
             "reviewed_at": reviewed_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(current))}
 
 
-def review_completed_at(run, repo, pr, head):
-    """When the review of this exact head was recorded: the createdAt of the authenticated user's newest OWNER-MERGE-REVIEW comment for it.
+def review_comment(run, repo, pr, head):
+    """(createdAt, reviewer) of the authenticated user's newest OWNER-MERGE-REVIEW comment for this exact head.
 
-    The evidence file takes this instead of a caller-written time. The PR must still be at `head`, so a review of an older head is never
-    stamped onto a newer one. It reads the comment's creation time, not its last edit, which can only make the time earlier (stricter).
+    createdAt is when the review of this head was recorded. The evidence file takes it instead of a caller-written time. The PR must
+    still be at `head`, so a review of an older head is never stamped onto a newer one. It reads the comment's creation time, not its
+    last edit, which can only make the time earlier (stricter).
     """
     if not REPO_RE.fullmatch(repo) or not re.fullmatch(r"[1-9][0-9]{0,8}", str(pr)) or not re.fullmatch(r"[0-9a-f]{40}", head):
         raise ValueError("repo, pr and head (40-hex) must be well formed")
@@ -1437,12 +1438,17 @@ def review_completed_at(run, repo, pr, head):
         raise ValueError(f"the PR comments could not be read from REST: {comments_error}")
     if (rest_n or 0) >= 100 or len(p.get("comments") or []) >= 100:
         raise ValueError("100 or more comments; the newest record may be hidden, so no completion time is stamped")
-    stamps = [c.get("createdAt") for c in comments
-              if (c.get("author") or {}).get("login", "").lower() == me
-              and any(m[0] == head for m in REVIEW_RE.findall(re.sub(r"```.*?```", "", c.get("body") or "", flags=re.S)))]
-    if not stamps or not stamps[-1]:
+    found = [(c.get("createdAt"), m[3]) for c in comments
+             if (c.get("author") or {}).get("login", "").lower() == me
+             for m in REVIEW_RE.findall(re.sub(r"```.*?```", "", c.get("body") or "", flags=re.S)) if m[0] == head]
+    if not found or not found[-1][0]:
         raise ValueError("no OWNER-MERGE-REVIEW comment by the authenticated user for this head")
-    return stamps[-1]
+    return found[-1]
+
+
+def review_completed_at(run, repo, pr, head):
+    """The createdAt of the authenticated user's newest OWNER-MERGE-REVIEW comment for this head (see review_comment)."""
+    return review_comment(run, repo, pr, head)[0]
 
 
 def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None, version_policy=None, ci_exception=False, local_first=None):
