@@ -88,7 +88,9 @@ class MonitorBase(unittest.TestCase):
         self.statuses = {}
         self.process_answers = {}
         self.shim = types.SimpleNamespace(**{k: getattr(da, k) for k in dir(da) if not k.startswith('__')})
-        self.shim.holder_status = lambda pid, token, workload, *a: da.HolderStatus(self.statuses.get(pid, 'alive'))
+        self.reasons = {}
+        self.shim.holder_status = lambda pid, token, workload, *a: da.HolderStatus(self.statuses.get(pid, 'alive'), reason=self.reasons.get(pid, ''))
+        self.emit_error = False
 
     def env(self):
         limits = mon.default_limits(da, ma)
@@ -96,8 +98,14 @@ class MonitorBase(unittest.TestCase):
                        boot=lambda: self.boot, table=lambda: self.table, memory=lambda: dict(self.mem), free=lambda: self.free,
                        advance=lambda: self.advances.append(self.clock.now) or {'exit': 0}, notify=lambda a: self.alerts.append(a) or True,
                        clear=lambda: self.cleared.append(self.clock.now) or True,
-                       emit_incident=lambda alert: self.alerts.append(alert) or dict(self.emit_result),
+                       emit_incident=self.emit,
                        owner_process=lambda pid, token: self.process_answers.get(pid))      # never the real process table: unknown unless a test says otherwise
+
+    def emit(self, alert):
+        self.alerts.append(alert)
+        if self.emit_error:
+            raise OSError('notifier unavailable')
+        return dict(self.emit_result)
 
     def enqueue(self, ticket, nbytes=16 * GIB, session='0b1d2e3f-aaaa-bbbb-cccc-1234567890ab'):
         out = da.queue_enqueue(self.state_path, label='job-' + ticket.lower(), tickets=[ticket], repo='horonom/x', worktree=str(self.worktree),
@@ -1994,6 +2002,196 @@ class SharedClock(MonitorBase):
         outs = [self.default_clock_tick(72) for _ in range(5)]
         self.assertEqual(outs[-1]['primary'], 'disk-floor')
         self.assertTrue(outs[-1]['confirmed'])
+
+
+class AbandonedClaims(MonitorBase):
+    """SPE-176: a CLAIMED entry whose supervising wrapper died before any inspection saw it running keeps its lane and bytes (the scheduler asks for an
+    explicit release), so the queue behind it waited 10-12 h under a false `disk-floor` while the monitor reported nothing. The monitor reports it, never frees it."""
+    TOKEN = 'Sat Nov 21 11:36:00 2026'
+    NOT_WITNESSED = 'workload-not-witnessed: the wrapper ended before any inspection saw it running'
+
+    def setUp(self):
+        super().setUp()
+        self.mem['latched'] = False
+        self.free = 154 * GIB
+        self.head_ids = []
+        self.first = self.enqueue('HORO-3950', nbytes=40 * GIB)
+        self.head_ids = [self.enqueue('HORO-395%d' % i, nbytes=40 * GIB) for i in (1, 2)]
+
+    def entry(self, qid):
+        return [e for e in da._queue_entries(self.state_path)[0] if e['id'] == qid][0]
+
+    def claim(self, hours, pid=95165, **holder):
+        entry = self.entry(self.first)
+        entry.update(state='CLAIMED', holder=dict({'pid': pid, 'start_token': self.TOKEN, 'claimed_at': mon.iso(self.clock.now - timedelta(hours=hours))}, **holder))
+        da._write_queue_entry(self.state_path, entry)
+        self.table = {}
+
+    def die(self, pid=95165):
+        self.statuses[pid] = 'unresolved'
+        self.reasons[pid] = self.NOT_WITNESSED
+
+    def stale_pages(self):
+        return [a for a in self.alerts if a['cause'] == 'stale-claim']
+
+    def state(self):
+        return json.loads((mon.monitor_dir(self.state_path) / 'state.json').read_text())
+
+    def outbox(self):
+        path = mon.monitor_dir(self.state_path) / mon.OUTBOX_NAME
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def test_the_monitor_misread_it_as_a_disk_floor_before_confirmation_and_names_it_after(self):
+        self.claim(0.5)
+        self.die()
+        for _ in range(mon.ABANDON_TICKS - 1):
+            out = self.tick(60)
+        self.assertEqual((out['primary'], out['abandoned_claims']), ('disk-floor', []))      # not yet confirmed: no accusation on one or two ticks
+        self.assertEqual(self.stale_pages(), [])
+        out = self.tick(60)
+        self.assertEqual((out['primary'], out['owner_action']), ('stale-claim', 'confirm-claim-ended'))
+        self.assertNotIn('disk-floor', out['causes'])      # the dead claim is not "running work holding the space"
+        (row,) = out['abandoned_claims']
+        self.assertEqual((row['id'], row['label'], row['repo']), (self.first, 'job-horo-3950', 'horonom/x'))
+        self.assertEqual((row['blocked'], row['blocked_total'], row['bytes_held']), (self.head_ids, 2, 40 * GIB))
+        self.assertEqual(set(row['owner']), {'kind', 'reachable'})
+        self.assertTrue(row['owner_known'])
+        self.assertEqual(out['observation_gap'], False)
+
+    def test_one_deduplicated_stale_claim_page_with_an_outbox_line_and_no_session_id(self):
+        self.claim(0.5)
+        self.die()
+        self.run_ticks(mon.ABANDON_TICKS + 40)
+        (page,) = self.stale_pages()
+        self.assertEqual((page['owner_action'], mon.recovery_phrase(page['recovery'], False)), ('confirm-claim-ended', 'none'))
+        self.assertEqual(list(self.state()['incidents']), [self.first + ':claim'])
+        (line,) = [l for l in self.outbox() if l['clock'] == 'claim']
+        self.assertEqual((line['cause'], line['job'], line['owner_action']), ('stale-claim', self.first, 'confirm-claim-ended'))
+        self.assertTrue({'holder-gone', 'claim-unwitnessed'} <= set(line['evidence']))
+        text = json.dumps([page, line])
+        self.assertNotIn('0b1d2e3f', text)      # the entry's session id never leaves the monitor
+        self.assertNotIn('horonom', text)
+
+    def test_the_verdict_level_alert_does_not_repeat_the_incident_page(self):
+        self.claim(0.5)
+        self.die()
+        self.run_ticks(60)
+        self.assertEqual([a['cause'] for a in self.alerts], ['stale-claim'])      # not also a verdict-level stale-claim or disk-floor page
+
+    def test_a_live_holder_is_never_flagged(self):
+        self.claim(5)
+        self.table = {95165: (1, 10.0)}
+        out = self.run_ticks(mon.ABANDON_TICKS + 5)
+        self.assertEqual((out['abandoned_claims'], self.stale_pages(), self.state().get('dead_claims')), ([], [], {}))
+
+    def test_an_uninspectable_holder_is_not_counted_as_dead(self):
+        self.claim(5)
+        self.statuses[95165], self.reasons[95165] = 'unresolved', 'holder-uninspectable: ps failed'
+        out = self.run_ticks(mon.ABANDON_TICKS + 5)
+        self.assertEqual((out['abandoned_claims'], self.stale_pages()), ([], []))
+
+    def test_a_workload_that_outlives_its_wrapper_is_not_abandoned(self):
+        self.claim(5)
+        self.statuses[95165], self.reasons[95165] = 'unresolved', 'workload-outlives-wrapper: wrapper pid 95165 is gone but 1 recorded process(es) still run (7)'
+        out = self.run_ticks(mon.ABANDON_TICKS + 5)
+        self.assertEqual((out['abandoned_claims'], self.stale_pages()), ([], []))
+
+    def test_a_claim_younger_than_the_minimum_age_is_not_flagged_until_it_is_old_enough(self):
+        self.claim(0.1)      # 6 min
+        self.die()
+        out = self.run_ticks(mon.ABANDON_TICKS + 2)
+        self.assertEqual((out['abandoned_claims'], self.stale_pages()), ([], []))
+        self.assertGreaterEqual(self.state()['dead_claims'][self.first]['ticks'], mon.ABANDON_TICKS)
+        self.run_ticks(mon.ABANDON_MIN_AGE_S // 60)
+        self.assertEqual(len(self.stale_pages()), 1)
+
+    def test_a_different_process_on_the_recorded_pid_restarts_the_count(self):
+        self.claim(0.5)
+        self.die()
+        self.run_ticks(mon.ABANDON_TICKS - 1)
+        entry = self.entry(self.first)
+        entry['holder'].update(pid=95166)      # another holder identity: the earlier observations say nothing about it
+        da._write_queue_entry(self.state_path, entry)
+        self.die(95166)
+        out = self.tick(60)
+        self.assertEqual((out['abandoned_claims'], self.state()['dead_claims'][self.first]['ticks']), ([], 1))
+
+    def test_pid_reuse_is_judged_by_the_start_token_not_the_pid(self):
+        workload = {'pgid': None, 'leader': False, 'members': [], 'observed': True, 'truncated': False, 'refreshes': 0}
+        for reused, expect_flag in ((False, False), (True, True)):
+            with self.subTest(reused=reused):
+                self.setUp()
+                self.claim(0.5, workload=workload)
+                token = 'Sun Nov 22 03:00:00 2026' if reused else self.TOKEN
+                self.shim.holder_status = lambda pid, tok, work, *a, token=token: da.holder_status(
+                    pid, tok, work, token_fn=lambda p: token, table_fn=lambda: {95165: (1, 95165, 'S', token)})
+                out = self.run_ticks(mon.ABANDON_TICKS + 1)
+                self.assertEqual(bool(out['abandoned_claims']), expect_flag)
+
+    def test_a_witnessed_exit_stays_a_stale_claim_for_the_scheduler_not_an_abandoned_one(self):
+        self.claim(0.5)
+        self.statuses[95165] = 'exited'
+        out = self.run_ticks(mon.ABANDON_TICKS + 3)
+        self.assertEqual((out['primary'], out['abandoned_claims'], self.stale_pages()), ('stale-claim', [], []))
+
+    def test_the_count_survives_an_observation_gap(self):
+        self.claim(2)
+        self.die()
+        self.run_ticks(3)
+        out = self.tick(3600, asleep=True)
+        self.assertTrue(out['observation_gap'])
+        self.tick(60)
+        out = self.tick(60)
+        self.assertEqual(len(out['abandoned_claims']), 1)
+
+    def test_the_monitor_stays_observe_only_even_in_act_mode(self):
+        self.claim(0.5)
+        self.die()
+        self.run_ticks(mon.ABANDON_TICKS + 30, act=True)
+        self.assertEqual(self.advances, [])
+        self.assertEqual(self.entry(self.first)['state'], 'CLAIMED')
+        self.assertEqual(self.entry(self.first)['holder']['pid'], 95165)
+
+    def test_a_failing_notifier_never_breaks_the_tick_and_the_page_is_retried(self):
+        self.claim(0.5)
+        self.die()
+        self.emit_error = True
+        out = self.run_ticks(mon.ABANDON_TICKS + 5)
+        self.assertTrue(out['ran'])
+        self.assertEqual(len(out['abandoned_claims']), 1)
+        self.emit_error = False
+        self.run_ticks(40)
+        self.assertEqual([a['cause'] for a in self.alerts[-1:]], ['stale-claim'])
+        before = len(self.alerts)
+        self.run_ticks(40)
+        self.assertEqual(len(self.alerts), before)      # delivered: no more asks
+
+    def test_the_incident_closes_when_the_claim_is_released(self):
+        self.claim(0.5)
+        self.die()
+        self.run_ticks(mon.ABANDON_TICKS + 2)
+        entry = self.entry(self.first)
+        entry['state'] = 'RELEASED'
+        da._write_queue_entry(self.state_path, entry)
+        self.tick(60)
+        (rec,) = self.state()['incidents'].values()
+        self.assertIsNotNone(rec['resolved_at'])
+        self.assertEqual(self.state()['dead_claims'], {})
+
+    def test_a_blocked_head_queued_over_the_wait_threshold_pages_once_behind_the_dead_claim(self):
+        self.claim(14)
+        self.die()
+        entry = self.entry(self.head_ids[0])
+        created = self.clock.now - timedelta(hours=13)
+        entry.update(created=mon.iso(created), wait_expires=mon.iso(created + timedelta(hours=24)))
+        da._write_queue_entry(self.state_path, entry)
+        self.run_ticks(60)
+        waits = [a for a in self.alerts if a['cause'] == 'queue-wait-excessive']
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(len(self.stale_pages()), 1)
+        self.run_ticks(120)
+        self.assertEqual(len([a for a in self.alerts if a['cause'] == 'queue-wait-excessive']), 1)
+        self.assertNotEqual(self.state()['incidents'][self.head_ids[0] + ':wait']['status'], mon.SUPPRESSED)      # a dead holder is never healthy running work
 
 
 class Inventory(unittest.TestCase):
