@@ -670,11 +670,12 @@ class Bounds(Base):
         self.assertEqual(analysis['scanned'], cw.MAX_FILES)
 
     def test_files_outside_the_window_are_not_read(self):
+        now = T0 + HOUR
         path = self.add('sid-a', 'alpha', rec_fail('sid-a', T0))
         self.add('sid-b', 'beta', rec_fail('sid-b', T0))
-        old = time.time() - 10 * 24 * 3600
+        old = now - 10 * 24 * 3600
         os.utime(path, (old, old))
-        out = cw.scan(self.src, now=time.time())
+        out = cw.scan(self.src, now=now)
         self.assertEqual(out['affected'], 1)
 
     def test_only_the_tail_window_of_a_big_file_is_read(self):
