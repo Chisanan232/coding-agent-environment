@@ -494,7 +494,9 @@ class Evidence(unittest.TestCase):
         self.review_at = rec.stamp(time.time() - 60)
         self.comments = [{"author": {"login": "me"}, "createdAt": self.review_at,
                           "body": f"OWNER-MERGE-REVIEW head={self.head} verdict=PASS blocking=0 reviewer={REVIEWER}"}]
-        self.live = {"headRefOid": self.head, "baseRefName": "main", "headRefName": "feat/x"}
+        self.live = {"headRefOid": self.head, "baseRefName": "main", "headRefName": "feat/x", "title": "feat: x"}
+        self.live_base = self.base_sha
+        self.gql = []
         patcher = mock.patch.object(runner_mod, "dir_chain_problems", return_value=[])
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -522,9 +524,11 @@ class Evidence(unittest.TestCase):
         if args[:2] == ("api", "user"):
             return "me\n"
         if args[:2] == ("pr", "view"):
-            if args[-1] == "headRefOid,comments":
-                return json.dumps({"headRefOid": self.live["headRefOid"], "comments": []})
+            if args[-1].endswith("comments"):
+                return json.dumps({"headRefOid": self.live["headRefOid"], "comments": self.gql, "files": [], "statusCheckRollup": []})
             return json.dumps(self.live)
+        if args[0] == "api" and "/compare/" in args[1]:
+            return self.live_base + "\n"
         if args[0] == "api" and "comments" in args[1]:
             return json.dumps(self.comments)
         raise AssertionError(args)
@@ -716,17 +720,53 @@ class Evidence(unittest.TestCase):
         cfg = runner_mod.repo_config(runner_mod.load_allowlist(self.allow), REPO)
         runner_mod.load_evidence(self.evidence_file, self.head, REPO, "7", "main", cfg, runner_mod.load_key(str(key)), time.time())
 
+    def posted(self, **over):
+        return dict({"author": {"login": "me"}, "createdAt": rec.stamp(time.time() + 5), "body": self.printed.strip(),
+                     "includesCreatedEdit": False, "isMinimized": False}, **over)
+
     def test_fallback_uses_only_the_line_the_authenticated_user_posted(self):
         os.unlink(self.record_file)
-        line = self.printed.strip()
         self.refused("cannot be opened")
-        self.comments.append({"author": {"login": "me"}, "createdAt": self.review_at, "body": line})
+        for label, comment in (("other author", self.posted(author={"login": "intruder"})),
+                               ("fenced", self.posted(body="```\n" + self.printed.strip() + "\n```")),
+                               ("edited", self.posted(includesCreatedEdit=True)), ("minimized", self.posted(isMinimized=True)),
+                               ("no integrity flags (REST only)", {k: v for k, v in self.posted().items() if not k.startswith("i")}),
+                               ("posted before it finished", self.posted(createdAt="2020-01-01T00:00:00Z"))):
+            with self.subTest(label):
+                self.gql = self.comments + [comment]
+                self.refused("", "--from-pr-comment")
+        self.gql = self.comments + [self.posted()]
+        self.comments = self.gql
         code, out, err = self.evidence("--from-pr-comment")
         self.assertEqual(code, 0, err)
-        self.comments[-1]["author"]["login"] = "intruder"
-        self.refused("no OWNER-MERGE-LOCAL-CI comment", "--from-pr-comment")
-        self.comments[-1] = {"author": {"login": "me"}, "createdAt": self.review_at, "body": "```\n" + line + "\n```"}
-        self.refused("no OWNER-MERGE-LOCAL-CI comment", "--from-pr-comment")
+
+    def test_fallback_newest_record_decides_and_must_itself_be_clean(self):
+        os.unlink(self.record_file)
+        good, bad = self.posted(createdAt=rec.stamp(time.time() + 5)), self.posted(createdAt=rec.stamp(time.time() + 6), isMinimized=True)
+        self.comments = self.gql = [self.comments[0], good, bad]
+        self.refused("minimized", "--from-pr-comment")
+
+    def test_a_base_that_moved_since_recording_refuses_and_a_matching_base_passes(self):
+        self.live_base = "9" * 40
+        self.refused("base moved since recording")
+        self.assertFalse(os.path.exists(self.evidence_file))
+        self.live_base = self.base_sha
+        self.assertEqual(self.evidence()[0], 0)
+
+    def test_pr_title_or_context_drift_refuses(self):
+        self.live["title"] = "feat: renamed"
+        self.refused("differ from the PR now")
+
+    def test_run_at_is_the_earliest_start_so_a_late_command_cannot_freshen_a_stale_record(self):
+        data = json.loads(pathlib.Path(self.record_file).read_text())
+        now = time.time()
+        data["commands"][0]["started_at"], data["commands"][0]["finished_at"] = rec.stamp(now - 23 * 3600), rec.stamp(now - 23 * 3600 + 5)
+        data["commands"][1]["started_at"], data["commands"][1]["finished_at"] = rec.stamp(now - 3600), rec.stamp(now - 3600 + 5)
+        pathlib.Path(self.record_file).write_text(json.dumps(data))
+        self.refused("stale", now=now + 2 * 3600)      # earliest start is 25h old; the latest start would be only 3h old
+        code, _, err = self.evidence(now=now)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(pathlib.Path(self.evidence_file).read_text())["local_ci"]["run_at"], rec.stamp(now - 23 * 3600))
 
 
 if __name__ == "__main__":
