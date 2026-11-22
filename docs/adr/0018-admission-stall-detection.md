@@ -89,6 +89,12 @@ Add `scripts/admission-monitor.py`: a stdlib-only, deterministic, single-shot `t
   **Clock.** Gap detection compares wall time with `host_uptime()` (`CLOCK_UPTIME_RAW`, else `CLOCK_MONOTONIC`). `time.monotonic()` under Apple's `/usr/bin/python3` 3.9.6 restarts near 0 in each process, so with a
   new launchd process per tick every tick over 60 s apart was an observation gap (all 2171 recorded ticks), which reset blocker confirmations and the progress clock and skipped wait incidents and escalated
   hand-offs. `status.json` carries `observation_gap_streak`; a streak that never returns to 0 means a broken clock, not a sleeping host.
+  **First live ticks after the clock fix.** Until the clock fix every tick was an observation gap, so wait incidents, escalated hand-offs and verdict-level alerts never ran. On the first
+  ticks of a fixed monitor every entry already past 12.5 h (up to `WAIT_INCIDENT_MAX` = 12) can raise its incident, plus any abandoned claim and any genuine verdict cause, at once. session-notify has
+  **no rate cap and no coalescing**: it dedups per cause and signature, and keeps at most `PENDING_CAP` = 20 notices waiting for a backend (oldest dropped; spool notices up to 200). The monitor
+  therefore hands at most `FIRST_NOTICES_PER_TICK` = 3 first-time incident notices to it per tick, abandoned claims first; the rest stay unsettled and go on later ticks (about 5 minutes for 13
+  notices). Delivery polls and the verdict-level alert are not counted. An abandoned claim never replaces or suppresses a coexisting genuine verdict cause: status leads with `stale-claim`, while the
+  verdict-level alert, its signature and its confirmation count are computed without it.
   A global cause already holding the queue (`disk-floor`, `memory-pressure`, `memory-hysteresis*`) is attributed in the incident's `blocker` field (also
   `higher-entry-running` or `none`); the entry still gets its one incident past 12.5 h. At most 12 wait and 6 run incidents are open at once, oldest wait first; the
   rest are counted in `wait_overflow` so 200 old entries never page 200 times or grow the state past its cap. An incident is resolved (`resolved_at`, owner-notice state `resolved`) when the
