@@ -201,7 +201,7 @@ Sequence, each step its own call, all at the same exact head:
 5. `owner-merge-gate.py verify --repo R --pr N --head SHA` in a separate call.
 
 `evidence` refuses (exit 2, nothing written) unless: the record file is a private regular file whose repo, PR and head equal the arguments;
-the live PR (`gh pr view`) is at that head with the recorded base and head ref; the recorded checks (names, argv, order, `env`) equal the
+the live PR (`gh pr view`) is at that head with the recorded base, head ref and title, and the recorded base commit is still the live merge base (otherwise re-record); the recorded checks (names, argv, order, `env`) equal the
 owner's trust file; every recorded check exited 0 and every `required_local_checks` name (plus any `--require NAME`) is present; every
 log file re-read from disk hashes to its recorded SHA-256; the oldest start is within the smaller of the allowlist's `max_evidence_age_hours` and the trust file's `max_age_hours`;
 and the authenticated user's `OWNER-MERGE-REVIEW` comment for this head exists and is accepted by the same rules as `check` (every at-head record PASS with blocking=0, so a later clean
@@ -212,7 +212,7 @@ or a link, is never overwritten; an unchanged record reproduces the same bytes (
 `evidence-json` is unchanged and still produces evidence without a `local_ci` block.
 
 Recordings made before the record file existed left only the `.log` files (digests are not stored anywhere on disk). If the authenticated user posted the
-recorder's printed line as a PR comment (the local-first flow above), `evidence --from-pr-comment` uses that line and still re-verifies every log digest; otherwise
+recorder's printed line as a PR comment (the local-first flow above), `evidence --from-pr-comment` uses that line under the gate's local-first comment rules (the authenticated user's newest unfenced record for the head, unedited and not minimized per the GraphQL flags, posted no earlier than the run finished) and still re-verifies every log digest; otherwise
 run `record` once more at the same head. Limit: the record and logs are written by the same OS user that runs the tool, so this removes hand-typed results but cannot prove a forged record
 (a user who can edit the record and the logs together); the signature and the host's own classifier are the remaining controls.
 
