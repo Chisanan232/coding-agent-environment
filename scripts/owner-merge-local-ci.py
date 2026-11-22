@@ -2,6 +2,8 @@
 """Recorder for the local-first CI basis of owner-merge-gate.py (SPE-135).
 
   owner-merge-local-ci.py record --repo OWNER/REPO --pr N --base BRANCH --worktree PATH [--evidence-host {claude,codex}] [--expect-head SHA] [--config FILE]
+  owner-merge-local-ci.py evidence --repo OWNER/REPO --pr N --head SHA [--key-file KEY] [--require NAME] [--from-pr-comment]   (docs/OWNER-MERGE-WORKFLOW.md)
+`record` also persists the printed line as local-ci-<repo>-<pr>-<head12>.record.json (0600) beside the logs; `evidence` builds the runner's review-evidence file from it.
 
 Runs the owner-configured checks for the repository (the trust file ~/.config/coding-agent-environment/local/local-first-ci.json,
 which this script only reads) in the worktree, with no shell, and prints exactly one unfenced line for the PR comment:

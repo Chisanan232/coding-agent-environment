@@ -186,6 +186,35 @@ independent review. Skipping a hosted check that would have failed: only owner-l
 - The `owner-merge-runner` is unchanged: a local-first repository is not on its allowlist, and a missing required check there is never
   exempted, so the merge is the direct pinned `gh pr merge`, which the host still asks about.
 
+## Local checks as runner evidence (`required_local_checks`)
+
+When the allowlist entry lists `required_local_checks`, the runner refuses unless the review-evidence file carries a `local_ci` block.
+Nobody types that block: `scripts/owner-merge-local-ci.py record` persists the run it executed as
+`~/.claude/owner-merge-evidence/local-ci-<owner>__<repo>-<pr>-<head12>.record.json` (mode 0600, exactly the printed `OWNER-MERGE-LOCAL-CI` line; the
+logs sit beside it as `local-ci-<owner>__<repo>-<pr>-<head12>-<name>.log`), and `evidence` builds the file from it.
+Sequence, each step its own call, all at the same exact head:
+
+1. `owner-merge-local-ci.py record --repo R --pr N --base B --worktree PATH` (exit 0 = every check passed; add `--evidence-host codex` for the Codex directory).
+2. Independent review at that head, then the `OWNER-MERGE-REVIEW head=<sha> verdict=PASS blocking=0 reviewer=<id>` comment (`owner-merge-gate.py evidence-line`).
+3. `owner-merge-local-ci.py evidence --repo R --pr N --head SHA [--key-file KEY]` writes `<owner>__<repo>-<pr>-<head12>.json` (0600, atomic) and prints only its path and SHA-256.
+4. `owner-merge-gate.py check --repo R --pr N --owners O --settings ...` and run the printed `merge_command` first with the runner's `--dry-run`, then alone without it.
+5. `owner-merge-gate.py verify --repo R --pr N --head SHA` in a separate call.
+
+`evidence` refuses (exit 2, nothing written) unless: the record file is a private regular file whose repo, PR and head equal the arguments;
+the live PR (`gh pr view`) is at that head with the recorded base and head ref; the recorded checks (names, argv, order, `env`) equal the
+owner's trust file; every recorded check exited 0 and every `required_local_checks` name (plus any `--require NAME`) is present; every
+log file re-read from disk hashes to its recorded SHA-256; the oldest start is within the smaller of the allowlist's `max_evidence_age_hours` and the trust file's `max_age_hours`;
+and the authenticated user's `OWNER-MERGE-REVIEW` comment for this head exists (reviewer and `reviewed_at` come from it; `--reviewer`, if given, must match, and
+the reviewer must be allowlisted). `--key-file` signs the file, which is needed when the allowlist requires signed evidence. An existing file for another repo, PR or head,
+or a link, is never overwritten; an unchanged record reproduces the same bytes (idempotent), and an older file for the same head (for example from `evidence-json`) is replaced.
+`tests` in each `local_ci` check is always 0: the recorder does not count tests, and the runner only requires a non-negative integer.
+`evidence-json` is unchanged and still produces evidence without a `local_ci` block.
+
+Recordings made before the record file existed left only the `.log` files (digests are not stored anywhere on disk). If the authenticated user posted the
+recorder's printed line as a PR comment (the local-first flow above), `evidence --from-pr-comment` uses that line and still re-verifies every log digest; otherwise
+run `record` once more at the same head. Limit: the record and logs are written by the same OS user that runs the tool, so this removes hand-typed results but cannot prove a forged record
+(a user who can edit the record and the logs together); the signature and the host's own classifier are the remaining controls.
+
 ## Version integration branches (Development-Ahead / Sequential Release)
 
 `main` is the protected cumulative release baseline. A founder-approved version integration branch (for example
