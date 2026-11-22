@@ -63,6 +63,11 @@ RUN_INCIDENT_MAX = 6
 NOTICE_LIST_MAX = 8
 OUTBOX_LIMIT = 1 << 20
 GAP_MAX_S = 48 * 3600         # one remembered gap never discounts more than this (and a stored one outside 0..this is dropped)
+# A CLAIMED entry whose supervising wrapper is gone (pid absent or reused, no recorded workload process running) and that was never witnessed running: the
+# scheduler keeps its lane and bytes on purpose ("release it explicitly"), so nothing frees them. Reported, never released (ADR 0019, decision B).
+ABANDON_TICKS = 5             # observations, at least CONFIRM_SPACING_S apart (about 5 min on a 60 s timer), of the same dead holder identity before it is reported
+ABANDON_MIN_AGE_S = 900       # and the claim itself must be this old: a wrapper that is still starting or exiting cleanly has released by then
+DEAD_CLAIM_LIMIT = 16
 GAP_LEDGER_MAX = 32           # observation gaps remembered for discounting wait and run ages
 OUTBOX_NAME = 'owner-outbox.jsonl'
 CPU_STALL_S = 900             # a claimed, alive workload with no CPU growth this long is reported, never touched
@@ -93,19 +98,22 @@ RECOVERY_NOTICE = {'terminated': ('obsolete-wrapper-terminated', 'wrapper-termin
                    'failed-to-terminate': ('failed-to-terminate', 'termination-failed')}
 RECOVERY_EVIDENCE = {'terminated': ['wrapper-registered', 'entry-terminal'], 'failed-to-terminate': ['wrapper-registered', 'entry-terminal'],
                      'cancelled': ['grant-unclaimed-escalate', 'owner-gone']}
-CAUSES = ('state-unreadable', 'disk-floor', 'memory-pressure', 'memory-hysteresis-static-compressor', 'memory-hysteresis',
-          'stale-claim', 'frozen-queue', 'unclaimed-handoff', 'failed-continuation', 'outdated-caller', 'stalled-running', 'unobservable', 'healthy-busy', 'unknown')
+CAUSES = ('state-unreadable', 'stale-claim', 'disk-floor', 'memory-pressure', 'memory-hysteresis-static-compressor', 'memory-hysteresis',
+          'frozen-queue', 'unclaimed-handoff', 'failed-continuation', 'outdated-caller', 'stalled-running', 'unobservable', 'healthy-busy', 'unknown')
 # Causes of the per-entry wait and execution incidents. They are never part of a verdict (they cannot make the queue "stalled" or start an advance).
-INCIDENT_CAUSES = ('queue-wait-excessive', 'workload-over-deadline')
+INCIDENT_CAUSES = ('queue-wait-excessive', 'workload-over-deadline', 'stale-claim')
+# Verdict causes whose owner notice is raised per entry by an incident (never by the verdict-level alert). `stale-claim` is one only while every stale claim
+# is an abandoned one (verdict['abandoned']); a claim whose exit the scheduler can prove stays on the verdict-level alert and the advance path.
+INCIDENT_PRIMARY = ('unclaimed-handoff',)
 PHASES = ('escalated', 'lapsed', 'near')
-CLOCKS = ('grant', 'wait', 'run')
+CLOCKS = ('grant', 'wait', 'run', 'claim')
 GLOBAL_BLOCKERS = ('disk-floor', 'memory-pressure', 'memory-hysteresis-static-compressor', 'memory-hysteresis')
 BLOCKERS = GLOBAL_BLOCKERS + ('higher-entry-running', 'none')
 OWNER_KINDS = ('claude', 'codex', 'heavy-run', 'la-cargo', 'unknown')
 OWNER_EVIDENCE = ('no-session-id', 'session-live', 'session-ended', 'session-unknown', 'process-alive', 'process-gone', 'process-uninspectable')
 SUPPRESSED = 'suppressed-higher-entry'
 EVIDENCE = OWNER_EVIDENCE + ('grant-unclaimed-escalate', 'grant-lapsed-unclaimed', 'no-waiter', 'queued-over-escalate', 'queued-expiry-near', 'blocked-by-global-cause', 'behind-running-entry', 'holder-alive',
-                             'over-deadline', 'deadline-declared', 'deadline-default', 'wrapper-registered', 'entry-terminal', 'owner-gone')
+                             'holder-gone', 'claim-unwitnessed', 'over-deadline', 'deadline-declared', 'deadline-default', 'wrapper-registered', 'entry-terminal', 'owner-gone')
 OWNER_ACTION = {'disk-floor': 'reclaim-disk', 'memory-pressure': 'reduce-load', 'memory-hysteresis-static-compressor': 'approve-memory-policy',
                 'memory-hysteresis': 'wait-or-approve-memory-policy', 'stale-claim': 'confirm-claim-ended',
                 'failed-continuation': 'restart-waiting-session', 'outdated-caller': 'restart-outdated-caller',
@@ -370,12 +378,17 @@ def classify(snap, limits):
         found['state-unreadable'] = snap['problems'][0]
     if not waiting and not granted:
         return {'causes': found, 'primary': next(iter(found), 'idle'), 'waiting': 0, 'oldest_grant_s': 0, 'notes': [], 'notices': [],
-                'unclaimed': [], 'grant_escalated': False, 'grant_stall_s': None}
+                'unclaimed': [], 'grant_escalated': False, 'grant_stall_s': None, 'abandoned': [], 'exited': []}
     head = waiting[0] if waiting else None
     mem = snap['mem']
     metrics = mem.get('metrics') or {}
+    abandoned = [e for e in entries if e['state'] == 'CLAIMED' and e['id'] in (snap.get('abandoned') or ())]
+    if abandoned:
+        found['stale-claim'] = '%s: supervising process gone and never witnessed, claim not released%s' % (
+            abandoned[0]['id'], '' if len(abandoned) == 1 else ' (+%d more)' % (len(abandoned) - 1))
     if head is not None:
-        claimed = sum(e['bytes'] for e in entries if e['state'] == 'CLAIMED')
+        # An abandoned claim still holds its lane and bytes, but it is not running work: the verdict names it instead of blaming the disk.
+        claimed = sum(e['bytes'] for e in entries if e['state'] == 'CLAIMED' and e not in abandoned)
         parked = sum(e['bytes'] for e in granted)   # reserved by a grant nobody has claimed: capacity held, nothing running
         if snap['free_bytes'] - claimed - head['bytes'] < limits['floor']:
             found['disk-floor'] = '%.0f GiB free, %.0f GiB held by running work, %.0f GiB requested' % (
@@ -395,12 +408,14 @@ def classify(snap, limits):
             kind = 'memory-hysteresis-static-compressor'
         found[kind] = 'latched, %s/%s good checks, exit blocked by %s' % (mem.get('ok_streak'), limits['exit_samples'],
                                                                          ','.join(blockers) or 'nothing now (waiting for checks)')
+    exited = []
     for entry in entries:
         if entry['state'] != 'CLAIMED':
             continue
         claim = snap['claims'].get(entry['id'], {})
         if claim.get('status') == 'exited':
             found['stale-claim'] = '%s holder exited, claim not released' % entry['id']
+            exited.append(entry['id'])
         elif claim.get('status') == 'alive' and claim.get('idle_s', 0) >= CPU_STALL_S:
             found['stalled-running'] = '%s alive but its CPU time has not changed for %d min (report only)' % (entry['id'], claim['idle_s'] // 60)
     oldest, notices, unclaimed, escalated, stall_s = 0, [], [], False, None
@@ -433,7 +448,7 @@ def classify(snap, limits):
     notes = ['%s grant lapsed unclaimed' % e['id'] for e in entries if e['state'] == 'EXPIRED' and isinstance(e.get('grant'), dict)
              and not e.get('holder') and 0 <= (now - safe_time(e['grant']['expires'])).total_seconds() < 3 * 3600]
     return {'causes': found, 'primary': primary, 'waiting': len(waiting), 'oldest_grant_s': oldest, 'notes': notes, 'notices': notices,
-            'unclaimed': unclaimed, 'grant_escalated': escalated, 'grant_stall_s': stall_s}
+            'unclaimed': unclaimed, 'grant_escalated': escalated, 'grant_stall_s': stall_s, 'abandoned': [e['id'] for e in abandoned], 'exited': exited}
 
 
 def gap_discount_s(gaps, start_wall):
@@ -509,6 +524,48 @@ def wait_notices(entries, now, gaps=()):
     return lines
 
 
+def track_dead_claims(state, entries, claims, now, wall):
+    """Ids of CLAIMED entries confirmed abandoned: the same holder identity (pid and start token) seen with its wrapper gone and never witnessed on
+    ABANDON_TICKS observations at least CONFIRM_SPACING_S apart, the claim at least ABANDON_MIN_AGE_S old. A holder that is alive, uninspectable, still has a
+    recorded workload running, or is a different process than recorded is not counted and its count restarts. The count survives an observation gap (a death is not
+    a clock reading); the age is a wall-clock age minus the observed gaps. Nothing is released, signalled or written to the queue."""
+    seen, confirmed = {}, []
+    for entry in entries:
+        holder = entry.get('holder')
+        if entry['state'] != 'CLAIMED' or not claims.get(entry['id'], {}).get('unwitnessed') or not (
+                isinstance(holder, dict) and type(holder.get('pid')) is int and isinstance(holder.get('start_token'), str)):
+            continue
+        token, before = str(holder['start_token'])[:64], state['dead_claims'].get(entry['id'])
+        if before and before['pid'] == holder['pid'] and before['token'] == token:
+            rec = dict(before)
+            if wall - before['last'] >= CONFIRM_SPACING_S:      # two quick manual ticks are one observation
+                rec.update(ticks=min(before['ticks'] + 1, 10 ** 6 - 1), last=wall)
+        else:
+            rec = {'pid': holder['pid'], 'token': token, 'ticks': 1, 'last': wall}
+        seen[entry['id']] = rec
+        age = run_elapsed_s(entry, now, state['gaps'])
+        if rec['ticks'] >= ABANDON_TICKS and age is not None and age >= ABANDON_MIN_AGE_S:
+            confirmed.append(entry['id'])
+    state['dead_claims'] = dict(sorted(seen.items())[:DEAD_CLAIM_LIMIT])
+    return confirmed
+
+
+def abandoned_report(env, entries, abandoned, tracked, now, gaps):
+    """Status rows for confirmed abandoned claims (local status.json only; the notice and the outbox line carry enums and the job id). The owner is reported as
+    kind and reachability: a session id is never presented."""
+    out = []
+    waiting = [e['id'] for e in entries if e['state'] in ('QUEUED', 'ELIGIBLE') and safe_time(e['wait_expires']) > now]
+    for entry in entries:
+        if entry['id'] not in abandoned:
+            continue
+        owner = env.owner(entry)
+        out.append({'id': entry['id'], 'label': str(entry.get('label'))[:64], 'repo': str(entry.get('repo'))[:80], 'claimed_for_s': run_elapsed_s(entry, now, gaps),
+                    'observations': tracked.get(entry['id'], {}).get('ticks'), 'owner': {'kind': owner['kind'], 'reachable': owner['reachable']},
+                    'owner_known': owner['evidence'] != ['no-session-id'], 'bytes_held': entry.get('bytes'), 'blocked': waiting[:NOTICE_LIST_MAX],
+                    'blocked_total': len(waiting), 'owner_action': OWNER_ACTION['stale-claim']})
+    return out
+
+
 def resolve_owner(entry, sessions, process=None, launcher=None):
     """Who owns this entry, as a closed record {kind, session_id, reachable, evidence}. Pure: all observation comes through the arguments.
 
@@ -555,7 +612,7 @@ def resolve_owner(entry, sessions, process=None, launcher=None):
 
 def outbox_record(rec, key, owner, now, extra):
     """One owner-outbox line: enum values, the incident key and the job id only; never a path, command line or session id."""
-    cause = {'wait': 'queue-wait-excessive', 'run': 'workload-over-deadline', 'grant': 'unclaimed-handoff'}[rec['clock']]
+    cause = {'wait': 'queue-wait-excessive', 'run': 'workload-over-deadline', 'grant': 'unclaimed-handoff', 'claim': 'stale-claim'}[rec['clock']]
     wanted = list(extra) + list(owner['evidence'])
     return {'v': 1, 'at': iso(now), 'key': key, 'job': rec['id'], 'clock': rec['clock'], 'phase': rec['phase'], 'cause': cause, 'blocker': rec['blocker'],
             'evidence': [x for x in EVIDENCE if x in wanted], 'owner_action': OWNER_ACTION[cause],
@@ -712,13 +769,18 @@ def sanitize_state(state):
                  if c} if isinstance(incidents, dict) else {}
     gaps = [[float(g[0]), float(g[1]), float(g[2])] for g in (state.get('gaps') if isinstance(state.get('gaps'), list) else [])
             if isinstance(g, list) and len(g) == 3 and all(finite(x) for x in g) and 0 <= g[2] <= GAP_MAX_S and g[0] <= g[1]][-GAP_LEDGER_MAX:]
+    dead = state.get('dead_claims')
+    dead = {k: {'pid': v['pid'], 'token': v['token'], 'ticks': v['ticks'], 'last': float(v['last'])} for k, v in dead.items()
+            if isinstance(k, str) and len(k) <= 16 and isinstance(v, dict) and type(v.get('pid')) is int and isinstance(v.get('token'), str) and len(v['token']) <= 64
+            and type(v.get('ticks')) is int and 0 < v['ticks'] < 10 ** 6 and finite(v.get('last'))} if isinstance(dead, dict) else {}
+    dead = dict(sorted(dead.items())[:DEAD_CLAIM_LIMIT])
     log = nums(state.get('recovery_log'), 64)
     candidates = state.get('candidates')
     candidates = dict(sorted(((k, float(v)) for k, v in candidates.items() if isinstance(k, str) and len(k) <= 64 and finite(v)), key=lambda kv: kv[1])[:RECOVERY_LIMIT]
                       ) if isinstance(candidates, dict) else {}
     recoveries = state.get('recoveries')
     recoveries = {k: c for k, c in ((k, clean_recovery(v)) for k, v in recoveries.items() if isinstance(k, str) and len(k) <= 64) if c} if isinstance(recoveries, dict) else {}
-    return dict(schema=1, gaps=gaps, incidents=bound_incidents(incidents), recovery_log=log, candidates=candidates, recoveries=recoveries, last_tick=last, blocker=blocker, alerts=alerts, cpu=cpu, states=states, window=window,
+    return dict(schema=1, gaps=gaps, incidents=bound_incidents(incidents), recovery_log=log, dead_claims=dead, candidates=candidates, recoveries=recoveries, last_tick=last, blocker=blocker, alerts=alerts, cpu=cpu, states=states, window=window,
                 advances=nums(state.get('advances'), 64), progress_at=progress if finite(progress) else None,
                 last_alert=state.get('last_alert') if isinstance(state.get('last_alert'), dict) and finite(state['last_alert'].get('clear_next', 0))
                 and type(state['last_alert'].get('clear_tries', 0)) is int else None,
@@ -1042,7 +1104,8 @@ def _tick_locked(env, directory, act, if_due):
             progress = progress or (before is not None)
         else:
             cpu_now[entry['id']] = before
-        claims[entry['id']] = {'status': status.state, 'idle_s': int(wall - cpu_now[entry['id']]['at'])}
+        claims[entry['id']] = {'status': status.state, 'idle_s': int(wall - cpu_now[entry['id']]['at']),
+                               'unwitnessed': status.state == 'unresolved' and str(status.reason).startswith(env.da.NOT_WITNESSED)}
     states_now = {e['id']: e['state'] for e in entries if e['state'] in LIVE}      # terminal entries never accumulate in the state file
     if not gap:
         now_by_id = {e['id']: e['state'] for e in entries}
@@ -1058,7 +1121,8 @@ def _tick_locked(env, directory, act, if_due):
     window = state['window']
     if ratio is not None:
         window = (window + [[wall, ratio]])[-WINDOW_MAX:]
-    snap = {'now': now, 'wall': wall, 'entries': entries, 'problems': problems, 'free_bytes': env.free(), 'mem': mem,
+    abandoned = track_dead_claims(state, entries, claims, now, wall)
+    snap = {'now': now, 'wall': wall, 'abandoned': abandoned, 'entries': entries, 'problems': problems, 'free_bytes': env.free(), 'mem': mem,
             'window': window, 'claims': claims, 'protocol': env.da.RUNNER_PROTOCOL, 'reservations': env.reservations(),
             'stamps': env.stamps([e for e in entries if e['state'] == 'GRANTED'])}
     verdict = classify(snap, env.limits)
@@ -1088,7 +1152,13 @@ def _tick_locked(env, directory, act, if_due):
               'owner_action': OWNER_ACTION.get(verdict['primary']), 'granted_is_execution': False, 'actions': [],
               'notes': verdict['notes'], 'notices': verdict['notices'] + wait_notices(entries, now, state['gaps'])}
     state['advances'] = [t for t in state['advances'] if wall - t < ADVANCE_WINDOW_S]
-    wants_advance = waiting > 0 and not gap and confirmed and any(c in ADVANCE_CAUSES for c in verdict['causes']) and not (
+    abandoned_only = bool(verdict['abandoned']) and not verdict['exited']
+    incident_only = verdict['primary'] in INCIDENT_PRIMARY or (verdict['primary'] == 'stale-claim' and abandoned_only)
+    result['abandoned_claims'] = abandoned_report(env, entries, abandoned, state['dead_claims'], now, state['gaps'])
+    result['notices'] = result['notices'] + ['%s claim abandoned: supervising process gone, never witnessed running; holds %d GiB, %d entries wait behind it (not released: report only)' % (
+        row['id'], (row['bytes_held'] or 0) // GIB, row['blocked_total']) for row in result['abandoned_claims'][:NOTICE_LIST_MAX]]
+    advanceable = set(verdict['causes']) - ({'stale-claim'} if abandoned_only else set())      # an abandoned claim is never advanced: the scheduler keeps it on purpose
+    wants_advance = waiting > 0 and not gap and confirmed and any(c in ADVANCE_CAUSES for c in advanceable) and not (
         {'disk-floor', 'memory-pressure', 'state-unreadable'} & set(verdict['causes']))
     if wants_advance:
         ok, why = advance_allowed(state, wall)
@@ -1108,7 +1178,7 @@ def _tick_locked(env, directory, act, if_due):
                 result['recovery_exhausted'] = True
     alert_key = '%s:%s' % (verdict['primary'], sig)
     state['alerts'] = {k: v for k, v in state['alerts'].items() if wall - v['sent_at'] < 2 * ALERT_COOLDOWN_S}
-    escalate = stalled and confirmed and verdict['primary'] != 'unclaimed-handoff' and (verdict['primary'] not in RECOVERABLE or result.get('recovery_exhausted')
+    escalate = stalled and confirmed and not incident_only and (verdict['primary'] not in RECOVERABLE or result.get('recovery_exhausted')
                                           or stalled_for >= 2 * STALL_S)
     if escalate and alert_due(state, alert_key, wall):
         alert = {'cause': verdict['primary'], 'causes': sorted(verdict['causes']), 'signature': sig, 'detail': verdict['causes'],
@@ -1472,6 +1542,8 @@ def incident_alert(key, rec, wall):
         cause, recovery = 'queue-wait-excessive', [{'wait': 'expiry-near'}] if rec['phase'] == 'near' else []
     elif rec['clock'] == 'run':
         cause, recovery = 'workload-over-deadline', []
+    elif rec['clock'] == 'claim':
+        cause, recovery = 'stale-claim', []
     else:
         cause, recovery = 'unclaimed-handoff', [{'handoff': 'lapsed'}] if rec['phase'] == 'lapsed' else []
     return {'cause': cause, 'causes': [cause], 'signature': incident_signature(key, rec['phase']), 'incident_ref': incident_ref(key), 'detail': {'phase': rec['phase']},
@@ -1500,7 +1572,7 @@ def wait_run_incidents(env, state, verdict, entries, claims, now, wall, gap, dir
         entry = by_id.get(rec['id'])
         if rec['clock'] == 'wait':
             over = entry is None or entry['state'] not in ('QUEUED', 'ELIGIBLE') or safe_time(entry['wait_expires']) <= now
-        elif rec['clock'] == 'run':
+        elif rec['clock'] in ('run', 'claim'):
             over = entry is None or entry['state'] != 'CLAIMED'
             if not over:
                 rec['expires_wall'] = wall
@@ -1509,6 +1581,15 @@ def wait_run_incidents(env, state, verdict, entries, claims, now, wall, gap, dir
         if over and trusted and rec['resolved_at'] is None:
             rec['resolved_at'] = wall      # the wait or the run ended (granted, expired, cancelled, released): resolved, never an owner acknowledgement
     overflow, gaps = 0, state['gaps']
+    # An abandoned claim is raised on any tick, gap or not: the death was observed on ABANDON_TICKS separate ticks and no wall-clock age decides it.
+    open_claim = sum(1 for r in incidents.values() if r['clock'] == 'claim' and r['resolved_at'] is None)
+    for entry in entries:
+        key = entry['id'] + ':claim'
+        if entry['id'] not in verdict.get('abandoned', ()) or entry['state'] != 'CLAIMED' or key in incidents or open_claim >= RUN_INCIDENT_MAX:
+            continue
+        open_claim += 1
+        started = safe_time(entry['holder'].get('claimed_at'))
+        incidents[key] = new_incident(entry['id'], 'escalated', (started or now).timestamp(), wall, wall, None, 'claim', blocker_for(verdict, entries, now))
     if not gap:
         blocker = blocker_for(verdict, entries, now)
         open_wait = sum(1 for r in incidents.values() if r['clock'] == 'wait' and r['resolved_at'] is None)
@@ -1561,6 +1642,8 @@ def wait_run_incidents(env, state, verdict, entries, claims, now, wall, gap, dir
         elif rec['clock'] == 'wait':
             facts = ['queued-expiry-near' if rec['phase'] == 'near' else 'queued-over-escalate']
             facts.append('blocked-by-global-cause' if rec['blocker'] in GLOBAL_BLOCKERS else 'behind-running-entry' if rec['blocker'] == 'higher-entry-running' else '')
+        elif rec['clock'] == 'claim':
+            facts = ['holder-gone', 'claim-unwitnessed']
         else:
             facts = ['holder-alive', 'over-deadline', 'deadline-declared' if rec['deadline_source'] == 'declared' else 'deadline-default']
         try:
