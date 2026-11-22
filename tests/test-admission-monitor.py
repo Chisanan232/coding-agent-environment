@@ -1942,6 +1942,60 @@ class WaitAndRunClocks(MonitorBase):
         self.assertEqual(len(self.pages()), 1)       # read back as a grant incident: it is not mistaken for a new wait incident
 
 
+class SharedClock(MonitorBase):
+    """The monitor is a new process on every launchd tick, so the uptime it stores must mean the same thing in the next process. Under Apple's
+    /usr/bin/python3 `time.monotonic()` restarts near 0 in each process (SPE-176: every recorded tick was an observation gap)."""
+
+    def setUp(self):
+        super().setUp()
+        self.mem['latched'] = False
+        restarted = unittest.mock.patch.object(mon.time, 'monotonic', side_effect=lambda: 0.2)      # a per-process clock: the same small number in every process
+        host = unittest.mock.patch.object(mon.time, 'clock_gettime', side_effect=lambda clock: self.clock.mono)     # the shared host clock
+        for patch in (restarted, host):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def default_clock_tick(self, seconds, asleep=False):
+        self.clock.advance(seconds, asleep=asleep)
+        os.environ['ADMISSION_MONITOR_DIR'] = str(mon.monitor_dir(self.state_path))
+        env = mon.Env(self.shim, self.state_path, self.memory_state, mon.default_limits(da, ma), clock=self.clock, boot=lambda: self.boot,
+                      table=lambda: self.table, memory=lambda: dict(self.mem), free=lambda: self.free, notify=lambda a: True, clear=lambda: True,
+                      emit_incident=lambda a: dict(self.emit_result))      # no `mono`: the production default
+        return mon.tick(env)
+
+    def test_the_default_clock_does_not_read_the_per_process_monotonic_clock(self):
+        self.clock.mono = 123456.0
+        self.assertEqual(mon.host_uptime(), 123456.0)
+
+    def test_ticks_72_seconds_apart_are_not_an_observation_gap(self):
+        self.enqueue('HORO-3901')
+        first = self.default_clock_tick(72)
+        self.assertTrue(first['observation_gap'])      # nothing is known on the very first tick
+        for _ in range(4):
+            out = self.default_clock_tick(72)
+            self.assertFalse(out['observation_gap'])
+            self.assertEqual(out['observation_gap_streak'], 0)
+
+    def test_a_real_sleep_is_still_a_gap_and_the_streak_counts_consecutive_gaps(self):
+        self.enqueue('HORO-3902')
+        self.default_clock_tick(60)
+        self.default_clock_tick(60)
+        slept = self.default_clock_tick(3600, asleep=True)
+        self.assertEqual((slept['observation_gap'], slept['observation_gap_streak']), (True, 1))
+        again = self.default_clock_tick(3600, asleep=True)
+        self.assertEqual((again['observation_gap'], again['observation_gap_streak']), (True, 2))
+        calm = self.default_clock_tick(60)
+        self.assertEqual((calm['observation_gap'], calm['observation_gap_streak']), (False, 0))
+
+    def test_a_blocked_head_is_confirmed_across_72_second_ticks(self):
+        """With every tick a gap the blocker confirmations never rose above 0, so no alert was ever due."""
+        self.enqueue('HORO-3903')
+        self.free = 110 * GIB
+        outs = [self.default_clock_tick(72) for _ in range(5)]
+        self.assertEqual(outs[-1]['primary'], 'disk-floor')
+        self.assertTrue(outs[-1]['confirmed'])
+
+
 class Inventory(unittest.TestCase):
     def test_callers_are_classified_from_text_without_running_them(self):
         with tempfile.TemporaryDirectory() as root:
