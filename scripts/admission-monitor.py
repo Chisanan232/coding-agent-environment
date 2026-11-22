@@ -178,7 +178,7 @@ def host_uptime():
 
     `time.monotonic()` is not that clock under Apple's /usr/bin/python3 (3.9.6): it restarts near 0 in each process, and the monitor is a new process on every
     launchd tick, so the stored value said "no time passed" and every tick looked like a sleep (an observation gap) from the day it was installed."""
-    for name in ('CLOCK_UPTIME_RAW', 'CLOCK_MONOTONIC'):      # macOS uptime (no sleep); elsewhere CLOCK_MONOTONIC, which also excludes suspend
+    for name in ('CLOCK_UPTIME_RAW', 'CLOCK_MONOTONIC'):      # macOS: CLOCK_UPTIME_RAW stops in sleep (macOS CLOCK_MONOTONIC would count it). Linux: CLOCK_MONOTONIC stops in suspend
         clock = getattr(time, name, None)
         if clock is not None:
             with contextlib.suppress(OSError, ValueError):
@@ -378,7 +378,7 @@ def classify(snap, limits):
         found['state-unreadable'] = snap['problems'][0]
     if not waiting and not granted:
         return {'causes': found, 'primary': next(iter(found), 'idle'), 'waiting': 0, 'oldest_grant_s': 0, 'notes': [], 'notices': [],
-                'unclaimed': [], 'grant_escalated': False, 'grant_stall_s': None, 'abandoned': [], 'exited': []}
+                'unclaimed': [], 'grant_escalated': False, 'grant_stall_s': None, 'abandoned': [], 'exited': [], 'alert_causes': found, 'alert_primary': next(iter(found), 'idle')}
     head = waiting[0] if waiting else None
     mem = snap['mem']
     metrics = mem.get('metrics') or {}
@@ -440,15 +440,21 @@ def classify(snap, limits):
     held_elsewhere = waiting and waiting[0]['state'] == 'ELIGIBLE' and snap.get('reservations', 0) > 0    # a lane held by a non-queue reservation
     if waiting and not found and not granted and not held_elsewhere and not any(e['state'] == 'CLAIMED' for e in entries):
         found['frozen-queue'] = 'waiting work, free lanes and no blocker, but nothing is being granted'
-    primary = next((c for c in CAUSES if c in found), 'unknown')
-    if not found:
+    # What the verdict-level alert sees: an abandoned claim has its own per-entry incident, so it neither becomes the alert's primary nor hides a coexisting cause.
+    alert_found = {c: v for c, v in found.items() if not (c == 'stale-claim' and abandoned and not exited)}
+
+    def primary_of(causes):
+        if causes:
+            return next((c for c in CAUSES if c in causes), 'unknown')
         busy = any(e['state'] == 'CLAIMED' for e in entries) or (any(e['state'] == 'ELIGIBLE' for e in waiting) and (bool(granted) or snap.get('reservations', 0) > 0))   # an ELIGIBLE head waits on a lane someone holds
-        primary = 'healthy-busy' if busy else 'unknown'
+        return 'healthy-busy' if busy else 'unknown'
+    primary, alert_primary = primary_of(found), primary_of(alert_found)
     # History for the owner, never a trigger: a grant that lapsed unclaimed shortly ago (a lost callback).
     notes = ['%s grant lapsed unclaimed' % e['id'] for e in entries if e['state'] == 'EXPIRED' and isinstance(e.get('grant'), dict)
              and not e.get('holder') and 0 <= (now - safe_time(e['grant']['expires'])).total_seconds() < 3 * 3600]
     return {'causes': found, 'primary': primary, 'waiting': len(waiting), 'oldest_grant_s': oldest, 'notes': notes, 'notices': notices,
-            'unclaimed': unclaimed, 'grant_escalated': escalated, 'grant_stall_s': stall_s, 'abandoned': [e['id'] for e in abandoned], 'exited': exited}
+            'unclaimed': unclaimed, 'grant_escalated': escalated, 'grant_stall_s': stall_s, 'abandoned': [e['id'] for e in abandoned], 'exited': exited,
+            'alert_causes': alert_found, 'alert_primary': alert_primary}
 
 
 def gap_discount_s(gaps, start_wall):
@@ -1134,32 +1140,31 @@ def _tick_locked(env, directory, act, if_due):
     stalled_for = int(wall - progress_at) if (waiting or old_grant) else 0
     if old_grant:
         stalled_for = max(stalled_for, verdict['oldest_grant_s'])    # a grant nobody claimed has been idle since it was made
-    sig = signature(verdict, entries)
+    alerting = dict(verdict, causes=verdict['alert_causes'], primary=verdict['alert_primary'])      # the verdict minus an abandoned claim (its incident pages it)
+    sig = signature(alerting, entries)
     blocker = state['blocker']
-    if verdict['causes'] and blocker and blocker['signature'] == sig and not gap:
+    if alerting['causes'] and blocker and blocker['signature'] == sig and not gap:
         if wall - blocker.get('last', 0) >= CONFIRM_SPACING_S:      # two quick manual ticks are one observation
             blocker['confirmations'] += 1
             blocker['last'] = wall
-    elif verdict['causes']:
+    elif alerting['causes']:
         blocker = {'signature': sig, 'since': iso(now), 'confirmations': 0 if gap else 1, 'last': wall}
     else:
         blocker = None
     confirmed = bool(blocker) and blocker['confirmations'] >= CONFIRM_TICKS
-    quiet = verdict['primary'] in ('idle', 'healthy-busy')
+    quiet = alerting['primary'] in ('idle', 'healthy-busy')
     stalled = (waiting > 0 or old_grant) and stalled_for >= (STALL_S if waiting else verdict['grant_stall_s'] or 0) and not quiet
     result = {'ran': True, 'at': iso(now), 'observation_gap': gap, 'observation_gap_streak': state['gap_streak'], 'primary': verdict['primary'], 'causes': verdict['causes'],
               'waiting': waiting, 'stalled': stalled, 'stalled_for_s': stalled_for, 'signature': sig, 'confirmed': confirmed,
               'owner_action': OWNER_ACTION.get(verdict['primary']), 'granted_is_execution': False, 'actions': [],
               'notes': verdict['notes'], 'notices': verdict['notices'] + wait_notices(entries, now, state['gaps'])}
     state['advances'] = [t for t in state['advances'] if wall - t < ADVANCE_WINDOW_S]
-    abandoned_only = bool(verdict['abandoned']) and not verdict['exited']
-    incident_only = verdict['primary'] in INCIDENT_PRIMARY or (verdict['primary'] == 'stale-claim' and abandoned_only)
+    incident_only = alerting['primary'] in INCIDENT_PRIMARY
     result['abandoned_claims'] = abandoned_report(env, entries, abandoned, state['dead_claims'], now, state['gaps'])
     result['notices'] = result['notices'] + ['%s claim abandoned: supervising process gone, never witnessed running; holds %d GiB, %d entries wait behind it (not released: report only)' % (
         row['id'], (row['bytes_held'] or 0) // GIB, row['blocked_total']) for row in result['abandoned_claims'][:NOTICE_LIST_MAX]]
-    advanceable = set(verdict['causes']) - ({'stale-claim'} if abandoned_only else set())      # an abandoned claim is never advanced: the scheduler keeps it on purpose
-    wants_advance = waiting > 0 and not gap and confirmed and any(c in ADVANCE_CAUSES for c in advanceable) and not (
-        {'disk-floor', 'memory-pressure', 'state-unreadable'} & set(verdict['causes']))
+    wants_advance = waiting > 0 and not gap and confirmed and any(c in ADVANCE_CAUSES for c in alerting['causes']) and not (      # an abandoned claim is never advanced: the scheduler keeps it on purpose
+        {'disk-floor', 'memory-pressure', 'state-unreadable'} & set(alerting['causes']))
     if wants_advance:
         ok, why = advance_allowed(state, wall)
         if not act:
@@ -1176,13 +1181,13 @@ def _tick_locked(env, directory, act, if_due):
             result['actions'].append({'advance': why})
             if why == 'recovery-exhausted':
                 result['recovery_exhausted'] = True
-    alert_key = '%s:%s' % (verdict['primary'], sig)
+    alert_key = '%s:%s' % (alerting['primary'], sig)
     state['alerts'] = {k: v for k, v in state['alerts'].items() if wall - v['sent_at'] < 2 * ALERT_COOLDOWN_S}
-    escalate = stalled and confirmed and not incident_only and (verdict['primary'] not in RECOVERABLE or result.get('recovery_exhausted')
+    escalate = stalled and confirmed and not incident_only and (alerting['primary'] not in RECOVERABLE or result.get('recovery_exhausted')
                                           or stalled_for >= 2 * STALL_S)
     if escalate and alert_due(state, alert_key, wall):
-        alert = {'cause': verdict['primary'], 'causes': sorted(verdict['causes']), 'signature': sig, 'detail': verdict['causes'],
-                 'recovery': result['actions'], 'owner_action': result['owner_action'], 'blocked_for_s': stalled_for}
+        alert = {'cause': alerting['primary'], 'causes': sorted(alerting['causes']), 'signature': sig, 'detail': alerting['causes'],
+                 'recovery': result['actions'], 'owner_action': OWNER_ACTION.get(alerting['primary']), 'blocked_for_s': stalled_for}
         try:
             delivered = bool(env.notify(alert))
         except Exception:
@@ -1191,7 +1196,7 @@ def _tick_locked(env, directory, act, if_due):
         attempts = previous.get('attempts', 0) + 1
         state['alerts'][alert_key] = {'sent_at': wall, 'delivered': delivered, 'attempts': attempts,
                                       'next_try': wall + min(300 * 2 ** (attempts - 1), ALERT_COOLDOWN_S)}
-        state['last_alert'] = {'at': iso(now), 'cause': verdict['primary'], 'signature': sig, 'delivered': delivered, 'attempts': attempts}
+        state['last_alert'] = {'at': iso(now), 'cause': alerting['primary'], 'signature': sig, 'delivered': delivered, 'attempts': attempts}
         result['alert'] = dict(alert, delivered=delivered)
     handoff_incidents(env, state, verdict, entries, now, wall, result, gap and not fresh_start, claims=claims, directory=directory)
     if act:
