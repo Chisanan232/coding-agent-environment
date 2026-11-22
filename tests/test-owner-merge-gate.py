@@ -182,6 +182,53 @@ class Gate(unittest.TestCase):
             with self.subTest(), self.assertRaises(ValueError):
                 omg.review_completed_at(fake, "Chisanan232/r", 7, HEAD)
 
+    MINE_LOGIN = {"login": "chisanan232"}
+
+    def review_line(self, head=HEAD, verdict="PASS", blocking=0, reviewer="independent-agent-1"):
+        return f"OWNER-MERGE-REVIEW head={head} verdict={verdict} blocking={blocking} reviewer={reviewer}"
+
+    def review_fake(self, *bodies, files=None, **kw):
+        fake = Fake(comments=[{"author": self.MINE_LOGIN, "body": b, "createdAt": f"2026-11-14T0{i}:00:00Z"} for i, b in enumerate(bodies)], **kw)
+        fake.pr["files"] = files or []
+        return fake
+
+    def test_evidence_review_refuses_a_failing_or_blocked_record_even_when_a_clean_one_exists(self):
+        for label, bodies in (("newest FAIL after older PASS", [self.review_line(), self.review_line(verdict="FAIL")]),
+                              ("newest PASS after older FAIL (the gate refuses any non-clean record at the head)",
+                               [self.review_line(verdict="FAIL"), self.review_line()]),
+                              ("blocking findings", [self.review_line(blocking=2)])):
+            with self.subTest(label), self.assertRaisesRegex(ValueError, "REVIEW_NOT_CLEAN"):
+                omg.review_completed_at(self.review_fake(*bodies), "Chisanan232/r", 7, HEAD)
+
+    def test_evidence_review_refuses_self_author_coordinator_and_the_authenticated_login(self):
+        for reviewer in ("self", "author", "coordinator", "chisanan232", "Chisanan232"):
+            with self.subTest(reviewer), self.assertRaisesRegex(ValueError, "REVIEW_NOT_INDEPENDENT"):
+                omg.review_comment(self.review_fake(self.review_line(reviewer=reviewer)), "Chisanan232/r", 7, HEAD)
+
+    def test_evidence_review_ignores_other_heads_and_refuses_when_none_is_left(self):
+        other = self.review_line(head="c" * 40, verdict="FAIL")
+        self.assertEqual(omg.review_comment(self.review_fake(other, self.review_line()), "Chisanan232/r", 7, HEAD)[1], "independent-agent-1")
+        with self.assertRaisesRegex(ValueError, "no OWNER-MERGE-REVIEW"):
+            omg.review_comment(self.review_fake(other), "Chisanan232/r", 7, HEAD)
+        with self.assertRaisesRegex(ValueError, "no OWNER-MERGE-REVIEW"):
+            omg.review_comment(self.review_fake("```\n" + self.review_line() + "\n```"), "Chisanan232/r", 7, HEAD)
+
+    def test_evidence_review_requires_the_controlled_format_exactly_when_the_gate_does(self):
+        entry = {"checks": [("c0", ("x",))], "env": {}, "pinned_paths": ("scripts/*",), "controlled_script_paths": ("scripts/*.py",)}
+        lf = {"chisanan232/r": entry}
+        controlled_pr = dict(statusCheckRollup=[], files=[{"path": "scripts/a.py"}])
+        recipe = omg.local_first_recipe_sha256(entry)
+        good = f"{self.review_line()} base_sha={BASE_SHA} recipe_sha256={recipe} scope=project-scripts authorization=standing-project-work"
+        stale = good.replace(BASE_SHA, "d" * 40)
+        self.assertEqual(omg.review_comment(self.review_fake(good, **controlled_pr), "Chisanan232/r", 7, HEAD, lf)[1], "independent-agent-1")
+        for label, bodies in (("legacy head-only line", [self.review_line()]), ("other base commit", [stale]), ("two bindings", [good, good])):
+            with self.subTest(label), self.assertRaisesRegex(ValueError, "CONTROLLED_REVIEW"):
+                omg.review_comment(self.review_fake(*bodies, **controlled_pr), "Chisanan232/r", 7, HEAD, lf)
+        with self.assertRaisesRegex(ValueError, "REVIEW_NOT_CLEAN"):
+            omg.review_comment(self.review_fake(good, self.review_line(verdict="FAIL"), **controlled_pr), "Chisanan232/r", 7, HEAD, lf)
+        # not controlled (rollup present or no pinned controlled path): the legacy line is what the gate accepts
+        self.assertEqual(omg.review_comment(self.review_fake(self.review_line()), "Chisanan232/r", 7, HEAD, lf)[1], "independent-agent-1")
+
     def test_evidence_json_takes_an_explicit_completion_time_and_never_a_future_one(self):
         args = ("o/r", 7, "main", HEAD, "agent-rv1")
         self.assertEqual(omg.evidence_json(*args, reviewed_at="2026-11-14T02:47:00Z", now=1794624480)["reviewed_at"], "2026-11-14T02:47:00Z")

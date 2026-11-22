@@ -55,6 +55,8 @@ CONTROLLED_REVIEW_RE = re.compile(
     r"^OWNER-MERGE-REVIEW head=([0-9a-f]{40}) verdict=(\w+) blocking=(\d+) reviewer=(\S+) "
     r"base_sha=([0-9a-f]{40}) recipe_sha256=([0-9a-f]{64}) scope=project-scripts "
     r"authorization=standing-project-work$")
+# Reviewer ids that name the author or the coordinator, never an independent reviewer (the authenticated login is added at each use).
+NOT_INDEPENDENT_IDS = ("self", "author", "coordinator")
 REVIEW_LINE_RE = re.compile(r"^OWNER-MERGE-REVIEW\b[^\r\n]*$", re.M)
 CI_RE = re.compile(r"^OWNER-MERGE-CI-UNAVAILABLE head=([0-9a-f]{40}) cause=(billing|quota|outage) local_equivalent=(\w+)\s*$", re.M)
 NOCI_RE = re.compile(r"^OWNER-MERGE-CI-EXCEPTION head=([0-9a-f]{40}) basis=no-hosted-ci local_equivalent=(\w+)\s*$", re.M)
@@ -1094,7 +1096,7 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
                 reasons.append("CONTROLLED_REVIEW_REQUIRED: the legacy head-only review does not bind the current base and recipe")
         else:
             match = applicable[0]
-            if match.group(4).lower() in (me.lower(), "self", "author", "coordinator"):
+            if match.group(4).lower() in (me.lower(), *NOT_INDEPENDENT_IDS):
                 reasons.append("REVIEW_NOT_INDEPENDENT: reviewer id is the author or coordinator")
             else:
                 facts["reviewer"] = match.group(4)
@@ -1115,7 +1117,7 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
             if stamps and stamps[-1]:
                 facts["review_comment_at"] = stamps[-1]   # the review was complete no later than this comment
             facts["review_kind"] = "recorded technical review, self-attested by the authenticated identity (not a GitHub approval)"
-            if at_head[-1][3].lower() in (me.lower(), "self", "author", "coordinator"):
+            if at_head[-1][3].lower() in (me.lower(), *NOT_INDEPENDENT_IDS):
                 reasons.append("REVIEW_NOT_INDEPENDENT: reviewer id is the author or coordinator")
     checks = p["statusCheckRollup"] or []
     failed = [c.get("name") or c.get("context") for c in checks
@@ -1420,16 +1422,20 @@ def evidence_json(repo, pr, base, head, reviewer, kind="independent-agent", now=
             "reviewed_at": reviewed_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(current))}
 
 
-def review_completed_at(run, repo, pr, head):
-    """When the review of this exact head was recorded: the createdAt of the authenticated user's newest OWNER-MERGE-REVIEW comment for it.
+def review_comment(run, repo, pr, head, local_first=None):
+    """(createdAt, reviewer) of the review record the gate `check` would accept for this exact head; raises ValueError otherwise.
 
-    The evidence file takes this instead of a caller-written time. The PR must still be at `head`, so a review of an older head is never
-    stamped onto a newer one. It reads the comment's creation time, not its last edit, which can only make the time earlier (stricter).
+    Mirrors `check`: every at-head OWNER-MERGE-REVIEW record by the authenticated user must be PASS with blocking=0 (a newer clean
+    record never hides an older failing one, and the reverse), the reviewer id may not be the authenticated login, self, author or
+    coordinator, and where `check` demands the controlled review format (the repository is in `local_first`, the rollup is empty and
+    the PR touches a controlled pinned path) exactly one record must bind the current base commit and recipe digest.
+    createdAt is when that review was recorded; it is the comment's creation time, not its last edit, which can only make it earlier.
+    The PR must still be at `head`, so a review of an older head is never stamped onto a newer one.
     """
     if not REPO_RE.fullmatch(repo) or not re.fullmatch(r"[1-9][0-9]{0,8}", str(pr)) or not re.fullmatch(r"[0-9a-f]{40}", head):
         raise ValueError("repo, pr and head (40-hex) must be well formed")
     me = run("api", "user", "--jq", ".login").strip().lower()
-    p = _json(run, "pr", "view", str(pr), "--repo", repo, "--json", "headRefOid,comments")
+    p = _json(run, "pr", "view", str(pr), "--repo", repo, "--json", "headRefOid,baseRefOid,statusCheckRollup,files,comments")
     if p["headRefOid"] != head:
         raise ValueError("the PR is no longer at this head; the recorded review does not apply")
     comments, rest_n, comments_error = merged_comments(run, repo, pr, p.get("comments"))
@@ -1437,12 +1443,46 @@ def review_completed_at(run, repo, pr, head):
         raise ValueError(f"the PR comments could not be read from REST: {comments_error}")
     if (rest_n or 0) >= 100 or len(p.get("comments") or []) >= 100:
         raise ValueError("100 or more comments; the newest record may be hidden, so no completion time is stamped")
-    stamps = [c.get("createdAt") for c in comments
-              if (c.get("author") or {}).get("login", "").lower() == me
-              and any(m[0] == head for m in REVIEW_RE.findall(re.sub(r"```.*?```", "", c.get("body") or "", flags=re.S)))]
-    if not stamps or not stamps[-1]:
+    mine = [(c.get("createdAt"), re.sub(r"```.*?```", "", c.get("body") or "", flags=re.S)) for c in comments
+            if (c.get("author") or {}).get("login", "").lower() == me]
+    entry = (local_first or {}).get(repo.lower())
+    controlled = bool(entry and not (p.get("statusCheckRollup") or []) and _controlled_pin_candidate(p.get("files"), entry))
+    rejected = (me, *NOT_INDEPENDENT_IDS)
+    if controlled:
+        recipe = local_first_recipe_sha256(entry)
+        lines = [(at, line) for at, text in mine for line in REVIEW_LINE_RE.findall(text)
+                 if re.match(r"^OWNER-MERGE-REVIEW\s+head=" + re.escape(head) + r"(?:\s|$)", line)]
+        legacy = [(at, REVIEW_RE.fullmatch(l)) for at, l in lines if REVIEW_RE.fullmatch(l)]
+        parsed = [(at, CONTROLLED_REVIEW_RE.fullmatch(l)) for at, l in lines if CONTROLLED_REVIEW_RE.fullmatch(l)]
+        applicable = [(at, m) for at, m in parsed if m.group(5) == p.get("baseRefOid") and m.group(6) == recipe]
+        if any(m.group(2) != "PASS" or m.group(3) != "0" for _, m in legacy + applicable):
+            raise ValueError("REVIEW_NOT_CLEAN: a recorded review for this head has blocking findings or a non-PASS verdict")
+        if len(legacy) + len(parsed) != len(lines):
+            raise ValueError("CONTROLLED_REVIEW_INVALID: a review record for this head is malformed")
+        if len(applicable) != 1:
+            raise ValueError("CONTROLLED_REVIEW_REQUIRED: exactly one controlled review record must bind this head, the base commit and the check recipe")
+        at, m = applicable[0]
+        if m.group(4).lower() in rejected:
+            raise ValueError("REVIEW_NOT_INDEPENDENT: reviewer id is the author or coordinator")
+        if not at:
+            raise ValueError("the review comment has no creation time")
+        return at, m.group(4)
+    found = [(at, m) for at, text in mine for m in REVIEW_RE.findall(text) if m[0] == head]
+    if not found:
         raise ValueError("no OWNER-MERGE-REVIEW comment by the authenticated user for this head")
-    return stamps[-1]
+    if any(m[1] != "PASS" or m[2] != "0" for _, m in found):
+        raise ValueError("REVIEW_NOT_CLEAN: a recorded review for this head has blocking findings or a non-PASS verdict")
+    at, m = found[-1]
+    if m[3].lower() in rejected:
+        raise ValueError("REVIEW_NOT_INDEPENDENT: reviewer id is the author or coordinator")
+    if not at:
+        raise ValueError("the review comment has no creation time")
+    return at, m[3]
+
+
+def review_completed_at(run, repo, pr, head, local_first=None):
+    """The createdAt of the review record the gate would accept for this head (see review_comment)."""
+    return review_comment(run, repo, pr, head, local_first)[0]
 
 
 def queue_report(run, repo, prs, owners, ci_unavailable=False, settings=None, version_policy=None, ci_exception=False, local_first=None):
@@ -1540,7 +1580,9 @@ def main(argv=None, run=None):
             if a.from_review_comment:
                 if at:
                     raise ValueError("--from-review-comment and --reviewed-at are alternatives")
-                at = review_completed_at(run, a.repo, a.pr, a.head)
+                lf = read_owner_file(LOCAL_FIRST_DEFAULT, False, load_local_first, "local-first CI config",
+                                     os.path.dirname(os.path.expanduser(LOCAL_FIRST_DEFAULT)))
+                at = review_completed_at(run, a.repo, a.pr, a.head, lf)
             print(json.dumps(evidence_json(a.repo, a.pr, a.base, a.head, a.reviewer, a.kind, reviewed_at=at), indent=1))
             return 0
         if a.cmd == "evidence-line":

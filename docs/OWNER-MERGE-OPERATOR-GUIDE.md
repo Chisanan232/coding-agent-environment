@@ -191,6 +191,9 @@ commands instead. The responsible agent installs the owner-governed `~/.config/c
 The standing project-work authorization is recorded in that review line and does not replace CI evidence or GitHub approval. Full rules and threat notes:
 `docs/OWNER-MERGE-WORKFLOW.md`. Step list for the first use: `docs/OWNER-MERGE-LOCAL-FIRST-HANDOFF.md`.
 
+For an allowlist entry with `required_local_checks`, the runner's review evidence is built with `owner-merge-local-ci.py evidence` from the recorder's persisted
+record (sequence: record, review comment, evidence, gate check, runner dry-run, runner merge, verify); see "Local checks as runner evidence" in `docs/OWNER-MERGE-WORKFLOW.md`.
+
 The recorder snapshots only inherited `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and `NEXTEST_TEST_THREADS`, validates any supplied
 values as ASCII decimal limits from 1 to 1024, and forwards only those three caps into checks. For limits permitted by the existing
 environment policy, the recorder uses the lower inherited/configured value. Configured `CARGO_*` keys remain refused; this change
