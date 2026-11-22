@@ -45,6 +45,9 @@ def py(code):
 
 
 class Recorder(unittest.TestCase):
+    def log_names(self):
+        return sorted(n for n in os.listdir(self.logs) if n.endswith(".log"))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         base = os.path.realpath(self.tmp.name)
@@ -198,7 +201,7 @@ class Recorder(unittest.TestCase):
     def test_logs_are_private_and_their_digest_is_recorded(self):
         _, out, _ = self.record(py("print('hello')"))
         cmd = json.loads(out.split(" ", 1)[1])["commands"][0]
-        logs = [os.path.join(self.logs, n) for n in os.listdir(self.logs)]
+        logs = [os.path.join(self.logs, n) for n in self.log_names()]
         self.assertEqual(len(logs), 1)
         self.assertEqual(stat.S_IMODE(os.stat(logs[0]).st_mode), 0o600)
         import hashlib
@@ -252,7 +255,7 @@ class Recorder(unittest.TestCase):
                    "RUST_LOG": "trace"}
         with mock.patch.dict(os.environ, hostile):
             self.record(dump, env={"OWNER_FIXED": "1"})
-        log = pathlib.Path(self.logs, os.listdir(self.logs)[0]).read_text().split(",")
+        log = pathlib.Path(self.logs, self.log_names()[0]).read_text().split(",")
         for key in hostile:
             self.assertNotIn(key, log)
         for key in ("PATH", "HOME", "OWNER_FIXED"):
@@ -305,7 +308,7 @@ class Recorder(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CARGO_BUILD_JOBS": "3"}), mock.patch.object(rec, "run_check", change_after_first):
             result, _, _ = self.record(py(code), py(code))
         self.assertEqual(result, 0)
-        logs = [pathlib.Path(self.logs, name).read_text().strip() for name in sorted(os.listdir(self.logs))]
+        logs = [pathlib.Path(self.logs, name).read_text().strip() for name in self.log_names()]
         self.assertEqual(logs, ["3", "3"])
 
     def test_invalid_inherited_caps_refuse_before_execution_and_log_truncation(self):
@@ -346,7 +349,7 @@ class Recorder(unittest.TestCase):
         os.mkdir(self.logs, 0o755)
         self.assertEqual(self.record(py("pass"))[0], 0)
         self.assertEqual(stat.S_IMODE(os.stat(self.logs).st_mode), 0o700)
-        name = os.listdir(self.logs)[0]
+        name = self.log_names()[0]
         os.chmod(os.path.join(self.logs, name), 0o644)
         code, out, _ = self.record(py(f"open({self.marker!r}, 'w')"))   # same head and check name: the existing log has another mode
         self.assertEqual((code, out), (2, ""))
@@ -420,7 +423,7 @@ class Recorder(unittest.TestCase):
             rec.load_entry(REPO, path, cfg)
 
     def log_text(self):
-        return pathlib.Path(self.logs, os.listdir(self.logs)[0]).read_text()
+        return pathlib.Path(self.logs, self.log_names()[0]).read_text()
 
     def test_checks_get_the_hosted_context_and_the_record_carries_it(self):
         dump = py("import os; print(*(os.environ.get(k, '<unset>') for k in ('PULL_BRANCH', 'PR_TITLE', 'GIT_BASE', 'CARGO_TARGET_DIR')), sep='\\n')")

@@ -119,6 +119,28 @@ def log_path(logs, name, head, tag):
     return os.path.join(logs, f"local-ci-{tag}-{head[:12]}-{gate.log_slug(name)}.log")
 
 
+def record_path(logs, head, tag):
+    return os.path.join(logs, f"local-ci-{tag}-{head[:12]}.record.json")
+
+
+def write_private(path, text):
+    """Persist a file atomically with mode 0600 (exclusive temp file, then rename); a link or non-file at `path` is refused."""
+    if os.path.lexists(path) and (os.path.islink(path) or not os.path.isfile(path)):
+        raise RuntimeError(f"{path} is not a regular file")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        raise
+
+
 def open_log(path):
     """Open (never follow a link) a log file that is a regular file owned by the caller with mode exactly 0600, creating it when absent."""
     import stat
@@ -239,6 +261,9 @@ def record(repo, pr, base, worktree, entry, logs, expect_head=None, evidence_hos
             path = log_path(logs, name, head, tag)
             if os.path.lexists(path):
                 open_log(path).close()
+        rpath = record_path(logs, head, tag)
+        if os.path.lexists(rpath) and (os.path.islink(rpath) or not os.path.isfile(rpath)):
+            return refuse(f"record file {rpath} is not a regular file")
     except (OSError, RuntimeError) as e:
         return refuse(str(e))
     child_env = check_env(entry.get("env") or {}, check_context, effective_caps)
@@ -261,7 +286,12 @@ def record(repo, pr, base, worktree, entry, logs, expect_head=None, evidence_hos
         print("owner-merge-local-ci: the checks also changed the worktree; printing the failing record only", file=sys.stderr)
     out = {"schema": 1, "repo": repo, "pr": int(pr), "base": base, "base_sha": base_sha, "head": head,
            "env": dict(entry.get("env") or {}), "context": context, "commands": commands}
-    print("OWNER-MERGE-LOCAL-CI " + json.dumps(out, separators=(",", ":")))
+    line = json.dumps(out, separators=(",", ":"))
+    try:   # the persisted file is what `evidence` consumes; it must equal the printed line
+        write_private(record_path(logs, head, tag), line)
+    except (OSError, RuntimeError) as e:
+        return refuse(f"cannot persist the record: {e}")
+    print("OWNER-MERGE-LOCAL-CI " + line)
     return 0 if all(c["exit_code"] == 0 for c in commands) else 1
 
 
