@@ -729,6 +729,7 @@ class Evidence(unittest.TestCase):
         self.refused("cannot be opened")
         for label, comment in (("other author", self.posted(author={"login": "intruder"})),
                                ("fenced", self.posted(body="```\n" + self.printed.strip() + "\n```")),
+                               ("tilde fenced", self.posted(body="~~~\n" + self.printed.strip() + "\n~~~")),
                                ("edited", self.posted(includesCreatedEdit=True)), ("minimized", self.posted(isMinimized=True)),
                                ("no integrity flags (REST only)", {k: v for k, v in self.posted().items() if not k.startswith("i")}),
                                ("posted before it finished", self.posted(createdAt="2020-01-01T00:00:00Z"))):
