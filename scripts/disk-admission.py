@@ -439,6 +439,7 @@ def process_table():
 # inspected while its wrapper is alive. A lane is freed only when none of those identities is running any more.
 MAX_WORKLOAD_MEMBERS = 256
 WITNESSES_REQUIRED = 1  # inspections of the running wrapper, after the capture, needed before an exit can be certified
+NOT_WITNESSED = 'workload-not-witnessed'  # holder_status reason prefix: the wrapper is gone and was never inspected running (the stall monitor reads it)
 MAX_PID = 2 ** 31
 
 
@@ -558,7 +559,7 @@ def holder_status(pid, token, workload, token_fn=None, table_fn=None):
         return HolderStatus('unresolved', reason='workload-not-fully-recorded: more than %d descendants were seen, so an '
                             'empty remainder cannot prove the workload ended' % MAX_WORKLOAD_MEMBERS, workload=grown)
     if workload.get('refreshes', 0) < WITNESSES_REQUIRED:
-        return HolderStatus('unresolved', reason='workload-not-witnessed: the wrapper ended before any inspection saw it '
+        return HolderStatus('unresolved', reason=NOT_WITNESSED + ': the wrapper ended before any inspection saw it '
                             'running, so detached work cannot be ruled out; release it explicitly once the job is over',
                             workload=grown)
     return HolderStatus('exited', evidence=gone, workload=grown)
