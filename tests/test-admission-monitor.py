@@ -1609,6 +1609,8 @@ class WaitAndRunClocks(MonitorBase):
             ids.append(out['id'])
         for n, qid in enumerate(ids):
             self.age(qid, 13 + n / 1000.0)                                     # distinct ages, oldest first by index descending
+        self.walk(2 * 120)
+        self.assertEqual(len(self.pages()), 2 * mon.FIRST_NOTICES_PER_TICK)      # a burst is paced: at most this many first notices per tick
         out = self.walk(3 * 120)
         self.assertEqual(len(self.incidents()), mon.WAIT_INCIDENT_MAX)
         self.assertEqual(len(self.pages()), mon.WAIT_INCIDENT_MAX)

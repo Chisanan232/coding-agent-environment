@@ -68,6 +68,7 @@ GAP_MAX_S = 48 * 3600         # one remembered gap never discounts more than thi
 ABANDON_TICKS = 5             # observations, at least CONFIRM_SPACING_S apart (about 5 min on a 60 s timer), of the same dead holder identity before it is reported
 ABANDON_MIN_AGE_S = 900       # and the claim itself must be this old: a wrapper that is still starting or exiting cleanly has released by then
 DEAD_CLAIM_LIMIT = 16
+FIRST_NOTICES_PER_TICK = 3    # incident notices handed to session-notify for the first time in one tick; the rest wait for the next tick (its own cap is 20 pending, oldest dropped)
 GAP_LEDGER_MAX = 32           # observation gaps remembered for discounting wait and run ages
 OUTBOX_NAME = 'owner-outbox.jsonl'
 CPU_STALL_S = 900             # a claimed, alive workload with no CPU growth this long is reported, never touched
@@ -1499,7 +1500,8 @@ def handoff_incidents(env, state, verdict, entries, now, wall, result, gap=False
     wait_run_incidents(env, state, verdict, entries, claims or {}, now, wall, gap, directory, result)
     in_use = sum(1 for e in entries if e['state'] == 'CLAIMED' or (e['state'] == 'GRANTED' and safe_time(e['grant']['expires']) > now))
     waiting = [e['id'] for e in entries if e['state'] in ('QUEUED', 'ELIGIBLE') and safe_time(e['wait_expires']) > now]
-    for key, rec in sorted(incidents.items(), key=lambda kv: kv[1]['grant_wall']):
+    fresh = 0
+    for key, rec in sorted(incidents.items(), key=lambda kv: (kv[1]['clock'] != 'claim', kv[1]['grant_wall'])):      # an abandoned claim is the cause of the waits behind it: first
         if rec['phase'] == 'lapsed':     # the lane must be free again, and an eligible entry should start (existing continuation checks decide blame)
             before = rec['verify'] or {}
             nxt = before.get('next') or (waiting[0] if waiting else None)
@@ -1508,6 +1510,10 @@ def handoff_incidents(env, state, verdict, entries, now, wall, result, gap=False
         handed = rec['notified_phase'] == rec['phase']
         if wall < rec['next_try'] or incident_settled(rec):
             continue
+        if not handed:
+            if fresh >= FIRST_NOTICES_PER_TICK:
+                continue      # deferred, not dropped: still unsettled, so the next tick asks again
+            fresh += 1
         alert = incident_alert(key, rec, wall)
         try:
             outcome = env.emit_incident(alert)
