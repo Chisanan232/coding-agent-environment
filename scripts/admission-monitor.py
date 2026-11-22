@@ -165,6 +165,19 @@ def boot_time():
         return 0
 
 
+def host_uptime():
+    """Seconds on a clock that is shared by every process and stops while the host sleeps, so a tick can compare it with the wall clock.
+
+    `time.monotonic()` is not that clock under Apple's /usr/bin/python3 (3.9.6): it restarts near 0 in each process, and the monitor is a new process on every
+    launchd tick, so the stored value said "no time passed" and every tick looked like a sleep (an observation gap) from the day it was installed."""
+    for name in ('CLOCK_UPTIME_RAW', 'CLOCK_MONOTONIC'):      # macOS uptime (no sleep); elsewhere CLOCK_MONOTONIC, which also excludes suspend
+        clock = getattr(time, name, None)
+        if clock is not None:
+            with contextlib.suppress(OSError, ValueError):
+                return time.clock_gettime(clock)
+    return time.monotonic()
+
+
 def cpu_seconds(table_text):
     """{pid: (ppid, cpu seconds)} from `ps -axo pid=,ppid=,time=`; command lines are never read."""
     out = {}
@@ -709,6 +722,7 @@ def sanitize_state(state):
                 advances=nums(state.get('advances'), 64), progress_at=progress if finite(progress) else None,
                 last_alert=state.get('last_alert') if isinstance(state.get('last_alert'), dict) and finite(state['last_alert'].get('clear_next', 0))
                 and type(state['last_alert'].get('clear_tries', 0)) is int else None,
+                gap_streak=state.get('gap_streak') if type(state.get('gap_streak')) is int and 0 <= state['gap_streak'] < 10 ** 6 else 0,
                 clean_ticks=state.get('clean_ticks') if type(state.get('clean_ticks')) is int and 0 <= state['clean_ticks'] < 10 ** 6 else 0)
 
 
@@ -722,7 +736,7 @@ class Env:
                  owner_sessions=None, owner_process=None, owner_launcher=None, recovery_env=None):
         self.da, self.state_path, self.memory_state_path, self.limits = da, Path(state_path), Path(memory_state_path), limits
         self.clock = clock or (lambda: datetime.now(timezone.utc))
-        self.mono = mono or time.monotonic
+        self.mono = mono or host_uptime
         self.boot = boot or boot_time
         self.table = table or ps_table
         self.memory = memory or (lambda: memory_view(self.memory_state_path))
@@ -1003,6 +1017,7 @@ def _tick_locked(env, directory, act, if_due):
         state['blocker'] = None
         if rebooted:
             state['cpu'], state['states'] = {}, {}
+    state['gap_streak'] = state['gap_streak'] + 1 if gap and not fresh_start else 0      # a gap on every tick is a broken clock, not a sleeping host: status shows it
     try:
         entries, problems = env.da._queue_entries(env.state_path)
     except Exception as exc:    # StateError from a symlinked queue directory, or an unreadable store
@@ -1068,7 +1083,7 @@ def _tick_locked(env, directory, act, if_due):
     confirmed = bool(blocker) and blocker['confirmations'] >= CONFIRM_TICKS
     quiet = verdict['primary'] in ('idle', 'healthy-busy')
     stalled = (waiting > 0 or old_grant) and stalled_for >= (STALL_S if waiting else verdict['grant_stall_s'] or 0) and not quiet
-    result = {'ran': True, 'at': iso(now), 'observation_gap': gap, 'primary': verdict['primary'], 'causes': verdict['causes'],
+    result = {'ran': True, 'at': iso(now), 'observation_gap': gap, 'observation_gap_streak': state['gap_streak'], 'primary': verdict['primary'], 'causes': verdict['causes'],
               'waiting': waiting, 'stalled': stalled, 'stalled_for_s': stalled_for, 'signature': sig, 'confirmed': confirmed,
               'owner_action': OWNER_ACTION.get(verdict['primary']), 'granted_is_execution': False, 'actions': [],
               'notes': verdict['notes'], 'notices': verdict['notices'] + wait_notices(entries, now, state['gaps'])}
