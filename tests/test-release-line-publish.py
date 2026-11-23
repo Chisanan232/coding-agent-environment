@@ -31,6 +31,8 @@ FAKE_GH = FAKE_GH.replace(_old, '''elif a[:2] == ["release", "view"]:
     if rel is None:
         sys.stderr.write("release not found\\\\n")
         sys.exit(1)
+    if st.get("fail_view"):
+        sys.exit(1)
     print(json.dumps({{"tagName": a[2], "name": rel["title"], "body": rel["body"], "isDraft": rel.get("draft", False),
                       "assets": [{{"name": n}} for n in sorted(rel["assets"])]}}))
 elif a[:2] == ["release", "download"]:
@@ -42,6 +44,7 @@ elif a[:2] == ["release", "download"]:
         open(os.path.join(opt("--dir"), n), "wb").write(base64.b64decode(b))
 elif a[:2] == ["release", "create"]:
     import base64
+    open(S + ".tok", "a").write("1" if os.environ.get("GH_TOKEN") else "0")
     tag, rest, files, o, i = a[2], a[3:], [], {{}}, 0
     while i < len(rest):
         x = rest[i]
@@ -366,6 +369,152 @@ class Publish(Pub):
         self.w("tag", "-d", "v0.3.0")
         self.tag("v0.3.0", "integration/v0.x")
         self.assertEqual(self.refused(self.rel("publish", execute=True)[1]), "PROMOTION_ASSERTION_FAILED")
+        self.assertEqual(self.creates(), [])
+
+
+GIT_TOKEN_WRAPPER = """#!/bin/sh
+[ -n "${{GH_TOKEN+x}}${{GITHUB_TOKEN+x}}" ] && echo leak >> "$GIT_LOG.leak"
+printf '%s\\n' "$*" >> "$GIT_LOG"
+exec {git} "$@"
+"""
+HOSTILE_BUILD = (BUILD + "import re, subprocess\n"
+                 "gd = re.search(r'gitdir: (.*)', pathlib.Path('.git').read_text()).group(1).strip()\n"
+                 "common = os.path.dirname(os.path.dirname(gd))\n"
+                 "marker = os.environ['TMPDIR'] + '/../filter-ran'\n"
+                 "open(common + '/config', 'a').write('[filter \"x\"]\\n\\tclean = touch ' + marker + '\\n')\n"
+                 "os.makedirs(common + '/info', exist_ok=True)\n"
+                 "open(common + '/info/attributes', 'a').write('* filter=x\\n')\n")
+
+
+class Hardened(Pub):
+    def probe(self):
+        spec = importlib.util.spec_from_file_location("rl_publish_probe", ROOT / "scripts/release-line.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def journal(self):
+        return [json.loads(x) for x in (self.state_dir / "journal.jsonl").read_text().splitlines()]
+
+    def pub_states(self):
+        keep = {"created", "published", "publish-unverified", "publish-failed", "reused"}
+        return [r["state"] for r in self.journal() if r["state"] in keep]
+
+    def test_git_children_never_receive_a_github_token_but_gh_does(self):
+        mod = self.probe()
+        seen = []
+        real = mod.subprocess.run
+
+        def spy(argv, **kw):
+            seen.append((os.path.basename(argv[0]), dict(kw["env"])))
+            return real(["true"], **{k: v for k, v in kw.items() if k != "env"}, env={"PATH": "/usr/bin:/bin"})
+        os.environ.update({"GH_TOKEN": "t-not-real", "GITHUB_TOKEN": "t-not-real"})
+        mod.subprocess.run = spy
+        mod._tool_cache.update({"git": "/usr/bin/git", "gh": "/usr/bin/gh"})
+        try:
+            mod.run3(["git", "--version"])
+            mod.run3(["gh", "--version"])
+        finally:
+            mod.subprocess.run = real
+            os.environ.pop("GH_TOKEN"), os.environ.pop("GITHUB_TOKEN")
+        (git_env,), (gh_env,) = [e for n, e in seen if n == "git"], [e for n, e in seen if n == "gh"]
+        for k in ("GH_TOKEN", "GITHUB_TOKEN"):
+            self.assertFalse(k in git_env, k)
+        self.assertTrue("GH_TOKEN" in gh_env)
+
+    def test_tokens_reach_gh_only_and_never_the_envelope_or_journal(self):
+        (self.bin / "git").write_text(GIT_TOKEN_WRAPPER.format(git=REAL_GIT))
+        self.env["GH_TOKEN"] = "fake-not-a-real-token-123"
+        self.env["GITHUB_TOKEN"] = "fake-not-a-real-token-456"
+        self.prepared()
+        rc, out, _ = self.rel("publish", execute=True)
+        self.assertEqual((rc, out["status"]), (0, "PASS"), out)
+        self.assertFalse(pathlib.Path(str(self.git_log) + ".leak").exists())  # no git child ever saw a token
+        self.assertEqual(pathlib.Path(str(self.gh_state) + ".tok").read_text(), "1")  # gh did
+        blob = json.dumps(out) + (self.state_dir / "journal.jsonl").read_text()
+        env_txt = (self.vdir() / "env.txt").read_text().split("\n")
+        for secret in ("fake-not-a-real-token-123", "fake-not-a-real-token-456"):
+            self.assertNotIn(secret, blob)
+        for k in ("GH_TOKEN", "GITHUB_TOKEN"):
+            self.assertFalse(k in env_txt, k)  # and the build never saw them
+
+    def test_a_build_that_plants_a_filter_in_the_clone_is_refused_and_never_runs_it(self):
+        self.ship()
+        (self.bin / "git").write_text(GIT_TOKEN_WRAPPER.format(git=REAL_GIT))
+        self.env["GH_TOKEN"] = "fake-not-a-real-token-123"
+        self.set_build([sys.executable, "-c", HOSTILE_BUILD])
+        rc, out, _ = self.rel("build", execute=True)
+        self.assertEqual((rc, self.refused(out)), (1, "CLONE_CONFIG_HOSTILE"), out)
+        self.assertFalse(self.top.exists())  # nothing recorded
+        self.assertFalse((pathlib.Path(self.tmp.name) / "filter-ran").exists())
+        self.assertFalse(any(pathlib.Path(self.tmp.name).glob("**/filter-ran")))
+        self.assertFalse(pathlib.Path(str(self.git_log) + ".leak").exists())
+
+    def test_info_attributes_with_a_driver_is_refused_by_the_clone_check(self):
+        mod = self.probe()
+        mod.require_clone(self.work, None)
+        info = pathlib.Path(self.work) / ".git" / "info"
+        info.mkdir(exist_ok=True)
+        (info / "attributes").write_text("* filter=x\n")
+        with self.assertRaises(mod.Refusal) as cm:
+            mod.require_clone(self.work, None)
+        self.assertEqual(cm.exception.code, "CLONE_CONFIG_HOSTILE")
+        (info / "attributes").write_text("*.png binary\n")
+        mod.require_clone(self.work, None)
+
+    def test_build_process_group_is_killed_on_normal_exit(self):
+        self.ship()
+        pidfile = pathlib.Path(self.tmp.name) / "child.pid"
+        spawn = ("import subprocess, sys\n"
+                 f"p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+                 f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n")
+        self.set_build([sys.executable, "-c", BUILD + spawn])
+        rc, out, _ = self.rel("build", execute=True)
+        self.assertEqual((rc, out["status"]), (0, "PASS"), out)
+        pid = int(pidfile.read_text())
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(pid, 9)
+            self.fail("the build's background process survived the build")
+
+    def test_verification_outage_after_create_is_a_journaled_fail_not_blocked(self):
+        self.prepared()
+        self.gh_update(fail_view=True)
+        rc, out, _ = self.rel("publish", execute=True)
+        self.assertEqual((rc, out["status"], self.step(out, "release")["state"], self.step(out, "verify")["state"]), (1, "FAIL", "CREATED", "FAIL"), out)
+        self.assertEqual(len(self.creates()), 1)
+        states = self.pub_states()
+        self.assertEqual(states, ["created", "publish-unverified"])
+
+    def test_created_is_journaled_before_verification_and_reuse_and_failure_are_journaled(self):
+        self.prepared()
+        self.gh_update(fail_create=True)
+        rc, out, _ = self.rel("publish", execute=True)
+        self.assertEqual(self.refused(out), "PUBLISH_FAILED")
+        self.assertEqual(self.pub_states(), ["publish-failed"])
+        self.gh_update(fail_create=False)
+        rc, out, _ = self.rel("publish", execute=True)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.pub_states(), ["publish-failed", "created", "published"])
+        rc, out, _ = self.rel("publish")  # dry run of a reuse writes nothing
+        self.assertEqual(self.step(out, "release")["state"], "REUSED")
+        self.assertEqual(len(self.pub_states()), 3)
+        rc, out, _ = self.rel("publish", execute=True)
+        self.assertEqual(self.step(out, "release")["state"], "REUSED")
+        self.assertEqual(self.pub_states()[-1], "reused")
+
+    def test_a_github_outage_fails_closed_in_resolve_final(self):
+        self.prepared()
+        self.gh_update(list_fail=True)
+        for cmd in ("notes", "build", "publish"):
+            rc, out, _ = self.rel(cmd, execute=True)
+            self.assertEqual((rc, out["status"]), (1, "BLOCKED"), (cmd, out))
+            self.assertEqual(self.refused(out), "GH_UNAVAILABLE", cmd)
         self.assertEqual(self.creates(), [])
 
 
