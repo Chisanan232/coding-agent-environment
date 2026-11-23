@@ -81,7 +81,7 @@ Use when a product (for example a public repository such as `horonomy/local-agen
 }
 ```
 
-6. While no Actions run can exist, every PR head commit message ends with `[skip actions]` (the gate's skip directive); without it the rollup is not provably empty by design and the gate refuses.
+6. While no Actions run can exist, every PR head commit message ends with `[skip actions]` (the gate's skip directive; the local-first basis requires either that directive or proof that no Actions run exists for the head).
 
 **Per PR (each step its own call, all at the same full head SHA):**
 
