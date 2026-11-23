@@ -2349,5 +2349,123 @@ class PrivateFreeCapability(Base):
                 self.assertRefused(FakeGh(plan_limited=True), "allowlist config")
 
 
+class LocalGateOnly(Base):
+    """local_gate_only: no hosted required check exists on the base, so the base branch must be protected on its own and the
+    local evidence is the mandatory gate."""
+
+    NAMES = ["ruff", "pytest"]
+
+    def local(self, **over):
+        lc = {"classification": "LOCAL_EQUIVALENT_PASS", "head": HEAD, "run_at": "2026-10-20T11:00:00Z",
+              "checks": [{"name": n, "exit_code": 0, "tests": 0} for n in self.NAMES]}
+        lc.update(over)
+        return lc
+
+    def cfg(self, **kw):
+        base = dict(required_checks=[], required_local_checks=self.NAMES, local_equivalent_ci=True, local_gate_only=True)
+        base.update(kw)
+        self.allow.write_text(json.dumps(allow_doc(**base)))
+
+    def setUp(self):
+        super().setUp()
+        self.cfg()
+        self.write_evidence(local_ci=self.local())
+
+    @staticmethod
+    def prot(**over):
+        body = {"enforce_admins": {"enabled": True}, "allow_force_pushes": {"enabled": False},
+                "allow_deletions": {"enabled": False}}
+        body.update(over)
+        return (0, json.dumps(body))
+
+    def gh(self, protection=None, rules=None, **kw):
+        pr = kw.pop("pr", None) or base_pr(statusCheckRollup=[])
+        return FakeGh(pr, rules=[] if rules is None else rules, protection=protection or self.prot(), **kw)
+
+    def test_protected_base_without_required_contexts_is_accepted_and_audited(self):
+        gh = self.gh()
+        code, rec = self.go(gh)
+        self.assertEqual((code, rec["outcome"]), (omr.EXIT_OK, "MERGED"), rec)
+        self.assertEqual(rec["guarantees"]["server_side"], "local-gate-protected-base")
+        self.assertEqual(rec["server_side"]["server_side"], "local-gate-protected-base")
+        self.assertEqual(len(gh.merges()), 1)
+
+    def test_a_ruleset_without_bypass_actors_is_accepted(self):
+        code, rec = self.go(self.gh(rules=[{"type": "deletion", "ruleset_id": 11}]), dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+
+    def test_config_validation_matrix(self):
+        for kw in (dict(local_gate_only="yes"), dict(local_gate_only=1), dict(required_checks=["ci"]),
+                   dict(required_local_checks=[]), dict(require_server_side_protection=False),
+                   dict(protection_capability="private-free-app-level"), dict(local_equivalent_ci=False)):
+            with self.subTest(kw=kw):
+                self.cfg(**kw)
+                self.assertRefused(self.gh(), "allowlist config")
+        doc = allow_doc(required_checks=[], required_local_checks=self.NAMES, local_gate_only=True)
+        doc["repos"][REPO].pop("local_equivalent_ci", None)
+        self.allow.write_text(json.dumps(doc))
+        self.assertRefused(self.gh(), "allowlist config")
+
+    def test_default_is_off_and_empty_contexts_still_refuse_without_it(self):
+        self.cfg(local_gate_only=False)
+        self.assertRefused(self.gh(), "no server-side required status checks")
+
+    def test_unprotected_or_weak_protection_refuses_even_with_accept_bypass_actors(self):
+        cases = {"absent": (1, "HTTP 404: Not Found"), "unreadable": (1, "HTTP 500"), "garbage": (0, "[]"),
+                 "admins_off": self.prot(enforce_admins={"enabled": False}),
+                 "admins_missing": self.prot(enforce_admins=None),
+                 "admins_string": self.prot(enforce_admins={"enabled": "true"}),
+                 "force_push": self.prot(allow_force_pushes={"enabled": True}),
+                 "force_push_missing": self.prot(allow_force_pushes={}),
+                 "deletions": self.prot(allow_deletions={"enabled": True}),
+                 "deletions_malformed": self.prot(allow_deletions=False)}
+        for accept in (False, True):
+            self.cfg(accept_bypass_actors=accept)
+            for name, protection in cases.items():
+                with self.subTest(case=name, accept=accept):
+                    self.assertRefused(self.gh(protection=protection), "local_gate_only")
+
+    def test_ruleset_bypass_actor_or_unreadable_ruleset_refuses_and_is_never_waived(self):
+        rules = [{"type": "deletion", "ruleset_id": 11}]
+        bad = {"actor": (0, json.dumps({"bypass_actors": [{"actor_type": "RepositoryRole"}]})),
+               "unreadable": (1, "HTTP 403"), "malformed": (0, json.dumps({"id": 1}))}
+        for accept in (False, True):
+            self.cfg(accept_bypass_actors=accept)
+            for name, ruleset in bad.items():
+                with self.subTest(case=name, accept=accept):
+                    self.assertRefused(self.gh(rules=rules, ruleset=ruleset), "local_gate_only")
+
+    def test_local_evidence_is_mandatory_and_bound_to_the_head(self):
+        self.write_evidence()
+        self.assertRefused(self.gh(), "no local_ci block")
+        self.write_evidence(local_ci=self.local(head=OTHER))
+        self.assertRefused(self.gh(), "local_ci head")
+        self.write_evidence(local_ci=self.local(checks=[{"name": "ruff", "exit_code": 0, "tests": 0}]))
+        self.assertRefused(self.gh(), "pytest")
+        self.write_evidence(local_ci=self.local(run_at="2026-10-18T11:00:00Z"))
+        self.assertRefused(self.gh(), "local_ci")
+
+    def test_review_evidence_and_pins_still_apply(self):
+        self.write_evidence(local_ci=self.local(), head=OTHER)
+        self.assertRefused(self.gh(), "head")
+        self.write_evidence(local_ci=self.local(), verdict="FAIL")
+        self.assertRefused(self.gh(), "verdict")
+        self.write_evidence(local_ci=self.local(), reviewer="someone-else")
+        self.assertRefused(self.gh(), "reviewer")
+        self.write_evidence(local_ci=self.local(), reviewed_at="2026-10-18T10:00:00Z")
+        self.assertRefused(self.gh(), "reviewed_at")
+        self.write_evidence(local_ci=self.local(), base="release/x")
+        self.assertRefused(self.gh(), "base")
+        self.write_evidence(local_ci=self.local())
+        self.assertRefused(self.gh(), "head", head=OTHER)
+        self.assertRefused(self.gh(pr=base_pr(statusCheckRollup=[], headRefOid=OTHER)), "head")
+
+    def test_dry_run_for_matching_review_and_local_evidence_approves(self):
+        gh = self.gh()
+        code, rec = self.go(gh, dry=True)
+        self.assertEqual((code, rec["decision"]), (omr.EXIT_OK, "APPROVE"), rec)
+        self.assertEqual(gh.merges(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
