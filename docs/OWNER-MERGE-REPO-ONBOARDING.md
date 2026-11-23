@@ -49,6 +49,55 @@ Same shape as the existing entry. **Warning:** the Libra template below sets `re
 `reviewers` stays the id the owner trusts: use `runner-recorded-review` only after the Design 1 runner is installed; until then it is a human or a separate reviewer's id.
 For `horonomy/circinus` use `"require_server_side_protection": true` together with `"protection_capability": "private-free-app-level"`; the runner rejects that capability when protection is false (the live canary entry is the precedent).
 
+## Protected integration base with a local gate while hosted CI is unavailable
+
+Use when a product (for example a public repository such as `horonomy/local-agent`) must merge eligible owner PRs with no host "Allow once" prompt while the organisation's Actions budget is exhausted, so PR heads show an empty rollup and no required status check can be configured. Reusable for any product; nothing below names a repository in code.
+
+**Why a dedicated base.** `release/*` (and `prod`, `production`, `releases`, `gh-pages`, `deploy`) are `DEPLOY_BASES` in `owner-merge-gate.py`: the gate never approves a merge into them. The pinned `gh pr merge` always prompts, because a permission `ask` outranks `allow` and hooks cannot allow past an `ask`; do not add blanket allow rules to get around it. The prompt-free path is the validating runner, and it needs a base that is not a deploy base: `integration/<name>`.
+
+**Two opt-in switches (both default off, owner-controlled, per repository):**
+
+- `public_ok` (boolean) in the repo entry of the owner trust file `local-first-ci.json`: skips only the `NOT_PRIVATE` refusal of the local-first basis for that repo. Every other local-first rule still applies (owner-authored class A, skip directive or no Actions run, `pinned_paths` / controlled script rules, owner-posted unedited `OWNER-MERGE-LOCAL-CI` record, freshness, independent review bound to the head). The check output carries `public_repo_local_first: true`. The standing admin-merge path keeps its own private-only check and is not widened. A non-boolean value or any unknown key makes the file invalid.
+- `local_gate_only` (boolean) in the runner allowlist entry: replaces the "server-side required status checks" requirement with a stricter base-branch protection requirement. The entry is invalid (the runner refuses) unless `required_checks` is `[]`, `required_local_checks` is non-empty, `require_server_side_protection` is true, `protection_capability` is `server-enforced` and `local_equivalent_ci` is true. At run time the runner reads the exact PR base and refuses unless classic branch protection is readable and shows `enforce_admins` enabled, `allow_force_pushes` disabled and `allow_deletions` disabled, and no ruleset applying to the branch has a bypass actor (unreadable or malformed reads refuse). `accept_bypass_actors` does not waive any of these in this mode. The audit records `server_side: local-gate-protected-base` with the facts read.
+
+**Owner steps, in order:**
+
+1. Create `integration/<name>` from the tip of the version branch.
+2. Protect it (`PUT /repos/OWNER/REPO/branches/integration/<name>/protection`): `enforce_admins: true`, `allow_force_pushes: false`, `allow_deletions: false`, no required status checks (`required_status_checks: null`), `required_pull_request_reviews: {"required_approving_review_count": 0}` (an object is mandatory: it forces every change through a PR, so with `enforce_admins` nobody can push straight to the base; 0 approvals is fine; `bypass_pull_request_allowances` must name no users, teams or apps, or the runner refuses), `restrictions: null`. Add no ruleset bypass actors. Classic branch protection is mandatory in this mode: rulesets alone are refused, because the runner reads `GET /repos/OWNER/REPO/branches/<base>/protection` and refuses on 404, unreadable or malformed data. Whether a wildcard protection rule (for example `integration/*`) is resolved by that endpoint is unverified here (the code only reads that one endpoint); protect the exact branch name. The runner reads the rules with `per_page=100` and refuses at 100 or more entries (possible truncation). It also refuses if any rule returned for the base lacks a valid `ruleset_id`, since that ruleset's bypass actors could then not be read.
+3. Add the owner version policy entry for the base so the gate accepts `integration/<name>` as a target.
+4. Add the repo to `local-first-ci.json`: `checks` (exact `name` and `argv`, no shell), optional `env`, `max_age_hours`, `pinned_paths`, `not_covered` (what the local run does not cover, for example other OS legs), and `"public_ok": true`.
+5. Add the allowlist entry:
+
+```json
+"OWNER/REPO": {
+  "required_checks": [],
+  "required_local_checks": ["<every check name from local-first-ci.json>"],
+  "local_equivalent_ci": true,
+  "local_gate_only": true,
+  "require_server_side_protection": true,
+  "protection_capability": "server-enforced",
+  "accept_bypass_actors": false,
+  "reviewers": ["<trusted reviewer id>"]
+}
+```
+
+6. While no Actions run can exist, every PR head commit message ends with `[skip actions]` (the gate's skip directive; the local-first basis requires either that directive or proof that no Actions run exists for the head).
+
+**Per PR (each step its own call, all at the same full head SHA):**
+
+1. Independent review; post the PASS comment bound to the full head SHA (`owner-merge-gate.py evidence-line`, i.e. `OWNER-MERGE-REVIEW head=<sha> verdict=PASS blocking=0 reviewer=<id>`).
+2. `owner-merge-local-ci.py record` in a DISPOSABLE detached worktree at the exact PR head (`git worktree add --detach <path> <head>`), run inside the heavy lane (`scripts/heavy-run` or the host's admission wrapper). The recorder forces `CARGO_TARGET_DIR=<worktree>/target`, so each recording builds a full per-worktree target; remove the worktree immediately after the record is posted (`git worktree remove --force <path>`), otherwise the per-worktree target-dir disk incident recurs (686 GB, see `/Users/bryant/CLAUDE.md`). Cap the load with the owner-configurable resource keys `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS` (the only three the recorder admits besides the owner `env`; positive decimal 1 to 1024; the effective value is the minimum of the inherited and the configured one).
+3. Post the printed `OWNER-MERGE-LOCAL-CI` line as a PR comment as the owner.
+4. `owner-merge-local-ci.py evidence` to write the runner evidence file.
+5. `owner-merge-gate.py check --repo R --pr N --owners O --settings ...`.
+6. Run the printed `merge_command` alone (first with `--dry-run`), then `owner-merge-gate.py verify` in a separate call.
+
+A changed head, missing or stale review or local evidence, evidence for another head, or a different base each refuse.
+
+**Revert when hosted CI recovers:** restore the hosted `required_checks` in the allowlist entry; remove `required_local_checks`, `local_gate_only` and (if no longer wanted) `local_equivalent_ci`; remove `public_ok` and the repo's `local-first-ci.json` entry; re-add the required status check contexts to the branch protection; stop appending `[skip actions]`.
+
+**Residual risks (accept knowingly):** in `local_gate_only` mode the review plus `local_ci` evidence file is the only gate: agents running as the same OS user can forge it by invoking the runner directly with a hand-made file, and an agent-written recorder run is trusted as is. `require_signed_evidence` with a key file the agents cannot read is the only mitigation, and it is optional (this mode does not require it); the checks are only those in `local-first-ci.json`, and `not_covered` stays uncovered. The server-side backstop is only admins-enforced, no force-push and no deletion: it requires no check and no approval (0 required approvals), only that changes arrive through a PR. The repository is public, so the gate decisions, records and logs' digests are visible to anyone.
+
 ## Acceptance still open
 
 Not demonstrated, because each depends on the owner steps above: autonomous no-prompt merge on a real host with a recorded review, and the live stale-head, failed-check, missing-evidence and non-owner cases through a trusted executor on a real host. Existing evidence is in `OWNER-MERGE-ACCEPTANCE-LEDGER.md` (L1 and L3 canaries by the founder, unit and mutation tests). Unsupported or unavailable automatic authorization stays **ASK**.
