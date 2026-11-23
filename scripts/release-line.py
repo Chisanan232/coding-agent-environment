@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Release-line registry, routing, audit, successor-train and forward-port CLI (SPE-180 design, slices SPE-181a, SPE-182, SPE-183).
+"""Release-line registry, routing, audit, successor-train and forward-port CLI (SPE-180 design, slices SPE-181a, SPE-182, SPE-183, SPE-184a).
 
   release-line.py registry validate|show        --repo O/R [--policy FILE]
   release-line.py registry propose --op add-successor|retire|eol|converge --repo O/R [--execute] [op flags]
@@ -11,6 +11,8 @@
   release-line.py train integrate --from LINE --into LINE --repo O/R --clone PATH [--execute]
   release-line.py train converge --line LINE --repo O/R --clone PATH [--execute]
   release-line.py forward-port plan|run|status (--merge SHA | --pr N | --range A..B) --repo O/R --clone PATH [--execute]
+  release-line.py release candidate-tag|promote|verify|final-tag --version V [--line L] --repo O/R --clone PATH [--execute]
+  release-line.py protection snapshot|verify --branch B --repo O/R [--execute]
 
 Prints exactly one JSON envelope on stdout. Exit 0 ok/no-op, 1 refused/blocked, 2 usage, 3 invalid config.
 The owner policy file (version-branches.json) is a trust anchor: it is read through owner-merge-gate.py's
@@ -19,6 +21,7 @@ authority-record template into a proposals directory, and only with --execute; t
 Whether a branch may receive merges stays decided by `branches` alone; release_lines is validated here, ignored by the gate.
 """
 import argparse
+import contextlib
 import copy
 import datetime
 import fcntl
@@ -28,9 +31,11 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import types
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -1454,6 +1459,559 @@ def forward_port(args, res):
                            else "re-run `forward-port run --execute` to push the heads and open the PRs")
 
 
+# ---------------------------------------------------------------- release: candidate-tag, promote, verify, final-tag (SPE-184a)
+# Publication approval is a per-version GO record read through the owner trust-anchor reader; the tool never writes one and never
+# changes branch protection. Pushes create new refs only. The final SHA is captured from the promotion merge and used for every later step.
+
+GO_DEFAULT_DIR = "~/.config/coding-agent-environment/local/release-go"
+GO_SCOPES = ("candidate_tag", "promote", "final_tag", "publish")
+GIT_MERGE_TREE = (2, 38)  # merge-tree --write-tree
+PROMOTION_SCAN = 5000
+FAILED_CHECK = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"}
+PENDING_CHECK = {"PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "EXPECTED"}
+
+
+def git_at_least(clone, need):
+    rc, out = git(clone, "--version")
+    m = re.search(r"(\d+)\.(\d+)", out) if rc == 0 else None
+    return bool(m) and (int(m.group(1)), int(m.group(2))) >= need
+
+
+def need_merge_tree(clone):
+    if not git_at_least(clone, GIT_MERGE_TREE):
+        raise Refusal("GIT_TOO_OLD", "promotion prediction needs git 2.38 or newer (git merge-tree --write-tree)")
+
+
+def go_file(args, version):
+    return os.path.join(os.path.expanduser(args.go_dir or GO_DEFAULT_DIR), f"{args.repo.replace('/', '__')}__{version}.json")
+
+
+def read_go(args, rl, ln, version):
+    """The validated GO record for this repo and version; never echoes its contents (only the fields the caller already knows)."""
+    try:
+        rec = omg.read_owner_file(go_file(args, version), True, lambda o: o, "release GO record")
+    except FileNotFoundError:
+        raise Refusal("GO_MISSING", f"no GO record for {args.repo} {version}; the owner records publication approval per version")
+    except (ValueError, OSError) as e:
+        raise Refusal("GO_INVALID", f"GO record unreadable or untrusted: {type(e).__name__}")
+    ok = (isinstance(rec, dict) and all(isinstance(rec.get(k), str) and rec[k] for k in ("repo", "version", "candidate_tag", "candidate_sha", "publication_base", "authority", "created_utc"))
+          and isinstance(rec.get("scopes"), list) and all(s in GO_SCOPES for s in rec["scopes"]) and SHA_RE.fullmatch(rec["candidate_sha"] or "") is not None)
+    if not ok:
+        raise Refusal("GO_INVALID", "GO record needs repo, version, candidate_tag, candidate_sha, publication_base, scopes, authority, created_utc")
+    if rec["repo"].lower() != args.repo.lower() or rec["version"] != version or rec["publication_base"] != ln["publication_base"]["branch"]:
+        raise Refusal("GO_MISMATCH", "GO record repo, version or publication base differs from this request")
+    m = fmt_re(rl["candidate_format"]).fullmatch(rec["candidate_tag"])
+    if not (m and m.group("v") == version):
+        raise Refusal("GO_MISMATCH", "GO candidate_tag does not match candidate_format for this version")
+    if "expires_utc" in rec:
+        try:
+            expired = datetime.datetime.strptime(rec["expires_utc"], "%Y-%m-%dT%H:%M:%SZ") <= datetime.datetime.strptime(now_utc(), "%Y-%m-%dT%H:%M:%SZ")
+        except (TypeError, ValueError):
+            raise Refusal("GO_INVALID", "expires_utc must be YYYY-MM-DDTHH:MM:SSZ")
+        if expired:
+            raise Refusal("GO_EXPIRED", "the GO record has expired")
+    return rec
+
+
+def need_scope(go, scope, sha=None):
+    if scope not in go["scopes"]:
+        raise Refusal("GO_SCOPE", f"GO record does not carry the {scope} scope")
+    if sha is not None and go["candidate_sha"] != sha:
+        raise Refusal("GO_MISMATCH", f"GO record approves candidate {go['candidate_sha'][:12]}, not {sha[:12]}")
+
+
+def release_ctx(args, res):
+    if not args.clone:
+        raise SystemExit(usage_error(f"{args.group} {args.cmd} needs --clone"))
+    if not VERSION_RE.fullmatch(args.version):
+        raise SystemExit(usage_error("--version must be MAJOR.MINOR or MAJOR.MINOR.PATCH"))
+    require_clone(args.clone)
+    policy, _ = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
+    _, entry = check_policy(policy, args.repo)
+    require_ready(entry)
+    rl = entry["release_lines"]
+    fetch(args.clone)
+    if args.line:
+        ln = line_by_id(entry, args.line)
+        if (ln["kind"] == "major" and ln["major"] != int(args.version.split(".")[0])) or (ln["kind"] != "major" and ln.get("version") != args.version):
+            raise Refusal("LINE_VERSION_MISMATCH", f"line {ln['id']} does not carry version {args.version}")
+    else:
+        ln = next((x for x in rl["lines"] if x["kind"] != "major" and x.get("version") == args.version), None) \
+            or next((x for x in rl["lines"] if x["kind"] == "major" and x["major"] == int(args.version.split(".")[0])), None)
+        if ln is None:
+            raise Refusal("NO_LINE", f"no release line carries version {args.version}")
+    if ln["support"] == "eol":
+        raise Refusal("EOL_LINE", f"line {ln['id']} is end-of-life")
+    if ln.get("state", "active") != "active":
+        raise Refusal("LINE_NOT_ACTIVE", f"line {ln['id']} is {ln['state']}")
+    return types.SimpleNamespace(entry=entry, rl=rl, ln=ln, version=args.version, clone=args.clone,
+                                 base=ln["publication_base"]["branch"], line_ref=need_ref(args.clone, ln["integration_branch"]))
+
+
+def remote_tag(clone, name):
+    """(tag object sha, peeled commit sha) on origin, or (None, None)."""
+    rc, out = git(clone, "ls-remote", "origin", f"refs/tags/{name}", f"refs/tags/{name}^{{}}")
+    if rc != 0:
+        raise Refusal("REMOTE_UNREACHABLE", "git ls-remote origin failed")
+    obj = peeled = None
+    for row in out.splitlines():
+        sha, _, ref = row.partition("\t")
+        if ref == f"refs/tags/{name}":
+            obj = sha
+        elif ref == f"refs/tags/{name}^{{}}":
+            peeled = sha
+    return obj, peeled or obj
+
+
+def push_tag(res, args, name, sha, message, step):
+    """Create an annotated tag at sha and push it as a new ref; an existing tag is reused at the same commit, never moved."""
+    obj, peeled = remote_tag(args.clone, name)
+    if obj is not None:
+        if peeled != sha:
+            raise Refusal("CONFLICT_EXISTING", f"tag {name} exists at {peeled}, not {sha}; tags are never moved or deleted")
+        res.step(step, "REUSED", {"tag": name, "sha": sha})
+        return False
+    if not args.execute:
+        res.step(step, "DRY_PLAN", {"would_push": f"refs/tags/{name}", "sha": sha})
+        res.status = "NOT_RUN"
+        return False
+    local = commit_of(args.clone, f"refs/tags/{name}")
+    if local not in (None, sha):
+        raise Refusal("CONFLICT_EXISTING", f"a local tag {name} points at {local}, not {sha}")
+    created = local is None
+    if created and git(args.clone, "tag", "-a", "-m", message, name, sha)[0] != 0:
+        raise Refusal("TAG_FAILED", f"could not create tag {name} (is a committer identity configured?)")
+    tag_obj = git(args.clone, "rev-parse", f"refs/tags/{name}")[1].strip()
+    git(args.clone, "push", "origin", f"{tag_obj}:refs/tags/{name}")
+    if remote_tag(args.clone, name) != (tag_obj, sha):
+        if created:
+            git(args.clone, "tag", "-d", name)
+        raise Refusal("CONFLICT_EXISTING", f"origin does not show tag {name} at {sha} after the push")
+    res.step(step, "CREATED", {"tag": name, "sha": sha, "tag_object": tag_obj})
+    return True
+
+
+def release_candidate_tag(args, res):
+    c = release_ctx(args, res)
+    rl, ln = c.rl, c.ln
+    tip = commit_of(args.clone, c.line_ref)
+    sha = tip if not args.sha else commit_of(args.clone, args.sha)
+    if sha is None or not is_ancestor(args.clone, sha, c.line_ref):
+        raise Refusal("SHA_NOT_ON_LINE", f"{args.sha or 'the line tip'} is not reachable from {ln['integration_branch']}")
+    pre = rl["milestone_tags"] == "pre-authorized"
+    try:
+        go = read_go(args, rl, ln, c.version)
+    except Refusal as e:
+        if not (pre and e.code == "GO_MISSING"):
+            raise
+        go = None
+    if go is not None:
+        if not (pre and "candidate_tag" not in go["scopes"]):  # a pre-authorized repo needs no scope, but a record that is present must still match
+            need_scope(go, "candidate_tag", sha)
+        elif go["candidate_sha"] != sha:
+            raise Refusal("GO_MISMATCH", f"GO record approves candidate {go['candidate_sha'][:12]}, not {sha[:12]}")
+        name = go["candidate_tag"]
+    else:
+        rc_re = fmt_re(rl["candidate_format"])
+        seen = [int(m.group("n")) for t in tag_names(args.clone) if (m := rc_re.fullmatch(t)) and m.group("v") == c.version]
+        n = args.n if args.n else (max(seen) + 1 if seen else 1)
+        name = rl["candidate_format"].replace("{version}", c.version).replace("{n}", str(n))
+    if go is not None and args.n and name != rl["candidate_format"].replace("{version}", c.version).replace("{n}", str(args.n)):
+        raise Refusal("GO_MISMATCH", f"--n {args.n} differs from the GO record's candidate tag {name}")
+    res.env["idempotency_key"] = f"tag:{args.repo}:{name}"
+    res.step("go", "ACCEPTED" if go else "PRE_AUTHORIZED", {"scope": "candidate_tag", "tag": name})
+    with (Journal(args) if args.execute else contextlib.nullcontext()) as j:
+        push_tag(res, args, name, sha, f"Release candidate {name} for {c.version} on line {ln['id']}", "tag")
+        if j and any(s["step"] == "tag" and s["state"] == "CREATED" for s in res.steps):
+            j.append(key=res.env["idempotency_key"], state="candidate-tag", tag=name, sha=sha, line=ln["id"], version=c.version)
+    if res.status == "PASS":
+        res.next_action = "none" if any(s["step"] == "tag" and s["state"] == "REUSED" for s in res.steps) else f"verify {name}, then `release promote` once the owner records the promote scope"
+    else:
+        res.next_action = "re-run with --execute to push the candidate tag"
+
+
+def scan_promotion(clone, base_ref, cand):
+    """The merge commit on the base's first-parent chain whose second parent is the candidate, or None."""
+    rc, out = git(clone, "log", "--first-parent", "--merges", "-n", str(PROMOTION_SCAN), "--format=%H %P", base_ref)
+    if rc != 0:
+        raise Refusal("GIT_LOG_FAILED", "git log failed while looking for the promotion merge")
+    for row in out.splitlines():
+        p = row.split()
+        if len(p) == 3 and p[2] == cand:
+            return p[0]
+    return None
+
+
+def promotion_prs(args, version, base, strict=False):
+    try:
+        return find_prs(args.repo, f"promote/{version}", base)
+    except Refusal:
+        if strict:
+            raise
+        return None, []
+
+
+def check_promotion(clone, final, cand):
+    """final^2 must be the candidate and final^{tree} must be what merge-tree predicts for final^1 + candidate. Returns (predicted tree, base SHA)."""
+    p = git(clone, "rev-list", "--parents", "-n", "1", final)[1].split()
+    if len(p) != 3 or p[2] != cand:
+        raise Refusal("PROMOTION_ASSERTION_FAILED", f"{final[:12]} is not a merge commit whose second parent is the candidate {cand[:12]}", "FAIL")
+    rc, out = git(clone, "merge-tree", "--write-tree", p[1], cand)
+    predicted = out.split()[0] if rc == 0 and out.split() else None
+    if predicted is None or predicted != git(clone, "rev-parse", final + "^{tree}")[1].strip():
+        raise Refusal("PROMOTION_ASSERTION_FAILED", f"{final[:12]}'s tree differs from the predicted merge of {p[1][:12]} and the candidate", "FAIL")
+    return predicted, p[1]
+
+
+def accounting_complete(args, c, cand, base_ref):
+    """Forward-port accounting for base-only changes (cand..base), with the SPE-183 per-source logic, read-only."""
+    rc, out = git(args.clone, "rev-list", "--first-parent", "--reverse", f"{cand}..{base_ref}")
+    if rc != 0:
+        raise Refusal("BAD_RANGE", "git rev-list failed while accounting for base-only changes")
+    revs = out.split()
+    if len(revs) > RANGE_MAX:
+        raise Refusal("RANGE_TOO_LARGE", f"{len(revs)} base-only commits; account for them with forward-port --range first")
+    scratch = Result("scratch", args.repo, "")
+    ctx = types.SimpleNamespace(res=scratch, args=args, clone=args.clone, repo=args.repo, rl=c.rl, keys=line_keys(c.rl), gh_ok=True,
+                                journal=None, pr=None, bases={x["publication_base"]["branch"] for x in c.rl["lines"]} | {"main", "master"},
+                                execute=False, predict=True)
+    bad = []
+    for rev in revs:
+        try:
+            for r in fp_source(ctx, rev, None):
+                if r["state"] not in TERMINAL:
+                    bad.append({"source": rev[:12], "line": r["line"], "code": r["code"]})
+        except Refusal as e:
+            bad.append({"source": rev[:12], "line": None, "code": e.code})
+    return len(revs), bad
+
+
+def final_tags(clone, rl, major):
+    final = fmt_re(rl["tag_format"])
+    return [(vkey(m.group("v")), m.group("v"), t) for t in tag_names(clone) if (m := final.fullmatch(t)) and m.group("v").split(".")[0] == major]
+
+
+def hosted_ci(res, args, number, cand):
+    """CI_PASS, CI_FAILED (refuses), CI_PENDING (defers) or NOT_RUN, which needs a passing local-equivalent record for the candidate."""
+    rc, out = run(["gh", "pr", "view", str(number), "--repo", args.repo, "--json", "statusCheckRollup"])
+    try:
+        rollup = json.loads(out).get("statusCheckRollup") if rc == 0 else None
+    except (ValueError, AttributeError):
+        rollup = None
+    states = [str((x.get("conclusion") or x.get("state") or x.get("status") or "")).upper() for x in rollup if isinstance(x, dict)] if isinstance(rollup, list) else []
+    if any(s in FAILED_CHECK for s in states):
+        res.step("hosted_ci", "CI_FAILED", {"checks": len(states)})
+        raise Refusal("CI_FAILED", "a required hosted check reported a failure; this tool never bypasses it", "FAIL")
+    if any(s in PENDING_CHECK or s == "" for s in states):
+        res.step("hosted_ci", "CI_PENDING", {"checks": len(states)})
+        res.status, res.next_action = "DEFERRED", "wait for the hosted checks, then re-run"
+        return False
+    if states:
+        res.step("hosted_ci", "CI_PASS", {"checks": len(states)})
+        return True
+    res.step("hosted_ci", "NOT_RUN", {"reason": "no hosted check ran or gh could not report them (outage, quota or none configured)"})
+    logs = os.path.expanduser(args.evidence_dir or omg.LOCAL_EVIDENCE_DIRS["claude"])
+    path = os.path.join(logs, omg.local_ci_evidence_filename(f"{args.repo.replace('/', '__')}-{number}", cand))
+    try:
+        with open(path, "rb") as f:
+            rec = json.loads(f.read(1 << 20))
+        cmds = rec["commands"]
+        good = (rec["repo"].lower() == args.repo.lower() and rec["pr"] == number and rec["head"] == cand and cmds
+                and all(c["exit_code"] == 0 for c in cmds))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        good = False
+    if not good:
+        raise Refusal("LOCAL_EVIDENCE_REQUIRED", f"hosted CI is NOT_RUN and no passing local-equivalent record exists for {cand[:12]} on PR #{number}; "
+                      "run owner-merge-local-ci.py record at the PR head first")
+    res.step("local_equivalent", "PASS", {"record": os.path.basename(path), "commands": len(cmds)})
+    return True
+
+
+def protection_get(args, branch):
+    rc, out = run(["gh", "api", f"repos/{args.repo}/branches/{branch}/protection"])
+    try:
+        body = json.loads(out)
+    except ValueError:
+        body = None
+    if isinstance(body, dict) and body.get("message") == "Branch not protected":
+        return {"protected": False}
+    if rc != 0 or not isinstance(body, dict):
+        raise Refusal("GH_UNAVAILABLE", "gh api branch protection failed")
+
+    def strip(x):
+        if isinstance(x, dict):
+            return {k: strip(v) for k, v in x.items() if not k.endswith("url")}
+        return [strip(v) for v in x] if isinstance(x, list) else x
+    return {"protected": True, "settings": strip(body)}
+
+
+def protection_file(args, branch):
+    return proposal_dir(args).parent / "protection" / (branch.replace("/", "%2F") + ".json")
+
+
+def protection_compare(args, branch):
+    """(snapshot digest, current digest, drifted top-level keys) or None when no snapshot was recorded."""
+    p = protection_file(args, branch)
+    if not p.exists():
+        return None
+    snap = json.loads(p.read_text())
+    cur = protection_get(args, branch)
+    keys = sorted(k for k in set(snap.get("settings", {})) | set(cur.get("settings", {})) if snap.get("settings", {}).get(k) != cur.get("settings", {}).get(k))
+    if snap.get("protected") != cur.get("protected"):
+        keys.append("protected")
+    return sha256_bytes(dump(snap)), sha256_bytes(dump(cur)), keys
+
+
+ROLLBACK = "scripts/branch-protection-rollout.py rollback (owner-run, hash-pinned)"
+
+
+def protection_cmd(args, res):
+    if not BRANCH_NAME_RE.fullmatch(args.branch):
+        raise SystemExit(usage_error("--branch is not a valid branch name"))
+    if args.cmd == "snapshot":
+        cur = protection_get(args, args.branch)
+        digest = sha256_bytes(dump(cur))
+        if not args.execute:
+            res.step("snapshot", "DRY_PLAN", {"branch": args.branch, "protected": cur["protected"], "sha256": digest})
+            res.status, res.next_action = "NOT_RUN", "re-run with --execute to record the snapshot"
+            return
+        with Journal(args) as j:
+            write_private(protection_file(args, args.branch).parent, ((protection_file(args, args.branch).name, dump(cur)),))
+            j.append(key=f"protection:{args.repo}:{args.branch}", state="snapshot", sha256=digest)
+        res.step("snapshot", "RECORDED", {"branch": args.branch, "protected": cur["protected"], "sha256": digest})
+        return
+    cmp_ = protection_compare(args, args.branch)
+    if cmp_ is None:
+        raise Refusal("NO_SNAPSHOT", f"no protection snapshot recorded for {args.branch}; run `protection snapshot --execute` first")
+    if cmp_[2]:
+        res.step("verify", "PROTECTION_DRIFT", {"branch": args.branch, "snapshot_sha256": cmp_[0], "current_sha256": cmp_[1], "changed": cmp_[2]})
+        res.status, res.next_action = "FAIL", f"restore the protection with {ROLLBACK}; this tool never changes protection"
+        return
+    res.step("verify", "UNCHANGED", {"branch": args.branch, "sha256": cmp_[1]})
+
+
+def release_promote(args, res):
+    c = release_ctx(args, res)
+    rl, ln, clone, version = c.rl, c.ln, args.clone, c.version
+    go = read_go(args, rl, ln, version)
+    need_scope(go, "promote")
+    cand, tag = go["candidate_sha"], go["candidate_tag"]
+    res.env["idempotency_key"] = f"promote:{args.repo}:{version}:{cand}"
+    res.step("go", "ACCEPTED", {"scope": "promote", "candidate_tag": tag, "candidate_sha": cand})
+    if commit_of(clone, cand) != cand or not is_ancestor(clone, cand, c.line_ref):
+        raise Refusal("CANDIDATE_NOT_ON_LINE", f"{cand[:12]} is not reachable from {ln['integration_branch']}")
+    if commit_of(clone, f"refs/tags/{tag}") != cand:
+        raise Refusal("GO_MISMATCH", f"tag {tag} does not point at the approved candidate {cand[:12]}")
+    base_ref = need_ref(clone, c.base)
+    head, bp = f"promote/{version}", ln["publication_base"]
+    done = scan_promotion(clone, base_ref, cand)
+    snap = protection_file(args, c.base).exists()
+    with (Journal(args) if args.execute else contextlib.nullcontext()) as j:
+        drift = []
+        try:
+            if snap and args.execute:
+                before = protection_compare(args, c.base)
+                res.step("protection_before", "DRIFT" if before[2] else "UNCHANGED", {"changed": before[2]})
+                if before[2]:
+                    raise Refusal("PROTECTION_DRIFT", f"{c.base} protection differs from its snapshot; restore it ({ROLLBACK})", "FAIL")
+            promote_body(args, res, c, go, cand, tag, base_ref, head, bp, done, j)
+        finally:
+            if snap and args.execute:
+                try:
+                    after = protection_compare(args, c.base)
+                    res.step("protection_after", "DRIFT" if after[2] else "UNCHANGED", {"changed": after[2]})
+                    drift = after[2]
+                except Refusal as e:
+                    res.step("protection_after", "NOT_RUN", {"reason": e.code})
+        if drift:
+            res.status, res.next_action = "FAIL", f"PROTECTION_DRIFT: restore {c.base} protection with {ROLLBACK}"
+    if not snap:
+        res.step("protection", "NOT_RUN", {"reason": "no snapshot recorded for the publication base; run `protection snapshot --execute` before an admin step"})
+
+
+def promote_body(args, res, c, go, cand, tag, base_ref, head, bp, done, j):
+    rl, ln, clone, version = c.rl, c.ln, args.clone, c.version
+    if done is None:
+        if not ln["support"] == "supported":
+            raise Refusal("LINE_NOT_SUPPORTED", f"line {ln['id']} is not supported")
+        cur = ln
+        while cur["kind"] == "successor":
+            pred = line_by_id(c.entry, cur["predecessor"]["line"])
+            try:
+                link = integration_link(clone, rl, pred, cur)
+            except Refusal as e:
+                raise Refusal("PREDECESSOR_NOT_SHIPPED", f"{pred['id']} {cur['predecessor']['version']} is not shipped ({e.code}: {e.detail})")
+            if not link["integrated"]:
+                raise Refusal("PREDECESSOR_NOT_INTEGRATED", f"{link['final_tag']} is not integrated into {cur['id']}; run `train integrate` first")
+            if not is_ancestor(clone, link["candidate"], cand):
+                raise Refusal("STALE_CANDIDATE", f"candidate {cand[:12]} was cut before {link['final_tag']} was integrated; cut a new candidate")
+            cur = pred
+        res.step("predecessors", "SHIPPED_AND_INTEGRATED" if ln["kind"] == "successor" else "NONE", {})
+        if bp["kind"] == "maintenance":
+            others = sorted((x for x in final_tags(clone, rl, version.split(".")[0]) if x[1] != version), reverse=True)
+            if others:
+                latest = others[0]
+                if not is_ancestor(clone, latest[2] + "^{commit}", base_ref):
+                    raise Refusal("BASE_MISSING_FINAL", f"{bp['branch']} does not contain the latest same-major final tag {latest[2]}")
+                if vkey(version) <= latest[0]:
+                    raise Refusal("VERSION_NOT_GREATER", f"{version} is not greater than the shipped {latest[1]} within major {version.split('.')[0]}")
+            res.step("maintenance_base", "OK", {"base": bp["branch"], "latest_final": others[0][2] if others else None})
+        n, bad = accounting_complete(args, c, cand, base_ref)
+        if bad:
+            res.step("forward_port_accounting", "INCOMPLETE", {"sources": n, "incomplete": bad[:50]})
+            raise Refusal("FORWARD_PORT_INCOMPLETE", f"{len(bad)} base-only change(s) are not forward-port accounted; run `forward-port run` first")
+        res.step("forward_port_accounting", "COMPLETE", {"sources": n})
+    need_merge_tree(clone)
+    base_tip = commit_of(clone, base_ref)
+    if done is None:
+        if is_ancestor(clone, cand, base_tip):
+            raise Refusal("CANDIDATE_ALREADY_ON_BASE", f"candidate {cand[:12]} is already on {bp['branch']} without a promotion merge of its own")
+        rc, out = git(clone, "merge-tree", "--write-tree", base_tip, cand)
+        if rc == 1:
+            raise Refusal("MERGE_CONFLICT", f"merging {cand[:12]} into {bp['branch']} conflicts; nothing was pushed")
+        if rc != 0 or not out.split():
+            raise Refusal("MERGE_TREE_FAILED", "git merge-tree could not evaluate the promotion")
+        predicted = out.split()[0]
+        carry = predicted == git(clone, "rev-parse", cand + "^{tree}")[1].strip()
+        res.step("prediction", "CLEAN", {"base_tip": base_tip, "predicted_tree": predicted, "verification": "CARRIED_OVER" if carry else "REQUIRED"})
+    remote = ls_remote(clone, f"refs/heads/{head}")
+    if remote is not None and remote != cand:
+        raise Refusal("CONFLICT_EXISTING", f"{head} exists at {remote}, not the approved candidate {cand}")
+    if done is None and remote is None:
+        if not args.execute:
+            res.step("head", "DRY_PLAN", {"would_push": f"{cand}:refs/heads/{head}"})
+        elif push_new_ref(clone, cand, f"refs/heads/{head}"):
+            res.step("head", "CREATED", {"sha": cand})
+        else:
+            raise Refusal("CONFLICT_EXISTING", f"{head} does not show {cand} on origin after the push")
+    elif remote is not None:
+        res.step("head", "REUSED", {"sha": cand})
+    if done is None:
+        pr = ensure_pr(res, args, head, bp["branch"], f"Promote {version} to {bp['branch']}",
+                       f"Promote approved candidate {tag} ({cand}) to {bp['branch']} as a merge commit. The merge is made only by "
+                       "`release-line.py release promote --execute` under a recorded GO.", refuse_merged=False) if remote is not None or args.execute else None
+        if pr is None:
+            res.status, res.next_action = "NOT_RUN", "re-run with --execute to push the head, open the PR and merge"
+            return
+        if not args.execute:
+            res.status, res.next_action = "NOT_RUN", f"re-run with --execute to merge PR #{pr['number']} (merge commit pinned to {cand[:12]})"
+            return
+        if not hosted_ci(res, args, pr["number"], cand):
+            return
+        rc, _ = run(["gh", "pr", "merge", str(pr["number"]), "--merge", "--match-head-commit", cand, "--repo", args.repo])
+        final, _ = merged_pr_commit(args.repo, pr["number"]) if rc == 0 or promotion_prs(args, c.version, bp["branch"])[1] else (None, None)
+        if final is None:
+            raise Refusal("MERGE_FAILED", f"gh pr merge #{pr['number']} did not merge; a failing required check or protection rule is never bypassed")
+        fetch(clone)
+        res.step("merge", "MERGED", {"pr": pr["number"], "final_sha": final})
+        pr_number = pr["number"]
+    else:
+        final, pr_number = done, (promotion_prs(args, c.version, bp["branch"])[1] or [{}])[0].get("number")
+        res.step("merge", "ALREADY_PROMOTED", {"final_sha": final, "pr": pr_number})
+    if commit_of(clone, final) != final:
+        fetch(clone)
+    tree, first_parent = check_promotion(clone, final, cand)
+    carry = tree == git(clone, "rev-parse", cand + "^{tree}")[1].strip()
+    res.step("assertions", "PASS", {"final_sha": final, "second_parent": cand, "tree": tree, "first_parent": first_parent})
+    res.step("verification", "CARRIED_OVER" if carry else "REQUIRED", {"candidate_tree_equals_final": carry})
+    if j:
+        j.append(key=res.env["idempotency_key"], state="promoted", final_sha=final, candidate_sha=cand, pr=pr_number, line=c.ln["id"], version=version)
+    res.next_action = ("`release verify`" if not carry else "none for verification (candidate tree carries over)") + "; then `release final-tag` under a GO with the final_tag scope"
+
+
+def release_verify(args, res):
+    c = release_ctx(args, res)
+    clone, version, bp = args.clone, c.version, c.ln["publication_base"]
+    base_ref = need_ref(clone, c.base)
+    pr, merged = promotion_prs(args, version, bp["branch"], strict=True)
+    if not merged:
+        raise Refusal("PROMOTION_NOT_FOUND", f"no merged promote/{version} PR into {bp['branch']}")
+    final, _ = merged_pr_commit(args.repo, merged[0]["number"])
+    if commit_of(clone, final) != final:
+        raise Refusal("FINAL_NOT_FETCHED", f"promotion merge {final[:12]} is not in the fetched clone")
+    cand = git(clone, "rev-parse", final + "^2")[1].strip()
+    res.env["idempotency_key"] = f"verify:{args.repo}:{version}:{final}"
+    if not is_ancestor(clone, final, base_ref):
+        raise Refusal("FINAL_NOT_ON_BASE", f"{final[:12]} is not on {bp['branch']}")
+    tree, first = check_promotion(clone, final, cand)
+    carry = tree == git(clone, "rev-parse", cand + "^{tree}")[1].strip()
+    res.step("promotion", "FOUND", {"pr": merged[0]["number"], "final_sha": final, "candidate_sha": cand})
+    if carry:
+        res.step("verification", "CARRIED_OVER", {"reason": "the final tree equals the candidate tree, so candidate verification applies"})
+        return
+    if not args.execute:
+        res.step("local_checks", "NOT_RUN", {"reason": "the final tree differs from the candidate tree; re-run with --execute to run the local-first checks at the final SHA"})
+        res.status, res.next_action = "NOT_RUN", "re-run with --execute to run the owner's local-first checks in a detached worktree"
+        return
+    ci = importlib.util.module_from_spec(importlib.util.spec_from_file_location("owner_merge_local_ci", HERE / "owner-merge-local-ci.py"))
+    ci.__spec__.loader.exec_module(ci)
+    try:
+        entry = ci.load_entry(args.repo, args.local_first)
+    except (ValueError, OSError) as e:
+        res.step("local_checks", "NOT_RUN", {"reason": f"local-first config unavailable: {type(e).__name__}"})
+        res.status, res.next_action = "NOT_RUN", "the owner installs the local-first CI config; verification stays NOT_RUN until then"
+        return
+    logs = os.path.expanduser(args.evidence_dir or omg.LOCAL_EVIDENCE_DIRS["claude"])
+    tag = f"{args.repo.replace('/', '__')}-release-{version}"
+    wt = tempfile.mkdtemp(prefix="release-verify-")
+    results = []
+    with Journal(args) as j:
+        try:
+            if git(clone, "worktree", "add", "--detach", wt, final)[0] != 0:
+                raise Refusal("WORKTREE_FAILED", "could not create the detached verification worktree")
+            ci.prepare_dir(logs)
+            context = {"PULL_BRANCH": f"promote/{version}", "PR_TITLE": f"Promote {version} to {bp['branch']}", "GIT_BASE": first,
+                       "CARGO_TARGET_DIR": os.path.join(wt, "target")}
+            for name, argv in entry["checks"]:
+                r, _ = ci.run_check(wt, name, argv, logs, final, tag, entry.get("env"), context)
+                results.append({"name": name, "exit_code": r["exit_code"], "log_sha256": r["log_sha256"]})
+            dirty = git(wt, "status", "--porcelain", "--untracked-files=all")[1].strip() != ""
+        except (RuntimeError, OSError) as e:
+            raise Refusal("VERIFY_ERROR", f"{type(e).__name__}: {e}")
+        finally:
+            git(clone, "worktree", "remove", "--force", wt)
+            shutil.rmtree(wt, ignore_errors=True)
+        ok = all(r["exit_code"] == 0 for r in results) and not dirty
+        j.append(key=res.env["idempotency_key"], state="verified" if ok else "verify-failed", final_sha=final, checks=results)
+    res.step("local_checks", "PASS" if ok else "FAIL", {"final_sha": final, "checks": results, "worktree_changed": dirty})
+    if not ok:
+        res.status, res.next_action = "FAIL", "a local-first check failed at the final SHA; do not tag or publish"
+
+
+def release_final_tag(args, res):
+    c = release_ctx(args, res)
+    rl, ln, clone, version = c.rl, c.ln, args.clone, c.version
+    go = read_go(args, rl, ln, version)
+    need_scope(go, "final_tag")
+    cand = go["candidate_sha"]
+    base_ref = need_ref(clone, c.base)
+    final = scan_promotion(clone, base_ref, cand)
+    if final is None:
+        raise Refusal("NOT_PROMOTED", f"no promotion merge of {cand[:12]} on {c.base}; run `release promote` first")
+    pr, merged = promotion_prs(args, version, c.base)
+    if merged:
+        oid, _ = merged_pr_commit(args.repo, merged[0]["number"])
+        if oid != final:
+            raise Refusal("PROMOTION_MISMATCH", f"PR #{merged[0]['number']} reports merge {oid[:12]}, the base history shows {final[:12]}")
+    check_promotion(clone, final, cand)
+    if not is_ancestor(clone, final, base_ref):
+        raise Refusal("FINAL_NOT_ON_BASE", f"{final[:12]} is not on {c.base}")
+    name = rl["tag_format"].replace("{version}", version)
+    res.env["idempotency_key"] = f"tag:{args.repo}:{name}"
+    res.step("go", "ACCEPTED", {"scope": "final_tag", "candidate_sha": cand})
+    res.step("final", "CAPTURED", {"final_sha": final, "base_tip_not_used": commit_of(clone, base_ref)})
+    with (Journal(args) if args.execute else contextlib.nullcontext()) as j:
+        created = push_tag(res, args, name, final, f"Release {version} ({name}) from line {ln['id']}", "tag")
+        if j:
+            j.append(key=res.env["idempotency_key"], state="final-tag", tag=name, source_branch=ln["integration_branch"], release_line=ln["id"],
+                     version=version, promotion_pr=(merged[0]["number"] if merged else None), candidate_sha=cand, final_sha=final, created=created)
+    res.next_action = "re-run with --execute to push the final tag" if res.status == "NOT_RUN" else "none; build, notes and publish are the next slice"
+
+
+def release_cmd(args, res):
+    {"candidate-tag": release_candidate_tag, "promote": release_promote, "verify": release_verify, "final-tag": release_final_tag}[args.cmd](args, res)
+
+
 # ---------------------------------------------------------------- envelope + CLI
 
 class Result:
@@ -1479,7 +2037,7 @@ def build_parser():
     common.add_argument("--repo", required=True, help="OWNER/REPO, the registry key")
     common.add_argument("--clone", help="local clone used for git facts")
     common.add_argument("--policy", help="owner policy file (default: the version-branches.json trust file)")
-    common.add_argument("--go-dir", help="reserved for the release-go records of later slices")
+    common.add_argument("--go-dir", help="release-go records directory (default under ~/.config/coding-agent-environment/local/release-go; must stay under the owner config root)")
     common.add_argument("--state-dir", help="journal/proposals root (default under ~/.local/state)")
     common.add_argument("--execute", action="store_true", help="write proposal files; without it, a dry plan")
     p = argparse.ArgumentParser(prog="release-line.py", description=__doc__.split("\n")[0])
@@ -1518,6 +2076,20 @@ def build_parser():
         grp.add_argument("--merge", help="a landed fix: a GitHub merge commit (its second-parent range is inspected) or a plain commit")
         grp.add_argument("--pr", type=int, help="a merged PR number (resolved through gh)")
         grp.add_argument("--range", help="A..B: every first-parent commit in the range is a source")
+    rel = top.add_parser("release").add_subparsers(dest="cmd", required=True)
+    for name in ("candidate-tag", "promote", "verify", "final-tag"):
+        sub = rel.add_parser(name, parents=[common])
+        sub.add_argument("--version", required=True, help="the version being released, e.g. 0.3.0")
+        sub.add_argument("--line", help="release line id (default: the line carrying the version, else its major line)")
+        if name == "candidate-tag":
+            sub.add_argument("--sha", help="candidate commit (default: the integration branch tip; must be reachable from it)")
+            sub.add_argument("--n", type=int, help="candidate number when no GO record names the tag")
+        if name in ("promote", "verify"):
+            sub.add_argument("--local-first", help="local-first CI trust file (default: the owner file)")
+            sub.add_argument("--evidence-dir", help="local CI evidence directory (default: the host evidence directory)")
+    prot = top.add_parser("protection").add_subparsers(dest="cmd", required=True)
+    for name in ("snapshot", "verify"):
+        prot.add_parser(name, parents=[common]).add_argument("--branch", required=True)
     return p
 
 
@@ -1525,7 +2097,9 @@ HANDLERS = {("registry", "validate"): registry_validate, ("registry", "show"): r
             ("audit", "observe"): observe, ("audit", "import"): audit_import, ("route", None): route,
             ("successor", "ensure"): successor_ensure, ("guard", None): guard, ("train", "integrate"): train_integrate,
             ("train", "converge"): train_converge,
-            ("forward-port", "plan"): forward_port, ("forward-port", "run"): forward_port, ("forward-port", "status"): forward_port}
+            ("forward-port", "plan"): forward_port, ("forward-port", "run"): forward_port, ("forward-port", "status"): forward_port,
+            **{("release", c): release_cmd for c in ("candidate-tag", "promote", "verify", "final-tag")},
+            ("protection", "snapshot"): protection_cmd, ("protection", "verify"): protection_cmd}
 
 
 def main(argv=None):
