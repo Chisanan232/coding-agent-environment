@@ -38,8 +38,8 @@ _rspec = importlib.util.spec_from_file_location("owner_merge_runner", pathlib.Pa
 runner = importlib.util.module_from_spec(_rspec)
 _rspec.loader.exec_module(runner)
 
-EVIDENCE_DIR = "~/.claude/owner-merge-evidence"
-CODEX_EVIDENCE_DIR = "~/.codex/owner-merge-evidence"
+EVIDENCE_DIR = gate.LOCAL_EVIDENCE_DIRS["claude"]
+CODEX_EVIDENCE_DIR = gate.LOCAL_EVIDENCE_DIRS["codex"]
 EVIDENCE_HOSTS = ("claude", "codex")
 COMMAND_TIMEOUT = 6 * 3600
 # Allowlist, not a blocklist: anything not named here (PYTHONPATH, NODE_PATH, VIRTUAL_ENV, PIP_*, LD_*, tokens ...) never reaches a check.
@@ -121,11 +121,11 @@ def pr_context(repo, pr, head):
 
 
 def log_path(logs, name, head, tag):
-    return os.path.join(logs, f"local-ci-{tag}-{head[:12]}-{gate.log_slug(name)}.log")
+    return os.path.join(logs, gate.local_ci_evidence_filename(tag, head, name))
 
 
 def record_path(logs, head, tag):
-    return os.path.join(logs, f"local-ci-{tag}-{head[:12]}.record.json")
+    return os.path.join(logs, gate.local_ci_evidence_filename(tag, head))
 
 
 def write_private(path, text):

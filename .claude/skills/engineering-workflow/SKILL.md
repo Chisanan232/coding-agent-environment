@@ -206,8 +206,8 @@ Do not merge until required checks, CODEOWNERS-required approvals, the class app
 conflict resolution, branch currency, and blocking review threads satisfy the
 repository's real gates.
 Administrator merge is never a bypass for a genuine product, test, security,
-quality, conflict, or substantive review failure. Exactly two narrow exceptions
-are authorized below; neither grants blanket administrator authority.
+quality, conflict, or substantive review failure. Apply the narrow exceptions
+below within their documented scope.
 Only the main coordinator may trigger the merge; an independent reviewer reports
 findings and evidence back to that coordinator.
 Check a merge before and after with `scripts/owner-merge-gate.py` (read-only PASS/REFUSE/WAIT at the
@@ -253,7 +253,15 @@ findings, and record the qualifying evidence durably in the PR/tracker. Use
    blocks. A host or tool refusal of the merge is `HARNESS_PERMISSION_BLOCK`: report
    it and never route around it.
 
-If either exception lacks its evidence, keep the normal gate pending. Fix a
+3. **Standing local CI substitution for a scoped personal repository**: use
+   the owner-controlled `standing_admin_targets` policy and the existing
+   recorder. Require full configured local results and independent review at
+   the current head. A qualifying hosted infrastructure condition may use
+   local results without another founder decision. The gate selects the
+   pinned admin command and preserves native host and GitHub rule checks.
+   See `docs/OWNER-MERGE-WORKFLOW.md` in coding-agent-environment.
+
+If an exception lacks its evidence, keep the normal gate pending. Fix a
 genuine failed check rather than reclassifying or bypassing it. No other approval,
 security, production, release, payment, or destructive-operation authority changes.
 

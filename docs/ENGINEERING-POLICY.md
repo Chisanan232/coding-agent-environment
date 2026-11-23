@@ -154,6 +154,15 @@ operates, and human execution is not an acceptance requirement unless technicall
 authentication, an OS credential prompt or a material product or cost decision. Local CI never replaces real end-to-end or
 realistic user-workflow acceptance, and final release approval remains the founder's.
 
+**Standing local CI substitution.** An explicit owner policy may enable
+automatic admin merges for listed integration targets of a private personal
+repository. A qualifying hosted CI condition and complete exact-head local
+evidence are required along with independent review and every other merge
+gate. A healthy queued or running pipeline remains pending. Hosted product,
+test or security failures require remediation. This authorization applies
+to the merge and leaves deployment and release approvals separate.
+See [the owner merge workflow](OWNER-MERGE-WORKFLOW.md).
+
 **Equivalence.** Inspect the workflow's real commands, run them locally with matching runtime, dependencies,
 features and configuration, record exit codes and test counts, preserve sanitized logs, pin to the exact
 commit or tree, and document platform or coverage differences. Reuse evidence while the tested inputs are
