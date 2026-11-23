@@ -82,38 +82,79 @@ def now_utc():
 
 # The child environment is built from an allowlist: GIT_SSH_COMMAND, GIT_PROXY_COMMAND, GIT_EXEC_PATH, GIT_EXTERNAL_DIFF, GIT_DIR, GIT_ASKPASS,
 # GIT_ALTERNATE_OBJECT_DIRECTORIES, GIT_CONFIG_COUNT/PARAMETERS and every other inherited GIT_* variable can redirect or run programs and are never passed on.
-ENV_ALLOW = frozenset({"PATH", "HOME", "LANG", "TMPDIR", "TZ", "SSH_AUTH_SOCK", "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
-                       "GH_HOST", "GH_CONFIG_DIR"})
+# GH_HOST, GH_CONFIG_DIR and the enterprise tokens are not passed: a caller-controlled host or hosts.yml could point gh at a server that forges merged-PR answers.
+# gh is always pinned to github.com, and PATH is a fixed trusted one (a caller's PATH never decides which git or gh runs).
+ENV_ALLOW = frozenset({"HOME", "LANG", "TMPDIR", "TZ", "SSH_AUTH_SOCK", "GH_TOKEN", "GITHUB_TOKEN"})
+TRUSTED_PATH = "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"
 ENV_HOOK_FILE = os.path.join(os.path.dirname(os.path.expanduser(omg.VERSION_POLICY_DEFAULT)), "release-line-test-env.json")
 _hook_cache = {}
+_tool_cache = {}
+
+
+def env_hook():
+    """The owner's release-line-test-env.json (trust-anchor reader): `pass` lists extra variable names handed to children and `tools` maps git/gh to absolute
+    wrapper paths. It is how the test harness runs its fake gh and git wrappers; there is no flag or environment switch for it."""
+    if "hook" not in _hook_cache:
+        names, tools = frozenset(), {}
+        try:
+            rec = omg.read_owner_file(ENV_HOOK_FILE, True, lambda o: o, "release-line env hook")
+            names = frozenset(n for n in rec.get("pass", []) if isinstance(n, str))
+            tools = {k: v for k, v in (rec.get("tools") or {}).items() if k in ("git", "gh") and isinstance(v, str) and os.path.isabs(v)}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+        _hook_cache["hook"] = (names, tools)
+    return _hook_cache["hook"]
 
 
 def env_hook_names():
-    """Extra variable names the owner lists in release-line-test-env.json (trust-anchor file, owner config root): the test harness's way to hand its fake
-    gh/git wrappers their state. There is no flag or environment switch for it."""
-    if "names" not in _hook_cache:
-        try:
-            names = omg.read_owner_file(ENV_HOOK_FILE, True, lambda o: o, "release-line env hook")["pass"]
-            _hook_cache["names"] = frozenset(n for n in names if isinstance(n, str))
-        except (OSError, ValueError, KeyError, TypeError):
-            _hook_cache["names"] = frozenset()
-    return _hook_cache["names"]
+    return env_hook()[0]
+
+
+def tool_path(name):
+    """git or gh as an absolute path: the owner hook's wrapper, else the first executable match in the fixed trusted PATH (resolved once)."""
+    if name not in _tool_cache:
+        found = env_hook()[1].get(name)
+        if not (found and os.access(found, os.X_OK)):
+            found = next((os.path.join(d, name) for d in TRUSTED_PATH.split(":") if os.path.isfile(os.path.join(d, name)) and os.access(os.path.join(d, name), os.X_OK)), None)
+        _tool_cache[name] = found
+    return _tool_cache[name]
 
 
 def child_env(extra_env=None):
-    allowed = ENV_ALLOW | env_hook_names()
+    allowed = (ENV_ALLOW | env_hook_names()) - {"PATH"}
     env = {k: v for k, v in os.environ.items() if k in allowed or k.startswith("LC_")}
-    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/nonexistent/release-line-grafts", **(extra_env or {})})
+    env.update({"PATH": TRUSTED_PATH, "GH_HOST": "github.com", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/nonexistent/release-line-grafts", **(extra_env or {})})
     return env
 
 
-def run(argv, cwd=None, extra_env=None, stdin=None):
-    env = child_env(extra_env)
+def run3(argv, cwd=None, extra_env=None, stdin=None, timeout=60):
+    """(returncode, stdout, stderr) through the allowlisted child environment; `git` and `gh` run from their pinned absolute paths."""
+    argv = list(argv)
+    if argv and argv[0] in ("git", "gh"):
+        exe = tool_path(argv[0])
+        if exe is None:
+            return 127, "", "NOT_FOUND"
+        argv[0] = exe
     try:
-        p = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, errors="replace", timeout=60, input=stdin)
+        p = subprocess.run(argv, cwd=cwd, env=child_env(extra_env), capture_output=True, text=True, errors="replace", timeout=timeout, input=stdin)
     except (OSError, subprocess.TimeoutExpired) as e:
-        return 127, type(e).__name__
-    return p.returncode, p.stdout
+        return 127, type(e).__name__, type(e).__name__
+    return p.returncode, p.stdout, p.stderr
+
+
+def gh_checked(*args):
+    """Read-only gh call for the imported gate logic (owner-merge-gate's own `gh` would inherit the caller's PATH and GH_HOST)."""
+    omg.read_only(args)
+    rc, out, err = run3(["gh", *args], timeout=120)
+    if rc:
+        raise RuntimeError(f"gh {args[0]} {args[1]} failed: {err.strip()[:200]}")
+    return out
+
+
+def run(argv, cwd=None, extra_env=None, stdin=None):
+    rc, out, _ = run3(argv, cwd, extra_env, stdin)
+    return rc, out
 
 
 def git(clone, *args, env=None, stdin=None):
@@ -1900,7 +1941,7 @@ def trusted_local_record(args, number, cand, base):
     and equal to the private recorder evidence (digest) which record_problem verifies."""
     try:
         _, entry = load_local_entry(args)
-        run_ = omg.gh
+        run_ = gh_checked
         p = json.loads(run_("pr", "view", str(number), "--repo", args.repo, "--json", omg.PR_FIELDS))
         if p.get("headRefOid") != cand or p.get("baseRefName") != base:
             return None, ["PR_HEAD_OR_BASE_MISMATCH"]
@@ -2598,11 +2639,7 @@ def release_notes(args, res):
 
 
 def gh_capture(argv, timeout=60):
-    try:
-        p = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return 127, "", type(e).__name__
-    return p.returncode, p.stdout, p.stderr
+    return run3(argv, timeout=timeout)
 
 
 def existing_release(args, tag):

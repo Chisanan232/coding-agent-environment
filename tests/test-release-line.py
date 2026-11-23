@@ -58,11 +58,13 @@ class Base(unittest.TestCase):
         self.policy_path = self.local / "version-branches.json"
         # Owner-visible test hook: release-line-test-env.json names the variables the fake gh/git wrappers need; the tool drops every other inherited one.
         hook = self.local / "release-line-test-env.json"
-        hook.write_text(json.dumps({"schema": 1, "pass": ["FAKE_GH_STATE", "GIT_LOG", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
-                                                          "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE"]}))
-        os.chmod(hook, 0o600)
         self.bin = pathlib.Path(self.tmp.name) / "bin"
         self.bin.mkdir()
+        # the owner hook also names the fake gh and git wrapper: a caller's PATH never decides which binary runs
+        hook.write_text(json.dumps({"schema": 1, "pass": ["FAKE_GH_STATE", "GIT_LOG", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+                                                          "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE"],
+                                    "tools": {"gh": str(self.bin / "gh"), "git": str(self.bin / "git")}}))
+        os.chmod(hook, 0o600)
         gh = self.bin / "gh"
         gh.write_text(FAKE_GH.format(py=sys.executable))
         gh.chmod(0o755)

@@ -25,6 +25,7 @@ FAKE_GH = relmod.FAKE_GH
 _old = 'elif a[:2] == ["repo", "view"]:'
 assert FAKE_GH.count(_old) == 1
 FAKE_GH = FAKE_GH.replace(_old, '''elif a[:2] == ["release", "view"]:
+    open(S + ".host", "a").write(os.environ.get("GH_HOST", "") + "\\n")
     rel = st.get("releases", {{}}).get(a[2])
     if rel is None:
         sys.stderr.write("release not found\\\\n")
@@ -83,6 +84,9 @@ class Pub(relmod.Rel):
         super().setUp()
         (self.bin / "gh").write_text(FAKE_GH.format(py=sys.executable, git=REAL_GIT, date=base.DATE))
         self.env["RELEASE_LEAK_MARKER"] = "do-not-leak"
+        for cmd in (("push", "-q", "--delete", "origin", "v0.3.0-rc.1"), ("tag", "-d", "v0.3.0-rc.1"), ("tag", "-a", "-m", "rc", "v0.3.0-rc.1", "integration/v0.x"),
+                    ("push", "-q", "origin", "v0.3.0-rc.1")):
+            self.w(*cmd)  # release tags are annotated; the harness fixture tag is lightweight
         self.set_build([sys.executable, "-c", BUILD])
         self.top = self.state_dir / "releases"
 
@@ -362,6 +366,50 @@ class Publish(Pub):
         self.tag("v0.3.0", "integration/v0.x")
         self.assertEqual(self.refused(self.rel("publish", execute=True)[1]), "PROMOTION_ASSERTION_FAILED")
         self.assertEqual(self.creates(), [])
+
+
+class Hardening(Pub):
+    def test_child_env_pins_gh_host_path_and_drops_enterprise_settings(self):
+        spec = importlib.util.spec_from_file_location("rl_mod", ROOT / "scripts/release-line.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        hostile = {"GH_HOST": "evil.example", "GH_CONFIG_DIR": "/tmp/evil", "GH_ENTERPRISE_TOKEN": "x", "GITHUB_ENTERPRISE_TOKEN": "x",
+                   "PATH": "/tmp/decoy:/usr/bin", "GIT_SSH_COMMAND": "evil"}
+        old = {k: os.environ.get(k) for k in hostile}
+        os.environ.update(hostile)
+        try:
+            env = mod.child_env()
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        self.assertEqual((env["GH_HOST"], env["PATH"]), ("github.com", "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"))
+        for k in ("GH_CONFIG_DIR", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GIT_SSH_COMMAND"):
+            self.assertNotIn(k, env)
+
+    def test_tools_resolve_from_the_fixed_path_not_the_callers_path(self):
+        decoy = pathlib.Path(self.tmp.name) / "decoy"
+        decoy.mkdir()
+        for n in ("gh", "git"):
+            (decoy / n).write_text(f"#!/bin/sh\ntouch {decoy}/used-{n}\nexit 1\n")
+            (decoy / n).chmod(0o755)
+        (self.local / "release-line-test-env.json").unlink()  # no hook: the tool must resolve git itself
+        self.env["PATH"] = f"{decoy}:{self.env['PATH']}"
+        self.env["GH_HOST"] = "evil.example"
+        rc, out, _ = self.cli("route", "--kind", "fix", "--version", "0.3.0", "--clone", str(self.work))
+        self.assertFalse(list(decoy.glob("used-*")), "a git or gh earlier in the caller's PATH was run")
+
+    def test_gh_is_pinned_to_github_com_and_the_hooked_binary_is_used(self):
+        self.prepared()
+        decoy = pathlib.Path(self.tmp.name) / "decoy"
+        decoy.mkdir()
+        (decoy / "gh").write_text(f"#!/bin/sh\ntouch {decoy}/used-gh\nexit 1\n")
+        (decoy / "gh").chmod(0o755)
+        self.env.update({"PATH": f"{decoy}:{self.env['PATH']}", "GH_HOST": "evil.example", "GH_CONFIG_DIR": str(decoy)})
+        rc, out, _ = self.rel("publish")
+        self.assertEqual((rc, out["status"]), (0, "NOT_RUN"), out)
+        self.assertFalse(list(decoy.glob("used-*")))
+        hosts = set(pathlib.Path(str(self.gh_state) + ".host").read_text().split())
+        self.assertEqual(hosts, {"github.com"})
 
 
 class Run(Pub):
