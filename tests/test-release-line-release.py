@@ -737,9 +737,21 @@ class HardenedGit(Rel):
         finally:
             for k in hostile:
                 os.environ.pop(k, None)
-        self.assertEqual([k for k in env if k.startswith("GIT_") and k not in ("GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS", "GIT_CONFIG_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS")], [])
+        self.assertEqual([k for k in env if k.startswith("GIT_") and k not in ("GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS", "GIT_CONFIG_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS", "GIT_GRAFT_FILE")], [])
         self.assertEqual((env["GIT_NO_REPLACE_OBJECTS"], env["GIT_CONFIG_NOSYSTEM"], env["GIT_TERMINAL_PROMPT"], env["X"]), ("1", "1", "0", "1"))
         self.assertNotIn("SSH_ASKPASS", env)
+        self.assertFalse(os.path.exists(env["GIT_GRAFT_FILE"]))  # grafts are off for every child, not only checked once
+
+    def test_graft_path_lookup_failure_is_refused_not_assumed_empty(self):
+        mod = self.probe()
+        real = mod.git
+        mod.git = lambda c, *a, **k: (128, "") if a[:2] == ("rev-parse", "--git-common-dir") else real(c, *a, **k)
+        try:
+            with self.assertRaises(mod.Refusal) as cm:
+                mod.require_clone(self.work, None)
+        finally:
+            mod.git = real
+        self.assertEqual(cm.exception.code, "CLONE_CONFIG_HOSTILE")
 
 
 class VerifyBinding(Rel):

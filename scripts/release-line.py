@@ -100,7 +100,7 @@ def env_hook_names():
 def child_env(extra_env=None):
     allowed = ENV_ALLOW | env_hook_names()
     env = {k: v for k, v in os.environ.items() if k in allowed or k.startswith("LC_")}
-    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_NO_REPLACE_OBJECTS": "1", **(extra_env or {})})
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/nonexistent/release-line-grafts", **(extra_env or {})})
     return env
 
 
@@ -582,8 +582,13 @@ def require_clone(clone, repo=None):
         raise Refusal("NOT_A_CLONE", "--clone is not a git checkout")
     # refs/replace/* and a grafts file rewrite history for every ancestry check; the tool never honors them, and a clone that carries any is refused.
     rc, out = git(clone, "for-each-ref", "--count=1", "refs/replace")
-    grafts = git(clone, "rev-parse", "--git-path", "info/grafts")[1].strip()
-    if rc != 0 or out.strip() or (grafts and os.path.exists(os.path.join(str(clone), grafts) if not os.path.isabs(grafts) else grafts)):
+    # Not --git-path: it honors GIT_GRAFT_FILE, which the child environment points at a nonexistent path.
+    grc, common = git(clone, "rev-parse", "--git-common-dir")
+    common = common.strip()
+    if grc != 0 or not common:
+        raise Refusal("CLONE_CONFIG_HOSTILE", "could not locate the clone's git directory; refusing rather than assuming no grafts file exists")
+    grafts = os.path.join(common if os.path.isabs(common) else os.path.join(str(clone), common), "info", "grafts")
+    if rc != 0 or out.strip() or os.path.exists(grafts):
         raise Refusal("CLONE_CONFIG_HOSTILE", "the clone carries refs/replace/* or an info/grafts file, which rewrite history; use a clone without them")
     if repo is None:
         return
