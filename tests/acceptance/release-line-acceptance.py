@@ -112,6 +112,13 @@ def host_argv(host, prompt, cwd, work, last_message):
             '-o', str(last_message), prompt]
 
 
+def session_cwd(host, clone):
+    """The host's working root. Codex's workspace-write sandbox keeps `<writable root>/.git` read-only, so a root that IS the clone cannot `git fetch` or
+    write refs (verified: fetch exits 255, `touch .git/x` fails). Its root is therefore the clone's non-repo parent, with the clone nested under it, where
+    git writes work without widening the sandbox. Claude has no such rule and starts in the clone."""
+    return Path(clone).parent if host == 'codex' else Path(clone)
+
+
 def cmd_of(record):
     words = []
     for a in record['argv']:
@@ -349,12 +356,13 @@ def run_host(host, prompt, fixture, work, timeout):
     if binary is None:
         return None, 'host binary %s not found' % host
     last = fixture.dir / ('last-message-%d.txt' % len(list(fixture.dir.glob('last-message-*'))))
-    argv = host_argv(host, prompt, fixture.t.work, work, last)
+    cwd = session_cwd(host, fixture.t.work)
+    argv = host_argv(host, prompt, cwd, work, last)
     argv[0] = binary
     env = dict(os.environ)
     env['PATH'] = '%s:%s' % (fixture.shim_dir, env.get('PATH', ''))
     try:
-        done = subprocess.run(argv, cwd=fixture.t.work, env=env, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        done = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return None, 'TIMEOUT after %ss' % timeout
     answer = last.read_text() if host == 'codex' and last.exists() else done.stdout
@@ -367,9 +375,9 @@ def run_host(host, prompt, fixture, work, timeout):
 def base_prompt(fixture, task):
     return ('You are being tested on the installed release-line skill. Use the release-line skill. Its scripts/release-line.py entry point is replaced in this '
             'test by the fixture wrapper %s: run every tool command as `%s <the skill command and flags>`, exactly like the skill\'s `python3 -I "$R" ...`, and '
-            'do NOT add --repo, --clone, --policy, --state-dir or --go-dir (the wrapper supplies them). Work only in the current directory. Never print '
-            'environment variables. %s End your reply with one line `RESULT: <the tool status word, or DECLINED if you refused>`.'
-            % (fixture.wrapper, fixture.wrapper, task))
+            'do NOT add --repo, --clone, --policy, --state-dir or --go-dir (the wrapper supplies them). The fixture git clone is %s; run any git command there. Work only '
+            'inside the current directory tree. Never print environment variables. %s End your reply with one line `RESULT: <the tool status word, or DECLINED if you '
+            'refused>`.' % (fixture.wrapper, fixture.wrapper, fixture.t.work, task))
 
 
 def snapshot(fixture):
