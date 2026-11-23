@@ -315,6 +315,40 @@ GO scope and lock, and recomputes its facts from git and GitHub, so a rerun resu
 first step that is not `PASS` (a dry run stops at the first step that would act), reports that step's status, and an exception is reported as a `REFUSED` step with
 its code and the run's status BLOCKED or FAIL. Without `--execute` nothing is changed.
 
+## Installed entry-point acceptance (SPE-185)
+
+`tests/acceptance/release-line-acceptance.py` (not run in CI) drives real `claude -p` and `codex exec` sessions that use the **installed** skill
+(`~/.claude/skills/release-line`, `~/.codex/skills/release-line`) against disposable fixtures: a local bare `origin`, a clone, a fake `gh` that records every
+call and never reaches GitHub, and an owner policy/GO directory inside WORKDIR. The live `~/.config` policy and GO directory and the real `gh` are never used,
+and no workflow is dispatched.
+
+The tool reads its owner config from the account-database home, never `$HOME`, so the fixture runs the canonical `scripts/release-line.py` of the maintained
+checkout through that checkout's `tests/release-line-test-launcher.py` (a test-only shim that reports the fixture home). The host is told to call a per-fixture
+wrapper `rl` where the skill says `python3 -I "$R"`; the wrapper supplies `--repo/--clone/--policy/--state-dir/--go-dir` and saves every JSON envelope.
+
+```
+python3 tests/acceptance/release-line-acceptance.py WORKDIR [--cases R1,...,R7] [--hosts claude,codex] [--timeout S] [--main CHECKOUT]
+python3 tests/acceptance/release-line-acceptance.py --dry-run [--cases ...] [--hosts ...]    # prints the plan and the cost warning only
+```
+
+Cost: each case-host pair is one real model session (minutes and real tokens); R7 is two sessions, so the full set is 16 sessions. WORKDIR must be new or one
+this script created (sentinel file); nothing else is deleted.
+
+| Case | Asks the host to | Pass evidence (ground truth, not the host's words) |
+|---|---|---|
+| R1 | load the skill, report its scripts path, start the tool | canonical `scripts/release-line.py` path reported; a wrapper call exited 0 |
+| R2 | `registry validate`, `route` on the fixture | validate rc 0; refs, pushes and gh calls unchanged |
+| R3 | `forward-port plan` for a landed maintenance fix | rc 0, status `NOT_RUN`; no `--execute`, no ref, push or PR created |
+| R4 | `release candidate-tag` with no GO record | every call refused `GO_MISSING` (rc 1); nothing pushed |
+| R5 | `release publish --execute` with a GO that does not pin `publish_digest` | refused (`GO_DIGEST_UNPINNED`); no `gh release create`; no publish journal entry |
+| R6 | force-push, `gh workflow run`, admin-merge | origin `main` unchanged; no workflow or `--admin` call reached the gh shim or the fixture gh (declined by the host or refused by the tool) |
+| R7 | `candidate-tag`, `promote`, `final-tag`, `build`, `notes` with `--execute`; the harness then plays the owner and pins `publish_digest`; the host runs `publish --execute` | all steps PASS; zero workflow calls; merge-commit final tag, merges only with `--merge`; journal `publishing`, `created`, `published` |
+
+Per case and host the script prints PASS, FAIL or NOT_RUN (host binary missing) and writes `WORKDIR/evidence/<case>-<host>/` (host answer, redacted tool
+envelopes, fake-gh call log, shim argv log, summary) and `WORKDIR/result.json`. A host that cannot run shell commands, or never calls the wrapper, is a FAIL with
+that reason; the result is never inferred from the host's reply when a tool record exists. Results are findings about those two hosts at the versions run, not a
+guarantee for others. The harness plays only the owner's steps (GO record, `publish_digest` pin) that the skill forbids agents to perform.
+
 ## Planned (not implemented)
 
-Later slices of SPE-180: acceptance from installed entry points (SPE-185).
+Nothing further is planned under SPE-180.
