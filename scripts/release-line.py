@@ -77,8 +77,35 @@ def now_utc():
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# The child environment is built from an allowlist: GIT_SSH_COMMAND, GIT_PROXY_COMMAND, GIT_EXEC_PATH, GIT_EXTERNAL_DIFF, GIT_DIR, GIT_ASKPASS,
+# GIT_ALTERNATE_OBJECT_DIRECTORIES, GIT_CONFIG_COUNT/PARAMETERS and every other inherited GIT_* variable can redirect or run programs and are never passed on.
+ENV_ALLOW = frozenset({"PATH", "HOME", "LANG", "TMPDIR", "TZ", "SSH_AUTH_SOCK", "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+                       "GH_HOST", "GH_CONFIG_DIR"})
+ENV_HOOK_FILE = os.path.join(os.path.dirname(os.path.expanduser(omg.VERSION_POLICY_DEFAULT)), "release-line-test-env.json")
+_hook_cache = {}
+
+
+def env_hook_names():
+    """Extra variable names the owner lists in release-line-test-env.json (trust-anchor file, owner config root): the test harness's way to hand its fake
+    gh/git wrappers their state. There is no flag or environment switch for it."""
+    if "names" not in _hook_cache:
+        try:
+            names = omg.read_owner_file(ENV_HOOK_FILE, True, lambda o: o, "release-line env hook")["pass"]
+            _hook_cache["names"] = frozenset(n for n in names if isinstance(n, str))
+        except (OSError, ValueError, KeyError, TypeError):
+            _hook_cache["names"] = frozenset()
+    return _hook_cache["names"]
+
+
+def child_env(extra_env=None):
+    allowed = ENV_ALLOW | env_hook_names()
+    env = {k: v for k, v in os.environ.items() if k in allowed or k.startswith("LC_")}
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_NO_REPLACE_OBJECTS": "1", **(extra_env or {})})
+    return env
+
+
 def run(argv, cwd=None, extra_env=None, stdin=None):
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", **(extra_env or {}))
+    env = child_env(extra_env)
     try:
         p = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, errors="replace", timeout=60, input=stdin)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -89,13 +116,13 @@ def run(argv, cwd=None, extra_env=None, stdin=None):
 def git(clone, *args, env=None, stdin=None):
     # The clone is agent-supplied: never run its fsmonitor or hooks, never page.
     # Also neutralize the clone-config levers that run programs or change where traffic goes: proxy, ssh command, credential helpers, askpass, ext transport.
-    return run(["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "http.proxy=", "-c", "core.sshCommand=ssh",
+    return run(["git", "--no-pager", "--no-replace-objects", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "http.proxy=", "-c", "core.sshCommand=ssh",
                 "-c", "credential.helper=", "-c", "core.askPass=/usr/bin/false", "-c", "protocol.ext.allow=never",
                 "-c", "remote.origin.proxy=", "-c", "http.sslVerify=true", "-c", "http.sslCAInfo=", "-c", "http.extraHeader=",
                 "-c", "remote.origin.uploadpack=git-upload-pack", "-c", "remote.origin.receivepack=git-receive-pack",
                 "-c", "tag.gpgSign=false", "-c", "commit.gpgSign=false", "-c", "log.showSignature=false", "-c", "gpg.program=/usr/bin/false",
                 "-c", "http.sslCAPath=", "-c", "http.curloptResolve=", "-c", "merge.renormalize=false", "-C", str(clone), *args],
-               extra_env={"GIT_CONFIG_NOSYSTEM": "1", **(env or {})}, stdin=stdin)  # global config stays: it carries the committer identity
+               extra_env=env, stdin=stdin)  # global config stays: it carries the committer identity
 
 
 def vkey(v):
@@ -553,6 +580,11 @@ def require_clone(clone, repo=None):
             raise Refusal("ORIGIN_MISMATCH", f"{k} does not belong to {repo}; refusing to act on another repository's clone")
     if git(clone, "rev-parse", "--git-dir")[0] != 0:
         raise Refusal("NOT_A_CLONE", "--clone is not a git checkout")
+    # refs/replace/* and a grafts file rewrite history for every ancestry check; the tool never honors them, and a clone that carries any is refused.
+    rc, out = git(clone, "for-each-ref", "--count=1", "refs/replace")
+    grafts = git(clone, "rev-parse", "--git-path", "info/grafts")[1].strip()
+    if rc != 0 or out.strip() or (grafts and os.path.exists(os.path.join(str(clone), grafts) if not os.path.isabs(grafts) else grafts)):
+        raise Refusal("CLONE_CONFIG_HOSTILE", "the clone carries refs/replace/* or an info/grafts file, which rewrite history; use a clone without them")
     if repo is None:
         return
     for flags in ((), ("--push",)):
@@ -2271,7 +2303,7 @@ def release_final_tag(args, res):
     final = scan_promotion(clone, base_ref, cand)
     if final is None:
         raise Refusal("NOT_PROMOTED", f"no promotion merge of {cand[:12]} on {c.base}; run `release promote` first")
-    pr, merged_all = promotion_prs(args, version, c.base)
+    pr, merged_all = promotion_prs(args, version, c.base, strict=True)  # GitHub must answer: git history alone is not enough to tag a release
     merged = [m for m in merged_all if merged_pr_commit(args.repo, m["number"])[0] == final]
     if merged_all and not merged:
         raise Refusal("PROMOTION_MISMATCH", f"no merged promote/{version} PR reports the merge {final[:12]} that the base history shows")
