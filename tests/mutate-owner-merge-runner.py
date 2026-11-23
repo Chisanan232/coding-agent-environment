@@ -15,6 +15,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNNER = "scripts/owner-merge-runner.py"
 ALLOW_FD = "        if {}:\n            bad.append(f\"{{label}} is"
 MUTANTS = [
+    ("local_gate_only ruleset id validation", '    if any(type(r.get("ruleset_id")) is not int or r["ruleset_id"] <= 0 for r in rules):', '    if False:'),
+    ("local_gate_only pull request requirement", '    if not isinstance(prot.get("required_pull_request_reviews"), dict):', '    if False:'),
     ("local_gate_only mode dispatch", '    if cfg.get("local_gate_only"):\n        return check_local_gate_base(runner, repo, base)\n', ''),
     ("local_gate_only config strictness", 'ok = ok and (not gate_only or (cfg["required_checks"] == [] and local_gate and prot is True', 'ok = ok and (True or (cfg["required_checks"] == [] and local_gate and prot is True'),
     ("local_gate_only absent protection", '            raise Refused(["local_gate_only: the base branch has no branch protection"])', '            pass'),
