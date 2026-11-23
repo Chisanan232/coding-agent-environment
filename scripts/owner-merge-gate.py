@@ -281,7 +281,7 @@ def load_local_first(obj):
     for repo, entry in obj["repos"].items():
         if not isinstance(repo, str) or not REPO_RE.fullmatch(repo) or not isinstance(entry, dict) \
                 or set(entry) - {"checks", "max_age_hours", "pinned_paths", "not_covered", "env", "controlled_script_paths",
-                                 "controlled_package_scripts", "standing_admin_targets"}:
+                                 "controlled_package_scripts", "standing_admin_targets", "public_ok"}:
             raise ValueError(f"local-first config repo {repo!r} is malformed")
         checks, names = [], set()
         if not isinstance(entry.get("checks"), list) or not entry["checks"]:
@@ -339,6 +339,12 @@ def load_local_first(obj):
             raise ValueError(f"local-first standing_admin_targets for {repo} must be unique exact git refs")
         if "standing_admin_targets" in entry:
             out[repo.lower()]["standing_admin_targets"] = tuple(standing_targets)
+        # Owner opt-in, per repo: lets the local-first basis apply to a PUBLIC repository (default: private only). It never
+        # widens the standing admin-merge path, which keeps its own private-only check.
+        if "public_ok" in entry:
+            if type(entry["public_ok"]) is not bool:
+                raise ValueError(f"local-first public_ok for {repo} must be a boolean")
+            out[repo.lower()]["public_ok"] = entry["public_ok"]
     return out
 
 
@@ -913,7 +919,9 @@ def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, raw_bo
     trust file. Every uncertainty refuses; a pass is never a CI pass (hosted checks stay NOT_RUN)."""
     reasons, wait, facts = [], [], {}
     if meta.get("isPrivate") is not True:
-        return ["NOT_PRIVATE: the local-first basis exists only for private repositories"], wait, facts
+        if not (cfg.get("public_ok") is True and meta.get("isPrivate") is False):
+            return ["NOT_PRIVATE: the local-first basis exists only for private repositories"], wait, facts
+        facts["public_repo_local_first"] = True
     files = p.get("files")
     # `pr view --json files` lists only the new path of a rename, so a workflow moved out of its directory is read from the REST list too.
     listed = _json(run, "api", f"repos/{repo}/pulls/{pr}/files?per_page=100", "--jq", "[.[] | {filename, previous_filename, status}]") \
