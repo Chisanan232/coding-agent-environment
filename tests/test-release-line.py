@@ -17,6 +17,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts/release-line.py"
+LAUNCHER = ROOT / "tests/release-line-test-launcher.py"
 EXAMPLE = ROOT / "docs/examples/version-branches-release-lines.example.json"
 SPEC = importlib.util.spec_from_file_location("omg", ROOT / "scripts/owner-merge-gate.py")
 omg = importlib.util.module_from_spec(SPEC)
@@ -72,7 +73,7 @@ class Base(unittest.TestCase):
         self.set_gh(prs=[])
         self.state_dir = pathlib.Path(self.tmp.name) / "state"
         self.env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GIT_CONFIG_NOSYSTEM": "1",
-                    "GIT_CONFIG_GLOBAL": "/dev/null", "SOURCE_DATE_EPOCH": "1767225600", "FAKE_GH_STATE": str(self.gh_state)}
+                    "GIT_CONFIG_GLOBAL": "/dev/null", "SOURCE_DATE_EPOCH": "1767225600", "FAKE_GH_STATE": str(self.gh_state), "RL_TEST_PW_HOME": str(self.home)}
 
     def allow_origin(self, bare):
         """Owner-visible test override: release-origins.json (trust-anchor file under the fixture HOME) lists the local bare repository as this repo's origin."""
@@ -90,7 +91,7 @@ class Base(unittest.TestCase):
         os.chmod(self.policy_path, 0o600)
 
     def cli(self, *args, repo=REPO, policy=True, state_dir=None):
-        argv = [sys.executable, "-I", str(CLI), *args, "--repo", repo, "--state-dir", str(state_dir or self.state_dir)]
+        argv = [sys.executable, "-I", str(LAUNCHER), *args, "--repo", repo, "--state-dir", str(state_dir or self.state_dir)]
         if policy:
             argv += ["--policy", str(self.policy_path)]
         p = subprocess.run(argv, env=self.env, capture_output=True, text=True)
@@ -223,7 +224,7 @@ class RegistryTests(Base):
         other = pathlib.Path(self.tmp.name) / "p.json"
         other.write_text(json.dumps(example()))
         os.chmod(other, 0o600)
-        argv = [sys.executable, "-I", str(CLI), "registry", "validate", "--repo", REPO, "--policy", str(other)]
+        argv = [sys.executable, "-I", str(LAUNCHER), "registry", "validate", "--repo", REPO, "--policy", str(other)]
         p = subprocess.run(argv, env=self.env, capture_output=True, text=True)
         self.assertEqual(p.returncode, 3)
 

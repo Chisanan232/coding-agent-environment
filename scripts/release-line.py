@@ -33,6 +33,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import pwd
 import re
 import shutil
 import signal
@@ -43,6 +44,17 @@ import tempfile
 import time
 import types
 import urllib.parse
+
+def real_home():
+    """The invoking user's home from the account database, never from $HOME: a caller-set HOME could redirect the owner config root, ~/.gitconfig,
+    ~/.ssh/config and gh's hosts.yml."""
+    return pwd.getpwuid(os.getuid()).pw_dir
+
+
+if __name__ == "__main__":  # the CLI: every expanduser below, including the gate module's owner-file paths, then derives from the real home
+    os.environ["HOME"] = real_home()
+    for _k in ("XDG_CONFIG_HOME", "GH_CONFIG_DIR"):
+        os.environ.pop(_k, None)
 
 HERE = pathlib.Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("owner_merge_gate", HERE / "owner-merge-gate.py")
@@ -84,7 +96,7 @@ def now_utc():
 # GIT_ALTERNATE_OBJECT_DIRECTORIES, GIT_CONFIG_COUNT/PARAMETERS and every other inherited GIT_* variable can redirect or run programs and are never passed on.
 # GH_HOST, GH_CONFIG_DIR and the enterprise tokens are not passed: a caller-controlled host or hosts.yml could point gh at a server that forges merged-PR answers.
 # gh is always pinned to github.com, and PATH is a fixed trusted one (a caller's PATH never decides which git or gh runs).
-ENV_ALLOW = frozenset({"HOME", "LANG", "TMPDIR", "TZ", "SSH_AUTH_SOCK", "GH_TOKEN", "GITHUB_TOKEN"})
+ENV_ALLOW = frozenset({"LANG", "TMPDIR", "TZ", "SSH_AUTH_SOCK", "GH_TOKEN", "GITHUB_TOKEN"})
 TRUSTED_PATH = "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"
 ENV_HOOK_FILE = os.path.join(os.path.dirname(os.path.expanduser(omg.VERSION_POLICY_DEFAULT)), "release-line-test-env.json")
 _hook_cache = {}
@@ -95,14 +107,16 @@ def env_hook():
     """The owner's release-line-test-env.json (trust-anchor reader): `pass` lists extra variable names handed to children and `tools` maps git/gh to absolute
     wrapper paths. It is how the test harness runs its fake gh and git wrappers; there is no flag or environment switch for it."""
     if "hook" not in _hook_cache:
-        names, tools = frozenset(), {}
+        names, tools, tpath = frozenset(), {}, None
         try:
             rec = omg.read_owner_file(ENV_HOOK_FILE, True, lambda o: o, "release-line env hook")
             names = frozenset(n for n in rec.get("pass", []) if isinstance(n, str))
             tools = {k: v for k, v in (rec.get("tools") or {}).items() if k in ("git", "gh") and isinstance(v, str) and os.path.isabs(v)}
+            tp = rec.get("trusted_path")
+            tpath = [d for d in tp if isinstance(d, str) and os.path.isabs(d)] if isinstance(tp, list) and tp else None
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             pass
-        _hook_cache["hook"] = (names, tools)
+        _hook_cache["hook"] = (names, tools, tpath)
     return _hook_cache["hook"]
 
 
@@ -110,12 +124,46 @@ def env_hook_names():
     return env_hook()[0]
 
 
+def trusted_dirs():
+    return env_hook()[2] or TRUSTED_PATH.split(":")
+
+
+def untrusted_component(path):
+    """The first path (the binary or one of its parent directories, for the path as given and after resolving symlinks) that is not owned by root or the
+    current user, or is group- or world-writable; None when the whole chain is trusted."""
+    uid = os.getuid()
+    chains = {os.path.abspath(path), os.path.realpath(path)}
+    for full in chains:
+        try:
+            st = os.stat(full)
+        except OSError:
+            return full
+        if not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, uid) or st.st_mode & 0o022:
+            return full
+        d = os.path.dirname(full)
+        while True:
+            try:
+                ds = os.stat(d)
+            except OSError:
+                return d
+            if ds.st_uid not in (0, uid) or ds.st_mode & 0o022:
+                return d
+            if os.path.dirname(d) == d:
+                break
+            d = os.path.dirname(d)
+    return None
+
+
 def tool_path(name):
-    """git or gh as an absolute path: the owner hook's wrapper, else the first executable match in the fixed trusted PATH (resolved once)."""
+    """git or gh as an absolute path: the owner hook's wrapper, else the first executable match in the fixed trusted PATH, which must sit in a chain of
+    directories owned by root or the user and writable by nobody else (TOOL_PATH_UNTRUSTED). Resolved once."""
     if name not in _tool_cache:
         found = env_hook()[1].get(name)
         if not (found and os.access(found, os.X_OK)):
-            found = next((os.path.join(d, name) for d in TRUSTED_PATH.split(":") if os.path.isfile(os.path.join(d, name)) and os.access(os.path.join(d, name), os.X_OK)), None)
+            found = next((os.path.join(d, name) for d in trusted_dirs() if os.path.isfile(os.path.join(d, name)) and os.access(os.path.join(d, name), os.X_OK)), None)
+            bad = untrusted_component(found) if found else None
+            if bad:
+                raise Refusal("TOOL_PATH_UNTRUSTED", f"{name} resolves to {found}, but {bad} is not owned by root or the current user or is group- or world-writable")
         _tool_cache[name] = found
     return _tool_cache[name]
 
@@ -123,7 +171,9 @@ def tool_path(name):
 def child_env(extra_env=None):
     allowed = (ENV_ALLOW | env_hook_names()) - {"PATH"}
     env = {k: v for k, v in os.environ.items() if k in allowed or k.startswith("LC_")}
-    env.update({"PATH": TRUSTED_PATH, "GH_HOST": "github.com", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1",
+    home = real_home()
+    env.update({"HOME": home, "XDG_CONFIG_HOME": os.path.join(home, ".config"), "GH_CONFIG_DIR": os.path.join(home, ".config", "gh"),
+                "PATH": ":".join(trusted_dirs()), "GH_HOST": "github.com", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": "/nonexistent/release-line-grafts", **(extra_env or {})})
     return env
 
@@ -175,7 +225,10 @@ def vkey(v):
 
 
 def tool_revision():
-    rc, out = git(HERE, "rev-parse", "HEAD")
+    try:
+        rc, out = git(HERE, "rev-parse", "HEAD")
+    except Refusal:
+        return "unknown"
     return out.strip() if rc == 0 and SHA_RE.fullmatch(out.strip()) else "unknown"
 
 

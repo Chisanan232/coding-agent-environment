@@ -26,6 +26,7 @@ _old = 'elif a[:2] == ["repo", "view"]:'
 assert FAKE_GH.count(_old) == 1
 FAKE_GH = FAKE_GH.replace(_old, '''elif a[:2] == ["release", "view"]:
     open(S + ".host", "a").write(os.environ.get("GH_HOST", "") + "\\n")
+    open(S + ".envs", "a").write(" ".join(os.environ.get(k, "") for k in ("HOME", "GH_CONFIG_DIR", "XDG_CONFIG_HOME")) + "\\n")
     rel = st.get("releases", {{}}).get(a[2])
     if rel is None:
         sys.stderr.write("release not found\\\\n")
@@ -383,8 +384,9 @@ class Hardening(Pub):
             for k, v in old.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
         self.assertEqual((env["GH_HOST"], env["PATH"]), ("github.com", "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"))
-        for k in ("GH_CONFIG_DIR", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GIT_SSH_COMMAND"):
-            self.assertNotIn(k, env)
+        for k in ("GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GIT_SSH_COMMAND"):
+            self.assertFalse(k in env, k)  # never assertNotIn(k, env): a failure would print the whole environment, tokens included
+        self.assertNotEqual(env["GH_CONFIG_DIR"], "/tmp/evil")
 
     def test_tools_resolve_from_the_fixed_path_not_the_callers_path(self):
         decoy = pathlib.Path(self.tmp.name) / "decoy"
@@ -410,6 +412,75 @@ class Hardening(Pub):
         self.assertFalse(list(decoy.glob("used-*")))
         hosts = set(pathlib.Path(str(self.gh_state) + ".host").read_text().split())
         self.assertEqual(hosts, {"github.com"})
+
+
+class Trust(Pub):
+    def load_module(self):
+        spec = importlib.util.spec_from_file_location("rl_trust_mod", ROOT / "scripts/release-line.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_home_and_config_dirs_come_from_the_account_database_not_the_environment(self):
+        self.prepared()
+        evil = pathlib.Path(self.tmp.name) / "evil-home"
+        (evil / ".config/gh").mkdir(parents=True)
+        (evil / ".config/coding-agent-environment/local").mkdir(parents=True)
+        (evil / ".config/coding-agent-environment/local/version-branches.json").write_text("{}")
+        self.env.update({"HOME": str(evil), "GH_CONFIG_DIR": str(evil / ".config/gh"), "XDG_CONFIG_HOME": str(evil / ".config")})
+        rc, out, _ = self.rel("publish")  # owner files (policy, GO record, pins) are still found under the real home
+        self.assertEqual((rc, out["status"]), (0, "NOT_RUN"), out)
+        seen = {tuple(x.split()) for x in pathlib.Path(str(self.gh_state) + ".envs").read_text().splitlines()}
+        home = str(self.home)
+        self.assertEqual(seen, {(home, f"{home}/.config/gh", f"{home}/.config")})
+        rc, out, _ = self.cli("registry", "validate", policy=False)  # default policy path: the real home's, not the hostile one
+        self.assertEqual(rc, 0, out)
+        mod, old = self.load_module(), os.environ.get("HOME")
+        try:
+            os.environ.update({"HOME": str(evil), "GH_CONFIG_DIR": "/x", "XDG_CONFIG_HOME": "/y"})
+            env = mod.child_env()
+        finally:
+            os.environ["HOME"] = old
+            os.environ.pop("GH_CONFIG_DIR"), os.environ.pop("XDG_CONFIG_HOME")
+        self.assertNotEqual(env["HOME"], str(evil))
+        self.assertEqual((env["GH_CONFIG_DIR"], env["XDG_CONFIG_HOME"]), (env["HOME"] + "/.config/gh", env["HOME"] + "/.config"))
+
+    def test_world_writable_tool_on_the_search_path_is_refused(self):
+        evil = pathlib.Path(self.tmp.name) / "evil-bin"
+        evil.mkdir()
+        for n in ("git", "gh"):
+            (evil / n).write_text(f"#!/bin/sh\ntouch {evil}/used-{n}\nexit 1\n")
+            (evil / n).chmod(0o777)
+        hook = self.local / "release-line-test-env.json"
+        hook.write_text(json.dumps({"schema": 1, "pass": ["FAKE_GH_STATE"], "trusted_path": [str(evil)]}))
+        os.chmod(hook, 0o600)
+        rc, out, _ = self.cli("route", "--kind", "fix", "--version", "0.3.0", "--clone", str(self.work))
+        self.assertEqual((rc, out["status"], self.refused(out)), (1, "BLOCKED", "TOOL_PATH_UNTRUSTED"), out)
+        self.assertIn("git", [s for s in out["steps"] if s["step"] == "refused"][0]["evidence"]["detail"])
+        self.assertFalse(list(evil.glob("used-*")))
+
+    def test_each_component_of_the_chain_is_checked(self):
+        mod = self.load_module()
+        root = pathlib.Path(self.tmp.name) / "chain"
+        (root / "inner").mkdir(parents=True)
+        tool = root / "inner/gh"
+        tool.write_text("#!/bin/sh\n")
+        tool.chmod(0o755)
+        self.assertIsNone(mod.untrusted_component(str(tool)))
+        for target, mode in ((root, 0o775), (root, 0o757), (root / "inner", 0o777)):
+            target.chmod(mode)
+            got = mod.untrusted_component(str(tool))
+            self.assertIn(os.path.realpath(got), (os.path.realpath(root), os.path.realpath(root / "inner")), (target, mode))
+            target.chmod(0o755)
+        tool.chmod(0o775)  # group-writable binary
+        self.assertEqual(os.path.realpath(mod.untrusted_component(str(tool))), os.path.realpath(tool))
+        tool.chmod(0o755)
+        link = root / "link-gh"
+        link.symlink_to(tool)
+        self.assertIsNone(mod.untrusted_component(str(link)))
+        root.chmod(0o777)  # the directory holding the symlink can swap it
+        self.assertEqual(os.path.realpath(mod.untrusted_component(str(link))), os.path.realpath(root))
+        root.chmod(0o755)
 
 
 class Run(Pub):
