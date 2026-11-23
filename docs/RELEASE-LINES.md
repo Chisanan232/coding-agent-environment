@@ -276,12 +276,12 @@ python3 -I $R release run --until candidate-tag|promote|verify|final-tag|build|n
 
 All three use the key `release:<repo>:<version>:<final_sha>` and default to a dry plan. The final SHA is recomputed every time from git and GitHub, never from
 the journal or the state directory: the `tag_format` tag must exist on origin and peel to a promotion merge on the publication base (`final^2` is the candidate,
-`final^{tree}` is the predicted tree, cross-checked with the promotion PR), and a final tree that differs from the candidate tree needs the same owner-pinned
+`final^{tree}` is the predicted tree, cross-checked with the promotion PR; the PR lookup is strict, so a GitHub outage is `GH_UNAVAILABLE`, never a silently skipped cross-check), and a final tree that differs from the candidate tree needs the same owner-pinned
 verification record as `final-tag` (`FINAL_TAG_MISSING`, `PROMOTION_ASSERTION_FAILED`, `FINAL_NOT_ON_BASE`, `PROMOTION_MISMATCH`, `FINAL_NOT_VERIFIED`).
 
 `build` runs the owner's `build.argv` from the registry (no shell, never taken from the clone) in a clean detached worktree at the final SHA with a scrubbed
 environment (`PATH`, `HOME`/`TMPDIR` in a fresh temp directory, `LANG`, `LC_ALL`, `TZ`, `SOURCE_DATE_EPOCH` = the commit time; no variable of the caller, no
-token) and a timeout (default 1800 s, at most 7200 s, the process group is killed). It fails closed, FAIL and nothing recorded: `BUILD_FAILED` (non-zero exit),
+token) and a timeout (default 1800 s, at most 7200 s, the process group is killed on timeout and on normal exit alike). The worktree shares the clone's `.git`, so after the build the clone is re-validated (`CLONE_CONFIG_HOSTILE` if the build planted config keys or an `info/attributes` driver) before any git call, and git children never receive `GH_TOKEN`/`GITHUB_TOKEN` (only `gh` does); `release verify` re-validates the same way after its checks. It fails closed, FAIL and nothing recorded: `BUILD_FAILED` (non-zero exit),
 `BUILD_TIMEOUT`, `BUILD_OUTPUT_MISSING` (an `outputs` glob matched no file), `BUILD_OUTPUT_UNSAFE` (symlink, special file or outside the tree),
 `BUILD_OUTPUT_DUPLICATE`/`BUILD_OUTPUT_NAME`/`BUILD_OUTPUT_PATTERN`, `BUILD_MUTATED_TREE` (a tracked file changed). Outputs are copied by file name to
 `releases/<version>/` and their sha256 recorded in `releases/<version>.json` and the journal. A rerun with intact copies is `REUSED`; damaged copies are rebuilt.
@@ -298,9 +298,13 @@ Publish re-hashes every artifact against the manifest (`ARTIFACT_TAMPERED`, `ART
 identical (`NOTES_MISSING`, `NOTES_TAMPERED`), and uploads the bytes it just verified from a private staging directory. With `--execute` it runs
 `gh release create <tag> --repo OWNER/REPO --verify-tag --title <tag> --notes-file <notes> <files...>` for the **existing** final tag: it never creates or moves a tag,
 never uses `--clobber`, never calls `gh release upload`, and dispatches no workflow. It then downloads the assets and verifies bytes, notes and `ls-remote` of the
-tag; a difference is FAIL. An existing release with identical notes and asset bytes is `REUSED`; any difference, a draft, or a failed create leaving a partial
+tag; a difference is FAIL. The journal records `created` immediately after `gh release create` succeeds, before verification; a verification error (gh or git outage, failed download) is a FAIL with `publish-unverified`, not a BLOCKED, so a public release never goes unjournaled. A failed create is journaled `publish-failed`, a reused release `reused`. An existing release with identical notes and asset bytes is `REUSED`; any difference, a draft, or a failed create leaving a partial
 release is `CONFLICT_EXISTING` or `PUBLISH_FAILED` and is never overwritten or deleted. Other backends are `UNSUPPORTED_BACKEND`; a registry `channel` other than
 `github-release` is `DEFERRED`.
+
+Zero Actions spend holds only if the target repository has no workflow triggered by `release` events or by tag pushes: creating a GitHub release or pushing a
+candidate or final tag can start `on: release` / `on: push: tags` workflows there (indirect Actions spend), which this tool neither dispatches nor can prevent.
+Check the target repo's workflows before relying on the zero-spend property.
 
 `run --until STEP` runs `candidate-tag`, `promote`, `verify`, `final-tag`, `build`, `notes`, `publish` in order up to STEP. Each step does its own gating, takes its own
 GO scope and lock, and recomputes its facts from git and GitHub, so a rerun resumes after an interruption and completed steps report `PASS`/`REUSED`. It stops at the
