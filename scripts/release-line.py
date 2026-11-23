@@ -485,9 +485,36 @@ def propose(args, res):
 
 # ---------------------------------------------------------------- git facts
 
-def require_clone(clone):
+ORIGINS_FILE = os.path.join(os.path.dirname(os.path.expanduser(omg.VERSION_POLICY_DEFAULT)), "release-origins.json")
+GITHUB_URL_RES = (re.compile(r"https://(?:[^/@]+@)?github\.com/([^/]+)/([^/]+?)(?:\.git)?/?"),
+                  re.compile(r"(?:ssh://)?git@github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?"))
+
+
+def origin_matches(url, repo):
+    """True when a remote URL names github.com/<repo> (https, ssh or scp form), or is a local path the owner listed for this repo in release-origins.json
+    (a trust-anchor file under the owner config root: the only way a non-GitHub origin, such as a test bare repository, is accepted)."""
+    for rx in GITHUB_URL_RES:
+        m = rx.fullmatch(url)
+        if m:
+            return f"{m.group(1)}/{m.group(2)}".lower() == repo.lower()
+    try:
+        allowed = omg.read_owner_file(ORIGINS_FILE, True, lambda o: o, "release origins")["origins"]
+        want = {os.path.realpath(x) for k, v in allowed.items() if k.lower() == repo.lower() for x in v}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+    return os.path.isabs(url) and os.path.realpath(url) in want
+
+
+def require_clone(clone, repo=None):
     if not clone or not os.path.isdir(clone) or git(clone, "rev-parse", "--git-dir")[0] != 0:
         raise Refusal("NOT_A_CLONE", "--clone is not a git checkout")
+    if repo is None:
+        return
+    for flags in ((), ("--push",)):
+        rc, out = git(clone, "remote", "get-url", "--all", *flags, "origin")
+        urls = out.split()
+        if rc != 0 or not urls or not all(origin_matches(u, repo) for u in urls):
+            raise Refusal("ORIGIN_MISMATCH", f"the clone's origin {'push ' if flags else 'fetch '}URL does not belong to {repo}; refusing to act on another repository's clone")
 
 
 def branch_ref(clone, branch):
@@ -534,9 +561,9 @@ def route(args, res):
         raise SystemExit(usage_error("route needs --clone"))
     if not VERSION_RE.fullmatch(args.version):
         raise SystemExit(usage_error("--version must be MAJOR.MINOR or MAJOR.MINOR.PATCH"))
-    require_clone(args.clone)
     policy, _ = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
     _, entry = check_policy(policy, args.repo)
+    require_clone(args.clone, args.repo)
     rl = entry["release_lines"]
     res.step("audit", rl["audit"]["status"], {})
     major = int(args.version.split(".")[0])
@@ -591,7 +618,7 @@ def observe(args, res):
     if not args.clone:
         raise SystemExit(usage_error("audit observe needs --clone"))
     clone = args.clone
-    require_clone(clone)
+    require_clone(clone, args.repo)
     rc, out = git(clone, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes/origin")
     names = sorted({r.split("/", 2)[2] if r.startswith("refs/heads/") else r.split("/", 3)[3] for r in out.split()} - {"HEAD"})
     res.step("branches", "OBSERVED", {"count": len(names), "names": names[:200]})
@@ -882,9 +909,9 @@ def integration_link(clone, rl, frm, into):
         raise Refusal("NOT_SUCCESSOR", f"{into['id']} is not a successor of {frm['id']}")
     version = into["predecessor"]["version"]
     tag = rl["tag_format"].replace("{version}", version)
-    final = commit_of(clone, "refs/tags/" + tag)
-    if final is None:
-        raise Refusal("NO_FINAL_TAG", f"{tag} does not exist; {frm['id']} has not shipped {version}")
+    obj, final = remote_tag(clone, tag)  # origin decides: a local-only tag is not a shipped version
+    if obj is None or commit_of(clone, final) != final:
+        raise Refusal("NO_FINAL_TAG", f"{tag} does not exist on origin (or is not fetched); {frm['id']} has not shipped {version}")
     rc, out = git(clone, "rev-list", "--parents", "-n", "1", final)
     parts = out.split()
     cand = parts[2] if len(parts) >= 3 else final
@@ -1436,7 +1463,7 @@ def fp_source(ctx, rev, hint):
 def forward_port(args, res):
     if not args.clone:
         raise SystemExit(usage_error(f"forward-port {args.cmd} needs --clone"))
-    require_clone(args.clone)
+    require_clone(args.clone, args.repo)
     policy, _ = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
     _, entry = check_policy(policy, args.repo)
     require_ready(entry)
@@ -1538,7 +1565,7 @@ def release_ctx(args, res):
         raise SystemExit(usage_error(f"{args.group} {args.cmd} needs --clone"))
     if not VERSION_RE.fullmatch(args.version):
         raise SystemExit(usage_error("--version must be MAJOR.MINOR or MAJOR.MINOR.PATCH"))
-    require_clone(args.clone)
+    require_clone(args.clone, args.repo)
     policy, _ = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
     _, entry = check_policy(policy, args.repo)
     require_ready(entry)
@@ -1591,6 +1618,9 @@ def push_tag(res, args, name, sha, message, step):
     local = commit_of(args.clone, f"refs/tags/{name}")
     if local not in (None, sha):
         raise Refusal("CONFLICT_EXISTING", f"a local tag {name} points at {local}, not {sha}")
+    if local is not None and git(args.clone, "cat-file", "-t", f"refs/tags/{name}")[1].strip() != "tag":
+        git(args.clone, "tag", "-d", name)  # a lightweight local tag is never pushed: release tags are annotated
+        local = None
     created = local is None
     if created and git(args.clone, "tag", "-a", "-m", message, name, sha)[0] != 0:
         raise Refusal("TAG_FAILED", f"could not create tag {name} (is a committer identity configured?)")
@@ -1699,9 +1729,24 @@ def accounting_complete(args, c, cand, base_ref):
     return len(revs), bad
 
 
+def remote_tags(clone):
+    """{tag name: peeled commit} for every tag on origin (ls-remote), never the clone's own tag list."""
+    rc, out = git(clone, "ls-remote", "--tags", "origin")
+    if rc != 0:
+        raise Refusal("REMOTE_UNREACHABLE", "git ls-remote --tags origin failed")
+    plain, peeled = {}, {}
+    for row in out.splitlines():
+        sha, _, ref = row.partition("\t")
+        if ref.startswith("refs/tags/") and SHA_RE.fullmatch(sha):
+            (peeled if ref.endswith("^{}") else plain)[ref[len("refs/tags/"):].removesuffix("^{}")] = sha
+    return {n: peeled.get(n, sha) for n, sha in plain.items()}
+
+
 def final_tags(clone, rl, major):
+    """(version key, version, tag, commit) for same-major final tags that exist on origin."""
     final = fmt_re(rl["tag_format"])
-    return [(vkey(m.group("v")), m.group("v"), t) for t in tag_names(clone) if (m := final.fullmatch(t)) and m.group("v").split(".")[0] == major]
+    return [(vkey(m.group("v")), m.group("v"), t, sha) for t, sha in remote_tags(clone).items()
+            if (m := final.fullmatch(t)) and m.group("v").split(".")[0] == major]
 
 
 def load_local_entry(args):
@@ -1784,20 +1829,34 @@ def trusted_local_record(args, number, cand, base):
             return None, ["PRIVATE_EVIDENCE_MISSING"]
         if hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":")).encode()).hexdigest() != facts.get("local_ci_digest"):
             return None, ["PRIVATE_EVIDENCE_DIFFERS_FROM_POSTED_RECORD"]
+        if pinned_digest(args, cand) != record_digest(rec):
+            return None, ["OWNER_PIN_MISSING"]  # the private record is a file the agent can write; the owner pins its digest, keyed by the PR head
         problem = record_problem(rec, entry, args.repo, number, cand, base)
         return (rec, []) if problem is None else (None, [problem])
     except (RuntimeError, ValueError, OSError, KeyError, TypeError, AttributeError) as e:
         return None, [type(e).__name__]
 
 
+def required_contexts(snap):
+    """Required status check names from the owner-pinned protection snapshot (legacy contexts and the newer checks list)."""
+    rsc = (snap.get("settings") or {}).get("required_status_checks") or {}
+    names = {c for c in rsc.get("contexts") or [] if isinstance(c, str)}
+    names |= {c.get("context") for c in rsc.get("checks") or [] if isinstance(c, dict) and isinstance(c.get("context"), str)}
+    return names
+
+
 def hosted_ci(res, args, number, cand, base):
-    """CI_PASS, CI_FAILED (refuses), CI_PENDING (defers) or NOT_RUN, which needs a passing local-equivalent record for the candidate."""
+    """CI_PASS needs every check required by the pinned protection snapshot to be SUCCESS (and, with none required, at least one SUCCESS);
+    a failure refuses, pending defers, and anything else (empty, all SKIPPED/NEUTRAL, a required check missing) is NOT_RUN, which
+    needs the owner-pinned local-equivalent record for the candidate."""
     rc, out = run(["gh", "pr", "view", str(number), "--repo", args.repo, "--json", "statusCheckRollup"])
     try:
         rollup = json.loads(out).get("statusCheckRollup") if rc == 0 else None
     except (ValueError, AttributeError):
         rollup = None
-    states = [str((x.get("conclusion") or x.get("state") or x.get("status") or "")).upper() for x in rollup if isinstance(x, dict)] if isinstance(rollup, list) else []
+    entries = [x for x in rollup if isinstance(x, dict)] if isinstance(rollup, list) else []
+    state = lambda x: str((x.get("conclusion") or x.get("state") or x.get("status") or "")).upper()
+    states = [state(x) for x in entries]
     if any(s in FAILED_CHECK for s in states):
         res.step("hosted_ci", "CI_FAILED", {"checks": len(states)})
         raise Refusal("CI_FAILED", "a required hosted check reported a failure; this tool never bypasses it", "FAIL")
@@ -1805,10 +1864,12 @@ def hosted_ci(res, args, number, cand, base):
         res.step("hosted_ci", "CI_PENDING", {"checks": len(states)})
         res.status, res.next_action = "DEFERRED", "wait for the hosted checks, then re-run"
         return False
-    if states:
-        res.step("hosted_ci", "CI_PASS", {"checks": len(states)})
+    required = required_contexts(trusted_snapshot(args, base))
+    passed = {x.get("name") or x.get("context") for x in entries if state(x) == "SUCCESS"}
+    if (required and required <= passed) or (not required and passed):
+        res.step("hosted_ci", "CI_PASS", {"checks": len(states), "required": sorted(required)})
         return True
-    res.step("hosted_ci", "NOT_RUN", {"reason": "no hosted check ran or gh could not report them (outage, quota or none configured)"})
+    res.step("hosted_ci", "NOT_RUN", {"reason": "no required hosted check succeeded (empty or skipped rollup, a required check missing, outage, quota, or gh unavailable)"})
     rec, problems = trusted_local_record(args, number, cand, base)
     if rec is None:
         raise Refusal("LOCAL_EVIDENCE_REQUIRED", f"hosted CI is NOT_RUN and no trusted, fresh local-equivalent record exists for {cand[:12]} on PR #{number} "
@@ -1931,8 +1992,10 @@ def release_promote(args, res):
                     after = protection_compare(args, c.base)
                     res.step("protection_after", "DRIFT" if after[2] else "UNCHANGED", {"changed": after[2]})
                     drift = after[2]
-                except Refusal as e:
-                    res.step("protection_after", "NOT_RUN", {"reason": e.code})
+                except (Refusal, ValueError, OSError) as e:
+                    # The merge may already have happened: an unverifiable result is never left looking like a pass.
+                    res.step("protection_after", "NOT_RUN", {"reason": getattr(e, "code", type(e).__name__)})
+                    res.status, res.next_action = "FAIL", f"verify {c.base} branch protection manually (the after-merge comparison could not run); {ROLLBACK} restores it"
         if drift:
             res.status, res.next_action = "FAIL", f"PROTECTION_DRIFT: restore {c.base} protection with {ROLLBACK}"
     if not args.execute:
@@ -1961,7 +2024,7 @@ def promote_body(args, res, c, go, cand, tag, base_ref, head, bp, done, j):
             others = sorted((x for x in final_tags(clone, rl, version.split(".")[0]) if x[1] != version), reverse=True)
             if others:
                 latest = others[0]
-                if not is_ancestor(clone, latest[2] + "^{commit}", base_ref):
+                if commit_of(clone, latest[3]) is None or not is_ancestor(clone, latest[3], base_ref):
                     raise Refusal("BASE_MISSING_FINAL", f"{bp['branch']} does not contain the latest same-major final tag {latest[2]}")
                 if vkey(version) <= latest[0]:
                     raise Refusal("VERSION_NOT_GREATER", f"{version} is not greater than the shipped {latest[1]} within major {version.split('.')[0]}")
@@ -2026,6 +2089,13 @@ def promote_body(args, res, c, go, cand, tag, base_ref, head, bp, done, j):
     res.step("verification", "CARRIED_OVER" if carry else "REQUIRED", {"candidate_tree_equals_final": carry})
     if j:
         j.append(key=res.env["idempotency_key"], state="promoted", final_sha=final, candidate_sha=cand, pr=pr_number, line=c.ln["id"], version=version)
+    if done is None and first_parent != base_tip:
+        # The base moved between accounting and the merge: account again against the base the merge really landed on.
+        n2, bad2 = accounting_complete(args, c, cand, first_parent)
+        res.step("base_moved", "INCOMPLETE" if bad2 else "ACCOUNTED", {"evaluated_base": base_tip, "merged_onto": first_parent, "sources": n2, "incomplete": bad2[:50]})
+        if bad2:
+            raise Refusal("BASE_MOVED_UNACCOUNTED", f"the base advanced to {first_parent[:12]} before the merge and {len(bad2)} new change(s) are not forward-port accounted; "
+                          f"the promotion {final[:12]} is already merged: account for them with forward-port, then continue", "FAIL")
     res.next_action = ("`release verify`" if not carry else "none for verification (candidate tree carries over)") + "; then `release final-tag` under a GO with the final_tag scope"
 
 
@@ -2033,13 +2103,15 @@ def release_verify(args, res):
     c = release_ctx(args, res)
     clone, version, bp = args.clone, c.version, c.ln["publication_base"]
     base_ref = need_ref(clone, c.base)
-    pr, merged = promotion_prs(args, version, bp["branch"], strict=True)
+    go = read_go(args, c.rl, c.ln, version)  # the approved candidate decides which promotion is verified, not the order of a PR list
+    cand = go["candidate_sha"]
+    final = scan_promotion(clone, base_ref, cand)
+    if final is None:
+        raise Refusal("PROMOTION_NOT_FOUND", f"no promotion merge of the approved candidate {cand[:12]} on {bp['branch']}")
+    pr, merged_all = promotion_prs(args, version, bp["branch"], strict=True)
+    merged = [m for m in merged_all if merged_pr_commit(args.repo, m["number"])[0] == final]
     if not merged:
-        raise Refusal("PROMOTION_NOT_FOUND", f"no merged promote/{version} PR into {bp['branch']}")
-    final, _ = merged_pr_commit(args.repo, merged[0]["number"])
-    if commit_of(clone, final) != final:
-        raise Refusal("FINAL_NOT_FETCHED", f"promotion merge {final[:12]} is not in the fetched clone")
-    cand = git(clone, "rev-parse", final + "^2")[1].strip()
+        raise Refusal("PROMOTION_NOT_FOUND", f"no merged promote/{version} PR reports the merge {final[:12]}")
     res.env["idempotency_key"] = f"verify:{args.repo}:{version}:{final}"
     if not is_ancestor(clone, final, base_ref):
         raise Refusal("FINAL_NOT_ON_BASE", f"{final[:12]} is not on {bp['branch']}")
@@ -2062,6 +2134,9 @@ def release_verify(args, res):
     logs = os.path.expanduser(omg.LOCAL_EVIDENCE_DIRS["claude"])
     pr_number = merged[0]["number"]
     tag = f"{args.repo.replace('/', '__')}-{pr_number}"
+    existing = read_fixed_record(args.repo, pr_number, final)
+    if existing is not None and pinned_digest(args, final) == record_digest(existing):
+        raise Refusal("VERIFY_RECORD_PINNED", f"the verification record for {final[:12]} is already pinned by the owner; remove the pin to re-verify")
     title = f"Promote {version} to {bp['branch']}"
     wt = tempfile.mkdtemp(prefix="release-verify-")
     results = []
@@ -2110,6 +2185,14 @@ def record_digest(rec):
     return hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def pinned_digest(args, sha):
+    """The owner-pinned record digest for this commit (release-verification.json via the trust-anchor reader), or None."""
+    try:
+        return omg.read_owner_file(VERIFY_PINS, True, lambda o: o, "release verification pins")["records"][args.repo][sha]
+    except (ValueError, OSError, KeyError, TypeError):
+        return None
+
+
 def final_tree_verified(args, entry_loader, pr_number, final, base, first):
     """True when the private recorder evidence for this exact final SHA is a passing record accepted by record_problem (fixed directories, log digests,
     owner commands and env, freshness) AND its digest is pinned by the owner in release-verification.json (trust-anchor reader), so a file the agent
@@ -2118,9 +2201,9 @@ def final_tree_verified(args, entry_loader, pr_number, final, base, first):
         return False
     try:
         _, entry = entry_loader(args)
-        pin = omg.read_owner_file(VERIFY_PINS, True, lambda o: o, "release verification pins")["records"][args.repo][final]
-    except (ValueError, OSError, KeyError, TypeError):
+    except (ValueError, OSError):
         return False
+    pin = pinned_digest(args, final)
     rec = read_fixed_record(args.repo, pr_number, final)
     return rec is not None and record_digest(rec) == pin and record_problem(rec, entry, args.repo, pr_number, final, base, first) is None
 
@@ -2135,11 +2218,10 @@ def release_final_tag(args, res):
     final = scan_promotion(clone, base_ref, cand)
     if final is None:
         raise Refusal("NOT_PROMOTED", f"no promotion merge of {cand[:12]} on {c.base}; run `release promote` first")
-    pr, merged = promotion_prs(args, version, c.base)
-    if merged:
-        oid, _ = merged_pr_commit(args.repo, merged[0]["number"])
-        if oid != final:
-            raise Refusal("PROMOTION_MISMATCH", f"PR #{merged[0]['number']} reports merge {oid[:12]}, the base history shows {final[:12]}")
+    pr, merged_all = promotion_prs(args, version, c.base)
+    merged = [m for m in merged_all if merged_pr_commit(args.repo, m["number"])[0] == final]
+    if merged_all and not merged:
+        raise Refusal("PROMOTION_MISMATCH", f"no merged promote/{version} PR reports the merge {final[:12]} that the base history shows")
     tree, first = check_promotion(clone, final, cand)
     if not is_ancestor(clone, final, base_ref):
         raise Refusal("FINAL_NOT_ON_BASE", f"{final[:12]} is not on {c.base}")
@@ -2180,6 +2262,18 @@ class Result:
 def usage_error(msg):
     print(msg, file=sys.stderr)
     return 2
+
+
+def positive_int(text):
+    if not re.fullmatch(r"[1-9][0-9]{0,6}", text):
+        raise argparse.ArgumentTypeError("must be an integer >= 1")
+    return int(text)
+
+
+def rev_arg(text):
+    if not REV_RE.fullmatch(text):
+        raise argparse.ArgumentTypeError("must be a commit id, not an option")
+    return text
 
 
 def build_parser():
@@ -2232,8 +2326,8 @@ def build_parser():
         sub.add_argument("--version", required=True, help="the version being released, e.g. 0.3.0")
         sub.add_argument("--line", help="release line id (default: the line carrying the version, else its major line)")
         if name == "candidate-tag":
-            sub.add_argument("--sha", help="candidate commit (default: the integration branch tip; must be reachable from it)")
-            sub.add_argument("--n", type=int, help="candidate number when no GO record names the tag")
+            sub.add_argument("--sha", type=rev_arg, help="candidate commit (default: the integration branch tip; must be reachable from it)")
+            sub.add_argument("--n", type=positive_int, help="candidate number (>= 1) when no GO record names the tag")
         if name in ("promote", "verify"):
             sub.add_argument("--local-first", help="local-first CI trust file (default: the owner file)")
     prot = top.add_parser("protection").add_subparsers(dest="cmd", required=True)
