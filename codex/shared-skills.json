@@ -30,6 +30,7 @@
     "python-precommit-repair",
     "python-pytest-failure-debugging",
     "python-ruff-fixing",
+    "release-line",
     "release-preparation",
     "release-readiness",
     "release-watch",
