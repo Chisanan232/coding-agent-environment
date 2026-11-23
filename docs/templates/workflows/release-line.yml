@@ -49,10 +49,12 @@ jobs:
         run: |
           git config user.name "release-line[bot]"
           git config user.email "release-line@users.noreply.github.com"
-          # TOOL: path to scripts/release-line.py of the maintained coding-agent-environment checkout (vendored or fetched by pinned SHA).
-          python3 -I "${TOOL:-scripts/release-line.py}" forward-port run --execute --pr "$PR_NUMBER" \
+          # TOOL: required path to scripts/release-line.py of the maintained coding-agent-environment checkout (fetched by pinned SHA, outside the PR checkout).
+          # Note: PRs opened with GITHUB_TOKEN do not trigger checks, and pushes touching .github/workflows are rejected; use an app token if the target requires checks.
+          : "${TOOL:?set TOOL to a pinned, out-of-tree release-line.py; never run the tool from the PR checkout with this token}"
+          python3 -I "$TOOL" forward-port run --execute --pr "$PR_NUMBER" \
             --repo "$REPO" --clone "$GITHUB_WORKSPACE" --policy "$RUNNER_TEMP/owner/version-branches.json" \
-            --state-dir "$RUNNER_TEMP/release-line-state" > "$RUNNER_TEMP/accounting.json" || true
+            --state-dir "$RUNNER_TEMP/release-line-state" > "$RUNNER_TEMP/accounting.json" && rc=0 || rc=$?
           {
             echo "### Forward-port accounting for PR #$PR_NUMBER"
             echo '```json'
@@ -60,3 +62,5 @@ jobs:
             echo '```'
           } | tee "$RUNNER_TEMP/accounting.md" >> "$GITHUB_STEP_SUMMARY"
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$RUNNER_TEMP/accounting.md"
+          # Exit 0 covers PASS, NOT_RUN and DEFERRED; a refusal (1), usage error (2), invalid config (3) or crash fails the job after the comment is posted.
+          if [ "$rc" -ne 0 ]; then exit "$rc"; fi
