@@ -148,8 +148,54 @@ predecessor to have a final tag and to be integrated, in order (`CONVERGE_PRECON
 opens or reuses the PR from the tip successor branch into the major integration branch (DEFERRED), and after the merge reports `CONVERGED` and emits one packet
 that marks every chain line `converged` with `converged_into` the major line.
 
+## Forward-port (SPE-183)
+
+```
+python3 -I $R forward-port plan   (--merge SHA | --pr N | --range A..B) --repo OWNER/REPO --clone PATH
+python3 -I $R forward-port run    (--merge SHA | --pr N | --range A..B) --repo OWNER/REPO --clone PATH [--execute]
+python3 -I $R forward-port status (--merge SHA | --pr N | --range A..B) --repo OWNER/REPO --clone PATH
+```
+
+A maintenance fix that landed on a line is accounted against every strictly newer line (major ascending, then the successor chain), including
+successors chained from a temporary successor. A line is never a target when it is `support: eol`, `state: retired|converged`, or a publication
+base; those are listed under `excluded:<src12>`. A source that landed straight on a publication base targets every line published from it and
+every newer one. `--merge` takes a GitHub merge commit (the work is the second-parent range `M^1..M^2`, since GitHub merge commits carry no
+trailers) or a plain commit; `--pr` resolves the merge commit through `gh pr view`; `--range` accounts for every first-parent commit.
+
+Each target ends in one state: `forward-port` (a port commit naming the source is on the target), `equivalent`, `not-applicable`, `pending`
+(`TO_PORT`, `HEAD_PUSHED_NO_PR`, `PR_OPEN`, `NOT_STARTED`) or `conflict` (`BLOCKED_CONFLICT`, `CONFLICT_EXISTING`, `STALE_HEAD_CONFLICT`,
+`NO_BRANCH`). The evidence order per target is: source already an ancestor (`CONTAINED`); a `Release-Line-Source` trailer on the target
+(`PORTED`, or an `equivalent`/`not-applicable` record written in a reviewed PR); equal patch-id since the merge base (`EQUIVALENT_PATCH`); an
+open PR from the fixed head; otherwise a `git merge-tree` replay of the source's net change (conflict, `EQUIVALENT_CONTENT` when the replayed tree
+equals the target tree, else `TO_PORT`). The `accounting:<src12>` step is recomputed on every run, never stored; `complete` is true only when every
+target is terminal. Targets are independent: a conflict on one never stalls the others.
+
+Idempotency key `fp:<repo>:<source_sha>:<target_line>` (per target, in the evidence; the envelope carries `fp:<repo>:<source_sha>:*`), head
+branch `fwdport/<target_line>/<src12>`. Only `run --execute` acts: it builds one port commit on the target tip with `merge-tree` and `commit-tree`
+(the clone's working tree and index are never touched, so a conflict leaves nothing dirty and nothing pushed), keeps the original author,
+pushes the new ref (`git push origin <sha>:refs/heads/<head>`, never force), requires `ls-remote` to show that SHA (else `CONFLICT_EXISTING`),
+and opens the PR with `gh pr create` (merge commit through the normal gate; the merge itself is never done here). Trailers on the port commit and
+PR body: `Release-Line-Source` (always the original source sha), `Release-Line-Source-Line`, `Release-Line-Target-Line`,
+`Release-Line-Kind: forward-port`, `Release-Line-Reason`. A retry recomputes from origin: an existing head carrying the port is reused (a missing PR is
+opened), and a head that fell behind its target is brought up to date by merging the target into it (a fast-forward push). A head that does not carry
+this source's port is `CONFLICT_EXISTING`.
+
+Loop prevention: a commit is not a source (state `LOOP_PREVENTED`) when it or any commit of `M^1..M^2` carries a `Release-Line-Source` trailer, and a
+merge whose second parent is already on another registered branch without the merge itself is `INTEGRATION_MERGE` (integrate, converge or promote), so
+ports never ping-pong between lines. Inapplicability needs a reviewed PR with an empty commit carrying `Release-Line-Kind: not-applicable` and
+`Release-Line-Reason`; a hand-written equivalent fix carries `Release-Line-Kind: equivalent`.
+
+Exit codes as everywhere: a dry plan with pending work is `NOT_RUN` (0); `run --execute` with PRs awaiting the gate is `DEFERRED` (0); nothing left
+is `PASS` (0); any `conflict` is `BLOCKED` (1). `plan` and `status` never act (`--execute` is ignored); `status` skips the conflict replay and so
+reports unstarted targets as `NOT_STARTED`. `run --execute` takes an flock and appends to `journal.jsonl` in the confined state directory (0700/0600,
+never a symlink, never under the owner config root); the journal is an audit trail only. If `gh` is unavailable `plan` and `status` report
+`pr_lookup: NOT_RUN` and `run` refuses. Needs git 2.40 or newer (`merge-tree --merge-base`).
+
+`docs/templates/workflows/release-line.yml` is a template for the product repository (not active here): on a merged PR into an integration or
+maintenance branch it runs `forward-port run --execute --pr N`, posts the accounting to the job summary and the PR, reads the owner mirror from the
+Actions variable `RELEASE_LINES_JSON` and reports `NOT_RUN` when it is missing. It has no publish, tag or merge step and does not dispatch workflows.
+
 ## Planned (not implemented)
 
-Later slices of SPE-180: forward-port plan/run/status with trailers (SPE-183); release candidate-tag/promote/verify/final-tag (SPE-184a);
-build/notes/publish (SPE-184b); protection snapshot/verify, skill packaging and install (SPE-181b); acceptance from installed entry points
-(SPE-185). None of these commands exist yet.
+Later slices of SPE-180: release candidate-tag/promote/verify/final-tag (SPE-184a); build/notes/publish (SPE-184b); protection snapshot/verify,
+skill packaging and install (SPE-181b); acceptance from installed entry points (SPE-185). None of these commands exist yet.
