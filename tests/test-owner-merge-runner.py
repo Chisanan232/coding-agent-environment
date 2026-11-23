@@ -2374,7 +2374,7 @@ class LocalGateOnly(Base):
     @staticmethod
     def prot(**over):
         body = {"enforce_admins": {"enabled": True}, "allow_force_pushes": {"enabled": False},
-                "allow_deletions": {"enabled": False}}
+                "allow_deletions": {"enabled": False}, "required_pull_request_reviews": {"required_approving_review_count": 0}}
         body.update(over)
         return (0, json.dumps(body))
 
@@ -2418,7 +2418,10 @@ class LocalGateOnly(Base):
                  "force_push": self.prot(allow_force_pushes={"enabled": True}),
                  "force_push_missing": self.prot(allow_force_pushes={}),
                  "deletions": self.prot(allow_deletions={"enabled": True}),
-                 "deletions_malformed": self.prot(allow_deletions=False)}
+                 "deletions_malformed": self.prot(allow_deletions=False),
+                 "no_pr_requirement": self.prot(required_pull_request_reviews=None),
+                 "pr_requirement_malformed": self.prot(required_pull_request_reviews=True),
+                 "pr_requirement_list": self.prot(required_pull_request_reviews=[])}
         for accept in (False, True):
             self.cfg(accept_bypass_actors=accept)
             for name, protection in cases.items():
@@ -2434,6 +2437,21 @@ class LocalGateOnly(Base):
             for name, ruleset in bad.items():
                 with self.subTest(case=name, accept=accept):
                     self.assertRefused(self.gh(rules=rules, ruleset=ruleset), "local_gate_only")
+
+    def test_a_rule_without_a_readable_ruleset_id_refuses(self):
+        for bad in ({"type": "deletion"}, {"type": "deletion", "ruleset_id": "11"}, {"type": "deletion", "ruleset_id": True},
+                    {"type": "deletion", "ruleset_id": None}, {"type": "deletion", "ruleset_id": 0}):
+            for accept in (False, True):
+                self.cfg(accept_bypass_actors=accept)
+                with self.subTest(rule=bad, accept=accept):
+                    self.assertRefused(self.gh(rules=[{"type": "deletion", "ruleset_id": 11}, bad]), "ruleset_id")
+        self.assertRefused(self.gh(rules={"type": "deletion"}), "malformed")
+        self.assertRefused(self.gh(rules=["x"]), "malformed")
+
+    def test_audit_facts_record_the_pull_request_requirement(self):
+        code, rec = self.go(self.gh(), dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
+        self.assertIs(rec["server_side"]["facts"]["pull_request_required"], True)
 
     def test_local_evidence_is_mandatory_and_bound_to_the_head(self):
         self.write_evidence()
