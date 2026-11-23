@@ -69,7 +69,7 @@ detection matches executable names only; it targets macOS. Wiring it into `disk-
 
 ## 4. Concurrency
 
-Up to two admitted heavy lanes, as the resource governor allows (the second only when the resource budget passes; a third runs as a pilot behind `THIRD_LANE_ENABLED`, still only when the budget passes and 160 GiB (floor plus a 60 GiB margin) stays free after all reservations and the request; [ADR 0017](adr/0017-resource-aware-workload-scheduling.md) revision 2). Do not start competing Cargo workspace builds, Docker
+Up to two admitted heavy lanes, as the resource governor allows (the second only when the resource budget passes; a third runs as a pilot behind `THIRD_LANE_ENABLED`, still only when the budget passes and 160 GiB (floor plus a 60 GiB margin) stays free after all reservations and the request; [ADR 0017](adr/0017-resource-aware-workload-scheduling.md) revision 2); a fourth runs in the wide tier as a pilot behind `FOURTH_LANE_ENABLED` (ADR 0017 revision 14) and needs 200 GiB to stay free after all reservations and the request. Do not start competing Cargo workspace builds, Docker
 suites, native QA or full E2E; lower subagent fan-out while pressure is not normal (the seven-subagent cap is a ceiling, not a
 target). Prefer reusable build artifacts and isolated targets inside the budget. Never kill another active session, and never delete
 its worktree, runtime, cache, container or reservation.
@@ -522,9 +522,12 @@ model the margin; its `callers` listing reports the effective stable cap (the ta
 
 ## Four heavy lanes (enabled as a monitored pilot)
 
-The fourth lane (SPE-176, ADR 0017 revision 8) is code behind `FOURTH_LANE_ENABLED` in `scripts/disk-admission.py`, enabled as a monitored pilot by ADR 0017 revision 14 (`True`); reverting that one-line pull request is the rollback. While it is
-off, `heavy_lane_cap` and every refusal text are unchanged (three lanes in the stable and wide tiers; the fourth lane is wide-only; its head-protection hook, the prerequisite recorded in ADR 0017 revision 12, is closed by revision 13a: `_protects_head` refuses a backfill candidate that would leave the blocked head short of `FOURTH_LANE_MARGIN` once it is the fourth job, logged as `head-unprotected-lane4-margin`). There is no runtime switch: enabling is a
-separate reviewed pull request that flips the constant, and rollback is reverting it. Running jobs are never signalled either way.
+The fourth lane (SPE-176, ADR 0017 revision 8) is code behind `FOURTH_LANE_ENABLED` in `scripts/disk-admission.py`. It shipped off and was
+enabled as a monitored pilot by ADR 0017 revision 14 (`True`), after its head-protection prerequisite (revisions 11 and 12) was closed by
+revision 13a: `_protects_head` refuses a backfill candidate that would leave the blocked head short of `FOURTH_LANE_MARGIN` once it is the
+fourth job (logged as `head-unprotected-lane4-margin`) or that would push an unstamped head into lane 3 or 4. There is no runtime switch:
+rollback is a reviewed pull request that reverts the constant, and with it off `heavy_lane_cap` and every refusal text return to the
+three-lane behaviour (three lanes in the stable and wide tiers; the fourth lane is wide-only). Running jobs are never signalled either way.
 
 With it on (and `THIRD_LANE_ENABLED`), the wide tier allows four lanes (`FOUR_LANE_CEILING`). Lane 4 additionally needs, at `reserve`,
 `queue advance` (before the memory probe, so it cannot arm the latch) and `queue claim`: free space minus all reservations minus the
@@ -538,8 +541,7 @@ blocks the queue. `fits_if_cap_were_4` appears beside `fits_if_cap_were_3` in th
 All read-only; none of it creates a queue entry, takes a reservation or runs the memory gate's latch-writing check.
 
 1. Read `snapshot.json` next to the admission state file (published by the existing snapshot refresher; `python3 scripts/disk-admission.py
-   snapshot --check-fresh` is its read-only freshness check): `heavy_lanes_allowed` is 3 while off, 4 when on and the tier is wide, 2 in
-   stable, and `budget.reference.fits_if_cap_were_4` is the shadow figure. Do not run `snapshot --json` or `status --json` for this: the
+   snapshot --check-fresh` is its read-only freshness check): `heavy_lanes_allowed` is 3 in the stable tier (`THIRD_LANE_ENABLED`) and 3 in the wide tier while the fourth lane is off, 4 in the wide tier when it is on, and `budget.reference.fits_if_cap_were_4` is the shadow figure. Do not run `snapshot --json` or `status --json` for this: the
    first writes the file, the second does not report lanes.
 2. In a Python shell: `import importlib.util as u; s=u.spec_from_file_location('m','scripts/memory-admission.py'); m=u.module_from_spec(s);
    s.loader.exec_module(m); print(m.read_lane_cap())` (it only loads `disk-admission.py` and reads the constants; it takes no sample).
