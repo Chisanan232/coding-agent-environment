@@ -92,7 +92,9 @@ def git(clone, *args, env=None, stdin=None):
     return run(["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "http.proxy=", "-c", "core.sshCommand=ssh",
                 "-c", "credential.helper=", "-c", "core.askPass=/usr/bin/false", "-c", "protocol.ext.allow=never",
                 "-c", "remote.origin.proxy=", "-c", "http.sslVerify=true", "-c", "http.sslCAInfo=", "-c", "http.extraHeader=",
-                "-c", "remote.origin.uploadpack=git-upload-pack", "-c", "remote.origin.receivepack=git-receive-pack", "-C", str(clone), *args],
+                "-c", "remote.origin.uploadpack=git-upload-pack", "-c", "remote.origin.receivepack=git-receive-pack",
+                "-c", "tag.gpgSign=false", "-c", "commit.gpgSign=false", "-c", "log.showSignature=false", "-c", "gpg.program=/usr/bin/false",
+                "-c", "http.sslCAPath=", "-c", "http.curloptResolve=", "-c", "merge.renormalize=false", "-C", str(clone), *args],
                extra_env={"GIT_CONFIG_NOSYSTEM": "1", **(env or {})}, stdin=stdin)  # global config stays: it carries the committer identity
 
 
@@ -526,19 +528,33 @@ def origin_matches(url, repo):
     return os.path.isabs(url) and os.path.realpath(url) in listed
 
 
-HOSTILE_CONFIG_RE = r"^(http\..+\.(proxy|sslverify|sslcainfo|extraheader)|remote\..*\.(proxy|uploadpack|receivepack)|filter\..*|diff\.external|core\.gitproxy)$"
+# The clone's own config is attacker-controlled input to every git call. It is accepted only if every key is on this short allowlist; anything else
+# (hooks, drivers, textconv, gpg, http.*, include, url rewrites, aliases, filters, extensions) is refused rather than chased with -c overrides.
+SAFE_CONFIG_RE = re.compile(r"core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|symlinks)"
+                            r"|remote\..+\.(url|fetch|pushurl)"
+                            r"|branch\..+\.(remote|merge|rebase|vscode-merge-base|github-pr-owner-number)"
+                            r"|user\.(name|email)")
 
 
 def require_clone(clone, repo=None):
-    if not clone or not os.path.isdir(clone) or git(clone, "rev-parse", "--git-dir")[0] != 0:
+    if not clone or not os.path.isdir(clone):
+        raise Refusal("NOT_A_CLONE", "--clone is not a git checkout")
+    # First, before any other git call: read the clone's local config only (system and global neutralised), as raw key/value pairs.
+    rc, out = run(["git", "-C", str(clone), "config", "--local", "--list", "-z"], extra_env={"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
+    if rc != 0:
+        raise Refusal("NOT_A_CLONE", "--clone is not a git checkout (or its config is unreadable)")
+    pairs = [(item.partition("\n")[0], item.partition("\n")[2]) for item in out.split("\0") if item]
+    bad = sorted({k for k, _ in pairs if not SAFE_CONFIG_RE.fullmatch(k)})
+    if bad:
+        raise Refusal("CLONE_CONFIG_HOSTILE", f"the clone's git config sets {bad[:10]}, which is not on the allowlist (core repository keys, remote url/fetch/pushurl, "
+                      "branch tracking keys, user.name/email); remove those settings")
+    for k, v in pairs:  # every remote, not only origin, must name this repository
+        if re.fullmatch(r"remote\..+\.(url|pushurl)", k) and repo is not None and not origin_matches(v, repo):
+            raise Refusal("ORIGIN_MISMATCH", f"{k} does not belong to {repo}; refusing to act on another repository's clone")
+    if git(clone, "rev-parse", "--git-dir")[0] != 0:
         raise Refusal("NOT_A_CLONE", "--clone is not a git checkout")
     if repo is None:
         return
-    # Per-URL and per-remote overrides cannot all be neutralized with -c, so a clone that sets any of them is refused outright.
-    rc, out = run(["git", "-C", str(clone), "config", "--get-regexp", HOSTILE_CONFIG_RE], extra_env={"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
-    if rc != 1:
-        keys = sorted({row.split()[0] for row in out.splitlines() if row.strip()}) if rc == 0 else ["<config unreadable>"]
-        raise Refusal("CLONE_CONFIG_HOSTILE", f"the clone's git config sets {keys[:10]}: proxy, TLS, header, helper-program, filter or diff settings are refused; remove them")
     for flags in ((), ("--push",)):
         rc, out = git(clone, "remote", "get-url", "--all", *flags, "origin")
         urls = out.split()
