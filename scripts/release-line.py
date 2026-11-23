@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Release-line registry, routing, audit and successor-train CLI (SPE-180 design, slices SPE-181a and SPE-182).
+"""Release-line registry, routing, audit, successor-train and forward-port CLI (SPE-180 design, slices SPE-181a, SPE-182, SPE-183).
 
   release-line.py registry validate|show        --repo O/R [--policy FILE]
   release-line.py registry propose --op add-successor|retire|eol|converge --repo O/R [--execute] [op flags]
@@ -10,6 +10,7 @@
   release-line.py guard --base BRANCH --head SHA --repo O/R --clone PATH
   release-line.py train integrate --from LINE --into LINE --repo O/R --clone PATH [--execute]
   release-line.py train converge --line LINE --repo O/R --clone PATH [--execute]
+  release-line.py forward-port plan|run|status (--merge SHA | --pr N | --range A..B) --repo O/R --clone PATH [--execute]
 
 Prints exactly one JSON envelope on stdout. Exit 0 ok/no-op, 1 refused/blocked, 2 usage, 3 invalid config.
 The owner policy file (version-branches.json) is a trust anchor: it is read through owner-merge-gate.py's
@@ -20,6 +21,7 @@ Whether a branch may receive merges stays decided by `branches` alone; release_l
 import argparse
 import copy
 import datetime
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -29,6 +31,7 @@ import re
 import stat
 import subprocess
 import sys
+import types
 
 HERE = pathlib.Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("owner_merge_gate", HERE / "owner-merge-gate.py")
@@ -44,7 +47,8 @@ AUDIT_MAX_BYTES = 1 << 20
 STATE_ROOT = "~/.local/state/coding-agent-environment/release-line"
 
 
-BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,100}")
+# Mirrors git check-ref-format: no "..", "//", empty or dot-leading components, ".lock" suffix, or trailing "/" or ".".
+BRANCH_NAME_RE = re.compile(r"(?!.*(?:\.\.|//|/\.|\.lock(?:/|$)|[/.]$))[A-Za-z0-9][A-Za-z0-9._/-]{0,100}")
 
 
 class Refusal(Exception):
@@ -65,18 +69,19 @@ def now_utc():
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def run(argv, cwd=None):
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
+def run(argv, cwd=None, extra_env=None, stdin=None):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", **(extra_env or {}))
     try:
-        p = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60)
+        p = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, errors="replace", timeout=60, input=stdin)
     except (OSError, subprocess.TimeoutExpired) as e:
         return 127, type(e).__name__
     return p.returncode, p.stdout
 
 
-def git(clone, *args):
+def git(clone, *args, env=None, stdin=None):
     # The clone is agent-supplied: never run its fsmonitor or hooks, never page.
-    return run(["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", str(clone), *args])
+    return run(["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", str(clone), *args],
+               extra_env=env, stdin=stdin)
 
 
 def vkey(v):
@@ -560,6 +565,7 @@ def route(args, res):
     if args.kind == "fix" or not frozen:
         return done(mline, "major line" + (" (fix for a frozen candidate)" if frozen else ""))
     active = [x for x in chain_of(rl, mline) if x["support"] == "supported" and x["state"] == "active"]
+    newest_frozen = None
     for tip in sorted(active, key=lambda x: vkey(x["version"]), reverse=True):
         if branch_ref(args.clone, tip["integration_branch"]) is None:
             raise Refusal("BRANCH_NOT_IN_CLONE", f"{tip['integration_branch']} is not in the clone; fetch it first")
@@ -567,10 +573,10 @@ def route(args, res):
         tip_frozen = [v for v in unshipped_candidates(args.clone, rl, tip) if v == tip["version"]]
         if not tip_frozen:
             return done(tip, f"major line is frozen by unshipped candidate {frozen[-1]}; feature goes to the newest unfrozen successor")
-        frozen = frozen + tip_frozen
-    res.step("route", "NEEDS_SUCCESSOR", {"line": mline["id"], "frozen_by": frozen[-1], "requested_version": args.version})
+        newest_frozen = newest_frozen or tip_frozen[-1]  # the newest tip is the one a new successor would follow
+    res.step("route", "NEEDS_SUCCESSOR", {"line": mline["id"], "frozen_by": newest_frozen or frozen[-1], "requested_version": args.version})
     res.status = "BLOCKED"
-    res.next_action = (f"no successor exists after frozen candidate {frozen[-1]}; owner registers one with "
+    res.next_action = (f"no successor exists after frozen candidate {newest_frozen or frozen[-1]}; owner registers one with "
                        "`successor ensure` then `registry propose --op add-successor`. Only this feature is blocked")
 
 
@@ -731,29 +737,30 @@ def find_prs(repo, head, base):
     return next((p for p in prs if p["state"] == "OPEN"), None), [p for p in prs if p["state"] == "MERGED"]
 
 
-def ensure_pr(res, args, head, base, title, body, refuse_merged=False):
+def ensure_pr(res, args, head, base, title, body, refuse_merged=False, step="pr"):
     """Reuse the one open PR head -> base or open it (--execute only). The merge itself belongs to the normal gate."""
     pr, merged = find_prs(args.repo, head, base)
     if pr is None and merged and refuse_merged:
         raise Refusal("NOT_INTEGRATED", f"PR #{merged[0]['number']} merged but the expected commit is not in {base}", "FAIL")
     if pr is not None:
-        res.step("pr", "REUSED", {"number": pr["number"], "url": pr.get("url")})
+        res.step(step, "REUSED", {"number": pr["number"], "url": pr.get("url")})
         return pr
     if not args.execute:
-        res.step("pr", "DRY_PLAN", {"head": head, "base": base})
+        res.step(step, "DRY_PLAN", {"head": head, "base": base})
         res.status = "NOT_RUN"
         return None
     rc, _ = run(["gh", "pr", "create", "--repo", args.repo, "--base", base, "--head", head, "--title", title, "--body", body])
     pr = find_prs(args.repo, head, base)[0] if rc == 0 else None
     if pr is None:
         raise Refusal("GH_PR_CREATE_FAILED", f"could not open {head} -> {base}")
-    res.step("pr", "CREATED", {"number": pr["number"], "url": pr.get("url")})
+    res.step(step, "CREATED", {"number": pr["number"], "url": pr.get("url")})
     return pr
 
 
-def trailers(kind, source_line, target_line, source):
+def trailers(kind, source_line, target_line, source, reason=None):
     return (f"Release-Line-Source: {source}\nRelease-Line-Source-Line: {source_line}\n"
-            f"Release-Line-Target-Line: {target_line}\nRelease-Line-Kind: {kind}\n")
+            f"Release-Line-Target-Line: {target_line}\nRelease-Line-Kind: {kind}\n"
+            + (f"Release-Line-Reason: {reason}\n" if reason else ""))
 
 
 def predecessor_line(rl, version):
@@ -1032,6 +1039,432 @@ def guard(args, res):
     res.step("successor_commits", "NONE", {"line": line["id"]})
 
 
+# ---------------------------------------------------------------- forward-port (SPE-183)
+# Accounting is recomputed from git and GitHub on every run; the local journal is an audit trail, never the source of truth.
+# Port commits are built with plumbing (merge-tree + commit-tree), so the clone's working tree and index are never touched.
+
+TRAILER_RE = re.compile(r"Release-Line-(Source|Source-Line|Target-Line|Kind|Reason): (.*)", re.ASCII)
+PORT_KINDS = {"forward-port": "PORTED", "equivalent": "TRAILER_EQUIVALENT", "not-applicable": "TRAILER_NOT_APPLICABLE"}
+TERMINAL = ("forward-port", "equivalent", "not-applicable")
+REV_RE = re.compile(r"[^-\s.][^\s]*")
+RANGE_MAX = 200
+
+
+class Journal:
+    """Append-only audit trail under the confined state directory, guarded by a flock so two runs never interleave."""
+
+    def __init__(self, args):
+        self.args, self.lfd, self.jfd = args, None, None
+
+    def __enter__(self):
+        base = proposal_dir(self.args).parent
+        base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            dfd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            raise Refusal("STATE_DIR_UNSAFE", "the state directory is not a plain directory")
+        try:
+            if os.fstat(dfd).st_uid != os.getuid():
+                raise Refusal("STATE_DIR_UNSAFE", "the state directory is not owned by the caller")
+            os.fchmod(dfd, 0o700)
+            self.lfd = os.open("lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+            try:
+                fcntl.flock(self.lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise Refusal("LOCKED", "another release-line run holds the state lock")
+            self.jfd = os.open("journal.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+        except BaseException:
+            self.__exit__()
+            raise
+        finally:
+            os.close(dfd)
+        return self
+
+    def __exit__(self, *exc):
+        for fd in (self.jfd, self.lfd):
+            if fd is not None:
+                os.close(fd)
+        self.jfd = self.lfd = None
+
+    def append(self, **rec):
+        os.write(self.jfd, (json.dumps({"ts": now_utc(), **rec}) + "\n").encode())
+
+
+def line_keys(rl):
+    """Order of lines: major ascending, then depth in the successor chain. A line is strictly newer when its key is greater."""
+    by_id = {x["id"]: x for x in rl["lines"]}
+    keys = {}
+    for ln in rl["lines"]:
+        depth, cur = 0, ln
+        while cur["kind"] == "successor":
+            depth, cur = depth + 1, by_id[cur["predecessor"]["line"]]
+        keys[ln["id"]] = (cur["major"], depth)
+    return keys
+
+
+def parse_trailers(msg):
+    """Release-Line trailers from the last paragraph of a message (where git itself reads trailers); first value wins."""
+    out = {}
+    for row in msg.strip().split("\n\n")[-1].splitlines():
+        m = TRAILER_RE.fullmatch(row.rstrip())
+        if m:
+            out.setdefault(m.group(1), m.group(2).strip())
+    return out
+
+
+def log_messages(clone, *revargs):
+    rc, out = git(clone, "log", "--format=%H%x1f%B%x1e", *revargs)
+    if rc != 0:
+        raise Refusal("GIT_LOG_FAILED", "git log failed in the clone")
+    rows = []
+    for chunk in out.split("\x1e"):
+        sha, _, msg = chunk.strip("\n").partition("\x1f")
+        if SHA_RE.fullmatch(sha.strip()):
+            rows.append((sha.strip(), msg))
+    return rows
+
+
+def trailer_hit(clone, tip, source):
+    """The first commit reachable from tip whose trailers name `source` as Release-Line-Source with a known kind."""
+    for sha, msg in log_messages(clone, "-F", f"--grep=Release-Line-Source: {source}", tip):
+        t = parse_trailers(msg)
+        if t.get("Source") == source and t.get("Kind") in PORT_KINDS:
+            return {"commit": sha, **t}
+    return None
+
+
+def merged_pr_commit(repo, number):
+    rc, out = run(["gh", "pr", "view", str(number), "--repo", repo, "--json", "number,state,mergeCommit,baseRefName"])
+    try:
+        pr = json.loads(out) if rc == 0 else None
+    except ValueError:
+        pr = None
+    if not isinstance(pr, dict):
+        raise Refusal("GH_UNAVAILABLE", f"gh pr view {number} failed")
+    oid = (pr.get("mergeCommit") or {}).get("oid")
+    if pr.get("state") != "MERGED" or not (isinstance(oid, str) and SHA_RE.fullmatch(oid)):
+        raise Refusal("PR_NOT_MERGED", f"PR #{number} is not merged (state {pr.get('state')})")
+    return oid, pr.get("baseRefName")
+
+
+def fp_revs(args, res):
+    """The source revisions to account for plus an optional branch hint (the PR's base)."""
+    if args.pr is not None:
+        sha, base = merged_pr_commit(args.repo, args.pr)
+        return [sha], base
+    if args.merge:
+        if not REV_RE.fullmatch(args.merge):
+            raise SystemExit(usage_error("--merge must be a commit id"))
+        return [args.merge], None
+    a, sep, b = args.range.partition("..")
+    if not (sep and REV_RE.fullmatch(a) and REV_RE.fullmatch(b) and ".." not in b):
+        raise SystemExit(usage_error("--range must be A..B"))
+    rc, out = git(args.clone, "rev-list", "--first-parent", "--reverse", f"{a}..{b}")
+    revs = out.split() if rc == 0 else []
+    if rc != 0:
+        raise Refusal("BAD_RANGE", f"{args.range} is not a range in the clone")
+    if len(revs) > RANGE_MAX:
+        raise Refusal("RANGE_TOO_LARGE", f"{len(revs)} commits; at most {RANGE_MAX} per run")
+    return revs, None
+
+
+def load_source(clone, rev):
+    sha = commit_of(clone, rev)
+    if sha is None:
+        raise Refusal("BAD_SOURCE", f"{rev} is not a commit in the clone")
+    parts = git(clone, "rev-list", "--parents", "-n", "1", sha)[1].split()
+    if len(parts) < 2 or len(parts) > 3:
+        raise Refusal("BAD_SOURCE", f"{sha[:12]} is a root or octopus commit")
+    merge = len(parts) == 3
+    # A GitHub merge commit carries no trailers of its own: the work is the second-parent range M^1..M^2.
+    own = log_messages(clone, f"{parts[1]}..{parts[2]}") if merge else []
+    return types.SimpleNamespace(sha=sha, merge=merge, net_base=parts[1], tip=parts[2] if merge else None,
+                                 range_commits=[s for s, _ in own] or [sha], range_msgs=own,
+                                 msg=git(clone, "log", "-1", "--format=%B", sha)[1])
+
+
+def source_origin(ctx, src, hint):
+    """(label, floor key, branch): where the source landed and which lines are strictly newer."""
+    rl, clone = ctx.rl, ctx.clone
+    if hint:
+        ln = next((x for x in rl["lines"] if x["integration_branch"] == hint), None)
+        if ln is not None:
+            ref = branch_ref(clone, hint)
+            if ref is None or not is_ancestor(clone, src.sha, ref):
+                raise Refusal("SOURCE_NOT_ON_BRANCH", f"{src.sha[:12]} is not on {hint}")
+            return ln["id"], ctx.keys[ln["id"]], hint, False
+        if hint not in ctx.bases:
+            raise Refusal("SOURCE_BRANCH_UNKNOWN", f"{hint} is neither a registered integration branch nor a publication base")
+    else:
+        found = [x for x in rl["lines"] if (ref := branch_ref(clone, x["integration_branch"])) and is_ancestor(clone, src.sha, ref)]
+        if found:
+            ln = min(found, key=lambda x: ctx.keys[x["id"]])
+            return ln["id"], ctx.keys[ln["id"]], ln["integration_branch"], False
+        hint = next((b for b in sorted(ctx.bases) if (ref := branch_ref(clone, b)) and is_ancestor(clone, src.sha, ref)), None)
+    if hint is None:
+        raise Refusal("SOURCE_NOT_ON_A_LINE", f"{src.sha[:12]} is on no registered integration branch or publication base")
+    owned = [ctx.keys[x["id"]] for x in rl["lines"] if x["publication_base"]["branch"] == hint]
+    # A change landed straight on a publication base targets every line that publishes from it, and every newer one.
+    return f"base:{hint}", min(owned) if owned else (10 ** 6, 0), hint, True
+
+
+def require_git_version(clone, minimum):
+    rc, out = git(clone, "--version")
+    m = re.search(r"(\d+)\.(\d+)", out if rc == 0 else "")
+    if not m or (int(m.group(1)), int(m.group(2))) < minimum:
+        raise Refusal("GIT_TOO_OLD", f"git >= {minimum[0]}.{minimum[1]} is required (found: {out.strip() or 'unknown'}); a failed merge-tree must not be reported as a conflict")
+
+
+def loop_reason(ctx, src, own_branch):
+    """Why this commit must not be forward-ported again, or None. Ports, integrate, converge and promote merges are never sources."""
+    for sha, msg in [(src.sha, src.msg)] + src.range_msgs:
+        t = parse_trailers(msg)
+        if SHA_RE.fullmatch(t.get("Source", "")):
+            return "LOOP_PREVENTED", f"{sha[:12]} carries Release-Line-Source {t['Source'][:12]}: it is itself a port or equivalence record"
+    if src.merge:
+        # Only registered branches count: an unregistered default branch (main) holding the second parent says nothing about integration work.
+        others = [x["integration_branch"] for x in ctx.rl["lines"]] + sorted({x["publication_base"]["branch"] for x in ctx.rl["lines"]})
+        for b in others:
+            ref = branch_ref(ctx.clone, b)
+            if b != own_branch and ref and is_ancestor(ctx.clone, src.tip, ref) and not is_ancestor(ctx.clone, src.sha, ref):
+                return "INTEGRATION_MERGE", f"second parent is already on {b} without this merge: an integrate, converge or promote merge, not a fix"
+    return None
+
+
+def net_patch_id(clone, src):
+    rc, diff = git(clone, "diff", "--no-ext-diff", "--no-textconv", src.net_base, src.sha)
+    toks = git(clone, "patch-id", "--stable", stdin=diff)[1].split() if rc == 0 and diff.strip() else []
+    return toks[0] if toks else None
+
+
+def patch_equivalent(clone, src, pid, tsha):
+    """A commit on the target since the merge base whose own patch-id equals the source's net patch-id."""
+    rc, mb = git(clone, "merge-base", src.sha, tsha)
+    if rc != 0 or not pid:
+        return None
+    rc, log = git(clone, "log", "-p", "--no-ext-diff", "--no-textconv", "--no-merges", "-n", "1000", f"{mb.strip()}..{tsha}")
+    for row in (git(clone, "patch-id", "--stable", stdin=log)[1].splitlines() if rc == 0 else []):
+        got, _, commit = row.partition(" ")
+        if got == pid:
+            return commit.strip()
+    return None
+
+
+def predict_port(clone, src, tsha):
+    """Replay the source's net change on the target without a working tree: ('clean', tree) or ('conflict', paths)."""
+    rc, out = git(clone, "merge-tree", "--write-tree", "--name-only", f"--merge-base={src.net_base}", tsha, src.sha)
+    rows = out.splitlines()
+    if rc == 0 and rows and SHA_RE.fullmatch(rows[0]):
+        return "clean", rows[0]
+    if rc == 1:
+        paths = []
+        for row in rows[1:]:
+            if not row:
+                break
+            paths.append(row)
+        return "conflict", paths
+    raise Refusal("MERGE_TREE_FAILED", "git merge-tree could not evaluate the port")
+
+
+def port_message(src, ln, label, clone):
+    rows = [r for r in src.msg.strip().splitlines()]
+    if src.merge:  # GitHub puts the PR title right after the generated subject
+        title = next((r for r in rows[1:] if r.strip()), rows[0] if rows else src.sha[:12])
+        head = f"{title} (forward-port to {ln['id']})"
+    else:
+        head = "\n".join(rows) if rows else src.sha[:12]
+    reason = f"maintenance change {src.sha[:12]} from {label} applies to {ln['id']}"
+    return f"{head}\n\n(cherry picked from commit {src.sha})\n\n{trailers('forward-port', label, ln['id'], src.sha, reason)}"
+
+
+def commit_tree(clone, tree, parents, message, author_of=None):
+    env = None
+    if author_of:
+        rc, out = git(clone, "log", "-1", "--format=%an%x1f%ae%x1f%aI", author_of)
+        name, _, rest = out.strip().partition("\x1f")
+        email, _, date = rest.partition("\x1f")
+        if rc == 0 and name and email:
+            env = {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email, "GIT_AUTHOR_DATE": date}
+    argv = ["commit-tree", tree]
+    for p in parents:
+        argv += ["-p", p]
+    rc, out = git(clone, *argv, "-F", "-", env=env, stdin=message)
+    if rc != 0 or not SHA_RE.fullmatch(out.strip()):
+        raise Refusal("COMMIT_FAILED", "git commit-tree failed (is a committer identity configured?)")
+    return out.strip()
+
+
+def open_pr(ctx, head, base):
+    try:
+        return find_prs(ctx.repo, head, base)[0]
+    except Refusal:
+        if ctx.execute:
+            raise
+        ctx.gh_ok = False
+        return None
+
+
+def refresh_head(ctx, head, remote, tsha, branch, out):
+    """A port head behind its target is brought up to date by merging the target into it: a fast-forward push, never a force."""
+    clone = ctx.clone
+    if commit_of(clone, remote) is None:
+        raise Refusal("CONFLICT_EXISTING", f"{head} is at {remote}, which is not in the fetched clone")
+    if is_ancestor(clone, tsha, remote):
+        return remote
+    out["head_stale"] = True
+    if not ctx.execute:
+        return remote
+    rc, o = git(clone, "merge-tree", "--write-tree", remote, tsha)
+    if rc != 0:
+        raise Refusal("STALE_HEAD_CONFLICT", f"{head} cannot be updated from {branch} without a conflict; resolve by hand")
+    new = commit_tree(clone, o.split()[0], [remote, tsha], f"Merge {branch} into {head}\n")
+    if not push_new_ref(clone, new, f"refs/heads/{head}"):
+        raise Refusal("CONFLICT_EXISTING", f"{head} does not show {new} on origin after the update")
+    out["head_refreshed"] = True
+    return new
+
+
+def fp_target(ctx, src, ln, label, pid):
+    """Account for one target line; returns {line, branch, key, head, state, code, ...}. state: forward-port|equivalent|not-applicable|pending|conflict."""
+    clone, branch, lid = ctx.clone, ln["integration_branch"], ln["id"]
+    head = f"fwdport/{lid}/{src.sha[:12]}"
+    out = {"line": lid, "branch": branch, "key": f"fp:{ctx.repo}:{src.sha}:{lid}", "head": head}
+
+    def done(state, code, **ev):
+        out.update(state=state, code=code, **ev)
+        return out
+
+    tref = branch_ref(clone, branch)
+    if tref is None:
+        return done("conflict", "NO_BRANCH")
+    tsha = commit_of(clone, tref)
+    if any(p and is_ancestor(clone, p, tsha) for p in (src.sha, src.tip)):
+        return done("equivalent", "CONTAINED")
+    hit = trailer_hit(clone, tsha, src.sha)
+    if hit:
+        return done(hit["Kind"], PORT_KINDS[hit["Kind"]], commit=hit["commit"], reason=hit.get("Reason"))
+    matched = patch_equivalent(clone, src, pid, tsha)
+    if matched:
+        return done("equivalent", "EQUIVALENT_PATCH", matched_commit=matched)
+    pr = open_pr(ctx, head, branch)
+    remote = ls_remote(clone, f"refs/heads/{head}")
+    if pr is not None:
+        if remote:
+            refresh_head(ctx, head, remote, tsha, branch, out)
+        return done("pending", "PR_OPEN", pr=pr["number"], url=pr.get("url"), head_sha=remote)
+    if remote is not None:  # the head was pushed but the PR is missing (an interrupted run): reuse it, never rebuild
+        if commit_of(clone, remote) is None or not trailer_hit(clone, remote, src.sha):
+            raise Refusal("CONFLICT_EXISTING", f"{head} exists at {remote} but does not carry this source's port commit")
+        refresh_head(ctx, head, remote, tsha, branch, out)
+        if not ctx.execute:
+            return done("pending", "HEAD_PUSHED_NO_PR", head_sha=remote)
+        return fp_open_pr(ctx, src, ln, label, out, done, remote)
+    if not ctx.predict:
+        return done("pending", "NOT_STARTED")
+    verdict, data = predict_port(clone, src, tsha)
+    if verdict == "conflict":
+        return done("conflict", "BLOCKED_CONFLICT", paths=data[:50])
+    if data == git(clone, "rev-parse", "--verify", "-q", tsha + "^{tree}")[1].strip():
+        return done("equivalent", "EQUIVALENT_CONTENT")
+    if not ctx.execute:
+        return done("pending", "TO_PORT", would_push=f"refs/heads/{head}")
+    new = commit_tree(clone, data, [tsha], port_message(src, ln, label, clone), author_of=src.sha)
+    if not push_new_ref(clone, new, f"refs/heads/{head}"):
+        raise Refusal("CONFLICT_EXISTING", f"{head} does not show {new} on origin after the push")
+    return fp_open_pr(ctx, src, ln, label, out, done, new)
+
+
+def fp_open_pr(ctx, src, ln, label, out, done, head_sha):
+    body = (f"Forward-port of {src.sha[:12]} from {label} to {ln['id']} (merge commit through the normal gate; never squash or rebase).\n\n"
+            + trailers("forward-port", label, ln["id"], src.sha, f"maintenance change {src.sha[:12]} from {label} applies to {ln['id']}"))
+    pr = ensure_pr(ctx.res, ctx.args, out["head"], ln["integration_branch"], f"Forward-port {src.sha[:12]} to {ln['id']}", body,
+                   step=f"pr:{ln['id']}")
+    return done("pending", "PR_OPEN", pr=pr["number"], url=pr.get("url"), head_sha=head_sha)
+
+
+def fp_source(ctx, rev, hint):
+    res, clone = ctx.res, ctx.clone
+    src = load_source(clone, rev)
+    s12 = src.sha[:12]
+    label, floor, own_branch, base_mode = source_origin(ctx, src, hint)
+    pid = net_patch_id(clone, src)
+    evidence = {"sha": src.sha, "line": label, "branch": own_branch, "merge": src.merge, "patch_id": pid, "pr": ctx.pr,
+                "range": f"{src.net_base}..{src.tip}" if src.merge else None, "range_commits": src.range_commits[:50]}
+    res.step(f"source:{s12}", "SOURCE", evidence)
+    skip = loop_reason(ctx, src, own_branch)
+    if skip:
+        res.step(f"source:{s12}", skip[0], {"detail": skip[1]})
+        return []
+    targets, excluded = [], []
+    for ln in sorted(ctx.rl["lines"], key=lambda x: ctx.keys[x["id"]]):
+        k = ctx.keys[ln["id"]]
+        if not (k >= floor if base_mode else k > floor):
+            continue
+        why = ("PUBLICATION_BASE" if ln["integration_branch"] in ctx.bases else "EOL" if ln["support"] == "eol"
+               else f"STATE_{ln['state'].upper()}" if ln.get("state", "active") != "active" else None)
+        (excluded.append({"line": ln["id"], "reason": why}) if why else targets.append(ln))
+    if excluded:
+        res.step(f"excluded:{s12}", "EXCLUDED", {"lines": excluded})
+    results = []
+    for ln in targets:
+        try:
+            out = fp_target(ctx, src, ln, label, pid)
+        except Refusal as e:
+            if e.code == "GH_UNAVAILABLE":
+                raise
+            out = {"line": ln["id"], "branch": ln["integration_branch"], "key": f"fp:{ctx.repo}:{src.sha}:{ln['id']}",
+                   "state": "conflict", "code": e.code, "detail": e.detail}
+        res.step(f"target:{s12}:{ln['id']}", out["state"], out)
+        if ctx.journal:
+            ctx.journal.append(key=out["key"], state=out["state"], code=out["code"])
+        results.append(out)
+    complete = all(r["state"] in TERMINAL for r in results)
+    res.step(f"accounting:{s12}", "COMPLETE" if complete else "INCOMPLETE", {
+        "schema": 1, "repo": ctx.repo, "source": {"merge_sha": src.sha, "pr": ctx.pr, "line": label, "patch_id": pid},
+        "targets": [{k: r.get(k) for k in ("line", "branch", "key", "state", "code")} for r in results],
+        "excluded": excluded, "complete": complete})
+    return results
+
+
+def forward_port(args, res):
+    if not args.clone:
+        raise SystemExit(usage_error(f"forward-port {args.cmd} needs --clone"))
+    require_clone(args.clone)
+    policy, _ = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
+    _, entry = check_policy(policy, args.repo)
+    require_ready(entry)
+    rl = entry["release_lines"]
+    require_git_version(args.clone, (2, 40))  # merge-tree --write-tree --merge-base builds the port without touching the worktree
+    fetch(args.clone)
+    revs, hint = fp_revs(args, res)
+    ctx = types.SimpleNamespace(
+        res=res, args=args, clone=args.clone, repo=args.repo, rl=rl, keys=line_keys(rl), gh_ok=True, journal=None, pr=args.pr,
+        bases={x["publication_base"]["branch"] for x in rl["lines"]} | {"main", "master"},
+        execute=args.cmd == "run" and args.execute, predict=args.cmd != "status")
+    if len(revs) == 1:
+        res.env["idempotency_key"] = f"fp:{args.repo}:{commit_of(args.clone, revs[0]) or revs[0]}:*"
+    results = []
+    journal = Journal(args) if ctx.execute else None
+    try:
+        ctx.journal = journal.__enter__() if journal else None
+        for rev in revs:
+            results += fp_source(ctx, rev, hint)
+    finally:
+        if journal:
+            journal.__exit__()
+    if not ctx.gh_ok:
+        res.step("pr_lookup", "NOT_RUN", {"reason": "gh unavailable; open pull requests could not be checked"})
+    pending = [r for r in results if r["state"] == "pending"]
+    if any(r["state"] == "conflict" for r in results):
+        res.status, res.next_action = "BLOCKED", "resolve the conflicting targets by hand (each target is independent; the others proceed)"
+    elif not ctx.gh_ok:
+        res.status, res.next_action = "NOT_RUN", "gh was unavailable, so pull request state is unknown; restore gh and re-run"
+    elif pending:
+        res.status = "DEFERRED" if ctx.execute or args.cmd == "status" else "NOT_RUN"
+        res.next_action = ("merge the forward-port PRs through the normal gate, then re-run to account for them" if ctx.execute or args.cmd == "status"
+                           else "re-run `forward-port run --execute` to push the heads and open the PRs")
+
+
 # ---------------------------------------------------------------- envelope + CLI
 
 class Result:
@@ -1089,13 +1522,21 @@ def build_parser():
     ti.add_argument("--from", dest="from_line", required=True)
     ti.add_argument("--into", required=True)
     tr.add_parser("converge", parents=[common]).add_argument("--line", required=True)
+    fp = top.add_parser("forward-port").add_subparsers(dest="cmd", required=True)
+    for name in ("plan", "run", "status"):
+        sub = fp.add_parser(name, parents=[common])
+        grp = sub.add_mutually_exclusive_group(required=True)
+        grp.add_argument("--merge", help="a landed fix: a GitHub merge commit (its second-parent range is inspected) or a plain commit")
+        grp.add_argument("--pr", type=int, help="a merged PR number (resolved through gh)")
+        grp.add_argument("--range", help="A..B: every first-parent commit in the range is a source")
     return p
 
 
 HANDLERS = {("registry", "validate"): registry_validate, ("registry", "show"): registry_show, ("registry", "propose"): propose,
             ("audit", "observe"): observe, ("audit", "import"): audit_import, ("route", None): route,
             ("successor", "ensure"): successor_ensure, ("guard", None): guard, ("train", "integrate"): train_integrate,
-            ("train", "converge"): train_converge}
+            ("train", "converge"): train_converge,
+            ("forward-port", "plan"): forward_port, ("forward-port", "run"): forward_port, ("forward-port", "status"): forward_port}
 
 
 def main(argv=None):

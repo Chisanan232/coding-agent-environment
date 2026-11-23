@@ -1,0 +1,66 @@
+# TEMPLATE, not an active workflow: copy to .github/workflows/release-line.yml in the product repository to use it.
+#
+# Proposes forward-port pull requests for maintenance fixes that land on a release line and posts the accounting.
+# It never publishes, tags or merges: ports are merged by the normal gate, promotion and publication stay under a recorded GO.
+# It also does not dispatch other workflows. The owner policy mirror comes from the Actions variable RELEASE_LINES_JSON
+# (a copy of the release-line registry installed by the owner); without it the job reports NOT_RUN and does nothing.
+name: release-line-forward-port
+
+on:
+  pull_request:
+    types: [closed]
+    branches: ["integration/**", "maintenance/**"]
+
+permissions:
+  contents: write        # pushes new fwdport/* heads only (never force, never a protected branch)
+  pull-requests: write   # opens the forward-port PRs and posts the accounting comment
+
+concurrency:
+  group: release-line-forward-port-${{ github.event.pull_request.base.ref }}
+  cancel-in-progress: false
+
+jobs:
+  forward-port:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_LINES_JSON: ${{ vars.RELEASE_LINES_JSON }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check the owner mirror
+        id: mirror
+        run: |
+          if [ -z "$RELEASE_LINES_JSON" ]; then
+            echo "NOT_RUN: Actions variable RELEASE_LINES_JSON is not set; no forward-port was attempted." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          umask 077
+          mkdir -p "$RUNNER_TEMP/owner"
+          printf '%s' "$RELEASE_LINES_JSON" > "$RUNNER_TEMP/owner/version-branches.json"
+          echo "present=true" >> "$GITHUB_OUTPUT"
+      - name: Propose forward-port PRs
+        if: steps.mirror.outputs.present == 'true'
+        run: |
+          git config user.name "release-line[bot]"
+          git config user.email "release-line@users.noreply.github.com"
+          # TOOL: required path to scripts/release-line.py of the maintained coding-agent-environment checkout (fetched by pinned SHA, outside the PR checkout).
+          # Note: PRs opened with GITHUB_TOKEN do not trigger checks, and pushes touching .github/workflows are rejected; use an app token if the target requires checks.
+          : "${TOOL:?set TOOL to a pinned, out-of-tree release-line.py; never run the tool from the PR checkout with this token}"
+          python3 -I "$TOOL" forward-port run --execute --pr "$PR_NUMBER" \
+            --repo "$REPO" --clone "$GITHUB_WORKSPACE" --policy "$RUNNER_TEMP/owner/version-branches.json" \
+            --state-dir "$RUNNER_TEMP/release-line-state" > "$RUNNER_TEMP/accounting.json" && rc=0 || rc=$?
+          {
+            echo "### Forward-port accounting for PR #$PR_NUMBER"
+            echo '```json'
+            cat "$RUNNER_TEMP/accounting.json"
+            echo '```'
+          } | tee "$RUNNER_TEMP/accounting.md" >> "$GITHUB_STEP_SUMMARY"
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$RUNNER_TEMP/accounting.md"
+          # Exit 0 covers PASS, NOT_RUN and DEFERRED; a refusal (1), usage error (2), invalid config (3) or crash fails the job after the comment is posted.
+          if [ "$rc" -ne 0 ]; then exit "$rc"; fi

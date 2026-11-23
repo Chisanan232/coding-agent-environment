@@ -326,6 +326,14 @@ class TrainTests(TrainBase):
         self.assertEqual(out["status"], "BLOCKED")
         self.assertTrue(any(s["step"] == "route" and s["state"] == "NEEDS_SUCCESSOR" for s in out["steps"]))
 
+    def test_branch_name_regex_agrees_with_git_check_ref_format(self):
+        spec = importlib.util.spec_from_file_location("rlmod2", ROOT / "scripts/release-line.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for name in ("integration/v0.4.0", "lineint/0.3.0/v0.5.0", "a..b", "a/", "a.lock", "a/b.lock", "a//b", "a/.b", "a.", "-x", "a b", "a@{b"):
+            ok = subprocess.run([REAL_GIT, "check-ref-format", "--branch", name], capture_output=True).returncode == 0
+            self.assertEqual(bool(mod.BRANCH_NAME_RE.fullmatch(name)), ok, name)
+
     def test_unreachable_origin_is_refused_for_guard_and_ensure(self):
         self.install(self.v0_only_policy())
         self.w("remote", "set-url", "origin", str(pathlib.Path(self.tmp.name) / "gone.git"))
