@@ -1,6 +1,6 @@
 # Release lines
 
-Status: slices 1 to 3 of the SPE-180 design (SPE-181a registry and routing, SPE-182 successor train, SPE-183 forward-port). This page documents what `scripts/release-line.py` implements today and lists
+Status: slices 1 to 3 and 6 of the SPE-180 design (SPE-181a registry and routing, SPE-182 successor train, SPE-183 forward-port, SPE-181b skill). This page documents what `scripts/release-line.py` implements today and lists
 later slices as planned. Nothing here changes the merge gate.
 
 ## Why
@@ -225,12 +225,12 @@ publication base, checks hosted CI, then with `--execute` runs `gh pr merge N --
 `merge-tree` result for `final^1` and the candidate (`PROMOTION_ASSERTION_FAILED` is FAIL). A rerun after the merge reports `ALREADY_PROMOTED` and merges nothing.
 Verification is `CARRIED_OVER` when the final tree equals the candidate tree, otherwise `REQUIRED`.
 
-Hosted CI: `CI_PASS` proceeds, a failing check is `CI_FAILED` (FAIL, never bypassed), pending checks are `DEFERRED`. When no hosted check ran (outage, quota, none
+Hosted CI: `CI_PASS` needs every check required by the owner-pinned protection snapshot (`required_status_checks` contexts and checks) to be `SUCCESS` in the PR's rollup, or, when none are required, at least one `SUCCESS`; an empty rollup, an all-`SKIPPED`/`NEUTRAL` rollup or a missing required check is `NOT_RUN`. A forged commit status with a required name is a residual risk the tool cannot see. `CI_PASS` proceeds, a failing check is `CI_FAILED` (FAIL, never bypassed), pending checks are `DEFERRED`. When no hosted check ran (outage, quota, none
 configured) the step is recorded `NOT_RUN` and promotion needs a local-equivalent record that passes the gate's own `local_first_basis` (private repo, the
 unedited and unminimized `OWNER-MERGE-LOCAL-CI` comment of the authenticated user on the promotion PR, strict `parse_local_record` schema, repo/PR/base/base
 commit/head/context match, commands and `env` equal to the owner's local-first entry, not finishing after it was posted or after now+60s, within `max_age_hours`;
 as in the gate, an unexplained empty rollup also needs a skip directive on the head commit and no Actions run). The posted record must equal the private recorder
-evidence, which is read only from the fixed evidence directories and re-verified with `verify_standing_local_record` (owner, mode, single link, log digests); there is no
+evidence, which the owner must also pin: `release-verification.json` `records.<repo>.<PR head sha>` holds its sha256 (`OWNER_PIN_MISSING` otherwise), because a file in the evidence directory is something the agent can write. The evidence is read only from the fixed evidence directories and re-verified with `verify_standing_local_record` (owner, mode, single link, log digests); there is no
 caller-chosen evidence directory (`LOCAL_EVIDENCE_REQUIRED` otherwise, with the gate's reason codes). No workflow is dispatched or rerun.
 
 `verify`: `CARRIED_OVER` when trees match; otherwise it needs `--execute` and runs the owner's local-first checks in a detached worktree at the final SHA
@@ -249,6 +249,21 @@ clock; `SOURCE_DATE_EPOCH` only affects reproducible output stamps. An annotated
 when the owner pins its sha256 under `snapshots.<repo>.<branch>` in `~/.config/coding-agent-environment/local/release-protection.json` (`SNAPSHOT_UNPINNED`,
 `NO_SNAPSHOT`, `SNAPSHOT_TAMPERED`). `protection verify` reports `PROTECTION_DRIFT` (FAIL) with the owner-run `branch-protection-rollout.py` rollback; `promote --execute`
 refuses without a pinned snapshot and compares before and after the merge. The tool never changes protection.
+
+Further guards (SPE-184a review): every release command ties the clone to `--repo` (`ORIGIN_MISMATCH`): all fetch and push URLs of `origin` must be github.com/`<repo>` and are parsed, not pattern-matched: `https://` or `ssh://` with the host exactly `github.com` (lowercase, no port,
+no query or fragment, userinfo limited to `[A-Za-z0-9._~%!$&'()*+,;=:-]`, no whitespace, control character or backslash anywhere), or the scp form `git@github.com:owner/repo` (the colon is required: `git@github.com/o/r` is a local path to git). Anything else, including `ext::` URLs, is refused before git runs; a local path is accepted only the owner listed for the repo in `~/.config/coding-agent-environment/local/release-origins.json` (`{"schema":1,"origins":{"<repo>":["/abs/path"]}}`, trust-anchor
+reader; that file is also how the test harness admits its bare origin, there is no flag or environment override). The check runs in every handler that uses `--clone` against origin: `route`, `audit observe`, `successor ensure`, `guard`, `train integrate`, `train converge`, `forward-port`, and all `release` commands (`registry propose` and `audit import` never touch a clone). `git` is also run with `GIT_CONFIG_NOSYSTEM=1` and defense-in-depth `-c` overrides (proxy, ssh command, credential helpers, askpass, `ext` transport, TLS verification, CA file and path, extra headers, resolve overrides, upload/receive-pack programs, gpg program and signing, `log.showSignature`, `merge.renormalize`). The clone's own config is not trusted at all: `require_clone` reads `git config --local --list -z` first (before any other git call, system and global config neutralised) and refuses with `CLONE_CONFIG_HOSTILE` any key outside a short allowlist: `core.repositoryformatversion|filemode|bare|logallrefupdates|ignorecase|precomposeunicode|symlinks`, `remote.<name>.url|fetch|pushurl`, `branch.<name>.remote|merge|rebase|vscode-merge-base|github-pr-owner-number`, and `user.name|email`. Everything else (hooks, `core.pager|editor|fsmonitor|sshCommand|askPass`, `merge.*.driver`, `diff.*`, `filter.*`, gpg and signing keys, every `http.*`, `credential.*`, `alias.*`, `url.*.insteadOf`, `include*`, `extensions.*`, `gc.*`, `pull.*`) is refused, so a clone with git-lfs filters or personal settings must be cleaned or a fresh clone used. Every remote's `url` and `pushurl`, not only origin's, must pass the same origin check. The user's global `~/.gitconfig` is intentionally trusted (it carries the committer identity, and is owner-controlled, unlike the clone). Every git call runs with `--no-replace-objects` and `GIT_NO_REPLACE_OBJECTS=1`, and a clone that carries any `refs/replace/*` or an `info/grafts` file is refused (`CLONE_CONFIG_HOSTILE`), so ancestry and promotion-merge checks cannot be forged from the clone. The child environment of every git/gh call is built from an allowlist (`PATH`, `HOME`, `LANG`, `LC_*`, `TMPDIR`, `TZ`, `SSH_AUTH_SOCK`, `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR`) plus the tool's forced values (`GIT_TERMINAL_PROMPT=0`, `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_NO_REPLACE_OBJECTS=1`); every other inherited `GIT_*` variable (`GIT_SSH_COMMAND`, `GIT_PROXY_COMMAND`, `GIT_EXEC_PATH`, `GIT_EXTERNAL_DIFF`, `GIT_DIR`, `GIT_ASKPASS`, `GIT_CONFIG_COUNT`, ...) and `SSH_ASKPASS` are dropped, so committer identity must come from the global git config. The only extension point is the owner file `release-line-test-env.json` (`{"schema":1,"pass":["NAME", ...]}`, trust-anchor reader), which the test harness uses for its fake gh and git wrappers. `final-tag` requires GitHub to answer the promotion-PR query (`GH_UNAVAILABLE` otherwise), like `verify`.  the tool's `credential.helper` reset means https pushes need an ssh origin or credentials supplied outside git config. Predecessor and same-major final tags are confirmed with `ls-remote` on origin; a tag that exists only
+in the clone is not a shipped version. A rerun of `promote` after the merge and `final-tag` recompute that accounting against the promotion's first parent from git and GitHub facts, so `BASE_MOVED_UNACCOUNTED` stays FAIL until the new changes are accounted (the journal is never the authority). After the merge the tool asserts `final^1` equals the evaluated base tip; if the base moved it re-runs the forward-port accounting against `final^1` and
+reports `BASE_MOVED_UNACCOUNTED` (FAIL, the merge has happened) when new changes are unaccounted. If the after-merge protection comparison cannot run, promote ends `FAIL` with "verify protection manually".
+Limits: protection checks cover classic branch protection only (not rulesets) and compare only before and after the promote call. `release verify` is bound to the GO candidate (the promotion merge of that
+SHA and the PR reporting it) and refuses to overwrite a record whose digest the owner has pinned (`VERIFY_RECORD_PINNED`). Candidate and final tags the tool pushes are annotated (a local lightweight tag is replaced; a lightweight tag already on origin at the commit is `CONFLICT_EXISTING`, never reused). Residual risk: tags created by others (the predecessor and same-major final tags read from origin, which the train and promote preconditions consult) are accepted as lightweight or annotated, since pre-existing releases may predate this tool; `--n` must be an integer >= 1 and `--sha` a commit id.
+
+## Skill (SPE-181b)
+
+The `release-line` skill (`.claude/skills/release-line/`) wraps this CLI for both hosts. It is listed in `codex/shared-skills.json`;
+`scripts/profile-install.sh --claude-skills` installs it to `~/.claude/skills/release-line/` and `--global` to `~/.codex/skills/release-line/`,
+and `--check` reports drift. It calls the CLI by absolute path from the maintained checkout and restates the safety rules: no force-push, no
+`gh workflow run`, no admin-merge outside the owner-merge exception, and tags, promotion or publication only under a recorded GO.
 
 ## Release: build, notes, publish, run (SPE-184b)
 
@@ -294,4 +309,4 @@ its code and the run's status BLOCKED or FAIL. Without `--execute` nothing is ch
 
 ## Planned (not implemented)
 
-Later slices of SPE-180: skill packaging and install (SPE-181b); acceptance from installed entry points (SPE-185).
+Later slices of SPE-180: acceptance from installed entry points (SPE-185).

@@ -57,7 +57,7 @@ Before tagging a release version. After all PRs for the release are merged.
 This checklist produces `RELEASE_CHECKLIST_PASS` only. Report it separately from `ENGINEERING_COMPLETE`,
 `FUNCTIONAL_QA_PASS`, `SECURITY_QA_PASS`, `INDEPENDENT_QA_SIGNED_OFF`, `READY_FOR_RELEASE`, `RELEASE_APPROVED` and
 `RELEASED`, each with its own evidence and exact SHA (`docs/ENGINEERING-POLICY.md`, section 8). A skipped or
-unavailable check is not PASS. Never tag, publish or deploy from this skill.
+unavailable check is not PASS. Never tag, publish or deploy from this skill; a multi-line product's candidate, promotion and final tags go through `release-line` under a recorded GO.
 
 ## Output
 

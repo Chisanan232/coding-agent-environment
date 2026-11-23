@@ -29,17 +29,21 @@ def stamp(delta=0):
     """Real wall-clock stamp: the tool's freshness decisions ignore SOURCE_DATE_EPOCH, which the harness pins to 2026-01-01."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + delta))
 
-FAKE_GH = train.FAKE_GH
+FAKE_GH = train.FAKE_GH.replace('if a[:2] == ["pr", "list"]:', 'if a[:2] == ["pr", "list"] and st.get("list_fail"):\n    sys.exit(1)\nelif a[:2] == ["pr", "list"]:', 1)
 for old, new in (
     ('    work = S + ".merge"\n', '''    mh = opt("--match-head-commit")
     if st.get("merge_fail"):
         sys.exit(1)
     if mh and subprocess.run(["{git}", "-C", st["bare"], "rev-parse", "refs/heads/" + pr["headRefName"]], capture_output=True, text=True).stdout.strip() != mh:
         sys.exit(1)
+    if st.get("pre_merge"):
+        subprocess.run([st["pre_merge"]], check=True)
     work = S + ".merge"
 '''),
     ('    subprocess.run(["rm", "-rf", work])\n    pr["state"] = "MERGED"', '''    pr["mergeOid"] = g("rev-parse", "HEAD").stdout.decode().strip()
     subprocess.run(["rm", "-rf", work])
+    if st.get("break_api_on_merge"):
+        st["api_broken"] = True
     if st.get("drift_on_merge"):
         st["protection"]["required_status_checks"] = {{"strict": False, "contexts": []}}
     pr["state"] = "MERGED"'''),
@@ -72,7 +76,7 @@ elif a[0] == "api" and "/compare/" in a[1]:
     b, _, h = a[1].split("/compare/")[1].partition("...")
     print(subprocess.run(["{git}", "-C", st["bare"], "merge-base", "refs/heads/" + b, h], capture_output=True, text=True).stdout.strip())
 elif a[0] == "api":
-    if "protection" not in st:
+    if "protection" not in st or st.get("api_broken"):
         sys.exit(1)
     print(json.dumps(st["protection"]))
     sys.exit(1 if st["protection"].get("message") else 0)
@@ -108,7 +112,9 @@ class Rel(train.TrainBase):
         rec = json.loads((self.evidence / omg.local_ci_evidence_filename(tag, final)).read_text())
         digest = digest or hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         pins = self.local / "release-verification.json"
-        pins.write_text(json.dumps({"schema": 1, "records": {REPO: {final: digest}}}))
+        cur = json.loads(pins.read_text()) if pins.exists() else {"schema": 1, "records": {REPO: {}}}
+        cur["records"][REPO][final] = digest
+        pins.write_text(json.dumps(cur))
         os.chmod(pins, 0o600)
 
     def pin_protection(self, branch="main"):
@@ -274,6 +280,26 @@ class CandidateTag(Rel):
         self.assertIsNone(self.remote("refs/tags/v0.3.0-rc.2"))
         self.assertNotEqual(tip, self.sha("v0.3.0-rc.1"))
 
+    def test_local_lightweight_tag_is_replaced_by_an_annotated_one(self):
+        tip = self.commit("integration/v0.x", "late.txt")
+        self.go(tag="v0.3.0-rc.2", sha=tip)
+        self.w("tag", "v0.3.0-rc.2", tip)  # lightweight, local only
+        rc, out, _ = self.rel("candidate-tag", execute=True)
+        self.assertEqual((rc, self.step(out, "tag")["state"]), (0, "CREATED"), out)
+        self.assertEqual(self.w("cat-file", "-t", "refs/tags/v0.3.0-rc.2", cwd=self.bare), "tag")
+
+    def test_lightweight_tag_already_on_origin_is_not_reused(self):
+        self.go()  # rc.1 exists on origin as a lightweight tag at the approved commit
+        for execute in (False, True):
+            rc, out, _ = self.rel("candidate-tag", execute=execute)
+            self.assertEqual((rc, self.refused(out)), (1, "CONFLICT_EXISTING"))
+            self.assertIn("lightweight", self.step(out, "refused")["evidence"]["detail"])
+
+    def test_n_and_sha_arguments_are_validated(self):
+        self.go()
+        for bad in (("--n", "0"), ("--n", "-1"), ("--n", "x"), ("--sha", "--upload-pack=evil"), ("--sha", ".hidden")):
+            self.assertEqual(self.rel("candidate-tag", *bad)[0], 2, bad)
+
     def test_pre_authorized_repo_needs_no_go_and_numbers_the_next_candidate(self):
         p = self.v0_only_policy()
         base.entry(p)["release_lines"]["milestone_tags"] = "pre-authorized"
@@ -343,6 +369,16 @@ class Promote(Rel):
         self.assertEqual(self.refused(self.rel("promote")[1]), "GO_SCOPE")
         self.assertIsNone(self.remote("refs/tags/v0.3.0"))
 
+    def test_final_tag_refuses_when_github_cannot_answer(self):
+        self.go()
+        self.assertEqual(self.promote_ok()[1]["status"], "PASS")
+        self.gh_update(list_fail=True)
+        rc, out, _ = self.rel("final-tag", execute=True)
+        self.assertEqual((rc, self.refused(out)), (1, "GH_UNAVAILABLE"))
+        self.assertIsNone(self.remote("refs/tags/v0.3.0"))
+        self.gh_update(list_fail=False)
+        self.assertEqual(self.step(self.rel("final-tag", execute=True)[1], "tag")["state"], "CREATED")
+
     def test_final_tag_conflict_when_tag_exists_elsewhere(self):
         self.go()
         self.assertEqual(self.promote_ok()[1]["status"], "PASS")
@@ -364,9 +400,18 @@ class Promote(Rel):
             # failing, other command than the owner's, stale, forged log digest, writable by others, finishing in the future, other env or
             # base commit, never posted, posted then edited, posted by another user, or posted record differing from the private evidence
             self.write_evidence(cand, **bad)
+            self.pin_verification(cand)  # pinned, so the refusal below is for the stated defect
             self.assertEqual(self.refused(self.promote_ok()[1]), "LOCAL_EVIDENCE_REQUIRED", bad)
         self.assertEqual(self.merges(), [])
         self.write_evidence(cand)
+        (self.local / "release-verification.json").unlink()  # a perfect record the agent could have written is still not enough
+        out = self.promote_ok()[1]
+        self.assertEqual(self.refused(out), "LOCAL_EVIDENCE_REQUIRED")
+        self.assertIn("OWNER_PIN_MISSING", self.step(out, "refused")["evidence"]["detail"])
+        self.pin_verification(cand, digest="0" * 64)
+        self.assertEqual(self.refused(self.promote_ok()[1]), "LOCAL_EVIDENCE_REQUIRED")  # a pin for another record does not match
+        self.assertEqual(self.merges(), [])
+        self.pin_verification(cand)
         rc, out, _ = self.promote_ok()
         self.assertEqual((rc, out["status"]), (0, "PASS"), out)
         self.assertEqual(self.step(out, "hosted_ci")["state"], "NOT_RUN")
@@ -379,13 +424,80 @@ class Promote(Rel):
         self.gh_update(checks=[])
         # a record that is stale on the real clock stays stale even when SOURCE_DATE_EPOCH makes it look fresh
         self.write_evidence(cand, finished="2026-01-01T00:00:00Z")
+        self.pin_verification(cand)
         self.env["SOURCE_DATE_EPOCH"] = "1767225600"
         self.assertEqual(self.refused(self.promote_ok()[1]), "LOCAL_EVIDENCE_REQUIRED")
         # a record that is fresh on the real clock stays fresh when SOURCE_DATE_EPOCH claims the year 2020
         self.write_evidence(cand)
+        self.pin_verification(cand)
         self.env["SOURCE_DATE_EPOCH"] = "1577836800"
         rc, out, _ = self.promote_ok()
         self.assertEqual((rc, out["status"], self.step(out, "local_equivalent")["state"]), (0, "PASS", "PASS"), out)
+
+    def test_required_checks_from_the_pinned_snapshot_must_succeed(self):
+        self.go()
+        prot = {"required_status_checks": {"strict": True, "contexts": ["ci"]}, "enforce_admins": {"enabled": True}}
+        self.gh_update(protection=prot)
+        self.pin_protection()
+        for rollup in ([{"name": "other", "conclusion": "SUCCESS"}], [{"name": "ci", "conclusion": "SKIPPED"}], [{"name": "ci", "conclusion": "NEUTRAL"}], []):
+            self.gh_update(checks=rollup)
+            out = self.promote_ok()[1]
+            self.assertEqual((self.step(out, "hosted_ci")["state"], self.refused(out)), ("NOT_RUN", "LOCAL_EVIDENCE_REQUIRED"), rollup)
+        self.assertEqual(self.merges(), [])
+        self.gh_update(checks=[{"name": "ci", "conclusion": "SUCCESS"}])
+        rc, out, _ = self.promote_ok()
+        self.assertEqual((rc, self.step(out, "hosted_ci")["state"]), (0, "CI_PASS"), out)
+        self.assertEqual(self.step(out, "hosted_ci")["evidence"]["required"], ["ci"])
+
+    def test_all_skipped_rollup_is_not_a_pass_even_with_no_required_checks(self):
+        self.go()
+        self.gh_update(checks=[{"name": "a", "conclusion": "SKIPPED"}, {"name": "b", "conclusion": "NEUTRAL"}])
+        out = self.promote_ok()[1]
+        self.assertEqual((self.step(out, "hosted_ci")["state"], self.refused(out)), ("NOT_RUN", "LOCAL_EVIDENCE_REQUIRED"))
+        self.assertEqual(self.merges(), [])
+
+    def test_unverifiable_protection_after_the_merge_is_not_a_pass(self):
+        self.go()
+        self.gh_update(break_api_on_merge=True)
+        rc, out, _ = self.promote_ok()
+        self.assertEqual((rc, out["status"]), (1, "FAIL"), out)
+        self.assertEqual(self.step(out, "protection_after")["state"], "NOT_RUN")
+        self.assertIn("manually", out["next_action"])
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_base_that_moves_before_the_merge_is_accounted_again(self):
+        self.go()
+        hook = pathlib.Path(self.tmp.name) / "move-base.sh"
+        hook.write_text(f"#!/bin/sh\nset -e\nd=$(mktemp -d)\n{REAL_GIT} clone -q {self.bare} $d/w\ncd $d/w\necho moved > moved.txt\n{REAL_GIT} add .\n"
+                        f"{REAL_GIT} commit -q -m moved\n{REAL_GIT} push -q origin HEAD:main\n")
+        hook.chmod(0o755)
+        self.gh_update(pre_merge=str(hook))
+        rc, out, env = self.promote_ok()
+        self.assertEqual((rc, out["status"], self.refused(out)), (1, "FAIL", "BASE_MOVED_UNACCOUNTED"), out)
+        self.assertEqual(self.step(out, "base_moved")["state"], "INCOMPLETE")
+        self.assertEqual(len(self.merges()), 1)  # merged, and reported as such: nothing is silently accepted
+        # sticky: a rerun recomputes from git and does not report a clean ALREADY_PROMOTED, and final-tag refuses too
+        rc, out, _ = self.promote_ok()
+        self.assertEqual((rc, out["status"], self.refused(out)), (1, "FAIL", "BASE_MOVED_UNACCOUNTED"), out)
+        self.assertEqual(self.step(out, "accounting_recheck")["state"], "INCOMPLETE")
+        self.assertEqual(self.refused(self.rel("final-tag", execute=True)[1]), "BASE_MOVED_UNACCOUNTED")
+        self.assertEqual(len(self.merges()), 1)
+        # once the moved change is accounted (reviewed not-applicable record on the line) the recheck passes
+        moved = self.w("rev-parse", "main^1", cwd=self.bare)
+        self.mark_not_applicable(moved)
+        rc, out, _ = self.promote_ok()
+        self.assertEqual((rc, out["status"], self.step(out, "accounting_recheck")["state"]), (0, "PASS", "ACCOUNTED"), out)
+        self.assertNotEqual(self.refused(self.rel("final-tag", execute=True)[1]), "BASE_MOVED_UNACCOUNTED")  # passes accounting; stops at verification
+
+    def test_local_only_tags_do_not_count_as_shipped_or_latest(self):
+        self.branch("maintenance/v0", "main")
+        self.install(self.v0_only_policy(publication_base={"branch": "maintenance/v0", "kind": "maintenance"}))
+        self.pin_protection("maintenance/v0")
+        self.w("tag", "v0.9.0", "main")  # never pushed: not on origin
+        self.go(publication_base="maintenance/v0")
+        out = self.rel("promote")[1]
+        self.assertEqual(self.step(out, "maintenance_base")["evidence"]["latest_final"], None)
+        self.assertEqual(self.step(out, "maintenance_base")["state"], "OK")
 
     def test_failing_hosted_check_refuses_and_pending_defers(self):
         self.go()
@@ -561,6 +673,220 @@ class Promote(Rel):
         self.assertEqual(self.merges(), [])
 
 
+class HardenedGit(Rel):
+    def probe(self):
+        spec = importlib.util.spec_from_file_location("rl_hardened_probe", ROOT / "scripts/release-line.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_replace_refs_cannot_forge_ancestry_or_a_promotion(self):
+        mod = self.probe()
+        root = self.w("commit-tree", "-m", "a", self.w("rev-parse", "main^{tree}"))
+        other = self.w("commit-tree", "-m", "b", self.w("rev-parse", "main^{tree}"))
+        self.assertFalse(mod.is_ancestor(self.work, root, other))
+        # forge: replace `other` by a commit whose parent is `root`
+        forged = self.w("commit-tree", "-m", "b", "-p", root, self.w("rev-parse", "main^{tree}"))
+        self.w("replace", other, forged)
+        plain = subprocess.run([REAL_GIT, "-C", str(self.work), "merge-base", "--is-ancestor", root, other], env=self.genv).returncode
+        self.assertEqual(plain, 0)  # plain git is fooled ...
+        self.assertFalse(mod.is_ancestor(self.work, root, other))  # ... the tool is not
+        # forge a promotion merge: `q` is replaced by a merge whose second parent is the approved candidate
+        cand = self.sha("v0.3.0-rc.1")
+        self.w("fetch", "-q", "origin")
+        q = self.w("commit-tree", "-m", "q", "-p", self.w("rev-parse", "origin/main"), self.w("rev-parse", "origin/main^{tree}"))
+        self.w("branch", "-f", "fq", q)
+        fake = self.w("commit-tree", "-m", "fake", "-p", self.w("rev-parse", "origin/main"), "-p", cand, self.w("rev-parse", "origin/main^{tree}"))
+        self.w("replace", q, fake)
+        plain = self.w("log", "--first-parent", "--merges", "--format=%H %P", "fq")
+        self.assertIn(cand, plain)
+        self.assertIsNone(mod.scan_promotion(self.work, "fq", cand))
+
+    def test_clone_with_replace_refs_or_grafts_is_refused(self):
+        self.go()
+        a = self.w("rev-parse", "main")
+        b = self.w("rev-parse", "integration/v0.x")
+        self.w("replace", b, a)
+        rc, out, _ = self.rel("candidate-tag", execute=True)
+        self.assertEqual((rc, self.refused(out)), (1, "CLONE_CONFIG_HOSTILE"))
+        self.w("replace", "-d", b)
+        self.assertNotEqual(self.refused(self.rel("candidate-tag")[1]), "CLONE_CONFIG_HOSTILE")
+        (pathlib.Path(self.w("rev-parse", "--git-dir", cwd=self.work)) if False else pathlib.Path(self.work) / ".git" / "info").mkdir(exist_ok=True)
+        (pathlib.Path(self.work) / ".git" / "info" / "grafts").write_text(f"{b} {a}\n")
+        self.assertEqual(self.refused(self.rel("candidate-tag", execute=True)[1]), "CLONE_CONFIG_HOSTILE")
+
+    def test_inherited_git_environment_is_scrubbed_and_never_executes(self):
+        marker = pathlib.Path(self.tmp.name) / "env-ran"
+        script = pathlib.Path(self.tmp.name) / "envhook.sh"
+        script.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+        script.chmod(0o755)
+        hostile = {"GIT_SSH_COMMAND": str(script), "GIT_SSH": str(script), "GIT_PROXY_COMMAND": str(script), "GIT_ASKPASS": str(script), "SSH_ASKPASS": str(script),
+                   "GIT_EXTERNAL_DIFF": str(script), "GIT_EXEC_PATH": "/nonexistent", "GIT_DIR": "/nonexistent", "GIT_WORK_TREE": "/nonexistent",
+                   "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/nonexistent", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsmonitor", "GIT_CONFIG_VALUE_0": str(script),
+                   "GIT_CONFIG_PARAMETERS": f"'core.pager={script}'", "GIT_INDEX_FILE": "/nonexistent", "GIT_PAGER": str(script), "GIT_EDITOR": str(script)}
+        self.env.update(hostile)
+        tip = self.commit("integration/v0.x", "late.txt")
+        self.go(tag="v0.3.0-rc.2", sha=tip)
+        rc, out, _ = self.rel("candidate-tag", execute=True)
+        self.assertEqual((rc, self.step(out, "tag")["state"]), (0, "CREATED"), out)  # GIT_DIR=/nonexistent would have broken every call if inherited
+        self.assertFalse(marker.exists())
+        mod = self.probe()
+        os.environ.update(hostile)
+        try:
+            env = mod.child_env({"X": "1"})
+        finally:
+            for k in hostile:
+                os.environ.pop(k, None)
+        self.assertEqual([k for k in env if k.startswith("GIT_") and k not in ("GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS", "GIT_CONFIG_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS", "GIT_GRAFT_FILE")], [])
+        self.assertEqual((env["GIT_NO_REPLACE_OBJECTS"], env["GIT_CONFIG_NOSYSTEM"], env["GIT_TERMINAL_PROMPT"], env["X"]), ("1", "1", "0", "1"))
+        self.assertNotIn("SSH_ASKPASS", env)
+        self.assertFalse(os.path.exists(env["GIT_GRAFT_FILE"]))  # grafts are off for every child, not only checked once
+
+    def test_graft_path_lookup_failure_is_refused_not_assumed_empty(self):
+        mod = self.probe()
+        real = mod.git
+        mod.git = lambda c, *a, **k: (128, "") if a[:2] == ("rev-parse", "--git-common-dir") else real(c, *a, **k)
+        try:
+            with self.assertRaises(mod.Refusal) as cm:
+                mod.require_clone(self.work, None)
+        finally:
+            mod.git = real
+        self.assertEqual(cm.exception.code, "CLONE_CONFIG_HOSTILE")
+
+
+class VerifyBinding(Rel):
+    def test_verify_is_bound_to_the_go_candidate_and_never_overwrites_a_pinned_record(self):
+        x = self.base_only_change()
+        self.mark_not_applicable(x)
+        self.w("fetch", "-q", "origin")
+        self.tag("v0.3.0-rc.2", "integration/v0.x")
+        self.go(tag="v0.3.0-rc.2")
+        self.assertEqual(self.rel("promote", execute=True)[1]["status"], "PASS")
+        final = self.remote("refs/heads/main")
+        self.go(tag="v0.3.0-rc.1")  # approves a different candidate: that promotion does not exist
+        self.assertEqual(self.refused(self.rel("verify")[1]), "PROMOTION_NOT_FOUND")
+        os.unlink(self.go_dir / f"{REPO.replace('/', '__')}__0.3.0.json")
+        self.assertEqual(self.refused(self.rel("verify")[1]), "GO_MISSING")
+        self.go(tag="v0.3.0-rc.2")
+        self.local_first()
+        extra = ("--local-first", str(self.lf))
+        self.env.pop("SOURCE_DATE_EPOCH")
+        out = self.rel("verify", *extra, execute=True)[1]
+        self.assertEqual(out["status"], "PASS", out)
+        self.pin_verification(final, digest=self.step(out, "local_checks")["evidence"]["record_sha256"])
+        out = self.rel("verify", *extra, execute=True)[1]
+        self.assertEqual(self.refused(out), "VERIFY_RECORD_PINNED")
+
+
+class OriginBinding(Rel):
+    def probe(self):
+        spec = importlib.util.spec_from_file_location("rl_origin_probe", ROOT / "scripts/release-line.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_origin_urls_must_belong_to_the_repo(self):
+        mod, r = self.probe(), REPO
+        for good in (f"https://github.com/{r}.git", f"https://github.com/{r}", f"git@github.com:{r}.git", f"ssh://git@github.com/{r}.git",
+                     f"https://github.com/{r.lower()}.git", f"https://user@github.com/{r}.git", f"https://user:tok%20en@github.com/{r}/"):
+            self.assertTrue(mod.origin_matches(good, r), good)
+        for bad in ("https://github.com/Other-Owner/example-product.git", f"https://github.com/{r}-evil.git", f"https://evil.example/{r}.git",
+                    f"https://github.com/{r}/../x.git", f"git@evil.example:{r}.git", "/tmp/not-listed", "relative/path",
+                    # authority tricks: git and curl end the authority at # ? / and a backslash
+                    f"https://evil.host#@github.com/{r}.git", f"https://evil.host?@github.com/{r}.git", f"https://evil.host\\@github.com/{r}.git",
+                    f"https://github.com@evil.host/{r}.git", f"https://github.com.evil.host/{r}.git", f"https://GitHub.com/{r}.git",
+                    f"https://GITHUB.COM/{r}.git", f"https://github.com:8443/{r}.git", f"https://github.com/{r}.git?x=1", f"https://github.com/{r}.git#frag",
+                    f"https://us er@github.com/{r}.git", f"https://us\ter@github.com/{r}.git", f"https://us\x01er@github.com/{r}.git",
+                    f"https://us\x7fer@github.com/{r}.git", f"https://u@s@github.com/{r}.git", f"http://github.com/{r}.git", f"ftp://github.com/{r}.git",
+                    f"ext::sh -c touch% x", f"git@github.com/{r}.git", f"git@github.com/{r}", f"github.com:{r}.git", f"other@github.com:{r}.git",
+                    f"git@github.com:{r}.git\n", f"git@github.com:{r}.git evil"):
+            self.assertFalse(mod.origin_matches(bad, r), repr(bad))
+
+    def test_commands_refuse_another_repositorys_clone(self):
+        self.go()
+        self.w("remote", "set-url", "origin", "https://github.com/Other-Owner/other.git")
+        rc, out, _ = self.rel("candidate-tag", execute=True)
+        self.assertEqual((rc, self.refused(out)), (1, "ORIGIN_MISMATCH"))
+        self.w("remote", "set-url", "origin", str(self.bare))
+        self.w("remote", "set-url", "--push", "origin", "https://github.com/Other-Owner/other.git")
+        self.assertEqual(self.refused(self.rel("candidate-tag", execute=True)[1]), "ORIGIN_MISMATCH")  # push URL is checked too
+        self.w("remote", "set-url", "--push", "origin", str(self.bare))
+        self.assertNotEqual(self.refused(self.rel("candidate-tag")[1]), "ORIGIN_MISMATCH")
+
+    def test_every_clone_using_handler_checks_the_origin(self):
+        self.w("remote", "set-url", "origin", f"https://evil.host#@github.com/{REPO}.git")
+        sha = self.sha("main")
+        c = str(self.work)
+        cmds = (("successor", "ensure", "--predecessor", "0.3.0", "--clone", c, "--execute"),
+                ("guard", "--base", "integration/v0.x", "--head", sha, "--clone", c),
+                ("train", "integrate", "--from", "v0", "--into", "v0.4.0", "--clone", c, "--execute"),
+                ("train", "converge", "--line", "v0", "--clone", c, "--execute"),
+                ("route", "--kind", "fix", "--version", "0.3.0", "--clone", c),
+                ("audit", "observe", "--clone", c),
+                ("forward-port", "plan", "--merge", sha, "--clone", c),
+                ("forward-port", "run", "--merge", sha, "--clone", c, "--execute"),
+                ("release", "candidate-tag", "--version", "0.3.0", "--clone", c, "--execute"),
+                ("release", "promote", "--version", "0.3.0", "--clone", c, "--execute"),
+                ("release", "verify", "--version", "0.3.0", "--clone", c, "--execute"),
+                ("release", "final-tag", "--version", "0.3.0", "--clone", c, "--execute"))
+        for argv in cmds:
+            rc, out, _ = self.cli(*argv)
+            self.assertEqual((rc, self.refused(out)), (1, "ORIGIN_MISMATCH"), argv)
+        self.assertEqual((self.pushes(), self.merges()), ([], []))
+
+    def test_ext_transport_origin_is_refused_without_running_anything(self):
+        marker = pathlib.Path(self.tmp.name) / "ext-ran"
+        self.w("remote", "set-url", "origin", f"ext::sh -c touch% {marker}")
+        self.assertEqual(self.refused(self.rel("candidate-tag", execute=True)[1]), "ORIGIN_MISMATCH")
+        self.assertFalse(marker.exists())
+
+    HOSTILE = (("gpg.program", "{m}"), ("tag.gpgsign", "true"), ("commit.gpgsign", "true"), ("log.showsignature", "true"), ("user.signingkey", "ABCD"),
+               ("merge.x.driver", "{m}"), ("diff.x.command", "{m}"), ("diff.x.textconv", "{m}"), ("http.sslcapath", "/tmp/ca"), ("http.curloptresolve", "a:1:b"),
+               ("http.sslverify", "false"), ("http.proxy", "http://127.0.0.1:9"), ("http.https://github.com/.proxy", "http://127.0.0.1:9"),
+               ("http.https://github.com/.extraheader", "X-A: b"), ("include.path", "/tmp/other"), ("includeif.gitdir:/.path", "/tmp/other"),
+               ("core.pager", "{m}"), ("core.editor", "{m}"), ("core.hookspath", "/tmp/hooks"), ("core.fsmonitor", "{m}"), ("core.sshcommand", "{m}"),
+               ("core.askpass", "{m}"), ("core.gitproxy", "{m}"), ("credential.helper", "!{m}"), ("alias.x", "!{m}"), ("url.https://evil/.insteadof", "https://github.com/"),
+               ("remote.origin.proxy", "http://127.0.0.1:9"), ("remote.origin.uploadpack", "{m}"), ("remote.origin.receivepack", "{m}"),
+               ("filter.evil.clean", "{m}"), ("diff.external", "{m}"), ("extensions.worktreeconfig", "true"), ("protocol.ext.allow", "always"),
+               ("gc.auto", "0"), ("pull.rebase", "true"))
+
+    def test_clone_config_outside_the_allowlist_is_refused_and_never_runs(self):
+        marker = pathlib.Path(self.tmp.name) / "hostile-ran"
+        script = pathlib.Path(self.tmp.name) / "hostile.sh"
+        script.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+        script.chmod(0o755)
+        self.go()
+        self.assertNotEqual(self.refused(self.rel("candidate-tag")[1]), "CLONE_CONFIG_HOSTILE")  # the clean clone passes
+        for key, val in self.HOSTILE:
+            self.w("config", "--add", key, val.format(m=script))
+            for argv in (("release", "candidate-tag", "--version", "0.3.0", "--clone", str(self.work), "--go-dir", str(self.go_dir), "--execute"),
+                         ("guard", "--base", "integration/v0.x", "--head", self.sha("main"), "--clone", str(self.work))):
+                rc, out, _ = self.cli(*argv)
+                self.assertEqual((rc, self.refused(out)), (1, "CLONE_CONFIG_HOSTILE"), key)
+            self.w("config", "--unset-all", key)
+        self.assertFalse(marker.exists())
+        self.assertEqual((self.pushes(), self.merges()), ([], []))
+        self.assertNotEqual(self.refused(self.rel("candidate-tag")[1]), "CLONE_CONFIG_HOSTILE")  # clean again
+
+    def test_other_remotes_must_name_the_repo_too(self):
+        self.go()
+        self.w("remote", "add", "evil", "https://github.com/Other-Owner/other.git")
+        self.assertEqual(self.refused(self.rel("candidate-tag", execute=True)[1]), "ORIGIN_MISMATCH")
+        self.w("remote", "set-url", "evil", f"https://github.com/{REPO}.git")
+        self.assertNotEqual(self.refused(self.rel("candidate-tag")[1]), "ORIGIN_MISMATCH")
+
+    def test_git_invocation_overrides_signing_and_transport_levers(self):
+        mod = self.probe()
+        # the clone's own values cannot be set (refused above); the -c overrides still define what every git call sees
+        for key, want in (("http.sslVerify", "true"), ("remote.origin.uploadpack", "git-upload-pack"), ("remote.origin.receivepack", "git-receive-pack"),
+                          ("remote.origin.proxy", ""), ("http.extraHeader", ""), ("http.sslCAInfo", ""), ("http.sslCAPath", ""), ("http.curloptResolve", ""),
+                          ("tag.gpgSign", "false"), ("commit.gpgSign", "false"), ("log.showSignature", "false"), ("gpg.program", "/usr/bin/false"),
+                          ("merge.renormalize", "false"), ("core.sshCommand", "ssh"), ("core.askPass", "/usr/bin/false"), ("protocol.ext.allow", "never"),
+                          ("http.proxy", ""), ("core.hooksPath", "/dev/null"), ("core.fsmonitor", "false")):
+            self.assertEqual(mod.git(self.work, "config", "--get", key)[1].strip(), want, key)
+        self.assertEqual(mod.git(self.work, "config", "--get-all", "credential.helper")[1].split("\n")[-2], "")  # the last value is empty: helper list reset
+
+
 class SuccessorPromotion(Rel):
     def setUp(self):
         super().setUp()
@@ -571,6 +897,9 @@ class SuccessorPromotion(Rel):
         self.tag("v0.4.0-rc.1", "integration/v0.4.0")
         self.go(version="0.4.0", tag="v0.4.0-rc.1", scopes=("promote",))
         self.assertEqual(self.refused(self.rel("promote", version="0.4.0")[1]), "PREDECESSOR_NOT_SHIPPED")
+        self.w("tag", "v0.3.0", "main")  # a final tag only in the agent's clone is not a shipped version
+        self.assertEqual(self.refused(self.rel("promote", version="0.4.0")[1]), "PREDECESSOR_NOT_SHIPPED")
+        self.w("tag", "-d", "v0.3.0")
         # v0.3.0 ships a late rc.2 that v0.4.0 does not contain yet
         self.commit("integration/v0.x", "late-fix.txt")
         self.tag("v0.3.0-rc.2", "integration/v0.x")
@@ -660,7 +989,7 @@ class Protection(Rel):
         self.assertEqual(self.prot("snapshot", execute=True)[1]["status"], "PASS")
         self.pin_protection()
         self.go()
-        self.gh_update(drift_on_merge=True)
+        self.gh_update(drift_on_merge=True, checks=[{"name": "ci", "conclusion": "SUCCESS"}])  # the pinned snapshot requires `ci`
         rc, out, _ = self.rel("promote", execute=True)
         self.assertEqual((rc, out["status"]), (1, "FAIL"), out)
         self.assertEqual(self.step(out, "protection_after")["state"], "DRIFT")
