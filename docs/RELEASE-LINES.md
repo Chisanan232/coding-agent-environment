@@ -1,6 +1,6 @@
 # Release lines
 
-Status: slice 1 of the SPE-180 design (SPE-181a). This page documents what `scripts/release-line.py` implements today and lists
+Status: slices 1 and 2 of the SPE-180 design (SPE-181a registry and routing, SPE-182 successor train). This page documents what `scripts/release-line.py` implements today and lists
 later slices as planned. Nothing here changes the merge gate.
 
 ## Why
@@ -106,8 +106,50 @@ audit JSON `{schema: 1, repo, release_lines}`, validates it, and emits a candida
 `audit` is `COMPLETE` with `source` and the sha256 of the audit file. That is what ends `AUDIT_PENDING`, once the owner
 installs the candidate.
 
+## Successor train (SPE-182)
+
+All four commands need `--clone` (a checkout whose `origin` is the product repo), refuse `AUDIT_PENDING`, fetch `origin` first,
+default to a dry plan, and only with `--execute` push or open PRs. Pushes create new refs only (`git push origin <sha>:refs/heads/<name>`,
+never force) and are verified with `ls-remote`. Durable state is git and GitHub: branch names, tags and PR heads; retries recompute it
+and create nothing twice. The tool creates no commits (merges are GitHub merge commits made by the normal gate); the PR bodies it opens
+carry `Release-Line-Kind: integrate|converge` plus source/target line trailers.
+
+```
+python3 -I $R successor ensure --predecessor 0.3.0 [--from REF] [--version 0.4.0] [--branch B] --repo OWNER/REPO --clone PATH [--execute]
+python3 -I $R guard --base BRANCH --head SHA --repo OWNER/REPO --clone PATH
+python3 -I $R train integrate --from LINE --into LINE --repo OWNER/REPO --clone PATH [--execute]
+python3 -I $R train converge --line LINE --repo OWNER/REPO --clone PATH [--execute]
+```
+
+`successor ensure` (key `succ:<repo>:<version>`): the predecessor line is the line carrying that version (else the major line); the
+successor version defaults to the next minor. The fork is `--from REF` or the predecessor's highest candidate tag, and must be reachable
+from the predecessor integration branch (so v0.5.0 forks from the v0.4.0 candidate it needs). The target is `integration/v<version>` or the
+registered name. `ls-remote` absent: push the fork SHA, `CREATED`; present and containing the fork: `REUSED`; otherwise `CONFLICT_EXISTING`
+(status BLOCKED, nothing pushed). Unless the line is already registered, it also emits an owner packet through the `registry propose`
+emitter (branch for `branches`, the line with `fork_ref`/`fork_sha` and predecessor, the `v<version>/` head prefix). The registry state stays
+`PENDING_OWNER_LISTING` until the owner installs it; the new branch cannot receive gated merges before that.
+
+`guard` (read-only; BLOCKED, exit 1, on a finding): `SUCCESSOR_ONLY_COMMITS` when a PR head into line P carries commits that exist only on an
+active successor of P (transitively); `EOL_BASE`; `CONVERGE_PRECONDITION`; `PUBLICATION_BASE_DIRECT_CHANGE` is advisory (status stays PASS).
+The one exception is a converge: a head equal to the tip of the major line's successor chain, into the major line, is `CONVERGE_ALLOWED` when
+every version was shipped and integrated, else `CONVERGE_PRECONDITION`.
+
+`train integrate --from LINE --into LINE` (key `int:<repo>:<from>:<into>:<from_final_tag>`): `into` must be a successor of `from`. Needs the final tag
+of the predecessor version (`NO_FINAL_TAG` otherwise); the promoted candidate is the final tag commit's second parent (or the commit itself when
+not a merge) and must be on `from`'s branch. If the predecessor line is itself a successor, its own predecessor must already be integrated
+(`OUT_OF_ORDER`). The head `lineint/<from_version>/<into_line>` is pinned at the candidate SHA (a different existing SHA is
+`CONFLICT_EXISTING`), a clean merge into the successor is predicted with `git merge-tree` (`MERGE_CONFLICT` pushes nothing), and one PR into the
+successor branch is opened or reused (status DEFERRED: the merge commit goes through the normal gate, never through this tool). A rerun after the
+merge verifies the candidate is an ancestor of the successor (`INTEGRATED`). Rule recorded as `stale_candidates`: any successor candidate tag cut
+before integration is `PROMOTION_BLOCKED` and must not be promoted; promotion itself is a later slice.
+
+`train converge --line LINE` (key `conv:<repo>:<line>`): needs every version of the chain from the frozen major candidate through the tip's
+predecessor to have a final tag and to be integrated, in order (`CONVERGE_PRECONDITION` lists the gaps; the tip's own version need not have shipped). It
+opens or reuses the PR from the tip successor branch into the major integration branch (DEFERRED), and after the merge reports `CONVERGED` and emits one packet
+that marks every chain line `converged` with `converged_into` the major line.
+
 ## Planned (not implemented)
 
-Later slices of SPE-180: successor ensure, guard, train integrate/converge (SPE-182); forward-port plan/run/status with trailers
-(SPE-183); release candidate-tag/promote/verify/final-tag (SPE-184a); build/notes/publish (SPE-184b); protection snapshot/verify,
-skill packaging and install (SPE-181b); acceptance from installed entry points (SPE-185). None of these commands exist yet.
+Later slices of SPE-180: forward-port plan/run/status with trailers (SPE-183); release candidate-tag/promote/verify/final-tag (SPE-184a);
+build/notes/publish (SPE-184b); protection snapshot/verify, skill packaging and install (SPE-181b); acceptance from installed entry points
+(SPE-185). None of these commands exist yet.
