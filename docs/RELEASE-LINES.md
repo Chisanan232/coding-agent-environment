@@ -226,15 +226,20 @@ publication base, checks hosted CI, then with `--execute` runs `gh pr merge N --
 Verification is `CARRIED_OVER` when the final tree equals the candidate tree, otherwise `REQUIRED`.
 
 Hosted CI: `CI_PASS` proceeds, a failing check is `CI_FAILED` (FAIL, never bypassed), pending checks are `DEFERRED`. When no hosted check ran (outage, quota, none
-configured) the step is recorded `NOT_RUN` and promotion needs a local-equivalent record: the recorder's record for the PR head, read from the fixed evidence
-directories (owner, mode 0600, single link, log digests re-verified through `verify_standing_local_record`), with commands equal to the owner's local-first entry,
-all exit 0, and no older than `max_age_hours` (`LOCAL_EVIDENCE_REQUIRED` otherwise). No workflow is dispatched or rerun.
+configured) the step is recorded `NOT_RUN` and promotion needs a local-equivalent record that passes the gate's own `local_first_basis` (private repo, the
+unedited and unminimized `OWNER-MERGE-LOCAL-CI` comment of the authenticated user on the promotion PR, strict `parse_local_record` schema, repo/PR/base/base
+commit/head/context match, commands and `env` equal to the owner's local-first entry, not finishing after it was posted or after now+60s, within `max_age_hours`;
+as in the gate, an unexplained empty rollup also needs a skip directive on the head commit and no Actions run). The posted record must equal the private recorder
+evidence, which is read only from the fixed evidence directories and re-verified with `verify_standing_local_record` (owner, mode, single link, log digests); there is no
+caller-chosen evidence directory (`LOCAL_EVIDENCE_REQUIRED` otherwise, with the gate's reason codes). No workflow is dispatched or rerun.
 
 `verify`: `CARRIED_OVER` when trees match; otherwise it needs `--execute` and runs the owner's local-first checks in a detached worktree at the final SHA
-(`PASS`, `FAIL`, or `NOT_RUN` when the trust file is unavailable) and journals `verified` or `verify-failed` for that SHA.
+(`PASS`, `FAIL`, or `NOT_RUN` when the trust file is unavailable). It writes the recorder-format record for the final SHA (PR number, base, merge base `final^1`) into the fixed
+private evidence directory; that record, not the journal, is what `final-tag` trusts. A failing or tree-changing run replaces or removes any earlier pass.
 
 `final-tag`: GO `final_tag`; the final SHA is found from the promotion merge (cross-checked with the PR's merge commit), never the base tip, and must be on the
-publication base. When the final tree differs from the candidate tree the latest journal outcome for that SHA must be `verified` (`FINAL_NOT_VERIFIED`). An annotated
+publication base. When the final tree differs from the candidate tree it re-checks the private record for that exact SHA the way `promote` does (fixed directories, log digests,
+owner commands and env, freshness, `FINAL_NOT_VERIFIED` otherwise); journal rows are an audit trail and never authorize anything. An annotated
 `tag_format` tag is pushed as a new ref. The journal records source branch, release line, version, promotion PR, candidate and final SHAs.
 
 `protection snapshot` records the publication base's protection (read-only `gh api`, URL fields removed) in the state directory; the snapshot is trusted only
