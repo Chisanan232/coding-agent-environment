@@ -71,7 +71,7 @@ class FP(train.TrainBase):
     def assert_no_force_push(self):
         self.assertTrue(self.pushes())
         for x in self.pushes():
-            self.assertRegex(x, r"^(?:--no-pager )?(?:-c \S+ )*-C \S+ push origin [0-9a-f]{40}:refs/heads/\S+$")
+            self.assertRegex(x, r"^(?:--no-pager )?(?:--no-replace-objects )?(?:-c \S+ )*-C \S+ push origin [0-9a-f]{40}:refs/heads/\S+$")
             self.assertNotRegex(x, r"--force|--delete|--mirror| -f |:refs/heads/\+| \+")
 
     def clean_clone(self):

@@ -56,6 +56,11 @@ class Base(unittest.TestCase):
         for d in (self.home / ".config", self.home / ".config/coding-agent-environment", self.local):
             os.chmod(d, 0o700)
         self.policy_path = self.local / "version-branches.json"
+        # Owner-visible test hook: release-line-test-env.json names the variables the fake gh/git wrappers need; the tool drops every other inherited one.
+        hook = self.local / "release-line-test-env.json"
+        hook.write_text(json.dumps({"schema": 1, "pass": ["FAKE_GH_STATE", "GIT_LOG", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+                                                          "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE"]}))
+        os.chmod(hook, 0o600)
         self.bin = pathlib.Path(self.tmp.name) / "bin"
         self.bin.mkdir()
         gh = self.bin / "gh"

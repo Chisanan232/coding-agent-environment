@@ -29,7 +29,7 @@ def stamp(delta=0):
     """Real wall-clock stamp: the tool's freshness decisions ignore SOURCE_DATE_EPOCH, which the harness pins to 2026-01-01."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + delta))
 
-FAKE_GH = train.FAKE_GH
+FAKE_GH = train.FAKE_GH.replace('if a[:2] == ["pr", "list"]:', 'if a[:2] == ["pr", "list"] and st.get("list_fail"):\n    sys.exit(1)\nelif a[:2] == ["pr", "list"]:', 1)
 for old, new in (
     ('    work = S + ".merge"\n', '''    mh = opt("--match-head-commit")
     if st.get("merge_fail"):
@@ -369,6 +369,16 @@ class Promote(Rel):
         self.assertEqual(self.refused(self.rel("promote")[1]), "GO_SCOPE")
         self.assertIsNone(self.remote("refs/tags/v0.3.0"))
 
+    def test_final_tag_refuses_when_github_cannot_answer(self):
+        self.go()
+        self.assertEqual(self.promote_ok()[1]["status"], "PASS")
+        self.gh_update(list_fail=True)
+        rc, out, _ = self.rel("final-tag", execute=True)
+        self.assertEqual((rc, self.refused(out)), (1, "GH_UNAVAILABLE"))
+        self.assertIsNone(self.remote("refs/tags/v0.3.0"))
+        self.gh_update(list_fail=False)
+        self.assertEqual(self.step(self.rel("final-tag", execute=True)[1], "tag")["state"], "CREATED")
+
     def test_final_tag_conflict_when_tag_exists_elsewhere(self):
         self.go()
         self.assertEqual(self.promote_ok()[1]["status"], "PASS")
@@ -661,6 +671,75 @@ class Promote(Rel):
         rc, out, _ = self.rel("promote", execute=True)
         self.assertEqual((rc, self.refused(out)), (1, "VERSION_NOT_GREATER"))  # 0.3.0 <= shipped 0.3.1
         self.assertEqual(self.merges(), [])
+
+
+class HardenedGit(Rel):
+    def probe(self):
+        spec = importlib.util.spec_from_file_location("rl_hardened_probe", ROOT / "scripts/release-line.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_replace_refs_cannot_forge_ancestry_or_a_promotion(self):
+        mod = self.probe()
+        root = self.w("commit-tree", "-m", "a", self.w("rev-parse", "main^{tree}"))
+        other = self.w("commit-tree", "-m", "b", self.w("rev-parse", "main^{tree}"))
+        self.assertFalse(mod.is_ancestor(self.work, root, other))
+        # forge: replace `other` by a commit whose parent is `root`
+        forged = self.w("commit-tree", "-m", "b", "-p", root, self.w("rev-parse", "main^{tree}"))
+        self.w("replace", other, forged)
+        plain = subprocess.run([REAL_GIT, "-C", str(self.work), "merge-base", "--is-ancestor", root, other], env=self.genv).returncode
+        self.assertEqual(plain, 0)  # plain git is fooled ...
+        self.assertFalse(mod.is_ancestor(self.work, root, other))  # ... the tool is not
+        # forge a promotion merge: `q` is replaced by a merge whose second parent is the approved candidate
+        cand = self.sha("v0.3.0-rc.1")
+        self.w("fetch", "-q", "origin")
+        q = self.w("commit-tree", "-m", "q", "-p", self.w("rev-parse", "origin/main"), self.w("rev-parse", "origin/main^{tree}"))
+        self.w("branch", "-f", "fq", q)
+        fake = self.w("commit-tree", "-m", "fake", "-p", self.w("rev-parse", "origin/main"), "-p", cand, self.w("rev-parse", "origin/main^{tree}"))
+        self.w("replace", q, fake)
+        plain = self.w("log", "--first-parent", "--merges", "--format=%H %P", "fq")
+        self.assertIn(cand, plain)
+        self.assertIsNone(mod.scan_promotion(self.work, "fq", cand))
+
+    def test_clone_with_replace_refs_or_grafts_is_refused(self):
+        self.go()
+        a = self.w("rev-parse", "main")
+        b = self.w("rev-parse", "integration/v0.x")
+        self.w("replace", b, a)
+        rc, out, _ = self.rel("candidate-tag", execute=True)
+        self.assertEqual((rc, self.refused(out)), (1, "CLONE_CONFIG_HOSTILE"))
+        self.w("replace", "-d", b)
+        self.assertNotEqual(self.refused(self.rel("candidate-tag")[1]), "CLONE_CONFIG_HOSTILE")
+        (pathlib.Path(self.w("rev-parse", "--git-dir", cwd=self.work)) if False else pathlib.Path(self.work) / ".git" / "info").mkdir(exist_ok=True)
+        (pathlib.Path(self.work) / ".git" / "info" / "grafts").write_text(f"{b} {a}\n")
+        self.assertEqual(self.refused(self.rel("candidate-tag", execute=True)[1]), "CLONE_CONFIG_HOSTILE")
+
+    def test_inherited_git_environment_is_scrubbed_and_never_executes(self):
+        marker = pathlib.Path(self.tmp.name) / "env-ran"
+        script = pathlib.Path(self.tmp.name) / "envhook.sh"
+        script.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+        script.chmod(0o755)
+        hostile = {"GIT_SSH_COMMAND": str(script), "GIT_SSH": str(script), "GIT_PROXY_COMMAND": str(script), "GIT_ASKPASS": str(script), "SSH_ASKPASS": str(script),
+                   "GIT_EXTERNAL_DIFF": str(script), "GIT_EXEC_PATH": "/nonexistent", "GIT_DIR": "/nonexistent", "GIT_WORK_TREE": "/nonexistent",
+                   "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/nonexistent", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsmonitor", "GIT_CONFIG_VALUE_0": str(script),
+                   "GIT_CONFIG_PARAMETERS": f"'core.pager={script}'", "GIT_INDEX_FILE": "/nonexistent", "GIT_PAGER": str(script), "GIT_EDITOR": str(script)}
+        self.env.update(hostile)
+        tip = self.commit("integration/v0.x", "late.txt")
+        self.go(tag="v0.3.0-rc.2", sha=tip)
+        rc, out, _ = self.rel("candidate-tag", execute=True)
+        self.assertEqual((rc, self.step(out, "tag")["state"]), (0, "CREATED"), out)  # GIT_DIR=/nonexistent would have broken every call if inherited
+        self.assertFalse(marker.exists())
+        mod = self.probe()
+        os.environ.update(hostile)
+        try:
+            env = mod.child_env({"X": "1"})
+        finally:
+            for k in hostile:
+                os.environ.pop(k, None)
+        self.assertEqual([k for k in env if k.startswith("GIT_") and k not in ("GIT_TERMINAL_PROMPT", "GIT_OPTIONAL_LOCKS", "GIT_CONFIG_NOSYSTEM", "GIT_NO_REPLACE_OBJECTS")], [])
+        self.assertEqual((env["GIT_NO_REPLACE_OBJECTS"], env["GIT_CONFIG_NOSYSTEM"], env["GIT_TERMINAL_PROMPT"], env["X"]), ("1", "1", "0", "1"))
+        self.assertNotIn("SSH_ASKPASS", env)
 
 
 class VerifyBinding(Rel):
