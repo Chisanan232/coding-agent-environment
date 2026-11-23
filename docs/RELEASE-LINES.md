@@ -108,7 +108,7 @@ installs the candidate.
 
 ## Successor train (SPE-182)
 
-All four commands need `--clone` (a checkout whose `origin` is the product repo), refuse `AUDIT_PENDING`, fetch `origin` first,
+`successor ensure`, `train integrate` and `train converge` refuse `AUDIT_PENDING`; `guard` is advisory and does not. All four need `--clone` (a checkout whose `origin` is the product repo) and fetch `origin` first (a failed fetch refuses `FETCH_FAILED`, never proceeds on a stale clone),
 default to a dry plan, and only with `--execute` push or open PRs. Pushes create new refs only (`git push origin <sha>:refs/heads/<name>`,
 never force) and are verified with `ls-remote`. Durable state is git and GitHub: branch names, tags and PR heads; retries recompute it
 and create nothing twice. The tool creates no commits (merges are GitHub merge commits made by the normal gate); the PR bodies it opens
@@ -129,7 +129,7 @@ registered name. `ls-remote` absent: push the fork SHA, `CREATED`; present and c
 emitter (branch for `branches`, the line with `fork_ref`/`fork_sha` and predecessor, the `v<version>/` head prefix). The registry state stays
 `PENDING_OWNER_LISTING` until the owner installs it; the new branch cannot receive gated merges before that.
 
-`guard` (read-only; BLOCKED, exit 1, on a finding): `SUCCESSOR_ONLY_COMMITS` when a PR head into line P carries commits that exist only on an
+`guard` (changes no remote state, but fetches into the clone; BLOCKED, exit 1, on a finding): a failed `rev-list` refuses `REV_LIST_FAILED` instead of reporting clean. `route` skips successors that are themselves frozen by an unshipped candidate and returns `NEEDS_SUCCESSOR` when every active successor is frozen. If a human resolves a `train integrate` conflict by pushing onto the `lineint/` head, open that PR manually; a rerun then reports `INTEGRATED` once it merges. `SUCCESSOR_ONLY_COMMITS` when a PR head into line P carries commits that exist only on an
 active successor of P (transitively); `EOL_BASE`; `CONVERGE_PRECONDITION`; `PUBLICATION_BASE_DIRECT_CHANGE` is advisory (status stays PASS).
 The one exception is a converge: a head equal to the tip of the major line's successor chain, into the major line, is `CONVERGE_ALLOWED` when
 every version was shipped and integrated, else `CONVERGE_PRECONDITION`.

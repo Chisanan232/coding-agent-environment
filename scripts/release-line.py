@@ -47,6 +47,9 @@ AUDIT_MAX_BYTES = 1 << 20
 STATE_ROOT = "~/.local/state/coding-agent-environment/release-line"
 
 
+BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,100}")
+
+
 class Refusal(Exception):
     def __init__(self, code, detail="", status="BLOCKED"):
         super().__init__(code)
@@ -561,13 +564,18 @@ def route(args, res):
     if args.kind == "fix" or not frozen:
         return done(mline, "major line" + (" (fix for a frozen candidate)" if frozen else ""))
     active = [x for x in chain_of(rl, mline) if x["support"] == "supported" and x["state"] == "active"]
-    if active:
-        tip = max(active, key=lambda x: vkey(x["version"]))
-        return done(tip, f"major line is frozen by unshipped candidate {frozen[-1]}; feature goes to the successor chain tip")
+    for tip in sorted(active, key=lambda x: vkey(x["version"]), reverse=True):
+        if branch_ref(args.clone, tip["integration_branch"]) is None:
+            raise Refusal("BRANCH_NOT_IN_CLONE", f"{tip['integration_branch']} is not in the clone; fetch it first")
+        # A successor forks from its predecessor's candidate, so only candidates of its own version freeze it.
+        tip_frozen = [v for v in unshipped_candidates(args.clone, rl, tip) if v == tip["version"]]
+        if not tip_frozen:
+            return done(tip, f"major line is frozen by unshipped candidate {frozen[-1]}; feature goes to the newest unfrozen successor")
+        frozen = frozen + tip_frozen
     res.step("route", "NEEDS_SUCCESSOR", {"line": mline["id"], "frozen_by": frozen[-1], "requested_version": args.version})
     res.status = "BLOCKED"
     res.next_action = (f"no successor exists after frozen candidate {frozen[-1]}; owner registers one with "
-                       "`registry propose --op add-successor` (automated `successor ensure` is planned for SPE-182). Only this feature is blocked")
+                       "`successor ensure` then `registry propose --op add-successor`. Only this feature is blocked")
 
 
 def observe(args, res):
@@ -683,7 +691,10 @@ def registry_show(args, res):
 # Durable state is git + GitHub only. Pushes create new refs and never force; every push is verified with ls-remote.
 
 def fetch(clone):
-    git(clone, "fetch", "-q", "--tags", "origin")
+    # Explicit refspecs: a plain --tags fetch exits non-zero when a local tag differs, which must not be mistaken for an outage.
+    rc, out = git(clone, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*")
+    if rc != 0:
+        raise Refusal("FETCH_FAILED", "git fetch origin failed; a stale clone must not decide freeze, guard or train state")
 
 
 def ls_remote(clone, ref):
@@ -807,7 +818,11 @@ def successor_ensure(args, res):
     listed = next((x for x in rl["lines"] if x["kind"] == "successor" and x.get("version") == version), None)
     if listed is not None and listed["predecessor"]["line"] != pred["id"]:
         raise Refusal("LINE_EXISTS", f"line {listed['id']} is registered with predecessor {listed['predecessor']['line']}")
+    if listed is not None and args.branch and args.branch != listed["integration_branch"]:
+        raise Refusal("BRANCH_MISMATCH", f"line {listed['id']} is registered on {listed['integration_branch']}; --branch {args.branch} would push an unregistered ref")
     branch = args.branch or (listed or {}).get("integration_branch") or f"integration/v{version}"
+    if not BRANCH_NAME_RE.fullmatch(branch):
+        raise Refusal("BAD_BRANCH", f"{branch!r} is not a valid integration branch name")
     fetch(args.clone)
     pred_ref = need_ref(args.clone, pred["integration_branch"])
     fork_ref = args.from_ref
@@ -1007,9 +1022,14 @@ def guard(args, res):
         else:
             res.step("converge", "CONVERGE_ALLOWED", {"tip": chain[-1]["id"]})
         return
-    mine = set(git(args.clone, "rev-list", f"{base_ref}..{head}")[1].split())
+    def commits(rng):
+        rc, out = git(args.clone, "rev-list", rng)
+        if rc != 0:
+            raise Refusal("REV_LIST_FAILED", f"git rev-list {rng} failed; refusing to report a clean guard")
+        return set(out.split())
+    mine = commits(f"{base_ref}..{head}")
     for succ in descendants(rl, line):
-        shared = sorted(mine & set(git(args.clone, "rev-list", f"{base_ref}..{need_ref(args.clone, succ['integration_branch'])}")[1].split()))
+        shared = sorted(mine & commits(f"{base_ref}..{need_ref(args.clone, succ['integration_branch'])}"))
         if shared:
             res.step("successor_commits", "SUCCESSOR_ONLY_COMMITS", {"successor": succ["id"], "commits": shared[:20], "count": len(shared)})
             res.status, res.next_action = "BLOCKED", f"{args.head} carries commits that exist only on {succ['id']}; they reach {line['id']} only through `train converge`"

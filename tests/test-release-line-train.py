@@ -312,6 +312,32 @@ class TrainTests(TrainBase):
             self.commit("integration/v0.4.0", f"{t}.txt")
             self.tag(t, "integration/v0.4.0")
 
+    def test_route_skips_frozen_successor_tip(self):
+        self.two_successors_registry(["v0.4.0-rc.1"])
+        def target():
+            rc, out, _ = self.cli("route", "--kind", "feature", "--version", "0.9.0", "--clone", str(self.work))
+            return rc, out
+        rc, out = target()  # v0.4.0 is frozen by its own unshipped candidate, so the newer v0.5.0 takes the feature
+        self.assertEqual(rc, 0)
+        self.assertEqual(next(s for s in out["steps"] if s["step"] == "route")["evidence"]["branch"], "integration/v0.5.0")
+        self.commit("integration/v0.5.0", "rc-v050.txt")
+        self.tag("v0.5.0-rc.1", "integration/v0.5.0")  # every active successor is now frozen
+        rc, out = target()
+        self.assertEqual(out["status"], "BLOCKED")
+        self.assertTrue(any(s["step"] == "route" and s["state"] == "NEEDS_SUCCESSOR" for s in out["steps"]))
+
+    def test_unreachable_origin_is_refused_for_guard_and_ensure(self):
+        self.install(self.v0_only_policy())
+        self.w("remote", "set-url", "origin", str(pathlib.Path(self.tmp.name) / "gone.git"))
+        self.assertIn("FETCH_FAILED", self.codes(self.guard("integration/v0.x", "HEAD")[1]))
+        self.assertIn("FETCH_FAILED", self.codes(self.ensure("0.3.0")[1]))
+
+    def test_branch_override_on_registered_line_is_refused(self):
+        self.two_successors_registry([])
+        rc, out, _ = self.ensure("0.3.0", "--version", "0.4.0", "--branch", "integration/other")
+        self.assertIn("BRANCH_MISMATCH", self.codes(out))
+        self.assertEqual(self.heads("integration/other"), [])
+
     def test_out_of_order_integrate_is_refused(self):
         self.two_successors_registry(["v0.4.0-rc.1"])
         self.commit("integration/v0.x", "late-fix.txt")
