@@ -85,6 +85,29 @@ class HeadProtection(tm.Base):
             _, math = da._protects_head(*self.args(), 351 * GIB, 60 * GIB, 3, 4)
             self.assertNotEqual(da._head_unprotected_part(math, [{'label': 'blocker'}]), 'head-unprotected-lane4-margin')
 
+    def test_an_unstamped_head_is_not_protected_when_it_would_take_lane_three_or_four_in_four_lane_mode(self):
+        self.shape()
+        args = list(self.args())
+        args[1] = {k: v for k, v in args[1].items() if k != 'lane_protocol'}          # an entry written by older code
+        ok, math = da._protects_head(*args, 352 * GIB, 60 * GIB, 3, 4)
+        self.assertFalse(ok)
+        self.assertIs(math['head_stamped'], False)
+        self.assertEqual(da._head_unprotected_part(math, [{'label': 'blocker'}]), 'head-unprotected-lanes')
+        stamped = list(self.args())
+        self.assertTrue(da._protects_head(*stamped, 352 * GIB, 60 * GIB, 3, 4)[0])
+
+    def test_queue_advance_backfills_behind_a_lane_four_head_only_with_the_head_margin(self):
+        self.shape()
+        with unittest.mock.patch.object(da, 'BACKFILL_ENABLED', True):
+            short = self.advance(free=330 * GIB)          # the candidate fits lane 4 (292 GiB) but the head would be 22 GiB short of 200
+            self.assertEqual((short['granted'], short['backfilled']), ([], []))
+            self.assertEqual(self.state(self.cand), 'QUEUED')
+            logged = [d for d in self.receipts('backfill-decision') if d['id'] == self.cand]
+            self.assertEqual([(d['outcome'], d['reason'], d['blocked_id']) for d in logged],
+                             [('refused', 'head-unprotected-lane4-margin', self.head)])
+            enough = self.advance(free=360 * GIB)
+            self.assertEqual(enough['backfilled'], [self.cand])
+
     def test_the_new_reason_is_in_the_closed_vocabulary(self):
         self.assertIn('head-unprotected-lane4-margin', da.BACKFILL_DECISION_REASONS)
 
