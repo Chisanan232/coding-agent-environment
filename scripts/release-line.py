@@ -1691,6 +1691,44 @@ def final_tags(clone, rl, major):
     return [(vkey(m.group("v")), m.group("v"), t) for t in tag_names(clone) if (m := final.fullmatch(t)) and m.group("v").split(".")[0] == major]
 
 
+def load_local_entry(args):
+    ci = importlib.util.module_from_spec(importlib.util.spec_from_file_location("owner_merge_local_ci", HERE / "owner-merge-local-ci.py"))
+    ci.__spec__.loader.exec_module(ci)
+    return ci, ci.load_entry(args.repo, args.local_first)
+
+
+def trusted_local_record(args, number, cand):
+    """The recorder's record for this PR head, accepted only like the gate accepts it: read from the fixed evidence directories with
+    owner/mode/link checks and re-verified log digests (omg.verify_standing_local_record), commands equal to the owner's local-first
+    entry, every exit 0, and inside max_age_hours. Returns the record or None."""
+    try:
+        _, entry = load_local_entry(args)
+        name = omg.local_ci_evidence_filename(f"{args.repo.replace('/', '__')}-{number}", cand)
+        for path in omg.LOCAL_EVIDENCE_DIRS.values():
+            try:
+                dfd = os.open(os.path.expanduser(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except OSError:
+                continue
+            try:
+                with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd), "rb") as f:
+                    rec = json.loads(f.read(omg.POLICY_MAX_BYTES), object_pairs_hook=omg._no_duplicate_keys)
+            except (OSError, ValueError):
+                continue
+            finally:
+                os.close(dfd)
+            cmds = rec.get("commands") if isinstance(rec, dict) else None
+            if not (isinstance(cmds, list) and cmds and rec.get("repo", "").lower() == args.repo.lower() and rec.get("pr") == number
+                    and rec.get("head") == cand and [(c.get("name"), tuple(c.get("argv", ()))) for c in cmds] == list(entry["checks"])
+                    and all(c.get("exit_code") == 0 for c in cmds) and omg.verify_standing_local_record(rec)):
+                continue
+            now = datetime.datetime.strptime(now_utc(), "%Y-%m-%dT%H:%M:%SZ")
+            if all(now - datetime.datetime.strptime(c["finished_at"], "%Y-%m-%dT%H:%M:%SZ") <= datetime.timedelta(hours=entry["max_age_hours"]) for c in cmds):
+                return rec
+    except (ValueError, OSError, KeyError, TypeError, AttributeError):
+        return None
+    return None
+
+
 def hosted_ci(res, args, number, cand):
     """CI_PASS, CI_FAILED (refuses), CI_PENDING (defers) or NOT_RUN, which needs a passing local-equivalent record for the candidate."""
     rc, out = run(["gh", "pr", "view", str(number), "--repo", args.repo, "--json", "statusCheckRollup"])
@@ -1710,20 +1748,12 @@ def hosted_ci(res, args, number, cand):
         res.step("hosted_ci", "CI_PASS", {"checks": len(states)})
         return True
     res.step("hosted_ci", "NOT_RUN", {"reason": "no hosted check ran or gh could not report them (outage, quota or none configured)"})
-    logs = os.path.expanduser(args.evidence_dir or omg.LOCAL_EVIDENCE_DIRS["claude"])
-    path = os.path.join(logs, omg.local_ci_evidence_filename(f"{args.repo.replace('/', '__')}-{number}", cand))
-    try:
-        with open(path, "rb") as f:
-            rec = json.loads(f.read(1 << 20))
-        cmds = rec["commands"]
-        good = (rec["repo"].lower() == args.repo.lower() and rec["pr"] == number and rec["head"] == cand and cmds
-                and all(c["exit_code"] == 0 for c in cmds))
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        good = False
-    if not good:
-        raise Refusal("LOCAL_EVIDENCE_REQUIRED", f"hosted CI is NOT_RUN and no passing local-equivalent record exists for {cand[:12]} on PR #{number}; "
+    rec = trusted_local_record(args, number, cand)
+    if rec is None:
+        raise Refusal("LOCAL_EVIDENCE_REQUIRED", f"hosted CI is NOT_RUN and no trusted, fresh local-equivalent record exists for {cand[:12]} on PR #{number}; "
                       "run owner-merge-local-ci.py record at the PR head first")
-    res.step("local_equivalent", "PASS", {"record": os.path.basename(path), "commands": len(cmds)})
+    cmds = rec["commands"]
+    res.step("local_equivalent", "PASS", {"commands": len(cmds), "head": cand})
     return True
 
 
@@ -1749,12 +1779,33 @@ def protection_file(args, branch):
     return proposal_dir(args).parent / "protection" / (branch.replace("/", "%2F") + ".json")
 
 
-def protection_compare(args, branch):
-    """(snapshot digest, current digest, drifted top-level keys) or None when no snapshot was recorded."""
+PROTECTION_PINS = os.path.join(os.path.dirname(os.path.expanduser(omg.VERSION_POLICY_DEFAULT)), "release-protection.json")
+
+
+def trusted_snapshot(args, branch):
+    """The recorded protection snapshot, accepted only when its sha256 is pinned by the owner in release-protection.json (read through the
+    trust-anchor reader), so the agent cannot forge, swap or remove it through --state-dir."""
+    try:
+        pins = omg.read_owner_file(PROTECTION_PINS, True, lambda o: o, "protection pins")
+        pin = pins["snapshots"][args.repo][branch]
+    except FileNotFoundError:
+        raise Refusal("SNAPSHOT_UNPINNED", f"owner file {PROTECTION_PINS} does not exist; the owner pins the snapshot digest there")
+    except (ValueError, OSError, KeyError, TypeError):
+        raise Refusal("SNAPSHOT_UNPINNED", f"no valid pin for {args.repo} {branch} in {PROTECTION_PINS}")
     p = protection_file(args, branch)
-    if not p.exists():
-        return None
-    snap = json.loads(p.read_text())
+    try:
+        raw = p.read_bytes()
+        snap = json.loads(raw)
+    except (OSError, ValueError):
+        raise Refusal("NO_SNAPSHOT", f"no protection snapshot recorded for {branch}; run `protection snapshot --execute`, then the owner pins its digest")
+    if not isinstance(snap, dict) or sha256_bytes(dump(snap)) != pin:
+        raise Refusal("SNAPSHOT_TAMPERED", f"the recorded snapshot for {branch} does not match the owner-pinned digest")
+    return snap
+
+
+def protection_compare(args, branch):
+    """(snapshot digest, current digest, drifted top-level keys); refuses without a trusted, owner-pinned snapshot."""
+    snap = trusted_snapshot(args, branch)
     cur = protection_get(args, branch)
     keys = sorted(k for k in set(snap.get("settings", {})) | set(cur.get("settings", {})) if snap.get("settings", {}).get(k) != cur.get("settings", {}).get(k))
     if snap.get("protected") != cur.get("protected"):
@@ -1779,10 +1830,9 @@ def protection_cmd(args, res):
             write_private(protection_file(args, args.branch).parent, ((protection_file(args, args.branch).name, dump(cur)),))
             j.append(key=f"protection:{args.repo}:{args.branch}", state="snapshot", sha256=digest)
         res.step("snapshot", "RECORDED", {"branch": args.branch, "protected": cur["protected"], "sha256": digest})
+        res.next_action = f"owner: pin sha256 {digest} under snapshots.{args.repo}.{args.branch} in {PROTECTION_PINS}; promote and verify trust only a pinned snapshot"
         return
     cmp_ = protection_compare(args, args.branch)
-    if cmp_ is None:
-        raise Refusal("NO_SNAPSHOT", f"no protection snapshot recorded for {args.branch}; run `protection snapshot --execute` first")
     if cmp_[2]:
         res.step("verify", "PROTECTION_DRIFT", {"branch": args.branch, "snapshot_sha256": cmp_[0], "current_sha256": cmp_[1], "changed": cmp_[2]})
         res.status, res.next_action = "FAIL", f"restore the protection with {ROLLBACK}; this tool never changes protection"
@@ -1805,18 +1855,17 @@ def release_promote(args, res):
     base_ref = need_ref(clone, c.base)
     head, bp = f"promote/{version}", ln["publication_base"]
     done = scan_promotion(clone, base_ref, cand)
-    snap = protection_file(args, c.base).exists()
     with (Journal(args) if args.execute else contextlib.nullcontext()) as j:
         drift = []
+        if args.execute:  # fail closed: an unpinned or missing snapshot means drift could not be detected
+            before = protection_compare(args, c.base)
+            res.step("protection_before", "DRIFT" if before[2] else "UNCHANGED", {"changed": before[2]})
+            if before[2]:
+                raise Refusal("PROTECTION_DRIFT", f"{c.base} protection differs from its snapshot; restore it ({ROLLBACK})", "FAIL")
         try:
-            if snap and args.execute:
-                before = protection_compare(args, c.base)
-                res.step("protection_before", "DRIFT" if before[2] else "UNCHANGED", {"changed": before[2]})
-                if before[2]:
-                    raise Refusal("PROTECTION_DRIFT", f"{c.base} protection differs from its snapshot; restore it ({ROLLBACK})", "FAIL")
             promote_body(args, res, c, go, cand, tag, base_ref, head, bp, done, j)
         finally:
-            if snap and args.execute:
+            if args.execute:
                 try:
                     after = protection_compare(args, c.base)
                     res.step("protection_after", "DRIFT" if after[2] else "UNCHANGED", {"changed": after[2]})
@@ -1825,8 +1874,8 @@ def release_promote(args, res):
                     res.step("protection_after", "NOT_RUN", {"reason": e.code})
         if drift:
             res.status, res.next_action = "FAIL", f"PROTECTION_DRIFT: restore {c.base} protection with {ROLLBACK}"
-    if not snap:
-        res.step("protection", "NOT_RUN", {"reason": "no snapshot recorded for the publication base; run `protection snapshot --execute` before an admin step"})
+    if not args.execute:
+        res.step("protection", "NOT_RUN", {"reason": "--execute refuses unless the owner has pinned a protection snapshot for the publication base"})
 
 
 def promote_body(args, res, c, go, cand, tag, base_ref, head, bp, done, j):
@@ -1943,15 +1992,13 @@ def release_verify(args, res):
         res.step("local_checks", "NOT_RUN", {"reason": "the final tree differs from the candidate tree; re-run with --execute to run the local-first checks at the final SHA"})
         res.status, res.next_action = "NOT_RUN", "re-run with --execute to run the owner's local-first checks in a detached worktree"
         return
-    ci = importlib.util.module_from_spec(importlib.util.spec_from_file_location("owner_merge_local_ci", HERE / "owner-merge-local-ci.py"))
-    ci.__spec__.loader.exec_module(ci)
     try:
-        entry = ci.load_entry(args.repo, args.local_first)
+        ci, entry = load_local_entry(args)
     except (ValueError, OSError) as e:
         res.step("local_checks", "NOT_RUN", {"reason": f"local-first config unavailable: {type(e).__name__}"})
         res.status, res.next_action = "NOT_RUN", "the owner installs the local-first CI config; verification stays NOT_RUN until then"
         return
-    logs = os.path.expanduser(args.evidence_dir or omg.LOCAL_EVIDENCE_DIRS["claude"])
+    logs = os.path.expanduser(omg.LOCAL_EVIDENCE_DIRS["claude"])
     tag = f"{args.repo.replace('/', '__')}-release-{version}"
     wt = tempfile.mkdtemp(prefix="release-verify-")
     results = []
@@ -1978,6 +2025,16 @@ def release_verify(args, res):
         res.status, res.next_action = "FAIL", "a local-first check failed at the final SHA; do not tag or publish"
 
 
+def verified_in_journal(args, final):
+    try:
+        rows = (proposal_dir(args).parent / "journal.jsonl").read_text().splitlines()
+        # The latest verification outcome for this exact final SHA decides: a later failure revokes an earlier pass.
+        last = [r["state"] for r in map(json.loads, rows) if r.get("final_sha") == final and r.get("state") in ("verified", "verify-failed")]
+        return bool(last) and last[-1] == "verified"
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def release_final_tag(args, res):
     c = release_ctx(args, res)
     rl, ln, clone, version = c.rl, c.ln, args.clone, c.version
@@ -1993,9 +2050,11 @@ def release_final_tag(args, res):
         oid, _ = merged_pr_commit(args.repo, merged[0]["number"])
         if oid != final:
             raise Refusal("PROMOTION_MISMATCH", f"PR #{merged[0]['number']} reports merge {oid[:12]}, the base history shows {final[:12]}")
-    check_promotion(clone, final, cand)
+    tree, _ = check_promotion(clone, final, cand)
     if not is_ancestor(clone, final, base_ref):
         raise Refusal("FINAL_NOT_ON_BASE", f"{final[:12]} is not on {c.base}")
+    if tree != git(clone, "rev-parse", cand + "^{tree}")[1].strip() and not verified_in_journal(args, final):
+        raise Refusal("FINAL_NOT_VERIFIED", f"the final tree differs from the candidate tree and `release verify --execute` has not recorded PASS for {final[:12]}")
     name = rl["tag_format"].replace("{version}", version)
     res.env["idempotency_key"] = f"tag:{args.repo}:{name}"
     res.step("go", "ACCEPTED", {"scope": "final_tag", "candidate_sha": cand})
@@ -2086,7 +2145,6 @@ def build_parser():
             sub.add_argument("--n", type=int, help="candidate number when no GO record names the tag")
         if name in ("promote", "verify"):
             sub.add_argument("--local-first", help="local-first CI trust file (default: the owner file)")
-            sub.add_argument("--evidence-dir", help="local CI evidence directory (default: the host evidence directory)")
     prot = top.add_parser("protection").add_subparsers(dest="cmd", required=True)
     for name in ("snapshot", "verify"):
         prot.add_parser(name, parents=[common]).add_argument("--branch", required=True)
