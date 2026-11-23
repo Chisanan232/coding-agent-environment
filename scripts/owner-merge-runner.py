@@ -634,7 +634,8 @@ def check_private_free(runner, repo, base):
 
 def check_local_gate_base(runner, repo, base):
     """local_gate_only mode: there is no hosted required check, so the base branch itself must be protected. Requires readable
-    classic protection with enforce_admins on and force-push and deletion off, and no ruleset bypass actor. accept_bypass_actors
+    classic protection (rulesets alone are refused) with enforce_admins on, force-push and deletion off, a required_pull_request_reviews
+    object (direct pushes blocked), and no ruleset bypass actor. accept_bypass_actors
     never waives any of this."""
     rc, rules, err = _read_json(runner, rules_argv(repo, base), "gh rules read")
     if rc != 0:
@@ -649,6 +650,10 @@ def check_local_gate_base(runner, repo, base):
     if not isinstance(prot, dict):
         raise Refused(["local_gate_only: branch protection response is malformed"])
     bad = []
+    # Without a pull-request requirement a writer could push straight to the base; with enforce_admins on, an
+    # object here (even with 0 required approvals) forces every change through a PR.
+    if not isinstance(prot.get("required_pull_request_reviews"), dict):
+        bad.append("local_gate_only: required_pull_request_reviews is absent or malformed, so direct pushes are not blocked")
     for key, want, what in (("enforce_admins", True, "enforce_admins is not enabled"),
                             ("allow_force_pushes", False, "force pushes are not disabled"),
                             ("allow_deletions", False, "branch deletion is not disabled")):
@@ -657,7 +662,10 @@ def check_local_gate_base(runner, repo, base):
             bad.append(f"local_gate_only: {what} (or the field is missing or malformed)")
     if bad:
         raise Refused(bad)
-    ids = {r["ruleset_id"] for r in rules if isinstance(r.get("ruleset_id"), int) and not isinstance(r.get("ruleset_id"), bool)}
+    # A rule whose ruleset id cannot be read would hide that ruleset's bypass actors, so any such entry refuses.
+    if any(type(r.get("ruleset_id")) is not int or r["ruleset_id"] <= 0 for r in rules):
+        raise Refused(["local_gate_only: a server-side rule has no valid ruleset_id, so its bypass actors cannot be read"])
+    ids = {r["ruleset_id"] for r in rules}
     for rid in sorted(ids):
         rc, detail, _ = _read_json(runner, ruleset_argv(repo, rid), "gh ruleset read")
         actors = detail.get("bypass_actors") if isinstance(detail, dict) else None
@@ -668,6 +676,7 @@ def check_local_gate_base(runner, repo, base):
     return {"contexts": [], "protection": "read", "enforce_admins": True, "bypass": "none", "waivers": [],
             "server_side": "local-gate-protected-base",
             "facts": {"enforce_admins": True, "allow_force_pushes": False, "allow_deletions": False,
+                      "pull_request_required": True,
                       "ruleset_ids": sorted(ids), "bypass_actors": 0}}
 
 
