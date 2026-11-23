@@ -56,6 +56,11 @@ class Base(unittest.TestCase):
         for d in (self.home / ".config", self.home / ".config/coding-agent-environment", self.local):
             os.chmod(d, 0o700)
         self.policy_path = self.local / "version-branches.json"
+        # Owner-visible test hook: release-line-test-env.json names the variables the fake gh/git wrappers need; the tool drops every other inherited one.
+        hook = self.local / "release-line-test-env.json"
+        hook.write_text(json.dumps({"schema": 1, "pass": ["FAKE_GH_STATE", "GIT_LOG", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+                                                          "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE"]}))
+        os.chmod(hook, 0o600)
         self.bin = pathlib.Path(self.tmp.name) / "bin"
         self.bin.mkdir()
         gh = self.bin / "gh"
@@ -66,6 +71,14 @@ class Base(unittest.TestCase):
         self.state_dir = pathlib.Path(self.tmp.name) / "state"
         self.env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GIT_CONFIG_NOSYSTEM": "1",
                     "GIT_CONFIG_GLOBAL": "/dev/null", "SOURCE_DATE_EPOCH": "1767225600", "FAKE_GH_STATE": str(self.gh_state)}
+
+    def allow_origin(self, bare):
+        """Owner-visible test override: release-origins.json (trust-anchor file under the fixture HOME) lists the local bare repository as this repo's origin."""
+        f = self.local / "release-origins.json"
+        cur = json.loads(f.read_text()) if f.exists() else {"schema": 1, "origins": {REPO: []}}
+        cur["origins"][REPO].append(str(bare))
+        f.write_text(json.dumps(cur))
+        os.chmod(f, 0o600)
 
     def set_gh(self, **state):
         self.gh_state.write_text(json.dumps(state))
@@ -117,6 +130,7 @@ class Base(unittest.TestCase):
         git(work, "push", "origin", "--all")
         git(work, "push", "origin", "--tags")
         git(work, "fetch", "origin")
+        self.allow_origin(bare)
         self.clone = str(work)
         return self.clone
 
