@@ -76,6 +76,7 @@ class TrainBase(base.Base):
         self.bare, self.work = root / "origin.git", root / "work"
         self.w("init", "-q", "--bare", "-b", "main", str(self.bare), cwd=root)
         self.w("clone", "-q", str(self.bare), str(self.work), cwd=root)
+        self.allow_origin(self.bare)
         self.w("checkout", "-q", "-B", "main")
         self.commit("main", "init.txt")
         self.set_gh(prs=[], bare=str(self.bare))

@@ -67,6 +67,14 @@ class Base(unittest.TestCase):
         self.env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin", "GIT_CONFIG_NOSYSTEM": "1",
                     "GIT_CONFIG_GLOBAL": "/dev/null", "SOURCE_DATE_EPOCH": "1767225600", "FAKE_GH_STATE": str(self.gh_state)}
 
+    def allow_origin(self, bare):
+        """Owner-visible test override: release-origins.json (trust-anchor file under the fixture HOME) lists the local bare repository as this repo's origin."""
+        f = self.local / "release-origins.json"
+        cur = json.loads(f.read_text()) if f.exists() else {"schema": 1, "origins": {REPO: []}}
+        cur["origins"][REPO].append(str(bare))
+        f.write_text(json.dumps(cur))
+        os.chmod(f, 0o600)
+
     def set_gh(self, **state):
         self.gh_state.write_text(json.dumps(state))
 
@@ -117,6 +125,7 @@ class Base(unittest.TestCase):
         git(work, "push", "origin", "--all")
         git(work, "push", "origin", "--tags")
         git(work, "fetch", "origin")
+        self.allow_origin(bare)
         self.clone = str(work)
         return self.clone
 
