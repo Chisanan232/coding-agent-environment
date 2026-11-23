@@ -729,6 +729,16 @@ class StandingAdminMerge(unittest.TestCase):
             self.assertNotEqual(verdict, "PASS", reasons)
             self.assertFalse(facts.get("standing_admin_merge", False))
 
+    def test_public_ok_never_widens_the_private_only_admin_merge(self):
+        fake = self.fake(lf_record(), isPrivate=False)
+        verdict, reasons, facts = self.evaluate(fake, public_ok=True)
+        self.assertFalse(facts.get("standing_admin_merge", False), facts)
+        if verdict == "PASS":
+            command = omg.select_executor(None, facts, "/home/owner", True, {"chisanan232/r"})["command"]
+            self.assertNotIn("--admin", command.split())
+        verdict, reasons, facts = self.evaluate(self.fake(lf_record(), isPrivate=False))
+        self.assertNotEqual(verdict, "PASS", reasons)
+
     def test_genuine_failed_hosted_check_and_repository_block_refuse(self):
         bad_check = [{"name": "test", "status": "COMPLETED", "conclusion": "FAILURE"}]
         for fake, expected in ((self.fake(lf_record(), checks=bad_check), "CI_FAILED"),
@@ -1185,6 +1195,34 @@ class LocalFirst(unittest.TestCase):
     def test_a_public_repository_is_denied(self):
         self.refused(self.fake(isPrivate=False), "NOT_PRIVATE")
         self.refused(self.fake(isPrivate=None), "NOT_PRIVATE")
+
+    def public_config(self, value=True):
+        entry = dict(LF_CONFIG["repos"]["Chisanan232/r"], public_ok=value)
+        return {"schema": 1, "repos": {"Chisanan232/r": entry}}
+
+    def test_public_repository_passes_only_with_the_owner_public_ok_opt_in(self):
+        for private in (False, None, "yes"):
+            self.refused(self.fake(isPrivate=private), "NOT_PRIVATE", config=self.public_config(False))
+            self.refused(self.fake(isPrivate=private), "NOT_PRIVATE", config=LF_CONFIG)
+        verdict, reasons, facts = self.evaluate(self.fake(isPrivate=False), config=self.public_config(True))
+        self.assertEqual(verdict, "PASS", reasons)
+        self.assertIs(facts.get("public_repo_local_first"), True)
+        # the opt-in does not skip any other requirement
+        verdict, reasons, _ = self.evaluate(self.fake(isPrivate=False, files=[{"path": "scripts/ci/x.sh"}]),
+                                            config=self.public_config(True))
+        self.assertEqual(verdict, "REFUSE", reasons)
+        v, _, facts = self.evaluate(self.fake(), config=self.public_config(True))
+        self.assertNotIn("public_repo_local_first", facts)
+
+    def test_public_ok_must_be_a_boolean_and_unknown_keys_stay_refused(self):
+        self.assertIs(omg.load_local_first(self.public_config(True))["chisanan232/r"]["public_ok"], True)
+        self.assertNotIn("public_ok", omg.load_local_first(LF_CONFIG)["chisanan232/r"])
+        for bad in ("true", 1, 0, None, [], {}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                omg.load_local_first(self.public_config(bad))
+        entry = dict(LF_CONFIG["repos"]["Chisanan232/r"], public_okay=True)
+        with self.assertRaises(ValueError):
+            omg.load_local_first({"schema": 1, "repos": {"Chisanan232/r": entry}})
 
     def test_each_identity_field_mismatch_alone_refuses(self):
         for over in ({"repo": "Chisanan232/x"}, {"pr": 8}, {"base": "dev"}, {"head": "c" * 40}, {"base_sha": "d" * 40}):
