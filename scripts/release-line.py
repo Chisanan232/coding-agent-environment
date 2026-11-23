@@ -166,6 +166,9 @@ def validate_entry(entry):
         return errs
     ids = [x.get("id") for x in lines if isinstance(x, dict)]
     majors = {}
+    # A publication base of any line is protected: the gate must never merge feature work straight into it.
+    bases = {x["publication_base"]["branch"] for x in lines if isinstance(x, dict) and isinstance(x.get("publication_base"), dict)
+             and isinstance(x["publication_base"].get("branch"), str)} | {"main", "master"}
     for ln in lines:
         lid = ln.get("id") if isinstance(ln, dict) else None
         if not isinstance(lid, str) or not LINE_ID_RE.fullmatch(lid) or ids.count(lid) > 1:
@@ -191,6 +194,8 @@ def validate_entry(entry):
             err(lid, "BAD_FIELD", "integration_branch missing")
         elif RELEASE_SEGMENT.search(ib):
             err(lid, "RELEASE_SEGMENT", f"{ib}: the gate refuses any branch with a release segment; use integration/v<major>.x")
+        elif ib in bases:
+            err(lid, "PROTECTED_BRANCH", f"{ib} is a publication base or default branch and cannot be an integration branch")
         elif ib not in branches:
             err(lid, "NOT_MERGE_ELIGIBLE", f"{ib} is not listed in branches, so the gate would not merge into it")
         pb = ln.get("publication_base")
@@ -480,7 +485,10 @@ def branch_ref(clone, branch):
 
 def tag_names(clone, *extra):
     rc, out = git(clone, "tag", "--list", *extra)
-    return out.split() if rc == 0 else []
+    if rc != 0:
+        # An unreadable tag list would make every line look unfrozen and route work onto a shipped line.
+        raise Refusal("TAG_LIST_FAILED", "git tag --list failed in the clone; fetch tags and retry")
+    return out.split()
 
 
 def unshipped_candidates(clone, rl, ln):
