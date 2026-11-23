@@ -340,6 +340,31 @@ class Cli(FP):
         self.install(p)
         self.assertIn("AUDIT_PENDING", self.codes(self.fp("plan", "--merge", "HEAD")[1]))
 
+    def test_gh_outage_on_plan_is_not_run_not_deferred(self):
+        m1 = self.merge_fix("one.txt")
+        (self.bin / "gh").write_text("#!/bin/sh\nexit 1\n")
+        out = self.fp("plan", "--merge", m1)[1]
+        self.assertIn("NOT_RUN", {s["state"] for s in out["steps"] if s["step"] == "pr_lookup"})
+        self.assertEqual(out["status"], "NOT_RUN")
+        self.assertEqual(self.fp("status", "--merge", m1)[1]["status"], "NOT_RUN")
+
+    def test_old_git_is_refused_not_reported_as_conflict(self):
+        spec = importlib.util.spec_from_file_location("rlmod3", ROOT / "scripts/release-line.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.git = lambda *a, **k: (0, "git version 2.39.5")
+        with self.assertRaises(mod.Refusal) as cm:
+            mod.require_git_version("/x", (2, 40))
+        self.assertEqual(cm.exception.code, "GIT_TOO_OLD")
+        mod.git = lambda *a, **k: (0, "git version 2.50.1 (Apple Git-155)")
+        mod.require_git_version("/x", (2, 40))
+
+    def test_template_requires_pinned_tool_and_propagates_failure(self):
+        text = (ROOT / "docs/templates/workflows/release-line.yml").read_text()
+        self.assertIn('${TOOL:?', text)
+        self.assertNotIn("|| true", text)
+        self.assertIn('exit "$rc"', text)
+
     def test_template_is_inert_and_safe(self):
         text = (ROOT / "docs/templates/workflows/release-line.yml").read_text()
         self.assertIn("RELEASE_LINES_JSON", text)

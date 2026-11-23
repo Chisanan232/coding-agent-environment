@@ -1213,6 +1213,13 @@ def source_origin(ctx, src, hint):
     return f"base:{hint}", min(owned) if owned else (10 ** 6, 0), hint, True
 
 
+def require_git_version(clone, minimum):
+    rc, out = git(clone, "--version")
+    m = re.search(r"(\d+)\.(\d+)", out if rc == 0 else "")
+    if not m or (int(m.group(1)), int(m.group(2))) < minimum:
+        raise Refusal("GIT_TOO_OLD", f"git >= {minimum[0]}.{minimum[1]} is required (found: {out.strip() or 'unknown'}); a failed merge-tree must not be reported as a conflict")
+
+
 def loop_reason(ctx, src, own_branch):
     """Why this commit must not be forward-ported again, or None. Ports, integrate, converge and promote merges are never sources."""
     for sha, msg in [(src.sha, src.msg)] + src.range_msgs:
@@ -1220,7 +1227,8 @@ def loop_reason(ctx, src, own_branch):
         if SHA_RE.fullmatch(t.get("Source", "")):
             return "LOOP_PREVENTED", f"{sha[:12]} carries Release-Line-Source {t['Source'][:12]}: it is itself a port or equivalence record"
     if src.merge:
-        others = [x["integration_branch"] for x in ctx.rl["lines"]] + sorted(ctx.bases)
+        # Only registered branches count: an unregistered default branch (main) holding the second parent says nothing about integration work.
+        others = [x["integration_branch"] for x in ctx.rl["lines"]] + sorted({x["publication_base"]["branch"] for x in ctx.rl["lines"]})
         for b in others:
             ref = branch_ref(ctx.clone, b)
             if b != own_branch and ref and is_ancestor(ctx.clone, src.tip, ref) and not is_ancestor(ctx.clone, src.sha, ref):
@@ -1431,6 +1439,7 @@ def forward_port(args, res):
     _, entry = check_policy(policy, args.repo)
     require_ready(entry)
     rl = entry["release_lines"]
+    require_git_version(args.clone, (2, 40))  # merge-tree --write-tree --merge-base builds the port without touching the worktree
     fetch(args.clone)
     revs, hint = fp_revs(args, res)
     ctx = types.SimpleNamespace(
@@ -1453,6 +1462,8 @@ def forward_port(args, res):
     pending = [r for r in results if r["state"] == "pending"]
     if any(r["state"] == "conflict" for r in results):
         res.status, res.next_action = "BLOCKED", "resolve the conflicting targets by hand (each target is independent; the others proceed)"
+    elif not ctx.gh_ok:
+        res.status, res.next_action = "NOT_RUN", "gh was unavailable, so pull request state is unknown; restore gh and re-run"
     elif pending:
         res.status = "DEFERRED" if ctx.execute or args.cmd == "status" else "NOT_RUN"
         res.next_action = ("merge the forward-port PRs through the normal gate, then re-run to account for them" if ctx.execute or args.cmd == "status"
