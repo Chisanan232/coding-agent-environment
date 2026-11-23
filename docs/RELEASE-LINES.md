@@ -195,7 +195,53 @@ never a symlink, never under the owner config root); the journal is an audit tra
 maintenance branch it runs `forward-port run --execute --pr N`, posts the accounting to the job summary and the PR, reads the owner mirror from the
 Actions variable `RELEASE_LINES_JSON` and reports `NOT_RUN` when it is missing. It has no publish, tag or merge step and does not dispatch workflows.
 
+## Release: candidate-tag, promote, verify, final-tag, protection (SPE-184a)
+
+```
+python3 -I $R release candidate-tag --version V [--line L] [--sha SHA] [--n N] --repo OWNER/REPO --clone PATH [--execute]
+python3 -I $R release promote       --version V [--line L] [--local-first FILE] --repo OWNER/REPO --clone PATH [--execute]
+python3 -I $R release verify        --version V [--line L] [--local-first FILE] --repo OWNER/REPO --clone PATH [--execute]
+python3 -I $R release final-tag     --version V [--line L] --repo OWNER/REPO --clone PATH [--execute]
+python3 -I $R protection snapshot|verify --branch B --repo OWNER/REPO [--execute]
+```
+
+All default to a dry plan and refuse `AUDIT_PENDING`. Publication approval is a per-version GO record,
+`~/.config/coding-agent-environment/local/release-go/<owner>__<repo>__<version>.json` (`--go-dir` must stay under the owner config root), read through the
+trust-anchor reader: `repo`, `version`, `candidate_tag`, `candidate_sha`, `publication_base`, `scopes` (`candidate_tag|promote|final_tag|publish`),
+`authority`, `created_utc`, optional `expires_utc`. Refusals: `GO_MISSING`, `GO_INVALID` (untrusted or malformed), `GO_MISMATCH` (repo, version,
+publication base, candidate tag or SHA differ), `GO_EXPIRED`, `GO_SCOPE`. The tool never writes a record and never prints its contents. With
+`milestone_tags: pre-authorized`, `candidate-tag` needs no record.
+
+`candidate-tag` (key `tag:<repo>:<tag>`): an annotated tag per `candidate_format` on the integration tip, or `--sha` (must be reachable from it). Only a new
+ref is pushed (verified with `ls-remote`); the same tag at the same commit is `REUSED`, at another commit `CONFLICT_EXISTING`. Tags are never moved or deleted.
+
+`promote` (key `promote:<repo>:<version>:<candidate_sha>`; needs git 2.38+ for `merge-tree --write-tree`): preconditions are a supported, active line; every
+predecessor shipped and integrated, and the candidate cut after that integration (`PREDECESSOR_NOT_SHIPPED`, `PREDECESSOR_NOT_INTEGRATED`, `STALE_CANDIDATE`);
+for a maintenance base the latest same-major final tag is on the base and the version is greater (`BASE_MISSING_FINAL`, `VERSION_NOT_GREATER`); forward-port
+accounting complete for every base-only change (`FORWARD_PORT_INCOMPLETE`); and the GO `promote` scope. It predicts `merge-tree` (conflict is `MERGE_CONFLICT`,
+BLOCKED, nothing pushed), pushes `promote/<version>` at the candidate SHA (any other SHA is `CONFLICT_EXISTING`), opens or reuses the PR to the
+publication base, checks hosted CI, then with `--execute` runs `gh pr merge N --merge --match-head-commit <candidate_sha> --repo OWNER/REPO` as its own call (never
+`--admin`, `--squash`, `--rebase` or `--auto`). The final SHA is the PR's `mergeCommit.oid`; the tool asserts `final^2 == candidate` and `final^{tree}` equals the
+`merge-tree` result for `final^1` and the candidate (`PROMOTION_ASSERTION_FAILED` is FAIL). A rerun after the merge reports `ALREADY_PROMOTED` and merges nothing.
+Verification is `CARRIED_OVER` when the final tree equals the candidate tree, otherwise `REQUIRED`.
+
+Hosted CI: `CI_PASS` proceeds, a failing check is `CI_FAILED` (FAIL, never bypassed), pending checks are `DEFERRED`. When no hosted check ran (outage, quota, none
+configured) the step is recorded `NOT_RUN` and promotion needs a local-equivalent record: the recorder's record for the PR head, read from the fixed evidence
+directories (owner, mode 0600, single link, log digests re-verified through `verify_standing_local_record`), with commands equal to the owner's local-first entry,
+all exit 0, and no older than `max_age_hours` (`LOCAL_EVIDENCE_REQUIRED` otherwise). No workflow is dispatched or rerun.
+
+`verify`: `CARRIED_OVER` when trees match; otherwise it needs `--execute` and runs the owner's local-first checks in a detached worktree at the final SHA
+(`PASS`, `FAIL`, or `NOT_RUN` when the trust file is unavailable) and journals `verified` or `verify-failed` for that SHA.
+
+`final-tag`: GO `final_tag`; the final SHA is found from the promotion merge (cross-checked with the PR's merge commit), never the base tip, and must be on the
+publication base. When the final tree differs from the candidate tree the latest journal outcome for that SHA must be `verified` (`FINAL_NOT_VERIFIED`). An annotated
+`tag_format` tag is pushed as a new ref. The journal records source branch, release line, version, promotion PR, candidate and final SHAs.
+
+`protection snapshot` records the publication base's protection (read-only `gh api`, URL fields removed) in the state directory; the snapshot is trusted only
+when the owner pins its sha256 under `snapshots.<repo>.<branch>` in `~/.config/coding-agent-environment/local/release-protection.json` (`SNAPSHOT_UNPINNED`,
+`NO_SNAPSHOT`, `SNAPSHOT_TAMPERED`). `protection verify` reports `PROTECTION_DRIFT` (FAIL) with the owner-run `branch-protection-rollout.py` rollback; `promote --execute`
+refuses without a pinned snapshot and compares before and after the merge. The tool never changes protection.
+
 ## Planned (not implemented)
 
-Later slices of SPE-180: release candidate-tag/promote/verify/final-tag (SPE-184a); build/notes/publish (SPE-184b); protection snapshot/verify,
-skill packaging and install (SPE-181b); acceptance from installed entry points (SPE-185). None of these commands exist yet.
+Later slices of SPE-180: build/notes/publish (SPE-184b); skill packaging and install (SPE-181b); acceptance from installed entry points (SPE-185).
