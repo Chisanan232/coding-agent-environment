@@ -47,7 +47,8 @@ AUDIT_MAX_BYTES = 1 << 20
 STATE_ROOT = "~/.local/state/coding-agent-environment/release-line"
 
 
-BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,100}")
+# Mirrors git check-ref-format: no "..", "//", empty or dot-leading components, ".lock" suffix, or trailing "/" or ".".
+BRANCH_NAME_RE = re.compile(r"(?!.*(?:\.\.|//|/\.|\.lock(?:/|$)|[/.]$))[A-Za-z0-9][A-Za-z0-9._/-]{0,100}")
 
 
 class Refusal(Exception):
@@ -564,6 +565,7 @@ def route(args, res):
     if args.kind == "fix" or not frozen:
         return done(mline, "major line" + (" (fix for a frozen candidate)" if frozen else ""))
     active = [x for x in chain_of(rl, mline) if x["support"] == "supported" and x["state"] == "active"]
+    newest_frozen = None
     for tip in sorted(active, key=lambda x: vkey(x["version"]), reverse=True):
         if branch_ref(args.clone, tip["integration_branch"]) is None:
             raise Refusal("BRANCH_NOT_IN_CLONE", f"{tip['integration_branch']} is not in the clone; fetch it first")
@@ -571,10 +573,10 @@ def route(args, res):
         tip_frozen = [v for v in unshipped_candidates(args.clone, rl, tip) if v == tip["version"]]
         if not tip_frozen:
             return done(tip, f"major line is frozen by unshipped candidate {frozen[-1]}; feature goes to the newest unfrozen successor")
-        frozen = frozen + tip_frozen
-    res.step("route", "NEEDS_SUCCESSOR", {"line": mline["id"], "frozen_by": frozen[-1], "requested_version": args.version})
+        newest_frozen = newest_frozen or tip_frozen[-1]  # the newest tip is the one a new successor would follow
+    res.step("route", "NEEDS_SUCCESSOR", {"line": mline["id"], "frozen_by": newest_frozen or frozen[-1], "requested_version": args.version})
     res.status = "BLOCKED"
-    res.next_action = (f"no successor exists after frozen candidate {frozen[-1]}; owner registers one with "
+    res.next_action = (f"no successor exists after frozen candidate {newest_frozen or frozen[-1]}; owner registers one with "
                        "`successor ensure` then `registry propose --op add-successor`. Only this feature is blocked")
 
 
