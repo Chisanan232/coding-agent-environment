@@ -39,9 +39,9 @@ STATE_ROOT = "~/.local/state/coding-agent-environment/release-line"
 
 
 class Refusal(Exception):
-    def __init__(self, code, detail=""):
+    def __init__(self, code, detail="", status="BLOCKED"):
         super().__init__(code)
-        self.code, self.detail = code, detail
+        self.code, self.detail, self.status = code, detail, status
 
 
 class ConfigError(Exception):
@@ -235,6 +235,9 @@ def emit_proposal(args, res, policy, baseline_sha, candidate, tag, summary):
     except (ConfigError, Refusal) as e:
         detail = e.errors if isinstance(e, ConfigError) and e.errors else e.detail
         raise Refusal("INVALID_CANDIDATE", json.dumps(detail))
+    adds = gate_additions(policy, candidate, repo)
+    if adds["branches"] or adds["prefixes"]:
+        summary += f"; GATE-RELEVANT ADDITIONS branches={adds['branches']} prefixes={adds['prefixes']}"
     body = dump(candidate)
     if len(body) > omg.POLICY_MAX_BYTES:
         raise Refusal("INVALID_CANDIDATE", f"candidate exceeds {omg.POLICY_MAX_BYTES} bytes")
@@ -247,7 +250,7 @@ def emit_proposal(args, res, policy, baseline_sha, candidate, tag, summary):
         "scope": f"release_lines change for {repo}: {summary}", "baseline": os.path.expanduser(args.policy or omg.VERSION_POLICY_DEFAULT),
         "baseline_sha256": baseline_sha, "candidate": str(cand_path), "candidate_sha256": cand_sha, "source_commit": tool_revision(),
         "canonical_loader": loader, "independent_review": "<pending>", "created_utc": now_utc()}
-    evidence = {"baseline_sha256": baseline_sha, "candidate_sha256": cand_sha, "canonical_loader": loader, "summary": summary,
+    evidence = {"gate_relevant_additions": adds, "baseline_sha256": baseline_sha, "candidate_sha256": cand_sha, "canonical_loader": loader, "summary": summary,
                 "candidate_path": str(cand_path), "authority_path": str(auth_path)}
     if args.execute:
         d.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -262,6 +265,16 @@ def emit_proposal(args, res, policy, baseline_sha, candidate, tag, summary):
         res.step("emit", "DRY_PLAN", evidence)
         res.status, res.next_action = "NOT_RUN", "re-run with --execute to write the candidate and authority template"
     res.step("authority_template", "TEMPLATE", authority)
+
+
+def gate_additions(old, new, repo):
+    """Branches and head prefixes the candidate adds to the repo entry: the only part of a packet that changes what the gate approves."""
+    _, o = find_entry(old, repo)
+    _, n = find_entry(new, repo)
+    ob = {b.get("branch") for b in (o or {}).get("branches", [])}
+    op = set((o or {}).get("future_head_prefixes", []))
+    return {"branches": [b["branch"] for b in n.get("branches", []) if b.get("branch") not in ob],
+            "prefixes": [x for x in n.get("future_head_prefixes", []) if x not in op]}
 
 
 def propose(args, res):
@@ -445,6 +458,13 @@ def audit_import(args, res):
     if not (isinstance(audit, dict) and audit.get("schema") == 1 and isinstance(audit.get("release_lines"), dict)
             and isinstance(audit.get("repo"), str) and audit["repo"].lower() == args.repo.lower()):
         raise ConfigError("AUDIT_INVALID", "audit needs schema 1, a repo equal to --repo and a release_lines object")
+    smuggled = [k for k in ("branches", "future_head_prefixes") if k in audit]
+    if smuggled:
+        raise Refusal("AUDIT_CARRIES_GATE_KEYS", f"audit file must not carry {smuggled}; an import adds only the imported lines' integration branches and promote/", "FAIL")
+    lines = audit["release_lines"].get("lines")
+    bad = [str(x.get("integration_branch")) for x in lines if isinstance(x, dict) and RELEASE_SEGMENT.search(str(x.get("integration_branch")))] if isinstance(lines, list) else []
+    if bad:
+        raise Refusal("RELEASE_SEGMENT", f"{bad}: the gate refuses any branch with a release segment; use integration/v<major>.x", "FAIL")
     obs_sha = sha256_bytes(raw)
     try:
         policy, baseline_sha = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
@@ -457,13 +477,15 @@ def audit_import(args, res):
     if entry is None:
         key, entry = args.repo, {"branches": [], "future_head_prefixes": []}
         cand["repos"][key] = entry
-    for b in audit.get("branches", []):
-        if isinstance(b, dict) and b.get("branch") not in [x.get("branch") for x in entry["branches"]]:
-            entry["branches"].append(b)
-    for pre in audit.get("future_head_prefixes", []):
-        if pre not in entry.setdefault("future_head_prefixes", []):
-            entry["future_head_prefixes"].append(pre)
     rl = copy.deepcopy(audit["release_lines"])
+    listed = [x.get("branch") for x in entry["branches"]]
+    for ln in rl.get("lines") if isinstance(rl.get("lines"), list) else []:
+        ib = ln.get("integration_branch") if isinstance(ln, dict) else None
+        if isinstance(ib, str) and ib not in listed:
+            listed.append(ib)
+            entry["branches"].append({"branch": ib, "version": ln.get("version") or f"{ln.get('major')}.x"})
+    if "promote/" not in entry.setdefault("future_head_prefixes", []):
+        entry["future_head_prefixes"].append("promote/")
     rl["audit"] = {"status": "COMPLETE", "source": path.name, "observed_sha256": obs_sha}
     entry["release_lines"] = rl
     res.step("audit_file", "VALID", {"observed_sha256": obs_sha})
@@ -560,7 +582,7 @@ def main(argv=None):
         HANDLERS[(args.group, cmd)](args, res)
         code = {"PASS": 0, "NOT_RUN": 0, "DEFERRED": 0}.get(res.status, 1)
     except Refusal as e:
-        res.status, code = "BLOCKED", 1
+        res.status, code = e.status, 1
         res.step("refused", e.code, {"detail": e.detail})
         res.next_action = "UNREGISTERED: add release_lines to the owner policy (`audit import`)" if e.code == "UNREGISTERED" else f"resolve {e.code}"
     except ConfigError as e:

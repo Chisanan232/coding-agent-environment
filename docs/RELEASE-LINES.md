@@ -62,6 +62,11 @@ Validator rules (registry validate, and every candidate the tool emits):
   `authority`, `scope`, `baseline`, `baseline_sha256`, `candidate`, `candidate_sha256`, `source_commit`, `canonical_loader`,
   `independent_review`, `created_utc`). The owner cites the founder instruction, reviews and installs the candidate.
 
+An audit file may not carry `branches` or `future_head_prefixes` (refused, status FAIL, exit 1, nothing written) and no line may use a
+`release` branch segment. The only gate-relevant additions an import proposes are the imported lines' unlisted `integration_branch`
+values and `promote/`. Every proposal lists its additions explicitly (`gate_relevant_additions` in the step evidence, the summary
+and the authority-record `scope`) so the owner sees what the approval changes.
+
 ## Owner packets
 
 Proposals are written only with `--execute` (without it the command prints a dry plan with the digests) to
@@ -97,7 +102,7 @@ newest active successor, or the result is `NEEDS_SUCCESSOR` (status BLOCKED, onl
 
 `audit observe` is read-only: branches, tag patterns, PR base counts and merged `promote/` PRs (via `gh pr list`; without a
 usable `gh` that step is `NOT_RUN` and the git facts still stand), and release-related doc paths. `audit import FILE` takes an
-audit JSON `{schema: 1, repo, branches, future_head_prefixes, release_lines}`, validates it, and emits a candidate whose
+audit JSON `{schema: 1, repo, release_lines}`, validates it, and emits a candidate whose
 `audit` is `COMPLETE` with `source` and the sha256 of the audit file. That is what ends `AUDIT_PENDING`, once the owner
 installs the candidate.
 

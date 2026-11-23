@@ -374,8 +374,7 @@ class AuditTests(Base):
 
     def audit_file(self, **over):
         a = example()
-        body = {"schema": 1, "repo": REPO, "branches": entry(a)["branches"], "future_head_prefixes": entry(a)["future_head_prefixes"],
-                "release_lines": entry(a)["release_lines"]}
+        body = {"schema": 1, "repo": REPO, "release_lines": entry(a)["release_lines"]}
         body.update(over)
         path = pathlib.Path(self.tmp.name) / "audit.json"
         path.write_text(json.dumps(body))
@@ -395,6 +394,34 @@ class AuditTests(Base):
         rc, out, _ = self.cli("registry", "propose", "--op", "eol", "--line", "v0", "--execute")
         self.assertEqual(rc, 0, out)
 
+    def test_import_lists_exactly_the_gate_relevant_additions(self):
+        rc, out, _ = self.cli("audit", "import", str(self.audit_file()), "--execute")
+        self.assertEqual(rc, 0, out)
+        adds = next(s for s in out["steps"] if s["step"] == "emit")["evidence"]["gate_relevant_additions"]
+        self.assertEqual(adds, {"branches": ["integration/v0.x", "integration/v0.4.0"], "prefixes": ["promote/"]})
+        ev = next(s for s in out["steps"] if s["step"] == "emit")["evidence"]
+        scope = json.loads(pathlib.Path(ev["authority_path"]).read_text())["scope"]
+        for name in ("integration/v0.x", "integration/v0.4.0", "promote/", "GATE-RELEVANT"):
+            self.assertIn(name, scope)
+        cand = json.loads(pathlib.Path(ev["candidate_path"]).read_text())
+        self.assertEqual(entry(cand)["future_head_prefixes"], ["promote/"])
+
+    def test_import_refuses_smuggled_branches_prefixes_and_release_segments(self):
+        for over, code in (({"branches": [{"branch": "integration/evil", "version": "9"}]}, "AUDIT_CARRIES_GATE_KEYS"),
+                           ({"future_head_prefixes": ["evil/"]}, "AUDIT_CARRIES_GATE_KEYS")):
+            with self.subTest(code, over=list(over)):
+                rc, out, _ = self.cli("audit", "import", str(self.audit_file(**over)), "--execute")
+                self.assertEqual((rc, out["status"]), (1, "FAIL"))
+                self.assertIn(code, self.codes(out))
+                self.assertFalse(self.state_dir.exists())
+        a = example()
+        rl = entry(a)["release_lines"]
+        rl["lines"][0]["integration_branch"] = "release/v0.x"
+        rc, out, _ = self.cli("audit", "import", str(self.audit_file(release_lines=rl)), "--execute")
+        self.assertEqual((rc, out["status"]), (1, "FAIL"))
+        self.assertIn("RELEASE_SEGMENT", self.codes(out))
+        self.assertFalse(self.state_dir.exists())
+
     def test_import_merges_into_an_existing_policy_without_dropping_other_repos(self):
         p = {"schema": 1, "repos": {"Other/plain": {"branches": [{"branch": "integration/mvp-1.0", "version": "1.0"}]}}}
         self.install(p)
@@ -412,7 +439,7 @@ class AuditTests(Base):
             self.assertEqual(self.cli("audit", "import", str(self.audit_file(**over)))[0], 3, over)
         a = example()
         lines = entry(a)["release_lines"]
-        lines["lines"][0]["integration_branch"] = "integration/unlisted"
+        lines["lines"][0]["support"] = "maybe"
         rc, out, _ = self.cli("audit", "import", str(self.audit_file(release_lines=lines)), "--execute")
         self.assertEqual(rc, 1)
         self.assertIn("INVALID_CANDIDATE", self.codes(out))
