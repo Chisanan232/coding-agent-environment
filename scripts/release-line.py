@@ -39,6 +39,7 @@ import sys
 import tempfile
 import time
 import types
+import urllib.parse
 
 HERE = pathlib.Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("owner_merge_gate", HERE / "owner-merge-gate.py")
@@ -87,7 +88,9 @@ def run(argv, cwd=None, extra_env=None, stdin=None):
 
 def git(clone, *args, env=None, stdin=None):
     # The clone is agent-supplied: never run its fsmonitor or hooks, never page.
-    return run(["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", str(clone), *args],
+    # Also neutralize the clone-config levers that run programs or change where traffic goes: proxy, ssh command, credential helpers, askpass, ext transport.
+    return run(["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "http.proxy=", "-c", "core.sshCommand=ssh",
+                "-c", "credential.helper=", "-c", "core.askPass=/usr/bin/false", "-c", "protocol.ext.allow=never", "-C", str(clone), *args],
                extra_env=env, stdin=stdin)
 
 
@@ -486,23 +489,39 @@ def propose(args, res):
 # ---------------------------------------------------------------- git facts
 
 ORIGINS_FILE = os.path.join(os.path.dirname(os.path.expanduser(omg.VERSION_POLICY_DEFAULT)), "release-origins.json")
-GITHUB_URL_RES = (re.compile(r"https://(?:[^/@]+@)?github\.com/([^/]+)/([^/]+?)(?:\.git)?/?"),
-                  re.compile(r"(?:ssh://)?git@github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?"))
+USERINFO_RE = re.compile(r"[A-Za-z0-9._~%!$&'()*+,;=:-]*")
+URL_PATH_RE = re.compile(r"/([^/]+)/([^/]+?)(?:\.git)?/?")
+SCP_RE = re.compile(r"git@github\.com:([^/]+)/([^/]+?)(?:\.git)?/?")  # the colon is what makes git read this as ssh; `git@host/o/r` is a local relative path
 
 
 def origin_matches(url, repo):
-    """True when a remote URL names github.com/<repo> (https, ssh or scp form), or is a local path the owner listed for this repo in release-origins.json
-    (a trust-anchor file under the owner config root: the only way a non-GitHub origin, such as a test bare repository, is accepted)."""
-    for rx in GITHUB_URL_RES:
-        m = rx.fullmatch(url)
-        if m:
-            return f"{m.group(1)}/{m.group(2)}".lower() == repo.lower()
+    """True when a remote URL names github.com/<repo>: https:// or ssh:// with the host exactly `github.com` (no port, query, fragment or odd userinfo),
+    or the scp form git@github.com:owner/repo; or a local absolute path the owner listed for this repo in release-origins.json (a trust-anchor file under
+    the owner config root: the only way a non-GitHub origin, such as a test bare repository, is accepted)."""
+    if not isinstance(url, str) or re.search(r"[\s\x00-\x1f\x7f\\]", url):
+        return False
+    want = repo.lower()
+    if "://" in url:
+        try:
+            u = urllib.parse.urlsplit(url)
+        except ValueError:
+            return False
+        if u.scheme not in ("https", "ssh") or u.query or u.fragment or "?" in url or "#" in url:
+            return False
+        userinfo, at, host = u.netloc.rpartition("@")
+        if host != "github.com" or (at and not USERINFO_RE.fullmatch(userinfo)):
+            return False
+        m = URL_PATH_RE.fullmatch(u.path)
+        return bool(m) and f"{m.group(1)}/{m.group(2)}".lower() == want
+    m = SCP_RE.fullmatch(url)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}".lower() == want
     try:
         allowed = omg.read_owner_file(ORIGINS_FILE, True, lambda o: o, "release origins")["origins"]
-        want = {os.path.realpath(x) for k, v in allowed.items() if k.lower() == repo.lower() for x in v}
+        listed = {os.path.realpath(x) for k, v in allowed.items() if k.lower() == want for x in v}
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return False
-    return os.path.isabs(url) and os.path.realpath(url) in want
+    return os.path.isabs(url) and os.path.realpath(url) in listed
 
 
 def require_clone(clone, repo=None):
@@ -844,6 +863,7 @@ def successor_ensure(args, res):
     policy, baseline_sha = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
     key, entry = check_policy(policy, args.repo)
     require_ready(entry)
+    require_clone(args.clone, args.repo)
     rl = entry["release_lines"]
     major, minor, _ = args.predecessor.split(".")
     version = args.version or f"{major}.{int(minor) + 1}.0"
@@ -927,6 +947,7 @@ def train_integrate(args, res):
     policy, _ = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
     _, entry = check_policy(policy, args.repo)
     require_ready(entry)
+    require_clone(args.clone, args.repo)
     rl = entry["release_lines"]
     frm, into = line_by_id(entry, args.from_line), line_by_id(entry, args.into)
     fetch(args.clone)
@@ -990,6 +1011,7 @@ def train_converge(args, res):
     policy, baseline_sha = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
     key, entry = check_policy(policy, args.repo)
     require_ready(entry)
+    require_clone(args.clone, args.repo)
     rl = entry["release_lines"]
     major = line_by_id(entry, args.line)
     if major["kind"] != "major":
@@ -1030,6 +1052,7 @@ def guard(args, res):
         raise SystemExit(usage_error("guard needs --clone"))
     policy, _ = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
     _, entry = check_policy(policy, args.repo)
+    require_clone(args.clone, args.repo)
     rl = entry["release_lines"]
     fetch(args.clone)
     head = commit_of(args.clone, args.head)
@@ -1609,6 +1632,8 @@ def push_tag(res, args, name, sha, message, step):
     if obj is not None:
         if peeled != sha:
             raise Refusal("CONFLICT_EXISTING", f"tag {name} exists at {peeled}, not {sha}; tags are never moved or deleted")
+        if obj == peeled:
+            raise Refusal("CONFLICT_EXISTING", f"tag {name} on origin is lightweight; release tags are annotated and tags are never moved or deleted")
         res.step(step, "REUSED", {"tag": name, "sha": sha})
         return False
     if not args.execute:
@@ -2089,10 +2114,12 @@ def promote_body(args, res, c, go, cand, tag, base_ref, head, bp, done, j):
     res.step("verification", "CARRIED_OVER" if carry else "REQUIRED", {"candidate_tree_equals_final": carry})
     if j:
         j.append(key=res.env["idempotency_key"], state="promoted", final_sha=final, candidate_sha=cand, pr=pr_number, line=c.ln["id"], version=version)
-    if done is None and first_parent != base_tip:
-        # The base moved between accounting and the merge: account again against the base the merge really landed on.
+    if done is not None or first_parent != base_tip:
+        # The base moved between accounting and the merge (or this is a rerun): account again, from git and GitHub facts, against the base the merge really
+        # landed on. A rerun therefore stays FAIL until the new changes are accounted; the journal is never the authority.
         n2, bad2 = accounting_complete(args, c, cand, first_parent)
-        res.step("base_moved", "INCOMPLETE" if bad2 else "ACCOUNTED", {"evaluated_base": base_tip, "merged_onto": first_parent, "sources": n2, "incomplete": bad2[:50]})
+        res.step("base_moved" if done is None else "accounting_recheck", "INCOMPLETE" if bad2 else "ACCOUNTED",
+                 {"evaluated_base": base_tip, "merged_onto": first_parent, "sources": n2, "incomplete": bad2[:50]})
         if bad2:
             raise Refusal("BASE_MOVED_UNACCOUNTED", f"the base advanced to {first_parent[:12]} before the merge and {len(bad2)} new change(s) are not forward-port accounted; "
                           f"the promotion {final[:12]} is already merged: account for them with forward-port, then continue", "FAIL")
@@ -2225,6 +2252,10 @@ def release_final_tag(args, res):
     tree, first = check_promotion(clone, final, cand)
     if not is_ancestor(clone, final, base_ref):
         raise Refusal("FINAL_NOT_ON_BASE", f"{final[:12]} is not on {c.base}")
+    n2, bad2 = accounting_complete(args, c, cand, first)  # recomputed: a promotion onto a moved base is not final until its new changes are accounted
+    if bad2:
+        res.step("accounting_recheck", "INCOMPLETE", {"merged_onto": first, "sources": n2, "incomplete": bad2[:50]})
+        raise Refusal("BASE_MOVED_UNACCOUNTED", f"{len(bad2)} change(s) on the base the promotion merged onto are not forward-port accounted", "FAIL")
     pr_number = merged[0]["number"] if merged else None
     if tree != git(clone, "rev-parse", cand + "^{tree}")[1].strip() and not final_tree_verified(args, load_local_entry, pr_number, final, c.base, first):
         raise Refusal("FINAL_NOT_VERIFIED", f"the final tree differs from the candidate tree and no passing, trusted local-first record exists for {final[:12]}; run `release verify --execute`")
