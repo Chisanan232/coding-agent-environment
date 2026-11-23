@@ -273,7 +273,7 @@ class Publish(Pub):
         self.assertEqual((rc, out["status"], self.step(out, "release")["state"]), (0, "PASS", "REUSED"), out)
         self.assertEqual(len(self.creates()), 1)
         journal = [json.loads(x) for x in (self.state_dir / "journal.jsonl").read_text().splitlines()]
-        self.assertEqual([r["state"] for r in journal if r["state"].startswith("publish")], ["published"])
+        self.assertEqual([r["state"] for r in journal if r["state"].startswith("publish")], ["publishing", "published"])
         self.assertFalse([c for c in self.calls() if "workflow" in c or c.startswith("run ")])
         self.assert_no_force()
 
