@@ -21,6 +21,7 @@ authority-record template into a proposals directory, and only with --execute; t
 Whether a branch may receive merges stays decided by `branches` alone; release_lines is validated here, ignored by the gate.
 """
 import argparse
+import calendar
 import contextlib
 import copy
 import datetime
@@ -36,6 +37,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import types
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -1705,42 +1707,89 @@ def final_tags(clone, rl, major):
 def load_local_entry(args):
     ci = importlib.util.module_from_spec(importlib.util.spec_from_file_location("owner_merge_local_ci", HERE / "owner-merge-local-ci.py"))
     ci.__spec__.loader.exec_module(ci)
-    return ci, ci.load_entry(args.repo, args.local_first)
+    return ci, ci.load_entry(args.repo, getattr(args, "local_first", None))
 
 
-def trusted_local_record(args, number, cand):
-    """The recorder's record for this PR head, accepted only like the gate accepts it: read from the fixed evidence directories with
-    owner/mode/link checks and re-verified log digests (omg.verify_standing_local_record), commands equal to the owner's local-first
-    entry, every exit 0, and inside max_age_hours. Returns the record or None."""
-    try:
-        _, entry = load_local_entry(args)
-        name = omg.local_ci_evidence_filename(f"{args.repo.replace('/', '__')}-{number}", cand)
-        for path in omg.LOCAL_EVIDENCE_DIRS.values():
-            try:
-                dfd = os.open(os.path.expanduser(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            except OSError:
-                continue
-            try:
-                with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd), "rb") as f:
-                    rec = json.loads(f.read(omg.POLICY_MAX_BYTES), object_pairs_hook=omg._no_duplicate_keys)
-            except (OSError, ValueError):
-                continue
-            finally:
-                os.close(dfd)
-            cmds = rec.get("commands") if isinstance(rec, dict) else None
-            if not (isinstance(cmds, list) and cmds and rec.get("repo", "").lower() == args.repo.lower() and rec.get("pr") == number
-                    and rec.get("head") == cand and [(c.get("name"), tuple(c.get("argv", ()))) for c in cmds] == list(entry["checks"])
-                    and all(c.get("exit_code") == 0 for c in cmds) and omg.verify_standing_local_record(rec)):
-                continue
-            now = datetime.datetime.strptime(now_utc(), "%Y-%m-%dT%H:%M:%SZ")
-            if all(now - datetime.datetime.strptime(c["finished_at"], "%Y-%m-%dT%H:%M:%SZ") <= datetime.timedelta(hours=entry["max_age_hours"]) for c in cmds):
-                return rec
-    except (ValueError, OSError, KeyError, TypeError, AttributeError):
-        return None
+def epoch_now():
+    return calendar.timegm(time.strptime(now_utc(), "%Y-%m-%dT%H:%M:%SZ"))
+
+
+def read_fixed_record(repo, pr, head):
+    """The recorder's record file for (repo, pr, head) from the fixed private evidence directories, no-follow; None when absent or unreadable."""
+    name = omg.local_ci_evidence_filename(f"{repo.replace('/', '__')}-{pr}", head)
+    for path in omg.LOCAL_EVIDENCE_DIRS.values():
+        try:
+            dfd = os.open(os.path.expanduser(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd), "rb") as f:
+                return json.loads(f.read(omg.POLICY_MAX_BYTES), object_pairs_hook=omg._no_duplicate_keys)
+        except (OSError, ValueError):
+            continue
+        finally:
+            os.close(dfd)
     return None
 
 
-def hosted_ci(res, args, number, cand):
+def record_problem(rec, entry, repo, pr, head, base, base_sha=None):
+    """None when the record is exactly what the gate accepts from the private recorder evidence, else the reason. Mirrors local_first_basis
+    (strict schema, repo/PR/base/head, commands and env equal to the owner entry, all exit 0, not finishing in the future, not stale)
+    and adds verify_standing_local_record (owner/mode/nlink/no-follow reads, log digests re-verified)."""
+    try:
+        finished = omg.parse_local_record(rec)
+    except (ValueError, KeyError, TypeError):
+        return "LOCAL_CI_MALFORMED"
+    now = epoch_now()
+    if rec["repo"].lower() != repo.lower() or rec["pr"] != pr or rec["head"] != head or rec["base"] != base \
+            or (base_sha is not None and rec["base_sha"] != base_sha) or max(finished) > now + 60:
+        return "LOCAL_CI_MISMATCH"
+    if [(c["name"], tuple(c["argv"])) for c in rec["commands"]] != entry["checks"] or rec["env"] != entry["env"]:
+        return "LOCAL_CI_COMMANDS_MISMATCH"
+    if rec["context"].get("GIT_BASE") != rec["base_sha"]:
+        return "LOCAL_CI_CONTEXT_MISMATCH"
+    if any(c["exit_code"] != 0 for c in rec["commands"]):
+        return "LOCAL_CI_FAILED"
+    if now - max(finished) > entry["max_age_hours"] * 3600:
+        return "LOCAL_CI_STALE"
+    if not omg.verify_standing_local_record(rec):
+        return "LOCAL_CI_LOGS_UNVERIFIED"
+    return None
+
+
+def trusted_local_record(args, number, cand, base):
+    """(record, problems). The record must be the unedited, visible OWNER-MERGE-LOCAL-CI comment of the authenticated user on the promotion PR, accepted by the
+    gate's own local_first_basis (repo/PR/base/base commit/head/context, owner commands and env, freshness, not finishing after it was posted),
+    and equal to the private recorder evidence (digest) which record_problem verifies."""
+    try:
+        _, entry = load_local_entry(args)
+        run_ = omg.gh
+        p = json.loads(run_("pr", "view", str(number), "--repo", args.repo, "--json", omg.PR_FIELDS))
+        if p.get("headRefOid") != cand or p.get("baseRefName") != base:
+            return None, ["PR_HEAD_OR_BASE_MISMATCH"]
+        meta = json.loads(run_("repo", "view", args.repo, "--json", "nameWithOwner,defaultBranchRef,isFork,isPrivate,viewerPermission,owner"))
+        me = run_("api", "user", "--jq", ".login").strip()
+        comments, _, err = omg.merged_comments(run_, args.repo, number, p.get("comments"))
+        if err:
+            return None, ["COMMENTS_UNREADABLE"]
+        mine = [c for c in comments if (c.get("author") or {}).get("login", "").lower() == me.lower()]
+        texts = [re.sub(r"```.*?```", "", (c.get("body") or ""), flags=re.S) for c in mine]
+        reasons, wait, facts = omg.local_first_basis(run_, args.repo, number, base, cand, p, meta, me, list(zip(mine, texts)),
+                                                     [c.get("body") or "" for c in mine], entry, epoch_now())
+        if reasons or wait:
+            return None, [r.split(":")[0] for r in reasons + wait]
+        rec = read_fixed_record(args.repo, number, cand)
+        if rec is None:
+            return None, ["PRIVATE_EVIDENCE_MISSING"]
+        if hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":")).encode()).hexdigest() != facts.get("local_ci_digest"):
+            return None, ["PRIVATE_EVIDENCE_DIFFERS_FROM_POSTED_RECORD"]
+        problem = record_problem(rec, entry, args.repo, number, cand, base)
+        return (rec, []) if problem is None else (None, [problem])
+    except (RuntimeError, ValueError, OSError, KeyError, TypeError, AttributeError) as e:
+        return None, [type(e).__name__]
+
+
+def hosted_ci(res, args, number, cand, base):
     """CI_PASS, CI_FAILED (refuses), CI_PENDING (defers) or NOT_RUN, which needs a passing local-equivalent record for the candidate."""
     rc, out = run(["gh", "pr", "view", str(number), "--repo", args.repo, "--json", "statusCheckRollup"])
     try:
@@ -1759,10 +1808,10 @@ def hosted_ci(res, args, number, cand):
         res.step("hosted_ci", "CI_PASS", {"checks": len(states)})
         return True
     res.step("hosted_ci", "NOT_RUN", {"reason": "no hosted check ran or gh could not report them (outage, quota or none configured)"})
-    rec = trusted_local_record(args, number, cand)
+    rec, problems = trusted_local_record(args, number, cand, base)
     if rec is None:
-        raise Refusal("LOCAL_EVIDENCE_REQUIRED", f"hosted CI is NOT_RUN and no trusted, fresh local-equivalent record exists for {cand[:12]} on PR #{number}; "
-                      "run owner-merge-local-ci.py record at the PR head first")
+        raise Refusal("LOCAL_EVIDENCE_REQUIRED", f"hosted CI is NOT_RUN and no trusted, fresh local-equivalent record exists for {cand[:12]} on PR #{number} "
+                      f"({', '.join(problems)}); run owner-merge-local-ci.py record at the PR head and post its line first")
     cmds = rec["commands"]
     res.step("local_equivalent", "PASS", {"commands": len(cmds), "head": cand})
     return True
@@ -1956,7 +2005,7 @@ def promote_body(args, res, c, go, cand, tag, base_ref, head, bp, done, j):
         if not args.execute:
             res.status, res.next_action = "NOT_RUN", f"re-run with --execute to merge PR #{pr['number']} (merge commit pinned to {cand[:12]})"
             return
-        if not hosted_ci(res, args, pr["number"], cand):
+        if not hosted_ci(res, args, pr["number"], cand, bp["branch"]):
             return
         rc, _ = run(["gh", "pr", "merge", str(pr["number"]), "--merge", "--match-head-commit", cand, "--repo", args.repo])
         final, _ = merged_pr_commit(args.repo, pr["number"]) if rc == 0 or promotion_prs(args, c.version, bp["branch"])[1] else (None, None)
@@ -2010,7 +2059,9 @@ def release_verify(args, res):
         res.status, res.next_action = "NOT_RUN", "the owner installs the local-first CI config; verification stays NOT_RUN until then"
         return
     logs = os.path.expanduser(omg.LOCAL_EVIDENCE_DIRS["claude"])
-    tag = f"{args.repo.replace('/', '__')}-release-{version}"
+    pr_number = merged[0]["number"]
+    tag = f"{args.repo.replace('/', '__')}-{pr_number}"
+    title = f"Promote {version} to {bp['branch']}"
     wt = tempfile.mkdtemp(prefix="release-verify-")
     results = []
     with Journal(args) as j:
@@ -2018,10 +2069,11 @@ def release_verify(args, res):
             if git(clone, "worktree", "add", "--detach", wt, final)[0] != 0:
                 raise Refusal("WORKTREE_FAILED", "could not create the detached verification worktree")
             ci.prepare_dir(logs)
-            context = {"PULL_BRANCH": f"promote/{version}", "PR_TITLE": f"Promote {version} to {bp['branch']}", "GIT_BASE": first,
-                       "CARGO_TARGET_DIR": os.path.join(wt, "target")}
+            context = {"PULL_BRANCH": f"promote/{version}", "PR_TITLE": title, "GIT_BASE": first}
+            commands = []
             for name, argv in entry["checks"]:
-                r, _ = ci.run_check(wt, name, argv, logs, final, tag, entry.get("env"), context)
+                r, _ = ci.run_check(wt, name, argv, logs, final, tag, entry.get("env"), {**context, "CARGO_TARGET_DIR": os.path.join(wt, "target")})
+                commands.append(r)
                 results.append({"name": name, "exit_code": r["exit_code"], "log_sha256": r["log_sha256"]})
             dirty = git(wt, "status", "--porcelain", "--untracked-files=all")[1].strip() != ""
         except (RuntimeError, OSError) as e:
@@ -2030,20 +2082,31 @@ def release_verify(args, res):
             git(clone, "worktree", "remove", "--force", wt)
             shutil.rmtree(wt, ignore_errors=True)
         ok = all(r["exit_code"] == 0 for r in results) and not dirty
+        # The record in the fixed private evidence directory is the authority `final-tag` reads (the gate's recorder format); the journal is an audit trail only.
+        rpath = ci.record_path(logs, final, tag)
+        if dirty and not any(r["exit_code"] for r in results):
+            if os.path.lexists(rpath):
+                os.unlink(rpath)  # a pass that changed the tree is no evidence, and must not leave an older pass standing
+        else:
+            ci.write_private(rpath, json.dumps({"schema": 1, "repo": args.repo, "pr": pr_number, "base": bp["branch"], "base_sha": first, "head": final,
+                                                "env": dict(entry.get("env") or {}), "context": context, "commands": commands}, separators=(",", ":")) + "\n")
         j.append(key=res.env["idempotency_key"], state="verified" if ok else "verify-failed", final_sha=final, checks=results)
     res.step("local_checks", "PASS" if ok else "FAIL", {"final_sha": final, "checks": results, "worktree_changed": dirty})
     if not ok:
         res.status, res.next_action = "FAIL", "a local-first check failed at the final SHA; do not tag or publish"
 
 
-def verified_in_journal(args, final):
-    try:
-        rows = (proposal_dir(args).parent / "journal.jsonl").read_text().splitlines()
-        # The latest verification outcome for this exact final SHA decides: a later failure revokes an earlier pass.
-        last = [r["state"] for r in map(json.loads, rows) if r.get("final_sha") == final and r.get("state") in ("verified", "verify-failed")]
-        return bool(last) and last[-1] == "verified"
-    except (OSError, ValueError, AttributeError):
+def final_tree_verified(args, entry_loader, pr_number, final, base, first):
+    """True when the private recorder evidence for this exact final SHA is a passing record accepted by record_problem (fixed directories, log digests,
+    owner commands and env, freshness). Nothing in the agent-writable state directory counts."""
+    if pr_number is None:
         return False
+    try:
+        _, entry = entry_loader(args)
+    except (ValueError, OSError):
+        return False
+    rec = read_fixed_record(args.repo, pr_number, final)
+    return rec is not None and record_problem(rec, entry, args.repo, pr_number, final, base, first) is None
 
 
 def release_final_tag(args, res):
@@ -2061,11 +2124,12 @@ def release_final_tag(args, res):
         oid, _ = merged_pr_commit(args.repo, merged[0]["number"])
         if oid != final:
             raise Refusal("PROMOTION_MISMATCH", f"PR #{merged[0]['number']} reports merge {oid[:12]}, the base history shows {final[:12]}")
-    tree, _ = check_promotion(clone, final, cand)
+    tree, first = check_promotion(clone, final, cand)
     if not is_ancestor(clone, final, base_ref):
         raise Refusal("FINAL_NOT_ON_BASE", f"{final[:12]} is not on {c.base}")
-    if tree != git(clone, "rev-parse", cand + "^{tree}")[1].strip() and not verified_in_journal(args, final):
-        raise Refusal("FINAL_NOT_VERIFIED", f"the final tree differs from the candidate tree and `release verify --execute` has not recorded PASS for {final[:12]}")
+    pr_number = merged[0]["number"] if merged else None
+    if tree != git(clone, "rev-parse", cand + "^{tree}")[1].strip() and not final_tree_verified(args, load_local_entry, pr_number, final, c.base, first):
+        raise Refusal("FINAL_NOT_VERIFIED", f"the final tree differs from the candidate tree and no passing, trusted local-first record exists for {final[:12]}; run `release verify --execute`")
     name = rl["tag_format"].replace("{version}", version)
     res.env["idempotency_key"] = f"tag:{args.repo}:{name}"
     res.step("go", "ACCEPTED", {"scope": "final_tag", "candidate_sha": cand})
