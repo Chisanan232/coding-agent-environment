@@ -48,7 +48,7 @@ MAC_RE = re.compile(r"[0-9a-f]{64}")
 HTTP_TOKEN_RE = re.compile(r"HTTP ([^\s:)]*)")
 STATUS_RE = re.compile(r"[0-9]{3}")
 BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,200}")
-READ_PATHS = (re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rules/branches/([A-Za-z0-9._/-]{1,200})"),
+READ_PATHS = (re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rules/branches/([A-Za-z0-9._/-]{1,200})\?per_page=100"),
               re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/branches/([A-Za-z0-9._/-]{1,200})/protection"),
               re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rulesets/([1-9][0-9]{0,11})"))
 JOB_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/actions/runs/[0-9]{1,15}/job/([0-9]{1,15})")
@@ -124,7 +124,7 @@ def pr_view_argv(repo, pr, fields):
 
 
 def rules_argv(repo, base):
-    return ["api", f"repos/{repo}/rules/branches/{base}"]
+    return ["api", f"repos/{repo}/rules/branches/{base}?per_page=100"]
 
 
 def protection_argv(repo, base):
@@ -322,7 +322,8 @@ def load_allowlist(path):
 
 REPO_KEYS = {"required_checks", "reviewers", "require_server_side_protection", "accept_bypass_actors",
              "max_evidence_age_hours", "require_signed_evidence", "local_equivalent_ci",
-             "independent_github_reviewers", "protection_capability", "required_local_checks"}
+             "independent_github_reviewers", "protection_capability", "required_local_checks",
+             "local_gate_only"}
 
 
 def repo_config(allow, repo):
@@ -351,6 +352,11 @@ def repo_config(allow, repo):
     cap = cfg.get("protection_capability", "server-enforced") if ok else "server-enforced"
     ok = ok and cap in CAPABILITIES and not (cap == "private-free-app-level" and not prot)
     ok = ok and all(isinstance(x, bool) for x in (prot, bypass, signed, lci))
+    gate_only = cfg.get("local_gate_only", False) if ok else False
+    ok = ok and type(gate_only) is bool
+    # local_gate_only drops the hosted-check requirement on the base, so every other guard must be present and strict.
+    ok = ok and (not gate_only or (cfg["required_checks"] == [] and local_gate and prot is True
+                                   and cap == "server-enforced" and lci is True))
     rlc = cfg.get("required_local_checks", []) if ok else []
     ok = ok and isinstance(rlc, list) and all(isinstance(x, str) and x.strip() and x == x.strip() for x in rlc) \
         and len(set(rlc)) == len(rlc)
@@ -359,14 +365,16 @@ def repo_config(allow, repo):
     ok = ok and not (signed and key_file is None)
     if not ok:
         raise Refused(["allowlist config for repo is invalid (needs a non-empty reviewers list and a non-empty required_checks list (which may be empty only when "
-                       "required_local_checks is non-empty and require_server_side_protection is not false); "
+                       "required_local_checks is non-empty and require_server_side_protection is not false; local_gate_only is valid only with "
+                       "required_checks [], required_local_checks, require_server_side_protection true, "
+                       "protection_capability server-enforced and local_equivalent_ci true); "
                        "booleans must be booleans; max_evidence_age_hours 1-%d; require_signed_evidence needs an "
                        "evidence_key_file)" % MAX_EVIDENCE_AGE_HOURS])
     return {"required_checks": list(cfg["required_checks"]), "reviewers": list(cfg["reviewers"]),
             "require_server_side_protection": prot, "accept_bypass_actors": bypass,
             "max_evidence_age_hours": age, "require_signed_evidence": signed, "local_equivalent_ci": lci,
             "independent_github_reviewers": [x.lower() for x in ind], "protection_capability": cap,
-            "required_local_checks": list(rlc)}
+            "required_local_checks": list(rlc), "local_gate_only": gate_only}
 
 
 def canonical_evidence(ev):
@@ -602,6 +610,8 @@ def http_status(err):
 
 def server_kind(info):
     """What actually backs the merge, as the audit states it."""
+    if info.get("server_side") == "local-gate-protected-base":
+        return "local-gate-protected-base"
     return info.get("capability", "waived" if info.get("waived") else "server-enforced")
 
 
@@ -622,9 +632,71 @@ def check_private_free(runner, repo, base):
     return None
 
 
+def check_local_gate_base(runner, repo, base):
+    """local_gate_only mode: there is no hosted required check, so the base branch itself must be protected. Requires readable
+    classic protection (rulesets alone are refused) with enforce_admins on, force-push and deletion off, a required_pull_request_reviews
+    object (direct pushes blocked), and no ruleset bypass actor. accept_bypass_actors
+    never waives any of this."""
+    rc, rules, err = _read_json(runner, rules_argv(repo, base), "gh rules read")
+    if rc != 0:
+        raise RuntimeError(gh_error(err, "rules-read"))
+    if not isinstance(rules, list) or not all(isinstance(r, dict) for r in rules):
+        raise Refused(["server-side rules response is malformed"])
+    rc, prot, err = _read_json(runner, protection_argv(repo, base), "gh branch protection read")
+    if rc != 0:
+        if http_status(err) == "404":
+            raise Refused(["local_gate_only: the base branch has no branch protection"])
+        raise Refused(["local_gate_only: branch protection could not be read"])
+    if not isinstance(prot, dict):
+        raise Refused(["local_gate_only: branch protection response is malformed"])
+    bad = []
+    # Without a pull-request requirement a writer could push straight to the base; with enforce_admins on, an
+    # object here (even with 0 required approvals) forces every change through a PR.
+    prr = prot.get("required_pull_request_reviews")
+    pr_ok = isinstance(prr, dict)
+    if not pr_ok:
+        bad.append("local_gate_only: required_pull_request_reviews is absent or malformed, so direct pushes are not blocked")
+    else:
+        allow = prr.get("bypass_pull_request_allowances", {})
+        # Absent or {} (or empty lists) means nobody may bypass the PR requirement; anything else could push around it.
+        if not isinstance(allow, dict) or any(not isinstance(allow.get(k, []), list) or allow.get(k, []) for k in allow):
+            bad.append("local_gate_only: bypass_pull_request_allowances names users, teams or apps (or is malformed), "
+                       "so they could bypass the pull-request requirement")
+            pr_ok = False
+    for key, want, what in (("enforce_admins", True, "enforce_admins is not enabled"),
+                            ("allow_force_pushes", False, "force pushes are not disabled"),
+                            ("allow_deletions", False, "branch deletion is not disabled")):
+        sub = prot.get(key)
+        if not isinstance(sub, dict) or sub.get("enabled") is not want:
+            bad.append(f"local_gate_only: {what} (or the field is missing or malformed)")
+    if bad:
+        raise Refused(bad)
+    # One page only: with 100 or more rules a bypass-bearing ruleset could sit on an unread page.
+    if len(rules) >= 100:
+        raise Refused(["local_gate_only: 100 or more server-side rules apply to the base; the list may be truncated"])
+    # A rule whose ruleset id cannot be read would hide that ruleset's bypass actors, so any such entry refuses.
+    if any(type(r.get("ruleset_id")) is not int or r["ruleset_id"] <= 0 for r in rules):
+        raise Refused(["local_gate_only: a server-side rule has no valid ruleset_id, so its bypass actors cannot be read"])
+    ids = {r["ruleset_id"] for r in rules}
+    for rid in sorted(ids):
+        rc, detail, _ = _read_json(runner, ruleset_argv(repo, rid), "gh ruleset read")
+        actors = detail.get("bypass_actors") if isinstance(detail, dict) else None
+        if rc != 0 or not isinstance(actors, list) or not all(isinstance(a, dict) for a in actors):
+            raise Refused(["local_gate_only: ruleset bypass actors are unreadable or malformed"])
+        if actors:
+            raise Refused(["local_gate_only: a ruleset allows bypass actors"])
+    return {"contexts": [], "protection": "read", "enforce_admins": True, "bypass": "none", "waivers": [],
+            "server_side": "local-gate-protected-base",
+            "facts": {"enforce_admins": True, "allow_force_pushes": False, "allow_deletions": False,
+                      "pull_request_required": pr_ok,
+                      "ruleset_ids": sorted(ids), "bypass_actors": 0}}
+
+
 def check_server_protection(runner, repo, base, cfg):
     """Require a non-empty server-side set of required status checks that covers every allowlisted
     required check, and refuse when a readable ruleset lists a bypass actor that could apply to us."""
+    if cfg.get("local_gate_only"):
+        return check_local_gate_base(runner, repo, base)
     rc, rules, err = _read_json(runner, rules_argv(repo, base), "gh rules read")
     if rc != 0:
         raise RuntimeError(gh_error(err, "rules-read"))
