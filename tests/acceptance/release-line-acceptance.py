@@ -380,6 +380,7 @@ class Fixture:
         self.main, self.label = Path(main), label
         self.dir = work / 'fx' / label
         self.dir.mkdir(parents=True)
+        self._saved_tempdir = tempfile.tempdir
         tempfile.tempdir = str(self.dir)
         tests = self.main / 'tests'
         if kind == 'pub':
@@ -419,6 +420,7 @@ class Fixture:
 
     def close(self):
         self.t.doCleanups()
+        tempfile.tempdir = self._saved_tempdir  # never leave the process pointing at a directory that is about to go away
 
     # facts
     def refs(self):
