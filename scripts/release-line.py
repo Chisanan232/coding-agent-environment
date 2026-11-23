@@ -1518,7 +1518,7 @@ def read_go(args, rl, ln, version):
         raise Refusal("GO_MISMATCH", "GO candidate_tag does not match candidate_format for this version")
     if "expires_utc" in rec:
         try:
-            expired = datetime.datetime.strptime(rec["expires_utc"], "%Y-%m-%dT%H:%M:%SZ") <= datetime.datetime.strptime(now_utc(), "%Y-%m-%dT%H:%M:%SZ")
+            expired = calendar.timegm(time.strptime(rec["expires_utc"], "%Y-%m-%dT%H:%M:%SZ")) <= epoch_now()
         except (TypeError, ValueError):
             raise Refusal("GO_INVALID", "expires_utc must be YYYY-MM-DDTHH:MM:SSZ")
         if expired:
@@ -1711,7 +1711,8 @@ def load_local_entry(args):
 
 
 def epoch_now():
-    return calendar.timegm(time.strptime(now_utc(), "%Y-%m-%dT%H:%M:%SZ"))
+    """The real wall clock. Every freshness and expiry decision uses it; SOURCE_DATE_EPOCH only shapes reproducible output stamps."""
+    return int(time.time())
 
 
 def read_fixed_record(repo, pr, head):
@@ -2091,22 +2092,37 @@ def release_verify(args, res):
             ci.write_private(rpath, json.dumps({"schema": 1, "repo": args.repo, "pr": pr_number, "base": bp["branch"], "base_sha": first, "head": final,
                                                 "env": dict(entry.get("env") or {}), "context": context, "commands": commands}, separators=(",", ":")) + "\n")
         j.append(key=res.env["idempotency_key"], state="verified" if ok else "verify-failed", final_sha=final, checks=results)
-    res.step("local_checks", "PASS" if ok else "FAIL", {"final_sha": final, "checks": results, "worktree_changed": dirty})
+    ev = {"final_sha": final, "checks": results, "worktree_changed": dirty}
+    if ok:
+        ev["record_sha256"] = record_digest(json.loads(pathlib.Path(rpath).read_text()))
+    res.step("local_checks", "PASS" if ok else "FAIL", ev)
     if not ok:
         res.status, res.next_action = "FAIL", "a local-first check failed at the final SHA; do not tag or publish"
+    else:
+        res.next_action = (f"owner: pin record_sha256 {ev['record_sha256']} under records.{args.repo}.{final} in {VERIFY_PINS}; "
+                           "`release final-tag` trusts only a pinned verification record")
+
+
+VERIFY_PINS = os.path.join(os.path.dirname(os.path.expanduser(omg.VERSION_POLICY_DEFAULT)), "release-verification.json")
+
+
+def record_digest(rec):
+    return hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def final_tree_verified(args, entry_loader, pr_number, final, base, first):
     """True when the private recorder evidence for this exact final SHA is a passing record accepted by record_problem (fixed directories, log digests,
-    owner commands and env, freshness). Nothing in the agent-writable state directory counts."""
+    owner commands and env, freshness) AND its digest is pinned by the owner in release-verification.json (trust-anchor reader), so a file the agent
+    can write is never enough on its own. Nothing in the agent-writable state directory counts."""
     if pr_number is None:
         return False
     try:
         _, entry = entry_loader(args)
-    except (ValueError, OSError):
+        pin = omg.read_owner_file(VERIFY_PINS, True, lambda o: o, "release verification pins")["records"][args.repo][final]
+    except (ValueError, OSError, KeyError, TypeError):
         return False
     rec = read_fixed_record(args.repo, pr_number, final)
-    return rec is not None and record_problem(rec, entry, args.repo, pr_number, final, base, first) is None
+    return rec is not None and record_digest(rec) == pin and record_problem(rec, entry, args.repo, pr_number, final, base, first) is None
 
 
 def release_final_tag(args, res):
