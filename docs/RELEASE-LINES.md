@@ -239,7 +239,10 @@ private evidence directory; that record, not the journal, is what `final-tag` tr
 
 `final-tag`: GO `final_tag`; the final SHA is found from the promotion merge (cross-checked with the PR's merge commit), never the base tip, and must be on the
 publication base. When the final tree differs from the candidate tree it re-checks the private record for that exact SHA the way `promote` does (fixed directories, log digests,
-owner commands and env, freshness, `FINAL_NOT_VERIFIED` otherwise); journal rows are an audit trail and never authorize anything. An annotated
+owner commands and env, freshness) and additionally requires the owner to have pinned the record's sha256 under `records.<repo>.<final_sha>` in
+`~/.config/coding-agent-environment/local/release-verification.json` (read through the trust-anchor reader; `release verify --execute` prints the digest), so a file the agent can write
+is never enough (`FINAL_NOT_VERIFIED` otherwise). Journal rows are an audit trail and never authorize anything. Every freshness, staleness and GO-expiry decision uses the real wall
+clock; `SOURCE_DATE_EPOCH` only affects reproducible output stamps. An annotated
 `tag_format` tag is pushed as a new ref. The journal records source branch, release line, version, promotion PR, candidate and final SHAs.
 
 `protection snapshot` records the publication base's protection (read-only `gh api`, URL fields removed) in the state directory; the snapshot is trusted only
