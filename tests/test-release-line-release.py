@@ -41,8 +41,30 @@ for old, new in (
     pr = next((p for p in st["prs"] if p["number"] == int(a[2])), None)
     if pr is None:
         sys.exit(1)
+    if "headRefOid" in (opt("--json") or ""):
+        oid = subprocess.run(["{git}", "-C", st["bare"], "rev-parse", "refs/heads/" + pr["headRefName"]], capture_output=True, text=True).stdout.strip()
+        print(json.dumps({{"number": pr["number"], "state": pr["state"], "title": "Promote " + pr["headRefName"].split("/")[1] + " to " + pr["baseRefName"],
+                          "baseRefName": pr["baseRefName"], "headRefName": pr["headRefName"], "headRefOid": oid, "baseRefOid": "0" * 40,
+                          "isCrossRepository": False, "files": [{{"path": "feature-a.txt"}}], "comments": st.get("comments", []), "commits": []}}))
+        sys.exit(0)
     print(json.dumps({{"number": pr["number"], "state": pr["state"], "baseRefName": pr["baseRefName"],
                       "mergeCommit": ({{"oid": pr["mergeOid"]}} if pr.get("mergeOid") else None), "statusCheckRollup": st.get("checks", [])}}))
+elif a[:2] == ["repo", "view"]:
+    print(json.dumps({{"nameWithOwner": "Example-Owner/example-product", "defaultBranchRef": {{"name": "main"}}, "isFork": False, "isPrivate": True,
+                      "viewerPermission": "ADMIN", "owner": {{"login": "Example-Owner"}}}}))
+elif a[0] == "api" and a[1] == "user":
+    print("me")
+elif a[0] == "api" and "/issues/" in a[1]:
+    print("[]")
+elif a[0] == "api" and "/pulls/" in a[1]:
+    print(json.dumps([{{"filename": "feature-a.txt", "previous_filename": None, "status": "added"}}]))
+elif a[0] == "api" and "/actions/runs" in a[1]:
+    print("0")
+elif a[0] == "api" and "/commits/" in a[1]:
+    print("outage [skip ci]")
+elif a[0] == "api" and "/compare/" in a[1]:
+    b, _, h = a[1].split("/compare/")[1].partition("...")
+    print(subprocess.run(["{git}", "-C", st["bare"], "merge-base", "refs/heads/" + b, h], capture_output=True, text=True).stdout.strip())
 elif a[0] == "api":
     if "protection" not in st:
         sys.exit(1)
@@ -128,8 +150,9 @@ class Rel(train.TrainBase):
             self.assertRegex(x, r"push origin [0-9a-f]{40}:refs/(heads|tags)/\S+$")
             self.assertNotRegex(x, r"--force|--delete|--mirror| -f |\+")
 
-    def write_evidence(self, cand, pr=1, exit_code=0, argv=None, finished="2026-01-01T00:00:00Z", log_digest=None, mode=0o600):
-        """A recorder record plus its log, as owner-merge-local-ci.py leaves them in the fixed evidence directory."""
+    def write_evidence(self, cand, pr=1, exit_code=0, argv=None, finished="2026-01-01T00:00:00Z", log_digest=None, mode=0o600, env=None,
+                       base_sha=None, post=True, edited=False, author="me", posted_differs=False):
+        """The recorder's private record and log (fixed evidence directory) plus the line the owner posts as a PR comment."""
         import hashlib
         self.local_first()
         self.evidence.mkdir(parents=True, exist_ok=True)
@@ -139,12 +162,19 @@ class Rel(train.TrainBase):
         lp = self.evidence / omg.local_ci_evidence_filename(tag, cand, "t")
         lp.write_bytes(log)
         os.chmod(lp, 0o600)
-        rec = {"schema": 1, "repo": REPO, "pr": pr, "head": cand, "commands": [
-            {"name": "t", "argv": argv or self.CHECKS[0][1], "exit_code": exit_code, "started_at": finished, "finished_at": finished,
-             "log_sha256": log_digest or hashlib.sha256(log).hexdigest()}]}
+        base_sha = base_sha or self.w("merge-base", "main", cand, cwd=self.bare)
+        rec = {"schema": 1, "repo": REPO, "pr": pr, "base": "main", "base_sha": base_sha, "head": cand, "env": env or {},
+               "context": {"PULL_BRANCH": "promote/0.3.0", "PR_TITLE": "Promote 0.3.0 to main", "GIT_BASE": base_sha},
+               "commands": [{"name": "t", "argv": argv or self.CHECKS[0][1], "exit_code": exit_code, "started_at": finished, "finished_at": finished,
+                             "log_sha256": log_digest or hashlib.sha256(log).hexdigest()}]}
         rp = self.evidence / omg.local_ci_evidence_filename(tag, cand)
-        rp.write_text(json.dumps(rec))
+        rp.write_text(json.dumps(rec, separators=(",", ":")))
         os.chmod(rp, mode)
+        posted = dict(rec, commands=[dict(rec["commands"][0], log_sha256="f" * 64)]) if posted_differs else rec
+        comments = [{"author": {"login": author}, "body": "OWNER-MERGE-LOCAL-CI " + json.dumps(posted, separators=(",", ":")),
+                     "createdAt": "2026-01-01T00:00:00Z", "includesCreatedEdit": edited, "isMinimized": False}] if post else []
+        self.gh_update(comments=comments)
+        return rec
 
     def base_only_change(self, fname="base-only.txt", text="x\n"):
         """A direct commit on main (not on any line) plus the reviewed not-applicable record on the line, so accounting is complete."""
@@ -310,8 +340,12 @@ class Promote(Rel):
         self.assertEqual((rc, self.refused(out)), (1, "LOCAL_EVIDENCE_REQUIRED"))
         self.assertEqual(self.step(out, "hosted_ci")["state"], "NOT_RUN")
         self.assertEqual(self.merges(), [])
-        for bad in ({"exit_code": 1}, {"argv": ["/bin/true"]}, {"finished": "2025-12-01T00:00:00Z"}, {"log_digest": "0" * 64}, {"mode": 0o666}):
-            self.write_evidence(cand, **bad)  # failing, other command than the owner's, stale, forged log digest, writable by others
+        for bad in ({"exit_code": 1}, {"argv": ["/bin/true"]}, {"finished": "2025-12-01T00:00:00Z"}, {"log_digest": "0" * 64}, {"mode": 0o666},
+                    {"finished": "2026-01-02T00:00:00Z"}, {"env": {"A": "b"}}, {"base_sha": "1" * 40}, {"post": False}, {"edited": True},
+                    {"author": "someone-else"}, {"posted_differs": True}):
+            # failing, other command than the owner's, stale, forged log digest, writable by others, finishing in the future, other env or
+            # base commit, never posted, posted then edited, posted by another user, or posted record differing from the private evidence
+            self.write_evidence(cand, **bad)
             self.assertEqual(self.refused(self.promote_ok()[1]), "LOCAL_EVIDENCE_REQUIRED", bad)
         self.assertEqual(self.merges(), [])
         self.write_evidence(cand)
@@ -384,6 +418,7 @@ class Promote(Rel):
             lf.write_text(json.dumps({"schema": 1, "repos": {REPO: {"checks": [{"name": f"c{i}", "argv": a} for i, a in enumerate(argvs)]}}}))
             os.chmod(lf, 0o600)
         extra = ("--local-first", str(lf),)
+        self.env.pop("SOURCE_DATE_EPOCH")  # the recorder stamps real time, so the tool's clock must be real too
         rc, out, _ = self.rel("verify")
         self.assertEqual((rc, out["status"], self.step(out, "local_checks")["state"]), (0, "NOT_RUN", "NOT_RUN"))
         rc, out, _ = self.rel("verify", *extra, execute=True)  # no trust file yet: honest NOT_RUN
@@ -404,6 +439,61 @@ class Promote(Rel):
         rc, out, _ = self.rel("final-tag", execute=True)
         self.assertEqual((rc, self.step(out, "tag")["state"]), (0, "CREATED"), out)
         self.assertEqual(self.sha("v0.3.0"), final)
+
+    def differing_tree_promotion(self):
+        x = self.base_only_change()
+        self.mark_not_applicable(x)
+        self.w("fetch", "-q", "origin")
+        self.tag("v0.3.0-rc.2", "integration/v0.x")
+        self.go(tag="v0.3.0-rc.2")
+        self.assertEqual(self.rel("promote", execute=True)[1]["status"], "PASS")
+        return self.remote("refs/heads/main")
+
+    def test_final_tag_ignores_forged_journal_and_forged_evidence(self):
+        final = self.differing_tree_promotion()
+        # the agent-writable journal is an audit trail only
+        with open(self.state_dir / "journal.jsonl", "a") as f:
+            f.write(json.dumps({"state": "verified", "final_sha": final}) + "\n")
+        self.assertEqual(self.refused(self.rel("final-tag", execute=True)[1]), "FINAL_NOT_VERIFIED")
+        # a planted record with a forged log digest, then one the owner's checks do not match, then a stale one
+        self.local_first()
+        first = self.w("rev-parse", final + "^1", cwd=self.bare)
+        self.evidence.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.evidence, 0o700)
+        tag = f"{REPO.replace('/', '__')}-1"
+        (self.evidence / omg.local_ci_evidence_filename(tag, final, "t")).write_bytes(b"ok\n")
+        os.chmod(self.evidence / omg.local_ci_evidence_filename(tag, final, "t"), 0o600)
+        import hashlib
+        good = hashlib.sha256(b"ok\n").hexdigest()
+
+        def plant(**over):
+            cmd = {"name": "t", "argv": self.CHECKS[0][1], "exit_code": 0, "started_at": "2026-11-23T00:00:00Z", "finished_at": "2026-11-23T00:00:00Z",
+                   "log_sha256": good, **over.pop("cmd", {})}
+            rec = {"schema": 1, "repo": REPO, "pr": 1, "base": "main", "base_sha": first, "head": final, "env": {},
+                   "context": {"PULL_BRANCH": "promote/0.3.0", "PR_TITLE": "Promote 0.3.0 to main", "GIT_BASE": first}, "commands": [cmd], **over}
+            rp = self.evidence / omg.local_ci_evidence_filename(tag, final)
+            rp.write_text(json.dumps(rec, separators=(",", ":")))
+            os.chmod(rp, 0o600)
+        self.env.pop("SOURCE_DATE_EPOCH")
+        for over in ({"cmd": {"log_sha256": "0" * 64}}, {"cmd": {"argv": ["/bin/true"]}}, {"env": {"A": "b"}}, {"base_sha": "1" * 40},
+                     {"cmd": {"started_at": "2020-01-01T00:00:00Z", "finished_at": "2020-01-01T00:00:00Z"}},
+                     {"cmd": {"started_at": "2099-01-01T00:00:00Z", "finished_at": "2099-01-01T00:00:00Z"}}):
+            plant(**over)
+            self.assertEqual(self.refused(self.rel("final-tag", execute=True)[1]), "FINAL_NOT_VERIFIED", over)
+        self.assertIsNone(self.remote("refs/tags/v0.3.0"))
+        import time
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        plant(cmd={"started_at": stamp, "finished_at": stamp})  # the same shape, accepted: the evidence is the authority
+        self.assertEqual(self.step(self.rel("final-tag", execute=True)[1], "tag")["state"], "CREATED")
+
+    def test_old_git_is_refused_before_anything_is_pushed(self):
+        self.go()
+        wrapper = self.bin / "git"
+        wrapper.write_text(wrapper.read_text().replace("exec ", 'case " $* " in *" --version "*) echo "git version 2.30.0"; exit 0;; esac\nexec ', 1))
+        for execute in (False, True):
+            rc, out, _ = self.rel("promote", execute=execute)
+            self.assertEqual((rc, self.refused(out)), (1, "GIT_TOO_OLD"))
+        self.assertEqual((self.heads("promote/"), self.merges()), ([], []))
 
     def test_carried_over_verification_runs_nothing(self):
         self.go()
