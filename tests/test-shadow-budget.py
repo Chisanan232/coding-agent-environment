@@ -621,17 +621,17 @@ class HeavyLaneCap(unittest.TestCase):
 
     def test_the_shipped_third_lane_value_gives_the_stable_and_wide_tiers_three(self):
         self.assertTrue(SHIPPED_THIRD_LANE_ENABLED)          # the pilot flip; reverting it is the rollback
-        with unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', SHIPPED_THIRD_LANE_ENABLED):
+        with unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', SHIPPED_THIRD_LANE_ENABLED), unittest.mock.patch.object(da, 'FOURTH_LANE_ENABLED', False):
             self.assertEqual({t: da.heavy_lane_cap(t) for t in da.HEAVY_LANES}, {'emergency': 0, 'low': 0, 'stable': 3, 'wide': 3})
             self.assertEqual(da.heavy_lane_cap('wide', True), 0)
             self.assertEqual(da.heavy_lane_cap('stable', True), 0)
 
-    def test_the_fourth_lane_ships_off_and_the_shipped_cap_is_unchanged(self):
-        self.assertIs(SHIPPED_FOURTH_LANE_ENABLED, False)    # enabling is a separate reviewed one-line PR; reverting it is the rollback
-        self.assertEqual((da.LANE_CEILING, da.FOUR_LANE_CEILING), (3, 4))
+    def test_the_fourth_lane_ships_on_as_a_monitored_pilot_and_only_the_wide_tier_gains_it(self):
+        self.assertIs(SHIPPED_FOURTH_LANE_ENABLED, True)    # the separate reviewed one-line PR (SPE-176); reverting it is the rollback
         with unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', SHIPPED_THIRD_LANE_ENABLED), \
                 unittest.mock.patch.object(da, 'FOURTH_LANE_ENABLED', SHIPPED_FOURTH_LANE_ENABLED):
-            self.assertEqual({t: da.heavy_lane_cap(t) for t in da.HEAVY_LANES}, {'emergency': 0, 'low': 0, 'stable': 3, 'wide': 3})
+            self.assertEqual({t: da.heavy_lane_cap(t) for t in da.HEAVY_LANES}, {'emergency': 0, 'low': 0, 'stable': 3, 'wide': 4})
+        self.assertEqual((da.LANE_CEILING, da.FOUR_LANE_CEILING), (3, 4))
 
     def test_the_cap_is_four_only_with_both_flags_and_only_on_the_wide_tier(self):
         table = {'stable': 2, 'wide': 2}
@@ -650,14 +650,16 @@ class HeavyLaneCap(unittest.TestCase):
 
     def test_the_third_lane_flag_adds_one_in_the_third_lane_tiers_only(self):
         self.assertEqual(da.THIRD_LANE_TIERS, ('stable', 'wide'))
-        with unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 2, 'wide': 2}), unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', True):
+        with unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 2, 'wide': 2}), unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', True), \
+                unittest.mock.patch.object(da, 'FOURTH_LANE_ENABLED', False):
             self.assertEqual((da.heavy_lane_cap('stable'), da.heavy_lane_cap('wide')), (3, 3))
             self.assertEqual((da.heavy_lane_cap('low'), da.heavy_lane_cap('wide', True)), (0, 0))
         with unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 2, 'wide': 2}):
             self.assertEqual((da.heavy_lane_cap('stable'), da.heavy_lane_cap('wide')), (2, 2))   # flag off: the table alone decides
 
     def test_nothing_ever_yields_more_than_the_ceiling(self):
-        with unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 9, 'wide': 3}), unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', True):
+        with unittest.mock.patch.dict(da.HEAVY_LANES, {'stable': 9, 'wide': 3}), unittest.mock.patch.object(da, 'THIRD_LANE_ENABLED', True), \
+                unittest.mock.patch.object(da, 'FOURTH_LANE_ENABLED', False):
             self.assertEqual((da.heavy_lane_cap('stable'), da.heavy_lane_cap('wide')), (3, 3))
 
     def test_the_lane_sites_and_the_shadow_budget_read_the_same_function(self):

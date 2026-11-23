@@ -329,7 +329,7 @@ THIRD_LANE_CLASSES = ('light', 'build-crate')
 # constant and reverting that PR is the rollback: there is deliberately no flag file, environment switch or kill file, because a
 # file or variable an agent can write is a forgeable cap. It needs THIRD_LANE_ENABLED too and adds one wide-tier lane, never above
 # FOUR_LANE_CEILING. LANE_CEILING stays 3 for the three-lane mode.
-FOURTH_LANE_ENABLED = False
+FOURTH_LANE_ENABLED = True
 FOUR_LANE_CEILING = 4
 # Lane 4 also needs this much free space left once every reservation and the request are counted (still the wide tier).
 FOURTH_LANE_MARGIN = 200 * 1024 ** 3

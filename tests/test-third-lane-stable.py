@@ -61,7 +61,7 @@ class CapTable(unittest.TestCase):
         self.assertEqual((da.LANE_CEILING, da.FOUR_LANE_CEILING), (3, 4))
         shipped = load('disk_admission_stable_lane_shipped', 'scripts/disk-admission.py')
         self.assertIs(shipped.THIRD_LANE_ENABLED, True)
-        self.assertIs(shipped.FOURTH_LANE_ENABLED, False)
+        self.assertIs(shipped.FOURTH_LANE_ENABLED, True)    # the monitored pilot flip; reverting it is the rollback
 
     def test_stable_and_wide_have_three_lanes_and_nothing_below_stable_has_any(self):
         self.assertEqual([self.cap(t) for t in ('emergency', 'low', 'stable', 'wide')], [0, 0, 3, 3])
