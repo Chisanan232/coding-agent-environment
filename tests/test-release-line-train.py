@@ -294,7 +294,7 @@ class TrainTests(TrainBase):
         pushes = [x for x in self.git_log.read_text().splitlines() if " push " in f" {x} "]
         self.assertTrue(pushes)
         for x in pushes:
-            self.assertRegex(x, r"^-C \S+ push origin [0-9a-f]{40}:refs/heads/\S+$")
+            self.assertRegex(x, r"^(?:--no-pager )?(?:-c \S+ )*-C \S+ push origin [0-9a-f]{40}:refs/heads/\S+$")
             self.assertNotRegex(x, r"--force|--delete|--mirror| -f |:refs/heads/\+| \+")
 
     def two_successors_registry(self, tags):
