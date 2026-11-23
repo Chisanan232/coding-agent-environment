@@ -10,8 +10,10 @@ import importlib.util
 import json
 import base64
 import pathlib
+import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("omg", pathlib.Path(__file__).resolve().parents[1] / "scripts/owner-merge-gate.py")
 omg = importlib.util.module_from_spec(SPEC)
@@ -648,6 +650,174 @@ def lf_comment(rec=None, body=None, **over):
                "createdAt": iso(NOW - 60), "includesCreatedEdit": False, "isMinimized": False}
     comment.update(over)
     return comment
+
+
+class StandingAdminMerge(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.evidence = pathlib.Path(directory.name)
+        patcher = patch.object(omg, "LOCAL_EVIDENCE_DIRS", {"codex": str(self.evidence)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def install_local_evidence(self, rec):
+        tag = "Chisanan232__r-7"
+        for check in rec["commands"]:
+            path = self.evidence / omg.local_ci_evidence_filename(tag, HEAD, check["name"])
+            payload = (check["name"] + " genuine fixture output").encode()
+            path.write_bytes(payload)
+            path.chmod(0o600)
+            check["log_sha256"] = hashlib.sha256(payload).hexdigest()
+        path = self.evidence / omg.local_ci_evidence_filename(tag, HEAD)
+        path.write_text(json.dumps(rec))
+        path.chmod(0o600)
+
+    def evaluate(self, fake, target="main", **recipe):
+        entry = {**LF_CONFIG["repos"]["Chisanan232/r"], "standing_admin_targets": [target], **recipe}
+        cfg = omg.load_local_first({"schema": 1, "repos": {"Chisanan232/r": entry}})
+        return omg.evaluate(fake, "Chisanan232/r", 7, OWNERS, local_first=cfg, ci_exception=True, now=NOW)
+
+    def fake(self, record=None, *, review=REVIEW, checks=None, **over):
+        if record is not None:
+            self.install_local_evidence(record)
+        comments = [lf_comment(record)] if record is not None else []
+        if review:
+            comments.append({"author": {"login": "chisanan232"}, "body": review})
+        fake = Fake(comments=comments, statusCheckRollup=checks or [], **over)
+        fake.pr["files"] = SRC
+        fake.message = "fix: apply reviewed change"
+        return fake
+
+    def test_hostless_ci_uses_record_without_per_pr_approval_and_pins_admin(self):
+        verdict, reasons, facts = self.evaluate(self.fake(lf_record()))
+        self.assertEqual((verdict, reasons), ("PASS", []))
+        self.assertTrue(facts["standing_admin_merge"])
+        command = omg.select_executor(None, facts, "/home/owner", True, {"chisanan232/r"})["command"]
+        self.assertIn("--admin", command.split())
+        self.assertIn("--merge", command.split())
+        self.assertEqual(command.split()[command.split().index("--match-head-commit") + 1], HEAD)
+
+    def test_green_hosted_checks_keep_normal_command(self):
+        fake = self.fake(lf_record(), checks=green())
+        verdict, reasons, facts = self.evaluate(fake)
+        self.assertEqual((verdict, reasons), ("PASS", []))
+        self.assertNotIn("--admin", omg.merge_command(facts).split())
+
+    def test_missing_local_evidence_or_review_blocks(self):
+        for fake, expected in ((self.fake(), "LOCAL_CI_MISSING"),
+                               (self.fake(lf_record(), review=None), "NO_REVIEW_EVIDENCE")):
+            with self.subTest(code=expected):
+                verdict, reasons, _ = self.evaluate(fake)
+                self.assertEqual(verdict, "REFUSE")
+                self.assertTrue(any(r.startswith(expected) for r in reasons), reasons)
+
+    def test_unlisted_target_and_public_repo_do_not_get_admin(self):
+        for target, private in (("integration/elsewhere", True), ("main", False)):
+            fake = self.fake(lf_record(), isPrivate=private)
+            verdict, reasons, facts = self.evaluate(fake, target=target)
+            self.assertNotEqual(verdict, "PASS", reasons)
+            self.assertFalse(facts.get("standing_admin_merge", False))
+
+    def test_genuine_failed_hosted_check_and_repository_block_refuse(self):
+        bad_check = [{"name": "test", "status": "COMPLETED", "conclusion": "FAILURE"}]
+        for fake, expected in ((self.fake(lf_record(), checks=bad_check), "CI_FAILED"),
+                               (self.fake(lf_record(), mergeStateStatus="BLOCKED"), "BLOCKED_BY_REPOSITORY_RULES")):
+            with self.subTest(code=expected):
+                verdict, reasons, _ = self.evaluate(fake)
+                self.assertEqual(verdict, "REFUSE")
+                self.assertTrue(any(r.startswith(expected) for r in reasons), reasons)
+
+    def test_recent_lint_cannot_freshen_an_old_suite(self):
+        rec = lf_record()
+        rec["commands"][0].update(started_at=iso(NOW - 25*3600), finished_at=iso(NOW - 25*3600 + 500))
+        verdict, reasons, _ = self.evaluate(self.fake(rec))
+        self.assertEqual(verdict, "REFUSE")
+        self.assertTrue(any(r.startswith("LOCAL_CI_STALE") for r in reasons), reasons)
+
+    def test_tampered_local_log_cannot_enable_admin_command(self):
+        fake = self.fake(lf_record())
+        path = self.evidence / omg.local_ci_evidence_filename("Chisanan232__r-7", HEAD, "suite")
+        path.write_bytes(b"modified log")
+        verdict, reasons, _ = self.evaluate(fake)
+        self.assertEqual(verdict, "REFUSE")
+        self.assertTrue(any(r.startswith("LOCAL_CI_LOGS_UNVERIFIED") for r in reasons), reasons)
+
+    def queued_fixture(self, *, run_age=7201, job_state="queued", changed=False, path="src/a.py"):
+        check = {"__typename": "CheckRun", "name": "ci", "status": "QUEUED", "conclusion": None,
+                 "detailsUrl": "https://github.com/Chisanan232/r/actions/runs/901/job/17"}
+        fake = self.fake(lf_record(), checks=[check])
+        fake.pr["files"] = [{"path": path}]
+        resources = {
+            "/actions/runs/901": {"id": 901, "head_sha": HEAD, "status": "queued", "conclusion": None,
+                                 "created_at": iso(NOW - 8000), "updated_at": iso(NOW - run_age)},
+            "/check-runs/17": {"id": 17, "head_sha": HEAD, "app": {"slug": "github-actions"},
+                               "name": "ci", "status": "queued", "conclusion": None},
+            "/actions/jobs/17": {"id": 17, "run_id": 901, "head_sha": HEAD, "status": job_state,
+                                  "conclusion": None, "started_at": None, "completed_at": None, "steps": []},
+        }
+        if changed:
+            fake.pr_after_first_view = {"statusCheckRollup": [
+                {**check, "status": "COMPLETED", "conclusion": "FAILURE"}]}
+        def run(*args):
+            if args[0] == "api" and args[1].startswith("repos/Chisanan232/r"):
+                path = args[1].removeprefix("repos/Chisanan232/r")
+                if path in resources:
+                    return json.dumps(resources[path])
+            return fake(*args)
+        return run
+
+    def test_confirmed_actions_queue_stall_can_use_verified_local_results(self):
+        verdict, reasons, facts = self.evaluate(self.queued_fixture())
+        self.assertEqual((verdict, reasons), ("PASS", []))
+        self.assertEqual(facts["hosted_checks"], "QUEUED_NEVER_STARTED")
+        self.assertIn("LOCAL_EQUIVALENT_PASS", facts["ci_verdict"])
+
+    def test_recent_queue_and_running_job_wait(self):
+        for options in ({"run_age": 180}, {"job_state": "in_progress"}):
+            with self.subTest(options=options):
+                verdict, reasons, _ = self.evaluate(self.queued_fixture(**options))
+                self.assertEqual(verdict, "WAIT")
+                self.assertTrue(any(r.startswith("CI_PENDING") for r in reasons), reasons)
+
+    def test_queued_stall_cannot_use_head_only_review_of_controlled_scripts(self):
+        fake = self.queued_fixture(path="scripts/update.py")
+        verdict, reasons, _ = self.evaluate(fake, pinned_paths=["scripts/*"], controlled_script_paths=["scripts/*"])
+        self.assertEqual(verdict, "REFUSE")
+        self.assertTrue(any(r.startswith("CONTROLLED_REVIEW_REQUIRED") for r in reasons), reasons)
+
+    def test_new_hosted_failure_on_final_read_prevents_merge(self):
+        verdict, reasons, _ = self.evaluate(self.queued_fixture(changed=True))
+        self.assertNotEqual(verdict, "PASS", reasons)
+
+    def test_billing_annotated_never_started_job_uses_local_evidence(self):
+        billing = BillingCI()
+        rec = lf_record()
+        self.install_local_evidence(rec)
+        check = billing.job("1", "ci")
+        run = billing.fake([check], {"1": [BillingCI.TEXT]},
+                           record=lf_comment(rec)["body"], mergeStateStatus="UNSTABLE")
+        # The comment fixture above does not carry GraphQL visibility metadata.
+        body = lf_comment(rec)
+        def with_visibility(*args):
+            if args[0] == "api" and args[1].endswith("/files?per_page=100"):
+                return json.dumps([{"filename": "src/a.py", "status": "modified"}])
+            result = run(*args)
+            if args[:2] != ("pr", "view"):
+                return result
+            pr = json.loads(result)
+            pr["files"] = SRC
+            pr["comments"][1] = body
+            return json.dumps(pr)
+        verdict, reasons, facts = self.evaluate(with_visibility)
+        self.assertEqual((verdict, reasons), ("PASS", []))
+        self.assertEqual(facts["standing_admin_reason"], "billing-never-started")
+        self.assertEqual(facts["hosted_checks"], "BILLING_BLOCKED_NOT_RUN")
+
+    def test_changed_head_after_evidence_refuses(self):
+        fake = self.fake(lf_record(), pr_after_first_view={"headRefOid": "8" * 40})
+        verdict, reasons, _ = self.evaluate(fake)
+        self.assertNotEqual(verdict, "PASS", reasons)
 
 
 class LocalFirst(unittest.TestCase):

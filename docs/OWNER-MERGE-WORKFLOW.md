@@ -77,7 +77,37 @@ identity, so the gate bounds what the record can cover; it does not independentl
 
 GitHub reports `mergeStateStatus` UNSTABLE while a non-required check has failed. When the billing waiver covers every failed check and nothing is pending, the gate treats that UNSTABLE as explained (`facts.merge_state`) and does not refuse on it; any other merge state (BLOCKED, DIRTY, BEHIND, unrecognized) and any failure the waiver does not cover still refuse.
 
-## Repository with no hosted CI (founder-approved per PR)
+## Standing admin merge for an approved personal repository
+
+The owner may authorize standing CI substitution for a private repository they
+personally administer. In the owner-controlled local-first recipe, set
+`standing_admin_targets` to exact, authorized integration refs. The separate
+version-branch policy still applies. The approval belongs to the repository
+and listed targets. Each merge still needs evidence tied to its exact PR,
+head, base and recipe.
+
+1. Run the full configured local recipe with `owner-merge-local-ci.py record`
+   in a clean worktree at the current head. Include the applicable test suite,
+   lint, type checks and security checks. Retain the command logs and their
+   digests. Post the recorder output according to the local-first instructions.
+2. Obtain a clean independent review of the exact head and resolve blocking
+   findings. Run `owner-merge-gate.py check --ci-exception`. Where the standing
+   rule applies, the local record supplies the technical evidence and the
+   owner’s policy supplies the authorization. A separate per-PR approval
+   marker is unnecessary.
+3. Use the single command printed by the gate after native host authorization.
+   A qualified substitution selects the exact-head, direct GitHub CLI admin
+   merge. A successful hosted pipeline follows the normal merge path. Verify
+   the merge parent, target and actual merged state in a separate call.
+
+Hosted CI that ran and genuinely failed still blocks. The gate requires
+affirmative hosted evidence before substituting local results and reports the
+hosted state separately. Healthy pending CI and ambiguous evidence remain
+pending. A GitHub rule or native host refusal applies to the printed command.
+The standing rule preserves formal review gates and any separate deployment or
+release authorization.
+
+## Repository with no hosted CI (legacy approval outside standing scope)
 
 A repository that defines no CI workflow at all (its `.github/workflows` directory does not exist) can never report a check, so
 `NO_CI_EVIDENCE` would block every PR. When the founder has approved the exception for a named PR, post, as the authenticated

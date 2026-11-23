@@ -72,11 +72,12 @@ commits, validation, review, pull request, merge, Jira reconciliation, and clean
 It alone defines the commit, branch, worktree and pull-request formats; do not
 restate them here.
 
-The shared engineering-workflow contract alone owns the two narrowly authorized
-administrator-merge exceptions: qualified `CI_UNAVAILABLE_EXTERNAL` and verified
-owner-only same-identity review deadlock (owner-admin merge needs no separate human
-Approve). Apply every evidence, identity, review,
-check and merge-strategy condition there; never bypass a genuine failing gate.
+The shared engineering-workflow contract defines the narrow administrator-merge
+exceptions, including verified owner-only same-identity review deadlock.
+Standing local CI substitution requires an owner-approved repository
+and exact target, a qualified hosted CI condition, the full recorded local recipe
+and independent review at the current head. Apply all identity, review, check
+and merge-strategy conditions in the workflow. Genuine failing gates block merge.
 
 <!-- coding-agent-environment:baseline:merge-sequence:start -->
 Merge an eligible PR only with the `merge_command` that `scripts/owner-merge-gate.py check --settings` prints (the validating `owner-merge-runner` when offered, else the pinned `gh pr merge`, which asks); never choose another merge spelling or interface (including the GitHub MCP merge tool) to avoid a prompt or a refusal. The merge is its own tool call: never combine it with a review comment, CI polling, a readback (`gh pr view`, `gh api`), a pipe, `head`/`tail`, `&&`, `;` or any other chaining. The order is: independent review, check the exact PR head, verify required CI, run `owner-merge-gate.py check`, write the review evidence at the printed `evidence_path` (its own call; only by an authorized path, never self-approved), run the printed `merge_command` alone, then verify the merged state with `owner-merge-gate.py verify` in a separate call. A compound shell call matches no merge rule, so the host asks about the whole thing; that is a workflow error, not a runner failure.
