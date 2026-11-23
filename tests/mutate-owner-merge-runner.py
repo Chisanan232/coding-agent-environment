@@ -18,7 +18,7 @@ MUTANTS = [
     ("local_gate_only PR bypass allowances", '        if not isinstance(allow, dict) or any(', '        if False and any('),
     ("local_gate_only rules page cap", '    if len(rules) >= 100:', '    if False:'),
     ("local_gate_only ruleset id validation", '    if any(type(r.get("ruleset_id")) is not int or r["ruleset_id"] <= 0 for r in rules):', '    if False:'),
-    ("local_gate_only pull request requirement", '    if not isinstance(prot.get("required_pull_request_reviews"), dict):', '    if False:'),
+    ("local_gate_only pull request requirement", '    pr_ok = isinstance(prr, dict)\n    if not pr_ok:', '    pr_ok = True\n    if not pr_ok:'),
     ("local_gate_only mode dispatch", '    if cfg.get("local_gate_only"):\n        return check_local_gate_base(runner, repo, base)\n', ''),
     ("local_gate_only config strictness", 'ok = ok and (not gate_only or (cfg["required_checks"] == [] and local_gate and prot is True', 'ok = ok and (True or (cfg["required_checks"] == [] and local_gate and prot is True'),
     ("local_gate_only absent protection", '            raise Refused(["local_gate_only: the base branch has no branch protection"])', '            pass'),
