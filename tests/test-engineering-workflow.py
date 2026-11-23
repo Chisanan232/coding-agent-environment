@@ -97,8 +97,10 @@ class EngineeringWorkflowContract(unittest.TestCase):
         for phrase in ['owner-admin merge', 'effective admin-bypass rights', 'freshly verified', 'A separate human GitHub Approve is not required', 'zero GitHub reviews is not by itself a blocker', 'independent risk-based review', 'Every genuine required check and security gate must', 'separately qualified CI_UNAVAILABLE_EXTERNAL', 'no unresolved blocking findings, `REQUEST_CHANGES`, or conflicts', '--match-head-commit <full sha>', 'HARNESS_PERMISSION_BLOCK', 'never route around it']:
             with self.subTest(owner_admin=phrase):
                 self.assertIn(phrase, flat)
-        self.assertIn("Exactly two narrow exceptions", text)
-        self.assertIn("neither grants blanket administrator authority", text)
+        for phrase in ("Standing local CI substitution", "standing_admin_targets",
+                       "full configured local results", "independent review",
+                       "native host and GitHub rule checks"):
+            self.assertIn(phrase, flat)
         self.assertNotIn("Never use administrator privileges to bypass them", text)
         for path in [ROOT / '.claude/CLAUDE.md', ROOT / 'codex/AGENTS.md']:
             self.assertIn('owner-only same-identity review deadlock', path.read_text())
