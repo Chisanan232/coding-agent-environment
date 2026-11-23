@@ -12,6 +12,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -22,6 +23,11 @@ base = train.base
 REPO = base.REPO
 REAL_GIT = train.REAL_GIT
 omg = base.omg
+
+
+def stamp(delta=0):
+    """Real wall-clock stamp: the tool's freshness decisions ignore SOURCE_DATE_EPOCH, which the harness pins to 2026-01-01."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + delta))
 
 FAKE_GH = train.FAKE_GH
 for old, new in (
@@ -95,6 +101,16 @@ class Rel(train.TrainBase):
         if self.AUTO_PIN:
             self.pin_protection()
 
+    def pin_verification(self, final, pr=1, digest=None):
+        """The owner pins the sha256 of the private verification record in release-verification.json."""
+        import hashlib
+        tag = f"{REPO.replace('/', '__')}-{pr}"
+        rec = json.loads((self.evidence / omg.local_ci_evidence_filename(tag, final)).read_text())
+        digest = digest or hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        pins = self.local / "release-verification.json"
+        pins.write_text(json.dumps({"schema": 1, "records": {REPO: {final: digest}}}))
+        os.chmod(pins, 0o600)
+
     def pin_protection(self, branch="main"):
         rc, out, _ = self.cli("protection", "snapshot", "--branch", branch, "--execute")
         self.assertEqual(rc, 0, out)
@@ -150,8 +166,10 @@ class Rel(train.TrainBase):
             self.assertRegex(x, r"push origin [0-9a-f]{40}:refs/(heads|tags)/\S+$")
             self.assertNotRegex(x, r"--force|--delete|--mirror| -f |\+")
 
-    def write_evidence(self, cand, pr=1, exit_code=0, argv=None, finished="2026-01-01T00:00:00Z", log_digest=None, mode=0o600, env=None,
+    def write_evidence(self, cand, pr=1, exit_code=0, argv=None, finished=None, log_digest=None, mode=0o600, env=None,
                        base_sha=None, post=True, edited=False, author="me", posted_differs=False):
+        created = stamp()
+        finished = finished or created
         """The recorder's private record and log (fixed evidence directory) plus the line the owner posts as a PR comment."""
         import hashlib
         self.local_first()
@@ -172,7 +190,7 @@ class Rel(train.TrainBase):
         os.chmod(rp, mode)
         posted = dict(rec, commands=[dict(rec["commands"][0], log_sha256="f" * 64)]) if posted_differs else rec
         comments = [{"author": {"login": author}, "body": "OWNER-MERGE-LOCAL-CI " + json.dumps(posted, separators=(",", ":")),
-                     "createdAt": "2026-01-01T00:00:00Z", "includesCreatedEdit": edited, "isMinimized": False}] if post else []
+                     "createdAt": created, "includesCreatedEdit": edited, "isMinimized": False}] if post else []
         self.gh_update(comments=comments)
         return rec
 
@@ -201,7 +219,7 @@ class GoRecords(Rel):
         self.assertEqual(self.refused(self.rel("candidate-tag", execute=True)[1]), "GO_SCOPE")
         self.go(expires_utc="2025-12-31T00:00:00Z")
         self.assertEqual(self.refused(self.rel("candidate-tag", execute=True)[1]), "GO_EXPIRED")
-        self.go(expires_utc="2027-01-01T00:00:00Z")
+        self.go(expires_utc="2099-01-01T00:00:00Z")
         self.assertEqual(self.step(self.rel("candidate-tag")[1], "go")["state"], "ACCEPTED")  # a live record is accepted
         for over in ({"repo": "Other-Owner/other"}, {"version": "0.9.0"}, {"publication_base": "master"}, {"candidate_sha": "a" * 40},
                      {"candidate_tag": "v0.9.0-rc.1"}, {"candidate_tag": "v0.3.0"}):
@@ -341,7 +359,7 @@ class Promote(Rel):
         self.assertEqual(self.step(out, "hosted_ci")["state"], "NOT_RUN")
         self.assertEqual(self.merges(), [])
         for bad in ({"exit_code": 1}, {"argv": ["/bin/true"]}, {"finished": "2025-12-01T00:00:00Z"}, {"log_digest": "0" * 64}, {"mode": 0o666},
-                    {"finished": "2026-01-02T00:00:00Z"}, {"env": {"A": "b"}}, {"base_sha": "1" * 40}, {"post": False}, {"edited": True},
+                    {"finished": stamp(86400)}, {"env": {"A": "b"}}, {"base_sha": "1" * 40}, {"post": False}, {"edited": True},
                     {"author": "someone-else"}, {"posted_differs": True}):
             # failing, other command than the owner's, stale, forged log digest, writable by others, finishing in the future, other env or
             # base commit, never posted, posted then edited, posted by another user, or posted record differing from the private evidence
@@ -354,6 +372,20 @@ class Promote(Rel):
         self.assertEqual(self.step(out, "hosted_ci")["state"], "NOT_RUN")
         self.assertEqual(self.step(out, "local_equivalent")["state"], "PASS")
         self.assertFalse([c for c in self.calls() if "workflow" in c])
+
+    def test_freshness_ignores_source_date_epoch(self):
+        self.go()
+        cand = self.sha("v0.3.0-rc.1")
+        self.gh_update(checks=[])
+        # a record that is stale on the real clock stays stale even when SOURCE_DATE_EPOCH makes it look fresh
+        self.write_evidence(cand, finished="2026-01-01T00:00:00Z")
+        self.env["SOURCE_DATE_EPOCH"] = "1767225600"
+        self.assertEqual(self.refused(self.promote_ok()[1]), "LOCAL_EVIDENCE_REQUIRED")
+        # a record that is fresh on the real clock stays fresh when SOURCE_DATE_EPOCH claims the year 2020
+        self.write_evidence(cand)
+        self.env["SOURCE_DATE_EPOCH"] = "1577836800"
+        rc, out, _ = self.promote_ok()
+        self.assertEqual((rc, out["status"], self.step(out, "local_equivalent")["state"]), (0, "PASS", "PASS"), out)
 
     def test_failing_hosted_check_refuses_and_pending_defers(self):
         self.go()
@@ -418,7 +450,6 @@ class Promote(Rel):
             lf.write_text(json.dumps({"schema": 1, "repos": {REPO: {"checks": [{"name": f"c{i}", "argv": a} for i, a in enumerate(argvs)]}}}))
             os.chmod(lf, 0o600)
         extra = ("--local-first", str(lf),)
-        self.env.pop("SOURCE_DATE_EPOCH")  # the recorder stamps real time, so the tool's clock must be real too
         rc, out, _ = self.rel("verify")
         self.assertEqual((rc, out["status"], self.step(out, "local_checks")["state"]), (0, "NOT_RUN", "NOT_RUN"))
         rc, out, _ = self.rel("verify", *extra, execute=True)  # no trust file yet: honest NOT_RUN
@@ -435,7 +466,15 @@ class Promote(Rel):
         self.assertEqual(len(self.w("worktree", "list").splitlines()), 1)  # the detached worktree is gone
         self.assertEqual(self.refused(self.rel("final-tag", execute=True)[1]), "FINAL_NOT_VERIFIED")  # a FAIL record does not unlock it
         checks([sys.executable, "-c", "pass"])
-        self.assertEqual(self.rel("verify", *extra, execute=True)[1]["status"], "PASS")
+        out = self.rel("verify", *extra, execute=True)[1]
+        self.assertEqual(out["status"], "PASS")
+        digest = self.step(out, "local_checks")["evidence"]["record_sha256"]
+        self.assertIn("release-verification.json", out["next_action"])
+        # the bare private record is not enough: the owner pins its digest
+        self.assertEqual(self.refused(self.rel("final-tag", execute=True)[1]), "FINAL_NOT_VERIFIED")
+        self.pin_verification(final, digest="0" * 64)
+        self.assertEqual(self.refused(self.rel("final-tag", execute=True)[1]), "FINAL_NOT_VERIFIED")
+        self.pin_verification(final, digest=digest)
         rc, out, _ = self.rel("final-tag", execute=True)
         self.assertEqual((rc, self.step(out, "tag")["state"]), (0, "CREATED"), out)
         self.assertEqual(self.sha("v0.3.0"), final)
@@ -467,23 +506,27 @@ class Promote(Rel):
         good = hashlib.sha256(b"ok\n").hexdigest()
 
         def plant(**over):
-            cmd = {"name": "t", "argv": self.CHECKS[0][1], "exit_code": 0, "started_at": "2026-11-23T00:00:00Z", "finished_at": "2026-11-23T00:00:00Z",
+            cmd = {"name": "t", "argv": self.CHECKS[0][1], "exit_code": 0, "started_at": stamp(), "finished_at": stamp(),
                    "log_sha256": good, **over.pop("cmd", {})}
             rec = {"schema": 1, "repo": REPO, "pr": 1, "base": "main", "base_sha": first, "head": final, "env": {},
                    "context": {"PULL_BRANCH": "promote/0.3.0", "PR_TITLE": "Promote 0.3.0 to main", "GIT_BASE": first}, "commands": [cmd], **over}
             rp = self.evidence / omg.local_ci_evidence_filename(tag, final)
             rp.write_text(json.dumps(rec, separators=(",", ":")))
             os.chmod(rp, 0o600)
-        self.env.pop("SOURCE_DATE_EPOCH")
         for over in ({"cmd": {"log_sha256": "0" * 64}}, {"cmd": {"argv": ["/bin/true"]}}, {"env": {"A": "b"}}, {"base_sha": "1" * 40},
                      {"cmd": {"started_at": "2020-01-01T00:00:00Z", "finished_at": "2020-01-01T00:00:00Z"}},
                      {"cmd": {"started_at": "2099-01-01T00:00:00Z", "finished_at": "2099-01-01T00:00:00Z"}}):
             plant(**over)
             self.assertEqual(self.refused(self.rel("final-tag", execute=True)[1]), "FINAL_NOT_VERIFIED", over)
         self.assertIsNone(self.remote("refs/tags/v0.3.0"))
-        import time
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        plant(cmd={"started_at": stamp, "finished_at": stamp})  # the same shape, accepted: the evidence is the authority
+        plant()  # a well-formed, fresh record is still not enough on its own: the owner must pin its digest
+        self.assertEqual(self.refused(self.rel("final-tag", execute=True)[1]), "FINAL_NOT_VERIFIED")
+        self.pin_verification(final, pr=1)
+        plant(env={})  # rewritten after pinning (same content here, so rewrite with a different log digest to change it)
+        plant(cmd={"finished_at": stamp(-5)})
+        self.assertEqual(self.refused(self.rel("final-tag", execute=True)[1]), "FINAL_NOT_VERIFIED")  # digest no longer matches the pin
+        plant()
+        self.pin_verification(final, pr=1)
         self.assertEqual(self.step(self.rel("final-tag", execute=True)[1], "tag")["state"], "CREATED")
 
     def test_old_git_is_refused_before_anything_is_pushed(self):
