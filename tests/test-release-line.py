@@ -74,8 +74,8 @@ class Base(unittest.TestCase):
         self.policy_path.write_text(json.dumps(policy, indent=2))
         os.chmod(self.policy_path, 0o600)
 
-    def cli(self, *args, repo=REPO, policy=True):
-        argv = [sys.executable, "-I", str(CLI), *args, "--repo", repo, "--state-dir", str(self.state_dir)]
+    def cli(self, *args, repo=REPO, policy=True, state_dir=None):
+        argv = [sys.executable, "-I", str(CLI), *args, "--repo", repo, "--state-dir", str(state_dir or self.state_dir)]
         if policy:
             argv += ["--policy", str(self.policy_path)]
         p = subprocess.run(argv, env=self.env, capture_output=True, text=True)
@@ -247,7 +247,7 @@ class RegistryTests(Base):
     def test_propose_retire_eol_converge_and_op_refusals(self):
         self.install(example())
         for args, check in ((("retire", "--line", "v0.4.0"), lambda ln: ln["state"] == "retired"),
-                            (("eol", "--line", "v0"), lambda ln: ln["support"] == "eol"),
+                            (("eol", "--line", "v0.4.0"), lambda ln: ln["support"] == "eol"),
                             (("converge", "--line", "v0.4.0", "--into", "v0"), lambda ln: ln["state"] == "converged" and ln["converged_into"] == "v0")):
             with self.subTest(args[0]):
                 op, _, lid, *rest = args
@@ -391,7 +391,7 @@ class AuditTests(Base):
         self.assertFalse(self.policy_path.exists())
         self.install(cand)  # the owner installs it
         self.assertEqual(self.cli("registry", "validate")[0], 0)
-        rc, out, _ = self.cli("registry", "propose", "--op", "eol", "--line", "v0", "--execute")
+        rc, out, _ = self.cli("registry", "propose", "--op", "eol", "--line", "v0.4.0", "--execute")
         self.assertEqual(rc, 0, out)
 
     def test_import_lists_exactly_the_gate_relevant_additions(self):
@@ -444,6 +444,271 @@ class AuditTests(Base):
         self.assertEqual(rc, 1)
         self.assertIn("INVALID_CANDIDATE", self.codes(out))
         self.assertFalse(self.state_dir.exists())
+
+
+def add_successor(p, lid, version, pred, pred_version, branch=None, **over):
+    e = entry(p)
+    branch = branch or f"integration/{lid}"
+    e["branches"].append({"branch": branch, "version": version})
+    line = {"id": lid, "kind": "successor", "version": version, "integration_branch": branch,
+            "predecessor": {"line": pred, "version": pred_version, "fork_ref": "v0.3.0-rc.2", "fork_sha": "3" * 40},
+            "publication_base": {"branch": "main", "kind": "default"}, "support": "supported", "state": "active"}
+    line.update(over)
+    e["release_lines"]["lines"].append(line)
+    return line
+
+
+class IntegrityTests(Base):
+    """Registry integrity rules, version grammar, tag formats (review findings 2, 5, 6, 7)."""
+
+    def invalid(self, mutate, code):
+        p = example()
+        mutate(p)
+        self.install(p)
+        rc, out, _ = self.cli("registry", "validate")
+        self.assertEqual((rc, out["status"]), (3, "FAIL"), out)
+        self.assertIn(code, self.codes(out))
+
+    def test_converged_into_self_and_cycles_are_rejected_not_recursed(self):
+        def selfref(p):
+            entry(p)["release_lines"]["lines"][1].update(state="converged", converged_into="v0.4.0")
+
+        def cycle(p):
+            add_successor(p, "v0.5.0", "0.5.0", "v0.4.0", "0.4.0", state="converged", converged_into="v0.4.0")
+            entry(p)["release_lines"]["lines"][1].update(state="converged", converged_into="v0.5.0")
+        self.invalid(selfref, "BAD_STATE")
+        self.invalid(cycle, "BAD_STATE")
+
+    def test_converged_into_must_not_be_retired(self):
+        def mutate(p):
+            add_successor(p, "v0.5.0", "0.5.0", "v0.4.0", "0.4.0", state="retired")
+            entry(p)["release_lines"]["lines"][1].update(state="converged", converged_into="v0.5.0")
+        self.invalid(mutate, "BAD_STATE")
+
+    def test_tag_format_placeholders_and_ambiguity(self):
+        for tf, cf in (("v{version}{version}", "v{version}-rc.{n}"), ("v{version}-{n}", "v{version}-rc.{n}"),
+                       ("v{version}", "v{version}-rc.{n}.{n}"), ("v{version}", "v{version}{n}"), ("v{version}", "v{version}-{x}-{n}")):
+            with self.subTest(tf=tf, cf=cf):
+                def mutate(p, tf=tf, cf=cf):
+                    entry(p)["release_lines"].update(tag_format=tf, candidate_format=cf)
+                self.invalid(mutate, "BAD_FIELD")
+
+    def test_two_part_versions_for_mvp_products_and_frozen_detection(self):
+        def mvp(p):
+            rl = entry(p)["release_lines"]
+            rl.update(tag_format="MVP-{version}", candidate_format="MVP-{version}-rc.{n}")
+            rl["lines"][0]["major"] = 2
+            rl["lines"][1].update(version="2.1")
+            rl["lines"][1]["predecessor"].update(version="2.0")
+            entry(p)["branches"][1]["version"] = "2.1"
+            entry(p)["branches"].append({"branch": "integration/mvp-5.0", "version": "5.0"})
+            rl["lines"].append({"id": "mvp-5", "kind": "version", "version": "5.0", "integration_branch": "integration/mvp-5.0",
+                                "publication_base": {"branch": "main", "kind": "default"}, "support": "supported"})
+            return p
+        self.install(mvp(example()))
+        self.assertEqual(self.cli("registry", "validate")[0], 0)
+        self.make_repo(tags=[("MVP-2.0-rc.1", "integration/v0.x")], extra_branches=("integration/mvp-5.0",))
+        rc, out, _ = self.cli("route", "--kind", "feature", "--version", "2.2", "--clone", self.clone)
+        self.assertEqual(next(s for s in out["steps"] if s["step"] == "route")["evidence"]["branch"], "integration/v0.4.0")
+        rc, out, _ = self.cli("route", "--kind", "feature", "--version", "5.0", "--clone", self.clone)
+        self.assertEqual(next(s for s in out["steps"] if s["step"] == "route")["evidence"]["branch"], "integration/mvp-5.0")
+        subprocess.run(["git", "-C", self.clone, "tag", "MVP-2.0", "origin/integration/v0.x"], check=True, env=self.env)
+        rc, out, _ = self.cli("route", "--kind", "feature", "--version", "2.2", "--clone", self.clone)
+        self.assertEqual(next(s for s in out["steps"] if s["step"] == "route")["evidence"]["branch"], "integration/v0.x")
+
+    def test_integrity_rules(self):
+        cases = {
+            "DUPLICATE_BRANCH": lambda p: add_successor(p, "v0.5.0", "0.5.0", "v0.4.0", "0.4.0", branch="integration/v0.4.0"),
+            "DUPLICATE_VERSION": lambda p: add_successor(p, "other", "0.4.0", "v0", "0.3.0"),
+            "DEFAULT_BASE_LISTED": lambda p: entry(p)["branches"].append({"branch": "main", "version": "m"}),
+            "BAD_PREDECESSOR": lambda p: entry(p)["release_lines"]["lines"][1]["predecessor"].update(version="0.4.0"),
+        }
+        for code, mutate in cases.items():
+            with self.subTest(code):
+                self.invalid(mutate, code)
+
+    def test_default_base_listed_fails_even_when_gate_accepts(self):
+        def mutate(p):
+            entry(p)["branches"].append({"branch": "main", "version": "m"})
+        self.invalid(mutate, "DEFAULT_BASE_LISTED")
+
+    def test_predecessor_cycle_and_unrooted_chain(self):
+        def cycle(p):
+            add_successor(p, "a", "0.6.0", "b", "0.5.0")
+            add_successor(p, "b", "0.7.0", "a", "0.6.0")
+        def unrooted(p):
+            entry(p)["release_lines"]["lines"].append({"id": "mvp-5", "kind": "version", "version": "5.0", "integration_branch": "integration/v0.x",
+                                                       "publication_base": {"branch": "main", "kind": "default"}, "support": "supported"})
+            entry(p)["release_lines"]["lines"][-1]["integration_branch"] = "integration/mvp-5.0"
+            entry(p)["branches"].append({"branch": "integration/mvp-5.0", "version": "5.0"})
+            add_successor(p, "v5.1", "5.1", "mvp-5", "5.0")
+        self.invalid(cycle, "BAD_PREDECESSOR")
+        self.invalid(unrooted, "BAD_PREDECESSOR")
+
+    def test_major_with_predecessor_and_bad_fork_refs(self):
+        self.invalid(lambda p: entry(p)["release_lines"]["lines"][0].update(predecessor={"line": "v0.4.0"}), "BAD_FIELD")
+        for ref in ("-x", "a..b", "a\nb", "a b", "x.lock", "", "a/"):
+            with self.subTest(ref=ref):
+                self.invalid(lambda p, ref=ref: entry(p)["release_lines"]["lines"][1]["predecessor"].update(fork_ref=ref), "BAD_PREDECESSOR")
+        self.invalid(lambda p: entry(p)["release_lines"]["lines"][1]["predecessor"].update(fork_sha="G" * 40), "BAD_PREDECESSOR")
+
+    def test_unexpected_shape_gives_an_envelope_not_a_traceback(self):
+        self.install({"schema": 1, "repos": {REPO: []}})
+        rc, out, err = self.cli("registry", "validate")
+        self.assertEqual((rc, out["status"]), (3, "FAIL"))
+        self.assertIn("UNEXPECTED_SHAPE", self.codes(out))
+        self.assertNotIn("Traceback", err)
+
+    def test_repo_name_is_validated_for_every_command(self):
+        self.install(example())
+        for repo in ("host.example/Owner/repo", "norepo", "a/b/c", "--x/y"):
+            for args in (("registry", "validate"), ("audit", "observe", "--clone", self.tmp.name)):
+                with self.subTest(repo=repo, args=args[:2]):
+                    rc, out, _ = self.cli(*args, repo=repo)
+                    self.assertEqual((rc, out), (2, None))
+
+
+class RouteClone(Base):
+    """route must refuse rather than guess when the clone cannot answer (review finding 1)."""
+
+    def route(self, clone, kind="feature", version="0.5.0"):
+        self.install(example())
+        return self.cli("route", "--kind", kind, "--version", version, "--clone", clone)
+
+    def test_missing_and_non_git_clone_are_refused(self):
+        for clone in (os.path.join(self.tmp.name, "nowhere"), self.tmp.name):
+            with self.subTest(clone=clone):
+                rc, out, _ = self.route(clone)
+                self.assertEqual((rc, out["status"]), (1, "BLOCKED"))
+                self.assertIn("NOT_A_CLONE", self.codes(out))
+
+    def test_branch_missing_from_clone_is_refused(self):
+        self.make_repo(tags=[("v0.3.0-rc.1", "integration/v0.x")])
+        for ref in ("refs/remotes/origin/integration/v0.x", "refs/heads/integration/v0.x"):
+            subprocess.run(["git", "-C", self.clone, "update-ref", "-d", ref], check=True, env=self.env)
+        rc, out, _ = self.route(self.clone)
+        self.assertEqual((rc, out["status"]), (1, "BLOCKED"))
+        self.assertIn("BRANCH_NOT_IN_CLONE", self.codes(out))
+
+    def test_fetched_remote_ref_beats_a_stale_local_head(self):
+        self.make_repo()
+        env = dict(self.env, GIT_AUTHOR_DATE=DATE, GIT_COMMITTER_DATE=DATE, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@e.x",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@e.x")
+        g = lambda *a: subprocess.run(["git", "-C", self.clone, *a], check=True, env=env, capture_output=True)
+        g("checkout", "-q", "integration/v0.x")
+        (pathlib.Path(self.clone) / "b.txt").write_text("b\n")
+        g("add", ".")
+        g("commit", "-q", "-m", "work")
+        g("tag", "v0.3.0-rc.1")
+        g("push", "-q", "origin", "integration/v0.x")
+        g("checkout", "-q", "main")
+        g("branch", "-f", "integration/v0.x", "main")  # local head is now stale, behind the fetched origin ref
+        rc, out, _ = self.route(self.clone)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(next(s for s in out["steps"] if s["step"] == "route")["evidence"]["branch"], "integration/v0.4.0")
+
+
+class ProposalSafety(Base):
+    """State directory confinement, modes and bounded input (review findings 3, 8, 13, 14)."""
+
+    def propose(self, *extra, state_dir=None):
+        return self.cli("registry", "propose", "--op", "eol", "--line", "v0.4.0", "--execute", *extra, state_dir=state_dir)
+
+    def test_state_dir_inside_owner_config_is_refused(self):
+        self.install(example())
+        before = sorted(p.name for p in self.local.iterdir())
+        rc, out, _ = self.propose(state_dir=self.local / "state")
+        self.assertEqual(rc, 1)
+        self.assertIn("STATE_DIR_UNSAFE", self.codes(out))
+        self.assertEqual(sorted(p.name for p in self.local.iterdir()), before)
+
+    def test_symlinked_state_or_proposals_dir_is_refused(self):
+        self.install(example())
+        target = pathlib.Path(self.tmp.name) / "elsewhere"
+        target.mkdir()
+        (self.state_dir).mkdir()
+        (self.state_dir / "proposals").symlink_to(target)
+        rc, out, _ = self.propose()
+        self.assertEqual(rc, 1)
+        self.assertIn("STATE_DIR_UNSAFE", self.codes(out))
+        link = pathlib.Path(self.tmp.name) / "linked-state"
+        link.symlink_to(target)
+        rc, out, _ = self.propose(state_dir=link)
+        self.assertIn("STATE_DIR_UNSAFE", self.codes(out))
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_modes_are_forced_and_loose_preexisting_files_do_not_survive(self):
+        self.install(example())
+        rc, out, _ = self.propose()
+        ev = next(s for s in out["steps"] if s["step"] == "emit")["evidence"]
+        d = pathlib.Path(ev["candidate_path"]).parent
+        os.chmod(d, 0o777)
+        for p in (ev["candidate_path"], ev["authority_path"]):
+            os.chmod(p, 0o666)
+        rc, out, _ = self.propose()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(oct(d.stat().st_mode & 0o777), "0o700")
+        for p in (ev["candidate_path"], ev["authority_path"]):
+            self.assertEqual(oct(os.stat(p).st_mode & 0o777), "0o600")
+        self.assertEqual([x.name for x in d.iterdir() if x.name.endswith(".tmp")], [])
+
+    def test_noop_propose_emits_no_packet(self):
+        p = example()
+        entry(p)["release_lines"]["lines"][1].update(state="retired")
+        self.install(p)
+        rc, out, _ = self.cli("registry", "propose", "--op", "retire", "--line", "v0.4.0", "--execute")
+        self.assertEqual((rc, out["status"]), (0, "PASS"))
+        self.assertIn("NO_OP", self.codes(out))
+        self.assertFalse(self.state_dir.exists())
+        p = example()
+        entry(p)["release_lines"]["lines"][1].update(support="eol")
+        self.install(p)
+        rc, out, _ = self.cli("registry", "propose", "--op", "eol", "--line", "v0.4.0", "--execute")
+        self.assertIn("NO_OP", self.codes(out))
+        self.assertFalse(self.state_dir.exists())
+
+    def test_retire_or_eol_of_a_line_with_active_dependents_is_refused(self):
+        p = example()
+        add_successor(p, "v0.5.0", "0.5.0", "v0.4.0", "0.4.0")
+        self.install(p)
+        for op, line in (("retire", "v0.4.0"), ("eol", "v0.4.0"), ("eol", "v0")):
+            with self.subTest(op=op, line=line):
+                rc, out, _ = self.cli("registry", "propose", "--op", op, "--line", line, "--execute")
+                self.assertEqual(rc, 1)
+                self.assertIn("HAS_ACTIVE_DEPENDENTS", self.codes(out))
+        self.assertFalse(self.state_dir.exists())
+
+    def test_add_successor_refuses_an_inactive_predecessor(self):
+        for mutate in (lambda ln: ln.update(support="eol"), lambda ln: ln.update(state="retired")):
+            p = example()
+            mutate(entry(p)["release_lines"]["lines"][1])
+            self.install(p)
+            rc, out, _ = self.cli("registry", "propose", "--op", "add-successor", "--version", "0.5.0", "--predecessor", "v0.4.0",
+                                  "--predecessor-version", "0.4.0", "--fork-ref", "v0.4.0-rc.1", "--fork-sha", "2" * 40, "--execute")
+            self.assertEqual(rc, 1)
+            self.assertIn("PREDECESSOR_NOT_ACTIVE", self.codes(out))
+
+    def audit_with(self, data):
+        path = pathlib.Path(self.tmp.name) / "a.json"
+        path.write_bytes(data)
+        return path
+
+    def test_audit_file_must_be_small_and_regular(self):
+        a = example()
+        body = json.dumps({"schema": 1, "repo": REPO, "release_lines": entry(a)["release_lines"]}).encode()
+        rc, out, _ = self.cli("audit", "import", str(self.audit_with(body + b" " * (1 << 20))))
+        self.assertEqual(rc, 3)
+        self.assertIn("too large", json.dumps(out))
+        fifo = pathlib.Path(self.tmp.name) / "fifo.json"
+        os.mkfifo(fifo)
+        rc, out, _ = self.cli("audit", "import", str(fifo))
+        self.assertEqual(rc, 3)
+        self.assertIn("regular file", json.dumps(out))
+        real = self.audit_with(body)
+        link = pathlib.Path(self.tmp.name) / "link.json"
+        link.symlink_to(real)
+        self.assertEqual(self.cli("audit", "import", str(link))[0], 3)
+        self.assertEqual(self.cli("audit", "import", str(real))[0], 0)
 
 
 if __name__ == "__main__":

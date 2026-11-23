@@ -26,6 +26,7 @@ import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
 
@@ -34,9 +35,10 @@ SPEC = importlib.util.spec_from_file_location("owner_merge_gate", HERE / "owner-
 omg = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(omg)
 
-VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
-LINE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-SHA_RE = re.compile(r"[0-9a-f]{40}")
+VERSION_PAT = r"\d+\.\d+(?:\.\d+)?"  # 3-part, or 2-part for MVP products and legacy per-version branches
+VERSION_RE = re.compile(VERSION_PAT, re.ASCII)
+LINE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", re.ASCII)
+SHA_RE = re.compile(r"[0-9a-f]{40}", re.ASCII)
 RELEASE_SEGMENT = re.compile(r"(^|/)releases?(/|$)", re.I)
 AUDIT_MAX_BYTES = 1 << 20
 STATE_ROOT = "~/.local/state/coding-agent-environment/release-line"
@@ -61,7 +63,7 @@ def now_utc():
 
 
 def run(argv, cwd=None):
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
     try:
         p = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -70,7 +72,13 @@ def run(argv, cwd=None):
 
 
 def git(clone, *args):
-    return run(["git", "-C", str(clone), *args])
+    # The clone is agent-supplied: never run its fsmonitor or hooks, never page.
+    return run(["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", str(clone), *args])
+
+
+def vkey(v):
+    parts = [int(x) for x in v.split(".")]
+    return tuple(parts + [0] * (3 - len(parts)))
 
 
 def tool_revision():
@@ -93,6 +101,25 @@ def find_entry(policy, repo):
         if key.lower() == repo.lower():
             return key, entry
     return None, None
+
+
+def format_ok(fmt, placeholders):
+    rest = fmt
+    for ph in placeholders:
+        if rest.count(ph) != 1:
+            return False
+        rest = rest.replace(ph, "")
+    return "{" not in rest and "}" not in rest and bool(fmt) and not fmt.startswith("-")
+
+
+def fmt_re(fmt):
+    """Regex for a validated tag format; literal parts are escaped, so this cannot raise re.error."""
+    out = [re.escape(x) for x in re.split(r"\{version\}|\{n\}", fmt)]
+    holes = re.findall(r"\{version\}|\{n\}", fmt)
+    pat = out[0]
+    for hole, lit in zip(holes, out[1:]):
+        pat += (f"(?P<v>{VERSION_PAT})" if hole == "{version}" else r"(?P<n>\d+)") + lit
+    return re.compile(pat, re.ASCII)
 
 
 def validate_entry(entry):
@@ -119,11 +146,14 @@ def validate_entry(entry):
         err(None, "BAD_FIELD", "publication_go must be per-version")
     if rl.get("milestone_tags") not in ("go-required", "pre-authorized"):
         err(None, "BAD_FIELD", "milestone_tags must be go-required or pre-authorized")
-    if not (isinstance(rl.get("tag_format"), str) and "{version}" in rl["tag_format"]):
-        err(None, "BAD_FIELD", "tag_format must contain {version}")
-    cf = rl.get("candidate_format")
-    if not (isinstance(cf, str) and "{version}" in cf and "{n}" in cf):
-        err(None, "BAD_FIELD", "candidate_format must contain {version} and {n}")
+    tf, cf = rl.get("tag_format"), rl.get("candidate_format")
+    if not (isinstance(tf, str) and format_ok(tf, ("{version}",))):
+        err(None, "BAD_FIELD", "tag_format must contain exactly one {version} and nothing else templated")
+    if not (isinstance(cf, str) and format_ok(cf, ("{version}", "{n}"))):
+        err(None, "BAD_FIELD", "candidate_format must contain exactly one {version} and one {n} and nothing else templated")
+    if isinstance(tf, str) and isinstance(cf, str) and format_ok(tf, ("{version}",)) and format_ok(cf, ("{version}", "{n}")) \
+            and (fmt_re(tf).fullmatch(cf.replace("{version}", "1.2.3").replace("{n}", "1")) or fmt_re(cf).fullmatch(tf.replace("{version}", "1.2.3"))):
+        err(None, "BAD_FIELD", "a candidate tag must never match tag_format (formats are ambiguous)")
     build = rl.get("build")
     if build is not None and not (isinstance(build, dict) and isinstance(build.get("argv"), list) and build["argv"]
                                   and all(isinstance(a, str) for a in build["argv"]) and isinstance(build.get("outputs"), list)):
@@ -152,8 +182,10 @@ def validate_entry(entry):
                 err(lid, "DUPLICATE_MAJOR", f"major {ln['major']} already has line {majors[ln['major']]}")
             else:
                 majors[ln["major"]] = lid
+            if ln.get("predecessor") is not None:
+                err(lid, "BAD_FIELD", "a major line has predecessor null")
         elif not (isinstance(ln.get("version"), str) and VERSION_RE.fullmatch(ln["version"])):
-            err(lid, "BAD_FIELD", "version must be MAJOR.MINOR.PATCH")
+            err(lid, "BAD_FIELD", "version must be MAJOR.MINOR or MAJOR.MINOR.PATCH")
         ib = ln.get("integration_branch")
         if not isinstance(ib, str):
             err(lid, "BAD_FIELD", "integration_branch missing")
@@ -166,20 +198,53 @@ def validate_entry(entry):
             err(lid, "BAD_FIELD", "publication_base needs branch and kind default|maintenance")
         elif pb["kind"] == "maintenance" and pb["branch"] in branches:
             err(lid, "MAINTENANCE_BASE_LISTED", f"{pb['branch']} must not be in branches (promotion never goes through the gate)")
+        elif pb["kind"] == "default" and pb["branch"] in branches:
+            err(lid, "DEFAULT_BASE_LISTED", f"{pb['branch']} is the publication base and must not be listed as an integration branch")
         if ln.get("support") not in ("supported", "eol"):
             err(lid, "BAD_FIELD", "support must be supported or eol")
         if kind == "successor":
             pred = ln.get("predecessor")
+            fr = pred.get("fork_ref") if isinstance(pred, dict) else None
             if not (isinstance(pred, dict) and pred.get("line") in ids and pred.get("line") != lid
-                    and VERSION_RE.fullmatch(str(pred.get("version"))) and isinstance(pred.get("fork_ref"), str)
+                    and VERSION_RE.fullmatch(str(pred.get("version"))) and isinstance(fr, str)
+                    and omg.VERSION_REF_RE.fullmatch(fr) and ".." not in fr and not omg.bad_ref_parts(fr) and not fr.endswith("/")
                     and SHA_RE.fullmatch(str(pred.get("fork_sha")))):
-                err(lid, "BAD_PREDECESSOR", "predecessor needs an existing line, version, fork_ref and 40-hex fork_sha")
+                err(lid, "BAD_PREDECESSOR", "predecessor needs an existing line, version, a valid fork_ref and 40-hex fork_sha")
+            elif isinstance(ln.get("version"), str) and VERSION_RE.fullmatch(ln["version"]) and vkey(pred["version"]) >= vkey(ln["version"]):
+                err(lid, "BAD_PREDECESSOR", "predecessor.version must be lower than the line's version")
             state = ln.get("state")
             if state not in ("active", "converged", "retired"):
                 err(lid, "BAD_STATE", "successor state must be active, converged or retired")
-            elif state == "converged" and ln.get("converged_into") not in ids:
-                err(lid, "BAD_STATE", "a converged line needs converged_into naming an existing line")
+            elif state == "converged":
+                tgt = next((x for x in lines if isinstance(x, dict) and x.get("id") == ln.get("converged_into")), None)
+                if tgt is None or tgt.get("id") == lid:
+                    err(lid, "BAD_STATE", "a converged line needs converged_into naming a different existing line")
+                elif tgt.get("state") in ("converged", "retired"):
+                    err(lid, "BAD_STATE", "converged_into must name a line that is not itself converged or retired")
+    cross_checks(lines, err)
     return errs
+
+
+def cross_checks(lines, err):
+    by_id = {x["id"]: x for x in lines if isinstance(x, dict) and isinstance(x.get("id"), str)}
+    for field, code in (("integration_branch", "DUPLICATE_BRANCH"), ("version", "DUPLICATE_VERSION")):
+        seen = {}
+        for x in by_id.values():
+            v = x.get(field)
+            if isinstance(v, str) and not (field == "version" and x.get("kind") == "major"):
+                if v in seen:
+                    err(x["id"], code, f"{field} {v} is also used by line {seen[v]}")
+                seen[v] = x["id"]
+    for x in by_id.values():
+        if x.get("kind") != "successor":
+            continue
+        cur, seen = x, set()
+        while isinstance(cur, dict) and cur.get("kind") == "successor" and cur["id"] not in seen:
+            seen.add(cur["id"])
+            pred = cur.get("predecessor")
+            cur = by_id.get(pred.get("line")) if isinstance(pred, dict) else None
+        if not (isinstance(cur, dict) and cur.get("kind") == "major"):
+            err(x["id"], "BAD_PREDECESSOR", "predecessor chain must be acyclic and rooted at a major line")
 
 
 def load_registry(path):
@@ -190,9 +255,19 @@ def load_registry(path):
         raise ConfigError("POLICY_MISSING", "owner policy file not found")
     except (ValueError, OSError) as e:
         raise ConfigError("POLICY_UNREADABLE", str(e))
-    raw = pathlib.Path(os.path.realpath(os.path.expanduser(path))).read_bytes()
     if not isinstance(policy, dict) or not isinstance(policy.get("repos"), dict):
         raise ConfigError("POLICY_INVALID", "policy must be an object with a repos object")
+    # The trust-anchor reader returns only the parsed object. Digest bytes are read once more through a no-follow descriptor and
+    # accepted only if they parse to exactly the object it validated, so the digest cannot describe different content.
+    try:
+        fd = os.open(os.path.realpath(os.path.expanduser(path)), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read(omg.POLICY_MAX_BYTES + 1)
+        same = len(raw) <= omg.POLICY_MAX_BYTES and json.loads(raw, object_pairs_hook=omg._no_duplicate_keys) == policy
+    except (OSError, ValueError):
+        same = False
+    if not same:
+        raise ConfigError("POLICY_CHANGED_DURING_READ", "owner policy changed while it was being read; retry")
     return policy, sha256_bytes(raw)
 
 
@@ -226,8 +301,48 @@ def line_by_id(entry, lid):
 # ---------------------------------------------------------------- proposals
 
 def proposal_dir(args):
-    d = pathlib.Path(os.path.expanduser(args.state_dir or f"{STATE_ROOT}/{args.repo.replace('/', '__')}")) / "proposals"
+    """Proposals directory; never a symlink and never inside the owner-config root (a proposal must not land beside a trust file)."""
+    base = pathlib.Path(os.path.expanduser(args.state_dir or f"{STATE_ROOT}/{args.repo.replace('/', '__')}"))
+    d = base / "proposals"
+    owner_root = os.path.realpath(os.path.expanduser(os.path.dirname(omg.VERSION_POLICY_DEFAULT)))
+    if os.path.islink(base) or os.path.islink(d):
+        raise Refusal("STATE_DIR_UNSAFE", "the state directory and its proposals directory must not be symlinks")
+    real = os.path.realpath(d)
+    if os.path.commonpath([owner_root, real]) == owner_root:
+        raise Refusal("STATE_DIR_UNSAFE", f"the state directory must not be inside {owner_root}")
     return d
+
+
+def write_private(d, files):
+    """Write (name, bytes) files into d: directory 0700 through a no-follow descriptor, each file via temp + rename at 0600."""
+    d.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.mkdir(d, 0o700)
+    except FileExistsError:
+        pass
+    try:
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise Refusal("STATE_DIR_UNSAFE", "proposals directory is not a plain directory")
+    try:
+        if os.fstat(dfd).st_uid != os.getuid():
+            raise Refusal("STATE_DIR_UNSAFE", "proposals directory is not owned by the caller")
+        os.fchmod(dfd, 0o700)
+        for name, data in files:
+            tmp = f".{name}.{os.getpid()}.tmp"
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except FileNotFoundError:
+                pass
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+            with os.fdopen(fd, "wb") as f:
+                os.fchmod(f.fileno(), 0o600)
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    finally:
+        os.close(dfd)
 
 
 def emit_proposal(args, res, policy, baseline_sha, candidate, tag, summary):
@@ -257,12 +372,7 @@ def emit_proposal(args, res, policy, baseline_sha, candidate, tag, summary):
     evidence = {"gate_relevant_additions": adds, "baseline_sha256": baseline_sha, "candidate_sha256": cand_sha, "canonical_loader": loader, "summary": summary,
                 "candidate_path": str(cand_path), "authority_path": str(auth_path)}
     if args.execute:
-        d.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(d, 0o700)
-        for p, data in ((cand_path, body), (auth_path, dump(authority))):
-            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
+        write_private(d, ((cand_path.name, body), (auth_path.name, dump(authority))))
         res.step("emit", "WRITTEN", evidence)
         res.next_action = f"owner: review {cand_path}, complete the authority record, install the candidate as the policy file"
     else:
@@ -283,6 +393,8 @@ def gate_additions(old, new, repo):
 
 def apply_add_successor(centry, pred, version, pred_version, fork_ref, fork_sha, branch=None):
     """Edit one candidate repo entry in place: list the successor's branch and head prefix and add its line; returns a summary."""
+    if pred["support"] == "eol" or pred.get("state", "active") != "active":
+        raise Refusal("PREDECESSOR_NOT_ACTIVE", f"line {pred['id']} is eol, retired or converged and cannot take a successor")
     rl = centry["release_lines"]
     lid, branch = f"v{version}", branch or f"integration/v{version}"
     if any(x["id"] == lid for x in rl["lines"]):
@@ -296,6 +408,11 @@ def apply_add_successor(centry, pred, version, pred_version, fork_ref, fork_sha,
         "predecessor": {"line": pred["id"], "version": pred_version, "fork_ref": fork_ref, "fork_sha": fork_sha},
         "publication_base": copy.deepcopy(pred["publication_base"]), "support": "supported", "state": "active"})
     return f"add successor {lid} on {branch} after {pred['id']}"
+
+
+def noop(res, why):
+    res.step("propose", "NO_OP", {"reason": why})
+    res.next_action = "none: the registry already has this state; no packet emitted"
 
 
 def propose(args, res):
@@ -320,15 +437,27 @@ def propose(args, res):
         ln = next((x for x in rl["lines"] if x["id"] == args.line), None)
         if ln is None:
             raise Refusal("UNKNOWN_LINE", f"no line {args.line}")
+        if op != "eol" and ln["kind"] != "successor":
+            raise Refusal("NOT_A_SUCCESSOR", f"{op} applies to successor lines only")
+        if op in ("eol", "retire"):
+            deps = [x["id"] for x in rl["lines"] if x["kind"] == "successor" and x["state"] == "active" and x["predecessor"]["line"] == ln["id"]]
+            if deps:
+                raise Refusal("HAS_ACTIVE_DEPENDENTS", f"active line(s) {deps} depend on {ln['id']} as predecessor")
         if op == "eol":
+            if ln["support"] == "eol":
+                return noop(res, f"{ln['id']} is already eol")
             ln["support"] = "eol"
         elif ln["kind"] != "successor":
             raise Refusal("NOT_A_SUCCESSOR", f"{op} applies to successor lines only")
         elif op == "retire":
+            if ln["state"] == "retired":
+                return noop(res, f"{ln['id']} is already retired")
             ln["state"] = "retired"
         else:
             if not args.into:
                 raise Refusal("MISSING_FLAGS", "converge needs --into")
+            if ln["state"] == "converged" and ln.get("converged_into") == args.into:
+                return noop(res, f"{ln['id']} is already converged into {args.into}")
             ln["state"], ln["converged_into"] = "converged", args.into
         summary = f"{op} {args.line}" + (f" into {args.into}" if op == "converge" else "")
     emit_proposal(args, res, policy, baseline_sha, cand, op, summary)
@@ -336,13 +465,14 @@ def propose(args, res):
 
 # ---------------------------------------------------------------- git facts
 
-def fmt_re(fmt):
-    pat = re.escape(fmt).replace(r"\{version\}", r"(?P<v>\d+\.\d+\.\d+)").replace(r"\{n\}", r"(?P<n>\d+)")
-    return re.compile(pat + "$")
+def require_clone(clone):
+    if not clone or not os.path.isdir(clone) or git(clone, "rev-parse", "--git-dir")[0] != 0:
+        raise Refusal("NOT_A_CLONE", "--clone is not a git checkout")
 
 
 def branch_ref(clone, branch):
-    for ref in (f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"):
+    # Prefer the fetched remote-tracking ref: a stale local head must not decide routing.
+    for ref in (f"refs/remotes/origin/{branch}", f"refs/heads/{branch}"):
         if git(clone, "rev-parse", "--verify", "-q", ref + "^{commit}")[0] == 0:
             return ref
     return None
@@ -359,9 +489,9 @@ def unshipped_candidates(clone, rl, ln):
     if ref is None:
         return []
     final, rc = fmt_re(rl["tag_format"]), fmt_re(rl["candidate_format"])
-    shipped = {m.group("v") for t in tag_names(clone) if (m := final.match(t))}
-    on_branch = {m.group("v") for t in tag_names(clone, "--merged", ref) if (m := rc.match(t))}
-    return sorted(on_branch - shipped, key=lambda v: tuple(map(int, v.split("."))))
+    shipped = {m.group("v") for t in tag_names(clone) if (m := final.fullmatch(t))}
+    on_branch = {m.group("v") for t in tag_names(clone, "--merged", ref) if (m := rc.fullmatch(t))}
+    return sorted(on_branch - shipped, key=vkey)
 
 
 def chain_of(rl, major_line):
@@ -380,12 +510,15 @@ def route(args, res):
     if not args.clone:
         raise SystemExit(usage_error("route needs --clone"))
     if not VERSION_RE.fullmatch(args.version):
-        raise SystemExit(usage_error("--version must be MAJOR.MINOR.PATCH"))
+        raise SystemExit(usage_error("--version must be MAJOR.MINOR or MAJOR.MINOR.PATCH"))
+    require_clone(args.clone)
     policy, _ = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
     _, entry = check_policy(policy, args.repo)
     rl = entry["release_lines"]
     res.step("audit", rl["audit"]["status"], {})
     major = int(args.version.split(".")[0])
+
+    seen = set()
 
     def usable(ln):
         if ln["support"] == "eol":
@@ -393,6 +526,9 @@ def route(args, res):
         if ln.get("state") == "retired":
             raise Refusal("LINE_RETIRED", f"line {ln['id']} is retired")
         if ln.get("state") == "converged":
+            if ln["id"] in seen:
+                raise Refusal("CONVERGED_CYCLE", f"converged_into loops at {ln['id']}")
+            seen.add(ln["id"])
             return usable(line_by_id(entry, ln["converged_into"]))
         return ln
 
@@ -407,12 +543,14 @@ def route(args, res):
     mline = next((x for x in rl["lines"] if x["kind"] == "major" and x["major"] == major), None)
     if mline is None:
         raise Refusal("NO_LINE", f"no release line for major {major}")
+    if branch_ref(args.clone, mline["integration_branch"]) is None:
+        raise Refusal("BRANCH_NOT_IN_CLONE", f"{mline['integration_branch']} is not in the clone; fetch it first, a missing branch is not 'unfrozen'")
     frozen = unshipped_candidates(args.clone, rl, mline)
     if args.kind == "fix" or not frozen:
         return done(mline, "major line" + (" (fix for a frozen candidate)" if frozen else ""))
     active = [x for x in chain_of(rl, mline) if x["support"] == "supported" and x["state"] == "active"]
     if active:
-        tip = max(active, key=lambda x: tuple(map(int, x["version"].split("."))))
+        tip = max(active, key=lambda x: vkey(x["version"]))
         return done(tip, f"major line is frozen by unshipped candidate {frozen[-1]}; feature goes to the successor chain tip")
     res.step("route", "NEEDS_SUCCESSOR", {"line": mline["id"], "frozen_by": frozen[-1], "requested_version": args.version})
     res.status = "BLOCKED"
@@ -424,8 +562,7 @@ def observe(args, res):
     if not args.clone:
         raise SystemExit(usage_error("audit observe needs --clone"))
     clone = args.clone
-    if git(clone, "rev-parse", "--git-dir")[0] != 0:
-        raise Refusal("NOT_A_CLONE", "--clone is not a git checkout")
+    require_clone(clone)
     rc, out = git(clone, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes/origin")
     names = sorted({r.split("/", 2)[2] if r.startswith("refs/heads/") else r.split("/", 3)[3] for r in out.split()} - {"HEAD"})
     res.step("branches", "OBSERVED", {"count": len(names), "names": names[:200]})
@@ -459,7 +596,11 @@ def observe(args, res):
 def audit_import(args, res):
     path = pathlib.Path(args.file)
     try:
-        raw = path.read_bytes()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                raise ValueError("audit file must be a regular file")
+            raw = f.read(AUDIT_MAX_BYTES + 1)
         if len(raw) > AUDIT_MAX_BYTES:
             raise ValueError("audit file is too large")
         audit = json.loads(raw, object_pairs_hook=omg._no_duplicate_keys)
@@ -934,6 +1075,8 @@ def main(argv=None):
         args = build_parser().parse_args(argv)
     except SystemExit as e:
         return 2 if e.code else 0
+    if not omg.REPO_RE.fullmatch(args.repo):
+        return usage_error("--repo must be OWNER/REPO (no host, no extra path segments)")
     cmd = getattr(args, "cmd", None)
     name = f"{args.group} {cmd}" if cmd else args.group
     detail = "|".join(str(v) for k, v in sorted(vars(args).items()) if k not in ("execute", "state_dir", "go_dir", "clone", "policy") and v)
@@ -955,6 +1098,10 @@ def main(argv=None):
         res.next_action = "fix the owner policy or input file; agents never edit the owner policy"
     except SystemExit as e:
         return int(e.code or 2)
+    except Exception as e:  # unexpected policy/input shapes must still produce an envelope, never a traceback
+        res.status, code = "FAIL", 3
+        res.step("config", "UNEXPECTED_SHAPE", {"detail": type(e).__name__})
+        res.next_action = "the owner policy or input has an unexpected shape; fix it and re-run"
     print(json.dumps(res.env, indent=2))
     return code
 
