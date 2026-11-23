@@ -247,7 +247,7 @@ class RegistryTests(Base):
     def test_propose_retire_eol_converge_and_op_refusals(self):
         self.install(example())
         for args, check in ((("retire", "--line", "v0.4.0"), lambda ln: ln["state"] == "retired"),
-                            (("eol", "--line", "v0"), lambda ln: ln["support"] == "eol"),
+                            (("eol", "--line", "v0.4.0"), lambda ln: ln["support"] == "eol"),
                             (("converge", "--line", "v0.4.0", "--into", "v0"), lambda ln: ln["state"] == "converged" and ln["converged_into"] == "v0")):
             with self.subTest(args[0]):
                 op, _, lid, *rest = args
@@ -391,7 +391,7 @@ class AuditTests(Base):
         self.assertFalse(self.policy_path.exists())
         self.install(cand)  # the owner installs it
         self.assertEqual(self.cli("registry", "validate")[0], 0)
-        rc, out, _ = self.cli("registry", "propose", "--op", "eol", "--line", "v0", "--execute")
+        rc, out, _ = self.cli("registry", "propose", "--op", "eol", "--line", "v0.4.0", "--execute")
         self.assertEqual(rc, 0, out)
 
     def test_import_lists_exactly_the_gate_relevant_additions(self):
