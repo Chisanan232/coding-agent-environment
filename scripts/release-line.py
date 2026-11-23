@@ -184,7 +184,7 @@ TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 def run3(argv, cwd=None, extra_env=None, stdin=None, timeout=60):
     """(returncode, stdout, stderr) through the allowlisted child environment; `git` and `gh` run from their pinned absolute paths."""
     argv = list(argv)
-    is_git = bool(argv) and argv[0] == "git"
+    is_git, is_gh = bool(argv) and argv[0] == "git", bool(argv) and argv[0] == "gh"
     if argv and argv[0] in ("git", "gh"):
         exe = tool_path(argv[0])
         if exe is None:
@@ -195,10 +195,17 @@ def run3(argv, cwd=None, extra_env=None, stdin=None, timeout=60):
         # Only gh needs the GitHub token. A git child runs code a clone or a build may have influenced (filters, hooks, attributes): it never sees one.
         for k in TOKEN_VARS:
             env.pop(k, None)
+    scratch = None
+    if cwd is None and is_gh:
+        scratch = tempfile.mkdtemp(prefix="release-gh-")  # gh never runs in the caller's directory (a hostile cwd could carry config or extensions)
+        cwd = scratch
     try:
         p = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, errors="replace", timeout=timeout, input=stdin)
     except (OSError, subprocess.TimeoutExpired) as e:
         return 127, type(e).__name__, type(e).__name__
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -2615,7 +2622,7 @@ def run_build(args, c, f, b, timeout):
                         proc.wait()
                         raise Refusal("BUILD_TIMEOUT", f"the build exceeded {timeout}s and was killed", "FAIL")
                 finally:
-                    kill_group(proc)  # also on a normal exit: nothing the build left running survives it
+                    kill_group(proc)  # also on a normal exit: leftovers in the build's own process group die; a process that called setsid()/setpgid() is not reached
         except OSError as e:
             raise Refusal("BUILD_FAILED", f"could not start the build: {type(e).__name__}", "FAIL")
         # The build shared the clone's .git through the worktree: whatever it planted there is not trusted, so the clone is re-validated before any git call.
@@ -2834,10 +2841,13 @@ def release_publish(args, res):
         pathlib.Path(notes_path).write_bytes(notes)
         argv = ["gh", "release", "create", f.tag, "--repo", args.repo, "--verify-tag", "--title", f.tag, "--notes-file", notes_path, *paths]
         with Journal(args) as j:
+            # Intent first: a crash or SIGKILL during the create leaves this entry, and a rerun reconciles through REUSED / CONFLICT_EXISTING.
+            j.append(key=key, state="publishing", tag=f.tag, final_sha=f.final, publish_digest=digest)
             rc, _, _ = gh_capture(argv, 1800)
             if rc != 0:
                 j.append(key=key, state="publish-failed", tag=f.tag, final_sha=f.final, publish_digest=digest)
-                raise Refusal("PUBLISH_FAILED", "gh release create failed; a partial release is never overwritten or deleted by this tool", "FAIL")
+                raise Refusal("PUBLISH_FAILED", "gh release create failed or timed out; a release may still exist (a timeout can leave one): rerun to reconcile "
+                              "(REUSED or CONFLICT_EXISTING). A partial release is never overwritten or deleted by this tool", "FAIL")
             # The release exists from here on: record that before anything that can fail, so a verification outage never leaves an unjournaled public release.
             j.append(key=key, state="created", tag=f.tag, final_sha=f.final, publish_digest=digest)
             res.step("release", "CREATED", {"tag": f.tag})
@@ -2846,7 +2856,7 @@ def release_publish(args, res):
                 diffs = release_differences(args, f.tag, after, notes, digests) if after is not None else ["release missing"]
                 if remote_tag(args.clone, f.tag)[1] != f.final:
                     diffs.append("tag moved")
-            except (Refusal, RuntimeError, OSError, ValueError) as e:
+            except (Refusal, RuntimeError, OSError, ValueError, KeyError, TypeError, AttributeError) as e:
                 diffs = [f"verification could not complete ({e.code if isinstance(e, Refusal) else type(e).__name__})"]
             res.step("verify", "FAIL" if diffs else "PASS", {"differences": diffs})
             j.append(key=key, state="published" if not diffs else "publish-unverified", tag=f.tag, final_sha=f.final, publish_digest=digest)
