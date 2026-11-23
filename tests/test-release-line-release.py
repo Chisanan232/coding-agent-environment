@@ -288,6 +288,13 @@ class CandidateTag(Rel):
         self.assertEqual((rc, self.step(out, "tag")["state"]), (0, "CREATED"), out)
         self.assertEqual(self.w("cat-file", "-t", "refs/tags/v0.3.0-rc.2", cwd=self.bare), "tag")
 
+    def test_lightweight_tag_already_on_origin_is_not_reused(self):
+        self.go()  # rc.1 exists on origin as a lightweight tag at the approved commit
+        for execute in (False, True):
+            rc, out, _ = self.rel("candidate-tag", execute=execute)
+            self.assertEqual((rc, self.refused(out)), (1, "CONFLICT_EXISTING"))
+            self.assertIn("lightweight", self.step(out, "refused")["evidence"]["detail"])
+
     def test_n_and_sha_arguments_are_validated(self):
         self.go()
         for bad in (("--n", "0"), ("--n", "-1"), ("--n", "x"), ("--sha", "--upload-pack=evil"), ("--sha", ".hidden")):
@@ -459,6 +466,18 @@ class Promote(Rel):
         self.assertEqual((rc, out["status"], self.refused(out)), (1, "FAIL", "BASE_MOVED_UNACCOUNTED"), out)
         self.assertEqual(self.step(out, "base_moved")["state"], "INCOMPLETE")
         self.assertEqual(len(self.merges()), 1)  # merged, and reported as such: nothing is silently accepted
+        # sticky: a rerun recomputes from git and does not report a clean ALREADY_PROMOTED, and final-tag refuses too
+        rc, out, _ = self.promote_ok()
+        self.assertEqual((rc, out["status"], self.refused(out)), (1, "FAIL", "BASE_MOVED_UNACCOUNTED"), out)
+        self.assertEqual(self.step(out, "accounting_recheck")["state"], "INCOMPLETE")
+        self.assertEqual(self.refused(self.rel("final-tag", execute=True)[1]), "BASE_MOVED_UNACCOUNTED")
+        self.assertEqual(len(self.merges()), 1)
+        # once the moved change is accounted (reviewed not-applicable record on the line) the recheck passes
+        moved = self.w("rev-parse", "main^1", cwd=self.bare)
+        self.mark_not_applicable(moved)
+        rc, out, _ = self.promote_ok()
+        self.assertEqual((rc, out["status"], self.step(out, "accounting_recheck")["state"]), (0, "PASS", "ACCOUNTED"), out)
+        self.assertNotEqual(self.refused(self.rel("final-tag", execute=True)[1]), "BASE_MOVED_UNACCOUNTED")  # passes accounting; stops at verification
 
     def test_local_only_tags_do_not_count_as_shipped_or_latest(self):
         self.branch("maintenance/v0", "main")
@@ -669,17 +688,28 @@ class VerifyBinding(Rel):
 
 
 class OriginBinding(Rel):
-    def test_origin_urls_must_belong_to_the_repo(self):
+    def probe(self):
         spec = importlib.util.spec_from_file_location("rl_origin_probe", ROOT / "scripts/release-line.py")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        r = REPO
+        return mod
+
+    def test_origin_urls_must_belong_to_the_repo(self):
+        mod, r = self.probe(), REPO
         for good in (f"https://github.com/{r}.git", f"https://github.com/{r}", f"git@github.com:{r}.git", f"ssh://git@github.com/{r}.git",
-                     f"https://github.com/{r.lower()}.git", f"https://user@github.com/{r}.git"):
+                     f"https://github.com/{r.lower()}.git", f"https://user@github.com/{r}.git", f"https://user:tok%20en@github.com/{r}/"):
             self.assertTrue(mod.origin_matches(good, r), good)
         for bad in ("https://github.com/Other-Owner/example-product.git", f"https://github.com/{r}-evil.git", f"https://evil.example/{r}.git",
-                    f"https://github.com/{r}/../x.git", f"git@evil.example:{r}.git", "/tmp/not-listed", "relative/path"):
-            self.assertFalse(mod.origin_matches(bad, r), bad)
+                    f"https://github.com/{r}/../x.git", f"git@evil.example:{r}.git", "/tmp/not-listed", "relative/path",
+                    # authority tricks: git and curl end the authority at # ? / and a backslash
+                    f"https://evil.host#@github.com/{r}.git", f"https://evil.host?@github.com/{r}.git", f"https://evil.host\\@github.com/{r}.git",
+                    f"https://github.com@evil.host/{r}.git", f"https://github.com.evil.host/{r}.git", f"https://GitHub.com/{r}.git",
+                    f"https://GITHUB.COM/{r}.git", f"https://github.com:8443/{r}.git", f"https://github.com/{r}.git?x=1", f"https://github.com/{r}.git#frag",
+                    f"https://us er@github.com/{r}.git", f"https://us\ter@github.com/{r}.git", f"https://us\x01er@github.com/{r}.git",
+                    f"https://us\x7fer@github.com/{r}.git", f"https://u@s@github.com/{r}.git", f"http://github.com/{r}.git", f"ftp://github.com/{r}.git",
+                    f"ext::sh -c touch% x", f"git@github.com/{r}.git", f"git@github.com/{r}", f"github.com:{r}.git", f"other@github.com:{r}.git",
+                    f"git@github.com:{r}.git\n", f"git@github.com:{r}.git evil"):
+            self.assertFalse(mod.origin_matches(bad, r), repr(bad))
 
     def test_commands_refuse_another_repositorys_clone(self):
         self.go()
@@ -691,6 +721,52 @@ class OriginBinding(Rel):
         self.assertEqual(self.refused(self.rel("candidate-tag", execute=True)[1]), "ORIGIN_MISMATCH")  # push URL is checked too
         self.w("remote", "set-url", "--push", "origin", str(self.bare))
         self.assertNotEqual(self.refused(self.rel("candidate-tag")[1]), "ORIGIN_MISMATCH")
+
+    def test_every_clone_using_handler_checks_the_origin(self):
+        self.w("remote", "set-url", "origin", f"https://evil.host#@github.com/{REPO}.git")
+        sha = self.sha("main")
+        c = str(self.work)
+        cmds = (("successor", "ensure", "--predecessor", "0.3.0", "--clone", c, "--execute"),
+                ("guard", "--base", "integration/v0.x", "--head", sha, "--clone", c),
+                ("train", "integrate", "--from", "v0", "--into", "v0.4.0", "--clone", c, "--execute"),
+                ("train", "converge", "--line", "v0", "--clone", c, "--execute"),
+                ("route", "--kind", "fix", "--version", "0.3.0", "--clone", c),
+                ("audit", "observe", "--clone", c),
+                ("forward-port", "plan", "--merge", sha, "--clone", c),
+                ("forward-port", "run", "--merge", sha, "--clone", c, "--execute"),
+                ("release", "candidate-tag", "--version", "0.3.0", "--clone", c, "--execute"),
+                ("release", "promote", "--version", "0.3.0", "--clone", c, "--execute"),
+                ("release", "verify", "--version", "0.3.0", "--clone", c, "--execute"),
+                ("release", "final-tag", "--version", "0.3.0", "--clone", c, "--execute"))
+        for argv in cmds:
+            rc, out, _ = self.cli(*argv)
+            self.assertEqual((rc, self.refused(out)), (1, "ORIGIN_MISMATCH"), argv)
+        self.assertEqual((self.pushes(), self.merges()), ([], []))
+
+    def test_ext_transport_origin_is_refused_without_running_anything(self):
+        marker = pathlib.Path(self.tmp.name) / "ext-ran"
+        self.w("remote", "set-url", "origin", f"ext::sh -c touch% {marker}")
+        self.assertEqual(self.refused(self.rel("candidate-tag", execute=True)[1]), "ORIGIN_MISMATCH")
+        self.assertFalse(marker.exists())
+
+    def test_hostile_clone_config_levers_are_neutralized(self):
+        marker = pathlib.Path(self.tmp.name) / "config-ran"
+        script = pathlib.Path(self.tmp.name) / "hostile.sh"
+        script.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        script.chmod(0o755)
+        for key, val in (("core.sshCommand", str(script)), ("credential.helper", f"!{script}"), ("core.askPass", str(script)),
+                         ("http.proxy", "http://127.0.0.1:9"), ("protocol.ext.allow", "always")):
+            self.w("config", key, val)
+        mod = self.probe()
+        get = lambda *a: mod.git(self.work, "config", *a)[1].strip()
+        self.assertEqual(get("--get", "core.sshCommand"), "ssh")
+        # the command-line `credential.helper=` is the last value, and an empty value resets the helper list for git's credential code
+        self.assertTrue(mod.git(self.work, "config", "--get-all", "credential.helper")[1].endswith("\n\n"))
+        self.assertEqual(get("--get", "core.askPass"), "/usr/bin/false")
+        self.assertEqual(get("--get", "http.proxy"), "")
+        self.assertEqual(get("--get", "protocol.ext.allow"), "never")
+        self.assertEqual(self.rel("candidate-tag")[0] in (0, 1), True)  # still works against the local origin
+        self.assertFalse(marker.exists())
 
 
 class SuccessorPromotion(Rel):
