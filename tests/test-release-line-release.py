@@ -749,50 +749,51 @@ class OriginBinding(Rel):
         self.assertEqual(self.refused(self.rel("candidate-tag", execute=True)[1]), "ORIGIN_MISMATCH")
         self.assertFalse(marker.exists())
 
-    def test_hostile_per_url_and_per_remote_config_is_refused_and_never_runs(self):
+    HOSTILE = (("gpg.program", "{m}"), ("tag.gpgsign", "true"), ("commit.gpgsign", "true"), ("log.showsignature", "true"), ("user.signingkey", "ABCD"),
+               ("merge.x.driver", "{m}"), ("diff.x.command", "{m}"), ("diff.x.textconv", "{m}"), ("http.sslcapath", "/tmp/ca"), ("http.curloptresolve", "a:1:b"),
+               ("http.sslverify", "false"), ("http.proxy", "http://127.0.0.1:9"), ("http.https://github.com/.proxy", "http://127.0.0.1:9"),
+               ("http.https://github.com/.extraheader", "X-A: b"), ("include.path", "/tmp/other"), ("includeif.gitdir:/.path", "/tmp/other"),
+               ("core.pager", "{m}"), ("core.editor", "{m}"), ("core.hookspath", "/tmp/hooks"), ("core.fsmonitor", "{m}"), ("core.sshcommand", "{m}"),
+               ("core.askpass", "{m}"), ("core.gitproxy", "{m}"), ("credential.helper", "!{m}"), ("alias.x", "!{m}"), ("url.https://evil/.insteadof", "https://github.com/"),
+               ("remote.origin.proxy", "http://127.0.0.1:9"), ("remote.origin.uploadpack", "{m}"), ("remote.origin.receivepack", "{m}"),
+               ("filter.evil.clean", "{m}"), ("diff.external", "{m}"), ("extensions.worktreeconfig", "true"), ("protocol.ext.allow", "always"),
+               ("gc.auto", "0"), ("pull.rebase", "true"))
+
+    def test_clone_config_outside_the_allowlist_is_refused_and_never_runs(self):
         marker = pathlib.Path(self.tmp.name) / "hostile-ran"
-        script = pathlib.Path(self.tmp.name) / "hostile2.sh"
-        script.write_text(f"#!/bin/sh\ntouch {marker}\nexec git-upload-pack \"$@\"\n")
+        script = pathlib.Path(self.tmp.name) / "hostile.sh"
+        script.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
         script.chmod(0o755)
         self.go()
-        hostile = (("remote.origin.proxy", "http://127.0.0.1:9"), ("remote.origin.uploadpack", str(script)), ("remote.origin.receivepack", str(script)),
-                   ("http.https://github.com/.proxy", "http://127.0.0.1:9"), ("http.https://github.com/.sslVerify", "false"),
-                   ("http.https://github.com/.sslCAInfo", "/tmp/ca.pem"), ("http.https://github.com/.extraHeader", "X-A: b"),
-                   ("filter.evil.clean", str(script)), ("diff.external", str(script)), ("core.gitProxy", str(script)))
-        for key, val in hostile:
-            self.w("config", key, val)
-            rc, out, _ = self.rel("candidate-tag", execute=True)
-            self.assertEqual((rc, self.refused(out)), (1, "CLONE_CONFIG_HOSTILE"), key)
-            self.assertIn(key.lower().split("/")[0].split(".")[0], self.step(out, "refused")["evidence"]["detail"].lower())
-            self.w("config", "--unset", key)
+        self.assertNotEqual(self.refused(self.rel("candidate-tag")[1]), "CLONE_CONFIG_HOSTILE")  # the clean clone passes
+        for key, val in self.HOSTILE:
+            self.w("config", "--add", key, val.format(m=script))
+            for argv in (("release", "candidate-tag", "--version", "0.3.0", "--clone", str(self.work), "--go-dir", str(self.go_dir), "--execute"),
+                         ("guard", "--base", "integration/v0.x", "--head", self.sha("main"), "--clone", str(self.work))):
+                rc, out, _ = self.cli(*argv)
+                self.assertEqual((rc, self.refused(out)), (1, "CLONE_CONFIG_HOSTILE"), key)
+            self.w("config", "--unset-all", key)
         self.assertFalse(marker.exists())
-        self.assertEqual(self.pushes(), [])
+        self.assertEqual((self.pushes(), self.merges()), ([], []))
         self.assertNotEqual(self.refused(self.rel("candidate-tag")[1]), "CLONE_CONFIG_HOSTILE")  # clean again
-        # the -c overrides are also in force for every git call the tool makes
-        mod = self.probe()
-        self.w("config", "http.sslVerify", "false")
-        for key, want in (("http.sslVerify", "true"), ("remote.origin.uploadpack", "git-upload-pack"), ("remote.origin.receivepack", "git-receive-pack"),
-                          ("remote.origin.proxy", ""), ("http.extraHeader", ""), ("http.sslCAInfo", "")):
-            self.assertEqual(mod.git(self.work, "config", "--get", key)[1].strip(), want, key)
 
-    def test_hostile_clone_config_levers_are_neutralized(self):
-        marker = pathlib.Path(self.tmp.name) / "config-ran"
-        script = pathlib.Path(self.tmp.name) / "hostile.sh"
-        script.write_text(f"#!/bin/sh\ntouch {marker}\n")
-        script.chmod(0o755)
-        for key, val in (("core.sshCommand", str(script)), ("credential.helper", f"!{script}"), ("core.askPass", str(script)),
-                         ("http.proxy", "http://127.0.0.1:9"), ("protocol.ext.allow", "always")):
-            self.w("config", key, val)
+    def test_other_remotes_must_name_the_repo_too(self):
+        self.go()
+        self.w("remote", "add", "evil", "https://github.com/Other-Owner/other.git")
+        self.assertEqual(self.refused(self.rel("candidate-tag", execute=True)[1]), "ORIGIN_MISMATCH")
+        self.w("remote", "set-url", "evil", f"https://github.com/{REPO}.git")
+        self.assertNotEqual(self.refused(self.rel("candidate-tag")[1]), "ORIGIN_MISMATCH")
+
+    def test_git_invocation_overrides_signing_and_transport_levers(self):
         mod = self.probe()
-        get = lambda *a: mod.git(self.work, "config", *a)[1].strip()
-        self.assertEqual(get("--get", "core.sshCommand"), "ssh")
-        # the command-line `credential.helper=` is the last value, and an empty value resets the helper list for git's credential code
-        self.assertTrue(mod.git(self.work, "config", "--get-all", "credential.helper")[1].endswith("\n\n"))
-        self.assertEqual(get("--get", "core.askPass"), "/usr/bin/false")
-        self.assertEqual(get("--get", "http.proxy"), "")
-        self.assertEqual(get("--get", "protocol.ext.allow"), "never")
-        self.assertEqual(self.rel("candidate-tag")[0] in (0, 1), True)  # still works against the local origin
-        self.assertFalse(marker.exists())
+        # the clone's own values cannot be set (refused above); the -c overrides still define what every git call sees
+        for key, want in (("http.sslVerify", "true"), ("remote.origin.uploadpack", "git-upload-pack"), ("remote.origin.receivepack", "git-receive-pack"),
+                          ("remote.origin.proxy", ""), ("http.extraHeader", ""), ("http.sslCAInfo", ""), ("http.sslCAPath", ""), ("http.curloptResolve", ""),
+                          ("tag.gpgSign", "false"), ("commit.gpgSign", "false"), ("log.showSignature", "false"), ("gpg.program", "/usr/bin/false"),
+                          ("merge.renormalize", "false"), ("core.sshCommand", "ssh"), ("core.askPass", "/usr/bin/false"), ("protocol.ext.allow", "never"),
+                          ("http.proxy", ""), ("core.hooksPath", "/dev/null"), ("core.fsmonitor", "false")):
+            self.assertEqual(mod.git(self.work, "config", "--get", key)[1].strip(), want, key)
+        self.assertEqual(mod.git(self.work, "config", "--get-all", "credential.helper")[1].split("\n")[-2], "")  # the last value is empty: helper list reset
 
 
 class SuccessorPromotion(Rel):
