@@ -532,6 +532,21 @@ class IntegrityTests(Base):
             entry(p)["branches"].append({"branch": "main", "version": "m"})
         self.invalid(mutate, "DEFAULT_BASE_LISTED")
 
+    def test_unreadable_tag_list_is_refused_not_treated_as_empty(self):
+        spec = importlib.util.spec_from_file_location("rlmod", ROOT / "scripts/release-line.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(mod.Refusal) as cm:
+                mod.tag_names(d)
+        self.assertEqual(cm.exception.code, "TAG_LIST_FAILED")
+
+    def test_default_branch_cannot_be_an_integration_branch(self):
+        def mutate(p):
+            entry(p)["release_lines"]["lines"][0]["integration_branch"] = "master"
+            entry(p)["branches"].append({"branch": "master", "version": "m"})
+        self.invalid(mutate, "PROTECTED_BRANCH")
+
     def test_predecessor_cycle_and_unrooted_chain(self):
         def cycle(p):
             add_successor(p, "a", "0.6.0", "b", "0.5.0")

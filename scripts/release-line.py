@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Release-line registry, routing and audit CLI (SPE-180 design, slice SPE-181a).
+"""Release-line registry, routing, audit and successor-train CLI (SPE-180 design, slices SPE-181a and SPE-182).
 
   release-line.py registry validate|show        --repo O/R [--policy FILE]
   release-line.py registry propose --op add-successor|retire|eol|converge --repo O/R [--execute] [op flags]
   release-line.py route --kind feature|fix --version V --repo O/R --clone PATH
   release-line.py audit observe --repo O/R --clone PATH
   release-line.py audit import FILE --repo O/R [--execute]
+  release-line.py successor ensure --predecessor V [--from REF] [--version V] --repo O/R --clone PATH [--execute]
+  release-line.py guard --base BRANCH --head SHA --repo O/R --clone PATH
+  release-line.py train integrate --from LINE --into LINE --repo O/R --clone PATH [--execute]
+  release-line.py train converge --line LINE --repo O/R --clone PATH [--execute]
 
 Prints exactly one JSON envelope on stdout. Exit 0 ok/no-op, 1 refused/blocked, 2 usage, 3 invalid config.
 The owner policy file (version-branches.json) is a trust anchor: it is read through owner-merge-gate.py's
@@ -38,6 +42,9 @@ SHA_RE = re.compile(r"[0-9a-f]{40}", re.ASCII)
 RELEASE_SEGMENT = re.compile(r"(^|/)releases?(/|$)", re.I)
 AUDIT_MAX_BYTES = 1 << 20
 STATE_ROOT = "~/.local/state/coding-agent-environment/release-line"
+
+
+BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,100}")
 
 
 class Refusal(Exception):
@@ -162,6 +169,9 @@ def validate_entry(entry):
         return errs
     ids = [x.get("id") for x in lines if isinstance(x, dict)]
     majors = {}
+    # A publication base of any line is protected: the gate must never merge feature work straight into it.
+    bases = {x["publication_base"]["branch"] for x in lines if isinstance(x, dict) and isinstance(x.get("publication_base"), dict)
+             and isinstance(x["publication_base"].get("branch"), str)} | {"main", "master"}
     for ln in lines:
         lid = ln.get("id") if isinstance(ln, dict) else None
         if not isinstance(lid, str) or not LINE_ID_RE.fullmatch(lid) or ids.count(lid) > 1:
@@ -187,6 +197,8 @@ def validate_entry(entry):
             err(lid, "BAD_FIELD", "integration_branch missing")
         elif RELEASE_SEGMENT.search(ib):
             err(lid, "RELEASE_SEGMENT", f"{ib}: the gate refuses any branch with a release segment; use integration/v<major>.x")
+        elif ib in bases:
+            err(lid, "PROTECTED_BRANCH", f"{ib} is a publication base or default branch and cannot be an integration branch")
         elif ib not in branches:
             err(lid, "NOT_MERGE_ELIGIBLE", f"{ib} is not listed in branches, so the gate would not merge into it")
         pb = ln.get("publication_base")
@@ -387,6 +399,25 @@ def gate_additions(old, new, repo):
             "prefixes": [x for x in n.get("future_head_prefixes", []) if x not in op]}
 
 
+def apply_add_successor(centry, pred, version, pred_version, fork_ref, fork_sha, branch=None):
+    """Edit one candidate repo entry in place: list the successor's branch and head prefix and add its line; returns a summary."""
+    if pred["support"] == "eol" or pred.get("state", "active") != "active":
+        raise Refusal("PREDECESSOR_NOT_ACTIVE", f"line {pred['id']} is eol, retired or converged and cannot take a successor")
+    rl = centry["release_lines"]
+    lid, branch = f"v{version}", branch or f"integration/v{version}"
+    if any(x["id"] == lid for x in rl["lines"]):
+        raise Refusal("LINE_EXISTS", f"line {lid} already registered")
+    centry["branches"].append({"branch": branch, "version": version})
+    centry.setdefault("future_head_prefixes", [])
+    if f"v{version}/" not in centry["future_head_prefixes"]:
+        centry["future_head_prefixes"].append(f"v{version}/")
+    rl["lines"].append({
+        "id": lid, "kind": "successor", "version": version, "integration_branch": branch,
+        "predecessor": {"line": pred["id"], "version": pred_version, "fork_ref": fork_ref, "fork_sha": fork_sha},
+        "publication_base": copy.deepcopy(pred["publication_base"]), "support": "supported", "state": "active"})
+    return f"add successor {lid} on {branch} after {pred['id']}"
+
+
 def noop(res, why):
     res.step("propose", "NO_OP", {"reason": why})
     res.next_action = "none: the registry already has this state; no packet emitted"
@@ -406,21 +437,8 @@ def propose(args, res):
         missing = [n for n in need if not getattr(args, n)]
         if missing:
             raise Refusal("MISSING_FLAGS", "add-successor needs " + ", ".join("--" + m.replace("_", "-") for m in missing))
-        pred = line_by_id(entry, args.predecessor)
-        if pred["support"] == "eol" or pred.get("state", "active") != "active":
-            raise Refusal("PREDECESSOR_NOT_ACTIVE", f"line {pred['id']} is eol, retired or converged and cannot take a successor")
-        lid, branch = f"v{args.version}", args.branch or f"integration/v{args.version}"
-        if any(x["id"] == lid for x in rl["lines"]):
-            raise Refusal("LINE_EXISTS", f"line {lid} already registered")
-        centry["branches"].append({"branch": branch, "version": args.version})
-        centry.setdefault("future_head_prefixes", [])
-        if f"v{args.version}/" not in centry["future_head_prefixes"]:
-            centry["future_head_prefixes"].append(f"v{args.version}/")
-        rl["lines"].append({
-            "id": lid, "kind": "successor", "version": args.version, "integration_branch": branch,
-            "predecessor": {"line": pred["id"], "version": args.predecessor_version, "fork_ref": args.fork_ref, "fork_sha": args.fork_sha},
-            "publication_base": copy.deepcopy(pred["publication_base"]), "support": "supported", "state": "active"})
-        summary = f"add successor {lid} on {branch} after {pred['id']}"
+        summary = apply_add_successor(centry, line_by_id(entry, args.predecessor), args.version, args.predecessor_version,
+                                      args.fork_ref, args.fork_sha, args.branch)
     else:
         if not args.line:
             raise Refusal("MISSING_FLAGS", f"{op} needs --line")
@@ -470,7 +488,10 @@ def branch_ref(clone, branch):
 
 def tag_names(clone, *extra):
     rc, out = git(clone, "tag", "--list", *extra)
-    return out.split() if rc == 0 else []
+    if rc != 0:
+        # An unreadable tag list would make every line look unfrozen and route work onto a shipped line.
+        raise Refusal("TAG_LIST_FAILED", "git tag --list failed in the clone; fetch tags and retry")
+    return out.split()
 
 
 def unshipped_candidates(clone, rl, ln):
@@ -539,13 +560,18 @@ def route(args, res):
     if args.kind == "fix" or not frozen:
         return done(mline, "major line" + (" (fix for a frozen candidate)" if frozen else ""))
     active = [x for x in chain_of(rl, mline) if x["support"] == "supported" and x["state"] == "active"]
-    if active:
-        tip = max(active, key=lambda x: vkey(x["version"]))
-        return done(tip, f"major line is frozen by unshipped candidate {frozen[-1]}; feature goes to the successor chain tip")
+    for tip in sorted(active, key=lambda x: vkey(x["version"]), reverse=True):
+        if branch_ref(args.clone, tip["integration_branch"]) is None:
+            raise Refusal("BRANCH_NOT_IN_CLONE", f"{tip['integration_branch']} is not in the clone; fetch it first")
+        # A successor forks from its predecessor's candidate, so only candidates of its own version freeze it.
+        tip_frozen = [v for v in unshipped_candidates(args.clone, rl, tip) if v == tip["version"]]
+        if not tip_frozen:
+            return done(tip, f"major line is frozen by unshipped candidate {frozen[-1]}; feature goes to the newest unfrozen successor")
+        frozen = frozen + tip_frozen
     res.step("route", "NEEDS_SUCCESSOR", {"line": mline["id"], "frozen_by": frozen[-1], "requested_version": args.version})
     res.status = "BLOCKED"
     res.next_action = (f"no successor exists after frozen candidate {frozen[-1]}; owner registers one with "
-                       "`registry propose --op add-successor` (automated `successor ensure` is planned for SPE-182). Only this feature is blocked")
+                       "`successor ensure` then `registry propose --op add-successor`. Only this feature is blocked")
 
 
 def observe(args, res):
@@ -657,6 +683,355 @@ def registry_show(args, res):
             "predecessor": ln.get("predecessor"), "converged_into": ln.get("converged_into")})
 
 
+# ---------------------------------------------------------------- successor train (SPE-182)
+# Durable state is git + GitHub only. Pushes create new refs and never force; every push is verified with ls-remote.
+
+def fetch(clone):
+    # Explicit refspecs: a plain --tags fetch exits non-zero when a local tag differs, which must not be mistaken for an outage.
+    rc, out = git(clone, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*", "+refs/tags/*:refs/tags/*")
+    if rc != 0:
+        raise Refusal("FETCH_FAILED", "git fetch origin failed; a stale clone must not decide freeze, guard or train state")
+
+
+def ls_remote(clone, ref):
+    rc, out = git(clone, "ls-remote", "origin", ref)
+    if rc != 0:
+        raise Refusal("REMOTE_UNREACHABLE", "git ls-remote origin failed")
+    for row in out.splitlines():
+        sha, _, name = row.partition("\t")
+        if name == ref and SHA_RE.fullmatch(sha):
+            return sha
+    return None
+
+
+def commit_of(clone, ref):
+    rc, out = git(clone, "rev-parse", "--verify", "-q", ref + "^{commit}")
+    return out.strip() if rc == 0 else None
+
+
+def is_ancestor(clone, a, b):
+    return git(clone, "merge-base", "--is-ancestor", a, b)[0] == 0
+
+
+def push_new_ref(clone, sha, ref):
+    git(clone, "push", "origin", f"{sha}:{ref}")
+    return ls_remote(clone, ref) == sha
+
+
+def find_prs(repo, head, base):
+    rc, out = run(["gh", "pr", "list", "--repo", repo, "--head", head, "--base", base, "--state", "all", "--limit", "50",
+                   "--json", "number,state,headRefName,baseRefName,url"])
+    try:
+        prs = json.loads(out) if rc == 0 else None
+    except ValueError:
+        prs = None
+    if not isinstance(prs, list):
+        raise Refusal("GH_UNAVAILABLE", "gh pr list failed; nothing was opened")
+    prs = [p for p in prs if p.get("headRefName") == head and p.get("baseRefName") == base]
+    return next((p for p in prs if p["state"] == "OPEN"), None), [p for p in prs if p["state"] == "MERGED"]
+
+
+def ensure_pr(res, args, head, base, title, body, refuse_merged=False):
+    """Reuse the one open PR head -> base or open it (--execute only). The merge itself belongs to the normal gate."""
+    pr, merged = find_prs(args.repo, head, base)
+    if pr is None and merged and refuse_merged:
+        raise Refusal("NOT_INTEGRATED", f"PR #{merged[0]['number']} merged but the expected commit is not in {base}", "FAIL")
+    if pr is not None:
+        res.step("pr", "REUSED", {"number": pr["number"], "url": pr.get("url")})
+        return pr
+    if not args.execute:
+        res.step("pr", "DRY_PLAN", {"head": head, "base": base})
+        res.status = "NOT_RUN"
+        return None
+    rc, _ = run(["gh", "pr", "create", "--repo", args.repo, "--base", base, "--head", head, "--title", title, "--body", body])
+    pr = find_prs(args.repo, head, base)[0] if rc == 0 else None
+    if pr is None:
+        raise Refusal("GH_PR_CREATE_FAILED", f"could not open {head} -> {base}")
+    res.step("pr", "CREATED", {"number": pr["number"], "url": pr.get("url")})
+    return pr
+
+
+def trailers(kind, source_line, target_line, source):
+    return (f"Release-Line-Source: {source}\nRelease-Line-Source-Line: {source_line}\n"
+            f"Release-Line-Target-Line: {target_line}\nRelease-Line-Kind: {kind}\n")
+
+
+def predecessor_line(rl, version):
+    ln = next((x for x in rl["lines"] if x["kind"] != "major" and x.get("version") == version), None)
+    ln = ln or next((x for x in rl["lines"] if x["kind"] == "major" and x["major"] == int(version.split(".")[0])), None)
+    if ln is None:
+        raise Refusal("NO_PREDECESSOR_LINE", f"no line carries predecessor version {version}")
+    return ln
+
+
+def active_chain(rl, line):
+    out, cur = [], line
+    while True:
+        nxt = [x for x in rl["lines"] if x["kind"] == "successor" and x["state"] == "active" and x["predecessor"]["line"] == cur["id"]]
+        if len(nxt) > 1:
+            raise Refusal("AMBIGUOUS_CHAIN", f"{cur['id']} has several active successors: {[x['id'] for x in nxt]}")
+        if not nxt:
+            return out
+        out.append(nxt[0])
+        cur = nxt[0]
+
+
+def descendants(rl, line):
+    out, todo = [], [line["id"]]
+    while todo:
+        pid = todo.pop()
+        for x in rl["lines"]:
+            if x["kind"] == "successor" and x["state"] == "active" and x["predecessor"]["line"] == pid and x not in out:
+                out.append(x)
+                todo.append(x["id"])
+    return out
+
+
+def need_ref(clone, branch):
+    """The fetched origin tip; local branches in a working clone go stale, so they are only a fallback."""
+    ref = next((r for r in (f"refs/remotes/origin/{branch}", f"refs/heads/{branch}") if commit_of(clone, r)), None)
+    if ref is None:
+        raise Refusal("NO_BRANCH", f"{branch} is not present in the clone (fetched from origin)")
+    return ref
+
+
+def successor_ensure(args, res):
+    if not args.clone:
+        raise SystemExit(usage_error("successor ensure needs --clone"))
+    if not VERSION_RE.fullmatch(args.predecessor):
+        raise SystemExit(usage_error("--predecessor must be MAJOR.MINOR.PATCH"))
+    policy, baseline_sha = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
+    key, entry = check_policy(policy, args.repo)
+    require_ready(entry)
+    rl = entry["release_lines"]
+    major, minor, _ = args.predecessor.split(".")
+    version = args.version or f"{major}.{int(minor) + 1}.0"
+    if not VERSION_RE.fullmatch(version):
+        raise SystemExit(usage_error("--version must be MAJOR.MINOR.PATCH"))
+    res.env["idempotency_key"] = f"succ:{args.repo}:{version}"
+    pred = predecessor_line(rl, args.predecessor)
+    listed = next((x for x in rl["lines"] if x["kind"] == "successor" and x.get("version") == version), None)
+    if listed is not None and listed["predecessor"]["line"] != pred["id"]:
+        raise Refusal("LINE_EXISTS", f"line {listed['id']} is registered with predecessor {listed['predecessor']['line']}")
+    if listed is not None and args.branch and args.branch != listed["integration_branch"]:
+        raise Refusal("BRANCH_MISMATCH", f"line {listed['id']} is registered on {listed['integration_branch']}; --branch {args.branch} would push an unregistered ref")
+    branch = args.branch or (listed or {}).get("integration_branch") or f"integration/v{version}"
+    if not BRANCH_NAME_RE.fullmatch(branch):
+        raise Refusal("BAD_BRANCH", f"{branch!r} is not a valid integration branch name")
+    fetch(args.clone)
+    pred_ref = need_ref(args.clone, pred["integration_branch"])
+    fork_ref = args.from_ref
+    if not fork_ref:
+        rc_re = fmt_re(rl["candidate_format"])
+        rcs = sorted((t for t in tag_names(args.clone, "--merged", pred_ref) if (m := rc_re.match(t)) and m.group("v") == args.predecessor),
+                     key=lambda t: int(rc_re.match(t).group("n")))
+        if not rcs:
+            raise Refusal("NO_FORK_POINT", f"no candidate tag for {args.predecessor} on {pred['integration_branch']}; pass --from REF")
+        fork_ref = rcs[-1]
+    fork_sha = commit_of(args.clone, fork_ref)
+    if fork_sha is None or not is_ancestor(args.clone, fork_sha, pred_ref):
+        raise Refusal("FORK_NOT_ON_PREDECESSOR", f"{fork_ref} must be reachable from {pred['integration_branch']}")
+    res.step("fork", "RESOLVED", {"fork_ref": fork_ref, "fork_sha": fork_sha, "predecessor_branch": pred["integration_branch"], "branch": branch})
+    cand = None
+    if listed is None:
+        cand = copy.deepcopy(policy)
+        apply_add_successor(cand["repos"][key], pred, version, args.predecessor, fork_ref, fork_sha, branch)
+        try:  # a candidate the owner could not install must not cost a pushed branch
+            check_policy(cand, args.repo)
+        except (ConfigError, Refusal) as e:
+            raise Refusal("INVALID_CANDIDATE", json.dumps(e.errors if isinstance(e, ConfigError) and e.errors else e.detail))
+    remote = ls_remote(args.clone, f"refs/heads/{branch}")
+    if remote is None:
+        if not args.execute:
+            res.step("branch", "DRY_PLAN", {"would_push": f"{fork_sha}:refs/heads/{branch}"})
+            res.status = "NOT_RUN"
+        elif push_new_ref(args.clone, fork_sha, f"refs/heads/{branch}"):
+            res.step("branch", "CREATED", {"sha": fork_sha})
+        else:
+            raise Refusal("CONFLICT_EXISTING", f"{branch} does not show {fork_sha} on origin after the push")
+    elif is_ancestor(args.clone, fork_sha, remote):
+        res.step("branch", "REUSED", {"sha": remote})
+    else:
+        raise Refusal("CONFLICT_EXISTING", f"{branch} exists at {remote}, which does not contain fork {fork_sha}")
+    if cand is None:
+        res.step("registry", "LISTED", {"line": listed["id"]})
+        return
+    res.step("registry", "PENDING_OWNER_LISTING", {"add_branch": branch, "head_prefix": f"v{version}/"})
+    emit_proposal(args, res, policy, baseline_sha, cand, "add-successor", f"add successor v{version} on {branch} after {pred['id']}")
+    if res.status == "PASS":
+        res.next_action = f"owner installs the packet so {branch} becomes merge-eligible; state stays PENDING_OWNER_LISTING until then"
+
+
+def integration_link(clone, rl, frm, into):
+    """Facts for integrating frm's shipped version into its successor: final tag, promoted candidate SHA, whether it is already there."""
+    if into["kind"] != "successor" or into["predecessor"]["line"] != frm["id"]:
+        raise Refusal("NOT_SUCCESSOR", f"{into['id']} is not a successor of {frm['id']}")
+    version = into["predecessor"]["version"]
+    tag = rl["tag_format"].replace("{version}", version)
+    final = commit_of(clone, "refs/tags/" + tag)
+    if final is None:
+        raise Refusal("NO_FINAL_TAG", f"{tag} does not exist; {frm['id']} has not shipped {version}")
+    rc, out = git(clone, "rev-list", "--parents", "-n", "1", final)
+    parts = out.split()
+    cand = parts[2] if len(parts) >= 3 else final
+    if not is_ancestor(clone, cand, need_ref(clone, frm["integration_branch"])):
+        raise Refusal("CANDIDATE_NOT_ON_LINE", f"promoted candidate {cand} is not on {frm['integration_branch']}")
+    into_ref = need_ref(clone, into["integration_branch"])
+    return {"from_version": version, "final_tag": tag, "candidate": cand, "into_ref": into_ref, "integrated": is_ancestor(clone, cand, into_ref)}
+
+
+def train_integrate(args, res):
+    if not args.clone:
+        raise SystemExit(usage_error("train integrate needs --clone"))
+    policy, _ = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
+    _, entry = check_policy(policy, args.repo)
+    require_ready(entry)
+    rl = entry["release_lines"]
+    frm, into = line_by_id(entry, args.from_line), line_by_id(entry, args.into)
+    fetch(args.clone)
+    link = integration_link(args.clone, rl, frm, into)
+    cand, version = link["candidate"], link["from_version"]
+    res.env["idempotency_key"] = f"int:{args.repo}:{frm['id']}:{into['id']}:{link['final_tag']}"
+    res.step("preconditions", "MET", {"final_tag": link["final_tag"], "candidate_sha": cand})
+    if frm["kind"] == "successor":
+        try:
+            prev = integration_link(args.clone, rl, line_by_id(entry, frm["predecessor"]["line"]), frm)
+        except Refusal as e:
+            raise Refusal("OUT_OF_ORDER", f"{frm['id']}'s own predecessor is not shipped and integrated first ({e.code}); integrate in dependency order")
+        if not prev["integrated"]:
+            raise Refusal("OUT_OF_ORDER", f"{prev['final_tag']} is not yet integrated into {frm['id']}; integrate in dependency order")
+    stale = [t for t in tag_names(args.clone, "--merged", link["into_ref"])
+             if (m := fmt_re(rl["candidate_format"]).match(t)) and m.group("v") == into.get("version") and not is_ancestor(args.clone, cand, t + "^{commit}")]
+    res.step("stale_candidates", "PROMOTION_BLOCKED" if stale else "NONE", {
+        "tags": stale, "rule": f"a {into['id']} candidate cut before {link['final_tag']} was integrated must not be promoted; cut a new one"})
+    if link["integrated"]:
+        res.step("integration", "INTEGRATED", {"candidate_sha": cand, "into": into["integration_branch"]})
+        return
+    predicted = git(args.clone, "merge-tree", "--write-tree", link["into_ref"], cand)[0]
+    if predicted != 0:
+        raise Refusal("MERGE_CONFLICT", f"merging {cand} into {into['integration_branch']} conflicts; resolve by hand, nothing was pushed")
+    head = f"lineint/{version}/{into['id']}"
+    remote = ls_remote(args.clone, f"refs/heads/{head}")
+    if remote is not None and remote != cand:
+        raise Refusal("CONFLICT_EXISTING", f"{head} exists at {remote}, not the promoted candidate {cand}")
+    if remote is None and not args.execute:
+        res.step("head", "DRY_PLAN", {"would_push": f"{cand}:refs/heads/{head}"})
+        res.status = "NOT_RUN"
+        return
+    if remote is None:
+        if not push_new_ref(args.clone, cand, f"refs/heads/{head}"):
+            raise Refusal("CONFLICT_EXISTING", f"{head} does not show {cand} on origin after the push")
+        res.step("head", "CREATED", {"sha": cand})
+    else:
+        res.step("head", "REUSED", {"sha": cand})
+    pr = ensure_pr(res, args, head, into["integration_branch"], f"Integrate {link['final_tag']} into {into['id']}",
+                   f"Integrate the promoted {frm['id']} candidate into the successor (merge commit, normal gate).\n\n"
+                   + trailers("integrate", frm["id"], into["id"], cand), refuse_merged=True)
+    if pr is not None:
+        res.status = "DEFERRED"
+        res.next_action = f"merge PR #{pr['number']} into {into['integration_branch']} as a merge commit through owner-merge-gate, then re-run to verify"
+
+
+def converge_problems(clone, rl, entry, major, chain):
+    problems = []
+    for frm, into in zip([major] + chain, chain):
+        try:
+            if not integration_link(clone, rl, frm, into)["integrated"]:
+                problems.append({"from": frm["id"], "into": into["id"], "problem": "NOT_INTEGRATED"})
+        except Refusal as e:
+            problems.append({"from": frm["id"], "into": into["id"], "problem": e.code})
+    return problems
+
+
+def train_converge(args, res):
+    if not args.clone:
+        raise SystemExit(usage_error("train converge needs --clone"))
+    policy, baseline_sha = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
+    key, entry = check_policy(policy, args.repo)
+    require_ready(entry)
+    rl = entry["release_lines"]
+    major = line_by_id(entry, args.line)
+    if major["kind"] != "major":
+        raise Refusal("NOT_A_MAJOR", "converge targets a major line")
+    res.env["idempotency_key"] = f"conv:{args.repo}:{major['id']}"
+    chain = active_chain(rl, major)
+    if not chain:
+        raise Refusal("NO_SUCCESSORS", f"{major['id']} has no active successor to converge")
+    fetch(args.clone)
+    problems = converge_problems(args.clone, rl, entry, major, chain)
+    if problems:
+        res.step("precondition", "CONVERGE_PRECONDITION", {"problems": problems})
+        res.status, res.next_action = "BLOCKED", "ship and integrate every version in dependency order (`train integrate`), then re-run"
+        return
+    res.step("precondition", "MET", {"chain": [x["id"] for x in chain]})
+    tip, base = chain[-1]["integration_branch"], major["integration_branch"]
+    tip_sha = ls_remote(args.clone, f"refs/heads/{tip}")
+    if tip_sha is None:
+        raise Refusal("NO_BRANCH", f"{tip} is not on origin")
+    if not is_ancestor(args.clone, tip_sha, need_ref(args.clone, base)):
+        pr = ensure_pr(res, args, tip, base, f"Converge {chain[-1]['id']} into {major['id']}",
+                       "Converge the successor train into the major line (merge commit, normal gate).\n\n"
+                       + trailers("converge", chain[-1]["id"], major["id"], tip_sha))
+        if pr is not None:
+            res.status = "DEFERRED"
+            res.next_action = f"merge PR #{pr['number']} into {base} as a merge commit through owner-merge-gate, then re-run"
+        return
+    res.step("convergence", "CONVERGED", {"tip_sha": tip_sha, "into": base})
+    cand = copy.deepcopy(policy)
+    for ln in cand["repos"][key]["release_lines"]["lines"]:
+        if ln["id"] in {x["id"] for x in chain}:
+            ln["state"], ln["converged_into"] = "converged", major["id"]
+    emit_proposal(args, res, policy, baseline_sha, cand, "converge", f"converge {', '.join(x['id'] for x in chain)} into {major['id']}")
+
+
+def guard(args, res):
+    if not args.clone:
+        raise SystemExit(usage_error("guard needs --clone"))
+    policy, _ = load_registry(args.policy or omg.VERSION_POLICY_DEFAULT)
+    _, entry = check_policy(policy, args.repo)
+    rl = entry["release_lines"]
+    fetch(args.clone)
+    head = commit_of(args.clone, args.head)
+    if head is None:
+        raise Refusal("BAD_HEAD", f"{args.head} is not a commit in the clone")
+    targets = [x for x in rl["lines"] if x["integration_branch"] == args.base]
+    pubs = [x["id"] for x in rl["lines"] if x["publication_base"]["branch"] == args.base]
+    if pubs:
+        res.step("base", "PUBLICATION_BASE_DIRECT_CHANGE", {"advisory": True, "lines": pubs,
+                 "detail": "a change merged straight into a publication base bypasses the integration branches and needs a forward-port"})
+    if not targets:
+        res.step("base", "NOT_AN_INTEGRATION_BASE", {"base": args.base})
+        return
+    line = targets[0]
+    if line["support"] == "eol":
+        res.step("base", "EOL_BASE", {"line": line["id"]})
+        res.status, res.next_action = "BLOCKED", f"{line['id']} is end-of-life; target a supported line"
+        return
+    base_ref = need_ref(args.clone, args.base)
+    chain = active_chain(rl, line) if line["kind"] == "major" else []
+    if chain and head == ls_remote(args.clone, f"refs/heads/{chain[-1]['integration_branch']}"):
+        problems = converge_problems(args.clone, rl, entry, line, chain)
+        if problems:
+            res.step("converge", "CONVERGE_PRECONDITION", {"problems": problems})
+            res.status, res.next_action = "BLOCKED", "converge only after every version shipped and was integrated in order"
+        else:
+            res.step("converge", "CONVERGE_ALLOWED", {"tip": chain[-1]["id"]})
+        return
+    def commits(rng):
+        rc, out = git(args.clone, "rev-list", rng)
+        if rc != 0:
+            raise Refusal("REV_LIST_FAILED", f"git rev-list {rng} failed; refusing to report a clean guard")
+        return set(out.split())
+    mine = commits(f"{base_ref}..{head}")
+    for succ in descendants(rl, line):
+        shared = sorted(mine & commits(f"{base_ref}..{need_ref(args.clone, succ['integration_branch'])}"))
+        if shared:
+            res.step("successor_commits", "SUCCESSOR_ONLY_COMMITS", {"successor": succ["id"], "commits": shared[:20], "count": len(shared)})
+            res.status, res.next_action = "BLOCKED", f"{args.head} carries commits that exist only on {succ['id']}; they reach {line['id']} only through `train converge`"
+            return
+    res.step("successor_commits", "NONE", {"line": line["id"]})
+
+
 # ---------------------------------------------------------------- envelope + CLI
 
 class Result:
@@ -701,11 +1076,26 @@ def build_parser():
     rt = top.add_parser("route", parents=[common])
     rt.add_argument("--kind", required=True, choices=["feature", "fix"])
     rt.add_argument("--version", required=True)
+    se = top.add_parser("successor").add_subparsers(dest="cmd", required=True).add_parser("ensure", parents=[common])
+    se.add_argument("--predecessor", required=True, help="predecessor version, e.g. 0.3.0")
+    se.add_argument("--from", dest="from_ref", help="fork point (default: the predecessor's highest candidate tag)")
+    se.add_argument("--version", help="successor version (default: next minor of the predecessor)")
+    se.add_argument("--branch", help="integration branch (default: the registered one, else integration/v<version>)")
+    gd = top.add_parser("guard", parents=[common])
+    gd.add_argument("--base", required=True)
+    gd.add_argument("--head", required=True)
+    tr = top.add_parser("train").add_subparsers(dest="cmd", required=True)
+    ti = tr.add_parser("integrate", parents=[common])
+    ti.add_argument("--from", dest="from_line", required=True)
+    ti.add_argument("--into", required=True)
+    tr.add_parser("converge", parents=[common]).add_argument("--line", required=True)
     return p
 
 
 HANDLERS = {("registry", "validate"): registry_validate, ("registry", "show"): registry_show, ("registry", "propose"): propose,
-            ("audit", "observe"): observe, ("audit", "import"): audit_import, ("route", None): route}
+            ("audit", "observe"): observe, ("audit", "import"): audit_import, ("route", None): route,
+            ("successor", "ensure"): successor_ensure, ("guard", None): guard, ("train", "integrate"): train_integrate,
+            ("train", "converge"): train_converge}
 
 
 def main(argv=None):
