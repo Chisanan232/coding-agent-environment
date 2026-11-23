@@ -31,8 +31,12 @@ FAKE_GH = FAKE_GH.replace(_old, '''elif a[:2] == ["release", "view"]:
     if rel is None:
         sys.stderr.write("release not found\\\\n")
         sys.exit(1)
+    open(S + ".cwd", "a").write(os.getcwd() + "\\n")
     if st.get("fail_view"):
         sys.exit(1)
+    if st.get("bad_assets"):
+        print(json.dumps({{"tagName": a[2], "name": a[2], "body": "", "isDraft": False, "assets": [1]}}))
+        sys.exit(0)
     print(json.dumps({{"tagName": a[2], "name": rel["title"], "body": rel["body"], "isDraft": rel.get("draft", False),
                       "assets": [{{"name": n}} for n in sorted(rel["assets"])]}}))
 elif a[:2] == ["release", "download"]:
@@ -397,7 +401,7 @@ class Hardened(Pub):
         return [json.loads(x) for x in (self.state_dir / "journal.jsonl").read_text().splitlines()]
 
     def pub_states(self):
-        keep = {"created", "published", "publish-unverified", "publish-failed", "reused"}
+        keep = {"publishing", "created", "published", "publish-unverified", "publish-failed", "reused"}
         return [r["state"] for r in self.journal() if r["state"] in keep]
 
     def test_git_children_never_receive_a_github_token_but_gh_does(self):
@@ -489,24 +493,49 @@ class Hardened(Pub):
         self.assertEqual((rc, out["status"], self.step(out, "release")["state"], self.step(out, "verify")["state"]), (1, "FAIL", "CREATED", "FAIL"), out)
         self.assertEqual(len(self.creates()), 1)
         states = self.pub_states()
-        self.assertEqual(states, ["created", "publish-unverified"])
+        self.assertEqual(states, ["publishing", "created", "publish-unverified"])
 
     def test_created_is_journaled_before_verification_and_reuse_and_failure_are_journaled(self):
         self.prepared()
         self.gh_update(fail_create=True)
         rc, out, _ = self.rel("publish", execute=True)
         self.assertEqual(self.refused(out), "PUBLISH_FAILED")
-        self.assertEqual(self.pub_states(), ["publish-failed"])
+        self.assertEqual(self.pub_states(), ["publishing", "publish-failed"])
         self.gh_update(fail_create=False)
         rc, out, _ = self.rel("publish", execute=True)
         self.assertEqual(rc, 0, out)
-        self.assertEqual(self.pub_states(), ["publish-failed", "created", "published"])
+        self.assertEqual(self.pub_states(), ["publishing", "publish-failed", "publishing", "created", "published"])
         rc, out, _ = self.rel("publish")  # dry run of a reuse writes nothing
         self.assertEqual(self.step(out, "release")["state"], "REUSED")
-        self.assertEqual(len(self.pub_states()), 3)
+        self.assertEqual(len(self.pub_states()), 5)
         rc, out, _ = self.rel("publish", execute=True)
         self.assertEqual(self.step(out, "release")["state"], "REUSED")
         self.assertEqual(self.pub_states()[-1], "reused")
+
+    def test_publishing_intent_is_journaled_before_create_and_dry_run_writes_nothing(self):
+        self.prepared()
+        self.rel("publish")
+        self.assertEqual(self.pub_states(), [])
+        self.gh_update(fail_create=True)
+        self.rel("publish", execute=True)
+        self.assertEqual(self.pub_states(), ["publishing", "publish-failed"])
+
+    def test_malformed_release_json_after_create_is_a_journaled_fail(self):
+        self.prepared()
+        self.gh_update(bad_assets=True)
+        rc, out, _ = self.rel("publish", execute=True)
+        self.assertEqual((rc, out["status"], self.step(out, "verify")["state"]), (1, "FAIL", "FAIL"), out)
+        self.assertEqual(self.pub_states(), ["publishing", "created", "publish-unverified"])
+
+    def test_gh_runs_in_a_fresh_empty_directory_not_the_callers(self):
+        self.prepared()
+        self.rel("publish", execute=True)
+        cwds = set(pathlib.Path(str(self.gh_state) + ".cwd").read_text().split())
+        self.assertTrue(cwds)
+        for d in cwds:
+            self.assertTrue(os.path.basename(d).startswith("release-gh-"), d)
+            self.assertNotEqual(os.path.realpath(d), os.path.realpath(os.getcwd()))
+            self.assertFalse(os.path.exists(d))  # removed after each call
 
     def test_a_github_outage_fails_closed_in_resolve_final(self):
         self.prepared()
