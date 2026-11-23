@@ -7,7 +7,7 @@ commit described below; reverting that commit restores 1 and is the rollback.** 
 reversible pilot (`THIRD_LANE_ENABLED = True`, wide-tier cap 3) on the owner's instruction of 2026-11-16, ahead of a trial PASS; the lane-3 trial
 evidence (revision 6 criteria) is still collected to decide whether to keep it as the default, and reverting the revision 7 pull request is the
 rollback.** Supersedes the clause "One heavy lane" in decision 3 of [ADR 0015](0015-memory-aware-admission-and-gh-first.md);
-the rest of ADR 0015 stands. **Revision 8 (SPE-176) merges a fourth-lane mode that ships off (`FOURTH_LANE_ENABLED = False`); enabling it is a separate reviewed pull request.**
+the rest of ADR 0015 stands. **Revision 8 (SPE-176) merged a fourth-lane mode that shipped off; revision 14 enables it as a monitored, reversible pilot (`FOURTH_LANE_ENABLED = True`) after revision 13a closed its head-protection prerequisite.**
 
 ## Context
 
@@ -755,3 +755,4 @@ Rollback: set `BACKFILL_HYSTERESIS = 0` (or revert the pull request).
 | 12 | Third lane in the stable tier: `THIRD_LANE_TIERS = ('stable', 'wide')`; lane 3 still needs the revision 11 margin, so no extra concurrency at 160 to 184 GiB free; lane 4 still OFF and wide-only; `THIRD_LANE_ENABLED` stays the kill switch; monitor reports the effective stable cap (SPE-176) |
 | 13 | Backfill grant hysteresis: a new backfill grant needs `BACKFILL_HYSTERESIS` (4 GiB) of head-protecting disk above the floor; the claim-time recheck keeps the plain floor; new decision reason `head-unprotected-hysteresis`; only tightens (SPE-176) |
 | 13a | Lane-4 head protection (the prerequisite named in revisions 11 and 12): `_protects_head` also requires the head's own lane-4 margin (`FOURTH_LANE_MARGIN`, 200 GiB after every reservation, the candidate and the head) when the head would take lane 4 once its blockers release, via `_fourth_lane_margin_refusal`; new decision reason `head-unprotected-lane4-margin`; inert while `FOURTH_LANE_ENABLED` is False (SPE-176) |
+| 14 | Fourth lane enabled as a monitored, reversible pilot on the owner's instruction (2026-11-23): `FOURTH_LANE_ENABLED = True`. The wide tier gains lane 4 only when the lane-4 gates pass: `FOURTH_LANE_MARGIN` (200 GiB) free after all reservations and the request, the 100 GiB heavy floor, exclusion keys, memory and CPU limits, `FOUR_LANE_CEILING` 4; stable stays at 3; `THIRD_LANE_ENABLED` stays the base switch; the head-protection prerequisite of revisions 11 and 12 is closed by revision 13a; rollback is reverting the one-line PR (SPE-176) |

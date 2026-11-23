@@ -79,7 +79,7 @@ first exists to check them; after you sign in `claude-auth-watch.py reconcile --
 
 ## D. Four heavy lanes: enable (separate reviewed one-line PR, NOT part of this packet's approvals unless you say so)
 
-Shipped OFF (`FOURTH_LANE_ENABLED = False`). Enabling changes the live default for every product session sharing the scheduler. ADR 0017 rev 8 prerequisites, all
+Shipped OFF when this packet was written; enabled as a monitored pilot by ADR 0017 revision 14 (`FOURTH_LANE_ENABLED = True`). Enabling changes the live default for every product session sharing the scheduler. ADR 0017 rev 8 prerequisites, all
 required: every active checkout current (a stale checkout's memory check arms the shared latch with four trees running: `admission-monitor.py callers` reported many unstamped and outdated checkouts on 2026-11-19 (116 and 55 by my count from that run; unverified, re-run it before deciding)), a fresh three-lane trial report PASS, measured headroom (lane 4 needs free space minus all reservations
 minus the request >= 200 GiB, no unmanaged build trees, no past-TTL/unresolved holder), and the monitor from B running so a stall is detected. Safe refusal is
 tested (`budget: lane 4 needs ...`, never latches); live lane-4 behaviour is NOT_VERIFIED. **Recommendation:** approve B and C first, then ask for D after a day of

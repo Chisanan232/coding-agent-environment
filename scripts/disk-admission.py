@@ -325,11 +325,11 @@ THIRD_LANE_TIERS = ('stable', 'wide')
 # memory or cpu slots; build-crate is granted its class min_jobs. This only feeds the trial report; it does not decide admission.
 # With THIRD_LANE_ENABLED the resource budget alone gates a third lane, whatever its class.
 THIRD_LANE_CLASSES = ('light', 'build-crate')
-# A fourth lane (SPE-176, ADR 0017 revision 8) is code that ships OFF. Enabling it is a separate reviewed one-line PR flipping this
-# constant and reverting that PR is the rollback: there is deliberately no flag file, environment switch or kill file, because a
+# A fourth lane (SPE-176, ADR 0017 revision 8) shipped OFF; ADR 0017 revision 14 enabled it as a monitored pilot by a separate reviewed
+# one-line PR flipping this constant, and reverting that PR is the rollback: there is deliberately no flag file, environment switch or kill file, because a
 # file or variable an agent can write is a forgeable cap. It needs THIRD_LANE_ENABLED too and adds one wide-tier lane, never above
 # FOUR_LANE_CEILING. LANE_CEILING stays 3 for the three-lane mode.
-FOURTH_LANE_ENABLED = False
+FOURTH_LANE_ENABLED = True
 FOUR_LANE_CEILING = 4
 # Lane 4 also needs this much free space left once every reservation and the request are counted (still the wide tier).
 FOURTH_LANE_MARGIN = 200 * 1024 ** 3
@@ -3533,7 +3533,7 @@ def _protects_head(host, head, cand, blockers, live, orphans, granted, now, lane
     lanes_after = heavy_lane_cap(tier_after, next_latch(projected_free, {'latch': latch}))
     math = {'free': free, 'reserved': reserved, 'cand_bytes': cand['bytes'], 'head_bytes': head['bytes'], 'floor': HEAVY_FLOOR,
             'disk_left': free - reserved - cand['bytes'] - head['bytes'], 'in_use': in_use, 'lanes': lanes,
-            'tier_after': tier_after, 'lanes_after': lanes_after, 'hysteresis': hysteresis, 'hysteresis_refused': False, 'cap': None, 'band_after': None,
+            'tier_after': tier_after, 'lanes_after': lanes_after, 'hysteresis': hysteresis, 'hysteresis_refused': False, 'head_stamped': _stamped(head), 'cap': None, 'band_after': None,
             'head_projected': None, 'head_limit': None, 'head_cpu': None, 'cpu_limit': None}
     cap = math['cap'] = min(lanes, lanes_after, heavy_lane_cap(lane_tier, latch))
     ok = math['disk_left'] >= HEAVY_FLOOR and in_use + 1 - len(blockers) < cap
@@ -3542,6 +3542,8 @@ def _protects_head(host, head, cand, blockers, live, orphans, granted, now, lane
     ok = ok and not _third_lane_refusal(in_use + 2 - len(blockers), free, reserved + cand['bytes'], head['bytes'])
     # Lane 4 has the same starvation shape: a candidate must not use up the 200 GiB margin the head will need once it is the fourth job.
     ok = ok and not _fourth_lane_margin_refusal(in_use + 2 - len(blockers), free, reserved + cand['bytes'], head['bytes'])
+    # With four-lane mode on, an unstamped entry is refused lanes 3 and 4 (_lane_refusal): a candidate must not push an unstamped head there.
+    ok = ok and not (_four_lane_mode() and in_use + 2 - len(blockers) >= 3 and not _stamped(head))
     try:
         gone = {b['label'] for b in blockers}
         holders = [h for h in budget_holders(live, orphans, granted, now) if not (h['kind'] == 'reservation' and h['label'] in gone)]
@@ -3675,6 +3677,8 @@ def _head_unprotected_part(math, blockers):
         return 'head-unprotected-lane3-margin'
     if _fourth_lane_margin_refusal(math['in_use'] + 2 - len(blockers), math['free'], math['reserved'] + math['cand_bytes'], math['head_bytes']):
         return 'head-unprotected-lane4-margin'
+    if _four_lane_mode() and math['in_use'] + 2 - len(blockers) >= 3 and not math.get('head_stamped', True):
+        return 'head-unprotected-lanes'
     if math.get('hysteresis_refused'):
         return 'head-unprotected-hysteresis'
     return 'head-unprotected-budget'

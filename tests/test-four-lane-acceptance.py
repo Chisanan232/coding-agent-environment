@@ -132,8 +132,8 @@ class ShippedDefault(Harness):
     """The shipped constants (third lane on, fourth off): today's three-lane behaviour, unchanged."""
     fourth = False
 
-    def test_the_shipped_default_is_off(self):
-        self.assertIs(SHIPPED_FOURTH, False)
+    def test_the_shipped_default_is_on(self):
+        self.assertIs(SHIPPED_FOURTH, True)    # the monitored pilot flip (SPE-176); reverting that one-line PR is the rollback
 
     def test_three_lanes_are_granted_and_the_fourth_waits(self):
         for n in range(1, 5):
