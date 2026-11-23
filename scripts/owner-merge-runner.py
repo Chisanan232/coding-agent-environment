@@ -48,7 +48,7 @@ MAC_RE = re.compile(r"[0-9a-f]{64}")
 HTTP_TOKEN_RE = re.compile(r"HTTP ([^\s:)]*)")
 STATUS_RE = re.compile(r"[0-9]{3}")
 BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,200}")
-READ_PATHS = (re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rules/branches/([A-Za-z0-9._/-]{1,200})"),
+READ_PATHS = (re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rules/branches/([A-Za-z0-9._/-]{1,200})\?per_page=100"),
               re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/branches/([A-Za-z0-9._/-]{1,200})/protection"),
               re.compile(r"repos/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/rulesets/([1-9][0-9]{0,11})"))
 JOB_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/actions/runs/[0-9]{1,15}/job/([0-9]{1,15})")
@@ -124,7 +124,7 @@ def pr_view_argv(repo, pr, fields):
 
 
 def rules_argv(repo, base):
-    return ["api", f"repos/{repo}/rules/branches/{base}"]
+    return ["api", f"repos/{repo}/rules/branches/{base}?per_page=100"]
 
 
 def protection_argv(repo, base):
@@ -652,8 +652,17 @@ def check_local_gate_base(runner, repo, base):
     bad = []
     # Without a pull-request requirement a writer could push straight to the base; with enforce_admins on, an
     # object here (even with 0 required approvals) forces every change through a PR.
-    if not isinstance(prot.get("required_pull_request_reviews"), dict):
+    prr = prot.get("required_pull_request_reviews")
+    pr_ok = isinstance(prr, dict)
+    if not pr_ok:
         bad.append("local_gate_only: required_pull_request_reviews is absent or malformed, so direct pushes are not blocked")
+    else:
+        allow = prr.get("bypass_pull_request_allowances", {})
+        # Absent or {} (or empty lists) means nobody may bypass the PR requirement; anything else could push around it.
+        if not isinstance(allow, dict) or any(not isinstance(allow.get(k, []), list) or allow.get(k, []) for k in allow):
+            bad.append("local_gate_only: bypass_pull_request_allowances names users, teams or apps (or is malformed), "
+                       "so they could bypass the pull-request requirement")
+            pr_ok = False
     for key, want, what in (("enforce_admins", True, "enforce_admins is not enabled"),
                             ("allow_force_pushes", False, "force pushes are not disabled"),
                             ("allow_deletions", False, "branch deletion is not disabled")):
@@ -662,6 +671,9 @@ def check_local_gate_base(runner, repo, base):
             bad.append(f"local_gate_only: {what} (or the field is missing or malformed)")
     if bad:
         raise Refused(bad)
+    # One page only: with 100 or more rules a bypass-bearing ruleset could sit on an unread page.
+    if len(rules) >= 100:
+        raise Refused(["local_gate_only: 100 or more server-side rules apply to the base; the list may be truncated"])
     # A rule whose ruleset id cannot be read would hide that ruleset's bypass actors, so any such entry refuses.
     if any(type(r.get("ruleset_id")) is not int or r["ruleset_id"] <= 0 for r in rules):
         raise Refused(["local_gate_only: a server-side rule has no valid ruleset_id, so its bypass actors cannot be read"])
@@ -676,7 +688,7 @@ def check_local_gate_base(runner, repo, base):
     return {"contexts": [], "protection": "read", "enforce_admins": True, "bypass": "none", "waivers": [],
             "server_side": "local-gate-protected-base",
             "facts": {"enforce_admins": True, "allow_force_pushes": False, "allow_deletions": False,
-                      "pull_request_required": True,
+                      "pull_request_required": pr_ok,
                       "ruleset_ids": sorted(ids), "bypass_actors": 0}}
 
 
