@@ -178,16 +178,25 @@ def child_env(extra_env=None):
     return env
 
 
+TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
+
+
 def run3(argv, cwd=None, extra_env=None, stdin=None, timeout=60):
     """(returncode, stdout, stderr) through the allowlisted child environment; `git` and `gh` run from their pinned absolute paths."""
     argv = list(argv)
+    is_git = bool(argv) and argv[0] == "git"
     if argv and argv[0] in ("git", "gh"):
         exe = tool_path(argv[0])
         if exe is None:
             return 127, "", "NOT_FOUND"
         argv[0] = exe
+    env = child_env(extra_env)
+    if is_git:
+        # Only gh needs the GitHub token. A git child runs code a clone or a build may have influenced (filters, hooks, attributes): it never sees one.
+        for k in TOKEN_VARS:
+            env.pop(k, None)
     try:
-        p = subprocess.run(argv, cwd=cwd, env=child_env(extra_env), capture_output=True, text=True, errors="replace", timeout=timeout, input=stdin)
+        p = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, errors="replace", timeout=timeout, input=stdin)
     except (OSError, subprocess.TimeoutExpired) as e:
         return 127, type(e).__name__, type(e).__name__
     return p.returncode, p.stdout, p.stderr
@@ -215,7 +224,7 @@ def git(clone, *args, env=None, stdin=None):
                 "-c", "remote.origin.proxy=", "-c", "http.sslVerify=true", "-c", "http.sslCAInfo=", "-c", "http.extraHeader=",
                 "-c", "remote.origin.uploadpack=git-upload-pack", "-c", "remote.origin.receivepack=git-receive-pack",
                 "-c", "tag.gpgSign=false", "-c", "commit.gpgSign=false", "-c", "log.showSignature=false", "-c", "gpg.program=/usr/bin/false",
-                "-c", "http.sslCAPath=", "-c", "http.curloptResolve=", "-c", "merge.renormalize=false", "-C", str(clone), *args],
+                "-c", "http.sslCAPath=", "-c", "http.curloptResolve=", "-c", "merge.renormalize=false", "-c", "core.attributesFile=/dev/null", "-C", str(clone), *args],
                extra_env=env, stdin=stdin)  # global config stays: it carries the committer identity
 
 
@@ -687,6 +696,14 @@ def require_clone(clone, repo=None):
     grafts = os.path.join(common if os.path.isabs(common) else os.path.join(str(clone), common), "info", "grafts")
     if rc != 0 or out.strip() or os.path.exists(grafts):
         raise Refusal("CLONE_CONFIG_HOSTILE", "the clone carries refs/replace/* or an info/grafts file, which rewrite history; use a clone without them")
+    # info/attributes can attach a filter driver to every path; the config allowlist already refuses the driver definition, this refuses the attachment too.
+    attrs = os.path.join(common if os.path.isabs(common) else os.path.join(str(clone), common), "info", "attributes")
+    try:
+        text = pathlib.Path(attrs).read_text(errors="replace") if os.path.lexists(attrs) else ""
+    except OSError:
+        text = "filter="
+    if re.search(r"(^|\s)(filter|diff|merge)=", text):
+        raise Refusal("CLONE_CONFIG_HOSTILE", "the clone's info/attributes attaches a filter, diff or merge driver; remove it")
     if repo is None:
         return
     for flags in ((), ("--push",)):
@@ -2338,11 +2355,13 @@ def release_verify(args, res):
                 r, _ = ci.run_check(wt, name, argv, logs, final, tag, entry.get("env"), {**context, "CARGO_TARGET_DIR": os.path.join(wt, "target")})
                 commands.append(r)
                 results.append({"name": name, "exit_code": r["exit_code"], "log_sha256": r["log_sha256"]})
+            require_clone(clone, args.repo)  # the checks ran in a worktree sharing this .git: re-validate before any git call
             dirty = git(wt, "status", "--porcelain", "--untracked-files=all")[1].strip() != ""
         except (RuntimeError, OSError) as e:
             raise Refusal("VERIFY_ERROR", f"{type(e).__name__}: {e}")
         finally:
-            git(clone, "worktree", "remove", "--force", wt)
+            if clone_safe(clone, args.repo):
+                git(clone, "worktree", "remove", "--force", wt)
             shutil.rmtree(wt, ignore_errors=True)
         ok = all(r["exit_code"] == 0 for r in results) and not dirty
         # The record in the fixed private evidence directory is the authority `final-tag` reads (the gate's recorder format); the journal is an audit trail only.
@@ -2519,7 +2538,7 @@ def resolve_final(args, c):
     tree, first = check_promotion(clone, final, cand)
     if not is_ancestor(clone, final, base_ref):
         raise Refusal("FINAL_NOT_ON_BASE", f"{final[:12]} is not on {c.base}")
-    _, merged = promotion_prs(args, c.version, c.base)
+    _, merged = promotion_prs(args, c.version, c.base, strict=True)  # GitHub must answer, as for final-tag: no silent skip of the cross-check
     if merged:
         oid, _ = merged_pr_commit(args.repo, merged[0]["number"])
         if oid != final:
@@ -2560,6 +2579,21 @@ def collect_outputs(wt, patterns):
     return dict(sorted(found.items()))
 
 
+def kill_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass  # the group is already gone
+
+
+def clone_safe(clone, repo):
+    try:
+        require_clone(clone, repo)
+        return True
+    except Refusal:
+        return False
+
+
 def run_build(args, c, f, b, timeout):
     """Run the owner's build argv, without a shell and with a scrubbed environment, in a clean detached worktree at the final SHA."""
     clone = args.clone
@@ -2574,13 +2608,18 @@ def run_build(args, c, f, b, timeout):
             with open(logp, "wb") as log:
                 proc = subprocess.Popen(b["argv"], cwd=wt, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                 try:
-                    code = proc.wait(timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait()
-                    raise Refusal("BUILD_TIMEOUT", f"the build exceeded {timeout}s and was killed", "FAIL")
+                    try:
+                        code = proc.wait(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        kill_group(proc)
+                        proc.wait()
+                        raise Refusal("BUILD_TIMEOUT", f"the build exceeded {timeout}s and was killed", "FAIL")
+                finally:
+                    kill_group(proc)  # also on a normal exit: nothing the build left running survives it
         except OSError as e:
             raise Refusal("BUILD_FAILED", f"could not start the build: {type(e).__name__}", "FAIL")
+        # The build shared the clone's .git through the worktree: whatever it planted there is not trusted, so the clone is re-validated before any git call.
+        require_clone(clone, args.repo)
         log_sha = sha256_bytes(pathlib.Path(logp).read_bytes())
         if code != 0:
             raise Refusal("BUILD_FAILED", f"the build exited {code} (log sha256 {log_sha})", "FAIL")
@@ -2588,8 +2627,9 @@ def run_build(args, c, f, b, timeout):
             raise Refusal("BUILD_MUTATED_TREE", "the build modified tracked files", "FAIL")
         return collect_outputs(wt, b["outputs"]), log_sha
     finally:
-        git(clone, "worktree", "remove", "--force", wt)
-        shutil.rmtree(wt, ignore_errors=True)
+        if clone_safe(clone, args.repo):
+            git(clone, "worktree", "remove", "--force", wt)
+        shutil.rmtree(wt, ignore_errors=True)  # a hostile clone is not asked to remove its own worktree; the stale registration is for the owner to prune
         shutil.rmtree(home, ignore_errors=True)
 
 
@@ -2767,11 +2807,15 @@ def release_publish(args, res):
         raise Refusal("GO_DIGEST_MISMATCH", f"the content to publish has digest {digest}, the GO record pins another")
     res.step("content", "VERIFIED", {"publish_digest": digest, "artifacts": {a["name"]: a["sha256"] for a in m["artifacts"]}})
     digests = {n: sha256_bytes(d) for n, d in files.items()}
+    key = res.env["idempotency_key"]
     rel = existing_release(args, f.tag)
     if rel is not None:
         diffs = release_differences(args, f.tag, rel, notes, digests)
         if diffs:
             raise Refusal("CONFLICT_EXISTING", f"GitHub release {f.tag} exists and differs ({', '.join(diffs)}); it is never overwritten")
+        if args.execute:
+            with Journal(args) as j:
+                j.append(key=key, state="reused", tag=f.tag, final_sha=f.final, publish_digest=digest)
         res.step("release", "REUSED", {"tag": f.tag})
         res.next_action = "none"
         return
@@ -2792,19 +2836,24 @@ def release_publish(args, res):
         with Journal(args) as j:
             rc, _, _ = gh_capture(argv, 1800)
             if rc != 0:
+                j.append(key=key, state="publish-failed", tag=f.tag, final_sha=f.final, publish_digest=digest)
                 raise Refusal("PUBLISH_FAILED", "gh release create failed; a partial release is never overwritten or deleted by this tool", "FAIL")
+            # The release exists from here on: record that before anything that can fail, so a verification outage never leaves an unjournaled public release.
+            j.append(key=key, state="created", tag=f.tag, final_sha=f.final, publish_digest=digest)
             res.step("release", "CREATED", {"tag": f.tag})
-            after = existing_release(args, f.tag)
-            diffs = release_differences(args, f.tag, after, notes, digests) if after is not None else ["release missing"]
-            if remote_tag(args.clone, f.tag)[1] != f.final:
-                diffs.append("tag moved")
+            try:
+                after = existing_release(args, f.tag)
+                diffs = release_differences(args, f.tag, after, notes, digests) if after is not None else ["release missing"]
+                if remote_tag(args.clone, f.tag)[1] != f.final:
+                    diffs.append("tag moved")
+            except (Refusal, RuntimeError, OSError, ValueError) as e:
+                diffs = [f"verification could not complete ({e.code if isinstance(e, Refusal) else type(e).__name__})"]
             res.step("verify", "FAIL" if diffs else "PASS", {"differences": diffs})
-            j.append(key=res.env["idempotency_key"], state="published" if not diffs else "publish-unverified", tag=f.tag, final_sha=f.final,
-                     publish_digest=digest)
+            j.append(key=key, state="published" if not diffs else "publish-unverified", tag=f.tag, final_sha=f.final, publish_digest=digest)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
     if diffs:
-        res.status, res.next_action = "FAIL", "the published release differs from the verified content; inspect it by hand"
+        res.status, res.next_action = "FAIL", "the published release differs from, or could not be verified against, the verified content; inspect it by hand"
     else:
         res.next_action = "none"
 
