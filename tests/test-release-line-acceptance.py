@@ -77,6 +77,10 @@ class Helpers(unittest.TestCase):
         self.assertEqual(b[-1], "PROMPT")
         self.assertIn("workspace-write", b)
 
+    def test_codex_root_is_the_clones_parent_so_its_git_dir_is_writable(self):
+        self.assertEqual(rla.session_cwd("codex", "/w/fx/tmp/work"), pathlib.Path("/w/fx/tmp"))
+        self.assertEqual(rla.session_cwd("claude", "/w/fx/tmp/work"), pathlib.Path("/w/fx/tmp/work"))
+
     def test_record_helpers(self):
         r = rec("release", "publish", "--version", "0.3.0", rc=1, status="BLOCKED", refused="GO_MISSING")
         self.assertEqual((rla.cmd_of(r), rla.refusal(r)), ("release publish", "GO_MISSING"))
