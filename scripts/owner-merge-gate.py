@@ -45,6 +45,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -196,6 +197,65 @@ def read_version_policy(path, required, root=None):
 
 
 LOCAL_FIRST_DEFAULT = "~/.config/coding-agent-environment/local/local-first-ci.json"
+LOCAL_EVIDENCE_DIRS = {"claude": "~/.claude/owner-merge-evidence", "codex": "~/.codex/owner-merge-evidence"}
+
+
+def local_ci_evidence_filename(tag, head, name=None):
+    tail = ".record.json" if name is None else "-" + log_slug(name) + ".log"
+    return f"local-ci-{tag}-{head[:12]}{tail}"
+
+
+def verify_standing_local_record(record):
+    tag = f"{record['repo'].replace('/', '__')}-{record['pr']}"
+    head = record["head"]
+
+    def read_at(directory, name, limit, *, digest=False):
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        with os.fdopen(os.open(name, flags, dir_fd=directory), "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                    or before.st_mode & 0o077 or before.st_nlink != 1 or before.st_size > limit):
+                raise ValueError("untrusted recorder evidence file")
+            if digest:
+                h = hashlib.sha256()
+                remaining = limit + 1
+                while chunk := stream.read(min(remaining, 1024 * 1024)):
+                    h.update(chunk)
+                    remaining -= len(chunk)
+                data = h.hexdigest()
+                if not remaining:
+                    raise ValueError("recorder log is oversized")
+            else:
+                data = stream.read(limit + 1)
+                if len(data) > limit:
+                    raise ValueError("recorder record is oversized")
+            after = os.fstat(stream.fileno())
+            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                    after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise ValueError("recorder evidence changed while reading")
+            return data
+
+    for path in LOCAL_EVIDENCE_DIRS.values():
+        try:
+            fd = os.open(os.path.expanduser(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                directory = os.fstat(fd)
+                if directory.st_uid != os.getuid() or directory.st_mode & 0o077:
+                    continue
+                raw = read_at(fd, local_ci_evidence_filename(tag, head), POLICY_MAX_BYTES)
+                from_disk = json.loads(raw, object_pairs_hook=_no_dup)
+                if from_disk != record:
+                    continue
+                if all(read_at(fd, local_ci_evidence_filename(tag, head, cmd["name"]), 1 << 28, digest=True)
+                       == cmd["log_sha256"] for cmd in record["commands"]):
+                    return True
+            finally:
+                os.close(fd)
+        except (OSError, ValueError):
+            continue
+    return False
+
+
 def log_slug(name):
     return re.sub(r"[^A-Za-z0-9._-]", "_", name)
 
@@ -221,7 +281,7 @@ def load_local_first(obj):
     for repo, entry in obj["repos"].items():
         if not isinstance(repo, str) or not REPO_RE.fullmatch(repo) or not isinstance(entry, dict) \
                 or set(entry) - {"checks", "max_age_hours", "pinned_paths", "not_covered", "env", "controlled_script_paths",
-                                 "controlled_package_scripts"}:
+                                 "controlled_package_scripts", "standing_admin_targets"}:
             raise ValueError(f"local-first config repo {repo!r} is malformed")
         checks, names = [], set()
         if not isinstance(entry.get("checks"), list) or not entry["checks"]:
@@ -271,6 +331,14 @@ def load_local_first(obj):
             normalized_package_scripts[path] = ("test",)
         if "controlled_package_scripts" in entry:
             out[repo.lower()]["controlled_package_scripts"] = normalized_package_scripts
+        standing_targets = entry.get("standing_admin_targets", [])
+        if (not isinstance(standing_targets, list)
+                or not all(isinstance(ref, str) and VERSION_REF_RE.fullmatch(ref) and ".." not in ref
+                           and not bad_ref_parts(ref) and not ref.endswith("/") for ref in standing_targets)
+                or len(standing_targets) != len(set(standing_targets))):
+            raise ValueError(f"local-first standing_admin_targets for {repo} must be unique exact git refs")
+        if "standing_admin_targets" in entry:
+            out[repo.lower()]["standing_admin_targets"] = tuple(standing_targets)
     return out
 
 
@@ -460,6 +528,7 @@ API_READS = [re.compile(x) for x in (
     # The billing waiver (--ci-unavailable) reads one check run, its job and its annotations by numeric id.
     _RO + r"/check-runs/\d{1,15}", _RO + r"/actions/jobs/\d{1,15}", _RO + r"/check-runs/\d{1,15}/annotations\?per_page=100",
     # The local-first basis asks GitHub whether any Actions run exists for the head (a count only).
+    _RO + r"/actions/runs/\d{1,15}",
     _RO + r"/actions/runs\?head_sha=[0-9a-f]{40}&per_page=1", _RO + r"/pulls/\d{1,9}/files\?per_page=100",
     _RO + r"/git/commits/[0-9a-f]{40}", _RO + r"/git/trees/[0-9a-f]{40}\?recursive=1",
     _RO + r"/git/blobs/[0-9a-f]{40}",
@@ -681,6 +750,51 @@ SIBLING_CANCEL_RE = re.compile(r'The strategy configuration was canceled because
 WAIVABLE_CONCLUSIONS = {"FAILURE", "CANCELLED"}
 
 
+
+# A GitHub Actions run still queued two hours after its own last transition has
+# a concrete scheduler delay. Running jobs and approval/environment waits stay pending.
+HOSTED_QUEUE_STALL_SECONDS = 2 * 3600
+
+
+def queued_actions_stall(run, repo, head, checks, now):
+    url_re = re.compile(r"https://github\.com/" + re.escape(repo) + r"/actions/runs/([0-9]{1,15})/job/([0-9]{1,15})", re.I)
+    if not checks or len(checks) >= 100:
+        return []
+    stalled, runs, jobs = [], {}, set()
+    try:
+        for check in checks:
+            if check.get("status") == "COMPLETED" and (check.get("conclusion") or "").upper() in OK:
+                continue
+            match = url_re.fullmatch(check.get("detailsUrl") or "")
+            if check.get("__typename") != "CheckRun" or check.get("status") != "QUEUED" or not match:
+                return []
+            run_id, job_id = match.groups()
+            if job_id in jobs:
+                return []
+            jobs.add(job_id)
+            if run_id not in runs:
+                record = _json(run, "api", f"repos/{repo}/actions/runs/{run_id}")
+                changed = _stamp(record["updated_at"])
+                if (str(record["id"]) != run_id or record["head_sha"] != head or record["status"] != "queued"
+                        or record["conclusion"] is not None or now - changed < HOSTED_QUEUE_STALL_SECONDS
+                        or _stamp(record["created_at"]) > changed):
+                    return []
+                runs[run_id] = record["updated_at"]
+            record = _json(run, "api", f"repos/{repo}/check-runs/{job_id}")
+            job = _json(run, "api", f"repos/{repo}/actions/jobs/{job_id}")
+            if (str(record["id"]) != job_id or record["head_sha"] != head
+                    or record["app"]["slug"] != "github-actions" or record["name"] != check.get("name")
+                    or record["status"] != "queued" or record["conclusion"] is not None
+                    or str(job["id"]) != job_id or str(job["run_id"]) != run_id or job["head_sha"] != head
+                    or job["status"] != "queued" or job["conclusion"] is not None or job["steps"] != []
+                    or job["started_at"] is not None or job["completed_at"] is not None):
+                return []
+            stalled.append({"run_id": run_id, "job_id": job_id, "last_run_update": runs[run_id]})
+    except (KeyError, TypeError, ValueError, RuntimeError, OSError, subprocess.SubprocessError):
+        return []
+    return stalled
+
+
 def _norm_job(name):
     return re.sub(r"[^a-z0-9]", "", str(name).lower())
 
@@ -793,7 +907,8 @@ def parse_local_record(rec):
     return finished
 
 
-def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, raw_bodies, cfg, now):
+def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, raw_bodies, cfg, now,
+                      standing_admin_reason=None):
     """Third CI basis. Returns (reasons, wait, facts). Only called for an empty rollup, --ci-exception and a repo in the owner's
     trust file. Every uncertainty refuses; a pass is never a CI pass (hosted checks stay NOT_RUN)."""
     reasons, wait, facts = [], [], {}
@@ -835,10 +950,11 @@ def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, raw_bo
             scope_invalid = True
     if scope_invalid:
         reasons.append("LOCAL_FIRST_SCOPE: the file list is unknown, truncated or inconsistent, or the PR renames a file or changes a workflow or an owner-pinned path")
-    if int(run("api", f"repos/{repo}/actions/runs?head_sha={head}&per_page=1", "--jq", ".total_count").strip()):
-        wait.append("CI_PENDING: GitHub Actions has a run for this head; the hosted result decides, not the local-first basis")
-    elif not has_skip_directive(run("api", f"repos/{repo}/commits/{head}", "--jq", ".commit.message")):
-        wait.append("CI_PENDING: the empty rollup is not explained by a skip directive in the head commit; hosted CI may not have started")
+    if standing_admin_reason is None:
+        if int(run("api", f"repos/{repo}/actions/runs?head_sha={head}&per_page=1", "--jq", ".total_count").strip()):
+            wait.append("CI_PENDING: GitHub Actions has a run for this head; the hosted result decides, not the local-first basis")
+        elif not has_skip_directive(run("api", f"repos/{repo}/commits/{head}", "--jq", ".commit.message")):
+            wait.append("CI_PENDING: the empty rollup is not explained by a skip directive in the head commit; hosted CI may not have started")
     items = []   # in comment order: ("rec", record, comment) or ("bad", None, comment)
     for c, text in texts_meta:
         for m in LOCAL_RE.finditer(re.sub(r"~~~.*?~~~", "", text, flags=re.S)):
@@ -897,7 +1013,8 @@ def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, raw_bo
         return reasons + ["LOCAL_CI_COMMANDS_MISMATCH: the recorded commands or environment are not exactly the owner's configured checks, in order"], wait, facts
     if rec["context"] != {"PULL_BRANCH": p.get("headRefName"), "PR_TITLE": p.get("title"), "GIT_BASE": rec["base_sha"]}:
         return reasons + ["LOCAL_CI_CONTEXT_MISMATCH: the record's PR branch, title or base differ from the PR now; rerun the local checks"], wait, facts
-    if now - max(finished) > cfg["max_age_hours"] * 3600:
+    age_anchor = min(_stamp(c["started_at"]) for c in rec["commands"]) if standing_admin_reason else max(finished)
+    if now - age_anchor > cfg["max_age_hours"] * 3600:
         return reasons + [f"LOCAL_CI_STALE: the record is older than {cfg['max_age_hours']} hours; rerun the local checks"], wait, facts
     if controlled_scope and not scope_invalid:
         try:
@@ -909,11 +1026,18 @@ def local_first_basis(run, repo, pr, base, head, p, meta, me, texts_meta, raw_bo
             stable = False
         if not stable:
             reasons.append("CONTROLLED_SCOPE_CHANGED: the PR base or head changed or became unverifiable during gate evaluation; re-read and review the current commits")
+    if not reasons and not wait and standing_admin_reason is not None and not verify_standing_local_record(rec):
+        reasons.append("LOCAL_CI_LOGS_UNVERIFIED: the posted record or its logs do not match the private recorder evidence")
     if not reasons and not wait:
-        facts.update(ci_exception="local-first", hosted_checks="NOT_RUN",
-                     ci_verdict="NOT_A_CI_PASS: LOCAL_EQUIVALENT_PASS; hosted checks never ran for this head",
+        hosted = {"billing-never-started": "BILLING_BLOCKED_NOT_RUN",
+                  "github-actions-queue-stall": "QUEUED_NEVER_STARTED"}.get(standing_admin_reason, "NOT_RUN")
+        facts.update(ci_exception="local-first",
+                     hosted_checks=hosted,
+                     ci_verdict="NOT_A_CI_PASS: LOCAL_EQUIVALENT_PASS; hosted results are recorded separately",
                      local_ci_digest=hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
                      not_covered=cfg["not_covered"])
+        if standing_admin_reason is not None:
+            facts.update(standing_admin_merge=True, standing_admin_reason=standing_admin_reason)
     return reasons, wait, facts
 
 
@@ -999,11 +1123,17 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
     default_branch = meta["defaultBranchRef"]["name"]
     pol = (version_policy or {}).get(repo.lower())
     head_ref = p.get("headRefName") or ""
-    if pol and base == default_branch and (head_ref.lower() in {b.lower() for b in pol["branches"]} or head_ref.lower().startswith(pol["prefixes"])):
+    future_version_into_main = bool(pol and base == default_branch
+                                    and (head_ref.lower() in {b.lower() for b in pol["branches"]}
+                                         or head_ref.lower().startswith(pol["prefixes"])))
+    if future_version_into_main:
         reasons.append(f"FUTURE_VERSION_INTO_MAIN: head {head_ref!r} is future-version work; it reaches {base!r} only through a "
                        "release step, never through this gate")
-    if DEPLOY_BASES.search(base) or (base != default_branch and not (pol and base in pol["branches"])) \
-            or (base != default_branch and POLICY_FORBIDDEN.search(base)):
+    base_rejected = bool(DEPLOY_BASES.search(base)
+                         or (base != default_branch and not (pol and base in pol["branches"]))
+                         or (base != default_branch and POLICY_FORBIDDEN.search(base)))
+    base_policy_allowed = not base_rejected and not future_version_into_main
+    if base_rejected:
         reasons.append(f"BASE_NOT_DEFAULT_OR_DEPLOY: base {base!r}; deployment, release and non-default bases need their own authorization")
     elif base != default_branch:
         facts["base_policy"] = "approved version integration branch"
@@ -1066,8 +1196,21 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
     mine = [c for c in comments if (c.get("author") or {}).get("login", "").lower() == me.lower()]
     texts = [re.sub(r"```.*?```", "", (c["body"] or ""), flags=re.S) for c in mine]
     configured_local = (local_first or {}).get(repo.lower())
-    controlled_review_required = (ci_exception and not (p.get("statusCheckRollup") or []) and configured_local
-                                  and _controlled_pin_candidate(p.get("files"), configured_local))
+    standing_admin_eligible = bool(
+        ci_exception and configured_local and base in configured_local.get("standing_admin_targets", ())
+        and base_policy_allowed and meta.get("isPrivate") is True and perm == "ADMIN" and klass == "A"
+        and owner == me.lower() and (meta.get("owner") or {}).get("login", "").lower() == me.lower()
+    )
+    hosted_checks = p.get("statusCheckRollup") or []
+    hosted_green = (
+        all((c.get("conclusion") or c.get("state") or "").upper() in OK
+            and c.get("status") in (None, "COMPLETED") for c in hosted_checks)
+        and any((c.get("conclusion") or c.get("state") or "").upper() == "SUCCESS" for c in hosted_checks)
+    )
+    controlled_review_required = (
+        ci_exception and configured_local and (not hosted_checks or standing_admin_eligible and not hosted_green)
+        and _controlled_pin_candidate(p.get("files"), configured_local)
+    )
     if controlled_review_required:
         recipe_sha = local_first_recipe_sha256(configured_local)
         facts["controlled_script_review"] = {"base_sha": p.get("baseRefOid"), "recipe_sha256": recipe_sha,
@@ -1119,22 +1262,38 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
             facts["review_kind"] = "recorded technical review, self-attested by the authenticated identity (not a GitHub approval)"
             if at_head[-1][3].lower() in (me.lower(), *NOT_INDEPENDENT_IDS):
                 reasons.append("REVIEW_NOT_INDEPENDENT: reviewer id is the author or coordinator")
-    checks = p["statusCheckRollup"] or []
+    checks = hosted_checks
     failed = [c.get("name") or c.get("context") for c in checks
               if (c.get("conclusion") or c.get("state") or "").upper() in FAIL]
     pending = [c.get("name") or c.get("context") for c in checks
                if c.get("status") not in (None, "COMPLETED") or (c.get("state") or "").upper() in ("PENDING", "EXPECTED")]
     waived = None
-    if failed and ci_unavailable:
+    standing_billing_waived = None
+    if failed and ci_unavailable and not standing_admin_eligible:
         recs = [m for t in texts for m in CI_RE.findall(t) if m[0] == head and m[2] == "PASS"]
         if recs and recs[-1][1] == "billing":  # quota and outage keep the old behaviour: a failed check still refuses
             waived, why = billing_waiver(run, repo, head, checks)
             if waived is None:
                 facts["ci_unavailable_refused"] = why[:10]
-    if failed and waived is None:
+    if failed and standing_admin_eligible:
+        standing_billing_waived, why = billing_waiver(run, repo, head, checks)
+        if standing_billing_waived is None:
+            facts["standing_admin_billing_refused"] = why[:10]
+    if failed and waived is None and standing_billing_waived is None:
         reasons.append(f"CI_FAILED: {sorted(set(failed))[:5]}")
     elif pending:
-        wait.append(f"CI_PENDING: {sorted(set(pending))[:5]}")
+        now_value = time.time() if now is None else now
+        stalled = queued_actions_stall(run, repo, head, checks, now_value) if standing_admin_eligible and not failed else []
+        if stalled:
+            lf_reasons, lf_wait, lf_facts = local_first_basis(
+                run, repo, pr, base, head, p, meta, me, list(zip(mine, texts)), [c["body"] or "" for c in mine],
+                configured_local, now_value, standing_admin_reason="github-actions-queue-stall")
+            reasons.extend(lf_reasons)
+            wait.extend(lf_wait)
+            facts.update(lf_facts)
+            facts["standing_admin_stalled_checks"] = stalled
+        else:
+            wait.append(f"CI_PENDING: {sorted(set(pending))[:5]}")
     elif waived is not None:
         done = [c for c in checks if (c.get("conclusion") or c.get("state") or "").upper() not in FAIL]
         if all((c.get("conclusion") or c.get("state") or "").upper() in OK for c in done):
@@ -1149,13 +1308,37 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
                                    "local-equivalent evidence stands in for them, they are not green")
         else:
             reasons.append("NO_CI_EVIDENCE: a non-failed check is not in a successful state alongside the billing-blocked jobs")
+    elif standing_billing_waived is not None:
+        done = [c for c in checks if (c.get("conclusion") or c.get("state") or "").upper() not in FAIL]
+        if all((c.get("conclusion") or c.get("state") or "").upper() in OK for c in done):
+            lf_reasons, lf_wait, lf_facts = local_first_basis(
+                run, repo, pr, base, head, p, meta, me, list(zip(mine, texts)), [c["body"] or "" for c in mine],
+                configured_local, time.time() if now is None else now, standing_admin_reason="billing-never-started")
+            reasons.extend(lf_reasons)
+            wait.extend(lf_wait)
+            facts.update(lf_facts)
+            facts["standing_admin_billing_checks"] = standing_billing_waived
+            if facts.get("standing_admin_merge") and unstable_reason in reasons:
+                reasons.remove(unstable_reason)
+                facts["merge_state"] = "UNSTABLE, explained by billing-blocked zero-step Actions jobs (not a CI pass)"
+        else:
+            reasons.append("NO_CI_EVIDENCE: a non-failed check is not in a successful state alongside the billing-blocked jobs")
     elif not checks or not all((c.get("conclusion") or c.get("state") or "").upper() in OK for c in checks) \
             or not any((c.get("conclusion") or c.get("state") or "").upper() == "SUCCESS" for c in checks):
         ci = [m for t in texts for m in CI_RE.findall(t) if m[0] == head and m[2] == "PASS"]
         noci = [m for t in texts for m in NOCI_RE.findall(t) if m[0] == head and m[1] == "PASS"]
-        if ci_unavailable and ci and not checks:
+        if ci_unavailable and ci and not checks and not standing_admin_eligible:
             facts["ci_exception"] = ci[-1][1]
-        elif ci_exception and noci and not checks and no_hosted_ci(run, repo, base, head, p.get("files") or [], bool(p.get("isCrossRepository"))):
+        elif standing_admin_eligible and not checks \
+                and no_hosted_ci(run, repo, base, head, p.get("files") or [], bool(p.get("isCrossRepository"))) \
+                and run("api", f"repos/{repo}/actions/runs?head_sha={head}&per_page=1", "--jq", ".total_count").strip() == "0":
+            lf_reasons, lf_wait, lf_facts = local_first_basis(
+                run, repo, pr, base, head, p, meta, me, list(zip(mine, texts)), [c["body"] or "" for c in mine],
+                configured_local, time.time() if now is None else now, standing_admin_reason="no-hosted-ci")
+            reasons.extend(lf_reasons)
+            wait.extend(lf_wait)
+            facts.update(lf_facts)
+        elif ci_exception and noci and not checks and not standing_admin_eligible and no_hosted_ci(run, repo, base, head, p.get("files") or [], bool(p.get("isCrossRepository"))):
             facts["ci_exception"] = "no-hosted-ci"
         elif ci_exception and not checks and (local_first or {}).get(repo.lower()):
             lf_reasons, lf_wait, lf_facts = local_first_basis(run, repo, pr, base, head, p, meta, me, list(zip(mine, texts)), [c["body"] or "" for c in mine],
@@ -1168,6 +1351,18 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
     facts["checks"] = len(checks)
     facts["formal_github_approval"] = "APPROVED" in latest.values()  # any reviewer; see owner_approved for the one that counts
     facts["owner_approved"] = owner_approved
+    if facts.get("standing_admin_merge"):
+        try:
+            current = _json(run, "pr", "view", str(pr), "--repo", repo,
+                            "--json", "baseRefName,baseRefOid,headRefOid,mergeStateStatus,reviewDecision,statusCheckRollup")
+            stable = all(current.get(field) == p.get(field) for field in (
+                "baseRefName", "baseRefOid", "headRefOid", "mergeStateStatus", "reviewDecision", "statusCheckRollup"))
+            if stable and facts["standing_admin_reason"] == "github-actions-queue-stall":
+                stable = queued_actions_stall(run, repo, head, checks, now_value) == stalled
+        except Exception:
+            stable = False
+        if not stable:
+            wait.append("CONTROLLED_SCOPE_CHANGED: the standing-admin target head or base changed or became unverifiable during gate evaluation")
     if reasons or [w for w in wait if not w.startswith("AWAITING_BOT_APPROVAL")]:
         facts.pop("approve_command", None)  # approve only after every other gate has passed
         facts.pop("needs_approval", None)
@@ -1197,7 +1392,8 @@ def verify(run, repo, pr, head):
 
 
 def merge_command(facts):
-    return (f"gh pr merge {facts['pr']} --repo {facts['repo']} --merge --match-head-commit {facts['head']}")
+    command = f"gh pr merge {facts['pr']} --repo {facts['repo']} --merge --match-head-commit {facts['head']}"
+    return command + (" --admin" if facts.get("standing_admin_merge") else "")
 
 
 # --- Canonical executor (SPE-118): one trusted way to run an eligible merge ------------------------------------------------
@@ -1233,6 +1429,9 @@ def runner_available(home):
 
 def select_executor(settings, facts, home, installed, repos):
     """Pure: the command to run for a PASS and the host permission that judges it. Runner only when it is host-allowed."""
+    if facts.get("standing_admin_merge"):
+        command = merge_command(facts)
+        return {"executor": "direct-gh", "command": command, "host": host_permission(settings, command)}
     if installed and facts["repo"].lower() in repos:
         command = runner_command(facts, home)
         host = host_permission(settings, command, rtk_twin=False)
@@ -1287,6 +1486,7 @@ REASON_TABLE = {
     "NO_CI_EVIDENCE": (ASK, "founder_risk_decision", "ENGINEERING_GATE"),
     "NOT_PRIVATE": (DENY, "none", "GITHUB_MERGE_ELIGIBILITY"),
     "LOCAL_CI_FAILED": (DENY, "author_fixes_ci", "ENGINEERING_GATE"),  # a local run that executed and failed is never overridden by a later pass
+    "LOCAL_CI_LOGS_UNVERIFIED": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"),
     "LOCAL_CI_MISSING": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"), "LOCAL_CI_STALE": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"),
     "LOCAL_CI_MISMATCH": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"), "LOCAL_CI_MALFORMED": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"),
     "LOCAL_CI_COMMANDS_MISMATCH": (ASK, "agent_reruns_local_ci", "ENGINEERING_GATE"),
