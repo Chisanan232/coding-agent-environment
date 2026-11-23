@@ -225,12 +225,12 @@ publication base, checks hosted CI, then with `--execute` runs `gh pr merge N --
 `merge-tree` result for `final^1` and the candidate (`PROMOTION_ASSERTION_FAILED` is FAIL). A rerun after the merge reports `ALREADY_PROMOTED` and merges nothing.
 Verification is `CARRIED_OVER` when the final tree equals the candidate tree, otherwise `REQUIRED`.
 
-Hosted CI: `CI_PASS` proceeds, a failing check is `CI_FAILED` (FAIL, never bypassed), pending checks are `DEFERRED`. When no hosted check ran (outage, quota, none
+Hosted CI: `CI_PASS` needs every check required by the owner-pinned protection snapshot (`required_status_checks` contexts and checks) to be `SUCCESS` in the PR's rollup, or, when none are required, at least one `SUCCESS`; an empty rollup, an all-`SKIPPED`/`NEUTRAL` rollup or a missing required check is `NOT_RUN`. A forged commit status with a required name is a residual risk the tool cannot see. `CI_PASS` proceeds, a failing check is `CI_FAILED` (FAIL, never bypassed), pending checks are `DEFERRED`. When no hosted check ran (outage, quota, none
 configured) the step is recorded `NOT_RUN` and promotion needs a local-equivalent record that passes the gate's own `local_first_basis` (private repo, the
 unedited and unminimized `OWNER-MERGE-LOCAL-CI` comment of the authenticated user on the promotion PR, strict `parse_local_record` schema, repo/PR/base/base
 commit/head/context match, commands and `env` equal to the owner's local-first entry, not finishing after it was posted or after now+60s, within `max_age_hours`;
 as in the gate, an unexplained empty rollup also needs a skip directive on the head commit and no Actions run). The posted record must equal the private recorder
-evidence, which is read only from the fixed evidence directories and re-verified with `verify_standing_local_record` (owner, mode, single link, log digests); there is no
+evidence, which the owner must also pin: `release-verification.json` `records.<repo>.<PR head sha>` holds its sha256 (`OWNER_PIN_MISSING` otherwise), because a file in the evidence directory is something the agent can write. The evidence is read only from the fixed evidence directories and re-verified with `verify_standing_local_record` (owner, mode, single link, log digests); there is no
 caller-chosen evidence directory (`LOCAL_EVIDENCE_REQUIRED` otherwise, with the gate's reason codes). No workflow is dispatched or rerun.
 
 `verify`: `CARRIED_OVER` when trees match; otherwise it needs `--execute` and runs the owner's local-first checks in a detached worktree at the final SHA
@@ -249,6 +249,14 @@ clock; `SOURCE_DATE_EPOCH` only affects reproducible output stamps. An annotated
 when the owner pins its sha256 under `snapshots.<repo>.<branch>` in `~/.config/coding-agent-environment/local/release-protection.json` (`SNAPSHOT_UNPINNED`,
 `NO_SNAPSHOT`, `SNAPSHOT_TAMPERED`). `protection verify` reports `PROTECTION_DRIFT` (FAIL) with the owner-run `branch-protection-rollout.py` rollback; `promote --execute`
 refuses without a pinned snapshot and compares before and after the merge. The tool never changes protection.
+
+Further guards (SPE-184a review): every release command ties the clone to `--repo` (`ORIGIN_MISMATCH`): all fetch and push URLs of `origin` must be github.com/`<repo>` (https, ssh or
+scp form) or a local path the owner listed for the repo in `~/.config/coding-agent-environment/local/release-origins.json` (`{"schema":1,"origins":{"<repo>":["/abs/path"]}}`, trust-anchor
+reader; that file is also how the test harness admits its bare origin, there is no flag or environment override). Predecessor and same-major final tags are confirmed with `ls-remote` on origin; a tag that exists only
+in the clone is not a shipped version. After the merge the tool asserts `final^1` equals the evaluated base tip; if the base moved it re-runs the forward-port accounting against `final^1` and
+reports `BASE_MOVED_UNACCOUNTED` (FAIL, the merge has happened) when new changes are unaccounted. If the after-merge protection comparison cannot run, promote ends `FAIL` with "verify protection manually".
+Limits: protection checks cover classic branch protection only (not rulesets) and compare only before and after the promote call. `release verify` is bound to the GO candidate (the promotion merge of that
+SHA and the PR reporting it) and refuses to overwrite a record whose digest the owner has pinned (`VERIFY_RECORD_PINNED`). Candidate tags are always annotated (a local lightweight tag is replaced); `--n` must be an integer >= 1 and `--sha` a commit id.
 
 ## Planned (not implemented)
 
