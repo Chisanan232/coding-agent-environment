@@ -628,7 +628,8 @@ def descendants(rl, line):
 
 
 def need_ref(clone, branch):
-    ref = branch_ref(clone, branch)
+    """The fetched origin tip; local branches in a working clone go stale, so they are only a fallback."""
+    ref = next((r for r in (f"refs/remotes/origin/{branch}", f"refs/heads/{branch}") if commit_of(clone, r)), None)
     if ref is None:
         raise Refusal("NO_BRANCH", f"{branch} is not present in the clone (fetched from origin)")
     return ref
