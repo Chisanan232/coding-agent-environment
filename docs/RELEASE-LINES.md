@@ -1,6 +1,6 @@
 # Release lines
 
-Status: slices 1 to 3 of the SPE-180 design (SPE-181a registry and routing, SPE-182 successor train, SPE-183 forward-port). This page documents what `scripts/release-line.py` implements today and lists
+Status: slices 1 to 3 and 6 of the SPE-180 design (SPE-181a registry and routing, SPE-182 successor train, SPE-183 forward-port, SPE-181b skill). This page documents what `scripts/release-line.py` implements today and lists
 later slices as planned. Nothing here changes the merge gate.
 
 ## Why
@@ -195,7 +195,14 @@ never a symlink, never under the owner config root); the journal is an audit tra
 maintenance branch it runs `forward-port run --execute --pr N`, posts the accounting to the job summary and the PR, reads the owner mirror from the
 Actions variable `RELEASE_LINES_JSON` and reports `NOT_RUN` when it is missing. It has no publish, tag or merge step and does not dispatch workflows.
 
+## Skill (SPE-181b)
+
+The `release-line` skill (`.claude/skills/release-line/`) wraps this CLI for both hosts. It is listed in `codex/shared-skills.json`;
+`scripts/profile-install.sh --claude-skills` installs it to `~/.claude/skills/release-line/` and `--global` to `~/.codex/skills/release-line/`,
+and `--check` reports drift. It calls the CLI by absolute path from the maintained checkout and restates the safety rules: no force-push, no
+`gh workflow run`, no admin-merge outside the owner-merge exception, and tags, promotion or publication only under a recorded GO.
+
 ## Planned (not implemented)
 
-Later slices of SPE-180: release candidate-tag/promote/verify/final-tag (SPE-184a); build/notes/publish (SPE-184b); protection snapshot/verify,
-skill packaging and install (SPE-181b); acceptance from installed entry points (SPE-185). None of these commands exist yet.
+Later slices of SPE-180: release candidate-tag/promote/verify/final-tag (SPE-184a); build/notes/publish (SPE-184b); protection snapshot/verify;
+acceptance from installed entry points (SPE-185). None of these commands exist yet.
