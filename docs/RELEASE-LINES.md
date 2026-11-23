@@ -1,6 +1,6 @@
 # Release lines
 
-Status: slices 1 to 3 of the SPE-180 design (SPE-181a registry and routing, SPE-182 successor train, SPE-183 forward-port). This page documents what `scripts/release-line.py` implements today and lists
+Status: slices 1 to 3 and 6 of the SPE-180 design (SPE-181a registry and routing, SPE-182 successor train, SPE-183 forward-port, SPE-181b skill). This page documents what `scripts/release-line.py` implements today and lists
 later slices as planned. Nothing here changes the merge gate.
 
 ## Why
@@ -258,6 +258,13 @@ reports `BASE_MOVED_UNACCOUNTED` (FAIL, the merge has happened) when new changes
 Limits: protection checks cover classic branch protection only (not rulesets) and compare only before and after the promote call. `release verify` is bound to the GO candidate (the promotion merge of that
 SHA and the PR reporting it) and refuses to overwrite a record whose digest the owner has pinned (`VERIFY_RECORD_PINNED`). Candidate tags are always annotated (a local lightweight tag is replaced); `--n` must be an integer >= 1 and `--sha` a commit id.
 
+## Skill (SPE-181b)
+
+The `release-line` skill (`.claude/skills/release-line/`) wraps this CLI for both hosts. It is listed in `codex/shared-skills.json`;
+`scripts/profile-install.sh --claude-skills` installs it to `~/.claude/skills/release-line/` and `--global` to `~/.codex/skills/release-line/`,
+and `--check` reports drift. It calls the CLI by absolute path from the maintained checkout and restates the safety rules: no force-push, no
+`gh workflow run`, no admin-merge outside the owner-merge exception, and tags, promotion or publication only under a recorded GO.
+
 ## Planned (not implemented)
 
-Later slices of SPE-180: build/notes/publish (SPE-184b); skill packaging and install (SPE-181b); acceptance from installed entry points (SPE-185).
+Later slices of SPE-180: build/notes/publish (SPE-184b); acceptance from installed entry points (SPE-185).

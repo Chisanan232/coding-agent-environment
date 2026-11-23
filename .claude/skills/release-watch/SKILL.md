@@ -74,3 +74,4 @@ notify only when decision-relevant state changes and posting is authorized.
   escalate — do not assume it will self-recover.
 
 See the [reference](references/release-operations.md) for the release window duties.
+For products with several release lines, see `release-line` for routing and forward-port accounting.
