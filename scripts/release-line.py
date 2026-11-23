@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Release-line registry, routing, audit, successor-train and forward-port CLI (SPE-180 design, slices SPE-181a, SPE-182, SPE-183, SPE-184a).
+"""Release-line registry, routing, audit, successor-train and forward-port CLI (SPE-180 design, slices SPE-181a, SPE-182, SPE-183, SPE-184a, SPE-184b).
 
   release-line.py registry validate|show        --repo O/R [--policy FILE]
   release-line.py registry propose --op add-successor|retire|eol|converge --repo O/R [--execute] [op flags]
@@ -11,7 +11,8 @@
   release-line.py train integrate --from LINE --into LINE --repo O/R --clone PATH [--execute]
   release-line.py train converge --line LINE --repo O/R --clone PATH [--execute]
   release-line.py forward-port plan|run|status (--merge SHA | --pr N | --range A..B) --repo O/R --clone PATH [--execute]
-  release-line.py release candidate-tag|promote|verify|final-tag --version V [--line L] --repo O/R --clone PATH [--execute]
+  release-line.py release candidate-tag|promote|verify|final-tag|build|notes|publish --version V [--line L] --repo O/R --clone PATH [--execute]
+  release-line.py release run --until STEP --version V [--line L] --repo O/R --clone PATH [--execute]
   release-line.py protection snapshot|verify --branch B --repo O/R [--execute]
 
 Prints exactly one JSON envelope on stdout. Exit 0 ok/no-op, 1 refused/blocked, 2 usage, 3 invalid config.
@@ -26,6 +27,7 @@ import contextlib
 import copy
 import datetime
 import fcntl
+import glob
 import hashlib
 import importlib.util
 import json
@@ -33,6 +35,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -2158,8 +2161,423 @@ def release_final_tag(args, res):
     res.next_action = "re-run with --execute to push the final tag" if res.status == "NOT_RUN" else "none; build, notes and publish are the next slice"
 
 
+# ---------------------------------------------------------------- build, notes, publish (SPE-184b)
+# Trust model: the state directory (releases/<version>.json, the artifact copies, the notes file, the journal) is agent-writable, so nothing in it can
+# authorize a publication. `publish` re-derives the final SHA from git/GitHub, re-hashes the artifacts and regenerates the notes, and requires the
+# owner's GO record to pin the digest of exactly that content (`publish_digest`, printed by `release notes`). The tag is never created here.
+
+BUILD_TIMEOUT, BUILD_TIMEOUT_MAX, ARTIFACT_MAX = 1800, 7200, 256 << 20
+ARTIFACT_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._+-]{0,199}", re.ASCII)
+RELEASE_STEPS = ("candidate-tag", "promote", "verify", "final-tag", "build", "notes", "publish")
+BUILD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
+HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
+
+
+def release_state_dirs(args, version):
+    """(releases dir, this version's artifact dir) under the confined state directory; symlinks are refused."""
+    top = proposal_dir(args).parent / "releases"
+    for p in (top, top / version):
+        if os.path.islink(p):
+            raise Refusal("STATE_DIR_UNSAFE", "the releases state directory must not be a symlink")
+    return top, top / version
+
+
+def read_state_file(d, name, limit):
+    """Bytes of a regular file in d (no-follow), or None when absent, unsafe or larger than limit."""
+    try:
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd), "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return None
+            data = f.read(limit + 1)
+        return None if len(data) > limit else data
+    except OSError:
+        return None
+    finally:
+        os.close(dfd)
+
+
+def read_manifest(top, version):
+    raw = read_state_file(top, f"{version}.json", 1 << 20)
+    try:
+        m = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    return m if isinstance(m, dict) else None
+
+
+def manifest_problem(m, args, version, final):
+    arts = m.get("artifacts") if m else None
+    if not (m and m.get("schema") == 1 and m.get("repo") == args.repo and m.get("version") == version and m.get("final_sha") == final
+            and isinstance(arts, list) and arts and all(isinstance(a, dict) and ARTIFACT_NAME_RE.fullmatch(str(a.get("name", "")))
+                                                        and HEX64.fullmatch(str(a.get("sha256", ""))) for a in arts)):
+        return "the build manifest is missing, malformed, or for another repo, version or final SHA; run `release build --execute`"
+    return None
+
+
+def load_artifacts(vdir, manifest):
+    """{name: bytes}, each re-hashed against the manifest; a missing or changed file refuses."""
+    out = {}
+    for a in manifest["artifacts"]:
+        data = read_state_file(vdir, a["name"], ARTIFACT_MAX)
+        if data is None:
+            raise Refusal("ARTIFACT_MISSING", f"artifact {a['name']} is missing from the state directory; run `release build --execute`")
+        if sha256_bytes(data) != a["sha256"]:
+            raise Refusal("ARTIFACT_TAMPERED", f"artifact {a['name']} no longer matches the checksum recorded by build")
+        out[a["name"]] = data
+    return out
+
+
+def resolve_final(args, c):
+    """The final SHA is recomputed from git and GitHub, never from the journal or state files: the final tag must exist and peel to a promotion
+    merge on the publication base whose second parent is the candidate and whose tree is the predicted (or pinned-verified) one."""
+    clone = args.clone
+    name = c.rl["tag_format"].replace("{version}", c.version)
+    obj, final = remote_tag(clone, name)
+    if obj is None:
+        raise Refusal("FINAL_TAG_MISSING", f"tag {name} does not exist on origin; run `release final-tag --execute` first")
+    if commit_of(clone, final) != final:
+        raise Refusal("FINAL_NOT_FETCHED", f"{name} points at {final[:12]}, which is not in the fetched clone")
+    need_merge_tree(clone)
+    base_ref = need_ref(clone, c.base)
+    cand = git(clone, "rev-parse", final + "^2")[1].strip()
+    if not SHA_RE.fullmatch(cand):
+        raise Refusal("PROMOTION_ASSERTION_FAILED", f"{name} does not point at a promotion merge commit", "FAIL")
+    tree, first = check_promotion(clone, final, cand)
+    if not is_ancestor(clone, final, base_ref):
+        raise Refusal("FINAL_NOT_ON_BASE", f"{final[:12]} is not on {c.base}")
+    _, merged = promotion_prs(args, c.version, c.base)
+    if merged:
+        oid, _ = merged_pr_commit(args.repo, merged[0]["number"])
+        if oid != final:
+            raise Refusal("PROMOTION_MISMATCH", f"PR #{merged[0]['number']} reports merge {oid[:12]}, the final tag points at {final[:12]}")
+    pr_number = merged[0]["number"] if merged else None
+    if tree != git(clone, "rev-parse", cand + "^{tree}")[1].strip() and not final_tree_verified(args, load_local_entry, pr_number, final, c.base, first):
+        raise Refusal("FINAL_NOT_VERIFIED", f"no passing, trusted local-first record exists for {final[:12]}; run `release verify --execute`")
+    return types.SimpleNamespace(final=final, cand=cand, tag=name, first=first, pr=pr_number, base_ref=base_ref)
+
+
+def collect_outputs(wt, patterns):
+    """{name: bytes} for every regular file matched by the owner's output patterns; a pattern that matches no file, a symlink, or a clash refuses."""
+    root, found, sources = os.path.realpath(wt), {}, {}
+    for pat in patterns:
+        if not isinstance(pat, str) or not pat or os.path.isabs(pat) or ".." in pathlib.PurePosixPath(pat).parts:
+            raise Refusal("BUILD_OUTPUT_PATTERN", "an output pattern must be a relative glob without '..'", "FAIL")
+        files = []
+        for hit in sorted(glob.glob(pat, root_dir=wt, recursive=True)):
+            full = os.path.join(root, hit)
+            st = os.lstat(full)
+            if stat.S_ISDIR(st.st_mode):
+                continue
+            if not stat.S_ISREG(st.st_mode) or not os.path.realpath(full).startswith(root + os.sep):
+                raise Refusal("BUILD_OUTPUT_UNSAFE", f"{hit} is a symlink, special file or leaves the build tree", "FAIL")
+            files.append((hit, full, st.st_size))
+        if not files:
+            raise Refusal("BUILD_OUTPUT_MISSING", f"output pattern {pat} matched no file", "FAIL")
+        for hit, full, size in files:
+            name = os.path.basename(hit)
+            if not ARTIFACT_NAME_RE.fullmatch(name):
+                raise Refusal("BUILD_OUTPUT_NAME", f"{name} is not a safe artifact file name", "FAIL")
+            if sources.setdefault(name, hit) != hit:
+                raise Refusal("BUILD_OUTPUT_DUPLICATE", f"{hit} and {sources[name]} would publish under the same name", "FAIL")
+            if size > ARTIFACT_MAX:
+                raise Refusal("BUILD_OUTPUT_TOO_LARGE", f"{hit} exceeds the artifact size limit", "FAIL")
+            with os.fdopen(os.open(full, os.O_RDONLY | os.O_NOFOLLOW), "rb") as f:
+                found[name] = f.read()
+    return dict(sorted(found.items()))
+
+
+def run_build(args, c, f, b, timeout):
+    """Run the owner's build argv, without a shell and with a scrubbed environment, in a clean detached worktree at the final SHA."""
+    clone = args.clone
+    wt, home = tempfile.mkdtemp(prefix="release-build-"), tempfile.mkdtemp(prefix="release-build-home-")
+    try:
+        if git(clone, "worktree", "add", "--detach", wt, f.final)[0] != 0:
+            raise Refusal("WORKTREE_FAILED", "could not create the detached build worktree")
+        epoch = git(clone, "log", "-1", "--format=%ct", f.final)[1].strip() or "0"
+        env = {"PATH": BUILD_PATH, "HOME": home, "TMPDIR": home, "LANG": "C", "LC_ALL": "C", "TZ": "UTC", "SOURCE_DATE_EPOCH": epoch}
+        logp = os.path.join(home, "build.log")
+        try:
+            with open(logp, "wb") as log:
+                proc = subprocess.Popen(b["argv"], cwd=wt, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                try:
+                    code = proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
+                    raise Refusal("BUILD_TIMEOUT", f"the build exceeded {timeout}s and was killed", "FAIL")
+        except OSError as e:
+            raise Refusal("BUILD_FAILED", f"could not start the build: {type(e).__name__}", "FAIL")
+        log_sha = sha256_bytes(pathlib.Path(logp).read_bytes())
+        if code != 0:
+            raise Refusal("BUILD_FAILED", f"the build exited {code} (log sha256 {log_sha})", "FAIL")
+        if git(wt, "status", "--porcelain", "--untracked-files=no")[1].strip():
+            raise Refusal("BUILD_MUTATED_TREE", "the build modified tracked files", "FAIL")
+        return collect_outputs(wt, b["outputs"]), log_sha
+    finally:
+        git(clone, "worktree", "remove", "--force", wt)
+        shutil.rmtree(wt, ignore_errors=True)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def release_build(args, res):
+    c = release_ctx(args, res)
+    b = c.rl.get("build")
+    if not b:
+        raise Refusal("BUILD_NOT_CONFIGURED", "the owner registry has no build entry (argv and outputs) for this repo")
+    timeout = min(max(getattr(args, "build_timeout", None) or BUILD_TIMEOUT, 1), BUILD_TIMEOUT_MAX)
+    f = resolve_final(args, c)
+    res.env["idempotency_key"] = f"release:{args.repo}:{c.version}:{f.final}"
+    res.step("final", "RESOLVED", {"tag": f.tag, "final_sha": f.final, "candidate_sha": f.cand})
+    top, vdir = release_state_dirs(args, c.version)
+    m = read_manifest(top, c.version)
+    if m and manifest_problem(m, args, c.version, f.final) is None:
+        try:
+            load_artifacts(vdir, m)
+            res.step("build", "REUSED", {"artifacts": m["artifacts"]})
+            res.next_action = "`release notes`"
+            return
+        except Refusal:
+            pass  # changed or missing copies: rebuild below
+    if not args.execute:
+        res.step("build", "DRY_PLAN", {"argv": b["argv"], "outputs": b["outputs"], "worktree_at": f.final})
+        res.status, res.next_action = "NOT_RUN", "re-run with --execute to build in a detached worktree at the final SHA"
+        return
+    with Journal(args) as j:
+        files, log_sha = run_build(args, c, f, b, timeout)
+        arts = [{"name": n, "sha256": sha256_bytes(d), "size": len(d)} for n, d in files.items()]
+        manifest = {"schema": 1, "repo": args.repo, "version": c.version, "release_line": c.ln["id"], "final_tag": f.tag, "final_sha": f.final,
+                    "candidate_sha": f.cand, "build": {"argv": b["argv"], "outputs": b["outputs"]}, "artifacts": arts}
+        if vdir.exists():
+            shutil.rmtree(vdir)
+        write_private(vdir, list(files.items()))
+        write_private(top, [(f"{c.version}.json", dump(manifest))])
+        j.append(key=res.env["idempotency_key"], state="built", final_sha=f.final, version=c.version, build_log_sha256=log_sha,
+                 artifacts=[{"name": a["name"], "sha256": a["sha256"]} for a in arts])
+    res.step("build", "BUILT", {"artifacts": arts, "build_log_sha256": log_sha})
+    res.next_action = "`release notes --execute`"
+
+
+def publish_digest(args, version, final, notes_sha, manifest):
+    """The content the owner pins in the GO record as `publish_digest`: final SHA, notes digest and every artifact digest."""
+    return record_digest({"repo": args.repo, "version": version, "final_sha": final, "notes_sha256": notes_sha,
+                          "artifacts": {a["name"]: a["sha256"] for a in manifest["artifacts"]}})
+
+
+def render_notes(args, c, f, manifest):
+    rl, clone = c.rl, args.clone
+    rc_re = fmt_re(rl["candidate_format"])
+    cands = sorted((int(m.group("n")), t) for t in tag_names(clone) if (m := rc_re.fullmatch(t)) and m.group("v") == c.version
+                   and commit_of(clone, f"refs/tags/{t}") == f.cand)
+    try:
+        n, bad = accounting_complete(args, c, f.cand, f.first)
+        accounted = f"{n} base-only change(s) inspected, {len(bad)} not fully accounted"
+    except Refusal:
+        accounted = "not available"
+    rows = "\n".join(f"{a['sha256']}  {a['name']}" for a in manifest["artifacts"])
+    text = "\n".join([
+        f"# Release {c.version}", "",
+        f"- Source branch: `{c.ln['integration_branch']}`",
+        f"- Release line: `{c.ln['id']}`",
+        f"- Version: `{c.version}`",
+        f"- Promotion PR: {'#' + str(f.pr) if f.pr else 'not found'}",
+        f"- Candidate tag: {'`' + cands[-1][1] + '`' if cands else 'none found'}",
+        f"- Candidate SHA: `{f.cand}`",
+        f"- Final tag: `{f.tag}`",
+        f"- Final SHA: `{f.final}`",
+        f"- Publication base: `{c.base}`",
+        f"- Forward-port accounting: {accounted}", "",
+        "## Artifact checksums (sha256)", "", "```", rows, "```", ""])
+    return text.encode()
+
+
+def release_notes(args, res):
+    c = release_ctx(args, res)
+    f = resolve_final(args, c)
+    res.env["idempotency_key"] = f"release:{args.repo}:{c.version}:{f.final}"
+    top, vdir = release_state_dirs(args, c.version)
+    m = read_manifest(top, c.version)
+    problem = manifest_problem(m, args, c.version, f.final)
+    if problem:
+        raise Refusal("BUILD_MISSING", problem)
+    load_artifacts(vdir, m)
+    notes = render_notes(args, c, f, m)
+    digest, path = sha256_bytes(notes), str(top / f"{c.version}.notes.md")
+    ev = {"path": path, "sha256": digest, "publish_digest": publish_digest(args, c.version, f.final, digest, m)}
+    if read_state_file(top, f"{c.version}.notes.md", 1 << 20) == notes:
+        res.step("notes", "REUSED", ev)
+    elif not args.execute:
+        res.step("notes", "DRY_PLAN", ev)
+        res.status = "NOT_RUN"
+    else:
+        with Journal(args) as j:
+            write_private(top, [(f"{c.version}.notes.md", notes)])
+            j.append(key=res.env["idempotency_key"], state="notes", final_sha=f.final, notes_sha256=digest)
+        res.step("notes", "WRITTEN", ev)
+    res.next_action = ("owner: record publish_digest in the GO record (scope publish), then `release publish`" if res.status == "PASS"
+                       else "re-run with --execute to write the notes")
+
+
+def gh_capture(argv, timeout=60):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", type(e).__name__
+    return p.returncode, p.stdout, p.stderr
+
+
+def existing_release(args, tag):
+    rc, out, err = gh_capture(["gh", "release", "view", tag, "--repo", args.repo, "--json", "tagName,name,body,isDraft,assets"])
+    if rc != 0:
+        if "not found" in err.lower():
+            return None
+        raise Refusal("GH_UNAVAILABLE", "gh release view failed; nothing was published")
+    try:
+        rel = json.loads(out)
+    except ValueError:
+        rel = None
+    if not isinstance(rel, dict):
+        raise Refusal("GH_UNAVAILABLE", "gh release view returned unreadable output")
+    return rel
+
+
+def release_differences(args, tag, rel, notes, digests):
+    """Why an existing GitHub release is not exactly the one this tool would create (empty list: identical notes and identical asset bytes)."""
+    diffs = []
+    norm = lambda s: s.replace("\r\n", "\n").strip()
+    if rel.get("tagName") != tag or rel.get("isDraft"):
+        diffs.append("tag or draft state")
+    if norm(rel.get("body") or "") != norm(notes.decode()):
+        diffs.append("notes")
+    names = sorted(a.get("name", "") for a in rel.get("assets") or [])
+    if names != sorted(digests):
+        diffs.append("asset names")
+        return diffs
+    with tempfile.TemporaryDirectory(prefix="release-dl-") as d:
+        rc, _, _ = gh_capture(["gh", "release", "download", tag, "--repo", args.repo, "--dir", d, "--pattern", "*"], 600)
+        if rc != 0:
+            raise Refusal("GH_UNAVAILABLE", "gh release download failed; nothing was published")
+        for name, want in digests.items():
+            data = read_state_file(d, name, ARTIFACT_MAX)
+            if data is None or sha256_bytes(data) != want:
+                diffs.append(f"asset {name}")
+    return diffs
+
+
+def release_publish(args, res):
+    c = release_ctx(args, res)
+    if getattr(args, "backend", "gh") != "gh":
+        raise Refusal("UNSUPPORTED_BACKEND", f"backend {args.backend} is not supported; only gh")
+    if c.rl["channel"] != "github-release":
+        res.step("channel", "DEFERRED", {"channel": c.rl["channel"]})
+        res.status, res.next_action = "DEFERRED", "only the github-release channel is implemented"
+        return
+    go = read_go(args, c.rl, c.ln, c.version)
+    need_scope(go, "publish")
+    f = resolve_final(args, c)
+    if go["candidate_sha"] != f.cand:
+        raise Refusal("GO_MISMATCH", f"GO record approves candidate {go['candidate_sha'][:12]}, the final tag's promotion merged {f.cand[:12]}")
+    res.env["idempotency_key"] = f"release:{args.repo}:{c.version}:{f.final}"
+    res.step("go", "ACCEPTED", {"scope": "publish", "candidate_sha": f.cand, "final_sha": f.final})
+    top, vdir = release_state_dirs(args, c.version)
+    m = read_manifest(top, c.version)
+    problem = manifest_problem(m, args, c.version, f.final)
+    if problem:
+        raise Refusal("BUILD_MISSING", problem)
+    files = load_artifacts(vdir, m)
+    notes = render_notes(args, c, f, m)
+    stored = read_state_file(top, f"{c.version}.notes.md", 1 << 20)
+    if stored is None:
+        raise Refusal("NOTES_MISSING", "run `release notes --execute` first")
+    if stored != notes:
+        raise Refusal("NOTES_TAMPERED", "the stored notes differ from the notes regenerated from git and the build manifest")
+    digest = publish_digest(args, c.version, f.final, sha256_bytes(notes), m)
+    if not go.get("publish_digest"):
+        raise Refusal("GO_DIGEST_UNPINNED", f"the GO record does not pin the content to publish; the owner records publish_digest {digest}")
+    if go["publish_digest"] != digest:
+        raise Refusal("GO_DIGEST_MISMATCH", f"the content to publish has digest {digest}, the GO record pins another")
+    res.step("content", "VERIFIED", {"publish_digest": digest, "artifacts": {a["name"]: a["sha256"] for a in m["artifacts"]}})
+    digests = {n: sha256_bytes(d) for n, d in files.items()}
+    rel = existing_release(args, f.tag)
+    if rel is not None:
+        diffs = release_differences(args, f.tag, rel, notes, digests)
+        if diffs:
+            raise Refusal("CONFLICT_EXISTING", f"GitHub release {f.tag} exists and differs ({', '.join(diffs)}); it is never overwritten")
+        res.step("release", "REUSED", {"tag": f.tag})
+        res.next_action = "none"
+        return
+    argv = ["gh", "release", "create", f.tag, "--repo", args.repo, "--verify-tag", "--title", f.tag, "--notes-file", "<notes>", *sorted(files)]
+    if not args.execute:
+        res.step("release", "DRY_PLAN", {"argv": argv, "tag_created_by_publish": False})
+        res.status, res.next_action = "NOT_RUN", "re-run with --execute to create the GitHub release for the existing final tag"
+        return
+    stage = tempfile.mkdtemp(prefix="release-publish-")
+    try:
+        paths = []
+        for n, d in files.items():
+            paths.append(os.path.join(stage, n))
+            pathlib.Path(paths[-1]).write_bytes(d)
+        notes_path = os.path.join(stage, ".notes.md")
+        pathlib.Path(notes_path).write_bytes(notes)
+        argv = ["gh", "release", "create", f.tag, "--repo", args.repo, "--verify-tag", "--title", f.tag, "--notes-file", notes_path, *paths]
+        with Journal(args) as j:
+            rc, _, _ = gh_capture(argv, 1800)
+            if rc != 0:
+                raise Refusal("PUBLISH_FAILED", "gh release create failed; a partial release is never overwritten or deleted by this tool", "FAIL")
+            res.step("release", "CREATED", {"tag": f.tag})
+            after = existing_release(args, f.tag)
+            diffs = release_differences(args, f.tag, after, notes, digests) if after is not None else ["release missing"]
+            if remote_tag(args.clone, f.tag)[1] != f.final:
+                diffs.append("tag moved")
+            res.step("verify", "FAIL" if diffs else "PASS", {"differences": diffs})
+            j.append(key=res.env["idempotency_key"], state="published" if not diffs else "publish-unverified", tag=f.tag, final_sha=f.final,
+                     publish_digest=digest)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    if diffs:
+        res.status, res.next_action = "FAIL", "the published release differs from the verified content; inspect it by hand"
+    else:
+        res.next_action = "none"
+
+
+def release_run(args, res):
+    """Chain the release steps in order, each independently gated; facts are recomputed from git and GitHub at every step, never taken from the journal."""
+    for step in RELEASE_STEPS:
+        sub = copy.copy(args)
+        sub.cmd = step
+        child = Result(f"release {step}", args.repo, "")
+        try:
+            if step == "candidate-tag" and not sub.sha:
+                try:
+                    c = release_ctx(sub, child)
+                    sub.sha = read_go(sub, c.rl, c.ln, c.version)["candidate_sha"]
+                except Refusal:
+                    pass
+            RELEASE_HANDLERS[step](sub, child)
+        except Refusal as e:
+            res.step(step, "REFUSED", {"code": e.code, "detail": e.detail})
+            res.status, res.next_action = e.status, f"resolve {e.code}"
+            return
+        res.step(step, child.status, {"idempotency_key": child.env["idempotency_key"], "steps": child.steps, "next_action": child.next_action})
+        if child.env["idempotency_key"].startswith("release:"):
+            res.env["idempotency_key"] = child.env["idempotency_key"]
+        if child.status != "PASS":
+            res.status, res.next_action = child.status, child.next_action
+            return
+        if step == args.until:
+            break
+    res.next_action = "none" if args.until == "publish" else f"stopped after {args.until}"
+
+
+RELEASE_HANDLERS = {"candidate-tag": release_candidate_tag, "promote": release_promote, "verify": release_verify, "final-tag": release_final_tag,
+                    "build": release_build, "notes": release_notes, "publish": release_publish}
+
+
 def release_cmd(args, res):
-    {"candidate-tag": release_candidate_tag, "promote": release_promote, "verify": release_verify, "final-tag": release_final_tag}[args.cmd](args, res)
+    (release_run if args.cmd == "run" else RELEASE_HANDLERS[args.cmd])(args, res)
 
 
 # ---------------------------------------------------------------- envelope + CLI
@@ -2227,15 +2645,21 @@ def build_parser():
         grp.add_argument("--pr", type=int, help="a merged PR number (resolved through gh)")
         grp.add_argument("--range", help="A..B: every first-parent commit in the range is a source")
     rel = top.add_parser("release").add_subparsers(dest="cmd", required=True)
-    for name in ("candidate-tag", "promote", "verify", "final-tag"):
+    for name in (*RELEASE_STEPS, "run"):
         sub = rel.add_parser(name, parents=[common])
         sub.add_argument("--version", required=True, help="the version being released, e.g. 0.3.0")
         sub.add_argument("--line", help="release line id (default: the line carrying the version, else its major line)")
-        if name == "candidate-tag":
-            sub.add_argument("--sha", help="candidate commit (default: the integration branch tip; must be reachable from it)")
+        if name in ("candidate-tag", "run"):
+            sub.add_argument("--sha", help="candidate commit (default: the GO record's, else the integration branch tip; must be reachable from it)")
             sub.add_argument("--n", type=int, help="candidate number when no GO record names the tag")
-        if name in ("promote", "verify"):
+        if name in ("promote", "verify", "run"):
             sub.add_argument("--local-first", help="local-first CI trust file (default: the owner file)")
+        if name in ("build", "run"):
+            sub.add_argument("--build-timeout", type=int, help=f"seconds before the build is killed (default {BUILD_TIMEOUT}, at most {BUILD_TIMEOUT_MAX})")
+        if name in ("publish", "run"):
+            sub.add_argument("--backend", default="gh", help="publication backend (only gh)")
+        if name == "run":
+            sub.add_argument("--until", required=True, choices=RELEASE_STEPS, help="last step to run; stops earlier at the first step that is not PASS")
     prot = top.add_parser("protection").add_subparsers(dest="cmd", required=True)
     for name in ("snapshot", "verify"):
         prot.add_parser(name, parents=[common]).add_argument("--branch", required=True)
@@ -2247,7 +2671,7 @@ HANDLERS = {("registry", "validate"): registry_validate, ("registry", "show"): r
             ("successor", "ensure"): successor_ensure, ("guard", None): guard, ("train", "integrate"): train_integrate,
             ("train", "converge"): train_converge,
             ("forward-port", "plan"): forward_port, ("forward-port", "run"): forward_port, ("forward-port", "status"): forward_port,
-            **{("release", c): release_cmd for c in ("candidate-tag", "promote", "verify", "final-tag")},
+            **{("release", c): release_cmd for c in (*RELEASE_STEPS, "run")},
             ("protection", "snapshot"): protection_cmd, ("protection", "verify"): protection_cmd}
 
 
