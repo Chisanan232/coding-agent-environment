@@ -2,7 +2,7 @@
 """Third heavy lane in the stable tier (SPE-176, ADR 0017 revision 12).
 
 `heavy_lane_cap` gives lane 3 to every tier in THIRD_LANE_TIERS (stable and wide) while THIRD_LANE_ENABLED; lane 4 stays wide-only
-behind FOURTH_LANE_ENABLED (off). The lane-3 disk margin (free - reserved - request >= 160 GiB, ADR 0017 revision 11) is unchanged, so in
+behind FOURTH_LANE_ENABLED (on since ADR 0017 revision 14). The lane-3 disk margin (free - reserved - request >= 160 GiB, ADR 0017 revision 11) is unchanged, so in
 the stable tier (free below 200 GiB) a third lane opens only while all reservations plus the request stay within 40 GiB.
 
 Every test runs against a private temporary scheduler state with throwaway /bin/sleep processes and injected free and host samples; the
