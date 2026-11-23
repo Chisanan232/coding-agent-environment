@@ -458,6 +458,16 @@ class VersionBranches(unittest.TestCase):
         with self.assertRaises(ValueError):
             omg.load_version_policy(bad)
 
+    def test_release_lines_keys_are_ignored_by_the_gate(self):
+        """release_lines is validated by scripts/release-line.py only; it can neither approve nor block a base (SPE-181a)."""
+        entry = dict(POLICY["repos"]["Chisanan232/r"])
+        with_lines = {"schema": 1, "repos": {"Chisanan232/r": dict(entry, release_lines={
+            "schema": 1, "lines": [{"id": "v9", "kind": "major", "major": 9, "integration_branch": "integration/v9.x"}], "unknown": "x"})}}
+        self.assertEqual(omg.load_version_policy(with_lines), omg.load_version_policy(POLICY))
+        self.refused(Fake(baseRefName="integration/v9.x"), "BASE_NOT_DEFAULT_OR_DEPLOY", with_lines)
+        v, reasons, _ = self.evaluate(Fake(baseRefName="integration/mvp-5.0"), with_lines)
+        self.assertEqual((v, reasons), ("PASS", []))
+
     def test_approved_base_still_needs_review_ci_and_threads(self):
         base = "integration/mvp-5.0"
         self.refused(Fake(baseRefName=base, comments=[]), "NO_REVIEW_EVIDENCE")
