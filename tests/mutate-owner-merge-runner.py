@@ -15,6 +15,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNNER = "scripts/owner-merge-runner.py"
 ALLOW_FD = "        if {}:\n            bad.append(f\"{{label}} is"
 MUTANTS = [
+    ("local_gate_only mode dispatch", '    if cfg.get("local_gate_only"):\n        return check_local_gate_base(runner, repo, base)\n', ''),
+    ("local_gate_only config strictness", 'ok = ok and (not gate_only or (cfg["required_checks"] == [] and local_gate and prot is True', 'ok = ok and (True or (cfg["required_checks"] == [] and local_gate and prot is True'),
+    ("local_gate_only absent protection", '            raise Refused(["local_gate_only: the base branch has no branch protection"])', '            pass'),
+    ("local_gate_only protection field check", '        if not isinstance(sub, dict) or sub.get("enabled") is not want:', '        if False:'),
+    ("local_gate_only bypass actors", '        if actors:\n            raise Refused(["local_gate_only: a ruleset allows bypass actors"])', '        pass'),
+    ("local_gate_only ruleset unreadable", '        if rc != 0 or not isinstance(actors, list) or not all(isinstance(a, dict) for a in actors):\n            raise Refused(["local_gate_only', '        if False:\n            raise Refused(["local_gate_only'),
     ("head pin", '    if observed != head:\n        bad.append("observed head differs from expected head")', '    if False:\n        bad.append("observed head differs from expected head")'),
     ("pre-exec full re-evaluation removed", '            observed2, class2, checks2, rec["server_side"], _ = evaluate(runner, repo, pr, head, me, cfg, evidence, key, clock, pin)', '            observed2, class2, checks2 = head, rec["class"], rec["checks"]'),
     ("pre-exec class compare", 'or class2 != rec["class"]', 'or False'),
