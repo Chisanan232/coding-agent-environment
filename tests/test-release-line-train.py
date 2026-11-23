@@ -337,7 +337,9 @@ class TrainTests(TrainBase):
 
     def test_unreachable_origin_is_refused_for_guard_and_ensure(self):
         self.install(self.v0_only_policy())
-        self.w("remote", "set-url", "origin", str(pathlib.Path(self.tmp.name) / "gone.git"))
+        gone = pathlib.Path(self.tmp.name) / "gone.git"
+        self.allow_origin(gone)  # owner-listed, so only the unreachable fetch is under test
+        self.w("remote", "set-url", "origin", str(gone))
         self.assertIn("FETCH_FAILED", self.codes(self.guard("integration/v0.x", "HEAD")[1]))
         self.assertIn("FETCH_FAILED", self.codes(self.ensure("0.3.0")[1]))
 

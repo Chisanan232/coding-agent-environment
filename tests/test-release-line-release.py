@@ -749,6 +749,32 @@ class OriginBinding(Rel):
         self.assertEqual(self.refused(self.rel("candidate-tag", execute=True)[1]), "ORIGIN_MISMATCH")
         self.assertFalse(marker.exists())
 
+    def test_hostile_per_url_and_per_remote_config_is_refused_and_never_runs(self):
+        marker = pathlib.Path(self.tmp.name) / "hostile-ran"
+        script = pathlib.Path(self.tmp.name) / "hostile2.sh"
+        script.write_text(f"#!/bin/sh\ntouch {marker}\nexec git-upload-pack \"$@\"\n")
+        script.chmod(0o755)
+        self.go()
+        hostile = (("remote.origin.proxy", "http://127.0.0.1:9"), ("remote.origin.uploadpack", str(script)), ("remote.origin.receivepack", str(script)),
+                   ("http.https://github.com/.proxy", "http://127.0.0.1:9"), ("http.https://github.com/.sslVerify", "false"),
+                   ("http.https://github.com/.sslCAInfo", "/tmp/ca.pem"), ("http.https://github.com/.extraHeader", "X-A: b"),
+                   ("filter.evil.clean", str(script)), ("diff.external", str(script)), ("core.gitProxy", str(script)))
+        for key, val in hostile:
+            self.w("config", key, val)
+            rc, out, _ = self.rel("candidate-tag", execute=True)
+            self.assertEqual((rc, self.refused(out)), (1, "CLONE_CONFIG_HOSTILE"), key)
+            self.assertIn(key.lower().split("/")[0].split(".")[0], self.step(out, "refused")["evidence"]["detail"].lower())
+            self.w("config", "--unset", key)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.pushes(), [])
+        self.assertNotEqual(self.refused(self.rel("candidate-tag")[1]), "CLONE_CONFIG_HOSTILE")  # clean again
+        # the -c overrides are also in force for every git call the tool makes
+        mod = self.probe()
+        self.w("config", "http.sslVerify", "false")
+        for key, want in (("http.sslVerify", "true"), ("remote.origin.uploadpack", "git-upload-pack"), ("remote.origin.receivepack", "git-receive-pack"),
+                          ("remote.origin.proxy", ""), ("http.extraHeader", ""), ("http.sslCAInfo", "")):
+            self.assertEqual(mod.git(self.work, "config", "--get", key)[1].strip(), want, key)
+
     def test_hostile_clone_config_levers_are_neutralized(self):
         marker = pathlib.Path(self.tmp.name) / "config-ran"
         script = pathlib.Path(self.tmp.name) / "hostile.sh"
