@@ -39,7 +39,7 @@ class Packaging(unittest.TestCase):
         text = (SKILL / 'SKILL.md').read_text()
         for required in ['Never force-push', 'Never run `gh workflow run`', 'Never admin-merge',
                          'owner-merge exception', 'recorded owner GO', 'scripts/release-line.py',
-                         '/Users/bryant/Bryant-Developments/coding-agent-environment-main-view/scripts/release-line.py']:
+                         '$HOME/Bryant-Developments/coding-agent-environment-main-view/scripts/release-line.py', '--repo OWNER/REPO']:
             with self.subTest(required=required):
                 self.assertIn(required, text)
         everything = text + (SKILL / 'references/algorithms.md').read_text()
@@ -52,7 +52,7 @@ class Packaging(unittest.TestCase):
 
     def test_release_preparation_pointer_keeps_the_gate(self):
         text = (ROOT / '.claude/skills/release-preparation/SKILL.md').read_text()
-        self.assertIn('except via `release-line` under a recorded GO', text)
+        self.assertIn('run only under a recorded owner GO; otherwise stop and report BLOCKED', text)
 
 
 class Install(unittest.TestCase):

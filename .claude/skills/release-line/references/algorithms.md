@@ -25,7 +25,7 @@ Evidence order: already an ancestor, trailer on target, equal patch-id, open PR 
 
 ## GO records and owner pin files
 - Merge eligibility comes only from `branches` in the owner policy; the tool never edits it.
-- Publication authority is a per-version GO record under `~/.config/coding-agent-environment/local/release-go/<owner>__<repo>__<version>.json` with `repo`, `version`, `candidate_tag`, `candidate_sha`, `publication_base`, `scopes` (`candidate_tag|promote|final_tag|publish`), `authority`, `created_utc`, optional `expires_utc`. A repo or SHA mismatch is refused. The owner writes it; an agent never does.
+- Publication authority is a per-version GO record under `~/.config/coding-agent-environment/local/release-go/<owner>__<repo>__<version>.json` with `repo`, `version`, `candidate_tag`, `candidate_sha`, `publication_base`, `scopes` (`candidate_tag|promote|final_tag|publish`), `authority`, `created_utc`, optional `expires_utc`. A repo or SHA mismatch is refused. The owner writes it; an agent never does. (Consumed by the release commands of later slices; no command on this base reads it.)
 - Proposals (`registry propose`, `audit import`) are written under `~/.local/state/coding-agent-environment/release-line/<owner>__<repo>/proposals/` as `.candidate.json` plus `.authority.json`; the owner reviews and installs them.
 
 ## Zero-spend rule

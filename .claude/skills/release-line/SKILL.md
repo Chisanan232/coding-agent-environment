@@ -15,9 +15,11 @@ eligibility stays with the owner merge gate; this skill never changes it.
 Call the tool by absolute path from the maintained checkout. It is stdlib only.
 
 ```bash
-R=/Users/bryant/Bryant-Developments/coding-agent-environment-main-view/scripts/release-line.py
+R="$HOME/Bryant-Developments/coding-agent-environment-main-view/scripts/release-line.py"
 python3 -I "$R" --help
 ```
+
+Every command takes `--repo OWNER/REPO` (the registered product repo) and, for commands that read git state, `--clone PATH` (a checkout whose `origin` is that repo). Exit codes: 0 for PASS, NOT_RUN or DEFERRED; 1 for BLOCKED or FAIL; 2 for a usage error; 3 for invalid configuration.
 
 Commands that exist today are documented in
 `docs/RELEASE-LINES.md` of that checkout: `registry validate|show|propose`,
@@ -28,9 +30,9 @@ publication commands are documented in `docs/RELEASE-LINES.md` once merged; do n
 assume them.
 
 ## Steps
-1. `registry validate` first. `AUDIT_PENDING` blocks every mutating command; read-only commands still work.
-2. Route new work with `route --kind feature|fix --version V`. `NEEDS_SUCCESSOR` blocks only that work.
-3. Before opening a PR, run `guard --base B --head SHA` and act on its finding.
+1. `registry validate --repo OWNER/REPO` first. `AUDIT_PENDING` blocks every mutating command; read-only commands still work.
+2. Route new work with `route --repo OWNER/REPO --clone PATH --kind feature|fix --version V`. `NEEDS_SUCCESSOR` blocks only that work.
+3. Before opening a PR, run `guard --repo OWNER/REPO --clone PATH --base B --head SHA` and act on its finding.
 4. Mutating commands print a dry plan by default. Review it, then rerun with `--execute`.
 5. After a maintenance fix merges, run `forward-port plan` then `forward-port run --execute`; confirm with `status` until `complete` is true.
 6. Report the JSON `status` verbatim (PASS, FAIL, BLOCKED, NOT_RUN, DEFERRED) with the command, revision and exit code.

@@ -66,6 +66,6 @@ the remaining release handoff if action is required. Internal file/version edits
 and successful preparation steps belong in the diff/state, not a status template.
 
 ## Safe-Fix Guidance
-- Do not create a tag manually — the automated workflow owns tagging, except via `release-line` under a recorded GO.
+- Do not create a tag manually — the automated workflow owns tagging. A multi-line product's gated tag commands (`release-line`, once merged) run only under a recorded owner GO; otherwise stop and report BLOCKED.
 - Do not push the version bump commit — let the automated workflow pull it.
 - If the last tag cannot be determined, stop and ask the engineer.
