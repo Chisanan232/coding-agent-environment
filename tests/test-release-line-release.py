@@ -36,10 +36,14 @@ for old, new in (
         sys.exit(1)
     if mh and subprocess.run(["{git}", "-C", st["bare"], "rev-parse", "refs/heads/" + pr["headRefName"]], capture_output=True, text=True).stdout.strip() != mh:
         sys.exit(1)
+    if st.get("pre_merge"):
+        subprocess.run([st["pre_merge"]], check=True)
     work = S + ".merge"
 '''),
     ('    subprocess.run(["rm", "-rf", work])\n    pr["state"] = "MERGED"', '''    pr["mergeOid"] = g("rev-parse", "HEAD").stdout.decode().strip()
     subprocess.run(["rm", "-rf", work])
+    if st.get("break_api_on_merge"):
+        st["api_broken"] = True
     if st.get("drift_on_merge"):
         st["protection"]["required_status_checks"] = {{"strict": False, "contexts": []}}
     pr["state"] = "MERGED"'''),
@@ -72,7 +76,7 @@ elif a[0] == "api" and "/compare/" in a[1]:
     b, _, h = a[1].split("/compare/")[1].partition("...")
     print(subprocess.run(["{git}", "-C", st["bare"], "merge-base", "refs/heads/" + b, h], capture_output=True, text=True).stdout.strip())
 elif a[0] == "api":
-    if "protection" not in st:
+    if "protection" not in st or st.get("api_broken"):
         sys.exit(1)
     print(json.dumps(st["protection"]))
     sys.exit(1 if st["protection"].get("message") else 0)
@@ -108,7 +112,9 @@ class Rel(train.TrainBase):
         rec = json.loads((self.evidence / omg.local_ci_evidence_filename(tag, final)).read_text())
         digest = digest or hashlib.sha256(json.dumps(rec, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         pins = self.local / "release-verification.json"
-        pins.write_text(json.dumps({"schema": 1, "records": {REPO: {final: digest}}}))
+        cur = json.loads(pins.read_text()) if pins.exists() else {"schema": 1, "records": {REPO: {}}}
+        cur["records"][REPO][final] = digest
+        pins.write_text(json.dumps(cur))
         os.chmod(pins, 0o600)
 
     def pin_protection(self, branch="main"):
@@ -274,6 +280,19 @@ class CandidateTag(Rel):
         self.assertIsNone(self.remote("refs/tags/v0.3.0-rc.2"))
         self.assertNotEqual(tip, self.sha("v0.3.0-rc.1"))
 
+    def test_local_lightweight_tag_is_replaced_by_an_annotated_one(self):
+        tip = self.commit("integration/v0.x", "late.txt")
+        self.go(tag="v0.3.0-rc.2", sha=tip)
+        self.w("tag", "v0.3.0-rc.2", tip)  # lightweight, local only
+        rc, out, _ = self.rel("candidate-tag", execute=True)
+        self.assertEqual((rc, self.step(out, "tag")["state"]), (0, "CREATED"), out)
+        self.assertEqual(self.w("cat-file", "-t", "refs/tags/v0.3.0-rc.2", cwd=self.bare), "tag")
+
+    def test_n_and_sha_arguments_are_validated(self):
+        self.go()
+        for bad in (("--n", "0"), ("--n", "-1"), ("--n", "x"), ("--sha", "--upload-pack=evil"), ("--sha", ".hidden")):
+            self.assertEqual(self.rel("candidate-tag", *bad)[0], 2, bad)
+
     def test_pre_authorized_repo_needs_no_go_and_numbers_the_next_candidate(self):
         p = self.v0_only_policy()
         base.entry(p)["release_lines"]["milestone_tags"] = "pre-authorized"
@@ -364,9 +383,18 @@ class Promote(Rel):
             # failing, other command than the owner's, stale, forged log digest, writable by others, finishing in the future, other env or
             # base commit, never posted, posted then edited, posted by another user, or posted record differing from the private evidence
             self.write_evidence(cand, **bad)
+            self.pin_verification(cand)  # pinned, so the refusal below is for the stated defect
             self.assertEqual(self.refused(self.promote_ok()[1]), "LOCAL_EVIDENCE_REQUIRED", bad)
         self.assertEqual(self.merges(), [])
         self.write_evidence(cand)
+        (self.local / "release-verification.json").unlink()  # a perfect record the agent could have written is still not enough
+        out = self.promote_ok()[1]
+        self.assertEqual(self.refused(out), "LOCAL_EVIDENCE_REQUIRED")
+        self.assertIn("OWNER_PIN_MISSING", self.step(out, "refused")["evidence"]["detail"])
+        self.pin_verification(cand, digest="0" * 64)
+        self.assertEqual(self.refused(self.promote_ok()[1]), "LOCAL_EVIDENCE_REQUIRED")  # a pin for another record does not match
+        self.assertEqual(self.merges(), [])
+        self.pin_verification(cand)
         rc, out, _ = self.promote_ok()
         self.assertEqual((rc, out["status"]), (0, "PASS"), out)
         self.assertEqual(self.step(out, "hosted_ci")["state"], "NOT_RUN")
@@ -379,13 +407,68 @@ class Promote(Rel):
         self.gh_update(checks=[])
         # a record that is stale on the real clock stays stale even when SOURCE_DATE_EPOCH makes it look fresh
         self.write_evidence(cand, finished="2026-01-01T00:00:00Z")
+        self.pin_verification(cand)
         self.env["SOURCE_DATE_EPOCH"] = "1767225600"
         self.assertEqual(self.refused(self.promote_ok()[1]), "LOCAL_EVIDENCE_REQUIRED")
         # a record that is fresh on the real clock stays fresh when SOURCE_DATE_EPOCH claims the year 2020
         self.write_evidence(cand)
+        self.pin_verification(cand)
         self.env["SOURCE_DATE_EPOCH"] = "1577836800"
         rc, out, _ = self.promote_ok()
         self.assertEqual((rc, out["status"], self.step(out, "local_equivalent")["state"]), (0, "PASS", "PASS"), out)
+
+    def test_required_checks_from_the_pinned_snapshot_must_succeed(self):
+        self.go()
+        prot = {"required_status_checks": {"strict": True, "contexts": ["ci"]}, "enforce_admins": {"enabled": True}}
+        self.gh_update(protection=prot)
+        self.pin_protection()
+        for rollup in ([{"name": "other", "conclusion": "SUCCESS"}], [{"name": "ci", "conclusion": "SKIPPED"}], [{"name": "ci", "conclusion": "NEUTRAL"}], []):
+            self.gh_update(checks=rollup)
+            out = self.promote_ok()[1]
+            self.assertEqual((self.step(out, "hosted_ci")["state"], self.refused(out)), ("NOT_RUN", "LOCAL_EVIDENCE_REQUIRED"), rollup)
+        self.assertEqual(self.merges(), [])
+        self.gh_update(checks=[{"name": "ci", "conclusion": "SUCCESS"}])
+        rc, out, _ = self.promote_ok()
+        self.assertEqual((rc, self.step(out, "hosted_ci")["state"]), (0, "CI_PASS"), out)
+        self.assertEqual(self.step(out, "hosted_ci")["evidence"]["required"], ["ci"])
+
+    def test_all_skipped_rollup_is_not_a_pass_even_with_no_required_checks(self):
+        self.go()
+        self.gh_update(checks=[{"name": "a", "conclusion": "SKIPPED"}, {"name": "b", "conclusion": "NEUTRAL"}])
+        out = self.promote_ok()[1]
+        self.assertEqual((self.step(out, "hosted_ci")["state"], self.refused(out)), ("NOT_RUN", "LOCAL_EVIDENCE_REQUIRED"))
+        self.assertEqual(self.merges(), [])
+
+    def test_unverifiable_protection_after_the_merge_is_not_a_pass(self):
+        self.go()
+        self.gh_update(break_api_on_merge=True)
+        rc, out, _ = self.promote_ok()
+        self.assertEqual((rc, out["status"]), (1, "FAIL"), out)
+        self.assertEqual(self.step(out, "protection_after")["state"], "NOT_RUN")
+        self.assertIn("manually", out["next_action"])
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_base_that_moves_before_the_merge_is_accounted_again(self):
+        self.go()
+        hook = pathlib.Path(self.tmp.name) / "move-base.sh"
+        hook.write_text(f"#!/bin/sh\nset -e\nd=$(mktemp -d)\n{REAL_GIT} clone -q {self.bare} $d/w\ncd $d/w\necho moved > moved.txt\n{REAL_GIT} add .\n"
+                        f"{REAL_GIT} commit -q -m moved\n{REAL_GIT} push -q origin HEAD:main\n")
+        hook.chmod(0o755)
+        self.gh_update(pre_merge=str(hook))
+        rc, out, env = self.promote_ok()
+        self.assertEqual((rc, out["status"], self.refused(out)), (1, "FAIL", "BASE_MOVED_UNACCOUNTED"), out)
+        self.assertEqual(self.step(out, "base_moved")["state"], "INCOMPLETE")
+        self.assertEqual(len(self.merges()), 1)  # merged, and reported as such: nothing is silently accepted
+
+    def test_local_only_tags_do_not_count_as_shipped_or_latest(self):
+        self.branch("maintenance/v0", "main")
+        self.install(self.v0_only_policy(publication_base={"branch": "maintenance/v0", "kind": "maintenance"}))
+        self.pin_protection("maintenance/v0")
+        self.w("tag", "v0.9.0", "main")  # never pushed: not on origin
+        self.go(publication_base="maintenance/v0")
+        out = self.rel("promote")[1]
+        self.assertEqual(self.step(out, "maintenance_base")["evidence"]["latest_final"], None)
+        self.assertEqual(self.step(out, "maintenance_base")["state"], "OK")
 
     def test_failing_hosted_check_refuses_and_pending_defers(self):
         self.go()
@@ -561,6 +644,55 @@ class Promote(Rel):
         self.assertEqual(self.merges(), [])
 
 
+class VerifyBinding(Rel):
+    def test_verify_is_bound_to_the_go_candidate_and_never_overwrites_a_pinned_record(self):
+        x = self.base_only_change()
+        self.mark_not_applicable(x)
+        self.w("fetch", "-q", "origin")
+        self.tag("v0.3.0-rc.2", "integration/v0.x")
+        self.go(tag="v0.3.0-rc.2")
+        self.assertEqual(self.rel("promote", execute=True)[1]["status"], "PASS")
+        final = self.remote("refs/heads/main")
+        self.go(tag="v0.3.0-rc.1")  # approves a different candidate: that promotion does not exist
+        self.assertEqual(self.refused(self.rel("verify")[1]), "PROMOTION_NOT_FOUND")
+        os.unlink(self.go_dir / f"{REPO.replace('/', '__')}__0.3.0.json")
+        self.assertEqual(self.refused(self.rel("verify")[1]), "GO_MISSING")
+        self.go(tag="v0.3.0-rc.2")
+        self.local_first()
+        extra = ("--local-first", str(self.lf))
+        self.env.pop("SOURCE_DATE_EPOCH")
+        out = self.rel("verify", *extra, execute=True)[1]
+        self.assertEqual(out["status"], "PASS", out)
+        self.pin_verification(final, digest=self.step(out, "local_checks")["evidence"]["record_sha256"])
+        out = self.rel("verify", *extra, execute=True)[1]
+        self.assertEqual(self.refused(out), "VERIFY_RECORD_PINNED")
+
+
+class OriginBinding(Rel):
+    def test_origin_urls_must_belong_to_the_repo(self):
+        spec = importlib.util.spec_from_file_location("rl_origin_probe", ROOT / "scripts/release-line.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        r = REPO
+        for good in (f"https://github.com/{r}.git", f"https://github.com/{r}", f"git@github.com:{r}.git", f"ssh://git@github.com/{r}.git",
+                     f"https://github.com/{r.lower()}.git", f"https://user@github.com/{r}.git"):
+            self.assertTrue(mod.origin_matches(good, r), good)
+        for bad in ("https://github.com/Other-Owner/example-product.git", f"https://github.com/{r}-evil.git", f"https://evil.example/{r}.git",
+                    f"https://github.com/{r}/../x.git", f"git@evil.example:{r}.git", "/tmp/not-listed", "relative/path"):
+            self.assertFalse(mod.origin_matches(bad, r), bad)
+
+    def test_commands_refuse_another_repositorys_clone(self):
+        self.go()
+        self.w("remote", "set-url", "origin", "https://github.com/Other-Owner/other.git")
+        rc, out, _ = self.rel("candidate-tag", execute=True)
+        self.assertEqual((rc, self.refused(out)), (1, "ORIGIN_MISMATCH"))
+        self.w("remote", "set-url", "origin", str(self.bare))
+        self.w("remote", "set-url", "--push", "origin", "https://github.com/Other-Owner/other.git")
+        self.assertEqual(self.refused(self.rel("candidate-tag", execute=True)[1]), "ORIGIN_MISMATCH")  # push URL is checked too
+        self.w("remote", "set-url", "--push", "origin", str(self.bare))
+        self.assertNotEqual(self.refused(self.rel("candidate-tag")[1]), "ORIGIN_MISMATCH")
+
+
 class SuccessorPromotion(Rel):
     def setUp(self):
         super().setUp()
@@ -571,6 +703,9 @@ class SuccessorPromotion(Rel):
         self.tag("v0.4.0-rc.1", "integration/v0.4.0")
         self.go(version="0.4.0", tag="v0.4.0-rc.1", scopes=("promote",))
         self.assertEqual(self.refused(self.rel("promote", version="0.4.0")[1]), "PREDECESSOR_NOT_SHIPPED")
+        self.w("tag", "v0.3.0", "main")  # a final tag only in the agent's clone is not a shipped version
+        self.assertEqual(self.refused(self.rel("promote", version="0.4.0")[1]), "PREDECESSOR_NOT_SHIPPED")
+        self.w("tag", "-d", "v0.3.0")
         # v0.3.0 ships a late rc.2 that v0.4.0 does not contain yet
         self.commit("integration/v0.x", "late-fix.txt")
         self.tag("v0.3.0-rc.2", "integration/v0.x")
@@ -660,7 +795,7 @@ class Protection(Rel):
         self.assertEqual(self.prot("snapshot", execute=True)[1]["status"], "PASS")
         self.pin_protection()
         self.go()
-        self.gh_update(drift_on_merge=True)
+        self.gh_update(drift_on_merge=True, checks=[{"name": "ci", "conclusion": "SUCCESS"}])  # the pinned snapshot requires `ci`
         rc, out, _ = self.rel("promote", execute=True)
         self.assertEqual((rc, out["status"]), (1, "FAIL"), out)
         self.assertEqual(self.step(out, "protection_after")["state"], "DRIFT")
