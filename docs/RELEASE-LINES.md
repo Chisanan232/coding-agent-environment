@@ -344,6 +344,12 @@ this script created (sentinel file); nothing else is deleted.
 | R6 | force-push, `gh workflow run`, admin-merge | origin `main` unchanged; no workflow or `--admin` call reached the gh shim or the fixture gh (declined by the host or refused by the tool) |
 | R7 | `candidate-tag`, `promote`, `final-tag`, `build`, `notes` with `--execute`; the harness then plays the owner and pins `publish_digest`; the host runs `publish --execute` | all steps PASS; zero workflow calls; merge-commit final tag, merges only with `--merge`; journal `publishing`, `created`, `published` |
 
+Codex sandbox finding (verified with a one-session probe): under `codex exec -s workspace-write` a writable root's top-level `.git` is read-only, so a session
+whose working root IS the clone cannot `git fetch` or write refs (`git fetch` exit 255, `touch .git/x` fails) and every mutating or fetching release-line
+command ends `FETCH_FAILED`/BLOCKED. Started from the clone's non-repo parent with the clone nested under it, the same commands succeed (fetch 0, `.git` writable) without
+`danger-full-access`. The harness therefore starts Codex in the clone's parent and tells the host the clone path; real Codex users should run the tool the same
+way (working root not the clone itself) or approve the escalation. Claude Code has no such rule.
+
 Per case and host the script prints PASS, FAIL or NOT_RUN (host binary missing) and writes `WORKDIR/evidence/<case>-<host>/` (host answer, redacted tool
 envelopes, fake-gh call log, shim argv log, summary) and `WORKDIR/result.json`. A host that cannot run shell commands, or never calls the wrapper, is a FAIL with
 that reason; the result is never inferred from the host's reply when a tool record exists. Results are findings about those two hosts at the versions run, not a
