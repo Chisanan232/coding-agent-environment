@@ -739,7 +739,7 @@ class EvidenceBindingAndAge(Base):
         gh = FakeGh(base_pr(baseRefName="release/1.x"))
         self.assertEqual(self.go(gh)[0], omr.EXIT_OK)
         reads = [c[1] for c in gh.calls if c[0] == "api" and c[1].startswith("repos/")]
-        self.assertIn(f"repos/{REPO}/rules/branches/release/1.x", reads)
+        self.assertIn(f"repos/{REPO}/rules/branches/release/1.x?per_page=100", reads)
         self.assertIn(f"repos/{REPO}/branches/release/1.x/protection", reads)
 
     def test_readback_with_changed_base_is_an_incident_with_its_own_exit_code(self):
@@ -1409,6 +1409,7 @@ class ArgvFixedness(Base):
                ["pr", "merge", "7", "--repo", REPO, "--squash", "--match-head-commit", HEAD],
                ["pr", "merge", "7", "--repo", REPO, "--merge", "--match-head-commit", "x" * 40],
                ["api", "repos/a/b/branches/main"], ["api", "repos/a/b/rules/branches/../x"],
+               ["api", "repos/a/b/rules/branches/main"], ["api", "repos/a/b/rules/branches/main?per_page=1000"],
                ["api", f"repos/{REPO}/branches/main/protection", "-X", "DELETE"],
                ["pr", "close", "7", "--repo", REPO], ["api", "user", "-X", "POST"],
                ["pr", "view", "7", "--repo", REPO, "--json", "body"], ["api", "repos/a/b/pulls/7/merge"]]
@@ -2447,6 +2448,35 @@ class LocalGateOnly(Base):
                     self.assertRefused(self.gh(rules=[{"type": "deletion", "ruleset_id": 11}, bad]), "ruleset_id")
         self.assertRefused(self.gh(rules={"type": "deletion"}), "malformed")
         self.assertRefused(self.gh(rules=["x"]), "malformed")
+
+    def test_bypass_pull_request_allowances_refuse_unless_empty_or_absent(self):
+        def prr(allow):
+            return self.prot(required_pull_request_reviews={"required_approving_review_count": 0,
+                                                            "bypass_pull_request_allowances": allow})
+        for who in ("users", "teams", "apps"):
+            for accept in (False, True):
+                self.cfg(accept_bypass_actors=accept)
+                with self.subTest(who=who, accept=accept):
+                    self.assertRefused(self.gh(protection=prr({"users": [], "teams": [], "apps": [], who: [{"login": "x"}]})),
+                                       "bypass_pull_request_allowances")
+        self.cfg()
+        for bad in (None, [], "x", {"users": "x"}, {"teams": None}, {"apps": {"a": 1}}):
+            with self.subTest(bad=bad):
+                self.assertRefused(self.gh(protection=prr(bad)), "bypass_pull_request_allowances")
+        for ok in ({}, {"users": [], "teams": [], "apps": []}):
+            code, rec = self.go(self.gh(protection=prr(ok)), dry=True)
+            self.assertEqual(code, omr.EXIT_OK, rec)
+        code, rec = self.go(self.gh(), dry=True)  # key absent altogether
+        self.assertEqual(code, omr.EXIT_OK, rec)
+
+    def test_rules_are_read_with_per_page_100_and_a_full_page_refuses(self):
+        gh = self.gh()
+        self.assertEqual(self.go(gh, dry=True)[0], omr.EXIT_OK)
+        self.assertIn(["api", f"repos/{REPO}/rules/branches/main?per_page=100"], gh.calls)
+        full = [{"type": "deletion", "ruleset_id": 11}] * 100
+        self.assertRefused(self.gh(rules=full), "100 or more")
+        code, rec = self.go(self.gh(rules=full[:99]), dry=True)
+        self.assertEqual(code, omr.EXIT_OK, rec)
 
     def test_audit_facts_record_the_pull_request_requirement(self):
         code, rec = self.go(self.gh(), dry=True)
