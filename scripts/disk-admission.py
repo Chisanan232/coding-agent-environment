@@ -3447,6 +3447,18 @@ def _third_lane_refusal(lane, free, reserved, nbytes):
     return 'budget: lane 3 needs %.1f GiB free after all reservations and this request, %.0f GiB required' % (left / GIB, need / GIB)
 
 
+def _fourth_lane_margin_refusal(lane, free, reserved, nbytes):
+    """Why lane 4 is refused for want of disk margin, or None: with four-lane mode on, the free space left after every reservation and
+    this request must stay at or above FOURTH_LANE_MARGIN. Any other lane, or four-lane mode off, is None. Pure: no I/O, no latch,
+    independent of the host sample. Head protection uses it for the head's own lane, mirroring _third_lane_refusal."""
+    if lane != 4 or not _four_lane_mode():
+        return None
+    left = free - reserved - nbytes
+    if left >= FOURTH_LANE_MARGIN:
+        return None
+    return 'budget: lane 4 needs %.1f GiB free after all reservations and this request, %.0f GiB required' % (left / GIB, FOURTH_LANE_MARGIN / GIB)
+
+
 def _lane_refusal(budget, in_use, free, reserved, nbytes, entry=None):
     """The one budget-side refusal at a lane site. With four-lane mode on, lanes 3 and 4 are given only to a stamped queue entry
     (an unstamped head blocks the queue: first in, first out beats utilisation); lane 4 also needs _fourth_lane_refusal's capacity.
@@ -3528,6 +3540,8 @@ def _protects_head(host, head, cand, blockers, live, orphans, granted, now, lane
     # The head takes the lane after the candidate's, once the blockers have released: the same lane-3 disk margin must hold for it,
     # or a candidate could be judged protective and the head then refused at lane 3 (starvation).
     ok = ok and not _third_lane_refusal(in_use + 2 - len(blockers), free, reserved + cand['bytes'], head['bytes'])
+    # Lane 4 has the same starvation shape: a candidate must not use up the 200 GiB margin the head will need once it is the fourth job.
+    ok = ok and not _fourth_lane_margin_refusal(in_use + 2 - len(blockers), free, reserved + cand['bytes'], head['bytes'])
     try:
         gone = {b['label'] for b in blockers}
         holders = [h for h in budget_holders(live, orphans, granted, now) if not (h['kind'] == 'reservation' and h['label'] in gone)]
@@ -3647,18 +3661,20 @@ def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans,
 # The closed vocabulary of `backfill-decision` reasons, one per refusal site of a backfill candidate (SPE-176 decision log). `qualified`
 # is the grant; `memory-gate` and `in-flight-cap` are the refusals made by advance itself rather than by _backfill_candidate.
 BACKFILL_DECISION_REASONS = ('qualified', 'key-overlap-pivot', 'key-overlap-skipped', 'no-requeue-capability', 'waiter-not-alive', 'disk-floor',
-                             'lane-refusal', 'head-unprotected-disk', 'head-unprotected-lanes', 'head-unprotected-lane3-margin', 'head-unprotected-budget',
+                             'lane-refusal', 'head-unprotected-disk', 'head-unprotected-lanes', 'head-unprotected-lane3-margin', 'head-unprotected-lane4-margin', 'head-unprotected-budget',
                              'head-unprotected-hysteresis', 'memory-gate', 'in-flight-cap', 'other')
 
 
 def _head_unprotected_part(math, blockers):
-    """Which part of _protects_head refused, from the figures it returns: disk first, then lanes, then the lane-3 margin, then the grant-time hysteresis (only when every other part passed), else the budget (memory, CPU, band)."""
+    """Which part of _protects_head refused, from the figures it returns: disk first, then lanes, then the lane-3 margin, then the lane-4 margin, then the grant-time hysteresis (only when every other part passed), else the budget (memory, CPU, band)."""
     if math['disk_left'] < HEAVY_FLOOR:
         return 'head-unprotected-disk'
     if math['in_use'] + 1 - len(blockers) >= math['cap']:
         return 'head-unprotected-lanes'
     if _third_lane_refusal(math['in_use'] + 2 - len(blockers), math['free'], math['reserved'] + math['cand_bytes'], math['head_bytes']):
         return 'head-unprotected-lane3-margin'
+    if _fourth_lane_margin_refusal(math['in_use'] + 2 - len(blockers), math['free'], math['reserved'] + math['cand_bytes'], math['head_bytes']):
+        return 'head-unprotected-lane4-margin'
     if math.get('hysteresis_refused'):
         return 'head-unprotected-hysteresis'
     return 'head-unprotected-budget'
