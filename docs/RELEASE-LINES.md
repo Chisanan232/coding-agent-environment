@@ -1,6 +1,6 @@
 # Release lines
 
-Status: slices 1 and 2 of the SPE-180 design (SPE-181a registry and routing, SPE-182 successor train). This page documents what `scripts/release-line.py` implements today and lists
+Status: slices 1 to 3 of the SPE-180 design (SPE-181a registry and routing, SPE-182 successor train, SPE-183 forward-port). This page documents what `scripts/release-line.py` implements today and lists
 later slices as planned. Nothing here changes the merge gate.
 
 ## Why
