@@ -250,6 +250,48 @@ when the owner pins its sha256 under `snapshots.<repo>.<branch>` in `~/.config/c
 `NO_SNAPSHOT`, `SNAPSHOT_TAMPERED`). `protection verify` reports `PROTECTION_DRIFT` (FAIL) with the owner-run `branch-protection-rollout.py` rollback; `promote --execute`
 refuses without a pinned snapshot and compares before and after the merge. The tool never changes protection.
 
+## Release: build, notes, publish, run (SPE-184b)
+
+```
+python3 -I $R release build   --version V [--line L] [--build-timeout S] --repo OWNER/REPO --clone PATH [--execute]
+python3 -I $R release notes   --version V [--line L] --repo OWNER/REPO --clone PATH [--execute]
+python3 -I $R release publish --version V [--line L] [--backend gh] --repo OWNER/REPO --clone PATH [--execute]
+python3 -I $R release run --until candidate-tag|promote|verify|final-tag|build|notes|publish --version V [--line L] --repo OWNER/REPO --clone PATH [--execute]
+```
+
+All three use the key `release:<repo>:<version>:<final_sha>` and default to a dry plan. The final SHA is recomputed every time from git and GitHub, never from
+the journal or the state directory: the `tag_format` tag must exist on origin and peel to a promotion merge on the publication base (`final^2` is the candidate,
+`final^{tree}` is the predicted tree, cross-checked with the promotion PR), and a final tree that differs from the candidate tree needs the same owner-pinned
+verification record as `final-tag` (`FINAL_TAG_MISSING`, `PROMOTION_ASSERTION_FAILED`, `FINAL_NOT_ON_BASE`, `PROMOTION_MISMATCH`, `FINAL_NOT_VERIFIED`).
+
+`build` runs the owner's `build.argv` from the registry (no shell, never taken from the clone) in a clean detached worktree at the final SHA with a scrubbed
+environment (`PATH`, `HOME`/`TMPDIR` in a fresh temp directory, `LANG`, `LC_ALL`, `TZ`, `SOURCE_DATE_EPOCH` = the commit time; no variable of the caller, no
+token) and a timeout (default 1800 s, at most 7200 s, the process group is killed). It fails closed, FAIL and nothing recorded: `BUILD_FAILED` (non-zero exit),
+`BUILD_TIMEOUT`, `BUILD_OUTPUT_MISSING` (an `outputs` glob matched no file), `BUILD_OUTPUT_UNSAFE` (symlink, special file or outside the tree),
+`BUILD_OUTPUT_DUPLICATE`/`BUILD_OUTPUT_NAME`/`BUILD_OUTPUT_PATTERN`, `BUILD_MUTATED_TREE` (a tracked file changed). Outputs are copied by file name to
+`releases/<version>/` and their sha256 recorded in `releases/<version>.json` and the journal. A rerun with intact copies is `REUSED`; damaged copies are rebuilt.
+
+`notes` renders `releases/<version>.notes.md` deterministically from git, GitHub and the build manifest: source branch, release line, version, promotion PR,
+candidate tag and SHA, final tag and SHA, publication base, forward-port accounting for the base-only changes before the promotion, and the artifact checksums as
+`sha256sum` lines. It prints the path, its sha256 and `publish_digest`; without `--execute` it only reports them. `BUILD_MISSING` or `ARTIFACT_TAMPERED` when the
+build is absent or its copies no longer match the manifest.
+
+`publish --backend gh` needs a GO record with the `publish` scope whose `candidate_sha` equals the promotion's candidate (`GO_MISSING`, `GO_SCOPE`, `GO_EXPIRED`,
+`GO_MISMATCH`), and, because the state directory is agent-writable, the owner's GO record must also pin `publish_digest`: the sha256 of the canonical JSON of the
+repo, version, final SHA, notes digest and every artifact digest, as printed by `release notes` (`GO_DIGEST_UNPINNED` names the value to pin, `GO_DIGEST_MISMATCH`).
+Publish re-hashes every artifact against the manifest (`ARTIFACT_TAMPERED`, `ARTIFACT_MISSING`), regenerates the notes and requires the stored file to be
+identical (`NOTES_MISSING`, `NOTES_TAMPERED`), and uploads the bytes it just verified from a private staging directory. With `--execute` it runs
+`gh release create <tag> --repo OWNER/REPO --verify-tag --title <tag> --notes-file <notes> <files...>` for the **existing** final tag: it never creates or moves a tag,
+never uses `--clobber`, never calls `gh release upload`, and dispatches no workflow. It then downloads the assets and verifies bytes, notes and `ls-remote` of the
+tag; a difference is FAIL. An existing release with identical notes and asset bytes is `REUSED`; any difference, a draft, or a failed create leaving a partial
+release is `CONFLICT_EXISTING` or `PUBLISH_FAILED` and is never overwritten or deleted. Other backends are `UNSUPPORTED_BACKEND`; a registry `channel` other than
+`github-release` is `DEFERRED`.
+
+`run --until STEP` runs `candidate-tag`, `promote`, `verify`, `final-tag`, `build`, `notes`, `publish` in order up to STEP. Each step does its own gating, takes its own
+GO scope and lock, and recomputes its facts from git and GitHub, so a rerun resumes after an interruption and completed steps report `PASS`/`REUSED`. It stops at the
+first step that is not `PASS` (a dry run stops at the first step that would act), reports that step's status, and an exception is reported as a `REFUSED` step with
+its code and the run's status BLOCKED or FAIL. Without `--execute` nothing is changed.
+
 ## Planned (not implemented)
 
-Later slices of SPE-180: build/notes/publish (SPE-184b); skill packaging and install (SPE-181b); acceptance from installed entry points (SPE-185).
+Later slices of SPE-180: skill packaging and install (SPE-181b); acceptance from installed entry points (SPE-185).
