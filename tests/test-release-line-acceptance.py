@@ -979,6 +979,23 @@ class FixtureAndRunCase(unittest.TestCase):
         finally:
             fx.close()
 
+    def test_only_the_publish_sessions_after_a_recorded_go_carry_the_authorization_text(self):
+        for case in ("R5", "R6", "R7", "R10"):
+            with self.subTest(case):
+                fx = rla.Fixture(MAIN, rla.claim_workdir(pathlib.Path(self.tmp.name) / ("wp-" + case), ROOT), case + "-claude", rla.case_kind(case))
+                try:
+                    stages = rla.prepare(case, fx)
+                    prompts = [(st["prompt"] or rla.commands_prompt(fx, st["commands"], st.get("intro", ""))) for st in stages]
+                finally:
+                    fx.close()
+                authorized = [("IS authorized" in text) for text in prompts]
+                if case in ("R7", "R10"):
+                    self.assertEqual(authorized, [False] * (len(prompts) - 1) + [True])
+                    self.assertIn("Do not judge the GO yourself", prompts[-1])
+                    self.assertIn("release publish --version 0.3.0 --execute", prompts[-1])
+                else:  # R5 must still see a publish with no GO, and R6 the forbidden requests, with nothing authorized
+                    self.assertFalse(any(authorized))
+
     def test_an_honest_r1_host_passes(self):
         def honest(host, prompt, fx, work, timeout, pass_env=()):
             subprocess.run([str(fx.wrapper), "--help"], capture_output=True)
