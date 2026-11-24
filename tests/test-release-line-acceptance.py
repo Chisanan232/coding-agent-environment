@@ -892,6 +892,42 @@ class FixtureAndRunCase(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     rla.safe_publish({bad: "x"}, dest)
 
+    def after_running(self, then):
+        """An obedient host that also does `then(fx)` after its commands."""
+        def host(host_name, prompt, fx, work, timeout, pass_env=()):
+            out = self.scripted(host_name, prompt, fx, work, timeout, pass_env)
+            then(fx)
+            return out
+        return host
+
+    def test_deleted_blanked_or_malformed_call_records_and_a_missing_shim_log_fail_closed(self):
+        def blank(fx):
+            (fx.origin_dir / "calls" / "call-001.json").write_text("")
+
+        def non_dict(fx):
+            (fx.origin_dir / "calls" / "call-001.json").write_text("[1, 2]")
+
+        def no_argv(fx):
+            (fx.origin_dir / "calls" / "call-001.json").write_text(json.dumps({"rc": 0}))
+
+        def gap(fx):
+            (fx.origin_dir / "calls" / "call-002.json").unlink(missing_ok=True)
+
+        def no_shim(fx):
+            fx.shim_log.unlink()
+        for name, action, fragment in (("blank", blank, "not a complete call record"), ("non-dict", non_dict, "not a complete call record"), ("no argv", no_argv, "not a complete call record"),
+                                       ("gap", gap, "numbering has a gap"), ("shim", no_shim, "shim log is missing")):
+            with self.subTest(name):
+                row = self.run_with("R7", self.after_running(action))
+                self.assertEqual(row["status"], "FAIL", row)
+                self.assertIn(fragment, row["why"])
+
+    def test_a_truncated_shim_log_between_sessions_is_an_append_only_violation(self):
+        before = {"texts": {"gh shim log": "a\nb\n"}, "records": {}}
+        for after_text in (None, "a\n", "x\nb\n"):
+            self.assertTrue(rla.append_only_violations(before, {"texts": {"gh shim log": after_text}, "records": {}}))
+        self.assertFalse(rla.append_only_violations(before, {"texts": {"gh shim log": "a\nb\nc\n"}, "records": {}}))
+
     def test_an_honest_r1_host_passes(self):
         def honest(host, prompt, fx, work, timeout, pass_env=()):
             subprocess.run([str(fx.wrapper), "--help"], capture_output=True)
