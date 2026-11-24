@@ -1003,7 +1003,7 @@ class Fixture:
                     records[p.name] = hashlib.sha256((read_regular(p) or '').encode()).hexdigest()
                 except ValueError:
                     records[p.name] = 'NOT-A-REGULAR-FILE'
-        return {'texts': {'fake-gh call log': self.read(str(self.t.gh_state) + '.calls'), 'tool journal': self.read(self.t.state_dir / 'journal.jsonl')},
+        return {'texts': {'fake-gh call log': self.read(str(self.t.gh_state) + '.calls'), 'tool journal': self.read(self.t.state_dir / 'journal.jsonl'), 'gh shim log': self.read(self.shim_log)},
                 'records': records}
 
     def gh_state_snapshot(self):
@@ -1056,15 +1056,33 @@ class Fixture:
         if calls.is_symlink():
             self.session_problems.append('the tool records directory is a symlink')
             return out
-        for p in sorted(calls.glob('call-*.json')) if calls.is_dir() else []:
+        paths = sorted(calls.glob('call-*.json')) if calls.is_dir() else []
+        numbers = []
+        for p in paths:
+            m = re.fullmatch(r'call-(\d+)\.json', p.name)
+            if m:
+                numbers.append(int(m.group(1)))
+            else:
+                self.session_problems.append('tool record %s has an unexpected name' % p.name)
             try:
-                out.append(json.loads(read_regular(p) or 'null'))
+                rec = json.loads(read_regular(p) or 'null')
             except (ValueError, OSError):
                 self.session_problems.append('tool record %s is not a plain regular JSON file' % p.name)
-        return [r for r in out if isinstance(r, dict) and isinstance(r.get('argv'), list)]
+                continue
+            if not isinstance(rec, dict) or not isinstance(rec.get('argv'), list) or 'rc' not in rec:
+                self.session_problems.append('tool record %s is empty or not a complete call record' % p.name)  # a blanked record would hide a command
+                continue
+            out.append(rec)
+        if numbers and sorted(numbers) != list(range(1, len(numbers) + 1)):
+            self.session_problems.append('tool record numbering has a gap (a record was removed)')
+        return out
 
     def shim_argv(self):
-        return (self.read(self.shim_log) or '').splitlines()
+        text = self.read(self.shim_log)
+        if text is None:
+            self.session_problems.append('the gh shim log is missing, so gh calls cannot be observed (failing closed)')
+            return []
+        return text.splitlines()
 
     def push_lines(self):
         """The tool's git push lines; None when the harness git log is gone or not a plain file (callers must fail closed, never read that as "no pushes")."""
