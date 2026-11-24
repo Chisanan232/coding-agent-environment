@@ -17,7 +17,7 @@ Output is a closed character set: no paths and no shell metacharacters. Exit cod
 
 A broken observer must not look like a quiet one: an internal failure (unwritable state, an unexpected exception) is QUIET the first
 time, `CHANGE: observer failing (<class>)` the second consecutive time, and `CHANGE: observer recovered` once when it works again. When
-even the failure counter cannot be written the failure is reported on every run, because it cannot be deduplicated.
+even the failure counter cannot be stored in the private observer directory (it never falls back to a shared temp directory) the failure is reported on every run, because it cannot be deduplicated.
 
 The harness goal evaluator (the `Stop hook feedback` and `Goal check-in` notices) is not part of this tool and cannot be changed by it.
 """
@@ -26,6 +26,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -43,28 +44,59 @@ LIVE_END = ("released", "expired", "cancelled")
 SAFE = re.compile(r"[^A-Za-z0-9 :,.;_#>()+-]")
 
 
-def default_failure_file():
-    return Path(tempfile.gettempdir()) / f"scheduler-observe-failures-{os.getuid()}.json"
+FAILURE_NAME = "observer-failures.json"
+MAX_FAILURE_BYTES = 4096
+_MEMORY_FAILURE = {}                                       # last resort when no private directory is usable; never a shared temp path
 
 
 def clean(text, limit=160):
     return SAFE.sub("", str(text))[:limit]
 
 
-def read_json(path):
-    with open(path, "rb") as handle:
-        raw = handle.read(MAX_JSON_BYTES + 1)
-    if len(raw) > MAX_JSON_BYTES:
+def read_json(path, own=False, limit=None):
+    """Read a small JSON file. Never blocks on a FIFO and only reads regular files. `own` is for the observer's own files: no symlink is
+    followed, the file must belong to this user and be private (no group or other access)."""
+    limit = MAX_JSON_BYTES if limit is None else limit
+    flags = os.O_RDONLY | os.O_NONBLOCK | (os.O_NOFOLLOW if own else 0)
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("not a regular file")
+        if own and (info.st_uid != os.getuid() or info.st_mode & 0o077):
+            raise ValueError("not a private file of this user")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            raw = handle.read(limit + 1)
+    finally:
+        os.close(descriptor)
+    if len(raw) > limit:
         raise ValueError("file too large")
     return json.loads(raw.decode("utf-8"))
 
 
+def ensure_private_dir(path):
+    """Create `path` as a 0700 directory owned by this user, or tighten an existing one that is ours; refuse a symlink or a foreign directory."""
+    path = Path(path)
+    path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise PermissionError("not a directory of this user")
+    if info.st_mode & 0o077:
+        os.chmod(path, 0o700)
+
+
 def read_tail_lines(path, limit):
-    with open(path, "rb") as handle:
-        size = handle.seek(0, os.SEEK_END)
-        start = max(0, size - limit)
-        handle.seek(start)
-        data = handle.read()
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            size = handle.seek(0, os.SEEK_END)
+            start = max(0, size - limit)
+            handle.seek(start)
+            data = handle.read()
+    finally:
+        os.close(descriptor)
     lines = data.split(b"\n")
     return lines[1:] if start > 0 else lines                # the first line of a tail read may be cut
 
@@ -209,8 +241,8 @@ def delta(old, new):
 def load_state(path):
     """The stored state, or None when it is missing, unreadable or any part of it has the wrong shape (it is then rebuilt)."""
     try:
-        data = read_json(path)
-    except (OSError, ValueError):
+        data = read_json(path, own=True)
+    except (OSError, ValueError, RecursionError):
         return None
     if not isinstance(data, dict) or data.get("schema") != SCHEMA:
         return None
@@ -223,7 +255,7 @@ def load_state(path):
 def write_private(path, payload):
     """Atomic write of a small JSON file, created 0600 (mkstemp does that; the chmod is defense in depth against a changed umask or platform)."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)
     descriptor, temp = tempfile.mkstemp(prefix=".observer-", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w") as handle:
@@ -285,16 +317,22 @@ def run(args, pr_provider=gh_prs):
 
 def read_failure(path):
     try:
-        data = read_json(path)
-    except (OSError, ValueError):
-        return None
+        data = read_json(path, own=True, limit=MAX_FAILURE_BYTES)
+    except (OSError, ValueError, RecursionError):
+        data = _MEMORY_FAILURE.get(str(path))
     if isinstance(data, dict) and isinstance(data.get("class"), str) and _int(data.get("count")) and data["count"] >= 1:
         return data
     return None
 
 
 def write_failure(path, value):
-    """Best effort. value None clears the counter. Returns whether the stored state now matches."""
+    """Best effort, in the private observer directory only. value None clears the counter. Returns whether it is stored durably;
+    when it is not, the count is kept in memory for this process only (never in a shared temp directory)."""
+    key = str(path)
+    if value is None:
+        _MEMORY_FAILURE.pop(key, None)
+    else:
+        _MEMORY_FAILURE[key] = value
     try:
         if value is None:
             try:
@@ -306,7 +344,7 @@ def write_failure(path, value):
         else:
             write_private(path, value)
         return True
-    except Exception:
+    except (OSError, ValueError, RecursionError):
         return False
 
 
@@ -330,7 +368,8 @@ def main(argv=None, environ=None, pr_provider=gh_prs):
     environ = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--state", default=environ.get("SCHEDULER_OBSERVE_STATE", str(DEFAULT_STATE)))
-    parser.add_argument("--failure-file", default=environ.get("SCHEDULER_OBSERVE_FAILURES", str(default_failure_file())))
+    parser.add_argument("--failure-file", default=environ.get("SCHEDULER_OBSERVE_FAILURES"),
+                        help="failure counter file (default: next to the state file, in the same private directory)")
     parser.add_argument("--queue-dir", default=environ.get("SCHEDULER_OBSERVE_QUEUE", str(DEFAULT_QUEUE)))
     parser.add_argument("--monitor-status", default=environ.get("SCHEDULER_OBSERVE_MONITOR", str(DEFAULT_MONITOR)))
     parser.add_argument("--supervisor-dir", default=environ.get("SCHEDULER_OBSERVE_SUPERVISOR", str(DEFAULT_SUPERVISOR)))
@@ -345,11 +384,12 @@ def main(argv=None, environ=None, pr_provider=gh_prs):
             raise                                          # --help
         print("QUIET")
         return 0
+    failure_file = args.failure_file or str(Path(args.state).parent / FAILURE_NAME)
     try:
         line, failure = run(args, pr_provider)
-    except Exception as exc:
+    except (Exception, RecursionError) as exc:
         line, failure = "QUIET", type(exc).__name__
-    print(settle(args.failure_file, line, failure))
+    print(settle(failure_file, line, failure))
     return 0
 
 
