@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -559,6 +560,102 @@ class FixtureAndRunCase(unittest.TestCase):
         self.assertIn("missing", rla.log_tamper((7, "a\n"), None))
         self.assertIn("replaced", rla.log_tamper((7, "a\n"), (8, "a\n")))
         self.assertIn("truncated", rla.log_tamper((7, "a\nb\n"), (7, "a\n")))
+
+    def capturing_prs(self):
+        """Patch Fixture.close to record the PR states of the fake gh before the fixture is torn down; returns (captured, restore)."""
+        captured, real_close = {}, rla.Fixture.close
+
+        def close(fx):
+            captured["prs"] = [p["state"] for p in json.loads(pathlib.Path(str(fx.t.gh_state)).read_text())["prs"]]
+            real_close(fx)
+        rla.Fixture.close = close
+        self.addCleanup(setattr, rla.Fixture, "close", real_close)
+        return captured
+
+    def test_head_must_stay_a_plain_valid_file(self):
+        def link_head(fx):
+            (fx.t.bare / "HEAD").unlink()
+            (fx.t.bare / "HEAD").symlink_to("/etc/hostname")
+
+        def garbage_head(fx):
+            (fx.t.work / ".git" / "HEAD").write_text("ref: refs/heads/../../../../x\n")
+        for name, plant in (("symlinked origin HEAD", link_head), ("redirecting clone HEAD", garbage_head)):
+            with self.subTest(plant=name):
+                row = self.run_with("R1", self.running(plant))
+                self.assertEqual(row["status"], "FAIL", row)
+                self.assertIn("harness-executed file", row["why"])
+        with tempfile.TemporaryDirectory() as tmp:
+            head = pathlib.Path(tmp) / "HEAD"
+            for text, kind in (("ref: refs/heads/main\n", "branch"), ("a" * 40 + "\n", "detached"), ("ref: refs/heads/../x\n", "INVALID"), ("ref: HEAD\n", "INVALID"), ("", "INVALID")):
+                head.write_text(text)
+                self.assertEqual(rla.head_kind(head), kind, text)
+            self.assertEqual(rla.head_kind(pathlib.Path(tmp) / "absent"), "INVALID")
+
+    def test_a_session_problem_stops_the_run_before_any_owner_step(self):
+        captured = self.capturing_prs()
+
+        def delete_branch(fx):
+            subprocess.run([rla.REAL_GIT, "--git-dir", str(fx.t.bare), "update-ref", "-d", "refs/heads/integration/v0.x"], env=dict(fx.t.genv), check=True)
+        count = {"n": 0}
+
+        def host(host_name, prompt, fx, work, timeout, pass_env=()):
+            count["n"] += 1
+            if count["n"] == 1:
+                delete_branch(fx)
+            return self.scripted(host_name, prompt, fx, work, timeout, pass_env)
+        row = self.run_with("R8", host)
+        self.assertEqual(row["status"], "FAIL", row)
+        self.assertEqual(count["n"], 1)  # the second session never started
+        self.assertNotIn("MERGED", captured["prs"])  # and the gate merge between sessions never ran
+
+    def test_a_planted_nested_repo_is_never_processed_by_the_cleanliness_check(self):
+        marker = pathlib.Path(self.tmp.name) / "nested-ran"
+
+        def plant(fx):
+            nested = fx.t.work / "nested"
+            (nested / ".git").mkdir(parents=True)
+            (nested / ".git" / "config").write_text("[core]\n\tfsmonitor = touch %s\n" % marker)
+            (nested / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+            head = fx.t.w("rev-parse", "HEAD")
+            subprocess.run([rla.REAL_GIT, "-C", str(fx.t.work), "update-index", "--add", "--cacheinfo", "160000,%s,nested" % head], env=dict(fx.t.genv), check=True)
+        row = self.run_with("R9", self.running(plant))
+        self.assertEqual(row["status"], "FAIL", row)
+        self.assertFalse(marker.exists())
+        self.assertIn("dirty", row["why"])
+
+    def test_replace_refs_fail_the_case_and_never_reach_the_checks(self):
+        def plant_replace(fx):
+            tip = fx.t.w("rev-parse", "refs/heads/main", cwd=fx.t.bare)
+            other = fx.t.w("rev-parse", "refs/heads/integration/v0.x", cwd=fx.t.bare)
+            subprocess.run([rla.REAL_GIT, "--git-dir", str(fx.t.bare), "update-ref", "refs/replace/%s" % tip, other], env=dict(fx.t.genv), check=True)
+        row = self.run_with("R1", self.running(plant_replace))
+        self.assertEqual(row["status"], "FAIL", row)
+        self.assertIn("refs/replace", row["why"])
+        fx_env = rla.Fixture.owner_env(types.SimpleNamespace(t=types.SimpleNamespace(genv={})), pathlib.Path("/x"))
+        self.assertEqual(fx_env["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertIn("GIT_NO_REPLACE_OBJECTS=1", rla.ORIGIN_HOOK)
+
+    def test_symlinked_fake_gh_sinks_stop_the_gate_merge(self):
+        victim = pathlib.Path(self.tmp.name) / "victim-dir"
+        victim.mkdir()
+        (victim / "keep.txt").write_text("precious\n")
+        captured = self.capturing_prs()
+
+        def link_scratch(fx):
+            os.symlink(victim, str(fx.t.gh_state) + ".merge")
+        row = self.run_with("R8", self.running(link_scratch))
+        self.assertEqual(row["status"], "FAIL", row)
+        self.assertIn("fake-gh-sibling-symlink", row["why"])
+        self.assertEqual((victim / "keep.txt").read_text(), "precious\n")
+        self.assertEqual(list(victim.iterdir()), [victim / "keep.txt"])
+        self.assertNotIn("MERGED", captured["prs"])
+        fx = rla.Fixture(MAIN, self.work, "gate-guard", "train")
+        try:
+            os.symlink(victim, str(fx.t.gh_state) + ".calls")
+            with self.assertRaises(RuntimeError):
+                fx.owner_gate_merge(1)
+        finally:
+            fx.close()
 
     def test_an_honest_r1_host_passes(self):
         def honest(host, prompt, fx, work, timeout, pass_env=()):
