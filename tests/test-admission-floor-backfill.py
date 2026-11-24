@@ -134,6 +134,69 @@ class FloorOnlyHead(tb.Base):
                                                 0, 0, 3)
         self.assertIsNone(lost, 'a head that now fits outright is judged by _protects_head, which a 20 GiB grant beside 400 GiB free keeps')
 
+    def test_the_claim_time_recheck_revokes_a_floor_only_grant_once_the_grant_itself_would_hold_the_head_back(self):
+        """150 GiB free: the 40 GiB head now fits outright, but with this 20 GiB grant charged beside it (150 - 20 - 40 = 90 < 100) it would not, so
+        the grant is withdrawn. At 160 GiB the head fits even with the grant charged and the grant stands."""
+        self.shape()
+        with backfill():
+            self.advance(free=135 * GIB)
+            entries = da._queue_entries(self.path)[0]
+            entry = next(e for e in entries if e['id'] == self.small_a)
+            def lost(free_gib):
+                return da._backfill_protection_lost(self.host(), entry, entries, [], [], self.now,
+                                                    {'free_bytes': free_gib * GIB, 'tier': 'wide', 'latch': False}, 0, 0, 3)
+            self.assertEqual(lost(150), ('head-unprotected', self.head))
+            self.assertIsNone(lost(160))
+
+    def test_the_floor_only_gate_needs_a_free_lane(self):
+        """No lane is free (in_use >= lanes): the head is refused for the lane, not for the floor alone, so nothing may pass it."""
+        self.shape()
+        head = next(e for e in da._queue_entries(self.path)[0] if e['id'] == self.head)
+        budget = {'status': 'ok', 'band': 'GREEN', 'cap_reason': None, 'excl_clash': False, 'resource_reasons': ['byte floor: 95 GiB left']}
+        self.assertEqual(da._floor_only_blockers(budget, 0, 3, False, 135 * GIB, head), [])
+        self.assertIsNone(da._floor_only_blockers(budget, 3, 3, False, 135 * GIB, head))
+
+    def stream(self, declared, persist, cap=1, rounds=60, free0=135):
+        """Each round one new job of `declared` GiB is offered; a granted one runs, then finishes and keeps `persist` GiB (a cargo target).
+        Returns the lowest free - reserved seen when a grant was made, the final free space and the number of grants."""
+        head = self.enqueue('la-cargo-head', 'build-workspace', [tb.LOCAL], 40)
+        free, lowest, grants = free0 * GIB, None, 0
+        for i in range(rounds):
+            self.enqueue('s%d' % i, 'build-workspace', ['cargo-target:/Users/dev/.cargo/targets/k%d' % i], declared)
+            with backfill(cap=cap):
+                out = self.advance(free=free)
+            if not out.get('backfilled'):
+                break
+            holders = [(qid, self.claim(qid)) for qid in out['backfilled']]
+            reserved = sum(e['bytes'] for e in self.entries().values() if e['state'] == 'CLAIMED')
+            lowest = free - reserved if lowest is None else min(lowest, free - reserved)
+            grants += len(holders)
+            for _qid, holder in holders:
+                holder.kill()
+                holder.wait()
+                free -= persist * GIB
+            with backfill(cap=cap):
+                self.advance(free=free)   # records the finished jobs as released
+        self.assertEqual(self.state(head), 'QUEUED')
+        return lowest, free, grants
+
+    def test_the_byte_floor_holds_for_a_stream_of_jobs_that_keep_their_output(self):
+        """Measured (SPE-188 follow-up): jobs of 20, 10, 4 and 1 GiB that each keep all they declared never take free space below the plain floor,
+        and the hysteresis keeps every grant at least 4 GiB above it. What the stream does change is how far the head is from fitting."""
+        for declared in (20, 10, 4, 1):
+            with self.subTest(declared=declared):
+                lowest, free, grants = self.stream(declared, persist=declared)
+                self.assertGreaterEqual(lowest, (100 + 4) * GIB)
+                self.assertGreaterEqual(free, 100 * GIB)
+                self.assertGreaterEqual(grants, 1)
+                self.setUp()
+
+    def test_simultaneous_grants_are_charged_against_the_same_floor(self):
+        """A cap of 3 and three 10 GiB candidates: each grant is charged beside the others, so the three together never pass the floor."""
+        lowest, free, grants = self.stream(10, persist=10, cap=3)
+        self.assertGreaterEqual(lowest, (100 + 4) * GIB)
+        self.assertGreaterEqual(free, 100 * GIB)
+
 
 if __name__ == '__main__':
     unittest.main()
