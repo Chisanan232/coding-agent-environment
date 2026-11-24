@@ -237,6 +237,52 @@ class Notes(Pub):
         self.commit("main", "later.txt")  # base moves on: the notes describe the promotion, not the tip
         self.assertEqual(self.notes()["sha256"], ev["evidence"]["sha256"])
 
+    def notes_text(self):
+        self.built()
+        self.notes()
+        return (self.top / "0.3.0.notes.md").read_text()
+
+    def test_notes_without_a_prior_release_record_verifications_and_no_deferrals(self):
+        text = self.notes_text()
+        for want in ("- Prior release: none", "- Comparison: none", "## Verifications", "- Final tree verification: CARRIED_OVER", "- Hosted CI: CI_PASS",
+                     "- Local-equivalent evidence: none", "- Branch protection after promotion: UNCHANGED", "## Deferrals\n\n- none\n"):
+            self.assertIn(want, text)
+        self.assertLess(text.index("## Deferrals"), text.index("## Artifact checksums (sha256)"))
+
+    def test_notes_name_the_prior_release_and_the_comparison_range_from_git(self):
+        self.w("fetch", "-q", "--tags", "origin")
+        self.w("tag", "-a", "-m", "v0.2.0", "v0.2.0", "origin/main")
+        self.w("push", "-q", "origin", "v0.2.0")
+        self.w("tag", "-a", "-m", "v0.9.0", "v0.9.0", "origin/main")  # a later version is never the prior release of 0.3.0
+        self.w("push", "-q", "origin", "v0.9.0")
+        text = self.notes_text()
+        self.assertRegex(text, r"- Prior release: `v0\.2\.0`\n- Comparison: `v0\.2\.0\.\.\.v0\.3\.0` \([0-9]+ commit\(s\)\)\n")
+        self.assertNotIn("v0.9.0", text)
+
+    def test_notes_list_not_run_checks_as_deferrals_and_ignore_unrecorded_journal_values(self):
+        self.built()
+        journal = self.state_dir / "journal.jsonl"
+        rows = [json.loads(x) for x in journal.read_text().splitlines()]
+        kept = []
+        for r in rows:
+            if r.get("state") == "protection-after":
+                continue  # a promotion whose after-merge protection check left no record
+            if r.get("state") == "promoted":
+                r["hosted_ci"], r["local_equivalent_sha256"] = "NOT_RUN", "z" * 64  # a value outside the closed set is dropped
+            kept.append(r)
+        journal.write_text("".join(json.dumps(r) + "\n" for r in kept))
+        self.notes()
+        text = (self.top / "0.3.0.notes.md").read_text()
+        for want in ("- Hosted CI: NOT_RUN", "- Local-equivalent evidence: none", "- Branch protection after promotion: not recorded",
+                     "- Hosted CI: NOT_RUN\n- Protection check after promotion: NOT_VERIFIED (no record)\n"):
+            self.assertIn(want, text)
+
+    def test_notes_bytes_are_identical_for_identical_inputs(self):
+        self.built()
+        first = self.notes()
+        again = self.notes()
+        self.assertEqual((first["sha256"], first["publish_digest"]), (again["sha256"], again["publish_digest"]))
+
     def ship_then_notes_without_build(self):
         self.ship()
         return self.rel("notes", execute=True)[1]
