@@ -95,7 +95,8 @@ class LocalGh:
                                "headRefName": pr["branch"], "headRefOid": self.head(n), "author": {"login": "chisanan232"},
                                "mergeable": "CONFLICTING" if not merged and self.conflicts(n) else "MERGEABLE",
                                "mergeStateStatus": "DIRTY" if not merged and self.conflicts(n) else "CLEAN",
-                               "reviewDecision": pr["decision"], "reviews": pr["reviews"], "comments": pr["comments"],
+                               "reviewDecision": pr["decision"], "reviews": pr["reviews"],
+                               "comments": [] if pr.get("issues_disabled") else pr["comments"],   # SPE-186b: pr-view sees none
                                "statusCheckRollup": checks, "isCrossRepository": False,
                                "mergeCommit": {"oid": self.merged[n]} if merged else None})
         if a[0] == "api" and "/compare/" in a[1]:
@@ -105,6 +106,12 @@ class LocalGh:
                 return git(self.repo, "rev-list", "--count", f"{hi}..{lo}") + "\n"
             anc = subprocess.run(["git", "merge-base", "--is-ancestor", lo, hi], cwd=self.repo, env=ENV).returncode == 0
             return ("identical" if git(self.repo, "rev-parse", lo) == git(self.repo, "rev-parse", hi) else "ahead" if anc else "diverged") + "\n"
+        if a[:2] == ("api", "graphql") and "timelineItems" in " ".join(a):
+            pr = next(p for k, p in self.prs.items() if f"n={k}" in " ".join(a))
+            nodes = [{"databaseId": 1 + i, "author": c.get("author"), "body": c.get("body") or "", "createdAt": c.get("createdAt"),
+                      "includesCreatedEdit": False, "isMinimized": False} for i, c in enumerate(pr["comments"])]
+            return json.dumps({"data": {"repository": {"pullRequest": {"timelineItems": {
+                "filteredCount": len(nodes), "pageInfo": {"hasNextPage": False}, "nodes": nodes}}}}})
         if a[:2] == ("api", "graphql"):
             pr = next(p for k, p in self.prs.items() if f"n={k}" in " ".join(a))
             return json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": pr["threads"]}}}}})
@@ -214,6 +221,18 @@ class Scenarios(unittest.TestCase):
         verbs = {a[:2] for a in self.gh.calls}
         self.assertTrue(verbs <= {("repo", "view"), ("pr", "view"), ("api", "user"), ("api", "graphql")} | {c[:2] for c in self.gh.calls if c[1].startswith("repos/")})
         self.assertEqual(git(self.gh.repo, "for-each-ref", "--format=%(refname) %(objectname)"), refs_before)  # no ref moved or created
+
+    def test_issues_disabled_repo_reads_timeline_flags_through_the_read_only_contract(self):
+        # SPE-186b: pr-view comments are empty, REST lists the review, and the timeline fills its integrity flags.
+        self.gh.branch(1, "feat/one", "a.txt", "one\n", review=False)
+        self.gh.prs[1]["issues_disabled"] = True
+        self.gh.prs[1]["comments"].append({"author": {"login": "chisanan232"}, "body": omg.evidence_line(self.gh.head(1), "independent-agent-1"),
+                                           "createdAt": "2026-11-24T00:00:00Z"})
+        v, reasons, facts = self.check(1)
+        self.assertEqual((v, reasons), ("PASS", []))
+        self.assertEqual(facts["comment_source_discrepancy"], {"graphql": 0, "rest": 1})
+        self.assertEqual(facts["comment_timeline"], {"nodes": 1, "filled": 1})
+        self.assertEqual(sum(1 for c in self.gh.calls if c[:2] == ("api", "graphql") and "timelineItems" in " ".join(c)), 1)
 
     def test_read_only_guard_rejects_writes(self):
         for call in (("pr", "merge", "1"), ("pr", "review", "1", "--approve"), ("pr", "comment", "1"), ("api", "repos/o/r/statuses/x", "-f", "state=success"),
