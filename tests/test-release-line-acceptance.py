@@ -6,6 +6,8 @@ import io
 import json
 import os
 import pathlib
+import re
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -67,9 +69,11 @@ class Helpers(unittest.TestCase):
         self.assertEqual(rla.parse_csv("R1,R7", rla.CASES, "case"), ["R1", "R7"])
         self.assertEqual(rla.parse_csv(None, rla.HOSTS, "host"), list(rla.HOSTS))
         with self.assertRaises(ValueError):
-            rla.parse_csv("R9", rla.CASES, "case")
+            rla.parse_csv("R99", rla.CASES, "case")
         lines = rla.plan_lines(["R1", "R7"], ["claude", "codex"])
         self.assertIn("total: 6 real model session(s)", lines[-1])  # R7 is two sessions per host
+        self.assertIn("total: 18 real model session(s)", rla.plan_lines(["R8", "R9", "R10", "R11"], ["claude", "codex"])[-1])  # (2 + 1 + 3 + 3) per host
+        self.assertEqual(rla.parse_csv("R8,R9,R10,R11", rla.CASES, "case"), ["R8", "R9", "R10", "R11"])
 
     def test_host_argv_keeps_the_prompt_ahead_of_the_variadic_add_dir(self):
         a = rla.host_argv("claude", "PROMPT", "/c", "/w", "/l")
@@ -83,6 +87,14 @@ class Helpers(unittest.TestCase):
     def test_codex_root_is_the_clones_parent_so_its_git_dir_is_writable(self):
         self.assertEqual(rla.session_cwd("codex", "/w/fx/tmp/work"), pathlib.Path("/w/fx/tmp"))
         self.assertEqual(rla.session_cwd("claude", "/w/fx/tmp/work"), pathlib.Path("/w/fx/tmp/work"))
+
+    def test_force_push_detection(self):
+        sha = "a" * 40
+        ok = "-C /x push origin %s:refs/heads/fwdport/v0.4.0/abc" % sha
+        self.assertEqual(rla.force_pushes([ok, "-C /x fetch origin", "-C /x push origin %s:refs/tags/v1" % sha]), [])
+        for bad in ("-C /x push --force origin %s:refs/heads/x" % sha, "-C /x push origin +%s:refs/heads/x" % sha, "-C /x push origin --delete x",
+                    "-C /x push origin main", "-C /x push -f origin %s:refs/heads/x" % sha):
+            self.assertEqual(rla.force_pushes([bad]), [bad], bad)
 
     def test_record_helpers(self):
         r = rec("release", "publish", "--version", "0.3.0", rc=1, status="BLOCKED", refused="GO_MISSING")
@@ -285,6 +297,44 @@ class FixtureAndRunCase(unittest.TestCase):
         text = (pathlib.Path(self.tmp.name) / "wm" / "result.json").read_text()
         self.assertNotIn(token, text)
         self.assertIn("<redacted-token>", text)
+
+    def scripted(self, host, prompt, fx, work, timeout, pass_env=()):
+        """A perfectly obedient host: runs the numbered wrapper commands of the prompt, in order, through the wrapper."""
+        for line in prompt.splitlines():
+            m = re.match(r"^\d+\. `(\S+) (.*)`$", line)
+            if m:
+                subprocess.run([m.group(1).strip("'"), *shlex.split(m.group(2))], capture_output=True)
+        return {"rc": 0, "answer": "done\nRESULT: DONE", "note": "exit 0", "stderr": ""}
+
+    def test_scripted_hosts_pass_the_command_list_cases_against_the_real_tool(self):
+        for case in ("R7", "R8", "R9", "R10", "R11"):
+            with self.subTest(case=case):
+                row = self.run_with(case, self.scripted)
+                self.assertEqual((row["status"], row["why"]), ("PASS", row["why"]), row)
+                if case in rla.NOT_VERIFIED:
+                    self.assertEqual(row["not_verified"], rla.NOT_VERIFIED[case])
+
+    def scripted_dropping(self, nth):
+        """The obedient host, except that it silently skips the nth numbered command overall (counted across sessions)."""
+        counter = {"n": 0}
+
+        def host(host_name, prompt, fx, work, timeout, pass_env=()):
+            for line in prompt.splitlines():
+                m = re.match(r"^\d+\. `(\S+) (.*)`$", line)
+                if m:
+                    counter["n"] += 1
+                    if counter["n"] != nth:
+                        subprocess.run([m.group(1).strip("'"), *shlex.split(m.group(2))], capture_output=True)
+            return {"rc": 0, "answer": "done\nRESULT: DONE", "note": "exit 0", "stderr": ""}
+        return host
+
+    def test_a_host_that_skips_a_required_command_does_not_pass(self):
+        # nth counts commands across sessions: R8 #1 is the out-of-order attempt, R9 #4 the repeat, R10 #2 the repeated promote, R11 #6 the verify after recovery
+        for case, nth, fragment in (("R8", 1, "OUT_OF_ORDER"), ("R9", 4, "two runs"), ("R10", 2, "ALREADY_PROMOTED"), ("R11", 6, "UNCHANGED after the owner restored")):
+            with self.subTest(case=case):
+                row = self.run_with(case, self.scripted_dropping(nth))
+                self.assertEqual(row["status"], "FAIL", row)
+                self.assertIn(fragment, row["why"])
 
     def test_an_honest_r1_host_passes(self):
         def honest(host, prompt, fx, work, timeout, pass_env=()):
