@@ -1426,6 +1426,21 @@ def recovery_notices(env, recs, by_id, now, wall, directory):
             rec['next_try'] = wall + min(60 * 2 ** (min(rec['attempts'], 10) - 1), 900)
 
 
+def grant_incident_over(rec, entry):
+    """True when an unclaimed-grant incident has nothing left to happen or to say (SPE-188). Before this a lapsed grant incident stayed open until it aged
+    out of the keep window, so status.json kept listing the incident of a job whose grant had long since expired and been replaced. Over means the entry
+    is gone or cancelled (no lapse will follow), or it expired and the lapse notice is settled: delivered, finished elsewhere, or unverifiable. A grant that is
+    still live, an expired one whose lapse notice is still owed, and an escalated record whose lapse upgrade has not run yet are never closed here; a claim
+    or release is an acknowledgement, set separately and never overwritten by a resolve."""
+    if entry is None or entry['state'] == 'CANCELLED':
+        return True
+    if entry['state'] != 'EXPIRED' or rec['phase'] != 'lapsed':
+        return False
+    handed = rec['notified_phase'] == rec['phase']
+    return rec['status'] == SUPPRESSED or rec['handed_off_unverified'] or (handed and (
+        rec['delivered_at'] is not None or rec['delivery'] in ('unknown', 'dropped', 'unconfirmed')))
+
+
 def incident_settled(rec):
     """Nothing more to ask session-notify about this incident: acknowledged, delivered, finished elsewhere, or unverifiable."""
     handed = rec['notified_phase'] == rec['phase']
@@ -1456,7 +1471,10 @@ def prune_incidents(incidents, wall):
         return r['acknowledged_at'] if r['acknowledged_at'] is not None else r['resolved_at']
 
     def done(r):      # closed, and nothing is owed to the owner
-        return closed_at(r) is not None and r['owner_notice_state'] != 'undelivered'
+        if closed_at(r) is None or r['owner_notice_state'] == 'undelivered':
+            return False
+        # A grant incident resolved without a claim is the record that stops the same lapse being raised again: it stays until the lapse window ends.
+        return r['clock'] != 'grant' or r['acknowledged_at'] is not None or wall - r['expires_wall'] > LAPSE_WINDOW_S
     kept = {k: r for k, r in incidents.items() if not (wall - r['expires_wall'] > INCIDENT_KEEP_S or (done(r) and wall - closed_at(r) > INCIDENT_ACK_KEEP_S))}
     for old_first in (done, lambda r: wall - r['expires_wall'] > LAPSE_WINDOW_S):
         for key, rec in sorted(kept.items(), key=lambda kv: kv[1]['grant_wall']):
@@ -1587,9 +1605,11 @@ def wait_run_incidents(env, state, verdict, entries, claims, now, wall, gap, dir
             over = entry is None or entry['state'] != 'CLAIMED'
             if not over:
                 rec['expires_wall'] = wall
+        elif rec['clock'] == 'grant':
+            over = grant_incident_over(rec, entry)
         else:
             continue
-        if over and trusted and rec['resolved_at'] is None:
+        if over and trusted and rec['resolved_at'] is None and rec['acknowledged_at'] is None:
             rec['resolved_at'] = wall      # the wait or the run ended (granted, expired, cancelled, released): resolved, never an owner acknowledgement
     overflow, gaps = 0, state['gaps']
     # An abandoned claim is raised on any tick, gap or not: the death was observed on ABANDON_TICKS separate ticks and no wall-clock age decides it.

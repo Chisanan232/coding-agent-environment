@@ -955,6 +955,52 @@ class HandoffIncidents(MonitorBase):
         self.walk(300)
         self.assertEqual(len(self.cleared), 1)
 
+    def test_a_lapsed_grant_incident_is_resolved_once_its_notice_is_settled(self):
+        """SPE-188: q001019 stayed phase 'lapsed' with resolved_at null long after its grant expired and the lane was reused."""
+        self.granted_handoff()
+        self.walk(900)
+        (rec,) = self.incidents().values()
+        self.assertIsNone(rec['resolved_at'])                                  # a live, escalated grant is still open
+        self.clock.advance(300)
+        self.expire()
+        self.walk(300)
+        (rec,) = self.incidents().values()
+        self.assertEqual((rec['phase'], rec['delivered_at'] is not None), ('lapsed', True))
+        self.assertIsNotNone(rec['resolved_at'])
+        self.assertIsNone(rec['acknowledged_at'])                              # a resolve is never an acknowledgement
+        self.assertEqual(self.tick()['handoff_incidents'][0]['owner_notice_state'], 'delivered')
+
+    def test_a_resolved_lapse_is_kept_so_it_is_not_raised_twice_inside_the_lapse_window(self):
+        self.granted_handoff()
+        self.walk(900)
+        self.clock.advance(300)
+        self.expire()
+        self.walk(300)
+        raised = len(self.alerts)
+        self.assertIsNotNone(next(iter(self.incidents().values()))['resolved_at'])
+        self.clock.advance(2 * 3600)
+        self.tick(0)
+        self.walk(600)
+        self.assertEqual((len(self.incidents()), len(self.alerts)), (1, raised))
+
+    def test_a_lapsed_grant_incident_whose_notice_is_still_owed_stays_open(self):
+        self.granted_handoff()
+        self.emit_result = {'result': 'no-backend', 'delivery': None}
+        self.walk(900)
+        self.clock.advance(300)
+        self.expire()
+        self.walk(300)
+        (rec,) = self.incidents().values()
+        self.assertIsNone(rec['resolved_at'])                                  # the owner has not been told: still an open obligation
+
+    def test_a_cancelled_unclaimed_grant_resolves_its_incident_without_a_notice(self):
+        qid = self.granted_handoff()
+        self.walk(900)
+        self.assertTrue(da.queue_cancel(self.state_path, qid, now=self.clock.now)['ok'])
+        self.walk(120)
+        (rec,) = self.incidents().values()
+        self.assertIsNotNone(rec['resolved_at'])
+
     def test_dedups_for_a_notice_never_handed_off_stop_after_a_bound(self):
         self.granted_handoff()
         self.emit_result = {'result': 'deduped', 'delivery': 'sent'}
