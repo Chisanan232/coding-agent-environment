@@ -1620,6 +1620,7 @@ def close_incidents(env, incidents, wall):
 
 
 SUPERVISOR_STATUS = Path.home() / '.local/share/engineering-supervisor/state/incident-status.json'
+RECONCILE_MAX_SENDS = 50      # one --apply sends at most this many closing notices; rows past it stay `closable` for the next run
 RECONCILE_KINDS = ('unclaimed-handoff', 'queue-wait-excessive', 'workload-over-deadline')
 
 
@@ -1646,7 +1647,7 @@ def reconcile_incidents(env, status_path=None, apply=False):
             keys.append(('grant', incident_key(entry)))
         for clock, key in keys:
             by_ref[incident_ref(key)] = (clock, key, entry)
-    rows, applied = [], 0
+    rows, applied, sends = [], 0, 0
     for item in sorted(opened, key=lambda i: i.get('ts') or ''):
         ref = item['incident_ref']
         found = by_ref.get(ref)
@@ -1656,7 +1657,8 @@ def reconcile_incidents(env, status_path=None, apply=False):
         clock, key, entry = found
         row = {'ref': ref, 'kind': item['kind'], 'id': entry['id'], 'clock': clock, 'state': entry['state'],
                'action': 'closable' if over_by_scheduler(clock, entry) and not problems else 'keep'}
-        if apply and row['action'] == 'closable':
+        if apply and row['action'] == 'closable' and sends < RECONCILE_MAX_SENDS:
+            sends += 1
             try:
                 outcome = env.emit_recovered(recovered_alert(key))
             except Exception:
@@ -1665,7 +1667,7 @@ def reconcile_incidents(env, status_path=None, apply=False):
             row['action'] = 'sent' if ok else 'failed'
             applied += 1 if ok else 0
         rows.append(row)
-    return {'rows': rows, 'applied': applied, 'dry_run': not apply, 'unreadable_queue': bool(problems)}
+    return {'rows': rows, 'applied': applied, 'dry_run': not apply, 'unreadable_queue': bool(problems), 'failed': sum(1 for r in rows if r['action'] == 'failed')}
 
 
 def incident_alert(key, rec, wall):
@@ -1898,7 +1900,7 @@ def main(argv=None):
             for row in out['rows']:
                 print('%-22s %-24s %-8s %-8s %-9s %s' % (row['ref'], row['kind'], row['id'] or '-', row['clock'] or '-', row['state'] or '-', row['action']))
             print('%s: %d closable, %d sent' % ('dry run' if out['dry_run'] else 'applied', sum(1 for r in out['rows'] if r['action'] == 'closable'), out['applied']))
-        return 0
+        return 1 if out['failed'] else 0      # a send that failed is visible to the caller, not only in the rows
     result = tick(env, act=args.act, if_due=args.if_due)
     print(json.dumps(result, indent=1, sort_keys=True) if args.json else '%s primary=%s waiting=%s stalled=%s actions=%s' % (
         result.get('at', '-'), result.get('primary', result.get('why')), result.get('waiting'), result.get('stalled'), result.get('actions')))
