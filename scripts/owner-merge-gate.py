@@ -685,9 +685,42 @@ def _json(run, *args):
 # every PR of horonomy/fornax-core while the REST issue-comments list held them, so the viewer's review record was
 # invisible and the gate refused with NO_REVIEW_EVIDENCE. The gate now reads the REST list as well and uses the union.
 REST_COMMENTS_JQ = '[.[]|{author:{login:(.user.login // "")},body:(.body // ""),createdAt:.created_at}]'
+# SPE-186b: on some repositories (measured on horonomy/local-agent, which reports Issues enabled; cause unknown) GraphQL pullRequest.comments is empty,
+# while the PR timeline's IssueComment items list the same comments with their integrity flags. A fixed query: only the
+# validated owner, name and number vary, as -F variables, exactly like THREADS. filteredCount, not totalCount: totalCount counts
+# every timeline item regardless of itemTypes (measured live: totalCount 4 for 2 issue comments).
+TIMELINE_COMMENTS = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n)"
+                     "{timelineItems(first:100,itemTypes:[ISSUE_COMMENT]){filteredCount pageInfo{hasNextPage}"
+                     " nodes{... on IssueComment{databaseId createdAt includesCreatedEdit isMinimized author{login} body}}}}}}")
 
 
-def merged_comments(run, repo, pr, graphql_comments):
+def _timeline_comments(run, repo, pr):
+    """The PR timeline's issue comments in the pr-view shape, or raise ValueError/RuntimeError. Fails closed on any doubt:
+    a truncated page, a count that does not match the nodes, or a node whose flags are not real booleans."""
+    if not REPO_RE.fullmatch(str(repo)) or not re.fullmatch(r"[1-9][0-9]{0,8}", str(pr)):
+        raise ValueError("invalid repository or pull request number")
+    o, r_ = repo.split("/")
+    data = json.loads(run("api", "graphql", "-f", f"query={TIMELINE_COMMENTS}", "-F", f"o={o}", "-F", f"r={r_}", "-F", f"n={pr}"))
+    items = data["data"]["repository"]["pullRequest"]["timelineItems"]
+    nodes = items["nodes"]
+    if not isinstance(nodes, list) or items["pageInfo"]["hasNextPage"] is not False or type(items["filteredCount"]) is not int:
+        raise ValueError("unexpected shape or more than one page")
+    if len(nodes) >= 100 or items["filteredCount"] != len(nodes):
+        raise ValueError("truncated or inconsistent timeline")
+    out = []
+    for n in nodes:
+        author = n.get("author") if isinstance(n, dict) else None
+        if (not isinstance(n, dict) or type(n.get("databaseId")) is not int or not isinstance(n.get("body"), str)
+                or not isinstance(n.get("createdAt"), str) or not (author is None or isinstance(author, dict))
+                or not isinstance((author or {}).get("login", ""), str)
+                or type(n.get("includesCreatedEdit")) is not bool or type(n.get("isMinimized")) is not bool):
+            raise ValueError("a timeline node is not an issue comment of the expected shape")
+        out.append({"author": {"login": (author or {}).get("login") or ""}, "body": n["body"], "createdAt": n["createdAt"],
+                    "includesCreatedEdit": n["includesCreatedEdit"], "isMinimized": n["isMinimized"]})
+    return out
+
+
+def merged_comments(run, repo, pr, graphql_comments, facts=None):
     """(comments, rest_count, error): GraphQL comments unioned with the REST issue comments, REST order first.
 
     Comments are the same kind of record from the same author on both paths, so the union adds no new trust: callers still
@@ -695,6 +728,12 @@ def merged_comments(run, repo, pr, graphql_comments):
     its REST twin (same login, body, createdAt) one-to-one; unmatched entries from either side are kept. If the REST list
     cannot be read or has an unexpected shape, `error` is set and the caller must refuse (fail closed) instead of silently
     trusting GraphQL alone.
+
+    SPE-186b: when a REST comment is still without a pr-view twin, the PR timeline's issue comments are read once and may
+    replace such a remaining REST comment one-to-one by the same key, carrying their flags. They never replace a pr-view
+    entry and are never appended (REST stays the list of what exists), so agreeing sources cannot duplicate a comment. If the
+    timeline read fails, is truncated or has an unexpected shape, it is ignored entirely (REST-only stays flagless, so the
+    local-first basis stays refused) and `facts["comment_timeline"]` says why; on success it holds the node and fill counts.
     """
     graphql_comments = list(graphql_comments or [])
     try:
@@ -720,6 +759,22 @@ def merged_comments(run, repo, pr, graphql_comments):
             out[slots.pop(0)] = c
         else:
             out.append(c)
+    if any(free.values()):
+        notes = {}
+        try:
+            timeline = _timeline_comments(run, repo, pr)
+        except Exception as e:
+            notes["ignored"] = f"{type(e).__name__}: {str(e)[:120]}"
+        else:
+            filled = 0
+            for c in timeline:
+                slots = free.get(key(c))
+                if slots:
+                    out[slots.pop(0)] = c
+                    filled += 1
+            notes.update(nodes=len(timeline), filled=filled)
+        if facts is not None:
+            facts["comment_timeline"] = notes
     # Latest-wins consumers (the reviewer-independence check, the newest local-first record) read the end of the list, so a
     # GraphQL-only entry appended after an edit race must not outrank a newer REST entry: order by creation time, with the
     # REST-first order as the stable tiebreak (and for entries that carry no time).
@@ -1115,7 +1170,9 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
             if role != "admin active":
                 reasons.append(f"OWNER_IDENTITY_NOT_VERIFIED: {me!r} is neither the repository owner account nor an administrator of org {owner!r}")
     graphql_n = len(p["comments"])
-    comments, rest_n, comments_error = merged_comments(run, repo, pr, p["comments"])
+    # comment_source_discrepancy compares pr-view (GraphQL pullRequest.comments) with REST only; {"graphql": 0, ...} is the
+    # expected shape on such a repository (empty GraphQL PR comments, cause unknown), where comment_timeline then records the timeline fill.
+    comments, rest_n, comments_error = merged_comments(run, repo, pr, p["comments"], facts=facts)
     if comments_error:
         reasons.append(f"COMMENTS_UNREADABLE: the REST issue comments could not be read ({comments_error}); review and CI records cannot be proven")
     elif rest_n != graphql_n:
