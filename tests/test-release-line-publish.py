@@ -13,7 +13,9 @@ import pathlib
 import re
 import sys
 import time
+import types
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("rl_release_tests", ROOT / "tests/test-release-line-release.py")
@@ -244,8 +246,8 @@ class Notes(Pub):
 
     def test_notes_without_a_prior_release_record_verifications_and_no_deferrals(self):
         text = self.notes_text()
-        for want in ("- Prior release: none", "- Comparison: none", "## Verifications", "- Final tree verification: CARRIED_OVER", "- Hosted CI: CI_PASS",
-                     "- Local-equivalent evidence: none", "- Branch protection after promotion: UNCHANGED", "## Deferrals\n\n- none\n"):
+        for want in ("- Prior release: none", "- Comparison: none", "## Verifications", "- Final tree verification: CARRIED_OVER", "- Hosted CI: CI_PASS (journal-recorded, unverified)",
+                     "- Local-equivalent evidence: none", "- Branch protection after promotion: UNCHANGED (journal-recorded, unverified)", "## Deferrals\n\n- none\n"):
             self.assertIn(want, text)
         self.assertLess(text.index("## Deferrals"), text.index("## Artifact checksums (sha256)"))
 
@@ -256,7 +258,7 @@ class Notes(Pub):
         self.w("tag", "-a", "-m", "v0.9.0", "v0.9.0", "origin/main")  # a later version is never the prior release of 0.3.0
         self.w("push", "-q", "origin", "v0.9.0")
         text = self.notes_text()
-        self.assertRegex(text, r"- Prior release: `v0\.2\.0`\n- Comparison: `v0\.2\.0\.\.\.v0\.3\.0` \([0-9]+ commit\(s\)\)\n")
+        self.assertRegex(text, r"- Prior release: `v0\.2\.0` \(local tags\)\n- Comparison: `v0\.2\.0\.\.\.v0\.3\.0` \([0-9]+ commit\(s\)\)\n")
         self.assertNotIn("v0.9.0", text)
 
     def test_notes_list_not_run_checks_as_deferrals_and_ignore_unrecorded_journal_values(self):
@@ -276,6 +278,66 @@ class Notes(Pub):
         for want in ("- Hosted CI: NOT_RUN", "- Local-equivalent evidence: none", "- Branch protection after promotion: not recorded",
                      "- Hosted CI: NOT_RUN\n- Protection check after promotion: NOT_VERIFIED (no record)\n"):
             self.assertIn(want, text)
+
+    def rewrite_journal(self, edit):
+        journal = self.state_dir / "journal.jsonl"
+        rows = [json.loads(x) for x in journal.read_text().splitlines()]
+        journal.write_text("".join(json.dumps(r) + "\n" for r in edit(rows)))
+
+    def test_protection_drift_is_not_overwritten_by_a_later_ok_row_and_is_deferred(self):
+        self.built()
+
+        def edit(rows):
+            row = next(r for r in rows if r.get("state") == "protection-after")
+            row["result"] = "DRIFT"
+            return rows + [dict(row, result="UNCHANGED")]
+        self.rewrite_journal(edit)
+        self.notes()
+        text = (self.top / "0.3.0.notes.md").read_text()
+        self.assertIn("- Branch protection after promotion: DRIFT (journal-recorded, unverified)", text)
+        self.assertIn("- Protection check after promotion: DRIFT\n", text)
+
+    def test_a_protection_row_for_another_final_sha_is_ignored(self):
+        self.built()
+        self.rewrite_journal(lambda rows: [dict(r, final_sha="0" * 40) if r.get("state") == "protection-after" else r for r in rows])
+        self.notes()
+        text = (self.top / "0.3.0.notes.md").read_text()
+        self.assertIn("- Branch protection after promotion: not recorded", text)
+        self.assertIn("- Protection check after promotion: NOT_VERIFIED (no record)", text)
+
+    def test_a_valid_local_equivalent_digest_is_rendered_with_the_unverified_label(self):
+        self.built()
+        self.rewrite_journal(lambda rows: [dict(r, local_equivalent_sha256="ab" * 32) if r.get("state") == "promoted" else r for r in rows])
+        self.notes()
+        self.assertIn(f"- Local-equivalent evidence: `{'ab' * 32}` (journal-recorded, unverified)", (self.top / "0.3.0.notes.md").read_text())
+
+    def test_prerelease_other_major_and_non_ancestor_tags_are_not_the_prior_release(self):
+        self.w("fetch", "-q", "--tags", "origin")
+        self.w("tag", "-a", "-m", "x", "v0.2.0-rc.1", "origin/main")  # a prerelease is not a final tag of this format
+        self.w("tag", "-a", "-m", "x", "v1.0.0", "origin/main")  # another major
+        self.w("checkout", "-q", "-b", "side", "origin/main")
+        (self.work / "side.txt").write_text("s\n")
+        self.w("add", ".")
+        self.w("commit", "-q", "-m", "side")
+        self.w("tag", "-a", "-m", "x", "v0.1.5", "side")  # not an ancestor of the base
+        for t in ("v0.2.0-rc.1", "v1.0.0", "v0.1.5"):
+            self.w("push", "-q", "origin", t)
+        text = self.notes_text()
+        self.assertIn("- Prior release: none\n- Comparison: none", text)
+
+    def test_deferrals_are_capped_at_twenty_with_a_count(self):
+        spec = importlib.util.spec_from_file_location("release_line_notes_unit", ROOT / "scripts/release-line.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        bad = [{"source": f"{i:012x}", "line": "v0", "code": "TO_PORT"} for i in range(23)]
+        c = types.SimpleNamespace(rl={"candidate_format": "v{version}-rc.{n}"}, version="0.3.0", base="main", ln={"integration_branch": "integration/v0.x", "id": "v0"})
+        f = types.SimpleNamespace(cand="c" * 40, final="f" * 40, tag="v0.3.0", first="b" * 40, pr=1)
+        facts = {"hosted_ci": "CI_PASS", "local_equivalent": None, "protection_after": "UNCHANGED"}
+        with mock.patch.multiple(mod, tag_names=lambda *a: [], commit_of=lambda *a: None, accounting_complete=lambda *a: (23, bad), prior_release=lambda *a: None,
+                                 journal_facts=lambda *a: facts, pinned_digest=lambda *a: None, git=lambda *a, **k: (0, "t\n")):
+            text = mod.render_notes(types.SimpleNamespace(clone="x", repo="o/r"), c, f, {"artifacts": []}).decode()
+        self.assertEqual(text.count("- Forward-port not merged: `"), 20)
+        self.assertIn("- Forward-port not merged: 3 more\n", text)
 
     def test_notes_bytes_are_identical_for_identical_inputs(self):
         self.built()
