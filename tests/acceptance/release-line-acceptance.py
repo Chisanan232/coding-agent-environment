@@ -6,7 +6,8 @@ against disposable fixture repositories: a local bare `origin`, a clone, a fake 
 policy / GO directory inside WORKDIR.
 
 Enforced by this script: the TOOL never reads the live ~/.config owner files (the launcher points it at the fixture home); the first `gh` on the host's PATH is
-the shim; the host environment has credential-shaped variables and GH_HOST removed (see --pass-env); Codex runs under `-s workspace-write`; the fixture owner
+the shim; the host environment drops names matching a credential pattern (TOKEN anywhere; SECRET/PASSWORD/API_KEY/PAT/AUTH words; *_KEY; *ASKPASS*; DATABASE_URL; GH_HOST;
+GH_CONFIG_DIR; GITHUB_*; so SSH_AUTH_SOCK too) unless named with --pass-env, while other names (e.g. MYSERVICE_CRED) and file credentials under the real HOME remain; Codex runs under `-s workspace-write`; the fixture owner
 files are hashed before and after every host session and a change fails the case. Only INSTRUCTED, not enforced: the host keeps the real HOME (so the installed
 skill and its login load) and Claude is not sandboxed, so a host could still touch the live policy/GO files or call a real gh by absolute path; the prompts tell it
 not to. A host can also write under WORKDIR, including the evidence files; treat the evidence as a record of what the host did, not as tamper-proof.
