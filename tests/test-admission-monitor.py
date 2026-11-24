@@ -92,13 +92,16 @@ class MonitorBase(unittest.TestCase):
         self.shim.holder_status = lambda pid, token, workload, *a: da.HolderStatus(self.statuses.get(pid, 'alive'), reason=self.reasons.get(pid, ''))
         self.emit_error = False
 
+    def emit_recovered(self, alert):      # the closing notice of a resolved incident (SPE-188): never the real notifier; tests/test-incident-recovered.py covers it
+        return {'result': 'queued', 'delivery': 'sent'}
+
     def env(self):
         limits = mon.default_limits(da, ma)
         return mon.Env(self.shim, self.state_path, self.memory_state, limits, clock=self.clock, mono=lambda: self.clock.mono,
                        boot=lambda: self.boot, table=lambda: self.table, memory=lambda: dict(self.mem), free=lambda: self.free,
                        advance=lambda: self.advances.append(self.clock.now) or {'exit': 0}, notify=lambda a: self.alerts.append(a) or True,
                        clear=lambda: self.cleared.append(self.clock.now) or True,
-                       emit_incident=self.emit,
+                       emit_incident=self.emit, emit_recovered=self.emit_recovered,
                        owner_process=lambda pid, token: self.process_answers.get(pid))      # never the real process table: unknown unless a test says otherwise
 
     def emit(self, alert):
