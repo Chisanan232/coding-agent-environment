@@ -363,7 +363,7 @@ The scenario cases only: `python3 tests/acceptance/release-line-acceptance.py WO
 Cost: each case-host pair is one real model session (minutes and real tokens); R7 is two sessions, so the full set (R1-R7) is 16 sessions; R8-R11 add 18 (R8 two sessions per host, R9 one, R10 and R11 three). WORKDIR must be new or one
 this script created (sentinel file); nothing else is deleted.
 
-| Case | Asks the host to | Pass evidence (ground truth, not the host's words; a `--help` call never counts as running a command) |
+| Case | Asks the host to | Pass evidence (taken from records, not from the host's words; see below for which records the host could write; a `--help` call never counts as running a command) |
 |---|---|---|
 | R1 | load the skill, report its scripts path, start the tool | canonical `scripts/release-line.py` path reported; a wrapper call exited 0 |
 | R2 | `registry validate`, `route` on the fixture | validate rc 0; refs, pushes and gh calls unchanged |
@@ -381,7 +381,12 @@ Not verified from a host (stated in each result row as `not_verified`, never cou
 second live target (with v0.5.0 EOL only v0.4.0 is live; covered by the unit tests); R10 a base that moves during the merge (`BASE_MOVED_UNACCOUNTED`, which needs a hook inside the fake gh); R11
 restoring branch protection (the tool never changes protection; the owner-run rollback script is not driven, the harness restores the fixture as the owner) and admin authorization scoped to its
 repository (an owner-merge gate feature, not a release-line one). The cases play the owner only where the tool says the owner acts (GO record, digest pin, local evidence and its pin, gate merge,
-protection restore); every verdict comes from tool envelopes, the fake-gh log, refs, the build manifest and the journal, not from the host's words.
+protection restore). Verdicts never rest on the host's words, but not every record they rest on is independent of the host: **read from origin** (refs and objects, verified metadata): R8 heads, their pinned shas and the PR count's
+consistency with them, R9 heads and clone cleanliness, R10 final tag, its parents, the base tip, the manifest-to-tag linkage, and R11 the promotion merge and annotated final tag. **Recorded by the wrapper** outside the fixture tree
+(append-only between sessions, but an unsandboxed host can write a NEW record within a session): every status, step state and refusal code in every case, all of R11's hosted-CI and protection assertions, R10's journal and manifest.
+**The fake gh's own files** (call log, `prs`, `releases`, `protection`; append-only or monotonic between sessions): all PR, merge and release counts, including R8's single tagged harness merge and R9's zero merges (a host that runs
+the fake gh by absolute path is counted, not prevented). A record forged within a session is a known limitation (covered by a test that documents the outcome); rewriting earlier records, logs, refs or owner files is detected. R11 therefore
+rests mostly on recorded evidence and is weaker than R8, R9 and R10; the offline unit test drives an obedient scripted host, which shows the checkers work, not how a real host behaves.
 
 Codex sandbox finding (verified with a one-session probe): under `codex exec -s workspace-write` a writable root's top-level `.git` is read-only, so a session
 whose working root IS the clone cannot `git fetch` or write refs (`git fetch` exit 255, `touch .git/x` fails) and every mutating or fetching release-line
