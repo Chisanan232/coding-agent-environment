@@ -287,8 +287,15 @@ token) and a timeout (default 1800 s, at most 7200 s, the build's own process gr
 `releases/<version>/` and their sha256 recorded in `releases/<version>.json` and the journal. A rerun with intact copies is `REUSED`; damaged copies are rebuilt.
 
 `notes` renders `releases/<version>.notes.md` deterministically from git, GitHub and the build manifest: source branch, release line, version, promotion PR,
-candidate tag and SHA, final tag and SHA, publication base, forward-port accounting for the base-only changes before the promotion, and the artifact checksums as
-`sha256sum` lines. It prints the path, its sha256 and `publish_digest`; without `--execute` it only reports them. `BUILD_MISSING` or `ARTIFACT_TAMPERED` when the
+candidate tag and SHA, final tag and SHA, publication base, forward-port accounting for the base-only changes before the promotion, the prior release and the
+comparison range, a **Verifications** section, a **Deferrals** section, and the artifact checksums as `sha256sum` lines. The prior release is the greatest same-major
+final tag below this version that is an ancestor of the base before the promotion, read from the clone's own tags (no network); the comparison is
+`<prior tag>...<final tag>` with the commit count, or `none` for both when there is no prior release. Verifications list the final-tree verification
+(`CARRIED_OVER` when the final tree equals the candidate tree, else `PASS` with the owner-pinned local-first record digest, else `not recorded`), the hosted CI
+state, the local-equivalent evidence digest and the protection check after promotion; the last three come from entries `release promote --execute` wrote to the
+journal and each is reduced to a closed set (a state name or a sha256), `not recorded` when absent. Deferrals list each forward-port not yet merged (source, line,
+code; at most 20, then a count), and each NOT_RUN or unrecorded hosted CI and protection check, or `none`. Output is bytes-deterministic for identical inputs,
+so the notes digest and `publish_digest` do not change between runs; a changed journal entry or pin changes them, and the owner re-pins `publish_digest`. It prints the path, its sha256 and `publish_digest`; without `--execute` it only reports them. `BUILD_MISSING` or `ARTIFACT_TAMPERED` when the
 build is absent or its copies no longer match the manifest.
 
 `publish --backend gh` needs a GO record with the `publish` scope whose `candidate_sha` equals the promotion's candidate (`GO_MISSING`, `GO_SCOPE`, `GO_EXPIRED`,

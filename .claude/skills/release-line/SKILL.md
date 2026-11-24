@@ -21,13 +21,13 @@ python3 -I "$R" --help
 
 Every command takes `--repo OWNER/REPO` (the registered product repo) and, for commands that read git state, `--clone PATH` (a checkout whose `origin` is that repo). Exit codes: 0 for PASS, NOT_RUN or DEFERRED; 1 for BLOCKED or FAIL; 2 for a usage error; 3 for invalid configuration.
 
-Commands that exist today are documented in
-`docs/RELEASE-LINES.md` of that checkout: `registry validate|show|propose`,
-`audit observe|import`, `route`, `guard`, `successor ensure`,
-`train integrate|converge`, `forward-port plan|run|status`. Only use commands the
-installed checkout's `--help` lists. Release candidate, promotion, final-tag and
-publication commands are documented in `docs/RELEASE-LINES.md` once merged; do not
-assume them.
+Commands are documented in `docs/RELEASE-LINES.md` of that checkout:
+`registry validate|show|propose`, `audit observe|import`, `route`, `guard`,
+`successor ensure`, `train integrate|converge`, `forward-port plan|run|status`,
+`release candidate-tag|promote|verify|final-tag|build|notes|publish|run`, and
+`protection snapshot|verify`. Only use commands the installed checkout's `--help`
+lists. Every `release` command and `protection snapshot` defaults to a dry plan;
+`--execute` acts, and acts only under a recorded owner GO (see Safety rules).
 
 ## Steps
 1. `registry validate --repo OWNER/REPO` first. `AUDIT_PENDING` blocks every mutating command; read-only commands still work.
@@ -35,7 +35,8 @@ assume them.
 3. Before opening a PR, run `guard --repo OWNER/REPO --clone PATH --base B --head SHA` and act on its finding.
 4. Mutating commands print a dry plan by default. Review it, then rerun with `--execute`.
 5. After a maintenance fix merges, run `forward-port plan` then `forward-port run --execute`; confirm with `status` until `complete` is true.
-6. Report the JSON `status` verbatim (PASS, FAIL, BLOCKED, NOT_RUN, DEFERRED) with the command, revision and exit code.
+6. For a release, run the steps in order: `release candidate-tag`, `promote`, `verify`, `final-tag`, `build`, `notes`, `publish` (or `release run --until STEP`). Each step is a dry plan first; run its `--execute` only when a GO record with that step's scope exists. `release notes` prints the notes digest and `publish_digest`; the owner pins `publish_digest` in the GO record before `publish`. `protection verify --branch B` reports drift of the publication base; the tool never changes protection.
+7. Report the JSON `status` verbatim (PASS, FAIL, BLOCKED, NOT_RUN, DEFERRED) with the command, revision and exit code.
 
 Routing rules, train order, accounting states, GO records and the zero-spend rule are in
 [references/algorithms.md](references/algorithms.md).
