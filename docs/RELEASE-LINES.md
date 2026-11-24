@@ -330,7 +330,11 @@ reachable because the real `HOME` is kept;
 Codex runs under `-s workspace-write`; the fixture's owner files (policy, GO directory, origins, pins) are hashed before and after every host session and any
 host-side change fails the case (the harness's own `publish_digest` pin between the two R7 sessions is the only exception). Only instructed: the host keeps the real
 `HOME` so the installed skill and its login load, and Claude is not sandboxed, so a host could still touch the live policy/GO files or run a real `gh` by absolute
-path; the prompts tell it not to. A host can also write under WORKDIR, including the evidence files, so the evidence is a record of what happened, not tamper-proof.
+path; the prompts tell it not to. A host can also write under WORKDIR, including the evidence files, so the evidence is a record of what happened, not tamper-proof. The harness also never runs code the host could have planted: origin refuses non-fast-forwards and deletions, and a harness-written `pre-receive` hook logs every ref update it
+receives (a rejected force-push is still detected and fails the case); the fake gh and git wrappers, the shim and wrapper, origin's and the clone's config, hooks and info, and the
+non-mutable fake-gh state are hashed before and after every host session, and a change fails the case before any owner step or git read; owner commits are made in a fresh
+harness-owned clone outside the fixture tree with hooks and fsmonitor off; a missing git or origin log fails closed. Residual risks: a host process that outlives its session can race
+those checks, the keys the fake gh itself writes (`prs`, `releases`, `protection`) are host-writable, and Claude is not sandboxed.
 
 The tool reads its owner config from the account-database home, never `$HOME`, so the fixture runs the canonical `scripts/release-line.py` of the maintained
 checkout through that checkout's `tests/release-line-test-launcher.py` (a test-only shim that reports the fixture home). The host is told to call a per-fixture
