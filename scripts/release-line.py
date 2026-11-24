@@ -2198,14 +2198,18 @@ def release_promote(args, res):
         finally:
             if args.execute:
                 try:
+                    merged_final = scan_promotion(clone, base_ref, cand)  # binds the protection row to the merge it describes
+                except Refusal:
+                    merged_final = None
+                try:
                     after = protection_compare(args, c.base)
                     res.step("protection_after", "DRIFT" if after[2] else "UNCHANGED", {"changed": after[2]})
                     drift = after[2]
-                    j.append(key=res.env["idempotency_key"], state="protection-after", result="DRIFT" if after[2] else "UNCHANGED")
+                    j.append(key=res.env["idempotency_key"], state="protection-after", final_sha=merged_final, result="DRIFT" if after[2] else "UNCHANGED")
                 except (Refusal, ValueError, OSError) as e:
                     # The merge may already have happened: an unverifiable result is never left looking like a pass.
                     res.step("protection_after", "NOT_RUN", {"reason": getattr(e, "code", type(e).__name__)})
-                    j.append(key=res.env["idempotency_key"], state="protection-after", result="NOT_RUN")
+                    j.append(key=res.env["idempotency_key"], state="protection-after", final_sha=merged_final, result="NOT_RUN")
                     res.status, res.next_action = "FAIL", f"verify {c.base} branch protection manually (the after-merge comparison could not run); {ROLLBACK} restores it"
         if drift:
             res.status, res.next_action = "FAIL", f"PROTECTION_DRIFT: restore {c.base} protection with {ROLLBACK}"
@@ -2690,9 +2694,10 @@ def publish_digest(args, version, final, notes_sha, manifest):
 
 
 NOTES_DEFERRAL_MAX = 20
+U = " (journal-recorded, unverified)"
 NOTES_TOKEN_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 HOSTED_CI_STATES = ("CI_PASS", "CI_PENDING", "NOT_RUN", "CI_FAILED")
-PROTECTION_STATES = ("UNCHANGED", "DRIFT", "NOT_RUN")
+PROTECTION_STATES = ("DRIFT", "NOT_RUN", "UNCHANGED")  # worst first
 
 
 def prior_release(args, c, f):
@@ -2714,7 +2719,8 @@ def prior_release(args, c, f):
 
 def journal_facts(args, c, f):
     """Recorded verification facts for this promotion from the journal, each reduced to a closed set (a state name or a sha256), else None.
-    The journal is an audit trail the agent can write, so these lines inform readers; the owner's publish_digest pin is what authorizes the content."""
+    The journal is an audit trail the agent can write, so the notes label every value taken from it as unverified; the owner's publish_digest pin is what
+    authorizes the content. Only rows bound to this final SHA count."""
     facts = {"hosted_ci": None, "local_equivalent": None, "protection_after": None}
     key = f"promote:{args.repo}:{c.version}:{f.cand}"
     try:
@@ -2725,13 +2731,16 @@ def journal_facts(args, c, f):
     for r in rows:
         if not isinstance(r, dict) or r.get("key") != key:
             continue
+        if r.get("final_sha") != f.final:
+            continue  # a row for another merge of this candidate says nothing about this one
         if r.get("state") == "promoted":
             if facts["hosted_ci"] is None and r.get("hosted_ci") in HOSTED_CI_STATES:
                 facts["hosted_ci"] = r["hosted_ci"]
             if facts["local_equivalent"] is None and isinstance(r.get("local_equivalent_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", r["local_equivalent_sha256"]):
                 facts["local_equivalent"] = r["local_equivalent_sha256"]
         elif r.get("state") == "protection-after" and r.get("result") in PROTECTION_STATES:
-            facts["protection_after"] = r["result"]
+            if facts["protection_after"] is None or PROTECTION_STATES.index(r["result"]) < PROTECTION_STATES.index(facts["protection_after"]):
+                facts["protection_after"] = r["result"]  # worst result wins: DRIFT, then NOT_RUN, then UNCHANGED
     return facts
 
 
@@ -2761,8 +2770,8 @@ def render_notes(args, c, f, manifest):
         deferrals.append(f"Forward-port not merged: {len(bad) - NOTES_DEFERRAL_MAX} more")
     if facts["hosted_ci"] in (None, "NOT_RUN"):
         deferrals.append("Hosted CI: NOT_RUN" if facts["hosted_ci"] else "Hosted CI: NOT_VERIFIED (no record)")
-    if facts["protection_after"] in (None, "NOT_RUN"):
-        deferrals.append("Protection check after promotion: NOT_RUN" if facts["protection_after"] else "Protection check after promotion: NOT_VERIFIED (no record)")
+    if facts["protection_after"] in (None, "NOT_RUN", "DRIFT"):
+        deferrals.append(f"Protection check after promotion: {facts['protection_after']}" if facts["protection_after"] else "Protection check after promotion: NOT_VERIFIED (no record)")
     rows = "\n".join(f"{a['sha256']}  {a['name']}" for a in manifest["artifacts"])
     text = "\n".join([
         f"# Release {c.version}", "",
@@ -2776,13 +2785,13 @@ def render_notes(args, c, f, manifest):
         f"- Final SHA: `{f.final}`",
         f"- Publication base: `{c.base}`",
         f"- Forward-port accounting: {accounted}",
-        f"- Prior release: {'`' + prior[1] + '`' if prior else 'none'}",
+        f"- Prior release: {'`' + prior[1] + '` (local tags)' if prior else 'none'}",
         f"- Comparison: {'`' + prior[1] + '...' + f.tag + '` (' + prior[2] + ' commit(s))' if prior else 'none'}", "",
         "## Verifications", "",
         f"- Final tree verification: {final_tree}",
-        f"- Hosted CI: {facts['hosted_ci'] or 'not recorded'}",
-        f"- Local-equivalent evidence: {'`' + facts['local_equivalent'] + '`' if facts['local_equivalent'] else 'none'}",
-        f"- Branch protection after promotion: {facts['protection_after'] or 'not recorded'}", "",
+        f"- Hosted CI: {facts['hosted_ci'] + U if facts['hosted_ci'] else 'not recorded'}",
+        f"- Local-equivalent evidence: {'`' + facts['local_equivalent'] + '`' + U if facts['local_equivalent'] else 'none'}",
+        f"- Branch protection after promotion: {facts['protection_after'] + U if facts['protection_after'] else 'not recorded'}", "",
         "## Deferrals", "",
         *([f"- {d}" for d in deferrals] or ["- none"]), "",
         "## Artifact checksums (sha256)", "", "```", rows, "```", ""])
