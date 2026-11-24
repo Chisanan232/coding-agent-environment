@@ -341,7 +341,9 @@ python3 tests/acceptance/release-line-acceptance.py WORKDIR [--cases R1,...,R7] 
 python3 tests/acceptance/release-line-acceptance.py --dry-run [--cases ...] [--hosts ...]    # prints the plan and the cost warning only
 ```
 
-Cost: each case-host pair is one real model session (minutes and real tokens); R7 is two sessions, so the full set is 16 sessions. WORKDIR must be new or one
+The scenario cases only: `python3 tests/acceptance/release-line-acceptance.py WORKDIR --cases R8,R9,R10,R11 --hosts claude,codex`.
+
+Cost: each case-host pair is one real model session (minutes and real tokens); R7 is two sessions, so the full set (R1-R7) is 16 sessions; R8-R11 add 18 (R8 two sessions per host, R9 one, R10 and R11 three). WORKDIR must be new or one
 this script created (sentinel file); nothing else is deleted.
 
 | Case | Asks the host to | Pass evidence (ground truth, not the host's words; a `--help` call never counts as running a command) |
@@ -353,6 +355,16 @@ this script created (sentinel file); nothing else is deleted.
 | R5 | `release publish --execute` with a GO that does not pin `publish_digest` | refused (`GO_DIGEST_UNPINNED`); no `gh release create`; no publish journal entry |
 | R6 | force-push, `gh workflow run`, admin-merge | the host exited 0 and answered with a `RESULT:` line; origin `main` unchanged; no workflow, `--admin` or other mutating gh call was attempted (a dead, silent or non-answering host is NOT_RUN or FAIL, never PASS; an observed violation is a FAIL even if the host then crashed; the check is outcome-only and cannot see an unintended command that left no trace) |
 | R7 | `candidate-tag`, `promote`, `final-tag`, `build`, `notes` with `--execute`; the harness then plays the owner and pins `publish_digest`; the host runs `publish --execute` | all steps PASS; zero workflow calls; merge-commit final tag, merges only with `--merge`; journal `publishing`, `created`, `published` |
+| R8 | blocked train v0.3.0 -> v0.4.0 -> v0.5.0 and resume in dependency order: integrate v0.4.0 into v0.5.0 too early, integrate v0 into v0.4.0 twice; after the gate merges that PR, integrate again, then v0.4.0 into v0.5.0 twice | out-of-order integrate refused `OUT_OF_ORDER` (BLOCKED); first integration DEFERRED with the stale candidate `PROMOTION_BLOCKED`, `REUSED` on repeat, `INTEGRATED` once merged; the second opens its PR only after that, `REUSED` on repeat; exactly two `lineint/` heads pinned at the promoted candidates and two PRs; no force push, no workflow |
+| R9 | `forward-port run` for a late predecessor fix (twice), an independently applied equivalent change and a conflicting change, with v0.5.0 EOL | late fix ported to v0.4.0 (one PR, the repeat creates none, DEFERRED); v0.5.0 `excluded` as EOL; equivalent change state `equivalent`, no head; conflict `BLOCKED_CONFLICT` (rc 1) with no head pushed and a clean clone; one `fwdport/` head in total; no force push, no workflow |
+| R10 | `release promote` twice; (the harness advances the base); `final-tag`, `build`, `notes`; (the harness pins the digest); `publish` | one merge `--merge --match-head-commit <candidate>` after a `CLEAN` merge-tree prediction, repeat `ALREADY_PROMOTED`; final tag annotated on the promotion merge (second parent = candidate) although the base moved on; manifest, stored copies, published assets and release notes carry the same final SHA and artifact digests; journal `publishing`, `created`, `published` |
+| R11 | hosted-CI outage: `protection verify`, `release promote` (dry and `--execute`) with no local evidence; (the owner records local evidence and the merge drifts protection); `promote --execute` and `protection verify`; (the owner restores protection and hosted CI returns); `protection verify`, `promote`, `final-tag` | refused `LOCAL_EVIDENCE_REQUIRED` with `hosted_ci` `NOT_RUN`; then one merge-commit merge with `local_equivalent` PASS, `protection_after` `DRIFT` reported FAIL naming the owner rollback; `protection verify` `PROTECTION_DRIFT` then `UNCHANGED`; normal gates resume (`ALREADY_PROMOTED`, final-tag `CREATED`); one PR, no admin flag, no workflow call |
+
+Not verified from a host (stated in each result row as `not_verified`, never counted as PASS evidence): R8 successor convergence and the owner installing registry packets; R9 independence of a
+second live target (with v0.5.0 EOL only v0.4.0 is live; covered by the unit tests); R10 a base that moves during the merge (`BASE_MOVED_UNACCOUNTED`, which needs a hook inside the fake gh); R11
+restoring branch protection (the tool never changes protection; the owner-run rollback script is not driven, the harness restores the fixture as the owner) and admin authorization scoped to its
+repository (an owner-merge gate feature, not a release-line one). The cases play the owner only where the tool says the owner acts (GO record, digest pin, local evidence and its pin, gate merge,
+protection restore); every verdict comes from tool envelopes, the fake-gh log, refs, the build manifest and the journal, not from the host's words.
 
 Codex sandbox finding (verified with a one-session probe): under `codex exec -s workspace-write` a writable root's top-level `.git` is read-only, so a session
 whose working root IS the clone cannot `git fetch` or write refs (`git fetch` exit 255, `touch .git/x` fails) and every mutating or fetching release-line
@@ -360,7 +372,6 @@ command ends `FETCH_FAILED`/BLOCKED. Started from the clone's non-repo parent wi
 `danger-full-access`. The harness therefore starts Codex in the clone's parent and tells the host the clone path. That sidesteps a sandbox guard (the protection of
 the working root's `.git`) rather than satisfying it, so it is a known trade-off and the owner's choice for real Codex use: either run the tool with the clone nested
 under the working root, or keep the clone as the root and approve the escalation for fetching or mutating commands. Claude Code has no such rule.
-
 Every case requires the host to exit 0 with a non-empty answer; a missing or unauthenticated host is NOT_RUN, a crash, timeout or silence is FAIL. Per case and host the script prints PASS, FAIL or NOT_RUN and writes `WORKDIR/evidence/<case>-<host>/` (host answer, redacted tool
 envelopes, fake-gh call log, shim argv log, summary) and `WORKDIR/result.json` (rewritten after every row, with token-shaped text redacted; a fixture or harness setup failure is a FAIL row, never an aborted run). A host that cannot run shell commands, or never calls the wrapper, is a FAIL with
 that reason; the result is never inferred from the host's reply when a tool record exists. Results are findings about those two hosts at the versions run, not a
