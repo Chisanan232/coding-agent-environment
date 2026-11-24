@@ -993,6 +993,25 @@ class HandoffIncidents(MonitorBase):
         (rec,) = self.incidents().values()
         self.assertIsNone(rec['resolved_at'])                                  # the owner has not been told: still an open obligation
 
+    def test_a_resolve_never_overwrites_an_acknowledgement(self):
+        """The guard `acknowledged_at is None` in the resolve step: a claimed grant is acknowledged, then its entry reads as over (cancelled);
+        the record keeps its acknowledgement and is not also marked resolved."""
+        qid = self.granted_handoff()
+        self.walk(960)
+        self.claim(qid)
+        for i in range(4):
+            self.table = {4242: (1, 10.0 + i)}
+            self.tick()
+        (rec,) = self.incidents().values()
+        self.assertIsNotNone(rec['acknowledged_at'])
+        entry = self.entry(qid)
+        entry['state'] = 'CANCELLED'
+        da._write_queue_entry(self.state_path, entry)
+        self.walk(120)
+        (rec,) = self.incidents().values()
+        self.assertIsNotNone(rec['acknowledged_at'])
+        self.assertIsNone(rec['resolved_at'])
+
     def test_a_cancelled_unclaimed_grant_resolves_its_incident_without_a_notice(self):
         qid = self.granted_handoff()
         self.walk(900)
