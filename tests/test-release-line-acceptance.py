@@ -8,6 +8,7 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -781,6 +782,115 @@ class FixtureAndRunCase(unittest.TestCase):
                 fx.owner_gate_merge(2)
         finally:
             fx.close()
+
+    def evidence_dir(self, case="R7", host="claude"):
+        return pathlib.Path(self.work_of_run) / "evidence" / ("%s-%s" % (case, host))
+
+    def run_in_fresh_workdir(self, case, host_fn):
+        rla.run_host = host_fn
+        self.count = getattr(self, "count", 0) + 1
+        self.work_of_run = rla.claim_workdir(pathlib.Path(self.tmp.name) / ("e%d" % self.count), ROOT)
+        return rla.run_case(case, "claude", MAIN, self.work_of_run, 5)
+
+    def test_evidence_is_never_written_through_host_planted_symlinks(self):
+        victim = pathlib.Path(self.tmp.name) / "victim-evidence"
+        victim.mkdir()
+        (victim / "keep.txt").write_text("precious\n")
+        evidence_label = lambda work: pathlib.Path(work) / "evidence" / "R7-claude"
+
+        def link_calls(host_name, prompt, fx, work, timeout, pass_env=()):
+            out = self.scripted(host_name, prompt, fx, work, timeout, pass_env)
+            planted = evidence_label(work) / "calls"
+            if planted.is_symlink():
+                planted.unlink()
+            shutil.rmtree(planted, ignore_errors=True)
+            os.symlink(victim, planted)  # pre-created in the evidence directory the harness will publish into
+            return out
+        row = self.run_in_fresh_workdir("R7", link_calls)
+        self.assertEqual(row["status"], "PASS", row)
+        self.assertEqual(sorted(p.name for p in victim.iterdir()), ["keep.txt"])  # nothing was written through the link
+        self.assertTrue((evidence_label(self.work_of_run) / "calls").is_dir() and not (evidence_label(self.work_of_run) / "calls").is_symlink())
+
+        def link_label(host_name, prompt, fx, work, timeout, pass_env=()):
+            out = self.scripted(host_name, prompt, fx, work, timeout, pass_env)
+            label = evidence_label(work)
+            if label.is_symlink():
+                label.unlink()
+            shutil.rmtree(label, ignore_errors=True)
+            os.symlink(victim, label)
+            return out
+        row = self.run_in_fresh_workdir("R7", link_label)
+        self.assertEqual(sorted(p.name for p in victim.iterdir()), ["keep.txt"])
+        self.assertFalse(evidence_label(self.work_of_run).is_symlink())
+        self.assertTrue((evidence_label(self.work_of_run) / "summary.json").is_file())
+
+        def link_root(host_name, prompt, fx, work, timeout, pass_env=()):
+            out = self.scripted(host_name, prompt, fx, work, timeout, pass_env)
+            root = pathlib.Path(work) / "evidence"
+            if root.is_symlink():
+                root.unlink()
+            shutil.rmtree(root, ignore_errors=True)
+            os.symlink(victim, root)
+            return out
+        row = self.run_in_fresh_workdir("R7", link_root)
+        self.assertEqual(row["status"], "FAIL", row)  # refused rather than written through
+        self.assertEqual(sorted(p.name for p in victim.iterdir()), ["keep.txt"])
+
+    def test_a_symlinked_or_special_source_record_is_a_problem_and_never_followed(self):
+        victim = pathlib.Path(self.tmp.name) / "victim-record.json"
+        victim.write_text(json.dumps({"argv": ["release", "candidate-tag"], "rc": 1, "envelope": {"status": "BLOCKED", "steps": []}}))
+
+        def swap_record(host_name, prompt, fx, work, timeout, pass_env=()):
+            out = self.scripted(host_name, prompt, fx, work, timeout, pass_env)
+            record = fx.origin_dir / "calls" / "call-001.json"
+            record.unlink()
+            record.symlink_to(victim)
+            return out
+        row = self.run_with("R7", swap_record)
+        self.assertEqual(row["status"], "FAIL", row)
+        self.assertIn("not a plain regular", row["why"])
+
+        def fifo_calls_log(host_name, prompt, fx, work, timeout, pass_env=()):
+            out = self.scripted(host_name, prompt, fx, work, timeout, pass_env)
+            log = pathlib.Path(str(fx.t.gh_state) + ".calls")
+            log.unlink(missing_ok=True)
+            os.mkfifo(log)
+            return out
+        row = self.run_with("R7", fifo_calls_log)  # must return, never block
+        self.assertEqual(row["status"], "FAIL", row)
+
+    def test_read_regular_never_follows_or_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            (tmp / "f").write_text("hi")
+            self.assertEqual(rla.read_regular(tmp / "f"), "hi")
+            self.assertIsNone(rla.read_regular(tmp / "absent"))
+            (tmp / "link").symlink_to(tmp / "f")
+            os.mkfifo(tmp / "fifo")
+            (tmp / "big").write_text("x" * 100)
+            for bad in ("link", "fifo"):
+                with self.assertRaises(ValueError):
+                    rla.read_regular(tmp / bad)
+            with self.assertRaises(ValueError):
+                rla.read_regular(tmp / "big", limit=10)
+            self.assertEqual(rla.read_regular(tmp / "f", binary=True), b"hi")
+
+    def test_safe_publish_creates_exclusively_and_replaces_planted_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            victim = tmp / "victim"
+            victim.mkdir()
+            dest = tmp / "evidence" / "R1-x"
+            dest.parent.mkdir()
+            dest.mkdir()
+            (dest / "summary.json").symlink_to(victim / "target")  # a pre-planted file link
+            rla.safe_publish({"summary.json": "new", "calls/call-001.json": "{}"}, dest)
+            self.assertEqual((dest / "summary.json").read_text(), "new")
+            self.assertFalse((dest / "summary.json").is_symlink())
+            self.assertEqual(list(victim.iterdir()), [])
+            for bad in ("../x", "a/../b", ""):
+                with self.assertRaises(ValueError):
+                    rla.safe_publish({bad: "x"}, dest)
 
     def test_an_honest_r1_host_passes(self):
         def honest(host, prompt, fx, work, timeout, pass_env=()):
