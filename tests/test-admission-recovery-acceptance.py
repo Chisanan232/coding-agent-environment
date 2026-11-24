@@ -191,6 +191,7 @@ class Acceptance(unittest.TestCase):
                       table=lambda: {}, memory=lambda: {'latched': False, 'ok_streak': 0, 'metrics': dict(CALM)}, free=lambda: 300 * GIB,
                       advance=lambda: self.advances.append(1) or {'exit': 0}, notify=lambda a: self.alerts.append(a) or True, clear=lambda: True,
                       emit_incident=lambda alert: self.alerts.append(alert) or dict(self.emit_result),
+                      emit_recovered=lambda alert: dict(self.emit_result),
                       owner_sessions=lambda: self.sessions, recovery_env=self.recovery_env, **kw)
         self.current_env = env
         return env

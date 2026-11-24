@@ -713,6 +713,8 @@ def clean_incident(rec):
             'dedups': rec['dedups'] if type(rec.get('dedups')) is int and 0 <= rec['dedups'] < 1000 else 0,
             'delivery': rec['delivery'] if rec.get('delivery') in ('sent', 'pending', 'dropped', 'unknown', 'unconfirmed') else None,
             'attempts': rec['attempts'] if type(rec.get('attempts')) is int and 0 <= rec['attempts'] < 1000 else 0, 'next_try': num('next_try') or 0,
+            'recovered_at': num('recovered_at'), 'recovered_tries': rec['recovered_tries'] if type(rec.get('recovered_tries')) is int and 0 <= rec['recovered_tries'] < 1000 else 0,
+            'recovered_next': num('recovered_next') or 0,
             'waiter': False, 'action': 'none', 'verify': verify}
 
 
@@ -801,7 +803,7 @@ class Env:
     """Everything a tick touches outside its own state, so tests substitute it."""
 
     def __init__(self, da, state_path, memory_state_path, limits, clock=None, mono=None, boot=None, table=None, memory=None,
-                 free=None, advance=None, notify=None, clear=None, reservations=None, stamps=None, events=None, emit_incident=None,
+                 free=None, advance=None, notify=None, clear=None, reservations=None, stamps=None, events=None, emit_incident=None, emit_recovered=None,
                  owner_sessions=None, owner_process=None, owner_launcher=None, recovery_env=None):
         self.da, self.state_path, self.memory_state_path, self.limits = da, Path(state_path), Path(memory_state_path), limits
         self.clock = clock or (lambda: datetime.now(timezone.utc))
@@ -815,6 +817,7 @@ class Env:
         self.stamps = stamps or self._stamps
         self.events = events or self._events
         self.emit_incident = emit_incident or session_notify_incident
+        self.emit_recovered = emit_recovered or session_notify_recovered
         self.owner_sessions = owner_sessions or (lambda: {})      # local session records: none are read yet, so the harness field decides the kind
         self.owner_process = owner_process or self._owner_process
         self.owner_launcher = owner_launcher or (lambda session: None)      # launcher metadata is not readable here: uninspectable, never gone
@@ -1010,6 +1013,21 @@ def session_notify_incident(alert, runner=None):
             '--owner-action', alert.get('owner_action') or 'inspect-admission-state', '--signature', alert['signature'], '--strict']
     if alert.get('incident_ref'):
         argv += ['--incident-ref', alert['incident_ref']]
+    try:
+        done = (runner or subprocess.run)(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return {'result': 'failed', 'delivery': None}
+    seen = re.search(r'emit-resource: (queued|deduped|no-backend)(?: delivery=(sent|pending|dropped|unknown))?', getattr(done, 'stdout', '') or '')
+    if done.returncode != 0 or not seen:
+        return {'result': 'failed', 'delivery': None}
+    return {'result': seen.group(1), 'delivery': seen.group(2)}
+
+
+def session_notify_recovered(alert, runner=None):
+    """Tell the supervisor, through the spool, that an incident it was told about is over (SPE-188): one closing `recovered` transition with the incident's own
+    ref. Same result shape as `session_notify_incident`. The notice carries only the fixed phrases of the closing notice (no id, path or number)."""
+    argv = [sys.executable, str(HERE / 'session-notify.py'), 'emit-resource', '--cause', 'incident-resolved', '--recovery', 'resolved',
+            '--owner-action', 'no-action-needed', '--signature', alert['signature'], '--incident-ref', alert['incident_ref'], '--strict']
     try:
         done = (runner or subprocess.run)(argv, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
@@ -1555,6 +1573,7 @@ def handoff_incidents(env, state, verdict, entries, now, wall, result, gap=False
             rec['next_try'] = wall + min(60 * 2 ** (min(rec['attempts'], 10) - 1), 900)     # not handed off, or not yet delivered: retried or polled
         state['last_alert'] = {'at': iso(now), 'cause': alert['cause'], 'signature': alert['signature'], 'delivered': rec['delivered_at'] is not None,
                                'attempts': rec['attempts']}
+    close_incidents(env, incidents, wall)
     for rec in incidents.values():
         rec['owner_notice_state'] = owner_notice_state(rec)
     state['incidents'] = prune_incidents(incidents, wall)
@@ -1563,6 +1582,92 @@ def handoff_incidents(env, state, verdict, entries, now, wall, result, gap=False
     result['handoff_incidents'] = [{'status': r['status'], 'clock': r['clock'], 'blocker': r['blocker'], 'id': r['id'], 'phase': r['phase'], 'owner_notice_state': r['owner_notice_state'], 'handed_off_at': r['handed_off_at'], 'delivered_at': r['delivered_at'],
                                     'delivery': r['delivery'], 'acknowledged_at': r['acknowledged_at'], 'resolved_at': r['resolved_at'], 'ack_deadline': r['ack_deadline'], 'waiter': False,
                                     'action': 'none', 'verify': r['verify']} for r in state['incidents'].values()]
+
+
+RECOVERED_PER_TICK = 5        # closing notices handed to session-notify in one tick; the rest wait for the next tick
+RECOVERED_MAX_TRIES = 20      # then the closing notice is given up (the spool stayed unusable); the incident itself is unaffected
+RECOVERABLE_CLOCKS = ('grant', 'wait', 'run')   # a stale-claim incident has no spool kind, so it never had a notice to close
+
+
+def recovered_alert(key):
+    return {'cause': 'incident-resolved', 'signature': incident_signature(key, 'recovered'), 'incident_ref': incident_ref(key)}
+
+
+def close_incidents(env, incidents, wall):
+    """Tell the supervisor, once, that an incident it was told about is over (SPE-188). Before this the supervisor kept every unclaimed-hand-off incident
+    open for ever: the monitor spooled `opened` and `escalated` and never anything that closes it. An incident is over when it is resolved (the grant lapsed or
+    was cancelled, the wait or run ended) or acknowledged (a holder claimed it), and it is closed only if a notice for it was handed to session-notify (an
+    incident that was never announced has nothing to close). This is a notification of a state the monitor already recorded, not a recovery action: it runs
+    in observe-only mode like the `opened` and `escalated` notices, and it takes no action on the queue. `recovered_at` makes it once per incident across
+    ticks and restarts (session-notify's own ledger dedups a crash between the send and the save)."""
+    sent = 0
+    for key, rec in sorted(incidents.items(), key=lambda kv: kv[1]['grant_wall']):
+        if (rec['clock'] not in RECOVERABLE_CLOCKS or rec['status'] == SUPPRESSED or rec['recovered_at'] is not None or rec['notified_phase'] is None
+                or (rec['resolved_at'] is None and rec['acknowledged_at'] is None) or wall < rec['recovered_next']):
+            continue
+        if sent >= RECOVERED_PER_TICK:
+            break
+        sent += 1
+        try:
+            outcome = env.emit_recovered(recovered_alert(key))
+        except Exception:
+            outcome = {}
+        rec['recovered_tries'] += 1
+        if outcome.get('result') in ('queued', 'deduped') or rec['recovered_tries'] >= RECOVERED_MAX_TRIES:
+            rec['recovered_at'] = wall
+        else:
+            rec['recovered_next'] = wall + min(60 * 2 ** (min(rec['recovered_tries'], 10) - 1), 900)
+
+
+SUPERVISOR_STATUS = Path.home() / '.local/share/engineering-supervisor/state/incident-status.json'
+RECONCILE_MAX_SENDS = 50      # one --apply sends at most this many closing notices; rows past it stay `closable` for the next run
+RECONCILE_KINDS = ('unclaimed-handoff', 'queue-wait-excessive', 'workload-over-deadline')
+
+
+def over_by_scheduler(clock, entry):
+    """Is the incident of this clock over according to the scheduler entry itself (not the monitor's pruned record)? A live grant, a queued wait and a claimed
+    run are not."""
+    return entry['state'] not in {'grant': ('GRANTED',), 'wait': ('QUEUED', 'ELIGIBLE'), 'run': ('CLAIMED',)}[clock]
+
+
+def reconcile_incidents(env, status_path=None, apply=False):
+    """One-shot reconcile (SPE-188): which incidents the supervisor still lists as open (its `incident-status.json`, read only) belong to a scheduler entry that
+    is no longer in the state that raised them. A ref is rebuilt from scheduler state with the monitor's own key rules (grant: id@grant.at, wait: id:wait, run:
+    id:run), because the monitor prunes old incident records. Dry run by default: it writes nothing. With `apply` it hands one closing `recovered`
+    notice per closable ref to session-notify (the same notice and dedup as the monitor's own), and never touches the queue, the monitor state or the supervisor's
+    files. Returns {'rows': [...], 'applied': n}; each row has ref, kind, id, clock, state, action in closable|keep|unmapped|sent|failed."""
+    path = Path(status_path) if status_path else SUPERVISOR_STATUS
+    doc = read_json(path, None)
+    opened = [i for i in (doc or {}).get('open_incidents', []) if isinstance(i, dict) and i.get('kind') in RECONCILE_KINDS and isinstance(i.get('incident_ref'), str)]
+    entries, problems = env.da._queue_entries(env.state_path)
+    by_ref = {}
+    for entry in entries:
+        keys = [('wait', entry['id'] + ':wait'), ('run', entry['id'] + ':run')]
+        if isinstance(entry.get('grant'), dict) and entry['grant'].get('at'):
+            keys.append(('grant', incident_key(entry)))
+        for clock, key in keys:
+            by_ref[incident_ref(key)] = (clock, key, entry)
+    rows, applied, sends = [], 0, 0
+    for item in sorted(opened, key=lambda i: i.get('ts') or ''):
+        ref = item['incident_ref']
+        found = by_ref.get(ref)
+        if found is None:
+            rows.append({'ref': ref, 'kind': item['kind'], 'id': None, 'clock': None, 'state': None, 'action': 'unmapped'})
+            continue
+        clock, key, entry = found
+        row = {'ref': ref, 'kind': item['kind'], 'id': entry['id'], 'clock': clock, 'state': entry['state'],
+               'action': 'closable' if over_by_scheduler(clock, entry) and not problems else 'keep'}
+        if apply and row['action'] == 'closable' and sends < RECONCILE_MAX_SENDS:
+            sends += 1
+            try:
+                outcome = env.emit_recovered(recovered_alert(key))
+            except Exception:
+                outcome = {}
+            ok = outcome.get('result') in ('queued', 'deduped')
+            row['action'] = 'sent' if ok else 'failed'
+            applied += 1 if ok else 0
+        rows.append(row)
+    return {'rows': rows, 'applied': applied, 'dry_run': not apply, 'unreadable_queue': bool(problems), 'failed': sum(1 for r in rows if r['action'] == 'failed')}
 
 
 def incident_alert(key, rec, wall):
@@ -1583,7 +1688,8 @@ def new_incident(entry_id, phase, started, expires, wall, deadline, clock, block
     return {'status': None, 'resolved_at': None, 'discounted_s': None, 'clock': clock, 'blocker': blocker, 'holder_pid': None, 'holder_token': None, 'elapsed_s': None, 'deadline_s': None, 'deadline_source': None,
             'outbox_phase': None, 'id': entry_id, 'phase': phase, 'grant_wall': started, 'expires_wall': expires, 'raised_at': wall, 'ack_deadline': deadline,
             'handed_off_at': None, 'delivered_at': None, 'delivery': None, 'acknowledged_at': None, 'owner_notice_state': 'pending', 'claim_seen': False,
-            'handed_off_unverified': False, 'dedups': 0, 'notified_phase': None, 'attempts': 0, 'next_try': 0, 'waiter': False, 'action': 'none', 'verify': None}
+            'handed_off_unverified': False, 'dedups': 0, 'notified_phase': None, 'attempts': 0, 'next_try': 0, 'recovered_at': None, 'recovered_tries': 0, 'recovered_next': 0,
+            'waiter': False, 'action': 'none', 'verify': None}
 
 
 def wait_run_incidents(env, state, verdict, entries, claims, now, wall, gap, directory, result):
@@ -1757,6 +1863,10 @@ def main(argv=None):
     s = sub.add_parser('status')
     s.add_argument('--json', action='store_true')
     sub.add_parser('callers')
+    ri = sub.add_parser('reconcile-incidents', help='list (and with --apply close) the supervisor incidents whose scheduler entry is no longer in the raising state')
+    ri.add_argument('--apply', action='store_true', help='hand one closing notice per closable incident to session-notify (default: dry run, writes nothing)')
+    ri.add_argument('--status-file', help='the supervisor incident-status.json to read (default: its installed state directory)')
+    ri.add_argument('--json', action='store_true')
     pl = sub.add_parser('plist')
     pl.add_argument('--checkout', required=True, help='the canonical checkout directory (its scripts/admission-monitor.py is the program)')
     pl.add_argument('--observe-only', action='store_true', help='omit --act: the agent only observes and reports')
@@ -1782,6 +1892,15 @@ def main(argv=None):
             data.get('at'), data.get('primary'), data.get('waiting'), data.get('stalled'), len(data.get('owner_notice_undelivered') or [])))
         return 0
     env = Env(da, state_path, ma.DEFAULT_STATE, default_limits(da, ma))
+    if args.cmd == 'reconcile-incidents':
+        out = reconcile_incidents(env, args.status_file, apply=args.apply)
+        if args.json:
+            print(json.dumps(out, indent=1, sort_keys=True))
+        else:
+            for row in out['rows']:
+                print('%-22s %-24s %-8s %-8s %-9s %s' % (row['ref'], row['kind'], row['id'] or '-', row['clock'] or '-', row['state'] or '-', row['action']))
+            print('%s: %d closable, %d sent' % ('dry run' if out['dry_run'] else 'applied', sum(1 for r in out['rows'] if r['action'] == 'closable'), out['applied']))
+        return 1 if out['failed'] else 0      # a send that failed is visible to the caller, not only in the rows
     result = tick(env, act=args.act, if_due=args.if_due)
     print(json.dumps(result, indent=1, sort_keys=True) if args.json else '%s primary=%s waiting=%s stalled=%s actions=%s' % (
         result.get('at', '-'), result.get('primary', result.get('why')), result.get('waiting'), result.get('stalled'), result.get('actions')))

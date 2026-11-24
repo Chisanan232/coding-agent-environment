@@ -96,6 +96,17 @@ is never trusted and is removed by the next tick (unlink only; dead pid, changed
 **Roll back.** Fastest: create `recovery.disabled`. Complete: reprint the agent with `--observe-only` as below, which removes every action including `queue advance`.
 The registry files and receipts can stay; removing `wrappers/` is safe because `heavy-run` and `la-cargo` write it best effort and never depend on it.
 
+## Closing incidents the supervisor still lists (SPE-188)
+
+The monitor announces an incident with `opened` and `escalated` spool files. Once the scheduler resolves it (the grant lapsed or was cancelled, the wait or run ended) or a holder claims it, the monitor sends one closing `recovered` file with the same `incident_ref` (`incident-resolved` cause, see `docs/SESSION-NOTIFICATIONS.md`). It is a notice, not an action, so it also runs in observe-only mode. Incidents resolved before this existed were never closed; list and close them once:
+
+```bash
+python3 scripts/admission-monitor.py reconcile-incidents              # dry run: lists each supervisor ref as closable, keep or unmapped; writes nothing
+python3 scripts/admission-monitor.py reconcile-incidents --apply      # sends one closing notice per closable ref
+```
+
+A ref is closable only when its scheduler entry (the ref is `inc:` plus the first 16 hex of sha256 of `<queue id>@<grant.at>`) shows the incident over. Whether the supervisor consumer drops an incident on `recovered` is its owner's side.
+
 ## Uninstall and rollback
 
 ```bash
