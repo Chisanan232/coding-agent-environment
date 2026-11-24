@@ -2084,7 +2084,7 @@ def hosted_ci(res, args, number, cand, base):
         raise Refusal("LOCAL_EVIDENCE_REQUIRED", f"hosted CI is NOT_RUN and no trusted, fresh local-equivalent record exists for {cand[:12]} on PR #{number} "
                       f"({', '.join(problems)}); run owner-merge-local-ci.py record at the PR head and post its line first")
     cmds = rec["commands"]
-    res.step("local_equivalent", "PASS", {"commands": len(cmds), "head": cand})
+    res.step("local_equivalent", "PASS", {"commands": len(cmds), "head": cand, "record_sha256": record_digest(rec)})
     return True
 
 
@@ -2201,9 +2201,11 @@ def release_promote(args, res):
                     after = protection_compare(args, c.base)
                     res.step("protection_after", "DRIFT" if after[2] else "UNCHANGED", {"changed": after[2]})
                     drift = after[2]
+                    j.append(key=res.env["idempotency_key"], state="protection-after", result="DRIFT" if after[2] else "UNCHANGED")
                 except (Refusal, ValueError, OSError) as e:
                     # The merge may already have happened: an unverifiable result is never left looking like a pass.
                     res.step("protection_after", "NOT_RUN", {"reason": getattr(e, "code", type(e).__name__)})
+                    j.append(key=res.env["idempotency_key"], state="protection-after", result="NOT_RUN")
                     res.status, res.next_action = "FAIL", f"verify {c.base} branch protection manually (the after-merge comparison could not run); {ROLLBACK} restores it"
         if drift:
             res.status, res.next_action = "FAIL", f"PROTECTION_DRIFT: restore {c.base} protection with {ROLLBACK}"
@@ -2297,7 +2299,10 @@ def promote_body(args, res, c, go, cand, tag, base_ref, head, bp, done, j):
     res.step("assertions", "PASS", {"final_sha": final, "second_parent": cand, "tree": tree, "first_parent": first_parent})
     res.step("verification", "CARRIED_OVER" if carry else "REQUIRED", {"candidate_tree_equals_final": carry})
     if j:
-        j.append(key=res.env["idempotency_key"], state="promoted", final_sha=final, candidate_sha=cand, pr=pr_number, line=c.ln["id"], version=version)
+        ci_step = next((x for x in res.steps if x["step"] == "hosted_ci"), None)
+        le_step = next((x for x in res.steps if x["step"] == "local_equivalent"), None)
+        j.append(key=res.env["idempotency_key"], state="promoted", final_sha=final, candidate_sha=cand, pr=pr_number, line=c.ln["id"], version=version,
+                 hosted_ci=ci_step["state"] if ci_step else None, local_equivalent_sha256=le_step["evidence"]["record_sha256"] if le_step else None)
     if done is not None or first_parent != base_tip:
         # The base moved between accounting and the merge (or this is a rerun): account again, from git and GitHub facts, against the base the merge really
         # landed on. A rerun therefore stays FAIL until the new changes are accounted; the journal is never the authority.
@@ -2684,16 +2689,80 @@ def publish_digest(args, version, final, notes_sha, manifest):
                           "artifacts": {a["name"]: a["sha256"] for a in manifest["artifacts"]}})
 
 
+NOTES_DEFERRAL_MAX = 20
+NOTES_TOKEN_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+HOSTED_CI_STATES = ("CI_PASS", "CI_PENDING", "NOT_RUN", "CI_FAILED")
+PROTECTION_STATES = ("UNCHANGED", "DRIFT", "NOT_RUN")
+
+
+def prior_release(args, c, f):
+    """(version, tag, commit count) of the greatest same-major final tag below this version whose commit is on the base before the promotion, from the
+    clone's own tags only (no network); None when there is none."""
+    fin, clone, best = fmt_re(c.rl["tag_format"]), args.clone, None
+    for t in tag_names(clone):
+        m = fin.fullmatch(t)
+        if not m or m.group("v") == c.version or m.group("v").split(".")[0] != c.version.split(".")[0] or vkey(m.group("v")) >= vkey(c.version):
+            continue
+        sha = commit_of(clone, f"refs/tags/{t}")
+        if sha and is_ancestor(clone, sha, f.first) and (best is None or vkey(m.group("v")) > vkey(best[0])):
+            best = (m.group("v"), t, sha)
+    if best is None:
+        return None
+    rc, out = git(clone, "rev-list", "--count", f"{best[2]}..{f.final}")
+    return best[0], best[1], out.strip() if rc == 0 and out.strip().isdigit() else "unknown"
+
+
+def journal_facts(args, c, f):
+    """Recorded verification facts for this promotion from the journal, each reduced to a closed set (a state name or a sha256), else None.
+    The journal is an audit trail the agent can write, so these lines inform readers; the owner's publish_digest pin is what authorizes the content."""
+    facts = {"hosted_ci": None, "local_equivalent": None, "protection_after": None}
+    key = f"promote:{args.repo}:{c.version}:{f.cand}"
+    try:
+        raw = read_state_file(proposal_dir(args).parent, "journal.jsonl", 8 << 20) or b""
+        rows = [json.loads(x) for x in raw.decode("utf-8", "replace").splitlines() if x.strip()]
+    except (ValueError, OSError):
+        rows = []
+    for r in rows:
+        if not isinstance(r, dict) or r.get("key") != key:
+            continue
+        if r.get("state") == "promoted":
+            if facts["hosted_ci"] is None and r.get("hosted_ci") in HOSTED_CI_STATES:
+                facts["hosted_ci"] = r["hosted_ci"]
+            if facts["local_equivalent"] is None and isinstance(r.get("local_equivalent_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", r["local_equivalent_sha256"]):
+                facts["local_equivalent"] = r["local_equivalent_sha256"]
+        elif r.get("state") == "protection-after" and r.get("result") in PROTECTION_STATES:
+            facts["protection_after"] = r["result"]
+    return facts
+
+
 def render_notes(args, c, f, manifest):
     rl, clone = c.rl, args.clone
     rc_re = fmt_re(rl["candidate_format"])
     cands = sorted((int(m.group("n")), t) for t in tag_names(clone) if (m := rc_re.fullmatch(t)) and m.group("v") == c.version
                    and commit_of(clone, f"refs/tags/{t}") == f.cand)
+    bad = None
     try:
         n, bad = accounting_complete(args, c, f.cand, f.first)
         accounted = f"{n} base-only change(s) inspected, {len(bad)} not fully accounted"
     except Refusal:
         accounted = "not available"
+    prior = prior_release(args, c, f)
+    facts = journal_facts(args, c, f)
+    carry = git(clone, "rev-parse", f.final + "^{tree}")[1].strip() == git(clone, "rev-parse", f.cand + "^{tree}")[1].strip()
+    pin = None if carry else pinned_digest(args, f.final)
+    pin = pin if isinstance(pin, str) and re.fullmatch(r"[0-9a-f]{64}", pin) else None
+    final_tree = "CARRIED_OVER (the final tree equals the candidate tree)" if carry else (f"PASS (pinned local-first record `{pin}`)" if pin else "not recorded")
+    deferrals = []
+    if bad is None:
+        deferrals.append("Forward-port accounting: NOT_RUN (not available)")
+    tok = lambda v, d: v if isinstance(v, str) and NOTES_TOKEN_RE.fullmatch(v) else d
+    deferrals += [f"Forward-port not merged: `{tok(b['source'], 'unknown')}` line `{tok(b['line'], 'none')}` ({tok(b['code'], 'UNKNOWN')})" for b in (bad or [])[:NOTES_DEFERRAL_MAX]]
+    if bad and len(bad) > NOTES_DEFERRAL_MAX:
+        deferrals.append(f"Forward-port not merged: {len(bad) - NOTES_DEFERRAL_MAX} more")
+    if facts["hosted_ci"] in (None, "NOT_RUN"):
+        deferrals.append("Hosted CI: NOT_RUN" if facts["hosted_ci"] else "Hosted CI: NOT_VERIFIED (no record)")
+    if facts["protection_after"] in (None, "NOT_RUN"):
+        deferrals.append("Protection check after promotion: NOT_RUN" if facts["protection_after"] else "Protection check after promotion: NOT_VERIFIED (no record)")
     rows = "\n".join(f"{a['sha256']}  {a['name']}" for a in manifest["artifacts"])
     text = "\n".join([
         f"# Release {c.version}", "",
@@ -2706,7 +2775,16 @@ def render_notes(args, c, f, manifest):
         f"- Final tag: `{f.tag}`",
         f"- Final SHA: `{f.final}`",
         f"- Publication base: `{c.base}`",
-        f"- Forward-port accounting: {accounted}", "",
+        f"- Forward-port accounting: {accounted}",
+        f"- Prior release: {'`' + prior[1] + '`' if prior else 'none'}",
+        f"- Comparison: {'`' + prior[1] + '...' + f.tag + '` (' + prior[2] + ' commit(s))' if prior else 'none'}", "",
+        "## Verifications", "",
+        f"- Final tree verification: {final_tree}",
+        f"- Hosted CI: {facts['hosted_ci'] or 'not recorded'}",
+        f"- Local-equivalent evidence: {'`' + facts['local_equivalent'] + '`' if facts['local_equivalent'] else 'none'}",
+        f"- Branch protection after promotion: {facts['protection_after'] or 'not recorded'}", "",
+        "## Deferrals", "",
+        *([f"- {d}" for d in deferrals] or ["- none"]), "",
         "## Artifact checksums (sha256)", "", "```", rows, "```", ""])
     return text.encode()
 
