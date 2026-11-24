@@ -281,8 +281,10 @@ is then left out of the fingerprint.
 
 **A broken observer is not a quiet one.** A stored fingerprint with any wrong-typed part is discarded and rebuilt, and a comparison that raises still stores a fresh fingerprint, so
 it cannot stay stuck. An internal failure (unwritable state, an unexpected exception) prints `QUIET` the first time, `CHANGE: observer failing (<class>)` the second consecutive time,
-then `NO_CHANGE`, and `CHANGE: observer recovered` once when it works again. If even the failure counter cannot be written (default `$TMPDIR/scheduler-observe-failures-<uid>.json`,
-`SCHEDULER_OBSERVE_FAILURES`) the failure is reported on every run because it cannot be deduplicated.
+then `NO_CHANGE`, and `CHANGE: observer recovered` once when it works again. The failure counter lives next to the fingerprint (`observer-failures.json`) in the private observer directory (`0700`, owned by this user,
+created or tightened by the tool; a symlinked or foreign directory is refused). Both of the observer's own files are opened without following symlinks and only as
+regular files owned by this user with no group or other access; anything else is discarded and rebuilt. It never uses a shared temp directory: if the private
+directory is unusable the count is kept in memory for that process only, and because that cannot be deduplicated across runs the failure is reported on every run.
 
 Suggested prompt for the recurring check (install it only when the owner asks; this change does not install anything):
 
