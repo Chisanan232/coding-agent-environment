@@ -94,8 +94,11 @@ def git_segments(cwd):
     with a multi-GB node_modules the untracked scan alone blows the timeout.
     """
     out = []
+    # --no-optional-locks: plain `git status` takes .git/index.lock to refresh the index, and
+    # `run` SIGKILLs git at the timeout. A kill mid-refresh leaves a stale 0-byte lock that
+    # blocks the next real git write in this checkout (28 of 300 repro runs vs 0 of 300).
     raw = run(
-        ["git", "status", "--porcelain=v1", "--branch", "--untracked-files=no"],
+        ["git", "--no-optional-locks", "status", "--porcelain=v1", "--branch", "--untracked-files=no"],
         cwd=cwd,
         timeout=0.6,
     )
