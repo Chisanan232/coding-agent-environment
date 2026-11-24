@@ -253,3 +253,45 @@ A third, objective level sits between them: `LOCAL_BANNER_PRESENTED_BY_OS`. Afte
 Expected lines: `Presenting <NotificationRecord app:"com.apple.ScriptEditor2" ...> as banner`, `Setting visible banner`, then `Clearing banner after expiration` about 5 s later. Use `/usr/bin/log`, since `log` is a zsh builtin. Recorded once on 2026-10-22 (no Focus assertion active). `LOCAL_BANNER_PRESENTED_BY_OS` is claimed; `LOCAL_BANNER_CONFIRMED` stays the owner's own sighting.
 
 A delivered record alone never upgrades to a confirmed banner. Until the owner reports seeing it, only `LOCAL_NOTIFICATION_DELIVERED` is claimed.
+
+## Quiet recurring checks: `scheduler-observe.py` (SPE-188)
+
+A scheduled check that restates an unchanged picture every run is noise. `scripts/scheduler-observe.py` is the read-only observer a recurring
+check should call instead of re-reading the scheduler and supervisor itself. It reduces what the check reads to a fingerprint of **material**
+state, compares it with the previous fingerprint and prints exactly one line, exit code 0:
+
+| Line | Meaning | What the caller does |
+|---|---|---|
+| `NO_CHANGE` | nothing material changed | reply with the single word `ok` |
+| `QUIET` | routine churn (claims, releases, cancels), the first baseline, or a first unconfirmed read error | reply with `ok` |
+| `CHANGE: <delta>` | a new incident, a resolved incident, any change of the supervisor's telegram status (for example leaving or returning to `running`), a monitor mode change, a live backfill claimed, the first cumulative-loss-cap refusal, a new open pull request, or a source unreadable twice running (and readable again) | tell the owner once, from the line |
+
+Material state: live claimed ids, backfill and cap-refusal counts, the monitor's mode and handoff incident ids, the supervisor's telegram status
+and open incident refs, provider-maintenance presence and the open scheduler pull requests. Volatile values (poll batch counters, timestamps,
+free-space jitter) are never part of it, so they cannot cause a message. A source that cannot be read keeps its last value; one failure is `QUIET`,
+the same failure twice running is reported once, and a recovery is reported once. A changed fingerprint is stored (file `0600`, atomic write, default
+`~/.cache/coding-agent-environment/observer/last.json`, overridable with `SCHEDULER_OBSERVE_STATE`), so the same observation next run is `NO_CHANGE`.
+
+The tool opens the queue receipts, the monitor status and the supervisor state read-only (JSON reads are size-capped and only the tail of the receipts file is read, 8 MiB by
+default) and writes only its own fingerprint and a small failure counter (both `0600`; the file is created private and the `chmod` is defense in depth). Output is a closed
+character set: it contains no paths and no shell metacharacters, and it never prints message ids. It does not change the monitor, which stays observe-only.
+
+**Network:** the default pull-request provider runs a read-only `gh pr list` (a network call to GitHub). `--no-prs` (or `SCHEDULER_OBSERVE_NO_PRS=1`) turns it off; the open-PR set
+is then left out of the fingerprint.
+
+**A broken observer is not a quiet one.** A stored fingerprint with any wrong-typed part is discarded and rebuilt, and a comparison that raises still stores a fresh fingerprint, so
+it cannot stay stuck. An internal failure (unwritable state, an unexpected exception) prints `QUIET` the first time, `CHANGE: observer failing (<class>)` the second consecutive time,
+then `NO_CHANGE`, and `CHANGE: observer recovered` once when it works again. The failure counter lives next to the fingerprint (`observer-failures.json`) in the private observer directory (`0700`, owned by this user,
+created or tightened by the tool; a symlinked or foreign directory is refused). Both of the observer's own files are opened without following symlinks and only as
+regular files owned by this user with no group or other access; anything else is discarded and rebuilt. It never uses a shared temp directory: if the private
+directory is unusable the count is kept in memory for that process only, and because that cannot be deduplicated across runs the failure is reported on every run.
+
+Suggested prompt for the recurring check (install it only when the owner asks; this change does not install anything):
+
+> Silent scheduler/supervisor check. Run `python3 <checkout>/scripts/scheduler-observe.py` (read-only, one line). If it prints `NO_CHANGE` or `QUIET`, reply with
+> the single word `ok`. If it prints `CHANGE: ...`, tell the user once what changed, in one or two sentences, then continue. Never mutate the queue; never
+> touch the supervisor fence.
+
+**Out of scope:** the harness goal evaluator (`Stop hook feedback: [goal text]` and the `Goal check-in` notices) fires every time a turn ends while a goal is
+set. It is not a hook in `settings.json` or in this repository, so this tool cannot suppress it; clearing or editing the goal is the owner's action.
+Tests: `tests/test-scheduler-observe.py`.
