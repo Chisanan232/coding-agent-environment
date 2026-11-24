@@ -202,6 +202,58 @@ def tree_digest(root):
     return out
 
 
+def read_regular(path, limit=8 << 20, binary=False):
+    """Text of a regular, non-symlink file (opened O_NOFOLLOW and non-blocking, so a FIFO can never hang the harness); None when absent. A symlink, FIFO, directory or
+    oversized file raises ValueError: harness reads of host-writable places never follow or block."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+        raise ValueError('%s is not a plain regular file' % path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with (os.fdopen(fd, 'rb') if binary else os.fdopen(fd, 'r', errors='replace')) as handle:
+        return handle.read()
+
+
+def safe_publish(files, dest):
+    """Publish {relative name: text} under dest as a FRESH directory: dest's parents and dest must not be symlinks (a symlinked dest is unlinked, a real one replaced) and every
+    file is created O_EXCL|O_NOFOLLOW relative to a directory fd, so nothing a host pre-created is ever written through."""
+    dest = Path(dest)
+    root = dest.parent
+    if root.is_symlink() or dest.parent.parent.is_symlink():
+        raise RuntimeError('the evidence directory path contains a symlink; nothing was written')
+    root.mkdir(exist_ok=True)
+    if dest.is_symlink() or dest.is_file():
+        dest.unlink()
+    elif dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir()
+    dfd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for name, text in files.items():
+            parts = Path(name).parts
+            if not parts or any(part in ('', '.', '..') for part in parts):
+                raise ValueError('unsafe evidence name %r' % name)
+            fd_dir, opened = dfd, []
+            for part in parts[:-1]:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd_dir)
+                except FileExistsError:
+                    pass
+                fd_dir = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd_dir)
+                opened.append(fd_dir)
+            try:
+                fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd_dir)
+                with os.fdopen(fd, 'w') as handle:
+                    handle.write(text)
+            finally:
+                for opened_fd in opened:
+                    os.close(opened_fd)
+    finally:
+        os.close(dfd)
+
+
 def path_digest(path):
     """{name: sha256} for one file, or for every file under one directory (symlinks by target); {} when absent."""
     path = Path(path)
@@ -212,6 +264,7 @@ def path_digest(path):
     return {str(path) + '/' + k: v for k, v in tree_digest(path).items()}
 
 
+ARTIFACT_MAX = 64 << 20
 BRANCH_OK = re.compile(r'(?!-)[A-Za-z0-9._/][A-Za-z0-9._/-]{0,99}')
 ARTIFACT_NAME_OK = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')
 HARNESS_MERGE_MARKER = '--harness-owner-merge'
@@ -221,7 +274,7 @@ GH_STATE_MUTABLE = ('prs', 'releases', 'created_tags', 'api_broken', 'protection
 def gh_control_digest(state_path):
     """Digest of the fake-gh state minus the keys the fake gh legitimately mutates: the rest (bare path, hooks to run, failure switches) is harness control."""
     try:
-        state = json.loads(Path(state_path).read_text())
+        state = json.loads(read_regular(state_path) or 'null')
     except (OSError, ValueError):
         return 'unreadable'
     return hashlib.sha256(json.dumps({k: v for k, v in state.items() if k not in GH_STATE_MUTABLE}, sort_keys=True).encode()).hexdigest()
@@ -837,9 +890,10 @@ class Fixture:
     def origin_updates(self):
         """The ref updates origin logged since the last reset; None when the log is gone (callers must fail closed)."""
         try:
-            return self.origin_log.read_text().splitlines()
-        except OSError:
+            text = read_regular(self.origin_log)
+        except ValueError:
             return None
+        return None if text is None else text.splitlines()
 
     def control_digest(self):
         """Digest of everything the harness itself later executes or trusts: the fake gh and git wrappers, the shim and wrapper, ALL non-data git metadata of origin and of
@@ -929,27 +983,40 @@ class Fixture:
         except RuntimeError:
             return False
 
+    def read(self, path):
+        """read_regular for the host-writable places; a non-regular file is recorded as a session problem and read as absent."""
+        try:
+            return read_regular(path)
+        except ValueError as e:
+            self.session_problems.append('%s' % e)
+            return None
+
     def append_snapshot(self):
         """Append-only evidence the host can write but must not rewrite: the fake-gh call log, the tool journal, and every earlier tool record."""
-        def text(path):
-            try:
-                return Path(path).read_text()
-            except OSError:
-                return None
         calls = self.origin_dir / 'calls'
-        return {'texts': {'fake-gh call log': text(str(self.t.gh_state) + '.calls'), 'tool journal': text(self.t.state_dir / 'journal.jsonl')},
-                'records': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(calls.glob('call-*.json'))} if calls.exists() else {}}
+        records = {}
+        if calls.is_symlink():
+            records['calls directory'] = 'SYMLINK'
+        elif calls.is_dir():
+            for p in sorted(calls.glob('call-*.json')):
+                try:
+                    records[p.name] = hashlib.sha256((read_regular(p) or '').encode()).hexdigest()
+                except ValueError:
+                    records[p.name] = 'NOT-A-REGULAR-FILE'
+        return {'texts': {'fake-gh call log': self.read(str(self.t.gh_state) + '.calls'), 'tool journal': self.read(self.t.state_dir / 'journal.jsonl')},
+                'records': records}
 
     def gh_state_snapshot(self):
         try:
-            return json.loads(Path(self.t.gh_state).read_text())
+            return json.loads(read_regular(self.t.gh_state) or 'null')
         except (OSError, ValueError):
             return None
 
     def log_snapshot(self):
         try:
-            return (self.origin_log.stat().st_ino, self.origin_log.read_text())
-        except OSError:
+            text = read_regular(self.origin_log)
+            return None if text is None else (os.lstat(self.origin_log).st_ino, text)
+        except (OSError, ValueError):
             return None
 
     def owner_state(self):
@@ -970,31 +1037,45 @@ class Fixture:
         return -1 if lines is None else len(lines)
 
     def gh_calls(self):
-        path = Path(str(self.t.gh_state) + '.calls')
-        return path.read_text().splitlines() if path.exists() else []
+        text = self.read(str(self.t.gh_state) + '.calls')
+        return text.splitlines() if text else []
 
     def journal_states(self):
-        path = self.t.state_dir / 'journal.jsonl'
         keep = {'publishing', 'created', 'published', 'publish-unverified', 'publish-failed', 'reused'}
-        rows = [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
-        return [r['state'] for r in rows if r.get('state') in keep]
+        rows = []
+        for line in (self.read(self.t.state_dir / 'journal.jsonl') or '').splitlines():
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                self.session_problems.append('the tool journal holds a line that is not JSON')
+        return [r['state'] for r in rows if isinstance(r, dict) and r.get('state') in keep]
 
     def records(self):
         calls = self.origin_dir / 'calls'
-        return [json.loads(p.read_text()) for p in sorted(calls.glob('call-*.json'))] if calls.exists() else []
+        out = []
+        if calls.is_symlink():
+            self.session_problems.append('the tool records directory is a symlink')
+            return out
+        for p in sorted(calls.glob('call-*.json')) if calls.is_dir() else []:
+            try:
+                out.append(json.loads(read_regular(p) or 'null'))
+            except (ValueError, OSError):
+                self.session_problems.append('tool record %s is not a plain regular JSON file' % p.name)
+        return [r for r in out if isinstance(r, dict) and isinstance(r.get('argv'), list)]
 
     def shim_argv(self):
-        return self.shim_log.read_text().splitlines()
+        return (self.read(self.shim_log) or '').splitlines()
 
     def push_lines(self):
-        """The tool's git push lines; None when the harness git log is gone (callers must fail closed, never read that as "no pushes")."""
+        """The tool's git push lines; None when the harness git log is gone or not a plain file (callers must fail closed, never read that as "no pushes")."""
         log = getattr(self.t, 'git_log', None)
         if log is None:
             return []
         try:
-            return [x for x in Path(log).read_text().splitlines() if ' push ' in ' %s ' % x]
-        except OSError:
+            text = read_regular(log)
+        except ValueError:
             return None
+        return None if text is None else [x for x in text.splitlines() if ' push ' in ' %s ' % x]
 
 
 def run_host(host, prompt, fixture, work, timeout, pass_env=()):
@@ -1015,7 +1096,10 @@ def run_host(host, prompt, fixture, work, timeout, pass_env=()):
         done = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return {'timeout': True, 'note': 'TIMEOUT after %ss' % timeout, 'answer': '', 'rc': None}
-    answer = last.read_text() if host == 'codex' and last.exists() else done.stdout
+    try:
+        answer = (read_regular(last) or '') if host == 'codex' and last.exists() else done.stdout
+    except ValueError:
+        answer = ''  # the last-message file was replaced by something that is not a plain file
     note = 'exit %d' % done.returncode
     stderr = redact(done.stderr.strip()[-300:], reps)
     if done.returncode != 0:
@@ -1067,18 +1151,19 @@ def build_evidence(fixture, before, answer, main, read_git=True):
 
 
 def write_evidence(fixture, case, host, status, why, ev, note, work, not_verified=()):
-    out = fixture.evidence
+    """Stage the evidence in memory, then publish it as a fresh directory without following anything the host pre-created."""
     reps = ((str(work), '<WORKDIR>'), (str(Path.home()), '~'))
-    (out / 'host-answer.txt').write_text(redact(ev['answer'], reps))
-    (out / 'gh-calls.log').write_text(redact('\n'.join(ev['gh_calls']), reps))
-    (out / 'shim-gh-argv.log').write_text(redact('\n'.join(ev['shim_argv']), reps))
-    (out / 'summary.json').write_text(redact(json.dumps({'case': case, 'host': host, 'status': status, 'why': why, 'host_note': note, 'not_verified': list(not_verified),
-                                                       'journal_states': ev['journal_publish_states'], 'tool_calls': [(r['argv'][:3], r['rc']) for r in ev['records']]},
-                                                      indent=2), reps))
-    kept = out / 'calls'
-    kept.mkdir(exist_ok=True)
-    for p in sorted((fixture.origin_dir / 'calls').glob('call-*.json')) if (fixture.origin_dir / 'calls').exists() else []:
-        (kept / p.name).write_text(redact(p.read_text(), reps))
+    files = {'host-answer.txt': redact(ev['answer'], reps), 'gh-calls.log': redact('\n'.join(ev['gh_calls']), reps),
+             'shim-gh-argv.log': redact('\n'.join(ev['shim_argv']), reps),
+             'summary.json': redact(json.dumps({'case': case, 'host': host, 'status': status, 'why': why, 'host_note': note, 'not_verified': list(not_verified),
+                                                'journal_states': ev['journal_publish_states'], 'tool_calls': [(r['argv'][:3], r['rc']) for r in ev['records']]}, indent=2), reps)}
+    calls = fixture.origin_dir / 'calls'
+    for p in sorted(calls.glob('call-*.json')) if calls.is_dir() and not calls.is_symlink() else []:
+        try:
+            files['calls/' + p.name] = redact(read_regular(p) or '', reps)
+        except ValueError:
+            files['calls/' + p.name + '.NOT-A-REGULAR-FILE'] = ''
+    safe_publish(files, Path(work) / 'evidence' / fixture.label)
 
 
 def commands_prompt(fixture, commands, intro=''):
@@ -1240,7 +1325,10 @@ def gather(case, fx, ev):
         gt['final_is_ancestor_of_tip'] = fx.is_ancestor(final, gt['main_tip'])
         gt['tag_type'] = bg('cat-file', '-t', 'refs/tags/v0.3.0')
         top = t.state_dir / 'releases'
-        manifest = json.loads((top / '0.3.0.json').read_text()) if (top / '0.3.0.json').exists() else {}
+        try:
+            manifest = json.loads(read_regular(top / '0.3.0.json') or '{}')
+        except (ValueError, OSError):
+            manifest = {}
         gt['manifest'] = manifest
         gt['vdir_digests'] = {}
         for artifact in manifest.get('artifacts', []):
@@ -1253,14 +1341,15 @@ def gather(case, fx, ev):
                 if not stat.S_ISREG(os.lstat(path).st_mode):
                     gt['vdir_digests'] = None  # a symlink, FIFO or directory: never opened
                     break
-                gt['vdir_digests'][name] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                gt['vdir_digests'][name] = hashlib.sha256(read_regular(path, ARTIFACT_MAX, binary=True) or b'').hexdigest()
             except OSError:
                 gt['vdir_digests'] = None
                 break
-        release = json.loads(t.gh_state.read_text()).get('releases', {}).get('v0.3.0') or {}
+        gh_state = fx.gh_state_snapshot() or {}
+        release = gh_state.get('releases', {}).get('v0.3.0') or {}
         gt['release_body'] = release.get('body', '')
         gt['asset_digests'] = {n: hashlib.sha256(base64.b64decode(b)).hexdigest() for n, b in (release.get('assets') or {}).items()}
-        gt['release_count'] = len(json.loads(t.gh_state.read_text()).get('releases', {}))
+        gt['release_count'] = len(gh_state.get('releases', {}))
     if case == 'R11':
         final = bg('rev-parse', 'refs/tags/v0.3.0^{commit}')
         gt['final'] = final
