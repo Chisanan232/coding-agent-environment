@@ -125,6 +125,7 @@ Three more causes, with their own phrases and a synthetic session `claude-auth-w
 - `--cause auth-required` with `--recovery no-auto-recovery --owner-action sign-in-claude`: title `Claude Code: sign-in required`.
 - `--cause remote-control-disconnect` with `--recovery remote-control-only --owner-action reconnect-remote-control`: title `Claude Code: Remote Control disconnected`, never worded as sign-in.
 - `--cause signin-recovered` with `--recovery sessions-resumed --owner-action verify-resumed-work`: title `Claude Code: sign-in recovered`.
+- `--cause incident-resolved` with `--recovery resolved --owner-action no-action-needed` and the required `--incident-ref REF`: the closing notice of an admission incident, title `Claude Code: admission incident resolved`. It spools one `recovered` transition (`info`) under the same `incident_ref` as the earlier `opened`/`escalated` files, so the supervisor can close the incident. It does not change the blockage state of the record: another disk or memory stall stays as it was.
 - `--detail D` (these causes only; anything else is `invalid`): 1 to 160 characters of `[A-Za-z0-9 ._(),+=-]` such as `host=mac names=alpha,beta +2 more`. A newline, URL, slash, colon, quote, bracket, backtick, asterisk or pipe is rejected at the CLI (exit 2) and in the engine, and a stored detail is re-checked at delivery. It is the only free-looking field in any notification.
 
 Mixing a sign-in cause with an admission phrase (or the reverse) is `invalid`. The id `claude-auth-watch` is ignored in hook events, case-insensitively.
@@ -145,7 +146,7 @@ sign-in and no network, so the reserved sessions (`admission-monitor`, `claude-a
   `test`; one incident keeps its ref across transitions, so `key` differs per transition), `severity` (`info`, `action`), `progress`, `action`, `ts`. `progress` and `action` are fixed phrases from the existing cause, recovery and owner-action tables; no
   path, id, command line, URL or free text can reach the file (charset `[A-Za-z0-9 .,;:()+-]`, at most 120 characters). `project` is `backends.zeroclaw-spool.project` (default `coding-agent-environment`).
 - **Mapping:** the three admission incident causes and `test-notice` map to their own kinds; `auth-required` and `remote-control-disconnect` to `auth-interrupted`; `signin-recovered`
-  to `recovered` (`info`). A recovery phrase of `lapsed`, `wait-expiry-near` or `recovery-exhausted` makes the transition `escalated`, otherwise `opened`. Other causes (disk,
+  and `incident-resolved` to `recovered` (`info`; the latter carries the incident's own ref). A recovery phrase of `lapsed`, `wait-expiry-near` or `recovery-exhausted` makes the transition `escalated`, otherwise `opened`. Other causes (disk,
   memory, wrapper recovery) and hook-driven session states have no spool kind and are never spooled.
 - **Dedup:** the key is the dedup identity. A key already in the directory, or written within 24 h per the local ledger `zeroclaw-spool.ledger` in the state directory (so a
   file the supervisor already consumed is not written again), produces no second file.
