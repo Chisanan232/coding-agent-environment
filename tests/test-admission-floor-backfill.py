@@ -185,17 +185,27 @@ class FloorOnlyHead(tb.Base):
         and the hysteresis keeps every grant at least 4 GiB above it. What the stream does change is how far the head is from fitting."""
         for declared in (20, 10, 4, 1):
             with self.subTest(declared=declared):
+                self.setUp()
                 lowest, free, grants = self.stream(declared, persist=declared)
                 self.assertGreaterEqual(lowest, (100 + 4) * GIB)
                 self.assertGreaterEqual(free, 100 * GIB)
                 self.assertGreaterEqual(grants, 1)
-                self.setUp()
 
     def test_simultaneous_grants_are_charged_against_the_same_floor(self):
-        """A cap of 3 and three 10 GiB candidates: each grant is charged beside the others, so the three together never pass the floor."""
-        lowest, free, grants = self.stream(10, persist=10, cap=3)
-        self.assertGreaterEqual(lowest, (100 + 4) * GIB)
-        self.assertGreaterEqual(free, 100 * GIB)
+        """Cap 3, a 160 GiB head the floor refuses (250 - 160 = 90 < 100) and five 60 GiB, 2-CPU candidates queued before ONE advance. 250 GiB is
+        above the third-lane margin band, so only the byte floor limits the batch: each grant is charged beside the ones already granted, which
+        admits two (250 - 120 = 130) and refuses the third (250 - 180 = 70 < 100 + 4). Without the per-grant charge a third would be granted."""
+        self.head = self.enqueue('la-cargo-head', 'build-workspace', [tb.LOCAL], 160)
+        candidates = [self.enqueue('c%d' % i, 'build-workspace', ['cargo-target:/Users/dev/.cargo/targets/k%d' % i], 60, cpus=2) for i in range(5)]
+        with backfill(cap=3):
+            out = self.advance(free=250 * GIB)
+        in_flight = [e for e in self.entries().values() if e['id'] in candidates and e['state'] in ('GRANTED', 'CLAIMED')]
+        self.assertEqual(sorted(out['backfilled']), sorted(e['id'] for e in in_flight))
+        self.assertGreaterEqual(len(in_flight), 2, 'grants must be in flight together')
+        self.assertLessEqual(len(in_flight), 3)
+        self.assertEqual(self.state(self.head), 'QUEUED')
+        reserved = sum(e['bytes'] for e in in_flight)
+        self.assertGreaterEqual(250 * GIB - reserved, (100 + 4) * GIB)
 
 
 if __name__ == '__main__':
