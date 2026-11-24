@@ -254,6 +254,23 @@ def safe_publish(files, dest):
         os.close(dfd)
 
 
+def publish_file(path, text):
+    """Replace one harness output file atomically without following a link a host may have planted at its name: write a fresh O_EXCL|O_NOFOLLOW sibling, then rename it
+    over the name (a rename replaces a symlink itself, never its target)."""
+    path = Path(path)
+    if path.parent.is_symlink():
+        raise RuntimeError('%s: the parent directory is a symlink; nothing was written' % path)
+    tmp = path.parent / ('.%s.%s.tmp' % (path.name, os.urandom(6).hex()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def path_digest(path):
     """{name: sha256} for one file, or for every file under one directory (symlinks by target); {} when absent."""
     path = Path(path)
@@ -813,8 +830,12 @@ class Fixture:
 
     def __init__(self, main, work, label, kind):
         self.main, self.label = Path(main), label
+        for name in ('fx', 'evidence'):
+            if (work / name).is_symlink():
+                raise RuntimeError('%s is a symlink (planted?); refusing to create fixtures or evidence through it' % (work / name))
         self.dir = work / 'fx' / label
         self.dir.mkdir(parents=True)
+        self._system_tmp = tempfile.gettempdir()  # the system temp, outside WORKDIR, taken before tempfile is pointed at the fixture
         self._saved_tempdir = tempfile.tempdir
         tempfile.tempdir = str(self.dir)
         self.t = None
@@ -835,7 +856,7 @@ class Fixture:
             self.t = cls('setUp')
             self.t.setUp()
             self.t.env['PYTHONNOUSERSITE'] = '1'  # before the wrapper config copies the environment
-            self.origin_dir = Path(tempfile.mkdtemp(prefix='rl-origin-', dir=self._saved_tempdir))  # harness-private: tool records and the origin log live here
+            self.origin_dir = Path(tempfile.mkdtemp(prefix='rl-origin-', dir=self._system_tmp))  # outside WORKDIR: tool records and the origin log (still writable by a host that can write the system temp)
             self.origin_log = None
             self.session_problems = []
             self.evidence = work / 'evidence' / label
@@ -1003,7 +1024,7 @@ class Fixture:
                     records[p.name] = hashlib.sha256((read_regular(p) or '').encode()).hexdigest()
                 except ValueError:
                     records[p.name] = 'NOT-A-REGULAR-FILE'
-        return {'texts': {'fake-gh call log': self.read(str(self.t.gh_state) + '.calls'), 'tool journal': self.read(self.t.state_dir / 'journal.jsonl'), 'gh shim log': self.read(self.shim_log)},
+        return {'texts': {'fake-gh call log': self.read(str(self.t.gh_state) + '.calls'), 'tool journal': self.read(self.t.state_dir / 'journal.jsonl'), 'gh shim log': self.read(self.shim_log), 'harness push log': self.read(self.t.git_log) if getattr(self.t, 'git_log', None) else None},
                 'records': records}
 
     def gh_state_snapshot(self):
@@ -1103,7 +1124,8 @@ def run_host(host, prompt, fixture, work, timeout, pass_env=()):
     binary = shutil.which(host)
     if binary is None:
         return {'missing': True, 'note': 'host binary %s not found' % host, 'answer': '', 'rc': None}
-    last = fixture.dir / ('last-message-%d.txt' % len(list(fixture.dir.glob('last-message-*'))))
+    last_dir = Path(tempfile.mkdtemp(prefix='rl-last-', dir=fixture._system_tmp))  # random, outside WORKDIR: Codex writes its last message here, never through a pre-planted name
+    last = last_dir / 'last.txt'
     cwd = session_cwd(host, fixture.t.work)
     argv = host_argv(host, prompt, cwd, work, last)
     argv[0] = binary
@@ -1113,11 +1135,13 @@ def run_host(host, prompt, fixture, work, timeout, pass_env=()):
     try:
         done = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
+        shutil.rmtree(last_dir, ignore_errors=True)
         return {'timeout': True, 'note': 'TIMEOUT after %ss' % timeout, 'answer': '', 'rc': None}
     try:
-        answer = (read_regular(last) or '') if host == 'codex' and last.exists() else done.stdout
+        answer = (read_regular(last) or '') if host == 'codex' and (last.exists() or last.is_symlink()) else done.stdout
     except ValueError:
         answer = ''  # the last-message file was replaced by something that is not a plain file
+    shutil.rmtree(last_dir, ignore_errors=True)
     note = 'exit %d' % done.returncode
     stderr = redact(done.stderr.strip()[-300:], reps)
     if done.returncode != 0:
@@ -1512,11 +1536,11 @@ def main(argv):
             row = run_case(case, host, main_dir, work, args.timeout, tuple(args.pass_env))
             row['why'] = redact(row['why'], ((str(work), '<WORKDIR>'), (str(Path.home()), '~')))
             results.append(row)
-            (work / 'result.json').write_text(json.dumps(results, indent=2))  # after every row, so an abort still leaves the results so far
+            publish_file(work / 'result.json', json.dumps(results, indent=2))  # after every row, so an abort still leaves the results so far
             print('%-3s %-7s %-8s %s' % (row['case'], row['host'], row['status'], row['why']), flush=True)
             for item in row.get('not_verified', ()):
                 print('      NOT_VERIFIED: %s' % item, flush=True)
-    (work / 'result.json').write_text(json.dumps(results, indent=2))
+    publish_file(work / 'result.json', json.dumps(results, indent=2))
     counts = {}
     for row in results:
         counts[row['status']] = counts.get(row['status'], 0) + 1
