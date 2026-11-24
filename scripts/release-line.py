@@ -2205,11 +2205,11 @@ def release_promote(args, res):
                     after = protection_compare(args, c.base)
                     res.step("protection_after", "DRIFT" if after[2] else "UNCHANGED", {"changed": after[2]})
                     drift = after[2]
-                    j.append(key=res.env["idempotency_key"], state="protection-after", final_sha=merged_final, result="DRIFT" if after[2] else "UNCHANGED")
+                    j.append(key=res.env["idempotency_key"], state="protection-after", final_sha=merged_final, merged=merged_final is not None, result="DRIFT" if after[2] else "UNCHANGED")
                 except (Refusal, ValueError, OSError) as e:
                     # The merge may already have happened: an unverifiable result is never left looking like a pass.
                     res.step("protection_after", "NOT_RUN", {"reason": getattr(e, "code", type(e).__name__)})
-                    j.append(key=res.env["idempotency_key"], state="protection-after", final_sha=merged_final, result="NOT_RUN")
+                    j.append(key=res.env["idempotency_key"], state="protection-after", final_sha=merged_final, merged=merged_final is not None, result="NOT_RUN")
                     res.status, res.next_action = "FAIL", f"verify {c.base} branch protection manually (the after-merge comparison could not run); {ROLLBACK} restores it"
         if drift:
             res.status, res.next_action = "FAIL", f"PROTECTION_DRIFT: restore {c.base} protection with {ROLLBACK}"
@@ -2720,7 +2720,8 @@ def prior_release(args, c, f):
 def journal_facts(args, c, f):
     """Recorded verification facts for this promotion from the journal, each reduced to a closed set (a state name or a sha256), else None.
     The journal is an audit trail the agent can write, so the notes label every value taken from it as unverified; the owner's publish_digest pin is what
-    authorizes the content. Only rows bound to this final SHA count."""
+    authorizes the content. Rows bound to another final SHA are ignored; a protection row with no final SHA (no merge was found when it was written) counts only when
+    it is DRIFT or NOT_RUN, so a missing binding can hide a failure never and show a pass never."""
     facts = {"hosted_ci": None, "local_equivalent": None, "protection_after": None}
     key = f"promote:{args.repo}:{c.version}:{f.cand}"
     try:
@@ -2731,8 +2732,11 @@ def journal_facts(args, c, f):
     for r in rows:
         if not isinstance(r, dict) or r.get("key") != key:
             continue
-        if r.get("final_sha") != f.final:
-            continue  # a row for another merge of this candidate says nothing about this one
+        row_final = r.get("final_sha")
+        if row_final is not None and row_final != f.final:
+            continue  # a row bound to another merge of this candidate says nothing about this one
+        if row_final is None and not (r.get("state") == "protection-after" and r.get("result") in ("DRIFT", "NOT_RUN")):
+            continue  # an unbound row counts only as adverse evidence: never as a pass, and never for promoted facts
         if r.get("state") == "promoted":
             if facts["hosted_ci"] is None and r.get("hosted_ci") in HOSTED_CI_STATES:
                 facts["hosted_ci"] = r["hosted_ci"]
