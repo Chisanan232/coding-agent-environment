@@ -685,7 +685,7 @@ def _json(run, *args):
 # every PR of horonomy/fornax-core while the REST issue-comments list held them, so the viewer's review record was
 # invisible and the gate refused with NO_REVIEW_EVIDENCE. The gate now reads the REST list as well and uses the union.
 REST_COMMENTS_JQ = '[.[]|{author:{login:(.user.login // "")},body:(.body // ""),createdAt:.created_at}]'
-# SPE-186b: on a repository with Issues disabled (measured on horonomy/local-agent) GraphQL pullRequest.comments is empty too,
+# SPE-186b: on some repositories (measured on horonomy/local-agent, which reports Issues enabled; cause unknown) GraphQL pullRequest.comments is empty,
 # while the PR timeline's IssueComment items list the same comments with their integrity flags. A fixed query: only the
 # validated owner, name and number vary, as -F variables, exactly like THREADS. filteredCount, not totalCount: totalCount counts
 # every timeline item regardless of itemTypes (measured live: totalCount 4 for 2 issue comments).
@@ -1171,7 +1171,7 @@ def evaluate(run, repo, pr, owners, ci_unavailable=False, bots=None, version_pol
                 reasons.append(f"OWNER_IDENTITY_NOT_VERIFIED: {me!r} is neither the repository owner account nor an administrator of org {owner!r}")
     graphql_n = len(p["comments"])
     # comment_source_discrepancy compares pr-view (GraphQL pullRequest.comments) with REST only; {"graphql": 0, ...} is the
-    # expected shape on a repository with Issues disabled, where comment_timeline then records the timeline fill.
+    # expected shape on such a repository (empty GraphQL PR comments, cause unknown), where comment_timeline then records the timeline fill.
     comments, rest_n, comments_error = merged_comments(run, repo, pr, p["comments"], facts=facts)
     if comments_error:
         reasons.append(f"COMMENTS_UNREADABLE: the REST issue comments could not be read ({comments_error}); review and CI records cannot be proven")
