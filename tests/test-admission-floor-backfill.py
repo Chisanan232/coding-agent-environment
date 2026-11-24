@@ -13,6 +13,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 _spec = spec_from_file_location('test_admission_backfill_base', ROOT / 'tests/test-admission-backfill.py')
@@ -197,7 +198,7 @@ class FloorOnlyHead(tb.Base):
         admits two (250 - 120 = 130) and refuses the third (250 - 180 = 70 < 100 + 4). Without the per-grant charge a third would be granted."""
         self.head = self.enqueue('la-cargo-head', 'build-workspace', [tb.LOCAL], 160)
         candidates = [self.enqueue('c%d' % i, 'build-workspace', ['cargo-target:/Users/dev/.cargo/targets/k%d' % i], 60, cpus=2) for i in range(5)]
-        with backfill(cap=3):
+        with backfill(cap=3), patch.object(da, 'BACKFILL_LOSS_CAP', 1 << 60):   # isolate the byte floor from the cumulative-loss cap (tested below)
             out = self.advance(free=250 * GIB)
         in_flight = [e for e in self.entries().values() if e['id'] in candidates and e['state'] in ('GRANTED', 'CLAIMED')]
         self.assertEqual(sorted(out['backfilled']), sorted(e['id'] for e in in_flight))
