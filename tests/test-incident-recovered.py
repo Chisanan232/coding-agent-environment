@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -132,8 +133,8 @@ class ClosingNotice(zs.Spool):
         self.assertEqual(len(self.files()), 1)
 
 
-class ClosingIncidents(tm.MonitorBase):
-    """admission-monitor side."""
+class ClosingBase(tm.MonitorBase):
+    """Shared harness for the monitor-side tests: an injected closing notifier and scratch scheduler state."""
 
     def setUp(self):
         super().setUp()
@@ -177,6 +178,33 @@ class ClosingIncidents(tm.MonitorBase):
         entry.update(state='CLAIMED', holder={'pid': pid, 'start_token': 't'})
         da._write_queue_entry(self.state_path, entry)
         self.table = {pid: (1, 10.0)}
+
+
+
+class ClosingIncidents(ClosingBase):
+    """admission-monitor side: closing of resolved incidents."""
+
+    def test_an_unannounced_wait_incident_is_never_closed_even_with_attempts_and_a_resolution(self):
+        wall = 1_000_000.0
+        rec = mon.new_incident('q000001', 'escalated', wall - 9000, wall + 600, wall - 9000, None, 'wait', 'none')
+        rec.update(resolved_at=wall - 100, attempts=3)                         # its opening notice kept failing: nothing was ever announced
+        self.assertIsNone(rec['notified_phase'])
+        sent = []
+        env = types.SimpleNamespace(emit_recovered=lambda a: sent.append(a) or {'result': 'queued'})
+        mon.close_incidents(env, {'q000001:wait': rec}, wall)
+        self.assertEqual(sent, [])
+        self.assertIsNone(rec['recovered_at'])
+
+    def test_a_failing_closing_notifier_is_called_only_as_often_as_the_backoff_allows(self):
+        wall = 1_000_000.0
+        rec = mon.new_incident('q000002', 'escalated', wall - 9000, wall + 600, wall - 9000, None, 'wait', 'none')
+        rec.update(resolved_at=wall - 100, notified_phase='escalated')
+        calls = []
+        env = types.SimpleNamespace(emit_recovered=lambda a: calls.append(a) or {'result': 'failed', 'delivery': None})
+        for second in range(600):                                              # a tick every second for ten minutes
+            mon.close_incidents(env, {'q000002:wait': rec}, wall + second)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertLessEqual(len(calls), 5)                                    # 60 s, 120 s, 240 s ... not one call per tick
 
     def test_a_resolved_incident_is_closed_with_one_notice_naming_its_own_ref(self):
         qid = self.granted_handoff()
@@ -279,7 +307,7 @@ class ClosingIncidents(tm.MonitorBase):
         self.assertIn('--strict', argv)
 
 
-class Reconcile(ClosingIncidents):
+class Reconcile(ClosingBase):
     """The one-shot command for incidents the supervisor already lists as open (the monitor's own records of old ones have been pruned)."""
 
     def status_file(self, refs):
@@ -321,6 +349,37 @@ class Reconcile(ClosingIncidents):
         self.assertEqual(alert['incident_ref'], self.refs(done))
         self.assertEqual({row['action'] for row in out['rows']}, {'sent', 'keep', 'unmapped'})
         self.assertEqual(self.advances, [])
+
+    def test_one_apply_sends_at_most_the_cap_and_a_failed_send_is_reported(self):
+        done, live = self.scenario()
+        status = self.status_file([self.refs(done)])
+        old = mon.RECONCILE_MAX_SENDS
+        mon.RECONCILE_MAX_SENDS = 0
+        try:
+            out = mon.reconcile_incidents(self.env(), status, apply=True)
+        finally:
+            mon.RECONCILE_MAX_SENDS = old
+        self.assertEqual((out['applied'], self.closing), (0, []))
+        self.assertEqual([r['action'] for r in out['rows']], ['closable'])
+        self.closing_result = {'result': 'failed', 'delivery': None}
+        out = mon.reconcile_incidents(self.env(), status, apply=True)
+        self.assertEqual((out['failed'], [r['action'] for r in out['rows']]), (1, ['failed']))
+
+    def test_the_command_exits_non_zero_when_an_apply_send_failed(self):
+        import io
+        from contextlib import redirect_stdout
+        done, live = self.scenario()
+        status = self.status_file([self.refs(done)])
+        self.closing_result = {'result': 'failed', 'delivery': None}
+        env = self.env()
+        old = mon.Env
+        try:
+            mon.Env = lambda *a, **k: env
+            with redirect_stdout(io.StringIO()):
+                rc = mon.main(['reconcile-incidents', '--status-file', str(status), '--apply'])
+        finally:
+            mon.Env = old
+        self.assertEqual(rc, 1)
 
     def test_a_missing_or_unreadable_status_file_closes_nothing(self):
         self.scenario()
