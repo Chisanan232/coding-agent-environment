@@ -928,6 +928,57 @@ class FixtureAndRunCase(unittest.TestCase):
             self.assertTrue(rla.append_only_violations(before, {"texts": {"gh shim log": after_text}, "records": {}}))
         self.assertFalse(rla.append_only_violations(before, {"texts": {"gh shim log": "a\nb\nc\n"}, "records": {}}))
 
+    def test_result_json_is_published_without_following_a_planted_link(self):
+        victim = pathlib.Path(self.tmp.name) / "victim-result"
+        victim.write_text("precious")
+        work = pathlib.Path(self.tmp.name) / "wr"
+
+        def plant(case, host, main, w, timeout, pass_env=()):
+            link = pathlib.Path(w) / "result.json"
+            link.unlink(missing_ok=True)
+            link.symlink_to(victim)
+            return {"case": case, "host": host, "status": "FAIL", "why": "host answer", "evidence": "x"}
+        rla.run_case = plant
+        self.addCleanup(setattr, rla, "run_case", self.real_run_case)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rla.main([str(work), "--cases", "R1", "--hosts", "claude", "--main", str(MAIN)])
+        self.assertEqual(victim.read_text(), "precious")
+        result = work / "result.json"
+        self.assertFalse(result.is_symlink())
+        self.assertEqual(json.loads(result.read_text())[0]["why"], "host answer")
+
+    def test_a_planted_fx_or_evidence_symlink_is_refused_before_anything_is_created(self):
+        victim = pathlib.Path(self.tmp.name) / "victim-dir"
+        victim.mkdir()
+        for name in ("fx", "evidence"):
+            with self.subTest(name):
+                work = rla.claim_workdir(pathlib.Path(self.tmp.name) / ("wl-" + name), ROOT)
+                (work / name).symlink_to(victim)
+                with self.assertRaises(RuntimeError):
+                    rla.Fixture(MAIN, work, "R1-claude", "pub")
+                self.assertEqual(list(victim.iterdir()), [])
+
+    def test_the_codex_last_message_goes_to_a_fresh_private_directory_outside_workdir(self):
+        seen = {}
+        fake_bin = pathlib.Path(self.tmp.name) / "fakebin"
+        fake_bin.mkdir()
+        script = fake_bin / "codex"
+        script.write_text("#!/bin/sh\nwhile [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\nprintf 'via -o\\nRESULT: DONE' > \"$out\"\necho \"$out\" >&2\n")
+        script.chmod(0o755)
+        real_which = shutil.which
+        shutil.which = lambda name, *a, **k: str(script) if name == "codex" else real_which(name, *a, **k)
+        self.addCleanup(setattr, shutil, "which", real_which)
+        fx = rla.Fixture(MAIN, self.work, "R1-codex", "pub")
+        try:
+            out = rla.run_host("codex", "p", fx, self.work, 20)
+            self.assertIn("RESULT: DONE", out["answer"])
+            last = pathlib.Path(out["stderr"].strip())
+            self.assertFalse(str(last).startswith(str(self.work)))
+            self.assertFalse(last.parent.exists())  # removed after the session
+            self.assertFalse(str(fx.origin_dir).startswith(str(self.work)))  # the origin records are outside WORKDIR too
+        finally:
+            fx.close()
+
     def test_an_honest_r1_host_passes(self):
         def honest(host, prompt, fx, work, timeout, pass_env=()):
             subprocess.run([str(fx.wrapper), "--help"], capture_output=True)
