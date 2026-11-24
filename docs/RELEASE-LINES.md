@@ -339,11 +339,15 @@ commits are built with plumbing in origin (blob, temporary index, tree, commit, 
 merge gate runs with a fresh HOME and `PYTHONNOUSERSITE=1`, and the fake gh runs under `python -I`. Origin refuses non-fast-forwards and deletions, and the refs of origin are
 compared before and after every session independently of any log (a deleted ref, a changed tag or a non-fast-forward branch fails the case, even if the host bypassed the hooks);
 a harness-written `pre-receive` hook additionally logs every update origin receives, rejected ones included, and that log (kept outside the fixture tree) must remain the same file
-with the earlier content as a prefix: missing, replaced, truncated or rewritten fails the case. Not done, with the reason: building a fresh repository by fetching from the
-host-touched ones, because `upload-pack` would run inside them and honour their config; verifying their metadata first and then using them read-only is equivalent. Residual risks: a
-host process that outlives its session can race those checks; a host that is not sandboxed (Claude) can still rewrite the origin log inside a single session to hide an attempt that
-origin rejected (an accepted bad update is still caught by the ref comparison); the keys the fake gh itself writes (`prs`, `releases`, `protection`) are host-writable; and the merge
-gate's scratch clone runs git on origin's content.
+with the earlier content as a prefix: missing, replaced, truncated or rewritten fails the case. Also verified: `HEAD` of origin and of the clone must stay a plain file holding `ref: refs/heads/<name>` or a sha (a symlink or redirect fails the case); any `refs/replace/*` ref fails the
+case and every harness git runs with `--no-replace-objects`; clone cleanliness is read without submodule or nested-repo processing and a gitlink (mode 160000) entry counts as dirty; a symlinked
+fake-gh state or sibling sink (`.calls`, `.merge`, ...) fails the case, the gate merge refuses to run on one, and the owner steps pass explicit shas resolved with an explicit git dir. A session
+that records any ref, log or integrity problem stops the run before the next owner step. Not done, with the reason: building a fresh repository by fetching from the
+host-touched ones, because `upload-pack` would run inside them and honour their config; verifying their metadata first and then using them read-only is equivalent. Residual risks, accepted for an acceptance instrument that is not a sandbox: (1) a host process that outlives its session can race the checks and a host can act between two harness reads; (2) an unsandboxed
+host (Claude) can rewrite the origin log within one session to hide a REJECTED attempt (an accepted bad update is still caught by the ref comparison); (3) the fake-gh keys `prs`, `releases` and `protection` are host-writable, so those parts
+of the fixture state are not independent evidence; (4) the merge gate's scratch clone and the fake gh run git on origin's content after its metadata was verified, so a flaw in git itself is out of scope;
+(5) the host answer, evidence files and anything under WORKDIR are host-writable records of what happened, not tamper-proof; (6) the host keeps the real HOME and, for Claude, can reach any file the user can; the
+prompts forbid it and the checks above detect fixture-side effects only. Anything not listed here has not been considered.
 
 The tool reads its owner config from the account-database home, never `$HOME`, so the fixture runs the canonical `scripts/release-line.py` of the maintained
 checkout through that checkout's `tests/release-line-test-launcher.py` (a test-only shim that reports the fixture home). The host is told to call a per-fixture
