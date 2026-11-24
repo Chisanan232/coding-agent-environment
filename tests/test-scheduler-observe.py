@@ -57,8 +57,10 @@ class Observe(unittest.TestCase):
             marker.unlink()
 
     def run_once(self):
-        argv = ["--state", self.state_arg, "--failure-file", str(self.failure_file), "--queue-dir", str(self.queue),
+        argv = ["--state", self.state_arg, "--queue-dir", str(self.queue),
                 "--monitor-status", str(self.monitor), "--supervisor-dir", str(self.sup), *self.extra_args]
+        if self.failure_file is not None:
+            argv += ["--failure-file", str(self.failure_file)]
 
         def provider(repo):
             if self.pr_error:
@@ -336,6 +338,98 @@ class Observe(unittest.TestCase):
         so.write_failure(self.failure_file, {"class": "X", "count": 1})
         for path in (self.state_dir / "last.json", self.failure_file):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    # -- the failure counter lives only in a private per-user directory (security review) -------------------
+    def default_counter(self):
+        self.failure_file = None
+        return self.state_dir / so.FAILURE_NAME
+
+    def fail_once(self):
+        with patch.object(so, "save_state", side_effect=OSError("disk")):
+            return self.run_once()
+
+    def test_the_default_counter_sits_next_to_the_state_in_a_0700_directory_with_a_0600_file(self):
+        counter = self.default_counter()
+        self.run_once()
+        self.assertEqual(self.fail_once(), "QUIET")
+        self.assertEqual(stat.S_IMODE(self.state_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(counter.stat().st_mode), 0o600)
+        self.assertTrue(self.fail_once().startswith("CHANGE: observer failing ("))
+
+    def test_a_looser_existing_state_directory_is_tightened(self):
+        self.state_dir.mkdir()
+        os.chmod(self.state_dir, 0o755)
+        self.default_counter()
+        self.run_once()
+        self.assertEqual(stat.S_IMODE(self.state_dir.stat().st_mode), 0o700)
+
+    def test_a_planted_symlink_at_the_old_shared_temp_path_is_ignored_and_never_written(self):
+        old = Path(tempfile.gettempdir()) / f"scheduler-observe-failures-{os.getuid()}.json"
+        if old.exists() or old.is_symlink():
+            self.skipTest("the legacy path exists on this machine; not touching it")
+        decoy = Path(self.tmp.name) / "decoy.json"
+        decoy.write_text(json.dumps({"class": "Evil", "count": 5}))
+        old.symlink_to(decoy)
+        self.addCleanup(old.unlink)
+        self.default_counter()
+        self.run_once()
+        self.assertEqual(self.fail_once(), "QUIET")                                  # the planted count of 5 was never consulted
+        self.assertEqual(json.loads(decoy.read_text()), {"class": "Evil", "count": 5})
+        self.assertTrue(old.is_symlink())
+
+    def test_a_counter_that_is_a_symlink_wrong_mode_or_not_a_regular_file_is_discarded(self):
+        counter = self.default_counter()
+        self.run_once()
+        decoy = Path(self.tmp.name) / "decoy2.json"
+        decoy.write_text(json.dumps({"class": "X", "count": 5}))
+        os.chmod(decoy, 0o600)
+        cases = {}
+        cases["symlink"] = lambda: counter.symlink_to(decoy)
+        cases["group-readable"] = lambda: (counter.write_text(json.dumps({"class": "X", "count": 5})), os.chmod(counter, 0o640))
+        cases["fifo"] = lambda: os.mkfifo(counter)
+        cases["oversized"] = lambda: (counter.write_text(" " * 9000 + json.dumps({"class": "X", "count": 5})), os.chmod(counter, 0o600))
+        for name, plant in cases.items():
+            with self.subTest(name):
+                so._MEMORY_FAILURE.clear()
+                if counter.exists() or counter.is_symlink():
+                    counter.unlink()
+                plant()
+                self.assertIsNone(so.read_failure(counter))
+                self.assertEqual(self.fail_once(), "QUIET")                          # a planted count of 5 would have printed CHANGE
+                if counter.exists() and not counter.is_symlink():
+                    counter.unlink()
+
+    def test_a_counter_owned_by_someone_else_is_discarded(self):
+        counter = self.default_counter()
+        self.run_once()
+        so.write_failure(counter, {"class": "X", "count": 5})
+        so._MEMORY_FAILURE.clear()
+        with patch.object(so.os, "getuid", return_value=os.getuid() + 1):
+            self.assertIsNone(so.read_failure(counter))
+
+    def test_a_foreign_or_symlinked_private_directory_is_refused_and_nothing_goes_to_a_shared_temp_path(self):
+        before = set(Path(tempfile.gettempdir()).glob("scheduler-observe-failures-*"))
+        target = Path(self.tmp.name) / "real"
+        target.mkdir()
+        link = Path(self.tmp.name) / "linked"
+        link.symlink_to(target)
+        self.state_arg = str(link / "last.json")
+        self.failure_file = None
+        for _ in range(3):
+            line = self.run_once()
+            self.assertTrue(line.startswith("CHANGE: observer failing ("), line)    # unusable directory: reported, not silent
+        self.assertEqual(list(target.iterdir()), [])
+        with patch.object(so.os, "getuid", return_value=os.getuid() + 1):
+            self.assertRaises(PermissionError, so.ensure_private_dir, self.state_dir)
+        self.assertEqual(set(Path(tempfile.gettempdir()).glob("scheduler-observe-failures-*")), before)
+
+    def test_a_deeply_nested_state_file_cannot_crash_or_stall_the_observer(self):
+        self.default_counter()
+        self.run_once()
+        (self.state_dir / "last.json").write_text("[" * 100000)
+        os.chmod(self.state_dir / "last.json", 0o600)
+        self.assertEqual(self.run_once(), "QUIET")
+        self.assertEqual(self.run_once(), "NO_CHANGE")
 
 
 if __name__ == "__main__":
