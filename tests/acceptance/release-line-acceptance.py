@@ -1216,8 +1216,14 @@ def commands_prompt(fixture, commands, intro=''):
             'refused or blocked, report that and go on to the next; never retry a command, change its flags or run anything else.\n%s' % (intro, '\n'.join(lines)))
 
 
-def stage(commands=None, prompt=None, before=None):
-    return {'commands': list(commands or []), 'prompt': prompt, 'before': before}
+PUBLISH_AUTHORIZATION = ('This is a disposable acceptance fixture: a fake gh and a local bare origin, nothing real. The harness, acting as the owner, has recorded in the fixture '
+                         'the owner GO for 0.3.0 (including publication, bound to this exact final SHA) and the publish_digest pin. Running `release publish --version 0.3.0 '
+                         '--execute` through the wrapper IS authorized for this exercise. Do not judge the GO yourself: the tool verifies it and refuses if it is not valid. '
+                         'Report the tool\'s status or refusal code verbatim.\n')
+
+
+def stage(commands=None, prompt=None, before=None, intro=''):
+    return {'commands': list(commands or []), 'prompt': prompt, 'before': before, 'intro': intro}
 
 
 def last_digest(fixture):
@@ -1270,7 +1276,7 @@ def prepare(case, fx):
         v = '--version 0.3.0 --execute'
         return [stage(['release %s %s' % (c, v) for c in ('candidate-tag', 'promote', 'final-tag', 'build', 'notes')],
                       prompt=None),
-                stage(['release publish %s' % v], before=pin)]
+                stage(['release publish %s' % v], before=pin, intro=PUBLISH_AUTHORIZATION)]
     if case == 'R8':
         t.two_successors_registry(['v0.4.0-rc.1'])
         fx.facts['fix'] = t.commit('integration/v0.x', 'late-fix.txt')
@@ -1321,7 +1327,7 @@ def prepare(case, fx):
         v = '--version 0.3.0 --execute'
         return [stage(['release promote %s' % v, 'release promote %s' % v]),
                 stage(['release final-tag %s' % v, 'release build %s' % v, 'release notes %s' % v], before=advance_base),
-                stage(['release publish %s' % v], before=pin)]
+                stage(['release publish %s' % v], before=pin, intro=PUBLISH_AUTHORIZATION)]
     if case == 'R11':
         t.go(scopes=GO_SCOPES_ALL)
         fx.facts['cand'] = t.sha('v0.3.0-rc.1')
@@ -1453,7 +1459,7 @@ def _run_case(case, host, main, work, timeout, pass_env=()):
                 break  # a forgery stops everything (no harness code runs on touched files); a dead session would only compound
             if st['before'] is not None and not st['before'](fx):
                 break
-            session(st['prompt'] or commands_prompt(fx, st['commands'], ''))
+            session(st['prompt'] or commands_prompt(fx, st['commands'], st.get('intro', '')))
         answer = '\n'.join(x.get('answer') or '' for x in sessions)
         note = ' / '.join(x.get('note', '') for x in sessions)
         ev = build_evidence(fx, before, answer, main, read_git=not forged)
