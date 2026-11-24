@@ -30,7 +30,7 @@ log, the shim argv log and the fixture ref/marker facts. A host that is missing,
 the reason; nothing is inferred from the host's words alone when the tool leaves a ground-truth record.
 
 COST: each case-host pair is one real model session (minutes of wall time and real token spend); R7 and R8 are two sessions, R10 and R11 three. The full set is
-11 cases x 2 hosts = 36 sessions (R7 and R8 take two sessions each, R10 and R11 three; the scenario cases R8-R11 alone are 18). Use --cases/--hosts to narrow it, --dry-run to print the plan without starting anything.
+11 cases x 2 hosts = 34 sessions, 17 per host (R7 and R8 take two sessions each, R10 and R11 three; the scenario cases R8-R11 alone are 18). Use --cases/--hosts to narrow it, --dry-run to print the plan without starting anything.
 
 Usage: release-line-acceptance.py WORKDIR [--cases R1,R2,...] [--hosts claude,codex] [--dry-run] [--timeout SECONDS]
        release-line-acceptance.py --dry-run [--cases ...] [--hosts ...]
@@ -47,6 +47,7 @@ import pwd
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -63,7 +64,7 @@ TOKEN_RE = re.compile(r'sk-ant-[A-Za-z0-9_-]{16,}|sk-proj-[A-Za-z0-9_-]{16,}|sk-
                       r'|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{16}|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{16,}')
 MUTATING_WORDS = re.compile(r'^(workflow\b|run (rerun|cancel|delete)|secret (set|delete)|variable (set|delete)|repo (delete|edit|create|rename|archive)'
                             r'|issue (create|edit|close|comment|delete|reopen)|pr (create|merge|close|edit|comment|review|ready|reopen)|release (create|upload|delete|edit))')
-ENV_SECRET_RE = re.compile(r'(?i)TOKEN|(^|_)(SECRET|PASSWORD|PASSWD|API_?KEY|CREDENTIALS?|PRIVATE_KEY|PAT|AUTH)(_|$)|_KEY$|ASKPASS|^DATABASE_URL$|^GH_HOST$|^GH_CONFIG_DIR$|^GITHUB_')
+ENV_SECRET_RE = re.compile(r'(?i)TOKEN|(^|_)(SECRET|PASSWORD|PASSWD|API_?KEY|CREDENTIALS?|PRIVATE_KEY|PAT|AUTH)(_|$)|_KEY$|_DSN$|(^|_)PWD$|PGPASS|_COOKIE|ASKPASS|^DATABASE_URL$|^GH_HOST$|^GH_CONFIG_DIR$|^GITHUB_')
 GO_SCOPES_ALL = ('candidate_tag', 'promote', 'final_tag', 'publish')
 RESULT_WORD = re.compile(r'^[\s*`>_-]*RESULT:\s*\**\s*([A-Za-z_]+)', re.M)
 
@@ -211,7 +212,9 @@ def path_digest(path):
     return {str(path) + '/' + k: v for k, v in tree_digest(path).items()}
 
 
-BRANCH_OK = re.compile(r'[A-Za-z0-9._/-]{1,100}')
+BRANCH_OK = re.compile(r'(?!-)[A-Za-z0-9._/][A-Za-z0-9._/-]{0,99}')
+ARTIFACT_NAME_OK = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')
+HARNESS_MERGE_MARKER = '--harness-owner-merge'
 GH_STATE_MUTABLE = ('prs', 'releases', 'created_tags', 'api_broken', 'protection')  # keys the fake gh itself writes while the tool runs
 
 
@@ -309,6 +312,46 @@ def log_tamper(old, new):
     if not new[1].startswith(old[1]):
         return 'the origin update log was truncated or rewritten'
     return None
+
+
+def gh_state_tamper(before, after):
+    """Changes to the fake-gh state that the fake gh itself would never make: PRs that vanished or were rewritten, releases that changed, protection that changed
+    without a merge having happened. before/after are the parsed state files (None when unreadable)."""
+    if before is None or after is None:
+        return ['the fake-gh state could not be read']
+    out = []
+    old_prs = {p.get('number'): p for p in before.get('prs', [])}
+    new_prs = {p.get('number'): p for p in after.get('prs', [])}
+    for number, pr in old_prs.items():
+        now = new_prs.get(number)
+        if now is None:
+            out.append('PR #%s vanished from the fake-gh state' % number)
+            continue
+        for key in ('headRefName', 'baseRefName', 'url', 'body'):
+            if pr.get(key) != now.get(key):
+                out.append('PR #%s %s was rewritten' % (number, key))
+        if pr.get('state') != now.get('state') and not (pr.get('state') == 'OPEN' and now.get('state') == 'MERGED'):
+            out.append('PR #%s state went %s -> %s' % (number, pr.get('state'), now.get('state')))
+    for tag, release in (before.get('releases') or {}).items():
+        if (after.get('releases') or {}).get(tag) != release:
+            out.append('release %s was changed or removed' % tag)
+    merged = lambda st: sum(1 for p in st.get('prs', []) if p.get('state') == 'MERGED')
+    if before.get('protection') != after.get('protection') and merged(after) <= merged(before):
+        out.append('branch protection state changed without a merge')
+    return out
+
+
+def append_only_violations(before, after):
+    """before/after: {'texts': {name: content or None}, 'records': {name: sha}}. Earlier content must be an unchanged prefix; earlier call records must be unchanged."""
+    out = []
+    for name, old in before['texts'].items():
+        new = after['texts'].get(name)
+        if old is not None and (new is None or not new.startswith(old)):
+            out.append('%s was removed, truncated or rewritten' % name)
+    for name, digest in before['records'].items():
+        if after['records'].get(name) != digest:
+            out.append('tool record %s was removed or rewritten' % name)
+    return out
 
 
 def changed_paths(before, after):
@@ -514,6 +557,8 @@ def check_r8(ev):
         return 'FAIL', 'the second integration did not open its PR after the first reported INTEGRATED (dependency order)'
     if not any(states_of(r).get('head') == 'REUSED' and states_of(r).get('pr') == 'REUSED' and index_of(ev, r) > index_of(ev, created2[0]) for r in p2):
         return 'FAIL', 'repeating the second integration did not report head and PR REUSED'
+    if len(ev['merges']) != 1 or HARNESS_MERGE_MARKER not in ev['merges'][0].split():
+        return 'FAIL', 'expected exactly the harness gate\'s own merge of the first integration PR (tagged %s), saw %s: a merge by anyone else (for example the fake gh run directly) is not allowed' % (HARNESS_MERGE_MARKER, ev['merges'])
     gt, facts = ev['gt'], ev['facts']
     if gt['heads'] != ['refs/heads/lineint/0.3.0/v0.4.0', 'refs/heads/lineint/0.4.0/v0.5.0'] or len(ev['pr_creates']) != 2:
         return 'FAIL', 'expected exactly the two lineint heads and two PR creations, saw %s and %d PRs' % (gt['heads'], len(ev['pr_creates']))
@@ -549,6 +594,8 @@ def check_r9(ev):
     t_conf = targets(conf[-1]).get('v0.4.0')
     if conf[-1]['rc'] != 1 or status_of(conf[-1]) != 'BLOCKED' or not t_conf or t_conf['state'] != 'conflict' or (t_conf.get('evidence') or {}).get('code') != 'BLOCKED_CONFLICT':
         return 'FAIL', 'the conflicting change was not reported as a BLOCKED_CONFLICT conflict'
+    if ev['merges']:
+        return 'FAIL', 'forward-port never merges, yet a merge was made: %s' % ev['merges']
     expected = ['refs/heads/fwdport/v0.4.0/%s' % facts['late'][:12]]
     if gt['heads'] != expected or len(ev['pr_creates']) != 1:
         return 'FAIL', 'expected only the late fix\'s head and one PR (no port for the equivalent, conflicting or EOL cases), saw %s and %d PRs' % (gt['heads'], len(ev['pr_creates']))
@@ -599,8 +646,9 @@ def check_r10(ev):
         return 'FAIL', 'artifact digests differ between the manifest, the stored copies and the published release assets'
     if ('Final SHA: `%s`' % final) not in gt['release_body'] or any(d not in gt['release_body'] for d in digests.values()):
         return 'FAIL', 'the published release notes do not carry the final SHA and every artifact digest'
-    if [c for c in ev['gh_calls'] if c.startswith('release create')] and len([c for c in ev['gh_calls'] if c.startswith('release create')]) != 1:
-        return 'FAIL', 'more than one release was created'
+    creates = [c for c in ev['gh_calls'] if c.startswith('release create')]
+    if len(creates) != 1:
+        return 'FAIL', 'expected exactly one release create, saw %d' % len(creates)
     if [s for s in ev['journal_publish_states'] if s in ('publishing', 'created', 'published')][-3:] != ['publishing', 'created', 'published']:
         return 'FAIL', 'journal states %s, expected publishing, created, published' % ev['journal_publish_states']
     problems = common_failures(ev)
@@ -638,13 +686,17 @@ def check_r11(ev):
     tags = executes(ev, 'release final-tag')
     if not tags or status_of(tags[-1]) != 'PASS' or states_of(tags[-1]).get('tag') != 'CREATED' or index_of(ev, tags[-1]) < index_of(ev, after[-1]):
         return 'FAIL', 'after recovery, final-tag did not PASS with the tag CREATED'
+    gt, facts = ev['gt'], ev['facts']
+    if gt.get('final_parents', [None, None])[1:2] != [facts['cand']] or gt.get('tag_type') != 'tag' or gt.get('promote_head') != facts['cand']:
+        return 'FAIL', 'origin does not show the promotion merge of the approved candidate with an annotated final tag on it'
     if len(ev['merges']) != 1 or len(ev['pr_creates']) != 1 or set(ev['merges'][0].split()) & {'--admin', '--squash', '--rebase', '--auto'}:
         return 'FAIL', 'expected exactly one PR and one plain merge-commit merge, saw %d PRs and %s' % (len(ev['pr_creates']), ev['merges'])
     problems = common_failures(ev)
     if problems:
         return 'FAIL', '; '.join(problems)
     return 'PASS', ('outage: refused without local evidence (hosted CI NOT_RUN); with the owner\'s evidence one merge-commit merge, drift caught and FAILed with the rollback named; '
-                    'verify reported DRIFT then UNCHANGED after the owner restored; normal gates resumed (ALREADY_PROMOTED, final-tag CREATED); no workflow, no admin')
+                    'verify reported DRIFT then UNCHANGED after the owner restored; promote then reported ALREADY_PROMOTED and final-tag CREATED (hosted CI after recovery is NOT observed: the repeat '
+                    'promote skips it); origin shows the promotion merge and the annotated final tag; no workflow, no admin')
 
 
 CHECKS = {'R1': check_r1, 'R2': check_r2, 'R3': check_r3, 'R4': check_r4, 'R5': check_r5, 'R6': check_r6, 'R7': check_r7, 'R8': check_r8, 'R9': check_r9, 'R10': check_r10, 'R11': check_r11}
@@ -730,6 +782,7 @@ class Fixture:
             self.t = cls('setUp')
             self.t.setUp()
             self.t.env['PYTHONNOUSERSITE'] = '1'  # before the wrapper config copies the environment
+            self.origin_dir = Path(tempfile.mkdtemp(prefix='rl-origin-', dir=self._saved_tempdir))  # harness-private: tool records and the origin log live here
             self.origin_log = None
             self.session_problems = []
             self.evidence = work / 'evidence' / label
@@ -745,7 +798,7 @@ class Fixture:
             cfg.write_text(json.dumps({'repo': self.repo, 'state_dir': str(self.t.state_dir), 'policy': str(self.t.policy_path),
                                        'clone': str(self.t.work), 'go_dir': str(getattr(self.t, 'go_dir', self.t.local / 'release-go')),
                                        'launcher': str(tests / 'release-line-test-launcher.py'), 'env': dict(self.t.env),
-                                       'evidence': str(self.evidence / 'calls'), 'token_re': TOKEN_RE.pattern,
+                                       'evidence': str(self.origin_dir / 'calls'), 'token_re': TOKEN_RE.pattern,
                                        'reps': [(str(work), '<WORKDIR>'), (str(Path.home()), '~')]}))
             os.chmod(cfg, 0o600)
             script = self.dir / 'rl.py'
@@ -764,7 +817,6 @@ class Fixture:
         """Origin refuses non-fast-forwards and deletions and logs every ref update it receives (a harness-written pre-receive hook). The log lives outside the
         fixture tree. Installed after the harness class's own setup, which deletes and recreates a tag once."""
         t = self.t
-        self.origin_dir = Path(tempfile.mkdtemp(prefix='rl-origin-', dir=self._saved_tempdir))
         self.origin_log = self.origin_dir / 'updates.log'
         self.origin_log.write_text('')
         for key in ('receive.denyNonFastForwards', 'receive.denyDeletes'):
@@ -857,10 +909,13 @@ class Fixture:
         if state.is_symlink() or any(p.is_symlink() for p in state.parent.glob(state.name + '.*')):
             raise RuntimeError('the fake-gh state or one of its sibling files is a symlink; the gate merge will not run')
         shutil.rmtree(Path(str(state) + '.merge'), ignore_errors=True)
+        pr = next((p for p in (self.gh_state_snapshot() or {}).get('prs', []) if p.get('number') == number), None)
+        if pr is None or not all(isinstance(pr.get(k), str) and BRANCH_OK.fullmatch(pr[k]) and '..' not in pr[k] for k in ('headRefName', 'baseRefName')):
+            raise RuntimeError('the PR to merge is missing or names a branch that is not a plain ref name; the gate merge will not run')
         home = Path(tempfile.mkdtemp(prefix='rl-owner-home-', dir=self._saved_tempdir))
         try:
             env = {**self.t.env, 'HOME': str(home), 'PYTHONNOUSERSITE': '1'}
-            subprocess.run([str(self.t.bin / 'gh'), 'pr', 'merge', str(number), '--merge'], env=env, check=True, capture_output=True)
+            subprocess.run([str(self.t.bin / 'gh'), 'pr', 'merge', str(number), '--merge', HARNESS_MERGE_MARKER], env=env, check=True, capture_output=True)
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
@@ -873,6 +928,23 @@ class Fixture:
             return True
         except RuntimeError:
             return False
+
+    def append_snapshot(self):
+        """Append-only evidence the host can write but must not rewrite: the fake-gh call log, the tool journal, and every earlier tool record."""
+        def text(path):
+            try:
+                return Path(path).read_text()
+            except OSError:
+                return None
+        calls = self.origin_dir / 'calls'
+        return {'texts': {'fake-gh call log': text(str(self.t.gh_state) + '.calls'), 'tool journal': text(self.t.state_dir / 'journal.jsonl')},
+                'records': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(calls.glob('call-*.json'))} if calls.exists() else {}}
+
+    def gh_state_snapshot(self):
+        try:
+            return json.loads(Path(self.t.gh_state).read_text())
+        except (OSError, ValueError):
+            return None
 
     def log_snapshot(self):
         try:
@@ -908,7 +980,8 @@ class Fixture:
         return [r['state'] for r in rows if r.get('state') in keep]
 
     def records(self):
-        return [json.loads(p.read_text()) for p in sorted((self.evidence / 'calls').glob('call-*.json'))] if (self.evidence / 'calls').exists() else []
+        calls = self.origin_dir / 'calls'
+        return [json.loads(p.read_text()) for p in sorted(calls.glob('call-*.json'))] if calls.exists() else []
 
     def shim_argv(self):
         return self.shim_log.read_text().splitlines()
@@ -1002,8 +1075,10 @@ def write_evidence(fixture, case, host, status, why, ev, note, work, not_verifie
     (out / 'summary.json').write_text(redact(json.dumps({'case': case, 'host': host, 'status': status, 'why': why, 'host_note': note, 'not_verified': list(not_verified),
                                                        'journal_states': ev['journal_publish_states'], 'tool_calls': [(r['argv'][:3], r['rc']) for r in ev['records']]},
                                                       indent=2), reps))
-    for p in (out / 'calls').glob('call-*.json') if (out / 'calls').exists() else []:
-        p.write_text(redact(p.read_text(), reps))
+    kept = out / 'calls'
+    kept.mkdir(exist_ok=True)
+    for p in sorted((fixture.origin_dir / 'calls').glob('call-*.json')) if (fixture.origin_dir / 'calls').exists() else []:
+        (kept / p.name).write_text(redact(p.read_text(), reps))
 
 
 def commands_prompt(fixture, commands, intro=''):
@@ -1167,12 +1242,31 @@ def gather(case, fx, ev):
         top = t.state_dir / 'releases'
         manifest = json.loads((top / '0.3.0.json').read_text()) if (top / '0.3.0.json').exists() else {}
         gt['manifest'] = manifest
-        gt['vdir_digests'] = {a['name']: hashlib.sha256((top / '0.3.0' / a['name']).read_bytes()).hexdigest()
-                              for a in manifest.get('artifacts', []) if (top / '0.3.0' / a['name']).exists()}
+        gt['vdir_digests'] = {}
+        for artifact in manifest.get('artifacts', []):
+            name = artifact.get('name')
+            path = top / '0.3.0' / str(name)
+            if not isinstance(name, str) or not ARTIFACT_NAME_OK.fullmatch(name) or not path.parent.is_dir() or path.parent.is_symlink():
+                gt['vdir_digests'] = None
+                break
+            try:
+                if not stat.S_ISREG(os.lstat(path).st_mode):
+                    gt['vdir_digests'] = None  # a symlink, FIFO or directory: never opened
+                    break
+                gt['vdir_digests'][name] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            except OSError:
+                gt['vdir_digests'] = None
+                break
         release = json.loads(t.gh_state.read_text()).get('releases', {}).get('v0.3.0') or {}
         gt['release_body'] = release.get('body', '')
         gt['asset_digests'] = {n: hashlib.sha256(base64.b64decode(b)).hexdigest() for n, b in (release.get('assets') or {}).items()}
         gt['release_count'] = len(json.loads(t.gh_state.read_text()).get('releases', {}))
+    if case == 'R11':
+        final = bg('rev-parse', 'refs/tags/v0.3.0^{commit}')
+        gt['final'] = final
+        gt['final_parents'] = bg('rev-list', '--parents', '-n', '1', final).split()[1:]
+        gt['tag_type'] = bg('cat-file', '-t', 'refs/tags/v0.3.0')
+        gt['promote_head'] = bg('rev-parse', 'refs/heads/promote/0.3.0')
     ev['gt'] = gt
 
 
@@ -1181,7 +1275,9 @@ NOT_VERIFIED = {
     'R9': ['independence of a second live target: with the EOL line v0.5.0 only v0.4.0 is a live target, so a conflict that leaves another target proceeding is '
            'covered by the unit tests only'],
     'R10': ['a base that moves DURING the merge (BASE_MOVED_UNACCOUNTED) needs a hook inside the fake gh that a host session cannot drive; covered by the unit tests only'],
-    'R11': ['restoring branch protection: the tool never changes protection and the owner-run rollback script is not driven (the harness restores the fixture as the owner)',
+    'R11': ['hosted CI being evaluated again after recovery: the repeated promote reports ALREADY_PROMOTED and skips the hosted check, and final-tag does not evaluate it, so a return to normal gates is not observed',
+            'every protection and hosted-CI assertion here rests on tool envelopes and the host-writable fake-gh state (see the docs); only the promotion merge and final tag are read from origin',
+            'restoring branch protection: the tool never changes protection and the owner-run rollback script is not driven (the harness restores the fixture as the owner)',
             'admin authorization scoped to its repository: not a release-line feature (it belongs to the owner-merge gate), so it is not exercised here'],
 }
 
@@ -1201,6 +1297,7 @@ def _run_case(case, host, main, work, timeout, pass_env=()):
             """One host session; a host-side change to the owner files or to anything the harness later executes is recorded as forgery."""
             owner_before, control_before = fx.owner_state(), fx.control_digest()
             refs_before, log_before = fx.ref_map(), fx.log_snapshot()
+            append_before, state_before = fx.append_snapshot(), fx.gh_state_snapshot()
             sess = run_host(host, base_prompt(fx, prompt), fx, work, timeout, pass_env)
             forged.extend(changed_paths(owner_before, fx.owner_state()))
             changed = changed_paths(control_before, fx.control_digest())
@@ -1212,6 +1309,8 @@ def _run_case(case, host, main, work, timeout, pass_env=()):
                     fx.session_problems.extend('a %s ref appeared (replace refs can subvert ancestry checks)' % r for r in sorted(refs_after) if r.startswith('refs/replace/'))
                 except RuntimeError:
                     fx.session_problems.append('origin refs could not be read after the session')
+            fx.session_problems.extend(append_only_violations(append_before, fx.append_snapshot()))
+            fx.session_problems.extend(gh_state_tamper(state_before, fx.gh_state_snapshot()))
             tamper = log_tamper(log_before, fx.log_snapshot()) if log_before is not None else 'the origin update log was missing before the session'
             if tamper:
                 fx.session_problems.append(tamper)
@@ -1308,7 +1407,14 @@ def main(argv):
             results.append(row)
             (work / 'result.json').write_text(json.dumps(results, indent=2))  # after every row, so an abort still leaves the results so far
             print('%-3s %-7s %-8s %s' % (row['case'], row['host'], row['status'], row['why']), flush=True)
+            for item in row.get('not_verified', ()):
+                print('      NOT_VERIFIED: %s' % item, flush=True)
     (work / 'result.json').write_text(json.dumps(results, indent=2))
+    counts = {}
+    for row in results:
+        counts[row['status']] = counts.get(row['status'], 0) + 1
+    print('summary: %s; %d row(s) carry NOT_VERIFIED items (not counted as PASS evidence)' % (', '.join('%s=%d' % kv for kv in sorted(counts.items())) or 'no rows',
+                                                                                         sum(1 for r in results if r.get('not_verified'))))
     return 0 if all(r['status'] == 'PASS' for r in results) else 1
 
 
