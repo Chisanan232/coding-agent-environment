@@ -2105,6 +2105,10 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                                          result['free_bytes'] / GIB, reserved / GIB, nxt['bytes'] / GIB, nxt['id'])
                                      if not floor_ok else budget_why)
                     blockers = _excl_only_blockers(budget, in_use, lanes, floor_ok, result['free_bytes'], reserved, nxt, live, entries)
+                    floor_only = False
+                    if blockers is None:
+                        blockers = _floor_only_blockers(budget, in_use, lanes, floor_ok, result['free_bytes'], nxt)
+                        floor_only = blockers is not None
                     if blockers is None:
                         return out
                     # Overtakers already in flight, from durable states alone: a GRANTED or CLAIMED entry queued after the oldest waiting
@@ -2113,7 +2117,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                                     and not _queued_after_grant(nxt, e))
                     out.update(head_reason=out['reason'], backfilled=[], backfill_shadow=[])
                     backfill = {'pivot': nxt['id'], 'head': nxt, 'blockers': blockers, 'keys': _excl_id_set(nxt),
-                                'in_flight': in_flight, 'taken': 0}
+                                'in_flight': in_flight, 'taken': 0, 'floor_only': floor_only}
                     if in_flight >= BACKFILL_MAX:
                         behind = waiting[waiting.index(nxt) + 1:]
                         if behind:   # the entry backfill would have tried first
@@ -3495,6 +3499,25 @@ def _excl_only_blockers(budget, in_use, lanes, floor_ok, free, reserved, entry, 
     return blockers
 
 
+def _floor_only_blockers(budget, in_use, lanes, floor_ok, free, entry):
+    """[] when `entry` (the oldest waiting head) is refused by the disk floor alone and could not start even with nothing reserved, else
+    None. Pure. The head must have a free lane and a budget that is ok, band GREEN, within the cap, with no exclusion clash and the byte floor as its only
+    resource reason; and free - entry bytes must already be below HEAVY_FLOOR. Its wait then ends only when free space grows from
+    outside the queue, so a small later job's declared bytes cannot delay it: the head would be refused with or without that job. As
+    soon as the head would fit on an empty queue (free - bytes >= HEAVY_FLOOR) this returns None and the pass drains instead, so
+    backfill can never keep a head from a disk that has become large enough (SPE-188). An empty list means no job's release is awaited."""
+    if floor_ok or in_use >= lanes or free - entry['bytes'] >= HEAVY_FLOOR:
+        return None
+    if not budget or budget.get('status') != 'ok' or budget.get('band') != 'GREEN' or budget.get('cap_reason'):
+        return None
+    reasons = list(budget.get('resource_reasons') or [])
+    if budget.get('excl_clash') or len(reasons) != 1 or not reasons[0].startswith('byte floor:'):
+        return None   # exactly the disk-floor reason: memory, CPU or an exclusion key are other refusals
+    if _lane_refusal(dict(budget, resource_reasons=[], would_admit=True), in_use, free, 0, 0, entry):
+        return None
+    return []
+
+
 def _per_pass_memo(fn):
     """`fn` answering once per argument tuple for the length of one queue pass: bounds the `ps` forks a pass makes without changing what
     any check sees. An exception is not cached, so every caller still fails closed on its own."""
@@ -3594,6 +3617,10 @@ def _backfill_protection_lost(host, entry, entries, live, orphans, now, result, 
         blockers = []
     else:
         blockers = _excl_only_blockers(budget, held, lanes, floor_ok, free, reserved_all, head, live, entries)
+        if blockers is None and _floor_only_blockers(budget, held, lanes, floor_ok, free, head) is not None:
+            # SPE-188: the head waits for free space alone and would be refused without this grant too; the grant's own disk fit was
+            # judged at grant time and is rechecked by the claim path's plain floor, so it cannot delay the head.
+            return None
         if blockers is None:
             return ('head-not-excl-only', head['id'])
     ok, _ = _protects_head(host, head, entry, blockers, live, orphans, granted, now, result['tier'], free, reserved_all, held, lanes,
@@ -3636,18 +3663,29 @@ def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans,
         if _lane_refusal(budget, in_use, free, reserved, cand['bytes'], cand):
             reason = 'lane-refusal'
         else:
-            ok, math = _protects_head(host, backfill['head'], cand, backfill['blockers'], live, orphans, granted, now, result['tier'], free,
-                                      reserved, in_use, lanes, result['latch'], BACKFILL_HYSTERESIS)
-            if not ok:
-                reason = _head_unprotected_part(math, backfill['blockers'])
+            if backfill.get('floor_only'):
+                # The head waits for free space alone (_floor_only_blockers): the candidate must fit by itself with the grant-time margin.
+                math = {'free': free, 'reserved': reserved, 'cand_bytes': cand['bytes'], 'head_bytes': backfill['head']['bytes'],
+                        'floor': HEAVY_FLOOR, 'hysteresis': BACKFILL_HYSTERESIS, 'disk_left': free - reserved - cand['bytes']}
+                if math['disk_left'] < HEAVY_FLOOR + BACKFILL_HYSTERESIS:
+                    reason = 'head-unprotected-hysteresis'
+            else:
+                ok, math = _protects_head(host, backfill['head'], cand, backfill['blockers'], live, orphans, granted, now, result['tier'],
+                                          free, reserved, in_use, lanes, result['latch'], BACKFILL_HYSTERESIS)
+                if not ok:
+                    reason = _head_unprotected_part(math, backfill['blockers'])
     if reason:
         backfill['keys'] |= keys
         _log_backfill_decision(state_path, backfill, cand, now, 'refused', reason)
         return None
-    blocker = backfill['blockers'][0]   # the first stays in blocker_id / blocker_label / excl_key for older readers
-    verdict = {'blocked_id': backfill['pivot'], 'blocker_id': blocker['id'], 'blocker_label': blocker['label'], 'excl_key': blocker['keys'][0],
-               'blockers': [{'id': b['id'], 'label': b['label'], 'keys': list(b['keys'])} for b in backfill['blockers']],
-               'reason': 'head-excl-only', 'math': math, 'in_flight': backfill['in_flight'] + backfill['taken'], 'cap': BACKFILL_MAX}
+    if backfill.get('floor_only'):
+        verdict = {'blocked_id': backfill['pivot'], 'blockers': [], 'reason': 'head-floor-only', 'math': math,
+                   'in_flight': backfill['in_flight'] + backfill['taken'], 'cap': BACKFILL_MAX}
+    else:
+        blocker = backfill['blockers'][0]   # the first stays in blocker_id / blocker_label / excl_key for older readers
+        verdict = {'blocked_id': backfill['pivot'], 'blocker_id': blocker['id'], 'blocker_label': blocker['label'], 'excl_key': blocker['keys'][0],
+                   'blockers': [{'id': b['id'], 'label': b['label'], 'keys': list(b['keys'])} for b in backfill['blockers']],
+                   'reason': 'head-excl-only', 'math': math, 'in_flight': backfill['in_flight'] + backfill['taken'], 'cap': BACKFILL_MAX}
     if cand.get('requeue_capable') is not True:
         # SPE-176: a waiter started before the re-queue logic (or a wrapper that cannot reach a runner with it) would exit 77 on a revoke
         # and lose the job's place. Such an entry is never backfilled, ON or OFF; it is skipped like any refused candidate, so its keys
@@ -3726,7 +3764,8 @@ def _log_backfill_decision(state_path, backfill, cand, now, outcome, reason):
         last = seen['loaded'].get(cand['id'])
         if last and (last.get('outcome'), last.get('reason'), last.get('blocker_ids')) == (outcome, reason, blockers):
             return
-        fields = {'blocked_id': backfill['pivot'], 'blocker_id': backfill['blockers'][0]['id'], 'blocker_ids': blockers, 'outcome': outcome,
+        fields = {'blocked_id': backfill['pivot'], 'blocker_id': backfill['blockers'][0]['id'] if backfill['blockers'] else None,
+                  'blocker_ids': blockers, 'outcome': outcome,
                   'reason': reason, 'in_flight': backfill['in_flight'] + backfill['taken'], 'cap': BACKFILL_MAX}
         if _queue_receipt(state_path, 'backfill-decision', cand, now, **fields):
             seen['loaded'][cand['id']] = dict(fields, id=cand['id'], ts=iso_utc(now))
