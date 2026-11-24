@@ -531,6 +531,11 @@ class Evidence(unittest.TestCase):
             return self.live_base + "\n"
         if args[0] == "api" and "comments" in args[1]:
             return json.dumps(self.comments)
+        if args[:2] == ("api", "graphql") and "timelineItems" in " ".join(args) and getattr(self, "timeline", None) is not None:
+            omg.read_only(args)
+            nodes = [dict(c, databaseId=100 + i) for i, c in enumerate(self.timeline)]
+            return json.dumps({"data": {"repository": {"pullRequest": {"timelineItems": {
+                "filteredCount": len(nodes), "pageInfo": {"hasNextPage": False}, "nodes": nodes}}}}})
         raise AssertionError(args)
 
     def evidence(self, *extra, now=None, entry=None, run=None):
@@ -738,6 +743,23 @@ class Evidence(unittest.TestCase):
                 self.refused("", "--from-pr-comment")
         self.gql = self.comments + [self.posted()]
         self.comments = self.gql
+        code, out, err = self.evidence("--from-pr-comment")
+        self.assertEqual(code, 0, err)
+
+    def test_fallback_on_an_issues_disabled_repo_takes_the_flags_from_the_pr_timeline(self):
+        # SPE-186b: pr-view comments are empty and REST has no flags; the timeline supplies them for the REST twin only.
+        os.unlink(self.record_file)
+        flagged_review = dict(self.comments[0], includesCreatedEdit=False, isMinimized=False)
+        rest_only = {k: v for k, v in self.posted().items() if not k.startswith("i")}
+        self.comments = [self.comments[0], rest_only]
+        self.gql = []
+        self.refused("", "--from-pr-comment")                      # no timeline answer: REST alone never qualifies
+        for label, copy in (("edited", dict(rest_only, includesCreatedEdit=True, isMinimized=False)),
+                            ("minimized", dict(rest_only, includesCreatedEdit=False, isMinimized=True))):
+            with self.subTest(label):
+                self.timeline = [flagged_review, copy]
+                self.refused("", "--from-pr-comment")
+        self.timeline = [flagged_review, dict(rest_only, includesCreatedEdit=False, isMinimized=False)]
         code, out, err = self.evidence("--from-pr-comment")
         self.assertEqual(code, 0, err)
 

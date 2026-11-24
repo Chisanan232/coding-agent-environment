@@ -98,6 +98,16 @@ A changed head, missing or stale review or local evidence, evidence for another 
 
 **Residual risks (accept knowingly):** in `local_gate_only` mode the review plus `local_ci` evidence file is the only gate: agents running as the same OS user can forge it by invoking the runner directly with a hand-made file, and an agent-written recorder run is trusted as is. `require_signed_evidence` with a key file the agents cannot read is the only mitigation, and it is optional (this mode does not require it); the checks are only those in `local-first-ci.json`, and `not_covered` stays uncovered. The server-side backstop is only admins-enforced, no force-push and no deletion: it requires no check and no approval (0 required approvals), only that changes arrive through a PR. The repository is public, so the gate decisions, records and logs' digests are visible to anyone.
 
+## Repositories whose GraphQL pull-request comments are empty (SPE-186b)
+
+On some repositories (measured on `horonomy/local-agent`, where REST and GraphQL both report Issues enabled; the cause is not established), `gh pr view --json comments` and GraphQL `pullRequest.comments` return no comments while REST and the PR timeline list them, so the gate reports `comment_source_discrepancy: {"graphql": 0, "rest": N}`. The REST issue comments still list the records, but they do not carry `includesCreatedEdit` or `isMinimized`, and without those flags the local-first basis can never trust an `OWNER-MERGE-LOCAL-CI` record. When some REST comment has no pr-view twin, the gate makes one more read-only call: the PR's `timelineItems(itemTypes:[ISSUE_COMMENT])`, a fixed query whose only variables are the validated owner, name and number. Its result is the `comment_timeline` fact:
+
+- A timeline comment may only supply the flags of a REST comment with the same author login, body and `createdAt`, one to one. It never adds a comment and never overrides a pr-view entry.
+- Edited, minimized and non-viewer comments stay untrusted.
+- If the timeline read fails, has another page, has 100 or more nodes, has a `filteredCount` that does not match its nodes, or has a node of any other shape, the gate ignores it completely: `comment_timeline` holds `ignored` and the local-first basis stays `LOCAL_CI_MISSING`. A review record that REST lists still counts, exactly as before.
+
+No onboarding step is needed; the gate does not depend on any repository setting. Whether other GraphQL pull-request connections on such a repository (`reviews`, `reviewThreads`) are affected too is not verified: check it on a PR that has review threads before relying on the unresolved-thread check there.
+
 ## Acceptance still open
 
 Not demonstrated, because each depends on the owner steps above: autonomous no-prompt merge on a real host with a recorded review, and the live stale-head, failed-check, missing-evidence and non-owner cases through a trusted executor on a real host. Existing evidence is in `OWNER-MERGE-ACCEPTANCE-LEDGER.md` (L1 and L3 canaries by the founder, unit and mutation tests). Unsupported or unavailable automatic authorization stays **ASK**.

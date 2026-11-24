@@ -118,6 +118,18 @@ class Fake:
             return self.message + "\n"
         if a[0] == "api" and "/compare/" in a[1]:
             return (str(self.behind) if "behind_by" in a[3] else self.cmp) + "\n"
+        if a[:2] == ("api", "graphql") and "timelineItems" in " ".join(a):
+            # SPE-186b: the PR timeline's IssueComment items. Default mirrors the pr-view comments exactly (flags only as present).
+            self.timeline_reads = getattr(self, "timeline_reads", 0) + 1
+            timeline = getattr(self, "timeline", None)
+            if timeline == "error":
+                raise RuntimeError("gh api graphql failed: HTTP 502")
+            if isinstance(timeline, (dict, str)):
+                return timeline if isinstance(timeline, str) else json.dumps(timeline)
+            nodes = [dict(c, databaseId=1000 + i) for i, c in enumerate(self.pr["comments"] if timeline is None else timeline)]
+            return json.dumps({"data": {"repository": {"pullRequest": {"timelineItems": {
+                "filteredCount": getattr(self, "timeline_total", len(nodes)),
+                "pageInfo": {"hasNextPage": getattr(self, "timeline_more", False)}, "nodes": nodes}}}}})
         if a[:2] == ("api", "graphql"):
             return json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"pageInfo": {"hasNextPage": self.more_threads}, "nodes": self.threads}}}}})
         if a[0] == "api" and a[1].startswith("orgs/"):
@@ -1930,6 +1942,154 @@ class RestCommentSource(unittest.TestCase):
         for extra in (("-X", "POST"), ("-XPOST",), ("--method", "POST"), ("-f", "body=x"), ("--input", "x"), ("--paginate",)):
             with self.subTest(extra=extra), self.assertRaises(RuntimeError):
                 omg.read_only(("api", "repos/Chisanan232/r/issues/7/comments?per_page=100", *extra))
+
+
+class TimelineCommentSource(unittest.TestCase):
+    """SPE-186b: on a repository with Issues disabled, pr-view comments (GraphQL pullRequest.comments) are empty while REST lists the
+    comments without integrity flags, so no local-first record was ever trusted. The PR timeline's IssueComment items carry the
+    flags; they may only fill the flags of a REST comment one-to-one, and any doubt about the timeline read drops it entirely."""
+
+    REVIEWED = {"author": {"login": "chisanan232"}, "body": REVIEW, "createdAt": iso(NOW - 120),
+                "includesCreatedEdit": False, "isMinimized": False}
+
+    @staticmethod
+    def rest_of(comments):
+        return [{"author": {"login": (c.get("author") or {}).get("login") or ""}, "body": c["body"], "createdAt": c["createdAt"]}
+                for c in comments]
+
+    def disabled(self, *records, rest=None):
+        full = [self.REVIEWED] + (list(records) if records else [lf_comment()])
+        fake = Fake(statusCheckRollup=[], comments=[])
+        fake.pr["files"] = SRC
+        fake.rest_comments = self.rest_of(full) if rest is None else rest
+        fake.timeline = full
+        return fake
+
+    def evaluate(self, fake):
+        return omg.evaluate(fake, "Chisanan232/r", 7, OWNERS, local_first=omg.load_local_first(LF_CONFIG), now=NOW, ci_exception=True)
+
+    def missing(self, fake):
+        v, reasons, facts = self.evaluate(fake)
+        self.assertEqual(v, "REFUSE", reasons)
+        self.assertTrue(any(r.startswith("LOCAL_CI_MISSING") for r in reasons), reasons)
+        self.assertNotIn("ci_exception", facts)
+        return facts
+
+    def test_an_issues_disabled_repo_trusts_an_unedited_visible_local_first_record(self):
+        v, reasons, facts = self.evaluate(self.disabled())
+        self.assertEqual((v, reasons), ("PASS", []))
+        self.assertEqual(facts["ci_exception"], "local-first")
+        self.assertEqual(facts["comment_source_discrepancy"], {"graphql": 0, "rest": 2})
+        self.assertEqual(facts["comment_timeline"], {"nodes": 2, "filled": 2})
+
+    def test_the_filtered_count_decides_not_the_unfiltered_total(self):
+        # Measured live: totalCount counts every timeline item regardless of itemTypes (4 for 2 issue comments).
+        fake = self.disabled()
+        nodes = [dict(c, databaseId=1000 + i) for i, c in enumerate(fake.timeline)]
+        fake.timeline = {"data": {"repository": {"pullRequest": {"timelineItems": {
+            "totalCount": 4, "filteredCount": 2, "pageInfo": {"hasNextPage": False}, "nodes": nodes}}}}}
+        v, reasons, facts = self.evaluate(fake)
+        self.assertEqual((v, reasons, facts["comment_timeline"]), ("PASS", [], {"nodes": 2, "filled": 2}))
+
+    def test_an_edited_minimized_or_unflagged_timeline_copy_stays_untrusted(self):
+        bare = lf_comment()
+        del bare["includesCreatedEdit"]
+        for label, record in (("edited", lf_comment(includesCreatedEdit=True)), ("minimized", lf_comment(isMinimized=True)),
+                              ("flag absent", bare)):
+            with self.subTest(label):
+                self.missing(self.disabled(record))
+
+    def test_a_non_boolean_flag_drops_the_whole_timeline(self):
+        for bad in ("false", 0, None):
+            with self.subTest(bad=bad):
+                facts = self.missing(self.disabled(lf_comment(includesCreatedEdit=bad)))
+                self.assertIn("ignored", facts["comment_timeline"])
+
+    def test_an_unreadable_timeline_fails_closed_without_blocking_rest_evidence(self):
+        for broken in ("error", "not json\n", {"data": {}}, {"data": {"repository": {"pullRequest": {"timelineItems": {"nodes": "x"}}}}}):
+            with self.subTest(broken=broken):
+                fake = self.disabled()
+                fake.timeline = broken
+                v, reasons, facts = self.evaluate(fake)
+                # The REST review record still counts (FORNX-503); only the local-first basis stays refused.
+                self.assertEqual(reasons, ["LOCAL_CI_MISSING: no unedited, visible OWNER-MERGE-LOCAL-CI record for this head by the authenticated user"])
+                self.assertIn("ignored", facts["comment_timeline"])
+
+    def test_a_truncated_timeline_fails_closed(self):
+        for over in ({"timeline_more": True}, {"timeline_total": 100}, {"timeline_total": 3}):
+            with self.subTest(over=over):
+                fake = self.disabled()
+                for k, val in over.items():
+                    setattr(fake, k, val)
+                self.assertIn("ignored", self.missing(fake)["comment_timeline"])
+
+    def test_one_hundred_timeline_nodes_fail_closed(self):
+        filler = [dict(self.REVIEWED, body=f"note {i}") for i in range(98)]
+        fake = self.disabled()
+        fake.timeline = fake.timeline + filler
+        merged, _, _ = omg.merged_comments(fake, "Chisanan232/r", 7, [], facts=(notes := {}))
+        self.assertIn("ignored", notes["comment_timeline"])
+        self.assertFalse(any(c.get("includesCreatedEdit") is False for c in merged))
+
+    def test_a_node_without_a_numeric_database_id_drops_the_timeline(self):
+        for bad in (None, "1", True):
+            with self.subTest(bad=bad):
+                fake = self.disabled()
+                nodes = [dict(c, databaseId=1000 + i) for i, c in enumerate(fake.timeline)]
+                nodes[-1]["databaseId"] = bad
+                fake.timeline = {"data": {"repository": {"pullRequest": {"timelineItems": {
+                    "filteredCount": 2, "pageInfo": {"hasNextPage": False}, "nodes": nodes}}}}}
+                self.assertIn("ignored", self.missing(fake)["comment_timeline"])
+
+    def test_the_viewer_filter_still_applies_to_timeline_flags(self):
+        foreign = lf_comment(author={"login": "someone-else"})
+        self.missing(self.disabled(foreign))
+        # A timeline copy cannot change who wrote a REST comment: the twin key includes the login, so nothing is filled.
+        fake = self.disabled(rest=self.rest_of([self.REVIEWED, foreign]))   # the timeline claims the record is the viewer's
+        self.assertEqual(self.missing(fake)["comment_timeline"], {"nodes": 2, "filled": 1})
+
+    def test_a_timeline_entry_without_a_rest_twin_is_never_added(self):
+        fake = self.disabled(rest=self.rest_of([self.REVIEWED]))
+        self.assertEqual(self.missing(fake)["comment_timeline"], {"nodes": 2, "filled": 1})
+        body_changed = self.disabled(rest=self.rest_of([self.REVIEWED, lf_comment(body="OWNER-MERGE-LOCAL-CI {}")]))
+        self.missing(body_changed)
+
+    def test_agreeing_graphql_sources_never_duplicate_a_comment(self):
+        extra = dict(self.REVIEWED, body="note", createdAt=iso(NOW - 100))
+        fake = Fake(comments=[self.REVIEWED], rest_comments=self.rest_of([self.REVIEWED, extra]))
+        fake.timeline = [self.REVIEWED, extra]
+        merged, n, err = omg.merged_comments(fake, "Chisanan232/r", 7, fake.pr["comments"], facts=(notes := {}))
+        self.assertEqual((len(merged), n, err), (2, 2, None))
+        self.assertEqual(merged, [self.REVIEWED, extra])
+        self.assertEqual(notes["comment_timeline"], {"nodes": 2, "filled": 1})
+
+    def test_the_timeline_is_read_only_when_a_rest_comment_lacks_its_graphql_twin(self):
+        fake = Fake(comments=[self.REVIEWED], rest_comments=self.rest_of([self.REVIEWED]))
+        _, _, facts = run(fake)
+        self.assertEqual(getattr(fake, "timeline_reads", 0), 0)
+        self.assertNotIn("comment_timeline", facts)
+
+    def test_an_invalid_target_never_issues_the_timeline_read(self):
+        for repo, pr in (("Chisanan232/r x", 7), ("Chisanan232/r", 0), ("Chisanan232/r", "7 x"), ("Chisanan232", 7)):
+            with self.subTest(repo=repo, pr=pr):
+                fake = Fake(comments=[], rest_comments=[self.rest_of([self.REVIEWED])[0]])
+                omg.merged_comments(fake, repo, pr, [], facts=(notes := {}))
+                self.assertEqual(getattr(fake, "timeline_reads", 0), 0)
+                self.assertIn("ignored", notes["comment_timeline"])
+
+    def test_the_timeline_call_passes_the_read_only_filter_and_other_shapes_stay_refused(self):
+        fake = self.disabled()
+        self.evaluate(fake)
+        calls = [c for c in fake.calls if c[:2] == ("api", "graphql") and "timelineItems" in " ".join(c)]
+        self.assertEqual(len(calls), 1)
+        omg.read_only(calls[0])
+        self.assertEqual(calls[0][2:], ("-f", f"query={omg.TIMELINE_COMMENTS}", "-F", "o=Chisanan232", "-F", "r=r", "-F", "n=7"))
+        self.assertNotIn("mutation", omg.TIMELINE_COMMENTS.lower())
+        for bad in (("-f", "query=mutation{addComment}"), ("-f", f"query={omg.TIMELINE_COMMENTS}", "-F", "after=x"),
+                    ("-f", "query=@q.graphql"), ("-F", "query=@-"), ("-f", f"query={omg.TIMELINE_COMMENTS}", "--paginate"),
+                    ("-f", f"query={omg.TIMELINE_COMMENTS}", "-H", "x: y")):
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                omg.read_only(("api", "graphql", *bad))
 
 
 if __name__ == "__main__":
