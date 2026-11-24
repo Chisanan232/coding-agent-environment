@@ -264,7 +264,7 @@ state, compares it with the previous fingerprint and prints exactly one line, ex
 |---|---|---|
 | `NO_CHANGE` | nothing material changed | reply with the single word `ok` |
 | `QUIET` | routine churn (claims, releases, cancels), the first baseline, or a first unconfirmed read error | reply with `ok` |
-| `CHANGE: <delta>` | a new incident, a resolved incident, the supervisor's telegram status leaving or returning to `running`, a monitor mode change, a live backfill claimed, the first cumulative-loss-cap refusal, a new open pull request, or a source unreadable twice running (and readable again) | tell the owner once, from the line |
+| `CHANGE: <delta>` | a new incident, a resolved incident, any change of the supervisor's telegram status (for example leaving or returning to `running`), a monitor mode change, a live backfill claimed, the first cumulative-loss-cap refusal, a new open pull request, or a source unreadable twice running (and readable again) | tell the owner once, from the line |
 
 Material state: live claimed ids, backfill and cap-refusal counts, the monitor's mode and handoff incident ids, the supervisor's telegram status
 and open incident refs, provider-maintenance presence and the open scheduler pull requests. Volatile values (poll batch counters, timestamps,
@@ -272,8 +272,17 @@ free-space jitter) are never part of it, so they cannot cause a message. A sourc
 the same failure twice running is reported once, and a recovery is reported once. A changed fingerprint is stored (file `0600`, atomic write, default
 `~/.cache/coding-agent-environment/observer/last.json`, overridable with `SCHEDULER_OBSERVE_STATE`), so the same observation next run is `NO_CHANGE`.
 
-The tool opens the queue receipts, the monitor status and the supervisor state read-only and writes only its own fingerprint. Output never contains a
-path, command line, token or message id (a closed character set). It does not change the monitor, which stays observe-only.
+The tool opens the queue receipts, the monitor status and the supervisor state read-only (JSON reads are size-capped and only the tail of the receipts file is read, 8 MiB by
+default) and writes only its own fingerprint and a small failure counter (both `0600`; the file is created private and the `chmod` is defense in depth). Output is a closed
+character set: it contains no paths and no shell metacharacters, and it never prints message ids. It does not change the monitor, which stays observe-only.
+
+**Network:** the default pull-request provider runs a read-only `gh pr list` (a network call to GitHub). `--no-prs` (or `SCHEDULER_OBSERVE_NO_PRS=1`) turns it off; the open-PR set
+is then left out of the fingerprint.
+
+**A broken observer is not a quiet one.** A stored fingerprint with any wrong-typed part is discarded and rebuilt, and a comparison that raises still stores a fresh fingerprint, so
+it cannot stay stuck. An internal failure (unwritable state, an unexpected exception) prints `QUIET` the first time, `CHANGE: observer failing (<class>)` the second consecutive time,
+then `NO_CHANGE`, and `CHANGE: observer recovered` once when it works again. If even the failure counter cannot be written (default `$TMPDIR/scheduler-observe-failures-<uid>.json`,
+`SCHEDULER_OBSERVE_FAILURES`) the failure is reported on every run because it cannot be deduplicated.
 
 Suggested prompt for the recurring check (install it only when the owner asks; this change does not install anything):
 
