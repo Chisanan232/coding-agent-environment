@@ -1460,6 +1460,13 @@ BACKFILL_MAX = 1
 # grant on a sliver of margin is wasted. 4 GiB is roughly ten times that jitter and small against the 25-40 GiB declared jobs. Grant time
 # only: the claim-time recheck keeps the plain floor. It only tightens; nothing is ever granted that was refused before.
 BACKFILL_HYSTERESIS = 4 * 1024 ** 3
+# SPE-188 (ADR 0017 revision 15, owner decision 2026-11-24): while a head waits for free space alone (it could not start on an empty queue),
+# backfilled jobs may take at most this much usable space from it, counted from the first pass that saw it floor-blocked. The floor itself
+# is never breached; this bounds how much farther from fitting the head can be pushed by jobs that keep their output. Measured against the
+# current free space, so reclaimed space gives the headroom back, and counted conservatively: a candidate's declared bytes are treated as
+# kept. Grant time and claim time both apply it; a rollback is reverting the PR.
+BACKFILL_LOSS_CAP = 20 * 1024 ** 3
+BACKFILL_BASELINE_FILE = 'backfill-baseline.json'
 BACKFILL_SHADOW_WINDOW_S = 600
 # Claim window of a backfilled grant (SPE-176 hardening): it holds a lane ahead of the oldest waiting entry, so it gets half the hand-off
 # window. Its waiter is proven alive when granted and polls for the grant; a lapse takes the existing EXPIRED path and frees the in-flight
@@ -2007,6 +2014,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
             waiting = [e for e in entries if e['state'] in ('QUEUED', 'ELIGIBLE')]
             granted = [e for e in entries if e['state'] == 'GRANTED']
             if not waiting:
+                _drop_loss_baseline(state_path)   # no waiting head: the baseline of the last one is finished
                 return out
             lanes = heavy_lane_cap(result['tier'], result['latch'])
             first = waiting[0]
@@ -2104,6 +2112,7 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                                      'over-capacity: %.1f GiB free, %.1f GiB reserved, %.1f GiB requested for %s, floor 100 GiB' % (
                                          result['free_bytes'] / GIB, reserved / GIB, nxt['bytes'] / GIB, nxt['id'])
                                      if not floor_ok else budget_why)
+                    loss_baseline = _loss_baseline_sync(state_path, nxt, result['free_bytes'], reserved, now)
                     blockers = _excl_only_blockers(budget, in_use, lanes, floor_ok, result['free_bytes'], reserved, nxt, live, entries)
                     floor_only = False
                     if blockers is None:
@@ -2117,13 +2126,14 @@ def _queue_advance(state_path, free_fn, now, token_fn, grant_s, table_fn=None, h
                                     and not _queued_after_grant(nxt, e))
                     out.update(head_reason=out['reason'], backfilled=[], backfill_shadow=[])
                     backfill = {'pivot': nxt['id'], 'head': nxt, 'blockers': blockers, 'keys': _excl_id_set(nxt),
-                                'in_flight': in_flight, 'taken': 0, 'floor_only': floor_only}
+                                'in_flight': in_flight, 'taken': 0, 'floor_only': floor_only, 'loss_baseline': loss_baseline}
                     if in_flight >= BACKFILL_MAX:
                         behind = waiting[waiting.index(nxt) + 1:]
                         if behind:   # the entry backfill would have tried first
                             _log_backfill_decision(state_path, backfill, behind[0], now, 'refused', 'in-flight-cap')
                         return out
                     continue
+                _drop_loss_baseline(state_path, nxt['id'])   # the head fits: its floor-blocked wait, and the baseline counted against it, are over
                 if memory == 'probe':
                     out['grant_pending'] = True   # the head fits: the caller asks the memory gate outside the lock, then calls again
                     return out
@@ -2335,7 +2345,7 @@ def _queue_claim(state_path, qid, label, nbytes, argv, cwd, free_fn, pid, now, t
                     result['free_bytes'] / GIB, reserved / GIB, nbytes / GIB)), budget)
             if budget_why:
                 return _with_budget(refuse(budget_why), budget)   # the grant is kept: a later claim may fit
-            lost = _backfill_protection_lost(host, entry, entries, live, orphans, now, result, reserved, in_use, lanes)
+            lost = _backfill_protection_lost(host, entry, entries, live, orphans, now, result, reserved, in_use, lanes, state_path)
             if lost and lost[0] == 'no-host-sample':
                 # Unknown, not disproved: refuse and keep the grant (its BACKFILL_GRANT_S window bounds the hold).
                 return _with_budget(refuse('backfill-unverifiable: no host sample, so %s cannot show it still protects the oldest waiting '
@@ -3518,6 +3528,69 @@ def _floor_only_blockers(budget, in_use, lanes, floor_ok, free, entry):
     return []
 
 
+def _loss_baseline_path(state_path):
+    return queue_dir(state_path) / BACKFILL_BASELINE_FILE
+
+
+def _read_loss_baseline(state_path):
+    """The persisted {head_id, baseline_free_bytes, first_seen} record, or None when missing, unreadable or not exactly that shape. The file
+    is three fixed keys (well under 300 bytes), so it cannot grow; a malformed one is treated as absent and rewritten under the lock."""
+    try:
+        record = _read_small_json(_loss_baseline_path(state_path), limit=512)
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(record, dict) or set(record) != {'head_id', 'baseline_free_bytes', 'first_seen'}
+            or not isinstance(record['head_id'], str) or not QUEUE_ID_RE.fullmatch(record['head_id'])
+            or type(record['baseline_free_bytes']) is not int or not 0 <= record['baseline_free_bytes'] < 1 << 50
+            or not isinstance(record['first_seen'], str) or len(record['first_seen']) > 40):
+        return None
+    return record
+
+
+def _drop_loss_baseline(state_path, head_id=None):
+    """Remove the baseline (only when it belongs to `head_id`, if one is given). Under the state lock; a missing file is fine."""
+    if head_id is not None:
+        record = _read_loss_baseline(state_path)
+        if record is not None and record['head_id'] != head_id:
+            return
+    try:
+        _loss_baseline_path(state_path).unlink()
+    except OSError:
+        pass   # absent, or not removable: a stale record names another head and is ignored and rewritten on the next floor-blocked pass
+
+
+def _loss_baseline_sync(state_path, head, free, reserved, now):
+    """Keep the free-space baseline of the waiting head in step with what this pass sees, and return it (bytes) or None. Under the lock.
+
+    The head is floor-blocked when it could not start even on an empty queue (free - bytes < HEAVY_FLOOR). The first pass that sees that
+    records free - reserved (usable space once every declared reservation is counted, the same figure the floor check uses) with the
+    head's id. The same head keeps its baseline however long it waits (a transient lane or key refusal is not a reset); a different
+    head, or a head that now fits on an empty queue, discards it. None when the head is not floor-blocked or the record cannot be written
+    (fail closed: no floor-only backfill without a baseline)."""
+    blocked = free - head['bytes'] < HEAVY_FLOOR
+    record = _read_loss_baseline(state_path)
+    if record is not None and (record['head_id'] != head['id'] or not blocked):
+        _drop_loss_baseline(state_path)
+        record = None
+    if not blocked:
+        return None
+    if record is not None:
+        return record['baseline_free_bytes']
+    baseline = max(0, free - reserved)
+    try:
+        write_json_atomic(_loss_baseline_path(state_path), {'head_id': head['id'], 'baseline_free_bytes': baseline,
+                                                           'first_seen': iso_utc(now)})
+    except OSError:
+        return None
+    return baseline
+
+
+def _loss_after(baseline, free, reserved, cand_bytes):
+    """Usable space the waiting head has lost since its baseline, if a candidate of `cand_bytes` were admitted and kept all it declared.
+    Never negative: space reclaimed beyond the baseline gives no credit beyond zero loss (and the baseline never moves up)."""
+    return max(0, baseline - (free - reserved - cand_bytes))
+
+
 def _per_pass_memo(fn):
     """`fn` answering once per argument tuple for the length of one queue pass: bounds the `ps` forks a pass makes without changing what
     any check sees. An exception is not cached, so every caller still fails closed on its own."""
@@ -3596,7 +3669,7 @@ def _overtaken_head(entries, entry, now):
     return min(earlier, key=_queue_order) if earlier else None
 
 
-def _backfill_protection_lost(host, entry, entries, live, orphans, now, result, reserved, in_use, lanes):
+def _backfill_protection_lost(host, entry, entries, live, orphans, now, result, reserved, in_use, lanes, state_path=None):
     """None, or (kind, head id) when `entry` is a backfilled grant whose head protection no longer holds at claim time. The head must be
     admitted outright or refused solely by the exclusion key of claimed running jobs (_excl_only_blockers), and _protects_head must hold
     with this grant charged beside everything else. Without a host sample nothing can be shown: ('no-host-sample', head id)."""
@@ -3619,7 +3692,13 @@ def _backfill_protection_lost(host, entry, entries, live, orphans, now, result, 
         blockers = _excl_only_blockers(budget, held, lanes, floor_ok, free, reserved_all, head, live, entries)
         if blockers is None and _floor_only_blockers(budget, held, lanes, floor_ok, free, head) is not None:
             # SPE-188: the head waits for free space alone and would be refused without this grant too; the grant's own disk fit was
-            # judged at grant time and is rechecked by the claim path's plain floor, so it cannot delay the head.
+            # judged at grant time and is rechecked by the claim path's plain floor, so it cannot delay the head. The cumulative-loss cap
+            # (SPE-188) is judged again here against the same persisted baseline: space the head's wait has lost since then, including
+            # this grant's declared bytes, must still be within BACKFILL_LOSS_CAP. A grant made before the baseline existed is left alone.
+            baseline = _read_loss_baseline(state_path) if state_path is not None else None
+            if (baseline is not None and baseline['head_id'] == head['id']
+                    and _loss_after(baseline['baseline_free_bytes'], free, reserved_all, entry['bytes']) > BACKFILL_LOSS_CAP):
+                return ('loss-cap', head['id'])
             return None
         if blockers is None:
             return ('head-not-excl-only', head['id'])
@@ -3667,8 +3746,13 @@ def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans,
                 # The head waits for free space alone (_floor_only_blockers): the candidate must fit by itself with the grant-time margin.
                 math = {'free': free, 'reserved': reserved, 'cand_bytes': cand['bytes'], 'head_bytes': backfill['head']['bytes'],
                         'floor': HEAVY_FLOOR, 'hysteresis': BACKFILL_HYSTERESIS, 'disk_left': free - reserved - cand['bytes']}
+                baseline = backfill.get('loss_baseline')
+                math.update(loss_baseline=baseline, loss_cap=BACKFILL_LOSS_CAP,
+                            loss_after=None if baseline is None else _loss_after(baseline, free, reserved, cand['bytes']))
                 if math['disk_left'] < HEAVY_FLOOR + BACKFILL_HYSTERESIS:
                     reason = 'head-unprotected-hysteresis'
+                elif baseline is None or math['loss_after'] > BACKFILL_LOSS_CAP:
+                    reason = 'cumulative-loss-cap'   # SPE-188: no baseline to count from, or the head would end up too far from fitting
             else:
                 ok, math = _protects_head(host, backfill['head'], cand, backfill['blockers'], live, orphans, granted, now, result['tier'],
                                           free, reserved, in_use, lanes, result['latch'], BACKFILL_HYSTERESIS)
@@ -3676,7 +3760,9 @@ def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans,
                     reason = _head_unprotected_part(math, backfill['blockers'])
     if reason:
         backfill['keys'] |= keys
-        _log_backfill_decision(state_path, backfill, cand, now, 'refused', reason)
+        _log_backfill_decision(state_path, backfill, cand, now, 'refused', reason,
+                               {key: math.get(key) for key in ('loss_baseline', 'loss_after', 'loss_cap')}
+                               if reason == 'cumulative-loss-cap' else None)
         return None
     if backfill.get('floor_only'):
         verdict = {'blocked_id': backfill['pivot'], 'blockers': [], 'reason': 'head-floor-only', 'math': math,
@@ -3702,7 +3788,7 @@ def _backfill_candidate(state_path, cand, backfill, host, result, live, orphans,
 # is the grant; `memory-gate` and `in-flight-cap` are the refusals made by advance itself rather than by _backfill_candidate.
 BACKFILL_DECISION_REASONS = ('qualified', 'key-overlap-pivot', 'key-overlap-skipped', 'no-requeue-capability', 'waiter-not-alive', 'disk-floor',
                              'lane-refusal', 'head-unprotected-disk', 'head-unprotected-lanes', 'head-unprotected-lane3-margin', 'head-unprotected-lane4-margin', 'head-unprotected-budget',
-                             'head-unprotected-hysteresis', 'memory-gate', 'in-flight-cap', 'other')
+                             'head-unprotected-hysteresis', 'cumulative-loss-cap', 'memory-gate', 'in-flight-cap', 'other')
 
 
 def _head_unprotected_part(math, blockers):
@@ -3746,7 +3832,7 @@ def _backfill_decisions(path, head, now):
     return found
 
 
-def _log_backfill_decision(state_path, backfill, cand, now, outcome, reason):
+def _log_backfill_decision(state_path, backfill, cand, now, outcome, reason, extra=None):
     """One `backfill-decision` receipt: the head (blocked_id), its blockers, the candidate (id, label) and why it was granted or refused.
 
     Only while BACKFILL_ENABLED (the OFF path keeps its shadow receipts). Written only when (head, candidate, outcome, reason, blocker set)
@@ -3767,6 +3853,8 @@ def _log_backfill_decision(state_path, backfill, cand, now, outcome, reason):
         fields = {'blocked_id': backfill['pivot'], 'blocker_id': backfill['blockers'][0]['id'] if backfill['blockers'] else None,
                   'blocker_ids': blockers, 'outcome': outcome,
                   'reason': reason, 'in_flight': backfill['in_flight'] + backfill['taken'], 'cap': BACKFILL_MAX}
+        if extra:
+            fields.update(extra)   # SPE-188: loss_baseline / loss_after / loss_cap, byte counts only
         if _queue_receipt(state_path, 'backfill-decision', cand, now, **fields):
             seen['loaded'][cand['id']] = dict(fields, id=cand['id'], ts=iso_utc(now))
     except Exception as failure:   # logging only: a failure here must never abort or change an advance (queue_advance catches only StateError, OSError)
