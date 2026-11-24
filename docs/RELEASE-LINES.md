@@ -287,8 +287,16 @@ token) and a timeout (default 1800 s, at most 7200 s, the build's own process gr
 `releases/<version>/` and their sha256 recorded in `releases/<version>.json` and the journal. A rerun with intact copies is `REUSED`; damaged copies are rebuilt.
 
 `notes` renders `releases/<version>.notes.md` deterministically from git, GitHub and the build manifest: source branch, release line, version, promotion PR,
-candidate tag and SHA, final tag and SHA, publication base, forward-port accounting for the base-only changes before the promotion, and the artifact checksums as
-`sha256sum` lines. It prints the path, its sha256 and `publish_digest`; without `--execute` it only reports them. `BUILD_MISSING` or `ARTIFACT_TAMPERED` when the
+candidate tag and SHA, final tag and SHA, publication base, forward-port accounting for the base-only changes before the promotion, the prior release and the
+comparison range, a **Verifications** section, a **Deferrals** section, and the artifact checksums as `sha256sum` lines. The prior release (labelled `(local tags)`) is the greatest same-major
+final tag below this version that is an ancestor of the base before the promotion, read from the clone's own tags (no network, so a tag that exists only on origin and was never fetched is not seen); prerelease tags,
+other majors and non-ancestors are never chosen. The comparison is `<prior tag>...<final tag>` with the commit count, or `none` for both when there is no prior release. Verifications list the final-tree verification
+(`CARRIED_OVER` when the final tree equals the candidate tree, else `PASS` with the owner-pinned local-first record digest, else `not recorded`), then the hosted CI
+state, the local-equivalent evidence digest and the protection check after promotion. Those three come from entries `release promote --execute` wrote to the
+journal, which the agent can write: each is labelled `(journal-recorded, unverified)`, reduced to a closed set (a state name or a sha256), only rows bound to this final SHA count (the
+`promoted` row and the `protection-after` row both record `final_sha`; a `protection-after` row written when no merge was found has no `final_sha` and `merged: false`, and counts only as adverse evidence: `DRIFT` or `NOT_RUN`, never as a pass), the worst protection result wins (`DRIFT`, then `NOT_RUN`, then `UNCHANGED`), and an absent value is `not recorded`. The local-equivalent digest is not compared with the owner-pinned record. Deferrals list each forward-port not yet merged (source, line,
+code; at most 20, then a count), a hosted CI or protection check that is NOT_RUN or unrecorded, and a protection `DRIFT`, or `none`. Output is bytes-deterministic for identical inputs,
+so the notes digest and `publish_digest` do not change between runs; a changed journal entry or pin changes them, and the owner re-pins `publish_digest`. It prints the path, its sha256 and `publish_digest`; without `--execute` it only reports them. `BUILD_MISSING` or `ARTIFACT_TAMPERED` when the
 build is absent or its copies no longer match the manifest.
 
 `publish --backend gh` needs a GO record with the `publish` scope whose `candidate_sha` equals the promotion's candidate (`GO_MISSING`, `GO_SCOPE`, `GO_EXPIRED`,

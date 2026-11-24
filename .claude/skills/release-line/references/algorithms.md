@@ -23,6 +23,12 @@ Every maintenance fix is accounted against every strictly newer line. Each targe
 - `conflict`: `BLOCKED_CONFLICT`, `CONFLICT_EXISTING`, `STALE_HEAD_CONFLICT`, `NO_BRANCH`.
 Evidence order: already an ancestor, trailer on target, equal patch-id, open PR from `fwdport/<target_line>/<src12>`, then a `merge-tree` replay. The accounting is recomputed on every run; `complete` is true only when every target is terminal. A conflict on one target never stalls the others. Loop prevention: a source carrying `Release-Line-Source`, and integration merges, are not sources.
 
+## Release steps and notes
+- Order: `candidate-tag` (scope `candidate_tag`), `promote` (`promote`), `verify`, `final-tag` (`final_tag`), `build`, `notes`, `publish` (`publish`). `release run --until STEP` runs them in order; each step does its own gating.
+- `promote --execute` refuses without an owner-pinned protection snapshot and compares protection before and after the merge. `protection snapshot|verify --branch B` records or compares it read-only; drift is FAIL with an owner-run rollback.
+- Hosted CI is `CI_PASS`, `CI_FAILED` (never bypassed), `CI_PENDING` (DEFERRED) or `NOT_RUN`; `NOT_RUN` needs the owner-pinned local-equivalent record. Report the two separately.
+- `notes` renders the release notes from git, GitHub, the build manifest and the journal: source branch, line, version, promotion PR, candidate and final tag and SHA, forward-port accounting, prior release and comparison range, verifications (final tree, hosted CI, local-equivalent evidence, protection after promotion) and deferrals (forward-ports not merged, NOT_RUN checks), then the artifact checksums. The digest of the notes is part of `publish_digest`, which the owner pins.
+
 ## GO records and owner pin files
 - Merge eligibility comes only from `branches` in the owner policy; the tool never edits it.
 - Publication authority is a per-version GO record under `~/.config/coding-agent-environment/local/release-go/<owner>__<repo>__<version>.json` with `repo`, `version`, `candidate_tag`, `candidate_sha`, `publication_base`, `scopes` (`candidate_tag|promote|final_tag|publish`), `authority`, `created_utc`, optional `expires_utc`. A repo or SHA mismatch is refused. The owner writes it; an agent never does. (Consumed by the release commands of later slices; no command on this base reads it.)
