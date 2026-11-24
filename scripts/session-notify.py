@@ -67,11 +67,14 @@ CAUSE_TEXT = {"disk-floor": "disk below floor", "memory-pressure": "memory press
               "failed-to-terminate": "wrapper failed to terminate",
               # Claude Code sign-in watch (SPE-176, ADR 0020): own session record, own titles; `detail` is a closed bounded field (AUTH_DETAIL) for these causes only.
               "auth-required": "Claude Code sign-in required", "remote-control-disconnect": "Remote Control disconnected",
-              "signin-recovered": "Claude Code sign-in recovered"}
+              "signin-recovered": "Claude Code sign-in recovered",
+              # Closing notice of an admission incident the monitor already raised (SPE-188): spool kind `recovered`, same incident_ref as its opened/escalated notices.
+              "incident-resolved": "incident resolved"}
 RECOVERY_TEXT = {"none": "none tried", "advance-tried": "queue advance tried", "recovery-exhausted": "recovery exhausted", "observe-only": "observe only",
                  "lapsed": "grant lapsed", "wait-expiry-near": "wait expiry near", "wrapper-terminated": "wrapper terminated",
                  "grant-cancelled": "grant cancelled", "termination-failed": "termination failed",
-                 "no-auto-recovery": "no automatic recovery", "remote-control-only": "remote control only", "sessions-resumed": "sessions resumed"}
+                 "no-auto-recovery": "no automatic recovery", "remote-control-only": "remote control only", "sessions-resumed": "sessions resumed",
+                 "resolved": "resolved by the scheduler"}
 OWNER_ACTION_TEXT = {"reclaim-disk": "reclaim disk", "reduce-load": "reduce load", "approve-memory-policy": "approve memory policy",
                      "wait-or-approve-memory-policy": "wait or approve memory policy", "confirm-claim-ended": "confirm claim ended",
                      "restart-waiting-session": "restart waiting session", "restart-outdated-caller": "restart outdated caller",
@@ -81,11 +84,12 @@ OWNER_ACTION_TEXT = {"reclaim-disk": "reclaim disk", "reduce-load": "reduce load
                      "check-over-deadline-workload": "check over-deadline workload", "check-recovery-result": "check recovery result",
                      "inspect-stuck-wrapper": "inspect stuck wrapper",
                      "sign-in-claude": "sign in to Claude Code", "reconnect-remote-control": "reconnect Remote Control",
-                     "verify-resumed-work": "verify resumed work"}
+                     "verify-resumed-work": "verify resumed work", "no-action-needed": "no action needed"}
 AUTH_SESSION = "claude-auth-watch"   # synthetic session of the sign-in watch notices: its dedup, pending queue and clear are independent of the admission monitor's
 AUTH_CAUSES = {"auth-required", "remote-control-disconnect", "signin-recovered"}
 AUTH_RECOVERY = {"no-auto-recovery", "remote-control-only", "sessions-resumed"}
 AUTH_ACTIONS = {"sign-in-claude", "reconnect-remote-control", "verify-resumed-work"}
+RESOLVED_CAUSE, RESOLVED_RECOVERY, RESOLVED_ACTION = "incident-resolved", "resolved", "no-action-needed"   # the closing notice's fixed phrases: only ever used together
 RESOURCE_SESSION = "admission-monitor"
 TEST_SESSION = "notify-test"   # own synthetic record for `test-notice`: shares no state with any other synthetic record
 RESERVED_SESSIONS = (RESOURCE_SESSION, AUTH_SESSION, TEST_SESSION)   # hook events cannot touch them; sweep never stales or removes them
@@ -115,7 +119,7 @@ SPOOL_UNAVAILABLE = "spool-unavailable"
 SPOOL_ESCALATING_RECOVERY = {"lapsed", "wait-expiry-near", "recovery-exhausted"}
 SPOOL_KIND_OF_CAUSE = {"unclaimed-handoff": "unclaimed-handoff", "queue-wait-excessive": "queue-wait-excessive",
                        "workload-over-deadline": "workload-over-deadline", "auth-required": "auth-interrupted",
-                       "remote-control-disconnect": "auth-interrupted", "signin-recovered": "recovered"}
+                       "remote-control-disconnect": "auth-interrupted", "signin-recovered": "recovered", "incident-resolved": "recovered"}
 DEFAULT_SPOOL_SUBDIR = ".local/share/engineering-supervisor/state/incident-spool"
 DELIVERY_STATUSES = {"pending", "sending", "failed", "sent", "dropped", "skipped"}
 TERMINAL = {"sent", "dropped", "skipped"}
@@ -563,6 +567,8 @@ def notice_kind(fields):
 def backend_routed(name, cfg, fields):
     """False when `kinds` of this backend leaves the notice to another destination (telegram and zeroclaw-spool only)."""
     b = (cfg.get("backends") or {}).get(name) or {}
+    if name != SPOOL_BACKEND and conforms(FIELDS_SCHEMA, fields) and fields.get("cause") == RESOLVED_CAUSE:
+        return False   # the closing notice only tells the supervisor an incident is over: a banner or message for it would be a new owner notification
     if name == SPOOL_BACKEND:
         return spool_kind(fields) in effective_kinds(name, b)
     if name == "telegram":
@@ -978,6 +984,8 @@ def render(fields):
             if fields.get("detail"):
                 body += f" | {fields['detail']}"
             return {"title": "Claude Code: " + AUTH_TITLE[fields["cause"]], "body": body[:300]}
+        if fields["cause"] == RESOLVED_CAUSE:
+            return {"title": "Claude Code: admission incident resolved", "body": body}
         return {"title": "Claude Code: admission stalled", "body": body}
     bits = [fields.get("repo", "unlisted")]
     if fields.get("ticket"):
@@ -1297,6 +1305,9 @@ class Engine:
         if not clear and (((req["cause"] in AUTH_CAUSES) != (req["recovery"] in AUTH_RECOVERY)) or ((req["cause"] in AUTH_CAUSES) != (req["owner_action"] in AUTH_ACTIONS))
                           or (req.get("detail") and req["cause"] not in AUTH_CAUSES)):
             return "invalid"   # sign-in phrases only go with sign-in causes, and `detail` exists for those causes alone
+        if not clear and ((req["cause"] == RESOLVED_CAUSE) != (req["recovery"] == RESOLVED_RECOVERY) or (req["cause"] == RESOLVED_CAUSE) != (req["owner_action"] == RESOLVED_ACTION)
+                          or (req["cause"] == RESOLVED_CAUSE and not req.get("incident_ref"))):
+            return "invalid"   # the closing notice's phrases go together and always name the incident it closes
         self.last_delivery, self.last_key = None, None
         sid = AUTH_SESSION if (req["cause"] in AUTH_CAUSES if not clear else scope == "auth") else RESOURCE_SESSION
         try:
@@ -1326,7 +1337,10 @@ class Engine:
                               "owner_decision" if "approve" in req["owner_action"] else "resource_available")
                     cp = {"task": sid, "repo": RESOURCE_REPO, "ticket": RESOURCE_TICKET, "blocker_owner": "resource", "resume_trigger": resume}
                     state = "IDLE" if req["cause"] == "signin-recovered" else "BLOCKED_RESOURCE"
-                    self.set_state(rec, state, "resource-stall", now, cp, notify=False)
+                    if req["cause"] == RESOLVED_CAUSE:
+                        state = rec["state"]   # closing one incident says nothing about any other blockage on this record: its state is left as it is
+                    else:
+                        self.set_state(rec, state, "resource-stall", now, cp, notify=False)
                     extra = {"cause": req["cause"], "recovery": req["recovery"], "owner_action": req["owner_action"], "detail": req.get("detail"),
                              "incident_ref": req.get("incident_ref") or "inc:" + (req.get("signature") or hashlib.sha256(req["cause"].encode()).hexdigest()[:16])}
                     queued = self.enqueue(rec, state, "resource-stall", now, extra_key=req["cause"] + ":" + (req.get("signature") or ""), extra=extra,
