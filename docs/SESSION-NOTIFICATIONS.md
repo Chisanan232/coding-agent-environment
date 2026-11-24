@@ -253,3 +253,34 @@ A third, objective level sits between them: `LOCAL_BANNER_PRESENTED_BY_OS`. Afte
 Expected lines: `Presenting <NotificationRecord app:"com.apple.ScriptEditor2" ...> as banner`, `Setting visible banner`, then `Clearing banner after expiration` about 5 s later. Use `/usr/bin/log`, since `log` is a zsh builtin. Recorded once on 2026-10-22 (no Focus assertion active). `LOCAL_BANNER_PRESENTED_BY_OS` is claimed; `LOCAL_BANNER_CONFIRMED` stays the owner's own sighting.
 
 A delivered record alone never upgrades to a confirmed banner. Until the owner reports seeing it, only `LOCAL_NOTIFICATION_DELIVERED` is claimed.
+
+## Quiet recurring checks: `scheduler-observe.py` (SPE-188)
+
+A scheduled check that restates an unchanged picture every run is noise. `scripts/scheduler-observe.py` is the read-only observer a recurring
+check should call instead of re-reading the scheduler and supervisor itself. It reduces what the check reads to a fingerprint of **material**
+state, compares it with the previous fingerprint and prints exactly one line, exit code 0:
+
+| Line | Meaning | What the caller does |
+|---|---|---|
+| `NO_CHANGE` | nothing material changed | reply with the single word `ok` |
+| `QUIET` | routine churn (claims, releases, cancels), the first baseline, or a first unconfirmed read error | reply with `ok` |
+| `CHANGE: <delta>` | a new incident, a resolved incident, the supervisor's telegram status leaving or returning to `running`, a monitor mode change, a live backfill claimed, the first cumulative-loss-cap refusal, a new open pull request, or a source unreadable twice running (and readable again) | tell the owner once, from the line |
+
+Material state: live claimed ids, backfill and cap-refusal counts, the monitor's mode and handoff incident ids, the supervisor's telegram status
+and open incident refs, provider-maintenance presence and the open scheduler pull requests. Volatile values (poll batch counters, timestamps,
+free-space jitter) are never part of it, so they cannot cause a message. A source that cannot be read keeps its last value; one failure is `QUIET`,
+the same failure twice running is reported once, and a recovery is reported once. A changed fingerprint is stored (file `0600`, atomic write, default
+`~/.cache/coding-agent-environment/observer/last.json`, overridable with `SCHEDULER_OBSERVE_STATE`), so the same observation next run is `NO_CHANGE`.
+
+The tool opens the queue receipts, the monitor status and the supervisor state read-only and writes only its own fingerprint. Output never contains a
+path, command line, token or message id (a closed character set). It does not change the monitor, which stays observe-only.
+
+Suggested prompt for the recurring check (install it only when the owner asks; this change does not install anything):
+
+> Silent scheduler/supervisor check. Run `python3 <checkout>/scripts/scheduler-observe.py` (read-only, one line). If it prints `NO_CHANGE` or `QUIET`, reply with
+> the single word `ok`. If it prints `CHANGE: ...`, tell the user once what changed, in one or two sentences, then continue. Never mutate the queue; never
+> touch the supervisor fence.
+
+**Out of scope:** the harness goal evaluator (`Stop hook feedback: [goal text]` and the `Goal check-in` notices) fires every time a turn ends while a goal is
+set. It is not a hook in `settings.json` or in this repository, so this tool cannot suppress it; clearing or editing the goal is the owner's action.
+Tests: `tests/test-scheduler-observe.py`.
