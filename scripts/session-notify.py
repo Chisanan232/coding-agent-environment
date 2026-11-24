@@ -567,6 +567,8 @@ def notice_kind(fields):
 def backend_routed(name, cfg, fields):
     """False when `kinds` of this backend leaves the notice to another destination (telegram and zeroclaw-spool only)."""
     b = (cfg.get("backends") or {}).get(name) or {}
+    if fields.get("cause") == RESOLVED_CAUSE and name != SPOOL_BACKEND:
+        return False   # the closing notice only tells the supervisor an incident is over: a banner or message for it would be a new owner notification
     if name == SPOOL_BACKEND:
         return spool_kind(fields) in effective_kinds(name, b)
     if name == "telegram":
