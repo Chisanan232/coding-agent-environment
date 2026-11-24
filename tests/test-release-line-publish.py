@@ -305,6 +305,21 @@ class Notes(Pub):
         self.assertIn("- Branch protection after promotion: not recorded", text)
         self.assertIn("- Protection check after promotion: NOT_VERIFIED (no record)", text)
 
+    def test_an_unbound_drift_row_stays_visible_and_an_unbound_ok_row_is_not_a_pass(self):
+        self.built()
+
+        def edit(rows):
+            row = next(r for r in rows if r.get("state") == "protection-after")
+            return [r for r in rows if r is not row] + [dict(row, final_sha=None, merged=False, result="DRIFT"), dict(row, final_sha=None, merged=False, result="UNCHANGED")]
+        self.rewrite_journal(edit)
+        self.notes()
+        text = (self.top / "0.3.0.notes.md").read_text()
+        self.assertIn("- Branch protection after promotion: DRIFT (journal-recorded, unverified)", text)
+        self.assertIn("- Protection check after promotion: DRIFT\n", text)
+        self.rewrite_journal(lambda rows: [dict(r, result="UNCHANGED") if r.get("state") == "protection-after" and r.get("result") == "DRIFT" else r for r in rows])
+        self.notes()
+        self.assertIn("- Branch protection after promotion: not recorded", (self.top / "0.3.0.notes.md").read_text())
+
     def test_a_valid_local_equivalent_digest_is_rendered_with_the_unverified_label(self):
         self.built()
         self.rewrite_journal(lambda rows: [dict(r, local_equivalent_sha256="ab" * 32) if r.get("state") == "promoted" else r for r in rows])
