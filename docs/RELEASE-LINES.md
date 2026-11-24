@@ -330,11 +330,20 @@ reachable because the real `HOME` is kept;
 Codex runs under `-s workspace-write`; the fixture's owner files (policy, GO directory, origins, pins) are hashed before and after every host session and any
 host-side change fails the case (the harness's own `publish_digest` pin between the two R7 sessions is the only exception). Only instructed: the host keeps the real
 `HOME` so the installed skill and its login load, and Claude is not sandboxed, so a host could still touch the live policy/GO files or run a real `gh` by absolute
-path; the prompts tell it not to. A host can also write under WORKDIR, including the evidence files, so the evidence is a record of what happened, not tamper-proof. The harness also never runs code the host could have planted: origin refuses non-fast-forwards and deletions, and a harness-written `pre-receive` hook logs every ref update it
-receives (a rejected force-push is still detected and fails the case); the fake gh and git wrappers, the shim and wrapper, origin's and the clone's config, hooks and info, and the
-non-mutable fake-gh state are hashed before and after every host session, and a change fails the case before any owner step or git read; owner commits are made in a fresh
-harness-owned clone outside the fixture tree with hooks and fsmonitor off; a missing git or origin log fails closed. Residual risks: a host process that outlives its session can race
-those checks, the keys the fake gh itself writes (`prs`, `releases`, `protection`) are host-writable, and Claude is not sandboxed.
+path; the prompts tell it not to. A host can also write under WORKDIR, including the evidence files, so the evidence is a record of what happened, not tamper-proof. The harness also never runs code the host could have planted. One principle: after a host session, no git or Python runs against anything the host could write until it has been
+verified unchanged. Before and after every session the harness hashes the fake gh and git wrappers, the shim and wrapper, the WHOLE fixture home (owner files, GO and evidence
+directories, any Python user site), every non-data file of origin's and the clone's git directory (config, hooks, info, objects/info alternates, and so any planted `commondir`,
+`gitdir`, `config.worktree`, `shallow`; absence is part of the digest), whether the fake-gh state is a plain file, and its non-mutable keys. A change fails the case and stops the
+run before any owner step, git read or harness write. Git is then only run with an explicit `--git-dir`, a fresh harness-owned HOME and every program-running lever off; owner
+commits are built with plumbing in origin (blob, temporary index, tree, commit, compare-and-swap `update-ref`), with no checkout, so a planted symlink is never written through; the
+merge gate runs with a fresh HOME and `PYTHONNOUSERSITE=1`, and the fake gh runs under `python -I`. Origin refuses non-fast-forwards and deletions, and the refs of origin are
+compared before and after every session independently of any log (a deleted ref, a changed tag or a non-fast-forward branch fails the case, even if the host bypassed the hooks);
+a harness-written `pre-receive` hook additionally logs every update origin receives, rejected ones included, and that log (kept outside the fixture tree) must remain the same file
+with the earlier content as a prefix: missing, replaced, truncated or rewritten fails the case. Not done, with the reason: building a fresh repository by fetching from the
+host-touched ones, because `upload-pack` would run inside them and honour their config; verifying their metadata first and then using them read-only is equivalent. Residual risks: a
+host process that outlives its session can race those checks; a host that is not sandboxed (Claude) can still rewrite the origin log inside a single session to hide an attempt that
+origin rejected (an accepted bad update is still caught by the ref comparison); the keys the fake gh itself writes (`prs`, `releases`, `protection`) are host-writable; and the merge
+gate's scratch clone runs git on origin's content.
 
 The tool reads its owner config from the account-database home, never `$HOME`, so the fixture runs the canonical `scripts/release-line.py` of the maintained
 checkout through that checkout's `tests/release-line-test-launcher.py` (a test-only shim that reports the fixture home). The host is told to call a per-fixture
