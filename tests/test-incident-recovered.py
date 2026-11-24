@@ -78,6 +78,41 @@ class ClosingNotice(zs.Spool):
         self.assertEqual(result, 'invalid')
         self.assertEqual(self.files(), [])
 
+    def all_backends(self):
+        cfg = self.cfg()
+        for name in ('macos', 'ntfy', 'pushover', 'telegram'):
+            cfg['backends'][name]['enabled'] = True                            # telegram keeps its default kinds, which include `recovered`
+            if name in sn.REMOTE_BACKENDS:
+                cfg['backends'][name]['approved_destination'] = 'owner'
+        sent = []
+        transports = {n: (lambda payload, b, n=n: sent.append(n) or 'sent') for n in ('macos', 'ntfy', 'pushover', 'telegram')}
+        transports['zeroclaw-spool'] = sn.REAL_TRANSPORTS['zeroclaw-spool']
+        return cfg, transports, sent
+
+    def test_the_closing_notice_goes_to_the_spool_only_never_to_a_direct_owner_backend(self):
+        cfg, transports, sent = self.all_backends()
+        result, engine = self.close(engine=self.engine(cfg, transports))
+        engine.sweep()
+        self.assertEqual(result, 'queued')
+        self.assertEqual(len(self.files()), 1)
+        self.assertEqual(sent, [])
+        codes = {n: b['code'] for e in self.record()['pending'] for n, b in e['backends'].items() if n != 'zeroclaw-spool'}
+        self.assertEqual(set(codes.values()) - {'kind-not-routed', 'disabled'}, set())
+
+    def test_the_sign_in_recovered_notice_still_reaches_the_direct_backends(self):
+        cfg, transports, sent = self.all_backends()
+        cfg['backends']['zeroclaw-spool']['enabled'] = False                   # the sign-in path predates the spool; its routing is not touched
+        engine = self.engine(cfg, transports)
+        engine.emit_resource({'cause': 'signin-recovered', 'recovery': 'sessions-resumed', 'owner_action': 'verify-resumed-work', 'signature': '5555555555555555'})
+        engine.sweep()
+        self.assertTrue(sent)
+
+    def test_a_closing_notice_adds_no_new_routing_conflict(self):
+        cfg, _, _ = self.all_backends()
+        before = sn.routing_conflict(cfg)
+        self.close(engine=self.engine(cfg))
+        self.assertEqual(sn.routing_conflict(cfg), before)                     # the check reads configured kinds only, never a cause
+
     def test_the_banner_of_a_closing_notice_says_resolved_not_stalled(self):
         fields = {'state': 'IDLE', 'cause': 'incident-resolved', 'recovery': 'resolved', 'owner_action': 'no-action-needed', 'incident_ref': REF}
         self.assertEqual(sn.render(fields)['title'], 'Claude Code: admission incident resolved')
