@@ -430,9 +430,20 @@ reverting that commit restores 1 (rollback procedure in the ADR) and the rules b
     `backfill-decision` receipt: `id`/`label` (candidate), `blocked_id` (head), `blocker_id`/`blocker_ids`, `outcome` (`granted` or
     `refused`), `reason`, `in_flight`, `cap`. `reason` is one of `qualified`, `key-overlap-pivot`, `key-overlap-skipped`,
     `no-requeue-capability`, `waiter-not-alive`, `disk-floor`, `lane-refusal`, `head-unprotected-disk`, `head-unprotected-lanes`,
-    `head-unprotected-lane3-margin`, `head-unprotected-lane4-margin`, `head-unprotected-budget`, `head-unprotected-hysteresis`, `memory-gate`, `in-flight-cap`, `other`. `head-unprotected-hysteresis` is a grant refused only because head protection had less than `BACKFILL_HYSTERESIS` (4 GiB, ADR 0017 revision 13) of disk above the floor: a new backfill grant needs floor + 4 GiB, while the claim-time recheck keeps the plain floor so free-space jitter between grant and claim does not revoke it (a larger drop still does). It only tightens; backfill still needs about three jobs' worth of headroom. `head-unprotected-lane3-margin` is a head whose own lane 3 would stay under the 160 GiB margin while the disk floor, the lane count and the tier all pass (see "Third lane disk margin"). An unchanged (head, candidate, outcome, reason, blocker set) is
+    `head-unprotected-lane3-margin`, `head-unprotected-lane4-margin`, `head-unprotected-budget`, `head-unprotected-hysteresis`, `cumulative-loss-cap`, `memory-gate`, `in-flight-cap`, `other`. `head-unprotected-hysteresis` is a grant refused only because head protection had less than `BACKFILL_HYSTERESIS` (4 GiB, ADR 0017 revision 13) of disk above the floor: a new backfill grant needs floor + 4 GiB, while the claim-time recheck keeps the plain floor so free-space jitter between grant and claim does not revoke it (a larger drop still does). It only tightens; backfill still needs about three jobs' worth of headroom. `head-unprotected-lane3-margin` is a head whose own lane 3 would stay under the 160 GiB margin while the disk floor, the lane count and the tier all pass (see "Third lane disk margin"). An unchanged (head, candidate, outcome, reason, blocker set) is
     not written again for 10 minutes. Logging only: it changes no decision, and a failure of the logger itself is swallowed. `other` is
     never emitted by the shipped code paths; it is how an unknown reason would be recorded, so the vocabulary stays closed.
+- Cumulative loss cap behind a floor-blocked head (SPE-188, ADR 0017 revision 15). While the oldest waiting entry cannot start even on an
+  empty queue (free - its bytes < 100 GiB), floor-only backfill may take at most `BACKFILL_LOSS_CAP` (20 GiB) of usable space from it. The
+  first pass that sees the head floor-blocked records `queue/backfill-baseline.json` (`head_id`, `baseline_free_bytes` = free - reserved,
+  `first_seen`; three fixed keys, under 300 bytes). A candidate is refused as `cumulative-loss-cap` when
+  `max(0, baseline - (free - reserved - candidate bytes)) > 20 GiB`: the candidate's declared bytes count as kept, every reservation
+  (including backfill grants already made) counts, and free space is read now, so jobs that clean up cost nothing and reclaimed space gives
+  the headroom back. The baseline never moves while the head waits; it is dropped when the head changes, starts or fits on an empty queue,
+  or no head waits. The refusal receipt carries `loss_baseline`, `loss_after` and `loss_cap` (byte counts). An unwritable baseline refuses
+  floor-only backfill (fail closed). The 100 GiB floor, the 4 GiB hysteresis, `BACKFILL_MAX` and the exclusion-key path are unchanged. The
+  claim-time recheck applies the same cap against the persisted baseline and withdraws a grant that would exceed it (kind `loss-cap`); a
+  grant made before a baseline existed is left alone. Rollback: revert the pull request.
 - `queue claim` of a backfilled grant (a GRANTED entry with an earlier unlapsed waiting entry) re-checks head protection against the
   oldest waiting entry.
   - If protection no longer holds, the grant is withdrawn: the entry becomes `EXPIRED`, a `backfill-revoked` receipt records the kind
