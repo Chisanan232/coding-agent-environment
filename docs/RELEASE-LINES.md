@@ -347,7 +347,7 @@ host-touched ones, because `upload-pack` would run inside them and honour their 
 host (Claude) can rewrite the origin log within one session to hide a REJECTED attempt (an accepted bad update is still caught by the ref comparison); (3) the fake-gh keys `prs`, `releases` and `protection` are host-writable, so those parts
 of the fixture state are not independent evidence; (4) the merge gate's scratch clone and the fake gh run git on origin's content after its metadata was verified, so a flaw in git itself is out of scope;
 (5) the host answer, evidence files and anything under WORKDIR are host-writable records of what happened, not tamper-proof; (6) the host keeps the real HOME and, for Claude, can reach any file the user can; the
-prompts forbid it and the checks above detect fixture-side effects only. Anything not listed here has not been considered.
+prompts forbid it and the checks above detect fixture-side effects only. Anything not listed here has not been considered. Link safety: the harness opens every host-writable record `O_NOFOLLOW` and non-blocking and accepts only a plain regular file (a link or FIFO is a session problem, so the case fails), and it publishes `evidence/<label>` by staging and creating files exclusively under directory descriptors, replacing a pre-planted `evidence`, label or `calls` link rather than writing through it.
 
 The tool reads its owner config from the account-database home, never `$HOME`, so the fixture runs the canonical `scripts/release-line.py` of the maintained
 checkout through that checkout's `tests/release-line-test-launcher.py` (a test-only shim that reports the fixture home). The host is told to call a per-fixture
