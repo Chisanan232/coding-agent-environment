@@ -380,39 +380,60 @@ def managed_session(cwd, allowed_profiles):
 
 
 EXPORT_MAX_FILES, EXPORT_MAX_FILE_BYTES, EXPORT_MAX_TOTAL_BYTES = 20000, 1 << 20, 64 << 20
-# Tracked files that look like credentials or tool configuration are not exported even though git tracks them.
-EXPORT_SKIP = re.compile(r"(?i)(^|/)(\.env[^/]*|\.npmrc|\.netrc|\.pypirc|\.git-credentials|id_(rsa|dsa|ecdsa|ed25519)[^/]*)$"
-                         r"|\.(pem|key|p12|pfx|jks|keystore|kdbx)$|(credential|secret|token|passwd|password)[^/]*$|^\.claude/|^\.codex/")
+# Matched against EVERY path component, case-insensitively: credential-looking or tool-configuration names are never exported.
+EXPORT_SKIP = re.compile(r"(?i)^\.env|\.env($|\.)|^\.(claude|codex|aws|ssh|gnupg|config|npmrc|netrc|pypirc|git-credentials|git)$"
+                         r"|^id_(rsa|dsa|ecdsa|ed25519)|\.(pem|key|p12|pfx|jks|keystore|kdbx)$"
+                         r"|credential|secret|token|passwd|password|private[_-]?key")
+
+
+def _skipped_name(name):
+    return any(EXPORT_SKIP.search(part) for part in name.split("/"))
 
 
 def export_tracked(cwd, dest):
-    """Copy the tracked, non-credential-looking regular files of the repository holding `cwd` into `dest`. False when it cannot.
+    """Export the COMMITTED blobs (HEAD) of the repository holding `cwd` into `dest`; never reads the working tree or the index.
 
-    The consult reads only this copy: untracked files, ignored files, .env files and local tool settings never exist in it."""
+    Skipped: symlinks (mode 120000), submodules (160000), credential-looking names (any path component), files over 1 MB, and files whose
+    content matches the secret rules. Returns (ok, content_hits): the paths skipped for content, which the caller checks against the prompt.
+    Uncommitted changes, staged files and untracked files are not exported. A repository with no commit exports nothing."""
     top = _git(cwd, "rev-parse", "--show-toplevel")
     if not top:
-        return False
+        return False, []
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    if _git(top, "rev-parse", "--verify", "-q", "HEAD^{commit}") is None:
+        return True, []
     try:
-        names = subprocess.run(["git", "-C", top, "ls-files", "-z"], capture_output=True, timeout=60, env=env).stdout.decode().split("\0")
+        listing = subprocess.run(["git", "-C", top, "ls-tree", "-r", "-z", "--full-tree", "HEAD"], capture_output=True, timeout=60, env=env)
+        if listing.returncode != 0:
+            return False, []
+        rows = [r for r in listing.stdout.decode().split("\0") if r]
     except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
-        return False
+        return False, []
     total = count = 0
-    for name in filter(None, names):
-        src = os.path.join(top, name)
-        if EXPORT_SKIP.search(name) or os.path.islink(src) or not os.path.isfile(src):
+    hits = []
+    secret_rule = PAYLOAD_RULES[0][1]
+    for row in rows:
+        meta, _, name = row.partition("\t")
+        mode, kind, sha = (meta.split() + ["", "", ""])[:3]
+        if mode not in ("100644", "100755") or kind != "blob" or _skipped_name(name) or not re.fullmatch(r"[0-9a-f]{40,64}", sha):
             continue
-        size = os.path.getsize(src)
-        if size > EXPORT_MAX_FILE_BYTES:
+        try:
+            blob = subprocess.run(["git", "-C", top, "cat-file", "blob", sha], capture_output=True, timeout=60, env=env).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False, []
+        if len(blob) > EXPORT_MAX_FILE_BYTES:
             continue
-        count, total = count + 1, total + size
+        if secret_rule.search(blob.decode("utf-8", "ignore")):
+            hits.append(name)
+            continue
+        count, total = count + 1, total + len(blob)
         if count > EXPORT_MAX_FILES or total > EXPORT_MAX_TOTAL_BYTES:
-            return False
+            return False, []
         target = os.path.join(dest, name)
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(src, "rb") as fin, open(target, "wb") as fout:
-            fout.write(fin.read())
-    return True
+        with open(target, "wb") as fout:
+            fout.write(blob)
+    return True, hits
 
 
 def isolation_verdict():
@@ -423,7 +444,7 @@ def isolation_verdict():
         text = ""
     flags = ("--setting-sources", "--permission-mode", "--disallowedTools")
     listed = all(f in text or f.lower().replace("tools", "-tools") in text.lower() for f in flags)
-    return {"cwd": "clean export of tracked, non-credential files only", "setting_sources": "project (the export has no .claude)",
+    return {"cwd": "clean export of committed (HEAD) credential-free blobs only; no working-tree reads", "setting_sources": "project (the export has no .claude)",
             "permission_mode": "dontAsk", "disallowed_tools": DISALLOWED_READS,
             "cli_lists_flags": listed, "honoured_in_print_mode": "UNVERIFIED until the live case inspects the tool-use list"}
 
@@ -914,9 +935,13 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
             raise EscalationError(record["failure"])
         export = tempfile.TemporaryDirectory(prefix="fable-export-")
         os.chmod(export.name, 0o700)
-        if not export_tracked(cwd, export.name):
+        exported, content_hits = export_tracked(cwd, export.name)
+        if not exported:
             export.cleanup()
             return _refused(blocker_id, "isolation_export_failed")
+        if any(name in prompt or os.path.basename(name) in prompt for name in content_hits):
+            export.cleanup()  # the prompt points at a file that holds a secret: the consult cannot be made safe
+            return _refused(blocker_id, "isolation_secret_in_referenced_file")
         try:
             rid, month = ledger_reserve(auth, record["id"], record.get("session_id") or "unknown", at)
         except Refusal as exc:
@@ -928,7 +953,7 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
         # Persist CONSULTING after the reservation and before the call: a crash or kill leaves both the consult and its $ spent.
         record["state"], record["consult_started"], record["reservation"] = CONSULTING, iso(at), {"rid": rid, "month": month}
         save(directory, record)
-        receipt(directory, "consult_started", record, rid=rid)
+        receipt(directory, "consult_started", record, rid=rid, export_content_skipped=len(content_hits))
     cost, problems = None, []
     try:
         # The prompt goes on stdin so attempt text never appears in a process listing.

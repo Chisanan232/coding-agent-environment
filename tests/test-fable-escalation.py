@@ -527,15 +527,28 @@ class Consult(Env):
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
         self.assertEqual(argv[argv.index("--setting-sources") + 1], "project")
 
-    def test_the_consult_runs_in_a_clean_export_of_tracked_credential_free_files_and_removes_it(self):
-        for name, body in (("src/a.py", "print(1)"), (".env", "X=1"), ("deploy.pem", "k"), ("src/api_token.txt", "t"), (".claude/settings.json", "{}"),
-                           ("docs/readme.md", "hi")):
+    def commit_files(self, files, link=None):
+        for name, body in files.items():
             path = Path(self.repo, name)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(body)
+        for name, dest in (link or {}).items():
+            os.symlink(dest, os.path.join(self.repo, name))
+        git = ["git", "-C", self.repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        subprocess.run([*git, "add", "-A"], check=True, capture_output=True)
+        subprocess.run([*git, "commit", "-q", "-m", "x"], check=True, capture_output=True)
+
+    def exported(self):
+        dest = os.path.join(self.tmp.name, "export")
+        os.makedirs(dest, exist_ok=True)
+        ok, hits = fe.export_tracked(self.repo, dest)
+        names = sorted(os.path.relpath(os.path.join(d, f), dest) for d, _, fs in os.walk(dest) for f in fs)
+        return ok, names, hits
+
+    def test_the_consult_runs_in_a_clean_export_of_committed_credential_free_blobs_and_removes_it(self):
+        self.commit_files({"src/a.py": "print(1)", "docs/readme.md": "hi", ".env": "X=1", "deploy.pem": "k", "src/api_token.txt": "t",
+                           ".claude/settings.json": "{}"})
         Path(self.repo, "untracked.txt").write_text("u")
-        subprocess.run(["git", "-C", self.repo, "add", "src/a.py", ".env", "deploy.pem", "src/api_token.txt", ".claude/settings.json", "docs/readme.md"],
-                       check=True, capture_output=True)
         seen = os.path.join(self.tmp.name, "cwd.log")
         os.environ["FAKE_CWD_LOG"] = seen
         try:
@@ -546,6 +559,58 @@ class Consult(Env):
         self.assertEqual(row["files"], ["docs/readme.md", "src/a.py"])
         self.assertNotEqual(os.path.realpath(row["cwd"]), os.path.realpath(self.repo))
         self.assertFalse(os.path.exists(row["cwd"]))  # removed after the call
+
+    def test_export_uses_committed_blobs_not_the_working_tree_or_the_index(self):
+        self.commit_files({"a.py": "committed = 1"})
+        Path(self.repo, "a.py").write_text("edited = 'uncommitted'")
+        Path(self.repo, "staged.py").write_text("staged = 1")
+        subprocess.run(["git", "-C", self.repo, "add", "staged.py"], check=True, capture_output=True)
+        dest = os.path.join(self.tmp.name, "export")
+        os.makedirs(dest)
+        fe.export_tracked(self.repo, dest)
+        self.assertEqual(Path(dest, "a.py").read_text(), "committed = 1")
+        self.assertFalse(Path(dest, "staged.py").exists())
+
+    def test_symlinks_symlinked_directories_and_submodules_are_not_exported(self):
+        outside = os.path.join(self.tmp.name, "outside.txt")
+        Path(outside).write_text("outside secret")
+        outdir = os.path.join(self.tmp.name, "outdir")
+        os.makedirs(outdir)
+        Path(outdir, "x.txt").write_text("x")
+        self.commit_files({"ok.py": "1"}, link={"link.txt": outside, "linkdir": outdir})
+        sub = "1" * 40
+        subprocess.run(["git", "-C", self.repo, "update-index", "--add", "--cacheinfo", f"160000,{sub},vendor/sub"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", self.repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "sub"],
+                       check=True, capture_output=True)
+        ok, names, _ = self.exported()
+        self.assertTrue(ok)
+        self.assertEqual(names, ["ok.py"])
+
+    def test_credential_looking_names_are_skipped_in_every_path_component_and_case(self):
+        bad = [".env", "app/.env", "a/b/.env.local", "config.env", "prod.env.json", ".aws/credentials", "x/.ssh/id_rsa", "x/.config/tool.toml",
+               ".gnupg/pubring.kbx", "Secrets/readme.md", "KEYS/Token.TXT", "deploy.PEM", "cert.p12", "vault.kdbx", ".codex/c.toml", "id_ed25519",
+               "my-password-list.txt", "private_key.txt", ".Env", "A/.ENV.PROD"]
+        self.commit_files({**{n: "data" for n in bad}, "keep/ok.py": "x = 1"})
+        ok, names, hits = self.exported()
+        self.assertEqual((ok, names, hits), (True, ["keep/ok.py"], []))
+
+    def test_a_file_whose_content_holds_a_token_is_skipped_and_counted(self):
+        self.commit_files({"notes.py": "x = 1\n# api_key = 'abc'\n", "fine.py": "x = 2\n"})
+        ok, names, hits = self.exported()
+        self.assertEqual((names, hits), (["fine.py"], ["notes.py"]))
+
+    def test_a_prompt_that_names_a_file_with_a_secret_is_refused_before_any_reservation(self):
+        self.commit_files({"locks/order.py": "token = 'abc'\n"})
+        bid = self.ready(failure="AC3 deadlock in locks/order.py at step 4")
+        out = self.consult(bid)
+        self.assertEqual((out["action"], out["reason"]), ("CONTINUE", "isolation_secret_in_referenced_file"))
+        self.assertEqual(self.calls(), 0)
+        self.assertFalse(os.path.exists(self.ledger))
+        self.assertFalse(fe.breaker(self.dir)["open"])
+
+    def test_a_repository_without_a_commit_exports_nothing(self):
+        Path(self.repo, "a.py").write_text("1")
+        self.assertEqual(self.exported(), (True, [], []))
 
     def test_consult_reserves_calls_once_and_settles_the_reported_cost(self):
         bid = self.ready()
