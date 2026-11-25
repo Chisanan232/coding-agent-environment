@@ -922,7 +922,7 @@ class Budget(Env):
         self.assertTrue(Path(self.ledger, "2026-12.json").is_file())
         self.assertEqual(fe.committed(json.loads(Path(self.ledger, "2026-12.json").read_text())), 0.9)
 
-    def test_twelve_concurrent_blockers_reserve_exactly_ten_slots_and_never_exceed_the_month(self):
+    def test_twelve_concurrent_blockers_never_overlap_and_never_exceed_the_month(self):
         self.out(total_cost_usd=4.0)
         ids = [self.ready(acceptance_check=f"AC{i} concurrent") for i in range(12)]
         results = []
@@ -931,12 +931,65 @@ class Budget(Env):
         [t.join() for t in threads]
         self.assertEqual(len(results), 12)
         refused = [r for r in results if r.get("action") == "CONTINUE"]
-        self.assertEqual({r["reason"] for r in refused}, {"monthly_budget_exhausted"})
-        self.assertEqual(len(refused), 2)
-        self.assertEqual(len(self.month()["entries"]), 10)
+        self.assertEqual({r["reason"] for r in refused} - {"consult_in_flight"}, set())
+        granted = 12 - len(refused)
+        self.assertGreaterEqual(granted, 1)
+        self.assertEqual(len(self.month()["entries"]), granted)
         self.assertLessEqual(fe.committed(self.month()), 40.0)
-        self.assertEqual(self.calls(), 10)
+        self.assertEqual(self.calls(), granted)
         self.assertFalse(fe.breaker(self.dir)["open"])
+
+    def seed_reserved(self, age_s, at=T0, usd=4.0, blocker="inflight000000001"):
+        os.makedirs(self.ledger, mode=0o700, exist_ok=True)
+        os.chmod(self.ledger, 0o700)
+        entry = {"rid": "held0", "blocker_id": blocker, "session": "other", "reserved_usd": usd, "state": "RESERVED",
+                 "charged_usd": None, "basis": None, "reserved_at": fe.iso(at - timedelta(seconds=age_s)), "settled_at": None}
+        Path(self.ledger, fe.month_key(at) + ".json").write_text(json.dumps({"month": fe.month_key(at), "entries": [entry]}))
+
+    def test_a_second_consult_is_refused_while_a_fresh_reservation_exists_without_a_call_or_breaker_trip(self):
+        self.seed_reserved(5)
+        bid = self.ready()
+        out = self.consult(bid)
+        self.assertEqual((out["action"], out["reason"]), ("CONTINUE", "consult_in_flight"))
+        self.assertIn("opus-architect", out["fallback"])
+        self.assertEqual(self.calls(), 0)
+        self.assertFalse(fe.breaker(self.dir)["open"])
+        self.assertEqual(fe.load(self.dir, bid)["state"], fe.READY)
+
+    def test_a_consult_is_allowed_again_once_the_first_has_settled(self):
+        self.out(total_cost_usd=0.5)
+        first = self.ready(acceptance_check="AC1 first")
+        self.assertIn("advice_path", self.consult(first))
+        second = self.ready(acceptance_check="AC2 second")
+        self.assertIn("advice_path", self.consult(second))
+        self.assertEqual(self.calls(), 2)
+
+    def test_the_in_flight_window_is_the_consult_timeout_plus_grace(self):
+        edge = fe.CONSULT_TIMEOUT_S + fe.IN_FLIGHT_GRACE_S
+        self.seed_reserved(edge)
+        bid = self.ready()
+        self.assertEqual(self.consult(bid)["reason"], "consult_in_flight")
+        self.seed_reserved(edge + 1)
+        self.assertIn("advice_path", self.consult(bid))
+
+    def test_a_stale_orphan_no_longer_blocks_but_still_counts_toward_the_month(self):
+        self.seed_reserved(fe.CONSULT_TIMEOUT_S + fe.IN_FLIGHT_GRACE_S + 1, usd=4.0)
+        self.assertEqual(fe.committed(self.month()), 4.0)
+        bid = self.ready()
+        self.assertIn("advice_path", self.consult(bid))
+        self.assertEqual(fe.committed(self.month()), 4.9)
+
+    def test_a_stale_orphan_still_counts_toward_the_forty_dollar_total(self):
+        stale = fe.CONSULT_TIMEOUT_S + fe.IN_FLIGHT_GRACE_S + 1
+        self.seed_reserved(stale, usd=4.0)
+        data = self.month()
+        data["entries"] += [{"rid": f"s{i}", "blocker_id": f"seed{i:012d}", "session": "seed", "reserved_usd": 4.0, "state": "SETTLED",
+                             "charged_usd": 4.0, "basis": "seed", "reserved_at": fe.iso(T0), "settled_at": fe.iso(T0)} for i in range(9)]
+        Path(self.ledger, fe.month_key(T0) + ".json").write_text(json.dumps(data))
+        self.assertEqual(fe.committed(self.month()), 40.0)
+        out = self.consult(self.ready())
+        self.assertEqual(out["reason"], "monthly_budget_exhausted")
+        self.assertEqual(self.calls(), 0)
 
     def test_the_same_blocker_in_two_state_directories_is_reserved_once_per_month(self):
         other = os.path.join(self.tmp.name, "fable2")
@@ -976,29 +1029,47 @@ import json, os, sys, time, importlib.util as u
 s = u.spec_from_file_location('fe', sys.argv[1]); fe = u.module_from_spec(s); s.loader.exec_module(fe)
 from datetime import datetime, timezone
 auth = {"ledger_dir": sys.argv[2], "caps": {"per_consult_usd": 4.0, "monthly_usd": 40.0}}
+at = datetime(2026, 11, 17, 9, tzinfo=timezone.utc)
+settle = sys.argv[5] == "settle"
 while time.time() < float(sys.argv[4]):
     pass
-try:
-    fe.ledger_reserve(auth, sys.argv[3], "proc", datetime(2026, 11, 17, 9, tzinfo=timezone.utc))
+while True:
+    try:
+        rid, month = fe.ledger_reserve(auth, sys.argv[3], "proc", at)
+    except fe.Refusal as exc:
+        if settle and exc.reason == "consult_in_flight":
+            time.sleep(0.005)
+            continue
+        print(exc.reason)
+        break
+    if settle:
+        fe.ledger_settle(auth, month, rid, 4.0, "test", at)
     print("granted")
-except fe.Refusal as exc:
-    print(exc.reason)
+    break
 """
 
 
 class SharedLedger(Env):
     """Separate processes, separate state directories, one ledger: the ledger lock alone keeps the month's total honest."""
-    def trial(self, workers=24):
+    def trial(self, workers=24, mode="settle"):
         shutil_rm = subprocess.run(["rm", "-rf", self.ledger])
         os.makedirs(self.ledger, mode=0o700, exist_ok=True)
         go = time.time() + 3.0
         procs = [subprocess.Popen([sys.executable, "-c", LOCK_WORKER, str(ROOT / "scripts/fable-escalation.py"), self.ledger,
-                                   f"{i:016x}", str(go)], stdout=subprocess.PIPE, text=True) for i in range(workers)]
+                                   f"{i:016x}", str(go), mode], stdout=subprocess.PIPE, text=True) for i in range(workers)]
         outs = [p.communicate(timeout=120)[0].strip() for p in procs]
         entries = json.loads(Path(self.ledger, fe.month_key(T0) + ".json").read_text())["entries"] if outs.count("granted") else []
         return outs, entries
 
-    def test_many_processes_never_grant_more_than_ten_reservations_or_lose_a_write(self):
+    def test_with_one_unsettled_reservation_exactly_one_of_many_processes_is_granted(self):
+        for _ in range(3):
+            outs, entries = self.trial(mode="hold")
+            self.assertEqual(outs.count("granted"), 1, outs)
+            self.assertEqual(set(outs) - {"granted"}, {"consult_in_flight"})
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(len(Path(self.ledger, "journal.jsonl").read_text().splitlines()), 1)
+
+    def test_many_processes_settling_in_turn_never_grant_more_than_ten_reservations_or_lose_a_write(self):
         for _ in range(3):
             outs, entries = self.trial()
             self.assertEqual(outs.count("granted"), 10, outs)
@@ -1007,7 +1078,7 @@ class SharedLedger(Env):
             self.assertEqual(len({e["blocker_id"] for e in entries}), 10)
             self.assertLessEqual(sum(e["reserved_usd"] for e in entries), 40.0)
             journal = Path(self.ledger, "journal.jsonl").read_text().splitlines()
-            self.assertEqual(len(journal), 10)
+            self.assertEqual(len(journal), 20)  # ten reservations and ten settles
 
     def test_a_breaker_opened_in_one_state_directory_blocks_every_other_one(self):
         other = os.path.join(self.tmp.name, "fable-other")
