@@ -31,7 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from importlib.util import module_from_spec, spec_from_file_location
 
@@ -40,6 +40,8 @@ MIN_CLAUDE = (2, 1, 321)  # Fable 5.2 needs this Claude Code version or later (r
 CONSULT_TIMEOUT_S = 540
 # A RESERVED entry younger than timeout + grace is a consult presumed in flight; older ones are orphans (counted, not blocking).
 IN_FLIGHT_GRACE_S = 60
+# A RESERVED entry stamped further ahead than this (clock stepped back, hand edit) is corrupt: its negative age would block forever.
+FUTURE_SKEW_S = 120
 PER_CONSULT_CEILING = 4.0  # USD; the script ceiling, whatever the authorization file says
 MONTHLY_CEILING = 40.0
 CONSULT_BUDGET_USD = "4"  # kept for the estimate's cap_usd: the reservation, not the client cap
@@ -762,11 +764,19 @@ def _journal(directory, event, **detail):
         fh.write(json.dumps({"event": event, **detail}, sort_keys=True) + "\n")
 
 
-def ledger_reserve(auth, blocker_id, session, at, clock=None):
-    """Reserve one consult's full per-consult cap. Raises Refusal (budget, dedup, in flight, breaker) or LedgerError (unreadable).
+def future_dated(entries, now):
+    """RESERVED entries stamped more than FUTURE_SKEW_S ahead of `now`."""
+    return [e["rid"] for e in entries if e["state"] == RESERVED
+            and (parse(e["reserved_at"]) - now).total_seconds() > FUTURE_SKEW_S]
+
+
+def ledger_reserve(auth, blocker_id, session, at, clock=None, claim=None):
+    """Reserve one consult's full per-consult cap. Raises Refusal (budget, dedup, in flight, breaker) or LedgerError (unreadable,
+    future-dated reservation).
 
     With `clock` the time is sampled inside the ledger lock, once, and used for the month key, the in-flight age check and
-    `reserved_at`; without it (tests, replays) `at` is used. Returns (rid, month, reserved_at)."""
+    `reserved_at`; without it (tests, replays) `at` is used. `claim(directory, now)`, when given, runs inside the same lock after
+    every refusal check and before the entry is written, so a refused reservation never claims it. Returns (rid, month, reserved_at)."""
     directory = ledger_dir_ready(auth["ledger_dir"])
     per = auth["caps"]["per_consult_usd"]
     with locked(directory):
@@ -783,6 +793,8 @@ def ledger_reserve(auth, blocker_id, session, at, clock=None):
         earlier = month_key(now - window)
         if earlier != month:
             files.append(read_month(directory, earlier))
+        if any(future_dated(d["entries"], now) for d in files):
+            raise LedgerError("a RESERVED entry is dated in the future")  # fail closed: it would otherwise block indefinitely
         if any(e.get("blocker_id") == blocker_id for e in data["entries"]):
             raise Refusal("blocker_already_reserved_this_month")
         # Serialize consults host-wide: the client budget cap is only checked between turns, so one in flight bounds the overshoot.
@@ -794,10 +806,14 @@ def ledger_reserve(auth, blocker_id, session, at, clock=None):
         rid = secrets.token_hex(8)
         data["entries"].append({"rid": rid, "blocker_id": blocker_id, "session": session, "reserved_usd": per, "state": RESERVED,
                                 "charged_usd": None, "basis": None, "reserved_at": iso(now), "settled_at": None})
+        marker = claim(directory, now) if claim else None
         try:
             _write(os.path.join(directory, month + ".json"), data)
             _journal(directory, "reserved", rid=rid, blocker_id=blocker_id, usd=per, at=iso(now), month=month)
         except OSError as exc:
+            if marker:
+                with suppress(OSError):
+                    os.unlink(marker)  # the reservation failed, so the one live case is given back
             raise LedgerError(str(exc))
     return rid, month, now
 
@@ -832,7 +848,8 @@ def month_budget(auth, at):
         raise LedgerError(f"ledger timestamp unreadable: {exc}")
     return {"month": month, "committed_usd": spent, "monthly_usd": auth["caps"]["monthly_usd"],
             "remaining_usd": round(auth["caps"]["monthly_usd"] - spent, 6), "entries": len(data["entries"]),
-            "reserved": sum(1 for e in data["entries"] if e["state"] == RESERVED), "orphaned": orphaned}
+            "reserved": sum(1 for e in data["entries"] if e["state"] == RESERVED), "orphaned": orphaned,
+            "future_dated": future_dated(data["entries"], at)}
 
 
 # --- eligibility -------------------------------------------------------------------------------------------------------
@@ -1015,22 +1032,26 @@ def attempt(directory, args, session_id, at, auth_path=None, auth_root=None):
 LIVE_MARKER = "live-verification.json"
 
 
-def _claim_live_verification(auth, directory, blocker_id, at):
-    """Host-wide one-shot: create the marker (exclusively, under the ledger lock) BEFORE the call. Refuses when it already exists or any
-    earlier verification record exists. A later refusal or failure does not give the case back: the owner deletes the marker by hand."""
-    ledger = ledger_dir_ready(auth["ledger_dir"])
-    with locked(ledger):
+def _claim_live_marker(auth, directory, blocker_id):
+    """Host-wide one-shot: returns a `claim(ledger, now)` for ledger_reserve, which creates the marker exclusively inside the ledger
+    lock AFTER every refusal check and BEFORE the call, so a refused reservation never consumes the case. Refuses when the marker
+    already exists or any earlier verification record exists. A later failure of the call does not give the case back: the owner
+    deletes the marker by hand."""
+    def claim(ledger, now):
         folder = os.path.join(directory, "verification")
-        if os.path.exists(os.path.join(ledger, LIVE_MARKER)) or (os.path.isdir(folder) and os.listdir(folder)):
+        path = os.path.join(ledger, LIVE_MARKER)
+        if os.path.exists(path) or (os.path.isdir(folder) and os.listdir(folder)):
             raise Refusal("live_verification_already_used")
         try:
-            fd = os.open(os.path.join(ledger, LIVE_MARKER), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, "w") as fh:
-                json.dump({"blocker": blocker_id, "at": iso(at)}, fh)
+                json.dump({"blocker": blocker_id, "at": iso(now)}, fh)
         except FileExistsError:
             raise Refusal("live_verification_already_used")
         except OSError as exc:
             raise LedgerError(str(exc))
+        return path
+    return claim
 
 
 def _isolation_gate(bid, auth_path, auth_root):
@@ -1362,31 +1383,20 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
         if any(name in prompt or os.path.basename(name) in prompt for name in content_hits):
             export.cleanup()  # the prompt points at a file that holds a secret: the consult cannot be made safe
             return _refused(blocker_id, "isolation_secret_in_referenced_file")
-        probes = None
-        if live_verification:
-            try:
-                _claim_live_verification(auth, directory, record["id"], at)
-            except Refusal as exc:
-                export.cleanup()
-                return _refused(blocker_id, exc.reason)
-            except LedgerError:
-                export.cleanup()
-                return _refused(blocker_id, "ledger_unreadable")
-            outside = tempfile.TemporaryDirectory(prefix="fable-outside-")
-            probes = build_probes(export.name, outside.name)
-            prompt = verification_preamble(probes) + prompt
+        claim = _claim_live_marker(auth, directory, record["id"]) if live_verification else None
         try:
-            rid, month, reserved_at = ledger_reserve(auth, record["id"], record.get("session_id") or "unknown", at, clock)
+            rid, month, reserved_at = ledger_reserve(auth, record["id"], record.get("session_id") or "unknown", at, clock, claim)
         except Refusal as exc:
             export.cleanup()
-            if probes:
-                outside.cleanup()
             return _refused(blocker_id, exc.reason)  # quota state, not a route failure: the breaker stays closed
         except LedgerError:
             export.cleanup()
-            if probes:
-                outside.cleanup()
             return _refused(blocker_id, "ledger_unreadable")
+        probes = None
+        if live_verification:
+            outside = tempfile.TemporaryDirectory(prefix="fable-outside-")
+            probes = build_probes(export.name, outside.name)
+            prompt = verification_preamble(probes) + prompt
         # Persist CONSULTING after the reservation and before the call: a crash or kill leaves both the consult and its $ spent.
         record["state"], record["consult_started"], record["reservation"] = CONSULTING, iso(reserved_at), {"rid": rid, "month": month}
         save(directory, record)

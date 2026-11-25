@@ -206,6 +206,13 @@ class Env(unittest.TestCase):
                     "charged_usd": c, "basis": "seed", "reserved_at": fe.iso(at), "settled_at": fe.iso(at)} for i, c in enumerate(chunks)]
         Path(self.ledger, fe.month_key(at) + ".json").write_text(json.dumps({"month": fe.month_key(at), "entries": entries}))
 
+    def seed_reserved(self, age_s, at=T0, usd=4.0, blocker="inflight000000001"):
+        os.makedirs(self.ledger, mode=0o700, exist_ok=True)
+        os.chmod(self.ledger, 0o700)
+        entry = {"rid": "held0", "blocker_id": blocker, "session": "other", "reserved_usd": usd, "state": "RESERVED",
+                 "charged_usd": None, "basis": None, "reserved_at": fe.iso(at - timedelta(seconds=age_s)), "settled_at": None}
+        Path(self.ledger, fe.month_key(at) + ".json").write_text(json.dumps({"month": fe.month_key(at), "entries": [entry]}))
+
     def out(self, **fields):
         os.environ["FAKE_OUT"] = json.dumps(dict(FABLE_OK, **fields))
 
@@ -940,13 +947,6 @@ class Budget(Env):
         self.assertEqual(self.calls(), granted)
         self.assertFalse(fe.breaker(self.dir)["open"])
 
-    def seed_reserved(self, age_s, at=T0, usd=4.0, blocker="inflight000000001"):
-        os.makedirs(self.ledger, mode=0o700, exist_ok=True)
-        os.chmod(self.ledger, 0o700)
-        entry = {"rid": "held0", "blocker_id": blocker, "session": "other", "reserved_usd": usd, "state": "RESERVED",
-                 "charged_usd": None, "basis": None, "reserved_at": fe.iso(at - timedelta(seconds=age_s)), "settled_at": None}
-        Path(self.ledger, fe.month_key(at) + ".json").write_text(json.dumps({"month": fe.month_key(at), "entries": [entry]}))
-
     def test_a_second_consult_is_refused_while_a_fresh_reservation_exists_without_a_call_or_breaker_trip(self):
         self.seed_reserved(5)
         bid = self.ready()
@@ -1001,6 +1001,62 @@ class Budget(Env):
         self.assertEqual(self.month()["entries"][-1]["reserved_at"], fe.iso(T0))
         with self.assertRaises(fe.Refusal):  # without the clock the stale `at` makes the old entry look fresh
             fe.ledger_reserve(auth, "c" * 16, "s", stale_at)
+
+    def test_a_future_dated_reservation_is_refused_as_corrupt_without_a_call_or_breaker_trip(self):
+        for label, ahead in (("2h", 7200), ("365d", 365 * 86400)):
+            with self.subTest(label):
+                self.tearDown()
+                self.setUp()
+                self.seed_reserved(-ahead)
+                bid = self.ready()
+                out = self.consult(bid)
+                self.assertEqual((out["action"], out["reason"]), ("CONTINUE", "ledger_unreadable"))
+                self.assertEqual(self.calls(), 0)
+                self.assertFalse(fe.breaker(self.dir)["open"])
+                self.assertEqual(fe.load(self.dir, bid)["state"], fe.READY)
+                self.assertEqual(len(self.month()["entries"]), 1)  # nothing was added next to it
+
+    def test_a_reservation_within_the_skew_allowance_still_behaves_as_fresh(self):
+        self.seed_reserved(-(fe.FUTURE_SKEW_S - 1))
+        bid = self.ready()
+        self.assertEqual(self.consult(bid)["reason"], "consult_in_flight")
+        self.assertEqual(self.calls(), 0)
+        self.seed_reserved(-(fe.FUTURE_SKEW_S + 1))
+        self.assertEqual(self.consult(bid)["reason"], "ledger_unreadable")
+
+    def test_month_budget_and_report_list_future_dated_entries_without_crashing(self):
+        self.seed_reserved(-7200)
+        auth = fe.load_authorization()[0]
+        budget = fe.month_budget(auth, T0)
+        self.assertEqual(budget["future_dated"], ["held0"])
+        self.assertEqual(budget["orphaned"], [])
+        self.assertEqual(fe.report(self.dir, budget)["month_budget"]["future_dated"], ["held0"])
+        self.seed_reserved(-(fe.FUTURE_SKEW_S - 1))
+        self.assertEqual(fe.month_budget(auth, T0)["future_dated"], [])
+        self.seed_reserved(5)
+        self.assertEqual(fe.month_budget(auth, T0)["future_dated"], [])
+
+    def test_one_clock_sample_taken_inside_the_lock_drives_the_month_age_check_and_reserved_at(self):
+        calls = []
+        real_locked = fe.locked
+
+        @contextlib.contextmanager
+        def spy(directory):
+            calls.append("lock")
+            with real_locked(directory):
+                yield
+
+        def clock():
+            calls.append("clock")
+            return T0 + timedelta(seconds=1000 * calls.count("clock"))  # a different value on every call
+        self.seed_reserved(fe.CONSULT_TIMEOUT_S + fe.IN_FLIGHT_GRACE_S + 500, at=T0 + timedelta(seconds=1000))
+        auth = fe.load_authorization()[0]
+        with mock.patch.object(fe, "locked", spy):
+            rid, month, reserved_at = fe.ledger_reserve(auth, "d" * 16, "s", T0 - timedelta(days=40), clock=clock)
+        self.assertEqual(calls, ["lock", "clock"])  # sampled once, and only after the lock was taken
+        self.assertEqual(reserved_at, T0 + timedelta(seconds=1000))
+        self.assertEqual(month, fe.month_key(reserved_at))
+        self.assertEqual(self.month()["entries"][-1]["reserved_at"], fe.iso(reserved_at))
 
     def test_the_model_call_is_bounded_from_the_reservation_timestamp(self):
         seen = {}
@@ -1133,6 +1189,31 @@ while True:
 """
 
 
+LIVE_WORKER = """
+import json, os, sys, time, importlib.util as u
+s = u.spec_from_file_location('fe', sys.argv[1]); fe = u.module_from_spec(s); s.loader.exec_module(fe)
+from datetime import datetime, timezone
+auth = {"ledger_dir": sys.argv[2], "caps": {"per_consult_usd": 4.0, "monthly_usd": 40.0}}
+at = datetime(2026, 11, 17, 9, tzinfo=timezone.utc)
+claim = fe._claim_live_marker(auth, sys.argv[6], sys.argv[3])
+while time.time() < float(sys.argv[4]):
+    pass
+while True:
+    try:
+        rid, month, _at = fe.ledger_reserve(auth, sys.argv[3], "proc", at, None, claim)
+    except fe.Refusal as exc:
+        if sys.argv[5] == "settle" and exc.reason == "consult_in_flight":
+            time.sleep(0.005)
+            continue
+        print(exc.reason)
+        break
+    if sys.argv[5] == "settle":
+        fe.ledger_settle(auth, month, rid, 4.0, "test", at)
+    print("granted")
+    break
+"""
+
+
 class SharedLedger(Env):
     """Separate processes, separate state directories, one ledger: the ledger lock alone keeps the month's total honest."""
     def trial(self, workers=24, mode="settle"):
@@ -1246,6 +1327,83 @@ class LiveVerification(_Cli, Env):
         again = fe.attempt(self.dir, self.args(approach="a third"), "s", T0)
         self.assertEqual(again["reason"], "isolation_unverified")
         self.assertEqual(self.calls(), 0)
+
+    def marker(self):
+        return os.path.join(self.ledger, fe.LIVE_MARKER)
+
+    def test_a_refusal_at_reserve_leaves_no_marker_and_the_live_case_stays_available(self):
+        def in_flight():
+            self.seed_reserved(5)
+
+        def breaker_late():  # the state-directory check passes; only the shared breaker read inside the ledger lock refuses
+            os.makedirs(self.ledger, mode=0o700, exist_ok=True)
+            Path(self.ledger, "breaker.json").write_text(json.dumps({"open": True, "reason": "route_failure"}))
+            return mock.patch.object(fe, "breaker", lambda d: {"open": False})
+
+        def budget():
+            self.seed_month(40)
+
+        def corrupt():
+            os.makedirs(self.ledger, mode=0o700, exist_ok=True)
+            Path(self.ledger, fe.month_key(T0) + ".json").write_text("{corrupt")
+
+        def future():
+            self.seed_reserved(-7200)
+        for name, setup, reason in (("in_flight", in_flight, "consult_in_flight"), ("breaker", breaker_late, "breaker_open"),
+                                    ("budget", budget, "monthly_budget_exhausted"), ("corrupt", corrupt, "ledger_unreadable"),
+                                    ("future", future, "ledger_unreadable")):
+            with self.subTest(name):
+                self.tearDown()
+                self.setUp()
+                bid = self.authorized_blocker()
+                os.environ["FAKE_LIVE"] = "good"
+                patch = setup()
+                with (patch if patch else contextlib.nullcontext()):
+                    out = self.live(bid)
+                self.assertTrue(out.get("reason", "").startswith(reason), out)
+                self.assertFalse(os.path.exists(self.marker()))
+                self.assertEqual(self.calls(), 0)
+                self.assertFalse(self.cli("authorization", "check")["isolation"]["live_verification_used"])
+                for leftover in Path(self.ledger).glob("*.json"):
+                    leftover.unlink()  # remove the cause: the same live case must still run
+                out = self.live(bid)
+                self.assertIn("verification", out, out)
+                self.assertTrue(os.path.exists(self.marker()))
+                self.assertEqual(self.calls(), 1)
+
+    def test_a_successful_reservation_claims_the_marker_exactly_once_for_the_named_blocker(self):
+        bid = self.authorized_blocker()
+        os.environ["FAKE_LIVE"] = "good"
+        self.live(bid)
+        self.assertEqual(json.loads(Path(self.marker()).read_text())["blocker"], bid)
+        self.assertEqual(len(self.month()["entries"]), 1)
+        self.assertEqual(self.calls(), 1)
+
+    def test_an_already_used_case_reserves_nothing(self):
+        bid = self.authorized_blocker()
+        os.makedirs(self.ledger, mode=0o700, exist_ok=True)
+        Path(self.marker()).write_text("{}")
+        self.assertEqual(self.live(bid)["reason"], "live_verification_already_used")
+        self.assertFalse(os.path.exists(os.path.join(self.ledger, fe.month_key(T0) + ".json")))
+
+    def test_racing_processes_produce_exactly_one_live_case(self):
+        for mode in ("hold", "settle"):
+            with self.subTest(mode):
+                subprocess.run(["rm", "-rf", self.ledger])
+                os.makedirs(self.ledger, mode=0o700, exist_ok=True)
+                go = time.time() + 3.0
+                procs = []
+                for i in range(12):
+                    state = os.path.join(self.tmp.name, f"state-{mode}-{i}")
+                    os.makedirs(state, mode=0o700)
+                    procs.append(subprocess.Popen([sys.executable, "-c", LIVE_WORKER, str(ROOT / "scripts/fable-escalation.py"), self.ledger,
+                                                   f"{i:016x}", str(go), mode, state], stdout=subprocess.PIPE, text=True))
+                outs = [p.communicate(timeout=120)[0].strip() for p in procs]
+                self.assertEqual(outs.count("granted"), 1, outs)
+                self.assertEqual(set(outs) - {"granted"}, {"consult_in_flight"} if mode == "hold" else {"live_verification_already_used"})
+                self.assertEqual(len(json.loads(Path(self.ledger, fe.month_key(T0) + ".json").read_text())["entries"]), 1)
+                self.assertEqual(len(Path(self.ledger, "journal.jsonl").read_text().splitlines()), 2 if mode == "settle" else 1)
+                self.assertTrue(os.path.exists(self.marker()))
 
     def test_an_ordinary_consult_is_refused_while_unverified_and_reserves_nothing(self):
         bid = self.authorized_blocker()
