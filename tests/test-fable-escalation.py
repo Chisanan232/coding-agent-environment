@@ -58,9 +58,19 @@ if os.environ.get("FAKE_LIVE"):
             body, err = open(full).read(), False
         elif mode == "notfound":
             body, err = "File does not exist.", True
+        elif mode == "nonerror":
+            body, err = "Permission to read %s has been denied." % path, False
+        elif mode == "substring":
+            body, err = "could not read it; permission may have been denied by something", True
         else:
-            body, err = "Permission to read this path was denied.", True
+            body, err = "Permission to read %s has been denied." % path, True
         events.append({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t%d" % i, "content": body, "is_error": err}]}})
+    if mode == "dupe":
+        dup = [e for e in events if e["type"] == "assistant"][1]["message"]["content"][0]
+        events.append({"type": "assistant", "message": {"content": [dict(dup, id="dup")]}})
+        events.append({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "dup", "content": "Permission to read %s has been denied." % dup["input"]["file_path"], "is_error": True}]}})
+    if mode == "multikey":
+        events.append({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "mk", "name": "Read", "input": {"file_path": "fable-verify-inside.txt", "path": "/etc/passwd"}}]}})
     if mode == "bash":
         events.append({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "ls"}}]}})
     if mode == "empty": events = []
@@ -1127,7 +1137,7 @@ class LiveVerification(_Cli, Env):
         self.assertEqual(self.cli("authorization", "check")["isolation"]["live_verification_used"], True)
 
     def test_any_missing_or_contrary_evidence_fails_the_verdict_and_opens_the_breaker(self):
-        for mode in ("leak", "notfound", "empty", "skip", "bash", "badinit", "mcp", "nomemory", "memory"):
+        for mode in ("leak", "notfound", "nonerror", "substring", "dupe", "multikey", "empty", "skip", "bash", "badinit", "mcp", "nomemory", "memory"):
             with self.subTest(mode):
                 self.tearDown()
                 self.setUp()
@@ -1139,6 +1149,48 @@ class LiveVerification(_Cli, Env):
                 self.assertEqual(fe.breaker(self.dir)["reason"], "isolation_verification_failed")
                 if mode == "leak":
                     self.assertTrue(verdict["canary_leaked"])
+
+    def test_the_probe_list_never_names_a_real_credential_or_memory_file_and_only_random_missing_paths_in_denied_directories(self):
+        export, outside = (tempfile.mkdtemp(dir=self.tmp.name) for _ in range(2))
+        probes = fe.build_probes(export, outside)
+        preamble = fe.verification_preamble(probes)
+        for forbidden in ("id_rsa", "id_ed25519", "CLAUDE.md", "credentials", "known_hosts", "settings.json"):
+            self.assertNotIn(forbidden, preamble)
+        homes = [d["path"] for d in probes["denied"] if d["path"].startswith("~/")]
+        self.assertEqual(len(homes), 3)
+        for path in homes:
+            self.assertRegex(path, r"^~/\.(ssh|config|claude)/fable-probe-[0-9a-f]{16}$")
+            self.assertFalse(os.path.lexists(os.path.expanduser(path)))
+        self.assertEqual([n for n in os.listdir(self.home) if n in (".ssh", ".claude")], [])  # nothing is created in the home directory
+        self.assertEqual(len({d["path"] for d in probes["denied"]}), 5)
+
+    def test_a_denial_must_be_an_error_with_the_anchored_message_and_any_normal_result_is_a_leak(self):
+        bid = self.authorized_blocker()
+        os.environ["FAKE_LIVE"] = "nonerror"
+        verdict = self.live(bid)["verification"]
+        self.assertFalse(verdict["pass"])
+        self.assertTrue(verdict["canary_leaked"])
+        self.assertTrue(all(r["returned_normally"] for r in verdict["denied_probes"]))
+        self.tearDown()
+        self.setUp()
+        bid = self.authorized_blocker()
+        os.environ["FAKE_LIVE"] = "substring"
+        verdict = self.live(bid)["verification"]
+        self.assertFalse(verdict["pass"])
+        self.assertEqual([r["refused"] for r in verdict["denied_probes"]], [False] * 5)
+
+    def test_every_path_like_input_is_checked_and_a_duplicated_probe_call_fails(self):
+        for mode, key in (("multikey", "outside_export"), ("dupe", None)):
+            self.tearDown()
+            self.setUp()
+            bid = self.authorized_blocker()
+            os.environ["FAKE_LIVE"] = mode
+            verdict = self.live(bid)["verification"]
+            self.assertFalse(verdict["pass"], mode)
+            if key:
+                self.assertIn("/etc/passwd", verdict[key])
+            else:
+                self.assertEqual(verdict["denied_probes"][0]["calls"], 2)
 
     def test_the_live_case_is_one_shot_host_wide_even_after_a_failure_and_for_a_prior_record(self):
         bid = self.authorized_blocker()
@@ -1206,6 +1258,23 @@ class LiveVerification(_Cli, Env):
 
 
 class PayloadControls(Env):
+    def test_long_identifiers_whitespace_runs_and_split_secrets_are_not_missed(self):
+        long_key = "api_key_for_the_production_billing_service_account_in_region_one"
+        for text in (f"{long_key} = abc", "api_key" + " " * 60 + "= abc", "token\t\t\t\t: x", "api_key\n=\nabc", "password\n: hunter2",
+                     "pass = {\n  'token'\n  : 'abc'\n}", "sk-" + "ant-" + "\n  api03-abcdefgh"):
+            self.assertIsNotNone(fe.payload_violation(text), text)
+        self.assertIsNone(fe.payload_violation("the lock order is documented in two places and nothing here is sensitive"))
+
+    def test_url_credentials_are_caught_after_any_prefix_character(self):
+        for text in ("DB=:-postgres://user:pw@host/db", "x.postgres://u:p@h", "1postgres://u:p@h", "a+b-c://u:p@h", "${URL:-mysql://root:pw@db/x}",
+                     "https://user:hunter2@example.com/x", "postgres://u:p@h"):
+            self.assertEqual(fe.payload_violation(text), "secret", text)
+
+    def test_a_secret_split_across_adjacent_lines_in_an_exported_file_is_skipped(self):
+        for body in ("api_key\n=\nabc\n", "x = 1\ntoken\n:\nabc\n", "ok = 1\nsk-" + "ant-\napi03-abcdefgh\n"):
+            self.assertIsNotNone(fe.scan_content(body, time.monotonic() + 30), body)
+        self.assertIsNone(fe.scan_content("x = 1\ny = 2\nprint(x + y)\n", time.monotonic() + 30))
+
     def test_the_original_bearer_and_email_controls_still_hold_alongside_the_new_ones(self):
         for text in ("Bearer abcdefgh12345678", "bearer ABCDEFGHIJKL", "sent bearer abcdefgh", "a@b.co", "x_y@my_host.com", "a@b.c.d", "me@host_name.com"):
             self.assertIsNotNone(fe.payload_violation(text), text)

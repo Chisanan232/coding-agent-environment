@@ -75,10 +75,9 @@ RESERVED, SETTLED = "RESERVED", "SETTLED"
 
 # Text that must not reach a Fable prompt, nor be stored at `attempt`. First matching rule names the refusal.
 PAYLOAD_RULES = (
-    ("secret", re.compile(r"(?i)(token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|credential|authorization)[\w-]{0,40}[\"'\]]*\s{0,20}[=:]"
-                          r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|\bbearer\s+(?=[A-Za-z0-9._~+/=-]*[0-9._~+/=-])[A-Za-z0-9._~+/=-]{6,}|\b(?:password|passwd|passphrase|secret|token|api key)\s+(?:is|was)\s+\S+|sk_(?:live|test)_[A-Za-z0-9]{8,}|AIza[0-9A-Za-z_-]{35}|github_pat_[A-Za-z0-9_]{20,}|gh[opusr]_[A-Za-z0-9]{20,}"
+    ("secret", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|\bbearer\s+(?=[A-Za-z0-9._~+/=-]*[0-9._~+/=-])[A-Za-z0-9._~+/=-]{6,}|\b(?:password|passwd|passphrase|secret|token|api key)\s+(?:is|was)\s+\S+|sk_(?:live|test)_[A-Za-z0-9]{8,}|AIza[0-9A-Za-z_-]{35}|github_pat_[A-Za-z0-9_]{20,}|gh[opusr]_[A-Za-z0-9]{20,}"
                           r"|(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}|sk-ant-|AKIA[0-9A-Z]{16}|xox[abprs]-"
-                          r"|eyJ[A-Za-z0-9_-]{8,1500}\.[A-Za-z0-9_-]{8,1500}\.[A-Za-z0-9_-]*|-----BEGIN |(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@"
+                          r"|eyJ[A-Za-z0-9_-]{8,200}\.[A-Za-z0-9_-]{8,2000}\.[A-Za-z0-9_-]*|-----BEGIN |[a-z][a-z0-9+.-]{0,31}://[^\s/:@]+:[^\s/@]+@"
                           r"|(?<![A-Za-z0-9+/=])(?=[A-Za-z0-9+/=]*[0-9])[A-Za-z0-9+/=]{40,}")),
     ("transcript", re.compile(r"(?m)^[ \t]*(Human|Assistant)[ \t]*:|\"role\"\s*:|\"type\"\s*:\s*\"(assistant|user|tool_use)\"|<system-reminder|"
                               r"\.claude/projects/|\.jsonl\b")),
@@ -252,33 +251,65 @@ def reset_breaker(directory, note, at):
 # --- payload minimization ----------------------------------------------------------------------------------------------
 
 MAX_LINE_CHARS = 4096
+WS_RE = re.compile(r"\s+")
+# An identifier (word characters and hyphens, started only at a word boundary so the scan is linear) directly followed by `=` or `:`.
+# Whether the identifier names a credential is decided on that one word afterwards: no bound on the word, no backtracking.
+KEY_ASSIGN_RE = re.compile(r"(?<![\w-])([\w-]+)[\"'\]]*[ \t]?[=:]")
+KEY_WORD_RE = re.compile(r"(?i)token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|credential|authorization")
+
+
+def _hit(text):
+    """First rule broken by one bounded piece of text (a line, a window or a segment), or None."""
+    flat = WS_RE.sub(" ", text)
+    for candidate in (text, flat) if flat != text else (text,):
+        if any(KEY_WORD_RE.search(m.group(1)) for m in KEY_ASSIGN_RE.finditer(candidate)):
+            return "secret"
+        for name, pattern in PAYLOAD_RULES:
+            if pattern.search(candidate):
+                return name
+    return None
+
+
+def scan_content(text, deadline):
+    """Name of the first payload rule broken by `text`, or None. Linear time: every pattern only ever sees one line, a window of three
+    adjacent lines, or a segment of the whitespace-collapsed text, so a secret split across lines or padded with whitespace is still
+    seen. An over-long line counts as a hit; the deadline is checked per piece (TimeoutError: the export fails closed)."""
+    def tick():
+        if time.monotonic() > deadline:
+            raise TimeoutError("content scan passed the export deadline")
+    lines = text.split("\n")
+    for line in lines:
+        tick()
+        if len(line) > MAX_LINE_CHARS:
+            return "long_line"
+        hit = _hit(line)
+        if hit:
+            return hit
+    for i in range(len(lines) - 1):
+        tick()
+        hit = _hit(" ".join(lines[i:i + 3]))
+        if hit:
+            return hit
+    flat = WS_RE.sub(" ", text)
+    for start in range(0, max(len(flat) - 2048, 1), 6144):
+        tick()
+        hit = _hit(flat[start:start + 8192])
+        if hit:
+            return hit
+    return None
 
 
 def payload_violation(text):
-    """Name of the first rule the text breaks (secret, transcript, email, size), or None. Offline and deterministic.
+    """Name of the first rule the text breaks (secret, transcript, email, size, long_line), or None. Offline and deterministic.
 
     Text over the prompt size cap is refused before any pattern runs, so no pattern ever sees an unbounded input."""
     text = str(text or "")
     if len(text.encode()) > MAX_PROMPT_BYTES:
         return "size"
-    for name, pattern in PAYLOAD_RULES:
-        if pattern.search(text):
-            return name
-    return None
-
-
-def scan_content(text, deadline):
-    """Name of the first payload rule broken by `text`, scanning line by line so no pattern backtracks across newlines, treating an
-    over-long line as a hit and checking the deadline on every line. TimeoutError past the deadline (the export fails closed)."""
-    for line in text.split("\n"):
-        if time.monotonic() > deadline:
-            raise TimeoutError("content scan passed the export deadline")
-        if len(line) > MAX_LINE_CHARS:
-            return "long_line"
-        for name, pattern in PAYLOAD_RULES:
-            if pattern.search(line):
-                return name
-    return None
+    try:
+        return scan_content(text, time.monotonic() + 30)
+    except TimeoutError:
+        return "size"
 
 
 def record_payload_violation(record):
@@ -1113,13 +1144,17 @@ def save_stream(directory, blocker_id, stdout):
 ALLOWED_TOOLS = ("Read", "Grep", "Glob")
 PATH_KEYS = ("file_path", "path", "pattern", "glob", "notebook_path")
 DENIED_PATH_RE = re.compile(r"(?i)(^|/)(\.env[^/]*|\.ssh|\.aws|\.gnupg|\.config|\.claude|\.codex)(/|$)|id_(rsa|dsa|ecdsa|ed25519)|\.(pem|key)$")
-DENIAL_RE = re.compile(r"(?i)permission|denied|not allowed|blocked|disallowed|don't have|not permitted|forbidden")
-HOME_DENIED_PROBES = ("~/.ssh/id_rsa", "~/.config/fable-verify-probe", "~/.claude/CLAUDE.md")
+# The anchored CLI wording of a permission refusal. UNVERIFIED against the real CLI: if the live case shows different wording the verdict
+# fails closed and this pattern is corrected from the saved stream, never loosened to a substring match.
+DENIAL_RE = re.compile(r"Permission to (?:read|access) [^\n]{1,400} has been denied\.?|[^\n]{1,400} denied by your permission settings\.?")
 INSIDE_PROBE = "fable-verify-inside.txt"
+# Denied locations probed with a random, guaranteed-nonexistent file name inside them. A real credential or memory file is never named.
+DENIED_HOME_DIRS = ("~/.ssh", "~/.config", "~/.claude")
 
 
 def build_probes(export_root, outside_root):
-    """Canaries for the live case: one readable file inside the export, and files outside it and in denied places the CLI must refuse."""
+    """Canaries for the live case: one readable file inside the export, token files outside it, and random nonexistent names in the
+    denied home directories. Nothing here names, creates or touches an existing file under the home directory."""
     tokens = {"inside": secrets.token_hex(8), "outside": secrets.token_hex(8), "outside_env": secrets.token_hex(8)}
     with open(os.path.join(export_root, INSIDE_PROBE), "w") as fh:
         fh.write(f"inside-canary-{tokens['inside']}\n")
@@ -1128,7 +1163,7 @@ def build_probes(export_root, outside_root):
             fh.write(f"outside-canary-{token}\n")
     denied = [{"path": os.path.join(outside_root, "outside-canary.txt"), "token": tokens["outside"]},
               {"path": os.path.join(outside_root, ".env"), "token": tokens["outside_env"]},
-              *({"path": p, "token": None} for p in HOME_DENIED_PROBES)]
+              *({"path": f"{d}/fable-probe-{secrets.token_hex(8)}", "token": None} for d in DENIED_HOME_DIRS)]
     return {"inside": {"path": INSIDE_PROBE, "token": f"inside-canary-{tokens['inside']}"}, "denied": denied}
 
 
@@ -1150,9 +1185,11 @@ def _result_text(block):
 
 def verification_verdict(events, export_root, saved_path, probes):
     """What the one live-verification run actually did, from its stream-json events. `pass` needs positive evidence on every line: the
-    init event shows only Read/Grep/Glob, no MCP server and permission mode dontAsk; the inside canary was read; every outside and
-    denied probe was attempted and refused with its canary content absent; nothing else was touched; memory/CLAUDE.md loading is
-    shown to be off. Missing evidence is a failure, never a pass."""
+    init event shows only Read/Grep/Glob, no MCP server and permission mode dontAsk; the inside canary was read by exactly one call;
+    every outside and denied probe was attempted by exactly one call whose result is an error carrying the anchored permission-denial
+    message and no canary content (any non-error result for a denied probe is a leak); no other call touches a denied, `..` or outside
+    path in ANY of its path-like inputs; memory/CLAUDE.md loading is shown to be off by the init event alone (the verdict never reads
+    such a file). Missing evidence is a failure, never a pass."""
     root = os.path.realpath(export_root)
     init = next((e for e in events if e.get("type") == "system" and e.get("subtype") == "init"), None)
     tools = init.get("tools") if init else None
@@ -1170,52 +1207,62 @@ def verification_verdict(events, export_root, saved_path, probes):
             if not isinstance(block, dict):
                 continue
             if e.get("type") == "assistant" and block.get("type") == "tool_use":
-                given = block.get("input") if isinstance(block.get("input"), dict) else {}
-                uses[str(block.get("id"))] = {"tool": str(block.get("name")), "input": given}
+                uses[str(block.get("id"))] = {"tool": str(block.get("name")), "input": block.get("input") if isinstance(block.get("input"), dict) else {}}
             elif e.get("type") == "user" and block.get("type") == "tool_result":
-                results[str(block.get("tool_use_id"))] = {"error": bool(block.get("is_error")), "text": _result_text(block)}
+                results[str(block.get("tool_use_id"))] = {"error": block.get("is_error") is True, "text": _result_text(block)}
 
-    def path_of(use):
-        for key in PATH_KEYS:
-            if isinstance(use["input"].get(key), str):
-                return use["input"][key]
-        return ""
+    full = lambda x: os.path.realpath(os.path.join(root, os.path.expanduser(x)))
+    path_values = lambda use: [(k, use["input"][k]) for k in PATH_KEYS if k in use["input"]]
 
-    def same(a, b):
-        full = lambda x: os.path.realpath(os.path.join(root, os.path.expanduser(x)))
-        return full(a) == full(b)
-
-    def find(path):
+    def exact_matches(path):
+        """Tool-use ids of Reads whose ONLY path-like input is file_path and equals the probe."""
+        found = []
         for uid, use in uses.items():
-            if use["tool"] == "Read" and path_of(use) and same(path_of(use), path):
-                return results.get(uid)
-        return None
+            values = path_values(use)
+            if use["tool"] == "Read" and len(values) == 1 and values[0][0] == "file_path" and isinstance(values[0][1], str) \
+                    and full(values[0][1]) == full(path):
+                found.append(uid)
+        return found
 
-    inside = find(probes["inside"]["path"])
+    exempt = set()
+    inside_hits = exact_matches(probes["inside"]["path"])
+    inside = results.get(inside_hits[0]) if len(inside_hits) == 1 else None
     inside_ok = bool(inside and not inside["error"] and probes["inside"]["token"] in inside["text"])
-    denied_rows, probe_paths = [], [probes["inside"]["path"]]
-    leaked = any(d["token"] and d["token"].split("-")[-1] in json.dumps(events) for d in probes["denied"])
+    if len(inside_hits) == 1:
+        exempt.add(inside_hits[0])
+    denied_rows, readable = [], False
     for d in probes["denied"]:
-        probe_paths.append(d["path"])
-        res = find(d["path"])
-        refused = bool(res and DENIAL_RE.search(res["text"]) and not (d["token"] and d["token"] in res["text"]))  # "not found" is not a refusal
-        denied_rows.append({"path": d["path"], "attempted": res is not None, "refused": refused})
+        hits = exact_matches(d["path"])
+        res = results.get(hits[0]) if len(hits) == 1 else None
+        if len(hits) == 1:
+            exempt.add(hits[0])
+        non_error = bool(res and not res["error"])  # a denied probe that returned normally is a leak, whatever it said
+        readable = readable or non_error
+        refused = bool(res and res["error"] and DENIAL_RE.fullmatch(res["text"].strip()) and not (d["token"] and d["token"] in res["text"]))
+        denied_rows.append({"path": d["path"], "attempted": len(hits) >= 1, "calls": len(hits), "refused": refused, "returned_normally": non_error})
+    dump = json.dumps(events)
+    leaked = readable or any(d["token"] and d["token"] in dump for d in probes["denied"])
     summary, other, outside, denied = [], [], [], []
-    for use in uses.values():
-        path = path_of(use)
+    for uid, use in uses.items():
         summary.append({"tool": use["tool"], "input": {k: str(use["input"][k])[:200] for k in PATH_KEYS if k in use["input"]}})
-        if path and any(same(path, probe) for probe in probe_paths) and use["tool"] == "Read":
-            continue  # a declared probe
+        if uid in exempt:
+            continue
         if use["tool"] not in ALLOWED_TOOLS:
             other.append(use["tool"])
-        if path and DENIED_PATH_RE.search(path):
-            denied.append(path[:200])
-        if path and (".." in path.split("/") or (os.path.isabs(os.path.expanduser(path)) and os.path.commonpath([root, os.path.realpath(os.path.expanduser(path))]) != root)):
-            outside.append(path[:200])
+        for _key, value in path_values(use):  # EVERY path-like input, not just the first
+            if not isinstance(value, str):
+                denied.append(str(value)[:200])
+                continue
+            if DENIED_PATH_RE.search(value):
+                denied.append(value[:200])
+            expanded = os.path.expanduser(value)
+            if ".." in value.split("/") or (os.path.isabs(expanded) and os.path.commonpath([root, os.path.realpath(expanded)]) != root):
+                outside.append(value[:200])
     return {"tool_uses": summary, "init_ok": init_ok, "inside_probe_read": inside_ok, "denied_probes": denied_rows, "canary_leaked": leaked,
             "non_allowed_tools": other, "outside_export": outside, "denied_path_access": denied,
             "memory_or_claude_md_loaded": memory, "saved_stream": saved_path,
-            "pass": bool(init_ok and inside_ok and all(r["attempted"] and r["refused"] for r in denied_rows) and not leaked
+            "pass": bool(init_ok and inside_ok and len(inside_hits) == 1 and not leaked
+                         and all(r["calls"] == 1 and r["refused"] for r in denied_rows)
                          and not other and not outside and not denied and memory is False)}
 
 
