@@ -1055,6 +1055,18 @@ class Budget(Env):
         self.seed_reserved(5)
         self.assertEqual(fe.month_budget(auth, T0)["future_dated"], [])
 
+    def test_month_budget_and_report_list_a_previous_month_future_dated_entry_at_the_boundary(self):
+        now = datetime(2026, 11, 30, 16, 3, tzinfo=timezone.utc)  # 2026-12-01 00:03 in fixed UTC+8
+        auth = fe.load_authorization()[0]
+        clean = fe.month_budget(auth, now)
+        self.assertEqual(clean["future_dated"], [])  # no entry anywhere
+        self.seed_reserved(-600, at=now - timedelta(minutes=5))  # in the 2026-11 file, dated after `now`
+        budget = fe.month_budget(auth, now)
+        self.assertEqual(budget["future_dated"], ["held0"])
+        self.assertEqual(fe.report(self.dir, budget)["month_budget"]["future_dated"], ["held0"])
+        for key in ("month", "committed_usd", "remaining_usd", "entries", "reserved", "orphaned"):
+            self.assertEqual(budget[key], clean[key], key)  # totals stay current-month
+
     def test_one_clock_sample_taken_inside_the_lock_drives_the_month_age_check_and_reserved_at(self):
         calls = []
         real_locked = fe.locked
