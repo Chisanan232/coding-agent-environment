@@ -76,13 +76,13 @@ RESERVED, SETTLED = "RESERVED", "SETTLED"
 # Text that must not reach a Fable prompt, nor be stored at `attempt`. First matching rule names the refusal.
 PAYLOAD_RULES = (
     ("secret", re.compile(r"(?i)(token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|credential|authorization)[\w-]*[\"'\]]*\s*[=:]"
-                          r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|github_pat_[A-Za-z0-9_]{20,}|gh[opusr]_[A-Za-z0-9]{20,}"
+                          r"|\bbearer\s+(?=[A-Za-z0-9._~+/=-]*[0-9._~+/=-])[A-Za-z0-9._~+/=-]{6,}|\b(?:password|passwd|passphrase|secret|token|api key)\s+(?:is|was)\s+\S+|sk_(?:live|test)_[A-Za-z0-9]{8,}|AIza[0-9A-Za-z_-]{35}|github_pat_[A-Za-z0-9_]{20,}|gh[opusr]_[A-Za-z0-9]{20,}"
                           r"|(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}|sk-ant-|AKIA[0-9A-Z]{16}|xox[abprs]-"
                           r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*|-----BEGIN |[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@"
                           r"|(?=[A-Za-z0-9+/=]*[0-9])[A-Za-z0-9+/=]{40,}")),
-    ("transcript", re.compile(r"(?m)^\s*(Human|Assistant):|\"role\"\s*:|\"type\"\s*:\s*\"(assistant|user|tool_use)\"|<system-reminder|"
+    ("transcript", re.compile(r"(?m)^\s*(Human|Assistant)\s*:|\"role\"\s*:|\"type\"\s*:\s*\"(assistant|user|tool_use)\"|<system-reminder|"
                               r"\.claude/projects/|\.jsonl\b")),
-    ("email", re.compile(r"(?i)(?<![\w.+-])(?!noreply@)[\w.+-]+@[\w-]+(?:\.[\w-]+)+")),
+    ("email", re.compile(r"(?i)(?<![\w.+-])(?!noreply@)[\w.+-]+@[A-Za-z0-9-]+(?:\.[\w-]+)*")),
 )
 
 
@@ -182,7 +182,31 @@ def receipt(directory, event, record, **detail):
 
 # --- circuit breaker ---------------------------------------------------------------------------------------------------
 
+def _shared_breaker_dir():
+    """The ledger directory (owner-governed, shared by every state directory), or None when no authorization names one."""
+    auth, _reason = load_authorization()
+    return auth["ledger_dir"] if auth else None
+
+
+def _read_breaker(path):
+    try:
+        with open(path) as fh:
+            state = json.load(fh)
+        return state if isinstance(state, dict) else {"open": True, "reason": "breaker_unreadable"}
+    except FileNotFoundError:
+        return {"open": False}
+    except (OSError, ValueError):
+        return {"open": True, "reason": "breaker_unreadable"}  # a corrupt shared breaker fails closed
+
+
 def breaker(directory):
+    """Open when either the per-state-directory breaker or the shared one (in the ledger directory, so a fresh state directory cannot
+    bypass it) is open. The shared one wins when both are."""
+    shared = _shared_breaker_dir()
+    if shared and os.path.isdir(shared):
+        state = _read_breaker(os.path.join(shared, "breaker.json"))
+        if state.get("open"):
+            return state
     try:
         with open(os.path.join(directory, "breaker.json")) as fh:
             return json.load(fh)
@@ -190,21 +214,38 @@ def breaker(directory):
         return {"open": False}
 
 
+def _write_shared_breaker(state):
+    """Best effort: write the breaker into the ledger directory under the ledger lock (lock order: state lock, then ledger lock)."""
+    auth, _reason = load_authorization()
+    if not auth:
+        return False
+    try:
+        ledger = ledger_dir_ready(auth["ledger_dir"])
+        with locked(ledger):
+            _write(os.path.join(ledger, "breaker.json"), state)
+    except (LedgerError, OSError):
+        return False
+    return True
+
+
 def trip(directory, reason, blocker_id, at):
     if breaker(directory).get("open"):
         return breaker(directory)  # keep the first reason
     state = {"open": True, "reason": reason, "blocker": blocker_id, "since": iso(at)}
-    _write(os.path.join(directory, "breaker.json"), state)
+    if not _write_shared_breaker(state):  # the shared breaker is the one that counts; the local file is only the fallback
+        _write(os.path.join(directory, "breaker.json"), state)
     receipt(directory, "breaker_open", {"id": blocker_id, "state": None}, reason=reason)
     return state
 
 
 def reset_breaker(directory, note, at):
-    """Owner action: nothing closes the breaker automatically."""
+    """Owner action: nothing closes the breaker automatically. Clears the per-directory and the shared breaker."""
     if not note or len(note.strip()) < 8:
         raise EscalationError("reset needs --note: why the route or the advice problem is resolved")
+    cleared = {"open": False, "reset_at": iso(at), "note": note.strip()[:200]}
     with locked(directory):
-        _write(os.path.join(directory, "breaker.json"), {"open": False, "reset_at": iso(at), "note": note.strip()[:200]})
+        _write(os.path.join(directory, "breaker.json"), cleared)
+        _write_shared_breaker(cleared)
         receipt(directory, "breaker_reset", {"id": None, "state": None}, note=note.strip()[:200])
 
 
@@ -253,7 +294,7 @@ def _number(value, label):
 
 def validate_authorization(obj):
     """Closed schema v1. Returns the normalized authorization with effective caps (file value, never above the script ceiling)."""
-    obj = _keys(obj, ("schema", "decision", "model", "billing_route", "retention", "scope", "caps", "ledger_dir"), "authorization")
+    obj = _keys(obj, ("schema", "decision", "model", "billing_route", "retention", "isolation", "scope", "caps", "ledger_dir"), "authorization")
     if obj["schema"] != AUTH_SCHEMA:
         raise ValueError(f"schema must be {AUTH_SCHEMA}")
     decision = _keys(obj["decision"], ("ticket", "date", "by", "ref"), "decision")
@@ -273,6 +314,12 @@ def validate_authorization(obj):
     confirmed = retention["confirmed_on"]
     if confirmed is not None and not (isinstance(confirmed, str) and DATE_RE.fullmatch(confirmed)):
         raise ValueError("retention.confirmed_on must be YYYY-MM-DD or null")
+    if retention["model_improvement_setting"] == "off" and confirmed is None:
+        raise ValueError("retention 'off' needs confirmed_on: the owner's attested date")
+    isolation = _keys(obj["isolation"], ("verified_on",), "isolation")
+    verified = isolation["verified_on"]
+    if verified is not None and not (isinstance(verified, str) and DATE_RE.fullmatch(verified)):
+        raise ValueError("isolation.verified_on must be YYYY-MM-DD or null")
     scope = _keys(obj["scope"], ("host_sha256", "repo_owners", "allowed_profiles"), "scope")
     if not isinstance(scope["host_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", scope["host_sha256"]):
         raise ValueError("scope.host_sha256 must be 64 lowercase hex characters")
@@ -292,6 +339,7 @@ def validate_authorization(obj):
     if not os.path.isabs(ledger) or os.path.commonpath([home, os.path.realpath(ledger)]) != home or os.path.realpath(ledger) == home:
         raise ValueError("ledger_dir must be an absolute path under the home directory")
     return {"retention": {"setting": retention["model_improvement_setting"], "confirmed_on": confirmed},
+            "isolation": {"verified_on": verified},
             "scope": {"host_sha256": scope["host_sha256"], "repo_owners": [x.strip().lower() for x in scope["repo_owners"]],
                       "allowed_profiles": list(scope["allowed_profiles"])},
             "caps": {"per_consult_usd": per, "monthly_usd": monthly}, "ledger_dir": ledger,
@@ -344,7 +392,13 @@ def origin_repo(cwd):
     if not remotes:
         return None
     found = GITHUB_REMOTE_RE.fullmatch(_git(top, "remote", "get-url", "origin" if "origin" in remotes else remotes[0]) or "")
-    return (found.group(1).lower(), found.group(2).lower()) if found else None
+    if not found:
+        return None
+    owner, repo = found.group(1).lower(), found.group(2).lower()
+    # "." and ".." name no repository, and a doubled `.git.git` suffix is ambiguous: both fail closed (so does ssh://...:22/).
+    if owner in (".", "..") or repo in (".", "..") or repo.endswith(".git"):
+        return None
+    return owner, repo
 
 
 def origin_owner(cwd):
@@ -368,7 +422,7 @@ def managed_session(cwd, allowed_profiles):
     if os.path.exists(MANAGED_SETTINGS):
         return True
     if not os.access(PROFILE_BIN, os.X_OK):
-        return False  # resolver absent: the presence check above is all there is
+        return True  # the resolver is how a company profile is recognised: without it the session cannot be shown to be personal
     try:
         proc = subprocess.run([PROFILE_BIN, "resolve", "--cwd", cwd], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
@@ -381,7 +435,7 @@ def managed_session(cwd, allowed_profiles):
     return found["name"] not in allowed_profiles
 
 
-EXPORT_MAX_ENTRIES, EXPORT_MAX_FILES, EXPORT_MAX_FILE_BYTES, EXPORT_MAX_TOTAL_BYTES = 50000, 20000, 1 << 20, 64 << 20
+EXPORT_MAX_ENTRIES, EXPORT_MAX_FILES, EXPORT_MAX_FILE_BYTES, EXPORT_MAX_TOTAL_BYTES = 50000, 10000, 512 << 10, 16 << 20
 EXPORT_DEADLINE_S = 120.0
 EXPORT_MAX_LISTING_BYTES = 16 << 20
 # Matched against EVERY path component, case-insensitively: credential-looking or tool-configuration names are never exported.
@@ -450,7 +504,7 @@ def export_tracked(cwd, dest):
     """Export the COMMITTED blobs (HEAD) of the repository holding `cwd` into `dest`; never reads the working tree or the index.
 
     Skipped: symlinks (mode 120000), submodules (160000), credential-looking names (any path component), files over 1 MB, and files whose
-    content has a NUL byte, is not strict UTF-8, or matches the secret rules. Returns (ok, content_hits): the paths skipped for content,
+    content has a NUL byte, is not strict UTF-8, or breaks any payload rule (secret, transcript marker, email). Returns (ok, content_hits): the paths skipped for content,
     which the caller checks against the prompt. Fail closed (ok False) on an unsafe tree path, on more than the allowed entries, files or
     bytes (judged from the listed sizes before any blob is read), on a git failure or when the overall deadline passes.
     Uncommitted, staged and untracked files are not exported. A repository with no commit exports nothing."""
@@ -467,7 +521,6 @@ def export_tracked(cwd, dest):
     root = os.path.realpath(dest)
     total = count = 0
     hits = []
-    secret_rule = PAYLOAD_RULES[0][1]
     for seen, row in enumerate(rows, 1):
         if seen > EXPORT_MAX_ENTRIES or time.monotonic() > deadline:
             return False, []
@@ -501,7 +554,7 @@ def export_tracked(cwd, dest):
         except UnicodeDecodeError:
             hits.append(name)
             continue
-        if secret_rule.search(text):
+        if any(pattern.search(text) for _name, pattern in PAYLOAD_RULES):  # secret, transcript marker or email: skipped and counted
             hits.append(name)
             continue
         target = os.path.join(root, name)
@@ -525,9 +578,10 @@ def isolation_verdict():
         text = ""
     flags = ("--setting-sources", "--permission-mode", "--disallowedTools")
     listed = all(f in text or f.lower().replace("tools", "-tools") in text.lower() for f in flags)
-    return {"cwd": "clean export of committed (HEAD) credential-free blobs only; no working-tree reads", "setting_sources": "project (the export has no .claude)",
-            "permission_mode": "dontAsk", "disallowed_tools": DISALLOWED_READS,
-            "cli_lists_flags": listed, "honoured_in_print_mode": "UNVERIFIED until the live case inspects the tool-use list"}
+    return {"cwd": "temporary export of committed (HEAD) credential-free blobs; a smaller working set, not a confinement (an absolute path is still readable unless a flag stops it)",
+            "setting_sources": "project (intended to leave user settings and ~/.claude/CLAUDE.md out; UNVERIFIED)",
+            "permission_mode": "dontAsk", "disallowed_tools": DISALLOWED_READS, "cli_lists_flags": listed,
+            "honoured_in_print_mode": "UNVERIFIED until the live-verification case inspects the stream-json tool-use list"}
 
 
 def authorize(target, cwd, path=None, root=None, retention=True):
@@ -552,6 +606,7 @@ def authorization_template(cwd):
                  "decision": {"ticket": AUTH_TICKET, "date": "2026-11-25", "by": "owner", "ref": "owner decision in chat 2026-11-25 (SPE-171)"},
                  "model": FABLE_MODEL, "billing_route": BILLING_ROUTE,
                  "retention": {"model_improvement_setting": "unconfirmed", "confirmed_on": None},
+                 "isolation": {"verified_on": None},
                  "scope": {"host_sha256": host_hash() or "", "repo_owners": [owner] if owner else [], "allowed_profiles": []},
                  "caps": {"per_consult_usd": 4, "monthly_usd": 40, "timezone": "Asia/Taipei"},
                  "ledger_dir": "~/.local/state/coding-agent-environment/fable-budget"}
@@ -559,7 +614,8 @@ def authorization_template(cwd):
     return {"install_path": AUTH_PATH, "candidate": candidate, "host_sha256": candidate["scope"]["host_sha256"] or None,
             "file_sha256": hashlib.sha256(text.encode()).hexdigest(),
             "file_sha256_of": "json.dumps(candidate, indent=2, sort_keys=True) followed by one newline",
-            "owner_steps": ["confirm the claude.ai 'help improve Claude' setting is OFF, then set retention.model_improvement_setting to "
+            "owner_steps": ["after the one deliberate `consult --live-verification` case passes its verdict, set isolation.verified_on to that date",
+                            "confirm the claude.ai 'help improve Claude' setting is OFF, then set retention.model_improvement_setting to "
                             "'off' and confirmed_on to that date",
                             "install the file yourself with mode 0600 in a directory only you can write; this script never writes it"]}
 
@@ -578,7 +634,8 @@ def authorization_check(cwd, target, at, path=None, root=None):
            "caps": auth["caps"]}
     if target:
         out["scope"]["target_repo"] = "owned" if repo_in_scope(target, cwd, owners) else "scope_repo_not_owned"
-    out["isolation"] = isolation_verdict()
+    out["isolation"] = {**isolation_verdict(), "verified_on": auth["isolation"]["verified_on"],
+                        "consults_enabled": auth["isolation"]["verified_on"] is not None}
     try:
         out["month_budget"] = month_budget(auth, at)
     except LedgerError:
@@ -608,6 +665,10 @@ def ledger_dir_ready(path, create=True):
     return path
 
 
+def _money(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
 def read_month(directory, month):
     path = os.path.join(directory, month + ".json")
     if not os.path.exists(path):
@@ -618,11 +679,12 @@ def read_month(directory, month):
         if not isinstance(data, dict) or data.get("month") != month or not isinstance(data.get("entries"), list):
             raise ValueError("bad shape")
         for e in data["entries"]:
-            if e["state"] not in (RESERVED, SETTLED) or not isinstance(e["reserved_usd"], (int, float)) or not isinstance(e["rid"], str):
+            if e["state"] not in (RESERVED, SETTLED) or not _money(e["reserved_usd"]) or not isinstance(e["rid"], str):
                 raise ValueError("bad entry")
-            if e["state"] == SETTLED and not isinstance(e["charged_usd"], (int, float)):
-                raise ValueError("bad charge")
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+            if e["state"] == SETTLED and not _money(e["charged_usd"]):
+                raise ValueError("bad charge")  # NaN, infinity, negative and non-numbers would all hide spend
+            parse(e["reserved_at"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         raise LedgerError(f"ledger for {month} is unreadable: {type(exc).__name__}")
     return data
 
@@ -682,8 +744,11 @@ def month_budget(auth, at):
     month = month_key(at)
     data = read_month(directory, month) if directory else {"month": month, "entries": []}
     spent = committed(data)
-    orphaned = [e["rid"] for e in data["entries"] if e["state"] == RESERVED
-                and (at - parse(e["reserved_at"])).total_seconds() > CONSULT_TIMEOUT_S]
+    try:
+        orphaned = [e["rid"] for e in data["entries"] if e["state"] == RESERVED
+                    and (at - parse(e["reserved_at"])).total_seconds() > CONSULT_TIMEOUT_S]
+    except ValueError as exc:
+        raise LedgerError(f"ledger timestamp unreadable: {exc}")
     return {"month": month, "committed_usd": spent, "monthly_usd": auth["caps"]["monthly_usd"],
             "remaining_usd": round(auth["caps"]["monthly_usd"] - spent, 6), "entries": len(data["entries"]),
             "reserved": sum(1 for e in data["entries"] if e["state"] == RESERVED), "orphaned": orphaned}
@@ -866,6 +931,18 @@ def attempt(directory, args, session_id, at, auth_path=None, auth_root=None):
     return out
 
 
+def _isolation_gate(bid, auth_path, auth_root):
+    """CONTINUE while the CLI's isolation flags are unverified (isolation.verified_on is null): no consult is offered. The one way
+    forward is the owner's single deliberate `consult --id X --execute --live-verification` case."""
+    auth, reason = load_authorization(auth_path, auth_root)
+    if reason:
+        return _continue(bid, reason)
+    if auth["isolation"]["verified_on"] is None:
+        return _continue(bid, "isolation_unverified", next=f"the owner or coordinator runs the one deliberate `consult --id {bid} --execute "
+                                                           "--live-verification` case, inspects its verdict and sets isolation.verified_on")
+    return None
+
+
 def _attempt(directory, args, session_id, at, auth_path, auth_root):
     target, check = args["target"], args["acceptance_check"]
     if not TARGET_RE.fullmatch(target or "") or not _norm(check):
@@ -906,8 +983,9 @@ def _attempt(directory, args, session_id, at, auth_path, auth_root):
             if state == READY and breaker(directory).get("open"):
                 return _continue(bid, "breaker_open: ready, but the circuit breaker is open: no consult")
             if state == READY:
-                return {"action": "CONSULT", "id": bid, "next": f"run `consult --id {bid} --execute` once, then implement and verify the "
-                                                                 "advice here and record `verdict`"}
+                gate = _isolation_gate(bid, auth_path, auth_root)
+                return gate or {"action": "CONSULT", "id": bid, "next": f"run `consult --id {bid} --execute` once, then implement and "
+                                                                          "verify the advice here and record `verdict`"}
             return _continue(bid, f"blocker already {state}: keep working on independent tasks")
         case = {"target": target, "acceptance_check": check, "blocker": held.get("blocker") or check, "attempts": held["attempts"],
                 "review": {"unresolved_architecture_disagreement": held["unresolved"], "positions": held["positions"]},
@@ -926,6 +1004,9 @@ def _attempt(directory, args, session_id, at, auth_path, auth_root):
         if reason:
             return _continue(bid, reason)
         _create_ready(directory, case, session_id, at, verdict)
+        gate = _isolation_gate(bid, auth_path, auth_root)
+        if gate:
+            return gate
     return {"action": "CONSULT", "id": bid, "next": f"run `consult --id {bid} --execute` once, then implement and verify the advice here "
                                                     "and record `verdict`; never ask the owner"}
 
@@ -953,12 +1034,67 @@ def consult_prompt(record):
             "Return: conclusion, the 3 strongest reasons, what would falsify it, what you could not verify.")
 
 
-def consult_argv(record, per_consult=PER_CONSULT_CEILING):
-    # Whether these flags are honoured in -p mode is unverified (docs/fable/escalation.md). The real confinement is the cwd: a clean
-    # export of tracked files, with no user settings source; the denies are defense in depth.
+def consult_argv(record, per_consult=PER_CONSULT_CEILING, live=False):
+    # Whether these flags are honoured in -p mode is UNVERIFIED (docs/fable/escalation.md): they are the controls, the export cwd only
+    # shrinks what is within reach. The live-verification case uses stream-json (which needs --verbose) so the tool-use list is saved.
+    fmt = ["--output-format", "stream-json", "--verbose"] if live else ["--output-format", "json"]
     return [claude_bin(), "-p", "--model", FABLE_MODEL, "--tools", "Read,Grep,Glob", "--disallowedTools", DISALLOWED_READS,
             "--permission-mode", "dontAsk", "--setting-sources", "project", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands", "--no-session-persistence",
-            "--max-budget-usd", client_cap(per_consult), "--output-format", "json"]
+            "--max-budget-usd", client_cap(per_consult), *fmt]
+
+
+def parse_stream(stdout):
+    """(result event, all events) of a `--output-format stream-json` run. ValueError when it has no result event."""
+    events = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+    results = [e for e in events if isinstance(e, dict) and e.get("type") == "result"]
+    if not results:
+        raise ValueError("no result event in the stream")
+    return results[-1], [e for e in events if isinstance(e, dict)]
+
+
+def save_stream(directory, blocker_id, stdout):
+    folder = os.path.join(directory, "verification")
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    path = os.path.join(folder, blocker_id + ".jsonl")
+    _write(path, stdout, text=True)
+    return path
+
+
+ALLOWED_TOOLS = ("Read", "Grep", "Glob")
+PATH_KEYS = ("file_path", "path", "pattern", "glob", "notebook_path")
+DENIED_PATH_RE = re.compile(r"(?i)(^|/)(\.env[^/]*|\.ssh|\.aws|\.gnupg|\.config|\.claude|\.codex)(/|$)|id_(rsa|dsa|ecdsa|ed25519)|\.(pem|key)$")
+
+
+def verification_verdict(events, export_root, saved_path):
+    """What the one live-verification run actually did, from its stream-json events. `pass` needs positive evidence on every line;
+    memory/CLAUDE.md loading that the stream does not show stays `unknown`, which is not a pass."""
+    root = os.path.realpath(export_root)
+    uses, outside, denied, other = [], [], [], []
+    memory = "unknown"
+    for e in events:
+        if e.get("type") == "system" and e.get("subtype") == "init":
+            keyed = {k: v for k, v in e.items() if "memory" in k.lower() or "claude_md" in k.lower()}
+            if keyed:
+                memory = any(bool(v) for v in keyed.values())
+        for block in (e.get("message") or {}).get("content") or [] if e.get("type") == "assistant" else []:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name, given = str(block.get("name")), block.get("input") if isinstance(block.get("input"), dict) else {}
+            uses.append({"tool": name, "input": {k: str(given[k])[:200] for k in PATH_KEYS if k in given}})
+            if name not in ALLOWED_TOOLS:
+                other.append(name)
+            for key in PATH_KEYS:
+                value = given.get(key)
+                if not isinstance(value, str):
+                    continue
+                if DENIED_PATH_RE.search(value):
+                    denied.append(value[:200])
+                expanded = os.path.expanduser(value)
+                if ".." in value.split("/") or (os.path.isabs(expanded) and os.path.commonpath([root, os.path.realpath(expanded)]) != root):
+                    outside.append(value[:200])
+    return {"tool_uses": uses, "non_allowed_tools": other, "outside_export": outside, "denied_path_access": denied,
+            "memory_or_claude_md_loaded": memory, "saved_stream": saved_path,
+            "pass": bool(not other and not outside and not denied and memory is False)}
 
 
 def check_route(result):
@@ -984,7 +1120,7 @@ def _reported_cost(result):
     return float(cost) if ok else None
 
 
-def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=None):
+def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=None, live_verification=False):
     with locked(directory):
         record = load(directory, blocker_id)
         if record["state"] != READY:
@@ -996,12 +1132,23 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
             return _refused(blocker_id, reason)
         if any(os.environ.get(name) for name in API_ENV):
             return _refused(blocker_id, "api_env_present")
+        unverified = auth["isolation"]["verified_on"] is None
+        if unverified and not live_verification:
+            return _refused(blocker_id, "isolation_unverified")
+        if live_verification and not unverified:
+            return _refused(blocker_id, "live_verification_not_needed")
         prompt = consult_prompt(record)
         rule = record_payload_violation(record)
         if rule:
             return _refused(blocker_id, f"ineligible_payload:{rule}")
+        # A hand-forged READY record must not skip the trigger: re-evaluate it from the stored facts (no state directory: that is this record).
+        again = evaluate({"target": record["target"], "acceptance_check": record["acceptance_check"], "blocker": record["blocker"],
+                          "attempts": record["attempts"], "review": record["review"], "cause": "none", "question": record["question"],
+                          "inputs_non_sensitive": True}, None)
+        if not again["eligible"]:
+            return _refused(blocker_id, "trigger_not_met")
         per = auth["caps"]["per_consult_usd"]
-        argv = consult_argv(record, per)
+        argv = consult_argv(record, per, live_verification)
         if not execute:
             return {"dry_run": True, "id": record["id"], "model": FABLE_MODEL, "argv": argv, "prompt_via": "stdin", "reserve_usd": per}
         try:
@@ -1035,11 +1182,15 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
         record["state"], record["consult_started"], record["reservation"] = CONSULTING, iso(at), {"rid": rid, "month": month}
         save(directory, record)
         receipt(directory, "consult_started", record, rid=rid, export_content_skipped=len(content_hits))
-    cost, problems = None, []
+    cost, problems, verification = None, [], None
     try:
         # The prompt goes on stdin so attempt text never appears in a process listing.
         proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, cwd=export.name, timeout=CONSULT_TIMEOUT_S)
-        result = json.loads(proc.stdout)
+        if live_verification:
+            result, events = parse_stream(proc.stdout)
+            verification = verification_verdict(events, export.name, save_stream(directory, record["id"], proc.stdout))
+        else:
+            result = json.loads(proc.stdout)
         if not isinstance(result, dict):
             raise ValueError("result is not a JSON object")
         cost = _reported_cost(result)
@@ -1082,8 +1233,13 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
         receipt(directory, "consulted", record, usd=cost)
         if overrun:  # the advice is kept, but a call that ran past its reservation stops further consults until the owner resets
             trip(directory, "cap_overrun", record["id"], settled_at)
-    return {"id": record["id"], "advice_path": advice, "usd_list_estimate": cost, "duration_ms": record["consult_ms"],
-            "next": "implement and verify in the original session, then run `verdict`"}
+    out = {"id": record["id"], "advice_path": advice, "usd_list_estimate": cost, "duration_ms": record["consult_ms"],
+           "next": "implement and verify in the original session, then run `verdict`"}
+    if verification is not None:
+        out["verification"] = verification
+        out["next"] = ("read the verification verdict and the saved stream; only if it passes, the owner sets isolation.verified_on in "
+                       "the authorization file")
+    return out
 
 
 # --- verdict / report --------------------------------------------------------------------------------------------------
@@ -1133,6 +1289,8 @@ def main(argv=None):
     s = sub.add_parser("consult")
     s.add_argument("--id", required=True)
     s.add_argument("--execute", action="store_true", help="without it: print the command shape only")
+    s.add_argument("--live-verification", action="store_true",
+                   help="the one deliberate case that verifies the CLI isolation flags: saves the stream-json tool-use list and prints a verdict")
     s.add_argument("--cwd", default=os.getcwd())
     s = sub.add_parser("verdict")
     s.add_argument("--id", required=True)
@@ -1183,7 +1341,7 @@ def main(argv=None):
                 case = json.load(fh)
             out = evaluate(case, directory)
         elif args.cmd == "consult":
-            out = consult(directory, args.id, args.execute, args.cwd, at)
+            out = consult(directory, args.id, args.execute, args.cwd, at, live_verification=args.live_verification)
         elif args.cmd == "verdict":
             out = verdict(directory, args.id, args.result,
                           {"rework_rounds": args.rework_rounds, "elapsed_s": args.elapsed_s, "usd": args.usd}, at)

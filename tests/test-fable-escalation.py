@@ -45,7 +45,7 @@ print(os.environ["FAKE_OUT"]); sys.exit(int(os.environ.get("FAKE_RC", "0")))
 # Runs the real CLI with the two host-specific probes pinned, so the CLI tests do not depend on the machine they run on.
 RUNNER = ("import sys, importlib.util as u\n"
           "s = u.spec_from_file_location('fe', sys.argv[1]); m = u.module_from_spec(s); s.loader.exec_module(m)\n"
-          f"m.host_hash = lambda: '{HOST}'; m.MANAGED_SETTINGS = '/nonexistent/managed-settings.json'; m.PROFILE_BIN = '/nonexistent/profile'\n"
+          f"m.host_hash = lambda: '{HOST}'; m.MANAGED_SETTINGS = '/nonexistent/managed-settings.json'; m.PROFILE_BIN = __import__('os').environ['FAKE_PROFILE_BIN']\n"
           "sys.exit(m.main(sys.argv[2:]))\n")
 
 
@@ -64,6 +64,7 @@ def valid_auth(home, **over):
             "decision": {"ticket": "SPE-171", "date": "2026-11-25", "by": "owner", "ref": "owner decision in chat"},
             "model": "claude-fable-5-2", "billing_route": "claude.ai-max-usage-credits-off",
             "retention": {"model_improvement_setting": "off", "confirmed_on": "2026-11-25"},
+            "isolation": {"verified_on": "2026-11-25"},
             "scope": {"host_sha256": HOST, "repo_owners": ["o"], "allowed_profiles": []},
             "caps": {"per_consult_usd": 4, "monthly_usd": 40, "timezone": "Asia/Taipei"},
             "ledger_dir": os.path.join(home, ".local", "state", "coding-agent-environment", "fable-budget")}
@@ -94,7 +95,13 @@ class Env(unittest.TestCase):
         # cannot land inside the 30 s version probe and look like a route failure.
         subprocess.run([self.bin, "--version"], capture_output=True, timeout=300, env=dict(os.environ, FAKE_VERSION="warm"))
         self.log = os.path.join(self.tmp.name, "calls.log")
-        self.env = {"FABLE_CLAUDE_BIN": self.bin, "FAKE_LOG": self.log, "FAKE_OUT": json.dumps(FABLE_OK), "HOME": self.home}
+        # A resolver that answers "no profile": a missing resolver now counts as company-managed.
+        self.profile_bin = os.path.join(self.tmp.name, "profile-resolver")
+        Path(self.profile_bin).write_text("#!/bin/sh\necho 'status=none name= root= overlay='\n")
+        os.chmod(self.profile_bin, 0o755)
+        subprocess.run([self.profile_bin], capture_output=True, timeout=300)
+        self.env = {"FABLE_CLAUDE_BIN": self.bin, "FAKE_LOG": self.log, "FAKE_OUT": json.dumps(FABLE_OK), "HOME": self.home,
+                    "FAKE_PROFILE_BIN": self.profile_bin}
         self.saved = {k: os.environ.get(k) for k in [*self.env, *fe.API_ENV, "FAKE_RC", "FAKE_VERSION", "FABLE_ESCALATION_DIR"]}
         for k in (*fe.API_ENV, "FAKE_RC", "FAKE_VERSION", "FABLE_ESCALATION_DIR"):
             os.environ.pop(k, None)
@@ -102,7 +109,7 @@ class Env(unittest.TestCase):
         self.patched = {k: getattr(fe, k) for k in ("host_hash", "MANAGED_SETTINGS", "PROFILE_BIN")}
         fe.host_hash = lambda: HOST
         fe.MANAGED_SETTINGS = os.path.join(self.tmp.name, "no-managed-settings.json")
-        fe.PROFILE_BIN = os.path.join(self.tmp.name, "no-profile-resolver")
+        fe.PROFILE_BIN = self.profile_bin
         self.repo = self.make_repo("repo", "https://github.com/o/r.git")
         self.write_auth()
         self.ledger = valid_auth(self.home)["ledger_dir"]
@@ -360,6 +367,17 @@ class Authorization(Env):
                 self.tearDown_state()
                 self.refused_at_attempt("authorization_invalid")
 
+    def test_off_without_a_confirmation_date_and_a_bad_isolation_block_are_invalid(self):
+        for obj in (valid_auth(self.home, retention={"model_improvement_setting": "off", "confirmed_on": None}),
+                    valid_auth(self.home, isolation={"verified_on": "yesterday"}), valid_auth(self.home, isolation={"verified_on": None, "x": 1})):
+            self.write_auth(obj)
+            self.tearDown_state()
+            self.refused_at_attempt("authorization_invalid")
+
+    def test_a_missing_profile_resolver_fails_closed(self):
+        fe.PROFILE_BIN = os.path.join(self.tmp.name, "no-such-resolver")
+        self.refused_at_attempt("managed_session")
+
     def test_duplicate_keys_in_the_file_are_invalid(self):
         Path(self.auth_path).write_text('{"schema": "fable-authorization/v1", "schema": "fable-authorization/v1"}')
         self.refused_at_attempt("authorization_invalid")
@@ -423,6 +441,12 @@ class Authorization(Env):
                 other = self.make_repo("trick", url)
                 self.assertEqual(fe.origin_repo(other), None)
                 self.assertEqual(self.two_attempts(cwd=other)["reason"], "scope_repo_not_owned")
+                subprocess.run(["rm", "-rf", other])
+        for url in ("https://github.com/o/r.git.git", "https://github.com/../r", "https://github.com/o/..", "https://github.com/./r",
+                    "ssh://git@github.com:22/o/r.git", "https://github.com/o/r.git/x"):
+            with self.subTest(url):
+                other = self.make_repo("edge", url)
+                self.assertIsNone(fe.origin_repo(other))
                 subprocess.run(["rm", "-rf", other])
         for url in ("https://github.com/o/r.git", "https://user:tok@github.com/o/r", "ssh://git@github.com/o/r.git", "git@github.com:O/R.git",
                     "https://github.com/o/r/"):
@@ -599,6 +623,11 @@ class Consult(Env):
         ok, names, hits = self.exported()
         self.assertEqual((names, hits), (["fine.py"], ["notes.py"]))
 
+    def test_files_with_transcript_markers_or_email_addresses_are_skipped_and_counted(self):
+        self.commit_files({"a.md": "Human: do it\nAssistant: ok\n", "b.txt": "write to bob@example.com\n", "c.py": "x = 1\n", "d.md": "ok\n"})
+        ok, names, hits = self.exported()
+        self.assertEqual((names, sorted(hits)), (["c.py", "d.md"], ["a.md", "b.txt"]))
+
     def test_a_prompt_that_names_a_file_with_a_secret_is_refused_before_any_reservation(self):
         self.commit_files({"locks/order.py": "token = 'abc'\n"})
         bid = self.ready(failure="AC3 deadlock in locks/order.py at step 4")
@@ -758,7 +787,7 @@ class Consult(Env):
             self.consult(bid)
         self.assertTrue(fe.breaker(self.dir)["open"])
         self.assertEqual(self.calls(), 0)
-        self.assertFalse(os.path.exists(self.ledger))
+        self.assertFalse(os.path.exists(os.path.join(self.ledger, fe.month_key(T0) + ".json")))  # nothing was reserved
 
     def test_a_consult_that_is_not_ready_is_refused(self):
         with self.assertRaises(fe.EscalationError):
@@ -906,6 +935,202 @@ class Budget(Env):
         self.assertIn("unavailable", fe.report(self.dir)["month_budget"])
 
 
+LOCK_WORKER = """
+import json, os, sys, time, importlib.util as u
+s = u.spec_from_file_location('fe', sys.argv[1]); fe = u.module_from_spec(s); s.loader.exec_module(fe)
+from datetime import datetime, timezone
+auth = {"ledger_dir": sys.argv[2], "caps": {"per_consult_usd": 4.0, "monthly_usd": 40.0}}
+while time.time() < float(sys.argv[4]):
+    pass
+try:
+    fe.ledger_reserve(auth, sys.argv[3], "proc", datetime(2026, 11, 17, 9, tzinfo=timezone.utc))
+    print("granted")
+except fe.Refusal as exc:
+    print(exc.reason)
+"""
+
+
+class SharedLedger(Env):
+    """Separate processes, separate state directories, one ledger: the ledger lock alone keeps the month's total honest."""
+    def trial(self, workers=24):
+        shutil_rm = subprocess.run(["rm", "-rf", self.ledger])
+        os.makedirs(self.ledger, mode=0o700, exist_ok=True)
+        go = time.time() + 3.0
+        procs = [subprocess.Popen([sys.executable, "-c", LOCK_WORKER, str(ROOT / "scripts/fable-escalation.py"), self.ledger,
+                                   f"{i:016x}", str(go)], stdout=subprocess.PIPE, text=True) for i in range(workers)]
+        outs = [p.communicate(timeout=120)[0].strip() for p in procs]
+        entries = json.loads(Path(self.ledger, fe.month_key(T0) + ".json").read_text())["entries"] if outs.count("granted") else []
+        return outs, entries
+
+    def test_many_processes_never_grant_more_than_ten_reservations_or_lose_a_write(self):
+        for _ in range(3):
+            outs, entries = self.trial()
+            self.assertEqual(outs.count("granted"), 10, outs)
+            self.assertEqual(set(outs) - {"granted"}, {"monthly_budget_exhausted"})
+            self.assertEqual(len(entries), 10)  # no lost write
+            self.assertEqual(len({e["blocker_id"] for e in entries}), 10)
+            self.assertLessEqual(sum(e["reserved_usd"] for e in entries), 40.0)
+            journal = Path(self.ledger, "journal.jsonl").read_text().splitlines()
+            self.assertEqual(len(journal), 10)
+
+    def test_a_breaker_opened_in_one_state_directory_blocks_every_other_one(self):
+        other = os.path.join(self.tmp.name, "fable-other")
+        os.makedirs(os.path.join(other, "advice"), mode=0o700)
+        bid = self.ready(directory=other)
+        fe.trip(self.dir, "route_failure", None, T0)
+        self.assertTrue(fe.breaker(other)["open"])
+        out = self.consult(bid, directory=other)
+        self.assertTrue(out["reason"].startswith("breaker_open"), out)
+        self.assertEqual(self.calls(), 0)
+        self.assertFalse(fe.evaluate(case(target="o/r#9", acceptance_check="AC9 new"), other)["eligible"])
+        fe.reset_breaker(other, "route re-verified by canary today", T0)
+        self.assertFalse(fe.breaker(self.dir)["open"])  # the owner's reset clears the shared breaker too
+        self.assertEqual(fe.attempt(other, self.args(approach="again"), "s", T0)["action"], "CONSULT")
+
+    def test_a_corrupt_shared_breaker_fails_closed(self):
+        os.makedirs(self.ledger, mode=0o700)
+        Path(self.ledger, "breaker.json").write_text("{corrupt")
+        self.assertTrue(fe.breaker(self.dir)["open"])
+
+
+class _Cli:
+    SCRIPT = str(ROOT / "scripts/fable-escalation.py")
+
+    def cli(self, *argv, rc=0):
+        env = dict(os.environ, FABLE_ESCALATION_DIR=self.dir)
+        proc = subprocess.run([sys.executable, "-c", RUNNER, self.SCRIPT, *argv], capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(proc.returncode, rc, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+
+class LedgerValidation(_Cli, Env):
+    def seeded_entry(self, **over):
+        entry = {"rid": "x1", "blocker_id": "b" * 16, "session": "s", "reserved_usd": 4.0, "state": "SETTLED", "charged_usd": 1.0, "basis": "x",
+                 "reserved_at": fe.iso(T0), "settled_at": fe.iso(T0)}
+        entry.update(over)
+        os.makedirs(self.ledger, mode=0o700, exist_ok=True)
+        Path(self.ledger, fe.month_key(T0) + ".json").write_text(json.dumps({"month": fe.month_key(T0), "entries": [entry]}))
+
+    def test_nan_negative_infinite_boolean_and_malformed_entries_refuse_and_never_call(self):
+        bad = ({"charged_usd": float("nan")}, {"charged_usd": -1000}, {"charged_usd": float("inf")}, {"reserved_usd": float("nan")},
+               {"reserved_usd": -4}, {"reserved_usd": True}, {"charged_usd": "1"}, {"reserved_at": "not a time"}, {"reserved_at": None},
+               {"state": "SETTLED", "charged_usd": None}, {"state": "WHAT"})
+        for over in bad:
+            with self.subTest(over):
+                self.tearDown()
+                self.setUp()
+                self.seeded_entry(**over)
+                out = self.consult(self.ready())
+                self.assertEqual((out["action"], out["reason"]), ("CONTINUE", "ledger_unreadable"))
+                self.assertEqual(self.calls(), 0)
+                self.assertFalse(fe.breaker(self.dir)["open"])
+                with self.assertRaises(fe.LedgerError):
+                    fe.month_budget(fe.load_authorization()[0], T0)
+
+    def test_report_through_the_cli_survives_a_corrupt_ledger(self):
+        self.seeded_entry(charged_usd=float("nan"))
+        self.assertEqual(self.cli("report")["month_budget"], {"error": "ledger_unreadable"})
+
+
+class LiveVerification(_Cli, Env):
+    def stream(self, tool_input=None, tool="Read", memory=None, cost=0.9):
+        init = {"type": "system", "subtype": "init"}
+        if memory is not None:
+            init["memory_paths"] = memory
+        use = {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": tool, "input": tool_input or {"file_path": "src/a.py"}}]}}
+        done = dict(FABLE_OK, type="result", total_cost_usd=cost)
+        os.environ["FAKE_OUT"] = "\n".join(json.dumps(e) for e in (init, use, done))
+
+    def unverified(self):
+        self.write_auth(isolation={"verified_on": None})
+
+    def test_while_isolation_is_unverified_attempt_never_returns_consult_but_the_blocker_is_recorded(self):
+        self.unverified()
+        out = self.two_attempts()
+        self.assertEqual((out["action"], out["reason"]), ("CONTINUE", "isolation_unverified"))
+        self.assertIn("--live-verification", out["next"])
+        self.assertEqual(fe.load(self.dir, out["id"])["state"], fe.READY)
+        again = fe.attempt(self.dir, self.args(approach="a third"), "s", T0)
+        self.assertEqual(again["reason"], "isolation_unverified")
+        self.assertEqual(self.calls(), 0)
+
+    def test_an_ordinary_consult_is_refused_while_unverified_and_reserves_nothing(self):
+        self.unverified()
+        bid = self.two_attempts()["id"]
+        out = self.consult(bid)
+        self.assertEqual(out["reason"], "isolation_unverified")
+        self.assertEqual(self.calls(), 0)
+        self.assertFalse(os.path.exists(os.path.join(self.ledger, fe.month_key(T0) + ".json")))
+
+    def test_the_live_verification_case_reserves_runs_stream_json_saves_the_tool_list_and_passes_with_positive_evidence(self):
+        self.unverified()
+        bid = self.two_attempts()["id"]
+        self.stream(memory=[])
+        out = fe.consult(self.dir, bid, True, self.repo, T0, live_verification=True)
+        verdict = out["verification"]
+        self.assertTrue(verdict["pass"], verdict)
+        self.assertEqual(verdict["tool_uses"][0]["tool"], "Read")
+        self.assertEqual(verdict["memory_or_claude_md_loaded"], False)
+        saved = verdict["saved_stream"]
+        self.assertEqual(stat.S_IMODE(os.stat(saved).st_mode), 0o600)
+        self.assertIn('"tool_use"', Path(saved).read_text())
+        argv = json.loads(Path(self.log).read_text().splitlines()[0])
+        self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
+        self.assertIn("--verbose", argv)
+        entry = self.month()["entries"][0]
+        self.assertEqual((entry["state"], entry["charged_usd"]), ("SETTLED", 0.9))  # the ledger and breaker still apply
+        self.assertEqual(fe.load(self.dir, bid)["state"], fe.CONSULTED)
+
+    def test_the_verdict_fails_on_outside_paths_other_tools_denied_paths_and_unproven_memory(self):
+        cases = (({"file_path": "/etc/passwd"}, "Read", [], "outside_export"), ({"file_path": "../x"}, "Read", [], "outside_export"),
+                 ({"file_path": "src/a.py"}, "Bash", [], "non_allowed_tools"), ({"file_path": ".env"}, "Read", [], "denied_path_access"),
+                 ({"file_path": "a/.ssh/id_rsa"}, "Read", [], "denied_path_access"), ({"file_path": "src/a.py"}, "Read", ["~/.claude/CLAUDE.md"], "memory"),
+                 ({"file_path": "src/a.py"}, "Read", None, "memory"))
+        for tool_input, tool, memory, key in cases:
+            with self.subTest(key, tool_input=tool_input):
+                self.tearDown()
+                self.setUp()
+                self.unverified()
+                bid = self.two_attempts()["id"]
+                self.stream(tool_input, tool, memory)
+                verdict = fe.consult(self.dir, bid, True, self.repo, T0, live_verification=True)["verification"]
+                self.assertFalse(verdict["pass"], verdict)
+                if key != "memory":
+                    self.assertTrue(verdict[key], verdict)
+
+    def test_live_verification_is_only_for_the_unverified_state_and_still_obeys_the_gates(self):
+        bid = self.ready()
+        self.assertEqual(fe.consult(self.dir, bid, True, self.repo, T0, live_verification=True)["reason"], "live_verification_not_needed")
+        self.tearDown()
+        self.setUp()
+        self.unverified()
+        bid = self.two_attempts()["id"]
+        fe.trip(self.dir, "route_failure", None, T0)
+        self.assertTrue(fe.consult(self.dir, bid, True, self.repo, T0, live_verification=True)["reason"].startswith("breaker_open"))
+        self.assertEqual(self.calls(), 0)
+
+    def test_the_cli_flag_and_the_check_verdict(self):
+        self.unverified()
+        bid = self.two_attempts()["id"]
+        os.environ["FAKE_OUT"] = "\n".join(json.dumps(e) for e in ({"type": "system", "subtype": "init", "memory_paths": []},
+                                                                    dict(FABLE_OK, type="result")))
+        out = self.cli("consult", "--id", bid, "--execute", "--live-verification", "--cwd", self.repo)
+        self.assertTrue(out["verification"]["pass"])
+        check = self.cli("authorization", "check")
+        self.assertEqual((check["isolation"]["verified_on"], check["isolation"]["consults_enabled"]), (None, False))
+
+    def test_a_forged_ready_record_cannot_skip_the_trigger(self):
+        bid = self.ready()
+        path = fe._record_path(self.dir, bid)
+        record = json.loads(Path(path).read_text())
+        record["attempts"] = record["attempts"][:1]
+        Path(path).write_text(json.dumps(record))
+        out = self.consult(bid)
+        self.assertEqual((out["action"], out["reason"]), ("CONTINUE", "trigger_not_met"))
+        self.assertEqual(self.calls(), 0)
+
+
+
 class BreakerAndFallback(Env):
     def failing(self, out, rc="0"):
         os.environ["FAKE_OUT"], os.environ["FAKE_RC"] = json.dumps(out), rc
@@ -1010,6 +1235,8 @@ class Payload(Env):
            ("transcript", '{"type":"tool_use"}'), ("transcript", "<system-reminder>x</system-reminder>"),
            ("transcript", "read ~/.claude/projects/p/s.jsonl"), ("transcript", "see run.jsonl"),
            ("email", "mail me at someone@example.com"),
+           ("secret", "sk_" + "live_abcdefgh1234"), ("secret", "AIza" + "x" * 35), ("secret", "the password is hunter2"), ("secret", "Bearer abc.def"),
+           ("transcript", "Human : hi"), ("email", "ssh user@localhost"),
            ("secret", '{"api_key": "abc"}'), ("secret", "'secret': 'x'"), ("secret", "token_value=abc"), ("secret", "password-hash: x"),
            ("secret", "Authorization: Bearer abcdefgh12345678"), ("secret", "sent Bearer abcdefgh12345678"),
            ("secret", "github_pat_" + "A1b2C3d4E5f6G7h8I9j0K1l2"), ("secret", "key sk-" + "proj_" + "abcdefghijklmnopqrstu"))
@@ -1323,9 +1550,11 @@ class RepoInvariants(unittest.TestCase):
             self.assertEqual(proc.returncode, 2, name)  # argparse: invalid choice
 
     def test_no_scheduler_hook_or_workflow_calls_consult(self):
-        for path in list((ROOT / ".github").rglob("*")) + list((ROOT / ".claude").rglob("*")):
-            if path.is_file():
-                self.assertNotIn("fable-escalation.py consult", path.read_text(errors="ignore"), str(path))
+        scanned = [path for name in (".github", ".claude", "codex", "bin", "profiles", "scripts") if (ROOT / name).is_dir()
+                   for path in (ROOT / name).rglob("*") if path.is_file() and ".git" not in path.parts]
+        self.assertTrue(any(p.name == "fable-escalation.py" for p in scanned))
+        for path in scanned:
+            self.assertNotIn("fable-escalation.py consult", path.read_text(errors="ignore"), str(path))
 
     def test_no_default_setting_or_agent_enables_fable(self):
         for path in (ROOT / ".claude").rglob("*"):
