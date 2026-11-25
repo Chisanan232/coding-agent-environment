@@ -1024,6 +1024,25 @@ class Budget(Env):
         self.seed_reserved(-(fe.FUTURE_SKEW_S + 1))
         self.assertEqual(self.consult(bid)["reason"], "ledger_unreadable")
 
+    def test_the_skew_allowance_is_exactly_120_seconds_and_its_boundary_is_inclusive(self):
+        self.assertEqual(fe.FUTURE_SKEW_S, 120)
+        bid = self.ready()
+        self.seed_reserved(-120)  # exactly at the allowance: still a fresh in-flight reservation
+        self.assertEqual(self.consult(bid)["reason"], "consult_in_flight")
+        self.seed_reserved(-121)  # one second past it: corrupt
+        self.assertEqual(self.consult(bid)["reason"], "ledger_unreadable")
+        self.assertEqual(self.calls(), 0)
+
+    def test_a_future_dated_reservation_in_the_previous_month_file_is_refused_across_the_month_boundary(self):
+        now = datetime(2026, 11, 30, 16, 3, tzinfo=timezone.utc)  # 2026-12-01 00:03 in fixed UTC+8
+        auth = fe.load_authorization()[0]
+        self.assertNotEqual(fe.month_key(now), fe.month_key(now - timedelta(minutes=10)))
+        self.seed_reserved(-600, at=now - timedelta(minutes=5))  # lives in the 2026-11 file, dated 5 minutes after `now`
+        self.assertTrue(os.path.exists(os.path.join(self.ledger, "2026-11.json")))
+        with self.assertRaises(fe.LedgerError):
+            fe.ledger_reserve(auth, "d" * 16, "s", now)
+        self.assertFalse(os.path.exists(os.path.join(self.ledger, "2026-12.json")))  # nothing was reserved
+
     def test_month_budget_and_report_list_future_dated_entries_without_crashing(self):
         self.seed_reserved(-7200)
         auth = fe.load_authorization()[0]
@@ -1378,6 +1397,26 @@ class LiveVerification(_Cli, Env):
         self.assertEqual(json.loads(Path(self.marker()).read_text())["blocker"], bid)
         self.assertEqual(len(self.month()["entries"]), 1)
         self.assertEqual(self.calls(), 1)
+
+    def test_a_failed_ledger_write_or_journal_after_the_claim_gives_the_marker_back_and_makes_no_call(self):
+        real_write = fe._write
+
+        def failing_month_write(path, *a, **kw):
+            if os.path.basename(path).endswith(".json") and os.path.basename(path)[:4].isdigit():
+                raise OSError("disk full")
+            return real_write(path, *a, **kw)
+        for label, patcher in (("write", mock.patch.object(fe, "_write", failing_month_write)),
+                               ("journal", mock.patch.object(fe, "_journal", side_effect=OSError("disk full")))):
+            with self.subTest(label):
+                self.tearDown()
+                self.setUp()
+                bid = self.authorized_blocker()
+                os.environ["FAKE_LIVE"] = "good"
+                with patcher:
+                    out = self.live(bid)
+                self.assertEqual(out["reason"], "ledger_unreadable", out)
+                self.assertFalse(os.path.exists(self.marker()))
+                self.assertEqual(self.calls(), 0)
 
     def test_an_already_used_case_reserves_nothing(self):
         bid = self.authorized_blocker()
