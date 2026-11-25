@@ -846,10 +846,16 @@ def month_budget(auth, at):
                     and (at - parse(e["reserved_at"])).total_seconds() > CONSULT_TIMEOUT_S]
     except ValueError as exc:
         raise LedgerError(f"ledger timestamp unreadable: {exc}")
+    # Same straddle condition as ledger_reserve: a future-dated entry in the previous month's file refuses a reservation, so it must
+    # be listed here too. Only `future_dated` looks at that file; the totals above stay current-month.
+    held = future_dated(data["entries"], at)
+    earlier = month_key(at - timedelta(seconds=CONSULT_TIMEOUT_S + IN_FLIGHT_GRACE_S))
+    if directory and earlier != month:
+        held = future_dated(read_month(directory, earlier)["entries"], at) + held
     return {"month": month, "committed_usd": spent, "monthly_usd": auth["caps"]["monthly_usd"],
             "remaining_usd": round(auth["caps"]["monthly_usd"] - spent, 6), "entries": len(data["entries"]),
             "reserved": sum(1 for e in data["entries"] if e["state"] == RESERVED), "orphaned": orphaned,
-            "future_dated": future_dated(data["entries"], at)}
+            "future_dated": held}
 
 
 # --- eligibility -------------------------------------------------------------------------------------------------------
