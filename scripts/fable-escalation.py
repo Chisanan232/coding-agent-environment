@@ -25,6 +25,7 @@ import math
 import os
 import re
 import secrets
+import select
 import stat
 import subprocess
 import sys
@@ -382,6 +383,7 @@ def managed_session(cwd, allowed_profiles):
 
 EXPORT_MAX_ENTRIES, EXPORT_MAX_FILES, EXPORT_MAX_FILE_BYTES, EXPORT_MAX_TOTAL_BYTES = 50000, 20000, 1 << 20, 64 << 20
 EXPORT_DEADLINE_S = 120.0
+EXPORT_MAX_LISTING_BYTES = 16 << 20
 # Matched against EVERY path component, case-insensitively: credential-looking or tool-configuration names are never exported.
 EXPORT_SKIP = re.compile(r"(?i)^\.env|\.env($|\.)|^\.(claude|codex|aws|ssh|gnupg|config|npmrc|netrc|pypirc|git-credentials|git)$"
                          r"|^id_(rsa|dsa|ecdsa|ed25519)|\.(pem|key|p12|pfx|jks|keystore|kdbx)$"
@@ -409,6 +411,41 @@ def _read_blob(top, sha, size, env):
     return data
 
 
+def _stream_listing(top, env, deadline):
+    """Rows of `git ls-tree -r -l -z HEAD`, read in bounded chunks. None (git killed and reaped) when the listing passes the entry cap, the
+    byte cap or the deadline, or when git fails: the cap applies while the data arrives, not after it is all in memory."""
+    proc = subprocess.Popen(["git", "-C", top, "ls-tree", "-r", "-l", "-z", "--full-tree", "HEAD"], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, env=env)
+    rows, pending, received = [], b"", 0
+    try:
+        fd = proc.stdout.fileno()
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], min(left, 1.0))[0]:
+                if left <= 0:
+                    return None
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            received += len(chunk)
+            pending += chunk
+            *done, pending = pending.split(b"\0")
+            rows.extend(done)
+            if received > EXPORT_MAX_LISTING_BYTES or len(rows) > EXPORT_MAX_ENTRIES or len(pending) > 8192:
+                return None
+        if pending:
+            return None  # the listing must end on a NUL terminator
+        return [r.decode() for r in rows if r] if proc.wait(timeout=10) == 0 else None
+    except (OSError, ValueError, UnicodeDecodeError, subprocess.SubprocessError):
+        return None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.stdout.close()
+        proc.wait()
+
+
 def export_tracked(cwd, dest):
     """Export the COMMITTED blobs (HEAD) of the repository holding `cwd` into `dest`; never reads the working tree or the index.
 
@@ -424,13 +461,8 @@ def export_tracked(cwd, dest):
     if _git(top, "rev-parse", "--verify", "-q", "HEAD^{commit}") is None:
         return True, []
     deadline = time.monotonic() + EXPORT_DEADLINE_S
-    try:
-        listing = subprocess.run(["git", "-C", top, "ls-tree", "-r", "-l", "-z", "--full-tree", "HEAD"], capture_output=True,
-                                 timeout=max(1.0, EXPORT_DEADLINE_S), env=env)
-        if listing.returncode != 0:
-            return False, []
-        rows = [r for r in listing.stdout.decode().split("\0") if r]
-    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+    rows = _stream_listing(top, env, deadline)
+    if rows is None:
         return False, []
     root = os.path.realpath(dest)
     total = count = 0

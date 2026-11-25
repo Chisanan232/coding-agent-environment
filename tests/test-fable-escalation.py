@@ -613,14 +613,23 @@ class Consult(Env):
         self.commit_files({"ok.py": "x = 1"})
         sha = subprocess.run(["git", "-C", self.repo, "rev-parse", "HEAD:ok.py"], capture_output=True, text=True).stdout.strip()
         listing = "".join(f"{mode} blob {sha} {size:>7}\t{name}\0" for mode, size, name in rows).encode()
-        real = subprocess.run
+        ok, names, hits = self.run_export(listing)
+        return ok, names, hits
 
-        def run(argv, *a, **kw):
+    def run_export(self, listing=None, script=None):
+        """export_tracked with `git ls-tree` replaced by a child that prints `listing` (or runs `script`); other git calls are real."""
+        real = subprocess.Popen
+        self.children = []
+
+        def popen(argv, *a, **kw):
             if "ls-tree" in argv:
-                return subprocess.CompletedProcess(argv, 0, listing, b"")
-            return real(argv, *a, **kw)
+                code = script or "import sys; sys.stdout.buffer.write(%r)" % (listing,)
+                argv = [sys.executable, "-c", code]
+            proc = real(argv, *a, **kw)
+            self.children.append(proc)
+            return proc
         dest = tempfile.mkdtemp(dir=self.tmp.name)
-        with mock.patch.object(fe.subprocess, "run", side_effect=run):
+        with mock.patch.object(fe.subprocess, "Popen", side_effect=popen):
             ok, hits = fe.export_tracked(self.repo, dest)
         names = sorted(os.path.relpath(os.path.join(d, f), dest) for d, _, fs in os.walk(dest) for f in fs)
         return ok, names, hits
@@ -676,6 +685,44 @@ class Consult(Env):
         finally:
             fe._read_blob = real_read
             (fe.EXPORT_MAX_ENTRIES, fe.EXPORT_MAX_FILES, fe.EXPORT_MAX_TOTAL_BYTES, fe.EXPORT_MAX_FILE_BYTES, fe.EXPORT_DEADLINE_S) = saved
+
+    def test_an_endless_or_oversized_listing_is_cut_off_while_streaming_and_the_child_is_reaped(self):
+        endless = "import sys\nrow = b'100644 blob ' + b'a' * 40 + b'      5\\tf.py\\0'\nwhile True:\n    sys.stdout.buffer.write(row * 1000); sys.stdout.buffer.flush()\n"
+        saved = (fe.EXPORT_MAX_ENTRIES, fe.EXPORT_MAX_LISTING_BYTES)
+        try:
+            self.commit_files({"ok.py": "x = 1"})
+            fe.EXPORT_MAX_ENTRIES = 10**9  # only the byte cap can stop it
+            fe.EXPORT_MAX_LISTING_BYTES = 200000
+            start = time.monotonic()
+            dest = tempfile.mkdtemp(dir=self.tmp.name)
+            self.assertEqual(self.run_with(endless, dest), False)
+            self.assertLess(time.monotonic() - start, 30)
+            self.assertTrue(all(c.poll() is not None for c in self.children))  # killed and reaped
+            fe.EXPORT_MAX_ENTRIES, fe.EXPORT_MAX_LISTING_BYTES = 50, 10**9  # now only the entry cap
+            self.assertEqual(self.run_with(endless, tempfile.mkdtemp(dir=self.tmp.name)), False)
+            self.assertTrue(all(c.poll() is not None for c in self.children))
+            fe.EXPORT_MAX_ENTRIES, fe.EXPORT_MAX_LISTING_BYTES = saved[0], 10**9
+            fe.EXPORT_DEADLINE_S, old = 1.0, fe.EXPORT_DEADLINE_S  # a listing that stalls hits the deadline
+            try:
+                self.assertEqual(self.run_with("import time; time.sleep(60)", tempfile.mkdtemp(dir=self.tmp.name)), False)
+            finally:
+                fe.EXPORT_DEADLINE_S = old
+            self.assertTrue(all(c.poll() is not None for c in self.children))
+        finally:
+            fe.EXPORT_MAX_ENTRIES, fe.EXPORT_MAX_LISTING_BYTES = saved
+
+    def run_with(self, script, dest):
+        self.children = []
+        real = subprocess.Popen
+
+        def popen(argv, *a, **kw):
+            if "ls-tree" in argv:
+                argv = [sys.executable, "-c", script]
+            proc = real(argv, *a, **kw)
+            self.children.append(proc)
+            return proc
+        with mock.patch.object(fe.subprocess, "Popen", side_effect=popen):
+            return fe.export_tracked(self.repo, dest)[0]
 
     def test_a_blob_larger_than_its_listed_size_fails_the_export(self):
         self.assertFalse(self.crafted([("100644", 2, "ok2.py")])[0])  # the real blob is 5 bytes
