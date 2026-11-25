@@ -38,6 +38,8 @@ from importlib.util import module_from_spec, spec_from_file_location
 FABLE_MODEL = "claude-fable-5-2"
 MIN_CLAUDE = (2, 1, 321)  # Fable 5.2 needs this Claude Code version or later (runbook)
 CONSULT_TIMEOUT_S = 540
+# A RESERVED entry younger than timeout + grace is a consult presumed in flight; older ones are orphans (counted, not blocking).
+IN_FLIGHT_GRACE_S = 60
 PER_CONSULT_CEILING = 4.0  # USD; the script ceiling, whatever the authorization file says
 MONTHLY_CEILING = 40.0
 CONSULT_BUDGET_USD = "4"  # kept for the estimate's cap_usd: the reservation, not the client cap
@@ -768,6 +770,10 @@ def ledger_reserve(auth, blocker_id, session, at):
         data = read_month(directory, month)
         if any(e.get("blocker_id") == blocker_id for e in data["entries"]):
             raise Refusal("blocker_already_reserved_this_month")
+        # Serialize consults host-wide: the client budget cap is only checked between turns, so one in flight bounds the overshoot.
+        if any(e["state"] == RESERVED and (at - parse(e["reserved_at"])).total_seconds() <= CONSULT_TIMEOUT_S + IN_FLIGHT_GRACE_S
+               for e in data["entries"]):
+            raise Refusal("consult_in_flight")
         if round(committed(data) + per, 6) > auth["caps"]["monthly_usd"]:
             raise Refusal("monthly_budget_exhausted")
         rid = secrets.token_hex(8)
