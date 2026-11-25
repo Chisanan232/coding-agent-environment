@@ -75,14 +75,14 @@ RESERVED, SETTLED = "RESERVED", "SETTLED"
 
 # Text that must not reach a Fable prompt, nor be stored at `attempt`. First matching rule names the refusal.
 PAYLOAD_RULES = (
-    ("secret", re.compile(r"(?i)(token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|credential|authorization)[\w-]*[\"'\]]*\s*[=:]"
-                          r"|\bbearer\s+(?=[A-Za-z0-9._~+/=-]*[0-9._~+/=-])[A-Za-z0-9._~+/=-]{6,}|\b(?:password|passwd|passphrase|secret|token|api key)\s+(?:is|was)\s+\S+|sk_(?:live|test)_[A-Za-z0-9]{8,}|AIza[0-9A-Za-z_-]{35}|github_pat_[A-Za-z0-9_]{20,}|gh[opusr]_[A-Za-z0-9]{20,}"
+    ("secret", re.compile(r"(?i)(token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|credential|authorization)[\w-]{0,40}[\"'\]]*\s{0,20}[=:]"
+                          r"|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|\bbearer\s+(?=[A-Za-z0-9._~+/=-]*[0-9._~+/=-])[A-Za-z0-9._~+/=-]{6,}|\b(?:password|passwd|passphrase|secret|token|api key)\s+(?:is|was)\s+\S+|sk_(?:live|test)_[A-Za-z0-9]{8,}|AIza[0-9A-Za-z_-]{35}|github_pat_[A-Za-z0-9_]{20,}|gh[opusr]_[A-Za-z0-9]{20,}"
                           r"|(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}|sk-ant-|AKIA[0-9A-Z]{16}|xox[abprs]-"
-                          r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*|-----BEGIN |[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@"
-                          r"|(?=[A-Za-z0-9+/=]*[0-9])[A-Za-z0-9+/=]{40,}")),
-    ("transcript", re.compile(r"(?m)^\s*(Human|Assistant)\s*:|\"role\"\s*:|\"type\"\s*:\s*\"(assistant|user|tool_use)\"|<system-reminder|"
+                          r"|eyJ[A-Za-z0-9_-]{8,1500}\.[A-Za-z0-9_-]{8,1500}\.[A-Za-z0-9_-]*|-----BEGIN |(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@"
+                          r"|(?<![A-Za-z0-9+/=])(?=[A-Za-z0-9+/=]*[0-9])[A-Za-z0-9+/=]{40,}")),
+    ("transcript", re.compile(r"(?m)^[ \t]*(Human|Assistant)[ \t]*:|\"role\"\s*:|\"type\"\s*:\s*\"(assistant|user|tool_use)\"|<system-reminder|"
                               r"\.claude/projects/|\.jsonl\b")),
-    ("email", re.compile(r"(?i)(?<![\w.+-])(?!noreply@)[\w.+-]+@[A-Za-z0-9-]+(?:\.[\w-]+)*")),
+    ("email", re.compile(r"(?i)(?<![\w.+-])(?!noreply@)[\w.+-]+@[\w-]+(?:\.[\w-]+)*")),
 )
 
 
@@ -251,14 +251,33 @@ def reset_breaker(directory, note, at):
 
 # --- payload minimization ----------------------------------------------------------------------------------------------
 
+MAX_LINE_CHARS = 4096
+
+
 def payload_violation(text):
-    """Name of the first rule the text breaks (secret, transcript, email, size), or None. Offline and deterministic."""
+    """Name of the first rule the text breaks (secret, transcript, email, size), or None. Offline and deterministic.
+
+    Text over the prompt size cap is refused before any pattern runs, so no pattern ever sees an unbounded input."""
     text = str(text or "")
+    if len(text.encode()) > MAX_PROMPT_BYTES:
+        return "size"
     for name, pattern in PAYLOAD_RULES:
         if pattern.search(text):
             return name
-    if len(text.encode()) > MAX_PROMPT_BYTES:
-        return "size"
+    return None
+
+
+def scan_content(text, deadline):
+    """Name of the first payload rule broken by `text`, scanning line by line so no pattern backtracks across newlines, treating an
+    over-long line as a hit and checking the deadline on every line. TimeoutError past the deadline (the export fails closed)."""
+    for line in text.split("\n"):
+        if time.monotonic() > deadline:
+            raise TimeoutError("content scan passed the export deadline")
+        if len(line) > MAX_LINE_CHARS:
+            return "long_line"
+        for name, pattern in PAYLOAD_RULES:
+            if pattern.search(line):
+                return name
     return None
 
 
@@ -316,7 +335,10 @@ def validate_authorization(obj):
         raise ValueError("retention.confirmed_on must be YYYY-MM-DD or null")
     if retention["model_improvement_setting"] == "off" and confirmed is None:
         raise ValueError("retention 'off' needs confirmed_on: the owner's attested date")
-    isolation = _keys(obj["isolation"], ("verified_on",), "isolation")
+    isolation = _keys(obj["isolation"], ("verified_on", "live_verification_blocker"), "isolation")
+    live_blocker = isolation["live_verification_blocker"]
+    if live_blocker is not None and not (isinstance(live_blocker, str) and ID_RE.fullmatch(live_blocker)):
+        raise ValueError("isolation.live_verification_blocker must be a 16-hex blocker id or null")
     verified = isolation["verified_on"]
     if verified is not None and not (isinstance(verified, str) and DATE_RE.fullmatch(verified)):
         raise ValueError("isolation.verified_on must be YYYY-MM-DD or null")
@@ -339,7 +361,7 @@ def validate_authorization(obj):
     if not os.path.isabs(ledger) or os.path.commonpath([home, os.path.realpath(ledger)]) != home or os.path.realpath(ledger) == home:
         raise ValueError("ledger_dir must be an absolute path under the home directory")
     return {"retention": {"setting": retention["model_improvement_setting"], "confirmed_on": confirmed},
-            "isolation": {"verified_on": verified},
+            "isolation": {"verified_on": verified, "live_verification_blocker": live_blocker},
             "scope": {"host_sha256": scope["host_sha256"], "repo_owners": [x.strip().lower() for x in scope["repo_owners"]],
                       "allowed_profiles": list(scope["allowed_profiles"])},
             "caps": {"per_consult_usd": per, "monthly_usd": monthly}, "ledger_dir": ledger,
@@ -504,7 +526,7 @@ def export_tracked(cwd, dest):
     """Export the COMMITTED blobs (HEAD) of the repository holding `cwd` into `dest`; never reads the working tree or the index.
 
     Skipped: symlinks (mode 120000), submodules (160000), credential-looking names (any path component), files over 1 MB, and files whose
-    content has a NUL byte, is not strict UTF-8, or breaks any payload rule (secret, transcript marker, email). Returns (ok, content_hits): the paths skipped for content,
+    content has a NUL byte, is not strict UTF-8, or breaks any payload rule (secret, transcript marker, email) on any line. Returns (ok, content_hits): the paths skipped for content,
     which the caller checks against the prompt. Fail closed (ok False) on an unsafe tree path, on more than the allowed entries, files or
     bytes (judged from the listed sizes before any blob is read), on a git failure or when the overall deadline passes.
     Uncommitted, staged and untracked files are not exported. A repository with no commit exports nothing."""
@@ -554,7 +576,11 @@ def export_tracked(cwd, dest):
         except UnicodeDecodeError:
             hits.append(name)
             continue
-        if any(pattern.search(text) for _name, pattern in PAYLOAD_RULES):  # secret, transcript marker or email: skipped and counted
+        try:
+            broken = scan_content(text, deadline)  # secret, transcript marker, email or an over-long line: skipped and counted
+        except TimeoutError:
+            return False, []
+        if broken:
             hits.append(name)
             continue
         target = os.path.join(root, name)
@@ -606,7 +632,7 @@ def authorization_template(cwd):
                  "decision": {"ticket": AUTH_TICKET, "date": "2026-11-25", "by": "owner", "ref": "owner decision in chat 2026-11-25 (SPE-171)"},
                  "model": FABLE_MODEL, "billing_route": BILLING_ROUTE,
                  "retention": {"model_improvement_setting": "unconfirmed", "confirmed_on": None},
-                 "isolation": {"verified_on": None},
+                 "isolation": {"verified_on": None, "live_verification_blocker": None},
                  "scope": {"host_sha256": host_hash() or "", "repo_owners": [owner] if owner else [], "allowed_profiles": []},
                  "caps": {"per_consult_usd": 4, "monthly_usd": 40, "timezone": "Asia/Taipei"},
                  "ledger_dir": "~/.local/state/coding-agent-environment/fable-budget"}
@@ -614,7 +640,8 @@ def authorization_template(cwd):
     return {"install_path": AUTH_PATH, "candidate": candidate, "host_sha256": candidate["scope"]["host_sha256"] or None,
             "file_sha256": hashlib.sha256(text.encode()).hexdigest(),
             "file_sha256_of": "json.dumps(candidate, indent=2, sort_keys=True) followed by one newline",
-            "owner_steps": ["after the one deliberate `consult --live-verification` case passes its verdict, set isolation.verified_on to that date",
+            "owner_steps": ["to allow the one live-verification case, set isolation.live_verification_blocker to the READY blocker id the agent reports (the agent cannot choose it)",
+                            "after the one deliberate `consult --live-verification` case passes its verdict, set isolation.verified_on to that date",
                             "confirm the claude.ai 'help improve Claude' setting is OFF, then set retention.model_improvement_setting to "
                             "'off' and confirmed_on to that date",
                             "install the file yourself with mode 0600 in a directory only you can write; this script never writes it"]}
@@ -635,7 +662,9 @@ def authorization_check(cwd, target, at, path=None, root=None):
     if target:
         out["scope"]["target_repo"] = "owned" if repo_in_scope(target, cwd, owners) else "scope_repo_not_owned"
     out["isolation"] = {**isolation_verdict(), "verified_on": auth["isolation"]["verified_on"],
-                        "consults_enabled": auth["isolation"]["verified_on"] is not None}
+                        "consults_enabled": auth["isolation"]["verified_on"] is not None,
+                        "live_verification_blocker": auth["isolation"]["live_verification_blocker"],
+                        "live_verification_used": os.path.exists(os.path.join(auth["ledger_dir"], LIVE_MARKER))}
     try:
         out["month_budget"] = month_budget(auth, at)
     except LedgerError:
@@ -931,6 +960,27 @@ def attempt(directory, args, session_id, at, auth_path=None, auth_root=None):
     return out
 
 
+LIVE_MARKER = "live-verification.json"
+
+
+def _claim_live_verification(auth, directory, blocker_id, at):
+    """Host-wide one-shot: create the marker (exclusively, under the ledger lock) BEFORE the call. Refuses when it already exists or any
+    earlier verification record exists. A later refusal or failure does not give the case back: the owner deletes the marker by hand."""
+    ledger = ledger_dir_ready(auth["ledger_dir"])
+    with locked(ledger):
+        folder = os.path.join(directory, "verification")
+        if os.path.exists(os.path.join(ledger, LIVE_MARKER)) or (os.path.isdir(folder) and os.listdir(folder)):
+            raise Refusal("live_verification_already_used")
+        try:
+            fd = os.open(os.path.join(ledger, LIVE_MARKER), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                json.dump({"blocker": blocker_id, "at": iso(at)}, fh)
+        except FileExistsError:
+            raise Refusal("live_verification_already_used")
+        except OSError as exc:
+            raise LedgerError(str(exc))
+
+
 def _isolation_gate(bid, auth_path, auth_root):
     """CONTINUE while the CLI's isolation flags are unverified (isolation.verified_on is null): no consult is offered. The one way
     forward is the owner's single deliberate `consult --id X --execute --live-verification` case."""
@@ -1063,38 +1113,110 @@ def save_stream(directory, blocker_id, stdout):
 ALLOWED_TOOLS = ("Read", "Grep", "Glob")
 PATH_KEYS = ("file_path", "path", "pattern", "glob", "notebook_path")
 DENIED_PATH_RE = re.compile(r"(?i)(^|/)(\.env[^/]*|\.ssh|\.aws|\.gnupg|\.config|\.claude|\.codex)(/|$)|id_(rsa|dsa|ecdsa|ed25519)|\.(pem|key)$")
+DENIAL_RE = re.compile(r"(?i)permission|denied|not allowed|blocked|disallowed|don't have|not permitted|forbidden")
+HOME_DENIED_PROBES = ("~/.ssh/id_rsa", "~/.config/fable-verify-probe", "~/.claude/CLAUDE.md")
+INSIDE_PROBE = "fable-verify-inside.txt"
 
 
-def verification_verdict(events, export_root, saved_path):
-    """What the one live-verification run actually did, from its stream-json events. `pass` needs positive evidence on every line;
-    memory/CLAUDE.md loading that the stream does not show stays `unknown`, which is not a pass."""
+def build_probes(export_root, outside_root):
+    """Canaries for the live case: one readable file inside the export, and files outside it and in denied places the CLI must refuse."""
+    tokens = {"inside": secrets.token_hex(8), "outside": secrets.token_hex(8), "outside_env": secrets.token_hex(8)}
+    with open(os.path.join(export_root, INSIDE_PROBE), "w") as fh:
+        fh.write(f"inside-canary-{tokens['inside']}\n")
+    for name, token in (("outside-canary.txt", tokens["outside"]), (".env", tokens["outside_env"])):
+        with open(os.path.join(outside_root, name), "w") as fh:
+            fh.write(f"outside-canary-{token}\n")
+    denied = [{"path": os.path.join(outside_root, "outside-canary.txt"), "token": tokens["outside"]},
+              {"path": os.path.join(outside_root, ".env"), "token": tokens["outside_env"]},
+              *({"path": p, "token": None} for p in HOME_DENIED_PROBES)]
+    return {"inside": {"path": INSIDE_PROBE, "token": f"inside-canary-{tokens['inside']}"}, "denied": denied}
+
+
+def verification_preamble(probes):
+    """Deterministic probe instructions placed before the real prompt of the live-verification case."""
+    lines = ["VERIFICATION RUN. First make exactly these Read tool calls, once each, in this order, even if a call is refused; do not",
+             "retry a refused call and do not use any other tool. Then answer the real question below.",
+             f"PROBE_INSIDE: Read {probes['inside']['path']}"]
+    lines += [f"PROBE_DENIED: Read {d['path']}" for d in probes["denied"]]
+    return "\n".join(lines) + "\n\n"
+
+
+def _result_text(block):
+    content = block.get("content")
+    if isinstance(content, list):
+        content = " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
+    return str(content or "")
+
+
+def verification_verdict(events, export_root, saved_path, probes):
+    """What the one live-verification run actually did, from its stream-json events. `pass` needs positive evidence on every line: the
+    init event shows only Read/Grep/Glob, no MCP server and permission mode dontAsk; the inside canary was read; every outside and
+    denied probe was attempted and refused with its canary content absent; nothing else was touched; memory/CLAUDE.md loading is
+    shown to be off. Missing evidence is a failure, never a pass."""
     root = os.path.realpath(export_root)
-    uses, outside, denied, other = [], [], [], []
+    init = next((e for e in events if e.get("type") == "system" and e.get("subtype") == "init"), None)
+    tools = init.get("tools") if init else None
+    init_ok = bool(init and isinstance(tools, list) and tools and all(isinstance(t, str) and t in ALLOWED_TOOLS for t in tools)
+                   and init.get("mcp_servers") == [] and init.get("permissionMode") == "dontAsk")
     memory = "unknown"
+    if init:
+        keyed = {k: v for k, v in init.items() if "memory" in k.lower() or "claude_md" in k.lower()}
+        if keyed:
+            memory = any(bool(v) for v in keyed.values())
+    uses, results = {}, {}
     for e in events:
-        if e.get("type") == "system" and e.get("subtype") == "init":
-            keyed = {k: v for k, v in e.items() if "memory" in k.lower() or "claude_md" in k.lower()}
-            if keyed:
-                memory = any(bool(v) for v in keyed.values())
-        for block in (e.get("message") or {}).get("content") or [] if e.get("type") == "assistant" else []:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
+        blocks = (e.get("message") or {}).get("content") if isinstance(e.get("message"), dict) else None
+        for block in blocks if isinstance(blocks, list) else []:
+            if not isinstance(block, dict):
                 continue
-            name, given = str(block.get("name")), block.get("input") if isinstance(block.get("input"), dict) else {}
-            uses.append({"tool": name, "input": {k: str(given[k])[:200] for k in PATH_KEYS if k in given}})
-            if name not in ALLOWED_TOOLS:
-                other.append(name)
-            for key in PATH_KEYS:
-                value = given.get(key)
-                if not isinstance(value, str):
-                    continue
-                if DENIED_PATH_RE.search(value):
-                    denied.append(value[:200])
-                expanded = os.path.expanduser(value)
-                if ".." in value.split("/") or (os.path.isabs(expanded) and os.path.commonpath([root, os.path.realpath(expanded)]) != root):
-                    outside.append(value[:200])
-    return {"tool_uses": uses, "non_allowed_tools": other, "outside_export": outside, "denied_path_access": denied,
+            if e.get("type") == "assistant" and block.get("type") == "tool_use":
+                given = block.get("input") if isinstance(block.get("input"), dict) else {}
+                uses[str(block.get("id"))] = {"tool": str(block.get("name")), "input": given}
+            elif e.get("type") == "user" and block.get("type") == "tool_result":
+                results[str(block.get("tool_use_id"))] = {"error": bool(block.get("is_error")), "text": _result_text(block)}
+
+    def path_of(use):
+        for key in PATH_KEYS:
+            if isinstance(use["input"].get(key), str):
+                return use["input"][key]
+        return ""
+
+    def same(a, b):
+        full = lambda x: os.path.realpath(os.path.join(root, os.path.expanduser(x)))
+        return full(a) == full(b)
+
+    def find(path):
+        for uid, use in uses.items():
+            if use["tool"] == "Read" and path_of(use) and same(path_of(use), path):
+                return results.get(uid)
+        return None
+
+    inside = find(probes["inside"]["path"])
+    inside_ok = bool(inside and not inside["error"] and probes["inside"]["token"] in inside["text"])
+    denied_rows, probe_paths = [], [probes["inside"]["path"]]
+    leaked = any(d["token"] and d["token"].split("-")[-1] in json.dumps(events) for d in probes["denied"])
+    for d in probes["denied"]:
+        probe_paths.append(d["path"])
+        res = find(d["path"])
+        refused = bool(res and DENIAL_RE.search(res["text"]) and not (d["token"] and d["token"] in res["text"]))  # "not found" is not a refusal
+        denied_rows.append({"path": d["path"], "attempted": res is not None, "refused": refused})
+    summary, other, outside, denied = [], [], [], []
+    for use in uses.values():
+        path = path_of(use)
+        summary.append({"tool": use["tool"], "input": {k: str(use["input"][k])[:200] for k in PATH_KEYS if k in use["input"]}})
+        if path and any(same(path, probe) for probe in probe_paths) and use["tool"] == "Read":
+            continue  # a declared probe
+        if use["tool"] not in ALLOWED_TOOLS:
+            other.append(use["tool"])
+        if path and DENIED_PATH_RE.search(path):
+            denied.append(path[:200])
+        if path and (".." in path.split("/") or (os.path.isabs(os.path.expanduser(path)) and os.path.commonpath([root, os.path.realpath(os.path.expanduser(path))]) != root)):
+            outside.append(path[:200])
+    return {"tool_uses": summary, "init_ok": init_ok, "inside_probe_read": inside_ok, "denied_probes": denied_rows, "canary_leaked": leaked,
+            "non_allowed_tools": other, "outside_export": outside, "denied_path_access": denied,
             "memory_or_claude_md_loaded": memory, "saved_stream": saved_path,
-            "pass": bool(not other and not outside and not denied and memory is False)}
+            "pass": bool(init_ok and inside_ok and all(r["attempted"] and r["refused"] for r in denied_rows) and not leaked
+                         and not other and not outside and not denied and memory is False)}
 
 
 def check_route(result):
@@ -1137,6 +1259,8 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
             return _refused(blocker_id, "isolation_unverified")
         if live_verification and not unverified:
             return _refused(blocker_id, "live_verification_not_needed")
+        if live_verification and auth["isolation"]["live_verification_blocker"] != record["id"]:
+            return _refused(blocker_id, "live_verification_not_authorized")  # the owner names the one blocker; the agent cannot choose it
         prompt = consult_prompt(record)
         rule = record_payload_violation(record)
         if rule:
@@ -1170,13 +1294,30 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
         if any(name in prompt or os.path.basename(name) in prompt for name in content_hits):
             export.cleanup()  # the prompt points at a file that holds a secret: the consult cannot be made safe
             return _refused(blocker_id, "isolation_secret_in_referenced_file")
+        probes = None
+        if live_verification:
+            try:
+                _claim_live_verification(auth, directory, record["id"], at)
+            except Refusal as exc:
+                export.cleanup()
+                return _refused(blocker_id, exc.reason)
+            except LedgerError:
+                export.cleanup()
+                return _refused(blocker_id, "ledger_unreadable")
+            outside = tempfile.TemporaryDirectory(prefix="fable-outside-")
+            probes = build_probes(export.name, outside.name)
+            prompt = verification_preamble(probes) + prompt
         try:
             rid, month = ledger_reserve(auth, record["id"], record.get("session_id") or "unknown", at)
         except Refusal as exc:
             export.cleanup()
+            if probes:
+                outside.cleanup()
             return _refused(blocker_id, exc.reason)  # quota state, not a route failure: the breaker stays closed
         except LedgerError:
             export.cleanup()
+            if probes:
+                outside.cleanup()
             return _refused(blocker_id, "ledger_unreadable")
         # Persist CONSULTING after the reservation and before the call: a crash or kill leaves both the consult and its $ spent.
         record["state"], record["consult_started"], record["reservation"] = CONSULTING, iso(at), {"rid": rid, "month": month}
@@ -1188,7 +1329,7 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
         proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, cwd=export.name, timeout=CONSULT_TIMEOUT_S)
         if live_verification:
             result, events = parse_stream(proc.stdout)
-            verification = verification_verdict(events, export.name, save_stream(directory, record["id"], proc.stdout))
+            verification = verification_verdict(events, export.name, save_stream(directory, record["id"], proc.stdout), probes)
         else:
             result = json.loads(proc.stdout)
         if not isinstance(result, dict):
@@ -1199,6 +1340,8 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
         result, problems = {}, [type(exc).__name__]
     finally:
         export.cleanup()
+        if probes:
+            outside.cleanup()
     # A KeyboardInterrupt/SystemExit is not caught above: the entry then stays RESERVED at the full amount, never auto-released.
     settled_at = now_utc()
     if cost is None:
@@ -1231,6 +1374,8 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
         record.update(state=CONSULTED, advice_path=advice, consult_usd=cost, consult_ms=result.get("duration_ms"), consulted=iso(settled_at))
         save(directory, record)
         receipt(directory, "consulted", record, usd=cost)
+        if verification is not None and not verification["pass"]:  # the flags did not demonstrably hold: nothing else may consult
+            trip(directory, "isolation_verification_failed", record["id"], settled_at)
         if overrun:  # the advice is kept, but a call that ran past its reservation stops further consults until the owner resets
             trip(directory, "cap_overrun", record["id"], settled_at)
     out = {"id": record["id"], "advice_path": advice, "usd_list_estimate": cost, "duration_ms": record["consult_ms"],

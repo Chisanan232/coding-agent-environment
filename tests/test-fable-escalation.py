@@ -40,6 +40,32 @@ if os.environ.get("FAKE_CWD_LOG"):
     open(os.environ["FAKE_CWD_LOG"], "a").write(json.dumps({"cwd": os.getcwd(), "files": sorted(
         os.path.relpath(os.path.join(d, f), os.getcwd()) for d, _, fs in os.walk(os.getcwd()) for f in fs)}) + "\\n")
 open(os.environ["FAKE_LOG"], "a").write(json.dumps(sys.argv[1:]) + "\\n")
+if os.environ.get("FAKE_LIVE"):
+    mode = os.environ["FAKE_LIVE"]
+    probes = [l.split("Read ", 1)[1] for l in sys.stdin.read().splitlines() if l.startswith("PROBE_")]
+    init = {"type": "system", "subtype": "init", "tools": ["Read", "Grep", "Glob"], "mcp_servers": [], "permissionMode": "dontAsk", "memory_paths": []}
+    if mode == "badinit": init["permissionMode"] = "default"
+    if mode == "mcp": init["mcp_servers"] = [{"name": "x"}]
+    if mode == "nomemory": del init["memory_paths"]
+    if mode == "memory": init["memory_paths"] = ["/home/u/.claude/CLAUDE.md"]
+    events = [init]
+    for i, path in enumerate(probes):
+        if mode == "skip" and i == len(probes) - 1: continue
+        events.append({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t%d" % i, "name": "Read", "input": {"file_path": path}}]}})
+        full = os.path.expanduser(path)
+        readable = not os.path.isabs(full) or (mode == "leak" and os.path.exists(full))
+        if readable:
+            body, err = open(full).read(), False
+        elif mode == "notfound":
+            body, err = "File does not exist.", True
+        else:
+            body, err = "Permission to read this path was denied.", True
+        events.append({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t%d" % i, "content": body, "is_error": err}]}})
+    if mode == "bash":
+        events.append({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "ls"}}]}})
+    if mode == "empty": events = []
+    events.append(dict(json.loads(os.environ["FAKE_OUT"]), type="result"))
+    print("\\n".join(json.dumps(e) for e in events)); sys.exit(0)
 print(os.environ["FAKE_OUT"]); sys.exit(int(os.environ.get("FAKE_RC", "0")))
 '''
 # Runs the real CLI with the two host-specific probes pinned, so the CLI tests do not depend on the machine they run on.
@@ -64,7 +90,7 @@ def valid_auth(home, **over):
             "decision": {"ticket": "SPE-171", "date": "2026-11-25", "by": "owner", "ref": "owner decision in chat"},
             "model": "claude-fable-5-2", "billing_route": "claude.ai-max-usage-credits-off",
             "retention": {"model_improvement_setting": "off", "confirmed_on": "2026-11-25"},
-            "isolation": {"verified_on": "2026-11-25"},
+            "isolation": {"verified_on": "2026-11-25", "live_verification_blocker": None},
             "scope": {"host_sha256": HOST, "repo_owners": ["o"], "allowed_profiles": []},
             "caps": {"per_consult_usd": 4, "monthly_usd": 40, "timezone": "Asia/Taipei"},
             "ledger_dir": os.path.join(home, ".local", "state", "coding-agent-environment", "fable-budget")}
@@ -102,8 +128,8 @@ class Env(unittest.TestCase):
         subprocess.run([self.profile_bin], capture_output=True, timeout=300)
         self.env = {"FABLE_CLAUDE_BIN": self.bin, "FAKE_LOG": self.log, "FAKE_OUT": json.dumps(FABLE_OK), "HOME": self.home,
                     "FAKE_PROFILE_BIN": self.profile_bin}
-        self.saved = {k: os.environ.get(k) for k in [*self.env, *fe.API_ENV, "FAKE_RC", "FAKE_VERSION", "FABLE_ESCALATION_DIR"]}
-        for k in (*fe.API_ENV, "FAKE_RC", "FAKE_VERSION", "FABLE_ESCALATION_DIR"):
+        self.saved = {k: os.environ.get(k) for k in [*self.env, *fe.API_ENV, "FAKE_RC", "FAKE_VERSION", "FABLE_ESCALATION_DIR", "FAKE_LIVE", "FAKE_CWD_LOG"]}
+        for k in (*fe.API_ENV, "FAKE_RC", "FAKE_VERSION", "FABLE_ESCALATION_DIR", "FAKE_LIVE", "FAKE_CWD_LOG"):
             os.environ.pop(k, None)
         os.environ.update(self.env)
         self.patched = {k: getattr(fe, k) for k in ("host_hash", "MANAGED_SETTINGS", "PROFILE_BIN")}
@@ -1033,16 +1059,18 @@ class LedgerValidation(_Cli, Env):
 
 
 class LiveVerification(_Cli, Env):
-    def stream(self, tool_input=None, tool="Read", memory=None, cost=0.9):
-        init = {"type": "system", "subtype": "init"}
-        if memory is not None:
-            init["memory_paths"] = memory
-        use = {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": tool, "input": tool_input or {"file_path": "src/a.py"}}]}}
-        done = dict(FABLE_OK, type="result", total_cost_usd=cost)
-        os.environ["FAKE_OUT"] = "\n".join(json.dumps(e) for e in (init, use, done))
-
     def unverified(self):
-        self.write_auth(isolation={"verified_on": None})
+        self.write_auth(isolation={"verified_on": None, "live_verification_blocker": None})
+
+    def authorized_blocker(self, directory=None, **over):
+        """An unverified authorization, a READY blocker, and the owner naming that blocker for the one live case."""
+        self.unverified()
+        bid = self.two_attempts(directory, **over)["id"]
+        self.write_auth(isolation={"verified_on": None, "live_verification_blocker": bid})
+        return bid
+
+    def live(self, bid, directory=None):
+        return fe.consult(directory or self.dir, bid, True, self.repo, T0, live_verification=True)
 
     def test_while_isolation_is_unverified_attempt_never_returns_consult_but_the_blocker_is_recorded(self):
         self.unverified()
@@ -1055,65 +1083,107 @@ class LiveVerification(_Cli, Env):
         self.assertEqual(self.calls(), 0)
 
     def test_an_ordinary_consult_is_refused_while_unverified_and_reserves_nothing(self):
-        self.unverified()
-        bid = self.two_attempts()["id"]
+        bid = self.authorized_blocker()
         out = self.consult(bid)
         self.assertEqual(out["reason"], "isolation_unverified")
         self.assertEqual(self.calls(), 0)
         self.assertFalse(os.path.exists(os.path.join(self.ledger, fe.month_key(T0) + ".json")))
 
-    def test_the_live_verification_case_reserves_runs_stream_json_saves_the_tool_list_and_passes_with_positive_evidence(self):
-        self.unverified()
-        bid = self.two_attempts()["id"]
-        self.stream(memory=[])
-        out = fe.consult(self.dir, bid, True, self.repo, T0, live_verification=True)
+    def test_the_live_case_needs_the_owner_to_name_that_blocker(self):
+        for named in (None, "f" * 16):
+            self.tearDown()
+            self.setUp()
+            self.unverified()
+            bid = self.two_attempts()["id"]
+            self.write_auth(isolation={"verified_on": None, "live_verification_blocker": named})
+            out = self.live(bid)
+            self.assertEqual(out["reason"], "live_verification_not_authorized")
+            self.assertEqual(self.calls(), 0)
+            self.assertFalse(os.path.exists(os.path.join(self.ledger, fe.LIVE_MARKER)))
+
+    def test_a_passing_live_case_has_positive_evidence_and_leaves_the_one_shot_marker(self):
+        bid = self.authorized_blocker()
+        os.environ["FAKE_LIVE"] = "good"
+        markers = []
+        real = subprocess.run
+        def watch(argv, *a, **kw):
+            if "-p" in argv:
+                markers.append(os.path.exists(os.path.join(self.ledger, fe.LIVE_MARKER)))  # persisted BEFORE the call
+            return real(argv, *a, **kw)
+        with mock.patch.object(fe.subprocess, "run", side_effect=watch):
+            out = self.live(bid)
+        self.assertEqual(markers, [True])
         verdict = out["verification"]
         self.assertTrue(verdict["pass"], verdict)
-        self.assertEqual(verdict["tool_uses"][0]["tool"], "Read")
-        self.assertEqual(verdict["memory_or_claude_md_loaded"], False)
-        saved = verdict["saved_stream"]
-        self.assertEqual(stat.S_IMODE(os.stat(saved).st_mode), 0o600)
-        self.assertIn('"tool_use"', Path(saved).read_text())
+        self.assertTrue(verdict["init_ok"] and verdict["inside_probe_read"])
+        self.assertEqual([r["refused"] for r in verdict["denied_probes"]], [True] * 5)
+        self.assertEqual(stat.S_IMODE(os.stat(verdict["saved_stream"]).st_mode), 0o600)
         argv = json.loads(Path(self.log).read_text().splitlines()[0])
         self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
         self.assertIn("--verbose", argv)
-        entry = self.month()["entries"][0]
-        self.assertEqual((entry["state"], entry["charged_usd"]), ("SETTLED", 0.9))  # the ledger and breaker still apply
+        self.assertEqual(self.month()["entries"][0]["state"], "SETTLED")
+        self.assertFalse(fe.breaker(self.dir)["open"])
         self.assertEqual(fe.load(self.dir, bid)["state"], fe.CONSULTED)
+        self.assertEqual(self.cli("authorization", "check")["isolation"]["live_verification_used"], True)
 
-    def test_the_verdict_fails_on_outside_paths_other_tools_denied_paths_and_unproven_memory(self):
-        cases = (({"file_path": "/etc/passwd"}, "Read", [], "outside_export"), ({"file_path": "../x"}, "Read", [], "outside_export"),
-                 ({"file_path": "src/a.py"}, "Bash", [], "non_allowed_tools"), ({"file_path": ".env"}, "Read", [], "denied_path_access"),
-                 ({"file_path": "a/.ssh/id_rsa"}, "Read", [], "denied_path_access"), ({"file_path": "src/a.py"}, "Read", ["~/.claude/CLAUDE.md"], "memory"),
-                 ({"file_path": "src/a.py"}, "Read", None, "memory"))
-        for tool_input, tool, memory, key in cases:
-            with self.subTest(key, tool_input=tool_input):
+    def test_any_missing_or_contrary_evidence_fails_the_verdict_and_opens_the_breaker(self):
+        for mode in ("leak", "notfound", "empty", "skip", "bash", "badinit", "mcp", "nomemory", "memory"):
+            with self.subTest(mode):
                 self.tearDown()
                 self.setUp()
-                self.unverified()
-                bid = self.two_attempts()["id"]
-                self.stream(tool_input, tool, memory)
-                verdict = fe.consult(self.dir, bid, True, self.repo, T0, live_verification=True)["verification"]
-                self.assertFalse(verdict["pass"], verdict)
-                if key != "memory":
-                    self.assertTrue(verdict[key], verdict)
+                bid = self.authorized_blocker()
+                os.environ["FAKE_LIVE"] = mode
+                out = self.live(bid) if mode != "empty" else self.live(bid)
+                verdict = out["verification"]
+                self.assertFalse(verdict["pass"], (mode, verdict))
+                self.assertEqual(fe.breaker(self.dir)["reason"], "isolation_verification_failed")
+                if mode == "leak":
+                    self.assertTrue(verdict["canary_leaked"])
+
+    def test_the_live_case_is_one_shot_host_wide_even_after_a_failure_and_for_a_prior_record(self):
+        bid = self.authorized_blocker()
+        os.environ["FAKE_LIVE"] = "leak"
+        self.live(bid)
+        fe.reset_breaker(self.dir, "owner reset after reading the failed verdict", T0)
+        other = self.make_repo("second", "https://github.com/o/r2.git")
+        self.unverified()
+        second = self.two_attempts(target="o/r2#7", cwd=other)["id"]
+        self.write_auth(isolation={"verified_on": None, "live_verification_blocker": second})
+        before = self.calls()
+        out = fe.consult(self.dir, second, True, other, T0, live_verification=True)
+        self.assertEqual(out["reason"], "live_verification_already_used")
+        self.assertEqual(self.calls(), before)
+        # an earlier verification record alone (marker removed) also blocks it
+        os.unlink(os.path.join(self.ledger, fe.LIVE_MARKER))
+        self.assertEqual(fe.consult(self.dir, second, True, other, T0, live_verification=True)["reason"], "live_verification_already_used")
+        self.assertEqual(self.calls(), before)
+
+    def test_two_state_directories_cannot_both_run_the_live_case(self):
+        other = os.path.join(self.tmp.name, "fable-b")
+        os.makedirs(os.path.join(other, "advice"), mode=0o700)
+        bid = self.authorized_blocker()
+        self.two_attempts(other)
+        os.environ["FAKE_LIVE"] = "good"
+        results = []
+        threads = [threading.Thread(target=lambda d=d: results.append(self.live(bid, d))) for d in (self.dir, other)]
+        [x.start() for x in threads]
+        [x.join() for x in threads]
+        self.assertEqual(sorted("verification" in r for r in results), [False, True])
+        self.assertEqual(self.calls(), 1)
 
     def test_live_verification_is_only_for_the_unverified_state_and_still_obeys_the_gates(self):
         bid = self.ready()
-        self.assertEqual(fe.consult(self.dir, bid, True, self.repo, T0, live_verification=True)["reason"], "live_verification_not_needed")
+        self.assertEqual(self.live(bid)["reason"], "live_verification_not_needed")
         self.tearDown()
         self.setUp()
-        self.unverified()
-        bid = self.two_attempts()["id"]
+        bid = self.authorized_blocker()
         fe.trip(self.dir, "route_failure", None, T0)
-        self.assertTrue(fe.consult(self.dir, bid, True, self.repo, T0, live_verification=True)["reason"].startswith("breaker_open"))
+        self.assertTrue(self.live(bid)["reason"].startswith("breaker_open"))
         self.assertEqual(self.calls(), 0)
 
     def test_the_cli_flag_and_the_check_verdict(self):
-        self.unverified()
-        bid = self.two_attempts()["id"]
-        os.environ["FAKE_OUT"] = "\n".join(json.dumps(e) for e in ({"type": "system", "subtype": "init", "memory_paths": []},
-                                                                    dict(FABLE_OK, type="result")))
+        bid = self.authorized_blocker()
+        os.environ["FAKE_LIVE"] = "good"
         out = self.cli("consult", "--id", bid, "--execute", "--live-verification", "--cwd", self.repo)
         self.assertTrue(out["verification"]["pass"])
         check = self.cli("authorization", "check")
@@ -1129,6 +1199,41 @@ class LiveVerification(_Cli, Env):
         self.assertEqual((out["action"], out["reason"]), ("CONTINUE", "trigger_not_met"))
         self.assertEqual(self.calls(), 0)
 
+    def test_the_schema_accepts_only_a_blocker_id_or_null_for_the_live_case(self):
+        for bad in ("abc", 5, "G" * 16):
+            self.write_auth(isolation={"verified_on": None, "live_verification_blocker": bad})
+            self.assertEqual(fe.load_authorization()[1], "authorization_invalid")
+
+
+class PayloadControls(Env):
+    def test_the_original_bearer_and_email_controls_still_hold_alongside_the_new_ones(self):
+        for text in ("Bearer abcdefgh12345678", "bearer ABCDEFGHIJKL", "sent bearer abcdefgh", "a@b.co", "x_y@my_host.com", "a@b.c.d", "me@host_name.com"):
+            self.assertIsNotNone(fe.payload_violation(text), text)
+        for text in ("Bearer abc.def", "user@localhost", "ssh git@github.com:o/r"):
+            self.assertIsNotNone(fe.payload_violation(text), text)
+        self.assertIsNone(fe.payload_violation("the bearer of the lock order"))
+
+    def test_pathological_whitespace_and_repetition_finish_far_inside_the_deadline(self):
+        started = time.monotonic()
+        for text in ("   \n" * 120000, ("token" * 700 + "\n") * 60, ("eyJ" * 1300 + "\n") * 60, ("A" * 4000 + "\n") * 100, "Human" + " \t" * 1000 + "\n",
+                     "Human" + " \t" * 200000 + "\n", "A1" * 200000, ("a" * 4000 + "\n") * 100):
+            fe.scan_content(text, time.monotonic() + 60)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(fe.scan_content("x" * (fe.MAX_LINE_CHARS + 1), time.monotonic() + 60), "long_line")
+        with self.assertRaises(TimeoutError):
+            fe.scan_content("a\nb\n", time.monotonic() - 1)
+
+    def test_a_committed_pathological_file_is_skipped_quickly_not_a_denial_of_service(self):
+        helper = Consult("test_a_repository_without_a_commit_exports_nothing")
+        helper.setUp()
+        try:
+            helper.commit_files({"evil.txt": "   \n" * 100000, "tok.txt": ("token" * 1500 + "\n") * 60, "ok.py": "x = 1\n"})
+            started = time.monotonic()
+            ok, names, hits = helper.exported()
+            self.assertLess(time.monotonic() - started, 20)
+            self.assertEqual((ok, names, sorted(hits)), (True, ["evil.txt", "ok.py"], ["tok.txt"]))
+        finally:
+            helper.tearDown()
 
 
 class BreakerAndFallback(Env):
