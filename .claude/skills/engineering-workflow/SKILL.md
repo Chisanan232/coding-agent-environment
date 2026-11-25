@@ -123,13 +123,16 @@ python3 "$HOME/Bryant-Developments/coding-agent-environment-main-view/scripts/fa
   --question "<one concrete question for Fable?>" --non-sensitive
 ```
 
-The command returns at once with one `action`. `CONTINUE`: do nothing, keep working. `ASK_OWNER`: it fires once per blocker, after
-two materially different Opus attempts end in the same failure or review leaves an unresolved architecture disagreement
-(`--review-unresolved --review-position ...`, cleared by `--review-resolved`); ask the owner once with AskUserQuestion (Approve / Decline) using the returned
-`packet`, then record the answer with `answer`. No reply is not approval: keep doing independent work and never re-ask (`show --id` re-prints a lost packet without asking). An approval older than 24 hours is not re-asked: continue without Fable. `CONSULT_APPROVED`:
-run `consult --id <id> --execute` once, implement and verify the advice here, then record `verdict`. A failed consult opens the
-circuit breaker and stops escalation until the owner resets it. Pass `--non-sensitive` only for inputs that hold no secret, customer or
-private data on an owned repo. Usage credits stay off and the default routes are unchanged. See `docs/fable/escalation.md` in that checkout.
+The command returns at once with one `action`. `CONTINUE`: do nothing, keep working (it also carries the reason and the fallback: Sonnet
+plus `opus-architect` and the existing circuit breaker). `CONSULT`: it fires after two materially different Opus attempts end in the same
+failure or review leaves an unresolved architecture disagreement (`--review-unresolved --review-position ...`, cleared by
+`--review-resolved`), and only when the owner's standing authorization, scope, retention state and payload checks all pass. Follow
+`CONSULT`, never ask the owner: run `consult --id <id> --execute` once, implement and verify the advice here, then record `verdict`. A
+refusal (no authorization, budget exhausted, breaker open, ineligible payload) comes back as `CONTINUE`; keep working. A failed consult
+opens the circuit breaker and stops escalation until the owner resets it. Pass `--non-sensitive` only for inputs that hold no secret,
+customer or private data on an owned repo, and never put a credential, customer data, an email address or a raw transcript in `--approach`,
+`--failure`, `--question` or `--blocker`: such text is dropped and the attempt is not counted. Usage credits stay off and the default routes
+are unchanged. See `docs/fable/escalation.md` in that checkout.
 <!-- claude-only:end -->
 
 ## Review and open the pull request
