@@ -101,6 +101,12 @@ TRUSTED_PATH = "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"
 ENV_HOOK_FILE = os.path.join(os.path.dirname(os.path.expanduser(omg.VERSION_POLICY_DEFAULT)), "release-line-test-env.json")
 _hook_cache = {}
 _tool_cache = {}
+# Owner-pinned gh (SPE-184): only the sha256 of the gh binary is trusted, and it runs from a private copy under the real home, never from --state-dir or TMPDIR.
+TOOL_PINS = os.path.join(os.path.dirname(os.path.expanduser(omg.VERSION_POLICY_DEFAULT)), "release-tools.json")
+PINNABLE = frozenset({"gh"})
+TOOL_MAX_BYTES = 256 << 20
+TOOLS_DIR = os.path.join(os.path.expanduser(STATE_ROOT), "tools")
+SHA256_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 
 
 def env_hook():
@@ -154,6 +160,95 @@ def untrusted_component(path):
     return None
 
 
+def load_tool_pins(obj):
+    """Validate release-tools.json: {"schema": 1, "tools": {"gh": [{"sha256": "<64 hex>", ...}]}}; path and version are diagnostics, only sha256 decides."""
+    if not isinstance(obj, dict) or obj.get("schema") != 1 or not isinstance(obj.get("tools"), dict) or set(obj["tools"]) - PINNABLE:
+        raise ValueError(f"release tool pins must be {{schema: 1, tools: {{<one of {sorted(PINNABLE)}>: [...]}}}}")
+    pins = {}
+    for name, entries in obj["tools"].items():
+        if not isinstance(entries, list):
+            raise ValueError(f"tools.{name} must be a list")
+        digests = set()
+        for e in entries:
+            d = e.get("sha256") if isinstance(e, dict) else None
+            if not isinstance(d, str) or not SHA256_RE.fullmatch(d):
+                raise ValueError(f"tools.{name} entries need a 64-character lowercase hex sha256")
+            digests.add(d)
+        pins[name] = frozenset(digests)
+    return pins
+
+
+def pinned_copy(name, found, bad):
+    """Run an owner-pinned binary from a private copy: the source (not trusted by path) is hashed in one pass while it is copied, the digest must be in
+    release-tools.json, and the copy under TOOLS_DIR must itself pass untrusted_component. Returns the copy's path, or raises TOOL_PATH_UNTRUSTED."""
+    def refuse(why):
+        raise Refusal("TOOL_PATH_UNTRUSTED", f"{name} resolves to {found}, but {bad} is not owned by root or the current user or is group- or world-writable, "
+                                             f"and it cannot run from an owner-pinned private copy: {why}")
+    try:
+        pins = omg.read_owner_file(TOOL_PINS, True, load_tool_pins, "release tool pins")
+    except FileNotFoundError:
+        refuse(f"no pin file at {TOOL_PINS}")
+    except (OSError, ValueError, TypeError) as e:
+        refuse(f"pin file {TOOL_PINS} unusable ({type(e).__name__})")
+    pinned = pins.get(name, frozenset())
+    prefix = name + "-"
+    if os.path.isdir(TOOLS_DIR):
+        for f in os.listdir(TOOLS_DIR):
+            if f.startswith(prefix) and SHA256_RE.fullmatch(f[len(prefix):]) and f[len(prefix):] not in pinned:
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(TOOLS_DIR, f))
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(os.path.realpath(found), flags)
+    except OSError as e:
+        refuse(f"source binary cannot be opened ({type(e).__name__})")
+    tmp = None
+    try:
+        with os.fdopen(fd, "rb") as src:
+            st = os.fstat(src.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, os.getuid()) or st.st_mode & 0o022 or st.st_size > TOOL_MAX_BYTES:
+                refuse("source binary not trusted (must be a regular file owned by root or the user, not group- or world-writable, within the size limit)")
+            os.makedirs(TOOLS_DIR, mode=0o700, exist_ok=True)
+            tfd, tmp = tempfile.mkstemp(dir=TOOLS_DIR, prefix=".tmp-")
+            h, size = hashlib.sha256(), 0
+            with os.fdopen(tfd, "wb") as out:
+                for chunk in iter(lambda: src.read(1 << 20), b""):
+                    size += len(chunk)
+                    if size > TOOL_MAX_BYTES:
+                        refuse("source binary exceeds the size limit")
+                    h.update(chunk)
+                    out.write(chunk)
+        digest = h.hexdigest()
+        if digest not in pinned:
+            refuse(f"sha256 {digest} of {os.path.realpath(found)} is not pinned; if the owner confirms it with `shasum -a 256`, add this entry to {TOOL_PINS}: "
+                   + json.dumps({"sha256": digest, "path": os.path.realpath(found)}))
+        dest = os.path.join(TOOLS_DIR, prefix + digest)
+        reusable = False
+        try:
+            dfd = os.open(dest, flags)
+        except OSError:
+            dfd = None
+        if dfd is not None:
+            with os.fdopen(dfd, "rb") as cached:
+                cs = os.fstat(cached.fileno())
+                reusable = (stat.S_ISREG(cs.st_mode) and cs.st_uid == os.getuid() and cs.st_mode & 0o7777 == 0o500 and cs.st_nlink == 1
+                            and hashlib.sha256(cached.read()).hexdigest() == digest)
+        if not reusable:
+            os.chmod(tmp, 0o500)
+            try:
+                os.replace(tmp, dest)  # never rewrite an existing binary in place (the macOS code-signing cache can kill the process)
+            except OSError as e:
+                refuse(f"cannot install the private copy ({type(e).__name__})")
+            tmp = None
+    finally:
+        if tmp:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+    if untrusted_component(dest):
+        refuse(f"copy directory untrusted: {untrusted_component(dest)}")
+    return dest
+
+
 def tool_path(name):
     """git or gh as an absolute path: the owner hook's wrapper, else the first executable match in the fixed trusted PATH, which must sit in a chain of
     directories owned by root or the user and writable by nobody else (TOOL_PATH_UNTRUSTED). Resolved once."""
@@ -163,7 +258,9 @@ def tool_path(name):
             found = next((os.path.join(d, name) for d in trusted_dirs() if os.path.isfile(os.path.join(d, name)) and os.access(os.path.join(d, name), os.X_OK)), None)
             bad = untrusted_component(found) if found else None
             if bad:
-                raise Refusal("TOOL_PATH_UNTRUSTED", f"{name} resolves to {found}, but {bad} is not owned by root or the current user or is group- or world-writable")
+                if name not in PINNABLE:
+                    raise Refusal("TOOL_PATH_UNTRUSTED", f"{name} resolves to {found}, but {bad} is not owned by root or the current user or is group- or world-writable")
+                found = pinned_copy(name, found, bad)
         _tool_cache[name] = found
     return _tool_cache[name]
 
