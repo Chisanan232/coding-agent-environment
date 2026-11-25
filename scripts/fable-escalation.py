@@ -38,6 +38,8 @@ from importlib.util import module_from_spec, spec_from_file_location
 FABLE_MODEL = "claude-fable-5-2"
 MIN_CLAUDE = (2, 1, 321)  # Fable 5.2 needs this Claude Code version or later (runbook)
 CONSULT_TIMEOUT_S = 540
+# A RESERVED entry younger than timeout + grace is a consult presumed in flight; older ones are orphans (counted, not blocking).
+IN_FLIGHT_GRACE_S = 60
 PER_CONSULT_CEILING = 4.0  # USD; the script ceiling, whatever the authorization file says
 MONTHLY_CEILING = 40.0
 CONSULT_BUDGET_USD = "4"  # kept for the estimate's cap_usd: the reservation, not the client cap
@@ -760,25 +762,44 @@ def _journal(directory, event, **detail):
         fh.write(json.dumps({"event": event, **detail}, sort_keys=True) + "\n")
 
 
-def ledger_reserve(auth, blocker_id, session, at):
-    """Reserve one consult's full per-consult cap. Raises Refusal (budget, dedup) or LedgerError (unreadable)."""
+def ledger_reserve(auth, blocker_id, session, at, clock=None):
+    """Reserve one consult's full per-consult cap. Raises Refusal (budget, dedup, in flight, breaker) or LedgerError (unreadable).
+
+    With `clock` the time is sampled inside the ledger lock, once, and used for the month key, the in-flight age check and
+    `reserved_at`; without it (tests, replays) `at` is used. Returns (rid, month, reserved_at)."""
     directory = ledger_dir_ready(auth["ledger_dir"])
-    month, per = month_key(at), auth["caps"]["per_consult_usd"]
+    per = auth["caps"]["per_consult_usd"]
     with locked(directory):
+        now = clock() if clock else at
+        month = month_key(now)
+        # The breaker is rechecked here, under the lock: a trip made between the caller's check and this point must still refuse.
+        shared = _read_breaker(os.path.join(directory, "breaker.json"))
+        if shared.get("open"):
+            raise Refusal("breaker_open: " + str(shared.get("reason")))
         data = read_month(directory, month)
+        # A fresh reservation may sit in the previous month's file when the window straddles the month boundary: fail closed on it.
+        window = timedelta(seconds=CONSULT_TIMEOUT_S + IN_FLIGHT_GRACE_S)
+        files = [data]
+        earlier = month_key(now - window)
+        if earlier != month:
+            files.append(read_month(directory, earlier))
         if any(e.get("blocker_id") == blocker_id for e in data["entries"]):
             raise Refusal("blocker_already_reserved_this_month")
+        # Serialize consults host-wide: the client budget cap is only checked between turns, so one in flight bounds the overshoot.
+        if any(e["state"] == RESERVED and (now - parse(e["reserved_at"])).total_seconds() <= window.total_seconds()
+               for d in files for e in d["entries"]):
+            raise Refusal("consult_in_flight")
         if round(committed(data) + per, 6) > auth["caps"]["monthly_usd"]:
             raise Refusal("monthly_budget_exhausted")
         rid = secrets.token_hex(8)
         data["entries"].append({"rid": rid, "blocker_id": blocker_id, "session": session, "reserved_usd": per, "state": RESERVED,
-                                "charged_usd": None, "basis": None, "reserved_at": iso(at), "settled_at": None})
+                                "charged_usd": None, "basis": None, "reserved_at": iso(now), "settled_at": None})
         try:
             _write(os.path.join(directory, month + ".json"), data)
-            _journal(directory, "reserved", rid=rid, blocker_id=blocker_id, usd=per, at=iso(at), month=month)
+            _journal(directory, "reserved", rid=rid, blocker_id=blocker_id, usd=per, at=iso(now), month=month)
         except OSError as exc:
             raise LedgerError(str(exc))
-    return rid, month
+    return rid, month, now
 
 
 def ledger_settle(auth, month, rid, charge, basis, at):
@@ -1289,7 +1310,7 @@ def _reported_cost(result):
     return float(cost) if ok else None
 
 
-def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=None, live_verification=False):
+def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=None, live_verification=False, clock=None):
     with locked(directory):
         record = load(directory, blocker_id)
         if record["state"] != READY:
@@ -1355,7 +1376,7 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
             probes = build_probes(export.name, outside.name)
             prompt = verification_preamble(probes) + prompt
         try:
-            rid, month = ledger_reserve(auth, record["id"], record.get("session_id") or "unknown", at)
+            rid, month, reserved_at = ledger_reserve(auth, record["id"], record.get("session_id") or "unknown", at, clock)
         except Refusal as exc:
             export.cleanup()
             if probes:
@@ -1367,13 +1388,15 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
                 outside.cleanup()
             return _refused(blocker_id, "ledger_unreadable")
         # Persist CONSULTING after the reservation and before the call: a crash or kill leaves both the consult and its $ spent.
-        record["state"], record["consult_started"], record["reservation"] = CONSULTING, iso(at), {"rid": rid, "month": month}
+        record["state"], record["consult_started"], record["reservation"] = CONSULTING, iso(reserved_at), {"rid": rid, "month": month}
         save(directory, record)
         receipt(directory, "consult_started", record, rid=rid, export_content_skipped=len(content_hits))
     cost, problems, verification = None, [], None
+    # The call's bound runs from the reservation timestamp, so it can never outlive the in-flight window that guards it.
+    call_timeout = CONSULT_TIMEOUT_S if clock is None else max(1.0, CONSULT_TIMEOUT_S - (clock() - reserved_at).total_seconds())
     try:
         # The prompt goes on stdin so attempt text never appears in a process listing.
-        proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, cwd=export.name, timeout=CONSULT_TIMEOUT_S)
+        proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, cwd=export.name, timeout=call_timeout)
         if live_verification:
             result, events = parse_stream(proc.stdout)
             verification = verification_verdict(events, export.name, save_stream(directory, record["id"], proc.stdout), probes)
@@ -1398,8 +1421,24 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
     overrun = charge > per
     if overrun:
         basis += "+cap_overrun"
+    # Trip BEFORE settling: once the entry settles a waiter may reserve, so the breaker must already be open by then.
+    if problems:
+        if overrun:
+            trip_reason = "cap_overrun"
+        elif any("effective model" in p for p in problems):
+            trip_reason = "model_mismatch"
+        else:
+            trip_reason = "route_failure"
+    elif verification is not None and not verification["pass"]:  # the flags did not demonstrably hold: nothing else may consult
+        trip_reason = "isolation_verification_failed"
+    elif overrun:  # the advice is kept, but a call that ran past its reservation stops further consults until the owner resets
+        trip_reason = "cap_overrun"
+    else:
+        trip_reason = None
     with locked(directory):
         record = load(directory, blocker_id)
+        if trip_reason:
+            trip(directory, trip_reason, record["id"], settled_at)
         try:
             ledger_settle(auth, month, rid, charge, basis, settled_at)
         except LedgerError:
@@ -1408,23 +1447,12 @@ def consult(directory, blocker_id, execute, cwd, at, auth_path=None, auth_root=N
             record["state"], record["failure"] = FAILED, "; ".join(problems)[:300]
             save(directory, record)
             receipt(directory, "consult_failed", record, problems=problems, charged_usd=charge)
-            if overrun:
-                reason_code = "cap_overrun"
-            elif any("effective model" in p for p in problems):
-                reason_code = "model_mismatch"
-            else:
-                reason_code = "route_failure"
-            trip(directory, reason_code, record["id"], settled_at)
             raise EscalationError("consult failed, breaker opened: " + record["failure"])
         advice = os.path.join(directory, "advice", record["id"] + ".txt")
         _write(advice, result["result"], text=True)
         record.update(state=CONSULTED, advice_path=advice, consult_usd=cost, consult_ms=result.get("duration_ms"), consulted=iso(settled_at))
         save(directory, record)
         receipt(directory, "consulted", record, usd=cost)
-        if verification is not None and not verification["pass"]:  # the flags did not demonstrably hold: nothing else may consult
-            trip(directory, "isolation_verification_failed", record["id"], settled_at)
-        if overrun:  # the advice is kept, but a call that ran past its reservation stops further consults until the owner resets
-            trip(directory, "cap_overrun", record["id"], settled_at)
     out = {"id": record["id"], "advice_path": advice, "usd_list_estimate": cost, "duration_ms": record["consult_ms"],
            "next": "implement and verify in the original session, then run `verdict`"}
     if verification is not None:
@@ -1533,7 +1561,7 @@ def main(argv=None):
                 case = json.load(fh)
             out = evaluate(case, directory)
         elif args.cmd == "consult":
-            out = consult(directory, args.id, args.execute, args.cwd, at, live_verification=args.live_verification)
+            out = consult(directory, args.id, args.execute, args.cwd, at, live_verification=args.live_verification, clock=now_utc)
         elif args.cmd == "verdict":
             out = verdict(directory, args.id, args.result,
                           {"rework_rounds": args.rework_rounds, "elapsed_s": args.elapsed_s, "usd": args.usd}, at)
