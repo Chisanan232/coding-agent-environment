@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -991,6 +992,89 @@ class Budget(Env):
         self.assertEqual(out["reason"], "monthly_budget_exhausted")
         self.assertEqual(self.calls(), 0)
 
+    def test_the_age_check_and_reserved_at_use_the_clock_sampled_inside_the_lock(self):
+        self.seed_reserved(fe.CONSULT_TIMEOUT_S + fe.IN_FLIGHT_GRACE_S + 50)  # stale at T0, still fresh at the earlier `at`
+        stale_at = T0 - timedelta(seconds=100)
+        auth = fe.load_authorization()[0]
+        rid, month, reserved_at = fe.ledger_reserve(auth, "b" * 16, "s", stale_at, clock=lambda: T0)
+        self.assertEqual(reserved_at, T0)
+        self.assertEqual(self.month()["entries"][-1]["reserved_at"], fe.iso(T0))
+        with self.assertRaises(fe.Refusal):  # without the clock the stale `at` makes the old entry look fresh
+            fe.ledger_reserve(auth, "c" * 16, "s", stale_at)
+
+    def test_the_model_call_is_bounded_from_the_reservation_timestamp(self):
+        seen = {}
+        real = subprocess.run
+
+        def spy(argv, *a, **kw):
+            if "-p" in argv:
+                seen["timeout"] = kw.get("timeout")
+            return real(argv, *a, **kw)
+        ticks = iter([T0, T0 + timedelta(seconds=40), T0 + timedelta(seconds=40)])
+        bid = self.ready()
+        with mock.patch.object(fe.subprocess, "run", side_effect=spy):
+            fe.consult(self.dir, bid, True, self.repo, T0, clock=lambda: next(ticks, T0 + timedelta(seconds=40)))
+        self.assertEqual(seen["timeout"], fe.CONSULT_TIMEOUT_S - 40)
+
+    def test_a_reservation_just_before_the_month_rollover_still_blocks_the_first_one_after_it(self):
+        before = datetime(2026, 11, 30, 15, 59, 0, tzinfo=timezone.utc)  # 23:59 UTC+8 on the last day
+        after = datetime(2026, 11, 30, 16, 0, 0, tzinfo=timezone.utc)  # 00:00 UTC+8 on the 1st
+        self.out(total_cost_usd=0.5)
+        first = self.ready(acceptance_check="AC1 first")
+        fe.ledger_reserve(fe.load_authorization()[0], first, "s", before)  # left RESERVED: in flight
+        out = self.consult(self.ready(acceptance_check="AC2 second"), at=after)
+        self.assertEqual((out["action"], out["reason"]), ("CONTINUE", "consult_in_flight"))
+        self.assertEqual(self.calls(), 0)
+        self.assertFalse(fe.breaker(self.dir)["open"])
+        self.assertEqual(fe.month_key(before), "2026-11")
+        self.assertEqual(fe.month_key(after), "2026-12")
+
+    def test_an_unreadable_previous_month_file_fails_closed_near_the_rollover(self):
+        after = datetime(2026, 11, 30, 16, 0, 0, tzinfo=timezone.utc)
+        os.makedirs(self.ledger, mode=0o700, exist_ok=True)
+        os.chmod(self.ledger, 0o700)
+        Path(self.ledger, "2026-11.json").write_text("{corrupt")
+        out = self.consult(self.ready(), at=after)
+        self.assertEqual(out["reason"], "ledger_unreadable")
+        self.assertEqual(self.calls(), 0)
+
+    def test_a_breaker_tripped_after_the_pre_check_but_before_the_reservation_still_refuses(self):
+        bid = self.ready()
+        real = fe.ledger_dir_ready
+
+        def trip_late(path, create=True):
+            directory = real(path, create)
+            if create and directory and not os.path.exists(os.path.join(directory, "breaker.json")):
+                fe._write(os.path.join(directory, "breaker.json"), {"open": True, "reason": "route_failure"})
+            return directory
+        with mock.patch.object(fe, "ledger_dir_ready", side_effect=trip_late):
+            out = self.consult(bid)
+        self.assertEqual(out["action"], "CONTINUE")
+        self.assertTrue(out["reason"].startswith("breaker_open"), out)
+        self.assertEqual(self.calls(), 0)
+        self.assertEqual(self.month()["entries"] if Path(self.ledger, fe.month_key(T0) + ".json").exists() else [], [])
+
+    def test_the_breaker_is_open_before_the_entry_settles_for_every_trip_cause(self):
+        for fields, reason in (({"total_cost_usd": 5.25}, "cap_overrun"), ({"is_error": True}, "route_failure")):
+            with self.subTest(reason=reason):
+                shutil.rmtree(self.ledger, ignore_errors=True)
+                fe.reset_breaker(self.dir, "reset between subtests", T0)
+                self.out(**fields)
+                bid = self.ready(acceptance_check=f"AC {reason} order")
+                seen = []
+                real = fe.ledger_settle
+
+                def spy(*a, **kw):
+                    seen.append(fe.breaker(self.dir).get("reason"))
+                    return real(*a, **kw)
+                with mock.patch.object(fe, "ledger_settle", side_effect=spy):
+                    try:
+                        self.consult(bid)
+                    except fe.EscalationError:
+                        pass
+                self.assertEqual(seen, [reason])
+                self.assertEqual(fe.breaker(self.dir)["reason"], reason)
+
     def test_the_same_blocker_in_two_state_directories_is_reserved_once_per_month(self):
         other = os.path.join(self.tmp.name, "fable2")
         os.makedirs(os.path.join(other, "advice"), mode=0o700)
@@ -1035,7 +1119,7 @@ while time.time() < float(sys.argv[4]):
     pass
 while True:
     try:
-        rid, month = fe.ledger_reserve(auth, sys.argv[3], "proc", at)
+        rid, month, _at = fe.ledger_reserve(auth, sys.argv[3], "proc", at)
     except fe.Refusal as exc:
         if settle and exc.reason == "consult_in_flight":
             time.sleep(0.005)
