@@ -536,7 +536,7 @@ class Consult(Env):
             os.symlink(dest, os.path.join(self.repo, name))
         git = ["git", "-C", self.repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
         subprocess.run([*git, "add", "-A"], check=True, capture_output=True)
-        subprocess.run([*git, "commit", "-q", "-m", "x"], check=True, capture_output=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "x"], check=True, capture_output=True)
 
     def exported(self):
         dest = os.path.join(self.tmp.name, "export")
@@ -607,6 +607,78 @@ class Consult(Env):
         self.assertEqual(self.calls(), 0)
         self.assertFalse(os.path.exists(self.ledger))
         self.assertFalse(fe.breaker(self.dir)["open"])
+
+    def crafted(self, rows):
+        """Run export_tracked against a hand-made `git ls-tree` listing; blob reads still go to the real object database."""
+        self.commit_files({"ok.py": "x = 1"})
+        sha = subprocess.run(["git", "-C", self.repo, "rev-parse", "HEAD:ok.py"], capture_output=True, text=True).stdout.strip()
+        listing = "".join(f"{mode} blob {sha} {size:>7}\t{name}\0" for mode, size, name in rows).encode()
+        real = subprocess.run
+
+        def run(argv, *a, **kw):
+            if "ls-tree" in argv:
+                return subprocess.CompletedProcess(argv, 0, listing, b"")
+            return real(argv, *a, **kw)
+        dest = tempfile.mkdtemp(dir=self.tmp.name)
+        with mock.patch.object(fe.subprocess, "run", side_effect=run):
+            ok, hits = fe.export_tracked(self.repo, dest)
+        names = sorted(os.path.relpath(os.path.join(d, f), dest) for d, _, fs in os.walk(dest) for f in fs)
+        return ok, names, hits
+
+    def test_unsafe_tree_paths_fail_the_export_closed_and_write_nothing_outside(self):
+        for name in ("../x.py", "a/../../x.py", "/abs/x.py", ".git/config", "a/.GIT/hooks/x", "a//b.py", "a/./b.py", "./b.py", "a/..", ""):
+            with self.subTest(name):
+                self.tearDown()
+                self.setUp()
+                ok, names, _ = self.crafted([("100644", 5, name)])
+                self.assertFalse(ok)
+                self.assertEqual(names, [])
+                self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "x.py")))
+
+    def test_dotted_but_ordinary_components_are_allowed(self):
+        ok, names, _ = self.crafted([("100644", 5, "pkg/.hidden/v1.2/a.py"), ("100644", 5, "...dots/b.py")])
+        self.assertEqual((ok, names), (True, ["...dots/b.py", "pkg/.hidden/v1.2/a.py"]))
+
+    def test_nul_padded_utf16_and_invalid_utf8_blobs_are_skipped_as_hits_not_scanned_clean(self):
+        bodies = {"u16.txt": "api_key = 'abc'".encode("utf-16"), "nul.txt": b"t\0o\0k\0e\0n\0", "bad.txt": b"api\xff_key = 'a'", "clean.txt": b"fine = 1\n"}
+        for name, body in bodies.items():
+            Path(self.repo, name).write_bytes(body)
+        git = ["git", "-C", self.repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        subprocess.run([*git, "add", "-A"], check=True, capture_output=True)
+        subprocess.run([*git, "commit", "-q", "-m", "x"], check=True, capture_output=True)
+        ok, names, hits = self.exported()
+        self.assertEqual((ok, names, sorted(hits)), (True, ["clean.txt"], ["bad.txt", "nul.txt", "u16.txt"]))
+
+    def test_resource_bounds_are_enforced_from_the_listing_before_any_blob_is_read(self):
+        reads = []
+        real_read = fe._read_blob
+        fe._read_blob = lambda *a: reads.append(a) or real_read(*a)
+        saved = (fe.EXPORT_MAX_ENTRIES, fe.EXPORT_MAX_FILES, fe.EXPORT_MAX_TOTAL_BYTES, fe.EXPORT_MAX_FILE_BYTES, fe.EXPORT_DEADLINE_S)
+        try:
+            ok, names, _ = self.crafted([("100644", 10 * 1024 * 1024, "huge.bin"), ("100644", 5, "a.py")])  # huge is skipped, not read
+            self.assertEqual((ok, names), (True, ["a.py"]))
+            self.assertEqual(len(reads), 1)
+            reads.clear()
+            fe.EXPORT_MAX_ENTRIES = 3
+            ok, names, _ = self.crafted([("100755", 5, f"d/f{i}.py") for i in range(10)])  # skipped names still count as entries
+            self.assertFalse(ok)
+            fe.EXPORT_MAX_ENTRIES = saved[0]
+            fe.EXPORT_MAX_FILES = 2
+            self.assertFalse(self.crafted([("100644", 5, f"f{i}.py") for i in range(5)])[0])
+            fe.EXPORT_MAX_FILES = saved[1]
+            fe.EXPORT_MAX_TOTAL_BYTES = 9
+            reads.clear()
+            self.assertFalse(self.crafted([("100644", 5, "a.py"), ("100644", 5, "b.py")])[0])
+            self.assertEqual(len(reads), 1)  # the second entry is refused from its listed size, unread
+            fe.EXPORT_MAX_TOTAL_BYTES = saved[2]
+            fe.EXPORT_DEADLINE_S = -1.0
+            self.assertFalse(self.crafted([("100644", 5, "a.py")])[0])
+        finally:
+            fe._read_blob = real_read
+            (fe.EXPORT_MAX_ENTRIES, fe.EXPORT_MAX_FILES, fe.EXPORT_MAX_TOTAL_BYTES, fe.EXPORT_MAX_FILE_BYTES, fe.EXPORT_DEADLINE_S) = saved
+
+    def test_a_blob_larger_than_its_listed_size_fails_the_export(self):
+        self.assertFalse(self.crafted([("100644", 2, "ok2.py")])[0])  # the real blob is 5 bytes
 
     def test_a_repository_without_a_commit_exports_nothing(self):
         Path(self.repo, "a.py").write_text("1")

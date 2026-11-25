@@ -29,6 +29,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from importlib.util import module_from_spec, spec_from_file_location
@@ -379,7 +380,8 @@ def managed_session(cwd, allowed_profiles):
     return found["name"] not in allowed_profiles
 
 
-EXPORT_MAX_FILES, EXPORT_MAX_FILE_BYTES, EXPORT_MAX_TOTAL_BYTES = 20000, 1 << 20, 64 << 20
+EXPORT_MAX_ENTRIES, EXPORT_MAX_FILES, EXPORT_MAX_FILE_BYTES, EXPORT_MAX_TOTAL_BYTES = 50000, 20000, 1 << 20, 64 << 20
+EXPORT_DEADLINE_S = 120.0
 # Matched against EVERY path component, case-insensitively: credential-looking or tool-configuration names are never exported.
 EXPORT_SKIP = re.compile(r"(?i)^\.env|\.env($|\.)|^\.(claude|codex|aws|ssh|gnupg|config|npmrc|netrc|pypirc|git-credentials|git)$"
                          r"|^id_(rsa|dsa|ecdsa|ed25519)|\.(pem|key|p12|pfx|jks|keystore|kdbx)$"
@@ -390,49 +392,96 @@ def _skipped_name(name):
     return any(EXPORT_SKIP.search(part) for part in name.split("/"))
 
 
+def _safe_export_name(name):
+    """A tree path that can be written under the export root: relative, no empty/'.'/'..'/.git component."""
+    return bool(name) and not name.startswith("/") and all(part not in ("", ".", "..") and part.lower() != ".git" for part in name.split("/"))
+
+
+def _read_blob(top, sha, size, env):
+    """The blob's bytes, read at most size+1 bytes (a blob larger than its listed size is refused by the caller)."""
+    proc = subprocess.Popen(["git", "-C", top, "cat-file", "blob", sha], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+    try:
+        data = proc.stdout.read(size + 1)
+    finally:
+        proc.kill()
+        proc.stdout.close()
+        proc.wait()
+    return data
+
+
 def export_tracked(cwd, dest):
     """Export the COMMITTED blobs (HEAD) of the repository holding `cwd` into `dest`; never reads the working tree or the index.
 
     Skipped: symlinks (mode 120000), submodules (160000), credential-looking names (any path component), files over 1 MB, and files whose
-    content matches the secret rules. Returns (ok, content_hits): the paths skipped for content, which the caller checks against the prompt.
-    Uncommitted changes, staged files and untracked files are not exported. A repository with no commit exports nothing."""
+    content has a NUL byte, is not strict UTF-8, or matches the secret rules. Returns (ok, content_hits): the paths skipped for content,
+    which the caller checks against the prompt. Fail closed (ok False) on an unsafe tree path, on more than the allowed entries, files or
+    bytes (judged from the listed sizes before any blob is read), on a git failure or when the overall deadline passes.
+    Uncommitted, staged and untracked files are not exported. A repository with no commit exports nothing."""
     top = _git(cwd, "rev-parse", "--show-toplevel")
     if not top:
         return False, []
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     if _git(top, "rev-parse", "--verify", "-q", "HEAD^{commit}") is None:
         return True, []
+    deadline = time.monotonic() + EXPORT_DEADLINE_S
     try:
-        listing = subprocess.run(["git", "-C", top, "ls-tree", "-r", "-z", "--full-tree", "HEAD"], capture_output=True, timeout=60, env=env)
+        listing = subprocess.run(["git", "-C", top, "ls-tree", "-r", "-l", "-z", "--full-tree", "HEAD"], capture_output=True,
+                                 timeout=max(1.0, EXPORT_DEADLINE_S), env=env)
         if listing.returncode != 0:
             return False, []
         rows = [r for r in listing.stdout.decode().split("\0") if r]
     except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         return False, []
+    root = os.path.realpath(dest)
     total = count = 0
     hits = []
     secret_rule = PAYLOAD_RULES[0][1]
-    for row in rows:
+    for seen, row in enumerate(rows, 1):
+        if seen > EXPORT_MAX_ENTRIES or time.monotonic() > deadline:
+            return False, []
         meta, _, name = row.partition("\t")
-        mode, kind, sha = (meta.split() + ["", "", ""])[:3]
+        fields = meta.split()
+        if len(fields) != 4:
+            return False, []
+        mode, kind, sha, size = fields
+        if not _safe_export_name(name):
+            return False, []
         if mode not in ("100644", "100755") or kind != "blob" or _skipped_name(name) or not re.fullmatch(r"[0-9a-f]{40,64}", sha):
             continue
-        try:
-            blob = subprocess.run(["git", "-C", top, "cat-file", "blob", sha], capture_output=True, timeout=60, env=env).stdout
-        except (OSError, subprocess.SubprocessError):
+        if not size.isdigit():
             return False, []
-        if len(blob) > EXPORT_MAX_FILE_BYTES:
+        size = int(size)
+        if size > EXPORT_MAX_FILE_BYTES:
             continue
-        if secret_rule.search(blob.decode("utf-8", "ignore")):
-            hits.append(name)
-            continue
-        count, total = count + 1, total + len(blob)
+        count, total = count + 1, total + size
         if count > EXPORT_MAX_FILES or total > EXPORT_MAX_TOTAL_BYTES:
             return False, []
-        target = os.path.join(dest, name)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "wb") as fout:
-            fout.write(blob)
+        try:
+            blob = _read_blob(top, sha, size, env)
+        except (OSError, subprocess.SubprocessError):
+            return False, []
+        if len(blob) != size:
+            return False, []
+        try:
+            text = blob.decode("utf-8")  # strict: invalid bytes cannot hide a secret from the scan
+            if b"\0" in blob:
+                raise UnicodeDecodeError("utf-8", b"", 0, 1, "NUL byte")
+        except UnicodeDecodeError:
+            hits.append(name)
+            continue
+        if secret_rule.search(text):
+            hits.append(name)
+            continue
+        target = os.path.join(root, name)
+        if os.path.commonpath([root, os.path.realpath(target)]) != root:
+            return False, []
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as fout:
+                fout.write(blob)
+        except OSError:  # includes a name collision on a case-insensitive filesystem: fail closed
+            return False, []
     return True, hits
 
 
